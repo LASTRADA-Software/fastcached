@@ -57,16 +57,22 @@ CredentialIdentifiers='
 signingKey|what a lease grant is MACed with; SchedulerService and SignedLeaseValidator hold it
 _signingKey|the SchedulerService member holding the same
 presharedKey|the cluster PSK, which MACs discovery proofs
+clusterKey|the cluster key an enrolling node is handed and writes to disk; EnrollReading holds it
 '
-# `clusterKey` is deliberately NOT a row, and it was one until the check refused the real
-# tree over it. Nothing here is called that: the secret's file-read form is a local named
-# `key`, and `clusterKeyFile` is a PATH -- which is not the secret, per the rule that a
-# secret reached BY PATH is a different question from the secret. A row matching only
-# `clusterKeyFile` would have made this guard report on a filename forever.
+# `clusterKey` WAS excluded, and the note said "nothing here is called that" -- true when
+# it was written and false now. It was excluded because a term matching nothing is a
+# REFUSAL here (that is case 3, and deliberately so), not because the name is dangerous:
+# matching is `\b`-anchored, so the row cannot reach `clusterKeyFile`, which is a PATH and
+# not the secret, per the rule that a secret reached BY PATH is a different question.
+# Measured before the row was added: `\bclusterKey\b` matches the span views and the
+# `EnrollReading` member, and NO declaration of a plain owning type -- so it refuses
+# nothing today and guards the enrolment path, which had no row and no way to acquire one
+# while its member was called `key`.
 #
-# A bare `key` cannot be a row either. This is a cache: `key` is the thing being cached in
+# A bare `key` still cannot be a row. This is a cache: `key` is the thing being cached in
 # most of the tree, so that row would refuse hundreds of correct declarations, and a guard
-# that has to be suppressed everywhere is one somebody deletes.
+# that has to be suppressed everywhere is one somebody deletes. That is what forced the
+# RENAME rather than a wider vocabulary -- the holder is named for what it holds.
 
 # Types that OWN bytes. A borrowing view (`std::span`, `BytesView`, `std::string_view`)
 # is deliberately absent: it owns no storage, so there is nothing for it to zero, and
@@ -192,6 +198,7 @@ RunSelfTest() {
 SecureByteBuffer signingKey;
 SecureByteBuffer _signingKey;
 SecureByteBuffer presharedKey;
+SecureByteBuffer clusterKey;
 
 EOF
     verdict=$(bash "$0" --root "$tmp/clean" 2>&1)
@@ -221,6 +228,7 @@ EOF
     cat > "$tmp/blind/a.hpp" <<'EOF'
 SecureByteBuffer signingKey;
 SecureByteBuffer _signingKey;
+SecureByteBuffer clusterKey;
 EOF
     verdict=$(bash "$0" --root "$tmp/blind" 2>&1)
     if grep -q "identifier 'presharedKey' matches nothing" <<< "$verdict"; then
@@ -260,6 +268,7 @@ EOF
 SecureByteBuffer signingKey;
 SecureByteBuffer _signingKey;
 SecureByteBuffer presharedKey;
+SecureByteBuffer clusterKey;
 inline std::string MintLeaseToken(std::span<std::byte const> signingKey, int claims);
 bool Authenticate(std::span<std::byte const> signingKey, std::string_view token);
 EOF

@@ -118,6 +118,29 @@ namespace
                             .code = Wire::ErrorCode::DispatchNotPermitted,
                             .why = "this endpoint is a cache, not a compile node; its counters are on the admin "
                                    "surface's /metrics, which needs no credential" },
+        // **`NoCluster`, with the four cluster rows and NOT with the two node rows
+        // above.** `Enroll` is a self-service `ClusterAdmit` -- it asks to be written
+        // into the replicated membership configuration, and `EnrollControl`'s `Approve`
+        // performs exactly the `ClusterAdmit` an operator would have typed. Two verbs
+        // that change the same replicated state must not be refused with two different
+        // codes by one endpoint, or a client's remedy depends on which spelling it
+        // happened to use. A joiner told `NoCluster` knows the question does not apply
+        // here and goes looking for a node that runs consensus; told
+        // `DispatchNotPermitted` it would conclude this endpoint merely declines to
+        // schedule and keep asking.
+        //
+        // `Enroll` is PRE-AUTH, so this refusal is reachable by anybody who can route to
+        // the port. That is deliberate and costs nothing: it names a role this process
+        // already advertises by answering `0xFC` at all, and says no more than the
+        // `NoCluster` a `ClusterStatus` has always drawn from the same door.
+        Wire::RefusedVerb { .op = Wire::Op::Enroll,
+                            .code = Wire::ErrorCode::NoCluster,
+                            .why = "this endpoint is a cache and belongs to no cluster, so there is nothing here to "
+                                   "join; ask a fastcache-compile-node that runs consensus instead" },
+        Wire::RefusedVerb { .op = Wire::Op::EnrollControl,
+                            .code = Wire::ErrorCode::NoCluster,
+                            .why = "this endpoint is a cache and belongs to no cluster, so it opens no enrollment "
+                                   "window; ask a fastcache-compile-node that runs consensus instead" },
     };
 
     /// What to answer `op` with.
@@ -867,6 +890,11 @@ Task<void> CompileCacheHandler::Run(ISocket* socket,
             // it, and it caught exactly this.
             case Wire::Op::NodeStatus:
             case Wire::Op::NodeMetrics:
+            // The enrollment pair, answered by a compile node that runs consensus. Same
+            // arm for the same reason: `RefusalFor` is the one place the code and the
+            // sentence are decided.
+            case Wire::Op::Enroll:
+            case Wire::Op::EnrollControl:
                 next = co_await HandleDistributed(socket, descriptor->code);
                 break;
         }

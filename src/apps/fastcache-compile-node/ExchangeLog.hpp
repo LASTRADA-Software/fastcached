@@ -120,6 +120,15 @@ inline constexpr std::array ExchangeLogTable {
     VerbLogRow { .code = CompileCacheWire::Op::NodeMetrics,
                  .level = LogLevel::Debug,
                  .rationale = "same shape as node-status, and a scrape is by construction periodic" },
+    VerbLogRow { .code = CompileCacheWire::Op::Enroll,
+                 .level = LogLevel::Info,
+                 .rationale = "the only verb on this wire an UNAUTHENTICATED stranger can reach, and the only "
+                              "record that one asked; a joiner polls every few seconds so a window held open "
+                              "produces traffic, which is exactly the reading an operator wants" },
+    VerbLogRow { .code = CompileCacheWire::Op::EnrollControl,
+                 .level = LogLevel::Info,
+                 .rationale = "decides who joins the fleet and hands a stranger this cluster's key; the same "
+                              "audit argument as cluster-admit, on the verb that reaches further" },
 };
 
 /// Whether every verb this build serves states a log level.

@@ -16,6 +16,9 @@
 #include "CompileResponder.hpp"
 #include "ConsensusTier.hpp"
 #include "DiscoveryTier.hpp"
+#include "EnrollClient.hpp"
+#include "EnrollmentResponder.hpp"
+#include "EnrollmentWindow.hpp"
 #include "NodeAnnounce.hpp"
 #include "NodeConfig.hpp"
 #include "NodeCredential.hpp"
@@ -74,12 +77,14 @@
 #include <atomic>
 #include <charconv>
 #include <chrono>
+#include <condition_variable>
 #include <csignal>
 #include <cstdlib>
 #include <filesystem>
 #include <format>
 #include <iostream>
 #include <map>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <string>
@@ -274,12 +279,162 @@ constexpr int ExitUsage = 2;
 /// What `main` returns when the worker served until it was asked to stop.
 constexpr int ExitOk = 0;
 
+/// Report a one-shot operator verb's answer and say what to exit with.
+///
+/// **Three verbs, one shape.** A cluster command, an enrollment decision and a
+/// machine asking to be let in all do the same two things with their runner's
+/// answer: print a refusal to stderr and exit `ExitUsage`, or print the answer to
+/// stdout and exit `ExitOk`. Written out at each site that was three copies of one
+/// branch pair -- blocks diverging by a name, which this codebase treats as a defect
+/// on its own -- and it is also what took `main` past the cognitive-complexity
+/// threshold the build enforces when the enrollment verbs added the second and
+/// third. `AnnounceOnce` above was split out of `WorkerBody` for the same reason, so
+/// this is the file's own idiom rather than a new one.
+///
+/// The runner CALL stays at each call site, because that is the part that genuinely
+/// differs -- and so does the credential, which is constructed per site so that the
+/// day one of these is asked from a running worker it reads the live secret rather
+/// than one captured here.
+/// @param answer What the runner said.
+/// @param prefix Prepended to a successful answer, for the verbs that name the binary.
+/// @return The process exit code.
+[[nodiscard]] int ReportOneShotVerb(std::expected<std::string, std::string> const& answer, std::string_view prefix = {})
+{
+    if (!answer.has_value())
+    {
+        std::cerr << "fastcache-compile-node: " << answer.error() << '\n';
+        return ExitUsage;
+    }
+
+    std::cout << prefix << *answer;
+    return ExitOk;
+}
+
+/// Whether this node will serve an enrollment surface.
+///
+/// Two clauses, and they answer different KINDS of question, which is why the
+/// configuration half lives in `NodeConfig` where a test can reach it and this
+/// one-line conjunction lives here. `EnrollmentConfigured` is the RULE -- consensus
+/// and a named cluster key file, with the history in its own doc comment -- and
+/// `tier != nullptr` is a runtime fact about what was actually built, which only this
+/// translation unit knows and which no test links.
+///
+/// Named rather than spelled inline because `WorkerBody` is at the
+/// cognitive-complexity ceiling the build enforces, and because the two sites that
+/// need this answer must not be able to disagree: reporting a window no verb can act
+/// on is the reading the repeating open-window warning exists to make impossible.
+/// @param cfg The parsed configuration.
+/// @param tier The scheduler tier, or nullptr when none was started.
+/// @return True when both halves hold.
+[[nodiscard]] bool ServesEnrollment(NodeConfig const& cfg, Node::SchedulerTier const* tier) noexcept
+{
+    return Node::EnrollmentConfigured(cfg) && tier != nullptr;
+}
+
+/// The address held by @p slot, or nullptr when it holds nothing.
+///
+/// **A component this node does not run is a NULL source, and an `optional` spells
+/// that with a ternary at every site.** Named instead, because `WorkerBody` carried
+/// several copies of that one branch -- blocks diverging by a name, and each one a
+/// charge against the cognitive-complexity threshold the enrollment surface pushed
+/// that function over. It reads as what it means at the call site, which a ternary
+/// buried in a designated initialiser does not.
+/// @tparam T What the slot may hold.
+/// @param slot The optional to read.
+/// @return Its address, or nullptr.
+template <typename T>
+[[nodiscard]] T* AddressOrNull(std::optional<T>& slot) noexcept
+{
+    return slot.has_value() ? &*slot : nullptr;
+}
+
+/// The scheduler service this node runs, or nullptr when it runs none.
+///
+/// The third member of `AddressOrNull`'s family, and the one that cannot be either of
+/// the others: the source only EXISTS behind the tier, so the test and the dereference
+/// cannot be separated and an eager helper taking the value would dereference a null
+/// tier to build its argument. Named here for the same two reasons as its siblings --
+/// it reads as what it means at the call site, and `WorkerBody` sits one point under
+/// the cognitive-complexity ceiling the build enforces.
+/// @param tier The scheduler tier, or nullptr when none was started.
+/// @return The service, or nullptr.
+[[nodiscard]] Distributed::SchedulerService const* ServiceOrNull(Node::SchedulerTier const* tier) noexcept
+{
+    return tier != nullptr ? &tier->Service() : nullptr;
+}
+
+/// @p value's address when @p present, and nullptr otherwise.
+///
+/// The sibling of `AddressOrNull` for a source this node OWNS unconditionally but
+/// reports on only when it serves the component -- the enrollment window is held
+/// whatever this node runs, because it is two words and a mutex, so whether to report
+/// it is a separate question from whether it exists.
+/// @tparam T The source's type.
+/// @param present Whether this node serves the component.
+/// @param value The source.
+/// @return Its address, or nullptr.
+template <typename T>
+[[nodiscard]] T* AddressWhen(bool present, T& value) noexcept
+{
+    return present ? &value : nullptr;
+}
+
+/// How often the open window is asked whether a warning is due.
+///
+/// A cadence, not a teardown cost: the wait below carries the stop token, so a stop is
+/// observed immediately whatever this is. It is stated beside its one reader rather
+/// than in the constants block above, because reading it apart from that sentence is
+/// what invites shortening it to buy responsiveness it does not buy.
+constexpr std::chrono::seconds EnrollmentWarningTick { 1 };
+
+/// Log the enrollment window's due warning until asked to stop.
+///
+/// Split out of `WorkerBody` for `AnnounceOnce`'s two reasons below, the second being
+/// the load-bearing one: a `while` holding an `if` costs that function more
+/// cognitive-complexity budget than either construct suggests, because the inner test
+/// is charged for its nesting as well as itself -- and a loop with a decision in it is
+/// more behaviour than belongs in the one translation unit no test reaches.
+///
+/// It owns no rule. The DECISION is `EnrollmentWindow::TakeDueWarning`, which is pure
+/// over an injected clock and is tested against a `ManualClock`; this is the driver.
+///
+/// The stop token is IN the wait rather than checked between sleeps, so a stop ends
+/// this loop at once. `EnrollmentWarningTick` therefore bounds only how late a DUE
+/// warning is logged; it is not a teardown cost, which is what a sliced sleep pays.
+///
+/// The heartbeat loop below still slices, so this is deliberately **not** the same
+/// shape -- an earlier draft of this comment said it was, and converting only this
+/// loop is what made that false. Converting that one is #1339; until it lands the
+/// divergence lives there rather than in a comment claiming a sameness this function
+/// stopped having.
+/// @param window The window to ask.
+/// @param logger Where a due warning is written.
+/// @param stop Participates in the wait, so a requested stop ends it immediately.
+void WarnWhileWindowIsOpen(Node::EnrollmentWindow& window, ILogger& logger, std::stop_token const& stop)
+{
+    // Nothing else ever notifies this: the stop token is the only wakeup, and
+    // `wait_for` registers for it rather than polling for it, so the mutex and the
+    // variable are locals rather than members somebody else could signal.
+    auto wakeMutex = std::mutex {};
+    auto wake = std::condition_variable_any {};
+    while (!stop.stop_requested())
+    {
+        if (auto const due = window.TakeDueWarning(); due.has_value())
+            logger.Logf(LogLevel::Warn, "{}", *due);
+        auto guard = std::unique_lock { wakeMutex };
+        (void) wake.wait_for(guard, stop, EnrollmentWarningTick, [&stop] { return stop.stop_requested(); });
+    }
+}
+
 /// Announce this machine once, following `NotLeader` to wherever it points.
 ///
 /// A function rather than a block inside `WorkerBody` for two reasons, and the
 /// second is the load-bearing one. `WorkerBody` is at the cognitive-complexity
 /// ceiling the build enforces -- this loop pushed it to 88 against a threshold of
-/// 60, which is the linter making a design point rather than a style one. And a
+/// 60, which is the linter making a design point rather than a style one. That the
+/// margin in this file is zero rather than small is #1351: extractions like this one
+/// are what keep it at zero, and the next change to `main` pays for the arrival
+/// order rather than for its own complexity. And a
 /// redirect chain with a memory and a fallback is far too much behaviour to leave
 /// in the one translation unit no test reaches.
 ///
@@ -1050,6 +1205,65 @@ void AdoptAllowlist(Cc::CompileJobRunner& jobs,
         .served = 0,
         .discovered = static_cast<std::uint32_t>(discoveredToolchains.entries.size()) } };
 
+    // The runtime enrollment window, and the key source it hands over from.
+    //
+    // Held whatever this node runs, because it is two words of state and a mutex, and
+    // declared here so it outlives both the surface that mutates it and the status
+    // source that reads it. **What decides whether it is REACHABLE is
+    // `servesEnrollment` below** -- `RunsConsensus`, which is the one predicate the
+    // consensus tier itself asks so the surface and the tier cannot disagree about
+    // whether this node has a cluster, AND a scheduler tier, without which the responder
+    // has no references to hold. A node missing either leaves the component null and the
+    // whole family is refused at the door: a window that could never admit anybody
+    // should not be openable, and one nothing serves should not be reported.
+    //
+    // The key source takes the PATH and re-reads the file at each hand-over rather than
+    // holding the bytes: an outbound credential is read where it is presented, which
+    // here also means this process does not carry a second copy of the cluster's secret
+    // for its whole uptime to serve a handful of exchanges in a fleet's life.
+    Node::EnrollmentWindow enrollmentWindow { statusClock };
+    Node::FileClusterKeySource const enrollmentKey { cfg.clusterKeyFile };
+
+    // **Whether this node serves enrollment at all, asked ONCE.**
+    //
+    // Two sites need it -- what `NodeStatus` REPORTS about a window, and whether the
+    // responder that serves one is built -- and they must agree or an operator is shown
+    // a window no verb can act on: `--enroll-list` against a node advertising `open`
+    // would meet a refusal from a surface that does not exist, which is the one reading
+    // the repeating open-warning is designed to make impossible to miss.
+    //
+    // They were two conditions, and the comment below this one already argued they must
+    // not be able to disagree -- *"`RunsConsensus` already implies a scheduler tier,
+    // which is why this is one condition rather than two that could disagree"* -- while
+    // the code under it spelled `RunsConsensus(cfg) && schedulerTier != nullptr` at one
+    // site and `RunsConsensus(cfg)` alone at the other. A stated invariant does not hold
+    // itself; naming it once is what does. If the implication ever stops being true, the
+    // two sites move together because there is only one of them.
+    //
+    // No test reaches this: `main.cpp` is the translation unit none of them links, so
+    // the guard here is CONSTRUCTION rather than a case -- a test built around a second
+    // copy of this expression would assert something other than what ships.
+    //
+    // **The key file is the THIRD clause, and it is the one that makes the sentence
+    // above true.** A node with no `--cluster-key-file` is a legal consensus node -- the
+    // startup table refuses a keyless one only where the compile port faces the network
+    // and admits remote peers -- and on such a node this window was openable, listable
+    // and APPROVABLE, and could never admit anybody, because the hand-over reads a key
+    // file that is not configured. Worse than a refusal: `AnswerDecision` commits
+    // `SchedulerService::ClusterAdmit` before the key is ever consulted, so an approval
+    // grew the replicated configuration -- and therefore the QUORUM -- by a machine that
+    // then received `StorageWriteFailed` and never became anything. A phantom member
+    // counted towards every future election, from one operator command that looked like
+    // it worked.
+    //
+    // Asked of the CONFIGURATION rather than of the filesystem, deliberately: this is a
+    // startup-time structural question ("could this node ever hand a key over"), and a
+    // readability probe here would be a different claim with a different lifetime -- the
+    // file can be repaired, or break, long after this line runs. The remaining window,
+    // a key file that is named and cannot be READ, is closed where it has to be, at the
+    // decision itself: the responder now reads the key BEFORE it admits anybody.
+    auto const servesEnrollment = ServesEnrollment(cfg, schedulerTier.get());
+
     Node::ConfiguredNodeStatus const nodeStatus {
         cfg,
         statusClock,
@@ -1060,13 +1274,19 @@ void AdoptAllowlist(Cc::CompileJobRunner& jobs,
                                .worker = true,
                                .scheduler = schedulerTier != nullptr,
                                .consensus = Node::RunsConsensus(cfg) },
-        // `capacity` and `scheduler` are read LIVE; only `runtime` is published into.
-        // Both are already in scope and already thread-safe, and a node running no
-        // scheduler passes a null -- which is what makes an absent role mean *runs no
-        // scheduler* rather than *is in an election*.
+        // `capacity`, `scheduler` and `enrollment` are read LIVE; only `runtime` is
+        // published into. All three are already in scope and already thread-safe, and a
+        // node running no scheduler passes a null -- which is what makes an absent role
+        // mean *runs no scheduler* rather than *is in an election*.
+        //
+        // The enrollment pointer follows the same rule one step further: a node with no
+        // cluster reports NOTHING about a window rather than reporting one that is shut,
+        // because a reassuring `closed` for a thing that does not exist is exactly the
+        // reading that stops an operator looking.
         Node::NodeRuntimeSources { .runtime = &runtimeState,
                                    .capacity = &compileCapacity,
-                                   .scheduler = schedulerTier != nullptr ? &schedulerTier->Service() : nullptr },
+                                   .scheduler = ServiceOrNull(schedulerTier.get()),
+                                   .enrollment = AddressWhen(servesEnrollment, enrollmentWindow) },
     };
 
     // The operator verbs. Declared BEFORE the surface that routes to it and therefore
@@ -1076,6 +1296,29 @@ void AdoptAllowlist(Cc::CompileJobRunner& jobs,
     // implementation re-asking for an oracle per request could never see `--fleet-open`
     // change, and a test that re-acquired it would pass under exactly that defect.
     Node::NodeStatusResponder nodeStatusResponder { nodeStatus, membership.Oracle(), metrics };
+
+    // The enrollment surface, built only where there is a cluster to be admitted to.
+    //
+    // An `optional` rather than a null pointer with a branch at the call site, because
+    // the responder holds references and a node with no scheduler has none to give it.
+    // `servesEnrollment` above is that condition, asked once and shared with what
+    // `NodeStatus` reports -- so the two cannot disagree, which is what this comment
+    // used to assert on the strength of `RunsConsensus` implying a scheduler tier while
+    // the two sites spelled different expressions.
+    //
+    // `membership.Oracle()` bound once, by reference, exactly as every other surface
+    // binds it. The credential is the SCHEDULER's -- `AUTH` routes there -- so this
+    // surface holds the same policy object rather than a second one, or a node with a
+    // token file would gate nine verbs and leave the tenth open.
+    std::optional<Node::EnrollmentResponder> enrollmentResponder;
+    if (servesEnrollment)
+        enrollmentResponder.emplace(enrollmentWindow,
+                                    schedulerTier->ServiceForSurfaces(),
+                                    membership.Oracle(),
+                                    enrollmentKey,
+                                    metrics,
+                                    logger,
+                                    schedulerTier->Policy());
 
     auto nodeSurfaceOrRefusal = Node::StartNodeSurfaceOrExplain(
         nodeIo,
@@ -1087,7 +1330,8 @@ void AdoptAllowlist(Cc::CompileJobRunner& jobs,
         Node::SurfaceComponents { .cache = cacheTier != nullptr ? &cacheTier->Responder() : nullptr,
                                   .scheduler = schedulerTier != nullptr ? &schedulerTier->Responder() : nullptr,
                                   .compile = &compileResponder,
-                                  .node = &nodeStatusResponder },
+                                  .node = &nodeStatusResponder,
+                                  .enrollment = AddressOrNull(enrollmentResponder) },
         activated,
         metrics,
         logger,
@@ -1108,6 +1352,37 @@ void AdoptAllowlist(Cc::CompileJobRunner& jobs,
     // not that case -- this surface's row states `Refuse`, so it arrives as the error
     // above rather than as a null. See `BindFailurePolicy` in NodeSurfaces.hpp.
     auto const nodeSurface = std::move(*nodeSurfaceOrRefusal);
+
+    // Says, once a minute and for as long as it is open, that this node is holding an
+    // enrollment window.
+    //
+    // **Repeating rather than one line at open, and that is the whole of #1298's
+    // observability half.** A single line scrolls away, and this is the one state in
+    // which this machine will hand its cluster's key to a stranger that asked and was
+    // approved. An operator who opened a window and was called away has the log and
+    // `NodeStatus`, and only one of those reaches somebody who is not already looking.
+    //
+    // A thread of its own rather than a ride on the heartbeat, because the heartbeat
+    // belongs to the WORKER and this belongs to the leader -- a scheduler holding no
+    // worker is an ordinary deployment and would otherwise be the one node that never
+    // said anything. It exists only where the surface does, so a node with no cluster
+    // starts no thread.
+    //
+    // The DECISION is `TakeDueWarning`, which is pure over an injected clock and is
+    // tested against a `ManualClock`. The driver is `WarnWhileWindowIsOpen` above,
+    // split out of this function exactly as `AnnounceOnce` was and for the same two
+    // reasons -- it took `WorkerBody` past the cognitive-complexity ceiling the build
+    // enforces, and a loop with a decision in it is more behaviour than belongs in the
+    // one translation unit no test reaches.
+    //
+    // An `optional` rather than an unconditional `jthread` whose body returns at once,
+    // which is what this was: that spelling STARTED a thread on every node in the fleet
+    // and made the sentence above ("a node with no cluster starts no thread") false by
+    // one word. The condition is `servesEnrollment`, so the thread and the surface
+    // cannot disagree about whether there is a window to watch.
+    std::optional<std::jthread> enrollmentWatch;
+    if (servesEnrollment)
+        enrollmentWatch.emplace([&](std::stop_token const& stop) { WarnWhileWindowIsOpen(enrollmentWindow, logger, stop); });
 
     // Consensus, when the operator configured a cluster. It is what turns the
     // scheduler tier's standalone leadership into a real one: without it, every node
@@ -2036,14 +2311,35 @@ int main(int argc, char** argv)
         // anyway, so the day one of these is asked from a running worker it reads the
         // live secret rather than the one this process was started with.
         Node::ConfiguredCredential const credential { cfg, nullptr };
-        auto const answer = RunClusterAdmin(cfg, cfg.cluster, credential);
-        if (!answer.has_value())
-        {
-            std::cerr << "fastcache-compile-node: " << answer.error() << '\n';
-            return ExitUsage;
-        }
-        std::cout << *answer;
-        return ExitOk;
+        return ReportOneShotVerb(RunClusterAdmin(cfg, cfg.cluster, credential));
+    }
+
+    // An operator deciding who may join, rather than a worker starting up. Beside the
+    // cluster block because it is the same kind of thing -- a question put to a running
+    // cluster by a person at a terminal, answered, and the process exits.
+    if (cfg.enroll.action != EnrollAction::None)
+    {
+        Node::ConfiguredCredential const credential { cfg, nullptr };
+        return ReportOneShotVerb(Node::RunEnrollAdmin(cfg, cfg.enroll, credential));
+    }
+
+    // A machine asking to be LET IN to somebody else's cluster, rather than a worker
+    // starting up. Beside the cluster block and after it, because the two are the same
+    // kind of thing from opposite ends -- that one is an operator administering a
+    // cluster they are already in, this one is a machine that is not in one yet.
+    //
+    // Before the startup table below, and that is the point rather than an accident:
+    // those rules judge a configuration this node will SERVE with, and this one serves
+    // nothing at all. A node enrolling has no --scheduler and no toolchain, and being
+    // refused for either would refuse exactly the fresh install the mode exists for.
+    // What this mode itself requires -- somewhere to write the key, and a consensus
+    // identity to be admitted AS -- it refuses by name itself, which is the shape
+    // `RunClusterAdmin` already uses for its own `--scheduler`.
+    if (!cfg.enrollFrom.empty())
+    {
+        SystemRandomSource enrollRandom;
+        Node::ConfiguredCredential const credential { cfg, nullptr };
+        return ReportOneShotVerb(Node::RunEnrollClient(cfg, credential, enrollRandom), "fastcache-compile-node: ");
     }
 
     // NOW the sink is chosen. Everything from here is what a RUNNING service reports

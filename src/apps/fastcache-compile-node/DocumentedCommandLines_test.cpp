@@ -162,6 +162,23 @@ constexpr std::array NonStartVerbs {
     NonStartVerb { .flag = "--cluster-set", .why = "a cluster admin verb: changes one replicated setting and exits" },
     NonStartVerb { .flag = "--cluster-admit", .why = "a cluster admin verb: proposes a member and exits" },
     NonStartVerb { .flag = "--cluster-forget", .why = "a cluster admin verb: proposes a removal and exits" },
+    // The enrollment verbs. The five operator ones are the cluster-admin rows above in
+    // every respect that matters here -- ask the window's holder one question, print
+    // the answer, exit -- and they are listed rather than left out because leaving them
+    // out is not neutral: each one carries a `--scheduler` and would therefore be
+    // JUDGED as a serving configuration and pass, so the check would be asking the
+    // wrong question about them and reporting that it had asked the right one.
+    NonStartVerb { .flag = "--enroll-open", .why = "an enrollment verb: opens the window and exits" },
+    NonStartVerb { .flag = "--enroll-close", .why = "an enrollment verb: closes the window and exits" },
+    NonStartVerb { .flag = "--enroll-list", .why = "an enrollment verb: prints what is pending and exits" },
+    NonStartVerb { .flag = "--enroll-approve", .why = "an enrollment verb: admits one pending id and exits" },
+    NonStartVerb { .flag = "--enroll-reject", .why = "an enrollment verb: refuses one pending id and exits" },
+    // Not a cluster verb but a one-shot JOIN: it asks a member to enrol this machine,
+    // polls until somebody decides, writes the cluster key and exits. It is judged by
+    // its own refusal on that path and NOT by `StartupPolicyRejection`, which asks what
+    // a node needs in order to SERVE -- so it names no `--scheduler`, and a check that
+    // demanded one would be documenting a flag this verb has no use for.
+    NonStartVerb { .flag = "--enroll-from", .why = "a one-shot join: enrols this machine in a cluster and exits" },
     // Answered before the configuration is even assembled, so these are further from
     // a start than anything above them.
     NonStartVerb { .flag = "--help", .why = "prints usage and exits, ahead of the config file being read" },
@@ -452,19 +469,25 @@ TEST_CASE("Every documented command line is one the node would start on", "[node
             continue;
         }
 
-        if (auto const* verb = NonStartVerbIn(found.command); verb != nullptr)
-        {
-            ++nonStart;
-            continue;
-        }
-
         if (auto const* skip = SkipFor(found.command); skip != nullptr)
         {
             skipsUsed.emplace_back(skip->needle);
             continue;
         }
 
-        ++checked;
+        // **Every non-template command line is PARSED, whether or not it starts a
+        // node.** A non-start verb short-circuits the STARTUP GATE and nothing else:
+        // `--cluster-admit` and `--enroll-open` have an argv exactly as parseable as a
+        // serving node's, and a flag that does not exist is a documentation defect on
+        // either. This test ran the two skips together until the enrollment verbs were
+        // added, which is when it mattered enough to measure -- a typo in any of the
+        // eleven `--cluster-*` / `--print-surfaces` / `--help` examples was invisible,
+        // and adding six rows to `NonStartVerbs` would have taken five more command
+        // lines out of every check rather than into the right one. **Measured both
+        // ways**: with the skip above the parse, planting `--not-a-real-flag` in a
+        // documented `--enroll-list` line leaves this case GREEN; with it here, the
+        // same plant fails it by name and line. Whole-suite cost of the move: nothing
+        // -- all sixteen parse today.
         auto const arguments = SplitArguments(found.command);
         // The program name is dropped: `ParseOptionsInto` takes flags only.
         auto flags = arguments | std::views::drop(1)
@@ -481,6 +504,16 @@ TEST_CASE("Every documented command line is one the node would start on", "[node
             continue;
         }
 
+        if (auto const* verb = NonStartVerbIn(found.command); verb != nullptr)
+        {
+            ++nonStart;
+            continue;
+        }
+
+        // Counted here rather than above the parse, so `checked` goes on meaning what
+        // its name says -- command lines judged against the startup gate -- now that
+        // parsing reaches strictly more of them than the gate does.
+        ++checked;
         if (auto const rejection = StartupPolicyRejection(cfg); rejection.has_value())
         {
             ++failures;

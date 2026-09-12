@@ -859,6 +859,15 @@ struct SurfaceComponents
     /// components a node may not run, and these verbs must not depend on which of them
     /// it runs.
     IFrameResponder* node { nullptr };
+
+    /// Answers the enrollment verbs, or nullptr when this node runs no consensus.
+    ///
+    /// Null is the ORDINARY state and the important one: a node with no cluster has
+    /// nothing to enrol anybody into, so the whole family is then refused at the door
+    /// with the same sentence every unserved family gets. A window that could never
+    /// admit anybody should not be openable, which is why this is a component a node
+    /// may not run rather than a surface that is always present and always refuses.
+    IFrameResponder* enrollment { nullptr };
 };
 
 class MergedResponder final: public IFrameResponder
@@ -869,7 +878,8 @@ class MergedResponder final: public IFrameResponder
         _cache { components.cache },
         _scheduler { components.scheduler },
         _compile { components.compile },
-        _node { components.node }
+        _node { components.node },
+        _enrollment { components.enrollment }
     {
     }
 
@@ -907,6 +917,12 @@ class MergedResponder final: public IFrameResponder
                 // emptiest node in the fleet, so this owner is never null in a built
                 // node the way the other three legitimately are.
                 return _node;
+            case CompileCacheWire::VerbFamily::Enrollment:
+                // Legitimately null, and on most deployments it is: a node that runs no
+                // consensus has no cluster to let anybody into, so the family is refused
+                // at the door with the sentence every unserved family gets rather than
+                // by a surface that exists only to say no.
+                return _enrollment;
             case CompileCacheWire::VerbFamily::Unset:
                 return nullptr;
         }
@@ -929,7 +945,7 @@ class MergedResponder final: public IFrameResponder
 
         auto* const owner = OwnerOf(header->opRaw);
         if (owner == nullptr)
-            co_return UnservedReply();
+            co_return UnservedReply(header->opRaw);
         co_return co_await owner->Answer(frame, std::move(peer));
     }
 
@@ -941,7 +957,7 @@ class MergedResponder final: public IFrameResponder
     {
         auto const* const owner = OwnerOf(opRaw);
         if (owner == nullptr)
-            return UnservedReply();
+            return UnservedReply(opRaw);
         return owner->RefusePeer(peer, opRaw);
     }
 
@@ -989,7 +1005,7 @@ class MergedResponder final: public IFrameResponder
     {
         auto const* const owner = OwnerOf(opRaw);
         if (owner == nullptr)
-            return UnservedReply();
+            return UnservedReply(opRaw);
         return owner->RefusalReply(decision, opRaw, detail);
     }
 
@@ -1008,7 +1024,7 @@ class MergedResponder final: public IFrameResponder
     {
         auto const* const owner = OwnerOf(opRaw);
         if (owner == nullptr)
-            return UnservedReply();
+            return UnservedReply(opRaw);
         return owner->EndpointRefusalReply(refusal, opRaw, detail);
     }
 
@@ -1136,9 +1152,41 @@ class MergedResponder final: public IFrameResponder
     /// `RefusalReply` and `EndpointRefusalReply` -- give one sentence: a peer asking
     /// for a verb served nowhere is told that, rather than being told its frame was
     /// too large and sent to shrink one that was never going to be answered.
+    /// **It takes the VERB, because one unserved family must not answer
+    /// `UnimplementedVerb`.** The enrollment family is refused `NoCluster` instead, and
+    /// the reason is the rule that *unimplemented is not served elsewhere*: a node
+    /// without consensus implements these verbs perfectly well and has no cluster to
+    /// let anybody into, so `UnimplementedVerb` -- which the client reads as
+    /// `UnknownOpcode` -- told a joiner *the seed is running a build older than this
+    /// one*. The documented flow points `--enroll-from` at ANY member and most members
+    /// run no consensus, so the commonest operator mistake produced a confident wrong
+    /// diagnosis that sends somebody to upgrade a node that is already current.
+    ///
+    /// `CompileCacheHandler`'s `RefusedVerbs` table already drew exactly this
+    /// distinction for the daemon, with the argument written out beside it -- *"a joiner
+    /// told `NoCluster` knows the question does not apply here and goes looking for a
+    /// node that runs consensus"* -- and this surface did not carry it across. Same
+    /// code, so the two endpoints cannot send a joiner two different remedies for one
+    /// condition.
+    ///
+    /// Taking the verb rather than being duplicated at the four call sites is the point:
+    /// `Answer`, `RefusePeer`, `RefusalReply` and `EndpointRefusalReply` all reach an
+    /// unowned verb, and a per-family answer chosen at each of them is four places to
+    /// forget it. Both refusals stay UNCOUNTED for the reason above -- a node that runs
+    /// no consensus answers this for every enrolment attempt anybody ever points at it.
+    /// @param opRaw The third header byte, as received.
     /// @return The encoded refusal.
-    [[nodiscard]] static std::vector<std::byte> UnservedReply()
+    [[nodiscard]] static std::vector<std::byte> UnservedReply(std::uint8_t opRaw)
     {
+        if (CompileCacheWire::FamilyOf(opRaw) == CompileCacheWire::VerbFamily::Enrollment)
+            return Cc::RefuseWithoutCounter(
+                { .code = CompileCacheWire::ErrorCode::NoCluster,
+                  .rationale = "what a node without consensus answers every enrolment attempt aimed at it, which is "
+                               "an ordinary misdirection rather than an event; counted, it would bury the scan it "
+                               "would be read for, exactly as the unserved-family answer below would" },
+                "this node runs no consensus, so it belongs to no cluster and there is nothing here to join; ask a "
+                "node that runs consensus -- --node-status names the components a node serves");
+
         return Cc::RefuseWithoutCounter({ .code = CompileCacheWire::UnimplementedVerb,
                                           .rationale =
                                               "an ANSWER healthy traffic produces continuously, not an event: a node runs "
@@ -1147,13 +1195,33 @@ class MergedResponder final: public IFrameResponder
                                         "this node serves no component for that verb family");
     }
 
-    /// The largest value the present owners report for one ceiling.
+    /// The largest value reported by the three owners this folds, for one ceiling.
     ///
     /// One helper rather than three near-identical folds: the three ceilings differ
     /// only in which member function they read, and copy-pasted branches that differ
     /// by a name are what this codebase treats as a defect.
+    ///
+    /// **It folds `_cache`, `_scheduler` and `_compile`. `_node` and `_enrollment` are
+    /// NOT folded**, and that is stated here rather than left to be read off the loop,
+    /// because both of those responders carry comments reasoning about the number they
+    /// contribute -- reasoning that is sound about the value and silent about the fact
+    /// that nothing reads it. Whoever changes this set should read those comments in the
+    /// same pass; whether the set is right is a question about capacity accounting on a
+    /// merged surface, not about any one responder's row, and is tracked on its own.
+    ///
+    /// Adding the two members would change no number today: this is a MAXIMUM, and each
+    /// of them was sized to be the SMALL one. A ceiling that only takes effect when it is
+    /// the largest is the opposite of the case those two were written for, so folding
+    /// them in would leave the comments looking addressed and the property unchanged.
+    ///
+    /// A max cannot narrow a busier owner's ceiling -- **except** that with every folded
+    /// owner null this answers 0, and 0 is not a small ceiling at the endpoint: the
+    /// in-flight check reads `budget != 0 && ...` (`FrameEndpoint.cpp:1657`), so zero
+    /// there means UNBOUNDED. Unreachable today, `main.cpp` setting `.compile`
+    /// unconditionally; stated narrowly because the general form of that sentence is
+    /// false and was believed.
     /// @param ceiling Which ceiling to read.
-    /// @return The largest; 0 when no owner is present.
+    /// @return The largest of the three folded owners; 0 when none of them is present.
     [[nodiscard]] std::size_t Largest(std::size_t (IFrameResponder::*ceiling)() const noexcept) const noexcept
     {
         std::size_t out = 0;
@@ -1167,6 +1235,7 @@ class MergedResponder final: public IFrameResponder
     IFrameResponder* _scheduler;
     IFrameResponder* _compile;
     IFrameResponder* _node;
+    IFrameResponder* _enrollment;
 };
 
 } // namespace FastCache::Node

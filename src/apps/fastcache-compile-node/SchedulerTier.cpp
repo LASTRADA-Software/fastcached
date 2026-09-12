@@ -30,6 +30,12 @@ SchedulerTier::SchedulerTier(Distributed::IMembershipOracle const& membership,
     // two surfaces would admit a peer to the fleet and refuse it the objects that
     // fleet produced. It also outlives this tier, which is what lets a node serve a
     // cache with no scheduler at all.
+    // Kept as well as handed on, because the enrollment surface requires the SAME
+    // credential rather than one of its own: `AUTH` is a `Session` verb and the merged
+    // listener routes it to the scheduler, so a second policy object would be one this
+    // node never checks anything against. A `shared_ptr` copy, so neither holder owns
+    // the other's lifetime.
+    _policy { policy },
     _responder { _protocol, membership, metrics, std::move(policy) }
 {
     // **Standalone leadership, and ONLY for a node that leads alone** (#613).

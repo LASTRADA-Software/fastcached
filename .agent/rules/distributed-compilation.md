@@ -2711,6 +2711,103 @@ crossed pair (both directions, with an uncrossed control, or a client that refus
 real framing, with an empty argument and one containing a space. That last one is the
 only thing that would catch an encoding that drops a field on the way.
 
+## The enrollment window (#1298, #1299)
+
+`--enroll-open` puts a node into the one interval in which a machine this cluster has
+never heard of can ask it for the pre-shared key that makes it a member. Everything
+below is a property that shipped WRONG in the first draft of that feature and was
+found by review rather than by a test, so each one is a rule with a bug behind it.
+
+**A window is openable only where a key can actually be handed over.** That is
+consensus AND a named `--cluster-key-file`, and the second clause is the one with the
+history. A keyless consensus node is legal — the startup table refuses one only where
+the compile port faces the network and admits remote peers — and on such a node the
+window was openable, listable and APPROVABLE while it could never admit anybody,
+because the hand-over reads a key file that is not configured. The predicate is
+`EnrollmentConfigured` in `NodeConfig`, asked of the CONFIGURATION alone so that it is
+testable at all: whether a scheduler tier was built is a runtime fact `main.cpp` holds
+and ANDs at the call site, and `main.cpp` is the one translation unit no test links.
+
+**And the approval READS the key before it admits anybody**, because `ClusterAdmit` is
+the irreversible half. It used to consult `_key.ClusterKey()` only on the joiner's next
+poll, so a node whose key file was NAMED and unreadable answered the operator `Ok`,
+grew the replicated configuration — and therefore the QUORUM — by a machine that then
+received `StorageWriteFailed` forever. A phantom member counted towards every future
+election, from one command that reported success. The two guards answer different
+questions and both stay: a configuration cannot see a file it cannot read, and a
+startup predicate cannot see a file that breaks later. What a test must assert is that
+consensus was offered NOTHING — a refusal alone is green under a build that refused the
+operator *after* telling the cluster, which is the whole defect.
+
+**A node that runs no consensus refuses the family `NoCluster`, never
+`UnimplementedVerb`.** This is *unimplemented is not served elsewhere* on a new
+surface: such a node implements the verbs perfectly well and has no cluster to let
+anybody into, so `UnimplementedVerb` — which the client reads as `UnknownOpcode` — told
+a joiner *the seed is running a build older than this one*. The documented flow points
+`--enroll-from` at ANY member and most members run no consensus, so that wrong sentence
+was the likeliest thing a healthy fleet would ever print, sending somebody to upgrade a
+node that was already current. `CompileCacheHandler`'s `RefusedVerbs` table had drawn
+exactly this distinction for the daemon, with the argument written beside it, and the
+node's merged surface did not carry it across — so `MergedResponder::UnservedReply`
+takes the VERB, and all four routes to an unowned verb get the right code rather than
+four call sites remembering. A test asserts it is NOT `UnimplementedVerb`: both codes
+refuse, so a case asserting only that the peer was refused passes under either.
+
+**Rejecting an already-approved joiner does not un-admit it.** `Reject` reaches no
+`ClusterAdmit`, which is right for a PENDING row — nothing was committed — but
+`EnrollmentWindow::Decide` permits `Approved -> Rejected`, which is the path an
+operator correcting a mis-approval takes, and there the approval has already committed
+the member. It is not refused outright, because the reject still stops the key
+hand-over and that is worth having; what changed is that the flag's own description and
+a Warn both name `--cluster-forget` as the thing that removes it. The control that a
+PENDING reject stays SILENT is what keeps that warning worth reading.
+
+**The grant is spendable once, so this mode's preconditions are refused before the
+exchange.** A machine that already holds a key file used to dial, be approved, burn the
+one collection its id has, and only then discover locally that it had nowhere to put
+what it was given — recovering needs an operator to re-approve an id that looks already
+handled. Both that check and `StoreClusterKey`'s stay, and each closes a window the
+other cannot: the early one is ADVISORY and allowed to be wrong, since anything may
+create that file during the ten minutes this mode spends waiting for a person, while
+the one in `StoreClusterKey` is the exclusive CREATE itself.
+
+**That create is `"wbx"` and there is no `exists()` in front of it.** The available
+spelling — ask, then open `"wb"` — is wrong twice over, because `"wb"` TRUNCATES: wrong
+when the answer goes stale, and wrong with no race at all when `exists()` cannot
+answer, its `error_code` overload reporting a failed stat by returning FALSE, which
+that code then discarded. A guard folded into the operation is self-enforcing. No
+platform claim is made for `x` beyond the MSVC CRT, where it was measured; the refusal
+reaches that open with nothing in front of it, so a libc ignoring `x` reddens `A key
+file that already exists is never written over` on the platform that ignores it. Its
+survival assertion is a file SIZE rather than a read-back, because
+`SecureSecretFileForServices` narrows the key past what a non-elevated test process can
+open — so a `static_assert` pins the two test keys to different LENGTHS, which is what
+a size comparison silently needs.
+
+**A one-shot verb's shape is refused on the path that uses it.** `--enroll-from` has a
+`StartupPolicyRejection` row and `main` dispatches the flag and RETURNS before that
+table is consulted, so the row was reachable only through `--print-surfaces`. Left to
+the dial, a bare host was reported as *cannot reach the seed* — the wrong problem — and
+reported it after this node had minted its identity into `--cluster-dir`, so a typo
+wrote durable state. `ParseDialEndpoint` at both sites, never a second spelling.
+
+**The redirect budget is a CHAIN bound, not a total.** `MaxRedirects` exists for the
+loop two nodes with a stale `_knownLeader` make by naming each other; counted across a
+ten-minute wait for a person — some three hundred polls — three ordinary leadership
+changes anywhere in it aborted a legitimate enrolment with a message naming a loop that
+never happened. A reading that a node answered on its own behalf breaks a chain, so it
+resets the count, and a genuine loop never reaches that arm.
+
+**And the window's state is REPORTED, or the counters cannot be read.** Both enrollment
+series are rendered by every node and read zero on a machine that has no window at all,
+so *no window here* and *a window nothing has come through* are one number. The
+distinction is kept in `--node-status`'s `enrollment` field, which is ABSENT on a node
+running no consensus and `closed` on one that does. That field was encoded, decoded,
+round-tripped in a test and rendered by NOTHING, while the operator documentation
+pointed at it three times — so the claim was circular. A case asserting only the open
+reading leaves the field's whole purpose untested; absent-against-`closed` is what
+earns its place.
+
 ## Open work
 - **[#661](https://github.com/LASTRADA-Software/fastcached/issues/661)** — `IProcessRunner`
   has no cancellable seam, so a compile whose client has GONE runs to completion and this

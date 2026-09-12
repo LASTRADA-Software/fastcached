@@ -45,6 +45,9 @@ add_executable(fastcache-compile-node
     ClusterAdminCli.cpp
     ConsensusTier.cpp
     DiscoveryTier.cpp
+    EnrollClient.cpp
+    EnrollmentResponder.cpp
+    EnrollmentWindow.cpp
     SchedulerLink.cpp
     SchedulerTier.cpp
     ScratchClaim.cpp
@@ -98,6 +101,12 @@ if(FASTCACHED_BUILD_TESTS)
         ConsensusTier_test.cpp
         DiscoveryTier.cpp
         DiscoveryTier_test.cpp
+        EnrollClient.cpp
+        EnrollClient_test.cpp
+        EnrollmentResponder.cpp
+        EnrollmentResponder_test.cpp
+        EnrollmentWindow.cpp
+        EnrollmentWindow_test.cpp
         ExchangeLog_test.cpp
         NodeAnnounce_test.cpp
         SchedulerLink.cpp

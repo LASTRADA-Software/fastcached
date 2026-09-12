@@ -140,6 +140,37 @@ class SchedulerTier
         return _responder;
     }
 
+    /// The scheduler a SECOND surface answers verbs against.
+    ///
+    /// **Non-const, and that is not a relaxation of `Service()` above -- it is a
+    /// different question with a different audience.** That one is for REPORTING, and
+    /// its constness is the whole statement: a report reads the fleet and cannot change
+    /// it. This is for a surface, which by definition changes things, and it is exactly
+    /// what `_responder` already holds one layer down through `_protocol`.
+    ///
+    /// Its one consumer is `EnrollmentResponder`, whose approval goes through
+    /// `SchedulerService::ClusterAdmit` -- the same entry point `--cluster-admit`
+    /// reaches. That reuse is the point: one leadership-and-membership gate, one
+    /// `Cluster::Validate`, and one mapping from a consensus refusal onto a wire code,
+    /// so what an operator is told does not depend on which door they came through.
+    /// @return The service this tier owns.
+    [[nodiscard]] Distributed::SchedulerService& ServiceForSurfaces() noexcept
+    {
+        return _service;
+    }
+
+    /// The credential this node's surfaces require, or null when none is configured.
+    ///
+    /// Handed out so a second surface requires the SAME one. `AUTH` is a `Session` verb
+    /// and the merged listener routes it here, so a surface holding a policy of its own
+    /// would gate against a credential nothing on this node ever accepts -- which is a
+    /// port that looks guarded and refuses everybody.
+    /// @return The policy, shared; null means membership is the only gate.
+    [[nodiscard]] std::shared_ptr<AuthPolicy const> Policy() const noexcept
+    {
+        return _policy;
+    }
+
   private:
     SchedulerTier(Distributed::IMembershipOracle const& membership,
                   IClock& clock,
@@ -155,6 +186,11 @@ class SchedulerTier
     // below it.
     Distributed::SchedulerService _service;
     Distributed::SchedulerProtocol _protocol;
+
+    /// The credential every surface on this node requires, or null. Declared before
+    /// `_responder`, which is handed the same object.
+    std::shared_ptr<AuthPolicy const> _policy;
+
     SchedulerResponder _responder;
 };
 

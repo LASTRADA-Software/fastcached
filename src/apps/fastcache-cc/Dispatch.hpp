@@ -484,6 +484,21 @@ inline constexpr std::array DeclineCauseTable {
     DeclineCauseRow { .code = CompileCacheWire::ErrorCode::WorkerToolchainSurveyInFlight, .cause = DeclineCause::Withdrawn },
     DeclineCauseRow { .code = CompileCacheWire::ErrorCode::RequestDeadlineExceeded, .cause = DeclineCause::Withdrawn },
     DeclineCauseRow { .code = CompileCacheWire::ErrorCode::ForeignValueGeneration, .cause = DeclineCause::ProtocolMismatch },
+    // Enrollment, which no compile reaches either: a LAUNCHER meeting one of these has
+    // reached a surface it did not think it was talking to, exactly as the cluster rows
+    // above have. Rows so that neither arrives `Unrecognised`, which reads as a peer
+    // from the future while really being this build forgetting an entry.
+    //
+    // `NotPermitted` rather than `Withdrawn` for both, and the difference is what a
+    // launcher DOES: withdrawn means retry somewhere else in a moment, and neither of
+    // these clears without a person. The joiner that legitimately meets them is
+    // `--enroll-from`, which does not go through this table at all -- it reads the same
+    // codes through `ReadEnrollReply`, where a closed window is a WAIT rather than a
+    // refusal, because that client is the one thing in the tree with a reason to keep
+    // asking.
+    DeclineCauseRow { .code = CompileCacheWire::ErrorCode::EnrollmentClosed, .cause = DeclineCause::NotPermitted },
+    DeclineCauseRow { .code = CompileCacheWire::ErrorCode::EnrollmentFull, .cause = DeclineCause::NotPermitted },
+    DeclineCauseRow { .code = CompileCacheWire::ErrorCode::EnrollmentAlreadyCollected, .cause = DeclineCause::NotPermitted },
 };
 
 /// Whether every refusal this build's wire header knows carries a classification.

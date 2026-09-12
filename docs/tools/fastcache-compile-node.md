@@ -1247,6 +1247,99 @@ addresses — see below.
 command lines are not edited, and the new member survives *their* restarts as well
 as its own, because it is a log entry rather than a flag.
 
+### Enrolling a machine instead of typing it
+
+The two commands above need the operator to know the joiner's id and its consensus
+address, and to type both correctly on a machine that is not the one being added.
+The enrollment window is the same expansion asked for from the other end: the
+joiner states who it is, an operator looks at the request and approves it, and the
+cluster key travels back over the wire instead of being copied out of band.
+
+**It is shut unless somebody opens it, and that is the whole security model.** An
+open window is the one interval in which a machine this cluster has never heard of
+can ask it for the key that makes it a member, so the window is a *moment an
+operator chooses* rather than a setting. There is no flag that starts a node with it
+open, deliberately: a service registration replays its command line at every boot
+forever, and a window re-opening on every reboot is a door nobody decided to leave
+unlocked. It is opened, used, and closed:
+
+```sh
+fastcache-compile-node --scheduler=10.0.0.1:6675 --enroll-open
+```
+
+The joiner is then started with `--enroll-from` naming any member. It states its own
+id and the address its consensus port will answer on, polls until somebody decides,
+writes the key to `--cluster-key-file`, and **exits** — it is a one-shot join and not
+a way to run a node:
+
+```sh
+fastcache-compile-node --enroll-from=10.0.0.1:6675 --raft-self=10.0.0.4 --listen-raft=6680 --cluster-key-file=/etc/fastcached/cluster.key
+```
+
+**No `--node-id`**, deliberately. The mode mints one into `--cluster-dir` — a node *is* its state directory — and the minted form is 128 bits of randomness rendered as 32 hex characters. **Naming a short id here is the one way to make this genuinely unsafe**: an open window will hand the key to whoever names an id an operator approved, and while the id is unguessable that is a gate, where `n4` is the first guess anybody would make. If you must pin an id, pin a minted-shaped one.
+
+While it polls, the window's holder reports what is waiting:
+
+```sh
+fastcache-compile-node --scheduler=10.0.0.1:6675 --enroll-list
+```
+
+Each row names the id the machine claims, the consensus address it claims, and **the
+host the kernel says the request came from**. Those last two are shown side by side
+and never checked against each other — [#242](https://github.com/LASTRADA-Software/fastcached/issues/242)
+settled that enforcing agreement refuses the documented setup and stops only a third
+host — so a disagreement is *marked* for a person to read rather than refused. That
+is the gate: at forty rows nobody notices an unmarked one.
+
+Approving does the `--cluster-admit` above, from inside the cluster, and lets the
+machine collect the key **exactly once** — the grant is spendable once, the same rule
+a compile lease follows, on a credential worth rather more:
+
+```sh
+fastcache-compile-node --scheduler=10.0.0.1:6675 --enroll-approve=n4
+```
+
+```sh
+fastcache-compile-node --scheduler=10.0.0.1:6675 --enroll-reject=n7
+```
+
+and when the expansion is done:
+
+```sh
+fastcache-compile-node --scheduler=10.0.0.1:6675 --enroll-close
+```
+
+Closing **forgets everything pending**. A request that was waiting is not held over
+to the next time somebody opens the window, because a list that survives its window
+is a machine approved weeks after anybody remembers asking for it.
+
+**If a joiner never got its key, approve it again.** The key is handed over once per
+approval, so a reply lost on the wire leaves the machine with nothing and the node
+answering `enrollment-already-collected` to every retry. Running `--enroll-approve`
+on that same id re-arms exactly one more collection — one command, on the id you
+already approved, and both counters go on telling the truth: the hand-over tally
+rises a second time because the key genuinely leaves a second time.
+
+That is the cost of the key being spendable once, and it was chosen over the
+alternative. Serving it on every poll would spare the lost-reply case and would hand
+the fleet's key to anybody who can reach this port while a window is open and name an
+id that was approved — invisibly, because the tally would not move and the real
+joiner would still get its key on its next poll. The observed peer host cannot close
+that instead: [#242](https://github.com/LASTRADA-Software/fastcached/issues/242)
+settled that gating on it refuses the documented setup and stops only a third host.
+So the row shows both addresses, marks a decided row that polls with a different
+claim, and the *spend* is what carries the security property.
+
+**An open window says so, repeatedly.** The node logs a warning when the window
+opens and goes on logging it at an interval for as long as it is open, so a window
+left open is visible in the ordinary log rather than only to whoever thinks to ask.
+`fastcache_enrollment_windows_opened_total` is the series to alert on, and
+`--node-status` carries the window's state and the number waiting.
+
+**A request while the window is shut is refused and counted, not queued** — there is
+no state in which a stranger's request is remembered without an operator having
+opened the door first.
+
 ### Changing it while it runs
 
 The log carries the cluster's configuration so it can be changed without editing a
@@ -2176,6 +2269,26 @@ is wrong until the leader goes, and then the cluster cannot re-elect. The second
 worth writing is the whole fleet disagreeing about
 `fastcache_node_consensus_leader{leader=...}` for longer than an election takes.
 
+### The enrollment window
+
+Two counters, both of them **events** rather than readings, so they belong here and
+not in the gauge table above. What a window *is* — open or shut, and how many
+machines are waiting in it — is reported by `--node-status` and by the window's own
+repeating warning, because that is a state and a counter cannot carry one.
+
+| Series | Says |
+|---|---|
+| `fastcache_enrollment_windows_opened_total` | An operator opened the window. **This is the series to alert on**, and the alert is that it moved at all outside a planned expansion: an open window is the one interval in which an unknown machine can ask this cluster for its key. A rise with no change window is somebody opening a door, and the rate matters less than the fact. |
+| `fastcache_enrollment_keys_handed_over_total` | An approved joiner collected the cluster key. Bounded by the number of machines an operator approved, so it should equal the size of the expansion and stop. It rising while `fastcache_enrollment_windows_opened_total` is flat is an approval collected late, which is ordinary; it rising past the number of machines anybody approved is not, and the pending list names who. |
+
+Both are rendered by **every** node, consensus or not, and read zero on a machine
+that has no window at all. That is deliberate and is this project's rule rather than
+an oversight: a counter is a tally, so zero is the truth about events that never
+happened, and absence is modelled in the *snapshot* rather than by dropping a row.
+Which of the two a zero means is answered by `--node-status`, whose enrollment field
+is **absent** on a node that runs no consensus and `closed` on one that does — the
+distinction a counter cannot carry, kept where it can be.
+
 ### What a refused connection looks like
 
 These are what a probe of that port looks like from outside the machine. They are
@@ -2216,6 +2329,12 @@ byte-budget refusal that fires in practice is a cache `STORE`.
 | `fastcache_node_cache_requests_refused_unsupported_version_total` | A cache request at a wire version this build cannot decode — a client from another release. Worth alerting on because the launcher steps over it and compiles locally, so the only other symptom is a cache that looks permanently cold. | cache verbs |
 | `fastcache_node_cache_requests_refused_malformed_payload_total` | A `FETCH` or `STORE` body that would not decode, in a frame whose declared length arrived in full. Two ends that agree on the framing and disagree about what goes inside it. | cache verbs |
 | `fastcache_node_cache_requests_refused_foreign_generation_total` | A `STORE` whose value names a canonicalization generation this build does not implement — the value-format twin of the unsupported-version row above, and the same operator action: find the machine that is out of step. Answered `foreign-value-generation`, never `malformed-value`: the value is well formed and the fleet is mid-upgrade, so reading it as a damaged cache is the one wrong move. Flat at zero unless the fleet spans a `CompileValueVersion` bump, so any rise is a real event. It is also the only view of what refusing costs, since the launcher reports a miss and compiles locally. | cache verbs |
+| `fastcache_enrollment_requests_refused_closed_total` | An `ENROLL` arrived while the window was shut. **This is the only series that sees a stranger asking**, and it is the one refusal here that is reachable pre-auth, so it doubles as the probe counter for that verb. A slow trickle is a joiner that was started before anybody opened the window and is polling; a burst from addresses nobody recognises is a scan, and the peer host is in the node's log beside it. | `ENROLL` |
+| `fastcache_enrollment_requests_refused_full_total` | The pending list already held every entry it will. Separate from the row above because the operator actions are opposite: *closed* means open the window, *full* means go and decide about the machines already in it. A fleet expansion larger than the list is the honest cause; anything else is a list nobody is draining. | `ENROLL` |
+| `fastcache_enrollment_requests_refused_malformed_total` | An `ENROLL` payload that would not decode, or one naming no id or no address. Flat at zero against this project's own client, so a rise is another implementation or a probe shaped like one. | `ENROLL` |
+| `fastcache_enrollment_control_refused_not_a_member_total` | An `ENROLL-CONTROL` from a host this node does not admit. The decision half of the family is the one that hands over the key, so it is gated twice — membership here, and `AUTH` in the row below — and this counter is the outer gate reporting. | `ENROLL-CONTROL` |
+| `fastcache_enrollment_requests_refused_already_collected_total` | An `ENROLL` naming an id whose key has already been collected. Refused with **no key bytes served** — the grant is spendable once. A healthy enrolment produces none of these, because a joiner that collects the key writes it and exits, so this is not a second spelling of the hand-over tally: that one says the key left, this one says somebody asked after it had left. Two causes and the rate separates them — one is a joiner whose reply was lost, a run of them is somebody answering to an id an operator approved. Both are fixed by `--enroll-approve` on that id, which re-arms exactly one more collection. | `ENROLL` |
+| `fastcache_enrollment_control_refused_unauthenticated_total` | An `ENROLL-CONTROL` from an admitted host that never presented a credential. Counted apart from the row above — and answered `unauthenticated` where that one answers `not-a-member` — because those are different machines with opposite remedies: one is a host to add to the membership policy, the other a host that is already trusted and whose operator tool is missing its token. A single "refused" tally would make the two indistinguishable at exactly the moment somebody is trying to work out why an approval will not go through. | `ENROLL-CONTROL` |
 
 ### Deciding whether a new refusal gets a counter
 

@@ -334,6 +334,76 @@ TEST_CASE("`node` omits the scheduler fields entirely on a node that runs none",
     CHECK(CellOf(answer, "leader") == nullptr);
 }
 
+TEST_CASE("`node` renders the enrollment window, and says nothing where there is none", "[cli][node][verbs]")
+{
+    // **The field an operator is TOLD to read to find a window they left open.** The
+    // node encoded it and the wire carried it, and no renderer anywhere consumed
+    // either cell -- so `--node-status` reported nothing about the one state in which
+    // this machine hands its cluster's key to a stranger that asked and was approved.
+    //
+    // And the third section is the one that matters, because this field exists to
+    // carry a distinction the counters cannot. Both enrollment series are rendered by
+    // every node and read zero on a machine that has no window at all, so *no window
+    // here* and *a window nothing has come through* are the same number. ABSENT
+    // against `closed` is where those part company, which is why a case asserting only
+    // the open reading would leave the field's whole purpose untested.
+    SECTION("an open window names itself and says how many are waiting")
+    {
+        ScriptedNodeExchange node { { StatusReply(
+            { .version = "1.2.3",
+              .nodeId = "node-a",
+              .uptimeSeconds = 90,
+              .surfaces = {},
+              .components = Cc::NodeComponentBit::Scheduler | Cc::NodeComponentBit::Consensus,
+              .runtime = { .schedulerRole = Cc::WireSchedulerRole::Leader,
+                           .enrollment = Cc::WireEnrollmentState::Open,
+                           .enrollmentPending = 3 } }) } };
+
+        auto const answer = RunNodeVerb("node", node);
+        CHECK(answer.outcome == Outcome::Affirmative);
+        CHECK(RequiredCell(answer, "enrollment").lexical == "open");
+        CHECK(RequiredCell(answer, "enrollment-pending").lexical == "3");
+        CHECK(RequiredCell(answer, "enrollment-pending").kind == CellKind::Number);
+    }
+
+    SECTION("a shut window on a node that HAS one is reported shut, not omitted")
+    {
+        ScriptedNodeExchange node { { StatusReply(
+            { .version = "1.2.3",
+              .nodeId = "node-a",
+              .uptimeSeconds = 90,
+              .surfaces = {},
+              .components = Cc::NodeComponentBit::Scheduler | Cc::NodeComponentBit::Consensus,
+              .runtime = { .schedulerRole = Cc::WireSchedulerRole::Leader,
+                           .enrollment = Cc::WireEnrollmentState::Closed,
+                           .enrollmentPending = 0 } }) } };
+
+        auto const answer = RunNodeVerb("node", node);
+        CHECK(RequiredCell(answer, "enrollment").lexical == "closed");
+
+        // Zero pending is a READING on a node that has a window, so it is a number
+        // rather than a missing field -- the counters' zero is what cannot say this.
+        CHECK(RequiredCell(answer, "enrollment-pending").lexical == "0");
+    }
+
+    SECTION("a node that runs no consensus says NOTHING rather than a reassuring closed")
+    {
+        ScriptedNodeExchange node { { StatusReply({ .version = "1.2.3",
+                                                    .nodeId = "node-a",
+                                                    .uptimeSeconds = 5,
+                                                    .surfaces = {},
+                                                    .components = Cc::NodeComponentBit::Worker,
+                                                    .runtime = { .toolchains = Cc::ToolchainState::Serving,
+                                                                 .toolchainsServed = 1,
+                                                                 .toolchainsDiscovered = 1 } }) } };
+
+        auto const answer = RunNodeVerb("node", node);
+        CHECK(answer.outcome == Outcome::Affirmative);
+        CHECK(CellOf(answer, "enrollment") == nullptr);
+        CHECK(CellOf(answer, "enrollment-pending") == nullptr);
+    }
+}
+
 TEST_CASE("`node` reports a component bit this client has no name for", "[cli][node][verbs]")
 {
     // An older client meeting a newer node must say *there is something here I do not
