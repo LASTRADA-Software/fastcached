@@ -1072,6 +1072,118 @@ class IMetricsSink
         /// `WatchPeer` keeps those two arms apart for exactly this reason.
         FramePeerWatchDeparturesAbortive,
 
+        /// ENROLL requests refused because this node runs no window right now.
+        ///
+        /// **The only pre-auth refusal series this protocol has, and the reason
+        /// `Op::Enroll` is counted at all.** Every other verb requires a credential, so a
+        /// stranger reaching for one is already visible as an authentication refusal.
+        /// This verb is deliberately reachable by anybody who can route to the port, and
+        /// the window is closed except for the minutes an operator spends admitting
+        /// machines -- so a rise here with nobody at a terminal is somebody trying the
+        /// door, and it is the only place that shows.
+        ///
+        /// Zero on a node that nobody has probed, which is the common case and is not
+        /// evidence the refusal works. What says the mechanism is live is
+        /// `EnrollmentWindowsOpened` beside it: a fleet that has enrolled machines has
+        /// moved that one.
+        EnrollmentRequestsRefusedClosed,
+
+        /// ENROLL requests refused because the pending list was full, so nothing was
+        /// recorded.
+        ///
+        /// **Not a capacity problem and never summed with `EndpointBusy`'s series.** The
+        /// window is ungated by decision -- the explicit approve is the gate -- so
+        /// anybody who can reach an open window can fill the list, and the bound refuses
+        /// rather than evicting precisely so that a flooder cannot push the real joiner
+        /// off the list an operator is reading. A rise is therefore one of exactly two
+        /// things: a rollout larger than the bound, which an operator fixes by approving
+        /// in batches, or somebody filling it on purpose while a window is open. Both are
+        /// worth an operator's attention within the minute, which no other series here
+        /// can claim.
+        EnrollmentRequestsRefusedFull,
+
+        /// ENROLL payloads that arrived in full and would not decode.
+        ///
+        /// Its own series rather than any other malformed-frame counter, which describe a
+        /// truncated compile frame, an undecodable compile payload, two AUTH payloads and
+        /// the cache tier's bodies. This one is the pre-auth surface's, and that is what
+        /// makes it read differently: a client of this tree sends two length-prefixed
+        /// fields, so a body that splits into anything else came from no version of this
+        /// software, and the peer had presented nothing when it sent it.
+        EnrollmentRequestsRefusedMalformed,
+
+        /// ENROLL-CONTROL requests refused because the caller is not a fleet member.
+        ///
+        /// **Somebody trying to approve themselves.** The window admits strangers by
+        /// design and the approval is what it withholds, so this is the refusal that
+        /// carries the whole security argument for the pair -- a peer that reaches this
+        /// has found an open window and gone on to ask for the decision as well. Not
+        /// ordinary on any deployment: an operator running the verb is either listed or
+        /// is being told to be.
+        ///
+        /// Never summed with `NodeStatusRequestsRefusedNotAMember`, which shares the wire
+        /// code and describes somebody asking a node what it is.
+        EnrollmentControlRefusedNotAMember,
+
+        /// ENROLL-CONTROL requests refused because the connection presented no accepted
+        /// credential.
+        ///
+        /// The third of three outcomes a caller can reach on this verb, and separate from
+        /// the two above for the reason the scheduler's three are separate: a peer that
+        /// never authenticated is a misconfigured operator, one whose token was rejected
+        /// is on the scheduler's own credential series, and a non-member that
+        /// authenticated correctly is the row above. Folded, the one that means somebody
+        /// is probing sits under the one that means somebody typo'd a path.
+        ///
+        /// Zero while no `--scheduler-token-file` is set, because there is then nothing to
+        /// fail -- so zero here does not mean the verb is protected, it means membership
+        /// is the only gate on it.
+        EnrollmentControlRefusedUnauthenticated,
+
+        /// Enrollment windows opened on this node.
+        ///
+        /// **An audit trail, and the only durable one.** The window lives in memory and a
+        /// restart closes it, the warning it emits reaches only whoever reads this node's
+        /// log, and the open STATE is a snapshot field that says nothing about how often
+        /// it has been open. This is what a scrape can alert on: any rise is a minute in
+        /// which this machine would have handed the cluster key to a stranger that asked
+        /// and was approved.
+        ///
+        /// A tally rather than a gauge, which is what keeps it and the snapshot from
+        /// being two spellings of one fact: this counts events and zero is the truth
+        /// about a node whose window has never been opened.
+        EnrollmentWindowsOpened,
+
+        /// Cluster keys handed to an approved joiner.
+        ///
+        /// **The event the whole feature exists to perform, and the one worth alerting
+        /// on.** Each rise is the fleet's pre-shared key crossing the network in
+        /// cleartext to one machine a person approved by name. During a rollout it rises
+        /// once per machine and stops; afterwards it should never rise again, so a single
+        /// increment on a settled fleet is either an operator adding a machine or the
+        /// event this counter exists for.
+        ///
+        /// Read beside `EnrollmentWindowsOpened`: hand-overs without an open is
+        /// impossible and would be a bug report, and opens without hand-overs is the
+        /// ordinary shape of a window somebody opened and closed again.
+        EnrollmentKeysHandedOver,
+
+        /// An `ENROLL` naming an id whose key has already been collected. Refused, and
+        /// no key bytes were served.
+        ///
+        /// **This is the counter for the spend, and a healthy enrolment produces
+        /// exactly none of them** -- a joiner that collects successfully writes the key
+        /// and exits, so there is no honest second poll. It is not the same fact as
+        /// `EnrollmentKeysHandedOver`, and the difference is the whole point: that one
+        /// says the key left, this one says somebody asked for it after it had already
+        /// left, and only one of the two can be read as an attempt.
+        ///
+        /// Two causes, named rather than guessed between, with the RATE separating
+        /// them: one is a joiner whose reply was lost, retrying; a run of them is
+        /// somebody answering to an id an operator approved. Both are refused and both
+        /// are fixed by one operator approving the machine again.
+        EnrollmentRequestsRefusedAlreadyCollected,
+
         Last,
     };
 

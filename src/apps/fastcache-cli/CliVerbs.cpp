@@ -957,6 +957,23 @@ namespace
         return "unknown";
     }
 
+    /// What to call one enrollment-window state.
+    /// @param state The wire tag.
+    /// @return A stable lower-case name.
+    [[nodiscard]] std::string_view NameOfEnrollmentState(CompileCacheWire::WireEnrollmentState state) noexcept
+    {
+        switch (state)
+        {
+            case CompileCacheWire::WireEnrollmentState::Closed:
+                return "closed";
+            case CompileCacheWire::WireEnrollmentState::Open:
+                return "open";
+        }
+        // Unreachable for `NameOfSchedulerRole`'s reason: `DecodeNodeRuntime` leaves a
+        // state this build has no name for disengaged rather than passing it through.
+        return "unknown";
+    }
+
     /// Add an optional unsigned field, or nothing at all when the node did not say.
     ///
     /// **A helper rather than four copies of the same `if`.** Each of these is a fact a
@@ -1043,6 +1060,29 @@ namespace
             record.push_back(
                 { .name = "leader",
                   .value = fields.runtime.leaderEndpoint.empty() ? AbsentCell() : TextCell(fields.runtime.leaderEndpoint) });
+        }
+
+        // **The window an operator needs to know they left open.** The node encodes
+        // these two and the wire carries them; until now nothing rendered either, so
+        // the one place an operator is told to look reported nothing at all -- filled,
+        // carried and drawn nowhere, which is the wiring this project asserts rather
+        // than assumes.
+        //
+        // It is also what the counters cannot say. Both enrollment series are rendered
+        // by every node and read zero on a machine that has no window, because a
+        // counter is a tally and zero is the truth about events that never happened --
+        // so *no window here* and *a window that nothing has come through* are one
+        // number, and this field is where that distinction is kept.
+        //
+        // ABSENT is the whole point of the shape: a node running no consensus says
+        // nothing, exactly as the toolchain trio does, rather than reporting a
+        // reassuring `closed` for a window that does not exist. Both cells or neither,
+        // since a state with no count invites the reading that nobody is waiting.
+        if (fields.runtime.enrollment.has_value())
+        {
+            record.push_back({ .name = "enrollment",
+                               .value = TextCell(std::string { NameOfEnrollmentState(*fields.runtime.enrollment) }) });
+            AddOptionalNumber(record, "enrollment-pending", fields.runtime.enrollmentPending);
         }
 
         // One field per surface the node actually opened. A surface it does not run gets

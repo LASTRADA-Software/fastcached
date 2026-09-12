@@ -13,6 +13,7 @@
 #include <FastCache/Config/SecretProvenance.hpp>
 #include <FastCache/Core/Errors/ConfigError.hpp>
 #include <FastCache/Core/HostPort.hpp>
+#include <FastCache/Core/Utf8.hpp>
 
 #include <algorithm>
 #include <array>
@@ -152,6 +153,58 @@ namespace
             return std::unexpected(
                 ArgvError(ConfigErrorCode::OutOfRange, "drain-timeout", std::format("not a number of seconds: {}", sv)));
         return value;
+    }
+
+    /// An applier for a flag that names an enrollment action, and its operand when it
+    /// takes one.
+    ///
+    /// The same shape as `SelectClusterAction` below and for the same reason: one flag
+    /// sets both the action and its operand, and a row using `SelectOutcome` alone would
+    /// leave the operand to a second row nobody would remember to add. Which verbs take
+    /// a subject is a COMPILE-TIME branch, so a row whose arity and whose applier
+    /// disagreed would not build.
+    ///
+    /// The subject goes through `ParseUtf8Text`'s rule rather than `ParseText`'s,
+    /// deliberately and unlike `--cluster-forget`: this id is what the leader COMMITS
+    /// through `ClusterAdmit`, so it is copied into every peer's `ClusterState` and
+    /// rendered into `/fleet.json`, where one byte that is not text makes that document
+    /// unparseable for the whole fleet. `--cluster-forget` is out of the gate because
+    /// its operand is the OFFENDING id and refusing it would make a bad member
+    /// unremovable; here the operand names a machine that is not a member yet, so
+    /// refusing it removes nothing and stops the fleet from acquiring the problem.
+    /// @return The applier, usable as an OptionSpec::apply in a `constexpr` table.
+    template <EnrollAction Action>
+    [[nodiscard]] constexpr auto SelectEnrollAction() noexcept
+    {
+        return [](auto& result, std::string_view value) -> std::expected<void, ConfigError> {
+            auto& request = TargetOf<&NodeConfig::enroll>(result);
+            request.action = Action;
+
+            if constexpr (Action == EnrollAction::Approve || Action == EnrollAction::Reject)
+            {
+                if (value.empty())
+                    return std::unexpected(ArgvError(ConfigErrorCode::ParseError, {}, "names no machine"));
+                if (!IsValidUtf8(value))
+                    return std::unexpected(ArgvError(ConfigErrorCode::ParseError, {}, "is not valid UTF-8"));
+                request.subject = std::string { value };
+            }
+            else
+            {
+                // **Cleared, because last-flag-wins has to move BOTH halves.** These
+                // flags are one-shot verbs that overwrite each other, so
+                // `--enroll-approve=n4 --enroll-open` must mean `Open`. Leaving the
+                // subject behind sent `EnrollControl(Open, "n4")`, which the decoder
+                // refuses on its arity rule -- `EnrollControlNamesSubject(Open)` is
+                // false while the subject is non-empty -- and the operator was answered
+                // *a control frame this build cannot read*: a VERSION-MISMATCH sentence
+                // for a flag-combination mistake, which sends somebody comparing builds
+                // across the fleet. The action and its operand are one decision and are
+                // reset together.
+                request.subject.clear();
+            }
+
+            return {};
+        };
     }
 
     /// An applier for a flag that names a cluster action AND carries its operand.
@@ -1398,6 +1451,64 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
                          "them. Pass the flags you would run with: it\n"
                          "prints what THIS configuration serves, not the\n"
                          "defaults." },
+        {
+            .primary = "--enroll-from",
+            .arity = Arity::Value,
+            .operand = "=<host:port>",
+            .apply = AssignFrom<&NodeConfig::enrollFrom, ParseText>(),
+            .description = "ask the node at this address to admit this machine to\n"
+                           "its cluster, then exit. Opens no port. Mints this\n"
+                           "node's identity into --cluster-dir, asks, waits for an\n"
+                           "operator there to approve it, and writes the cluster\n"
+                           "key it is handed to --cluster-key-file. The key\n"
+                           "crosses in CLEARTEXT: this wire has no TLS, and what\n"
+                           "that key buys is admission to the fleet. Run it on a\n"
+                           "trusted segment, at a moment somebody is watching.",
+        },
+        { .primary = "--enroll-open",
+          .arity = Arity::None,
+          .apply = SelectEnrollAction<EnrollAction::Open>(),
+          .description = "open an enrollment window on the cluster at\n"
+                         "--scheduler, then exit. While it is open ANY machine\n"
+                         "that can reach that node may ask to join, and\n"
+                         "approving one hands it this cluster's key in\n"
+                         "cleartext. The window is held in memory: a restart\n"
+                         "closes it, and so does --enroll-close." },
+        { .primary = "--enroll-close",
+          .arity = Arity::None,
+          .apply = SelectEnrollAction<EnrollAction::Close>(),
+          .description = "close the enrollment window and forget everything\n"
+                         "waiting at it, then exit. A request made while\n"
+                         "nobody was watching must not be approvable after\n"
+                         "they stopped, so the list goes with the window." },
+        { .primary = "--enroll-list",
+          .arity = Arity::None,
+          .apply = SelectEnrollAction<EnrollAction::List>(),
+          .description = "print what is waiting at the enrollment window and\n"
+                         "exit. Shows each machine's claimed address AND the\n"
+                         "host it actually came from, and marks a\n"
+                         "disagreement -- it does not refuse one, because DNS,\n"
+                         "NAT and multi-homing all produce it legitimately." },
+        { .primary = "--enroll-approve",
+          .arity = Arity::Value,
+          .operand = "=<node-id>",
+          .apply = SelectEnrollAction<EnrollAction::Approve>(),
+          .description = "admit the named machine to the cluster and let it\n"
+                         "collect the cluster key, then exit. Take the id from\n"
+                         "--enroll-list and check the two addresses beside it\n"
+                         "first: this is the moment the fleet's key leaves\n"
+                         "this cluster." },
+        { .primary = "--enroll-reject",
+          .arity = Arity::Value,
+          .operand = "=<node-id>",
+          .apply = SelectEnrollAction<EnrollAction::Reject>(),
+          .description = "refuse the named machine, then exit. It is told so\n"
+                         "and stops asking. A machine still WAITING was never\n"
+                         "committed to the cluster and needs no\n"
+                         "--cluster-forget. One already approved is a\n"
+                         "different matter: the approval committed it, so this\n"
+                         "stops it being handed the key but does NOT remove\n"
+                         "it, and --cluster-forget is what does." },
         { .primary = "--version",
           .arity = Arity::None,
           .apply = SetTrue<&NodeConfig::version>(),
@@ -1447,6 +1558,16 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
         { "--cluster-set", "changes a running cluster's settings and exits" },
         { "--cluster-admit", "admits a member and exits" },
         { "--cluster-forget", "removes a member and exits" },
+        { "--enroll-from",
+          "asks a seed to admit this machine and exits; a key would re-ask at every start, on a "
+          "machine that is already a member" },
+        { "--enroll-open",
+          "opens a window a stranger can be handed the cluster key through, and exits; a key would "
+          "re-open it at every start, which is a window nobody ever closes" },
+        { "--enroll-close", "closes the window and exits" },
+        { "--enroll-list", "prints what is waiting and exits" },
+        { "--enroll-approve", "admits one machine and exits; a key would re-admit it at every start" },
+        { "--enroll-reject", "refuses one machine and exits" },
         { "--help", "prints usage and exits" },
         { "--version", "prints the version and exits" },
     });
@@ -2116,6 +2237,14 @@ bool RunsConsensus(NodeConfig const& cfg) noexcept
     // of the surface row rather than of `cfg.raftListen`, so this and
     // `--print-surfaces` cannot disagree about whether the port is served.
     return !RowFor(NodeSurface::Raft).Resolve(cfg).empty();
+}
+
+bool EnrollmentConfigured(NodeConfig const& cfg) noexcept
+{
+    // `RunsConsensus` rather than `raftListen`, so this inherits the surface-row
+    // answer and cannot disagree with `--print-surfaces` about whether there is a
+    // cluster here at all.
+    return RunsConsensus(cfg) && !cfg.clusterKeyFile.empty();
 }
 
 std::string RaftSelfEndpoint(NodeConfig const& cfg)
@@ -2790,6 +2919,36 @@ std::vector<std::filesystem::path> NodeSecretFiles(NodeConfig const& cfg,
     return files;
 }
 
+namespace
+{
+    /// The value of a scalar dialled-address flag when it is not an address to dial.
+    ///
+    /// **One helper rather than three lambdas differing only in which member they
+    /// read.** `--scheduler`, `--upstream` and `--enroll-from` all ask the identical
+    /// question, and they asked it in three copy-pasted bodies inside
+    /// `StartupPolicyRejection` -- branches diverging by a name, which this codebase
+    /// treats as a defect on its own. It also cost that function real
+    /// cognitive-complexity budget: three lambdas, each with a branch and a
+    /// short-circuit, counted against a threshold the enrollment window's rows pushed
+    /// it over.
+    ///
+    /// `--fleet-member` keeps a body of its own and is not folded in, deliberately: it
+    /// is a repeatable LIST and it asks a different question (an EMPTY element, not a
+    /// malformed one), because a bare host is legal there and refusing it would break
+    /// the documented setup.
+    /// @tparam Field The `NodeConfig` member holding the typed value.
+    /// @param cfg The parsed configuration.
+    /// @return The offending value, or nothing when it is empty or well formed.
+    template <auto Field>
+    [[nodiscard]] std::optional<std::string> NotAnAddressToDial(NodeConfig const& cfg)
+    {
+        auto const& value = cfg.*Field;
+        if (value.empty() || ParseDialEndpoint(value).has_value())
+            return std::nullopt;
+        return value;
+    }
+} // namespace
+
 std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
 {
     // The value each listen flag takes, judged here rather than inside the tier that
@@ -2913,18 +3072,13 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
 
     constexpr auto DialledAddresses = std::to_array<DialledAddress>({
         { .flag = "--scheduler",
-          .offender = [](NodeConfig const& c) -> std::optional<std::string> {
-              if (c.scheduler.empty() || ParseDialEndpoint(c.scheduler).has_value())
-                  return std::nullopt;
-              return c.scheduler;
-          },
+          .offender = &NotAnAddressToDial<&NodeConfig::scheduler>,
           .shape = "an address to dial, as <host>:<port>" },
         { .flag = "--upstream",
-          .offender = [](NodeConfig const& c) -> std::optional<std::string> {
-              if (c.upstream.empty() || ParseDialEndpoint(c.upstream).has_value())
-                  return std::nullopt;
-              return c.upstream;
-          },
+          .offender = &NotAnAddressToDial<&NodeConfig::upstream>,
+          .shape = "an address to dial, as <host>:<port>" },
+        { .flag = "--enroll-from",
+          .offender = &NotAnAddressToDial<&NodeConfig::enrollFrom>,
           .shape = "an address to dial, as <host>:<port>" },
         { .flag = "--fleet-member",
           .offender = [](NodeConfig const& c) -> std::optional<std::string> {

@@ -499,8 +499,20 @@ TEST_CASE("Exactly the verbs meant to be reachable before AUTH are reachable")
     CHECK_FALSE(IsPreAuthAllowed(static_cast<std::uint8_t>(Op::Fetch)));
     CHECK_FALSE(IsPreAuthAllowed(static_cast<std::uint8_t>(Op::Store)));
 
+    // `Op::Enroll` is the SECOND pre-auth verb this wire has ever had, and this case
+    // firing is what made that a reviewed decision rather than a column nobody read: a
+    // joiner has no credential by construction -- the key is what it is asking for --
+    // so the verb that asks for one cannot require the thing it is asking for. Its
+    // decision half, `Op::EnrollControl`, stays behind AUTH and is asserted so beside
+    // the family's own cases, because opening a family rather than a verb is the one
+    // mistake that split exists to prevent.
+    CHECK(IsPreAuthAllowed(static_cast<std::uint8_t>(Op::Enroll)));
+    CHECK_FALSE(IsPreAuthAllowed(static_cast<std::uint8_t>(Op::EnrollControl)));
+
+    // The COUNT lives here and nowhere else, so a third verb arriving reddens exactly
+    // one case rather than being argued about in two.
     auto const openVerbs = std::ranges::count_if(OpTable, [](auto const& row) { return row.preAuth.Allowed(); });
-    CHECK(openVerbs == 1);
+    CHECK(openVerbs == 2);
 }
 
 TEST_CASE("An unknown opcode is never reachable before AUTH")
@@ -1693,4 +1705,329 @@ TEST_CASE("A receipt carries the bytes it was given, not a tidied version of the
     auto const back = DecodeClusterAdmitReceipt(EncodeClusterAdmitReceipt(odd));
     REQUIRE(back.has_value());
     CHECK(Unwrap(back) == odd);
+}
+
+TEST_CASE("The enrollment verbs occupy the bytes they were assigned, and the bytes are what travels", "[wire][enrollment]")
+{
+    // **The VALUE, not the name.** A symbol both ends spell can only test the first of
+    // the two facts a wire constant has; change the enumerator consistently and every
+    // in-tree test still agrees while every deployed peer breaks. These bytes were
+    // picked because nothing had claimed them, which is a statement about the wire
+    // rather than about this build's vocabulary.
+    CHECK(static_cast<std::uint8_t>(Op::Enroll) == 0x10);
+    CHECK(static_cast<std::uint8_t>(Op::EnrollControl) == 0x11);
+    CHECK(static_cast<std::uint8_t>(ErrorCode::EnrollmentClosed) == 0x22);
+    CHECK(static_cast<std::uint8_t>(ErrorCode::EnrollmentFull) == 0x23);
+
+    // And nothing else answers to them, which a pair of equality checks does not cover:
+    // a second row claiming one of these bytes would leave every assertion above true.
+    CHECK(std::ranges::count(OpTable, Op::Enroll, &OpDescriptor::code) == 1);
+    CHECK(std::ranges::count(OpTable, Op::EnrollControl, &OpDescriptor::code) == 1);
+    CHECK(std::ranges::count(ErrorTable, ErrorCode::EnrollmentClosed, &ErrorDescriptor::code) == 1);
+    CHECK(std::ranges::count(ErrorTable, ErrorCode::EnrollmentFull, &ErrorDescriptor::code) == 1);
+}
+
+TEST_CASE("Enrollment is its own verb family, and only the joiner's half is reachable before auth", "[wire][enrollment]")
+{
+    CHECK(FamilyOf(static_cast<std::uint8_t>(Op::Enroll)) == VerbFamily::Enrollment);
+    CHECK(FamilyOf(static_cast<std::uint8_t>(Op::EnrollControl)) == VerbFamily::Enrollment);
+
+    // **The asymmetry IS the design.** A case asserting only that `Enroll` is pre-auth
+    // would pass under a build that opened the whole family, which is the one mistake
+    // this split exists to prevent: the decision verb hands a stranger the fleet's key.
+    CHECK(IsPreAuthAllowed(static_cast<std::uint8_t>(Op::Enroll)));
+    CHECK_FALSE(IsPreAuthAllowed(static_cast<std::uint8_t>(Op::EnrollControl)));
+
+    // The COUNT of pre-auth rows is deliberately NOT re-asserted here. It already lives
+    // in "Exactly the verbs meant to be reachable before AUTH are reachable", and two
+    // cases asserting one number is two things to be wrong rather than a cross-check --
+    // a third pre-auth verb should redden one case naming the set, not two arguing
+    // about it. What is this case's own is the ASYMMETRY: the family is split down the
+    // middle and both halves are named.
+
+    // The pre-auth one is bounded far under the control cap, because the two are
+    // bounded against different populations: a peer that authenticated once, and
+    // anybody who can route to the port.
+    CHECK(OpPayloadCap(static_cast<std::uint8_t>(Op::Enroll), MaxFramePayload) == MaxEnrollPayload);
+    CHECK(OpPayloadCap(static_cast<std::uint8_t>(Op::EnrollControl), MaxFramePayload) == MaxControlPayload);
+}
+
+TEST_CASE("An enroll request round-trips, and a payload of the wrong arity is refused", "[wire][enrollment]")
+{
+    auto const frame = EncodeEnroll(EnrollRequest { .nodeId = "joiner-a", .raftEndpoint = "10.0.0.9:7100" });
+    auto const header = DecodeRequestHeader(frame);
+    REQUIRE(header.has_value());
+    CHECK(Unwrap(header).opRaw == static_cast<std::uint8_t>(Op::Enroll));
+
+    auto const fields = DecodeEnrollPayload(std::span<std::byte const> { frame }.subspan(RequestHeaderSize));
+    REQUIRE(fields.has_value());
+    CHECK(AsStringView(Unwrap(fields).nodeId) == "joiner-a");
+    CHECK(AsStringView(Unwrap(fields).raftEndpoint) == "10.0.0.9:7100");
+
+    // One field where two are declared: refused on the count alone, which is what keeps
+    // a peer speaking a shape this build does not know from being read as a short one.
+    CHECK_FALSE(DecodeEnrollPayload(WireFields::Encode({ AsBytes(std::string_view { "joiner-a" }) })).has_value());
+}
+
+TEST_CASE("A pending enroll reply carries a zero-length key field rather than an absent one", "[wire][enrollment]")
+{
+    // **The property the reply's whole shape exists for.** A client asserts the LENGTH,
+    // because an outcome byte is equally correct in a healthy build and in one that
+    // leaked the key on `Pending` -- so the key travels as a field of its own and
+    // "there is none" is a length of zero rather than a convention.
+    //
+    // Every payload below is a NAMED local rather than a temporary, because
+    // `EnrollReplyView` borrows: `Decode(Encode(x))` is the obvious spelling and reads
+    // freed memory the moment the full expression ends. That is the rule the type is
+    // named `*View` to announce, and this file is where it gets tested rather than
+    // demonstrated -- the first draft of this case was written the obvious way and the
+    // key came back as thirteen bytes of rubble.
+    auto const pendingPayload = EncodeEnrollReply(EnrollOutcome::Pending, {});
+    auto const pending = DecodeEnrollReply(pendingPayload);
+    REQUIRE(pending.has_value());
+    CHECK(Unwrap(pending).outcome == EnrollOutcome::Pending);
+    CHECK(Unwrap(pending).clusterKey.empty());
+
+    auto const key = AsBytes(std::string_view { "a-cluster-key" });
+    auto const approvedPayload = EncodeEnrollReply(EnrollOutcome::Approved, key);
+    auto const approved = DecodeEnrollReply(approvedPayload);
+    REQUIRE(approved.has_value());
+    CHECK(Unwrap(approved).outcome == EnrollOutcome::Approved);
+    CHECK(AsStringView(Unwrap(approved).clusterKey) == "a-cluster-key");
+
+    // An outcome byte this build has no name for is REFUSED rather than skipped, which
+    // is the opposite of the rule for a surface tag one level up and is right here: a
+    // joiner that cannot tell approved from rejected has no safe default -- reading it
+    // as pending polls forever, reading it as approved takes a key out of a field that
+    // may hold anything.
+    auto const tag = std::array { std::byte { 0x7F } };
+    CHECK_FALSE(DecodeEnrollReply(WireFields::Encode({ std::span<std::byte const> { tag }, {} })).has_value());
+}
+
+TEST_CASE("An enroll-control request carries a subject exactly when its verb takes one", "[wire][enrollment]")
+{
+    // Named frames, for the reason the reply case above gives: `EnrollControlView`
+    // borrows its subject out of the bytes it was handed.
+    for (auto const verb: { EnrollControlVerb::Open, EnrollControlVerb::Close, EnrollControlVerb::List })
+    {
+        auto const frame = EncodeEnrollControl(verb);
+        auto const decoded = DecodeEnrollControlPayload(std::span<std::byte const> { frame }.subspan(RequestHeaderSize));
+        REQUIRE(decoded.has_value());
+        CHECK(Unwrap(decoded).verb == verb);
+        CHECK(Unwrap(decoded).subject.empty());
+    }
+
+    for (auto const verb: { EnrollControlVerb::Approve, EnrollControlVerb::Reject })
+    {
+        auto const frame = EncodeEnrollControl(verb, "joiner-a");
+        auto const decoded = DecodeEnrollControlPayload(std::span<std::byte const> { frame }.subspan(RequestHeaderSize));
+        REQUIRE(decoded.has_value());
+        CHECK(Unwrap(decoded).verb == verb);
+        CHECK(AsStringView(Unwrap(decoded).subject) == "joiner-a");
+    }
+
+    // **Both directions of the arity rule**, because each alone passes under a decoder
+    // that checks only the other: a `Close` naming an id, and an `Approve` naming
+    // nobody. Answering either by ignoring the mismatch is how an operator comes to
+    // believe they approved somebody.
+    CHECK_FALSE(DecodeEnrollControlPayload(
+                    std::span<std::byte const> { EncodeEnrollControl(EnrollControlVerb::Close, "joiner-a") }.subspan(
+                        RequestHeaderSize))
+                    .has_value());
+    CHECK_FALSE(
+        DecodeEnrollControlPayload(
+            std::span<std::byte const> { EncodeEnrollControl(EnrollControlVerb::Approve) }.subspan(RequestHeaderSize))
+            .has_value());
+
+    // A verb byte this build cannot name is refused rather than dispatched, so a
+    // surface never has to carry an arm for a verb it has no meaning for.
+    auto const unknown = std::array { std::byte { 0x7F } };
+    CHECK_FALSE(DecodeEnrollControlPayload(WireFields::Encode({ std::span<std::byte const> { unknown }, {} })).has_value());
+}
+
+TEST_CASE("An enrollment report round-trips every row, ages included", "[wire][enrollment]")
+{
+    EnrollmentReport const report { .state = WireEnrollmentState::Open,
+                                    .openForSeconds = 137,
+                                    .pending = { EnrollmentPendingEntry { .nodeId = "joiner-a",
+                                                                          .raftEndpoint = "10.0.0.9:7100",
+                                                                          .peerId = "10.0.0.9",
+                                                                          .firstSeenSecondsAgo = 90,
+                                                                          .attempts = 45,
+                                                                          .claimsChanged = 0,
+                                                                          .decision = EnrollmentDecision::Pending },
+                                                 EnrollmentPendingEntry { .nodeId = "joiner-b",
+                                                                          .raftEndpoint = "node-b.example:7100",
+                                                                          .peerId = "198.51.100.4",
+                                                                          .firstSeenSecondsAgo = 12,
+                                                                          .attempts = 6,
+                                                                          .claimsChanged = 3,
+                                                                          .decision = EnrollmentDecision::Collected } } };
+
+    auto const back = DecodeEnrollmentReport(EncodeEnrollmentReport(report));
+    REQUIRE(back.has_value());
+    CHECK(Unwrap(back).state == WireEnrollmentState::Open);
+    CHECK(Unwrap(back).openForSeconds == 137);
+    REQUIRE(Unwrap(back).pending.size() == 2);
+
+    // Every field of a row rather than a sample of them: these differ only by position
+    // in the nested record, so a transposed pair would leave any single assertion true.
+    // The two hosts particularly, since the whole point of the row is that a person
+    // compares them.
+    auto const& first = Unwrap(back).pending.front();
+    CHECK(first.nodeId == "joiner-a");
+    CHECK(first.raftEndpoint == "10.0.0.9:7100");
+    CHECK(first.peerId == "10.0.0.9");
+    CHECK(first.firstSeenSecondsAgo == 90);
+    CHECK(first.attempts == 45);
+    CHECK(first.claimsChanged == 0);
+    CHECK(first.decision == EnrollmentDecision::Pending);
+
+    // The second row differs from the first in every numeric field, so a transposition
+    // between the two u32s -- `attempts` and `claimsChanged` -- cannot pass by both
+    // happening to be zero. That pair is the one worth arranging against: they are the
+    // same width, adjacent in meaning, and the marks an operator reads sit on one of
+    // them.
+    auto const& second = Unwrap(back).pending.back();
+    CHECK(second.attempts == 6);
+    CHECK(second.claimsChanged == 3);
+    CHECK(second.decision == EnrollmentDecision::Collected);
+
+    // A closed window with nothing waiting is a real reading rather than an empty
+    // message, and round-trips as one.
+    auto const shut = DecodeEnrollmentReport(EncodeEnrollmentReport(EnrollmentReport {}));
+    REQUIRE(shut.has_value());
+    CHECK(Unwrap(shut).state == WireEnrollmentState::Closed);
+    CHECK(Unwrap(shut).pending.empty());
+}
+
+TEST_CASE("A pending row from a build that records one fewer fact is read for what it does say", "[wire][enrollment]")
+{
+    // **The row's own variable arity, which its header claimed before it had it.** The
+    // reader was exact at six fields until `claimsChanged` became the first fact added
+    // to a row, so "a fact added to one of these rows must not move the reply's arity"
+    // was true of the REPLY and false of the ROW. This is the half that makes it true.
+    //
+    // Both directions, because a decoder tolerant in one of them still leaves a fleet
+    // mid-upgrade unable to read a neighbour.
+    EnrollmentReport const report { .state = WireEnrollmentState::Open,
+                                    .openForSeconds = 5,
+                                    .pending = { EnrollmentPendingEntry { .nodeId = "joiner-a",
+                                                                          .raftEndpoint = "10.0.0.9:7100",
+                                                                          .peerId = "10.0.0.9",
+                                                                          .firstSeenSecondsAgo = 1,
+                                                                          .attempts = 2,
+                                                                          .claimsChanged = 7,
+                                                                          .decision = EnrollmentDecision::Pending } } };
+
+    auto const encoded = EncodeEnrollmentReport(report);
+    auto const outer = WireFields::SplitAll(encoded);
+    REQUIRE(outer.has_value());
+    REQUIRE(Unwrap(outer).size() == 3);
+    auto const rows = WireFields::SplitAll(Unwrap(outer)[2]);
+    REQUIRE(rows.has_value());
+    REQUIRE(Unwrap(rows).size() == 1);
+    auto const parts = WireFields::SplitAll(Unwrap(rows).front());
+    REQUIRE(parts.has_value());
+    REQUIRE(Unwrap(parts).size() == 7);
+
+    // Rebuilt with the six fields a pre-`claimsChanged` build emitted. Absent is ZERO
+    // here and that is honest rather than a shortcut: the field is a tally, and a sender
+    // too old to keep it observed no changed claim it could have reported.
+    auto const older = std::vector<std::span<std::byte const>> { Unwrap(parts).begin(), Unwrap(parts).begin() + 6 };
+    auto const olderRow = WireFields::Encode(WireFields::FieldList { older });
+    auto const olderRows = std::array { std::span<std::byte const> { olderRow } };
+    auto const olderPacked = WireFields::Encode(WireFields::FieldList { olderRows });
+    auto const olderBack = DecodeEnrollmentReport(
+        WireFields::Encode({ Unwrap(outer)[0], Unwrap(outer)[1], std::span<std::byte const> { olderPacked } }));
+    REQUIRE(olderBack.has_value());
+    REQUIRE(Unwrap(olderBack).pending.size() == 1);
+    CHECK(Unwrap(olderBack).pending.front().attempts == 2);
+    CHECK(Unwrap(olderBack).pending.front().claimsChanged == 0);
+
+    // And a row from a build carrying one fact more than this one knows of.
+    auto surplus = std::vector<std::span<std::byte const>> { Unwrap(parts).begin(), Unwrap(parts).end() };
+    auto const extra = AsBytes(std::string_view { "a fact from the future" });
+    surplus.emplace_back(extra);
+    auto const widerRow = WireFields::Encode(WireFields::FieldList { surplus });
+    auto const widerRows = std::array { std::span<std::byte const> { widerRow } };
+    auto const widerPacked = WireFields::Encode(WireFields::FieldList { widerRows });
+    auto const widerBack = DecodeEnrollmentReport(
+        WireFields::Encode({ Unwrap(outer)[0], Unwrap(outer)[1], std::span<std::byte const> { widerPacked } }));
+    REQUIRE(widerBack.has_value());
+    REQUIRE(Unwrap(widerBack).pending.size() == 1);
+    CHECK(Unwrap(widerBack).pending.front().claimsChanged == 7);
+
+    // SHORTER than six is refused, not padded: those six are not optional, and reading
+    // a missing one would invent a value rather than omit a fact.
+    auto const truncated = std::vector<std::span<std::byte const>> { Unwrap(parts).begin(), Unwrap(parts).begin() + 5 };
+    auto const shortRow = WireFields::Encode(WireFields::FieldList { truncated });
+    auto const shortRows = std::array { std::span<std::byte const> { shortRow } };
+    auto const shortPacked = WireFields::Encode(WireFields::FieldList { shortRows });
+    CHECK_FALSE(DecodeEnrollmentReport(
+                    WireFields::Encode({ Unwrap(outer)[0], Unwrap(outer)[1], std::span<std::byte const> { shortPacked } }))
+                    .has_value());
+}
+
+TEST_CASE("A node runtime record carries the enrollment window, and absent is not closed", "[wire][enrollment][nodestatus]")
+{
+    // **Absent is not zero, and here absent is not CLOSED.** A node running no
+    // consensus has no window to report on, and a `Closed` there is a reassuring claim
+    // about a thing that does not exist -- which is exactly the reading that stops an
+    // operator looking.
+    auto const silent = DecodeNodeRuntime(EncodeNodeRuntime(NodeRuntimeFields {}));
+    REQUIRE(silent.has_value());
+    CHECK_FALSE(Unwrap(silent).enrollment.has_value());
+    CHECK_FALSE(Unwrap(silent).enrollmentPending.has_value());
+
+    NodeRuntimeFields open {};
+    open.enrollment = WireEnrollmentState::Open;
+    open.enrollmentPending = 3;
+    auto const back = DecodeNodeRuntime(EncodeNodeRuntime(open));
+    REQUIRE(back.has_value());
+    CHECK(Unwrap(back).enrollment == std::optional<WireEnrollmentState> { WireEnrollmentState::Open });
+    CHECK(Unwrap(back).enrollmentPending == std::optional<std::uint32_t> { 3 });
+
+    // Zero pending is a READING and not an absence: a window nobody has found yet says
+    // zero, and a node with no window says nothing. Both are asserted, because one
+    // optional renders them alike to anybody who only checks the engaged case.
+    NodeRuntimeFields quiet {};
+    quiet.enrollment = WireEnrollmentState::Closed;
+    quiet.enrollmentPending = 0;
+    auto const none = DecodeNodeRuntime(EncodeNodeRuntime(quiet));
+    REQUIRE(none.has_value());
+    CHECK(Unwrap(none).enrollment == std::optional<WireEnrollmentState> { WireEnrollmentState::Closed });
+    CHECK(Unwrap(none).enrollmentPending == std::optional<std::uint32_t> { 0 });
+}
+
+TEST_CASE("An older peer's runtime record reads without the enrollment fields, and a newer one's surplus is skipped",
+          "[wire][enrollment][nodestatus]")
+{
+    // **This is why the two fields cost no wire version.** The nested runtime record is
+    // variable-arity by design: a sender that predates these fields is answered with
+    // them disengaged, and one carrying more than this build knows is read for what it
+    // does know. Both directions, because a decoder tolerant in only one of them still
+    // leaves a fleet mid-upgrade unable to speak.
+    NodeRuntimeFields older {};
+    older.toolchainsServed = 4;
+    auto const emitted = EncodeNodeRuntime(older);
+    auto const parts = WireFields::SplitAll(emitted);
+    REQUIRE(parts.has_value());
+    REQUIRE(Unwrap(parts).size() >= 10);
+
+    // Rebuilt with exactly the ten fields a pre-enrollment build emitted.
+    auto const truncated = std::vector<std::span<std::byte const>> { Unwrap(parts).begin(), Unwrap(parts).begin() + 10 };
+    auto const back = DecodeNodeRuntime(WireFields::Encode(WireFields::FieldList { truncated }));
+    REQUIRE(back.has_value());
+    CHECK(Unwrap(back).toolchainsServed == 4);
+    CHECK_FALSE(Unwrap(back).enrollment.has_value());
+    CHECK_FALSE(Unwrap(back).enrollmentPending.has_value());
+
+    // And a record from a build with one more field than this one has heard of.
+    auto surplus = std::vector<std::span<std::byte const>> { Unwrap(parts).begin(), Unwrap(parts).end() };
+    auto const extra = AsBytes(std::string_view { "a fact from the future" });
+    surplus.emplace_back(extra);
+    auto const ahead = DecodeNodeRuntime(WireFields::Encode(WireFields::FieldList { surplus }));
+    REQUIRE(ahead.has_value());
+    CHECK(Unwrap(ahead).toolchainsServed == 4);
 }

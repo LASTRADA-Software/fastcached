@@ -413,6 +413,21 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   exactly that defect. And a reload may not WIDEN admission on a node with no `--cluster-key-file`,
   which built an unchecked lease validator at startup. Asked as a TRANSITION, or it refuses the
   keyless nodes running happily today.
+- An enrollment window is openable only where a key can actually be handed over — consensus AND a
+  named `--cluster-key-file` (`EnrollmentConfigured`) — and the APPROVAL reads that key before
+  `ClusterAdmit`, which is the irreversible half. A keyless consensus node is LEGAL, so both guards
+  are owed and neither can see the other's case.
+- A node that runs no consensus refuses the enrollment family `NoCluster`, never
+  `UnimplementedVerb`: a client reads the latter as *this seed's build is too old* and is sent to
+  upgrade a node that is already current. Asserted as NOT `UnimplementedVerb`, since both refuse.
+- Rejecting an already-APPROVED joiner does NOT un-admit it. The reject still stops the key
+  hand-over, and `--cluster-forget` is what removes the member — said in the flag's own description
+  and in a Warn, with the silence on a PENDING reject as the control.
+- The grant is spendable once, so `--enroll-from` refuses its own preconditions BEFORE the exchange.
+  `StoreClusterKey`'s exclusive create stays as well (`"wbx"`, with no `exists()` in front of it):
+  `"wb"` TRUNCATES, and a stat that is stale or cannot answer destroys the key this machine holds.
+- `--node-status`'s `enrollment` field is ABSENT on a node with no window and `closed` on one whose
+  window is shut — the distinction the two enrollment counters' zero cannot carry.
 - A compile is awaited onto a `ThreadPoolExecutor` sized to the slot cap, never served inline and
   never on a reactor. On the merged `0xFC` surface that is TWO hops, a frame arriving on a reactor:
   off to the pool, and **back before the reply is returned**. The hop back is invisible at every

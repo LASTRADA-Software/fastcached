@@ -411,6 +411,23 @@ CompileCacheWire::NodeStatusFields ConfiguredNodeStatus::Describe() const
         fields.runtime.leaderEndpoint = _sources.scheduler->LeaderEndpoint();
     }
 
+    // The one state in this record an operator may act on within seconds of reading it:
+    // while it is `Open`, any machine that can route to this node's 0xFC port may ask to
+    // join, and approving one hands it this cluster's key in cleartext. Reported here
+    // rather than left to the repeating log line, because that line reaches only
+    // whoever is reading THIS node's log -- and an operator who opened a window and
+    // walked away has no other way to find out.
+    //
+    // Both halves together, and both absent on a node that runs no window: a count with
+    // no state beside it cannot say whether a zero means nobody has found the window yet
+    // or that there is no window, which are opposite facts.
+    if (_sources.enrollment != nullptr)
+    {
+        auto const [state, pending] = _sources.enrollment->Summary();
+        fields.runtime.enrollment = state;
+        fields.runtime.enrollmentPending = pending;
+    }
+
     for (auto const& mapping: mappings)
     {
         // **A surface the configuration does not resolve is ABSENT, never a zero port.**

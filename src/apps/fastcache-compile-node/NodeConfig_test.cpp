@@ -334,6 +334,26 @@ TEST_CASE("NodeConfig: every flag that is worker state reaches the supervisor", 
         // Reports on a configuration and exits; a service that printed its ports at
         // every boot instead of serving them would be one that never starts.
         "--print-surfaces",
+        // The enrollment verbs, and the same rule the cluster ones above carry -- with
+        // the sharpest consequence in the set. `--enroll-open` is the one flag here
+        // whose replay is a SECURITY event rather than a wasted one: a registration
+        // carrying it would re-open the window at every boot, forever, so a machine
+        // rebooting would silently re-enter the one interval in which a stranger can
+        // ask this cluster for its key, with the counter that reports it
+        // (`fastcache_enrollment_windows_opened_total`) rising on a schedule nobody
+        // reads as an event. The window is a MOMENT an operator chooses; a service
+        // registration is a decision replayed forever, and those cannot be the same
+        // flag.
+        //
+        // `--enroll-from` is excluded for the ordinary reason rather than that one: it
+        // is a one-shot join that ends the process, so a service that carried it would
+        // try to join a cluster it is already a member of instead of serving.
+        "--enroll-from",
+        "--enroll-open",
+        "--enroll-close",
+        "--enroll-list",
+        "--enroll-approve",
+        "--enroll-reject",
     });
 
     // A configuration in which no field holds its default, so every emitter fires.
@@ -472,6 +492,77 @@ TEST_CASE("NodeConfig: every toolchain is re-emitted", "[node][service]")
         INFO("toolchain: " << toolchain);
         CHECK(std::ranges::contains(spec.arguments, std::format("--toolchain={}", toolchain)));
     }
+}
+
+TEST_CASE("NodeConfig: a node with no cluster key file serves no enrollment window", "[node][config]")
+{
+    // **The keyless-node rule, and it is here because this is where it can be tested.**
+    // It used to live only as a conjunction inside `WorkerBody`, in the one translation
+    // unit no test links, so nothing could assert it at all.
+    //
+    // A keyless consensus node is LEGAL -- the startup table refuses one only where the
+    // compile port faces the network and admits remote peers -- and on such a node the
+    // enrollment window was openable, listable and APPROVABLE while it could never
+    // admit anybody, because the hand-over reads a key file that is not configured.
+    // Worse than a refusal: an approval commits `ClusterAdmit` before the key is
+    // consulted, so it grew the replicated configuration, and therefore the QUORUM, by
+    // a machine that then received `StorageWriteFailed` and never became anything.
+    auto const configured = ParseNodeArgv({ "--scheduler=s:1", "--listen-raft=7100", "--cluster-key-file=/etc/fc/key" });
+    REQUIRE(configured.has_value());
+    CHECK(EnrollmentConfigured(*configured));
+
+    // The clause with the history. Consensus is on, so `RunsConsensus` says yes and the
+    // OLD predicate said yes with it — which is the defect, not a near miss.
+    auto const keyless = ParseNodeArgv({ "--scheduler=s:1", "--listen-raft=7100" });
+    REQUIRE(keyless.has_value());
+    REQUIRE(RunsConsensus(*keyless));
+    CHECK_FALSE(EnrollmentConfigured(*keyless));
+
+    // And the other clause still bites, or "require a key file" would have been
+    // implemented as "require only a key file" and every keyed worker in the fleet
+    // would offer to admit machines to a cluster it does not belong to.
+    auto const clusterless = ParseNodeArgv({ "--scheduler=s:1", "--cluster-key-file=/etc/fc/key" });
+    REQUIRE(clusterless.has_value());
+    REQUIRE_FALSE(RunsConsensus(*clusterless));
+    CHECK_FALSE(EnrollmentConfigured(*clusterless));
+
+    auto const neither = ParseNodeArgv({ "--scheduler=s:1" });
+    REQUIRE(neither.has_value());
+    CHECK_FALSE(EnrollmentConfigured(*neither));
+}
+
+TEST_CASE("NodeConfig: a later enrollment verb drops the earlier one's subject", "[node][config]")
+{
+    // **Last-flag-wins has to move BOTH halves.** These are one-shot verbs that
+    // overwrite each other, so `--enroll-approve=n4 --enroll-open` means `Open`. The
+    // applier set the action and left the subject behind, so the client sent
+    // `EnrollControl(Open, "n4")` -- which the decoder refuses on its arity rule,
+    // `EnrollControlNamesSubject(Open)` being false while the subject is not empty --
+    // and the operator was answered *a control frame this build cannot read*: a
+    // VERSION-MISMATCH sentence for a flag-combination mistake, which sends somebody
+    // comparing builds across a fleet that is fine.
+    auto const overridden = ParseNodeArgv({ "--scheduler=s:1", "--enroll-approve=n4", "--enroll-open" });
+    REQUIRE(overridden.has_value());
+    CHECK(overridden->enroll.action == EnrollAction::Open);
+
+    // The assertion that DISTINGUISHES: the action alone was already correct under the
+    // defect, because it was the half that got assigned. It is the residue that made
+    // the frame unreadable.
+    CHECK(overridden->enroll.subject.empty());
+
+    // The other order still carries its operand, or "clear it" would have been
+    // implemented as "never set it" and every approval would name nobody.
+    auto const named = ParseNodeArgv({ "--scheduler=s:1", "--enroll-open", "--enroll-approve=n4" });
+    REQUIRE(named.has_value());
+    CHECK(named->enroll.action == EnrollAction::Approve);
+    CHECK(named->enroll.subject == "n4");
+
+    // And a subject-taking verb replacing another keeps its OWN subject rather than the
+    // first one's, which is the case a naive clear-on-entry would also pass.
+    auto const second = ParseNodeArgv({ "--scheduler=s:1", "--enroll-approve=n4", "--enroll-reject=n9" });
+    REQUIRE(second.has_value());
+    CHECK(second->enroll.action == EnrollAction::Reject);
+    CHECK(second->enroll.subject == "n9");
 }
 
 TEST_CASE("NodeConfig: discovery is on unless the operator turns it off", "[node][config]")

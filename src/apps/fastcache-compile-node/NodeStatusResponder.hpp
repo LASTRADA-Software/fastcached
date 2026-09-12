@@ -2,6 +2,7 @@
 #pragma once
 
 #include "CompileCapacity.hpp"
+#include "EnrollmentWindow.hpp"
 #include "FrameEndpoint.hpp"
 
 #include <FastCache/Core/Clock.hpp>
@@ -189,10 +190,14 @@ class NodeStatusResponder final: public IFrameResponder
     ///
     /// The control cap, which is what the `OpTable` rows already bound these verbs to.
     /// Both are FIELDLESS, so the honest per-verb answer is smaller still -- and stating
-    /// that here would be wrong rather than tight: this is the SESSION cap the endpoint
-    /// folds across owners with `Largest`, and `OpPayloadCap` is what applies the
-    /// per-verb bound. A surface claiming less than it can serve narrows nothing today
-    /// and would narrow a payload-bearing sibling the day this is the only owner.
+    /// that here would be wrong rather than tight: this is a SESSION cap, and
+    /// `OpPayloadCap` is what applies the per-verb bound.
+    ///
+    /// It said this was "the SESSION cap the endpoint folds across owners with
+    /// `Largest`". It is not folded: `MergedResponder::Largest` covers `_cache`,
+    /// `_scheduler` and `_compile`, and this responder is neither. On the merged
+    /// listener nothing reads this number; it is the answer given when this responder is
+    /// asked directly, and it stays the honest one either way.
     [[nodiscard]] std::size_t MaxRequestBytes() const noexcept override
     {
         return CompileCacheWire::MaxControlPayload;
@@ -201,10 +206,17 @@ class NodeStatusResponder final: public IFrameResponder
     /// @copydoc IFrameResponder::MaxOpenConnections
     ///
     /// Modest, and deliberately not the cache's hundreds: an operator tool opens one
-    /// connection and closes it. Folded with `Largest`, so it cannot narrow a busier
-    /// sibling's ceiling -- what it decides is the ceiling on a node serving nothing
-    /// else, where a diagnostic port with hundreds of descriptors is a port worth
-    /// exhausting.
+    /// connection and closes it, and a diagnostic port with hundreds of descriptors is
+    /// a port worth exhausting.
+    ///
+    /// It claimed this "decides the ceiling on a node serving nothing else". **It
+    /// decides nothing today** -- `MergedResponder::Largest` does not fold this
+    /// responder, so on the merged listener this 32 is never consulted, including on the
+    /// node serving nothing else. The value is kept because it is the right one for this
+    /// surface to report; what is wrong is a comment that described a consequence the
+    /// mechanism cannot deliver, which is the more durable half of the defect: the
+    /// number could be corrected by anyone reading it, and the false consequence read as
+    /// a reason not to look.
     [[nodiscard]] std::size_t MaxOpenConnections() const noexcept override
     {
         return 32;
@@ -212,10 +224,14 @@ class NodeStatusResponder final: public IFrameResponder
 
     /// @copydoc IFrameResponder::MaxInFlightBytes
     ///
-    /// A handful of control payloads. Folded with `Largest`, so on any node holding a
-    /// tier the cache's budget governs and this contributes nothing; it matters only
-    /// where this is the largest owner, and there the right budget is the one these
-    /// verbs can actually spend.
+    /// A handful of control payloads -- the right budget for what these verbs can
+    /// actually spend.
+    ///
+    /// It said "folded with `Largest`, so on any node holding a tier the cache's budget
+    /// governs and this contributes nothing; it matters only where this is the largest
+    /// owner". The first half was the correct conclusion for the wrong reason and the
+    /// second half is false: this responder is in no fold, so it contributes nothing
+    /// anywhere on the merged surface, not only where a tier outweighs it.
     [[nodiscard]] std::size_t MaxInFlightBytes() const noexcept override
     {
         return CompileCacheWire::MaxControlPayload * 16;
@@ -458,6 +474,17 @@ struct NodeRuntimeSources
     /// node that runs none -- which is why the role is ABSENT there rather than
     /// `Undecided`, a reading that would claim this node is in an election.
     Distributed::SchedulerService const* scheduler { nullptr };
+
+    /// This node's enrollment window; null on a node that runs no consensus.
+    ///
+    /// Null is ABSENT and not `Closed`, for the reason every member here is nullable:
+    /// a node with no cluster has no window to report on, and a `Closed` there is a
+    /// reassuring claim about a thing that does not exist. The distinction is worth
+    /// more here than anywhere else in this record, because the state an operator is
+    /// scanning for is `Open` -- a minute in which this machine hands the fleet's key
+    /// to a stranger it approves -- and a false `Closed` is exactly the reading that
+    /// stops them looking.
+    EnrollmentWindow const* enrollment { nullptr };
 };
 
 /// The production `INodeStatusSource`: config for the surfaces, a clock for the uptime.

@@ -62,6 +62,40 @@ struct ClusterRequest
     std::string value;
 };
 
+/// What an operator asked of a seed's enrollment window, instead of serving.
+///
+/// Its own enum rather than five more `ClusterAction` rows, because the two reach
+/// different verbs on the wire and are gated differently at the far end -- and a single
+/// enum would make `ClusterRequest::key` mean *a setting, a member, or a joiner*
+/// depending on which arm read it. `None` is the ordinary case: a worker starting up.
+///
+/// A private enum: nothing transmits or persists these ordinals. It is parsed from argv
+/// into `EnrollCommand` and keys a table through `Last`, and no byte of it reaches a
+/// wire or a file -- so the order is free to change, and the `= 0` on `None` states the
+/// value a default-constructed `EnrollCommand` holds rather than any contract with a
+/// reader elsewhere. Said out loud because this tree holds both kinds and a declaration
+/// that says neither reads as either (#308).
+enum class EnrollAction : std::uint8_t
+{
+    None = 0, ///< Serve, rather than administer a window.
+    Open,     ///< Start accepting enrollment requests.
+    Close,    ///< Stop accepting them, and forget what was waiting.
+    List,     ///< Print the window and everything waiting.
+    Approve,  ///< Admit the named machine and let it collect the cluster key.
+    Reject,   ///< Refuse the named machine.
+
+    Last, ///< Not an action: the length of a table keyed by one.
+};
+
+/// One enrollment-administration request, as parsed from the command line.
+struct EnrollCommand
+{
+    EnrollAction action { EnrollAction::None };
+
+    /// The joiner's id for `Approve` and `Reject`; empty for the rest.
+    std::string subject;
+};
+
 /// Split `name=value` as `--cluster-set` takes it.
 ///
 /// At the FIRST `=`, so a value may contain one and a name may not -- the same
@@ -743,6 +777,30 @@ struct NodeConfig
     /// part of a service registration -- a worker that administered the cluster at
     /// every boot would replay one operator's decision forever.
     ClusterRequest cluster;
+
+    /// The seed to ask for admission, instead of serving, when non-empty.
+    ///
+    /// A mode rather than a serving option, exactly as `cluster` above is: this
+    /// process mints its identity, asks one machine to let it in, waits for a person,
+    /// writes the key it is given, and exits. It opens NO surface at all while doing
+    /// it, which is what keeps it out of every widening question a running node has.
+    ///
+    /// Deliberately NOT part of a service registration and deliberately unreachable
+    /// from a configuration file: a worker that re-enrolled at every boot would ask
+    /// forever after the one time it needed to.
+    std::string enrollFrom;
+
+    /// What to do to a seed's enrollment window instead of serving, when anything.
+    ///
+    /// The OPERATOR's half of the pair `enrollFrom` is the joiner's half of: that one
+    /// is a machine asking to be let in, this one is a person at a terminal deciding
+    /// whether to let it. Asked of `--scheduler`, like every other cluster verb.
+    ///
+    /// A mode rather than a serving option, and out of every service registration for
+    /// the same reason the cluster verbs are: a worker that opened an enrollment window
+    /// at every boot would replay one operator's decision forever, on the one surface
+    /// where the consequence is handing a stranger the fleet's key.
+    EnrollCommand enroll;
 };
 
 /// What this machine offers the fleet, from its configuration and its hardware.
@@ -1241,6 +1299,28 @@ inline constexpr std::string_view ConsensusNamesNoSelfPeerRefusal =
 /// @param cfg The parsed configuration.
 /// @return True when a consensus driver will run and report a role.
 [[nodiscard]] bool RunsConsensus(NodeConfig const& cfg) noexcept;
+
+/// Whether this node's CONFIGURATION could serve an enrollment window.
+///
+/// **Consensus AND a key file, and the second clause is the one with a history.** A
+/// keyless consensus node is legal -- the startup table refuses one only where the
+/// compile port faces the network and admits remote peers -- and on such a node the
+/// window was openable, listable and APPROVABLE while it could never admit anybody,
+/// because the hand-over reads a key file that is not configured. Worse than a
+/// refusal: an approval commits `ClusterAdmit` before the key is consulted, so it grew
+/// the replicated configuration -- and therefore the QUORUM -- by a machine that then
+/// received `StorageWriteFailed` and never became anything. A phantom member counted
+/// towards every future election, from one operator command that looked like it worked.
+///
+/// Asked of the configuration ALONE, which is what makes it testable: whether a
+/// scheduler TIER was actually built is a runtime fact the caller holds and ANDs at the
+/// call site, and `main.cpp` is the one translation unit no test links. The remaining
+/// window -- a key file that is NAMED and cannot be read -- is not a configuration
+/// question and is answered at the decision itself, where `EnrollmentResponder` reads
+/// the key before it admits anybody.
+/// @param cfg The parsed configuration.
+/// @return True when consensus will run and a cluster key file is named.
+[[nodiscard]] bool EnrollmentConfigured(NodeConfig const& cfg) noexcept;
 
 /// The member endpoint `--raft-self` and `--listen-raft` name between them.
 ///

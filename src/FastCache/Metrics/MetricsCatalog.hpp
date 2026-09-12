@@ -700,6 +700,86 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
               "a rise here is crashing clients, a lost route, or a middlebox resetting "
               "long-lived connections.",
       .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::EnrollmentRequestsRefusedClosed,
+      .prometheusName = "fastcache_enrollment_requests_refused_closed_total",
+      .help = "Enrollment requests refused because no window is open. The only pre-auth refusal "
+              "series on this wire: enroll is reachable without a credential by design, because "
+              "the machine asking is the one that holds no secret of this cluster, and the window "
+              "is shut except for the minutes an operator spends admitting machines. So a rise "
+              "with nobody at a terminal is somebody trying the door, and nothing else shows it. "
+              "Zero on a node nobody has probed, which is the common case and is not evidence the "
+              "refusal works -- fastcache_enrollment_windows_opened_total is what says the "
+              "mechanism has ever run.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::EnrollmentRequestsRefusedFull,
+      .prometheusName = "fastcache_enrollment_requests_refused_full_total",
+      .help = "Enrollment requests refused because the pending list was full, so nothing was "
+              "recorded. Never sum with any endpoint-busy series: this is not momentary and the "
+              "same request will go on being refused until a person decides something. The list "
+              "refuses rather than evicting on purpose -- an open window is ungated, so eviction "
+              "would let a flooder push the real joiner off the list the operator is reading, "
+              "which is silent from both ends. A rise is a rollout larger than the bound, fixed "
+              "by approving in batches, or somebody filling it while a window is open.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::EnrollmentRequestsRefusedMalformed,
+      .prometheusName = "fastcache_enrollment_requests_refused_malformed_total",
+      .help = "Enrollment bodies that arrived in full and would not decode. Its own series rather "
+              "than any other malformed-frame counter, which describe a truncated compile frame, "
+              "an undecodable compile payload, two AUTH payloads and the cache tier's bodies. A "
+              "client of this tree sends two length-prefixed fields, so a body that splits into "
+              "anything else came from no version of this software -- and the peer had presented "
+              "nothing when it sent it, which is what makes this one worth reading.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::EnrollmentControlRefusedNotAMember,
+      .prometheusName = "fastcache_enrollment_control_refused_not_a_member_total",
+      .help = "Enrollment control verbs refused because the caller is not a fleet member -- "
+              "somebody trying to approve themselves. The window admits strangers by design and "
+              "the approval is what it withholds, so this refusal carries the whole security "
+              "argument for the pair: a peer reaching it has found an open window and gone on to "
+              "ask for the decision too. Not ordinary on any deployment. Never sum with "
+              "fastcache_node_status_requests_refused_not_a_member_total, which shares the wire "
+              "code and describes somebody asking a node what it is.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::EnrollmentControlRefusedUnauthenticated,
+      .prometheusName = "fastcache_enrollment_control_refused_unauthenticated_total",
+      .help = "Enrollment control verbs refused because the connection presented no accepted "
+              "credential. The third of three outcomes on this verb and separate from the other "
+              "two for the reason the scheduler's three are: a peer that never authenticated is a "
+              "misconfigured operator, one whose token was rejected is on the scheduler's own "
+              "credential series, and a non-member that authenticated correctly is the row above. "
+              "Zero while no --scheduler-token-file is set, so zero here does not mean the verb "
+              "is protected -- it means membership is the only gate on it.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::EnrollmentWindowsOpened,
+      .prometheusName = "fastcache_enrollment_windows_opened_total",
+      .help = "Enrollment windows opened on this node. The only durable audit trail there is: the "
+              "window lives in memory, a restart closes it, its repeating warning reaches only "
+              "whoever reads this node's log, and the open state is a snapshot field that says "
+              "nothing about how often it has been open. Any rise is a minute in which this "
+              "machine would have handed the cluster key to a stranger it approved. A tally and "
+              "not a gauge, which is what keeps it from being a second spelling of the snapshot.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::EnrollmentKeysHandedOver,
+      .prometheusName = "fastcache_enrollment_keys_handed_over_total",
+      .help = "Cluster keys handed to an approved joiner -- the event the feature exists to "
+              "perform and the one worth alerting on. Each rise is the fleet's pre-shared key "
+              "crossing the network in cleartext to one machine a person approved by name. During "
+              "a rollout it rises once per machine and stops; on a settled fleet it should never "
+              "rise again. Read beside fastcache_enrollment_windows_opened_total: hand-overs "
+              "without an open is impossible and is a bug report, while opens without hand-overs "
+              "is the ordinary shape of a window somebody opened and closed again.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::EnrollmentRequestsRefusedAlreadyCollected,
+      .prometheusName = "fastcache_enrollment_requests_refused_already_collected_total",
+      .help = "Enroll requests naming an id whose cluster key had already been collected. Refused "
+              "with no key bytes served: the grant is spendable once. A healthy enrolment produces "
+              "none of these, because a joiner that collects the key writes it and exits -- so this "
+              "is not a second spelling of "
+              "fastcache_enrollment_keys_handed_over_total, which says the key left, where this says "
+              "somebody asked for it after it had left. Two causes and the rate separates them: one "
+              "is a joiner whose reply was lost, a run of them is somebody answering to an id an "
+              "operator approved. Both are fixed by approving that machine again.",
+      .type = MetricType::Counter },
 } };
 
 // Checked at compile time rather than by a test, because the failure this prevents
