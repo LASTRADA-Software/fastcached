@@ -3203,12 +3203,45 @@ if [[ "$format" -eq 1 ]]; then
         fail "git ls-files matched no C++ source in $(pwd), so $formatter was never run and this tree's formatting is UNEXAMINED -- this is NOT a formatting failure. A linked worktree whose .git file holds an absolute 'gitdir:' is how this happens: the other git cannot resolve it and lists nothing, where the same tree lists hundreds of files once the pointer is relative (#1064)"
     fi
 
-    printf '%s\n' "$format_list" | xargs "$formatter" -i --style=file \
-        || fail "clang-format"
+    # `--verbose` makes the formatter name every file it PROCESSES, one line each --
+    # and name none of the files it DECLINES. That is what lets both numbers below
+    # come out of the same walk that does the work, rather than a second walk whose
+    # answer could drift from it.
+    #
+    # ON STDERR, not stdout. Measured with clang-format-22: stdout carries nothing at
+    # all. A counter reading stdout would score `formatted` as 0 and compute
+    # `declined` as the whole offered set -- which renders as ".clang-format-ignore is
+    # declining everything", the most reassuring sentence available, while the
+    # instrument measures nothing. That is the direction this control must not fail in,
+    # so the redirection is deliberate and is the point of this comment.
+    # No `local`: this block is at statement level, inside `if [[ "$format" -eq 1 ]]`
+    # rather than in a function, and bash answers `local: can only be used in a
+    # function` on stderr and carries on -- so the line still printed the right
+    # numbers while the gate emitted two errors per run.
+    format_log="$(mktemp)"
+    printf '%s\n' "$format_list" | xargs "$formatter" -i --verbose --style=file 2>"$format_log" \
+        || { rm -f "$format_log"; fail "clang-format"; }
+
+    # Counted from a FILE rather than through a pipe: `grep -c` exits 1 on a zero
+    # count, and under `pipefail` that reading is indistinguishable from the producer
+    # having died. `|| true` because zero declined files is a legitimate answer on a
+    # tree with no vendored code.
+    format_done="$(grep -c '^Formatting ' "$format_log" || true)"
+    rm -f "$format_log"
+    format_declined=$(( format_count - format_done ))
 
     # The COUNT, not just the tool: zero and 683 must not render the same sentence,
     # which is the whole defect one line up.
-    echo "== formatted ${format_count} file(s) with $formatter"
+    #
+    # And `declined` is a LIVE CONTROL on `.clang-format-ignore`, not decoration. The
+    # vendored tree under `vendor/` is kept byte-identical to upstream so improvements
+    # can be sent back, and that file is what stops the formatter rewriting it -- 146
+    # of 165 files on the first run, measured. If it is deleted or stops matching,
+    # `declined` falls toward zero HERE, in the step that caused it, on every run.
+    # `vendor-verbatim` catches the same break later in the same run, which is the
+    # second witness; this one names the cause rather than the symptom. Neither is
+    # redundant: keep both.
+    echo "== formatted ${format_done} file(s), declined ${format_declined} (.clang-format-ignore) with $formatter"
 fi
 
 # @param 1 The preset to build and test.
