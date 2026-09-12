@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <FastCache/Core/Ranges.hpp>
 #include <FastCache/Core/Utf8.hpp>
 
 #include <algorithm>
@@ -57,12 +58,11 @@ struct TextEscape
 /// being PRESENT is.
 ///
 /// Shared with `fastcache-cli`, and the TABLE is the shared part rather than the
-/// walk. `EscapeDelimited` below also spells control bytes and replaces invalid
-/// UTF-8, because `/fleet.txt` is read by a terminal; the client's TSV carries a
-/// cached value a terminal never sees and touches only these four. That
-/// divergence is deliberate and `CliFormat_test.cpp` asserts it in both
-/// directions -- so sharing the FUNCTION would silently change a format that was
-/// already correct, which is why only the rows move.
+/// walk -- `EscapeDelimited` below escapes more than the client's TSV does, on
+/// purpose. That divergence is argued at `EscapeTsvField` in
+/// `apps/fastcache-cli/CliFormat.cpp`, which is where somebody is tempted to call
+/// the node's function instead, and restating it here would be this change's own
+/// defect one level up.
 inline constexpr std::array DelimitedEscapes {
     TextEscape { .byte = '\\', .spelling = R"(\\)" },
     TextEscape { .byte = '\t', .spelling = R"(\t)" },
@@ -72,29 +72,45 @@ inline constexpr std::array DelimitedEscapes {
 
 /// What one format writes for `byte`, or nothing when it may carry it as it is.
 ///
-/// A range-based scan rather than `std::ranges::find_if`, and the reason is
-/// portability rather than taste: over a `std::array`, libc++ and libstdc++ yield
-/// a raw pointer -- so clang-tidy's `readability-qualified-auto` requires
-/// `auto const* const` -- while MSVC yields a class-type iterator that such a
-/// declaration cannot deduce. See `.agent/rules/build-and-toolchain.md`.
+/// `FindOrNull` rather than `std::ranges::find_if`, for the reason `Core/Ranges.hpp`
+/// exists: over a `std::array` libstdc++ and libc++ yield a raw pointer, so
+/// clang-tidy's `readability-qualified-auto` asks for `auto const* const`, which
+/// MSVC's class-type iterator cannot deduce. `TraitsOf` in `Platform/ServiceControl.cpp`
+/// is the same two lines.
+///
+/// This site used to hand-roll the scan, and the rule in
+/// `.agent/rules/build-and-toolchain.md` permits that -- a site wanting a VALUE out
+/// of a range may scan and name no iterator. It takes the helper anyway because the
+/// function became cross-binary API in this change, and a shared helper that
+/// re-derives what a shared helper already solved is how a tree ends up with the
+/// explanation written out seventeen times instead of the answer used once. Where
+/// the helper is genuinely unreachable the scan is still right:
+/// `CompileCacheWire::FindOp` hand-rolls it because that header must stay
+/// dependency-free for the launcher.
 /// @param escapes The format's table.
 /// @param byte The byte to spell.
 /// @return Its spelling, or an empty view when the byte needs none.
 [[nodiscard]] constexpr std::string_view EscapeFor(std::span<TextEscape const> escapes, char byte) noexcept
 {
-    for (auto const& row: escapes)
-        if (row.byte == byte)
-            return row.spelling;
-    return {};
+    auto const* const row = FindOrNull(escapes, byte, &TextEscape::byte);
+    return row != nullptr ? row->spelling : std::string_view {};
 }
 
 /// How each format spells what it cannot carry.
 ///
-/// Namespaced because these tables are how the functions below agree with each
-/// other rather than anything a caller names. `TextEscape`, `DelimitedEscapes`
-/// and `EscapeFor` sit OUTSIDE it because a second binary shares them; the
-/// replacement constants stay outside for the older reason, so a test can assert
-/// against the one spelling rather than against a second copy of it.
+/// Namespaced because nothing outside this header reaches these two tables BY
+/// NAME -- which is a statement about spelling and **not** a claim that no other
+/// file implements the same conventions. It is not: `CliFormat.cpp` hand-rolls
+/// the JSON convention as a `switch` and has drifted from `JsonEscapes` in both
+/// directions (#1356), and `fastcache-cc/Stats.cpp` and
+/// `Platform/ServiceControl.cpp` each hand-roll the markup one. Said the other
+/// way round, this comment previously read as *nobody else does this*, which is
+/// the sentence a future reader uses to decide not to look.
+///
+/// `TextEscape`, `DelimitedEscapes` and `EscapeFor` sit OUTSIDE it because a
+/// second binary shares them; the replacement constants stay outside for the
+/// older reason, so a test can assert against the one spelling rather than
+/// against a second copy of it.
 namespace Detail
 {
 
