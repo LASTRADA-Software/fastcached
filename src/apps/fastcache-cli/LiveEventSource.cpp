@@ -77,15 +77,16 @@ namespace
                 if (_readsStatus)
                     _status = _dialed.get();
             }
+            // In the same hop and BEFORE the counters: `TakeSample` stamps the moment `Gather()`
+            // returns, and every rate is divided by the time between two stamps, so a round trip
+            // read after the counters would put its own jitter into every rate's denominator.
+            if (_status != nullptr)
+                _lastStatus = _status->ReadNodeStatus();
             auto attempts = _current->Gather();
             // Failed by the reader's own decision rather than by a second reading of the
             // attempts: a round the ladder cannot choose a record from is the round that
             // renders as a gap, and exactly that round is the one worth a re-dial.
             _lastFailed = ChooseStats(attempts).outcome != Outcome::Affirmative;
-            // In the same hop and right after the counters, so the status beside a sample
-            // describes the moment it was taken rather than one a hop later.
-            if (_status != nullptr)
-                _lastStatus = _status->ReadNodeStatus();
             return attempts;
         }
 
@@ -137,7 +138,9 @@ namespace
 ///
 /// Every member is read and written on the reactor's thread only -- the producers resume
 /// there before touching any of it, and `LiveSourceParts::reactor` states the same of the
-/// caller -- except the two that are atomic, which a drain reads from another thread.
+/// caller -- except the two that are atomic, which a drain reads from another thread, and
+/// `gatherer`, which a sample uses on the pool between two hand-offs and never at once with
+/// the reactor.
 struct LiveEventSource::State
 {
     explicit State(LiveSourceParts from):
