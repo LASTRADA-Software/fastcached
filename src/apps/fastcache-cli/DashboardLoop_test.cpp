@@ -1141,3 +1141,86 @@ TEST_CASE("after many fleet samples exactly one document is alive, and the histo
     CHECK(exit.model.latestDocument.use_count() == 1);
     CHECK(exit.model.history.size() == static_cast<std::size_t>(Samples));
 }
+
+namespace
+{
+
+/// A view that places one image over the model's geometry, to watch the loop carry it.
+class PlacingView final: public IDashboardView
+{
+  public:
+    [[nodiscard]] std::string Frame(DashboardModel const& model) override
+    {
+        return PlacedFrame(model).text;
+    }
+
+    [[nodiscard]] DashboardFrame PlacedFrame(DashboardModel const& model) override
+    {
+        cellPixelsSeen.push_back(model.cellPixels);
+        return DashboardFrame { .text = std::format("cols={}", model.columns),
+                                .placements = { FramePlacement { .row = 2,
+                                                                 .column = 3,
+                                                                 .cellsWide = static_cast<std::size_t>(model.columns),
+                                                                 .cellsHigh = 1,
+                                                                 .sixel = "body" } } };
+    }
+
+    std::vector<std::optional<CellPixelSize>> cellPixelsSeen {};
+};
+
+} // namespace
+
+TEST_CASE("a frame's images reach the sink with its text, and a cell size rides each resize", "[cli][dashboard]")
+{
+    // WHAT DISTINGUISHES: the placement a view made arrives at the sink beside its text -- a loop
+    // presenting `Frame` alone would drop it -- and the model's cell size is the LAST resize's, so a
+    // resize that carried none clears the size an earlier one reported.
+    auto view = PlacingView {};
+    auto sink = CollectingSink {};
+    (void) Drive({ DashboardEvent { .kind = DashboardEventKind::Resize,
+                                    .columns = 40,
+                                    .rows = 10,
+                                    .cellPixels = CellPixelSize { .width = 9, .height = 18 } },
+                   DashboardEvent { .kind = DashboardEventKind::Tick },
+                   DashboardEvent { .kind = DashboardEventKind::Resize, .columns = 50, .rows = 10 },
+                   DashboardEvent { .kind = DashboardEventKind::Tick } },
+                 DashboardLimits {},
+                 view,
+                 sink);
+
+    REQUIRE(sink.frames.size() == 2);
+    REQUIRE(sink.placements.size() == 2);
+    CHECK(sink.frames[0] == "cols=40");
+    REQUIRE(sink.placements[0].size() == 1);
+    CHECK(sink.placements[0][0].cellsWide == 40);
+    CHECK(sink.placements[0][0].sixel == "body");
+
+    REQUIRE(view.cellPixelsSeen.size() == 2);
+    REQUIRE(view.cellPixelsSeen[0].has_value());
+    CHECK(view.cellPixelsSeen[0]->width == 9);
+    CHECK(view.cellPixelsSeen[0]->height == 18);
+    CHECK_FALSE(view.cellPixelsSeen[1].has_value());
+}
+
+TEST_CASE("a sink that draws no image presents a placed frame's text", "[cli][dashboard]")
+{
+    // The default door. WHAT DISTINGUISHES: a sink overriding only `Present` still receives the text
+    // of a frame that carried an image, so a pipe never loses a frame for having no image support.
+    class TextOnly final: public IFrameSink
+    {
+      public:
+        void Present(std::string_view frame) override
+        {
+            seen.emplace_back(frame);
+        }
+
+        std::vector<std::string> seen {};
+    };
+    auto sink = TextOnly {};
+    auto& door = static_cast<IFrameSink&>(sink);
+    door.PresentPlaced(DashboardFrame {
+        .text = "rows",
+        .placements = { FramePlacement { .row = 1, .column = 1, .cellsWide = 1, .cellsHigh = 1, .sixel = "x" } } });
+    REQUIRE(sink.seen.size() == 1);
+    CHECK(sink.seen[0] == "rows");
+}

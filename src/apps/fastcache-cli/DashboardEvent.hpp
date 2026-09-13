@@ -2,6 +2,7 @@
 #pragma once
 
 #include "CliAnswer.hpp"
+#include "DashboardFrame.hpp"
 #include "SocketExchange.hpp"
 #include "StatsSource.hpp"
 
@@ -135,6 +136,12 @@ struct DashboardEvent
     /// draws from these until a `Resize` has carried real ones.
     int columns { 0 };
     int rows { 0 };
+
+    /// `Resize`: how many pixels a cell measures now, or nullopt when the terminal has not said.
+    ///
+    /// Rides the resize because a font change resizes the grid and the cells together, and an image
+    /// drawn from the old cell size would be the wrong size in the new grid.
+    std::optional<CellPixelSize> cellPixels {};
 };
 
 /// A wall `time_point` cannot be stored as when a reading was taken.
