@@ -1242,3 +1242,35 @@ TEST_CASE("a fleet session parses each sample once, however many frames and reco
     CHECK(view.records > 0);
     CHECK(fleetParses == static_cast<std::size_t>(Samples));
 }
+
+TEST_CASE("the fleet table drawn is the section the context names, and the strip brackets that one",
+          "[cli][dashboard][panel][fleet]")
+{
+    // `PanelContext::section` is how a session chooses the table. WHAT DISTINGUISHES: one document,
+    // which carries machines and no workers, drawn with `section = Workers` has no machine rows, the
+    // marker where the workers table goes, and `[workers]` bracketed rather than `[machines]` -- a view
+    // that always drew the machines passes none of the three.
+    auto view = PanelView { FleetPanel(),
+                            PanelContext { .absent = std::string { Absent },
+                                           .cellWidth = &FakeCellWidth,
+                                           .section = FleetSection::Workers,
+                                           .rung = RenderRung::Unicode } };
+    auto sink = CollectingSink {};
+    (void) Drive({ DashboardEvent { .kind = DashboardEventKind::Resize, .columns = 132, .rows = 40 },
+                   FleetSampleOf(1, FleetText(FleetMachines)),
+                   Tick },
+                 DashboardLimits {},
+                 view,
+                 sink,
+                 &ReadFleetSample);
+    REQUIRE(sink.frames.size() == 1);
+    auto const& frame = sink.frames.front();
+    CHECK(LinesStarting(frame, "build-") == 0);
+    CHECK(frame.contains("[workers]"));
+    CHECK(!frame.contains("[machines]"));
+    CHECK(frame.contains(" machines "));
+    CHECK(std::ranges::count_if(
+              Lines(frame),
+              [](std::string const& line) { return Trimmed(Columns(line, 1, FakeCellWidth(line) - 2)) == Absent; })
+          == 1);
+}
