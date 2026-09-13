@@ -95,7 +95,9 @@ and `src/FastCache/Core`.
 
 For fastcached code the authoritative ones are **always** the first-party ones:
 `FastCache::Async::Task`, `FastCache::Async::Cancellation`, `FastCache::IClock`.
-Nothing under `src/` may include `<coro/...>` or `<platform/Clock.hpp>`.
+Nothing under `src/` may reach `<coro/...>` or `<platform/Clock.hpp>`, whether by
+including one or by including a vendored header that does. `ctest -R vendor-vocabulary`
+enforces it.
 
 The vendored copies exist for exactly one reason: to keep the vendored sources
 compiling **unmodified**. They are the price of the verbatim constraint, not a
@@ -114,14 +116,17 @@ Two facts that make this much less alarming than it sounds, both measured:
 
   **This previously said `runtime/` was not built and was enforced by a configure-time
   refusal. Both halves are now gone**, and the rule that survives is the one that was
-  actually load-bearing: **nothing under `src/` may include `<coro/...>` or
-  `<platform/Clock.hpp>`.** That is currently **unenforced** — the include root
-  `endo/` is exposed `PUBLIC` and necessarily carries `coro/` and `platform/` beside
-  `tui/`, so first-party code can reach the second vocabulary by construction, and
-  narrowing the root would hide `<tui/...>` from the consumers that need it. Measured
-  at the time of writing: `src/` reaches none of it. An open hazard with no current
-  violation, tracked rather than asserted here, because a comment nothing checks
-  cannot fail.
+  actually load-bearing: **nothing under `src/` may reach `<coro/...>` or
+  `<platform/Clock.hpp>`.** No arrangement of the vendored target can say that: the
+  include root `endo/` is exposed `PUBLIC` and necessarily carries `coro/` and
+  `platform/` beside `tui/`, so first-party code can reach the second vocabulary by
+  construction, and narrowing the root would hide `<tui/...>` from the consumers that
+  need it. So it is a scan, `scripts/check-vendor-vocabulary.cmake` (#1377). It
+  follows every include resolving into `vendor/endo` through the vendored headers,
+  because `<tui/runtime/TuiRuntime.hpp>` puts `coro::Task` in scope with no forbidden
+  spelling anywhere under `src/`. The one legitimate crossing, the adapter layer, is
+  an exemption row with a reason, and a row that stops describing a crossing is
+  refused.
 
   The built library's external surface is libunicode, `platform/{Types,Wakeup,Clock,
   SignalHandler}.hpp`, `coro/*` and `crispy/FNV.hpp`. `platform/SystemPipe.hpp` and
