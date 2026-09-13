@@ -44,6 +44,13 @@ constexpr auto Interval = std::chrono::milliseconds { 2000 };
                             .note = {} } };
 }
 
+/// What became of a terminal a source owned.
+struct TerminalRelease
+{
+    bool released { false };    ///< It was destroyed, which is what restores a real one.
+    bool closedFirst { false }; ///< It had been closed when it was, as its contract asks.
+};
+
 /// A terminal a case speaks for, one event at a time.
 ///
 /// It parks on an empty queue exactly as a terminal read parks on an idle input, and it
@@ -53,9 +60,31 @@ class SpokenTerminal final: public IDashboardEventSource
 {
   public:
     /// @param reactor Where a parked read is resumed.
-    explicit SpokenTerminal(IReactor& reactor):
-        _events { reactor, AsyncQueueOptions {} }
+    /// @param release Where to record this terminal's destruction, which is when production
+    ///        restores one; null when the case does not ask.
+    explicit SpokenTerminal(IReactor& reactor, TerminalRelease* release = nullptr):
+        _events { reactor, AsyncQueueOptions {} },
+        _release { release }
     {
+    }
+
+    SpokenTerminal(SpokenTerminal const&) = delete;
+    SpokenTerminal(SpokenTerminal&&) = delete;
+    SpokenTerminal& operator=(SpokenTerminal const&) = delete;
+    SpokenTerminal& operator=(SpokenTerminal&&) = delete;
+
+    ~SpokenTerminal() override
+    {
+        if (_release == nullptr)
+            return;
+        _release->released = true;
+        _release->closedFirst = _events.IsClosed();
+    }
+
+    /// The terminal goes away by itself: its reader gets `Detached` while nobody has closed it.
+    void GoAway()
+    {
+        (void) _events.Push(DashboardEvent { .kind = DashboardEventKind::Detached, .note = "the terminal went away" });
     }
 
     /// Say something at the terminal.
@@ -80,6 +109,7 @@ class SpokenTerminal final: public IDashboardEventSource
 
   private:
     AsyncQueue<DashboardEvent> _events;
+    TerminalRelease* _release;
 };
 
 /// A view whose frame is the sample count, which is all these cases read.
@@ -120,8 +150,12 @@ struct Rig
     CountView view {};
     CountSink sink {};
 
-    /// The terminal `SpokenParts()` built; owned by the source it went into.
+    /// The terminal `SpokenParts()` built; owned by the source it went into, so valid only
+    /// until `terminalRelease.released`.
     SpokenTerminal* terminal { nullptr };
+
+    /// What became of `terminal`.
+    TerminalRelease terminalRelease {};
 
     /// A source over this rig, with no terminal.
     /// @return The parts.
@@ -151,7 +185,7 @@ struct Rig
     /// @return The parts.
     [[nodiscard]] LiveSourceParts SpokenParts()
     {
-        auto spoken = std::make_unique<SpokenTerminal>(reactor);
+        auto spoken = std::make_unique<SpokenTerminal>(reactor, &terminalRelease);
         terminal = spoken.get();
         auto parts = Parts();
         parts.terminal = std::move(spoken);
@@ -554,6 +588,44 @@ TEST_CASE("a stop watch that fails ends the session saying why", "[cli][live][so
     auto const ended = NextDue(rig, source);
     CHECK(KindOf(ended) == DashboardEventKind::Detached);
     CHECK((ended.has_value() && ended->note.contains("Ctrl-C")));
+
+    CloseAndDrain(rig, source);
+}
+
+TEST_CASE("a terminal is released once nothing reads it and not when a stuck sample returns", "[cli][live][source]")
+{
+    // Releasing the terminal is what restores it. A sample that never comes back must not
+    // leave an operator's terminal in raw mode behind a process that is about to give up on
+    // that sample.
+    Rig rig;
+    LiveEventSource source { rig.SpokenParts() };
+    rig.reactor.Drain();
+    CHECK(rig.pool.PendingSubmissions() == 1);
+
+    source.Close();
+    rig.reactor.Drain();
+    CHECK(rig.terminalRelease.released);
+    CHECK(rig.terminalRelease.closedFirst);
+    // The sample is still out, and its start is readable from anywhere.
+    CHECK(source.SampleOutstandingSince() == rig.clock.Now());
+
+    rig.Settle();
+    CHECK_FALSE(source.SampleOutstandingSince().has_value());
+    CloseAndDrain(rig, source);
+}
+
+TEST_CASE("a terminal that goes away on its own is closed before it is released", "[cli][live][source]")
+{
+    Rig rig;
+    LiveEventSource source { rig.SpokenParts() };
+    rig.Settle();
+
+    // Detached with nobody having closed anything: the forwarder ends and releases the
+    // terminal, which its contract says must be closed first -- and nobody else closed it.
+    rig.terminal->GoAway();
+    rig.reactor.Drain();
+    CHECK(rig.terminalRelease.released);
+    CHECK(rig.terminalRelease.closedFirst);
 
     CloseAndDrain(rig, source);
 }
