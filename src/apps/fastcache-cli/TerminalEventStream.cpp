@@ -4,12 +4,14 @@
 #include <FastCache/Async/ResumeOn.hpp>
 #include <FastCache/Core/Ranges.hpp>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstdint>
 #include <deque>
 #include <exception>
 #include <mutex>
+#include <ranges>
 #include <string_view>
 #include <utility>
 #include <variant>
@@ -416,8 +418,6 @@ TerminalScreenBytes const& ScreenBytes()
                 output.showCursor();
                 output.leaveAltScreen();
             }),
-            .home = spell([](tui::TerminalOutput& output) { output.moveTo(1, 1); }),
-            .clearBelow = spell([](tui::TerminalOutput& output) { output.clearToEndOfDisplay(); }),
             .syncBegin = std::string { SyncBegin },
             .syncEnd = std::string { SyncEnd },
         };
@@ -432,18 +432,33 @@ bool PresentsSynchronized(TerminalCapabilities const& capabilities) noexcept
 
 std::string FrameBytes(std::string_view frame, bool synchronized)
 {
-    auto const& screen = ScreenBytes();
-    auto bytes = std::string {};
-    bytes.reserve(frame.size() + screen.home.size() + screen.clearBelow.size() + screen.syncBegin.size()
-                  + screen.syncEnd.size());
+    if (frame.ends_with('\n'))
+        frame.remove_suffix(1);
+
+    auto output = CapturedOutput {};
     if (synchronized)
-        bytes.append(screen.syncBegin);
-    bytes.append(screen.home);
-    bytes.append(frame);
-    bytes.append(screen.clearBelow);
+        output.writeRaw(SyncBegin);
+
+    // Everything from the frame's last row down is erased FIRST, and each row is erased before it is
+    // written, never after: an erase starts AT the cursor, and a row as wide as the screen leaves the
+    // cursor on its own last cell, so erasing after writing it would take that cell with it. Placing
+    // the clear below the frame instead would put it on a row the screen may not have, clamped to the
+    // bottom one.
+    auto const rows = frame.empty() ? 0 : std::ranges::count(frame, '\n') + 1;
+    output.moveTo(static_cast<int>(std::max<std::ptrdiff_t>(rows, 1)), 1);
+    output.clearToEndOfDisplay();
+    auto row = 1;
+    for (auto const line: frame | std::views::split('\n'))
+    {
+        output.moveTo(row, 1);
+        output.clearToEndOfLine();
+        output.writeRaw(std::string_view { line.begin(), line.end() });
+        ++row;
+    }
+
     if (synchronized)
-        bytes.append(screen.syncEnd);
-    return bytes;
+        output.writeRaw(SyncEnd);
+    return output.Take();
 }
 
 SynchronizedOutputAnswer ToSynchronizedOutputAnswer(tui::DecModeStatus status) noexcept
