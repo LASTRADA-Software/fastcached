@@ -711,17 +711,22 @@ TEST_CASE("a Resize between two frames lays out the next frame for the new size"
     // The size is model state, so the frame after a resize must be laid out for it. WHAT
     // DISTINGUISHES: the two frames' widths are each terminal's, the second fits the smaller height,
     // and the second is byte for byte what a view that only ever saw the new size draws -- so nothing
-    // measured at the old size (the trends' beside reserve) survives into the new layout.
+    // measured at the old size survives into the new layout.
+    //
+    // 45 columns, not any narrow width: here no beside text fits on any row, so the trends take all the
+    // room the figures leave, and the beside reserve measured at 132 columns would narrow them to their
+    // minimum. At 50 columns `get 100` still fits and keeps the trends at their minimum either way, so
+    // a view that never reset its reserve drew the identical frame there and passed.
     auto script = TwoTierScript();
-    script.push_back(DashboardEvent { .kind = DashboardEventKind::Resize, .columns = 50, .rows = 12 });
+    script.push_back(DashboardEvent { .kind = DashboardEventKind::Resize, .columns = 45, .rows = 12 });
     script.push_back(Tick);
     auto const frames = FramesAt(CachePanel(), std::move(script), RenderRung::Unicode, 132, 40);
     REQUIRE(frames.size() == 2);
     CHECK(WidestLine(frames[0]) == 132);
-    CHECK(WidestLine(frames[1]) == 50);
+    CHECK(WidestLine(frames[1]) == 45);
     CHECK(Lines(frames[1]).size() <= 12);
     CHECK(Lines(frames[0]).size() > Lines(frames[1]).size());
-    CHECK(frames[1] == CacheFrameAt(50, 12));
+    CHECK(frames[1] == CacheFrameAt(45, 12));
 }
 
 TEST_CASE("what does not fit goes in priority order, not position order", "[cli][dashboard][panel][responsive]")
