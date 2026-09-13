@@ -2016,8 +2016,321 @@ void AdoptAllowlist(Cc::CompileJobRunner& jobs,
     return surveyFoundNothing || fleetAssertionFailed ? ExitUsage : ExitOk;
 }
 
+/// What every early verb is handed.
+///
+/// One context rather than a parameter list per verb, because a shared signature is what
+/// makes the table below a table: a verb needing a different one would be a verb that
+/// could not be a row. `cliOnly` rides along for the service registration alone, which
+/// bakes in the command line AS TYPED and must not see what the file supplied -- the
+/// distinction the two parses at the top of `main` exist to draw.
+struct EarlyVerbContext
+{
+    /// The merged configuration: the file, then the command line applied over it.
+    ///
+    /// NOT `const`, and that is a statement about what these verbs do rather than an
+    /// oversight: the service registration MINTS this node's identity into it, because a
+    /// registration replays its command line forever and one that omitted the identity
+    /// would let a re-image answer to an identity the cluster never admitted. A `const`
+    /// context would read as "the verbs only inspect the configuration", which is false
+    /// for exactly the row where it matters most.
+    NodeConfig& cfg;
+
+    /// The command line alone, with no file applied.
+    ///
+    /// Not `const` either, and for a sharper reason than `cfg`: `AdoptNodeIdentity`
+    /// applies the resolved identity to BOTH, and this is the copy `MakeNodeServiceSpec`
+    /// bakes into the registration. A registration built from an un-stamped `cliOnly`
+    /// would replay forever with no `--node-id` at all, which is the defect the minting
+    /// exists to prevent rather than a lost optimisation.
+    NodeConfig& cliOnly;
+
+    /// Where a refusal goes. Still the CONSOLE logger, because every verb here answers
+    /// an operator at a terminal; the switch to an event log happens below them all.
+    ILogger& logger;
+};
+
+/// One verb that answers an operator and exits, ahead of the startup table.
+struct EarlyVerbRow
+{
+    /// Whether this verb is what was asked for. Reads the parsed configuration and
+    /// nothing else, so choosing a verb costs no I/O and cannot fail.
+    bool (*applies)(NodeConfig const& cfg);
+
+    /// The verb. What it returns is what `main` returns.
+    int (*run)(EarlyVerbContext const& context);
+};
+
+/// Print the resolved surface map, and judge it (`--print-surfaces`).
+/// @param context The configuration and the console logger.
+/// @return `ExitOk` when the configuration would start, `ExitUsage` when it would not.
+[[nodiscard]] int RunPrintSurfaces(EarlyVerbContext const& context)
+{
+    // **The ordering is right; the exit code was the defect** (#582). This printed the
+    // map and returned 0 for a configuration the node then refuses to run -- measured:
+    // the documented scheduler line without `--cluster-key-file` exits 2 on its own and
+    // exited 0 through this flag. Since the flag prints the RESOLVED configuration, an
+    // operator reaches for it before writing a unit file, and it answered "fine" to a
+    // command line with no chance of starting.
+    //
+    // Printing the map for a broken configuration is the feature; reporting SUCCESS for
+    // it is not. `ReportSurfaces` renders and judges in one call so this site decides
+    // nothing: the verdict is `StartupPolicyRejection`'s own sentence, and the exit code
+    // follows from whether there is one. See that function for why it is a function
+    // rather than four lines here -- the verbs in `EarlyVerbs` answer and exit ahead of
+    // the startup table, and they do not all want the same answer.
+    auto const report = ReportSurfaces(context.cfg);
+    std::cout << report.text;
+    if (!report.refusal.has_value())
+        return ExitOk;
+    context.logger.Logf(LogLevel::Error, "{}", *report.refusal);
+    return ExitUsage;
+}
+
+/// Write the packaged configuration template to this binary's own system path
+/// (`--seed-config`).
+///
+/// The WORKER seeds its own file. `fastcached --seed-config` derives its destination
+/// from `DaemonApplicationName`, so it can only ever write the daemon's -- which is why
+/// the MSI shipped no worker configuration and the .pkg shipped none either (#397).
+/// Deriving it here from this binary's own application name is what makes the seeded
+/// path and the path the startup lookup walks one answer rather than two that agree
+/// until somebody edits one.
+/// @param context The configuration and the console logger.
+/// @return `ExitOk` once the file is in place, `ExitUsage` when it could not be written.
+[[nodiscard]] int RunSeedConfig(EarlyVerbContext const& context)
+{
+    auto const seeded =
+        SystemConfigPath(SystemConfigPathProbe {}, NodeApplicationName).and_then([&context](auto const& destination) {
+            return SeedConfigFile(context.cfg.seedConfigTemplate, destination, DirectoryPolicy::AdministratorsOnly);
+        });
+    if (!seeded.has_value())
+    {
+        context.logger.Logf(LogLevel::Error, "{}", seeded.error().ToString());
+        return ExitUsage;
+    }
+    context.logger.Logf(LogLevel::Info, "{}", SeedOutcomeSentence(*seeded, context.cfg.seedConfigTemplate));
+    return ExitOk;
+}
+
+/// Register or remove this worker's service entry (`--install-service`,
+/// `--uninstall-service`).
+/// @param context The merged configuration, the command line alone, and the logger.
+/// @return The registration's own exit code, or `ExitUsage` when it was refused.
+[[nodiscard]] int RunServiceRegistration(EarlyVerbContext const& context)
+{
+    // Only an install has to be viable; an uninstall merely names a registration to
+    // remove, and refusing to remove one because it was misconfigured is how a bad
+    // registration becomes permanent.
+    //
+    // Judged on the MERGED configuration, and registered from the command line alone --
+    // which is not a contradiction. What the service will run with is the file plus
+    // these arguments, so judging the command line alone would refuse the documented
+    // setup, where `--scheduler` and the toolchains come out of the packaged file. What
+    // is baked in is still only what was typed, plus the `--config` path that supplies
+    // the rest.
+    if (context.cfg.installService)
+        if (auto const rejection = NodeInstallRejection(context.cfg))
+        {
+            context.logger.Logf(LogLevel::Error, "{}", *rejection);
+            return ExitUsage;
+        }
+
+    // The identity the registration will bake in, resolved here because a registration
+    // replays its command line forever: one that omitted it would let a re-image answer
+    // to an identity the cluster never admitted, with both machines up throughout. AFTER
+    // `NodeInstallRejection`, so a command line this install is about to refuse leaves
+    // no state directory behind, exactly as the start path resolves after its own table.
+    //
+    // An uninstall reaches neither -- `NodeIdentityNeed` declines it -- because removing
+    // a registration is the recovery an operator reaches for when the configuration is
+    // already wrong.
+    SystemRandomSource identityRandom;
+    if (auto const adopted = AdoptNodeIdentity(context.cfg, context.cliOnly, identityRandom, context.logger);
+        !adopted.has_value())
+    {
+        context.logger.Logf(LogLevel::Error, "{}; refusing to install", adopted.error());
+        return ExitUsage;
+    }
+
+    // `cliOnly`, never `cfg`: a registration replays its arguments at every start, so
+    // baking in what the FILE said would freeze one reading of that file into launch
+    // arguments that then outrank the file itself -- the operator edits it, restarts the
+    // service, and nothing changes. What the registration does carry is the `--config`
+    // path, so the service reads the current file at every start rather than a snapshot
+    // of it.
+    auto const spec = MakeNodeServiceSpec(CurrentExecutablePath(), context.cliOnly);
+    auto const result = context.cfg.installService ? InstallService(spec, context.cfg.serviceScope)
+                                                   : UninstallService(spec, context.cfg.serviceScope);
+    if (result.exitCode == 0)
+        std::cout << "fastcache-compile-node: " << result.message << '\n';
+    else
+        std::cerr << "fastcache-compile-node: " << result.message << '\n';
+    return result.exitCode;
+}
+
+/// Convert this node's disk tier to the format this build reads (`--migrate-cache`).
+/// @param context The configuration and the console logger.
+/// @return 0 once converted, `ExitUsage` when the store could not be.
+[[nodiscard]] int RunMigrateCache(EarlyVerbContext const& context)
+{
+    auto const outcome = MigrateDiskTier(context.cfg);
+    if (!outcome.has_value())
+    {
+        context.logger.Logf(LogLevel::Error, "{}", outcome.error());
+        return ExitUsage;
+    }
+    std::cout << "fastcache-compile-node: " << *outcome << '\n';
+    return 0;
+}
+
+/// Put a cluster question to a running cluster and report the answer (`--cluster-*`).
+///
+/// No reloader exists at this point and none ever will on this path: a cluster verb
+/// answers and the process returns. The seam is threaded through anyway, so the day one
+/// of these is asked from a running worker it reads the live secret rather than the one
+/// this process was started with.
+/// @param context The configuration.
+/// @return What the verb answered, rendered by `ReportOneShotVerb`.
+[[nodiscard]] int RunClusterVerb(EarlyVerbContext const& context)
+{
+    Node::ConfiguredCredential const credential { context.cfg, nullptr };
+    return ReportOneShotVerb(RunClusterAdmin(context.cfg, context.cfg.cluster, credential));
+}
+
+/// Decide who may join, on behalf of an operator (`--enroll-*`).
+/// @param context The configuration.
+/// @return What the verb answered, rendered by `ReportOneShotVerb`.
+[[nodiscard]] int RunEnrollVerb(EarlyVerbContext const& context)
+{
+    Node::ConfiguredCredential const credential { context.cfg, nullptr };
+    return ReportOneShotVerb(Node::RunEnrollAdmin(context.cfg, context.cfg.enroll, credential));
+}
+
+/// Ask another cluster to let this machine in (`--enroll-from`).
+/// @param context The configuration.
+/// @return What the exchange answered, rendered by `ReportOneShotVerb`.
+[[nodiscard]] int RunEnrollFrom(EarlyVerbContext const& context)
+{
+    SystemRandomSource enrollRandom;
+    Node::ConfiguredCredential const credential { context.cfg, nullptr };
+    return ReportOneShotVerb(Node::RunEnrollClient(context.cfg, credential, enrollRandom), "fastcache-compile-node: ");
+}
+
+/// The verbs that answer an operator and exit, in the order they are asked.
+///
+/// A plain array rather than an `EnumTable`, and the reason is that nothing indexes
+/// this: the ORDER is the content. There is no enumerator to be in the order of, so
+/// `RowsInEnumeratorOrder` would have nothing to check, and a trailing `Last` would be a
+/// sentinel for a sequence that is keyed by nothing.
+///
+/// Each row carries the reason it sits where it does. That ordering used to be expressed
+/// by the LAYOUT of seven `if` blocks in `main` -- true, readable only by scrolling, and
+/// with nothing that made reordering them show up as a change to the thing being ordered.
+constexpr std::array<EarlyVerbRow, 7> EarlyVerbs { {
+    // **Below the logger and still above the startup table** (#582). Its refusal has to
+    // reach the same terminal a start prints to, rendered the same way -- an operator
+    // who meets that sentence here and again at boot should be reading one message, not
+    // matching two. Ahead of `StartupPolicyRejection`, so the worksheet is printed for a
+    // broken configuration: an operator reaches for this BECAUSE a port is wrong, and
+    // withholding the map until the configuration is valid would withhold it exactly
+    // when it is wanted. It opens nothing, so there is no state to protect.
+    { .applies = [](NodeConfig const& cfg) { return cfg.printSurfaces; }, .run = &RunPrintSurfaces },
+
+    // Seeding, ahead of the startup table for `--print-surfaces`' reason: it is an
+    // INSTALLER step, run before this machine has a working configuration at all, so
+    // refusing it until the configuration is already valid would make it unusable at the
+    // only moment it is wanted.
+    { .applies = [](NodeConfig const& cfg) { return !cfg.seedConfigTemplate.empty(); }, .run = &RunSeedConfig },
+
+    // Service registration, before anything that costs time. A misconfiguration is
+    // decided in microseconds while a toolchain fingerprint takes seconds, which is the
+    // same cheap-and-fallible-first ordering the socket-activation check follows.
+    //
+    // The command line is registered as typed. Every other flag alongside
+    // `--install-service` is baked in and reused at every start, so a registration that
+    // cannot work must fail here, where an operator is watching, rather than at every
+    // boot where nobody is. That is why the gate is `NodeInstallRejection` and not
+    // `NodeServiceRejection`: an install has to satisfy the STARTUP rules as well, since
+    // this returns before they are ever reached and every one of them is decided by the
+    // command line being baked in.
+    { .applies = [](NodeConfig const& cfg) { return cfg.installService || cfg.uninstallService; },
+      .run = &RunServiceRegistration },
+
+    // Converting the store acts on the files and exits. After the service row for the
+    // same reason that one is early -- it costs microseconds to decide -- and before
+    // everything below it, because a node whose store is of the wrong vintage cannot
+    // start at all: making the operator satisfy `--scheduler` or a toolchain probe first
+    // would be demanding they fix a running configuration before being allowed to fix
+    // the store that stops it running.
+    { .applies = [](NodeConfig const& cfg) { return cfg.migrateCache; }, .run = &RunMigrateCache },
+
+    // A question asked OF a running cluster, rather than a worker starting up. After the
+    // service row, because an installation is about this machine and this is about
+    // somebody else's; before the `--scheduler` and `--toolchain` checks, because a
+    // cluster command needs the first and not the second.
+    { .applies = [](NodeConfig const& cfg) { return cfg.cluster.action != ClusterAction::None; }, .run = &RunClusterVerb },
+
+    // An operator deciding who may join, rather than a worker starting up. Beside the
+    // cluster row because it is the same kind of thing -- a question put to a running
+    // cluster by a person at a terminal, answered, and the process exits.
+    { .applies = [](NodeConfig const& cfg) { return cfg.enroll.action != EnrollAction::None; }, .run = &RunEnrollVerb },
+
+    // A machine asking to be LET IN to somebody else's cluster. Beside the cluster row
+    // and after it, because the two are the same kind of thing from opposite ends --
+    // that one is an operator administering a cluster they are already in, this one is a
+    // machine that is not in one yet.
+    //
+    // Before the startup table below, and that is the point rather than an accident:
+    // those rules judge a configuration this node will SERVE with, and this one serves
+    // nothing at all. A node enrolling has no --scheduler and no toolchain, and being
+    // refused for either would refuse exactly the fresh install the mode exists for.
+    // What this mode itself requires -- somewhere to write the key, and a consensus
+    // identity to be admitted AS -- it refuses by name itself, which is the shape
+    // `RunClusterAdmin` already uses for its own `--scheduler`.
+    { .applies = [](NodeConfig const& cfg) { return !cfg.enrollFrom.empty(); }, .run = &RunEnrollFrom },
+} };
+
 } // namespace
 
+// **`main` scores 37 against a threshold of 60, and NOTHING ENFORCES THAT MARGIN.**
+//
+// Recorded rather than guarded, which is the honest half of #1351 and is stated here so
+// nobody reads it as a guarantee. `readability-function-cognitive-complexity.Threshold`
+// in `.clang-tidy` is GLOBAL: there is no per-function budget to express this in, and
+// lowering the global number to enforce it would redden every function sitting between
+// the new number and 60. So this figure is checked by nobody and will decay exactly the
+// way the 60 it replaced did -- incrementally, with every contributor seeing a passing
+// build. A comment claiming otherwise would be worse than no comment, because it would
+// retire the suspicion.
+//
+// Measured 2026-09-13 on `b5ff67f1`, with `clang-tidy-22` at apt.llvm.org snapshot
+// `1:22.1.8~++20260714014902+ca7933e47d3a` -- the build, not just the major, because two
+// snapshots a month apart print the same `--version`. Re-derive it in one command
+// against any build directory holding a compile database. The indented lines are ONE
+// command, wrapped for width:
+//
+//     clang-tidy-22 -p <build-dir> --quiet
+//       --config="{Checks: '-*,readability-function-cognitive-complexity',
+//                  CheckOptions: [{key: readability-function-cognitive-complexity.Threshold,
+//                                  value: '1'}]}"
+//       src/apps/fastcache-compile-node/main.cpp
+//
+// Wrapped WITHOUT trailing backslashes, deliberately. A `//` line ending in one is a
+// LINE SPLICE: the next line is swallowed into the comment, and GCC refuses the file
+// under `-Wcomment` with `-Werror` while clang's leg says nothing at all. Measured --
+// this exact block failed `gate-gcc-release` that way, during dependency scanning, so
+// the error named a phase rather than a line anyone was looking at.
+//
+// A threshold of 1 makes every function report its own score; at the real threshold of
+// 60 this file reports nothing at all.
+//
+// The check fires on EXCEEDING the threshold, which is measured here rather than
+// inferred from its documentation: `WorkerBody` scores 59, and it reports at a threshold
+// of 58 and stays silent at 59. So 60 passes and 61 fails, and the margin below is 23
+// ordinary edits' worth at the 1-to-3 points an added conditional typically costs.
+//
+// **`WorkerBody` is at 59 and is the next instance.** This change did not buy `main`'s
+// headroom out of it: it measured 59 before and 59 after.
 int main(int argc, char** argv)
 {
     std::span<char const* const> const argvSpan { const_cast<char const* const*>(argv), static_cast<std::size_t>(argc) };
@@ -2158,189 +2471,20 @@ int main(int argc, char** argv)
     // which is the half a signature cannot check.
     auto const consoleLogger = MakeNodeConsoleLogger(std::cerr, cfg);
 
-    // **Moved BELOW the logger and still above the startup table** (#582). It is one of
-    // the terminal-facing verbs the comment above is about, and its refusal has to
-    // reach the same terminal, rendered the same way as the one a start prints -- an
-    // operator who meets this sentence here and again at boot should be reading one
-    // message, not matching two. The ordering that matters is unchanged: this is still
-    // ahead of `StartupPolicyRejection`, so the worksheet is printed for a broken
-    // configuration exactly as before, and only the exit code moved.
-    if (cfg.printSurfaces)
-    {
-        // Before the startup rules below, deliberately. An operator reaches for this
-        // BECAUSE a port is wrong, and refusing to show the map until the
-        // configuration is already valid would withhold it exactly when it is wanted.
-        // It opens nothing and changes nothing, so there is no state to protect.
-        //
-        // **The ordering is right; the exit code was the defect** (#582). This printed
-        // the map and returned 0 for a configuration the node then refuses to run --
-        // measured: the documented scheduler line without `--cluster-key-file` exits 2
-        // on its own and exited 0 through this flag. Since the flag prints the RESOLVED
-        // configuration, an operator reaches for it before writing a unit file, and it
-        // answered "fine" to a command line with no chance of starting.
-        //
-        // Printing the map for a broken configuration is the feature; reporting SUCCESS
-        // for it is not. `ReportSurfaces` renders and judges in one call so this site
-        // decides nothing: the verdict is `StartupPolicyRejection`'s own sentence, and
-        // the exit code follows from whether there is one. See that function for why it
-        // is a function rather than four lines here -- five verbs answer and exit ahead
-        // of the startup table, and they do not all want the same answer.
-        auto const report = ReportSurfaces(cfg);
-        std::cout << report.text;
-        if (!report.refusal.has_value())
-            return ExitOk;
-        consoleLogger->Logf(LogLevel::Error, "{}", *report.refusal);
-        return ExitUsage;
-    }
-
-    // Seeding, ahead of the startup table for `--print-surfaces`' reason: it is an
-    // INSTALLER step, run before this machine has a working configuration at all, so
-    // refusing it until the configuration is already valid would make it unusable at
-    // the only moment it is wanted.
+    // The verbs that answer an operator and exit, asked in one place.
     //
-    // The WORKER seeds its own file. `fastcached --seed-config` derives its
-    // destination from `DaemonApplicationName`, so it can only ever write the daemon's
-    // — which is why the MSI shipped no worker configuration and the .pkg shipped none
-    // either (#397). Deriving it here from this binary's own application name is what
-    // makes the seeded path and the path the startup lookup walks one answer rather
-    // than two that agree until somebody edits one.
-    if (!cfg.seedConfigTemplate.empty())
-    {
-        auto const seeded =
-            SystemConfigPath(SystemConfigPathProbe {}, NodeApplicationName).and_then([&](auto const& destination) {
-                return SeedConfigFile(cfg.seedConfigTemplate, destination, DirectoryPolicy::AdministratorsOnly);
-            });
-        if (!seeded.has_value())
-        {
-            consoleLogger->Logf(LogLevel::Error, "{}", seeded.error().ToString());
-            return ExitUsage;
-        }
-        consoleLogger->Logf(LogLevel::Info, "{}", SeedOutcomeSentence(*seeded, cfg.seedConfigTemplate));
-        return ExitOk;
-    }
-
-    // Service registration, before anything that costs time. A misconfiguration is
-    // decided in microseconds while a toolchain fingerprint takes seconds, which is
-    // the same cheap-and-fallible-first ordering the socket-activation check follows.
+    // Each of these was an `if` block returning from `main`, and together they were 25
+    // of this function's 60 cognitive-complexity points against a threshold of 60 --
+    // because a test nested one level inside another costs TWICE what the same test
+    // costs at the top level, so the error handling inside each verb was charged at the
+    // nested rate (#1351). The same seven verbs cost three points as a walk.
     //
-    // The command line is registered as typed. Every other flag alongside
-    // --install-service is baked in and reused at every start, so a registration
-    // that cannot work must fail here, where an operator is watching, rather than
-    // at every boot where nobody is. That is why the gate is
-    // `NodeInstallRejection` and not `NodeServiceRejection`: an install has to
-    // satisfy the STARTUP rules as well, since this returns before they are ever
-    // reached and every one of them is decided by the command line being baked in.
-    if (cfg.installService || cfg.uninstallService)
-    {
-        // Only an install has to be viable; an uninstall merely names a
-        // registration to remove, and refusing to remove one because it was
-        // misconfigured is how a bad registration becomes permanent.
-        //
-        // Judged on the MERGED configuration, and registered from the command line
-        // alone -- which is not a contradiction. What the service will run with is
-        // the file plus these arguments, so judging the command line alone would
-        // refuse the documented setup, where `--scheduler` and the toolchains come
-        // out of the packaged file. What is baked in is still only what was typed,
-        // plus the `--config` path that supplies the rest.
-        if (cfg.installService)
-            if (auto const rejection = NodeInstallRejection(cfg))
-            {
-                consoleLogger->Logf(LogLevel::Error, "{}", *rejection);
-                return ExitUsage;
-            }
-
-        // The identity the registration will bake in, resolved here because a
-        // registration replays its command line forever: one that omitted it would let
-        // a re-image answer to an identity the cluster never admitted, with both
-        // machines up throughout. AFTER `NodeInstallRejection`, so a command line this
-        // install is about to refuse leaves no state directory behind, exactly as the
-        // start path resolves after its own table.
-        //
-        // An uninstall reaches neither -- `NodeIdentityNeed` declines it -- because
-        // removing a registration is the recovery an operator reaches for when the
-        // configuration is already wrong.
-        SystemRandomSource identityRandom;
-        if (auto const adopted = AdoptNodeIdentity(cfg, cliOnly, identityRandom, *consoleLogger); !adopted.has_value())
-        {
-            consoleLogger->Logf(LogLevel::Error, "{}; refusing to install", adopted.error());
-            return ExitUsage;
-        }
-
-        // `cliOnly`, never `cfg`: a registration replays its arguments at every
-        // start, so baking in what the FILE said would freeze one reading of that
-        // file into launch arguments that then outrank the file itself -- the
-        // operator edits it, restarts the service, and nothing changes. What the
-        // registration does carry is the `--config` path, so the service reads the
-        // current file at every start rather than a snapshot of it.
-        auto const spec = MakeNodeServiceSpec(CurrentExecutablePath(), cliOnly);
-        auto const result =
-            cfg.installService ? InstallService(spec, cfg.serviceScope) : UninstallService(spec, cfg.serviceScope);
-        if (result.exitCode == 0)
-            std::cout << "fastcache-compile-node: " << result.message << '\n';
-        else
-            std::cerr << "fastcache-compile-node: " << result.message << '\n';
-        return result.exitCode;
-    }
-
-    // Converting the store acts on the files and exits. After the service block
-    // for the same reason that one is early -- it costs microseconds to decide --
-    // and before everything below it, because a node whose store is of the wrong
-    // vintage cannot start at all: making the operator satisfy `--scheduler` or a
-    // toolchain probe first would be demanding they fix a running configuration
-    // before being allowed to fix the store that stops it running.
-    if (cfg.migrateCache)
-    {
-        auto const outcome = MigrateDiskTier(cfg);
-        if (!outcome.has_value())
-        {
-            consoleLogger->Logf(LogLevel::Error, "{}", outcome.error());
-            return ExitUsage;
-        }
-        std::cout << "fastcache-compile-node: " << *outcome << '\n';
-        return 0;
-    }
-
-    // A question asked OF a running cluster, rather than a worker starting up.
-    // After the service block, because an installation is about this machine and
-    // this is about somebody else's; before the `--scheduler` and `--toolchain`
-    // checks, because a cluster command needs the first and not the second.
-    if (cfg.cluster.action != ClusterAction::None)
-    {
-        // No reloader exists at this point and none ever will on this path: a
-        // cluster verb answers and the process returns. The seam is threaded through
-        // anyway, so the day one of these is asked from a running worker it reads the
-        // live secret rather than the one this process was started with.
-        Node::ConfiguredCredential const credential { cfg, nullptr };
-        return ReportOneShotVerb(RunClusterAdmin(cfg, cfg.cluster, credential));
-    }
-
-    // An operator deciding who may join, rather than a worker starting up. Beside the
-    // cluster block because it is the same kind of thing -- a question put to a running
-    // cluster by a person at a terminal, answered, and the process exits.
-    if (cfg.enroll.action != EnrollAction::None)
-    {
-        Node::ConfiguredCredential const credential { cfg, nullptr };
-        return ReportOneShotVerb(Node::RunEnrollAdmin(cfg, cfg.enroll, credential));
-    }
-
-    // A machine asking to be LET IN to somebody else's cluster, rather than a worker
-    // starting up. Beside the cluster block and after it, because the two are the same
-    // kind of thing from opposite ends -- that one is an operator administering a
-    // cluster they are already in, this one is a machine that is not in one yet.
-    //
-    // Before the startup table below, and that is the point rather than an accident:
-    // those rules judge a configuration this node will SERVE with, and this one serves
-    // nothing at all. A node enrolling has no --scheduler and no toolchain, and being
-    // refused for either would refuse exactly the fresh install the mode exists for.
-    // What this mode itself requires -- somewhere to write the key, and a consensus
-    // identity to be admitted AS -- it refuses by name itself, which is the shape
-    // `RunClusterAdmin` already uses for its own `--scheduler`.
-    if (!cfg.enrollFrom.empty())
-    {
-        SystemRandomSource enrollRandom;
-        Node::ConfiguredCredential const credential { cfg, nullptr };
-        return ReportOneShotVerb(Node::RunEnrollClient(cfg, credential, enrollRandom), "fastcache-compile-node: ");
-    }
+    // The order is `EarlyVerbs`' order, and each row carries the reason it sits where it
+    // does.
+    EarlyVerbContext const verbContext { .cfg = cfg, .cliOnly = cliOnly, .logger = *consoleLogger };
+    for (auto const& verb: EarlyVerbs)
+        if (verb.applies(cfg))
+            return verb.run(verbContext);
 
     // NOW the sink is chosen. Everything from here is what a RUNNING service reports
     // -- every startup refusal below, the toolchain survey, and the loop itself --
