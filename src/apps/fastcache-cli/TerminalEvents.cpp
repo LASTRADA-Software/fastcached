@@ -4,11 +4,17 @@
 
 #include <FastCache/Platform/Terminal.hpp>
 
+#include <array>
+#include <atomic>
 #include <exception>
+#include <optional>
+#include <string>
+#include <string_view>
 #include <utility>
 
 #include <platform/Wakeup.hpp>
 #include <tui/Terminal.hpp>
+#include <tui/TerminalProtocols.hpp>
 #include <tui/runtime/TerminalEventSource.hpp>
 
 namespace FastCache::Cli
@@ -16,6 +22,31 @@ namespace FastCache::Cli
 
 namespace
 {
+    /// What `RestoreNow` writes before putting the modes back, in this order.
+    ///
+    /// First `CAN`, which abandons an escape sequence the dashboard was halfway through writing, so
+    /// the rest is not read as its tail. Then the input protocols endo's `Terminal` pushes -- the
+    /// union of what its POSIX and Windows arms enable, since switching off a mode that was never on
+    /// is harmless -- spelled through endo's own constants rather than restated. Then what a
+    /// renderer switches on: synchronized output, a hidden cursor, the alternate screen.
+    ///
+    /// **Leaving the alternate screen is the one that is not free.** `CSI ? 1049 l` also restores
+    /// the cursor saved on entry, so on a terminal that never entered the alternate screen it can
+    /// move the cursor. This is for an exit, where a moved cursor beats a shell on the wrong screen.
+    constexpr auto RestoreNowSequences = std::to_array<std::string_view>({
+        "\x18",
+        tui::protocols::DisableFocusTracking,
+        tui::protocols::DisableColorSchemeNotify,
+        tui::protocols::DisableBracketedPaste,
+        tui::protocols::DisableAnyMotionTracking,
+        tui::protocols::DisablePassiveMouseTracking,
+        tui::protocols::DisableWin32InputMode,
+        tui::protocols::DisableCsiU,
+        "\x1b[?2026l",
+        "\x1b[?25h",
+        "\x1b[?1049l",
+    });
+
     /// endo's `Terminal`, the wakeup `Close()` signals, and the event source waiting on both.
     ///
     /// Member ORDER is the lifetime: the source borrows the terminal and the wakeup, so it is
@@ -45,6 +76,10 @@ namespace
         {
             if (!StandardStreamsAreInteractive())
                 return std::unexpected(std::string { "standard input and output are not both an interactive terminal" });
+            // BEFORE `initialize()` changes anything: these are the modes `RestoreNow` puts back.
+            _saved = SavedTerminalModes::Capture();
+            for (auto const sequence: RestoreNowSequences)
+                _resets.append(sequence);
             if (auto opened = _terminal.initialize(); !opened)
                 return std::unexpected("the terminal could not be opened: " + opened.error());
             return {};
@@ -82,6 +117,16 @@ namespace
 
         void Restore() noexcept override
         {
+            // After a `RestoreNow`, endo's teardown below sends its input resets a second time. Every
+            // one of them lands where the terminal already is except the keyboard protocol's POP, which
+            // would pop an entry the dashboard never pushed -- a shell's own. So the entry `RestoreNow`
+            // popped is pushed back first, for this pop to take. Once: the exchange makes the device's
+            // own destructor, calling this again after endo has shut down, push nothing.
+            if (_restoredNow.exchange(false, std::memory_order_acq_rel))
+            {
+                _terminal.output().writeRaw(tui::protocols::EnableCsiU);
+                _terminal.output().flush();
+            }
             // `Terminal::shutdown` undoes a completed `initialize()` (protocols, raw mode, the SIGWINCH
             // handler) and does nothing when it never completed. The input's own `shutdown` then covers
             // an `initialize()` that got as far as raw mode and no further. Both are idempotent.
@@ -89,10 +134,24 @@ namespace
             _terminal.input().shutdown();
         }
 
+        void RestoreNow() noexcept override
+        {
+            // Not `shutdown()`: that closes the resize pipe the parked `poll` is waiting on and writes
+            // endo's state unlocked. The saved modes are this device's own, written once in `Acquire`
+            // on the pool and read only after the start handed the device back.
+            if (!_saved.has_value())
+                return;
+            _saved->Apply(_resets);
+            _restoredNow.store(true, std::memory_order_release);
+        }
+
       private:
         tui::Terminal _terminal;
         endo::platform::Wakeup _wakeup;
         tui::runtime::TerminalEventSource _source;
+        std::optional<SavedTerminalModes> _saved;
+        std::string _resets;
+        std::atomic<bool> _restoredNow { false };
     };
 } // namespace
 
