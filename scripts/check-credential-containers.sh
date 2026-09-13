@@ -99,38 +99,119 @@ SourceFiles() {
 # Strip full-line comments, so a rule quoted in a comment is not a call site. A comment
 # is not a declaration, and two checks in this tree have already matched their own
 # headers (#723).
+#
+# ONE awk rather than the three greps this used to be (`grep -n ''` into two `grep -v`).
+# The output is byte-identical -- `NR ":" $0` is what `grep -n` prints, and the pattern
+# tests the line itself rather than the numbered form of it, which is what the sentence
+# above always meant.
+#
+# Three processes became one, which is worth less than it sounds and is kept for the
+# clarity rather than the saving: MEASURED under Git Bash, awk costs 22.9 ms to start
+# against grep's 21.3, so this trades three cheap starts for one about as cheap. What
+# made the difference was running it once per FILE instead of once per (file, identifier),
+# and then not running it on files that cannot match at all (#1331).
 # reads a file path on $1
 CodeLines() {
-    grep -n '' "$1" 2>/dev/null | grep -v '^[0-9]*:[[:space:]]*//' | grep -v '^[0-9]*:[[:space:]]*\*'
+    awk '!/^[[:space:]]*(\/\/|\*)/ { print NR ":" $0 }' "$1" 2>/dev/null
 }
 
 # $1: root. Prints "file:line:text" for every offending declaration; sets Matched counts.
+#
+# FILES OUTER, IDENTIFIERS INNER, and a candidate pass in front of both -- the cost fix
+# rather than a tidy-up (#1331). `CodeLines` is a property of the FILE alone, so running
+# it inside the identifier loop re-derived the same stripped text once per identifier,
+# four times per file here and a fifth the day somebody adds a row.
+#
+# MEASURED at 765 files and 4 identifiers, in PROCESS CREATIONS -- tool spawns plus
+# subshell forks, because a `$( )` forks and costs 12.97 ms against a grep's 21.2:
+#
+#     original             12,506 spawns + 3,061 forks = 15,567
+#     hoist alone           4,091 spawns + 3,826 forks =  7,917
+#     hoist + candidates       364 spawns +    97 forks =    461
+#
+# Counting tool spawns ALONE said the hoist was a 3.06x win; the CI leg said 1.51x, and
+# the difference was that the hoist had increased the FORK count while cutting spawns. A
+# model and a counter that share an assumption agree with each other and with nothing
+# else.
+#
+# What this must NOT lose is the per-identifier verdict: a term matching nothing is a
+# REFUSAL here, deliberately, because that is what a rename leaves behind and it looks
+# exactly like a clean tree. With the loops swapped there is no longer one counter alive
+# per identifier pass, so the counts are carried in a parallel array instead -- and it is
+# PARALLEL ARRAYS rather than an associative one because a hygiene script `ctest` runs is
+# constrained to macOS's 2007 bash 3.2, which has no `declare -A`.
 ScanRoot() {
     local root="$1"
-    local files identifier reason ownedType findings totalMatches identMatches file hits
-    local line text
+    local files identifier reason ownedType findings totalMatches file hits
+    local line text code index
 
     files=$(SourceFiles "$root")
     [ -n "$files" ] || Refuse "no source files under $root -- an empty population agrees with every rule"
 
+    # The vocabulary, read once. `identCounts` is what the refusal below reads.
+    local identNames=() identReasons=() identCounts=() alternation=""
+    while IFS='|' read -r identifier reason; do
+        [ -n "$identifier" ] || continue
+        identNames+=("$identifier")
+        identReasons+=("$reason")
+        identCounts+=(0)
+        # Built with shell string ops rather than a `$( )`, because a subshell FORK
+        # is the cost this whole function is now organised around: measured under
+        # Git Bash, `x=$(true)` is 12.97 ms against 21.2 ms for an entire `grep`,
+        # while a builtin is free.
+        if [ -z "$alternation" ]; then
+            alternation="$identifier"
+        else
+            alternation="${alternation}|${identifier}"
+        fi
+    done <<< "$CredentialIdentifiers"
+
+    # ONE pass to find the files worth opening, and it is the difference between
+    # this scan costing minutes and costing seconds (#1331).
+    #
+    # WHY IT IS SAFE, which is the only interesting thing about it: a file with no
+    # whole-word mention of ANY identifier contributes zero to every per-identifier
+    # count and can produce no finding, so excluding it changes no number this
+    # function reports. It is a SUPERSET filter -- comments are not stripped here,
+    # so a file mentioning an identifier only in a comment still gets opened and
+    # still contributes zero once `CodeLines` has stripped it. The anchoring is the
+    # same `\b` as below, so it cannot reach `clusterKeyFile` either.
+    #
+    # `find -exec ... {} +` rather than passing the file list as arguments: 765
+    # paths is roughly 46 KB of command line, and Windows caps a process's at about
+    # 32 KB. `find` batches to whatever the platform allows.
+    local candidates
+    candidates=$(find "$root" -type f \( -name '*.cpp' -o -name '*.hpp' \) \
+        -exec grep -lE "\\b(${alternation})\\b" {} + 2>/dev/null | sort)
+
     totalMatches=0
     findings=""
 
-    while IFS='|' read -r identifier reason; do
-        [ -n "$identifier" ] || continue
+    # An EMPTY candidate list is not an error here: it means no file mentions any
+    # identifier, and the per-identifier refusals below are what report that -- by
+    # name, one per term, which is more useful than a single "nothing matched".
+    while IFS= read -r file; do
+        [ -n "$file" ] || continue
 
-        identMatches=0
-        while IFS= read -r file; do
-            [ -n "$file" ] || continue
+        # ONCE per file, for every identifier that follows.
+        code=$(CodeLines "$file")
+        [ -n "$code" ] || continue
 
-            # Every code line mentioning this identifier as a whole word.
-            local hits
-            hits=$(CodeLines "$file" | grep -E "\\b${identifier}\\b" 2>/dev/null)
-            [ -n "$hits" ] || continue
+        index=0
+        while [ "$index" -lt "${#identNames[@]}" ]; do
+            identifier="${identNames[$index]}"
+
+            # Every code line mentioning this identifier as a whole word. The matcher is
+            # unchanged: `\b`-anchored, so a row cannot reach `clusterKeyFile`.
+            hits=$(grep -E "\\b${identifier}\\b" <<< "$code" 2>/dev/null)
+            if [ -z "$hits" ]; then
+                index=$((index + 1))
+                continue
+            fi
 
             while IFS= read -r hit; do
                 [ -n "$hit" ] || continue
-                identMatches=$((identMatches + 1))
+                identCounts[$index]=$(( ${identCounts[$index]} + 1 ))
                 totalMatches=$((totalMatches + 1))
                 line="${hit%%:*}"
                 text="${hit#*:}"
@@ -155,16 +236,25 @@ ScanRoot() {
                     fi
                 done <<< "$OwningTypes"
             done <<< "$hits"
-        done <<< "$files"
 
-        if [ "$identMatches" -eq 0 ]; then
-            Refuse "the identifier '${identifier}' matches nothing under ${root}.
-       It is on the table because: ${reason}
+            index=$((index + 1))
+        done
+    done <<< "$candidates"
+
+    # The per-identifier verdict, unchanged in meaning and now asked after the walk
+    # rather than at the end of each identifier's own pass. Still one refusal per term,
+    # still naming the term and its reason.
+    index=0
+    while [ "$index" -lt "${#identNames[@]}" ]; do
+        if [ "${identCounts[$index]}" -eq 0 ]; then
+            Refuse "the identifier '${identNames[$index]}' matches nothing under ${root}.
+       It is on the table because: ${identReasons[$index]}
        A term that has stopped matching is a guard that has stopped guarding, and it
        looks exactly like a clean tree. Either the code was renamed -- update the row --
        or the credential is gone and the row goes with it."
         fi
-    done <<< "$CredentialIdentifiers"
+        index=$((index + 1))
+    done
 
     if [ "$totalMatches" -eq 0 ]; then
         Refuse "no credential identifier matched anywhere under ${root}"
