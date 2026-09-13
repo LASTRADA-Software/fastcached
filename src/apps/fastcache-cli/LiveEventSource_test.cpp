@@ -269,6 +269,25 @@ TEST_CASE("a stop request after a sample ends a session with no terminal as answ
     CloseAndDrain(rig, source);
 }
 
+TEST_CASE("a stop request arrives as StopRequested and never as a keystroke", "[cli][live][source]")
+{
+    // The loop quits on both, so a case driving the loop cannot tell them apart: this reads the
+    // event itself. A `Key` would carry bytes nobody typed.
+    Rig rig;
+    LiveEventSource source { rig.StoppableParts() };
+    rig.Settle();
+    CHECK(KindOf(NextDue(rig, source)) == DashboardEventKind::Sample);
+    CHECK(KindOf(NextDue(rig, source)) == DashboardEventKind::Tick);
+
+    rig.stop->Fire();
+    rig.reactor.Drain();
+    auto const stop = NextDue(rig, source);
+    CHECK(KindOf(stop) == DashboardEventKind::StopRequested);
+    CHECK((stop.has_value() && stop->keys.empty()));
+
+    CloseAndDrain(rig, source);
+}
+
 TEST_CASE("a stop request before any sample does not end a session as answered", "[cli][live][source]")
 {
     // The control for the case above: a stop is not an answer by itself. Quit before a

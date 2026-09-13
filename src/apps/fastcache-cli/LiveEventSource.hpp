@@ -103,8 +103,8 @@ struct LiveSourceParts
     /// An operator's stop request, or null where none is composed.
     ///
     /// A run with no terminal is the one that hears Ctrl-C as a signal; a terminal in raw
-    /// mode sends it as a key. So a stop is delivered as that same key, and the loop has one
-    /// way to be quit whichever route Ctrl-C took.
+    /// mode sends it as a key. A signal is delivered as `StopRequested`, never as a `Key`
+    /// spelling the byte nobody typed, and the loop quits on either.
     std::unique_ptr<IStopSignal> stop {};
 
     /// Where `stop`'s blocking wait runs, when there is a `stop`: see `IStopSignal::Stopped`
