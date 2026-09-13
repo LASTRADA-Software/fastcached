@@ -22,6 +22,7 @@
 #include <ranges>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include <tests/Unwrap.hpp>
 
@@ -474,6 +475,26 @@ TEST_CASE("The strip's words are public, row for row with its keys", "[distribut
     auto const snapshot = LeadingSnapshot();
     CHECK(RenderFleetHtml(snapshot, NoHistory(), 0)
               .contains(std::format("/ {} {}", snapshot.nodes.front().registeredSlots, compiling->ofNoun)));
+}
+
+TEST_CASE("A limit's tone and a refusal's alert are the leader's, beside the page's chip", "[distributed][fleetview][tone]")
+{
+    // #134 G1. WHAT DISTINGUISHES: each limit gets its own tone, by the name `SlotLimitTable` spells -- a
+    // table that fell through to one tone for every limit fails the registered/scratch pair -- the tone
+    // comes only from the `limited-by` column, and a name no limit has is plain rather than a guess. The
+    // refusal share is the one tile whose value above zero is an alert.
+    CHECK(FleetCellTone(FleetSection::Workers, "limited-by", std::string_view { "registered" }) == CellTone::Fresh);
+    CHECK(FleetCellTone(FleetSection::Workers, "limited-by", std::string_view { "external-cpu" }) == CellTone::Limited);
+    CHECK(FleetCellTone(FleetSection::Workers, "limited-by", std::string_view { "memory" }) == CellTone::Limited);
+    CHECK(FleetCellTone(FleetSection::Workers, "limited-by", std::string_view { "scratch" }) == CellTone::Alert);
+    CHECK(FleetCellTone(FleetSection::Workers, "limited-by", std::string_view { "zeta" }) == CellTone::Plain);
+    CHECK(FleetCellTone(FleetSection::Workers, "endpoint", std::string_view { "scratch" }) == CellTone::Plain);
+
+    auto alerting = std::vector<std::string_view> {};
+    for (auto const& kpi: FleetKpis())
+        if (kpi.alertAboveZero)
+            alerting.push_back(kpi.key);
+    CHECK(alerting == std::vector<std::string_view> { "refused" });
 }
 
 TEST_CASE("A number nobody reported renders as an absence, never as a zero", "[distributed][fleetview]")

@@ -459,10 +459,12 @@ enum class ColumnKeep : std::uint8_t
 /// pill where nobody reported is a healthy reading nobody gave.
 enum class CellTone : std::uint8_t
 {
-    Plain, ///< No tint.
-    Fresh, ///< A heartbeat or lease age still inside its threshold.
-    Stale, ///< Past it: stop trusting the rest of the row.
-    Last,  ///< Not a tone.
+    Plain,   ///< No tint.
+    Fresh,   ///< A heartbeat or lease age still inside its threshold, or a worker nothing holds back.
+    Stale,   ///< Past it: stop trusting the rest of the row.
+    Limited, ///< A ceiling other than the registered one withdrew slots: somebody's machine, or its memory.
+    Alert,   ///< A figure that should be zero is not, or a limit that stops work outright.
+    Last,    ///< Not a tone.
 };
 
 /// The tone the column @p name in @p section gives the value @p number.
@@ -474,6 +476,17 @@ enum class CellTone : std::uint8_t
 /// @param number The cell's integer, in the column's scale.
 /// @return The tone; `Plain` for a column with no freshness decoration or a name the section lacks.
 [[nodiscard]] CellTone FleetCellTone(FleetSection section, std::string_view name, std::uint64_t number);
+
+/// The tone the column @p name in @p section gives the text @p text.
+///
+/// **The one place a limit is judged**, beside the page's chip for it: `registered` is fresh, a machine's
+/// own use or its memory is limited, a full scratch disk is an alert. A limit this build does not name is
+/// plain rather than a guess.
+/// @param section The section the header belongs to.
+/// @param name The column's name.
+/// @param text The cell's text.
+/// @return The tone; `Plain` for a column with no text decoration or a name the section lacks.
+[[nodiscard]] CellTone FleetCellTone(FleetSection section, std::string_view name, std::string_view text);
 
 /// One number of the fleet document written for a PERSON: the page's cell and the terminal panel's.
 ///
@@ -546,6 +559,7 @@ struct FleetKpiText
     std::string_view ofNoun; ///< What the denominator counts (`slots`), or empty for a figure with none.
     std::string_view note;   ///< Words for a figure with no denominator (`not yet resolved`), or empty.
     bool sparkline;          ///< Whether the figure carries a trend.
+    bool alertAboveZero;     ///< Whether any value above zero is worth an operator's eye, as a refusal share is.
 };
 
 /// Every headline figure's words, in the order the strip presents them.
