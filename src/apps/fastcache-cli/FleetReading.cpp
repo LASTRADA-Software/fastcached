@@ -4,6 +4,7 @@
 #include "SocketExchange.hpp"
 
 #include <format>
+#include <memory>
 #include <string>
 #include <utility>
 
@@ -25,8 +26,8 @@ SampleReading ReadFleetSample(DashboardEvent const& event)
             .outcome = OutcomeOf(fetched.error().kind), .value = {}, .source = {}, .note = fetched.error().detail
         };
 
-    // Validation only: see the header for why the parsed document is not kept.
-    if (auto const parsed = ParseFleetDocument(*fetched); !parsed.has_value())
+    auto parsed = ParseFleetDocument(*fetched);
+    if (!parsed.has_value())
         return SampleReading { .outcome = Outcome::Protocol,
                                .value = {},
                                .source = {},
@@ -35,7 +36,8 @@ SampleReading ReadFleetSample(DashboardEvent const& event)
     return SampleReading { .outcome = Outcome::Affirmative,
                            .value = ScalarValue(TextCell(*fetched)),
                            .source = std::string { FleetReadingSource },
-                           .note = {} };
+                           .note = {},
+                           .document = std::make_shared<FleetDocument const>(std::move(*parsed)) };
 }
 
 } // namespace FastCache::Cli
