@@ -230,6 +230,27 @@ class StdoutFrames final: public IFrameSink
     }
 };
 
+/// A piped session's remarks, to stderr as they happen, unless `--quiet`.
+class StderrRemarks final: public IRemarkSink
+{
+  public:
+    /// @param quiet Whether remarks are suppressed.
+    explicit StderrRemarks(bool quiet) noexcept:
+        _quiet { quiet }
+    {
+    }
+
+    void Remark(std::string_view line) override
+    {
+        if (_quiet)
+            return;
+        std::cerr << ProgramName << ": " << line << '\n' << std::flush;
+    }
+
+  private:
+    bool _quiet;
+};
+
 /// The process's own Ctrl-C, installed for a session with no terminal.
 class ProcessStopSignals final: public IStopSignalInstaller
 {
@@ -350,6 +371,7 @@ class StopReactorOnExit
     ThreadPoolExecutor stopWaiter { 1 };
     ThreadPoolExecutor terminalPool { 1 };
     StdoutFrames sink;
+    StderrRemarks remarks { command.quiet };
     ProcessStopSignals stops;
     StandardTerminalAcquisition terminals;
     LadderRedial redial { command, WireTable[static_cast<std::size_t>(verb.wire)] };
@@ -368,6 +390,7 @@ class StopReactorOnExit
                                                  .stopWaiter = &stopWaiter,
                                                  .terminalPool = &terminalPool,
                                                  .sink = &sink,
+                                                 .remarks = &remarks,
                                                  .streamsInteractive = StandardStreamsAreInteractive(),
                                                  .render = render,
                                                  .terminals = &terminals,
