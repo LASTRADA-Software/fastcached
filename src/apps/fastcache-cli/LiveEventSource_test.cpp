@@ -254,6 +254,44 @@ TEST_CASE("a terminal's presenter goes before its events, and a frame after the 
     CloseAndDrain(rig, source);
 }
 
+TEST_CASE("a frame's images reach the terminal's presenter through the source, and none after the terminal went away",
+          "[cli][live][source]")
+{
+    // The loop presents through `Frames()`, never through the presenter itself, so an image placed in
+    // a frame is drawn only if the source hands the presenter the FRAME. Handing it the rows alone
+    // still draws every row, which is why the placement is what this case reads.
+    Rig rig;
+    auto presented = PresenterRecord { .events = &rig.terminalRelease };
+    auto parts = rig.SpokenParts();
+    parts.frames = std::make_unique<PresenterRecord::Sink>(&presented);
+    LiveEventSource source { std::move(parts) };
+    auto* const frames = source.Frames();
+    REQUIRE(frames != nullptr);
+    rig.Settle();
+
+    auto const placed = DashboardFrame {
+        .text = "rows",
+        .placements = { FramePlacement { .row = 4, .column = 3, .cellsWide = 8, .cellsHigh = 2, .sixel = "#0!8~" } },
+    };
+    frames->PresentPlaced(placed);
+    CHECK(presented.frames == 1);
+    CHECK(presented.last == "rows");
+    REQUIRE(presented.placements.size() == 1);
+    CHECK(presented.placements.front().row == 4);
+    CHECK(presented.placements.front().column == 3);
+    CHECK(presented.placements.front().sixel == "#0!8~");
+
+    rig.terminal->GoAway();
+    rig.Settle();
+    REQUIRE(presented.released);
+
+    frames->PresentPlaced(DashboardFrame { .text = "after it went away", .placements = {} });
+    CHECK(presented.frames == 1);
+    CHECK(presented.last == "rows");
+
+    CloseAndDrain(rig, source);
+}
+
 TEST_CASE("a source with no presenter hands the loop none", "[cli][live][source]")
 {
     Rig rig;

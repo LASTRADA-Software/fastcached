@@ -8,6 +8,7 @@
 /// drive the same object, and a second copy of a fixture is a second place for it to be
 /// wrong.
 
+#include "DashboardFrame.hpp"
 #include "DashboardLoop.hpp"
 #include "LiveEventSource.hpp"
 #include "ScriptedExchange.hpp"
@@ -202,6 +203,13 @@ struct PresenterRecord
             _record->last = frame;
         }
 
+        void PresentPlaced(DashboardFrame const& frame) override
+        {
+            ++_record->frames;
+            _record->last = frame.text;
+            _record->placements = frame.placements;
+        }
+
       private:
         PresenterRecord* _record;
     };
@@ -209,6 +217,7 @@ struct PresenterRecord
     TerminalRelease const* events { nullptr }; ///< What became of the events it presented over.
     std::size_t frames { 0 };                  ///< How many frames were presented.
     std::string last {};                       ///< The newest frame.
+    std::vector<FramePlacement> placements {}; ///< The images of the newest frame that placed any.
     bool released { false };                   ///< Whether the presenter was destroyed.
     bool afterEvents { false };                ///< Whether it was destroyed after the events were.
 };
