@@ -22,19 +22,14 @@ namespace FastCache::Cli
 
 namespace
 {
-    /// What `RestoreNow` writes before putting the modes back, in this order.
+    /// The input's resets `RestoreNow` writes after the screen's, before putting the modes back.
     ///
-    /// First `CAN`, which abandons an escape sequence the dashboard was halfway through writing, so
-    /// the rest is not read as its tail. Then the input protocols endo's `Terminal` pushes -- the
-    /// union of what its POSIX and Windows arms enable, since switching off a mode that was never on
-    /// is harmless -- spelled through endo's own constants rather than restated. Then what a
-    /// renderer switches on: synchronized output, a hidden cursor, the alternate screen.
-    ///
-    /// **Leaving the alternate screen is the one that is not free.** `CSI ? 1049 l` also restores
-    /// the cursor saved on entry, so on a terminal that never entered the alternate screen it can
-    /// move the cursor. This is for an exit, where a moved cursor beats a shell on the wrong screen.
-    constexpr auto RestoreNowSequences = std::to_array<std::string_view>({
-        "\x18",
+    /// The input protocols endo's `Terminal` pushes -- the union of what its POSIX and Windows arms
+    /// enable, since switching off a mode that was never on is harmless -- spelled through endo's own
+    /// constants rather than restated. What the SCREEN switched on (synchronized output, the cursor,
+    /// the alternate screen) is not here: the restore handle composes those, because it knows whether
+    /// the screen is still entered, and passes them first.
+    constexpr auto InputResetSequences = std::to_array<std::string_view>({
         tui::protocols::DisableFocusTracking,
         tui::protocols::DisableColorSchemeNotify,
         tui::protocols::DisableBracketedPaste,
@@ -42,10 +37,10 @@ namespace
         tui::protocols::DisablePassiveMouseTracking,
         tui::protocols::DisableWin32InputMode,
         tui::protocols::DisableCsiU,
-        "\x1b[?2026l",
-        "\x1b[?25h",
-        "\x1b[?1049l",
     });
+
+    /// The DEC private mode synchronized output is asked about as.
+    constexpr auto SynchronizedOutputMode = 2026;
 
     /// endo's `Terminal`, the wakeup `Close()` signals, and the event source waiting on both.
     ///
@@ -78,7 +73,7 @@ namespace
                 return std::unexpected(std::string { "standard input and output are not both an interactive terminal" });
             // BEFORE `initialize()` changes anything: these are the modes `RestoreNow` puts back.
             _saved = SavedTerminalModes::Capture();
-            for (auto const sequence: RestoreNowSequences)
+            for (auto const sequence: InputResetSequences)
                 _resets.append(sequence);
             if (auto opened = _terminal.initialize(); !opened)
                 return std::unexpected("the terminal could not be opened: " + opened.error());
@@ -88,6 +83,11 @@ namespace
         [[nodiscard]] SixelAnswer AskSixel() override
         {
             return ToSixelAnswer(_terminal.queryDeviceAttributes());
+        }
+
+        [[nodiscard]] SynchronizedOutputAnswer AskSynchronizedOutput() override
+        {
+            return ToSynchronizedOutputAnswer(_terminal.queryDecMode(SynchronizedOutputMode));
         }
 
         [[nodiscard]] TerminalTextEncoding Encoding() override
@@ -115,6 +115,12 @@ namespace
             _wakeup.signal();
         }
 
+        void Write(std::string_view bytes) noexcept override
+        {
+            _terminal.output().writeRaw(bytes);
+            _terminal.output().flush();
+        }
+
         void Restore() noexcept override
         {
             // After a `RestoreNow`, endo's teardown below sends its input resets a second time. Every
@@ -134,7 +140,7 @@ namespace
             _terminal.input().shutdown();
         }
 
-        void RestoreNow() noexcept override
+        void RestoreNow(std::string_view leading) noexcept override
         {
             // Not `shutdown()`: that closes the resize pipe the parked `poll` is waiting on and writes
             // endo's state unlocked. The saved modes are this device's own, written once in `Acquire`
@@ -148,7 +154,8 @@ namespace
             // exit exists for may be the one that is stuck, and it would hold that lock forever.
             if (!_saved.has_value())
                 return;
-            _saved->Apply(_resets);
+            auto const pieces = std::array<std::string_view, 2> { leading, _resets };
+            _saved->Apply(pieces);
             _restoredNow.store(true, std::memory_order_release);
         }
 

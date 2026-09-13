@@ -179,14 +179,42 @@ struct DeviceRecord
     std::atomic<int> restoredNow { 0 };
     std::thread::id acquiredOn {};
     std::thread::id askedOn {};
+
+    /// Everything written to the device, `Write` and `RestoreNow`'s leading bytes alike, in order.
+    [[nodiscard]] std::string Written() const
+    {
+        auto const lock = std::scoped_lock { mutex };
+        return written;
+    }
+
+    /// Append @p bytes to what was written. Callable from any thread.
+    void Append(std::string_view bytes)
+    {
+        auto const lock = std::scoped_lock { mutex };
+        written.append(bytes);
+    }
+
+    mutable std::mutex mutex;
+    std::string written;
 };
+
+/// How often @p needle occurs in @p haystack, without overlaps.
+[[nodiscard]] std::size_t Occurrences(std::string_view haystack, std::string_view needle)
+{
+    auto count = std::size_t { 0 };
+    for (auto at = haystack.find(needle); at != std::string_view::npos; at = haystack.find(needle, at + needle.size()))
+        ++count;
+    return count;
+}
 
 /// How a `FakeDevice` answers each step of a start.
 struct DeviceScript
 {
     bool refuseAcquire { false };
     bool throwOnAsk { false };
+    bool throwOnEncoding { false };
     SixelAnswer sixel { SixelAnswer::Advertised };
+    SynchronizedOutputAnswer synchronizedOutput { SynchronizedOutputAnswer::Supported };
     TerminalTextEncoding encoding { TerminalTextEncoding::Utf8 };
 
     /// Where the device's events come from when set; a scripted source that never blocks when not.
@@ -222,8 +250,15 @@ class FakeDevice final: public ITerminalDevice
         return _script.sixel;
     }
 
+    [[nodiscard]] SynchronizedOutputAnswer AskSynchronizedOutput() override
+    {
+        return _script.synchronizedOutput;
+    }
+
     [[nodiscard]] TerminalTextEncoding Encoding() override
     {
+        if (_script.throwOnEncoding)
+            throw std::runtime_error("the environment could not be read");
         return _script.encoding;
     }
 
@@ -250,13 +285,19 @@ class FakeDevice final: public ITerminalDevice
             _script.blocking->Wake();
     }
 
+    void Write(std::string_view bytes) noexcept override
+    {
+        _record->Append(bytes);
+    }
+
     void Restore() noexcept override
     {
         _record->restores.fetch_add(1, std::memory_order_acq_rel);
     }
 
-    void RestoreNow() noexcept override
+    void RestoreNow(std::string_view leading) noexcept override
     {
+        _record->Append(leading);
         _record->restoredNow.fetch_add(1, std::memory_order_acq_rel);
     }
 
@@ -661,4 +702,226 @@ TEST_CASE("a started terminal whose events were destroyed first is not restored 
     started.restore->RestoreNow();
     CHECK(record.restoredNow.load() == 0);
     CHECK(record.restores.load() == 1);
+}
+
+TEST_CASE("presentation bytes are endo's own spellings", "[cli][dashboard][terminal]")
+{
+    // Captured from endo's TerminalOutput rather than restated, so this asserts the capture caught
+    // what each call writes, in the order the steps call them -- a capture that flushed nothing
+    // would leave every string empty and every presenter case below comparing empty strings.
+    auto const& screen = ScreenBytes();
+    CHECK(screen.enter == "\x1b[?1049h\x1b[?25l");
+    CHECK(screen.leave == "\x1b[?25h\x1b[?1049l");
+    CHECK(screen.home == "\x1b[1;1H");
+    CHECK(screen.clearBelow == "\x1b[J");
+    CHECK(screen.syncBegin == "\x1b[?2026h");
+    CHECK(screen.syncEnd == "\x1b[?2026l");
+}
+
+TEST_CASE("a DECRQM answer for mode 2026 keeps its meaning as a synchronized-output answer", "[cli][dashboard][terminal]")
+{
+    CHECK(ToSynchronizedOutputAnswer(tui::DecModeStatus::Set) == SynchronizedOutputAnswer::Supported);
+    CHECK(ToSynchronizedOutputAnswer(tui::DecModeStatus::Reset) == SynchronizedOutputAnswer::Supported);
+    CHECK(ToSynchronizedOutputAnswer(tui::DecModeStatus::NotRecognized) == SynchronizedOutputAnswer::NotSupported);
+    CHECK(ToSynchronizedOutputAnswer(tui::DecModeStatus::PermanentlySet) == SynchronizedOutputAnswer::NotSupported);
+    CHECK(ToSynchronizedOutputAnswer(tui::DecModeStatus::PermanentlyReset) == SynchronizedOutputAnswer::NotSupported);
+    CHECK(ToSynchronizedOutputAnswer(tui::DecModeStatus::NoReply) == SynchronizedOutputAnswer::NoReply);
+    CHECK(ToSynchronizedOutputAnswer(tui::DecModeStatus::NotAsked) == SynchronizedOutputAnswer::NotAsked);
+    CHECK(ToSynchronizedOutputAnswer(tui::DecModeStatus::NotImplemented) == SynchronizedOutputAnswer::NotAsked);
+}
+
+TEST_CASE("a started terminal enters the alternate screen once and its destruction leaves it once",
+          "[cli][dashboard][terminal]")
+{
+    auto record = DeviceRecord {};
+    auto clock = ManualClock {};
+    auto reactor = TestReactor { clock };
+    auto pool = ThreadPoolExecutor { 1 };
+    auto const& screen = ScreenBytes();
+
+    auto outcome = StartFake({}, record, pool, reactor);
+    REQUIRE(outcome.started.has_value());
+    CHECK(Occurrences(record.Written(), screen.enter) == 1);
+    CHECK(Occurrences(record.Written(), screen.leave) == 0);
+
+    outcome.started->frames.reset();
+    outcome.started->events.reset();
+    auto const written = record.Written();
+    CHECK(Occurrences(written, screen.enter) == 1);
+    CHECK(Occurrences(written, screen.leave) == 1);
+    CHECK(written.find(screen.enter) < written.find(screen.leave));
+    CHECK(record.restores.load() == 1);
+}
+
+TEST_CASE("a start that fails after entering the alternate screen leaves it before the failure is delivered",
+          "[cli][dashboard][terminal]")
+{
+    // The encoding is read after the screen is entered, so its failure is the halfway point.
+    auto record = DeviceRecord {};
+    auto clock = ManualClock {};
+    auto reactor = TestReactor { clock };
+    auto pool = ThreadPoolExecutor { 1 };
+    auto const& screen = ScreenBytes();
+
+    auto const outcome = StartFake({ .throwOnEncoding = true }, record, pool, reactor);
+
+    REQUIRE_FALSE(outcome.started.has_value());
+    CHECK(outcome.started.error() == "the terminal failed while being started: the environment could not be read");
+    auto const written = record.Written();
+    CHECK(Occurrences(written, screen.enter) == 1);
+    CHECK(Occurrences(written, screen.leave) == 1);
+    CHECK(outcome.restoresWhenDelivered == 1);
+}
+
+TEST_CASE("a start that fails before entering the alternate screen writes neither entering nor leaving",
+          "[cli][dashboard][terminal]")
+{
+    // The control on the case above: a guard that left the screen unconditionally would pass that one
+    // and write a leave here, onto a screen nobody entered.
+    auto clock = ManualClock {};
+    auto reactor = TestReactor { clock };
+    auto pool = ThreadPoolExecutor { 1 };
+
+    auto refusedRecord = DeviceRecord {};
+    auto const refused = StartFake({ .refuseAcquire = true }, refusedRecord, pool, reactor);
+    REQUIRE_FALSE(refused.started.has_value());
+    CHECK(refusedRecord.Written().empty());
+
+    auto thrownRecord = DeviceRecord {};
+    auto const thrown = StartFake({ .throwOnAsk = true }, thrownRecord, pool, reactor);
+    REQUIRE_FALSE(thrown.started.has_value());
+    CHECK(thrownRecord.Written().empty());
+    CHECK(thrownRecord.restores.load() == 1);
+}
+
+TEST_CASE("restoring a started terminal now leaves the alternate screen, and a later destruction does not leave it again",
+          "[cli][dashboard][terminal]")
+{
+    auto record = DeviceRecord {};
+    auto clock = ManualClock {};
+    auto reactor = TestReactor { clock };
+    auto pool = ThreadPoolExecutor { 1 };
+    auto const& screen = ScreenBytes();
+
+    auto outcome = StartFake({}, record, pool, reactor);
+    REQUIRE(outcome.started.has_value());
+    auto& started = *outcome.started;
+
+    started.restore->RestoreNow();
+    started.restore->RestoreNow();
+    auto const afterRestore = record.Written();
+    CHECK(Occurrences(afterRestore, screen.leave) == 1);
+    // Synchronized output is ended BEFORE the screen is left, so a frame the restore interrupted
+    // cannot keep the terminal holding its output.
+    CHECK(afterRestore.rfind(screen.syncEnd) < afterRestore.rfind(screen.leave));
+
+    started.frames.reset();
+    started.events.reset();
+    CHECK(Occurrences(record.Written(), screen.enter) == 1);
+    CHECK(Occurrences(record.Written(), screen.leave) == 1);
+    CHECK(record.restores.load() == 1);
+}
+
+TEST_CASE("a started terminal destroyed before a restore-now leaves the alternate screen exactly once",
+          "[cli][dashboard][terminal]")
+{
+    auto record = DeviceRecord {};
+    auto clock = ManualClock {};
+    auto reactor = TestReactor { clock };
+    auto pool = ThreadPoolExecutor { 1 };
+    auto const& screen = ScreenBytes();
+
+    auto outcome = StartFake({}, record, pool, reactor);
+    REQUIRE(outcome.started.has_value());
+    auto& started = *outcome.started;
+
+    started.frames.reset();
+    started.events.reset();
+    started.restore->RestoreNow();
+    CHECK(Occurrences(record.Written(), screen.enter) == 1);
+    CHECK(Occurrences(record.Written(), screen.leave) == 1);
+    CHECK(record.restoredNow.load() == 0);
+}
+
+TEST_CASE("a frame on a terminal that reported synchronized output is bracketed in it", "[cli][dashboard][terminal]")
+{
+    auto record = DeviceRecord {};
+    auto clock = ManualClock {};
+    auto reactor = TestReactor { clock };
+    auto pool = ThreadPoolExecutor { 1 };
+    auto const& screen = ScreenBytes();
+
+    auto outcome = StartFake({ .synchronizedOutput = SynchronizedOutputAnswer::Supported }, record, pool, reactor);
+    REQUIRE(outcome.started.has_value());
+    REQUIRE(outcome.started->frames != nullptr);
+    CHECK(outcome.started->capabilities.synchronizedOutput == SynchronizedOutputAnswer::Supported);
+
+    auto const before = record.Written().size();
+    outcome.started->frames->Present("PANELS");
+    auto const frame = record.Written().substr(before);
+
+    CHECK(frame == screen.syncBegin + screen.home + "PANELS" + screen.clearBelow + screen.syncEnd);
+}
+
+TEST_CASE("a frame on a terminal that did not report synchronized output is never bracketed in it",
+          "[cli][dashboard][terminal]")
+{
+    // Every answer but Supported, each its own start. The guard between the DECRQM answer and the
+    // bytes is the whole of this case: a presenter that bracketed unconditionally passes the case
+    // above and fails every row here.
+    auto const& screen = ScreenBytes();
+    for (auto const answer:
+         { SynchronizedOutputAnswer::NotSupported, SynchronizedOutputAnswer::NoReply, SynchronizedOutputAnswer::NotAsked })
+    {
+        auto record = DeviceRecord {};
+        auto clock = ManualClock {};
+        auto reactor = TestReactor { clock };
+        auto pool = ThreadPoolExecutor { 1 };
+
+        auto outcome = StartFake({ .synchronizedOutput = answer }, record, pool, reactor);
+        REQUIRE(outcome.started.has_value());
+        REQUIRE(outcome.started->frames != nullptr);
+
+        auto const before = record.Written().size();
+        outcome.started->frames->Present("PANELS");
+        auto const frame = record.Written().substr(before);
+
+        CHECK(frame == screen.home + "PANELS" + screen.clearBelow);
+        CHECK(Occurrences(record.Written(), screen.syncBegin) == 0);
+    }
+}
+
+TEST_CASE("a burst of resizes is delivered as the latest geometry, and a key between them keeps them apart",
+          "[cli][dashboard][terminal]")
+{
+    auto clock = ManualClock {};
+    auto reactor = TestReactor { clock };
+    auto pool = ThreadPoolExecutor { 1 };
+    auto source = tui::runtime::testing::MockEventSource {};
+    source.pushEvents({ tui::ResizeEvent { .columns = 81, .rows = 25 },
+                        tui::ResizeEvent { .columns = 90, .rows = 30 },
+                        tui::ResizeEvent { .columns = 100, .rows = 35 } });
+    source.pushEvents(
+        { tui::ResizeEvent { .columns = 110, .rows = 40 }, Key(U'a'), tui::ResizeEvent { .columns = 120, .rows = 45 } });
+    auto stream = MakeTerminalEventStream(
+        { .source = &source, .pool = &pool, .resumeOn = &reactor, .wake = {}, .columns = 80, .rows = 24 });
+
+    auto const opened = TakeNext(*stream, reactor);
+    auto const burst = TakeNext(*stream, reactor);
+    auto const beforeKey = TakeNext(*stream, reactor);
+    auto const key = TakeNext(*stream, reactor);
+    auto const afterKey = TakeNext(*stream, reactor);
+
+    CHECK(opened.kind == DashboardEventKind::Resize);
+    CHECK(opened.columns == 80);
+    CHECK(burst.kind == DashboardEventKind::Resize);
+    CHECK(burst.columns == 100);
+    CHECK(burst.rows == 35);
+    CHECK(beforeKey.kind == DashboardEventKind::Resize);
+    CHECK(beforeKey.columns == 110);
+    CHECK(key.kind == DashboardEventKind::Key);
+    CHECK(afterKey.kind == DashboardEventKind::Resize);
+    CHECK(afterKey.columns == 120);
+    CHECK(afterKey.rows == 45);
+    CHECK(source.waitCount() == 2);
 }
