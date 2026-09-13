@@ -95,20 +95,28 @@ second opinion about how to write a coroutine.
 
 Two facts that make this much less alarming than it sounds, both measured:
 
-- **`coro/*` and `platform/Clock.hpp` are reached only from `tui/runtime/`, and
-  `tui/runtime/` is not built.** They sit on disk so the copy is include-closed and
-  a later ticket that wants the runtime needs no second import. **Nothing compiles
-  them today.** The built library's entire external surface is libunicode,
-  `platform/Types.hpp`, `platform/Wakeup.hpp` and `crispy/FNV.hpp`.
+- **`coro/*` and `platform/Clock.hpp` are reached only from `tui/runtime/`, which is
+  now built** (#1374). They are compiled as part of `fastcache-tui`, so the second
+  coroutine type and the second clock are real objects in this build rather than
+  files sitting on disk. That was decided deliberately and the reasoning is in
+  `vendor/CMakeLists.txt`: `runtime/` is the only descriptor-parking coroutine API
+  available, `IReactor` has none (#1372), and the alternative failed in a worse
+  direction — a coroutine resumed on the wrong thread under IOCP is green everywhere
+  and wrong in production.
 
-  **That sentence is true because something enforces it, not because it is written
-  here.** "Never compiled" is not a property of the vendored code — **upstream's own
-  `src/tui/CMakeLists.txt` compiles `runtime/`**, so our exclusion reads like an
-  oversight beside it and is the obvious thing for the next person to "fix". A source
-  list naming `endo/tui/runtime/` therefore **refuses at configure time**
-  (`vendor/CMakeLists.txt`), and the refusal explains the trade and says what a
-  deliberate reversal would have to do. Four absent lines were the only thing holding
-  this up before that guard existed.
+  **This previously said `runtime/` was not built and was enforced by a configure-time
+  refusal. Both halves are now gone**, and the rule that survives is the one that was
+  actually load-bearing: **nothing under `src/` may include `<coro/...>` or
+  `<platform/Clock.hpp>`.** That is currently **unenforced** — the include root
+  `endo/` is exposed `PUBLIC` and necessarily carries `coro/` and `platform/` beside
+  `tui/`, so first-party code can reach the second vocabulary by construction, and
+  narrowing the root would hide `<tui/...>` from the consumers that need it. Measured
+  at the time of writing: `src/` reaches none of it. An open hazard with no current
+  violation, tracked rather than asserted here, because a comment nothing checks
+  cannot fail.
+
+  The built library's external surface is libunicode, `platform/{Types,Wakeup,Clock,
+  SignalHandler}.hpp`, `coro/*` and `crispy/FNV.hpp`.
 - **The two vocabularies meet in one place.** Vendored code serves the vendored TUI
   only; no vendored file reaches `FastCache::*`, and first-party code reaches the TUI
   through a single adapter layer. If you find yourself wanting to cross that boundary
@@ -192,10 +200,12 @@ helper functions, none of which exist here, and editing it would put a local cha
 inside the contribution diff on day one.
 
 Every vendored translation unit this target does **not** build is named in that
-file's `_fcTuiNotBuilt`, with one of three reasons: it reaches `stb_image` (image
-decoding), it reaches `coro` (the event runtime), or nothing on a stats panel's
-path reaches it — an interactive editor's widgets, present and working and simply
-not called here.
+file's `_fcTuiNotBuilt`, with one of two reasons: it reaches `stb_image` (image
+decoding), or nothing on a stats panel's path reaches it — an interactive editor's
+widgets, present and working and simply not called here. There was a third,
+`coro` (the event runtime), retired in #1374 when `runtime/` joined the build;
+`QuestionComponent.cpp` moved to the second reason rather than out of the list,
+because it is still not reached by anything built here.
 
 The two lists are asserted at configure time to **partition** the vendored `.cpp`
 files on disk, so the counts are derived rather than written down, and a re-sync
