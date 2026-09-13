@@ -138,7 +138,7 @@ class CountSink final: public IFrameSink
     std::size_t frames { 0 };
 };
 
-/// A reactor for the session, a second one standing in for the pool, one clock for both.
+/// A reactor for the session, one more standing in for each pool, one clock for all of them.
 ///
 /// **The pool is a `TestReactor` so a case decides when a gather RUNS.** A real pool
 /// would run it at once, and "a keystroke arrives while a sample is outstanding" would
@@ -150,7 +150,6 @@ struct Rig
     TestReactor pool { clock };
     TestReactor stopWaiter { clock };
     ScriptedGatherer gatherer { Reading() };
-    ScriptedStopSignal stop { reactor };
     CountView view {};
     CountSink sink {};
 
@@ -160,6 +159,13 @@ struct Rig
 
     /// What became of `terminal`.
     TerminalRelease terminalRelease {};
+
+    /// The stop signal `StoppableParts()` built; owned by the source it went into, so valid
+    /// only until `stopReleased`.
+    ScriptedStopSignal* stop { nullptr };
+
+    /// Whether the source has released `stop`.
+    bool stopReleased { false };
 
     /// A source over this rig, with no terminal.
     /// @return The parts.
@@ -179,8 +185,10 @@ struct Rig
     /// @return The parts.
     [[nodiscard]] LiveSourceParts StoppableParts()
     {
+        auto signal = std::make_unique<ScriptedStopSignal>(reactor, &stopReleased);
+        stop = signal.get();
         auto parts = Parts();
-        parts.stop = &stop;
+        parts.stop = std::move(signal);
         parts.stopWaiter = &stopWaiter;
         return parts;
     }
@@ -238,6 +246,14 @@ struct Rig
                                         std::optional<DashboardExit>* out)
 {
     *out = co_await RunDashboard(source, view, sink, limits);
+}
+
+/// How a session that may not have ended stopped.
+/// @param exit The session's end, if it has one.
+/// @return Its stop, or `Last` when it has not ended.
+[[nodiscard]] inline DashboardStop StopOf(std::optional<DashboardExit> const& exit)
+{
+    return exit.has_value() ? exit->stop : DashboardStop::Last;
 }
 
 /// The kind of an event that may not have arrived.

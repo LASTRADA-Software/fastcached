@@ -23,9 +23,23 @@ class ScriptedStopSignal final: public IStopSignal
 {
   public:
     /// @param reactor Where a parked wait is resumed.
-    explicit ScriptedStopSignal(IReactor& reactor):
-        _wakes { reactor, AsyncQueueOptions {} }
+    /// @param released Set when this signal is destroyed, which is when production puts the
+    ///        previous disposition back; null when the case does not ask.
+    explicit ScriptedStopSignal(IReactor& reactor, bool* released = nullptr):
+        _wakes { reactor, AsyncQueueOptions {} },
+        _released { released }
     {
+    }
+
+    ScriptedStopSignal(ScriptedStopSignal const&) = delete;
+    ScriptedStopSignal(ScriptedStopSignal&&) = delete;
+    ScriptedStopSignal& operator=(ScriptedStopSignal const&) = delete;
+    ScriptedStopSignal& operator=(ScriptedStopSignal&&) = delete;
+
+    ~ScriptedStopSignal() override
+    {
+        if (_released != nullptr)
+            *_released = true;
     }
 
     /// The operator asks to stop.
@@ -63,6 +77,7 @@ class ScriptedStopSignal final: public IStopSignal
 
   private:
     AsyncQueue<StopWake> _wakes;
+    bool* _released;
     int _waits { 0 };
 };
 
