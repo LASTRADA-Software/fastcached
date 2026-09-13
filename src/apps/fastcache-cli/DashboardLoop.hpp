@@ -116,6 +116,15 @@ struct DashboardModel
     /// How many readings have been accepted.
     std::size_t samples { 0 };
 
+    /// How many samples were TAKEN, readings and failures alike: what `--samples` bounds.
+    ///
+    /// Apart from `samples` because the two answer different questions. `samples` is how much
+    /// the dashboard knows; this is how many times it asked. A budget counting only readings
+    /// never ends a run whose every sample fails -- measured, `live-stats --samples=3` against
+    /// such an endpoint hung with no output -- and §9.17's never-answered exit is reachable only
+    /// if a failed attempt spends the budget too.
+    std::size_t attempts { 0 };
+
     /// How many frames have been drawn.
     std::size_t frames { 0 };
 
@@ -206,6 +215,13 @@ struct SampleReading
     /// breaks the run: a change taken across `/metrics` and then `INFO` subtracts one
     /// vocabulary from another, and the result is not a rate of anything.
     std::string source {};
+
+    /// Why there is no reading, in words for a person; empty when `outcome` is `Affirmative`.
+    ///
+    /// The decision's own account, carried out of the reader, so whoever reports a failed sample
+    /// says why without running the decision a second time -- which would be a second place for
+    /// the two accounts to disagree.
+    std::string note {};
 };
 
 /// Turns one session's raw `Sample` payload into a reading.
@@ -275,7 +291,7 @@ class IDashboardView
 /// What bounds the run.
 struct DashboardLimits
 {
-    /// Stop after this many accepted readings; 0 means no limit.
+    /// Stop after this many samples taken, failed ones included; 0 means no limit.
     ///
     /// Zero as *no limit* rather than a disengaged optional, matching how
     /// `--cache-memory 0` and `InMemoryLruStorage` already spell unbounded in this tree.
