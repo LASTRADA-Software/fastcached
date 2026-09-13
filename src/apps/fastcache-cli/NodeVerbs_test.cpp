@@ -1453,3 +1453,35 @@ TEST_CASE("a compile node answers stats through the ladder's node-metrics rung",
     CHECK(RequiredCell(answer, "source").lexical == "node-metrics");
     CHECK(RequiredCell(answer, "fastcache_worker_jobs_completed_total").lexical == "12");
 }
+
+TEST_CASE("a node whose description this client cannot read is a node it cannot read", "[cli][node][identity]")
+{
+    // Still a node -- a verb inferring a subject must not drift to `cache` -- and flagged, so a
+    // verb deciding whether to start asks a field. The control beside it: a readable node is not.
+    auto const unreadable = IdentityFor(OkWithUnreadableBody());
+    CHECK(unreadable.kind == RemoteKind::CompileNode);
+    CHECK(unreadable.unreadable);
+    CHECK(unreadable.detail.contains("cannot read"));
+
+    auto const readable = IdentityFor(StatusReply({ .version = "0.2.0", .nodeId = {}, .uptimeSeconds = 5, .surfaces = {} }));
+    CHECK_FALSE(readable.unreadable);
+
+    // A refusal is not a node at all, and says nothing about a description.
+    CHECK_FALSE(IdentityFor(RefusalReply(Cc::UnimplementedVerb)).unreadable);
+}
+
+TEST_CASE("a node-status refused on the wire version names both versions and does not deny a node", "[cli][node][identity]")
+{
+    // Refused before the verb was read, so nothing says whether a node is there: the sentence
+    // names this client's wire and carries the server's own range, and never claims "not a
+    // compile node", which is what every other refusal is worded as.
+    auto const refused =
+        IdentityFor(RefusalReply(Cc::ErrorCode::UnsupportedVersion, "unsupported wire version 8; this server speaks 6..6"));
+    CHECK(refused.kind == RemoteKind::FastcacheWireOnly);
+    CHECK(refused.detail.contains(std::format("0xFC wire {}", static_cast<unsigned>(Cc::CurrentVersion))));
+    CHECK(refused.detail.contains("this server speaks 6..6"));
+    CHECK_FALSE(refused.detail.contains("not a compile node"));
+
+    // The control: an unimplemented verb keeps the daemon's sentence.
+    CHECK(IdentityFor(RefusalReply(Cc::UnimplementedVerb)).detail.contains("not a compile node"));
+}
