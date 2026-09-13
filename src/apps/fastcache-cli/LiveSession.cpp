@@ -72,6 +72,32 @@ namespace
         std::vector<std::string>* _into;
     };
 
+    /// @p text as one line: each run of line breaks is `; `, and none leads or trails.
+    ///
+    /// A reason can carry a server's whole body -- a follower's `503` names its leader in several
+    /// comment lines -- and a remark is one line on stderr, where a line break would read as a
+    /// second remark.
+    /// @param text The reason.
+    /// @return The line, or the words saying there was none.
+    [[nodiscard]] std::string OneLine(std::string_view text)
+    {
+        auto line = std::string {};
+        auto broken = false;
+        for (auto const ch: text)
+        {
+            if (ch == '\n' || ch == '\r')
+            {
+                broken = !line.empty();
+                continue;
+            }
+            if (broken)
+                line += "; ";
+            broken = false;
+            line += ch;
+        }
+        return line.empty() ? std::string { "no reason was given" } : line;
+    }
+
     /// A session that never started.
     /// @param answer Why.
     /// @return The ending.
@@ -132,6 +158,15 @@ Task<std::expected<LiveSessionRun, Answer>> RunComposedSession(LiveSessionParts 
                                          .stopWaiter = nullptr };
     auto rung = RenderRung::Piped;
 
+    // Refused before acquiring anything: raw mode, the capability queries and the alternate screen
+    // for a subject there is nothing to draw of would flash the operator's terminal for a refusal.
+    if (parts.interactive && subject.panel == nullptr)
+        co_return std::unexpected(Concluded(Outcome::Local,
+                                            std::format("cannot draw live-stats {} on this terminal: this build has "
+                                                        "no panel for it; run it with its output redirected for one "
+                                                        "line per sample instead",
+                                                        subject.key)));
+
     if (parts.interactive)
     {
         auto started = co_await parts.terminals->Acquire(parts.terminalPool, parts.reactor);
@@ -150,7 +185,17 @@ Task<std::expected<LiveSessionRun, Answer>> RunComposedSession(LiveSessionParts 
         // The source owns the presenter beside the events, and releases it first: see
         // `LiveSourceParts::frames`.
         sourceParts.frames = std::move(started->frames);
-        assert(sourceParts.frames != nullptr && "a started terminal names where its frames go");
+        if (sourceParts.frames == nullptr)
+        {
+            // Never drawn to stdout instead: that terminal is in raw mode on the alternate screen.
+            // Closed first, and released, as a terminal nothing will read must be.
+            sourceParts.terminal->Close();
+            sourceParts.terminal.reset();
+            co_return std::unexpected(Concluded(Outcome::Local,
+                                                "cannot draw live-stats on this terminal: it was started with "
+                                                "nowhere to draw frames; run it with its output redirected for one "
+                                                "line per sample instead"));
+        }
     }
     else if (auto installed = parts.stops->Install(); installed.has_value())
     {
@@ -242,7 +287,7 @@ void FailureRemarks::Observe(DashboardEvent const& event)
     }
 
     if (reason.has_value() && reason != _failing)
-        _sink->Remark(std::format("a sample read nothing: {}", reason->empty() ? "no reason was given" : *reason));
+        _sink->Remark(std::format("a sample read nothing: {}", OneLine(*reason)));
     _failing = std::move(reason);
 }
 
