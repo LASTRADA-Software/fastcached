@@ -10,6 +10,7 @@
 
 #include <cstddef>
 #include <deque>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -17,6 +18,8 @@
 
 namespace FastCache::Cli
 {
+
+struct FleetDocument;
 
 /// @file DashboardLoop.hpp
 /// The `live-stats` render loop: a fold over one ordered event stream.
@@ -97,6 +100,15 @@ struct DashboardModel
     /// then draws the absent marker beside a gap, exactly as a figure does, instead of showing the
     /// last thing a node said before it stopped saying anything.
     std::optional<CompileCacheWire::NodeStatusFields> nodeStatus {};
+
+    /// The fleet document the NEWEST sample's reading carried, or null when that sample carried none.
+    ///
+    /// Replaced by every sample taken, exactly as `nodeStatus` is: a failed sample, or a reading with
+    /// no document, leaves it null rather than keeping the last fleet a leader described, so a fleet
+    /// panel draws absent beside the gap instead of a table of figures from before it. Parsed once,
+    /// by the reader, and shared rather than copied into the history: a panel draws the newest
+    /// document only, and 256 copies of a whole fleet would be memory nobody reads.
+    std::shared_ptr<FleetDocument const> latestDocument {};
 
     /// How many readings in a row belong to one measurable run.
     ///
@@ -230,6 +242,15 @@ struct SampleReading
     /// says why without running the decision a second time -- which would be a second place for
     /// the two accounts to disagree.
     std::string note {};
+
+    /// The document this reading was parsed from, for a reader that parses one; null otherwise.
+    ///
+    /// **The reader's parse, handed over rather than repeated.** A `fleet` reader has to parse the
+    /// leader's text to know whether it is a reading at all, and a panel drawing that parse again
+    /// every frame would be the same work done twice with two chances to disagree. The fold keeps
+    /// it as `DashboardModel::latestDocument`. Forward-declared here, so every unit including the
+    /// loop does not compile the fleet's vocabulary.
+    std::shared_ptr<FleetDocument const> document {};
 };
 
 /// Turns one session's raw `Sample` payload into a reading.

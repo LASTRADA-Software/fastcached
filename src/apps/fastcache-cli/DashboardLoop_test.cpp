@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "DashboardLoop.hpp"
 #include "DashboardRig.hpp"
+#include "FleetDocument.hpp"
 #include "ScriptedDashboardEvents.hpp"
 
 #include <FastCache/Async/TestReactor.hpp>
@@ -410,6 +411,23 @@ namespace
     record.shape = Shape::Record;
     record.fields.push_back(Field { .name = "body", .value = TextCell(event.document->value()) });
     return SampleReading { .outcome = Outcome::Affirmative, .value = std::move(record), .source = "fleet.txt" };
+}
+
+/// A reader that hands over a document naming the sample's body, as a parsing reader does.
+/// @param event The sample.
+/// @return A reading carrying a document whose `kpi` table holds the body, or a failure.
+[[nodiscard]] SampleReading HandingReader(DashboardEvent const& event)
+{
+    if (!event.document.has_value() || !event.document->has_value())
+        return SampleReading { .outcome = Outcome::Unreachable, .value = {}, .source = {} };
+    auto document = FleetDocument {};
+    document.sections.at(static_cast<std::size_t>(FleetSection::Kpi)) =
+        TableValue({ "body" }, { { TextCell(event.document->value()) } });
+    return SampleReading { .outcome = Outcome::Affirmative,
+                           .value = ScalarValue(TextCell(event.document->value())),
+                           .source = "fleet.txt",
+                           .note = {},
+                           .document = std::make_shared<FleetDocument const>(std::move(document)) };
 }
 
 /// A reader for which every sample was answered and declined.
@@ -1016,4 +1034,56 @@ TEST_CASE("the model's node status is what the newest sample carried and nothing
     CHECK(versionAt(2) == "<absent>");      // the sample carried none: not `first`
     CHECK(versionAt(3) == "while-failing"); // a failed sample replaces it too
     CHECK(versionAt(4) == "third");
+}
+
+TEST_CASE("the model's fleet document is the newest reading's and nothing older", "[cli][dashboard]")
+{
+    // A fleet panel draws the newest document, so the model holds exactly that. WHAT DISTINGUISHES:
+    // a sample whose reader REFUSED it leaves the model's document null -- a rule keeping the last one
+    // draws a fleet from before the gap -- and so does a `SampleFailed`, since the same helper replaces
+    // it on both routes.
+    auto const tick = DashboardEvent { .kind = DashboardEventKind::Tick };
+    auto const fleet = [](int seconds, std::string body) {
+        return DashboardEvent { .kind = DashboardEventKind::Sample,
+                                .at = At(seconds),
+                                .document = std::expected<std::string, AdminError> { std::move(body) } };
+    };
+
+    auto view = RecordingView {};
+    auto sink = CollectingSink {};
+    (void) Drive(
+        { tick,
+          fleet(1, "first"),
+          tick,
+          DashboardEvent { .kind = DashboardEventKind::Sample,
+                           .at = At(2),
+                           .document =
+                               std::expected<std::string, AdminError> {
+                                   std::unexpect, AdminError { .kind = AdminFailure::Refused, .detail = "follower" } } },
+          tick,
+          fleet(3, "third"),
+          tick,
+          DashboardEvent { .kind = DashboardEventKind::SampleFailed, .outcome = Outcome::Unreachable },
+          tick,
+          fleet(5, "fifth"),
+          tick },
+        DashboardLimits {},
+        view,
+        sink,
+        &HandingReader);
+
+    auto const bodyAt = [&view](std::size_t frame) {
+        auto const& document = view.seen.at(frame).latestDocument;
+        if (document == nullptr)
+            return std::string { "<null>" };
+        auto const* table = document->Section(FleetSection::Kpi);
+        return table == nullptr || table->rows.empty() ? std::string { "<no kpi>" } : table->rows.front().front().lexical;
+    };
+    REQUIRE(view.seen.size() == 6);
+    CHECK(bodyAt(0) == "<null>"); // nothing taken yet
+    CHECK(bodyAt(1) == "first");
+    CHECK(bodyAt(2) == "<null>"); // refused by its reader: not `first`
+    CHECK(bodyAt(3) == "third");
+    CHECK(bodyAt(4) == "<null>"); // a failed sample replaces it too
+    CHECK(bodyAt(5) == "fifth");
 }
