@@ -7,7 +7,9 @@
 #include "StatsSource.hpp"
 
 #include <FastCache/Core/EnumTable.hpp>
+#include <FastCache/Distributed/FleetView.hpp>
 
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -16,6 +18,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace FastCache::Cli
@@ -163,6 +166,50 @@ struct TierColumn
     Priority priority { Priority::Normal }; ///< When the column is dropped for width.
 };
 
+/// How a `kpi` row's unit is written for a person.
+///
+/// **The one place this client reads a unit's NAME.** `/fleet.txt` carries a headline figure as a raw
+/// number beside the name of the scale it is in, and those names are spelled once, file-local, in
+/// `FleetView.cpp`'s `CellFormatTable`. A unit with no row here is written exactly as the leader sent
+/// it rather than guessed at, and a test renders a real document and requires every unit it carries
+/// to have a row, so a rename there cannot leave the tiles raw in silence.
+struct KpiUnit
+{
+    std::string_view name; ///< The unit's spelling in the document.
+    double scale { 1.0 };  ///< Applied first: a thousandth is a fraction, a millisecond a thousandth of a second.
+    std::optional<FigureFormat> format {}; ///< How the scaled value is written; nullopt to write the cell as sent.
+};
+
+/// Every unit a `kpi` row can name, as this client writes it.
+inline constexpr auto KpiUnitTable = std::to_array<KpiUnit>({
+    { .name = "count", .scale = 1.0, .format = FigureFormat::Count },
+    { .name = "bytes", .scale = 1.0, .format = FigureFormat::Bytes },
+    { .name = "permille", .scale = 0.001, .format = FigureFormat::Percent },
+    { .name = "milliseconds", .scale = 0.001, .format = FigureFormat::Seconds },
+    { .name = "text", .scale = 1.0, .format = std::nullopt },
+});
+
+/// How a panel draws the fleet document a `fleet` reading carries (#134 §5).
+///
+/// **No column list lives here, or anywhere in this client** (#1320): a section's columns are the
+/// header line the leader sent, walked as it arrived. So what the layout knows about a table it
+/// cannot name ahead of time is POSITIONAL, and stated here as data: the first column says which row
+/// a line is and is `Essential`, and every later column shares `columnPriority` -- among equals
+/// `FitPieces` drops the rightmost first, so columns go from the right.
+///
+/// The headline tiles are the `kpi` section's rows, in `Distributed::FleetKpiKeys()` order and under
+/// those keys: the page's labels are prose beside its own table and are not restated here. Within a
+/// tile the denominator goes before the tile does, and tiles that do not fit the width at all are
+/// not drawn -- they are not essential, so they never turn a frame into the minimum-size line.
+struct DocumentSpec
+{
+    Priority tilePriority { Priority::Normal };     ///< When a line of tiles goes, for height.
+    Priority stripPriority { Priority::Low };       ///< When the section strip goes, for height.
+    Priority stripTabPriority { Priority::Low };    ///< When a tab other than the active one goes, for width.
+    Priority tablePriority { Priority::Essential }; ///< When the section's table shrinks to `+N more`, and goes.
+    Priority columnPriority { Priority::Normal };   ///< When a column after the first goes, for width.
+};
+
 /// A whole panel.
 ///
 /// **A table that does not fit vertically ends in `+N more`** rather than losing rows silently: it
@@ -177,6 +224,7 @@ struct PanelSpec
     Priority tierPriority { Priority::Normal };  ///< When the tier table shrinks, then goes, for height.
     Priority tierNotePriority { Priority::Low }; ///< When the tier note lines go.
     Priority sourcePriority { Priority::High };  ///< When the source line goes.
+    std::optional<DocumentSpec> document {};     ///< The fleet document block; nullopt for a panel without one.
 };
 
 /// A terminal size, in cells.
@@ -211,7 +259,9 @@ struct PanelContext
     std::string endpoint {};                              ///< Where the samples are asked; empty when not stated.
     std::optional<std::chrono::milliseconds> interval {}; ///< The sampling interval, when stated.
     CellWidth cellWidth { nullptr };                      ///< How many cells text occupies; must not be null.
-    RenderRung rung { RenderRung::Ascii };                ///< What the frame is drawn with; last, so it pads nothing.
+    /// Which section of a fleet document the panel's table draws; a panel without a document block ignores it.
+    Distributed::FleetSection section { Distributed::FleetSection::Machines };
+    RenderRung rung { RenderRung::Ascii }; ///< What the frame is drawn with; last with `section`, so they pad nothing.
 };
 
 /// The source a model's newest reading came from.
