@@ -23,7 +23,7 @@ namespace FastCache::Cli
 ///
 /// Every member is read and written on the reactor's thread only -- the producers resume
 /// there before touching any of it, and `LiveSourceParts::reactor` states the same of the
-/// caller -- which is why the count is plain rather than atomic.
+/// caller -- except the two that are atomic, which a drain reads from another thread.
 struct LiveEventSource::State
 {
     explicit State(LiveSourceParts from):
@@ -41,11 +41,10 @@ struct LiveEventSource::State
     /// What `Next()` hands out, and whether the session is closed: only `Close()` closes it.
     ///
     /// **Unbounded, because every producer is self-limiting and a drop would be a lie.**
-    /// The cadence waits for one sample before starting the next, and the forwarder awaits
-    /// each terminal read before asking for another, so neither can outrun a consumer that
-    /// draws a frame per tick. And what a bound would displace is a sample the budget
-    /// counts or a quit key -- either one lost silently is a session that miscounts or
-    /// cannot be left.
+    /// The cadence waits for one sample before starting the next, and the forwarders await
+    /// each read before asking for another, so none can outrun a consumer that draws a frame
+    /// per tick. And what a bound would displace is a sample the budget counts or a quit
+    /// key -- either one lost silently is a session that miscounts or cannot be left.
     AsyncQueue<DashboardEvent> events;
 
     /// Closed when the last producer ends; nothing is ever pushed to it.
@@ -67,9 +66,10 @@ struct LiveEventSource::State
 
     int producers { 0 };
 
+    /// Whether the last producer has ended, for a drain that cannot park on `finished`.
+    std::atomic<bool> drained { false };
+
     /// When the outstanding sample started, in the reactor clock's ticks, or `NoSample`.
-    ///
-    /// The one member read off the reactor thread, so the one member that is atomic.
     std::atomic<TimePoint::rep> sampleSince { NoSample };
 
     /// `sampleSince` when no sample is out. No real reading of a steady clock is this.
@@ -89,11 +89,13 @@ struct LiveEventSource::State
         (void) events.Push(std::move(event));
     }
 
-    /// One producer has ended; the last one resumes `Drained()`.
+    /// One producer has ended; the last one says so to both kinds of waiter.
     void ProducerEnded() noexcept
     {
-        if (--producers == 0)
-            finished.Close();
+        if (--producers != 0)
+            return;
+        drained.store(true, std::memory_order_release);
+        finished.Close();
     }
 };
 
@@ -132,9 +134,8 @@ namespace
             shared->Deliver(DashboardEvent { .kind = DashboardEventKind::Tick });
 
             deadline = std::max(deadline + parts.interval, parts.reactor->Clock().Now());
-            // One sleep straight through to the deadline: a zero poll interval, because
-            // nothing needs the timer to look at a flag -- `Close()` wakes this through the
-            // queue, and the timer's destructor retracts what is still pending.
+            // A zero poll interval: `Close()` wakes this through `due`, so the timer never
+            // needs to look at anything before its deadline.
             auto const timer = DeadlineTimer { *parts.reactor, deadline, &SampleDue, &shared->due, Duration::zero() };
             if (!(co_await shared->due.Pop()).has_value())
                 break;
@@ -185,30 +186,30 @@ namespace
     /// @param shared The source's state; held so it outlives the source if need be.
     DetachedTask RunStopWatch(std::shared_ptr<LiveEventSource::State> shared)
     {
-        auto const& parts = shared->parts;
+        auto& parts = shared->parts;
         auto const wake = co_await parts.stop->Stopped(parts.stopWaiter, parts.reactor);
-        // Closed first: the wait ended because `Close()` cancelled it, or said something
-        // nobody is left to hear.
-        if (!shared->Closed())
+
+        // Released as soon as nothing waits on it, which is what puts the previous signal
+        // disposition back: a sample stuck on the pool is no reason to keep Ctrl-C redirected
+        // at a watch that has ended.
+        parts.stop.reset();
+
+        // The wait ended because `Close()` cancelled it, or it said something nobody is left
+        // to hear.
+        if (shared->Closed() || wake == StopWake::Cancelled)
         {
-            switch (wake)
-            {
-                case StopWake::Stopped:
-                    shared->Deliver(DashboardEvent { .kind = DashboardEventKind::Key, .keys = std::string { CtrlC } });
-                    break;
-                case StopWake::Failed:
-                    // With the handler installed, Ctrl-C no longer ends the process by
-                    // itself, and nothing is waiting to hear it -- so a session that went
-                    // on would be one Ctrl-C cannot end. Ending it says why instead.
-                    shared->Deliver(
-                        DashboardEvent { .kind = DashboardEventKind::Detached,
-                                         .note = "stopped watching for Ctrl-C: waiting for the stop request failed" });
-                    break;
-                case StopWake::Cancelled:
-                case StopWake::Last:
-                    break;
-            }
+            shared->ProducerEnded();
+            co_return;
         }
+
+        if (wake == StopWake::Stopped)
+            shared->Deliver(DashboardEvent { .kind = DashboardEventKind::Key, .keys = std::string { CtrlC } });
+        else
+            // With the handler installed, Ctrl-C no longer ended the process by itself, and
+            // nothing was waiting to hear it -- so a session that went on would be one Ctrl-C
+            // could not end. Ending it says why instead.
+            shared->Deliver(DashboardEvent { .kind = DashboardEventKind::Detached,
+                                             .note = "stopped watching for Ctrl-C: waiting for the stop request failed" });
         shared->ProducerEnded();
     }
 } // namespace
@@ -256,15 +257,16 @@ void LiveEventSource::Close() noexcept
     if (state.Closed())
         return;
     state.events.Close();
-    // A cadence between samples would otherwise wait out a whole interval before seeing
-    // the close, and `Drained()` with it.
     state.due.Close();
     if (state.parts.terminal != nullptr)
         state.parts.terminal->Close();
-    // The stop wait holds a thread until something answers it, and `Drained()` waits for
-    // that thread's answer to come back.
     if (state.parts.stop != nullptr)
         state.parts.stop->Cancel();
+}
+
+bool LiveEventSource::IsDrained() const noexcept
+{
+    return _state->drained.load(std::memory_order_acquire);
 }
 
 std::optional<TimePoint> LiveEventSource::SampleOutstandingSince() const noexcept
