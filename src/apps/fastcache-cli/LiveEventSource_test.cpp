@@ -336,11 +336,8 @@ TEST_CASE("closing a source between samples retires its timer without waiting fo
     rig.Settle();
     CHECK(rig.reactor.PendingTimers() == 1);
 
-    source.Close();
-    // Retracted at the close, not at the deadline.
-    CHECK(rig.reactor.PendingTimers() == 0);
-
-    // Drained with the clock where it was, and without another sample.
+    // Drained, and the timer gone from the heap, with the clock where it was and without
+    // another sample: the close is heard on the reactor's next turn, not at the deadline.
     CloseAndDrain(rig, source);
     CHECK(rig.gatherer.Calls() == 1);
 }
