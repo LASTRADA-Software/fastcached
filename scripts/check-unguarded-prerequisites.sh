@@ -176,16 +176,20 @@ Blank() {
 # #1038's own fix uses -- `RequiredTools=(gh jq)` iterated into `command -v "$tool"` --
 # because reading only literal guards makes `jq` invisible on master too.
 GuardedIn() {
-    local blanked var arr guardKey
+    local guardKey
     guardKey="$(Blanked "$1")"; guardKey="${guardKey%.blank}.guards"
-    if [ -s "$guardKey" ]; then cat "$guardKey"; return 0; fi
+    if [ -s "$guardKey" ]; then printf '%s\n' "$(<"$guardKey")"; return 0; fi
     _GuardedIn "$1" | sort -u > "$guardKey"
-    cat "$guardKey"
+    # `[ -s ]` and not a bare read: `cat` on an empty file emits NOTHING, while
+    # `printf '%s\n' "$(<f)"` emits a newline -- which would put a phantom empty
+    # entry in the guards list. Measured both ways before this was written (#1346).
+    [ -s "$guardKey" ] && printf '%s\n' "$(<"$guardKey")"
+    return 0
 }
 
 _GuardedIn() {
     local blanked var arr
-    blanked="$(cat "$(Blanked "$1")")"
+    blanked="$(<"$(Blanked "$1")")"
 
     printf '%s\n' "$blanked" \
         | sed -nE 's/.*command -v[[:space:]]+([A-Za-z_][A-Za-z0-9_.-]*).*/\1/p'
@@ -212,9 +216,53 @@ _GuardedIn() {
 # out of the default set. Blank each file ONCE into a cache and read that instead: 1.5s.
 #
 # Files rather than an associative array, because bash 3.2 has none.
+#
+# ---------------------------------------------------------------------------------
+# WHAT THIS COSTS NOW, AND WHERE THE REST OF IT IS (#1346)
+# ---------------------------------------------------------------------------------
+#
+# The unit is PROCESS CREATIONS -- tool spawns PLUS subshell forks -- and it is not the
+# same as a count of tools. A `$( )` forks without exec'ing anything on PATH, so a
+# wrapper-on-PATH counter is blind to it; on this check that blindness was 1,838 of 4,631
+# creations, 40%. Measured from the kernel's own counter, `/proc/stat`'s `processes`
+# field read either side of a run, with a control measuring the floor.
+#
+# At 71 scripts and 24 optional tools:
+#
+#                       creations   tool spawns   ext4 ms   Git Bash/ReFS
+#   before                  4,631         2,793     2,752          112 s
+#   after                   2,438         1,149     1,013         35.6 s
+#
+# Three idiom changes, each MEASURED before it was used rather than reasoned about:
+#
+#   x=$(printf %s "$p" | tr ...)   4.20 creations per call   ->  ${p//[\/.]/_}   0.04
+#   x=$(cat f)                     1.85 creations per call   ->  x=$(<f)         0.00
+#   grep -qx -- "$t" <<< "$list"   1 spawn + 1 fork per pair ->  case            0
+#
+# WHAT IS LEFT, so nobody re-derives it: about 1,289 forks and 887 sed+sort spawns, all
+# in `_GuardedIn`'s per-file pipelines. Removing them is a STRUCTURAL change -- merging
+# the passes over the file list, or narrowing what `_GuardedIn` re-derives -- and at
+# ~10% of the ctest budget it has no business case. It is written here rather than filed
+# as a ticket for that reason.
+#
+# AND THE OBVIOUS REMEDY FROM #1331 DOES NOT TRANSFER. There, a candidate pre-filter was
+# sound because a file with no whole-word mention contributed zero to every count. Here
+# the `optional` vocabulary is DERIVED from every file's guards in a first pass over the
+# whole list, so skipping a file can remove a derived token and silently narrow what the
+# check looks for EVERYWHERE ELSE. It would read as a speedup and be a guard that stopped
+# guarding.
 _cache=""
 Blanked() {
-    local key="${_cache}/$(printf '%s' "$1" | tr '/.' '__')"
+    # The key is built with parameter expansion rather than `printf | tr`, because
+    # this function is called several hundred times per run and that pipeline cost
+    # 4.20 PROCESS CREATIONS every time -- a `$( )` fork, a pipeline fork and the
+    # `tr` itself -- against 0.04 for the builtin. Measured, both the cost and the
+    # equivalence: `[\/.]` maps exactly what `tr '/.' '__'` mapped (#1346).
+    #
+    # The `\/` escape is load-bearing rather than decorative: inside
+    # `${var//pattern/repl}` an unescaped `/` ENDS the pattern, so `[/.]` would
+    # parse as pattern `[` with replacement `.]`.
+    local key="${_cache}/${1//[\/.]/_}"
     [ -s "${key}.blank" ] || Blank "$1" > "${key}.blank"
     printf '%s\n' "${key}.blank"
 }
@@ -232,7 +280,8 @@ CommandPositions() {
                 | sed -nE 's/.*(\|\||&&|[|;]|\$\()[[:space:]]*([a-z][a-z0-9_.-]*)[[:space:]]+.*/\2/p'
         } | sort -u > "$key"
     fi
-    cat "$key"
+    [ -s "$key" ] && printf '%s\n' "$(<"$key")"
+    return 0
 }
 
 # A HERESTRING, never a pipe. Piping a producer into a quiet matcher is a false NEGATIVE
@@ -327,6 +376,9 @@ Main() {
         return 1
     fi
 
+    # The newline sentinel the two membership tests below wrap their lists in.
+    local nl='
+'
     local problems=0 guards positions
     for f in $files; do
         guards="$(GuardedIn "${root}/${f}" | sort -u)"
@@ -347,8 +399,18 @@ Main() {
         positions="$(CommandPositions "${root}/${f}")"
         for t in $optional; do
             IsPrerequisite "$t" && continue
-            grep -qx -- "$t" <<< "$guards" && continue
-            grep -qx -- "$t" <<< "$positions" || continue
+            # `case` rather than `grep -qx`, and it is the SAME test: an exact
+            # whole-line match against a newline-separated list. The difference is
+            # that the shell does it with NO process at all, where each `grep` is a
+            # fork plus an exec -- MEASURED at about 1,100 of them per run here, and
+            # a process costs ~21 ms under the MSYS shell the Windows legs use.
+            #
+            # The idiom is this file's own: `IsPrerequisite` above is the same shape
+            # with a space sentinel. The sentinel is a NEWLINE here because these
+            # lists are newline-separated, and it wraps BOTH sides so the first and
+            # last entries match exactly as the middle ones do.
+            case "${nl}${guards}${nl}" in *"${nl}${t}${nl}"*) continue ;; esac
+            case "${nl}${positions}${nl}" in *"${nl}${t}${nl}"*) ;; *) continue ;; esac
             echo "CMake Error: unguarded-prerequisites: ${f} guards a prerequisite and then" >&2
             echo "  uses '${t}' unguarded, at line(s): $(LinesUsing "$t" "${root}/${f}")" >&2
             echo "  A missing '${t}' is reported as a failed read rather than a missing tool." >&2
