@@ -69,11 +69,15 @@ struct Admission
 /// @param operands The positional arguments after the verb.
 /// @param options The modifiers.
 /// @param identity What the endpoint turns out to be.
+/// @param resp The RESP connection, or null when none opened.
 /// @return The conclusion and the ask count.
-[[nodiscard]] Admission Admit(std::vector<std::string> const& operands, VerbOptions options, EndpointIdentity identity)
+[[nodiscard]] Admission Admit(std::vector<std::string> const& operands,
+                              VerbOptions options,
+                              EndpointIdentity identity,
+                              IExchange* resp = nullptr)
 {
     ScriptedIdentity scripted { std::move(identity) };
-    auto const context = VerbContext { .operands = operands, .options = options, .identity = &scripted };
+    auto const context = VerbContext { .operands = operands, .options = options, .resp = resp, .identity = &scripted };
     auto result = AdmitLiveStats(context);
     return Admission { .result = std::move(result), .asks = scripted.Calls() };
 }
@@ -123,6 +127,48 @@ TEST_CASE("an unnamed subject is inferred from what the endpoint is and nobody-c
     REQUIRE_FALSE(foreign.result.has_value());
     CHECK(foreign.result.error().outcome == Outcome::Protocol);
     CHECK(RefusalText(foreign).contains("the server closed the connection"));
+}
+
+TEST_CASE("an endpoint that opened RESP and identified nothing over 0xFC is refused saying what was observed", "[cli][live]")
+{
+    // The address evidently reaches something, so the remedy *check that --addr reaches a
+    // fastcached* would send an operator to verify an address that works. Refused all the
+    // same (§9.7) -- only the sentence changes, and it changes to what was OBSERVED.
+    //
+    // Each observed case beside its neighbour with no RESP, which must keep its own
+    // wording: a sentence that said *RESP opened* whatever happened would pass the first
+    // half of every pair.
+    auto resp = ScriptedExchange { {} };
+
+    // 0xFC could not even be opened.
+    auto const unopened = Admit({}, {}, NotAsked(), &resp);
+    REQUIRE_FALSE(unopened.result.has_value());
+    CHECK(unopened.result.error().outcome == Outcome::Unreachable);
+    CHECK(RefusalText(unopened).contains("a RESP connection opened"));
+    CHECK(RefusalText(unopened).contains("no 0xFC connection was opened"));
+    CHECK(RefusalText(unopened).contains("not a fastcached, or one too old to identify itself"));
+    CHECK_FALSE(RefusalText(unopened).contains("check that --addr"));
+
+    auto const unreachable = Admit({}, {}, NotAsked());
+    REQUIRE_FALSE(unreachable.result.has_value());
+    CHECK(RefusalText(unreachable).contains("check that --addr"));
+    CHECK_FALSE(RefusalText(unreachable).contains("RESP"));
+
+    // 0xFC opened and answered in nothing this client reads.
+    auto const silent = Admit({}, {}, Foreign(), &resp);
+    REQUIRE_FALSE(silent.result.has_value());
+    CHECK(silent.result.error().outcome == Outcome::Protocol);
+    CHECK(RefusalText(silent).contains("a RESP connection opened, but 0xFC did not answer"));
+    CHECK(RefusalText(silent).contains("the server closed the connection"));
+    CHECK(RefusalText(silent).contains("not a fastcached, or one too old to identify itself"));
+
+    auto const foreign = Admit({}, {}, Foreign());
+    REQUIRE_FALSE(foreign.result.has_value());
+    CHECK_FALSE(RefusalText(foreign).contains("RESP"));
+
+    // The two observed cases are worded apart, and admission asked RESP nothing.
+    CHECK(RefusalText(unopened) != RefusalText(silent));
+    CHECK(resp.Sent().empty());
 }
 
 TEST_CASE("a named subject nobody could check is refused like an unnamed one", "[cli][live]")
