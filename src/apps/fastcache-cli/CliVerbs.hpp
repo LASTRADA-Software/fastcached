@@ -205,6 +205,12 @@ struct VerbContext
     IEndpointIdentity* identity { nullptr };   ///< What the endpoint is, or null.
 };
 
+/// What a verb that reads the admin surface says when `VerbContext::admin` is null.
+///
+/// Not a failure to reach anything -- nothing was CONFIGURED to reach -- so it is `Usage`
+/// wherever it is said, and one spelling for every verb and session that says it.
+inline constexpr std::string_view NoAdminSurface = "no admin surface is available to this invocation";
+
 /// The wires, one row per enumerator, in enumerator order.
 ///
 /// Below `VerbContext` rather than beside `WireSpec`, because `available` is a function
