@@ -544,6 +544,7 @@ TEST_CASE("every outcome has a distinct exit code", "[cli][command]")
     // The pairs the table's own documentation promises to keep apart.
     CHECK(ExitCodeOf(Outcome::Negative) != ExitCodeOf(Outcome::Unreachable));
     CHECK(ExitCodeOf(Outcome::Refused) != ExitCodeOf(Outcome::Protocol));
+    CHECK(ExitCodeOf(Outcome::Local) != ExitCodeOf(Outcome::Refused));
     CHECK(ExitCodeOf(Outcome::Affirmative) == 0);
     CHECK(ExitCodeOf(Outcome::Usage) == 2);
 }

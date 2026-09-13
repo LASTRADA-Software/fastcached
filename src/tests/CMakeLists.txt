@@ -6726,3 +6726,31 @@ set_tests_properties("vendor-verbatim-selftest" PROPERTIES
     LABELS "hygiene"
     TIMEOUT 120
 )
+
+# ---------------------------------------------------------------------------
+# The exit codes the fastcache-cli page lists are OutcomeTable's, code, name and meaning.
+#
+# `--help` renders the table and cannot drift; the operator page restated six codes and
+# their count by hand, and #134 added a seventh. Reads `OutcomeTable`'s literal in
+# `src/apps/fastcache-cli/CliAnswer.hpp` and the `## Exit codes` section of
+# `docs/tools/fastcache-cli.md`, so renaming either is a refusal here, by design.
+add_test(
+    NAME "cli-exit-code-docs"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-cli-exit-code-docs.sh"
+            "${CMAKE_SOURCE_DIR}"
+)
+set_tests_properties("cli-exit-code-docs" PROPERTIES
+    LABELS "hygiene;docs-subject"
+    TIMEOUT 60
+)
+
+# And the verdicts, against synthetic trees: every way the two can disagree, a decoy
+# beside each bounded read, and both ways the reader can fail to LOOK.
+add_test(
+    NAME "cli-exit-code-docs-selftest"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-cli-exit-code-docs.sh" --self-test
+)
+set_tests_properties("cli-exit-code-docs-selftest" PROPERTIES
+    LABELS "hygiene"
+    TIMEOUT 60
+)

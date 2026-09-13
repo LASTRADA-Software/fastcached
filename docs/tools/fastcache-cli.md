@@ -459,16 +459,20 @@ classification.
 
 ## Exit codes
 
-Six outcomes, because one code cannot answer six questions:
+One code per outcome, because one code cannot answer several questions. The rows are
+`OutcomeTable`'s, word for word — `--help` renders that table, and
+`ctest -R cli-exit-code-docs` refuses this listing the moment a code, a name or a meaning
+differs from it:
 
 | | | |
 |--:|---|---|
 | 0 | `ok` | the command was answered |
-| 1 | `no` | answered, and the answer is no — a miss, or no such key |
+| 1 | `no` | the command was answered and the answer is no (a miss, or no such key) |
 | 2 | `usage` | the command line was wrong; nothing was sent |
 | 3 | `unreachable` | the server could not be reached, or the connection failed |
 | 4 | `refused` | the server answered and declined |
-| 5 | `protocol` | the reply could not be read; the peer may not be a `fastcached` |
+| 5 | `protocol` | the reply could not be read; the peer may not be a fastcached |
+| 6 | `local` | this machine could not carry the command out; the server is not implicated |
 
 The pairs that matter:
 
@@ -476,6 +480,10 @@ The pairs that matter:
   gives up on the other cannot be written if they agree.
 - **4 against 5** — the server said no, versus the server said something this
   client could not read. Different people fix those.
+- **4 against 6** — the server declined, versus this machine could not do it.
+  `live-stats` on a terminal it cannot draw on exits **6**: nothing at the server
+  is wrong, and the remedy — redirecting the output, for one line per sample — is
+  on this machine.
 - **3 against 4, pointed at a compile node** — a `fastcache-compile-node` serves no
   keyspace, so `get` there cannot work and never will. It exits **4**, not 3: the
   endpoint answered, and `3` is the code that reads as *retry, the daemon may be
