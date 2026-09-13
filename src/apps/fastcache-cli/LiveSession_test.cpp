@@ -232,10 +232,12 @@ class RecordingRungViews final: public IRungViews
 {
   public:
     /// @param throwing Whether the views it hands out throw.
-    /// @param pipedOnly Whether only the `Piped` rung has a view, as in this build.
-    explicit RecordingRungViews(bool throwing, bool pipedOnly = false) noexcept:
+    /// @param pipedOnly Whether only the `Piped` rung has a view.
+    /// @param none Whether no rung has one.
+    explicit RecordingRungViews(bool throwing, bool pipedOnly = false, bool none = false) noexcept:
         _throwing { throwing },
-        _pipedOnly { pipedOnly }
+        _pipedOnly { pipedOnly },
+        _none { none }
     {
     }
 
@@ -244,7 +246,7 @@ class RecordingRungViews final: public IRungViews
                                                       std::string_view /*address*/) override
     {
         _asked.push_back(rung);
-        if (_pipedOnly && rung != RenderRung::Piped)
+        if (_none || (_pipedOnly && rung != RenderRung::Piped))
             return nullptr;
         if (_throwing)
             return std::make_unique<ThrowingView>();
@@ -266,6 +268,7 @@ class RecordingRungViews final: public IRungViews
   private:
     bool _throwing;
     bool _pipedOnly;
+    bool _none;
     std::vector<RenderRung> _asked {};
     std::vector<std::pair<int, int>> _geometry {};
 };
@@ -276,7 +279,8 @@ struct CompositionFaults
     bool detachAtOnce { false };                ///< An acquired terminal goes away before its first read.
     std::string stopRefusal {};                 ///< Why installing the stop request fails; empty when it does not.
     bool throwingViews { false };               ///< Every view throws on its first frame.
-    bool pipedViewsOnly { false };              ///< Only the `Piped` rung has a view, as in this build.
+    bool pipedViewsOnly { false };              ///< Only the `Piped` rung has a view.
+    bool noViews { false };                     ///< No rung has a view, the `Piped` one included.
     IStatsGatherer* gatherer { nullptr };       ///< What samples ask instead of the rig's gatherer, when set.
     IStatsDialer* dialer { nullptr };           ///< What re-dials after a failed sample; none when null.
     LiveSubject subject { LiveSubject::Cache }; ///< What the admitted plan watches.
@@ -318,7 +322,7 @@ struct Composition
         rig { rig },
         terminals { rig.reactor, std::move(terminal), faults.detachAtOnce },
         stops { rig.reactor, std::move(faults.stopRefusal) },
-        views { faults.throwingViews, faults.pipedViewsOnly },
+        views { faults.throwingViews, faults.pipedViewsOnly, faults.noViews },
         terminalPool { rig.clock },
         gatherer { faults.gatherer != nullptr ? faults.gatherer : &rig.gatherer },
         dialer { faults.dialer },
@@ -579,6 +583,24 @@ TEST_CASE("an interactive session whose rung has no view refuses by name and rel
     composition.Finish();
 }
 
+TEST_CASE("a piped session whose subject has no record to stream refuses by name", "[cli][live][session]")
+{
+    Rig rig;
+    Composition composition { rig, SixelTerminal, CompositionFaults { .noViews = true } };
+    composition.Start(false);
+    rig.Settle();
+
+    auto const* const refusal = composition.Refusal();
+    CHECK((refusal != nullptr && refusal->outcome == Outcome::Local));
+    CHECK((refusal != nullptr && AdvisoryText(*refusal).contains("no record to stream")));
+    // Not the terminal's wording: there is no terminal, and redirecting the output is no remedy.
+    CHECK((refusal != nullptr && !AdvisoryText(*refusal).contains("terminal")));
+    CHECK_FALSE(composition.source.has_value());
+    CHECK(rig.gatherer.Calls() == 0);
+
+    composition.Finish();
+}
+
 TEST_CASE("an interactive session draws every frame through the terminal's presenter and none to the pipe",
           "[cli][live][session]")
 {
@@ -641,7 +663,7 @@ TEST_CASE("a resize reaches the next frame an interactive session draws", "[cli]
 TEST_CASE("the standard views draw the piped rung, and each subject's own panel on an interactive one",
           "[cli][live][session]")
 {
-    auto views = StandardRungViews { RenderOptions { .format = OutputFormat::Human }, &LatestReading, &FakeCellWidth };
+    auto views = StandardRungViews { RenderOptions { .format = OutputFormat::Human }, &FakeCellWidth };
     auto const cache = LivePlan { .subject = LiveSubject::Cache,
                                   .interval = std::chrono::milliseconds { 2000 },
                                   .samples = 0,
@@ -652,7 +674,9 @@ TEST_CASE("the standard views draw the piped rung, and each subject's own panel 
     fleet.subject = LiveSubject::Fleet;
 
     CHECK(views.For(RenderRung::Piped, cache, "10.0.0.4:6674") != nullptr);
-    CHECK(views.For(RenderRung::Piped, fleet, "10.0.0.4:6674") != nullptr);
+    CHECK(views.For(RenderRung::Piped, node, "10.0.0.4:6674") != nullptr);
+    // Nothing to stream for the fleet yet: refused by name, never streamed as some other record.
+    CHECK(views.For(RenderRung::Piped, fleet, "10.0.0.4:6674") == nullptr);
 
     // Which panel, told apart by its title, and the frame names where and how often it samples.
     auto const model = DashboardModel {};
@@ -1106,7 +1130,7 @@ struct RunningSeat
     ScriptedInstaller stops { reactor, "" };
     StopOnDemandInstaller onDemand { reactor };
     ScriptedAcquisition terminals { reactor, std::unexpected(std::string { "stdin is not a terminal" }), false };
-    StandardRungViews views { render, &LatestReading, &FakeCellWidth };
+    StandardRungViews views { render, &FakeCellWidth };
     ThreadDrainWait drainWait;
     ScriptedGatherer gatherer { Reading() };
     GatedGatherer gated { &onDemand };
@@ -1196,7 +1220,9 @@ TEST_CASE("a piped live-stats session runs to its budget, drains, and exits with
     // The header and the one row the budget allowed, in the format asked for.
     auto const stream = seat.Stream();
     CHECK(std::ranges::count(stream, '\n') == 2);
-    CHECK(stream.contains("\tcurr_connections\n"));
+    // The cache panel's figures, named as the panel labels them.
+    CHECK(stream.starts_with("source\thit_rate\t"));
+    CHECK(stream.contains("\tbytes_limit\n"));
     CHECK((seat.source.has_value() && seat.source->IsDrained()));
 }
 
