@@ -75,7 +75,25 @@ class IStopSignal
 ///
 /// One per process at a time, because a signal disposition is process-wide: a second is
 /// refused while the first lives rather than silently replacing it.
-/// @return The installed signal, or why it could not be installed.
+///
+/// **Three outcomes, and the second is not a failure.**
+///   - A signal that fires on the operator's stop request.
+///   - On POSIX, when this process INHERITED SIGINT as ignored -- a background job, `nohup` --
+///     a signal that installs nothing and never fires: only `Cancel()` ends its wait. The caller
+///     asked for Ctrl-C to be ignored, and it is; catching it would let a Ctrl-C meant for the
+///     foreground end this process, which is the changed death the rule above forbids. Windows
+///     has no call that reads an inherited ignore back, so it has no such arm.
+///   - Why nothing could be installed.
+/// @return The signal, or why it could not be installed.
 [[nodiscard]] std::expected<std::unique_ptr<IStopSignal>, std::string> InstallStopSignal();
+
+/// The descriptor (POSIX) or handle value (Windows) the stop handler writes to, or -1 before any
+/// install has created it.
+///
+/// **Created once and never closed**, because a handler already running when a signal is
+/// uninstalled may still write to it. Exposed so a test can hold that property to what it claims
+/// -- reused by the next install, and still open after an uninstall -- and nothing else needs it.
+/// @return The handler-facing end, or -1.
+[[nodiscard]] std::intptr_t StopSignalHandlerEnd() noexcept;
 
 } // namespace FastCache
