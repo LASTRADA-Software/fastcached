@@ -45,6 +45,12 @@ set -uo pipefail
 source_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 library="${source_dir}/scripts/lib/e2e-common.sh"
 
+# Which files are third-party (#1370), for the one census here that lists the whole
+# repository rather than walking `scripts/`.
+# shellcheck source=lib/third-party-roots.sh
+. "${source_dir}/scripts/lib/third-party-roots.sh" \
+    || { echo "FAIL: cannot read scripts/lib/third-party-roots.sh" >&2; exit 1; }
+
 # How many immediate commands `fast_path_ms` puts through `run_bounded`.
 #
 # LOAD-BEARING, and therefore a NAME rather than a literal in the loop with the
@@ -4545,10 +4551,56 @@ fi
 # rather than scripts ctest runs and are not bash at all. Widening it to classify
 # by shebang would report those ten on a correct tree, which is the noise that
 # gets a scan deleted.
+#
+# A script under a third-party root is DECLINED rather than reported (#1370): an
+# upstream script is not one the walk owes a scan, and it is named on every run rather
+# than dropped silently. The census is a function so a planted tree can drive it before
+# the real one does -- a decline nobody has watched decline is not known to work.
+#
+# @param 1 A repository root. Prints its first-party tracked `*.sh` outside `scripts/`,
+# names what it declined on stderr, and answers 2 when the roots cannot be read.
+_shell_walk_strays() {
+    local tracked firstParty declined
+    tracked="$(git -C "$1" ls-files '*.sh')" || return 2
+    firstParty="$(first_party_paths "$1" "$tracked")" || return 2
+    declined="$(third_party_paths "$1" "$tracked")"
+    [ -z "$declined" ] \
+        || echo "   walk scope: $(third_party_declined_summary 'shell script(s)' "$declined")" >&2
+    [ -z "$firstParty" ] || grep -v '^scripts/' <<< "$firstParty" || true
+}
+
 if git -C "$source_dir" rev-parse --git-dir >/dev/null 2>&1; then
     ran=$(( ran + 1 ))
-    stray="$(git -C "$source_dir" ls-files '*.sh' | grep -v '^scripts/' || true)"
-    if [ -n "$stray" ]; then
+    # The positive control: one first-party stray, one third-party script, one script
+    # inside the walk. Exactly the stray must come back, and the declined one by name.
+    stray_canary="$(mktemp -d)"
+    mkdir -p "${stray_canary}/tree/scripts/lib" "${stray_canary}/tree/vendor/upstream" "${stray_canary}/tree/tools"
+    printf '# planted\nvendor/upstream\n' > "${stray_canary}/tree/scripts/lib/third-party-roots.txt"
+    : > "${stray_canary}/tree/scripts/inside.sh"
+    : > "${stray_canary}/tree/vendor/upstream/upstream.sh"
+    : > "${stray_canary}/tree/tools/stray.sh"
+    stray_canary_found=""
+    if git -C "${stray_canary}/tree" init -q >/dev/null 2>&1 \
+        && git -C "${stray_canary}/tree" add -A >/dev/null 2>&1; then
+        stray_canary_found="$(_shell_walk_strays "${stray_canary}/tree" 2>"${stray_canary}/declined")"
+    fi
+    stray_canary_declined="$(cat "${stray_canary}/declined" 2>/dev/null || true)"
+    rm -rf "$stray_canary"
+    case "$stray_canary_declined" in
+        *"first vendor/upstream/upstream.sh"*) stray_canary_named=yes ;;
+        *) stray_canary_named=no ;;
+    esac
+    if [ "$stray_canary_found" != "tools/stray.sh" ] || [ "$stray_canary_named" != yes ]; then
+        echo "FAIL shell-walk-scope: the planted tree did not come back as exactly its one first-party" >&2
+        echo "     stray (got [${stray_canary_found}]) with its third-party script declined by name" >&2
+        echo "     (got [${stray_canary_declined}]), so the census below cannot be believed either way." >&2
+        note_failure "shell-walk-scope"
+    fi
+    if ! stray="$(_shell_walk_strays "$source_dir")"; then
+        echo "FAIL shell-walk-scope: the third-party roots of ${source_dir} could not be read (the reader says" >&2
+        echo "     why above), so a vendored script cannot be told from a stray first-party one." >&2
+        note_failure "shell-walk-scope"
+    elif [ -n "$stray" ]; then
         echo "FAIL shell-walk-scope: tracked shell script(s) live outside scripts/, where the" >&2
         echo "     _shell_scripts walk every scan in this file reads does not reach them:" >&2
         printf '%s\n' "$stray" | sed 's/^/     | /' >&2

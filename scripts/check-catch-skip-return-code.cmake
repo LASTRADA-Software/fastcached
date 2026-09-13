@@ -225,6 +225,19 @@ endif()
 list(REMOVE_DUPLICATES listFiles)
 list(SORT listFiles)
 
+# And TRACKED stopped meaning OWNED when `vendor/` arrived: upstream's own CMakeLists are
+# in the index, copied verbatim, and nobody here may add a property to them. So both modes
+# decline the third-party roots (#1370), and name what they declined on every run -- the
+# fourth fix to this scan's scope is the one that states the scope rather than guessing it.
+include("${CMAKE_CURRENT_LIST_DIR}/lib/CheckCommon.cmake")
+fastcached_decline_third_party("${FASTCACHED_SOURCE_DIR}" listFiles declinedFiles)
+if(declinedFiles)
+    list(LENGTH declinedFiles declinedCount)
+    list(GET declinedFiles 0 firstDeclined)
+    message(STATUS
+        "catch skip return code: declined ${declinedCount} third-party CMakeLists under the roots in scripts/lib/third-party-roots.txt, first ${firstDeclined}")
+endif()
+
 if(NOT listFiles)
     message("")
     message("  No CMakeLists.txt was found in this repository at all.")

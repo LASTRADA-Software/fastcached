@@ -367,7 +367,31 @@ SourceExtensions=(c cc cxx h hh hpp cpp ipp hxx inl)
 # here: this script's subject is "every source this repository has", which is open,
 # whereas the set it does not own is closed and named. So it is stated as roots, the
 # enumeration is asserted below rather than trusted, and a new root is a row.
-NotOurRoots=(vendor)
+#
+# That row is in `scripts/lib/third-party-roots.txt` (#1370), not here. This was one of
+# five tree-wide enumerators that each had to be told about `vendor/` separately, and
+# three of them were found by review; the roots are now ONE answer every enumerator
+# reads. `LoadNotOurRoots` fills this, and the one pattern matching a path under any of
+# them, once the repository is known -- and refuses rather than leaving either empty: an
+# empty exclusion is a sweep of vendored code.
+NotOurRoots=()
+NotOurPattern=""
+
+# shellcheck source=lib/third-party-roots.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib/third-party-roots.sh" \
+    || { echo "TIDY SWEEP FATAL: cannot read scripts/lib/third-party-roots.sh" >&2; exit 2; }
+
+# Read the third-party roots of the repository at @p 1 into `NotOurRoots` and `NotOurPattern`.
+# @param 1 The repository root.
+LoadNotOurRoots() {
+    local roots root
+    roots="$(third_party_roots "$1")" && NotOurPattern="$(third_party_path_pattern "$1")" \
+        || fatal "the third-party roots of $1 could not be read, so this sweep cannot tell code it owns from code it does not"
+    NotOurRoots=()
+    while IFS= read -r root; do
+        NotOurRoots+=("$root")
+    done <<< "$roots"
+}
 
 # Every first-party file, which is every tracked-or-new file outside the roots above.
 #
@@ -383,12 +407,20 @@ NotOurRoots=(vendor)
 #
 # @param @ Optional `git ls-files` pathspec globs.
 FirstPartyFiles() {
-    local kept root
-    kept="$(git ls-files --cached --others --exclude-standard "$@")"
-    for root in "${NotOurRoots[@]}"; do
-        kept="$(grep -v "^${root}/" <<< "$kept" || true)"
-    done
-    printf '%s\n' "$kept"
+    local listed
+    listed="$(git ls-files --cached --others --exclude-standard "$@")"
+    grep -vE "$NotOurPattern" <<< "$listed" || true
+}
+
+# Every tracked-or-new file UNDER the roots: exactly what `FirstPartyFiles` declines.
+# Printed by name at the top level, so a run says what it declined rather than the
+# reader having to trust that it did.
+#
+# @param @ Optional `git ls-files` pathspec globs.
+DeclinedThirdPartyFiles() {
+    local listed
+    listed="$(git ls-files --cached --others --exclude-standard "$@")"
+    grep -E "$NotOurPattern" <<< "$listed" || true
 }
 
 # That the exclusion above still bites. Called once, from the top level, where a
@@ -1477,6 +1509,28 @@ STUB
            "not-parsing fatal error: ${SQ}stddef.h${SQ} file not found" \
            "$(CanaryVerdict 0 "fatal error: ${SQ}stddef.h${SQ} file not found")"
 
+    # The third-party roots (#1370), planted: a scratch repository whose roots file names
+    # `vendor`, holding one first-party source and one vendored one. The sweep's file set
+    # must keep the first and decline the second BY NAME -- a roots reader that silently
+    # read nothing would keep both and report nothing, which is the defect.
+    local tp="$scratch/third-party"
+    mkdir -p "$tp/src" "$tp/vendor/upstream" "$tp/scripts/lib"
+    printf 'int a;\n' > "$tp/src/a.cpp"
+    printf 'int b;\n' > "$tp/vendor/upstream/b.cpp"
+    printf '# roots\nvendor\n' > "$tp/scripts/lib/third-party-roots.txt"
+    if env -u GIT_DIR -u GIT_WORK_TREE git -C "$tp" init -q >/dev/null 2>&1 \
+        && env -u GIT_DIR -u GIT_WORK_TREE git -C "$tp" add -A >/dev/null 2>&1; then
+        Expect "a planted third-party source is declined, and the first-party one kept" \
+               "src/a.cpp"$'\t'"vendor/upstream/b.cpp" \
+               "$(cd "$tp" && LoadNotOurRoots "$tp" && printf '%s\t%s' "$(FirstPartyFiles '*.cpp')" "$(DeclinedThirdPartyFiles '*.cpp')")"
+    else
+        echo "  FAIL third-party roots: git could not stage the scratch repository, so the planted case did not run"
+        status=1
+    fi
+    printf '# no roots at all\n' > "$tp/scripts/lib/third-party-roots.txt"
+    ( LoadNotOurRoots "$tp" ) >/dev/null 2>&1
+    Expect "a roots file naming no root is refused, never read as nothing third-party" "2" "$?"
+
     [[ "$status" -eq 0 ]] && echo "TIDY SWEEP SELF-TEST PASSED"
     return "$status"
 }
@@ -1513,6 +1567,7 @@ esac
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)" || fatal "cannot locate the repository"
 cd "$repo_root" || fatal "cannot enter ${repo_root}"
+LoadNotOurRoots "$repo_root"
 
 if [[ "$mode" == selftest ]]; then
     # The contribution checks shell out to `PreprocessArgv`, so python3 is a
@@ -1755,6 +1810,8 @@ fi
 # Before either enumeration below reaches `FirstPartyFiles`, and at the top level so
 # a refusal can stop the run.
 AssertNotOurRootsExcluded
+declinedFiles="$(DeclinedThirdPartyFiles)"
+[[ -z "$declinedFiles" ]] || echo "TIDY SWEEP: $(third_party_declined_summary 'file(s)' "$declinedFiles")"
 
 if [[ "$mode" != all && "$mode" != only ]]; then
     mapfile -t changed < <({ git diff --name-only "${BASE}...HEAD"

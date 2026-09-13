@@ -5219,6 +5219,57 @@ not only the refusing one. The same sentence is made from the other side in
 `.agent/rules/wire-and-protocol.md`, where `write-slot-guard-canary` drives an ordinary
 sequential pair of writes and requires the acceptance marker before it double-arms.
 
+## Which files are this project's own is ONE answer (#1370)
+
+Importing `vendor/` for #134 needed **five** tree-wide enumerators told about it one at a
+time -- `tidy-sweep.sh`, the header filter and the registration derivation in
+`local-gate.sh`, `check-succeed-not-skip.cmake`, `check-target-file-guards.cmake` -- and
+**three of the five were found by review** rather than by the import. Each answered *which
+files are this project's own?* on its own, in its own grammar, and the default was the
+dangerous one: an enumerator nobody had told INCLUDED the vendored tree, so upstream code
+was linted, formatted, scanned and counted as first-party, silently and green. The census
+that opened the work found more than five.
+
+So the answer is data, in one place: `scripts/lib/third-party-roots.txt`, one root per
+line, `#` comments, read by `third_party_roots` (bash 3.2) and `fastcached_third_party_roots`
+(`cmake -P`). Both readers REFUSE a file that is missing, names no root, or names one with a
+leading or trailing `/`, a `..` or a backslash -- read as empty, it would hand every vendored
+file to every enumerator. `third-party-roots-selftest` drives both over the same files and
+requires them to agree, because two readers of one format are two parsers.
+
+- **An enumerator asks, and says what it declined.** `first_party_paths` /
+  `third_party_paths` in `scripts/lib/third-party-roots.sh`, `fastcached_decline_third_party`
+  in `CheckCommon.cmake`, then a line naming the count and the first declined path. A run
+  that declines silently cannot be told from one that declined nothing.
+- **It asks the tree it WALKS, not this repository** -- which is what lets each script's own
+  self-test plant a roots file and a third-party path and watch the decline happen. Every
+  migrated self-test has that case, and each was neutered to confirm it bites.
+- **The set of enumerators is DERIVED.** `check-third-party-roots.cmake` holds what a
+  tree-wide walk IS as a table of spellings with the rule beside each count, finds every
+  site, and refuses one in a file that calls no reader. The readers it recognises are
+  derived from the two libraries, and a CALL outside a comment is what counts: its first
+  version accepted any mention of the file name, which a comment satisfies.
+- **An exemption is a row with a REASON** (`third-party-roots-exemptions.txt`), and a row
+  whose file no longer spells that walk is refused as stale. *Third-party code happens not
+  to match* is not a reason: it is a bet on the world's layout.
+- **A root is the upstream COPY, never the directory holding copies.** `vendor/endo`, not
+  `vendor`: `vendor/CMakeLists.txt`, `VENDOR.md` and `MANIFEST` are written here, and a root
+  of `vendor` answers *third-party* for this project's own build glue, dropping it from every
+  scan that reads the file. The next import is its own row.
+- **clang-format is the enumerator no script can make ask**, so each root is also a row of
+  `.clang-format-ignore`, refused when missing -- and `local-gate.sh` compares the
+  formatter's declined count with the offered files under the roots, both directions: fewer
+  means vendored source was just rewritten, more means first-party files went unexamined.
+
+**What it does NOT cover, stated so nobody reads it as more.** The answer is per FILE: a
+script with one enumerator that asks and a second that does not passes, because following
+data flow through shell variables is beyond any line reader here. The spellings are a model
+narrower than bash, so a walk spelled another way (`ls -R`, a `**` glob, `find` over a root
+variable with an unrecognised name) is not seen, and adding one is adding a row. Only
+`scripts/`, `cmake/` and `.github/workflows/` are scanned -- a `CMakeLists.txt` globs from
+its own directory -- and nothing checks an enumerator that is anchored under `src/`, which
+is correct: an inclusion list naming this repository's own layout needs no roots.
+
 ## Open work
 
 - **[#829](https://github.com/LASTRADA-Software/fastcached/issues/829)** — six

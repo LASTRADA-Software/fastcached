@@ -10,7 +10,9 @@
 # `clang-format -i` over the tree. Excluding it HERE means the formatter itself
 # declines, once, for every caller.
 #
-# The convention is that everything under `vendor/` is third-party. `local-gate.sh`
-# asserts the directory is non-empty and outside clang-tidy's header filter, so the
-# convention cannot quietly stop describing anything.
-vendor/**
+# The roots are `scripts/lib/third-party-roots.txt` (#1370), and each is a row here as
+# `<root>/**`: `check-third-party-roots` refuses a root this file does not name, and
+# `local-gate.sh` refuses a run where the formatter declined anything other than exactly
+# the offered files under the roots -- so a row here that stops matching, or one that
+# declines first-party code, is caught in the step that caused it.
+vendor/endo/**

@@ -6493,3 +6493,54 @@ set_tests_properties("cli-node-flags-selftest" PROPERTIES
     LABELS "hygiene"
     TIMEOUT 60
 )
+
+# ---------------------------------------------------------------------------
+# Which files are this project's own is ONE answer: `scripts/lib/third-party-roots.txt`
+# (#1370).
+#
+# Importing `vendor/` for #134 needed five tree-wide enumerators told about it one at a
+# time, and three of the five were found by review rather than by the import. An
+# enumerator that had not been told INCLUDED the vendored tree, so upstream code was
+# linted, formatted, scanned and counted as first-party, silently and green. So the roots
+# are one data file, read by a bash 3.2 reader and a `cmake -P` reader, and every script
+# that lists the repository's files asks it and names what it declined.
+#
+# The set of enumerators is DERIVED, never listed: the check finds every site spelling a
+# tree-wide walk (`git ls-files` with no directory, a root-level `GLOB_RECURSE`, `find` or
+# `grep -r` over the repository root) and refuses one in a file that calls no reader and
+# has no exemption row carrying a reason. A stale exemption, a roots file that is missing,
+# empty or malformed, a root naming no directory and a root `.clang-format-ignore` does
+# not name are all refused. The rule text travels beside each spelling's count.
+#
+# In the default set: it reads files and compares strings.
+add_test(
+    NAME "third-party-roots"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-third-party-roots.cmake"
+)
+set_tests_properties("third-party-roots" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 60
+)
+
+# And that check must be SEEN to refuse: one planted enumerator of each spelling that does
+# not read the roots, each refused by `path:line`; the shapes its first versions got wrong
+# (a literal-name recursive glob, a comment read as a call, a CMake pathspec on the next
+# line, a continued shell line); every exemption and roots-file refusal; and the two
+# readers driven over the same files, required to agree. The bash reader runs under the
+# bash every other script test here uses.
+add_test(
+    NAME "third-party-roots-selftest"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DFASTCACHED_SCRATCH_DIR=${CMAKE_CURRENT_BINARY_DIR}/third-party-roots-selftest"
+        "-DFASTCACHED_BASH=${FASTCACHED_BASH}"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-third-party-roots-selftest.cmake"
+)
+set_tests_properties("third-party-roots-selftest" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 120
+)

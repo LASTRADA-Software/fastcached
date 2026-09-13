@@ -46,6 +46,11 @@
 #   bash scripts/check-bash32-parse.sh --root <dir>
 set -euo pipefail
 
+# Which files are third-party, asked of the tree being checked (#1370). Upstream scripts
+# are not this project's to keep parseable by bash 3.2, and ctest runs none of them.
+# shellcheck source=lib/third-party-roots.sh
+. "$(dirname "$0")/lib/third-party-roots.sh"
+
 root="$(cd "$(dirname "$0")/.." && pwd)"
 selfTest=0
 # Only for the self-test, which must exercise the version gate on a host whose bash is
@@ -96,7 +101,7 @@ TrackedShellScripts() {
 }
 
 RunParseCheck() {
-    local mode scripts file parsed failed out
+    local mode scripts file parsed failed out firstParty declined
     parsed=0
     failed=0
 
@@ -107,8 +112,21 @@ RunParseCheck() {
     mode="${scripts%%$'\n'*}"
     scripts="${scripts#*$'\n'}"
 
+    # Declined after the mode is known and before anything is parsed, so both modes
+    # decline alike. A roots file that cannot be read is a refusal: read as nothing, every
+    # vendored script would be parsed as a first-party one.
+    if ! firstParty="$(first_party_paths "$root" "$scripts")"; then
+        printf 'FAIL check-bash32-parse: the third-party roots of %s could not be read (the reader says why above),\n' "$root" >&2
+        printf '     so a vendored script cannot be told from a first-party one.\n' >&2
+        return 1
+    fi
+    declined="$(third_party_paths "$root" "$scripts")"
+    scripts="$firstParty"
+
     printf 'check-bash32-parse: parsing with bash %s, file set from %s\n' \
         "$(BashDescription)" "$mode"
+    [ -z "$declined" ] \
+        || printf 'check-bash32-parse: %s\n' "$(third_party_declined_summary 'shell script(s)' "$declined")"
 
     while IFS= read -r file; do
         [ -n "$file" ] || continue
@@ -157,9 +175,17 @@ RunSelfTest() {
     tmp="$(mktemp -d)" || { printf 'mktemp failed\n' >&2; exit 1; }
     trap 'rm -rf "$tmp"' EXIT
 
+    # Every synthetic tree states its third-party roots (#1370): one that did not would
+    # be REFUSED, and a case expecting a refusal would then pass for the wrong reason.
+    PlantRoots() {
+        mkdir -p "$1/scripts/lib"
+        printf '%s\n' '# planted' 'vendor/upstream' > "$1/scripts/lib/third-party-roots.txt"
+    }
+
     # Case 1 -- the ACCEPTING direction. A guard whose only observed behaviour is refusal
     # is indistinguishable from one that always refuses (#1031).
     mkdir -p "$tmp/a/scripts"
+    PlantRoots "$tmp/a"
     printf '%s\n' '#!/usr/bin/env bash' 'echo hello' > "$tmp/a/scripts/fine.sh"
     out=$(FASTCACHED_PARSE_ALLOW_MODERN_BASH=1 bash "$0" --root "$tmp/a" 2>&1) && rc=0 || rc=$?
     if [ "$rc" -eq 0 ]; then
@@ -173,6 +199,7 @@ RunSelfTest() {
     # on bash 4+, which is the whole reason the version gate exists, so it cannot be the
     # case that proves the checker reports a failure at all.
     mkdir -p "$tmp/b/scripts"
+    PlantRoots "$tmp/b"
     printf '%s\n' '#!/usr/bin/env bash' 'if [ 1 -eq 1 ]; then' 'echo unterminated' > "$tmp/b/scripts/broken.sh"
     out=$(FASTCACHED_PARSE_ALLOW_MODERN_BASH=1 bash "$0" --root "$tmp/b" 2>&1) && rc=0 || rc=$?
     case "$out" in
@@ -197,6 +224,7 @@ RunSelfTest() {
     # the same file is the red case, and that is where the ticket's "shown red on the
     # actual construct" is observed.
     mkdir -p "$tmp/c/scripts"
+    PlantRoots "$tmp/c"
     {
         printf '%s\n' '#!/usr/bin/env bash'
         printf '%s\n' 'x="$('
@@ -231,6 +259,7 @@ RunSelfTest() {
     # this repository's `check-catch-skip-return-code` scar.
     case "$out" in *) : ;; esac
     mkdir -p "$tmp/d/scripts"
+    PlantRoots "$tmp/d"
     out=$(FASTCACHED_PARSE_ALLOW_MODERN_BASH=1 bash "$0" --root "$tmp/d" 2>&1) && rc=0 || rc=$?
     case "$out" in
         *"the walk is"*) : ;;
@@ -238,6 +267,46 @@ RunSelfTest() {
     esac
     [ "$rc" -ne 0 ] || Bad "case 6: refused and exited 0" "$out"
     Ok "case 6: a walk that finds no script is refused, not reported clean"
+
+    # Cases 7 and 8 -- a third-party script is DECLINED, by name, in BOTH modes (#1370).
+    # The planted one does not parse, so a check that failed to decline it refuses the
+    # tree: accepting is the proof, and the name in the output is what says why.
+    local mode tree
+    for mode in walk git; do
+        tree="$tmp/vendored-$mode"
+        mkdir -p "$tree/scripts" "$tree/vendor/upstream"
+        PlantRoots "$tree"
+        printf '%s\n' '#!/usr/bin/env bash' 'echo hello' > "$tree/scripts/fine.sh"
+        printf '%s\n' '#!/usr/bin/env bash' 'if [ 1 -eq 1 ]; then' > "$tree/vendor/upstream/broken.sh"
+        if [ "$mode" = git ]; then
+            ( cd "$tree" && git init -q . && git add -A ) >/dev/null 2>&1 \
+                || Bad "case 8: git could not stage the planted tree, so the git mode was not exercised"
+        fi
+        out=$(FASTCACHED_PARSE_ALLOW_MODERN_BASH=1 bash "$0" --root "$tree" 2>&1) && rc=0 || rc=$?
+        [ "$rc" -eq 0 ] || Bad "case $mode: a tree whose only unparseable script is third-party was refused (rc=$rc)" "$out"
+        case "$out" in
+            *"file set from $mode"*) : ;;
+            *) Bad "case $mode: the planted tree was not enumerated by $mode" "$out" ;;
+        esac
+        case "$out" in
+            *"declined 1 third-party shell script(s) under the roots in scripts/lib/third-party-roots.txt, first vendor/upstream/broken.sh"*) : ;;
+            *) Bad "case $mode: the declined script was not named" "$out" ;;
+        esac
+    done
+    Ok "case 7: a third-party script is declined and named when the file set is walked"
+    Ok "case 8: a third-party script is declined and named when the file set comes from git"
+
+    # Case 9 -- a roots file naming no root is a REFUSAL, never "nothing is third-party".
+    mkdir -p "$tmp/noroots/scripts/lib"
+    printf '%s\n' '#!/usr/bin/env bash' 'echo hello' > "$tmp/noroots/scripts/fine.sh"
+    printf '%s\n' '# no root at all' > "$tmp/noroots/scripts/lib/third-party-roots.txt"
+    out=$(FASTCACHED_PARSE_ALLOW_MODERN_BASH=1 bash "$0" --root "$tmp/noroots" 2>&1) && rc=0 || rc=$?
+    [ "$rc" -ne 0 ] || Bad "case 9: a roots file naming no root was accepted" "$out"
+    case "$out" in
+        *"the third-party roots of"*"could not be read"*) : ;;
+        *) Bad "case 9: refused, but not for the roots file (rc=$rc)" "$out" ;;
+    esac
+    Ok "case 9: a roots file naming no root is refused, not read as an empty set"
 
     printf '\nself-test: %d case(s) ran, all passed (bash %s)\n' "$SelfTestCases" "$(BashDescription)"
 }

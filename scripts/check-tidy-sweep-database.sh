@@ -88,6 +88,10 @@ set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
+# Which files are third-party, asked of the tree being scanned (#1370).
+# shellcheck source=lib/third-party-roots.sh
+. scripts/lib/third-party-roots.sh
+
 Workflow=".github/workflows/build.yml"
 
 # The sweep's database directory, which is what makes a `cmake --preset` line a
@@ -232,8 +236,14 @@ ExtractDocumentedConfigure() {
 #
 # This file is always excluded: its self-test fixtures quote wrong lines on
 # purpose, so scanning it would compare the check against its own counter-examples.
+#
+# And a file under a third-party root is DECLINED (#1370): an upstream document is not
+# instructions for reproducing THIS repository's sweep. Named on a `declined:` line, and
+# a roots file that cannot be read is a `refused:` line -- this runs in a process
+# substitution, where an exit would end only the subshell and leave the caller reading a
+# truncated list with a clean status.
 DocumentationSites() {
-    local tracked matches
+    local tracked matches firstParty declined
     if tracked="$(git ls-files 2>/dev/null)" && [[ -n "$tracked" ]]; then
         echo "mode:git ls-files"
         matches="$(printf '%s\n' "$tracked" | tr '\n' '\0' \
@@ -244,7 +254,14 @@ DocumentationSites() {
                         --exclude-dir=out --exclude-dir=_deps \
                         -e "-B ${DatabaseDir}" . 2>/dev/null | sed 's|^\./||' || true)"
     fi
-    printf '%s\n' "$matches" | grep -v "^${SelfPath}$" | grep -v '^$' | sort || true
+    matches="$(printf '%s\n' "$matches" | grep -v "^${SelfPath}$" | grep -v '^$' || true)"
+    if ! firstParty="$(first_party_paths "$(pwd)" "$matches")"; then
+        echo "refused:the third-party roots of $(pwd) could not be read (the reader says why above), so a vendored document cannot be told from a first-party one"
+        return 0
+    fi
+    declined="$(third_party_paths "$(pwd)" "$matches")"
+    [[ -z "$declined" ]] || echo "declined:$(third_party_declined_summary 'documentation site(s)' "$declined")"
+    printf '%s\n' "$firstParty" | grep -v '^$' | sort || true
 }
 
 # ---------------------------------------------------------------------------
@@ -442,9 +459,14 @@ and again, three hundred lines further down:
     ExpectScan() {
         name="$1"; wantMode="$2"; useGit="$3"
         tree="$scratch/scan-$4"
-        mkdir -p "$tree/scripts" "$tree/.claude/worktrees/other/scripts"
+        mkdir -p "$tree/scripts/lib" "$tree/.claude/worktrees/other/scripts" "$tree/vendor/upstream"
         printf '#   cmake --preset clang-debug -B %s -DENABLE_TIDY=OFF\n' "$DatabaseDir" \
             > "$tree/scripts/tidy-sweep.sh"
+        # A TRACKED third-party document quoting a wrong line (#1370): declined by name
+        # in both modes, never compared.
+        printf '# planted\nvendor/upstream\n' > "$tree/scripts/lib/third-party-roots.txt"
+        printf '    cmake --preset clang-debug -B %s -DUPSTREAM=YES\n' "$DatabaseDir" \
+            > "$tree/vendor/upstream/README.md"
         printf '  cmake --preset clang-debug -B %s -DSTALE=YES\n' "$DatabaseDir" \
             > "$tree/.claude/worktrees/other/scripts/tidy-sweep.sh"
         printf '.claude/\n' > "$tree/.gitignore"
@@ -462,9 +484,13 @@ and again, three hundred lines further down:
         fi
         got="$( cd "$tree" && DocumentationSites )"
         gotMode="$(printf '%s\n' "$got" | sed -n 's/^mode:\(.*\)/\1/p')"
-        gotSites="$(printf '%s\n' "$got" | grep -v '^mode:' | grep -v '^$' | tr '\n' ' ')"
+        gotSites="$(printf '%s\n' "$got" | grep -v '^mode:' | grep -v '^declined:' | grep -v '^$' | tr '\n' ' ')"
+        gotDeclined="$(printf '%s\n' "$got" | sed -n 's/^declined:\(.*\)/\1/p')"
         Report "scan '$name' mode" "$wantMode" "$gotMode"
         Report "scan '$name' sites" "scripts/tidy-sweep.sh " "$gotSites"
+        Report "scan '$name' declines the third-party document by name" \
+            "declined 1 third-party documentation site(s) under the roots in scripts/lib/third-party-roots.txt, first vendor/upstream/README.md" \
+            "$gotDeclined"
     }
 
     if command -v git >/dev/null 2>&1; then
@@ -475,6 +501,15 @@ and again, three hundred lines further down:
     fi
     ExpectScan "no git index, ignored sibling checkout excluded" \
         "directory walk (no git index)" nogit w
+
+    # A roots file naming no root is a REFUSAL line, never an empty set (#1370).
+    tree="$scratch/scan-noroots"
+    mkdir -p "$tree/scripts/lib"
+    printf '# no root at all\n' > "$tree/scripts/lib/third-party-roots.txt"
+    printf '#   cmake --preset clang-debug -B %s\n' "$DatabaseDir" > "$tree/scripts/tidy-sweep.sh"
+    got="$( cd "$tree" && DocumentationSites 2>/dev/null )"
+    Report "scan with a roots file naming no root refuses" "refused" \
+        "$(printf '%s\n' "$got" | sed -n 's/^\(refused\):.*/\1/p')"
 
     # -----------------------------------------------------------------------
     # The WORKFLOW-side extractor, which decides what everything else is compared
@@ -622,6 +657,8 @@ scanMode="(not reported)"
 while IFS= read -r site; do
     case "$site" in
         mode:*) scanMode="${site#mode:}"; continue ;;
+        declined:*) echo "ok: ${site#declined:}"; continue ;;
+        refused:*) Abort "${site#refused:}" ;;
         "") continue ;;
     esac
     sites+=("$site")

@@ -369,14 +369,22 @@ gate_lock_waiting_marker="== GATE LOCK WAITING"
 gate_lock_refused_marker="GATE NOT STARTED: the gate lock was held"
 gate_lock_unusable_marker="GATE NOT STARTED: the gate lock could not be taken"
 
-# The root this repository TRACKS but does not OWN: third-party source copied
-# verbatim from upstream (vendor/VENDOR.md). Named once here because THIS FILE has
-# two independent tree-wide enumerators that both had to learn about it -- the
-# clang-tidy header-filter coverage count and the ctest registration derivation --
-# and the second was found by review rather than by the first's author, four hundred
-# lines away in the same script. A third would be found the same way, so a reader
-# adding one has at least got a name to grep for.
-GateVendorRoot="vendor"
+# The roots this repository TRACKS but does not OWN -- third-party source copied
+# verbatim from upstream (vendor/VENDOR.md) -- are READ from
+# `scripts/lib/third-party-roots.txt` (#1370) and named nowhere in this file. It has
+# three tree-wide enumerators that each had to learn about `vendor/`: the clang-tidy
+# header-filter coverage count, the ctest registration derivation and the formatter's
+# file list. The second was found by review rather than by the first's author, four
+# hundred lines away in the same script, and a root named in each is how the next
+# root reaches one of them and not the others.
+#
+# Each enumerator asks the tree it WALKS rather than this repository, so `--self-test`
+# can plant a roots file in a synthetic tree and watch the answer move with it.
+# `check-third-party-roots` refuses a tree-wide enumerator in any script that does not
+# read the file.
+# shellcheck source=lib/third-party-roots.sh
+. "${repo_root}/scripts/lib/third-party-roots.sh" \
+    || { echo "${gate_failed_marker} cannot read scripts/lib/third-party-roots.sh, so no enumerator in this gate can tell third-party files from this repository's own" >&2; exit 1; }
 
 # ctest's own totals line, which three readers here hinge on: it is what
 # `skip_report` requires before it will conclude anything from a missing block,
@@ -1632,10 +1640,12 @@ header_filter_coverage() {
     # TRACKED used to be the same set as FIRST-PARTY, and everything above rests on
     # that: "dependency trees are untracked" is why coverage cannot see `deps-leak`,
     # and why a partial match can only mean a first-party root fell out of the
-    # pattern. `vendor/` ends the identity. It holds third-party source copied
-    # verbatim from upstream -- tracked, so counted here, and deliberately outside
-    # clang-tidy's filter, because it is not ours to fix and `WarningsAsErrors: "*"`
-    # would fail the build on naming rules it has no reason to satisfy.
+    # pattern. A third-party root ends the identity (`vendor/` was the first; the set
+    # is `scripts/lib/third-party-roots.txt` under the tree being measured). It holds
+    # third-party source copied verbatim from upstream -- tracked, so counted here, and
+    # deliberately outside clang-tidy's filter, because it is not ours to fix and
+    # `WarningsAsErrors: "*"` would fail the build on naming rules it has no reason to
+    # satisfy.
     #
     # This is the SAME SHAPE as the partial-match refusal below for the OPPOSITE
     # reason, which is exactly how a guard rots: without this split the gate refuses
@@ -1643,17 +1653,33 @@ header_filter_coverage() {
     # widen the filter -- and widening it is the `deps-leak` defect, arrived at by
     # following the remedy. So the set is partitioned rather than the pattern
     # loosened, and each half is asked its own question.
-    local vendored firstParty
-    vendored="$(grep -E "^${GateVendorRoot}/" <<< "$headers" || true)"
-    firstParty="$(grep -vE "^${GateVendorRoot}/" <<< "$headers" || true)"
+    #
+    # A roots file that cannot be read is its own word, never an empty set: read as
+    # "nothing is third-party", every vendored header would count as first-party and
+    # the filter declining them would present as a partial match -- a refusal naming
+    # the wrong cause, whose remedy is to widen the filter over vendored code.
+    local pattern vendored firstParty thirdPartyRoot
+    pattern="$(third_party_path_pattern "$root")" || { echo "no-roots"; return 0; }
+    vendored="$(grep -E "$pattern" <<< "$headers" || true)"
+    firstParty="$(grep -vE "$pattern" <<< "$headers" || true)"
 
     # A convention that has stopped describing anything reads exactly like one that
-    # is being honoured: if the directory is there, it must carry tracked files, or
-    # the two halves below are being taken over an empty set and agree perfectly.
-    if [[ -d "${root}/${GateVendorRoot}" ]] \
-        && [[ -z "$(git -C "$root" ls-files "$GateVendorRoot" 2>/dev/null)" ]]; then
-        echo "vendor-untracked"
-        return 0
+    # is being honoured: if a root's directory is there, it must carry tracked files,
+    # or the two halves below are being taken over an empty set and agree perfectly.
+    # Every root, not the first: a second root is exactly what a check written
+    # against one would not see.
+    while IFS= read -r thirdPartyRoot; do
+        if [[ -d "${root}/${thirdPartyRoot}" ]] \
+            && [[ -z "$(git -C "$root" ls-files "$thirdPartyRoot" 2>/dev/null)" ]]; then
+            echo "third-party-untracked ${thirdPartyRoot}"
+            return 0
+        fi
+    done <<< "$(third_party_roots "$root")"
+
+    # What was declined, BY NAME, so a run says it rather than the reader trusting
+    # that it did. On stderr, because stdout is the verdict and three readers parse it.
+    if [[ -n "$vendored" ]]; then
+        echo "== clang-tidy header filter: $(third_party_declined_summary 'header(s)' "$vendored")" >&2
     fi
 
     # The tracked half of `deps-leak`: a vendored header INSIDE the filter buries
@@ -1670,7 +1696,7 @@ header_filter_coverage() {
     local vendorHit
     vendorHit="$(header_filter_match "$include" "$exclude" "$root" <<< "$vendored")"
     if [[ "${vendorHit%%/*}" != 0 ]]; then
-        echo "vendor-leak"
+        echo "third-party-leak ${vendorHit%% *}"
         return 0
     fi
 
@@ -1745,12 +1771,16 @@ header_filter_report() {
             echo "clang-tidy's header filter in $config would report findings inside a DEPENDENCY tree, which carries no .clang-tidy of its own and would bury every first-party finding under someone else's code -- measured at 228 reported catch2 lines from a single test translation unit. Coverage cannot see this, because dependency trees are untracked and so are absent from the set the count is taken over: a filter that takes catch2 still reports perfect coverage. Both layouts are checked, because they disagree -- FetchContent unpacks into out/build/*/_deps/ locally while build.yml sets CPM_SOURCE_CACHE to .cache/CPM, and a pattern excluding only the first passed every developer machine and failed CI inside catch2. Fix it by narrowing what the filter INCLUDES to this repository's own roots under src/, not by adding another dependency location to exclude -- an exclusion bets on where the world puts things, and that bet has now lost once"
             return 1
             ;;
-        vendor-leak)
-            echo "clang-tidy's header filter in $config reaches inside vendor/, which holds third-party source copied VERBATIM from upstream. Those files are not ours to fix, and with WarningsAsErrors: \"*\" the build would fail on naming rules they have no reason to satisfy -- while every first-party finding drowns underneath them, which is the same drowning measured at 228 catch2 lines from one translation unit. Coverage cannot see this: a filter that takes vendor/ counts every tracked header as covered and reports a perfect score. Fix it by narrowing what the filter INCLUDES to this repository's own roots under src/, never by adding vendor/ to an exclusion -- an exclusion bets on where third-party code will be put next, and that bet has already lost once here"
+        third-party-leak*)
+            echo "clang-tidy's header filter in $config reaches inside a third-party root named in scripts/lib/third-party-roots.txt -- it would report on ${verdict#* } of the tracked headers under those roots -- and they hold third-party source copied VERBATIM from upstream. Those files are not ours to fix, and with WarningsAsErrors: \"*\" the build would fail on naming rules they have no reason to satisfy -- while every first-party finding drowns underneath them, which is the same drowning measured at 228 catch2 lines from one translation unit. Coverage cannot see this: a filter that takes a third-party root counts every tracked header as covered and reports a perfect score. Fix it by narrowing what the filter INCLUDES to this repository's own roots under src/, never by adding the root to an exclusion -- an exclusion bets on where third-party code will be put next, and that bet has already lost once here"
             return 1
             ;;
-        vendor-untracked)
-            echo "a vendor/ directory exists in this tree but git tracks nothing inside it, so the split this check makes between first-party and vendored headers is being taken over an empty set -- and two empty sets agree perfectly. Either the vendored source is untracked (it must be committed, since the whole point is that the copy is reviewable and diffable against upstream) or vendor/ is a leftover directory that should be removed. This is the CHECK refusing to report, not a verdict about the filter"
+        third-party-untracked*)
+            echo "the third-party root ${verdict#* }/ named in scripts/lib/third-party-roots.txt exists in this tree but git tracks nothing inside it, so the split this check makes between first-party and vendored headers is being taken over an empty set -- and two empty sets agree perfectly. Either the vendored source is untracked (it must be committed, since the whole point is that the copy is reviewable and diffable against upstream) or ${verdict#* }/ is a leftover directory that should be removed. This is the CHECK refusing to report, not a verdict about the filter"
+            return 1
+            ;;
+        no-roots)
+            echo "scripts/lib/third-party-roots.txt could not be read under the tree being measured, or names no root (the reader says which on stderr above), so which tracked headers are third-party cannot be answered. Read as none, every vendored header would count as first-party and the filter declining them would present as a PARTIAL match, whose remedy is to widen the filter over vendored code. This is the CHECK refusing to report, not a verdict about the filter"
             return 1
             ;;
         0/*)
@@ -2071,15 +2101,25 @@ target_set_report() {
 # worktree whose `.git` file holds an ABSOLUTE `gitdir:` is unreadable to the other
 # git on this machine, which is #1064 and #336, and it presents as every command
 # listing zero files.
+#
+# The third-party roots of the tree in the working directory are excluded because this
+# build never reads those files: the vendored tree carries upstream's own CMakeLists,
+# which `vendor/CMakeLists.txt` states it deliberately does not use. One of them
+# registers `add_test(NAME test-tui ...)`, and counting a registration from a file no
+# build processes puts a permanently unclosable row in this derivation -- worse than a
+# red, because a line that can never be cleared is a line that stops being read. What is
+# declined is named on stderr; stdout is the list. A roots file that cannot be read
+# yields NOTHING, which every caller already refuses or reports as skipped.
 gate_registration_sources() {
-    # `vendor/` is excluded because this build never reads those files: the vendored
-    # tree carries upstream's own CMakeLists, which `vendor/CMakeLists.txt` states it
-    # deliberately does not use. One of them registers `add_test(NAME test-tui ...)`,
-    # and counting a registration from a file no build processes puts a permanently
-    # unclosable row in this derivation -- worse than a red, because a line that can
-    # never be cleared is a line that stops being read.
-    git ls-files '*CMakeLists.txt' 'cmake/*.cmake' 2>/dev/null \
-        | grep -v "^${GateVendorRoot}/" || true
+    local pattern sources declined
+    pattern="$(third_party_path_pattern "$(pwd)")" || return 2
+    sources="$(git ls-files '*CMakeLists.txt' 'cmake/*.cmake' 2>/dev/null)"
+    [[ -n "$sources" ]] || return 0
+    declined="$(grep -E "$pattern" <<< "$sources" || true)"
+    if [[ -n "$declined" ]]; then
+        echo "== registration walk: $(third_party_declined_summary 'CMake source(s)' "$declined")" >&2
+    fi
+    grep -vE "$pattern" <<< "$sources" || true
 }
 
 # Every test name the CMake sources register, and every registration whose name
@@ -2336,6 +2376,44 @@ format_plan() {
         echo "format ${count}"
     fi
 }
+
+# Whether the formatter declined EXACTLY the offered files under the third-party roots.
+#
+# `declined` was a live control on `.clang-format-ignore` that could only fall: a count
+# nothing compared against. Asked against the roots it is an equality with two failure
+# directions fixed in different places -- fewer means vendored source was just
+# REWRITTEN, more means first-party files went unformatted and unexamined. Pure over
+# its arguments so `--self-test` drives both.
+#
+# @param 1 How many offered files the formatter declined.
+# @param 2 The offered files under a third-party root, newline-separated, possibly empty.
+format_decline_report() {
+    local declined="$1" thirdParty="$2" count=0
+    [[ -z "$thirdParty" ]] || count="$(grep -c . <<< "$thirdParty")"
+    if [[ "$declined" -eq "$count" && "$count" -eq 0 ]]; then
+        echo "== the formatter declined nothing, and no offered file is under a third-party root (scripts/lib/third-party-roots.txt)"
+        return 0
+    fi
+    if [[ "$declined" -eq "$count" ]]; then
+        echo "== the formatter declined exactly the ${count} offered file(s) under the third-party roots (scripts/lib/third-party-roots.txt), first ${thirdParty%%$'\n'*}"
+        return 0
+    fi
+    if [[ "$declined" -lt "$count" ]]; then
+        echo "clang-format was offered ${count} file(s) under the third-party roots in scripts/lib/third-party-roots.txt and declined only ${declined}, so .clang-format-ignore no longer covers every root and the formatter has just REWRITTEN vendored source that must stay byte-identical to upstream -- ${thirdParty%%$'\n'*} is one of the files it was offered. Restore the roots with git checkout, then make .clang-format-ignore name each root as <root>/**. This does not mean the formatter is broken; it did exactly what it was told"
+        return 1
+    fi
+    echo "clang-format declined ${declined} file(s), but only ${count} of those it was offered are under a third-party root (scripts/lib/third-party-roots.txt), so .clang-format-ignore declines $((declined - count)) first-party file(s) whose formatting this gate never examined. Narrow .clang-format-ignore to the roots -- or, if that directory really is third-party, add it to scripts/lib/third-party-roots.txt, which is the one answer every enumerator reads"
+    return 1
+}
+
+# The roots file is refused HERE, once, before anything is built or self-tested: every
+# enumerator above answers a word or nothing when it cannot read the file, and this is
+# the one place that can say so as the gate's own failure rather than as the symptom
+# three readers each describe differently.
+if ! third_party_roots "$repo_root" >/dev/null; then
+    echo "${gate_failed_marker} scripts/lib/third-party-roots.txt could not be used (the reader says why on the line above), so this gate cannot tell third-party files from this repository's own and would take every vendored file as first-party" >&2
+    exit 1
+fi
 
 if [[ "$self_test" -eq 1 ]]; then
     scratch="$(mktemp -d)"
@@ -2844,10 +2922,12 @@ src/apps/fastcached/Main.hpp"
         "said|1" "$(report_says 'produced NO verdict' header_filter_report /w/.clang-tidy '')"
     expect "a filter that would take _deps refuses, and says why coverage cannot see it" \
         "said|1" "$(report_says 'dependency trees are untracked' header_filter_report /w/.clang-tidy deps-leak)"
-    expect "a filter that would take vendor/ refuses, and says not to exclude it" \
-        "said|1" "$(report_says 'reaches inside vendor/' header_filter_report /w/.clang-tidy vendor-leak)"
-    expect "a vendor/ directory tracking nothing refuses as the CHECK, not the filter" \
-        "said|1" "$(report_says 'two empty sets agree perfectly' header_filter_report /w/.clang-tidy vendor-untracked)"
+    expect "a filter that would take a third-party root refuses, and says not to exclude it" \
+        "said|1" "$(report_says 'it would report on 1/2 of the tracked headers under those roots' header_filter_report /w/.clang-tidy 'third-party-leak 1/2')"
+    expect "a third-party root tracking nothing refuses as the CHECK, naming the root" \
+        "said|1" "$(report_says 'the third-party root thirdparty/ named in' header_filter_report /w/.clang-tidy 'third-party-untracked thirdparty')"
+    expect "an unreadable roots file refuses as the CHECK, never as a partial match" \
+        "said|1" "$(report_says 'which tracked headers are third-party cannot be answered' header_filter_report /w/.clang-tidy no-roots)"
 
     # -----------------------------------------------------------------------
     # The vendored/first-party SPLIT, driven through `header_filter_coverage` at a
@@ -2865,14 +2945,43 @@ src/apps/fastcached/Main.hpp"
     _hf_tree="$scratch/header-filter"
     _hf_clean='.*/src/(CowTree|FastCache|apps|tests)/.*'
     _hf_config() { printf "HeaderFilterRegex: '%s'\n" "$1" > "$_hf_tree/.clang-tidy"; }
-    mkdir -p "$_hf_tree/src/FastCache/Core" "$_hf_tree/vendor/endo/tui"
+    # The roots come from the TREE (#1370), so the tree plants its own file -- and a
+    # second root, `thirdparty`, which no line of this script names: a split still
+    # keyed on `vendor` would count its header as first-party and go 1/2.
+    _hf_roots() { { echo '# planted'; printf '%s\n' "$@"; } > "$_hf_tree/scripts/lib/third-party-roots.txt"; }
+    mkdir -p "$_hf_tree/src/FastCache/Core" "$_hf_tree/vendor/endo/tui" \
+             "$_hf_tree/thirdparty/lib" "$_hf_tree/scripts/lib"
     : > "$_hf_tree/src/FastCache/Core/Base64.hpp"
     : > "$_hf_tree/vendor/endo/tui/Sixel.hpp"
+    : > "$_hf_tree/thirdparty/lib/Upstream.hpp"
+    : > "$_hf_tree/CMakeLists.txt"
+    : > "$_hf_tree/vendor/endo/CMakeLists.txt"
+    : > "$_hf_tree/thirdparty/lib/CMakeLists.txt"
+    _hf_roots vendor thirdparty
     if git -C "$_hf_tree" init -q . 2>/dev/null \
         && git -C "$_hf_tree" add -A 2>/dev/null; then
         _hf_config "$_hf_clean"
         expect "a vendored header is excluded from coverage, and the first-party one still counts" \
-            "1/1" "$(header_filter_coverage "$_hf_tree/.clang-tidy" "$_hf_tree")"
+            "1/1" "$(header_filter_coverage "$_hf_tree/.clang-tidy" "$_hf_tree" 2>/dev/null)"
+        expect "the coverage count names the third-party headers it declined, from BOTH roots" \
+            "== clang-tidy header filter: declined 2 third-party header(s) under the roots in scripts/lib/third-party-roots.txt, first thirdparty/lib/Upstream.hpp" \
+            "$(header_filter_coverage "$_hf_tree/.clang-tidy" "$_hf_tree" 2>&1 >/dev/null)"
+        expect "the registration walk keeps the first-party CMake source and declines both roots" \
+            "CMakeLists.txt" "$(cd "$_hf_tree" && gate_registration_sources 2>/dev/null)"
+        expect "the registration walk names what it declined" \
+            "== registration walk: declined 2 third-party CMake source(s) under the roots in scripts/lib/third-party-roots.txt, first thirdparty/lib/CMakeLists.txt" \
+            "$(cd "$_hf_tree" && gate_registration_sources 2>&1 >/dev/null)"
+
+        # PLANTED the other way: the FILE decides. Drop `thirdparty` from it and the
+        # same tree's header is first-party again -- which the clean pattern does not
+        # cover, so the count goes partial and names it.
+        _hf_roots vendor
+        expect "a root the roots file no longer names is first-party again" \
+            "1/2 thirdparty/lib/Upstream.hpp" "$(header_filter_coverage "$_hf_tree/.clang-tidy" "$_hf_tree" 2>/dev/null)"
+        expect "so is its CMake source" \
+            "CMakeLists.txt thirdparty/lib/CMakeLists.txt" \
+            "$(cd "$_hf_tree" && gate_registration_sources 2>/dev/null | tr '\n' ' ' | sed 's/ $//')"
+        _hf_roots vendor thirdparty
 
         # PLANTED: widen the pattern the way the partial-match remedy tempts you to,
         # and the vendor arm must fire rather than the count going 2/2.
@@ -2885,13 +2994,23 @@ src/apps/fastcached/Main.hpp"
         # to reach the arm it names.
         _hf_config "${_hf_clean}|.*/vendor/.*"
         expect "widening the filter over vendor/ is caught, not scored as full coverage" \
-            "vendor-leak" "$(header_filter_coverage "$_hf_tree/.clang-tidy" "$_hf_tree")"
+            "third-party-leak 1/2" "$(header_filter_coverage "$_hf_tree/.clang-tidy" "$_hf_tree" 2>/dev/null)"
 
-        # PLANTED: a vendor/ directory git knows nothing about.
+        # PLANTED: a roots file naming no root. Refused as its own word, never read
+        # as "nothing is third-party" -- which would score this tree 1/3.
         _hf_config "$_hf_clean"
+        printf '# no roots\n' > "$_hf_tree/scripts/lib/third-party-roots.txt"
+        expect "a roots file naming no root is refused, never read as an empty set" \
+            "no-roots" "$(header_filter_coverage "$_hf_tree/.clang-tidy" "$_hf_tree" 2>/dev/null)"
+        expect "and the registration walk yields nothing rather than every source" \
+            "" "$(cd "$_hf_tree" && gate_registration_sources 2>/dev/null)"
+        _hf_roots vendor thirdparty
+
+        # PLANTED: a root's directory git knows nothing about -- the FIRST root, with
+        # the second still tracked, so a check asking only one root cannot pass it.
         git -C "$_hf_tree" rm -r -q --cached vendor 2>/dev/null
-        expect "a vendor/ directory tracking nothing is refused by name" \
-            "vendor-untracked" "$(header_filter_coverage "$_hf_tree/.clang-tidy" "$_hf_tree")"
+        expect "a third-party root tracking nothing is refused by name" \
+            "third-party-untracked vendor" "$(header_filter_coverage "$_hf_tree/.clang-tidy" "$_hf_tree" 2>/dev/null)"
     else
         # Not a skip, and deliberately not a silently-passing `expect X X`: the split
         # is what keeps the gate from refusing every tree carrying vendored code, so
@@ -2900,7 +3019,7 @@ src/apps/fastcached/Main.hpp"
         expect "the header-filter vendored/first-party split was exercised" \
             "exercised" "no usable git, so the split was never driven -- inconclusive, not a pass"
     fi
-    unset -f _hf_config
+    unset -f _hf_config _hf_roots
 
     # THE WIRING, which none of the above can see: the real `.clang-tidy` in this
     # very tree must cover every header this repository tracks. This is the case
@@ -3408,6 +3527,19 @@ $_started"
     expect "a single file is offered to the formatter" "format 1" "$(format_plan "a.cpp")"
     expect "every file in the list is counted" "format 3" \
         "$(format_plan "$(printf 'a.cpp\nb.hpp\nc.h')")"
+
+    # The formatter's declined count against the roots (#1370): both refusing
+    # directions, and the two agreeing shapes, since an equality that refused every
+    # tree would pass both refusals.
+    expect "declining exactly the third-party files carries on, naming the first" \
+        "== the formatter declined exactly the 2 offered file(s) under the third-party roots (scripts/lib/third-party-roots.txt), first thirdparty/lib/a.cpp|0" \
+        "$(text="$(format_decline_report 2 "$(printf 'thirdparty/lib/a.cpp\nvendor/b.hpp')")"; printf '%s|%s' "$text" "$?")"
+    expect "declining nothing over a tree with no third-party file carries on" \
+        "said|0" "$(report_says 'declined nothing' format_decline_report 0 "")"
+    expect "declining fewer than the third-party files refuses: vendored source was rewritten" \
+        "said|1" "$(report_says 'has just REWRITTEN vendored source' format_decline_report 1 "$(printf 'thirdparty/lib/a.cpp\nvendor/b.hpp')")"
+    expect "declining more than the third-party files refuses: first-party files went unexamined" \
+        "said|1" "$(report_says 'declines 1 first-party file(s)' format_decline_report 3 "$(printf 'thirdparty/lib/a.cpp\nvendor/b.hpp')")"
 
     # -----------------------------------------------------------------------
     # #1130: the skipped NAMES a leg reports, driven as a pure function over
@@ -4048,11 +4180,15 @@ if [[ "$format" -eq 1 ]]; then
     # vendored tree under `vendor/` is kept byte-identical to upstream so improvements
     # can be sent back, and that file is what stops the formatter rewriting it -- 146
     # of 165 files on the first run, measured. If it is deleted or stops matching,
-    # `declined` falls toward zero HERE, in the step that caused it, on every run.
+    # `declined` falls below the count of offered files under the third-party roots
+    # HERE, in the step that caused it, on every run, and `format_decline_report`
+    # refuses.
     # `vendor-verbatim` catches the same break later in the same run, which is the
     # second witness; this one names the cause rather than the symptom. Neither is
     # redundant: keep both.
     echo "== formatted ${format_done} file(s), declined ${format_declined} (.clang-format-ignore) with $formatter"
+    format_third_party="$(grep -E "$(third_party_path_pattern "$repo_root")" <<< "$format_list" || true)"
+    report_or_refuse format_decline_report "$format_declined" "$format_third_party"
 fi
 
 # @param 1 The preset to build and test.

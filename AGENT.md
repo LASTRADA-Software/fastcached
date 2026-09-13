@@ -1276,6 +1276,12 @@ what differs between compilers, standard libraries, hosts and tool versions.
   instance was a manager quoting a corrected number back, wrong for the same reason as the thing it
   corrected. Nobody is outside this: the remedy is that the pattern travels with the figure. And
   **a ticket cannot be closed against a count that no longer describes the tree.**
+- **Which files are this project's own is ONE answer: `scripts/lib/third-party-roots.txt`.** A
+  script listing the repository's files asks it (`first_party_paths`, `fastcached_decline_third_party`)
+  and NAMES what it declined, or carries an exemption row with a reason; `ctest -R third-party-roots`
+  derives the enumerators from their spellings, so a new one that does not ask is refused. Importing
+  `vendor/` needed five told separately and review found three. A root is the upstream COPY
+  (`vendor/endo`), never the directory holding copies.
 - **A total stated beside a table is DERIVED from it, or it is a second claim** — a hand-maintained
   number describing a hand-maintained list is two sources of truth wearing one hat, and it drifted
   three commits running, in one file, in one day, each commit fixing the last count and introducing
