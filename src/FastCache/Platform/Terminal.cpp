@@ -154,15 +154,18 @@ std::optional<SavedTerminalModes> SavedTerminalModes::Capture() noexcept
     }
 }
 
-void SavedTerminalModes::Apply(std::string_view resets) const noexcept
+void SavedTerminalModes::Apply(std::span<std::string_view const> resets) const noexcept
 {
-    while (!resets.empty())
+    for (auto piece: resets)
     {
-        DWORD written = 0;
-        if (::WriteFile(_modes->output, resets.data(), static_cast<DWORD>(resets.size()), &written, nullptr) == 0
-            || written == 0)
-            break;
-        resets.remove_prefix(written);
+        while (!piece.empty())
+        {
+            DWORD written = 0;
+            if (::WriteFile(_modes->output, piece.data(), static_cast<DWORD>(piece.size()), &written, nullptr) == 0
+                || written == 0)
+                break;
+            piece.remove_prefix(written);
+        }
     }
     ::SetConsoleMode(_modes->input, _modes->inputMode);
     ::SetConsoleMode(_modes->output, _modes->outputMode);
@@ -209,16 +212,19 @@ std::optional<SavedTerminalModes> SavedTerminalModes::Capture() noexcept
     }
 }
 
-void SavedTerminalModes::Apply(std::string_view resets) const noexcept
+void SavedTerminalModes::Apply(std::span<std::string_view const> resets) const noexcept
 {
-    while (!resets.empty())
+    for (auto piece: resets)
     {
-        auto const written = ::write(STDOUT_FILENO, resets.data(), resets.size());
-        if (written < 0 && errno == EINTR)
-            continue;
-        if (written <= 0)
-            break;
-        resets.remove_prefix(static_cast<std::size_t>(written));
+        while (!piece.empty())
+        {
+            auto const written = ::write(STDOUT_FILENO, piece.data(), piece.size());
+            if (written < 0 && errno == EINTR)
+                continue;
+            if (written <= 0)
+                break;
+            piece.remove_prefix(static_cast<std::size_t>(written));
+        }
     }
     // TCSANOW, not the TCSAFLUSH a UI's own teardown uses: FLUSH waits for pending output to drain,
     // and a process ending because something is stuck must not wait on a terminal that stopped
