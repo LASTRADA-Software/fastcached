@@ -31,6 +31,7 @@ set(_fc_cli_sources
     SocketExchange.cpp
     StatsGatherer.cpp
     StatsSource.cpp
+    TerminalCapabilities.cpp
 )
 
 add_executable(fastcache-cli main.cpp ${_fc_cli_sources})
@@ -66,6 +67,7 @@ if(FASTCACHED_BUILD_TESTS)
         NodeVerbs_test.cpp
         RespClient_test.cpp
         StatsSource_test.cpp
+        TerminalCapabilities_test.cpp
     )
     target_include_directories(fastcache-cli-tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
     target_link_libraries(fastcache-cli-tests PRIVATE FastCache Catch2::Catch2WithMain)
