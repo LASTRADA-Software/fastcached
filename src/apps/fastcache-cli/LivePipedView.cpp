@@ -53,29 +53,31 @@ namespace
 std::string FigureKey(std::string_view label)
 {
     auto key = std::string {};
-    auto pendingSeparator = false;
+    // A word ended since the last character was written, so the next one written starts a new word.
+    auto separate = false;
     for (auto const ch: label)
     {
         auto const lowered = ch >= 'A' && ch <= 'Z' ? static_cast<char>(ch - 'A' + 'a') : ch;
-        auto const kept = (lowered >= 'a' && lowered <= 'z') || (lowered >= '0' && lowered <= '9');
-        if (!kept)
+        if ((lowered >= 'a' && lowered <= 'z') || (lowered >= '0' && lowered <= '9'))
         {
-            if (ch == '/')
-            {
-                key += key.empty() ? "per_" : "_per_";
-                pendingSeparator = false;
-                continue;
-            }
-            pendingSeparator = !key.empty() && !key.ends_with('_');
-            continue;
+            if (separate && !key.empty())
+                key += '_';
+            separate = false;
+            key += lowered;
         }
-        if (pendingSeparator)
-            key += '_';
-        pendingSeparator = false;
-        key += lowered;
+        else if (ch == '/')
+        {
+            // The word `per`, a word of its own on both sides.
+            if (!key.empty())
+                key += '_';
+            key += "per";
+            separate = true;
+        }
+        else
+        {
+            separate = true;
+        }
     }
-    while (key.ends_with('_'))
-        key.pop_back();
     return key;
 }
 

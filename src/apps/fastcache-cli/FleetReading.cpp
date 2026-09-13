@@ -3,6 +3,8 @@
 #include "FleetReading.hpp"
 #include "SocketExchange.hpp"
 
+#include <FastCache/Core/NumericText.hpp>
+
 #include <algorithm>
 #include <cstddef>
 #include <format>
@@ -63,10 +65,24 @@ Value FleetKpiFigures(DashboardModel const& model)
     };
     auto const nameAt = column("kpi");
     auto const valueAt = column("value");
+    auto const ofAt = column("of");
     if (nameAt >= kpi->columns.size() || valueAt >= kpi->columns.size())
         return RecordValue(std::move(fields));
+
+    // The parser reads every cell as text; a stream is read by a program, so a figure that is a
+    // finite number is one -- `jq`'s numeric comparisons and `human`'s right alignment both key on it.
+    auto const figure = [](Cell cell) {
+        auto parsed = 0.0;
+        if (cell.kind == CellKind::Text && ParseFiniteDouble(cell.lexical, parsed))
+            cell.kind = CellKind::Number;
+        return cell;
+    };
     for (auto const& row: kpi->rows)
-        fields.push_back(Field { .name = row[nameAt].lexical, .value = row[valueAt] });
+    {
+        fields.push_back(Field { .name = row[nameAt].lexical, .value = figure(row[valueAt]) });
+        if (ofAt < kpi->columns.size() && row[ofAt].kind != CellKind::Absent)
+            fields.push_back(Field { .name = std::format("{}-of", row[nameAt].lexical), .value = figure(row[ofAt]) });
+    }
     return RecordValue(std::move(fields));
 }
 

@@ -35,7 +35,7 @@ namespace FastCache::Cli
 /// What one dial opened: the stats ladder, and the node's own status, over the same new connections.
 ///
 /// One object for both, because they are one connection: a re-dial that replaced the ladder and
-/// went on asking the dead connection for the status would draw a status block of gaps over a
+/// went on asking the dead connection for the status would carry no status for the rest of a
 /// session that had recovered.
 class IDialedStats: public IStatsGatherer, public INodeStatusReader
 {
@@ -86,9 +86,10 @@ struct LiveSourceParts
     /// What each sample asks for the node's own status, beside `gatherer` and until a sample fails;
     /// null for a session whose samples carry none.
     ///
-    /// Read in the same hop as the counters, right after them, and carried on the event as
-    /// `DashboardEvent::nodeStatus` -- a `SampleFailed` included. After a re-dial it is asked of what
-    /// the dial opened, never of the connection that failed.
+    /// Read in the same hop as the counters, just before them -- so the sample's stamp still follows
+    /// the counters directly -- and carried on the event as `DashboardEvent::nodeStatus`, a
+    /// `SampleFailed` included. After a re-dial it is asked of what the dial opened, never of the
+    /// connection that failed.
     INodeStatusReader* status { nullptr };
 
     /// The admin surface a document sample fetches from; null where nothing samples a document.
