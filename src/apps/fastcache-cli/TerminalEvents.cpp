@@ -139,6 +139,13 @@ namespace
             // Not `shutdown()`: that closes the resize pipe the parked `poll` is waiting on and writes
             // endo's state unlocked. The saved modes are this device's own, written once in `Acquire`
             // on the pool and read only after the start handed the device back.
+            //
+            // NO LOCK AGAINST A FRAME BEING WRITTEN, deliberately. If the reactor is halfway through
+            // writing a frame to the same output handle, these resets can splice into its bytes and a
+            // stray fragment of frame may land on screen. The MODES are restored regardless, since
+            // those are syscalls rather than bytes, and the leading `CAN` abandons a sequence the
+            // frame left open. A lock shared with the frame writer would be worse: the writer this
+            // exit exists for may be the one that is stuck, and it would hold that lock forever.
             if (!_saved.has_value())
                 return;
             _saved->Apply(_resets);
