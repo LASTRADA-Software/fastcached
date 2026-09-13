@@ -260,6 +260,7 @@ TARGETS=(
     "FastCacheTest|[async],[consensus],[distributed],[reactor],[task],[net],[tls],[sharded],[expiry],[clock],[pubsub],[server]|first-party"
     "fastcache-compile-node-tests||first-party"
     "fastcache-cc-tests||none: the launcher does not link the FastCache library, it compiles its few shared sources in"
+    "fastcache-cli-tests||first-party"
 )
 
 # What this gate DID, one entry per row of TARGETS above.
