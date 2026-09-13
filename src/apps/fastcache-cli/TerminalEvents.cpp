@@ -90,6 +90,20 @@ namespace
             return ToSynchronizedOutputAnswer(_terminal.queryDecMode(SynchronizedOutputMode));
         }
 
+        [[nodiscard]] std::optional<CellPixelSize> AskCellPixels() override
+        {
+            // Not a second `CSI 16 t`: `initialize()` already asked it, through the same raw-mode read
+            // and deadline as every endo query, and keeps the answer -- zero on each side when the
+            // terminal did not give one. Asking again would charge a silent terminal a second deadline
+            // at every start for the same answer.
+            return ToCellPixelSize(std::pair { _terminal.cellPixelWidth(), _terminal.cellPixelHeight() });
+        }
+
+        [[nodiscard]] std::optional<CellPixelSize> RereadCellPixels() override
+        {
+            return ToCellPixelSize(_terminal.queryCellSize());
+        }
+
         [[nodiscard]] TerminalTextEncoding Encoding() override
         {
             return DetectTerminalTextEncoding();

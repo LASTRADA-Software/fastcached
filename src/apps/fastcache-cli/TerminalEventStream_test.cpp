@@ -22,6 +22,7 @@
 #include <string_view>
 #include <thread>
 #include <tuple>
+#include <utility>
 #include <vector>
 
 #include <tests/Unwrap.hpp>
@@ -180,6 +181,7 @@ struct DeviceRecord
 {
     std::atomic<int> restores { 0 };
     std::atomic<int> restoredNow { 0 };
+    std::atomic<int> rereads { 0 };
     std::thread::id acquiredOn {};
     std::thread::id askedOn {};
 
@@ -220,8 +222,15 @@ struct DeviceScript
     SynchronizedOutputAnswer synchronizedOutput { SynchronizedOutputAnswer::Supported };
     TerminalTextEncoding encoding { TerminalTextEncoding::Utf8 };
 
+    /// What the acquisition measured, and what each re-read after a resize answers.
+    std::optional<CellPixelSize> cellPixels { CellPixelSize { .width = 10, .height = 20 } };
+    std::optional<CellPixelSize> reread { CellPixelSize { .width = 10, .height = 20 } };
+
     /// Where the device's events come from when set; a scripted source that never blocks when not.
     BlockingEventSource* blocking { nullptr };
+
+    /// What the scripted source's one wait delivers, when `blocking` is not set.
+    std::vector<tui::InputEvent> input {};
 };
 
 /// A terminal device that records where each step ran and can fail at each one.
@@ -232,9 +241,11 @@ class FakeDevice final: public ITerminalDevice
 {
   public:
     FakeDevice(DeviceScript script, DeviceRecord* record):
-        _script { script },
+        _script { std::move(script) },
         _record { record }
     {
+        if (!_script.input.empty())
+            _source.pushEvents(_script.input);
     }
 
     [[nodiscard]] std::expected<void, std::string> Acquire() override
@@ -256,6 +267,17 @@ class FakeDevice final: public ITerminalDevice
     [[nodiscard]] SynchronizedOutputAnswer AskSynchronizedOutput() override
     {
         return _script.synchronizedOutput;
+    }
+
+    [[nodiscard]] std::optional<CellPixelSize> AskCellPixels() override
+    {
+        return _script.cellPixels;
+    }
+
+    [[nodiscard]] std::optional<CellPixelSize> RereadCellPixels() override
+    {
+        _record->rereads.fetch_add(1, std::memory_order_acq_rel);
+        return _script.reread;
     }
 
     [[nodiscard]] TerminalTextEncoding Encoding() override
@@ -334,7 +356,7 @@ struct StartOutcome
 }
 
 /// Start a `FakeDevice` following @p script, driving @p reactor until the start is delivered.
-[[nodiscard]] StartOutcome StartFake(DeviceScript script, DeviceRecord& record, IExecutor& pool, TestReactor& reactor)
+[[nodiscard]] StartOutcome StartFake(DeviceScript const& script, DeviceRecord& record, IExecutor& pool, TestReactor& reactor)
 {
     auto outcome = StartOutcome {};
     auto task = StartInto(std::make_unique<FakeDevice>(script, &record), &pool, &reactor, &record, &outcome);
@@ -732,15 +754,31 @@ namespace
 /// by line feeds all landed in the last column.
 ///
 /// Reads UTF-8 one code point per cell -- every glyph the panels draw is one cell wide -- and the
-/// sequences the presenter writes: `CSI <row>;<col> H`, `CSI K`, `CSI J`, and private modes, which
-/// change nothing drawn here. Anything else is recorded, so a presenter writing a sequence this
-/// model does not know fails the case rather than drawing nothing silently.
+/// sequences the presenter writes: `CSI <row>;<col> H`, `CSI K`, `CSI J`, private modes, which
+/// change nothing drawn here, and a Sixel image (`DCS ... q <body> ST`). Anything else is recorded,
+/// so a presenter writing a sequence this model does not know fails the case rather than drawing
+/// nothing silently.
+///
+/// **An image covers cells, as on a terminal that draws Sixel.** It is drawn from the cursor over as
+/// many cells as its raster attributes' pixels fill at this screen's cell size, rounded up. Erasing a
+/// cell or writing a character on it removes the image there. That is what makes an image a frame
+/// wrote before its rows invisible, and one a later frame did not write gone.
 class NoAutoReturnScreen
 {
   public:
-    NoAutoReturnScreen(std::size_t columns, std::size_t rows):
+    /// An image as it was drawn: the cell it started at, 0-based, and its body.
+    struct DrawnImage
+    {
+        std::size_t row { 0 };
+        std::size_t column { 0 };
+        std::string body;
+    };
+
+    NoAutoReturnScreen(std::size_t columns, std::size_t rows, CellPixelSize cell = { .width = 10, .height = 20 }):
         _columns { columns },
-        _cells(rows, std::vector<std::string>(columns, " "))
+        _cell { cell },
+        _cells(rows, std::vector<std::string>(columns, " ")),
+        _imaged(rows, std::vector<bool>(columns, false))
     {
     }
 
@@ -749,6 +787,17 @@ class NoAutoReturnScreen
     {
         while (!bytes.empty())
         {
+            if (bytes.starts_with("\x1bP"))
+            {
+                auto const terminator = bytes.find("\x1b\\");
+                REQUIRE(terminator != std::string_view::npos);
+                auto const sequence = bytes.substr(2, terminator - 2);
+                auto const introducer = sequence.find('q');
+                REQUIRE(introducer != std::string_view::npos);
+                Image(sequence.substr(introducer + 1));
+                bytes.remove_prefix(terminator + 2);
+                continue;
+            }
             if (bytes.starts_with("\x1b["))
             {
                 bytes.remove_prefix(2);
@@ -774,6 +823,7 @@ class NoAutoReturnScreen
             auto const length = Utf8SequenceLength(bytes);
             REQUIRE(length > 0);
             _cells[_row][_column] = std::string { bytes.substr(0, length) };
+            _imaged[_row][_column] = false;
             if (_column + 1 < _columns)
                 ++_column;
             bytes.remove_prefix(length);
@@ -787,6 +837,23 @@ class NoAutoReturnScreen
         for (auto const& cell: _cells[row])
             text += cell;
         return text;
+    }
+
+    /// @return Each cell an image covers now, as `(row, column)`, 0-based, row by row.
+    [[nodiscard]] std::vector<std::pair<std::size_t, std::size_t>> ImagedCells() const
+    {
+        auto cells = std::vector<std::pair<std::size_t, std::size_t>> {};
+        for (auto const row: std::views::iota(std::size_t { 0 }, _imaged.size()))
+            for (auto const column: std::views::iota(std::size_t { 0 }, _columns))
+                if (_imaged[row][column])
+                    cells.emplace_back(row, column);
+        return cells;
+    }
+
+    /// @return Every image drawn so far, in the order drawn, whether or not it is still on screen.
+    [[nodiscard]] std::vector<DrawnImage> const& Drawn() const noexcept
+    {
+        return _drawn;
     }
 
     /// @return The sequences this model did not know, each as `<parameters><final>`.
@@ -812,14 +879,20 @@ class NoAutoReturnScreen
         if (terminator == 'K' && parameters.empty())
         {
             for (auto const column: std::views::iota(_column, _columns))
+            {
                 _cells[_row][column] = " ";
+                _imaged[_row][column] = false;
+            }
             return;
         }
         if (terminator == 'J' && parameters.empty())
         {
             Control({}, 'K');
             for (auto const row: std::views::iota(_row + 1, _cells.size()))
+            {
                 _cells[row].assign(_columns, " ");
+                _imaged[row].assign(_columns, false);
+            }
             return;
         }
         _unknown.push_back(std::string { parameters } + terminator);
@@ -834,6 +907,32 @@ class NoAutoReturnScreen
         }
         _cells.erase(_cells.begin());
         _cells.emplace_back(_columns, " ");
+        _imaged.erase(_imaged.begin());
+        _imaged.emplace_back(_columns, false);
+    }
+
+    /// Draw a Sixel image from the cursor. The body must open with raster attributes
+    /// (`"<pan>;<pad>;<width>;<height>`), which is what says how many pixels it covers.
+    void Image(std::string_view body)
+    {
+        REQUIRE(body.starts_with('"'));
+        auto numbers = std::vector<std::size_t> { 0 };
+        for (auto const character: body.substr(1))
+        {
+            if (character == ';')
+                numbers.push_back(0);
+            else if (character >= '0' && character <= '9')
+                numbers.back() = (numbers.back() * 10) + static_cast<std::size_t>(character - '0');
+            else
+                break;
+        }
+        REQUIRE(numbers.size() == 4);
+        auto const across = (numbers[2] + _cell.width - 1) / _cell.width;
+        auto const down = (numbers[3] + _cell.height - 1) / _cell.height;
+        for (auto const row: std::views::iota(_row, std::min(_row + down, _imaged.size())))
+            for (auto const column: std::views::iota(_column, std::min(_column + across, _columns)))
+                _imaged[row][column] = true;
+        _drawn.push_back(DrawnImage { .row = _row, .column = _column, .body = std::string { body } });
     }
 
     /// @return A 1-based CSI parameter, where empty and 0 both mean 1.
@@ -846,11 +945,28 @@ class NoAutoReturnScreen
     }
 
     std::size_t _columns;
+    CellPixelSize _cell;
     std::vector<std::vector<std::string>> _cells;
+    std::vector<std::vector<bool>> _imaged;
     std::size_t _row { 0 };
     std::size_t _column { 0 };
     std::vector<std::string> _unknown;
+    std::vector<DrawnImage> _drawn;
 };
+
+/// @return The cells of the rectangle @p high by @p wide from @p top, @p left, 0-based, row by row:
+///         `NoAutoReturnScreen::ImagedCells` for an image covering exactly that.
+[[nodiscard]] std::vector<std::pair<std::size_t, std::size_t>> Rectangle(std::size_t top,
+                                                                         std::size_t left,
+                                                                         std::size_t high,
+                                                                         std::size_t wide)
+{
+    auto cells = std::vector<std::pair<std::size_t, std::size_t>> {};
+    for (auto const row: std::views::iota(top, top + high))
+        for (auto const column: std::views::iota(left, left + wide))
+            cells.emplace_back(row, column);
+    return cells;
+}
 } // namespace
 
 TEST_CASE("full-width frame rows each start in the first column on a terminal whose line feed does not return",
@@ -1114,4 +1230,266 @@ TEST_CASE("a burst of resizes is delivered as the latest geometry, and a key bet
     CHECK(afterKey.columns == 120);
     CHECK(afterKey.rows == 45);
     CHECK(source.waitCount() == 2);
+}
+
+namespace
+{
+/// A 40 by 40 pixel Sixel body, raster attributes first as `ISixelEncoder` writes them: four cells
+/// across and two down at a 10 by 20 pixel cell.
+constexpr auto FortyPixelChart = std::string_view { "\"1;1;40;40#0;2;100;0;0#0~~~~-~~~~" };
+
+/// A three-row frame whose rows 2 and 3 leave columns 4 to 7 blank, and an image placed over exactly
+/// those cells.
+[[nodiscard]] DashboardFrame ChartFrame()
+{
+    return DashboardFrame {
+        .text = "fleet   load\ncpu     rate\nmem     used",
+        .placements = { FramePlacement {
+            .row = 2, .column = 4, .cellsWide = 4, .cellsHigh = 2, .sixel = std::string { FortyPixelChart } } },
+    };
+}
+
+/// @return @p size as `(width, height)`, or `(0, 0)` for none: comparable in a `CHECK`, and a swapped
+///         width and height reads as different.
+[[nodiscard]] std::pair<std::size_t, std::size_t> Pixels(std::optional<CellPixelSize> const& size)
+{
+    return size.has_value() ? std::pair { size->width, size->height } : std::pair<std::size_t, std::size_t> { 0, 0 };
+}
+} // namespace
+
+TEST_CASE("an image placed in a frame is drawn on its cells after the rows, inside the frame's synchronized output",
+          "[cli][dashboard][terminal]")
+{
+    // WHAT DISTINGUISHES: the cells the screen shows the image on. An image written before the rows is
+    // taken off again by the erase of the row it sits in, and one written without placing the cursor
+    // lands where the last row left it; both still write the image's bytes somewhere.
+    auto const frame = ChartFrame();
+    auto const& screen = ScreenBytes();
+    for (auto const synchronized: { false, true })
+    {
+        auto const bytes = FrameBytes(frame, synchronized);
+        auto terminal = NoAutoReturnScreen { 12, 4 };
+        terminal.Feed(bytes);
+
+        CHECK(terminal.ImagedCells() == Rectangle(1, 3, 2, 4));
+        REQUIRE(terminal.Drawn().size() == 1);
+        CHECK(terminal.Drawn().front().body == FortyPixelChart);
+        CHECK(terminal.Row(0) == "fleet   load");
+        CHECK(terminal.Row(1) == "cpu     rate");
+        CHECK(terminal.Row(2) == "mem     used");
+        CHECK(terminal.Unknown().empty());
+
+        // The rows exactly as a frame with no image, then the cursor placed on the image's first cell and
+        // the image framed by endo, and only then the end of the bracket.
+        auto expected = std::string { synchronized ? screen.syncBegin : "" };
+        expected.append(FrameBytes(frame.text, false));
+        expected.append("\x1b[2;4H\x1bP0;1q");
+        expected.append(FortyPixelChart);
+        expected.append("\x1b\\");
+        expected.append(synchronized ? screen.syncEnd : "");
+        CHECK(bytes == expected);
+    }
+}
+
+TEST_CASE("a frame drawn without an earlier frame's image leaves none of that image on screen", "[cli][dashboard][terminal]")
+{
+    auto const placed = ChartFrame();
+
+    // The control: a frame that places the image again shows it once, where it was. Without it, an empty
+    // screen below could be a model that never keeps an image rather than a frame that removed one.
+    auto again = NoAutoReturnScreen { 12, 4 };
+    again.Feed(FrameBytes(placed, false));
+    again.Feed(FrameBytes(placed, false));
+    CHECK(again.ImagedCells() == Rectangle(1, 3, 2, 4));
+
+    // The same text without the image: each covered row is erased and written again.
+    auto same = NoAutoReturnScreen { 12, 4 };
+    same.Feed(FrameBytes(placed, false));
+    REQUIRE(same.ImagedCells() == Rectangle(1, 3, 2, 4));
+    same.Feed(FrameBytes(DashboardFrame { .text = placed.text, .placements = {} }, false));
+    CHECK(same.ImagedCells().empty());
+    CHECK(same.Row(1) == "cpu     rate");
+    CHECK(same.Row(2) == "mem     used");
+
+    // Rows that end before the image's first column write no character on its cells, so only the erase
+    // of each row removes it.
+    auto narrower = NoAutoReturnScreen { 12, 4 };
+    narrower.Feed(FrameBytes(placed, false));
+    REQUIRE(narrower.ImagedCells() == Rectangle(1, 3, 2, 4));
+    narrower.Feed(FrameBytes(DashboardFrame { .text = "fleet   load\ncpu\nmem", .placements = {} }, false));
+    CHECK(narrower.ImagedCells().empty());
+    CHECK(narrower.Row(1) == "cpu         ");
+
+    // A shorter frame whose only row is above the image: the erase below the frame's last row takes it.
+    auto shorter = NoAutoReturnScreen { 12, 4 };
+    shorter.Feed(FrameBytes(placed, true));
+    REQUIRE(shorter.ImagedCells() == Rectangle(1, 3, 2, 4));
+    shorter.Feed(FrameBytes(DashboardFrame { .text = "fleet", .placements = {} }, true));
+    CHECK(shorter.ImagedCells().empty());
+    CHECK(shorter.Row(0) == "fleet       ");
+    CHECK(shorter.Unknown().empty());
+}
+
+TEST_CASE("a started terminal's frames draw the images placed in them", "[cli][dashboard][terminal]")
+{
+    // The loop reaches a sink through `PresentPlaced`, whose default draws the text alone. A presenter
+    // that did not override it would pass every FrameBytes case above and never draw an image.
+    for (auto const answer: { SynchronizedOutputAnswer::Supported, SynchronizedOutputAnswer::NoReply })
+    {
+        auto record = DeviceRecord {};
+        auto clock = ManualClock {};
+        auto reactor = TestReactor { clock };
+        auto pool = ThreadPoolExecutor { 1 };
+
+        auto outcome = StartFake({ .synchronizedOutput = answer }, record, pool, reactor);
+        REQUIRE(outcome.started.has_value());
+        REQUIRE(outcome.started->frames != nullptr);
+
+        auto const frame = ChartFrame();
+        auto const before = record.Written().size();
+        outcome.started->frames->PresentPlaced(frame);
+
+        CHECK(record.Written().substr(before) == FrameBytes(frame, answer == SynchronizedOutputAnswer::Supported));
+    }
+}
+
+TEST_CASE("a CSI 16 t answer, and each way of having none, keeps its meaning as a cell size", "[cli][dashboard][terminal]")
+{
+    // endo answers width first; the reply on the wire is height first, and endo's own query test pins
+    // that `CSI 6 ; 20 ; 10 t` answers ten wide and twenty high.
+    using Answer = std::expected<std::pair<int, int>, tui::QueryUnanswered>;
+
+    CHECK(Pixels(ToCellPixelSize(Answer { std::pair { 10, 20 } })) == std::pair<std::size_t, std::size_t> { 10, 20 });
+    // A terminal answering zero is saying it does not know, and a size of zero draws nothing.
+    CHECK_FALSE(ToCellPixelSize(Answer { std::pair { 0, 0 } }).has_value());
+    CHECK_FALSE(ToCellPixelSize(Answer { std::pair { 10, 0 } }).has_value());
+    CHECK_FALSE(ToCellPixelSize(Answer { std::pair { 0, 20 } }).has_value());
+    CHECK_FALSE(ToCellPixelSize(Answer { std::pair { -10, 20 } }).has_value());
+    CHECK_FALSE(ToCellPixelSize(Answer { std::unexpected(tui::QueryUnanswered::NoReply) }).has_value());
+    CHECK_FALSE(ToCellPixelSize(Answer { std::unexpected(tui::QueryUnanswered::NotAsked) }).has_value());
+}
+
+TEST_CASE("a terminal that reports its cell size starts on the Sixel rung and is asked again after each resize",
+          "[cli][dashboard][terminal]")
+{
+    auto record = DeviceRecord {};
+    auto clock = ManualClock {};
+    auto reactor = TestReactor { clock };
+    auto pool = ThreadPoolExecutor { 1 };
+
+    auto outcome = StartFake({ .cellPixels = CellPixelSize { .width = 10, .height = 20 },
+                               .reread = CellPixelSize { .width = 9, .height = 18 },
+                               .input = { tui::ResizeEvent { .columns = 100, .rows = 30 } } },
+                             record,
+                             pool,
+                             reactor);
+    REQUIRE(outcome.started.has_value());
+    auto& started = *outcome.started;
+
+    CHECK(Pixels(started.capabilities.cellPixels) == std::pair<std::size_t, std::size_t> { 10, 20 });
+    CHECK(ChooseRenderRung(started.capabilities) == RenderRung::Sixel);
+
+    auto const opened = TakeNext(*started.events, reactor);
+    CHECK(Pixels(opened.cellPixels) == std::pair<std::size_t, std::size_t> { 10, 20 });
+    CHECK(record.rereads.load() == 0);
+
+    // The size the font change left, not the one the start measured.
+    auto const resized = TakeNext(*started.events, reactor);
+    CHECK(resized.kind == DashboardEventKind::Resize);
+    CHECK(resized.columns == 100);
+    CHECK(Pixels(resized.cellPixels) == std::pair<std::size_t, std::size_t> { 9, 18 });
+    CHECK(record.rereads.load() == 1);
+}
+
+TEST_CASE("a terminal that does not report its cell size is not the Sixel rung and is never asked again",
+          "[cli][dashboard][terminal]")
+{
+    // It advertised Sixel, so the missing size is the only thing keeping it off the Sixel rung.
+    auto record = DeviceRecord {};
+    auto clock = ManualClock {};
+    auto reactor = TestReactor { clock };
+    auto pool = ThreadPoolExecutor { 1 };
+
+    auto outcome = StartFake({ .sixel = SixelAnswer::Advertised,
+                               .cellPixels = std::nullopt,
+                               .reread = CellPixelSize { .width = 10, .height = 20 },
+                               .input = { tui::ResizeEvent { .columns = 100, .rows = 30 } } },
+                             record,
+                             pool,
+                             reactor);
+    REQUIRE(outcome.started.has_value());
+    auto& started = *outcome.started;
+
+    CHECK_FALSE(started.capabilities.cellPixels.has_value());
+    CHECK(ChooseRenderRung(started.capabilities) == RenderRung::Unicode);
+
+    auto const opened = TakeNext(*started.events, reactor);
+    CHECK_FALSE(opened.cellPixels.has_value());
+    auto const resized = TakeNext(*started.events, reactor);
+    CHECK(resized.kind == DashboardEventKind::Resize);
+    CHECK_FALSE(resized.cellPixels.has_value());
+    CHECK(record.rereads.load() == 0);
+}
+
+TEST_CASE("the cell size is re-read on the pool once per wait that resized, and a wait without a resize asks nothing",
+          "[cli][dashboard][terminal]")
+{
+    auto clock = ManualClock {};
+    auto reactor = TestReactor { clock };
+    auto pool = ThreadPoolExecutor { 1 };
+    auto source = tui::runtime::testing::MockEventSource {};
+    source.pushEvents({ tui::ResizeEvent { .columns = 100, .rows = 30 }, tui::ResizeEvent { .columns = 110, .rows = 35 } });
+    source.pushEvents({ Key(U'a') });
+    auto asked = std::atomic<int> { 0 };
+    auto askedOn = std::atomic<std::thread::id> {};
+    auto stream = MakeTerminalEventStream({ .source = &source,
+                                            .pool = &pool,
+                                            .resumeOn = &reactor,
+                                            .wake = {},
+                                            .columns = 80,
+                                            .rows = 24,
+                                            .cellPixels = CellPixelSize { .width = 10, .height = 20 },
+                                            .rereadCellPixels = [&asked, &askedOn] {
+                                                askedOn.store(std::this_thread::get_id());
+                                                asked.fetch_add(1);
+                                                return std::optional { CellPixelSize { .width = 12, .height = 24 } };
+                                            } });
+    auto const driverThread = std::this_thread::get_id();
+
+    auto const opened = TakeNext(*stream, reactor);
+    auto const resized = TakeNext(*stream, reactor);
+    CHECK(Pixels(opened.cellPixels) == std::pair<std::size_t, std::size_t> { 10, 20 });
+    CHECK(resized.columns == 110);
+    CHECK(Pixels(resized.cellPixels) == std::pair<std::size_t, std::size_t> { 12, 24 });
+    CHECK(asked.load() == 1);
+    CHECK(askedOn.load() != std::thread::id {});
+    CHECK(askedOn.load() != driverThread);
+
+    auto const key = TakeNext(*stream, reactor);
+    CHECK(key.kind == DashboardEventKind::Key);
+    CHECK(asked.load() == 1);
+}
+
+TEST_CASE("a resize whose re-read gets no answer carries no cell size, never the one from before it",
+          "[cli][dashboard][terminal]")
+{
+    auto clock = ManualClock {};
+    auto reactor = TestReactor { clock };
+    auto pool = ThreadPoolExecutor { 1 };
+    auto source = tui::runtime::testing::MockEventSource {};
+    source.pushEvents({ tui::ResizeEvent { .columns = 100, .rows = 30 } });
+    auto stream = MakeTerminalEventStream({ .source = &source,
+                                            .pool = &pool,
+                                            .resumeOn = &reactor,
+                                            .wake = {},
+                                            .columns = 80,
+                                            .rows = 24,
+                                            .cellPixels = CellPixelSize { .width = 10, .height = 20 },
+                                            .rereadCellPixels = [] { return std::optional<CellPixelSize> {}; } });
+
+    auto const opened = TakeNext(*stream, reactor);
+    auto const resized = TakeNext(*stream, reactor);
+    CHECK(opened.cellPixels.has_value());
+    CHECK(resized.kind == DashboardEventKind::Resize);
+    CHECK_FALSE(resized.cellPixels.has_value());
 }
