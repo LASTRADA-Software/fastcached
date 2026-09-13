@@ -145,7 +145,39 @@ namespace
                 return row.label;
         return std::string_view {};
     }
+
+    /// The dialer production uses: a real `BlockingConnector`, constructed per dial.
+    ///
+    /// **The concrete type never leaves `Dial`**, which is what preserves
+    /// `Cc::DialEndpointBlocking`'s guard. That function takes a `BlockingConnector&`
+    /// rather than an `IConnector&` because its soundness rests on the connector
+    /// resolving inline and never leaving its task suspended -- there the type IS the
+    /// rule. Injecting one level up keeps that rule intact while making the REPLIES
+    /// scriptable, which is what the enrol loop's properties are about.
+    ///
+    /// Per dial rather than once, which is what the loop did before this seam existed:
+    /// a redirect moves the endpoint, and a connector carries socket-level timeouts
+    /// for the dial it is about.
+    class BlockingEnrollDialer final: public IEnrollDialer
+    {
+      public:
+        /// @copydoc IEnrollDialer::Dial
+        [[nodiscard]] std::unique_ptr<ISocket> Dial(std::string_view endpoint, DialOptions options) override
+        {
+            // A one-shot CLI on the process main thread: no reactor exists here, so this
+            // legitimately blocks.
+            BlockingConnector connector { DefaultAddressResolver(), BlockingConnectorOptions { .ioTimeout = DialTimeout } };
+            return Cc::DialEndpointBlocking(connector, endpoint, options);
+        }
+    };
+
 } // namespace
+
+IEnrollDialer& DefaultEnrollDialer() noexcept
+{
+    static BlockingEnrollDialer instance;
+    return instance;
+}
 
 EnrollReading ReadEnrollReply(Cc::CacheOutcome const& outcome)
 {
@@ -488,7 +520,8 @@ std::expected<void, std::string> StoreClusterKey(std::filesystem::path const& pa
 std::expected<std::string, std::string> RunEnrollClient(NodeConfig const& cfg,
                                                         ICredentialSource const& credential,
                                                         IRandomSource& random,
-                                                        IDrainWait& wait)
+                                                        IDrainWait& wait,
+                                                        IEnrollDialer& dialer)
 {
     // **This mode's own preconditions are refused HERE and not as `StartupPolicyRejection`
     // rows, and that is a decision rather than a missed table row.** That table judges a
@@ -612,12 +645,10 @@ std::expected<std::string, std::string> RunEnrollClient(NodeConfig const& cfg,
     auto const startedAt = wait.Now();
     while (true)
     {
-        // A one-shot CLI on the process main thread: no reactor exists here, so this
-        // legitimately blocks. `DialEndpointBlocking` takes a `BlockingConnector` by
-        // TYPE rather than an `IConnector`, which is what keeps that fact checkable
-        // rather than a comment.
-        BlockingConnector connector { DefaultAddressResolver(), BlockingConnectorOptions { .ioTimeout = DialTimeout } };
-        auto client = Cc::DialEndpointBlocking(connector, seed, DialOptions { .connectTimeout = DialTimeout });
+        // Through the seam, so a test can script what comes BACK. The blocking dial
+        // and its `BlockingConnector` live in `BlockingEnrollDialer` above, where
+        // `DialEndpointBlocking` still sees the concrete type it requires.
+        auto client = dialer.Dial(seed, DialOptions { .connectTimeout = DialTimeout });
         if (client == nullptr)
             return std::unexpected { std::format("cannot reach the seed at {}", seed) };
 
