@@ -189,12 +189,21 @@ TEST_CASE("the sampler's thread identities are not equal by construction", "[cli
     //
     // Measured rather than assumed, because it is a property of the HARNESS, and a
     // premise nobody wrote down is the one that quietly stops holding.
-    auto pool = ThreadPoolExecutor { 1 };
+    //
+    // DECLARATION ORDER IS LOAD-BEARING, and the next tidy-up must not reorder it. `marker`
+    // completes on the POOL thread, and `ran` is its last statement rather than its end: the
+    // frame is still being written on the way to `final_suspend` when the wait below returns.
+    // Declared BEFORE `pool`, the task is destroyed AFTER the pool has joined its thread, so the
+    // frame is freed once nothing is inside it. The other way round, `~Task` frees the frame
+    // while the pool thread is still in it -- a data race under TSan and a heap-use-after-free
+    // when it lands. An `optional` only because the task needs the pool's address, which does
+    // not exist yet where the task has to be declared.
     auto poolThread = std::atomic<std::thread::id> {};
     auto ran = std::atomic<bool> { false };
+    auto marker = std::optional<Task<void>> {};
+    auto pool = ThreadPoolExecutor { 1 };
 
-    auto marker = MarkThread(&pool, &poolThread, &ran);
-    pool.Submit(marker.Native());
+    pool.Submit(marker.emplace(MarkThread(&pool, &poolThread, &ran)).Native());
 
     while (!ran.load(std::memory_order_acquire))
         std::this_thread::yield();
