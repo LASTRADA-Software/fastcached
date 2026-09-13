@@ -19,7 +19,7 @@ namespace FastCache::Cli
 /// one ordered stream on one reactor.
 ///
 /// **Every producer is a coroutine parked on the reactor, never a thread and never a
-/// sleep.** The cadence parks on `IReactor::Schedule` between samples, a sample runs
+/// sleep.** The cadence waits on a `DeadlineTimer` between samples, a sample runs
 /// `TakeSample`'s two hops off the reactor and back, and the terminal's own source parks
 /// on whatever it reads. So a keystroke that lands while a sample is still on the pool is
 /// delivered while that sample is still on the pool: nothing here waits for one producer
@@ -90,9 +90,9 @@ class LiveEventSource final: public IDashboardEventSource
     /// Stop both producers.
     ///
     /// Discards what is queued, resumes an outstanding `Next()` with `Detached`, closes the
-    /// terminal, and takes a cadence parked between samples back off the timer heap at
-    /// once rather than at its deadline. A sample already on the pool cannot be taken back;
-    /// it is dropped when it returns, and `Drained()` resumes then.
+    /// terminal, and wakes a cadence waiting between samples on the reactor's next turn
+    /// rather than at its deadline. A sample already on the pool cannot be taken back; it
+    /// is dropped when it returns, and `Drained()` resumes then.
     void Close() noexcept override;
 
     /// Resume once nothing this source started is still running.
