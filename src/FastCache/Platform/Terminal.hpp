@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string_view>
 
 namespace FastCache
@@ -107,15 +108,18 @@ class SavedTerminalModes final
     ///         modes could not be read.
     [[nodiscard]] static std::optional<SavedTerminalModes> Capture() noexcept;
 
-    /// Write @p resets to standard output, then put the captured modes back.
+    /// Write @p resets to standard output, in order, then put the captured modes back.
     ///
     /// In that order, because the captured Windows output mode may not interpret escape sequences
     /// at all. Touches only process-wide terminal state -- `tcsetattr(TCSANOW)`, or the console
     /// modes and code pages -- and the output handle, so it is safe from a thread other than the
     /// one reading the terminal while that read is parked. It is NOT idempotent by itself: whoever
     /// calls it decides whether a second call is wanted.
-    /// @param resets Escape sequences undoing what the UI switched on.
-    void Apply(std::string_view resets) const noexcept;
+    ///
+    /// Pieces rather than one string, so a caller composing resets from two owners -- the screen's
+    /// and the input's -- needs no allocation on a path that must not throw.
+    /// @param resets Escape sequences undoing what the UI switched on, written in order.
+    void Apply(std::span<std::string_view const> resets) const noexcept;
 
   private:
     struct Modes;
