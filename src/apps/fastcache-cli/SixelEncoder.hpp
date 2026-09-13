@@ -20,14 +20,13 @@ namespace FastCache::Cli
 /// first-party one in one place (`vendor/VENDOR.md`: widen the adapter, never add a crossing). A
 /// test substitutes `Testing::ScriptedSixelEncoder` and needs no TUI at all.
 ///
-/// **Byte-stable within a build, NOT across standard libraries.** Measured with a standalone
-/// probe linking the vendored `tui/Sixel.cpp` as of trunk `976d129a`, four images encoded fifty
-/// times per process: identical bytes within a process, across processes, and between gcc 14 and
-/// clang 22 on libstdc++ -- and different bytes on three of the four images under clang 22 with
-/// libc++. The cause is inferred from the source rather than proven: the median-cut quantizer
-/// orders pixels with an unstable sort, so pixels that tie on the sorted channel split differently
-/// per standard library. So one event list renders one Sixel frame on one platform, and a test
-/// must never compare Sixel bytes against a value produced elsewhere.
+/// **The same image encodes to the same bytes on every standard library.** The vendored median-cut
+/// quantizer orders a bucket's pixels by the whole colour, its widest channel first, so no split
+/// follows the order a sort happened to leave equal keys in. It once sorted on the widest channel
+/// alone, unstably, and libstdc++, libc++ and MSVC's library each encoded one image to different
+/// bytes. So one event list renders one Sixel frame everywhere, and `SixelEncoder_test.cpp` pins an
+/// encoding's digest at this seam -- the image and the digest the vendored `tui/Sixel_test.cpp`
+/// pins below it.
 
 /// RGBA pixels, row-major, four bytes per pixel, borrowed for the call.
 struct RgbaImage
