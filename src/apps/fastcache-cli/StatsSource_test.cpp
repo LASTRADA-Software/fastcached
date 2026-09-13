@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "StatsSource.hpp"
 
+#include <FastCache/Core/Version.hpp>
+#include <FastCache/Metrics/MetricsCatalog.hpp>
+#include <FastCache/Metrics/PrometheusFormatter.hpp>
+
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
@@ -239,6 +243,65 @@ TEST_CASE("a Prometheus body parses into numbered fields, keeping labels", "[cli
 
     // The comments contributed nothing.
     CHECK(record.fields.size() == 3);
+}
+
+TEST_CASE("a label is read out of a series name, unescaped, whichever position it holds", "[cli][stats]")
+{
+    CHECK(LabelValue(R"(x_info{version="0.4.1"})", "version") == "0.4.1");
+    CHECK(LabelValue(R"(x_info{tier="memory",version="0.4.1"})", "version") == "0.4.1");
+    CHECK(LabelValue(R"(x_info{version="0.4.1",tier="memory"})", "tier") == "memory");
+    // The three exposition escapes, each standing for its character: a quote does not end the value.
+    CHECK(LabelValue(R"(x_info{version="1.0 \"vendor\"\\build\nline"})", "version") == "1.0 \"vendor\"\\build\nline");
+    CHECK(LabelValue(R"(x_info{version=""})", "version") == "");
+
+    // Absent, and every way of not parsing, is no value rather than a guess.
+    CHECK_FALSE(LabelValue(R"(x_info{tier="memory"})", "version").has_value());
+    CHECK_FALSE(LabelValue("x_info", "version").has_value());
+    CHECK_FALSE(LabelValue(R"(x_info{version="0.4.1)", "version").has_value());
+    CHECK_FALSE(LabelValue(R"(x_info{version="0.4.1})", "version").has_value());
+    CHECK_FALSE(LabelValue(R"(x_info{version="a\tb"})", "version").has_value());
+    CHECK_FALSE(LabelValue(R"(x_info{version=0.4.1})", "version").has_value());
+}
+
+TEST_CASE("the build a /metrics body names round-trips through the parser to its version", "[cli][stats]")
+{
+    // WHAT DISTINGUISHES: the client's reader against the server's own renderer, with a value carrying every
+    // escape. A reader that forgot to unescape, or split the series at a quoted space, reads something else.
+    constexpr std::string_view Awkward = "1.0 \"vendor\"\\build\nline";
+    auto row = InfoTable.front();
+    row.value = Awkward;
+    auto const reading = ParsePrometheus(RenderInfoMetric(row));
+    REQUIRE(reading.fields.size() == 1);
+    CHECK(VersionIn(reading, StatsOrigin::Metrics) == std::string { Awkward });
+
+    auto const real = ParsePrometheus(RenderInfoMetric(InfoTable.front()));
+    CHECK(VersionIn(real, StatsOrigin::Metrics) == std::string { VersionString });
+}
+
+TEST_CASE("a version is read where each source states it, and not in another source's spelling", "[cli][stats]")
+{
+    auto const buildInfo = RecordValue(
+        { Field { .name = R"(fastcached_build_info{version="0.4.1"})", .value = NumberCell(std::uint64_t { 1 }) } });
+    auto const infoField = RecordValue({ Field { .name = "fastcached_version", .value = TextCell("0.4.1") } });
+
+    CHECK(VersionIn(buildInfo, StatsOrigin::Metrics) == "0.4.1");
+    CHECK(VersionIn(infoField, StatsOrigin::Info) == "0.4.1");
+    CHECK_FALSE(VersionIn(infoField, StatsOrigin::Metrics).has_value());
+    CHECK_FALSE(VersionIn(buildInfo, StatsOrigin::Info).has_value());
+    // The counter catalogue states none; a node's version is in its status.
+    CHECK_FALSE(VersionIn(buildInfo, StatsOrigin::NodeMetrics).has_value());
+
+    // A series whose name merely begins with the build info's is another series.
+    auto const longer = RecordValue(
+        { Field { .name = R"(fastcached_build_info_extra{version="9"})", .value = NumberCell(std::uint64_t { 1 }) } });
+    CHECK_FALSE(VersionIn(longer, StatsOrigin::Metrics).has_value());
+
+    // An empty version is no version, in both shapes.
+    auto const emptyLabel =
+        RecordValue({ Field { .name = R"(fastcached_build_info{version=""})", .value = NumberCell(std::uint64_t { 1 }) } });
+    CHECK_FALSE(VersionIn(emptyLabel, StatsOrigin::Metrics).has_value());
+    CHECK_FALSE(VersionIn(RecordValue({ Field { .name = "fastcached_version", .value = TextCell("") } }), StatsOrigin::Info)
+                    .has_value());
 }
 
 TEST_CASE("an INFO body parses, classifying numbers apart from text", "[cli][stats]")

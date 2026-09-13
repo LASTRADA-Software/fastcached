@@ -25,6 +25,7 @@
 #include <cstdint>
 #include <expected>
 #include <format>
+#include <iterator>
 #include <optional>
 #include <ranges>
 #include <set>
@@ -1694,6 +1695,17 @@ constexpr std::string_view ChromeAdmin = "127.0.0.1:9464";
     return std::format("{} {} {}{}", glyphs.horizontal, right, glyphs.horizontal, glyphs.topRight);
 }
 
+/// The fields a `/metrics` body stating build @p version parses into: the server's own info series, read by the
+/// parser the session reads with -- so a fixture cannot state the version in a spelling `/metrics` never sends.
+/// @param version The version the build info names.
+/// @return The fields.
+[[nodiscard]] std::vector<Field> BuildInfoFields(std::string_view version)
+{
+    auto row = InfoTable.front();
+    row.value = version;
+    return ParsePrometheus(RenderInfoMetric(row)).fields;
+}
+
 /// A cache reading carrying what §3's title bar states: a version, and an uptime of `6d04:12`.
 /// @return The event.
 [[nodiscard]] DashboardEvent CacheChromeSample()
@@ -1703,7 +1715,7 @@ constexpr std::string_view ChromeAdmin = "127.0.0.1:9464";
     auto& attempt = sample.attempts.front();
     auto fields = Unwrap(attempt.record).fields;
     fields.push_back(Field { .name = std::string { CacheUptimeField }, .value = NumberCell(Uptime) });
-    fields.push_back(Field { .name = std::string { CacheVersionField }, .value = TextCell("0.4.1") });
+    std::ranges::copy(BuildInfoFields("0.4.1"), std::back_inserter(fields));
     attempt.record = RecordValue(std::move(fields));
     attempt.where = std::string { ChromeAdmin };
     return sample;
@@ -1741,6 +1753,31 @@ TEST_CASE("a cache panel's title bar reads as section 3 draws it, its facts endi
     CHECK(FakeCellWidth(top) == 80);
     CHECK(top.starts_with(TopStart("fastcached 0.4.1")));
     CHECK(top.ends_with(TopEnd("127.0.0.1:6379  up 6d04:12  every 2s  q quit")));
+}
+
+TEST_CASE("a cache panel titles itself with the version where its source states it, and in no other spelling",
+          "[cli][dashboard][panel][chrome]")
+{
+    // WHAT DISTINGUISHES: each source's reading is asked in that source's spelling. A /metrics reading states the
+    // version as a LABEL of its build info and INFO as a field's VALUE; asking either in the other's spelling
+    // titles the panel `fastcached -`, which is what every cache read over /metrics drew before (#134 C1).
+    auto const titleOf = [](std::vector<Field> fields, StatsOrigin origin) {
+        auto sample = SampleOf({}, 1, origin);
+        sample.attempts.front().record = RecordValue(std::move(fields));
+        auto const frames = CacheChromeFrames({ sample, Tick }, 80);
+        REQUIRE(frames.size() == 1);
+        return TopEdge(frames.front());
+    };
+    auto const infoField = [] {
+        return std::vector { Field { .name = "fastcached_version", .value = TextCell("0.4.1") } };
+    };
+
+    CHECK(titleOf(BuildInfoFields("0.4.1"), StatsOrigin::Metrics).starts_with(TopStart("fastcached 0.4.1")));
+    CHECK(titleOf(infoField(), StatsOrigin::Info).starts_with(TopStart("fastcached 0.4.1")));
+
+    // The other source's spelling in each reading is not a version.
+    CHECK(titleOf(infoField(), StatsOrigin::Metrics).starts_with(TopStart(std::format("fastcached {}", Absent))));
+    CHECK(titleOf(BuildInfoFields("0.4.1"), StatsOrigin::Info).starts_with(TopStart(std::format("fastcached {}", Absent))));
 }
 
 TEST_CASE("a cache panel's source line names the source, what was asked and where, and counts at the edge",
