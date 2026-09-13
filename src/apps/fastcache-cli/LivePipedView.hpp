@@ -29,6 +29,13 @@ namespace FastCache::Cli
 /// the header does not name is dropped and a column the reading lacks renders absent. The
 /// alternative, a header per change of shape, is a stream no `read` loop can consume.
 ///
+/// **So the header is written after the first SUCCESSFUL sample, never before it.** Some columns
+/// exist only because of what a reading carried -- a cache's tiers, which no flag and no panel
+/// states -- and a header written earlier would have to guess them: omit a tier the daemon runs,
+/// or name one it does not. Waiting costs nothing a program can see, because a failure before the
+/// first reading writes no row either. What that reading carried is the whole of it: a tier that
+/// appears later gains no column, and one that goes away renders absent under its heading.
+///
 /// **A sample that failed is a row of absent cells, not a missing row** -- a gap, which is what
 /// §9.17 calls a failure after the first success. What tells the view the sample failed is the
 /// model's `runLength` being zero, which a failure and nothing else leaves behind. A failure
@@ -60,9 +67,11 @@ using FigureProjection = Value (*)(DashboardModel const& model);
 ///
 /// Fields in panel order, each named by the row's own machine `key` -- never by its label, which is
 /// worded for the screen: `source`, then each rate row followed by the figures beside it, then each
-/// level row followed by its limit (`limitKey`). A level row naming no field exists to say why there
-/// is nothing to draw, and has no field here. The tier block is not streamed: which tiers a reading
-/// carries is not known when the header is written.
+/// level row followed by its limit (`limitKey`), then, for each tier the newest reading carries
+/// (`TiersIn`, the panel's own answer), every tier column as `TierFigureKey`: `memory_items`,
+/// `disk_bytes_used`. A level row naming no field exists to say why there is nothing to draw, and
+/// has no field here. With no reading there are no tiers, which is why `PipedRecordView` writes its
+/// header from a reading.
 /// @param panel The panel.
 /// @param model What is known.
 /// @return The record.
