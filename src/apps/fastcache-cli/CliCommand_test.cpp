@@ -321,6 +321,26 @@ TEST_CASE("the modifiers each verb does honour are accepted", "[cli][command]")
     CHECK(command.verbOptions.onlyIfAbsent);
 }
 
+TEST_CASE("every modifier is refused by its own name on a verb that honours none", "[cli][command]")
+{
+    // Each modifier row states whether it was given through its own predicate, so the
+    // defect worth a case is a row reading ANOTHER row's field: `--xx` reading
+    // `onlyIfAbsent` would leave `ping --xx` accepted in silence, and the case above --
+    // which spot-checks four verbs -- would still pass. WHAT DISTINGUISHES is the flag
+    // named in the refusal, per flag, against one verb that can honour nothing.
+    auto const* const ping = FindVerb("ping");
+    REQUIRE(ping != nullptr);
+    REQUIRE(ping->modifiers == Modifier::None);
+
+    for (auto const flag: std::to_array<std::string_view>({ "--ttl=30", "--nx", "--xx", "--raw", "--all" }))
+    {
+        CAPTURE(flag);
+        auto const refused = Parse({ "ping", flag });
+        CHECK(refused.action == Action::UsageError);
+        CHECK(refused.diagnostic.contains(flag.substr(0, flag.find('='))));
+    }
+}
+
 TEST_CASE("nx and xx together are refused", "[cli][command]")
 {
     auto const command = Parse({ "set", "k", "v", "--nx", "--xx" });
@@ -658,8 +678,9 @@ TEST_CASE("a verb's page states which modifiers it honours, from the table", "[c
 
 TEST_CASE("the ttl row does not disturb the applicability refusal", "[cli][command][help]")
 {
-    // The row it gained carries a NULL member pointer, which `UnhonouredModifier` reads
-    // through. A control: both directions still answer as they did.
+    // `--ttl` carries a VALUE, so whether it was given is a comparison against
+    // `TtlUnset` rather than a flag -- the one row shaped unlike its neighbours, and the
+    // one a predicate table is likeliest to get wrong. A control: both directions answer.
     CHECK(Parse({ "set", "k", "v", "--ttl", "5" }).action == Action::RunVerb);
 
     auto const refused = Parse({ "get", "k", "--ttl", "5" });
