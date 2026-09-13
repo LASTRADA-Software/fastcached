@@ -1003,10 +1003,13 @@ what differs between compilers, standard libraries, hosts and tool versions.
   flake, a re-run clears every one. **Neither the wrapper's exit status NOR the presence of a
   log settles whether the gate ran**, so the wrapper writes an artefact BEFORE the gate starts
   naming the commit it is about, and the verdict is read from the tool's own terminal text.
-  Serialise the gate across lanes with `flock` — **a poll-for-zero is not a lock**: it starves
-  and it stampedes, and it behaves correctly only while there is a single waiter, which is the
-  condition it is invariably tested under. A run that was KILLED mid-build is discarded rather
-  than read.
+  **The gate serialises ITSELF** — `local-gate.sh` takes `flock` on ONE path it defines
+  (`$HOME/.fastcached-local-gate.lock`), so run it bare: a `flock <path> <command>` wrapper
+  holding that lock is detected rather than deadlocked against, one holding a DIFFERENT path is
+  reported with both, and `GATE NOT STARTED:` is a lock outcome, never a verdict (#1379). **A poll-for-zero is not a
+  lock**: it starves and it stampedes, and it behaves correctly only while there is a single
+  waiter, which is the condition it is invariably tested under. A run that was KILLED mid-build
+  is discarded rather than read.
 - **A red gate reads as "my branch is bad", never as "the gate is broken" — so a gate that
   fails CLOSED and UNCONDITIONALLY can sit for days with nobody filing it.** Not another
   wrong-tree entry: that list is the gate reporting on the wrong tree, this is the gate

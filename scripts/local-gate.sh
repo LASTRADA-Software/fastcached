@@ -62,9 +62,19 @@
 #                exit. Needs no compiler, no cmake and no clang-tidy, which is what
 #                lets `ctest -R local-gate-selftest` run it everywhere.
 #   --classify=  read a captured gate log and say what happened to the run that
-#                wrote it -- `passed`, `failed`, `did-not-conclude` or
-#                `no-gate-run` -- with a distinct exit status for each. `-` reads
-#                stdin. See "A run that never concluded" below.
+#                wrote it -- one word per row of the `gate_outcomes` table below,
+#                with a distinct exit status for each. `-` reads stdin. See "A run
+#                that never concluded" below. The rows are deliberately NOT listed
+#                here: this line named four of them while the table held six, and a
+#                stale list reads as complete.
+#
+# A real run takes this host's gate lock ITSELF, before it reads the tree, so run it
+# bare -- see "One gate per host, and the lock is taken HERE" below (#1379).
+#
+#   FASTCACHED_GATE_LOCK       the lock file. Default `$HOME/.fastcached-local-gate.lock`.
+#   FASTCACHED_GATE_LOCK_WAIT  seconds to queue for it before refusing. Default 10800.
+#   FASTCACHED_GATE_STOP_AFTER_LOCK  the self-test's seam: stop once the lock stage has
+#                              decided, checking nothing, with `no-gate-run`'s status.
 #
 # ## A run that never concluded (#584)
 #
@@ -333,8 +343,8 @@ leg_pairs() {
 # ---------------------------------------------------------------------------
 # What a run says about itself, and what a LOG of one says afterwards (#584).
 #
-# The three lines a run emits about its own fate, defined once and both WRITTEN
-# and READ through these names. A classifier holding its own copy of the strings
+# The lines a run emits about its own fate, defined once and both WRITTEN and READ
+# through these names. A classifier holding its own copy of the strings
 # would be a second claim rather than a cross-check: it would go on agreeing with
 # itself after the gate stopped printing what it looks for, which is the shape of
 # defect this whole file is about.
@@ -346,6 +356,18 @@ leg_pairs() {
 gate_start_marker="== LOCAL GATE STARTED"
 gate_passed_marker="LOCAL GATE PASSED"
 gate_failed_marker="GATE FAILED:"
+
+# The lines a run emits when the HOST LOCK decides it (#1379): one while it queues, and
+# two terminal ones for a run that never started. The two terminal ones share the
+# `GATE NOT STARTED:` prefix so a monitor watching for `GATE FAILED:` and
+# `LOCAL GATE PASSED` has one more prefix to watch rather than two -- and they are two
+# lines rather than one because *another gate held it* and *the lock could not be
+# taken at all* are fixed in different places: the first by waiting, the second on the
+# host. Neither is a verdict about the tree. Neither is a prefix of the other, and
+# neither starts with `GATE FAILED:`, so each is matched anchored like the three above.
+gate_lock_waiting_marker="== GATE LOCK WAITING"
+gate_lock_refused_marker="GATE NOT STARTED: the gate lock was held"
+gate_lock_unusable_marker="GATE NOT STARTED: the gate lock could not be taken"
 
 # The root this repository TRACKS but does not OWN: third-party source copied
 # verbatim from upstream (vendor/VENDOR.md). Named once here because THIS FILE has
@@ -386,7 +408,8 @@ gate_totals_pattern='^[0-9]+% tests passed, [0-9]+ tests failed out of [0-9]+'
 # drifted onto one number would rebuild it silently.
 #
 # `0` and `1` are the gate's OWN statuses for those two outcomes, so classifying a
-# log answers with what the run itself answered. `2` is skipped deliberately and is
+# log answers with what the run itself answered -- and so are `7` and `8`, which a
+# run that never got the host lock exits with. `2` is skipped deliberately and is
 # the interesting one: it is this script's usage status, and `--classify=$LOG` with
 # an unset `LOG` is a usage error -- a caller reading only the status would take
 # "you typed that wrong" for "the run was killed". The two are not commensurable, so
@@ -407,13 +430,17 @@ gate_outcomes=(
     "no-gate-run|4|this log holds no gate run to classify. It was truncated above the start marker, or it is not a gate log."
     "unrecognised|5|UNRECOGNISED OUTCOME -- this gate has no row for that, which is a bug in the gate and not a verdict."
     "unreadable-log|6|the log named could not be read, so there is nothing here to classify. That is a different fact from anything the log might have said."
+    "lock-not-acquired|7|the gate did NOT START: another gate on this host held the lock for the whole wait. Nothing about your tree was checked. Re-run it when the host is free; this is not a verdict."
+    "lock-unusable|8|the gate did NOT START: the host lock could not be taken at all -- an unwritable lock directory, a wait that is not a number, or a flock that refused its own options. Nothing about your tree was checked. Fix the host, not the branch."
 )
 
 # What a gate LOG says about the run that produced it. PURE: log text on stdin,
 # one outcome word on stdout, nothing else read and nothing written.
 #
 # The LAST start marker wins, and a terminal line counts only when a marker came
-# before it. Both halves are load-bearing:
+# before it -- except the two `GATE NOT STARTED:` lines, which by definition have no
+# marker to follow and are the last event of the invocation that printed them. Both
+# halves are load-bearing:
 #
 #   - A log file is reused. A `/tmp` wipe once left a PREVIOUS run's durable copy
 #     sitting where the current one goes, and it reported a failure already fixed;
@@ -436,6 +463,15 @@ gate_outcome() {
                 ;;
             "$gate_failed_marker"*)
                 [[ "$outcome" == "did-not-conclude" ]] && outcome="failed"
+                ;;
+            # A refusal is the LAST event of the invocation that printed it, so it
+            # wins over an earlier green run in a reused log -- the latest invocation
+            # did not start -- and loses to a start marker that follows it.
+            "$gate_lock_refused_marker"*)
+                outcome="lock-not-acquired"
+                ;;
+            "$gate_lock_unusable_marker"*)
+                outcome="lock-unusable"
                 ;;
         esac
     done
@@ -467,6 +503,397 @@ gate_outcome_status() {
     local row
     row="$(gate_outcome_row "$1")"
     echo "${row%%|*}"
+}
+
+# ---------------------------------------------------------------------------
+# One gate per host, and the lock is taken HERE (#1379).
+#
+# `.agent/rules/build-and-toolchain.md` required the gate to be serialised across lanes
+# with `flock`, and this script took no lock. Serialisation lived in each session's
+# WRAPPER and nothing in the repository named a path, so every lane invented one and two
+# lanes serialised only when they happened to coincide. Measured: one lane's `flock` was
+# on a path no other lane used, three gates ran at once on one host, and that lane's
+# lock had acquired instantly every time -- which is exactly what a lock nobody else
+# takes looks like, and exactly what a free host looks like. So the path is defined ONCE,
+# below, and the lock is taken by the thing being serialised. A lane that runs the gate
+# is serialised whether or not it wrote a wrapper, which is the only form of this rule
+# that cannot be satisfied by omission.
+#
+# **Per USER, under `$HOME`, and that is chosen rather than settled for.** A host-wide
+# path means `/tmp`, and WSL wipes `/tmp` when it idles out. `flock` on a file that is
+# UNLINKED while held leaves the holder locking an orphaned inode, and the next opener
+# creates a fresh file and acquires it: two holders, no error from either. That fails
+# silently in exactly the direction this lock exists to close, while the per-user limit
+# is stated. What it therefore does NOT cover, and says so in its own lines: CI (a VM per
+# job), another machine, another user on this one -- and Git Bash against WSL on one
+# Windows box, whose `$HOME`s differ.
+#
+# **Descendants must not inherit it** -- see `gate_lock_run` for why that makes it
+# `flock -o` rather than a descriptor. **A wrapper that already holds it** must not be
+# deadlocked against, and `gate_lock_holder` is how that is told apart.
+# ---------------------------------------------------------------------------
+
+# The spelling two lock paths are compared in when they cannot be compared as FILES: the
+# directory resolved, the name kept. `gate_lock_same` asks `-ef` first.
+# @param 1 a lock path. Echoes it with its directory resolved, or unchanged.
+gate_lock_canonical() {
+    local dir base
+    case "$1" in
+        */*)
+            dir="${1%/*}"
+            base="${1##*/}"
+            [[ -n "$dir" ]] || dir="/"
+            ;;
+        *)
+            dir="."
+            base="$1"
+            ;;
+    esac
+    if dir="$(cd -- "$dir" 2>/dev/null && pwd -P)"; then
+        printf '%s/%s\n' "${dir%/}" "$base"
+    else
+        printf '%s\n' "$1"
+    fi
+}
+
+# Whether two lock paths name ONE lock. `-ef` first, because a symlinked directory, a
+# `//home` and a relative spelling are all one file; the canonical spelling second, for a
+# lock file nobody has created yet. @param 1 @param 2. Status 0 when they are one lock.
+gate_lock_same() {
+    [[ "$1" -ef "$2" ]] && return 0
+    [[ "$(gate_lock_canonical "$1")" == "$(gate_lock_canonical "$2")" ]]
+}
+
+# The MODE and lock FILE a `flock(1)` command line names, as `mode<TAB>file`, or nothing
+# when the line holds no path this can see: a descriptor (`flock 9`), a file with no
+# command, or a shell whose script merely MENTIONS flock.
+#
+# The mode is part of the answer because a lock that excludes nobody is not one this gate
+# may call held: two gates under `flock -s` would each be told so and run at once.
+# `exclusive` is flock's default; `-s`/`--shared` makes it `shared`, `-x`/`-e` exclusive
+# again (the later option wins, as in flock), and `-u`/`--unlock` is `unlock`.
+#
+# Read the way util-linux reads it, because a parser that disagrees with flock's in EITHER
+# direction answers wrongly here -- one way silently, the other as a deadlock:
+#   - options stop at the first non-option (a `+` optstring), so that argument is the file;
+#   - `-w` and `-E` take a value, attached (`-w5`, `-Ew`) or next (`-w 5`, `-nw 5`), and a
+#     bundle is read letter by letter because the letter after `-E` is `-E`'s VALUE;
+#   - a long option may be ABBREVIATED to any unambiguous prefix (`--sh`, `--wai 5`), as
+#     `getopt_long` allows, and may carry its value after `=`;
+#   - an all-digits argument is a DESCRIPTOR only when nothing follows it; with a command
+#     after it, flock opens it as a file.
+# @param 1 argv, fields separated by $'\037'. Trailing separators are not arguments: a
+#          `/proc` cmdline ends in one, and read as an empty argument it would pass for a
+#          command.
+gate_lock_flock_file() {
+    local u=$'\037'
+    local in="$1" rest field argv0 skip=0 bundle c mode="exclusive" name attached long candidate
+    while [[ "$in" == *"$u" ]]; do
+        in="${in%"$u"}"
+    done
+    rest="$in$u"
+    argv0="${rest%%"$u"*}"
+    rest="${rest#*"$u"}"
+    [[ "${argv0##*/}" == "flock" ]] || return 0
+    while [[ -n "$rest" ]]; do
+        field="${rest%%"$u"*}"
+        rest="${rest#*"$u"}"
+        if [[ "$skip" -eq 1 ]]; then
+            skip=0
+            continue
+        fi
+        case "$field" in
+            --)
+                [[ -n "$rest" ]] || return 0
+                field="${rest%%"$u"*}"
+                rest="${rest#*"$u"}"
+                ;;
+            --?*)
+                name="${field#--}"
+                attached=0
+                case "$name" in
+                    *=*)
+                        name="${name%%=*}"
+                        attached=1
+                        ;;
+                esac
+                # util-linux 2.39's long options. An exact name wins; otherwise a prefix of
+                # exactly one is that option. A prefix of several is an error flock refuses
+                # -- it then runs no command, so nothing here needs an answer for it.
+                long=""
+                for candidate in shared exclusive unlock nonblocking nb timeout wait \
+                    conflict-exit-code close no-fork verbose help version; do
+                    if [[ "$candidate" == "$name" ]]; then
+                        long="$candidate"
+                        break
+                    fi
+                    case "$candidate" in
+                        "$name"*)
+                            if [[ -z "$long" ]]; then
+                                long="$candidate"
+                            else
+                                long="ambiguous"
+                            fi
+                            ;;
+                    esac
+                done
+                case "$long" in
+                    shared) mode="shared" ;;
+                    exclusive) mode="exclusive" ;;
+                    unlock) mode="unlock" ;;
+                    timeout|wait|conflict-exit-code) [[ "$attached" -eq 1 ]] || skip=1 ;;
+                esac
+                continue
+                ;;
+            -?*)
+                bundle="${field#-}"
+                while [[ -n "$bundle" ]]; do
+                    c="${bundle:0:1}"
+                    bundle="${bundle:1}"
+                    case "$c" in
+                        w|E)
+                            [[ -n "$bundle" ]] || skip=1
+                            break
+                            ;;
+                        s) mode="shared" ;;
+                        x|e) mode="exclusive" ;;
+                        u) mode="unlock" ;;
+                    esac
+                done
+                continue
+                ;;
+        esac
+        # The first non-option. With nothing after it, it is a descriptor (digits) or a
+        # file flock refuses to run without a command -- either way no path held for a
+        # command that could be this gate.
+        [[ -n "$rest" && -n "$field" ]] || return 0
+        printf '%s\t%s\n' "$mode" "$field"
+        return 0
+    done
+    return 0
+}
+
+# What already holds this run's lock, before this process takes it. Echoes `word|pid|path`:
+#
+#   marker|<pid>|<path>   the gate invocation that started this one took it
+#   marker-unverified|<pid>|<path>
+#                         the same, except this run's ancestry could not be read far
+#                         enough to find the marker's pid. Trusted, and the caller says
+#                         so: the alternative is this gate queueing behind the `flock` its
+#                         own parent holds, for the whole budget, then blaming "another gate"
+#   wrapper|<pid>|<path>  an ancestor `flock` holds this same lock
+#   nonexclusive|<pid>|<path>
+#                         an ancestor `flock` holds THIS lock in a mode that excludes nobody
+#                         (`-s`, `-u`). Not held, since a second such gate would run beside
+#                         this one; and not free, since an exclusive lock taken here would
+#                         wait on this gate's own ancestor for the whole budget
+#   foreign|<pid>|<path>  an ancestor `flock` holds a DIFFERENT lock -- neither held nor
+#                         free, so it is reported with both paths rather than folded into
+#                         either: a wrapper with a mistyped path would otherwise get no
+#                         serialisation and no word about it
+#   unknown||             nothing seen, but the ancestry could not be read to its root, so a
+#                         wrapper may be up there unseen. Never `free`, which would claim a
+#                         fact nobody observed
+#   free||                nothing above this process holds it
+#
+# ANCESTORS, never the parent: `flock L bash -lc 'bash scripts/local-gate.sh'` makes the
+# flock this gate's GRANDPARENT, and a parent-only test reports that locked gate as
+# unlocked. What this cannot see at all is a lock held through a DESCRIPTOR an ancestor
+# opened (`exec 9>L; flock 9; ...`) or by `flock -F`, which becomes the command rather than
+# its parent: neither leaves a `flock` process above the gate.
+#
+# The MARKER is asked across every ancestor BEFORE any flock is. The gate's own re-exec
+# runs under a `flock` naming this same lock, and that flock is the child's nearest
+# ancestor -- so a single pass would tell the gate its own lock is a redundant wrapper.
+# A marker is believed only when its pid IS an ancestor, so one leaked into a long-lived
+# shell describes some other process and is ignored rather than trusted.
+#
+# @param 1 the lock this run resolved
+# @param 2 FASTCACHED_GATE_LOCK_HELD as found (`pid:path`), possibly empty
+# @param 3 ancestor records, nearest first, one `pid<TAB>cwd<TAB>argv` line each with
+#          argv fields $'\037'-separated; a `?<TAB><TAB><pid>` line means the chain could
+#          not be read past <pid>. Injected, so the self-test stages a process tree
+#          without forking one.
+gate_lock_holder() {
+    local lock="$1" marker="$2" records="$3"
+    local tab=$'\t' nl=$'\n' line pid rest cwd argv found mode file foreign="" mpid="" mpath="" incomplete=0
+    case "$nl$records" in
+        *"$nl?$tab"*) incomplete=1 ;;
+    esac
+    if [[ -n "$marker" ]]; then
+        mpid="${marker%%:*}"
+        mpath="${marker#*:}"
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            [[ -n "$line" ]] || continue
+            pid="${line%%"$tab"*}"
+            if [[ "$pid" == "$mpid" ]] && gate_lock_same "$mpath" "$lock"; then
+                echo "marker|$pid|$mpath"
+                return 0
+            fi
+        done <<< "$records"
+        if [[ "$incomplete" -eq 1 ]] && gate_lock_same "$mpath" "$lock"; then
+            echo "marker-unverified|$mpid|$mpath"
+            return 0
+        fi
+    fi
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ -n "$line" ]] || continue
+        pid="${line%%"$tab"*}"
+        [[ "$pid" != "?" ]] || continue
+        rest="${line#*"$tab"}"
+        cwd="${rest%%"$tab"*}"
+        argv="${rest#*"$tab"}"
+        found="$(gate_lock_flock_file "$argv")"
+        [[ -n "$found" ]] || continue
+        mode="${found%%"$tab"*}"
+        file="${found#*"$tab"}"
+        # A relative path is relative to the HOLDER's directory, not this one.
+        case "$file" in
+            /*) ;;
+            *) [[ -z "$cwd" ]] || file="${cwd%/}/$file" ;;
+        esac
+        if gate_lock_same "$file" "$lock"; then
+            if [[ "$mode" == "exclusive" ]]; then
+                echo "wrapper|$pid|$file"
+            else
+                echo "nonexclusive|$pid|$file"
+            fi
+            return 0
+        fi
+        [[ -n "$foreign" ]] || foreign="foreign|$pid|$file"
+    done <<< "$records"
+    if [[ -n "$foreign" ]]; then
+        echo "$foreign"
+    elif [[ "$incomplete" -eq 1 ]]; then
+        echo "unknown||"
+    else
+        echo "free||"
+    fi
+}
+
+# One process's parent pid, or nothing when it cannot be read. `/proc/<pid>/stat` first,
+# so a Linux host needs no `ps`: a container carrying util-linux and not procps otherwise
+# walks no ancestry at all, and its gate queues behind its own re-exec. The command name
+# in that file is parenthesised and may itself contain `) `, so the fields are read after
+# the LAST one. @param 1 pid
+gate_lock_ppid() {
+    local stat=""
+    if [[ -r "/proc/$1/stat" ]]; then
+        IFS= read -r stat < "/proc/$1/stat" 2>/dev/null || true
+    fi
+    if [[ -n "$stat" ]]; then
+        stat="${stat##*) }"
+        stat="${stat#* }"
+        printf '%s\n' "${stat%% *}"
+        return 0
+    fi
+    stat="$(ps -o ppid= -p "$1" 2>/dev/null)" || return 0
+    printf '%s\n' "${stat// /}"
+}
+
+# This process's ancestors as `gate_lock_holder` records, nearest first. Bounded like
+# `reap-my-gate.sh`'s walk and for its reason: a circular or unreadable chain must end the
+# walk rather than hang the gate. And an END that is not the root is SAID, as a `?` record,
+# because a walk that silently stops early answers `free` for a chain nobody read.
+# `/proc` where it exists, because it is the exact argv -- NUL-separated, spaces intact --
+# and the holder's directory; `ps -o args=` otherwise, which joins argv with spaces and so
+# cannot keep a lock path containing one. That degrades to a `foreign` report printing both
+# paths, loudly.
+gate_lock_ancestors() {
+    local pid="$$" parent argv cwd depth=0
+    while [[ "$depth" -lt 64 ]]; do
+        parent="$(gate_lock_ppid "$pid")"
+        case "$parent" in
+            0)
+                return 0
+                ;;
+            ''|*[!0-9]*)
+                printf '?\t\t%s\n' "$pid"
+                return 0
+                ;;
+        esac
+        pid="$parent"
+        cwd=""
+        if [[ -r "/proc/$pid/cmdline" ]]; then
+            argv="$(tr '\000\n' '\037 ' < "/proc/$pid/cmdline" 2>/dev/null)" || argv=""
+            cwd="$(readlink "/proc/$pid/cwd" 2>/dev/null)" || cwd=""
+        else
+            argv="$(ps -o args= -p "$pid" 2>/dev/null | tr ' \n' '\037\037')" || argv=""
+        fi
+        if [[ -z "$argv" ]]; then
+            # An ancestor whose command line cannot be read may be the wrapper.
+            printf '?\t\t%s\n' "$pid"
+        else
+            printf '%s\t%s\t%s\n' "$pid" "$cwd" "$argv"
+        fi
+        [[ "$pid" != "1" ]] || return 0
+        depth=$((depth + 1))
+    done
+    printf '?\t\t%s\n' "$pid"
+}
+
+# Run a command holding the host's gate lock, and say so when it had to queue.
+#
+# **`flock -o`, and the `-o` is the design rather than a detail.** It closes the lock's
+# descriptor in the command, so only the `flock` process holds the lock and it is released
+# when the RUN ends. The obvious alternative -- `exec 9>>lock; flock 9` -- hands the
+# descriptor to every descendant, and a daemon that an e2e fixture leaked would then hold
+# the gate lock for the life of the machine: every later gate queues for the whole budget
+# and refuses, on a tree that is fine. A fixture leaking a daemon is a recorded event here,
+# not a hypothetical. The wrapper form `flock <path> bash scripts/local-gate.sh` has that
+# exposure today, and running the gate bare is what removes it.
+#
+# The price, measured rather than assumed: killing the waiting parent ALONE leaves `flock`
+# and the run going with the lock still held, so the run finishes unwatched; killing the
+# `flock` process ALONE frees the lock while the run it serialised carries on, so a second
+# gate can start beside it. Kill the process GROUP -- which Ctrl-C and `timeout` do, and
+# which `reap-my-gate.sh` does. A trap cannot close this, for the reason the header gives
+# about traps and foreground commands.
+#
+# **Whether the command RAN is read from a sentinel it touches, never from the status.**
+# `flock` returns the command's own status once it holds the lock, so a command exiting
+# with the refusal status would otherwise read as a lock that was never acquired.
+#
+# @param 1 lock file  @param 2 seconds to queue  @param 3 refused status
+# @param 4 unusable status  @param 5.. the command, which is handed
+#          FASTCACHED_GATE_LOCK_RAN -- a path to create as soon as it starts.
+# Returns the command's own status, or @3 / @4 with the line naming it printed.
+gate_lock_run() {
+    local lock="$1" wait="$2" refused="$3" unusable="$4"
+    shift 4
+    local scratch rc limits
+    limits="It serialises gates run by this user on this host -- not CI, not another machine, not another user."
+    case "$wait" in
+        ''|*[!0-9]*)
+            echo "$gate_lock_unusable_marker -- FASTCACHED_GATE_LOCK_WAIT='$wait' is not a whole number of seconds."
+            return "$unusable"
+            ;;
+    esac
+    if ! scratch="$(mktemp -d 2>/dev/null)"; then
+        echo "$gate_lock_unusable_marker -- mktemp -d failed, so there is nowhere for the started-sentinel."
+        return "$unusable"
+    fi
+    # Probing with `-n` against `true` is the one way to ASK whether the lock is free
+    # without becoming a contender. `-E` so a busy lock is told apart from a lock file
+    # that cannot be opened, which the real `flock` below reports itself. It decides only
+    # this message: the answer can change before the real `flock` runs, harmlessly.
+    flock -n -E "$refused" "$lock" true 2>/dev/null
+    if [[ $? -eq "$refused" ]]; then
+        echo "$gate_lock_waiting_marker -- another gate on this host holds $lock; queued for up to ${wait}s. $limits"
+    fi
+    FASTCACHED_GATE_LOCK_RAN="$scratch/ran" flock -o -w "$wait" -E "$refused" "$lock" "$@"
+    rc=$?
+    if [[ -e "$scratch/ran" ]]; then
+        rm -rf "$scratch"
+        return "$rc"
+    fi
+    rm -rf "$scratch"
+    if [[ "$rc" -eq "$refused" ]]; then
+        echo "$gate_lock_refused_marker by another gate for the whole ${wait}s ($lock). Nothing about the tree was checked; re-run when the host is free. A wrapper holding this lock through a descriptor or \`flock -F\` cannot be seen, and would itself be what this waited for -- run the gate bare. $limits"
+        return "$refused"
+    fi
+    echo "$gate_lock_unusable_marker -- flock exited $rc on $lock before the gate started; its own message is above."
+    return "$unusable"
 }
 
 # The tests a leg did not run, BY NAME, read out of that leg's own ctest output.
@@ -1106,7 +1533,7 @@ compiler_shim_verdict() {
     # unresolved path still gets the component check below, so the worst case is
     # a symlinked shim going unnoticed rather than a wrong verdict.
     resolved="$(readlink -f "$compiler" 2>/dev/null || true)"
-    if [[ -z "$resolved" ]]; then
+    if [[ -z "$resolved" ]] && command -v python3 >/dev/null 2>&1; then
         resolved="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$compiler" 2>/dev/null || true)"
     fi
     [[ -n "$resolved" ]] || resolved="$compiler"
@@ -2660,6 +3087,293 @@ $gate_passed_marker"
     expect "did-not-conclude and failed do not share a status" \
         "no" "$([[ "$(gate_outcome_status did-not-conclude)" == "$(gate_outcome_status failed)" ]] && echo yes || echo no)"
 
+    # ---- the host gate lock (#1379) ------------------------------------------------
+    #
+    # The two lock outcomes are ROWS. The distinctness assertion above counts rows, so a
+    # lock outcome missing from the table would pass it -- it renders as `unrecognised`
+    # instead, which this asks directly.
+    expect "the lock outcomes are rows, not the unrecognised fallback" "no no" \
+        "$([[ "$(gate_outcome_status lock-not-acquired)" == "$(gate_outcome_status unrecognised)" ]] && echo yes || echo no) $([[ "$(gate_outcome_status lock-unusable)" == "$(gate_outcome_status unrecognised)" ]] && echo yes || echo no)"
+
+    outcome_case "a run that queued and was refused did not start" \
+        "lock-not-acquired" "$gate_lock_waiting_marker -- held
+$gate_lock_refused_marker by another gate"
+    outcome_case "a run that could not take the lock at all is its own outcome" \
+        "lock-unusable" "$gate_lock_unusable_marker -- flock exited 1"
+    outcome_case "a run that queued and then passed is judged by what it did" \
+        "passed" "$gate_lock_waiting_marker -- held
+$_started
+$_legs
+$gate_passed_marker"
+    outcome_case "a refusal after a green run in a reused log: the latest invocation did not start" \
+        "lock-not-acquired" "$_started
+$_legs
+$gate_passed_marker
+$gate_lock_refused_marker by another gate"
+    outcome_case "a start marker after a refusal is a later run that started" \
+        "did-not-conclude" "$gate_lock_refused_marker by another gate
+$_started"
+    outcome_case "a run killed while it queued holds no gate run" \
+        "no-gate-run" "$gate_lock_waiting_marker -- held"
+
+    _u=$'\037'
+    _t=$'\t'
+    mkdir -p "$scratch/lock"
+    _lk="$scratch/lock/gate.lock"
+    _other="$scratch/lock/other.lock"
+    : > "$_lk"
+    : > "$_other"
+
+    flock_file_case() {
+        expect "flock argv: $1" "$2" "$(gate_lock_flock_file "$3")"
+    }
+    flock_file_case "a bare file" "exclusive${_t}/x/l" "flock${_u}/x/l${_u}bash"
+    flock_file_case "an absolute argv0" "exclusive${_t}/x/l" "/usr/bin/flock${_u}/x/l${_u}bash"
+    flock_file_case "-w and -E take the next argument" "exclusive${_t}/x/l" \
+        "flock${_u}-w${_u}10800${_u}-E${_u}111${_u}/x/l${_u}bash${_u}scripts/local-gate.sh"
+    flock_file_case "a long option with its value attached" "exclusive${_t}/x/l" "flock${_u}--wait=5${_u}/x/l${_u}cmd"
+    flock_file_case "a long option taking the next argument" "exclusive${_t}/x/l" \
+        "flock${_u}--conflict-exit-code${_u}7${_u}-o${_u}/x/l${_u}cmd"
+    flock_file_case "a bundle ending in w takes the next argument" "exclusive${_t}/x/l" "flock${_u}-nw${_u}5${_u}/x/l${_u}cmd"
+    flock_file_case "a value attached to -w" "exclusive${_t}/x/l" "flock${_u}-w5${_u}/x/l${_u}cmd"
+    flock_file_case "the letter after -E is its value, not an option" "exclusive${_t}/x/l" "flock${_u}-Ew${_u}/x/l${_u}cmd"
+    flock_file_case "-- ends the options" "exclusive${_t}/x/l" "flock${_u}--${_u}/x/l${_u}cmd"
+    flock_file_case "-s holds it shared" "shared${_t}/x/l" "flock${_u}-s${_u}/x/l${_u}cmd"
+    flock_file_case "--shared holds it shared" "shared${_t}/x/l" "flock${_u}--shared${_u}-w${_u}5${_u}/x/l${_u}cmd"
+    flock_file_case "a later -x wins over an earlier -s" "exclusive${_t}/x/l" "flock${_u}-s${_u}-x${_u}/x/l${_u}cmd"
+    flock_file_case "-u is not a lock at all" "unlock${_t}/x/l" "flock${_u}-nu${_u}/x/l${_u}cmd"
+    flock_file_case "an abbreviated --sh is shared" "shared${_t}/x/l" "flock${_u}--sh${_u}/x/l${_u}cmd"
+    flock_file_case "an abbreviated --wai takes the next argument" "exclusive${_t}/x/l" "flock${_u}--wai${_u}5${_u}/x/l${_u}cmd"
+    flock_file_case "an abbreviated --time=5 carries its value" "exclusive${_t}/x/l" "flock${_u}--time=5${_u}/x/l${_u}cmd"
+    flock_file_case "digits followed by a command are a file" "exclusive${_t}123" "flock${_u}123${_u}bash${_u}scripts/local-gate.sh"
+    flock_file_case "a trailing separator is not a command" "" "flock${_u}9${_u}"
+    flock_file_case "a file with no command names nothing" "" "flock${_u}/x/l"
+    flock_file_case "a descriptor names no path" "" "flock${_u}9"
+    flock_file_case "a shell whose script mentions flock is not flock" "" \
+        "bash${_u}-lc${_u}flock /x/l bash scripts/local-gate.sh"
+
+    holder_case() {
+        expect "lock holder: $1" "$2" "$(gate_lock_holder "$_lk" "$3" "$4")"
+    }
+    holder_case "nothing holds it" "free||" "" "30${_t}/w${_t}bash${_u}-l"
+    holder_case "the parent flock holds it" "wrapper|77|$_lk" "" \
+        "77${_t}/w${_t}flock${_u}-w${_u}10800${_u}-E${_u}111${_u}$_lk${_u}bash${_u}scripts/local-gate.sh"
+    holder_case "a flock two levels up holds it -- an ancestor, not only the parent" "wrapper|77|$_lk" "" \
+        "40${_t}/w${_t}bash${_u}-lc${_u}bash scripts/local-gate.sh
+77${_t}/w${_t}flock${_u}$_lk${_u}bash${_u}-lc${_u}bash scripts/local-gate.sh"
+    holder_case "a flock on another path is neither held nor free" "foreign|77|$_other" "" \
+        "77${_t}/w${_t}flock${_u}$_other${_u}bash"
+    holder_case "a SHARED flock on this lock serialises nothing" "nonexclusive|77|$_lk" "" \
+        "77${_t}/w${_t}flock${_u}-s${_u}$_lk${_u}bash${_u}scripts/local-gate.sh"
+    holder_case "this lock further up outranks a nearer foreign one" "wrapper|90|$_lk" "" \
+        "77${_t}/w${_t}flock${_u}$_other${_u}bash
+90${_t}/w${_t}flock${_u}$_lk${_u}bash"
+    holder_case "a marker whose pid is an ancestor holds it" "marker|55|$_lk" "55:$_lk" \
+        "55${_t}/w${_t}bash${_u}scripts/local-gate.sh"
+    # The shape the gate's own re-exec has: its nearest ancestor is the `flock -o` it
+    # started, naming this same lock. A single pass reads that as a redundant wrapper.
+    holder_case "the gate's own re-exec is the marker, not a redundant wrapper" "marker|55|$_lk" "55:$_lk" \
+        "60${_t}/w${_t}flock${_u}-o${_u}-w${_u}10800${_u}-E${_u}7${_u}$_lk${_u}env${_u}bash
+55${_t}/w${_t}bash${_u}scripts/local-gate.sh"
+    holder_case "a marker whose pid is no ancestor is stale" "free||" "999:$_lk" "55${_t}/w${_t}bash"
+    holder_case "a marker naming another lock is not this one" "free||" "55:$_other" "55${_t}/w${_t}bash"
+    holder_case "a descriptor-mode flock names no path" "free||" "" "77${_t}/w${_t}flock${_u}9"
+    holder_case "an unreadable chain with nothing seen is unknown, never free" "unknown||" "" \
+        "30${_t}/w${_t}bash
+?${_t}${_t}30"
+    holder_case "an unreadable chain trusts a marker for this lock, and says which" "marker-unverified|55|$_lk" "55:$_lk" \
+        "30${_t}/w${_t}bash
+?${_t}${_t}30"
+    holder_case "an unreadable chain does not trust a marker for another lock" "unknown||" "55:$_other" \
+        "30${_t}/w${_t}bash
+?${_t}${_t}30"
+    holder_case "an unreadable chain still reports the wrapper it did see" "wrapper|77|$_lk" "" \
+        "77${_t}/w${_t}flock${_u}$_lk${_u}bash
+?${_t}${_t}77"
+
+    _nl=$'\n'
+    expect "the parent pid is read for this shell" "$PPID" "$(gate_lock_ppid "$$")"
+    _anc="$(gate_lock_ancestors)"
+    _first="${_anc%%"$_nl"*}"
+    expect "the ancestor walk starts at this shell's parent" "$PPID" "${_first%%"$_t"*}"
+    case "$_nl$_anc" in
+        *"$_nl?$_t"*)
+            self_test_skipped="${self_test_skipped:+$self_test_skipped, }the ancestor walk's reach (this host's chain is not readable to its root)"
+            ;;
+    esac
+    # A command name holding `) ` -- the field the `/proc/<pid>/stat` parse must read past.
+    #
+    # A copy of THIS interpreter under that name, never `command -v sleep`: a `command -v`
+    # of a tool is a GUARD to `unguarded-prerequisites`, which then holds every script that
+    # sleeps to guarding `sleep` -- nine sites across eight scripts went red for it. The
+    # trailing `:` keeps bash from exec'ing `sleep` and taking the odd name with it.
+    if [[ -r "/proc/$$/stat" ]] && cp "$BASH" "$scratch/lock/x) y" 2>/dev/null; then
+        "$scratch/lock/x) y" -c 'sleep 20; :' </dev/null >/dev/null 2>&1 &
+        _odd=$!
+        _polls=0
+        while [[ "$(cat "/proc/$_odd/comm" 2>/dev/null)" != "x) y" && "$_polls" -lt 50 ]]; do
+            sleep 0.1
+            _polls=$((_polls + 1))
+        done
+        if [[ "$(cat "/proc/$_odd/comm" 2>/dev/null)" == "x) y" ]]; then
+            expect "a command name containing ') ' does not move the parent pid" "$$" "$(gate_lock_ppid "$_odd")"
+        else
+            self_test_skipped="${self_test_skipped:+$self_test_skipped, }the ') ' command-name case (the copy never ran as 'x) y')"
+        fi
+        pkill -KILL -P "$_odd" 2>/dev/null
+        kill -KILL "$_odd" 2>/dev/null
+        wait "$_odd" 2>/dev/null
+    fi
+    holder_case "a relative path is read against the holder's directory" "wrapper|77|$scratch/lock/gate.lock" "" \
+        "77${_t}$scratch/lock${_t}flock${_u}gate.lock${_u}bash"
+    if ln -s "$_lk" "$scratch/lock/alias.lock" 2>/dev/null; then
+        holder_case "a symlink to the lock is the lock" "wrapper|77|$scratch/lock/alias.lock" "" \
+            "77${_t}/w${_t}flock${_u}$scratch/lock/alias.lock${_u}bash"
+    else
+        self_test_skipped="${self_test_skipped:+$self_test_skipped, }the gate lock's symlink case (ln -s failed here)"
+    fi
+
+    # The lock by CONTENTION, not by acquisition: a lock nobody contends always acquires,
+    # which reads exactly like a free host and is the whole of #1379. Both directions --
+    # refused while held, acquired once released -- because a guard nobody has watched
+    # ACCEPT is not known to work either. Needs a real `flock`, so a host without one
+    # SKIPS by name rather than passing.
+    if command -v flock >/dev/null 2>&1 && flock -o -w 1 -E 9 "$_lk" true >/dev/null 2>&1; then
+        _refused="$(gate_outcome_status lock-not-acquired)"
+        _unusable="$(gate_outcome_status lock-unusable)"
+        _ran="$scratch/lock/command-ran"
+        _ready="$scratch/lock/holder-ready"
+        _has() {
+            case "$1" in *"$2"*) echo yes ;; *) echo no ;; esac
+        }
+
+        rm -f "$_ran"
+        _out="$(gate_lock_run "$_lk" 5 "$_refused" "$_unusable" \
+            sh -c ': > "$FASTCACHED_GATE_LOCK_RAN"; : > "$1"' _ "$_ran" 2>&1)"
+        _rc=$?
+        expect "an uncontended lock runs the command" "0 yes" "$_rc $([[ -e "$_ran" ]] && echo yes || echo no)"
+        expect "an uncontended lock prints no waiting line" "no" "$(_has "$_out" "$gate_lock_waiting_marker")"
+
+        # The holder resets the EXIT trap before it becomes `flock`, and is ended through
+        # its `sleep` rather than signalled itself: a backgrounded subshell inherits this
+        # self-test's `rm -rf "$scratch"` trap, and signalling it before the reset would
+        # run that cleanup under the cases still using the directory.
+        rm -f "$_ready"
+        # Its output goes nowhere: a `sleep` left holding this self-test's stdout would keep
+        # ctest waiting for it if the `pkill` below were missing.
+        ( trap - EXIT TERM INT HUP; exec flock -o "$_lk" sh -c ': > "$1"; exec sleep 30' _ "$_ready" ) >/dev/null 2>&1 &
+        _holder=$!
+        _polls=0
+        while [[ ! -e "$_ready" && "$_polls" -lt 100 ]]; do
+            sleep 0.1
+            _polls=$((_polls + 1))
+        done
+        if [[ -e "$_ready" ]]; then
+            rm -f "$_ran"
+            _out="$(gate_lock_run "$_lk" 1 "$_refused" "$_unusable" \
+                sh -c ': > "$FASTCACHED_GATE_LOCK_RAN"; : > "$1"' _ "$_ran" 2>&1)"
+            _rc=$?
+            expect "a held lock refuses with its own status" "$_refused" "$_rc"
+            expect "a held lock does not run the command" "no" "$([[ -e "$_ran" ]] && echo yes || echo no)"
+            expect "a queued run is OBSERVED waiting" "yes" "$(_has "$_out" "$gate_lock_waiting_marker")"
+            expect "a refused run names the refusal" "yes" "$(_has "$_out" "$gate_lock_refused_marker")"
+            expect "a refused run says what the lock does not cover" "yes" "$(_has "$_out" "not CI")"
+        else
+            expect "the holder took the scratch lock within 100 polls of 0.1s requested" "ready" "never ready"
+        fi
+        pkill -TERM -P "$_holder" 2>/dev/null || kill -KILL "$_holder" 2>/dev/null
+        wait "$_holder" 2>/dev/null
+
+        rm -f "$_ran"
+        _out="$(gate_lock_run "$_lk" 10 "$_refused" "$_unusable" \
+            sh -c ': > "$FASTCACHED_GATE_LOCK_RAN"; : > "$1"' _ "$_ran" 2>&1)"
+        _rc=$?
+        expect "a released lock is acquired and runs the command" "0 yes" "$_rc $([[ -e "$_ran" ]] && echo yes || echo no)"
+
+        # The sentinel, not the status: a command that exits with the refusal status RAN.
+        _out="$(gate_lock_run "$_lk" 5 "$_refused" "$_unusable" \
+            sh -c ': > "$FASTCACHED_GATE_LOCK_RAN"; exit "$1"' _ "$_refused" 2>&1)"
+        _rc=$?
+        expect "a command exiting the refusal status keeps its status" "$_refused" "$_rc"
+        expect "a command exiting the refusal status is not reported refused" "no" \
+            "$(_has "$_out" "$gate_lock_refused_marker")"
+        _out="$(gate_lock_run "$_lk" 5 "$_refused" "$_unusable" \
+            sh -c ': > "$FASTCACHED_GATE_LOCK_RAN"; exit 3' 2>&1)"
+        _rc=$?
+        expect "a command's own status passes through" "3" "$_rc"
+
+        # `-o` is the design, so it gets a case: a DESCENDANT the command leaves behind
+        # must not be holding the lock once the run is over. Without `-o` the background
+        # `sleep` inherits the lock's descriptor and the probe below finds it held --
+        # which on a real host is a leaked fixture daemon holding the gate lock for good.
+        # Its stdio goes to /dev/null or the `$( )` capture would wait for it to exit.
+        _straggler="$scratch/lock/straggler.pid"
+        _out="$(gate_lock_run "$_lk" 5 "$_refused" "$_unusable" \
+            sh -c ': > "$FASTCACHED_GATE_LOCK_RAN"; sleep 20 </dev/null >/dev/null 2>&1 & echo $! > "$1"' _ "$_straggler" 2>&1)"
+        flock -n -E "$_refused" "$_lk" true 2>/dev/null
+        expect "a descendant left running does not hold the lock after the run" "0" "$?"
+        [[ ! -s "$_straggler" ]] || kill -KILL "$(cat "$_straggler")" 2>/dev/null
+
+        _out="$(gate_lock_run "$scratch/lock/no-such-dir/gate.lock" 1 "$_refused" "$_unusable" \
+            sh -c ': > "$FASTCACHED_GATE_LOCK_RAN"' 2>&1)"
+        _rc=$?
+        expect "a lock that cannot be opened is unusable, not refused" "$_unusable" "$_rc"
+        expect "an unopenable lock prints no waiting line" "no" "$(_has "$_out" "$gate_lock_waiting_marker")"
+        expect "an unopenable lock names the unusable outcome" "yes" "$(_has "$_out" "$gate_lock_unusable_marker")"
+        _out="$(gate_lock_run "$_lk" soon "$_refused" "$_unusable" sh -c 'exit 0' 2>&1)"
+        _rc=$?
+        expect "a wait that is not a number is unusable" "$_unusable" "$_rc"
+
+        # The REAL lock path: this script, re-exec and marker and ancestor walk included,
+        # stopped at its seam once the lock stage has decided. Everything above drives
+        # `gate_lock_run` with stand-ins, and stand-ins passed while three one-line mutants
+        # of this path broke every real run. The wait is short so that a regression here
+        # REFUSES in seconds rather than hanging ctest for the whole default budget. Only the
+        # decisions are asserted, never the absence of other lines: run inside a real gate,
+        # that gate's own `flock` is an ancestor of these, which is a legitimate MISMATCH.
+        _gate_script="$repo_root/scripts/${BASH_SOURCE[0]##*/}"
+        _e2e="$scratch/lock/main-path.lock"
+        _stopped="$(gate_outcome_status no-gate-run)"
+        _gate_env() {
+            env -u FASTCACHED_GATE_LOCK_HELD -u FASTCACHED_GATE_LOCK_RAN -u FASTCACHED_GATE_LOCK_QUEUED_AT \
+                FASTCACHED_GATE_LOCK="$_e2e" FASTCACHED_GATE_LOCK_WAIT=2 FASTCACHED_GATE_STOP_AFTER_LOCK=1 "$@"
+        }
+        _out="$(_gate_env "$BASH" "$_gate_script" 2>&1)"
+        _rc=$?
+        expect "main path: a bare gate takes the lock and stops at the seam" "$_stopped" "$_rc"
+        expect "main path: a bare gate's re-exec holds the lock as the marker" "yes" \
+            "$(_has "$_out" "held for this run (taken by pid")"
+        _out="$(_gate_env flock -w 30 -E 111 "$_e2e" "$BASH" "$_gate_script" 2>&1)"
+        _rc=$?
+        expect "main path: under the old wrapper form the gate does not queue behind it" "$_stopped" "$_rc"
+        expect "main path: the old wrapper form is recognised" "yes" \
+            "$(_has "$_out" "already held by the calling wrapper's flock")"
+        _out="$(_gate_env flock -s "$_e2e" "$BASH" "$_gate_script" 2>&1)"
+        _rc=$?
+        expect "main path: a shared wrapper is refused at once" "$_unusable" "$_rc"
+        rm -f "$_ready"
+        ( trap - EXIT TERM INT HUP; exec flock -o "$_e2e" sh -c ': > "$1"; exec sleep 30' _ "$_ready" ) >/dev/null 2>&1 &
+        _holder=$!
+        _polls=0
+        while [[ ! -e "$_ready" && "$_polls" -lt 100 ]]; do
+            sleep 0.1
+            _polls=$((_polls + 1))
+        done
+        if [[ -e "$_ready" ]]; then
+            _out="$(_gate_env "$BASH" "$_gate_script" 2>&1)"
+            _rc=$?
+            expect "main path: a bare gate behind a held lock is refused" "$_refused" "$_rc"
+            expect "main path: a bare gate behind a held lock is observed waiting" "yes" \
+                "$(_has "$_out" "$gate_lock_waiting_marker")"
+        else
+            expect "the main-path holder took its lock within 100 polls of 0.1s requested" "ready" "never ready"
+        fi
+        pkill -TERM -P "$_holder" 2>/dev/null || kill -KILL "$_holder" 2>/dev/null
+        wait "$_holder" 2>/dev/null
+    else
+        self_test_skipped="${self_test_skipped:+$self_test_skipped, }the gate lock's contention half (no working flock here)"
+    fi
+
     # ... and no outcome may sit on the USAGE status, because `--classify=$LOG`
     # with an unset variable exits with it. A caller checking only the status would
     # read "you typed that wrong" as "the run was killed" -- two facts that are not
@@ -3107,6 +3821,96 @@ unresolved src/tests/CMakeLists.txt:288' 'alpha' 2 2)" == *"does not claim to ha
     # the log is the only place that difference is visible.
     echo "LOCAL GATE SELF-TEST PASSED (bash ${BASH_VERSION})${self_test_skipped:+ -- SKIPPED: $self_test_skipped}"
     exit 0
+fi
+
+# The host lock, and it comes BEFORE the start marker (#1379).
+#
+# Before the marker because the marker names the commit, and a queued gate may wait
+# hours: a lane that commits while its gate queues would otherwise get a verdict naming a
+# commit that was never measured. After `--classify` and `--self-test` because neither
+# touches the host -- and `--self-test` is the ctest entry `local-gate-selftest`, which
+# THIS gate runs, so a lock taken before that exit would make the gate queue behind
+# itself for the whole wait and then refuse.
+#
+# A wrapper that already holds this lock is detected rather than deadlocked against, which
+# is what keeps every existing `flock <path> bash scripts/local-gate.sh` working after this
+# lands. Without that, `flock` taking a SECOND descriptor on the path would block against
+# the wrapper's own descriptor for the whole wait.
+gate_lock_path="${FASTCACHED_GATE_LOCK:-${HOME:+$HOME/.fastcached-local-gate.lock}}"
+if [[ -z "$gate_lock_path" ]]; then
+    echo "$gate_lock_unusable_marker -- neither FASTCACHED_GATE_LOCK nor HOME is set, so there is no lock file to name."
+    exit "$(gate_outcome_status lock-unusable)"
+fi
+gate_lock_marker="${FASTCACHED_GATE_LOCK_HELD:-}"
+gate_lock_found="$(gate_lock_holder "$gate_lock_path" "$gate_lock_marker" "$(gate_lock_ancestors)")"
+gate_lock_word="${gate_lock_found%%|*}"
+gate_lock_rest="${gate_lock_found#*|}"
+gate_lock_holder_pid="${gate_lock_rest%%|*}"
+gate_lock_holder_path="${gate_lock_rest#*|}"
+case "$gate_lock_word" in
+    marker|marker-unverified)
+        [[ -z "${FASTCACHED_GATE_LOCK_RAN:-}" ]] || : > "$FASTCACHED_GATE_LOCK_RAN"
+        [[ "$gate_lock_word" == "marker" ]] || \
+            echo "== gate lock: this run's ancestry could not be read far enough to find pid $gate_lock_holder_pid, so FASTCACHED_GATE_LOCK_HELD is trusted without that check."
+        gate_lock_queued=""
+        case "${FASTCACHED_GATE_LOCK_QUEUED_AT:-}" in
+            ''|*[!0-9]*) ;;
+            *)
+                # By the wall clock, which steps here, so a negative reading is said to be
+                # unknown rather than printed as the shortest queue there could be.
+                gate_lock_queued=$(( $(date +%s) - FASTCACHED_GATE_LOCK_QUEUED_AT ))
+                if [[ "$gate_lock_queued" -ge 0 ]]; then
+                    gate_lock_queued=", after ~${gate_lock_queued}s queued by the wall clock"
+                else
+                    gate_lock_queued=", queued for an unknown time (the wall clock stepped back)"
+                fi
+                ;;
+        esac
+        unset FASTCACHED_GATE_LOCK_RAN FASTCACHED_GATE_LOCK_QUEUED_AT
+        echo "== gate lock $gate_lock_path held for this run (taken by pid $gate_lock_holder_pid${gate_lock_queued})"
+        ;;
+    wrapper)
+        echo "== gate lock $gate_lock_path already held by the calling wrapper's flock (pid $gate_lock_holder_pid), so it is not taken twice. The wrapper is redundant: run \`bash scripts/local-gate.sh\` bare."
+        ;;
+    nonexclusive)
+        echo "$gate_lock_unusable_marker -- the calling wrapper's flock (pid $gate_lock_holder_pid) holds $gate_lock_holder_path SHARED or unlocked, which excludes no other gate, and waiting for it exclusively would queue behind this gate's own wrapper. Run \`bash scripts/local-gate.sh\` bare."
+        exit "$(gate_outcome_status lock-unusable)"
+        ;;
+    foreign|free|unknown)
+        if [[ "$gate_lock_word" == "unknown" ]]; then
+            echo "== gate lock: this run's ancestry could not be read to its root, so a wrapper already holding $gate_lock_path cannot be seen. If this run then waits on its own wrapper, run the gate bare."
+        fi
+        [[ -z "$gate_lock_marker" ]] || \
+            echo "== gate lock: ignoring FASTCACHED_GATE_LOCK_HELD='$gate_lock_marker' -- that pid is not an ancestor of this run holding this lock, so it describes some other process."
+        if [[ "$gate_lock_word" == "foreign" ]]; then
+            echo "== GATE LOCK MISMATCH -- the calling wrapper's flock (pid $gate_lock_holder_pid) holds $gate_lock_holder_path, but this gate's lock is $gate_lock_path. That wrapper serialises this run against nothing that uses $gate_lock_path, so this gate takes $gate_lock_path as well."
+        fi
+        if ! command -v flock >/dev/null 2>&1; then
+            # Loud and not a refusal: a gate that refused on every host without util-linux
+            # would fail closed unconditionally there, which reads as "my branch is bad".
+            echo "== GATE LOCK UNAVAILABLE -- flock is not on PATH, so this run is NOT serialised against other gates on this host."
+        else
+            gate_lock_run "$gate_lock_path" "${FASTCACHED_GATE_LOCK_WAIT:-10800}" \
+                "$(gate_outcome_status lock-not-acquired)" "$(gate_outcome_status lock-unusable)" \
+                env "FASTCACHED_GATE_LOCK_HELD=$$:$gate_lock_path" "FASTCACHED_GATE_LOCK_QUEUED_AT=$(date +%s)" \
+                "$BASH" "$repo_root/scripts/${BASH_SOURCE[0]##*/}" ${1+"$@"}
+            exit $?
+        fi
+        ;;
+    *)
+        echo "$gate_lock_unusable_marker -- the holder check answered '$gate_lock_found', which this gate has no arm for."
+        exit "$(gate_outcome_status lock-unusable)"
+        ;;
+esac
+
+# The self-test's seam onto the REAL lock path. A self-test that drives `gate_lock_run`
+# with stand-in commands passes while the re-exec, the marker and the ancestor walk are all
+# broken -- three one-line mutants of this path each passed it and broke every real run --
+# so it runs this script and stops here. It exits with `no-gate-run`'s status, which is what
+# `--classify` says of the log it leaves, and it says plainly that nothing was checked.
+if [[ -n "${FASTCACHED_GATE_STOP_AFTER_LOCK:-}" ]]; then
+    echo "== GATE STOPPED AFTER THE LOCK STAGE -- FASTCACHED_GATE_STOP_AFTER_LOCK is set, so nothing about the tree was checked. This is the self-test's seam, not a way to run the gate."
+    exit "$(gate_outcome_status no-gate-run)"
 fi
 
 # The start marker, and it is the FIRST thing a real run does -- before the analyser

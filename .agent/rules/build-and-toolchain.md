@@ -682,9 +682,11 @@ determinism rests on.
     wipe left one gate's log where another's goes and it reported a failure that was
     already fixed. The pid is there because the cause is a name-matched kill, and the
     tree because that is the field such a kill does not look at.
-  - **The rule is a function, not prose**: `local-gate.sh --classify=<log>` answers
-    `passed` / `failed` / `did-not-conclude` / `no-gate-run`, each with an exit status
-    of its own, so the tooling around a run can tell. Pure -- log text in, one word out
+  - **The rule is a function, not prose**: `local-gate.sh --classify=<log>` answers one
+    word per row of the script's `gate_outcomes` table, each with an exit status of its
+    own, so the tooling around a run can tell. The rows are deliberately not listed here:
+    this sentence named four of them while the table held six, and a stale list reads as
+    complete. Pure -- log text in, one word out
     -- which is the standing answer above applied once more. `passed` and `failed` keep
     the gate's own `0` and `1`; `2` is skipped because it is the script's USAGE status,
     and `--classify=$LOG` with an unset `LOG` lands there -- a caller reading only the
@@ -1471,6 +1473,72 @@ invariably tested under. With N waiters it fails twice:
 already give: an `fcntl` lock is per PROCESS, so two gates inside one shell would both take
 it and succeed. It is not FIFO, so a lane can be unlucky; unlucky-and-bounded is not
 starving and cannot stampede, and it **must not be "improved" into a queue**.
+
+### And the gate takes the lock ITSELF, on ONE path it defines (#1379)
+
+Everything above was right, and satisfiable in a way that did nothing. `local-gate.sh` took
+no lock: serialisation lived in each session's wrapper, nothing in the repository named a
+path, and every lane invented one, so two lanes serialised only when their spellings happened
+to coincide. Measured: one lane's `flock` sat on a path no other lane used, three gates ran at
+once on one host, and that lane's lock acquired instantly every time. **A lock nobody else
+takes always acquires, which is indistinguishable from a free host — the lock's success WAS
+the symptom.** The queueing that lane did observe came from a separate hand-rolled wait loop,
+so the broken mechanism sat behind a working one where nothing could see it.
+
+So the lock is taken by the thing being serialised, and omission stops being possible:
+
+- **One path, defined once in the script** — `$HOME/.fastcached-local-gate.lock`, overridable
+  by `FASTCACHED_GATE_LOCK`. **Per user, and chosen rather than settled for.** A host-wide path
+  means `/tmp`, which WSL wipes when it idles out, and `flock` on a file unlinked while held
+  leaves the holder locking an orphaned inode while the next opener creates a fresh file and
+  acquires it: two holders, no error from either. That fails silently in exactly the direction
+  the lock exists to close, where the per-user limit is stated — in the lock's own output lines.
+  It does not cover CI, another machine, another user, or Git Bash against WSL on one Windows
+  box, whose `$HOME`s differ.
+- **After `--classify` and `--self-test`, and before the start marker.** `--self-test` is the
+  ctest entry `local-gate-selftest`, which the gate itself runs, so a lock taken before that
+  exit makes the gate queue behind itself for the whole wait. Before the marker, because the
+  marker names the commit, and a lane committing while its gate queues would otherwise get a
+  verdict naming a commit nobody measured.
+- **`flock -o`, never a descriptor the run keeps.** A descriptor is inherited by every
+  descendant, so a daemon an e2e fixture leaked would hold the gate lock for the life of the
+  machine and every later gate would queue for the whole budget and refuse. `-o` releases the
+  lock when the run ends. The price, MEASURED because the first version of this sentence got
+  it backwards: killing the waiting parent alone leaves `flock` and the run going with the
+  lock still held, while killing the **`flock` process** alone frees the lock under a run that
+  carries on, so a second gate starts beside it. Kill the process GROUP.
+- **A wrapper that already holds the lock is DETECTED rather than deadlocked against** — which
+  is what keeps every existing `flock <path> bash scripts/local-gate.sh` working, since a second
+  descriptor on the path would block against the wrapper's own. Two detectors, because neither
+  covers both cases: a marker the gate exports for its own re-exec, believed only when its pid
+  is an ANCESTOR, and a scan of the ancestors — never only the parent — for a `flock` naming the
+  same file. The marker is asked first, because the gate's own re-exec sits directly under a
+  `flock` naming that very lock and a single pass would call it a redundant wrapper. A wrapper
+  holding a **different** path is its own outcome, printed with both paths, and the gate takes
+  its own lock too: folded into *held* or *free*, a mistyped wrapper would be serialised against
+  nothing and told nothing. A wrapper holding THIS lock `-s` or `-u` excludes nobody and is
+  refused at once. The argv is read the way util-linux reads it — abbreviated long options,
+  `=` values, digits that are a FILE when a command follows — because a parser that disagrees
+  with flock's answers wrongly in both directions, silently one way and as a deadlock the other.
+  **What detection cannot see**: a lock held through a descriptor an ancestor opened, or by
+  `flock -F`, which becomes the gate rather than its parent. Neither leaves a `flock` above the
+  gate, so the gate waits on it and its refusal says so. And an ancestry that cannot be READ to
+  its root — no `/proc`, no `ps` — is reported as unknown, never as free: the parent pid comes
+  from `/proc/<pid>/stat` first precisely so that a host with util-linux and no procps does not
+  queue behind its own re-exec.
+- **`GATE NOT STARTED:` is an outcome, never a verdict** — `lock-not-acquired` when another gate
+  held the lock for the whole wait, `lock-unusable` when it could not be taken at all, each with
+  a status of its own and each read back by `--classify`. A queued run prints
+  `== GATE LOCK WAITING` first, so contention is observed rather than inferred from a long wall
+  time. The self-test proves it by CONTENTION — refused while held, acquired once released —
+  because a lock that acquires proves nothing, which is this whole section. **And it drives the
+  REAL path, not stand-ins**: the script itself, stopped by `FASTCACHED_GATE_STOP_AFTER_LOCK`
+  once the lock stage has decided. Its first version exercised `gate_lock_run` with `sh -c`
+  commands only, and a review showed three one-line mutants of the real path — the marker
+  exported under another name, the sentinel never touched, the ancestor walk returning nothing
+  — each passing it 208/208 while breaking every real run.
+- **A host without `flock` is told so and runs UNSERIALISED**, loudly. Refusing there would be a
+  gate that fails closed unconditionally on that host, which reads as *my branch is bad*.
 
 ## A count that OVERSTATES what is wrong is the same defect as one that understates it
 
