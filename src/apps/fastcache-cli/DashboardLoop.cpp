@@ -84,7 +84,7 @@ namespace
     /// @param model What is known; its frame count advances.
     void PresentFrame(IDashboardView& view, IFrameSink& sink, DashboardModel& model)
     {
-        sink.Present(view.Frame(model));
+        sink.PresentPlaced(view.PlacedFrame(model));
         ++model.frames;
     }
 
@@ -291,6 +291,7 @@ Task<DashboardExit> RunDashboard(
             case DashboardEventKind::Resize:
                 exit.model.columns = event.columns;
                 exit.model.rows = event.rows;
+                exit.model.cellPixels = event.cellPixels;
                 break;
 
             case DashboardEventKind::Detached:

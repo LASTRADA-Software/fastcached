@@ -39,7 +39,14 @@ class CollectingSink final: public IFrameSink
         frames.emplace_back(frame);
     }
 
-    std::vector<std::string> frames {};
+    void PresentPlaced(DashboardFrame const& frame) override
+    {
+        placements.push_back(frame.placements);
+        Present(frame.text);
+    }
+
+    std::vector<std::string> frames {};                     ///< Each frame's text.
+    std::vector<std::vector<FramePlacement>> placements {}; ///< Each frame's images, index for index with `frames`.
 };
 
 /// Run the dashboard once, writing the result where the caller can read it.

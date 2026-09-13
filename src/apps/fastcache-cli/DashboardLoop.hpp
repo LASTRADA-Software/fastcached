@@ -4,6 +4,7 @@
 #include "CliAnswer.hpp"
 #include "CliValue.hpp"
 #include "DashboardEvent.hpp"
+#include "DashboardFrame.hpp"
 
 #include <FastCache/Async/Task.hpp>
 #include <FastCache/Core/Clock.hpp>
@@ -132,6 +133,12 @@ struct DashboardModel
     /// The terminal geometry, as last reported. Zero until a `Resize` says.
     int columns { 0 };
     int rows { 0 };
+
+    /// How many pixels a cell measures, as the last `Resize` reported it; nullopt until one says.
+    ///
+    /// Replaced by every `Resize`, never kept from an earlier one: a resize that carried no cell size
+    /// leaves no size to draw an image from, rather than the size of a grid that is gone.
+    std::optional<CellPixelSize> cellPixels {};
 
     /// How many readings have been accepted.
     std::size_t samples { 0 };
@@ -292,6 +299,18 @@ class IFrameSink
     /// Show one frame.
     /// @param frame The bytes to present.
     virtual void Present(std::string_view frame) = 0;
+
+    /// Show one frame with the images placed over it.
+    ///
+    /// **The loop's one door into a sink.** The default presents the text alone, which is right for
+    /// every sink that cannot draw an image -- a pipe, a test collecting text -- because a view places
+    /// an image only over cells it left blank. A terminal presenter that can draw one overrides this.
+    /// A different NAME from `Present`, not an overload: an override of one overload hides the other.
+    /// @param frame The frame.
+    virtual void PresentPlaced(DashboardFrame const& frame)
+    {
+        Present(frame.text);
+    }
 };
 
 /// Turns the model into one frame.
@@ -315,6 +334,18 @@ class IDashboardView
     /// @param model What is known right now.
     /// @return The frame's bytes.
     [[nodiscard]] virtual std::string Frame(DashboardModel const& model) = 0;
+
+    /// Draw the model with any images placed over it.
+    ///
+    /// **What the loop calls.** The default is `Frame` with no images, which is every view that draws
+    /// none; a view that places images overrides this and makes `Frame` its text. A different NAME,
+    /// not an overload, for `PresentPlaced`'s reason.
+    /// @param model What is known right now.
+    /// @return The frame.
+    [[nodiscard]] virtual DashboardFrame PlacedFrame(DashboardModel const& model)
+    {
+        return DashboardFrame { .text = Frame(model), .placements = {} };
+    }
 };
 
 /// What bounds the run.
