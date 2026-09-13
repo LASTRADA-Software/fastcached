@@ -651,8 +651,12 @@ TEST_CASE("an interactive live-stats fleet session draws the fleet panel, and it
     CHECK_FALSE(admin.Asked().empty());
     auto const& presented = composition.terminals.Presented();
     CHECK(presented.frames > 0);
-    // The panel's title beside the endpoint, as its top edge draws them: never the source line's `fleet.txt`.
-    CHECK(presented.last.contains(std::format("{}  10.0.0.4:6674", FleetPanel().title)));
+    // The panel's title, and the endpoint named as the leader's once a reading came from it.
+    CHECK(presented.last.contains(std::format(" {} ", FleetPanel().title)));
+    CHECK(presented.last.contains("leader 10.0.0.4:6674"));
+    // The source line names what was fetched and where the surface said it answered, through the whole
+    // composition: the source's fetch, the reader and the panel.
+    CHECK(presented.last.contains(std::format("/fleet.txt at {} (leader)", ScriptedDocument::ScriptedAdminAddress)));
     CHECK(presented.last.contains(Distributed::FleetKpiKeys().front()));
     // The fleet chart's image, placed in the frame and handed to the terminal's presenter.
     REQUIRE(presented.placements.size() == 1);
@@ -1411,6 +1415,12 @@ class CountingAdmin final: public IAdminDocument
     {
         ++_fetches;
         return std::unexpected(AdminError { .kind = AdminFailure::Unreachable, .detail = "not scripted" });
+    }
+
+    /// @return Nothing: this surface never resolves.
+    [[nodiscard]] std::string AdminAddress() override
+    {
+        return {};
     }
 
     /// @return How many documents were asked for.

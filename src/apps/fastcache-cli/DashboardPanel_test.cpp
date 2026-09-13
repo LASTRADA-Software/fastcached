@@ -1660,3 +1660,214 @@ TEST_CASE("the active fleet section's tab is one Selected run over exactly its b
         CHECK(sink.frames[index].contains(tab));
     }
 }
+
+namespace
+{
+
+/// The admin address the chrome fixtures' cache readings answered at.
+constexpr std::string_view ChromeAdmin = "127.0.0.1:9464";
+
+/// @p frame's top edge.
+/// @param frame The frame.
+/// @return Its first line.
+[[nodiscard]] std::string TopEdge(std::string_view frame)
+{
+    return Lines(frame).front();
+}
+
+/// @p frame's source line, or nullopt without one.
+/// @param frame The frame.
+/// @return The line.
+[[nodiscard]] std::optional<std::string> SourceRow(std::string_view frame)
+{
+    constexpr std::string_view Label = "source  ";
+    for (auto const& line: Lines(frame))
+        if (Columns(line, LabelFrom, FakeCellWidth(Label)) == Label)
+            return line;
+    return std::nullopt;
+}
+
+/// How a top edge starts on the Unicode rung: the corner, one edge glyph, then @p left padded.
+/// @param left The left half.
+/// @return The start.
+[[nodiscard]] std::string TopStart(std::string_view left)
+{
+    auto const& glyphs = GlyphsFor(RenderRung::Unicode);
+    return std::format("{}{} {} {}", glyphs.topLeft, glyphs.horizontal, left, glyphs.horizontal);
+}
+
+/// How a top edge ends on the Unicode rung: an edge glyph, @p right padded, an edge glyph, the corner.
+/// @param right The right half.
+/// @return The end.
+[[nodiscard]] std::string TopEnd(std::string_view right)
+{
+    auto const& glyphs = GlyphsFor(RenderRung::Unicode);
+    return std::format("{} {} {}{}", glyphs.horizontal, right, glyphs.horizontal, glyphs.topRight);
+}
+
+/// A cache reading carrying what §3's title bar states: a version, and an uptime of `6d04:12`.
+/// @return The event.
+[[nodiscard]] DashboardEvent CacheChromeSample()
+{
+    constexpr auto Uptime = std::uint64_t { (6 * 24 * 60 * 60) + (4 * 60 * 60) + (12 * 60) };
+    auto sample = SampleOf(CacheSeries(1, { "memory" }), 1);
+    auto& attempt = sample.attempts.front();
+    auto fields = Unwrap(attempt.record).fields;
+    fields.push_back(Field { .name = std::string { CacheUptimeField }, .value = NumberCell(Uptime) });
+    fields.push_back(Field { .name = std::string { CacheVersionField }, .value = TextCell("0.4.1") });
+    attempt.record = RecordValue(std::move(fields));
+    attempt.where = std::string { ChromeAdmin };
+    return sample;
+}
+
+/// The frames a cache panel asking `127.0.0.1:6379` every two seconds draws for @p script, @p columns wide.
+/// @param script The events after the resize.
+/// @param columns The terminal's width.
+/// @return The frames.
+[[nodiscard]] std::vector<std::string> CacheChromeFrames(std::vector<DashboardEvent> script, int columns)
+{
+    script.insert(script.begin(), DashboardEvent { .kind = DashboardEventKind::Resize, .columns = columns, .rows = 40 });
+    auto view = PanelView { CachePanel(),
+                            PanelContext { .absent = std::string { Absent },
+                                           .endpoint = "127.0.0.1:6379",
+                                           .interval = 2s,
+                                           .cellWidth = &FakeCellWidth,
+                                           .rung = RenderRung::Unicode } };
+    auto sink = CollectingSink {};
+    (void) Drive(std::move(script), DashboardLimits {}, view, sink);
+    return sink.frames;
+}
+
+} // namespace
+
+TEST_CASE("a cache panel's title bar reads as section 3 draws it, its facts ending at the corner",
+          "[cli][dashboard][panel][chrome]")
+{
+    // §3: `fastcached 0.4.1 ───── 127.0.0.1:6379  up 6d04:12  every 2s  q quit ─┐`. WHAT DISTINGUISHES: the
+    // facts END at the corner, which the same words drawn left-aligned do not; the version is beside the
+    // subject rather than among the facts; and the uptime is days, then hours and minutes.
+    auto const frames = CacheChromeFrames({ CacheChromeSample(), Tick }, 80);
+    REQUIRE(frames.size() == 1);
+    auto const top = TopEdge(frames.front());
+    CHECK(FakeCellWidth(top) == 80);
+    CHECK(top.starts_with(TopStart("fastcached 0.4.1")));
+    CHECK(top.ends_with(TopEnd("127.0.0.1:6379  up 6d04:12  every 2s  q quit")));
+}
+
+TEST_CASE("a cache panel's source line names the source, what was asked and where, and counts at the edge",
+          "[cli][dashboard][panel][chrome]")
+{
+    // §3: `source  metrics (/metrics at 127.0.0.1:9464)     148 samples, 1 gap`. WHAT DISTINGUISHES: the
+    // route and the address are the ANSWERING attempt's, and the counts end one blank column before the
+    // right edge rather than trailing the source.
+    auto const frames = CacheChromeFrames({ CacheChromeSample(), Tick }, 80);
+    REQUIRE(frames.size() == 1);
+    auto const row = SourceRow(frames.front());
+    REQUIRE(row.has_value());
+    CHECK(Columns(Unwrap(row), 1, 80).starts_with(std::format("  source  metrics (/metrics at {})   ", ChromeAdmin)));
+    CHECK(Unwrap(row).ends_with(std::format("1 samples, 0 gaps {}", GlyphsFor(RenderRung::Unicode).vertical)));
+}
+
+TEST_CASE("before its first reading a title bar and source line name each absent fact by the marker",
+          "[cli][dashboard][panel][chrome]")
+{
+    // A fact with no reading keeps its place and reads as the marker, never a missing word: `up n/a`, not a
+    // title bar that silently lost its uptime.
+    auto const frames = CacheChromeFrames({ Tick }, 80);
+    REQUIRE(frames.size() == 1);
+    auto const top = TopEdge(frames.front());
+    CHECK(top.starts_with(TopStart(std::format("fastcached {}", Absent))));
+    CHECK(top.ends_with(TopEnd(std::format("127.0.0.1:6379  up {}  every 2s  q quit", Absent))));
+    auto const row = SourceRow(frames.front());
+    REQUIRE(row.has_value());
+    CHECK(Trimmed(Columns(Unwrap(row), 1, 40)) == std::format("source  {}", Absent));
+}
+
+TEST_CASE("a narrow title bar drops its facts by priority, and never the subject", "[cli][dashboard][panel][chrome]")
+{
+    // WHAT DISTINGUISHES: the version is drawn LEFT of the endpoint and still goes first, because the
+    // endpoint's row outranks it -- a title cut from the right would keep the version and lose the address.
+    auto const at = [](int columns) {
+        auto const frames = CacheChromeFrames({ CacheChromeSample(), Tick }, columns);
+        REQUIRE(frames.size() == 1);
+        return TopEdge(frames.front());
+    };
+    auto const wide = at(56);
+    CHECK(wide.ends_with(TopEnd("127.0.0.1:6379  up 6d04:12")));
+    CHECK_FALSE(wide.contains("every"));
+    CHECK_FALSE(wide.contains(" q quit"));
+
+    auto const narrow = at(40);
+    CHECK(FakeCellWidth(narrow) == 40);
+    CHECK(narrow.starts_with(TopStart("fastcached")));
+    CHECK(narrow.ends_with(TopEnd("127.0.0.1:6379")));
+    CHECK_FALSE(narrow.contains("0.4.1"));
+}
+
+TEST_CASE("a node panel's title bar and source line read as section 4 draws them", "[cli][dashboard][panel][chrome]")
+{
+    // §4: `fastcache-compile-node 0.4.1 ───── build-07:7070  up 2d11:48  every 2s  q ─┐` and
+    // `source  metrics (/metrics at build-07:9464)`. The version and the uptime come from the node's own
+    // status, which its stats record does not carry.
+    auto sample = SampleOf({ { "fastcache_node_logical_cores", 32 } }, 1);
+    sample.attempts.front().where = "build-07:9464";
+    auto status = CompileCacheWire::NodeStatusFields {};
+    status.version = "0.4.1";
+    status.uptimeSeconds = (2 * 24 * 60 * 60) + (11 * 60 * 60) + (48 * 60);
+    sample.nodeStatus = std::move(status);
+
+    auto view = PanelView { NodePanel(),
+                            PanelContext { .absent = std::string { Absent },
+                                           .endpoint = "build-07:7070",
+                                           .interval = 2s,
+                                           .cellWidth = &FakeCellWidth,
+                                           .rung = RenderRung::Unicode } };
+    auto sink = CollectingSink {};
+    (void) Drive(
+        { DashboardEvent { .kind = DashboardEventKind::Resize, .columns = 80, .rows = 40 }, std::move(sample), Tick },
+        DashboardLimits {},
+        view,
+        sink);
+    REQUIRE(sink.frames.size() == 1);
+    auto const top = TopEdge(sink.frames.front());
+    CHECK(top.starts_with(TopStart("fastcache-compile-node 0.4.1")));
+    CHECK(top.ends_with(TopEnd("build-07:7070  up 2d11:48  every 2s  q")));
+    auto const row = SourceRow(sink.frames.front());
+    REQUIRE(row.has_value());
+    CHECK(Columns(Unwrap(row), 1, 80).starts_with("  source  metrics (/metrics at build-07:9464)   "));
+}
+
+TEST_CASE("a fleet panel's title bar names the leader once it answered as one, and its source line says so",
+          "[cli][dashboard][panel][chrome][fleet]")
+{
+    // §5: `fleet ───── leader build-01:7071  12 machines  every 5s  q ─┐` and
+    // `source  /fleet.txt at build-01:9464 (leader)`. WHAT DISTINGUISHES: before a reading the address is
+    // not called the leader's -- nothing has shown it to be one -- and the machine count is the marker.
+    auto sample = FleetSampleOf(1, FleetText(FleetMachines));
+    sample.documentWhere = "10.0.0.4:9464";
+    auto view = PanelView { FleetPanel(),
+                            PanelContext { .absent = std::string { Absent },
+                                           .endpoint = "10.0.0.4:6674",
+                                           .interval = 5s,
+                                           .cellWidth = &FakeCellWidth,
+                                           .rung = RenderRung::Unicode } };
+    auto sink = CollectingSink {};
+    (void) Drive(
+        { DashboardEvent { .kind = DashboardEventKind::Resize, .columns = 80, .rows = 40 }, Tick, std::move(sample), Tick },
+        DashboardLimits {},
+        view,
+        sink,
+        &ReadFleetSample);
+    REQUIRE(sink.frames.size() == 2);
+
+    auto const before = TopEdge(sink.frames[0]);
+    CHECK(before.ends_with(TopEnd(std::format("10.0.0.4:6674  {} machines  every 5s  q", Absent))));
+    CHECK_FALSE(before.contains("leader"));
+
+    auto const after = TopEdge(sink.frames[1]);
+    CHECK(after.starts_with(TopStart("fleet")));
+    CHECK(after.ends_with(TopEnd(std::format("leader 10.0.0.4:6674  {} machines  every 5s  q", FleetMachines))));
+    auto const row = SourceRow(sink.frames[1]);
+    REQUIRE(row.has_value());
+    CHECK(Columns(Unwrap(row), 1, 80).starts_with("  source  /fleet.txt at 10.0.0.4:9464 (leader)   "));
+}

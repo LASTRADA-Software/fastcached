@@ -205,6 +205,44 @@ struct DocumentSpec
     Priority chartPriority { Priority::Low };       ///< When the Sixel chart goes, for height.
 };
 
+/// A fact a panel's title bar states about its session rather than its content (#134 §3-§5).
+///
+/// TRANSMITTED/PERSISTED: no. Private; enumerators may be inserted.
+///
+/// **One vocabulary for every panel's chrome**, each rendered by one row of `ChromeFactTable` from
+/// what the frame already knows. A panel does not write its title bar: it lists the facts it states,
+/// in reading order and with a drop priority, and the frame lays them out. A fact whose reading is
+/// not known renders its absent marker BY NAME (`up -`), so a title bar never loses a slot silently.
+enum class ChromeFact : std::uint8_t
+{
+    Version,  ///< The endpoint's version, beside the subject.
+    Endpoint, ///< The address the session asks.
+    Leader,   ///< `leader <addr>`: the address, stated as the leader's once a reading came from it.
+    Uptime,   ///< `up <d>d<hh>:<mm>`: how long the endpoint has served.
+    Machines, ///< `<N> machines`: the rows of the fleet document's machines section.
+    Interval, ///< `every <N>s`: the sampling interval.
+    Quit,     ///< `q`.
+    QuitWord, ///< `q quit`.
+    Last,
+};
+
+/// Which side of a title bar a fact is drawn on.
+///
+/// TRANSMITTED/PERSISTED: no. Private; enumerators may be inserted.
+enum class TitleSide : std::uint8_t
+{
+    Subject, ///< After the subject, on the left: a version.
+    Right,   ///< Right-aligned, in reading order.
+};
+
+/// One fact a panel's title bar states.
+struct TitleFactRow
+{
+    ChromeFact fact { ChromeFact::Endpoint }; ///< What it says.
+    TitleSide side { TitleSide::Right };      ///< Where it is drawn.
+    Priority priority { Priority::Normal };   ///< When it is dropped for width; the subject itself never is.
+};
+
 /// A whole panel.
 ///
 /// **A table that does not fit vertically ends in `+N more`** rather than losing rows silently: it
@@ -220,7 +258,22 @@ struct PanelSpec
     Priority tierNotePriority { Priority::Low }; ///< When the tier note lines go.
     Priority sourcePriority { Priority::High };  ///< When the source line goes.
     std::optional<DocumentSpec> document {};     ///< The fleet document block; nullopt for a panel without one.
+    std::span<TitleFactRow const> titleFacts {}; ///< What the title bar states beside `title`, in reading order.
 };
+
+/// How long an endpoint has served, as a title bar states it: `2d11:48`.
+///
+/// Days and then hours and minutes, always all three, so the width holds still from one frame to the
+/// next and a restart reads as the number going back to `0d00:00` rather than as a change of format.
+/// @param seconds The uptime.
+/// @return The text, without the `up` a title bar puts in front of it.
+[[nodiscard]] std::string UptimeText(std::uint64_t seconds);
+
+/// The `INFO` field a cache states its version in, which a title bar reads beside the subject.
+inline constexpr std::string_view CacheVersionField = "fastcached_version";
+
+/// The `/metrics` series a cache states how long it has served in.
+inline constexpr std::string_view CacheUptimeField = "fastcached_uptime_seconds";
 
 /// A terminal size, in cells.
 struct PanelSize
