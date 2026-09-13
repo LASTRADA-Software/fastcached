@@ -5187,18 +5187,14 @@ sequential pair of writes and requires the acceptance marker before it double-ar
   *the check is broken*, and it will not be: a red gate reads as "my branch is bad"
   rather than as an instrument asking a question nobody has answered yet.
 
-- **[#1351](https://github.com/LASTRADA-Software/fastcached/issues/1351)** —
-  `fastcache-compile-node`'s `main()` measures **exactly 60** against
-  `readability-function-cognitive-complexity.Threshold` of 60, and `WarningsAsErrors` is
-  `"*"`, so the next change that adds one point to it fails the build. **The cost lands on
-  the wrong person**: `main` did not arrive at 60 in one change, and every contributor who
-  spent margin saw a passing build, so whoever adds three lines to a startup sequence pays
-  the whole extraction. It has already distorted one change — #1298's complexity
-  extractions could not be a separate commit, because the feature commit without them does
-  not build, so a zero-margin threshold propagates into commit STRUCTURE and not only into
-  code. `WorkerBody` sits at 59 on the same ceiling, which makes it a property of the file
-  rather than a coincidence of two changes. Not a request to raise the threshold: the cost
-  is the subject and the ceiling is only how it becomes visible. What is missing first is a
-  REPRODUCTION — nobody has watched it fire, so "the next change fails" is inferred from
-  the threshold semantics plus `WarningsAsErrors` rather than observed, and a guard nobody
-  has watched refuse is not known to work.
+- **[#1387](https://github.com/LASTRADA-Software/fastcached/issues/1387)** —
+  `fastcache-compile-node`'s `WorkerBody` measures **59** against
+  `readability-function-cognitive-complexity.Threshold` of 60 under `WarningsAsErrors: "*"`,
+  so the next change adding one point to the worker's startup fails the build — and **the cost
+  lands on the wrong person**, since every contributor who spent the margin saw a passing
+  build. #1351 closed the same hazard for `main` (60 to 37, by making seven early-exit verbs a
+  table) and deliberately left `WorkerBody` untouched, recording it unchanged so the headroom
+  was visibly not bought by moving work sideways. Measured on `b5ff67f1` with the tool BUILD
+  named in the ticket. Not a request to raise the threshold: the threshold is global and cannot
+  hold a per-function margin, so a comment claiming one is maintained is worse than the bare
+  number.
