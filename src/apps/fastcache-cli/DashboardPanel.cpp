@@ -617,12 +617,8 @@ namespace
         return items;
     }
 
-    /// The tier table: a heading and one row per tier the newest reading carries, or nothing.
-    ///
-    /// **A tier the cache does not run contributes no row** (§9.5) -- not a row of absent markers,
-    /// which would claim the tier exists and reported nothing. Presence is asked of the NEWEST
-    /// reading's first column, the same series the daemon omits entirely for a tier it lacks.
-    /// Columns are dropped for width from the heading, and every row keeps the same ones.
+    /// The tier table: a heading and one row per tier the newest reading carries (`TiersIn`), or
+    /// nothing. Columns are dropped for width from the heading, and every row keeps the same ones.
     /// @param in The frame's inputs.
     /// @param spec The panel.
     /// @param budget The content width.
@@ -636,14 +632,7 @@ namespace
         if (spec.tierColumns.empty() || !in.origin.has_value() || !in.model->latest.has_value())
             return items;
 
-        auto const& presence = spec.tierColumns.front().figure;
-        auto tiers = std::vector<std::string_view> {};
-        for (auto const& tier: StorageTierTable)
-        {
-            auto const name = NameIn(presence.field, *in.origin);
-            if (!name.empty() && FindField(*in.model->latest, TierSeriesName(name, tier.name)) != nullptr)
-                tiers.push_back(tier.name);
-        }
+        auto const tiers = TiersIn(spec, *in.model->latest, *in.origin);
         if (tiers.empty())
             return items;
 
@@ -1021,6 +1010,25 @@ namespace
 std::string_view NameIn(FieldNames const& names, StatsOrigin origin) noexcept
 {
     return names.*(OriginFieldTable[static_cast<std::size_t>(origin)].name);
+}
+
+std::string TierFigureKey(std::string_view tier, std::string_view column)
+{
+    return std::format("{}{}{}", tier, TierKeySeparator, column);
+}
+
+std::vector<std::string_view> TiersIn(PanelSpec const& spec, Value const& reading, StatsOrigin origin)
+{
+    auto tiers = std::vector<std::string_view> {};
+    if (spec.tierColumns.empty())
+        return tiers;
+    auto const name = NameIn(spec.tierColumns.front().figure.field, origin);
+    if (name.empty())
+        return tiers;
+    for (auto const& tier: StorageTierTable)
+        if (FindField(reading, TierSeriesName(name, tier.name)) != nullptr)
+            tiers.push_back(tier.name);
+    return tiers;
 }
 
 std::string TierSeriesName(std::string_view base, std::string_view tier)

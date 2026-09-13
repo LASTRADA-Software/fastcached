@@ -81,12 +81,16 @@ namespace
     /// @param figure The figure.
     /// @param model What is known.
     /// @param origin The newest reading's source.
+    /// @param tier A tier's name for a tier column's figure, or empty.
     /// @return The value, or absent.
-    [[nodiscard]] Cell NewestCell(FigureSpec const& figure, DashboardModel const& model, std::optional<StatsOrigin> origin)
+    [[nodiscard]] Cell NewestCell(FigureSpec const& figure,
+                                  DashboardModel const& model,
+                                  std::optional<StatsOrigin> origin,
+                                  std::string_view tier = {})
     {
         if (!origin.has_value() || model.history.empty())
             return AbsentCell();
-        auto const series = FigureSeries(model.history, figure, *origin, {});
+        auto const series = FigureSeries(model.history, figure, *origin, tier);
         return series.empty() || !series.back().has_value() ? AbsentCell() : RawFigureCell(*series.back(), figure.format);
     }
 
@@ -121,6 +125,11 @@ Value PanelFigures(PanelSpec const& panel, DashboardModel const& model)
         if (row.limit.has_value())
             fields.push_back(Field { .name = std::string { row.limitKey }, .value = NewestCell(*row.limit, model, origin) });
     }
+    if (origin.has_value() && model.latest.has_value())
+        for (auto const tier: TiersIn(panel, *model.latest, *origin))
+            for (auto const& column: panel.tierColumns)
+                fields.push_back(Field { .name = TierFigureKey(tier, column.key),
+                                         .value = NewestCell(column.figure, model, origin, tier) });
     return RecordValue(std::move(fields));
 }
 
