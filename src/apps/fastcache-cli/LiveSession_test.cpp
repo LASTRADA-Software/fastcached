@@ -11,6 +11,7 @@
 #include <FastCache/Async/ThreadPoolExecutor.hpp>
 #include <FastCache/Core/BoundedDrain.hpp>
 #include <FastCache/Core/Clock.hpp>
+#include <FastCache/Distributed/FleetView.hpp>
 #include <FastCache/Platform/StopSignal.hpp>
 
 #include <catch2/catch_test_macros.hpp>
@@ -809,8 +810,7 @@ TEST_CASE("the standard views draw the piped rung, and each subject's own panel 
 
     CHECK(views.For(RenderRung::Piped, cache, "10.0.0.4:6674") != nullptr);
     CHECK(views.For(RenderRung::Piped, node, "10.0.0.4:6674") != nullptr);
-    // Nothing to stream for the fleet yet: refused by name, never streamed as some other record.
-    CHECK(views.For(RenderRung::Piped, fleet, "10.0.0.4:6674") == nullptr);
+    CHECK(views.For(RenderRung::Piped, fleet, "10.0.0.4:6674") != nullptr);
 
     // Which panel, told apart by its title, and the frame names where and how often it samples.
     auto const model = DashboardModel {};
@@ -1724,27 +1724,34 @@ TEST_CASE("a live-stats session with no stats source is refused before anything 
     CHECK_FALSE(seat.source.has_value());
 }
 
-TEST_CASE("a live-stats fleet session is refused by name while fleet sessions cannot sample", "[cli][live][session][seat]")
+TEST_CASE("a piped live-stats fleet session streams the leader's KPI strip, one row per whole document",
+          "[cli][live][session][seat][fleet]")
 {
     auto seat = RunningSeat { RenderOptions { .format = OutputFormat::Tsv }, false };
     auto identity = ScriptedIdentity { EndpointIdentity {
         .kind = RemoteKind::CompileNode, .detail = "10.0.0.4:6674 is a fastcache-compile-node", .unreadable = false } };
     auto const operands = std::vector<std::string> { "fleet" };
-    auto admin = CountingAdmin {};
+    auto leader = Distributed::FleetSnapshot {};
+    leader.role = Distributed::SchedulerRole::Leader;
+    auto admin = ScriptedDocument { Distributed::RenderFleetText(leader, Distributed::FleetHistoryView {}, std::nullopt) };
 
-    // At fleet's own default, which the cache floor the other cases use is below. No stats
-    // ladder: a fleet session never reads one, so its absence must not be what refuses it.
-    auto context = SessionContext(operands, 1, &identity, nullptr);
-    context.options.interval = std::nullopt;
+    // At fleet's own floor, so two samples cost two seconds. No stats ladder: a fleet session never
+    // reads one, so its absence must not be what refuses it.
+    auto context = SessionContext(operands, 2, &identity, nullptr);
+    context.options.interval = LiveSubjectTable[static_cast<std::size_t>(LiveSubject::Fleet)].minInterval;
     context.admin = &admin;
 
     auto const ending = seat.Run(context);
 
-    CHECK(ending.kind == SessionEndKind::Refused);
-    CHECK(ending.answer.outcome == Outcome::Local);
-    CHECK(AdvisoryText(ending.answer).contains("live-stats fleet"));
-    CHECK(admin.Fetches() == 0);
-    CHECK_FALSE(seat.source.has_value());
+    CHECK(ending.kind == SessionEndKind::Ran);
+    CHECK(ending.answer.outcome == Outcome::Affirmative);
+    // The whole document, once per sample: never a section at a time.
+    CHECK(admin.Asked() == std::vector<std::string>(2, "/fleet.txt"));
+    // The header and two rows, the header naming the strip's figures after the source.
+    auto const stream = seat.Stream();
+    CHECK(std::ranges::count(stream, '\n') == 3);
+    CHECK(stream.starts_with(std::format("source\t{}\t", Distributed::FleetKpiKeys().front())));
+    CHECK(stream.contains("\nfleet.txt\t"));
 }
 
 TEST_CASE("a live-stats fleet session with no admin surface is refused as usage before anything is composed",
