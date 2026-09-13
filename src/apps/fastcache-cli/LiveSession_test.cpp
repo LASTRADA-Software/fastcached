@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "LiveSession.hpp"
 #include "LiveSourceRig.hpp"
+#include "ScriptedCellWidth.hpp"
 #include "ScriptedDashboardEvents.hpp"
 #include "TerminalCapabilities.hpp"
 
@@ -596,7 +597,7 @@ TEST_CASE("a resize reaches the next frame an interactive session draws", "[cli]
 TEST_CASE("the standard views draw the piped rung, and each subject's own panel on an interactive one",
           "[cli][live][session]")
 {
-    auto views = StandardRungViews { RenderOptions { .format = OutputFormat::Human }, &LatestReading };
+    auto views = StandardRungViews { RenderOptions { .format = OutputFormat::Human }, &LatestReading, &FakeCellWidth };
     auto const cache = LivePlan { .subject = LiveSubject::Cache,
                                   .interval = std::chrono::milliseconds { 2000 },
                                   .samples = 0,
@@ -1057,7 +1058,7 @@ struct RunningSeat
     ScriptedInstaller stops { reactor, "" };
     StopOnDemandInstaller onDemand { reactor };
     ScriptedAcquisition terminals { reactor, std::unexpected(std::string { "stdin is not a terminal" }), false };
-    StandardRungViews views { render, &LatestReading };
+    StandardRungViews views { render, &LatestReading, &FakeCellWidth };
     ThreadDrainWait drainWait;
     ScriptedGatherer gatherer { Reading() };
     GatedGatherer gated { &onDemand };

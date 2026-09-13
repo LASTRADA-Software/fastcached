@@ -63,6 +63,16 @@ else()
     list(APPEND _fc_cli_sources SixelEncoderUnavailable.cpp)
 endif()
 
+# How many cells text takes on a terminal is the vendored `tui::stringWidth`, reached through
+# `TerminalCellWidth.cpp` alone. A build without the library has no terminal session to lay a frame
+# out for, so its twin measures nothing: it names the build and ends the process.
+if(TARGET fastcache-tui)
+    list(APPEND _fc_cli_sources TerminalCellWidth.cpp)
+    list(APPEND _fc_cli_tui_tests TerminalCellWidth_test.cpp)
+else()
+    list(APPEND _fc_cli_sources TerminalCellWidthUnavailable.cpp)
+endif()
+
 add_executable(fastcache-cli main.cpp ${_fc_cli_sources})
 target_include_directories(fastcache-cli PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 target_link_libraries(fastcache-cli PRIVATE FastCache)
