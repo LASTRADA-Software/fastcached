@@ -6,6 +6,7 @@
 #include "FleetChartModel.hpp"
 #include "FleetDocument.hpp"
 #include "FleetReading.hpp"
+#include "LivePipedView.hpp"
 #include "ScriptedCellWidth.hpp"
 #include "ScriptedSixelEncoder.hpp"
 #include "StatsSource.hpp"
@@ -1146,11 +1147,147 @@ TEST_CASE("a fleet panel drawn after a failed sample shows no table from before 
     CHECK(AfterWord(frames[1], Distributed::FleetKpiKeys().front()).value_or("").starts_with(Absent));
 }
 
+namespace
+{
+
+/// A leading snapshot with one machine whose memory and CPU figures the unit cases read, rendered by
+/// the leader's own renderer: the document a real leader sends, not one written by hand.
+/// @return The `/fleet.txt` body.
+[[nodiscard]] std::string OneMachineFleetText()
+{
+    auto snapshot = Distributed::FleetSnapshot {};
+    snapshot.role = Distributed::SchedulerRole::Leader;
+    auto machine = Distributed::NodeReport {};
+    machine.endpoint = "build-01:7070";
+    machine.fingerprints = { "gcc-13-abcdef" };
+    machine.capacity.logicalCores = 32;
+    machine.capacity.totalMemoryBytes = 100552671232ULL;
+    // `memory-available` and `scratch-free` are left unsaid, so they arrive absent.
+    machine.load.cpuBusyPermille = 715;
+    snapshot.nodes = { machine };
+    return RenderFleetText(snapshot, Distributed::FleetHistoryView {}, std::nullopt);
+}
+
+/// The cell under @p heading in the row of @p frame whose first cell starts with @p rowStart, trimmed.
+///
+/// Every column after the first aligns on its last cell, so a cell ends where its heading does, and it
+/// starts after the two-space gap before it.
+/// @param frame The frame.
+/// @param heading The column's heading.
+/// @param rowStart What the row's first cell starts with.
+/// @return The cell, or nullopt without that heading or row.
+[[nodiscard]] std::optional<std::string> CellUnder(std::string_view frame,
+                                                   std::string_view heading,
+                                                   std::string_view rowStart)
+{
+    auto const lines = Lines(frame);
+    auto const headingPoints = CodePoints(heading).size();
+    for (auto const& header: lines)
+    {
+        auto const points = CodePoints(header);
+        for (auto const start: std::views::iota(std::size_t { 1 }, points.size()))
+        {
+            auto const end = start + headingPoints;
+            if (Columns(header, start, headingPoints) != heading || points[start - 1] != " "
+                || (end < points.size() && points[end] != " "))
+                continue;
+            auto const row = std::ranges::find_if(lines, [rowStart](std::string const& line) {
+                return Trimmed(Columns(line, LabelFrom, FakeCellWidth(line))).starts_with(rowStart);
+            });
+            if (row == lines.end())
+                return std::nullopt;
+            // Back from the heading's last column to the gap before the cell.
+            auto const cell = Columns(*row, 0, end);
+            auto const gap = cell.rfind("  ");
+            return Trimmed(gap == std::string::npos ? std::string_view { cell } : std::string_view { cell }.substr(gap));
+        }
+    }
+    return std::nullopt;
+}
+
+} // namespace
+
+TEST_CASE("a fleet table writes each cell in the scale its column has in the leader's own tables",
+          "[cli][dashboard][panel][fleet][units]")
+{
+    // The owner read `100552671232` for a machine's memory. WHAT DISTINGUISHES: the bytes column reads
+    // `93.65 GiB` and the per-mille one `71.5 %`, exactly as the leader's page writes them -- a panel that
+    // copied the document's integers draws `100552671232` and `715`, which every width-only case still
+    // accepts -- and a figure nobody reported stays the absent marker rather than becoming `0 B`.
+    auto const frames = FleetFramesAt({ FleetSampleOf(1, OneMachineFleetText()), Tick }, 240, 40);
+    REQUIRE(frames.size() == 1);
+    auto const& frame = frames.front();
+
+    CHECK(CellUnder(frame, "memory", "build-01") == std::optional<std::string> { "93.65 GiB" });
+    CHECK(CellUnder(frame, "cpu-busy", "build-01") == std::optional<std::string> { "71.5 %" });
+    CHECK(CellUnder(frame, "memory-available", "build-01") == std::optional<std::string> { std::string { Absent } });
+    CHECK(CellUnder(frame, "cores", "build-01") == std::optional<std::string> { "32" });
+    CHECK_FALSE(frame.contains("100552671232"));
+    CHECK(WidestLine(frame) <= 240);
+    // The column is as wide as what is DRAWN: `93.65 GiB` is nine cells, so the heading is padded by
+    // three after the two-cell gap. Measured on the leader's `100552671232` it would be padded by six,
+    // and the width drop would be deciding on columns nobody sees.
+    CHECK(frame.contains("cores     memory"));
+}
+
+TEST_CASE("every column a leader renders has a scale the panel finds, and a column it does not render has none",
+          "[cli][dashboard][panel][fleet][units]")
+{
+    // The lookup is by (section, column name) in the leader's tables, so a column renamed there must
+    // not silently start rendering raw here. WHAT DISTINGUISHES: every name `FleetColumnNames` gives for
+    // every tabular section -- tier columns included, with every tier present -- finds a scale, and a
+    // name no table has finds none, which is what makes `zeta-column` render exactly as it was sent.
+    auto snapshot = Distributed::FleetSnapshot {};
+    snapshot.tiersPresent.fill(true);
+    auto known = std::size_t { 0 };
+    auto unknown = std::vector<std::string> {};
+    for (auto const& row: Distributed::FleetSectionTable)
+    {
+        if (!row.tabular)
+            continue;
+        for (auto const& name: Distributed::FleetColumnNames(row.section, snapshot))
+        {
+            if (Distributed::FleetColumnFormat(row.section, name).has_value())
+                ++known;
+            else
+                unknown.push_back(std::format("{}.{}", row.key, name));
+        }
+    }
+    INFO("columns with no scale: " << unknown.size());
+    CHECK(unknown.empty());
+    CHECK(known > 20);
+    CHECK_FALSE(Distributed::FleetColumnFormat(FleetSection::Machines, "zeta-column").has_value());
+    CHECK(Distributed::FleetColumnFormat(FleetSection::Machines, "memory") == Distributed::CellFormat::Bytes);
+    CHECK(Distributed::FleetColumnFormat(FleetSection::Machines, "cpu-busy") == Distributed::CellFormat::Permille);
+}
+
+TEST_CASE("a piped fleet record carries the leader's integers, never the panel's written figures",
+          "[cli][dashboard][panel][fleet][units]")
+{
+    // Machine-readable output never humanises: a script reading the stream parses `881`, and `88.1 %`
+    // would be a second grammar for it. WHAT DISTINGUISHES: the same document that draws `88.1 %` and
+    // `12 884` in the panel streams `881` and `12884` through the piped view.
+    auto view = PipedRecordView { OutputFormat::Tsv, std::nullopt, &FleetKpiFigures };
+    auto sink = CollectingSink {};
+    (void) Drive({ FleetSampleOf(1, FleetText(FleetMachines)), Tick }, DashboardLimits {}, view, sink, &ReadFleetSample);
+    auto stream = std::string {};
+    for (auto const& frame: sink.frames)
+        stream += frame;
+    CHECK(stream.contains("\t881\t"));
+    CHECK(stream.contains("\t12884\t"));
+    CHECK_FALSE(stream.contains("%"));
+    CHECK_FALSE(stream.contains("12 884"));
+
+    auto const panel = FleetFrameAt(FleetMachines, 132, 40);
+    CHECK(panel.contains("88.1 %"));
+    CHECK(panel.contains("12 884"));
+}
+
 TEST_CASE("every unit a leader's headline figures carry is one the fleet panel knows how to write",
           "[cli][dashboard][panel][fleet]")
 {
-    // `KpiUnitTable` is the one place this client reads a unit's name, which is spelled once, file-local,
-    // in `FleetView.cpp`. WHAT DISTINGUISHES: the units come from the leader's own renderer, so a unit
+    // `Distributed::CellFormatFromName` is the one place this client reads a unit's name, which is spelled
+    // once, in the leader's `CellFormatTable`. WHAT DISTINGUISHES: the units come from the leader's own renderer, so a unit
     // renamed or added there fails here instead of leaving a tile written raw. The control is that the
     // section has rows at all -- an empty one would pass every check below.
     auto snapshot = Distributed::FleetSnapshot {};
@@ -1172,7 +1309,7 @@ TEST_CASE("every unit a leader's headline figures carry is one the fleet panel k
     {
         auto const& unit = row[unitIndex].lexical;
         INFO("unit " << unit);
-        CHECK(FindIfOrNull(KpiUnitTable, [&unit](KpiUnit const& known) { return known.name == unit; }) != nullptr);
+        CHECK(Distributed::CellFormatFromName(unit).has_value());
         ++checked;
     }
     CHECK(checked == kpi->rows.size());

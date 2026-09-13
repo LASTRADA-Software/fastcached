@@ -45,6 +45,7 @@ target_sources(FastCache
         Consensus/RaftPeerServer.cpp
         Consensus/RaftPeerTransport.cpp
         Core/Crc32c.cpp
+        Core/FigureText.cpp
         Core/PathKind.cpp
         Core/SecureBytes.cpp
         Core/Sha256.cpp
@@ -207,6 +208,7 @@ target_sources(FastCache
             Core/SecureBytes.hpp
             Core/Compression.hpp
             Core/Endian.hpp
+            Core/FigureText.hpp
             Core/Markup.hpp
             Core/StringHash.hpp
             Core/Utf8.hpp
