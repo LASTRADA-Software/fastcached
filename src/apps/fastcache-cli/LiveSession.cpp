@@ -53,9 +53,11 @@ Task<std::expected<LiveSessionRun, Answer>> RunComposedSession(LiveSessionParts 
     if (parts.interactive)
     {
         auto started = co_await parts.terminals->Acquire(parts.terminalPool, parts.reactor);
+        // `Local`, not `Refused`: nothing at the server declined anything, and the remedy is on
+        // this machine. A script reading 4 would go and look at the node.
         if (!started.has_value())
             co_return std::unexpected(
-                Concluded(Outcome::Refused,
+                Concluded(Outcome::Local,
                           std::format("cannot draw live-stats on this terminal: {}; run it with its output "
                                       "redirected for one line per sample instead",
                                       started.error())));
