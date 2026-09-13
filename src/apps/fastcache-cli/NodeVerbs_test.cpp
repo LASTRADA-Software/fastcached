@@ -9,6 +9,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -1340,4 +1341,108 @@ TEST_CASE("the stats ladder relays the same remedy when it skips /metrics", "[cl
     CHECK(std::ranges::any_of(answer.advisories, [](std::string const& line) {
         return line.contains("was not asked") && line.contains("--admin-listen");
     }));
+}
+
+// ---------------------------------------------------------------------------
+// #134: an endpoint's identity, TYPED.
+//
+// `live-stats` infers its subject from what the endpoint is. The gatherer used to answer
+// that only as `std::expected<NodeStatusFields, std::string>`, whose error side held
+// three different states as three sentences of one type -- so a verb deciding from it
+// would have been matching prose.
+// ---------------------------------------------------------------------------
+
+namespace
+{
+
+/// A node-status reply that says `Ok` and carries a body no decoder can read.
+///
+/// The fourth arm, and the one where two classifiers would most naturally drift: the
+/// STATUS says compile node while the fields say nothing, so a second copy of the
+/// decision that keyed on "did the fields decode" would call it something else.
+/// @return The reply frame.
+[[nodiscard]] std::vector<std::byte> OkWithUnreadableBody()
+{
+    auto const garbage = std::to_array({ std::byte { 0xFF } });
+    return Cc::EncodeReply(Cc::Status::Ok, garbage);
+}
+
+/// The identity a gatherer reports for one scripted reply.
+/// @param reply What the endpoint answers node-status with.
+/// @return The identification.
+[[nodiscard]] EndpointIdentity IdentityFor(ScriptedNodeExchange::Outcome reply)
+{
+    ScriptedNodeExchange node { { std::move(reply) }, "10.0.0.4:6674" };
+    auto gatherer = GathererFor(node);
+    return gatherer.IdentifyEndpoint();
+}
+
+} // namespace
+
+TEST_CASE("an endpoint's identity keeps its four states apart by type", "[cli][node][identity]")
+{
+    // THE state that must not collapse is the first: nobody could ask. Inferring `cache`
+    // for it reports *INFO did not answer* against a port that may speak no RESP.
+    auto notAskedGatherer =
+        LadderGatherer { Endpoint {}, Endpoint { .host = "10.0.0.4", .port = 6674 }, DialTimeouts {}, std::nullopt, nullptr,
+                         nullptr };
+    auto const notAsked = notAskedGatherer.IdentifyEndpoint();
+    auto const silent = IdentityFor(NodeFailure(ExchangeFailure::Transport, "the server closed the connection"));
+    auto const daemon = IdentityFor(RefusalReply(Cc::UnimplementedVerb));
+    auto const node = IdentityFor(StatusReply({ .version = "0.2.0", .nodeId = {}, .uptimeSeconds = 5, .surfaces = {} }));
+
+    CHECK_FALSE(notAsked.kind.has_value());
+    CHECK(silent.kind == RemoteKind::NotFastcacheWire);
+    CHECK(daemon.kind == RemoteKind::FastcacheWireOnly);
+    CHECK(node.kind == RemoteKind::CompileNode);
+
+    // Each answered state names the endpoint, which is what a refusal quoting it needs.
+    for (auto const& identity: { silent, daemon, node })
+        CHECK(identity.detail.contains("10.0.0.4:6674"));
+    CHECK(notAsked.detail.contains("no 0xFC connection"));
+}
+
+TEST_CASE("the identity and the probe classify every reply the same way", "[cli][node][identity]")
+{
+    // Two askers, one decision. Driven over every reply shape, and the unreadable `Ok`
+    // body is the row that distinguishes: it is a compile node by status and nothing by
+    // fields, which is exactly where a second copy of the decision would part company.
+    auto const replies = std::to_array<ScriptedNodeExchange::Outcome>({
+        StatusReply({ .version = "0.2.0", .nodeId = {}, .uptimeSeconds = 5, .surfaces = {} }),
+        OkWithUnreadableBody(),
+        RefusalReply(Cc::UnimplementedVerb),
+        RefusalReply(Cc::ErrorCode::NotAMember),
+        NodeFailure(ExchangeFailure::Transport, "the server closed the connection"),
+    });
+
+    for (auto const& reply: replies)
+    {
+        ScriptedNodeExchange probed { { reply } };
+        auto const probe = ProbeRemote(probed);
+        auto const identity = IdentityFor(reply);
+        CAPTURE(static_cast<int>(probe), identity.detail);
+        CHECK(identity.kind == probe);
+    }
+
+    // And the unreadable body is still a NODE, not merely consistent with the probe: a
+    // probe and an identity that both drifted to `FastcacheWireOnly` would agree.
+    CHECK(IdentityFor(OkWithUnreadableBody()).kind == RemoteKind::CompileNode);
+}
+
+TEST_CASE("an endpoint is identified once however many callers ask", "[cli][node][identity]")
+{
+    // A verb asking what the endpoint is, and a rung then reading the same fact, must pay
+    // ONE node-status round trip between them -- a second is a second request a daemon
+    // refuses. `FetchAdmin` stands in for the rung: this node reports no admin surface,
+    // so it reads the identification and dials nothing.
+    ScriptedNodeExchange node { { StatusReply({ .version = "0.2.0", .nodeId = {}, .uptimeSeconds = 5, .surfaces = {} }) },
+                                "10.0.0.4:6674" };
+    auto gatherer = GathererFor(node);
+
+    CHECK(gatherer.IdentifyEndpoint().kind == RemoteKind::CompileNode);
+    CHECK(gatherer.IdentifyEndpoint().kind == RemoteKind::CompileNode);
+    CHECK_FALSE(gatherer.FetchAdmin("/fleet.txt?section=workers").has_value());
+
+    CHECK(node.Sent().size() == 1);
+    CHECK(node.Unused() == 0);
 }

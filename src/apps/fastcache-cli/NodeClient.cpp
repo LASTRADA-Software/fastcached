@@ -130,7 +130,11 @@ std::optional<Outcome> EstablishedBy(RemoteKind kind) noexcept
 
 RemoteKind ProbeRemote(INodeExchange& node)
 {
-    auto const reply = node.Send(Wire::EncodeNodeStatusRequest());
+    return ClassifyNodeStatusReply(node.Send(Wire::EncodeNodeStatusRequest()));
+}
+
+RemoteKind ClassifyNodeStatusReply(std::expected<NodeReply, ExchangeError> const& reply) noexcept
+{
     if (!reply.has_value())
         // A `0xFC` request that produced no frame at all. That covers a peer that closed
         // having sent nothing and one that sent something unreadable, and both mean the
