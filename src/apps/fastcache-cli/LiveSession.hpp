@@ -1,12 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include "CliAnswer.hpp"
 #include "DashboardEvent.hpp"
 #include "DashboardLoop.hpp"
+#include "LiveEventSource.hpp"
 
 #include <FastCache/Async/Task.hpp>
+#include <FastCache/Core/BoundedDrain.hpp>
+#include <FastCache/Core/Clock.hpp>
 
+#include <atomic>
 #include <memory>
+#include <optional>
+#include <string>
+#include <string_view>
 
 namespace FastCache::Cli
 {
@@ -54,5 +62,56 @@ class IViewLadder
                                                  IViewLadder* ladder,
                                                  IFrameSink* sink,
                                                  DashboardLimits limits);
+
+/// How the process leaves once a session has ended and its source has been drained, or has
+/// not been.
+struct SessionEnding
+{
+    /// The exit code the session earned (#134 §1.7). **The drain never changes it**: a session
+    /// that showed readings and then could not wait out one last scrape still showed readings.
+    int exitCode { 0 };
+
+    /// What to write to stderr before ending the process WITHOUT unwinding, or nullopt when the
+    /// source drained and the ordinary path returns.
+    ///
+    /// Without unwinding, because a sample still inside `Gather()` holds the gatherer, the pool
+    /// and the connections the caller's stack owns: returning destroys them under that thread,
+    /// which is a use-after-free presenting as a rare crash on exit. The bound is spent; say
+    /// what is abandoned and end the process.
+    std::optional<std::string> abandonment {};
+};
+
+/// Decide how the process leaves, from how the drain ended.
+///
+/// Pure, so the decision is tested apart from the one call that acts on it.
+/// @param drain How the drain ended.
+/// @param earned The session's outcome, which decides the exit code whatever the drain did.
+/// @param endpoint Where the samples were asked, as the abandonment line should name it.
+/// @param sampleAge How long the sample still out had been out, or nullopt when none was.
+/// @return The exit code, and the abandonment line when there is one.
+[[nodiscard]] SessionEnding DecideSessionEnding(DrainResult drain,
+                                                Outcome earned,
+                                                std::string_view endpoint,
+                                                std::optional<Duration> sampleAge);
+
+/// Wait for a closed session's source to drain, within @p bound, and decide how the process leaves.
+///
+/// **`DrainWithin` -- this tree's one bounded shutdown drain -- on the CALLING thread, which
+/// must not be the reactor's.** The reactor has to keep running for a returning sample to land,
+/// and a poll on it would stall exactly that; on a thread with nothing else to do at shutdown it
+/// is how every other drain here waits.
+/// @param drained Set on the reactor once `source.Drained()` has resumed.
+/// @param source The closed source, asked how long a sample still out has been out.
+/// @param earned The session's outcome.
+/// @param endpoint Where the samples were asked.
+/// @param bound The ceiling, and how often to look.
+/// @param wait The drain's clock and its sleep; injected so a test spends no real time.
+/// @return How the process leaves.
+[[nodiscard]] SessionEnding DrainSession(std::atomic<bool> const& drained,
+                                         LiveEventSource const& source,
+                                         Outcome earned,
+                                         std::string_view endpoint,
+                                         DrainBound bound,
+                                         IDrainWait& wait);
 
 } // namespace FastCache::Cli
