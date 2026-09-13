@@ -61,7 +61,8 @@ TEST_CASE("an advertised Sixel with no cell size is not the Sixel rung", "[cli][
     for (auto const encoding: { TerminalTextEncoding::Utf8, TerminalTextEncoding::Other, TerminalTextEncoding::Unknown })
     {
         CAPTURE(static_cast<int>(encoding));
-        auto const withSize = TerminalCapabilities { .sixel = SixelAnswer::Advertised, .encoding = encoding, .cellPixels = measured };
+        auto const withSize =
+            TerminalCapabilities { .sixel = SixelAnswer::Advertised, .encoding = encoding, .cellPixels = measured };
         auto const withoutSize = TerminalCapabilities { .sixel = SixelAnswer::Advertised, .encoding = encoding };
         CHECK(ChooseRenderRung(withSize) == RenderRung::Sixel);
         CHECK(ChooseRenderRung(withoutSize)
@@ -69,9 +70,8 @@ TEST_CASE("an advertised Sixel with no cell size is not the Sixel rung", "[cli][
         CHECK(ChooseRenderRung(withoutSize) != RenderRung::Sixel);
     }
     // And a cell size alone draws no Sixel: the terminal still has to say it can.
-    CHECK(ChooseRenderRung(TerminalCapabilities { .sixel = SixelAnswer::NotAdvertised,
-                                                  .encoding = TerminalTextEncoding::Utf8,
-                                                  .cellPixels = measured })
+    CHECK(ChooseRenderRung(TerminalCapabilities {
+              .sixel = SixelAnswer::NotAdvertised, .encoding = TerminalTextEncoding::Utf8, .cellPixels = measured })
           == RenderRung::Unicode);
 }
 
