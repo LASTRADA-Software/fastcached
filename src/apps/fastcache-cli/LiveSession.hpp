@@ -108,6 +108,7 @@ struct LiveSessionParts
     std::string address {};                      ///< Where the samples are asked, as a frame names it.
     IReactor* reactor { nullptr };               ///< Where the session runs.
     IStatsGatherer* gatherer { nullptr };        ///< What each sample asks, until one fails.
+    INodeStatusReader* status { nullptr };       ///< What a node sample asks for its status; see `readsNodeStatus`.
     IAdminDocument* admin { nullptr };           ///< What a document sample asks; see `LiveSubjectSpec::document`.
     IStatsDialer* dialer { nullptr };            ///< What re-dials after a failed sample.
     SampleReader reader { nullptr };             ///< What a sample says: the subject's reader.
