@@ -989,6 +989,16 @@ OnlyCoverageVerdict() {
 # prints a confident count. So it gets asserted, on a synthetic tree, with no
 # compile database and no clang-tidy needed. The CI job runs this before the
 # sweep for the same reason the sweep canaries its binary.
+# The phony targets CMake's Ninja generator gives every target that has objects, one
+# each, each depending on whatever must exist BEFORE that target's objects compile:
+# generated headers, and the tools that generate them. Pure over the listing so
+# `--self-test` drives it; `EnsureGeneratedSources` acquires the listing.
+#
+# @param 1 The output of `ninja -t targets all`.
+ObjectOrderTargets() {
+    sed -n 's/^\(cmake_object_order_depends_target_[^:]*\):.*/\1/p' <<< "$1" | sort -u
+}
+
 # The canary's DECISION, split out so it can be driven without an analyser (#257).
 #
 # The acquisition far below needs clang-tidy, a compile database and a real
@@ -1531,6 +1541,19 @@ STUB
     ( LoadNotOurRoots "$tp" ) >/dev/null 2>&1
     Expect "a roots file naming no root is refused, never read as nothing third-party" "2" "$?"
 
+    # The generated-sources step asks for exactly the object-order phonies, once each,
+    # and nothing else: not `all`, which would compile the tree, and not an object.
+    Expect "the object-order phony targets are selected, once each, and nothing else" \
+           "cmake_object_order_depends_target_FastCache cmake_object_order_depends_target_unicode_ucd" \
+           "$(ObjectOrderTargets "$(printf '%s\n' \
+               'cmake_object_order_depends_target_unicode_ucd: phony' \
+               'all: phony' \
+               'CMakeFiles/FastCache.dir/src/FastCache/Core/Base64.cpp.o: CXX_COMPILER__FastCache_unscanned_Debug' \
+               'cmake_object_order_depends_target_FastCache: phony' \
+               'cmake_object_order_depends_target_unicode_ucd: phony')" | tr '\n' ' ' | sed 's/ $//')"
+    Expect "a listing with no object-order phony selects nothing, which the step refuses" \
+           "" "$(ObjectOrderTargets "$(printf 'all: phony\nclean: CLEAN\n')")"
+
     [[ "$status" -eq 0 ]] && echo "TIDY SWEEP SELF-TEST PASSED"
     return "$status"
 }
@@ -1755,6 +1778,42 @@ Canary() {
     esac
 }
 
+# A compile database is not a tree that PARSES. clang-tidy reads each unit the way the
+# compiler would, so a header the build generates has to exist -- and the clang-tidy job
+# configures without building. libunicode, which the vendored TUI links, writes its
+# `ucd_enums.h` and eight more tables into its SOURCE directory at build time, so a CPM
+# cache that never saw a build has none of them. CI refused #1392 on exactly that
+# (`TerminalCellWidth.cpp`: 'libunicode/ucd_enums.h' file not found), where every local
+# gate had passed: the gate builds before it tidies.
+#
+# So the sweep builds the object-order phony targets: every generated input any unit
+# needs, and no object. Measured on the #134 tree, WSL, clang-debug, a fresh CPM cache:
+# 28 targets, 21 edges, six compiles (libunicode's table generator) and 3 s, after which
+# that unit passes. A database that is not Ninja's cannot be asked, and says so; a unit
+# still missing a header is then refused below as not preprocessable, by name.
+EnsureGeneratedSources() {
+    local listing targets log
+    if [[ ! -f "${DB}/build.ninja" ]]; then
+        echo "TIDY SWEEP: ${DB} is not a Ninja build, so generated sources were not built first"
+        return 0
+    fi
+    command -v ninja >/dev/null 2>&1 \
+        || fatal "ninja is not on PATH, so the generated sources ${DB} needs before its units parse cannot be built"
+    listing="$(ninja -C "$DB" -t targets all)" || fatal "ninja could not list the targets of ${DB}"
+    targets="$(ObjectOrderTargets "$listing")"
+    # A Ninja build with objects always has them, so none means the generator's naming
+    # moved -- never that nothing needs generating.
+    [[ -n "$targets" ]] \
+        || fatal "${DB}/build.ninja names no cmake_object_order_depends_target_ phony, so which generated sources the units need cannot be asked"
+    log="${scratch}/generated-sources.log"
+    # shellcheck disable=SC2086  # target names carry no whitespace
+    if ! ninja -C "$DB" $targets > "$log" 2>&1; then
+        tail -40 "$log" >&2
+        fatal "building the generated sources in ${DB} failed, so its units cannot be parsed"
+    fi
+    echo "TIDY SWEEP: generated sources built first ($(grep -c . <<< "$targets") object-order target(s), $(grep -c '^\[' "$log") edge(s) run)"
+}
+
 selection="--all"
 if [[ "$mode" != all ]]; then
     # Committed changes, everything different from HEAD, and files not yet added.
@@ -1878,6 +1937,7 @@ if [[ "${#plan[@]}" -eq 0 ]]; then
     exit 0
 fi
 echo "TIDY SWEEP: ${#plan[@]} translation unit(s), ${TIDY}, ${JOBS} at a time"
+EnsureGeneratedSources
 Canary
 
 # One translation unit, into numbered files so the report below is in a stable
