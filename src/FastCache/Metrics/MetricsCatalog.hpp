@@ -2,8 +2,10 @@
 #pragma once
 
 #include <FastCache/Core/EnumTable.hpp>
+#include <FastCache/Core/Version.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <string_view>
@@ -788,6 +790,35 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
 // precisely the step that was missed.
 static_assert(RowsInEnumeratorOrder(CounterTable, &CounterDescriptor::counter),
               "CounterTable must hold one row per IMetricsSink::Counter, in enumerator order");
+
+/// A fact about the BUILD this process runs, exported as a Prometheus info series:
+/// one sample whose value is always 1 and whose label carries the fact.
+///
+/// A row here rather than a line in `PrometheusFormatter`, for the reason
+/// `CounterDescriptor` gives: the renderer walks tables, and a series spelled inside
+/// the renderer is one nothing else can enumerate. Not a `CounterDescriptor`, because
+/// a version is not a tally the sink holds -- it is known at compile time and never
+/// moves.
+///
+/// Why it exists at all (#134): `fastcache-cli live-stats cache` titles its panel with
+/// the daemon's version, and the scrape it reads carried none, so the title could only
+/// say `-`. The label is the version verbatim; the renderer escapes it, since
+/// `-DFASTCACHED_VERSION_STRING` accepts any text.
+struct InfoDescriptor
+{
+    std::string_view prometheusName; ///< Fully-qualified exported name.
+    std::string_view help;           ///< One-line `# HELP` text.
+    std::string_view label;          ///< The label the fact is carried in.
+    std::string_view value;          ///< The fact, unescaped.
+};
+
+/// Every info series this build exports, rendered once each by `PrometheusFormatter`.
+inline constexpr std::array InfoTable {
+    InfoDescriptor { .prometheusName = "fastcached_build_info",
+                     .help = "The build this process runs: the version is the label, and the value is always 1.",
+                     .label = "version",
+                     .value = VersionString },
+};
 
 /// The row describing `counter`.
 ///

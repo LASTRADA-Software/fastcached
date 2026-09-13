@@ -217,4 +217,15 @@ struct MetricsSnapshot
 /// @return A complete metrics body in Prometheus text exposition format.
 [[nodiscard]] std::string RenderPrometheus(IMetricsSink const& metrics, MetricsSnapshot const& snapshot);
 
+struct InfoDescriptor;
+
+/// Render one info series: its `# HELP` and `# TYPE` lines and the single sample, with
+/// the fact escaped as a Prometheus label value.
+///
+/// Separate from `RenderPrometheus` so the escaping can be tested with a value no
+/// build carries: the table's own value is a compile-time constant.
+/// @param row The info series to render.
+/// @return The three exposition lines.
+[[nodiscard]] std::string RenderInfoMetric(InfoDescriptor const& row);
+
 } // namespace FastCache
