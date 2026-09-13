@@ -145,9 +145,14 @@ struct LiveSessionRun
 /// @param source Where the running source is kept, the caller's: a drain on another thread
 ///        still waits on it after this coroutine has returned. Left empty when the session was
 ///        refused before starting.
+/// @param restore Where the acquired terminal's restore handle is kept, the caller's, set the
+///        moment the terminal is acquired: an abandonment reaches for it after this coroutine
+///        has returned, and a loop that threw returned nothing to carry it in. Left null when
+///        no terminal was acquired.
 /// @return How the session ended, or the refusal that kept it from starting.
 [[nodiscard]] Task<std::expected<LiveSessionRun, Answer>> RunComposedSession(LiveSessionParts parts,
-                                                                             std::optional<LiveEventSource>* source);
+                                                                             std::optional<LiveEventSource>* source,
+                                                                             std::shared_ptr<ITerminalRestore>* restore);
 
 /// The stderr line for a closed session whose source did not drain within its bound.
 ///
@@ -259,7 +264,52 @@ struct SessionEnding
     SessionEndKind kind { SessionEndKind::Refused }; ///< Which of the three.
     Answer answer {};                                ///< The refusal, or the outcome and remarks earned.
     std::string line {};                             ///< `Abandoned` only: the stderr line.
+
+    /// `Abandoned` only: what puts the terminal back, or null when the session acquired none.
+    ///
+    /// **Null is the whole answer for a piped session, not a missing part**: it changed no
+    /// terminal mode, so there is nothing to put back and nothing stands in for the handle. An
+    /// interactive session's events are never destroyed on this ending -- the process ends without
+    /// unwinding -- so this is the only thing that leaves the alternate screen and raw mode.
+    std::shared_ptr<ITerminalRestore> restore {};
 };
+
+/// How a process whose session was abandoned ends: the three things `main` does, as a seam.
+///
+/// A seam because the ORDER is the property, and `main` is in no test target: the terminal is
+/// put back before anything is written, so the stderr line lands on the operator's own screen
+/// rather than on an alternate screen about to vanish, and a flush in raw mode cannot mangle it.
+class IAbandonedExit
+{
+  public:
+    IAbandonedExit() = default;
+    IAbandonedExit(IAbandonedExit const&) = delete;
+    IAbandonedExit(IAbandonedExit&&) = delete;
+    IAbandonedExit& operator=(IAbandonedExit const&) = delete;
+    IAbandonedExit& operator=(IAbandonedExit&&) = delete;
+    virtual ~IAbandonedExit() = default;
+
+    /// Flush what the session already wrote to stdout.
+    virtual void Flush() = 0;
+
+    /// Tell the operator: the answer's remarks, then what was abandoned.
+    /// @param answer The outcome and remarks earned.
+    /// @param line The abandonment line.
+    virtual void Say(Answer const& answer, std::string_view line) = 0;
+
+    /// End the process without unwinding. Returns only in a test.
+    /// @param code The exit code the session earned.
+    virtual void Exit(int code) = 0;
+};
+
+/// End a process whose session was abandoned: restore the terminal, flush, say why, exit.
+///
+/// **`RestoreNow` first, whenever there is a terminal**, and it is safe while a terminal read is
+/// still parked on the pool, which is the usual state here. A piped session has no handle and
+/// skips that step, and only that one.
+/// @param ending An `Abandoned` ending.
+/// @param exit How this process flushes, speaks and ends.
+void EndAbandonedSession(SessionEnding const& ending, IAbandonedExit& exit);
 
 /// Run `live-stats`: admit, compose, run to the end, drain.
 ///
