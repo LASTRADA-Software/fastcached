@@ -2,6 +2,10 @@
 #include <FastCache/Platform/Environment.hpp>
 #include <FastCache/Platform/Terminal.hpp>
 
+#include <algorithm>
+#include <array>
+#include <string>
+
 #if defined(_WIN32)
     #include <windows.h>
 #else
@@ -21,7 +25,55 @@ namespace
         auto const value = ReadEnvironmentVariable("NO_COLOR");
         return value.has_value() && !value->empty();
     }
+
+    /// The code page Windows numbers UTF-8 with.
+    constexpr auto Utf8CodePage = std::uint32_t { 65001 };
+
+    /// The codeset spellings that name UTF-8, once case and hyphens are dropped.
+    constexpr auto Utf8Codesets = std::to_array<std::string_view>({ "utf8" });
+
+    /// @return @p locale's codeset, lowercased and without hyphens; empty when it names none.
+    [[nodiscard]] std::string NormalisedCodeset(std::string_view locale)
+    {
+        auto const dot = locale.find('.');
+        if (dot == std::string_view::npos)
+            return {};
+        auto codeset = locale.substr(dot + 1);
+        codeset = codeset.substr(0, codeset.find('@'));
+        auto normalised = std::string {};
+        for (auto const character: codeset)
+        {
+            if (character == '-')
+                continue;
+            normalised.push_back((character >= 'A' && character <= 'Z') ? static_cast<char>(character - 'A' + 'a')
+                                                                        : character);
+        }
+        return normalised;
+    }
 } // namespace
+
+TerminalTextEncoding EncodingFromLocaleVariables(std::optional<std::string_view> lcAll,
+                                                 std::optional<std::string_view> lcCtype,
+                                                 std::optional<std::string_view> lang) noexcept
+{
+    for (auto const& variable: { lcAll, lcCtype, lang })
+    {
+        if (!variable.has_value() || variable->empty())
+            continue;
+        auto const codeset = NormalisedCodeset(*variable);
+        return std::ranges::find(Utf8Codesets, std::string_view { codeset }) != Utf8Codesets.end()
+                   ? TerminalTextEncoding::Utf8
+                   : TerminalTextEncoding::Other;
+    }
+    return TerminalTextEncoding::Unknown;
+}
+
+TerminalTextEncoding EncodingFromConsoleOutputCodePage(std::optional<std::uint32_t> codePage) noexcept
+{
+    if (!codePage.has_value())
+        return TerminalTextEncoding::Unknown;
+    return *codePage == Utf8CodePage ? TerminalTextEncoding::Utf8 : TerminalTextEncoding::Other;
+}
 
 #if defined(_WIN32)
 
@@ -47,6 +99,25 @@ bool StdoutSupportsColor() noexcept
     return ::SetConsoleMode(handle, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING) != 0;
 }
 
+TerminalTextEncoding DetectTerminalTextEncoding()
+{
+    // `GetConsoleOutputCP` answers 0 when this process has no console to ask.
+    auto const codePage = ::GetConsoleOutputCP();
+    return EncodingFromConsoleOutputCodePage(codePage == 0 ? std::nullopt : std::optional<std::uint32_t> { codePage });
+}
+
+bool StandardStreamsAreInteractive() noexcept
+{
+    auto const isConsole = [](DWORD which) {
+        HANDLE const handle = ::GetStdHandle(which);
+        if (handle == nullptr || handle == INVALID_HANDLE_VALUE || ::GetFileType(handle) != FILE_TYPE_CHAR)
+            return false;
+        DWORD mode = 0;
+        return ::GetConsoleMode(handle, &mode) != 0;
+    };
+    return isConsole(STD_INPUT_HANDLE) && isConsole(STD_OUTPUT_HANDLE);
+}
+
 #else
 
 bool StdoutSupportsColor() noexcept
@@ -54,6 +125,22 @@ bool StdoutSupportsColor() noexcept
     if (NoColorRequested())
         return false;
     return ::isatty(STDOUT_FILENO) != 0;
+}
+
+bool StandardStreamsAreInteractive() noexcept
+{
+    return ::isatty(STDIN_FILENO) != 0 && ::isatty(STDOUT_FILENO) != 0;
+}
+
+TerminalTextEncoding DetectTerminalTextEncoding()
+{
+    auto const lcAll = ReadEnvironmentVariable("LC_ALL");
+    auto const lcCtype = ReadEnvironmentVariable("LC_CTYPE");
+    auto const lang = ReadEnvironmentVariable("LANG");
+    auto const view = [](std::optional<std::string> const& value) {
+        return value.has_value() ? std::optional<std::string_view> { *value } : std::nullopt;
+    };
+    return EncodingFromLocaleVariables(view(lcAll), view(lcCtype), view(lang));
 }
 
 #endif
