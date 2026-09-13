@@ -369,6 +369,18 @@ namespace
         return options.*Field;
     }
 
+    /// Whether a value-carrying modifier was given.
+    ///
+    /// The optional-shaped rows' answer, spelled once for all of them as `FlagGiven` is for
+    /// the flags: an empty optional is how `VerbOptions` says nothing was typed.
+    /// @param options The parsed modifiers.
+    /// @return Whether the field holds a value.
+    template <auto Field>
+    [[nodiscard]] constexpr bool ValueGiven(VerbOptions const& options) noexcept
+    {
+        return (options.*Field).has_value();
+    }
+
     /// One modifier's flag spelling, the bit that honours it, and how to tell it was given.
     struct ModifierSpec
     {
@@ -404,12 +416,8 @@ namespace
         { .bit = Modifier::Exclusivity, .flag = "--xx", .given = &FlagGiven<&VerbOptions::onlyIfPresent> },
         { .bit = Modifier::Raw, .flag = "--raw", .given = &FlagGiven<&VerbOptions::raw> },
         { .bit = Modifier::Everything, .flag = "--all", .given = &FlagGiven<&VerbOptions::everything> },
-        { .bit = Modifier::Interval,
-          .flag = "--interval",
-          .given = [](VerbOptions const& options) { return options.interval.has_value(); } },
-        { .bit = Modifier::Samples,
-          .flag = "--samples",
-          .given = [](VerbOptions const& options) { return options.samples.has_value(); } },
+        { .bit = Modifier::Interval, .flag = "--interval", .given = &ValueGiven<&VerbOptions::interval> },
+        { .bit = Modifier::Samples, .flag = "--samples", .given = &ValueGiven<&VerbOptions::samples> },
     });
 
     /// One connection a verb's wire needs, and the word the help calls it.
