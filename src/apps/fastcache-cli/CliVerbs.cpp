@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "CliVerbs.hpp"
 #include "FleetDocument.hpp"
+#include "LiveStats.hpp"
 
 #include <FastCache/Cluster/ClusterState.hpp>
 
@@ -1737,6 +1738,25 @@ namespace
           .protocolCommand = "",
           .modifiers = Modifier::None,
           .handler = &Stats,
+          .nodeFallback = nullptr },
+        { .name = "live-stats",
+          // `Stats` because it is the one wire whose connections cover all three
+          // subjects: RESP or `/metrics` for a cache, `0xFC` for a node, and `0xFC` to
+          // discover the admin port the fleet page is fetched from (#134 §1.1).
+          .wire = Wire::Stats,
+          .minOperands = 0,
+          .maxOperands = 1,
+          // Derived from `LiveSubjectTable` at compile time, unlike `fleet`'s list below,
+          // because #134 §1 asks for exactly that and a derived list cannot drift where a
+          // test only notices after it has.
+          .operands = LiveSubjectOperands,
+          .summary = "watch a cache, a node or the fleet, one sample per interval;\n"
+                     "the subject is inferred when not named, and `fleet` never is",
+          .protocolCommand = "",
+          .modifiers = Modifier::Interval | Modifier::Samples,
+          .handler = &LiveStatsVerb,
+          // No second attempt exists to make: identifying the endpoint IS the subject
+          // decision, and it happens before any sample (#134 §1.3).
           .nodeFallback = nullptr },
 
         // The `0xFC` verbs. These are the ONLY ones a `fastcache-compile-node` answers:
