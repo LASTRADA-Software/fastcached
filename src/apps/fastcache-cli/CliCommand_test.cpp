@@ -340,30 +340,15 @@ TEST_CASE("the modifiers each verb does honour are accepted", "[cli][command]")
     CHECK(command.verbOptions.onlyIfAbsent);
 }
 
-TEST_CASE("every modifier is refused by its own name on a verb that honours none", "[cli][command]")
-{
-    // Each modifier row states whether it was given through its own predicate, so the
-    // defect worth a case is a row reading ANOTHER row's field: `--xx` reading
-    // `onlyIfAbsent` would leave `ping --xx` accepted in silence, and the case above --
-    // which spot-checks four verbs -- would still pass. WHAT DISTINGUISHES is the flag
-    // named in the refusal, per flag, against one verb that can honour nothing.
-    auto const* const ping = FindVerb("ping");
-    REQUIRE(ping != nullptr);
-    REQUIRE(ping->modifiers == Modifier::None);
-
-    for (auto const flag: std::to_array<std::string_view>({ "--ttl=30", "--nx", "--xx", "--raw", "--all" }))
-    {
-        CAPTURE(flag);
-        auto const refused = Parse({ "ping", flag });
-        CHECK(refused.action == Action::UsageError);
-        CHECK(refused.diagnostic.contains(flag.substr(0, flag.find('='))));
-    }
-}
-
-TEST_CASE("the live-stats modifiers are refused by name on every verb that does not honour them", "[cli][command]")
+TEST_CASE("every modifier is refused by name on every verb that does not honour it", "[cli][command]")
 {
     // §9.19, derived over the WHOLE table rather than spot-checked: a new verb is a row,
-    // and a row that honours these by accident is refused nowhere a sample would look.
+    // and a row that honours a modifier by accident is refused nowhere a sample would
+    // look. A probe per FLAG rather than per bit, because each modifier row states whether
+    // it was given through its own predicate, and the defect worth catching is a row
+    // reading ANOTHER row's field: `--xx` reading `onlyIfAbsent` leaves `ping --xx`
+    // accepted in silence. WHAT DISTINGUISHES is the flag and the verb the refusal names.
+    //
     // Each verb is given exactly its minimum operand count, so the modifier is the only
     // thing that can refuse -- `ParseCommand` checks arity before applicability.
     struct Probe
@@ -373,14 +358,19 @@ TEST_CASE("the live-stats modifiers are refused by name on every verb that does 
         std::string_view spelling;
     };
     auto const probes = std::to_array<Probe>({
+        { .bit = Modifier::Ttl, .flag = "--ttl", .spelling = "--ttl=30" },
+        { .bit = Modifier::Exclusivity, .flag = "--nx", .spelling = "--nx" },
+        { .bit = Modifier::Exclusivity, .flag = "--xx", .spelling = "--xx" },
+        { .bit = Modifier::Raw, .flag = "--raw", .spelling = "--raw" },
+        { .bit = Modifier::Everything, .flag = "--all", .spelling = "--all" },
         { .bit = Modifier::Interval, .flag = "--interval", .spelling = "--interval=1000" },
         { .bit = Modifier::Samples, .flag = "--samples", .spelling = "--samples=3" },
     });
 
-    auto checked = std::size_t { 0 };
-    for (auto const& verb: Verbs())
+    for (auto const& probe: probes)
     {
-        for (auto const& probe: probes)
+        auto checked = std::size_t { 0 };
+        for (auto const& verb: Verbs())
         {
             if ((verb.modifiers & probe.bit) != 0)
                 continue;
@@ -395,10 +385,12 @@ TEST_CASE("the live-stats modifiers are refused by name on every verb that does 
             CHECK(command.diagnostic.contains(std::format("{} means nothing for `{}`", probe.flag, verb.name)));
             ++checked;
         }
-    }
 
-    // A table in which every row honoured both would check nothing and pass.
-    CHECK(checked > 0);
+        // Per probe: a modifier every verb honoured would check nothing for itself and
+        // pass, however many the other probes checked.
+        CAPTURE(probe.flag);
+        CHECK(checked > 0);
+    }
 }
 
 TEST_CASE("live-stats is the one verb that honours the interval and sample modifiers", "[cli][command]")
@@ -1047,23 +1039,26 @@ TEST_CASE("a wire with no verbs gets no group and a wire with one still does", "
         CHECK(group.heading == WireTable[static_cast<std::size_t>(group.wire)].heading);
     }
 
-    // And the ACCEPTING direction from the real table rather than a synthetic one:
-    // `Stats` is this tree's SMALLEST group, and a grouping that dropped a group it
-    // thought too small would lose it while every other assertion here stayed green.
+    // And the ACCEPTING direction from the real table rather than a synthetic one: every
+    // wire the table has verbs on gets a group holding exactly those verbs, the smallest
+    // included -- a grouping that dropped a group it thought too small would lose one
+    // while every other assertion here stayed green.
     //
-    // Its size is COUNTED from the table rather than written as a literal. This case
+    // COUNTED per wire from the table, never a literal and never a named wire. This case
     // used to say `== 1` beside a comment calling `stats` the single-verb wire, and
     // `live-stats` is that wire's second row (#134 §1.1) -- a premise about a table's
     // size that became false the moment the table grew, reddening a case whose property
     // had not changed.
     auto const real = GroupVerbsByWire(Verbs());
-    auto const smallest = std::ranges::find(real, Wire::Stats, &VerbGroup::wire);
-    REQUIRE(smallest != real.end());
-    auto const statsRows = std::ranges::count(Verbs(), Wire::Stats, &VerbSpec::wire);
-    REQUIRE(statsRows > 0);
-    CHECK(std::cmp_equal(smallest->verbs.size(), statsRows));
-    CHECK(std::ranges::all_of(real,
-                              [&smallest](VerbGroup const& group) { return group.verbs.size() >= smallest->verbs.size(); }));
+    for (auto const& spec: WireTable)
+    {
+        INFO("wire: " << spec.name);
+        auto const rows = std::ranges::count(Verbs(), spec.wire, &VerbSpec::wire);
+        auto const group = std::ranges::find(real, spec.wire, &VerbGroup::wire);
+        CHECK((group != real.end()) == (rows > 0));
+        if (group != real.end())
+            CHECK(std::cmp_equal(group->verbs.size(), rows));
+    }
 }
 
 TEST_CASE("the help prints each wire's heading above that wire's own verbs", "[cli][command][help]")

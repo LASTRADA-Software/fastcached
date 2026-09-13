@@ -364,4 +364,22 @@ class ScriptedGatherer final: public IStatsGatherer
     int _calls { 0 };
 };
 
+/// Every advisory joined, for a `contains` check.
+///
+/// A refusal's sentence is an ADVISORY here rather than a field of `Answer` -- remarks
+/// go to stderr in every format so stdout stays parseable -- and which advisory carries
+/// it is not a property worth pinning.
+/// @param answer The answer.
+/// @return The advisories, newline separated.
+[[nodiscard]] inline std::string AdvisoryText(Answer const& answer)
+{
+    std::string out;
+    for (auto const& advisory: answer.advisories)
+    {
+        out += advisory;
+        out.push_back('\n');
+    }
+    return out;
+}
+
 } // namespace FastCache::Cli::Testing
