@@ -75,19 +75,18 @@ namespace FastCache::Cli
 /// The bytes presentation is spelled with, composed once.
 ///
 /// **Spelled by endo, not here.** Each is captured from endo's own `TerminalOutput` -- its
-/// `enterAltScreen`, `hideCursor`, `moveTo`, `clearToEndOfDisplay` -- through the
+/// `enterAltScreen`, `hideCursor`, `showCursor`, `leaveAltScreen` -- through the
 /// `writeToDestination` hook it provides for exactly that, so no sequence endo already writes is
-/// restated in this project. The two exceptions are synchronized output's begin and end: endo
-/// writes those only from inside `SyncGuard`, straight to a native handle, so there is nothing to
-/// capture, and they are spelled once in `TerminalEventStream.cpp`.
+/// restated in this project. `FrameBytes` spells a frame the same way. The two exceptions are
+/// synchronized output's begin and end: endo writes those only from inside `SyncGuard`, straight to
+/// a native handle, so there is nothing to capture, and they are spelled once in
+/// `TerminalEventStream.cpp`.
 struct TerminalScreenBytes
 {
-    std::string enter;      ///< Enter the alternate screen, then hide the cursor.
-    std::string leave;      ///< Show the cursor, then leave the alternate screen.
-    std::string home;       ///< Move the cursor to the top-left cell.
-    std::string clearBelow; ///< Clear from the cursor to the end of the screen.
-    std::string syncBegin;  ///< Begin synchronized output (DEC mode 2026).
-    std::string syncEnd;    ///< End synchronized output.
+    std::string enter;     ///< Enter the alternate screen, then hide the cursor.
+    std::string leave;     ///< Show the cursor, then leave the alternate screen.
+    std::string syncBegin; ///< Begin synchronized output (DEC mode 2026).
+    std::string syncEnd;   ///< End synchronized output.
 };
 
 /// @return The bytes, composed on first use.
@@ -102,8 +101,23 @@ struct TerminalScreenBytes
 /// @return True for `SynchronizedOutputAnswer::Supported` alone.
 [[nodiscard]] bool PresentsSynchronized(TerminalCapabilities const& capabilities) noexcept;
 
-/// One frame as it goes on the wire: home, the frame, clear below, optionally bracketed.
-/// @param frame The composed frame.
+/// One frame as it goes on the wire: each row placed at its own position, optionally bracketed.
+///
+/// **Every row is positioned absolutely -- `CSI <row>;1H`, `CSI K`, the row -- after the screen is
+/// cleared from the frame's last row down. A frame's `\n` never reaches the terminal.** A line feed moves the
+/// cursor DOWN; whether it also returns to the first column is the terminal's newline mode, a
+/// Windows console's DISABLE_NEWLINE_AUTO_RETURN (which endo's raw mode sets) and a POSIX tty's
+/// output post-processing, none of it this process's to rely on. Measured in a 120x40 ConPTY: rows
+/// joined by bare line feeds after a full-width row all landed in the last column, and the screen
+/// showed the top border and one column. Positioning each row is also immune to a pending wrap and
+/// to a row whose width was miscounted, since the next row starts where it says regardless.
+///
+/// Erasing comes BEFORE writing, because an erase starts at the cursor and a full-width row leaves
+/// the cursor on its own last cell: `row, CSI K` would erase that cell.
+///
+/// A frame's final `\n`, if it has one, ends the last row rather than starting an empty one below
+/// it, which on a screen exactly as tall as the frame would erase the bottom row.
+/// @param frame The composed frame, rows separated by `\n`.
 /// @param synchronized Whether to bracket it in synchronized output.
 /// @return The bytes.
 [[nodiscard]] std::string FrameBytes(std::string_view frame, bool synchronized);
