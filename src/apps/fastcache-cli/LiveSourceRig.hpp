@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
+#include <expected>
 #include <memory>
 #include <optional>
 #include <string>
@@ -171,6 +172,36 @@ class SpokenTerminal final: public IDashboardEventSource
     TerminalRelease* _release;
 };
 
+/// An admin surface answering one scripted document to every fetch, and remembering each path.
+///
+/// Read and written on whichever rig reactor runs the fetch; the rig drains them on one thread.
+class ScriptedDocument final: public IAdminDocument
+{
+  public:
+    /// @param answer What every fetch returns.
+    explicit ScriptedDocument(std::expected<std::string, AdminError> answer):
+        _answer { std::move(answer) }
+    {
+    }
+
+    [[nodiscard]] std::expected<std::string, AdminError> FetchAdmin(std::string_view path) override
+    {
+        _asked.emplace_back(path);
+        return _answer;
+    }
+
+    /// Every path this was asked for, in order.
+    /// @return The paths.
+    [[nodiscard]] std::vector<std::string> const& Asked() const noexcept
+    {
+        return _asked;
+    }
+
+  private:
+    std::expected<std::string, AdminError> _answer;
+    std::vector<std::string> _asked;
+};
+
 /// A view whose frame is the sample count, which is all these cases read.
 class CountView final: public IDashboardView
 {
@@ -228,6 +259,8 @@ struct Rig
     {
         return LiveSourceParts { .reactor = &reactor,
                                  .gatherer = &gatherer,
+                                 .admin = nullptr,
+                                 .document = {},
                                  .dialer = nullptr,
                                  .pool = &pool,
                                  .clock = &clock,

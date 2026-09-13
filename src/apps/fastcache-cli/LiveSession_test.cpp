@@ -192,15 +192,18 @@ class RecordingRungViews final: public IRungViews
     std::vector<RenderRung> _asked {};
 };
 
-/// How a composition's collaborators misbehave, when a case wants them to.
+/// How a composition's collaborators misbehave or differ from a cache session's, when a case wants them to.
 struct CompositionFaults
 {
-    bool detachAtOnce { false };          ///< An acquired terminal goes away before its first read.
-    std::string stopRefusal {};           ///< Why installing the stop request fails; empty when it does not.
-    bool throwingViews { false };         ///< Every view throws on its first frame.
-    bool pipedViewsOnly { false };        ///< Only the `Piped` rung has a view, as in this build.
-    IStatsGatherer* gatherer { nullptr }; ///< What samples ask instead of the rig's gatherer, when set.
-    IStatsDialer* dialer { nullptr };     ///< What re-dials after a failed sample; none when null.
+    bool detachAtOnce { false };                ///< An acquired terminal goes away before its first read.
+    std::string stopRefusal {};                 ///< Why installing the stop request fails; empty when it does not.
+    bool throwingViews { false };               ///< Every view throws on its first frame.
+    bool pipedViewsOnly { false };              ///< Only the `Piped` rung has a view, as in this build.
+    IStatsGatherer* gatherer { nullptr };       ///< What samples ask instead of the rig's gatherer, when set.
+    IStatsDialer* dialer { nullptr };           ///< What re-dials after a failed sample; none when null.
+    LiveSubject subject { LiveSubject::Cache }; ///< What the admitted plan watches.
+    IAdminDocument* admin { nullptr };          ///< What a document sample asks; none when null.
+    SampleReader reader { &ReadStatsSample };   ///< What a sample says.
 };
 
 /// Await a composed session into @p out, recording an exception rather than losing it.
@@ -238,7 +241,10 @@ struct Composition
         views { faults.throwingViews, faults.pipedViewsOnly },
         terminalPool { rig.clock },
         gatherer { faults.gatherer != nullptr ? faults.gatherer : &rig.gatherer },
-        dialer { faults.dialer }
+        dialer { faults.dialer },
+        subject { faults.subject },
+        admin { faults.admin },
+        reader { faults.reader }
     {
     }
 
@@ -249,6 +255,9 @@ struct Composition
     TestReactor terminalPool;
     IStatsGatherer* gatherer;
     IStatsDialer* dialer;
+    LiveSubject subject;
+    IAdminDocument* admin;
+    SampleReader reader;
     std::optional<LiveEventSource> source;
     std::optional<std::expected<LiveSessionRun, Answer>> result;
     bool threw { false };
@@ -259,23 +268,23 @@ struct Composition
     /// @param samples The sample budget; 0 for none.
     void Start(bool interactive, std::size_t samples = 0)
     {
-        auto parts = LiveSessionParts { .plan = LivePlan { .subject = LiveSubject::Cache,
-                                                           .interval = Interval,
-                                                           .samples = samples,
-                                                           .endpoint = "10.0.0.4:6674" },
-                                        .reactor = &rig.reactor,
-                                        .gatherer = gatherer,
-                                        .dialer = dialer,
-                                        .reader = &ReadStatsSample,
-                                        .clock = &rig.clock,
-                                        .samplePool = &rig.pool,
-                                        .stopWaiter = &rig.stopWaiter,
-                                        .terminalPool = &terminalPool,
-                                        .sink = &rig.sink,
-                                        .interactive = interactive,
-                                        .terminals = &terminals,
-                                        .stops = &stops,
-                                        .views = &views };
+        auto parts = LiveSessionParts {
+            .plan = LivePlan { .subject = subject, .interval = Interval, .samples = samples, .endpoint = "10.0.0.4:6674" },
+            .reactor = &rig.reactor,
+            .gatherer = gatherer,
+            .admin = admin,
+            .dialer = dialer,
+            .reader = reader,
+            .clock = &rig.clock,
+            .samplePool = &rig.pool,
+            .stopWaiter = &rig.stopWaiter,
+            .terminalPool = &terminalPool,
+            .sink = &rig.sink,
+            .interactive = interactive,
+            .terminals = &terminals,
+            .stops = &stops,
+            .views = &views
+        };
         task = ComposeInto(std::move(parts), &source, &result, &threw);
         rig.reactor.Submit(task.Native());
     }
@@ -500,6 +509,45 @@ TEST_CASE("a composed session re-dials after a failed sample and reaches its bud
 
     CHECK(composition.Stop() == DashboardStop::SampleBudget);
     CHECK(dialer.Dials() == 1);
+
+    composition.Finish();
+}
+
+namespace
+{
+
+/// A reader for a document session that reads only whether a document arrived.
+///
+/// Stands in for the fleet reader this build does not have yet: the composition is the subject,
+/// and it cannot tell one reader from another.
+/// @param event The `Sample`.
+/// @return A reading when the fetch produced a document; otherwise the failure.
+[[nodiscard]] SampleReading ReadAnyDocument(DashboardEvent const& event)
+{
+    if (!event.document.has_value() || !event.document->has_value())
+        return SampleReading { .outcome = Outcome::Unreachable, .value = {}, .source = {} };
+    return SampleReading { .outcome = Outcome::Affirmative, .value = {}, .source = "fleet.txt" };
+}
+
+} // namespace
+
+TEST_CASE("a composed fleet session samples its subject's document and never the stats gatherer",
+          "[cli][live][session][document]")
+{
+    // The composition, not the source, decides which door a session's samples go through: it
+    // reads the subject's column. Composed as `cache` this same case gathers every sample.
+    Rig rig;
+    ScriptedDocument admin { std::string { "# kpi" } };
+    Composition composition {
+        rig, SixelTerminal, CompositionFaults { .subject = LiveSubject::Fleet, .admin = &admin, .reader = &ReadAnyDocument }
+    };
+    composition.Start(false, 2);
+    composition.RunFor(3);
+
+    CHECK(composition.Stop() == DashboardStop::SampleBudget);
+    auto const path = std::string { LiveSubjectTable[static_cast<std::size_t>(LiveSubject::Fleet)].document };
+    CHECK(admin.Asked() == std::vector<std::string>(2, path));
+    CHECK(rig.gatherer.Calls() == 0);
 
     composition.Finish();
 }
@@ -1177,15 +1225,41 @@ TEST_CASE("a live-stats fleet session is refused by name while fleet sessions ca
     auto identity = ScriptedIdentity { EndpointIdentity {
         .kind = RemoteKind::CompileNode, .detail = "10.0.0.4:6674 is a fastcache-compile-node", .unreadable = false } };
     auto const operands = std::vector<std::string> { "fleet" };
+    auto admin = CountingAdmin {};
 
-    // At fleet's own default, which the cache floor the other cases use is below.
-    auto context = SessionContext(operands, 1, &identity, &seat.gatherer);
+    // At fleet's own default, which the cache floor the other cases use is below. No stats
+    // ladder: a fleet session never reads one, so its absence must not be what refuses it.
+    auto context = SessionContext(operands, 1, &identity, nullptr);
     context.options.interval = std::nullopt;
+    context.admin = &admin;
 
     auto const ending = seat.Run(context);
 
     CHECK(ending.kind == SessionEndKind::Refused);
     CHECK(ending.answer.outcome == Outcome::Local);
     CHECK(AdvisoryText(ending.answer).contains("live-stats fleet"));
+    CHECK(admin.Fetches() == 0);
+    CHECK_FALSE(seat.source.has_value());
+}
+
+TEST_CASE("a live-stats fleet session with no admin surface is refused as usage before anything is composed",
+          "[cli][live][session][seat]")
+{
+    auto seat = RunningSeat { RenderOptions { .format = OutputFormat::Tsv }, false };
+    auto identity = ScriptedIdentity { EndpointIdentity {
+        .kind = RemoteKind::CompileNode, .detail = "10.0.0.4:6674 is a fastcache-compile-node", .unreadable = false } };
+    auto const operands = std::vector<std::string> { "fleet" };
+
+    // A stats ladder is there and is not the door a fleet sample goes through.
+    auto context = SessionContext(operands, 1, &identity, &seat.gatherer);
+    context.options.interval = std::nullopt;
+
+    auto const ending = seat.Run(context);
+
+    CHECK(ending.kind == SessionEndKind::Refused);
+    CHECK(ending.answer.outcome == Outcome::Usage);
+    CHECK(AdvisoryText(ending.answer).contains(NoAdminSurface));
+    CHECK(seat.gatherer.Calls() == 0);
+    CHECK(seat.stops.Calls() == 0);
     CHECK_FALSE(seat.source.has_value());
 }

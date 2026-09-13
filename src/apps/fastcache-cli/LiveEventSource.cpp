@@ -10,6 +10,7 @@
 #include <atomic>
 #include <cassert>
 #include <cstddef>
+#include <expected>
 #include <limits>
 #include <string>
 #include <string_view>
@@ -21,6 +22,34 @@ namespace FastCache::Cli
 
 namespace
 {
+    /// One document sample, and when it was taken.
+    struct DocumentOutcome
+    {
+        std::expected<std::string, AdminError> document { std::unexpected(AdminError {}) }; ///< What the fetch produced.
+        TimePoint takenAt {};                                                               ///< When it answered.
+    };
+
+    /// Fetch one admin document off the reactor and come back: `TakeSample`'s two hops.
+    ///
+    /// The same shape for the same reasons, and stamped in the same place -- on the pool, the
+    /// moment the fetch returns -- so a rate over documents is divided by the time the fetches took.
+    /// @param admin What to ask.
+    /// @param path The document; by value, for the coroutine frame.
+    /// @param clock What stamps it; reads its source on every call.
+    /// @param pool Where the blocking fetch runs.
+    /// @param resumeOn Where the caller resumes.
+    /// @return The document, and when it arrived.
+    Task<DocumentOutcome> TakeDocument(
+        IAdminDocument* admin, std::string path, IClock* clock, IExecutor* pool, IExecutor* resumeOn)
+    {
+        auto outcome = DocumentOutcome {};
+        co_await ResumeOn { *pool };
+        outcome.document = admin->FetchAdmin(path);
+        outcome.takenAt = clock->Now();
+        co_await ResumeOn { *resumeOn };
+        co_return outcome;
+    }
+
     /// Asks the gatherer it holds, dialling a new one first when the last round failed.
     ///
     /// Read and written only by the gathers, which run one at a time on the pool: the cadence
@@ -154,6 +183,38 @@ namespace
         (void) static_cast<AsyncQueue<std::monostate>*>(due)->Push(std::monostate {});
     }
 
+    /// Take one sample through whichever door the session samples, as the event it becomes.
+    ///
+    /// One step for both doors, so the cadence around it -- the stamp of when a sample is out,
+    /// the tick, the deadline -- is written once.
+    /// @param state The source's state; the cadence holds it alive.
+    /// @return The `Sample` or `SampleFailed` to deliver.
+    Task<DashboardEvent> SampleOnce(LiveEventSource::State* state)
+    {
+        auto const& parts = state->parts;
+        if (!parts.document.empty())
+        {
+            auto fetched = co_await TakeDocument(parts.admin, parts.document, parts.clock, parts.pool, parts.reactor);
+            // Success or failure, the document is the reader's to interpret: a refusal carries the
+            // leader's own words, and the reader decides which outcome that is.
+            co_return DashboardEvent { .kind = DashboardEventKind::Sample,
+                                       .at = fetched.takenAt,
+                                       .document = std::move(fetched.document) };
+        }
+
+        auto sample = co_await TakeSample(&state->gatherer, parts.clock, parts.pool, parts.reactor);
+        if (sample.attempts.empty())
+            // Nothing could be asked at all. A failure the loop counts and draws as a gap -- never
+            // a reading with nothing in it, which the reader would have to guess about.
+            co_return DashboardEvent { .kind = DashboardEventKind::SampleFailed,
+                                       .at = sample.takenAt,
+                                       .outcome = Outcome::Unreachable,
+                                       .note = "no stats source could be asked" };
+        co_return DashboardEvent { .kind = DashboardEventKind::Sample,
+                                   .at = sample.takenAt,
+                                   .attempts = std::move(sample.attempts) };
+    }
+
     /// Sample, deliver, park until the next deadline; until closed.
     ///
     /// **The deadline is the later of the cadence grid and now.** On the grid, a sample
@@ -171,21 +232,12 @@ namespace
         while (!shared->Closed())
         {
             shared->sampleSince.store(parts.clock->Now().time_since_epoch().count(), std::memory_order_release);
-            auto sample = co_await TakeSample(&shared->gatherer, parts.clock, parts.pool, parts.reactor);
+            auto sample = co_await SampleOnce(shared.get());
             shared->sampleSince.store(LiveEventSource::State::NoSample, std::memory_order_release);
-            // Closed while the gather was on the pool: the closed queue refuses the reading,
+            // Closed while the sample was on the pool: the closed queue refuses the reading,
             // which describes a session that has already ended, and the closed `due` ends
             // the loop below without a wait.
-            if (sample.attempts.empty())
-                // Nothing could be asked at all. A failure the loop counts and draws as a gap --
-                // never a reading with nothing in it, which the reader would have to guess about.
-                shared->Deliver(DashboardEvent { .kind = DashboardEventKind::SampleFailed,
-                                                 .at = sample.takenAt,
-                                                 .outcome = Outcome::Unreachable,
-                                                 .note = "no stats source could be asked" });
-            else
-                shared->Deliver(DashboardEvent {
-                    .kind = DashboardEventKind::Sample, .at = sample.takenAt, .attempts = std::move(sample.attempts) });
+            shared->Deliver(std::move(sample));
             shared->Deliver(DashboardEvent { .kind = DashboardEventKind::Tick });
 
             deadline = std::max(deadline + parts.interval, parts.reactor->Clock().Now());
