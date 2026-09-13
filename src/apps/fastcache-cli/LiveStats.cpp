@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "LiveStats.hpp"
 
+#include <FastCache/Core/Ranges.hpp>
+
 #include <format>
 #include <string>
 #include <utility>
@@ -53,25 +55,21 @@ namespace
     /// @return The row, or nullptr when no inferrable subject is served by that kind.
     [[nodiscard]] LiveSubjectSpec const* InferredSubject(RemoteKind kind) noexcept
     {
-        for (auto const& row: LiveSubjectTable)
-            if (row.inferrable && row.servedBy == kind)
-                return &row;
-        return nullptr;
+        return FindIfOrNull(LiveSubjectTable,
+                            [kind](LiveSubjectSpec const& row) { return row.inferrable && row.servedBy == kind; });
     }
 } // namespace
 
 LiveSubjectSpec const* FindLiveSubject(std::string_view key) noexcept
 {
-    for (auto const& row: LiveSubjectTable)
-        if (row.key == key)
-            return &row;
-    return nullptr;
+    return FindOrNull(LiveSubjectTable, key, &LiveSubjectSpec::key);
 }
 
 std::expected<LivePlan, Answer> AdmitLiveStats(VerbContext const& context)
 {
     // What can be refused WITHOUT asking the endpoint is refused first, so a typo costs no
-    // round trip: a word naming no subject, and a named subject's floor.
+    // identification: a word naming no subject, and a named subject's floor. Not yet no
+    // CONNECTION -- `main` opens the wire's connections before any handler runs.
     LiveSubjectSpec const* named = nullptr;
     if (!context.operands.empty())
     {
@@ -105,41 +103,40 @@ std::expected<LivePlan, Answer> AdmitLiveStats(VerbContext const& context)
                                                      identity.detail)));
     auto const kind = *identity.kind;
 
-    // The port answered in a protocol this client does not speak. No subject, named or
-    // not, can be watched there, and `Protocol` is the outcome that says the peer may not
-    // be a fastcache at all.
-    if (kind == RemoteKind::NotFastcacheWire)
+    // What an endpoint of this kind makes of a subject it cannot serve is the kind's own
+    // row, so this admission and `RunNodeFallback` give one endpoint one outcome. A kind
+    // that establishes nothing answered in a protocol this client does not speak: no
+    // subject, named or not, can be watched there, and `Protocol` is the outcome that says
+    // the peer may not be a fastcache at all.
+    auto const established = EstablishedBy(kind);
+    if (!established.has_value())
         return std::unexpected(Concluded(Outcome::Protocol, std::format("cannot watch this endpoint: {}", identity.detail)));
 
-    auto const* subject = named;
+    auto const* const subject = named != nullptr ? named : InferredSubject(kind);
     if (subject == nullptr)
-    {
-        subject = InferredSubject(kind);
-        if (subject == nullptr)
-            return std::unexpected(
-                Concluded(Outcome::Refused,
-                          std::format("nothing live-stats watches is inferred for this endpoint ({}); name one of: {}",
-                                      identity.detail,
-                                      SubjectKeys())));
-        // The floor of an INFERRED subject is known only now, which is why this check is
-        // the one refusal that costs a round trip.
-        if (auto refusal = BelowFloor(*subject, context.options.interval); refusal.has_value())
-            return std::unexpected(*std::move(refusal));
-    }
-    else if (subject->servedBy != kind)
-    {
-        // **Asserted, not requested** (#134 §1.2): the refusal names what the endpoint
-        // turned out to be, because a bare *refused* leaves the operator guessing which of
-        // the two -- their address or their subject -- is wrong.
         return std::unexpected(
-            Concluded(Outcome::Refused,
-                      std::format("`live-stats {}` needs {}, and {}", subject->key, subject->needs, identity.detail)));
-    }
+            Concluded(*established,
+                      std::format("nothing live-stats watches is inferred for this endpoint ({}); name one of: {}",
+                                  identity.detail,
+                                  SubjectKeys())));
+
+    // **Asserted, not requested** (#134 §1.2): the refusal names what the endpoint turned
+    // out to be, because a bare *refused* leaves the operator guessing which of the two --
+    // their address or their subject -- is wrong. An inferred subject matches by
+    // construction, so only a named one can be refused here.
+    if (subject->servedBy != kind)
+        return std::unexpected(Concluded(
+            *established, std::format("`live-stats {}` needs {}, and {}", subject->key, subject->needs, identity.detail)));
+
+    // A named subject's floor was checked before asking. An INFERRED one's is known only
+    // now, which is why this is the one floor refusal that costs a round trip.
+    if (auto refusal = BelowFloor(*subject, context.options.interval); refusal.has_value())
+        return std::unexpected(*std::move(refusal));
 
     return LivePlan { .subject = subject->subject,
                       .interval = context.options.interval.value_or(subject->defaultInterval),
                       .samples = context.options.samples.value_or(0),
-                      .identity = std::move(identity) };
+                      .endpoint = std::move(identity.detail) };
 }
 
 Answer LiveStatsVerb(VerbContext const& context)
@@ -157,7 +154,7 @@ Answer LiveStatsVerb(VerbContext const& context)
         Field { .name = "samples",
                 .value =
                     plan->samples == 0 ? TextCell("unbounded") : NumberCell(static_cast<std::uint64_t>(plan->samples)) },
-        Field { .name = "endpoint", .value = TextCell(plan->identity.detail) },
+        Field { .name = "endpoint", .value = TextCell(plan->endpoint) },
     }));
 }
 

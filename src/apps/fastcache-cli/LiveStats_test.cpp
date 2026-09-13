@@ -83,12 +83,7 @@ struct Admission
 /// @return The advisories joined; empty when the admission was not refused.
 [[nodiscard]] std::string RefusalText(Admission const& admission)
 {
-    auto text = std::string {};
-    if (admission.result.has_value())
-        return text;
-    for (auto const& line: admission.result.error().advisories)
-        text += line + "\n";
-    return text;
+    return admission.result.has_value() ? std::string {} : AdvisoryText(admission.result.error());
 }
 
 /// The options with only an interval set.
@@ -284,8 +279,9 @@ TEST_CASE("live-stats through the verb table answers its admission", "[cli][live
     auto const admitted = RunVerb(*verb, VerbContext { .stats = &gatherer, .identity = &node });
     CHECK(admitted.outcome == Outcome::Affirmative);
     REQUIRE(admitted.value.shape == Shape::Record);
-    CHECK(std::ranges::any_of(admitted.value.fields,
-                              [](Field const& field) { return field.name == "subject" && field.value.lexical == "node"; }));
+    auto const* const subject = FindField(admitted.value, "subject");
+    REQUIRE(subject != nullptr);
+    CHECK(subject->value.lexical == "node");
 
     ScriptedIdentity nobody { NotAsked() };
     CHECK(RunVerb(*verb, VerbContext { .stats = &gatherer, .identity = &nobody }).outcome == Outcome::Unreachable);

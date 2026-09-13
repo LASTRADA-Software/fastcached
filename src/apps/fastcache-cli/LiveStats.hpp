@@ -15,6 +15,7 @@
 #include <expected>
 #include <optional>
 #include <ranges>
+#include <string>
 #include <string_view>
 
 namespace FastCache::Cli
@@ -163,10 +164,10 @@ namespace Detail
     /// @return `" ["` + the keys joined by `|` + `"]"`.
     [[nodiscard]] consteval std::size_t LiveSubjectOperandsLength() noexcept
     {
-        auto length = std::string_view { " []" }.size();
+        auto length = std::string_view { " ]" }.size();
         for (auto const& row: LiveSubjectTable)
-            length += row.key.size() + 1; // the key and its separator
-        return length - 1;                // n keys have n-1 separators
+            length += 1 + row.key.size(); // the `[` or `|` before the key, and the key
+        return length;
     }
 
     /// The operand list, spelled from the table at compile time.
@@ -179,14 +180,13 @@ namespace Detail
             for (auto const ch: piece)
                 text.at(at++) = ch;
         };
-        put(" [");
-        auto first = true;
+        put(" ");
+        auto separator = std::string_view { "[" };
         for (auto const& row: LiveSubjectTable)
         {
-            if (!first)
-                put("|");
-            first = false;
+            put(separator);
             put(row.key);
+            separator = "|";
         }
         put("]");
         return text;
@@ -215,25 +215,27 @@ struct LivePlan
     LiveSubject subject { LiveSubject::Cache }; ///< What it watches.
     std::chrono::milliseconds interval {};      ///< Time between samples.
     std::size_t samples { 0 };                  ///< Stop after this many; 0 means no bound.
-    EndpointIdentity identity {};               ///< What the endpoint turned out to be.
+    std::string endpoint {};                    ///< What the endpoint turned out to be, in words.
 };
 
 /// Decide whether @p context may start a `live-stats` session, and what it watches.
 ///
 /// **Everything that can be refused without asking the endpoint is refused first**: an
 /// operand naming no subject, and a named subject's interval below its floor, cost no
-/// round trip. Only then is the endpoint identified -- to infer an unnamed subject, or to
-/// check a named one is something this endpoint can serve.
+/// identification. Only then is the endpoint identified -- to infer an unnamed subject, or
+/// to check a named one is something this endpoint can serve.
 ///
 /// The refusals, and why each is the outcome it is:
 ///   - an operand naming no subject, or an interval below the subject's floor: `Usage`,
 ///     naming the floor, the subject it belongs to and who pays for a sample;
-///   - nobody could ask what the endpoint is: `Unreachable`, naming why and saying to name
-///     the subject -- **never** silently `cache`;
+///   - nobody could ask what the endpoint is: `Unreachable`, naming why and pointing at the
+///     address -- **never** silently `cache`, and never *name a subject*, which leads back
+///     here;
 ///   - the endpoint framed nothing recognisable: `Protocol`, because the port answered in
 ///     a protocol this client does not speak;
-///   - a named subject the endpoint cannot serve: `Refused`, naming what it turned out to
-///     be, which is the half a bare "refused" leaves out.
+///   - a named subject the endpoint cannot serve, or no subject to infer: the outcome the
+///     endpoint's kind establishes (`RemoteKindTable`), naming what it turned out to be,
+///     which is the half a bare "refused" leaves out.
 ///
 /// @param context The invocation; its `identity` is what the endpoint is asked through.
 /// @return The plan, or the answer that refuses it.

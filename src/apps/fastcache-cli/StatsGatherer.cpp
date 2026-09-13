@@ -42,11 +42,8 @@ LadderGatherer::Identification const& LadderGatherer::Identified()
                                  std::string detail,
                                  std::optional<CompileCacheWire::NodeStatusFields> fields =
                                      std::nullopt) -> Identification const& {
-        using Described = std::expected<CompileCacheWire::NodeStatusFields, std::string>;
-        auto described = fields.has_value() ? Described { *std::move(fields) } : Described { std::unexpect, detail };
-        _identification = Identification { .fields = std::move(described),
-                                           .endpoint = EndpointIdentity { .kind = kind, .detail = std::move(detail) } };
-        return *_identification;
+        return _identification.emplace(Identification {
+            .fields = std::move(fields), .endpoint = EndpointIdentity { .kind = kind, .detail = std::move(detail) } });
     };
 
     if (_node == nullptr)
@@ -89,11 +86,6 @@ LadderGatherer::Identification const& LadderGatherer::Identified()
     return remember(kind, std::format("{} is a fastcache-compile-node", _node->Address()), *std::move(fields));
 }
 
-std::expected<CompileCacheWire::NodeStatusFields, std::string> const& LadderGatherer::Identify()
-{
-    return Identified().fields;
-}
-
 EndpointIdentity LadderGatherer::IdentifyEndpoint()
 {
     return Identified().endpoint;
@@ -107,12 +99,14 @@ std::expected<Endpoint, std::string> LadderGatherer::ResolveAdmin()
     if (_admin.Configured())
         return _admin;
 
-    auto const& identity = Identify();
-    if (!identity.has_value())
-        return std::unexpected(std::format("no admin address is known and none could be discovered: {}", identity.error()));
+    auto const& identified = Identified();
+    if (!identified.fields.has_value())
+        return std::unexpected(
+            std::format("no admin address is known and none could be discovered: {}", identified.endpoint.detail));
+    auto const& identity = *identified.fields;
 
     auto const admin = std::ranges::find(
-        identity->surfaces, CompileCacheWire::WireSurface::Admin, &CompileCacheWire::SurfaceReport::surface);
+        identity.surfaces, CompileCacheWire::WireSurface::Admin, &CompileCacheWire::SurfaceReport::surface);
 
     // **Absent, and that is an ANSWER rather than a failure to get one.** A node that
     // opened no admin surface said so; telling an operator the scrape *failed* would
@@ -131,7 +125,7 @@ std::expected<Endpoint, std::string> LadderGatherer::ResolveAdmin()
     // its endpoint with `--admin-listen` alone and wants no dashboard at all. The
     // necessary condition both callers share is the only remedy a shared sentence can
     // state without being wrong for one of them.
-    if (admin == identity->surfaces.end())
+    if (admin == identity.surfaces.end())
         return std::unexpected(std::format("{} runs no admin surface. Start the node with --admin-listen to open "
                                            "one: it is off unless asked for, so a node without one is configured "
                                            "rather than broken",
@@ -239,9 +233,9 @@ StatsAttempt LadderGatherer::AskNodeMetrics()
     // consulted about it, and reporting *did not answer* would send an operator to check
     // a component that is not there. Against a plain `fastcached` this is the ordinary
     // path and must be quiet.
-    if (auto const& identity = Identify(); !identity.has_value())
+    if (auto const& identified = Identified(); !identified.fields.has_value())
     {
-        attempt.note = identity.error();
+        attempt.note = identified.endpoint.detail;
         return attempt;
     }
 
