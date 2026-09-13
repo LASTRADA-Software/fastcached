@@ -27,7 +27,8 @@ namespace
 } // namespace
 
 std::expected<std::unique_ptr<UnstartedTerminal>, std::string> MakeTerminalEvents(IExecutor* /*pool*/,
-                                                                                  IExecutor* /*resumeOn*/)
+                                                                                  IExecutor* /*resumeOn*/,
+                                                                                  UsageColor /*colour*/)
 {
     return std::unexpected(std::string { Unavailable });
 }

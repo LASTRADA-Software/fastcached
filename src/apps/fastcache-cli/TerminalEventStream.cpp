@@ -10,13 +10,16 @@
 #include <cstdint>
 #include <deque>
 #include <exception>
+#include <iterator>
 #include <mutex>
 #include <optional>
 #include <ranges>
 #include <span>
+#include <string>
 #include <string_view>
 #include <utility>
 #include <variant>
+#include <vector>
 
 #include <tui/KeyCode.hpp>
 #include <tui/Modifier.hpp>
@@ -299,20 +302,20 @@ namespace
     class TerminalFramePresenter final: public IFrameSink
     {
       public:
-        TerminalFramePresenter(std::shared_ptr<ITerminalDevice> device, bool synchronized) noexcept:
+        TerminalFramePresenter(std::shared_ptr<ITerminalDevice> device, TerminalCapabilities capabilities) noexcept:
             _device { std::move(device) },
-            _synchronized { synchronized }
+            _capabilities { capabilities }
         {
         }
 
         void PresentPlaced(DashboardFrame const& frame) override
         {
-            _device->Write(FrameBytes(frame, _synchronized));
+            _device->Write(FrameBytes(frame, _capabilities));
         }
 
       private:
         std::shared_ptr<ITerminalDevice> _device;
-        bool _synchronized;
+        TerminalCapabilities _capabilities;
     };
 
     /// The events of a started terminal, sharing the device they are read from.
@@ -445,9 +448,62 @@ bool PresentsSynchronized(TerminalCapabilities const& capabilities) noexcept
 
 namespace
 {
+    /// endo's style for a palette row.
+    /// @param row The row.
+    /// @return The style.
+    [[nodiscard]] tui::Style StyleOf(TonePaletteRow const& row)
+    {
+        auto style = tui::Style {};
+        if (row.colour.has_value())
+            style.fg = *row.colour;
+        style.bold = row.bold;
+        style.dim = row.dim;
+        style.inverse = row.inverse;
+        return style;
+    }
+
+    /// How a frame's dressed runs are written.
+    struct Dressing
+    {
+        std::span<FrameSpan const> spans;   ///< Every span of the frame, in any order.
+        TerminalCapabilities const* record; ///< Whose palette answer applies; null writes every run plain.
+    };
+
+    /// Write one row: its dressed runs through endo's styled text, the rest as it stands.
+    ///
+    /// A run that does not lie inside the row, or that overlaps the one before it, is written plain, and so
+    /// is every run where the record allows no colour: a span dresses bytes, and never adds, drops or
+    /// reorders one.
+    /// @param output Where the row goes.
+    /// @param line The row's text.
+    /// @param dressing The spans and the record.
+    /// @param row The row's 1-based number.
+    void WriteRow(CapturedOutput& output, std::string_view line, Dressing const& dressing, std::size_t row)
+    {
+        auto mine = std::vector<FrameSpan> {};
+        if (dressing.record != nullptr)
+            std::ranges::copy_if(
+                dressing.spans, std::back_inserter(mine), [row](FrameSpan const& span) { return span.row == row; });
+        std::ranges::sort(mine, {}, &FrameSpan::byte);
+
+        auto written = std::size_t { 0 };
+        for (auto const& span: mine)
+        {
+            auto const* const palette = PaletteFor(span.tone, *dressing.record);
+            if (palette == nullptr || span.byte < written || span.length > line.size()
+                || span.byte > line.size() - span.length)
+                continue;
+            output.writeRaw(line.substr(written, span.byte - written));
+            output.writeText(line.substr(span.byte, span.length), StyleOf(*palette));
+            written = span.byte + span.length;
+        }
+        output.writeRaw(line.substr(written));
+    }
+
     /// `FrameBytes`, with or without images: the rows, then @p placements, in one bracket.
     [[nodiscard]] std::string RowsThenPlacements(std::string_view frame,
                                                  std::span<FramePlacement const> placements,
+                                                 Dressing const& dressing,
                                                  bool synchronized)
     {
         if (frame.ends_with('\n'))
@@ -470,7 +526,7 @@ namespace
         {
             output.moveTo(row, 1);
             output.clearToEndOfLine();
-            output.writeRaw(std::string_view { line.begin(), line.end() });
+            WriteRow(output, std::string_view { line.begin(), line.end() }, dressing, static_cast<std::size_t>(row));
             ++row;
         }
 
@@ -491,12 +547,20 @@ namespace
 
 std::string FrameBytes(std::string_view frame, bool synchronized)
 {
-    return RowsThenPlacements(frame, {}, synchronized);
+    return RowsThenPlacements(frame, {}, Dressing { .spans = {}, .record = nullptr }, synchronized);
 }
 
 std::string FrameBytes(DashboardFrame const& frame, bool synchronized)
 {
-    return RowsThenPlacements(frame.text, frame.placements, synchronized);
+    return RowsThenPlacements(frame.text, frame.placements, Dressing { .spans = {}, .record = nullptr }, synchronized);
+}
+
+std::string FrameBytes(DashboardFrame const& frame, TerminalCapabilities const& capabilities)
+{
+    return RowsThenPlacements(frame.text,
+                              frame.placements,
+                              Dressing { .spans = frame.spans, .record = &capabilities },
+                              PresentsSynchronized(capabilities));
 }
 
 SynchronizedOutputAnswer ToSynchronizedOutputAnswer(tui::DecModeStatus status) noexcept
@@ -622,6 +686,7 @@ Task<std::expected<StartedTerminal, std::string>> StartTerminalDevice(std::uniqu
             guard.ScreenEntering();
             device->Write(enter);
             record.encoding = device->Encoding();
+            record.colour = device->AskColour();
             capabilities = record;
         }
     }
@@ -658,7 +723,7 @@ Task<std::expected<StartedTerminal, std::string>> StartTerminalDevice(std::uniqu
         };
     auto stream = MakeTerminalEventStream(std::move(parts));
     auto restore = std::make_shared<TerminalRestoreHandle>(shared.get(), RestoreNowLeading());
-    auto frames = std::make_unique<TerminalFramePresenter>(shared, PresentsSynchronized(*capabilities));
+    auto frames = std::make_unique<TerminalFramePresenter>(shared, *capabilities);
     auto events = std::make_unique<StartedTerminalEvents>(shared, std::move(stream), restore);
     guard.Keep();
     co_return StartedTerminal {

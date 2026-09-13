@@ -294,6 +294,7 @@ namespace
         Priority priority { Priority::Normal }; ///< When it goes.
         std::size_t slot { 0 };                 ///< Which column it is, for a table whose rows follow its heading.
         bool trend { false };                   ///< Whether this is the trend, which narrows before it goes.
+        std::optional<FrameTone> tone {};       ///< How its text is dressed, spaces around it excluded; none for plain.
     };
 
     /// The pieces of a line that fit in @p budget cells.
@@ -351,6 +352,15 @@ namespace
         return total;
     }
 
+    /// A run of one of an item's lines a presenter dresses.
+    struct LineSpan
+    {
+        std::size_t line { 0 };                 ///< Which of the item's lines; a table's heading is 0.
+        std::size_t byte { 0 };                 ///< Where the run starts in that line's text.
+        std::size_t length { 0 };               ///< How many bytes it covers.
+        FrameTone tone { FrameTone::Selected }; ///< What it is.
+    };
+
     /// One vertical item of a frame: a line, a blank, or a table that can shrink.
     struct Item
     {
@@ -359,12 +369,14 @@ namespace
         std::size_t hidden { 0 };               ///< How many of a table's rows are not shown.
         bool table { false };                   ///< Whether it shrinks to `+N more` before it goes.
         bool image { false };                   ///< Whether its lines are blank cells an image is placed over.
+        std::vector<LineSpan> spans {};         ///< The runs of its lines a presenter dresses.
     };
 
-    /// The lines a layout keeps, and where its image item landed if it kept one.
+    /// The lines a layout keeps, the runs it dresses, and where its image item landed if it kept one.
     struct FittedRows
     {
         std::vector<std::string> lines {};       ///< Every kept line, top to bottom.
+        std::vector<LineSpan> spans {};          ///< Every kept run; `line` indexes `lines`.
         std::optional<std::size_t> imageLine {}; ///< The index of the image item's first line, when kept.
     };
 
@@ -473,23 +485,24 @@ namespace
                 return std::nullopt;
         }
 
-        auto lines = std::vector<std::string> {};
-        auto imageLine = std::optional<std::size_t> {};
+        auto fitted = FittedRows {};
         for (auto& item: items)
         {
-            if (!item.table)
-            {
-                if (item.image)
-                    imageLine = lines.size();
-                std::ranges::move(item.lines, std::back_inserter(lines));
-                continue;
-            }
-            auto const shown = (item.lines.size() - 1) - item.hidden;
-            std::ranges::move(item.lines | std::views::take(1 + shown), std::back_inserter(lines));
-            if (item.hidden > 0)
-                lines.push_back(std::format("{}+{} more", Indent, item.hidden));
+            // A table keeps its heading and the rows it shows, and the runs on them; a run on a hidden row
+            // goes with the row.
+            auto const first = fitted.lines.size();
+            auto const kept = item.table ? 1 + ((item.lines.size() - 1) - item.hidden) : item.lines.size();
+            for (auto const& span: item.spans)
+                if (span.line < kept)
+                    fitted.spans.push_back(
+                        LineSpan { .line = first + span.line, .byte = span.byte, .length = span.length, .tone = span.tone });
+            if (item.image)
+                fitted.imageLine = first;
+            std::ranges::move(item.lines | std::views::take(kept), std::back_inserter(fitted.lines));
+            if (item.table && item.hidden > 0)
+                fitted.lines.push_back(std::format("{}+{} more", Indent, item.hidden));
         }
-        return FittedRows { .lines = std::move(lines), .imageLine = imageLine };
+        return fitted;
     }
 
     /// A blank separator.
@@ -558,6 +571,38 @@ namespace
 
     /// What a breakdown line under a rate row starts with: deeper than the rows, so it reads as theirs.
     constexpr std::string_view SplitIndent = "      ";
+
+    /// One line's item from its kept pieces: the joined text, and a run for every piece with a tone.
+    ///
+    /// **The one way a panel dresses a piece.** A run covers the piece's text without the spaces around it,
+    /// so a gap or an alignment pad is never dressed: inverse video over padding would draw a block wider
+    /// than the word it marks.
+    /// @param pieces The kept pieces.
+    /// @param trend The trend's glyphs, drawn where the trend piece stands.
+    /// @param priority When the item goes.
+    /// @return The item.
+    [[nodiscard]] Item LineOf(std::span<Piece const> pieces, std::string_view trend, Priority priority)
+    {
+        auto item = Item { .lines = { std::string {} }, .priority = priority };
+        auto& line = item.lines.front();
+        for (auto const& piece: pieces)
+        {
+            if (piece.trend)
+            {
+                line += std::string { TrendGap } + std::string { trend };
+                continue;
+            }
+            auto const first = piece.text.find_first_not_of(' ');
+            if (piece.tone.has_value() && first != std::string::npos)
+            {
+                auto const last = piece.text.find_last_not_of(' ');
+                item.spans.push_back(
+                    LineSpan { .line = 0, .byte = line.size() + first, .length = last + 1 - first, .tone = *piece.tone });
+            }
+            line += piece.text;
+        }
+        return item;
+    }
 
     /// The rate block, laid out for @p budget cells.
     /// @param in The frame's inputs.
@@ -1220,13 +1265,15 @@ namespace
             auto const isActive = row.section == active;
             auto text = pieces.size() > 1 ? std::string { ColumnGap } : std::string {};
             text += isActive ? std::format("[{}]", row.key) : std::format(" {} ", row.key);
-            pieces.push_back(
-                Piece { .text = std::move(text), .priority = isActive ? Priority::Essential : spec.stripTabPriority });
+            // The brackets stay where the terminal dresses the tab too: a plain frame is the same grid.
+            pieces.push_back(Piece { .text = std::move(text),
+                                     .priority = isActive ? Priority::Essential : spec.stripTabPriority,
+                                     .tone = isActive ? std::optional<FrameTone> { FrameTone::Selected } : std::nullopt });
         }
         auto kept = FitPieces(std::move(pieces), budget, 0, in.cellWidth);
         if (!kept.has_value())
             return {};
-        return { Item { .lines = { Joined(*kept, {}) }, .priority = spec.stripPriority } };
+        return { LineOf(*kept, {}, spec.stripPriority) };
     }
 
     /// The active section's table, walked from the header line the leader sent.
@@ -1805,7 +1852,13 @@ DashboardFrame PanelView::PlacedFrame(DashboardModel const& model)
     auto const title = TitleFor(in, *_spec, _context, columns);
     auto frame =
         DashboardFrame { .text = Cli::Frame(title.subject, title.facts, fitted->lines, columns, *_glyphs, in.cellWidth),
-                         .placements = {} };
+                         .placements = {},
+                         .spans = {} };
+    // A content line's frame row is its index plus two, after the top edge, and its text starts after the
+    // left edge's bytes.
+    for (auto const& span: fitted->spans)
+        frame.spans.push_back(FrameSpan {
+            .row = span.line + 2, .byte = _glyphs->vertical.size() + span.byte, .length = span.length, .tone = span.tone });
 
     // The chart kept its rows: draw the image over them. The frame's first row is its top edge and its
     // first column its left edge, so a content line's frame row is its index plus two and the chart's
