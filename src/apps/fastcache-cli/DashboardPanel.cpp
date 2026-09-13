@@ -1093,6 +1093,58 @@ PanelSize MinimumPanelSize(PanelSpec const& spec, CellWidth cellWidth) noexcept
     return PanelSize { .columns = content + FrameColumns, .rows = rows };
 }
 
+namespace
+{
+    /// Which way a stepping key walks the strip.
+    ///
+    /// TRANSMITTED/PERSISTED: no. Private; enumerators may be inserted.
+    enum class SectionStep : std::uint8_t
+    {
+        Next,     ///< The tab after the active one, wrapping to the first.
+        Previous, ///< The tab before it, wrapping to the last.
+    };
+
+    /// A keystroke that steps through the fleet sections, as the bytes `KeyBytes` delivers it.
+    struct SectionStepKey
+    {
+        std::string_view keys; ///< The keystroke's bytes.
+        SectionStep step;      ///< Which way it walks.
+    };
+
+    /// Every stepping key. `Shift+Tab` is not here: it arrives as the bytes of `Tab`.
+    constexpr auto SectionStepKeys = std::to_array<SectionStepKey>({
+        { .keys = "\t", .step = SectionStep::Next },
+        { .keys = "\x1b[C", .step = SectionStep::Next },
+        { .keys = "\x1b[D", .step = SectionStep::Previous },
+    });
+} // namespace
+
+std::optional<FleetSection> SectionForKey(FleetSection active, std::string_view keys)
+{
+    auto tabs = std::vector<FleetSection> {};
+    for (auto const& row: Distributed::FleetSectionTable)
+        if (row.tabular)
+            tabs.push_back(row.section);
+    if (tabs.empty())
+        return std::nullopt;
+
+    if (keys.size() == 1 && keys.front() >= '1' && keys.front() <= '9')
+    {
+        auto const position = static_cast<std::size_t>(keys.front() - '1');
+        return position < tabs.size() ? std::optional<FleetSection> { tabs[position] } : std::nullopt;
+    }
+
+    auto const* stepping = FindIfOrNull(SectionStepKeys, [keys](SectionStepKey const& row) { return row.keys == keys; });
+    if (stepping == nullptr)
+        return std::nullopt;
+    auto const found = std::ranges::find(tabs, active);
+    auto const forward = stepping->step == SectionStep::Next;
+    if (found == tabs.end())
+        return forward ? tabs.front() : tabs.back();
+    auto const index = static_cast<std::size_t>(found - tabs.begin());
+    return tabs[forward ? (index + 1) % tabs.size() : (index + tabs.size() - 1) % tabs.size()];
+}
+
 PanelView::PanelView(PanelSpec const& spec, PanelContext context):
     _spec { &spec },
     _glyphs { &GlyphsFor(context.rung) },
@@ -1104,6 +1156,17 @@ PanelView::PanelView(PanelSpec const& spec, PanelContext context):
 std::string PanelView::Frame(DashboardModel const& model)
 {
     return PlacedFrame(model).text;
+}
+
+bool PanelView::Key(std::string_view keys)
+{
+    if (!_spec->document.has_value())
+        return false;
+    auto const section = SectionForKey(_context.section, keys);
+    if (!section.has_value() || *section == _context.section)
+        return false;
+    _context.section = *section;
+    return true;
 }
 
 DashboardFrame PanelView::PlacedFrame(DashboardModel const& model)

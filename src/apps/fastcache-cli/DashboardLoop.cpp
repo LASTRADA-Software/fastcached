@@ -278,7 +278,12 @@ Task<DashboardExit> RunDashboard(
 
             case DashboardEventKind::Key:
                 if (!IsQuitKey(event.keys))
+                {
+                    // Owed now, not at the next `Tick`: the view changed, and nothing was read.
+                    if (view->Key(event.keys))
+                        PresentFrame(*view, *sink, exit.model);
                     break;
+                }
                 [[fallthrough]];
 
             case DashboardEventKind::StopRequested:
