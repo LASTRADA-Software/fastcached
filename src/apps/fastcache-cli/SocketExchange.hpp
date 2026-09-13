@@ -230,6 +230,16 @@ struct AdminError
     std::string detail;                              ///< What to tell the operator.
 };
 
+/// What an admin fetch that produced no document means as an outcome.
+///
+/// One mapping for every reader of the admin surface. Nothing answered is `Unreachable`; a surface
+/// that answered and declined -- a follower naming its leader, a section it does not have -- is
+/// `Refused`, and the server's own words stay in `AdminError::detail`. They are different exit
+/// codes with different remedies, so the choice is made once rather than per caller.
+/// @param failure Which way the fetch failed.
+/// @return The outcome.
+[[nodiscard]] Outcome OutcomeOf(AdminFailure failure) noexcept;
+
 /// Fetch one document from the endpoint's own admin surface.
 ///
 /// The seam a verb reaches the admin surface through, so that WHERE that surface is
