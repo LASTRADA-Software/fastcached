@@ -49,8 +49,7 @@ enum class SynchronizedOutputAnswer : std::uint8_t
     Supported,    ///< DECRQM recognised mode 2026 and it can be switched: set or reset.
     NotSupported, ///< DECRQM answered that mode 2026 is not recognised, or permanently reset.
     NoReply,      ///< DECRQM was sent and nothing answered before the query deadline.
-    NotAsked,     ///< No DECRQM was sent: no terminal input to read a reply from, or a platform
-                  ///< arm that implements no DECRQM query.
+    NotAsked,     ///< No DECRQM was sent: there was no terminal input to read a reply from.
 };
 
 /// Everything the rung is decided from, and what a frame may be presented with.
