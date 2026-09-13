@@ -6334,3 +6334,47 @@ if(FASTCACHED_BUILD_TUI AND TARGET fastcache-tui-tests)
         TIMEOUT 120
     )
 endif()
+
+# The vendored vocabulary stays in vendor/ (#1377). Building endo's `runtime/` (#1374) put
+# `coro::Task`, `coro::Cancellation` and `endo::platform::IClock` into the link beside our
+# own, and the vendored include root is exposed PUBLIC with `coro/` and `platform/` beside
+# `tui/`, so no arrangement of the target can keep first-party code out of them. Fails when
+# anything under src/, tests included, reaches `<coro/...>` or `<platform/Clock.hpp>`, by
+# spelling or through a vendored header, outside the adapter layer's exemption rows.
+# scripts/check-vendor-vocabulary.cmake carries the tables and says in its refusal what the
+# rule does not cover.
+#
+# Default set, for net-boundary's reason: no daemon, no socket, no compiler, and no skip path,
+# since the source tree and vendor/ are both present in an exported tarball. Its zero has a
+# positive control: a vendored header known to reach `coro/` is walked by the same reader and
+# must be seen to reach it, or the run refuses rather than reporting a clean src/.
+add_test(
+    NAME "vendor-vocabulary"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-vendor-vocabulary.cmake"
+)
+set_tests_properties("vendor-vocabulary" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 60
+)
+
+# The shipped tree reaches none of the vocabulary, so the real run only ever shows the
+# accepting direction. Everything about refusing is shown here, over synthesised trees
+# under a scratch directory: every forbidden spelling, the closure at one and two hops, a
+# first-party file shadowing a vendored one, both ways an exemption row goes stale, a dead
+# control, and a scan of nothing. Each case has been WATCHED to fail: every mutant of the check
+# tried reddens exactly the cases it should and no others, and the unmutated check reddens none.
+add_test(
+    NAME "vendor-vocabulary-selftest"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DFASTCACHED_SCRATCH_DIR=${CMAKE_CURRENT_BINARY_DIR}/vendor-vocabulary-selftest"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-vendor-vocabulary-selftest.cmake"
+)
+set_tests_properties("vendor-vocabulary-selftest" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 60
+)
