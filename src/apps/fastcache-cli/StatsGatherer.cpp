@@ -31,46 +31,72 @@ LadderGatherer::LadderGatherer(Endpoint admin,
 {
 }
 
-std::expected<CompileCacheWire::NodeStatusFields, std::string> const& LadderGatherer::Identify()
+LadderGatherer::Identification const& LadderGatherer::Identified()
 {
-    if (_identity.has_value())
-        return *_identity;
+    if (_identification.has_value())
+        return *_identification;
+
+    // The one place both views are written, in one statement, so the fields a rung reads
+    // and the kind a verb reads cannot describe two different answers.
+    auto const remember = [this](std::optional<RemoteKind> kind,
+                                 std::string detail,
+                                 std::optional<CompileCacheWire::NodeStatusFields> fields =
+                                     std::nullopt) -> Identification const& {
+        using Described = std::expected<CompileCacheWire::NodeStatusFields, std::string>;
+        auto described = fields.has_value() ? Described { *std::move(fields) } : Described { std::unexpect, detail };
+        _identification = Identification { .fields = std::move(described),
+                                           .endpoint = EndpointIdentity { .kind = kind, .detail = std::move(detail) } };
+        return *_identification;
+    };
 
     if (_node == nullptr)
-    {
-        _identity = std::unexpected(std::string { "no 0xFC connection was opened" });
-        return *_identity;
-    }
+        return remember(std::nullopt, "no 0xFC connection was opened");
 
     auto const reply = _node->Send(CompileCacheWire::EncodeNodeStatusRequest());
+
+    // The KIND is the classifier's -- the one `ProbeRemote` uses -- so the probe and this
+    // cache cannot disagree about what an endpoint is. Everything below chooses a
+    // sentence and reads fields; none of it decides the kind.
+    auto const kind = ClassifyNodeStatusReply(reply);
+
     if (!reply.has_value())
     {
         // Whatever is on that port did not frame a reply. Worded as what it IS rather
         // than as a failed scrape: this is a fact about the endpoint, and the rungs
         // below turn it into *was not asked*.
-        _identity = std::unexpected(std::format("{} is not a compile node ({})", _node->Address(), reply.error().detail));
-        return *_identity;
+        return remember(kind, std::format("{} is not a compile node ({})", _node->Address(), reply.error().detail));
     }
-    if (reply->status != CompileCacheWire::Status::Ok)
+    if (kind != RemoteKind::CompileNode)
     {
         // It framed a refusal, so it speaks `0xFC` -- and has no operator component.
         // That is the ORDINARY answer from `fastcached`, which serves the compile-cache
         // verbs on this same wire, so it must not read as a fault.
-        _identity = std::unexpected(
-            std::format("{} speaks 0xFC and serves no node verbs, so it is not a compile node", _node->Address()));
-        return *_identity;
+        return remember(
+            kind, std::format("{} speaks 0xFC and serves no node verbs, so it is not a compile node", _node->Address()));
     }
 
     auto fields = CompileCacheWire::DecodeNodeStatus(reply->payload);
     if (!fields.has_value())
     {
-        _identity =
-            std::unexpected(std::format("{} answered node-status with a body this client cannot read", _node->Address()));
-        return *_identity;
+        // It said `Ok`, so it IS a compile node, and the classifier agrees. A node whose
+        // own description this client cannot read -- a newer encoding, most likely -- is
+        // still a node: the kind stays `CompileNode`, so a verb deciding a subject shows
+        // it a node's view rather than inferring `cache` for an endpoint that speaks no
+        // RESP. Only the fields are missing, and the rungs still read that as a reason.
+        return remember(kind, std::format("{} answered node-status with a body this client cannot read", _node->Address()));
     }
 
-    _identity = *std::move(fields);
-    return *_identity;
+    return remember(kind, std::format("{} is a fastcache-compile-node", _node->Address()), *std::move(fields));
+}
+
+std::expected<CompileCacheWire::NodeStatusFields, std::string> const& LadderGatherer::Identify()
+{
+    return Identified().fields;
+}
+
+EndpointIdentity LadderGatherer::IdentifyEndpoint()
+{
+    return Identified().endpoint;
 }
 
 std::expected<Endpoint, std::string> LadderGatherer::ResolveAdmin()
