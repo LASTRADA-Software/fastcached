@@ -1317,6 +1317,72 @@ constexpr auto FleetMachines = std::size_t { 12 };
     return std::nullopt;
 }
 
+/// A leader's `/fleet.txt` for @p machines machines, rendered by the leader's own renderer.
+///
+/// Rendered rather than written, so every column a real leader sends is there under its real name, with
+/// widths a real fleet has: a build string, a heartbeat past its threshold on the second machine.
+/// @param machines How many machines.
+/// @return The document.
+[[nodiscard]] std::string LeaderFleetText(std::size_t machines)
+{
+    auto snapshot = Distributed::FleetSnapshot {};
+    snapshot.role = Distributed::SchedulerRole::Leader;
+    for (auto const index: std::views::iota(std::size_t { 1 }, machines + 1))
+    {
+        auto machine = Distributed::NodeReport {};
+        machine.endpoint = std::format("build-{:02}:7070", index);
+        machine.displayName = std::format("ci-{:02}", index);
+        machine.version = "0.4.1-12-g0123abc";
+        machine.fingerprints = { "gcc-13-abcdef", "clang-18-fedcba" };
+        machine.capacity.logicalCores = 64;
+        machine.capacity.totalMemoryBytes = 100552671232ULL;
+        machine.load.cpuBusyPermille = 182;
+        machine.load.freeScratchBytes = 442381631488ULL;
+        machine.registeredSlots = 16;
+        machine.heartbeatAge = std::chrono::milliseconds { index == 2 ? 71'300 : 900 };
+        snapshot.nodes.push_back(std::move(machine));
+    }
+    snapshot.liveLeases = 47;
+    return RenderFleetText(snapshot, Distributed::FleetHistoryView {}, std::nullopt);
+}
+
+/// Whether @p heading names the column @p name as a whole word.
+/// @param heading A table's heading line.
+/// @param name A column name.
+/// @return True when the heading carries it, bounded by spaces or the line's ends.
+[[nodiscard]] bool HeadingNames(std::string_view heading, std::string_view name)
+{
+    for (auto at = heading.find(name); at != std::string_view::npos; at = heading.find(name, at + 1))
+    {
+        auto const end = at + name.size();
+        if ((at == 0 || heading[at - 1] == ' ') && (end == heading.size() || heading[end] == ' '))
+            return true;
+    }
+    return false;
+}
+
+/// @p names joined by spaces, for a message.
+/// @param names The names.
+/// @return The text.
+[[nodiscard]] std::string JoinedNames(std::vector<std::string> const& names)
+{
+    auto text = std::string {};
+    for (auto const& name: names)
+        text += (text.empty() ? "" : " ") + name;
+    return text;
+}
+
+/// The index of the first line of @p frame holding @p text.
+/// @param frame The frame.
+/// @param text What to find.
+/// @return The index; the line count when none holds it.
+[[nodiscard]] std::size_t LineIndexHolding(std::string_view frame, std::string_view text)
+{
+    auto const lines = Lines(frame);
+    auto const found = std::ranges::find_if(lines, [text](std::string const& line) { return line.contains(text); });
+    return static_cast<std::size_t>(found - lines.begin());
+}
+
 /// How many lines of @p frame start, after the edge and indent, with @p prefix.
 /// @param frame The frame.
 /// @param prefix The start.
@@ -1333,23 +1399,23 @@ constexpr auto FleetMachines = std::size_t { 12 };
 TEST_CASE("a fleet panel before its first reading draws every tile absent, the strip, and no table",
           "[cli][dashboard][panel][fleet]")
 {
-    // WHAT DISTINGUISHES: every headline key has its tile and each reads the absent marker -- never a
-    // missing tile or a zero -- and where the table goes there is the marker alone, never an empty
-    // table, which would say the fleet has no machines.
+    // WHAT DISTINGUISHES: every headline figure has its tile under the page's label and each reads the
+    // absent marker -- never a missing tile or a zero -- and where the table goes there is the marker
+    // alone, never an empty table, which would say the fleet has no machines.
     auto const frames = FleetFramesAt({ Tick }, 132, 40);
     REQUIRE(frames.size() == 1);
     auto const& frame = frames.front();
 
     auto tiles = std::size_t { 0 };
-    for (auto const key: Distributed::FleetKpiKeys())
+    for (auto const& kpi: Distributed::FleetKpis())
     {
-        INFO("tile " << key);
-        auto const after = AfterWord(frame, key);
+        INFO("tile " << kpi.label);
+        auto const after = AfterWord(frame, kpi.label);
         REQUIRE(after.has_value());
         CHECK(Unwrap(after).starts_with(Absent));
         ++tiles;
     }
-    CHECK(tiles == Distributed::FleetKpiKeys().size());
+    CHECK(tiles == Distributed::FleetKpis().size());
 
     auto tabs = std::size_t { 0 };
     for (auto const& row: Distributed::FleetSectionTable)
@@ -1393,56 +1459,108 @@ TEST_CASE("a fleet panel draws the section from the header line it was sent, a c
     CHECK(Unwrap(third).contains(Absent)); // the `-` cell, as the absent marker
     CHECK(LinesStarting(frame, "build-") == FleetMachines);
 
-    auto const keys = Distributed::FleetKpiKeys();
-    REQUIRE(keys.size() >= 3);
-    CHECK(AfterWord(frame, keys[0]).value_or("").starts_with("12 884"));
-    CHECK(AfterWord(frame, keys[1]).value_or("").starts_with("47"));
-    CHECK(AfterWord(frame, keys[1]).value_or("").contains("of 192"));
-    CHECK(AfterWord(frame, keys[2]).value_or("").starts_with("88.1 %"));
+    auto const kpis = Distributed::FleetKpis();
+    REQUIRE(kpis.size() >= 3);
+    CHECK(AfterWord(frame, kpis[0].label).value_or("").starts_with("12 884"));
+    CHECK(AfterWord(frame, kpis[1].label).value_or("").starts_with("47"));
+    CHECK(AfterWord(frame, kpis[1].label).value_or("").contains(std::format("of 192 {}", kpis[1].ofNoun)));
+    CHECK(AfterWord(frame, kpis[2].label).value_or("").starts_with("88.1 %"));
     CHECK(frame.contains(FleetReadingSource));
 }
 
-TEST_CASE("a fleet table's columns go from the right as the terminal narrows, and its first column never does",
-          "[cli][dashboard][panel][fleet]")
+TEST_CASE("a fleet table fills its width by the leader's rank, a narrow column in room a wide one cannot use",
+          "[cli][dashboard][panel][fleet][keep]")
 {
-    // Positional, and stated as data. WHAT DISTINGUISHES: at the first width a column goes, the one
-    // gone is the LAST column the leader sent; and at the narrowest width that is still a frame the
-    // first column is there -- one column narrower is the minimum-size line, never a table without it.
-    auto firstDrop = std::optional<int> {};
-    auto narrowestFrame = std::optional<int> {};
-    for (auto const columns: std::views::iota(12, 133) | std::views::reverse)
+    // #134 F7: the positional rule is withdrawn, and dropping by rank alone left room empty. Over a machines
+    // section whose every cell is the absent marker -- so a column is exactly as wide as its name -- at every
+    // width from 240 cells down to the narrowest frame, with the ranks read back through `FleetColumnKeep`
+    // and never restated here. WHAT DISTINGUISHES:
+    //   - the identity column is always drawn;
+    //   - no column left out would fit in the room the drawn ones leave: a fit that stops at the first
+    //     column too wide fails this;
+    //   - no column left out outranks a drawn one it could have replaced: a fit in drawing order fails this;
+    //   - at some width a column of a lower rank IS drawn while one of a higher rank is not, so the filling
+    //     is observed rather than vacuous.
+    auto const names = Distributed::FleetColumnNames(FleetSection::Machines, Distributed::FleetSnapshot {});
+    auto document =
+        std::format("# {}\n", Distributed::FleetSectionTable[static_cast<std::size_t>(FleetSection::Machines)].key);
+    for (auto const index: std::views::iota(std::size_t { 0 }, names.size()))
+        document += (index == 0 ? "" : "\t") + names[index];
+    document += "\n";
+    for (auto const machine: std::views::iota(1, 4))
     {
-        auto const frame = FleetFrameAt(FleetMachines, columns, 60);
-        if (!frame.starts_with("\xe2\x94\x8c"))
+        document += std::format("m{}", machine);
+        for (auto const index: std::views::iota(std::size_t { 1 }, names.size()))
+        {
+            (void) index;
+            document += "\t-";
+        }
+        document += "\n";
+    }
+    auto const rank = [](std::string const& name) {
+        return std::to_underlying(Unwrap(Distributed::FleetColumnKeep(FleetSection::Machines, name)));
+    };
+    auto const gap = std::size_t { 2 };
+
+    auto filled = false;
+    auto narrowestFrame = std::optional<int> {};
+    for (auto const columns: std::views::iota(12, 241) | std::views::reverse)
+    {
+        auto const frames = FleetFramesAt({ FleetSampleOf(1, document), Tick }, columns, 60);
+        REQUIRE(frames.size() == 1);
+        if (!frames.front().starts_with("\xe2\x94\x8c"))
             break;
         narrowestFrame = columns;
-        auto const heading = LineStarting(frame, "endpoint");
+        auto const heading = LineStarting(frames.front(), "endpoint");
         REQUIRE(heading.has_value());
-        if (!Unwrap(heading).contains("cores") && !firstDrop.has_value())
+        auto shown = std::vector<std::string> {};
+        auto hidden = std::vector<std::string> {};
+        auto used = std::size_t { 2 }; // the indent
+        for (auto const& name: names)
         {
-            firstDrop = columns;
-            INFO("first column drop at " << columns << ": " << Unwrap(heading));
-            CHECK(Unwrap(heading).contains("zeta-column"));
-            CHECK(Unwrap(heading).contains("name"));
+            if (HeadingNames(Unwrap(heading), name))
+            {
+                shown.push_back(name);
+                used += FakeCellWidth(name) + (name == names.front() ? 0 : gap);
+            }
+            else
+                hidden.push_back(name);
+        }
+        auto const budget = ContentColumns(static_cast<std::size_t>(columns));
+        REQUIRE(used <= budget);
+        auto const room = budget - used;
+        INFO(columns << " columns: drawn " << JoinedNames(shown) << "; left out " << JoinedNames(hidden) << "; room "
+                     << room);
+        CHECK(std::ranges::find(shown, names.front()) != shown.end());
+        for (auto const& out: hidden)
+        {
+            CHECK(FakeCellWidth(out) + gap > room);
+            for (auto const& in: shown)
+                if (in != names.front() && rank(in) > rank(out))
+                    CHECK(FakeCellWidth(out) + gap > room + FakeCellWidth(in) + gap);
+            filled = filled || std::ranges::any_of(shown, [&](std::string const& in) { return rank(in) > rank(out); });
         }
     }
-    REQUIRE(firstDrop.has_value());
     REQUIRE(narrowestFrame.has_value());
+    CHECK(filled);
+
     auto const below = FleetFrameAt(FleetMachines, Unwrap(narrowestFrame) - 1, 60);
     CHECK(Lines(below).size() == 1);
     CHECK(below.contains("needs "));
-    CHECK(FakeCellWidth(below) <= static_cast<std::size_t>(Unwrap(narrowestFrame) - 1));
 }
 
-TEST_CASE("a fleet table taller than the terminal keeps its heading and counts what it hides, after all else has gone",
+TEST_CASE("a fleet table taller than its room gives up rows before the tiles, and says how to reach them",
           "[cli][dashboard][panel][fleet]")
 {
-    // The table is what this panel is for. WHAT DISTINGUISHES: at the tallest height that cannot show
-    // every machine, the strip, the tiles and the source line have ALL gone already, the heading stays,
-    // and `+N more` counts exactly the machines not shown. One line taller shows every machine.
+    // §5 at 80x24: the tiles, the strip, some machines and `... 8 more machines; PgDn scrolls, / filters`.
+    // WHAT DISTINGUISHES: at the tallest height that cannot show every machine, the first tile, the strip
+    // and the source line are all STILL drawn, and the overflow line counts exactly the machines not shown
+    // -- the rule this replaced dropped every one of them before hiding a row. One line taller shows every
+    // machine. Much shorter, the tiles go while the table still keeps the rows it keeps.
+    auto const& spec = Unwrap(FleetPanel().document);
     auto shrunkAt = std::optional<int> {};
     for (auto const rows: std::views::iota(4, 41) | std::views::reverse)
-        if (FleetFrameAt(FleetMachines, 132, rows).contains(" more"))
+        if (FleetFrameAt(FleetMachines, 132, rows).contains(" more "))
         {
             shrunkAt = rows;
             break;
@@ -1452,17 +1570,28 @@ TEST_CASE("a fleet table taller than the terminal keeps its heading and counts w
     auto const frame = FleetFrameAt(FleetMachines, 132, Unwrap(shrunkAt));
     CHECK(Lines(frame).size() <= static_cast<std::size_t>(Unwrap(shrunkAt)));
     CHECK(LineStarting(frame, "endpoint").has_value());
-    CHECK(!frame.contains(Distributed::FleetKpiKeys().front()));
-    CHECK(!frame.contains("[machines]"));
-    CHECK(!frame.contains(FleetReadingSource));
+    CHECK(frame.contains(Distributed::FleetKpis().front().label));
+    CHECK(frame.contains("[machines]"));
+    CHECK(frame.contains(FleetReadingSource));
     auto const shown = LinesStarting(frame, "build-");
-    auto const more = AfterWord(frame, "+");
-    REQUIRE(more.has_value());
-    CHECK(Unwrap(more).starts_with(std::format("{} more ", FleetMachines - shown)));
+    CHECK(frame.contains(std::format("... {} more machines; PgDn scrolls, / filters", FleetMachines - shown)));
 
     auto const taller = FleetFrameAt(FleetMachines, 132, Unwrap(shrunkAt) + 1);
-    CHECK(!taller.contains(" more"));
+    CHECK(!taller.contains(" more "));
     CHECK(LinesStarting(taller, "build-") == FleetMachines);
+
+    auto keptWithoutTiles = std::optional<int> {};
+    for (auto const rows: std::views::iota(4, Unwrap(shrunkAt)) | std::views::reverse)
+    {
+        auto const shorter = FleetFrameAt(FleetMachines, 132, rows);
+        if (!shorter.contains(Distributed::FleetKpis().back().label))
+        {
+            keptWithoutTiles = rows;
+            CHECK(LinesStarting(shorter, "build-") == spec.tableRowsKept);
+            break;
+        }
+    }
+    CHECK(keptWithoutTiles.has_value());
 }
 
 TEST_CASE("a fleet panel drawn after a failed sample shows no table from before it", "[cli][dashboard][panel][fleet]")
@@ -1480,7 +1609,7 @@ TEST_CASE("a fleet panel drawn after a failed sample shows no table from before 
     REQUIRE(frames.size() == 2);
     CHECK(LinesStarting(frames[0], "build-") == FleetMachines);
     CHECK(LinesStarting(frames[1], "build-") == 0);
-    CHECK(AfterWord(frames[1], Distributed::FleetKpiKeys().front()).value_or("").starts_with(Absent));
+    CHECK(AfterWord(frames[1], Distributed::FleetKpis().front().label).value_or("").starts_with(Absent));
 }
 
 namespace
@@ -1829,7 +1958,8 @@ TEST_CASE("at the Sixel rung the fleet chart is one image exactly the size of th
     auto const& request = drawing.requests[0];
     CHECK(request.width == placement.cellsWide * ChartCell.width);
     CHECK(request.height == placement.cellsHigh * ChartCell.height);
-    CHECK(placement.cellsHigh == Unwrap(FleetPanel().document).chartCellsHigh);
+    CHECK(placement.cellsHigh >= Unwrap(FleetPanel().document).chartCellsHigh);
+    CHECK(placement.cellsHigh <= Unwrap(FleetPanel().document).chartCellsHighMost);
     CHECK(placement.sixel == std::format("sixel:{}x{}", request.width, request.height));
 
     auto const lines = Lines(drawing.frames[0]);
@@ -1848,18 +1978,20 @@ TEST_CASE("at the Sixel rung the fleet chart is one image exactly the size of th
 TEST_CASE("below the Sixel rung, or without a cell size, the fleet panel draws no chart and keeps no rows for one",
           "[cli][dashboard][panel][fleet][chart]")
 {
-    // WHAT DISTINGUISHES: the Unicode frame asks the encoder for nothing and places nothing, and is SHORTER
-    // than the Sixel one by the chart's rows -- blank rows left behind would be the chart faked -- and a
+    // WHAT DISTINGUISHES: the Unicode frame asks the encoder for nothing and places nothing, and its strip
+    // sits HIGHER than the Sixel one's by the chart's rows and their blank -- blank rows left behind would be
+    // the chart faked; both frames are the terminal's height, so the count of lines cannot say it -- and a
     // Sixel rung with no cell size draws exactly the Unicode frame, since no size is ever guessed.
     auto const sixel = DrawChart(RenderRung::Sixel, ChartCell, 100, 60);
     auto const unicode = DrawChart(RenderRung::Unicode, ChartCell, 100, 60);
     auto const unmeasured = DrawChart(RenderRung::Sixel, std::nullopt, 100, 60);
     REQUIRE(unicode.frames.size() == 1);
     REQUIRE(unmeasured.frames.size() == 1);
+    REQUIRE(sixel.placements.at(0).size() == 1);
     CHECK(unicode.requests.empty());
     CHECK(unicode.placements.at(0).empty());
-    CHECK(Lines(unicode.frames[0]).size() + Unwrap(FleetPanel().document).chartCellsHigh + 1
-          == Lines(sixel.frames.at(0)).size());
+    CHECK(LineIndexHolding(unicode.frames[0], "[machines]") + sixel.placements[0][0].cellsHigh + 1
+          == LineIndexHolding(sixel.frames.at(0), "[machines]"));
     CHECK(unmeasured.requests.empty());
     CHECK(unmeasured.placements.at(0).empty());
     CHECK(unmeasured.frames[0] == unicode.frames[0]);
@@ -1880,7 +2012,7 @@ TEST_CASE("the fleet chart goes for height before the tiles, and below its width
         }
     REQUIRE(shortest.has_value());
     auto const without = DrawChart(RenderRung::Sixel, ChartCell, 100, Unwrap(shortest));
-    CHECK(without.frames.at(0).contains(Distributed::FleetKpiKeys().front()));
+    CHECK(without.frames.at(0).contains(Distributed::FleetKpis().front().label));
     CHECK(DrawChart(RenderRung::Sixel, ChartCell, 100, Unwrap(shortest) + 1).placements.at(0).size() == 1);
 
     auto const narrow = DrawChart(RenderRung::Sixel, ChartCell, 24, 60);
@@ -1962,6 +2094,148 @@ TEST_CASE("a panel without a fleet document acts on no key", "[cli][dashboard][p
     };
     CHECK_FALSE(view.Key("\t"));
     CHECK_FALSE(view.Key("1"));
+}
+
+namespace
+{
+
+/// What one fleet session drew, frame by frame, and how it ended.
+struct FleetRun
+{
+    std::vector<std::string> frames {};                     ///< Each frame's text.
+    std::vector<std::vector<FramePlacement>> placements {}; ///< Each frame's images.
+    std::vector<std::vector<FrameSpan>> spans {};           ///< Each frame's dressed runs.
+    DashboardStop stop { DashboardStop::SourceDetached };   ///< How the run ended.
+};
+
+/// Draw @p script through the fleet panel after a `Resize` of @p columns by @p rows.
+/// @param script The events after the resize.
+/// @param columns The terminal's width.
+/// @param rows The terminal's height.
+/// @param context The panel's context; its width function is the fake one.
+/// @param cellPixels The cell size the resize reports, or nullopt.
+/// @return What was drawn.
+[[nodiscard]] FleetRun RunFleet(std::vector<DashboardEvent> script,
+                                int columns,
+                                int rows,
+                                PanelContext context,
+                                std::optional<CellPixelSize> cellPixels = std::nullopt)
+{
+    script.insert(
+        script.begin(),
+        DashboardEvent { .kind = DashboardEventKind::Resize, .columns = columns, .rows = rows, .cellPixels = cellPixels });
+    context.cellWidth = &FakeCellWidth;
+    auto view = PanelView { FleetPanel(), std::move(context) };
+    auto sink = CollectingSink {};
+    auto const exit = Drive(std::move(script), DashboardLimits {}, view, sink, &ReadFleetSample);
+    return FleetRun { .frames = std::move(sink.frames),
+                      .placements = std::move(sink.placements),
+                      .spans = std::move(sink.spans),
+                      .stop = exit.stop };
+}
+
+/// A key event.
+/// @param keys The bytes.
+/// @return The event.
+[[nodiscard]] DashboardEvent KeyOf(std::string_view keys)
+{
+    return DashboardEvent { .kind = DashboardEventKind::Key, .keys = std::string { keys } };
+}
+
+/// The text a span dresses.
+/// @param frame The frame's text.
+/// @param span The span.
+/// @return The bytes it covers.
+[[nodiscard]] std::string SpanText(std::string_view frame, FrameSpan const& span)
+{
+    return Lines(frame).at(span.row - 1).substr(span.byte, span.length);
+}
+
+/// The number in the first machine row's endpoint, `build-NN`.
+/// @param frame The frame.
+/// @return NN, or zero with no machine row.
+[[nodiscard]] int FirstMachine(std::string_view frame)
+{
+    auto const row = LineStarting(frame, "build-");
+    if (!row.has_value())
+        return 0;
+    auto const& line = Unwrap(row);
+    auto const at = line.find("build-");
+    return std::stoi(line.substr(at + 6, 2));
+}
+
+/// The plain Unicode context the parity cases draw with.
+/// @return The context.
+[[nodiscard]] PanelContext UnicodeContext()
+{
+    return PanelContext { .absent = std::string { Absent }, .rung = RenderRung::Unicode };
+}
+
+} // namespace
+
+TEST_CASE("at 80x24 the fleet panel reads as the mockup draws it", "[cli][dashboard][panel][fleet][parity]")
+{
+    // #134 §5, the owner's report. WHAT DISTINGUISHES, each against the frame the owner saw:
+    //   - every tile under the page's LABEL -- the frame that was sent back said `compiling-now`;
+    //   - two columns of tiles, `Dispatched` beside `Cache hit rate`, where it stacked seven;
+    //   - the qualifiers `of 192 slots` and `not yet resolved`, where it wrote a bare `of 30` and nothing;
+    //   - `heartbeat-age` and `cpu-busy` in the heading at 80, `memory`, `class` and `version` gone, where
+    //     it dropped from the right and kept `version`;
+    //   - the strip's `keys  m w l c t`, right-aligned against the frame's blank column.
+    auto const run = RunFleet({ FleetSampleOf(1, LeaderFleetText(FleetMachines)), Tick }, 80, 24, UnicodeContext());
+    REQUIRE(run.frames.size() == 1);
+    auto const& frame = run.frames.front();
+    INFO(frame);
+
+    for (auto const& kpi: Distributed::FleetKpis())
+    {
+        INFO("tile " << kpi.label);
+        CHECK(frame.contains(kpi.label));
+    }
+    auto const kpis = Distributed::FleetKpis();
+    auto const first = LineStarting(frame, kpis[0].label);
+    REQUIRE(first.has_value());
+    auto const* const beside = FindIfOrNull(
+        kpis, [](Distributed::FleetKpiText const& kpi) { return kpi.ofNoun.empty() && kpi.note.empty() && !kpi.sparkline; });
+    REQUIRE(beside != nullptr);
+    CHECK(Unwrap(first).contains(beside->label));
+    CHECK(AfterWord(frame, "Compiling now").value_or("").contains("of 192 slots"));
+    CHECK(AfterWord(frame, "Leases outstanding").value_or("").contains("not yet resolved"));
+
+    auto const heading = LineStarting(frame, "endpoint");
+    REQUIRE(heading.has_value());
+    CHECK(HeadingNames(Unwrap(heading), "heartbeat-age"));
+    CHECK(HeadingNames(Unwrap(heading), "cpu-busy"));
+    CHECK_FALSE(HeadingNames(Unwrap(heading), "memory"));
+    CHECK_FALSE(HeadingNames(Unwrap(heading), "class"));
+    CHECK_FALSE(HeadingNames(Unwrap(heading), "version"));
+
+    auto const strip = LineIndexHolding(frame, "[machines]");
+    REQUIRE(strip < Lines(frame).size());
+    CHECK(Lines(frame)[strip].ends_with("keys  m w l c t \xe2\x94\x82"));
+
+    CHECK(Lines(frame).size() == 24);
+    CHECK(WidestLine(frame) <= 80);
+}
+
+TEST_CASE("the active section's tab is dressed as selected, and a letter from the strip's keys switches it",
+          "[cli][dashboard][panel][fleet][parity]")
+{
+    // #134 F6. WHAT DISTINGUISHES: the one Selected span covers exactly the bracketed tab -- not the strip,
+    // not the key alone -- and after `w` it covers `[workers]`, so the dress follows the section rather
+    // than a position.
+    auto const run = RunFleet({ FleetSampleOf(1, LeaderFleetText(3)), Tick, KeyOf("w") }, 132, 40, UnicodeContext());
+    REQUIRE(run.frames.size() == 2);
+    for (auto const& [index, tab]: { std::pair { std::size_t { 0 }, std::string_view { "[machines]" } },
+                                     std::pair { std::size_t { 1 }, std::string_view { "[workers]" } } })
+    {
+        INFO("frame " << index);
+        auto selected = std::vector<std::string> {};
+        for (auto const& span: run.spans.at(index))
+            if (span.tone == FrameTone::Selected)
+                selected.push_back(SpanText(run.frames[index], span));
+        CHECK(selected == std::vector<std::string> { std::string { tab } });
+    }
 }
 
 namespace
@@ -2618,39 +2892,6 @@ TEST_CASE("before a node says anything about itself its facts read the marker, a
     CHECK(ContentStarting(NodeFrameAt(80, 24, unaccepted), "toolchains").contains("registrars  0 of 1, never accepted"));
 }
 
-TEST_CASE("the active fleet section's tab is one Selected run over exactly its bracketed key",
-          "[cli][dashboard][panel][fleet][tone]")
-{
-    // #134 F6, and the mechanism's first consumer. WHAT DISTINGUISHES: exactly one run, covering `[workers]`
-    // byte for byte in the row it sits in -- not the gap before it, which inverse video would draw as a
-    // block, and not `[machines]` -- after the Tab that switched to it; the text is unchanged, brackets
-    // included, so a terminal with no colour reads the same grid.
-    auto view = PanelView {
-        FleetPanel(),
-        PanelContext { .absent = std::string { Absent }, .cellWidth = &FakeCellWidth, .rung = RenderRung::Unicode }
-    };
-    auto sink = CollectingSink {};
-    (void) Drive({ DashboardEvent { .kind = DashboardEventKind::Resize, .columns = 132, .rows = 40 },
-                   FleetSampleOf(1, FleetText(FleetMachines)),
-                   Tick,
-                   DashboardEvent { .kind = DashboardEventKind::Key, .keys = "\t" } },
-                 DashboardLimits {},
-                 view,
-                 sink,
-                 &ReadFleetSample);
-    REQUIRE(sink.frames.size() == 2);
-    for (auto const& [index, tab]: { std::pair { std::size_t { 0 }, std::string_view { "[machines]" } },
-                                     std::pair { std::size_t { 1 }, std::string_view { "[workers]" } } })
-    {
-        INFO("frame " << index);
-        REQUIRE(sink.spans.at(index).size() == 1);
-        auto const& span = sink.spans[index].front();
-        CHECK(span.tone == FrameTone::Selected);
-        CHECK(Lines(sink.frames[index]).at(span.row - 1).substr(span.byte, span.length) == tab);
-        CHECK(sink.frames[index].contains(tab));
-    }
-}
-
 namespace
 {
 
@@ -2863,4 +3104,152 @@ TEST_CASE("a cache rate block dresses its labels and beside words as labels and 
     CHECK(ToneOver(presented, number) == FrameTone::Figure);
     CHECK(unit == "/s");
     CHECK(ToneOver(presented, unit) == FrameTone::Label);
+}
+
+TEST_CASE("a heartbeat past its threshold is dressed stale and one inside it fresh, on exactly its cell",
+          "[cli][dashboard][panel][fleet][parity]")
+{
+    // #134 F9, through the leader's one threshold. WHAT DISTINGUISHES: the stale tone lies on exactly the
+    // second machine's heartbeat cell and the fresh one on the first's -- a span one cell over dresses a
+    // figure the threshold never judged -- and the three machines' ages are the only toned cells. Whether a
+    // tone shows as colour is the presenter's decision from the capability record, not the panel's.
+    auto const lit = RunFleet({ FleetSampleOf(1, LeaderFleetText(3)), Tick }, 240, 40, UnicodeContext());
+    REQUIRE(lit.frames.size() == 1);
+    auto const& frame = lit.frames.front();
+
+    auto const toneOn = [&](std::string_view rowStart) -> std::optional<FrameTone> {
+        auto const row = LineIndexHolding(frame, rowStart) + 1;
+        auto const cell = CellUnder(frame, "heartbeat-age", rowStart);
+        for (auto const& span: lit.spans.front())
+            if (span.row == row && cell.has_value() && SpanText(frame, span) == Unwrap(cell))
+                return span.tone;
+        return std::nullopt;
+    };
+    CHECK(toneOn("build-01") == std::optional<FrameTone> { FrameTone::Fresh });
+    CHECK(toneOn("build-02") == std::optional<FrameTone> { FrameTone::Stale });
+    CHECK(std::ranges::count_if(lit.spans.front(), [](FrameSpan const& span) { return span.tone != FrameTone::Selected; })
+          == 3);
+}
+
+TEST_CASE("PgDn and PgUp scroll the fleet table by the rows it shows, and the overflow line says so",
+          "[cli][dashboard][panel][fleet][parity]")
+{
+    // #134 F10: `... N more machines; PgDn scrolls, / filters` is a promise, so it is kept. WHAT
+    // DISTINGUISHES: after PgDn the first row drawn is the one after the last row shown before, and the
+    // overflow line counts what is above as well as what is below; PgUp comes back to the first machine.
+    constexpr auto Machines = std::size_t { 40 };
+    auto const run = RunFleet(
+        { FleetSampleOf(1, LeaderFleetText(Machines)), Tick, KeyOf("\x1b[6~"), KeyOf("\x1b[5~") }, 80, 24, UnicodeContext());
+    REQUIRE(run.frames.size() == 3);
+    auto const shown = LinesStarting(run.frames[0], "build-");
+    REQUIRE(shown > 0);
+    CHECK(FirstMachine(run.frames[0]) == 1);
+    CHECK(run.frames[0].contains(std::format("... {} more machines; PgDn scrolls, / filters", Machines - shown)));
+
+    CHECK(FirstMachine(run.frames[1]) == static_cast<int>(shown) + 1);
+    CHECK(run.frames[1].contains(std::format(", {} above; PgUp/PgDn scroll, / filters", shown)));
+
+    CHECK(FirstMachine(run.frames[2]) == 1);
+    CHECK(run.frames[2] == run.frames[0]);
+}
+
+TEST_CASE("a typed filter keeps the fleet rows that contain it, holds a q, and Esc clears it",
+          "[cli][dashboard][panel][fleet][parity]")
+{
+    // #134 F10's `/ filters`. WHAT DISTINGUISHES: while the filter is typed a `q` is a character of it --
+    // the session does not end, and the filter reads `build-2q` and matches nothing -- Backspace takes it
+    // back to the ten machines `build-2` names, case ignored, Enter keeps it with a count, and `/` then
+    // Esc brings every machine back.
+    constexpr auto Machines = std::size_t { 40 };
+    auto script = std::vector<DashboardEvent> { FleetSampleOf(1, LeaderFleetText(Machines)), Tick, KeyOf("/") };
+    for (auto const* const typed: { "B", "u", "i", "l", "d", "-", "2" })
+        script.push_back(KeyOf(typed));
+    for (auto const* const key: { "q", "\x7f", "\r", "/", "\x1b" })
+        script.push_back(KeyOf(key));
+    auto const run = RunFleet(std::move(script), 132, 60, UnicodeContext());
+
+    CHECK(run.stop == DashboardStop::SourceDetached);
+    REQUIRE(run.frames.size() == 14);
+    CHECK(run.frames[1].contains("filter  /_  Enter keeps, Esc clears"));
+    auto const& typed = run.frames[8];
+    CHECK(typed.contains("filter  /Build-2_"));
+    CHECK(LinesStarting(typed, "build-") == 10);
+    CHECK(LinesStarting(typed, "build-2") == 10);
+    CHECK(run.frames[9].contains("filter  /Build-2q_"));
+    CHECK(LinesStarting(run.frames[9], "build-") == 0);
+    CHECK(LinesStarting(run.frames[10], "build-") == 10);
+    CHECK(run.frames[11].contains(std::format("filter  /Build-2  10 of {} machines; / edits", Machines)));
+    CHECK(LinesStarting(run.frames[13], "build-") == Machines);
+    CHECK_FALSE(run.frames[13].contains("filter  /"));
+}
+
+TEST_CASE("the fleet chart yields rows to the table, and grows into rows nothing else wants",
+          "[cli][dashboard][panel][fleet][chart][parity]")
+{
+    // #134 F12 and F13. WHAT DISTINGUISHES: at 80x24 with twelve machines the Sixel rung draws NO chart and
+    // every machine row, where a chart kept at the table's cost would hide rows; with one machine at
+    // 120x40 the chart is drawn taller than its minimum, the frame is the terminal's height, and the
+    // source line sits on its last content row.
+    auto encoder = ScriptedSixelEncoder {};
+    auto context = UnicodeContext();
+    context.rung = RenderRung::Sixel;
+    context.sixel = &encoder;
+
+    auto const crowded = RunFleet({ FleetSampleOf(1, LeaderFleetText(FleetMachines)), Tick }, 80, 24, context, ChartCell);
+    REQUIRE(crowded.frames.size() == 1);
+    CHECK(crowded.placements.front().empty());
+    CHECK(LinesStarting(crowded.frames.front(), "build-") == FleetMachines);
+
+    auto const roomy = RunFleet({ FleetSampleOf(1, LeaderFleetText(1)), Tick }, 120, 40, context, ChartCell);
+    REQUIRE(roomy.frames.size() == 1);
+    REQUIRE(roomy.placements.front().size() == 1);
+    auto const& spec = Unwrap(FleetPanel().document);
+    CHECK(roomy.placements.front().front().cellsHigh > spec.chartCellsHigh);
+    auto const lines = Lines(roomy.frames.front());
+    CHECK(lines.size() == 40);
+    CHECK(lines.at(38).contains(FleetReadingSource));
+}
+
+TEST_CASE("the Dispatched tile draws its trend across the samples, and no trend on a rung without one",
+          "[cli][dashboard][panel][fleet][parity]")
+{
+    // #134 F5: the page marks `dispatched` with a sparkline, so the tile carries one. WHAT DISTINGUISHES: after
+    // three samples the text after `Dispatched`'s figure holds block glyphs -- a tile drawing its words column
+    // blank passes every label check -- and on the ASCII rung, which draws no sparkline anywhere (§10), there
+    // are none.
+    auto const kpis = Distributed::FleetKpis();
+    auto const* const trended = FindIfOrNull(kpis, [](Distributed::FleetKpiText const& kpi) { return kpi.sparkline; });
+    REQUIRE(trended != nullptr);
+    auto script = std::vector<DashboardEvent> {
+        FleetSampleOf(1, FleetText(3)), FleetSampleOf(2, FleetText(3)), FleetSampleOf(3, FleetText(3)), Tick
+    };
+    auto const drawn = RunFleet(script, 132, 40, UnicodeContext());
+    auto ascii = UnicodeContext();
+    ascii.rung = RenderRung::Ascii;
+    auto const plain = RunFleet(script, 132, 40, ascii);
+    REQUIRE(drawn.frames.size() == 1);
+    REQUIRE(plain.frames.size() == 1);
+
+    auto const blocks = [](std::string_view text) {
+        return std::ranges::count_if(BlockLevels, [text](std::string_view glyph) { return text.contains(glyph); });
+    };
+    auto const after = AfterWord(drawn.frames.front(), trended->label);
+    REQUIRE(after.has_value());
+    CHECK(Unwrap(after).starts_with("12 884"));
+    CHECK(blocks(Unwrap(after)) > 0);
+    CHECK(blocks(AfterWord(plain.frames.front(), trended->label).value_or("")) == 0);
+}
+
+TEST_CASE("without a chart the fleet frame is still the terminal's height, its source line at the bottom",
+          "[cli][dashboard][panel][fleet][parity]")
+{
+    // #134 F13 on the rungs with no image. WHAT DISTINGUISHES: one machine at 120x40 fills forty rows with
+    // the source on the last content row -- the frame the owner saw ended halfway down the screen -- and
+    // the blank rows are above the source line, not below it.
+    auto const run = RunFleet({ FleetSampleOf(1, LeaderFleetText(1)), Tick }, 120, 40, UnicodeContext());
+    REQUIRE(run.frames.size() == 1);
+    auto const lines = Lines(run.frames.front());
+    CHECK(lines.size() == 40);
+    CHECK(lines.at(38).contains(FleetReadingSource));
+    CHECK(Trimmed(Columns(lines.at(37), 1, FakeCellWidth(lines.at(37)) - 2)).empty());
 }
