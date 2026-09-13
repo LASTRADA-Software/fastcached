@@ -69,7 +69,7 @@ not happen. `stats` reports *which* source answered as a field of its own output
 because the difference between a 127-series `/metrics` scrape and a 7-field
 `INFO` reply is not something a dashboard should have to guess at.
 
-Its exit codes distinguish six outcomes rather than success and failure: a cache
+Its exit codes distinguish outcomes rather than success and failure: a cache
 **miss** exits 1 and an **unreachable** daemon exits 3, so a script can retry one
 and give up on the other.
 
