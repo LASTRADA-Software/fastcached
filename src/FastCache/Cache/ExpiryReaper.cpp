@@ -5,11 +5,51 @@
 #include <FastCache/Core/BoundedDrain.hpp>
 #include <FastCache/Core/Profiling.hpp>
 
+#include <coroutine>
 #include <format>
 #include <tuple>
 
 namespace FastCache
 {
+
+namespace
+{
+
+    /// The hop back to the reactor, closing the trip `AwayFromReactor()` measures.
+    ///
+    /// `ResumeOn` plus one statement, and the statement's POSITION is the fix (#1397): the
+    /// count falls only once the hand-over has returned, so while it is raised the frame is
+    /// on the executor or still being handed back -- never on neither side with the count down.
+    ///
+    /// **The counter's address is copied to a local BEFORE the hand-over.** This awaiter is a
+    /// temporary in the frame, and once `Submit` returns the reactor may already be running
+    /// that frame past this expression -- or `Stop` may be about to free it -- so nothing
+    /// after the call may read `this`. What it touches instead is the reaper's counter,
+    /// which `Stop` outlives only by waiting for exactly this decrement.
+    struct HopBackToReactor
+    {
+        IReactor& reactor;
+        /// The count to lower after the hand-over, or null when the frame never left.
+        std::atomic<std::uint32_t>* away;
+
+        [[nodiscard]] bool await_ready() const noexcept
+        {
+            return false;
+        }
+
+        template <typename Promise>
+        void await_suspend(std::coroutine_handle<Promise> handle) const
+        {
+            auto* const count = away;
+            ResumeOn { reactor }.await_suspend(handle);
+            if (count != nullptr)
+                count->fetch_sub(1, std::memory_order_acq_rel);
+        }
+
+        void await_resume() const noexcept {}
+    };
+
+} // namespace
 
 ExpiryReaper::ExpiryReaper(IStorage& storage, ILogger& logger, ExpiryReaperOptions options, IMetricsSink* metrics) noexcept:
     _storage { storage },
@@ -34,19 +74,21 @@ void ExpiryReaper::Stop() noexcept
         return;
     _source.Cancel();
 
-    // **Waited for BEFORE anything is reclaimed**, because a sweep on the executor
-    // is a frame the reactor does not hold: `CancelPending` would answer false and
-    // `~Task` would then destroy a coroutine the pool thread is still executing.
-    // Cancelling the token does not end the sweep -- `PurgeExpired` does not observe
-    // it -- so this waits for the body, which finishes on its own and needs no
-    // reactor to do so.
+    // **Waited for BEFORE anything is reclaimed**, because a frame away from the reactor
+    // is one the reactor does not hold: `CancelPending` would answer false and `~Task`
+    // would then destroy a coroutine another thread is still executing or handing over.
+    // Cancelling the token does not end the trip -- `PurgeExpired` does not observe it --
+    // so this waits for the whole of it, which needs no reactor: the count falls on the
+    // executor thread when the hop back's `Submit` returns, so this stays safe after
+    // `IReactor::Run` has returned (#1397). Once it is down the frame is queued or parked
+    // on the reactor, done, or never started, and the retraction below covers all three.
     //
     // Bounded, and it says what it abandoned: an unbounded wait here hands the
     // choice to the supervisor, which answers SIGKILL with no diagnostic. Through
     // `DrainWithin` rather than a hand-rolled loop, because a `waited += poll` count
     // measures the sleep it ASKED for and a sleep costs what the host's timer
     // granularity says.
-    if (DrainWithin([this] { return Sweeping(); }) == DrainResult::Ceiling)
+    if (DrainWithin([this] { return AwayFromReactor(); }) == DrainResult::Ceiling)
         _logger.Log(LogLevel::Warn,
                     "expiry: a sweep was still running when the cycle stopped; abandoning it rather than waiting "
                     "further. The frame is left to the reactor's own teardown.");
@@ -125,6 +167,10 @@ void ExpiryReaper::AdaptScanBudget(Duration elapsed) noexcept
 
 Task<void> ExpiryReaper::Run(IReactor* reactor, IExecutor* sweepOn, CancellationToken token)
 {
+    // Whether the sweep LEAVES the reactor, decided once, by the identity of the executor
+    // object -- see `AwayFromReactor()` for why that is the safe side of the question.
+    auto* const away = sweepOn == static_cast<IExecutor*>(reactor) ? nullptr : &_awayFromReactor;
+
     // A disabled cycle ends rather than parking forever: a coroutine asleep on
     // a deadline nobody will move is a frame the reactor has to outlive.
     if (_options.interval <= Duration::zero())
@@ -180,12 +226,12 @@ Task<void> ExpiryReaper::Run(IReactor* reactor, IExecutor* sweepOn, Cancellation
         // The same two-hop the compile surface uses, and `IReactor` IS an `IExecutor`
         // -- so a caller that passes the reactor gets exactly the previous behaviour
         // through the same statements, rather than through a second code path.
+        //
+        // The trip opens HERE, on the reactor thread and before the hand-over (#1397).
+        if (away != nullptr)
+            away->fetch_add(1, std::memory_order_acq_rel);
         co_await ResumeOn { *sweepOn };
 
-        // Bracketed around the body and nothing else: this is the interval in which
-        // the frame is NOT parked on the reactor, which is precisely the interval
-        // `Stop` must not destroy it in. See `Sweeping()`.
-        _sweeping.store(true, std::memory_order_release);
         PurgeOutcome outcome {};
         try
         {
@@ -200,7 +246,6 @@ Task<void> ExpiryReaper::Run(IReactor* reactor, IExecutor* sweepOn, Cancellation
             // reclaimed nothing; the cycle continues and the next one tries again.
             outcome = PurgeOutcome {};
         }
-        _sweeping.store(false, std::memory_order_release);
 
         // --- Back, ALWAYS, before anything reads the reactor again. ---
         //
@@ -209,7 +254,11 @@ Task<void> ExpiryReaper::Run(IReactor* reactor, IExecutor* sweepOn, Cancellation
         // shape `TeardownIsSerialisedWithDispatch()` exists to catch (#668, #737,
         // #840, #875). The loop's own `IsCancelled()` check is one statement below
         // and runs on the reactor, where ending is safe.
-        co_await ResumeOn { *reactor };
+        //
+        // And it closes the trip only after its hand-over has returned -- see
+        // `HopBackToReactor` for why that position, and not the end of the body, is the one
+        // `Stop` can rely on.
+        co_await HopBackToReactor { .reactor = *reactor, .away = away };
 
         AdaptScanBudget(reactor->Clock().Now() - startedAt);
         if (outcome.purged != 0)

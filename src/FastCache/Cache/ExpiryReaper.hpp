@@ -10,6 +10,7 @@
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -206,22 +207,39 @@ class ExpiryReaper
     /// @return What the sweep did.
     PurgeOutcome SweepOnce(TimePoint now);
 
-    /// Whether a sweep body is executing right now.
+    /// Whether the task's frame is away from the reactor right now.
     ///
-    /// **The one fact `Stop` cannot do without.** Once the sweep runs on a pool the
-    /// task's frame is, for that interval, not parked on the reactor -- so
-    /// `CancelPending` cannot retract it and `~Task` would destroy a frame the pool
-    /// thread is still inside. Reading this is how `Stop` waits for that window to
-    /// close before it reclaims anything.
+    /// **The one fact `Stop` cannot do without.** While the sweep is handed to another
+    /// executor the frame is not parked on the reactor, so `CancelPending` cannot retract
+    /// it and `~Task` would destroy a frame another thread is still inside. Reading this is
+    /// how `Stop` waits for that interval to close before it reclaims anything.
     ///
-    /// Set on the pool immediately before the sweep and cleared immediately after,
-    /// so it brackets exactly the interval in which the frame is unreachable from
-    /// the reactor. It is NOT "a cycle is running": between sweeps the frame is
-    /// parked on the reactor's timer and perfectly reclaimable.
-    /// @return True while the sweep body is on the executor.
-    [[nodiscard]] bool Sweeping() const noexcept
+    /// **The interval is the whole trip, not the sweep body** (#1397). It opens on the
+    /// reactor thread immediately BEFORE the hop out -- once the frame is handed to the
+    /// executor, nothing on the reactor can take it back -- and closes on the executor
+    /// thread only AFTER the hop back's `Submit` has returned, when the frame is either
+    /// queued on the reactor or already running there. Bracketing the body alone leaves both
+    /// hops uncovered, and a stop landing in either frees a frame the executor is still inside.
+    ///
+    /// A COUNT rather than a flag, because the close is late by design: the reactor may
+    /// resume the frame and send it away again before the executor thread returns from the
+    /// previous hop's `Submit`, and clearing a flag then would erase the new trip.
+    ///
+    /// Never raised when the executor IS the reactor: that frame does not leave, and a
+    /// count raised for a hop still queued on a reactor whose loop has returned would never
+    /// fall, turning every stop into a wait for the drain ceiling. "Is" means the same
+    /// OBJECT. **A decorator over the reactor is a different object and is counted**, and
+    /// that is the safe side of the trade: stopped with a hop still queued on a loop that has
+    /// returned, it waits out the ceiling. Treating it as the reactor instead would skip the
+    /// wait for an executor that may really be elsewhere, which is this defect back again as a
+    /// use-after-free -- so a slow stop there is a cost, not a bug to fix.
+    ///
+    /// It is NOT "a cycle is running": between sweeps the frame is parked on the reactor's
+    /// timer and reclaimable.
+    /// @return True while the frame is on its way to, on, or on its way back from the executor.
+    [[nodiscard]] bool AwayFromReactor() const noexcept
     {
-        return _sweeping.load(std::memory_order_acquire);
+        return _awayFromReactor.load(std::memory_order_acquire) != 0;
     }
 
     /// @return How many sweeps have run.
@@ -277,8 +295,9 @@ class ExpiryReaper
 
     /// Set by `Start`; the reactor `Stop` reclaims the frame from.
     IReactor* _reactor { nullptr };
-    /// See `Sweeping()`. Atomic because `Stop` reads it from another thread.
-    std::atomic<bool> _sweeping { false };
+    /// See `AwayFromReactor()`. Atomic because the executor lowers it and `Stop` reads it,
+    /// each from its own thread.
+    std::atomic<std::uint32_t> _awayFromReactor { 0 };
     CancellationSource _source;
     Task<void> _task;
 };
