@@ -4,20 +4,29 @@
 #include "ScriptedDashboardEvents.hpp"
 #include "TerminalCapabilities.hpp"
 
+#include <FastCache/Async/PlatformReactor.hpp>
 #include <FastCache/Async/TestReactor.hpp>
+#include <FastCache/Async/ThreadPoolExecutor.hpp>
+#include <FastCache/Core/BoundedDrain.hpp>
 #include <FastCache/Core/Clock.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <expected>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <ranges>
+#include <semaphore>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 using namespace FastCache;
@@ -46,29 +55,58 @@ class ScriptedAcquisition final: public ITerminalAcquisition
 
     [[nodiscard]] Task<std::expected<StartedTerminal, std::string>> Acquire(IExecutor* pool, IExecutor* resumeOn) override
     {
-        ++calls;
-        askedPool = pool;
-        askedResumeOn = resumeOn;
+        ++_calls;
+        _askedPool = pool;
+        _askedResumeOn = resumeOn;
         co_await ParkAwaiter { .reactor = _reactor };
         if (!_answer.has_value())
             co_return std::unexpected(_answer.error());
-        auto terminal = std::make_unique<SpokenTerminal>(_reactor, &release);
-        spoken = terminal.get();
+        auto terminal = std::make_unique<SpokenTerminal>(_reactor, &_release);
+        _spoken = terminal.get();
         if (_detachAtOnce)
             terminal->GoAway();
         co_return StartedTerminal { .capabilities = *_answer, .events = std::move(terminal) };
     }
 
-    int calls { 0 };
-    IExecutor* askedPool { nullptr };
-    IExecutor* askedResumeOn { nullptr };
-    SpokenTerminal* spoken { nullptr };
-    TerminalRelease release {};
+    /// @return How many acquisitions were asked for.
+    [[nodiscard]] int Calls() const noexcept
+    {
+        return _calls;
+    }
+
+    /// @return The pool the last acquisition was told to block on.
+    [[nodiscard]] IExecutor* AskedPool() const noexcept
+    {
+        return _askedPool;
+    }
+
+    /// @return Where the last acquisition was told to resume.
+    [[nodiscard]] IExecutor* AskedResumeOn() const noexcept
+    {
+        return _askedResumeOn;
+    }
+
+    /// @return The terminal the last acquisition handed out, while it lives; null before one.
+    [[nodiscard]] SpokenTerminal* Spoken() const noexcept
+    {
+        return _spoken;
+    }
+
+    /// @return What became of the terminal handed out.
+    [[nodiscard]] TerminalRelease const& Release() const noexcept
+    {
+        return _release;
+    }
 
   private:
     IReactor& _reactor;
     std::expected<TerminalCapabilities, std::string> _answer;
     bool _detachAtOnce;
+    int _calls { 0 };
+    IExecutor* _askedPool { nullptr };
+    IExecutor* _askedResumeOn { nullptr };
+    SpokenTerminal* _spoken { nullptr };
+    TerminalRelease _release {};
 };
 
 /// A stop-signal installer that hands out scripted signals, or refuses.
@@ -85,17 +123,22 @@ class ScriptedInstaller final: public IStopSignalInstaller
 
     [[nodiscard]] std::expected<std::unique_ptr<IStopSignal>, std::string> Install() override
     {
-        ++calls;
+        ++_calls;
         if (!_refusal.empty())
             return std::unexpected(_refusal);
         return std::make_unique<ScriptedStopSignal>(_reactor);
     }
 
-    int calls { 0 };
+    /// @return How many installs were asked for.
+    [[nodiscard]] int Calls() const noexcept
+    {
+        return _calls;
+    }
 
   private:
     IReactor& _reactor;
     std::string _refusal;
+    int _calls { 0 };
 };
 
 /// A view that throws on its first frame.
@@ -113,23 +156,33 @@ class RecordingRungViews final: public IRungViews
 {
   public:
     /// @param throwing Whether the views it hands out throw.
-    explicit RecordingRungViews(bool throwing) noexcept:
-        _throwing { throwing }
+    /// @param pipedOnly Whether only the `Piped` rung has a view, as in this build.
+    explicit RecordingRungViews(bool throwing, bool pipedOnly = false) noexcept:
+        _throwing { throwing },
+        _pipedOnly { pipedOnly }
     {
     }
 
     [[nodiscard]] std::unique_ptr<IDashboardView> For(RenderRung rung) override
     {
-        asked.push_back(rung);
+        _asked.push_back(rung);
+        if (_pipedOnly && rung != RenderRung::Piped)
+            return nullptr;
         if (_throwing)
             return std::make_unique<ThrowingView>();
         return std::make_unique<CountView>();
     }
 
-    std::vector<RenderRung> asked {};
+    /// @return The rungs asked for, in order.
+    [[nodiscard]] std::vector<RenderRung> const& Asked() const noexcept
+    {
+        return _asked;
+    }
 
   private:
     bool _throwing;
+    bool _pipedOnly;
+    std::vector<RenderRung> _asked {};
 };
 
 /// How a composition's collaborators misbehave, when a case wants them to.
@@ -138,6 +191,7 @@ struct CompositionFaults
     bool detachAtOnce { false };  ///< An acquired terminal goes away before its first read.
     std::string stopRefusal {};   ///< Why installing the stop request fails; empty when it does not.
     bool throwingViews { false }; ///< Every view throws on its first frame.
+    bool pipedViewsOnly { false }; ///< Only the `Piped` rung has a view, as in this build.
 };
 
 /// Await a composed session into @p out, recording an exception rather than losing it.
@@ -172,7 +226,7 @@ struct Composition
         rig { rig },
         terminals { rig.reactor, std::move(terminal), faults.detachAtOnce },
         stops { rig.reactor, std::move(faults.stopRefusal) },
-        views { faults.throwingViews },
+        views { faults.throwingViews, faults.pipedViewsOnly },
         terminalPool { rig.clock }
     {
     }
@@ -317,7 +371,7 @@ TEST_CASE("a session decides how it draws once however many frames it draws", "[
 
     CHECK(composition.Stop() == DashboardStop::SampleBudget);
     CHECK(rig.sink.frames >= 2);
-    CHECK(composition.views.asked == std::vector<RenderRung> { RenderRung::Piped });
+    CHECK(composition.views.Asked() == std::vector<RenderRung> { RenderRung::Piped });
 
     composition.Finish();
 }
@@ -330,19 +384,19 @@ TEST_CASE("an interactive session acquires its terminal on the terminal pool and
     composition.Start(true);
     rig.Settle();
 
-    CHECK(composition.terminals.calls == 1);
+    CHECK(composition.terminals.Calls() == 1);
     // Its own pool, never the sample pool: a read that waits for a keystroke would starve sampling.
-    CHECK(composition.terminals.askedPool == &composition.terminalPool);
-    CHECK(composition.terminals.askedResumeOn == &rig.reactor);
-    CHECK(composition.stops.calls == 0);
-    CHECK(composition.views.asked == std::vector<RenderRung> { RenderRung::Sixel });
+    CHECK(composition.terminals.AskedPool() == &composition.terminalPool);
+    CHECK(composition.terminals.AskedResumeOn() == &rig.reactor);
+    CHECK(composition.stops.Calls() == 0);
+    CHECK(composition.views.Asked() == std::vector<RenderRung> { RenderRung::Sixel });
     CHECK(rig.gatherer.Calls() == 1);
 
-    if (composition.terminals.spoken != nullptr)
-        composition.terminals.spoken->Say(DashboardEvent { .kind = DashboardEventKind::Key, .keys = "q" });
+    if (composition.terminals.Spoken() != nullptr)
+        composition.terminals.Spoken()->Say(DashboardEvent { .kind = DashboardEventKind::Key, .keys = "q" });
     rig.Settle();
     CHECK(composition.Stop() == DashboardStop::Quit);
-    CHECK(composition.terminals.release.released);
+    CHECK(composition.terminals.Release().released);
 
     composition.Finish();
 }
@@ -358,9 +412,9 @@ TEST_CASE("a session with no terminal acquires none and takes its whole budget e
     composition.Start(false, 3);
     composition.RunFor(3);
 
-    CHECK(composition.terminals.calls == 0);
-    CHECK(composition.stops.calls == 1);
-    CHECK(composition.views.asked == std::vector<RenderRung> { RenderRung::Piped });
+    CHECK(composition.terminals.Calls() == 0);
+    CHECK(composition.stops.Calls() == 1);
+    CHECK(composition.views.Asked() == std::vector<RenderRung> { RenderRung::Piped });
     CHECK(rig.gatherer.Calls() == 3);
     CHECK(composition.Stop() == DashboardStop::SampleBudget);
 
@@ -382,11 +436,42 @@ TEST_CASE("a terminal that goes away ends an interactive session and no gather s
     CHECK(composition.Stop() == DashboardStop::SourceDetached);
     CHECK(gathersAtDetach <= 1);
     CHECK(rig.gatherer.Calls() == gathersAtDetach);
-    CHECK(composition.views.asked.size() == 1);
+    CHECK(composition.views.Asked().size() == 1);
     // Closed by the runner, not by the test: the source has drained with nobody else closing anything.
     CHECK((composition.source.has_value() && composition.source->IsDrained()));
 
     composition.Finish();
+}
+
+TEST_CASE("an interactive session whose rung has no view refuses by name and releases the terminal",
+          "[cli][live][session]")
+{
+    // Never drawn through the piped view instead: a terminal session in record lines is the shape
+    // change §1.6 rules out. The terminal it acquired is closed and released before the refusal.
+    Rig rig;
+    Composition composition { rig, SixelTerminal, CompositionFaults { .pipedViewsOnly = true } };
+    composition.Start(true);
+    rig.Settle();
+
+    auto const* const refusal = composition.Refusal();
+    CHECK((refusal != nullptr && refusal->outcome == Outcome::Local));
+    CHECK((refusal != nullptr && AdvisoryText(*refusal).contains("interactive views are not built")));
+    CHECK(composition.views.Asked() == std::vector<RenderRung> { RenderRung::Sixel });
+    CHECK(composition.terminals.Release().released);
+    CHECK(composition.terminals.Release().closedFirst);
+    CHECK_FALSE(composition.source.has_value());
+    CHECK(rig.gatherer.Calls() == 0);
+
+    composition.Finish();
+}
+
+TEST_CASE("the standard views draw the piped rung and have no view for an interactive one", "[cli][live][session]")
+{
+    auto views = StandardRungViews { RenderOptions { .format = OutputFormat::Tsv }, &LatestReading };
+    CHECK(views.For(RenderRung::Piped) != nullptr);
+    CHECK(views.For(RenderRung::Sixel) == nullptr);
+    CHECK(views.For(RenderRung::Unicode) == nullptr);
+    CHECK(views.For(RenderRung::Ascii) == nullptr);
 }
 
 TEST_CASE("an interactive terminal that cannot be acquired refuses the session naming why", "[cli][live][session]")
@@ -404,8 +489,8 @@ TEST_CASE("an interactive terminal that cannot be acquired refuses the session n
            && refusal->advisories.front().contains("stdin is not a terminal")));
     // The remedy is on this machine, which is what `Local` says to a script and this says to a person.
     CHECK((refusal != nullptr && !refusal->advisories.empty() && refusal->advisories.front().contains("output redirected")));
-    CHECK(composition.stops.calls == 0);
-    CHECK(composition.views.asked.empty());
+    CHECK(composition.stops.Calls() == 0);
+    CHECK(composition.views.Asked().empty());
     CHECK_FALSE(composition.source.has_value());
     CHECK(rig.gatherer.Calls() == 0);
 
@@ -487,4 +572,353 @@ TEST_CASE("abandoning a session with no sample out says so rather than inventing
     auto const withoutSample = DescribeAbandonment("10.0.0.4:6674", std::nullopt);
     CHECK(withoutSample.contains("no sample"));
     CHECK_FALSE(withoutSample.contains(" ms"));
+}
+
+namespace
+{
+
+/// An installer whose signal fires when a case says: Ctrl-C pressed at a chosen moment.
+class StopOnDemandInstaller final: public IStopSignalInstaller
+{
+  public:
+    /// @param reactor Where the signal's wait parks.
+    explicit StopOnDemandInstaller(IReactor& reactor):
+        _reactor { reactor }
+    {
+    }
+
+    [[nodiscard]] std::expected<std::unique_ptr<IStopSignal>, std::string> Install() override
+    {
+        ++_calls;
+        auto signal = std::make_unique<ScriptedStopSignal>(_reactor);
+        _installed = signal.get();
+        return signal;
+    }
+
+    /// Press Ctrl-C. Only while the session still waits on the signal, which outlives any sample
+    /// that is out: the source releases it only once its wait has returned.
+    void Press()
+    {
+        auto* const installed = _installed.load();
+        REQUIRE(installed != nullptr);
+        installed->Fire();
+    }
+
+    /// @return How many installs were asked for.
+    [[nodiscard]] int Calls() const noexcept
+    {
+        return _calls.load();
+    }
+
+  private:
+    IReactor& _reactor;
+    std::atomic<ScriptedStopSignal*> _installed { nullptr };
+    std::atomic<int> _calls { 0 };
+};
+
+/// A gatherer whose every gather presses Ctrl-C and then waits for the case to open a gate: a
+/// sample that is out when the operator stops, for as long as the case says.
+///
+/// Pressed FROM the gather so the order is fixed rather than raced: the stop cannot arrive
+/// before the sample is out.
+class GatedGatherer final: public IStatsGatherer
+{
+  public:
+    /// @param stop What the gather presses.
+    explicit GatedGatherer(StopOnDemandInstaller* stop) noexcept:
+        _stop { stop }
+    {
+    }
+
+    [[nodiscard]] std::vector<StatsAttempt> Gather() override
+    {
+        ++_calls;
+        _stop->Press();
+        _gate.acquire();
+        return Reading();
+    }
+
+    /// Let every gather that is waiting, or will wait, return. Once: a semaphore released past
+    /// its bound is undefined, and MSVC's ends the process for it.
+    void Open()
+    {
+        if (!_opened.exchange(true))
+            _gate.release(GateWidth);
+    }
+
+    /// @return How many gathers started.
+    [[nodiscard]] int Calls() const noexcept
+    {
+        return _calls.load();
+    }
+
+  private:
+    static constexpr auto GateWidth = 64;
+    std::atomic<int> _calls { 0 };
+    StopOnDemandInstaller* _stop;
+    std::counting_semaphore<GateWidth> _gate { 0 };
+    std::atomic<bool> _opened { false };
+};
+
+/// Frames as one stream, written on the reactor's thread and read on the case's.
+class StreamingSink final: public IFrameSink
+{
+  public:
+    void Present(std::string_view frame) override
+    {
+        auto const lock = std::scoped_lock { _mutex };
+        _stream += frame;
+    }
+
+    /// @return Everything presented so far.
+    [[nodiscard]] std::string Stream() const
+    {
+        auto const lock = std::scoped_lock { _mutex };
+        return _stream;
+    }
+
+  private:
+    mutable std::mutex _mutex;
+    std::string _stream;
+};
+
+/// What `main` acquires, for real: a platform reactor on a thread of its own, three one-thread
+/// pools and a steady clock -- so the session's blocking wait and its drain run on the case's
+/// thread exactly as they run on `main`'s.
+///
+/// **Torn down in the order `main` owes**: open the gate so a stuck sample can return, wait for
+/// the source to drain, stop the reactor and join it, and only then destroy the source. A
+/// destructor rather than a closing statement, so a failed `REQUIRE` unwinds through it instead
+/// of leaving a reactor thread nobody stops.
+struct RunningSeat
+{
+    /// @param render The `--format` asked for.
+    /// @param streamsInteractive Whether the standard streams are a terminal.
+    /// @param stoppedFromGather Whether the stop request is the one the gated gather presses.
+    RunningSeat(RenderOptions render, bool streamsInteractive, bool stoppedFromGather = false):
+        render { std::move(render) },
+        streamsInteractive { streamsInteractive },
+        stoppedFromGather { stoppedFromGather }
+    {
+        thread = std::jthread { [this] { reactor.Run(); } };
+    }
+
+    RunningSeat(RunningSeat const&) = delete;
+    RunningSeat(RunningSeat&&) = delete;
+    RunningSeat& operator=(RunningSeat const&) = delete;
+    RunningSeat& operator=(RunningSeat&&) = delete;
+
+    ~RunningSeat()
+    {
+        gated.Open();
+        if (source.has_value())
+        {
+            auto wait = ThreadDrainWait {};
+            CHECK_FALSE(DrainSession(*source, "teardown", DrainBound {}, wait).has_value());
+        }
+        reactor.Stop();
+        thread.join();
+        source.reset();
+    }
+
+    /// The seat `main` would hand over.
+    /// @param bound How long the drain may take.
+    /// @return The seat.
+    [[nodiscard]] LiveSessionSeat Seat(DrainBound bound = {})
+    {
+        return LiveSessionSeat { .reactor = &reactor,
+                                 .clock = &clock,
+                                 .samplePool = &samplePool,
+                                 .stopWaiter = &stopWaiter,
+                                 .terminalPool = &terminalPool,
+                                 .sink = &sink,
+                                 .streamsInteractive = streamsInteractive,
+                                 .render = render,
+                                 .terminals = &terminals,
+                                 .stops = stoppedFromGather ? static_cast<IStopSignalInstaller*>(&onDemand) : &stops,
+                                 .views = &views,
+                                 .drainWait = &drainWait,
+                                 .drainBound = bound,
+                                 .source = &source };
+    }
+
+    /// @return What the pipe received.
+    [[nodiscard]] std::string Stream() const
+    {
+        return sink.Stream();
+    }
+
+    RenderOptions render;
+    bool streamsInteractive;
+    bool stoppedFromGather;
+    SteadyClock clock;
+    PlatformReactor reactor { clock };
+    ThreadPoolExecutor samplePool { 1 };
+    ThreadPoolExecutor stopWaiter { 1 };
+    ThreadPoolExecutor terminalPool { 1 };
+    StreamingSink sink;
+    ScriptedInstaller stops { reactor, "" };
+    StopOnDemandInstaller onDemand { reactor };
+    ScriptedAcquisition terminals { reactor, std::unexpected(std::string { "stdin is not a terminal" }), false };
+    StandardRungViews views { render, &LatestReading };
+    ThreadDrainWait drainWait;
+    ScriptedGatherer gatherer { Reading() };
+    GatedGatherer gated { &onDemand };
+    std::optional<LiveEventSource> source;
+    std::jthread thread;
+};
+
+/// The invocation a session verb is handed.
+/// @param operands The operands.
+/// @param samples `--samples`.
+/// @param identity What the endpoint is.
+/// @param stats What each sample asks.
+/// @return The context.
+[[nodiscard]] VerbContext SessionContext(std::span<std::string const> operands,
+                                         std::size_t samples,
+                                         IEndpointIdentity* identity,
+                                         IStatsGatherer* stats)
+{
+    return VerbContext {
+        .operands = operands, .options = VerbOptions { .samples = samples }, .stats = stats, .identity = identity
+    };
+}
+
+/// A cache daemon, as the identification describes one.
+/// @return The identification.
+[[nodiscard]] EndpointIdentity CacheDaemon()
+{
+    return EndpointIdentity { .kind = RemoteKind::FastcacheWireOnly,
+                              .detail = "10.0.0.4:6674 speaks 0xFC and serves no node verbs, so it is not a compile node" };
+}
+
+} // namespace
+
+TEST_CASE("a live-stats session refused at admission composes nothing", "[cli][live][session][seat]")
+{
+    auto seat = RunningSeat { RenderOptions { .format = OutputFormat::Tsv }, false };
+    auto identity =
+        ScriptedIdentity { EndpointIdentity { .kind = std::nullopt, .detail = "no 0xFC connection was opened" } };
+
+    auto const ending = RunLiveStatsSession(SessionContext({}, 1, &identity, &seat.gatherer), seat.Seat());
+
+    CHECK(ending.kind == SessionEndKind::Refused);
+    CHECK(ending.answer.outcome == Outcome::Unreachable);
+    CHECK(seat.stops.Calls() == 0);
+    CHECK(seat.gatherer.Calls() == 0);
+    CHECK_FALSE(seat.source.has_value());
+}
+
+TEST_CASE("a piped live-stats session runs to its budget, drains, and exits with what it read", "[cli][live][session][seat]")
+{
+    auto seat = RunningSeat { RenderOptions { .format = OutputFormat::Tsv }, false };
+    auto identity = ScriptedIdentity { CacheDaemon() };
+
+    auto const ending = RunLiveStatsSession(SessionContext({}, 1, &identity, &seat.gatherer), seat.Seat());
+
+    CHECK(ending.kind == SessionEndKind::Ran);
+    CHECK(ending.answer.outcome == Outcome::Affirmative);
+    CHECK(seat.stops.Calls() == 1);
+    CHECK(seat.terminals.Calls() == 0);
+    // The header and the one row the budget allowed, in the format asked for.
+    auto const stream = seat.Stream();
+    CHECK(std::ranges::count(stream, '\n') == 2);
+    CHECK(stream.contains("\tcurr_connections\n"));
+    CHECK((seat.source.has_value() && seat.source->IsDrained()));
+}
+
+TEST_CASE("live-stats --format=json at a terminal streams its records rather than drawing", "[cli][live][session][seat]")
+{
+    // §1.6: the format does not change because the streams are a terminal. A json run asks for
+    // no terminal, installs the stop request a piped run ends on, and writes one document.
+    auto seat = RunningSeat { RenderOptions { .format = OutputFormat::Json }, true };
+    auto identity = ScriptedIdentity { CacheDaemon() };
+
+    auto const ending = RunLiveStatsSession(SessionContext({}, 1, &identity, &seat.gatherer), seat.Seat());
+
+    CHECK(ending.kind == SessionEndKind::Ran);
+    CHECK(seat.terminals.Calls() == 0);
+    CHECK(seat.stops.Calls() == 1);
+    CHECK(seat.Stream().starts_with('{'));
+}
+
+TEST_CASE("a human live-stats session at a terminal asks for the terminal", "[cli][live][session][seat]")
+{
+    // The control for the case above: the same streams in the human format, and the terminal IS
+    // asked -- here it cannot be acquired, which refuses the session with the outcome that puts
+    // the remedy on this machine.
+    auto seat = RunningSeat { RenderOptions { .format = OutputFormat::Human }, true };
+    auto identity = ScriptedIdentity { CacheDaemon() };
+
+    auto const ending = RunLiveStatsSession(SessionContext({}, 1, &identity, &seat.gatherer), seat.Seat());
+
+    CHECK(ending.kind == SessionEndKind::Refused);
+    CHECK(ending.answer.outcome == Outcome::Local);
+    CHECK(seat.terminals.Calls() == 1);
+    CHECK(seat.stops.Calls() == 0);
+    CHECK(seat.Stream().empty());
+}
+
+TEST_CASE("a live-stats session that ends with a sample stuck is abandoned with the outcome it earned",
+          "[cli][live][session][seat]")
+{
+    // Ctrl-C lands while the first gather is out, and the gather does not return within the
+    // bound. The session neither waits forever nor unwinds: it hands `main` the line naming the
+    // endpoint and how long the sample had been out, and the outcome of a run that read nothing.
+    auto seat = RunningSeat { RenderOptions { .format = OutputFormat::Tsv }, false, true };
+    auto identity = ScriptedIdentity { CacheDaemon() };
+    auto const bound = DrainBound { .ceiling = std::chrono::milliseconds { 50 }, .poll = std::chrono::milliseconds { 5 } };
+
+    auto const ending = RunLiveStatsSession(SessionContext({}, 0, &identity, &seat.gated), seat.Seat(bound));
+
+    CHECK(ending.kind == SessionEndKind::Abandoned);
+    CHECK(ending.answer.outcome == Outcome::Unreachable);
+    CHECK(ending.line.contains("10.0.0.4:6674"));
+    CHECK(ending.line.contains(" ms"));
+    CHECK(seat.gated.Calls() == 1);
+    CHECK((seat.source.has_value() && !seat.source->IsDrained()));
+}
+
+TEST_CASE("a live-stats session stopped with a sample out drains when the sample returns in time",
+          "[cli][live][session][seat]")
+{
+    // The control for the case above: the same stop and the same gated gather, with the gate
+    // already open. Nothing is abandoned.
+    auto seat = RunningSeat { RenderOptions { .format = OutputFormat::Tsv }, false, true };
+    auto identity = ScriptedIdentity { CacheDaemon() };
+    seat.gated.Open();
+
+    auto const ending = RunLiveStatsSession(SessionContext({}, 0, &identity, &seat.gated), seat.Seat());
+
+    CHECK(ending.kind == SessionEndKind::Ran);
+    CHECK(ending.line.empty());
+    CHECK((seat.source.has_value() && seat.source->IsDrained()));
+}
+
+TEST_CASE("a live-stats session with no stats source is refused before anything is composed", "[cli][live][session][seat]")
+{
+    auto seat = RunningSeat { RenderOptions { .format = OutputFormat::Tsv }, false };
+    auto identity = ScriptedIdentity { CacheDaemon() };
+
+    auto const ending = RunLiveStatsSession(SessionContext({}, 1, &identity, nullptr), seat.Seat());
+
+    CHECK(ending.kind == SessionEndKind::Refused);
+    CHECK(ending.answer.outcome == Outcome::Unreachable);
+    CHECK(seat.stops.Calls() == 0);
+    CHECK_FALSE(seat.source.has_value());
+}
+
+TEST_CASE("a live-stats fleet session is refused by name while fleet sessions cannot sample", "[cli][live][session][seat]")
+{
+    auto seat = RunningSeat { RenderOptions { .format = OutputFormat::Tsv }, false };
+    auto identity = ScriptedIdentity { EndpointIdentity { .kind = RemoteKind::CompileNode,
+                                                          .detail = "10.0.0.4:6674 is a fastcache-compile-node" } };
+    auto const operands = std::vector<std::string> { "fleet" };
+
+    auto const ending = RunLiveStatsSession(SessionContext(operands, 1, &identity, &seat.gatherer), seat.Seat());
+
+    CHECK(ending.kind == SessionEndKind::Refused);
+    CHECK(ending.answer.outcome == Outcome::Local);
+    CHECK(AdvisoryText(ending.answer).contains("live-stats fleet"));
+    CHECK_FALSE(seat.source.has_value());
 }

@@ -3,6 +3,7 @@
 
 #include "CliAnswer.hpp"
 #include "CliVerbs.hpp"
+#include "DashboardLoop.hpp"
 #include "NodeClient.hpp"
 
 #include <FastCache/Core/EnumTable.hpp>
@@ -89,6 +90,14 @@ struct LiveSubjectSpec
     /// section for the whole fleet, and that cost lands where the operator is not
     /// looking.
     std::string_view costsWhom;
+
+    /// What one of this subject's samples reads as: the reader its session's loop is given.
+    ///
+    /// **Null for `fleet` until a fleet session samples the leader's admin document**: the
+    /// cadence asks the stats ladder only, so a fleet reader would have nothing to read, and
+    /// a composition refuses a null reader by name rather than streaming a table it cannot
+    /// take.
+    SampleReader reader;
 };
 
 /// The subjects, one row per enumerator, in enumerator order.
@@ -100,7 +109,8 @@ inline constexpr EnumTable<LiveSubject, LiveSubjectSpec> LiveSubjectTable { {
       .needs = "a cache daemon",
       .minInterval = std::chrono::milliseconds { 1000 },
       .defaultInterval = std::chrono::milliseconds { 2000 },
-      .costsWhom = "each sample is served by the cache daemon itself" },
+      .costsWhom = "each sample is served by the cache daemon itself",
+      .reader = &ReadStatsSample },
     { .subject = LiveSubject::Node,
       .key = "node",
       .inferrable = true,
@@ -108,7 +118,8 @@ inline constexpr EnumTable<LiveSubject, LiveSubjectSpec> LiveSubjectTable { {
       .needs = "a fastcache-compile-node",
       .minInterval = std::chrono::milliseconds { 1000 },
       .defaultInterval = std::chrono::milliseconds { 2000 },
-      .costsWhom = "each sample is served by the node itself" },
+      .costsWhom = "each sample is served by the node itself",
+      .reader = &ReadStatsSample },
     { .subject = LiveSubject::Fleet,
       .key = "fleet",
       .inferrable = false,
@@ -117,7 +128,8 @@ inline constexpr EnumTable<LiveSubject, LiveSubjectSpec> LiveSubjectTable { {
       .minInterval = std::chrono::milliseconds { 2000 },
       .defaultInterval = std::chrono::milliseconds { 5000 },
       .costsWhom = "each sample makes the LEADER render a whole section for the whole fleet, "
-                   "once per watcher" },
+                   "once per watcher",
+      .reader = nullptr },
 } };
 
 static_assert(RowsInEnumeratorOrder(LiveSubjectTable, &LiveSubjectSpec::subject),
