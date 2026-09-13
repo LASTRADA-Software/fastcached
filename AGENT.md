@@ -1116,6 +1116,14 @@ what differs between compilers, standard libraries, hosts and tool versions.
   `ctest` rather than only building. Nothing states that level, so `iterator-debug-canary` is a
   program that must die and `scripts/iterator-debug-gate.ps1` refuses a build where it survives.
   Guarded to MSVC Debug, so its absence elsewhere is normal rather than a lost registration.
+- **No executable raises a modal error dialog, and the BUILD installs that, never each `main`**
+  — an assert that opens a dialog does not fail a test, it hangs it, and four binaries on
+  `Catch2WithMain` had no `main` of ours to install it in. `cmake/ErrorPopups.cmake` attaches one
+  translation unit to every executable, and `ctest -R error-popup-coverage` reads the LINK LINES
+  of every executable a test launches. A PRODUCT binary suppresses only when
+  `FASTCACHED_SUPPRESS_ERROR_DIALOGS` is set, so a developer's Debug run keeps its debugger, and
+  EVERY registered test sets it -- a new `catch_discover_tests` names
+  `FASTCACHED_ERROR_DIALOG_ENVIRONMENT` or the check refuses its cases (#1389).
 - So a sanitizer job proves nothing until something proves the sanitizer. `scripts/tsan-gate.sh`
   refuses to report clean until every artefact's OWN OBJECT FILES carry an **undefined**
   `__tsan_init` reference **and** a deliberate race (`src/tests/TsanCanary.cpp`) has gone red —

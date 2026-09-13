@@ -4,10 +4,7 @@
 #define CATCH_CONFIG_RUNNER
 #include <catch2/catch_session.hpp>
 
-#include <tests/WindowsErrorPopups.hpp>
-
 int main(int argc, char* argv[])
 {
-    FastCache::Testing::SuppressWindowsErrorPopups();
     return Catch::Session().run(argc, argv);
 }

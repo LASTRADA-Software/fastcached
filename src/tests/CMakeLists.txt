@@ -74,7 +74,7 @@ include(Catch)
 # than restated, because this comment exists five times over -- and the fix is a change
 # of MECHANISM, tracked as #1152. `catch-skip-exit-collision` below asserts the premises
 # that argument rests on, so it cannot rot into a false rule.
-catch_discover_tests(FastCacheTest PROPERTIES SKIP_RETURN_CODE 4)
+catch_discover_tests(FastCacheTest PROPERTIES SKIP_RETURN_CODE 4 ENVIRONMENT_MODIFICATION "${FASTCACHED_ERROR_DIALOG_ENVIRONMENT}")
 
 # ---------------------------------------------------------------------------
 # The ThreadSanitizer canary: a program that MUST fail, so that a green sanitizer
@@ -107,9 +107,6 @@ if(ENABLE_SANITIZER_THREAD)
     # sequences the two, and is the only thing that should run this.
     find_package(Threads REQUIRED)
     target_link_libraries(tsan-canary PRIVATE Threads::Threads)
-    # <tests/WindowsErrorPopups.hpp>: this target links no FastCache, which is what
-    # otherwise carries src/ as a PUBLIC include directory.
-    target_include_directories(tsan-canary PRIVATE "${CMAKE_SOURCE_DIR}/src")
 endif()
 
 # ---------------------------------------------------------------------------
@@ -140,10 +137,6 @@ endif()
 # diagnostic, the same way the TSan gate requires "data race".
 if(MSVC AND CMAKE_BUILD_TYPE STREQUAL "Debug")
     add_executable(iterator-debug-canary IteratorDebugCanary.cpp)
-    # <tests/WindowsErrorPopups.hpp>. This target links nothing on purpose -- it is a
-    # bare program so that _ITERATOR_DEBUG_LEVEL is the only thing under test -- so it
-    # inherits no include directory either.
-    target_include_directories(iterator-debug-canary PRIVATE "${CMAKE_SOURCE_DIR}/src")
     add_test(
         NAME "iterator-debug-canary"
         COMMAND pwsh -NoProfile -File "${CMAKE_SOURCE_DIR}/scripts/iterator-debug-gate.ps1"
@@ -6544,3 +6537,83 @@ set_tests_properties("third-party-roots-selftest" PROPERTIES
     LABELS "hygiene"
     TIMEOUT 120
 )
+
+# ---------------------------------------------------------------------------
+# No executable raises a modal error dialog on Windows (#1389).
+#
+# `cmake/ErrorPopups.cmake` attaches `ErrorPopupsAtStartup.cpp` to every executable by
+# walking the build system. Two registrations prove it, and they answer different
+# questions:
+#
+#   * `error-popup-coverage` reads the GENERATED files -- the walk's manifest, every
+#     `CTestTestfile.cmake` and `build.ninja` -- and refuses an executable a test launches
+#     whose link line lacks the object and which states no reason. On every platform: the
+#     suppression only acts on Windows, but a walk that misses a target misses it
+#     everywhere, and the Linux gate is where that is cheapest to see.
+#   * `error-popup-canary` asks the RUNTIME. It links `Catch2::Catch2WithMain`, the
+#     population the defect lived in, fails a Debug assert, and its gate requires the
+#     process to END with the assertion's text inside a bound. Only an MSVC Debug build has
+#     the dialog, so elsewhere it is registered as a skip naming that.
+add_test(
+    NAME "error-popup-coverage"
+    COMMAND ${CMAKE_COMMAND}
+        "-DBUILD_DIR=${CMAKE_BINARY_DIR}"
+        "-DCONFIG=$<CONFIG>"
+        -DANCHOR=FastCacheTest
+        "-DVARIABLE=${FASTCACHED_ERROR_DIALOG_VARIABLE}"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-error-popups.cmake"
+)
+set_tests_properties("error-popup-coverage" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    SKIP_REGULAR_EXPRESSION "SKIP: "
+    LABELS "hygiene"
+    TIMEOUT 120
+)
+add_test(
+    NAME "error-popup-coverage-selftest"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DFASTCACHED_SCRATCH_DIR=${CMAKE_CURRENT_BINARY_DIR}/error-popup-coverage-selftest"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-error-popups-selftest.cmake"
+)
+set_tests_properties("error-popup-coverage-selftest" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 120
+)
+if(MSVC AND CMAKE_BUILD_TYPE STREQUAL "Debug")
+    add_executable(error-popup-canary ErrorPopupCanary.cpp)
+    target_link_libraries(error-popup-canary PRIVATE Catch2::Catch2WithMain)
+    add_test(
+        NAME "error-popup-canary"
+        COMMAND ${CMAKE_COMMAND}
+            "-DCANARY=$<TARGET_FILE:error-popup-canary>"
+            -P "${CMAKE_SOURCE_DIR}/scripts/error-popup-gate.cmake"
+    )
+    set_tests_properties("error-popup-canary" PROPERTIES
+        FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+        LABELS "hygiene"
+        TIMEOUT 120
+    )
+    # The PRODUCT policy, in both directions: this canary is built as a product binary is,
+    # and its gate runs it with the variable and without.
+    add_executable(error-popup-product-canary ErrorPopupProductCanary.cpp)
+    set_target_properties(error-popup-product-canary PROPERTIES FASTCACHED_ERROR_POPUPS_POLICY "on-request")
+    add_test(
+        NAME "error-popup-product-canary"
+        COMMAND ${CMAKE_COMMAND}
+            "-DCANARY=$<TARGET_FILE:error-popup-product-canary>"
+            "-DVARIABLE=${FASTCACHED_ERROR_DIALOG_VARIABLE}"
+            -P "${CMAKE_SOURCE_DIR}/scripts/error-popup-product-gate.cmake"
+    )
+    set_tests_properties("error-popup-product-canary" PROPERTIES
+        FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+        LABELS "hygiene"
+        TIMEOUT 120
+    )
+else()
+    fastcached_register_skipped_test("error-popup-canary"
+        "only an MSVC Debug CRT raises the assert dialog this canary proves gone, and this build is not one")
+    fastcached_register_skipped_test("error-popup-product-canary"
+        "only an MSVC Debug CRT has an assert report mode to route, and this build is not one")
+endif()

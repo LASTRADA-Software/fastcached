@@ -45,8 +45,9 @@ if (-not (Test-Path $Canary)) {
     Fail "the canary was not built: $Canary`n    Build it before running this gate; it is guarded to MSVC Debug builds."
 }
 
-# The canary sets its own report modes so the assertion goes to stderr rather than
-# to a modal dialog -- without that, this line hangs a CI job until its timeout.
+# The build attaches src/tests/ErrorPopupsAtStartup.cpp to the canary, as to every
+# executable (#1389), so the assertion goes to stderr rather than to a modal dialog --
+# without that, this line hangs a CI job until its timeout.
 $stdout = & $Canary 2>&1 | Out-String
 $code = $LASTEXITCODE
 

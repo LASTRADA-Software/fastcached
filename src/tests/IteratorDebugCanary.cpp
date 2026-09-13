@@ -41,12 +41,8 @@
 #include <cstdlib>
 #include <vector>
 
-#include <tests/WindowsErrorPopups.hpp>
-
 int main()
 {
-    FastCache::Testing::SuppressWindowsErrorPopups();
-
     // Sized from a runtime value and read past the end. Not a constant expression
     // and not a literal index: MSVC folds the obvious spelling away at compile
     // time, and a canary the optimiser deletes reports exactly what a missing
