@@ -1,0 +1,216 @@
+// SPDX-License-Identifier: Apache-2.0
+#pragma once
+
+#include "DashboardRung.hpp"
+
+#include <FastCache/Core/EnumTable.hpp>
+
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <optional>
+#include <span>
+#include <string>
+#include <string_view>
+
+namespace FastCache::Cli
+{
+
+/// @file DashboardGlyphs.hpp
+/// What each rung of the `live-stats` ladder draws WITH, and the few drawing rules every panel
+/// shares.
+///
+/// **One table, so a panel never branches on its rung.** A panel is handed a rung as a value
+/// (`DashboardRung.hpp`), looks its row up once, and draws through the row: the sparkline, the
+/// frame and the gauge are all spelled here. Two panels asking `if (rung == Ascii)` would be two
+/// places for the rungs to come to disagree about what a gap looks like.
+///
+/// **What is NOT in the table is as deliberate as what is.** The absent marker has no column:
+/// it is the operator's `--absent`, resolved once by whoever composes the session, and it is the
+/// same text on every rung (#134 §9.6). A column for it would be the one way to let two rungs
+/// render one absent cell differently.
+
+/// The eight block elements a Unicode sparkline draws, lowest first.
+///
+/// U+2581 to U+2588. `▁` is the lowest VALUE, which is why a cell with no reading is never drawn
+/// with it (§6.1): a space is *nothing was read*, `▁` is *zero was read*.
+inline constexpr std::array<std::string_view, 8> BlockLevels { "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█" };
+
+/// Everything one rung draws with.
+struct RungGlyphs
+{
+    RenderRung rung; ///< The enumerator this row describes.
+
+    /// The sparkline's levels, lowest first; EMPTY on a rung that draws no sparkline.
+    ///
+    /// Empty rather than one `#`, and that is §10's rule rather than a gap in the table: one level
+    /// per cell carries no information and LOOKS like data, which is worse than no column.
+    std::span<std::string_view const> sparkLevels;
+
+    /// A sparkline cell with no reading behind it.
+    std::string_view noReading;
+
+    std::string_view horizontal;  ///< The frame's top and bottom edge.
+    std::string_view vertical;    ///< The frame's left and right edge.
+    std::string_view topLeft;     ///< The frame's corners, clockwise from the top left.
+    std::string_view topRight;    ///< See `topLeft`.
+    std::string_view bottomRight; ///< See `topLeft`.
+    std::string_view bottomLeft;  ///< See `topLeft`.
+
+    std::string_view gaugeOpen;   ///< What opens a gauge; empty where the fill alone is legible.
+    std::string_view gaugeFilled; ///< One filled gauge cell.
+    std::string_view gaugeEmpty;  ///< One unfilled gauge cell.
+    std::string_view gaugeClose;  ///< What closes a gauge; see `gaugeOpen`.
+};
+
+/// The rungs' glyphs, one row per `RenderRung`, in enumerator order.
+///
+/// `Sixel` draws its TEXT exactly as `Unicode` does -- a chart is an image beside the figures, not
+/// a different spelling of them. `Piped` has a row only because the table covers the enum: a piped
+/// session draws no frame, and no panel is constructed for it.
+inline constexpr EnumTable<RenderRung, RungGlyphs> RungGlyphTable { {
+    { .rung = RenderRung::Sixel,
+      .sparkLevels = BlockLevels,
+      .noReading = " ",
+      .horizontal = "─",
+      .vertical = "│",
+      .topLeft = "┌",
+      .topRight = "┐",
+      .bottomRight = "┘",
+      .bottomLeft = "└",
+      .gaugeOpen = "",
+      .gaugeFilled = "█",
+      .gaugeEmpty = "░",
+      .gaugeClose = "" },
+    { .rung = RenderRung::Unicode,
+      .sparkLevels = BlockLevels,
+      .noReading = " ",
+      .horizontal = "─",
+      .vertical = "│",
+      .topLeft = "┌",
+      .topRight = "┐",
+      .bottomRight = "┘",
+      .bottomLeft = "└",
+      .gaugeOpen = "",
+      .gaugeFilled = "█",
+      .gaugeEmpty = "░",
+      .gaugeClose = "" },
+    { .rung = RenderRung::Ascii,
+      .sparkLevels = {},
+      .noReading = " ",
+      .horizontal = "-",
+      .vertical = "|",
+      .topLeft = "+",
+      .topRight = "+",
+      .bottomRight = "+",
+      .bottomLeft = "+",
+      .gaugeOpen = "[",
+      .gaugeFilled = "#",
+      .gaugeEmpty = ".",
+      .gaugeClose = "]" },
+    { .rung = RenderRung::Piped,
+      .sparkLevels = {},
+      .noReading = " ",
+      .horizontal = "-",
+      .vertical = "|",
+      .topLeft = "+",
+      .topRight = "+",
+      .bottomRight = "+",
+      .bottomLeft = "+",
+      .gaugeOpen = "[",
+      .gaugeFilled = "#",
+      .gaugeEmpty = ".",
+      .gaugeClose = "]" },
+} };
+
+static_assert(RowsInEnumeratorOrder(RungGlyphTable, &RungGlyphs::rung),
+              "RungGlyphTable must hold one row per RenderRung, in enumerator order");
+
+/// The row for @p rung.
+/// @param rung A rung below `Last`.
+/// @return Its glyphs.
+[[nodiscard]] RungGlyphs const& GlyphsFor(RenderRung rung) noexcept;
+
+/// How many terminal columns @p text occupies.
+///
+/// Counts code points, which is right for everything a panel draws ITSELF -- ASCII, box drawing
+/// and block elements are one column each. A wide or combining character in text a PEER chose (a
+/// fleet display name) is measured as one column and will misalign its row; the fleet page's UTF-8
+/// gate guarantees the text is valid, not that it is narrow.
+/// @param text Valid UTF-8.
+/// @return The width in columns.
+[[nodiscard]] std::size_t DisplayWidth(std::string_view text) noexcept;
+
+/// @p text cut or padded on the right to exactly @p width columns.
+/// @param text Valid UTF-8.
+/// @param width The columns to fill.
+/// @return The fitted text; never splits a code point.
+[[nodiscard]] std::string FitRight(std::string_view text, std::size_t width);
+
+/// @p text padded on the LEFT to @p width columns, for a figure that aligns on its last digit.
+/// Text wider than @p width is returned whole: a figure is never cut, since a truncated number is
+/// a different number.
+/// @param text Valid UTF-8.
+/// @param width The columns to fill.
+/// @return The aligned text.
+[[nodiscard]] std::string AlignRight(std::string_view text, std::size_t width);
+
+/// One sparkline, one glyph per cell, oldest on the left.
+///
+/// **Scaled from ZERO to the largest present value, never from the smallest**: a sparkline scaled
+/// from its minimum draws a flat series at 1000/s and one at 0/s identically, which is the trend a
+/// reader came to see erased. So a present zero is the lowest level, the largest value is the
+/// highest, and any other present value is at least one level above zero -- `▁` claims zero and
+/// must not be borrowed for "small". A cell with no reading is `noReading`, and so is a value that
+/// is not finite, because that is not a reading either.
+/// @param cells The values, oldest first; nullopt where there was no reading.
+/// @param glyphs The rung's glyphs.
+/// @return The glyphs, or empty on a rung that draws no sparkline.
+[[nodiscard]] std::string Sparkline(std::span<std::optional<double> const> cells, RungGlyphs const& glyphs);
+
+/// A gauge @p width cells wide, filled in proportion to @p fraction.
+/// @param fraction Clamped into [0, 1].
+/// @param width How many fill cells, excluding the rung's open and close.
+/// @param glyphs The rung's glyphs.
+/// @return The gauge.
+[[nodiscard]] std::string Gauge(double fraction, std::size_t width, RungGlyphs const& glyphs);
+
+/// How a figure is written.
+///
+/// TRANSMITTED/PERSISTED: no. Private; enumerators may be inserted.
+enum class FigureFormat : std::uint8_t
+{
+    Count,   ///< A whole number, grouped in thousands: `1 284 991`.
+    Rate,    ///< Events per unit time: grouped when at least ten, one decimal below.
+    Percent, ///< A fraction in [0, 1] as `94.2 %`.
+    Bytes,   ///< Binary units: `3.41 GiB`.
+    Seconds, ///< A duration in seconds: `1.84 s`.
+    Last,
+};
+
+/// @p value written as @p format says.
+///
+/// **Takes no rung, and that is the point** (§9.6): every rung writes a figure through this one
+/// function, so no rung can come to write one differently.
+/// @param value The value, or nullopt where nothing was reported.
+/// @param format How to write it.
+/// @param absent The resolved absent marker.
+/// @return The text; @p absent when @p value is nullopt or not finite.
+[[nodiscard]] std::string FormatFigure(std::optional<double> value, FigureFormat format, std::string_view absent);
+
+/// @p lines inside the rung's frame, @p width columns wide in total.
+///
+/// Each line is fitted to the inside width, so a panel lays out its rows and the frame decides
+/// nothing but the edge. The title is set into the top edge. Lines are separated by `\n` with no
+/// cursor movement: where the picture goes on the screen is the terminal sink's decision.
+/// @param title The top edge's title; cut to fit.
+/// @param lines The content lines.
+/// @param width The frame's total width, edges included; at least four.
+/// @param glyphs The rung's glyphs.
+/// @return The frame.
+[[nodiscard]] std::string Frame(std::string_view title,
+                                std::span<std::string const> lines,
+                                std::size_t width,
+                                RungGlyphs const& glyphs);
+
+} // namespace FastCache::Cli
