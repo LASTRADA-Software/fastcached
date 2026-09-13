@@ -2,6 +2,7 @@
 #pragma once
 
 #include "DashboardEvent.hpp"
+#include "DashboardLoop.hpp"
 #include "StatsSource.hpp"
 
 #include <FastCache/Async/IExecutor.hpp>
@@ -110,6 +111,17 @@ struct LiveSourceParts
     /// that detaches ends the session only where there is one.
     std::unique_ptr<IDashboardEventSource> terminal {};
 
+    /// Where `terminal`'s frames are presented, or null for a run with no terminal.
+    ///
+    /// **Owned here, beside the events it presents over, and released immediately before them**
+    /// -- when the terminal goes away on its own as much as when the session is closed. A presenter
+    /// the composition held instead outlived a terminal that detached: the events were destroyed
+    /// the moment their `Detached` was read, which restores the operator's screen, while a sample
+    /// and its tick already queued ahead of that `Detached` still drew a frame onto it. The loop
+    /// presents through `Frames()`, which drops a frame once this is gone. Declared after
+    /// `terminal`, so a destroyed source releases it first too.
+    std::unique_ptr<IFrameSink> frames {};
+
     /// An operator's stop request, or null where none is composed.
     ///
     /// A run with no terminal is the one that hears Ctrl-C as a signal; a terminal in raw
@@ -183,6 +195,16 @@ class LiveEventSource final: public IDashboardEventSource
     /// clock to count from the same epoch -- `SteadyClock` against `steady_clock` does.
     /// @return The start of the outstanding sample, or nullopt.
     [[nodiscard]] std::optional<TimePoint> SampleOutstandingSince() const noexcept;
+
+    /// Where the loop presents a terminal session's frames, or null when this source was given no
+    /// `frames`.
+    ///
+    /// Presents through `LiveSourceParts::frames` for as long as the terminal's events exist, and
+    /// drops a frame after: once the terminal has gone the operator's own screen is back, and a
+    /// frame there is output nobody asked for. Called on the reactor's thread, as every presenter
+    /// is; valid for the source's lifetime.
+    /// @return The sink, or null.
+    [[nodiscard]] IFrameSink* Frames() noexcept;
 
     /// The producers' shared state; outlives the source while a producer still runs.
     ///
