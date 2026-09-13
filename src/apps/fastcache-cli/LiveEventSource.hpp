@@ -7,6 +7,7 @@
 #include <FastCache/Async/IExecutor.hpp>
 #include <FastCache/Async/IReactor.hpp>
 #include <FastCache/Async/Task.hpp>
+#include <FastCache/Platform/StopSignal.hpp>
 
 #include <chrono>
 #include <memory>
@@ -53,12 +54,25 @@ struct LiveSourceParts
     /// `Next()` on `reactor`.
     ///
     /// Null is a whole mode rather than a missing part: a run whose output is not a
-    /// terminal takes its samples with nothing else able to end it early, and a terminal
+    /// terminal takes its samples with only `stop` able to end it early, and a terminal
     /// that detaches ends the session only where there is one.
     std::unique_ptr<IDashboardEventSource> terminal {};
+
+    /// An operator's stop request, or null where none is composed.
+    ///
+    /// A run with no terminal is the one that hears Ctrl-C as a signal; a terminal in raw
+    /// mode sends it as a key. So a stop is delivered as that same key, and the loop has one
+    /// way to be quit whichever route Ctrl-C took.
+    IStopSignal* stop { nullptr };
+
+    /// Where `stop`'s blocking wait runs, when there is a `stop`.
+    ///
+    /// **Its own thread, never `pool`**: the wait holds its thread for the whole session, so
+    /// a one-thread sample pool lent to it would never sample again.
+    IExecutor* stopWaiter { nullptr };
 };
 
-/// Samples on a cadence and forwards a terminal, as one stream.
+/// Samples on a cadence and forwards a terminal and a stop request, as one stream.
 ///
 /// **A `Tick` follows every sample and every resize**, and that is the whole tick policy.
 /// A frame is drawn on a tick, so a piped run -- which has no terminal, hence no resize --
