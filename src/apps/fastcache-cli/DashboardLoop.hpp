@@ -27,6 +27,13 @@ namespace FastCache::Cli
 /// two catch different things -- a scan cannot see a hidden ambient read reached through
 /// a helper, and determinism cannot see one whose answer happens to be stable.
 
+/// When a reading was taken and where it came from: what decides whether it continues a run.
+struct ReadingStamp
+{
+    TimePoint at {};       ///< When it was taken, on the steady clock.
+    std::string source {}; ///< Which source produced it, by stable name.
+};
+
 /// What the dashboard knows right now.
 ///
 /// Everything a frame is drawn from, and nothing else. A renderer that needed a fact not
@@ -47,15 +54,20 @@ struct DashboardModel
     /// reading is model state rather than something a renderer recomputes.
     std::optional<Value> previous {};
 
-    /// How many readings in a row have been accepted since the last failure.
+    /// When `latest` was taken and which source produced it; engaged exactly when `latest` is.
     ///
-    /// **A counter rather than a flag, because two rules turned out to be one.** A rate
-    /// needs two readings (so the first reading of a session has none) AND it must not
-    /// span a gap (so the first reading after a failure has none either). Written as a
-    /// boolean those are two conditions that have to agree, and the first version of
-    /// this file got the second one wrong in the direction nothing notices: it cleared
-    /// the flag on the reading straight after a failure, drawing a rate over an interval
-    /// where the source was down. One counter states the invariant once.
+    /// Kept because the NEXT reading is judged against it.
+    std::optional<ReadingStamp> latestStamp {};
+
+    /// How many readings in a row belong to one measurable run.
+    ///
+    /// **A counter rather than a flag, because the rules turned out to be one.** A rate
+    /// needs two readings (so the first reading of a session has none), and it must not
+    /// span anything that makes the interval unmeasurable: a failure, a change of source,
+    /// or a stamp no later than the one before. Written as flags those are conditions that
+    /// have to agree, and the first version of this file got one wrong in the direction
+    /// nothing notices: it cleared the flag on the reading straight after a failure,
+    /// drawing a rate over an interval where the source was down. One counter, one rule.
     std::size_t runLength { 0 };
 
     /// The terminal geometry, as last reported. Zero until a `Resize` says.
@@ -107,6 +119,44 @@ struct DashboardExit
 
     DashboardModel model {};
 };
+
+/// What one `Sample` reads as, once its session's reader has looked at it.
+struct SampleReading
+{
+    /// `Affirmative` when there is a reading; otherwise why there is none.
+    Outcome outcome { Outcome::Unreachable };
+
+    /// The reading. Meaningful iff `outcome` is `Affirmative`.
+    Value value {};
+
+    /// Which source produced it, by stable name. Meaningful iff `outcome` is `Affirmative`.
+    ///
+    /// Part of the reading rather than something the fold infers, because a change of source
+    /// breaks the run: a change taken across `/metrics` and then `INFO` subtracts one
+    /// vocabulary from another, and the result is not a rate of anything.
+    std::string source {};
+};
+
+/// Turns one session's raw `Sample` payload into a reading.
+///
+/// **Injected, so the fold never branches on a subject.** A `cache` or `node` session reads
+/// `attempts` through the stats ladder and a `fleet` session reads `document`; the loop calls
+/// whichever reader it was given and cannot tell them apart. That keeps the choice in the
+/// deterministic half, where a loop fixture reaches it.
+///
+/// **A plain function pointer rather than `std::function`, deliberately.** A reader has no
+/// state to carry, and a capture is exactly how a gatherer, a socket or a clock would reach
+/// the one half of this design that must touch none of them. The type forbids that rather
+/// than a comment asking.
+using SampleReader = SampleReading (*)(DashboardEvent const& event);
+
+/// The reader for a `cache` or `node` session: the stats ladder's own decision.
+///
+/// `ChooseStats` over the event's attempts, which is what the fold ran inline before a reader
+/// was injected -- moved, not rewritten, so a `cache` session sees the decision it always saw.
+/// @param event The `Sample`.
+/// @return The chosen record and its source, or why nothing could be chosen.
+[[nodiscard]] SampleReading ReadStatsSample(DashboardEvent const& event);
 
 /// Where a rendered frame goes.
 ///
@@ -170,14 +220,14 @@ struct DashboardLimits
 /// the alternative. None may be null.
 ///
 /// @param events Where every input comes from, in order.
+/// @param reader What turns a `Sample` into a reading; the session's subject is chosen by
+///        which one is passed.
 /// @param view What draws a frame.
 /// @param sink Where a frame goes.
 /// @param limits What bounds the run.
 /// @return How it ended, and what it knew when it did.
-[[nodiscard]] Task<DashboardExit> RunDashboard(IDashboardEventSource* events,
-                                               IDashboardView* view,
-                                               IFrameSink* sink,
-                                               DashboardLimits limits);
+[[nodiscard]] Task<DashboardExit> RunDashboard(
+    IDashboardEventSource* events, SampleReader reader, IDashboardView* view, IFrameSink* sink, DashboardLimits limits);
 
 /// Whether @p keys asks the dashboard to quit.
 ///

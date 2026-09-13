@@ -5,6 +5,7 @@
 
 #include <FastCache/Async/IExecutor.hpp>
 #include <FastCache/Async/Task.hpp>
+#include <FastCache/Core/Clock.hpp>
 
 #include <thread>
 #include <vector>
@@ -37,6 +38,9 @@ struct SampleOutcome
     /// What each source said. Empty when the gather could not be attempted.
     std::vector<StatsAttempt> attempts {};
 
+    /// When the sources answered, on the injected clock. See `TakeSample` for where it is read.
+    TimePoint takenAt {};
+
     /// The thread `Gather()` actually ran on.
     std::thread::id gatheredOn {};
 
@@ -58,11 +62,20 @@ struct SampleOutcome
 /// other than `IReactor` drives the dashboard; now the sampler names a place to come
 /// back to rather than a scheduler.
 ///
+/// **The clock is read on the POOL, while the reactor may be parked, so it must read its
+/// source on every call.** A clock cached by the loop -- `CachedClock`, whose `Now()` returns
+/// what the reactor's last wake-up `Refresh()`ed, or simply passing the reactor's own clock --
+/// answers the time the dashboard reactor last woke, and during a `Gather()` that reactor is
+/// asleep by design. Every rate's denominator would then be off by up to one gather, silently:
+/// `ManualClock` has no cache, so no test can see it. `IClock` cannot say this in its type,
+/// which leaves this sentence as the only guard. Pass `SteadyClock`.
+///
 /// @param gatherer The ladder to ask.
+/// @param clock What stamps the reading. Must read its source on every `Now()`; see above.
 /// @param pool Where the blocking gather runs. Sized 1: one sampler, and it keeps the
 ///        ordering of readings trivially rather than by arrangement.
 /// @param resumeOn Where the caller is resumed before the result is used.
 /// @return The reading, and where it was taken.
-[[nodiscard]] Task<SampleOutcome> TakeSample(IStatsGatherer* gatherer, IExecutor* pool, IExecutor* resumeOn);
+[[nodiscard]] Task<SampleOutcome> TakeSample(IStatsGatherer* gatherer, IClock* clock, IExecutor* pool, IExecutor* resumeOn);
 
 } // namespace FastCache::Cli
