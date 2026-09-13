@@ -206,7 +206,7 @@ TEST_CASE("SIGINT reaches a waiting stop signal and the previous disposition ret
     struct sigaction original {};
     struct sigaction prior {};
     prior.sa_handler = &PriorHandler;
-    static_cast<void>(::sigemptyset(&prior.sa_mask));
+    static_cast<void>(sigemptyset(&prior.sa_mask));
     REQUIRE(::sigaction(SIGINT, &prior, &original) == 0);
     priorHandlerRuns.store(0);
 
@@ -262,7 +262,7 @@ TEST_CASE("a stop an earlier install heard is not the next install's, and the ne
     struct sigaction original {};
     struct sigaction prior {};
     prior.sa_handler = &PriorHandler;
-    static_cast<void>(::sigemptyset(&prior.sa_mask));
+    static_cast<void>(sigemptyset(&prior.sa_mask));
     REQUIRE(::sigaction(SIGINT, &prior, &original) == 0);
 
     {
@@ -298,7 +298,7 @@ TEST_CASE("a SIGINT this process inherited as ignored stays ignored, and its sto
     struct sigaction original {};
     struct sigaction ignored {};
     ignored.sa_handler = SIG_IGN;
-    static_cast<void>(::sigemptyset(&ignored.sa_mask));
+    static_cast<void>(sigemptyset(&ignored.sa_mask));
     REQUIRE(::sigaction(SIGINT, &ignored, &original) == 0);
 
     {
