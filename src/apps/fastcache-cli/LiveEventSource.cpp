@@ -19,6 +19,46 @@
 namespace FastCache::Cli
 {
 
+namespace
+{
+    /// Asks the gatherer it holds, dialling a new one first when the last round failed.
+    ///
+    /// Read and written only by the gathers, which run one at a time on the pool: the cadence
+    /// never starts a sample before the previous one has come back.
+    class RedialingGatherer final: public IStatsGatherer
+    {
+      public:
+        /// @param first What to ask until a round fails.
+        /// @param dialer What dials a replacement; null for never.
+        RedialingGatherer(IStatsGatherer* first, IStatsDialer* dialer) noexcept:
+            _current { first },
+            _dialer { dialer }
+        {
+        }
+
+        [[nodiscard]] std::vector<StatsAttempt> Gather() override
+        {
+            if (_lastFailed && _dialer != nullptr)
+            {
+                _dialed = _dialer->Dial();
+                _current = _dialed.get();
+            }
+            auto attempts = _current->Gather();
+            // Failed by the reader's own decision rather than by a second reading of the
+            // attempts: a round the ladder cannot choose a record from is the round that
+            // renders as a gap, and exactly that round is the one worth a re-dial.
+            _lastFailed = ChooseStats(attempts).outcome != Outcome::Affirmative;
+            return attempts;
+        }
+
+      private:
+        IStatsGatherer* _current;
+        IStatsDialer* _dialer;
+        std::unique_ptr<IStatsGatherer> _dialed {};
+        bool _lastFailed { false };
+    };
+} // namespace
+
 /// Shared by the source and its producers.
 ///
 /// Every member is read and written on the reactor's thread only -- the producers resume
@@ -30,7 +70,8 @@ struct LiveEventSource::State
         parts { std::move(from) },
         events { *parts.reactor, AsyncQueueOptions {} },
         finished { *parts.reactor, AsyncQueueOptions {} },
-        due { *parts.reactor, AsyncQueueOptions {} }
+        due { *parts.reactor, AsyncQueueOptions {} },
+        gatherer { parts.gatherer, parts.dialer }
     {
     }
 
@@ -63,6 +104,11 @@ struct LiveEventSource::State
     /// leaves through its own tail like every other exit, and its timer's destructor takes
     /// the pending deadline off the heap.
     AsyncQueue<std::monostate> due;
+
+    /// What every sample asks: `parts.gatherer`, re-dialled through `parts.dialer` after a
+    /// failure. Held here because a sample still on the pool when the source is destroyed is
+    /// still inside it, and this state outlives the source for exactly that long.
+    RedialingGatherer gatherer;
 
     int producers { 0 };
 
@@ -125,7 +171,7 @@ namespace
         while (!shared->Closed())
         {
             shared->sampleSince.store(parts.clock->Now().time_since_epoch().count(), std::memory_order_release);
-            auto sample = co_await TakeSample(parts.gatherer, parts.clock, parts.pool, parts.reactor);
+            auto sample = co_await TakeSample(&shared->gatherer, parts.clock, parts.pool, parts.reactor);
             shared->sampleSince.store(LiveEventSource::State::NoSample, std::memory_order_release);
             // Closed while the gather was on the pool: the closed queue refuses the reading,
             // which describes a session that has already ended, and the closed `due` ends

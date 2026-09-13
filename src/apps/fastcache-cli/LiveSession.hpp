@@ -101,7 +101,8 @@ struct LiveSessionParts
 {
     LivePlan plan {};                            ///< What was admitted.
     IReactor* reactor { nullptr };               ///< Where the session runs.
-    IStatsGatherer* gatherer { nullptr };        ///< What each sample asks.
+    IStatsGatherer* gatherer { nullptr };        ///< What each sample asks, until one fails.
+    IStatsDialer* dialer { nullptr };            ///< What re-dials after a failed sample.
     SampleReader reader { nullptr };             ///< What a sample says: the subject's reader.
     IClock* clock { nullptr };                   ///< What samples are stamped with: `SteadyClock`.
     IExecutor* samplePool { nullptr };           ///< Where a gather blocks.
@@ -202,6 +203,7 @@ struct LiveSessionSeat
 {
     IReactor* reactor { nullptr };               ///< Running on a thread of its own.
     IClock* clock { nullptr };                   ///< What samples are stamped with: `SteadyClock`.
+    IStatsDialer* dialer { nullptr };            ///< What re-dials the endpoint after a failed sample.
     IExecutor* samplePool { nullptr };           ///< Where a gather blocks.
     IExecutor* stopWaiter { nullptr };           ///< Where the stop wait blocks.
     IExecutor* terminalPool { nullptr };         ///< Where terminal reads block.
