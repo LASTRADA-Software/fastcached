@@ -25,8 +25,8 @@ struct LiveEventSource::State
     explicit State(LiveSourceParts from):
         parts { std::move(from) },
         events { *parts.reactor, AsyncQueueOptions {} },
-        due { *parts.reactor, AsyncQueueOptions {} },
-        finished { *parts.reactor, AsyncQueueOptions {} }
+        finished { *parts.reactor, AsyncQueueOptions {} },
+        due { *parts.reactor, AsyncQueueOptions {} }
     {
     }
 
