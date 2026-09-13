@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# The fastcache-cli files that may name an ambient-read token, and why.
+#
+# Read by `scripts/check-cli-ambient-reads.cmake`, which refuses a file under
+# `src/apps/fastcache-cli/` that names `getenv`, `isatty`, `ioctl` or `GetConsoleMode`
+# outside a comment -- unless a row here names that file and that token.
+#
+# One row per (file, token):
+#
+#   <path relative to the source root>|<token>|<why this file must read it directly>
+#
+# The reason is REQUIRED and is printed with the verdict, so whoever meets the row later
+# meets the argument rather than a bare permission. A row whose file no longer names its
+# token is refused as STALE: a permission that no longer describes the tree reads exactly
+# like one still in use, and is what lets the next read in that file through unasked.
+#
+# Empty on purpose. The render path takes what a terminal can draw as a value
+# (`TerminalCapabilities`), and the environment reaches this binary through
+# `Platform/Environment` from `main`, so nothing under `src/apps/fastcache-cli/` has a
+# reason to ask either question itself (#134 §9.11).
