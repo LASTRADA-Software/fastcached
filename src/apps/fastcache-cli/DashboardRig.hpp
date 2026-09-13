@@ -34,15 +34,10 @@ namespace FastCache::Cli::Testing
 class CollectingSink final: public IFrameSink
 {
   public:
-    void Present(std::string_view frame) override
-    {
-        frames.emplace_back(frame);
-    }
-
     void PresentPlaced(DashboardFrame const& frame) override
     {
+        frames.push_back(frame.text);
         placements.push_back(frame.placements);
-        Present(frame.text);
     }
 
     std::vector<std::string> frames {};                     ///< Each frame's text.
