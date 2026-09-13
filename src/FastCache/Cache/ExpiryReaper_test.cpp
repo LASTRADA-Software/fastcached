@@ -30,6 +30,7 @@
 #include <future>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <optional>
 #include <ranges>
 #include <string>
@@ -179,6 +180,19 @@ class ParkingReactor final: public IReactor
         _park.store(where, std::memory_order_release);
     }
 
+    /// Make the next `Submit(ParkedWork)` throw `std::bad_alloc` without forwarding, the way
+    /// an allocating `Submit` fails.
+    void RefuseNextSubmit() noexcept
+    {
+        _refuse.store(true, std::memory_order_release);
+    }
+
+    /// @return How many `Submit(ParkedWork)` calls threw.
+    [[nodiscard]] std::size_t Refused() const noexcept
+    {
+        return _refused.load(std::memory_order_acquire);
+    }
+
     /// @return How many `Submit(ParkedWork)` calls have arrived.
     [[nodiscard]] std::size_t ParkedWorkSubmits() const noexcept
     {
@@ -202,6 +216,11 @@ class ParkingReactor final: public IReactor
     void Submit(ParkedWork work) override
     {
         _submits.fetch_add(1, std::memory_order_acq_rel);
+        if (_refuse.exchange(false, std::memory_order_acq_rel))
+        {
+            _refused.fetch_add(1, std::memory_order_acq_rel);
+            throw std::bad_alloc {};
+        }
         auto const where = _park.exchange(Park::No, std::memory_order_acq_rel);
         if (where == Park::BeforeForwarding)
             _gate.ParkHere();
@@ -236,10 +255,13 @@ class ParkingReactor final: public IReactor
     TestReactor& _inner;
     ParkGate _gate;
     std::atomic<Park> _park { Park::No };
+    std::atomic<bool> _refuse { false };
     std::atomic<std::size_t> _submits { 0 };
+    std::atomic<std::size_t> _refused { 0 };
 };
 
-/// An executor that forwards to another but can HOLD the next piece of work it is given.
+/// An executor that forwards to another but can HOLD the next piece of work it is given, or
+/// REFUSE it by throwing.
 ///
 /// The mirror of `ParkingReactor`, for the hop OUT: the reactor thread has handed the frame
 /// to the pool and gone back to its loop, and the pool has not yet resumed it. Held here,
@@ -256,6 +278,24 @@ class HoldingExecutor final: public IExecutor
     void HoldNextSubmit() noexcept
     {
         _hold.store(true, std::memory_order_release);
+    }
+
+    /// Make the next `Submit(ParkedWork)` throw `std::bad_alloc` instead of forwarding it.
+    void RefuseNextSubmit() noexcept
+    {
+        _refuse.store(true, std::memory_order_release);
+    }
+
+    /// @return How many `Submit(ParkedWork)` calls threw.
+    [[nodiscard]] std::size_t Refused() const noexcept
+    {
+        return _refused.load(std::memory_order_acquire);
+    }
+
+    /// @return How many `Submit(ParkedWork)` calls were forwarded to the inner executor.
+    [[nodiscard]] std::size_t Forwarded() const noexcept
+    {
+        return _forwarded.load(std::memory_order_acquire);
     }
 
     /// @return True while a piece of work is being held.
@@ -286,6 +326,11 @@ class HoldingExecutor final: public IExecutor
     }
     void Submit(ParkedWork work) override
     {
+        if (_refuse.exchange(false, std::memory_order_acq_rel))
+        {
+            _refused.fetch_add(1, std::memory_order_acq_rel);
+            throw std::bad_alloc {};
+        }
         if (_hold.exchange(false, std::memory_order_acq_rel))
         {
             std::scoped_lock const lock { _mutex };
@@ -293,11 +338,15 @@ class HoldingExecutor final: public IExecutor
             return;
         }
         _inner.Submit(work);
+        _forwarded.fetch_add(1, std::memory_order_acq_rel);
     }
 
   private:
     IExecutor& _inner;
     std::atomic<bool> _hold { false };
+    std::atomic<bool> _refuse { false };
+    std::atomic<std::size_t> _refused { 0 };
+    std::atomic<std::size_t> _forwarded { 0 };
     mutable std::mutex _mutex;
     std::optional<ParkedWork> _held;
 };
@@ -850,4 +899,56 @@ TEST_CASE("A sweep frame that never comes back is abandoned by ending the proces
     auto const held = executor.TakeHeld();
     REQUIRE(held.has_value());
     Unwrap(held).resume.destroy();
+}
+
+TEST_CASE("A sweep that could not be handed to its executor is skipped without stranding the stop",
+          "[expiry][reaper][offreactor]")
+{
+    // An executor's `Submit` allocates, so it can throw. The trip count is raised before the
+    // hand-over, and a hand-over that threw never moved the frame: left raised, the count
+    // would describe a trip nobody is on, and the stop would wait out its ceiling and end the
+    // process. And the exception resumes the frame on the reactor, where ending the cycle over
+    // one failed allocation would mean nothing expires again.
+    Fixture f;
+    CapturingLogger logger;
+    RecordingAbandonment abandonment;
+    ThreadPoolExecutor pool { 1 };
+    HoldingExecutor executor { pool };
+    auto reaper = std::make_unique<ExpiryReaper>(f.storage, logger, FastCycleShortDrain, nullptr, abandonment);
+    executor.RefuseNextSubmit();
+    reaper->Start(f.reactor, executor);
+    REQUIRE(TickUntil(f.clock, f.reactor, [&] { return executor.Refused() == 1; }));
+    // The cycle survived it: a later sweep was handed over.
+    REQUIRE(TickUntil(f.clock, f.reactor, [&] { return executor.Forwarded() != 0; }));
+
+    reaper.reset();
+
+    CHECK(abandonment.calls.load(std::memory_order_acquire) == 0);
+    CHECK_FALSE(std::ranges::any_of(logger.Snapshot(), [](auto const& record) { return record.level == LogLevel::Error; }));
+}
+
+TEST_CASE("A hop back that could not be handed to the reactor still brings the sweep back", "[expiry][reaper][offreactor]")
+{
+    // The mirror, and the direction where lowering the count would be the use-after-free: a
+    // hop back that threw resumes the frame on the EXECUTOR, so it has not come back. Ending
+    // the coroutine there would finish the frame off the reactor and leave the count raised
+    // for good -- a stop that waits out its ceiling and ends the process. So the hop is tried
+    // again, and the cycle carries on from the reactor.
+    Fixture f;
+    CapturingLogger logger;
+    RecordingAbandonment abandonment;
+    ThreadPoolExecutor pool { 1 };
+    ParkingReactor reactor { f.reactor };
+    auto reaper = std::make_unique<ExpiryReaper>(f.storage, logger, FastCycleShortDrain, nullptr, abandonment);
+    reactor.RefuseNextSubmit();
+    reaper->Start(reactor, pool);
+    // The refused hop back, its retry, and the NEXT sweep's hop back, which only a frame that
+    // came back to the reactor can make.
+    REQUIRE(TickUntil(f.clock, f.reactor, [&] { return reactor.ParkedWorkSubmits() >= 3; }));
+
+    reaper.reset();
+
+    CHECK(reactor.Refused() == 1);
+    CHECK(abandonment.calls.load(std::memory_order_acquire) == 0);
+    CHECK_FALSE(std::ranges::any_of(logger.Snapshot(), [](auto const& record) { return record.level == LogLevel::Error; }));
 }

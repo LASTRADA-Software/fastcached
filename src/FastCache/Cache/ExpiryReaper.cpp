@@ -7,6 +7,7 @@
 
 #include <coroutine>
 #include <format>
+#include <thread>
 #include <tuple>
 #include <utility>
 
@@ -15,6 +16,49 @@ namespace FastCache
 
 namespace
 {
+
+    /// The hop out to the executor, opening the trip `AwayFromReactor()` measures.
+    ///
+    /// The count rises on the reactor thread BEFORE the hand-over, because once the frame is
+    /// on the executor's queue nothing on the reactor can take it back (#1397). And it falls
+    /// again if the hand-over THROWS -- an executor's `Submit` allocates -- because then the
+    /// frame never left: the exception resumes it right here, on the reactor. Left raised, the
+    /// count would describe a trip nobody is on, and every later `Stop` would wait out its
+    /// ceiling and end the process.
+    ///
+    /// Only the throwing path touches the count after the call, and on that path the frame
+    /// was never handed over, so reading the local is all it does.
+    struct HopOffReactor
+    {
+        IExecutor& executor;
+        /// The count to raise for the trip, or null when the executor is the reactor.
+        std::atomic<std::uint32_t>* away;
+
+        [[nodiscard]] bool await_ready() const noexcept
+        {
+            return false;
+        }
+
+        template <typename Promise>
+        void await_suspend(std::coroutine_handle<Promise> handle) const
+        {
+            auto* const count = away;
+            if (count != nullptr)
+                count->fetch_add(1, std::memory_order_acq_rel);
+            try
+            {
+                ResumeOn { executor }.await_suspend(handle);
+            }
+            catch (...)
+            {
+                if (count != nullptr)
+                    count->fetch_sub(1, std::memory_order_acq_rel);
+                throw;
+            }
+        }
+
+        void await_resume() const noexcept {}
+    };
 
     /// The hop back to the reactor, closing the trip `AwayFromReactor()` measures.
     ///
@@ -27,6 +71,11 @@ namespace
     /// that frame past this expression -- or `Stop` may be about to free it -- so nothing
     /// after the call may read `this`. What it touches instead is the reaper's counter,
     /// which `Stop` outlives only by waiting for exactly this decrement.
+    ///
+    /// **A hand-over that throws leaves the count raised, and that is the TRUE answer**, not a
+    /// leak: the exception resumes the frame on the EXECUTOR thread, so it has not come back.
+    /// Lowering the count there would let `Stop` free a frame that thread is still running.
+    /// `Run` tries the hop again instead, which is what eventually lowers it.
     struct HopBackToReactor
     {
         IReactor& reactor;
@@ -244,10 +293,21 @@ Task<void> ExpiryReaper::Run(IReactor* reactor, IExecutor* sweepOn, Cancellation
         // -- so a caller that passes the reactor gets exactly the previous behaviour
         // through the same statements, rather than through a second code path.
         //
-        // The trip opens HERE, on the reactor thread and before the hand-over (#1397).
-        if (away != nullptr)
-            away->fetch_add(1, std::memory_order_acq_rel);
-        co_await ResumeOn { *sweepOn };
+        // The trip opens in `HopOffReactor`, on the reactor thread and before the hand-over
+        // (#1397). A hand-over that throws resumes this frame HERE, on the reactor, with the
+        // count already lowered again: the sweep is skipped rather than ending the cycle over
+        // one failed allocation, and the next interval tries again.
+        auto handedOver = true;
+        try
+        {
+            co_await HopOffReactor { .executor = *sweepOn, .away = away };
+        }
+        catch (...)
+        {
+            handedOver = false;
+        }
+        if (!handedOver)
+            continue;
 
         PurgeOutcome outcome {};
         try
@@ -275,7 +335,25 @@ Task<void> ExpiryReaper::Run(IReactor* reactor, IExecutor* sweepOn, Cancellation
         // And it closes the trip only after its hand-over has returned -- see
         // `HopBackToReactor` for why that position, and not the end of the body, is the one
         // `Stop` can rely on.
-        co_await HopBackToReactor { .reactor = *reactor, .away = away };
+        //
+        // Retried when the hand-over throws, because that resumes this frame on the EXECUTOR
+        // with the count still raised. Letting the exception end the coroutine would finish
+        // the frame off the reactor -- the ownerless shape above -- and strand the count, so
+        // every later `Stop` would end the process. Yielding between attempts gives whatever
+        // failed a moment; a `Stop` meanwhile waits, and past its ceiling says so.
+        auto back = false;
+        while (!back)
+        {
+            try
+            {
+                co_await HopBackToReactor { .reactor = *reactor, .away = away };
+                back = true;
+            }
+            catch (...)
+            {
+                std::this_thread::yield();
+            }
+        }
 
         AdaptScanBudget(reactor->Clock().Now() - startedAt);
         if (outcome.purged != 0)

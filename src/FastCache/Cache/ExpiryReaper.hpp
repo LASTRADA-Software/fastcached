@@ -255,6 +255,10 @@ class ExpiryReaper
     /// use-after-free. Nothing can tell the two apart from an `IExecutor&`, so to keep the sweep
     /// on the loop, pass the reactor itself and never a wrapper around it.
     ///
+    /// A hand-over that THROWS keeps the count true in both directions: a hop out that could
+    /// not be handed over lowers it again, since the frame never left, and a hop back that
+    /// could not be handed over keeps it raised and is retried, since the frame never returned.
+    ///
     /// It is NOT "a cycle is running": between sweeps the frame is parked on the reactor's
     /// timer and reclaimable.
     /// @return True while the frame is on its way to, on, or on its way back from the executor.
