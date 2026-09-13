@@ -133,27 +133,53 @@ TEST_CASE("a piped fleet record is the newest reading's KPI strip, parsed from i
 
     auto const record = FleetKpiFigures(model);
     REQUIRE(record.shape == Shape::Record);
-    auto const keys = FleetKpiKeys();
-    REQUIRE(record.fields.size() == keys.size() + 1);
+    REQUIRE_FALSE(record.fields.empty());
     CHECK(record.fields[0].name == "source");
     CHECK(record.fields[0].value.lexical == FleetReadingSource);
-    for (auto const index: std::views::iota(std::size_t { 0 }, keys.size()))
-        CHECK(record.fields[index + 1].name == keys[index]);
 
-    // Each figure's VALUE cell, as the leader writes the strip on its own: read through the one-section
-    // form rather than the whole document, so a record taking the wrong column cannot agree with it.
+    // The strip as the leader writes it on its own: read through the one-section form rather than the
+    // whole document, so a record taking the wrong column or dropping a row cannot agree with it.
     auto snapshot = FleetSnapshot {};
     snapshot.role = SchedulerRole::Leader;
     auto const strip = FleetTable(RenderFleetText(snapshot, FleetHistoryView {}, FleetSection::Kpi));
     REQUIRE(strip.has_value());
-    auto const valueAt = static_cast<std::size_t>(std::ranges::find(strip->columns, "value") - strip->columns.begin());
-    REQUIRE(valueAt < strip->columns.size());
-    REQUIRE(strip->rows.size() == keys.size());
-    for (auto const index: std::views::iota(std::size_t { 0 }, keys.size()))
+    auto const at = [&strip](std::string_view name) {
+        auto const found = std::ranges::find(strip->columns, name);
+        REQUIRE(found != strip->columns.end());
+        return static_cast<std::size_t>(found - strip->columns.begin());
+    };
+    auto const kpiAt = at("kpi");
+    auto const valueAt = at("value");
+    auto const ofAt = at("of");
+
+    // Every figure in the leader's order, each followed by `<kpi>-of` exactly where the strip has one.
+    auto expected = std::vector<std::string> { "source" };
+    for (auto const& row: strip->rows)
     {
-        CHECK(record.fields[index + 1].value.kind == strip->rows[index][valueAt].kind);
-        CHECK(record.fields[index + 1].value.lexical == strip->rows[index][valueAt].lexical);
+        expected.push_back(row[kpiAt].lexical);
+        if (row[ofAt].kind != CellKind::Absent)
+            expected.push_back(row[kpiAt].lexical + "-of");
     }
+    auto names = std::vector<std::string> {};
+    for (auto const& field: record.fields)
+        names.push_back(field.name);
+    CHECK(names == expected);
+    REQUIRE(strip->rows.size() == FleetKpiKeys().size());
+
+    // Each value is the strip's own lexical form, and a number where it reads as one.
+    auto readsAsNumber = false;
+    for (auto const& row: strip->rows)
+    {
+        auto const* const field = FindField(record, row[kpiAt].lexical);
+        REQUIRE(field != nullptr);
+        CHECK(field->value.lexical == row[valueAt].lexical);
+        if (row[valueAt].kind != CellKind::Absent)
+        {
+            CHECK(field->value.kind == CellKind::Number);
+            readsAsNumber = true;
+        }
+    }
+    CHECK(readsAsNumber);
 
     // Before any reading there is only the source, and it is absent.
     auto const empty = FleetKpiFigures(DashboardModel {});
