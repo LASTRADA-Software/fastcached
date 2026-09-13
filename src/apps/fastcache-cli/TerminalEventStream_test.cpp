@@ -176,6 +176,7 @@ void DrainUntil(TestReactor& reactor, Condition done, char const* what)
 struct DeviceRecord
 {
     std::atomic<int> restores { 0 };
+    std::atomic<int> restoredNow { 0 };
     std::thread::id acquiredOn {};
     std::thread::id askedOn {};
 };
@@ -187,6 +188,9 @@ struct DeviceScript
     bool throwOnAsk { false };
     SixelAnswer sixel { SixelAnswer::Advertised };
     TerminalTextEncoding encoding { TerminalTextEncoding::Utf8 };
+
+    /// Where the device's events come from when set; a scripted source that never blocks when not.
+    BlockingEventSource* blocking { nullptr };
 };
 
 /// A terminal device that records where each step ran and can fail at each one.
@@ -235,14 +239,25 @@ class FakeDevice final: public ITerminalDevice
 
     [[nodiscard]] tui::runtime::EventSource& Events() override
     {
+        if (_script.blocking != nullptr)
+            return *_script.blocking;
         return _source;
     }
 
-    void Wake() override {}
+    void Wake() override
+    {
+        if (_script.blocking != nullptr)
+            _script.blocking->Wake();
+    }
 
     void Restore() noexcept override
     {
         _record->restores.fetch_add(1, std::memory_order_acq_rel);
+    }
+
+    void RestoreNow() noexcept override
+    {
+        _record->restoredNow.fetch_add(1, std::memory_order_acq_rel);
     }
 
   private:
@@ -570,5 +585,80 @@ TEST_CASE("a terminal start that throws after acquiring is restored and reported
     REQUIRE_FALSE(outcome.started.has_value());
     CHECK(outcome.started.error() == "the terminal failed while being started: the reply could not be read");
     CHECK(outcome.restoresWhenDelivered == 1);
+    CHECK(record.restores.load() == 1);
+}
+
+TEST_CASE("restoring a started terminal now, from another thread while a read is parked, restores it once",
+          "[cli][dashboard][terminal]")
+{
+    // The abandonment path: `main` restores the terminal and ends the process with a terminal
+    // read still parked on the pool, from a thread that is neither the pool nor the reactor, and
+    // without closing anything first. The events are closed and destroyed here only so the case
+    // can go on to show that a later destruction does not restore through this handle again.
+    auto source = BlockingEventSource {};
+    auto record = DeviceRecord {};
+    auto clock = ManualClock {};
+    auto reactor = TestReactor { clock };
+    auto pool = ThreadPoolExecutor { 1 };
+
+    auto outcome = StartFake({ .blocking = &source }, record, pool, reactor);
+    auto const wakeOnExit = WakeOnExit { source };
+    REQUIRE(outcome.started.has_value());
+    auto& started = *outcome.started;
+    REQUIRE(started.restore != nullptr);
+    std::ignore = TakeNext(*started.events, reactor);
+
+    auto result = std::optional<DashboardEvent> {};
+    auto deliveredOn = std::thread::id {};
+    auto task = NextInto(started.events.get(), &result, &deliveredOn);
+    reactor.Submit(task.Native());
+    reactor.Drain();
+    DrainUntil(reactor, [&source] { return source.Entered(); }, "the stream never parked in the terminal wait");
+
+    {
+        auto restorer = std::thread { [&started] { started.restore->RestoreNow(); } };
+        restorer.join();
+    }
+    CHECK(record.restoredNow.load() == 1);
+    CHECK(record.restores.load() == 0);
+    CHECK(!result.has_value()); // the parked read was not disturbed
+
+    started.restore->RestoreNow();
+    CHECK(record.restoredNow.load() == 1);
+
+    started.events->Close();
+    DrainUntil(reactor, [&result] { return result.has_value(); }, "the outstanding Next() never resumed after Close()");
+    CHECK(Unwrap(result).kind == DashboardEventKind::Detached);
+
+    started.events.reset();
+    CHECK(record.restores.load() == 1);
+    CHECK(record.restoredNow.load() == 1);
+
+    // The handle outlives the events it restored for, and a call through it is still safe.
+    started.restore->RestoreNow();
+    CHECK(record.restoredNow.load() == 1);
+}
+
+TEST_CASE("a started terminal whose events were destroyed first is not restored again through its handle",
+          "[cli][dashboard][terminal]")
+{
+    // The other order. Destroying the events restored the terminal and tore the device down, so a
+    // restore-now after it must reach nothing -- the device it would reach no longer exists.
+    auto record = DeviceRecord {};
+    auto clock = ManualClock {};
+    auto reactor = TestReactor { clock };
+    auto pool = ThreadPoolExecutor { 1 };
+
+    auto outcome = StartFake({}, record, pool, reactor);
+    REQUIRE(outcome.started.has_value());
+    auto& started = *outcome.started;
+    REQUIRE(started.restore != nullptr);
+
+    started.events.reset();
+    CHECK(record.restores.load() == 1);
+
+    started.restore->RestoreNow();
+    started.restore->RestoreNow();
+    CHECK(record.restoredNow.load() == 0);
     CHECK(record.restores.load() == 1);
 }
