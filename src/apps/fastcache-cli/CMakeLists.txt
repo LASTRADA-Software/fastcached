@@ -36,6 +36,7 @@ set(_fc_cli_sources
     DashboardGlyphs.cpp
     DashboardPanel.cpp
     DashboardPanels.cpp
+    FleetReading.cpp
 )
 
 # The terminal half of the dashboard's input (#1372) is the one place this binary meets the
@@ -99,6 +100,7 @@ if(FASTCACHED_BUILD_TESTS)
         TerminalCapabilities_test.cpp
         DashboardGlyphs_test.cpp
         DashboardPanel_test.cpp
+        FleetReading_test.cpp
         ${_fc_cli_tui_tests}
     )
     target_include_directories(fastcache-cli-tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")

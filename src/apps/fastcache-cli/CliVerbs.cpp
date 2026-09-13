@@ -1520,15 +1520,7 @@ namespace
             // second carries the server's own words, including the list of sections
             // when the guess was wrong and the leader's address when this node is not
             // it.
-            switch (document.error().kind)
-            {
-                case AdminFailure::Refused:
-                    return Concluded(Outcome::Refused, document.error().detail);
-                case AdminFailure::Unreachable:
-                case AdminFailure::Last:
-                    break;
-            }
-            return Concluded(Outcome::Unreachable, document.error().detail);
+            return Concluded(OutcomeOf(document.error().kind), document.error().detail);
         }
 
         auto table = FleetTable(*document);
