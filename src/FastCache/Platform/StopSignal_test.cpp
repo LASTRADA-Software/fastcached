@@ -7,9 +7,11 @@
 #include <atomic>
 #include <chrono>
 #include <coroutine>
+#include <cstddef>
 #include <cstdint>
 #include <future>
 #include <optional>
+#include <ranges>
 
 #if defined(_WIN32)
     #include <windows.h>
@@ -114,6 +116,28 @@ TEST_CASE("a cancel wakes a stop signal's waiter as cancelled", "[platform][stop
     CHECK(WaitWhile(signal, [] {}) == StopWake::Cancelled);
 }
 
+TEST_CASE("cancels past the pipe's capacity stay one cancel, and do not end the process", "[platform][stop-signal]")
+{
+    // A cancel pipe is never read, so enough cancels fill it and the next write answers `EAGAIN`.
+    // WHAT DISTINGUISHES: that answer is a wake already pending, not a failure -- a stop signal
+    // treating it as one ends this process here. The count is past every host's pipe capacity
+    // (64 KiB on Linux and on macOS, where a pipe can grow to it), so the full-pipe answer is
+    // reached rather than hoped for.
+    constexpr auto PastAnyPipeCapacity = std::size_t { 1 } << 17U;
+    auto installed = InstallStopSignal();
+    REQUIRE(installed.has_value());
+    auto& signal = **installed;
+
+    auto cancels = std::size_t { 0 };
+    for ([[maybe_unused]] auto const each: std::views::iota(std::size_t { 0 }, PastAnyPipeCapacity))
+    {
+        signal.Cancel();
+        ++cancels;
+    }
+    CHECK(cancels == PastAnyPipeCapacity);
+    CHECK(WaitWhile(signal, [] {}) == StopWake::Cancelled);
+}
+
 TEST_CASE("a second stop signal is refused while the first is installed", "[platform][stop-signal]")
 {
     // A disposition is process-wide, so a second install would silently take the first
@@ -209,6 +233,25 @@ TEST_CASE("SIGINT reaches a waiting stop signal and the previous disposition ret
     CHECK(priorHandlerRuns.load() == 1);
 
     static_cast<void>(::sigaction(SIGINT, &original, nullptr));
+}
+
+TEST_CASE("SIGINTs past the stop pipe's capacity stay one stop, and do not end the process", "[platform][stop-signal]")
+{
+    // The handler's own arm of the full-pipe answer. The stop pipe is drained only at an install,
+    // so a burst of SIGINT fills it; WHAT DISTINGUISHES is that the handler takes the full pipe as
+    // a stop already pending -- one that took it as a failure ends the process inside the burst.
+    constexpr auto PastAnyPipeCapacity = std::size_t { 1 } << 17U;
+    auto installed = InstallStopSignal();
+    REQUIRE(installed.has_value());
+
+    auto raised = std::size_t { 0 };
+    for ([[maybe_unused]] auto const each: std::views::iota(std::size_t { 0 }, PastAnyPipeCapacity))
+    {
+        static_cast<void>(::raise(SIGINT));
+        ++raised;
+    }
+    CHECK(raised == PastAnyPipeCapacity);
+    CHECK(WaitWhile(**installed, [] {}) == StopWake::Stopped);
 }
 
 TEST_CASE("a stop an earlier install heard is not the next install's, and the next still hears its own",
