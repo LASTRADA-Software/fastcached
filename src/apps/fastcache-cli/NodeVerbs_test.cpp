@@ -1446,3 +1446,28 @@ TEST_CASE("an endpoint is identified once however many callers ask", "[cli][node
     CHECK(node.Sent().size() == 1);
     CHECK(node.Unused() == 0);
 }
+
+TEST_CASE("a compile node answers stats through the ladder's node-metrics rung", "[cli][node][stats]")
+{
+    // The FACT a verb page's "on a compile node" cell must agree with. `stats` is on the
+    // `Stats` wire, carries no fallback and is not a node verb -- once the only two ways
+    // that cell knew a node could answer -- yet a node answers it, through the rung that
+    // asks the node for its own counters. Asserting only what the page SAYS would prove the text
+    // changed; this proves the text is true.
+    auto const counter = WireFields::Encode(
+        { Cc::AsBytes("fastcache_worker_jobs_completed_total"), std::span<std::byte const> { Cc::EncodeU64Field(12) } });
+    auto const payload = WireFields::Encode(WireFields::FieldList { std::vector<std::span<std::byte const>> { counter } });
+
+    ScriptedNodeExchange node { { StatusReply({ .version = "0.2.0", .nodeId = {}, .uptimeSeconds = 5, .surfaces = {} }),
+                                  Cc::EncodeReply(Cc::Status::Ok, payload) },
+                                "10.0.0.4:6674" };
+    auto gatherer = GathererFor(node);
+
+    auto const* const stats = FindVerb("stats");
+    REQUIRE(stats != nullptr);
+    auto const answer = RunVerb(*stats, VerbContext { .node = &node, .stats = &gatherer, .admin = &gatherer });
+
+    CHECK(answer.outcome == Outcome::Affirmative);
+    CHECK(RequiredCell(answer, "source").lexical == "node-metrics");
+    CHECK(RequiredCell(answer, "fastcache_worker_jobs_completed_total").lexical == "12");
+}
