@@ -21,13 +21,22 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
+#include <cstdint>
 #include <format>
+#include <future>
+#include <memory>
+#include <mutex>
+#include <optional>
 #include <ranges>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <tuple>
+#include <utility>
 #include <vector>
 
 using namespace std::chrono_literals;
@@ -98,6 +107,251 @@ struct Fixture
         storage.SetReclaimLog(&log);
     }
 };
+
+/// A gate one thread parks at until another opens it, with a BOUNDED wait on both
+/// sides so a case that goes wrong ends red rather than hung.
+class ParkGate
+{
+  public:
+    /// Block the caller until `Open()`, recording that it arrived.
+    void ParkHere()
+    {
+        std::unique_lock lock { _mutex };
+        _parked = true;
+        _changed.notify_all();
+        _changed.wait_for(lock, std::chrono::seconds { 30 }, [this] { return _open; });
+    }
+
+    /// @return True once a thread is parked here, waiting at most @p bound.
+    [[nodiscard]] bool WaitUntilParked(std::chrono::milliseconds bound)
+    {
+        std::unique_lock lock { _mutex };
+        return _changed.wait_for(lock, bound, [this] { return _parked; });
+    }
+
+    /// Let the parked thread continue.
+    void Open()
+    {
+        std::scoped_lock const lock { _mutex };
+        _open = true;
+        _changed.notify_all();
+    }
+
+  private:
+    std::mutex _mutex;
+    std::condition_variable _changed;
+    bool _parked { false };
+    bool _open { false };
+};
+
+/// A reactor that forwards to a `TestReactor` and can PARK the thread handing it work.
+///
+/// **This is what makes #1397's window deterministic.** The sweep's hop back to the reactor
+/// is `IExecutor::Submit(ParkedWork)` called on the POOL thread, and the defect is that the
+/// frame's owner could destroy it while that call was still in progress. Parking inside the
+/// call holds the pool thread exactly there for as long as the case needs, instead of
+/// waiting for a scheduler to produce the interleaving.
+///
+/// Parks either BEFORE forwarding (the frame is on neither side) or AFTER it (the frame is
+/// already queued on the inner reactor while the pool thread has not returned).
+class ParkingReactor final: public IReactor
+{
+  public:
+    /// Where `Submit(ParkedWork)` parks. Private to this fixture: never stored or sent.
+    enum class Park : std::uint8_t
+    {
+        No,
+        BeforeForwarding,
+        AfterForwarding,
+    };
+
+    explicit ParkingReactor(TestReactor& inner) noexcept:
+        _inner { inner }
+    {
+    }
+
+    /// Park the next `Submit(ParkedWork)` at @p where.
+    void ParkNextSubmit(Park where) noexcept
+    {
+        _park.store(where, std::memory_order_release);
+    }
+
+    /// @return How many `Submit(ParkedWork)` calls have arrived.
+    [[nodiscard]] std::size_t ParkedWorkSubmits() const noexcept
+    {
+        return _submits.load(std::memory_order_acquire);
+    }
+
+    /// @return Where a `Park` holds the handing thread, and where the case releases it.
+    [[nodiscard]] ParkGate& Gate() noexcept
+    {
+        return _gate;
+    }
+
+    void Stop() noexcept override
+    {
+        _inner.Stop();
+    }
+    void Submit(std::coroutine_handle<> handle) override
+    {
+        _inner.Submit(handle);
+    }
+    void Submit(ParkedWork work) override
+    {
+        _submits.fetch_add(1, std::memory_order_acq_rel);
+        auto const where = _park.exchange(Park::No, std::memory_order_acq_rel);
+        if (where == Park::BeforeForwarding)
+            _gate.ParkHere();
+        _inner.Submit(work);
+        if (where == Park::AfterForwarding)
+            _gate.ParkHere();
+    }
+    void Schedule(TimePoint deadline, std::coroutine_handle<> handle) override
+    {
+        _inner.Schedule(deadline, handle);
+    }
+    void Schedule(TimePoint deadline, ParkedWork work) override
+    {
+        _inner.Schedule(deadline, work);
+    }
+    [[nodiscard]] bool CancelPending(std::coroutine_handle<> handle) noexcept override
+    {
+        return _inner.CancelPending(handle);
+    }
+    [[nodiscard]] IClock& Clock() noexcept override
+    {
+        return _inner.Clock();
+    }
+
+  protected:
+    void RunLoop() override
+    {
+        std::ignore = _inner.Drain();
+    }
+
+  private:
+    TestReactor& _inner;
+    ParkGate _gate;
+    std::atomic<Park> _park { Park::No };
+    std::atomic<std::size_t> _submits { 0 };
+};
+
+/// An executor that forwards to another but can HOLD the next piece of work it is given.
+///
+/// The mirror of `ParkingReactor`, for the hop OUT: the reactor thread has handed the frame
+/// to the pool and gone back to its loop, and the pool has not yet resumed it. Held here,
+/// that interval lasts until the case says otherwise.
+class HoldingExecutor final: public IExecutor
+{
+  public:
+    explicit HoldingExecutor(IExecutor& inner) noexcept:
+        _inner { inner }
+    {
+    }
+
+    /// Hold the next `Submit(ParkedWork)` instead of forwarding it.
+    void HoldNextSubmit() noexcept
+    {
+        _hold.store(true, std::memory_order_release);
+    }
+
+    /// @return True while a piece of work is being held.
+    [[nodiscard]] bool Holding() const
+    {
+        std::scoped_lock const lock { _mutex };
+        return _held.has_value();
+    }
+
+    /// Take the held work, leaving nothing held.
+    /// @return The held work, or nothing if none was held.
+    [[nodiscard]] std::optional<ParkedWork> TakeHeld()
+    {
+        std::scoped_lock const lock { _mutex };
+        return std::exchange(_held, std::nullopt);
+    }
+
+    /// Hand the held work to the inner executor.
+    void ForwardHeld()
+    {
+        if (auto work = TakeHeld(); work.has_value())
+            _inner.Submit(*work);
+    }
+
+    void Submit(std::coroutine_handle<> handle) override
+    {
+        _inner.Submit(handle);
+    }
+    void Submit(ParkedWork work) override
+    {
+        if (_hold.exchange(false, std::memory_order_acq_rel))
+        {
+            std::scoped_lock const lock { _mutex };
+            _held = work;
+            return;
+        }
+        _inner.Submit(work);
+    }
+
+  private:
+    IExecutor& _inner;
+    std::atomic<bool> _hold { false };
+    mutable std::mutex _mutex;
+    std::optional<ParkedWork> _held;
+};
+
+/// Tick @p reactor until @p reached holds, a bounded number of times.
+/// @return Whether it held.
+template <typename Predicate>
+[[nodiscard]] bool TickUntil(ManualClock& clock, TestReactor& reactor, Predicate reached)
+{
+    for (auto i = 0; i < 3000 && !reached(); ++i)
+    {
+        clock.Advance(1ms);
+        reactor.Tick();
+        std::this_thread::sleep_for(std::chrono::microseconds { 100 });
+    }
+    return reached();
+}
+
+/// How long a case gives the destructor to return BEFORE it releases the park. On the
+/// defect it returns at once, so the look can be short; a fixed destructor does not return
+/// until the release however long the look is, so a slow host cannot turn the fix red.
+constexpr auto StopLook = 200ms;
+
+/// A cycle that sweeps every millisecond and notices a stop within one, so a case reaches a
+/// hop in a few ticks.
+constexpr ExpiryReaperOptions FastCycle { .interval = 1ms, .stopWakeBound = 1ms };
+
+/// What a staged destruction observed.
+struct StagedDestruction
+{
+    bool returnedBeforeRelease; ///< The destructor returned while the frame was still away.
+    bool finished;              ///< The destructor returned once the frame was released.
+};
+
+/// Destroy @p reaper on a thread of its own while the case holds its frame away, then release.
+///
+/// A thread of its own because a fixed destructor WAITS for the frame to come back, and the
+/// release that lets it come back is this thread's. The look before the release is the
+/// assertion; `std::async`'s future joins that thread on every path out.
+/// @param reaper  The reaper to destroy.
+/// @param staged  Whether the case reached the window; if not, nothing is destroyed here.
+/// @param release Lets the held frame continue. Called whether or not @p staged.
+/// @return What the destruction did either side of the release.
+template <typename Release>
+[[nodiscard]] StagedDestruction DestroyWhileAway(std::unique_ptr<ExpiryReaper>& reaper, bool staged, Release release)
+{
+    if (!staged)
+    {
+        release();
+        return { .returnedBeforeRelease = false, .finished = true };
+    }
+    auto destroyed = std::async(std::launch::async, [&reaper] { reaper.reset(); });
+    auto const returnedBeforeRelease = destroyed.wait_for(StopLook) == std::future_status::ready;
+    release();
+    return { .returnedBeforeRelease = returnedBeforeRelease,
+             .finished = destroyed.wait_for(10s) == std::future_status::ready };
+}
 
 } // namespace
 
@@ -415,4 +669,122 @@ TEST_CASE("Passing the reactor as the sweep executor keeps the sweep on the loop
         CHECK(f.observer.sweptOn.load(std::memory_order_acquire) == reactorThread);
     }
     SUCCEED("the sweep stayed on the reactor when the reactor was the executor");
+}
+
+TEST_CASE("Stopping the expiry cycle waits until the hop back has reached the reactor", "[expiry][reaper][offreactor]")
+{
+    // #1397, the shape the gate caught: the pool thread is INSIDE the reactor's `Submit` for
+    // the hop back, the frame is on neither side, and the owner destroys it. The flag the
+    // destructor waited on was cleared BEFORE the hop began, so it answered "not sweeping"
+    // and `~Task` freed a frame the pool thread was still handing over.
+    //
+    // Destroyed on another thread, because a fixed destructor waits for the hop back and
+    // the hop back is parked by this case. The look before the release is the assertion;
+    // the tick after it is where the defect shows as ASan's heap-use-after-free -- the inner
+    // reactor resumes a handle whose frame the destructor already freed.
+    Fixture f;
+    ThreadPoolExecutor pool { 1 };
+    ParkingReactor reactor { f.reactor };
+    auto reaper = std::make_unique<ExpiryReaper>(f.storage, f.logger, FastCycle);
+    reactor.ParkNextSubmit(ParkingReactor::Park::BeforeForwarding);
+    reaper->Start(reactor, pool);
+    auto const parked = TickUntil(f.clock, f.reactor, [&] { return reactor.Gate().WaitUntilParked(0ms); });
+
+    auto const destruction = DestroyWhileAway(reaper, parked, [&] { reactor.Gate().Open(); });
+
+    REQUIRE(parked);
+    CHECK_FALSE(destruction.returnedBeforeRelease);
+    CHECK(destruction.finished);
+    // Taken back off the reactor rather than left for it: nothing may resume it now.
+    CHECK(f.reactor.PendingSubmissions() == 0);
+    CHECK(f.reactor.Tick() == 0);
+}
+
+TEST_CASE("Stopping the expiry cycle waits for a frame handed to its executor and not yet resumed",
+          "[expiry][reaper][offreactor]")
+{
+    // #1397's mirror window: the reactor thread has handed the frame to the executor and
+    // gone back to its loop, and the executor has not resumed it yet. Nothing marked that
+    // interval -- the flag was set only once the body began -- so the destructor saw "not
+    // sweeping", `CancelPending` could not find the frame, and `~Task` freed it. Held here
+    // instead of raced, and the release is what the pool then resumes.
+    Fixture f;
+    ThreadPoolExecutor pool { 1 };
+    HoldingExecutor executor { pool };
+    auto reaper = std::make_unique<ExpiryReaper>(f.storage, f.logger, FastCycle);
+    executor.HoldNextSubmit();
+    reaper->Start(f.reactor, executor);
+    auto const held = TickUntil(f.clock, f.reactor, [&] { return executor.Holding(); });
+
+    auto const destruction = DestroyWhileAway(reaper, held, [&] { executor.ForwardHeld(); });
+
+    REQUIRE(held);
+    CHECK_FALSE(destruction.returnedBeforeRelease);
+    CHECK(destruction.finished);
+    CHECK(f.reactor.PendingSubmissions() == 0);
+    CHECK(f.reactor.Tick() == 0);
+}
+
+TEST_CASE("A late return from one hop back does not end the wait for the next trip off the reactor",
+          "[expiry][reaper][offreactor]")
+{
+    // The reason the wait is on a COUNT and not a flag. The pool thread returns from the
+    // reactor's `Submit` AFTER the reactor has already resumed the frame, run the loop and
+    // sent it away again -- a multi-worker pool can do this with no parking at all. A flag
+    // cleared on that late return would clobber the next hop's "away", and the destructor
+    // would free a frame that is sitting on the executor.
+    //
+    // Staged: the first hop back parks AFTER forwarding, the reactor runs the frame into the
+    // next hop out, which the executor holds, and only then does the late return land.
+    Fixture f;
+    ThreadPoolExecutor pool { 1 };
+    ParkingReactor reactor { f.reactor };
+    HoldingExecutor executor { pool };
+    auto reaper = std::make_unique<ExpiryReaper>(f.storage, f.logger, FastCycle);
+    reactor.ParkNextSubmit(ParkingReactor::Park::AfterForwarding);
+    reaper->Start(reactor, executor);
+    auto const parked = TickUntil(f.clock, f.reactor, [&] { return reactor.Gate().WaitUntilParked(0ms); });
+
+    // The pool thread is still inside the first hop back; the frame is queued on the inner
+    // reactor. Run it into the SECOND hop out, and hold that one.
+    executor.HoldNextSubmit();
+    auto const heldAgain = parked && TickUntil(f.clock, f.reactor, [&] { return executor.Holding(); });
+
+    // Now the late return from the first hop back.
+    reactor.Gate().Open();
+
+    auto const destruction = DestroyWhileAway(reaper, heldAgain, [&] { executor.ForwardHeld(); });
+
+    REQUIRE(parked);
+    REQUIRE(heldAgain);
+    CHECK_FALSE(destruction.returnedBeforeRelease);
+    CHECK(destruction.finished);
+    CHECK(f.reactor.PendingSubmissions() == 0);
+    CHECK(f.reactor.Tick() == 0);
+}
+
+TEST_CASE("Stopping a cycle whose executor is its own reactor does not wait for the frame", "[expiry][reaper][offreactor]")
+{
+    // The control for the rule that the wait covers only a frame that LEFT the reactor. With
+    // the reactor as its own executor the hop out lands on the reactor's own queue, which
+    // `CancelPending` takes back -- so there is nothing to wait for. Counted anyway, a frame
+    // parked there when the loop has already stopped would never come back to lower the
+    // count, and every in-memory shutdown would wait out the drain ceiling and then warn
+    // that a sweep was still running.
+    Fixture f;
+    CapturingLogger logger;
+    ParkingReactor reactor { f.reactor };
+    auto reaper = std::make_unique<ExpiryReaper>(f.storage, logger, FastCycle);
+    reaper->Start(reactor, reactor);
+
+    // One tick at a time until the hop out has been handed to the reactor. `Tick` swaps the
+    // ready batch before resuming, so that submission waits for a NEXT tick that never runs.
+    REQUIRE(TickUntil(f.clock, f.reactor, [&] { return reactor.ParkedWorkSubmits() != 0; }));
+    REQUIRE(reactor.ParkedWorkSubmits() == 1);
+    REQUIRE(f.reactor.PendingSubmissions() == 1);
+
+    reaper.reset();
+
+    CHECK(f.reactor.PendingSubmissions() == 0);
+    CHECK_FALSE(std::ranges::any_of(logger.Snapshot(), [](auto const& record) { return record.level == LogLevel::Warn; }));
 }
