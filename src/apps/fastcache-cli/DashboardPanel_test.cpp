@@ -3,6 +3,7 @@
 #include "DashboardPanel.hpp"
 #include "DashboardPanels.hpp"
 #include "DashboardRig.hpp"
+#include "ScriptedCellWidth.hpp"
 #include "StatsSource.hpp"
 
 #include <FastCache/Cache/StorageTier.hpp>
@@ -14,6 +15,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <format>
 #include <optional>
 #include <ranges>
 #include <set>
@@ -208,7 +210,8 @@ constexpr auto SparkFrom = LabelFrom + LabelWidth + FigureWidth + 2;
 /// @return The frames.
 [[nodiscard]] std::vector<std::string> CacheFrames(std::vector<DashboardEvent> script, RenderRung rung)
 {
-    auto view = PanelView { CachePanel(), PanelContext { .absent = std::string { Absent }, .rung = rung } };
+    auto view = PanelView { CachePanel(),
+                            PanelContext { .absent = std::string { Absent }, .cellWidth = &FakeCellWidth, .rung = rung } };
     auto sink = CollectingSink {};
     (void) Drive(std::move(script), DashboardLimits {}, view, sink);
     return sink.frames;
@@ -438,7 +441,7 @@ TEST_CASE("every panel line is the terminal's width and a wider terminal draws m
     for (auto const& [frame, columns]:
          { std::pair { narrow[0], std::size_t { 80 } }, std::pair { wide[0], std::size_t { 120 } } })
         for (auto const& line: Lines(frame))
-            CHECK(DisplayWidth(line) == columns);
+            CHECK(FakeCellWidth(line) == columns);
 
     auto const narrowLine = RowLine(narrow[0], "conns/sec");
     auto const wideLine = RowLine(wide[0], "conns/sec");
@@ -570,7 +573,10 @@ TEST_CASE("the node panel's per-minute rate and mean compile come from the catal
             { std::string { DescriptorOf(IMetricsSink::Counter::WorkerCompileMillisTotal)->prometheusName }, millis },
         };
     };
-    auto view = PanelView { NodePanel(), PanelContext { .absent = std::string { Absent }, .rung = RenderRung::Unicode } };
+    auto view = PanelView {
+        NodePanel(),
+        PanelContext { .absent = std::string { Absent }, .cellWidth = &FakeCellWidth, .rung = RenderRung::Unicode }
+    };
     auto sink = CollectingSink {};
     (void) Drive({ SampleOf(node(10, 1000), 1, StatsOrigin::NodeMetrics),
                    SampleOf(node(20, 21000), 3, StatsOrigin::NodeMetrics),
@@ -586,4 +592,283 @@ TEST_CASE("the node panel's per-minute rate and mean compile come from the catal
     REQUIRE(mean.has_value());
     CHECK(FigureOf(Unwrap(compiles)) == "300");
     CHECK(FigureOf(Unwrap(mean)) == "2.00 s");
+}
+
+namespace
+{
+
+/// Draw @p script through @p spec on @p rung, after a `Resize` to @p columns by @p rows.
+/// @param spec The panel.
+/// @param script The events after the resize.
+/// @param rung The rung.
+/// @param columns The terminal's width.
+/// @param rows The terminal's height.
+/// @return The frames.
+[[nodiscard]] std::vector<std::string> FramesAt(
+    PanelSpec const& spec, std::vector<DashboardEvent> script, RenderRung rung, int columns, int rows)
+{
+    script.insert(script.begin(), DashboardEvent { .kind = DashboardEventKind::Resize, .columns = columns, .rows = rows });
+    auto view =
+        PanelView { spec, PanelContext { .absent = std::string { Absent }, .cellWidth = &FakeCellWidth, .rung = rung } };
+    auto sink = CollectingSink {};
+    (void) Drive(std::move(script), DashboardLimits {}, view, sink);
+    return sink.frames;
+}
+
+/// The one model every size is drawn from: two readings of a cache with both tiers.
+/// @return The events.
+[[nodiscard]] std::vector<DashboardEvent> TwoTierScript()
+{
+    return { SampleOf(CacheSeries(1, { "memory", "disk" }), 1), SampleOf(CacheSeries(2, { "memory", "disk" }), 2), Tick };
+}
+
+/// The one frame @p script draws through the cache panel at @p columns by @p rows.
+/// @param columns The terminal's width.
+/// @param rows The terminal's height.
+/// @return The frame.
+[[nodiscard]] std::string CacheFrameAt(int columns, int rows)
+{
+    auto const frames = FramesAt(CachePanel(), TwoTierScript(), RenderRung::Unicode, columns, rows);
+    REQUIRE(frames.size() == 1);
+    return frames.front();
+}
+
+/// The widest line of @p frame, in cells.
+/// @param frame The frame.
+/// @return The width.
+[[nodiscard]] std::size_t WidestLine(std::string_view frame)
+{
+    auto widest = std::size_t { 0 };
+    for (auto const& line: Lines(frame))
+        widest = std::max(widest, FakeCellWidth(line));
+    return widest;
+}
+
+/// The frame line whose content starts with @p prefix after the edge and indent, or nullopt.
+/// @param frame The frame.
+/// @param prefix The start.
+/// @return The line.
+[[nodiscard]] std::optional<std::string> LineStarting(std::string_view frame, std::string_view prefix)
+{
+    for (auto const& line: Lines(frame))
+        if (Columns(line, LabelFrom, FakeCellWidth(prefix)) == prefix)
+            return line;
+    return std::nullopt;
+}
+
+} // namespace
+
+TEST_CASE("a panel fits every size it is given and keeps its essential figures", "[cli][dashboard][panel][responsive]")
+{
+    // #134 decision 5. WHAT DISTINGUISHES, at every size over ONE model: no line is wider than the
+    // terminal in CELLS, no frame taller than it, it is a frame rather than the minimum-size line,
+    // and every essential figure is present and whole. The control is the widest size, where every
+    // row and every tier column is present -- without it, a panel that always drew only its
+    // essentials would pass the rest.
+    struct Size
+    {
+        int columns;
+        int rows;
+    };
+    auto sizesChecked = std::size_t { 0 };
+    for (auto const size: { Size { .columns = 132, .rows = 40 },
+                            Size { .columns = 80, .rows = 24 },
+                            Size { .columns = 40, .rows = 24 },
+                            Size { .columns = 80, .rows = 14 },
+                            Size { .columns = 60, .rows = 9 } })
+    {
+        INFO("size " << size.columns << "x" << size.rows);
+        auto const frame = CacheFrameAt(size.columns, size.rows);
+        CHECK(frame.starts_with("\xe2\x94\x8c")); // a frame's corner, not the minimum-size line
+        CHECK(WidestLine(frame) <= static_cast<std::size_t>(size.columns));
+        CHECK(Lines(frame).size() <= static_cast<std::size_t>(size.rows));
+
+        auto const hitRate = RowLine(frame, "hit rate");
+        auto const ops = RowLine(frame, "ops/sec");
+        REQUIRE(hitRate.has_value());
+        REQUIRE(ops.has_value());
+        CHECK(FigureOf(Unwrap(hitRate)) == "90.0 %");
+        CHECK(FigureOf(Unwrap(ops)) == "105");
+        auto const bytes = LineStarting(frame, "bytes");
+        REQUIRE(bytes.has_value());
+        CHECK(Unwrap(bytes).contains("3.00 GiB"));
+        ++sizesChecked;
+    }
+    CHECK(sizesChecked == 5);
+
+    auto const wide = CacheFrameAt(132, 40);
+    for (auto const& row: CachePanel().rates)
+        CHECK(RowLine(wide, row.label).has_value());
+    for (auto const& column: CachePanel().tierColumns)
+        CHECK(wide.contains(column.header));
+    CHECK(LineStarting(wide, "memory").has_value());
+    CHECK(LineStarting(wide, "disk").has_value());
+    CHECK(!wide.contains(" more"));
+}
+
+TEST_CASE("a Resize between two frames lays out the next frame for the new size", "[cli][dashboard][panel][responsive]")
+{
+    // The size is model state, so the frame after a resize must be laid out for it. WHAT
+    // DISTINGUISHES: the two frames' widths are each terminal's, the second fits the smaller height,
+    // and the second is byte for byte what a view that only ever saw the new size draws -- so nothing
+    // measured at the old size (the trends' beside reserve) survives into the new layout.
+    auto script = TwoTierScript();
+    script.push_back(DashboardEvent { .kind = DashboardEventKind::Resize, .columns = 50, .rows = 12 });
+    script.push_back(Tick);
+    auto const frames = FramesAt(CachePanel(), std::move(script), RenderRung::Unicode, 132, 40);
+    REQUIRE(frames.size() == 2);
+    CHECK(WidestLine(frames[0]) == 132);
+    CHECK(WidestLine(frames[1]) == 50);
+    CHECK(Lines(frames[1]).size() <= 12);
+    CHECK(Lines(frames[0]).size() > Lines(frames[1]).size());
+    CHECK(frames[1] == CacheFrameAt(50, 12));
+}
+
+TEST_CASE("what does not fit goes in priority order, not position order", "[cli][dashboard][panel][responsive]")
+{
+    // The drop order is the Priority column. WHAT DISTINGUISHES: in both cases below the piece that
+    // goes FIRST is not the rightmost one -- `evict/s` (Low) is left of `index (RAM)` (Normal), and a
+    // row's gauge (Low) is left of its percentage (High) -- so dropping by position fails each.
+    auto const heading = [](std::string_view frame) {
+        return LineStarting(frame, "tier");
+    };
+
+    auto firstTierDrop = std::optional<int> {};
+    auto firstBytesDrop = std::optional<int> {};
+    for (auto const columns: std::views::iota(40, 133) | std::views::reverse)
+    {
+        auto const frame = CacheFrameAt(columns, 60);
+        auto const tier = heading(frame);
+        REQUIRE(tier.has_value());
+        auto const allColumns = std::ranges::all_of(
+            CachePanel().tierColumns, [&](TierColumn const& column) { return Unwrap(tier).contains(column.header); });
+        if (!allColumns && !firstTierDrop.has_value())
+        {
+            firstTierDrop = columns;
+            INFO("first tier drop at " << columns << ": " << Unwrap(tier));
+            CHECK(!Unwrap(tier).contains("evict/s"));
+            CHECK(Unwrap(tier).contains("index (RAM)"));
+        }
+
+        auto const bytes = LineStarting(frame, "bytes");
+        REQUIRE(bytes.has_value());
+        auto const gauge = Unwrap(bytes).contains("\xe2\x96\x88") || Unwrap(bytes).contains("\xe2\x96\x91");
+        auto const percent = Unwrap(bytes).contains("75.0 %");
+        if ((!gauge || !percent) && !firstBytesDrop.has_value())
+        {
+            firstBytesDrop = columns;
+            INFO("first bytes drop at " << columns << ": " << Unwrap(bytes));
+            CHECK(!gauge);
+            CHECK(percent);
+        }
+    }
+    // Both drops happened inside the range scanned, or the checks above asserted nothing.
+    CHECK(firstTierDrop.has_value());
+    CHECK(firstBytesDrop.has_value());
+}
+
+TEST_CASE("a trend narrows to its minimum before a figure beside it is dropped", "[cli][dashboard][panel][responsive]")
+{
+    // Sparklines narrow first. WHAT DISTINGUISHES: at the widest width where the beside figure has
+    // gone, one column wider draws it again -- with the trends at exactly their minimum. A layout
+    // that dropped a beside figure while the trend was still wider than that fails the last check.
+    auto dropAt = std::optional<int> {};
+    for (auto const columns: std::views::iota(40, 133) | std::views::reverse)
+    {
+        auto const frame = CacheFrameAt(columns, 60);
+        auto const evictions = RowLine(frame, "evictions/s");
+        REQUIRE(evictions.has_value());
+        if (!Unwrap(evictions).contains("evicted unfetched"))
+        {
+            dropAt = columns;
+            break;
+        }
+    }
+    REQUIRE(dropAt.has_value());
+
+    auto const wider = CacheFrameAt(Unwrap(dropAt) + 1, 60);
+    auto const evictions = RowLine(wider, "evictions/s");
+    REQUIRE(evictions.has_value());
+    REQUIRE(Unwrap(evictions).contains("evicted unfetched"));
+    CHECK(SparkOf(Unwrap(evictions), "evicted").size() == 8);
+}
+
+TEST_CASE("a table that does not fit vertically ends in a count of what it hides", "[cli][dashboard][panel][responsive]")
+{
+    // WHAT DISTINGUISHES: at the tallest height that cannot show both tier rows, the heading stays and
+    // a `+2 more` line stands for the rows -- they are not silently gone -- while the lines of lower
+    // priority (the blank separators, the `connected` note row, the tier notes) went first. One line
+    // taller, both rows show and nothing says `more`.
+    auto shrunkAt = std::optional<int> {};
+    for (auto const rows: std::views::iota(5, 41) | std::views::reverse)
+        if (CacheFrameAt(132, rows).contains("+2 more"))
+        {
+            shrunkAt = rows;
+            break;
+        }
+    REQUIRE(shrunkAt.has_value());
+
+    auto const shrunk = CacheFrameAt(132, Unwrap(shrunkAt));
+    CHECK(Lines(shrunk).size() <= static_cast<std::size_t>(Unwrap(shrunkAt)));
+    CHECK(LineStarting(shrunk, "tier").has_value());
+    CHECK(!LineStarting(shrunk, "memory").has_value());
+    CHECK(!LineStarting(shrunk, "connected").has_value());
+    CHECK(!shrunk.contains("per-tier denominations"));
+    CHECK(RowLine(shrunk, "evictions/s").has_value()); // Normal rows outlast the Normal table's rows
+
+    auto const taller = CacheFrameAt(132, Unwrap(shrunkAt) + 1);
+    CHECK(!taller.contains(" more"));
+    CHECK(LineStarting(taller, "memory").has_value());
+    CHECK(LineStarting(taller, "disk").has_value());
+}
+
+TEST_CASE("below its minimum size a panel is one line naming the minimum and the terminal",
+          "[cli][dashboard][panel][responsive]")
+{
+    // A clipped panel is worse than none: it shows some figures and silently not others. WHAT
+    // DISTINGUISHES: one column or one row under the minimum gives ONE line saying both sizes and no
+    // wider than the terminal, and AT the minimum a real frame is drawn -- or "always draw the line"
+    // passes the first half.
+    auto const minimum = MinimumPanelSize(CachePanel(), &FakeCellWidth);
+    auto const columns = static_cast<int>(minimum.columns);
+    auto const rows = static_cast<int>(minimum.rows);
+
+    auto const narrow = CacheFrameAt(columns - 1, 24);
+    CHECK(Lines(narrow).size() == 1);
+    CHECK(narrow.contains(std::format("needs {}x{}, have {}x24", columns, rows, columns - 1)));
+    CHECK(FakeCellWidth(narrow) <= minimum.columns - 1);
+
+    auto const shortTerminal = CacheFrameAt(80, rows - 1);
+    CHECK(Lines(shortTerminal).size() == 1);
+    CHECK(shortTerminal.contains(std::format("needs {}x{}, have 80x{} -- fastcached", columns, rows, rows - 1)));
+
+    auto const exact = CacheFrameAt(columns, rows);
+    CHECK(exact.starts_with("\xe2\x94\x8c"));
+    CHECK(Lines(exact).size() <= minimum.rows);
+    CHECK(WidestLine(exact) <= minimum.columns);
+    CHECK(RowLine(exact, "hit rate").has_value());
+}
+
+TEST_CASE("a wide endpoint in the title never pushes the frame past the terminal", "[cli][dashboard][panel][responsive]")
+{
+    // Hostnames can be wide, and a width counted in bytes or code points misplaces the corner. WHAT
+    // DISTINGUISHES: the endpoint's cells differ from its bytes AND its code points, and every line
+    // is still exactly the terminal's width in cells.
+    auto const endpoint = std::string { "\xe7\xb7\xa8\xe8\xad\xaf\xe6\xa9\x9f-07:7070" }; // three CJK characters
+    REQUIRE(FakeCellWidth(endpoint) != endpoint.size());
+    REQUIRE(FakeCellWidth(endpoint) == 14);
+
+    auto view = PanelView { CachePanel(),
+                            PanelContext { .absent = std::string { Absent },
+                                           .endpoint = endpoint,
+                                           .cellWidth = &FakeCellWidth,
+                                           .rung = RenderRung::Unicode } };
+    auto sink = CollectingSink {};
+    auto script = TwoTierScript();
+    script.insert(script.begin(), DashboardEvent { .kind = DashboardEventKind::Resize, .columns = 60, .rows = 30 });
+    (void) Drive(std::move(script), DashboardLimits {}, view, sink);
+    REQUIRE(sink.frames.size() == 1);
+    CHECK(sink.frames[0].contains(endpoint));
+    for (auto const& line: Lines(sink.frames[0]))
+        CHECK(FakeCellWidth(line) == 60);
 }

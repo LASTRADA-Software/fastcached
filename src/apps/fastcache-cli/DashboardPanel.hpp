@@ -80,12 +80,35 @@ struct FigureSpec
     FigureFormat format { FigureFormat::Count }; ///< How it is written.
 };
 
+/// How much a piece of a panel matters when the terminal cannot fit all of it.
+///
+/// TRANSMITTED/PERSISTED: no. Private; enumerators may be inserted at their place in the order.
+///
+/// **Declaration order IS the keep order, and it is the panel's whole drop policy** (#134 decision
+/// 5). `Essential` is never dropped: a terminal that cannot fit every essential piece gets the
+/// minimum-size line instead of a clipped panel. Everything else goes lowest first -- `Spacing`, then
+/// `Low`, then `Normal`, then `High` -- and among pieces of one priority the rightmost or bottom-most
+/// goes first. A trend narrows to its minimum before anything is dropped for it.
+///
+/// A column on every row, beside figure and tier column rather than an order written into the
+/// layout code, so that a panel's priorities are read in its table and a new row states its own.
+enum class Priority : std::uint8_t
+{
+    Essential, ///< Never dropped; not fitting it is the minimum-size line.
+    High,      ///< Dropped last.
+    Normal,    ///< The default.
+    Low,       ///< Dropped first among content.
+    Spacing,   ///< A blank separator line; dropped before any content.
+    Last,
+};
+
 /// A figure written beside a row's own, with words around it.
 struct BesideFigure
 {
-    std::string_view before {}; ///< Words before the value.
-    FigureSpec figure {};       ///< The value.
-    std::string_view after {};  ///< Words after the value.
+    std::string_view before {};             ///< Words before the value.
+    FigureSpec figure {};                   ///< The value.
+    std::string_view after {};              ///< Words after the value.
+    Priority priority { Priority::Normal }; ///< When it is dropped for width.
 };
 
 /// Whether a row draws its series as a sparkline.
@@ -98,22 +121,35 @@ enum class Trend : std::uint8_t
 };
 
 /// One row of the upper block: a figure of each interval, its trend, and what sits beside it.
+///
+/// The label and the figure are ESSENTIAL and are not a column: a row that has lost its figure is
+/// not a row. The byte-wide members close the struct in one run, so it pads nothing between
+/// 8-aligned members.
 struct RateRow
 {
-    std::string_view label;                  ///< What the figure is.
-    FigureSpec figure;                       ///< The figure.
-    std::span<BesideFigure const> beside {}; ///< Figures written after it.
-    std::string_view note {};                ///< Words written after those.
-    Trend trend { Trend::Drawn };            ///< Whether a sparkline is drawn; last, so it pads nothing.
+    std::string_view label;                    ///< What the figure is.
+    FigureSpec figure;                         ///< The figure.
+    std::span<BesideFigure const> beside {};   ///< Figures written after it.
+    std::string_view note {};                  ///< Words written after those.
+    Trend trend { Trend::Drawn };              ///< Whether a sparkline is drawn.
+    Priority priority { Priority::Normal };    ///< When the whole row is dropped for height.
+    Priority trendPriority { Priority::High }; ///< When the trend is dropped for width, after narrowing.
+    Priority notePriority { Priority::Low };   ///< When the note is dropped for width.
 };
 
 /// One row of the lower block: a reading of now, optionally against its limit.
+///
+/// The label and the reading are ESSENTIAL; the limit, its gauge and the percentage are columns.
 struct LevelRow
 {
-    std::string_view label;             ///< What the figure is.
-    FigureSpec value;                   ///< The reading.
-    std::optional<FigureSpec> limit {}; ///< What bounds it, drawn with a gauge and a percentage.
-    std::string_view note {};           ///< Words written after it.
+    std::string_view label;                      ///< What the figure is.
+    FigureSpec value;                            ///< The reading.
+    std::optional<FigureSpec> limit {};          ///< What bounds it, drawn with a gauge and a percentage.
+    std::string_view note {};                    ///< Words written after it.
+    Priority priority { Priority::Normal };      ///< When the whole row is dropped for height.
+    Priority limitPriority { Priority::Normal }; ///< When the limit and the percentage are dropped for width.
+    Priority gaugePriority { Priority::Low };    ///< When the gauge is dropped for width.
+    Priority notePriority { Priority::Low };     ///< When the note is dropped for width.
 };
 
 /// One column of the tier block.
@@ -122,29 +158,59 @@ struct LevelRow
 /// `StorageTierTable`, so no tier is spelled here.
 struct TierColumn
 {
-    std::string_view header; ///< The column's heading.
-    FigureSpec figure;       ///< The figure, per tier.
+    std::string_view header;                ///< The column's heading.
+    FigureSpec figure;                      ///< The figure, per tier.
+    Priority priority { Priority::Normal }; ///< When the column is dropped for width.
 };
 
 /// A whole panel.
+///
+/// **A table that does not fit vertically ends in `+N more`** rather than losing rows silently: it
+/// shrinks, keeping its heading, before rows of its own priority are dropped.
 struct PanelSpec
 {
-    std::string_view title;                     ///< The frame's title.
-    std::span<RateRow const> rates;             ///< The upper block.
-    std::span<LevelRow const> levels;           ///< The lower block.
-    std::span<TierColumn const> tierColumns;    ///< The tier block; empty for a panel without one.
-    std::span<std::string_view const> tierNote; ///< Lines under the tier block, when it is drawn.
+    std::string_view title;                      ///< The frame's title.
+    std::span<RateRow const> rates;              ///< The upper block.
+    std::span<LevelRow const> levels;            ///< The lower block.
+    std::span<TierColumn const> tierColumns;     ///< The tier block; empty for a panel without one.
+    std::span<std::string_view const> tierNote;  ///< Lines under the tier block, when it is drawn.
+    Priority tierPriority { Priority::Normal };  ///< When the tier table shrinks, then goes, for height.
+    Priority tierNotePriority { Priority::Low }; ///< When the tier note lines go.
+    Priority sourcePriority { Priority::High };  ///< When the source line goes.
 };
+
+/// A terminal size, in cells.
+struct PanelSize
+{
+    std::size_t columns { 0 }; ///< Cells across.
+    std::size_t rows { 0 };    ///< Lines down.
+};
+
+/// The smallest terminal @p spec is drawn in, rather than the minimum-size line.
+///
+/// Derived from the spec rather than written beside it: the width every essential piece needs at its
+/// column widths plus the frame, and one line per essential row plus the frame -- a table counting as
+/// its heading and its `+N more`. A figure wider than its column can still need more, and the view
+/// then names what it needed.
+/// @param spec The panel.
+/// @param cellWidth How wide text is.
+/// @return The minimum size.
+[[nodiscard]] PanelSize MinimumPanelSize(PanelSpec const& spec, CellWidth cellWidth) noexcept;
 
 /// Everything a panel view is told rather than reads.
 ///
 /// **The rung is a value here, decided once by whoever composed the session** (§9.12), and so is
 /// the absent marker: the operator's `--absent`, resolved, and the same text on every rung (§9.6).
+///
+/// And so is how wide text is, for the same reason: the one width function the adapter layer
+/// provides, never a count this view makes of its own. Required; a view is never constructed
+/// without one.
 struct PanelContext
 {
     std::string absent {};                                ///< What an absent figure reads as.
     std::string endpoint {};                              ///< Where the samples are asked; empty when not stated.
     std::optional<std::chrono::milliseconds> interval {}; ///< The sampling interval, when stated.
+    CellWidth cellWidth { nullptr };                      ///< How many cells text occupies; must not be null.
     RenderRung rung { RenderRung::Ascii };                ///< What the frame is drawn with; last, so it pads nothing.
 };
 
@@ -175,7 +241,12 @@ struct PanelContext
 /// @return `base{tier="<tier>"}`.
 [[nodiscard]] std::string TierSeriesName(std::string_view base, std::string_view tier);
 
-/// Draws any `PanelSpec` on the rung it was given.
+/// Draws any `PanelSpec` on the rung it was given, laid out for the model's current size.
+///
+/// **Responsive to `columns x rows`** (#134 decision 5), which arrive as `Resize` events: no line is
+/// wider than `columns` cells and no frame taller than `rows`. What does not fit goes in `Priority`
+/// order; a figure is never cut; below `MinimumPanelSize` the frame is one line naming the minimum
+/// and the current size. The mockups in #134 are one size, not the layout.
 class PanelView final: public IDashboardView
 {
   public:
@@ -192,8 +263,15 @@ class PanelView final: public IDashboardView
     RungGlyphs const* _glyphs;
     PanelContext _context;
 
-    /// Columns kept for the widest beside text any frame has written; only ever grows.
+    /// Cells kept for the widest beside text any frame has written at the current width.
+    ///
+    /// Only grows while the width holds, so a figure gaining a digit narrows the trends once rather
+    /// than making them jump from frame to frame; a new width starts it again, since a reserve
+    /// measured at another width can be wider than this one allows.
     std::size_t _besideReserve { 0 };
+
+    /// The content width `_besideReserve` was measured at.
+    std::size_t _reserveColumns { 0 };
 };
 
 } // namespace FastCache::Cli
