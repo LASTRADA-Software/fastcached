@@ -46,6 +46,28 @@ using namespace FastCache::Cli::Testing;
 namespace
 {
 
+/// Every remark a session made, in order.
+class RecordingRemarks final: public IRemarkSink
+{
+  public:
+    void Remark(std::string_view line) override
+    {
+        auto const lock = std::scoped_lock { _mutex };
+        _lines.emplace_back(line);
+    }
+
+    /// @return The remarks so far.
+    [[nodiscard]] std::vector<std::string> Lines() const
+    {
+        auto const lock = std::scoped_lock { _mutex };
+        return _lines;
+    }
+
+  private:
+    mutable std::mutex _mutex;
+    std::vector<std::string> _lines;
+};
+
 /// A restore handle that counts its calls, and notes them in a log when it is given one.
 class LoggingRestore final: public ITerminalRestore
 {
@@ -342,6 +364,7 @@ struct Composition
     LiveSubject subject;
     IAdminDocument* admin;
     SampleReader reader;
+    RecordingRemarks remarks;
     std::optional<LiveEventSource> source;
     std::shared_ptr<ITerminalRestore> restore;
     std::optional<std::expected<LiveSessionRun, Answer>> result;
@@ -366,6 +389,7 @@ struct Composition
             .stopWaiter = &rig.stopWaiter,
             .terminalPool = &terminalPool,
             .sink = &rig.sink,
+            .remarks = &remarks,
             .interactive = interactive,
             .terminals = &terminals,
             .stops = &stops,
@@ -599,6 +623,116 @@ TEST_CASE("a piped session whose subject has no record to stream refuses by name
     CHECK(rig.gatherer.Calls() == 0);
 
     composition.Finish();
+}
+
+namespace
+{
+
+/// The remarks a session makes over @p script, read by the stats ladder's reader.
+/// @param script The events, in order.
+/// @return The remarks.
+[[nodiscard]] std::vector<std::string> RemarksOver(std::vector<DashboardEvent> script)
+{
+    auto clock = ManualClock {};
+    auto reactor = TestReactor { clock };
+    auto events = ScriptedDashboardEvents { reactor, std::move(script) };
+    auto remarks = RecordingRemarks {};
+    auto remarking = FailureRemarks { &events, &ReadStatsSample, &remarks };
+    auto view = CountView {};
+    auto sink = CountSink {};
+    auto exit = std::optional<DashboardExit> {};
+    auto task = RunOver(&remarking, &view, &sink, DashboardLimits {}, &exit);
+    reactor.Submit(task.Native());
+    reactor.Drain();
+    REQUIRE(exit.has_value());
+    return remarks.Lines();
+}
+
+/// A sample the source could not take, for @p reason.
+/// @param reason Why.
+/// @return The event.
+[[nodiscard]] DashboardEvent FailedFor(std::string reason)
+{
+    return DashboardEvent { .kind = DashboardEventKind::SampleFailed,
+                            .outcome = Outcome::Unreachable,
+                            .note = std::move(reason) };
+}
+
+/// A sample that arrived carrying @p attempts.
+/// @param attempts What each source said.
+/// @return The event.
+[[nodiscard]] DashboardEvent SampleOf(std::vector<StatsAttempt> attempts)
+{
+    return DashboardEvent { .kind = DashboardEventKind::Sample, .attempts = std::move(attempts) };
+}
+
+} // namespace
+
+TEST_CASE("a failing sample is remarked on once per reason, and again after a recovery", "[cli][live][session][remark]")
+{
+    // WHAT DISTINGUISHES: the repeat of a reason stays quiet (once per sample would say it twice),
+    // a changed reason speaks (once per run would not), and a recovery re-arms it (a reason
+    // remembered across a reading would not tell the second outage).
+    auto const unread = SampleOf(NothingAnswered());
+    auto const readerNote = ReadStatsSample(unread).note;
+    REQUIRE_FALSE(readerNote.empty());
+
+    auto const remarks = RemarksOver({ SampleOf(Reading()),
+                                       FailedFor("the daemon is down"),
+                                       FailedFor("the daemon is down"),
+                                       FailedFor("the daemon refused"),
+                                       SampleOf(Reading()),
+                                       FailedFor("the daemon refused"),
+                                       unread,
+                                       unread });
+
+    REQUIRE(remarks.size() == 4);
+    CHECK(remarks[0].contains("the daemon is down"));
+    CHECK(remarks[1].contains("the daemon refused"));
+    CHECK(remarks[2].contains("the daemon refused"));
+    // A sample the READER could not read says the reader's own account.
+    CHECK(remarks[3].contains(readerNote));
+}
+
+TEST_CASE("a run whose samples all read is never remarked on", "[cli][live][session][remark]")
+{
+    CHECK(RemarksOver({ SampleOf(Reading()), SampleOf(Reading()), SampleOf(Reading()) }).empty());
+}
+
+TEST_CASE("a piped session remarks on a failing sample as it happens, and an interactive one at the end",
+          "[cli][live][session][remark]")
+{
+    {
+        // Piped: stderr is free, so the operator reading an absent row learns why at once.
+        Rig rig;
+        DyingGatherer dying;
+        Composition composition { rig, SixelTerminal, CompositionFaults { .gatherer = &dying } };
+        composition.Start(false, 3);
+        composition.RunFor(3);
+
+        CHECK(composition.Stop() == DashboardStop::SampleBudget);
+        CHECK(composition.remarks.Lines().size() == 1);
+        auto const* const run = composition.Run();
+        REQUIRE(run != nullptr);
+        CHECK(std::ranges::none_of(run->remarks, [](std::string const& line) { return line.contains("read nothing"); }));
+        composition.Finish();
+    }
+    {
+        // Interactive: stderr is the screen being drawn on, so the remark waits for the terminal to be back.
+        Rig rig;
+        DyingGatherer dying;
+        Composition composition { rig, SixelTerminal, CompositionFaults { .gatherer = &dying } };
+        composition.Start(true, 3);
+        composition.RunFor(3);
+
+        CHECK(composition.Stop() == DashboardStop::SampleBudget);
+        CHECK(composition.remarks.Lines().empty());
+        auto const* const run = composition.Run();
+        REQUIRE(run != nullptr);
+        CHECK(std::ranges::count_if(run->remarks, [](std::string const& line) { return line.contains("read nothing"); })
+              == 1);
+        composition.Finish();
+    }
 }
 
 TEST_CASE("an interactive session draws every frame through the terminal's presenter and none to the pipe",
@@ -1071,6 +1205,7 @@ struct RunningSeat
                                  .stopWaiter = &stopWaiter,
                                  .terminalPool = &terminalPool,
                                  .sink = &sink,
+                                 .remarks = &remarks,
                                  .streamsInteractive = streamsInteractive,
                                  .render = render,
                                  .terminals = terminalsOverride != nullptr ? terminalsOverride : &terminals,
@@ -1127,6 +1262,7 @@ struct RunningSeat
     ThreadPoolExecutor stopWaiter { 1 };
     ThreadPoolExecutor terminalPool { 1 };
     StreamingSink sink;
+    RecordingRemarks remarks;
     ScriptedInstaller stops { reactor, "" };
     StopOnDemandInstaller onDemand { reactor };
     ScriptedAcquisition terminals { reactor, std::unexpected(std::string { "stdin is not a terminal" }), false };
