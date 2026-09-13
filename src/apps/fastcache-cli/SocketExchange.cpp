@@ -415,4 +415,17 @@ std::expected<HttpResponse, ExchangeError> HttpGet(Endpoint const& endpoint,
     return HttpResponse { .status = status, .body = raw.substr(headEnd + 4) };
 }
 
+Outcome OutcomeOf(AdminFailure failure) noexcept
+{
+    switch (failure)
+    {
+        case AdminFailure::Refused:
+            return Outcome::Refused;
+        case AdminFailure::Unreachable:
+        case AdminFailure::Last:
+            break;
+    }
+    return Outcome::Unreachable;
+}
+
 } // namespace FastCache::Cli
