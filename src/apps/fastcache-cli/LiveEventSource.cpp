@@ -9,13 +9,15 @@
 #include <algorithm>
 #include <cassert>
 #include <cstddef>
+#include <string>
+#include <string_view>
 #include <utility>
 #include <variant>
 
 namespace FastCache::Cli
 {
 
-/// Shared by the source and its two producers.
+/// Shared by the source and its producers.
 ///
 /// Every member is read and written on the reactor's thread only -- the producers resume
 /// there before touching any of it, and `LiveSourceParts::reactor` states the same of the
@@ -154,6 +156,43 @@ namespace
         }
         shared->ProducerEnded();
     }
+
+    /// The key a terminal in raw mode sends for Ctrl-C, which is what a stop becomes.
+    constexpr auto CtrlC = std::string_view { "\x03" };
+
+    /// Wait for a stop request and tell the loop what it means.
+    ///
+    /// **Awaited, never polled**: the blocking wait is on `stopWaiter`, and this resumes on
+    /// the reactor only once the signal or `Close()` has said something.
+    /// @param shared The source's state; held so it outlives the source if need be.
+    DetachedTask RunStopWatch(std::shared_ptr<LiveEventSource::State> shared)
+    {
+        auto const& parts = shared->parts;
+        auto const wake = co_await parts.stop->Stopped(parts.stopWaiter, parts.reactor);
+        // Closed first: the wait ended because `Close()` cancelled it, or said something
+        // nobody is left to hear.
+        if (!shared->Closed())
+        {
+            switch (wake)
+            {
+                case StopWake::Stopped:
+                    shared->Deliver(DashboardEvent { .kind = DashboardEventKind::Key, .keys = std::string { CtrlC } });
+                    break;
+                case StopWake::Failed:
+                    // With the handler installed, Ctrl-C no longer ends the process by
+                    // itself, and nothing is waiting to hear it -- so a session that went
+                    // on would be one Ctrl-C cannot end. Ending it says why instead.
+                    shared->Deliver(
+                        DashboardEvent { .kind = DashboardEventKind::Detached,
+                                         .note = "stopped watching for Ctrl-C: waiting for the stop request failed" });
+                    break;
+                case StopWake::Cancelled:
+                case StopWake::Last:
+                    break;
+            }
+        }
+        shared->ProducerEnded();
+    }
 } // namespace
 
 LiveEventSource::LiveEventSource(LiveSourceParts parts):
@@ -170,6 +209,12 @@ LiveEventSource::LiveEventSource(LiveSourceParts parts):
     {
         ++_state->producers;
         RunTerminal(_state);
+    }
+    if (_state->parts.stop != nullptr)
+    {
+        assert(_state->parts.stopWaiter != nullptr);
+        ++_state->producers;
+        RunStopWatch(_state);
     }
 }
 
@@ -198,6 +243,10 @@ void LiveEventSource::Close() noexcept
     state.due.Close();
     if (state.parts.terminal != nullptr)
         state.parts.terminal->Close();
+    // The stop wait holds a thread until something answers it, and `Drained()` waits for
+    // that thread's answer to come back.
+    if (state.parts.stop != nullptr)
+        state.parts.stop->Cancel();
 }
 
 Task<void> LiveEventSource::Drained()
