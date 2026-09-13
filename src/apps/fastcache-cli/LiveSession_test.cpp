@@ -238,10 +238,10 @@ class GeometryView final: public IDashboardView
     {
     }
 
-    [[nodiscard]] std::string Frame(DashboardModel const& model) override
+    [[nodiscard]] DashboardFrame PlacedFrame(DashboardModel const& model) override
     {
         _geometry->emplace_back(model.columns, model.rows);
-        return std::to_string(model.samples);
+        return DashboardFrame { .text = std::to_string(model.samples), .placements = {} };
     }
 
   private:
@@ -252,7 +252,7 @@ class GeometryView final: public IDashboardView
 class ThrowingView final: public IDashboardView
 {
   public:
-    [[nodiscard]] std::string Frame(DashboardModel const& /*model*/) override
+    [[nodiscard]] DashboardFrame PlacedFrame(DashboardModel const& /*model*/) override
     {
         throw std::runtime_error { "the view could not draw" };
     }
