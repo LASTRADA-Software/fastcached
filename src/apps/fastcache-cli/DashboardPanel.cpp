@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "DashboardPanel.hpp"
+#include "FleetDocument.hpp"
 
 #include <FastCache/Cache/StorageTier.hpp>
+#include <FastCache/Core/NumericText.hpp>
 #include <FastCache/Core/Ranges.hpp>
 
 #include <algorithm>
@@ -396,7 +398,8 @@ namespace
     ///
     /// **The one place a line is dropped for height.** Lowest priority first: at each priority the
     /// bottom-most table shrinks to `+N more`, then the bottom-most other item goes, then the bottom-most
-    /// table goes whole. `Essential` items never go.
+    /// table goes whole. `Essential` items never go -- an essential table only shrinks, and only once
+    /// everything else has gone.
     /// @param items The frame's items, top to bottom.
     /// @param available The lines available, or nullopt for no limit.
     /// @return The lines; nullopt when the essential items alone do not fit.
@@ -407,6 +410,20 @@ namespace
         for (auto const& item: items)
             total += HeightOf(item);
 
+        // Hide one more row of the bottom-most table of @p priority that can still get shorter.
+        auto const shrinkLast = [&items, &total](Priority priority) {
+            auto const table = LastWhere(items, [priority](Item const& item) {
+                auto probe = item;
+                return item.table && item.priority == priority && Shrink(probe);
+            });
+            if (table == items.size())
+                return false;
+            total -= HeightOf(items[table]);
+            (void) Shrink(items[table]);
+            total += HeightOf(items[table]);
+            return true;
+        };
+
         if (available.has_value())
         {
             for (auto const level: std::views::iota(std::to_underlying(Priority::High), std::to_underlying(Priority::Last))
@@ -415,17 +432,8 @@ namespace
                 auto const priority = static_cast<Priority>(level);
                 while (total > *available)
                 {
-                    auto const table = LastWhere(items, [&](Item const& item) {
-                        auto probe = item;
-                        return item.table && item.priority == priority && Shrink(probe);
-                    });
-                    if (table != items.size())
-                    {
-                        total -= HeightOf(items[table]);
-                        (void) Shrink(items[table]);
-                        total += HeightOf(items[table]);
+                    if (shrinkLast(priority))
                         continue;
-                    }
                     auto const line =
                         LastWhere(items, [&](Item const& item) { return !item.table && item.priority == priority; });
                     auto const whole = line != items.size()
@@ -437,6 +445,11 @@ namespace
                     items.erase(items.begin() + static_cast<std::ptrdiff_t>(whole));
                 }
             }
+            // Last of all, an ESSENTIAL table keeps its heading and says how many rows it hides: it
+            // never goes, but a frame with room for its heading and a count is not the minimum-size line.
+            while (total > *available)
+                if (!shrinkLast(Priority::Essential))
+                    break;
             if (total > *available)
                 return std::nullopt;
         }
@@ -673,6 +686,265 @@ namespace
         return items;
     }
 
+    /// What separates two headline tiles on one line.
+    constexpr std::string_view TileGap = "   ";
+
+    /// Columns a tile's value is right-aligned into, at the least.
+    constexpr auto TileValueColumns = std::size_t { 10 };
+
+    /// What separates two columns of a document table, and two tabs of the section strip.
+    constexpr std::string_view ColumnGap = "  ";
+
+    /// The text a document cell reads as.
+    /// @param in The frame's inputs.
+    /// @param cell The cell.
+    /// @return The absent marker for an absent cell, its text otherwise.
+    [[nodiscard]] std::string CellText(FrameInputs const& in, Cell const& cell)
+    {
+        return cell.kind == CellKind::Absent ? std::string { in.absent } : cell.lexical;
+    }
+
+    /// Where the column named @p name is in @p table.
+    /// @param table The table.
+    /// @param name The column's name.
+    /// @return Its index, or nullopt when the table has no such column.
+    [[nodiscard]] std::optional<std::size_t> ColumnNamed(Value const& table, std::string_view name)
+    {
+        for (auto const index: std::views::iota(std::size_t { 0 }, table.columns.size()))
+            if (table.columns[index] == name)
+                return index;
+        return std::nullopt;
+    }
+
+    /// A `kpi` cell written for a person, in the unit its row names.
+    /// @param in The frame's inputs.
+    /// @param cell The raw value.
+    /// @param unit The row's unit.
+    /// @return Formatted where `KpiUnitTable` says how; the cell as the leader sent it otherwise.
+    [[nodiscard]] std::string KpiText(FrameInputs const& in, Cell const& cell, std::string_view unit)
+    {
+        if (cell.kind == CellKind::Absent)
+            return std::string { in.absent };
+        auto const* row = FindIfOrNull(KpiUnitTable, [unit](KpiUnit const& candidate) { return candidate.name == unit; });
+        auto number = 0.0;
+        if (row == nullptr || !row->format.has_value() || !ParseFiniteDouble(cell.lexical, number))
+            return cell.lexical;
+        return FormatFigure(number * row->scale, *row->format, in.absent);
+    }
+
+    /// One headline tile's words.
+    struct Tile
+    {
+        std::string key;   ///< The figure's key.
+        std::string value; ///< Its value, written.
+        std::string of;    ///< `of <n>`, or empty for a figure with no denominator.
+    };
+
+    /// One tile per `FleetKpiKeys()` key, in that order.
+    ///
+    /// Every key has a tile whether or not the document carried its row, so the strip is one shape from
+    /// the first frame on: a figure not yet read is the absent marker, never a missing tile.
+    /// @param in The frame's inputs.
+    /// @return The tiles.
+    [[nodiscard]] std::vector<Tile> Tiles(FrameInputs const& in)
+    {
+        // The `kpi` section's own column names, from the one door that lists them: the first names
+        // the figure, and the three after it are its value, its unit and its denominator.
+        auto const names = Distributed::FleetColumnNames(FleetSection::Kpi, Distributed::FleetSnapshot {});
+        auto const* document = in.model->latestDocument.get();
+        auto const* table = document == nullptr ? nullptr : document->Section(FleetSection::Kpi);
+        auto const column = [&names, table](std::size_t position) {
+            return table == nullptr || position >= names.size() ? std::nullopt : ColumnNamed(*table, names[position]);
+        };
+        auto const keyAt = column(0);
+        auto const valueAt = column(1);
+        auto const unitAt = column(2);
+        auto const ofAt = column(3);
+        auto const readable = keyAt.has_value() && valueAt.has_value() && unitAt.has_value();
+
+        auto tiles = std::vector<Tile> {};
+        for (auto const key: Distributed::FleetKpiKeys())
+        {
+            auto tile = Tile { .key = std::string { key }, .value = std::string { in.absent }, .of = {} };
+            auto const* row = !readable ? nullptr : FindIfOrNull(table->rows, [&keyAt, key](std::vector<Cell> const& cells) {
+                return cells[*keyAt].lexical == key;
+            });
+            if (row != nullptr && valueAt.has_value() && unitAt.has_value())
+            {
+                auto const& unit = (*row)[*unitAt].lexical;
+                tile.value = KpiText(in, (*row)[*valueAt], unit);
+                if (ofAt.has_value() && (*row)[*ofAt].kind != CellKind::Absent)
+                    tile.of = "of " + KpiText(in, (*row)[*ofAt], unit);
+            }
+            tiles.push_back(std::move(tile));
+        }
+        return tiles;
+    }
+
+    /// The headline tiles laid out for @p budget cells: as many to a line as fit, every tile one width.
+    /// @param in The frame's inputs.
+    /// @param spec The document block.
+    /// @param budget The content width.
+    /// @return One item per line of tiles; none when not even one tile's key and value fit.
+    [[nodiscard]] std::vector<Item> TileItems(FrameInputs const& in, DocumentSpec const& spec, std::size_t budget)
+    {
+        auto const tiles = Tiles(in);
+        auto keyColumns = std::size_t { 0 };
+        auto valueColumns = TileValueColumns;
+        auto ofColumns = std::size_t { 0 };
+        for (auto const& tile: tiles)
+        {
+            keyColumns = std::max(keyColumns, in.cellWidth(tile.key));
+            valueColumns = std::max(valueColumns, in.cellWidth(tile.value));
+            ofColumns = std::max(ofColumns, in.cellWidth(tile.of));
+        }
+        auto const indent = in.cellWidth(Indent);
+        auto const gap = in.cellWidth(ColumnGap);
+        auto const essential = keyColumns + gap + valueColumns;
+        if (indent + essential > budget)
+            return {};
+        // The denominators go before a line holds fewer than one tile.
+        auto const withOf = ofColumns > 0 && indent + essential + gap + ofColumns <= budget;
+        auto const tileWidth = essential + (withOf ? gap + ofColumns : 0);
+        auto const perLine = 1 + ((budget - indent - tileWidth) / (in.cellWidth(TileGap) + tileWidth));
+
+        auto items = std::vector<Item> {};
+        auto line = std::string {};
+        auto onLine = std::size_t { 0 };
+        for (auto const& tile: tiles)
+        {
+            line += onLine == 0 ? std::string { Indent } : std::string { TileGap };
+            line += FitRight(tile.key, keyColumns, in.cellWidth) + std::string { ColumnGap }
+                    + AlignRight(tile.value, valueColumns, in.cellWidth);
+            if (withOf)
+                line += std::string { ColumnGap } + FitRight(tile.of, ofColumns, in.cellWidth);
+            if (++onLine == perLine)
+            {
+                items.push_back(Item { .lines = { std::exchange(line, {}) }, .priority = spec.tilePriority });
+                onLine = 0;
+            }
+        }
+        if (onLine > 0)
+            items.push_back(Item { .lines = { std::move(line) }, .priority = spec.tilePriority });
+        return items;
+    }
+
+    /// The section strip: every tabular section's key, the active one in brackets.
+    ///
+    /// Not essential either: a terminal too narrow for the active tab draws no strip.
+    /// @param in The frame's inputs.
+    /// @param spec The document block.
+    /// @param active The section the table draws.
+    /// @param budget The content width.
+    /// @return The strip's one item, or none.
+    [[nodiscard]] std::vector<Item> StripItems(FrameInputs const& in,
+                                               DocumentSpec const& spec,
+                                               FleetSection active,
+                                               std::size_t budget)
+    {
+        auto pieces = std::vector<Piece> { Piece { .text = std::string { Indent }, .priority = Priority::Essential } };
+        for (auto const& row: Distributed::FleetSectionTable)
+        {
+            if (!row.tabular)
+                continue;
+            auto const isActive = row.section == active;
+            auto text = pieces.size() > 1 ? std::string { ColumnGap } : std::string {};
+            text += isActive ? std::format("[{}]", row.key) : std::format(" {} ", row.key);
+            pieces.push_back(
+                Piece { .text = std::move(text), .priority = isActive ? Priority::Essential : spec.stripTabPriority });
+        }
+        auto kept = FitPieces(std::move(pieces), budget, 0, in.cellWidth);
+        if (!kept.has_value())
+            return {};
+        return { Item { .lines = { Joined(*kept, {}) }, .priority = spec.stripPriority } };
+    }
+
+    /// The active section's table, walked from the header line the leader sent.
+    /// @param in The frame's inputs.
+    /// @param spec The document block.
+    /// @param section The section to draw.
+    /// @param budget The content width.
+    /// @return The table -- or the absent marker where no document, or no such section, was read --
+    ///         or the cells its first column needed when that does not fit.
+    [[nodiscard]] std::expected<std::vector<Item>, std::size_t> SectionItems(FrameInputs const& in,
+                                                                             DocumentSpec const& spec,
+                                                                             FleetSection section,
+                                                                             std::size_t budget)
+    {
+        auto const* document = in.model->latestDocument.get();
+        auto const* table = document == nullptr ? nullptr : document->Section(section);
+        if (table == nullptr || table->columns.empty())
+        {
+            // Nothing read yet, or a reading without this section: the marker where the table goes,
+            // never an empty table, which would claim the fleet has no such rows.
+            auto line = std::string { Indent } + std::string { in.absent };
+            if (in.cellWidth(line) > budget)
+                return std::unexpected(in.cellWidth(line));
+            return std::vector<Item> { Item { .lines = { std::move(line) }, .priority = spec.tablePriority } };
+        }
+
+        // Each column as wide as its widest cell, heading included, so no cell is ever cut.
+        auto widths = std::vector<std::size_t> {};
+        for (auto const index: std::views::iota(std::size_t { 0 }, table->columns.size()))
+        {
+            auto width = in.cellWidth(table->columns[index]);
+            for (auto const& row: table->rows)
+                width = std::max(width, in.cellWidth(CellText(in, row[index])));
+            widths.push_back(width);
+        }
+
+        // The positional rule, as pieces: the first column is essential, every later one shares one
+        // priority, and `FitPieces` takes the rightmost of equals first.
+        auto heading = std::vector<Piece> { Piece { .text = std::string { Indent }
+                                                            + FitRight(table->columns.front(), widths.front(), in.cellWidth),
+                                                    .priority = Priority::Essential,
+                                                    .slot = 0 } };
+        for (auto const index: std::views::iota(std::size_t { 1 }, table->columns.size()))
+            heading.push_back(
+                Piece { .text = std::string { ColumnGap } + AlignRight(table->columns[index], widths[index], in.cellWidth),
+                        .priority = spec.columnPriority,
+                        .slot = index });
+        auto kept = FitPieces(std::move(heading), budget, 0, in.cellWidth);
+        if (!kept.has_value())
+            return std::unexpected(kept.error());
+
+        auto item = Item { .lines = { Joined(*kept, {}) }, .priority = spec.tablePriority, .table = true };
+        for (auto const& row: table->rows)
+        {
+            auto line = std::string { Indent } + FitRight(CellText(in, row.front()), widths.front(), in.cellWidth);
+            for (auto const& piece: *kept | std::views::drop(1))
+                line +=
+                    std::string { ColumnGap } + AlignRight(CellText(in, row[piece.slot]), widths[piece.slot], in.cellWidth);
+            item.lines.push_back(std::move(line));
+        }
+        return std::vector<Item> { std::move(item) };
+    }
+
+    /// The fleet document block: the tiles, a blank, the strip and the active section's table.
+    /// @param in The frame's inputs.
+    /// @param spec The panel.
+    /// @param section The section the table draws.
+    /// @param budget The content width.
+    /// @return The block, nothing for a panel without one, or the cells the table's first column needed.
+    [[nodiscard]] std::expected<std::vector<Item>, std::size_t> DocumentItems(FrameInputs const& in,
+                                                                              PanelSpec const& spec,
+                                                                              FleetSection section,
+                                                                              std::size_t budget)
+    {
+        auto items = std::vector<Item> {};
+        if (!spec.document.has_value())
+            return items;
+        auto table = SectionItems(in, *spec.document, section, budget);
+        if (!table.has_value())
+            return std::unexpected(table.error());
+        std::ranges::move(TileItems(in, *spec.document, budget), std::back_inserter(items));
+        if (!items.empty())
+            items.push_back(Blank());
+        std::ranges::move(StripItems(in, *spec.document, section, budget), std::back_inserter(items));
+        std::ranges::move(*table, std::back_inserter(items));
+        return items;
+    }
+
     /// The last line: which source answered, how many samples, how many of them were gaps.
     /// @param in The frame's inputs.
     /// @return The line.
@@ -762,6 +1034,13 @@ PanelSize MinimumPanelSize(PanelSpec const& spec, CellWidth cellWidth) noexcept
         content = std::max(content, tier);
         rows += spec.tierPriority == Priority::Essential ? 2 : 0;
     }
+    if (spec.document.has_value())
+    {
+        // A table's first column is as wide as what the leader sent, so no width is knowable here
+        // beyond the indent; the layout names the cells it measured when that column does not fit.
+        content = std::max(content, cellWidth(Indent));
+        rows += spec.document->tablePriority == Priority::Essential ? 2 : 0;
+    }
     rows += spec.sourcePriority == Priority::Essential ? 1 : 0;
     return PanelSize { .columns = content + FrameColumns, .rows = rows };
 }
@@ -807,13 +1086,13 @@ std::string PanelView::Frame(DashboardModel const& model)
     auto rates = RateItems(in, _spec->rates, budget, _besideReserve);
     auto levels = LevelItems(in, _spec->levels, budget);
     auto tiers = TierItems(in, *_spec, budget);
-    for (auto const* block: { &rates, &levels, &tiers })
+    auto document = DocumentItems(in, *_spec, _context.section, budget);
+    for (auto const* block: { &rates, &levels, &tiers, &document })
         if (!block->has_value())
             return tooSmall(block->error() + FrameColumns);
 
-    auto items = std::vector<Item> { Blank() };
-    std::ranges::move(*rates, std::back_inserter(items));
-    for (auto* block: { &*levels, &*tiers })
+    auto items = std::vector<Item> {};
+    for (auto* block: { &*rates, &*levels, &*tiers, &*document })
     {
         if (block->empty())
             continue;

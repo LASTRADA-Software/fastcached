@@ -255,6 +255,18 @@ namespace
                                           .tierNotePriority = Priority::Low,
                                           .sourcePriority = Priority::High };
 
+    // ---- fleet ------------------------------------------------------------------------------
+
+    constexpr auto FleetSpec = PanelSpec { .title = "fleet",
+                                           .rates = {},
+                                           .levels = {},
+                                           .tierColumns = {},
+                                           .tierNote = {},
+                                           .tierPriority = Priority::Normal,
+                                           .tierNotePriority = Priority::Low,
+                                           .sourcePriority = Priority::High,
+                                           .document = DocumentSpec {} };
+
 } // namespace
 
 PanelSpec const& CachePanel() noexcept
@@ -265,6 +277,11 @@ PanelSpec const& CachePanel() noexcept
 PanelSpec const& NodePanel() noexcept
 {
     return NodeSpec;
+}
+
+PanelSpec const& FleetPanel() noexcept
+{
+    return FleetSpec;
 }
 
 } // namespace FastCache::Cli

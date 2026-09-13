@@ -3,18 +3,24 @@
 #include "DashboardPanel.hpp"
 #include "DashboardPanels.hpp"
 #include "DashboardRig.hpp"
+#include "FleetDocument.hpp"
+#include "FleetReading.hpp"
 #include "ScriptedCellWidth.hpp"
 #include "StatsSource.hpp"
 
 #include <FastCache/Cache/StorageTier.hpp>
+#include <FastCache/Core/Ranges.hpp>
+#include <FastCache/Distributed/FleetView.hpp>
 #include <FastCache/Metrics/MetricsCatalog.hpp>
 #include <FastCache/Metrics/PrometheusFormatter.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdint>
+#include <expected>
 #include <format>
 #include <optional>
 #include <ranges>
@@ -876,4 +882,296 @@ TEST_CASE("a wide endpoint in the title never pushes the frame past the terminal
     CHECK(sink.frames[0].contains(endpoint));
     for (auto const& line: Lines(sink.frames[0]))
         CHECK(FakeCellWidth(line) == 60);
+}
+
+namespace
+{
+
+/// How many machines the fleet fixtures describe: more than a short terminal shows.
+constexpr auto FleetMachines = std::size_t { 12 };
+
+/// A leader's whole `/fleet.txt`, written in its grammar by hand.
+///
+/// By hand rather than rendered, for one reason: its machines section carries `zeta-column`, a column
+/// no table in this tree has, so a panel that drew from a column list of its own would lose it. The
+/// markers and the `kpi` header still come from the library's own doors, so only the invented column
+/// is invented. The third machine's name is `-`, the absent cell.
+/// @param machines How many machine rows.
+/// @return The document.
+[[nodiscard]] std::string FleetText(std::size_t machines)
+{
+    auto const marker = [](Distributed::FleetSection section) {
+        return std::format("# {}\n", Distributed::FleetSectionTable[static_cast<std::size_t>(section)].key);
+    };
+    auto text = marker(FleetSection::Kpi);
+    auto const kpiColumns = Distributed::FleetColumnNames(FleetSection::Kpi, Distributed::FleetSnapshot {});
+    for (auto const index: std::views::iota(std::size_t { 0 }, kpiColumns.size()))
+        text += (index == 0 ? "" : "\t") + kpiColumns[index];
+    text += "\n";
+    // The first three figures carry what the tile cases read: a grouped count, a denominator, and a
+    // per-mille share. The rest are ones.
+    constexpr auto LeadingFigures =
+        std::to_array<std::string_view>({ "12884\tcount\t-", "47\tcount\t192", "881\tpermille\t-" });
+    auto const keys = Distributed::FleetKpiKeys();
+    for (auto const index: std::views::iota(std::size_t { 0 }, keys.size()))
+    {
+        text += std::format("{}\t{}\n", keys[index], index < LeadingFigures.size() ? LeadingFigures[index] : "1\tcount\t-");
+    }
+    text += "\n" + marker(FleetSection::Machines) + "endpoint\tname\tzeta-column\tcores\n";
+    for (auto const machine: std::views::iota(std::size_t { 1 }, machines + 1))
+        text += std::format("build-{:02}:7070\t{}\tz{}\t64\n",
+                            machine,
+                            machine == 3 ? std::string { "-" } : std::format("ci-{:02}", machine),
+                            machine);
+    return text;
+}
+
+/// A `fleet` sample carrying @p document, taken @p seconds in.
+/// @param seconds When.
+/// @param document What the fetch produced.
+/// @return The event.
+[[nodiscard]] DashboardEvent FleetSampleOf(int seconds, std::expected<std::string, AdminError> document)
+{
+    return DashboardEvent { .kind = DashboardEventKind::Sample,
+                            .at = TimePoint { std::chrono::seconds { seconds } },
+                            .document = std::move(document) };
+}
+
+/// Draw @p script through the fleet panel, read by the fleet reader, after a `Resize`.
+/// @param script The events after the resize.
+/// @param columns The terminal's width.
+/// @param rows The terminal's height.
+/// @return The frames.
+[[nodiscard]] std::vector<std::string> FleetFramesAt(std::vector<DashboardEvent> script, int columns, int rows)
+{
+    script.insert(script.begin(), DashboardEvent { .kind = DashboardEventKind::Resize, .columns = columns, .rows = rows });
+    auto view = PanelView {
+        FleetPanel(),
+        PanelContext { .absent = std::string { Absent }, .cellWidth = &FakeCellWidth, .rung = RenderRung::Unicode }
+    };
+    auto sink = CollectingSink {};
+    (void) Drive(std::move(script), DashboardLimits {}, view, sink, &ReadFleetSample);
+    return sink.frames;
+}
+
+/// The one frame a fleet of @p machines draws at @p columns by @p rows.
+/// @param machines How many machines.
+/// @param columns The terminal's width.
+/// @param rows The terminal's height.
+/// @return The frame.
+[[nodiscard]] std::string FleetFrameAt(std::size_t machines, int columns, int rows)
+{
+    auto const frames = FleetFramesAt({ FleetSampleOf(1, FleetText(machines)), Tick }, columns, rows);
+    REQUIRE(frames.size() == 1);
+    return frames.front();
+}
+
+/// What follows @p word on the line of @p frame that holds it, spaces trimmed; nullopt without one.
+/// @param frame The frame.
+/// @param word The word.
+/// @return The rest of that line.
+[[nodiscard]] std::optional<std::string> AfterWord(std::string_view frame, std::string_view word)
+{
+    for (auto const& line: Lines(frame))
+        if (auto const at = line.find(word); at != std::string::npos)
+            return Trimmed(std::string_view { line }.substr(at + word.size()));
+    return std::nullopt;
+}
+
+/// How many lines of @p frame start, after the edge and indent, with @p prefix.
+/// @param frame The frame.
+/// @param prefix The start.
+/// @return The count.
+[[nodiscard]] std::size_t LinesStarting(std::string_view frame, std::string_view prefix)
+{
+    return static_cast<std::size_t>(std::ranges::count_if(Lines(frame), [prefix](std::string const& line) {
+        return Columns(line, LabelFrom, FakeCellWidth(prefix)) == prefix;
+    }));
+}
+
+} // namespace
+
+TEST_CASE("a fleet panel before its first reading draws every tile absent, the strip, and no table",
+          "[cli][dashboard][panel][fleet]")
+{
+    // WHAT DISTINGUISHES: every headline key has its tile and each reads the absent marker -- never a
+    // missing tile or a zero -- and where the table goes there is the marker alone, never an empty
+    // table, which would say the fleet has no machines.
+    auto const frames = FleetFramesAt({ Tick }, 132, 40);
+    REQUIRE(frames.size() == 1);
+    auto const& frame = frames.front();
+
+    auto tiles = std::size_t { 0 };
+    for (auto const key: Distributed::FleetKpiKeys())
+    {
+        INFO("tile " << key);
+        auto const after = AfterWord(frame, key);
+        REQUIRE(after.has_value());
+        CHECK(Unwrap(after).starts_with(Absent));
+        ++tiles;
+    }
+    CHECK(tiles == Distributed::FleetKpiKeys().size());
+
+    auto tabs = std::size_t { 0 };
+    for (auto const& row: Distributed::FleetSectionTable)
+        if (row.tabular)
+        {
+            CHECK(frame.contains(row.section == FleetSection::Machines ? std::format("[{}]", row.key)
+                                                                       : std::format(" {} ", row.key)));
+            ++tabs;
+        }
+    CHECK(tabs > 1);
+    CHECK(std::ranges::count_if(
+              Lines(frame),
+              [](std::string const& line) { return Trimmed(Columns(line, 1, FakeCellWidth(line) - 2)) == Absent; })
+          == 1);
+    CHECK(WidestLine(frame) <= 132);
+}
+
+TEST_CASE("a fleet panel draws the section from the header line it was sent, a column it never heard of included",
+          "[cli][dashboard][panel][fleet]")
+{
+    // #1320: no column list lives in this client. WHAT DISTINGUISHES: `zeta-column` is in no table in
+    // this tree and it is drawn, in the order the leader sent it -- a renderer walking a list of its own
+    // draws the columns it knows and loses this one without a word. The tiles are the kpi rows written
+    // in their own units.
+    auto const frame = FleetFrameAt(FleetMachines, 132, 40);
+
+    auto const heading = LineStarting(frame, "endpoint");
+    REQUIRE(heading.has_value());
+    auto const& line = Unwrap(heading);
+    CHECK(line.find("endpoint") < line.find("name"));
+    CHECK(line.find("name") < line.find("zeta-column"));
+    CHECK(line.find("zeta-column") < line.find("cores"));
+
+    auto const second = LineStarting(frame, "build-02:7070");
+    REQUIRE(second.has_value());
+    CHECK(Unwrap(second).contains("ci-02"));
+    CHECK(Unwrap(second).contains("z2"));
+    CHECK(Unwrap(second).contains("64"));
+    auto const third = LineStarting(frame, "build-03:7070");
+    REQUIRE(third.has_value());
+    CHECK(Unwrap(third).contains(Absent)); // the `-` cell, as the absent marker
+    CHECK(LinesStarting(frame, "build-") == FleetMachines);
+
+    auto const keys = Distributed::FleetKpiKeys();
+    REQUIRE(keys.size() >= 3);
+    CHECK(AfterWord(frame, keys[0]).value_or("").starts_with("12 884"));
+    CHECK(AfterWord(frame, keys[1]).value_or("").starts_with("47"));
+    CHECK(AfterWord(frame, keys[1]).value_or("").contains("of 192"));
+    CHECK(AfterWord(frame, keys[2]).value_or("").starts_with("88.1 %"));
+    CHECK(frame.contains(FleetReadingSource));
+}
+
+TEST_CASE("a fleet table's columns go from the right as the terminal narrows, and its first column never does",
+          "[cli][dashboard][panel][fleet]")
+{
+    // Positional, and stated as data. WHAT DISTINGUISHES: at the first width a column goes, the one
+    // gone is the LAST column the leader sent; and at the narrowest width that is still a frame the
+    // first column is there -- one column narrower is the minimum-size line, never a table without it.
+    auto firstDrop = std::optional<int> {};
+    auto narrowestFrame = std::optional<int> {};
+    for (auto const columns: std::views::iota(12, 133) | std::views::reverse)
+    {
+        auto const frame = FleetFrameAt(FleetMachines, columns, 60);
+        if (!frame.starts_with("\xe2\x94\x8c"))
+            break;
+        narrowestFrame = columns;
+        auto const heading = LineStarting(frame, "endpoint");
+        REQUIRE(heading.has_value());
+        if (!Unwrap(heading).contains("cores") && !firstDrop.has_value())
+        {
+            firstDrop = columns;
+            INFO("first column drop at " << columns << ": " << Unwrap(heading));
+            CHECK(Unwrap(heading).contains("zeta-column"));
+            CHECK(Unwrap(heading).contains("name"));
+        }
+    }
+    REQUIRE(firstDrop.has_value());
+    REQUIRE(narrowestFrame.has_value());
+    auto const below = FleetFrameAt(FleetMachines, Unwrap(narrowestFrame) - 1, 60);
+    CHECK(Lines(below).size() == 1);
+    CHECK(below.contains("needs "));
+    CHECK(FakeCellWidth(below) <= static_cast<std::size_t>(Unwrap(narrowestFrame) - 1));
+}
+
+TEST_CASE("a fleet table taller than the terminal keeps its heading and counts what it hides, after all else has gone",
+          "[cli][dashboard][panel][fleet]")
+{
+    // The table is what this panel is for. WHAT DISTINGUISHES: at the tallest height that cannot show
+    // every machine, the strip, the tiles and the source line have ALL gone already, the heading stays,
+    // and `+N more` counts exactly the machines not shown. One line taller shows every machine.
+    auto shrunkAt = std::optional<int> {};
+    for (auto const rows: std::views::iota(4, 41) | std::views::reverse)
+        if (FleetFrameAt(FleetMachines, 132, rows).contains(" more"))
+        {
+            shrunkAt = rows;
+            break;
+        }
+    REQUIRE(shrunkAt.has_value());
+
+    auto const frame = FleetFrameAt(FleetMachines, 132, Unwrap(shrunkAt));
+    CHECK(Lines(frame).size() <= static_cast<std::size_t>(Unwrap(shrunkAt)));
+    CHECK(LineStarting(frame, "endpoint").has_value());
+    CHECK(!frame.contains(Distributed::FleetKpiKeys().front()));
+    CHECK(!frame.contains("[machines]"));
+    CHECK(!frame.contains(FleetReadingSource));
+    auto const shown = LinesStarting(frame, "build-");
+    auto const more = AfterWord(frame, "+");
+    REQUIRE(more.has_value());
+    CHECK(Unwrap(more).starts_with(std::format("{} more ", FleetMachines - shown)));
+
+    auto const taller = FleetFrameAt(FleetMachines, 132, Unwrap(shrunkAt) + 1);
+    CHECK(!taller.contains(" more"));
+    CHECK(LinesStarting(taller, "build-") == FleetMachines);
+}
+
+TEST_CASE("a fleet panel drawn after a failed sample shows no table from before it", "[cli][dashboard][panel][fleet]")
+{
+    // A leader that stopped answering is a gap, not its last fleet. WHAT DISTINGUISHES: the frame after
+    // the refusal has no machine rows and the marker where the table goes, while the frame before it has
+    // every row -- a panel keeping the last document passes the first half and fails the second.
+    auto const frames = FleetFramesAt(
+        { FleetSampleOf(1, FleetText(FleetMachines)),
+          Tick,
+          FleetSampleOf(2, std::unexpected(AdminError { .kind = AdminFailure::Refused, .detail = "not the leader" })),
+          Tick },
+        132,
+        40);
+    REQUIRE(frames.size() == 2);
+    CHECK(LinesStarting(frames[0], "build-") == FleetMachines);
+    CHECK(LinesStarting(frames[1], "build-") == 0);
+    CHECK(AfterWord(frames[1], Distributed::FleetKpiKeys().front()).value_or("").starts_with(Absent));
+}
+
+TEST_CASE("every unit a leader's headline figures carry is one the fleet panel knows how to write",
+          "[cli][dashboard][panel][fleet]")
+{
+    // `KpiUnitTable` is the one place this client reads a unit's name, which is spelled once, file-local,
+    // in `FleetView.cpp`. WHAT DISTINGUISHES: the units come from the leader's own renderer, so a unit
+    // renamed or added there fails here instead of leaving a tile written raw. The control is that the
+    // section has rows at all -- an empty one would pass every check below.
+    auto snapshot = Distributed::FleetSnapshot {};
+    snapshot.role = Distributed::SchedulerRole::Leader;
+    auto const parsed = ParseFleetDocument(RenderFleetText(snapshot, Distributed::FleetHistoryView {}, std::nullopt));
+    REQUIRE(parsed.has_value());
+    auto const* kpi = parsed->Section(FleetSection::Kpi);
+    REQUIRE(kpi != nullptr);
+    REQUIRE(!kpi->rows.empty());
+
+    auto const names = Distributed::FleetColumnNames(FleetSection::Kpi, snapshot);
+    REQUIRE(names.size() >= 3);
+    auto const unitAt = std::ranges::find(kpi->columns, names[2]);
+    REQUIRE(unitAt != kpi->columns.end());
+    auto const unitIndex = static_cast<std::size_t>(unitAt - kpi->columns.begin());
+
+    auto checked = std::size_t { 0 };
+    for (auto const& row: kpi->rows)
+    {
+        auto const& unit = row[unitIndex].lexical;
+        INFO("unit " << unit);
+        CHECK(FindIfOrNull(KpiUnitTable, [&unit](KpiUnit const& known) { return known.name == unit; }) != nullptr);
+        ++checked;
+    }
+    CHECK(checked == kpi->rows.size());
 }
