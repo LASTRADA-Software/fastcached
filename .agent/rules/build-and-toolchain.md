@@ -5026,6 +5026,59 @@ Three rules fall out, each generalising past this change:
   TABLE keyed on the driver NAME, never a sniff for a leading `/` -- on POSIX that starts
   a path, which is the compile-cache rule arriving from the other direction.
 
+### A suite run on a Windows host failed for the HOST, and every entry said it was the tree (#1355)
+
+Three causes, each MEASURED by running the entries on that host, and none of them visible
+from Linux. Each one presented as a defect in the tree under test -- a scan "broken, not the
+tree", a `git` fatal, a shallow clone -- so a lane meeting them either investigated a branch
+that was fine or learned to ignore the names, and an ignored red is a disarmed check.
+
+<!-- table-total: none -->
+
+| where `ctest` ran | cause | what the entries said | what closes it |
+|---|---|---|---|
+| Git Bash, with `MSYS_NO_PATHCONV=1` and `MSYS2_ARG_CONV_EXCL='*'` exported | every check INHERITED the switch, and a check spelling a POSIX path (`pwd` is `/d/...`, `mktemp` is `/tmp/...`) to a native program relies on the conversion it turns off | `mkdocs-validation`: `/d/...\mkdocs.yml does not exist -- the scan is broken, not the tree`; `script-modes-selftest`: `fatal: cannot change to '/tmp/...'`, exit 128; `workflow-script-invocations`: exit 128 and nothing else; `node-reloadable-docs-selftest`: no tracked file carries its marker; `reactor-teardown-gate-selftest`: the canary does not exist; and the `smoke` entry `fastcache-cli-e2e`, registered without the wrapper: the daemon DIED, on a config file `/tmp/.../empty.yaml` that did not exist | every test `src/tests/CMakeLists.txt` registers starts without the switch on Windows, a DEFERRED `ENVIRONMENT_MODIFICATION` so a registration appended later is covered too; `run-check.sh` unsets it as well, for a check run by hand |
+| PowerShell, or a Visual Studio developer shell | a bare `bash` resolved to `C:\Windows\System32\bash.exe`, a launcher for WSL's LINUX bash, ahead of Git on that PATH | 53 of 136 `hygiene` entries: `No such file or directory` | `FASTCACHED_BASH` on Windows is Git for Windows' `bin/bash.exe`, found beside `GIT_EXECUTABLE` and asked for `MSYSTEM` |
+| WSL over DrvFs, in a worktree the Windows git created | the absolute `gitdir:` pointer, which WSL git cannot follow | `workflow-script-invocations`: exit 128, silent; `unguarded-prerequisites-selftest`: *"a shallow clone must fetch depth 0"*; `node-reloadable-docs`: no tracked file carries its marker; `unguarded-prerequisites`: enumerated by directory WALK; `local-gate-selftest`: `no-headers` | `run-check.sh` refuses a check in a git tree the git on PATH cannot read, before it starts, printing `repair-worktree-pointers.sh`'s diagnosis; `local-gate.sh`'s live header case names the same cause |
+
+Measured, with the switch exported: the five wrapped entries fail -- exactly those five --
+with no unset anywhere, and pass with the switch not exported; `fastcache-cli-e2e` failed
+twice running with it and passed twice without. With the deferred property alone, and both
+script-level unsets removed, all six pass. From PowerShell the full native suite ran 4061
+tests with none failing.
+Under WSL in the unreadable worktree, 65 of 168 `hygiene` entries failed and all 65 named the
+unreadable work tree; after `repair-worktree-pointers.sh --apply`, none failed.
+
+- **The conversion switch belongs to the SPAWN that needs it, never to an environment a
+  suite inherits.** The bullet above says to set both spellings, always, and it is right about
+  a compiler invocation. Exported into the shell that then runs `ctest`, the same two lines
+  reach every check, and the entries that break are the ones written correctly for a POSIX
+  host. A check that needs the switch -- `check-banner-probe-identity.sh` -- already pins it
+  itself, which is the only place that can know.
+- **"Git for Windows' bash is the only one there" was a claim nobody had measured**, and it
+  lived in the comment above the registration it justified. A Windows host with WSL has two
+  more, both ahead of Git on PATH in the shells that are not Git Bash. CI's Windows legs run
+  `ctest` from `pwsh` and pass, which says that image puts Git first -- inferred from their
+  being green, not read from a log.
+- **An unreadable work tree is a REFUSAL, not a skip.** A skip is green, and a `hygiene` label
+  reporting green over checks that never asked git anything is the collapse `run-check.sh`
+  exists to remove. What it does NOT cover: a tree with no `.git` entry and a host with no
+  git both still run, by the walk their checks carry, since neither has a git answer to be
+  wrong about.
+- **The ticket named six entries and they were two things.** Five were the conversion switch.
+  The sixth, `e2e-helpers-selftest`, is not registered on Windows at all -- `if(NOT WIN32)`
+  since `26d8ac60`, before the ticket -- and its reported "120 s" was the CALLER's foreground
+  cap on a run by hand that exited 0, not the registration's `TIMEOUT 120`. Under WSL it
+  took 69 s at `-j 8`.
+- **And a full run found one more that no single-entry run would.** `RefusalNotice: two
+  daemons and two causes throttle separately` failed once at `-j 16` and passed alone. It
+  wrote its stamps into a bare `UniqueScratchPath`, never cleared and never removed, at a
+  FIXED epoch -- so a leftover from an earlier run whose pid Windows handed out again read as
+  *announced a second ago*. Staged by planting a leftover for every multiple of 4 below 65536
+  (76 real ones were already in `%TEMP%`): 5 of 5 runs failed, and 0 of 5 once the case took
+  `ScratchDirectory`, which clears first. A pid separates LIVE processes; it does not separate
+  a live one from a dead one's leftovers unless something clears them.
+
 ## What the TSan scope covers, and the three ways it has been wrong
 
 The scope is **one Catch2 tag expression**, living in `scripts/tsan-gate.sh`'s `TARGETS`

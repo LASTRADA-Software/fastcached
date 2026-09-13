@@ -2907,6 +2907,13 @@ src/apps/fastcached/Main.hpp"
     # that would have been RED on every lane worktree before #1040, and it is the
     # one that fires for layout number four without anybody editing this file.
     _live="$(header_filter_coverage "${repo_root}/.clang-tidy" "$repo_root")"
+    # In a work tree the git on PATH cannot read, `no-headers` is true and names the
+    # wrong cause: it sends the reader to `.clang-tidy`, which is fine. The main path
+    # refuses that state through the pointer diagnosis, so this case says so too (#1355).
+    if [[ "$_live" == no-headers* ]] \
+        && ! bash "$(dirname "${BASH_SOURCE[0]}")/repair-worktree-pointers.sh" "$repo_root" >/dev/null 2>&1; then
+        _live="unreadable-work-tree -- git cannot read ${repo_root}, so no header was counted; bash scripts/repair-worktree-pointers.sh names the remedy"
+    fi
     expect "this tree's own .clang-tidy covers every tracked header" \
         "covers-all" \
         "$([[ "${_live%% *}" == *"/"* && "${_live%%/*}" == "${_live##*/}" ]] \

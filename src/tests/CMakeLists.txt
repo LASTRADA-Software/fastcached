@@ -234,15 +234,83 @@ set(FASTCACHED_SCRIPT_CHECK_FAILED "CMake Error|CMake Warning")
 # interpreter is chosen from PATH at RUN time; naming `/bin/bash` removes a live
 # dependency on PATH ordering rather than fixing a present defect.
 #
-# Windows has no `/bin/bash`, so it keeps the PATH lookup -- Git for Windows'
-# bash is the only one there and nothing is being selected between. The rule is
-# about macOS's system interpreter, and this is the one place that says so.
+# Windows has no `/bin/bash`, and it does NOT keep the PATH lookup either (#1355). This
+# paragraph used to say Git for Windows' bash "is the only one there and nothing is being
+# selected between", and that is MEASURED FALSE: a Windows host with WSL carries
+# `C:\Windows\System32\bash.exe` and `%LOCALAPPDATA%\Microsoft\WindowsApps\bash.exe`, both
+# launchers for LINUX bash, and on this project's development machine both come ahead of
+# Git on the PATH a PowerShell or a Visual Studio developer shell hands `ctest`. Every script
+# test then starts under Linux bash with a Windows path and answers "No such file or
+# directory" -- 53 of 136 `hygiene` entries in one run, measured, each reading as a defect in
+# the tree. CI's Windows legs run `ctest` from `pwsh` as well (the step names no shell) and
+# pass, which says that image puts Git first; that is inferred from their being green, not
+# read from a log.
+#
+# So Windows asks for Git's own `bin/bash.exe`, found beside the git `cmake/Version.cmake`
+# already located. `bin/` and not `usr/bin/`: the first is Git's launcher, which sets
+# `MSYSTEM` and puts `/usr/bin` on PATH, while the second started from PowerShell finds no
+# `sed`, `grep` or `mktemp` at all (measured). Each candidate is ASKED for `MSYSTEM`, which
+# Linux bash and a bare `usr/bin/bash.exe` both leave empty, because an existing file is not
+# an interpreter that runs. Nothing found keeps the bare name and says so at configure.
+# The bash 3.2 rule is about macOS's system interpreter, and this is the one place that
+# says so.
 #
 # One variable rather than twenty-nine literals, and `check-script-interpreter`
 # asserts every registration uses it. A literal `/bin/bash` is refused too: it
 # would be correct today and break the Windows rows the day somebody adds one.
 if(WIN32)
     set(FASTCACHED_BASH bash)
+    file(TO_CMAKE_PATH "$ENV{ProgramFiles}" _programFiles)
+    set(_gitBashCandidates "${_programFiles}/Git/bin/bash.exe")
+    if(GIT_EXECUTABLE)
+        # `cmd/git.exe` and `bin/git.exe` sit one level below Git's root, `mingw64/bin/git.exe` two.
+        get_filename_component(_gitDir "${GIT_EXECUTABLE}" DIRECTORY)
+        list(PREPEND _gitBashCandidates "${_gitDir}/../bin/bash.exe" "${_gitDir}/../../bin/bash.exe")
+    endif()
+    foreach(_gitBash IN LISTS _gitBashCandidates)
+        if(NOT EXISTS "${_gitBash}")
+            continue()
+        endif()
+        set(_gitBashSystem "")
+        execute_process(
+            COMMAND "${_gitBash}" -c "printf '%s' \"\${MSYSTEM:-}\""
+            OUTPUT_VARIABLE _gitBashSystem
+            ERROR_QUIET
+            ENCODING NONE
+            # A configure blocked in a subprocess writes nothing and reads as a hang.
+            TIMEOUT 30
+        )
+        if(_gitBashSystem)
+            get_filename_component(FASTCACHED_BASH "${_gitBash}" ABSOLUTE)
+            break()
+        endif()
+    endforeach()
+    if(FASTCACHED_BASH STREQUAL "bash")
+        message(STATUS "[bash] no Git for Windows bin/bash.exe answered, so script tests take `bash` from PATH at run time -- where a WSL launcher can come first")
+    else()
+        message(STATUS "[bash] script tests run under ${FASTCACHED_BASH}")
+    endif()
+
+    # And no test inherits the caller's MSYS path-conversion switch (#1355). A Git Bash that
+    # exported `MSYS_NO_PATHCONV=1` / `MSYS2_ARG_CONV_EXCL='*'` -- which the rulebook tells a
+    # developer driving MSVC to do -- handed it to every script `ctest` started, and a script
+    # spelling a POSIX path to a native program depends on the conversion it switches off.
+    # Measured: `fastcache-cli-e2e` started `fastcached.exe` on `/tmp/.../empty.yaml` and
+    # reported the daemon DIED, deterministically, and only with the switch exported.
+    #
+    # Every test in this directory rather than a list of the ones seen failing: a list is exact
+    # about what it knows and silent about the next. DEFERRED to the end of this directory, so a
+    # registration appended below this line is covered too. A script that needs the switch pins
+    # it itself (`check-banner-probe-identity.sh`), and `run-check.sh` unsets it as well, for a
+    # check run by hand outside `ctest`.
+    function(_fastcached_unset_msys_conversion)
+        get_property(_tests DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" PROPERTY TESTS)
+        foreach(_test IN LISTS _tests)
+            set_property(TEST "${_test}" APPEND PROPERTY ENVIRONMENT_MODIFICATION
+                "MSYS_NO_PATHCONV=unset:" "MSYS2_ARG_CONV_EXCL=unset:")
+        endforeach()
+    endfunction()
+    cmake_language(DEFER CALL _fastcached_unset_msys_conversion)
 else()
     set(FASTCACHED_BASH /bin/bash)
 endif()
@@ -325,19 +393,29 @@ endfunction()
 # candidates are therefore named, most-specific first, and each is ASKED its version --
 # registering an unchecked find would put the interpreter question back where it started
 # behind a variable named as though it had been answered.
+#
+# NOT ASKED ON WINDOWS (#1355). Its one consumer, `tidy-sweep-selftest`, is registered only
+# off Windows, and PATH's `bash` there can be a WSL launcher: measured, the probe started a
+# Linux interpreter at configure and printed `[bash44] C:/Windows/System32/bash.exe is 5.2`
+# for a variable nothing on that host reads.
 set(FASTCACHED_BASH44 "")
 set(FASTCACHED_BASH44_VERSION "")
-find_program(FASTCACHED_BASH44_ON_PATH NAMES bash)
-set(_bashCandidates
-    /opt/homebrew/bin/bash          # Homebrew, Apple Silicon
-    /usr/local/bin/bash             # Homebrew, Intel
-    "${FASTCACHED_BASH44_ON_PATH}"  # whatever PATH offers
-    /bin/bash)                      # the system interpreter, last
+set(_bashCandidates "")
+if(NOT WIN32)
+    find_program(FASTCACHED_BASH44_ON_PATH NAMES bash)
+    set(_bashCandidates
+        /opt/homebrew/bin/bash          # Homebrew, Apple Silicon
+        /usr/local/bin/bash             # Homebrew, Intel
+        "${FASTCACHED_BASH44_ON_PATH}"  # whatever PATH offers
+        /bin/bash)                      # the system interpreter, last
+endif()
 # On a stock macOS the third and fourth are the SAME binary -- PATH's `bash` IS
 # `/bin/bash` there, which is the measurement this whole block rests on -- so without
 # this the 3.2 interpreter is spawned and version-probed twice, on exactly the host
 # where the answer is "no candidate qualifies" and all four are tried.
-list(REMOVE_DUPLICATES _bashCandidates)
+if(_bashCandidates)
+    list(REMOVE_DUPLICATES _bashCandidates)
+endif()
 foreach(_bashCandidate IN LISTS _bashCandidates)
     if(NOT _bashCandidate OR NOT EXISTS "${_bashCandidate}")
         continue()
@@ -357,7 +435,9 @@ foreach(_bashCandidate IN LISTS _bashCandidates)
     endif()
 endforeach()
 
-if(FASTCACHED_BASH44)
+if(WIN32)
+    message(STATUS "[bash44] not probed on Windows, where tidy-sweep's self-test is not registered")
+elseif(FASTCACHED_BASH44)
     message(STATUS "[bash44] ${FASTCACHED_BASH44} is ${FASTCACHED_BASH44_VERSION}")
 else()
     message(STATUS

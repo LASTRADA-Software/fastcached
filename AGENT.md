@@ -1394,7 +1394,11 @@ what differs between compilers, standard libraries, hosts and tool versions.
   a coverage check then reported CLEAN over the six files it exists to read. Drop flags from a TABLE
   keyed on the driver NAME, never by sniffing a leading `/`. And a mode that NAMES its set may not
   report clean over a member it could not cover. Knowing a rule and having just applied it is not
-  protection: the ENOEXEC was the same author's own fix from three hours earlier.
+  protection: the ENOEXEC was the same author's own fix from three hours earlier. **And that switch
+  belongs to the SPAWN, never to an environment `ctest` inherits** — exported, it broke six entries
+  that read as tree defects, so no test in `src/tests` inherits it on Windows; Windows script tests run Git's
+  `bin/bash.exe`, because WSL's launchers come first on PowerShell's PATH; and a check in a work tree
+  the git on PATH cannot read is REFUSED, never run over a walk (#1355).
 
 **[`.agent/rules/testing.md`](.agent/rules/testing.md)** — how tests are registered
 and what they may assume.

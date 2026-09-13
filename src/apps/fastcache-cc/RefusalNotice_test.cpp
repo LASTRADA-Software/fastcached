@@ -32,8 +32,11 @@ TEST_CASE("RefusalNotice: a refusal about the daemon is persistent, one about th
 
 TEST_CASE("RefusalNotice: a thousand units produce one line, not a thousand", "[launcher]")
 {
-    auto const dir = FastCache::Testing::UniqueScratchPath("refusal-throttle");
-    std::filesystem::create_directories(dir);
+    // `ScratchDirectory`, never a bare `UniqueScratchPath`: the stamps are written at a FIXED
+    // epoch and a bare path is never cleared, so a leftover from an earlier run whose pid
+    // Windows handed out again reads as "announced a second ago" (#1355).
+    auto const scratch = FastCache::Testing::ScratchDirectory { "refusal-throttle" };
+    auto const& dir = scratch.Path();
 
     // The defect this exists to prevent is silence; the defect it must not introduce
     // is a line per translation unit. Both directions asserted, because a throttle
@@ -53,8 +56,11 @@ TEST_CASE("RefusalNotice: a thousand units produce one line, not a thousand", "[
 
 TEST_CASE("RefusalNotice: two daemons and two causes throttle separately", "[launcher]")
 {
-    auto const dir = FastCache::Testing::UniqueScratchPath("refusal-keys");
-    std::filesystem::create_directories(dir);
+    // `ScratchDirectory`, never a bare `UniqueScratchPath`: the stamps are written at a FIXED
+    // epoch and a bare path is never cleared, so a leftover from an earlier run whose pid
+    // Windows handed out again reads as "announced a second ago" (#1355).
+    auto const scratch = FastCache::Testing::ScratchDirectory { "refusal-keys" };
+    auto const& dir = scratch.Path();
 
     CHECK(ShouldAnnounceRefusal(dir, "a:1", Wire::ErrorCode::UnsupportedVersion, Epoch));
 
