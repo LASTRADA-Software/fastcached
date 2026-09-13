@@ -24,6 +24,26 @@ namespace FastCache
 
 namespace
 {
+    /// A stop signal whose wait blocks a thread: the two hops every platform takes around it.
+    ///
+    /// Written once here, so what differs between platforms is only how the thread blocks.
+    class BlockingStopSignal: public IStopSignal
+    {
+      public:
+        [[nodiscard]] Task<StopWake> Stopped(IExecutor* waiter, IExecutor* resumeOn) final
+        {
+            co_await ResumeOn { *waiter };
+            auto const wake = WaitBlocking();
+            co_await ResumeOn { *resumeOn };
+            co_return wake;
+        }
+
+      private:
+        /// Block the calling thread until a stop is requested or the signal is cancelled.
+        /// @return Why the wait ended; `Cancelled` wins when both have happened.
+        [[nodiscard]] virtual StopWake WaitBlocking() const = 0;
+    };
+
 #if defined(_WIN32)
 
     /// The event the console control handler sets; null when no stop signal is installed.
@@ -84,7 +104,7 @@ namespace
         HANDLE _handle { nullptr };
     };
 
-    class WindowsStopSignal final: public IStopSignal
+    class WindowsStopSignal final: public BlockingStopSignal
     {
       public:
         WindowsStopSignal() = default;
@@ -126,14 +146,6 @@ namespace
             return {};
         }
 
-        [[nodiscard]] Task<StopWake> Stopped(IExecutor* waiter, IExecutor* resumeOn) override
-        {
-            co_await ResumeOn { *waiter };
-            auto const wake = WaitBlocking();
-            co_await ResumeOn { *resumeOn };
-            co_return wake;
-        }
-
         void Cancel() noexcept override
         {
             (void) ::SetEvent(_cancel.Handle());
@@ -142,7 +154,7 @@ namespace
       private:
         /// Block until either event is set.
         /// @return Why the wait ended.
-        [[nodiscard]] StopWake WaitBlocking() const
+        [[nodiscard]] StopWake WaitBlocking() const override
         {
             // Cancel FIRST: `WaitForMultipleObjects` names the lowest index when both are set,
             // and a session that is already closing has decided how it ends.
@@ -240,7 +252,7 @@ namespace
         std::array<int, 2> _ends { -1, -1 };
     };
 
-    class PosixStopSignal final: public IStopSignal
+    class PosixStopSignal final: public BlockingStopSignal
     {
       public:
         PosixStopSignal() = default;
@@ -288,14 +300,6 @@ namespace
             return {};
         }
 
-        [[nodiscard]] Task<StopWake> Stopped(IExecutor* waiter, IExecutor* resumeOn) override
-        {
-            co_await ResumeOn { *waiter };
-            auto const wake = WaitBlocking();
-            co_await ResumeOn { *resumeOn };
-            co_return wake;
-        }
-
         void Cancel() noexcept override
         {
             auto const byte = char { 1 };
@@ -308,7 +312,7 @@ namespace
         /// Neither byte is ever read, which is what keeps both outcomes sticky: a readable
         /// pipe stays readable for every later wait.
         /// @return Why the wait ended.
-        [[nodiscard]] StopWake WaitBlocking() const
+        [[nodiscard]] StopWake WaitBlocking() const override
         {
             auto fds = std::array<pollfd, 2> {
                 pollfd { .fd = _cancel.Reader(), .events = POLLIN, .revents = 0 },
