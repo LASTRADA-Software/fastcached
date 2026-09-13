@@ -2,16 +2,20 @@
 #pragma once
 
 #include "DashboardEvent.hpp"
+#include "DashboardFrame.hpp"
 #include "TerminalCapabilities.hpp"
 #include "TerminalEvents.hpp"
 
 #include <FastCache/Async/IExecutor.hpp>
 #include <FastCache/Async/Task.hpp>
 
+#include <expected>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include <tui/InputEvent.hpp>
@@ -52,8 +56,21 @@ namespace FastCache::Cli
 /// (EOF, hang-up, a failed wait), so it ends the stream with `Detached` after whatever came
 /// before it.
 /// @param outcome What the wait returned.
+/// @param cellPixels The cell size every resize in @p outcome carries: what was read after this wait.
 /// @return The events, possibly none.
-[[nodiscard]] std::vector<DashboardEvent> ToDashboardEvents(tui::runtime::WaitOutcome const& outcome);
+[[nodiscard]] std::vector<DashboardEvent> ToDashboardEvents(tui::runtime::WaitOutcome const& outcome,
+                                                            std::optional<CellPixelSize> cellPixels);
+
+/// What endo's answer to `CSI 16 t` says about the cell size, in the dashboard's vocabulary.
+///
+/// **Only a size both of whose sides are positive is one.** A reply of `CSI 6 ; 0 ; 0 t` is a terminal
+/// saying it does not know, and an image sized from it would be empty; it is nullopt exactly as a
+/// terminal that stayed silent is, because the Sixel rung is decided on having a size, never on why
+/// there is none.
+/// @param answer endo's `queryCellSize` answer: width then height in pixels, or why there is none.
+/// @return The size, or nullopt.
+[[nodiscard]] std::optional<CellPixelSize> ToCellPixelSize(
+    std::expected<std::pair<int, int>, tui::QueryUnanswered> const& answer) noexcept;
 
 /// What endo's DA1 answer says about Sixel, in the dashboard's vocabulary.
 ///
@@ -122,6 +139,22 @@ struct TerminalScreenBytes
 /// @return The bytes.
 [[nodiscard]] std::string FrameBytes(std::string_view frame, bool synchronized);
 
+/// One frame with its images, as it goes on the wire: the text rows exactly as `FrameBytes` writes
+/// them, then each image at its own cell, inside the same synchronized-output bracket.
+///
+/// **The images go on AFTER every row.** A row is erased and written over its whole width, and on a
+/// terminal that draws Sixel an erase or a character on a cell removes the image there, so an image
+/// written first would be taken off again by the row it sits in. Each is written as `CSI <row>;<column> H`
+/// and then the image, framed by endo's `writeSixel`, because a Sixel image is drawn from the cursor.
+///
+/// **A later frame without an image leaves none of it behind, with nothing remembered here.** Every
+/// frame erases each of its rows and everything below its last before writing, so the cells an earlier
+/// image covered are repainted by whatever the new frame puts there, text or blank.
+/// @param frame The composed frame and the images placed over it.
+/// @param synchronized Whether to bracket it in synchronized output.
+/// @return The bytes.
+[[nodiscard]] std::string FrameBytes(DashboardFrame const& frame, bool synchronized);
+
 /// What a terminal event stream is built from.
 struct TerminalStreamParts
 {
@@ -137,6 +170,12 @@ struct TerminalStreamParts
     /// The geometry at open, delivered as the first event.
     int columns { 0 };
     int rows { 0 };
+    /// The cell size at open, carried by that first event.
+    std::optional<CellPixelSize> cellPixels {};
+    /// Asks the terminal for its cell size again. BLOCKS for up to a query's deadline, so it runs on
+    /// `pool`, after a wait that delivered a resize and before the next wait. Empty means the cell size
+    /// is never asked again and every later resize carries none.
+    std::function<std::optional<CellPixelSize>()> rereadCellPixels {};
 };
 
 /// An `IDashboardEventSource` over @p parts.
@@ -150,6 +189,13 @@ struct TerminalStreamParts
 /// worth rather than dozens, and what is delivered is the latest geometry. A resize separated from
 /// an earlier one by any other event is delivered separately, so the order of keys and resizes is
 /// kept.
+///
+/// **A resize carries the cell size read AFTER it.** A font change resizes the grid and the cells
+/// together, so a size remembered from before the resize could be the wrong one. After a wait that
+/// delivered a resize, `rereadCellPixels` asks the terminal again, on the pool and before the next
+/// wait, so the query's reply is read by the same thread that reads the input, with nothing parked
+/// beside it. One question per wait, however many resizes it delivered. With no `rereadCellPixels`,
+/// every resize after the first carries none.
 ///
 /// **Lifetime.** A `Next()` parked in the wait holds the stream. Close it and let that `Next()`
 /// resume before destroying the stream, which is the order `RunDashboard` already follows.
@@ -187,6 +233,16 @@ class ITerminalDevice
     /// @return The answer, `NoReply` included.
     [[nodiscard]] virtual SynchronizedOutputAnswer AskSynchronizedOutput() = 0;
 
+    /// How many pixels a cell of the acquired terminal measures, as it answered `CSI 16 t` while being
+    /// acquired: under the same deadline, and through the same raw-mode read, as DA1. Called on the pool.
+    /// @return The size, or nullopt when the terminal did not report one.
+    [[nodiscard]] virtual std::optional<CellPixelSize> AskCellPixels() = 0;
+
+    /// Ask the acquired terminal for its cell size again (`CSI 16 t`), now. BLOCKS for up to the query
+    /// deadline; called on the pool, between two waits in `Events()`, after a resize.
+    /// @return The size, or nullopt when the terminal did not report one.
+    [[nodiscard]] virtual std::optional<CellPixelSize> RereadCellPixels() = 0;
+
     /// @return What the environment says the terminal draws. Called on the pool.
     [[nodiscard]] virtual TerminalTextEncoding Encoding() = 0;
 
@@ -221,10 +277,14 @@ class ITerminalDevice
 
 /// `StartTerminal` over any device: the two-hop, the restore guard, the screen and the record.
 ///
-/// Hops to @p pool, acquires the device, asks it for Sixel and synchronized output, enters the
-/// alternate screen, reads the encoding, hops back to @p resumeOn and only then returns. On every
-/// exit but success -- a refused acquisition, or an exception after the terminal was already in raw
-/// mode or on the alternate screen -- the screen is left if it was entered and the device is
+/// Hops to @p pool, acquires the device, asks it for Sixel, synchronized output and its cell size,
+/// enters the alternate screen, reads the encoding, hops back to @p resumeOn and only then returns.
+/// The events ask for the cell size again after each resize only when the start got one: a terminal
+/// that did not answer at start is not asked again, since its rung is not Sixel and each unanswered
+/// question costs a deadline.
+///
+/// On every exit but success -- a refused acquisition, or an exception after the terminal was already
+/// in raw mode or on the alternate screen -- the screen is left if it was entered and the device is
 /// restored, before the result is handed back. On success the device is shared by the returned
 /// events, which leave the screen and restore the device when they are destroyed, and the frame
 /// presenter.

@@ -112,11 +112,11 @@ struct StartedTerminal
 
     /// Where frames are drawn: the alternate screen.
     ///
-    /// It owns presentation, so no escape byte lives in a panel or in the composition. Each
-    /// `Present` moves the cursor home, writes the frame, and clears to the end of the screen --
-    /// bracketed in synchronized output (DEC mode 2026) exactly when `capabilities` says
-    /// `SynchronizedOutputAnswer::Supported`. A terminal that did not answer gets unsynchronized
-    /// frames, and never a wait.
+    /// It owns presentation, so no escape byte lives in a panel or in the composition. Each frame
+    /// places every row itself and erases what the previous frame left, then writes the frame's images
+    /// at their cells (`PresentPlaced`) -- all of it bracketed in synchronized output (DEC mode 2026)
+    /// exactly when `capabilities` says `SynchronizedOutputAnswer::Supported`. A terminal that did not
+    /// answer gets unsynchronized frames, and never a wait.
     ///
     /// Call `Present` on the thread that awaits `events`, and not after `events` is destroyed: the
     /// terminal is put back by then, so a late frame would land on the operator's own screen.
@@ -148,8 +148,9 @@ struct StartedTerminal
 /// Acquire @p terminal and learn what it can draw.
 ///
 /// Hops to the pool; refuses unless stdin and stdout are both a terminal; enters raw mode; asks
-/// for the device attributes (DA1, for Sixel) and for DEC mode 2026 (DECRQM, for synchronized
-/// output); reads the text encoding behind `Platform/Terminal`; enters the alternate screen and
+/// for the cell size in pixels (`CSI 16 t`, which the Sixel rung needs and the events ask again after
+/// each resize), for the device attributes (DA1, for Sixel) and for DEC mode 2026 (DECRQM, for
+/// synchronized output); reads the text encoding behind `Platform/Terminal`; enters the alternate screen and
 /// hides the cursor; then hops back to `resumeOn` before returning. Input typed while the queries
 /// were in flight is kept and arrives from `events`.
 ///

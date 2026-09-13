@@ -11,7 +11,9 @@
 #include <deque>
 #include <exception>
 #include <mutex>
+#include <optional>
 #include <ranges>
+#include <span>
 #include <string_view>
 #include <utility>
 #include <variant>
@@ -109,10 +111,13 @@ namespace
             _source { parts.source },
             _pool { parts.pool },
             _resumeOn { parts.resumeOn },
-            _wake { std::move(parts.wake) }
+            _wake { std::move(parts.wake) },
+            _rereadCellPixels { std::move(parts.rereadCellPixels) }
         {
-            _ready.push_back(
-                DashboardEvent { .kind = DashboardEventKind::Resize, .columns = parts.columns, .rows = parts.rows });
+            _ready.push_back(DashboardEvent { .kind = DashboardEventKind::Resize,
+                                              .columns = parts.columns,
+                                              .rows = parts.rows,
+                                              .cellPixels = parts.cellPixels });
         }
 
         [[nodiscard]] Task<DashboardEvent> Next() override
@@ -141,11 +146,18 @@ namespace
                 // hop back: the stream's state belongs to the thread `Next()` is awaited on.
                 co_await ResumeOn { *_pool };
                 auto outcome = _source->wait(timeoutMs);
+                // Still on the pool, before the next wait: the query reads its reply from the input
+                // this wait just finished reading, and hands back anything else it reads there.
+                auto const reread =
+                    _rereadCellPixels && std::ranges::any_of(outcome.events, [](tui::InputEvent const& input) {
+                        return std::holds_alternative<tui::ResizeEvent>(input);
+                    });
+                auto const measured = reread ? _rereadCellPixels() : std::nullopt;
                 co_await ResumeOn { *_resumeOn };
 
                 // A short wait that came back empty has had its chance to settle a lone ESC.
                 _inputJustArrived = !(timeoutMs >= 0 && outcome.events.empty());
-                for (auto& event: ToDashboardEvents(outcome))
+                for (auto& event: ToDashboardEvents(outcome, measured))
                     Enqueue(std::move(event));
             }
         }
@@ -175,6 +187,7 @@ namespace
         IExecutor* _pool;
         IExecutor* _resumeOn;
         std::function<void()> _wake;
+        std::function<std::optional<CellPixelSize>()> _rereadCellPixels;
         std::deque<DashboardEvent> _ready;
         std::string _ended;
         std::atomic<bool> _closed { false };
@@ -293,6 +306,11 @@ namespace
         }
 
         void Present(std::string_view frame) override
+        {
+            _device->Write(FrameBytes(frame, _synchronized));
+        }
+
+        void PresentPlaced(DashboardFrame const& frame) override
         {
             _device->Write(FrameBytes(frame, _synchronized));
         }
@@ -430,35 +448,60 @@ bool PresentsSynchronized(TerminalCapabilities const& capabilities) noexcept
     return capabilities.synchronizedOutput == SynchronizedOutputAnswer::Supported;
 }
 
+namespace
+{
+    /// `FrameBytes`, with or without images: the rows, then @p placements, in one bracket.
+    [[nodiscard]] std::string RowsThenPlacements(std::string_view frame,
+                                                 std::span<FramePlacement const> placements,
+                                                 bool synchronized)
+    {
+        if (frame.ends_with('\n'))
+            frame.remove_suffix(1);
+
+        auto output = CapturedOutput {};
+        if (synchronized)
+            output.writeRaw(SyncBegin);
+
+        // Everything from the frame's last row down is erased FIRST, and each row is erased before it is
+        // written, never after: an erase starts AT the cursor, and a row as wide as the screen leaves the
+        // cursor on its own last cell, so erasing after writing it would take that cell with it. Placing
+        // the clear below the frame instead would put it on a row the screen may not have, clamped to the
+        // bottom one.
+        auto const rows = frame.empty() ? 0 : std::ranges::count(frame, '\n') + 1;
+        output.moveTo(static_cast<int>(std::max<std::ptrdiff_t>(rows, 1)), 1);
+        output.clearToEndOfDisplay();
+        auto row = 1;
+        for (auto const line: frame | std::views::split('\n'))
+        {
+            output.moveTo(row, 1);
+            output.clearToEndOfLine();
+            output.writeRaw(std::string_view { line.begin(), line.end() });
+            ++row;
+        }
+
+        // After every row, or a row's erase and text would take the image off its cells again. Each
+        // from its own position: a Sixel image is drawn from the cursor, and where the cursor is left
+        // afterwards is the terminal's Sixel scrolling mode, not anything this frame decided.
+        for (auto const& placement: placements)
+        {
+            output.moveTo(static_cast<int>(placement.row), static_cast<int>(placement.column));
+            output.writeSixel(placement.sixel);
+        }
+
+        if (synchronized)
+            output.writeRaw(SyncEnd);
+        return output.Take();
+    }
+} // namespace
+
 std::string FrameBytes(std::string_view frame, bool synchronized)
 {
-    if (frame.ends_with('\n'))
-        frame.remove_suffix(1);
+    return RowsThenPlacements(frame, {}, synchronized);
+}
 
-    auto output = CapturedOutput {};
-    if (synchronized)
-        output.writeRaw(SyncBegin);
-
-    // Everything from the frame's last row down is erased FIRST, and each row is erased before it is
-    // written, never after: an erase starts AT the cursor, and a row as wide as the screen leaves the
-    // cursor on its own last cell, so erasing after writing it would take that cell with it. Placing
-    // the clear below the frame instead would put it on a row the screen may not have, clamped to the
-    // bottom one.
-    auto const rows = frame.empty() ? 0 : std::ranges::count(frame, '\n') + 1;
-    output.moveTo(static_cast<int>(std::max<std::ptrdiff_t>(rows, 1)), 1);
-    output.clearToEndOfDisplay();
-    auto row = 1;
-    for (auto const line: frame | std::views::split('\n'))
-    {
-        output.moveTo(row, 1);
-        output.clearToEndOfLine();
-        output.writeRaw(std::string_view { line.begin(), line.end() });
-        ++row;
-    }
-
-    if (synchronized)
-        output.writeRaw(SyncEnd);
-    return output.Take();
+std::string FrameBytes(DashboardFrame const& frame, bool synchronized)
+{
+    return RowsThenPlacements(frame.text, frame.placements, synchronized);
 }
 
 SynchronizedOutputAnswer ToSynchronizedOutputAnswer(tui::DecModeStatus status) noexcept
@@ -501,7 +544,8 @@ std::string KeyBytes(tui::KeyEvent const& key)
     return bytes;
 }
 
-std::vector<DashboardEvent> ToDashboardEvents(tui::runtime::WaitOutcome const& outcome)
+std::vector<DashboardEvent> ToDashboardEvents(tui::runtime::WaitOutcome const& outcome,
+                                              std::optional<CellPixelSize> cellPixels)
 {
     auto events = std::vector<DashboardEvent> {};
     for (auto const& input: outcome.events)
@@ -513,13 +557,25 @@ std::vector<DashboardEvent> ToDashboardEvents(tui::runtime::WaitOutcome const& o
         }
         else if (auto const* resize = std::get_if<tui::ResizeEvent>(&input))
         {
-            events.push_back(
-                DashboardEvent { .kind = DashboardEventKind::Resize, .columns = resize->columns, .rows = resize->rows });
+            events.push_back(DashboardEvent { .kind = DashboardEventKind::Resize,
+                                              .columns = resize->columns,
+                                              .rows = resize->rows,
+                                              .cellPixels = cellPixels });
         }
     }
     if (outcome.interrupted)
         events.push_back(DashboardEvent { .kind = DashboardEventKind::Detached, .note = "the terminal's input closed" });
     return events;
+}
+
+std::optional<CellPixelSize> ToCellPixelSize(std::expected<std::pair<int, int>, tui::QueryUnanswered> const& answer) noexcept
+{
+    if (!answer.has_value())
+        return std::nullopt;
+    auto const [width, height] = *answer;
+    if (width <= 0 || height <= 0)
+        return std::nullopt;
+    return CellPixelSize { .width = static_cast<std::size_t>(width), .height = static_cast<std::size_t>(height) };
 }
 
 SixelAnswer ToSixelAnswer(std::expected<tui::DeviceAttributesReport, tui::QueryUnanswered> const& attributes) noexcept
@@ -566,6 +622,7 @@ Task<std::expected<StartedTerminal, std::string>> StartTerminalDevice(std::uniqu
             auto record = TerminalCapabilities {};
             record.sixel = device->AskSixel();
             record.synchronizedOutput = device->AskSynchronizedOutput();
+            record.cellPixels = device->AskCellPixels();
             auto const& enter = ScreenBytes().enter;
             guard.ScreenEntering();
             device->Write(enter);
@@ -588,14 +645,23 @@ Task<std::expected<StartedTerminal, std::string>> StartTerminalDevice(std::uniqu
     // stood down with nothing between them. The guard's pointer names the device object, never an
     // owner, so it stays valid across every move.
     auto shared = std::shared_ptr<ITerminalDevice> { std::move(device) };
-    auto stream = MakeTerminalEventStream(TerminalStreamParts {
+    auto parts = TerminalStreamParts {
         .source = &shared->Events(),
         .pool = pool,
         .resumeOn = resumeOn,
         .wake = [raw = shared.get()] { raw->Wake(); },
         .columns = shared->Columns(),
         .rows = shared->Rows(),
-    });
+        .cellPixels = capabilities->cellPixels,
+        .rereadCellPixels = {},
+    };
+    // Asked again only of a terminal that answered once: one that did not is not drawn on the Sixel
+    // rung, so a size would change nothing, and every resize would cost it the query's deadline.
+    if (capabilities->cellPixels.has_value())
+        parts.rereadCellPixels = [raw = shared.get()] {
+            return raw->RereadCellPixels();
+        };
+    auto stream = MakeTerminalEventStream(std::move(parts));
     auto restore = std::make_shared<TerminalRestoreHandle>(shared.get(), RestoreNowLeading());
     auto frames = std::make_unique<TerminalFramePresenter>(shared, PresentsSynchronized(*capabilities));
     auto events = std::make_unique<StartedTerminalEvents>(shared, std::move(stream), restore);
