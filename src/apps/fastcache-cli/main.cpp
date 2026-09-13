@@ -26,6 +26,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <format>
 #include <fstream>
 #include <iostream>
 #include <memory>
@@ -324,6 +325,7 @@ class StopReactorOnExit
 
     auto ending = verb.session(context,
                                LiveSessionSeat { .reactor = &reactor,
+                                                 .address = std::format("{}:{}", command.cache.host, command.cache.port),
                                                  .clock = &clock,
                                                  .dialer = &redial,
                                                  .samplePool = &samplePool,

@@ -88,6 +88,29 @@ namespace
     };
 } // namespace
 
+namespace
+{
+    /// Presents through a source's presenter while it exists, and drops frames after.
+    class GatedFrames final: public IFrameSink
+    {
+      public:
+        /// @param presenter The source's presenter slot; outlives this.
+        explicit GatedFrames(std::unique_ptr<IFrameSink> const* presenter) noexcept:
+            _presenter { presenter }
+        {
+        }
+
+        void Present(std::string_view frame) override
+        {
+            if (*_presenter != nullptr)
+                (*_presenter)->Present(frame);
+        }
+
+      private:
+        std::unique_ptr<IFrameSink> const* _presenter;
+    };
+} // namespace
+
 /// Shared by the source and its producers.
 ///
 /// Every member is read and written on the reactor's thread only -- the producers resume
@@ -100,7 +123,9 @@ struct LiveEventSource::State
         events { *parts.reactor, AsyncQueueOptions {} },
         finished { *parts.reactor, AsyncQueueOptions {} },
         due { *parts.reactor, AsyncQueueOptions {} },
-        gatherer { parts.gatherer, parts.dialer }
+        gatherer { parts.gatherer, parts.dialer },
+        presents { parts.frames != nullptr },
+        frames { &parts.frames }
     {
     }
 
@@ -138,6 +163,12 @@ struct LiveEventSource::State
     /// failure. Held here because a sample still on the pool when the source is destroyed is
     /// still inside it, and this state outlives the source for exactly that long.
     RedialingGatherer gatherer;
+
+    /// Whether the source was given a presenter at all, which `Frames()` answers by.
+    bool presents;
+
+    /// What the loop presents through: `parts.frames` while it exists.
+    GatedFrames frames;
 
     int producers { 0 };
 
@@ -277,7 +308,9 @@ namespace
         // Released here, on the reactor, as soon as nothing reads it: destroying it is what
         // restores the terminal, and a sample still on the pool is no reason to leave an
         // operator's terminal in raw mode. Closed first, because a terminal that went away
-        // on its own was never closed, and its contract asks for that before destruction.
+        // on its own was never closed, and its contract asks for that before destruction. Its
+        // presenter goes first: nothing may be drawn once the operator's screen is back.
+        shared->parts.frames.reset();
         shared->parts.terminal->Close();
         shared->parts.terminal.reset();
         shared->ProducerEnded();
@@ -379,6 +412,11 @@ std::optional<TimePoint> LiveEventSource::SampleOutstandingSince() const noexcep
     if (since == State::NoSample)
         return std::nullopt;
     return TimePoint { TimePoint::duration { since } };
+}
+
+IFrameSink* LiveEventSource::Frames() noexcept
+{
+    return _state->presents ? &_state->frames : nullptr;
 }
 
 Task<void> LiveEventSource::Drained()

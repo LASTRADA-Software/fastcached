@@ -4,6 +4,7 @@
 #include "CliAnswer.hpp"
 #include "CliVerbs.hpp"
 #include "DashboardLoop.hpp"
+#include "DashboardPanels.hpp"
 #include "NodeClient.hpp"
 
 #include <FastCache/Core/EnumTable.hpp>
@@ -42,6 +43,9 @@ enum class LiveSubject : std::uint8_t
     Fleet, ///< The fleet as its leader sees it.
     Last,
 };
+
+/// The panel a subject's interactive session draws, as `CachePanel` and `NodePanel` hand it out.
+using PanelOf = PanelSpec const& (*) () noexcept;
 
 /// One subject's fixed properties.
 struct LiveSubjectSpec
@@ -107,6 +111,14 @@ struct LiveSubjectSpec
     /// section behind its marker, because one sample is one moment and a strip read now beside
     /// a table read a second later would describe two fleets.
     std::string_view document;
+
+    /// The panel an interactive session of this subject draws, or null where this build has none.
+    ///
+    /// **A column, so the rung's view never branches on a subject**: the composition asks the row
+    /// and draws whatever panel it names. Null for `fleet`, whose panel binds to the fleet reader
+    /// and arrives with it; a null panel refuses an interactive session by name, and never draws
+    /// it through the piped view instead.
+    PanelOf panel;
 };
 
 /// The subjects, one row per enumerator, in enumerator order.
@@ -120,7 +132,8 @@ inline constexpr EnumTable<LiveSubject, LiveSubjectSpec> LiveSubjectTable { {
       .defaultInterval = std::chrono::milliseconds { 2000 },
       .costsWhom = "each sample is served by the cache daemon itself",
       .reader = &ReadStatsSample,
-      .document = "" },
+      .document = "",
+      .panel = &CachePanel },
     { .subject = LiveSubject::Node,
       .key = "node",
       .inferrable = true,
@@ -130,7 +143,8 @@ inline constexpr EnumTable<LiveSubject, LiveSubjectSpec> LiveSubjectTable { {
       .defaultInterval = std::chrono::milliseconds { 2000 },
       .costsWhom = "each sample is served by the node itself",
       .reader = &ReadStatsSample,
-      .document = "" },
+      .document = "",
+      .panel = &NodePanel },
     { .subject = LiveSubject::Fleet,
       .key = "fleet",
       .inferrable = false,
@@ -141,7 +155,8 @@ inline constexpr EnumTable<LiveSubject, LiveSubjectSpec> LiveSubjectTable { {
       .costsWhom = "each sample makes the LEADER render every fleet section for the whole fleet, "
                    "once per watcher",
       .reader = nullptr,
-      .document = "/fleet.txt" },
+      .document = "/fleet.txt",
+      .panel = nullptr },
 } };
 
 static_assert(RowsInEnumeratorOrder(LiveSubjectTable, &LiveSubjectSpec::subject),
