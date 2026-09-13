@@ -7,8 +7,10 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <cstddef>
 #include <expected>
 #include <optional>
+#include <ranges>
 #include <string>
 
 using namespace FastCache;
@@ -83,6 +85,43 @@ TEST_CASE("a fleet fetch that produced no document keeps the fetch's own outcome
 
     auto const composedWrongly = ReadFleetSample(DashboardEvent { .kind = DashboardEventKind::Sample });
     CHECK(composedWrongly.outcome != Outcome::Affirmative);
+}
+
+TEST_CASE("a piped fleet record is the newest reading's KPI strip, parsed from its text", "[cli][fleet][reading]")
+{
+    auto const document = LeaderDocument();
+    auto model = DashboardModel {};
+    model.latest = ReadFleetSample(FleetSample(document)).value;
+    model.latestStamp = ReadingStamp { .at = {}, .source = std::string { FleetReadingSource } };
+
+    auto const record = FleetKpiFigures(model);
+    REQUIRE(record.shape == Shape::Record);
+    auto const keys = FleetKpiKeys();
+    REQUIRE(record.fields.size() == keys.size() + 1);
+    CHECK(record.fields[0].name == "source");
+    CHECK(record.fields[0].value.lexical == FleetReadingSource);
+    for (auto const index: std::views::iota(std::size_t { 0 }, keys.size()))
+        CHECK(record.fields[index + 1].name == keys[index]);
+
+    // Each figure's VALUE cell, as the leader writes the strip on its own: read through the one-section
+    // form rather than the whole document, so a record taking the wrong column cannot agree with it.
+    auto snapshot = FleetSnapshot {};
+    snapshot.role = SchedulerRole::Leader;
+    auto const strip = FleetTable(RenderFleetText(snapshot, FleetHistoryView {}, FleetSection::Kpi));
+    REQUIRE(strip.has_value());
+    auto const valueAt = static_cast<std::size_t>(std::ranges::find(strip->columns, "value") - strip->columns.begin());
+    REQUIRE(valueAt < strip->columns.size());
+    REQUIRE(strip->rows.size() == keys.size());
+    for (auto const index: std::views::iota(std::size_t { 0 }, keys.size()))
+    {
+        CHECK(record.fields[index + 1].value.kind == strip->rows[index][valueAt].kind);
+        CHECK(record.fields[index + 1].value.lexical == strip->rows[index][valueAt].lexical);
+    }
+
+    // Before any reading there is only the source, and it is absent.
+    auto const empty = FleetKpiFigures(DashboardModel {});
+    REQUIRE(empty.fields.size() == 1);
+    CHECK(empty.fields[0].value.kind == CellKind::Absent);
 }
 
 TEST_CASE("an admin fetch's failure is one outcome for every reader", "[cli][fleet][reading]")

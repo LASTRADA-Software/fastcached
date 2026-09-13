@@ -33,4 +33,14 @@ inline constexpr std::string_view FleetReadingSource = "fleet.txt";
 /// @return The document as a text scalar from `FleetReadingSource`, or why there is none.
 [[nodiscard]] SampleReading ReadFleetSample(DashboardEvent const& event);
 
+/// A piped `fleet` session's record: the `kpi` section of the newest reading, one field per figure.
+///
+/// **Parsed here, from the reading's text, when it is drawn** -- the reader kept no parsed copy, so
+/// this and the fleet panel read one text through one parser. The strip arrives computed (#1302):
+/// each field is named by the section's `kpi` column and carries its `value` cell as the leader
+/// wrote it, `-` read as absent. `source` comes first, as every piped record's does.
+/// @param model What is known; `latest` is a fleet reading's text when there is one.
+/// @return The record: `source` alone before any reading.
+[[nodiscard]] Value FleetKpiFigures(DashboardModel const& model);
+
 } // namespace FastCache::Cli
