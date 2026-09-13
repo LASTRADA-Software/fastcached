@@ -128,6 +128,35 @@ namespace
         return (*to - *from) / std::chrono::duration<double> { *entry.elapsed }.count();
     }
 
+    /// Count one sample taken -- a reading or a failure -- against the budget.
+    /// @param model Where the count is kept.
+    /// @param limits The budget.
+    /// @return True when this sample spent it.
+    [[nodiscard]] bool SpendsBudget(DashboardModel& model, DashboardLimits limits) noexcept
+    {
+        ++model.attempts;
+        return limits.samples != 0 && model.attempts >= limits.samples;
+    }
+
+    /// End the run on its budget.
+    ///
+    /// The stop that consumed a sample owes that sample its frame, whether it was a reading or a
+    /// failure. This is the loop's only draw not preceded by a `Tick`: the `Tick` owed for the
+    /// last sample would arrive after the loop had already returned, so without it `--samples=N`
+    /// presents N-1 frames and the Nth sample -- the one the budget was spent on -- is never
+    /// shown. Drawn here rather than by whoever runs the loop, so frames are still presented from
+    /// one place.
+    /// @param exit The run so far.
+    /// @param view What draws.
+    /// @param sink Where the frame goes.
+    /// @param events The source, closed.
+    void StopOnBudget(DashboardExit& exit, IDashboardView& view, IFrameSink& sink, IDashboardEventSource& events)
+    {
+        PresentFrame(view, sink, exit.model);
+        exit.stop = DashboardStop::SampleBudget;
+        events.Close();
+    }
+
 } // namespace
 
 std::optional<double> NumberIn(std::optional<Value> const& reading, std::string_view field)
@@ -156,12 +185,21 @@ SampleReading ReadStatsSample(DashboardEvent const& event)
 {
     auto answer = ChooseStats(event.attempts);
     if (answer.outcome != Outcome::Affirmative)
-        return SampleReading { .outcome = answer.outcome, .value = {}, .source = {} };
+    {
+        // The advisories ARE the account: the conclusion, then what happened to each source. One
+        // line, because whoever surfaces it writes one line per failed sample.
+        auto note = std::string {};
+        for (auto const& advisory: answer.advisories)
+            note += (note.empty() ? "" : "; ") + advisory;
+        return SampleReading { .outcome = answer.outcome, .value = {}, .source = {}, .note = std::move(note) };
+    }
 
     // Copied out BEFORE the value moves, since the field points into it.
     auto const* named = FindField(answer.value, StatsSourceFieldName);
     auto source = named == nullptr ? std::string {} : named->value.lexical;
-    return SampleReading { .outcome = Outcome::Affirmative, .value = std::move(answer.value), .source = std::move(source) };
+    return SampleReading {
+        .outcome = Outcome::Affirmative, .value = std::move(answer.value), .source = std::move(source), .note = {}
+    };
 }
 
 bool IsQuitKey(std::string_view keys) noexcept
@@ -196,25 +234,18 @@ Task<DashboardExit> RunDashboard(
                 if (reading.outcome != Outcome::Affirmative)
                 {
                     RecordFailure(exit, reading.outcome);
-                    break;
                 }
-
-                AcceptReading(exit.model, std::move(reading), event.at);
-                // One reading is enough to make the run a success forever after. A source
-                // lost later is drawn as gaps, not turned into a failure -- §9.17, and the
-                // direction a healthy-path test cannot see.
-                exit.outcome = Outcome::Affirmative;
-                if (limits.samples != 0 && exit.model.samples >= limits.samples)
+                else
                 {
-                    // The stop that consumed a sample owes that sample its frame. This is the
-                    // loop's only draw not preceded by a `Tick`: the `Tick` owed for this
-                    // reading would arrive after the loop had already returned, so without it
-                    // `--samples=N` presents N-1 frames and the Nth reading -- the one the budget
-                    // was spent on -- is never shown. Drawn here rather than by whoever runs the
-                    // loop, so frames are still presented from one place.
-                    PresentFrame(*view, *sink, exit.model);
-                    exit.stop = DashboardStop::SampleBudget;
-                    events->Close();
+                    AcceptReading(exit.model, std::move(reading), event.at);
+                    // One reading is enough to make the run a success forever after. A source
+                    // lost later is drawn as gaps, not turned into a failure -- §9.17, and the
+                    // direction a healthy-path test cannot see.
+                    exit.outcome = Outcome::Affirmative;
+                }
+                if (SpendsBudget(exit.model, limits))
+                {
+                    StopOnBudget(exit, *view, *sink, *events);
                     co_return exit;
                 }
                 break;
@@ -222,6 +253,11 @@ Task<DashboardExit> RunDashboard(
 
             case DashboardEventKind::SampleFailed:
                 RecordFailure(exit, event.outcome);
+                if (SpendsBudget(exit.model, limits))
+                {
+                    StopOnBudget(exit, *view, *sink, *events);
+                    co_return exit;
+                }
                 break;
 
             case DashboardEventKind::Key:
