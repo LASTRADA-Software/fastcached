@@ -128,12 +128,18 @@ namespace
         return (*to - *from) / std::chrono::duration<double> { *entry.elapsed }.count();
     }
 
-    /// Count one sample taken -- a reading or a failure -- against the budget.
-    /// @param model Where the count is kept.
+    /// Everything a sample taken does whatever it read: it spends the budget, and it replaces the
+    /// node status with whatever it carried.
+    ///
+    /// One helper for both arms -- a `Sample` and a `SampleFailed` -- so neither route can count a
+    /// sample without replacing the status, or the reverse.
+    /// @param model Where the count and the status are kept.
+    /// @param event The sample.
     /// @param limits The budget.
-    /// @return True when this sample spent it.
-    [[nodiscard]] bool SpendsBudget(DashboardModel& model, DashboardLimits limits) noexcept
+    /// @return True when this sample spent the budget.
+    [[nodiscard]] bool RecordSampleTaken(DashboardModel& model, DashboardEvent const& event, DashboardLimits limits)
     {
+        model.nodeStatus = event.nodeStatus;
         ++model.attempts;
         return limits.samples != 0 && model.attempts >= limits.samples;
     }
@@ -243,7 +249,7 @@ Task<DashboardExit> RunDashboard(
                     // direction a healthy-path test cannot see.
                     exit.outcome = Outcome::Affirmative;
                 }
-                if (SpendsBudget(exit.model, limits))
+                if (RecordSampleTaken(exit.model, event, limits))
                 {
                     StopOnBudget(exit, *view, *sink, *events);
                     co_return exit;
@@ -253,7 +259,7 @@ Task<DashboardExit> RunDashboard(
 
             case DashboardEventKind::SampleFailed:
                 RecordFailure(exit, event.outcome);
-                if (SpendsBudget(exit.model, limits))
+                if (RecordSampleTaken(exit.model, event, limits))
                 {
                     StopOnBudget(exit, *view, *sink, *events);
                     co_return exit;

@@ -90,6 +90,14 @@ struct DashboardModel
     /// Kept because the NEXT reading is judged against it.
     std::optional<ReadingStamp> latestStamp {};
 
+    /// The node's status as the NEWEST sample carried it, or nullopt when that sample carried none.
+    ///
+    /// Replaced by every sample taken, a failed one included, and never merely updated: a sample
+    /// that brought no status leaves this empty rather than keeping the one before. A status block
+    /// then draws the absent marker beside a gap, exactly as a figure does, instead of showing the
+    /// last thing a node said before it stopped saying anything.
+    std::optional<CompileCacheWire::NodeStatusFields> nodeStatus {};
+
     /// How many readings in a row belong to one measurable run.
     ///
     /// **A counter rather than a flag, because the rules turned out to be one.** A rate

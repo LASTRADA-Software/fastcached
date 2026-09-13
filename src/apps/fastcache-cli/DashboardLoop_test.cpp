@@ -959,3 +959,61 @@ TEST_CASE("a sample its reader could not read says why", "[cli][dashboard]")
     CHECK(read.outcome == Outcome::Affirmative);
     CHECK(read.note.empty());
 }
+
+namespace
+{
+
+/// A node status naming @p version, and nothing else anyone reads here.
+/// @param version The node's compiled-in version.
+/// @return The status.
+[[nodiscard]] CompileCacheWire::NodeStatusFields StatusNamed(std::string version)
+{
+    auto status = CompileCacheWire::NodeStatusFields {};
+    status.version = std::move(version);
+    return status;
+}
+
+} // namespace
+
+TEST_CASE("the model's node status is what the newest sample carried and nothing older", "[cli][dashboard]")
+{
+    // A status block is a live view, so the status it draws is the newest sample's. WHAT
+    // DISTINGUISHES: a sample that carried NO status leaves the model's EMPTY -- an "update when
+    // present" rule keeps `first` there, which is a view of the past -- and a FAILED sample
+    // replaces it too, since a node can answer its status while its counters cannot be read.
+    auto const tick = DashboardEvent { .kind = DashboardEventKind::Tick };
+    auto withStatus = [](int seconds, std::int64_t value, std::string version) {
+        return DashboardEvent { .kind = DashboardEventKind::Sample,
+                                .at = At(seconds),
+                                .attempts = Reading(value),
+                                .nodeStatus = StatusNamed(std::move(version)) };
+    };
+
+    auto view = RecordingView {};
+    auto sink = CollectingSink {};
+    (void) Drive({ tick,
+                   withStatus(1, 10, "first"),
+                   tick,
+                   DashboardEvent { .kind = DashboardEventKind::Sample, .at = At(2), .attempts = Reading(20) },
+                   tick,
+                   DashboardEvent { .kind = DashboardEventKind::SampleFailed,
+                                    .nodeStatus = StatusNamed("while-failing"),
+                                    .outcome = Outcome::Refused },
+                   tick,
+                   withStatus(3, 30, "third"),
+                   tick },
+                 DashboardLimits {},
+                 view,
+                 sink);
+
+    auto const versionAt = [&view](std::size_t frame) {
+        auto const& status = view.seen.at(frame).nodeStatus;
+        return status.has_value() ? status->version : std::string { "<absent>" };
+    };
+    REQUIRE(view.seen.size() == 5);
+    CHECK(versionAt(0) == "<absent>"); // nothing taken yet
+    CHECK(versionAt(1) == "first");
+    CHECK(versionAt(2) == "<absent>");      // the sample carried none: not `first`
+    CHECK(versionAt(3) == "while-failing"); // a failed sample replaces it too
+    CHECK(versionAt(4) == "third");
+}
