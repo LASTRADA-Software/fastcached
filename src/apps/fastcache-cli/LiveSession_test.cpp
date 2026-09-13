@@ -922,7 +922,8 @@ class CountingAdmin final: public IAdminDocument
 [[nodiscard]] EndpointIdentity CacheDaemon()
 {
     return EndpointIdentity { .kind = RemoteKind::FastcacheWireOnly,
-                              .detail = "10.0.0.4:6674 speaks 0xFC and serves no node verbs, so it is not a compile node" };
+                              .detail = "10.0.0.4:6674 speaks 0xFC and serves no node verbs, so it is not a compile node",
+                              .unreadable = false };
 }
 
 } // namespace
@@ -930,8 +931,8 @@ class CountingAdmin final: public IAdminDocument
 TEST_CASE("a live-stats session refused at admission composes nothing", "[cli][live][session][seat]")
 {
     auto seat = RunningSeat { RenderOptions { .format = OutputFormat::Tsv }, false };
-    auto identity =
-        ScriptedIdentity { EndpointIdentity { .kind = std::nullopt, .detail = "no 0xFC connection was opened" } };
+    auto identity = ScriptedIdentity { EndpointIdentity {
+        .kind = std::nullopt, .detail = "no 0xFC connection was opened", .unreadable = false } };
 
     auto const ending = seat.Run(SessionContext({}, 1, &identity, &seat.gatherer));
 
@@ -1173,8 +1174,8 @@ TEST_CASE("a live-stats session with no stats source is refused before anything 
 TEST_CASE("a live-stats fleet session is refused by name while fleet sessions cannot sample", "[cli][live][session][seat]")
 {
     auto seat = RunningSeat { RenderOptions { .format = OutputFormat::Tsv }, false };
-    auto identity = ScriptedIdentity { EndpointIdentity { .kind = RemoteKind::CompileNode,
-                                                          .detail = "10.0.0.4:6674 is a fastcache-compile-node" } };
+    auto identity = ScriptedIdentity { EndpointIdentity {
+        .kind = RemoteKind::CompileNode, .detail = "10.0.0.4:6674 is a fastcache-compile-node", .unreadable = false } };
     auto const operands = std::vector<std::string> { "fleet" };
 
     // At fleet's own default, which the cache floor the other cases use is below.

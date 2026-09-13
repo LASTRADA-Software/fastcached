@@ -42,8 +42,10 @@ LadderGatherer::Identification const& LadderGatherer::Identified()
                                  std::string detail,
                                  std::optional<CompileCacheWire::NodeStatusFields> fields =
                                      std::nullopt) -> Identification const& {
+        auto const unreadable = kind == RemoteKind::CompileNode && !fields.has_value();
         return _identification.emplace(Identification {
-            .fields = std::move(fields), .endpoint = EndpointIdentity { .kind = kind, .detail = std::move(detail) } });
+            .fields = std::move(fields),
+            .endpoint = EndpointIdentity { .kind = kind, .detail = std::move(detail), .unreadable = unreadable } });
     };
 
     if (_node == nullptr)
@@ -62,6 +64,17 @@ LadderGatherer::Identification const& LadderGatherer::Identified()
         // than as a failed scrape: this is a fact about the endpoint, and the rungs
         // below turn it into *was not asked*.
         return remember(kind, std::format("{} is not a compile node ({})", _node->Address(), reply.error().detail));
+    }
+    if (kind != RemoteKind::CompileNode && reply->code == CompileCacheWire::ErrorCode::UnsupportedVersion)
+    {
+        // Refused on the WIRE VERSION, before the verb was read: nothing is known about
+        // whether a node is there, so this must not say it is not one. The server's own
+        // words name the range it speaks, and this client's version is the other half.
+        return remember(kind,
+                        std::format("{} refused this client's 0xFC wire {}: {}",
+                                    _node->Address(),
+                                    static_cast<unsigned>(CompileCacheWire::CurrentVersion),
+                                    reply->detail.empty() ? std::string { "no range given" } : reply->detail));
     }
     if (kind != RemoteKind::CompileNode)
     {
