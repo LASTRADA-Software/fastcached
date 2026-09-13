@@ -3,6 +3,8 @@
 #include "LiveStats.hpp"
 #include "ScriptedExchange.hpp"
 
+#include <FastCache/Protocol/CompileCacheWire.hpp>
+
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
@@ -33,21 +35,24 @@ namespace
 [[nodiscard]] EndpointIdentity Daemon()
 {
     return EndpointIdentity { .kind = RemoteKind::FastcacheWireOnly,
-                              .detail = "10.0.0.4:6674 speaks 0xFC and serves no node verbs, so it is not a compile node" };
+                              .detail = "10.0.0.4:6674 speaks 0xFC and serves no node verbs, so it is not a compile node",
+                              .unreadable = false };
 }
 
 /// A compile node, as the gatherer describes one.
 /// @return The identification.
 [[nodiscard]] EndpointIdentity CompileNode()
 {
-    return EndpointIdentity { .kind = RemoteKind::CompileNode, .detail = "10.0.0.4:6674 is a fastcache-compile-node" };
+    return EndpointIdentity { .kind = RemoteKind::CompileNode,
+                              .detail = "10.0.0.4:6674 is a fastcache-compile-node",
+                              .unreadable = false };
 }
 
 /// An endpoint nobody could ask.
 /// @return The identification.
 [[nodiscard]] EndpointIdentity NotAsked()
 {
-    return EndpointIdentity { .kind = std::nullopt, .detail = "no 0xFC connection was opened" };
+    return EndpointIdentity { .kind = std::nullopt, .detail = "no 0xFC connection was opened", .unreadable = false };
 }
 
 /// A port that framed nothing.
@@ -55,7 +60,8 @@ namespace
 [[nodiscard]] EndpointIdentity Foreign()
 {
     return EndpointIdentity { .kind = RemoteKind::NotFastcacheWire,
-                              .detail = "10.0.0.4:6674 is not a compile node (the server closed the connection)" };
+                              .detail = "10.0.0.4:6674 is not a compile node (the server closed the connection)",
+                              .unreadable = false };
 }
 
 /// What one admission concluded, and how often it asked the endpoint.
@@ -240,7 +246,7 @@ TEST_CASE("each subject's floor refuses one millisecond below it and accepts it 
     for (auto const& row: LiveSubjectTable)
     {
         CAPTURE(row.key);
-        auto const identity = EndpointIdentity { .kind = row.servedBy, .detail = "scripted" };
+        auto const identity = EndpointIdentity { .kind = row.servedBy, .detail = "scripted", .unreadable = false };
         auto const operands = std::vector<std::string> { std::string { row.key } };
 
         auto const below = Admit(operands, WithInterval(row.minInterval - 1ms), identity);
@@ -331,4 +337,29 @@ TEST_CASE("live-stats through the verb table answers its admission", "[cli][live
 
     ScriptedIdentity nobody { NotAsked() };
     CHECK(RunVerb(*verb, VerbContext { .stats = &gatherer, .identity = &nobody }).outcome == Outcome::Unreachable);
+}
+
+TEST_CASE("live-stats refuses a node whose description it cannot read, naming this client's wire version", "[cli][live]")
+{
+    // The rollout case: a newer client against an older node, whose node-status body this client
+    // cannot decode. Every sample would fail the same way, so the session never starts -- named
+    // or inferred, node or fleet -- and the refusal says which version this client speaks.
+    auto unreadable = CompileNode();
+    unreadable.detail = "10.0.0.4:6674 answered node-status with a body this client cannot read";
+    unreadable.unreadable = true;
+
+    for (auto const& operands:
+         { std::vector<std::string> {}, std::vector<std::string> { "node" }, std::vector<std::string> { "fleet" } })
+    {
+        INFO("operands: " << operands.size());
+        auto const refused = Admit(operands, {}, unreadable);
+        REQUIRE_FALSE(refused.result.has_value());
+        CHECK(refused.result.error().outcome == Outcome::Protocol);
+        CHECK(RefusalText(refused).contains("cannot read"));
+        CHECK(RefusalText(refused).contains(
+            std::format("0xFC wire {}", static_cast<unsigned>(FastCache::CompileCacheWire::CurrentVersion))));
+    }
+
+    // The control: the same node, readable, is admitted.
+    CHECK(Admit({}, {}, CompileNode()).result.has_value());
 }
