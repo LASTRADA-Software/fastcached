@@ -7,7 +7,7 @@ namespace FastCache::Cli
 {
 
 /// @file DashboardPanels.hpp
-/// The `cache` and `node` panels, as the tables `PanelView` draws.
+/// The `cache`, `node` and `fleet` panels, as the tables `PanelView` draws.
 ///
 /// **Names come from the catalogue where the catalogue has them.** A counter's name is
 /// `DescriptorOf(...)->prometheusName`, which is also what a node's `NodeMetrics` reply calls it,
@@ -27,5 +27,14 @@ namespace FastCache::Cli
 /// only what the model holds.
 /// @return The spec; static storage.
 [[nodiscard]] PanelSpec const& NodePanel() noexcept;
+
+/// The `fleet` panel (#134 §5): the leader's `/fleet.txt`, as the headline tiles, a strip naming its
+/// sections, and the active section's table walked from its own header line.
+///
+/// No figure rows: everything it draws is the newest reading's document, which the fleet reader hands
+/// to the model parsed. `DocumentSpec`'s defaults are this panel's drop order -- the strip first, then
+/// the tiles, then the source line, and the table last of all, shrinking to `+N more` and never going.
+/// @return The spec; static storage.
+[[nodiscard]] PanelSpec const& FleetPanel() noexcept;
 
 } // namespace FastCache::Cli
