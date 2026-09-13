@@ -60,6 +60,19 @@ namespace
             exit.outcome = why;
     }
 
+    /// Draw what is known and present it.
+    ///
+    /// Every frame the loop presents goes through here, so a frame is drawn and counted in
+    /// one place however many reasons there are to owe one.
+    /// @param view What draws.
+    /// @param sink Where the frame goes.
+    /// @param model What is known; its frame count advances.
+    void PresentFrame(IDashboardView& view, IFrameSink& sink, DashboardModel& model)
+    {
+        sink.Present(view.Frame(model));
+        ++model.frames;
+    }
+
     /// Fold one accepted reading into the model.
     /// @param model What to update.
     /// @param reading What the session's reader made of the sample.
@@ -114,8 +127,7 @@ Task<DashboardExit> RunDashboard(
                 // source's call -- a fixture opening with a `Tick` is that fixture's script,
                 // not a rule, and a piped run owes none until the first sample, because an
                 // empty first line would break §9.13.
-                sink->Present(view->Frame(exit.model));
-                ++exit.model.frames;
+                PresentFrame(*view, *sink, exit.model);
                 break;
 
             case DashboardEventKind::Sample: {
@@ -133,6 +145,13 @@ Task<DashboardExit> RunDashboard(
                 exit.outcome = Outcome::Affirmative;
                 if (limits.samples != 0 && exit.model.samples >= limits.samples)
                 {
+                    // The stop that consumed a sample owes that sample its frame. This is the
+                    // loop's only draw not preceded by a `Tick`: the `Tick` owed for this
+                    // reading would arrive after the loop had already returned, so without it
+                    // `--samples=N` presents N-1 frames and the Nth reading -- the one the budget
+                    // was spent on -- is never shown. Drawn here rather than by whoever runs the
+                    // loop, so frames are still presented from one place.
+                    PresentFrame(*view, *sink, exit.model);
                     exit.stop = DashboardStop::SampleBudget;
                     events->Close();
                     co_return exit;
