@@ -6294,3 +6294,43 @@ if(FASTCACHED_BUILD_TUI AND TARGET fastcache-tui-linkprobe)
         TIMEOUT 60
     )
 endif()
+
+# The vendored TUI runtime's own tests (#1374). Declared in `vendor/CMakeLists.txt`,
+# registered HERE because `add_subdirectory(vendor)` runs before `enable_testing()`
+# -- an `add_test` in that file builds a binary that never runs and reports nothing,
+# which looks exactly like a registered test that passes.
+#
+# What it pins is the fact the mockable-dashboard plan rests on: `TuiRuntime` reads
+# time only through its injected `IClock`. It was claimed by a header comment and
+# measured by nothing. Two of the cases are the discrimination -- "An injected
+# ManualClock makes a delay's computed timeout exact" freezes the clock and requires
+# the delay NOT to fire, and "A delay fires deterministically once the ManualClock
+# crosses its deadline" advances a ManualClock 40ms per scripted wait and requires a
+# 100ms delay to resume on the THIRD wait, `REQUIRE(source.waitCount() == 3)`. A
+# hidden `steady_clock::now()` in any awaiter makes the first flake as real time
+# crosses the deadline and the second resume at the wrong wait. Neither is a test
+# that passes either way.
+#
+# A third pins the readiness half: "Runtime delivers a scripted input event to a
+# waiting flow" wakes on a pushed key with no clock advancing and no timer anywhere,
+# which is what fails against any `SleepUntil(now + interval)` implementation.
+#
+# ONE ctest entry running the whole binary rather than `catch_discover_tests`,
+# deliberately: per-case registration would put upstream's case names into this
+# repository's ctest namespace and under its Catch2 name hygiene, which vendored
+# tests have no reason to satisfy, and it would expose them to the SKIP_RETURN_CODE
+# collision (#1152). Catch2's exit status is its failed-assertion count, so a plain
+# non-zero is the failure signal this needs and nothing here maps 4 to "skipped".
+#
+# Guarded on `TARGET` as well as the option: `$<TARGET_FILE:>` on a target that was
+# not built is a hard error at generate time, and the two conditions are independent.
+if(FASTCACHED_BUILD_TUI AND TARGET fastcache-tui-tests)
+    add_test(
+        NAME "vendor-tui-runtime-clock"
+        COMMAND $<TARGET_FILE:fastcache-tui-tests>
+    )
+    set_tests_properties("vendor-tui-runtime-clock" PROPERTIES
+        LABELS "hygiene"
+        TIMEOUT 120
+    )
+endif()

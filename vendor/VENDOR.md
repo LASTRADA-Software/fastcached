@@ -21,7 +21,7 @@ from the contents.
 
 | upstream | fork point | files | what |
 |---|---|---|---|
-| [contour-terminal/endo](https://github.com/contour-terminal/endo) | `687b90a042a3eee96f50f8f46cf811a03155b786` | 165 | `tui/**` (154 files, all of `src/tui`), `platform/{Types,Wakeup,Clock,SignalHandler,SystemPipe,PlatformError}.hpp`, the three per-platform `platform/{linux,posix,windows}/*Wakeup.cpp`, `platform/SignalHandler.cpp`, `testing/SuppressWindowsDialogs.hpp` |
+| [contour-terminal/endo](https://github.com/contour-terminal/endo) | `687b90a042a3eee96f50f8f46cf811a03155b786` | 168 | `tui/**` (154 files, all of `src/tui`), `platform/{Types,Wakeup,Clock,SignalHandler,SystemPipe,PlatformError,WinsockInit}.hpp`, the three per-platform `platform/{linux,posix,windows}/*Wakeup.cpp`, `platform/{SignalHandler,SystemPipe,WinsockInit}.cpp`, `testing/SuppressWindowsDialogs.hpp` |
 | [contour-terminal/contour](https://github.com/contour-terminal/contour) | `243d776aed99bcc0f634b0608189609fd4e548ba` | 5 | `coro/{Task,Cancellation,WhenAny,UniqueCoroHandle}.hpp`, `crispy/FNV.hpp` |
 
 
@@ -36,22 +36,23 @@ contour, not against endo.** They were verified byte-identical between contour
 Both repositories are Apache-2.0, and so is this copy. `endo/tui` was last touched
 upstream at `37d875f8` (2026-08-15).
 
-`src/tui` upstream is 154 files and ~46k lines; with the sixteen supporting files below the
-copy is **170 files, 48,163 lines**.
+`src/tui` upstream is 154 files and ~46k lines; with the nineteen supporting files below the
+copy is **173 files, 48,484 lines**.
 
-## The sixteen supporting files
+## The nineteen supporting files
 
 `tui` does not stand alone: it includes headers from three sibling libraries. The
 set copied here is the **measured transitive closure** of those includes — every
 non-`tui`, non-system header reachable from `src/tui`, followed until it
-terminates. It is sixteen files and 2,117 lines: twelve headers, plus **four
+terminates. It is nineteen files and 2,438 lines: thirteen headers, plus **six
 implementation files** — the three per-platform implementations of
-`endo::platform::Wakeup`, which `tui/platform/TerminalInput.cpp` calls into, and
-`platform/SignalHandler.cpp`, which `tui/runtime/` calls into. None of them
-reaches any further into either upstream.
+`endo::platform::Wakeup`, which `tui/platform/TerminalInput.cpp` calls into,
+`platform/SignalHandler.cpp`, which `tui/runtime/` calls into, and
+`platform/{SystemPipe,WinsockInit}.cpp`, which only the vendored runtime TESTS
+reach. None of them reaches any further into either upstream.
 
-**Twelve of the sixteen are header-only, and the closure has now been wrong about
-that twice — read the second one, because it is not the same mistake.**
+**Thirteen of the nineteen are header-only, and the closure has been wrong about
+that three times — read past the first, because they are not the same mistake.**
 
 The first: `platform/Wakeup.hpp` declares a class whose methods are defined
 elsewhere, and reading `#include` lines cannot see that — a header graph and a
@@ -66,13 +67,20 @@ the header says so. It sits in the same directory as headers whose definitions
 *were* imported, and every one of its members being `static` means every call site
 compiles.
 
+The third: `platform/SystemPipe.cpp` and `platform/WinsockInit.cpp`, reached when
+the vendored runtime tests were built. This one moved the ROOT rather than missing
+a file from a fixed one — adding test translation units enlarged what the closure
+is a closure OF, and a set that was complete stopped being complete without
+changing. It also cascaded one level, which neither earlier miss did.
+
 So the sentence above — *the measured transitive closure of those includes* —
-describes the twelve headers and **cannot** describe the four `.cpp` files, which
+describes the thirteen headers and **cannot** describe the six `.cpp` files, which
 were hand-picked. That `plus` is the unguarded part of this criterion, and
 **a closure is only ever complete with respect to the root it was walked from**;
-an upstream project's target boundaries are invisible from inside its source tree.
-`fastcache-tui-linkprobe` is what found both and is what stops a third: it names
-the gap in one link, where reading finds none of it.
+an upstream project's target boundaries are invisible from inside its source tree,
+and the root moves whenever the build takes on new translation units.
+`fastcache-tui-linkprobe` found the first two and the test link found the third:
+each named its gap in one link, where reading finds none of them.
 
 That number is worth stating because the obvious estimate is an order of magnitude
 larger. `coro` and `endo-platform` are together about 12,000 lines, and "vendor the
@@ -116,7 +124,10 @@ Two facts that make this much less alarming than it sounds, both measured:
   cannot fail.
 
   The built library's external surface is libunicode, `platform/{Types,Wakeup,Clock,
-  SignalHandler}.hpp`, `coro/*` and `crispy/FNV.hpp`.
+  SignalHandler}.hpp`, `coro/*` and `crispy/FNV.hpp`. `platform/SystemPipe.hpp` and
+  `platform/WinsockInit.hpp` are reached by the vendored TESTS only, so their
+  implementations are sources of `fastcache-tui-tests` and not of the library —
+  which is also what keeps `ws2_32` off it.
 - **The two vocabularies meet in one place.** Vendored code serves the vendored TUI
   only; no vendored file reaches `FastCache::*`, and first-party code reaches the TUI
   through a single adapter layer. If you find yourself wanting to cross that boundary
@@ -125,7 +136,7 @@ Two facts that make this much less alarming than it sounds, both measured:
 
 ## Local changes
 
-**None.** All 170 files are byte-identical to their upstream blobs, which is
+**None.** All 173 files are byte-identical to their upstream blobs, which is
 checked rather than asserted — see below.
 
 Every local change goes in its own commit, never folded into the import, and gets a

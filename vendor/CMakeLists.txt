@@ -133,6 +133,17 @@ list(APPEND _fcTuiSources endo/platform/SignalHandler.cpp)
 # replacement, and one of them wrote an actual `co_await SleepUntil(now + interval)`
 # loop to replace a readiness-driven one.
 #
+# There IS one poll-shaped call, and naming it is what stops this being reopened,
+# because it is the last thing a re-reader can point at. `PollEventSource.cpp:33`:
+# `::poll(nullptr, 0, timeoutMs)`, guarded by `timeoutMs > 0`, reached only when
+# nothing is registered. It is not a counter-example. With ZERO descriptors nothing
+# CAN become ready, so that call is a sleep spelled `poll(2)` -- it exists so the
+# runtime's timers still fire when there is nothing to watch, and upstream's own
+# comment beside it says exactly that. No loop around it and no re-check, which is
+# what the polling PATTERN would need. `PollEventSource` is also the generic-fd
+# source; the terminal uses `TerminalEventSource`, so the degenerate path is not
+# even on the path the objection would be about.
+#
 # The true half, which stands and is now a DECISION rather than an obstacle: runtime/
 # is the only thing reaching `coro/Task.hpp`, `coro/Cancellation.hpp` and
 # `platform/Clock.hpp`, so building it does put a second coroutine type and a second
@@ -424,3 +435,60 @@ set_target_properties(fastcache-tui-linkprobe PROPERTIES
     CXX_SCAN_FOR_MODULES OFF
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/linkprobe"
 )
+
+# ----------------------------------------------------------------------------
+# UPSTREAM'S OWN runtime/ TESTS, built here.
+#
+# #1374 rests on one fact that was, until this target, claimed by a header comment
+# and measured by nothing: `TuiRuntime` reads time ONLY through its injected
+# `endo::platform::IClock`. Everything the mockable dashboard plan needs follows from
+# it, and a single `steady_clock::now()` in any awaiter makes the plan vacuous while
+# leaving every existing test green.
+#
+# These are upstream's tests, built rather than re-derived, for a reason beyond cost:
+# re-derived equivalents would assert our understanding of the runtime, while these
+# assert UPSTREAM's -- so they also catch a re-sync that changes the property, which
+# is the failure a copy of them could not see. They compile against our Catch2
+# unmodified; endo's test files need no endo-only harness.
+#
+# Registration is NOT here. `add_subdirectory(vendor)` runs before `enable_testing()`,
+# so an `add_test` in this file is a silent no-op -- the test would build, never run,
+# and report nothing while looking registered. The `add_test` lives at the end of
+# `src/tests/CMakeLists.txt`; this file only declares the binary.
+#
+# Guarded on the Catch2 target rather than on a build option: this file is reached
+# whenever the TUI is on, and Catch2 is fetched under the test option, so the two are
+# independent conditions and only one of them is visible from here.
+if(TARGET Catch2::Catch2WithMain)
+    # SystemPipe and WinsockInit are sources of the TEST target and NOT of
+    # `fastcache-tui-objects`, deliberately. Only two cases reach them -- the ones
+    # that park `waitReadable` on a real pipe instead of the scripted mock -- and
+    # `fastcache-tui-linkprobe` resolves without them, which is the measurement
+    # saying the production runtime does not. Keeping them here also keeps `ws2_32`
+    # off the library: SystemPipe's Windows implementation is a loopback socket pair.
+    add_executable(fastcache-tui-tests
+        endo/tui/runtime/TuiRuntime_test.cpp
+        endo/tui/runtime/Modal_test.cpp
+        endo/platform/SystemPipe.cpp
+        endo/platform/WinsockInit.cpp
+    )
+    target_link_libraries(fastcache-tui-tests PRIVATE fastcache-tui Catch2::Catch2WithMain)
+    if(WIN32)
+        target_link_libraries(fastcache-tui-tests PRIVATE ws2_32)
+    endif()
+    # Vendored code is not governed by this repository's own rules -- the same
+    # reasoning as `fastcache-tui-objects`, and for tests it also keeps upstream's
+    # case names out of our Catch2 naming hygiene, which they have no reason to obey.
+    set_target_properties(fastcache-tui-tests PROPERTIES
+        CXX_CLANG_TIDY ""
+        C_CLANG_TIDY ""
+        CXX_SCAN_FOR_MODULES OFF
+    )
+    if(MSVC)
+        target_compile_options(fastcache-tui-tests PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/utf-8>)
+    endif()
+    if(WIN32)
+        target_compile_definitions(fastcache-tui-tests PRIVATE
+            WIN32_LEAN_AND_MEAN NOMINMAX _WIN32_WINNT=0x0A00)
+    endif()
+endif()
