@@ -17,8 +17,10 @@ namespace FastCache::Cli
 
 /// What one command invocation concluded.
 ///
-/// **Six outcomes rather than success-or-failure, because one exit code cannot answer
-/// six questions.** The tree has already paid for the collapsed version: one status
+/// **One code per outcome rather than success-or-failure, because one exit code cannot
+/// answer several questions.** How many there are is `OutcomeTable`'s to say, and nothing
+/// else states it: the help renders the table, and `ctest -R cli-exit-code-docs` holds the
+/// operator page's listing to it. The tree has already paid for the collapsed version: one status
 /// answering *did the file parse*, *would it start* and *would it bind* was three
 /// fixtures leaning on the same number, and it stopped being able to carry all three
 /// the moment one of them changed meaning.
@@ -29,6 +31,9 @@ namespace FastCache::Cli
 ///   - `Refused` against `Protocol` -- the server said no, versus the server said
 ///     something this client could not read. Different people fix those.
 ///   - `Usage` against everything -- the operator's mistake, not the system's.
+///   - `Local` against `Refused` -- this machine could not do it, versus the server
+///     declined. One remedy is here (redirect the output, use another terminal) and the
+///     other is at the server, and a script told `refused` goes to the wrong one.
 ///
 /// A private enum; only the `code` column below is a published contract.
 enum class Outcome : std::uint8_t
@@ -39,6 +44,7 @@ enum class Outcome : std::uint8_t
     Unreachable, ///< Nothing answered, or the connection failed.
     Refused,     ///< The server answered and declined.
     Protocol,    ///< Bytes arrived that this client cannot read as a reply.
+    Local,       ///< This machine could not carry the command out; the server is not implicated.
     Last,
 };
 
@@ -73,6 +79,10 @@ inline constexpr EnumTable<Outcome, OutcomeSpec> OutcomeTable { {
       .code = 5,
       .name = "protocol",
       .meaning = "the reply could not be read; the peer may not be a fastcached" },
+    { .outcome = Outcome::Local,
+      .code = 6,
+      .name = "local",
+      .meaning = "this machine could not carry the command out; the server is not implicated" },
 } };
 
 static_assert(RowsInEnumeratorOrder(OutcomeTable, &OutcomeSpec::outcome),
