@@ -23,6 +23,8 @@ set(_fc_cli_sources
     CliFormat.cpp
     CliValue.cpp
     CliVerbs.cpp
+    DashboardLoop.cpp
+    DashboardSampler.cpp
     MemcachedClient.cpp
     NodeClient.cpp
     RespClient.cpp
@@ -56,6 +58,8 @@ if(FASTCACHED_BUILD_TESTS)
         CliFormat_test.cpp
         CliValue_test.cpp
         CliVerbs_test.cpp
+        DashboardLoop_test.cpp
+        DashboardSampler_test.cpp
         MemcachedClient_test.cpp
         MemcachedVerbs_test.cpp
         NodeClient_test.cpp
