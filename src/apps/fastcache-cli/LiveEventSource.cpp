@@ -58,10 +58,13 @@ namespace
     {
       public:
         /// @param first What to ask until a round fails.
+        /// @param status What to ask for the node's status until then; null for never.
         /// @param dialer What dials a replacement; null for never.
-        RedialingGatherer(IStatsGatherer* first, IStatsDialer* dialer) noexcept:
+        RedialingGatherer(IStatsGatherer* first, INodeStatusReader* status, IStatsDialer* dialer) noexcept:
             _current { first },
-            _dialer { dialer }
+            _status { status },
+            _dialer { dialer },
+            _readsStatus { status != nullptr }
         {
         }
 
@@ -71,19 +74,38 @@ namespace
             {
                 _dialed = _dialer->Dial();
                 _current = _dialed.get();
+                if (_readsStatus)
+                    _status = _dialed.get();
             }
             auto attempts = _current->Gather();
             // Failed by the reader's own decision rather than by a second reading of the
             // attempts: a round the ladder cannot choose a record from is the round that
             // renders as a gap, and exactly that round is the one worth a re-dial.
             _lastFailed = ChooseStats(attempts).outcome != Outcome::Affirmative;
+            // In the same hop and right after the counters, so the status beside a sample
+            // describes the moment it was taken rather than one a hop later.
+            if (_status != nullptr)
+                _lastStatus = _status->ReadNodeStatus();
             return attempts;
+        }
+
+        /// The status the last gather read, handed over once.
+        ///
+        /// Written on the pool and taken on the reactor after `TakeSample` has hopped back, which
+        /// the executor's hand-off orders; the cadence never starts a gather before taking this.
+        /// @return The status, or nullopt when none was read.
+        [[nodiscard]] std::optional<CompileCacheWire::NodeStatusFields> TakeStatus() noexcept
+        {
+            return std::exchange(_lastStatus, std::nullopt);
         }
 
       private:
         IStatsGatherer* _current;
+        INodeStatusReader* _status;
         IStatsDialer* _dialer;
-        std::unique_ptr<IStatsGatherer> _dialed {};
+        std::unique_ptr<IDialedStats> _dialed {};
+        std::optional<CompileCacheWire::NodeStatusFields> _lastStatus {};
+        bool _readsStatus;
         bool _lastFailed { false };
     };
 } // namespace
@@ -123,7 +145,7 @@ struct LiveEventSource::State
         events { *parts.reactor, AsyncQueueOptions {} },
         finished { *parts.reactor, AsyncQueueOptions {} },
         due { *parts.reactor, AsyncQueueOptions {} },
-        gatherer { parts.gatherer, parts.dialer },
+        gatherer { parts.gatherer, parts.status, parts.dialer },
         presents { parts.frames != nullptr },
         frames { &parts.frames }
     {
@@ -234,16 +256,19 @@ namespace
         }
 
         auto sample = co_await TakeSample(&state->gatherer, parts.clock, parts.pool, parts.reactor);
+        auto status = state->gatherer.TakeStatus();
         if (sample.attempts.empty())
             // Nothing could be asked at all. A failure the loop counts and draws as a gap -- never
             // a reading with nothing in it, which the reader would have to guess about.
             co_return DashboardEvent { .kind = DashboardEventKind::SampleFailed,
                                        .at = sample.takenAt,
+                                       .nodeStatus = std::move(status),
                                        .outcome = Outcome::Unreachable,
                                        .note = "no stats source could be asked" };
         co_return DashboardEvent { .kind = DashboardEventKind::Sample,
                                    .at = sample.takenAt,
-                                   .attempts = std::move(sample.attempts) };
+                                   .attempts = std::move(sample.attempts),
+                                   .nodeStatus = std::move(status) };
     }
 
     /// Sample, deliver, park until the next deadline; until closed.

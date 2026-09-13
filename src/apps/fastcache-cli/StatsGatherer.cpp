@@ -104,6 +104,17 @@ EndpointIdentity LadderGatherer::IdentifyEndpoint()
     return Identified().endpoint;
 }
 
+std::optional<CompileCacheWire::NodeStatusFields> LadderGatherer::ReadNodeStatus()
+{
+    if (_node == nullptr)
+        return std::nullopt;
+    auto const reply = _node->Send(CompileCacheWire::EncodeNodeStatusRequest());
+    // The classifier's decision, as `Identified()` takes it: only a node's `Ok` carries a status.
+    if (ClassifyNodeStatusReply(reply) != RemoteKind::CompileNode)
+        return std::nullopt;
+    return CompileCacheWire::DecodeNodeStatus(reply->payload);
+}
+
 std::expected<Endpoint, std::string> LadderGatherer::ResolveAdmin()
 {
     // The operator's own answer wins, for the reason every override in this tree does:
