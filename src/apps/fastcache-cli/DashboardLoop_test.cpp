@@ -1214,3 +1214,62 @@ TEST_CASE("a frame presented as text reaches a sink's one door as a frame with n
     REQUIRE(sink.placements.size() == 1);
     CHECK(sink.placements[0].empty());
 }
+
+namespace
+{
+
+/// A view that acts on one key and ignores every other.
+class OneKeyView final: public IDashboardView
+{
+  public:
+    [[nodiscard]] std::string Frame(DashboardModel const& model) override
+    {
+        (void) model;
+        return std::format("frame after {} keys", acted);
+    }
+
+    [[nodiscard]] bool Key(std::string_view keys) override
+    {
+        offered.emplace_back(keys);
+        if (keys != "x")
+            return false;
+        ++acted;
+        return true;
+    }
+
+    std::size_t acted { 0 };
+    std::vector<std::string> offered {};
+};
+
+} // namespace
+
+TEST_CASE("a key the view acts on is drawn at once, and one it ignores draws nothing", "[cli][dashboard]")
+{
+    // WHAT DISTINGUISHES: the frame count. A loop that waited for the next `Tick` draws one frame
+    // here and a loop that drew on every key draws three; only a loop asking the view draws two.
+    auto view = OneKeyView {};
+    auto sink = CollectingSink {};
+    auto const exit = Drive({ DashboardEvent { .kind = DashboardEventKind::Key, .keys = "y" },
+                              DashboardEvent { .kind = DashboardEventKind::Key, .keys = "x" },
+                              DashboardEvent { .kind = DashboardEventKind::Tick } },
+                            DashboardLimits {},
+                            view,
+                            sink);
+    CHECK(exit.stop == DashboardStop::SourceDetached);
+    CHECK(view.offered == std::vector<std::string> { "y", "x" });
+    CHECK(sink.frames == std::vector<std::string> { "frame after 1 keys", "frame after 1 keys" });
+}
+
+TEST_CASE("a quit key is not offered to the view", "[cli][dashboard]")
+{
+    auto view = OneKeyView {};
+    auto sink = CollectingSink {};
+    auto const exit = Drive({ DashboardEvent { .kind = DashboardEventKind::Key, .keys = "q" },
+                              DashboardEvent { .kind = DashboardEventKind::Key, .keys = "x" } },
+                            DashboardLimits {},
+                            view,
+                            sink);
+    CHECK(exit.stop == DashboardStop::Quit);
+    CHECK(view.offered.empty());
+    CHECK(sink.frames.empty());
+}

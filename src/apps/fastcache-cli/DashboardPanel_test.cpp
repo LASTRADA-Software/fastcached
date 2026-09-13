@@ -1415,3 +1415,78 @@ TEST_CASE("the fleet chart goes for height before the tiles, and below its width
     CHECK(narrow.requests.empty());
     CHECK(LineStarting(narrow.frames.at(0), "endpoint").has_value());
 }
+
+TEST_CASE("the fleet section keys walk the strip's tabs in its order, wrapping, and a digit names one",
+          "[cli][dashboard][panel][fleet]")
+{
+    auto tabs = std::vector<FleetSection> {};
+    for (auto const& row: Distributed::FleetSectionTable)
+        if (row.tabular)
+            tabs.push_back(row.section);
+    REQUIRE(tabs.size() >= 3);
+    // The position past the last tab must still be a digit for the last check to mean anything.
+    REQUIRE(tabs.size() < 9);
+
+    CHECK(SectionForKey(tabs[0], "\t") == tabs[1]);
+    CHECK(SectionForKey(tabs[0], "\x1b[C") == tabs[1]);
+    CHECK(SectionForKey(tabs[1], "\x1b[D") == tabs[0]);
+    // Both ends wrap.
+    CHECK(SectionForKey(tabs.back(), "\t") == tabs.front());
+    CHECK(SectionForKey(tabs.front(), "\x1b[D") == tabs.back());
+    // A digit is a position on the strip, not an enumerator.
+    CHECK(SectionForKey(tabs[0], "1") == tabs[0]);
+    CHECK(SectionForKey(tabs[0], "3") == tabs[2]);
+    CHECK(SectionForKey(tabs[0], std::string(1, static_cast<char>('0' + tabs.size()))) == tabs.back());
+
+    // From a section the strip does not name, the first step lands on an end of it.
+    CHECK(SectionForKey(FleetSection::Kpi, "\t") == tabs.front());
+    CHECK(SectionForKey(FleetSection::Kpi, "\x1b[D") == tabs.back());
+
+    // A key naming nothing, and a tab past the last.
+    CHECK_FALSE(SectionForKey(tabs[0], "x").has_value());
+    CHECK_FALSE(SectionForKey(tabs[0], "0").has_value());
+    CHECK_FALSE(SectionForKey(tabs[0], "\x1b[A").has_value());
+    CHECK_FALSE(SectionForKey(tabs[0], "\t\t").has_value());
+    CHECK_FALSE(SectionForKey(tabs[0], std::string(1, static_cast<char>('1' + tabs.size()))).has_value());
+}
+
+TEST_CASE("a key on the fleet panel switches the table it draws, at once", "[cli][dashboard][panel][fleet]")
+{
+    // WHAT DISTINGUISHES: which tab is bracketed in each frame, and how many frames there are. A key
+    // naming no tab draws no frame, so the tick and four keys draw four.
+    auto view = PanelView { FleetPanel(),
+                            PanelContext { .absent = std::string { Absent },
+                                           .cellWidth = &FakeCellWidth,
+                                           .section = FleetSection::Machines,
+                                           .rung = RenderRung::Unicode } };
+    auto sink = CollectingSink {};
+    (void) Drive({ DashboardEvent { .kind = DashboardEventKind::Resize, .columns = 132, .rows = 40 },
+                   FleetSampleOf(1, FleetText(FleetMachines)),
+                   Tick,
+                   DashboardEvent { .kind = DashboardEventKind::Key, .keys = "\t" },
+                   DashboardEvent { .kind = DashboardEventKind::Key, .keys = "9" },
+                   DashboardEvent { .kind = DashboardEventKind::Key, .keys = "3" },
+                   DashboardEvent { .kind = DashboardEventKind::Key, .keys = "\x1b[D" } },
+                 DashboardLimits {},
+                 view,
+                 sink,
+                 &ReadFleetSample);
+    REQUIRE(sink.frames.size() == 4);
+    CHECK(sink.frames[0].contains("[machines]"));
+    CHECK(LinesStarting(sink.frames[0], "build-") == FleetMachines);
+    CHECK(sink.frames[1].contains("[workers]"));
+    CHECK(LinesStarting(sink.frames[1], "build-") == 0);
+    CHECK(sink.frames[2].contains("[leases]"));
+    CHECK(sink.frames[3].contains("[workers]"));
+    CHECK(!sink.frames[3].contains("[machines]"));
+}
+
+TEST_CASE("a panel without a fleet document acts on no key", "[cli][dashboard][panel]")
+{
+    auto view = PanelView {
+        CachePanel(),
+        PanelContext { .absent = std::string { Absent }, .cellWidth = &FakeCellWidth, .rung = RenderRung::Unicode }
+    };
+    CHECK_FALSE(view.Key("\t"));
+    CHECK_FALSE(view.Key("1"));
+}
