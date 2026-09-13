@@ -124,13 +124,22 @@ namespace
         auto deadline = parts.reactor->Clock().Now();
         while (!shared->Closed())
         {
-            shared->sampleSince.store(parts.reactor->Clock().Now().time_since_epoch().count(), std::memory_order_release);
-            auto sample = co_await TakeSample(parts.gatherer, parts.pool, parts.reactor);
+            shared->sampleSince.store(parts.clock->Now().time_since_epoch().count(), std::memory_order_release);
+            auto sample = co_await TakeSample(parts.gatherer, parts.clock, parts.pool, parts.reactor);
             shared->sampleSince.store(LiveEventSource::State::NoSample, std::memory_order_release);
             // Closed while the gather was on the pool: the closed queue refuses the reading,
             // which describes a session that has already ended, and the closed `due` ends
             // the loop below without a wait.
-            shared->Deliver(DashboardEvent { .kind = DashboardEventKind::Sample, .attempts = std::move(sample.attempts) });
+            if (sample.attempts.empty())
+                // Nothing could be asked at all. A failure the loop counts and draws as a gap --
+                // never a reading with nothing in it, which the reader would have to guess about.
+                shared->Deliver(DashboardEvent { .kind = DashboardEventKind::SampleFailed,
+                                                 .at = sample.takenAt,
+                                                 .outcome = Outcome::Unreachable,
+                                                 .note = "no stats source could be asked" });
+            else
+                shared->Deliver(DashboardEvent {
+                    .kind = DashboardEventKind::Sample, .at = sample.takenAt, .attempts = std::move(sample.attempts) });
             shared->Deliver(DashboardEvent { .kind = DashboardEventKind::Tick });
 
             deadline = std::max(deadline + parts.interval, parts.reactor->Clock().Now());

@@ -43,6 +43,7 @@ Task<std::expected<LiveSessionRun, Answer>> RunComposedSession(LiveSessionParts 
     auto sourceParts = LiveSourceParts { .reactor = parts.reactor,
                                          .gatherer = parts.gatherer,
                                          .pool = parts.samplePool,
+                                         .clock = parts.clock,
                                          .interval = parts.plan.interval,
                                          .terminal = nullptr,
                                          .stop = nullptr,
@@ -80,7 +81,8 @@ Task<std::expected<LiveSessionRun, Answer>> RunComposedSession(LiveSessionParts 
 
     source->emplace(std::move(sourceParts));
     auto const closeOnExit = CloseOnExit { &**source };
-    run.exit = co_await RunDashboard(&**source, view.get(), parts.sink, DashboardLimits { .samples = parts.plan.samples });
+    run.exit = co_await RunDashboard(
+        &**source, parts.reader, view.get(), parts.sink, DashboardLimits { .samples = parts.plan.samples });
     co_return run;
 }
 

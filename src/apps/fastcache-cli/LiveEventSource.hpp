@@ -49,6 +49,14 @@ struct LiveSourceParts
     /// Where the blocking gather runs.
     IExecutor* pool { nullptr };
 
+    /// What a sample is stamped with, and when an outstanding one started.
+    ///
+    /// Its own part rather than `reactor->Clock()`, because a sample is stamped ON THE POOL
+    /// the moment `Gather()` returns: a clock refreshed once per reactor turn would hand that
+    /// thread a stale reading, and every rate would be divided by a wrong duration. `SteadyClock`
+    /// in production.
+    IClock* clock { nullptr };
+
     /// Time from one sample's start to the next one's. A sample slower than this is never
     /// overlapped: the next starts when it returns, and the ones its lateness skipped are
     /// not taken in a burst afterwards.
@@ -131,7 +139,7 @@ class LiveEventSource final: public IDashboardEventSource
     ///
     /// **Safe from any thread**: this is what a drain waiting from outside the reactor reads
     /// to say how long a sample it is about to abandon had been out. Measured on the
-    /// reactor's clock, so a caller subtracting it from another clock's `Now()` needs that
+    /// source's `clock`, so a caller subtracting it from another clock's `Now()` needs that
     /// clock to count from the same epoch -- `SteadyClock` against `steady_clock` does.
     /// @return The start of the outstanding sample, or nullopt.
     [[nodiscard]] std::optional<TimePoint> SampleOutstandingSince() const noexcept;
