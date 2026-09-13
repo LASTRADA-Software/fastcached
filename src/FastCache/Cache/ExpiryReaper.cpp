@@ -8,6 +8,7 @@
 #include <coroutine>
 #include <format>
 #include <tuple>
+#include <utility>
 
 namespace FastCache
 {
@@ -51,10 +52,15 @@ namespace
 
 } // namespace
 
-ExpiryReaper::ExpiryReaper(IStorage& storage, ILogger& logger, ExpiryReaperOptions options, IMetricsSink* metrics) noexcept:
+ExpiryReaper::ExpiryReaper(IStorage& storage,
+                           ILogger& logger,
+                           ExpiryReaperOptions options,
+                           IMetricsSink* metrics,
+                           IDrainAbandonment& abandonment) noexcept:
     _storage { storage },
     _logger { logger },
     _metrics { metrics },
+    _abandonment { abandonment },
     _options { options },
     _interval { _options.interval },
     _scanBudget { _options.scanBudget }
@@ -70,7 +76,8 @@ void ExpiryReaper::Start(IReactor& reactor, IExecutor& sweepOn)
 
 void ExpiryReaper::Stop() noexcept
 {
-    if (_reactor == nullptr)
+    auto* const reactor = std::exchange(_reactor, nullptr);
+    if (reactor == nullptr)
         return;
     _source.Cancel();
 
@@ -87,11 +94,22 @@ void ExpiryReaper::Stop() noexcept
     // choice to the supervisor, which answers SIGKILL with no diagnostic. Through
     // `DrainWithin` rather than a hand-rolled loop, because a `waited += poll` count
     // measures the sleep it ASKED for and a sleep costs what the host's timer
-    // granularity says.
-    if (DrainWithin([this] { return AwayFromReactor(); }) == DrainResult::Ceiling)
-        _logger.Log(LogLevel::Warn,
-                    "expiry: a sweep was still running when the cycle stopped; abandoning it rather than waiting "
-                    "further. The frame is left to the reactor's own teardown.");
+    // granularity says. Past the bound the frame is ABANDONED, never destroyed; the
+    // declaration of `Stop` says why.
+    if (DrainWithin([this] { return AwayFromReactor(); }, _options.stopDrain) == DrainResult::Ceiling)
+    {
+        _logger.Logf(LogLevel::Error,
+                     "expiry: the sweep did not come back from its executor within {} ms of the cycle stopping; "
+                     "ending the process rather than freeing a coroutine another thread is still inside (#1397)",
+                     _options.stopDrain.ceiling.count());
+        _abandonment.Abandon();
+
+        // Reached only through a seam that RETURNS, which only a test supplies. Released --
+        // not destroyed, and not retracted, since the reactor never held it -- so `~Task`
+        // cannot free it, and whoever supplied that seam now owns it.
+        std::ignore = _task.Release();
+        return;
+    }
 
     // Taken back off the timer wheel rather than left there: by the time this
     // runs the loop has usually already stopped, so a parked frame would never
@@ -111,8 +129,7 @@ void ExpiryReaper::Stop() noexcept
     // What is NOT optional is that the handle be this task's own, and it is
     // only because `Run` awaits `SleepUntil` directly rather than a nested
     // `Task` -- see the comment there.
-    std::ignore = _reactor->CancelPending(_task.Native());
-    _reactor = nullptr;
+    std::ignore = reactor->CancelPending(_task.Native());
 }
 
 PurgeOutcome ExpiryReaper::SweepOnce(TimePoint now)

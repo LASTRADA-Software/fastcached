@@ -6,6 +6,7 @@
 #include <FastCache/Async/Task.hpp>
 #include <FastCache/Cache/IStorage.hpp>
 #include <FastCache/Cache/ReclaimLog.hpp>
+#include <FastCache/Core/BoundedDrain.hpp>
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
@@ -86,6 +87,13 @@ struct ExpiryReaperOptions
     /// This does NOT move the sweep off the reactor, which is the other half of
     /// #946 and a decision of its own.
     Duration sweepStallCeiling { std::chrono::milliseconds { 50 } };
+
+    /// How long `ExpiryReaper::Stop` waits for the frame to come back from its executor.
+    ///
+    /// Past it the frame is abandoned through `IDrainAbandonment`, which in production ends the
+    /// process. The default is `DrainBound`'s, as for every other shutdown drain here; a test
+    /// shortens it to drive the abandonment.
+    DrainBound stopDrain {};
 };
 
 static_assert(ExpiryReaperOptions::DefaultPurgeBudget <= ReclaimLog::DefaultCapacity,
@@ -148,7 +156,12 @@ class ExpiryReaper
     /// @param logger  Where a swept cycle is reported at Debug.
     /// @param options Pacing and ceilings.
     /// @param metrics Counter sink, or nullptr.
-    ExpiryReaper(IStorage& storage, ILogger& logger, ExpiryReaperOptions options, IMetricsSink* metrics = nullptr) noexcept;
+    /// @param abandonment What `Stop` does with a frame that does not come back in time.
+    ExpiryReaper(IStorage& storage,
+                 ILogger& logger,
+                 ExpiryReaperOptions options,
+                 IMetricsSink* metrics = nullptr,
+                 IDrainAbandonment& abandonment = DefaultDrainAbandonment()) noexcept;
 
     ~ExpiryReaper()
     {
@@ -180,6 +193,11 @@ class ExpiryReaper
     /// `CancelPending` is what makes taking it back decidable rather than a
     /// guess -- true means this call removed it and we are now its only owner.
     /// Idempotent; the destructor calls it.
+    ///
+    /// Waits at most `stopDrain` for a frame away on the executor, and past that ABANDONS it
+    /// rather than destroying it: the frame's code reaches into this reaper, so freeing it frees
+    /// a coroutine another thread is still inside. In production `IDrainAbandonment` ends the
+    /// process; a seam that returns -- only a test's -- gets the frame released, and owns it.
     void Stop() noexcept;
 
     /// Sweep until `token` is cancelled.
@@ -229,10 +247,13 @@ class ExpiryReaper
     /// count raised for a hop still queued on a reactor whose loop has returned would never
     /// fall, turning every stop into a wait for the drain ceiling. "Is" means the same
     /// OBJECT. **A decorator over the reactor is a different object and is counted**, and
-    /// that is the safe side of the trade: stopped with a hop still queued on a loop that has
-    /// returned, it waits out the ceiling. Treating it as the reactor instead would skip the
+    /// that is the safe side of the trade. Stopped with its hop out still queued on a loop that
+    /// has returned, its count never falls: `Stop` waits out `stopDrain`, logs an Error saying
+    /// the sweep did not come back from its executor, and **the process ends with
+    /// `AbandonedDrainExitCode`**. Treating the decorator as the reactor instead would skip the
     /// wait for an executor that may really be elsewhere, which is this defect back again as a
-    /// use-after-free -- so a slow stop there is a cost, not a bug to fix.
+    /// use-after-free. Nothing can tell the two apart from an `IExecutor&`, so to keep the sweep
+    /// on the loop, pass the reactor itself and never a wrapper around it.
     ///
     /// It is NOT "a cycle is running": between sweeps the frame is parked on the reactor's
     /// timer and reclaimable.
@@ -280,6 +301,7 @@ class ExpiryReaper
     IStorage& _storage;
     ILogger& _logger;
     IMetricsSink* _metrics;
+    IDrainAbandonment& _abandonment;
     ExpiryReaperOptions _options;
     Duration _interval;
 

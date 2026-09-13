@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "CompileCapacity.hpp"
 
+#include <FastCache/Core/BoundedDrain.hpp>
+
 #include <chrono>
+#include <cstdlib>
 
 namespace FastCache::Node
 {
@@ -15,15 +18,6 @@ namespace
     /// the interval is short enough that an operator watching `systemctl stop` sees
     /// the count fall rather than a pause.
     constexpr std::chrono::seconds DrainReportInterval { 2 };
-
-    /// What this process exits with when it abandons compiles to stop.
-    ///
-    /// Distinct from every ordinary failure, so a supervisor's log tells "stopped
-    /// with compiles still running" from a crash. 75 is `EX_TEMPFAIL` from
-    /// `sysexits.h` -- not a standard this project otherwise uses, but the closest
-    /// thing to a shared vocabulary for "this was not clean, and retrying is
-    /// reasonable", and unambiguous beside a compiler's own exit codes.
-    constexpr int DrainAbandonedExitCode = 75;
 } // namespace
 
 bool CompileCapacity::TakeBytes(std::size_t want) noexcept
@@ -133,7 +127,7 @@ void CompileCapacity::Drain()
                 //
                 // `_Exit`, not `exit`: static destructors would run the same teardown
                 // this is avoiding.
-                std::_Exit(DrainAbandonedExitCode);
+                std::_Exit(AbandonedDrainExitCode);
 
             case DrainAction::Last:
                 break;

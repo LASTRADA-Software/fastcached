@@ -39,8 +39,11 @@
 #include <utility>
 #include <vector>
 
+#include <tests/Unwrap.hpp>
+
 using namespace std::chrono_literals;
 using FastCache::Testing::MakeBytes;
+using FastCache::Testing::Unwrap;
 
 namespace
 {
@@ -313,6 +316,19 @@ template <typename Predicate>
     return reached();
 }
 
+/// An abandonment that RETURNS and counts, so a case can drive `Stop` past its drain ceiling
+/// and see what it did instead of watching the process end.
+class RecordingAbandonment final: public IDrainAbandonment
+{
+  public:
+    void Abandon() noexcept override
+    {
+        calls.fetch_add(1, std::memory_order_acq_rel);
+    }
+
+    std::atomic<int> calls { 0 }; ///< How many times `Stop` abandoned a frame.
+};
+
 /// How long a case gives the destructor to return BEFORE it releases the park. On the
 /// defect it returns at once, so the look can be short; a fixed destructor does not return
 /// until the release however long the look is, so a slow host cannot turn the fix red.
@@ -321,6 +337,11 @@ constexpr auto StopLook = 200ms;
 /// A cycle that sweeps every millisecond and notices a stop within one, so a case reaches a
 /// hop in a few ticks.
 constexpr ExpiryReaperOptions FastCycle { .interval = 1ms, .stopWakeBound = 1ms };
+
+/// `FastCycle` with a stop drain short enough for a case to wait out.
+constexpr ExpiryReaperOptions FastCycleShortDrain { .interval = 1ms,
+                                                    .stopWakeBound = 1ms,
+                                                    .stopDrain = DrainBound { .ceiling = 20ms, .poll = 1ms } };
 
 /// What a staged destruction observed.
 struct StagedDestruction
@@ -769,12 +790,16 @@ TEST_CASE("Stopping a cycle whose executor is its own reactor does not wait for 
     // the reactor as its own executor the hop out lands on the reactor's own queue, which
     // `CancelPending` takes back -- so there is nothing to wait for. Counted anyway, a frame
     // parked there when the loop has already stopped would never come back to lower the
-    // count, and every in-memory shutdown would wait out the drain ceiling and then warn
-    // that a sweep was still running.
+    // count, and every in-memory shutdown would wait out the drain ceiling and then end the
+    // process as though a sweep were stuck on an executor.
+    //
+    // The ceiling is short and the abandonment is a seam that returns, so that defect shows
+    // here as an assertion rather than as the test process ending with status 75.
     Fixture f;
     CapturingLogger logger;
+    RecordingAbandonment abandonment;
     ParkingReactor reactor { f.reactor };
-    auto reaper = std::make_unique<ExpiryReaper>(f.storage, logger, FastCycle);
+    auto reaper = std::make_unique<ExpiryReaper>(f.storage, logger, FastCycleShortDrain, nullptr, abandonment);
     reaper->Start(reactor, reactor);
 
     // One tick at a time until the hop out has been handed to the reactor. `Tick` swaps the
@@ -785,6 +810,44 @@ TEST_CASE("Stopping a cycle whose executor is its own reactor does not wait for 
 
     reaper.reset();
 
+    CHECK(abandonment.calls.load(std::memory_order_acquire) == 0);
     CHECK(f.reactor.PendingSubmissions() == 0);
-    CHECK_FALSE(std::ranges::any_of(logger.Snapshot(), [](auto const& record) { return record.level == LogLevel::Warn; }));
+    CHECK_FALSE(std::ranges::any_of(logger.Snapshot(), [](auto const& record) {
+        return record.level == LogLevel::Warn || record.level == LogLevel::Error;
+    }));
+}
+
+TEST_CASE("A sweep frame that never comes back is abandoned by ending the process and never freed",
+          "[expiry][reaper][offreactor]")
+{
+    // The drain ceiling's other half. Past it there is no safe way to carry on: the frame's
+    // code reaches into the reaper, so freeing it frees a coroutine another thread is inside,
+    // and returning lets the reaper die underneath that thread. Production ends the process;
+    // this seam returns, so the case can see the ceiling reached, the reason stated, and the
+    // frame left alone.
+    //
+    // The frame is HELD on the executor, so it cannot come back. Destroyed below by the case,
+    // which now owns it: had `~Task` already freed it, that destruction is a double free.
+    Fixture f;
+    CapturingLogger logger;
+    RecordingAbandonment abandonment;
+    ThreadPoolExecutor pool { 1 };
+    HoldingExecutor executor { pool };
+    auto reaper = std::make_unique<ExpiryReaper>(f.storage, logger, FastCycleShortDrain, nullptr, abandonment);
+    executor.HoldNextSubmit();
+    reaper->Start(f.reactor, executor);
+    REQUIRE(TickUntil(f.clock, f.reactor, [&] { return executor.Holding(); }));
+
+    reaper.reset();
+
+    CHECK(abandonment.calls.load(std::memory_order_acquire) == 1);
+    CHECK(std::ranges::any_of(logger.Snapshot(), [](auto const& record) {
+        return record.level == LogLevel::Error
+               && record.message.find("ending the process rather than freeing a coroutine another thread is still inside")
+                      != std::string::npos;
+    }));
+    // Still held, so nothing has resumed it; this is its one and only destruction.
+    auto const held = executor.TakeHeld();
+    REQUIRE(held.has_value());
+    Unwrap(held).resume.destroy();
 }
