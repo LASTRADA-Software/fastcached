@@ -158,15 +158,8 @@ Task<std::expected<LiveSessionRun, Answer>> RunComposedSession(LiveSessionParts 
                                          .stopWaiter = nullptr };
     auto rung = RenderRung::Piped;
 
-    // Refused before acquiring anything: raw mode, the capability queries and the alternate screen
-    // for a subject there is nothing to draw of would flash the operator's terminal for a refusal.
-    if (parts.interactive && subject.panel == nullptr)
-        co_return std::unexpected(Concluded(Outcome::Local,
-                                            std::format("cannot draw live-stats {} on this terminal: this build has "
-                                                        "no panel for it; run it with its output redirected for one "
-                                                        "line per sample instead",
-                                                        subject.key)));
-
+    // No subject is refused here for want of a panel: every row names one (`EverySubjectHasAPanel`),
+    // so acquiring the terminal is never spent on a session that then cannot draw its subject.
     if (parts.interactive)
     {
         auto started = co_await parts.terminals->Acquire(parts.terminalPool, parts.reactor);
@@ -330,9 +323,8 @@ std::unique_ptr<IDashboardView> StandardRungViews::For(RenderRung rung, LivePlan
                    ? nullptr
                    : std::make_unique<PipedRecordView>(_render.format, _render.absentOverride, row.figures);
 
+    // Never null: `EverySubjectHasAPanel`.
     auto const panel = row.panel;
-    if (panel == nullptr)
-        return nullptr;
     // A panel is drawn for a person, so its absent marker is the human format's unless the
     // operator named one: the same text on every rung (§9.6).
     auto absent = _render.absentOverride.value_or(

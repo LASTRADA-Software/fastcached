@@ -3,6 +3,7 @@
 #include "LiveSourceRig.hpp"
 #include "ScriptedCellWidth.hpp"
 #include "ScriptedDashboardEvents.hpp"
+#include "ScriptedSixelEncoder.hpp"
 #include "TerminalCapabilities.hpp"
 
 #include <FastCache/Async/PlatformReactor.hpp>
@@ -317,6 +318,7 @@ struct CompositionFaults
     LiveSubject subject { LiveSubject::Cache }; ///< What the admitted plan watches.
     IAdminDocument* admin { nullptr };          ///< What a document sample asks; none when null.
     SampleReader reader { &ReadStatsSample };   ///< What a sample says.
+    IRungViews* rungViews { nullptr };          ///< What draws instead of the recording views, when set.
 };
 
 /// Await a composed session into @p out, recording an exception rather than losing it.
@@ -359,7 +361,8 @@ struct Composition
         dialer { faults.dialer },
         subject { faults.subject },
         admin { faults.admin },
-        reader { faults.reader }
+        reader { faults.reader },
+        rungViews { faults.rungViews != nullptr ? faults.rungViews : &views }
     {
     }
 
@@ -373,6 +376,7 @@ struct Composition
     LiveSubject subject;
     IAdminDocument* admin;
     SampleReader reader;
+    IRungViews* rungViews; ///< `views`, unless the case named others.
     RecordingRemarks remarks;
     std::optional<LiveEventSource> source;
     std::shared_ptr<ITerminalRestore> restore;
@@ -402,7 +406,7 @@ struct Composition
             .interactive = interactive,
             .terminals = &terminals,
             .stops = &stops,
-            .views = &views
+            .views = rungViews
         };
         task = ComposeInto(std::move(parts), &source, &restore, &result, &threw);
         rig.reactor.Submit(task.Native());
@@ -617,25 +621,45 @@ TEST_CASE("an interactive session whose rung has no view refuses by name and rel
     composition.Finish();
 }
 
-TEST_CASE("an interactive session for a subject with no panel is refused before the terminal is acquired",
-          "[cli][live][session]")
+TEST_CASE("an interactive live-stats fleet session draws the fleet panel, and its chart reaches the terminal",
+          "[cli][live][session][fleet]")
 {
+    // Composed with the standard views, the session's own binding: a view the case built itself would
+    // draw the fleet panel whatever the subject table names. Until the fleet row named its panel this
+    // session was refused by name and nothing was drawn at all.
     Rig rig;
-    ScriptedDocument admin { std::string { "# kpi" } };
+    auto leader = Distributed::FleetSnapshot {};
+    leader.role = Distributed::SchedulerRole::Leader;
+    ScriptedDocument admin { Distributed::RenderFleetText(leader, Distributed::FleetHistoryView {}, std::nullopt) };
+    ScriptedSixelEncoder sixel;
+    auto views = StandardRungViews { RenderOptions { .format = OutputFormat::Human }, &FakeCellWidth, &sixel };
     Composition composition {
-        rig, SixelTerminal, CompositionFaults { .subject = LiveSubject::Fleet, .admin = &admin, .reader = &ReadFleetSample }
+        rig,
+        SixelTerminal,
+        CompositionFaults { .subject = LiveSubject::Fleet, .admin = &admin, .reader = &ReadFleetSample, .rungViews = &views }
     };
     composition.Start(true);
     rig.Settle();
+    REQUIRE(composition.Refusal() == nullptr);
+    REQUIRE(composition.terminals.Spoken() != nullptr);
 
-    auto const* const refusal = composition.Refusal();
-    CHECK((refusal != nullptr && refusal->outcome == Outcome::Local));
-    CHECK((refusal != nullptr && AdvisoryText(*refusal).contains("live-stats fleet")));
-    // Nothing flashed: no raw mode, no queries, no alternate screen for a refusal.
-    CHECK(composition.terminals.Calls() == 0);
-    CHECK(composition.views.Asked().empty());
-    CHECK(admin.Asked().empty());
+    composition.terminals.Spoken()->Say(DashboardEvent {
+        .kind = DashboardEventKind::Resize, .columns = 100, .rows = 40, .cellPixels = SixelTerminal.cellPixels });
+    composition.RunFor(2);
 
+    CHECK(composition.terminals.Calls() == 1);
+    CHECK_FALSE(admin.Asked().empty());
+    auto const& presented = composition.terminals.Presented();
+    CHECK(presented.frames > 0);
+    // The panel's title beside the endpoint, as its top edge draws them: never the source line's `fleet.txt`.
+    CHECK(presented.last.contains(std::format("{}  10.0.0.4:6674", FleetPanel().title)));
+    CHECK(presented.last.contains(Distributed::FleetKpiKeys().front()));
+    // The fleet chart's image, placed in the frame and handed to the terminal's presenter.
+    REQUIRE(presented.placements.size() == 1);
+    CHECK(presented.placements.front().sixel.starts_with("sixel:"));
+
+    composition.terminals.Spoken()->Say(DashboardEvent { .kind = DashboardEventKind::Key, .keys = "q" });
+    rig.Settle();
     composition.Finish();
 }
 
@@ -907,8 +931,12 @@ TEST_CASE("the standard views draw the piped rung, and each subject's own panel 
         CHECK(nodeFrame.contains("10.0.0.5:6674"));
         CHECK(cacheFrame.contains("every 2s"));
 
-        // No panel for the fleet yet: refused by name, never drawn as records.
-        CHECK(views.For(rung, fleet, "10.0.0.4:6674") == nullptr);
+        auto const fleetView = views.For(rung, fleet, "10.0.0.6:6674");
+        REQUIRE(fleetView != nullptr);
+        auto const fleetFrame = fleetView->Frame(model);
+        CHECK(fleetFrame.contains(FleetPanel().title));
+        CHECK_FALSE(fleetFrame.contains(CachePanel().title));
+        CHECK(fleetFrame.contains("10.0.0.6:6674"));
     }
 }
 
