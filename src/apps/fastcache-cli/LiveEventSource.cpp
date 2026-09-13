@@ -3,12 +3,11 @@
 #include "LiveEventSource.hpp"
 
 #include <FastCache/Async/AsyncQueue.hpp>
+#include <FastCache/Async/DeadlineTimer.hpp>
 #include <FastCache/Async/ResumeOn.hpp>
-#include <FastCache/Async/SleepUntil.hpp>
 
 #include <algorithm>
 #include <cassert>
-#include <coroutine>
 #include <cstddef>
 #include <utility>
 #include <variant>
@@ -20,17 +19,18 @@ namespace FastCache::Cli
 ///
 /// Every member is read and written on the reactor's thread only -- the producers resume
 /// there before touching any of it, and `LiveSourceParts::reactor` states the same of the
-/// caller -- which is why the handle and the count are plain rather than atomic.
+/// caller -- which is why the count is plain rather than atomic.
 struct LiveEventSource::State
 {
     explicit State(LiveSourceParts from):
         parts { std::move(from) },
         events { *parts.reactor, AsyncQueueOptions {} },
+        due { *parts.reactor, AsyncQueueOptions {} },
         finished { *parts.reactor, AsyncQueueOptions {} }
     {
     }
 
-    /// What the source was built from, held whole. Declared first: both queues are
+    /// What the source was built from, held whole. Declared first: the queues are
     /// constructed from its reactor.
     LiveSourceParts parts;
 
@@ -50,14 +50,16 @@ struct LiveEventSource::State
     /// this tree's one way to park a coroutine until something else says so.
     AsyncQueue<std::monostate> finished;
 
-    /// The cadence coroutine's own frame while it runs, so `Close()` can retract it; empty
-    /// once it has ended.
+    /// Where the cadence waits between samples: the timer pushes when the next sample is
+    /// due, and `Close()` closes it.
     ///
-    /// No flag says *parked between samples*, because `CancelPending` already answers it:
-    /// during a sample the frame on a queue is `TakeSample`'s, not this one, so a retraction
-    /// then finds nothing -- the `DeadlineTimer` shape, where a live handle means only
-    /// *may be parked*.
-    std::coroutine_handle<> cadence {};
+    /// **The wait is a `DeadlineTimer` feeding this queue rather than a `SleepUntil`**,
+    /// because a sleep can be taken back only by whoever holds the sleeping frame's handle
+    /// -- which the coroutine cannot hand out without copying `DeadlineTimer`'s own
+    /// machinery. Here closing the queue wakes the cadence on the reactor's next turn, it
+    /// leaves through its own tail like every other exit, and its timer's destructor takes
+    /// the pending deadline off the heap.
+    AsyncQueue<std::monostate> due;
 
     int producers { 0 };
 
@@ -85,27 +87,12 @@ struct LiveEventSource::State
 
 namespace
 {
-    /// Leave the coroutine's own handle in @p slot without suspending.
-    ///
-    /// The same shape `DeadlineTimer` uses to let its owner retract a parked wait: a
-    /// coroutine cannot hand out its own handle any other way.
-    struct CaptureHandle
+    /// A cadence deadline has come: say so to the queue the cadence waits on.
+    /// @param due The source's `due` queue.
+    void SampleDue(void* due)
     {
-        std::coroutine_handle<>* slot;
-
-        [[nodiscard]] bool await_ready() const noexcept
-        {
-            return false;
-        }
-
-        [[nodiscard]] bool await_suspend(std::coroutine_handle<> handle) const noexcept
-        {
-            *slot = handle;
-            return false;
-        }
-
-        void await_resume() const noexcept {}
-    };
+        (void) static_cast<AsyncQueue<std::monostate>*>(due)->Push(std::monostate {});
+    }
 
     /// Sample, deliver, park until the next deadline; until closed.
     ///
@@ -117,7 +104,6 @@ namespace
     /// @param shared The source's state; held so it outlives the source if need be.
     DetachedTask RunCadence(std::shared_ptr<LiveEventSource::State> shared)
     {
-        co_await CaptureHandle { &shared->cadence };
         auto const& parts = shared->parts;
         co_await ResumeOn { *parts.reactor };
 
@@ -125,18 +111,20 @@ namespace
         while (!shared->Closed())
         {
             auto sample = co_await TakeSample(parts.gatherer, parts.pool, parts.reactor);
-            // Closed while the gather was on the pool: nobody is listening, and the reading
-            // describes a session that has already ended.
-            if (shared->Closed())
-                break;
-
+            // Closed while the gather was on the pool: the closed queue refuses the reading,
+            // which describes a session that has already ended, and the closed `due` ends
+            // the loop below without a wait.
             shared->Deliver(DashboardEvent { .kind = DashboardEventKind::Sample, .attempts = std::move(sample.attempts) });
             shared->Deliver(DashboardEvent { .kind = DashboardEventKind::Tick });
 
             deadline = std::max(deadline + parts.interval, parts.reactor->Clock().Now());
-            co_await SleepUntil { .reactor = parts.reactor, .deadline = deadline };
+            // One sleep straight through to the deadline: a zero poll interval, because
+            // nothing needs the timer to look at a flag -- `Close()` wakes this through the
+            // queue, and the timer's destructor retracts what is still pending.
+            auto const timer = DeadlineTimer { *parts.reactor, deadline, &SampleDue, &shared->due, Duration::zero() };
+            if (!(co_await shared->due.Pop()).has_value())
+                break;
         }
-        shared->cadence = {};
         shared->ProducerEnded();
     }
 
@@ -205,18 +193,11 @@ void LiveEventSource::Close() noexcept
     if (state.Closed())
         return;
     state.events.Close();
+    // A cadence between samples would otherwise wait out a whole interval before seeing
+    // the close, and `Drained()` with it.
+    state.due.Close();
     if (state.parts.terminal != nullptr)
         state.parts.terminal->Close();
-
-    // A cadence between samples is on the timer heap until its deadline, a whole interval,
-    // and `Drained()` would wait that out for nothing. Retracted, it is freed here, and its
-    // end is counted here because the code after its `co_await` will never run.
-    if (auto const handle = state.cadence; handle && state.parts.reactor->CancelPending(handle))
-    {
-        state.cadence = {};
-        handle.destroy();
-        state.ProducerEnded();
-    }
 }
 
 Task<void> LiveEventSource::Drained()
