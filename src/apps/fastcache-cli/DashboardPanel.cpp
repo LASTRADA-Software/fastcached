@@ -1011,16 +1011,195 @@ namespace
         return items;
     }
 
-    /// The last line: which source answered, how many samples, how many of them were gaps.
+    /// Which source answered, as the source line names it.
+    ///
+    /// `metrics (/metrics at 127.0.0.1:9464)`: the source, and in brackets what was asked where. A reading
+    /// from an endpoint with a role in its subject reads the other way round, because the route IS the
+    /// source there: `/fleet.txt at build-01:9464 (leader)`. Each part the reader did not say is left out
+    /// rather than guessed, and before any reading the whole of it is the absent marker.
     /// @param in The frame's inputs.
-    /// @return The line.
-    [[nodiscard]] std::string SourceLine(FrameInputs const& in)
+    /// @return The text.
+    [[nodiscard]] std::string SourceText(FrameInputs const& in)
+    {
+        if (!in.model->latestStamp.has_value())
+            return std::string { in.absent };
+        auto const& stamp = *in.model->latestStamp;
+        if (stamp.route.empty())
+            return stamp.source;
+        auto const asked = stamp.where.empty() ? stamp.route : std::format("{} at {}", stamp.route, stamp.where);
+        if (!stamp.role.empty())
+            return std::format("{} ({})", asked, stamp.role);
+        return std::format("{} ({})", stamp.source, asked);
+    }
+
+    /// The last line: which source answered on the left, and on the right how many samples and how many
+    /// of them were gaps.
+    ///
+    /// The counts go first for width -- they describe the run, the source says what the run is of -- and
+    /// what is kept is laid out right-aligned, so the counts stay in one place as the source's text changes.
+    /// @param in The frame's inputs.
+    /// @param priority When the line goes; the counts go before it.
+    /// @param budget The content width.
+    /// @return The line; nullopt when even the source was dropped; or, when an essential source does not
+    ///         fit, the cells it needed.
+    [[nodiscard]] std::expected<std::optional<std::string>, std::size_t> SourceLine(FrameInputs const& in,
+                                                                                    Priority priority,
+                                                                                    std::size_t budget)
     {
         auto const& model = *in.model;
         auto const gaps =
             std::ranges::count_if(model.history, [](HistoryEntry const& entry) { return !entry.reading.has_value(); });
-        auto const source = model.latestStamp.has_value() ? std::string_view { model.latestStamp->source } : in.absent;
-        return std::format("{}source  {}   {} samples, {} gap{}", Indent, source, model.samples, gaps, gaps == 1 ? "" : "s");
+        auto const counts = std::format("{} samples, {} gap{}", model.samples, gaps, gaps == 1 ? "" : "s");
+        auto kept =
+            FitPieces({ Piece { .text = std::format("{}source  {}", Indent, SourceText(in)), .priority = priority },
+                        Piece { .text = std::string { PieceGap } + counts, .priority = std::max(priority, Priority::Low) } },
+                      budget,
+                      0,
+                      in.cellWidth);
+        if (!kept.has_value())
+            return std::unexpected(kept.error());
+        if (kept->empty())
+            return std::optional<std::string> {};
+        auto line = kept->front().text;
+        if (kept->size() == 2)
+        {
+            auto const used = in.cellWidth(line) + in.cellWidth(kept->back().text);
+            line.append(budget - used, ' ');
+            line += kept->back().text;
+        }
+        return line;
+    }
+
+    /// What renders one chrome fact in one frame.
+    struct ChromeFactSpec
+    {
+        ChromeFact fact; ///< The enumerator this row describes.
+        /// The fact's text in this frame, its absent marker by name where it has no reading.
+        std::string (*render)(FrameInputs const& in, PanelContext const& context);
+    };
+
+    /// A text field of the newest reading, or nullptr when it carries none.
+    /// @param model What is known.
+    /// @param name The field.
+    /// @return The field's lexical form, or nullptr.
+    [[nodiscard]] std::string const* NewestText(DashboardModel const& model, std::string_view name) noexcept
+    {
+        auto const* field = model.latest.has_value() ? FindField(*model.latest, name) : nullptr;
+        return field == nullptr || field->value.kind == CellKind::Absent ? nullptr : &field->value.lexical;
+    }
+
+    /// How long the endpoint has served, from whichever reading carries it.
+    /// @param model What is known.
+    /// @return Seconds, or nullopt when nothing read says.
+    [[nodiscard]] std::optional<std::uint64_t> UptimeOf(DashboardModel const& model) noexcept
+    {
+        if (model.nodeStatus.has_value())
+            return model.nodeStatus->uptimeSeconds;
+        auto const* text = NewestText(model, CacheUptimeField);
+        if (text == nullptr)
+            return std::nullopt;
+        auto seconds = std::uint64_t { 0 };
+        auto const [end, error] = std::from_chars(text->data(), text->data() + text->size(), seconds);
+        return error == std::errc {} && end == text->data() + text->size() ? std::optional { seconds } : std::nullopt;
+    }
+
+    /// One row per `ChromeFact`, in enumerator order.
+    constexpr auto ChromeFactTable = EnumTable<ChromeFact, ChromeFactSpec> { {
+        { .fact = ChromeFact::Version,
+          .render = [](FrameInputs const& in, PanelContext const& /*context*/) -> std::string {
+              // A node says it in its status; a cache's INFO says it as a field. Neither is invented.
+              if (in.model->nodeStatus.has_value() && !in.model->nodeStatus->version.empty())
+                  return in.model->nodeStatus->version;
+              auto const* text = NewestText(*in.model, CacheVersionField);
+              return text == nullptr ? std::string { in.absent } : *text;
+          } },
+        { .fact = ChromeFact::Endpoint,
+          .render = [](FrameInputs const& in, PanelContext const& context) -> std::string {
+              return context.endpoint.empty() ? std::string { in.absent } : context.endpoint;
+          } },
+        { .fact = ChromeFact::Leader,
+          .render = [](FrameInputs const& in, PanelContext const& context) -> std::string {
+              // Stated as the leader's only once a reading came from it: an endpoint that has not answered as
+              // the leader has not been shown to be one, and is still where the session asks.
+              auto const led = in.model->latestStamp.has_value() && in.model->latestStamp->role == LeaderRole;
+              auto const where = context.endpoint.empty() ? in.absent : std::string_view { context.endpoint };
+              return led ? std::format("{} {}", LeaderRole, where) : std::string { where };
+          } },
+        { .fact = ChromeFact::Uptime,
+          .render = [](FrameInputs const& in, PanelContext const& /*context*/) -> std::string {
+              auto const seconds = UptimeOf(*in.model);
+              return std::format("up {}", seconds.has_value() ? UptimeText(*seconds) : std::string { in.absent });
+          } },
+        { .fact = ChromeFact::Machines,
+          .render = [](FrameInputs const& in, PanelContext const& /*context*/) -> std::string {
+              auto const* document = in.model->latestDocument.get();
+              auto const* machines = document == nullptr ? nullptr : document->Section(FleetSection::Machines);
+              return machines == nullptr ? std::format("{} machines", in.absent)
+                                         : std::format("{} machines", machines->rows.size());
+          } },
+        { .fact = ChromeFact::Interval,
+          .render = [](FrameInputs const& in, PanelContext const& context) -> std::string {
+              return context.interval.has_value()
+                         ? std::format("every {}s", std::chrono::duration<double> { *context.interval }.count())
+                         : std::format("every {}", in.absent);
+          } },
+        { .fact = ChromeFact::Quit,
+          .render = [](FrameInputs const& /*in*/, PanelContext const& /*context*/) -> std::string { return "q"; } },
+        { .fact = ChromeFact::QuitWord,
+          .render = [](FrameInputs const& /*in*/, PanelContext const& /*context*/) -> std::string { return "q quit"; } },
+    } };
+
+    static_assert(RowsInEnumeratorOrder(ChromeFactTable, &ChromeFactSpec::fact),
+                  "ChromeFactTable must hold one row per ChromeFact, in enumerator order");
+
+    /// A title bar's two halves.
+    struct TitleText
+    {
+        std::string subject {}; ///< The left half: the subject and what is stated beside it.
+        std::string facts {};   ///< The right half, right-aligned by the frame.
+    };
+
+    /// The title bar @p spec states, fitted to a frame @p columns wide.
+    ///
+    /// The subject is essential; every fact goes in `Priority` order, the rightmost among equals first, so
+    /// what a narrow terminal keeps is decided by the same one function that decides every other line.
+    /// @param in The frame's inputs.
+    /// @param spec The panel.
+    /// @param context The session's facts.
+    /// @param columns The frame's width.
+    /// @return The two halves.
+    [[nodiscard]] TitleText TitleFor(FrameInputs const& in,
+                                     PanelSpec const& spec,
+                                     PanelContext const& context,
+                                     std::size_t columns)
+    {
+        // `┌─ ` subject ` ` fill ` ` facts ` ─┐`: two corners, two edge glyphs, four spaces and the one fill
+        // cell that keeps the halves apart are what the text cannot have.
+        constexpr auto Chrome = std::size_t { 9 };
+        constexpr auto SubjectSlot = std::size_t { 0 };
+        constexpr auto FactsSlot = std::size_t { 1 };
+        auto pieces = std::vector<Piece> { Piece { .text = std::string { spec.title }, .priority = Priority::Essential } };
+        for (auto const& row: spec.titleFacts)
+        {
+            auto const beside = row.side == TitleSide::Subject;
+            auto text = ChromeFactTable[static_cast<std::size_t>(row.fact)].render(in, context);
+            pieces.push_back(Piece { .text = std::string { beside ? " " : "  " } + text,
+                                     .priority = row.priority,
+                                     .slot = beside ? SubjectSlot : FactsSlot });
+        }
+        auto kept = FitPieces(std::move(pieces), columns > Chrome ? columns - Chrome : 0, 0, in.cellWidth);
+        auto title = TitleText {};
+        if (!kept.has_value())
+        {
+            // Not even the subject fits; the frame cuts it.
+            title.subject = std::string { spec.title };
+            return title;
+        }
+        for (auto const& piece: *kept)
+            (piece.slot == SubjectSlot ? title.subject : title.facts) += piece.text;
+        // The first fact kept on the right carries the gap written for one before it.
+        title.facts.erase(0, std::min(title.facts.find_first_not_of(' '), title.facts.size()));
+        return title;
     }
 
     /// The one line drawn instead of a panel that does not fit.
@@ -1043,6 +1222,14 @@ namespace
     }
 
 } // namespace
+
+std::string UptimeText(std::uint64_t seconds)
+{
+    constexpr auto PerMinute = std::uint64_t { 60 };
+    constexpr auto PerHour = PerMinute * 60;
+    constexpr auto PerDay = PerHour * 24;
+    return std::format("{}d{:02}:{:02}", seconds / PerDay, (seconds % PerDay) / PerHour, (seconds % PerHour) / PerMinute);
+}
 
 std::string_view NameIn(FieldNames const& names, StatsOrigin origin) noexcept
 {
@@ -1250,24 +1437,20 @@ DashboardFrame PanelView::PlacedFrame(DashboardModel const& model)
         std::ranges::move(*block, std::back_inserter(items));
     }
     items.push_back(Blank());
-    auto source =
-        FitPieces({ Piece { .text = SourceLine(in), .priority = _spec->sourcePriority } }, budget, 0, in.cellWidth);
+    auto source = SourceLine(in, _spec->sourcePriority, budget);
     if (!source.has_value())
         return tooSmall(source.error() + FrameColumns);
-    if (!source->empty())
-        items.push_back(Item { .lines = { Joined(*source, {}) }, .priority = _spec->sourcePriority });
+    if (source->has_value())
+        items.push_back(Item { .lines = { std::move(**source) }, .priority = _spec->sourcePriority });
 
     auto const fitted = FitRows(std::move(items), available);
     if (!fitted.has_value())
         return tooSmall(0);
 
-    auto title = std::string { _spec->title };
-    if (!_context.endpoint.empty())
-        title += "  " + _context.endpoint;
-    if (_context.interval.has_value())
-        title += std::format("  every {}s", std::chrono::duration<double> { *_context.interval }.count());
+    auto const title = TitleFor(in, *_spec, _context, columns);
     auto frame =
-        DashboardFrame { .text = Cli::Frame(title, fitted->lines, columns, *_glyphs, in.cellWidth), .placements = {} };
+        DashboardFrame { .text = Cli::Frame(title.subject, title.facts, fitted->lines, columns, *_glyphs, in.cellWidth),
+                         .placements = {} };
 
     // The chart kept its rows: draw the image over them. The frame's first row is its top edge and its
     // first column its left edge, so a content line's frame row is its index plus two and the chart's

@@ -123,14 +123,31 @@ std::string Frame(std::string_view title,
                   RungGlyphs const& glyphs,
                   CellWidth cellWidth)
 {
+    return Frame(title, {}, lines, width, glyphs, cellWidth);
+}
+
+std::string Frame(std::string_view title,
+                  std::string_view trailing,
+                  std::span<std::string const> lines,
+                  std::size_t width,
+                  RungGlyphs const& glyphs,
+                  CellWidth cellWidth)
+{
     auto const inside = std::max<std::size_t>(width, 4) - 2;
 
-    // `┌─ title ───┐`: one edge glyph, the title padded by a space each side, then edge to the
-    // corner. A title too long for the frame is cut, never allowed to push the corner out.
+    // `┌─ title ─── trailing ─┐`: one edge glyph, the title padded by a space each side, fill, the trailing
+    // half padded the same way and one edge glyph before the corner. A title too long for the frame is cut,
+    // never allowed to push the corner out; the trailing half is left off before that happens.
     auto const label = title.empty() ? std::string {} : std::format(" {} ", title);
-    auto const shownLabel = FitRight(label, std::min(cellWidth(label), inside - 1), cellWidth);
+    auto const right = trailing.empty() ? std::string {} : std::format(" {} ", trailing);
+    auto const rightFits = !right.empty() && cellWidth(label) + cellWidth(right) + 3 <= inside;
+    auto const rightCells = rightFits ? cellWidth(right) + 1 : 0;
+    auto const shownLabel = FitRight(label, std::min(cellWidth(label), inside - 1 - rightCells), cellWidth);
     auto frame = std::string { glyphs.topLeft } + std::string { glyphs.horizontal } + shownLabel
-                 + Repeat(glyphs.horizontal, inside - 1 - cellWidth(shownLabel)) + std::string { glyphs.topRight } + "\n";
+                 + Repeat(glyphs.horizontal, inside - 1 - cellWidth(shownLabel) - rightCells);
+    if (rightFits)
+        frame += right + std::string { glyphs.horizontal };
+    frame += std::string { glyphs.topRight } + "\n";
 
     // One blank column is kept before the right edge, so no content ever touches it: a figure
     // written up against the edge reads as one word with it, to a person and to a script alike.

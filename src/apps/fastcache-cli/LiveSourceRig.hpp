@@ -295,6 +295,15 @@ class ScriptedDocument final: public IAdminDocument
         return _answer;
     }
 
+    /// @return Where this surface says it answers.
+    [[nodiscard]] std::string AdminAddress() override
+    {
+        return std::string { ScriptedAdminAddress };
+    }
+
+    /// The address every scripted surface answers at, so a case can find it in a source line.
+    static constexpr std::string_view ScriptedAdminAddress = "127.0.0.1:9464";
+
     /// Every path this was asked for, in order.
     /// @return The paths.
     [[nodiscard]] std::vector<std::string> const& Asked() const noexcept

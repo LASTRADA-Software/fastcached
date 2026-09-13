@@ -207,6 +207,13 @@ std::expected<std::string, AdminError> LadderGatherer::FetchAdmin(std::string_vi
     return response->body;
 }
 
+std::string LadderGatherer::AdminAddress()
+{
+    // `ResolveAdmin` remembers what it resolved, so asking after a fetch dials nothing new.
+    auto const admin = ResolveAdmin();
+    return admin.has_value() ? EndpointText(*admin) : std::string {};
+}
+
 StatsAttempt LadderGatherer::AskMetrics()
 {
     StatsAttempt attempt { .origin = StatsOrigin::Metrics };
@@ -223,6 +230,7 @@ StatsAttempt LadderGatherer::AskMetrics()
     }
 
     attempt.asked = true;
+    attempt.where = EndpointText(*admin);
     auto const response = HttpGet(*admin, MetricsPath, _timeouts, _bearer);
     if (!response.has_value())
     {
@@ -264,6 +272,7 @@ StatsAttempt LadderGatherer::AskNodeMetrics()
     }
 
     attempt.asked = true;
+    attempt.where = std::string { _node->Address() };
     auto const reply = _node->Send(CompileCacheWire::EncodeNodeMetricsRequest());
     if (!reply.has_value())
     {
@@ -305,6 +314,7 @@ StatsAttempt LadderGatherer::AskInfo()
     }
 
     attempt.asked = true;
+    attempt.where = EndpointText(_cache);
     auto const reply = Call(*_resp, { "INFO" });
     if (!reply.has_value())
     {

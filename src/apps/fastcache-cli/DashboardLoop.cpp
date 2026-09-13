@@ -94,7 +94,11 @@ namespace
     /// @param at When the sample was taken.
     void AcceptReading(DashboardModel& model, SampleReading reading, TimePoint at)
     {
-        auto stamp = ReadingStamp { .at = at, .source = std::move(reading.source) };
+        auto stamp = ReadingStamp { .at = at,
+                                    .source = std::move(reading.source),
+                                    .route = std::move(reading.route),
+                                    .where = std::move(reading.where),
+                                    .role = std::move(reading.role) };
         // The interval is decided ONCE, and the run length and the history are both written from
         // that one decision, so the history and `BrokenRun()` cannot come to disagree about it.
         auto const elapsed = model.runLength > 0 && model.latestStamp.has_value() && ContinuesRun(*model.latestStamp, stamp)
@@ -209,9 +213,21 @@ SampleReading ReadStatsSample(DashboardEvent const& event)
     // Copied out BEFORE the value moves, since the field points into it.
     auto const* named = FindField(answer.value, StatsSourceFieldName);
     auto source = named == nullptr ? std::string {} : named->value.lexical;
-    return SampleReading {
+    // Where it answered is the WINNING attempt's, found by the name the decision reported rather than
+    // decided a second time; the route is that source's own row.
+    auto reading = SampleReading {
         .outcome = Outcome::Affirmative, .value = std::move(answer.value), .source = std::move(source), .note = {}
     };
+    for (auto const& attempt: event.attempts)
+    {
+        auto const* row = DescriptorOf(attempt.origin);
+        if (row != nullptr && row->name == reading.source)
+        {
+            reading.route = std::string { row->route };
+            reading.where = attempt.where;
+        }
+    }
+    return reading;
 }
 
 bool IsQuitKey(std::string_view keys) noexcept

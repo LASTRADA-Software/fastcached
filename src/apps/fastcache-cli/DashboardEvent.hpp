@@ -98,6 +98,10 @@ struct DashboardEvent
     /// fleet session could not stream at all. Disengaged on a `cache` or `node` sample.
     std::optional<std::expected<std::string, AdminError>> document {};
 
+    /// `Sample`, `fleet` session: the `host:port` the document was asked at, or empty when the fetch
+    /// resolved no admin surface. What a panel's source line names as `/fleet.txt at <where>`.
+    std::string documentWhere {};
+
     /// `Sample` and `SampleFailed`, `node` session: what the node said about itself when this
     /// sample was taken, or nullopt when the sample carried no status.
     ///

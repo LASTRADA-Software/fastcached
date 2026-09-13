@@ -229,4 +229,23 @@ using FastCache::FigureFormat;
                                 RungGlyphs const& glyphs,
                                 CellWidth cellWidth);
 
+/// @p lines inside the rung's frame, with @p title on the left of the top edge and @p trailing right-aligned
+/// on it: `┌─ title ───── trailing ─┐`.
+///
+/// What goes into either half is the caller's to decide; the frame only draws it. When both do not fit
+/// with a fill cell between them the trailing half is left off rather than overlapping the title.
+/// @param title The top edge's left half; cut to fit.
+/// @param trailing The top edge's right half; empty for none.
+/// @param lines The content lines.
+/// @param width The frame's total width in cells, edges included; at least four.
+/// @param glyphs The rung's glyphs.
+/// @param cellWidth How wide text is.
+/// @return The frame.
+[[nodiscard]] std::string Frame(std::string_view title,
+                                std::string_view trailing,
+                                std::span<std::string const> lines,
+                                std::size_t width,
+                                RungGlyphs const& glyphs,
+                                CellWidth cellWidth);
+
 } // namespace FastCache::Cli
