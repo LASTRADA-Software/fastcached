@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "DashboardLoop.hpp"
+#include "DashboardRig.hpp"
 #include "ScriptedDashboardEvents.hpp"
 
 #include <FastCache/Async/TestReactor.hpp>
@@ -50,18 +51,6 @@ class RecordingView final: public IDashboardView
     std::vector<DashboardModel> seen {};
 };
 
-/// Collects frames so a case can compare runs to each other.
-class CollectingSink final: public IFrameSink
-{
-  public:
-    void Present(std::string_view frame) override
-    {
-        frames.emplace_back(frame);
-    }
-
-    std::vector<std::string> frames {};
-};
-
 /// A reading that `ChooseStats` will accept.
 /// @param value What the one metric reads.
 /// @return One attempt carrying it.
@@ -97,55 +86,6 @@ class CollectingSink final: public IFrameSink
 [[nodiscard]] std::vector<StatsAttempt> NothingAnswered()
 {
     return { StatsAttempt { .origin = StatsOrigin::Info, .asked = true, .record = std::nullopt, .note = "refused" } };
-}
-
-/// Run the dashboard once, writing the result where the caller can read it.
-///
-/// A named coroutine over POINTERS rather than a capturing lambda: a lambda
-/// coroutine destroys its closure at the first suspension, so every captured
-/// reference dangles from then on -- and this coroutine suspends on its first
-/// statement. The caller owns every argument for the whole run.
-/// @param events The scripted source.
-/// @param view What draws.
-/// @param sink Where frames go.
-/// @param limits What bounds the run.
-/// @param out Where to put the result.
-/// @return The task to submit.
-[[nodiscard]] Task<void> DriveOnce(IDashboardEventSource* events,
-                                   SampleReader reader,
-                                   IDashboardView* view,
-                                   IFrameSink* sink,
-                                   DashboardLimits limits,
-                                   std::optional<DashboardExit>* out)
-{
-    *out = co_await RunDashboard(events, reader, view, sink, limits);
-}
-
-/// Drive the loop to completion on a deterministic reactor.
-/// @param script The events, in order.
-/// @param limits What bounds the run.
-/// @param view The view to draw through.
-/// @param sink Where frames go.
-/// @param reader What reads a `Sample`; the stats ladder's own, as a `cache` session binds it.
-/// @return How it ended.
-[[nodiscard]] DashboardExit Drive(std::vector<DashboardEvent> script,
-                                  DashboardLimits limits,
-                                  RecordingView& view,
-                                  CollectingSink& sink,
-                                  SampleReader reader = &ReadStatsSample)
-{
-    auto clock = ManualClock {};
-    auto reactor = TestReactor { clock };
-    auto events = ScriptedDashboardEvents { reactor, std::move(script) };
-
-    auto result = std::optional<DashboardExit> {};
-    auto task = DriveOnce(&events, reader, &view, &sink, limits, &result);
-
-    reactor.Submit(task.Native());
-    reactor.Drain();
-
-    REQUIRE(result.has_value());
-    return Unwrap(result);
 }
 
 } // namespace
