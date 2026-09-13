@@ -31,79 +31,6 @@ namespace
         return run;
     }
 
-    /// @p value rounded to a whole number and grouped in thousands with a space, which reads in
-    /// every locale and is never mistaken for a decimal separator.
-    ///
-    /// Rounded by FORMATTING rather than through an integer: a counter is a `uint64_t` and can
-    /// exceed what `llround` may return, which is unspecified rather than an error.
-    /// @param value A finite number.
-    /// @return The grouped text.
-    [[nodiscard]] std::string Grouped(double value)
-    {
-        auto const whole = std::format("{:.0f}", std::fabs(value));
-        auto grouped = std::string {};
-        grouped.reserve(whole.size() + (whole.size() / 3) + 1);
-        if (std::signbit(value) && whole != "0")
-            grouped.push_back('-');
-        for (auto const index: std::views::iota(std::size_t { 0 }, whole.size()))
-        {
-            if (index != 0 && (whole.size() - index) % 3 == 0)
-                grouped.push_back(' ');
-            grouped.push_back(whole[index]);
-        }
-        return grouped;
-    }
-
-    /// One binary unit.
-    struct ByteUnit
-    {
-        double scale;          ///< Bytes per unit.
-        std::string_view name; ///< What it is called.
-    };
-
-    /// The units a byte figure may be written in, largest first.
-    constexpr auto ByteUnits = std::array {
-        ByteUnit { .scale = 1024.0 * 1024.0 * 1024.0 * 1024.0, .name = "TiB" },
-        ByteUnit { .scale = 1024.0 * 1024.0 * 1024.0, .name = "GiB" },
-        ByteUnit { .scale = 1024.0 * 1024.0, .name = "MiB" },
-        ByteUnit { .scale = 1024.0, .name = "KiB" },
-    };
-
-    /// A byte count in the largest unit it fills at least once.
-    /// @param value Bytes.
-    /// @return The text.
-    [[nodiscard]] std::string Bytes(double value)
-    {
-        for (auto const& unit: ByteUnits)
-        {
-            auto const scaled = value / unit.scale;
-            if (scaled >= 1.0)
-                return scaled < 100.0 ? std::format("{:.2f} {}", scaled, unit.name)
-                                      : std::format("{:.1f} {}", scaled, unit.name);
-        }
-        return std::format("{:.0f} B", value);
-    }
-
-    /// How one figure format writes a present, finite value.
-    struct FigureFormatSpec
-    {
-        FigureFormat format;                ///< The enumerator this row describes.
-        std::string (*write)(double value); ///< The writer.
-    };
-
-    /// The figure formats, one row per enumerator, in enumerator order.
-    constexpr EnumTable<FigureFormat, FigureFormatSpec> FigureFormatTable { {
-        { .format = FigureFormat::Count, .write = [](double value) { return Grouped(value); } },
-        { .format = FigureFormat::Rate,
-          .write = [](double value) { return std::fabs(value) >= 10.0 ? Grouped(value) : std::format("{:.1f}", value); } },
-        { .format = FigureFormat::Percent, .write = [](double value) { return std::format("{:.1f} %", value * 100.0); } },
-        { .format = FigureFormat::Bytes, .write = &Bytes },
-        { .format = FigureFormat::Seconds, .write = [](double value) { return std::format("{:.2f} s", value); } },
-    } };
-
-    static_assert(RowsInEnumeratorOrder(FigureFormatTable, &FigureFormatSpec::format),
-                  "FigureFormatTable must hold one row per FigureFormat, in enumerator order");
-
     /// The level @p value draws at, given the largest present value.
     /// @param value A present, finite value.
     /// @param largest The largest present value in the series.
@@ -187,7 +114,7 @@ std::string FormatFigure(std::optional<double> value, FigureFormat format, std::
 {
     if (!value.has_value() || !std::isfinite(*value))
         return std::string { absent };
-    return FigureFormatTable[static_cast<std::size_t>(format)].write(*value);
+    return WriteFigure(*value, format);
 }
 
 std::string Frame(std::string_view title,

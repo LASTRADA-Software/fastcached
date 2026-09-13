@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
+#include <FastCache/Core/FigureText.hpp>
+#include <FastCache/Core/Ranges.hpp>
 #include <FastCache/Distributed/FleetChart.hpp>
 #include <FastCache/Distributed/FleetText.hpp>
 #include <FastCache/Distributed/FleetView.hpp>
@@ -77,46 +79,6 @@ namespace
         }
     };
 
-    /// How a page renders a number, and what SCALE the integer beside it is in.
-    ///
-    /// The page reads it to dress a cell. A machine-readable surface ignores it for a
-    /// column -- a column's scale is a property of the column name, which a consumer
-    /// already has -- and NAMES it for a headline figure, where the name alone cannot
-    /// say whether `853` is a count or eight-hundred-and-fifty-three thousandths.
-    ///
-    /// Private to this file, so the enumerator values bind nothing; the explicit `= 0`
-    /// is `EnumTable`'s anchor rather than a contract.
-    enum class CellFormat : std::uint8_t
-    {
-        Count = 0,
-        Bytes,
-        Permille,
-        Millis,
-        Text,
-        Last,
-    };
-
-    /// What a scale is called where a machine has to read it.
-    struct CellFormatRow
-    {
-        CellFormat format;     ///< The enumerator this row describes.
-        std::string_view name; ///< Its machine spelling.
-    };
-
-    /// One spelling per scale, so the word a consumer parses and the arm that renders
-    /// it cannot be attached to different formats.
-    constexpr EnumTable<CellFormat, CellFormatRow> CellFormatTable {
-        CellFormatRow { .format = CellFormat::Count, .name = "count" },
-        CellFormatRow { .format = CellFormat::Bytes, .name = "bytes" },
-        // Thousandths, not percent: the cell carries an integer, so a percentage with
-        // one decimal has to be scaled somewhere and the name is where a reader finds
-        // out which. `853` is 85.3%.
-        CellFormatRow { .format = CellFormat::Permille, .name = "permille" },
-        CellFormatRow { .format = CellFormat::Millis, .name = "milliseconds" },
-        CellFormatRow { .format = CellFormat::Text, .name = "text" },
-    };
-    static_assert(RowsInEnumeratorOrder(CellFormatTable, &CellFormatRow::format));
-
     /// How the PAGE dresses a cell. The JSON ignores it entirely: a chip and a
     /// freshness pill are a reader's shorthand for a value the machine-readable
     /// form already carries verbatim, so decorating there would put presentation
@@ -183,20 +145,6 @@ namespace
         AppendJsonText(out, text);
     }
 
-    /// Render a byte count the way an operator reads one.
-    [[nodiscard]] std::string HumanBytes(std::uint64_t bytes)
-    {
-        constexpr std::array<std::string_view, 5> Units { "B", "KiB", "MiB", "GiB", "TiB" };
-        auto scaled = static_cast<double>(bytes);
-        std::size_t unit = 0;
-        while (scaled >= 1024.0 && unit + 1 < Units.size())
-        {
-            scaled /= 1024.0;
-            ++unit;
-        }
-        return unit == 0 ? std::format("{} {}", bytes, Units[unit]) : std::format("{:.1f} {}", scaled, Units[unit]);
-    }
-
     /// The chip class per slot limit, in enumerator order.
     ///
     /// A table rather than the `if` ladder this used to be, and the ladder is why:
@@ -242,16 +190,6 @@ namespace
     /// the same claim on one and different claims on the other.
     constexpr std::string_view AbsentText = "&ndash;";
 
-    /// Render an age the way an operator reads one.
-    [[nodiscard]] std::string HumanMillis(std::uint64_t millis)
-    {
-        if (millis < 1000)
-            return std::format("{} ms", millis);
-        if (millis < 60'000)
-            return std::format("{:.1f} s", static_cast<double>(millis) / 1000.0);
-        return std::format("{:.1f} min", static_cast<double>(millis) / 60'000.0);
-    }
-
     /// One cell, as the page shows it.
     ///
     /// The dash is the spelling `--cluster-status` already uses for "has not said",
@@ -262,20 +200,8 @@ namespace
             return std::string { AbsentText };
         if (cell.kind == FleetCell::Kind::Text)
             return EscapeHtml(cell.text);
-        switch (format)
-        {
-            case CellFormat::Bytes:
-                return HumanBytes(cell.number);
-            case CellFormat::Permille:
-                return std::format("{:.1f}%", static_cast<double>(cell.number) / 10.0);
-            case CellFormat::Millis:
-                return HumanMillis(cell.number);
-            case CellFormat::Count:
-            case CellFormat::Text:
-            case CellFormat::Last:
-                break;
-        }
-        return std::format("{}", cell.number);
+        // Through the one writer the terminal fleet panel uses too, so a figure reads the same on both.
+        return EscapeHtml(HumanFleetFigure(cell.number, format));
     }
 
     /// One cell, as the JSON carries it. Absent is `null`, never `0`.
@@ -1336,6 +1262,60 @@ std::vector<std::string> FleetColumnNames(FleetSection section, FleetSnapshot co
     return {};
 }
 
+std::optional<CellFormat> CellFormatFromName(std::string_view name) noexcept
+{
+    auto const* row =
+        FindIfOrNull(CellFormatTable, [name](CellFormatRow const& candidate) { return candidate.name == name; });
+    return row == nullptr ? std::nullopt : std::optional<CellFormat> { row->format };
+}
+
+std::optional<CellFormat> FleetColumnFormat(FleetSection section, std::string_view name)
+{
+    auto const formatOf = [name](auto const& columns) -> std::optional<CellFormat> {
+        for (auto const& column: columns)
+            if (column.name == name)
+                return column.format;
+        return std::nullopt;
+    };
+
+    // The tables `FleetColumnNames` reads, section for section, with no default arm for its reason.
+    switch (section)
+    {
+        case FleetSection::Kpi:
+            // Each row names its own unit, so no column of this section has one scale.
+            return std::nullopt;
+        case FleetSection::Machines:
+            return formatOf(NodeColumns);
+        case FleetSection::Workers:
+            return formatOf(WorkerColumns);
+        case FleetSection::Leases:
+            return formatOf(LeaseColumns);
+        case FleetSection::Members:
+            return formatOf(MemberColumns);
+        case FleetSection::Tiers:
+            if (name == TierEndpointColumn)
+                return CellFormat::Text;
+            // Every tier crossed with every suffix, composed through `TierColumnName` exactly as the
+            // renderers compose it, so there is no second spelling of a tier column to parse.
+            for (auto const& tier: StorageTierTable)
+                for (auto const& column: TierColumns)
+                    if (TierColumnName(tier.tier, column.suffix) == name)
+                        return column.format;
+            return std::nullopt;
+        case FleetSection::Last:
+            break;
+    }
+    return std::nullopt;
+}
+
+std::string HumanFleetFigure(std::uint64_t number, CellFormat format)
+{
+    auto const& row = CellFormatTable[static_cast<std::size_t>(format)];
+    if (!row.figure.has_value())
+        return std::format("{}", number);
+    return WriteFigure(static_cast<double>(number) * row.scale, *row.figure);
+}
+
 std::string RenderFleetText(FleetSnapshot const& snapshot,
                             FleetHistoryView const& history,
                             std::optional<FleetSection> section)
@@ -1695,7 +1675,7 @@ footer { margin-top:2.4rem; padding-top:1rem; border-top:1px solid var(--line);
 
     /// A percentage as a per-mille cell.
     ///
-    /// The cell carries an integer, so a share with one decimal has to be scaled: 85.3%
+    /// The cell carries an integer, so a share with one decimal has to be scaled: 85.3 %
     /// travels as `853` under `CellFormat::Permille`, which is the same shape every
     /// percentage COLUMN on this page already uses rather than a second convention.
     /// @param share The share as a percentage, absent when it cannot be computed.
@@ -1775,7 +1755,7 @@ footer { margin-top:2.4rem; padding-top:1rem; border-top:1px solid var(--line);
     KpiReadout KpiHitRate(FleetSnapshot const& /*snapshot*/, FleetHistoryView const& history)
     {
         // The `%` moved out of the page's `<small>` and into the cell, because
-        // `CellAsText` already renders a per-mille cell as `85.3%` and two places
+        // `CellAsText` already renders a per-mille cell as `85.3 %` and two places
         // spelling one suffix is the drift this table exists to prevent.
         return KpiReadout { .value = PermilleCell(FoldedSeries("hit-rate", history)),
                             .of = FleetCell::Nothing(),

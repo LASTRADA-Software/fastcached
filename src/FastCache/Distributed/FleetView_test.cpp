@@ -290,6 +290,29 @@ TEST_CASE("Outstanding leases are listed, and the truncation is visible", "[dist
     CHECK(json.contains(R"("age":90000)"));
 }
 
+TEST_CASE("The page writes a figure as every human surface does, and the text and the JSON keep the integer",
+          "[distributed][fleetview][units]")
+{
+    // One writer per scale (`HumanFleetFigure` over `WriteFigure`), shared with the terminal fleet panel.
+    // WHAT DISTINGUISHES: the page's memory cell is exactly the shared writer's `93.65 GiB` and its CPU
+    // cell `71.5 %` -- a page keeping a byte formatter of its own draws `93.6 GiB` beside the panel's
+    // `93.65 GiB` -- while `/fleet.txt` and `/fleet.json` carry `100552671232` and `715` untouched.
+    auto snapshot = LeadingSnapshot();
+    snapshot.nodes.front().capacity.totalMemoryBytes = 100552671232ULL;
+    snapshot.nodes.front().load.cpuBusyPermille = 715;
+
+    auto const html = RenderFleetHtml(snapshot, NoHistory(), 10);
+    CHECK(html.contains(">93.65 GiB<"));
+    CHECK(html.contains(">71.5 %<"));
+    CHECK(HumanFleetFigure(100552671232ULL, CellFormat::Bytes) == "93.65 GiB");
+
+    auto const text = RenderFleetText(snapshot, NoHistory(), FleetSection::Machines);
+    CHECK(text.contains("\t100552671232\t"));
+    CHECK(text.contains("\t715\t"));
+    CHECK_FALSE(text.contains("GiB"));
+    CHECK(RenderFleetJson(snapshot, NoHistory()).contains(":100552671232"));
+}
+
 TEST_CASE("A complete lease listing does not claim to be truncated", "[distributed][fleetview]")
 {
     auto snapshot = LeadingSnapshot();

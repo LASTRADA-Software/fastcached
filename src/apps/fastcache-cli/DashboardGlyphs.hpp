@@ -4,6 +4,7 @@
 #include "DashboardRung.hpp"
 
 #include <FastCache/Core/EnumTable.hpp>
+#include <FastCache/Core/FigureText.hpp>
 
 #include <array>
 #include <cstddef>
@@ -187,23 +188,14 @@ using CellWidth = std::size_t (*)(std::string_view text) noexcept;
 /// @return The gauge.
 [[nodiscard]] std::string Gauge(double fraction, std::size_t width, RungGlyphs const& glyphs);
 
-/// How a figure is written.
-///
-/// TRANSMITTED/PERSISTED: no. Private; enumerators may be inserted.
-enum class FigureFormat : std::uint8_t
-{
-    Count,   ///< A whole number, grouped in thousands: `1 284 991`.
-    Rate,    ///< Events per unit time: grouped when at least ten, one decimal below.
-    Percent, ///< A fraction in [0, 1] as `94.2 %`.
-    Bytes,   ///< Binary units: `3.41 GiB`.
-    Seconds, ///< A duration in seconds: `1.84 s`.
-    Last,
-};
+/// How a figure is written: the library's, so a panel and the browser page write one figure alike.
+using FastCache::FigureFormat;
 
 /// @p value written as @p format says.
 ///
 /// **Takes no rung, and that is the point** (§9.6): every rung writes a figure through this one
-/// function, so no rung can come to write one differently.
+/// function, so no rung can come to write one differently. The writing itself is
+/// `FastCache::WriteFigure`, which the leader's page uses too; this adds the absent marker.
 /// @param value The value, or nullopt where nothing was reported.
 /// @param format How to write it.
 /// @param absent The resolved absent marker.

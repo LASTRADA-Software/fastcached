@@ -33,13 +33,16 @@ struct FleetDocument;
 /// the chart needs one figure per machine and the document carries dozens: a test requires both
 /// columns to be ones the leader's own renderer writes (`FleetColumnNames`), so a column renamed there
 /// fails here instead of drawing an empty chart.
+///
+/// **No scale column**: the raw cell is scaled by the value column's own `Distributed::CellFormat`, looked up in
+/// the leader's tables (`FleetColumnFormat`), so `cpu-busy` is in thousandths because the leader says so and not
+/// because this row restates it.
 struct FleetChartMetric
 {
     std::string_view key;              ///< The series its points carry; static storage.
     Distributed::FleetSection section; ///< The table the figure is read from.
     std::string_view subjectColumn;    ///< The column naming the machine a row describes.
     std::string_view valueColumn;      ///< The column holding the figure.
-    double scale { 1.0 };              ///< Applied to the raw cell: `cpu-busy` travels in thousandths.
     double full { 1.0 };               ///< The scaled value the chart's hottest colour stands for.
 };
 
@@ -53,7 +56,6 @@ inline constexpr auto FleetChartMetrics = std::to_array<FleetChartMetric>({
       .section = Distributed::FleetSection::Machines,
       .subjectColumn = "endpoint",
       .valueColumn = "cpu-busy",
-      .scale = 0.001,
       .full = 1.0 },
 });
 

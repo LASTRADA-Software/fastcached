@@ -4,18 +4,20 @@
 #include "FleetDocument.hpp"
 
 #include <FastCache/Cache/StorageTier.hpp>
-#include <FastCache/Core/NumericText.hpp>
 #include <FastCache/Core/Ranges.hpp>
 
 #include <algorithm>
 #include <cassert>
+#include <charconv>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <expected>
 #include <format>
 #include <iterator>
 #include <ranges>
 #include <span>
+#include <system_error>
 #include <utility>
 
 namespace FastCache::Cli
@@ -698,15 +700,6 @@ namespace
     /// What separates two columns of a document table, and two tabs of the section strip.
     constexpr std::string_view ColumnGap = "  ";
 
-    /// The text a document cell reads as.
-    /// @param in The frame's inputs.
-    /// @param cell The cell.
-    /// @return The absent marker for an absent cell, its text otherwise.
-    [[nodiscard]] std::string CellText(FrameInputs const& in, Cell const& cell)
-    {
-        return cell.kind == CellKind::Absent ? std::string { in.absent } : cell.lexical;
-    }
-
     /// Where the column named @p name is in @p table.
     /// @param table The table.
     /// @param name The column's name.
@@ -719,20 +712,52 @@ namespace
         return std::nullopt;
     }
 
+    /// A document cell written for a person, in the scale the leader's own tables give it.
+    ///
+    /// **No client-side knowledge of which column or unit is which**: the scale comes from
+    /// `Distributed::FleetColumnFormat` or `Distributed::CellFormatFromName`, and the writing from
+    /// `Distributed::HumanFleetFigure`, which is the leader's page's own. A cell whose scale is unknown,
+    /// or that is not an integer, is shown as the leader sent it rather than guessed at.
+    /// @param in The frame's inputs.
+    /// @param cell The raw value.
+    /// @param format The cell's scale, or nullopt where none is known.
+    /// @return The absent marker, the written figure, or the cell as sent.
+    [[nodiscard]] std::string HumanCellText(FrameInputs const& in,
+                                            Cell const& cell,
+                                            std::optional<Distributed::CellFormat> format)
+    {
+        if (cell.kind == CellKind::Absent)
+            return std::string { in.absent };
+        auto number = std::uint64_t { 0 };
+        auto const* const end = cell.lexical.data() + cell.lexical.size();
+        auto const [at, error] = std::from_chars(cell.lexical.data(), end, number);
+        if (!format.has_value() || error != std::errc {} || at != end)
+            return cell.lexical;
+        return Distributed::HumanFleetFigure(number, *format);
+    }
+
+    /// The scale of each column of a section's header, in the leader's own column tables.
+    /// @param section The section the header belongs to.
+    /// @param columns The header, as the leader sent it.
+    /// @return One scale per column, index for index; nullopt for a name that section does not render.
+    [[nodiscard]] std::vector<std::optional<Distributed::CellFormat>> ColumnFormats(FleetSection section,
+                                                                                    std::span<std::string const> columns)
+    {
+        auto formats = std::vector<std::optional<Distributed::CellFormat>> {};
+        formats.reserve(columns.size());
+        for (auto const& name: columns)
+            formats.push_back(Distributed::FleetColumnFormat(section, name));
+        return formats;
+    }
+
     /// A `kpi` cell written for a person, in the unit its row names.
     /// @param in The frame's inputs.
     /// @param cell The raw value.
     /// @param unit The row's unit.
-    /// @return Formatted where `KpiUnitTable` says how; the cell as the leader sent it otherwise.
+    /// @return As `HumanCellText` writes it.
     [[nodiscard]] std::string KpiText(FrameInputs const& in, Cell const& cell, std::string_view unit)
     {
-        if (cell.kind == CellKind::Absent)
-            return std::string { in.absent };
-        auto const* row = FindIfOrNull(KpiUnitTable, [unit](KpiUnit const& candidate) { return candidate.name == unit; });
-        auto number = 0.0;
-        if (row == nullptr || !row->format.has_value() || !ParseFiniteDouble(cell.lexical, number))
-            return cell.lexical;
-        return FormatFigure(number * row->scale, *row->format, in.absent);
+        return HumanCellText(in, cell, Distributed::CellFormatFromName(unit));
     }
 
     /// One headline tile's words.
@@ -886,13 +911,26 @@ namespace
             return std::vector<Item> { Item { .lines = { std::move(line) }, .priority = spec.tablePriority } };
         }
 
+        // Every cell written for a person FIRST, by the scale its column has in the leader's own tables,
+        // so the widths below are the widths drawn and the drop for width sees the real figures.
+        auto const formats = ColumnFormats(section, table->columns);
+        auto cells = std::vector<std::vector<std::string>> {};
+        cells.reserve(table->rows.size());
+        for (auto const& row: table->rows)
+        {
+            auto& written = cells.emplace_back();
+            written.reserve(row.size());
+            for (auto const index: std::views::iota(std::size_t { 0 }, row.size()))
+                written.push_back(HumanCellText(in, row[index], formats[index]));
+        }
+
         // Each column as wide as its widest cell, heading included, so no cell is ever cut.
         auto widths = std::vector<std::size_t> {};
         for (auto const index: std::views::iota(std::size_t { 0 }, table->columns.size()))
         {
             auto width = in.cellWidth(table->columns[index]);
-            for (auto const& row: table->rows)
-                width = std::max(width, in.cellWidth(CellText(in, row[index])));
+            for (auto const& row: cells)
+                width = std::max(width, in.cellWidth(row[index]));
             widths.push_back(width);
         }
 
@@ -912,12 +950,11 @@ namespace
             return std::unexpected(kept.error());
 
         auto item = Item { .lines = { Joined(*kept, {}) }, .priority = spec.tablePriority, .table = true };
-        for (auto const& row: table->rows)
+        for (auto const& row: cells)
         {
-            auto line = std::string { Indent } + FitRight(CellText(in, row.front()), widths.front(), in.cellWidth);
+            auto line = std::string { Indent } + FitRight(row.front(), widths.front(), in.cellWidth);
             for (auto const& piece: *kept | std::views::drop(1))
-                line +=
-                    std::string { ColumnGap } + AlignRight(CellText(in, row[piece.slot]), widths[piece.slot], in.cellWidth);
+                line += std::string { ColumnGap } + AlignRight(row[piece.slot], widths[piece.slot], in.cellWidth);
             item.lines.push_back(std::move(line));
         }
         return std::vector<Item> { std::move(item) };
