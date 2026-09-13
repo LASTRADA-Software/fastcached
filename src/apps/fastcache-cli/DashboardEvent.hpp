@@ -46,12 +46,13 @@ namespace FastCache::Cli
 /// are events with names rather than states a test has to contrive.
 enum class DashboardEventKind : std::uint8_t
 {
-    Tick,         ///< A frame is owed. The source decides when; the loop keeps no cadence.
-    Sample,       ///< A reading arrived, raw; the session's reader decides what it says.
-    SampleFailed, ///< The source could not be read at all. NOT a sample of zeroes.
-    Key,          ///< A keystroke arrived.
-    Resize,       ///< The terminal geometry changed.
-    Detached,     ///< The source went away mid-session.
+    Tick,          ///< A frame is owed. The source decides when; the loop keeps no cadence.
+    Sample,        ///< A reading arrived, raw; the session's reader decides what it says.
+    SampleFailed,  ///< The source could not be read at all. NOT a sample of zeroes.
+    Key,           ///< A keystroke arrived.
+    StopRequested, ///< The operator asked to stop by a route that is not a keystroke.
+    Resize,        ///< The terminal geometry changed.
+    Detached,      ///< The source went away mid-session.
     Last,
 };
 
@@ -106,6 +107,11 @@ struct DashboardEvent
     std::string note {};
 
     /// `Key`: the decoded keystroke's bytes, as they arrived.
+    ///
+    /// Never bytes nobody typed. A stop that reached this process some other way -- a signal
+    /// on a run with no raw-mode terminal to decode a Ctrl-C byte -- is `StopRequested`, not a
+    /// `Key` spelling `"\x03"` on its behalf. Both routes exist: a raw-mode terminal still
+    /// delivers a real Ctrl-C here, and `IsQuitKey` still reads it.
     std::string keys {};
 
     /// `Resize`: the new geometry, as endo reports it.

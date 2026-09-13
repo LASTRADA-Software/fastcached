@@ -686,3 +686,46 @@ TEST_CASE("the sample that meets the budget is drawn before the run stops", "[cl
     CHECK(quit.stop == DashboardStop::Quit);
     CHECK(quitSink.frames.size() == 1);
 }
+
+TEST_CASE("a stop request ends the run as a quit and is not a keystroke", "[cli][dashboard]")
+{
+    // A stop that did not arrive as a keystroke -- a signal on a piped run, where no raw-mode
+    // terminal decodes a Ctrl-C byte -- is its own event rather than a `Key` carrying bytes
+    // nobody typed.
+    //
+    // WHAT DISTINGUISHES: the request carries no keys at all, so a loop that judged it through
+    // `IsQuitKey` would ignore it, draw the trailing tick and end `SourceDetached`. And the
+    // outcome is the run's rather than the stop's: one reading makes it `Affirmative`.
+    auto const tick = DashboardEvent { .kind = DashboardEventKind::Tick };
+    auto const stop = DashboardEvent { .kind = DashboardEventKind::StopRequested };
+    auto const sample = DashboardEvent { .kind = DashboardEventKind::Sample, .at = At(1), .attempts = Reading(10) };
+
+    auto view = RecordingView {};
+    auto sink = CollectingSink {};
+    auto const stopped = Drive({ sample, tick, stop, tick }, DashboardLimits {}, view, sink);
+    CHECK(stopped.stop == DashboardStop::Quit);
+    CHECK(stopped.outcome == Outcome::Affirmative);
+    CHECK(sink.frames.size() == 1);
+
+    // The control: a stop before anything was read is still a quit and is NOT exit 0, or "a
+    // stop is a success" passes above. Which non-zero outcome it is belongs to the exit-code
+    // rules, not to this case.
+    auto earlyView = RecordingView {};
+    auto earlySink = CollectingSink {};
+    auto const early = Drive({ stop, tick }, DashboardLimits {}, earlyView, earlySink);
+    CHECK(early.stop == DashboardStop::Quit);
+    CHECK(early.outcome != Outcome::Affirmative);
+    CHECK(earlySink.frames.empty());
+
+    // And the keystroke route stays: a raw-mode terminal decodes a real Ctrl-C as a `Key`, so
+    // the two routes coexist and neither absorbs the other.
+    auto keyView = RecordingView {};
+    auto keySink = CollectingSink {};
+    auto const keyed = Drive({ sample, tick, DashboardEvent { .kind = DashboardEventKind::Key, .keys = "\x03" }, tick },
+                             DashboardLimits {},
+                             keyView,
+                             keySink);
+    CHECK(keyed.stop == DashboardStop::Quit);
+    CHECK(keyed.outcome == Outcome::Affirmative);
+    CHECK(keySink.frames.size() == 1);
+}
