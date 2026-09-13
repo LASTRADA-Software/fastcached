@@ -17,11 +17,11 @@ namespace FastCache::Cli::Testing
 /// @file ScriptedSixelEncoder.hpp
 /// A Sixel encoder that writes down what it was asked and answers from a script.
 ///
-/// **Its body names the image rather than encoding it**, and that is deliberate: Sixel bytes differ
-/// between standard libraries (`SixelEncoder.hpp`), so a view test comparing real Sixel output would
-/// pass on the platform it was written on and fail on another. A view test asserts WHAT it asked to
-/// have drawn -- the dimensions, the pixels, the palette ceiling -- and this fake is what makes that
-/// the only thing it can assert.
+/// **Its body names the image rather than encoding it**, and that is deliberate: a view test asserts
+/// WHAT it asked to have drawn -- the dimensions, the pixels, the palette ceiling -- and this fake is
+/// what makes that the only thing it can assert. Real Sixel bytes are the quantizer's answer, so a
+/// view test comparing them would move with every change to the vendored encoder while saying nothing
+/// about the view; the encoder's own bytes are pinned once, at the seam (`SixelEncoder_test.cpp`).
 
 /// One call the fake received.
 struct SixelRequest
