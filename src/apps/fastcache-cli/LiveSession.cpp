@@ -314,9 +314,10 @@ std::optional<std::string> DrainSession(LiveEventSource const& source,
     return DescribeAbandonment(endpoint, since.has_value() ? std::optional<Duration> { wait.Now() - *since } : std::nullopt);
 }
 
-StandardRungViews::StandardRungViews(RenderOptions render, CellWidth cellWidth):
+StandardRungViews::StandardRungViews(RenderOptions render, CellWidth cellWidth, ISixelEncoder* sixel):
     _render { std::move(render) },
-    _cellWidth { cellWidth }
+    _cellWidth { cellWidth },
+    _sixel { sixel }
 {
     assert(_cellWidth != nullptr && "a panel is laid out through the one width function the session is handed");
 }
@@ -341,6 +342,7 @@ std::unique_ptr<IDashboardView> StandardRungViews::For(RenderRung rung, LivePlan
                                                       .endpoint = std::string { address },
                                                       .interval = plan.interval,
                                                       .cellWidth = _cellWidth,
+                                                      .sixel = _sixel,
                                                       .rung = rung });
 }
 

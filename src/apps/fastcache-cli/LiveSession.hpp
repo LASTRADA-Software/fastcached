@@ -9,6 +9,7 @@
 #include "LiveEventSource.hpp"
 #include "LivePipedView.hpp"
 #include "LiveStats.hpp"
+#include "SixelEncoder.hpp"
 #include "StatsSource.hpp"
 #include "TerminalEvents.hpp"
 
@@ -259,7 +260,8 @@ class StandardRungViews final: public IRungViews
   public:
     /// @param render The `--format` and `--absent` the operator asked for.
     /// @param cellWidth How many cells text occupies on the terminal a panel is drawn on; not null.
-    StandardRungViews(RenderOptions render, CellWidth cellWidth);
+    /// @param sixel What draws an image on the Sixel rung, or null for a build or session with none.
+    StandardRungViews(RenderOptions render, CellWidth cellWidth, ISixelEncoder* sixel);
 
     [[nodiscard]] std::unique_ptr<IDashboardView> For(RenderRung rung,
                                                       LivePlan const& plan,
@@ -268,6 +270,7 @@ class StandardRungViews final: public IRungViews
   private:
     RenderOptions _render;
     CellWidth _cellWidth;
+    ISixelEncoder* _sixel;
 };
 
 /// Everything `main` acquires for a session, and nothing a session decides.

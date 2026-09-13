@@ -66,7 +66,10 @@ struct RungGlyphs
 /// The rungs' glyphs, one row per `RenderRung`, in enumerator order.
 ///
 /// `Sixel` draws its TEXT exactly as `Unicode` does -- a chart is an image beside the figures, not
-/// a different spelling of them. `Piped` has a row only because the table covers the enum: a piped
+/// a different spelling of them. **So the cache and node panels are byte-identical on the two rungs,
+/// and that is correct rather than a missing image** (#134's decision on Sixel): their figures fit in
+/// cells as sparklines, and the one image a panel draws is the fleet chart, 40 machines across a time
+/// window, which does not. `Piped` has a row only because the table covers the enum: a piped
 /// session draws no frame, and no panel is constructed for it.
 inline constexpr EnumTable<RenderRung, RungGlyphs> RungGlyphTable { {
     { .rung = RenderRung::Sixel,

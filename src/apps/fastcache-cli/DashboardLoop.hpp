@@ -41,6 +41,18 @@ struct ReadingStamp
     std::string source {}; ///< Which source produced it, by stable name.
 };
 
+/// One per-subject figure a sample read, kept in the history for a chart to draw.
+///
+/// **Numbers, never documents.** A fleet reading's history is what its chart draws from, so it keeps
+/// the one figure per machine the chart needs and nothing else: the document itself lives only as
+/// `DashboardModel::latestDocument`, for the newest sample.
+struct SeriesPoint
+{
+    std::string_view series; ///< Which series: a `FleetChartMetrics` key, in static storage.
+    std::string subject;     ///< Whose figure: a machine's key as the document names it.
+    double value { 0.0 };    ///< The figure, already scaled.
+};
+
 /// One point of the dashboard's sample history: a reading, or the fact that there was none.
 ///
 /// **A failed sample is an entry, not a missing one.** The gap is the information: a history
@@ -60,6 +72,10 @@ struct HistoryEntry
     /// all leave it disengaged. A series that re-applied the run rule to stored stamps would be a
     /// second copy of that rule, free to disagree with the first.
     std::optional<Duration> elapsed {};
+
+    /// The per-subject figures this sample read, for a chart; empty for a failure or a reader that
+    /// reads none. A subject absent here is a gap in its series at this entry.
+    std::vector<SeriesPoint> points {};
 };
 
 /// How many history entries the model keeps, oldest dropped first.
@@ -258,6 +274,10 @@ struct SampleReading
     /// it as `DashboardModel::latestDocument`. Forward-declared here, so every unit including the
     /// loop does not compile the fleet's vocabulary.
     std::shared_ptr<FleetDocument const> document {};
+
+    /// Per-subject figures for a chart, kept in the history entry this reading becomes; empty for a
+    /// reader that reads none.
+    std::vector<SeriesPoint> points {};
 };
 
 /// Turns one session's raw `Sample` payload into a reading.
