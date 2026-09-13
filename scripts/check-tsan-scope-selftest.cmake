@@ -341,6 +341,37 @@ FastCachedStageTree("no-cmakelists" tree)
 file(REMOVE "${tree}/CMakeLists.txt")
 FastCachedSelftestCase("a-tree-with-no-root-CMakeLists" "${tree}" refuse "does not exist")
 
+# -- the links column (#134) ------------------------------------------------
+# Staged by editing the COPIED gate's first `|first-party"` declaration, so the rows
+# the cases mutate are the shipped ones. The accepting arm is the baseline above,
+# which carries both declarations the shipped table uses.
+foreach(linksCase IN ITEMS "no-declaration" "unknown-declaration" "none-without-reason")
+    FastCachedStageTree("links-${linksCase}" tree)
+    file(READ "${tree}/scripts/tsan-gate.sh" linksGate)
+    string(FIND "${linksGate}" "|first-party\"" linksAt)
+    if(linksAt EQUAL -1)
+        message(FATAL_ERROR
+            "check-tsan-scope-selftest: the gate declares no row `first-party`, so the "
+            "links-column cases have nothing to mutate. If every row became `none`, "
+            "stage these from one of those instead.")
+    endif()
+    string(SUBSTRING "${linksGate}" 0 ${linksAt} linksBefore)
+    math(EXPR linksAfterAt "${linksAt} + 13")
+    string(SUBSTRING "${linksGate}" ${linksAfterAt} -1 linksAfter)
+    if(linksCase STREQUAL "no-declaration")
+        set(linksGate "${linksBefore}\"${linksAfter}")
+        set(linksNeedle "declares nothing about what it links")
+    elseif(linksCase STREQUAL "unknown-declaration")
+        set(linksGate "${linksBefore}|firstparty\"${linksAfter}")
+        set(linksNeedle "declares .firstparty. about what")
+    else()
+        set(linksGate "${linksBefore}|none: \"${linksAfter}")
+        set(linksNeedle "declares .none: . about what")
+    endif()
+    file(WRITE "${tree}/scripts/tsan-gate.sh" "${linksGate}")
+    FastCachedSelftestCase("a-row-with-${linksCase}" "${tree}" refuse "${linksNeedle}")
+endforeach()
+
 # The count is printed because a self-test that STOPPED early must not look
 # like one that judged everything: `set -e`'s CMake equivalent is a
 # FATAL_ERROR anywhere above, and eight cases reported green is what that
