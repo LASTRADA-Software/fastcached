@@ -133,6 +133,22 @@ TEST_CASE("the help text names every verb, format, exit code and variable", "[cl
     CHECK(help.back() == '\n');
 }
 
+TEST_CASE("the help text sends an operator to fastcache-compile-node for what only it does", "[cli][command]")
+{
+    // #1307. Which flags exist is `fastcache-compile-node`'s to say, and `cli-node-flags`
+    // asks that binary; this pins that the paragraph is in the NOTES at all, and that it
+    // names both halves an operator cannot find from here -- enrollment and the ports.
+    auto const help = HelpText();
+    auto const notes = help.find("\nNOTES\n");
+    REQUIRE(notes != std::string::npos);
+    auto const tail = std::string_view { help }.substr(notes);
+    CHECK(tail.contains("fastcache-compile-node"));
+    CHECK(tail.contains("--enroll-open"));
+    CHECK(tail.contains("--enroll-from"));
+    CHECK(tail.contains("--print-surfaces"));
+    CHECK(tail.contains("--cluster-status"));
+}
+
 TEST_CASE("the help text substitutes the default address rather than printing the token", "[cli][command]")
 {
     auto const help = HelpText();

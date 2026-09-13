@@ -598,9 +598,16 @@ Stated so it is not rediscovered:
 - **No key enumeration.** There is no `list`, because the server exposes no
   `KEYS`, `SCAN` or `stats cachedump` at any layer a client can reach. It needs a
   cursor on the storage engine first.
-- **No fleet or cluster verbs yet.** `fastcache-compile-node --cluster-status`
-  and the `/fleet` dashboard remain where they are; bringing them here is
-  tracked work.
+- **No enrollment verbs, and no `--print-surfaces`.** The fleet tables (`fleet`)
+  and the cluster verbs (`cluster-*`) are here; these are not.
+  - Opening an enrollment window, and listing, approving or rejecting what waits
+    at it, are `fastcache-compile-node --enroll-open`, `--enroll-list`,
+    `--enroll-approve`, `--enroll-reject` and `--enroll-close`.
+  - Joining a cluster is `--enroll-from`, run on the machine that is joining.
+  - The ports a node's configuration would open are `--print-surfaces`.
+
+  `fastcache-cli --help` says so in its NOTES, and `ctest -R cli-node-flags`
+  requires every flag named there to be an option of `fastcache-compile-node --help`.
 - **The memcached verbs are not routed over the binary protocol.** That protocol
   has SASL and would let them work under `--requirepass`, and doing so is out of
   scope here rather than impossible.
