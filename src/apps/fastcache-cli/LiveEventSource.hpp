@@ -11,6 +11,7 @@
 
 #include <chrono>
 #include <memory>
+#include <optional>
 
 namespace FastCache::Cli
 {
@@ -32,7 +33,8 @@ namespace FastCache::Cli
 /// Pointers are borrowed and must outlive the source's `Drained()`, not merely the source:
 /// a sample already on the pool when the session ends still reads `gatherer` there, and
 /// nothing can call it back. The terminal is OWNED, because nothing but this source reads
-/// it and closing it is part of closing the session.
+/// it and closing it is part of closing the session -- and it is released, restoring the
+/// terminal, the moment nothing reads it any more, whatever a sample on the pool is doing.
 struct LiveSourceParts
 {
     /// Where every event is delivered, and whose clock paces the samples. Close, Next and
@@ -116,6 +118,14 @@ class LiveEventSource final: public IDashboardEventSource
     /// what makes destroying the gatherer and the pool afterwards safe. One caller.
     /// @return A task completing when both producers have finished.
     [[nodiscard]] Task<void> Drained();
+
+    /// When the sample now on the pool was started, or nullopt when none is out.
+    ///
+    /// **Safe from any thread**, unlike everything else here: this is what a caller waiting
+    /// for the drain from outside the reactor reads to say how long a sample it is about to
+    /// abandon had been out. Measured on the reactor's clock.
+    /// @return The start of the outstanding sample, or nullopt.
+    [[nodiscard]] std::optional<TimePoint> SampleOutstandingSince() const noexcept;
 
     /// The producers' shared state; outlives the source while a producer still runs.
     ///
