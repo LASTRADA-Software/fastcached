@@ -158,6 +158,9 @@ Task<std::expected<LiveSessionRun, Answer>> RunComposedSession(LiveSessionParts 
             sourceParts.terminal->Close();
             sourceParts.terminal.reset();
         }
+        if (rung == RenderRung::Piped)
+            co_return std::unexpected(
+                Concluded(Outcome::Local, std::format("live-stats {} has no record to stream in this build", subject.key)));
         co_return std::unexpected(Concluded(Outcome::Local,
                                             std::format("cannot draw live-stats {} on this terminal: this build has "
                                                         "no panel for it; run it with its output redirected for one "
@@ -198,18 +201,20 @@ std::optional<std::string> DrainSession(LiveEventSource const& source,
     return DescribeAbandonment(endpoint, since.has_value() ? std::optional<Duration> { wait.Now() - *since } : std::nullopt);
 }
 
-StandardRungViews::StandardRungViews(RenderOptions render, FigureProjection project):
-    _render { std::move(render) },
-    _project { project }
+StandardRungViews::StandardRungViews(RenderOptions render):
+    _render { std::move(render) }
 {
 }
 
 std::unique_ptr<IDashboardView> StandardRungViews::For(RenderRung rung, LivePlan const& plan, std::string_view address)
 {
+    auto const& row = LiveSubjectTable[static_cast<std::size_t>(plan.subject)];
     if (rung == RenderRung::Piped)
-        return std::make_unique<PipedRecordView>(_render.format, _render.absentOverride, _project);
+        return row.figures == nullptr
+                   ? nullptr
+                   : std::make_unique<PipedRecordView>(_render.format, _render.absentOverride, row.figures);
 
-    auto const panel = LiveSubjectTable[static_cast<std::size_t>(plan.subject)].panel;
+    auto const panel = row.panel;
     if (panel == nullptr)
         return nullptr;
     // A panel is drawn for a person, so its absent marker is the human format's unless the

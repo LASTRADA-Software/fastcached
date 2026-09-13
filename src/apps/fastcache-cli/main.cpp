@@ -352,7 +352,7 @@ class StopReactorOnExit
     ProcessStopSignals stops;
     StandardTerminalAcquisition terminals;
     LadderRedial redial { command, WireTable[static_cast<std::size_t>(verb.wire)] };
-    StandardRungViews views { render, &LatestReading };
+    StandardRungViews views { render };
     ThreadDrainWait drainWait;
     std::optional<LiveEventSource> source;
     std::jthread reactorThread { [&reactor] { reactor.Run(); } };

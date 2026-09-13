@@ -187,19 +187,17 @@ struct LiveSessionRun
                                                       DrainBound bound,
                                                       IDrainWait& wait);
 
-/// The views this build draws through: the `Piped` rung's record stream, in `--format`, and the
-/// subject's panel on every interactive rung.
+/// The views this build draws through: the subject's figures as a record stream on the `Piped`
+/// rung, in `--format`, and the subject's panel on every interactive rung.
 ///
-/// **A subject with no panel answers null on an interactive rung**, which refuses the session by
-/// name. Drawing a terminal session through the piped view instead would change the output's
-/// shape under a script copied from a run at that terminal, which is the silent fall back §1.6
-/// rules out.
+/// **A subject with nothing for a rung answers null**, which refuses the session by name. Drawing a
+/// terminal session through the piped view instead would change the output's shape under a
+/// script copied from a run at that terminal, which is the silent fall back §1.6 rules out.
 class StandardRungViews final: public IRungViews
 {
   public:
     /// @param render The `--format` and `--absent` the operator asked for.
-    /// @param project What a row reports.
-    StandardRungViews(RenderOptions render, FigureProjection project);
+    explicit StandardRungViews(RenderOptions render);
 
     [[nodiscard]] std::unique_ptr<IDashboardView> For(RenderRung rung,
                                                       LivePlan const& plan,
@@ -207,7 +205,6 @@ class StandardRungViews final: public IRungViews
 
   private:
     RenderOptions _render;
-    FigureProjection _project;
 };
 
 /// Everything `main` acquires for a session, and nothing a session decides.

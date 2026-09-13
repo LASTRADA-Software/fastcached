@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#include "DashboardPanels.hpp"
 #include "LivePipedView.hpp"
 #include "ScriptedDashboardEvents.hpp"
 
@@ -35,6 +36,19 @@ class StreamSink final: public IFrameSink
 
     std::string stream {};
 };
+
+/// A projection that reports the newest reading as it arrived, field for field.
+///
+/// The view's own mechanics -- the header, the rows by name, the formats -- are the subject of most
+/// cases here, and they are easiest to see over a record whose fields the case chose.
+/// @param model What is known.
+/// @return The newest reading, or an empty record.
+[[nodiscard]] Value ReadingAsIs(DashboardModel const& model)
+{
+    if (!model.latest.has_value() || model.latest->shape != Shape::Record)
+        return RecordValue({});
+    return *model.latest;
+}
 
 /// A stats round `ChooseStats` accepts, with the fields named.
 /// @param fields The record's fields, in order.
@@ -93,16 +107,18 @@ void AddFailure(std::vector<DashboardEvent>& script)
 /// @param format The `--format`.
 /// @param limits The bound.
 /// @param absent The `--absent` override.
+/// @param project What a row reports.
 /// @return The stream.
 [[nodiscard]] std::string Stream(std::vector<DashboardEvent> script,
                                  OutputFormat format,
                                  DashboardLimits limits = {},
-                                 std::optional<std::string> absent = std::nullopt)
+                                 std::optional<std::string> absent = std::nullopt,
+                                 FigureProjection project = &ReadingAsIs)
 {
     auto clock = ManualClock {};
     auto reactor = TestReactor { clock };
     auto events = ScriptedDashboardEvents { reactor, std::move(script) };
-    auto view = PipedRecordView { format, std::move(absent), &LatestReading };
+    auto view = PipedRecordView { format, std::move(absent), project };
     auto sink = StreamSink {};
 
     auto result = std::optional<DashboardExit> {};
@@ -264,4 +280,151 @@ TEST_CASE("piped kv writes one block of name=value lines per sample", "[cli][liv
     CHECK(lines[3].empty());
     CHECK(lines[5] == "curr_connections=11");
     CHECK(std::ranges::count(lines, std::string { "curr_connections=10" }) == 1);
+}
+
+namespace
+{
+
+/// @p line split on tabs.
+/// @param line One TSV line.
+/// @return Its fields.
+[[nodiscard]] std::vector<std::string> Fields(std::string_view line)
+{
+    auto fields = std::vector<std::string> {};
+    while (true)
+    {
+        auto const end = line.find('\t');
+        fields.emplace_back(line.substr(0, end));
+        if (end == std::string_view::npos)
+            return fields;
+        line.remove_prefix(end + 1);
+    }
+}
+
+/// The names of @p record's fields, in order.
+/// @param record The record.
+/// @return The names.
+[[nodiscard]] std::vector<std::string> NamesOf(Value const& record)
+{
+    auto names = std::vector<std::string> {};
+    for (auto const& field: record.fields)
+        names.push_back(field.name);
+    return names;
+}
+
+/// A cache daemon's `INFO` counters at one moment.
+/// @param hits `keyspace_hits`.
+/// @param misses `keyspace_misses`.
+/// @param commands `total_commands_processed`.
+/// @param used `used_memory`.
+/// @return The attempts.
+[[nodiscard]] std::vector<StatsAttempt> InfoAt(std::uint64_t hits,
+                                               std::uint64_t misses,
+                                               std::uint64_t commands,
+                                               std::uint64_t used)
+{
+    return ReadingOf({
+        Field { .name = "keyspace_hits", .value = NumberCell(hits) },
+        Field { .name = "keyspace_misses", .value = NumberCell(misses) },
+        Field { .name = "total_commands_processed", .value = NumberCell(commands) },
+        Field { .name = "used_memory", .value = NumberCell(used) },
+        Field { .name = "maxmemory", .value = NumberCell(std::uint64_t { 8192 }) },
+    });
+}
+
+} // namespace
+
+TEST_CASE("a figure's piped key is its panel label, lowered, with a slash read as per", "[cli][live][piped][figures]")
+{
+    CHECK(FigureKey("ops/sec") == "ops_per_sec");
+    CHECK(FigureKey("no-slot/min") == "no_slot_per_min");
+    CHECK(FigureKey("hit rate  since start") == "hit_rate_since_start");
+    CHECK(FigureKey("index (RAM)") == "index_ram");
+    CHECK(FigureKey("  Mean Compile ") == "mean_compile");
+    CHECK(FigureKey("ops/sec get ") == "ops_per_sec_get");
+}
+
+TEST_CASE("a piped cache and node stream name exactly the figures their panels draw", "[cli][live][piped][figures]")
+{
+    // Pinned, because a script reads these names: relabelling a panel row renames a column, and
+    // this is where that is seen. Derived from the panels, so a row added to one shows up here too.
+    auto const model = DashboardModel {};
+    CHECK(NamesOf(CacheFigures(model))
+          == std::vector<std::string> { "source",
+                                        "hit_rate",
+                                        "hit_rate_since_start",
+                                        "ops_per_sec",
+                                        "ops_per_sec_get",
+                                        "ops_per_sec_set",
+                                        "conns_per_sec",
+                                        "conns_per_sec_accepted",
+                                        "evictions_per_s",
+                                        "evictions_per_s_evicted_unfetched",
+                                        "reclaimed_per_s",
+                                        "reclaimed_per_s_expired_unfetched",
+                                        "items",
+                                        "bytes",
+                                        "bytes_limit" });
+    CHECK(NamesOf(NodeFigures(model))
+          == std::vector<std::string> { "source",
+                                        "compiles_per_min",
+                                        "compiles_per_min_completed",
+                                        "mean_compile",
+                                        "no_slot_per_min",
+                                        "lease_exp_per_min",
+                                        "unknown_fp_per_min",
+                                        "cache_hits",
+                                        "cores",
+                                        "slots_busy",
+                                        "slots_busy_limit",
+                                        "memory",
+                                        "scratch_free",
+                                        "scratch_free_limit" });
+
+    // A header is a promise about every row under it, so no two columns may share a name.
+    for (auto const& names: { NamesOf(CacheFigures(model)), NamesOf(NodeFigures(model)) })
+    {
+        auto sorted = names;
+        std::ranges::sort(sorted);
+        CHECK(std::ranges::adjacent_find(sorted) == sorted.end());
+    }
+}
+
+TEST_CASE("a piped cache row reports the panel's figures unformatted, absent until a rate can be taken",
+          "[cli][live][piped][figures]")
+{
+    std::vector<DashboardEvent> script;
+    AddSample(script, 1, InfoAt(90, 10, 1000, 4096));
+    AddSample(script, 3, InfoAt(180, 20, 1500, 5120));
+
+    auto const lines = Lines(Stream(std::move(script), OutputFormat::Tsv, {}, std::nullopt, &CacheFigures));
+    REQUIRE(lines.size() == 3);
+    auto const header = Fields(lines[0]);
+    auto const first = Fields(lines[1]);
+    auto const second = Fields(lines[2]);
+    REQUIRE(header.size() == 15);
+    REQUIRE(first.size() == header.size());
+    REQUIRE(second.size() == header.size());
+
+    // A column the header does not name fails here, rather than reading past the end of a row.
+    auto const cell = [&header](std::vector<std::string> const& row, std::string_view name) {
+        auto const found = std::ranges::find(header, name);
+        REQUIRE(found != header.end());
+        return row[static_cast<std::size_t>(found - header.begin())];
+    };
+
+    // One reading has no interval: every rate is absent -- never 0, which would claim a server that
+    // did nothing -- while what was read as a level is there.
+    CHECK(cell(first, "hit_rate").empty());
+    CHECK(cell(first, "ops_per_sec").empty());
+    CHECK(cell(first, "hit_rate_since_start") == "0.9000");
+    CHECK(cell(first, "bytes") == "4096");
+    CHECK(cell(first, "bytes_limit") == "8192");
+    // A figure INFO does not carry is absent rather than zero.
+    CHECK(cell(first, "items").empty());
+
+    // Over two seconds: 90 hits of 100 lookups, and 500 commands.
+    CHECK(cell(second, "hit_rate") == "0.9000");
+    CHECK(cell(second, "ops_per_sec") == "250.000");
+    CHECK(cell(second, "bytes") == "5120");
 }

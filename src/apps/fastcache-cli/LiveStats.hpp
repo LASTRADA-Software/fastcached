@@ -5,6 +5,7 @@
 #include "CliVerbs.hpp"
 #include "DashboardLoop.hpp"
 #include "DashboardPanels.hpp"
+#include "LivePipedView.hpp"
 #include "NodeClient.hpp"
 
 #include <FastCache/Core/EnumTable.hpp>
@@ -127,6 +128,13 @@ struct LiveSubjectSpec
     /// and arrives with it; a null panel refuses an interactive session by name, and never draws
     /// it through the piped view instead.
     PanelOf panel;
+
+    /// What a piped session of this subject streams per sample, or null where this build has nothing.
+    ///
+    /// The panel's own figures for `cache` and `node` (`PanelFigures`), so a piped header names what
+    /// an interactive run draws. Null for `fleet`, whose record is the leader's KPI section and
+    /// arrives with its reader; a null projection refuses a piped session by name.
+    FigureProjection figures;
 };
 
 /// The subjects, one row per enumerator, in enumerator order.
@@ -142,7 +150,8 @@ inline constexpr EnumTable<LiveSubject, LiveSubjectSpec> LiveSubjectTable { {
       .costsWhom = "each sample is served by the cache daemon itself",
       .reader = &ReadStatsSample,
       .document = "",
-      .panel = &CachePanel },
+      .panel = &CachePanel,
+      .figures = &CacheFigures },
     { .subject = LiveSubject::Node,
       .key = "node",
       .inferrable = true,
@@ -154,7 +163,8 @@ inline constexpr EnumTable<LiveSubject, LiveSubjectSpec> LiveSubjectTable { {
       .costsWhom = "each sample is served by the node itself",
       .reader = &ReadStatsSample,
       .document = "",
-      .panel = &NodePanel },
+      .panel = &NodePanel,
+      .figures = &NodeFigures },
     { .subject = LiveSubject::Fleet,
       .key = "fleet",
       .inferrable = false,
@@ -167,7 +177,8 @@ inline constexpr EnumTable<LiveSubject, LiveSubjectSpec> LiveSubjectTable { {
                    "once per watcher",
       .reader = nullptr,
       .document = "/fleet.txt",
-      .panel = nullptr },
+      .panel = nullptr,
+      .figures = nullptr },
 } };
 
 static_assert(RowsInEnumeratorOrder(LiveSubjectTable, &LiveSubjectSpec::subject),
