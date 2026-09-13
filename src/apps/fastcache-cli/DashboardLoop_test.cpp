@@ -640,3 +640,49 @@ TEST_CASE("the fold reads a sample only through the reader it was given", "[cli]
     REQUIRE(fleet.model.latestStamp.has_value());
     CHECK(Unwrap(fleet.model.latestStamp).source == "fleet.txt");
 }
+
+TEST_CASE("the sample that meets the budget is drawn before the run stops", "[cli][dashboard]")
+{
+    // `--samples=N` must show N readings. The frame owed for the Nth arrives as a `Tick`
+    // AFTER that sample, and the budget stop returns before it can be consumed -- so the
+    // stop has to draw it.
+    //
+    // WHAT DISTINGUISHES: the count AND what the last frame shows. A count alone passes for a
+    // fix that presents a stale frame; the last frame must hold sample N, not N-1.
+    auto const tick = DashboardEvent { .kind = DashboardEventKind::Tick };
+    auto sample = [](std::int64_t value, int seconds) {
+        return DashboardEvent { .kind = DashboardEventKind::Sample, .at = At(seconds), .attempts = Reading(value) };
+    };
+
+    auto view = RecordingView {};
+    auto sink = CollectingSink {};
+    auto const exit = Drive({ sample(10, 1), tick, sample(20, 2), tick, sample(30, 3), tick, sample(40, 4), tick },
+                            DashboardLimits { .samples = 3 },
+                            view,
+                            sink);
+
+    CHECK(exit.stop == DashboardStop::SampleBudget);
+    CHECK(sink.frames.size() == 3);
+    CHECK(exit.model.frames == 3);
+    REQUIRE(!view.seen.empty());
+    CHECK(view.seen.back().samples == 3);
+    CHECK(LatestField(view.seen.back(), "curr_connections") == "30");
+
+    // The controls: only the stop that CONSUMED a sample owes a frame. A source running out,
+    // and an operator quitting, stop without one -- or "draw on every stop" would pass above.
+    auto detachedView = RecordingView {};
+    auto detachedSink = CollectingSink {};
+    auto const detached =
+        Drive({ sample(10, 1), tick, sample(20, 2), tick }, DashboardLimits {}, detachedView, detachedSink);
+    CHECK(detached.stop == DashboardStop::SourceDetached);
+    CHECK(detachedSink.frames.size() == 2);
+
+    auto quitView = RecordingView {};
+    auto quitSink = CollectingSink {};
+    auto const quit = Drive({ sample(10, 1), tick, DashboardEvent { .kind = DashboardEventKind::Key, .keys = "q" } },
+                            DashboardLimits {},
+                            quitView,
+                            quitSink);
+    CHECK(quit.stop == DashboardStop::Quit);
+    CHECK(quitSink.frames.size() == 1);
+}
