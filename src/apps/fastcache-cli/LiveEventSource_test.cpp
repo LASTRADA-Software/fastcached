@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "LiveSourceRig.hpp"
+#include "LiveStats.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -9,6 +10,7 @@
 #include <memory>
 #include <optional>
 #include <ranges>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -402,6 +404,70 @@ TEST_CASE("a sample carries the moment it was taken rather than the moment it wa
     auto const sample = NextDue(rig, source);
     CHECK(KindOf(sample) == DashboardEventKind::Sample);
     CHECK((sample.has_value() && sample->at == TimePoint {} + std::chrono::milliseconds { 700 }));
+
+    CloseAndDrain(rig, source);
+}
+
+TEST_CASE("a document session fetches its whole document on the pool, stamped when it answered, and gathers nothing",
+          "[cli][live][source][document]")
+{
+    // Fleet's own column, so the case follows the table: the WHOLE document, never one section.
+    auto const path = std::string { LiveSubjectTable[static_cast<std::size_t>(LiveSubject::Fleet)].document };
+    REQUIRE_FALSE(path.empty());
+    CHECK_FALSE(path.contains('?'));
+
+    Rig rig;
+    auto const body = std::string { "# kpi\nkpi\tvalue\tunit\tof\n" };
+    ScriptedDocument admin { body };
+    auto parts = rig.Parts();
+    parts.admin = &admin;
+    parts.document = path;
+    LiveEventSource source { std::move(parts) };
+
+    // Handed off on the reactor's turn and fetched only when the pool runs, 700 ms later: a
+    // fetch on the reactor would already have happened, and a stamp taken where it was asked
+    // for would be wrong by exactly that.
+    rig.reactor.Drain();
+    CHECK(admin.Asked().empty());
+    rig.clock.Advance(std::chrono::milliseconds { 700 });
+    rig.Settle();
+
+    auto const sample = NextDue(rig, source);
+    REQUIRE(KindOf(sample) == DashboardEventKind::Sample);
+    CHECK(admin.Asked() == std::vector<std::string> { path });
+    CHECK(Unwrap(sample).at == TimePoint {} + std::chrono::milliseconds { 700 });
+    CHECK(Unwrap(sample).attempts.empty());
+    REQUIRE(Unwrap(sample).document.has_value());
+    CHECK(Unwrap(Unwrap(sample).document) == body);
+    CHECK(rig.gatherer.Calls() == 0);
+    CHECK(KindOf(NextDue(rig, source)) == DashboardEventKind::Tick);
+
+    CloseAndDrain(rig, source);
+}
+
+TEST_CASE("a document fetch that fails is still a sample, carrying the failure for the reader",
+          "[cli][live][source][document]")
+{
+    // Which outcome a refusal is -- the leader declining, a follower naming the leader -- is the
+    // reader's decision, made with the server's own words. A source that turned it into a gap
+    // here would pick an outcome for it, and lose the words.
+    Rig rig;
+    ScriptedDocument admin { std::unexpected(
+        AdminError { .kind = AdminFailure::Refused, .detail = "this node is not the leader; ask 10.0.0.9:7071" }) };
+    auto parts = rig.Parts();
+    parts.admin = &admin;
+    parts.document = "/fleet.txt";
+    LiveEventSource source { std::move(parts) };
+    rig.Settle();
+
+    auto const sample = NextDue(rig, source);
+    REQUIRE(KindOf(sample) == DashboardEventKind::Sample);
+    REQUIRE(Unwrap(sample).document.has_value());
+    auto const& fetched = Unwrap(Unwrap(sample).document);
+    REQUIRE_FALSE(fetched.has_value());
+    CHECK(fetched.error().kind == AdminFailure::Refused);
+    CHECK(fetched.error().detail.contains("10.0.0.9:7071"));
+    CHECK(KindOf(NextDue(rig, source)) == DashboardEventKind::Tick);
 
     CloseAndDrain(rig, source);
 }
