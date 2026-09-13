@@ -2,6 +2,7 @@
 #include "DashboardLoop.hpp"
 #include "LiveEventSource.hpp"
 #include "ScriptedExchange.hpp"
+#include "ScriptedStopSignal.hpp"
 
 #include <FastCache/Async/AsyncQueue.hpp>
 #include <FastCache/Async/TestReactor.hpp>
@@ -113,7 +114,9 @@ struct Rig
     ManualClock clock {};
     TestReactor reactor { clock };
     TestReactor pool { clock };
+    TestReactor stopWaiter { clock };
     ScriptedGatherer gatherer { Reading() };
+    ScriptedStopSignal stop { reactor };
     CountView view {};
     CountSink sink {};
 
@@ -124,9 +127,24 @@ struct Rig
     /// @return The parts.
     [[nodiscard]] LiveSourceParts Parts()
     {
-        return LiveSourceParts {
-            .reactor = &reactor, .gatherer = &gatherer, .pool = &pool, .interval = Interval, .terminal = nullptr
-        };
+        return LiveSourceParts { .reactor = &reactor,
+                                 .gatherer = &gatherer,
+                                 .pool = &pool,
+                                 .interval = Interval,
+                                 .terminal = nullptr,
+                                 .stop = nullptr,
+                                 .stopWaiter = nullptr };
+    }
+
+    /// A source over this rig with no terminal and a stop signal a case fires through `stop`,
+    /// which is the non-interactive composition.
+    /// @return The parts.
+    [[nodiscard]] LiveSourceParts StoppableParts()
+    {
+        auto parts = Parts();
+        parts.stop = &stop;
+        parts.stopWaiter = &stopWaiter;
+        return parts;
     }
 
     /// A source over this rig, with a terminal a case speaks for through `terminal`.
@@ -454,6 +472,88 @@ TEST_CASE("a run with no terminal takes its whole sample budget", "[cli][live][s
 
     CHECK((exit.has_value() && exit->stop == DashboardStop::SampleBudget));
     CHECK(rig.gatherer.Calls() == 3);
+
+    CloseAndDrain(rig, source);
+}
+
+TEST_CASE("a stop request after a sample ends a session with no terminal as answered", "[cli][live][source]")
+{
+    Rig rig;
+    LiveEventSource source { rig.StoppableParts() };
+
+    auto exit = std::optional<DashboardExit> {};
+    auto run = RunOver(&source, &rig.view, &rig.sink, DashboardLimits {}, &exit);
+    rig.reactor.Submit(run.Native());
+    rig.Settle();
+    CHECK(rig.gatherer.Calls() == 1);
+    CHECK_FALSE(exit.has_value());
+
+    rig.stop.Fire();
+    rig.reactor.Drain();
+
+    // Quit, and a session that had a reading to show: the operator ended a run that
+    // worked, which is exit 0 rather than a failure they have to explain to a script.
+    CHECK((exit.has_value() && exit->stop == DashboardStop::Quit));
+    CHECK((exit.has_value() && ExitCodeOf(exit->outcome) == 0));
+
+    CloseAndDrain(rig, source);
+}
+
+TEST_CASE("a stop request before any sample does not end a session as answered", "[cli][live][source]")
+{
+    // The control for the case above: a stop is not an answer by itself. Quit before a
+    // reading arrived is a session that showed nothing, and exit 0 would claim otherwise.
+    Rig rig;
+    rig.stop.Fire();
+    LiveEventSource source { rig.StoppableParts() };
+
+    auto exit = std::optional<DashboardExit> {};
+    auto run = RunOver(&source, &rig.view, &rig.sink, DashboardLimits {}, &exit);
+    rig.reactor.Submit(run.Native());
+    rig.reactor.Drain();
+
+    CHECK((exit.has_value() && exit->stop == DashboardStop::Quit));
+    CHECK((exit.has_value() && ExitCodeOf(exit->outcome) != 0));
+    CHECK(rig.gatherer.Calls() == 0);
+
+    CloseAndDrain(rig, source);
+}
+
+TEST_CASE("a session with a stop signal keeps sampling until a stop arrives and drains once closed", "[cli][live][source]")
+{
+    Rig rig;
+    LiveEventSource source { rig.StoppableParts() };
+
+    auto exit = std::optional<DashboardExit> {};
+    auto run = RunOver(&source, &rig.view, &rig.sink, DashboardLimits {}, &exit);
+    rig.reactor.Submit(run.Native());
+    rig.Settle();
+    rig.clock.Advance(Interval);
+    rig.Settle();
+
+    // Nothing fired: the watch is waiting, not ending the session and not asking twice.
+    CHECK_FALSE(exit.has_value());
+    CHECK(rig.gatherer.Calls() == 2);
+    CHECK(rig.stop.Waits() == 1);
+
+    // And a close answers that wait, so the drain does not hang on a thread nobody woke.
+    CloseAndDrain(rig, source);
+    CHECK((exit.has_value() && exit->stop == DashboardStop::SourceDetached));
+}
+
+TEST_CASE("a stop watch that fails ends the session saying why", "[cli][live][source]")
+{
+    // A session nothing could interrupt with Ctrl-C is not one to keep running.
+    Rig rig;
+    LiveEventSource source { rig.StoppableParts() };
+    rig.Settle();
+    (void) NextDue(rig, source);
+    (void) NextDue(rig, source);
+
+    rig.stop.Fail();
+    auto const ended = NextDue(rig, source);
+    CHECK(KindOf(ended) == DashboardEventKind::Detached);
+    CHECK((ended.has_value() && ended->note.contains("Ctrl-C")));
 
     CloseAndDrain(rig, source);
 }
