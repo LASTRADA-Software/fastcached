@@ -198,11 +198,21 @@ enum class FigureFormat : std::uint8_t
 /// @return The text; @p absent when @p value is nullopt or not finite.
 [[nodiscard]] std::string FormatFigure(std::optional<double> value, FigureFormat format, std::string_view absent);
 
+/// How many columns of content a frame @p width columns wide holds: the two edges and the blank
+/// column before the right one taken away.
+/// @param width The frame's total width; `Frame` treats anything below four as four.
+/// @return The content columns.
+[[nodiscard]] constexpr std::size_t ContentColumns(std::size_t width) noexcept
+{
+    return width > 4 ? width - 3 : 1;
+}
+
 /// @p lines inside the rung's frame, @p width columns wide in total.
 ///
-/// Each line is fitted to the inside width, so a panel lays out its rows and the frame decides
-/// nothing but the edge. The title is set into the top edge. Lines are separated by `\n` with no
-/// cursor movement: where the picture goes on the screen is the terminal sink's decision.
+/// Each line is fitted to `ContentColumns(width)` and followed by one blank column before the
+/// right edge, so a panel lays out its rows and the frame decides nothing but the edge. The title is set into the top edge.
+/// Lines are separated by `\n` with no cursor movement: where the picture goes on the screen is the terminal sink's
+/// decision.
 /// @param title The top edge's title; cut to fit.
 /// @param lines The content lines.
 /// @param width The frame's total width, edges included; at least four.

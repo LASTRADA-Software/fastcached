@@ -203,8 +203,11 @@ std::string Frame(std::string_view title, std::span<std::string const> lines, st
     auto frame = std::string { glyphs.topLeft } + std::string { glyphs.horizontal } + shownLabel
                  + Repeat(glyphs.horizontal, inside - 1 - DisplayWidth(shownLabel)) + std::string { glyphs.topRight } + "\n";
 
+    // One blank column is kept before the right edge, so no content ever touches it: a figure
+    // written up against the edge reads as one word with it, to a person and to a script alike.
     for (auto const& line: lines)
-        frame += std::string { glyphs.vertical } + FitRight(line, inside) + std::string { glyphs.vertical } + "\n";
+        frame += std::string { glyphs.vertical } + FitRight(line, ContentColumns(width)) + " "
+                 + std::string { glyphs.vertical } + "\n";
 
     frame += std::string { glyphs.bottomLeft } + Repeat(glyphs.horizontal, inside) + std::string { glyphs.bottomRight };
     return frame;
