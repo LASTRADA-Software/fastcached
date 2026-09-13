@@ -5,6 +5,7 @@
 #include <FastCache/Async/TestReactor.hpp>
 #include <FastCache/Async/ThreadPoolExecutor.hpp>
 #include <FastCache/Core/Clock.hpp>
+#include <FastCache/Core/Utf8.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -15,8 +16,10 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <ranges>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <tuple>
 #include <vector>
@@ -712,10 +715,196 @@ TEST_CASE("presentation bytes are endo's own spellings", "[cli][dashboard][termi
     auto const& screen = ScreenBytes();
     CHECK(screen.enter == "\x1b[?1049h\x1b[?25l");
     CHECK(screen.leave == "\x1b[?25h\x1b[?1049l");
-    CHECK(screen.home == "\x1b[1;1H");
-    CHECK(screen.clearBelow == "\x1b[J");
     CHECK(screen.syncBegin == "\x1b[?2026h");
     CHECK(screen.syncEnd == "\x1b[?2026l");
+    // A frame: the screen erased from its last row down, then each row placed and erased before it
+    // is written.
+    CHECK(FrameBytes("ab\ncd", false) == "\x1b[2;1H\x1b[J\x1b[1;1H\x1b[Kab\x1b[2;1H\x1b[Kcd");
+    CHECK(FrameBytes("", false) == "\x1b[1;1H\x1b[J");
+}
+
+namespace
+{
+/// A terminal screen as the frame presenter cannot assume it: a LINE FEED moves the cursor down
+/// and does NOT return it to the first column, and autowrap is off, so a character written in the
+/// last column overwrites that column. That is a Windows console with DISABLE_NEWLINE_AUTO_RETURN
+/// (endo's raw mode) or a POSIX tty with output post-processing off, and it is where rows joined
+/// by line feeds all landed in the last column.
+///
+/// Reads UTF-8 one code point per cell -- every glyph the panels draw is one cell wide -- and the
+/// sequences the presenter writes: `CSI <row>;<col> H`, `CSI K`, `CSI J`, and private modes, which
+/// change nothing drawn here. Anything else is recorded, so a presenter writing a sequence this
+/// model does not know fails the case rather than drawing nothing silently.
+class NoAutoReturnScreen
+{
+  public:
+    NoAutoReturnScreen(std::size_t columns, std::size_t rows):
+        _columns { columns },
+        _cells(rows, std::vector<std::string>(columns, " "))
+    {
+    }
+
+    /// Interpret @p bytes as the terminal would.
+    void Feed(std::string_view bytes)
+    {
+        while (!bytes.empty())
+        {
+            if (bytes.starts_with("\x1b["))
+            {
+                bytes.remove_prefix(2);
+                auto const terminator =
+                    bytes.find_first_of("@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~");
+                REQUIRE(terminator != std::string_view::npos);
+                Control(bytes.substr(0, terminator), bytes[terminator]);
+                bytes.remove_prefix(terminator + 1);
+                continue;
+            }
+            if (bytes.front() == '\n')
+            {
+                LineFeed();
+                bytes.remove_prefix(1);
+                continue;
+            }
+            if (bytes.front() == '\r')
+            {
+                _column = 0;
+                bytes.remove_prefix(1);
+                continue;
+            }
+            auto const length = Utf8SequenceLength(bytes);
+            REQUIRE(length > 0);
+            _cells[_row][_column] = std::string { bytes.substr(0, length) };
+            if (_column + 1 < _columns)
+                ++_column;
+            bytes.remove_prefix(length);
+        }
+    }
+
+    /// @return Row @p row as drawn, every cell included.
+    [[nodiscard]] std::string Row(std::size_t row) const
+    {
+        auto text = std::string {};
+        for (auto const& cell: _cells[row])
+            text += cell;
+        return text;
+    }
+
+    /// @return The sequences this model did not know, each as `<parameters><final>`.
+    [[nodiscard]] std::vector<std::string> const& Unknown() const noexcept
+    {
+        return _unknown;
+    }
+
+  private:
+    void Control(std::string_view parameters, char terminator)
+    {
+        if (parameters.starts_with('?') && (terminator == 'h' || terminator == 'l'))
+            return;
+        if (terminator == 'H')
+        {
+            auto const separator = parameters.find(';');
+            auto const row = separator == std::string_view::npos ? parameters : parameters.substr(0, separator);
+            auto const column = separator == std::string_view::npos ? std::string_view {} : parameters.substr(separator + 1);
+            _row = std::min(Ordinal(row), _cells.size()) - 1;
+            _column = std::min(Ordinal(column), _columns) - 1;
+            return;
+        }
+        if (terminator == 'K' && parameters.empty())
+        {
+            for (auto const column: std::views::iota(_column, _columns))
+                _cells[_row][column] = " ";
+            return;
+        }
+        if (terminator == 'J' && parameters.empty())
+        {
+            Control({}, 'K');
+            for (auto const row: std::views::iota(_row + 1, _cells.size()))
+                _cells[row].assign(_columns, " ");
+            return;
+        }
+        _unknown.push_back(std::string { parameters } + terminator);
+    }
+
+    void LineFeed()
+    {
+        if (_row + 1 < _cells.size())
+        {
+            ++_row;
+            return;
+        }
+        _cells.erase(_cells.begin());
+        _cells.emplace_back(_columns, " ");
+    }
+
+    /// @return A 1-based CSI parameter, where empty and 0 both mean 1.
+    [[nodiscard]] static std::size_t Ordinal(std::string_view digits)
+    {
+        auto value = std::size_t { 0 };
+        for (auto const digit: digits)
+            value = (value * 10) + static_cast<std::size_t>(digit - '0');
+        return std::max<std::size_t>(value, 1);
+    }
+
+    std::size_t _columns;
+    std::vector<std::vector<std::string>> _cells;
+    std::size_t _row { 0 };
+    std::size_t _column { 0 };
+    std::vector<std::string> _unknown;
+};
+} // namespace
+
+TEST_CASE("full-width frame rows each start in the first column on a terminal whose line feed does not return",
+          "[cli][dashboard][terminal]")
+{
+    // The defect measured in a 120x40 ConPTY: rows joined by line feeds, each exactly the frame's
+    // width, so after the first the cursor sits in the last column and every later row lands there.
+    // The frame is as wide as the screen, which is the case that exposes it -- and the one where an
+    // erase written after a row would take the row's last cell. Synchronized or not changes nothing
+    // drawn.
+    auto const frame = std::string { "\u250c\u2500 node \u2500\u2500\u2510\n\u2502 up 3s   "
+                                     "\u2502\n\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518" };
+    for (auto const synchronized: { false, true })
+    {
+        auto screen = NoAutoReturnScreen { 11, 5 };
+        screen.Feed(FrameBytes(frame, synchronized));
+
+        CHECK(screen.Row(0) == "\u250c\u2500 node \u2500\u2500\u2510");
+        CHECK(screen.Row(1) == "\u2502 up 3s   \u2502");
+        CHECK(screen.Row(2) == "\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518");
+        CHECK(screen.Row(3) == "           ");
+        CHECK(screen.Row(4) == "           ");
+        CHECK(screen.Unknown().empty());
+    }
+}
+
+TEST_CASE("a frame shorter than the one before it leaves nothing of the earlier frame on screen",
+          "[cli][dashboard][terminal]")
+{
+    // A resize or a panel losing a line draws fewer rows; the rows below, and the tail of a row that got
+    // shorter, must not keep the previous frame's text.
+    auto screen = NoAutoReturnScreen { 8, 5 };
+    screen.Feed(FrameBytes("AAAAAAAA\nBBBBBBBB\nCCCCCCCC\nDDDDDDDD", false));
+    screen.Feed(FrameBytes("xy\nzzzzzzzz", false));
+
+    CHECK(screen.Row(0) == "xy      ");
+    CHECK(screen.Row(1) == "zzzzzzzz");
+    CHECK(screen.Row(2) == "        ");
+    CHECK(screen.Row(3) == "        ");
+    CHECK(screen.Row(4) == "        ");
+    CHECK(screen.Unknown().empty());
+}
+
+TEST_CASE("a frame as tall as the screen that ends in a newline keeps its bottom row", "[cli][dashboard][terminal]")
+{
+    // The final newline ends the last row. Read as an empty row below it, it would be placed on a
+    // row the screen does not have -- clamped to the bottom one -- and erase it.
+    auto screen = NoAutoReturnScreen { 4, 3 };
+    screen.Feed(FrameBytes("top \nmid \nbot \n", false));
+
+    CHECK(screen.Row(0) == "top ");
+    CHECK(screen.Row(1) == "mid ");
+    CHECK(screen.Row(2) == "bot ");
+    CHECK(screen.Unknown().empty());
 }
 
 TEST_CASE("a DECRQM answer for mode 2026 keeps its meaning as a synchronized-output answer", "[cli][dashboard][terminal]")
@@ -859,7 +1048,9 @@ TEST_CASE("a frame on a terminal that reported synchronized output is bracketed 
     outcome.started->frames->Present("PANELS");
     auto const frame = record.Written().substr(before);
 
-    CHECK(frame == screen.syncBegin + screen.home + "PANELS" + screen.clearBelow + screen.syncEnd);
+    CHECK(frame == FrameBytes("PANELS", true));
+    CHECK(frame.starts_with(screen.syncBegin));
+    CHECK(frame.ends_with(screen.syncEnd));
 }
 
 TEST_CASE("a frame on a terminal that did not report synchronized output is never bracketed in it",
@@ -885,7 +1076,7 @@ TEST_CASE("a frame on a terminal that did not report synchronized output is neve
         outcome.started->frames->Present("PANELS");
         auto const frame = record.Written().substr(before);
 
-        CHECK(frame == screen.home + "PANELS" + screen.clearBelow);
+        CHECK(frame == FrameBytes("PANELS", false));
         CHECK(Occurrences(record.Written(), screen.syncBegin) == 0);
     }
 }
