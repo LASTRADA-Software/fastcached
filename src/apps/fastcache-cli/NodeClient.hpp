@@ -243,6 +243,16 @@ struct EndpointIdentity
 
     /// The identification in words for a person, naming the address.
     std::string detail {};
+
+    /// Whether this is a compile node whose own description this client could not read.
+    ///
+    /// **Still a node** -- `kind` says so, and a verb inferring a subject must not drift to
+    /// `cache` for a port that speaks no RESP -- but not one this client can watch: a node
+    /// answering `NodeStatus` in a shape this build cannot decode is, overwhelmingly, a node on
+    /// another `0xFC` wire version, and every exchange a session would take with it is suspect
+    /// for the same reason. A field rather than a sentence, so a verb deciding whether to start
+    /// asks it instead of matching on `detail`.
+    bool unreadable { false };
 };
 
 /// Where a verb learns what the endpoint is.
