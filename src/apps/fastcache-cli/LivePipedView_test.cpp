@@ -9,8 +9,10 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -332,59 +334,95 @@ namespace
     });
 }
 
+constexpr auto WholeRate = FigureSpec { .field = { .metrics = "a_total", .nodeMetrics = {}, .info = {} } };
+constexpr auto BesideNamed = std::array { BesideFigure { .key = "b", .figure = WholeRate } };
+constexpr auto BesideUnnamed = std::array { BesideFigure { .key = "", .figure = WholeRate } };
+constexpr auto BesideRepeating = std::array { BesideFigure { .key = "a", .figure = WholeRate } };
+constexpr auto RatesNamed =
+    std::array { RateRow { .label = "a/s", .key = "a", .figure = WholeRate, .beside = BesideNamed } };
+constexpr auto RatesUnnamedBeside =
+    std::array { RateRow { .label = "a/s", .key = "a", .figure = WholeRate, .beside = BesideUnnamed } };
+constexpr auto RatesRepeating =
+    std::array { RateRow { .label = "a/s", .key = "a", .figure = WholeRate, .beside = BesideRepeating } };
+constexpr auto LevelsLimitNamed =
+    std::array { LevelRow { .label = "c", .key = "c", .value = WholeRate, .limit = WholeRate, .limitKey = "c_limit" } };
+constexpr auto LevelsRepeatingARate = std::array { LevelRow { .label = "c", .key = "b", .value = WholeRate } };
+constexpr auto LevelsLimitUnnamed =
+    std::array { LevelRow { .label = "c", .key = "c", .value = WholeRate, .limit = WholeRate } };
+constexpr auto LevelsKeyWithoutLimit =
+    std::array { LevelRow { .label = "c", .key = "c", .value = WholeRate, .limitKey = "c_limit" } };
+constexpr auto TiersNamed = std::array { TierColumn { .header = "items", .key = "a", .figure = WholeRate } };
+constexpr auto TiersUnnamed = std::array { TierColumn { .header = "items", .key = "", .figure = WholeRate } };
+constexpr auto TiersRepeating = std::array { TierColumn { .header = "items", .key = "items", .figure = WholeRate },
+                                             TierColumn { .header = "count", .key = "items", .figure = WholeRate } };
+
+/// A panel over the blocks a case chose.
+/// @param rates The rate rows.
+/// @param levels The level rows.
+/// @param tiers The tier columns.
+/// @return The spec.
+[[nodiscard]] constexpr PanelSpec SpecOf(std::span<RateRow const> rates,
+                                         std::span<LevelRow const> levels,
+                                         std::span<TierColumn const> tiers) noexcept
+{
+    return PanelSpec { .title = "t", .rates = rates, .levels = levels, .tierColumns = tiers, .tierNote = {} };
+}
+
 } // namespace
 
-TEST_CASE("a figure's piped key is its panel label, lowered, with a slash read as per", "[cli][live][piped][figures]")
+TEST_CASE("a panel names every figure once for a program and never by its label", "[cli][live][piped][figures]")
 {
-    CHECK(FigureKey("ops/sec") == "ops_per_sec");
-    CHECK(FigureKey("no-slot/min") == "no_slot_per_min");
-    CHECK(FigureKey("hit rate  since start") == "hit_rate_since_start");
-    CHECK(FigureKey("index (RAM)") == "index_ram");
-    CHECK(FigureKey("  Mean Compile ") == "mean_compile");
-    CHECK(FigureKey("ops/sec get ") == "ops_per_sec_get");
-    // No doubled or dangling separator however the slashes fall.
-    CHECK(FigureKey("a//b") == "a_per_per_b");
-    CHECK(FigureKey("/min") == "per_min");
-    CHECK(FigureKey("rate/") == "rate_per");
-    CHECK(FigureKey("(--)").empty());
+    // The control: whole keys pass, a tier key may repeat a figure key (a tier's is named per tier).
+    STATIC_REQUIRE(PanelKeysAreWhole(SpecOf(RatesNamed, LevelsLimitNamed, TiersNamed)));
+    CHECK(PanelKeysAreWhole(CachePanel()));
+    CHECK(PanelKeysAreWhole(NodePanel()));
+
+    // Each way a key can be missing or ambiguous is refused, one at a time.
+    STATIC_REQUIRE_FALSE(PanelKeysAreWhole(SpecOf(RatesUnnamedBeside, LevelsLimitNamed, TiersNamed)));
+    STATIC_REQUIRE_FALSE(PanelKeysAreWhole(SpecOf(RatesRepeating, LevelsLimitNamed, TiersNamed)));
+    STATIC_REQUIRE_FALSE(PanelKeysAreWhole(SpecOf(RatesNamed, LevelsRepeatingARate, TiersNamed)));
+    STATIC_REQUIRE_FALSE(PanelKeysAreWhole(SpecOf(RatesNamed, LevelsLimitUnnamed, TiersNamed)));
+    STATIC_REQUIRE_FALSE(PanelKeysAreWhole(SpecOf(RatesNamed, LevelsKeyWithoutLimit, TiersNamed)));
+    STATIC_REQUIRE_FALSE(PanelKeysAreWhole(SpecOf(RatesNamed, LevelsLimitNamed, TiersUnnamed)));
+    STATIC_REQUIRE_FALSE(PanelKeysAreWhole(SpecOf(RatesNamed, LevelsLimitNamed, TiersRepeating)));
 }
 
 TEST_CASE("a piped cache and node stream name exactly the figures their panels draw", "[cli][live][piped][figures]")
 {
-    // Pinned, because a script reads these names: relabelling a panel row renames a column, and
-    // this is where that is seen. Derived from the panels, so a row added to one shows up here too.
+    // Pinned, because a script reads these names. They are the panels' `key` columns, so a label
+    // reworded for the screen leaves them alone and a key changed on purpose is seen here.
     auto const model = DashboardModel {};
     CHECK(NamesOf(CacheFigures(model))
           == std::vector<std::string> { "source",
                                         "hit_rate",
                                         "hit_rate_since_start",
                                         "ops_per_sec",
-                                        "ops_per_sec_get",
-                                        "ops_per_sec_set",
+                                        "get_per_sec",
+                                        "set_per_sec",
                                         "conns_per_sec",
-                                        "conns_per_sec_accepted",
-                                        "evictions_per_s",
-                                        "evictions_per_s_evicted_unfetched",
-                                        "reclaimed_per_s",
-                                        "reclaimed_per_s_expired_unfetched",
+                                        "connections_accepted",
+                                        "evictions_per_sec",
+                                        "evicted_unfetched_per_sec",
+                                        "reclaimed_per_sec",
+                                        "expired_unfetched_per_sec",
                                         "items",
-                                        "bytes",
+                                        "bytes_used",
                                         "bytes_limit" });
     CHECK(NamesOf(NodeFigures(model))
           == std::vector<std::string> { "source",
                                         "compiles_per_min",
-                                        "compiles_per_min_completed",
-                                        "mean_compile",
+                                        "compiles_completed",
+                                        "mean_compile_seconds",
                                         "no_slot_per_min",
-                                        "lease_exp_per_min",
-                                        "unknown_fp_per_min",
-                                        "cache_hits",
+                                        "lease_expired_per_min",
+                                        "unknown_fingerprint_per_min",
+                                        "cache_hit_rate",
                                         "cores",
                                         "slots_busy",
-                                        "slots_busy_limit",
-                                        "memory",
-                                        "scratch_free",
-                                        "scratch_free_limit" });
+                                        "slots_configured",
+                                        "memory_bytes",
+                                        "scratch_free_bytes",
+                                        "scratch_capacity_bytes" });
 
     // A header is a promise about every row under it, so no two columns may share a name.
     for (auto const& names: { NamesOf(CacheFigures(model)), NamesOf(NodeFigures(model)) })
@@ -423,7 +461,7 @@ TEST_CASE("a piped cache row reports the panel's figures unformatted, absent unt
     CHECK(cell(first, "hit_rate").empty());
     CHECK(cell(first, "ops_per_sec").empty());
     CHECK(cell(first, "hit_rate_since_start") == "0.9000");
-    CHECK(cell(first, "bytes") == "4096");
+    CHECK(cell(first, "bytes_used") == "4096");
     CHECK(cell(first, "bytes_limit") == "8192");
     // A figure INFO does not carry is absent rather than zero.
     CHECK(cell(first, "items").empty());
@@ -431,5 +469,5 @@ TEST_CASE("a piped cache row reports the panel's figures unformatted, absent unt
     // Over two seconds: 90 hits of 100 lookups, and 500 commands.
     CHECK(cell(second, "hit_rate") == "0.9000");
     CHECK(cell(second, "ops_per_sec") == "250.000");
-    CHECK(cell(second, "bytes") == "5120");
+    CHECK(cell(second, "bytes_used") == "5120");
 }
