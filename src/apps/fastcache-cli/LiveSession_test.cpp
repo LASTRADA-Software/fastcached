@@ -453,8 +453,9 @@ struct Composition
 };
 
 /// The capabilities of a terminal that reported Sixel.
-constexpr auto SixelTerminal =
-    TerminalCapabilities { .sixel = SixelAnswer::Advertised, .encoding = TerminalTextEncoding::Utf8 };
+constexpr auto SixelTerminal = TerminalCapabilities { .sixel = SixelAnswer::Advertised,
+                                                      .encoding = TerminalTextEncoding::Utf8,
+                                                      .cellPixels = CellPixelSize { .width = 10, .height = 20 } };
 
 /// A drain wait whose time passes only when the drain sleeps, and which can let the rig run
 /// after a chosen number of sleeps -- so a source drains for real, mid-drain.

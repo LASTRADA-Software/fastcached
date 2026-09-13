@@ -37,7 +37,7 @@ constexpr auto RungRows = std::to_array<RungRow>({
 
 } // namespace
 
-TEST_CASE("the rung is Sixel only when advertised, then Unicode only for UTF-8, and ASCII otherwise",
+TEST_CASE("with a cell size, the rung is Sixel only when advertised, then Unicode only for UTF-8, and ASCII otherwise",
           "[cli][dashboard][rung]")
 {
     // A terminal that did not answer DA1 is drawn exactly as one that answered without Sixel, and
@@ -46,8 +46,33 @@ TEST_CASE("the rung is Sixel only when advertised, then Unicode only for UTF-8, 
     for (auto const& row: RungRows)
     {
         CAPTURE(static_cast<int>(row.sixel), static_cast<int>(row.encoding));
-        CHECK(ChooseRenderRung(TerminalCapabilities { .sixel = row.sixel, .encoding = row.encoding }) == row.rung);
+        CHECK(ChooseRenderRung(TerminalCapabilities {
+                  .sixel = row.sixel, .encoding = row.encoding, .cellPixels = CellPixelSize { .width = 10, .height = 20 } })
+              == row.rung);
     }
+}
+
+TEST_CASE("an advertised Sixel with no cell size is not the Sixel rung", "[cli][dashboard][rung]")
+{
+    // An image is sized in pixels to cover cells. WHAT DISTINGUISHES: the same advertised Sixel is the
+    // Sixel rung with a reported cell size and the ENCODING's rung without one -- Unicode for UTF-8,
+    // ASCII otherwise -- never Sixel drawn from a guessed size.
+    auto const measured = CellPixelSize { .width = 10, .height = 20 };
+    for (auto const encoding: { TerminalTextEncoding::Utf8, TerminalTextEncoding::Other, TerminalTextEncoding::Unknown })
+    {
+        CAPTURE(static_cast<int>(encoding));
+        auto const withSize = TerminalCapabilities { .sixel = SixelAnswer::Advertised, .encoding = encoding, .cellPixels = measured };
+        auto const withoutSize = TerminalCapabilities { .sixel = SixelAnswer::Advertised, .encoding = encoding };
+        CHECK(ChooseRenderRung(withSize) == RenderRung::Sixel);
+        CHECK(ChooseRenderRung(withoutSize)
+              == ChooseRenderRung(TerminalCapabilities { .sixel = SixelAnswer::NotAdvertised, .encoding = encoding }));
+        CHECK(ChooseRenderRung(withoutSize) != RenderRung::Sixel);
+    }
+    // And a cell size alone draws no Sixel: the terminal still has to say it can.
+    CHECK(ChooseRenderRung(TerminalCapabilities { .sixel = SixelAnswer::NotAdvertised,
+                                                  .encoding = TerminalTextEncoding::Utf8,
+                                                  .cellPixels = measured })
+          == RenderRung::Unicode);
 }
 
 TEST_CASE("the rung is decided from the record alone, with nothing to ask", "[cli][dashboard][rung]")

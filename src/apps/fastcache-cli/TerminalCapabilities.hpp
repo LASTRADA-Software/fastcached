@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include "DashboardFrame.hpp"
 #include "DashboardRung.hpp"
 
 #include <FastCache/Platform/Terminal.hpp>
 
 #include <cstdint>
+#include <optional>
 
 namespace FastCache::Cli
 {
@@ -64,11 +66,18 @@ struct TerminalCapabilities
 
     /// Whether a frame may be bracketed in synchronized output. Read by the presenter, not the rung.
     SynchronizedOutputAnswer synchronizedOutput { SynchronizedOutputAnswer::NotAsked };
+
+    /// How many pixels a cell measures (`CSI 16 t`), or nullopt when the terminal did not say.
+    ///
+    /// Nullopt is not a default size to assume: an image sized from a guess is the wrong size while
+    /// every figure beside it is right. So without it the Sixel rung is not chosen at all.
+    std::optional<CellPixelSize> cellPixels {};
 };
 
 /// The rung a terminal with @p capabilities is drawn on.
 ///
-/// Sixel when the terminal advertised it. Otherwise Unicode when the encoding is UTF-8, and ASCII
+/// Sixel when the terminal advertised it AND reported its cell size -- an image cannot be placed in
+/// cells whose pixels nobody measured. Otherwise Unicode when the encoding is UTF-8, and ASCII
 /// for anything else, UNKNOWN included: ASCII keeps every figure and every absent marker (§10), so
 /// it is the floor a guess falls to. `Piped` is not an answer here, because a run without a terminal
 /// never has capabilities to ask about.
