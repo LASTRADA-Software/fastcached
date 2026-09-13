@@ -2134,7 +2134,9 @@ TEST_CASE("a heartbeat past its threshold is dressed stale and one inside it fre
     };
     CHECK(toneOn("build-01") == std::optional<FrameTone> { FrameTone::Fresh });
     CHECK(toneOn("build-02") == std::optional<FrameTone> { FrameTone::Stale });
-    CHECK(std::ranges::count_if(lit.spans.front(), [](FrameSpan const& span) { return span.tone != FrameTone::Selected; })
+    CHECK(std::ranges::count_if(
+              lit.spans.front(),
+              [](FrameSpan const& span) { return span.tone == FrameTone::Fresh || span.tone == FrameTone::Stale; })
           == 3);
 }
 
@@ -2259,4 +2261,87 @@ TEST_CASE("without a chart the fleet frame is still the terminal's height, its s
     CHECK(lines.size() == 40);
     CHECK(lines.at(38).contains(FleetReadingSource));
     CHECK(Trimmed(Columns(lines.at(37), 1, FakeCellWidth(lines.at(37)) - 2)).empty());
+}
+
+namespace
+{
+
+/// The tones of the runs in @p run's frame @p index covering exactly @p text on the row holding @p rowText.
+/// @param run What was drawn.
+/// @param index Which frame.
+/// @param rowText Text the row holds.
+/// @param text The run's bytes.
+/// @return The tones, in span order; empty when no run covers exactly that text there.
+[[nodiscard]] std::vector<FrameTone> TonesOver(FleetRun const& run,
+                                               std::size_t index,
+                                               std::string_view rowText,
+                                               std::string_view text)
+{
+    auto const& frame = run.frames.at(index);
+    auto const row = LineIndexHolding(frame, rowText) + 1;
+    auto tones = std::vector<FrameTone> {};
+    for (auto const& span: run.spans.at(index))
+        if (span.row == row && SpanText(frame, span) == text)
+            tones.push_back(span.tone);
+    return tones;
+}
+
+} // namespace
+
+TEST_CASE("a fleet tile's label and words recede, its figure is weighted, and a refusal above zero alerts",
+          "[cli][dashboard][panel][fleet][tone]")
+{
+    // #134 G1. WHAT DISTINGUISHES: each label is one Label run over exactly its word -- not its padding --
+    // `Dispatched`'s figure is a Figure run, `of 192 slots` a Label run, and `Refused` is an Alert run at 1
+    // and a Figure run at 0 over the same document, so the alert is the value and not the tile.
+    auto const refusing = FleetText(3);
+    auto quiet = refusing;
+    auto const refusedRow = std::string { "\nrefused\t1\tcount\t-\n" };
+    REQUIRE(quiet.contains(refusedRow));
+    quiet.replace(quiet.find(refusedRow), refusedRow.size(), "\nrefused\t0\tcount\t-\n");
+
+    auto const run =
+        RunFleet({ FleetSampleOf(1, refusing), Tick, FleetSampleOf(2, quiet), Tick }, 132, 40, UnicodeContext());
+    REQUIRE(run.frames.size() == 2);
+    for (auto const& kpi: Distributed::FleetKpis())
+    {
+        INFO("tile " << kpi.label);
+        CHECK(TonesOver(run, 0, kpi.label, kpi.label) == std::vector<FrameTone> { FrameTone::Label });
+    }
+    CHECK(TonesOver(run, 0, "Dispatched", "12 884") == std::vector<FrameTone> { FrameTone::Figure });
+    CHECK(TonesOver(run, 0, "Compiling now", "of 192 slots") == std::vector<FrameTone> { FrameTone::Label });
+    CHECK(TonesOver(run, 0, "Refused", "1") == std::vector<FrameTone> { FrameTone::Alert });
+    CHECK(TonesOver(run, 1, "Refused", "0") == std::vector<FrameTone> { FrameTone::Figure });
+}
+
+TEST_CASE("a worker's limit is toned by the leader, and a table's heading, key hint and overflow are labels",
+          "[cli][dashboard][panel][fleet][tone]")
+{
+    // #134 G1. WHAT DISTINGUISHES: `registered` is Fresh and `scratch` an Alert, by the leader's one table --
+    // a panel tinting every limit alike fails the pair -- the heading's `limited-by` is a Label run over the
+    // word alone, and so are `keys  m w l c t` and the overflow line, while no machine name is toned.
+    auto document = FleetText(3);
+    document += "\n# workers\nendpoint\tlimited-by\n";
+    for (auto const index: std::views::iota(1, 31))
+        document += std::format("build-{:02}:7070\t{}\n", index, index == 2 ? "scratch" : "registered");
+
+    auto const run = RunFleet({ FleetSampleOf(1, document), Tick, KeyOf("w") }, 132, 24, UnicodeContext());
+    REQUIRE(run.frames.size() == 2);
+    auto const& frame = run.frames[1];
+    CHECK(TonesOver(run, 1, "build-01:7070", "registered") == std::vector<FrameTone> { FrameTone::Fresh });
+    CHECK(TonesOver(run, 1, "build-02:7070", "scratch") == std::vector<FrameTone> { FrameTone::Alert });
+    CHECK(TonesOver(run, 1, "build-02:7070", "build-02:7070").empty());
+    CHECK(TonesOver(run, 1, "limited-by", "limited-by") == std::vector<FrameTone> { FrameTone::Label });
+    CHECK(TonesOver(run, 1, "keys  m w l c t", "keys  m w l c t") == std::vector<FrameTone> { FrameTone::Label });
+
+    auto const overflow = LineStarting(frame, "... ");
+    REQUIRE(overflow.has_value());
+    auto const& line = Unwrap(overflow);
+    constexpr auto Last = std::string_view { "/ filters" };
+    auto const at = line.find("... ");
+    auto const end = line.find(Last);
+    REQUIRE(at != std::string::npos);
+    REQUIRE(end != std::string::npos);
+    auto const words = line.substr(at, end + Last.size() - at);
+    CHECK(TonesOver(run, 1, words, words) == std::vector<FrameTone> { FrameTone::Label });
 }
