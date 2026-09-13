@@ -399,9 +399,11 @@ TEST_CASE("an interactive terminal that cannot be acquired refuses the session n
     rig.Settle();
 
     auto const* const refusal = composition.Refusal();
-    CHECK((refusal != nullptr && refusal->outcome == Outcome::Refused));
+    CHECK((refusal != nullptr && refusal->outcome == Outcome::Local));
     CHECK((refusal != nullptr && !refusal->advisories.empty()
            && refusal->advisories.front().contains("stdin is not a terminal")));
+    // The remedy is on this machine, which is what `Local` says to a script and this says to a person.
+    CHECK((refusal != nullptr && !refusal->advisories.empty() && refusal->advisories.front().contains("output redirected")));
     CHECK(composition.stops.calls == 0);
     CHECK(composition.views.asked.empty());
     CHECK_FALSE(composition.source.has_value());
