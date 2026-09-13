@@ -6446,3 +6446,50 @@ if(FASTCACHED_BUILD_TUI AND TARGET fastcache-tui-tests)
         TIMEOUT 120
     )
 endif()
+
+# ---------------------------------------------------------------------------
+# cli-node-flags: `fastcache-cli --help` sends operators to flags that exist.
+#
+# The client's NOTES name the operator actions that live only in
+# `fastcache-compile-node` -- enrollment and `--print-surfaces` (#1307). That is prose
+# in one binary about another binary's option table, and nothing else connects them: a
+# flag renamed in `NodeConfig.cpp` would leave the help pointing at nothing while every
+# unit test in both binaries stays green. So the check asks both BINARIES, and requires
+# every flag a paragraph naming the node cites to be an option row of the node's own
+# `--help`.
+#
+# Registered HERE and not beside either app because it names two targets, and
+# `src/apps` walks its table in order: a `$<TARGET_FILE:>` guard on a target configured
+# later does not fail, it silently skips the test forever. Both targets are optional,
+# and `$<TARGET_FILE:>` on one that was not built is a hard error at generate time, so
+# the registration is guarded on both.
+#
+# Not POSIX-only: it runs two `--help`s and reads their text with CRs stripped. Measured
+# before this was written, and no further: through Git Bash, a Windows `fastcache-cli.exe`
+# (whose help carries CRs) was captured and judged, and the CRLF case is in the self-test.
+if(NOT TARGET fastcache-cli OR NOT TARGET fastcache-compile-node)
+    message(STATUS "cli-node-flags: client or compile node not built -- skipping")
+else()
+    add_test(
+        NAME "cli-node-flags"
+        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-cli-node-flags.sh"
+            --cli "$<TARGET_FILE:fastcache-cli>"
+            --node "$<TARGET_FILE:fastcache-compile-node>"
+    )
+    set_tests_properties("cli-node-flags" PROPERTIES
+        LABELS "hygiene"
+        TIMEOUT 60
+    )
+endif()
+
+# And the verdicts, over staged help texts: both directions, a flag named only in
+# another row's prose, a prefix of a real flag, CRLF input, and every way the reader
+# can fail to LOOK -- since an empty citation list agrees with any node perfectly.
+add_test(
+    NAME "cli-node-flags-selftest"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-cli-node-flags.sh" --self-test
+)
+set_tests_properties("cli-node-flags-selftest" PROPERTIES
+    LABELS "hygiene"
+    TIMEOUT 60
+)

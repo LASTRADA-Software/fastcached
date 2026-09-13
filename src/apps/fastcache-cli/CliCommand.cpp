@@ -285,6 +285,18 @@ namespace
         "Reading TSV with `IFS=$'\\t' read` does not work when a field can be absent:\n"
         "tab is IFS whitespace, so an empty field collapses and shifts every field\n"
         "after it. Use --absent to name a placeholder, or prefer csv or json.",
+
+        // The other operator binary, named where an operator who learned this one would
+        // look (#1307). Every flag this paragraph cites is required to be an option row of
+        // `fastcache-compile-node --help` by `ctest -R cli-node-flags`, so a flag renamed
+        // there reddens here instead of leaving this paragraph pointing at nothing.
+        "Some operator actions are fastcache-compile-node flags, not commands here.\n"
+        "Enrollment: --enroll-open, --enroll-list, --enroll-approve, --enroll-reject\n"
+        "and --enroll-close ask the cluster at --scheduler; --enroll-from runs on the\n"
+        "machine that is joining, since it writes that machine's identity and the key\n"
+        "it is handed. --print-surfaces lists the ports a node's configuration would\n"
+        "open, and dials nothing. The cluster-* commands above send the requests its\n"
+        "--cluster-status, --cluster-set, --cluster-admit and --cluster-forget send.",
     });
 
     /// The verb's invocation form, for the left column of the COMMANDS block.
