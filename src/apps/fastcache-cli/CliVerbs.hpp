@@ -307,6 +307,17 @@ static_assert(EveryNodeAnswerDialsTheNode(WireTable),
 /// uses for its handlers.
 using VerbHandler = Answer (*)(VerbContext const&);
 
+struct LiveSessionSeat;
+struct SessionEnding;
+
+/// What a verb that WATCHES does instead of answering once.
+///
+/// **A stream is not an answer**, so it cannot be a `VerbHandler`: a session runs for as
+/// long as it is watched, on a reactor, pools and a sink that `main` acquires and hands
+/// over as the seat. The seat and the ending are declared with the session
+/// (`LiveSession.hpp`), which keeps this header from naming a reactor.
+using VerbSession = SessionEnding (*)(VerbContext const&, LiveSessionSeat const&);
+
 /// The command-line modifiers a verb can honour, as bits of `VerbSpec::modifiers`.
 ///
 /// **A column, so a modifier that means nothing for a verb is REFUSED rather than
@@ -365,6 +376,15 @@ struct VerbSpec
     /// Reached only after the primary wire failed AND the endpoint was probed, so it
     /// costs the common case nothing. `RunNodeFallback` is the one door.
     VerbHandler nodeFallback;
+
+    /// The session this verb runs, or null for a verb that answers once.
+    ///
+    /// **Null on every row but `live-stats`**, following `nodeFallback`: a column rather than
+    /// a name `main` compares, because a dispatch on a string in a file no test builds is the
+    /// one place a second watching verb would be forgotten. `main` asks this before
+    /// `handler`; the handler stays the synchronous door onto the same admission, so
+    /// `RunVerb` is still total over every row.
+    VerbSession session;
 };
 
 /// The verbs, in the order `--help` documents them.

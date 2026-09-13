@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "CliVerbs.hpp"
+#include "LiveSession.hpp"
 #include "ScriptedExchange.hpp"
 
 #include <FastCache/Distributed/FleetView.hpp>
@@ -64,6 +65,21 @@ TEST_CASE("the verb table is internally consistent", "[cli][verbs]")
             CHECK_FALSE(verb.protocolCommand.empty());
     }
     CHECK(FindVerb("no-such-verb") == nullptr);
+}
+
+TEST_CASE("the one verb that watches is live-stats, and it runs its session on its own column", "[cli][verbs][live]")
+{
+    // `main` asks `session` before `handler`, so a watching verb with no session would answer
+    // its admission once and exit, and a second session on some other row would be dispatched
+    // there silently. Both directions, by name.
+    for (auto const& verb: Verbs())
+    {
+        INFO("verb: " << verb.name);
+        CHECK((verb.session != nullptr) == (verb.name == "live-stats"));
+    }
+    auto const* const live = FindVerb("live-stats");
+    REQUIRE(live != nullptr);
+    CHECK(live->session == &RunLiveStatsSession);
 }
 
 TEST_CASE("no two verbs claim the same name", "[cli][verbs]")

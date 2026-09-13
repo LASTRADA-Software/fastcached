@@ -892,7 +892,8 @@ namespace
                       .protocolCommand = "",
                       .modifiers = Modifier::None,
                       .handler = nullptr,
-                      .nodeFallback = nullptr };
+                      .nodeFallback = nullptr,
+                      .session = nullptr };
 }
 
 /// Where @p verb's row begins in @p text.
