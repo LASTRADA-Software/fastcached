@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "DashboardGlyphs.hpp"
+#include "ScriptedCellWidth.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -13,6 +14,7 @@
 #include <vector>
 
 using namespace FastCache::Cli;
+using FastCache::Cli::Testing::FakeCellWidth;
 
 namespace
 {
@@ -185,11 +187,11 @@ TEST_CASE("every frame line is exactly the frame's width on both text rungs", "[
 
     for (auto const rung: { RenderRung::Unicode, RenderRung::Ascii })
     {
-        auto const frame = Frame("a title that is also far too long", lines, Width, GlyphsFor(rung));
+        auto const frame = Frame("a title that is also far too long", lines, Width, GlyphsFor(rung), &FakeCellWidth);
         auto rows = std::size_t { 0 };
         for (auto const row: std::views::split(std::string_view { frame }, '\n'))
         {
-            CHECK(DisplayWidth(std::string_view { row.begin(), row.end() }) == Width);
+            CHECK(FakeCellWidth(std::string_view { row.begin(), row.end() }) == Width);
             ++rows;
         }
         CHECK(rows == lines.size() + 2);
@@ -198,11 +200,26 @@ TEST_CASE("every frame line is exactly the frame's width on both text rungs", "[
 
 TEST_CASE("fitting text never splits a code point", "[cli][dashboard][glyphs]")
 {
-    auto const fitted = FitRight("\xe2\x96\x81\xe2\x96\x82\xe2\x96\x83", 2);
+    auto const fitted = FitRight("\xe2\x96\x81\xe2\x96\x82\xe2\x96\x83", 2, &FakeCellWidth);
     CHECK(fitted == "\xe2\x96\x81\xe2\x96\x82");
-    CHECK(FitRight("ab", 4) == "ab  ");
-    CHECK(AlignRight("42", 5) == "   42");
-    CHECK(AlignRight("123456", 3) == "123456"); // a figure is never cut
+    CHECK(FitRight("ab", 4, &FakeCellWidth) == "ab  ");
+    CHECK(AlignRight("42", 5, &FakeCellWidth) == "   42");
+    CHECK(AlignRight("123456", 3, &FakeCellWidth) == "123456"); // a figure is never cut
+}
+
+TEST_CASE("fitting text measures cells, not bytes or code points", "[cli][dashboard][glyphs]")
+{
+    // A hostname can be wide. WHAT DISTINGUISHES: a two-cell character that would straddle the edge
+    // is left out and its half-cell padded, so the result is exactly the width; a zero-width mark
+    // costs nothing, so it stays with the character it modifies; and a byte or code-point count
+    // gives a different answer for each of the three lines below.
+    auto const wideA = std::string { "\xef\xbc\xa1" };  // U+FF21 FULLWIDTH LATIN CAPITAL A, two cells
+    auto const wideB = std::string { "\xef\xbc\xa2" };  // U+FF22, two cells
+    auto const combining = std::string { "e\xcc\x81" }; // e + U+0301, one cell
+    CHECK(FitRight(wideA + wideB + "c", 3, &FakeCellWidth) == wideA + " ");
+    CHECK(FakeCellWidth(FitRight(wideA + wideB + "c", 3, &FakeCellWidth)) == 3);
+    CHECK(FitRight(combining + "x", 2, &FakeCellWidth) == combining + "x");
+    CHECK(AlignRight(wideA, 4, &FakeCellWidth) == "  " + wideA);
 }
 
 TEST_CASE("a gauge fills in proportion and keeps its width", "[cli][dashboard][glyphs]")
@@ -211,5 +228,5 @@ TEST_CASE("a gauge fills in proportion and keeps its width", "[cli][dashboard][g
     CHECK(Gauge(0.5, 10, ascii) == "[#####.....]");
     CHECK(Gauge(-1.0, 4, ascii) == "[....]");
     CHECK(Gauge(7.0, 4, ascii) == "[####]");
-    CHECK(DisplayWidth(Gauge(0.853, 20, GlyphsFor(RenderRung::Unicode))) == 20);
+    CHECK(FakeCellWidth(Gauge(0.853, 20, GlyphsFor(RenderRung::Unicode))) == 20);
 }

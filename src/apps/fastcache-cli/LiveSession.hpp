@@ -3,6 +3,7 @@
 
 #include "CliAnswer.hpp"
 #include "DashboardEvent.hpp"
+#include "DashboardGlyphs.hpp"
 #include "DashboardLoop.hpp"
 #include "DashboardRung.hpp"
 #include "LiveEventSource.hpp"
@@ -188,12 +189,17 @@ struct LiveSessionRun
 /// name. Drawing a terminal session through the piped view instead would change the output's
 /// shape under a script copied from a run at that terminal, which is the silent fall back §1.6
 /// rules out.
+///
+/// **How wide text is arrives here, and every panel is laid out through it**: `main` binds
+/// `TerminalCellWidth`, a test binds its fake. It is not looked up per view, so one session has one
+/// opinion about where a terminal's right edge is.
 class StandardRungViews final: public IRungViews
 {
   public:
     /// @param render The `--format` and `--absent` the operator asked for.
     /// @param project What a row reports.
-    StandardRungViews(RenderOptions render, FigureProjection project);
+    /// @param cellWidth How many cells text occupies on the terminal a panel is drawn on; not null.
+    StandardRungViews(RenderOptions render, FigureProjection project, CellWidth cellWidth);
 
     [[nodiscard]] std::unique_ptr<IDashboardView> For(RenderRung rung,
                                                       LivePlan const& plan,
@@ -202,6 +208,7 @@ class StandardRungViews final: public IRungViews
   private:
     RenderOptions _render;
     FigureProjection _project;
+    CellWidth _cellWidth;
 };
 
 /// Everything `main` acquires for a session, and nothing a session decides.

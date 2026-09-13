@@ -131,29 +131,38 @@ static_assert(RowsInEnumeratorOrder(RungGlyphTable, &RungGlyphs::rung),
 /// @return Its glyphs.
 [[nodiscard]] RungGlyphs const& GlyphsFor(RenderRung rung) noexcept;
 
-/// How many terminal columns @p text occupies.
+/// How many terminal CELLS a piece of UTF-8 text occupies.
 ///
-/// Counts code points, which is right for everything a panel draws ITSELF -- ASCII, box drawing
-/// and block elements are one column each. A wide or combining character in text a PEER chose (a
-/// fleet display name) is measured as one column and will misalign its row; the fleet page's UTF-8
-/// gate guarantees the text is valid, not that it is narrow.
-/// @param text Valid UTF-8.
-/// @return The width in columns.
-[[nodiscard]] std::size_t DisplayWidth(std::string_view text) noexcept;
+/// **A value the panels are handed, never a function they own.** A cell is not a byte and not a
+/// code point: a CJK hostname is two cells a character, a combining mark is none, and an emoji
+/// sequence is two however many code points it spells. The only function in this binary that knows
+/// that is the vendored terminal library's, and it is reached through the adapter layer rather than
+/// named here, so this is the seam: one pointer, passed into every drawing function below and into
+/// `PanelContext`, and the SAME pointer everywhere a frame is laid out -- two width functions would
+/// be two opinions about where the right edge is.
+///
+/// A plain function pointer for the reason `SampleReader` is one: a width has nothing to carry.
+using CellWidth = std::size_t (*)(std::string_view text) noexcept;
 
-/// @p text cut or padded on the right to exactly @p width columns.
+/// @p text cut or padded on the right to exactly @p width cells.
+///
+/// Cut only at a code-point boundary, as the longest prefix @p cellWidth measures within @p width,
+/// so a character is never split; a wide character that would straddle the edge is left out and
+/// the cell it would have half-filled is padded.
 /// @param text Valid UTF-8.
-/// @param width The columns to fill.
-/// @return The fitted text; never splits a code point.
-[[nodiscard]] std::string FitRight(std::string_view text, std::size_t width);
+/// @param width The cells to fill.
+/// @param cellWidth How wide text is.
+/// @return The fitted text.
+[[nodiscard]] std::string FitRight(std::string_view text, std::size_t width, CellWidth cellWidth);
 
-/// @p text padded on the LEFT to @p width columns, for a figure that aligns on its last digit.
+/// @p text padded on the LEFT to @p width cells, for a figure that aligns on its last digit.
 /// Text wider than @p width is returned whole: a figure is never cut, since a truncated number is
 /// a different number.
 /// @param text Valid UTF-8.
-/// @param width The columns to fill.
+/// @param width The cells to fill.
+/// @param cellWidth How wide text is.
 /// @return The aligned text.
-[[nodiscard]] std::string AlignRight(std::string_view text, std::size_t width);
+[[nodiscard]] std::string AlignRight(std::string_view text, std::size_t width, CellWidth cellWidth);
 
 /// One sparkline, one glyph per cell, oldest on the left.
 ///
@@ -215,12 +224,14 @@ enum class FigureFormat : std::uint8_t
 /// decision.
 /// @param title The top edge's title; cut to fit.
 /// @param lines The content lines.
-/// @param width The frame's total width, edges included; at least four.
+/// @param width The frame's total width in cells, edges included; at least four.
 /// @param glyphs The rung's glyphs.
+/// @param cellWidth How wide text is.
 /// @return The frame.
 [[nodiscard]] std::string Frame(std::string_view title,
                                 std::span<std::string const> lines,
                                 std::size_t width,
-                                RungGlyphs const& glyphs);
+                                RungGlyphs const& glyphs,
+                                CellWidth cellWidth);
 
 } // namespace FastCache::Cli

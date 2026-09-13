@@ -124,36 +124,34 @@ RungGlyphs const& GlyphsFor(RenderRung rung) noexcept
     return RungGlyphTable[static_cast<std::size_t>(rung)];
 }
 
-std::size_t DisplayWidth(std::string_view text) noexcept
+std::string FitRight(std::string_view text, std::size_t width, CellWidth cellWidth)
 {
-    return static_cast<std::size_t>(std::ranges::count_if(text, [](char byte) { return !IsContinuation(byte); }));
-}
-
-std::string FitRight(std::string_view text, std::size_t width)
-{
-    auto fitted = std::string {};
-    fitted.reserve(text.size() + width);
-    auto columns = std::size_t { 0 };
-    for (auto const byte: text)
+    // The longest prefix, ending on a code-point boundary, that the width function measures within
+    // `width`. Measured as a PREFIX rather than summed per code point, so whatever the function knows
+    // about clusters -- a combining mark adds nothing, a joined emoji is two -- is what decides.
+    auto kept = std::size_t { 0 };
+    auto keptWidth = std::size_t { 0 };
+    for (auto const end: std::views::iota(std::size_t { 1 }, text.size() + 1))
     {
-        if (!IsContinuation(byte))
-        {
-            if (columns == width)
-                break;
-            ++columns;
-        }
-        fitted.push_back(byte);
+        if (end < text.size() && IsContinuation(text[end]))
+            continue;
+        auto const prefixWidth = cellWidth(text.substr(0, end));
+        if (prefixWidth > width)
+            break;
+        kept = end;
+        keptWidth = prefixWidth;
     }
-    fitted.append(width - columns, ' ');
+    auto fitted = std::string { text.substr(0, kept) };
+    fitted.append(width - keptWidth, ' ');
     return fitted;
 }
 
-std::string AlignRight(std::string_view text, std::size_t width)
+std::string AlignRight(std::string_view text, std::size_t width, CellWidth cellWidth)
 {
-    auto const columns = DisplayWidth(text);
-    if (columns >= width)
+    auto const cells = cellWidth(text);
+    if (cells >= width)
         return std::string { text };
-    return std::string(width - columns, ' ') + std::string { text };
+    return std::string(width - cells, ' ') + std::string { text };
 }
 
 std::string Sparkline(std::span<std::optional<double> const> cells, RungGlyphs const& glyphs)
@@ -192,21 +190,25 @@ std::string FormatFigure(std::optional<double> value, FigureFormat format, std::
     return FigureFormatTable[static_cast<std::size_t>(format)].write(*value);
 }
 
-std::string Frame(std::string_view title, std::span<std::string const> lines, std::size_t width, RungGlyphs const& glyphs)
+std::string Frame(std::string_view title,
+                  std::span<std::string const> lines,
+                  std::size_t width,
+                  RungGlyphs const& glyphs,
+                  CellWidth cellWidth)
 {
     auto const inside = std::max<std::size_t>(width, 4) - 2;
 
     // `┌─ title ───┐`: one edge glyph, the title padded by a space each side, then edge to the
     // corner. A title too long for the frame is cut, never allowed to push the corner out.
     auto const label = title.empty() ? std::string {} : std::format(" {} ", title);
-    auto const shownLabel = FitRight(label, std::min(DisplayWidth(label), inside - 1));
+    auto const shownLabel = FitRight(label, std::min(cellWidth(label), inside - 1), cellWidth);
     auto frame = std::string { glyphs.topLeft } + std::string { glyphs.horizontal } + shownLabel
-                 + Repeat(glyphs.horizontal, inside - 1 - DisplayWidth(shownLabel)) + std::string { glyphs.topRight } + "\n";
+                 + Repeat(glyphs.horizontal, inside - 1 - cellWidth(shownLabel)) + std::string { glyphs.topRight } + "\n";
 
     // One blank column is kept before the right edge, so no content ever touches it: a figure
     // written up against the edge reads as one word with it, to a person and to a script alike.
     for (auto const& line: lines)
-        frame += std::string { glyphs.vertical } + FitRight(line, ContentColumns(width)) + " "
+        frame += std::string { glyphs.vertical } + FitRight(line, ContentColumns(width), cellWidth) + " "
                  + std::string { glyphs.vertical } + "\n";
 
     frame += std::string { glyphs.bottomLeft } + Repeat(glyphs.horizontal, inside) + std::string { glyphs.bottomRight };
