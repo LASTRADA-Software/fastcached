@@ -236,24 +236,14 @@ class EnrollmentResponder final: public IFrameResponder
 
     /// A handful: one operator and however many machines are enrolling at once.
     ///
-    /// Deliberately small. Every other ceiling on this node is sized for a fleet's
-    /// worth of workers or a build's worth of launchers; this surface serves one person
-    /// and at most `MaxPendingEnrollments` joiners that each dial, ask and hang up. A
-    /// generous number here would be capacity handed to whoever can reach an open
-    /// window, on the one surface where that is anybody.
-    ///
-    /// **That paragraph is inverted, and it is kept above so the inversion is legible.**
+    /// **This number protects nothing, and must not be read as a narrowing.**
     /// `MergedResponder::Largest` folds `_cache`, `_scheduler` and `_compile`; this
-    /// responder is in no fold, so nothing reads this number today. And `Largest` is a
-    /// MAXIMUM, so the only effect this value could ever have if it were folded is to
-    /// WIDEN: 128 is a no-op beside the incumbents, while raising it -- which the
-    /// paragraph above invites, by arguing that a small number is protective -- would
-    /// raise the cap for the cache and compile surfaces too. Generous here is the one
-    /// direction that does anything, and it is the direction the warning warns against.
-    ///
-    /// Two edits that each read as reasonable compose into that: folding this member in
-    /// (looks like the obvious repair, changes nothing) and then raising the number
-    /// (looks like tuning, widens three surfaces).
+    /// responder is in no fold, so on the merged listener nothing reads it. And `Largest`
+    /// is a MAXIMUM: folded in, a small value here would still change nothing, while a
+    /// larger one would widen the connection cap of the cache and compile surfaces too.
+    /// Two edits that each read as reasonable compose into exactly that -- folding this
+    /// member in (looks like the obvious repair, changes nothing) and then raising the
+    /// number (looks like tuning, widens three surfaces).
     ///
     /// **A per-component narrowing is not expressible at this seam at all.**
     /// `RequestTimeout` and `HoldsOwnByteBudget` route to the owner because they are
@@ -266,8 +256,7 @@ class EnrollmentResponder final: public IFrameResponder
     /// **What actually bounds an unauthenticated peer's exposure here is that the window
     /// is CLOSED by default**, opened only by a deliberate operator act, held in memory
     /// and forgotten on restart -- plus `Op::Enroll`'s own per-verb payload cap. No
-    /// number in this class bounds it, and the accounting that would is tracked on
-    /// #1338 rather than improvised here.
+    /// number in this class bounds it.
     [[nodiscard]] std::size_t MaxOpenConnections() const noexcept override
     {
         return 2 * MaxPendingEnrollments;

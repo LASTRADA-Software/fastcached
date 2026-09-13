@@ -429,6 +429,14 @@ class IFrameResponder
     /// scheduler verb carries a fingerprint and a key, while a cache STORE carries a
     /// whole object file. Sizing both for the larger would hand an unauthenticated
     /// peer a way to make the scheduler allocate megabytes.
+    ///
+    /// **Zero here refuses every payload-bearing frame, and that is the OPPOSITE of what
+    /// zero means for the two ceilings below**, where the endpoint reads it as *no ceiling*
+    /// (`concurrent != 0`, `budget != 0`). The reader is built with this as its cap, so
+    /// nothing a zero declares is buffered. The difference would surface through
+    /// `MergedResponder`, whose fold answers 0 for all three when it folds no owner. No
+    /// node builds that shape today -- `main.cpp` always hands it a compile owner -- so a
+    /// case in `NodeFrameSurface_test.cpp` pins what each ceiling answers there (#1338).
     [[nodiscard]] virtual std::size_t MaxRequestBytes() const noexcept = 0;
 
     /// How many connections this surface will hold open at once.
@@ -445,6 +453,9 @@ class IFrameResponder
     /// So what it bounds is descriptors and coroutine frames, and it is sized for
     /// those. Memory is NOT what this bounds; `MaxInFlightBytes()` below is, which is
     /// why this can afford to be generous.
+    ///
+    /// **Zero means no ceiling**: the accept loop refuses only when this is non-zero. Not
+    /// what zero means for `MaxRequestBytes()`, which see.
     [[nodiscard]] virtual std::size_t MaxOpenConnections() const noexcept = 0;
 
     /// How many declared payload bytes may be in flight across all connections.
@@ -460,6 +471,10 @@ class IFrameResponder
     /// them, and does not need a second count to say the same thing less precisely.
     /// A refusal here is a reply on a kept connection, so a peer that arrives during
     /// a busy moment is told to come back rather than made to reconnect.
+    ///
+    /// **Zero means no budget**: a header is refused for its declared length only when
+    /// this is non-zero. Not what zero means for `MaxRequestBytes()`, which see -- and a
+    /// surface whose request cap is also zero admits no payload to spend a budget on.
     [[nodiscard]] virtual std::size_t MaxInFlightBytes() const noexcept = 0;
 
     /// Whether this verb's owner accounts for the request's bytes itself.
