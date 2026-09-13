@@ -27,6 +27,10 @@ def address_sanitized(cmd):
     own code, and one small function is 1 symbol: scored, it read as blind while clang-tidy
     reads its source like any other. Order matters because target options follow the
     directory-scoped `-fsanitize=address`, and a later `-fsanitize=` turns it back on.
+
+    The exemption is THE COMPILE LINE DISABLED THE SANITIZER, read from the command, and
+    nothing else. It is not "objects with few symbols": an instrumented object with one
+    symbol is exactly what the signature exists to call blind, and it still is.
     """
     on = False
     for token in cmd:
@@ -71,8 +75,9 @@ for e in db:
 # Named, never dropped: a unit this cannot measure is a third answer beside blind and
 # analysed. A unit measured by ANOTHER, sanitized compile keeps that measurement.
 for key in sorted(unmeasured - best.keys()):
-    print(f"NOTE {key}: compiled with AddressSanitizer off, so the empty-object signature "
-          f"does not apply and it is not measured here", file=sys.stderr)
+    print(f"NOTE {key}: not measured -- the compile line disabled the sanitizer, so "
+          f"AddressSanitizer's empty-object signature does not apply to its object. That is the "
+          f"whole exemption: an instrumented object with few symbols is still scored", file=sys.stderr)
 if not best:
     print("!ERROR no objects found; run this after a build", file=sys.stderr)
     sys.exit(2)
