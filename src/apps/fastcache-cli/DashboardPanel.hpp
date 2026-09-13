@@ -407,6 +407,19 @@ struct PanelContext
 /// @return `base{tier="<tier>"}`.
 [[nodiscard]] std::string TierSeriesName(std::string_view base, std::string_view tier);
 
+/// The fleet section a keystroke switches a document panel's table to, from @p active.
+///
+/// **The sections a key walks are the ones the strip names**: the tabular rows of
+/// `Distributed::FleetSectionTable`, in its order. `Tab` and `Right` step to the next, `Left` to the
+/// previous, both wrapping; a digit `1`-`9` names the strip's tab in that position. From a section
+/// the strip does not name, the first step lands on its first or last tab. A key naming no section,
+/// or a digit past the last tab, switches nothing.
+/// @param active The section drawn now.
+/// @param keys The bytes the keystroke delivered.
+/// @return The section to draw, or nullopt when the key names none.
+[[nodiscard]] std::optional<Distributed::FleetSection> SectionForKey(Distributed::FleetSection active,
+                                                                     std::string_view keys);
+
 /// Draws any `PanelSpec` on the rung it was given, laid out for the model's current size.
 ///
 /// **Responsive to `columns x rows`** (#134 decision 5), which arrive as `Resize` events: no line is
@@ -427,6 +440,13 @@ class PanelView final: public IDashboardView
     /// @param model What is known.
     /// @return The frame, with the fleet chart placed over it on the Sixel rung.
     [[nodiscard]] DashboardFrame PlacedFrame(DashboardModel const& model) override;
+
+    /// Switch a document panel's table to the section @p keys names (`SectionForKey`).
+    ///
+    /// A panel without a document block has no sections and acts on no key.
+    /// @param keys The bytes the keystroke delivered.
+    /// @return Whether the section changed.
+    [[nodiscard]] bool Key(std::string_view keys) override;
 
   private:
     PanelSpec const* _spec;
