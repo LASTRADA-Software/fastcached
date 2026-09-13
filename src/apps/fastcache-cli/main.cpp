@@ -252,6 +252,37 @@ class StandardTerminalAcquisition final: public ITerminalAcquisition
     }
 };
 
+/// How this process ends once its session was abandoned: flushed, told, and gone without unwinding.
+class ProcessAbandonedExit final: public IAbandonedExit
+{
+  public:
+    /// @param quiet Whether remarks are suppressed.
+    explicit ProcessAbandonedExit(bool quiet) noexcept:
+        _quiet { quiet }
+    {
+    }
+
+    void Flush() override
+    {
+        std::cout.flush();
+        std::fflush(stdout);
+    }
+
+    void Say(Answer const& answer, std::string_view line) override
+    {
+        ReportAdvisories(answer, _quiet);
+        std::cerr << ProgramName << ": " << line << '\n' << std::flush;
+    }
+
+    void Exit(int code) override
+    {
+        std::_Exit(code);
+    }
+
+  private:
+    bool _quiet;
+};
+
 /// Stops a reactor when it goes out of scope, however that happens.
 ///
 /// Declared after the thread running the reactor, so it is destroyed first: a `jthread` joins a
@@ -291,10 +322,9 @@ class StopReactorOnExit
 ///
 /// **An abandonment ends the process here, without unwinding**: a sample still inside a gather
 /// holds the gatherer and the connections this stack owns, and returning would destroy them
-/// under the pool thread. The terminal and the stop request are not the ones left running --
-/// the source releases each once nothing waits on it, which a closed source's producers reach
-/// without the sample -- so what is left to do is flush, say what was abandoned, and exit with
-/// the code the session earned.
+/// under the pool thread. A terminal read may be parked too, so the terminal is put back through
+/// its restore handle rather than by destroying anything, before the flush and the line --
+/// `EndAbandonedSession` owns that order.
 /// @param command The parsed command.
 /// @param verb The verb; its `session` is not null.
 /// @param context What the session runs against.
@@ -346,11 +376,8 @@ class StopReactorOnExit
 
     if (ending.kind == SessionEndKind::Abandoned)
     {
-        std::cout.flush();
-        std::fflush(stdout);
-        ReportAdvisories(answer, command.quiet);
-        std::cerr << ProgramName << ": " << ending.line << '\n' << std::flush;
-        std::_Exit(ExitCodeOf(answer.outcome));
+        auto exit = ProcessAbandonedExit { command.quiet };
+        EndAbandonedSession(ending, exit);
     }
 
     // A session that ran has already written everything it had to say, one frame at a time;

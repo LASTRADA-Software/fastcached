@@ -20,6 +20,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <expected>
+#include <format>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -43,6 +44,34 @@ using namespace FastCache::Cli::Testing;
 
 namespace
 {
+
+/// A restore handle that counts its calls, and notes them in a log when it is given one.
+class LoggingRestore final: public ITerminalRestore
+{
+  public:
+    /// @param log Where each call is noted, or null.
+    explicit LoggingRestore(std::vector<std::string>* log = nullptr) noexcept:
+        _log { log }
+    {
+    }
+
+    void RestoreNow() noexcept override
+    {
+        ++_calls;
+        if (_log != nullptr)
+            _log->emplace_back("restore");
+    }
+
+    /// @return How many times the terminal was put back through this handle.
+    [[nodiscard]] int Calls() const noexcept
+    {
+        return _calls.load();
+    }
+
+  private:
+    std::vector<std::string>* _log;
+    std::atomic<int> _calls { 0 };
+};
 
 /// A terminal acquisition that answers from a script, counting what it was asked.
 ///
@@ -76,8 +105,14 @@ class ScriptedAcquisition final: public ITerminalAcquisition
         _presented.events = &_release;
         co_return StartedTerminal { .capabilities = *_answer,
                                     .events = std::move(terminal),
-                                    .restore = nullptr,
+                                    .restore = _restore,
                                     .frames = std::make_unique<PresenterRecord::Sink>(&_presented) };
+    }
+
+    /// @return The restore handle every acquisition hands out.
+    [[nodiscard]] std::shared_ptr<LoggingRestore> const& RestoreHandle() const noexcept
+    {
+        return _restore;
     }
 
     /// @return What the presenter it handed out was given, and whether it outlived the events.
@@ -126,6 +161,7 @@ class ScriptedAcquisition final: public ITerminalAcquisition
     SpokenTerminal* _spoken { nullptr };
     TerminalRelease _release {};
     PresenterRecord _presented {};
+    std::shared_ptr<LoggingRestore> _restore { std::make_shared<LoggingRestore>() };
 };
 
 /// A stop-signal installer that hands out scripted signals, or refuses.
@@ -250,17 +286,19 @@ struct CompositionFaults
 /// Await a composed session into @p out, recording an exception rather than losing it.
 /// @param parts What to compose from.
 /// @param source Where the running source is kept.
+/// @param restore Where the acquired terminal's restore handle is kept.
 /// @param out How it ended.
 /// @param threw Set when it ended by an exception.
 /// @return The task to submit.
 [[nodiscard]] Task<void> ComposeInto(LiveSessionParts parts,
                                      std::optional<LiveEventSource>* source,
+                                     std::shared_ptr<ITerminalRestore>* restore,
                                      std::optional<std::expected<LiveSessionRun, Answer>>* out,
                                      bool* threw)
 {
     try
     {
-        *out = co_await RunComposedSession(std::move(parts), source);
+        *out = co_await RunComposedSession(std::move(parts), source, restore);
     }
     catch (std::runtime_error const&)
     {
@@ -300,6 +338,7 @@ struct Composition
     IAdminDocument* admin;
     SampleReader reader;
     std::optional<LiveEventSource> source;
+    std::shared_ptr<ITerminalRestore> restore;
     std::optional<std::expected<LiveSessionRun, Answer>> result;
     bool threw { false };
     Task<void> task {};
@@ -327,7 +366,7 @@ struct Composition
             .stops = &stops,
             .views = &views
         };
-        task = ComposeInto(std::move(parts), &source, &result, &threw);
+        task = ComposeInto(std::move(parts), &source, &restore, &result, &threw);
         rig.reactor.Submit(task.Native());
     }
 
@@ -456,6 +495,10 @@ TEST_CASE("an interactive session acquires its terminal on the terminal pool and
     CHECK(composition.stops.Calls() == 0);
     CHECK(composition.views.Asked() == std::vector<RenderRung> { RenderRung::Sixel });
     CHECK(rig.gatherer.Calls() == 1);
+    // The restore handle is kept apart from the events, where an abandonment can reach it, and
+    // nothing in a session that is still running calls it.
+    CHECK(composition.restore == composition.terminals.RestoreHandle());
+    CHECK(composition.terminals.RestoreHandle()->Calls() == 0);
 
     if (composition.terminals.Spoken() != nullptr)
         composition.terminals.Spoken()->Say(DashboardEvent { .kind = DashboardEventKind::Key, .keys = "q" });
@@ -481,6 +524,7 @@ TEST_CASE("a session with no terminal acquires none and takes its whole budget e
     CHECK(composition.stops.Calls() == 1);
     CHECK(composition.views.Asked() == std::vector<RenderRung> { RenderRung::Piped });
     CHECK(rig.gatherer.Calls() == 3);
+    CHECK(composition.restore == nullptr);
     CHECK(composition.Stop() == DashboardStop::SampleBudget);
 
     composition.Finish();
@@ -842,7 +886,7 @@ class StopOnDemandInstaller final: public IStopSignalInstaller
 class GatedGatherer final: public IStatsGatherer
 {
   public:
-    /// @param stop What the gather presses.
+    /// @param stop What the gather presses, or null for a gather that only waits.
     explicit GatedGatherer(StopOnDemandInstaller* stop) noexcept:
         _stop { stop }
     {
@@ -851,7 +895,8 @@ class GatedGatherer final: public IStatsGatherer
     [[nodiscard]] std::vector<StatsAttempt> Gather() override
     {
         ++_calls;
-        _stop->Press();
+        if (_stop != nullptr)
+            _stop->Press();
         _gate.acquire();
         return Reading();
     }
@@ -972,6 +1017,7 @@ struct RunningSeat
     ~RunningSeat()
     {
         gated.Open();
+        stuck.Open();
         if (source.has_value())
         {
             auto wait = ThreadDrainWait {};
@@ -993,6 +1039,7 @@ struct RunningSeat
         else if (stoppedFromGather)
             installer = &onDemand;
         return LiveSessionSeat { .reactor = &reactor,
+                                 .address = "10.0.0.4:6674",
                                  .clock = &clock,
                                  .dialer = dialer,
                                  .samplePool = &samplePool,
@@ -1001,7 +1048,7 @@ struct RunningSeat
                                  .sink = &sink,
                                  .streamsInteractive = streamsInteractive,
                                  .render = render,
-                                 .terminals = &terminals,
+                                 .terminals = terminalsOverride != nullptr ? terminalsOverride : &terminals,
                                  .stops = installer,
                                  .views = &views,
                                  .drainWait = &drainWait,
@@ -1048,6 +1095,7 @@ struct RunningSeat
     bool stoppedFromGather;
     IStatsDialer* dialer { nullptr };
     IStopSignalInstaller* stopsOverride { nullptr };
+    ITerminalAcquisition* terminalsOverride { nullptr };
     SteadyClock clock;
     PlatformReactor reactor { clock };
     ThreadPoolExecutor samplePool { 1 };
@@ -1061,6 +1109,8 @@ struct RunningSeat
     ThreadDrainWait drainWait;
     ScriptedGatherer gatherer { Reading() };
     GatedGatherer gated { &onDemand };
+    GatedGatherer stuck { nullptr };
+    ScriptedAcquisition acquiring { reactor, SixelTerminal, true };
     std::optional<LiveEventSource> source;
     std::jthread thread;
 };
@@ -1199,6 +1249,31 @@ TEST_CASE("a live-stats session that ends with a sample stuck is abandoned with 
     CHECK(ending.line.contains(" ms"));
     CHECK(seat.gated.Calls() == 1);
     CHECK((seat.source.has_value() && !seat.source->IsDrained()));
+    // A piped session changed no terminal mode, so the ending carries nothing to put back.
+    CHECK(ending.restore == nullptr);
+}
+
+TEST_CASE("an interactive live-stats session abandoned with a sample stuck hands main the terminal's restore handle",
+          "[cli][live][session][seat]")
+{
+    // The terminal goes away while the first gather is out, and the gather never returns within
+    // the bound. The events are not destroyed on this ending -- the process ends without unwinding
+    // -- so the restore handle is the only thing that can leave raw mode and the alternate screen,
+    // and the session hands it over uncalled: calling it is `main`'s, first, before any output.
+    auto seat = RunningSeat { RenderOptions { .format = OutputFormat::Human }, true };
+    seat.terminalsOverride = &seat.acquiring;
+    auto identity = ScriptedIdentity { CacheDaemon() };
+    auto const bound = DrainBound { .ceiling = std::chrono::milliseconds { 50 }, .poll = std::chrono::milliseconds { 5 } };
+
+    auto const ending = seat.Run(SessionContext({}, 0, &identity, &seat.stuck), bound);
+
+    CHECK(ending.kind == SessionEndKind::Abandoned);
+    CHECK(seat.acquiring.Calls() == 1);
+    CHECK(seat.stuck.Calls() == 1);
+    REQUIRE(ending.restore != nullptr);
+    CHECK(ending.restore == seat.acquiring.RestoreHandle());
+    CHECK(seat.acquiring.RestoreHandle()->Calls() == 0);
+    seat.stuck.Open();
 }
 
 TEST_CASE("a live-stats session stopped with a sample out drains when the sample returns in time",
@@ -1238,6 +1313,74 @@ TEST_CASE("a live-stats session re-dials through the seat's dialer after a faile
     CHECK(dialer.Dials() == 1);
     // The header, a reading, the gap, and the reading over the re-dial.
     CHECK(std::ranges::count(seat.Stream(), '\n') == 4);
+}
+
+namespace
+{
+
+/// A process end that notes each step in a log shared with a restore handle.
+class LoggingExit final: public IAbandonedExit
+{
+  public:
+    /// @param log Where each step is noted.
+    explicit LoggingExit(std::vector<std::string>* log) noexcept:
+        _log { log }
+    {
+    }
+
+    void Flush() override
+    {
+        _log->emplace_back("flush");
+    }
+
+    void Say(Answer const& /*answer*/, std::string_view line) override
+    {
+        _log->push_back(std::format("say {}", line));
+    }
+
+    void Exit(int code) override
+    {
+        _log->push_back(std::format("exit {}", code));
+    }
+
+  private:
+    std::vector<std::string>* _log;
+};
+
+} // namespace
+
+TEST_CASE("an abandoned session puts the terminal back before it flushes, says why, and exits", "[cli][live][session]")
+{
+    auto log = std::vector<std::string> {};
+    auto restore = std::make_shared<LoggingRestore>(&log);
+    auto exit = LoggingExit { &log };
+
+    EndAbandonedSession(SessionEnding { .kind = SessionEndKind::Abandoned,
+                                        .answer = Concluded(Outcome::Unreachable),
+                                        .line = "gave up waiting",
+                                        .restore = restore },
+                        exit);
+
+    CHECK(log
+          == std::vector<std::string> {
+              "restore", "flush", "say gave up waiting", std::format("exit {}", ExitCodeOf(Outcome::Unreachable)) });
+}
+
+TEST_CASE("an abandoned piped session has no terminal to put back and still flushes, says why, and exits",
+          "[cli][live][session]")
+{
+    auto log = std::vector<std::string> {};
+    auto exit = LoggingExit { &log };
+
+    EndAbandonedSession(SessionEnding { .kind = SessionEndKind::Abandoned,
+                                        .answer = Concluded(Outcome::Affirmative),
+                                        .line = "gave up waiting",
+                                        .restore = nullptr },
+                        exit);
+
+    CHECK(log
+          == std::vector<std::string> {
+              "flush", "say gave up waiting", std::format("exit {}", ExitCodeOf(Outcome::Affirmative)) });
 }
 
 TEST_CASE("a live-stats session reaches its endpoint only through the stats gatherer and the identity",
