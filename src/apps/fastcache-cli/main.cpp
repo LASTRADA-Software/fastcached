@@ -237,7 +237,10 @@ void ReportAdvisories(Answer const& answer, bool quiet)
                                        // The same object twice, deliberately: it holds the one cached
                                        // answer to "what is this endpoint", which both the stats ladder
                                        // and any verb reaching the admin surface are asking about.
-                                       .admin = &gatherer };
+                                       .admin = &gatherer,
+                                       // And a third time: what the endpoint IS is that same cached
+                                       // answer, which `live-stats` decides its subject from.
+                                       .identity = &gatherer };
 
     auto answer = RunVerb(verb, context);
 
