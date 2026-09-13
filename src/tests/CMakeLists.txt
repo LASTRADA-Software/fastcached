@@ -6378,3 +6378,23 @@ set_tests_properties("vendor-vocabulary-selftest" PROPERTIES
     LABELS "hygiene"
     TIMEOUT 60
 )
+
+# `vendor-verbatim` told a declared local change from an accidental edit only in its refusal
+# TEXT: regenerating the manifest silenced it for any edit, declared or not (found landing
+# #1375, the first local change this tree carries). The manifest now records each file's
+# upstream hash and a regeneration carries it forward, and every file that differs from
+# upstream must be named by a row of VENDOR.md's "Local changes" table. This drives synthetic
+# trees through edits, regenerations, declarations and re-syncs, and asserts WHICH verdict each
+# gets. Each case has been watched to fail under a mutant of the check that removes what it pins.
+add_test(
+    NAME "vendor-verbatim-selftest"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DFASTCACHED_SCRATCH_DIR=${CMAKE_CURRENT_BINARY_DIR}/vendor-verbatim-selftest"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-vendor-verbatim-selftest.cmake"
+)
+set_tests_properties("vendor-verbatim-selftest" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 120
+)
