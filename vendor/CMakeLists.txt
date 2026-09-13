@@ -52,6 +52,8 @@ set(_fcTuiSources
     endo/tui/Unicode.cpp
     endo/tui/VtParser.cpp
     endo/tui/platform/TerminalShared.cpp
+    endo/tui/runtime/PollEventSource.cpp
+    endo/tui/runtime/TuiRuntime.cpp
 )
 
 # The platform terminal implementations. Named as BOTH sets regardless of which
@@ -64,11 +66,13 @@ set(_fcTuiWin32Sources
     endo/tui/platform/TerminalWin32.cpp
     endo/tui/platform/TerminalInputWin32.cpp
     endo/tui/platform/TerminalOutputWin32.cpp
+    endo/tui/runtime/platform/TerminalEventSourceWin32.cpp
 )
 set(_fcTuiPosixSources
     endo/tui/platform/Terminal.cpp
     endo/tui/platform/TerminalInput.cpp
     endo/tui/platform/TerminalOutput.cpp
+    endo/tui/runtime/platform/TerminalEventSourcePosix.cpp
 )
 
 if(WIN32)
@@ -89,6 +93,19 @@ else()
     list(APPEND _fcTuiSources endo/platform/posix/PosixWakeup.cpp)
 endif()
 
+# `endo::platform::SignalHandler`, which `runtime/` calls into. ONE file for every
+# platform rather than Wakeup's three, because upstream puts the `#if` inside the
+# implementation instead of selecting between files -- so this is unconditional and
+# the difference from the block above is upstream's shape, not a decision here.
+#
+# It was missing from the first two imports. Every member of the class is `static`
+# and the header declares them all without defining any, so every call site compiled
+# and the gap was invisible until something linked: two undefined symbols on Windows,
+# three on POSIX. See VENDOR.md's closure paragraph -- the twelve headers are a
+# measured closure and the implementation files beside them are hand-picked, which is
+# the part that has now been wrong twice.
+list(APPEND _fcTuiSources endo/platform/SignalHandler.cpp)
+
 # Every vendored translation unit this target does NOT build, and why. Three
 # groups, and the third is the one that needs stating: "nothing reached it" is a
 # real reason, but it is indistinguishable from "nobody looked" unless it is
@@ -96,55 +113,69 @@ endif()
 #
 #   stb_image   image decoding, which a stats view does none of. The sources stay
 #               on disk verbatim; only the target is subset.
-#   coro        the event runtime. UPSTREAM'S OWN TARGET COMPILES runtime/ --
-#               TuiRuntime.cpp and PollEventSource.cpp unconditionally, plus a
-#               per-platform TerminalEventSource -- so leaving it out is a decision
-#               this file is making, not a property of the vendored code, and beside
-#               upstream's build file it reads like an oversight.
-#
-#               The decision: runtime/ is the only thing that reaches `coro/Task.hpp`,
-#               `coro/Cancellation.hpp` and `platform/Clock.hpp`. Compiling it would
-#               put a SECOND coroutine library and a SECOND clock into a tree whose
-#               central rule is one source of truth per concept -- the tree that says
-#               there is exactly one TCP client and not to write a second. fastcached
-#               has `Async/Task`, `Async/Cancellation` and `IClock`, and the vendored
-#               TUI reaches them through one adapter layer instead.
-#
-#               SECOND REASON, and it is the stronger one -- recorded because the
-#               first would not survive its own resolution. The dependency argument
-#               above says runtime/ is not BUILDABLE here; a later re-sync that
-#               settles the coro question could then build it in good faith and be
-#               right about everything this comment said. But `live-stats` runs a
-#               COROUTINE-NATIVE event loop of ours, and `runtime/`'s
-#               `EventSource::wait(int timeoutMs)` is a poll with a timeout -- the
-#               blocking design that loop exists not to be. So runtime/ is REPLACED,
-#               not merely unbuildable, and it stays out even once its dependencies
-#               would link. We vendored the rendering surface and left the event
-#               loop behind, deliberately.
-#
-#               A decision that is load-bearing for two reasons and records one is a
-#               cleanup away from being reversed for free.
-#
-#               That is arguable, and someone may later decide the adapter is worse
-#               than the duplication. What is not acceptable is the change happening
-#               by accident, so the guard below refuses it rather than leaving a
-#               sentence for a reader who has already stopped reading.
-#               QuestionComponent is in this group rather than `unreached` because it
-#               reaches coro through runtime/Modal.hpp.
 #   unreached   an interactive editor's widgets. Present, working, and simply not
 #               on any path from a stats panel.
+#
+# There were THREE groups until #1374, and the third was `coro`: runtime/ excluded so
+# the tree would not carry a second coroutine library and a second clock. runtime/ is
+# now BUILT, and both halves of why are worth keeping, because one of them was false.
+#
+# The false half, deleted rather than reworded: this file used to say
+# `EventSource::wait(int timeoutMs)` "is a poll with a timeout -- the blocking design
+# that loop exists not to be". It is a blocking readiness wait, structurally what
+# `EpollReactor::RunLoop` is. EventSource.hpp's own parameter doc reads "-1 to block
+# indefinitely, 0 to poll, >0 to wait that many ms"; the POSIX implementation is one
+# `::poll(fds, n, timeoutMs)` over a descriptor set with no re-check loop, and the
+# Win32 one is `WaitForMultipleObjects(..., FALSE, timeout)`. `timeoutMs` is the timer
+# deadline, not a re-check interval. The comment read the `poll` in `PollEventSource`
+# as the polling PATTERN when it is the syscall's NAME -- and that wrong sentence cost
+# real work: it told two readers that endo's runtime was a polling design needing
+# replacement, and one of them wrote an actual `co_await SleepUntil(now + interval)`
+# loop to replace a readiness-driven one.
+#
+# There IS one poll-shaped call, and naming it is what stops this being reopened,
+# because it is the last thing a re-reader can point at. `PollEventSource.cpp:33`:
+# `::poll(nullptr, 0, timeoutMs)`, guarded by `timeoutMs > 0`, reached only when
+# nothing is registered. It is not a counter-example. With ZERO descriptors nothing
+# CAN become ready, so that call is a sleep spelled `poll(2)` -- it exists so the
+# runtime's timers still fire when there is nothing to watch, and upstream's own
+# comment beside it says exactly that. No loop around it and no re-check, which is
+# what the polling PATTERN would need. `PollEventSource` is also the generic-fd
+# source; the terminal uses `TerminalEventSource`, so the degenerate path is not
+# even on the path the objection would be about.
+#
+# The true half, which stands and is now a DECISION rather than an obstacle: runtime/
+# is the only thing reaching `coro/Task.hpp`, `coro/Cancellation.hpp` and
+# `platform/Clock.hpp`, so building it does put a second coroutine type and a second
+# clock beside `Async/Task` and `IClock`. That cost is accepted deliberately. It buys
+# the only descriptor-parking coroutine API available: `IReactor` has none -- `Stop`,
+# two `Schedule(deadline, ...)` overloads, `CancelPending`, `Clock`, `RunLoop` -- and
+# readiness reaches it only through `ISocket` (#1372). The alternative was an
+# `EventSource` backed by our reactor, which needs #1372 closed across epoll, IOCP and
+# kqueue first and then a blocking `wait()` built over a run loop that wants to be the
+# outer loop; `RunLoop` is unbounded and `Stop` only posts a wakeup, so there is no
+# bounded "run one turn" to build it from, leaving a reactor thread plus a condvar --
+# cross-thread coroutine resumption, which `IocpReactor.hpp` names unsafe.
+#
+# So the choice was made on FAILURE MODE, not on size: this direction fails as a
+# compile error or a visibly wrong dashboard, the other fails as a coroutine resumed
+# on the wrong thread under IOCP -- green everywhere, wrong in production. The clock
+# half of the duplication is nearly free, because `endo::platform::SteadyTimePoint`
+# and `FastCache::TimePoint` are both `std::chrono::steady_clock::time_point`, so our
+# own `ManualClock` drives `TuiRuntime` through a forwarder.
+#
+# QuestionComponent.cpp moved to `unreached` rather than leaving the list: it was
+# excluded for reaching coro through runtime/Modal.hpp, which has stopped being a
+# reason, and nothing we build reaches it -- only itself and its own test. It is still
+# forbidden, for a reason that is true and checkable now.
 set(_fcTuiNotBuilt
     # stb_image
     ImageLoader.cpp ImageProvider.cpp StbImageImpl.cpp
-    # coro
-    QuestionComponent.cpp
-    runtime/PollEventSource.cpp runtime/TuiRuntime.cpp
-    runtime/platform/TerminalEventSourcePosix.cpp
-    runtime/platform/TerminalEventSourceWin32.cpp
     # unreached
     CommandPalettePopup.cpp CommandRegistry.cpp CompletionPopup.cpp Dialog.cpp
     FuzzyPickerPopup.cpp
     InputField.cpp KeyBindings.cpp List.cpp LogPanel.cpp
+    QuestionComponent.cpp
     SemanticBlockClient.cpp Spinner.cpp StatusBar.cpp
     completer/Completer.cpp completer/FuzzyMatch.cpp completer/SmartCaseMatch.cpp
 )
@@ -210,36 +241,36 @@ foreach(_src IN LISTS _fcTuiSources)
             "If this followed an upstream re-sync, the file moved or was removed "
             "there: update the list and record the change in vendor/VENDOR.md.")
     endif()
-    # The runtime/ guard. Folded into the loop the source list already walks, rather
-    # than written as a separate scan, because a guard riding on something the site
-    # must do cannot be forgotten -- adding a source is what trips it.
-    if(_src MATCHES "^endo/tui/runtime/")
-        message(FATAL_ERROR
-            "vendor: ${_src} is under endo/tui/runtime/, which this target does not "
-            "build.\n\n"
-            "runtime/ is the ONLY thing in the vendored tree that reaches coro/Task.hpp, "
-            "coro/Cancellation.hpp and platform/Clock.hpp. Building it puts a second "
-            "coroutine library and a second clock into a tree that has one of each -- "
-            "FastCache::Async::Task, FastCache::Async::Cancellation and FastCache::IClock "
-            "are the authoritative ones, and vendor/VENDOR.md says so in the words a "
-            "reader of this refusal needs.\n\n"
-            "Upstream's own src/tui/CMakeLists.txt DOES compile runtime/, so this "
-            "exclusion looks like an oversight beside it and that is exactly why it is "
-            "guarded rather than merely commented.\n\n"
-            "AND THERE IS A SECOND REASON, which outlives the first: `live-stats` runs a "
-            "COROUTINE-NATIVE event loop, and runtime/'s EventSource::wait(int timeoutMs) "
-            "is a poll with a timeout -- the blocking design that loop exists not to be. "
-            "So runtime/ is REPLACED rather than merely unbuildable, and it stays out even "
-            "once the coro dependency question is settled and it WOULD link. If you are "
-            "reading this because you just solved that question: solving it is not "
-            "sufficient.\n\n"
-            "If the adapter layer has turned out worse than the duplication, that is a "
-            "decision worth making -- make it deliberately: delete this guard, say why "
-            "in vendor/VENDOR.md's \"Two of some things\", and vendor the coro and "
-            "platform/Clock sources the runtime needs, which this import does not carry "
-            "as built sources. Adding the row alone will not link.")
-    endif()
 endforeach()
+
+# THE runtime/ GUARD IS GONE, and this paragraph is what replaces it, because a
+# deleted guard with no account of where its property went is how a decision gets
+# reversed for free -- which is the exact failure the guard was written against.
+#
+# It refused any source under endo/tui/runtime/. #1374 decided runtime/ IS built, so
+# its premise is false and it had to go: a guard that refuses what the tree now does
+# cannot be reworded into usefulness, and contorting it to refuse something it cannot
+# see would be worse -- a guard that cannot fire reads exactly like one that does.
+#
+# What it was really protecting is NOT "runtime/ is unbuilt". It is "the second
+# coroutine vocabulary does not spread into first-party code": nothing under src/ may
+# include <coro/...> or <platform/Clock.hpp>, which is VENDOR.md's rule and is still
+# in force. That property is unguarded and this file cannot guard it, for a reason
+# worth writing down rather than rediscovering:
+#
+#   the include root below is `endo/`, exposed PUBLIC, and it necessarily carries
+#   tui/, coro/, platform/, crispy/ and testing/ together. So <coro/Task.hpp> is
+#   reachable by construction from anything linking fastcache-tui, and narrowing the
+#   root is not available -- it would hide <tui/...> from the consumers that need it.
+#   The leak is therefore a property of src/, not of this target's source list, and
+#   the loop above cannot see src/ at all.
+#
+# Measured when the guard was removed: src/ reaches none of it today (a grep for
+# `#include <coro/` and `#include <platform/Clock.hpp>` over src/ returns nothing,
+# with the vendored runtime/ headers as the positive control that the pattern
+# matches what it is meant to match, ~50ms). So this is an open hazard with no
+# current violation, not a live defect -- filed rather than left here, because a
+# comment nothing checks cannot fail.
 
 foreach(_src IN LISTS _fcTuiClassified)
     if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/endo/tui/${_src}")
@@ -404,3 +435,60 @@ set_target_properties(fastcache-tui-linkprobe PROPERTIES
     CXX_SCAN_FOR_MODULES OFF
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/linkprobe"
 )
+
+# ----------------------------------------------------------------------------
+# UPSTREAM'S OWN runtime/ TESTS, built here.
+#
+# #1374 rests on one fact that was, until this target, claimed by a header comment
+# and measured by nothing: `TuiRuntime` reads time ONLY through its injected
+# `endo::platform::IClock`. Everything the mockable dashboard plan needs follows from
+# it, and a single `steady_clock::now()` in any awaiter makes the plan vacuous while
+# leaving every existing test green.
+#
+# These are upstream's tests, built rather than re-derived, for a reason beyond cost:
+# re-derived equivalents would assert our understanding of the runtime, while these
+# assert UPSTREAM's -- so they also catch a re-sync that changes the property, which
+# is the failure a copy of them could not see. They compile against our Catch2
+# unmodified; endo's test files need no endo-only harness.
+#
+# Registration is NOT here. `add_subdirectory(vendor)` runs before `enable_testing()`,
+# so an `add_test` in this file is a silent no-op -- the test would build, never run,
+# and report nothing while looking registered. The `add_test` lives at the end of
+# `src/tests/CMakeLists.txt`; this file only declares the binary.
+#
+# Guarded on the Catch2 target rather than on a build option: this file is reached
+# whenever the TUI is on, and Catch2 is fetched under the test option, so the two are
+# independent conditions and only one of them is visible from here.
+if(TARGET Catch2::Catch2WithMain)
+    # SystemPipe and WinsockInit are sources of the TEST target and NOT of
+    # `fastcache-tui-objects`, deliberately. Only two cases reach them -- the ones
+    # that park `waitReadable` on a real pipe instead of the scripted mock -- and
+    # `fastcache-tui-linkprobe` resolves without them, which is the measurement
+    # saying the production runtime does not. Keeping them here also keeps `ws2_32`
+    # off the library: SystemPipe's Windows implementation is a loopback socket pair.
+    add_executable(fastcache-tui-tests
+        endo/tui/runtime/TuiRuntime_test.cpp
+        endo/tui/runtime/Modal_test.cpp
+        endo/platform/SystemPipe.cpp
+        endo/platform/WinsockInit.cpp
+    )
+    target_link_libraries(fastcache-tui-tests PRIVATE fastcache-tui Catch2::Catch2WithMain)
+    if(WIN32)
+        target_link_libraries(fastcache-tui-tests PRIVATE ws2_32)
+    endif()
+    # Vendored code is not governed by this repository's own rules -- the same
+    # reasoning as `fastcache-tui-objects`, and for tests it also keeps upstream's
+    # case names out of our Catch2 naming hygiene, which they have no reason to obey.
+    set_target_properties(fastcache-tui-tests PROPERTIES
+        CXX_CLANG_TIDY ""
+        C_CLANG_TIDY ""
+        CXX_SCAN_FOR_MODULES OFF
+    )
+    if(MSVC)
+        target_compile_options(fastcache-tui-tests PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/utf-8>)
+    endif()
+    if(WIN32)
+        target_compile_definitions(fastcache-tui-tests PRIVATE
+            WIN32_LEAN_AND_MEAN NOMINMAX _WIN32_WINNT=0x0A00)
+    endif()
+endif()

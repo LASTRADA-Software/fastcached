@@ -21,7 +21,7 @@ from the contents.
 
 | upstream | fork point | files | what |
 |---|---|---|---|
-| [contour-terminal/endo](https://github.com/contour-terminal/endo) | `687b90a042a3eee96f50f8f46cf811a03155b786` | 164 | `tui/**` (154 files, all of `src/tui`), `platform/{Types,Wakeup,Clock,SignalHandler,SystemPipe,PlatformError}.hpp`, the three per-platform `platform/{linux,posix,windows}/*Wakeup.cpp`, `testing/SuppressWindowsDialogs.hpp` |
+| [contour-terminal/endo](https://github.com/contour-terminal/endo) | `687b90a042a3eee96f50f8f46cf811a03155b786` | 168 | `tui/**` (154 files, all of `src/tui`), `platform/{Types,Wakeup,Clock,SignalHandler,SystemPipe,PlatformError,WinsockInit}.hpp`, the three per-platform `platform/{linux,posix,windows}/*Wakeup.cpp`, `platform/{SignalHandler,SystemPipe,WinsockInit}.cpp`, `testing/SuppressWindowsDialogs.hpp` |
 | [contour-terminal/contour](https://github.com/contour-terminal/contour) | `243d776aed99bcc0f634b0608189609fd4e548ba` | 5 | `coro/{Task,Cancellation,WhenAny,UniqueCoroHandle}.hpp`, `crispy/FNV.hpp` |
 
 
@@ -36,26 +36,51 @@ contour, not against endo.** They were verified byte-identical between contour
 Both repositories are Apache-2.0, and so is this copy. `endo/tui` was last touched
 upstream at `37d875f8` (2026-08-15).
 
-`src/tui` upstream is 154 files and ~46k lines; with the fifteen supporting files below the
-copy is **169 files, 47,804 lines**.
+`src/tui` upstream is 154 files and ~46k lines; with the nineteen supporting files below the
+copy is **173 files, 48,484 lines**.
 
-## The fifteen supporting files
+## The nineteen supporting files
 
 `tui` does not stand alone: it includes headers from three sibling libraries. The
 set copied here is the **measured transitive closure** of those includes — every
 non-`tui`, non-system header reachable from `src/tui`, followed until it
-terminates. It is fifteen files and 1,758 lines: twelve headers, plus the three
-per-platform implementations of `endo::platform::Wakeup`, which
-`tui/platform/TerminalInput.cpp` calls into. None of them reaches any further into
-either upstream.
+terminates. It is nineteen files and 2,438 lines: thirteen headers, plus **six
+implementation files** — the three per-platform implementations of
+`endo::platform::Wakeup`, which `tui/platform/TerminalInput.cpp` calls into,
+`platform/SignalHandler.cpp`, which `tui/runtime/` calls into, and
+`platform/{SystemPipe,WinsockInit}.cpp`, which only the vendored runtime TESTS
+reach. None of them reaches any further into either upstream.
 
-**Twelve of the fifteen are header-only and the first import assumed all of them
-were.** `platform/Wakeup.hpp` declares a class whose methods are defined elsewhere,
-and reading `#include` lines cannot see that — a header graph and a symbol graph are
-different graphs. The build did not see it either: a static archive never resolves
-symbols, so it compiled clean and simply carried two undefined references for
-whoever linked it first. `fastcache-tui-linkprobe` is what found it and is what
-stops it coming back.
+**Thirteen of the nineteen are header-only, and the closure has been wrong about
+that three times — read past the first, because they are not the same mistake.**
+
+The first: `platform/Wakeup.hpp` declares a class whose methods are defined
+elsewhere, and reading `#include` lines cannot see that — a header graph and a
+symbol graph are different graphs. The build did not see it either: a static
+archive never resolves symbols, so it compiled clean and simply carried two
+undefined references for whoever linked it first.
+
+The second: `platform/SignalHandler.hpp` is a **pure-static declaration header**,
+and its definitions live in a file upstream keeps in a **sibling target** —
+`endo-platform`, not the `tui` target this closure is walked from. Nothing about
+the header says so. It sits in the same directory as headers whose definitions
+*were* imported, and every one of its members being `static` means every call site
+compiles.
+
+The third: `platform/SystemPipe.cpp` and `platform/WinsockInit.cpp`, reached when
+the vendored runtime tests were built. This one moved the ROOT rather than missing
+a file from a fixed one — adding test translation units enlarged what the closure
+is a closure OF, and a set that was complete stopped being complete without
+changing. It also cascaded one level, which neither earlier miss did.
+
+So the sentence above — *the measured transitive closure of those includes* —
+describes the thirteen headers and **cannot** describe the six `.cpp` files, which
+were hand-picked. That `plus` is the unguarded part of this criterion, and
+**a closure is only ever complete with respect to the root it was walked from**;
+an upstream project's target boundaries are invisible from inside its source tree,
+and the root moves whenever the build takes on new translation units.
+`fastcache-tui-linkprobe` found the first two and the test link found the third:
+each named its gap in one link, where reading finds none of them.
 
 That number is worth stating because the obvious estimate is an order of magnitude
 larger. `coro` and `endo-platform` are together about 12,000 lines, and "vendor the
@@ -78,20 +103,31 @@ second opinion about how to write a coroutine.
 
 Two facts that make this much less alarming than it sounds, both measured:
 
-- **`coro/*` and `platform/Clock.hpp` are reached only from `tui/runtime/`, and
-  `tui/runtime/` is not built.** They sit on disk so the copy is include-closed and
-  a later ticket that wants the runtime needs no second import. **Nothing compiles
-  them today.** The built library's entire external surface is libunicode,
-  `platform/Types.hpp`, `platform/Wakeup.hpp` and `crispy/FNV.hpp`.
+- **`coro/*` and `platform/Clock.hpp` are reached only from `tui/runtime/`, which is
+  now built** (#1374). They are compiled as part of `fastcache-tui`, so the second
+  coroutine type and the second clock are real objects in this build rather than
+  files sitting on disk. That was decided deliberately and the reasoning is in
+  `vendor/CMakeLists.txt`: `runtime/` is the only descriptor-parking coroutine API
+  available, `IReactor` has none (#1372), and the alternative failed in a worse
+  direction — a coroutine resumed on the wrong thread under IOCP is green everywhere
+  and wrong in production.
 
-  **That sentence is true because something enforces it, not because it is written
-  here.** "Never compiled" is not a property of the vendored code — **upstream's own
-  `src/tui/CMakeLists.txt` compiles `runtime/`**, so our exclusion reads like an
-  oversight beside it and is the obvious thing for the next person to "fix". A source
-  list naming `endo/tui/runtime/` therefore **refuses at configure time**
-  (`vendor/CMakeLists.txt`), and the refusal explains the trade and says what a
-  deliberate reversal would have to do. Four absent lines were the only thing holding
-  this up before that guard existed.
+  **This previously said `runtime/` was not built and was enforced by a configure-time
+  refusal. Both halves are now gone**, and the rule that survives is the one that was
+  actually load-bearing: **nothing under `src/` may include `<coro/...>` or
+  `<platform/Clock.hpp>`.** That is currently **unenforced** — the include root
+  `endo/` is exposed `PUBLIC` and necessarily carries `coro/` and `platform/` beside
+  `tui/`, so first-party code can reach the second vocabulary by construction, and
+  narrowing the root would hide `<tui/...>` from the consumers that need it. Measured
+  at the time of writing: `src/` reaches none of it. An open hazard with no current
+  violation, tracked rather than asserted here, because a comment nothing checks
+  cannot fail.
+
+  The built library's external surface is libunicode, `platform/{Types,Wakeup,Clock,
+  SignalHandler}.hpp`, `coro/*` and `crispy/FNV.hpp`. `platform/SystemPipe.hpp` and
+  `platform/WinsockInit.hpp` are reached by the vendored TESTS only, so their
+  implementations are sources of `fastcache-tui-tests` and not of the library —
+  which is also what keeps `ws2_32` off it.
 - **The two vocabularies meet in one place.** Vendored code serves the vendored TUI
   only; no vendored file reaches `FastCache::*`, and first-party code reaches the TUI
   through a single adapter layer. If you find yourself wanting to cross that boundary
@@ -100,7 +136,7 @@ Two facts that make this much less alarming than it sounds, both measured:
 
 ## Local changes
 
-**None.** All 169 files are byte-identical to their upstream blobs, which is
+**None.** All 173 files are byte-identical to their upstream blobs, which is
 checked rather than asserted — see below.
 
 Every local change goes in its own commit, never folded into the import, and gets a
@@ -175,10 +211,12 @@ helper functions, none of which exist here, and editing it would put a local cha
 inside the contribution diff on day one.
 
 Every vendored translation unit this target does **not** build is named in that
-file's `_fcTuiNotBuilt`, with one of three reasons: it reaches `stb_image` (image
-decoding), it reaches `coro` (the event runtime), or nothing on a stats panel's
-path reaches it — an interactive editor's widgets, present and working and simply
-not called here.
+file's `_fcTuiNotBuilt`, with one of two reasons: it reaches `stb_image` (image
+decoding), or nothing on a stats panel's path reaches it — an interactive editor's
+widgets, present and working and simply not called here. There was a third,
+`coro` (the event runtime), retired in #1374 when `runtime/` joined the build;
+`QuestionComponent.cpp` moved to the second reason rather than out of the list,
+because it is still not reached by anything built here.
 
 The two lists are asserted at configure time to **partition** the vendored `.cpp`
 files on disk, so the counts are derived rather than written down, and a re-sync
