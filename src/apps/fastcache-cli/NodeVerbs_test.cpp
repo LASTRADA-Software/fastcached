@@ -5,13 +5,17 @@
 #include "StatsGatherer.hpp"
 
 #include <FastCache/Cluster/ClusterState.hpp>
+#include <FastCache/Core/Ranges.hpp>
+#include <FastCache/Net/BlockingSocket.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <format>
 #include <optional>
 #include <ranges>
 #include <span>
@@ -1104,6 +1108,12 @@ class ScriptedAdmin final: public IAdminDocument
         return _answer;
     }
 
+    /// @return Nothing: the verb under test does not ask.
+    [[nodiscard]] std::string AdminAddress() override
+    {
+        return {};
+    }
+
     /// Every path this was asked for, in order.
     [[nodiscard]] std::vector<std::string> const& Asked() const noexcept
     {
@@ -1385,6 +1395,62 @@ TEST_CASE("the stats ladder relays the same remedy when it skips /metrics", "[cl
     CHECK(std::ranges::any_of(answer.advisories, [](std::string const& line) {
         return line.contains("was not asked") && line.contains("--admin-listen");
     }));
+}
+
+TEST_CASE("the stats ladder records where it asked each source, and no address for one it did not ask", "[cli][node][stats]")
+{
+    // A panel's source line names the address that ANSWERED, so each attempt carries its own: the node's
+    // `0xFC` address for node-metrics, the cache's for INFO, an IPv6 literal bracketed so its port reads.
+    // WHAT DISTINGUISHES: /metrics was not asked, and an address beside it would name a listener nothing
+    // dialled -- and node-metrics was asked and failed, which still says where.
+    ScriptedNodeExchange node {
+        { StatusReply({ .version = "0.2.0",
+                        .nodeId = {},
+                        .uptimeSeconds = 5,
+                        .surfaces = { Cc::SurfaceReport { .surface = Cc::WireSurface::Raft, .port = 6680 } } }),
+          NodeFailure(ExchangeFailure::Transport, "the node-metrics verb went unanswered") },
+        "10.0.0.4:6674"
+    };
+    ScriptedExchange resp { Answers({ Bulk("fastcached_version:0.4.1\r\n") }) };
+    auto gatherer =
+        LadderGatherer { Endpoint {}, Endpoint { .host = "fd00::9", .port = 6379 }, DialTimeouts {}, std::nullopt, &resp,
+                         &node };
+
+    auto const attempts = gatherer.Gather();
+    auto const whereOf = [&attempts](StatsOrigin origin) {
+        auto const* attempt = FindIfOrNull(attempts, [origin](StatsAttempt const& one) { return one.origin == origin; });
+        return attempt == nullptr ? std::optional<std::string> {} : std::optional<std::string> { attempt->where };
+    };
+    CHECK(whereOf(StatsOrigin::Metrics) == std::string {});
+    CHECK(whereOf(StatsOrigin::NodeMetrics) == std::string { "10.0.0.4:6674" });
+    CHECK(whereOf(StatsOrigin::Info) == std::string { "[fd00::9]:6379" });
+}
+
+TEST_CASE("the stats ladder records where it asked /metrics, whatever the scrape then did", "[cli][node][stats]")
+{
+    // The /metrics rung's address, which the case above cannot reach: that rung only asks an admin surface it
+    // can DIAL. So this one gives it a real one -- a loopback listener this process holds, which accepts into
+    // its backlog and never answers -- and a read bound short enough that the scrape gives up at once. WHAT
+    // DISTINGUISHES: the attempt was asked and failed, and still says where; nothing about the address comes
+    // from the reply, because there is none.
+    auto listener = BlockingListener::Bind("127.0.0.1", 0);
+    if (listener == nullptr || !listener->IsBound() || listener->BoundPort() == 0)
+        SKIP("this host would not bind a loopback listener on any port; the /metrics rung cannot be dialled here");
+    auto const admin = Endpoint { .host = "127.0.0.1", .port = listener->BoundPort() };
+    auto gatherer =
+        LadderGatherer { admin,
+                         Endpoint { .host = "10.0.0.4", .port = 6674 },
+                         DialTimeouts { .connect = std::chrono::seconds { 5 }, .io = std::chrono::milliseconds { 50 } },
+                         std::nullopt,
+                         nullptr,
+                         nullptr };
+
+    auto const attempts = gatherer.Gather();
+    auto const* metrics = FindIfOrNull(attempts, [](StatsAttempt const& one) { return one.origin == StatsOrigin::Metrics; });
+    REQUIRE(metrics != nullptr);
+    CHECK(metrics->asked);
+    CHECK_FALSE(metrics->record.has_value());
+    CHECK(metrics->where == std::format("127.0.0.1:{}", admin.port));
 }
 
 // ---------------------------------------------------------------------------

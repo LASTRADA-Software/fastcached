@@ -3,6 +3,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <format>
 #include <string>
 
 namespace FastCache::Cli
@@ -29,6 +30,15 @@ struct Endpoint
         return !host.empty() && port != 0;
     }
 };
+
+/// @p endpoint as `host:port`, an IPv6 literal bracketed so its port stays readable.
+/// @param endpoint Where.
+/// @return The text.
+[[nodiscard]] inline std::string EndpointText(Endpoint const& endpoint)
+{
+    return endpoint.host.contains(':') ? std::format("[{}]:{}", endpoint.host, endpoint.port)
+                                       : std::format("{}:{}", endpoint.host, endpoint.port);
+}
 
 /// How long to wait.
 ///

@@ -54,6 +54,9 @@ class LadderGatherer final: public IStatsGatherer, public IAdminDocument, public
     /// @return The body, or why there is none.
     [[nodiscard]] std::expected<std::string, AdminError> FetchAdmin(std::string_view path) override;
 
+    /// @return The resolved admin surface as `host:port`, or empty when none resolves.
+    [[nodiscard]] std::string AdminAddress() override;
+
     /// What the endpoint is, typed.
     ///
     /// The same single `NodeStatus` round trip the ladder's rungs share, so a verb asking

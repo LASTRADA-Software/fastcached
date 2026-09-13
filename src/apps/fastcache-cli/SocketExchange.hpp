@@ -265,6 +265,14 @@ class IAdminDocument
     /// @param path An absolute path, query string included.
     /// @return The body, or what went wrong and which KIND of wrong it was.
     [[nodiscard]] virtual std::expected<std::string, AdminError> FetchAdmin(std::string_view path) = 0;
+
+    /// Where the admin surface answers, as `host:port`.
+    ///
+    /// **Pure, so an implementation cannot forget it.** A panel's source line names the address its
+    /// document came from (`/fleet.txt at <where>`), and a default answering nothing would render that
+    /// line absent for a surface that answered -- the silent shape `PresentPlaced`'s default had.
+    /// @return The address the last `FetchAdmin` resolved, or empty when it resolved none.
+    [[nodiscard]] virtual std::string AdminAddress() = 0;
 };
 
 /// Issue one `GET` and read the whole response.
