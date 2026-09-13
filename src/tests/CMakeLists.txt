@@ -2098,8 +2098,8 @@ set_tests_properties("pedantic-suppressions-selftest" PROPERTIES
 # but the loopback listener it stages for itself, so it belongs in the default
 # `ctest` set where whoever edits the helpers is the one who sees it break.
 #
-# `if(NOT WIN32)` for the reason `local-gate-selftest` and `ci-scope` carry the
-# same guard -- the library serves POSIX fixtures and is POSIX itself. Measured
+# Not RUN on Windows -- registered there as a named skip -- for the reason `local-gate-selftest`
+# and `ci-scope` carry a guard -- the library serves POSIX fixtures and is POSIX itself. Measured
 # rather than assumed, and worth recording: on msys2 bash a `/dev/tcp` connect to
 # an unbound loopback port can SUCCEED, so the socket cases there report a wait
 # of 0s against a listener that binds a second later. The same cases read 1s on
@@ -2213,6 +2213,13 @@ if(NOT WIN32)
         LABELS "hygiene"
         TIMEOUT 120
     )
+else()
+    # REGISTERED and skipped, never omitted (#1355): absent is not skipped. A Windows run had
+    # no row for this at all, and the ticket that found it named the test anyway -- from a
+    # run by hand -- which is the absence reading as a result. The reason is the measured one
+    # above, so the skip says what a green here would have meant.
+    fastcached_register_skipped_test("e2e-helpers-selftest"
+        "the helper library is POSIX and serves POSIX fixtures; on msys2 bash a /dev/tcp connect to an unbound loopback port can SUCCEED, so its socket cases would pass against a listener that is not there")
 endif()
 
 # ---------------------------------------------------------------------------
