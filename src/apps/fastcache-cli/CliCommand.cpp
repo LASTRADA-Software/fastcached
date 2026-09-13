@@ -435,16 +435,17 @@ namespace
     ///
     /// THREE states, and reading `nodeFallback` alone gives two. That column answers *is
     /// there a SECOND answer once the primary wire has already failed against a compile
-    /// node*, which is a question a verb whose primary wire IS the node does not have --
+    /// node*, which is a question a verb whose primary wire a node answers does not have --
     /// so `node` and `node-metrics`, the two verbs whose whole subject is a compile node,
     /// rendered as *refuses it by name*. A confident wrong answer, on the page written to
-    /// stop an operator having to dial a machine to find out.
+    /// stop an operator having to dial a machine to find out. Which wires a node answers
+    /// is `WireSpec::nodeAnswer`, not a wire named here.
     /// @param verb The verb.
     /// @return The cell's text.
     [[nodiscard]] std::string_view NodeAnswerFor(VerbSpec const& verb) noexcept
     {
-        if (verb.wire == Wire::Node)
-            return "answered: this is a node verb";
+        if (auto const& wire = WireTable[static_cast<std::size_t>(verb.wire)]; !wire.nodeAnswer.empty())
+            return wire.nodeAnswer;
         if (verb.nodeFallback != nullptr)
             return "answered: the row carries a fallback";
         return "refused by name";

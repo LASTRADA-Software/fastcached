@@ -826,6 +826,36 @@ TEST_CASE("a verb's page says what a compile node does with it", "[cli][command]
     CHECK(cell(nodePage) != cell(versionPage));
 }
 
+TEST_CASE("a stats-wire verb's page does not say a compile node refuses it", "[cli][command][help]")
+{
+    // A compile node ANSWERS the stats wire -- `stats` through the ladder's node-metrics
+    // rung, `live-stats` through its node and fleet subjects -- and the stats wire is
+    // neither the node wire nor a row carrying a fallback, which were the only two ways
+    // the cell knew. So both pages said *refused by name*, on the page written to stop an
+    // operator dialling a machine to find out. That the node answers is asserted
+    // separately, against a scripted node, beside the node verbs.
+    //
+    // Derived over the table, and compared against a verb a node really does refuse, so a
+    // renderer that says the same thing for all of them fails rather than contains a word.
+    auto const* const get = FindVerb("get");
+    REQUIRE(get != nullptr);
+    REQUIRE(get->nodeFallback == nullptr);
+    auto const refused = CellOf(HelpTopicText(*get), "on a compile node");
+    REQUIRE_FALSE(refused.empty());
+
+    auto checked = 0;
+    for (auto const& verb: Verbs())
+    {
+        if (verb.wire != Wire::Stats)
+            continue;
+        INFO(verb.name);
+        CHECK(CellOf(HelpTopicText(verb), "on a compile node") != refused);
+        ++checked;
+    }
+    // `stats` and `live-stats` today; zero would make the loop above assert nothing.
+    CHECK(checked >= 2);
+}
+
 TEST_CASE("a verb that sends no single command says so rather than rendering absent", "[cli][command][help]")
 {
     // An empty `protocolCommand` is a KNOWN fact -- the column means *sends none
