@@ -498,17 +498,22 @@ TEST_CASE("the standard views draw the piped rung and have no view for an intera
 
 TEST_CASE("a composed session re-dials after a failed sample and reaches its budget", "[cli][live][session][redial]")
 {
-    // The composition hands its dialer to the source: the connection dies after one reading, and
-    // the budget of two is met only because the sample after the gap was taken over a re-dial.
+    // The composition hands its dialer to the source: the connection dies after one reading, the
+    // gap spends a sample of the budget, and the third sample reads only because it was taken
+    // over a re-dial.
     Rig rig;
     DyingGatherer dying;
     ScriptedDialer dialer { { true } };
     Composition composition { rig, SixelTerminal, CompositionFaults { .gatherer = &dying, .dialer = &dialer } };
-    composition.Start(false, 2);
+    composition.Start(false, 3);
     composition.RunFor(3);
 
     CHECK(composition.Stop() == DashboardStop::SampleBudget);
     CHECK(dialer.Dials() == 1);
+    auto const* const run = composition.Run();
+    REQUIRE(run != nullptr);
+    // Two readings of three samples: the one before the connection died and the one over the re-dial.
+    CHECK(run->exit.model.samples == 2);
 
     composition.Finish();
 }
@@ -1080,17 +1085,18 @@ TEST_CASE("a live-stats session stopped with a sample out drains when the sample
 TEST_CASE("a live-stats session re-dials through the seat's dialer after a failed sample",
           "[cli][live][session][seat][redial]")
 {
-    // What `main` hands over reaches the source: the connection dies after one reading, and a
-    // budget of two is met only over a re-dial. Two intervals at the floor, so about two seconds.
-    // Without the re-dial the dead connection is asked a third time, which presses Ctrl-C: the
-    // case fails on its assertions rather than waiting forever.
+    // What `main` hands over reaches the source: the connection dies after one reading, the gap
+    // spends a sample, and the third sample of a budget of three reads only over a re-dial. Two
+    // intervals at the floor, so about two seconds. Without the re-dial the dead connection is
+    // asked a third time, which presses Ctrl-C: the case fails on its assertions rather than
+    // waiting forever.
     auto seat = RunningSeat { RenderOptions { .format = OutputFormat::Tsv }, false, true };
     auto identity = ScriptedIdentity { CacheDaemon() };
     auto dying = BoundedDyingGatherer { &seat.onDemand };
     ScriptedDialer dialer { { true } };
     seat.dialer = &dialer;
 
-    auto const ending = seat.Run(SessionContext({}, 2, &identity, &dying));
+    auto const ending = seat.Run(SessionContext({}, 3, &identity, &dying));
 
     CHECK(ending.kind == SessionEndKind::Ran);
     CHECK(ending.answer.outcome == Outcome::Affirmative);
