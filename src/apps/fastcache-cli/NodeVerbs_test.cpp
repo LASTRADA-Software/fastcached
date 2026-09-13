@@ -785,24 +785,6 @@ namespace
     return static_cast<std::size_t>(std::ranges::distance(answer.value.columns.begin(), at));
 }
 
-/// Every advisory joined, for a `contains` check.
-///
-/// A refusal's sentence is an ADVISORY here rather than a field of `Answer` -- remarks
-/// go to stderr in every format so stdout stays parseable -- and which advisory carries
-/// it is not a property worth pinning.
-/// @param answer The answer.
-/// @return The advisories, newline separated.
-[[nodiscard]] std::string AdvisoryText(Answer const& answer)
-{
-    std::string out;
-    for (auto const& advisory: answer.advisories)
-    {
-        out += advisory;
-        out.push_back('\n');
-    }
-    return out;
-}
-
 } // namespace
 
 TEST_CASE("cluster-members reports who the cluster agreed on, and an unled member as ABSENT", "[cli][node][cluster]")
