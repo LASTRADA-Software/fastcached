@@ -12,6 +12,7 @@
 #include <optional>
 #include <ranges>
 #include <string>
+#include <string_view>
 
 using namespace FastCache;
 using namespace FastCache::Cli;
@@ -39,19 +40,23 @@ namespace
 
 } // namespace
 
-TEST_CASE("a fleet reading is the leader's whole document as text, parsed only to be sure it can be",
-          "[cli][fleet][reading]")
+TEST_CASE("a fleet reading's value is the leader's KPI strip, never the document's text", "[cli][fleet][reading]")
 {
+    // The value is what the model's HISTORY keeps for every sample. WHAT DISTINGUISHES: it is a record
+    // of the strip's figures -- one field per `kpi` row, plus `-of` fields -- and no field holds the
+    // document's text, so 256 samples of history are 256 small records rather than 256 documents.
     auto const document = LeaderDocument();
     auto const reading = ReadFleetSample(FleetSample(document));
 
     REQUIRE(reading.outcome == Outcome::Affirmative);
     CHECK(reading.source == FleetReadingSource);
     CHECK(reading.note.empty());
-    // The TEXT, verbatim: whoever draws it parses this same text, so it must be the document.
-    REQUIRE(reading.value.shape == Shape::Scalar);
-    CHECK(reading.value.scalar.lexical == document);
-    CHECK(ParseFleetDocument(reading.value.scalar.lexical).has_value());
+    REQUIRE(reading.value.shape == Shape::Record);
+    CHECK(reading.value.fields.size() >= FleetKpiKeys().size());
+    for (auto const key: FleetKpiKeys())
+        CHECK(FindField(reading.value, key) != nullptr);
+    for (auto const& field: reading.value.fields)
+        CHECK(field.value.lexical.size() < document.size() / 4);
 }
 
 TEST_CASE("a fleet reading hands over the document it parsed, and a refused one hands over none", "[cli][fleet][reading]")
@@ -124,7 +129,7 @@ TEST_CASE("a fleet fetch that produced no document keeps the fetch's own outcome
     CHECK(composedWrongly.outcome != Outcome::Affirmative);
 }
 
-TEST_CASE("a piped fleet record is the newest reading's KPI strip, parsed from its text", "[cli][fleet][reading]")
+TEST_CASE("a piped fleet record is the newest reading's KPI strip, with its source first", "[cli][fleet][reading]")
 {
     auto const document = LeaderDocument();
     auto model = DashboardModel {};
@@ -191,4 +196,43 @@ TEST_CASE("an admin fetch's failure is one outcome for every reader", "[cli][fle
 {
     CHECK(OutcomeOf(AdminFailure::Refused) == Outcome::Refused);
     CHECK(OutcomeOf(AdminFailure::Unreachable) == Outcome::Unreachable);
+}
+
+namespace
+{
+
+/// How many times `CountingParse` has parsed a document. A test counter, reset by the case that reads it.
+std::size_t parsesTaken = 0;
+
+/// `ParseFleetDocument`, counted.
+/// @param document The text.
+/// @return The parse.
+[[nodiscard]] std::expected<FleetDocument, std::string> CountingParse(std::string_view document)
+{
+    ++parsesTaken;
+    return ParseFleetDocument(document);
+}
+
+} // namespace
+
+TEST_CASE("a fleet sample is parsed exactly once by its reader", "[cli][fleet][reading]")
+{
+    // The seam the parse-once property is measured through. WHAT DISTINGUISHES: one call reads one
+    // parse, a refused fetch reads none -- and the piped record drawn from that reading parses nothing
+    // more, so a record that re-parsed the text would move the count.
+    parsesTaken = 0;
+    auto const reading = ReadFleetSampleThrough(FleetSample(LeaderDocument()), &CountingParse);
+    REQUIRE(reading.outcome == Outcome::Affirmative);
+    CHECK(parsesTaken == 1);
+
+    auto model = DashboardModel {};
+    model.latest = reading.value;
+    model.latestStamp = ReadingStamp { .at = {}, .source = std::string { FleetReadingSource } };
+    auto const record = FleetKpiFigures(model);
+    CHECK(record.fields.size() == reading.value.fields.size() + 1);
+    CHECK(parsesTaken == 1);
+
+    (void) ReadFleetSampleThrough(FleetSample(std::unexpected(AdminError { .kind = AdminFailure::Refused, .detail = "no" })),
+                                  &CountingParse);
+    CHECK(parsesTaken == 1);
 }
