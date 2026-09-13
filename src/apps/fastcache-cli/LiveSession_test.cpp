@@ -30,6 +30,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #if !defined(_WIN32)
@@ -72,7 +73,17 @@ class ScriptedAcquisition final: public ITerminalAcquisition
         _spoken = terminal.get();
         if (_detachAtOnce)
             terminal->GoAway();
-        co_return StartedTerminal { .capabilities = *_answer, .events = std::move(terminal) };
+        _presented.events = &_release;
+        co_return StartedTerminal { .capabilities = *_answer,
+                                    .events = std::move(terminal),
+                                    .restore = nullptr,
+                                    .frames = std::make_unique<PresenterRecord::Sink>(&_presented) };
+    }
+
+    /// @return What the presenter it handed out was given, and whether it outlived the events.
+    [[nodiscard]] PresenterRecord const& Presented() const noexcept
+    {
+        return _presented;
     }
 
     /// @return How many acquisitions were asked for.
@@ -114,6 +125,7 @@ class ScriptedAcquisition final: public ITerminalAcquisition
     IExecutor* _askedResumeOn { nullptr };
     SpokenTerminal* _spoken { nullptr };
     TerminalRelease _release {};
+    PresenterRecord _presented {};
 };
 
 /// A stop-signal installer that hands out scripted signals, or refuses.
@@ -148,6 +160,26 @@ class ScriptedInstaller final: public IStopSignalInstaller
     int _calls { 0 };
 };
 
+/// A view whose frame is the sample count, and which records the geometry every frame was drawn at.
+class GeometryView final: public IDashboardView
+{
+  public:
+    /// @param geometry Where each frame's columns and rows go; outlives the view.
+    explicit GeometryView(std::vector<std::pair<int, int>>* geometry) noexcept:
+        _geometry { geometry }
+    {
+    }
+
+    [[nodiscard]] std::string Frame(DashboardModel const& model) override
+    {
+        _geometry->emplace_back(model.columns, model.rows);
+        return std::to_string(model.samples);
+    }
+
+  private:
+    std::vector<std::pair<int, int>>* _geometry;
+};
+
 /// A view that throws on its first frame.
 class ThrowingView final: public IDashboardView
 {
@@ -170,14 +202,22 @@ class RecordingRungViews final: public IRungViews
     {
     }
 
-    [[nodiscard]] std::unique_ptr<IDashboardView> For(RenderRung rung) override
+    [[nodiscard]] std::unique_ptr<IDashboardView> For(RenderRung rung,
+                                                      LivePlan const& /*plan*/,
+                                                      std::string_view /*address*/) override
     {
         _asked.push_back(rung);
         if (_pipedOnly && rung != RenderRung::Piped)
             return nullptr;
         if (_throwing)
             return std::make_unique<ThrowingView>();
-        return std::make_unique<CountView>();
+        return std::make_unique<GeometryView>(&_geometry);
+    }
+
+    /// @return The columns and rows every frame was drawn at, in order.
+    [[nodiscard]] std::vector<std::pair<int, int>> const& Geometry() const noexcept
+    {
+        return _geometry;
     }
 
     /// @return The rungs asked for, in order.
@@ -190,6 +230,7 @@ class RecordingRungViews final: public IRungViews
     bool _throwing;
     bool _pipedOnly;
     std::vector<RenderRung> _asked {};
+    std::vector<std::pair<int, int>> _geometry {};
 };
 
 /// How a composition's collaborators misbehave or differ from a cache session's, when a case wants them to.
@@ -270,6 +311,7 @@ struct Composition
     {
         auto parts = LiveSessionParts {
             .plan = LivePlan { .subject = subject, .interval = Interval, .samples = samples, .endpoint = "10.0.0.4:6674" },
+            .address = "10.0.0.4:6674",
             .reactor = &rig.reactor,
             .gatherer = gatherer,
             .admin = admin,
@@ -469,7 +511,8 @@ TEST_CASE("a terminal that goes away ends an interactive session and no gather s
 TEST_CASE("an interactive session whose rung has no view refuses by name and releases the terminal", "[cli][live][session]")
 {
     // Never drawn through the piped view instead: a terminal session in record lines is the shape
-    // change §1.6 rules out. The terminal it acquired is closed and released before the refusal.
+    // change §1.6 rules out. The terminal it acquired is closed and released before the refusal,
+    // and its presenter before that.
     Rig rig;
     Composition composition { rig, SixelTerminal, CompositionFaults { .pipedViewsOnly = true } };
     composition.Start(true);
@@ -477,23 +520,115 @@ TEST_CASE("an interactive session whose rung has no view refuses by name and rel
 
     auto const* const refusal = composition.Refusal();
     CHECK((refusal != nullptr && refusal->outcome == Outcome::Local));
-    CHECK((refusal != nullptr && AdvisoryText(*refusal).contains("interactive views are not built")));
+    CHECK((refusal != nullptr && AdvisoryText(*refusal).contains("live-stats cache")));
+    CHECK((refusal != nullptr && AdvisoryText(*refusal).contains("no panel")));
     CHECK(composition.views.Asked() == std::vector<RenderRung> { RenderRung::Sixel });
     CHECK(composition.terminals.Release().released);
     CHECK(composition.terminals.Release().closedFirst);
+    CHECK(composition.terminals.Presented().released);
+    CHECK_FALSE(composition.terminals.Presented().afterEvents);
+    CHECK(composition.terminals.Presented().frames == 0);
     CHECK_FALSE(composition.source.has_value());
     CHECK(rig.gatherer.Calls() == 0);
 
     composition.Finish();
 }
 
-TEST_CASE("the standard views draw the piped rung and have no view for an interactive one", "[cli][live][session]")
+TEST_CASE("an interactive session draws every frame through the terminal's presenter and none to the pipe",
+          "[cli][live][session]")
 {
-    auto views = StandardRungViews { RenderOptions { .format = OutputFormat::Tsv }, &LatestReading };
-    CHECK(views.For(RenderRung::Piped) != nullptr);
-    CHECK(views.For(RenderRung::Sixel) == nullptr);
-    CHECK(views.For(RenderRung::Unicode) == nullptr);
-    CHECK(views.For(RenderRung::Ascii) == nullptr);
+    // The alternate screen is the presenter's: a frame written to stdout as well would scroll the
+    // operator's own screen underneath it, and a frame written only there would never be seen.
+    Rig rig;
+    Composition composition { rig, SixelTerminal };
+    composition.Start(true);
+    composition.RunFor(2);
+
+    CHECK(composition.terminals.Presented().frames >= 2);
+    CHECK(rig.sink.frames == 0);
+
+    if (composition.terminals.Spoken() != nullptr)
+        composition.terminals.Spoken()->Say(DashboardEvent { .kind = DashboardEventKind::Key, .keys = "q" });
+    rig.Settle();
+    CHECK(composition.Stop() == DashboardStop::Quit);
+    composition.Finish();
+    // Released, and before the events it presented over.
+    CHECK(composition.terminals.Presented().released);
+    CHECK_FALSE(composition.terminals.Presented().afterEvents);
+    CHECK(composition.terminals.Release().released);
+}
+
+TEST_CASE("an interactive session's presenter is released before the terminal's events when the terminal goes away",
+          "[cli][live][session]")
+{
+    Rig rig;
+    Composition composition { rig, SixelTerminal, CompositionFaults { .detachAtOnce = true } };
+    composition.Start(true);
+    rig.Settle();
+
+    CHECK(composition.Stop() == DashboardStop::SourceDetached);
+    composition.Finish();
+    CHECK(composition.terminals.Presented().released);
+    CHECK_FALSE(composition.terminals.Presented().afterEvents);
+    CHECK(composition.terminals.Release().released);
+}
+
+TEST_CASE("a resize reaches the next frame an interactive session draws", "[cli][live][session]")
+{
+    Rig rig;
+    Composition composition { rig, SixelTerminal };
+    composition.Start(true);
+    rig.Settle();
+    REQUIRE(composition.terminals.Spoken() != nullptr);
+
+    composition.terminals.Spoken()->Say(DashboardEvent { .kind = DashboardEventKind::Resize, .columns = 132, .rows = 43 });
+    rig.Settle();
+
+    REQUIRE_FALSE(composition.views.Geometry().empty());
+    CHECK(composition.views.Geometry().front() != std::pair { 132, 43 });
+    CHECK(composition.views.Geometry().back() == std::pair { 132, 43 });
+
+    composition.terminals.Spoken()->Say(DashboardEvent { .kind = DashboardEventKind::Key, .keys = "q" });
+    rig.Settle();
+    composition.Finish();
+}
+
+TEST_CASE("the standard views draw the piped rung, and each subject's own panel on an interactive one",
+          "[cli][live][session]")
+{
+    auto views = StandardRungViews { RenderOptions { .format = OutputFormat::Human }, &LatestReading };
+    auto const cache = LivePlan { .subject = LiveSubject::Cache,
+                                  .interval = std::chrono::milliseconds { 2000 },
+                                  .samples = 0,
+                                  .endpoint = "a cache daemon" };
+    auto node = cache;
+    node.subject = LiveSubject::Node;
+    auto fleet = cache;
+    fleet.subject = LiveSubject::Fleet;
+
+    CHECK(views.For(RenderRung::Piped, cache, "10.0.0.4:6674") != nullptr);
+    CHECK(views.For(RenderRung::Piped, fleet, "10.0.0.4:6674") != nullptr);
+
+    // Which panel, told apart by its title, and the frame names where and how often it samples.
+    auto const model = DashboardModel {};
+    for (auto const rung: { RenderRung::Sixel, RenderRung::Unicode, RenderRung::Ascii })
+    {
+        auto const cacheView = views.For(rung, cache, "10.0.0.4:6674");
+        auto const nodeView = views.For(rung, node, "10.0.0.5:6674");
+        REQUIRE(cacheView != nullptr);
+        REQUIRE(nodeView != nullptr);
+        auto const cacheFrame = cacheView->Frame(model);
+        auto const nodeFrame = nodeView->Frame(model);
+        CHECK(cacheFrame.contains(CachePanel().title));
+        CHECK_FALSE(cacheFrame.contains(NodePanel().title));
+        CHECK(nodeFrame.contains(NodePanel().title));
+        CHECK(cacheFrame.contains("10.0.0.4:6674"));
+        CHECK(nodeFrame.contains("10.0.0.5:6674"));
+        CHECK(cacheFrame.contains("every 2s"));
+
+        // No panel for the fleet yet: refused by name, never drawn as records.
+        CHECK(views.For(rung, fleet, "10.0.0.4:6674") == nullptr);
+    }
 }
 
 TEST_CASE("a composed session re-dials after a failed sample and reaches its budget", "[cli][live][session][redial]")
