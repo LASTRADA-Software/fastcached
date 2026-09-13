@@ -202,7 +202,7 @@ TEST_CASE("piped json is one document per line, and a failure is a document of n
     CHECK(lines[2] == R"({"source":null,"curr_connections":null,"used_memory":null})");
 }
 
-TEST_CASE("--samples=N piped writes exactly N rows under its header", "[cli][live][piped]")
+TEST_CASE("Piped output under --samples=N writes exactly N rows under its header", "[cli][live][piped]")
 {
     // §9.16 through the view: the budget's own frame is the Nth row, and the sample after the
     // budget is never read.
