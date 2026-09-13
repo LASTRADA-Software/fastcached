@@ -4,17 +4,26 @@
 #include "CliAnswer.hpp"
 #include "DashboardEvent.hpp"
 #include "DashboardLoop.hpp"
+#include "DashboardRung.hpp"
 #include "LiveEventSource.hpp"
+#include "LiveStats.hpp"
+#include "StatsSource.hpp"
+#include "TerminalEvents.hpp"
 
+#include <FastCache/Async/IExecutor.hpp>
+#include <FastCache/Async/IReactor.hpp>
 #include <FastCache/Async/Task.hpp>
 #include <FastCache/Core/BoundedDrain.hpp>
 #include <FastCache/Core/Clock.hpp>
+#include <FastCache/Platform/StopSignal.hpp>
 
 #include <atomic>
+#include <expected>
 #include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace FastCache::Cli
 {
@@ -107,6 +116,112 @@ struct SessionEnding
 /// @param bound The ceiling, and how often to look.
 /// @param wait The drain's clock and its sleep; injected so a test spends no real time.
 /// @return How the process leaves.
+/// Acquires the terminal an interactive session draws on.
+///
+/// A seam over `MakeTerminalEvents` then `StartTerminal`, so a composition is testable without
+/// a terminal and so "a run with no terminal never acquires one" is COUNTED rather than read off
+/// an `if`.
+class ITerminalAcquisition
+{
+  public:
+    ITerminalAcquisition() = default;
+    ITerminalAcquisition(ITerminalAcquisition const&) = delete;
+    ITerminalAcquisition(ITerminalAcquisition&&) = delete;
+    ITerminalAcquisition& operator=(ITerminalAcquisition const&) = delete;
+    ITerminalAcquisition& operator=(ITerminalAcquisition&&) = delete;
+    virtual ~ITerminalAcquisition() = default;
+
+    /// Acquire the terminal and learn what it can draw.
+    /// @param pool Where acquiring and each blocking read run: a thread of its own.
+    /// @param resumeOn Where the caller resumes.
+    /// @return The started terminal, or why it could not be acquired.
+    [[nodiscard]] virtual Task<std::expected<StartedTerminal, std::string>> Acquire(IExecutor* pool,
+                                                                                    IExecutor* resumeOn) = 0;
+};
+
+/// Installs the stop request a session with no terminal ends on.
+class IStopSignalInstaller
+{
+  public:
+    IStopSignalInstaller() = default;
+    IStopSignalInstaller(IStopSignalInstaller const&) = delete;
+    IStopSignalInstaller(IStopSignalInstaller&&) = delete;
+    IStopSignalInstaller& operator=(IStopSignalInstaller const&) = delete;
+    IStopSignalInstaller& operator=(IStopSignalInstaller&&) = delete;
+    virtual ~IStopSignalInstaller() = default;
+
+    /// Install it; the disposition returns when the result is destroyed.
+    /// @return The installed signal, or why none could be installed.
+    [[nodiscard]] virtual std::expected<std::unique_ptr<IStopSignal>, std::string> Install() = 0;
+};
+
+/// The view each rung draws through.
+class IRungViews
+{
+  public:
+    IRungViews() = default;
+    IRungViews(IRungViews const&) = delete;
+    IRungViews(IRungViews&&) = delete;
+    IRungViews& operator=(IRungViews const&) = delete;
+    IRungViews& operator=(IRungViews&&) = delete;
+    virtual ~IRungViews() = default;
+
+    /// @param rung The rung decided for this session.
+    /// @return Its view; never null.
+    [[nodiscard]] virtual std::unique_ptr<IDashboardView> For(RenderRung rung) = 0;
+};
+
+/// Everything a session is composed from. `main` acquires each part; nothing here does.
+struct LiveSessionParts
+{
+    LivePlan plan {};                            ///< What was admitted.
+    IReactor* reactor { nullptr };               ///< Where the session runs.
+    IStatsGatherer* gatherer { nullptr };        ///< What each sample asks.
+    IExecutor* samplePool { nullptr };           ///< Where a gather blocks.
+    IExecutor* stopWaiter { nullptr };           ///< Where the stop wait blocks: its own thread.
+    IExecutor* terminalPool { nullptr };         ///< Where terminal reads block: its own thread.
+    IFrameSink* sink { nullptr };                ///< Where frames go.
+    bool interactive { false };                  ///< `StandardStreamsAreInteractive()`, asked by `main`.
+    ITerminalAcquisition* terminals { nullptr }; ///< Asked only when interactive.
+    IStopSignalInstaller* stops { nullptr };     ///< Asked only when not.
+    IRungViews* views { nullptr };               ///< What each rung draws through.
+};
+
+/// What a composed session leaves behind that must outlive it: the source a drain waits on, and
+/// the stop signal whose disposition returns only once nothing waits on it.
+///
+/// Owned by the caller rather than by the session's coroutine, because the drain runs AFTER the
+/// coroutine has returned, on another thread.
+struct LiveSessionHold
+{
+    std::unique_ptr<IStopSignal> stop {};  ///< Destroyed after the drain; restores the disposition.
+    std::optional<LiveEventSource> source; ///< Empty when the session was refused before starting.
+    std::atomic<bool> drained { false };   ///< Set on the reactor once `source` has drained.
+};
+
+/// How a composed session ended, when it ran at all.
+struct LiveSessionRun
+{
+    DashboardExit exit {};               ///< What the loop returned.
+    std::vector<std::string> remarks {}; ///< What an operator should be told beside it.
+};
+
+/// Compose and run one `live-stats` session.
+///
+/// **Interactive**: acquire the terminal (on its own pool), decide the rung from what it
+/// reported, and listen to it; a terminal that cannot be acquired REFUSES the session naming
+/// why, and never falls back to piped output -- that would change the output's shape under a
+/// script somebody wrote by copying an interactive run. **Not interactive**: acquire no
+/// terminal at all, install the stop request instead, and draw on the `Piped` rung.
+///
+/// **The source is closed on every way the loop ends**, an exception included, because
+/// `Drained()` completes only after a close and a terminal that went away on its own closes
+/// nothing. Then the caller drains `hold` off the reactor.
+/// @param parts What to compose from.
+/// @param hold Where the parts that outlive the session are kept; the caller's.
+/// @return How the session ended, or the refusal that kept it from starting.
+[[nodiscard]] Task<std::expected<LiveSessionRun, Answer>> RunComposedSession(LiveSessionParts parts, LiveSessionHold* hold);
+
 [[nodiscard]] SessionEnding DrainSession(std::atomic<bool> const& drained,
                                          LiveEventSource const& source,
                                          Outcome earned,
