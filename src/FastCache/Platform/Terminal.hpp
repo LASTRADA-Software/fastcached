@@ -2,6 +2,7 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string_view>
 
@@ -86,5 +87,40 @@ enum class TerminalTextEncoding : std::uint8_t
 /// that must not read ambient state is handed the result as a value.
 /// @return The encoding.
 [[nodiscard]] TerminalTextEncoding DetectTerminalTextEncoding();
+
+/// The standard streams' terminal modes, as they were before a terminal UI changed them.
+///
+/// Captured once, before the UI takes the terminal over, so they can be put back from ANY thread
+/// without reaching into whatever changed them. That is the path a process takes when it has to
+/// end NOW -- a read still parked on another thread, and no destructor going to run -- where the
+/// UI's own teardown is exactly the thing that cannot be called: it shares state with the parked
+/// read.
+///
+/// Implementation per platform:
+///   - Windows: the console input and output modes and both code pages
+///   - POSIX:   standard input's `termios`
+class SavedTerminalModes final
+{
+  public:
+    /// Capture the modes of standard input and output now.
+    /// @return The modes, or nothing when the standard streams are not both a terminal or their
+    ///         modes could not be read.
+    [[nodiscard]] static std::optional<SavedTerminalModes> Capture() noexcept;
+
+    /// Write @p resets to standard output, then put the captured modes back.
+    ///
+    /// In that order, because the captured Windows output mode may not interpret escape sequences
+    /// at all. Touches only process-wide terminal state -- `tcsetattr(TCSANOW)`, or the console
+    /// modes and code pages -- and the output handle, so it is safe from a thread other than the
+    /// one reading the terminal while that read is parked. It is NOT idempotent by itself: whoever
+    /// calls it decides whether a second call is wanted.
+    /// @param resets Escape sequences undoing what the UI switched on.
+    void Apply(std::string_view resets) const noexcept;
+
+  private:
+    struct Modes;
+    explicit SavedTerminalModes(std::shared_ptr<Modes const> modes) noexcept;
+    std::shared_ptr<Modes const> _modes;
+};
 
 } // namespace FastCache

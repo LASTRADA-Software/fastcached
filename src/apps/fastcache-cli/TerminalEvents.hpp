@@ -60,16 +60,48 @@ class UnstartedTerminal final
     std::unique_ptr<Parts> _parts;
 };
 
-/// A terminal that was acquired: what it can draw, and the events it produces.
+/// Puts a started terminal back NOW: from any thread, whatever its events are doing.
+///
+/// For the one exit that runs no destructor. A session abandoned because something is stuck ends
+/// in `std::_Exit`, so `events` never restores the terminal, and a terminal read may still be
+/// parked on the pool when it does -- which would leave the operator in raw mode, on the alternate
+/// screen, with the keyboard protocol still pushed. The events' own teardown cannot be called
+/// there instead: it shares state with that parked read.
+class ITerminalRestore
+{
+  public:
+    ITerminalRestore() = default;
+    ITerminalRestore(ITerminalRestore const&) = delete;
+    ITerminalRestore(ITerminalRestore&&) = delete;
+    ITerminalRestore& operator=(ITerminalRestore const&) = delete;
+    ITerminalRestore& operator=(ITerminalRestore&&) = delete;
+    virtual ~ITerminalRestore() = default;
+
+    /// Put the terminal's modes back, and switch off what the dashboard switched on.
+    ///
+    /// - **Idempotent.** Any number of calls, in any order with destroying `events`, restore at
+    ///   most once through this handle; once `events` has been destroyed -- which restores the
+    ///   terminal itself -- a call does nothing.
+    /// - **`noexcept`, and safe from any thread while a read is parked.** It touches process-wide
+    ///   terminal state and the output handle, never the event stream or its queue.
+    /// - **Needs no `Close()` first**, and does not close anything: the events go on existing, and
+    ///   a caller that continues rather than exiting still has to close and destroy them.
+    virtual void RestoreNow() noexcept = 0;
+};
+
+/// A terminal that was acquired: what it can draw, the events it produces, and the way to put it
+/// back without them.
 ///
 /// The record arrives beside the source so the rung can be decided (`ChooseRenderRung`) before
 /// the first event is read. `events` owns the terminal: it is restored when `events` is destroyed,
 /// which must follow `Close()` and the outstanding `Next()` resuming. The first event is always a
-/// `Resize` carrying the geometry at start.
+/// `Resize` carrying the geometry at start. `restore` is for the exit where `events` is never
+/// destroyed; it may outlive `events`.
 struct StartedTerminal
 {
     TerminalCapabilities capabilities;
     std::unique_ptr<IDashboardEventSource> events;
+    std::shared_ptr<ITerminalRestore> restore;
 };
 
 /// A terminal event source over this process's standard streams, not yet started.

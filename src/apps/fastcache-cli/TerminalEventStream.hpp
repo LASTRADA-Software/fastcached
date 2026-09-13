@@ -129,8 +129,16 @@ class ITerminalDevice
     /// Wake a wait parked in `Events()`. Callable from any thread.
     virtual void Wake() = 0;
 
-    /// Put back whatever `Acquire` changed, however far it got. Idempotent.
+    /// Put back whatever `Acquire` changed, however far it got. Idempotent. Called on the thread
+    /// that owns the events, once nothing waits in `Events()`.
     virtual void Restore() noexcept = 0;
+
+    /// Put the terminal's modes back NOW, from any thread, while a wait in `Events()` may be parked.
+    ///
+    /// Touches process-wide terminal state and the output handle only, never anything `Events()`
+    /// reads. Reached through `StartedTerminal::restore`, which calls it at most once and never
+    /// after the device's teardown has begun.
+    virtual void RestoreNow() noexcept = 0;
 };
 
 /// `StartTerminal` over any device: the two-hop, the restore guard and the record.
