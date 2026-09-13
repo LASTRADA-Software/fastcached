@@ -1197,8 +1197,8 @@ TEST_CASE("a frame's images reach the sink with its text, and a cell size rides 
 
     REQUIRE(view.cellPixelsSeen.size() == 2);
     REQUIRE(view.cellPixelsSeen[0].has_value());
-    CHECK(view.cellPixelsSeen[0]->width == 9);
-    CHECK(view.cellPixelsSeen[0]->height == 18);
+    CHECK(Unwrap(view.cellPixelsSeen[0]).width == 9);
+    CHECK(Unwrap(view.cellPixelsSeen[0]).height == 18);
     CHECK_FALSE(view.cellPixelsSeen[1].has_value());
 }
 
