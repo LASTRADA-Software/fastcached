@@ -101,7 +101,8 @@ namespace
                                  ? std::optional<Duration> { stamp.at - model.latestStamp->at }
                                  : std::optional<Duration> {};
         model.runLength = elapsed.has_value() ? model.runLength + 1 : 1;
-        RecordHistory(model, HistoryEntry { .reading = reading.value, .elapsed = elapsed });
+        RecordHistory(model,
+                      HistoryEntry { .reading = reading.value, .elapsed = elapsed, .points = std::move(reading.points) });
         model.previous = std::move(model.latest);
         model.latest = std::move(reading.value);
         model.latestStamp = std::move(stamp);

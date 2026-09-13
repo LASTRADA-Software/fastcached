@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#include "FleetChartModel.hpp"
 #include "FleetDocument.hpp"
 #include "FleetReading.hpp"
 #include "SocketExchange.hpp"
@@ -84,11 +85,16 @@ SampleReading ReadFleetSampleThrough(DashboardEvent const& event, FleetParser pa
                                .source = {},
                                .note = std::format("the leader's fleet document could not be read: {}", parsed.error()) };
 
-    return SampleReading { .outcome = Outcome::Affirmative,
-                           .value = RecordValue(KpiFields(*parsed)),
-                           .source = std::string { FleetReadingSource },
-                           .note = {},
-                           .document = std::make_shared<FleetDocument const>(std::move(*parsed)) };
+    auto reading = SampleReading { .outcome = Outcome::Affirmative,
+                                   .value = RecordValue(KpiFields(*parsed)),
+                                   .source = std::string { FleetReadingSource },
+                                   .note = {},
+                                   .document = nullptr,
+                                   .points = FleetChartPoints(*parsed) };
+    // The points are taken from the parse before it moves: the chart's history keeps these numbers,
+    // and only the newest document is kept whole.
+    reading.document = std::make_shared<FleetDocument const>(std::move(*parsed));
+    return reading;
 }
 
 Value FleetKpiFigures(DashboardModel const& model)
