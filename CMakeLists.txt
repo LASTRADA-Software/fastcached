@@ -465,6 +465,49 @@ include(Utf8CodePage)
 include(ErrorPopups)
 
 # ----------------------------------------------------------------------------
+# The vendored TUI gets the sanitizer flags TARGET BY TARGET, and that is not a style choice.
+#
+# `Sanitizers` instruments with directory-scoped `add_compile_options`, which reaches only
+# targets defined AFTER it -- and `add_subdirectory(vendor)` runs above, inside the
+# `FASTCACHED_BUILD_TUI` block that fetches libunicode. So until this block
+# the vendored code was built with no sanitizer at all in every sanitizer configuration: the
+# ASan/UBSan leg never covered endo, and a ThreadSanitizer run of `fastcache-cli-tests` reported
+# that binary's own objects instrumented while its endo half -- the terminal wait on the pool,
+# and the wakeup signalled to it from the reactor -- was not. Measured: a
+# `fastcache-tui-objects` object in the ASan build carried no `-fsanitize` and 0 `__asan`
+# symbols, beside a `FastCache` object carrying both.
+#
+# Moving `add_subdirectory(vendor)` below these includes is the tidy-looking fix and the wrong
+# one: it would also put `PedanticCompiler`'s -Werror and clang-tidy on the verbatim copy, which
+# `vendor/VENDOR.md` says we do not govern. And folding this back into directory scope would
+# silently undo it, which is why it says so here.
+#
+# Read from the module's OWN variables, so a sanitizer added there reaches the vendored code
+# too, and applied to every target the `vendor/` directory declares -- derived, not named, so a
+# vendored test binary added later is covered without an edit. Executables get the link flags as
+# well, or instrumented objects would not link. libunicode is a different directory and stays
+# uninstrumented, like every other third-party dependency. `ctest -R vendor-sanitized` asserts the
+# result in the OBJECTS, where a flag that never reached a compile line would show.
+if(FASTCACHED_BUILD_TUI AND SANITIZER_COMPILE_OPTIONS)
+    get_property(_fcVendorTargets DIRECTORY "${CMAKE_SOURCE_DIR}/vendor" PROPERTY BUILDSYSTEM_TARGETS)
+    if(NOT _fcVendorTargets)
+        message(FATAL_ERROR
+            "The vendor/ directory declares no targets, so the sanitizer flags reached none of them. "
+            "A derived set that comes back empty is this block having stopped working, not a vendored "
+            "library that needs no instrumentation.")
+    endif()
+    foreach(_fcVendorTarget IN LISTS _fcVendorTargets)
+        get_target_property(_fcVendorTargetType ${_fcVendorTarget} TYPE)
+        if(_fcVendorTargetType MATCHES "^(OBJECT_LIBRARY|STATIC_LIBRARY|SHARED_LIBRARY|MODULE_LIBRARY|EXECUTABLE)$")
+            target_compile_options(${_fcVendorTarget} PRIVATE ${SANITIZER_COMPILE_OPTIONS})
+        endif()
+        if(_fcVendorTargetType MATCHES "^(SHARED_LIBRARY|MODULE_LIBRARY|EXECUTABLE)$")
+            target_link_options(${_fcVendorTarget} PRIVATE ${SANITIZER_LINK_OPTIONS})
+        endif()
+    endforeach()
+endif()
+
+# ----------------------------------------------------------------------------
 # Test wiring is enabled early so all subdirectories (CowTree, FastCache,
 # src/tests) can register their CTest test executables via
 # catch_discover_tests().
