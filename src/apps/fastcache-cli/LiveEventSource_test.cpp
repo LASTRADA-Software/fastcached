@@ -37,10 +37,10 @@ constexpr auto Interval = std::chrono::milliseconds { 2000 };
 /// @return One answered attempt.
 [[nodiscard]] std::vector<StatsAttempt> Reading()
 {
-    auto record = Value {};
-    record.shape = Shape::Record;
-    record.fields.push_back(Field { .name = "curr_connections", .value = TextCell("10") });
-    return { StatsAttempt { .origin = StatsOrigin::Info, .asked = true, .record = std::move(record), .note = {} } };
+    return { StatsAttempt { .origin = StatsOrigin::Info,
+                            .asked = true,
+                            .record = RecordValue({ Field { .name = "curr_connections", .value = TextCell("10") } }),
+                            .note = {} } };
 }
 
 /// A terminal a case speaks for, one event at a time.
@@ -114,15 +114,30 @@ struct Rig
     TestReactor reactor { clock };
     TestReactor pool { clock };
     ScriptedGatherer gatherer { Reading() };
+    CountView view {};
+    CountSink sink {};
 
-    /// A source over this rig.
-    /// @param terminal The terminal, or null for a run with none.
+    /// The terminal `SpokenParts()` built; owned by the source it went into.
+    SpokenTerminal* terminal { nullptr };
+
+    /// A source over this rig, with no terminal.
     /// @return The parts.
-    [[nodiscard]] LiveSourceParts Parts(std::unique_ptr<IDashboardEventSource> terminal = nullptr)
+    [[nodiscard]] LiveSourceParts Parts()
     {
         return LiveSourceParts {
-            .reactor = &reactor, .gatherer = &gatherer, .pool = &pool, .interval = Interval, .terminal = std::move(terminal)
+            .reactor = &reactor, .gatherer = &gatherer, .pool = &pool, .interval = Interval, .terminal = nullptr
         };
+    }
+
+    /// A source over this rig, with a terminal a case speaks for through `terminal`.
+    /// @return The parts.
+    [[nodiscard]] LiveSourceParts SpokenParts()
+    {
+        auto spoken = std::make_unique<SpokenTerminal>(reactor);
+        terminal = spoken.get();
+        auto parts = Parts();
+        parts.terminal = std::move(spoken);
+        return parts;
     }
 
     /// Run everything runnable, gathers included, until nothing is.
@@ -160,7 +175,7 @@ struct Rig
 /// @param limits The budget.
 /// @param out How it ended.
 /// @return The task to submit.
-[[nodiscard]] Task<void> RunOver(LiveEventSource* source,
+[[nodiscard]] Task<void> RunOver(IDashboardEventSource* source,
                                  IDashboardView* view,
                                  IFrameSink* sink,
                                  DashboardLimits limits,
@@ -252,16 +267,14 @@ TEST_CASE("a live source takes no second sample until its clock reaches the inte
 TEST_CASE("a keystroke that arrives while a sample is outstanding is delivered first", "[cli][live][source]")
 {
     Rig rig;
-    auto terminal = std::make_unique<SpokenTerminal>(rig.reactor);
-    auto* const at = terminal.get();
-    LiveEventSource source { rig.Parts(std::move(terminal)) };
+    LiveEventSource source { rig.SpokenParts() };
 
     // The reactor has run and the pool has not: the first gather is handed off and has
     // not happened, which is the window this case is about.
     rig.reactor.Drain();
     CHECK(rig.pool.PendingSubmissions() == 1);
 
-    at->Say(DashboardEvent { .kind = DashboardEventKind::Key, .keys = "x" });
+    rig.terminal->Say(DashboardEvent { .kind = DashboardEventKind::Key, .keys = "x" });
     auto const key = NextDue(rig, source);
     CHECK(KindOf(key) == DashboardEventKind::Key);
     CHECK((key.has_value() && key->keys == "x"));
@@ -278,19 +291,15 @@ TEST_CASE("quitting during a sample ends the dashboard at once and the source dr
           "[cli][live][source]")
 {
     Rig rig;
-    auto terminal = std::make_unique<SpokenTerminal>(rig.reactor);
-    auto* const at = terminal.get();
-    LiveEventSource source { rig.Parts(std::move(terminal)) };
-    CountView view;
-    CountSink sink;
+    LiveEventSource source { rig.SpokenParts() };
 
     auto exit = std::optional<DashboardExit> {};
-    auto run = RunOver(&source, &view, &sink, DashboardLimits {}, &exit);
+    auto run = RunOver(&source, &rig.view, &rig.sink, DashboardLimits {}, &exit);
     rig.reactor.Submit(run.Native());
     rig.reactor.Drain();
     CHECK(rig.pool.PendingSubmissions() == 1);
 
-    at->Say(DashboardEvent { .kind = DashboardEventKind::Key, .keys = "q" });
+    rig.terminal->Say(DashboardEvent { .kind = DashboardEventKind::Key, .keys = "q" });
     rig.reactor.Drain();
 
     // The operator was not made to wait for the scrape: the loop has returned, and the
@@ -310,7 +319,7 @@ TEST_CASE("quitting during a sample ends the dashboard at once and the source dr
     CHECK(drained);
     CHECK(rig.gatherer.Calls() == 1);
     // Returned into a closed session, the reading is dropped rather than drawn.
-    CHECK(sink.frames == 0);
+    CHECK(rig.sink.frames == 0);
     CHECK(rig.reactor.PendingTimers() == 0);
     CHECK(rig.reactor.PendingSubmissions() == 0);
     CHECK(rig.pool.PendingSubmissions() == 0);
@@ -328,16 +337,11 @@ TEST_CASE("closing a source between samples retires its timer without waiting fo
     CHECK(rig.reactor.PendingTimers() == 1);
 
     source.Close();
-    // Retracted at the close, not at the deadline: `fleet` waits five seconds between
-    // samples, and a quit that took that long to finish would read as a hang.
+    // Retracted at the close, not at the deadline.
     CHECK(rig.reactor.PendingTimers() == 0);
 
-    // Drained with the clock where it was.
-    auto drained = false;
-    auto wait = AwaitDrained(&source, &drained);
-    rig.reactor.Submit(wait.Native());
-    rig.Settle();
-    CHECK(drained);
+    // Drained with the clock where it was, and without another sample.
+    CloseAndDrain(rig, source);
     CHECK(rig.gatherer.Calls() == 1);
 }
 
@@ -395,21 +399,19 @@ TEST_CASE("a sample slower than the interval is never overlapped and never made 
 TEST_CASE("a resize is followed by a tick, so the frame is redrawn at the new size", "[cli][live][source]")
 {
     Rig rig;
-    auto terminal = std::make_unique<SpokenTerminal>(rig.reactor);
-    auto* const at = terminal.get();
-    LiveEventSource source { rig.Parts(std::move(terminal)) };
+    LiveEventSource source { rig.SpokenParts() };
     rig.Settle();
     (void) NextDue(rig, source);
     (void) NextDue(rig, source);
 
-    at->Say(DashboardEvent { .kind = DashboardEventKind::Resize, .columns = 120, .rows = 40 });
+    rig.terminal->Say(DashboardEvent { .kind = DashboardEventKind::Resize, .columns = 120, .rows = 40 });
     auto const resize = NextDue(rig, source);
     CHECK(KindOf(resize) == DashboardEventKind::Resize);
     CHECK((resize.has_value() && resize->columns == 120 && resize->rows == 40));
     CHECK(KindOf(NextDue(rig, source)) == DashboardEventKind::Tick);
 
     // A key changes nothing a frame is drawn from, so it earns no tick.
-    at->Say(DashboardEvent { .kind = DashboardEventKind::Key, .keys = "x" });
+    rig.terminal->Say(DashboardEvent { .kind = DashboardEventKind::Key, .keys = "x" });
     CHECK(KindOf(NextDue(rig, source)) == DashboardEventKind::Key);
     auto after = std::optional<DashboardEvent> {};
     auto task = TakeOne(&source, &after);
@@ -423,19 +425,15 @@ TEST_CASE("a resize is followed by a tick, so the frame is redrawn at the new si
 TEST_CASE("a terminal that goes away ends the session", "[cli][live][source]")
 {
     Rig rig;
-    auto terminal = std::make_unique<SpokenTerminal>(rig.reactor);
-    auto* const at = terminal.get();
-    LiveEventSource source { rig.Parts(std::move(terminal)) };
-    CountView view;
-    CountSink sink;
+    LiveEventSource source { rig.SpokenParts() };
 
     auto exit = std::optional<DashboardExit> {};
-    auto run = RunOver(&source, &view, &sink, DashboardLimits {}, &exit);
+    auto run = RunOver(&source, &rig.view, &rig.sink, DashboardLimits {}, &exit);
     rig.reactor.Submit(run.Native());
     rig.Settle();
     CHECK_FALSE(exit.has_value());
 
-    at->Close();
+    rig.terminal->Close();
     rig.Settle();
     CHECK((exit.has_value() && exit->stop == DashboardStop::SourceDetached));
 
@@ -446,11 +444,9 @@ TEST_CASE("a run with no terminal takes its whole sample budget", "[cli][live][s
 {
     Rig rig;
     LiveEventSource source { rig.Parts() };
-    CountView view;
-    CountSink sink;
 
     auto exit = std::optional<DashboardExit> {};
-    auto run = RunOver(&source, &view, &sink, DashboardLimits { .samples = 3 }, &exit);
+    auto run = RunOver(&source, &rig.view, &rig.sink, DashboardLimits { .samples = 3 }, &exit);
     rig.reactor.Submit(run.Native());
     for ([[maybe_unused]] auto const round: std::views::iota(0, 3))
     {
