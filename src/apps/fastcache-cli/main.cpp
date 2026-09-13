@@ -13,6 +13,7 @@
 #include "CliFormat.hpp"
 #include "CliVerbs.hpp"
 #include "LiveSession.hpp"
+#include "SixelEncoder.hpp"
 #include "SocketExchange.hpp"
 #include "StatsGatherer.hpp"
 #include "TerminalCellWidth.hpp"
@@ -375,7 +376,10 @@ class StopReactorOnExit
     ProcessStopSignals stops;
     StandardTerminalAcquisition terminals;
     LadderRedial redial { command, WireTable[static_cast<std::size_t>(verb.wire)] };
-    StandardRungViews views { render, &TerminalCellWidth };
+    // A build without the terminal library has no encoder, and its sessions never reach the Sixel
+    // rung; the chart is then simply not drawn.
+    auto sixel = MakeSixelEncoder();
+    StandardRungViews views { render, &TerminalCellWidth, sixel.has_value() ? sixel->get() : nullptr };
     ThreadDrainWait drainWait;
     std::optional<LiveEventSource> source;
     std::jthread reactorThread { [&reactor] { reactor.Run(); } };
