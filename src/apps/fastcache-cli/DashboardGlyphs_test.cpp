@@ -172,6 +172,9 @@ TEST_CASE("figures are written in their own units", "[cli][dashboard][glyphs]")
     CHECK(FormatFigure(3.41 * 1024 * 1024 * 1024, FigureFormat::Bytes, "-") == "3.41 GiB");
     CHECK(FormatFigure(248.1 * 1024 * 1024, FigureFormat::Bytes, "-") == "248.1 MiB");
     CHECK(FormatFigure(1.84, FigureFormat::Seconds, "-") == "1.84 s");
+    // A lease out for an hour and a half is read in hours, never as thousands of seconds.
+    CHECK(FormatFigure(90.0, FigureFormat::Seconds, "-") == "1.5 min");
+    CHECK(FormatFigure(5400.0, FigureFormat::Seconds, "-") == "1.5 h");
 }
 
 TEST_CASE("every frame line is exactly the frame's width on both text rungs", "[cli][dashboard][glyphs]")

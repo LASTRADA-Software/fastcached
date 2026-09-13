@@ -175,29 +175,6 @@ struct TierColumn
     Priority priority { Priority::Normal }; ///< When the column is dropped for width.
 };
 
-/// How a `kpi` row's unit is written for a person.
-///
-/// **The one place this client reads a unit's NAME.** `/fleet.txt` carries a headline figure as a raw
-/// number beside the name of the scale it is in, and those names are spelled once, file-local, in
-/// `FleetView.cpp`'s `CellFormatTable`. A unit with no row here is written exactly as the leader sent
-/// it rather than guessed at, and a test renders a real document and requires every unit it carries
-/// to have a row, so a rename there cannot leave the tiles raw in silence.
-struct KpiUnit
-{
-    std::string_view name; ///< The unit's spelling in the document.
-    double scale { 1.0 };  ///< Applied first: a thousandth is a fraction, a millisecond a thousandth of a second.
-    std::optional<FigureFormat> format {}; ///< How the scaled value is written; nullopt to write the cell as sent.
-};
-
-/// Every unit a `kpi` row can name, as this client writes it.
-inline constexpr auto KpiUnitTable = std::to_array<KpiUnit>({
-    { .name = "count", .scale = 1.0, .format = FigureFormat::Count },
-    { .name = "bytes", .scale = 1.0, .format = FigureFormat::Bytes },
-    { .name = "permille", .scale = 0.001, .format = FigureFormat::Percent },
-    { .name = "milliseconds", .scale = 0.001, .format = FigureFormat::Seconds },
-    { .name = "text", .scale = 1.0, .format = std::nullopt },
-});
-
 /// How a panel draws the fleet document a `fleet` reading carries (#134 §5).
 ///
 /// **No column list lives here, or anywhere in this client** (#1320): a section's columns are the

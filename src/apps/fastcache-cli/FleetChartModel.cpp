@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <map>
 #include <optional>
 #include <ranges>
@@ -73,6 +74,8 @@ std::vector<SeriesPoint> FleetChartPoints(FleetDocument const& document)
         auto const valueAt = ColumnOf(*table, metric.valueColumn);
         if (!subjectAt.has_value() || !valueAt.has_value())
             continue;
+        auto const format = Distributed::FleetColumnFormat(metric.section, metric.valueColumn);
+        auto const scale = format.has_value() ? Distributed::CellFormatTable[static_cast<std::size_t>(*format)].scale : 1.0;
         for (auto const& row: table->rows)
         {
             auto const& subject = row[*subjectAt];
@@ -80,7 +83,7 @@ std::vector<SeriesPoint> FleetChartPoints(FleetDocument const& document)
             auto raw = 0.0;
             if (subject.kind == CellKind::Absent || cell.kind == CellKind::Absent || !ParseFiniteDouble(cell.lexical, raw))
                 continue;
-            points.push_back(SeriesPoint { .series = metric.key, .subject = subject.lexical, .value = raw * metric.scale });
+            points.push_back(SeriesPoint { .series = metric.key, .subject = subject.lexical, .value = raw * scale });
         }
     }
     return points;
