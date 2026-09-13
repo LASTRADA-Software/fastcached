@@ -131,6 +131,16 @@ struct DashboardModel
     }
 };
 
+/// The number @p reading holds for @p field.
+///
+/// A `Number` cell and a `Text` cell alike, because which kind a figure arrives as depends on the
+/// source that reported it. Named kinds rather than excluded ones, so a kind added later is no
+/// number until somebody says it is. Text that is not a finite number is no number either.
+/// @param reading The reading, or nullopt where there was none.
+/// @param field The field's name.
+/// @return The number, or nullopt.
+[[nodiscard]] std::optional<double> NumberIn(std::optional<Value> const& reading, std::string_view field);
+
 /// How fast one counter rose over the interval ending at each entry of @p history, per second.
 ///
 /// **One element per ENTRY, oldest first**, so a panel draws one cell per sample and a cell sits

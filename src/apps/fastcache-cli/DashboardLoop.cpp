@@ -108,27 +108,6 @@ namespace
         ++model.samples;
     }
 
-    /// The number @p reading holds for @p field.
-    ///
-    /// A `Number` cell and a `Text` cell alike, because which kind a figure arrives as depends on
-    /// the source that reported it. Named kinds rather than excluded ones, so a kind added later is
-    /// no number until somebody says it is. Text that is not a finite number is no number either.
-    /// @param reading The reading, or nullopt where there was none.
-    /// @param field The field's name.
-    /// @return The number, or nullopt.
-    [[nodiscard]] std::optional<double> NumberOf(std::optional<Value> const& reading, std::string_view field)
-    {
-        if (!reading.has_value())
-            return std::nullopt;
-        auto const* found = FindField(*reading, field);
-        if (found == nullptr || (found->value.kind != CellKind::Number && found->value.kind != CellKind::Text))
-            return std::nullopt;
-        auto parsed = 0.0;
-        if (!ParseFiniteDouble(found->value.lexical, parsed))
-            return std::nullopt;
-        return parsed;
-    }
-
     /// The rate of @p field over the interval from @p before to @p entry, per second.
     /// @param before The entry the interval starts at.
     /// @param entry The entry the interval ends at.
@@ -142,14 +121,27 @@ namespace
         // divide by zero: the fold never records one, and this function does not rely on that.
         if (!entry.elapsed.has_value() || entry.elapsed->count() <= 0)
             return std::nullopt;
-        auto const from = NumberOf(before.reading, field);
-        auto const to = NumberOf(entry.reading, field);
+        auto const from = NumberIn(before.reading, field);
+        auto const to = NumberIn(entry.reading, field);
         if (!from.has_value() || !to.has_value() || *to < *from)
             return std::nullopt;
         return (*to - *from) / std::chrono::duration<double> { *entry.elapsed }.count();
     }
 
 } // namespace
+
+std::optional<double> NumberIn(std::optional<Value> const& reading, std::string_view field)
+{
+    if (!reading.has_value())
+        return std::nullopt;
+    auto const* found = FindField(*reading, field);
+    if (found == nullptr || (found->value.kind != CellKind::Number && found->value.kind != CellKind::Text))
+        return std::nullopt;
+    auto parsed = 0.0;
+    if (!ParseFiniteDouble(found->value.lexical, parsed))
+        return std::nullopt;
+    return parsed;
+}
 
 std::vector<std::optional<double>> CounterRateSeries(std::deque<HistoryEntry> const& history, std::string_view field)
 {
