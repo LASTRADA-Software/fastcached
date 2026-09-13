@@ -164,13 +164,17 @@ Task<DashboardExit> RunDashboard(
                 break;
 
             case DashboardEventKind::Key:
-                if (IsQuitKey(event.keys))
-                {
-                    exit.stop = DashboardStop::Quit;
-                    events->Close();
-                    co_return exit;
-                }
-                break;
+                if (!IsQuitKey(event.keys))
+                    break;
+                [[fallthrough]];
+
+            case DashboardEventKind::StopRequested:
+                // Two routes to one stop, and neither reads the other's fields: a quit KEY is
+                // judged by its bytes, a stop REQUEST carries none. The run's outcome is not
+                // touched -- a stop after one reading is still that reading's success.
+                exit.stop = DashboardStop::Quit;
+                events->Close();
+                co_return exit;
 
             case DashboardEventKind::Resize:
                 exit.model.columns = event.columns;
