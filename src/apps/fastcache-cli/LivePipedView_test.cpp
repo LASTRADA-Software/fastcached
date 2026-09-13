@@ -54,11 +54,11 @@ class StreamSink final: public IFrameSink
 
 /// A stats round `ChooseStats` accepts, with the fields named.
 /// @param fields The record's fields, in order.
+/// @param origin The source that answered.
 /// @return One attempt carrying them.
-[[nodiscard]] std::vector<StatsAttempt> ReadingOf(std::vector<Field> fields)
+[[nodiscard]] std::vector<StatsAttempt> ReadingOf(std::vector<Field> fields, StatsOrigin origin = StatsOrigin::Info)
 {
-    return { StatsAttempt {
-        .origin = StatsOrigin::Info, .asked = true, .record = RecordValue(std::move(fields)), .note = {} } };
+    return { StatsAttempt { .origin = origin, .asked = true, .record = RecordValue(std::move(fields)), .note = {} } };
 }
 
 /// The ordinary reading these cases stream: two counters.
@@ -334,6 +334,38 @@ namespace
     });
 }
 
+/// A cache daemon's `/metrics` at one moment, carrying @p tiers.
+/// @param items Every tier's item count; its bytes used are a hundred times that.
+/// @param tiers The `StorageTierTable` names the reading carries.
+/// @return The attempts.
+[[nodiscard]] std::vector<StatsAttempt> TieredAt(std::uint64_t items, std::vector<std::string_view> const& tiers)
+{
+    auto fields = std::vector<Field> { Field { .name = "fastcached_items", .value = NumberCell(items) } };
+    for (auto const tier: tiers)
+    {
+        fields.push_back(Field { .name = TierSeriesName("fastcached_tier_items", tier), .value = NumberCell(items) });
+        fields.push_back(
+            Field { .name = TierSeriesName("fastcached_tier_bytes_used", tier), .value = NumberCell(items * 100) });
+    }
+    return ReadingOf(std::move(fields), StatsOrigin::Metrics);
+}
+
+/// The cell under @p name in @p row, failing the case when the header names no such column.
+/// @param header The header's fields.
+/// @param row A row's fields.
+/// @param name The column.
+/// @return The cell's text.
+[[nodiscard]] std::string CellUnder(std::vector<std::string> const& header,
+                                    std::vector<std::string> const& row,
+                                    std::string_view name)
+{
+    auto const found = std::ranges::find(header, name);
+    REQUIRE(found != header.end());
+    auto const index = static_cast<std::size_t>(found - header.begin());
+    REQUIRE(index < row.size());
+    return row[index];
+}
+
 constexpr auto WholeRate = FigureSpec { .field = { .metrics = "a_total", .nodeMetrics = {}, .info = {} } };
 constexpr auto BesideNamed = std::array { BesideFigure { .key = "b", .figure = WholeRate } };
 constexpr auto BesideUnnamed = std::array { BesideFigure { .key = "", .figure = WholeRate } };
@@ -347,6 +379,10 @@ constexpr auto RatesRepeating =
 constexpr auto LevelsLimitNamed =
     std::array { LevelRow { .label = "c", .key = "c", .value = WholeRate, .limit = WholeRate, .limitKey = "c_limit" } };
 constexpr auto LevelsRepeatingARate = std::array { LevelRow { .label = "c", .key = "b", .value = WholeRate } };
+// `<tier>_<key>` for `TiersNamed`'s column in each tier: a figure key a program could not tell apart.
+constexpr auto LevelsNamingAMemoryTierFigure =
+    std::array { LevelRow { .label = "c", .key = "memory_a", .value = WholeRate } };
+constexpr auto LevelsNamingADiskTierFigure = std::array { LevelRow { .label = "c", .key = "disk_a", .value = WholeRate } };
 constexpr auto LevelsLimitUnnamed =
     std::array { LevelRow { .label = "c", .key = "c", .value = WholeRate, .limit = WholeRate } };
 constexpr auto LevelsKeyWithoutLimit =
@@ -385,6 +421,24 @@ TEST_CASE("a panel names every figure once for a program and never by its label"
     STATIC_REQUIRE_FALSE(PanelKeysAreWhole(SpecOf(RatesNamed, LevelsKeyWithoutLimit, TiersNamed)));
     STATIC_REQUIRE_FALSE(PanelKeysAreWhole(SpecOf(RatesNamed, LevelsLimitNamed, TiersUnnamed)));
     STATIC_REQUIRE_FALSE(PanelKeysAreWhole(SpecOf(RatesNamed, LevelsLimitNamed, TiersRepeating)));
+
+    // A figure key spelling a tier figure's name is refused in every tier, and only because a tier
+    // column makes it one: without the column the same key is an ordinary name.
+    STATIC_REQUIRE(PanelKeysAreWhole(SpecOf(RatesNamed, LevelsNamingAMemoryTierFigure, {})));
+    STATIC_REQUIRE_FALSE(PanelKeysAreWhole(SpecOf(RatesNamed, LevelsNamingAMemoryTierFigure, TiersNamed)));
+    STATIC_REQUIRE_FALSE(PanelKeysAreWhole(SpecOf(RatesNamed, LevelsNamingADiskTierFigure, TiersNamed)));
+}
+
+TEST_CASE("a tier figure's machine name is the tier and the column key joined, and nothing else is",
+          "[cli][live][piped][figures]")
+{
+    CHECK(TierFigureKey("disk", "bytes_used") == "disk_bytes_used");
+    CHECK(IsTierFigureKey(TierFigureKey("disk", "bytes_used"), "disk", "bytes_used"));
+    CHECK_FALSE(IsTierFigureKey("disk_bytes_used", "disk", "bytes"));
+    CHECK_FALSE(IsTierFigureKey("disk_bytes_used", "memory", "bytes_used"));
+    CHECK_FALSE(IsTierFigureKey("diskXbytes_used", "disk", "bytes_used"));
+    CHECK_FALSE(IsTierFigureKey("bytes_used_disk", "disk", "bytes_used"));
+    CHECK_FALSE(IsTierFigureKey("disk_x_bytes_used", "disk", "bytes_used"));
 }
 
 TEST_CASE("a piped cache and node stream name exactly the figures their panels draw", "[cli][live][piped][figures]")
@@ -470,4 +524,61 @@ TEST_CASE("a piped cache row reports the panel's figures unformatted, absent unt
     CHECK(cell(second, "hit_rate") == "0.9000");
     CHECK(cell(second, "ops_per_sec") == "250.000");
     CHECK(cell(second, "bytes_used") == "5120");
+}
+
+TEST_CASE("a piped cache header waits for a successful reading and names exactly the tiers it carried",
+          "[cli][live][piped][figures]")
+{
+    // The tiers are known only from a reading, so the header is written from the first one that
+    // succeeded -- never before it, which would have to guess them.
+    std::vector<DashboardEvent> script;
+    AddFailure(script);
+    AddSample(script, 1, TieredAt(10, { "memory", "disk" }));
+    AddSample(script, 2, TieredAt(20, { "memory" }));
+
+    auto const lines = Lines(Stream(std::move(script), OutputFormat::Tsv, {}, std::nullopt, &CacheFigures));
+    REQUIRE(lines.size() == 3);
+    auto const header = Fields(lines[0]);
+    auto const first = Fields(lines[1]);
+    auto const second = Fields(lines[2]);
+
+    // After the panel's own fifteen, tier by tier in `StorageTierTable` order, column by column.
+    REQUIRE(header.size() == 25);
+    CHECK(std::vector<std::string>(header.begin() + 15, header.end())
+          == std::vector<std::string> { "memory_items",
+                                        "memory_bytes_used",
+                                        "memory_bytes_limit",
+                                        "memory_evictions_per_sec",
+                                        "memory_index_bytes",
+                                        "disk_items",
+                                        "disk_bytes_used",
+                                        "disk_bytes_limit",
+                                        "disk_evictions_per_sec",
+                                        "disk_index_bytes" });
+    CHECK(first.size() == header.size());
+    CHECK(second.size() == header.size());
+
+    CHECK(CellUnder(header, first, "memory_items") == "10");
+    CHECK(CellUnder(header, first, "disk_bytes_used") == "1000");
+    // A reading that does not carry a figure has it absent, never zero.
+    CHECK(CellUnder(header, first, "disk_bytes_limit").empty());
+    // A tier the header named that a later reading lacks is absent under its heading.
+    CHECK(CellUnder(header, second, "memory_items") == "20");
+    CHECK(CellUnder(header, second, "disk_items").empty());
+}
+
+TEST_CASE("a tier that first appears after the piped header gains no column", "[cli][live][piped][figures]")
+{
+    std::vector<DashboardEvent> script;
+    AddSample(script, 1, TieredAt(10, { "memory" }));
+    AddSample(script, 2, TieredAt(20, { "memory", "disk" }));
+
+    auto const lines = Lines(Stream(std::move(script), OutputFormat::Tsv, {}, std::nullopt, &CacheFigures));
+    REQUIRE(lines.size() == 3);
+    auto const header = Fields(lines[0]);
+    CHECK(header.size() == 20);
+    CHECK(header.back() == "memory_index_bytes");
+    CHECK(std::ranges::none_of(header, [](std::string const& name) { return name.starts_with("disk_"); }));
+    CHECK(Fields(lines[2]).size() == header.size());
+    CHECK(CellUnder(header, Fields(lines[2]), "memory_items") == "20");
 }
