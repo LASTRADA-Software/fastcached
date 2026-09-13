@@ -278,6 +278,19 @@ set(FastCachedIstreambufCases
     "doc comment is not a use|newfile|src/FastCache/Core/Note.cpp|/// Deliberately NOT through `std::istreambuf_iterator`.~n~int Note() { return 0~sc~ }~n~|all prose, none constructing|CMake Error"
     "block comment is not a use|newfile|src/FastCache/Core/Note.cpp|/*~n~ A paragraph mentioning std::istreambuf_iterator with no leading stars.~n~*/~n~int Note() { return 0~sc~ }~n~|all prose, none constructing|CMake Error"
 
+    # COMMENT ORDERING, and the first of these is the false green it was: the `/*`
+    # test ran BEFORE `//` was stripped, so a line comment NAMING a block opener
+    # opened one that no `*/` ever closed -- every remaining line of that file
+    # skipped, while the run still printed a clean count over lines it never read.
+    # The use one line below it was invisible.
+    "a line comment naming a block opener does not open one|newfile|src/FastCache/Core/Order.cpp|// Never std::istreambuf_iterator, and not inside a /* block either.~n~std::vector<char> Read(std::ifstream& in) { return { std::istreambuf_iterator<char> { in }, {} }~sc~ }~n~|src/FastCache/Core/Order.cpp:2: constructs from|-"
+
+    # ...and the CONTROL, which is what stops the repair from being *ignore block
+    # comments*: a `//` inside an open block stays inside it, so line 2 is never
+    # named, and the file RESUMES after `*/`, so line 4 is. Both halves are needed --
+    # a reader that dropped block tracking passes the case above.
+    "a block comment survives a line marker inside it|newfile|src/FastCache/Core/Order.cpp|/*~n~ Prose with a // in it, naming std::istreambuf_iterator to argue against.~n~*/~n~std::vector<char> Read(std::ifstream& in) { return { std::istreambuf_iterator<char> { in }, {} }~sc~ }~n~|src/FastCache/Core/Order.cpp:4: constructs from|Order.cpp:2"
+
     # THE PARTIAL-FIX SHAPE: a file that explains the rule AND breaks it. Refused --
     # a prose mention must not excuse the file it sits in.
     "prose and a use in one file|newfile|src/FastCache/Core/Both.cpp|// Never std::istreambuf_iterator: GCC reports null-dereference.~n~#include <vector>~n~std::vector<char> Read(std::ifstream& in)~n~{~n~    return { std::istreambuf_iterator<char> { in }, {} }~sc~~n~}~n~|src/FastCache/Core/Both.cpp:5: constructs from|-"
@@ -376,6 +389,18 @@ if(caseCount EQUAL 0)
         "what a green run with no cases looks like")
 endif()
 
+# TWO DIFFERENT THINGS ARE BEING COUNTED, and the wording says so.
+#
+# `caseCount` is rows of the table; `failures` is MESSAGES, and one case appends
+# one per unmet needle plus possibly a verdict line. So a single case failing three
+# needles used to render `3 of 1 case(s)` -- a number nobody can explain, under a
+# phrasing that asserts the two count the same thing.
+#
+# NOT fixed by clamping the first number to the second: that restores a plausible
+# figure by hiding the mismatch, which is the same move as clamping a negative
+# interval and is already paid for in this tree. The counts are honest and the
+# preposition carries the difference -- findings ACROSS cases, never findings OF
+# cases. Matches `markup-entities-selftest` and `cli-text-cell-selftest`.
 if(failures)
     list(LENGTH failures failureCount)
     message("")
@@ -387,7 +412,7 @@ if(failures)
     message("A check nobody has watched refuse is not a check -- and one nobody has")
     message("watched stay QUIET over prose is one that gets deleted.")
     message(FATAL_ERROR
-        "istreambuf-iterator-selftest: ${failureCount} of ${caseCount} case(s) disagreed with the check")
+        "istreambuf-iterator-selftest: ${failureCount} finding(s) across ${caseCount} case(s)")
 endif()
 
 message(STATUS "istreambuf-iterator-selftest: ${caseCount} case(s), every verdict as documented")
