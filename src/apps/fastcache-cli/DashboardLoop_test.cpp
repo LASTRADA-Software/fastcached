@@ -299,8 +299,9 @@ TEST_CASE("a sample budget of N takes exactly N readings", "[cli][dashboard]")
     CHECK(exit.stop == DashboardStop::SampleBudget);
     CHECK(exit.model.samples == 2);
 
-    // And a FAILED round does not spend the budget, or a flapping source ends the run
-    // early while reporting it completed normally.
+    // And a FAILED sample spends the budget as a reading does: `--samples=N` counts samples
+    // taken, so a flapping source ends at N as well. The control for the all-failing case below:
+    // one reading among the N keeps the run `Affirmative`.
     auto second = RecordingView {};
     auto secondSink = CollectingSink {};
     auto const withGap =
@@ -311,7 +312,9 @@ TEST_CASE("a sample budget of N takes exactly N readings", "[cli][dashboard]")
               second,
               secondSink);
     CHECK(withGap.stop == DashboardStop::SampleBudget);
-    CHECK(withGap.model.samples == 2);
+    CHECK(withGap.outcome == Outcome::Affirmative);
+    CHECK(withGap.model.attempts == 2);
+    CHECK(withGap.model.samples == 1);
 }
 
 TEST_CASE("a quit arriving mid-fetch ends the run and closes the source", "[cli][dashboard]")
@@ -909,4 +912,50 @@ TEST_CASE("the history keeps its bound by dropping the oldest samples", "[cli][d
     CHECK(!rates.front().has_value());
     REQUIRE(rates[1].has_value());
     CHECK(Unwrap(rates[1]) == 1.0);
+}
+
+TEST_CASE("a run whose every sample fails still ends at its sample budget", "[cli][dashboard]")
+{
+    // Measured before this case existed: `live-stats --samples=3` against an endpoint whose every
+    // sample failed never ended. §9.16 bounds a run by samples TAKEN, and §9.17's never-answered
+    // exit code is reachable only if a failure spends the budget.
+    //
+    // WHAT DISTINGUISHES: the run stops at the budget with `SampleBudget` -- not by the script
+    // running out, which the rig reports as `SourceDetached` rather than hanging -- carries the
+    // MOST RECENT failure's outcome, and draws the frame the last sample was owed. Both failure
+    // routes spend it: a `SampleFailed` and a `Sample` its reader could not read.
+    auto view = RecordingView {};
+    auto sink = CollectingSink {};
+    auto const exit =
+        Drive({ DashboardEvent { .kind = DashboardEventKind::SampleFailed, .outcome = Outcome::Unreachable },
+                DashboardEvent { .kind = DashboardEventKind::Sample, .at = At(1), .attempts = NothingAnswered() },
+                DashboardEvent { .kind = DashboardEventKind::SampleFailed, .outcome = Outcome::Refused },
+                DashboardEvent { .kind = DashboardEventKind::SampleFailed, .outcome = Outcome::Unreachable },
+                DashboardEvent { .kind = DashboardEventKind::SampleFailed, .outcome = Outcome::Unreachable } },
+              DashboardLimits { .samples = 3 },
+              view,
+              sink);
+
+    CHECK(exit.stop == DashboardStop::SampleBudget);
+    CHECK(exit.outcome == Outcome::Refused);
+    CHECK(exit.model.attempts == 3);
+    CHECK(exit.model.samples == 0);
+    CHECK(sink.frames.size() == 1);
+}
+
+TEST_CASE("a sample its reader could not read says why", "[cli][dashboard]")
+{
+    // Whoever reports a failed sample needs the decision's account, and must not run the decision
+    // again to get it. WHAT DISTINGUISHES: the note carries the conclusion AND the source's own
+    // reason, and a reading carries none -- or "always say something" passes the first half.
+    auto const failed =
+        ReadStatsSample(DashboardEvent { .kind = DashboardEventKind::Sample, .at = At(1), .attempts = NothingAnswered() });
+    CHECK(failed.outcome == Outcome::Unreachable);
+    CHECK(failed.note.contains("no stats source answered"));
+    CHECK(failed.note.contains("refused"));
+
+    auto const read =
+        ReadStatsSample(DashboardEvent { .kind = DashboardEventKind::Sample, .at = At(1), .attempts = Reading(10) });
+    CHECK(read.outcome == Outcome::Affirmative);
+    CHECK(read.note.empty());
 }
