@@ -37,7 +37,7 @@ Both repositories are Apache-2.0, and so is this copy. `endo/tui` was last touch
 upstream at `37d875f8` (2026-08-15).
 
 `src/tui` upstream is 154 files and ~46k lines; with the nineteen supporting files below and
-three local changes' new test files ("Local changes") the copy is **176 files, 49,443 lines**.
+three local changes' new test files ("Local changes") the copy is **176 files, 49,467 lines**.
 
 ## The nineteen supporting files
 
