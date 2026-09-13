@@ -10,6 +10,7 @@
 #include <chrono>
 #include <format>
 #include <optional>
+#include <ranges>
 #include <string>
 #include <vector>
 
@@ -728,4 +729,244 @@ TEST_CASE("a stop request ends the run as a quit and is not a keystroke", "[cli]
     CHECK(keyed.stop == DashboardStop::Quit);
     CHECK(keyed.outcome == Outcome::Affirmative);
     CHECK(keySink.frames.size() == 1);
+}
+
+namespace
+{
+
+/// The field every `Reading` carries.
+constexpr std::string_view Counter = "curr_connections";
+
+/// A `Sample` carrying one `Counter` reading, taken @p seconds in.
+/// @param value What it reads.
+/// @param seconds When it was taken.
+/// @return The event.
+[[nodiscard]] DashboardEvent SampleAt(std::int64_t value, int seconds)
+{
+    return DashboardEvent { .kind = DashboardEventKind::Sample, .at = At(seconds), .attempts = Reading(value) };
+}
+
+/// A `SampleFailed`, taken @p seconds in.
+/// @param seconds When it was attempted.
+/// @return The event.
+[[nodiscard]] DashboardEvent FailedAt(int seconds)
+{
+    return DashboardEvent { .kind = DashboardEventKind::SampleFailed, .at = At(seconds), .outcome = Outcome::Refused };
+}
+
+/// Drive @p script and hand back the model the run ended with.
+/// @param script The events.
+/// @return The final model.
+[[nodiscard]] DashboardModel FinalModel(std::vector<DashboardEvent> script)
+{
+    auto view = RecordingView {};
+    auto sink = CollectingSink {};
+    return Drive(std::move(script), DashboardLimits {}, view, sink).model;
+}
+
+/// The rates of `Counter` over @p script's final history.
+/// @param script The events.
+/// @return One rate per history entry.
+[[nodiscard]] std::vector<std::optional<double>> RatesOf(std::vector<DashboardEvent> script)
+{
+    return CounterRateSeries(FinalModel(std::move(script)).history, Counter);
+}
+
+} // namespace
+
+TEST_CASE("both routes to a failed reading leave an entry with no reading in the history", "[cli][dashboard]")
+{
+    // A `SampleFailed` and a `Sample` its reader could not read are two routes to one outcome,
+    // and the history is a thing each must update. WHAT DISTINGUISHES: an empty entry at EACH
+    // route's own position. Neutering either route drops its entry and shifts every later
+    // index, so each has its own assertion rather than one count both could satisfy.
+    auto const model =
+        FinalModel({ SampleAt(10, 1),
+                     FailedAt(2),
+                     SampleAt(20, 3),
+                     DashboardEvent { .kind = DashboardEventKind::Sample, .at = At(4), .attempts = NothingAnswered() },
+                     SampleAt(30, 5) });
+
+    REQUIRE(model.history.size() == 5);
+    CHECK(model.history[0].reading.has_value());
+    CHECK(!model.history[1].reading.has_value()); // SampleFailed
+    CHECK(model.history[2].reading.has_value());
+    CHECK(!model.history[3].reading.has_value()); // nothing answered
+    CHECK(model.history[4].reading.has_value());
+}
+
+TEST_CASE("a gap and a steady counter are different cells", "[cli][dashboard]")
+{
+    // §9.2 at the model level: an absent rate and a rate of zero must stay two different
+    // things, or no renderer downstream could draw a space for one and a floor glyph for the
+    // other however it chose its glyphs.
+    //
+    // WHAT DISTINGUISHES: absent on the gapped side AND a present zero on the steady side.
+    // Asserting only that the gap is absent passes under a series that never reports a rate.
+    auto const gapped = RatesOf({ SampleAt(10, 1), FailedAt(2), SampleAt(10, 3) });
+    auto const steady = RatesOf({ SampleAt(10, 1), SampleAt(10, 2), SampleAt(10, 3) });
+    REQUIRE(gapped.size() == 3);
+    REQUIRE(steady.size() == 3);
+
+    CHECK(!gapped[1].has_value()); // the interval into the failure
+    CHECK(!gapped[2].has_value()); // and the one out of it
+    REQUIRE(steady[1].has_value());
+    CHECK(Unwrap(steady[1]) == 0.0);
+    REQUIRE(steady[2].has_value());
+    CHECK(Unwrap(steady[2]) == 0.0);
+}
+
+TEST_CASE("a counter that went down is a gap and the interval after it is a rate again", "[cli][dashboard]")
+{
+    // §9.3. A decrease is a restart: not a negative rate, and not a zero.
+    //
+    // WHAT DISTINGUISHES: the decreasing interval is ABSENT -- which fails both the naive
+    // subtraction (-50) and the clamp (0) -- and the interval after it is PRESENT, which fails
+    // a series that treats a restart as the end of the run.
+    auto const rates = RatesOf({ SampleAt(100, 1), SampleAt(50, 2), SampleAt(60, 3) });
+    REQUIRE(rates.size() == 3);
+    CHECK(!rates[1].has_value());
+    REQUIRE(rates[2].has_value());
+    CHECK(Unwrap(rates[2]) == 10.0);
+}
+
+TEST_CASE("one reading has no rate and a second reading has one", "[cli][dashboard]")
+{
+    // §9.1 at the model level. Both directions in one case, because a series that reports a
+    // rate from nothing passes a check on the second model alone.
+    auto const one = RatesOf({ SampleAt(10, 1) });
+    REQUIRE(one.size() == 1);
+    CHECK(!one[0].has_value());
+
+    auto const two = RatesOf({ SampleAt(10, 1), SampleAt(25, 2) });
+    REQUIRE(two.size() == 2);
+    CHECK(!two[0].has_value());
+    REQUIRE(two[1].has_value());
+    CHECK(Unwrap(two[1]) == 15.0);
+}
+
+TEST_CASE("a rate is divided by the elapsed time the fold measured", "[cli][dashboard]")
+{
+    // A rate over an interval nobody measured is a claim about the sampler's schedule, not the
+    // server. WHAT DISTINGUISHES: two intervals with the SAME change and different lengths give
+    // different rates. A series returning the change passes neither; one dividing by a nominal
+    // second passes the second interval and fails the first.
+    auto const rates = RatesOf({ SampleAt(10, 1), SampleAt(30, 5), SampleAt(50, 6) });
+    REQUIRE(rates.size() == 3);
+    REQUIRE(rates[1].has_value());
+    CHECK(Unwrap(rates[1]) == 5.0);
+    REQUIRE(rates[2].has_value());
+    CHECK(Unwrap(rates[2]) == 20.0);
+}
+
+TEST_CASE("an interval the run did not continue has no rate though the counter rose", "[cli][dashboard]")
+{
+    // The run rule decides the history's intervals, not a second rule in the series. Every
+    // counter here rises, so a decrease cannot be why an interval is absent -- only a change of
+    // source or a stamp no later than the one before can.
+    //
+    // WHAT DISTINGUISHES: the interval at the break is absent AND the interval after it, from
+    // the same source with a later stamp, is present again.
+    auto const switched = RatesOf(
+        { DashboardEvent {
+              .kind = DashboardEventKind::Sample, .at = At(1), .attempts = ReadingFrom(StatsOrigin::Metrics, 10) },
+          DashboardEvent {
+              .kind = DashboardEventKind::Sample, .at = At(2), .attempts = ReadingFrom(StatsOrigin::Metrics, 20) },
+          DashboardEvent { .kind = DashboardEventKind::Sample, .at = At(3), .attempts = ReadingFrom(StatsOrigin::Info, 30) },
+          DashboardEvent {
+              .kind = DashboardEventKind::Sample, .at = At(4), .attempts = ReadingFrom(StatsOrigin::Info, 40) } });
+    REQUIRE(switched.size() == 4);
+    REQUIRE(switched[1].has_value());
+    CHECK(Unwrap(switched[1]) == 10.0);
+    CHECK(!switched[2].has_value()); // the switch
+    REQUIRE(switched[3].has_value());
+    CHECK(Unwrap(switched[3]) == 10.0);
+
+    auto const stalled = RatesOf({ SampleAt(10, 5), SampleAt(20, 5), SampleAt(30, 6) });
+    REQUIRE(stalled.size() == 3);
+    CHECK(!stalled[1].has_value()); // the same instant
+    REQUIRE(stalled[2].has_value());
+    CHECK(Unwrap(stalled[2]) == 10.0);
+}
+
+TEST_CASE("the newest history entry agrees with BrokenRun at every frame", "[cli][dashboard]")
+{
+    // The history's intervals and `runLength` are two representations of one decision. This is
+    // the case that keeps them one: at every frame, the newest entry carries a measured interval
+    // exactly when `BrokenRun()` says a rate may be drawn. The script walks every way a run
+    // breaks -- both failure routes, a change of source and a stalled stamp.
+    auto const tick = DashboardEvent { .kind = DashboardEventKind::Tick };
+    auto metrics = [](std::int64_t value, int seconds) {
+        return DashboardEvent { .kind = DashboardEventKind::Sample,
+                                .at = At(seconds),
+                                .attempts = ReadingFrom(StatsOrigin::Metrics, value) };
+    };
+
+    auto view = RecordingView {};
+    auto sink = CollectingSink {};
+    (void) Drive({ tick, SampleAt(10, 1),
+                   tick, SampleAt(20, 2),
+                   tick, FailedAt(3),
+                   tick, SampleAt(30, 4),
+                   tick, SampleAt(40, 5),
+                   tick, DashboardEvent { .kind = DashboardEventKind::Sample, .at = At(6), .attempts = NothingAnswered() },
+                   tick, SampleAt(50, 7),
+                   tick, SampleAt(60, 8),
+                   tick, metrics(70, 9),
+                   tick, metrics(80, 10),
+                   tick, metrics(90, 10),
+                   tick, metrics(100, 11),
+                   tick },
+                 DashboardLimits {},
+                 view,
+                 sink);
+
+    auto measured = std::size_t { 0 };
+    auto broken = std::size_t { 0 };
+    for (auto const& model: view.seen)
+    {
+        auto const newestMeasured = !model.history.empty() && model.history.back().elapsed.has_value();
+        INFO("history " << model.history.size() << " runLength " << model.runLength);
+        CHECK(newestMeasured == !model.BrokenRun());
+        if (newestMeasured)
+            ++measured;
+        else
+            ++broken;
+    }
+
+    // The control. Equality holds vacuously over a run broken at every frame, so the script
+    // must have produced both kinds -- or the loop above tested one arm.
+    REQUIRE(view.seen.size() == 13);
+    CHECK(measured == 5);
+    CHECK(broken == 8);
+}
+
+TEST_CASE("the history keeps its bound by dropping the oldest samples", "[cli][dashboard]")
+{
+    // Bounded so a long session holds the same memory as a short one. WHAT DISTINGUISHES: WHICH
+    // end goes. A history that dropped its newest sample would hold the right count and a
+    // sparkline frozen at the moment it filled.
+    constexpr auto Extra = std::size_t { 3 };
+    auto script = std::vector<DashboardEvent> {};
+    for (auto const index: std::views::iota(std::size_t { 0 }, HistoryCapacity + Extra))
+        script.push_back(SampleAt(static_cast<std::int64_t>(index), static_cast<int>(index) + 1));
+
+    auto const model = FinalModel(std::move(script));
+
+    REQUIRE(model.history.size() == HistoryCapacity);
+    auto const* first = FindField(Unwrap(model.history.front().reading), Counter);
+    auto const* last = FindField(Unwrap(model.history.back().reading), Counter);
+    REQUIRE(first != nullptr);
+    REQUIRE(last != nullptr);
+    CHECK(first->value.lexical == std::to_string(Extra));
+    CHECK(last->value.lexical == std::to_string(HistoryCapacity + Extra - 1));
+
+    // The oldest entry kept continued its run, but the reading it was measured against has been
+    // dropped: no rate can be claimed for it, and the one after it has one.
+    CHECK(model.history.front().elapsed.has_value());
+    auto const rates = CounterRateSeries(model.history, Counter);
+    REQUIRE(rates.size() == HistoryCapacity);
+    CHECK(!rates.front().has_value());
+    REQUIRE(rates[1].has_value());
+    CHECK(Unwrap(rates[1]) == 1.0);
 }

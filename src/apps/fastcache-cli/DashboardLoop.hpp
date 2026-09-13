@@ -6,11 +6,14 @@
 #include "DashboardEvent.hpp"
 
 #include <FastCache/Async/Task.hpp>
+#include <FastCache/Core/Clock.hpp>
 
 #include <cstddef>
+#include <deque>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace FastCache::Cli
 {
@@ -33,6 +36,34 @@ struct ReadingStamp
     TimePoint at {};       ///< When it was taken, on the steady clock.
     std::string source {}; ///< Which source produced it, by stable name.
 };
+
+/// One point of the dashboard's sample history: a reading, or the fact that there was none.
+///
+/// **A failed sample is an entry, not a missing one.** The gap is the information: a history
+/// that dropped the failure would hold the readings either side of it as neighbours, and every
+/// trend drawn from it would join them as if the source had never gone away. §9.2's gap is only
+/// expressible because an element exists at its position and says *nothing was read*.
+struct HistoryEntry
+{
+    /// What was read, or nullopt where the sample produced no reading.
+    std::optional<Value> reading {};
+
+    /// How long the interval ending at this entry lasted, or nullopt where none was measured.
+    ///
+    /// **The fold's decision, recorded rather than re-derived.** Engaged exactly when this reading
+    /// continued the run of the entry before it -- the decision that moved `runLength` past one --
+    /// so a first reading, a failure, a change of source and a stamp no later than the one before
+    /// all leave it disengaged. A series that re-applied the run rule to stored stamps would be a
+    /// second copy of that rule, free to disagree with the first.
+    std::optional<Duration> elapsed {};
+};
+
+/// How many history entries the model keeps, oldest dropped first.
+///
+/// Bounded so a dashboard left open for days holds the same memory as one opened a minute ago.
+/// One entry is one sparkline cell, and §3's 80-column layout draws about thirty, so this is
+/// several screens' worth; a wider terminal draws the most recent entries that fit.
+inline constexpr std::size_t HistoryCapacity = 256;
 
 /// What the dashboard knows right now.
 ///
@@ -70,6 +101,14 @@ struct DashboardModel
     /// drawing a rate over an interval where the source was down. One counter, one rule.
     std::size_t runLength { 0 };
 
+    /// The recent samples, oldest first, a failure included as an entry with no reading.
+    ///
+    /// `latest` and `previous` answer *what is the value now*; this answers *what has it been
+    /// doing*, which is what a sparkline draws. The fold writes it in the same two helpers that
+    /// write `runLength`, so a reading and a failure reach both or neither, and a test holds the
+    /// newest entry's interval to `BrokenRun()` at every frame.
+    std::deque<HistoryEntry> history {};
+
     /// The terminal geometry, as last reported. Zero until a `Resize` says.
     int columns { 0 };
     int rows { 0 };
@@ -91,6 +130,28 @@ struct DashboardModel
         return runLength < 2;
     }
 };
+
+/// How fast one counter rose over the interval ending at each entry of @p history, per second.
+///
+/// **One element per ENTRY, oldest first**, so a panel draws one cell per sample and a cell sits
+/// at the same position in every row. A rate is present only when all three hold:
+///
+/// - **the fold measured the interval** (`HistoryEntry::elapsed`), which is `BrokenRun()`'s rule
+///   applied to every entry rather than only the newest -- so a failure costs TWO cells, the
+///   interval into it and the interval out of it, since neither was measured;
+/// - **both ends are in the window and read the field as a finite number**, so the oldest entry
+///   kept has no rate even where its run continued past the bound;
+/// - **the counter did not go DOWN.** A decrease is a restart and is a gap -- never a negative
+///   rate, and never clamped to zero, which would claim the server did nothing (§9.3).
+///
+/// Divided by the MEASURED elapsed time rather than the nominal interval, so a sampler that fell
+/// behind draws the rate that happened rather than one inflated by how far behind it was.
+///
+/// @param history The samples, oldest first.
+/// @param field The counter's field name, as the reading spells it.
+/// @return Events per second per entry; nullopt where no rate can be claimed.
+[[nodiscard]] std::vector<std::optional<double>> CounterRateSeries(std::deque<HistoryEntry> const& history,
+                                                                   std::string_view field);
 
 /// Why the loop stopped.
 ///
