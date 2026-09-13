@@ -50,7 +50,18 @@ namespace
     {
         std::optional<std::expected<LiveSessionRun, Answer>> run {}; ///< How it ended, when it did not throw.
         std::exception_ptr failure {};                               ///< What it threw, when it did.
+        std::shared_ptr<ITerminalRestore> restore {};                ///< The acquired terminal's, or null.
     };
+
+    /// A session that never started.
+    /// @param answer Why.
+    /// @return The ending.
+    [[nodiscard]] SessionEnding RefusedEnding(Answer answer)
+    {
+        return SessionEnding {
+            .kind = SessionEndKind::Refused, .answer = std::move(answer), .line = {}, .restore = nullptr
+        };
+    }
 
     /// Run a composed session on its reactor, and release @p done when it is over.
     ///
@@ -71,7 +82,7 @@ namespace
         co_await ResumeOn { *parts.reactor };
         try
         {
-            out->run = co_await RunComposedSession(std::move(parts), source);
+            out->run = co_await RunComposedSession(std::move(parts), source, &out->restore);
         }
         catch (...)
         {
@@ -82,7 +93,8 @@ namespace
 } // namespace
 
 Task<std::expected<LiveSessionRun, Answer>> RunComposedSession(LiveSessionParts parts,
-                                                               std::optional<LiveEventSource>* source)
+                                                               std::optional<LiveEventSource>* source,
+                                                               std::shared_ptr<ITerminalRestore>* restore)
 {
     auto run = LiveSessionRun {};
     auto const& subject = LiveSubjectTable[static_cast<std::size_t>(parts.plan.subject)];
@@ -112,6 +124,8 @@ Task<std::expected<LiveSessionRun, Answer>> RunComposedSession(LiveSessionParts 
                                       "redirected for one line per sample instead",
                                       started.error())));
         rung = ChooseRenderRung(started->capabilities);
+        // Kept apart from the events, and before anything else can go wrong: see the parameter.
+        *restore = std::move(started->restore);
         sourceParts.terminal = std::move(started->events);
         // The source owns the presenter beside the events, and releases it first: see
         // `LiveSourceParts::frames`.
@@ -215,7 +229,7 @@ SessionEnding RunLiveStatsSession(VerbContext const& context, LiveSessionSeat co
 {
     auto plan = AdmitLiveStats(context);
     if (!plan.has_value())
-        return SessionEnding { .kind = SessionEndKind::Refused, .answer = std::move(plan).error(), .line = {} };
+        return RefusedEnding(std::move(plan).error());
 
     auto const& subject = LiveSubjectTable[static_cast<std::size_t>(plan->subject)];
 
@@ -224,27 +238,15 @@ SessionEnding RunLiveStatsSession(VerbContext const& context, LiveSessionSeat co
     // this subject's samples go through and of no other, so a fleet session is not refused for
     // a stats ladder it never reads.
     if (subject.document.empty() && context.stats == nullptr)
-        return SessionEnding {
-            .kind = SessionEndKind::Refused,
-            .answer = Concluded(Outcome::Unreachable,
-                                std::string { WireTable[static_cast<std::size_t>(Wire::Stats)].unavailable }),
-            .line = {},
-        };
+        return RefusedEnding(
+            Concluded(Outcome::Unreachable, std::string { WireTable[static_cast<std::size_t>(Wire::Stats)].unavailable }));
     if (!subject.document.empty() && context.admin == nullptr)
-        return SessionEnding {
-            .kind = SessionEndKind::Refused,
-            .answer = Concluded(Outcome::Usage, std::string { NoAdminSurface }),
-            .line = {},
-        };
+        return RefusedEnding(Concluded(Outcome::Usage, std::string { NoAdminSurface }));
     if (subject.reader == nullptr)
-        return SessionEnding {
-            .kind = SessionEndKind::Refused,
-            .answer = Concluded(Outcome::Local,
-                                std::format("live-stats {} cannot stream from this build: its sessions do not "
-                                            "sample the leader's admin document yet",
-                                            subject.key)),
-            .line = {},
-        };
+        return RefusedEnding(Concluded(Outcome::Local,
+                                       std::format("live-stats {} cannot stream from this build: its sessions do not "
+                                                   "sample the leader's admin document yet",
+                                                   subject.key)));
 
     auto const endpoint = plan->endpoint;
     auto parts = LiveSessionParts {
@@ -274,7 +276,7 @@ SessionEnding RunLiveStatsSession(VerbContext const& context, LiveSessionSeat co
     done.acquire();
 
     if (result.run.has_value() && !result.run->has_value())
-        return SessionEnding { .kind = SessionEndKind::Refused, .answer = std::move(*result.run).error(), .line = {} };
+        return RefusedEnding(std::move(*result.run).error());
 
     // Closed by the composition on every way out, so what is left is waiting for what was
     // still running when it closed -- here, off the reactor, which must keep turning for it.
@@ -291,10 +293,22 @@ SessionEnding RunLiveStatsSession(VerbContext const& context, LiveSessionSeat co
     if (abandoned.has_value())
         return SessionEnding { .kind = SessionEndKind::Abandoned,
                                .answer = std::move(answer),
-                               .line = *std::move(abandoned) };
+                               .line = *std::move(abandoned),
+                               .restore = std::move(result.restore) };
     if (result.failure)
         std::rethrow_exception(result.failure);
-    return SessionEnding { .kind = SessionEndKind::Ran, .answer = std::move(answer), .line = {} };
+    // Ran: the caller destroys the source, whose events put the terminal back themselves.
+    return SessionEnding { .kind = SessionEndKind::Ran, .answer = std::move(answer), .line = {}, .restore = nullptr };
+}
+
+void EndAbandonedSession(SessionEnding const& ending, IAbandonedExit& exit)
+{
+    assert(ending.kind == SessionEndKind::Abandoned);
+    if (ending.restore != nullptr)
+        ending.restore->RestoreNow();
+    exit.Flush();
+    exit.Say(ending.answer, ending.line);
+    exit.Exit(ExitCodeOf(ending.answer.outcome));
 }
 
 } // namespace FastCache::Cli
