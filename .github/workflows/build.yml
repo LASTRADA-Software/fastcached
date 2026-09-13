@@ -729,9 +729,10 @@ jobs:
       # errors that made issue #84 were clang-tidy findings rather than compile
       # failures, so this is the only job in the workflow that can see them.
       #
-      # ENABLE_TIDY=OFF because nothing is built here — the preset's
-      # CMAKE_CXX_CLANG_TIDY would be inert, and leaving it on would say this job
-      # tidies through the build when it does not.
+      # ENABLE_TIDY=OFF because no translation unit is compiled here — the
+      # preset's CMAKE_CXX_CLANG_TIDY would be inert, and leaving it on would say
+      # this job tidies through the build when it does not. (The one target this
+      # job does build is a code generator; see the step after Configure.)
       #
       # CMAKE_CXX_SCAN_FOR_MODULES=OFF is NOT optional and NOT redundant. A
       # module-scanning generator writes `@…modmap` flags into the database that
@@ -744,6 +745,22 @@ jobs:
           cmake --preset clang-debug -DENABLE_TIDY=OFF
           -DCMAKE_CXX_SCAN_FOR_MODULES=OFF -DFASTCACHED_ENABLE_TLS=ON
           -DFASTCACHED_BUILD_BENCHMARKS=ON -DFASTCACHED_BUILD_TESTCLIENT=ON
+
+      # The sweep compiles nothing, and a unit can include a header only a BUILD
+      # writes. libunicode's tablegen writes `ucd_enums.h` and eight siblings into
+      # its own SOURCE directory, inside this job's CPM cache, and a cache that
+      # never saw a build does not carry them -- so `TerminalCellWidth.cpp` failed
+      # with "'libunicode/ucd_enums.h' file not found" and was reported as a unit
+      # that could not be preprocessed, never analysed.
+      #
+      # `unicode_ucd` is the target whose sources are that custom command's
+      # outputs, so building it runs the generator and compiles libunicode's table
+      # library, and nothing first-party. It is built rather than the unit
+      # excluded: excluding it sweeps less and says nothing. A developer machine
+      # does not see this, because a shared CPM cache that any build has touched
+      # already holds the generated files.
+      - name: "Generate the headers the swept units include"
+        run: cmake --build out/build/clang-debug --target unicode_ucd
 
       # Which translation units the sweep picks is the part of it that can fail
       # SILENTLY: it has no output of its own to be wrong in, it just sweeps too
