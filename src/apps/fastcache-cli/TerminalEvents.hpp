@@ -83,7 +83,9 @@ class ITerminalRestore
     ///   most once through this handle; once `events` has been destroyed -- which restores the
     ///   terminal itself -- a call does nothing.
     /// - **`noexcept`, and safe from any thread while a read is parked.** It touches process-wide
-    ///   terminal state and the output handle, never the event stream or its queue.
+    ///   terminal state and the output handle, never the event stream or its queue. It takes no lock
+    ///   against a frame being drawn, so a frame half-written at that moment may leave a stray
+    ///   fragment on screen; the modes are restored regardless.
     /// - **Needs no `Close()` first**, and does not close anything: the events go on existing, and
     ///   a caller that continues rather than exiting still has to close and destroy them.
     virtual void RestoreNow() noexcept = 0;
