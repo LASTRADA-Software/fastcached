@@ -183,10 +183,12 @@ std::optional<std::string> DrainSession(LiveEventSource const& source,
     return DescribeAbandonment(endpoint, since.has_value() ? std::optional<Duration> { wait.Now() - *since } : std::nullopt);
 }
 
-StandardRungViews::StandardRungViews(RenderOptions render, FigureProjection project):
+StandardRungViews::StandardRungViews(RenderOptions render, FigureProjection project, CellWidth cellWidth):
     _render { std::move(render) },
-    _project { project }
+    _project { project },
+    _cellWidth { cellWidth }
 {
+    assert(_cellWidth != nullptr && "a panel is laid out through the one width function the session is handed");
 }
 
 std::unique_ptr<IDashboardView> StandardRungViews::For(RenderRung rung, LivePlan const& plan, std::string_view address)
@@ -201,10 +203,12 @@ std::unique_ptr<IDashboardView> StandardRungViews::For(RenderRung rung, LivePlan
     // operator named one: the same text on every rung (§9.6).
     auto absent = _render.absentOverride.value_or(
         std::string { FormatTable[static_cast<std::size_t>(OutputFormat::Human)].absentText });
-    return std::make_unique<PanelView>(
-        panel(),
-        PanelContext {
-            .absent = std::move(absent), .endpoint = std::string { address }, .interval = plan.interval, .rung = rung });
+    return std::make_unique<PanelView>(panel(),
+                                       PanelContext { .absent = std::move(absent),
+                                                      .endpoint = std::string { address },
+                                                      .interval = plan.interval,
+                                                      .cellWidth = _cellWidth,
+                                                      .rung = rung });
 }
 
 SessionEnding RunLiveStatsSession(VerbContext const& context, LiveSessionSeat const& seat)
