@@ -342,6 +342,56 @@ TEST_CASE("a counter that went down draws a gap and the next interval draws a ra
     CHECK(SparkOf(Unwrap(after), "accepted").at(2) != " ");
 }
 
+TEST_CASE("a tier table keeps three blank cells between every pair of columns, heading and rows alike",
+          "[cli][dashboard][panel]")
+{
+    // §3: `tier      items        used       limit    evict/s   index (RAM)`. WHAT DISTINGUISHES: the heading and
+    // each row split at runs of THREE blanks into exactly one cell per column. With a one-cell gap the 11-cell
+    // `index (RAM)` joins `evict/s` in a 12-cell column, and a 10-cell `248.00 MiB` joins the figure before it,
+    // so the count comes out one short -- while every figure is still present, which a contains() check passes.
+    auto const cellsOf = [](std::string_view line) {
+        auto cells = std::vector<std::string> {};
+        auto cell = std::string {};
+        auto blanks = std::size_t { 0 };
+        for (auto const ch: line)
+        {
+            if (ch == ' ')
+            {
+                ++blanks;
+                continue;
+            }
+            if (blanks >= 3 && !cell.empty())
+                cells.push_back(std::exchange(cell, {}));
+            else if (!cell.empty())
+                cell.append(blanks, ' ');
+            blanks = 0;
+            cell += ch;
+        }
+        if (!cell.empty())
+            cells.push_back(std::move(cell));
+        return cells;
+    };
+
+    auto const frames = CacheFrames({ SampleOf(CacheSeries(1, { "memory", "disk" }), 1), Tick }, RenderRung::Unicode);
+    REQUIRE(frames.size() == 1);
+    auto const lines = Lines(frames.front());
+    auto const columns = CachePanel().tierColumns.size();
+    auto checked = std::size_t { 0 };
+    for (auto const& line: lines)
+    {
+        auto const name = Trimmed(Columns(line, LabelFrom, 8));
+        if (name != "tier" && name != "memory" && name != "disk")
+            continue;
+        INFO("line: " << line);
+        auto const cells = cellsOf(Columns(line, LabelFrom, FakeCellWidth(line) - LabelFrom - 2));
+        CHECK(cells.size() == columns + 1);
+        if (name == "tier")
+            CHECK(cells.back() == "index (RAM)");
+        ++checked;
+    }
+    CHECK(checked == 3);
+}
+
 TEST_CASE("a tier the endpoint does not run contributes no row", "[cli][dashboard][panel]")
 {
     // §9.5. WHAT DISTINGUISHES: the disk row is missing for a memory-only reading AND present for a

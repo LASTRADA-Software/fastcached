@@ -207,6 +207,9 @@ namespace
     /// Columns each tier figure is right-aligned into, at the least.
     constexpr auto TierFigureColumns = std::size_t { 12 };
 
+    /// Blank cells a tier column keeps before its widest cell, as §3's table separates every pair.
+    constexpr auto TierColumnGap = std::size_t { 3 };
+
     /// The indent every content line starts with.
     constexpr std::string_view Indent = "  ";
 
@@ -770,16 +773,17 @@ namespace
         if (tiers.empty())
             return items;
 
-        // Each column is as wide as its widest cell, so a figure is never cut to fit the column.
+        // Each column is as wide as its widest cell and the gap before it, so a figure is never cut to fit
+        // the column and no two columns read as one: `evict/s index (RAM)` is three headings or two.
         auto cells = std::vector<std::vector<std::string>>(tiers.size());
         auto widths = std::vector<std::size_t> {};
         for (auto const& column: spec.tierColumns)
         {
-            auto width = std::max(TierFigureColumns, in.cellWidth(column.header) + 1);
+            auto width = std::max(TierFigureColumns, in.cellWidth(column.header) + TierColumnGap);
             for (auto const index: std::views::iota(std::size_t { 0 }, tiers.size()))
             {
                 cells[index].push_back(FigureText(in, column.figure, Newest(SeriesFor(in, column.figure, tiers[index]))));
-                width = std::max(width, in.cellWidth(cells[index].back()) + 1);
+                width = std::max(width, in.cellWidth(cells[index].back()) + TierColumnGap);
             }
             widths.push_back(width);
         }
