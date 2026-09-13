@@ -142,6 +142,45 @@ namespace
         };
     }
 
+    /// An applier that parses `--interval`'s milliseconds into the verb options.
+    ///
+    /// Milliseconds rather than a duration with units, matching `--timeout` and
+    /// `--connect-timeout`: one convention in one tool, and there is no duration parser in
+    /// this tree to share. Whether the value is ALLOWED is not decided here -- that
+    /// depends on the subject, whose floor this parser cannot see.
+    /// @return The applier.
+    [[nodiscard]] constexpr auto AssignInterval() noexcept
+    {
+        return [](Command& command, std::string_view value) -> std::expected<void, ConfigError> {
+            auto const parsed = ParseCount(value);
+            if (!parsed.has_value())
+                return std::unexpected(parsed.error());
+            command.verbOptions.interval = std::chrono::milliseconds { *parsed };
+            return {};
+        };
+    }
+
+    /// An applier that parses `--samples` into the verb options.
+    ///
+    /// **Zero is refused here, not accepted as "none".** `DashboardLimits` spells *no
+    /// bound* as zero, so an accepted `--samples=0` would reach the loop meaning *run
+    /// forever* -- the opposite of what anybody typing it could want -- and nothing
+    /// downstream could tell the two apart.
+    /// @return The applier.
+    [[nodiscard]] constexpr auto AssignSamples() noexcept
+    {
+        return [](Command& command, std::string_view value) -> std::expected<void, ConfigError> {
+            auto const parsed = ParseCount(value);
+            if (!parsed.has_value())
+                return std::unexpected(parsed.error());
+            if (*parsed == 0)
+                return std::unexpected(
+                    ArgvError(ConfigErrorCode::OutOfRange, {}, "expected at least one sample; omit the flag for no bound"));
+            command.verbOptions.samples = static_cast<std::size_t>(*parsed);
+            return {};
+        };
+    }
+
     /// An applier that parses the AUTH username into the nested credential.
     /// @return The applier.
     [[nodiscard]] constexpr auto AssignUsername() noexcept
@@ -226,6 +265,17 @@ namespace
         { .primary = "--all",
           .apply = SetVerbFlag<&VerbOptions::everything>(),
           .description = "`flush` clears every database, not just the current one" },
+        { .primary = "--interval",
+          .arity = Arity::Value,
+          .operand = "=<ms>",
+          .apply = AssignInterval(),
+          .description = "`live-stats`: time between samples; each subject has\n"
+                         "its own default and its own floor" },
+        { .primary = "--samples",
+          .arity = Arity::Value,
+          .operand = "=<n>",
+          .apply = AssignSamples(),
+          .description = "`live-stats`: end after this many samples" },
         { .primary = "--connect-timeout",
           .arity = Arity::Value,
           .operand = "=<ms>",
@@ -342,6 +392,12 @@ namespace
         { .bit = Modifier::Exclusivity, .flag = "--xx", .given = &FlagGiven<&VerbOptions::onlyIfPresent> },
         { .bit = Modifier::Raw, .flag = "--raw", .given = &FlagGiven<&VerbOptions::raw> },
         { .bit = Modifier::Everything, .flag = "--all", .given = &FlagGiven<&VerbOptions::everything> },
+        { .bit = Modifier::Interval,
+          .flag = "--interval",
+          .given = [](VerbOptions const& options) { return options.interval.has_value(); } },
+        { .bit = Modifier::Samples,
+          .flag = "--samples",
+          .given = [](VerbOptions const& options) { return options.samples.has_value(); } },
     });
 
     /// One connection a verb's wire needs, and the word the help calls it.
