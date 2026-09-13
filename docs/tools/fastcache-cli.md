@@ -110,7 +110,7 @@ the help renders `Verbs()` grouped by `WireSpec::heading`, and
 
 | | |
 |---|---|
-| Read | `get`, `mget`, `exists`, `ttl`, `info`, `stats`, `version`, `ping`, `echo` |
+| Read | `get`, `mget`, `exists`, `ttl`, `info`, `stats`, `live-stats`, `version`, `ping`, `echo` |
 | Write | `set`, `del`, `incr`, `decr`, `incrby`, `decrby`, `expire`, `persist`, `flush` |
 | Read (memcached) | `gat`, `gats`, `inspect`, `mc-stats` |
 | Write (memcached) | `touch`, `add`, `replace`, `append`, `prepend`, `cas`, `cache-memlimit` |
