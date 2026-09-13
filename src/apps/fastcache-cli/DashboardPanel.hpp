@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <deque>
 #include <optional>
+#include <ranges>
 #include <span>
 #include <string>
 #include <string_view>
@@ -105,6 +106,7 @@ enum class Priority : std::uint8_t
 /// A figure written beside a row's own, with words around it.
 struct BesideFigure
 {
+    std::string_view key;                   ///< Its machine name; see `PanelKeysAreWhole`.
     std::string_view before {};             ///< Words before the value.
     FigureSpec figure {};                   ///< The value.
     std::string_view after {};              ///< Words after the value.
@@ -128,6 +130,7 @@ enum class Trend : std::uint8_t
 struct RateRow
 {
     std::string_view label;                    ///< What the figure is.
+    std::string_view key;                      ///< Its machine name; see `PanelKeysAreWhole`.
     FigureSpec figure;                         ///< The figure.
     std::span<BesideFigure const> beside {};   ///< Figures written after it.
     std::string_view note {};                  ///< Words written after those.
@@ -143,8 +146,10 @@ struct RateRow
 struct LevelRow
 {
     std::string_view label;                      ///< What the figure is.
+    std::string_view key;                        ///< Its machine name; see `PanelKeysAreWhole`.
     FigureSpec value;                            ///< The reading.
     std::optional<FigureSpec> limit {};          ///< What bounds it, drawn with a gauge and a percentage.
+    std::string_view limitKey {};                ///< The limit's machine name; named exactly when `limit` is.
     std::string_view note {};                    ///< Words written after it.
     Priority priority { Priority::Normal };      ///< When the whole row is dropped for height.
     Priority limitPriority { Priority::Normal }; ///< When the limit and the percentage are dropped for width.
@@ -159,6 +164,7 @@ struct LevelRow
 struct TierColumn
 {
     std::string_view header;                ///< The column's heading.
+    std::string_view key;                   ///< Its machine name, qualified by each tier; see `PanelKeysAreWhole`.
     FigureSpec figure;                      ///< The figure, per tier.
     Priority priority { Priority::Normal }; ///< When the column is dropped for width.
 };
@@ -196,6 +202,61 @@ struct PanelSize
 /// @param cellWidth How wide text is.
 /// @return The minimum size.
 [[nodiscard]] PanelSize MinimumPanelSize(PanelSpec const& spec, CellWidth cellWidth) noexcept;
+
+/// Call @p visit with every machine key @p panel's rate and level blocks name, in panel order.
+/// @param panel The panel.
+/// @param visit Called with each key.
+template <typename Visit>
+constexpr void ForEachFigureKey(PanelSpec const& panel, Visit const& visit)
+{
+    for (auto const& row: panel.rates)
+    {
+        visit(row.key);
+        for (auto const& beside: row.beside)
+            visit(beside.key);
+    }
+    for (auto const& row: panel.levels)
+    {
+        visit(row.key);
+        if (row.limit.has_value())
+            visit(row.limitKey);
+    }
+}
+
+/// Whether @p panel names every figure it draws for a program, once each.
+///
+/// **A figure's machine name is its own column, never derived from what a person reads**: a label
+/// reworded for the screen must not rename what a script reads, and the two change for different
+/// reasons. So every rate row, beside figure, level row, limit and tier column states a `key`, and
+/// this is the check that none is missing, none repeats within its block -- the rate and level
+/// keys are one namespace, the tier columns another, since a tier's figure is named per tier --
+/// and a level row's `limitKey` is named exactly when it has a limit. `static_assert`ed beside
+/// every panel, so a row added without one fails the build on every compiler.
+/// @param panel The panel.
+/// @return True when the keys are whole.
+[[nodiscard]] constexpr bool PanelKeysAreWhole(PanelSpec const& panel) noexcept
+{
+    auto whole = true;
+    auto position = std::size_t { 0 };
+    ForEachFigureKey(panel, [&panel, &whole, &position](std::string_view key) {
+        whole = whole && !key.empty();
+        auto earlier = std::size_t { 0 };
+        ForEachFigureKey(panel, [&whole, &earlier, position, key](std::string_view other) {
+            whole = whole && !(earlier < position && other == key);
+            ++earlier;
+        });
+        ++position;
+    });
+    for (auto const& row: panel.levels)
+        whole = whole && row.limit.has_value() == !row.limitKey.empty();
+    for (auto const index: std::views::iota(std::size_t { 0 }, panel.tierColumns.size()))
+    {
+        whole = whole && !panel.tierColumns[index].key.empty();
+        for (auto const earlier: std::views::iota(std::size_t { 0 }, index))
+            whole = whole && panel.tierColumns[earlier].key != panel.tierColumns[index].key;
+    }
+    return whole;
+}
 
 /// Everything a panel view is told rather than reads.
 ///
