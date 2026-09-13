@@ -83,6 +83,16 @@ struct WireSpec
     /// the verb's own page, where `NodeAnswerFor` states it in three values.
     std::string_view heading;
 
+    /// What a compile node does with every verb on this wire, or empty when it does
+    /// nothing with them.
+    ///
+    /// A COLUMN because *a node answers this* is a property of the wire, and the stats
+    /// wire is the case a special case missed: `NodeAnswerFor` knew the node wire by name
+    /// and a row by its `nodeFallback`, so `stats` and `live-stats` -- which a node answers
+    /// through its own counters -- read *refused by name* on their own pages. EMPTY is a
+    /// real answer, and a verb there may still carry a fallback of its own.
+    std::string_view nodeAnswer;
+
     WireAvailable available; ///< Which collaborator says this wire is open.
 
     /// What this wire can add when a value could not be shown as text.
@@ -204,6 +214,7 @@ inline constexpr EnumTable<Wire, WireSpec> WireTable { {
       .name = "resp",
       .unavailable = "no connection to the cache was opened",
       .heading = "a cache daemon, over RESP",
+      .nodeAnswer = "",
       .available = [](VerbContext const& context) { return context.resp != nullptr; },
       .binaryNote = "",
       .authenticable = true,
@@ -214,6 +225,7 @@ inline constexpr EnumTable<Wire, WireSpec> WireTable { {
       .name = "memcached",
       .unavailable = "no memcached-text connection to the cache was opened",
       .heading = "a cache daemon, over the memcached text protocol",
+      .nodeAnswer = "",
       .available = [](VerbContext const& context) { return context.memcached != nullptr; },
       .binaryNote = "a memcached key is a byte string, so this is ordinary rather than a fault",
       .authenticable = false,
@@ -224,6 +236,7 @@ inline constexpr EnumTable<Wire, WireSpec> WireTable { {
       .name = "node",
       .unavailable = "no 0xFC connection to the node was opened",
       .heading = "a compile node, over the 0xFC wire",
+      .nodeAnswer = "answered: this is a node verb",
       .available = [](VerbContext const& context) { return context.node != nullptr; },
       .binaryNote = "",
       // `AUTH` IS a `0xFC` verb, unlike on the memcached wire -- so this wire can
@@ -236,6 +249,7 @@ inline constexpr EnumTable<Wire, WireSpec> WireTable { {
       .name = "stats",
       .unavailable = "no stats source was configured",
       .heading = "either, over whichever surface answers",
+      .nodeAnswer = "answered: a compile node reports its own counters",
       .available = [](VerbContext const& context) { return context.stats != nullptr; },
       .binaryNote = "",
       .authenticable = true,
@@ -270,6 +284,21 @@ static_assert(RowsInEnumeratorOrder(WireTable, &WireSpec::wire),
 }
 
 static_assert(EveryWireIsHeaded(WireTable), "every Wire row must carry the heading --help groups its verbs under");
+
+/// Whether every wire a compile node answers opens a connection to one.
+///
+/// A page saying *answered* over a wire whose verbs never dial `0xFC` is the same
+/// confident wrong cell in the other direction: the operator is told the node answers,
+/// and the invocation never asks it.
+/// @param table The wire table.
+/// @return True when no row claims a node answer without needing the node.
+[[nodiscard]] consteval bool EveryNodeAnswerDialsTheNode(EnumTable<Wire, WireSpec> const& table) noexcept
+{
+    return std::ranges::none_of(table, [](WireSpec const& row) { return !row.nodeAnswer.empty() && !row.needsNode; });
+}
+
+static_assert(EveryNodeAnswerDialsTheNode(WireTable),
+              "a Wire row saying a compile node answers it must open the 0xFC connection");
 
 /// What a verb does.
 ///
