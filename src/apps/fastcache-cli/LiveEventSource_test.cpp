@@ -3,9 +3,14 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <chrono>
+#include <cstddef>
+#include <memory>
 #include <optional>
 #include <ranges>
+#include <utility>
+#include <vector>
 
 using namespace FastCache;
 using namespace FastCache::Cli;
@@ -397,6 +402,108 @@ TEST_CASE("a gather that could ask nothing is a failed sample rather than an emp
     CHECK((failed.has_value() && failed->at == rig.clock.Now()));
     // Still a frame owed: a gap is drawn.
     CHECK(KindOf(NextDue(rig, source)) == DashboardEventKind::Tick);
+
+    CloseAndDrain(rig, source);
+}
+
+namespace
+{
+
+/// Whether @p event is a sample the ladder read a record from.
+/// @param event The event.
+/// @return True for a sample with an answer in it.
+[[nodiscard]] bool Answered(std::optional<DashboardEvent> const& event)
+{
+    return event.has_value() && event->kind == DashboardEventKind::Sample
+           && ReadStatsSample(*event).outcome == Outcome::Affirmative;
+}
+
+/// Take the next sample: let the interval pass, run the gather, and read the sample and its tick.
+/// @param rig The rig.
+/// @param source The source.
+/// @return The sample.
+[[nodiscard]] std::optional<DashboardEvent> NextSample(Rig& rig, LiveEventSource& source)
+{
+    rig.clock.Advance(Interval);
+    rig.Settle();
+    auto sample = NextDue(rig, source);
+    CHECK(KindOf(NextDue(rig, source)) == DashboardEventKind::Tick);
+    return sample;
+}
+
+} // namespace
+
+TEST_CASE("a failed sample re-dials before the next, so a daemon restart is one gap", "[cli][live][source][redial]")
+{
+    // §6.4. The connection dies after the first answer; without a re-dial every sample after it
+    // fails for as long as the session runs, which is a monitor that cannot show the restart.
+    Rig rig;
+    DyingGatherer dying;
+    ScriptedDialer dialer { { true } };
+    auto parts = rig.Parts();
+    parts.gatherer = &dying;
+    parts.dialer = &dialer;
+    LiveEventSource source { std::move(parts) };
+    rig.Settle();
+
+    CHECK(Answered(NextDue(rig, source)));
+    CHECK(KindOf(NextDue(rig, source)) == DashboardEventKind::Tick);
+    CHECK(dialer.Dials() == 0);
+
+    CHECK_FALSE(Answered(NextSample(rig, source)));
+    // Not re-dialled in the gap itself: the dial waits for the next sample's turn on the cadence.
+    CHECK(dialer.Dials() == 0);
+
+    CHECK(Answered(NextSample(rig, source)));
+    CHECK(Answered(NextSample(rig, source)));
+    CHECK(dialer.Dials() == 1);
+    CHECK(dying.Calls() == 2);
+
+    CloseAndDrain(rig, source);
+}
+
+TEST_CASE("a healthy session dials nothing", "[cli][live][source][redial]")
+{
+    // The control for the case above: the connections a session starts with serve every sample
+    // for as long as they answer.
+    Rig rig;
+    ScriptedDialer dialer { { true } };
+    auto parts = rig.Parts();
+    parts.dialer = &dialer;
+    LiveEventSource source { std::move(parts) };
+    rig.Settle();
+
+    CHECK(Answered(NextDue(rig, source)));
+    CHECK(KindOf(NextDue(rig, source)) == DashboardEventKind::Tick);
+    CHECK(Answered(NextSample(rig, source)));
+    CHECK(Answered(NextSample(rig, source)));
+    CHECK(dialer.Dials() == 0);
+    CHECK(rig.gatherer.Calls() == 3);
+
+    CloseAndDrain(rig, source);
+}
+
+TEST_CASE("a daemon still down is re-dialled once per sample and never in a loop of its own", "[cli][live][source][redial]")
+{
+    Rig rig;
+    DyingGatherer dying;
+    ScriptedDialer dialer { { false } };
+    auto parts = rig.Parts();
+    parts.gatherer = &dying;
+    parts.dialer = &dialer;
+    LiveEventSource source { std::move(parts) };
+    rig.Settle();
+
+    CHECK(Answered(NextDue(rig, source)));
+    CHECK(KindOf(NextDue(rig, source)) == DashboardEventKind::Tick);
+    CHECK_FALSE(Answered(NextSample(rig, source)));
+    CHECK_FALSE(Answered(NextSample(rig, source)));
+    CHECK_FALSE(Answered(NextSample(rig, source)));
+    CHECK(dialer.Dials() == 2);
+
+    // Everything runnable has run and the clock has not moved: nothing dials between samples.
+    rig.Settle();
+    CHECK(dialer.Dials() == 2);
 
     CloseAndDrain(rig, source);
 }

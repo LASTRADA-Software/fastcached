@@ -149,6 +149,66 @@ void ReportAdvisories(Answer const& answer, bool quiet)
     return ExitCodeOf(Outcome::Usage);
 }
 
+/// The credential the admin surface is presented, when one was configured.
+/// @param command The parsed command.
+/// @return The bearer, or nullopt.
+[[nodiscard]] std::optional<std::string> AdminBearer(Command const& command)
+{
+    return command.credential.Configured() ? std::optional<std::string> { command.credential.secret } : std::nullopt;
+}
+
+/// The stats ladder over connections of its own: what a re-dial builds.
+///
+/// Owns what it opened, where the ladder in `RunAndReport` borrows the connections that
+/// frame opened. A connection that could not be opened is simply absent -- the ladder reports
+/// that rung as not answering, which is the failed sample the next re-dial follows.
+class DialedLadder final: public IStatsGatherer
+{
+  public:
+    /// @param command Where to dial, with what credential and timeouts.
+    /// @param wire The verb's wire, which says which connections it needs.
+    DialedLadder(Command const& command, WireSpec const& wire):
+        _resp { wire.needsResp ? SocketExchange::Open(command.cache, command.timeouts, command.credential).value_or(nullptr)
+                               : nullptr },
+        _node { wire.needsNode ? NodeExchange::Open(command.cache, command.timeouts, command.credential).value_or(nullptr)
+                               : nullptr },
+        _ladder { command.admin, command.cache, command.timeouts, AdminBearer(command), _resp.get(), _node.get() }
+    {
+    }
+
+    [[nodiscard]] std::vector<StatsAttempt> Gather() override
+    {
+        return _ladder.Gather();
+    }
+
+  private:
+    std::unique_ptr<SocketExchange> _resp;
+    std::unique_ptr<NodeExchange> _node;
+    LadderGatherer _ladder;
+};
+
+/// Re-dials the endpoint a session watches, the way this invocation dialled it first.
+class LadderRedial final: public IStatsDialer
+{
+  public:
+    /// @param command Where to dial; must outlive every dial.
+    /// @param wire The verb's wire; must outlive every dial.
+    LadderRedial(Command const& command, WireSpec const& wire) noexcept:
+        _command { command },
+        _wire { wire }
+    {
+    }
+
+    [[nodiscard]] std::unique_ptr<IStatsGatherer> Dial() override
+    {
+        return std::make_unique<DialedLadder>(_command, _wire);
+    }
+
+  private:
+    Command const& _command;
+    WireSpec const& _wire;
+};
+
 /// A session's frames, to stdout, each flushed as it is presented.
 ///
 /// Flushed per frame because a pipe is block-buffered: without it a reader downstream of
@@ -255,6 +315,7 @@ class StopReactorOnExit
     StdoutFrames sink;
     ProcessStopSignals stops;
     StandardTerminalAcquisition terminals;
+    LadderRedial redial { command, WireTable[static_cast<std::size_t>(verb.wire)] };
     StandardRungViews views { render, &LatestReading };
     ThreadDrainWait drainWait;
     std::optional<LiveEventSource> source;
@@ -264,6 +325,7 @@ class StopReactorOnExit
     auto ending = verb.session(context,
                                LiveSessionSeat { .reactor = &reactor,
                                                  .clock = &clock,
+                                                 .dialer = &redial,
                                                  .samplePool = &samplePool,
                                                  .stopWaiter = &stopWaiter,
                                                  .terminalPool = &terminalPool,
@@ -376,14 +438,8 @@ class StopReactorOnExit
         }
     }
 
-    auto gatherer = LadderGatherer {
-        command.admin,
-        command.cache,
-        command.timeouts,
-        command.credential.Configured() ? std::optional<std::string> { command.credential.secret } : std::nullopt,
-        resp.get(),
-        node.get()
-    };
+    auto gatherer =
+        LadderGatherer { command.admin, command.cache, command.timeouts, AdminBearer(command), resp.get(), node.get() };
 
     auto const context = VerbContext { .operands = command.operands,
                                        .options = command.verbOptions,
