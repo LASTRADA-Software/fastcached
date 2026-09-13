@@ -94,15 +94,46 @@ endif()
 set(selftestRan 0)
 set(selftestFailed 0)
 
-# The exemption targets, derived from the shipped rows rather than listed here.
+# The exemption targets and the directories their claims are about, derived from
+# the shipped rows rather than listed here.
 set(FastCachedExemptTargets "")
+set(FastCachedExemptDirectories "")
+set(FastCachedShippedExemptionLines "")
 foreach(exemptionRow IN LISTS FastCachedTsanBinaryExemptions)
+    string(APPEND FastCachedShippedExemptionLines "    \"${exemptionRow}\"\n")
     string(FIND "${exemptionRow}" "|" bar)
     if(NOT bar EQUAL -1)
         string(SUBSTRING "${exemptionRow}" 0 ${bar} exemptTarget)
         list(APPEND FastCachedExemptTargets "${exemptTarget}")
+        math(EXPR restStart "${bar} + 1")
+        string(SUBSTRING "${exemptionRow}" ${restStart} -1 rest)
+        string(FIND "${rest}" "|" secondBar)
+        if(NOT secondBar EQUAL -1)
+            string(SUBSTRING "${rest}" 0 ${secondBar} exemptDirectory)
+            list(APPEND FastCachedExemptDirectories "${exemptDirectory}")
+        endif()
     endif()
 endforeach()
+list(LENGTH FastCachedExemptTargets exemptTargetCount)
+list(LENGTH FastCachedExemptDirectories exemptDirectoryCount)
+if(NOT exemptTargetCount EQUAL exemptDirectoryCount)
+    message(FATAL_ERROR
+        "check-tsan-binaries-selftest: the shipped exemption rows yielded "
+        "${exemptTargetCount} target(s) but ${exemptDirectoryCount} directory(ies). "
+        "Every row is `target|directory|reason`, and the staged trees give each "
+        "directory a source, so a row without one would stage a baseline that "
+        "refuses for a reason no case names.")
+endif()
+
+# The shipped table plus @p extraLines, as the text a staged check carries. A case
+# about ONE planted row must keep the shipped rows too: replacing the table would
+# leave every shipped binary registered and unexempt, and a case expected to PASS
+# would then refuse for that instead.
+function(FastCachedExemptionsPlus extraLines out)
+    set("${out}"
+        "set(FastCachedTsanBinaryExemptions\n${FastCachedShippedExemptionLines}${extraLines})\n"
+        PARENT_SCOPE)
+endfunction()
 
 if(NOT FastCachedExemptTargets)
     message(FATAL_ERROR
@@ -166,6 +197,12 @@ function(FastCachedStageBinariesTree which extraRegistrations exemptionsOverride
     string(APPEND registrations "${extraRegistrations}")
     file(WRITE "${tree}/src/staged/CMakeLists.txt" "${registrations}")
 
+    # Each shipped exemption's directory, holding one source that names nothing, so
+    # the baseline's claims are scanned and hold rather than refusing as empty.
+    foreach(exemptDirectory IN LISTS FastCachedExemptDirectories)
+        file(WRITE "${tree}/${exemptDirectory}/clean.cpp" "int CleanSource() { return 0; }\n")
+    endforeach()
+
     set("${out}" "${tree}" PARENT_SCOPE)
 endfunction()
 
@@ -225,7 +262,7 @@ message("== check-tsan-binaries-selftest")
 
 # -- the accepting direction, first, and asserting a positive report -------
 FastCachedStageBinariesTree("baseline" "" "" tree)
-FastCachedBinariesCase("baseline-tree-is-accepted" "${tree}" pass "Catch2 binary")
+FastCachedBinariesCase("baseline-tree-is-accepted" "${tree}" pass "whose [0-9]+ source")
 
 # -- the defect the check exists for: a binary nobody decided about ---------
 FastCachedStageBinariesTree("uncovered"
@@ -251,11 +288,11 @@ FastCachedBinariesCase("a-mention-with-no-paren-is-not-a-call-site" "${tree}" pa
 
 # -- the exemption table's own failure modes --------------------------------
 FastCachedStageBinariesTree("empty-reason" ""
-    "set(FastCachedTsanBinaryExemptions\n    \"lonely-tests|\"\n)\n" tree)
+    "set(FastCachedTsanBinaryExemptions\n    \"lonely-tests|src/lonely|\"\n)\n" tree)
 FastCachedBinariesCase("an-exemption-with-no-reason-is-refused" "${tree}" refuse "EMPTY reason")
 
 FastCachedStageBinariesTree("stale" ""
-    "set(FastCachedTsanBinaryExemptions\n    \"gone-tests|it was here once\"\n)\n" tree)
+    "set(FastCachedTsanBinaryExemptions\n    \"gone-tests|src/gone|it was here once\"\n)\n" tree)
 FastCachedBinariesCase("a-stale-exemption-is-refused" "${tree}" refuse "STALE exemption")
 
 # An exemption naming a binary the gate ALSO runs is a contradiction, and it is
@@ -264,7 +301,7 @@ FastCachedBinariesCase("a-stale-exemption-is-refused" "${tree}" refuse "STALE ex
 # check still green.
 list(GET FastCachedTsanGateTargets 0 firstGateTarget)
 FastCachedStageBinariesTree("contradiction" ""
-    "set(FastCachedTsanBinaryExemptions\n    \"${firstGateTarget}|it is also a row\"\n)\n" tree)
+    "set(FastCachedTsanBinaryExemptions\n    \"${firstGateTarget}|src/staged|it is also a row\"\n)\n" tree)
 FastCachedBinariesCase("an-exemption-that-is-also-a-row-is-refused" "${tree}" refuse "BOTH a TARGETS row")
 
 # A semicolon splits a CMake list element, so this row arrives as two and the
@@ -272,8 +309,85 @@ FastCachedBinariesCase("an-exemption-that-is-also-a-row-is-refused" "${tree}" re
 # and the refusal has to name the CAUSE -- `carries no |` is a true description
 # of a symptom that is somewhere else entirely.
 FastCachedStageBinariesTree("semicolon" ""
-    "set(FastCachedTsanBinaryExemptions\n    \"lonely-tests|one reason; and another\"\n)\n" tree)
+    "set(FastCachedTsanBinaryExemptions\n    \"lonely-tests|src/lonely|one reason; and another\"\n)\n" tree)
 FastCachedBinariesCase("a-semicolon-in-a-reason-is-refused-by-cause" "${tree}" refuse "SEMICOLON in a")
+
+# -- an exemption's claim is re-measured, not recorded ----------------------
+#
+# Each case plants one exempt binary, `planted-tests`, whose claim is about
+# `src/planted`, beside the shipped rows. The refusing cases are driven once per
+# row of the check's own primitive table, so a primitive added there is a
+# primitive this file plants.
+set(plantedRegistration "catch_discover_tests(planted-tests PROPERTIES SKIP_RETURN_CODE 4)\n")
+FastCachedExemptionsPlus("    \"planted-tests|src/planted|its sources name no thread primitive\"\n" plantedTable)
+
+foreach(primitive IN LISTS FastCachedTsanThreadPrimitives)
+    string(MAKE_C_IDENTIFIER "${primitive}" primitiveSlug)
+    FastCachedStageBinariesTree("claim-${primitiveSlug}" "${plantedRegistration}" "${plantedTable}" tree)
+    file(WRITE "${tree}/src/planted/worker.cpp"
+        "#include <cstddef>\nvoid Spawn() { auto unused = ${primitive}; }\n")
+    FastCachedBinariesCase("an-exempt-directory-naming-${primitiveSlug}-is-refused"
+        "${tree}" refuse "src/planted/worker.cpp:2 names ${primitive}")
+endforeach()
+
+# THE FLOOR, and it is a deliberate SECOND SPELLING. Do not fold it into the loop
+# above. That loop is generated from the check's own list, so it notices a primitive
+# ARRIVING and is blind to one LEAVING: delete `ThreadPoolExecutor` from
+# `FastCachedTsanThreadPrimitives` and the loop simply plants one case fewer, all
+# green. These two are the primitives this rule exists for -- `std::thread` is what
+# every exemption reason claimed, and `ThreadPoolExecutor` is how the stale
+# `fastcache-cli-tests` row went false without anybody spelling a thread -- so they
+# are written out here independently of the list. A floor, not a mirror: the list
+# may grow past it, and it may not shrink below it.
+foreach(pinnedPrimitive IN ITEMS "std::thread" "ThreadPoolExecutor")
+    string(MAKE_C_IDENTIFIER "${pinnedPrimitive}" pinnedSlug)
+    FastCachedStageBinariesTree("floor-${pinnedSlug}" "${plantedRegistration}" "${plantedTable}" tree)
+    file(WRITE "${tree}/src/planted/pinned.cpp"
+        "#include <cstddef>\nvoid Spawn() { auto unused = ${pinnedPrimitive}; }\n")
+    FastCachedBinariesCase("the-floor-still-refuses-${pinnedSlug}"
+        "${tree}" refuse "src/planted/pinned.cpp:2 names ${pinnedPrimitive}")
+endforeach()
+
+# The accepting twins. Without the comment case, a scan that refused every file
+# mentioning a primitive anywhere passes the loop above; without the near-miss
+# case, one matching substrings does.
+FastCachedStageBinariesTree("claim-comment" "${plantedRegistration}" "${plantedTable}" tree)
+file(WRITE "${tree}/src/planted/worker.cpp"
+    "// std::thread would be wrong here\n/// ThreadPoolExecutor is not used\n/* std::jthread\n * std::async and pthread_create\n */\nint Quiet() { return 0; }\n")
+FastCachedBinariesCase("a-primitive-in-a-comment-is-not-a-thread" "${tree}" pass "whose [0-9]+ source")
+
+FastCachedStageBinariesTree("claim-near-miss" "${plantedRegistration}" "${plantedTable}" tree)
+file(WRITE "${tree}/src/planted/worker.cpp"
+    "void Yield() { std::this_thread::yield(); }\nstruct ThreadPoolExecutorLike {};\nvoid my_pthread_create_wrapper();\nint std_async_count = 0;\n")
+FastCachedBinariesCase("a-longer-name-is-not-a-primitive" "${tree}" pass "whose [0-9]+ source")
+
+# Where the scan looks, and how it reports.
+FastCachedStageBinariesTree("claim-deep" "${plantedRegistration}" "${plantedTable}" tree)
+file(WRITE "${tree}/src/planted/clean.cpp" "int Clean() { return 0; }\n")
+file(WRITE "${tree}/src/planted/deep/inner.hpp" "std::jthread worker;\n")
+FastCachedBinariesCase("a-primitive-in-a-subdirectory-is-found" "${tree}" refuse "src/planted/deep/inner.hpp:1 names std::jthread")
+
+FastCachedStageBinariesTree("claim-many" "${plantedRegistration}" "${plantedTable}" tree)
+string(REPEAT "std::thread worker;\n" 10 manyHits)
+file(WRITE "${tree}/src/planted/worker.cpp" "${manyHits}")
+math(EXPR hiddenHits "10 - ${FastCachedTsanClaimHitsShown}")
+FastCachedBinariesCase("hits-past-the-cap-are-counted-not-dropped" "${tree}" refuse "and ${hiddenHits} more of 10")
+
+# A claim about nothing verifies nothing.
+FastCachedStageBinariesTree("claim-missing" "${plantedRegistration}" "${plantedTable}" tree)
+FastCachedBinariesCase("an-exempt-directory-that-does-not-exist-is-refused" "${tree}" refuse "which does not exist")
+
+FastCachedStageBinariesTree("claim-empty" "${plantedRegistration}" "${plantedTable}" tree)
+file(WRITE "${tree}/src/planted/NOTES.md" "std::thread lives in prose only\n")
+FastCachedBinariesCase("an-exempt-directory-with-no-source-is-refused" "${tree}" refuse "A claim about an empty directory")
+
+FastCachedExemptionsPlus("    \"planted-tests|its sources name no thread primitive\"\n" oneBarTable)
+FastCachedStageBinariesTree("claim-no-directory" "${plantedRegistration}" "${oneBarTable}" tree)
+FastCachedBinariesCase("a-row-naming-no-directory-is-refused" "${tree}" refuse "carries one")
+
+FastCachedExemptionsPlus("    \"planted-tests|src/../elsewhere|its sources name no thread primitive\"\n" outsideTable)
+FastCachedStageBinariesTree("claim-outside" "${plantedRegistration}" "${outsideTable}" tree)
+FastCachedBinariesCase("a-directory-outside-src-is-refused" "${tree}" refuse "not a path under")
 
 # -- the ways this check can stop being able to answer ----------------------
 FastCachedStageBinariesTree("no-registrations" "" "" tree)
