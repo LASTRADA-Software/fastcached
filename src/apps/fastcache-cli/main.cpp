@@ -15,6 +15,7 @@
 #include "LiveSession.hpp"
 #include "SocketExchange.hpp"
 #include "StatsGatherer.hpp"
+#include "TerminalCellWidth.hpp"
 
 #include <FastCache/Async/PlatformReactor.hpp>
 #include <FastCache/Async/ThreadPoolExecutor.hpp>
@@ -317,7 +318,7 @@ class StopReactorOnExit
     ProcessStopSignals stops;
     StandardTerminalAcquisition terminals;
     LadderRedial redial { command, WireTable[static_cast<std::size_t>(verb.wire)] };
-    StandardRungViews views { render, &LatestReading };
+    StandardRungViews views { render, &LatestReading, &TerminalCellWidth };
     ThreadDrainWait drainWait;
     std::optional<LiveEventSource> source;
     std::jthread reactorThread { [&reactor] { reactor.Run(); } };
