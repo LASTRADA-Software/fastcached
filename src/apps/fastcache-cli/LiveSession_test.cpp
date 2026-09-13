@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "LiveSession.hpp"
+#include "LiveSourceRig.hpp"
 #include "ScriptedDashboardEvents.hpp"
 
 #include <FastCache/Async/TestReactor.hpp>
@@ -21,16 +22,6 @@ using namespace FastCache::Cli::Testing;
 
 namespace
 {
-
-/// A reading `ChooseStats` accepts, so every sample moves the model.
-/// @return One answered attempt.
-[[nodiscard]] std::vector<StatsAttempt> Reading()
-{
-    return { StatsAttempt { .origin = StatsOrigin::Info,
-                            .asked = true,
-                            .record = RecordValue({ Field { .name = "curr_connections", .value = TextCell("10") } }),
-                            .note = {} } };
-}
 
 /// A view that counts the frames drawn through it.
 class CountingView final: public IDashboardView
@@ -64,18 +55,6 @@ class CountingLadder final: public IViewLadder
 
     std::size_t decisions { 0 };
     std::size_t framesThroughDecidedViews { 0 };
-};
-
-/// Counts presented frames.
-class CountSink final: public IFrameSink
-{
-  public:
-    void Present(std::string_view /*frame*/) override
-    {
-        ++frames;
-    }
-
-    std::size_t frames { 0 };
 };
 
 /// Await a whole session into @p out.
