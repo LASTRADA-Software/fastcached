@@ -2,6 +2,7 @@
 #include "LiveStats.hpp"
 
 #include <FastCache/Core/Ranges.hpp>
+#include <FastCache/Protocol/CompileCacheWire.hpp>
 
 #include <format>
 #include <string>
@@ -140,6 +141,18 @@ std::expected<LivePlan, Answer> AdmitLiveStats(VerbContext const& context)
                             RespButUnidentified)));
         return std::unexpected(Concluded(Outcome::Protocol, std::format("cannot watch this endpoint: {}", identity.detail)));
     }
+
+    // A node whose own description this client could not read is refused whatever was named:
+    // it answered in a shape this build's wire version does not have, so every sample would
+    // fail the same way, and the session would stream nothing but gaps. Said by version, since
+    // that is what an operator changes -- the node's cannot be read, so this client's is named.
+    if (identity.unreadable)
+        return std::unexpected(
+            Concluded(Outcome::Protocol,
+                      std::format("cannot watch this node: {}. This client speaks 0xFC wire {}, and a node on another wire "
+                                  "version answers in a shape it cannot read -- upgrade the node and this client together",
+                                  identity.detail,
+                                  static_cast<unsigned>(CompileCacheWire::CurrentVersion))));
 
     auto const* const subject = named != nullptr ? named : InferredSubject(kind);
     if (subject == nullptr)
