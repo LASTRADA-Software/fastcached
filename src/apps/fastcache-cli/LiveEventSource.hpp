@@ -12,6 +12,7 @@
 #include <chrono>
 #include <memory>
 #include <optional>
+#include <string>
 
 namespace FastCache::Cli
 {
@@ -66,8 +67,17 @@ struct LiveSourceParts
     /// Drained are called on its thread; so is every resumption this source performs.
     IReactor* reactor { nullptr };
 
-    /// What the first sample asks, and every one after it until a sample fails.
+    /// What the first sample asks, and every one after it until a sample fails; unread by a
+    /// source that samples a `document`.
     IStatsGatherer* gatherer { nullptr };
+
+    /// The admin surface a document sample fetches from; null where nothing samples a document.
+    IAdminDocument* admin { nullptr };
+
+    /// The document one sample fetches, or empty to sample `gatherer` instead.
+    ///
+    /// One kind of fetch for the whole session, because a reader reads one kind.
+    std::string document {};
 
     /// What re-dials after a failed sample, or null for a source that never re-dials.
     ///
@@ -76,7 +86,7 @@ struct LiveSourceParts
     /// `gatherer` from then on, and is owned by the source until its last producer has ended.
     IStatsDialer* dialer { nullptr };
 
-    /// Where the blocking gather runs.
+    /// Where the blocking gather, or the blocking document fetch, runs.
     IExecutor* pool { nullptr };
 
     /// What a sample is stamped with, and when an outstanding one started.

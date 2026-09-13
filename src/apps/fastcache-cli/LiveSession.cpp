@@ -79,8 +79,11 @@ Task<std::expected<LiveSessionRun, Answer>> RunComposedSession(LiveSessionParts 
                                                                std::optional<LiveEventSource>* source)
 {
     auto run = LiveSessionRun {};
+    auto const& subject = LiveSubjectTable[static_cast<std::size_t>(parts.plan.subject)];
     auto sourceParts = LiveSourceParts { .reactor = parts.reactor,
                                          .gatherer = parts.gatherer,
+                                         .admin = parts.admin,
+                                         .document = std::string { subject.document },
                                          .dialer = parts.dialer,
                                          .pool = parts.samplePool,
                                          .clock = parts.clock,
@@ -183,17 +186,25 @@ SessionEnding RunLiveStatsSession(VerbContext const& context, LiveSessionSeat co
     if (!plan.has_value())
         return SessionEnding { .kind = SessionEndKind::Refused, .answer = std::move(plan).error(), .line = {} };
 
+    auto const& subject = LiveSubjectTable[static_cast<std::size_t>(plan->subject)];
+
     // What `RunVerb` asks of every row before its handler, asked here because a session is
-    // not reached through `RunVerb`: a sample would otherwise gather from nothing.
-    if (context.stats == nullptr)
+    // not reached through `RunVerb`: a sample would otherwise ask nothing. Asked of the door
+    // this subject's samples go through and of no other, so a fleet session is not refused for
+    // a stats ladder it never reads.
+    if (subject.document.empty() && context.stats == nullptr)
         return SessionEnding {
             .kind = SessionEndKind::Refused,
             .answer = Concluded(Outcome::Unreachable,
                                 std::string { WireTable[static_cast<std::size_t>(Wire::Stats)].unavailable }),
             .line = {},
         };
-
-    auto const& subject = LiveSubjectTable[static_cast<std::size_t>(plan->subject)];
+    if (!subject.document.empty() && context.admin == nullptr)
+        return SessionEnding {
+            .kind = SessionEndKind::Refused,
+            .answer = Concluded(Outcome::Usage, std::string { NoAdminSurface }),
+            .line = {},
+        };
     if (subject.reader == nullptr)
         return SessionEnding {
             .kind = SessionEndKind::Refused,
@@ -209,6 +220,7 @@ SessionEnding RunLiveStatsSession(VerbContext const& context, LiveSessionSeat co
         .plan = *std::move(plan),
         .reactor = seat.reactor,
         .gatherer = context.stats,
+        .admin = context.admin,
         .dialer = seat.dialer,
         .reader = subject.reader,
         .clock = seat.clock,
