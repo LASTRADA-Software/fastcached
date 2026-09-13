@@ -508,7 +508,9 @@ namespace
 
             struct sigaction ours {};
             ours.sa_handler = &OnStopSignal;
-            static_cast<void>(::sigemptyset(&ours.sa_mask));
+            // Never `::sigemptyset`: the macOS SDK defines it as a MACRO, and a qualified name
+            // expanded to an expression does not parse there.
+            static_cast<void>(sigemptyset(&ours.sa_mask));
             // Restarted, so a SIGINT landing on some other thread's blocking call is not
             // turned into that call failing with EINTR.
             ours.sa_flags = SA_RESTART;
