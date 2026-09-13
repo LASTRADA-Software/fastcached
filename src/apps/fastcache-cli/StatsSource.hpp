@@ -66,6 +66,8 @@ struct StatsOriginSpec
 {
     StatsOrigin origin;    ///< The enumerator this row describes.
     std::string_view name; ///< Stable lower-case name; reported as the `source` field.
+    /// What was asked, as a panel's source line names it: `metrics (/metrics at ...)`.
+    std::string_view route;
     std::string_view what; ///< Where it is, for a remark an operator can act on.
     /// What choosing it costs, as the TAIL of a sentence the emitter opens by naming
     /// the source and the field count it observed. Empty when nothing.
@@ -74,14 +76,20 @@ struct StatsOriginSpec
 
 /// The origins, one row per enumerator, in enumerator order -- which is ladder order.
 inline constexpr EnumTable<StatsOrigin, StatsOriginSpec> StatsOriginTable { {
-    { .origin = StatsOrigin::Metrics, .name = "metrics", .what = "the admin surface's /metrics endpoint", .caveat = "" },
+    { .origin = StatsOrigin::Metrics,
+      .name = "metrics",
+      .route = "/metrics",
+      .what = "the admin surface's /metrics endpoint",
+      .caveat = "" },
     { .origin = StatsOrigin::NodeMetrics,
       .name = "node-metrics",
+      .route = "NodeMetrics",
       .what = "the node's own NodeMetrics verb over 0xFC",
       .caveat = "this is the counter catalogue only; /metrics adds the storage and "
                 "per-tier series" },
     { .origin = StatsOrigin::Info,
       .name = "info",
+      .route = "INFO",
       .what = "RESP INFO on the data port",
       .caveat = "start the daemon with its metrics listener enabled, or pass "
                 "--admin-addr, for the full counter set" },
@@ -108,6 +116,7 @@ struct StatsAttempt
     bool asked { false };                        ///< Whether it was contacted at all.
     std::optional<Value> record {};              ///< What it produced; nullopt when it produced nothing.
     std::string note {};                         ///< Why it produced nothing, or why it was not asked.
+    std::string where {};                        ///< The `host:port` it was asked at; empty when it was not.
 };
 
 /// The field `ChooseStats` prepends to a winning record, naming which source answered.

@@ -186,6 +186,15 @@ namespace
         "hit rate is published, deliberately.",
     };
 
+    // §3: `fastcached 0.4.1 ───── 127.0.0.1:6379  up 6d04:12  every 2s  q quit`.
+    constexpr auto CacheTitle = std::array {
+        TitleFactRow { .fact = ChromeFact::Version, .side = TitleSide::Subject },
+        TitleFactRow { .fact = ChromeFact::Endpoint, .priority = Priority::High },
+        TitleFactRow { .fact = ChromeFact::Uptime },
+        TitleFactRow { .fact = ChromeFact::Interval },
+        TitleFactRow { .fact = ChromeFact::QuitWord, .priority = Priority::Low },
+    };
+
     constexpr auto CacheSpec = PanelSpec { .title = "fastcached",
                                            .rates = CacheRates,
                                            .levels = CacheLevels,
@@ -193,7 +202,8 @@ namespace
                                            .tierNote = CacheTierNote,
                                            .tierPriority = Priority::Normal,
                                            .tierNotePriority = Priority::Low,
-                                           .sourcePriority = Priority::High };
+                                           .sourcePriority = Priority::High,
+                                           .titleFacts = CacheTitle };
 
     // ---- node -------------------------------------------------------------------------------
 
@@ -282,6 +292,15 @@ namespace
                    .priority = Priority::Normal },
     };
 
+    // §4: `fastcache-compile-node 0.4.1 ───── build-07:7070  up 2d11:48  every 2s  q`.
+    constexpr auto NodeTitle = std::array {
+        TitleFactRow { .fact = ChromeFact::Version, .side = TitleSide::Subject },
+        TitleFactRow { .fact = ChromeFact::Endpoint, .priority = Priority::High },
+        TitleFactRow { .fact = ChromeFact::Uptime },
+        TitleFactRow { .fact = ChromeFact::Interval },
+        TitleFactRow { .fact = ChromeFact::Quit, .priority = Priority::Low },
+    };
+
     constexpr auto NodeSpec = PanelSpec { .title = "fastcache-compile-node",
                                           .rates = NodeRates,
                                           .levels = NodeLevels,
@@ -289,9 +308,18 @@ namespace
                                           .tierNote = {},
                                           .tierPriority = Priority::Normal,
                                           .tierNotePriority = Priority::Low,
-                                          .sourcePriority = Priority::High };
+                                          .sourcePriority = Priority::High,
+                                          .titleFacts = NodeTitle };
 
     // ---- fleet ------------------------------------------------------------------------------
+
+    // §5: `fleet ───── leader build-01:7071  12 machines  every 5s  q`.
+    constexpr auto FleetTitle = std::array {
+        TitleFactRow { .fact = ChromeFact::Leader, .priority = Priority::High },
+        TitleFactRow { .fact = ChromeFact::Machines },
+        TitleFactRow { .fact = ChromeFact::Interval },
+        TitleFactRow { .fact = ChromeFact::Quit, .priority = Priority::Low },
+    };
 
     constexpr auto FleetSpec = PanelSpec { .title = "fleet",
                                            .rates = {},
@@ -301,7 +329,8 @@ namespace
                                            .tierPriority = Priority::Normal,
                                            .tierNotePriority = Priority::Low,
                                            .sourcePriority = Priority::High,
-                                           .document = DocumentSpec {} };
+                                           .document = DocumentSpec {},
+                                           .titleFacts = FleetTitle };
 
     static_assert(PanelKeysAreWhole(CacheSpec), "every cache panel figure needs its own machine key");
     static_assert(PanelKeysAreWhole(NodeSpec), "every node panel figure needs its own machine key");

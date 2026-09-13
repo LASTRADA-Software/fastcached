@@ -515,6 +515,8 @@ TEST_CASE("a document session fetches its whole document on the pool, stamped wh
     CHECK(Unwrap(sample).attempts.empty());
     REQUIRE(Unwrap(sample).document.has_value());
     CHECK(Unwrap(Unwrap(sample).document) == body);
+    // Where it answered rides beside it, for the source line: the surface's own word, never a guess.
+    CHECK(Unwrap(sample).documentWhere == ScriptedDocument::ScriptedAdminAddress);
     CHECK(rig.gatherer.Calls() == 0);
     CHECK(KindOf(NextDue(rig, source)) == DashboardEventKind::Tick);
 

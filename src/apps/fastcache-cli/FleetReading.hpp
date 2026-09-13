@@ -17,6 +17,9 @@ namespace FastCache::Cli
 /// The source name a fleet reading carries, which no stats source shares.
 inline constexpr std::string_view FleetReadingSource = "fleet.txt";
 
+/// The document a `fleet` session asks the leader for, and the route its source line names.
+inline constexpr std::string_view FleetDocumentRoute = "/fleet.txt";
+
 /// How a fleet reader parses the leader's document: `ParseFleetDocument`, or a test's counting stand-in.
 using FleetParser = std::expected<FleetDocument, std::string> (*)(std::string_view document);
 

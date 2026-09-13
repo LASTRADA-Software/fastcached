@@ -34,11 +34,18 @@ struct FleetDocument;
 /// two catch different things -- a scan cannot see a hidden ambient read reached through
 /// a helper, and determinism cannot see one whose answer happens to be stable.
 
+/// The role a reading states when the endpoint that answered is its subject's leader: the fleet reader
+/// writes it, and a title bar reads it back to say `leader <addr>`.
+inline constexpr std::string_view LeaderRole = "leader";
+
 /// When a reading was taken and where it came from: what decides whether it continues a run.
 struct ReadingStamp
 {
     TimePoint at {};       ///< When it was taken, on the steady clock.
     std::string source {}; ///< Which source produced it, by stable name.
+    std::string route {};  ///< What was asked there, as the source line names it; see `SampleReading::route`.
+    std::string where {};  ///< The `host:port` that answered; empty when the reader did not say.
+    std::string role {};   ///< What the answering endpoint is to its subject, such as `leader`; usually empty.
 };
 
 /// One per-subject figure a sample read, kept in the history for a chart to draw.
@@ -278,6 +285,19 @@ struct SampleReading
     /// Per-subject figures for a chart, kept in the history entry this reading becomes; empty for a
     /// reader that reads none.
     std::vector<SeriesPoint> points {};
+
+    /// What was asked, as a panel's source line names it: `/metrics`, `INFO`, `/fleet.txt`.
+    ///
+    /// **The reader's own spelling**, from the table that already names its source, so the source line
+    /// cannot name a route the reader did not take. Meaningful iff `outcome` is `Affirmative`.
+    std::string route {};
+
+    /// The `host:port` that answered, or empty when the reader does not know it.
+    std::string where {};
+
+    /// What the answering endpoint is to the subject, when that is part of the reading: `leader` for a
+    /// fleet document, which only the leader serves. Empty otherwise.
+    std::string role {};
 };
 
 /// Turns one session's raw `Sample` payload into a reading.

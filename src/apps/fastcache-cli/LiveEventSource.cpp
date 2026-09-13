@@ -26,6 +26,7 @@ namespace
     struct DocumentOutcome
     {
         std::expected<std::string, AdminError> document { std::unexpected(AdminError {}) }; ///< What the fetch produced.
+        std::string where {};                                                               ///< Where it was asked.
         TimePoint takenAt {};                                                               ///< When it answered.
     };
 
@@ -46,6 +47,7 @@ namespace
         co_await ResumeOn { *pool };
         outcome.document = admin->FetchAdmin(path);
         outcome.takenAt = clock->Now();
+        outcome.where = admin->AdminAddress();
         co_await ResumeOn { *resumeOn };
         co_return outcome;
     }
@@ -255,7 +257,8 @@ namespace
             // leader's own words, and the reader decides which outcome that is.
             co_return DashboardEvent { .kind = DashboardEventKind::Sample,
                                        .at = fetched.takenAt,
-                                       .document = std::move(fetched.document) };
+                                       .document = std::move(fetched.document),
+                                       .documentWhere = std::move(fetched.where) };
         }
 
         auto sample = co_await TakeSample(&state->gatherer, parts.clock, parts.pool, parts.reactor);

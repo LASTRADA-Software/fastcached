@@ -177,7 +177,7 @@ inline constexpr EnumTable<LiveSubject, LiveSubjectSpec> LiveSubjectTable { {
       .costsWhom = "each sample makes the LEADER render every fleet section for the whole fleet, "
                    "once per watcher",
       .reader = &ReadFleetSample,
-      .document = "/fleet.txt",
+      .document = FleetDocumentRoute,
       .panel = &FleetPanel,
       .figures = &FleetKpiFigures },
 } };

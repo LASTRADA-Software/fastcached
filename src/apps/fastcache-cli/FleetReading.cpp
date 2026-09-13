@@ -90,7 +90,12 @@ SampleReading ReadFleetSampleThrough(DashboardEvent const& event, FleetParser pa
                                    .source = std::string { FleetReadingSource },
                                    .note = {},
                                    .document = nullptr,
-                                   .points = FleetChartPoints(*parsed) };
+                                   .points = FleetChartPoints(*parsed),
+                                   .route = std::string { FleetDocumentRoute },
+                                   .where = event.documentWhere,
+                                   // Only the leader answers this document with a reading; a follower's 503
+                                   // never gets this far.
+                                   .role = std::string { LeaderRole } };
     // The points are taken from the parse before it moves: the chart's history keeps these numbers,
     // and only the newest document is kept whole.
     reading.document = std::make_shared<FleetDocument const>(std::move(*parsed));
