@@ -255,8 +255,13 @@ void ReportAdvisories(Answer const& answer, bool quiet)
     // client cannot read as a reply, and reporting *the reply could not be read* for a
     // binary that speaks another protocol entirely sends an operator hunting a codec
     // bug.
+    //
+    // And only for a wire that did not dial `0xFC` itself. One that did either holds that
+    // connection, so its verb has had the node's answer already, or failed to open it --
+    // and a second dial to the same address spends another connect timeout to learn what
+    // the first one said.
     auto const unanswered = answer.outcome == Outcome::Unreachable || answer.outcome == Outcome::Protocol;
-    if (unanswered && verb.wire != Wire::Node && node == nullptr)
+    if (unanswered && !wire.needsNode)
     {
         if (auto probe = NodeExchange::Open(command.cache, command.timeouts, command.credential); probe.has_value())
         {
