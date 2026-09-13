@@ -2265,6 +2265,31 @@ set_tests_properties("target-file-guards" PROPERTIES
 # nothing, and a build option the reader never turned into a target is refused as lost
 # rows rather than silently dropped.
 #
+# Eight more since #1369, for the SECOND source of optional targets -- a directory the
+# root adds only under a `FASTCACHED_BUILD_*` option outside `src/`, which is `vendor/`.
+# Before #1369 an unguarded `$<TARGET_FILE:fastcache-tui-linkprobe>` planted in this file
+# PASSED, because the check never read the file declaring that target. They assert:
+# - a planted violation in EACH source is refused and names the source that made the
+#   target optional (the app-table case above checks that too);
+# - the gated file's reference to its own target passes;
+# - the app table's own equality still refuses a dropped row with a gated target present;
+# - each of the second reader's own assertions refuses: a root option whose `if()` was
+#   not read, a declaration whose target name was not read, and no gated directory;
+# - a stray `]` in the gated file changes nothing.
+#
+# Seven more from the review of that first version, each of which it failed:
+# - a target the ROOT declares under an option is not exempt in the root, which runs with
+#   the option OFF too;
+# - a gated directory spelled quoted or under `${CMAKE_CURRENT_SOURCE_DIR}` keeps its
+#   targets, and one no path can be resolved from is refused by its spelling;
+# - `if(X)  # why`, a condition spelled across lines, and upper-case `IF`/`ADD_EXECUTABLE`
+#   are all followed;
+# - an `endif()` with no open `if()` is reported where it happened.
+#
+# The run states how many trees it built: 20. Shown to bite: against master's check 14
+# of the 20 fail, against the first #1369 version 7 do, and neutering each assertion or
+# fix fails exactly its own case.
+#
 # The bracket sits on a ROW and not in a comment, which is the difference between a
 # regression test and the appearance of one: a REGEX-filtered `file(STRINGS)` discards
 # non-matching lines BEFORE building its list, so the first version of that case put

@@ -54,6 +54,13 @@ include("${CMAKE_CURRENT_LIST_DIR}/lib/CheckCommon.cmake")
 # -- it is a second thing to be wrong. A new app therefore arrives under this
 # guard by existing, without anyone remembering to add it.
 #
+# The app table is not the only place a target becomes optional (#1369). The ROOT
+# `CMakeLists.txt` adds `vendor/` only under `FASTCACHED_BUILD_TUI`, so every target
+# `vendor/CMakeLists.txt` declares is exactly as optional as an app -- and until
+# #1369 this check read neither file, so an unguarded `$<TARGET_FILE:>` naming one
+# passed. Those targets are read by a SECOND reader with its own completeness
+# argument; see "The second source" below for why it is not folded into the first.
+#
 # Runs as `cmake -P`, for the reason check-test-names.cmake gives: this reads
 # files, compares strings and reports, so a .sh + .ps1 pair would be two
 # implementations of one rule differing only in syntax.
@@ -139,11 +146,319 @@ if(NOT optionalTargetsFound EQUAL appTableOptionCount)
         "can no longer see in full.")
 endif()
 list(LENGTH optionalTargets optionalTargetCount)
+foreach(target IN LISTS optionalTargets)
+    set("optionalOrigin_${target}" "a row of the app table in src/apps/CMakeLists.txt")
+endforeach()
+
+# ---------------------------------------------------------------------------
+# The second source (#1369): a directory the ROOT adds only under a
+# `FASTCACHED_BUILD_*` option, outside `src/`. `vendor/` is the one today, and every
+# target its CMakeLists.txt declares exists only when `FASTCACHED_BUILD_TUI` is on.
+# The app table cannot describe them -- its grammar is a `"<target>|FASTCACHED_BUILD_"`
+# row, theirs is `add_library`/`add_executable` -- and neither file is under `src/`,
+# which is all the reference scan below used to read.
+#
+# A PARALLEL derivation with its OWN completeness argument, never merged into the app
+# table's counts. Merged, a row lost from the app table could be masked by a target
+# found here, and the equality above would hold while proving nothing. So that equality
+# stays exactly as it is, over the app table alone, and this source carries two
+# assertions and a floor of its own:
+#
+# 1. Every `option(FASTCACHED_BUILD_...)` the root declares, counted over its RAW bytes
+#    (which never pass through CMake's list parser), was SEEN by the line reader naming
+#    the condition of an `if()`. A reader that lost lines loses the
+#    `if(FASTCACHED_BUILD_TUI)` that makes `vendor/` gated, and would otherwise report
+#    fewer optional targets and pass -- the app table's 5-to-1 truncation again.
+# 2. In each file read here, the declarations the line reader collected equal the
+#    `add_library`/`add_executable` calls counted over the raw bytes. A declaration
+#    spelled so the reader cannot name its target is refused rather than skipped.
+# 3. The floor: no gated directory at all is a refusal, because a source that yields
+#    nothing agrees perfectly with a tree that declares nothing.
+#
+# What this does NOT read, stated so it is not over-applied: a directory gated by a
+# condition naming no `FASTCACHED_BUILD_*` option; a directory under `src/`, whose
+# optional targets are the app table's; an `add_subdirectory` nested inside a gated
+# directory; and a target declared inside an `if()` WITHIN a file, which is optional for
+# a reason no reader here models. Nor does it judge a guard's ORDER for these targets --
+# the stale-guard rule below is the app table's, whose order is the build's.
+
+# Apply one line to an `if` frame stack. This is the ONE way both readers here follow
+# conditions -- the reference scan below and the declaration reader -- because two walkers
+# would drift, and the first version of #1369 had two that failed differently.
+#
+# @p framesVar and @p pendingVar name the caller's stack and its unfinished condition, and
+# both are updated in the caller. @p codeOut receives the line with a trailing comment
+# dropped and its leading command word folded to lower case. @p conditionOut receives the
+# condition an `if` or `elseif` completed on this line, or empty. @p unbalancedOut is TRUE
+# when the line closes or extends a chain that was never opened, or completes a statement
+# that cannot be read -- the walk has lost track, and every later verdict in that file is
+# drawn from the wrong conditions.
+#
+# Three things a line-by-line `^if\((.*)\)$` got wrong, each found in review:
+# - CMake commands are case-insensitive, so `IF(` is `if(`. Only the command word is folded;
+#   what follows keeps its case, because target and variable names are case-sensitive.
+# - `if(X)  # why` is a frame. The comment is dropped before matching, where the old pattern
+#   pushed nothing and let the matching `endif()` pop the frame ENCLOSING it.
+# - A condition spelled across lines is a frame too: lines are accumulated until the
+#   parentheses balance. This tree has one (src/tests/CMakeLists.txt, `_fc_caveat_msvc_like`).
+function(fastcached_step_frames line framesVar pendingVar codeOut conditionOut unbalancedOut)
+    set(frames "${${framesVar}}")
+    set(pending "${${pendingVar}}")
+    set(condition "")
+    set(unbalanced FALSE)
+
+    string(REGEX REPLACE "(^|[ \t])#.*$" "" code "${line}")
+    if(code MATCHES "^([ \t]*)([A-Za-z_][A-Za-z0-9_]*)([ \t]*\\(.*)$")
+        set(indent "${CMAKE_MATCH_1}")
+        set(command "${CMAKE_MATCH_2}")
+        set(rest "${CMAKE_MATCH_3}")
+        string(TOLOWER "${command}" command)
+        set(code "${indent}${command}${rest}")
+    endif()
+
+    set(statement "")
+    if(NOT pending STREQUAL "")
+        set(statement "${pending} ${code}")
+    elseif(code MATCHES "^[ \t]*(if|elseif)[ \t]*\\(")
+        set(statement "${code}")
+    elseif(code MATCHES "^[ \t]*endif[ \t]*\\(")
+        list(LENGTH frames depth)
+        if(depth GREATER 0)
+            list(POP_BACK frames)
+        else()
+            set(unbalanced TRUE)
+        endif()
+    endif()
+
+    if(NOT statement STREQUAL "")
+        string(REGEX MATCHALL "\\(" opens "${statement}")
+        string(REGEX MATCHALL "\\)" closes "${statement}")
+        list(LENGTH opens openCount)
+        list(LENGTH closes closeCount)
+        if(openCount GREATER closeCount)
+            set(pending "${statement}")
+        else()
+            set(pending "")
+            list(LENGTH frames depth)
+            if(statement MATCHES "^[ \t]*if[ \t]*\\((.*)\\)[ \t]*$")
+                set(condition "${CMAKE_MATCH_1}")
+                list(APPEND frames "${condition}")
+            elseif(statement MATCHES "^[ \t]*elseif[ \t]*\\((.*)\\)[ \t]*$" AND depth GREATER 0)
+                set(condition "${CMAKE_MATCH_1}")
+                list(POP_BACK frames top)
+                list(APPEND frames "${top} ${condition}")
+            else()
+                set(unbalanced TRUE)
+            endif()
+        endif()
+    endif()
+
+    set(${framesVar} "${frames}" PARENT_SCOPE)
+    set(${pendingVar} "${pending}" PARENT_SCOPE)
+    set(${codeOut} "${code}" PARENT_SCOPE)
+    set(${conditionOut} "${condition}" PARENT_SCOPE)
+    set(${unbalancedOut} ${unbalanced} PARENT_SCOPE)
+endfunction()
+
+# Walk @p file's lines and report every declaration and every `add_subdirectory` with the
+# `FASTCACHED_BUILD_*` options its enclosing frames name.
+#
+# Declarations are `<target>|<options>` rows in @p declarationsOut. Directories are
+# `<directory>|<options>|<spelling>` rows in @p directoriesOut, where `<directory>` is empty
+# when the spelling names no path this check can resolve. Every option named by an
+# `if`/`elseif` condition goes in @p conditionsOut. The RAW counts of declarations and of
+# `add_subdirectory` calls, never split into a list, go in @p rawDeclarationsOut and
+# @p rawDirectoriesOut.
+#
+# The raw counts fold case exactly as the walker does, since CMake commands are
+# case-insensitive. A raw count matching lower case alone agrees with a reader that also
+# missed `ADD_EXECUTABLE`, and 0 == 0 proves nothing.
+function(fastcached_read_declarations file declarationsOut directoriesOut conditionsOut rawDeclarationsOut rawDirectoriesOut)
+    file(READ "${file}" content)
+    string(TOLOWER "\n${content}" lowered)
+    string(REGEX MATCHALL "\n[ \t]*add_(executable|library)[ \t]*\\(" rawDeclarations "${lowered}")
+    string(REGEX MATCHALL "\n[ \t]*add_subdirectory[ \t]*\\(" rawDirectories "${lowered}")
+    list(LENGTH rawDeclarations rawDeclarationCount)
+    list(LENGTH rawDirectories rawDirectoryCount)
+
+    fastcached_split_lines_verbatim("${content}" lines)
+    set(frames "")
+    set(pending "")
+    set(declarations "")
+    set(directories "")
+    set(conditions "")
+    set(lineNumber 0)
+    foreach(line IN LISTS lines)
+        math(EXPR lineNumber "${lineNumber} + 1")
+        fastcached_step_frames("${line}" frames pending code condition unbalanced)
+        if(unbalanced)
+            file(RELATIVE_PATH relative "${FASTCACHED_SOURCE_DIR}" "${file}")
+            message(FATAL_ERROR
+                "${relative}:${lineNumber}: an if()/elseif()/endif() this reader could not match to "
+                "its chain. The walk lost track, so every FASTCACHED_BUILD_* condition it would "
+                "report for that file is drawn from the wrong frames.")
+        endif()
+        if(NOT condition STREQUAL "")
+            string(REGEX MATCHALL "FASTCACHED_BUILD_[A-Z_]+" named "${condition}")
+            list(APPEND conditions ${named})
+        endif()
+
+        string(REGEX MATCHALL "FASTCACHED_BUILD_[A-Z_]+" gating "${frames}")
+        list(REMOVE_DUPLICATES gating)
+        string(REPLACE ";" "," gating "${gating}")
+        if(code MATCHES "^[ \t]*add_(executable|library)[ \t]*\\([ \t]*([A-Za-z0-9_.:+-]+)")
+            list(APPEND declarations "${CMAKE_MATCH_2}|${gating}")
+        elseif(code MATCHES "^[ \t]*add_(executable|library)[ \t]*\\(")
+            # Counted by the raw count and named by nothing: the completeness assertion refuses it.
+        elseif(code MATCHES "^[ \t]*add_subdirectory[ \t]*\\((.*)$")
+            set(spelling "${CMAKE_MATCH_1}")
+            set(directory "")
+            # A literal path, optionally quoted, optionally under the source directory's variable.
+            if(spelling MATCHES "^[ \t]*\"?([$][{](CMAKE_CURRENT_SOURCE_DIR|CMAKE_SOURCE_DIR|PROJECT_SOURCE_DIR)[}]/)?([A-Za-z0-9_.-][A-Za-z0-9_./-]*)\"?([ \t)]|$)")
+                set(directory "${CMAKE_MATCH_3}")
+            endif()
+            string(REGEX REPLACE "\\).*$" "" spelling "${spelling}")
+            string(STRIP "${spelling}" spelling)
+            list(APPEND directories "${directory}|${gating}|add_subdirectory(${spelling})")
+        endif()
+    endforeach()
+    list(LENGTH frames openFrames)
+    if(openFrames GREATER 0 OR NOT pending STREQUAL "")
+        file(RELATIVE_PATH relative "${FASTCACHED_SOURCE_DIR}" "${file}")
+        message(FATAL_ERROR
+            "${relative}: ${openFrames} if() block(s) still open, or a condition never closed, at "
+            "end of file; this reader could not follow it, so its FASTCACHED_BUILD_* verdicts for "
+            "that file mean nothing")
+    endif()
+    list(REMOVE_DUPLICATES conditions)
+    set(${declarationsOut} "${declarations}" PARENT_SCOPE)
+    set(${directoriesOut} "${directories}" PARENT_SCOPE)
+    set(${conditionsOut} "${conditions}" PARENT_SCOPE)
+    set(${rawDeclarationsOut} "${rawDeclarationCount}" PARENT_SCOPE)
+    set(${rawDirectoriesOut} "${rawDirectoryCount}" PARENT_SCOPE)
+endfunction()
+
+# Refuse when @p relative's reader collected fewer (or more) of @p what than its raw bytes hold.
+function(fastcached_require_complete relative what rows rawCount)
+    list(LENGTH rows readCount)
+    if(NOT readCount EQUAL rawCount)
+        message(FATAL_ERROR
+            "${relative} holds ${rawCount} ${what} call(s) but only ${readCount} were read. "
+            "The reader lost lines, or a call names its target on a later line -- every "
+            "verdict about the optional targets reached through that file would be drawn from "
+            "a file this check can no longer see in full.")
+    endif()
+endfunction()
+
+set(rootFile "${FASTCACHED_SOURCE_DIR}/CMakeLists.txt")
+if(NOT EXISTS "${rootFile}")
+    message(FATAL_ERROR "the root CMakeLists.txt is missing: ${rootFile}")
+endif()
+fastcached_read_declarations("${rootFile}"
+    rootDeclarations rootDirectories rootConditions rootRawDeclarations rootRawDirectories)
+fastcached_require_complete("CMakeLists.txt" "add_library/add_executable" "${rootDeclarations}" "${rootRawDeclarations}")
+fastcached_require_complete("CMakeLists.txt" "add_subdirectory" "${rootDirectories}" "${rootRawDirectories}")
+
+file(READ "${rootFile}" rootContent)
+string(REGEX MATCHALL "[oO][pP][tT][iI][oO][nN][ \t]*\\([ \t]*FASTCACHED_BUILD_[A-Z_]+" rootOptionCalls "${rootContent}")
+set(rootOptions "")
+foreach(call IN LISTS rootOptionCalls)
+    string(REGEX MATCH "FASTCACHED_BUILD_[A-Z_]+" option "${call}")
+    list(APPEND rootOptions "${option}")
+endforeach()
+list(REMOVE_DUPLICATES rootOptions)
+foreach(option IN LISTS rootOptions)
+    if(NOT option IN_LIST rootConditions)
+        message(FATAL_ERROR
+            "CMakeLists.txt declares option(${option}) but no if() naming it was read. Either "
+            "the reader lost lines -- and with them every directory and target that option "
+            "gates -- or the option gates nothing this check can see.")
+    endif()
+endforeach()
+
+set(gatedTargets "")
+set(gatedFiles "")
+set(gatedSourceFiles "")
+foreach(row IN LISTS rootDeclarations)
+    string(REPLACE "|" ";" fields "${row}")
+    list(GET fields 0 target)
+    list(LENGTH fields fieldCount)
+    if(fieldCount GREATER 1)
+        list(GET fields 1 gating)
+        if(NOT gating STREQUAL "")
+            list(APPEND gatedTargets "${target}")
+            set("optionalOrigin_${target}" "declared in CMakeLists.txt inside if(${gating})")
+            # NOT exempt in the root, unlike a gated directory's file below: the root runs
+            # whether the option is on or not, so a reference to this target anywhere in it
+            # needs its guard like any other.
+        endif()
+    endif()
+endforeach()
+
+foreach(row IN LISTS rootDirectories)
+    string(REPLACE "|" ";" fields "${row}")
+    list(GET fields 0 directory)
+    list(GET fields 1 gating)
+    list(GET fields 2 spelling)
+    if(gating STREQUAL "")
+        continue()
+    endif()
+    if(directory STREQUAL "")
+        message(FATAL_ERROR
+            "CMakeLists.txt calls ${spelling} under ${gating}, which this check cannot resolve to "
+            "a directory -- only a literal path, optionally quoted and optionally under "
+            "\${CMAKE_CURRENT_SOURCE_DIR}, is read. Every target that directory declares would "
+            "be unseen, and a reference to one unguarded would pass.")
+    endif()
+    if(directory MATCHES "^src(/|$)")
+        continue()
+    endif()
+    set(gatedFile "${FASTCACHED_SOURCE_DIR}/${directory}/CMakeLists.txt")
+    set(gatedRelative "${directory}/CMakeLists.txt")
+    if(NOT EXISTS "${gatedFile}")
+        message(FATAL_ERROR
+            "CMakeLists.txt adds ${directory} under ${gating}, but ${gatedRelative} does not exist")
+    endif()
+    fastcached_read_declarations("${gatedFile}"
+        declarations ignoredDirectories ignoredConditions rawCount ignoredRawDirectories)
+    fastcached_require_complete("${gatedRelative}" "add_library/add_executable" "${declarations}" "${rawCount}")
+    if(rawCount EQUAL 0)
+        message(FATAL_ERROR
+            "CMakeLists.txt adds ${directory} under ${gating}, but ${gatedRelative} declares no "
+            "target: a gated directory that yields nothing cannot be told from one this check "
+            "could not read")
+    endif()
+    list(APPEND gatedFiles "${gatedFile}")
+    list(APPEND gatedSourceFiles "${gatedRelative}")
+    foreach(declaration IN LISTS declarations)
+        string(REPLACE "|" ";" parts "${declaration}")
+        list(GET parts 0 target)
+        list(APPEND gatedTargets "${target}")
+        set("optionalOrigin_${target}" "declared in ${gatedRelative}, which CMakeLists.txt adds only under ${gating}")
+        set("declaredIn_${target}" "${gatedRelative}")
+    endforeach()
+endforeach()
+
+if(NOT gatedSourceFiles)
+    message(FATAL_ERROR
+        "no directory outside src/ is added by CMakeLists.txt under a FASTCACHED_BUILD_* option, "
+        "so the second source of optional targets read nothing; this check would pass vacuously "
+        "for every target vendor/ declares. If the tree really gates no such directory any more, "
+        "this reader and its floor go with it -- they exist for #1369.")
+endif()
+list(REMOVE_DUPLICATES gatedTargets)
+list(LENGTH gatedTargets gatedTargetCount)
+list(LENGTH gatedSourceFiles gatedSourceCount)
+
+set(checkedTargets ${optionalTargets} ${gatedTargets})
+list(REMOVE_DUPLICATES checkedTargets)
 
 # ---------------------------------------------------------------------------
 # Every file that may register a test. A file this does not scan is a hole that
 # reports green.
 file(GLOB_RECURSE cmakeFiles "${FASTCACHED_SOURCE_DIR}/src/*CMakeLists.txt")
+list(APPEND cmakeFiles "${rootFile}" ${gatedFiles})
+list(REMOVE_DUPLICATES cmakeFiles)
 
 set(violations "")
 set(referenceCount 0)
@@ -209,19 +524,21 @@ foreach(cmakeFile IN LISTS cmakeFiles)
     # than parsing the boolean, is deliberate -- this guard is about the
     # question having been asked at all.
     set(frames "")
+    set(pending "")
+    set(lostTrack FALSE)
     set(lineNumber 0)
 
     foreach(line IN LISTS lines)
         math(EXPR lineNumber "${lineNumber} + 1")
 
-        if(line MATCHES "^[ \t]*if[ \t]*\\((.*)\\)[ \t]*$")
-            list(APPEND frames "${CMAKE_MATCH_1}")
-        elseif(line MATCHES "^[ \t]*elseif[ \t]*\\((.*)\\)[ \t]*$")
-            set(extra "${CMAKE_MATCH_1}")
-            list(POP_BACK frames top)
-            list(APPEND frames "${top} ${extra}")
-        elseif(line MATCHES "^[ \t]*endif[ \t]*\\(")
-            list(POP_BACK frames)
+        # The same walker the declaration reader uses, so a trailing comment, a
+        # condition spelled across lines and an upper-case `IF` are followed alike.
+        # Losing track is reported once per file, where it happened.
+        fastcached_step_frames("${line}" frames pending ignoredCode ignoredCondition unbalanced)
+        if(unbalanced AND NOT lostTrack)
+            set(lostTrack TRUE)
+            list(APPEND violations
+                 "${relative}:${lineNumber}: an if()/elseif()/endif() this checker could not match to its chain; it lost track here, so its verdicts on the rest of this file mean nothing")
         endif()
 
         # A comment naming the expression is prose, not a reference. The
@@ -232,11 +549,16 @@ foreach(cmakeFile IN LISTS cmakeFiles)
             continue()
         endif()
 
-        foreach(target IN LISTS optionalTargets)
+        foreach(target IN LISTS checkedTargets)
             if(NOT line MATCHES "\\$<TARGET_FILE:${target}>")
                 continue()
             endif()
             if(target STREQUAL selfTarget)
+                continue()
+            endif()
+            # A gated file is read only when its option is on, so its own targets exist
+            # there by construction -- the second source's form of `selfTarget`.
+            if(DEFINED "declaredIn_${target}" AND relative STREQUAL "${declaredIn_${target}}")
                 continue()
             endif()
             math(EXPR referenceCount "${referenceCount} + 1")
@@ -273,7 +595,7 @@ foreach(cmakeFile IN LISTS cmakeFiles)
                 math(EXPR guardedCount "${guardedCount} + 1")
             else()
                 list(APPEND violations
-                     "${relative}:${lineNumber}: $<TARGET_FILE:${target}> is reached without any enclosing `TARGET ${target}` condition")
+                     "${relative}:${lineNumber}: $<TARGET_FILE:${target}> is reached without any enclosing `TARGET ${target}` condition (optional because it is ${optionalOrigin_${target}})")
             endif()
         endforeach()
     endforeach()
@@ -282,10 +604,10 @@ foreach(cmakeFile IN LISTS cmakeFiles)
     # from that file afterwards was drawn from the wrong conditions. Reported
     # rather than absorbed: a checker that quietly recovers is one that quietly
     # stops checking.
-    if(frames)
-        list(LENGTH frames leftOver)
+    list(LENGTH frames leftOver)
+    if(leftOver GREATER 0 OR NOT pending STREQUAL "")
         list(APPEND violations
-             "${relative}: ${leftOver} unclosed if() block(s) at end of file; this checker could not follow it, so its verdicts on this file mean nothing")
+             "${relative}: ${leftOver} unclosed if() block(s), or a condition never closed, at end of file; this checker could not follow it, so its verdicts on this file mean nothing")
     endif()
 endforeach()
 
@@ -295,7 +617,7 @@ endforeach()
 # be a statement about the checker rather than about the tree.
 if(referenceCount EQUAL 0)
     message(FATAL_ERROR
-        "no $<TARGET_FILE:> reference to any of the ${optionalTargetCount} optional targets was found at all; "
+        "no $<TARGET_FILE:> reference to any of the ${optionalTargetCount} + ${gatedTargetCount} optional targets was found at all; "
         "this check would pass vacuously")
 endif()
 
@@ -318,4 +640,6 @@ if(violations)
 endif()
 
 message(STATUS
-    "target-file guard hygiene: ${guardedCount} reference(s) to ${optionalTargetCount} optional target(s), all guarded")
+    "target-file guard hygiene: ${guardedCount} reference(s) to ${optionalTargetCount} optional target(s) "
+    "from the app table and ${gatedTargetCount} from ${gatedSourceCount} gated file(s) outside src/ "
+    "(${gatedSourceFiles}), all guarded")
