@@ -49,6 +49,15 @@ else()
     set(_fc_cli_tui_tests "")
 endif()
 
+# The Sixel rung's encoder follows the same split: `EndoSixelEncoder.cpp` is the one file that
+# includes the vendored `<tui/Sixel.hpp>`, and a build without it refuses by saying why.
+if(TARGET fastcache-tui)
+    list(APPEND _fc_cli_sources EndoSixelEncoder.cpp)
+    list(APPEND _fc_cli_tui_tests SixelEncoder_test.cpp)
+else()
+    list(APPEND _fc_cli_sources SixelEncoderUnavailable.cpp)
+endif()
+
 add_executable(fastcache-cli main.cpp ${_fc_cli_sources})
 target_include_directories(fastcache-cli PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 target_link_libraries(fastcache-cli PRIVATE FastCache)
