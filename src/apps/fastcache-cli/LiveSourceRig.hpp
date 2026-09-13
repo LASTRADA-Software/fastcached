@@ -111,6 +111,47 @@ struct TerminalRelease
     bool closedFirst { false }; ///< It had been closed when it was, as its contract asks.
 };
 
+/// What a started terminal's presenter was given.
+struct PresenterRecord
+{
+    /// A presenter that counts into a record the acquisition keeps.
+    class Sink final: public IFrameSink
+    {
+      public:
+        /// @param record Where it counts; outlives the sink.
+        explicit Sink(PresenterRecord* record) noexcept:
+            _record { record }
+        {
+        }
+
+        Sink(Sink const&) = delete;
+        Sink(Sink&&) = delete;
+        Sink& operator=(Sink const&) = delete;
+        Sink& operator=(Sink&&) = delete;
+
+        ~Sink() override
+        {
+            _record->released = true;
+            _record->afterEvents = _record->events != nullptr && _record->events->released;
+        }
+
+        void Present(std::string_view frame) override
+        {
+            ++_record->frames;
+            _record->last = frame;
+        }
+
+      private:
+        PresenterRecord* _record;
+    };
+
+    TerminalRelease const* events { nullptr }; ///< What became of the events it presented over.
+    std::size_t frames { 0 };                  ///< How many frames were presented.
+    std::string last {};                       ///< The newest frame.
+    bool released { false };                   ///< Whether the presenter was destroyed.
+    bool afterEvents { false };                ///< Whether it was destroyed after the events were.
+};
+
 /// A terminal a case speaks for, one event at a time.
 ///
 /// It parks on an empty queue exactly as a terminal read parks on an idle input, and it
@@ -266,6 +307,7 @@ struct Rig
                                  .clock = &clock,
                                  .interval = Interval,
                                  .terminal = nullptr,
+                                 .frames = nullptr,
                                  .stop = nullptr,
                                  .stopWaiter = nullptr };
     }

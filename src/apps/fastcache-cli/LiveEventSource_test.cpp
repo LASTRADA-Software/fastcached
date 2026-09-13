@@ -224,6 +224,44 @@ TEST_CASE("a terminal that goes away ends the session", "[cli][live][source]")
     CloseAndDrain(rig, source);
 }
 
+TEST_CASE("a terminal's presenter goes before its events, and a frame after the terminal went away is dropped",
+          "[cli][live][source]")
+{
+    // A sample and its tick can be queued ahead of the terminal's `Detached`: the loop draws them
+    // after the events are gone and the operator's own screen is back. That frame must not land.
+    Rig rig;
+    auto presented = PresenterRecord { .events = &rig.terminalRelease };
+    auto parts = rig.SpokenParts();
+    parts.frames = std::make_unique<PresenterRecord::Sink>(&presented);
+    LiveEventSource source { std::move(parts) };
+    auto* const frames = source.Frames();
+    REQUIRE(frames != nullptr);
+    rig.Settle();
+
+    frames->Present("while the terminal is there");
+    CHECK(presented.frames == 1);
+
+    rig.terminal->GoAway();
+    rig.Settle();
+    REQUIRE(rig.terminalRelease.released);
+    CHECK(presented.released);
+    CHECK_FALSE(presented.afterEvents);
+
+    frames->Present("after it went away");
+    CHECK(presented.frames == 1);
+    CHECK(presented.last == "while the terminal is there");
+
+    CloseAndDrain(rig, source);
+}
+
+TEST_CASE("a source with no presenter hands the loop none", "[cli][live][source]")
+{
+    Rig rig;
+    LiveEventSource source { rig.SpokenParts() };
+    CHECK(source.Frames() == nullptr);
+    CloseAndDrain(rig, source);
+}
+
 TEST_CASE("a run with no terminal takes its whole sample budget", "[cli][live][source]")
 {
     Rig rig;
