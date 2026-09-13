@@ -11,6 +11,7 @@
 
 #include <chrono>
 #include <format>
+#include <memory>
 #include <optional>
 #include <ranges>
 #include <string>
@@ -1086,4 +1087,57 @@ TEST_CASE("the model's fleet document is the newest reading's and nothing older"
     CHECK(bodyAt(3) == "third");
     CHECK(bodyAt(4) == "<null>"); // a failed sample replaces it too
     CHECK(bodyAt(5) == "fifth");
+}
+
+namespace
+{
+
+/// A view that watches the model's fleet document without keeping it alive.
+///
+/// **Weak, deliberately.** `RecordingView` copies the whole model, and a copied `shared_ptr` is
+/// itself an owner -- a view recording that way would keep every document alive and could never see
+/// one released.
+class DocumentWatchingView final: public IDashboardView
+{
+  public:
+    [[nodiscard]] std::string Frame(DashboardModel const& model) override
+    {
+        seen.emplace_back(model.latestDocument);
+        return {};
+    }
+
+    std::vector<std::weak_ptr<FleetDocument const>> seen {};
+};
+
+} // namespace
+
+TEST_CASE("after many fleet samples exactly one document is alive, and the history holds none", "[cli][dashboard]")
+{
+    // History exists for trends and rates. WHAT DISTINGUISHES: every document an earlier frame drew
+    // has been RELEASED once a later sample replaced it -- a fold that kept documents in its history
+    // entries would keep each of them alive -- while the newest is alive and owned by the model alone.
+    constexpr auto Samples = 6;
+    auto script = std::vector<DashboardEvent> {};
+    for (auto const second: std::views::iota(1, Samples + 1))
+    {
+        script.push_back(
+            DashboardEvent { .kind = DashboardEventKind::Sample,
+                             .at = At(second),
+                             .document = std::expected<std::string, AdminError> { std::format("body-{}", second) } });
+        script.push_back(DashboardEvent { .kind = DashboardEventKind::Tick });
+    }
+
+    auto view = DocumentWatchingView {};
+    auto sink = CollectingSink {};
+    auto const exit = Drive(std::move(script), DashboardLimits {}, view, sink, &HandingReader);
+
+    REQUIRE(view.seen.size() == static_cast<std::size_t>(Samples));
+    for (auto const frame: std::views::iota(std::size_t { 0 }, view.seen.size() - 1))
+    {
+        INFO("frame " << frame);
+        CHECK(view.seen[frame].expired());
+    }
+    CHECK_FALSE(view.seen.back().expired());
+    CHECK(exit.model.latestDocument.use_count() == 1);
+    CHECK(exit.model.history.size() == static_cast<std::size_t>(Samples));
 }
