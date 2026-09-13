@@ -1189,10 +1189,11 @@ class BoundedDyingGatherer final: public IStatsGatherer
 class StreamingSink final: public IFrameSink
 {
   public:
-    void Present(std::string_view frame) override
+    // The stream is text: no case here reads an image.
+    void PresentPlaced(DashboardFrame const& frame) override
     {
         auto const lock = std::scoped_lock { _mutex };
-        _stream += frame;
+        _stream += frame.text;
     }
 
     /// @return Everything presented so far.

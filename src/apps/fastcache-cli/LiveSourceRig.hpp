@@ -197,12 +197,6 @@ struct PresenterRecord
             _record->afterEvents = _record->events != nullptr && _record->events->released;
         }
 
-        void Present(std::string_view frame) override
-        {
-            ++_record->frames;
-            _record->last = frame;
-        }
-
         void PresentPlaced(DashboardFrame const& frame) override
         {
             ++_record->frames;
@@ -217,7 +211,7 @@ struct PresenterRecord
     TerminalRelease const* events { nullptr }; ///< What became of the events it presented over.
     std::size_t frames { 0 };                  ///< How many frames were presented.
     std::string last {};                       ///< The newest frame.
-    std::vector<FramePlacement> placements {}; ///< The images of the newest frame that placed any.
+    std::vector<FramePlacement> placements {}; ///< The newest frame's images.
     bool released { false };                   ///< Whether the presenter was destroyed.
     bool afterEvents { false };                ///< Whether it was destroyed after the events were.
 };
@@ -327,7 +321,7 @@ class CountView final: public IDashboardView
 class CountSink final: public IFrameSink
 {
   public:
-    void Present(std::string_view /*frame*/) override
+    void PresentPlaced(DashboardFrame const& /*frame*/) override
     {
         ++frames;
     }
