@@ -3,9 +3,11 @@
 #include "DashboardPanel.hpp"
 #include "DashboardPanels.hpp"
 #include "DashboardRig.hpp"
+#include "FleetChartModel.hpp"
 #include "FleetDocument.hpp"
 #include "FleetReading.hpp"
 #include "ScriptedCellWidth.hpp"
+#include "ScriptedSixelEncoder.hpp"
 #include "StatsSource.hpp"
 
 #include <FastCache/Cache/StorageTier.hpp>
@@ -1273,4 +1275,143 @@ TEST_CASE("the fleet table drawn is the section the context names, and the strip
               Lines(frame),
               [](std::string const& line) { return Trimmed(Columns(line, 1, FakeCellWidth(line) - 2)) == Absent; })
           == 1);
+}
+
+namespace
+{
+
+/// The cell size every chart case reports: small enough that a chart's pixels stay few.
+constexpr auto ChartCell = CellPixelSize { .width = 4, .height = 8 };
+
+/// A document with the headline strip and a machines section carrying the chart's two columns.
+/// @param busy Each machine's `cpu-busy`, in thousandths; `-` for a machine nobody read.
+/// @return The text.
+[[nodiscard]] std::string ChartText(std::vector<std::string> const& busy)
+{
+    auto const& metric = FleetChartMetrics.front();
+    auto text = FleetText(0);
+    // `FleetText` ends with its machines heading; replace that section with one the chart reads.
+    text = text.substr(0,
+                       text.find(std::format(
+                           "# {}", Distributed::FleetSectionTable[static_cast<std::size_t>(FleetSection::Machines)].key)));
+    text += std::format("# {}\n{}\t{}\n",
+                        Distributed::FleetSectionTable[static_cast<std::size_t>(metric.section)].key,
+                        metric.subjectColumn,
+                        metric.valueColumn);
+    for (auto const index: std::views::iota(std::size_t { 0 }, busy.size()))
+        text += std::format("build-{:02}:7070\t{}\n", index + 1, busy[index]);
+    return text;
+}
+
+/// What a fleet session drew: the frames, and every image the encoder was asked for.
+struct ChartDrawing
+{
+    std::vector<std::string> frames;                     ///< Each frame's text.
+    std::vector<std::vector<FramePlacement>> placements; ///< Each frame's images.
+    std::vector<SixelRequest> requests;                  ///< What the encoder was asked to draw.
+};
+
+/// Draw three fleet samples and one frame through the fleet panel.
+/// @param rung The rung.
+/// @param cellPixels The cell size the resize carries, or nullopt.
+/// @param columns The terminal's width.
+/// @param rows The terminal's height.
+/// @return What was drawn.
+[[nodiscard]] ChartDrawing DrawChart(RenderRung rung, std::optional<CellPixelSize> cellPixels, int columns, int rows)
+{
+    auto encoder = ScriptedSixelEncoder {};
+    auto view = PanelView {
+        FleetPanel(),
+        PanelContext { .absent = std::string { Absent }, .cellWidth = &FakeCellWidth, .sixel = &encoder, .rung = rung }
+    };
+    auto sink = CollectingSink {};
+    (void) Drive(
+        { DashboardEvent { .kind = DashboardEventKind::Resize, .columns = columns, .rows = rows, .cellPixels = cellPixels },
+          FleetSampleOf(1, ChartText({ "100", "900", "500" })),
+          FleetSampleOf(2, ChartText({ "200", "-", "600" })),
+          FleetSampleOf(3, ChartText({ "300", "800", "700" })),
+          Tick },
+        DashboardLimits {},
+        view,
+        sink,
+        &ReadFleetSample);
+    return ChartDrawing { .frames = sink.frames, .placements = sink.placements, .requests = encoder.Requests() };
+}
+
+} // namespace
+
+TEST_CASE("at the Sixel rung the fleet chart is one image exactly the size of the cells it covers",
+          "[cli][dashboard][panel][fleet][chart]")
+{
+    // #134's Sixel acceptance. WHAT DISTINGUISHES: one placement, and the encoder was asked for an image
+    // of cellsWide times the cell width by cellsHigh times the cell height -- a chart sized in any other
+    // unit spills over or leaves a band blank -- over cells the frame's text left blank, with some pixel
+    // drawn, since an all-transparent image would pass every size check.
+    auto const drawing = DrawChart(RenderRung::Sixel, ChartCell, 100, 60);
+    REQUIRE(drawing.frames.size() == 1);
+    REQUIRE(drawing.placements.size() == 1);
+    REQUIRE(drawing.placements[0].size() == 1);
+    REQUIRE(drawing.requests.size() == 1);
+    auto const& placement = drawing.placements[0][0];
+    auto const& request = drawing.requests[0];
+    CHECK(request.width == placement.cellsWide * ChartCell.width);
+    CHECK(request.height == placement.cellsHigh * ChartCell.height);
+    CHECK(placement.cellsHigh == Unwrap(FleetPanel().document).chartCellsHigh);
+    CHECK(placement.sixel == std::format("sixel:{}x{}", request.width, request.height));
+
+    auto const lines = Lines(drawing.frames[0]);
+    REQUIRE(placement.row + placement.cellsHigh - 1 <= lines.size());
+    for (auto const row: std::views::iota(placement.row, placement.row + placement.cellsHigh))
+    {
+        INFO("frame row " << row);
+        CHECK(Trimmed(Columns(lines[row - 1], placement.column - 1, placement.cellsWide)).empty());
+    }
+    auto drawn = std::size_t { 0 };
+    for (auto const pixel: std::views::iota(std::size_t { 0 }, request.pixels.size() / 4))
+        drawn += request.pixels[(pixel * 4) + 3] != 0 ? 1 : 0;
+    CHECK(drawn > 0);
+}
+
+TEST_CASE("below the Sixel rung, or without a cell size, the fleet panel draws no chart and keeps no rows for one",
+          "[cli][dashboard][panel][fleet][chart]")
+{
+    // WHAT DISTINGUISHES: the Unicode frame asks the encoder for nothing and places nothing, and is SHORTER
+    // than the Sixel one by the chart's rows -- blank rows left behind would be the chart faked -- and a
+    // Sixel rung with no cell size draws exactly the Unicode frame, since no size is ever guessed.
+    auto const sixel = DrawChart(RenderRung::Sixel, ChartCell, 100, 60);
+    auto const unicode = DrawChart(RenderRung::Unicode, ChartCell, 100, 60);
+    auto const unmeasured = DrawChart(RenderRung::Sixel, std::nullopt, 100, 60);
+    REQUIRE(unicode.frames.size() == 1);
+    REQUIRE(unmeasured.frames.size() == 1);
+    CHECK(unicode.requests.empty());
+    CHECK(unicode.placements.at(0).empty());
+    CHECK(Lines(unicode.frames[0]).size() + Unwrap(FleetPanel().document).chartCellsHigh + 1
+          == Lines(sixel.frames.at(0)).size());
+    CHECK(unmeasured.requests.empty());
+    CHECK(unmeasured.placements.at(0).empty());
+    CHECK(unmeasured.frames[0] == unicode.frames[0]);
+}
+
+TEST_CASE("the fleet chart goes for height before the tiles, and below its width it is not drawn",
+          "[cli][dashboard][panel][fleet][chart]")
+{
+    // The chart is an item in the drop order like any other. WHAT DISTINGUISHES: at the tallest height
+    // without the chart, the headline tiles are still there -- the chart went first -- and at a width
+    // under the chart's minimum there is no image while the table still draws.
+    auto shortest = std::optional<int> {};
+    for (auto const rows: std::views::iota(8, 61) | std::views::reverse)
+        if (DrawChart(RenderRung::Sixel, ChartCell, 100, rows).placements.at(0).empty())
+        {
+            shortest = rows;
+            break;
+        }
+    REQUIRE(shortest.has_value());
+    auto const without = DrawChart(RenderRung::Sixel, ChartCell, 100, Unwrap(shortest));
+    CHECK(without.frames.at(0).contains(Distributed::FleetKpiKeys().front()));
+    CHECK(DrawChart(RenderRung::Sixel, ChartCell, 100, Unwrap(shortest) + 1).placements.at(0).size() == 1);
+
+    auto const narrow = DrawChart(RenderRung::Sixel, ChartCell, 24, 60);
+    CHECK(narrow.placements.at(0).empty());
+    CHECK(narrow.requests.empty());
+    CHECK(LineStarting(narrow.frames.at(0), "endpoint").has_value());
 }

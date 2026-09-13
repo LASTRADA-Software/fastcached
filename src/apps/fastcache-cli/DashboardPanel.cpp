@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "DashboardPanel.hpp"
+#include "FleetChartModel.hpp"
 #include "FleetDocument.hpp"
 
 #include <FastCache/Cache/StorageTier.hpp>
@@ -344,8 +345,16 @@ namespace
     {
         std::vector<std::string> lines {};      ///< Its lines; a table's first is its heading.
         Priority priority { Priority::Normal }; ///< When it goes.
-        bool table { false };                   ///< Whether it shrinks to `+N more` before it goes.
         std::size_t hidden { 0 };               ///< How many of a table's rows are not shown.
+        bool table { false };                   ///< Whether it shrinks to `+N more` before it goes.
+        bool image { false };                   ///< Whether its lines are blank cells an image is placed over.
+    };
+
+    /// The lines a layout keeps, and where its image item landed if it kept one.
+    struct FittedRows
+    {
+        std::vector<std::string> lines {};       ///< Every kept line, top to bottom.
+        std::optional<std::size_t> imageLine {}; ///< The index of the image item's first line, when kept.
     };
 
     /// How many lines @p item draws as it stands.
@@ -402,9 +411,8 @@ namespace
     /// everything else has gone.
     /// @param items The frame's items, top to bottom.
     /// @param available The lines available, or nullopt for no limit.
-    /// @return The lines; nullopt when the essential items alone do not fit.
-    [[nodiscard]] std::optional<std::vector<std::string>> FitRows(std::vector<Item> items,
-                                                                  std::optional<std::size_t> available)
+    /// @return The lines, and where the image item landed; nullopt when the essential items alone do not fit.
+    [[nodiscard]] std::optional<FittedRows> FitRows(std::vector<Item> items, std::optional<std::size_t> available)
     {
         auto total = std::size_t { 0 };
         for (auto const& item: items)
@@ -455,10 +463,13 @@ namespace
         }
 
         auto lines = std::vector<std::string> {};
+        auto imageLine = std::optional<std::size_t> {};
         for (auto& item: items)
         {
             if (!item.table)
             {
+                if (item.image)
+                    imageLine = lines.size();
                 std::ranges::move(item.lines, std::back_inserter(lines));
                 continue;
             }
@@ -467,14 +478,14 @@ namespace
             if (item.hidden > 0)
                 lines.push_back(std::format("{}+{} more", Indent, item.hidden));
         }
-        return lines;
+        return FittedRows { .lines = std::move(lines), .imageLine = imageLine };
     }
 
     /// A blank separator.
     /// @return The item.
     [[nodiscard]] Item Blank()
     {
-        return Item { .lines = { std::string {} }, .priority = Priority::Spacing, .table = false, .hidden = 0 };
+        return Item { .lines = { std::string {} }, .priority = Priority::Spacing, .hidden = 0, .table = false };
     }
 
     /// The pieces of a line joined, the trend drawn where the trend piece stands.
@@ -685,6 +696,9 @@ namespace
         }
         return items;
     }
+
+    /// The palette ceiling a chart is encoded with: its ramp's eight colours fit without merging.
+    constexpr auto ChartColours = std::size_t { 16 };
 
     /// What separates two headline tiles on one line.
     constexpr std::string_view TileGap = "   ";
@@ -920,27 +934,53 @@ namespace
         return std::vector<Item> { std::move(item) };
     }
 
+    /// The Sixel chart's blank cells, on the rung and terminal that can draw it; nothing otherwise.
+    /// @param in The frame's inputs.
+    /// @param spec The document block.
+    /// @param context The session facts: the rung and the encoder.
+    /// @param budget The content width.
+    /// @return The chart item, or none.
+    [[nodiscard]] std::vector<Item> ChartItems(FrameInputs const& in,
+                                               DocumentSpec const& spec,
+                                               PanelContext const& context,
+                                               std::size_t budget)
+    {
+        auto const indent = in.cellWidth(Indent);
+        if (context.rung != RenderRung::Sixel || context.sixel == nullptr || !in.model->cellPixels.has_value()
+            || spec.chartCellsHigh == 0 || budget < indent + spec.chartMinimumCells)
+            return {};
+        return { Item { .lines = std::vector<std::string>(spec.chartCellsHigh, std::string {}),
+                        .priority = spec.chartPriority,
+                        .image = true } };
+    }
+
     /// The fleet document block: the tiles, a blank, the strip and the active section's table.
     /// @param in The frame's inputs.
     /// @param spec The panel.
-    /// @param section The section the table draws.
+    /// @param context The session facts: the section the table draws, the rung and the encoder.
     /// @param budget The content width.
     /// @return The block, nothing for a panel without one, or the cells the table's first column needed.
     [[nodiscard]] std::expected<std::vector<Item>, std::size_t> DocumentItems(FrameInputs const& in,
                                                                               PanelSpec const& spec,
-                                                                              FleetSection section,
+                                                                              PanelContext const& context,
                                                                               std::size_t budget)
     {
         auto items = std::vector<Item> {};
         if (!spec.document.has_value())
             return items;
-        auto table = SectionItems(in, *spec.document, section, budget);
+        auto table = SectionItems(in, *spec.document, context.section, budget);
         if (!table.has_value())
             return std::unexpected(table.error());
         std::ranges::move(TileItems(in, *spec.document, budget), std::back_inserter(items));
         if (!items.empty())
             items.push_back(Blank());
-        std::ranges::move(StripItems(in, *spec.document, section, budget), std::back_inserter(items));
+        auto chart = ChartItems(in, *spec.document, context, budget);
+        if (!chart.empty())
+        {
+            std::ranges::move(chart, std::back_inserter(items));
+            items.push_back(Blank());
+        }
+        std::ranges::move(StripItems(in, *spec.document, context.section, budget), std::back_inserter(items));
         std::ranges::move(*table, std::back_inserter(items));
         return items;
     }
@@ -1055,6 +1095,11 @@ PanelView::PanelView(PanelSpec const& spec, PanelContext context):
 
 std::string PanelView::Frame(DashboardModel const& model)
 {
+    return PlacedFrame(model).text;
+}
+
+DashboardFrame PanelView::PlacedFrame(DashboardModel const& model)
+{
     auto const in = FrameInputs { .model = &model,
                                   .origin = OriginOf(model),
                                   .glyphs = _glyphs,
@@ -1066,11 +1111,13 @@ std::string PanelView::Frame(DashboardModel const& model)
         reportedRows > 0 ? std::optional<std::size_t> { reportedRows - std::min(reportedRows, FrameRows) } : std::nullopt;
     auto const minimum = MinimumPanelSize(*_spec, in.cellWidth);
     auto const tooSmall = [&](std::size_t neededColumns) {
-        return TooSmall(_spec->title,
-                        PanelSize { .columns = std::max(minimum.columns, neededColumns), .rows = minimum.rows },
-                        columns,
-                        reportedRows,
-                        in.cellWidth);
+        return DashboardFrame { .text = TooSmall(
+                                    _spec->title,
+                                    PanelSize { .columns = std::max(minimum.columns, neededColumns), .rows = minimum.rows },
+                                    columns,
+                                    reportedRows,
+                                    in.cellWidth),
+                                .placements = {} };
     };
     // No early refusal against `minimum`: the layout below is the one judge of what fits, and the
     // minimum only NAMES the size. That keeps `MinimumPanelSize` a claim the layout can contradict --
@@ -1086,7 +1133,7 @@ std::string PanelView::Frame(DashboardModel const& model)
     auto rates = RateItems(in, _spec->rates, budget, _besideReserve);
     auto levels = LevelItems(in, _spec->levels, budget);
     auto tiers = TierItems(in, *_spec, budget);
-    auto document = DocumentItems(in, *_spec, _context.section, budget);
+    auto document = DocumentItems(in, *_spec, _context, budget);
     for (auto const* block: { &rates, &levels, &tiers, &document })
         if (!block->has_value())
             return tooSmall(block->error() + FrameColumns);
@@ -1107,8 +1154,8 @@ std::string PanelView::Frame(DashboardModel const& model)
     if (!source->empty())
         items.push_back(Item { .lines = { Joined(*source, {}) }, .priority = _spec->sourcePriority });
 
-    auto const lines = FitRows(std::move(items), available);
-    if (!lines.has_value())
+    auto const fitted = FitRows(std::move(items), available);
+    if (!fitted.has_value())
         return tooSmall(0);
 
     auto title = std::string { _spec->title };
@@ -1116,7 +1163,31 @@ std::string PanelView::Frame(DashboardModel const& model)
         title += "  " + _context.endpoint;
     if (_context.interval.has_value())
         title += std::format("  every {}s", std::chrono::duration<double> { *_context.interval }.count());
-    return Cli::Frame(title, *lines, columns, *_glyphs, in.cellWidth);
+    auto frame =
+        DashboardFrame { .text = Cli::Frame(title, fitted->lines, columns, *_glyphs, in.cellWidth), .placements = {} };
+
+    // The chart kept its rows: draw the image over them. The frame's first row is its top edge and its
+    // first column its left edge, so a content line's frame row is its index plus two and the chart's
+    // first cell sits after the edge and the indent.
+    if (fitted->imageLine.has_value() && _spec->document.has_value() && model.cellPixels.has_value()
+        && _context.sixel != nullptr)
+    {
+        auto const cellsWide = budget - in.cellWidth(Indent);
+        auto const cellsHigh = _spec->document->chartCellsHigh;
+        auto const raster = FleetChartRaster(model.history,
+                                             FleetChartMetrics.front(),
+                                             cellsWide * model.cellPixels->width,
+                                             cellsHigh * model.cellPixels->height);
+        auto encoded = _context.sixel->Encode(
+            RgbaImage { .pixels = raster.rgba, .width = raster.width, .height = raster.height }, ChartColours);
+        if (encoded.has_value())
+            frame.placements.push_back(FramePlacement { .row = *fitted->imageLine + 2,
+                                                        .column = 2 + in.cellWidth(Indent),
+                                                        .cellsWide = cellsWide,
+                                                        .cellsHigh = cellsHigh,
+                                                        .sixel = std::move(*encoded) });
+    }
+    return frame;
 }
 
 } // namespace FastCache::Cli
