@@ -106,10 +106,15 @@ class ScriptedAcquisition final: public ITerminalAcquisition
     /// @param reactor Where the answer parks.
     /// @param answer What the terminal reports, or why it cannot be acquired.
     /// @param detachAtOnce Whether the acquired terminal goes away before its first read.
-    ScriptedAcquisition(IReactor& reactor, std::expected<TerminalCapabilities, std::string> answer, bool detachAtOnce):
+    /// @param noPresenter Whether the started terminal names nowhere to draw frames.
+    ScriptedAcquisition(IReactor& reactor,
+                        std::expected<TerminalCapabilities, std::string> answer,
+                        bool detachAtOnce,
+                        bool noPresenter = false):
         _reactor { reactor },
         _answer { std::move(answer) },
-        _detachAtOnce { detachAtOnce }
+        _detachAtOnce { detachAtOnce },
+        _noPresenter { noPresenter }
     {
     }
 
@@ -129,7 +134,8 @@ class ScriptedAcquisition final: public ITerminalAcquisition
         co_return StartedTerminal { .capabilities = *_answer,
                                     .events = std::move(terminal),
                                     .restore = _restore,
-                                    .frames = std::make_unique<PresenterRecord::Sink>(&_presented) };
+                                    .frames =
+                                        _noPresenter ? nullptr : std::make_unique<PresenterRecord::Sink>(&_presented) };
     }
 
     /// @return The restore handle every acquisition hands out.
@@ -178,6 +184,7 @@ class ScriptedAcquisition final: public ITerminalAcquisition
     IReactor& _reactor;
     std::expected<TerminalCapabilities, std::string> _answer;
     bool _detachAtOnce;
+    bool _noPresenter;
     int _calls { 0 };
     IExecutor* _askedPool { nullptr };
     IExecutor* _askedResumeOn { nullptr };
@@ -303,6 +310,7 @@ struct CompositionFaults
     bool throwingViews { false };               ///< Every view throws on its first frame.
     bool pipedViewsOnly { false };              ///< Only the `Piped` rung has a view.
     bool noViews { false };                     ///< No rung has a view, the `Piped` one included.
+    bool noPresenter { false };                 ///< An acquired terminal names nowhere to draw frames.
     IStatsGatherer* gatherer { nullptr };       ///< What samples ask instead of the rig's gatherer, when set.
     IStatsDialer* dialer { nullptr };           ///< What re-dials after a failed sample; none when null.
     LiveSubject subject { LiveSubject::Cache }; ///< What the admitted plan watches.
@@ -342,7 +350,7 @@ struct Composition
     /// @param faults How the collaborators misbehave.
     Composition(Rig& rig, std::expected<TerminalCapabilities, std::string> terminal, CompositionFaults faults = {}):
         rig { rig },
-        terminals { rig.reactor, std::move(terminal), faults.detachAtOnce },
+        terminals { rig.reactor, std::move(terminal), faults.detachAtOnce, faults.noPresenter },
         stops { rig.reactor, std::move(faults.stopRefusal) },
         views { faults.throwingViews, faults.pipedViewsOnly, faults.noViews },
         terminalPool { rig.clock },
@@ -607,6 +615,64 @@ TEST_CASE("an interactive session whose rung has no view refuses by name and rel
     composition.Finish();
 }
 
+TEST_CASE("an interactive session for a subject with no panel is refused before the terminal is acquired",
+          "[cli][live][session]")
+{
+    Rig rig;
+    ScriptedDocument admin { std::string { "# kpi" } };
+    Composition composition {
+        rig, SixelTerminal, CompositionFaults { .subject = LiveSubject::Fleet, .admin = &admin, .reader = &ReadFleetSample }
+    };
+    composition.Start(true);
+    rig.Settle();
+
+    auto const* const refusal = composition.Refusal();
+    CHECK((refusal != nullptr && refusal->outcome == Outcome::Local));
+    CHECK((refusal != nullptr && AdvisoryText(*refusal).contains("live-stats fleet")));
+    // Nothing flashed: no raw mode, no queries, no alternate screen for a refusal.
+    CHECK(composition.terminals.Calls() == 0);
+    CHECK(composition.views.Asked().empty());
+    CHECK(admin.Asked().empty());
+
+    composition.Finish();
+}
+
+TEST_CASE("an interactive terminal started with nowhere to draw frames is refused and released, never drawn to the pipe",
+          "[cli][live][session]")
+{
+    Rig rig;
+    Composition composition { rig, SixelTerminal, CompositionFaults { .noPresenter = true } };
+    composition.Start(true);
+    rig.Settle();
+
+    auto const* const refusal = composition.Refusal();
+    CHECK((refusal != nullptr && refusal->outcome == Outcome::Local));
+    CHECK((refusal != nullptr && AdvisoryText(*refusal).contains("nowhere to draw")));
+    CHECK(composition.terminals.Release().released);
+    CHECK(composition.terminals.Release().closedFirst);
+    CHECK(rig.sink.frames == 0);
+    CHECK_FALSE(composition.source.has_value());
+
+    composition.Finish();
+}
+
+TEST_CASE("a composition whose loop throws still left the terminal's restore handle where an abandonment finds it",
+          "[cli][live][session]")
+{
+    // The reason the handle has its own slot: a loop that threw returns no run to carry it in, and the
+    // abandonment that follows a stuck drain still has to put the terminal back.
+    Rig rig;
+    Composition composition { rig, SixelTerminal, CompositionFaults { .throwingViews = true } };
+    composition.Start(true);
+    rig.Settle();
+
+    CHECK(composition.threw);
+    CHECK_FALSE(composition.result.has_value());
+    CHECK(composition.restore == composition.terminals.RestoreHandle());
+
+    composition.Finish();
+}
+
 TEST_CASE("a piped session whose subject has no record to stream refuses by name", "[cli][live][session]")
 {
     Rig rig;
@@ -667,6 +733,17 @@ namespace
 }
 
 } // namespace
+
+TEST_CASE("a remark is one line whatever its reason carried", "[cli][live][session][remark]")
+{
+    // A follower's 503 names its leader across several comment lines of its body.
+    auto const remarks =
+        RemarksOver({ FailedFor("/fleet.txt answered HTTP 503: # not the leader\n# leader: 10.0.0.9:7071\n") });
+    REQUIRE(remarks.size() == 1);
+    CHECK_FALSE(remarks[0].contains('\n'));
+    CHECK(remarks[0].contains("# not the leader; # leader: 10.0.0.9:7071"));
+    CHECK_FALSE(remarks[0].ends_with("; "));
+}
 
 TEST_CASE("a failing sample is remarked on once per reason, and again after a recovery", "[cli][live][session][remark]")
 {
@@ -1460,8 +1537,7 @@ TEST_CASE("a live-stats session re-dials through the seat's dialer after a faile
     // What `main` hands over reaches the source: the connection dies after one reading, the gap
     // spends a sample, and the third sample of a budget of three reads only over a re-dial. Two
     // intervals at the floor, so about two seconds. Without the re-dial the dead connection is
-    // asked a third time, which presses Ctrl-C: the case fails on its assertions rather than
-    // waiting forever.
+    // asked a third time, which presses Ctrl-C, and the last row is a gap rather than a reading.
     auto seat = RunningSeat { RenderOptions { .format = OutputFormat::Tsv }, false, true };
     auto identity = ScriptedIdentity { CacheDaemon() };
     auto dying = BoundedDyingGatherer { &seat.onDemand };
@@ -1473,8 +1549,12 @@ TEST_CASE("a live-stats session re-dials through the seat's dialer after a faile
     CHECK(ending.kind == SessionEndKind::Ran);
     CHECK(ending.answer.outcome == Outcome::Affirmative);
     CHECK(dialer.Dials() == 1);
-    // The header, a reading, the gap, and the reading over the re-dial.
-    CHECK(std::ranges::count(seat.Stream(), '\n') == 4);
+    // The header, a reading, the gap, and the reading over the re-dial -- a READING, which a gap row
+    // of absent cells is not.
+    auto const stream = seat.Stream();
+    CHECK(std::ranges::count(stream, '\n') == 4);
+    auto const lastRow = std::string_view { stream }.substr(stream.rfind('\n', stream.size() - 2) + 1);
+    CHECK(lastRow.starts_with("info\t"));
 }
 
 namespace
@@ -1706,6 +1786,7 @@ TEST_CASE("a live-stats node session with no way to ask the node's status is ref
 
     CHECK(ending.kind == SessionEndKind::Refused);
     CHECK(ending.answer.outcome == Outcome::Unreachable);
+    CHECK(AdvisoryText(ending.answer).contains(WireTable[static_cast<std::size_t>(Wire::Node)].unavailable));
     CHECK(seat.gatherer.Calls() == 0);
     CHECK_FALSE(seat.source.has_value());
 }

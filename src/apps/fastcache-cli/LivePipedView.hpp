@@ -52,9 +52,10 @@ using FigureProjection = Value (*)(DashboardModel const& model);
 ///
 /// **Derived, rather than a second name written beside every label**, so a stream cannot name one
 /// figure while the panel draws another in the same row. ASCII letters are lowered and digits
-/// kept, `/` reads as `_per_`, every other run of characters is one `_`, and none leads or trails:
-/// `ops/sec` is `ops_per_sec`, `no-slot/min` is `no_slot_per_min`. Relabelling a row is therefore
-/// a change to what a script reads, which is why the cache and node headers are pinned by a test.
+/// kept, `/` reads as the word `per`, every other run of characters separates two words by one `_`,
+/// and nothing leads or trails: `ops/sec` is `ops_per_sec`, `no-slot/min` is `no_slot_per_min`. A
+/// label of nothing but punctuation has an empty key. Relabelling a row is therefore a change to
+/// what a script reads, which is why the cache and node headers are pinned by a test.
 /// @param label The panel's words.
 /// @return The key.
 [[nodiscard]] std::string FigureKey(std::string_view label);

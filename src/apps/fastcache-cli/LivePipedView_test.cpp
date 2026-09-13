@@ -342,6 +342,11 @@ TEST_CASE("a figure's piped key is its panel label, lowered, with a slash read a
     CHECK(FigureKey("index (RAM)") == "index_ram");
     CHECK(FigureKey("  Mean Compile ") == "mean_compile");
     CHECK(FigureKey("ops/sec get ") == "ops_per_sec_get");
+    // No doubled or dangling separator however the slashes fall.
+    CHECK(FigureKey("a//b") == "a_per_per_b");
+    CHECK(FigureKey("/min") == "per_min");
+    CHECK(FigureKey("rate/") == "rate_per");
+    CHECK(FigureKey("(--)").empty());
 }
 
 TEST_CASE("a piped cache and node stream name exactly the figures their panels draw", "[cli][live][piped][figures]")

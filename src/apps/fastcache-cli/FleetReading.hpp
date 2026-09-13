@@ -26,9 +26,9 @@ inline constexpr std::string_view FleetReadingSource = "fleet.txt";
 /// - A fetch that produced no document is the fetch's own outcome (`OutcomeOf`): `Unreachable`
 ///   when nothing answered, `Refused` when the leader -- or a follower naming it -- declined, with
 ///   the server's words as the note.
-/// - A document that does not parse is `Protocol`, naming what the parser refused. A follower's
-///   all-comment answer is one: it names no section, and an empty fleet would be a claim about the
-///   fleet that a follower cannot make.
+/// - A document that does not parse is `Protocol`, naming what the parser refused -- a body naming
+///   no section among them, since an empty fleet is a claim only a leader can make. A follower
+///   itself answers the route `503`, naming its leader, which is `Refused`.
 /// @param event A `Sample` of a `fleet` session.
 /// @return The document as a text scalar from `FleetReadingSource`, or why there is none.
 [[nodiscard]] SampleReading ReadFleetSample(DashboardEvent const& event);
@@ -37,8 +37,10 @@ inline constexpr std::string_view FleetReadingSource = "fleet.txt";
 ///
 /// **Parsed here, from the reading's text, when it is drawn** -- the reader kept no parsed copy, so
 /// this and the fleet panel read one text through one parser. The strip arrives computed (#1302):
-/// each field is named by the section's `kpi` column and carries its `value` cell as the leader
-/// wrote it, `-` read as absent. `source` comes first, as every piped record's does.
+/// each field is named by the section's `kpi` column, spelled as the leader spells it -- the key
+/// `/fleet.json` carries too -- and holds its `value`, a number where it reads as a finite one, `-`
+/// read as absent. A figure counted against something (`compiling-now` of the slots) is followed by
+/// `<kpi>-of`. `source` comes first, as every piped record's does.
 /// @param model What is known; `latest` is a fleet reading's text when there is one.
 /// @return The record: `source` alone before any reading.
 [[nodiscard]] Value FleetKpiFigures(DashboardModel const& model);
