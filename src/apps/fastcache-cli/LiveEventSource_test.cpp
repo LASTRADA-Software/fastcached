@@ -364,3 +364,39 @@ TEST_CASE("a terminal that goes away on its own is closed before it is released"
 
     CloseAndDrain(rig, source);
 }
+
+TEST_CASE("a sample carries the moment it was taken rather than the moment it was asked for", "[cli][live][source]")
+{
+    // A rate is a change over the time it TOOK. The gather is handed off at the epoch and runs
+    // 700 ms later, so a stamp taken where it was asked for would be wrong by exactly that.
+    Rig rig;
+    LiveEventSource source { rig.Parts() };
+    rig.reactor.Drain();
+    rig.clock.Advance(std::chrono::milliseconds { 700 });
+    rig.Settle();
+
+    auto const sample = NextDue(rig, source);
+    CHECK(KindOf(sample) == DashboardEventKind::Sample);
+    CHECK((sample.has_value() && sample->at == TimePoint {} + std::chrono::milliseconds { 700 }));
+
+    CloseAndDrain(rig, source);
+}
+
+TEST_CASE("a gather that could ask nothing is a failed sample rather than an empty reading", "[cli][live][source]")
+{
+    Rig rig;
+    ScriptedGatherer asksNothing { {} };
+    auto parts = rig.Parts();
+    parts.gatherer = &asksNothing;
+    LiveEventSource source { std::move(parts) };
+    rig.Settle();
+
+    auto const failed = NextDue(rig, source);
+    CHECK(KindOf(failed) == DashboardEventKind::SampleFailed);
+    CHECK((failed.has_value() && failed->outcome == Outcome::Unreachable));
+    CHECK((failed.has_value() && failed->at == rig.clock.Now()));
+    // Still a frame owed: a gap is drawn.
+    CHECK(KindOf(NextDue(rig, source)) == DashboardEventKind::Tick);
+
+    CloseAndDrain(rig, source);
+}
