@@ -19,8 +19,9 @@ cmake_minimum_required(VERSION 3.28)
 # The ticket enumerated the test binaries by hand and its table listed four. This
 # tree registers SIX with `catch_discover_tests`, five of them in a default
 # configuration; `fastcache-cli-tests` and `CowTreeTests` were in neither the
-# table nor any row. Neither is threaded, so the ticket's conclusion survived its
-# census -- but a hand list is exact about what it knows and silent about what it
+# table nor any row. Neither was threaded then, so the ticket's conclusion survived
+# its census (`fastcache-cli-tests` stopped being so with #134 and is a gate row
+# now) -- but a hand list is exact about what it knows and silent about what it
 # does not, and that silence reads identically to complete coverage (#492). The
 # census was written by whoever understood the gap best, and it still missed two.
 #
@@ -113,7 +114,6 @@ endif()
 # ---------------------------------------------------------------------------
 set(FastCachedTsanBinaryExemptions
     "compile-cache-testclient-tests|FASTCACHED_BUILD_TESTCLIENT is default OFF, so the clang-tsan configure does not declare this target at all, and no source under src/apps/compile-cache-testclient names std::thread, std::jthread, std::async or pthread (measured 2026-09-11 over *.cpp and *.hpp, not only the test sources)"
-    "fastcache-cli-tests|the operator client is single-threaded -- no source under src/apps/fastcache-cli names std::thread, std::jthread, std::async or pthread (measured 2026-09-11 over *.cpp and *.hpp)"
     "CowTreeTests|no source under src/CowTree names std::thread, std::jthread, std::async or pthread (measured 2026-09-11 over *.cpp and *.hpp). The CoW store's concurrency question is a SECOND PROCESS -- an exclusive flock taken at Open, refusing the second opener by name -- which is not a data race and which ThreadSanitizer cannot observe from inside one process"
 )
 
