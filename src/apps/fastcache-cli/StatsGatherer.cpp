@@ -83,7 +83,7 @@ LadderGatherer::Identification const& LadderGatherer::Identified()
         return remember(kind, std::format("{} answered node-status with a body this client cannot read", _node->Address()));
     }
 
-    return remember(kind, std::format("{} is a fastcache-compile-node", _node->Address()), *std::move(fields));
+    return remember(kind, std::format("{} is a fastcache-compile-node", _node->Address()), std::move(fields));
 }
 
 EndpointIdentity LadderGatherer::IdentifyEndpoint()
