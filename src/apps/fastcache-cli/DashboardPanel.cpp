@@ -259,8 +259,14 @@ namespace
         return text;
     }
 
-    /// The newest @p cells of @p series, right-aligned, with the cells before the session began
-    /// drawn as no reading -- which is what they were.
+    /// The newest @p cells of @p series, from the trend's first cell: a session younger than the trend
+    /// fills it from the left, and the cells after its newest reading are drawn as no reading, which is
+    /// what they are -- nothing has been sampled for them yet.
+    ///
+    /// **From the left, so a trend starts where its figure ends** (#134 §3, §4). Right-aligned, a young
+    /// session drew a blank run between the figure and its first readings that read as a narrow trend
+    /// pushed to the far edge; once the history is as long as the trend the two are the same picture,
+    /// newest on the right, and it scrolls.
     /// @param series The series.
     /// @param cells How many cells the sparkline has.
     /// @return The window.
@@ -268,8 +274,7 @@ namespace
     {
         auto window = Series(cells);
         auto const shown = std::min(cells, series.size());
-        std::ranges::copy(series | std::views::drop(series.size() - shown),
-                          window.begin() + static_cast<std::ptrdiff_t>(cells - shown));
+        std::ranges::copy(series | std::views::drop(series.size() - shown), window.begin());
         return window;
     }
 

@@ -290,12 +290,33 @@ TEST_CASE("a gap and a real zero draw different middle cells in a panel's trend"
     REQUIRE(gappedSpark.size() >= 3);
     REQUIRE(zeroedSpark.size() == gappedSpark.size());
 
-    auto const middle = gappedSpark.size() - 2;
+    // Four readings, so four cells from the trend's start; the middle of their last three is the third.
+    auto const middle = std::size_t { 2 };
     CHECK(gappedSpark[middle] != zeroedSpark[middle]);
     CHECK(gappedSpark[middle] == " ");
     CHECK(zeroedSpark[middle] == "\xe2\x96\x81");
     CHECK(gappedSpark[middle - 1] == zeroedSpark[middle - 1]);
     CHECK(gappedSpark[middle + 1] == zeroedSpark[middle + 1]);
+}
+
+TEST_CASE("a young session's trend starts where its figure ends and fills toward the right", "[cli][dashboard][panel]")
+{
+    // N5 and C4: three readings in a trend wider than three cells. WHAT DISTINGUISHES: the trend's FIRST cell
+    // is a reading and every cell after the newest is blank -- a right-aligned window draws the blank run
+    // first and the readings at the far end, which is the picture that read as a narrow trend pushed right.
+    auto const frames = CacheFrames(
+        { SampleOf(CacheSeries(1, {}), 1), SampleOf(CacheSeries(2, {}), 2), SampleOf(CacheSeries(3, {}), 3), Tick },
+        RenderRung::Unicode);
+    REQUIRE(frames.size() == 1);
+    auto const row = RowLine(frames[0], "ops/sec");
+    REQUIRE(row.has_value());
+    auto const spark = SparkOf(Unwrap(row), "get");
+    REQUIRE(spark.size() > 3);
+    // The first reading has no interval before it, so the rate starts at the second.
+    CHECK(spark[0] == " ");
+    CHECK(spark[1] != " ");
+    CHECK(spark[2] != " ");
+    CHECK(std::ranges::all_of(spark | std::views::drop(3), [](std::string const& cell) { return cell == " "; }));
 }
 
 TEST_CASE("a counter that went down draws a gap and the next interval draws a rate", "[cli][dashboard][panel]")
@@ -313,10 +334,11 @@ TEST_CASE("a counter that went down draws a gap and the next interval draws a ra
     auto const after = RowLine(frames[1], "conns/sec");
     REQUIRE(restarted.has_value());
     REQUIRE(after.has_value());
+    // The newest cell is the reading count's, from the trend's start: two readings, then three.
     CHECK(FigureOf(Unwrap(restarted)) == Absent);
-    CHECK(SparkOf(Unwrap(restarted), "accepted").back() == " ");
+    CHECK(SparkOf(Unwrap(restarted), "accepted").at(1) == " ");
     CHECK(FigureOf(Unwrap(after)) == "10");
-    CHECK(SparkOf(Unwrap(after), "accepted").back() != " ");
+    CHECK(SparkOf(Unwrap(after), "accepted").at(2) != " ");
 }
 
 TEST_CASE("a tier the endpoint does not run contributes no row", "[cli][dashboard][panel]")
