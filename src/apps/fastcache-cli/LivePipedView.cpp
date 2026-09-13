@@ -116,6 +116,8 @@ Value PanelFigures(PanelSpec const& panel, DashboardModel const& model)
         for (auto const& beside: row.beside)
             fields.push_back(
                 Field { .name = std::string { beside.key }, .value = NewestCell(beside.figure, model, origin) });
+        for (auto const& part: row.split)
+            fields.push_back(Field { .name = std::string { part.key }, .value = NewestCell(part.figure, model, origin) });
     }
     for (auto const& row: panel.levels)
     {
@@ -125,6 +127,12 @@ Value PanelFigures(PanelSpec const& panel, DashboardModel const& model)
         if (row.limit.has_value())
             fields.push_back(Field { .name = std::string { row.limitKey }, .value = NewestCell(*row.limit, model, origin) });
     }
+    for (auto const& block: panel.facts)
+        for (auto const& line: block.lines)
+            for (auto const& cell: line.cells)
+                for (auto const& figure: cell.figures)
+                    fields.push_back(
+                        Field { .name = std::string { figure.key }, .value = NewestCell(figure.figure, model, origin) });
     if (origin.has_value() && model.latest.has_value())
         for (auto const tier: TiersIn(panel, *model.latest, *origin))
             for (auto const& column: panel.tierColumns)

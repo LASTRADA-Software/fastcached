@@ -214,6 +214,38 @@ namespace
                        .priority = Priority::Normal },
     };
 
+    /// A refusal counter's rate per minute, as the split under the total writes it.
+    /// @param counter The counter.
+    /// @return The figure.
+    [[nodiscard]] constexpr FigureSpec RefusalsPerMinute(Counter counter) noexcept
+    {
+        return FigureSpec { .field = Catalogued(counter),
+                            .scale = 60.0,
+                            .suffix = "/min",
+                            .source = FigureSource::Rate,
+                            .format = FigureFormat::Rate };
+    }
+
+    constexpr auto RefusalAddends = std::array {
+        Catalogued(Counter::WorkerJobsRefusedLeaseExpired),
+        Catalogued(Counter::WorkerJobsRefusedUnknownFingerprint),
+    };
+
+    constexpr auto RefusalSplit = std::array {
+        BesideFigure { .key = "no_slot_per_min",
+                       .before = "no-slot",
+                       .figure = RefusalsPerMinute(Counter::WorkerJobsRefusedNoSlot),
+                       .priority = Priority::High },
+        BesideFigure { .key = "lease_expired_per_min",
+                       .before = "lease-expired",
+                       .figure = RefusalsPerMinute(Counter::WorkerJobsRefusedLeaseExpired),
+                       .priority = Priority::Normal },
+        BesideFigure { .key = "unknown_fingerprint_per_min",
+                       .before = "unknown-fingerprint",
+                       .figure = RefusalsPerMinute(Counter::WorkerJobsRefusedUnknownFingerprint),
+                       .priority = Priority::Normal },
+    };
+
     constexpr auto NodeRates = std::array {
         RateRow { .label = "compiles/min",
                   .key = "compiles_per_min",
@@ -232,64 +264,74 @@ namespace
                               .scale = 0.001,
                               .source = FigureSource::RateQuotient,
                               .format = FigureFormat::Seconds },
-                  .note = "sum/count this interval; no percentile",
+                  .note = "sum/count over this interval; no histogram exists, so no p50/p95 can be shown",
                   .trend = Trend::None,
-                  .priority = Priority::High },
-        // The refusals are a SPLIT, never a total: each has a different fix (§4).
-        RateRow { .label = "no-slot/min",
-                  .key = "no_slot_per_min",
+                  .priority = Priority::High,
+                  .notePriority = Priority::High },
+        // ONE total with its trend, and the split under it: each refusal has a different fix, so the total
+        // is never drawn alone (§4). The total is the three counters' rates added, not a fourth counter.
+        RateRow { .label = "refused/min",
+                  .key = "refused_per_min",
                   .figure = { .field = Catalogued(Counter::WorkerJobsRefusedNoSlot),
                               .scale = 60.0,
+                              .addends = RefusalAddends,
                               .source = FigureSource::Rate,
                               .format = FigureFormat::Rate },
-                  .priority = Priority::Normal },
-        RateRow { .label = "lease-exp/min",
-                  .key = "lease_expired_per_min",
-                  .figure = { .field = Catalogued(Counter::WorkerJobsRefusedLeaseExpired),
-                              .scale = 60.0,
-                              .source = FigureSource::Rate,
-                              .format = FigureFormat::Rate },
-                  .priority = Priority::Normal },
-        RateRow { .label = "unknown-fp/min",
-                  .key = "unknown_fingerprint_per_min",
-                  .figure = { .field = Catalogued(Counter::WorkerJobsRefusedUnknownFingerprint),
-                              .scale = 60.0,
-                              .source = FigureSource::Rate,
-                              .format = FigureFormat::Rate },
-                  .priority = Priority::Normal },
-        RateRow { .label = "cache hits",
-                  .key = "cache_hit_rate",
-                  .figure = { .field = Catalogued(Counter::NodeCacheHits),
-                              .other = Catalogued(Counter::NodeCacheMisses),
-                              .source = FigureSource::RateRatio,
-                              .format = FigureFormat::Percent },
+                  .split = RefusalSplit,
                   .priority = Priority::High },
     };
 
-    constexpr auto NodeLevels = std::array {
-        LevelRow { .label = "cores",
-                   .key = "cores",
-                   .value = { .field = MetricsOnly("fastcache_node_logical_cores") },
-                   .priority = Priority::Low },
-        LevelRow { .label = "slots busy",
-                   .key = "slots_busy",
-                   .value = { .field = MetricsOnly("fastcache_node_slots_busy") },
-                   .limit = FigureSpec { .field = MetricsOnly("fastcache_node_slots_configured") },
-                   .limitKey = "slots_configured",
-                   .priority = Priority::Essential,
-                   .limitPriority = Priority::High,
-                   .gaugePriority = Priority::Low },
-        LevelRow { .label = "memory",
-                   .key = "memory_bytes",
-                   .value = { .field = MetricsOnly("fastcache_node_memory_total_bytes"), .format = FigureFormat::Bytes },
-                   .priority = Priority::Low },
-        LevelRow { .label = "scratch free",
-                   .key = "scratch_free_bytes",
-                   .value = { .field = MetricsOnly("fastcache_node_disk_free_bytes"), .format = FigureFormat::Bytes },
-                   .limit = FigureSpec { .field = MetricsOnly("fastcache_node_disk_capacity_bytes"),
-                                         .format = FigureFormat::Bytes },
-                   .limitKey = "scratch_capacity_bytes",
-                   .priority = Priority::Normal },
+    constexpr auto IdentityCells = std::array {
+        FactCell { .label = "node-id", .fact = StatusFact::NodeId },
+        FactCell { .label = "components", .fact = StatusFact::Components },
+    };
+    constexpr auto WorkingCells = std::array {
+        FactCell { .label = "toolchains", .fact = StatusFact::Toolchains },
+        FactCell { .label = "registrars", .fact = StatusFact::Registrars },
+    };
+    constexpr auto ConsensusCells = std::array {
+        FactCell { .label = "consensus", .fact = StatusFact::Consensus },
+        FactCell { .label = "leader", .fact = StatusFact::Leader },
+    };
+    constexpr auto SlotCells = std::array { FactCell { .label = "slots", .fact = StatusFact::Slots } };
+
+    constexpr auto CacheHits = std::array {
+        BesideFigure { .key = "cache_hit_rate",
+                       .before = "hits",
+                       .figure = { .field = Catalogued(Counter::NodeCacheHits),
+                                   .other = Catalogued(Counter::NodeCacheMisses),
+                                   .source = FigureSource::RateRatio,
+                                   .format = FigureFormat::Percent },
+                       .priority = Priority::High },
+    };
+    constexpr auto CacheTierCells =
+        std::array { FactCell { .label = "cache tier", .fact = StatusFact::CacheTier, .figures = CacheHits } };
+
+    constexpr auto ScratchFree = std::array {
+        BesideFigure { .key = "scratch_free_bytes",
+                       .before = "scratch free",
+                       .figure = { .field = MetricsOnly("fastcache_node_disk_free_bytes"), .format = FigureFormat::Bytes },
+                       .priority = Priority::Normal },
+    };
+    constexpr auto HostCells = std::array { FactCell { .label = "host", .fact = StatusFact::Host, .figures = ScratchFree } };
+
+    // §4's order: who the node is; whether it is WORKING rather than merely up; its slots and what limits
+    // them; then the rates; then its cache tier and the machine.
+    constexpr auto IdentityLines = std::array { FactLine { .cells = IdentityCells, .priority = Priority::Normal } };
+    constexpr auto WorkingLines = std::array {
+        FactLine { .cells = WorkingCells, .priority = Priority::High },
+        FactLine { .cells = ConsensusCells, .priority = Priority::Normal },
+    };
+    constexpr auto SlotLines = std::array { FactLine { .cells = SlotCells, .priority = Priority::High } };
+    constexpr auto CacheTierLines = std::array { FactLine { .cells = CacheTierCells, .priority = Priority::Normal } };
+    constexpr auto HostLines = std::array { FactLine { .cells = HostCells, .priority = Priority::Low } };
+
+    constexpr auto NodeFacts = std::array {
+        FactBlock { .lines = IdentityLines, .place = FactPlace::AboveRates },
+        FactBlock { .lines = WorkingLines, .place = FactPlace::AboveRates },
+        FactBlock { .lines = SlotLines, .place = FactPlace::AboveRates },
+        FactBlock { .lines = CacheTierLines, .place = FactPlace::BelowRates },
+        FactBlock { .lines = HostLines, .place = FactPlace::BelowRates },
     };
 
     // §4: `fastcache-compile-node 0.4.1 ───── build-07:7070  up 2d11:48  every 2s  q`.
@@ -303,13 +345,14 @@ namespace
 
     constexpr auto NodeSpec = PanelSpec { .title = "fastcache-compile-node",
                                           .rates = NodeRates,
-                                          .levels = NodeLevels,
+                                          .levels = {},
                                           .tierColumns = {},
                                           .tierNote = {},
                                           .tierPriority = Priority::Normal,
                                           .tierNotePriority = Priority::Low,
                                           .sourcePriority = Priority::High,
-                                          .titleFacts = NodeTitle };
+                                          .titleFacts = NodeTitle,
+                                          .facts = NodeFacts };
 
     // ---- fleet ------------------------------------------------------------------------------
 

@@ -3,6 +3,7 @@
 #include "FleetDocument.hpp"
 #include "LiveSession.hpp"
 #include "LiveStats.hpp"
+#include "NodeStatusText.hpp"
 
 #include <FastCache/Cluster/ClusterState.hpp>
 
@@ -918,58 +919,6 @@ namespace
         return answer;
     }
 
-    /// Which `NodeComponentBit` each reported component name stands for.
-    ///
-    /// A table because the set grows: a bit this build does not name is reported under
-    /// its NUMBER rather than dropped, so an older client meeting a newer node says
-    /// *there is something here I do not know about* instead of quietly under-reporting
-    /// what the node runs.
-    struct ComponentBit
-    {
-        std::uint32_t bit;     ///< The mask bit.
-        std::string_view name; ///< What to call it.
-    };
-
-    constexpr std::array<ComponentBit, 4> ComponentBits { {
-        { .bit = CompileCacheWire::NodeComponentBit::CacheTier, .name = "cache-tier" },
-        { .bit = CompileCacheWire::NodeComponentBit::Worker, .name = "worker" },
-        { .bit = CompileCacheWire::NodeComponentBit::Scheduler, .name = "scheduler" },
-        { .bit = CompileCacheWire::NodeComponentBit::Consensus, .name = "consensus" },
-    } };
-
-    /// The components @p mask names, as a comma-separated list.
-    ///
-    /// **An empty MASK renders as the word `none` rather than as an absent cell**: a
-    /// node that runs no component is a reading, not a missing one, and the two must
-    /// not render alike.
-    /// @param mask What the node reported.
-    /// @return The list.
-    [[nodiscard]] std::string DescribeComponents(std::uint32_t mask)
-    {
-        std::string out;
-        std::uint32_t named = 0;
-        for (auto const& row: ComponentBits)
-            if ((mask & row.bit) != 0)
-            {
-                named |= row.bit;
-                if (!out.empty())
-                    out += ", ";
-                out += row.name;
-            }
-
-        // Whatever is left is a component this build has no name for. Reported as the
-        // residual mask, because *some bits I do not understand* is a fact an operator
-        // can act on -- upgrade the client -- and silence is not.
-        if (auto const unknown = mask & ~named; unknown != 0)
-        {
-            if (!out.empty())
-                out += ", ";
-            out += std::format("unknown(0x{:x})", unknown);
-        }
-
-        return out.empty() ? std::string { "none" } : out;
-    }
-
     /// What to call one reported surface.
     /// @param surface The wire tag.
     /// @return A stable lower-case name.
@@ -988,46 +937,6 @@ namespace
         // one rather than refusing the whole reply, which is what lets an older client
         // read a newer node at all. Closed anyway, because falling off the end of a
         // function returning a view is a dangling one.
-        return "unknown";
-    }
-
-    /// What to call one toolchain-survey state.
-    /// @param state The wire tag.
-    /// @return A stable lower-case name.
-    [[nodiscard]] std::string_view NameOfToolchainState(CompileCacheWire::ToolchainState state) noexcept
-    {
-        switch (state)
-        {
-            case CompileCacheWire::ToolchainState::Surveying:
-                return "surveying";
-            case CompileCacheWire::ToolchainState::Serving:
-                return "serving";
-            case CompileCacheWire::ToolchainState::NothingToServe:
-                return "nothing-to-serve";
-        }
-        // Unreachable for the reason `NameOfSurface`'s tail is: `DecodeNodeRuntime`
-        // leaves a state this build has no name for DISENGAGED rather than passing it
-        // through, so nothing but a named one arrives. Closed anyway -- falling off the
-        // end of a function returning a view is a dangling one.
-        return "unknown";
-    }
-
-    /// What to call one scheduler role.
-    /// @param role The wire tag.
-    /// @return A stable lower-case name.
-    [[nodiscard]] std::string_view NameOfSchedulerRole(CompileCacheWire::WireSchedulerRole role) noexcept
-    {
-        switch (role)
-        {
-            case CompileCacheWire::WireSchedulerRole::Follower:
-                return "follower";
-            case CompileCacheWire::WireSchedulerRole::Undecided:
-                return "undecided";
-            case CompileCacheWire::WireSchedulerRole::Leader:
-                return "leader";
-        }
-        // Unreachable for `NameOfSurface`'s reason: `DecodeNodeRuntime` leaves a role
-        // this build has no name for disengaged rather than passing it through.
         return "unknown";
     }
 
