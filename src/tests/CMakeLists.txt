@@ -6321,6 +6321,47 @@ set_tests_properties("cli-text-cell-selftest" PROPERTIES
     TIMEOUT 180
 )
 
+# fastcache-cli asks neither the environment nor the terminal anything itself (#134 §9.11).
+#
+# `live-stats` is HANDED what a terminal can draw (`TerminalCapabilities`) and reads the
+# environment only through `Platform/Environment` from `main`. A `getenv`, `isatty`,
+# `ioctl` or `GetConsoleMode` under `src/apps/fastcache-cli/` draws the right frame on the
+# machine it was tested on and passes every behavioural test, so the clause is a scan.
+# Exemptions are rows with reasons in `scripts/cli-ambient-read-exemptions.txt`, and a row
+# that no longer describes the tree is refused. It fails closed: the same scanner must
+# recognise a read in `src/FastCache/Platform/`, where these calls live.
+#
+# DEFAULT set: no compiler, no daemon, no socket.
+add_test(
+    NAME "cli-ambient-reads"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DGIT_EXECUTABLE=${GIT_EXECUTABLE}"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-cli-ambient-reads.cmake"
+)
+set_tests_properties("cli-ambient-reads" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 120
+)
+
+# And that check must be seen to refuse a planted read of each token, to accept prose, and
+# to refuse a stale, reasonless or malformed exemption row -- in both enumeration modes,
+# since a synthetic tree takes the directory walk while CI takes git.
+add_test(
+    NAME "cli-ambient-reads-selftest"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DGIT_EXECUTABLE=${GIT_EXECUTABLE}"
+        "-DFASTCACHED_SCRATCH_DIR=${CMAKE_CURRENT_BINARY_DIR}/cli-ambient-reads-selftest"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-cli-ambient-reads-selftest.cmake"
+)
+set_tests_properties("cli-ambient-reads-selftest" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 180
+)
+
 # ----------------------------------------------------------------------------
 # vendor/ is still byte-for-byte what was imported (#134).
 #
