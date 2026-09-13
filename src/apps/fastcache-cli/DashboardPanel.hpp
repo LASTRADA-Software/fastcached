@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include "DashboardFrame.hpp"
 #include "DashboardGlyphs.hpp"
 #include "DashboardLoop.hpp"
 #include "DashboardRung.hpp"
+#include "SixelEncoder.hpp"
 #include "StatsSource.hpp"
 
 #include <FastCache/Core/EnumTable.hpp>
@@ -203,17 +205,26 @@ inline constexpr auto KpiUnitTable = std::to_array<KpiUnit>({
 /// a line is and is `Essential`, and every later column shares `columnPriority` -- among equals
 /// `FitPieces` drops the rightmost first, so columns go from the right.
 ///
+/// **The chart is the Sixel rung's alone** (#134's decision on Sixel): on that rung, with a cell size the
+/// terminal reported and an encoder to draw it, the first `FleetChartMetrics` row is drawn per machine
+/// across the history as one image over `chartCellsHigh` rows of blank cells, placed in the frame and
+/// dropped for height at `chartPriority` like any other item. On every other rung there is no chart
+/// row at all -- not blank rows, not a glyph imitation.
+///
 /// The headline tiles are the `kpi` section's rows, in `Distributed::FleetKpiKeys()` order and under
 /// those keys: the page's labels are prose beside its own table and are not restated here. Within a
 /// tile the denominator goes before the tile does, and tiles that do not fit the width at all are
 /// not drawn -- they are not essential, so they never turn a frame into the minimum-size line.
 struct DocumentSpec
 {
+    std::size_t chartCellsHigh { 6 };               ///< Rows of cells the Sixel chart covers.
+    std::size_t chartMinimumCells { 24 };           ///< The fewest cells across the chart is drawn in; narrower, it goes.
     Priority tilePriority { Priority::Normal };     ///< When a line of tiles goes, for height.
     Priority stripPriority { Priority::Low };       ///< When the section strip goes, for height.
     Priority stripTabPriority { Priority::Low };    ///< When a tab other than the active one goes, for width.
     Priority tablePriority { Priority::Essential }; ///< When the section's table shrinks to `+N more`, and goes.
     Priority columnPriority { Priority::Normal };   ///< When a column after the first goes, for width.
+    Priority chartPriority { Priority::Low };       ///< When the Sixel chart goes, for height.
 };
 
 /// A whole panel.
@@ -320,6 +331,8 @@ struct PanelContext
     std::string endpoint {};                              ///< Where the samples are asked; empty when not stated.
     std::optional<std::chrono::milliseconds> interval {}; ///< The sampling interval, when stated.
     CellWidth cellWidth { nullptr };                      ///< How many cells text occupies; must not be null.
+    /// What draws an image on the Sixel rung, or null for a session with none; never owned.
+    ISixelEncoder* sixel { nullptr };
     /// Which section of a fleet document the panel's table draws; a panel without a document block ignores it.
     Distributed::FleetSection section { Distributed::FleetSection::Machines };
     RenderRung rung { RenderRung::Ascii }; ///< What the frame is drawn with; last with `section`, so they pad nothing.
@@ -366,8 +379,12 @@ class PanelView final: public IDashboardView
     PanelView(PanelSpec const& spec, PanelContext context);
 
     /// @param model What is known.
-    /// @return The frame.
+    /// @return The frame's text; see `PlacedFrame`.
     [[nodiscard]] std::string Frame(DashboardModel const& model) override;
+
+    /// @param model What is known.
+    /// @return The frame, with the fleet chart placed over it on the Sixel rung.
+    [[nodiscard]] DashboardFrame PlacedFrame(DashboardModel const& model) override;
 
   private:
     PanelSpec const* _spec;
