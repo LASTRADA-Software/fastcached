@@ -36,17 +36,18 @@ namespace
 class RecordingView final: public IDashboardView
 {
   public:
-    [[nodiscard]] std::string Frame(DashboardModel const& model) override
+    [[nodiscard]] DashboardFrame PlacedFrame(DashboardModel const& model) override
     {
         ++calls;
         seen.push_back(model);
-        return std::format("latest={} previous={} broken={} samples={} cols={} rows={}",
-                           model.latest.has_value(),
-                           model.previous.has_value(),
-                           model.BrokenRun(),
-                           model.samples,
-                           model.columns,
-                           model.rows);
+        return DashboardFrame { .text = std::format("latest={} previous={} broken={} samples={} cols={} rows={}",
+                                                    model.latest.has_value(),
+                                                    model.previous.has_value(),
+                                                    model.BrokenRun(),
+                                                    model.samples,
+                                                    model.columns,
+                                                    model.rows),
+                                .placements = {} };
     }
 
     std::size_t calls { 0 };
@@ -1100,7 +1101,7 @@ namespace
 class DocumentWatchingView final: public IDashboardView
 {
   public:
-    [[nodiscard]] std::string Frame(DashboardModel const& model) override
+    [[nodiscard]] DashboardFrame PlacedFrame(DashboardModel const& model) override
     {
         seen.emplace_back(model.latestDocument);
         return {};
@@ -1149,11 +1150,6 @@ namespace
 class PlacingView final: public IDashboardView
 {
   public:
-    [[nodiscard]] std::string Frame(DashboardModel const& model) override
-    {
-        return PlacedFrame(model).text;
-    }
-
     [[nodiscard]] DashboardFrame PlacedFrame(DashboardModel const& model) override
     {
         cellPixelsSeen.push_back(model.cellPixels);
@@ -1215,6 +1211,20 @@ TEST_CASE("a frame presented as text reaches a sink's one door as a frame with n
     CHECK(sink.placements[0].empty());
 }
 
+TEST_CASE("a view drawn as text is its one frame door's text, drawn once", "[cli][dashboard]")
+{
+    // `Frame` is not a second door: a view implements `PlacedFrame` alone, and `Frame` is that frame's
+    // text from the same single call -- a view that places an image still draws the rows it placed
+    // it over.
+    auto view = PlacingView {};
+    auto& door = static_cast<IDashboardView&>(view);
+    auto model = DashboardModel {};
+    model.columns = 40;
+    model.rows = 10;
+    CHECK(door.Frame(model) == "cols=40");
+    CHECK(view.cellPixelsSeen.size() == 1);
+}
+
 namespace
 {
 
@@ -1222,10 +1232,10 @@ namespace
 class OneKeyView final: public IDashboardView
 {
   public:
-    [[nodiscard]] std::string Frame(DashboardModel const& model) override
+    [[nodiscard]] DashboardFrame PlacedFrame(DashboardModel const& model) override
     {
         (void) model;
-        return std::format("frame after {} keys", acted);
+        return DashboardFrame { .text = std::format("frame after {} keys", acted), .placements = {} };
     }
 
     [[nodiscard]] bool Key(std::string_view keys) override

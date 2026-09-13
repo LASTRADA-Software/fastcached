@@ -1153,11 +1153,6 @@ PanelView::PanelView(PanelSpec const& spec, PanelContext context):
     assert(_context.cellWidth != nullptr && "a panel is laid out through the one width function it is handed");
 }
 
-std::string PanelView::Frame(DashboardModel const& model)
-{
-    return PlacedFrame(model).text;
-}
-
 bool PanelView::Key(std::string_view keys)
 {
     if (!_spec->document.has_value())
