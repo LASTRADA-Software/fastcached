@@ -170,11 +170,36 @@ function(fastcached_scan_lines content outVar)
         endif()
         if(NOT skipLine)
             string(REGEX REPLACE "/\\*.*\\*/" " " stripped "${stripped}")
-            if(stripped MATCHES "/\\*")
-                string(REGEX REPLACE "/\\*.*$" "" stripped "${stripped}")
+
+            # Which introducer comes FIRST decides. The order is not a detail: the
+            # `/*` test used to run BEFORE `//` was stripped, so a line comment
+            # mentioning `/*` opened a block comment no `*/` ever closed, and every
+            # remaining line of that file was skipped while this still printed a
+            # clean count over lines it never read -- a false green, in the one
+            # direction the check exists to refuse.
+            #
+            # Positional rather than simply stripping `//` first, which MEASURED
+            # identical on every input tried: below the inline `/* ... */` strip
+            # above, removing `//...` removes any `/*` that followed it too, so the
+            # two orderings agree. What position buys is not a different verdict but
+            # independence -- it states the rule itself rather than being correct
+            # only while the strip above it keeps running first. A reordering is
+            # correct by PRECONDITION; this is correct by construction.
+            #
+            # Third copy of this defect: `check-cli-text-cell.cmake` and
+            # `check-markup-entities.cmake` carried it too. Consolidating the
+            # line-walking idiom is #495 and is not this ticket.
+            #
+            # Still blind to either introducer inside a STRING LITERAL, as every
+            # regex-shaped reader here is. That is unchanged by this.
+            string(FIND "${stripped}" "/*" blockAt)
+            string(FIND "${stripped}" "//" lineAt)
+            if(NOT blockAt EQUAL -1 AND (lineAt EQUAL -1 OR blockAt LESS lineAt))
+                string(SUBSTRING "${stripped}" 0 ${blockAt} stripped)
                 set(inBlockComment TRUE)
+            elseif(NOT lineAt EQUAL -1)
+                string(SUBSTRING "${stripped}" 0 ${lineAt} stripped)
             endif()
-            string(REGEX REPLACE "//.*$" "" stripped "${stripped}")
             if(stripped MATCHES "${bannedToken}")
                 list(APPEND hits "use:${lineNumber}")
             endif()
