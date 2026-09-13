@@ -7,8 +7,10 @@
 #include <FastCache/Async/ResumeOn.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cstddef>
+#include <limits>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -65,6 +67,14 @@ struct LiveEventSource::State
 
     int producers { 0 };
 
+    /// When the outstanding sample started, in the reactor clock's ticks, or `NoSample`.
+    ///
+    /// The one member read off the reactor thread, so the one member that is atomic.
+    std::atomic<TimePoint::rep> sampleSince { NoSample };
+
+    /// `sampleSince` when no sample is out. No real reading of a steady clock is this.
+    static constexpr auto NoSample = std::numeric_limits<TimePoint::rep>::min();
+
     /// Whether the session is closed.
     /// @return True once `Close()` has run.
     [[nodiscard]] bool Closed() const noexcept
@@ -112,7 +122,9 @@ namespace
         auto deadline = parts.reactor->Clock().Now();
         while (!shared->Closed())
         {
+            shared->sampleSince.store(parts.reactor->Clock().Now().time_since_epoch().count(), std::memory_order_release);
             auto sample = co_await TakeSample(parts.gatherer, parts.pool, parts.reactor);
+            shared->sampleSince.store(LiveEventSource::State::NoSample, std::memory_order_release);
             // Closed while the gather was on the pool: the closed queue refuses the reading,
             // which describes a session that has already ended, and the closed `due` ends
             // the loop below without a wait.
@@ -154,6 +166,12 @@ namespace
             if (kind == DashboardEventKind::Resize)
                 shared->Deliver(DashboardEvent { .kind = DashboardEventKind::Tick });
         }
+        // Released here, on the reactor, as soon as nothing reads it: destroying it is what
+        // restores the terminal, and a sample still on the pool is no reason to leave an
+        // operator's terminal in raw mode. Closed first, because a terminal that went away
+        // on its own was never closed, and its contract asks for that before destruction.
+        shared->parts.terminal->Close();
+        shared->parts.terminal.reset();
         shared->ProducerEnded();
     }
 
@@ -247,6 +265,14 @@ void LiveEventSource::Close() noexcept
     // that thread's answer to come back.
     if (state.parts.stop != nullptr)
         state.parts.stop->Cancel();
+}
+
+std::optional<TimePoint> LiveEventSource::SampleOutstandingSince() const noexcept
+{
+    auto const since = _state->sampleSince.load(std::memory_order_acquire);
+    if (since == State::NoSample)
+        return std::nullopt;
+    return TimePoint { TimePoint::duration { since } };
 }
 
 Task<void> LiveEventSource::Drained()
