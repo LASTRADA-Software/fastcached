@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "CliVerbs.hpp"
+#include "FleetDocument.hpp"
 
 #include <FastCache/Cluster/ClusterState.hpp>
 
@@ -1493,86 +1494,6 @@ namespace
                           Field { .name = "member-id-as-received", .value = TextCell(receipt->memberId) },
                           Field { .name = "consensus-endpoint-as-recorded", .value = TextCell(receipt->raftEndpoint) },
                           Field { .name = "state", .value = TextCell("appended, not committed") } }));
-    }
-
-    /// One `/fleet.txt` section, as a table.
-    ///
-    /// The header line names the columns and every later line is a row, which is the
-    /// whole grammar -- there is no column list here, and there must not be: the
-    /// leader decided them from `FleetColumn`, and a second list in this binary would
-    /// be a place for the two to disagree.
-    ///
-    /// A cell of `-` becomes the real `Absent`, so `--absent` and the JSON `null`
-    /// behave as they do for every other verb rather than a dash being text that
-    /// happens to look absent. Everything else stays TEXT, escaping included: this
-    /// client has no model of which columns are numbers, and inventing one would be a
-    /// second description of the same columns.
-    /// @param document One section's rendering.
-    /// @return The table.
-    [[nodiscard]] std::expected<Value, std::string> FleetTable(std::string_view document)
-    {
-        std::vector<std::string> columns;
-        std::vector<std::vector<Cell>> rows;
-
-        auto const split = [](std::string_view line) {
-            std::vector<std::string_view> fields;
-            while (true)
-            {
-                auto const at = line.find('\t');
-                if (at == std::string_view::npos)
-                    break;
-                fields.push_back(line.substr(0, at));
-                line.remove_prefix(at + 1);
-            }
-            fields.push_back(line);
-            return fields;
-        };
-
-        bool header = true;
-        while (!document.empty())
-        {
-            auto const end = document.find('\n');
-            auto const line = document.substr(0, end);
-            document = end == std::string_view::npos ? std::string_view {} : document.substr(end + 1);
-
-            // A trailing newline leaves an empty tail, which is not a row of one empty
-            // cell. Skipped rather than rendered, or every table gains a blank row.
-            if (line.empty())
-                continue;
-
-            if (header)
-            {
-                for (auto const& field: split(line))
-                    columns.emplace_back(field);
-                header = false;
-                continue;
-            }
-
-            auto const fields = split(line);
-
-            // Every renderer walks `row[index]` for each of the HEADER's columns, so a
-            // short row is an out-of-range read rather than a narrow table. Refused
-            // rather than padded: padding presents truncated data as complete, and an
-            // `Absent` cell claims nobody reported the value when in fact it was
-            // reported and lost.
-            if (fields.size() != columns.size())
-                return std::unexpected(std::format(
-                    "row {} carries {} field(s) where the header names {}", rows.size() + 1, fields.size(), columns.size()));
-
-            std::vector<Cell> row;
-            row.reserve(columns.size());
-            for (auto const& field: fields)
-                row.push_back(field == "-" ? AbsentCell() : TextCell(std::string { field }));
-            rows.push_back(std::move(row));
-        }
-
-        // No header at all is not an empty fleet -- an empty SECTION still renders its
-        // header line, which is the whole reason the renderer emits one for a table
-        // with no rows. A document without one is not a table this client can read.
-        if (columns.empty())
-            return std::unexpected("the document carries no header line");
-
-        return TableValue(std::move(columns), std::move(rows));
     }
 
     /// `fleet <section>` -- one of the leader's fleet tables, in a terminal.
