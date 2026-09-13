@@ -33,6 +33,7 @@ set(_fc_cli_sources
     LiveStats.cpp
     MemcachedClient.cpp
     NodeClient.cpp
+    NodeStatusText.cpp
     RespClient.cpp
     SocketExchange.cpp
     StatsGatherer.cpp

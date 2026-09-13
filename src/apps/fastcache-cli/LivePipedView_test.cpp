@@ -468,16 +468,12 @@ TEST_CASE("a piped cache and node stream name exactly the figures their panels d
                                         "compiles_per_min",
                                         "compiles_completed",
                                         "mean_compile_seconds",
+                                        "refused_per_min",
                                         "no_slot_per_min",
                                         "lease_expired_per_min",
                                         "unknown_fingerprint_per_min",
                                         "cache_hit_rate",
-                                        "cores",
-                                        "slots_busy",
-                                        "slots_configured",
-                                        "memory_bytes",
-                                        "scratch_free_bytes",
-                                        "scratch_capacity_bytes" });
+                                        "scratch_free_bytes" });
 
     // A header is a promise about every row under it, so no two columns may share a name.
     for (auto const& names: { NamesOf(CacheFigures(model)), NamesOf(NodeFigures(model)) })

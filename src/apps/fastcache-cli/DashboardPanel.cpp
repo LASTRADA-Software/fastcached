@@ -2,6 +2,7 @@
 #include "DashboardPanel.hpp"
 #include "FleetChartModel.hpp"
 #include "FleetDocument.hpp"
+#include "NodeStatusText.hpp"
 
 #include <FastCache/Cache/StorageTier.hpp>
 #include <FastCache/Core/Ranges.hpp>
@@ -133,6 +134,8 @@ namespace
         FigureSource source; ///< The enumerator this row describes.
         /// The computation, over the resolved primary and second field names.
         Series (*compute)(std::deque<HistoryEntry> const& history, std::string const& field, std::string const& other);
+        /// Whether a figure's `addends` add their rates to what `compute` made.
+        bool takesAddends { false };
     };
 
     /// One row per `FigureSource`, in enumerator order.
@@ -153,7 +156,8 @@ namespace
                   // unnamed one must not turn the rate absent, so it is not paired at all.
                   return other.empty() ? Rates(history, field)
                                        : Pairwise(Rates(history, field), Rates(history, other), &Sum);
-              } },
+              },
+          .takesAddends = true },
         { .source = FigureSource::RateRatio,
           .compute =
               [](std::deque<HistoryEntry> const& history, std::string const& field, std::string const& other) {
@@ -502,6 +506,54 @@ namespace
         return line;
     }
 
+    /// A figure written beside something else, with its words around it: `completed 12 884`.
+    /// @param in The frame's inputs.
+    /// @param beside The figure.
+    /// @return The text.
+    [[nodiscard]] std::string BesideText(FrameInputs const& in, BesideFigure const& beside)
+    {
+        auto text = std::string {};
+        if (!beside.before.empty())
+            text += std::string { beside.before } + " ";
+        text += FigureText(in, beside.figure, Newest(SeriesFor(in, beside.figure, {})));
+        if (!beside.after.empty())
+            text += " " + std::string { beside.after };
+        return text;
+    }
+
+    /// @p text wrapped at its spaces into lines of at most @p width cells; a word wider than that is a line of its own.
+    /// @param text Prose.
+    /// @param width The cells a line may take.
+    /// @param cellWidth How wide text is.
+    /// @return The lines, none for text with no words.
+    [[nodiscard]] std::vector<std::string> Wrapped(std::string_view text, std::size_t width, CellWidth cellWidth)
+    {
+        auto lines = std::vector<std::string> {};
+        auto line = std::string {};
+        for (auto const word: std::views::split(text, ' '))
+        {
+            auto const piece = std::string_view { word.begin(), word.end() };
+            if (piece.empty())
+                continue;
+            auto candidate = line.empty() ? std::string { piece } : std::format("{} {}", line, piece);
+            if (!line.empty() && cellWidth(candidate) > width)
+            {
+                lines.push_back(std::exchange(line, std::string { piece }));
+                continue;
+            }
+            line = std::move(candidate);
+        }
+        if (!line.empty())
+            lines.push_back(std::move(line));
+        return lines;
+    }
+
+    /// The fewest cells a wrapped note is given before it is dropped rather than wrapped narrower.
+    constexpr auto MinimumNoteCells = std::size_t { 16 };
+
+    /// What a breakdown line under a rate row starts with: deeper than the rows, so it reads as theirs.
+    constexpr std::string_view SplitIndent = "      ";
+
     /// The rate block, laid out for @p budget cells.
     /// @param in The frame's inputs.
     /// @param rows The panel's rate rows.
@@ -528,6 +580,7 @@ namespace
         auto const drawsTrend = in.glyphs->sparkLevels.size() >= 2;
         auto const trendMinimum = in.cellWidth(TrendGap) + MinimumTrendCells;
         auto fitted = std::vector<std::vector<Piece>> {};
+        auto notes = std::vector<std::vector<std::string>> {};
         for (auto const index: std::views::iota(std::size_t { 0 }, rows.size()))
         {
             auto const& row = rows[index];
@@ -538,22 +591,28 @@ namespace
             if (drawsTrend && row.trend == Trend::Drawn)
                 pieces.push_back(Piece { .priority = row.trendPriority, .trend = true });
             for (auto const& beside: row.beside)
-            {
-                auto text = std::string { PieceGap };
-                if (!beside.before.empty())
-                    text += std::string { beside.before } + " ";
-                text += FigureText(in, beside.figure, Newest(SeriesFor(in, beside.figure, {})));
-                if (!beside.after.empty())
-                    text += " " + std::string { beside.after };
-                pieces.push_back(Piece { .text = std::move(text), .priority = beside.priority });
-            }
-            if (!row.note.empty())
+                pieces.push_back(
+                    Piece { .text = std::string { PieceGap } + BesideText(in, beside), .priority = beside.priority });
+            // A row with no trend has nothing whose width the note competes with, so its note wraps under the
+            // row instead of going; a row with one keeps its note a piece like any other.
+            auto const wraps = row.trend == Trend::None && !row.note.empty();
+            if (!row.note.empty() && !wraps)
                 pieces.push_back(
                     Piece { .text = std::string { PieceGap } + std::string { row.note }, .priority = row.notePriority });
 
             auto kept = FitPieces(std::move(pieces), budget, trendMinimum, in.cellWidth);
             if (!kept.has_value())
                 return std::unexpected(kept.error());
+            auto note = std::vector<std::string> {};
+            if (wraps)
+            {
+                auto const start = TextWidth(*kept, in.cellWidth) + in.cellWidth(PieceGap);
+                if (budget >= start + MinimumNoteCells)
+                    note = Wrapped(row.note, budget - start, in.cellWidth);
+                for (auto const at: std::views::iota(std::size_t { 0 }, note.size()))
+                    note[at] = std::string(at == 0 ? in.cellWidth(PieceGap) : start, ' ') + note[at];
+            }
+            notes.push_back(std::move(note));
             fitted.push_back(std::move(*kept));
         }
 
@@ -572,8 +631,31 @@ namespace
         auto items = std::vector<Item> {};
         for (auto const index: std::views::iota(std::size_t { 0 }, rows.size()))
         {
+            auto const& row = rows[index];
             auto const trend = Sparkline(Window(series[index], trendCells), *in.glyphs);
-            items.push_back(Item { .lines = { Joined(fitted[index], trend) }, .priority = rows[index].priority });
+            auto item = Item { .lines = { Joined(fitted[index], trend) }, .priority = row.priority };
+            // The note's first line continues the row; the rest hang under where it began.
+            for (auto const at: std::views::iota(std::size_t { 0 }, notes[index].size()))
+            {
+                if (at == 0)
+                    item.lines.front() += notes[index][at];
+                else
+                    item.lines.push_back(notes[index][at]);
+            }
+            items.push_back(std::move(item));
+
+            if (row.split.empty())
+                continue;
+            // The breakdown goes with the row, part by part as the width asks, and is its own line so a
+            // narrow terminal keeps the total's trend.
+            auto parts = std::vector<Piece> {};
+            for (auto const& part: row.split)
+                parts.push_back(
+                    Piece { .text = std::string { parts.empty() ? SplitIndent : PieceGap } + BesideText(in, part),
+                            .priority = part.priority });
+            auto kept = FitPieces(std::move(parts), budget, 0, in.cellWidth);
+            if (kept.has_value() && !kept->empty())
+                items.push_back(Item { .lines = { Joined(*kept, {}) }, .priority = row.priority });
         }
         return items;
     }
@@ -686,6 +768,261 @@ namespace
                 items.push_back(Item { .lines = { Joined(*fitted, {}) }, .priority = spec.tierNotePriority });
         }
         return items;
+    }
+
+    /// What separates a fact's label from its value, and one cell of a fact line from the next.
+    constexpr std::string_view FactGap = "  ";
+
+    /// What one status fact says in a frame.
+    struct FactText
+    {
+        std::vector<Piece> pieces {};     ///< Its line, in pieces a narrow terminal drops by priority.
+        std::vector<std::string> more {}; ///< Lines under it, already laid out for the width it was given.
+    };
+
+    /// @p text as a fact of one piece.
+    /// @param text The text.
+    /// @return The fact.
+    [[nodiscard]] FactText Said(std::string text)
+    {
+        return FactText { .pieces = { Piece { .text = std::move(text), .priority = Priority::Essential } }, .more = {} };
+    }
+
+    /// The newest node status, or nullptr before any was read.
+    /// @param in The frame's inputs.
+    /// @return The status.
+    [[nodiscard]] CompileCacheWire::NodeStatusFields const* StatusOf(FrameInputs const& in) noexcept
+    {
+        return in.model->nodeStatus.has_value() ? &*in.model->nodeStatus : nullptr;
+    }
+
+    /// Whether @p status is of a node running consensus: its component, or a role only a scheduler reports.
+    /// @param status The status, or nullptr.
+    /// @return False before a status was read.
+    [[nodiscard]] bool RunsConsensus(CompileCacheWire::NodeStatusFields const* status) noexcept
+    {
+        return status != nullptr
+               && ((status->components & CompileCacheWire::NodeComponentBit::Consensus) != 0
+                   || status->runtime.schedulerRole.has_value());
+    }
+
+    /// @p value written, or the absent marker for a node that did not say.
+    /// @param in The frame's inputs.
+    /// @param value The number.
+    /// @return The text.
+    [[nodiscard]] std::string CountText(FrameInputs const& in, std::optional<std::uint32_t> value)
+    {
+        return value.has_value() ? std::to_string(*value) : std::string { in.absent };
+    }
+
+    /// What renders one status fact.
+    struct StatusFactSpec
+    {
+        StatusFact fact; ///< The enumerator this row describes.
+        /// The fact laid out for @p width cells after its label, or nullopt where it does not apply to this node.
+        std::optional<FactText> (*render)(FrameInputs const& in, FactCell const& cell, std::size_t width);
+    };
+
+    /// One row per `StatusFact`, in enumerator order.
+    constexpr auto StatusFactTable = EnumTable<StatusFact, StatusFactSpec> { {
+        { .fact = StatusFact::NodeId,
+          .render = [](FrameInputs const& in, FactCell const& /*cell*/, std::size_t /*width*/) -> std::optional<FactText> {
+              // Absent on a node running no consensus: it has no minted identity, and an empty one is not a name.
+              auto const* status = StatusOf(in);
+              return Said(status == nullptr || status->nodeId.empty() ? std::string { in.absent } : status->nodeId);
+          } },
+        { .fact = StatusFact::Components,
+          .render = [](FrameInputs const& in, FactCell const& /*cell*/, std::size_t /*width*/) -> std::optional<FactText> {
+              auto const* status = StatusOf(in);
+              return Said(status == nullptr ? std::string { in.absent } : DescribeComponents(status->components));
+          } },
+        { .fact = StatusFact::Toolchains,
+          .render = [](FrameInputs const& in, FactCell const& /*cell*/, std::size_t /*width*/) -> std::optional<FactText> {
+              // The counts stand or fall with the state: `0 of 0` under no state is the collapse it exists to end.
+              auto const* status = StatusOf(in);
+              if (status == nullptr || !status->runtime.toolchains.has_value())
+                  return Said(std::string { in.absent });
+              auto const& runtime = status->runtime;
+              return Said(std::format("{} {} of {}",
+                                      NameOfToolchainState(*runtime.toolchains),
+                                      runtime.toolchainsServed,
+                                      runtime.toolchainsDiscovered));
+          } },
+        { .fact = StatusFact::Registrars,
+          .render = [](FrameInputs const& in, FactCell const& /*cell*/, std::size_t /*width*/) -> std::optional<FactText> {
+              // A node holding no registration at all -- no scheduler named -- has no count to state.
+              auto const* status = StatusOf(in);
+              if (status == nullptr || !status->runtime.registrarsTotal.has_value())
+                  return Said(std::string { in.absent });
+              auto const& runtime = status->runtime;
+              // Absent means NEVER, which is not a long time ago: a node no scheduler has accepted says so.
+              return Said(std::format("{} of {}, {}",
+                                      CountText(in, runtime.registrarsRegistered),
+                                      *runtime.registrarsTotal,
+                                      runtime.lastRegistrationSecondsAgo.has_value()
+                                          ? std::format("last {}s ago", *runtime.lastRegistrationSecondsAgo)
+                                          : std::string { "never accepted" }));
+          } },
+        { .fact = StatusFact::Consensus,
+          .render = [](FrameInputs const& in, FactCell const& /*cell*/, std::size_t /*width*/) -> std::optional<FactText> {
+              auto const* status = StatusOf(in);
+              if (!RunsConsensus(status))
+                  return std::nullopt;
+              auto const& role = status->runtime.schedulerRole;
+              return Said(role.has_value() ? std::string { NameOfSchedulerRole(*role) } : std::string { in.absent });
+          } },
+        { .fact = StatusFact::Leader,
+          .render = [](FrameInputs const& in, FactCell const& /*cell*/, std::size_t /*width*/) -> std::optional<FactText> {
+              // Empty is a READING -- no leader is known -- so it is the marker, on the line the role is on.
+              auto const* status = StatusOf(in);
+              if (!RunsConsensus(status))
+                  return std::nullopt;
+              auto const& leader = status->runtime.leaderEndpoint;
+              return Said(leader.empty() ? std::string { in.absent } : leader);
+          } },
+        { .fact = StatusFact::Slots,
+          .render = [](FrameInputs const& in, FactCell const& /*cell*/, std::size_t /*width*/) -> std::optional<FactText> {
+              auto const* status = StatusOf(in);
+              if (status == nullptr)
+                  return Said(std::string { in.absent });
+              auto const& runtime = status->runtime;
+              if (!runtime.compileSlots.has_value())
+                  return std::nullopt;
+              // What is available right now and which ceiling binds it are `Distributed::SlotCeilingsFor` over the
+              // machine's live load, which no status carries: both are the marker, by name, until one does.
+              auto fact = Said(std::format("{} in flight / {} available / {} registered",
+                                           CountText(in, runtime.compilesInFlight),
+                                           in.absent,
+                                           *runtime.compileSlots));
+              fact.more.push_back(std::format("limited-by  {}", in.absent));
+              return fact;
+          } },
+        { .fact = StatusFact::CacheTier,
+          .render = [](FrameInputs const& in, FactCell const& cell, std::size_t /*width*/) -> std::optional<FactText> {
+              auto const* status = StatusOf(in);
+              if (status == nullptr || (status->components & CompileCacheWire::NodeComponentBit::CacheTier) == 0)
+                  return std::nullopt;
+              auto fact = FactText {};
+              for (auto const& figure: cell.figures)
+                  fact.pieces.push_back(
+                      Piece { .text = std::string { fact.pieces.empty() ? "" : PieceGap } + BesideText(in, figure),
+                              .priority = fact.pieces.empty() ? Priority::Essential : figure.priority });
+              // How full the tier is: no status carries it yet, so the marker stands where the fill goes.
+              fact.pieces.push_back(
+                  Piece { .text = std::format("{}{} / {}", PieceGap, in.absent, in.absent), .priority = Priority::Normal });
+              return fact;
+          } },
+        { .fact = StatusFact::Host,
+          .render = [](FrameInputs const& in, FactCell const& cell, std::size_t /*width*/) -> std::optional<FactText> {
+              // CPU busy and memory free are what the node samples for its heartbeat, and no status carries
+              // them yet: named, with the marker, so the line has the shape it will have.
+              auto fact = FactText {};
+              fact.pieces.push_back(
+                  Piece { .text = std::format("cpu-busy {}", in.absent), .priority = Priority::Essential });
+              fact.pieces.push_back(
+                  Piece { .text = std::format("{}mem free {}", PieceGap, in.absent), .priority = Priority::Normal });
+              for (auto const& figure: cell.figures)
+                  fact.pieces.push_back(
+                      Piece { .text = std::string { PieceGap } + BesideText(in, figure), .priority = figure.priority });
+              return fact;
+          } },
+    } };
+
+    static_assert(RowsInEnumeratorOrder(StatusFactTable, &StatusFactSpec::fact),
+                  "StatusFactTable must hold one row per StatusFact, in enumerator order");
+
+    /// The fact blocks @p spec draws at @p place, one group of items per block that has a line to draw.
+    ///
+    /// Every first cell shares one label column across the whole panel, so `slots` and `host` start where
+    /// `toolchains` does; a second cell's label is aligned across the lines of its own block.
+    /// @param in The frame's inputs.
+    /// @param spec The panel.
+    /// @param place Which blocks.
+    /// @param budget The content width.
+    /// @return The groups; or the cells an essential line needed when it does not fit.
+    [[nodiscard]] std::expected<std::vector<std::vector<Item>>, std::size_t> FactGroups(FrameInputs const& in,
+                                                                                        PanelSpec const& spec,
+                                                                                        FactPlace place,
+                                                                                        std::size_t budget)
+    {
+        auto labelColumns = std::size_t { 0 };
+        for (auto const& block: spec.facts)
+            for (auto const& line: block.lines)
+                if (!line.cells.empty())
+                    labelColumns = std::max(labelColumns, in.cellWidth(line.cells.front().label) + in.cellWidth(FactGap));
+        auto const lead = in.cellWidth(Indent) + labelColumns;
+        auto const valueBudget = budget > lead ? budget - lead : 0;
+
+        auto groups = std::vector<std::vector<Item>> {};
+        for (auto const& block: spec.facts)
+        {
+            if (block.place != place)
+                continue;
+
+            struct Rendered
+            {
+                FactLine const* line;           ///< The line.
+                FactText first;                 ///< Its first cell, which applies, or the line is not drawn.
+                std::optional<FactText> second; ///< Its second cell, when it has one that applies.
+            };
+            auto rendered = std::vector<Rendered> {};
+            auto firstColumns = std::size_t { 0 };
+            auto secondLabelColumns = std::size_t { 0 };
+            for (auto const& line: block.lines)
+            {
+                if (line.cells.empty())
+                    continue;
+                auto const render = [&in, valueBudget](FactCell const& cell) {
+                    return StatusFactTable[static_cast<std::size_t>(cell.fact)].render(in, cell, valueBudget);
+                };
+                auto first = render(line.cells.front());
+                if (!first.has_value())
+                    continue;
+                auto entry = Rendered { .line = &line, .first = std::move(*first), .second = std::nullopt };
+                if (line.cells.size() > 1)
+                {
+                    entry.second = render(line.cells[1]);
+                    firstColumns = std::max(firstColumns, TextWidth(entry.first.pieces, in.cellWidth));
+                    secondLabelColumns =
+                        std::max(secondLabelColumns, in.cellWidth(line.cells[1].label) + in.cellWidth(FactGap));
+                }
+                rendered.push_back(std::move(entry));
+            }
+
+            auto group = std::vector<Item> {};
+            for (auto& entry: rendered)
+            {
+                auto kept = FitPieces(std::move(entry.first.pieces), valueBudget, 0, in.cellWidth);
+                if (!kept.has_value())
+                {
+                    if (entry.line->priority == Priority::Essential)
+                        return std::unexpected(lead + kept.error());
+                    continue;
+                }
+                auto text = std::string { Indent } + FitRight(entry.line->cells.front().label, labelColumns, in.cellWidth)
+                            + Joined(*kept, {});
+                if (entry.second.has_value())
+                {
+                    auto const aligned = std::max(in.cellWidth(text), lead + firstColumns);
+                    auto second = std::string { FactGap }
+                                  + FitRight(entry.line->cells[1].label, secondLabelColumns, in.cellWidth)
+                                  + Joined(entry.second->pieces, {});
+                    // The second cell goes whole when it does not fit beside the first.
+                    if (aligned + in.cellWidth(second) <= budget)
+                    {
+                        text = FitRight(text, aligned, in.cellWidth);
+                        text += second;
+                    }
+                }
+                auto item = Item { .lines = { std::move(text) }, .priority = entry.line->priority };
+                for (auto const& more: entry.first.more)
+                    item.lines.push_back(std::string(lead, ' ') + more);
+                group.push_back(std::move(item));
+            }
+            if (!group.empty())
+                groups.push_back(std::move(group));
+        }
+        return groups;
     }
 
     /// The palette ceiling a chart is encoded with: its ramp's eight colours fit without merging.
@@ -1274,8 +1611,11 @@ std::vector<std::optional<double>> FigureSeries(std::deque<HistoryEntry> const& 
                                                 StatsOrigin origin,
                                                 std::string_view label)
 {
-    auto series = FigureSourceTable[static_cast<std::size_t>(figure.source)].compute(
-        history, ResolvedName(figure.field, origin, label), ResolvedName(figure.other, origin, label));
+    auto const& row = FigureSourceTable[static_cast<std::size_t>(figure.source)];
+    auto series = row.compute(history, ResolvedName(figure.field, origin, label), ResolvedName(figure.other, origin, label));
+    if (row.takesAddends)
+        for (auto const& addend: figure.addends)
+            series = Pairwise(series, Rates(history, ResolvedName(addend, origin, label)), &Sum);
     for (auto& cell: series)
         if (cell.has_value())
             *cell *= figure.scale;
@@ -1420,21 +1760,31 @@ DashboardFrame PanelView::PlacedFrame(DashboardModel const& model)
         _reserveColumns = budget;
     }
 
+    auto above = FactGroups(in, *_spec, FactPlace::AboveRates, budget);
     auto rates = RateItems(in, _spec->rates, budget, _besideReserve);
     auto levels = LevelItems(in, _spec->levels, budget);
     auto tiers = TierItems(in, *_spec, budget);
     auto document = DocumentItems(in, *_spec, _context, budget);
+    auto below = FactGroups(in, *_spec, FactPlace::BelowRates, budget);
     for (auto const* block: { &rates, &levels, &tiers, &document })
         if (!block->has_value())
             return tooSmall(block->error() + FrameColumns);
+    for (auto const* facts: { &above, &below })
+        if (!facts->has_value())
+            return tooSmall(facts->error() + FrameColumns);
 
-    auto items = std::vector<Item> {};
+    // Top to bottom, a blank before every block that has something to draw.
+    auto groups = std::move(*above);
     for (auto* block: { &*rates, &*levels, &*tiers, &*document })
+        groups.push_back(std::move(*block));
+    std::ranges::move(*below, std::back_inserter(groups));
+    auto items = std::vector<Item> {};
+    for (auto& group: groups)
     {
-        if (block->empty())
+        if (group.empty())
             continue;
         items.push_back(Blank());
-        std::ranges::move(*block, std::back_inserter(items));
+        std::ranges::move(group, std::back_inserter(items));
     }
     items.push_back(Blank());
     auto source = SourceLine(in, _spec->sourcePriority, budget);
