@@ -32,6 +32,7 @@ set(_fc_cli_sources
     StatsGatherer.cpp
     StatsSource.cpp
     TerminalCapabilities.cpp
+    DashboardGlyphs.cpp
 )
 
 # The terminal half of the dashboard's input (#1372) is the one place this binary meets the
@@ -83,6 +84,7 @@ if(FASTCACHED_BUILD_TESTS)
         RespClient_test.cpp
         StatsSource_test.cpp
         TerminalCapabilities_test.cpp
+        DashboardGlyphs_test.cpp
         ${_fc_cli_tui_tests}
     )
     target_include_directories(fastcache-cli-tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
