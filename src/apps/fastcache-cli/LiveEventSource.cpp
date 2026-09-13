@@ -123,14 +123,6 @@ namespace
         {
         }
 
-        void Present(std::string_view frame) override
-        {
-            if (*_presenter != nullptr)
-                (*_presenter)->Present(frame);
-        }
-
-        // Forwarded as a frame, never as its text: the default would hand the presenter the rows alone,
-        // and every image placed in a frame would be dropped here with nothing to say so.
         void PresentPlaced(DashboardFrame const& frame) override
         {
             if (*_presenter != nullptr)

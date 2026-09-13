@@ -225,9 +225,10 @@ class LadderRedial final: public IStatsDialer
 class StdoutFrames final: public IFrameSink
 {
   public:
-    void Present(std::string_view frame) override
+    // Text alone: a pipe draws no image, and the piped view places none.
+    void PresentPlaced(DashboardFrame const& frame) override
     {
-        std::cout << frame << std::flush;
+        std::cout << frame.text << std::flush;
     }
 };
 

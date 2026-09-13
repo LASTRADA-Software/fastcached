@@ -118,7 +118,7 @@ struct StartedTerminal
     /// exactly when `capabilities` says `SynchronizedOutputAnswer::Supported`. A terminal that did not
     /// answer gets unsynchronized frames, and never a wait.
     ///
-    /// Call `Present` on the thread that awaits `events`, and not after `events` is destroyed: the
+    /// Present frames on the thread that awaits `events`, and not after `events` is destroyed: the
     /// terminal is put back by then, so a late frame would land on the operator's own screen.
     /// Leaving the alternate screen is not the presenter's job; destroying `events` or
     /// `RestoreNow` does it.

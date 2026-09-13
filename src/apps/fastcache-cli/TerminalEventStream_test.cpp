@@ -1332,8 +1332,8 @@ TEST_CASE("a frame drawn without an earlier frame's image leaves none of that im
 
 TEST_CASE("a started terminal's frames draw the images placed in them", "[cli][dashboard][terminal]")
 {
-    // The loop reaches a sink through `PresentPlaced`, whose default draws the text alone. A presenter
-    // that did not override it would pass every FrameBytes case above and never draw an image.
+    // The loop reaches a sink through `PresentPlaced`. A presenter that wrote only the frame's text would
+    // pass every FrameBytes case above and never draw an image.
     for (auto const answer: { SynchronizedOutputAnswer::Supported, SynchronizedOutputAnswer::NoReply })
     {
         auto record = DeviceRecord {};
