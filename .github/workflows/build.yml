@@ -1216,8 +1216,9 @@ jobs:
   # enumerated the test binaries by hand and its table listed four; this tree
   # registers six with `catch_discover_tests`, five of them in a default
   # configuration — `fastcache-cli-tests` and `CowTreeTests` were in neither the
-  # table nor any row. Neither is threaded, so the ticket's conclusion survives its
-  # census, but a hand list is exact about what it knows and silent about what it
+  # table nor any row. Neither was threaded then, so the ticket's conclusion survived
+  # its census (`fastcache-cli-tests` became threaded with #134 and is a row now), but
+  # a hand list is exact about what it knows and silent about what it
   # does not (#492), and that silence reads identically to complete coverage. So
   # `scripts/check-tsan-scope.cmake` DERIVES the set from the
   # `catch_discover_tests` registrations and requires each one to be a `TARGETS`
@@ -1364,7 +1365,8 @@ jobs:
       # the one above and a reader reconciling them would be reconciling nothing.
       #
       # What this job still does NOT build: the daemon, the launcher itself
-      # (`fastcache-cc`, as opposed to its tests), `fastcache-cli` and its tests,
+      # (`fastcache-cc`, as opposed to its tests), `fastcache-cli` (its tests are a
+      # row since #134 gave them a thread pool),
       # `CowTreeTests`, and the two default-OFF targets (benchmarks, testclient).
       # `scripts/check-tsan-scope.cmake` is what keeps that list honest — every
       # Catch2 binary this tree registers is either a `TARGETS` row or carries a
@@ -1373,7 +1375,7 @@ jobs:
       - name: "Build"
         run: >-
           cmake --build --preset clang-tsan --target
-          FastCacheTest fastcache-compile-node-tests fastcache-cc-tests tsan-canary
+          FastCacheTest fastcache-compile-node-tests fastcache-cc-tests fastcache-cli-tests tsan-canary
 
       - name: "Report ccache effectiveness"
         run: ccache --show-stats --verbose
