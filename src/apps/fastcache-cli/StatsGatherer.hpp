@@ -48,7 +48,7 @@ class LadderGatherer final: public IStatsGatherer, public IAdminDocument, public
     ///
     /// Public because a VERB needs it, where `ResolveAdmin` below stays private: the
     /// address is this class's business and the document is the caller's. It reuses
-    /// the identity `Identify()` already cached, so a verb pays no second `NodeStatus`
+    /// the identity `Identified()` already cached, so a verb pays no second `NodeStatus`
     /// round trip for asking.
     /// @param path An absolute path, query string included.
     /// @return The body, or why there is none.
@@ -66,19 +66,16 @@ class LadderGatherer final: public IStatsGatherer, public IAdminDocument, public
     ///
     /// ONE cache rather than two beside each other, because they describe one fact: the
     /// fields the admin rung reads and the kind a verb decides a subject from are written
-    /// in the same statement, so they cannot describe two different answers.
+    /// in the same statement, so they cannot describe two different answers. The reason
+    /// there are no fields is `endpoint.detail`, held once.
     struct Identification
     {
-        /// The node's own description, or the reason there is none -- what the rungs read.
-        std::expected<CompileCacheWire::NodeStatusFields, std::string> fields;
+        /// The node's own description, or nullopt when there is none -- what the rungs read.
+        std::optional<CompileCacheWire::NodeStatusFields> fields;
 
-        /// What the endpoint is, typed -- what a verb reads.
+        /// What the endpoint is, typed, and in words -- what a verb reads.
         EndpointIdentity endpoint;
     };
-
-    /// The identification, asked ONCE and remembered.
-    /// @return Both views of it.
-    [[nodiscard]] Identification const& Identified();
 
     /// What the endpoint is, asked ONCE and remembered.
     ///
@@ -94,8 +91,8 @@ class LadderGatherer final: public IStatsGatherer, public IAdminDocument, public
     /// rather than *did not answer* against a daemon -- an endpoint that cannot serve a
     /// verb was not consulted about it, and saying otherwise sends an operator to check
     /// a component that is not there.
-    /// @return The node's own description, or why there is none.
-    [[nodiscard]] std::expected<CompileCacheWire::NodeStatusFields, std::string> const& Identify();
+    /// @return Both views of the identification.
+    [[nodiscard]] Identification const& Identified();
 
     /// Where the admin surface is, asking the node when the operator named nowhere.
     ///
