@@ -100,6 +100,57 @@ class IRungViews
                                                               std::string_view address) = 0;
 };
 
+/// Where a piped session's remarks go as they happen: stderr, in `main`.
+class IRemarkSink
+{
+  public:
+    IRemarkSink() = default;
+    IRemarkSink(IRemarkSink const&) = delete;
+    IRemarkSink(IRemarkSink&&) = delete;
+    IRemarkSink& operator=(IRemarkSink const&) = delete;
+    IRemarkSink& operator=(IRemarkSink&&) = delete;
+    virtual ~IRemarkSink() = default;
+
+    /// Tell the operator @p line now. Called on the reactor's thread.
+    /// @param line One remark, without a newline.
+    virtual void Remark(std::string_view line) = 0;
+};
+
+/// Tells an operator why samples fail: once per reason, never once per sample.
+///
+/// Forwards a session's events unchanged, and remarks on a sample that read nothing when it is the
+/// first such sample since a reading -- or of the run -- or when its reason differs from the one
+/// before it. A stream of absent rows then says why exactly as often as the why changes: a daemon
+/// that is down for an hour is one line, not one per sample, and a daemon that recovers and fails
+/// again is told about again.
+///
+/// **The reason is the decision's own account, never a second one**: `SampleReading::note` for a
+/// `Sample` its reader could not read, asked of the very reader the loop is given (it is pure, so
+/// both ask one question and get one answer), and `DashboardEvent::note` for a `SampleFailed`.
+class FailureRemarks final: public IDashboardEventSource
+{
+  public:
+    /// @param events What to forward; outlives this.
+    /// @param reader The session's reader.
+    /// @param sink Where a remark goes; outlives this.
+    FailureRemarks(IDashboardEventSource* events, SampleReader reader, IRemarkSink* sink) noexcept;
+
+    [[nodiscard]] Task<DashboardEvent> Next() override;
+    void Close() noexcept override;
+
+  private:
+    /// Remark on @p event when it is a failure worth one.
+    /// @param event What is about to be forwarded.
+    void Observe(DashboardEvent const& event);
+
+    IDashboardEventSource* _events;
+    SampleReader _reader;
+    IRemarkSink* _sink;
+
+    /// Why the previous sample read nothing, or nullopt when it read something or none was taken.
+    std::optional<std::string> _failing {};
+};
+
 /// Everything a session is composed from. `main` acquires each part; nothing here does.
 struct LiveSessionParts
 {
@@ -116,6 +167,7 @@ struct LiveSessionParts
     IExecutor* stopWaiter { nullptr };           ///< Where the stop wait blocks: its own thread.
     IExecutor* terminalPool { nullptr };         ///< Where terminal reads block: its own thread.
     IFrameSink* sink { nullptr };                ///< Where a piped session's frames go; never an interactive one's.
+    IRemarkSink* remarks { nullptr };            ///< Where a piped session's remarks go as they happen.
     bool interactive { false };                  ///< `StandardStreamsAreInteractive()`, asked by `main`.
     ITerminalAcquisition* terminals { nullptr }; ///< Asked only when interactive.
     IStopSignalInstaller* stops { nullptr };     ///< Asked only when not.
@@ -137,6 +189,10 @@ struct LiveSessionRun
 /// never falls back to piped output -- that would change the output's shape under a script
 /// somebody wrote by copying an interactive run. **Not interactive**: acquire no terminal at all,
 /// install the stop request instead, and draw on the `Piped` rung to `parts.sink`.
+///
+/// **Why samples fail is remarked once per reason** (`FailureRemarks`): on `parts.remarks` as it
+/// happens for a piped session, whose stderr is free, and into the run's remarks for an interactive
+/// one, whose stderr is the screen being drawn on -- they are written once the terminal is back.
 ///
 /// **The source is closed on every way the loop ends**, an exception included, because the
 /// source drains only after a close and a terminal that went away on its own closes nothing.
@@ -222,6 +278,7 @@ struct LiveSessionSeat
     IExecutor* stopWaiter { nullptr };           ///< Where the stop wait blocks.
     IExecutor* terminalPool { nullptr };         ///< Where terminal reads block.
     IFrameSink* sink { nullptr };                ///< Where a piped session's frames go: stdout.
+    IRemarkSink* remarks { nullptr };            ///< Where a piped session's remarks go as they happen: stderr.
     bool streamsInteractive { false };           ///< `StandardStreamsAreInteractive()`.
     RenderOptions render {};                     ///< The `--format` and `--absent` asked for.
     ITerminalAcquisition* terminals { nullptr }; ///< Asked only for an interactive session.

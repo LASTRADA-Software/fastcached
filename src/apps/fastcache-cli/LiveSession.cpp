@@ -53,6 +53,25 @@ namespace
         std::shared_ptr<ITerminalRestore> restore {};                ///< The acquired terminal's, or null.
     };
 
+    /// Remarks kept for the end of a session: an interactive one, whose stderr is its screen.
+    class KeptRemarks final: public IRemarkSink
+    {
+      public:
+        /// @param into Where they are kept; outlives this.
+        explicit KeptRemarks(std::vector<std::string>* into) noexcept:
+            _into { into }
+        {
+        }
+
+        void Remark(std::string_view line) override
+        {
+            _into->emplace_back(line);
+        }
+
+      private:
+        std::vector<std::string>* _into;
+    };
+
     /// A session that never started.
     /// @param answer Why.
     /// @return The ending.
@@ -170,12 +189,61 @@ Task<std::expected<LiveSessionRun, Answer>> RunComposedSession(LiveSessionParts 
 
     source->emplace(std::move(sourceParts));
     auto const closeOnExit = CloseOnExit { &**source };
+    auto kept = KeptRemarks { &run.remarks };
+    assert((parts.interactive || parts.remarks != nullptr) && "a piped session names where its remarks go");
+    auto remarking = FailureRemarks { &**source, parts.reader, parts.interactive ? &kept : parts.remarks };
     // An interactive session draws on the terminal's presenter and never on the pipe.
     auto* const terminalFrames = (*source)->Frames();
     auto* const sink = terminalFrames != nullptr ? terminalFrames : parts.sink;
     run.exit =
-        co_await RunDashboard(&**source, parts.reader, view.get(), sink, DashboardLimits { .samples = parts.plan.samples });
+        co_await RunDashboard(&remarking, parts.reader, view.get(), sink, DashboardLimits { .samples = parts.plan.samples });
     co_return run;
+}
+
+FailureRemarks::FailureRemarks(IDashboardEventSource* events, SampleReader reader, IRemarkSink* sink) noexcept:
+    _events { events },
+    _reader { reader },
+    _sink { sink }
+{
+}
+
+Task<DashboardEvent> FailureRemarks::Next()
+{
+    auto event = co_await _events->Next();
+    Observe(event);
+    co_return event;
+}
+
+void FailureRemarks::Close() noexcept
+{
+    _events->Close();
+}
+
+void FailureRemarks::Observe(DashboardEvent const& event)
+{
+    auto reason = std::optional<std::string> {};
+    switch (event.kind)
+    {
+        case DashboardEventKind::Sample:
+            if (auto reading = _reader(event); reading.outcome != Outcome::Affirmative)
+                reason = std::move(reading.note);
+            break;
+        case DashboardEventKind::SampleFailed:
+            reason = event.note;
+            break;
+        case DashboardEventKind::Tick:
+        case DashboardEventKind::Key:
+        case DashboardEventKind::Resize:
+        case DashboardEventKind::Detached:
+        case DashboardEventKind::StopRequested:
+        case DashboardEventKind::Last:
+            // Not a sample: whether samples are failing has not changed.
+            return;
+    }
+
+    if (reason.has_value() && reason != _failing)
+        _sink->Remark(std::format("a sample read nothing: {}", reason->empty() ? "no reason was given" : *reason));
+    _failing = std::move(reason);
 }
 
 std::string DescribeAbandonment(std::string_view endpoint, std::optional<Duration> sampleAge)
@@ -268,6 +336,7 @@ SessionEnding RunLiveStatsSession(VerbContext const& context, LiveSessionSeat co
         .stopWaiter = seat.stopWaiter,
         .terminalPool = seat.terminalPool,
         .sink = seat.sink,
+        .remarks = seat.remarks,
         // The format does not change because the streams are a terminal (§1.6): only a human
         // run draws, and every other format streams its records wherever stdout goes.
         .interactive = seat.streamsInteractive && seat.render.format == OutputFormat::Human,
