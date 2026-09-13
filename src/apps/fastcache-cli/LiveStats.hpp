@@ -65,10 +65,11 @@ struct LiveSubjectSpec
 
     /// Whether each of this subject's samples carries what the node says about itself now.
     ///
-    /// **True for `node` alone**: its panel draws the node's version, uptime, toolchains and slots
-    /// from `DashboardEvent::nodeStatus`, asked afresh with every sample. A cache daemon has no
-    /// `NodeStatus` to ask, and `fleet`'s status is the leader's document. Beside `inferrable`, so
-    /// the two flags share one run of padding.
+    /// **True for `node` alone**: its samples carry `DashboardEvent::nodeStatus`, asked afresh with
+    /// every sample, which the model keeps as the newest sample's status for a node's status block
+    /// to draw -- the version, uptime, toolchains and slots no stats record carries. A cache daemon
+    /// has no `NodeStatus` to ask, and `fleet`'s status is the leader's document. Beside `inferrable`,
+    /// so the two flags share one run of padding.
     bool readsNodeStatus;
 
     /// What an endpoint must turn out to be to serve this subject.
@@ -125,9 +126,9 @@ struct LiveSubjectSpec
     /// The panel an interactive session of this subject draws, or null where this build has none.
     ///
     /// **A column, so the rung's view never branches on a subject**: the composition asks the row
-    /// and draws whatever panel it names. Null for `fleet`, whose panel binds to the fleet reader
-    /// and arrives with it; a null panel refuses an interactive session by name, and never draws
-    /// it through the piped view instead.
+    /// and draws whatever panel it names. Null for `fleet`, whose panel binds to `ReadFleetSample`
+    /// and is not in this build; a null panel refuses an interactive session by name -- before the
+    /// terminal is acquired -- and never draws it through the piped view instead.
     PanelOf panel;
 
     /// What a piped session of this subject streams per sample, or null where this build has nothing.

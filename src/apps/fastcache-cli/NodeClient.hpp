@@ -278,8 +278,8 @@ class IEndpointIdentity
 ///
 /// **Asked afresh on every call, never answered from an identification.** `IEndpointIdentity`
 /// is asked once and remembered, which is right for deciding what an endpoint is and wrong for
-/// a status block: toolchains served, registrars, the scheduler role and the slots are what a
-/// `node` panel exists to show moving, and a remembered answer would draw the session's first
+/// a watch: toolchains served, registrars, the scheduler role and the slots are what a node's
+/// status block exists to show moving, and a remembered answer would show the session's first
 /// moment for as long as it runs.
 class INodeStatusReader
 {
