@@ -2,6 +2,7 @@
 #pragma once
 
 #include "DashboardEvent.hpp"
+#include "DashboardLoop.hpp"
 #include "TerminalCapabilities.hpp"
 
 #include <FastCache/Async/IExecutor.hpp>
@@ -91,19 +92,37 @@ class ITerminalRestore
     virtual void RestoreNow() noexcept = 0;
 };
 
-/// A terminal that was acquired: what it can draw, the events it produces, and the way to put it
-/// back without them.
+/// A terminal that was acquired: what it can draw, the events it produces, where frames go, and
+/// the way to put it back without any of them.
 ///
 /// The record arrives beside the source so the rung can be decided (`ChooseRenderRung`) before
 /// the first event is read. `events` owns the terminal: it is restored when `events` is destroyed,
 /// which must follow `Close()` and the outstanding `Next()` resuming. The first event is always a
 /// `Resize` carrying the geometry at start. `restore` is for the exit where `events` is never
 /// destroyed; it may outlive `events`.
+///
+/// **The start entered the alternate screen and hid the cursor.** Both are left on every way out:
+/// destroying `events`, `restore->RestoreNow()`, and a start that failed after entering -- which
+/// never produces this record at all.
 struct StartedTerminal
 {
     TerminalCapabilities capabilities;
     std::unique_ptr<IDashboardEventSource> events;
     std::shared_ptr<ITerminalRestore> restore;
+
+    /// Where frames are drawn: the alternate screen.
+    ///
+    /// It owns presentation, so no escape byte lives in a panel or in the composition. Each
+    /// `Present` moves the cursor home, writes the frame, and clears to the end of the screen --
+    /// bracketed in synchronized output (DEC mode 2026) exactly when `capabilities` says
+    /// `SynchronizedOutputAnswer::Supported`. A terminal that did not answer gets unsynchronized
+    /// frames, and never a wait.
+    ///
+    /// Call `Present` on the thread that awaits `events`, and not after `events` is destroyed: the
+    /// terminal is put back by then, so a late frame would land on the operator's own screen.
+    /// Leaving the alternate screen is not the presenter's job; destroying `events` or
+    /// `RestoreNow` does it.
+    std::unique_ptr<IFrameSink> frames;
 };
 
 /// A terminal event source over this process's standard streams, not yet started.
@@ -129,12 +148,14 @@ struct StartedTerminal
 /// Acquire @p terminal and learn what it can draw.
 ///
 /// Hops to the pool; refuses unless stdin and stdout are both a terminal; enters raw mode; asks
-/// for the device attributes (DA1, for Sixel); reads the text encoding behind `Platform/Terminal`;
-/// then hops back to `resumeOn` before returning. Input typed while the queries were in flight is
-/// kept and arrives from `events`.
+/// for the device attributes (DA1, for Sixel) and for DEC mode 2026 (DECRQM, for synchronized
+/// output); reads the text encoding behind `Platform/Terminal`; enters the alternate screen and
+/// hides the cursor; then hops back to `resumeOn` before returning. Input typed while the queries
+/// were in flight is kept and arrives from `events`.
 ///
-/// **A terminal that never answers DA1 is a successful start** whose record says
-/// `SixelAnswer::NoReply`, so the rung falls back rather than the dashboard failing. Only failing
+/// **A terminal that never answers DA1 or DECRQM is a successful start** whose record says
+/// `NoReply`, so the rung falls back and frames go unsynchronized rather than the dashboard
+/// failing. Each unanswered query costs its deadline once, at start, and never per frame. Only failing
 /// to acquire the terminal at all is an error, and then the terminal is restored before this
 /// returns, however far the acquisition got.
 /// @param terminal The terminal to start; consumed.
