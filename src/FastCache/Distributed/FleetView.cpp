@@ -127,6 +127,7 @@ namespace
         std::string_view help;                   ///< The header's tooltip; a reader's, so not in the JSON.
         CellFormat format { CellFormat::Count }; ///< How the page renders it.
         CellDecor decor { CellDecor::Plain };    ///< How the page dresses it; the JSON ignores this.
+        ColumnKeep keep { ColumnKeep::Useful };  ///< How long a narrow human surface keeps it; see `FleetColumnKeep`.
         FleetCell (*project)(Subject const&);    ///< What to read.
     };
 
@@ -244,6 +245,7 @@ namespace
             .name = "id",
             .help = "The member's stable identity: what consensus counts.",
             .format = CellFormat::Text,
+            .keep = ColumnKeep::Identity,
             .project = [](Cluster::ClusterMember const& m) { return FleetCell::Of(m.id); } },
         FleetColumn<Cluster::ClusterMember> {
             .name = "raft-endpoint",
@@ -268,6 +270,7 @@ namespace
         FleetColumn<NodeReport> { .name = "endpoint",
                                   .help = "host:port the machine answers on.",
                                   .format = CellFormat::Text,
+                                  .keep = ColumnKeep::Identity,
                                   .project = [](NodeReport const& n) { return FleetCell::Of(n.endpoint); } },
         FleetColumn<NodeReport> { .name = "name",
                                   .help = "What this machine calls itself, as an operator would recognise it. Advisory: "
@@ -288,6 +291,9 @@ namespace
             .help = "Which build of fastcache-compile-node this machine is running. Absent "
                     "when the node predates the field and cannot report one.",
             .format = CellFormat::Text,
+            // Detail at a narrow width, whatever it means during an upgrade: a build string is the widest
+            // cell on the row, and the page, which draws every column, is where a rollout is read.
+            .keep = ColumnKeep::Detail,
             // Absent rather than blank, and the distinction earns its place during
             // the one activity this column exists for: a rolling upgrade. A node
             // too old to report a version is exactly the node an operator is
@@ -313,6 +319,7 @@ namespace
         FleetColumn<NodeReport> { .name = "memory",
                                   .help = "Physical memory. Absent when the machine did not say.",
                                   .format = CellFormat::Bytes,
+                                  .keep = ColumnKeep::Detail,
                                   .project =
                                       [](NodeReport const& n) {
                                           return n.capacity.totalMemoryBytes == 0
@@ -323,6 +330,7 @@ namespace
             .name = "class",
             .help = "How hard this machine may be driven, and how many cores are held back for whoever uses it.",
             .format = CellFormat::Text,
+            .keep = ColumnKeep::Detail,
             .project =
                 [](NodeReport const& n) {
                     auto const& traits = TraitsFor(n.capacity.nodeClass);
@@ -332,15 +340,18 @@ namespace
         FleetColumn<NodeReport> { .name = "cpu-busy",
                                   .help = "Host-wide CPU in use, this fleet's work included. Absent when unread.",
                                   .format = CellFormat::Permille,
+                                  .keep = ColumnKeep::Vital,
                                   .project = [](NodeReport const& n) { return FleetCell::Maybe(n.load.cpuBusyPermille); } },
         FleetColumn<NodeReport> {
             .name = "memory-available",
             .help = "Memory a new compile could get. Absent when unread.",
             .format = CellFormat::Bytes,
+            .keep = ColumnKeep::Detail,
             .project = [](NodeReport const& n) { return FleetCell::Maybe(n.load.availableMemoryBytes); } },
         FleetColumn<NodeReport> { .name = "scratch-free",
                                   .help = "Room where compiles run. The limit that most often reaches zero.",
                                   .format = CellFormat::Bytes,
+                                  .keep = ColumnKeep::Vital,
                                   .project = [](NodeReport const& n) { return FleetCell::Maybe(n.load.freeScratchBytes); } },
         FleetColumn<NodeReport> { .name = "cache-hit-rate",
                                   .help = "Reads this node's cache served. Absent when it has served none.",
@@ -351,6 +362,7 @@ namespace
             .help = "Since this machine last reported. Everything on its row is that old.",
             .format = CellFormat::Millis,
             .decor = CellDecor::Freshness,
+            .keep = ColumnKeep::Vital,
             // The column that tells "this cache is empty" from "this node stopped
             // answering an hour ago and these are its last figures" -- which look
             // identical without it, and lead to opposite conclusions.
@@ -363,6 +375,7 @@ namespace
         FleetColumn<WorkerReport> { .name = "id",
                                     .help = "The id this leader assigned at registration.",
                                     .format = CellFormat::Text,
+                                    .keep = ColumnKeep::Identity,
                                     .project = [](WorkerReport const& w) { return FleetCell::Of(w.info.id); } },
         FleetColumn<WorkerReport> { .name = "toolchain",
                                     .help = "Matched byte-for-byte. A job never crosses fingerprints.",
@@ -379,6 +392,7 @@ namespace
             .help = "What this toolchain is, for a reader. Never matched on -- the fingerprint beside it is what "
                     "decides. Absent when the node did not say, which a pinned --toolchain override never does.",
             .format = CellFormat::Text,
+            .keep = ColumnKeep::Detail,
             // Absent rather than blank, like `version` above and for the same reason:
             // a node too old to report one, or one whose fingerprint an operator
             // pinned by hand, is exactly the row somebody is looking for -- so it must
@@ -403,6 +417,7 @@ namespace
             .name = "available",
             .help = "Compiles it may take right now. Below the registered count when something withdrew capacity.",
             .format = CellFormat::Count,
+            .keep = ColumnKeep::Vital,
             .project =
                 [](WorkerReport const& w) {
                     return FleetCell::Of(AvailableSlots(w.info.capacity, w.info.slots, w.info.load));
@@ -411,6 +426,7 @@ namespace
                                     .help = "Which ceiling withdrew the difference: the three have opposite fixes.",
                                     .format = CellFormat::Text,
                                     .decor = CellDecor::Limit,
+                                    .keep = ColumnKeep::Vital,
                                     .project =
                                         [](WorkerReport const& w) {
                                             auto const ceilings =
@@ -422,6 +438,7 @@ namespace
             .help = "Since this entry last reported. A worker unheard-from is dropped.",
             .format = CellFormat::Millis,
             .decor = CellDecor::Freshness,
+            .keep = ColumnKeep::Vital,
             .project =
                 [](WorkerReport const& w) { return FleetCell::Of(static_cast<std::uint64_t>(w.heartbeatAge.count())); } },
         // The two below are one answer in two cells, and neither half means much
@@ -437,6 +454,7 @@ namespace
             .help = "Since this entry last registered. Read it beside last-picked-age: never picked matters at forty "
                     "minutes and means nothing at one second.",
             .format = CellFormat::Millis,
+            .keep = ColumnKeep::Detail,
             .project =
                 [](WorkerReport const& w) { return FleetCell::Of(static_cast<std::uint64_t>(w.registeredAge.count())); } },
         FleetColumn<WorkerReport> {
@@ -471,6 +489,7 @@ namespace
                                     .help = "The object key being compiled. What an already-in-flight refusal named, "
                                             "and what the launcher logs as key=.",
                                     .format = CellFormat::Text,
+                                    .keep = ColumnKeep::Identity,
                                     .project = [](LeaseHolding const& l) { return FleetCell::Of(l.key); } },
         FleetColumn<LeaseHolding> { .name = "worker",
                                     .help = "The worker it was leased to; its row is in the table above.",
@@ -481,6 +500,7 @@ namespace
             .help = "host:port that worker answers on. Absent when it is no longer registered, which is the "
                     "answer rather than a missing cell.",
             .format = CellFormat::Text,
+            .keep = ColumnKeep::Detail,
             .project =
                 [](LeaseHolding const& l) {
                     return l.workerEndpoint.empty() ? FleetCell::Nothing() : FleetCell::Of(l.workerEndpoint);
@@ -491,6 +511,7 @@ namespace
                     "is a client that died mid-build whose worker is still answering.",
             .format = CellFormat::Millis,
             .decor = CellDecor::LeaseAge,
+            .keep = ColumnKeep::Vital,
             .project = [](LeaseHolding const& l) { return FleetCell::Of(static_cast<std::uint64_t>(l.age.count())); } },
     };
 
@@ -908,19 +929,40 @@ namespace
     /// silently stopped tracking the timeout would colour rows by nothing.
     constexpr std::uint64_t LeaseOldAfterMillis = static_cast<std::uint64_t>(LeaseTable::DefaultLeaseTimeout.count()) / 2;
 
-    /// An age, as a pill that goes amber past `staleAfter`.
+    /// The tone @p decor gives a present value of @p number.
     ///
-    /// One implementation for both age decors, which differ by their threshold and
-    /// by nothing else. Two near-identical `case` bodies is how the pair comes to
-    /// draw differently for no reason anybody intended.
-    /// @param text The already-formatted value.
-    /// @param millis The age, for the comparison.
-    /// @param staleAfter Where the pill turns amber.
-    /// @return The cell's inner HTML.
-    [[nodiscard]] std::string AgePill(std::string_view text, std::uint64_t millis, std::uint64_t staleAfter)
+    /// **The one place an age threshold is applied**, for the page's pill and for every other human
+    /// surface through `FleetCellTone`. The two age decors differ by their threshold and by nothing
+    /// else, so they are one comparison.
+    /// @param decor The column's decoration.
+    /// @param number The cell's integer.
+    /// @return `Stale` past the decor's threshold, `Fresh` inside it, `Plain` for a decor with none.
+    [[nodiscard]] constexpr CellTone ToneOf(CellDecor decor, std::uint64_t number) noexcept
     {
-        auto const* const tone = millis >= staleAfter ? "pill--warn" : "pill--ok";
-        return std::format(R"(<span class="pill pill--value {}"><span class="dot"></span>{}</span>)", tone, text);
+        auto const agedPast = [number](std::uint64_t staleAfter) {
+            return number >= staleAfter ? CellTone::Stale : CellTone::Fresh;
+        };
+        switch (decor)
+        {
+            case CellDecor::Plain:
+            case CellDecor::Limit:
+                return CellTone::Plain;
+            case CellDecor::Freshness:
+                return agedPast(HeartbeatStaleAfterMillis);
+            case CellDecor::LeaseAge:
+                return agedPast(LeaseOldAfterMillis);
+        }
+        return CellTone::Plain;
+    }
+
+    /// An age, as a pill that goes amber once its tone is `Stale`.
+    /// @param text The already-formatted value.
+    /// @param tone What `ToneOf` decided.
+    /// @return The cell's inner HTML.
+    [[nodiscard]] std::string AgePill(std::string_view text, CellTone tone)
+    {
+        auto const* const pill = tone == CellTone::Stale ? "pill--warn" : "pill--ok";
+        return std::format(R"(<span class="pill pill--value {}"><span class="dot"></span>{}</span>)", pill, text);
     }
 
     /// Dress one cell the way its column asks.
@@ -949,9 +991,8 @@ namespace
             case CellDecor::Freshness:
                 // Amber past the point where a reader should stop trusting the
                 // rest of the row. Everything on it is as old as this number.
-                return AgePill(text, cell.number, HeartbeatStaleAfterMillis);
             case CellDecor::LeaseAge:
-                return AgePill(text, cell.number, LeaseOldAfterMillis);
+                return AgePill(text, ToneOf(column.decor, cell.number));
         }
         return text;
     }
@@ -1269,43 +1310,81 @@ std::optional<CellFormat> CellFormatFromName(std::string_view name) noexcept
     return row == nullptr ? std::nullopt : std::optional<CellFormat> { row->format };
 }
 
-std::optional<CellFormat> FleetColumnFormat(FleetSection section, std::string_view name)
+namespace
 {
-    auto const formatOf = [name](auto const& columns) -> std::optional<CellFormat> {
-        for (auto const& column: columns)
-            if (column.name == name)
-                return column.format;
-        return std::nullopt;
+    /// What a human surface other than the page reads about one column, whichever table holds it.
+    struct ColumnFacts
+    {
+        CellFormat format; ///< Its scale.
+        CellDecor decor;   ///< Its decoration.
+        ColumnKeep keep;   ///< How long it is kept for width.
     };
 
-    // The tables `FleetColumnNames` reads, section for section, with no default arm for its reason.
-    switch (section)
+    /// The facts of the column @p name in @p section.
+    ///
+    /// **The one walk behind `FleetColumnFormat`, `FleetColumnKeep` and `FleetCellTone`**, so the three
+    /// answer for one column set: the tables `FleetColumnNames` reads, section for section, with no
+    /// default arm for its reason.
+    /// @param section The section the header belongs to.
+    /// @param name The column's name.
+    /// @return The facts, or absent for a name the section does not render.
+    [[nodiscard]] std::optional<ColumnFacts> FactsOf(FleetSection section, std::string_view name)
     {
-        case FleetSection::Kpi:
-            // Each row names its own unit, so no column of this section has one scale.
+        auto const factsOf = [name](auto const& columns) -> std::optional<ColumnFacts> {
+            for (auto const& column: columns)
+                if (column.name == name)
+                    return ColumnFacts { .format = column.format, .decor = column.decor, .keep = column.keep };
             return std::nullopt;
-        case FleetSection::Machines:
-            return formatOf(NodeColumns);
-        case FleetSection::Workers:
-            return formatOf(WorkerColumns);
-        case FleetSection::Leases:
-            return formatOf(LeaseColumns);
-        case FleetSection::Members:
-            return formatOf(MemberColumns);
-        case FleetSection::Tiers:
-            if (name == TierEndpointColumn)
-                return CellFormat::Text;
-            // Every tier crossed with every suffix, composed through `TierColumnName` exactly as the
-            // renderers compose it, so there is no second spelling of a tier column to parse.
-            for (auto const& tier: StorageTierTable)
-                for (auto const& column: TierColumns)
-                    if (TierColumnName(tier.tier, column.suffix) == name)
-                        return column.format;
-            return std::nullopt;
-        case FleetSection::Last:
-            break;
+        };
+
+        switch (section)
+        {
+            case FleetSection::Kpi:
+                // Each row names its own unit, so no column of this section has one scale.
+                return std::nullopt;
+            case FleetSection::Machines:
+                return factsOf(NodeColumns);
+            case FleetSection::Workers:
+                return factsOf(WorkerColumns);
+            case FleetSection::Leases:
+                return factsOf(LeaseColumns);
+            case FleetSection::Members:
+                return factsOf(MemberColumns);
+            case FleetSection::Tiers:
+                if (name == TierEndpointColumn)
+                    return ColumnFacts { .format = CellFormat::Text,
+                                         .decor = CellDecor::Plain,
+                                         .keep = ColumnKeep::Identity };
+                // Every tier crossed with every suffix, composed through `TierColumnName` exactly as the
+                // renderers compose it, so there is no second spelling of a tier column to parse.
+                for (auto const& tier: StorageTierTable)
+                    for (auto const& column: TierColumns)
+                        if (TierColumnName(tier.tier, column.suffix) == name)
+                            return ColumnFacts { .format = column.format,
+                                                 .decor = CellDecor::Plain,
+                                                 .keep = ColumnKeep::Useful };
+                return std::nullopt;
+            case FleetSection::Last:
+                break;
+        }
+        return std::nullopt;
     }
-    return std::nullopt;
+} // namespace
+
+std::optional<CellFormat> FleetColumnFormat(FleetSection section, std::string_view name)
+{
+    return FactsOf(section, name).transform([](ColumnFacts const& facts) -> CellFormat { return facts.format; });
+}
+
+std::optional<ColumnKeep> FleetColumnKeep(FleetSection section, std::string_view name)
+{
+    return FactsOf(section, name).transform([](ColumnFacts const& facts) -> ColumnKeep { return facts.keep; });
+}
+
+CellTone FleetCellTone(FleetSection section, std::string_view name, std::uint64_t number)
+{
+    auto const facts = FactsOf(section, name);
+    return facts.has_value() ? ToneOf(facts->decor, number) : CellTone::Plain;
 }
 
 std::string HumanFleetFigure(std::uint64_t number, CellFormat format)
@@ -1727,6 +1806,20 @@ footer { margin-top:2.4rem; padding-top:1rem; border-top:1px solid var(--line);
     // two spellings is the live one -- superseded code goes out, it does not get a
     // deprecation.
 
+    /// What `compiling-now`'s denominator counts: the page's `/ 32 slots` and a terminal's `of 32 slots`.
+    constexpr std::string_view SlotsNoun = "slots";
+
+    /// What `never-picked`'s denominator counts.
+    constexpr std::string_view ToolchainsNoun = "toolchain(s)";
+
+    /// What an outstanding lease is, in the words the page's sub-line and a terminal tile share.
+    ///
+    /// "Not yet resolved", not "not yet claimed". Nothing claimed a lease and nothing ever could -- the
+    /// only way one left this figure was by expiring, ten minutes after the job it named had finished,
+    /// so on a busy fleet it read as a backlog that did not exist. A client now hands its lease back
+    /// when its job ends (#212), which is what makes this a live number.
+    constexpr std::string_view LeasesNote = "not yet resolved";
+
     KpiReadout KpiDispatched(FleetSnapshot const& /*snapshot*/, FleetHistoryView const& history)
     {
         return KpiReadout { .value = CountCell(FoldedSeries("dispatched", history)),
@@ -1748,7 +1841,7 @@ footer { margin-top:2.4rem; padding-top:1rem; border-top:1px solid var(--line);
                             // have to take `32` back out of.
                             .of = FleetCell::Of(totals.registered),
                             .format = CellFormat::Count,
-                            .unit = std::format("/ {} slots", totals.registered),
+                            .unit = std::format("/ {} {}", totals.registered, SlotsNoun),
                             .sub = NeverDispatched(snapshot, totals) ? "nothing dispatched yet" : "this fleet's own work" };
     }
 
@@ -1775,16 +1868,11 @@ footer { margin-top:2.4rem; padding-top:1rem; border-top:1px solid var(--line);
 
     KpiReadout KpiLeases(FleetSnapshot const& snapshot, FleetHistoryView const& /*history*/)
     {
-        // "Not yet resolved", not "not yet claimed". Nothing claimed a lease and
-        // nothing ever could -- the only way one left this figure was by expiring,
-        // ten minutes after the job it named had finished, so on a busy fleet it
-        // read as a backlog that did not exist. A client now hands its lease back
-        // when its job ends (#212), which is what makes this a live number.
         return KpiReadout { .value = FleetCell::Of(snapshot.liveLeases),
                             .of = FleetCell::Nothing(),
                             .format = CellFormat::Count,
                             .unit = {},
-                            .sub = "granted, not yet resolved" };
+                            .sub = std::format("granted, {}", LeasesNote) };
     }
 
     KpiReadout KpiOldestHeartbeat(FleetSnapshot const& snapshot, FleetHistoryView const& /*history*/)
@@ -1841,7 +1929,7 @@ footer { margin-top:2.4rem; padding-top:1rem; border-top:1px solid var(--line);
                             .of = FleetCell::Of(coverage->toolchains),
                             .format = CellFormat::Count,
                             .unit = {},
-                            .sub = std::format("of {} toolchain(s) registered", coverage->toolchains) };
+                            .sub = std::format("of {} {} registered", coverage->toolchains, ToolchainsNoun) };
     }
 
     /// One readout on the strip.
@@ -1867,7 +1955,9 @@ footer { margin-top:2.4rem; padding-top:1rem; border-top:1px solid var(--line);
         std::string_view key;
 
         KpiReadout (*project)(FleetSnapshot const&, FleetHistoryView const&); ///< What it reads.
-        bool sparkline;                                                       ///< Whether it carries one.
+        std::string_view ofNoun {}; ///< What the denominator counts; empty for a figure with none.
+        std::string_view note {};   ///< Words for a figure with no denominator; empty for none.
+        bool sparkline;             ///< Whether it carries one.
     };
 
     /// The strip, in the order it is read. The mockup's six, in the mockup's order,
@@ -1876,12 +1966,24 @@ footer { margin-top:2.4rem; padding-top:1rem; border-top:1px solid var(--line);
     /// place one.
     constexpr std::array<KpiRow, 7> KpiTable {
         KpiRow { .label = "Dispatched", .key = "dispatched", .project = KpiDispatched, .sparkline = true },
-        KpiRow { .label = "Compiling now", .key = "compiling-now", .project = KpiCompilingNow, .sparkline = false },
+        KpiRow { .label = "Compiling now",
+                 .key = "compiling-now",
+                 .project = KpiCompilingNow,
+                 .ofNoun = SlotsNoun,
+                 .sparkline = false },
         KpiRow { .label = "Cache hit rate", .key = "cache-hit-rate", .project = KpiHitRate, .sparkline = false },
         KpiRow { .label = "Refused", .key = "refused", .project = KpiRefused, .sparkline = false },
-        KpiRow { .label = "Leases outstanding", .key = "leases-outstanding", .project = KpiLeases, .sparkline = false },
+        KpiRow { .label = "Leases outstanding",
+                 .key = "leases-outstanding",
+                 .project = KpiLeases,
+                 .note = LeasesNote,
+                 .sparkline = false },
         KpiRow { .label = "Oldest heartbeat", .key = "oldest-heartbeat", .project = KpiOldestHeartbeat, .sparkline = false },
-        KpiRow { .label = "Never picked", .key = "never-picked", .project = KpiNeverPicked, .sparkline = false },
+        KpiRow { .label = "Never picked",
+                 .key = "never-picked",
+                 .project = KpiNeverPicked,
+                 .ofNoun = ToolchainsNoun,
+                 .sparkline = false },
     };
 
     /// Every tile states a key, and no two share one.
@@ -1902,6 +2004,18 @@ footer { margin-top:2.4rem; padding-top:1rem; border-top:1px solid var(--line);
         });
     }
     static_assert(EveryKpiIsKeyed(), "every KpiTable row needs its own non-empty machine key");
+
+    /// Each row's words, so `FleetKpis` can hand out a view of something static.
+    constexpr auto KpiTexts = [] {
+        std::array<FleetKpiText, KpiTable.size()> texts {};
+        for (auto const index: std::views::iota(std::size_t { 0 }, KpiTable.size()))
+            texts[index] = FleetKpiText { .key = KpiTable[index].key,
+                                          .label = KpiTable[index].label,
+                                          .ofNoun = KpiTable[index].ofNoun,
+                                          .note = KpiTable[index].note,
+                                          .sparkline = KpiTable[index].sparkline };
+        return texts;
+    }();
 
     /// The keys alone, so `FleetKpiKeys` can hand out a view of something static.
     constexpr auto KpiKeys = [] {
@@ -2191,6 +2305,11 @@ footer { margin-top:2.4rem; padding-top:1rem; border-top:1px solid var(--line);
 std::span<std::string_view const> FleetKpiKeys() noexcept
 {
     return KpiKeys;
+}
+
+std::span<FleetKpiText const> FleetKpis() noexcept
+{
+    return KpiTexts;
 }
 
 std::string RenderFleetHtml(FleetSnapshot const& snapshot, FleetHistoryView const& history, unsigned refreshSeconds)
