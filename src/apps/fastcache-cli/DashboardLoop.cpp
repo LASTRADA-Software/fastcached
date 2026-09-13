@@ -2,8 +2,12 @@
 #include "DashboardLoop.hpp"
 #include "StatsSource.hpp"
 
+#include <FastCache/Core/NumericText.hpp>
+
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <ranges>
 #include <string_view>
 #include <utility>
 
@@ -41,21 +45,32 @@ namespace
         return after.source == before.source && after.at > before.at;
     }
 
+    /// Append one sample to the history, dropping the oldest entries past the bound.
+    /// @param model What to update.
+    /// @param entry The sample.
+    void RecordHistory(DashboardModel& model, HistoryEntry entry)
+    {
+        model.history.push_back(std::move(entry));
+        while (model.history.size() > HistoryCapacity)
+            model.history.pop_front();
+    }
+
     /// Record a sample that produced no reading, by either route.
     ///
     /// **The one place a failure is recorded.** A `SampleFailed`, and a `Sample` its reader
     /// could not read, both arrive here. They used to be two inline assignments that happened
     /// to agree, under a test comment saying they went through one helper; a failure now
-    /// carries an outcome too, and *happened to agree* is how one route would record it and
-    /// the other would not.
+    /// carries an outcome and a history entry too, and *happened to agree* is how one route
+    /// would record them and the other would not.
     ///
     /// The outcome is kept only while nothing has been read: one reading makes the run a
     /// success for good (§9.17), and a failure after that is a gap rather than a verdict.
     /// @param exit The run so far.
     /// @param why What the failure means as an outcome.
-    void RecordFailure(DashboardExit& exit, Outcome why) noexcept
+    void RecordFailure(DashboardExit& exit, Outcome why)
     {
         exit.model.runLength = 0;
+        RecordHistory(exit.model, HistoryEntry {});
         if (exit.outcome != Outcome::Affirmative)
             exit.outcome = why;
     }
@@ -80,16 +95,70 @@ namespace
     void AcceptReading(DashboardModel& model, SampleReading reading, TimePoint at)
     {
         auto stamp = ReadingStamp { .at = at, .source = std::move(reading.source) };
-        auto const continues =
-            model.runLength > 0 && model.latestStamp.has_value() && ContinuesRun(*model.latestStamp, stamp);
-        model.runLength = continues ? model.runLength + 1 : 1;
+        // The interval is decided ONCE, and the run length and the history are both written from
+        // that one decision, so the history and `BrokenRun()` cannot come to disagree about it.
+        auto const elapsed = model.runLength > 0 && model.latestStamp.has_value() && ContinuesRun(*model.latestStamp, stamp)
+                                 ? std::optional<Duration> { stamp.at - model.latestStamp->at }
+                                 : std::optional<Duration> {};
+        model.runLength = elapsed.has_value() ? model.runLength + 1 : 1;
+        RecordHistory(model, HistoryEntry { .reading = reading.value, .elapsed = elapsed });
         model.previous = std::move(model.latest);
         model.latest = std::move(reading.value);
         model.latestStamp = std::move(stamp);
         ++model.samples;
     }
 
+    /// The number @p reading holds for @p field.
+    ///
+    /// A `Number` cell and a `Text` cell alike, because which kind a figure arrives as depends on
+    /// the source that reported it. Named kinds rather than excluded ones, so a kind added later is
+    /// no number until somebody says it is. Text that is not a finite number is no number either.
+    /// @param reading The reading, or nullopt where there was none.
+    /// @param field The field's name.
+    /// @return The number, or nullopt.
+    [[nodiscard]] std::optional<double> NumberOf(std::optional<Value> const& reading, std::string_view field)
+    {
+        if (!reading.has_value())
+            return std::nullopt;
+        auto const* found = FindField(*reading, field);
+        if (found == nullptr || (found->value.kind != CellKind::Number && found->value.kind != CellKind::Text))
+            return std::nullopt;
+        auto parsed = 0.0;
+        if (!ParseFiniteDouble(found->value.lexical, parsed))
+            return std::nullopt;
+        return parsed;
+    }
+
+    /// The rate of @p field over the interval from @p before to @p entry, per second.
+    /// @param before The entry the interval starts at.
+    /// @param entry The entry the interval ends at.
+    /// @param field The counter's field name.
+    /// @return The rate, or nullopt where `CounterRateSeries` says none can be claimed.
+    [[nodiscard]] std::optional<double> RateInto(HistoryEntry const& before,
+                                                 HistoryEntry const& entry,
+                                                 std::string_view field)
+    {
+        // Non-positive is refused here as well as by the fold, so a hand-built entry cannot
+        // divide by zero: the fold never records one, and this function does not rely on that.
+        if (!entry.elapsed.has_value() || entry.elapsed->count() <= 0)
+            return std::nullopt;
+        auto const from = NumberOf(before.reading, field);
+        auto const to = NumberOf(entry.reading, field);
+        if (!from.has_value() || !to.has_value() || *to < *from)
+            return std::nullopt;
+        return (*to - *from) / std::chrono::duration<double> { *entry.elapsed }.count();
+    }
+
 } // namespace
+
+std::vector<std::optional<double>> CounterRateSeries(std::deque<HistoryEntry> const& history, std::string_view field)
+{
+    auto series = std::vector<std::optional<double>> {};
+    series.reserve(history.size());
+    for (auto const index: std::views::iota(std::size_t { 0 }, history.size()))
+        series.push_back(index == 0 ? std::optional<double> {} : RateInto(history[index - 1], history[index], field));
+    return series;
+}
 
 SampleReading ReadStatsSample(DashboardEvent const& event)
 {
