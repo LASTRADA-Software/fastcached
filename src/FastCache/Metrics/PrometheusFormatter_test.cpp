@@ -5,6 +5,7 @@
 // from rather than written out here: a list restated in the test is a second thing
 // to keep in step, and it would agree with a renderer that had lost a row.
 #include <FastCache/Consensus/RaftNode.hpp>
+#include <FastCache/Core/Version.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Metrics/MetricsCatalog.hpp>
 #include <FastCache/Metrics/PrometheusFormatter.hpp>
@@ -40,6 +41,26 @@ namespace
     return found;
 }
 } // namespace
+
+TEST_CASE("RenderPrometheus names the build it came from, once, as an info series", "[metrics][prometheus]")
+{
+    AtomicMetricsSink metrics;
+    auto const body = RenderPrometheus(metrics, MetricsSnapshot {});
+    auto const sample = std::format("fastcached_build_info{{version=\"{}\"}} 1\n", VersionString);
+    CHECK(body.contains("# TYPE fastcached_build_info gauge\n"));
+    CHECK(body.contains(sample));
+    CHECK(Occurrences(body, "fastcached_build_info{") == 1);
+}
+
+TEST_CASE("RenderInfoMetric escapes a label value the exposition format would misread", "[metrics][prometheus]")
+{
+    // A version string is operator-supplied text (`-DFASTCACHED_VERSION_STRING`), so a
+    // quote in it must not end the label early and a line feed must not start a new
+    // sample.
+    auto const rendered = RenderInfoMetric(InfoDescriptor {
+        .prometheusName = "x_info", .help = "h", .label = "version", .value = "1.0 \"vendor\"\\build\nline" });
+    CHECK(rendered == "# HELP x_info h\n# TYPE x_info gauge\nx_info{version=\"1.0 \\\"vendor\\\"\\\\build\\nline\"} 1\n");
+}
 
 TEST_CASE("RenderPrometheus emits HELP/TYPE/value triples", "[metrics][prometheus]")
 {

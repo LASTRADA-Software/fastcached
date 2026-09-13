@@ -391,6 +391,38 @@ static void AppendConsensusMetrics(std::string& out, ConsensusStatus const& stat
     }
 }
 
+std::string RenderInfoMetric(InfoDescriptor const& row)
+{
+    // The exposition format's three label-value escapes and nothing else: a
+    // backslash, a double quote and a line feed. Anything else is literal UTF-8.
+    std::string escaped;
+    escaped.reserve(row.value.size());
+    for (char const c: row.value)
+    {
+        switch (c)
+        {
+            case '\\':
+                escaped += "\\\\";
+                break;
+            case '"':
+                escaped += "\\\"";
+                break;
+            case '\n':
+                escaped += "\\n";
+                break;
+            default:
+                escaped += c;
+                break;
+        }
+    }
+    return std::format("# HELP {0} {1}\n# TYPE {0} {2}\n{0}{{{3}=\"{4}\"}} 1\n",
+                       row.prometheusName,
+                       row.help,
+                       TypeName(MetricType::Gauge),
+                       row.label,
+                       escaped);
+}
+
 std::string RenderPrometheus(StatsReading const& reading)
 {
     auto const& snapshot = reading.snapshot;
@@ -409,7 +441,7 @@ std::string RenderPrometheus(StatsReading const& reading)
     // it, so a realloc already happens on every scrape. That is pre-existing and
     // deliberately left alone here rather than retuned in a change about skew --
     // a corrected estimate would want measuring, not guessing.
-    out.reserve((StorageMetricCount + CounterTable.size() + 2) * 200);
+    out.reserve((StorageMetricCount + CounterTable.size() + InfoTable.size() + 2) * 200);
 
     // Only when there is a cache. A worker running this same endpoint would
     // otherwise report an empty, unbounded one — zeroes that read as facts.
@@ -503,6 +535,12 @@ std::string RenderPrometheus(StatsReading const& reading)
                             "catalogue and the sink were compiled against different versions of the counter enum.",
                     .type = MetricType::Gauge,
                     .value = omittedBySkew });
+
+    // What build this is. Unconditional, like uptime: every process serving this
+    // endpoint is some build, and a panel titling itself with the version has no
+    // other place to read it from (#134).
+    for (auto const& row: InfoTable)
+        out += RenderInfoMetric(row);
 
     // Uptime is neither the cache's nor the sink's: every process that serves
     // this endpoint has one, and a worker's is as useful as a daemon's.

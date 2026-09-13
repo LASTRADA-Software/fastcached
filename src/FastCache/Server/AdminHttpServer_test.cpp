@@ -2,6 +2,7 @@
 #include <FastCache/Async/Task.hpp>
 #include <FastCache/Cache/IStorage.hpp>
 #include <FastCache/Core/Bytes.hpp>
+#include <FastCache/Core/Version.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Net/InMemoryTransport.hpp>
 #include <FastCache/Server/AdminHttpServer.hpp>
@@ -11,6 +12,7 @@
 
 #include <chrono>
 #include <cstddef>
+#include <format>
 #include <memory>
 #include <optional>
 #include <span>
@@ -215,6 +217,8 @@ TEST_CASE("AdminHttp: GET /metrics returns Prometheus body", "[metrics][http]")
     REQUIRE(response.contains("fastcached_cmd_get_total 42\n"));
     REQUIRE(response.contains("fastcached_connections_total 4\n"));
     REQUIRE(response.contains("fastcached_uptime_seconds 7\n"));
+    // The build's version, which `live-stats cache` titles its panel with (#134).
+    REQUIRE(response.contains(std::format("fastcached_build_info{{version=\"{}\"}} 1\n", FastCache::VersionString)));
 }
 
 TEST_CASE("AdminHttp: /metrics with a query string still routes", "[metrics][http]")
