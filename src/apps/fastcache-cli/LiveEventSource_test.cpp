@@ -11,7 +11,6 @@ using namespace FastCache;
 using namespace FastCache::Cli;
 using namespace FastCache::Cli::Testing;
 using namespace std::chrono_literals;
-using FastCache::Testing::Unwrap;
 
 TEST_CASE("a live source takes no second sample until its clock reaches the interval", "[cli][live][source]")
 {
@@ -85,7 +84,7 @@ TEST_CASE("quitting during a sample ends the dashboard at once and the source dr
 
     // The operator was not made to wait for the scrape: the loop has returned, and the
     // gather has still not run.
-    CHECK((exit.has_value() && exit->stop == DashboardStop::Quit));
+    CHECK(StopOf(exit) == DashboardStop::Quit);
     CHECK(rig.gatherer.Calls() == 0);
 
     // The SESSION is over and the SOURCE is not: the sample is still on the pool, reading
@@ -213,7 +212,7 @@ TEST_CASE("a terminal that goes away ends the session", "[cli][live][source]")
 
     rig.terminal->Close();
     rig.Settle();
-    CHECK((exit.has_value() && exit->stop == DashboardStop::SourceDetached));
+    CHECK(StopOf(exit) == DashboardStop::SourceDetached);
 
     CloseAndDrain(rig, source);
 }
@@ -233,7 +232,7 @@ TEST_CASE("a run with no terminal takes its whole sample budget", "[cli][live][s
     }
     rig.Settle();
 
-    CHECK((exit.has_value() && exit->stop == DashboardStop::SampleBudget));
+    CHECK(StopOf(exit) == DashboardStop::SampleBudget);
     CHECK(rig.gatherer.Calls() == 3);
 
     CloseAndDrain(rig, source);
@@ -251,12 +250,15 @@ TEST_CASE("a stop request after a sample ends a session with no terminal as answ
     CHECK(rig.gatherer.Calls() == 1);
     CHECK_FALSE(exit.has_value());
 
-    rig.stop.Fire();
+    rig.stop->Fire();
     rig.reactor.Drain();
+    // Released when its watch ended, which is what restores the disposition -- not when the
+    // source goes.
+    CHECK(rig.stopReleased);
 
     // Quit, and a session that had a reading to show: the operator ended a run that
     // worked, which is exit 0 rather than a failure they have to explain to a script.
-    CHECK((exit.has_value() && exit->stop == DashboardStop::Quit));
+    CHECK(StopOf(exit) == DashboardStop::Quit);
     CHECK((exit.has_value() && ExitCodeOf(exit->outcome) == 0));
 
     CloseAndDrain(rig, source);
@@ -267,15 +269,16 @@ TEST_CASE("a stop request before any sample does not end a session as answered",
     // The control for the case above: a stop is not an answer by itself. Quit before a
     // reading arrived is a session that showed nothing, and exit 0 would claim otherwise.
     Rig rig;
-    rig.stop.Fire();
-    LiveEventSource source { rig.StoppableParts() };
+    auto parts = rig.StoppableParts();
+    rig.stop->Fire();
+    LiveEventSource source { std::move(parts) };
 
     auto exit = std::optional<DashboardExit> {};
     auto run = RunOver(&source, &rig.view, &rig.sink, DashboardLimits {}, &exit);
     rig.reactor.Submit(run.Native());
     rig.reactor.Drain();
 
-    CHECK((exit.has_value() && exit->stop == DashboardStop::Quit));
+    CHECK(StopOf(exit) == DashboardStop::Quit);
     CHECK((exit.has_value() && ExitCodeOf(exit->outcome) != 0));
     CHECK(rig.gatherer.Calls() == 0);
 
@@ -297,11 +300,14 @@ TEST_CASE("a session with a stop signal keeps sampling until a stop arrives and 
     // Nothing fired: the watch is waiting, not ending the session and not asking twice.
     CHECK_FALSE(exit.has_value());
     CHECK(rig.gatherer.Calls() == 2);
-    CHECK(rig.stop.Waits() == 1);
+    CHECK(rig.stop->Waits() == 1);
+    CHECK_FALSE(rig.stopReleased);
 
-    // And a close answers that wait, so the drain does not hang on a thread nobody woke.
+    // And a close answers that wait, so the drain does not hang on a thread nobody woke, and
+    // the signal is released for it.
     CloseAndDrain(rig, source);
-    CHECK((exit.has_value() && exit->stop == DashboardStop::SourceDetached));
+    CHECK(rig.stopReleased);
+    CHECK(StopOf(exit) == DashboardStop::SourceDetached);
 }
 
 TEST_CASE("a stop watch that fails ends the session saying why", "[cli][live][source]")
@@ -313,7 +319,7 @@ TEST_CASE("a stop watch that fails ends the session saying why", "[cli][live][so
     (void) NextDue(rig, source);
     (void) NextDue(rig, source);
 
-    rig.stop.Fail();
+    rig.stop->Fail();
     auto const ended = NextDue(rig, source);
     CHECK(KindOf(ended) == DashboardEventKind::Detached);
     CHECK((ended.has_value() && ended->note.contains("Ctrl-C")));
