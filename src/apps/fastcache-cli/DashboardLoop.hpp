@@ -366,6 +366,21 @@ class IDashboardView
     {
         return DashboardFrame { .text = Frame(model), .placements = {} };
     }
+
+    /// Act on a keystroke that is not a quit key.
+    ///
+    /// **What a view is showing is the view's state, not the model's**: the model is what was READ,
+    /// and a key reads nothing. So a key the view acts on changes the view, and the loop draws the
+    /// next frame at once rather than at the next `Tick` -- an interval can be seconds, and a key
+    /// answered that late reads as ignored. The default acts on nothing, which is every view that
+    /// has nothing to switch; there is no decorating view for one to be lost in.
+    /// @param keys The bytes the keystroke delivered.
+    /// @return Whether the next frame differs, so one is owed now.
+    [[nodiscard]] virtual bool Key(std::string_view keys)
+    {
+        (void) keys;
+        return false;
+    }
 };
 
 /// What bounds the run.
