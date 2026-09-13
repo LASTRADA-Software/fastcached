@@ -3982,6 +3982,49 @@ label workflow again and still no `Build`.
   losing the other side AND a stray marker, both as additions that are not yours,
   where a marker scan sees only the second and only when it knows to look for it.
 
+### A pull request that BECAME conflicting keeps its verdicts, and reads the opposite way (#1352)
+
+The section above is right about DISPATCH and silent about RETRACTION. A conflicting pull
+request dispatches nothing from the moment it conflicts; it does not take back what was
+dispatched before that. So there are two conflicting states, and they read as opposites:
+
+<!-- table-total: none -->
+
+| it conflicted | its required contexts show | the conclusion they invite |
+|---|---|---|
+| before its head was pushed | **absent** -- no run exists | *nothing is known about this branch*, which is true |
+| after its head was pushed | **stale verdicts with real values**, from runs made while it still merged | *nearly green*, which is false |
+
+Measured on #1333: `mergeStateStatus` `DIRTY`, the branch 49 commits behind master, and
+30 contexts reporting -- 27 `SUCCESS`, 2 `SKIPPED`, 1 `FAILURE`. The failure was a
+`clang-tidy` run on head `44fe4a59` that had completed nine hours earlier, and it is still
+attached to that SHA.
+
+- **Absent looks like nothing; a stale verdict looks like information.** And the green half
+  is the dangerous half: a red invites investigation, a green invites merging. This cost a
+  wrong handover -- a pull request described as having dispatched nothing, whose contexts in
+  fact carried nine-hour-old values a lane acting on that description would have read as
+  current.
+- **So the discriminator is the pull request's state, asked FIRST, never its contexts.**
+  `gh pr view <n> --json mergeStateStatus,mergeable`: `DIRTY` or `CONFLICTING` says every
+  context below it describes a head that does not merge, whatever the context reads. The
+  ordering advice above already points here; this is the state where skipping it costs most.
+- **Neither cheap tell survives this state.** The context COUNT looks normal, because the old
+  runs are all still there. A context's completion time is a tell only against the head's
+  push time, which nobody has in hand -- and `gh`'s `completedAt` is `0001-01-01T00:00:00Z`
+  for a run still in progress, so sorting on it ranks a superseded failure above its live
+  replacement. Order runs by START time.
+- **`scripts/ci-pr-required.sh` answers the merge question, on its own line.** It reads
+  contexts at the head SHA, and a context is never retracted, so its `every required context
+  reports SUCCESS` was a true statement about a commit and silent about whether that commit
+  merges -- the dangerous green, from the script every lane verifies CI with. It now reads
+  REST's `mergeable_state` and `mergeable` from the same response as the head SHA, prints a
+  `merge:` line beside `states:` and a separate `MERGE VERDICT:`, qualifies the context verdict
+  for a head that conflicts, is behind or is not yet computed, and exits 0 only when the
+  contexts are green AND the head neither conflicts nor lags. `unknown` is its own outcome, a
+  pull request no longer open is a record rather than a question to ask again, and a state its
+  table does not name is refused by name.
+
 ## A gate that does not report reads as a gate that passed
 
 The three doors above are all about a required context that never arrives. These

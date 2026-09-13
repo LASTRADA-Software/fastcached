@@ -1178,7 +1178,11 @@ what differs between compilers, standard libraries, hosts and tool versions.
   CI being slow. **Order matters more than the fact**: ask `mergeable` BEFORE reading a workflow,
   and on push ask `git merge-tree --write-tree`, which needs no pull request and no API. Resolving
   it, assert the ORDERING of diff3's four markers rather than counting three, and prove the
-  resolution with `git diff origin/master HEAD -- <file>` showing no deletion lines.
+  resolution with `git diff origin/master HEAD -- <file>` showing no deletion lines. **And it is
+  TWO states**: conflicting when pushed shows contexts ABSENT, while one that BECAME conflicting
+  keeps its old verdicts, values and all, and reads as nearly green -- so the state is asked
+  BEFORE any context is read, since the context count cannot tell the two apart, and
+  `ci-pr-required.sh` says the merge state on its own line (#1352).
 - A skipped job REPORTS, and a skipped REQUIRED context reads as PASSING. A skipped **matrix** job
   is the opposite: it never expands, so its per-leg contexts never exist and nothing reports at all.
   One passes, one hangs; the difference is the matrix. So never let a dependency's failure skip a
