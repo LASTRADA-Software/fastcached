@@ -94,6 +94,7 @@ target_sources(FastCache
         Platform/PosixDaemonHost.cpp
         Platform/Registry.cpp
         Platform/ServiceControl.cpp
+        Platform/StopSignal.cpp
         Platform/Terminal.cpp
         Platform/WindowsEventLogger.cpp
         Platform/WindowsServiceHost.cpp
