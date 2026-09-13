@@ -17,6 +17,11 @@
 # https://github.com/LASTRADA-Software/fastcached/issues/858, and it is 5 until a
 # macOS leg exists.
 #
+# One row is the measurement's blind spot rather than the sweep's: a unit compiled with
+# `-fno-sanitize=all` ON PURPOSE has real code and no ASan symbols, which is the empty-object
+# signature. It is listed so the check stays exact, names the leg that does read it, and says
+# so in its reason -- it is not a hole.
+#
 # Format: <path><TAB><reached-by, comma-separated, or `none`><TAB><reason>
 src/FastCache/Async/IocpReactor.cpp	clang-tidy-windows	`#if defined(_WIN32)`
 src/FastCache/Async/IocpReactor_test.cpp	clang-tidy-windows	`#if defined(_WIN32)`
@@ -29,3 +34,4 @@ src/FastCache/Async/KqueueReactor_test.cpp	none	`#if defined(__APPLE__)`; no mac
 src/FastCache/Net/KqueueConnector.cpp	none	`#if defined(__APPLE__)`; no macOS analyser leg exists
 src/FastCache/Net/KqueueSocket.cpp	none	`#if defined(__APPLE__)`; no macOS analyser leg exists
 src/FastCache/Net/KqueueSocket_test.cpp	none	`#if defined(__APPLE__)`; no macOS analyser leg exists
+src/tests/SanitizerAbsentProbe.cpp	clang-tidy	NOT empty: `-fno-sanitize=all` by design, as `vendor-sanitized`'s uninstrumented control. Its one real function carries no ASan symbols, so this measurement cannot tell it from an empty object; the Linux sweep reads it
