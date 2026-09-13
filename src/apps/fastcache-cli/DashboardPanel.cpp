@@ -6,6 +6,7 @@
 #include "NodeStatusText.hpp"
 
 #include <FastCache/Cache/StorageTier.hpp>
+#include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/NumericText.hpp>
 #include <FastCache/Core/Ranges.hpp>
 #include <FastCache/Distributed/NodePolicy.hpp>
@@ -667,7 +668,13 @@ namespace
                 fitted.tableShown = kept - 1;
             std::ranges::move(item.lines | std::views::take(kept), std::back_inserter(fitted.lines));
             if (item.table && HasOverflowLine(item))
-                fitted.lines.push_back(OverflowLine(item));
+            {
+                auto line = OverflowLine(item);
+                auto const words = line.find_first_not_of(' ');
+                fitted.spans.push_back(LineSpan {
+                    .line = fitted.lines.size(), .byte = words, .length = line.size() - words, .tone = FrameTone::Label });
+                fitted.lines.push_back(std::move(line));
+            }
         }
         return fitted;
     }
@@ -677,18 +684,6 @@ namespace
     [[nodiscard]] Item Blank()
     {
         return Item { .lines = { std::string {} }, .priority = Priority::Spacing };
-    }
-
-    /// The pieces of a line joined, the trend drawn where the trend piece stands.
-    /// @param pieces The kept pieces.
-    /// @param trend The trend's glyphs, drawn where the trend piece stands.
-    /// @return The line.
-    [[nodiscard]] std::string Joined(std::span<Piece const> pieces, std::string_view trend)
-    {
-        auto line = std::string {};
-        for (auto const& piece: pieces)
-            line += piece.trend ? std::string { TrendGap } + std::string { trend } : piece.text;
-        return line;
     }
 
     /// Whether @p value is past what @p figure calls worth acting on.
@@ -1680,6 +1675,7 @@ namespace
         std::string words {};      ///< `of 192 slots`, `not yet resolved`, or empty.
         bool trend { false };      ///< Whether a sparkline is drawn where its words would be.
         bool worded { false };     ///< Whether the figure's row carries words or a trend at all, read or not.
+        bool alert { false };      ///< Whether its value is one the leader says is worth an operator's eye.
     };
 
     /// One tile per `FleetKpis()` row, in that order.
@@ -1723,6 +1719,7 @@ namespace
             {
                 auto const& unit = (*row)[*unitAt].lexical;
                 tile.value = KpiText(in, (*row)[*valueAt], unit);
+                tile.alert = kpi.alertAboveZero && CellInteger((*row)[*valueAt]).value_or(0) > 0;
                 if (ofAt.has_value() && (*row)[*ofAt].kind != CellKind::Absent)
                     tile.words = "of " + KpiText(in, (*row)[*ofAt], unit)
                                  + (kpi.ofNoun.empty() ? std::string {} : " " + std::string { kpi.ofNoun });
@@ -1774,24 +1771,33 @@ namespace
         return column.label + gap + column.value + (column.words > 0 ? gap + column.words : 0);
     }
 
-    /// The @p index-th tile of @p column as text, or nothing past its last.
+    /// The @p index-th tile of @p column as pieces, or none past its last.
+    ///
+    /// The label and the words recede and the figure carries the weight -- or the alert, where the leader
+    /// says its value is worth an operator's eye. The trend is drawn in the terminal's own colour.
     /// @param in The frame's inputs.
     /// @param column The column.
     /// @param index Which tile.
-    /// @return The text, unpadded after its last cell.
-    [[nodiscard]] std::string TileText(FrameInputs const& in, TileColumn const& column, std::size_t index)
+    /// @return The pieces, unpadded after the last cell.
+    [[nodiscard]] std::vector<Piece> TilePieces(FrameInputs const& in, TileColumn const& column, std::size_t index)
     {
         if (index >= column.tiles.size())
             return {};
         auto const& tile = *column.tiles[index];
-        auto text = FitRight(tile.label, column.label, in.cellWidth) + std::string { ColumnGap }
-                    + AlignRight(tile.value, column.value, in.cellWidth);
+        auto pieces = std::vector<Piece> {
+            Piece { .text = FitRight(tile.label, column.label, in.cellWidth), .tone = FrameTone::Label },
+            Piece { .text = std::string { ColumnGap } + AlignRight(tile.value, column.value, in.cellWidth),
+                    .tone = tile.alert ? FrameTone::Alert : FrameTone::Figure },
+        };
         if (column.words == 0)
-            return text;
+            return pieces;
         if (tile.trend)
-            return text + std::string { ColumnGap }
-                   + Sparkline(Window(DocumentLevels(in.model->history, tile.key), column.words), *in.glyphs);
-        return tile.words.empty() ? text : text + std::string { ColumnGap } + tile.words;
+            pieces.push_back(Piece {
+                .text = std::string { ColumnGap }
+                        + Sparkline(Window(DocumentLevels(in.model->history, tile.key), column.words), *in.glyphs) });
+        else if (!tile.words.empty())
+            pieces.push_back(Piece { .text = std::string { ColumnGap } + tile.words, .tone = FrameTone::Label });
+        return pieces;
     }
 
     /// The headline tiles laid out for @p budget cells, as §5 draws them.
@@ -1836,13 +1842,18 @@ namespace
         auto items = std::vector<Item> {};
         for (auto const index: std::views::iota(std::size_t { 0 }, lines))
         {
-            auto line = std::string { Indent };
+            auto pieces = std::vector<Piece> { Piece { .text = std::string { Indent } } };
+            std::ranges::move(TilePieces(in, layout[0], index), std::back_inserter(pieces));
             if (layout.size() > 1 && index < layout[1].tiles.size())
-                line += FitRight(TileText(in, layout[0], index), TileColumnWidth(in, layout[0]), in.cellWidth)
-                        + std::string { TileGap } + TileText(in, layout[1], index);
-            else
-                line += TileText(in, layout[0], index);
-            items.push_back(Item { .lines = { std::move(line) }, .priority = spec.tilePriority });
+            {
+                // The first column padded to its width, so the second starts where every line's second does.
+                auto const leftWidth = TileColumnWidth(in, layout[0]);
+                auto const drawn = TextWidth(pieces, in.cellWidth) - in.cellWidth(Indent);
+                pieces.push_back(
+                    Piece { .text = std::string(leftWidth - std::min(leftWidth, drawn), ' ') + std::string { TileGap } });
+                std::ranges::move(TilePieces(in, layout[1], index), std::back_inserter(pieces));
+            }
+            items.push_back(LineOf(pieces, {}, spec.tilePriority));
         }
         return items;
     }
@@ -1932,7 +1943,8 @@ namespace
         if (!letters.empty())
             pieces.push_back(Piece { .text = std::format("{}keys  {}", ColumnGap, letters),
                                      .priority = spec.keysHintPriority,
-                                     .slot = HintSlot });
+                                     .slot = HintSlot,
+                                     .tone = FrameTone::Label });
         auto kept = FitPieces(std::move(pieces), budget, 0, in.cellWidth);
         if (!kept.has_value())
             return {};
@@ -1993,30 +2005,44 @@ namespace
                || needle.empty();
     }
 
+    /// The frame's word for one of the leader's cell tones.
+    struct CellToneDress
+    {
+        Distributed::CellTone tone;     ///< The enumerator this row describes.
+        std::optional<FrameTone> frame; ///< How the frame dresses it; none for plain.
+    };
+
+    /// One row per `CellTone`, in enumerator order. A limit that withdrew slots is dressed as a stale age
+    /// is: both say *look at this row*, and a terminal has fewer colours than the page's chips.
+    constexpr EnumTable<Distributed::CellTone, CellToneDress> CellToneDressTable { {
+        { .tone = Distributed::CellTone::Plain, .frame = std::nullopt },
+        { .tone = Distributed::CellTone::Fresh, .frame = FrameTone::Fresh },
+        { .tone = Distributed::CellTone::Stale, .frame = FrameTone::Stale },
+        { .tone = Distributed::CellTone::Limited, .frame = FrameTone::Stale },
+        { .tone = Distributed::CellTone::Alert, .frame = FrameTone::Alert },
+    } };
+
+    static_assert(RowsInEnumeratorOrder(CellToneDressTable, &CellToneDress::tone),
+                  "CellToneDressTable must hold one row per CellTone, in enumerator order");
+
     /// The tone a cell is dressed with, where its column has one.
     ///
     /// Given whether or not the terminal shows colour: the presenter decides how a tone looks, and a
-    /// plain one draws it as the text it already is.
+    /// plain one draws it as the text it already is. An absent cell has none, since a green age where
+    /// nobody reported is a healthy reading nobody gave.
     /// @param section The section.
     /// @param column The column's name.
     /// @param cell The raw cell.
     /// @return The tone, or nullopt for none.
     [[nodiscard]] std::optional<FrameTone> CellFrameTone(FleetSection section, std::string_view column, Cell const& cell)
     {
-        auto const number = CellInteger(cell);
-        if (!number.has_value())
+        if (cell.kind == CellKind::Absent)
             return std::nullopt;
-        switch (Distributed::FleetCellTone(section, column, *number))
-        {
-            case Distributed::CellTone::Fresh:
-                return FrameTone::Fresh;
-            case Distributed::CellTone::Stale:
-                return FrameTone::Stale;
-            case Distributed::CellTone::Plain:
-            case Distributed::CellTone::Last:
-                break;
-        }
-        return std::nullopt;
+        auto const number = CellInteger(cell);
+        auto const tone = number.has_value()
+                              ? Distributed::FleetCellTone(section, column, *number)
+                              : Distributed::FleetCellTone(section, column, std::string_view { cell.lexical });
+        return tone < Distributed::CellTone::Last ? CellToneDressTable[static_cast<std::size_t>(tone)].frame : std::nullopt;
     }
 
     /// The active section's table, walked from the header line the leader sent.
@@ -2103,7 +2129,11 @@ namespace
         if (!kept.has_value())
             return std::unexpected(kept.error());
 
-        auto item = Item { .lines = { Joined(*kept, {}) },
+        for (auto& piece: *kept)
+            piece.tone = FrameTone::Label;
+        auto headingLine = LineOf(*kept, {}, spec.tablePriority);
+        auto item = Item { .lines = std::move(headingLine.lines),
+                           .spans = std::move(headingLine.spans),
                            .noun = Distributed::FleetSectionTable[static_cast<std::size_t>(section)].key,
                            .above = scroll,
                            .rowsKept = spec.tableRowsKept,
