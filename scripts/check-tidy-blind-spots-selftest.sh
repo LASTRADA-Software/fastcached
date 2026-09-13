@@ -148,12 +148,18 @@ sanflag="-fsanitize=address"
 # A unit compiled with the sanitizer turned OFF is not measured by its signature (#134
 # CI): `sanitizer-absent-probe` is the vendor-sanitized control, `-fno-sanitize=all` on
 # purpose, one function and 1 symbol. Scored, it read as blind -- a refusal naming a unit
-# clang-tidy does read. It is named as unmeasured instead, and the pair below keeps that
-# from being a blanket skip: the same flags with the sanitizer turned back ON are scored.
+# clang-tidy does read. It is named as unmeasured instead, and the two cases after it keep
+# that from being a blanket skip or a symbol-count rule: the SAME one-symbol object compiled
+# WITH the sanitizer is refused as blind, and so is one whose line turns it back on.
 unsanitized="src/tests/SanitizerAbsentProbe.cpp"
 unsanitizedFlags="-fno-sanitize=all"
 stage "$(printf '# empty\n')" "$ctrl" 50 "src/tests/SanitizerAbsentProbe.cpp" 1
-run_case sanitizer_off_is_unmeasured pass "SanitizerAbsentProbe.cpp: compiled with AddressSanitizer off"
+run_case sanitizer_off_is_unmeasured pass "SanitizerAbsentProbe.cpp: not measured -- the compile line disabled the sanitizer"
+unsanitized=""
+unsanitizedFlags=""
+stage "$(printf '# empty\n')" "$ctrl" 50 "src/tests/SanitizerAbsentProbe.cpp" 1
+run_case one_symbol_with_sanitizer_is_blind refuse "SanitizerAbsentProbe.cpp' is analysed by nothing and is not in"
+unsanitized="src/tests/SanitizerAbsentProbe.cpp"
 unsanitizedFlags="-fno-sanitize=all -fsanitize=address"
 stage "$(printf '# empty\n')" "$ctrl" 50 "src/tests/SanitizerAbsentProbe.cpp" 1
 run_case sanitizer_back_on_is_scored refuse "SanitizerAbsentProbe.cpp' is analysed by nothing and is not in"
