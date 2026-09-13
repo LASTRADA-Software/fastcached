@@ -1871,3 +1871,269 @@ TEST_CASE("a fleet panel's title bar names the leader once it answered as one, a
     REQUIRE(row.has_value());
     CHECK(Columns(Unwrap(row), 1, 80).starts_with("  source  /fleet.txt at 10.0.0.4:9464 (leader)   "));
 }
+
+namespace
+{
+
+using NodeCounter = IMetricsSink::Counter;
+
+/// A catalogued counter's exported name.
+/// @param counter The counter.
+/// @return Its name.
+[[nodiscard]] std::string CounterName(NodeCounter counter)
+{
+    return std::string { DescriptorOf(counter)->prometheusName };
+}
+
+/// A node reading @p step intervals in: every counter the node panel draws, moved by @p step.
+/// @param step How far the counters have moved.
+/// @param seconds When it was taken.
+/// @param status What the node said about itself, or nothing.
+/// @return The event.
+[[nodiscard]] DashboardEvent NodeSampleOf(std::uint64_t step,
+                                          int seconds,
+                                          std::optional<CompileCacheWire::NodeStatusFields> status)
+{
+    auto sample = SampleOf({ { CounterName(NodeCounter::WorkerJobsCompleted), 41 * step },
+                             { CounterName(NodeCounter::WorkerCompileMillisTotal), 75440 * step },
+                             { CounterName(NodeCounter::WorkerJobsRefusedNoSlot), 2 * step },
+                             { CounterName(NodeCounter::WorkerJobsRefusedLeaseExpired), step },
+                             { CounterName(NodeCounter::WorkerJobsRefusedUnknownFingerprint), 0 },
+                             { CounterName(NodeCounter::NodeCacheHits), 881 * step },
+                             { CounterName(NodeCounter::NodeCacheMisses), 119 * step },
+                             { "fastcache_node_disk_free_bytes", std::uint64_t { 41 } << 30U } },
+                           seconds);
+    sample.attempts.front().where = "build-07:9464";
+    sample.nodeStatus = std::move(status);
+    return sample;
+}
+
+/// §4's node: a follower running a cache tier, a worker and consensus, serving three toolchains.
+/// @return The status.
+[[nodiscard]] CompileCacheWire::NodeStatusFields MockupNodeStatus()
+{
+    namespace Bits = CompileCacheWire::NodeComponentBit;
+    auto status = CompileCacheWire::NodeStatusFields {};
+    status.version = "0.4.1";
+    status.nodeId = "n-7f3c9a21";
+    status.uptimeSeconds = 215280;
+    status.components = Bits::CacheTier | Bits::Worker | Bits::Consensus;
+    status.runtime.toolchains = CompileCacheWire::ToolchainState::Serving;
+    status.runtime.toolchainsServed = 3;
+    status.runtime.toolchainsDiscovered = 3;
+    status.runtime.compileSlots = 16;
+    status.runtime.compilesInFlight = 6;
+    status.runtime.schedulerRole = CompileCacheWire::WireSchedulerRole::Follower;
+    status.runtime.leaderEndpoint = "build-01:7071";
+    status.runtime.registrarsRegistered = 1;
+    status.runtime.registrarsTotal = 1;
+    status.runtime.lastRegistrationSecondsAgo = 4;
+    return status;
+}
+
+/// The frames a node panel asking `build-07:7070` every two seconds draws for @p script.
+/// @param script The events after the resize.
+/// @param columns The terminal's width.
+/// @param rows The terminal's height.
+/// @return The frames.
+[[nodiscard]] std::vector<std::string> NodeFramesAt(std::vector<DashboardEvent> script, int columns, int rows)
+{
+    script.insert(script.begin(), DashboardEvent { .kind = DashboardEventKind::Resize, .columns = columns, .rows = rows });
+    auto view = PanelView { NodePanel(),
+                            PanelContext { .absent = std::string { Absent },
+                                           .endpoint = "build-07:7070",
+                                           .interval = 2s,
+                                           .cellWidth = &FakeCellWidth,
+                                           .rung = RenderRung::Unicode } };
+    auto sink = CollectingSink {};
+    (void) Drive(std::move(script), DashboardLimits {}, view, sink);
+    return sink.frames;
+}
+
+/// The one frame §4's node draws at @p columns by @p rows, two readings in.
+/// @param columns The terminal's width.
+/// @param rows The terminal's height.
+/// @param status What the node says about itself.
+/// @return The frame.
+[[nodiscard]] std::string NodeFrameAt(int columns, int rows, CompileCacheWire::NodeStatusFields const& status)
+{
+    auto const frames = NodeFramesAt({ NodeSampleOf(1, 1, status), NodeSampleOf(2, 3, status), Tick }, columns, rows);
+    REQUIRE(frames.size() == 1);
+    return frames.front();
+}
+
+} // namespace
+
+namespace
+{
+
+/// The line under the one of @p frame starting with @p prefix.
+/// @param frame The frame.
+/// @param prefix The start of the line above.
+/// @return The line, or nullopt without one.
+[[nodiscard]] std::optional<std::string> LineUnder(std::string_view frame, std::string_view prefix)
+{
+    auto const lines = Lines(frame);
+    for (auto const index: std::views::iota(std::size_t { 0 }, lines.size()))
+        if (Columns(lines[index], LabelFrom, FakeCellWidth(prefix)) == prefix && index + 1 < lines.size())
+            return lines[index + 1];
+    return std::nullopt;
+}
+
+/// What the line of an 80-column @p frame starting with @p prefix says, between its edges and without its padding.
+/// @param frame The frame.
+/// @param prefix The start.
+/// @return The text; empty when no line starts so, which no expected text is.
+[[nodiscard]] std::string ContentStarting(std::string_view frame, std::string_view prefix)
+{
+    auto const line = LineStarting(frame, prefix);
+    return line.has_value() ? Trimmed(Columns(Unwrap(line), 1, 78)) : std::string {};
+}
+
+/// The cell column @p text starts at on @p line, or nullopt.
+/// @param line The line.
+/// @param text The text.
+/// @return Its column.
+[[nodiscard]] std::optional<std::size_t> ColumnOf(std::string_view line, std::string_view text)
+{
+    auto const at = line.find(text);
+    return at == std::string_view::npos ? std::nullopt : std::optional { FakeCellWidth(line.substr(0, at)) };
+}
+
+} // namespace
+
+TEST_CASE("a node panel says who the node is and whether it is working, as section 4 draws it",
+          "[cli][dashboard][panel][node]")
+{
+    // §4's upper half. WHAT DISTINGUISHES: each fact is the status's own -- identity, the survey's state
+    // and counts, the registrations and when one was last accepted, the role and its leader -- and the
+    // second column is ONE column: `registrars` and `leader` start in the same cell.
+    auto const frame = NodeFrameAt(80, 24, MockupNodeStatus());
+
+    auto const identity = LineStarting(frame, "node-id");
+    REQUIRE(identity.has_value());
+    CHECK(Unwrap(identity).contains("n-7f3c9a21"));
+    CHECK(Unwrap(identity).contains("components  cache-tier, worker, consensus"));
+
+    auto const working = LineStarting(frame, "toolchains");
+    auto const consensus = LineStarting(frame, "consensus");
+    REQUIRE(working.has_value());
+    REQUIRE(consensus.has_value());
+    CHECK(Trimmed(Columns(Unwrap(working), 1, 78)).starts_with("toolchains  serving 3 of 3"));
+    CHECK(Unwrap(working).contains("registrars  1 of 1, last 4s ago"));
+    CHECK(Trimmed(Columns(Unwrap(consensus), 1, 78)).starts_with("consensus   follower"));
+    CHECK(Unwrap(consensus).contains("leader      build-01:7071"));
+    CHECK(ColumnOf(Unwrap(working), "registrars") == ColumnOf(Unwrap(consensus), "leader"));
+    // And every first label is ONE column, so `slots` and `host` start where `toolchains` does.
+    auto const slots = LineStarting(frame, "slots");
+    REQUIRE(slots.has_value());
+    CHECK(ColumnOf(Unwrap(working), "serving") == ColumnOf(Unwrap(slots), "6 in flight"));
+}
+
+TEST_CASE("a node panel draws its slots as three numbers and what limits them, marking what no status carries",
+          "[cli][dashboard][panel][node]")
+{
+    // N4. The three numbers are in flight, available and registered; `available` and `limited-by` are
+    // `SlotCeilingsFor` over the machine's live load, which no status carries yet -- so both are the marker BY
+    // NAME, under the value column, never a missing line.
+    auto const frame = NodeFrameAt(80, 24, MockupNodeStatus());
+    auto const slots = LineStarting(frame, "slots");
+    REQUIRE(slots.has_value());
+    CHECK(Trimmed(Columns(Unwrap(slots), 1, 78))
+          == std::format("slots       6 in flight / {} available / 16 registered", Absent));
+    auto const under = LineUnder(frame, "slots");
+    REQUIRE(under.has_value());
+    CHECK(ColumnOf(Unwrap(under), "limited-by") == ColumnOf(Unwrap(slots), "6 in flight"));
+    CHECK(Trimmed(Columns(Unwrap(under), 1, 78)) == std::format("limited-by  {}", Absent));
+}
+
+TEST_CASE("a node panel draws ONE refusal total with its trend, and the split under it", "[cli][dashboard][panel][node]")
+{
+    // N6. WHAT DISTINGUISHES: the total is the three counters' rates ADDED (2 + 1 + 0 per two seconds is
+    // 90 a minute, and no one counter reads 90), the split is on the line under it, and no refusal is a
+    // row of its own any more.
+    auto const frame = NodeFrameAt(80, 24, MockupNodeStatus());
+    auto const total = RowLine(frame, "refused/min");
+    REQUIRE(total.has_value());
+    CHECK(FigureOf(Unwrap(total)) == "90");
+    auto const split = LineUnder(frame, "refused/min");
+    REQUIRE(split.has_value());
+    CHECK(Trimmed(Columns(Unwrap(split), 1, 78)) == "no-slot 60/min   lease-expired 30/min   unknown-fingerprint 0.0/min");
+    for (auto const* label: { "no-slot/min", "lease-exp/min", "unknown-fp/min" })
+        CHECK_FALSE(RowLine(frame, label).has_value());
+}
+
+TEST_CASE("a mean compile note too long for its line wraps under where it began", "[cli][dashboard][panel][node]")
+{
+    // N7. At 80 the note is two lines, the second hanging at the column the first began at, and the words
+    // are the note's in order; at 120 it is one line. A note dropped for width would pass neither.
+    auto const note = std::string { "sum/count over this interval; no histogram exists, so no p50/p95 can be shown" };
+    auto const narrow = NodeFrameAt(80, 24, MockupNodeStatus());
+    auto const row = RowLine(narrow, "mean compile");
+    auto const under = LineUnder(narrow, "mean compile");
+    REQUIRE(row.has_value());
+    REQUIRE(under.has_value());
+    CHECK_FALSE(Unwrap(row).contains(note));
+    REQUIRE(ColumnOf(Unwrap(row), "sum/count").has_value());
+    CHECK(Trimmed(Columns(Unwrap(under), 1, Unwrap(ColumnOf(Unwrap(row), "sum/count")) - 1)).empty());
+    auto const column = Unwrap(ColumnOf(Unwrap(row), "sum/count"));
+    auto const first = Trimmed(Columns(Unwrap(row), column, 79 - column));
+    auto const second = Trimmed(Columns(Unwrap(under), 1, 78));
+    CHECK(std::format("{} {}", first, second) == note);
+
+    auto const wide = NodeFrameAt(120, 40, MockupNodeStatus());
+    auto const one = RowLine(wide, "mean compile");
+    REQUIRE(one.has_value());
+    CHECK(Unwrap(one).contains(note));
+}
+
+TEST_CASE("a node panel draws its cache tier and host below the rates, and the tier only on a node running one",
+          "[cli][dashboard][panel][node]")
+{
+    // N8 and N9. The tier line appears exactly when the status names the component -- not a line of markers
+    // for a tier that does not exist -- and the host line is one line of the machine's figures, the two no
+    // status carries yet marked by name.
+    auto const frame = NodeFrameAt(80, 24, MockupNodeStatus());
+    auto const tier = LineStarting(frame, "cache tier");
+    REQUIRE(tier.has_value());
+    CHECK(Trimmed(Columns(Unwrap(tier), 1, 78)).starts_with("cache tier  hits 88.1 %"));
+    auto const host = LineStarting(frame, "host");
+    REQUIRE(host.has_value());
+    CHECK(Trimmed(Columns(Unwrap(host), 1, 78))
+          == std::format("host        cpu-busy {}   mem free {}   scratch free 41.00 GiB", Absent, Absent));
+    for (auto const* gone: { "cores", "memory", "slots busy", "scratch free" })
+        CHECK_FALSE(LineStarting(frame, gone).has_value());
+
+    auto plain = MockupNodeStatus();
+    plain.components = CompileCacheWire::NodeComponentBit::Worker;
+    plain.runtime.schedulerRole.reset();
+    plain.runtime.leaderEndpoint.clear();
+    plain.nodeId.clear();
+    auto const worker = NodeFrameAt(80, 24, plain);
+    CHECK_FALSE(LineStarting(worker, "cache tier").has_value());
+    CHECK_FALSE(LineStarting(worker, "consensus").has_value());
+    CHECK(LineStarting(worker, "host").has_value());
+    // No consensus, no minted identity: the marker, never an empty name somebody could paste.
+    CHECK(ContentStarting(worker, "node-id").starts_with(std::format("node-id     {}", Absent)));
+}
+
+TEST_CASE("before a node says anything about itself its facts read the marker, and what may not apply draws nothing",
+          "[cli][dashboard][panel][node]")
+{
+    // A reading with no status: identity and work are the marker by name, while consensus and a cache tier --
+    // which may not exist on this node at all -- are not claimed.
+    auto const frames = NodeFramesAt({ NodeSampleOf(1, 1, std::nullopt), Tick }, 80, 24);
+    REQUIRE(frames.size() == 1);
+    auto const& frame = frames.front();
+    CHECK(ContentStarting(frame, "node-id").starts_with(std::format("node-id     {}", Absent)));
+    CHECK(ContentStarting(frame, "toolchains").starts_with(std::format("toolchains  {}", Absent)));
+    CHECK(ContentStarting(frame, "slots") == std::format("slots       {}", Absent));
+    CHECK_FALSE(LineStarting(frame, "consensus").has_value());
+    CHECK_FALSE(LineStarting(frame, "cache tier").has_value());
+
+    // And a node no scheduler has ever accepted says NEVER, not an age.
+    auto unaccepted = MockupNodeStatus();
+    unaccepted.runtime.registrarsRegistered = 0;
+    unaccepted.runtime.lastRegistrationSecondsAgo.reset();
+    CHECK(ContentStarting(NodeFrameAt(80, 24, unaccepted), "toolchains").contains("registrars  0 of 1, never accepted"));
+}

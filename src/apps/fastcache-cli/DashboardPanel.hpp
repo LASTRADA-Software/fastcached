@@ -79,10 +79,13 @@ enum class FigureSource : std::uint8_t
 /// 8-aligned members.
 struct FigureSpec
 {
-    FieldNames field {};                         ///< The primary field.
-    FieldNames other {};                         ///< The second operand; see `FigureSource`.
-    double scale { 1.0 };                        ///< Applied to every value: 60 turns a rate per second into one per minute.
-    std::string_view suffix {};                  ///< Written after a PRESENT value only, such as `/s`.
+    FieldNames field {};        ///< The primary field.
+    FieldNames other {};        ///< The second operand; see `FigureSource`.
+    double scale { 1.0 };       ///< Applied to every value: 60 turns a rate per second into one per minute.
+    std::string_view suffix {}; ///< Written after a PRESENT value only, such as `/s`.
+    /// Further counters whose rates a `Rate` adds beyond `other`: a total over more than two, such as
+    /// every refusal. Read only by a source whose `FigureSourceTable` row takes addends.
+    std::span<FieldNames const> addends {};
     FigureSource source { FigureSource::Level }; ///< How it is made.
     FigureFormat format { FigureFormat::Count }; ///< How it is written.
 };
@@ -135,11 +138,16 @@ enum class Trend : std::uint8_t
 /// 8-aligned members.
 struct RateRow
 {
-    std::string_view label;                    ///< What the figure is.
-    std::string_view key;                      ///< Its machine name; see `PanelKeysAreWhole`.
-    FigureSpec figure;                         ///< The figure.
-    std::span<BesideFigure const> beside {};   ///< Figures written after it.
-    std::string_view note {};                  ///< Words written after those.
+    std::string_view label;                  ///< What the figure is.
+    std::string_view key;                    ///< Its machine name; see `PanelKeysAreWhole`.
+    FigureSpec figure;                       ///< The figure.
+    std::span<BesideFigure const> beside {}; ///< Figures written after it.
+    /// Figures written on a line of their own under the row: the breakdown a total is never drawn without
+    /// (#134 §4 -- each refusal has a different fix, so a total alone is the collapse this tree paid for).
+    std::span<BesideFigure const> split {};
+    /// Words written after those. On a row that draws no trend, a note too long for the line is wrapped
+    /// onto lines under it, aligned where it began, rather than dropped.
+    std::string_view note {};
     Trend trend { Trend::Drawn };              ///< Whether a sparkline is drawn.
     Priority priority { Priority::Normal };    ///< When the whole row is dropped for height.
     Priority trendPriority { Priority::High }; ///< When the trend is dropped for width, after narrowing.
@@ -243,6 +251,61 @@ struct TitleFactRow
     Priority priority { Priority::Normal };   ///< When it is dropped for width; the subject itself never is.
 };
 
+/// A fact a panel states in words about the endpoint it asks, read from that endpoint's own status rather
+/// than from a series (#134 §4).
+///
+/// TRANSMITTED/PERSISTED: no. Private; enumerators may be inserted.
+///
+/// **What a node is DOING, as opposed to how fast it does it.** Each is rendered by one row of
+/// `StatusFactTable` from the newest `NodeStatusFields`. A fact the status does not carry renders the
+/// absent marker by name; one that does not apply to this node -- a consensus role on a node running no
+/// consensus, a cache tier on one with none -- draws no line at all, rather than a line of markers claiming
+/// the thing exists.
+enum class StatusFact : std::uint8_t
+{
+    NodeId,     ///< Its minted identity.
+    Components, ///< What it runs.
+    Toolchains, ///< `serving 3 of 3`: the survey's state and its counts.
+    Registrars, ///< `1 of 1, last 4s ago`: its registrations, and when one was last accepted.
+    Consensus,  ///< Its scheduler role; only on a node running consensus.
+    Leader,     ///< The leader it knows about; beside `Consensus`.
+    Slots,      ///< In flight, available and registered, and what limits them; only on a node running a worker.
+    CacheTier,  ///< Its cache tier's hit rate and fill; only on a node running one.
+    Host,       ///< The machine: CPU busy, memory free, scratch free.
+    Last,
+};
+
+/// One label and the fact written after it.
+struct FactCell
+{
+    std::string_view label;                   ///< What the fact is.
+    StatusFact fact { StatusFact::NodeId };   ///< The fact.
+    std::span<BesideFigure const> figures {}; ///< Series the fact writes beside what the status says, in order.
+};
+
+/// One line of facts: one or two cells, a second one aligned across the lines of its block.
+struct FactLine
+{
+    std::span<FactCell const> cells;        ///< The cells, left to right; the line is drawn when the first applies.
+    Priority priority { Priority::Normal }; ///< When the line goes, for height.
+};
+
+/// Where a block of facts is drawn in a panel.
+///
+/// TRANSMITTED/PERSISTED: no. Private; enumerators may be inserted.
+enum class FactPlace : std::uint8_t
+{
+    AboveRates, ///< Under the title, before the rates.
+    BelowRates, ///< After every figure block.
+};
+
+/// Lines of facts drawn together, their columns aligned, with a blank before them.
+struct FactBlock
+{
+    std::span<FactLine const> lines;           ///< The lines.
+    FactPlace place { FactPlace::AboveRates }; ///< Where.
+};
+
 /// A whole panel.
 ///
 /// **A table that does not fit vertically ends in `+N more`** rather than losing rows silently: it
@@ -259,6 +322,7 @@ struct PanelSpec
     Priority sourcePriority { Priority::High };  ///< When the source line goes.
     std::optional<DocumentSpec> document {};     ///< The fleet document block; nullopt for a panel without one.
     std::span<TitleFactRow const> titleFacts {}; ///< What the title bar states beside `title`, in reading order.
+    std::span<FactBlock const> facts {};         ///< Blocks of status facts; empty for a panel that reads no status.
 };
 
 /// How long an endpoint has served, as a title bar states it: `2d11:48`.
@@ -293,7 +357,7 @@ struct PanelSize
 /// @return The minimum size.
 [[nodiscard]] PanelSize MinimumPanelSize(PanelSpec const& spec, CellWidth cellWidth) noexcept;
 
-/// Call @p visit with every machine key @p panel's rate and level blocks name, in panel order.
+/// Call @p visit with every machine key @p panel's rate, level and fact blocks name, in panel order.
 /// @param panel The panel.
 /// @param visit Called with each key.
 template <typename Visit>
@@ -304,6 +368,8 @@ constexpr void ForEachFigureKey(PanelSpec const& panel, Visit const& visit)
         visit(row.key);
         for (auto const& beside: row.beside)
             visit(beside.key);
+        for (auto const& part: row.split)
+            visit(part.key);
     }
     for (auto const& row: panel.levels)
     {
@@ -311,6 +377,11 @@ constexpr void ForEachFigureKey(PanelSpec const& panel, Visit const& visit)
         if (row.limit.has_value())
             visit(row.limitKey);
     }
+    for (auto const& block: panel.facts)
+        for (auto const& line: block.lines)
+            for (auto const& cell: line.cells)
+                for (auto const& figure: cell.figures)
+                    visit(figure.key);
 }
 
 /// What joins a tier's name to a tier column's key in the machine name of that tier's figure.
