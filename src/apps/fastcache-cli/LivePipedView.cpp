@@ -1,8 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
+#include "DashboardPanels.hpp"
 #include "LivePipedView.hpp"
+
+#include <FastCache/Core/EnumTable.hpp>
 
 #include <algorithm>
 #include <cassert>
+#include <cstddef>
 #include <format>
 #include <ranges>
 #include <string_view>
@@ -46,11 +50,121 @@ namespace
     }
 } // namespace
 
-Value LatestReading(DashboardModel const& model)
+std::string FigureKey(std::string_view label)
 {
-    if (!model.latest.has_value() || model.latest->shape != Shape::Record)
-        return RecordValue({});
-    return *model.latest;
+    auto key = std::string {};
+    auto pendingSeparator = false;
+    for (auto const ch: label)
+    {
+        auto const lowered = ch >= 'A' && ch <= 'Z' ? static_cast<char>(ch - 'A' + 'a') : ch;
+        auto const kept = (lowered >= 'a' && lowered <= 'z') || (lowered >= '0' && lowered <= '9');
+        if (!kept)
+        {
+            if (ch == '/')
+            {
+                key += key.empty() ? "per_" : "_per_";
+                pendingSeparator = false;
+                continue;
+            }
+            pendingSeparator = !key.empty() && !key.ends_with('_');
+            continue;
+        }
+        if (pendingSeparator)
+            key += '_';
+        pendingSeparator = false;
+        key += lowered;
+    }
+    while (key.ends_with('_'))
+        key.pop_back();
+    return key;
+}
+
+namespace
+{
+    /// How one figure format is written for a program rather than a person.
+    struct RawFigureRow
+    {
+        FigureFormat format;                ///< The enumerator this row describes.
+        std::string (*write)(double value); ///< The lexical form: no unit, no grouping.
+    };
+
+    /// One row per `FigureFormat`: whole numbers stay whole, and a fraction keeps the digits its
+    /// panel percentage is drawn from and one more.
+    constexpr auto RawFigureTable = EnumTable<FigureFormat, RawFigureRow> { {
+        { .format = FigureFormat::Count, .write = [](double value) { return std::format("{:.0f}", value); } },
+        { .format = FigureFormat::Rate, .write = [](double value) { return std::format("{:.3f}", value); } },
+        { .format = FigureFormat::Percent, .write = [](double value) { return std::format("{:.4f}", value); } },
+        { .format = FigureFormat::Bytes, .write = [](double value) { return std::format("{:.0f}", value); } },
+        { .format = FigureFormat::Seconds, .write = [](double value) { return std::format("{:.3f}", value); } },
+    } };
+
+    static_assert(RowsInEnumeratorOrder(RawFigureTable, &RawFigureRow::format),
+                  "RawFigureTable must hold one row per FigureFormat, in enumerator order");
+
+    /// @p value as a piped cell in @p format's raw form.
+    /// @param value The value.
+    /// @param format How the panel writes it.
+    /// @return The cell.
+    [[nodiscard]] Cell RawFigureCell(double value, FigureFormat format)
+    {
+        return Cell { .kind = CellKind::Number, .lexical = RawFigureTable[static_cast<std::size_t>(format)].write(value) };
+    }
+    /// The newest cell of @p figure's series: what the panel draws for it now.
+    /// @param figure The figure.
+    /// @param model What is known.
+    /// @param origin The newest reading's source.
+    /// @return The value, or absent.
+    [[nodiscard]] Cell NewestCell(FigureSpec const& figure, DashboardModel const& model, std::optional<StatsOrigin> origin)
+    {
+        if (!origin.has_value() || model.history.empty())
+            return AbsentCell();
+        auto const series = FigureSeries(model.history, figure, *origin, {});
+        return series.empty() || !series.back().has_value() ? AbsentCell() : RawFigureCell(*series.back(), figure.format);
+    }
+
+    /// Whether @p names names the field in any source: a figure there is something to read.
+    /// @param names The names.
+    /// @return True when one source carries it.
+    [[nodiscard]] bool NamesAnything(FieldNames const& names) noexcept
+    {
+        return !names.metrics.empty() || !names.nodeMetrics.empty() || !names.info.empty();
+    }
+} // namespace
+
+Value PanelFigures(PanelSpec const& panel, DashboardModel const& model)
+{
+    auto const origin = OriginOf(model);
+    auto fields = std::vector<Field> {};
+    fields.push_back(Field { .name = "source",
+                             .value = model.latestStamp.has_value() ? TextCell(model.latestStamp->source) : AbsentCell() });
+
+    for (auto const& row: panel.rates)
+    {
+        fields.push_back(Field { .name = FigureKey(row.label), .value = NewestCell(row.figure, model, origin) });
+        for (auto const& beside: row.beside)
+            fields.push_back(Field { .name = FigureKey(std::format("{} {} {}", row.label, beside.before, beside.after)),
+                                     .value = NewestCell(beside.figure, model, origin) });
+    }
+    for (auto const& row: panel.levels)
+    {
+        if (!NamesAnything(row.value.field))
+            continue;
+        fields.push_back(Field { .name = FigureKey(row.label), .value = NewestCell(row.value, model, origin) });
+        if (row.limit.has_value())
+            fields.push_back(Field { .name = FigureKey(std::format("{} limit", row.label)),
+                                     .value = NewestCell(*row.limit, model, origin) });
+    }
+    return RecordValue(std::move(fields));
+}
+
+Value CacheFigures(DashboardModel const& model)
+{
+    return PanelFigures(CachePanel(), model);
+}
+
+Value NodeFigures(DashboardModel const& model)
+{
+    return PanelFigures(NodePanel(), model);
 }
 
 PipedRecordView::PipedRecordView(OutputFormat format, std::optional<std::string> absentOverride, FigureProjection project):
