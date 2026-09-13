@@ -231,9 +231,6 @@ namespace
         shared->ProducerEnded();
     }
 
-    /// The key a terminal in raw mode sends for Ctrl-C, which is what a stop becomes.
-    constexpr auto CtrlC = std::string_view { "\x03" };
-
     /// Wait for a stop request and tell the loop what it means.
     ///
     /// **Awaited, never polled**: the blocking wait is on `stopWaiter`, and this resumes on
@@ -258,7 +255,7 @@ namespace
         }
 
         if (wake == StopWake::Stopped)
-            shared->Deliver(DashboardEvent { .kind = DashboardEventKind::Key, .keys = std::string { CtrlC } });
+            shared->Deliver(DashboardEvent { .kind = DashboardEventKind::StopRequested });
         else
             // With the handler installed, Ctrl-C no longer ended the process by itself, and
             // nothing was waiting to hear it -- so a session that went on would be one Ctrl-C
