@@ -426,6 +426,55 @@ static_assert(RowsInEnumeratorOrder(CellFormatTable, &CellFormatRow::format));
 /// @return The scale, or absent for a name that section does not render.
 [[nodiscard]] std::optional<CellFormat> FleetColumnFormat(FleetSection section, std::string_view name);
 
+/// How long a column is kept by a human surface too narrow to draw every column.
+///
+/// **The leader's decision, as a column of its tables**, because which columns matter is a property of
+/// the column -- `heartbeat-age` is the one that tells a live row from a dead one, `class` is detail --
+/// and a client deciding it from position or from a list of its own is the second description of the
+/// columns #1320 removed. The page and the machine-readable surfaces draw every column and ignore it.
+///
+/// Transmitted and persisted nowhere: a query's answer inside one process. Declaration order IS the keep
+/// order, so a rank is inserted at its place in it.
+enum class ColumnKeep : std::uint8_t
+{
+    Identity, ///< Says which row a line is; never dropped.
+    Vital,    ///< What the section exists to show; dropped last.
+    Useful,   ///< The default.
+    Detail,   ///< Dropped first.
+    Last,     ///< Not a rank, and has no row.
+};
+
+/// How long the column @p name in @p section is kept, looked up in the tables the renderers walk.
+///
+/// The same door as `FleetColumnFormat`, over the same tables, so the two cannot answer for different
+/// column sets.
+/// @param section The section the header belongs to.
+/// @param name The column's name, as the header spells it.
+/// @return The rank, or absent for a name that section does not render.
+[[nodiscard]] std::optional<ColumnKeep> FleetColumnKeep(FleetSection section, std::string_view name);
+
+/// How a human surface tints one cell: the page's pill colour, as a word a terminal can also act on.
+///
+/// Transmitted and persisted nowhere. `Plain` is also the answer for an absent cell, since a green
+/// pill where nobody reported is a healthy reading nobody gave.
+enum class CellTone : std::uint8_t
+{
+    Plain, ///< No tint.
+    Fresh, ///< A heartbeat or lease age still inside its threshold.
+    Stale, ///< Past it: stop trusting the rest of the row.
+    Last,  ///< Not a tone.
+};
+
+/// The tone the column @p name in @p section gives the value @p number.
+///
+/// **The one place a freshness threshold is applied**: the page's pill and the terminal panel's
+/// colour both ask here, so a heartbeat cannot be amber on one and green on the other.
+/// @param section The section the header belongs to.
+/// @param name The column's name.
+/// @param number The cell's integer, in the column's scale.
+/// @return The tone; `Plain` for a column with no freshness decoration or a name the section lacks.
+[[nodiscard]] CellTone FleetCellTone(FleetSection section, std::string_view name, std::uint64_t number);
+
 /// One number of the fleet document written for a PERSON: the page's cell and the terminal panel's.
 ///
 /// Never for a machine-readable surface: `/fleet.txt` and `/fleet.json` carry the integer.
@@ -484,6 +533,24 @@ static_assert(RowsInEnumeratorOrder(CellFormatTable, &CellFormatRow::format));
 /// reworded; the key is what a scraper keyed on `/fleet.json` depends on.
 /// @return A view of the static table; never empty.
 [[nodiscard]] std::span<std::string_view const> FleetKpiKeys() noexcept;
+
+/// What a human surface other than the page needs to write one headline figure.
+///
+/// The page's `KpiTable` row, minus its projection: `/fleet.txt` carries each figure's key, value, unit
+/// and denominator, and this carries the words around them, so a terminal tile reads *Compiling now 47
+/// of 192 slots* from the same table the page writes *Compiling now 47 / 192 slots* from.
+struct FleetKpiText
+{
+    std::string_view key;    ///< The machine key; `FleetKpiKeys()` in the same order.
+    std::string_view label;  ///< What the page calls the tile.
+    std::string_view ofNoun; ///< What the denominator counts (`slots`), or empty for a figure with none.
+    std::string_view note;   ///< Words for a figure with no denominator (`not yet resolved`), or empty.
+    bool sparkline;          ///< Whether the figure carries a trend.
+};
+
+/// Every headline figure's words, in the order the strip presents them.
+/// @return A view of the static table; never empty.
+[[nodiscard]] std::span<FleetKpiText const> FleetKpis() noexcept;
 
 /// Render a fleet snapshot as tab-separated text.
 ///

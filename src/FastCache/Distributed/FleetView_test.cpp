@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Cache/StorageTier.hpp>
 #include <FastCache/Core/Clock.hpp>
+#include <FastCache/Core/Ranges.hpp>
 #include <FastCache/Core/Utf8.hpp>
 #include <FastCache/Distributed/FleetChart.hpp>
 #include <FastCache/Distributed/FleetText.hpp>
@@ -382,6 +383,97 @@ TEST_CASE("A lease age is not a heartbeat age, and is not coloured like one", "[
                                                       .age = LeaseTable::DefaultLeaseTimeout / 2 } };
         CHECK(RenderFleetHtml(snapshot, NoHistory(), 10).contains(WarnPill));
     }
+}
+
+TEST_CASE("Every column a section renders states how long a narrow surface keeps it", "[distributed][fleetview][keep]")
+{
+    // #134 F7: which columns survive a narrow terminal is the leader's decision, as a column of its tables.
+    // WHAT DISTINGUISHES: every name `FleetColumnNames` gives a tabular section has a rank, and each section
+    // has exactly one column saying which row a line is. A table row added without thinking about width
+    // takes the default, which is a rank; a section whose identity column went Useful fails the count.
+    auto snapshot = LeadingSnapshot();
+    snapshot.tiersPresent[MemoryIndex] = true;
+    snapshot.tiersPresent[DiskIndex] = true;
+
+    auto sections = std::size_t { 0 };
+    for (auto const& row: FleetSectionTable)
+    {
+        if (!row.tabular)
+            continue;
+        ++sections;
+        INFO("section " << row.key);
+        auto identities = std::size_t { 0 };
+        auto const names = FleetColumnNames(row.section, snapshot);
+        REQUIRE_FALSE(names.empty());
+        for (auto const& name: names)
+        {
+            INFO("column " << name);
+            auto const keep = FleetColumnKeep(row.section, name);
+            REQUIRE(keep.has_value());
+            identities += keep == std::optional<ColumnKeep> { ColumnKeep::Identity } ? 1 : 0;
+        }
+        CHECK(identities == 1);
+    }
+    CHECK(sections > 1);
+
+    // The ranks §5's mockup is drawn from: the row this panel exists for survives, the detail goes first.
+    CHECK(FleetColumnKeep(FleetSection::Machines, "heartbeat-age") == ColumnKeep::Vital);
+    CHECK(FleetColumnKeep(FleetSection::Machines, "cpu-busy") == ColumnKeep::Vital);
+    CHECK(FleetColumnKeep(FleetSection::Machines, "memory") == ColumnKeep::Detail);
+    CHECK(FleetColumnKeep(FleetSection::Machines, "class") == ColumnKeep::Detail);
+    CHECK(FleetColumnKeep(FleetSection::Machines, "version") == ColumnKeep::Detail);
+    CHECK_FALSE(FleetColumnKeep(FleetSection::Machines, "zeta-column").has_value());
+    CHECK_FALSE(FleetColumnKeep(FleetSection::Kpi, "value").has_value());
+}
+
+TEST_CASE("An age's tone is one threshold, asked by the page and every other surface", "[distributed][fleetview][tone]")
+{
+    // #134 F9. WHAT DISTINGUISHES: the boundary itself, on both sides, for both age columns -- a lease
+    // fifteen seconds old is fresh where a heartbeat that old is stale -- and the page's pill follows the
+    // same answer rather than a comparison of its own.
+    CHECK(FleetCellTone(FleetSection::Machines, "heartbeat-age", 14'999) == CellTone::Fresh);
+    CHECK(FleetCellTone(FleetSection::Machines, "heartbeat-age", 15'000) == CellTone::Stale);
+    CHECK(FleetCellTone(FleetSection::Workers, "heartbeat-age", 15'000) == CellTone::Stale);
+    CHECK(FleetCellTone(FleetSection::Leases, "age", 15'000) == CellTone::Fresh);
+    auto const leaseOld = static_cast<std::uint64_t>(LeaseTable::DefaultLeaseTimeout.count()) / 2;
+    CHECK(FleetCellTone(FleetSection::Leases, "age", leaseOld - 1) == CellTone::Fresh);
+    CHECK(FleetCellTone(FleetSection::Leases, "age", leaseOld) == CellTone::Stale);
+    CHECK(FleetCellTone(FleetSection::Machines, "cores", 1'000'000) == CellTone::Plain);
+    CHECK(FleetCellTone(FleetSection::Machines, "zeta-column", 1'000'000) == CellTone::Plain);
+
+    auto snapshot = LeadingSnapshot();
+    snapshot.nodes[0].heartbeatAge = std::chrono::milliseconds { 15'000 };
+    CHECK(RenderFleetHtml(snapshot, NoHistory(), 0).contains(R"(pill--warn"><span class="dot">)"));
+    snapshot.nodes[0].heartbeatAge = std::chrono::milliseconds { 14'999 };
+    CHECK_FALSE(RenderFleetHtml(snapshot, NoHistory(), 0).contains(R"(pill--warn"><span class="dot">)"));
+}
+
+TEST_CASE("The strip's words are public, row for row with its keys", "[distributed][fleetview][kpi]")
+{
+    // #134 F2/F4: a terminal tile reads the page's label and the page's nouns. WHAT DISTINGUISHES: the
+    // descriptors are the keys' own rows in the keys' order, and the page's `/ N slots` is spelled from
+    // the same noun a tile writes -- a second spelling on either side would pass a count and fail here.
+    auto const kpis = FleetKpis();
+    auto const keys = FleetKpiKeys();
+    REQUIRE(kpis.size() == keys.size());
+    auto sparklines = std::size_t { 0 };
+    for (auto const index: std::views::iota(std::size_t { 0 }, keys.size()))
+    {
+        INFO("kpi " << keys[index]);
+        CHECK(kpis[index].key == keys[index]);
+        CHECK_FALSE(kpis[index].label.empty());
+        CHECK((kpis[index].ofNoun.empty() || kpis[index].note.empty()));
+        sparklines += kpis[index].sparkline ? 1 : 0;
+    }
+    CHECK(sparklines == 1);
+
+    auto const* const compiling = FindIfOrNull(kpis, [](FleetKpiText const& kpi) { return kpi.key == "compiling-now"; });
+    REQUIRE(compiling != nullptr);
+    CHECK(compiling->label == "Compiling now");
+    CHECK(compiling->ofNoun == "slots");
+    auto const snapshot = LeadingSnapshot();
+    CHECK(RenderFleetHtml(snapshot, NoHistory(), 0)
+              .contains(std::format("/ {} {}", snapshot.nodes.front().registeredSlots, compiling->ofNoun)));
 }
 
 TEST_CASE("A number nobody reported renders as an absence, never as a zero", "[distributed][fleetview]")
