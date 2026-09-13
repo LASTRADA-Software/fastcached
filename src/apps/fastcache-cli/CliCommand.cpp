@@ -295,12 +295,24 @@ namespace
         return std::format("{}{}", verb.name, verb.operands);
     }
 
-    /// One modifier's flag spelling and the bit it sets, for the applicability check.
+    /// Whether a flag-valued modifier was given.
+    ///
+    /// The flag-shaped rows' answer, spelled once for all of them the way `SetVerbFlag`
+    /// spells their applier once.
+    /// @param options The parsed modifiers.
+    /// @return The field's value.
+    template <bool VerbOptions::* Field>
+    [[nodiscard]] constexpr bool FlagGiven(VerbOptions const& options) noexcept
+    {
+        return options.*Field;
+    }
+
+    /// One modifier's flag spelling, the bit that honours it, and how to tell it was given.
     struct ModifierSpec
     {
-        std::uint8_t bit;        ///< The `Modifier` bit.
-        std::string_view flag;   ///< The flag an operator typed.
-        bool VerbOptions::* set; ///< The field to read; null for `--ttl`, which is not a bool.
+        std::uint8_t bit;                  ///< The `Modifier` bit.
+        std::string_view flag;             ///< The flag an operator typed.
+        bool (*given)(VerbOptions const&); ///< Whether the operator typed it.
     };
 
     /// The modifiers, so the applicability refusal names the flag the operator typed.
@@ -309,20 +321,27 @@ namespace
     /// being written into a message -- a refusal naming a flag that has been renamed is
     /// worse than no refusal, because it sends the reader looking for something that is
     /// not there.
+    ///
+    /// **Every row says whether it was given, including the ones that carry a value.**
+    /// `--ttl` used to be read through a member pointer to a `bool`, which it is not, so
+    /// its row carried a null pointer and `UnhonouredModifier` carried a second,
+    /// hand-written `--ttl` clause beside the loop. That was one special case while one
+    /// modifier carried a value; a second value-carrying modifier would have been a
+    /// second clause, each a place for the refusal to drift from the table. A predicate
+    /// states *given* for a flag and for a value alike, so a new modifier of either shape
+    /// is a row and the loop has no arm that knows a name.
+    ///
+    /// And a row is not optional: `HelpTopicText` reads this same table as a verb page's
+    /// modifier list, so a modifier without one would be refused nowhere and documented
+    /// nowhere, with nothing to say it was missing.
     constexpr auto Modifiers = std::to_array<ModifierSpec>({
-        // `--ttl` had no row although the struct's own `set` field was documented as
-        // *"null for `--ttl`, which is not a bool"* -- the column anticipated the row and
-        // the row was never written. Nothing was wrong while `UnhonouredModifier` was the
-        // only reader, because it carries a second, hand-written `--ttl` clause below; it
-        // goes wrong the moment a SECOND reader treats the table as the modifier list,
-        // which `HelpTopicText` does. `set` staying null is what keeps the two readers
-        // honest: the applicability loop skips the row it cannot read, and the help
-        // renderer, which only ever wants the spelling, does not.
-        { .bit = Modifier::Ttl, .flag = "--ttl", .set = nullptr },
-        { .bit = Modifier::Exclusivity, .flag = "--nx", .set = &VerbOptions::onlyIfAbsent },
-        { .bit = Modifier::Exclusivity, .flag = "--xx", .set = &VerbOptions::onlyIfPresent },
-        { .bit = Modifier::Raw, .flag = "--raw", .set = &VerbOptions::raw },
-        { .bit = Modifier::Everything, .flag = "--all", .set = &VerbOptions::everything },
+        { .bit = Modifier::Ttl,
+          .flag = "--ttl",
+          .given = [](VerbOptions const& options) { return options.ttlSeconds != TtlUnset; } },
+        { .bit = Modifier::Exclusivity, .flag = "--nx", .given = &FlagGiven<&VerbOptions::onlyIfAbsent> },
+        { .bit = Modifier::Exclusivity, .flag = "--xx", .given = &FlagGiven<&VerbOptions::onlyIfPresent> },
+        { .bit = Modifier::Raw, .flag = "--raw", .given = &FlagGiven<&VerbOptions::raw> },
+        { .bit = Modifier::Everything, .flag = "--all", .given = &FlagGiven<&VerbOptions::everything> },
     });
 
     /// One connection a verb's wire needs, and the word the help calls it.
@@ -370,18 +389,8 @@ namespace
     [[nodiscard]] std::string UnhonouredModifier(Command const& command, VerbSpec const& verb)
     {
         for (auto const& modifier: Modifiers)
-        {
-            // The `--ttl` row carries no bool to read; whether it was given is a
-            // comparison against `TtlUnset`, which the clause after this loop makes.
-            if (modifier.set == nullptr)
-                continue;
-            if (!(command.verbOptions.*modifier.set))
-                continue;
-            if ((verb.modifiers & modifier.bit) == 0)
+            if (modifier.given(command.verbOptions) && (verb.modifiers & modifier.bit) == 0)
                 return std::format("{} means nothing for `{}`", modifier.flag, verb.name);
-        }
-        if (command.verbOptions.ttlSeconds != TtlUnset && (verb.modifiers & Modifier::Ttl) == 0)
-            return std::format("--ttl means nothing for `{}`", verb.name);
         return {};
     }
 } // namespace
