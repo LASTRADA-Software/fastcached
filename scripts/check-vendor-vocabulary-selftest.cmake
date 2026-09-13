@@ -9,8 +9,8 @@
 # ## How the tables get into a synthetic tree
 #
 # The check's exemption and control tables name files in the REAL tree, and a synthetic tree
-# has none of them. So each case copies the check and `lib/CheckCommon.cmake` into its own
-# tree and inserts its own tables after the check's `@tables-end` marker, which re-`set`s both
+# has none of them. So each case copies the check and `lib/CheckCommon.cmake` into the tree it
+# runs in and inserts its own tables after the check's `@tables-end` marker, which re-`set`s both
 # tables and so overrides whatever rows the real ones carry. The copy is otherwise
 # byte-identical, so the thing tested is the thing that ships. The marker is asserted to occur
 # exactly ONCE: missing and duplicated both make the injection mean something else, and a
@@ -86,6 +86,48 @@ set(defaultControls "\"tui/runtime/TuiRuntime.hpp|synthetic control: includes co
 function(fastcached_make_tree name probeBody exemptions controls outVar)
     set(tree "${root}/${name}")
     file(REMOVE_RECURSE "${tree}")
+    fastcached_stage_vendor("${tree}")
+    file(WRITE "${tree}/src/apps/probe/Probe.cpp" "${probeBody}")
+    fastcached_write_check("${tree}" "${exemptions}" "${controls}")
+    set(${outVar} "${tree}" PARENT_SCOPE)
+endfunction()
+
+# The one tree every `fastcached_case` shares, rewritten only where a case differs.
+#
+# **The cost of this selftest is creating files, and on the local gate that is a DrvFs cost.**
+# MEASURED on 09714dc9, WSL2 over a Windows volume, host load 3-4 from another lane's build, three
+# interleaved rounds: 10.4-17.8 s with the scratch tree on DrvFs, 0.83-0.88 s with the same sources
+# and the scratch tree on ext4, 0.17-0.18 s with both native -- and a gate's `ctest --parallel 32`
+# killed it at 60 s. So the cases that only swap the probe source and the tables no longer each
+# stage, delete and re-stage a whole tree: they share one, write the probe, and rewrite the check
+# only when the injected tables change. The cases that ADD or REMOVE a file keep a tree of their own
+# (`fastcached_make_tree`), so nothing one of them leaves behind reaches another.
+#
+# MEASURED after, same host, scratch on DrvFs, the per-case version and this one interleaved, all 26
+# cases passing in every run: at load 2.8, 10.4-19.3 s against 6.2-8.7 s over four rounds; at load
+# 13-34, 21.7-34.2 s against 9.2-17.5 s over three. The residue is the check's own run per case,
+# which reads its tree over the same filesystem. A reference, not a budget: the ctest TIMEOUT stays
+# where it was.
+function(fastcached_shared_tree probeBody exemptions controls outVar)
+    set(tree "${root}/shared")
+    get_property(staged GLOBAL PROPERTY FASTCACHED_VOCABULARY_SHARED_STAGED SET)
+    if(NOT staged)
+        file(REMOVE_RECURSE "${tree}")
+        fastcached_stage_vendor("${tree}")
+        set_property(GLOBAL PROPERTY FASTCACHED_VOCABULARY_SHARED_STAGED TRUE)
+    endif()
+    file(WRITE "${tree}/src/apps/probe/Probe.cpp" "${probeBody}")
+    get_property(tables GLOBAL PROPERTY FASTCACHED_VOCABULARY_SHARED_TABLES)
+    if(NOT "${tables}" STREQUAL "${exemptions}|${controls}")
+        fastcached_write_check("${tree}" "${exemptions}" "${controls}")
+        set_property(GLOBAL PROPERTY FASTCACHED_VOCABULARY_SHARED_TABLES "${exemptions}|${controls}")
+    endif()
+    set(${outVar} "${tree}" PARENT_SCOPE)
+endfunction()
+
+# The vendored tree the cases are read against.
+# @param tree Where to stage it.
+function(fastcached_stage_vendor tree)
     file(WRITE "${tree}/vendor/endo/coro/Task.hpp" "#pragma once\n")
     file(WRITE "${tree}/vendor/endo/platform/Clock.hpp" "#pragma once\n")
     file(WRITE "${tree}/vendor/endo/platform/Types.hpp" "#pragma once\n#include <cstdint>\n")
@@ -93,8 +135,14 @@ function(fastcached_make_tree name probeBody exemptions controls outVar)
     file(WRITE "${tree}/vendor/endo/tui/runtime/TuiRuntime.hpp" "#pragma once\n#include <tui/Screen.hpp>\n#include <coro/Task.hpp>\n")
     file(WRITE "${tree}/vendor/endo/tui/Widget.hpp" "#pragma once\n#include <tui/Screen.hpp>\n#include \"runtime/Flow.hpp\"\n")
     file(WRITE "${tree}/vendor/endo/tui/runtime/Flow.hpp" "#pragma once\n#include <platform/Clock.hpp>\n")
-    file(WRITE "${tree}/src/apps/probe/Probe.cpp" "${probeBody}")
+    file(COPY "${checkCommon}" DESTINATION "${tree}/scripts/lib")
+endfunction()
 
+# The check under test, with the case's tables injected after its `# @tables-end` marker.
+# @param tree The tree to write it into.
+# @param exemptions The exemption rows, as quoted CMake arguments, or empty.
+# @param controls The control rows, as quoted CMake arguments.
+function(fastcached_write_check tree exemptions controls)
     file(READ "${check}" checkText)
     string(REGEX MATCHALL "# @tables-end[^\n]*\n" markers "${checkText}")
     list(LENGTH markers markerCount)
@@ -116,8 +164,6 @@ function(fastcached_make_tree name probeBody exemptions controls outVar)
         "set(FastCachedVendorVocabularyExemptions ${exemptions})\n"
         "set(FastCachedVendorVocabularyControls ${controls})\n"
         "${rest}")
-    file(COPY "${checkCommon}" DESTINATION "${tree}/scripts/lib")
-    set(${outVar} "${tree}" PARENT_SCOPE)
 endfunction()
 
 function(fastcached_run_check tree outObjected outOutput)
@@ -163,7 +209,7 @@ endfunction()
 # escape rather than as the include under test.
 function(fastcached_case name probeBody exemptions controls expect mustSay why)
     math(EXPR caseCount "${caseCount} + 1")
-    fastcached_make_tree("${name}" "${probeBody}" "${exemptions}" "${controls}" caseTree)
+    fastcached_shared_tree("${probeBody}" "${exemptions}" "${controls}" caseTree)
     fastcached_run_check("${caseTree}" caseObjected caseOutput)
     if("${expect}" STREQUAL "refuse" AND NOT caseObjected)
         list(APPEND failures "${name}: accepted, and must refuse -- ${why}")
@@ -334,7 +380,8 @@ endif()
 # --- the refusal text ----------------------------------------------------------------------
 # A guard's remedy text is the part most people read and the part nothing tests. #1377's
 # acceptance asks that it say what the rule does NOT cover, so it is asserted here.
-fastcached_make_tree("remedyText" "${legal}#include <coro/Task.hpp>\n" "" "${defaultControls}" remedyTree)
+# Nothing is added or removed, so it shares the tree.
+fastcached_shared_tree("${legal}#include <coro/Task.hpp>\n" "" "${defaultControls}" remedyTree)
 math(EXPR caseCount "${caseCount} + 1")
 fastcached_run_check("${remedyTree}" objected output)
 foreach(phrase IN ITEMS "does NOT cover" "<tui/...> includes are fine" "<platform/SignalHandler.hpp>"
