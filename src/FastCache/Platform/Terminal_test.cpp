@@ -61,6 +61,16 @@ TEST_CASE("Terminal: standard streams are not interactive when stdin is a pipe",
     REQUIRE_FALSE(FastCache::StandardStreamsAreInteractive());
 }
 
+TEST_CASE("Terminal: saved terminal modes are not captured without a terminal", "[platform][terminal]")
+{
+    // The capturing direction needs a real terminal, which no test runner has; this is the half
+    // that can be asserted anywhere. It matters on its own: a capture that "succeeded" on a pipe
+    // would later apply a zeroed termios to whatever stdin is.
+    FastCache::Testing::ScopedPipeStdin const guard;
+    REQUIRE(guard.installed);
+    CHECK_FALSE(FastCache::SavedTerminalModes::Capture().has_value());
+}
+
 TEST_CASE("Terminal: the locale variables decide the encoding by libc's precedence", "[platform][terminal]")
 {
     using FastCache::EncodingFromLocaleVariables;

@@ -4,11 +4,15 @@
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
+#include <new>
 #include <string>
+#include <utility>
 
 #if defined(_WIN32)
     #include <windows.h>
 #else
+    #include <termios.h>
     #include <unistd.h>
 #endif
 
@@ -118,6 +122,57 @@ bool StandardStreamsAreInteractive() noexcept
     return isConsole(STD_INPUT_HANDLE) && isConsole(STD_OUTPUT_HANDLE);
 }
 
+struct SavedTerminalModes::Modes
+{
+    HANDLE input { nullptr };
+    HANDLE output { nullptr };
+    DWORD inputMode { 0 };
+    DWORD outputMode { 0 };
+    UINT inputCodePage { 0 };
+    UINT outputCodePage { 0 };
+};
+
+std::optional<SavedTerminalModes> SavedTerminalModes::Capture() noexcept
+{
+    if (!StandardStreamsAreInteractive())
+        return std::nullopt;
+    try
+    {
+        auto modes = std::make_shared<Modes>();
+        modes->input = ::GetStdHandle(STD_INPUT_HANDLE);
+        modes->output = ::GetStdHandle(STD_OUTPUT_HANDLE);
+        if (::GetConsoleMode(modes->input, &modes->inputMode) == 0
+            || ::GetConsoleMode(modes->output, &modes->outputMode) == 0)
+            return std::nullopt;
+        modes->inputCodePage = ::GetConsoleCP();
+        modes->outputCodePage = ::GetConsoleOutputCP();
+        return SavedTerminalModes { std::move(modes) };
+    }
+    catch (std::bad_alloc const&)
+    {
+        return std::nullopt;
+    }
+}
+
+void SavedTerminalModes::Apply(std::string_view resets) const noexcept
+{
+    while (!resets.empty())
+    {
+        DWORD written = 0;
+        if (::WriteFile(_modes->output, resets.data(), static_cast<DWORD>(resets.size()), &written, nullptr) == 0
+            || written == 0)
+            break;
+        resets.remove_prefix(written);
+    }
+    ::SetConsoleMode(_modes->input, _modes->inputMode);
+    ::SetConsoleMode(_modes->output, _modes->outputMode);
+    // 0 is what both getters answer when there was no console page to read.
+    if (_modes->outputCodePage != 0)
+        ::SetConsoleOutputCP(_modes->outputCodePage);
+    if (_modes->inputCodePage != 0)
+        ::SetConsoleCP(_modes->inputCodePage);
+}
+
 #else
 
 bool StdoutSupportsColor() noexcept
@@ -132,6 +187,45 @@ bool StandardStreamsAreInteractive() noexcept
     return ::isatty(STDIN_FILENO) != 0 && ::isatty(STDOUT_FILENO) != 0;
 }
 
+struct SavedTerminalModes::Modes
+{
+    termios input {};
+};
+
+std::optional<SavedTerminalModes> SavedTerminalModes::Capture() noexcept
+{
+    if (!StandardStreamsAreInteractive())
+        return std::nullopt;
+    try
+    {
+        auto modes = std::make_shared<Modes>();
+        if (::tcgetattr(STDIN_FILENO, &modes->input) != 0)
+            return std::nullopt;
+        return SavedTerminalModes { std::move(modes) };
+    }
+    catch (std::bad_alloc const&)
+    {
+        return std::nullopt;
+    }
+}
+
+void SavedTerminalModes::Apply(std::string_view resets) const noexcept
+{
+    while (!resets.empty())
+    {
+        auto const written = ::write(STDOUT_FILENO, resets.data(), resets.size());
+        if (written < 0 && errno == EINTR)
+            continue;
+        if (written <= 0)
+            break;
+        resets.remove_prefix(static_cast<std::size_t>(written));
+    }
+    // TCSANOW, not the TCSAFLUSH a UI's own teardown uses: FLUSH waits for pending output to drain,
+    // and a process ending because something is stuck must not wait on a terminal that stopped
+    // reading.
+    ::tcsetattr(STDIN_FILENO, TCSANOW, &_modes->input);
+}
+
 TerminalTextEncoding DetectTerminalTextEncoding()
 {
     auto const lcAll = ReadEnvironmentVariable("LC_ALL");
@@ -144,5 +238,10 @@ TerminalTextEncoding DetectTerminalTextEncoding()
 }
 
 #endif
+
+SavedTerminalModes::SavedTerminalModes(std::shared_ptr<Modes const> modes) noexcept:
+    _modes { std::move(modes) }
+{
+}
 
 } // namespace FastCache
