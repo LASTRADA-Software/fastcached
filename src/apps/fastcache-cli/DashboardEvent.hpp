@@ -7,6 +7,7 @@
 
 #include <FastCache/Async/Task.hpp>
 #include <FastCache/Core/Clock.hpp>
+#include <FastCache/Protocol/CompileCacheWire.hpp>
 
 #include <chrono>
 #include <cstdint>
@@ -95,6 +96,15 @@ struct DashboardEvent
     /// `/fleet.txt` answer is a table rather than a stats attempt, so without its own member a
     /// fleet session could not stream at all. Disengaged on a `cache` or `node` sample.
     std::optional<std::expected<std::string, AdminError>> document {};
+
+    /// `Sample` and `SampleFailed`, `node` session: what the node said about itself when this
+    /// sample was taken, or nullopt when the sample carried no status.
+    ///
+    /// **Per sample, never a copy of the session's first answer.** Toolchains served, registrars,
+    /// the scheduler role and the slots are what a `node` panel exists to show moving, so a status
+    /// asked once and repeated would be a live view of the past. The version and uptime ride here
+    /// too, which is why the node panel reads them from this rather than from a stats record.
+    std::optional<CompileCacheWire::NodeStatusFields> nodeStatus {};
 
     /// `SampleFailed`: what the failure means as an outcome.
     ///
