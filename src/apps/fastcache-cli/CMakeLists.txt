@@ -27,6 +27,7 @@ set(_fc_cli_sources
     DashboardSampler.cpp
     FleetDocument.cpp
     LiveEventSource.cpp
+    LiveSession.cpp
     LiveStats.cpp
     MemcachedClient.cpp
     NodeClient.cpp
@@ -84,6 +85,7 @@ if(FASTCACHED_BUILD_TESTS)
         DashboardSampler_test.cpp
         FleetDocument_test.cpp
         LiveEventSource_test.cpp
+        LiveSession_test.cpp
         LiveStats_test.cpp
         MemcachedClient_test.cpp
         MemcachedVerbs_test.cpp
