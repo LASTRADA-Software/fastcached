@@ -221,6 +221,7 @@ struct DeviceScript
     SixelAnswer sixel { SixelAnswer::Advertised };
     SynchronizedOutputAnswer synchronizedOutput { SynchronizedOutputAnswer::Supported };
     TerminalTextEncoding encoding { TerminalTextEncoding::Utf8 };
+    ColourAnswer colour { ColourAnswer::Suppressed };
 
     /// What the acquisition measured, and what each re-read after a resize answers.
     std::optional<CellPixelSize> cellPixels { CellPixelSize { .width = 10, .height = 20 } };
@@ -285,6 +286,11 @@ class FakeDevice final: public ITerminalDevice
         if (_script.throwOnEncoding)
             throw std::runtime_error("the environment could not be read");
         return _script.encoding;
+    }
+
+    [[nodiscard]] ColourAnswer AskColour() override
+    {
+        return _script.colour;
     }
 
     [[nodiscard]] int Columns() const override
@@ -1492,4 +1498,137 @@ TEST_CASE("a resize whose re-read gets no answer carries no cell size, never the
     CHECK(opened.cellPixels.has_value());
     CHECK(resized.kind == DashboardEventKind::Resize);
     CHECK_FALSE(resized.cellPixels.has_value());
+}
+
+namespace
+{
+
+/// @p bytes with every SGR sequence (`ESC [ digits and semicolons m`) taken out, and how many there were.
+/// @param bytes Presenter output.
+/// @return The rest, and the count.
+[[nodiscard]] std::pair<std::string, std::size_t> SplitSgr(std::string_view bytes)
+{
+    auto out = std::pair<std::string, std::size_t> {};
+    auto at = std::size_t { 0 };
+    while (at < bytes.size())
+    {
+        if (bytes.substr(at).starts_with("\x1b["))
+        {
+            auto const end = bytes.find_first_not_of("0123456789;", at + 2);
+            if (end != std::string_view::npos && bytes[end] == 'm')
+            {
+                ++out.second;
+                at = end + 1;
+                continue;
+            }
+        }
+        out.first.push_back(bytes[at]);
+        ++at;
+    }
+    return out;
+}
+
+/// @p bytes with every SGR sequence taken out.
+/// @param bytes Presenter output.
+/// @return The rest.
+[[nodiscard]] std::string WithoutSgr(std::string_view bytes)
+{
+    return SplitSgr(bytes).first;
+}
+
+/// How many SGR sequences @p bytes carries.
+/// @param bytes Presenter output.
+/// @return The count.
+[[nodiscard]] std::size_t SgrCount(std::string_view bytes)
+{
+    return SplitSgr(bytes).second;
+}
+
+/// A frame with a selected tab, a stale age, and a run past the end of its row.
+/// @return The frame.
+[[nodiscard]] DashboardFrame DressedFrame()
+{
+    return DashboardFrame {
+        .text = "strip  [machines]  workers\nhb  0.90 s",
+        .placements = {},
+        .spans = { FrameSpan { .row = 1, .byte = 7, .length = 10, .tone = FrameTone::Selected },
+                   FrameSpan { .row = 2, .byte = 4, .length = 6, .tone = FrameTone::Stale },
+                   FrameSpan { .row = 2, .byte = 9, .length = 6, .tone = FrameTone::Fresh } },
+    };
+}
+
+} // namespace
+
+TEST_CASE("a dressed run is the same bytes with the palette's style around them, where the record allows colour",
+          "[cli][dashboard][terminal][tone]")
+{
+    // #134 G1, the presenter half. WHAT DISTINGUISHES: with colour allowed, every SGR taken out leaves exactly
+    // the plain frame's bytes -- a presenter that rewrote a run, or wrote it twice, fails that -- the tab sits
+    // inside inverse video and a reset, the stale age inside its palette colour, and the run past its row's
+    // end dresses nothing. With colour suppressed, or never decided, not ONE SGR is written.
+    auto const frame = DressedFrame();
+    auto const plain = FrameBytes(frame, false);
+
+    auto coloured = TerminalCapabilities {};
+    coloured.colour = ColourAnswer::Supported;
+    auto const dressed = FrameBytes(frame, coloured);
+    CHECK(WithoutSgr(dressed) == plain);
+    CHECK(dressed.contains("\x1b[7m[machines]\x1b[m"));
+    CHECK(dressed.contains("0.90 s\x1b[m"));
+    CHECK(SgrCount(dressed) == 4);
+
+    for (auto const answer: { ColourAnswer::Suppressed, ColourAnswer::NotAsked })
+    {
+        auto record = TerminalCapabilities {};
+        record.colour = answer;
+        CHECK(FrameBytes(frame, record) == plain);
+        CHECK(SgrCount(FrameBytes(frame, record)) == 0);
+    }
+}
+
+TEST_CASE("every tone has a palette row, and a record that allows no colour dresses no tone",
+          "[cli][dashboard][terminal][tone]")
+{
+    // One palette, looked up in one place. WHAT DISTINGUISHES: a tone added without a row fails the build at
+    // the table (`RowsInEnumeratorOrder`); here, every tone answers a row where colour is allowed and none
+    // where it is not, and the selected tone is the one drawn inverse.
+    auto coloured = TerminalCapabilities {};
+    coloured.colour = ColourAnswer::Supported;
+    auto const plain = TerminalCapabilities {};
+    for (auto const index: std::views::iota(std::size_t { 0 }, static_cast<std::size_t>(FrameTone::Last)))
+    {
+        auto const tone = static_cast<FrameTone>(index);
+        INFO("tone " << index);
+        REQUIRE(PaletteFor(tone, coloured) != nullptr);
+        CHECK(PaletteFor(tone, coloured)->tone == tone);
+        CHECK(PaletteFor(tone, plain) == nullptr);
+    }
+    CHECK(PaletteFor(FrameTone::Selected, coloured)->inverse);
+    CHECK(PaletteFor(FrameTone::Last, coloured) == nullptr);
+}
+
+TEST_CASE("a started terminal records its colour answer and its frames are dressed by it",
+          "[cli][dashboard][terminal][tone]")
+{
+    // The decision is on the capability record, like the rest of the ladder. WHAT DISTINGUISHES: the device's
+    // answer lands on the record, and the presenter the start built dresses a frame exactly as the record's
+    // overload does -- a presenter keeping only the synchronized flag writes the plain frame for both answers.
+    for (auto const answer: { ColourAnswer::Supported, ColourAnswer::Suppressed })
+    {
+        auto record = DeviceRecord {};
+        auto clock = ManualClock {};
+        auto reactor = TestReactor { clock };
+        auto pool = ThreadPoolExecutor { 1 };
+
+        auto outcome = StartFake({ .colour = answer }, record, pool, reactor);
+        REQUIRE(outcome.started.has_value());
+        CHECK(outcome.started->capabilities.colour == answer);
+
+        auto const frame = DressedFrame();
+        auto const before = record.Written().size();
+        outcome.started->frames->PresentPlaced(frame);
+        auto const written = record.Written().substr(before);
+        CHECK(written == FrameBytes(frame, outcome.started->capabilities));
+        CHECK((SgrCount(written) > 0) == (answer == ColourAnswer::Supported));
+    }
 }

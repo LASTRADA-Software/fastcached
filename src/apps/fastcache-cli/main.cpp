@@ -272,13 +272,22 @@ class ProcessStopSignals final: public IStopSignalInstaller
 class StandardTerminalAcquisition final: public ITerminalAcquisition
 {
   public:
+    /// @param colour `--color`, resolved once by `ResolveColor`: what the capability record says of colour.
+    explicit StandardTerminalAcquisition(UsageColor colour) noexcept:
+        _colour { colour }
+    {
+    }
+
     [[nodiscard]] Task<std::expected<StartedTerminal, std::string>> Acquire(IExecutor* pool, IExecutor* resumeOn) override
     {
-        auto unstarted = MakeTerminalEvents(pool, resumeOn);
+        auto unstarted = MakeTerminalEvents(pool, resumeOn, _colour);
         if (!unstarted.has_value())
             co_return std::unexpected(std::move(unstarted).error());
         co_return co_await StartTerminal(*std::move(unstarted));
     }
+
+  private:
+    UsageColor _colour;
 };
 
 /// How this process ends once its session was abandoned: flushed, told, and gone without unwinding.
@@ -375,7 +384,7 @@ class StopReactorOnExit
     StdoutFrames sink;
     StderrRemarks remarks { command.quiet };
     ProcessStopSignals stops;
-    StandardTerminalAcquisition terminals;
+    StandardTerminalAcquisition terminals { ResolveColor(command.color) };
     LadderRedial redial { command, WireTable[static_cast<std::size_t>(verb.wire)] };
     // A build without the terminal library has no encoder, and its sessions never reach the Sixel
     // rung; the chart is then simply not drawn.

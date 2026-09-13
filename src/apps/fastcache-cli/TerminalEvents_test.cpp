@@ -63,7 +63,7 @@ TEST_CASE("a terminal is made without one, and starting it with none refuses by 
     auto reactor = TestReactor { clock };
     auto pool = ThreadPoolExecutor { 1 };
 
-    auto made = MakeTerminalEvents(&pool, &reactor);
+    auto made = MakeTerminalEvents(&pool, &reactor, UsageColor::Plain);
     REQUIRE(made.has_value());
 
     auto started = std::expected<StartedTerminal, std::string> { std::unexpected(std::string { "never delivered" }) };
