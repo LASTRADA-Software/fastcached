@@ -9,6 +9,8 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <atomic>
+#include <chrono>
+#include <coroutine>
 #include <optional>
 #include <thread>
 #include <vector>
@@ -52,17 +54,72 @@ class RecordingGatherer final: public IStatsGatherer
 /// them: a lambda coroutine loses its closure at the first suspension, and this one
 /// suspends immediately.
 /// @param gatherer The ladder.
+/// @param clock What stamps the reading.
 /// @param pool Where the gather runs.
 /// @param resumeOn Where to come back.
 /// @param out Where to put the result.
 /// @return The task to submit.
-[[nodiscard]] Task<void> TakeOnce(IStatsGatherer* gatherer,
-                                  IExecutor* pool,
-                                  IExecutor* resumeOn,
-                                  std::optional<SampleOutcome>* out)
+[[nodiscard]] Task<void> TakeOnce(
+    IStatsGatherer* gatherer, IClock* clock, IExecutor* pool, IExecutor* resumeOn, std::optional<SampleOutcome>* out)
 {
-    *out = co_await TakeSample(gatherer, pool, resumeOn);
+    *out = co_await TakeSample(gatherer, clock, pool, resumeOn);
 }
+
+/// A gatherer during which time passes, by a known amount.
+///
+/// It does not block: the property it serves is WHEN the stamp is read, not whether the
+/// reactor stays free, and a gather that returns promptly keeps the case about one thing.
+class TimedGatherer final: public IStatsGatherer
+{
+  public:
+    TimedGatherer(ManualClock& clock, Duration during):
+        _clock { clock },
+        _during { during }
+    {
+    }
+
+    [[nodiscard]] std::vector<StatsAttempt> Gather() override
+    {
+        _clock.Advance(_during);
+        return { StatsAttempt { .origin = StatsOrigin::Info, .asked = true, .record = std::nullopt, .note = "probe" } };
+    }
+
+  private:
+    ManualClock& _clock;
+    Duration _during;
+};
+
+/// An executor that makes the queue take time before it hands work on.
+///
+/// Stands in for the reactor's own latency: the delay between a continuation being posted
+/// and the reactor running it, which is real and which must not become part of a reading.
+class SlowQueue final: public IExecutor
+{
+  public:
+    SlowQueue(ManualClock& clock, Duration delay, IExecutor& inner):
+        _clock { clock },
+        _delay { delay },
+        _inner { inner }
+    {
+    }
+
+    void Submit(std::coroutine_handle<> handle) override
+    {
+        _clock.Advance(_delay);
+        _inner.Submit(handle);
+    }
+
+    void Submit(ParkedWork work) override
+    {
+        _clock.Advance(_delay);
+        _inner.Submit(work);
+    }
+
+  private:
+    ManualClock& _clock;
+    Duration _delay;
+    IExecutor& _inner;
+};
 
 /// Record which thread an executor runs work on.
 /// @param pool The executor to hop onto.
@@ -95,7 +152,7 @@ TEST_CASE("a stats reading is gathered off the reactor and delivered back onto i
 
     auto const driverThread = std::this_thread::get_id();
     auto result = std::optional<SampleOutcome> {};
-    auto task = TakeOnce(&gatherer, &pool, &reactor, &result);
+    auto task = TakeOnce(&gatherer, &clock, &pool, &reactor, &result);
 
     reactor.Submit(task.Native());
     reactor.Drain();
@@ -143,4 +200,38 @@ TEST_CASE("the sampler's thread identities are not equal by construction", "[cli
         std::this_thread::yield();
 
     CHECK(poolThread.load(std::memory_order_acquire) != std::this_thread::get_id());
+}
+
+TEST_CASE("a reading is stamped after its gather returns and before the hop back", "[cli][dashboard][sampler]")
+{
+    // The stamp is a rate's denominator, so WHERE it is read is the whole property: before
+    // the gather it would exclude the time the sources took to answer, and after the hop
+    // back it would include however long the reactor queue took to resume the caller.
+    //
+    // WHAT DISTINGUISHES: time passes on BOTH sides of the correct line -- 5 s inside the
+    // gather and 7 s in the queue -- so each misplacement produces its own wrong answer.
+    // Stamped before the gather reads the start; stamped after the hop reads 12 s. Only the
+    // right line reads exactly 5 s, and an assertion of "later than the start" would pass
+    // for the second mistake.
+    constexpr auto InsideGather = Duration { std::chrono::seconds { 5 } };
+    constexpr auto InQueue = Duration { std::chrono::seconds { 7 } };
+
+    auto clock = ManualClock {};
+    auto const start = clock.Now();
+    auto reactor = TestReactor { clock };
+    auto pool = ThreadPoolExecutor { 1 };
+    auto gatherer = TimedGatherer { clock, InsideGather };
+    auto queue = SlowQueue { clock, InQueue, reactor };
+
+    auto result = std::optional<SampleOutcome> {};
+    auto task = TakeOnce(&gatherer, &clock, &pool, &queue, &result);
+    reactor.Submit(task.Native());
+    while (!result.has_value())
+        reactor.Drain();
+
+    REQUIRE(result.has_value());
+    CHECK(Unwrap(result).takenAt == start + InsideGather);
+    // And the queue delay really happened, or the case above would pass on a line that
+    // cannot tell "after the hop" from "before it".
+    CHECK(clock.Now() == start + InsideGather + InQueue);
 }
