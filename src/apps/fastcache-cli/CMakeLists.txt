@@ -26,6 +26,7 @@ set(_fc_cli_sources
     DashboardLoop.cpp
     DashboardSampler.cpp
     FleetDocument.cpp
+    LiveStats.cpp
     MemcachedClient.cpp
     NodeClient.cpp
     RespClient.cpp
@@ -81,6 +82,7 @@ if(FASTCACHED_BUILD_TESTS)
         DashboardLoop_test.cpp
         DashboardSampler_test.cpp
         FleetDocument_test.cpp
+        LiveStats_test.cpp
         MemcachedClient_test.cpp
         MemcachedVerbs_test.cpp
         NodeClient_test.cpp

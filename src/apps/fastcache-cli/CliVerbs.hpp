@@ -192,6 +192,7 @@ struct VerbContext
     INodeExchange* node { nullptr };           ///< The `0xFC` connection, or null.
     IStatsGatherer* stats { nullptr };         ///< The stats ladder, or null.
     IAdminDocument* admin { nullptr };         ///< The endpoint's admin surface, or null.
+    IEndpointIdentity* identity { nullptr };   ///< What the endpoint is, or null.
 };
 
 /// The wires, one row per enumerator, in enumerator order.

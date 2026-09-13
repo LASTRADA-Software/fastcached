@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <format>
@@ -14,6 +15,7 @@
 #include <ranges>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include <tests/Unwrap.hpp>
@@ -381,6 +383,30 @@ TEST_CASE("the live-stats modifiers are refused by name on every verb that does 
 
     // A table in which every row honoured both would check nothing and pass.
     CHECK(checked > 0);
+}
+
+TEST_CASE("live-stats is the one verb that honours the interval and sample modifiers", "[cli][command]")
+{
+    // §9.19's other half: the mechanism watched ACCEPTING. Without it a check refusing
+    // both flags on every verb would pass the derived case above -- which is exactly what
+    // the tree looked like before this row existed.
+    auto const command = Parse({ "live-stats", "--interval=2000", "--samples=3" });
+    CHECK(command.action == Action::RunVerb);
+    REQUIRE(command.verbOptions.interval.has_value());
+    CHECK(Unwrap(command.verbOptions.interval) == std::chrono::milliseconds { 2000 });
+    REQUIRE(command.verbOptions.samples.has_value());
+    CHECK(Unwrap(command.verbOptions.samples) == 3);
+
+    // With a subject named, the operand stays an operand and the modifier stays a modifier.
+    auto const named = Parse({ "live-stats", "fleet", "--interval=5000" });
+    CHECK(named.action == Action::RunVerb);
+    CHECK(named.operands == std::vector<std::string> { "fleet" });
+
+    // "Set on this row alone" (#134 §1.5) is the property, so it is counted rather than
+    // assumed: a second row honouring either bit is a verb where the flags quietly apply.
+    auto const carriers = std::ranges::count_if(
+        Verbs(), [](VerbSpec const& verb) { return (verb.modifiers & (Modifier::Interval | Modifier::Samples)) != 0; });
+    CHECK(carriers == 1);
 }
 
 TEST_CASE("a malformed interval or sample count is refused as a value rather than as an unhonoured flag", "[cli][command]")
@@ -976,12 +1002,22 @@ TEST_CASE("a wire with no verbs gets no group and a wire with one still does", "
     }
 
     // And the ACCEPTING direction from the real table rather than a synthetic one:
-    // `stats` is this tree's single-verb wire, and a grouping that dropped a group it
+    // `Stats` is this tree's SMALLEST group, and a grouping that dropped a group it
     // thought too small would lose it while every other assertion here stayed green.
+    //
+    // Its size is COUNTED from the table rather than written as a literal. This case
+    // used to say `== 1` beside a comment calling `stats` the single-verb wire, and
+    // `live-stats` is that wire's second row (#134 §1.1) -- a premise about a table's
+    // size that became false the moment the table grew, reddening a case whose property
+    // had not changed.
     auto const real = GroupVerbsByWire(Verbs());
-    auto const single = std::ranges::find(real, Wire::Stats, &VerbGroup::wire);
-    REQUIRE(single != real.end());
-    CHECK(single->verbs.size() == 1);
+    auto const smallest = std::ranges::find(real, Wire::Stats, &VerbGroup::wire);
+    REQUIRE(smallest != real.end());
+    auto const statsRows = std::ranges::count(Verbs(), Wire::Stats, &VerbSpec::wire);
+    REQUIRE(statsRows > 0);
+    CHECK(std::cmp_equal(smallest->verbs.size(), statsRows));
+    CHECK(std::ranges::all_of(real,
+                              [&smallest](VerbGroup const& group) { return group.verbs.size() >= smallest->verbs.size(); }));
 }
 
 TEST_CASE("the help prints each wire's heading above that wire's own verbs", "[cli][command][help]")
