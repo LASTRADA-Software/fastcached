@@ -630,3 +630,90 @@ TEST_CASE("a daemon still down is re-dialled once per sample and never in a loop
 
     CloseAndDrain(rig, source);
 }
+
+TEST_CASE("a node sample carries the node's status, read afresh with every sample", "[cli][live][source][status]")
+{
+    // Per sample and never remembered: a status block repeating the session's first answer is a
+    // live view of the past, so the second sample must carry the second read.
+    Rig rig;
+    auto parts = rig.Parts();
+    parts.status = &rig.status;
+    LiveEventSource source { std::move(parts) };
+    rig.Settle();
+
+    auto const first = NextDue(rig, source);
+    REQUIRE(KindOf(first) == DashboardEventKind::Sample);
+    REQUIRE(Unwrap(first).nodeStatus.has_value());
+    CHECK(Unwrap(Unwrap(first).nodeStatus).version == "read-1");
+    CHECK(KindOf(NextDue(rig, source)) == DashboardEventKind::Tick);
+
+    auto const second = NextSample(rig, source);
+    REQUIRE(KindOf(second) == DashboardEventKind::Sample);
+    REQUIRE(Unwrap(second).nodeStatus.has_value());
+    CHECK(Unwrap(Unwrap(second).nodeStatus).version == "read-2");
+    CHECK(rig.status.Reads() == 2);
+
+    CloseAndDrain(rig, source);
+}
+
+TEST_CASE("a failed node sample still carries the status read with it", "[cli][live][source][status]")
+{
+    // The model REPLACES its status with every sample taken, a failed one included, so a failure
+    // that dropped the status would blank a block the node was still answering for.
+    Rig rig;
+    ScriptedGatherer asksNothing { {} };
+    auto parts = rig.Parts();
+    parts.gatherer = &asksNothing;
+    parts.status = &rig.status;
+    LiveEventSource source { std::move(parts) };
+    rig.Settle();
+
+    auto const failed = NextDue(rig, source);
+    REQUIRE(KindOf(failed) == DashboardEventKind::SampleFailed);
+    REQUIRE(Unwrap(failed).nodeStatus.has_value());
+    CHECK(Unwrap(Unwrap(failed).nodeStatus).version == "read-1");
+
+    CloseAndDrain(rig, source);
+}
+
+TEST_CASE("a session whose samples carry no node status asks for none", "[cli][live][source][status]")
+{
+    Rig rig;
+    LiveEventSource source { rig.Parts() };
+    rig.Settle();
+
+    auto const sample = NextDue(rig, source);
+    REQUIRE(KindOf(sample) == DashboardEventKind::Sample);
+    CHECK_FALSE(Unwrap(sample).nodeStatus.has_value());
+    CHECK(rig.status.Reads() == 0);
+
+    CloseAndDrain(rig, source);
+}
+
+TEST_CASE("after a re-dial the node status is read over what the dial opened", "[cli][live][source][redial][status]")
+{
+    // The status and the counters are one connection. Re-dialled for the counters and still asking
+    // the dead connection for the status would draw a status block of gaps over a recovered session.
+    Rig rig;
+    DyingGatherer dying;
+    ScriptedDialer dialer { { true } };
+    auto parts = rig.Parts();
+    parts.gatherer = &dying;
+    parts.status = &rig.status;
+    parts.dialer = &dialer;
+    LiveEventSource source { std::move(parts) };
+    rig.Settle();
+
+    CHECK(Answered(NextDue(rig, source)));
+    CHECK(KindOf(NextDue(rig, source)) == DashboardEventKind::Tick);
+    CHECK_FALSE(Answered(NextSample(rig, source)));
+
+    auto const over = NextSample(rig, source);
+    CHECK(Answered(over));
+    CHECK(dialer.Dials() == 1);
+    REQUIRE((over.has_value() && over->nodeStatus.has_value()));
+    CHECK(Unwrap(Unwrap(over).nodeStatus).version == "dialled-1");
+    CHECK(rig.status.Reads() == 2);
+
+    CloseAndDrain(rig, source);
+}
