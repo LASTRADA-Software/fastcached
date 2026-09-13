@@ -48,18 +48,6 @@ namespace FastCache::Cli
 /// @return A record; its field names become the header the first time.
 using FigureProjection = Value (*)(DashboardModel const& model);
 
-/// The machine name a piped stream gives a panel figure, derived from what the panel labels it.
-///
-/// **Derived, rather than a second name written beside every label**, so a stream cannot name one
-/// figure while the panel draws another in the same row. ASCII letters are lowered and digits
-/// kept, `/` reads as the word `per`, every other run of characters separates two words by one `_`,
-/// and nothing leads or trails: `ops/sec` is `ops_per_sec`, `no-slot/min` is `no_slot_per_min`. A
-/// label of nothing but punctuation has an empty key. Relabelling a row is therefore a change to
-/// what a script reads, which is why the cache and node headers are pinned by a test.
-/// @param label The panel's words.
-/// @return The key.
-[[nodiscard]] std::string FigureKey(std::string_view label);
-
 /// Every figure @p panel draws, as one record: what a piped row of that panel reports.
 ///
 /// **Through the panel's own table and its own computation**, so a piped header names exactly the
@@ -70,10 +58,11 @@ using FigureProjection = Value (*)(DashboardModel const& model);
 /// before a rate has two readings, beside a gap, for a field the source does not carry -- and never
 /// zero in its place.
 ///
-/// Fields in panel order: `source`, then each rate row followed by the figures beside it (keyed
-/// `<row> <before> <after>`), then each level row followed by its limit (`<row> limit`). A level
-/// row naming no field exists to say why there is nothing to draw, and has no field here. The tier
-/// block is not streamed: which tiers a reading carries is not known when the header is written.
+/// Fields in panel order, each named by the row's own machine `key` -- never by its label, which is
+/// worded for the screen: `source`, then each rate row followed by the figures beside it, then each
+/// level row followed by its limit (`limitKey`). A level row naming no field exists to say why there
+/// is nothing to draw, and has no field here. The tier block is not streamed: which tiers a reading
+/// carries is not known when the header is written.
 /// @param panel The panel.
 /// @param model What is known.
 /// @return The record.
