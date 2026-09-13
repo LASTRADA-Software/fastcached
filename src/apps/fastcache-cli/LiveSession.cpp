@@ -315,11 +315,6 @@ SessionEnding RunLiveStatsSession(VerbContext const& context, LiveSessionSeat co
             Concluded(Outcome::Unreachable, std::string { WireTable[static_cast<std::size_t>(Wire::Node)].unavailable }));
     if (!subject.document.empty() && context.admin == nullptr)
         return RefusedEnding(Concluded(Outcome::Usage, std::string { NoAdminSurface }));
-    if (subject.reader == nullptr)
-        return RefusedEnding(Concluded(Outcome::Local,
-                                       std::format("live-stats {} cannot stream from this build: its sessions do not "
-                                                   "sample the leader's admin document yet",
-                                                   subject.key)));
 
     auto const endpoint = plan->endpoint;
     auto parts = LiveSessionParts {
