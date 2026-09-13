@@ -11,6 +11,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <tui/InputEvent.hpp>
@@ -62,6 +63,51 @@ namespace FastCache::Cli
 [[nodiscard]] SixelAnswer ToSixelAnswer(
     std::expected<tui::DeviceAttributesReport, tui::QueryUnanswered> const& attributes) noexcept;
 
+/// What endo's DECRQM answer for mode 2026 says about synchronized output.
+///
+/// Recognised and switchable -- set or reset -- is `Supported`. Not recognised, or permanently set
+/// or reset, is `NotSupported`: a mode that cannot be switched is not one a frame can bracket. A
+/// platform arm that cannot send the query is `NotAsked`, as is a terminal with no input to read.
+/// @param status The DECRQM answer.
+/// @return The answer.
+[[nodiscard]] SynchronizedOutputAnswer ToSynchronizedOutputAnswer(tui::DecModeStatus status) noexcept;
+
+/// The bytes presentation is spelled with, composed once.
+///
+/// **Spelled by endo, not here.** Each is captured from endo's own `TerminalOutput` -- its
+/// `enterAltScreen`, `hideCursor`, `moveTo`, `clearToEndOfDisplay` -- through the
+/// `writeToDestination` hook it provides for exactly that, so no sequence endo already writes is
+/// restated in this project. The two exceptions are synchronized output's begin and end: endo
+/// writes those only from inside `SyncGuard`, straight to a native handle, so there is nothing to
+/// capture, and they are spelled once in `TerminalEventStream.cpp`.
+struct TerminalScreenBytes
+{
+    std::string enter;      ///< Enter the alternate screen, then hide the cursor.
+    std::string leave;      ///< Show the cursor, then leave the alternate screen.
+    std::string home;       ///< Move the cursor to the top-left cell.
+    std::string clearBelow; ///< Clear from the cursor to the end of the screen.
+    std::string syncBegin;  ///< Begin synchronized output (DEC mode 2026).
+    std::string syncEnd;    ///< End synchronized output.
+};
+
+/// @return The bytes, composed on first use.
+[[nodiscard]] TerminalScreenBytes const& ScreenBytes();
+
+/// Whether a frame for a terminal with @p capabilities is bracketed in synchronized output.
+///
+/// The one guard between a DECRQM answer and a `CSI ? 2026 h` on the wire: only a terminal that
+/// answered `Supported` gets one, so a terminal that never answered is drawn unsynchronized and
+/// nothing waits on it.
+/// @param capabilities The record the start produced.
+/// @return True for `SynchronizedOutputAnswer::Supported` alone.
+[[nodiscard]] bool PresentsSynchronized(TerminalCapabilities const& capabilities) noexcept;
+
+/// One frame as it goes on the wire: home, the frame, clear below, optionally bracketed.
+/// @param frame The composed frame.
+/// @param synchronized Whether to bracket it in synchronized output.
+/// @return The bytes.
+[[nodiscard]] std::string FrameBytes(std::string_view frame, bool synchronized);
+
 /// What a terminal event stream is built from.
 struct TerminalStreamParts
 {
@@ -84,6 +130,12 @@ struct TerminalStreamParts
 /// Its first event is a `Resize` carrying the geometry at open. Each later `Next()` hops to the
 /// pool, waits there for readiness, hops back and delivers what the wait produced, one event
 /// per call. After `Close()` or the end of input it answers `Detached`, and keeps answering it.
+///
+/// **Resizes coalesce.** A resize that arrives while the last event still waiting to be read is a
+/// resize REPLACES it, so a window being dragged -- dozens of geometry changes -- queues one frame's
+/// worth rather than dozens, and what is delivered is the latest geometry. A resize separated from
+/// an earlier one by any other event is delivered separately, so the order of keys and resizes is
+/// kept.
 ///
 /// **Lifetime.** A `Next()` parked in the wait holds the stream. Close it and let that `Next()`
 /// resume before destroying the stream, which is the order `RunDashboard` already follows.
@@ -116,6 +168,11 @@ class ITerminalDevice
     /// @return The answer, `NoReply` included.
     [[nodiscard]] virtual SixelAnswer AskSixel() = 0;
 
+    /// Ask the acquired terminal whether it supports synchronized output (DECRQM for mode 2026).
+    /// BLOCKS; called on the pool.
+    /// @return The answer, `NoReply` included.
+    [[nodiscard]] virtual SynchronizedOutputAnswer AskSynchronizedOutput() = 0;
+
     /// @return What the environment says the terminal draws. Called on the pool.
     [[nodiscard]] virtual TerminalTextEncoding Encoding() = 0;
 
@@ -129,25 +186,34 @@ class ITerminalDevice
     /// Wake a wait parked in `Events()`. Callable from any thread.
     virtual void Wake() = 0;
 
+    /// Write @p bytes to the terminal, now. On the pool while starting, and on the thread that
+    /// awaits the events after that.
+    /// @param bytes The bytes.
+    virtual void Write(std::string_view bytes) noexcept = 0;
+
     /// Put back whatever `Acquire` changed, however far it got. Idempotent. Called on the thread
     /// that owns the events, once nothing waits in `Events()`.
     virtual void Restore() noexcept = 0;
 
     /// Put the terminal's modes back NOW, from any thread, while a wait in `Events()` may be parked.
     ///
-    /// Touches process-wide terminal state and the output handle only, never anything `Events()`
-    /// reads. Reached through `StartedTerminal::restore`, which calls it at most once and never
-    /// after the device's teardown has begun.
-    virtual void RestoreNow() noexcept = 0;
+    /// Writes @p leading first -- the screen's own resets, which the caller composes -- then the
+    /// input's, then puts the modes back. Touches process-wide terminal state and the output
+    /// handle only, never anything `Events()` reads. Reached through `StartedTerminal::restore`,
+    /// which calls it at most once and never after the device's teardown has begun.
+    /// @param leading Bytes to write before the input's resets.
+    virtual void RestoreNow(std::string_view leading) noexcept = 0;
 };
 
-/// `StartTerminal` over any device: the two-hop, the restore guard and the record.
+/// `StartTerminal` over any device: the two-hop, the restore guard, the screen and the record.
 ///
-/// Hops to @p pool, acquires the device and asks it for Sixel and the encoding, hops back to
-/// @p resumeOn and only then returns. On every exit but success -- a refused acquisition, or an
-/// exception after the terminal was already in raw mode -- the device is restored before the result
-/// is handed back. On success the device moves into the returned events, which restore it when they
-/// are destroyed.
+/// Hops to @p pool, acquires the device, asks it for Sixel and synchronized output, enters the
+/// alternate screen, reads the encoding, hops back to @p resumeOn and only then returns. On every
+/// exit but success -- a refused acquisition, or an exception after the terminal was already in raw
+/// mode or on the alternate screen -- the screen is left if it was entered and the device is
+/// restored, before the result is handed back. On success the device is shared by the returned
+/// events, which leave the screen and restore the device when they are destroyed, and the frame
+/// presenter.
 /// @param device The device to start; consumed.
 /// @param pool Where the blocking steps run.
 /// @param resumeOn Where the start and the events resume.
