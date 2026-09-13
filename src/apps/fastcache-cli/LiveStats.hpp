@@ -61,6 +61,14 @@ struct LiveSubjectSpec
     /// them. Naming the subject is how the operator says which question they are asking.
     bool inferrable;
 
+    /// Whether each of this subject's samples carries what the node says about itself now.
+    ///
+    /// **True for `node` alone**: its panel draws the node's version, uptime, toolchains and slots
+    /// from `DashboardEvent::nodeStatus`, asked afresh with every sample. A cache daemon has no
+    /// `NodeStatus` to ask, and `fleet`'s status is the leader's document. Beside `inferrable`, so
+    /// the two flags share one run of padding.
+    bool readsNodeStatus;
+
     /// What an endpoint must turn out to be to serve this subject.
     ///
     /// **Inference is DERIVED from this column rather than written beside it**: an
@@ -126,6 +134,7 @@ inline constexpr EnumTable<LiveSubject, LiveSubjectSpec> LiveSubjectTable { {
     { .subject = LiveSubject::Cache,
       .key = "cache",
       .inferrable = true,
+      .readsNodeStatus = false,
       .servedBy = RemoteKind::FastcacheWireOnly,
       .needs = "a cache daemon",
       .minInterval = std::chrono::milliseconds { 1000 },
@@ -137,6 +146,7 @@ inline constexpr EnumTable<LiveSubject, LiveSubjectSpec> LiveSubjectTable { {
     { .subject = LiveSubject::Node,
       .key = "node",
       .inferrable = true,
+      .readsNodeStatus = true,
       .servedBy = RemoteKind::CompileNode,
       .needs = "a fastcache-compile-node",
       .minInterval = std::chrono::milliseconds { 1000 },
@@ -148,6 +158,7 @@ inline constexpr EnumTable<LiveSubject, LiveSubjectSpec> LiveSubjectTable { {
     { .subject = LiveSubject::Fleet,
       .key = "fleet",
       .inferrable = false,
+      .readsNodeStatus = false,
       .servedBy = RemoteKind::CompileNode,
       .needs = "a fastcache-compile-node (the fleet page is served by the one that leads)",
       .minInterval = std::chrono::milliseconds { 2000 },

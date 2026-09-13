@@ -3,6 +3,7 @@
 
 #include "DashboardEvent.hpp"
 #include "DashboardLoop.hpp"
+#include "NodeClient.hpp"
 #include "StatsSource.hpp"
 
 #include <FastCache/Async/IExecutor.hpp>
@@ -31,6 +32,15 @@ namespace FastCache::Cli
 /// another, which is the property a dashboard that must answer `q` during a slow scrape
 /// exists to have.
 
+/// What one dial opened: the stats ladder, and the node's own status, over the same new connections.
+///
+/// One object for both, because they are one connection: a re-dial that replaced the ladder and
+/// went on asking the dead connection for the status would draw a status block of gaps over a
+/// session that had recovered.
+class IDialedStats: public IStatsGatherer, public INodeStatusReader
+{
+};
+
 /// Opens fresh connections to the endpoint, and a gatherer over them.
 ///
 /// **What lets a session survive the daemon restarting under it** (#134 §6.4). A gatherer is
@@ -49,9 +59,10 @@ class IStatsDialer
     virtual ~IStatsDialer() = default;
 
     /// Dial again. Runs where a gather runs, on the pool.
-    /// @return A gatherer over new connections; never null. One whose connections could not be
-    ///         opened says so from `Gather()`, as a gatherer built at startup does.
-    [[nodiscard]] virtual std::unique_ptr<IStatsGatherer> Dial() = 0;
+    /// @return A gatherer over new connections, which reads the node's status over them too; never
+    ///         null. One whose connections could not be opened says so from `Gather()`, as a
+    ///         gatherer built at startup does.
+    [[nodiscard]] virtual std::unique_ptr<IDialedStats> Dial() = 0;
 };
 
 /// What a `LiveEventSource` is built from.
@@ -71,6 +82,14 @@ struct LiveSourceParts
     /// What the first sample asks, and every one after it until a sample fails; unread by a
     /// source that samples a `document`.
     IStatsGatherer* gatherer { nullptr };
+
+    /// What each sample asks for the node's own status, beside `gatherer` and until a sample fails;
+    /// null for a session whose samples carry none.
+    ///
+    /// Read in the same hop as the counters, right after them, and carried on the event as
+    /// `DashboardEvent::nodeStatus` -- a `SampleFailed` included. After a re-dial it is asked of what
+    /// the dial opened, never of the connection that failed.
+    INodeStatusReader* status { nullptr };
 
     /// The admin surface a document sample fetches from; null where nothing samples a document.
     IAdminDocument* admin { nullptr };
