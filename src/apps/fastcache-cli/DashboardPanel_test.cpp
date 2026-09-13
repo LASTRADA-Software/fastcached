@@ -1175,3 +1175,70 @@ TEST_CASE("every unit a leader's headline figures carry is one the fleet panel k
     }
     CHECK(checked == kpi->rows.size());
 }
+
+namespace
+{
+
+/// How many times `CountedFleetParse` has run. Reset by the case that reads it.
+std::size_t fleetParses = 0;
+
+/// `ParseFleetDocument`, counted.
+/// @param document The text.
+/// @return The parse.
+[[nodiscard]] std::expected<FleetDocument, std::string> CountedFleetParse(std::string_view document)
+{
+    ++fleetParses;
+    return ParseFleetDocument(document);
+}
+
+/// The fleet reader, parsing through the counter.
+/// @param event The sample.
+/// @return The reading.
+[[nodiscard]] SampleReading CountedFleetReader(DashboardEvent const& event)
+{
+    return ReadFleetSampleThrough(event, &CountedFleetParse);
+}
+
+/// The panel and the piped record together, drawn from one model: every drawer a fleet session has.
+class EveryFleetDrawer final: public IDashboardView
+{
+  public:
+    [[nodiscard]] std::string Frame(DashboardModel const& model) override
+    {
+        auto frame = panel.Frame(model);
+        records += FleetKpiFigures(model).fields.size();
+        return frame;
+    }
+
+    PanelView panel { FleetPanel(),
+                      PanelContext {
+                          .absent = std::string { Absent }, .cellWidth = &FakeCellWidth, .rung = RenderRung::Unicode } };
+    std::size_t records { 0 };
+};
+
+} // namespace
+
+TEST_CASE("a fleet session parses each sample once, however many frames and records draw it",
+          "[cli][dashboard][panel][fleet]")
+{
+    // WHAT DISTINGUISHES: two frames are owed per sample here, and each frame draws both the panel and
+    // the piped record -- so a drawer that parsed the document itself would add parses per FRAME, and
+    // the count would be a multiple of the samples rather than the samples.
+    constexpr auto Samples = 4;
+    auto script = std::vector<DashboardEvent> {};
+    for (auto const second: std::views::iota(1, Samples + 1))
+    {
+        script.push_back(FleetSampleOf(second, FleetText(3)));
+        script.push_back(Tick);
+        script.push_back(Tick);
+    }
+
+    fleetParses = 0;
+    auto view = EveryFleetDrawer {};
+    auto sink = CollectingSink {};
+    (void) Drive(std::move(script), DashboardLimits {}, view, sink, &CountedFleetReader);
+    REQUIRE(sink.frames.size() == static_cast<std::size_t>(2 * Samples));
+    CHECK(LinesStarting(sink.frames.back(), "build-") == 3); // the frames drew the document
+    CHECK(view.records > 0);
+    CHECK(fleetParses == static_cast<std::size_t>(Samples));
+}
