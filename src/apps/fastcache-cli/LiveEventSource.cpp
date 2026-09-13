@@ -7,6 +7,7 @@
 #include <FastCache/Async/SleepUntil.hpp>
 
 #include <algorithm>
+#include <cassert>
 #include <coroutine>
 #include <cstddef>
 #include <utility>
@@ -19,27 +20,21 @@ namespace FastCache::Cli
 ///
 /// Every member is read and written on the reactor's thread only -- the producers resume
 /// there before touching any of it, and `LiveSourceParts::reactor` states the same of the
-/// caller -- which is why the flags are plain rather than atomic.
+/// caller -- which is why the handle and the count are plain rather than atomic.
 struct LiveEventSource::State
 {
-    explicit State(LiveSourceParts parts):
-        reactor { parts.reactor },
-        gatherer { parts.gatherer },
-        pool { parts.pool },
-        interval { parts.interval },
-        terminal { std::move(parts.terminal) },
+    explicit State(LiveSourceParts from):
+        parts { std::move(from) },
         events { *parts.reactor, AsyncQueueOptions {} },
         finished { *parts.reactor, AsyncQueueOptions {} }
     {
     }
 
-    IReactor* reactor;
-    IStatsGatherer* gatherer;
-    IExecutor* pool;
-    std::chrono::milliseconds interval;
-    std::unique_ptr<IDashboardEventSource> terminal;
+    /// What the source was built from, held whole. Declared first: both queues are
+    /// constructed from its reactor.
+    LiveSourceParts parts;
 
-    /// What `Next()` hands out.
+    /// What `Next()` hands out, and whether the session is closed: only `Close()` closes it.
     ///
     /// **Unbounded, because every producer is self-limiting and a drop would be a lie.**
     /// The cadence waits for one sample before starting the next, and the forwarder awaits
@@ -55,15 +50,23 @@ struct LiveEventSource::State
     /// this tree's one way to park a coroutine until something else says so.
     AsyncQueue<std::monostate> finished;
 
-    /// The cadence coroutine's own frame, so `Close()` can take it off the timer heap.
+    /// The cadence coroutine's own frame while it runs, so `Close()` can retract it; empty
+    /// once it has ended.
+    ///
+    /// No flag says *parked between samples*, because `CancelPending` already answers it:
+    /// during a sample the frame on a queue is `TakeSample`'s, not this one, so a retraction
+    /// then finds nothing -- the `DeadlineTimer` shape, where a live handle means only
+    /// *may be parked*.
     std::coroutine_handle<> cadence {};
 
-    /// Whether `cadence` is parked between samples right now -- the only moment it is on
-    /// the timer heap, and so the only moment `CancelPending` can retract it.
-    bool sleeping { false };
-
-    bool closed { false };
     int producers { 0 };
+
+    /// Whether the session is closed.
+    /// @return True once `Close()` has run.
+    [[nodiscard]] bool Closed() const noexcept
+    {
+        return events.IsClosed();
+    }
 
     /// Queue @p event for `Next()`.
     /// @param event What happened.
@@ -115,25 +118,25 @@ namespace
     DetachedTask RunCadence(std::shared_ptr<LiveEventSource::State> shared)
     {
         co_await CaptureHandle { &shared->cadence };
-        co_await ResumeOn { *shared->reactor };
+        auto const& parts = shared->parts;
+        co_await ResumeOn { *parts.reactor };
 
-        auto deadline = shared->reactor->Clock().Now();
-        while (!shared->closed)
+        auto deadline = parts.reactor->Clock().Now();
+        while (!shared->Closed())
         {
-            auto sample = co_await TakeSample(shared->gatherer, shared->pool, shared->reactor);
+            auto sample = co_await TakeSample(parts.gatherer, parts.pool, parts.reactor);
             // Closed while the gather was on the pool: nobody is listening, and the reading
             // describes a session that has already ended.
-            if (shared->closed)
+            if (shared->Closed())
                 break;
 
             shared->Deliver(DashboardEvent { .kind = DashboardEventKind::Sample, .attempts = std::move(sample.attempts) });
             shared->Deliver(DashboardEvent { .kind = DashboardEventKind::Tick });
 
-            deadline = std::max(deadline + shared->interval, shared->reactor->Clock().Now());
-            shared->sleeping = true;
-            co_await SleepUntil { .reactor = shared->reactor, .deadline = deadline };
-            shared->sleeping = false;
+            deadline = std::max(deadline + parts.interval, parts.reactor->Clock().Now());
+            co_await SleepUntil { .reactor = parts.reactor, .deadline = deadline };
         }
+        shared->cadence = {};
         shared->ProducerEnded();
     }
 
@@ -141,21 +144,21 @@ namespace
     /// @param shared The source's state; held so it outlives the source if need be.
     DetachedTask RunTerminal(std::shared_ptr<LiveEventSource::State> shared)
     {
-        co_await ResumeOn { *shared->reactor };
+        co_await ResumeOn { *shared->parts.reactor };
 
-        while (!shared->closed)
+        while (!shared->Closed())
         {
-            auto event = co_await shared->terminal->Next();
+            auto event = co_await shared->parts.terminal->Next();
             // Closed while the read was outstanding: this is the `Detached` that `Close()`
             // asked the terminal for, not news for the loop.
-            if (shared->closed)
+            if (shared->Closed())
                 break;
 
             auto const kind = event.kind;
             shared->Deliver(std::move(event));
 
-            // A terminal that has gone has nothing left to show a frame on, so its
-            // `Detached` ends the session: delivered, and nothing more read.
+            // A terminal that has gone has nothing more to read. Its `Detached` is delivered
+            // like any other event, and what it means for the session is the loop's call.
             if (kind == DashboardEventKind::Detached)
                 break;
             if (kind == DashboardEventKind::Resize)
@@ -168,9 +171,14 @@ namespace
 LiveEventSource::LiveEventSource(LiveSourceParts parts):
     _state { std::make_shared<State>(std::move(parts)) }
 {
+    // Zero would make every deadline `now`, and the cadence would gather back to back --
+    // never blocking the reactor, and never letting the endpoint rest either. Admission
+    // refuses anything below a subject's floor, so this is a caller's mistake, not input.
+    assert(_state->parts.interval > std::chrono::milliseconds::zero());
+
     ++_state->producers;
     RunCadence(_state);
-    if (_state->terminal != nullptr)
+    if (_state->parts.terminal != nullptr)
     {
         ++_state->producers;
         RunTerminal(_state);
@@ -194,21 +202,19 @@ Task<DashboardEvent> LiveEventSource::Next()
 void LiveEventSource::Close() noexcept
 {
     auto& state = *_state;
-    if (state.closed)
+    if (state.Closed())
         return;
-    state.closed = true;
     state.events.Close();
-    if (state.terminal != nullptr)
-        state.terminal->Close();
+    if (state.parts.terminal != nullptr)
+        state.parts.terminal->Close();
 
-    // A cadence between samples is on the timer heap until its deadline -- a whole
-    // interval, five seconds for `fleet` -- and `Drained()` would wait that out for
-    // nothing. Retracted, it is freed here, and its end is counted here because the code
-    // after its `co_await` will never run.
-    if (state.sleeping && state.reactor->CancelPending(state.cadence))
+    // A cadence between samples is on the timer heap until its deadline, a whole interval,
+    // and `Drained()` would wait that out for nothing. Retracted, it is freed here, and its
+    // end is counted here because the code after its `co_await` will never run.
+    if (auto const handle = state.cadence; handle && state.parts.reactor->CancelPending(handle))
     {
-        state.sleeping = false;
-        state.cadence.destroy();
+        state.cadence = {};
+        handle.destroy();
         state.ProducerEnded();
     }
 }
@@ -217,8 +223,7 @@ Task<void> LiveEventSource::Drained()
 {
     auto const state = _state;
     // Nothing is ever pushed, so this resumes exactly when the last producer closes it.
-    auto const ended = co_await state->finished.Pop();
-    static_cast<void>(ended);
+    (void) co_await state->finished.Pop();
 }
 
 } // namespace FastCache::Cli
