@@ -48,41 +48,7 @@ namespace
     {
         out.append(count, ' ');
     }
-} // namespace
 
-std::string FigureKey(std::string_view label)
-{
-    auto key = std::string {};
-    // A word ended since the last character was written, so the next one written starts a new word.
-    auto separate = false;
-    for (auto const ch: label)
-    {
-        auto const lowered = ch >= 'A' && ch <= 'Z' ? static_cast<char>(ch - 'A' + 'a') : ch;
-        if ((lowered >= 'a' && lowered <= 'z') || (lowered >= '0' && lowered <= '9'))
-        {
-            if (separate && !key.empty())
-                key += '_';
-            separate = false;
-            key += lowered;
-        }
-        else if (ch == '/')
-        {
-            // The word `per`, a word of its own on both sides.
-            if (!key.empty())
-                key += '_';
-            key += "per";
-            separate = true;
-        }
-        else
-        {
-            separate = true;
-        }
-    }
-    return key;
-}
-
-namespace
-{
     /// How one figure format is written for a program rather than a person.
     struct RawFigureRow
     {
@@ -142,19 +108,18 @@ Value PanelFigures(PanelSpec const& panel, DashboardModel const& model)
 
     for (auto const& row: panel.rates)
     {
-        fields.push_back(Field { .name = FigureKey(row.label), .value = NewestCell(row.figure, model, origin) });
+        fields.push_back(Field { .name = std::string { row.key }, .value = NewestCell(row.figure, model, origin) });
         for (auto const& beside: row.beside)
-            fields.push_back(Field { .name = FigureKey(std::format("{} {} {}", row.label, beside.before, beside.after)),
-                                     .value = NewestCell(beside.figure, model, origin) });
+            fields.push_back(
+                Field { .name = std::string { beside.key }, .value = NewestCell(beside.figure, model, origin) });
     }
     for (auto const& row: panel.levels)
     {
         if (!NamesAnything(row.value.field))
             continue;
-        fields.push_back(Field { .name = FigureKey(row.label), .value = NewestCell(row.value, model, origin) });
+        fields.push_back(Field { .name = std::string { row.key }, .value = NewestCell(row.value, model, origin) });
         if (row.limit.has_value())
-            fields.push_back(Field { .name = FigureKey(std::format("{} limit", row.label)),
-                                     .value = NewestCell(*row.limit, model, origin) });
+            fields.push_back(Field { .name = std::string { row.limitKey }, .value = NewestCell(*row.limit, model, origin) });
     }
     return RecordValue(std::move(fields));
 }
