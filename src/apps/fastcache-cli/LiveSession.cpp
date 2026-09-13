@@ -100,6 +100,7 @@ Task<std::expected<LiveSessionRun, Answer>> RunComposedSession(LiveSessionParts 
     auto const& subject = LiveSubjectTable[static_cast<std::size_t>(parts.plan.subject)];
     auto sourceParts = LiveSourceParts { .reactor = parts.reactor,
                                          .gatherer = parts.gatherer,
+                                         .status = subject.readsNodeStatus ? parts.status : nullptr,
                                          .admin = parts.admin,
                                          .document = std::string { subject.document },
                                          .dialer = parts.dialer,
@@ -240,6 +241,9 @@ SessionEnding RunLiveStatsSession(VerbContext const& context, LiveSessionSeat co
     if (subject.document.empty() && context.stats == nullptr)
         return RefusedEnding(
             Concluded(Outcome::Unreachable, std::string { WireTable[static_cast<std::size_t>(Wire::Stats)].unavailable }));
+    if (subject.readsNodeStatus && context.nodeStatus == nullptr)
+        return RefusedEnding(
+            Concluded(Outcome::Unreachable, std::string { WireTable[static_cast<std::size_t>(Wire::Node)].unavailable }));
     if (!subject.document.empty() && context.admin == nullptr)
         return RefusedEnding(Concluded(Outcome::Usage, std::string { NoAdminSurface }));
     if (subject.reader == nullptr)
@@ -254,6 +258,7 @@ SessionEnding RunLiveStatsSession(VerbContext const& context, LiveSessionSeat co
         .address = seat.address,
         .reactor = seat.reactor,
         .gatherer = context.stats,
+        .status = context.nodeStatus,
         .admin = context.admin,
         .dialer = seat.dialer,
         .reader = subject.reader,

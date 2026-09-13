@@ -16,13 +16,16 @@
 #include <FastCache/Async/AsyncQueue.hpp>
 #include <FastCache/Async/TestReactor.hpp>
 #include <FastCache/Core/Clock.hpp>
+#include <FastCache/Protocol/CompileCacheWire.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <expected>
+#include <format>
 #include <memory>
 #include <optional>
 #include <string>
@@ -76,6 +79,64 @@ class DyingGatherer final: public IStatsGatherer
     int _calls { 0 };
 };
 
+/// A node status naming @p version, which is all these cases tell statuses apart by.
+/// @param version The version it names.
+/// @return The status.
+[[nodiscard]] inline CompileCacheWire::NodeStatusFields NodeStatusNamed(std::string version)
+{
+    auto status = CompileCacheWire::NodeStatusFields {};
+    status.version = std::move(version);
+    return status;
+}
+
+/// A node that answers every status read with a status naming the read: `read-1`, `read-2`, ...
+///
+/// Numbered so a case can tell a status read with THIS sample from one remembered from an earlier.
+class CountingNodeStatus final: public INodeStatusReader
+{
+  public:
+    [[nodiscard]] std::optional<CompileCacheWire::NodeStatusFields> ReadNodeStatus() override
+    {
+        return NodeStatusNamed(std::format("read-{}", ++_reads));
+    }
+
+    /// @return How many statuses were read.
+    [[nodiscard]] int Reads() const noexcept
+    {
+        return _reads.load();
+    }
+
+  private:
+    std::atomic<int> _reads { 0 };
+};
+
+/// What one scripted dial opened: fixed attempts, and a status naming the dial.
+class ScriptedDialed final: public IDialedStats
+{
+  public:
+    /// @param attempts What every gather reports.
+    /// @param name What every status read's version says.
+    ScriptedDialed(std::vector<StatsAttempt> attempts, std::string name):
+        _attempts { std::move(attempts) },
+        _name { std::move(name) }
+    {
+    }
+
+    [[nodiscard]] std::vector<StatsAttempt> Gather() override
+    {
+        return _attempts;
+    }
+
+    [[nodiscard]] std::optional<CompileCacheWire::NodeStatusFields> ReadNodeStatus() override
+    {
+        return NodeStatusNamed(_name);
+    }
+
+  private:
+    std::vector<StatsAttempt> _attempts;
+    std::string _name;
+};
+
 /// Dials gatherers from a script, counting the dials.
 class ScriptedDialer final: public IStatsDialer
 {
@@ -86,11 +147,11 @@ class ScriptedDialer final: public IStatsDialer
     {
     }
 
-    [[nodiscard]] std::unique_ptr<IStatsGatherer> Dial() override
+    [[nodiscard]] std::unique_ptr<IDialedStats> Dial() override
     {
         auto const answers = _answers[std::min(_dials, _answers.size() - 1)];
         ++_dials;
-        return std::make_unique<ScriptedGatherer>(answers ? Reading() : NothingAnswered());
+        return std::make_unique<ScriptedDialed>(answers ? Reading() : NothingAnswered(), std::format("dialled-{}", _dials));
     }
 
     /// @return How many dials were made.
@@ -277,6 +338,7 @@ struct Rig
     TestReactor pool { clock };
     TestReactor stopWaiter { clock };
     ScriptedGatherer gatherer { Reading() };
+    CountingNodeStatus status {};
     CountView view {};
     CountSink sink {};
 
@@ -300,6 +362,7 @@ struct Rig
     {
         return LiveSourceParts { .reactor = &reactor,
                                  .gatherer = &gatherer,
+                                 .status = nullptr,
                                  .admin = nullptr,
                                  .document = {},
                                  .dialer = nullptr,
