@@ -5,6 +5,7 @@
 #include "CliVerbs.hpp"
 #include "DashboardLoop.hpp"
 #include "DashboardPanels.hpp"
+#include "FleetReading.hpp"
 #include "LivePipedView.hpp"
 #include "NodeClient.hpp"
 
@@ -106,9 +107,9 @@ struct LiveSubjectSpec
 
     /// What one of this subject's samples reads as: the reader its session's loop is given.
     ///
-    /// **Null for `fleet` until its reader's shape is settled.** Its samples arrive as the leader's
-    /// whole document, and a composition refuses a null reader by name rather than streaming a
-    /// document nothing reads.
+    /// Never null (`EverySubjectHasAReader`): a subject a session could be admitted for and then not
+    /// read would be a refusal written as a missing row. `fleet`'s is `ReadFleetSample`, over the
+    /// leader's whole document.
     SampleReader reader;
 
     /// The admin document one sample fetches, or empty for a subject sampled through the stats
@@ -132,8 +133,8 @@ struct LiveSubjectSpec
     /// What a piped session of this subject streams per sample, or null where this build has nothing.
     ///
     /// The panel's own figures for `cache` and `node` (`PanelFigures`), so a piped header names what
-    /// an interactive run draws. Null for `fleet`, whose record is the leader's KPI section and
-    /// arrives with its reader; a null projection refuses a piped session by name.
+    /// an interactive run draws, and the leader's KPI section for `fleet` (`FleetKpiFigures`). A null
+    /// projection refuses a piped session by name.
     FigureProjection figures;
 };
 
@@ -175,10 +176,10 @@ inline constexpr EnumTable<LiveSubject, LiveSubjectSpec> LiveSubjectTable { {
       .defaultInterval = std::chrono::milliseconds { 5000 },
       .costsWhom = "each sample makes the LEADER render every fleet section for the whole fleet, "
                    "once per watcher",
-      .reader = nullptr,
+      .reader = &ReadFleetSample,
       .document = "/fleet.txt",
       .panel = nullptr,
-      .figures = nullptr },
+      .figures = &FleetKpiFigures },
 } };
 
 static_assert(RowsInEnumeratorOrder(LiveSubjectTable, &LiveSubjectSpec::subject),
@@ -204,6 +205,16 @@ static_assert(RowsInEnumeratorOrder(LiveSubjectTable, &LiveSubjectSpec::subject)
 
 static_assert(EveryKindInfersAtMostOneSubject(LiveSubjectTable),
               "two inferrable live-stats subjects are served by one RemoteKind, so inference would be ambiguous");
+
+/// Whether every subject names the reader its samples are read with.
+/// @param table The subject table.
+/// @return True when no row's reader is null.
+[[nodiscard]] consteval bool EverySubjectHasAReader(EnumTable<LiveSubject, LiveSubjectSpec> const& table) noexcept
+{
+    return std::ranges::all_of(table, [](LiveSubjectSpec const& row) { return row.reader != nullptr; });
+}
+
+static_assert(EverySubjectHasAReader(LiveSubjectTable), "every live-stats subject needs a reader for its samples");
 
 /// Whether every subject's default is at or above its own floor.
 ///
