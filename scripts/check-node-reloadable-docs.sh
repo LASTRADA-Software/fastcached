@@ -48,6 +48,12 @@
 
 set -uo pipefail
 
+# Which files are third-party, asked of the tree being checked (#1370). An upstream file
+# cannot declare a subject of THIS project's, whatever text it happens to carry.
+# shellcheck source=lib/third-party-roots.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/third-party-roots.sh" \
+    || { echo "FAIL node-reloadable-docs: cannot read scripts/lib/third-party-roots.sh" >&2; exit 1; }
+
 # The markers that DEFINE the artefact set. Spelled once each: they are what the scan
 # searches for, what the refusal names, and what a new artefact would have to adopt.
 # The SUBJECT marker: which binary's option table an artefact is describing.
@@ -252,9 +258,17 @@ check_tree() {
     [[ -n "$truth" ]] || refuse "the option table yielded no Reloadable::Yes row with a yamlKey; the scan has stopped matching, so a clean result would describe a table it never read"
     truthCount="$(printf '%s\n' "$truth" | wc -l | tr -d ' ')"
 
-    # Scope: every tracked file that DECLARES this subject.
-    local declaring subject mine=""
-    declaring="$(files_carrying "$root" "$SubjectMarker")"
+    # Scope: every tracked file that DECLARES this subject -- and is this project's own.
+    # A vendored file carrying the marker is declined BY NAME rather than read: refused, an
+    # upstream sync reddens a check about our documentation; read, it is a claim about our
+    # binary written by somebody else.
+    local declaring subject mine="" carrying declined
+    carrying="$(files_carrying "$root" "$SubjectMarker")"
+    declaring="$(first_party_paths "$root" "$carrying")" \
+        || refuse "the third-party roots of ${root} could not be read (the reader says why above), so a vendored file carrying '${SubjectMarker}' cannot be told from a first-party artefact"
+    declined="$(third_party_paths "$root" "$carrying")"
+    [[ -z "$declined" ]] \
+        || echo "node-reloadable-docs: $(third_party_declined_summary "file(s) carrying '${SubjectMarker}'" "$declined")"
     [[ -n "$declaring" ]] || refuse "no tracked file carries '${SubjectMarker}'; the artefacts that state a reloadable set declare which binary they describe, and a scan that finds none is describing nothing"
 
     while IFS= read -r f; do
@@ -405,6 +419,11 @@ if [[ "${1:-}" == "--self-test" ]]; then
             echo "# ${count} settings are reloadable and the rest are read once at startup."
         } > "${at}/packaging/config/node.yaml"
 
+        # The tree states its third-party roots (#1370), or every case is refused for
+        # the roots file -- including the ones expecting a refusal for something else.
+        mkdir -p "${at}/scripts/lib"
+        printf '# planted\nvendor/upstream\n' > "${at}/scripts/lib/third-party-roots.txt"
+
         ( cd "$at" && git init -q . && git add -A \
             && git -c user.email=t@t -c user.name=t commit -qm t ) >/dev/null 2>&1
     }
@@ -494,6 +513,26 @@ if [[ "${1:-}" == "--self-test" ]]; then
     ( cd "${work}/nodocstable" && git add -A \
         && git -c user.email=t@t -c user.name=t commit -qm d ) >/dev/null 2>&1
     _case "nothing-declaring-the-subject-has-the-table" 1 "carries the docs marker" "${work}/nodocstable"
+
+    # 12. A THIRD-PARTY file declaring a subject this check does not read is declined, by
+    #     name (#1370). The same file outside the roots is case 8's refusal, so a check
+    #     that failed to decline it refuses this tree: exit 0 is the proof.
+    _tree "${work}/vendored" "log_level" "log_level" "one"
+    mkdir -p "${work}/vendored/vendor/upstream/docs"
+    {
+        echo '<!-- reloadable-for: fastcached -->'
+        echo '| Reloadable | Requires a restart |'
+    } > "${work}/vendored/vendor/upstream/docs/daemon.md"
+    ( cd "${work}/vendored" && git add -A \
+        && git -c user.email=t@t -c user.name=t commit -qm v ) >/dev/null 2>&1
+    _case "a-third-party-artefact-is-declined-by-name" 0 \
+        "declined 1 third-party file(s) carrying 'reloadable-for:' under the roots in scripts/lib/third-party-roots.txt, first vendor/upstream/docs/daemon.md" \
+        "${work}/vendored"
+
+    # 13. A roots file naming no root is a refusal, never "nothing is third-party".
+    _tree "${work}/noroots" "log_level" "log_level" "one"
+    printf '# no root at all\n' > "${work}/noroots/scripts/lib/third-party-roots.txt"
+    _case "a-roots-file-naming-no-root-is-refused" 1 "the third-party roots of" "${work}/noroots"
 
     echo "node-reloadable-docs-selftest: ${ran} case(s) ran, ${failed} failed"
     [[ "$failed" -eq 0 ]] || exit 1

@@ -55,22 +55,36 @@ endif()
 set(root "${FASTCACHED_SCRATCH_DIR}/catch-skip-selftest")
 file(REMOVE_RECURSE "${root}")
 set(failures "")
+# How many trees the check was actually RUN against, counted where it runs rather than stated
+# beside the cases -- a literal here went stale the day a case was added.
+set(checkRuns 0)
 
 # Build a synthetic tree holding one CMakeLists.
 # @param name Which case; also the directory.
 # @param relative Where the CMakeLists goes, relative to the tree root.
 # @param body What it contains.
+#
+# Every tree states its third-party roots (#1370). One that did not would be REFUSED for the
+# roots file, and every case below expecting a refusal would pass for that wrong reason.
 function(fastcached_make_tree name relative body outVar)
     set(tree "${root}/${name}")
     file(REMOVE_RECURSE "${tree}")
     get_filename_component(directory "${tree}/${relative}" DIRECTORY)
     file(MAKE_DIRECTORY "${directory}")
     file(WRITE "${tree}/${relative}" "${body}")
+    fastcached_plant_roots("${tree}")
     set(${outVar} "${tree}" PARENT_SCOPE)
+endfunction()
+
+# @param tree The synthetic tree to give a roots file naming `vendor/upstream`.
+function(fastcached_plant_roots tree)
+    file(WRITE "${tree}/scripts/lib/third-party-roots.txt" "# planted\nvendor/upstream\n")
 endfunction()
 
 # Run the check against a tree and say whether it objected.
 function(fastcached_run_check tree outObjected outOutput)
+    math(EXPR runs "${checkRuns} + 1")
+    set(checkRuns ${runs} PARENT_SCOPE)
     execute_process(
         COMMAND "${CMAKE_COMMAND}" "-DFASTCACHED_SOURCE_DIR=${tree}" -P "${check}"
         OUTPUT_VARIABLE captured
@@ -192,6 +206,7 @@ else()
         file(WRITE "${tree}/.cache/CPM/catch2/deadbeef/tests/CMakeLists.txt"
              "catch_discover_tests(SelfTest)
 ")
+        fastcached_plant_roots("${tree}")
 
         execute_process(COMMAND "${FASTCACHED_GIT}" init -q "${tree}" RESULT_VARIABLE ignored)
         execute_process(COMMAND "${FASTCACHED_GIT}" -C "${tree}" add "src/thing/CMakeLists.txt"
@@ -273,6 +288,48 @@ else()
     endif()
 endif()
 
+# 11 and 12. A TRACKED third-party registration is declined, by name, in both modes (#1370).
+#
+#    Untracked is not third-party: `vendor/` is in the index, so case 7's reasoning does not
+#    reach it. The planted registration is bare, so a check that failed to decline it
+#    objects -- NOT objecting is the proof, and the name in the output is what says why.
+set(vendoredBody "catch_discover_tests(upstream-tests)\n")
+fastcached_make_tree("vendored-walk" "src/thing/CMakeLists.txt"
+    "catch_discover_tests(thing-tests PROPERTIES SKIP_RETURN_CODE 4)\n" tree)
+file(WRITE "${tree}/vendor/upstream/tests/CMakeLists.txt" "${vendoredBody}")
+set(vendoredTrees "${tree}")
+if(FASTCACHED_GIT)
+    fastcached_make_tree("vendored-git" "src/thing/CMakeLists.txt"
+        "catch_discover_tests(thing-tests PROPERTIES SKIP_RETURN_CODE 4)\n" tree)
+    file(WRITE "${tree}/vendor/upstream/tests/CMakeLists.txt" "${vendoredBody}")
+    execute_process(COMMAND "${FASTCACHED_GIT}" init -q "${tree}" RESULT_VARIABLE ignored)
+    execute_process(COMMAND "${FASTCACHED_GIT}" -C "${tree}" add -A RESULT_VARIABLE ignored)
+    list(APPEND vendoredTrees "${tree}")
+endif()
+foreach(tree IN LISTS vendoredTrees)
+    get_filename_component(case "${tree}" NAME)
+    fastcached_run_check("${tree}" objected output)
+    string(REGEX REPLACE "[ \t\r\n]+" " " flat "${output}")
+    if(objected)
+        list(APPEND failures "${case}: a bare registration in a TRACKED third-party CMakeLists was reported -- upstream's files are copied verbatim and nobody here may edit them")
+    endif()
+    string(FIND "${flat}" "declined 1 third-party CMakeLists under the roots in scripts/lib/third-party-roots.txt, first vendor/upstream/tests/CMakeLists.txt" position)
+    if(position EQUAL -1)
+        list(APPEND failures "${case}: the third-party CMakeLists was not declined BY NAME, so a run cannot say what it did not scan")
+    endif()
+endforeach()
+
+# 13. A roots file naming no root is a refusal, never "nothing is third-party".
+fastcached_make_tree("no-roots" "src/thing/CMakeLists.txt"
+    "catch_discover_tests(thing-tests PROPERTIES SKIP_RETURN_CODE 4)\n" tree)
+file(WRITE "${tree}/scripts/lib/third-party-roots.txt" "# no root at all\n")
+fastcached_run_check("${tree}" objected output)
+string(REGEX REPLACE "[ \t\r\n]+" " " flat "${output}")
+string(FIND "${flat}" "names no root" position)
+if(NOT objected OR position EQUAL -1)
+    list(APPEND failures "no-roots: a roots file naming no root was not refused for that reason, so an empty file would read as nothing being third-party")
+endif()
+
 if(failures)
     list(LENGTH failures failureCount)
     message("")
@@ -287,4 +344,4 @@ if(failures)
     message(FATAL_ERROR "catch skip selftest: ${failureCount} verdict(s) wrong")
 endif()
 
-message(STATUS "catch skip selftest: 10 synthetic tree(s), every verdict as expected")
+message(STATUS "catch skip selftest: ${checkRuns} synthetic tree(s), every verdict as expected")

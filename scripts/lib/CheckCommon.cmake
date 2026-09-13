@@ -270,3 +270,79 @@ function(fastcached_split_lines_verbatim content linesOut)
     string(REPLACE "\n" ";" lines "${content}")
     set(${linesOut} "${lines}" PARENT_SCOPE)
 endfunction()
+
+# The third-party roots (#1370): which directories of the repository hold source this
+# project copies from elsewhere, read from `scripts/lib/third-party-roots.txt`, the ONE
+# answer to "is this path first-party?". That file carries the format and the reasons; the
+# bash reader is `third_party_roots` in `scripts/lib/third-party-roots.sh`.
+#
+# Refuses with FATAL_ERROR -- never an empty answer -- when the file is missing, names no
+# root, or names one spelled outside the format: a leading or trailing `/`, or `..`. A check
+# handed "nothing is third-party" would take every vendored file as this project's own.
+#
+# @param sourceDir The repository root.
+# @param rootsOut Set to the roots, in file order, relative to @p sourceDir.
+function(fastcached_third_party_roots sourceDir rootsOut)
+    set(rootsFile "${sourceDir}/scripts/lib/third-party-roots.txt")
+    if(NOT EXISTS "${rootsFile}")
+        message(FATAL_ERROR
+            "third-party roots: ${rootsFile} is missing, so no check can tell third-party files "
+            "from this project's own")
+    endif()
+    file(READ "${rootsFile}" content)
+    fastcached_split_lines_verbatim("${content}" lines)
+    set(roots "")
+    foreach(line IN LISTS lines)
+        string(REGEX REPLACE "#.*$" "" line "${line}")
+        string(STRIP "${line}" line)
+        if(line STREQUAL "")
+            continue()
+        endif()
+        if(line MATCHES "^/" OR line MATCHES "/$" OR line MATCHES "\\.\\." OR line MATCHES "\\\\")
+            message(FATAL_ERROR
+                "third-party roots: ${rootsFile} names '${line}', which is not a root relative "
+                "to the repository (no leading or trailing '/', no '..', no backslash)")
+        endif()
+        list(APPEND roots "${line}")
+    endforeach()
+    list(LENGTH roots rootCount)
+    if(rootCount EQUAL 0)
+        message(FATAL_ERROR
+            "third-party roots: ${rootsFile} names no root; refused rather than read as "
+            "'nothing is third-party'")
+    endif()
+    set(${rootsOut} "${roots}" PARENT_SCOPE)
+endfunction()
+
+# Split a list of repository-relative paths into this project's own and the ones under a
+# third-party root (#1370). Refuses exactly as `fastcached_third_party_roots`, and reads the
+# roots even for an empty list.
+#
+# A PREFIX test on `<path>/` against `<root>/`, never a regex: a root is a path name, and
+# a `.` or `+` in one is a character, not a pattern.
+#
+# @param sourceDir The repository root whose roots file is read.
+# @param pathsVar The NAME of the caller's list; rewritten to the first-party paths.
+# @param declinedOut Receives the paths under a third-party root, in their original order.
+function(fastcached_decline_third_party sourceDir pathsVar declinedOut)
+    fastcached_third_party_roots("${sourceDir}" roots)
+    set(kept "")
+    set(declined "")
+    foreach(path IN LISTS ${pathsVar})
+        set(underRoot FALSE)
+        foreach(root IN LISTS roots)
+            string(FIND "${path}/" "${root}/" position)
+            if(position EQUAL 0)
+                set(underRoot TRUE)
+                break()
+            endif()
+        endforeach()
+        if(underRoot)
+            list(APPEND declined "${path}")
+        else()
+            list(APPEND kept "${path}")
+        endif()
+    endforeach()
+    set(${pathsVar} "${kept}" PARENT_SCOPE)
+    set(${declinedOut} "${declined}" PARENT_SCOPE)
+endfunction()

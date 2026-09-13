@@ -1,0 +1,19 @@
+# Tree-wide enumerators that do NOT read `scripts/lib/third-party-roots.txt`, and why
+# (#1370). Read by `scripts/check-third-party-roots.cmake`, and by nothing else.
+#
+# One row per file and spelling: `<path>|<spelling>|<reason>`. The spelling is one of the
+# names in that check's `FastCachedEnumeratorSpellings` table.
+# - The REASON is required. An exemption is a decision, and a row without its reason reads
+#   exactly like a row somebody forgot.
+# - A row whose file no longer spells that enumerator is STALE and refused, so this table
+#   cannot outlive what it excused. That includes a file that has since started reading
+#   the roots: the row is then excusing nothing.
+#
+# The bar is that the files the site lists need no answer to "is this first-party?" --
+# it counts them, or walks something that is not this repository. "Third-party code
+# happens not to match" is not a reason: it is a bet on the world's layout.
+
+.github/workflows/build.yml|git-ls-files|hands every tracked C++ file to clang-format, which declines the third-party roots itself through .clang-format-ignore -- and this check refuses a root missing from that file
+scripts/check-credential-containers.sh|find|`$root` is src/ by default (`Root="${ScriptDir}/../src"`) and a synthetic `--root` in its self-test, never the repository root
+scripts/macos-package-e2e.sh|find|walks the expanded installer payload inside its own work directory (`cd "${workdir}/expanded"`), not the repository
+scripts/repair-worktree-pointers.sh|git-ls-files|counts tracked files only to learn whether this git can read the worktree at all; which of them are first-party does not change that answer
