@@ -2126,3 +2126,36 @@ TEST_CASE("before a node says anything about itself its facts read the marker, a
     unaccepted.runtime.lastRegistrationSecondsAgo.reset();
     CHECK(ContentStarting(NodeFrameAt(80, 24, unaccepted), "toolchains").contains("registrars  0 of 1, never accepted"));
 }
+
+TEST_CASE("the active fleet section's tab is one Selected run over exactly its bracketed key",
+          "[cli][dashboard][panel][fleet][tone]")
+{
+    // #134 F6, and the mechanism's first consumer. WHAT DISTINGUISHES: exactly one run, covering `[workers]`
+    // byte for byte in the row it sits in -- not the gap before it, which inverse video would draw as a
+    // block, and not `[machines]` -- after the Tab that switched to it; the text is unchanged, brackets
+    // included, so a terminal with no colour reads the same grid.
+    auto view = PanelView {
+        FleetPanel(),
+        PanelContext { .absent = std::string { Absent }, .cellWidth = &FakeCellWidth, .rung = RenderRung::Unicode }
+    };
+    auto sink = CollectingSink {};
+    (void) Drive({ DashboardEvent { .kind = DashboardEventKind::Resize, .columns = 132, .rows = 40 },
+                   FleetSampleOf(1, FleetText(FleetMachines)),
+                   Tick,
+                   DashboardEvent { .kind = DashboardEventKind::Key, .keys = "\t" } },
+                 DashboardLimits {},
+                 view,
+                 sink,
+                 &ReadFleetSample);
+    REQUIRE(sink.frames.size() == 2);
+    for (auto const& [index, tab]: { std::pair { std::size_t { 0 }, std::string_view { "[machines]" } },
+                                     std::pair { std::size_t { 1 }, std::string_view { "[workers]" } } })
+    {
+        INFO("frame " << index);
+        REQUIRE(sink.spans.at(index).size() == 1);
+        auto const& span = sink.spans[index].front();
+        CHECK(span.tone == FrameTone::Selected);
+        CHECK(Lines(sink.frames[index]).at(span.row - 1).substr(span.byte, span.length) == tab);
+        CHECK(sink.frames[index].contains(tab));
+    }
+}
