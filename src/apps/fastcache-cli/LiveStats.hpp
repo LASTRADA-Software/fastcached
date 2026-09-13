@@ -123,12 +123,11 @@ struct LiveSubjectSpec
     /// a table read a second later would describe two fleets.
     std::string_view document;
 
-    /// The panel an interactive session of this subject draws, or null where this build has none.
+    /// The panel an interactive session of this subject draws.
     ///
     /// **A column, so the rung's view never branches on a subject**: the composition asks the row
-    /// and draws whatever panel it names. Null for `fleet`, whose panel binds to `ReadFleetSample`
-    /// and is not in this build; a null panel refuses an interactive session by name -- before the
-    /// terminal is acquired -- and never draws it through the piped view instead.
+    /// and draws whatever panel it names. Never null (`EverySubjectHasAPanel`): a subject an operator
+    /// can name at a terminal is one the terminal can draw, so no session is refused for want of one.
     PanelOf panel;
 
     /// What a piped session of this subject streams per sample, or null where this build has nothing.
@@ -179,7 +178,7 @@ inline constexpr EnumTable<LiveSubject, LiveSubjectSpec> LiveSubjectTable { {
                    "once per watcher",
       .reader = &ReadFleetSample,
       .document = "/fleet.txt",
-      .panel = nullptr,
+      .panel = &FleetPanel,
       .figures = &FleetKpiFigures },
 } };
 
@@ -216,6 +215,16 @@ static_assert(EveryKindInfersAtMostOneSubject(LiveSubjectTable),
 }
 
 static_assert(EverySubjectHasAReader(LiveSubjectTable), "every live-stats subject needs a reader for its samples");
+
+/// Whether every subject names the panel an interactive session of it draws.
+/// @param table The subject table.
+/// @return True when no row's panel is null.
+[[nodiscard]] consteval bool EverySubjectHasAPanel(EnumTable<LiveSubject, LiveSubjectSpec> const& table) noexcept
+{
+    return std::ranges::all_of(table, [](LiveSubjectSpec const& row) { return row.panel != nullptr; });
+}
+
+static_assert(EverySubjectHasAPanel(LiveSubjectTable), "every live-stats subject needs a panel for an interactive session");
 
 /// Whether every subject's default is at or above its own floor.
 ///
