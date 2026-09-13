@@ -1496,11 +1496,14 @@ namespace
     constexpr auto ChromeFactTable = EnumTable<ChromeFact, ChromeFactSpec> { {
         { .fact = ChromeFact::Version,
           .render = [](FrameInputs const& in, PanelContext const& /*context*/) -> std::string {
-              // A node says it in its status; a cache's INFO says it as a field. Neither is invented.
+              // A node says it in its status; a cache's reading says it where its source states it (a field of
+              // INFO, a label of /metrics' build info). Neither is invented.
               if (in.model->nodeStatus.has_value() && !in.model->nodeStatus->version.empty())
                   return in.model->nodeStatus->version;
-              auto const* text = NewestText(*in.model, CacheVersionField);
-              return text == nullptr ? std::string { in.absent } : *text;
+              auto const version = in.origin.has_value() && in.model->latest.has_value()
+                                       ? VersionIn(*in.model->latest, *in.origin)
+                                       : std::nullopt;
+              return version.value_or(std::string { in.absent });
           } },
         { .fact = ChromeFact::Endpoint,
           .render = [](FrameInputs const& in, PanelContext const& context) -> std::string {
