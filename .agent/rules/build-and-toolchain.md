@@ -5123,6 +5123,22 @@ either a `TARGETS` row or carries a **written exemption**. Three shapes are refu
 empty reason, a row naming a binary nothing registers, and a row that is also a `TARGETS`
 row.
 
+**And an exemption's CLAIM is re-taken on every run, because a reason nobody re-measures
+goes false in silence.** `fastcache-cli-tests` stayed exempt as "single-threaded -- no
+source names `std::thread`" after #134 gave it a thread pool and two suites asserting on
+thread identities; the check went on passing, since a reason was only required to be
+non-empty. So a row is `target|directory|reason`, and the check scans the directory for
+the primitives in `FastCachedTsanThreadPrimitives` (`ThreadPoolExecutor` among them, which
+is how this tree reaches a thread without spelling one), refusing a hit outside a comment,
+a missing directory, and one holding no source.
+
+That is the thread census the paragraph above declines to trust, used in the ONE direction
+where its errors are cheap: a false positive refuses an exemption and costs a sanitized
+binary that did not strictly need it, never a hidden race; a false negative -- a thread
+spawned through a helper defined elsewhere -- leaves the row as unverified as it was
+before. **A clean scan proves the written claim, not a single-threaded binary**, and the
+refusal says so rather than letting a green run read as the stronger statement.
+
 #1209's own hand census listed **four** test binaries where the tree registers **six**.
 That is why this is a check and not a review item: the person writing the ticket, looking
 directly at the thing, miscounted it.
