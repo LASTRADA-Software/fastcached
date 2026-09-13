@@ -8,6 +8,7 @@
 #include "SixelEncoder.hpp"
 #include "StatsSource.hpp"
 
+#include <FastCache/Cache/StorageTier.hpp>
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Distributed/FleetView.hpp>
 
@@ -169,7 +170,7 @@ struct LevelRow
 struct TierColumn
 {
     std::string_view header;                ///< The column's heading.
-    std::string_view key;                   ///< Its machine name, qualified by each tier; see `PanelKeysAreWhole`.
+    std::string_view key;                   ///< Its machine name, per tier `TierFigureKey`; see `PanelKeysAreWhole`.
     FigureSpec figure;                      ///< The figure, per tier.
     Priority priority { Priority::Normal }; ///< When the column is dropped for width.
 };
@@ -282,15 +283,31 @@ constexpr void ForEachFigureKey(PanelSpec const& panel, Visit const& visit)
     }
 }
 
+/// What joins a tier's name to a tier column's key in the machine name of that tier's figure.
+inline constexpr std::string_view TierKeySeparator = "_";
+
+/// Whether @p key is the machine name `TierFigureKey` gives @p column's figure in @p tier.
+/// @param key A machine name.
+/// @param tier A `StorageTierTable` name.
+/// @param column A tier column's key.
+/// @return True when @p key is `<tier>_<column>`.
+[[nodiscard]] constexpr bool IsTierFigureKey(std::string_view key, std::string_view tier, std::string_view column) noexcept
+{
+    return key.size() == tier.size() + TierKeySeparator.size() + column.size() && key.starts_with(tier)
+           && key.substr(tier.size(), TierKeySeparator.size()) == TierKeySeparator && key.ends_with(column);
+}
+
 /// Whether @p panel names every figure it draws for a program, once each.
 ///
 /// **A figure's machine name is its own column, never derived from what a person reads**: a label
 /// reworded for the screen must not rename what a script reads, and the two change for different
 /// reasons. So every rate row, beside figure, level row, limit and tier column states a `key`, and
-/// this is the check that none is missing, none repeats within its block -- the rate and level
-/// keys are one namespace, the tier columns another, since a tier's figure is named per tier --
-/// and a level row's `limitKey` is named exactly when it has a limit. `static_assert`ed beside
-/// every panel, so a row added without one fails the build on every compiler.
+/// this is the check that none is missing and none repeats: the rate and level keys, beside
+/// figures and limits included, are one namespace; the tier columns' keys are unique among
+/// themselves, and no figure key spells a tier column's figure in any `StorageTierTable` tier
+/// (`<tier>_<key>`), which is how a program meets them beside the others. A level row's
+/// `limitKey` is named exactly when it has a limit. `static_assert`ed beside every panel, so a row
+/// added without one fails the build on every compiler.
 /// @param panel The panel.
 /// @return True when the keys are whole.
 [[nodiscard]] constexpr bool PanelKeysAreWhole(PanelSpec const& panel) noexcept
@@ -313,6 +330,10 @@ constexpr void ForEachFigureKey(PanelSpec const& panel, Visit const& visit)
         whole = whole && !panel.tierColumns[index].key.empty();
         for (auto const earlier: std::views::iota(std::size_t { 0 }, index))
             whole = whole && panel.tierColumns[earlier].key != panel.tierColumns[index].key;
+        for (auto const& tier: StorageTierTable)
+            ForEachFigureKey(panel, [&whole, &panel, index, &tier](std::string_view key) {
+                whole = whole && !IsTierFigureKey(key, tier.name, panel.tierColumns[index].key);
+            });
     }
     return whole;
 }
@@ -358,6 +379,27 @@ struct PanelContext
                                                               FigureSpec const& figure,
                                                               StatsOrigin origin,
                                                               std::string_view label);
+
+/// The machine name of @p column's figure in @p tier: `<tier>_<column>`.
+///
+/// A program reads a tier's figures beside the panel's others, so they need names that cannot meet
+/// one of those; `PanelKeysAreWhole` refuses a panel where one would.
+/// @param tier A `StorageTierTable` name.
+/// @param column A tier column's key.
+/// @return The name.
+[[nodiscard]] std::string TierFigureKey(std::string_view tier, std::string_view column);
+
+/// The tiers @p spec draws a tier row for from @p reading, in `StorageTierTable` order.
+///
+/// **A tier the cache does not run has no row** (§9.5) -- not a row of absent markers, which would
+/// claim the tier exists and reported nothing. Presence is asked of the reading's series for the
+/// FIRST tier column, which the daemon omits entirely for a tier it lacks. One answer for the panel
+/// and the piped record, so the two cannot disagree about which tiers exist.
+/// @param spec The panel.
+/// @param reading A reading.
+/// @param origin The source it came from, whose names apply.
+/// @return The tiers' names; empty for a panel without a tier block or a source that names none.
+[[nodiscard]] std::vector<std::string_view> TiersIn(PanelSpec const& spec, Value const& reading, StatsOrigin origin);
 
 /// The series name a labelled per-tier sample is exported under.
 /// @param base The unlabelled series name.
