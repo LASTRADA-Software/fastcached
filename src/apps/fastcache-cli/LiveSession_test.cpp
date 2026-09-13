@@ -839,6 +839,26 @@ struct RunningSeat
     };
 }
 
+/// An admin surface that counts what it is asked and answers nothing.
+class CountingAdmin final: public IAdminDocument
+{
+  public:
+    [[nodiscard]] std::expected<std::string, AdminError> FetchAdmin(std::string_view /*path*/) override
+    {
+        ++_fetches;
+        return std::unexpected(AdminError { .kind = AdminFailure::Unreachable, .detail = "not scripted" });
+    }
+
+    /// @return How many documents were asked for.
+    [[nodiscard]] int Fetches() const noexcept
+    {
+        return _fetches;
+    }
+
+  private:
+    int _fetches { 0 };
+};
+
 /// A cache daemon, as the identification describes one.
 /// @return The identification.
 [[nodiscard]] EndpointIdentity CacheDaemon()
@@ -970,6 +990,37 @@ TEST_CASE("a live-stats session re-dials through the seat's dialer after a faile
     CHECK(dialer.Dials() == 1);
     // The header, a reading, the gap, and the reading over the re-dial.
     CHECK(std::ranges::count(seat.Stream(), '\n') == 4);
+}
+
+TEST_CASE("a live-stats session reaches its endpoint only through the stats gatherer and the identity",
+          "[cli][live][session][seat]")
+{
+    // §9.18, asserted as wiring. Every other door `main` hands a verb is in the context and
+    // counts what it is asked: the RESP, memcached and 0xFC connections and the admin surface. A
+    // session that took a second path to the endpoint -- a direct call on a connection it happened
+    // to be given -- would still stream correct samples, so the counts are the assertion.
+    auto seat = RunningSeat { RenderOptions { .format = OutputFormat::Tsv }, false };
+    auto identity = ScriptedIdentity { CacheDaemon() };
+    auto resp = ScriptedExchange { {} };
+    auto memcached = ScriptedMemcachedExchange { {} };
+    auto node = ScriptedNodeExchange { {} };
+    auto admin = CountingAdmin {};
+
+    auto context = SessionContext({}, 2, &identity, &seat.gatherer);
+    context.resp = &resp;
+    context.memcached = &memcached;
+    context.node = &node;
+    context.admin = &admin;
+
+    auto const ending = RunLiveStatsSession(context, seat.Seat());
+
+    CHECK(ending.kind == SessionEndKind::Ran);
+    CHECK(seat.gatherer.Calls() == 2);
+    CHECK(identity.Calls() == 1);
+    CHECK(resp.Sent().empty());
+    CHECK(memcached.Sent().empty());
+    CHECK(node.Sent().empty());
+    CHECK(admin.Fetches() == 0);
 }
 
 TEST_CASE("a live-stats session with no stats source is refused before anything is composed", "[cli][live][session][seat]")
