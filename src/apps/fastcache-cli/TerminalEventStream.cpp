@@ -462,7 +462,6 @@ SynchronizedOutputAnswer ToSynchronizedOutputAnswer(tui::DecModeStatus status) n
         case tui::DecModeStatus::NoReply:
             return SynchronizedOutputAnswer::NoReply;
         case tui::DecModeStatus::NotAsked:
-        case tui::DecModeStatus::NotImplemented:
             return SynchronizedOutputAnswer::NotAsked;
     }
     return SynchronizedOutputAnswer::NotAsked;
