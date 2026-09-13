@@ -1736,7 +1736,7 @@ TEST_CASE("a live-stats session that inherited SIGINT ignored runs to its budget
     struct sigaction original {};
     struct sigaction ignored {};
     ignored.sa_handler = SIG_IGN;
-    static_cast<void>(::sigemptyset(&ignored.sa_mask));
+    static_cast<void>(sigemptyset(&ignored.sa_mask));
     REQUIRE(::sigaction(SIGINT, &ignored, &original) == 0);
 
     {
