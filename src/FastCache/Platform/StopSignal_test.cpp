@@ -7,11 +7,16 @@
 #include <atomic>
 #include <chrono>
 #include <coroutine>
+#include <cstdint>
 #include <future>
 #include <optional>
 
-#if !defined(_WIN32)
+#if defined(_WIN32)
+    #include <windows.h>
+#else
     #include <csignal>
+
+    #include <fcntl.h>
 #endif
 
 using namespace FastCache;
@@ -65,9 +70,12 @@ class InlineExecutor final: public IExecutor
 /// than a hang.
 /// @param signal What to wait for.
 /// @param meanwhile What to do once the wait is under way.
+/// @param bound How long the wait may take before it is cancelled.
 /// @return Why the wait ended, or nullopt when it did not end within the bound.
 template <typename Meanwhile>
-[[nodiscard]] std::optional<StopWake> WaitWhile(IStopSignal& signal, Meanwhile meanwhile)
+[[nodiscard]] std::optional<StopWake> WaitWhile(IStopSignal& signal,
+                                                Meanwhile meanwhile,
+                                                std::chrono::milliseconds bound = WakeBound)
 {
     auto answer = std::promise<StopWake> {};
     auto answered = answer.get_future();
@@ -79,7 +87,7 @@ template <typename Meanwhile>
         task = AwaitStop(&signal, &waiter, &resumeHere, &answer);
         task.Native().resume();
         meanwhile();
-        if (answered.wait_for(WakeBound) == std::future_status::ready)
+        if (answered.wait_for(bound) == std::future_status::ready)
             result = answered.get();
         else
         {
@@ -120,6 +128,29 @@ TEST_CASE("a second stop signal is refused while the first is installed", "[plat
 
     // And the refusal is about the one ALIVE, not about having ever installed one.
     CHECK(InstallStopSignal().has_value());
+}
+
+TEST_CASE("the stop handler's end outlives an uninstall and the next install reuses it", "[platform][stop-signal]")
+{
+    // A handler already running when a signal is uninstalled may still write to the end it loaded,
+    // so that end is created once and never closed: still open after the uninstall, and the one
+    // the next install hands the handler again.
+    auto first = InstallStopSignal();
+    REQUIRE(first.has_value());
+    auto const end = StopSignalHandlerEnd();
+    REQUIRE(end != -1);
+    first->reset();
+
+#if defined(_WIN32)
+    auto flags = DWORD { 0 };
+    CHECK(::GetHandleInformation(reinterpret_cast<HANDLE>(static_cast<std::uintptr_t>(end)), &flags) != FALSE);
+#else
+    CHECK(::fcntl(static_cast<int>(end), F_GETFD) != -1);
+#endif
+
+    auto second = InstallStopSignal();
+    REQUIRE(second.has_value());
+    CHECK(StopSignalHandlerEnd() == end);
 }
 
 // POSIX only. The Windows twin would drive `GenerateConsoleCtrlEvent`, which reaches every
@@ -177,6 +208,73 @@ TEST_CASE("SIGINT reaches a waiting stop signal and the previous disposition ret
     static_cast<void>(::raise(SIGINT));
     CHECK(priorHandlerRuns.load() == 1);
 
+    static_cast<void>(::sigaction(SIGINT, &original, nullptr));
+}
+
+TEST_CASE("a stop an earlier install heard is not the next install's, and the next still hears its own",
+          "[platform][stop-signal]")
+{
+    // The handler's pipe outlives each install, so the byte a stop left in it must not reach the
+    // next one as a stop nobody made -- and a stop made to the next one still arrives.
+    struct sigaction original {};
+    struct sigaction prior {};
+    prior.sa_handler = &PriorHandler;
+    static_cast<void>(::sigemptyset(&prior.sa_mask));
+    REQUIRE(::sigaction(SIGINT, &prior, &original) == 0);
+
+    {
+        auto first = InstallStopSignal();
+        REQUIRE(first.has_value());
+        CHECK(WaitWhile(**first, [] { static_cast<void>(::raise(SIGINT)); }) == StopWake::Stopped);
+    }
+    {
+        auto second = InstallStopSignal();
+        REQUIRE(second.has_value());
+        // Nothing asked this one to stop: its wait does not end on its own. A short bound is
+        // enough, since a leftover byte would answer at once; it can only miss the defect, never
+        // invent it.
+        CHECK_FALSE(WaitWhile(**second, [] {}, std::chrono::milliseconds { 200 }).has_value());
+    }
+    {
+        // A third, because the wait above was cancelled at its bound and a cancel is sticky.
+        auto third = InstallStopSignal();
+        REQUIRE(third.has_value());
+        CHECK(WaitWhile(**third, [] { static_cast<void>(::raise(SIGINT)); }) == StopWake::Stopped);
+    }
+
+    static_cast<void>(::sigaction(SIGINT, &original, nullptr));
+}
+
+TEST_CASE("a SIGINT this process inherited as ignored stays ignored, and its stop signal never fires",
+          "[platform][stop-signal]")
+{
+    // A background job or `nohup` starts with SIGINT ignored. Catching it would let a Ctrl-C meant
+    // for the foreground end this process. So nothing is installed: the disposition is still
+    // `SIG_IGN`, a SIGINT changes nothing, and only a cancel ends the wait -- a signal that can
+    // never fire, not a failure to install one.
+    struct sigaction original {};
+    struct sigaction ignored {};
+    ignored.sa_handler = SIG_IGN;
+    static_cast<void>(::sigemptyset(&ignored.sa_mask));
+    REQUIRE(::sigaction(SIGINT, &ignored, &original) == 0);
+
+    {
+        auto installed = InstallStopSignal();
+        REQUIRE(installed.has_value());
+
+        struct sigaction during {};
+        static_cast<void>(::sigaction(SIGINT, nullptr, &during));
+        CHECK(during.sa_handler == SIG_IGN);
+
+        CHECK_FALSE(WaitWhile(
+                        **installed, [] { static_cast<void>(::raise(SIGINT)); }, std::chrono::milliseconds { 200 })
+                        .has_value());
+        CHECK(WaitWhile(**installed, [&installed] { (*installed)->Cancel(); }) == StopWake::Cancelled);
+    }
+
+    struct sigaction after {};
+    static_cast<void>(::sigaction(SIGINT, nullptr, &after));
+    CHECK(after.sa_handler == SIG_IGN);
     static_cast<void>(::sigaction(SIGINT, &original, nullptr));
 }
 
