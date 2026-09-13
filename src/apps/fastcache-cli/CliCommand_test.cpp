@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <format>
 #include <optional>
 #include <ranges>
@@ -355,6 +356,70 @@ TEST_CASE("every modifier is refused by its own name on a verb that honours none
         CHECK(refused.action == Action::UsageError);
         CHECK(refused.diagnostic.contains(flag.substr(0, flag.find('='))));
     }
+}
+
+TEST_CASE("the live-stats modifiers are refused by name on every verb that does not honour them", "[cli][command]")
+{
+    // §9.19, derived over the WHOLE table rather than spot-checked: a new verb is a row,
+    // and a row that honours these by accident is refused nowhere a sample would look.
+    // Each verb is given exactly its minimum operand count, so the modifier is the only
+    // thing that can refuse -- `ParseCommand` checks arity before applicability.
+    struct Probe
+    {
+        std::uint8_t bit;
+        std::string_view flag;
+        std::string_view spelling;
+    };
+    auto const probes = std::to_array<Probe>({
+        { .bit = Modifier::Interval, .flag = "--interval", .spelling = "--interval=1000" },
+        { .bit = Modifier::Samples, .flag = "--samples", .spelling = "--samples=3" },
+    });
+
+    auto checked = std::size_t { 0 };
+    for (auto const& verb: Verbs())
+    {
+        for (auto const& probe: probes)
+        {
+            if ((verb.modifiers & probe.bit) != 0)
+                continue;
+
+            auto argv = std::vector<std::string> { std::string { verb.name } };
+            argv.insert(argv.end(), verb.minOperands, std::string { "x" });
+            argv.emplace_back(probe.spelling);
+
+            CAPTURE(verb.name, probe.flag);
+            auto const command = ParseCommand(argv);
+            CHECK(command.action == Action::UsageError);
+            CHECK(command.diagnostic.contains(std::format("{} means nothing for `{}`", probe.flag, verb.name)));
+            ++checked;
+        }
+    }
+
+    // A table in which every row honoured both would check nothing and pass.
+    CHECK(checked > 0);
+}
+
+TEST_CASE("a malformed interval or sample count is refused as a value rather than as an unhonoured flag", "[cli][command]")
+{
+    // WHAT DISTINGUISHES is the sentence. `ping` honours neither flag, so every one of
+    // these would be a usage error even with no value grammar at all -- refused as
+    // *means nothing for `ping`*. Asserting only `UsageError` passes with the zero check
+    // deleted; asserting the value's own complaint does not.
+    auto const expectValueRefusal = [](std::string_view flag, std::string_view complaint) {
+        CAPTURE(flag);
+        auto const command = Parse({ "ping", flag });
+        CHECK(command.action == Action::UsageError);
+        CHECK(command.diagnostic.contains(complaint));
+        CHECK_FALSE(command.diagnostic.contains("means nothing"));
+    };
+
+    expectValueRefusal("--interval=soon", "whole number");
+    expectValueRefusal("--interval=-1", "whole number");
+    expectValueRefusal("--samples=many", "whole number");
+
+    // Zero is a well-formed count and still refused: `DashboardLimits` spells *no bound*
+    // as zero, so accepting it would turn `--samples=0` into *run forever*.
+    expectValueRefusal("--samples=0", "at least one sample");
 }
 
 TEST_CASE("nx and xx together are refused", "[cli][command]")

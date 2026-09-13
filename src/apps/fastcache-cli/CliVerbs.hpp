@@ -11,7 +11,10 @@
 #include <FastCache/Core/EnumTable.hpp>
 
 #include <algorithm>
+#include <chrono>
+#include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -146,10 +149,28 @@ constexpr std::int64_t TtlUnset = -1;
 struct VerbOptions
 {
     std::int64_t ttlSeconds { TtlUnset }; ///< From `--ttl`; `TtlUnset` when not given.
-    bool onlyIfAbsent { false };          ///< From `--nx`.
-    bool onlyIfPresent { false };         ///< From `--xx`.
-    bool raw { false };                   ///< From `--raw`: write the value's bytes verbatim.
-    bool everything { false };            ///< From `--all`: `flush` clears every database.
+
+    /// From `--interval`: how long between samples, or nullopt when not given.
+    ///
+    /// **Optional rather than defaulted**, because the default is not one number: each
+    /// `live-stats` subject has its own, and so does its floor. A default written here
+    /// would be a second copy of a figure `LiveSubjectTable` owns, and it could not say
+    /// whether the operator chose it -- which is the difference between *use the
+    /// subject's default* and *the operator asked for exactly this, check it against the
+    /// floor*.
+    std::optional<std::chrono::milliseconds> interval {};
+
+    /// From `--samples`: end after this many, or nullopt for no bound.
+    ///
+    /// Never zero once parsed. Zero is how `DashboardLimits` spells *no bound*, so an
+    /// operator's `--samples=0` accepted here would silently mean *forever* -- it is
+    /// refused where it is parsed instead.
+    std::optional<std::size_t> samples {};
+
+    bool onlyIfAbsent { false };  ///< From `--nx`.
+    bool onlyIfPresent { false }; ///< From `--xx`.
+    bool raw { false };           ///< From `--raw`: write the value's bytes verbatim.
+    bool everything { false };    ///< From `--all`: `flush` clears every database.
 };
 
 struct VerbSpec;
@@ -270,6 +291,8 @@ namespace Modifier
     constexpr std::uint8_t Exclusivity = 0b0010; ///< `--nx` and `--xx`
     constexpr std::uint8_t Raw = 0b0100;         ///< `--raw`
     constexpr std::uint8_t Everything = 0b1000;  ///< `--all`
+    constexpr std::uint8_t Interval = 0b1'0000;  ///< `--interval`
+    constexpr std::uint8_t Samples = 0b10'0000;  ///< `--samples`
 } // namespace Modifier
 
 /// `VerbSpec::maxOperands` for a verb that takes any number.
