@@ -311,9 +311,9 @@ class ScriptedDocument final: public IAdminDocument
 class CountView final: public IDashboardView
 {
   public:
-    [[nodiscard]] std::string Frame(DashboardModel const& model) override
+    [[nodiscard]] DashboardFrame PlacedFrame(DashboardModel const& model) override
     {
-        return std::to_string(model.samples);
+        return DashboardFrame { .text = std::to_string(model.samples), .placements = {} };
     }
 };
 

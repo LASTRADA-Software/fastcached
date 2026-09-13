@@ -356,21 +356,28 @@ class IDashboardView
     IDashboardView& operator=(IDashboardView&&) = delete;
     virtual ~IDashboardView() = default;
 
-    /// Draw the model.
-    /// @param model What is known right now.
-    /// @return The frame's bytes.
-    [[nodiscard]] virtual std::string Frame(DashboardModel const& model) = 0;
-
     /// Draw the model with any images placed over it.
     ///
-    /// **What the loop calls.** The default is `Frame` with no images, which is every view that draws
-    /// none; a view that places images overrides this and makes `Frame` its text. A different NAME,
-    /// not an overload, for `PresentPlaced`'s reason.
+    /// **What the loop calls, the one thing a view implements, and it has no default.** It is
+    /// `IFrameSink::PresentPlaced`'s shape for `PresentPlaced`'s reason: with a text door beside it
+    /// that the frame door defaulted to, a view that wrapped another and implemented only the text
+    /// would draw every row and drop every image, and nothing would say so. A view that places no
+    /// image returns its text with no placements.
     /// @param model What is known right now.
     /// @return The frame.
-    [[nodiscard]] virtual DashboardFrame PlacedFrame(DashboardModel const& model)
+    [[nodiscard]] virtual DashboardFrame PlacedFrame(DashboardModel const& model) = 0;
+
+    /// Draw the model's text alone.
+    ///
+    /// **Deliberately not virtual.** It is `PlacedFrame`'s text, so there is one door to implement and
+    /// none to override by mistake: a view that wrote this instead of `PlacedFrame` would not compile.
+    /// A different NAME, not an overload of `PlacedFrame`, so a view's override hides nothing a caller
+    /// reaches.
+    /// @param model What is known right now.
+    /// @return The frame's bytes.
+    [[nodiscard]] std::string Frame(DashboardModel const& model)
     {
-        return DashboardFrame { .text = Frame(model), .placements = {} };
+        return PlacedFrame(model).text;
     }
 
     /// Act on a keystroke that is not a quit key.

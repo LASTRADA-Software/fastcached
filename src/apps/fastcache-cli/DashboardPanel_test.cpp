@@ -1205,9 +1205,9 @@ std::size_t fleetParses = 0;
 class EveryFleetDrawer final: public IDashboardView
 {
   public:
-    [[nodiscard]] std::string Frame(DashboardModel const& model) override
+    [[nodiscard]] DashboardFrame PlacedFrame(DashboardModel const& model) override
     {
-        auto frame = panel.Frame(model);
+        auto frame = panel.PlacedFrame(model);
         records += FleetKpiFigures(model).fields.size();
         return frame;
     }

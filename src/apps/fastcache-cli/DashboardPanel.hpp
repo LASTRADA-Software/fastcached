@@ -434,10 +434,6 @@ class PanelView final: public IDashboardView
     PanelView(PanelSpec const& spec, PanelContext context);
 
     /// @param model What is known.
-    /// @return The frame's text; see `PlacedFrame`.
-    [[nodiscard]] std::string Frame(DashboardModel const& model) override;
-
-    /// @param model What is known.
     /// @return The frame, with the fleet chart placed over it on the Sixel rung.
     [[nodiscard]] DashboardFrame PlacedFrame(DashboardModel const& model) override;
 

@@ -158,7 +158,12 @@ std::string_view PipedRecordView::AbsentText() const noexcept
     return DescriptorOf(_format)->absentText;
 }
 
-std::string PipedRecordView::Frame(DashboardModel const& model)
+DashboardFrame PipedRecordView::PlacedFrame(DashboardModel const& model)
+{
+    return DashboardFrame { .text = Lines(model), .placements = {} };
+}
+
+std::string PipedRecordView::Lines(DashboardModel const& model)
 {
     if (!model.latest.has_value())
         return {};
