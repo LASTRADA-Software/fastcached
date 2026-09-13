@@ -18,8 +18,8 @@ namespace FastCache::Cli
 /// §9.11, §9.12). A fixture substitutes the record, which is how the ASCII rung is driven without
 /// a terminal that lacks Unicode.
 ///
-/// It names nothing from `vendor/`: endo's DA1 answer is translated into `SixelAnswer` where it
-/// is read, in `TerminalEvents.cpp`.
+/// It names nothing from `vendor/`: endo's DA1 and DECRQM answers are translated into
+/// `SixelAnswer` and `SynchronizedOutputAnswer` where they are read, in `TerminalEventStream.cpp`.
 
 /// What the terminal said about Sixel graphics, or why it said nothing.
 ///
@@ -36,7 +36,24 @@ enum class SixelAnswer : std::uint8_t
     NotAsked,      ///< No DA1 was sent: there was no terminal input to read a reply from.
 };
 
-/// Everything the rung is decided from.
+/// What the terminal said about synchronized output (DEC mode 2026), or why it said nothing.
+///
+/// TRANSMITTED/PERSISTED: no. Private; enumerators may be inserted.
+///
+/// Folded from a DECRQM reply rather than carried as one, because a presenter needs one fact --
+/// may a frame be bracketed -- and the reply has eight. Kept four-valued for `SixelAnswer`'s
+/// reason: only `Supported` brackets a frame, and the other three are different facts about why
+/// not, which a report can tell apart.
+enum class SynchronizedOutputAnswer : std::uint8_t
+{
+    Supported,    ///< DECRQM recognised mode 2026 and it can be switched: set or reset.
+    NotSupported, ///< DECRQM answered that mode 2026 is not recognised, or permanently reset.
+    NoReply,      ///< DECRQM was sent and nothing answered before the query deadline.
+    NotAsked,     ///< No DECRQM was sent: no terminal input to read a reply from, or a platform
+                  ///< arm that implements no DECRQM query.
+};
+
+/// Everything the rung is decided from, and what a frame may be presented with.
 struct TerminalCapabilities
 {
     SixelAnswer sixel { SixelAnswer::NotAsked };
@@ -45,6 +62,9 @@ struct TerminalCapabilities
     /// `Unknown` means there was nothing to read, and it is carried as such rather than folded
     /// into `Other`, so a report can say *unknown* instead of claiming the terminal lacks Unicode.
     TerminalTextEncoding encoding { TerminalTextEncoding::Unknown };
+
+    /// Whether a frame may be bracketed in synchronized output. Read by the presenter, not the rung.
+    SynchronizedOutputAnswer synchronizedOutput { SynchronizedOutputAnswer::NotAsked };
 };
 
 /// The rung a terminal with @p capabilities is drawn on.
