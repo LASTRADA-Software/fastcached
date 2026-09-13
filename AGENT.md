@@ -1491,7 +1491,9 @@ and what they may assume.
   not a skipped test, so the whole configure fails and the message names CMake rather than the
   option the operator set. Guard the block on `TARGET x` as well as on whatever feature makes the
   test interesting — the two are independent. `ctest -R target-file-guards`, in the default set,
-  reads the optional targets from `src/apps/CMakeLists.txt` rather than restating them.
+  reads the optional targets rather than restating them, from TWO sources with a completeness
+  argument each: the app table, and every directory the root adds under a `FASTCACHED_BUILD_*`
+  option outside `src/` (`vendor/`). Never merge their counts.
 - A fixture whose client is always LOCAL cannot test who is admitted: `Classify` returns `Member`
   for the whole of `127.0.0.0/8` before it reads the member list. A second loopback address does
   not reach that list, and changing to one looks exactly like a fix; the host's OWN non-loopback
