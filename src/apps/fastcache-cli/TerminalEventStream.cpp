@@ -396,7 +396,9 @@ Task<std::expected<StartedTerminal, std::string>> StartTerminalDevice(std::uniqu
     auto restore = std::make_shared<TerminalRestoreHandle>(device.get());
     auto events = std::make_unique<StartedTerminalEvents>(std::move(device), std::move(stream), restore);
     guard.Keep();
-    co_return StartedTerminal { .capabilities = *capabilities, .events = std::move(events), .restore = std::move(restore) };
+    co_return StartedTerminal {
+        .capabilities = *capabilities, .events = std::move(events), .restore = std::move(restore), .frames = nullptr
+    };
 }
 
 } // namespace FastCache::Cli
