@@ -1003,10 +1003,13 @@ what differs between compilers, standard libraries, hosts and tool versions.
   flake, a re-run clears every one. **Neither the wrapper's exit status NOR the presence of a
   log settles whether the gate ran**, so the wrapper writes an artefact BEFORE the gate starts
   naming the commit it is about, and the verdict is read from the tool's own terminal text.
-  Serialise the gate across lanes with `flock` — **a poll-for-zero is not a lock**: it starves
-  and it stampedes, and it behaves correctly only while there is a single waiter, which is the
-  condition it is invariably tested under. A run that was KILLED mid-build is discarded rather
-  than read.
+  **The gate serialises ITSELF** — `local-gate.sh` takes `flock` on ONE path it defines
+  (`$HOME/.fastcached-local-gate.lock`), so run it bare: a `flock <path> <command>` wrapper
+  holding that lock is detected rather than deadlocked against, one holding a DIFFERENT path is
+  reported with both, and `GATE NOT STARTED:` is a lock outcome, never a verdict (#1379). **A poll-for-zero is not a
+  lock**: it starves and it stampedes, and it behaves correctly only while there is a single
+  waiter, which is the condition it is invariably tested under. A run that was KILLED mid-build
+  is discarded rather than read.
 - **A red gate reads as "my branch is bad", never as "the gate is broken" — so a gate that
   fails CLOSED and UNCONDITIONALLY can sit for days with nobody filing it.** Not another
   wrong-tree entry: that list is the gate reporting on the wrong tree, this is the gate
@@ -1175,7 +1178,11 @@ what differs between compilers, standard libraries, hosts and tool versions.
   CI being slow. **Order matters more than the fact**: ask `mergeable` BEFORE reading a workflow,
   and on push ask `git merge-tree --write-tree`, which needs no pull request and no API. Resolving
   it, assert the ORDERING of diff3's four markers rather than counting three, and prove the
-  resolution with `git diff origin/master HEAD -- <file>` showing no deletion lines.
+  resolution with `git diff origin/master HEAD -- <file>` showing no deletion lines. **And it is
+  TWO states**: conflicting when pushed shows contexts ABSENT, while one that BECAME conflicting
+  keeps its old verdicts, values and all, and reads as nearly green -- so the state is asked
+  BEFORE any context is read, since the context count cannot tell the two apart, and
+  `ci-pr-required.sh` says the merge state on its own line (#1352).
 - A skipped job REPORTS, and a skipped REQUIRED context reads as PASSING. A skipped **matrix** job
   is the opposite: it never expands, so its per-leg contexts never exist and nothing reports at all.
   One passes, one hangs; the difference is the matrix. So never let a dependency's failure skip a
@@ -1387,7 +1394,11 @@ what differs between compilers, standard libraries, hosts and tool versions.
   a coverage check then reported CLEAN over the six files it exists to read. Drop flags from a TABLE
   keyed on the driver NAME, never by sniffing a leading `/`. And a mode that NAMES its set may not
   report clean over a member it could not cover. Knowing a rule and having just applied it is not
-  protection: the ENOEXEC was the same author's own fix from three hours earlier.
+  protection: the ENOEXEC was the same author's own fix from three hours earlier. **And that switch
+  belongs to the SPAWN, never to an environment `ctest` inherits** — exported, it broke six entries
+  that read as tree defects, so no test in `src/tests` inherits it on Windows; Windows script tests run Git's
+  `bin/bash.exe`, because WSL's launchers come first on PowerShell's PATH; and a check in a work tree
+  the git on PATH cannot read is REFUSED, never run over a walk (#1355).
 
 **[`.agent/rules/testing.md`](.agent/rules/testing.md)** — how tests are registered
 and what they may assume.

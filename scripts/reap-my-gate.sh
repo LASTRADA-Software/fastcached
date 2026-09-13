@@ -107,24 +107,25 @@
 # Why this does not read the gate lock
 # ---------------------------------------------------------------------------
 #
-# Gate SERIALISATION moved to a `flock` on `~/gate-logs/.gate.lock` while this was
-# being written, which removes command-line matching from the WAITING side
-# entirely. The obvious follow-on is for this to read the holder's pid from the
-# lock and walk down from there, and it is declined for three reasons rather than
+# The gate takes `$HOME/.fastcached-local-gate.lock` ITSELF now (#1379). This section
+# used to name `~/gate-logs/.gate.lock` and to say a gate run by hand takes no lock --
+# both were one lane's wrapper convention, which is exactly what that ticket retired.
+# Reading the lock to find the victim is still declined, for three reasons rather than
 # from not knowing about it:
 #
-#   * **A gate run by hand holds nothing.** `bash scripts/local-gate.sh` typed
-#     straight into a shell is the common case this helper exists for -- a lane
-#     that has to stop its own run -- and it takes no lock. A lock-based killer
-#     would find nothing and report success.
-#   * **The holder is the WRAPPER, not the gate.** The lock is taken by the shell
-#     that then execs the gate, so the pid in it needs the same PPID walk to reach
-#     anything worth signalling.
-#   * **The descendants hold nothing either.** cmake, ninja and ctest are what
-#     orphaning actually costs, and no lock names them.
+#   * **A `flock` lock names no process a script can read.** Its holder is the gate's
+#     own `flock` process, whose CHILD is the run, so finding anything worth signalling
+#     needs the same ancestry walk this already does.
+#   * **The descendants hold nothing.** The gate re-execs under `flock -o`, so cmake,
+#     ninja and ctest -- what orphaning actually costs -- carry no lock and none names
+#     them.
+#   * **Killing the holder ALONE is the one wrong kill.** It frees the lock while the
+#     run it serialised carries on, and a second gate starts beside it. This helper
+#     takes every gate process rooted at the worktree, that `flock` included -- its
+#     command line names this script and it runs from the tree the gate `cd`s into --
+#     which is the right shape.
 #
-# The lock is a real improvement to the convention and it does not answer this
-# question. Said here so the next reader knows it was weighed rather than missed.
+# Said here so the next reader knows it was weighed rather than missed.
 #
 # Usage:
 #   scripts/reap-my-gate.sh [<worktree>]   kill the gate rooted at <worktree>

@@ -56,8 +56,11 @@ TABLE
     # @param 2 the record, as `name<TAB>status<TAB>conclusion<TAB>started_at` lines
     # @param 3 expected exit: 0 mergeable, 1 blocked, 2 refused
     # @param 4 a substring the output must carry -- the VERDICT, not just the colour
+    # @param 5 the head's `mergeable_state`, default clean -- stated by every case, since the
+    #          tool refuses a record that carries none
+    # @param 6 its `mergeable`, default true
     Case() {
-        local what="$1" record="$2" wantExit="$3" wantText="$4" out got=0
+        local what="$1" record="$2" wantExit="$3" wantText="$4" mergeState="${5:-clean}" mergeable="${6:-true}" out got=0
         cases=$((cases + 1))
         # An EMPTY record is a real state -- a SHA with no check runs yet -- and
         # `printf` would write a single blank line instead, which the reader then
@@ -69,7 +72,7 @@ TABLE
             : > "$scratch/record.tsv"
         fi
         out="$(FASTCACHED_REQUIRED_CONTEXTS_FILE="$scratch/table.sh" \
-               bash "$Tool" --record "$scratch/record.tsv" 2>&1)" || got=$?
+               bash "$Tool" --record "$scratch/record.tsv" --merge-state "$mergeState" --mergeable "$mergeable" 2>&1)" || got=$?
         local ok=1
         [[ "$got" == "$wantExit" ]] || ok=0
         # Flattened before matching: a verdict wrapped across lines is a phrase
@@ -243,6 +246,55 @@ Some Other Job	completed	failure	2026-01-01T00:00:00Z" \
     Verdict "an API error body where the total should be is unreadable" \
         "API rate limit exceeded for user ID 56763" 0 "unreadable-total"
 
+    # ---- whether the head merges (#1352) ---------------------------------
+    #
+    # A check run is never taken back, so a pull request that BECAME conflicting keeps its
+    # green verdicts. These cases share one fully green record and differ ONLY in the merge
+    # state, because that is the whole ticket: the contexts say SUCCESS in every one of them.
+    Case "a clean head with green contexts is MERGEABLE and says so on its own line" \
+        "$All" 0 "MERGE VERDICT: clean" clean true
+    Case "a DIRTY head with green contexts is NOT mergeable, and the context verdict says it cannot merge" \
+        "$All" 1 "every required context reports SUCCESS -- about a head that CANNOT MERGE" dirty false
+    Case "a head BEHIND its base with green contexts is not ready to merge" \
+        "$All" 1 "about a head BEHIND its base" behind true
+    Case "an UNKNOWN merge state is NOT YET COMPUTED, never clean" \
+        "$All" 2 "NOT YET COMPUTED" unknown null
+    Case "a blocked head with green contexts is mergeable as far as CI is concerned" \
+        "$All" 0 "MERGE VERDICT: blocked" blocked true
+    Case "a DRAFT that conflicts reads as conflicting, not as a draft" \
+        "$All" 1 "CANNOT MERGE" draft false
+    Case "a DRAFT whose mergeability is not computed is not yet computed" \
+        "$All" 2 "NOT YET COMPUTED" draft null
+    Case "a draft that merges is mergeable" \
+        "$All" 0 "every required context reports SUCCESS." draft true
+    Case "a merge state the table does not name is REFUSED by name" \
+        "$All" 2 "does not name: 'sideways'" sideways true
+    Case "GitHub's two answers disagreeing is REFUSED, not believed" \
+        "$All" 2 "disagree" dirty true
+    Case "a MERGED pull request is a record, not a question to ask again" \
+        "$All" 0 "no longer open, as a record rather than a gate" merged null
+    Case "a CLOSED pull request is a record too" \
+        "$All" 0 "MERGE VERDICT: closed" closed null
+    Case "a failing context on a dirty head still says the head cannot merge" \
+        "Alpha	completed	success	2026-01-01T00:00:00Z
+Beta	completed	success	2026-01-01T00:00:00Z
+Gamma	completed	failure	2026-01-01T00:00:00Z" \
+        1 "not SUCCESS -- about a head that CANNOT MERGE" dirty false
+
+    # And a record carrying NO merge state is a usage error, never a clean head -- the one
+    # default the tool could have chosen is the collapse.
+    cases=$((cases + 1))
+    printf '%s\n' "$All" > "$scratch/record.tsv"
+    got=0
+    out="$(FASTCACHED_REQUIRED_CONTEXTS_FILE="$scratch/table.sh" bash "$Tool" --record "$scratch/record.tsv" 2>&1)" || got=$?
+    if [[ "$got" == 2 && "$out" == *"--merge-state"* && "$out" != *"every required context reports SUCCESS"* ]]; then
+        echo "  ok    (exit $got) a record with no merge state is refused as usage, not read as clean"
+    else
+        failures=$((failures + 1))
+        echo "  FAIL  (exit $got) a record with no merge state was not refused as usage" >&2
+        printf '%s\n' "$out" | sed 's/^/        /' >&2
+    fi
+
     # An empty table is the failure this whole family has: two empty lists agree
     # perfectly, so a tool with nothing to check must refuse rather than report
     # that everything is fine.
@@ -315,7 +367,7 @@ fi
 
 # And the reader must not admit a COMMENT. Asserted directly, because the count
 # above passes whenever the two mechanisms are wrong together.
-phantoms="$(bash "$Tool" --record /dev/null 2>&1 | grep -c '^  [A-Z]* *#' || true)"
+phantoms="$(bash "$Tool" --record /dev/null --merge-state clean --mergeable true 2>&1 | grep -c '^  [A-Z]* *#' || true)"
 if [[ "$phantoms" -eq 0 ]]; then
     echo "ok: no comment line in the table is read as a required context"
 else

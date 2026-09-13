@@ -34,7 +34,8 @@
 # that date. They are a property of the image, not of the registration.
 #
 # `${FASTCACHED_BASH}` is `/bin/bash` everywhere but Windows, which has none and
-# keeps the PATH lookup. Defined once in `src/tests/CMakeLists.txt`; this asserts
+# resolves Git for Windows' `bin/bash.exe` instead, since a WSL launcher can come first
+# on its PATH (#1355). Defined once in `src/tests/CMakeLists.txt`; this asserts
 # every site uses it.
 #
 # ## Why the SET is derived and never listed

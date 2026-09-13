@@ -363,10 +363,94 @@ Decide() {
 }
 
 # ---------------------------------------------------------------------------
+# WHETHER THE HEAD MERGES -- a second question, answered on its own line (#1352).
+#
+# Every verdict above is about check runs AT THE HEAD SHA, and a check run is never taken
+# back. A pull request that BECAME conflicting after its runs finished keeps every one of
+# them, values and all, while nothing further dispatches -- so on such a head this tool
+# used to print `every required context reports SUCCESS` about a commit that cannot merge.
+# That is the dangerous green: a red invites investigation, a green invites merging, and
+# this is the script every lane is told to verify CI with. So it asks the pull request's
+# merge state as well, and says it beside the context verdict rather than folding it in.
+#
+# From REST's `mergeable_state` and `mergeable`, never GraphQL's `mergeStateStatus`, for
+# the budget reason `--pr` gives. REST spells the states in lowercase.
+#
+# A TABLE, and a state it does not name is REFUSED by name: the next word GitHub adds must
+# not land in a default arm and read as clean. `unknown` is not clean either -- GitHub
+# computes mergeability lazily, so the first query after a push routinely answers it.
+# `draft` hides the merge state, so a draft's kind is read from `mergeable` instead: our
+# pull requests are opened as drafts, and a draft that conflicts must not read as fine.
+# `merged` and `closed` are not GitHub merge states at all -- `--pr` substitutes them from
+# the same response -- because a pull request that is no longer open answers `unknown`
+# FOREVER, and telling a lane to ask again about a question nobody will compute is the
+# collapse in the other direction. Measured on #1383, merged: `unknown` with `null`.
+#
+#   state|mergeable values it is consistent with|kind|what it means for the verdict
+MergeStates=(
+    "clean|true|merges|the head merges into its base as it stands."
+    "unstable|true|merges|the head merges; a NON-required check is failing or still running."
+    "blocked|true|merges|the head merges once a repository rule is met, such as a review."
+    "has_hooks|true|merges|the head merges, subject to the repository's pre-receive hooks."
+    "behind|true|behind|the head is BEHIND its base, so the contexts describe a tree that is not what merging would produce. Rebase before merging."
+    "dirty|false|conflicts|the head CONFLICTS with its base: nothing has dispatched since it began to, so every context above is a verdict about a commit that cannot merge."
+    "unknown|null|uncomputed|NOT YET COMPUTED. GitHub computes this lazily and answers it for a while after every push; ask again. It is not clean."
+    "draft|true false null|derive|a draft, whose merge state GitHub does not report, so whether it merges is read from its separate mergeable answer."
+    "merged|true false null|history|the pull request is already MERGED: nothing is left to merge, and the contexts above are a record of its head, not a gate."
+    "closed|true false null|history|the pull request is CLOSED without merging: the contexts above are a record of its head, not a gate."
+)
+
+# The merge half of the verdict. Pure: two words in, one line out.
+#
+# @param 1 `mergeable_state` as GitHub answered it
+# @param 2 `mergeable`: true | false | null
+# @return prints `kind|sentence`, kind one of merges | behind | conflicts | uncomputed |
+#         history | refuse
+MergeVerdict() {
+    local state="$1" mergeable="$2" row word allowed kind sentence
+    case "$mergeable" in
+        true|false|null) ;;
+        *)
+            echo "refuse|the mergeable answer '$mergeable' is none of true, false or null."
+            return
+            ;;
+    esac
+    for row in "${MergeStates[@]}"; do
+        word="${row%%|*}"
+        row="${row#*|}"
+        allowed="${row%%|*}"
+        row="${row#*|}"
+        kind="${row%%|*}"
+        sentence="${row#*|}"
+        [[ "$word" == "$state" ]] || continue
+        case " $allowed " in
+            *" $mergeable "*) ;;
+            *)
+                echo "refuse|GitHub's two answers disagree -- mergeable_state '$state' with mergeable '$mergeable' -- so neither can be believed."
+                return
+                ;;
+        esac
+        if [[ "$kind" == "derive" ]]; then
+            # `mergeable` was checked above to be exactly one of these three.
+            case "$mergeable" in
+                true) kind="merges" ;;
+                false) kind="conflicts" ;;
+                null) kind="uncomputed" ;;
+            esac
+        fi
+        echo "$kind|$sentence"
+        return
+    done
+    echo "refuse|a merge state this script does not name: '$state'. Add it to MergeStates deliberately -- a word nobody enumerated is not a clean head."
+}
+
+# ---------------------------------------------------------------------------
 # Rendering and the verdict. Kept apart from `Decide` so the self-test can assert
 # on states rather than on prose.
+# @param 1 the decision file  @param 2 `mergeable_state`  @param 3 `mergeable`
 Render() {
-    local decided="$1" blocked=0 unknown=0 line state name
+    local decided="$1" mergeState="$2" mergeable="$3" blocked=0 unknown=0 line state name
+    local merge kind sentence qualifier contexts
     echo "required contexts:"
     while IFS=$'\t' read -r kind state name; do
         case "$kind" in
@@ -407,6 +491,10 @@ Render() {
 
     echo
     [[ -n "$tally" ]] && printf '%s\n' "$tally" | sed 's/^TALLY/  states:/'
+    merge="$(MergeVerdict "$mergeState" "$mergeable")"
+    kind="${merge%%|*}"
+    sentence="${merge#*|}"
+    printf '  merge:\t%s\tmergeable=%s\t%s\n' "$mergeState" "$mergeable" "$kind"
 
     if [[ -n "$refusals" ]]; then
         echo
@@ -419,23 +507,54 @@ Render() {
         echo "  A conclusion nobody has enumerated is not a pass; add it to \`stateOf\` deliberately."
         return 2
     fi
+    # The context verdict says what the merge state makes of it, on its own line, so a
+    # reader of that line alone cannot take a verdict about a stale head for a current one.
+    case "$kind" in
+        conflicts)  qualifier=" -- about a head that CANNOT MERGE, so these are verdicts about a commit that no longer merges" ;;
+        behind)     qualifier=" -- about a head BEHIND its base, not about what merging would produce" ;;
+        uncomputed) qualifier=" -- and whether the head merges is NOT YET COMPUTED" ;;
+        history)    qualifier=" -- about a pull request that is no longer open, as a record rather than a gate" ;;
+        merges|refuse) qualifier="" ;;
+        *)
+            echo
+            echo "VERDICT: REFUSING -- MergeVerdict answered a kind this script does not enumerate: '$kind'."
+            return 2
+            ;;
+    esac
     echo
     if [[ "$blocked" -eq 0 ]]; then
-        echo "VERDICT: every required context reports SUCCESS."
-        return 0
+        echo "VERDICT: every required context reports SUCCESS${qualifier}."
+        contexts=0
+    else
+        echo "VERDICT: $blocked required context(s) are not SUCCESS${qualifier} -- read the list above by NAME."
+        echo "  RUNNING   a wait."
+        echo "  ABSENT    no check run of that name exists at this SHA. On a pull request whose"
+        echo "            workflows are still queued that is a wait too, and it becomes a blocker"
+        echo "            only if it persists -- then the workflow does not fire for this event,"
+        echo "            which is the never-arrives failure check-merge-queue-contexts guards."
+        echo "  SKIPPED   reports, and a required context that skips reads as PASSING to the"
+        echo "            ruleset. It will not clear on its own."
+        echo "  FAILED    will not clear on its own."
+        echo "  WITHDRAWN a verdict was cancelled and no replacement is in flight (#903)."
+        echo "            Re-run that workflow rather than waiting."
+        contexts=1
     fi
-    echo "VERDICT: $blocked required context(s) are not SUCCESS -- read the list above by NAME."
-    echo "  RUNNING   a wait."
-    echo "  ABSENT    no check run of that name exists at this SHA. On a pull request whose"
-    echo "            workflows are still queued that is a wait too, and it becomes a blocker"
-    echo "            only if it persists -- then the workflow does not fire for this event,"
-    echo "            which is the never-arrives failure check-merge-queue-contexts guards."
-    echo "  SKIPPED   reports, and a required context that skips reads as PASSING to the"
-    echo "            ruleset. It will not clear on its own."
-    echo "  FAILED    will not clear on its own."
-    echo "  WITHDRAWN a verdict was cancelled and no replacement is in flight (#903)."
-    echo "            Re-run that workflow rather than waiting."
-    return 1
+    if [[ "$kind" == "refuse" ]]; then
+        echo "MERGE VERDICT: REFUSING -- $sentence"
+        return 2
+    fi
+    echo "MERGE VERDICT: $mergeState -- $sentence"
+    # A context that is not SUCCESS blocks whatever the merge state says. Only a fully
+    # green set asks the merge half: a head that is behind or conflicts is not ready, and
+    # one whose state is not yet computed is not known to be.
+    [[ "$contexts" -eq 0 ]] || return 1
+    case "$kind" in
+        merges|history) return 0 ;;
+        behind|conflicts) return 1 ;;
+        uncomputed) return 2 ;;
+    esac
+    echo "VERDICT: REFUSING -- no exit status is enumerated for merge kind '$kind'."
+    return 2
 }
 
 # ---------------------------------------------------------------------------
@@ -443,12 +562,15 @@ Render() {
 # `check-pr-required.sh --self-test`, which is where every verdict in this file is
 # driven from -- a reference to ANOTHER script's mode, not an offer of one here.
 usage() {
-    echo "usage: $(basename "${BASH_SOURCE[0]}") --pr <number> | --record <file>" >&2
+    echo "usage: $(basename "${BASH_SOURCE[0]}") --pr <number>" >&2
+    echo "       $(basename "${BASH_SOURCE[0]}") --record <file> --merge-state <mergeable_state> --mergeable <true|false|null>" >&2
     echo "       $(basename "${BASH_SOURCE[0]}") --listing-verdict <total_count> <rows-read>" >&2
     echo "  the verdicts are driven by scripts/check-pr-required.sh --self-test" >&2
-    echo "  exit 0 every required context is SUCCESS" >&2
-    echo "  exit 1 at least one is not, named above" >&2
-    echo "  exit 2 refusing to give a verdict about the pull request" >&2
+    echo "  exit 0 every required context is SUCCESS, and the head is neither behind nor conflicting" >&2
+    echo "         (or the pull request is no longer open, and the verdict is a record)" >&2
+    echo "  exit 1 at least one is not, named above -- or the head is behind or conflicts" >&2
+    echo "  exit 2 refusing to give a verdict about the pull request, including a merge state" >&2
+    echo "         not yet computed or not named by MergeStates" >&2
     echo "  exit 3 the instrument could not ask -- nothing was measured" >&2
     exit 2
 }
@@ -456,8 +578,10 @@ usage() {
 [[ $# -ge 1 ]] || usage
 
 case "$1" in
+    # The merge state is REQUIRED with a record. Optional, a staged record with none would
+    # have to mean something, and the only thing it could mean is clean -- the collapse.
     --record)
-        [[ $# -eq 2 ]] || usage
+        [[ $# -eq 6 && "$3" == "--merge-state" && "$5" == "--mergeable" ]] || usage
         [[ -f "$2" ]] || Fatal "no such record: $2"
         req="$(mktemp)"; dec="$(mktemp)"
         # shellcheck disable=SC2064
@@ -465,7 +589,7 @@ case "$1" in
         ReadRequiredContexts > "$req"
         ApplyReaderControl "$2" "$req"
         Decide "$2" "$req" > "$dec" || true
-        Render "$dec"
+        Render "$dec" "$4" "$6"
         ;;
     # Not a hidden mode. `ListingVerdict` is a DECISION made during acquisition,
     # and a decision reachable only through the network is one nobody has driven
@@ -491,9 +615,32 @@ case "$1" in
         #
         # gh's own stderr is left alone rather than swallowed: the API's wording
         # is what tells a rate limit from an auth failure from a 404.
-        sha="$(gh api "repos/$repo/pulls/$2" --jq '.head.sha')" \
+        #
+        # The head SHA and the merge state come from ONE response, so the two cannot describe
+        # different moments. Split by expansion rather than `IFS=$'\t' read`, which collapses
+        # an empty field and would shift `mergeable` into `mergeable_state`.
+        head="$(gh api "repos/$repo/pulls/$2" \
+            --jq '[.head.sha, (.mergeable_state // ""), (if .mergeable == null then "null" else (.mergeable | tostring) end), (if .merged then "merged" elif .state == "closed" then "closed" else "open" end)] | @tsv')" \
             || Unavailable "the API would not answer the head SHA of #$2 -- read gh's message above"
+        case "$head" in
+            *$'\t'*$'\t'*$'\t'*) ;;
+            *) Unavailable "the pull request response for #$2 did not carry four fields: '$head'" ;;
+        esac
+        sha="${head%%$'\t'*}"
+        head="${head#*$'\t'}"
+        mergeState="${head%%$'\t'*}"
+        head="${head#*$'\t'}"
+        mergeable="${head%%$'\t'*}"
+        openness="${head#*$'\t'}"
+        # A pull request that is no longer open has no merge state to compute, whatever
+        # `mergeable_state` says -- so its openness names the row instead.
+        case "$openness" in
+            open) ;;
+            merged|closed) mergeState="$openness" ;;
+            *) Unavailable "#$2 came back neither open, merged nor closed: '$openness'" ;;
+        esac
         [[ -n "$sha" ]] || Unavailable "#$2 came back with no head SHA"
+        [[ -n "$mergeState" ]] || Unavailable "#$2 came back with no mergeable_state, so nothing says whether its head merges"
         rec="$(mktemp)"; req="$(mktemp)"; dec="$(mktemp)"
         # shellcheck disable=SC2064
         trap "rm -f '$rec' '$req' '$dec'" EXIT
@@ -532,7 +679,7 @@ case "$1" in
         ReadRequiredContexts > "$req"
         ApplyReaderControl "$rec" "$req"
         Decide "$rec" "$req" > "$dec" || true
-        Render "$dec"
+        Render "$dec" "$mergeState" "$mergeable"
         ;;
     *) usage ;;
 esac

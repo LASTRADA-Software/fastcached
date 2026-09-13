@@ -682,9 +682,11 @@ determinism rests on.
     wipe left one gate's log where another's goes and it reported a failure that was
     already fixed. The pid is there because the cause is a name-matched kill, and the
     tree because that is the field such a kill does not look at.
-  - **The rule is a function, not prose**: `local-gate.sh --classify=<log>` answers
-    `passed` / `failed` / `did-not-conclude` / `no-gate-run`, each with an exit status
-    of its own, so the tooling around a run can tell. Pure -- log text in, one word out
+  - **The rule is a function, not prose**: `local-gate.sh --classify=<log>` answers one
+    word per row of the script's `gate_outcomes` table, each with an exit status of its
+    own, so the tooling around a run can tell. The rows are deliberately not listed here:
+    this sentence named four of them while the table held six, and a stale list reads as
+    complete. Pure -- log text in, one word out
     -- which is the standing answer above applied once more. `passed` and `failed` keep
     the gate's own `0` and `1`; `2` is skipped because it is the script's USAGE status,
     and `--classify=$LOG` with an unset `LOG` lands there -- a caller reading only the
@@ -1471,6 +1473,72 @@ invariably tested under. With N waiters it fails twice:
 already give: an `fcntl` lock is per PROCESS, so two gates inside one shell would both take
 it and succeed. It is not FIFO, so a lane can be unlucky; unlucky-and-bounded is not
 starving and cannot stampede, and it **must not be "improved" into a queue**.
+
+### And the gate takes the lock ITSELF, on ONE path it defines (#1379)
+
+Everything above was right, and satisfiable in a way that did nothing. `local-gate.sh` took
+no lock: serialisation lived in each session's wrapper, nothing in the repository named a
+path, and every lane invented one, so two lanes serialised only when their spellings happened
+to coincide. Measured: one lane's `flock` sat on a path no other lane used, three gates ran at
+once on one host, and that lane's lock acquired instantly every time. **A lock nobody else
+takes always acquires, which is indistinguishable from a free host — the lock's success WAS
+the symptom.** The queueing that lane did observe came from a separate hand-rolled wait loop,
+so the broken mechanism sat behind a working one where nothing could see it.
+
+So the lock is taken by the thing being serialised, and omission stops being possible:
+
+- **One path, defined once in the script** — `$HOME/.fastcached-local-gate.lock`, overridable
+  by `FASTCACHED_GATE_LOCK`. **Per user, and chosen rather than settled for.** A host-wide path
+  means `/tmp`, which WSL wipes when it idles out, and `flock` on a file unlinked while held
+  leaves the holder locking an orphaned inode while the next opener creates a fresh file and
+  acquires it: two holders, no error from either. That fails silently in exactly the direction
+  the lock exists to close, where the per-user limit is stated — in the lock's own output lines.
+  It does not cover CI, another machine, another user, or Git Bash against WSL on one Windows
+  box, whose `$HOME`s differ.
+- **After `--classify` and `--self-test`, and before the start marker.** `--self-test` is the
+  ctest entry `local-gate-selftest`, which the gate itself runs, so a lock taken before that
+  exit makes the gate queue behind itself for the whole wait. Before the marker, because the
+  marker names the commit, and a lane committing while its gate queues would otherwise get a
+  verdict naming a commit nobody measured.
+- **`flock -o`, never a descriptor the run keeps.** A descriptor is inherited by every
+  descendant, so a daemon an e2e fixture leaked would hold the gate lock for the life of the
+  machine and every later gate would queue for the whole budget and refuse. `-o` releases the
+  lock when the run ends. The price, MEASURED because the first version of this sentence got
+  it backwards: killing the waiting parent alone leaves `flock` and the run going with the
+  lock still held, while killing the **`flock` process** alone frees the lock under a run that
+  carries on, so a second gate starts beside it. Kill the process GROUP.
+- **A wrapper that already holds the lock is DETECTED rather than deadlocked against** — which
+  is what keeps every existing `flock <path> bash scripts/local-gate.sh` working, since a second
+  descriptor on the path would block against the wrapper's own. Two detectors, because neither
+  covers both cases: a marker the gate exports for its own re-exec, believed only when its pid
+  is an ANCESTOR, and a scan of the ancestors — never only the parent — for a `flock` naming the
+  same file. The marker is asked first, because the gate's own re-exec sits directly under a
+  `flock` naming that very lock and a single pass would call it a redundant wrapper. A wrapper
+  holding a **different** path is its own outcome, printed with both paths, and the gate takes
+  its own lock too: folded into *held* or *free*, a mistyped wrapper would be serialised against
+  nothing and told nothing. A wrapper holding THIS lock `-s` or `-u` excludes nobody and is
+  refused at once. The argv is read the way util-linux reads it — abbreviated long options,
+  `=` values, digits that are a FILE when a command follows — because a parser that disagrees
+  with flock's answers wrongly in both directions, silently one way and as a deadlock the other.
+  **What detection cannot see**: a lock held through a descriptor an ancestor opened, or by
+  `flock -F`, which becomes the gate rather than its parent. Neither leaves a `flock` above the
+  gate, so the gate waits on it and its refusal says so. And an ancestry that cannot be READ to
+  its root — no `/proc`, no `ps` — is reported as unknown, never as free: the parent pid comes
+  from `/proc/<pid>/stat` first precisely so that a host with util-linux and no procps does not
+  queue behind its own re-exec.
+- **`GATE NOT STARTED:` is an outcome, never a verdict** — `lock-not-acquired` when another gate
+  held the lock for the whole wait, `lock-unusable` when it could not be taken at all, each with
+  a status of its own and each read back by `--classify`. A queued run prints
+  `== GATE LOCK WAITING` first, so contention is observed rather than inferred from a long wall
+  time. The self-test proves it by CONTENTION — refused while held, acquired once released —
+  because a lock that acquires proves nothing, which is this whole section. **And it drives the
+  REAL path, not stand-ins**: the script itself, stopped by `FASTCACHED_GATE_STOP_AFTER_LOCK`
+  once the lock stage has decided. Its first version exercised `gate_lock_run` with `sh -c`
+  commands only, and a review showed three one-line mutants of the real path — the marker
+  exported under another name, the sentinel never touched, the ancestor walk returning nothing
+  — each passing it 208/208 while breaking every real run.
+- **A host without `flock` is told so and runs UNSERIALISED**, loudly. Refusing there would be a
+  gate that fails closed unconditionally on that host, which reads as *my branch is bad*.
 
 ## A count that OVERSTATES what is wrong is the same defect as one that understates it
 
@@ -3914,6 +3982,49 @@ label workflow again and still no `Build`.
   losing the other side AND a stray marker, both as additions that are not yours,
   where a marker scan sees only the second and only when it knows to look for it.
 
+### A pull request that BECAME conflicting keeps its verdicts, and reads the opposite way (#1352)
+
+The section above is right about DISPATCH and silent about RETRACTION. A conflicting pull
+request dispatches nothing from the moment it conflicts; it does not take back what was
+dispatched before that. So there are two conflicting states, and they read as opposites:
+
+<!-- table-total: none -->
+
+| it conflicted | its required contexts show | the conclusion they invite |
+|---|---|---|
+| before its head was pushed | **absent** -- no run exists | *nothing is known about this branch*, which is true |
+| after its head was pushed | **stale verdicts with real values**, from runs made while it still merged | *nearly green*, which is false |
+
+Measured on #1333: `mergeStateStatus` `DIRTY`, the branch 49 commits behind master, and
+30 contexts reporting -- 27 `SUCCESS`, 2 `SKIPPED`, 1 `FAILURE`. The failure was a
+`clang-tidy` run on head `44fe4a59` that had completed nine hours earlier, and it is still
+attached to that SHA.
+
+- **Absent looks like nothing; a stale verdict looks like information.** And the green half
+  is the dangerous half: a red invites investigation, a green invites merging. This cost a
+  wrong handover -- a pull request described as having dispatched nothing, whose contexts in
+  fact carried nine-hour-old values a lane acting on that description would have read as
+  current.
+- **So the discriminator is the pull request's state, asked FIRST, never its contexts.**
+  `gh pr view <n> --json mergeStateStatus,mergeable`: `DIRTY` or `CONFLICTING` says every
+  context below it describes a head that does not merge, whatever the context reads. The
+  ordering advice above already points here; this is the state where skipping it costs most.
+- **Neither cheap tell survives this state.** The context COUNT looks normal, because the old
+  runs are all still there. A context's completion time is a tell only against the head's
+  push time, which nobody has in hand -- and `gh`'s `completedAt` is `0001-01-01T00:00:00Z`
+  for a run still in progress, so sorting on it ranks a superseded failure above its live
+  replacement. Order runs by START time.
+- **`scripts/ci-pr-required.sh` answers the merge question, on its own line.** It reads
+  contexts at the head SHA, and a context is never retracted, so its `every required context
+  reports SUCCESS` was a true statement about a commit and silent about whether that commit
+  merges -- the dangerous green, from the script every lane verifies CI with. It now reads
+  REST's `mergeable_state` and `mergeable` from the same response as the head SHA, prints a
+  `merge:` line beside `states:` and a separate `MERGE VERDICT:`, qualifies the context verdict
+  for a head that conflicts, is behind or is not yet computed, and exits 0 only when the
+  contexts are green AND the head neither conflicts nor lags. `unknown` is its own outcome, a
+  pull request no longer open is a record rather than a question to ask again, and a state its
+  table does not name is refused by name.
+
 ## A gate that does not report reads as a gate that passed
 
 The three doors above are all about a required context that never arrives. These
@@ -4914,6 +5025,59 @@ Three rules fall out, each generalising past this change:
   is the run failing to do what it was asked. Both spellings of a driver's flags are a
   TABLE keyed on the driver NAME, never a sniff for a leading `/` -- on POSIX that starts
   a path, which is the compile-cache rule arriving from the other direction.
+
+### A suite run on a Windows host failed for the HOST, and every entry said it was the tree (#1355)
+
+Three causes, each MEASURED by running the entries on that host, and none of them visible
+from Linux. Each one presented as a defect in the tree under test -- a scan "broken, not the
+tree", a `git` fatal, a shallow clone -- so a lane meeting them either investigated a branch
+that was fine or learned to ignore the names, and an ignored red is a disarmed check.
+
+<!-- table-total: none -->
+
+| where `ctest` ran | cause | what the entries said | what closes it |
+|---|---|---|---|
+| Git Bash, with `MSYS_NO_PATHCONV=1` and `MSYS2_ARG_CONV_EXCL='*'` exported | every check INHERITED the switch, and a check spelling a POSIX path (`pwd` is `/d/...`, `mktemp` is `/tmp/...`) to a native program relies on the conversion it turns off | `mkdocs-validation`: `/d/...\mkdocs.yml does not exist -- the scan is broken, not the tree`; `script-modes-selftest`: `fatal: cannot change to '/tmp/...'`, exit 128; `workflow-script-invocations`: exit 128 and nothing else; `node-reloadable-docs-selftest`: no tracked file carries its marker; `reactor-teardown-gate-selftest`: the canary does not exist; and the `smoke` entry `fastcache-cli-e2e`, registered without the wrapper: the daemon DIED, on a config file `/tmp/.../empty.yaml` that did not exist | every test `src/tests/CMakeLists.txt` registers starts without the switch on Windows, a DEFERRED `ENVIRONMENT_MODIFICATION` so a registration appended later is covered too; `run-check.sh` unsets it as well, for a check run by hand |
+| PowerShell, or a Visual Studio developer shell | a bare `bash` resolved to `C:\Windows\System32\bash.exe`, a launcher for WSL's LINUX bash, ahead of Git on that PATH | 53 of 136 `hygiene` entries: `No such file or directory` | `FASTCACHED_BASH` on Windows is Git for Windows' `bin/bash.exe`, found beside `GIT_EXECUTABLE` and asked for `MSYSTEM` |
+| WSL over DrvFs, in a worktree the Windows git created | the absolute `gitdir:` pointer, which WSL git cannot follow | `workflow-script-invocations`: exit 128, silent; `unguarded-prerequisites-selftest`: *"a shallow clone must fetch depth 0"*; `node-reloadable-docs`: no tracked file carries its marker; `unguarded-prerequisites`: enumerated by directory WALK; `local-gate-selftest`: `no-headers` | `run-check.sh` refuses a check in a git tree the git on PATH cannot read, before it starts, printing `repair-worktree-pointers.sh`'s diagnosis; `local-gate.sh`'s live header case names the same cause |
+
+Measured, with the switch exported: the five wrapped entries fail -- exactly those five --
+with no unset anywhere, and pass with the switch not exported; `fastcache-cli-e2e` failed
+twice running with it and passed twice without. With the deferred property alone, and both
+script-level unsets removed, all six pass. From PowerShell the full native suite ran 4061
+tests with none failing.
+Under WSL in the unreadable worktree, 65 of 168 `hygiene` entries failed and all 65 named the
+unreadable work tree; after `repair-worktree-pointers.sh --apply`, none failed.
+
+- **The conversion switch belongs to the SPAWN that needs it, never to an environment a
+  suite inherits.** The bullet above says to set both spellings, always, and it is right about
+  a compiler invocation. Exported into the shell that then runs `ctest`, the same two lines
+  reach every check, and the entries that break are the ones written correctly for a POSIX
+  host. A check that needs the switch -- `check-banner-probe-identity.sh` -- already pins it
+  itself, which is the only place that can know.
+- **"Git for Windows' bash is the only one there" was a claim nobody had measured**, and it
+  lived in the comment above the registration it justified. A Windows host with WSL has two
+  more, both ahead of Git on PATH in the shells that are not Git Bash. CI's Windows legs run
+  `ctest` from `pwsh` and pass, which says that image puts Git first -- inferred from their
+  being green, not read from a log.
+- **An unreadable work tree is a REFUSAL, not a skip.** A skip is green, and a `hygiene` label
+  reporting green over checks that never asked git anything is the collapse `run-check.sh`
+  exists to remove. What it does NOT cover: a tree with no `.git` entry and a host with no
+  git both still run, by the walk their checks carry, since neither has a git answer to be
+  wrong about.
+- **The ticket named six entries and they were two things.** Five were the conversion switch.
+  The sixth, `e2e-helpers-selftest`, is not registered on Windows at all -- `if(NOT WIN32)`
+  since `26d8ac60`, before the ticket -- and its reported "120 s" was the CALLER's foreground
+  cap on a run by hand that exited 0, not the registration's `TIMEOUT 120`. Under WSL it
+  took 69 s at `-j 8`.
+- **And a full run found one more that no single-entry run would.** `RefusalNotice: two
+  daemons and two causes throttle separately` failed once at `-j 16` and passed alone. It
+  wrote its stamps into a bare `UniqueScratchPath`, never cleared and never removed, at a
+  FIXED epoch -- so a leftover from an earlier run whose pid Windows handed out again read as
+  *announced a second ago*. Staged by planting a leftover for every multiple of 4 below 65536
+  (76 real ones were already in `%TEMP%`): 5 of 5 runs failed, and 0 of 5 once the case took
+  `ScratchDirectory`, which clears first. A pid separates LIVE processes; it does not separate
+  a live one from a dead one's leftovers unless something clears them.
 
 ## What the TSan scope covers, and the three ways it has been wrong
 
