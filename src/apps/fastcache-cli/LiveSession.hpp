@@ -91,15 +91,20 @@ class IRungViews
     virtual ~IRungViews() = default;
 
     /// @param rung The rung decided for this session.
+    /// @param plan What was admitted: the subject whose panel is drawn, and the interval it states.
+    /// @param address Where the samples are asked, as a frame names it.
     /// @return Its view, or null for a rung this build has no view for -- which refuses the
     ///         session by name rather than drawing it through some other rung's view.
-    [[nodiscard]] virtual std::unique_ptr<IDashboardView> For(RenderRung rung) = 0;
+    [[nodiscard]] virtual std::unique_ptr<IDashboardView> For(RenderRung rung,
+                                                              LivePlan const& plan,
+                                                              std::string_view address) = 0;
 };
 
 /// Everything a session is composed from. `main` acquires each part; nothing here does.
 struct LiveSessionParts
 {
     LivePlan plan {};                            ///< What was admitted.
+    std::string address {};                      ///< Where the samples are asked, as a frame names it.
     IReactor* reactor { nullptr };               ///< Where the session runs.
     IStatsGatherer* gatherer { nullptr };        ///< What each sample asks, until one fails.
     IAdminDocument* admin { nullptr };           ///< What a document sample asks; see `LiveSubjectSpec::document`.
@@ -109,7 +114,7 @@ struct LiveSessionParts
     IExecutor* samplePool { nullptr };           ///< Where a gather or a document fetch blocks.
     IExecutor* stopWaiter { nullptr };           ///< Where the stop wait blocks: its own thread.
     IExecutor* terminalPool { nullptr };         ///< Where terminal reads block: its own thread.
-    IFrameSink* sink { nullptr };                ///< Where frames go.
+    IFrameSink* sink { nullptr };                ///< Where a piped session's frames go; never an interactive one's.
     bool interactive { false };                  ///< `StandardStreamsAreInteractive()`, asked by `main`.
     ITerminalAcquisition* terminals { nullptr }; ///< Asked only when interactive.
     IStopSignalInstaller* stops { nullptr };     ///< Asked only when not.
@@ -126,10 +131,11 @@ struct LiveSessionRun
 /// Compose and run one `live-stats` session.
 ///
 /// **Interactive**: acquire the terminal (on its own pool), decide the rung from what it
-/// reported, and listen to it; a terminal that cannot be acquired REFUSES the session naming
-/// why, and never falls back to piped output -- that would change the output's shape under a
-/// script somebody wrote by copying an interactive run. **Not interactive**: acquire no
-/// terminal at all, install the stop request instead, and draw on the `Piped` rung.
+/// reported, listen to it, and draw every frame through ITS presenter -- on the alternate screen,
+/// never to `parts.sink`; a terminal that cannot be acquired REFUSES the session naming why, and
+/// never falls back to piped output -- that would change the output's shape under a script
+/// somebody wrote by copying an interactive run. **Not interactive**: acquire no terminal at all,
+/// install the stop request instead, and draw on the `Piped` rung to `parts.sink`.
 ///
 /// **The source is closed on every way the loop ends**, an exception included, because the
 /// source drains only after a close and a terminal that went away on its own closes nothing.
@@ -175,12 +181,13 @@ struct LiveSessionRun
                                                       DrainBound bound,
                                                       IDrainWait& wait);
 
-/// The views this build draws through: the `Piped` rung's record stream, in `--format`.
+/// The views this build draws through: the `Piped` rung's record stream, in `--format`, and the
+/// subject's panel on every interactive rung.
 ///
-/// **The interactive rungs answer null**, which refuses an interactive session by name. Drawing a
-/// terminal session through the piped view instead would change the output's shape under a
-/// script copied from a run at that terminal, which is the silent fall back §1.6 rules out. The
-/// Sixel, Unicode and ASCII views are the panels' own and take their rows here when they land.
+/// **A subject with no panel answers null on an interactive rung**, which refuses the session by
+/// name. Drawing a terminal session through the piped view instead would change the output's
+/// shape under a script copied from a run at that terminal, which is the silent fall back §1.6
+/// rules out.
 class StandardRungViews final: public IRungViews
 {
   public:
@@ -188,7 +195,9 @@ class StandardRungViews final: public IRungViews
     /// @param project What a row reports.
     StandardRungViews(RenderOptions render, FigureProjection project);
 
-    [[nodiscard]] std::unique_ptr<IDashboardView> For(RenderRung rung) override;
+    [[nodiscard]] std::unique_ptr<IDashboardView> For(RenderRung rung,
+                                                      LivePlan const& plan,
+                                                      std::string_view address) override;
 
   private:
     RenderOptions _render;
@@ -203,12 +212,13 @@ class StandardRungViews final: public IRungViews
 struct LiveSessionSeat
 {
     IReactor* reactor { nullptr };               ///< Running on a thread of its own.
+    std::string address {};                      ///< Where the samples are asked, as a frame names it.
     IClock* clock { nullptr };                   ///< What samples are stamped with: `SteadyClock`.
     IStatsDialer* dialer { nullptr };            ///< What re-dials the endpoint after a failed sample.
     IExecutor* samplePool { nullptr };           ///< Where a gather blocks.
     IExecutor* stopWaiter { nullptr };           ///< Where the stop wait blocks.
     IExecutor* terminalPool { nullptr };         ///< Where terminal reads block.
-    IFrameSink* sink { nullptr };                ///< Where frames go: stdout.
+    IFrameSink* sink { nullptr };                ///< Where a piped session's frames go: stdout.
     bool streamsInteractive { false };           ///< `StandardStreamsAreInteractive()`.
     RenderOptions render {};                     ///< The `--format` and `--absent` asked for.
     ITerminalAcquisition* terminals { nullptr }; ///< Asked only for an interactive session.

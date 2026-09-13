@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
+#include "CliFormat.hpp"
+#include "DashboardPanel.hpp"
 #include "LiveSession.hpp"
 #include "TerminalCapabilities.hpp"
 
@@ -6,9 +8,13 @@
 
 #include <cassert>
 #include <chrono>
+#include <cstddef>
 #include <exception>
 #include <format>
+#include <memory>
 #include <semaphore>
+#include <string>
+#include <string_view>
 #include <utility>
 
 namespace FastCache::Cli
@@ -89,6 +95,7 @@ Task<std::expected<LiveSessionRun, Answer>> RunComposedSession(LiveSessionParts 
                                          .clock = parts.clock,
                                          .interval = parts.plan.interval,
                                          .terminal = nullptr,
+                                         .frames = nullptr,
                                          .stop = nullptr,
                                          .stopWaiter = nullptr };
     auto rung = RenderRung::Piped;
@@ -106,6 +113,10 @@ Task<std::expected<LiveSessionRun, Answer>> RunComposedSession(LiveSessionParts 
                                       started.error())));
         rung = ChooseRenderRung(started->capabilities);
         sourceParts.terminal = std::move(started->events);
+        // The source owns the presenter beside the events, and releases it first: see
+        // `LiveSourceParts::frames`.
+        sourceParts.frames = std::move(started->frames);
+        assert(sourceParts.frames != nullptr && "a started terminal names where its frames go");
     }
     else if (auto installed = parts.stops->Install(); installed.has_value())
     {
@@ -121,26 +132,31 @@ Task<std::expected<LiveSessionRun, Answer>> RunComposedSession(LiveSessionParts 
     }
 
     // Once, and before the first event: see `IRungViews`.
-    auto const view = parts.views->For(rung);
+    auto const view = parts.views->For(rung, parts.plan, parts.address);
     if (view == nullptr)
     {
         // Released before refusing, closed first as its contract asks: nothing reads it, and an
         // acquired terminal left in raw mode is the most visible way this command can fail.
+        sourceParts.frames.reset();
         if (sourceParts.terminal != nullptr)
         {
             sourceParts.terminal->Close();
             sourceParts.terminal.reset();
         }
-        co_return std::unexpected(
-            Concluded(Outcome::Local,
-                      "cannot draw live-stats on this terminal: the interactive views are not built yet; run "
-                      "it with its output redirected for one line per sample instead"));
+        co_return std::unexpected(Concluded(Outcome::Local,
+                                            std::format("cannot draw live-stats {} on this terminal: this build has "
+                                                        "no panel for it; run it with its output redirected for one "
+                                                        "line per sample instead",
+                                                        subject.key)));
     }
 
     source->emplace(std::move(sourceParts));
     auto const closeOnExit = CloseOnExit { &**source };
-    run.exit = co_await RunDashboard(
-        &**source, parts.reader, view.get(), parts.sink, DashboardLimits { .samples = parts.plan.samples });
+    // An interactive session draws on the terminal's presenter and never on the pipe.
+    auto* const terminalFrames = (*source)->Frames();
+    auto* const sink = terminalFrames != nullptr ? terminalFrames : parts.sink;
+    run.exit =
+        co_await RunDashboard(&**source, parts.reader, view.get(), sink, DashboardLimits { .samples = parts.plan.samples });
     co_return run;
 }
 
@@ -173,11 +189,22 @@ StandardRungViews::StandardRungViews(RenderOptions render, FigureProjection proj
 {
 }
 
-std::unique_ptr<IDashboardView> StandardRungViews::For(RenderRung rung)
+std::unique_ptr<IDashboardView> StandardRungViews::For(RenderRung rung, LivePlan const& plan, std::string_view address)
 {
-    if (rung != RenderRung::Piped)
+    if (rung == RenderRung::Piped)
+        return std::make_unique<PipedRecordView>(_render.format, _render.absentOverride, _project);
+
+    auto const panel = LiveSubjectTable[static_cast<std::size_t>(plan.subject)].panel;
+    if (panel == nullptr)
         return nullptr;
-    return std::make_unique<PipedRecordView>(_render.format, _render.absentOverride, _project);
+    // A panel is drawn for a person, so its absent marker is the human format's unless the
+    // operator named one: the same text on every rung (§9.6).
+    auto absent = _render.absentOverride.value_or(
+        std::string { FormatTable[static_cast<std::size_t>(OutputFormat::Human)].absentText });
+    return std::make_unique<PanelView>(
+        panel(),
+        PanelContext {
+            .absent = std::move(absent), .endpoint = std::string { address }, .interval = plan.interval, .rung = rung });
 }
 
 SessionEnding RunLiveStatsSession(VerbContext const& context, LiveSessionSeat const& seat)
@@ -218,6 +245,7 @@ SessionEnding RunLiveStatsSession(VerbContext const& context, LiveSessionSeat co
     auto const endpoint = plan->endpoint;
     auto parts = LiveSessionParts {
         .plan = *std::move(plan),
+        .address = seat.address,
         .reactor = seat.reactor,
         .gatherer = context.stats,
         .admin = context.admin,
