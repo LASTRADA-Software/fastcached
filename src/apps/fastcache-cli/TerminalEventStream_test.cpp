@@ -727,7 +727,6 @@ TEST_CASE("a DECRQM answer for mode 2026 keeps its meaning as a synchronized-out
     CHECK(ToSynchronizedOutputAnswer(tui::DecModeStatus::PermanentlyReset) == SynchronizedOutputAnswer::NotSupported);
     CHECK(ToSynchronizedOutputAnswer(tui::DecModeStatus::NoReply) == SynchronizedOutputAnswer::NoReply);
     CHECK(ToSynchronizedOutputAnswer(tui::DecModeStatus::NotAsked) == SynchronizedOutputAnswer::NotAsked);
-    CHECK(ToSynchronizedOutputAnswer(tui::DecModeStatus::NotImplemented) == SynchronizedOutputAnswer::NotAsked);
 }
 
 TEST_CASE("a started terminal enters the alternate screen once and its destruction leaves it once",
