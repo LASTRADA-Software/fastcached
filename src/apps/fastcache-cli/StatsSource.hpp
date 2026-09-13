@@ -110,6 +110,15 @@ struct StatsAttempt
     std::string note {};                         ///< Why it produced nothing, or why it was not asked.
 };
 
+/// The field `ChooseStats` prepends to a winning record, naming which source answered.
+///
+/// On stdout rather than only in a remark: *which numbers am I looking at* is a question a
+/// script asks too, and a dashboard that cannot tell a 102-counter reading from a 7-field one
+/// will draw the second as if the missing 95 were zero. In this header rather than beside its
+/// one writer, because the dashboard READS it -- a change of source breaks a run -- and a
+/// reader spelling the name again is a second copy that can disagree with the first.
+inline constexpr std::string_view StatsSourceFieldName = "source";
+
 /// Choose which attempt to report and say what was covered.
 ///
 /// Pure, so the interesting cases -- every source silent, the rich one down and the

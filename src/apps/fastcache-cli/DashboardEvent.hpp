@@ -1,12 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include "CliAnswer.hpp"
+#include "SocketExchange.hpp"
 #include "StatsSource.hpp"
 
 #include <FastCache/Async/Task.hpp>
+#include <FastCache/Core/Clock.hpp>
 
+#include <chrono>
 #include <cstdint>
+#include <expected>
+#include <optional>
 #include <string>
+#include <type_traits>
+#include <vector>
 
 namespace FastCache::Cli
 {
@@ -38,8 +46,8 @@ namespace FastCache::Cli
 /// are events with names rather than states a test has to contrive.
 enum class DashboardEventKind : std::uint8_t
 {
-    Tick,         ///< The render cadence fired.
-    Sample,       ///< A stats reading arrived; `attempts` carries it, absence included.
+    Tick,         ///< A frame is owed. The source decides when; the loop keeps no cadence.
+    Sample,       ///< A reading arrived, raw; the session's reader decides what it says.
     SampleFailed, ///< The source could not be read at all. NOT a sample of zeroes.
     Key,          ///< A keystroke arrived.
     Resize,       ///< The terminal geometry changed.
@@ -59,13 +67,40 @@ struct DashboardEvent
 {
     DashboardEventKind kind { DashboardEventKind::Tick };
 
-    /// `Sample` only: what each source said, in the gatherer's own vocabulary.
+    /// `Sample` and `SampleFailed`: when the reading was TAKEN, on the injected steady clock.
     ///
-    /// The RAW attempts rather than an already-chosen record, so the fold runs
-    /// `ChooseStats` itself. That keeps the decision -- every source silent, the rich
-    /// one down and the thin one up, one never asked -- inside the deterministic half
-    /// where a fixture can reach it, instead of behind a socket.
+    /// A rate is a change divided by the time it took, and that time is measured rather than
+    /// assumed. The nominal `--interval` would count the wait that was ASKED for instead of the
+    /// one that happened -- `DrainWithin`'s defect -- so a sampler that fell behind would report
+    /// every rate too high by exactly how far behind it was, and nothing would say so.
+    ///
+    /// A steady `TimePoint`, and the `static_assert` below the struct keeps it one. A wall clock
+    /// is not a duration -- this tree has measured WSL2 stepping `CLOCK_REALTIME` backwards -- so
+    /// #134 §9.4's *wall time steps back and no rate moves* holds because no wall time can be
+    /// stored here at all.
+    TimePoint at {};
+
+    /// `Sample`, `cache` and `node` sessions: what each stats source said.
+    ///
+    /// The RAW attempts rather than an already-chosen record, so the decision -- every source
+    /// silent, the rich one down and the thin one up, one never asked -- is made by the reader
+    /// the fold was given, inside the deterministic half where a fixture can reach it, instead
+    /// of behind a socket.
     std::vector<StatsAttempt> attempts {};
+
+    /// `Sample`, `fleet` session: what the leader's admin document fetch produced.
+    ///
+    /// Raw for the reason `attempts` is: success or failure, it is the reader's to interpret. A
+    /// `/fleet.txt` answer is a table rather than a stats attempt, so without its own member a
+    /// fleet session could not stream at all. Disengaged on a `cache` or `node` sample.
+    std::optional<std::expected<std::string, AdminError>> document {};
+
+    /// `SampleFailed`: what the failure means as an outcome.
+    ///
+    /// A run that never read anything ends with this, and `Unreachable` and `Refused` are
+    /// different exit codes -- 3 and 4 -- with different remedies. A failure that did not say
+    /// which would force the loop to pick one for it.
+    Outcome outcome { Outcome::Unreachable };
 
     /// `SampleFailed` and `Detached`: why, in words for a person.
     std::string note {};
@@ -86,6 +121,10 @@ struct DashboardEvent
     int rows { 0 };
 };
 
+/// A wall `time_point` cannot be stored as when a reading was taken.
+static_assert(std::is_same_v<decltype(DashboardEvent::at)::clock, std::chrono::steady_clock>,
+              "DashboardEvent::at must be a steady-clock time: a wall clock is not a duration");
+
 /// Where the dashboard's input comes from.
 ///
 /// **One door, and it SUSPENDS.** A source that resolved synchronously would satisfy
@@ -96,8 +135,9 @@ struct DashboardEvent
 /// returning a ready task: a fake that resolves what production suspends on cannot
 /// exercise a suspension protocol.
 ///
-/// Production multiplexes a tick timer, a terminal reader and a sampler into one queue;
-/// a fixture is a list. The loop cannot tell them apart, which is the point.
+/// Production multiplexes a terminal reader and a sampler into one queue and owes a frame
+/// after each sample and after each resize -- it runs no tick timer. A fixture is a list.
+/// The loop cannot tell them apart, which is the point.
 class IDashboardEventSource
 {
   public:
