@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <deque>
 #include <exception>
+#include <mutex>
 #include <string_view>
 #include <utility>
 #include <variant>
@@ -168,6 +169,44 @@ namespace
 
 namespace
 {
+    /// `StartedTerminal::restore`: at most one `RestoreNow` reaches the device, and none once the
+    /// device's teardown has begun.
+    ///
+    /// A mutex rather than an atomic flag, because a flag cannot keep the DEVICE alive: a call from
+    /// another thread that has passed the check must finish before the events' destructor tears the
+    /// device down. The lock is held across the device call, and `Detach` takes it, so that
+    /// destructor waits.
+    class TerminalRestoreHandle final: public ITerminalRestore
+    {
+      public:
+        explicit TerminalRestoreHandle(ITerminalDevice* device) noexcept:
+            _device { device }
+        {
+        }
+
+        void RestoreNow() noexcept override
+        {
+            auto const lock = std::scoped_lock { _mutex };
+            if (_device == nullptr)
+                return;
+            _device->RestoreNow();
+            // The idempotence: nothing reaches the device through this handle again.
+            _device = nullptr;
+        }
+
+        /// The device is being torn down, and the teardown restores the terminal. After this
+        /// returns, no call reaches the device, and none is still inside it.
+        void Detach() noexcept
+        {
+            auto const lock = std::scoped_lock { _mutex };
+            _device = nullptr;
+        }
+
+      private:
+        std::mutex _mutex;
+        ITerminalDevice* _device;
+    };
+
     /// The events of a started terminal, owning the device they are read from.
     ///
     /// Member ORDER is the lifetime: the stream borrows the device's event source, so the device is
@@ -179,9 +218,11 @@ namespace
     {
       public:
         StartedTerminalEvents(std::unique_ptr<ITerminalDevice> device,
-                              std::unique_ptr<IDashboardEventSource> stream) noexcept:
+                              std::unique_ptr<IDashboardEventSource> stream,
+                              std::shared_ptr<TerminalRestoreHandle> restore) noexcept:
             _device { std::move(device) },
-            _stream { std::move(stream) }
+            _stream { std::move(stream) },
+            _restore { std::move(restore) }
         {
         }
 
@@ -193,6 +234,9 @@ namespace
         ~StartedTerminalEvents() override
         {
             _stream.reset();
+            // Before the teardown, so a restore-now racing it from another thread either finished
+            // already or never reaches the device.
+            _restore->Detach();
             _device->Restore();
         }
 
@@ -209,6 +253,7 @@ namespace
       private:
         std::unique_ptr<ITerminalDevice> _device;
         std::unique_ptr<IDashboardEventSource> _stream;
+        std::shared_ptr<TerminalRestoreHandle> _restore;
     };
 
     /// Restores a device when a start leaves by any path but success.
@@ -348,9 +393,10 @@ Task<std::expected<StartedTerminal, std::string>> StartTerminalDevice(std::uniqu
         .columns = device->Columns(),
         .rows = device->Rows(),
     });
-    auto events = std::make_unique<StartedTerminalEvents>(std::move(device), std::move(stream));
+    auto restore = std::make_shared<TerminalRestoreHandle>(device.get());
+    auto events = std::make_unique<StartedTerminalEvents>(std::move(device), std::move(stream), restore);
     guard.Keep();
-    co_return StartedTerminal { .capabilities = *capabilities, .events = std::move(events) };
+    co_return StartedTerminal { .capabilities = *capabilities, .events = std::move(events), .restore = std::move(restore) };
 }
 
 } // namespace FastCache::Cli
