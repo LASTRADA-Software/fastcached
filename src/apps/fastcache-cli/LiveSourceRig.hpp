@@ -19,6 +19,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <cstddef>
 #include <memory>
@@ -47,6 +48,60 @@ inline constexpr auto Interval = std::chrono::milliseconds { 2000 };
                             .record = RecordValue({ Field { .name = "curr_connections", .value = TextCell("10") } }),
                             .note = {} } };
 }
+
+/// A round in which the source was asked and did not answer: what a dead connection gives.
+/// @return The attempts.
+[[nodiscard]] inline std::vector<StatsAttempt> NothingAnswered()
+{
+    return { StatsAttempt { .origin = StatsOrigin::Info, .asked = true, .record = std::nullopt, .note = "closed" } };
+}
+
+/// A gatherer whose connection dies after its first answer, as a daemon's does when it restarts.
+class DyingGatherer final: public IStatsGatherer
+{
+  public:
+    [[nodiscard]] std::vector<StatsAttempt> Gather() override
+    {
+        return ++_calls == 1 ? Reading() : NothingAnswered();
+    }
+
+    /// @return How many gathers it served.
+    [[nodiscard]] int Calls() const noexcept
+    {
+        return _calls;
+    }
+
+  private:
+    int _calls { 0 };
+};
+
+/// Dials gatherers from a script, counting the dials.
+class ScriptedDialer final: public IStatsDialer
+{
+  public:
+    /// @param answers Whether each dial's gatherer answers; the last is repeated.
+    explicit ScriptedDialer(std::vector<bool> answers):
+        _answers { std::move(answers) }
+    {
+    }
+
+    [[nodiscard]] std::unique_ptr<IStatsGatherer> Dial() override
+    {
+        auto const answers = _answers[std::min(_dials, _answers.size() - 1)];
+        ++_dials;
+        return std::make_unique<ScriptedGatherer>(answers ? Reading() : NothingAnswered());
+    }
+
+    /// @return How many dials were made.
+    [[nodiscard]] std::size_t Dials() const noexcept
+    {
+        return _dials;
+    }
+
+  private:
+    std::vector<bool> _answers;
+    std::size_t _dials { 0 };
+};
 
 /// What became of a terminal a source owned.
 struct TerminalRelease
@@ -173,6 +228,7 @@ struct Rig
     {
         return LiveSourceParts { .reactor = &reactor,
                                  .gatherer = &gatherer,
+                                 .dialer = nullptr,
                                  .pool = &pool,
                                  .clock = &clock,
                                  .interval = Interval,

@@ -188,10 +188,12 @@ class RecordingRungViews final: public IRungViews
 /// How a composition's collaborators misbehave, when a case wants them to.
 struct CompositionFaults
 {
-    bool detachAtOnce { false };  ///< An acquired terminal goes away before its first read.
-    std::string stopRefusal {};   ///< Why installing the stop request fails; empty when it does not.
-    bool throwingViews { false }; ///< Every view throws on its first frame.
-    bool pipedViewsOnly { false }; ///< Only the `Piped` rung has a view, as in this build.
+    bool detachAtOnce { false };          ///< An acquired terminal goes away before its first read.
+    std::string stopRefusal {};           ///< Why installing the stop request fails; empty when it does not.
+    bool throwingViews { false };         ///< Every view throws on its first frame.
+    bool pipedViewsOnly { false };        ///< Only the `Piped` rung has a view, as in this build.
+    IStatsGatherer* gatherer { nullptr }; ///< What samples ask instead of the rig's gatherer, when set.
+    IStatsDialer* dialer { nullptr };     ///< What re-dials after a failed sample; none when null.
 };
 
 /// Await a composed session into @p out, recording an exception rather than losing it.
@@ -227,7 +229,9 @@ struct Composition
         terminals { rig.reactor, std::move(terminal), faults.detachAtOnce },
         stops { rig.reactor, std::move(faults.stopRefusal) },
         views { faults.throwingViews, faults.pipedViewsOnly },
-        terminalPool { rig.clock }
+        terminalPool { rig.clock },
+        gatherer { faults.gatherer != nullptr ? faults.gatherer : &rig.gatherer },
+        dialer { faults.dialer }
     {
     }
 
@@ -236,6 +240,8 @@ struct Composition
     ScriptedInstaller stops;
     RecordingRungViews views;
     TestReactor terminalPool;
+    IStatsGatherer* gatherer;
+    IStatsDialer* dialer;
     std::optional<LiveEventSource> source;
     std::optional<std::expected<LiveSessionRun, Answer>> result;
     bool threw { false };
@@ -251,7 +257,8 @@ struct Composition
                                                            .samples = samples,
                                                            .endpoint = "10.0.0.4:6674" },
                                         .reactor = &rig.reactor,
-                                        .gatherer = &rig.gatherer,
+                                        .gatherer = gatherer,
+                                        .dialer = dialer,
                                         .reader = &ReadStatsSample,
                                         .clock = &rig.clock,
                                         .samplePool = &rig.pool,
@@ -474,6 +481,23 @@ TEST_CASE("the standard views draw the piped rung and have no view for an intera
     CHECK(views.For(RenderRung::Ascii) == nullptr);
 }
 
+TEST_CASE("a composed session re-dials after a failed sample and reaches its budget", "[cli][live][session][redial]")
+{
+    // The composition hands its dialer to the source: the connection dies after one reading, and
+    // the budget of two is met only because the sample after the gap was taken over a re-dial.
+    Rig rig;
+    DyingGatherer dying;
+    ScriptedDialer dialer { { true } };
+    Composition composition { rig, SixelTerminal, CompositionFaults { .gatherer = &dying, .dialer = &dialer } };
+    composition.Start(false, 2);
+    composition.RunFor(3);
+
+    CHECK(composition.Stop() == DashboardStop::SampleBudget);
+    CHECK(dialer.Dials() == 1);
+
+    composition.Finish();
+}
+
 TEST_CASE("an interactive terminal that cannot be acquired refuses the session naming why", "[cli][live][session]")
 {
     // Never a silent fall back to piped output: an interactive run whose shape changed under it
@@ -660,6 +684,31 @@ class GatedGatherer final: public IStatsGatherer
     std::atomic<bool> _opened { false };
 };
 
+/// A connection that dies after one answer and is never re-dialled past a third ask: the third
+/// ask presses Ctrl-C, so a session that failed to re-dial ends rather than waiting forever for
+/// a budget only a re-dial could meet.
+class BoundedDyingGatherer final: public IStatsGatherer
+{
+  public:
+    /// @param stop What the third ask presses.
+    explicit BoundedDyingGatherer(StopOnDemandInstaller* stop) noexcept:
+        _stop { stop }
+    {
+    }
+
+    [[nodiscard]] std::vector<StatsAttempt> Gather() override
+    {
+        auto const call = ++_calls;
+        if (call == 3)
+            _stop->Press();
+        return call == 1 ? Reading() : NothingAnswered();
+    }
+
+  private:
+    StopOnDemandInstaller* _stop;
+    int _calls { 0 };
+};
+
 /// Frames as one stream, written on the reactor's thread and read on the case's.
 class StreamingSink final: public IFrameSink
 {
@@ -728,6 +777,7 @@ struct RunningSeat
     {
         return LiveSessionSeat { .reactor = &reactor,
                                  .clock = &clock,
+                                 .dialer = dialer,
                                  .samplePool = &samplePool,
                                  .stopWaiter = &stopWaiter,
                                  .terminalPool = &terminalPool,
@@ -751,6 +801,7 @@ struct RunningSeat
     RenderOptions render;
     bool streamsInteractive;
     bool stoppedFromGather;
+    IStatsDialer* dialer { nullptr };
     SteadyClock clock;
     PlatformReactor reactor { clock };
     ThreadPoolExecutor samplePool { 1 };
@@ -768,9 +819,9 @@ struct RunningSeat
     std::jthread thread;
 };
 
-/// The invocation a session verb is handed.
+/// The invocation a session verb is handed, at the cache subject's floor interval.
 /// @param operands The operands.
-/// @param samples `--samples`.
+/// @param samples `--samples`; 0 for none given.
 /// @param identity What the endpoint is.
 /// @param stats What each sample asks.
 /// @return The context.
@@ -780,7 +831,11 @@ struct RunningSeat
                                          IStatsGatherer* stats)
 {
     return VerbContext {
-        .operands = operands, .options = VerbOptions { .samples = samples }, .stats = stats, .identity = identity
+        .operands = operands,
+        .options = VerbOptions { .interval = LiveSubjectTable[static_cast<std::size_t>(LiveSubject::Cache)].minInterval,
+                                 .samples = samples == 0 ? std::nullopt : std::optional<std::size_t> { samples } },
+        .stats = stats,
+        .identity = identity
     };
 }
 
@@ -895,6 +950,28 @@ TEST_CASE("a live-stats session stopped with a sample out drains when the sample
     CHECK((seat.source.has_value() && seat.source->IsDrained()));
 }
 
+TEST_CASE("a live-stats session re-dials through the seat's dialer after a failed sample",
+          "[cli][live][session][seat][redial]")
+{
+    // What `main` hands over reaches the source: the connection dies after one reading, and a
+    // budget of two is met only over a re-dial. Two intervals at the floor, so about two seconds.
+    // Without the re-dial the dead connection is asked a third time, which presses Ctrl-C: the
+    // case fails on its assertions rather than waiting forever.
+    auto seat = RunningSeat { RenderOptions { .format = OutputFormat::Tsv }, false, true };
+    auto identity = ScriptedIdentity { CacheDaemon() };
+    auto dying = BoundedDyingGatherer { &seat.onDemand };
+    ScriptedDialer dialer { { true } };
+    seat.dialer = &dialer;
+
+    auto const ending = RunLiveStatsSession(SessionContext({}, 2, &identity, &dying), seat.Seat());
+
+    CHECK(ending.kind == SessionEndKind::Ran);
+    CHECK(ending.answer.outcome == Outcome::Affirmative);
+    CHECK(dialer.Dials() == 1);
+    // The header, a reading, the gap, and the reading over the re-dial.
+    CHECK(std::ranges::count(seat.Stream(), '\n') == 4);
+}
+
 TEST_CASE("a live-stats session with no stats source is refused before anything is composed", "[cli][live][session][seat]")
 {
     auto seat = RunningSeat { RenderOptions { .format = OutputFormat::Tsv }, false };
@@ -915,7 +992,11 @@ TEST_CASE("a live-stats fleet session is refused by name while fleet sessions ca
                                                           .detail = "10.0.0.4:6674 is a fastcache-compile-node" } };
     auto const operands = std::vector<std::string> { "fleet" };
 
-    auto const ending = RunLiveStatsSession(SessionContext(operands, 1, &identity, &seat.gatherer), seat.Seat());
+    // At fleet's own default, which the cache floor the other cases use is below.
+    auto context = SessionContext(operands, 1, &identity, &seat.gatherer);
+    context.options.interval = std::nullopt;
+
+    auto const ending = RunLiveStatsSession(context, seat.Seat());
 
     CHECK(ending.kind == SessionEndKind::Refused);
     CHECK(ending.answer.outcome == Outcome::Local);
