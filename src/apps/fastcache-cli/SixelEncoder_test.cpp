@@ -53,6 +53,20 @@ namespace
     return count;
 }
 
+/// FNV-1a, 64 bit, over @p bytes. Not `std::hash`, whose value is each standard library's own.
+/// @param bytes The bytes.
+/// @return The digest.
+[[nodiscard]] constexpr std::uint64_t Fnv1a64(std::string_view bytes) noexcept
+{
+    auto hash = std::uint64_t { 0xcbf29ce484222325ULL };
+    for (auto const byte: bytes)
+    {
+        hash ^= static_cast<std::uint8_t>(byte);
+        hash *= std::uint64_t { 0x100000001b3ULL };
+    }
+    return hash;
+}
+
 /// The production encoder, which this build must have.
 /// @return The encoder.
 [[nodiscard]] std::unique_ptr<ISixelEncoder> Production()
@@ -79,29 +93,31 @@ TEST_CASE("the Sixel adapter answers with a body whose raster attributes are the
     CHECK(!body->contains('\x1b'));
 }
 
-TEST_CASE("encoding one image twice gives the same bytes", "[cli][dashboard][sixel]")
+TEST_CASE("an image encodes through the adapter to the same bytes on every standard library", "[cli][dashboard][sixel]")
 {
-    // The property measured before this seam existed, kept as a test so a change to the vendored
-    // encoder that brings in nondeterminism within a build is seen here. It says nothing about
-    // other standard libraries, which differ (SixelEncoder.hpp).
-    auto encoder = Production();
+    // The vendored quantizer orders pixels by a total order, so an encoding's bytes are a constant.
+    // WHAT DISTINGUISHES: the image is the vendored test's tie-shaped fixture -- many pixels share each
+    // channel's level -- on which a split left to a sort's tie order, a pixel dropped or moved, or a
+    // palette ceiling passed differently each gives another digest. The digest is the one the vendored
+    // `tui/Sixel_test.cpp` records for the same image and ceiling, measured identical on libstdc++,
+    // libc++ and MSVC's library; this case says the adapter hands the encoder that image unchanged.
+    constexpr auto Side = std::size_t { 48 };
+    constexpr auto Ceiling = std::size_t { 16 };
+    constexpr auto RecordedDigest = std::uint64_t { 0xbace46a6344de1d9ULL };
+
     auto pixels = std::vector<std::uint8_t> {};
-    auto state = std::uint32_t { 12345 };
-    std::ranges::for_each(std::views::iota(std::size_t { 0 }, std::size_t { 40 * 30 }), [&](std::size_t) {
-        state = (state * 1664525U) + 1013904223U;
-        pixels.insert(pixels.end(),
-                      { static_cast<std::uint8_t>(state >> 24U),
-                        static_cast<std::uint8_t>(state >> 16U),
-                        static_cast<std::uint8_t>(state >> 8U),
-                        std::uint8_t { 255 } });
-    });
-    auto const image = RgbaImage { .pixels = pixels, .width = 40, .height = 30 };
-    auto const first = encoder->Encode(image, 64);
-    auto const second = encoder->Encode(image, 64);
-    REQUIRE(first.has_value());
-    REQUIRE(second.has_value());
-    CHECK(*first == *second);
-    CHECK(first->size() > 100);
+    std::ranges::for_each(std::views::iota(std::uint32_t { 0 }, static_cast<std::uint32_t>(Side * Side)),
+                          [&](std::uint32_t index) {
+                              auto const hash = index * std::uint32_t { 2654435761U };
+                              auto const level = [hash](unsigned shift) {
+                                  return static_cast<std::uint8_t>(((hash >> shift) % 16U) * 17U);
+                              };
+                              pixels.insert(pixels.end(), { level(8U), level(16U), level(24U), std::uint8_t { 255 } });
+                          });
+    auto encoder = Production();
+    auto const body = encoder->Encode(RgbaImage { .pixels = pixels, .width = Side, .height = Side }, Ceiling);
+    REQUIRE(body.has_value());
+    CHECK(Fnv1a64(*body) == RecordedDigest);
 }
 
 TEST_CASE("a Sixel image with no width or one past what the encoder addresses is refused by name", "[cli][dashboard][sixel]")
