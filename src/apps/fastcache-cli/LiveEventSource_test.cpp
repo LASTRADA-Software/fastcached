@@ -656,6 +656,81 @@ TEST_CASE("a node sample carries the node's status, read afresh with every sampl
     CloseAndDrain(rig, source);
 }
 
+namespace
+{
+
+/// A node whose status read takes a while, on the rig's clock.
+class SlowNodeStatus final: public INodeStatusReader
+{
+  public:
+    /// @param clock The clock the read advances.
+    /// @param takes How long each read takes.
+    SlowNodeStatus(ManualClock* clock, Duration takes) noexcept:
+        _clock { clock },
+        _takes { takes }
+    {
+    }
+
+    [[nodiscard]] std::optional<CompileCacheWire::NodeStatusFields> ReadNodeStatus() override
+    {
+        _clock->Advance(_takes);
+        return NodeStatusNamed("slow");
+    }
+
+  private:
+    ManualClock* _clock;
+    Duration _takes;
+};
+
+/// A gatherer that notes when, on the rig's clock, the counters answered.
+class ClockedGatherer final: public IStatsGatherer
+{
+  public:
+    /// @param clock What it reads.
+    explicit ClockedGatherer(ManualClock* clock) noexcept:
+        _clock { clock }
+    {
+    }
+
+    [[nodiscard]] std::vector<StatsAttempt> Gather() override
+    {
+        _answeredAt = _clock->Now();
+        return Reading();
+    }
+
+    /// @return When the last gather answered.
+    [[nodiscard]] TimePoint AnsweredAt() const noexcept
+    {
+        return _answeredAt;
+    }
+
+  private:
+    ManualClock* _clock;
+    TimePoint _answeredAt {};
+};
+
+} // namespace
+
+TEST_CASE("a node sample is stamped when its counters answered, not when its status did", "[cli][live][source][status]")
+{
+    // A rate is divided by the time between two stamps. A status round trip taken between the counters
+    // and the stamp would put its own duration into every rate's denominator.
+    Rig rig;
+    ClockedGatherer counters { &rig.clock };
+    SlowNodeStatus status { &rig.clock, std::chrono::milliseconds { 300 } };
+    auto parts = rig.Parts();
+    parts.gatherer = &counters;
+    parts.status = &status;
+    LiveEventSource source { std::move(parts) };
+    rig.Settle();
+
+    auto const sample = NextDue(rig, source);
+    REQUIRE(KindOf(sample) == DashboardEventKind::Sample);
+    CHECK(Unwrap(sample).at == counters.AnsweredAt());
+
+    CloseAndDrain(rig, source);
+}
+
 TEST_CASE("a failed node sample still carries the status read with it", "[cli][live][source][status]")
 {
     // The model REPLACES its status with every sample taken, a failed one included, so a failure

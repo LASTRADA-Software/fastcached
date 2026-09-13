@@ -156,7 +156,7 @@ class FailureRemarks final: public IDashboardEventSource
 struct LiveSessionParts
 {
     LivePlan plan {};                            ///< What was admitted.
-    std::string address {};                      ///< Where the samples are asked, as a frame names it.
+    std::string address {};                      ///< The endpoint this invocation dialled, as a frame names it.
     IReactor* reactor { nullptr };               ///< Where the session runs.
     IStatsGatherer* gatherer { nullptr };        ///< What each sample asks, until one fails.
     INodeStatusReader* status { nullptr };       ///< What a node sample asks for its status; see `readsNodeStatus`.
@@ -278,7 +278,7 @@ class StandardRungViews final: public IRungViews
 struct LiveSessionSeat
 {
     IReactor* reactor { nullptr };               ///< Running on a thread of its own.
-    std::string address {};                      ///< Where the samples are asked, as a frame names it.
+    std::string address {};                      ///< The endpoint this invocation dialled, as a frame names it.
     IClock* clock { nullptr };                   ///< What samples are stamped with: `SteadyClock`.
     IStatsDialer* dialer { nullptr };            ///< What re-dials the endpoint after a failed sample.
     IExecutor* samplePool { nullptr };           ///< Where a gather blocks.
