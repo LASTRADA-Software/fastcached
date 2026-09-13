@@ -4,6 +4,7 @@
 
 #include <FastCache/Async/Task.hpp>
 #include <FastCache/Core/HostPort.hpp>
+#include <FastCache/Core/StopAwareWait.hpp>
 #if defined(FC_TLS_ENABLED)
     #include <FastCache/Net/TlsContext.hpp>
 #endif
@@ -783,7 +784,7 @@ FleetSampler::FleetSampler(std::optional<Distributed::FleetSources> sources,
                  PerSeriesKiB * 2,
                  PerSeriesKiB);
 
-    _thread = std::jthread { [this](std::stop_token stop) {
+    _thread = std::jthread { [this](std::stop_token const& stop) {
         auto sinceSave = std::chrono::steady_clock::duration::zero();
         while (!stop.stop_requested())
         {
@@ -794,13 +795,11 @@ FleetSampler::FleetSampler(std::optional<Distributed::FleetSources> sources,
                 sinceSave = std::chrono::steady_clock::duration::zero();
             }
 
-            // Interruptible, rather than a sleep this loop would have to wake from
-            // on its own schedule. A stop that had to wait out a full interval makes
-            // teardown look hung, which this repository has already paid for once as
-            // a `systemctl stop` that escalated to SIGKILL.
-            auto guard = std::unique_lock { _wakeMutex };
-            (void) _wake.wait_for(
-                guard, stop, Distributed::FleetHistory::SampleInterval, [&stop] { return stop.stop_requested(); });
+            // A stop ends the wait at once: one that had to wait out a full interval makes
+            // teardown look hung, which this repository has already paid for once as a
+            // `systemctl stop` that escalated to SIGKILL.
+            if (WaitForStopOr(stop, Distributed::FleetHistory::SampleInterval) == WaitEnd::Stopped)
+                break;
             sinceSave += Distributed::FleetHistory::SampleInterval;
         }
     } };
@@ -809,7 +808,6 @@ FleetSampler::FleetSampler(std::optional<Distributed::FleetSources> sources,
 FleetSampler::~FleetSampler()
 {
     _thread.request_stop();
-    _wake.notify_all();
     if (_thread.joinable())
         _thread.join();
     // One last write, so a clean shutdown does not throw away up to five minutes of

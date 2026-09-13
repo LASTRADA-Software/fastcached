@@ -51,6 +51,7 @@
 #include <FastCache/Core/HostPort.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Core/ReadinessMarker.hpp>
+#include <FastCache/Core/StopAwareWait.hpp>
 #include <FastCache/Core/Version.hpp>
 #include <FastCache/Distributed/FleetView.hpp>
 #include <FastCache/Distributed/LeaseToken.hpp>
@@ -77,14 +78,12 @@
 #include <atomic>
 #include <charconv>
 #include <chrono>
-#include <condition_variable>
 #include <csignal>
 #include <cstdlib>
 #include <filesystem>
 #include <format>
 #include <iostream>
 #include <map>
-#include <mutex>
 #include <optional>
 #include <span>
 #include <string>
@@ -111,10 +110,6 @@ using namespace FastCache::Node;
 /// its place in the fleet until it re-registers, while one that arrives early costs
 /// a few bytes.
 constexpr std::chrono::seconds HeartbeatInterval { 20 };
-
-/// Slices the heartbeat sleep is broken into, so a stop request is observed
-/// promptly rather than after a full interval.
-constexpr int HeartbeatSlices = 20;
 
 /// How many heartbeats between unconditional toolchain sweeps.
 ///
@@ -144,6 +139,14 @@ constexpr std::chrono::milliseconds HeartbeatConnectTimeout { 1'000 };
 /// something else has to notice and close the listener, and it cannot be the
 /// accept loop, which is parked inside `Accept()`. Short enough that `systemctl
 /// stop` and Ctrl-C feel immediate, long enough to cost nothing while idle.
+///
+/// **A poll, deliberately, where the heartbeat and the enrollment ticker WAIT
+/// (`WaitForStopOr`, #1339).** Those two wait on a `std::stop_token` that another
+/// thread requests; this loop waits on `DaemonControls`' flags, which a signal or
+/// console handler sets, and a handler may only store an atomic -- notifying a
+/// condition variable from one is not async-signal-safe. Nothing can wake a wait
+/// here without a new mechanism (a self-pipe, an event handle), and the same loop
+/// also takes reload requests off the other flag.
 constexpr std::chrono::milliseconds StopPollInterval { 100 };
 
 /// Record a stop request.
@@ -398,31 +401,21 @@ constexpr std::chrono::seconds EnrollmentWarningTick { 1 };
 /// It owns no rule. The DECISION is `EnrollmentWindow::TakeDueWarning`, which is pure
 /// over an injected clock and is tested against a `ManualClock`; this is the driver.
 ///
-/// The stop token is IN the wait rather than checked between sleeps, so a stop ends
-/// this loop at once. `EnrollmentWarningTick` therefore bounds only how late a DUE
-/// warning is logged; it is not a teardown cost, which is what a sliced sleep pays.
-///
-/// The heartbeat loop below still slices, so this is deliberately **not** the same
-/// shape -- an earlier draft of this comment said it was, and converting only this
-/// loop is what made that false. Converting that one is #1339; until it lands the
-/// divergence lives there rather than in a comment claiming a sameness this function
-/// stopped having.
+/// The stop token is IN the wait rather than checked between sleeps (`WaitForStopOr`),
+/// so a stop ends this loop at once. `EnrollmentWarningTick` therefore bounds only how
+/// late a DUE warning is logged; it is not a teardown cost. The heartbeat loop waits the
+/// same way, through the same function.
 /// @param window The window to ask.
 /// @param logger Where a due warning is written.
 /// @param stop Participates in the wait, so a requested stop ends it immediately.
 void WarnWhileWindowIsOpen(Node::EnrollmentWindow& window, ILogger& logger, std::stop_token const& stop)
 {
-    // Nothing else ever notifies this: the stop token is the only wakeup, and
-    // `wait_for` registers for it rather than polling for it, so the mutex and the
-    // variable are locals rather than members somebody else could signal.
-    auto wakeMutex = std::mutex {};
-    auto wake = std::condition_variable_any {};
     while (!stop.stop_requested())
     {
         if (auto const due = window.TakeDueWarning(); due.has_value())
             logger.Logf(LogLevel::Warn, "{}", *due);
-        auto guard = std::unique_lock { wakeMutex };
-        (void) wake.wait_for(guard, stop, EnrollmentWarningTick, [&stop] { return stop.stop_requested(); });
+        if (WaitForStopOr(stop, EnrollmentWarningTick) == WaitEnd::Stopped)
+            break;
     }
 }
 
@@ -1882,11 +1875,10 @@ void AdoptAllowlist(Cc::CompileJobRunner& jobs,
 
             PublishRegistration(runtimeState, statusClock, registrars, AnnounceRound(round, link, heartbeatConnector));
 
-            // Slept in slices so a stop request is observed promptly: a worker that
-            // took a full heartbeat interval to exit would hold its port that long
-            // against a restart.
-            for (int slice = 0; slice < HeartbeatSlices && !stop.stop_requested(); ++slice)
-                std::this_thread::sleep_for(HeartbeatInterval / HeartbeatSlices);
+            // A worker that took even part of the interval to exit would hold its port
+            // that long against a restart.
+            if (WaitForStopOr(stop, HeartbeatInterval) == WaitEnd::Stopped)
+                break;
         }
     } };
 

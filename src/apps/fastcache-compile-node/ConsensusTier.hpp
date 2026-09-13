@@ -26,7 +26,6 @@
 
 #include <atomic>
 #include <chrono>
-#include <condition_variable>
 #include <cstdint>
 #include <expected>
 #include <functional>
@@ -618,14 +617,6 @@ class ConsensusTier final: public Distributed::IClusterAdmin
     /// Whichever finishes last stops the reactor, so `Run()` never returns while a
     /// coroutine is still parked on it -- which would leak that frame outright.
     std::atomic<int> _loopsRunning { 2 };
-
-    /// Wakes the reconciler for a stop rather than leaving it in a bare sleep.
-    ///
-    /// A stop that had to wait out a full interval would make teardown look hung
-    /// for a second per node, which is the shape of defect this repository has
-    /// already paid for once as a `systemctl stop` that escalated to SIGKILL.
-    std::condition_variable_any _wake;
-    std::mutex _wakeMutex;
 
     // Started last and joined first, which the member order gives for free.
     std::jthread _ioThread;
