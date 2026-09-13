@@ -16,6 +16,9 @@ namespace FastCache::Cli
 
 namespace
 {
+    /// `Ctrl+C`: the quit key that stays one while a view `CapturesText`, so a session is always leavable.
+    constexpr std::string_view InterruptKey = "\x03";
+
     /// The keystrokes that mean *leave*.
     ///
     /// A table rather than an `if` ladder, so a fourth spelling is a row. `ESC` is here
@@ -23,7 +26,7 @@ namespace
     /// it is safe only because this view sends no query whose reply begins with `ESC`
     /// -- the DA1 exchange is over before the loop starts, which is stage 2's one-shot
     /// probe, not a thing that can arrive mid-run.
-    constexpr auto QuitKeys = std::to_array<std::string_view>({ "q", "Q", "\x03", "\x1b" });
+    constexpr auto QuitKeys = std::to_array<std::string_view>({ "q", "Q", InterruptKey, "\x1b" });
 
     /// Whether a reading continues the run the reading before it belongs to.
     ///
@@ -293,7 +296,7 @@ Task<DashboardExit> RunDashboard(
                 break;
 
             case DashboardEventKind::Key:
-                if (!IsQuitKey(event.keys))
+                if (!IsQuitKey(event.keys) || (view->CapturesText() && event.keys != InterruptKey))
                 {
                     // Owed now, not at the next `Tick`: the view changed, and nothing was read.
                     if (view->Key(event.keys))

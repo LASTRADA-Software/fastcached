@@ -1283,3 +1283,70 @@ TEST_CASE("a quit key is not offered to the view", "[cli][dashboard]")
     CHECK(view.offered.empty());
     CHECK(sink.frames.empty());
 }
+
+namespace
+{
+
+/// A view that is typing text until it is offered Enter.
+class TypingView final: public IDashboardView
+{
+  public:
+    [[nodiscard]] DashboardFrame PlacedFrame(DashboardModel const& model) override
+    {
+        (void) model;
+        return DashboardFrame { .text = std::format("typed {}", typed), .placements = {} };
+    }
+
+    [[nodiscard]] bool Key(std::string_view keys) override
+    {
+        offered.emplace_back(keys);
+        if (keys == "\r")
+        {
+            typing = false;
+            return true;
+        }
+        typed += keys;
+        return true;
+    }
+
+    [[nodiscard]] bool CapturesText() const noexcept override
+    {
+        return typing;
+    }
+
+    bool typing { true };
+    std::string typed {};
+    std::vector<std::string> offered {};
+};
+
+} // namespace
+
+TEST_CASE("a view typing text is offered the quit keys as text, and Ctrl+C still ends the run", "[cli][dashboard]")
+{
+    // WHAT DISTINGUISHES: `q` and `Esc` reach the view while it types and the run goes on; once it stops
+    // typing `q` quits as ever; and `Ctrl+C` quits while it types -- a loop asking the quit table first
+    // ends on the first `q`, and one that handed every key to a typing view could never be left.
+    auto typing = TypingView {};
+    auto sink = CollectingSink {};
+    auto const exit = Drive({ DashboardEvent { .kind = DashboardEventKind::Key, .keys = "q" },
+                              DashboardEvent { .kind = DashboardEventKind::Key, .keys = "\x1b" },
+                              DashboardEvent { .kind = DashboardEventKind::Key, .keys = "\x03" },
+                              DashboardEvent { .kind = DashboardEventKind::Key, .keys = "x" } },
+                            DashboardLimits {},
+                            typing,
+                            sink);
+    CHECK(exit.stop == DashboardStop::Quit);
+    CHECK(typing.offered == std::vector<std::string> { "q", "\x1b" });
+    CHECK(sink.frames == std::vector<std::string> { "typed q", "typed q\x1b" });
+
+    auto done = TypingView {};
+    auto doneSink = CollectingSink {};
+    auto const doneExit = Drive({ DashboardEvent { .kind = DashboardEventKind::Key, .keys = "\r" },
+                                  DashboardEvent { .kind = DashboardEventKind::Key, .keys = "q" },
+                                  DashboardEvent { .kind = DashboardEventKind::Key, .keys = "x" } },
+                                DashboardLimits {},
+                                done,
+                                doneSink);
+    CHECK(doneExit.stop == DashboardStop::Quit);
+    CHECK(done.offered == std::vector<std::string> { "\r" });
+}

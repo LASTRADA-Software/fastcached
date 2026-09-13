@@ -400,7 +400,8 @@ class IDashboardView
         return PlacedFrame(model).text;
     }
 
-    /// Act on a keystroke that is not a quit key.
+    /// Act on a keystroke that is not a quit key -- or on any keystroke but `Ctrl+C` while the view
+    /// `CapturesText`.
     ///
     /// **What a view is showing is the view's state, not the model's**: the model is what was READ,
     /// and a key reads nothing. So a key the view acts on changes the view, and the loop draws the
@@ -412,6 +413,17 @@ class IDashboardView
     [[nodiscard]] virtual bool Key(std::string_view keys)
     {
         (void) keys;
+        return false;
+    }
+
+    /// Whether the view is taking typed text, so `q` and `Esc` are characters of it rather than a quit.
+    ///
+    /// **Asked before the quit keys, and `Ctrl+C` is never text**: a filter an operator is typing a
+    /// hostname into must be able to hold a `q`, and must still be leavable by the one key that always
+    /// stops a session. The default takes none, which is every view with no text to edit.
+    /// @return True while the view is editing text.
+    [[nodiscard]] virtual bool CapturesText() const noexcept
+    {
         return false;
     }
 };

@@ -178,31 +178,47 @@ struct TierColumn
 /// How a panel draws the fleet document a `fleet` reading carries (#134 §5).
 ///
 /// **No column list lives here, or anywhere in this client** (#1320): a section's columns are the
-/// header line the leader sent, walked as it arrived. So what the layout knows about a table it
-/// cannot name ahead of time is POSITIONAL, and stated here as data: the first column says which row
-/// a line is and is `Essential`, and every later column shares `columnPriority` -- among equals
-/// `FitPieces` drops the rightmost first, so columns go from the right.
+/// header line the leader sent, walked as it arrived. **Which of them survive a narrow terminal is the
+/// leader's decision too**, asked by name (`Distributed::FleetColumnKeep`) exactly as a column's scale
+/// is: `Identity` is essential, `Vital` goes last, `Detail` first, and a column the leader's tables do
+/// not name keeps the default. **The width is filled by rank**: the most important columns first, then
+/// every next column that still fits, among equals the leftmost first -- so a narrow column is drawn in
+/// room a wider, more important one could not use, as §5 keeps `cores` at 80 and leaves `memory` out. The
+/// positional rule this replaced dropped `heartbeat-age` -- the column §5 calls the row this panel exists
+/// for -- first.
 ///
 /// **The chart is the Sixel rung's alone** (#134's decision on Sixel): on that rung, with a cell size the
 /// terminal reported and an encoder to draw it, the first `FleetChartMetrics` row is drawn per machine
-/// across the history as one image over `chartCellsHigh` rows of blank cells, placed in the frame and
-/// dropped for height at `chartPriority` like any other item. On every other rung there is no chart
-/// row at all -- not blank rows, not a glyph imitation.
+/// across the history as one image over at least `chartCellsHigh` rows of blank cells, placed in the
+/// frame and dropped for height at `chartPriority` like any other item. **It yields rows to the table**:
+/// it goes before a machine row is hidden, and it grows into rows nothing else wants, up to
+/// `chartCellsHighMost`. On every other rung there is no chart row at all -- not blank rows, not a glyph
+/// imitation.
 ///
-/// The headline tiles are the `kpi` section's rows, in `Distributed::FleetKpiKeys()` order and under
-/// those keys: the page's labels are prose beside its own table and are not restated here. Within a
-/// tile the denominator goes before the tile does, and tiles that do not fit the width at all are
-/// not drawn -- they are not essential, so they never turn a frame into the minimum-size line.
+/// The headline tiles are the `kpi` section's rows, in `Distributed::FleetKpis()` order, under the
+/// page's own labels and with its nouns (`of 192 slots`, `not yet resolved`); a figure the page draws a
+/// trend for draws one here. Tiles that carry words fill the first column and the rest the second, so
+/// the strip is two columns at 80 wide, as §5 draws it; narrower they stack, then lose their words, and
+/// tiles that do not fit at all are not drawn -- they are not essential, so they never turn a frame
+/// into the minimum-size line.
+///
+/// **A table taller than its room gives up rows before the tiles go**: it shrinks at `tableShrinkPriority`
+/// down to `tableRowsKept` rows, and only an essential shrink takes it below that. Its last line says what
+/// is not shown and how to reach it (`... 8 more machines; PgDn scrolls, / filters`).
 struct DocumentSpec
 {
-    std::size_t chartCellsHigh { 6 };               ///< Rows of cells the Sixel chart covers.
-    std::size_t chartMinimumCells { 24 };           ///< The fewest cells across the chart is drawn in; narrower, it goes.
-    Priority tilePriority { Priority::Normal };     ///< When a line of tiles goes, for height.
-    Priority stripPriority { Priority::Low };       ///< When the section strip goes, for height.
-    Priority stripTabPriority { Priority::Low };    ///< When a tab other than the active one goes, for width.
-    Priority tablePriority { Priority::Essential }; ///< When the section's table shrinks to `+N more`, and goes.
-    Priority columnPriority { Priority::Normal };   ///< When a column after the first goes, for width.
-    Priority chartPriority { Priority::Low };       ///< When the Sixel chart goes, for height.
+    std::size_t chartCellsHigh { 6 };                  ///< The fewest rows of cells the Sixel chart covers.
+    std::size_t chartCellsHighMost { 16 };             ///< The most it grows to, into rows nothing else wants.
+    std::size_t chartMinimumCells { 24 };              ///< The fewest cells across the chart is drawn in; narrower, it goes.
+    std::size_t tableRowsKept { 3 };                   ///< The rows a table keeps before the tiles go.
+    Priority tilePriority { Priority::Normal };        ///< When a line of tiles goes, for height.
+    Priority stripPriority { Priority::High };         ///< When the section strip goes, for height.
+    Priority stripTabPriority { Priority::Low };       ///< When a tab other than the active one goes, for width.
+    Priority keysHintPriority { Priority::Low };       ///< When the strip's `keys` hint goes, for width; before any tab.
+    Priority tablePriority { Priority::Essential };    ///< When the section's table goes; an essential one only shrinks.
+    Priority tableShrinkPriority { Priority::Normal }; ///< When the table gives up rows down to `tableRowsKept`.
+    Priority filterPriority { Priority::High };        ///< When an applied filter's line goes; while typed it stays.
+    Priority chartPriority { Priority::Low };          ///< When the Sixel chart goes, for height.
 };
 
 /// A fact a panel's title bar states about its session rather than its content (#134 §3-§5).
@@ -257,6 +273,12 @@ struct PanelSpec
     Priority tierPriority { Priority::Normal };  ///< When the tier table shrinks, then goes, for height.
     Priority tierNotePriority { Priority::Low }; ///< When the tier note lines go.
     Priority sourcePriority { Priority::High };  ///< When the source line goes.
+    /// Whether the frame is as tall as the terminal, its source line on the last row.
+    ///
+    /// A frame that ends halfway down the screen reads as one that stopped drawing, and §5 draws the fleet
+    /// panel's box the terminal's full height. The rows are padded above the source line, after the chart
+    /// has grown into what it can use.
+    bool fillsHeight { false };
     std::optional<DocumentSpec> document {};     ///< The fleet document block; nullopt for a panel without one.
     std::span<TitleFactRow const> titleFacts {}; ///< What the title bar states beside `title`, in reading order.
 };
@@ -441,9 +463,10 @@ struct PanelContext
 ///
 /// **The sections a key walks are the ones the strip names**: the tabular rows of
 /// `Distributed::FleetSectionTable`, in its order. `Tab` and `Right` step to the next, `Left` to the
-/// previous, both wrapping; a digit `1`-`9` names the strip's tab in that position. From a section
-/// the strip does not name, the first step lands on its first or last tab. A key naming no section,
-/// or a digit past the last tab, switches nothing.
+/// previous, both wrapping; a digit `1`-`9` names the strip's tab in that position, and each tab's
+/// letter -- the strip's `keys  m w l c t` -- names that tab. From a section the strip does not name,
+/// the first step lands on its first or last tab. A key naming no section, or a digit past the last
+/// tab, switches nothing.
 /// @param active The section drawn now.
 /// @param keys The bytes the keystroke delivered.
 /// @return The section to draw, or nullopt when the key names none.
@@ -467,17 +490,33 @@ class PanelView final: public IDashboardView
     /// @return The frame, with the fleet chart placed over it on the Sixel rung.
     [[nodiscard]] DashboardFrame PlacedFrame(DashboardModel const& model) override;
 
-    /// Switch a document panel's table to the section @p keys names (`SectionForKey`).
+    /// Act on a key for a document panel's table.
     ///
-    /// A panel without a document block has no sections and acts on no key.
+    /// A section key (`SectionForKey`) switches the table, and the new section starts at its top with no
+    /// filter. `PgDn` and `PgUp` scroll it by the rows the last frame showed, `Home` goes back to the top.
+    /// `/` starts typing a filter: while typed, printable text is appended, `Backspace` takes the last
+    /// character, `Enter` keeps the filter and `Esc` clears it. A row is drawn when any of its written
+    /// cells contains the filter, ignoring ASCII case. A panel without a document block acts on no key.
     /// @param keys The bytes the keystroke delivered.
-    /// @return Whether the section changed.
+    /// @return Whether the next frame differs.
     [[nodiscard]] bool Key(std::string_view keys) override;
+
+    /// @return True while a filter is being typed.
+    [[nodiscard]] bool CapturesText() const noexcept override;
 
   private:
     PanelSpec const* _spec;
     RungGlyphs const* _glyphs;
     PanelContext _context;
+
+    /// The table's rows skipped at the top; clamped by the frame that draws it.
+    std::size_t _scroll { 0 };
+
+    /// How many of the table's rows the last frame showed: the step `PgDn` and `PgUp` take.
+    std::size_t _page { 1 };
+
+    /// The filter the table's rows are matched against; empty for none.
+    std::string _filter {};
 
     /// Cells kept for the widest beside text any frame has written at the current width.
     ///
@@ -488,6 +527,9 @@ class PanelView final: public IDashboardView
 
     /// The content width `_besideReserve` was measured at.
     std::size_t _reserveColumns { 0 };
+
+    /// Whether the filter is being typed; last, so it pads nothing between 8-aligned members.
+    bool _typingFilter { false };
 };
 
 } // namespace FastCache::Cli
