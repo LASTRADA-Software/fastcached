@@ -4,8 +4,10 @@
 #include "DashboardFrame.hpp"
 #include "DashboardRung.hpp"
 
+#include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Platform/Terminal.hpp>
 
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 
@@ -54,6 +56,52 @@ enum class SynchronizedOutputAnswer : std::uint8_t
     NotAsked,     ///< No DECRQM was sent: there was no terminal input to read a reply from.
 };
 
+/// Whether a frame's dressed runs may be written with colour and attributes, and why not.
+///
+/// TRANSMITTED/PERSISTED: no. Private; enumerators may be inserted.
+///
+/// Decided once, where the rest of the record is, from the one resolution this program makes of
+/// `--color` (`always`, `never`, or `auto`: a terminal, unless `NO_COLOR` says otherwise). Only
+/// `Supported` dresses anything; the other two are different facts about why a frame is plain.
+enum class ColourAnswer : std::uint8_t
+{
+    Supported,  ///< Colour and attributes are written.
+    Suppressed, ///< `--color` resolved to plain: `never`, `NO_COLOR`, or no terminal to colour.
+    NotAsked,   ///< Nothing decided it; a record nobody filled is plain.
+};
+
+/// How one `FrameTone` looks where colour is allowed.
+///
+/// **Colour by palette index, never by value**, so a terminal theme's own green is what an operator
+/// sees, and a light theme stays legible: a tone says *fine*, *look at this* or *act*, never a shade.
+struct TonePaletteRow
+{
+    FrameTone tone;                     ///< The enumerator this row describes.
+    std::optional<std::uint8_t> colour; ///< The foreground's palette index, or none to keep the terminal's.
+    bool bold;                          ///< Whether the run is bold.
+    bool dim;                           ///< Whether it is dimmed.
+    bool inverse;                       ///< Whether it is drawn in inverse video.
+};
+
+/// The one palette: a row per `FrameTone`, in enumerator order (#134 G1).
+///
+/// Figures carry weight and what names them recedes; the active choice is inverse; state is the
+/// terminal's green, yellow and red. Every panel's dressed runs are looked up here and nowhere else.
+inline constexpr EnumTable<FrameTone, TonePaletteRow> TonePalette { {
+    { .tone = FrameTone::Selected, .colour = std::nullopt, .bold = false, .dim = false, .inverse = true },
+    { .tone = FrameTone::Figure, .colour = std::nullopt, .bold = true, .dim = false, .inverse = false },
+    { .tone = FrameTone::Label, .colour = std::nullopt, .bold = false, .dim = true, .inverse = false },
+    { .tone = FrameTone::Fresh, .colour = std::uint8_t { 2 }, .bold = false, .dim = false, .inverse = false },
+    { .tone = FrameTone::Stale, .colour = std::uint8_t { 3 }, .bold = true, .dim = false, .inverse = false },
+    { .tone = FrameTone::Alert, .colour = std::uint8_t { 1 }, .bold = true, .dim = false, .inverse = false },
+    { .tone = FrameTone::LevelLow, .colour = std::uint8_t { 2 }, .bold = false, .dim = false, .inverse = false },
+    { .tone = FrameTone::LevelMid, .colour = std::uint8_t { 3 }, .bold = false, .dim = false, .inverse = false },
+    { .tone = FrameTone::LevelHigh, .colour = std::uint8_t { 1 }, .bold = false, .dim = false, .inverse = false },
+} };
+
+static_assert(RowsInEnumeratorOrder(TonePalette, &TonePaletteRow::tone),
+              "TonePalette must hold one row per FrameTone, in enumerator order");
+
 /// Everything the rung is decided from, and what a frame may be presented with.
 struct TerminalCapabilities
 {
@@ -67,12 +115,27 @@ struct TerminalCapabilities
     /// Whether a frame may be bracketed in synchronized output. Read by the presenter, not the rung.
     SynchronizedOutputAnswer synchronizedOutput { SynchronizedOutputAnswer::NotAsked };
 
+    /// Whether a frame's dressed runs are written with the palette. Read by the presenter, not the rung:
+    /// a plain frame is the same grid, the active section in `[brackets]` either way.
+    ColourAnswer colour { ColourAnswer::NotAsked };
+
     /// How many pixels a cell measures (`CSI 16 t`), or nullopt when the terminal did not say.
     ///
     /// Nullopt is not a default size to assume: an image sized from a guess is the wrong size while
     /// every figure beside it is right. So without it the Sixel rung is not chosen at all.
     std::optional<CellPixelSize> cellPixels {};
 };
+
+/// How @p tone is dressed on a terminal with @p capabilities.
+/// @param tone A tone below `Last`.
+/// @param capabilities The record.
+/// @return The palette row, or null where the record allows no colour and the run is written plain.
+[[nodiscard]] constexpr TonePaletteRow const* PaletteFor(FrameTone tone, TerminalCapabilities const& capabilities) noexcept
+{
+    if (capabilities.colour != ColourAnswer::Supported || tone >= FrameTone::Last)
+        return nullptr;
+    return &TonePalette[static_cast<std::size_t>(tone)];
+}
 
 /// The rung a terminal with @p capabilities is drawn on.
 ///

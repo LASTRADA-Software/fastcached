@@ -7,6 +7,7 @@
 
 #include <FastCache/Async/IExecutor.hpp>
 #include <FastCache/Async/Task.hpp>
+#include <FastCache/Cli/UsageDoc.hpp>
 
 #include <expected>
 #include <memory>
@@ -141,9 +142,11 @@ struct StartedTerminal
 /// question.
 /// @param pool Where acquiring the terminal and each blocking wait run.
 /// @param resumeOn Where `StartTerminal` and `Next()` resume before they return.
+/// @param colour `--color` as this program resolved it, which the capability record's `colour` answers.
 /// @return The unstarted terminal, or why none could be made.
 [[nodiscard]] std::expected<std::unique_ptr<UnstartedTerminal>, std::string> MakeTerminalEvents(IExecutor* pool,
-                                                                                                IExecutor* resumeOn);
+                                                                                                IExecutor* resumeOn,
+                                                                                                UsageColor colour);
 
 /// Acquire @p terminal and learn what it can draw.
 ///

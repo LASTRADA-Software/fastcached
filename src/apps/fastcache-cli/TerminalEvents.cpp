@@ -52,8 +52,9 @@ namespace
     class EndoTerminalDevice final: public ITerminalDevice
     {
       public:
-        EndoTerminalDevice():
-            _source { _terminal, &_wakeup }
+        explicit EndoTerminalDevice(UsageColor colour):
+            _source { _terminal, &_wakeup },
+            _colour { colour }
         {
         }
 
@@ -107,6 +108,11 @@ namespace
         [[nodiscard]] TerminalTextEncoding Encoding() override
         {
             return DetectTerminalTextEncoding();
+        }
+
+        [[nodiscard]] ColourAnswer AskColour() override
+        {
+            return _colour == UsageColor::Colored ? ColourAnswer::Supported : ColourAnswer::Suppressed;
         }
 
         [[nodiscard]] int Columns() const override
@@ -180,6 +186,7 @@ namespace
         std::optional<SavedTerminalModes> _saved;
         std::string _resets;
         std::atomic<bool> _restoredNow { false };
+        UsageColor _colour; ///< `--color` as this program resolved it: what `AskColour` answers.
     };
 } // namespace
 
@@ -206,12 +213,14 @@ UnstartedTerminal::UnstartedTerminal(std::unique_ptr<Parts> parts) noexcept:
 
 UnstartedTerminal::~UnstartedTerminal() = default;
 
-std::expected<std::unique_ptr<UnstartedTerminal>, std::string> MakeTerminalEvents(IExecutor* pool, IExecutor* resumeOn)
+std::expected<std::unique_ptr<UnstartedTerminal>, std::string> MakeTerminalEvents(IExecutor* pool,
+                                                                                  IExecutor* resumeOn,
+                                                                                  UsageColor colour)
 {
     try
     {
         auto parts = std::make_unique<UnstartedTerminal::Parts>();
-        parts->device = std::make_unique<EndoTerminalDevice>();
+        parts->device = std::make_unique<EndoTerminalDevice>(colour);
         parts->pool = pool;
         parts->resumeOn = resumeOn;
         return std::make_unique<UnstartedTerminal>(std::move(parts));

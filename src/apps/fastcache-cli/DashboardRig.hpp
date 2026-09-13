@@ -38,10 +38,12 @@ class CollectingSink final: public IFrameSink
     {
         frames.push_back(frame.text);
         placements.push_back(frame.placements);
+        spans.push_back(frame.spans);
     }
 
     std::vector<std::string> frames {};                     ///< Each frame's text.
     std::vector<std::vector<FramePlacement>> placements {}; ///< Each frame's images, index for index with `frames`.
+    std::vector<std::vector<FrameSpan>> spans {};           ///< Each frame's dressed runs, index for index with `frames`.
 };
 
 /// Run the dashboard once, writing the result where the caller can read it.
