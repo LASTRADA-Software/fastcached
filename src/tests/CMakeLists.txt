@@ -5394,27 +5394,100 @@ set_tests_properties("unguarded-prerequisites-selftest" PROPERTIES
 # Git Bash against 0.62 ms under WSL2, 34x. 9193 x 21.28 ms is 196 s, most of that
 # column's runtime. Somebody optimising the filesystem would get nothing.
 #
-# ## What that means for the budget, in two different answers
+# ## The conclusion this comment used to draw was WRONG, and the correction is the
+# ## most useful thing here
 #
-# **CI is nowhere near it.** 6.5 s against 300 s is 2.2 %, with the three readings
-# spanning 0.16 s. There is nothing to fix for the leg that gates a merge.
+# It said: *"CI is nowhere near it -- 6.5 s against 300 s is 2.2 %. There is nothing to
+# fix for the leg that gates a merge... The Linux legs are the ones that gate."*
 #
-# **A Windows developer's local `ctest` now always exceeds it.** 444-620 s standalone,
-# with nothing else running: 1.5-2.1x the budget on every run, where at `13baf8ca` it was
-# a near miss. That is not a hypothetical and it is not contention -- #1331's own
-# contention model does not survive this, since run 3 of the first column already exceeded
-# 300 s standalone on master.
+# **Both sentences are false, and everything needed to predict that was in the paragraph
+# above them.** The 6.5 s was measured on a LINUX leg and generalised to "CI". But the
+# finding directly above is that the dominant term is the SHELL -- 21.28 ms per spawn
+# under MSYS against 0.62 ms under WSL2 -- and GitHub's WINDOWS runners run that same
+# MSYS shell. So the Windows *local* column was always the better predictor of the
+# Windows *runner* than the Linux runner figure was, and `Windows-cl-release` and
+# `Windows-clangcl-release` are both among the fourteen REQUIRED contexts. It read as
+# settled because two of three conditions agreed; the third was the one that mattered.
 #
-# The budget is deliberately LEFT ALONE here, and that is a decision rather than an
-# oversight. Raising it is the move this project's timeout rule exists to refuse, and a
-# number large enough for Git Bash (900 s?) would stop describing anything on the platform
-# that actually gates merges. Lowering it would redden a tree for a cost CI does not pay.
-# What the numbers argue for is making the scan cheaper -- one pass over the files instead
-# of one per identifier -- and that is #1331's remaining work, deliberately not taken here
-# because this file's scan was held by another lane while this was measured.
+# What the Windows CI leg actually did, run over run (measured from the job logs, not
+# modelled), at the identifier count each head carried:
+#
+#   13baf8ca  177.70 s   3 identifiers
+#   563beb83  210.06 s   4 identifiers
+#   6e9b2456  231.14 s   4 identifiers
+#   c6effe67  262.05 s   4 identifiers
+#   8a9e6837  259.39 s   4 identifiers   <- master, 86.5 % of the budget
+#   20931ad5  ***Timeout 300.01 s        <- blocked a merge on a required context
+#
+# The cost function explains the LEVEL rather than the rise. Dividing each leg's time by
+# the process creations that head's tree implies gives 13.5-16.8 ms per creation across
+# all five -- a model validated five times on a remote machine it was never fitted to.
+# What it does NOT explain is the climb; see the note under the budget below.
+#
+# ## What the fix did, and what it is MEASURED IN -- which took two tries
+#
+# Two changes. `CodeLines` ran once per (file, identifier) and is a property of the FILE
+# alone, so it is hoisted -- files outer, identifiers inner. And one pass now finds the
+# files that mention any identifier at all, so the per-file work runs on those rather than
+# on all of them: 19 files of 765 here.
+#
+# The pre-filter is safe for a reason worth stating, because it is the only interesting
+# thing about it: a file with no whole-word mention of any identifier contributes zero to
+# every per-identifier count and can produce no finding, so excluding it changes no number
+# this check reports. It is a SUPERSET filter -- comments are not stripped in that pass,
+# so a file mentioning an identifier only in a comment is still opened and still
+# contributes zero once `CodeLines` has run.
+#
+# ### The first measurement of this used the wrong unit
+#
+# Counting TOOL spawns (by wrapping them on PATH) said the hoist alone was a 3.06x
+# reduction -- 12,506 to 4,091 -- and predicted 69-86 s on CI. The CI leg measured
+# 167.35 s against master's 252.25 s on the same leg: 1.51x.
+#
+# The gap was the instrument. A PATH shim cannot see a `$( )`, and a command substitution
+# forks a subshell. MEASURED under Git Bash: `x=$(true)` costs 12.97 ms against 21.2 ms
+# for an entire `grep`, while a builtin costs nothing. So a fork is most of a spawn, and
+# the hoist had INCREASED the fork count while cutting tool spawns. The model and the
+# counter agreed perfectly because they were the same incomplete idea counted twice; CI
+# was the third, independent count, and it is the one that disagreed.
+#
+# The honest unit is PROCESS CREATIONS -- tool spawns plus subshell forks:
+#
+#                       tool spawns   forks   creations
+#   original               12,506     3,061     15,567
+#   hoist only              4,091     3,826      7,917
+#   hoist + pre-filter        364        97        461
+#
+# Each reconciles with the structure: 19 candidates x 4 identifiers plus 66 mentions x 4
+# owning types plus two `find`s and two `sort`s is 364, and the forks are one per
+# `$( )` the loops execute.
+#
+# Two explanations were checked and REFUTED before that one was found, both by direct
+# measurement rather than argument: awk is not expensive (22.9 ms against grep's 21.3),
+# and a herestring is not expensive (21.8 against 21.2 reading the file directly).
+#
+# Local Git Bash on ReFS, same `time` instrument, 765 files x 4 identifiers: 267 s before,
+# 18.5 s after. The residue is no longer process creation -- it is reading the 765 files
+# once, which is what the check is for.
+#
+# ## The budget stays at 300 s
+#
+# Raising it is the move this project's timeout rule exists to refuse: the budget is the
+# only thing that made any of this visible, and a number large enough for the old cost
+# would have hidden the LEVEL as well as the crossings. Lowering it would redden a tree
+# for a cost nobody pays. The scan got cheaper instead.
+#
+# And note what the CI series does NOT show, since the obvious reading is wrong: between
+# `563beb83` and `8a9e6837` the scan's process count moved 0.13 % while the leg's time
+# rose 23.5 %. Only the first step -- the `clusterKey` row, +35.7 % -- was the scan
+# growing. The rest was the runner, whose per-creation cost varies 25 % across those five
+# runs. That is why the LEVEL was worth attacking: runner variance is not fixable from
+# here, and at 259 s a run needed to land only 16 % above the mean to cross 300 s.
 #
 # So: if you are on Windows and this entry times out, it is the shell and the identifier
-# count, not your branch. The Linux legs are the ones that gate.
+# count rather than your branch -- **and it IS blocking you**, because the Windows legs
+# are required contexts. Do not wait it out; the cost is proportional to
+# (files x identifiers), so check whether your branch added either.
 add_test(
     NAME "credential-containers"
     COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-credential-containers.sh"
