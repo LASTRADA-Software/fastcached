@@ -6583,3 +6583,38 @@ set_tests_properties("cli-exit-code-docs-selftest" PROPERTIES
     LABELS "hygiene"
     TIMEOUT 60
 )
+
+# The vendored TUI is sanitized in the OBJECTS, not only on a compile line (#134). Until the
+# target-by-target block after `include(Sanitizers)` in the top-level CMakeLists.txt, every
+# `vendor/` target was declared before the directory-scoped sanitizer options and built with none,
+# while the configure printed "Enabling". This reads the objects `fastcache-tui-objects` produced
+# for the undefined init reference each enabled sanitizer leaves, beside a CONTROL object compiled
+# in the same configuration with `-fno-sanitize=all`, which must come back without it -- so the
+# reader is watched saying "absent" as well as "present". ASan and TSan only: UBSan leaves no
+# per-object init to read, and MSVC has no `nm`.
+if(TARGET fastcache-tui-objects AND (ENABLE_SANITIZER_ADDRESS OR ENABLE_SANITIZER_THREAD) AND NOT MSVC AND CMAKE_NM)
+    add_library(sanitizer-absent-probe OBJECT SanitizerAbsentProbe.cpp)
+    target_compile_options(sanitizer-absent-probe PRIVATE -fno-sanitize=all)
+    set(_fcSanitizerInitSymbols "")
+    if(ENABLE_SANITIZER_ADDRESS)
+        list(APPEND _fcSanitizerInitSymbols "__asan_init")
+    endif()
+    if(ENABLE_SANITIZER_THREAD)
+        list(APPEND _fcSanitizerInitSymbols "__tsan_init")
+    endif()
+    list(JOIN _fcSanitizerInitSymbols "|" _fcSanitizerInitSymbols)
+    add_test(
+        NAME "vendor-sanitized"
+        COMMAND ${CMAKE_COMMAND}
+            "-DFASTCACHED_NM=${CMAKE_NM}"
+            "-DFASTCACHED_SYMBOLS=${_fcSanitizerInitSymbols}"
+            "-DFASTCACHED_INSTRUMENTED=$<JOIN:$<TARGET_OBJECTS:fastcache-tui-objects>,|>"
+            "-DFASTCACHED_UNINSTRUMENTED=$<JOIN:$<TARGET_OBJECTS:sanitizer-absent-probe>,|>"
+            -P "${CMAKE_SOURCE_DIR}/scripts/check-sanitized-objects.cmake"
+    )
+    set_tests_properties("vendor-sanitized" PROPERTIES
+        FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+        LABELS "hygiene"
+        TIMEOUT 120
+    )
+endif()
