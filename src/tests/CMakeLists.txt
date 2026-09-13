@@ -6315,6 +6315,10 @@ endif()
 # waiting flow" wakes on a pushed key with no clock advancing and no timer anywhere,
 # which is what fails against any `SleepUntil(now + interval)` implementation.
 #
+# The same binary carries endo's `TerminalQuery_test.cpp` (#1375, a declared local change):
+# queries keep the input they read, time out on an injected clock, and say NotAsked or NoReply
+# rather than returning a value that stands for both.
+#
 # ONE ctest entry running the whole binary rather than `catch_discover_tests`,
 # deliberately: per-case registration would put upstream's case names into this
 # repository's ctest namespace and under its Catch2 name hygiene, which vendored
