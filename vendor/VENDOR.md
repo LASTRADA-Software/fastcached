@@ -37,7 +37,7 @@ Both repositories are Apache-2.0, and so is this copy. `endo/tui` was last touch
 upstream at `37d875f8` (2026-08-15).
 
 `src/tui` upstream is 154 files and ~46k lines; with the nineteen supporting files below and
-one local change's new test file ("Local changes") the copy is **174 files, 48,960 lines**.
+two local changes' new test files ("Local changes") the copy is **175 files, 49,283 lines**.
 
 ## The nineteen supporting files
 
@@ -141,7 +141,8 @@ Two facts that make this much less alarming than it sounds, both measured:
 
 ## Local changes
 
-One local change, 20 files; the other 154 files are byte-identical to their upstream blobs.
+Two local changes, 21 files between them; the other 154 files are byte-identical to their upstream
+blobs. The second changes seven of the first's files again, so a file can be named by both rows.
 Both halves are checked rather than asserted: `vendor/MANIFEST` records each changed file's
 UPSTREAM hash beside its current one, and `ctest -R vendor-verbatim` refuses a file that differs
 from upstream unless a row below names it, and refuses a row naming a file that does not.
@@ -154,6 +155,7 @@ nothing.
 | files | what | why | upstream | prepared as |
 |---|---|---|---|---|
 | `vendor/endo/tui/CMakeLists.txt`<br>`vendor/endo/tui/InputEvent.hpp`<br>`vendor/endo/tui/MockTerminalOutput.cpp`<br>`vendor/endo/tui/MockTerminalOutput.hpp`<br>`vendor/endo/tui/Screen.cpp`<br>`vendor/endo/tui/Terminal.hpp`<br>`vendor/endo/tui/TerminalInput.hpp`<br>`vendor/endo/tui/TerminalOutput.hpp`<br>`vendor/endo/tui/TerminalQuery_test.cpp`<br>`vendor/endo/tui/VtParser.cpp`<br>`vendor/endo/tui/platform/Terminal.cpp`<br>`vendor/endo/tui/platform/TerminalInput.cpp`<br>`vendor/endo/tui/platform/TerminalInputWin32.cpp`<br>`vendor/endo/tui/platform/TerminalOutput.cpp`<br>`vendor/endo/tui/platform/TerminalOutputWin32.cpp`<br>`vendor/endo/tui/platform/TerminalShared.cpp`<br>`vendor/endo/tui/platform/TerminalWin32.cpp`<br>`vendor/endo/tui/runtime/TerminalEventSource.hpp`<br>`vendor/endo/tui/runtime/platform/TerminalEventSourcePosix.cpp`<br>`vendor/endo/tui/runtime/platform/TerminalEventSourceWin32.cpp` | Terminal's capability queries share one reply loop on an injected `IClock`; input read while waiting that is not the reply is handed back through `TerminalInput::unread()` and delivered first by `poll()` and `TerminalEventSource::wait()`; the seven inline `ColorSchemeReport` workarounds are gone; `queryDecMode` returns `DecModeStatus`, cursor position and cell size return `std::expected<..., QueryUnanswered>`; new `queryDeviceAttributes()` (DA1) with `DeviceAttributesReport` and `advertisesSixel()`; `TerminalQueryInput` test seam and `TerminalQuery_test.cpp`. Endo's `shell/ui/Prompt.cpp` caller changes too, and is not vendored | #1375: a probe ate keystrokes typed before its reply and during a timeout, the timeout could only run in real time, and "never asked", "no reply", "declined" and "not implemented" read as one value. DA1 is the Sixel half of #134's rung detection | endo (contour-terminal/endo) | `D:/endo` branch `fastcached/terminal-queries` at `9ae3c66b35a37aa7df8648900edfc8535ed746e6`, on fork point `687b90a0`; unpublished, pending owner |
+| `vendor/endo/tui/CMakeLists.txt`<br>`vendor/endo/tui/Terminal.hpp`<br>`vendor/endo/tui/TerminalInputWin32_test.cpp`<br>`vendor/endo/tui/TerminalQuery_test.cpp`<br>`vendor/endo/tui/platform/Terminal.cpp`<br>`vendor/endo/tui/platform/TerminalInputWin32.cpp`<br>`vendor/endo/tui/platform/TerminalShared.cpp`<br>`vendor/endo/tui/platform/TerminalWin32.cpp` | `queryDecMode` moves into `TerminalShared.cpp`, so the Windows arm sends DECRQM and reads the reply through the shared loop; the Windows stub and `DecModeStatus::NotImplemented` go. Raw mode on Windows also asks for `ENABLE_WINDOW_INPUT`. New `TerminalInputWin32_test.cpp` runs against the real console, serialised by a named mutex, and SKIPs by name where there is none: the console mode carries both flags, a size record arrives as a resize with the window's geometry, a buffer resize the console makes is reported, the console's own DECRQM answer for DECTCEM reads Set then Reset, and an unanswered DECRQM is NoReply at the deadline | #134: the Windows arm answered every DEC mode query NotImplemented, so synchronized output could never be detected on Windows. Measured on Windows 11 (26200): conhost answered DECRQM 2026 not-recognized and Windows Terminal answered it reset, both through the shared loop. The flag is the documented condition for size records and is not what made resizing work on the hosts measured: both delivered a window resize with it cleared | endo (contour-terminal/endo) | `D:/endo` branch `fastcached/terminal-queries` at `ee25be66e1ece8f2637c3a0aade3ad85153e0eff`, on `9ae3c66b`; unpublished, pending owner |
 
 ## How to send a change back
 
