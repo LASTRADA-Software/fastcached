@@ -1732,16 +1732,23 @@ Canary() {
 # gate had passed: the gate builds before it tidies.
 #
 # So the sweep builds the object-order phony targets: every generated input any unit
-# needs, and no object. Measured on the #134 tree, WSL, clang-debug, a fresh CPM cache:
-# 28 targets, 21 edges, six compiles (libunicode's table generator) and 3 s, after which
-# that unit passes. A database that is not Ninja's cannot be asked, and says so; a unit
-# still missing a header is then refused below as not preprocessable, by name.
+# needs, and no object. The set is DERIVED from the build the database came from, so it
+# names neither libunicode's nine files nor its generator target -- `unicode_ucd`, whose
+# `cmake_object_order_depends_target_unicode_ucd` is one of them -- and a generated header
+# that some other dependency adds tomorrow is covered the same way. Measured on the #134
+# tree, WSL, clang-debug, a fresh CPM cache: 28 targets, 21 edges, six compiles (the table
+# generator) and 3 s, after which that unit is analysed.
+#
+# Every way of not generating is FATAL, never a skip: a database this cannot ask (every
+# preset here is Ninja's), no ninja, no such targets, or a failed build. And a unit still
+# missing a header after all that is refused below as not preprocessable, by name -- the
+# sweep does not report clean over a unit it could not parse. No dry-run "nothing left to
+# do" canary follows the build, because measured it can never answer yes: a second
+# `ninja -n` over the same targets re-checks CONFIGURE_DEPENDS globs and re-runs CMake.
 EnsureGeneratedSources() {
     local listing targets log
-    if [[ ! -f "${DB}/build.ninja" ]]; then
-        echo "TIDY SWEEP: ${DB} is not a Ninja build, so generated sources were not built first"
-        return 0
-    fi
+    [[ -f "${DB}/build.ninja" ]] \
+        || fatal "${DB} is not a Ninja build, so the generated sources its units need before they parse cannot be built"
     command -v ninja >/dev/null 2>&1 \
         || fatal "ninja is not on PATH, so the generated sources ${DB} needs before its units parse cannot be built"
     listing="$(ninja -C "$DB" -t targets all)" || fatal "ninja could not list the targets of ${DB}"
