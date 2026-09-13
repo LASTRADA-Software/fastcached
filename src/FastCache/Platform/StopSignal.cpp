@@ -2,6 +2,7 @@
 #include <FastCache/Async/ResumeOn.hpp>
 #include <FastCache/Platform/StopSignal.hpp>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstdint>
@@ -14,6 +15,7 @@
 #else
     #include <cerrno>
     #include <csignal>
+    #include <cstdlib>
 
     #include <fcntl.h>
     #include <poll.h>
@@ -273,8 +275,64 @@ namespace
 
     static_assert(std::atomic<int>::is_always_lock_free, "the stop handler reads this from a signal handler");
 
+    /// What writing one wake byte to a non-blocking pipe came to.
+    ///
+    /// TRANSMITTED/PERSISTED: no. Private to this file; enumerators may be inserted.
+    enum class WakeWrite : std::uint8_t
+    {
+        Written,        ///< The byte is in the pipe.
+        AlreadyPending, ///< The pipe is full, so a wake is already waiting to be seen.
+        Failed,         ///< Anything else: the pipe cannot carry a wake.
+    };
+
+    /// The `errno` values a non-blocking write answers for a full pipe. Two spellings that are one
+    /// value on most hosts and need not be, so they are listed rather than compared in one `||`.
+    constexpr auto FullPipeErrors = std::array { EAGAIN, EWOULDBLOCK };
+
+    /// Write one wake byte to @p fd, a non-blocking pipe whose bytes are never consumed by a wait.
+    ///
+    /// **Async-signal-safe**: `write(2)` and `errno`, no allocation, no logging -- the stop handler
+    /// calls it. Three answers, because the failures are not alike:
+    ///   - `EINTR` is retried: a signal landing mid-write is not an answer about the pipe.
+    ///   - A FULL pipe (`EAGAIN`) is `AlreadyPending`, and benign: a wait only polls these pipes
+    ///     and never reads them, so the bytes filling it stay readable and a wake is already due.
+    ///     One more byte would say nothing the pipe does not already say.
+    ///   - Anything else is `Failed`. Neither pipe is closed while a writer can reach it, so no
+    ///     other answer should happen -- and a wake that could not be written leaves a wait that
+    ///     will never end.
+    /// @param fd The write end.
+    /// @return What the write came to.
+    [[nodiscard]] WakeWrite WriteWakeByte(int fd) noexcept
+    {
+        auto const byte = char { 1 };
+        auto written = ::write(fd, &byte, 1);
+        while (written < 0 && errno == EINTR)
+            written = ::write(fd, &byte, 1);
+        if (written == 1)
+            return WakeWrite::Written;
+        if (written < 0 && std::ranges::find(FullPipeErrors, errno) != FullPipeErrors.end())
+            return WakeWrite::AlreadyPending;
+        return WakeWrite::Failed;
+    }
+
+    /// Write a wake byte to @p fd, and end the process when the pipe cannot carry one.
+    ///
+    /// **Ending the process is the answer, not a shortcut past one.** Every caller has nothing to
+    /// return a failure through -- a signal handler, and a `noexcept` cancel -- and the waiter it
+    /// exists to wake would otherwise block forever: a session the operator can no longer stop, or
+    /// one that never finishes closing, with nothing anywhere saying why. `Failed` means the
+    /// never-closed invariant on these pipes has been broken, which is a defect in this file; and
+    /// `std::abort` is async-signal-safe, so the handler may take this path too.
+    /// @param fd The write end.
+    void WakeOrAbort(int fd) noexcept
+    {
+        if (WriteWakeByte(fd) == WakeWrite::Failed)
+            std::abort();
+    }
+
     /// The whole handler: one `write(2)`, which is the one async-signal-safe way to say
-    /// something. A full pipe drops the byte, and that is fine -- one byte already says it.
+    /// something. A full pipe drops the byte, and that is fine -- one byte already says it
+    /// (`WriteWakeByte`).
     /// A byte written after an uninstall is drained by the next install, never heard as its stop.
     /// @param number The signal number; unused, since only SIGINT is routed here.
     void OnStopSignal(int number) noexcept
@@ -283,8 +341,7 @@ namespace
         auto const savedErrno = errno;
         if (auto const fd = stopPipeWrite.load(std::memory_order_acquire); fd >= 0)
         {
-            auto const byte = char { 1 };
-            static_cast<void>(::write(fd, &byte, 1));
+            WakeOrAbort(fd);
         }
         errno = savedErrno;
     }
@@ -465,8 +522,8 @@ namespace
 
         void Cancel() noexcept override
         {
-            auto const byte = char { 1 };
-            static_cast<void>(::write(_cancel.Writer(), &byte, 1));
+            // A cancel already pending fills the pipe as well as one byte does (`WriteWakeByte`).
+            WakeOrAbort(_cancel.Writer());
         }
 
       private:
@@ -498,8 +555,8 @@ namespace
 
         void Cancel() noexcept override
         {
-            auto const byte = char { 1 };
-            static_cast<void>(::write(_cancel.Writer(), &byte, 1));
+            // A cancel already pending fills the pipe as well as one byte does (`WriteWakeByte`).
+            WakeOrAbort(_cancel.Writer());
         }
 
       private:
