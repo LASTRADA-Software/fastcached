@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/FigureText.hpp>
 #include <FastCache/Core/Ranges.hpp>
 #include <FastCache/Distributed/FleetChart.hpp>
@@ -146,42 +147,59 @@ namespace
         AppendJsonText(out, text);
     }
 
-    /// The chip class per slot limit, in enumerator order.
+    /// How a human surface dresses one slot limit: the page's chip class, and the tone every other
+    /// surface tints the same cell with.
+    struct LimitDress
+    {
+        SlotLimit limit;            ///< The enumerator this row describes.
+        std::string_view chipClass; ///< The page's chip.
+        CellTone tone;              ///< The tone a terminal gives it.
+    };
+
+    /// One row per slot limit, in enumerator order.
     ///
     /// A table rather than the `if` ladder this used to be, and the ladder is why:
     /// it named `scratch` and `registered` and let everything else fall through to
     /// the CPU class, so a MEMORY-bound worker was dressed as "somebody else is
     /// using this machine" -- pointing an operator at the wrong remedy, which is
-    /// the one thing `SlotLimitTraits::remedy` exists to get right. `EnumTable`
-    /// takes its extent from the enum, so a fifth limit fails the build here
-    /// instead of quietly inheriting a colour.
-    constexpr EnumTable<SlotLimit, std::string_view> LimitChipClass {
-        "chip--registered", "chip--cpu", "chip--memory", "chip--scratch"
-    };
+    /// the one thing `SlotLimitTraits::remedy` exists to get right. The chip and the
+    /// tone are one row, so the page and a terminal cannot dress one limit two ways;
+    /// a terminal has no accent colour, so memory is `Limited` where the page's chip
+    /// is its own hue.
+    constexpr EnumTable<SlotLimit, LimitDress> LimitDressTable { {
+        { .limit = SlotLimit::Registered, .chipClass = "chip--registered", .tone = CellTone::Fresh },
+        { .limit = SlotLimit::ExternalCpu, .chipClass = "chip--cpu", .tone = CellTone::Limited },
+        { .limit = SlotLimit::Memory, .chipClass = "chip--memory", .tone = CellTone::Limited },
+        { .limit = SlotLimit::Scratch, .chipClass = "chip--scratch", .tone = CellTone::Alert },
+    } };
 
-    // `EnumTable` fixes the extent, but aggregate initialization value-initializes
-    // a row nobody wrote -- so an appended enumerator would silently get an EMPTY
-    // class rather than a build error. This is the guard `RowsInEnumeratorOrder`
-    // provides for tables whose rows name their own enumerator; these are bare
-    // values, so the check is that none of them is missing.
-    static_assert(std::ranges::none_of(LimitChipClass, [](std::string_view chipClass) { return chipClass.empty(); }),
-                  "every SlotLimit needs a chip class");
+    static_assert(RowsInEnumeratorOrder(LimitDressTable, &LimitDress::limit),
+                  "LimitDressTable must hold one row per SlotLimit, in enumerator order");
 
-    /// The chip class for a limit named the way `SlotLimitTable` spells it.
+    /// The dress for a limit named the way `SlotLimitTable` spells it.
     ///
     /// Resolved through that table rather than by matching strings here, so the
     /// two cannot drift: the cell carries the limit's NAME, and its name is what
     /// the table already owns.
     ///
     /// @param limitName The cell's text.
+    /// @return The dress, or null for a name no limit has.
+    [[nodiscard]] LimitDress const* LimitDressFor(std::string_view limitName) noexcept
+    {
+        for (auto const& row: SlotLimitTable)
+            if (row.name == limitName)
+                return &LimitDressTable[static_cast<std::size_t>(row.limit)];
+        return nullptr;
+    }
+
+    /// The chip class for a limit named the way `SlotLimitTable` spells it.
+    /// @param limitName The cell's text.
     /// @return The chip class; `Registered`'s when nothing matches, which is the
     ///         reading that claims least.
     [[nodiscard]] std::string_view ChipClassFor(std::string_view limitName)
     {
-        for (auto const& row: SlotLimitTable)
-            if (row.name == limitName)
-                return LimitChipClass[static_cast<std::size_t>(row.limit)];
-        return LimitChipClass[static_cast<std::size_t>(SlotLimit::Registered)];
+        auto const* const dress = LimitDressFor(limitName);
+        return (dress != nullptr ? *dress : LimitDressTable[static_cast<std::size_t>(SlotLimit::Registered)]).chipClass;
     }
 
     /// How the page spells "nobody reported this".
@@ -1387,6 +1405,15 @@ CellTone FleetCellTone(FleetSection section, std::string_view name, std::uint64_
     return facts.has_value() ? ToneOf(facts->decor, number) : CellTone::Plain;
 }
 
+CellTone FleetCellTone(FleetSection section, std::string_view name, std::string_view text)
+{
+    auto const facts = FactsOf(section, name);
+    if (!facts.has_value() || facts->decor != CellDecor::Limit)
+        return CellTone::Plain;
+    auto const* const dress = LimitDressFor(text);
+    return dress != nullptr ? dress->tone : CellTone::Plain;
+}
+
 std::string HumanFleetFigure(std::uint64_t number, CellFormat format)
 {
     auto const& row = CellFormatTable[static_cast<std::size_t>(format)];
@@ -1958,6 +1985,7 @@ footer { margin-top:2.4rem; padding-top:1rem; border-top:1px solid var(--line);
         std::string_view ofNoun {}; ///< What the denominator counts; empty for a figure with none.
         std::string_view note {};   ///< Words for a figure with no denominator; empty for none.
         bool sparkline;             ///< Whether it carries one.
+        bool alertAboveZero {};     ///< Whether any value above zero is worth an operator's eye.
     };
 
     /// The strip, in the order it is read. The mockup's six, in the mockup's order,
@@ -1972,7 +2000,7 @@ footer { margin-top:2.4rem; padding-top:1rem; border-top:1px solid var(--line);
                  .ofNoun = SlotsNoun,
                  .sparkline = false },
         KpiRow { .label = "Cache hit rate", .key = "cache-hit-rate", .project = KpiHitRate, .sparkline = false },
-        KpiRow { .label = "Refused", .key = "refused", .project = KpiRefused, .sparkline = false },
+        KpiRow { .label = "Refused", .key = "refused", .project = KpiRefused, .sparkline = false, .alertAboveZero = true },
         KpiRow { .label = "Leases outstanding",
                  .key = "leases-outstanding",
                  .project = KpiLeases,
@@ -2013,7 +2041,8 @@ footer { margin-top:2.4rem; padding-top:1rem; border-top:1px solid var(--line);
                                           .label = KpiTable[index].label,
                                           .ofNoun = KpiTable[index].ofNoun,
                                           .note = KpiTable[index].note,
-                                          .sparkline = KpiTable[index].sparkline };
+                                          .sparkline = KpiTable[index].sparkline,
+                                          .alertAboveZero = KpiTable[index].alertAboveZero };
         return texts;
     }();
 
