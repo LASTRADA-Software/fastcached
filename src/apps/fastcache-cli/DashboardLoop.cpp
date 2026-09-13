@@ -129,17 +129,22 @@ namespace
     }
 
     /// Everything a sample taken does whatever it read: it spends the budget, and it replaces the
-    /// node status with whatever it carried.
+    /// node status and the fleet document with whatever it carried.
     ///
     /// One helper for both arms -- a `Sample` and a `SampleFailed` -- so neither route can count a
-    /// sample without replacing the status, or the reverse.
-    /// @param model Where the count and the status are kept.
+    /// sample without replacing both, or the reverse.
+    /// @param model Where the count, the status and the document are kept.
     /// @param event The sample.
+    /// @param document The document its reading carried; null for a failure or a reading without one.
     /// @param limits The budget.
     /// @return True when this sample spent the budget.
-    [[nodiscard]] bool RecordSampleTaken(DashboardModel& model, DashboardEvent const& event, DashboardLimits limits)
+    [[nodiscard]] bool RecordSampleTaken(DashboardModel& model,
+                                         DashboardEvent const& event,
+                                         std::shared_ptr<FleetDocument const> document,
+                                         DashboardLimits limits)
     {
         model.nodeStatus = event.nodeStatus;
+        model.latestDocument = std::move(document);
         ++model.attempts;
         return limits.samples != 0 && model.attempts >= limits.samples;
     }
@@ -237,6 +242,10 @@ Task<DashboardExit> RunDashboard(
 
             case DashboardEventKind::Sample: {
                 auto reading = reader(event);
+                // Only a reading's document is kept: a reader that refused a sample made no claim
+                // about the fleet, whatever it had in hand.
+                auto document = reading.outcome == Outcome::Affirmative ? std::move(reading.document)
+                                                                        : std::shared_ptr<FleetDocument const> {};
                 if (reading.outcome != Outcome::Affirmative)
                 {
                     RecordFailure(exit, reading.outcome);
@@ -249,7 +258,7 @@ Task<DashboardExit> RunDashboard(
                     // direction a healthy-path test cannot see.
                     exit.outcome = Outcome::Affirmative;
                 }
-                if (RecordSampleTaken(exit.model, event, limits))
+                if (RecordSampleTaken(exit.model, event, std::move(document), limits))
                 {
                     StopOnBudget(exit, *view, *sink, *events);
                     co_return exit;
@@ -259,7 +268,7 @@ Task<DashboardExit> RunDashboard(
 
             case DashboardEventKind::SampleFailed:
                 RecordFailure(exit, event.outcome);
-                if (RecordSampleTaken(exit.model, event, limits))
+                if (RecordSampleTaken(exit.model, event, {}, limits))
                 {
                     StopOnBudget(exit, *view, *sink, *events);
                     co_return exit;

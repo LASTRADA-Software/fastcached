@@ -17,11 +17,11 @@ inline constexpr std::string_view FleetReadingSource = "fleet.txt";
 
 /// The reader for a `fleet` session: the leader's whole document, validated by parsing it.
 ///
-/// **The parse is VALIDATION, and its result is thrown away on purpose.** The reading's value is
-/// the document's TEXT, and whoever draws it -- the fleet panel, the piped KPI record -- parses
-/// that same text with the same `ParseFleetDocument` when it draws. A parsed copy kept here beside
-/// the text would be a second answer to one question, free to go stale against it; so there is
-/// none to keep, and a document that cannot be parsed never becomes a reading at all.
+/// **The parse decides whether there is a reading, and its result is handed over.** The reading's
+/// value is the document's TEXT, verbatim, and its `document` is that text's one parse -- made here,
+/// in the same call, from the same bytes, so the two are one answer and are replaced together on
+/// every sample. A panel draws the parse rather than parsing the text again each frame. A document
+/// that cannot be parsed never becomes a reading at all.
 ///
 /// - A fetch that produced no document is the fetch's own outcome (`OutcomeOf`): `Unreachable`
 ///   when nothing answered, `Refused` when the leader -- or a follower naming it -- declined, with
@@ -30,7 +30,7 @@ inline constexpr std::string_view FleetReadingSource = "fleet.txt";
 ///   all-comment answer is one: it names no section, and an empty fleet would be a claim about the
 ///   fleet that a follower cannot make.
 /// @param event A `Sample` of a `fleet` session.
-/// @return The document as a text scalar from `FleetReadingSource`, or why there is none.
+/// @return The document as a text scalar from `FleetReadingSource` with its parse, or why there is none.
 [[nodiscard]] SampleReading ReadFleetSample(DashboardEvent const& event);
 
 } // namespace FastCache::Cli

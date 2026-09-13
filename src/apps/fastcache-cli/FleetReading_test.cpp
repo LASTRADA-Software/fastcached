@@ -7,6 +7,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <cstddef>
 #include <expected>
 #include <optional>
 #include <string>
@@ -50,6 +51,43 @@ TEST_CASE("a fleet reading is the leader's whole document as text, parsed only t
     REQUIRE(reading.value.shape == Shape::Scalar);
     CHECK(reading.value.scalar.lexical == document);
     CHECK(ParseFleetDocument(reading.value.scalar.lexical).has_value());
+}
+
+TEST_CASE("a fleet reading hands over the document it parsed, and a refused one hands over none", "[cli][fleet][reading]")
+{
+    // Parsed once, here, so a panel draws the parse instead of parsing again every frame. WHAT
+    // DISTINGUISHES: the document arrives AND is this text's parse -- every section the text's own
+    // parse carries is carried, table for table -- and a sample that is not a reading brings none,
+    // so a reader handing over whatever it had parsed would fail the second half.
+    auto const text = LeaderDocument();
+    auto const reading = ReadFleetSample(FleetSample(text));
+    REQUIRE(reading.outcome == Outcome::Affirmative);
+    REQUIRE(reading.document != nullptr);
+
+    auto const reparsed = ParseFleetDocument(text);
+    REQUIRE(reparsed.has_value());
+    auto sections = std::size_t { 0 };
+    for (auto const& row: FleetSectionTable)
+    {
+        INFO("section " << row.key);
+        auto const* handed = reading.document->Section(row.section);
+        auto const* expected = reparsed->Section(row.section);
+        REQUIRE((handed == nullptr) == (expected == nullptr));
+        if (expected == nullptr)
+            continue;
+        CHECK(handed->columns == expected->columns);
+        CHECK(handed->rows.size() == expected->rows.size());
+        ++sections;
+    }
+    CHECK(sections > 0);
+
+    auto snapshot = FleetSnapshot {};
+    snapshot.role = SchedulerRole::Follower;
+    snapshot.leaderEndpoint = "10.0.0.9:7071";
+    CHECK(ReadFleetSample(FleetSample(RenderFleetText(snapshot, FleetHistoryView {}, std::nullopt))).document == nullptr);
+    CHECK(
+        ReadFleetSample(FleetSample(std::unexpected(AdminError { .kind = AdminFailure::Refused, .detail = "no" }))).document
+        == nullptr);
 }
 
 TEST_CASE("a fleet document that does not parse is a protocol failure naming what was refused", "[cli][fleet][reading]")
