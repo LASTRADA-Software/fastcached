@@ -96,12 +96,17 @@ class PipedRecordView final: public IDashboardView
     /// @param project What a row reports.
     PipedRecordView(OutputFormat format, std::optional<std::string> absentOverride, FigureProjection project);
 
+    /// The lines this frame owes, with nothing placed over them: a pipe draws no image.
+    /// @param model What is known.
+    /// @return The frame; its text is `Lines`.
+    [[nodiscard]] DashboardFrame PlacedFrame(DashboardModel const& model) override;
+
+  private:
     /// The lines this frame owes: the header when none was written yet, then one row.
     /// @param model What is known.
     /// @return The text, or nothing before the first reading.
-    [[nodiscard]] std::string Frame(DashboardModel const& model) override;
+    [[nodiscard]] std::string Lines(DashboardModel const& model);
 
-  private:
     /// One row, rendered in the view's format.
     /// @param cells One cell per column.
     /// @return The row's text.
