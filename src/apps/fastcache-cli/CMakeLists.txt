@@ -34,9 +34,24 @@ set(_fc_cli_sources
     TerminalCapabilities.cpp
 )
 
+# The terminal half of the dashboard's input (#1372) is the one place this binary meets the
+# vendored TUI, so it is built only where that library is. With `FASTCACHED_BUILD_TUI` off,
+# `MakeTerminalEvents` still links, and refuses by saying why, so a caller asking for a
+# terminal gets a reason rather than a link error.
+if(TARGET fastcache-tui)
+    list(APPEND _fc_cli_sources TerminalEventStream.cpp TerminalEvents.cpp)
+    set(_fc_cli_tui_tests TerminalEventStream_test.cpp TerminalEvents_test.cpp)
+else()
+    list(APPEND _fc_cli_sources TerminalEventsUnavailable.cpp)
+    set(_fc_cli_tui_tests "")
+endif()
+
 add_executable(fastcache-cli main.cpp ${_fc_cli_sources})
 target_include_directories(fastcache-cli PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 target_link_libraries(fastcache-cli PRIVATE FastCache)
+if(TARGET fastcache-tui)
+    target_link_libraries(fastcache-cli PRIVATE fastcache-tui)
+endif()
 
 # The version is compiled in from the git tag rather than read at runtime, so
 # `fastcache-cli version` cannot report a value that has drifted from the build. The
@@ -68,9 +83,13 @@ if(FASTCACHED_BUILD_TESTS)
         RespClient_test.cpp
         StatsSource_test.cpp
         TerminalCapabilities_test.cpp
+        ${_fc_cli_tui_tests}
     )
     target_include_directories(fastcache-cli-tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
     target_link_libraries(fastcache-cli-tests PRIVATE FastCache Catch2::Catch2WithMain)
+    if(TARGET fastcache-tui)
+        target_link_libraries(fastcache-cli-tests PRIVATE fastcache-tui)
+    endif()
     target_compile_definitions(fastcache-cli-tests PRIVATE FASTCACHE_CLI_VERSION="${FASTCACHED_VERSION_STRING}")
     include(Catch)
     # `SKIP_RETURN_CODE 4` tells ctest a Catch2 skip is a skip and not a failure
