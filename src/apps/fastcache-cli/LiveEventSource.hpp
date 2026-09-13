@@ -17,24 +17,26 @@ namespace FastCache::Cli
 {
 
 /// @file LiveEventSource.hpp
-/// The production `IDashboardEventSource`: a sampling cadence and a terminal, merged into
-/// one ordered stream on one reactor.
+/// The production `IDashboardEventSource`: a sampling cadence, a terminal and a stop
+/// request, merged into one ordered stream on one reactor.
 ///
-/// **Every producer is a coroutine parked on the reactor, never a thread and never a
-/// sleep.** The cadence waits on a `DeadlineTimer` between samples, a sample runs
-/// `TakeSample`'s two hops off the reactor and back, and the terminal's own source parks
-/// on whatever it reads. So a keystroke that lands while a sample is still on the pool is
-/// delivered while that sample is still on the pool: nothing here waits for one producer
-/// before hearing another, which is the property a dashboard that must answer `q` during
-/// a slow scrape exists to have.
+/// **Every producer is a coroutine parked on the reactor, and nothing on the reactor
+/// sleeps.** The cadence waits on a `DeadlineTimer` between samples, a sample runs
+/// `TakeSample`'s two hops off the reactor and back, the terminal's own source parks on
+/// whatever it reads, and a stop request blocks on a waiter thread of its own before it hops
+/// back. So a keystroke that lands while a sample is still on the pool is delivered while
+/// that sample is still on the pool: nothing here waits for one producer before hearing
+/// another, which is the property a dashboard that must answer `q` during a slow scrape
+/// exists to have.
 
 /// What a `LiveEventSource` is built from.
 ///
-/// Pointers are borrowed and must outlive the source's `Drained()`, not merely the source:
-/// a sample already on the pool when the session ends still reads `gatherer` there, and
-/// nothing can call it back. The terminal is OWNED, because nothing but this source reads
-/// it and closing it is part of closing the session -- and it is released, restoring the
-/// terminal, the moment nothing reads it any more, whatever a sample on the pool is doing.
+/// Pointers are borrowed and must outlive the source's drain, not merely the source: a
+/// sample already on the pool when the session ends still reads `gatherer` there, and
+/// nothing can call it back. The terminal and the stop request are OWNED, because nothing
+/// but this source reads them and closing them is part of closing the session -- and each
+/// is released the moment nothing waits on it any more, whatever a sample on the pool is
+/// doing, which is what restores the terminal and the signal disposition.
 struct LiveSourceParts
 {
     /// Where every event is delivered, and whose clock paces the samples. Close, Next and
@@ -65,12 +67,10 @@ struct LiveSourceParts
     /// A run with no terminal is the one that hears Ctrl-C as a signal; a terminal in raw
     /// mode sends it as a key. So a stop is delivered as that same key, and the loop has one
     /// way to be quit whichever route Ctrl-C took.
-    IStopSignal* stop { nullptr };
+    std::unique_ptr<IStopSignal> stop {};
 
-    /// Where `stop`'s blocking wait runs, when there is a `stop`.
-    ///
-    /// **Its own thread, never `pool`**: the wait holds its thread for the whole session, so
-    /// a one-thread sample pool lent to it would never sample again.
+    /// Where `stop`'s blocking wait runs, when there is a `stop`: see `IStopSignal::Stopped`
+    /// for why it is never `pool`.
     IExecutor* stopWaiter { nullptr };
 };
 
@@ -85,14 +85,14 @@ struct LiveSourceParts
 class LiveEventSource final: public IDashboardEventSource
 {
   public:
-    /// Start sampling at once and, when there is a terminal, start reading it.
+    /// Start sampling at once, and start every other producer that has something to read.
     ///
-    /// Nothing runs inline: both producers begin on the reactor's next turn, so the
+    /// Nothing runs inline: the producers begin on the reactor's next turn, so the
     /// constructor never re-enters its caller.
     /// @param parts What to sample, where, how often, and what else to listen to.
     explicit LiveEventSource(LiveSourceParts parts);
 
-    /// Closes the source. Awaiting `Drained()` first is the caller's obligation, and not
+    /// Closes the source. Waiting for the drain first is the caller's obligation, and not
     /// one a destructor can discharge: a sample on the pool cannot be recalled.
     ~LiveEventSource() override;
 
@@ -103,27 +103,36 @@ class LiveEventSource final: public IDashboardEventSource
 
     [[nodiscard]] Task<DashboardEvent> Next() override;
 
-    /// Stop both producers.
+    /// Stop every producer.
     ///
     /// Discards what is queued, resumes an outstanding `Next()` with `Detached`, closes the
-    /// terminal, and wakes a cadence waiting between samples on the reactor's next turn
-    /// rather than at its deadline. A sample already on the pool cannot be taken back; it
-    /// is dropped when it returns, and `Drained()` resumes then.
+    /// terminal, cancels the stop request's wait, and wakes a cadence waiting between samples
+    /// on the reactor's next turn rather than at its deadline. A sample already on the pool
+    /// cannot be taken back; it is dropped when it returns, and the source drains then.
     void Close() noexcept override;
 
     /// Resume once nothing this source started is still running.
     ///
     /// The session's end is not this source's end: the loop returns the moment an operator
-    /// quits, while a sample may still be reading `gatherer` on the pool. Awaiting this is
-    /// what makes destroying the gatherer and the pool afterwards safe. One caller.
-    /// @return A task completing when both producers have finished.
+    /// quits, while a sample may still be reading `gatherer` on the pool. Awaiting this, or
+    /// seeing `IsDrained()`, is what makes destroying the gatherer and the pool afterwards
+    /// safe. One caller.
+    /// @return A task completing when every producer has finished.
     [[nodiscard]] Task<void> Drained();
+
+    /// Whether every producer has finished.
+    ///
+    /// **Safe from any thread**, unlike everything but `SampleOutstandingSince()`: this is
+    /// what a drain waiting from outside the reactor reads.
+    /// @return True once the last producer has ended.
+    [[nodiscard]] bool IsDrained() const noexcept;
 
     /// When the sample now on the pool was started, or nullopt when none is out.
     ///
-    /// **Safe from any thread**, unlike everything else here: this is what a caller waiting
-    /// for the drain from outside the reactor reads to say how long a sample it is about to
-    /// abandon had been out. Measured on the reactor's clock.
+    /// **Safe from any thread**: this is what a drain waiting from outside the reactor reads
+    /// to say how long a sample it is about to abandon had been out. Measured on the
+    /// reactor's clock, so a caller subtracting it from another clock's `Now()` needs that
+    /// clock to count from the same epoch -- `SteadyClock` against `steady_clock` does.
     /// @return The start of the outstanding sample, or nullopt.
     [[nodiscard]] std::optional<TimePoint> SampleOutstandingSince() const noexcept;
 
