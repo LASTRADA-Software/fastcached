@@ -16,6 +16,7 @@
 
 #include <tui/KeyCode.hpp>
 #include <tui/Modifier.hpp>
+#include <tui/TerminalOutput.hpp>
 
 namespace FastCache::Cli
 {
@@ -143,7 +144,7 @@ namespace
                 // A short wait that came back empty has had its chance to settle a lone ESC.
                 _inputJustArrived = !(timeoutMs >= 0 && outcome.events.empty());
                 for (auto& event: ToDashboardEvents(outcome))
-                    _ready.push_back(std::move(event));
+                    Enqueue(std::move(event));
             }
         }
 
@@ -156,6 +157,18 @@ namespace
         }
 
       private:
+        /// Queue @p event, coalescing a resize into one still waiting at the back.
+        void Enqueue(DashboardEvent event)
+        {
+            if (event.kind == DashboardEventKind::Resize && !_ready.empty()
+                && _ready.back().kind == DashboardEventKind::Resize)
+            {
+                _ready.back() = std::move(event);
+                return;
+            }
+            _ready.push_back(std::move(event));
+        }
+
         tui::runtime::EventSource* _source;
         IExecutor* _pool;
         IExecutor* _resumeOn;
@@ -169,6 +182,52 @@ namespace
 
 namespace
 {
+    /// Begin and end synchronized output (DEC mode 2026).
+    ///
+    /// The only presentation bytes spelled in this project. endo writes these solely from inside
+    /// `SyncGuard`, directly to a native handle, so unlike the rest of `TerminalScreenBytes` there is
+    /// no buffered call to capture them from.
+    constexpr auto SyncBegin = std::string_view { "\x1b[?2026h" };
+    constexpr auto SyncEnd = std::string_view { "\x1b[?2026l" };
+
+    /// `CAN`: abandons an escape sequence a frame was halfway through, so what follows is not read
+    /// as its tail.
+    constexpr auto Cancel = std::string_view { "\x18" };
+
+    /// An endo `TerminalOutput` whose destination is a string, so a sequence endo spells can be read
+    /// back as bytes rather than restated.
+    class CapturedOutput final: public tui::TerminalOutput
+    {
+      public:
+        /// @return What was flushed so far.
+        [[nodiscard]] std::string Take()
+        {
+            flush();
+            return std::move(_captured);
+        }
+
+      protected:
+        void writeToDestination(std::string_view bytes) override
+        {
+            _captured.append(bytes);
+        }
+
+      private:
+        std::string _captured;
+    };
+
+    /// @return The bytes `RestoreNow` writes before the input's resets on a started terminal: abandon
+    /// a half-written sequence, end synchronized output, then leave the screen. In that order, and
+    /// the screen BEFORE the input protocols: the keyboard protocol keeps a separate stack per
+    /// screen, and its pop must land on the screen its push did.
+    [[nodiscard]] std::string RestoreNowLeading()
+    {
+        auto leading = std::string { Cancel };
+        leading.append(SyncEnd);
+        leading.append(ScreenBytes().leave);
+        return leading;
+    }
+
     /// `StartedTerminal::restore`: at most one `RestoreNow` reaches the device, and none once the
     /// device's teardown has begun.
     ///
@@ -176,10 +235,14 @@ namespace
     /// another thread that has passed the check must finish before the events' destructor tears the
     /// device down. The lock is held across the device call, and `Detach` takes it, so that
     /// destructor waits.
+    ///
+    /// It also decides who leaves the alternate screen. The start entered it; exactly one of this
+    /// handle's `RestoreNow` and the events' destructor leaves it, whichever comes first.
     class TerminalRestoreHandle final: public ITerminalRestore
     {
       public:
-        explicit TerminalRestoreHandle(ITerminalDevice* device) noexcept:
+        TerminalRestoreHandle(ITerminalDevice* device, std::string leading) noexcept:
+            _leading { std::move(leading) },
             _device { device }
         {
         }
@@ -189,35 +252,66 @@ namespace
             auto const lock = std::scoped_lock { _mutex };
             if (_device == nullptr)
                 return;
-            _device->RestoreNow();
-            // The idempotence: nothing reaches the device through this handle again.
+            _device->RestoreNow(_leading);
+            // The idempotence: nothing reaches the device through this handle again, and the
+            // screen has been left.
             _device = nullptr;
         }
 
-        /// The device is being torn down, and the teardown restores the terminal. After this
-        /// returns, no call reaches the device, and none is still inside it.
-        void Detach() noexcept
+        /// The device is being torn down. After this returns, no call reaches the device through this
+        /// handle, and none is still inside it.
+        /// @return Whether the screen is still entered -- no `RestoreNow` got there first -- so the
+        ///         caller leaves it.
+        [[nodiscard]] bool Detach() noexcept
         {
             auto const lock = std::scoped_lock { _mutex };
+            auto const stillEntered = _device != nullptr;
             _device = nullptr;
+            return stillEntered;
         }
 
       private:
+        std::string _leading;
         std::mutex _mutex;
         ITerminalDevice* _device;
     };
 
-    /// The events of a started terminal, owning the device they are read from.
+    /// The frames of a started terminal: one `Write` per `Present`, spelled by `FrameBytes`.
+    ///
+    /// Shares the device with the events rather than borrowing it, so a frame presented after the
+    /// events are gone -- which the contract forbids -- reaches a torn-down terminal rather than freed
+    /// memory.
+    class TerminalFramePresenter final: public IFrameSink
+    {
+      public:
+        TerminalFramePresenter(std::shared_ptr<ITerminalDevice> device, bool synchronized) noexcept:
+            _device { std::move(device) },
+            _synchronized { synchronized }
+        {
+        }
+
+        void Present(std::string_view frame) override
+        {
+            _device->Write(FrameBytes(frame, _synchronized));
+        }
+
+      private:
+        std::shared_ptr<ITerminalDevice> _device;
+        bool _synchronized;
+    };
+
+    /// The events of a started terminal, sharing the device they are read from.
     ///
     /// Member ORDER is the lifetime: the stream borrows the device's event source, so the device is
-    /// declared first and destroyed last, and the destructor restores it once nothing reads it.
+    /// declared first and destroyed last, and the destructor leaves the screen and restores the
+    /// device once nothing reads it.
     ///
     /// Constructing one cannot throw: the stream is built BEFORE the device is handed over, so no
-    /// failure can leave the device owned by a half-built object whose destructor never runs.
+    /// failure can leave the device held by a half-built object whose destructor never runs.
     class StartedTerminalEvents final: public IDashboardEventSource
     {
       public:
-        StartedTerminalEvents(std::unique_ptr<ITerminalDevice> device,
+        StartedTerminalEvents(std::shared_ptr<ITerminalDevice> device,
                               std::unique_ptr<IDashboardEventSource> stream,
                               std::shared_ptr<TerminalRestoreHandle> restore) noexcept:
             _device { std::move(device) },
@@ -235,8 +329,9 @@ namespace
         {
             _stream.reset();
             // Before the teardown, so a restore-now racing it from another thread either finished
-            // already or never reaches the device.
-            _restore->Detach();
+            // already -- and left the screen -- or never reaches the device.
+            if (_restore->Detach())
+                _device->Write(ScreenBytes().leave);
             _device->Restore();
         }
 
@@ -251,15 +346,16 @@ namespace
         }
 
       private:
-        std::unique_ptr<ITerminalDevice> _device;
+        std::shared_ptr<ITerminalDevice> _device;
         std::unique_ptr<IDashboardEventSource> _stream;
         std::shared_ptr<TerminalRestoreHandle> _restore;
     };
 
-    /// Restores a device when a start leaves by any path but success.
+    /// Leaves the screen and restores a device when a start leaves by any path but success.
     ///
     /// A guard rather than a restore call on each failure path, because the path that matters most
-    /// is the one nobody writes a call on: an exception thrown after raw mode was already entered.
+    /// is the one nobody writes a call on: an exception thrown after raw mode, or the alternate
+    /// screen, was already entered.
     class RestoreUnlessKept
     {
       public:
@@ -275,11 +371,22 @@ namespace
 
         ~RestoreUnlessKept()
         {
-            if (!_kept)
-                _device->Restore();
+            if (_kept)
+                return;
+            if (_screenEntered)
+                _device->Write(ScreenBytes().leave);
+            _device->Restore();
         }
 
-        /// Ownership moved on, and whoever holds it restores the device now.
+        /// The alternate screen is about to be entered, so a failure from here on leaves it. Marked
+        /// BEFORE the write: a write that fails halfway may still have entered it, and leaving a
+        /// screen that was never entered costs a cursor move where the opposite costs the shell.
+        void ScreenEntering() noexcept
+        {
+            _screenEntered = true;
+        }
+
+        /// Ownership moved on, and whoever holds it leaves the screen and restores the device now.
         void Keep() noexcept
         {
             _kept = true;
@@ -287,9 +394,79 @@ namespace
 
       private:
         ITerminalDevice* _device;
+        bool _screenEntered { false };
         bool _kept { false };
     };
 } // namespace
+
+TerminalScreenBytes const& ScreenBytes()
+{
+    static auto const bytes = [] {
+        auto const spell = [](void (*step)(tui::TerminalOutput&)) {
+            auto output = CapturedOutput {};
+            step(output);
+            return output.Take();
+        };
+        return TerminalScreenBytes {
+            .enter = spell([](tui::TerminalOutput& output) {
+                output.enterAltScreen();
+                output.hideCursor();
+            }),
+            .leave = spell([](tui::TerminalOutput& output) {
+                output.showCursor();
+                output.leaveAltScreen();
+            }),
+            .home = spell([](tui::TerminalOutput& output) { output.moveTo(1, 1); }),
+            .clearBelow = spell([](tui::TerminalOutput& output) { output.clearToEndOfDisplay(); }),
+            .syncBegin = std::string { SyncBegin },
+            .syncEnd = std::string { SyncEnd },
+        };
+    }();
+    return bytes;
+}
+
+bool PresentsSynchronized(TerminalCapabilities const& capabilities) noexcept
+{
+    return capabilities.synchronizedOutput == SynchronizedOutputAnswer::Supported;
+}
+
+std::string FrameBytes(std::string_view frame, bool synchronized)
+{
+    auto const& screen = ScreenBytes();
+    auto bytes = std::string {};
+    bytes.reserve(frame.size() + screen.home.size() + screen.clearBelow.size() + screen.syncBegin.size()
+                  + screen.syncEnd.size());
+    if (synchronized)
+        bytes.append(screen.syncBegin);
+    bytes.append(screen.home);
+    bytes.append(frame);
+    bytes.append(screen.clearBelow);
+    if (synchronized)
+        bytes.append(screen.syncEnd);
+    return bytes;
+}
+
+SynchronizedOutputAnswer ToSynchronizedOutputAnswer(tui::DecModeStatus status) noexcept
+{
+    // A switch with no default, so a status endo adds is a compiler warning here rather than a value
+    // quietly read as one of these.
+    switch (status)
+    {
+        case tui::DecModeStatus::Set:
+        case tui::DecModeStatus::Reset:
+            return SynchronizedOutputAnswer::Supported;
+        case tui::DecModeStatus::NotRecognized:
+        case tui::DecModeStatus::PermanentlySet:
+        case tui::DecModeStatus::PermanentlyReset:
+            return SynchronizedOutputAnswer::NotSupported;
+        case tui::DecModeStatus::NoReply:
+            return SynchronizedOutputAnswer::NoReply;
+        case tui::DecModeStatus::NotAsked:
+        case tui::DecModeStatus::NotImplemented:
+            return SynchronizedOutputAnswer::NotAsked;
+    }
+    return SynchronizedOutputAnswer::NotAsked;
+}
 
 std::string KeyBytes(tui::KeyEvent const& key)
 {
@@ -363,14 +540,24 @@ Task<std::expected<StartedTerminal, std::string>> StartTerminalDevice(std::uniqu
     auto capabilities = std::expected<TerminalCapabilities, std::string> {};
 
     // The acquisition and both queries BLOCK, so they run on the pool; the record is used only
-    // after the hop back.
+    // after the hop back. The screen is entered last of the terminal-facing steps, once the queries
+    // have their answers, and the encoding -- which asks the environment, not the terminal -- after it.
     co_await ResumeOn { *pool };
     try
     {
         if (auto acquired = device->Acquire(); !acquired)
             capabilities = std::unexpected(std::move(acquired).error());
         else
-            capabilities = TerminalCapabilities { .sixel = device->AskSixel(), .encoding = device->Encoding() };
+        {
+            auto record = TerminalCapabilities {};
+            record.sixel = device->AskSixel();
+            record.synchronizedOutput = device->AskSynchronizedOutput();
+            auto const& enter = ScreenBytes().enter;
+            guard.ScreenEntering();
+            device->Write(enter);
+            record.encoding = device->Encoding();
+            capabilities = record;
+        }
     }
     catch (std::exception const& failure)
     {
@@ -381,23 +568,29 @@ Task<std::expected<StartedTerminal, std::string>> StartTerminalDevice(std::uniqu
     if (!capabilities.has_value())
         co_return std::unexpected(std::move(capabilities).error());
 
-    // Everything that can throw runs while the guard still restores: the stream, then the allocation.
-    // The constructor moves two pointers and cannot, so the device is handed over and the guard stood
-    // down with nothing between them. The guard's pointer names the device object, never the owner,
-    // so it stays valid across the move.
+    // Everything that can throw runs while the guard still leaves the screen and restores: sharing
+    // the device, the stream, the restore handle, the presenter, then the events' allocation. The
+    // events' constructor moves three pointers and cannot, so the device is handed over and the guard
+    // stood down with nothing between them. The guard's pointer names the device object, never an
+    // owner, so it stays valid across every move.
+    auto shared = std::shared_ptr<ITerminalDevice> { std::move(device) };
     auto stream = MakeTerminalEventStream(TerminalStreamParts {
-        .source = &device->Events(),
+        .source = &shared->Events(),
         .pool = pool,
         .resumeOn = resumeOn,
-        .wake = [raw = device.get()] { raw->Wake(); },
-        .columns = device->Columns(),
-        .rows = device->Rows(),
+        .wake = [raw = shared.get()] { raw->Wake(); },
+        .columns = shared->Columns(),
+        .rows = shared->Rows(),
     });
-    auto restore = std::make_shared<TerminalRestoreHandle>(device.get());
-    auto events = std::make_unique<StartedTerminalEvents>(std::move(device), std::move(stream), restore);
+    auto restore = std::make_shared<TerminalRestoreHandle>(shared.get(), RestoreNowLeading());
+    auto frames = std::make_unique<TerminalFramePresenter>(shared, PresentsSynchronized(*capabilities));
+    auto events = std::make_unique<StartedTerminalEvents>(shared, std::move(stream), restore);
     guard.Keep();
     co_return StartedTerminal {
-        .capabilities = *capabilities, .events = std::move(events), .restore = std::move(restore), .frames = nullptr
+        .capabilities = *capabilities,
+        .events = std::move(events),
+        .restore = std::move(restore),
+        .frames = std::move(frames),
     };
 }
 
