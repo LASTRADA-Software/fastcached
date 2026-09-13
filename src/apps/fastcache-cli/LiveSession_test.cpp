@@ -5,16 +5,19 @@
 #include "TerminalCapabilities.hpp"
 
 #include <FastCache/Async/PlatformReactor.hpp>
+#include <FastCache/Async/ResumeOn.hpp>
 #include <FastCache/Async/TestReactor.hpp>
 #include <FastCache/Async/ThreadPoolExecutor.hpp>
 #include <FastCache/Core/BoundedDrain.hpp>
 #include <FastCache/Core/Clock.hpp>
+#include <FastCache/Platform/StopSignal.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <expected>
 #include <memory>
@@ -28,6 +31,10 @@
 #include <string_view>
 #include <thread>
 #include <vector>
+
+#if !defined(_WIN32)
+    #include <csignal>
+#endif
 
 using namespace FastCache;
 using namespace FastCache::Cli;
@@ -450,8 +457,7 @@ TEST_CASE("a terminal that goes away ends an interactive session and no gather s
     composition.Finish();
 }
 
-TEST_CASE("an interactive session whose rung has no view refuses by name and releases the terminal",
-          "[cli][live][session]")
+TEST_CASE("an interactive session whose rung has no view refuses by name and releases the terminal", "[cli][live][session]")
 {
     // Never drawn through the piped view instead: a terminal session in record lines is the shape
     // change §1.6 rules out. The terminal it acquired is closed and released before the refusal.
@@ -731,6 +737,24 @@ class StreamingSink final: public IFrameSink
     std::string _stream;
 };
 
+/// Close @p source on its reactor's thread, which is the only thread `Close()` may run on.
+/// @param reactor Where to close it.
+/// @param source The source, when one was composed.
+/// @return The detached task.
+DetachedTask CloseOnReactor(IReactor* reactor, std::optional<LiveEventSource>* source)
+{
+    co_await ResumeOn { *reactor };
+    if (source->has_value())
+        (*source)->Close();
+}
+
+/// How long a seat case waits for a session before closing it from outside.
+///
+/// Every case here ends its session by budget, refusal or Ctrl-C within a couple of seconds.
+/// One that does not -- a mutant that never reads, a budget nothing can meet -- would otherwise
+/// block the case's thread for the life of the run; closed, it fails on its assertions instead.
+inline constexpr auto SeatSessionBound = std::chrono::seconds { 20 };
+
 /// What `main` acquires, for real: a platform reactor on a thread of its own, three one-thread
 /// pools and a steady clock -- so the session's blocking wait and its drain run on the case's
 /// thread exactly as they run on `main`'s.
@@ -775,6 +799,11 @@ struct RunningSeat
     /// @return The seat.
     [[nodiscard]] LiveSessionSeat Seat(DrainBound bound = {})
     {
+        auto* installer = static_cast<IStopSignalInstaller*>(&stops);
+        if (stopsOverride != nullptr)
+            installer = stopsOverride;
+        else if (stoppedFromGather)
+            installer = &onDemand;
         return LiveSessionSeat { .reactor = &reactor,
                                  .clock = &clock,
                                  .dialer = dialer,
@@ -785,7 +814,7 @@ struct RunningSeat
                                  .streamsInteractive = streamsInteractive,
                                  .render = render,
                                  .terminals = &terminals,
-                                 .stops = stoppedFromGather ? static_cast<IStopSignalInstaller*>(&onDemand) : &stops,
+                                 .stops = installer,
                                  .views = &views,
                                  .drainWait = &drainWait,
                                  .drainBound = bound,
@@ -798,10 +827,39 @@ struct RunningSeat
         return sink.Stream();
     }
 
+    /// Run a session on this seat, closing it from outside if it outlives `SeatSessionBound`.
+    ///
+    /// **A session that never ends must fail rather than hang**: the call blocks this thread
+    /// until the session drains, so a watchdog closes the source on the reactor at the bound, and
+    /// the case then fails on whatever it asserted -- and on the watchdog having fired at all.
+    /// @param context The invocation.
+    /// @param bound How long the drain may take.
+    /// @return How the session ended.
+    [[nodiscard]] SessionEnding Run(VerbContext const& context, DrainBound bound = {})
+    {
+        auto fired = std::atomic<bool> { false };
+        auto watchdog = std::jthread { [this, &fired](std::stop_token const& stop) {
+            auto mutex = std::mutex {};
+            auto wake = std::condition_variable_any {};
+            auto lock = std::unique_lock { mutex };
+            (void) wake.wait_for(lock, stop, SeatSessionBound, [] { return false; });
+            if (stop.stop_requested())
+                return;
+            fired = true;
+            CloseOnReactor(&reactor, &source);
+        } };
+        auto ending = RunLiveStatsSession(context, Seat(bound));
+        watchdog.request_stop();
+        watchdog.join();
+        CHECK_FALSE(fired.load());
+        return ending;
+    }
+
     RenderOptions render;
     bool streamsInteractive;
     bool stoppedFromGather;
     IStatsDialer* dialer { nullptr };
+    IStopSignalInstaller* stopsOverride { nullptr };
     SteadyClock clock;
     PlatformReactor reactor { clock };
     ThreadPoolExecutor samplePool { 1 };
@@ -875,7 +933,7 @@ TEST_CASE("a live-stats session refused at admission composes nothing", "[cli][l
     auto identity =
         ScriptedIdentity { EndpointIdentity { .kind = std::nullopt, .detail = "no 0xFC connection was opened" } };
 
-    auto const ending = RunLiveStatsSession(SessionContext({}, 1, &identity, &seat.gatherer), seat.Seat());
+    auto const ending = seat.Run(SessionContext({}, 1, &identity, &seat.gatherer));
 
     CHECK(ending.kind == SessionEndKind::Refused);
     CHECK(ending.answer.outcome == Outcome::Unreachable);
@@ -889,7 +947,7 @@ TEST_CASE("a piped live-stats session runs to its budget, drains, and exits with
     auto seat = RunningSeat { RenderOptions { .format = OutputFormat::Tsv }, false };
     auto identity = ScriptedIdentity { CacheDaemon() };
 
-    auto const ending = RunLiveStatsSession(SessionContext({}, 1, &identity, &seat.gatherer), seat.Seat());
+    auto const ending = seat.Run(SessionContext({}, 1, &identity, &seat.gatherer));
 
     CHECK(ending.kind == SessionEndKind::Ran);
     CHECK(ending.answer.outcome == Outcome::Affirmative);
@@ -909,7 +967,7 @@ TEST_CASE("live-stats --format=json at a terminal streams its records rather tha
     auto seat = RunningSeat { RenderOptions { .format = OutputFormat::Json }, true };
     auto identity = ScriptedIdentity { CacheDaemon() };
 
-    auto const ending = RunLiveStatsSession(SessionContext({}, 1, &identity, &seat.gatherer), seat.Seat());
+    auto const ending = seat.Run(SessionContext({}, 1, &identity, &seat.gatherer));
 
     CHECK(ending.kind == SessionEndKind::Ran);
     CHECK(seat.terminals.Calls() == 0);
@@ -925,7 +983,7 @@ TEST_CASE("a human live-stats session at a terminal asks for the terminal", "[cl
     auto seat = RunningSeat { RenderOptions { .format = OutputFormat::Human }, true };
     auto identity = ScriptedIdentity { CacheDaemon() };
 
-    auto const ending = RunLiveStatsSession(SessionContext({}, 1, &identity, &seat.gatherer), seat.Seat());
+    auto const ending = seat.Run(SessionContext({}, 1, &identity, &seat.gatherer));
 
     CHECK(ending.kind == SessionEndKind::Refused);
     CHECK(ending.answer.outcome == Outcome::Local);
@@ -944,7 +1002,7 @@ TEST_CASE("a live-stats session that ends with a sample stuck is abandoned with 
     auto identity = ScriptedIdentity { CacheDaemon() };
     auto const bound = DrainBound { .ceiling = std::chrono::milliseconds { 50 }, .poll = std::chrono::milliseconds { 5 } };
 
-    auto const ending = RunLiveStatsSession(SessionContext({}, 0, &identity, &seat.gated), seat.Seat(bound));
+    auto const ending = seat.Run(SessionContext({}, 0, &identity, &seat.gated), bound);
 
     CHECK(ending.kind == SessionEndKind::Abandoned);
     CHECK(ending.answer.outcome == Outcome::Unreachable);
@@ -963,7 +1021,7 @@ TEST_CASE("a live-stats session stopped with a sample out drains when the sample
     auto identity = ScriptedIdentity { CacheDaemon() };
     seat.gated.Open();
 
-    auto const ending = RunLiveStatsSession(SessionContext({}, 0, &identity, &seat.gated), seat.Seat());
+    auto const ending = seat.Run(SessionContext({}, 0, &identity, &seat.gated));
 
     CHECK(ending.kind == SessionEndKind::Ran);
     CHECK(ending.line.empty());
@@ -983,7 +1041,7 @@ TEST_CASE("a live-stats session re-dials through the seat's dialer after a faile
     ScriptedDialer dialer { { true } };
     seat.dialer = &dialer;
 
-    auto const ending = RunLiveStatsSession(SessionContext({}, 2, &identity, &dying), seat.Seat());
+    auto const ending = seat.Run(SessionContext({}, 2, &identity, &dying));
 
     CHECK(ending.kind == SessionEndKind::Ran);
     CHECK(ending.answer.outcome == Outcome::Affirmative);
@@ -1012,7 +1070,7 @@ TEST_CASE("a live-stats session reaches its endpoint only through the stats gath
     context.node = &node;
     context.admin = &admin;
 
-    auto const ending = RunLiveStatsSession(context, seat.Seat());
+    auto const ending = seat.Run(context);
 
     CHECK(ending.kind == SessionEndKind::Ran);
     CHECK(seat.gatherer.Calls() == 2);
@@ -1023,12 +1081,88 @@ TEST_CASE("a live-stats session reaches its endpoint only through the stats gath
     CHECK(admin.Fetches() == 0);
 }
 
+#if !defined(_WIN32)
+
+namespace
+{
+
+/// A gatherer that notes, as it gathers, whether SIGINT is still ignored: DURING the session,
+/// which is when an install over the ignore would show -- by the session's end it is restored.
+class DispositionGatherer final: public IStatsGatherer
+{
+  public:
+    [[nodiscard]] std::vector<StatsAttempt> Gather() override
+    {
+        struct sigaction current {};
+        if (::sigaction(SIGINT, nullptr, &current) != 0 || current.sa_handler != SIG_IGN)
+            _overridden = true;
+        return Reading();
+    }
+
+    /// @return Whether any gather saw SIGINT caught rather than ignored.
+    [[nodiscard]] bool Overridden() const noexcept
+    {
+        return _overridden.load();
+    }
+
+  private:
+    std::atomic<bool> _overridden { false };
+};
+
+/// The process's own stop request, as `main` installs it.
+class ProcessStopInstaller final: public IStopSignalInstaller
+{
+  public:
+    [[nodiscard]] std::expected<std::unique_ptr<IStopSignal>, std::string> Install() override
+    {
+        return InstallStopSignal();
+    }
+};
+
+} // namespace
+
+TEST_CASE("a live-stats session that inherited SIGINT ignored runs to its budget and leaves it ignored",
+          "[cli][live][session][seat]")
+{
+    // A background job started with SIGINT ignored: the session installs nothing over it, says
+    // nothing about it, and still ends on its budget -- the stop signal it got can never fire,
+    // which is not a failure to install one.
+    struct sigaction original {};
+    struct sigaction ignored {};
+    ignored.sa_handler = SIG_IGN;
+    static_cast<void>(::sigemptyset(&ignored.sa_mask));
+    REQUIRE(::sigaction(SIGINT, &ignored, &original) == 0);
+
+    {
+        auto seat = RunningSeat { RenderOptions { .format = OutputFormat::Tsv }, false };
+        auto identity = ScriptedIdentity { CacheDaemon() };
+        auto process = ProcessStopInstaller {};
+        auto gatherer = DispositionGatherer {};
+        seat.stopsOverride = &process;
+
+        auto const ending = seat.Run(SessionContext({}, 2, &identity, &gatherer));
+
+        CHECK(ending.kind == SessionEndKind::Ran);
+        CHECK(ending.answer.outcome == Outcome::Affirmative);
+        CHECK(ending.answer.advisories.empty());
+        CHECK(std::ranges::count(seat.Stream(), '\n') == 3);
+        CHECK_FALSE(gatherer.Overridden());
+    }
+
+    struct sigaction after {};
+    static_cast<void>(::sigaction(SIGINT, nullptr, &after));
+    CHECK(after.sa_handler == SIG_IGN);
+    static_cast<void>(::sigaction(SIGINT, &original, nullptr));
+}
+
+#endif
+
 TEST_CASE("a live-stats session with no stats source is refused before anything is composed", "[cli][live][session][seat]")
 {
     auto seat = RunningSeat { RenderOptions { .format = OutputFormat::Tsv }, false };
     auto identity = ScriptedIdentity { CacheDaemon() };
 
-    auto const ending = RunLiveStatsSession(SessionContext({}, 1, &identity, nullptr), seat.Seat());
+    auto const ending = seat.Run(SessionContext({}, 1, &identity, nullptr));
 
     CHECK(ending.kind == SessionEndKind::Refused);
     CHECK(ending.answer.outcome == Outcome::Unreachable);
@@ -1047,7 +1181,7 @@ TEST_CASE("a live-stats fleet session is refused by name while fleet sessions ca
     auto context = SessionContext(operands, 1, &identity, &seat.gatherer);
     context.options.interval = std::nullopt;
 
-    auto const ending = RunLiveStatsSession(context, seat.Seat());
+    auto const ending = seat.Run(context);
 
     CHECK(ending.kind == SessionEndKind::Refused);
     CHECK(ending.answer.outcome == Outcome::Local);
