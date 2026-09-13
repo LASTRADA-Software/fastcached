@@ -398,6 +398,7 @@ namespace
                                            .tierPriority = Priority::Normal,
                                            .tierNotePriority = Priority::Low,
                                            .sourcePriority = Priority::High,
+                                           .fillsHeight = true,
                                            .document = DocumentSpec {},
                                            .titleFacts = FleetTitle };
 

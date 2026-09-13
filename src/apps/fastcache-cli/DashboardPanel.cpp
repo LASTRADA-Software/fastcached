@@ -6,6 +6,7 @@
 #include "NodeStatusText.hpp"
 
 #include <FastCache/Cache/StorageTier.hpp>
+#include <FastCache/Core/NumericText.hpp>
 #include <FastCache/Core/Ranges.hpp>
 #include <FastCache/Distributed/NodePolicy.hpp>
 
@@ -18,6 +19,7 @@
 #include <expected>
 #include <format>
 #include <iterator>
+#include <numeric>
 #include <ranges>
 #include <span>
 #include <system_error>
@@ -143,6 +145,29 @@ namespace
             auto const slots = SlotsAt(history, index);
             if (slots.has_value() && slots->ceilings.has_value())
                 series[index] = static_cast<double>(slots->ceilings->available);
+        }
+        return series;
+    }
+
+    /// Each entry's value of a field its DOCUMENT reading names, such as a fleet headline tile's.
+    ///
+    /// A fleet reading is the leader's rendered text, which no `StatsReading` models, so its figures are read by the
+    /// name the document gives them rather than through a `ReadingField`.
+    /// @param history The samples.
+    /// @param name The field.
+    /// @return One value per entry, absent where the entry holds no reading or the reading no such number.
+    [[nodiscard]] Series DocumentLevels(std::deque<HistoryEntry> const& history, std::string_view name)
+    {
+        auto series = Series(history.size());
+        for (auto const index: std::views::iota(std::size_t { 0 }, history.size()))
+        {
+            auto const& reading = history[index].reading;
+            auto const* field = reading.has_value() ? FindField(*reading, name) : nullptr;
+            if (field == nullptr || (field->value.kind != CellKind::Number && field->value.kind != CellKind::Text))
+                continue;
+            auto parsed = 0.0;
+            if (ParseFiniteDouble(field->value.lexical, parsed))
+                series[index] = parsed;
         }
         return series;
     }
@@ -403,6 +428,47 @@ namespace
         return pieces;
     }
 
+    /// The columns of a table's heading that fit in @p budget cells: by rank, each one that still fits.
+    ///
+    /// **Not `FitPieces`, which drops a line's lowest pieces until the rest fit.** A line is read left to right,
+    /// so a piece it loses goes whole; a table's columns are independent, so the room a wide column could not
+    /// use is given to the next column that fits in it. At 80 cells that keeps `cores` beside the vital
+    /// columns and leaves `memory` out, as §5 draws it, where dropping by rank alone left the room empty.
+    /// Columns are taken most important first and, among equals, leftmost first; they come back in drawing order.
+    /// @param pieces The heading's pieces, one per column, in drawing order.
+    /// @param budget The cells available.
+    /// @param cellWidth How wide text is.
+    /// @return The kept columns; or, when the essential ones alone do not fit, the cells they needed.
+    [[nodiscard]] std::expected<std::vector<Piece>, std::size_t> FitColumns(std::vector<Piece> pieces,
+                                                                            std::size_t budget,
+                                                                            CellWidth cellWidth)
+    {
+        auto order = std::vector<std::size_t>(pieces.size());
+        std::ranges::iota(order, std::size_t { 0 });
+        std::ranges::stable_sort(
+            order, {}, [&pieces](std::size_t index) { return std::to_underlying(pieces[index].priority); });
+
+        auto kept = std::vector<bool>(pieces.size(), false);
+        auto used = std::size_t { 0 };
+        for (auto const index: order)
+        {
+            auto const width = cellWidth(pieces[index].text);
+            auto const essential = pieces[index].priority == Priority::Essential;
+            if (!essential && used + width > budget)
+                continue;
+            kept[index] = true;
+            used += width;
+        }
+        if (used > budget)
+            return std::unexpected(used);
+
+        auto fitted = std::vector<Piece> {};
+        for (auto const index: std::views::iota(std::size_t { 0 }, pieces.size()))
+            if (kept[index])
+                fitted.push_back(std::move(pieces[index]));
+        return fitted;
+    }
+
     /// The cells @p pieces take, the trend excluded.
     /// @param pieces The pieces.
     /// @param cellWidth How wide text is.
@@ -426,23 +492,43 @@ namespace
     };
 
     /// One vertical item of a frame: a line, a blank, or a table that can shrink.
+    ///
+    /// The byte-wide members close the struct in one run, so it pads nothing between 8-aligned ones.
     struct Item
     {
         std::vector<std::string> lines {};      ///< Its lines; a table's first is its heading.
-        Priority priority { Priority::Normal }; ///< When it goes.
-        std::size_t hidden { 0 };               ///< How many of a table's rows are not shown.
-        bool table { false };                   ///< Whether it shrinks to `+N more` before it goes.
-        bool image { false };                   ///< Whether its lines are blank cells an image is placed over.
         std::vector<LineSpan> spans {};         ///< The runs of its lines a presenter dresses.
+        std::string_view noun {};               ///< What a table's rows are, for its overflow line; empty draws `+N more`.
+        std::size_t hidden { 0 };               ///< How many of a table's rows are not shown, below those that are.
+        std::size_t above { 0 };                ///< How many rows a scrolled table skipped above its first.
+        std::size_t rowsKept { 0 };             ///< The rows a table keeps when it shrinks at `shrinkAt`.
+        Priority priority { Priority::Normal }; ///< When it goes.
+        std::optional<Priority> shrinkAt {};    ///< The level a table gives up rows at, when that is not `priority`.
+        bool table { false };                   ///< Whether it shrinks to its overflow line before it goes.
+        bool image { false };                   ///< Whether its lines are blank cells an image is placed over.
     };
 
-    /// The lines a layout keeps, the runs it dresses, and where its image item landed if it kept one.
+    /// The lines a layout keeps, the runs it dresses, and where its image and its scrolled table landed.
     struct FittedRows
     {
-        std::vector<std::string> lines {};       ///< Every kept line, top to bottom.
-        std::vector<LineSpan> spans {};          ///< Every kept run; `line` indexes `lines`.
-        std::optional<std::size_t> imageLine {}; ///< The index of the image item's first line, when kept.
+        std::vector<std::string> lines {};        ///< Every kept line, top to bottom.
+        std::vector<LineSpan> spans {};           ///< Every kept run; `line` indexes `lines`.
+        std::optional<std::size_t> imageLine {};  ///< The index of the image item's first line, when kept.
+        std::size_t imageRows { 0 };              ///< How many lines the image item kept.
+        std::optional<std::size_t> tableShown {}; ///< How many rows a table with an overflow noun showed.
     };
+
+    /// What a scrolled table's overflow line tells the operator to press, before and after scrolling.
+    constexpr std::string_view ScrollDownHint = "PgDn scrolls, / filters";
+    constexpr std::string_view ScrollBothHint = "PgUp/PgDn scroll, / filters";
+
+    /// Whether @p item draws an overflow line below its rows.
+    /// @param item A table.
+    /// @return True when rows are hidden below or skipped above.
+    [[nodiscard]] constexpr bool HasOverflowLine(Item const& item) noexcept
+    {
+        return item.hidden > 0 || item.above > 0;
+    }
 
     /// How many lines @p item draws as it stands.
     /// @param item The item.
@@ -452,29 +538,36 @@ namespace
         if (!item.table)
             return item.lines.size();
         auto const rows = item.lines.size() - 1;
-        return 1 + (rows - item.hidden) + (item.hidden > 0 ? 1 : 0);
+        return 1 + (rows - item.hidden) + (HasOverflowLine(item) ? 1 : 0);
     }
 
-    /// Hide one more of a table's rows, if that makes it shorter.
+    /// How many rows @p item hides after one more cut that leaves at least @p floor shown, if a cut can.
     ///
-    /// The first cut hides two rows for one `+N more` line; each later cut hides one more. A table
-    /// that has shown its last row keeps its heading and its `+N more` until it goes whole.
+    /// A table with no overflow line yet hides two rows for the line it gains; every later cut hides one
+    /// more. A table that has shown its last row keeps its heading and its overflow line until it goes
+    /// whole.
     /// @param item The table.
-    /// @return True when the table got shorter.
-    [[nodiscard]] bool Shrink(Item& item) noexcept
+    /// @param floor The fewest rows the cut may leave shown.
+    /// @return The rows hidden after the cut, or nullopt when no cut makes it shorter.
+    [[nodiscard]] std::optional<std::size_t> AfterCut(Item const& item, std::size_t floor) noexcept
     {
         auto const shown = (item.lines.size() - 1) - item.hidden;
-        if (item.hidden == 0)
-        {
-            if (shown < 2)
-                return false;
-            item.hidden = 2;
-            return true;
-        }
-        if (shown == 0)
-            return false;
-        ++item.hidden;
-        return true;
+        if (!HasOverflowLine(item))
+            return shown >= floor + 2 ? std::optional<std::size_t> { 2 } : std::nullopt;
+        return shown > floor ? std::optional<std::size_t> { item.hidden + 1 } : std::nullopt;
+    }
+
+    /// The overflow line under a table: what is not shown, and for a table with a noun, how to reach it.
+    /// @param item The table.
+    /// @return The line.
+    [[nodiscard]] std::string OverflowLine(Item const& item)
+    {
+        if (item.noun.empty())
+            return std::format("{}+{} more", Indent, item.hidden);
+        auto what = item.hidden > 0 ? std::format("{} more {}", item.hidden, item.noun) : std::string {};
+        if (item.above > 0)
+            what += what.empty() ? std::format("{} {} above", item.above, item.noun) : std::format(", {} above", item.above);
+        return std::format("{}... {}; {}", Indent, what, item.above > 0 ? ScrollBothHint : ScrollDownHint);
     }
 
     /// The last index in @p items matching @p match, or `items.size()`.
@@ -505,16 +598,23 @@ namespace
         for (auto const& item: items)
             total += HeightOf(item);
 
-        // Hide one more row of the bottom-most table of @p priority that can still get shorter.
+        // Hide one more row of the bottom-most table shrinking at @p priority that can still get shorter.
+        // A table shrinks at its own `shrinkAt`, down to its `rowsKept`; the essential stage takes an
+        // essential table below that, to its heading and its overflow line.
         auto const shrinkLast = [&items, &total](Priority priority) {
-            auto const table = LastWhere(items, [priority](Item const& item) {
-                auto probe = item;
-                return item.table && item.priority == priority && Shrink(probe);
-            });
+            auto const essentialStage = priority == Priority::Essential;
+            auto const floorOf = [essentialStage](Item const& item) {
+                return essentialStage || !item.shrinkAt.has_value() ? 0 : item.rowsKept;
+            };
+            auto const shrinksHere = [&](Item const& item) {
+                auto const level = essentialStage ? item.priority : item.shrinkAt.value_or(item.priority);
+                return item.table && level == priority && AfterCut(item, floorOf(item)).has_value();
+            };
+            auto const table = LastWhere(items, shrinksHere);
             if (table == items.size())
                 return false;
             total -= HeightOf(items[table]);
-            (void) Shrink(items[table]);
+            items[table].hidden = AfterCut(items[table], floorOf(items[table])).value_or(items[table].hidden);
             total += HeightOf(items[table]);
             return true;
         };
@@ -552,8 +652,6 @@ namespace
         auto fitted = FittedRows {};
         for (auto& item: items)
         {
-            // A table keeps its heading and the rows it shows, and the runs on them; a run on a hidden row
-            // goes with the row.
             auto const first = fitted.lines.size();
             auto const kept = item.table ? 1 + ((item.lines.size() - 1) - item.hidden) : item.lines.size();
             for (auto const& span: item.spans)
@@ -561,10 +659,15 @@ namespace
                     fitted.spans.push_back(
                         LineSpan { .line = first + span.line, .byte = span.byte, .length = span.length, .tone = span.tone });
             if (item.image)
+            {
                 fitted.imageLine = first;
+                fitted.imageRows = item.lines.size();
+            }
+            if (item.table && !item.noun.empty())
+                fitted.tableShown = kept - 1;
             std::ranges::move(item.lines | std::views::take(kept), std::back_inserter(fitted.lines));
-            if (item.table && item.hidden > 0)
-                fitted.lines.push_back(std::format("{}+{} more", Indent, item.hidden));
+            if (item.table && HasOverflowLine(item))
+                fitted.lines.push_back(OverflowLine(item));
         }
         return fitted;
     }
@@ -573,7 +676,7 @@ namespace
     /// @return The item.
     [[nodiscard]] Item Blank()
     {
-        return Item { .lines = { std::string {} }, .priority = Priority::Spacing, .hidden = 0, .table = false };
+        return Item { .lines = { std::string {} }, .priority = Priority::Spacing };
     }
 
     /// The pieces of a line joined, the trend drawn where the trend piece stands.
@@ -1488,11 +1591,11 @@ namespace
     /// The palette ceiling a chart is encoded with: its ramp's eight colours fit without merging.
     constexpr auto ChartColours = std::size_t { 16 };
 
-    /// What separates two headline tiles on one line.
-    constexpr std::string_view TileGap = "   ";
+    /// What separates the two columns of headline tiles.
+    constexpr std::string_view TileGap = "  ";
 
     /// Columns a tile's value is right-aligned into, at the least.
-    constexpr auto TileValueColumns = std::size_t { 10 };
+    constexpr auto TileValueColumns = std::size_t { 6 };
 
     /// What separates two columns of a document table, and two tabs of the section strip.
     constexpr std::string_view ColumnGap = "  ";
@@ -1507,6 +1610,19 @@ namespace
             if (table.columns[index] == name)
                 return index;
         return std::nullopt;
+    }
+
+    /// The integer a document cell carries, or nullopt for an absent cell or one that is not an integer.
+    /// @param cell The raw cell.
+    /// @return The integer.
+    [[nodiscard]] std::optional<std::uint64_t> CellInteger(Cell const& cell) noexcept
+    {
+        if (cell.kind == CellKind::Absent)
+            return std::nullopt;
+        auto number = std::uint64_t { 0 };
+        auto const* const end = cell.lexical.data() + cell.lexical.size();
+        auto const [at, error] = std::from_chars(cell.lexical.data(), end, number);
+        return error == std::errc {} && at == end ? std::optional<std::uint64_t> { number } : std::nullopt;
     }
 
     /// A document cell written for a person, in the scale the leader's own tables give it.
@@ -1525,12 +1641,10 @@ namespace
     {
         if (cell.kind == CellKind::Absent)
             return std::string { in.absent };
-        auto number = std::uint64_t { 0 };
-        auto const* const end = cell.lexical.data() + cell.lexical.size();
-        auto const [at, error] = std::from_chars(cell.lexical.data(), end, number);
-        if (!format.has_value() || error != std::errc {} || at != end)
+        auto const number = CellInteger(cell);
+        if (!format.has_value() || !number.has_value())
             return cell.lexical;
-        return Distributed::HumanFleetFigure(number, *format);
+        return Distributed::HumanFleetFigure(*number, *format);
     }
 
     /// The scale of each column of a section's header, in the leader's own column tables.
@@ -1560,15 +1674,20 @@ namespace
     /// One headline tile's words.
     struct Tile
     {
-        std::string key;   ///< The figure's key.
-        std::string value; ///< Its value, written.
-        std::string of;    ///< `of <n>`, or empty for a figure with no denominator.
+        std::string_view key {};   ///< The figure's key, which its trend is read under.
+        std::string_view label {}; ///< The page's label for it.
+        std::string value {};      ///< Its value, written.
+        std::string words {};      ///< `of 192 slots`, `not yet resolved`, or empty.
+        bool trend { false };      ///< Whether a sparkline is drawn where its words would be.
+        bool worded { false };     ///< Whether the figure's row carries words or a trend at all, read or not.
     };
 
-    /// One tile per `FleetKpiKeys()` key, in that order.
+    /// One tile per `FleetKpis()` row, in that order.
     ///
-    /// Every key has a tile whether or not the document carried its row, so the strip is one shape from
-    /// the first frame on: a figure not yet read is the absent marker, never a missing tile.
+    /// Every figure has a tile whether or not the document carried its row, so the strip is one shape
+    /// from the first frame on: a figure not yet read is the absent marker, never a missing tile. Its words
+    /// are drawn only beside a row that was read, since *not yet resolved* beside a figure nobody reported
+    /// would be a claim about it.
     /// @param in The frame's inputs.
     /// @return The tiles.
     [[nodiscard]] std::vector<Tile> Tiles(FrameInputs const& in)
@@ -1586,77 +1705,201 @@ namespace
         auto const unitAt = column(2);
         auto const ofAt = column(3);
         auto const readable = keyAt.has_value() && valueAt.has_value() && unitAt.has_value();
+        auto const drawsTrend = in.glyphs->sparkLevels.size() >= 2;
 
         auto tiles = std::vector<Tile> {};
-        for (auto const key: Distributed::FleetKpiKeys())
+        for (auto const& kpi: Distributed::FleetKpis())
         {
-            auto tile = Tile { .key = std::string { key }, .value = std::string { in.absent }, .of = {} };
-            auto const* row = !readable ? nullptr : FindIfOrNull(table->rows, [&keyAt, key](std::vector<Cell> const& cells) {
-                return cells[*keyAt].lexical == key;
-            });
+            auto tile = Tile { .key = kpi.key,
+                               .label = kpi.label,
+                               .value = std::string { in.absent },
+                               .trend = kpi.sparkline && drawsTrend,
+                               .worded = kpi.sparkline || !kpi.ofNoun.empty() || !kpi.note.empty() };
+            auto const* row =
+                !readable ? nullptr : FindIfOrNull(table->rows, [&keyAt, &kpi](std::vector<Cell> const& cells) {
+                    return cells[*keyAt].lexical == kpi.key;
+                });
             if (row != nullptr && valueAt.has_value() && unitAt.has_value())
             {
                 auto const& unit = (*row)[*unitAt].lexical;
                 tile.value = KpiText(in, (*row)[*valueAt], unit);
                 if (ofAt.has_value() && (*row)[*ofAt].kind != CellKind::Absent)
-                    tile.of = "of " + KpiText(in, (*row)[*ofAt], unit);
+                    tile.words = "of " + KpiText(in, (*row)[*ofAt], unit)
+                                 + (kpi.ofNoun.empty() ? std::string {} : " " + std::string { kpi.ofNoun });
+                else
+                    tile.words = std::string { kpi.note };
             }
             tiles.push_back(std::move(tile));
         }
         return tiles;
     }
 
-    /// The headline tiles laid out for @p budget cells: as many to a line as fit, every tile one width.
+    /// A column of tiles, measured: every tile in it one width.
+    struct TileColumn
+    {
+        std::vector<Tile const*> tiles {}; ///< Its tiles, top to bottom.
+        std::size_t label { 0 };           ///< Cells its labels take.
+        std::size_t value { 0 };           ///< Cells its values are right-aligned into.
+        std::size_t words { 0 };           ///< Cells its words or trends take; zero for a column drawn without them.
+    };
+
+    /// @p tiles measured as one column, with or without their words.
+    /// @param in The frame's inputs.
+    /// @param tiles The tiles.
+    /// @param withWords Whether words and trends are drawn.
+    /// @return The column.
+    [[nodiscard]] TileColumn MeasureTiles(FrameInputs const& in, std::vector<Tile const*> tiles, bool withWords)
+    {
+        auto column = TileColumn { .tiles = std::move(tiles), .label = 0, .value = TileValueColumns, .words = 0 };
+        for (auto const* tile: column.tiles)
+        {
+            column.label = std::max(column.label, in.cellWidth(tile->label));
+            column.value = std::max(column.value, in.cellWidth(tile->value));
+            if (withWords)
+                column.words = std::max(
+                    { column.words, in.cellWidth(tile->words), tile->trend ? MinimumTrendCells : std::size_t { 0 } });
+        }
+        return column;
+    }
+
+    /// The cells a column of tiles takes; zero for an empty one.
+    /// @param in The frame's inputs.
+    /// @param column The column.
+    /// @return The width.
+    [[nodiscard]] std::size_t TileColumnWidth(FrameInputs const& in, TileColumn const& column) noexcept
+    {
+        if (column.tiles.empty())
+            return 0;
+        auto const gap = in.cellWidth(ColumnGap);
+        return column.label + gap + column.value + (column.words > 0 ? gap + column.words : 0);
+    }
+
+    /// The @p index-th tile of @p column as text, or nothing past its last.
+    /// @param in The frame's inputs.
+    /// @param column The column.
+    /// @param index Which tile.
+    /// @return The text, unpadded after its last cell.
+    [[nodiscard]] std::string TileText(FrameInputs const& in, TileColumn const& column, std::size_t index)
+    {
+        if (index >= column.tiles.size())
+            return {};
+        auto const& tile = *column.tiles[index];
+        auto text = FitRight(tile.label, column.label, in.cellWidth) + std::string { ColumnGap }
+                    + AlignRight(tile.value, column.value, in.cellWidth);
+        if (column.words == 0)
+            return text;
+        if (tile.trend)
+            return text + std::string { ColumnGap }
+                   + Sparkline(Window(DocumentLevels(in.model->history, tile.key), column.words), *in.glyphs);
+        return tile.words.empty() ? text : text + std::string { ColumnGap } + tile.words;
+    }
+
+    /// The headline tiles laid out for @p budget cells, as §5 draws them.
+    ///
+    /// **Two columns where they fit**: the tiles whose rows carry words or a trend fill the first and the
+    /// rest fill the second, in `FleetKpis()` order within each -- which is what makes two columns fit at
+    /// 80 wide at all. Decided by what a row CAN carry rather than by what this reading carried, so a tile
+    /// does not jump columns the moment its denominator is first read. Narrower, one column with the
+    /// words; narrower again, one without; and no tiles when not even a label and its value fit.
     /// @param in The frame's inputs.
     /// @param spec The document block.
     /// @param budget The content width.
-    /// @return One item per line of tiles; none when not even one tile's key and value fit.
+    /// @return One item per line of tiles; none when not even one fits.
     [[nodiscard]] std::vector<Item> TileItems(FrameInputs const& in, DocumentSpec const& spec, std::size_t budget)
     {
         auto const tiles = Tiles(in);
-        auto keyColumns = std::size_t { 0 };
-        auto valueColumns = TileValueColumns;
-        auto ofColumns = std::size_t { 0 };
+        auto worded = std::vector<Tile const*> {};
+        auto plain = std::vector<Tile const*> {};
+        auto all = std::vector<Tile const*> {};
         for (auto const& tile: tiles)
         {
-            keyColumns = std::max(keyColumns, in.cellWidth(tile.key));
-            valueColumns = std::max(valueColumns, in.cellWidth(tile.value));
-            ofColumns = std::max(ofColumns, in.cellWidth(tile.of));
+            (tile.worded ? worded : plain).push_back(&tile);
+            all.push_back(&tile);
         }
         auto const indent = in.cellWidth(Indent);
-        auto const gap = in.cellWidth(ColumnGap);
-        auto const essential = keyColumns + gap + valueColumns;
-        if (indent + essential > budget)
-            return {};
-        // The denominators go before a line holds fewer than one tile.
-        auto const withOf = ofColumns > 0 && indent + essential + gap + ofColumns <= budget;
-        auto const tileWidth = essential + (withOf ? gap + ofColumns : 0);
-        auto const perLine = 1 + ((budget - indent - tileWidth) / (in.cellWidth(TileGap) + tileWidth));
 
-        auto items = std::vector<Item> {};
-        auto line = std::string {};
-        auto onLine = std::size_t { 0 };
-        for (auto const& tile: tiles)
+        auto layout = std::vector<TileColumn> { MeasureTiles(in, worded, true), MeasureTiles(in, plain, true) };
+        auto const twoFit =
+            indent + TileColumnWidth(in, layout[0]) + in.cellWidth(TileGap) + TileColumnWidth(in, layout[1]) <= budget;
+        if (!twoFit || layout[0].tiles.empty() || layout[1].tiles.empty())
         {
-            line += onLine == 0 ? std::string { Indent } : std::string { TileGap };
-            line += FitRight(tile.key, keyColumns, in.cellWidth) + std::string { ColumnGap }
-                    + AlignRight(tile.value, valueColumns, in.cellWidth);
-            if (withOf)
-                line += std::string { ColumnGap } + FitRight(tile.of, ofColumns, in.cellWidth);
-            if (++onLine == perLine)
-            {
-                items.push_back(Item { .lines = { std::exchange(line, {}) }, .priority = spec.tilePriority });
-                onLine = 0;
-            }
+            layout = { MeasureTiles(in, all, true) };
+            if (indent + TileColumnWidth(in, layout[0]) > budget)
+                layout = { MeasureTiles(in, all, false) };
+            if (indent + TileColumnWidth(in, layout[0]) > budget)
+                return {};
         }
-        if (onLine > 0)
+
+        auto lines = std::size_t { 0 };
+        for (auto const& column: layout)
+            lines = std::max(lines, column.tiles.size());
+        auto items = std::vector<Item> {};
+        for (auto const index: std::views::iota(std::size_t { 0 }, lines))
+        {
+            auto line = std::string { Indent };
+            if (layout.size() > 1 && index < layout[1].tiles.size())
+                line += FitRight(TileText(in, layout[0], index), TileColumnWidth(in, layout[0]), in.cellWidth)
+                        + std::string { TileGap } + TileText(in, layout[1], index);
+            else
+                line += TileText(in, layout[0], index);
             items.push_back(Item { .lines = { std::move(line) }, .priority = spec.tilePriority });
+        }
         return items;
     }
 
-    /// The section strip: every tabular section's key, the active one in brackets.
+    /// The key a section's tab answers to.
+    struct SectionHotkey
+    {
+        FleetSection section; ///< The enumerator this row describes.
+        std::string_view key; ///< The keystroke's bytes; empty for a section the strip does not name.
+    };
+
+    /// One row per `FleetSection`, in enumerator order: what the strip's `keys  m w l c t` hint lists.
     ///
-    /// Not essential either: a terminal too narrow for the active tab draws no strip.
+    /// A letter per tab, from the section's key -- except `members`, whose `m` `machines` already has, so it
+    /// answers to `c`, for cluster. None is a quit key or `/`, which the panel reads first.
+    constexpr EnumTable<FleetSection, SectionHotkey> SectionHotkeyTable { {
+        { .section = FleetSection::Kpi, .key = {} },
+        { .section = FleetSection::Machines, .key = "m" },
+        { .section = FleetSection::Workers, .key = "w" },
+        { .section = FleetSection::Leases, .key = "l" },
+        { .section = FleetSection::Members, .key = "c" },
+        { .section = FleetSection::Tiers, .key = "t" },
+    } };
+
+    static_assert(RowsInEnumeratorOrder(SectionHotkeyTable, &SectionHotkey::section),
+                  "SectionHotkeyTable must hold one row per FleetSection, in enumerator order");
+
+    /// Whether every tab the strip names has a key of its own, and no other section has one.
+    /// @return True when the keys are whole.
+    [[nodiscard]] constexpr bool EveryTabHasItsOwnKey() noexcept
+    {
+        auto whole = true;
+        for (auto const& row: Distributed::FleetSectionTable)
+        {
+            auto const key = SectionHotkeyTable[static_cast<std::size_t>(row.section)].key;
+            whole = whole && row.tabular != key.empty();
+            for (auto const& other: SectionHotkeyTable)
+                whole = whole && (other.section == row.section || key.empty() || other.key != key);
+        }
+        return whole;
+    }
+
+    static_assert(EveryTabHasItsOwnKey(), "every tab the fleet strip names needs a key no other section has");
+
+    /// The key @p section's tab answers to.
+    /// @param section The section.
+    /// @return Its key; empty for a section the strip does not name.
+    [[nodiscard]] constexpr std::string_view SectionHotkeyOf(FleetSection section) noexcept
+    {
+        return SectionHotkeyTable[static_cast<std::size_t>(section)].key;
+    }
+
+    /// The section strip: every tabular section's key, the active one in brackets and dressed as selected,
+    /// and the keys that name them right-aligned after.
+    ///
+    /// Not essential either: a terminal too narrow for the active tab draws no strip. The hint goes for
+    /// width before any tab.
     /// @param in The frame's inputs.
     /// @param spec The document block.
     /// @param active The section the table draws.
@@ -1667,37 +1910,135 @@ namespace
                                                FleetSection active,
                                                std::size_t budget)
     {
+        // The hint's piece slot, so the spare cells go in front of it.
+        constexpr auto HintSlot = std::size_t { 1 };
         auto pieces = std::vector<Piece> { Piece { .text = std::string { Indent }, .priority = Priority::Essential } };
+        auto letters = std::string {};
         for (auto const& row: Distributed::FleetSectionTable)
         {
             if (!row.tabular)
                 continue;
             auto const isActive = row.section == active;
             auto text = pieces.size() > 1 ? std::string { ColumnGap } : std::string {};
-            text += isActive ? std::format("[{}]", row.key) : std::format(" {} ", row.key);
+            text += isActive ? std::format("[{}]", row.key) : std::string { row.key };
             // The brackets stay where the terminal dresses the tab too: a plain frame is the same grid.
             pieces.push_back(Piece { .text = std::move(text),
                                      .priority = isActive ? Priority::Essential : spec.stripTabPriority,
                                      .tone = isActive ? std::optional<FrameTone> { FrameTone::Selected } : std::nullopt });
+            auto const hotkey = SectionHotkeyOf(row.section);
+            if (!hotkey.empty())
+                letters += (letters.empty() ? "" : " ") + std::string { hotkey };
         }
+        if (!letters.empty())
+            pieces.push_back(Piece { .text = std::format("{}keys  {}", ColumnGap, letters),
+                                     .priority = spec.keysHintPriority,
+                                     .slot = HintSlot });
         auto kept = FitPieces(std::move(pieces), budget, 0, in.cellWidth);
         if (!kept.has_value())
             return {};
+
+        // The hint right-aligned: the spare cells go in front of it once the pieces that fit are known.
+        auto const spare = budget - std::min(budget, TextWidth(*kept, in.cellWidth));
+        for (auto& piece: *kept)
+            if (piece.slot == HintSlot)
+                piece.text.insert(0, spare, ' ');
         return { LineOf(*kept, {}, spec.stripPriority) };
     }
 
+    /// What the operator has done to a document panel's table: how far it is scrolled and what filters it.
+    struct TableState
+    {
+        std::string_view filter {}; ///< The text a row must contain; empty for none.
+        std::size_t scroll { 0 };   ///< The matching rows skipped at the top.
+        bool typing { false };      ///< Whether the filter is being typed.
+    };
+
+    /// A section's table as a frame draws it, with what the filter and the scroll made of it.
+    struct SectionTable
+    {
+        std::vector<Item> items {}; ///< The table, or the absent marker where no table was read.
+        std::size_t rows { 0 };     ///< The rows the leader sent.
+        std::size_t matched { 0 };  ///< The rows the filter kept.
+        std::size_t scroll { 0 };   ///< The scroll, clamped to the rows the filter kept.
+    };
+
+    /// How long a panel keeps a column of each `ColumnKeep` rank.
+    struct KeepPriority
+    {
+        Distributed::ColumnKeep keep; ///< The enumerator this row describes.
+        Priority priority;            ///< The panel's priority for it.
+    };
+
+    /// One row per `ColumnKeep`, in enumerator order: the leader's rank, in this layout's vocabulary.
+    constexpr EnumTable<Distributed::ColumnKeep, KeepPriority> KeepPriorityTable { {
+        { .keep = Distributed::ColumnKeep::Identity, .priority = Priority::Essential },
+        { .keep = Distributed::ColumnKeep::Vital, .priority = Priority::High },
+        { .keep = Distributed::ColumnKeep::Useful, .priority = Priority::Normal },
+        { .keep = Distributed::ColumnKeep::Detail, .priority = Priority::Low },
+    } };
+
+    static_assert(RowsInEnumeratorOrder(KeepPriorityTable, &KeepPriority::keep),
+                  "KeepPriorityTable must hold one row per ColumnKeep, in enumerator order");
+
+    /// Whether @p text contains @p needle, ASCII letters compared without case.
+    /// @param text The haystack.
+    /// @param needle The needle; empty matches everything.
+    /// @return True on a match.
+    [[nodiscard]] bool ContainsIgnoringAsciiCase(std::string_view text, std::string_view needle) noexcept
+    {
+        auto const lower = [](char c) {
+            return c >= 'A' && c <= 'Z' ? static_cast<char>(c - 'A' + 'a') : c;
+        };
+        return !std::ranges::search(text, needle, [&lower](char a, char b) { return lower(a) == lower(b); }).empty()
+               || needle.empty();
+    }
+
+    /// The tone a cell is dressed with, where its column has one.
+    ///
+    /// Given whether or not the terminal shows colour: the presenter decides how a tone looks, and a
+    /// plain one draws it as the text it already is.
+    /// @param section The section.
+    /// @param column The column's name.
+    /// @param cell The raw cell.
+    /// @return The tone, or nullopt for none.
+    [[nodiscard]] std::optional<FrameTone> CellFrameTone(FleetSection section, std::string_view column, Cell const& cell)
+    {
+        auto const number = CellInteger(cell);
+        if (!number.has_value())
+            return std::nullopt;
+        switch (Distributed::FleetCellTone(section, column, *number))
+        {
+            case Distributed::CellTone::Fresh:
+                return FrameTone::Fresh;
+            case Distributed::CellTone::Stale:
+                return FrameTone::Stale;
+            case Distributed::CellTone::Plain:
+            case Distributed::CellTone::Last:
+                break;
+        }
+        return std::nullopt;
+    }
+
     /// The active section's table, walked from the header line the leader sent.
+    ///
+    /// Every column's priority is its rank in the leader's tables (`FleetColumnKeep`), through
+    /// `KeepPriorityTable`, and `FitColumns` fills the width by it; a name those tables do not have keeps the default. A
+    /// header with no `Identity` column -- a section vocabulary this build does not know -- keeps its first column instead,
+    /// so a line still says which row it is.
     /// @param in The frame's inputs.
+    /// @param context The session facts: the section.
     /// @param spec The document block.
-    /// @param section The section to draw.
+    /// @param state The filter and the scroll.
     /// @param budget The content width.
     /// @return The table -- or the absent marker where no document, or no such section, was read --
-    ///         or the cells its first column needed when that does not fit.
-    [[nodiscard]] std::expected<std::vector<Item>, std::size_t> SectionItems(FrameInputs const& in,
-                                                                             DocumentSpec const& spec,
-                                                                             FleetSection section,
-                                                                             std::size_t budget)
+    ///         or the cells its essential columns needed when those do not fit.
+    [[nodiscard]] std::expected<SectionTable, std::size_t> SectionItems(FrameInputs const& in,
+                                                                        PanelContext const& context,
+                                                                        DocumentSpec const& spec,
+                                                                        TableState const& state,
+                                                                        std::size_t budget)
     {
+        auto const section = context.section;
         auto const* document = in.model->latestDocument.get();
         auto const* table = document == nullptr ? nullptr : document->Section(section);
         if (table == nullptr || table->columns.empty())
@@ -1707,56 +2048,117 @@ namespace
             auto line = std::string { Indent } + std::string { in.absent };
             if (in.cellWidth(line) > budget)
                 return std::unexpected(in.cellWidth(line));
-            return std::vector<Item> { Item { .lines = { std::move(line) }, .priority = spec.tablePriority } };
+            return SectionTable { .items = { Item { .lines = { std::move(line) }, .priority = spec.tablePriority } } };
         }
 
         // Every cell written for a person FIRST, by the scale its column has in the leader's own tables,
-        // so the widths below are the widths drawn and the drop for width sees the real figures.
+        // so the widths below are the widths drawn, the drop for width sees the real figures, and the
+        // filter matches what the operator reads.
         auto const formats = ColumnFormats(section, table->columns);
+        auto matched = std::vector<std::size_t> {};
         auto cells = std::vector<std::vector<std::string>> {};
-        cells.reserve(table->rows.size());
-        for (auto const& row: table->rows)
+        for (auto const rowIndex: std::views::iota(std::size_t { 0 }, table->rows.size()))
         {
-            auto& written = cells.emplace_back();
+            auto const& row = table->rows[rowIndex];
+            auto written = std::vector<std::string> {};
             written.reserve(row.size());
             for (auto const index: std::views::iota(std::size_t { 0 }, row.size()))
                 written.push_back(HumanCellText(in, row[index], formats[index]));
+            if (!std::ranges::any_of(
+                    written, [&state](std::string const& cell) { return ContainsIgnoringAsciiCase(cell, state.filter); }))
+                continue;
+            matched.push_back(rowIndex);
+            cells.push_back(std::move(written));
         }
+        auto const scroll = matched.empty() ? 0 : std::min(state.scroll, matched.size() - 1);
 
-        // Each column as wide as its widest cell, heading included, so no cell is ever cut.
+        // Each column as wide as its widest matching cell, heading included, so no cell is ever cut.
         auto widths = std::vector<std::size_t> {};
+        auto priorities = std::vector<Priority> {};
         for (auto const index: std::views::iota(std::size_t { 0 }, table->columns.size()))
         {
             auto width = in.cellWidth(table->columns[index]);
             for (auto const& row: cells)
                 width = std::max(width, in.cellWidth(row[index]));
             widths.push_back(width);
+            auto const keep = Distributed::FleetColumnKeep(section, table->columns[index]);
+            priorities.push_back(keep.has_value() ? KeepPriorityTable[static_cast<std::size_t>(*keep)].priority
+                                                  : Priority::Normal);
         }
+        if (std::ranges::none_of(priorities, [](Priority priority) { return priority == Priority::Essential; }))
+            priorities.front() = Priority::Essential;
 
-        // The positional rule, as pieces: the first column is essential, every later one shares one
-        // priority, and `FitPieces` takes the rightmost of equals first.
-        auto heading = std::vector<Piece> { Piece { .text = std::string { Indent }
-                                                            + FitRight(table->columns.front(), widths.front(), in.cellWidth),
-                                                    .priority = Priority::Essential,
-                                                    .slot = 0 } };
-        for (auto const index: std::views::iota(std::size_t { 1 }, table->columns.size()))
-            heading.push_back(
-                Piece { .text = std::string { ColumnGap } + AlignRight(table->columns[index], widths[index], in.cellWidth),
-                        .priority = spec.columnPriority,
-                        .slot = index });
-        auto kept = FitPieces(std::move(heading), budget, 0, in.cellWidth);
+        auto const prefixOf = [](std::size_t index) {
+            return index == 0 ? std::string { Indent } : std::string { ColumnGap };
+        };
+        auto const alignedOf = [&](std::size_t index, std::string_view text) {
+            return index == 0 ? FitRight(text, widths[index], in.cellWidth) : AlignRight(text, widths[index], in.cellWidth);
+        };
+        auto heading = std::vector<Piece> {};
+        for (auto const index: std::views::iota(std::size_t { 0 }, table->columns.size()))
+            heading.push_back(Piece { .text = prefixOf(index) + alignedOf(index, table->columns[index]),
+                                      .priority = priorities[index],
+                                      .slot = index });
+        auto kept = FitColumns(std::move(heading), budget, in.cellWidth);
         if (!kept.has_value())
             return std::unexpected(kept.error());
 
-        auto item = Item { .lines = { Joined(*kept, {}) }, .priority = spec.tablePriority, .table = true };
-        for (auto const& row: cells)
+        auto item = Item { .lines = { Joined(*kept, {}) },
+                           .noun = Distributed::FleetSectionTable[static_cast<std::size_t>(section)].key,
+                           .above = scroll,
+                           .rowsKept = spec.tableRowsKept,
+                           .priority = spec.tablePriority,
+                           .shrinkAt = spec.tableShrinkPriority,
+                           .table = true };
+        for (auto const shown: std::views::iota(scroll, cells.size()))
         {
-            auto line = std::string { Indent } + FitRight(row.front(), widths.front(), in.cellWidth);
-            for (auto const& piece: *kept | std::views::drop(1))
-                line += std::string { ColumnGap } + AlignRight(row[piece.slot], widths[piece.slot], in.cellWidth);
+            auto line = std::string {};
+            for (auto const& piece: *kept)
+            {
+                line += prefixOf(piece.slot);
+                auto const aligned = alignedOf(piece.slot, cells[shown][piece.slot]);
+                auto const& raw = table->rows[matched[shown]][piece.slot];
+                if (auto const tone = CellFrameTone(section, table->columns[piece.slot], raw); tone.has_value())
+                {
+                    auto const text = cells[shown][piece.slot];
+                    auto const start = piece.slot == 0 ? 0 : aligned.size() - text.size();
+                    item.spans.push_back(LineSpan {
+                        .line = item.lines.size(), .byte = line.size() + start, .length = text.size(), .tone = *tone });
+                }
+                line += aligned;
+            }
             item.lines.push_back(std::move(line));
         }
-        return std::vector<Item> { std::move(item) };
+        return SectionTable {
+            .items = { std::move(item) }, .rows = table->rows.size(), .matched = matched.size(), .scroll = scroll
+        };
+    }
+
+    /// The line under a filtered table: what is typed, or what the filter kept.
+    /// @param in The frame's inputs.
+    /// @param spec The document block.
+    /// @param state The filter.
+    /// @param table What the filter made of the table.
+    /// @param noun What the table's rows are.
+    /// @param budget The content width.
+    /// @return The line's item, or none when there is no filter and none is being typed.
+    [[nodiscard]] std::vector<Item> FilterItems(FrameInputs const& in,
+                                                DocumentSpec const& spec,
+                                                TableState const& state,
+                                                SectionTable const& table,
+                                                std::string_view noun,
+                                                std::size_t budget)
+    {
+        if (!state.typing && state.filter.empty())
+            return {};
+        // While typed it is essential -- an operator must see what they type -- and cut rather than
+        // refused when it is wider than the terminal, since the text is theirs and not a figure.
+        auto const text =
+            state.typing
+                ? std::format("{}filter  /{}_  Enter keeps, Esc clears", Indent, state.filter)
+                : std::format("{}filter  /{}  {} of {} {}; / edits", Indent, state.filter, table.matched, table.rows, noun);
+        return { Item { .lines = { FitRight(text, std::min(budget, in.cellWidth(text)), in.cellWidth) },
+                        .priority = state.typing ? Priority::Essential : spec.filterPriority } };
     }
 
     /// The Sixel chart's blank cells, on the rung and terminal that can draw it; nothing otherwise.
@@ -1779,23 +2181,34 @@ namespace
                         .image = true } };
     }
 
-    /// The fleet document block: the tiles, a blank, the strip and the active section's table.
+    /// The fleet document block as one frame draws it, and where the table's scroll landed.
+    struct DocumentBlock
+    {
+        std::vector<Item> items {}; ///< The block, top to bottom.
+        std::size_t scroll { 0 };   ///< The table's scroll, clamped to its matching rows.
+    };
+
+    /// The fleet document block: the tiles, a blank, the chart, the strip, the active section's table and
+    /// its filter line.
     /// @param in The frame's inputs.
     /// @param spec The panel.
     /// @param context The session facts: the section the table draws, the rung and the encoder.
+    /// @param state The table's filter and scroll.
     /// @param budget The content width.
-    /// @return The block, nothing for a panel without one, or the cells the table's first column needed.
-    [[nodiscard]] std::expected<std::vector<Item>, std::size_t> DocumentItems(FrameInputs const& in,
-                                                                              PanelSpec const& spec,
-                                                                              PanelContext const& context,
-                                                                              std::size_t budget)
+    /// @return The block, nothing for a panel without one, or the cells the table's essential columns needed.
+    [[nodiscard]] std::expected<DocumentBlock, std::size_t> DocumentItems(FrameInputs const& in,
+                                                                          PanelSpec const& spec,
+                                                                          PanelContext const& context,
+                                                                          TableState const& state,
+                                                                          std::size_t budget)
     {
-        auto items = std::vector<Item> {};
+        auto block = DocumentBlock {};
         if (!spec.document.has_value())
-            return items;
-        auto table = SectionItems(in, *spec.document, context.section, budget);
+            return block;
+        auto table = SectionItems(in, context, *spec.document, state, budget);
         if (!table.has_value())
             return std::unexpected(table.error());
+        auto& items = block.items;
         std::ranges::move(TileItems(in, *spec.document, budget), std::back_inserter(items));
         if (!items.empty())
             items.push_back(Blank());
@@ -1806,8 +2219,16 @@ namespace
             items.push_back(Blank());
         }
         std::ranges::move(StripItems(in, *spec.document, context.section, budget), std::back_inserter(items));
-        std::ranges::move(*table, std::back_inserter(items));
-        return items;
+        auto filter = FilterItems(in,
+                                  *spec.document,
+                                  state,
+                                  *table,
+                                  Distributed::FleetSectionTable[static_cast<std::size_t>(context.section)].key,
+                                  budget);
+        std::ranges::move(table->items, std::back_inserter(items));
+        std::ranges::move(filter, std::back_inserter(items));
+        block.scroll = table->scroll;
+        return block;
     }
 
     /// Which source answered, as the source line names it.
@@ -2112,6 +2533,79 @@ namespace
         { .keys = "\x1b[C", .step = SectionStep::Next },
         { .keys = "\x1b[D", .step = SectionStep::Previous },
     });
+
+    /// Which way a scrolling key moves a document panel's table.
+    ///
+    /// TRANSMITTED/PERSISTED: no. Private; enumerators may be inserted.
+    enum class TableScroll : std::uint8_t
+    {
+        PageDown, ///< By the rows the last frame showed.
+        PageUp,   ///< Back by as many.
+        Top,      ///< To the first row.
+    };
+
+    /// A keystroke that scrolls the table, as the bytes `KeyBytes` delivers it.
+    struct TableScrollKey
+    {
+        std::string_view keys; ///< The keystroke's bytes.
+        TableScroll scroll;    ///< What it does.
+    };
+
+    /// Every scrolling key.
+    constexpr auto TableScrollKeys = std::to_array<TableScrollKey>({
+        { .keys = "\x1b[6~", .scroll = TableScroll::PageDown },
+        { .keys = "\x1b[5~", .scroll = TableScroll::PageUp },
+        { .keys = "\x1b[H", .scroll = TableScroll::Top },
+    });
+
+    /// The key that starts typing a filter.
+    constexpr std::string_view FilterStartKey = "/";
+
+    /// What a key does to a filter being typed.
+    ///
+    /// TRANSMITTED/PERSISTED: no. Private; enumerators may be inserted.
+    enum class FilterEdit : std::uint8_t
+    {
+        Keep,      ///< Stop typing and keep the filter.
+        Clear,     ///< Stop typing and clear it.
+        Backspace, ///< Take its last character.
+    };
+
+    /// A keystroke that edits a filter being typed, as the bytes `KeyBytes` delivers it.
+    struct FilterEditKey
+    {
+        std::string_view keys; ///< The keystroke's bytes.
+        FilterEdit edit;       ///< What it does.
+    };
+
+    /// Every editing key; any other printable text is typed into the filter.
+    constexpr auto FilterEditKeys = std::to_array<FilterEditKey>({
+        { .keys = "\r", .edit = FilterEdit::Keep },
+        { .keys = "\x1b", .edit = FilterEdit::Clear },
+        { .keys = "\x7f", .edit = FilterEdit::Backspace },
+        { .keys = "\b", .edit = FilterEdit::Backspace },
+    });
+
+    /// Whether @p keys is text to type: no control byte and no escape sequence.
+    /// @param keys The keystroke's bytes.
+    /// @return True for printable text.
+    [[nodiscard]] bool IsTypedText(std::string_view keys) noexcept
+    {
+        return !keys.empty() && std::ranges::none_of(keys, [](char c) {
+            auto const byte = static_cast<unsigned char>(c);
+            return byte < 0x20U || byte == 0x7FU;
+        });
+    }
+
+    /// @p text without its last UTF-8 character.
+    /// @param text Valid UTF-8.
+    void PopCharacter(std::string& text) noexcept
+    {
+        while (!text.empty() && (static_cast<unsigned char>(text.back()) & 0xC0U) == 0x80U)
+            text.pop_back();
+        if (!text.empty())
+            text.pop_back();
+    }
 } // namespace
 
 std::optional<FleetSection> SectionForKey(FleetSection active, std::string_view keys)
@@ -2128,6 +2622,10 @@ std::optional<FleetSection> SectionForKey(FleetSection active, std::string_view 
         auto const position = static_cast<std::size_t>(keys.front() - '1');
         return position < tabs.size() ? std::optional<FleetSection> { tabs[position] } : std::nullopt;
     }
+
+    auto const* named = FindIfOrNull(tabs, [keys](FleetSection tab) { return SectionHotkeyOf(tab) == keys; });
+    if (named != nullptr)
+        return *named;
 
     auto const* stepping = FindIfOrNull(SectionStepKeys, [keys](SectionStepKey const& row) { return row.keys == keys; });
     if (stepping == nullptr)
@@ -2152,11 +2650,73 @@ bool PanelView::Key(std::string_view keys)
 {
     if (!_spec->document.has_value())
         return false;
+
+    if (_typingFilter)
+    {
+        if (auto const* edit = FindIfOrNull(FilterEditKeys, [keys](FilterEditKey const& row) { return row.keys == keys; }))
+        {
+            switch (edit->edit)
+            {
+                case FilterEdit::Keep:
+                    _typingFilter = false;
+                    return true;
+                case FilterEdit::Clear:
+                    _typingFilter = false;
+                    _filter.clear();
+                    _scroll = 0;
+                    return true;
+                case FilterEdit::Backspace:
+                    if (_filter.empty())
+                        return false;
+                    PopCharacter(_filter);
+                    _scroll = 0;
+                    return true;
+            }
+        }
+        if (!IsTypedText(keys))
+            return false;
+        _filter += keys;
+        _scroll = 0;
+        return true;
+    }
+
+    if (keys == FilterStartKey)
+    {
+        _typingFilter = true;
+        return true;
+    }
+
+    if (auto const* scroll = FindIfOrNull(TableScrollKeys, [keys](TableScrollKey const& row) { return row.keys == keys; }))
+    {
+        auto const before = _scroll;
+        switch (scroll->scroll)
+        {
+            case TableScroll::PageDown:
+                _scroll += _page;
+                break;
+            case TableScroll::PageUp:
+                _scroll -= std::min(_scroll, _page);
+                break;
+            case TableScroll::Top:
+                _scroll = 0;
+                break;
+        }
+        return _scroll != before;
+    }
+
     auto const section = SectionForKey(_context.section, keys);
     if (!section.has_value() || *section == _context.section)
         return false;
+    // A section is its own table: it starts at its top, with nothing filtered out of it.
     _context.section = *section;
+    _scroll = 0;
+    _filter.clear();
     return true;
+}
+
+bool PanelView::CapturesText() const noexcept
+{
+    return _typingFilter;
 }
 
 DashboardFrame PanelView::PlacedFrame(DashboardModel const& model)
@@ -2192,18 +2752,22 @@ DashboardFrame PanelView::PlacedFrame(DashboardModel const& model)
     auto rates = RateItems(in, _spec->rates, budget, _besideReserve);
     auto levels = LevelItems(in, _spec->levels, budget);
     auto tiers = TierItems(in, *_spec, budget);
-    auto document = DocumentItems(in, *_spec, _context, budget);
+    auto document = DocumentItems(
+        in, *_spec, _context, TableState { .filter = _filter, .scroll = _scroll, .typing = _typingFilter }, budget);
     auto below = FactGroups(in, *_spec, FactPlace::BelowRates, budget);
-    for (auto const* block: { &rates, &levels, &tiers, &document })
+    for (auto const* block: { &rates, &levels, &tiers })
         if (!block->has_value())
             return tooSmall(block->error() + FrameColumns);
     for (auto const* facts: { &above, &below })
         if (!facts->has_value())
             return tooSmall(facts->error() + FrameColumns);
+    if (!document.has_value())
+        return tooSmall(document.error() + FrameColumns);
+    _scroll = document->scroll;
 
     // Top to bottom, a blank before every block that has something to draw.
     auto groups = std::move(*above);
-    for (auto* block: { &*rates, &*levels, &*tiers, &*document })
+    for (auto* block: { &*rates, &*levels, &*tiers, &document->items })
         groups.push_back(std::move(*block));
     std::ranges::move(*below, std::back_inserter(groups));
     auto items = std::vector<Item> {};
@@ -2218,12 +2782,38 @@ DashboardFrame PanelView::PlacedFrame(DashboardModel const& model)
     auto source = SourceLine(in, _spec->sourcePriority, budget);
     if (!source.has_value())
         return tooSmall(source.error() + FrameColumns);
-    if (source->has_value())
-        items.push_back(Item { .lines = { std::move(**source) }, .priority = _spec->sourcePriority });
+    auto const& sourceLine = *source;
+    if (sourceLine.has_value())
+        items.push_back(Item { .lines = { *sourceLine }, .priority = _spec->sourcePriority });
 
-    auto const fitted = FitRows(std::move(items), available);
+    // The chart grows into rows nothing else wanted, then the frame pads to the terminal's height: both
+    // after a first fit, so neither ever takes a row a table or a tile could have had.
+    auto fitted = FitRows(items, available);
     if (!fitted.has_value())
         return tooSmall(0);
+    if (available.has_value() && _spec->document.has_value() && fitted->imageLine.has_value())
+    {
+        auto const spare = *available - std::min(*available, fitted->lines.size());
+        auto const grown = std::min(_spec->document->chartCellsHighMost, fitted->imageRows + spare);
+        if (grown > fitted->imageRows)
+        {
+            for (auto& item: items)
+                if (item.image)
+                    item.lines.resize(grown);
+            if (auto regrown = FitRows(items, available); regrown.has_value())
+                fitted = std::move(regrown);
+        }
+    }
+    if (available.has_value() && _spec->fillsHeight && fitted->lines.size() < *available)
+    {
+        auto const pad = *available - fitted->lines.size();
+        auto const at = sourceLine.has_value() && !fitted->lines.empty() && fitted->lines.back() == *sourceLine
+                            ? fitted->lines.size() - 1
+                            : fitted->lines.size();
+        fitted->lines.insert(fitted->lines.begin() + static_cast<std::ptrdiff_t>(at), pad, std::string {});
+    }
+    if (fitted->tableShown.has_value())
+        _page = std::max<std::size_t>(1, *fitted->tableShown);
 
     auto const title = TitleFor(in, *_spec, _context, columns);
     auto frame =
@@ -2243,7 +2833,7 @@ DashboardFrame PanelView::PlacedFrame(DashboardModel const& model)
         && _context.sixel != nullptr)
     {
         auto const cellsWide = budget - in.cellWidth(Indent);
-        auto const cellsHigh = _spec->document->chartCellsHigh;
+        auto const cellsHigh = fitted->imageRows;
         auto const raster = FleetChartRaster(model.history,
                                              FleetChartMetrics.front(),
                                              cellsWide * model.cellPixels->width,

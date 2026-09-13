@@ -657,7 +657,7 @@ TEST_CASE("an interactive live-stats fleet session draws the fleet panel, and it
     // The source line names what was fetched and where the surface said it answered, through the whole
     // composition: the source's fetch, the reader and the panel.
     CHECK(presented.last.contains(std::format("/fleet.txt at {} (leader)", ScriptedDocument::ScriptedAdminAddress)));
-    CHECK(presented.last.contains(Distributed::FleetKpiKeys().front()));
+    CHECK(presented.last.contains(Distributed::FleetKpis().front().label));
     // The fleet chart's image, placed in the frame and handed to the terminal's presenter.
     REQUIRE(presented.placements.size() == 1);
     CHECK(presented.placements.front().sixel.starts_with("sixel:"));
