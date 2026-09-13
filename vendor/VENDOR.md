@@ -36,8 +36,8 @@ contour, not against endo.** They were verified byte-identical between contour
 Both repositories are Apache-2.0, and so is this copy. `endo/tui` was last touched
 upstream at `37d875f8` (2026-08-15).
 
-`src/tui` upstream is 154 files and ~46k lines; with the nineteen supporting files below the
-copy is **173 files, 48,484 lines**.
+`src/tui` upstream is 154 files and ~46k lines; with the nineteen supporting files below and
+one local change's new test file ("Local changes") the copy is **174 files, 48,960 lines**.
 
 ## The nineteen supporting files
 
@@ -141,11 +141,19 @@ Two facts that make this much less alarming than it sounds, both measured:
 
 ## Local changes
 
-**None.** All 173 files are byte-identical to their upstream blobs, which is
-checked rather than asserted — see below.
+One local change, 20 files; the other 154 files are byte-identical to their upstream blobs.
+Both halves are checked rather than asserted: `vendor/MANIFEST` records each changed file's
+UPSTREAM hash beside its current one, and `ctest -R vendor-verbatim` refuses a file that differs
+from upstream unless a row below names it, and refuses a row naming a file that does not.
 
-Every local change goes in its own commit, never folded into the import, and gets a
-row here saying what, why, and which upstream it belongs to.
+Every local change goes in its own commit, never folded into the import, and gets a row here
+saying what, why, and which upstream it belongs to. **The table is read by that check**: a file
+counts as declared only when a row names it in backticks, so prose here explains and declares
+nothing.
+
+| files | what | why | upstream | prepared as |
+|---|---|---|---|---|
+| `vendor/endo/tui/CMakeLists.txt`<br>`vendor/endo/tui/InputEvent.hpp`<br>`vendor/endo/tui/MockTerminalOutput.cpp`<br>`vendor/endo/tui/MockTerminalOutput.hpp`<br>`vendor/endo/tui/Screen.cpp`<br>`vendor/endo/tui/Terminal.hpp`<br>`vendor/endo/tui/TerminalInput.hpp`<br>`vendor/endo/tui/TerminalOutput.hpp`<br>`vendor/endo/tui/TerminalQuery_test.cpp`<br>`vendor/endo/tui/VtParser.cpp`<br>`vendor/endo/tui/platform/Terminal.cpp`<br>`vendor/endo/tui/platform/TerminalInput.cpp`<br>`vendor/endo/tui/platform/TerminalInputWin32.cpp`<br>`vendor/endo/tui/platform/TerminalOutput.cpp`<br>`vendor/endo/tui/platform/TerminalOutputWin32.cpp`<br>`vendor/endo/tui/platform/TerminalShared.cpp`<br>`vendor/endo/tui/platform/TerminalWin32.cpp`<br>`vendor/endo/tui/runtime/TerminalEventSource.hpp`<br>`vendor/endo/tui/runtime/platform/TerminalEventSourcePosix.cpp`<br>`vendor/endo/tui/runtime/platform/TerminalEventSourceWin32.cpp` | Terminal's capability queries share one reply loop on an injected `IClock`; input read while waiting that is not the reply is handed back through `TerminalInput::unread()` and delivered first by `poll()` and `TerminalEventSource::wait()`; the seven inline `ColorSchemeReport` workarounds are gone; `queryDecMode` returns `DecModeStatus`, cursor position and cell size return `std::expected<..., QueryUnanswered>`; new `queryDeviceAttributes()` (DA1) with `DeviceAttributesReport` and `advertisesSixel()`; `TerminalQueryInput` test seam and `TerminalQuery_test.cpp`. Endo's `shell/ui/Prompt.cpp` caller changes too, and is not vendored | #1375: a probe ate keystrokes typed before its reply and during a timeout, the timeout could only run in real time, and "never asked", "no reply", "declined" and "not implemented" read as one value. DA1 is the Sixel half of #134's rung detection | endo (contour-terminal/endo) | `D:/endo` branch `fastcached/terminal-queries` at `9ae3c66b35a37aa7df8648900edfc8535ed746e6`, on fork point `687b90a0`; unpublished, pending owner |
 
 ## How to send a change back
 
