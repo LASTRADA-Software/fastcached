@@ -99,6 +99,8 @@ struct LiveSessionParts
     LivePlan plan {};                            ///< What was admitted.
     IReactor* reactor { nullptr };               ///< Where the session runs.
     IStatsGatherer* gatherer { nullptr };        ///< What each sample asks.
+    SampleReader reader { nullptr };             ///< What a sample says: the subject's reader.
+    IClock* clock { nullptr };                   ///< What samples are stamped with: `SteadyClock`.
     IExecutor* samplePool { nullptr };           ///< Where a gather blocks.
     IExecutor* stopWaiter { nullptr };           ///< Where the stop wait blocks: its own thread.
     IExecutor* terminalPool { nullptr };         ///< Where terminal reads block: its own thread.

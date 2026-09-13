@@ -198,6 +198,8 @@ struct Composition
                                                            .endpoint = "10.0.0.4:6674" },
                                         .reactor = &rig.reactor,
                                         .gatherer = &rig.gatherer,
+                                        .reader = &ReadStatsSample,
+                                        .clock = &rig.clock,
                                         .samplePool = &rig.pool,
                                         .stopWaiter = &rig.stopWaiter,
                                         .terminalPool = &terminalPool,

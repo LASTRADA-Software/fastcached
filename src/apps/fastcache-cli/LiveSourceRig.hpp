@@ -174,6 +174,7 @@ struct Rig
         return LiveSourceParts { .reactor = &reactor,
                                  .gatherer = &gatherer,
                                  .pool = &pool,
+                                 .clock = &clock,
                                  .interval = Interval,
                                  .terminal = nullptr,
                                  .stop = nullptr,
@@ -245,7 +246,7 @@ struct Rig
                                         DashboardLimits limits,
                                         std::optional<DashboardExit>* out)
 {
-    *out = co_await RunDashboard(source, view, sink, limits);
+    *out = co_await RunDashboard(source, &ReadStatsSample, view, sink, limits);
 }
 
 /// How a session that may not have ended stopped.
