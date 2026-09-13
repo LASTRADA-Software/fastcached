@@ -53,6 +53,16 @@ namespace
     /// Derived from `servedBy`, and unique by `EveryKindInfersAtMostOneSubject`.
     /// @param kind What the endpoint turned out to be.
     /// @return The row, or nullptr when no inferrable subject is served by that kind.
+    /// What a refusal says when RESP opened and `0xFC` identified nothing.
+    ///
+    /// The observation, not a remedy: the address evidently reaches SOMETHING, so *check
+    /// that --addr reaches a fastcached* would send an operator to verify an address that
+    /// works. What is known is that the thing there speaks RESP and would not say what it
+    /// is -- a Redis-compatible server that is not this project, or a fastcached older
+    /// than the question.
+    constexpr std::string_view RespButUnidentified =
+        "so this is not a fastcached, or one too old to identify itself over 0xFC";
+
     [[nodiscard]] LiveSubjectSpec const* InferredSubject(RemoteKind kind) noexcept
     {
         return FindIfOrNull(LiveSubjectTable,
@@ -95,12 +105,23 @@ std::expected<LivePlan, Answer> AdmitLiveStats(VerbContext const& context)
     // NAMED subject is refused too, because an assertion about the endpoint that cannot
     // be checked is not one this view may act on. The remedy is therefore about the
     // address, not about naming a subject: telling the operator to name one would send
-    // them straight back into this same refusal.
+    // them straight back into this same refusal -- unless RESP opened, and then the
+    // address is not in question either, so the refusal says what was observed instead.
+    // Refused all the same (§9.7): RESP alone identifies nothing, and a plain Redis `INFO`
+    // would not fill a cache panel anyway.
     if (!identity.kind.has_value())
+    {
+        if (context.resp != nullptr)
+            return std::unexpected(Concluded(Outcome::Unreachable,
+                                             std::format("cannot tell what this endpoint is: a RESP connection opened, "
+                                                         "but {}; {}",
+                                                         identity.detail,
+                                                         RespButUnidentified)));
         return std::unexpected(Concluded(Outcome::Unreachable,
                                          std::format("cannot tell what this endpoint is ({}); check that --addr "
                                                      "reaches a fastcached or a fastcache-compile-node",
                                                      identity.detail)));
+    }
     auto const kind = *identity.kind;
 
     // What an endpoint of this kind makes of a subject it cannot serve is the kind's own
@@ -110,7 +131,15 @@ std::expected<LivePlan, Answer> AdmitLiveStats(VerbContext const& context)
     // the peer may not be a fastcache at all.
     auto const established = EstablishedBy(kind);
     if (!established.has_value())
+    {
+        if (context.resp != nullptr)
+            return std::unexpected(Concluded(
+                Outcome::Protocol,
+                std::format("cannot watch this endpoint: a RESP connection opened, but 0xFC did not answer ({}); {}",
+                            identity.detail,
+                            RespButUnidentified)));
         return std::unexpected(Concluded(Outcome::Protocol, std::format("cannot watch this endpoint: {}", identity.detail)));
+    }
 
     auto const* const subject = named != nullptr ? named : InferredSubject(kind);
     if (subject == nullptr)
