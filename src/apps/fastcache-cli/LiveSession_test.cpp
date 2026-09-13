@@ -8,6 +8,8 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <memory>
 #include <optional>
@@ -128,4 +130,110 @@ TEST_CASE("a session decides how it draws before its first event arrives", "[cli
     CHECK((exit.has_value() && exit->stop == DashboardStop::SourceDetached));
     CHECK(sink.frames == 0);
     CHECK(ladder.decisions == 1);
+}
+
+namespace
+{
+
+/// A drain wait whose time passes only when the drain sleeps, and which can let the source
+/// finish draining after a chosen number of sleeps.
+///
+/// **No real time passes**: the drain's ceiling is measured on this clock, so a five-second
+/// ceiling costs a loop of five hundred iterations and nothing else.
+class SteppedDrainWait final: public IDrainWait
+{
+  public:
+    /// @param drained Set after @p landsAfter sleeps, standing in for the reactor; null when
+    ///        nothing ever lands.
+    /// @param landsAfter How many sleeps pass before it does.
+    explicit SteppedDrainWait(std::atomic<bool>* drained = nullptr, int landsAfter = 0) noexcept:
+        _drained { drained },
+        _landsAfter { landsAfter }
+    {
+    }
+
+    [[nodiscard]] TimePoint Now() const noexcept override
+    {
+        return _now;
+    }
+
+    void Sleep(std::chrono::milliseconds requested) noexcept override
+    {
+        _now += requested;
+        ++_sleeps;
+        if (_drained != nullptr && _sleeps == _landsAfter)
+            _drained->store(true);
+    }
+
+    [[nodiscard]] int Sleeps() const noexcept
+    {
+        return _sleeps;
+    }
+
+  private:
+    std::atomic<bool>* _drained;
+    int _landsAfter;
+    TimePoint _now {};
+    int _sleeps { 0 };
+};
+
+/// The bound every drain case uses.
+constexpr auto Bound = DrainBound { .ceiling = std::chrono::seconds { 5 }, .poll = std::chrono::milliseconds { 10 } };
+
+} // namespace
+
+TEST_CASE("a sample that never returns is abandoned at the ceiling with the exit code the session earned",
+          "[cli][live][session]")
+{
+    Rig rig;
+    LiveEventSource source { rig.Parts() };
+    // The first gather is out, started at the clock's epoch -- where the drain's clock starts too.
+    rig.reactor.Drain();
+    CHECK(rig.pool.PendingSubmissions() == 1);
+    source.Close();
+
+    auto const drained = std::atomic<bool> { false };
+
+    auto answered = SteppedDrainWait {};
+    auto const afterReadings = DrainSession(drained, source, Outcome::Affirmative, "10.0.0.4:6674", Bound, answered);
+    CHECK(afterReadings.exitCode == 0);
+    CHECK((afterReadings.abandonment.has_value() && afterReadings.abandonment->contains("10.0.0.4:6674")));
+    CHECK((afterReadings.abandonment.has_value() && afterReadings.abandonment->contains("5000 ms")));
+
+    // The exit code is the session's, not the drain's: one that never had a reading is still 3.
+    auto unanswered = SteppedDrainWait {};
+    auto const withoutReadings = DrainSession(drained, source, Outcome::Unreachable, "10.0.0.4:6674", Bound, unanswered);
+    CHECK(withoutReadings.exitCode == 3);
+    CHECK(withoutReadings.abandonment.has_value());
+
+    rig.Settle();
+    CloseAndDrain(rig, source);
+}
+
+TEST_CASE("a sample that returns inside the bound drains and leaves through the ordinary path", "[cli][live][session]")
+{
+    // The control for the case above: the same drain, and the source finishes draining on the
+    // third look. Nothing is abandoned, and the drain stopped looking when it did.
+    Rig rig;
+    LiveEventSource source { rig.Parts() };
+    rig.reactor.Drain();
+    source.Close();
+
+    auto drained = std::atomic<bool> { false };
+    auto wait = SteppedDrainWait { &drained, 3 };
+    auto const ending = DrainSession(drained, source, Outcome::Affirmative, "10.0.0.4:6674", Bound, wait);
+    CHECK(ending.exitCode == 0);
+    CHECK_FALSE(ending.abandonment.has_value());
+    CHECK(wait.Sleeps() == 3);
+
+    rig.Settle();
+    CloseAndDrain(rig, source);
+}
+
+TEST_CASE("abandoning a session with no sample out says so rather than inventing an age", "[cli][live][session]")
+{
+    auto const ending = DecideSessionEnding(DrainResult::Ceiling, Outcome::Affirmative, "10.0.0.4:6674", std::nullopt);
+    CHECK(ending.exitCode == 0);
+    CHECK((ending.abandonment.has_value() && ending.abandonment->contains("no sample")));
+    CHECK((ending.abandonment.has_value() && !ending.abandonment->contains(" ms")));
 }
