@@ -333,9 +333,6 @@ struct PanelSpec
 /// @return The text, without the `up` a title bar puts in front of it.
 [[nodiscard]] std::string UptimeText(std::uint64_t seconds);
 
-/// The `INFO` field a cache states its version in, which a title bar reads beside the subject.
-inline constexpr std::string_view CacheVersionField = "fastcached_version";
-
 /// The `/metrics` series a cache states how long it has served in.
 inline constexpr std::string_view CacheUptimeField = "fastcached_uptime_seconds";
 

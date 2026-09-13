@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "StatsSource.hpp"
 
+#include <FastCache/Core/Ranges.hpp>
+
 #include <algorithm>
+#include <array>
 #include <charconv>
 #include <cstddef>
 #include <format>
@@ -76,6 +79,20 @@ namespace
         auto const last = text.find_last_not_of(" \t");
         return text.substr(first, last - first + 1);
     }
+
+    /// One escape the exposition format writes inside a label value.
+    struct LabelEscape
+    {
+        char written; ///< What follows the backslash.
+        char means;   ///< The character it stands for.
+    };
+
+    /// Every label-value escape, and nothing else: any other backslash sequence does not parse.
+    constexpr auto LabelEscapes = std::array {
+        LabelEscape { .written = '\\', .means = '\\' },
+        LabelEscape { .written = '"', .means = '"' },
+        LabelEscape { .written = 'n', .means = '\n' },
+    };
 } // namespace
 
 StatsOriginSpec const* DescriptorOf(StatsOrigin origin) noexcept
@@ -106,6 +123,75 @@ Value ParsePrometheus(std::string_view body)
         fields.push_back(Field { .name = std::string { name }, .value = ClassifiedCell(value) });
     }
     return RecordValue(std::move(fields));
+}
+
+std::optional<std::string> LabelValue(std::string_view series, std::string_view label)
+{
+    auto const open = series.find('{');
+    if (open == std::string_view::npos || !series.ends_with('}'))
+        return std::nullopt;
+    auto rest = series.substr(open + 1, series.size() - open - 2);
+    while (!rest.empty())
+    {
+        auto const equals = rest.find("=\"");
+        if (equals == std::string_view::npos)
+            return std::nullopt;
+        auto const name = Trim(rest.substr(0, equals));
+        auto value = std::string {};
+        auto at = equals + 2;
+        while (at < rest.size() && rest[at] != '"')
+        {
+            if (rest[at] != '\\')
+            {
+                value += rest[at];
+                ++at;
+                continue;
+            }
+            auto const* const escape =
+                at + 1 < rest.size() ? FindOrNull(LabelEscapes, rest[at + 1], &LabelEscape::written) : nullptr;
+            if (escape == nullptr)
+                return std::nullopt;
+            value += escape->means;
+            at += 2;
+        }
+        if (at == rest.size())
+            return std::nullopt;
+        if (name == label)
+            return value;
+        rest.remove_prefix(at + 1);
+        if (rest.starts_with(','))
+            rest.remove_prefix(1);
+        else if (!rest.empty())
+            return std::nullopt;
+    }
+    return std::nullopt;
+}
+
+std::optional<std::string> VersionIn(Value const& reading, StatsOrigin origin)
+{
+    auto const* const row = DescriptorOf(origin);
+    if (row == nullptr || row->version.field.empty())
+        return std::nullopt;
+    auto const& place = row->version;
+
+    // An empty version is no version: a title reading `fastcached ` would lose the fact silently, where
+    // the absent marker says it.
+    auto const stated = [](std::optional<std::string> text) {
+        return text.has_value() && !text->empty() ? std::move(text) : std::nullopt;
+    };
+    if (place.label.empty())
+    {
+        auto const* const field = FindField(reading, place.field);
+        return field == nullptr || field->value.kind == CellKind::Absent ? std::nullopt : stated(field->value.lexical);
+    }
+    for (auto const& field: reading.fields)
+    {
+        auto const name = std::string_view { field.name };
+        if (name.starts_with(place.field) && name.substr(place.field.size()).starts_with('{'))
+            if (auto version = stated(LabelValue(name, place.label)); version.has_value())
+                return version;
+    }
+    return std::nullopt;
 }
 
 Value ParseInfo(std::string_view body)
