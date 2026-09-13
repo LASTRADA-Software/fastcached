@@ -150,10 +150,22 @@ struct TerminalScreenBytes
 /// **A later frame without an image leaves none of it behind, with nothing remembered here.** Every
 /// frame erases each of its rows and everything below its last before writing, so the cells an earlier
 /// image covered are repainted by whatever the new frame puts there, text or blank.
+///
+/// **Its spans are not dressed**: this is the plain frame, which the capability-record overload below
+/// dresses where colour is allowed.
 /// @param frame The composed frame and the images placed over it.
 /// @param synchronized Whether to bracket it in synchronized output.
 /// @return The bytes.
 [[nodiscard]] std::string FrameBytes(DashboardFrame const& frame, bool synchronized);
+
+/// One frame as a terminal with @p capabilities is sent it: `FrameBytes`, bracketed exactly when
+/// `PresentsSynchronized`, and with each `FrameSpan` dressed from `TonePalette` exactly when the record
+/// allows colour. Where it does not, the bytes are the plain frame's: not one SGR sequence, and the grid
+/// the same.
+/// @param frame The composed frame, the images placed over it and the runs it dresses.
+/// @param capabilities The terminal's record.
+/// @return The bytes.
+[[nodiscard]] std::string FrameBytes(DashboardFrame const& frame, TerminalCapabilities const& capabilities);
 
 /// What a terminal event stream is built from.
 struct TerminalStreamParts
@@ -245,6 +257,11 @@ class ITerminalDevice
 
     /// @return What the environment says the terminal draws. Called on the pool.
     [[nodiscard]] virtual TerminalTextEncoding Encoding() = 0;
+
+    /// Whether this terminal's frames are dressed with the palette: `--color` as this program resolved it.
+    /// Called on the pool.
+    /// @return `Supported` or `Suppressed`.
+    [[nodiscard]] virtual ColourAnswer AskColour() = 0;
 
     /// @return The geometry, once acquired.
     [[nodiscard]] virtual int Columns() const = 0;
