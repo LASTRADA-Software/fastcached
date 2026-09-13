@@ -81,6 +81,7 @@ Task<std::expected<LiveSessionRun, Answer>> RunComposedSession(LiveSessionParts 
     auto run = LiveSessionRun {};
     auto sourceParts = LiveSourceParts { .reactor = parts.reactor,
                                          .gatherer = parts.gatherer,
+                                         .dialer = parts.dialer,
                                          .pool = parts.samplePool,
                                          .clock = parts.clock,
                                          .interval = parts.plan.interval,
@@ -208,6 +209,7 @@ SessionEnding RunLiveStatsSession(VerbContext const& context, LiveSessionSeat co
         .plan = *std::move(plan),
         .reactor = seat.reactor,
         .gatherer = context.stats,
+        .dialer = seat.dialer,
         .reader = subject.reader,
         .clock = seat.clock,
         .samplePool = seat.samplePool,
