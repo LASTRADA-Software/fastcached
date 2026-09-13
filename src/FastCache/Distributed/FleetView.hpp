@@ -4,6 +4,7 @@
 #include <FastCache/Cache/StorageTier.hpp>
 #include <FastCache/Cluster/ClusterState.hpp>
 #include <FastCache/Core/EnumTable.hpp>
+#include <FastCache/Core/FigureText.hpp>
 #include <FastCache/Distributed/FleetHistory.hpp>
 #include <FastCache/Distributed/SchedulerService.hpp>
 #include <FastCache/Distributed/WorkerRegistry.hpp>
@@ -364,6 +365,74 @@ static_assert(RowsInEnumeratorOrder(FleetSectionTable, &FleetSectionRow::section
 /// @param key The `section` value, as typed.
 /// @return The section, or absent when nothing is called that.
 [[nodiscard]] std::optional<FleetSection> FleetSectionFromKey(std::string_view key) noexcept;
+
+/// What SCALE one of the fleet document's integers is in, and so how a person reads it.
+///
+/// A machine-readable surface ignores it for a column -- a column's scale is a property of the
+/// column name, which a consumer already has -- and NAMES it for a headline figure, where the name
+/// alone cannot say whether `853` is a count or eight-hundred-and-fifty-three thousandths.
+///
+/// Public because a HUMAN surface other than the page reads it too: the terminal fleet panel writes
+/// a `/fleet.txt` cell through `FleetColumnFormat` and `HumanFleetFigure`, so a byte column is
+/// `93.65 GiB` there exactly as on the page, and no client carries a list of which column is which.
+///
+/// Transmitted by NAME only (`CellFormatTable::name`, a headline figure's unit), so the enumerator
+/// values bind nothing; the explicit `= 0` is `EnumTable`'s anchor rather than a contract.
+enum class CellFormat : std::uint8_t
+{
+    Count = 0,
+    Bytes,
+    Permille,
+    Millis,
+    Text,
+    Last,
+};
+
+/// One scale: what it is called where a machine reads it, and how a person is shown it.
+struct CellFormatRow
+{
+    CellFormat format;     ///< The enumerator this row describes.
+    std::string_view name; ///< Its machine spelling.
+    double scale { 1.0 };  ///< Applied before writing: a thousandth is a fraction, a millisecond a thousandth of a second.
+    std::optional<FigureFormat> figure {}; ///< How the scaled value is written; nullopt to show the text as sent.
+};
+
+/// One spelling and one writing per scale, so the word a consumer parses, the arm that renders it and
+/// what a person reads cannot be attached to different formats.
+inline constexpr EnumTable<CellFormat, CellFormatRow> CellFormatTable {
+    CellFormatRow { .format = CellFormat::Count, .name = "count", .scale = 1.0, .figure = FigureFormat::Count },
+    CellFormatRow { .format = CellFormat::Bytes, .name = "bytes", .scale = 1.0, .figure = FigureFormat::Bytes },
+    // Thousandths, not percent: the cell carries an integer, so a percentage with one decimal has to
+    // be scaled somewhere and the name is where a reader finds out which. `853` is 85.3 %.
+    CellFormatRow { .format = CellFormat::Permille, .name = "permille", .scale = 0.001, .figure = FigureFormat::Percent },
+    CellFormatRow { .format = CellFormat::Millis, .name = "milliseconds", .scale = 0.001, .figure = FigureFormat::Seconds },
+    CellFormatRow { .format = CellFormat::Text, .name = "text", .scale = 1.0, .figure = std::nullopt },
+};
+static_assert(RowsInEnumeratorOrder(CellFormatTable, &CellFormatRow::format));
+
+/// The scale a headline figure's unit column names.
+/// @param name The unit, as the document spells it.
+/// @return The scale, or absent for a name no row spells.
+[[nodiscard]] std::optional<CellFormat> CellFormatFromName(std::string_view name) noexcept;
+
+/// The scale of the column @p name in @p section, looked up in the tables the renderers walk.
+///
+/// **The one answer to "how does this column read"**, for a client that has only the header line of
+/// `/fleet.txt` in front of it. Every section's tables are consulted exactly as `FleetColumnNames`
+/// consults them; a tier column is recognised by its tier and suffix, as `TierColumnName` composes it.
+/// `Kpi` has no scale per column -- each of its rows names its own unit -- so it answers absent there.
+/// @param section The section the header belongs to.
+/// @param name The column's name, as the header spells it.
+/// @return The scale, or absent for a name that section does not render.
+[[nodiscard]] std::optional<CellFormat> FleetColumnFormat(FleetSection section, std::string_view name);
+
+/// One number of the fleet document written for a PERSON: the page's cell and the terminal panel's.
+///
+/// Never for a machine-readable surface: `/fleet.txt` and `/fleet.json` carry the integer.
+/// @param number The integer the document carries.
+/// @param format Its scale.
+/// @return The text; the integer as written for a scale with no figure format (`Text`).
+[[nodiscard]] std::string HumanFleetFigure(std::uint64_t number, CellFormat format);
 
 /// Every column name @p section renders for @p snapshot, in the order all three
 /// surfaces walk them.
