@@ -1490,6 +1490,64 @@ TEST_CASE("a live-stats session that inherited SIGINT ignored runs to its budget
 
 #endif
 
+namespace
+{
+
+/// A compile node, as the identification describes one.
+/// @return The identification.
+[[nodiscard]] EndpointIdentity NodeIdentity()
+{
+    return EndpointIdentity { .kind = RemoteKind::CompileNode,
+                              .detail = "10.0.0.4:6674 is a fastcache-compile-node",
+                              .unreadable = false };
+}
+
+} // namespace
+
+TEST_CASE("a live-stats node session reads the node's status with every sample", "[cli][live][session][seat][status]")
+{
+    auto seat = RunningSeat { RenderOptions { .format = OutputFormat::Tsv }, false };
+    auto identity = ScriptedIdentity { NodeIdentity() };
+    auto status = CountingNodeStatus {};
+    auto context = SessionContext({}, 2, &identity, &seat.gatherer);
+    context.nodeStatus = &status;
+
+    auto const ending = seat.Run(context);
+
+    CHECK(ending.kind == SessionEndKind::Ran);
+    CHECK(seat.gatherer.Calls() == 2);
+    CHECK(status.Reads() == 2);
+}
+
+TEST_CASE("a live-stats cache session reads no node status even where one could be asked",
+          "[cli][live][session][seat][status]")
+{
+    auto seat = RunningSeat { RenderOptions { .format = OutputFormat::Tsv }, false };
+    auto identity = ScriptedIdentity { CacheDaemon() };
+    auto status = CountingNodeStatus {};
+    auto context = SessionContext({}, 1, &identity, &seat.gatherer);
+    context.nodeStatus = &status;
+
+    auto const ending = seat.Run(context);
+
+    CHECK(ending.kind == SessionEndKind::Ran);
+    CHECK(status.Reads() == 0);
+}
+
+TEST_CASE("a live-stats node session with no way to ask the node's status is refused before anything is composed",
+          "[cli][live][session][seat][status]")
+{
+    auto seat = RunningSeat { RenderOptions { .format = OutputFormat::Tsv }, false };
+    auto identity = ScriptedIdentity { NodeIdentity() };
+
+    auto const ending = seat.Run(SessionContext({}, 1, &identity, &seat.gatherer));
+
+    CHECK(ending.kind == SessionEndKind::Refused);
+    CHECK(ending.answer.outcome == Outcome::Unreachable);
+    CHECK(seat.gatherer.Calls() == 0);
+    CHECK_FALSE(seat.source.has_value());
+}
+
 TEST_CASE("a live-stats session with no stats source is refused before anything is composed", "[cli][live][session][seat]")
 {
     auto seat = RunningSeat { RenderOptions { .format = OutputFormat::Tsv }, false };

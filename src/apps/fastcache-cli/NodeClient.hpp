@@ -274,6 +274,29 @@ class IEndpointIdentity
     [[nodiscard]] virtual EndpointIdentity IdentifyEndpoint() = 0;
 };
 
+/// Where a watcher asks a node what it says about itself NOW.
+///
+/// **Asked afresh on every call, never answered from an identification.** `IEndpointIdentity`
+/// is asked once and remembered, which is right for deciding what an endpoint is and wrong for
+/// a status block: toolchains served, registrars, the scheduler role and the slots are what a
+/// `node` panel exists to show moving, and a remembered answer would draw the session's first
+/// moment for as long as it runs.
+class INodeStatusReader
+{
+  public:
+    INodeStatusReader() = default;
+    INodeStatusReader(INodeStatusReader const&) = delete;
+    INodeStatusReader(INodeStatusReader&&) = delete;
+    INodeStatusReader& operator=(INodeStatusReader const&) = delete;
+    INodeStatusReader& operator=(INodeStatusReader&&) = delete;
+    virtual ~INodeStatusReader() = default;
+
+    /// Ask the node for its status, one round trip.
+    /// @return What it said, or nullopt when nothing could be asked or nothing readable came back
+    ///         -- a status block draws that as absent, beside the sample's gap or reading.
+    [[nodiscard]] virtual std::optional<CompileCacheWire::NodeStatusFields> ReadNodeStatus() = 0;
+};
+
 /// What to tell an operator whose verb could not be answered by @p kind.
 ///
 /// Pure over the classification, so every sentence is testable without a socket -- and

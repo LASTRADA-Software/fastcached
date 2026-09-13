@@ -163,7 +163,7 @@ void ReportAdvisories(Answer const& answer, bool quiet)
 /// Owns what it opened, where the ladder in `RunAndReport` borrows the connections that
 /// frame opened. A connection that could not be opened is simply absent -- the ladder reports
 /// that rung as not answering, which is the failed sample the next re-dial follows.
-class DialedLadder final: public IStatsGatherer
+class DialedLadder final: public IDialedStats
 {
   public:
     /// @param command Where to dial, with what credential and timeouts.
@@ -180,6 +180,11 @@ class DialedLadder final: public IStatsGatherer
     [[nodiscard]] std::vector<StatsAttempt> Gather() override
     {
         return _ladder.Gather();
+    }
+
+    [[nodiscard]] std::optional<CompileCacheWire::NodeStatusFields> ReadNodeStatus() override
+    {
+        return _ladder.ReadNodeStatus();
     }
 
   private:
@@ -200,7 +205,7 @@ class LadderRedial final: public IStatsDialer
     {
     }
 
-    [[nodiscard]] std::unique_ptr<IStatsGatherer> Dial() override
+    [[nodiscard]] std::unique_ptr<IDialedStats> Dial() override
     {
         return std::make_unique<DialedLadder>(_command, _wire);
     }
@@ -482,7 +487,10 @@ class StopReactorOnExit
                                        .admin = &gatherer,
                                        // And a third time: what the endpoint IS is that same cached
                                        // answer, which `live-stats` decides its subject from.
-                                       .identity = &gatherer };
+                                       .identity = &gatherer,
+                                       // And a fourth, deliberately NOT that cached answer: what a node
+                                       // says about itself now, asked afresh every time.
+                                       .nodeStatus = &gatherer };
 
     if (verb.session != nullptr)
         return RunSessionAndReport(command, verb, context, openingRemarks);
