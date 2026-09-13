@@ -1202,25 +1202,15 @@ TEST_CASE("a frame's images reach the sink with its text, and a cell size rides 
     CHECK_FALSE(view.cellPixelsSeen[1].has_value());
 }
 
-TEST_CASE("a sink that draws no image presents a placed frame's text", "[cli][dashboard]")
+TEST_CASE("a frame presented as text reaches a sink's one door as a frame with no images", "[cli][dashboard]")
 {
-    // The default door. WHAT DISTINGUISHES: a sink overriding only `Present` still receives the text
-    // of a frame that carried an image, so a pipe never loses a frame for having no image support.
-    class TextOnly final: public IFrameSink
-    {
-      public:
-        void Present(std::string_view frame) override
-        {
-            seen.emplace_back(frame);
-        }
-
-        std::vector<std::string> seen {};
-    };
-    auto sink = TextOnly {};
+    // `Present` is not a second door: a sink implements `PresentPlaced` alone, and text handed to
+    // `Present` arrives there, whole and with nothing placed over it.
+    auto sink = CollectingSink {};
     auto& door = static_cast<IFrameSink&>(sink);
-    door.PresentPlaced(DashboardFrame {
-        .text = "rows",
-        .placements = { FramePlacement { .row = 1, .column = 1, .cellsWide = 1, .cellsHigh = 1, .sixel = "x" } } });
-    REQUIRE(sink.seen.size() == 1);
-    CHECK(sink.seen[0] == "rows");
+    door.Present("rows\nmore rows");
+    REQUIRE(sink.frames.size() == 1);
+    CHECK(sink.frames[0] == "rows\nmore rows");
+    REQUIRE(sink.placements.size() == 1);
+    CHECK(sink.placements[0].empty());
 }

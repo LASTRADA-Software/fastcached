@@ -31,9 +31,10 @@ namespace
 class StreamSink final: public IFrameSink
 {
   public:
-    void Present(std::string_view frame) override
+    // A pipe draws no image, and a piped view places none.
+    void PresentPlaced(DashboardFrame const& frame) override
     {
-        stream += frame;
+        stream += frame.text;
     }
 
     std::string stream {};

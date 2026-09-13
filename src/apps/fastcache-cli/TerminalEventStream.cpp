@@ -291,7 +291,7 @@ namespace
         ITerminalDevice* _device;
     };
 
-    /// The frames of a started terminal: one `Write` per `Present`, spelled by `FrameBytes`.
+    /// The frames of a started terminal: one `Write` per frame, spelled by `FrameBytes`.
     ///
     /// Shares the device with the events rather than borrowing it, so a frame presented after the
     /// events are gone -- which the contract forbids -- reaches a torn-down terminal rather than freed
@@ -303,11 +303,6 @@ namespace
             _device { std::move(device) },
             _synchronized { synchronized }
         {
-        }
-
-        void Present(std::string_view frame) override
-        {
-            _device->Write(FrameBytes(frame, _synchronized));
         }
 
         void PresentPlaced(DashboardFrame const& frame) override

@@ -316,20 +316,26 @@ class IFrameSink
     IFrameSink& operator=(IFrameSink&&) = delete;
     virtual ~IFrameSink() = default;
 
-    /// Show one frame.
-    /// @param frame The bytes to present.
-    virtual void Present(std::string_view frame) = 0;
-
     /// Show one frame with the images placed over it.
     ///
-    /// **The loop's one door into a sink.** The default presents the text alone, which is right for
-    /// every sink that cannot draw an image -- a pipe, a test collecting text -- because a view places
-    /// an image only over cells it left blank. A terminal presenter that can draw one overrides this.
-    /// A different NAME from `Present`, not an overload: an override of one overload hides the other.
+    /// **The one thing a sink implements, and it has no default.** A default that handed on the text
+    /// alone let a decorator that overrode only the text door drop every image before the terminal,
+    /// while each row still drew. So forgetting the frame is a build failure rather than a blank chart.
+    /// A sink that cannot draw an image -- a pipe, a test collecting text -- writes `frame.text`, which
+    /// loses nothing a person reads, because a view places an image only over cells it left blank.
     /// @param frame The frame.
-    virtual void PresentPlaced(DashboardFrame const& frame)
+    virtual void PresentPlaced(DashboardFrame const& frame) = 0;
+
+    /// Show one frame that places no image.
+    ///
+    /// **Deliberately not virtual.** It is `PresentPlaced` with no placements, so there is one door to
+    /// implement and none to override by mistake: a decorator that wrote this instead of
+    /// `PresentPlaced` would not compile. A different NAME, not an overload of `PresentPlaced`, so a
+    /// sink's override hides nothing a caller reaches.
+    /// @param text The bytes to present.
+    void Present(std::string_view text)
     {
-        Present(frame.text);
+        PresentPlaced(DashboardFrame { .text = std::string { text }, .placements = {} });
     }
 };
 
