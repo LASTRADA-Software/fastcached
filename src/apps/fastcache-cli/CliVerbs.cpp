@@ -1521,7 +1521,7 @@ namespace
         // listener nothing dialled, which is the three-state rule the stats ladder
         // already keeps.
         if (context.admin == nullptr)
-            return Concluded(Outcome::Usage, "no admin surface is available to this invocation");
+            return Concluded(Outcome::Usage, std::string { NoAdminSurface });
 
         auto const document = context.admin->FetchAdmin(std::format("/fleet.txt?section={}", context.operands[0]));
         if (!document.has_value())

@@ -102,10 +102,11 @@ struct LiveSessionParts
     LivePlan plan {};                            ///< What was admitted.
     IReactor* reactor { nullptr };               ///< Where the session runs.
     IStatsGatherer* gatherer { nullptr };        ///< What each sample asks, until one fails.
+    IAdminDocument* admin { nullptr };           ///< What a document sample asks; see `LiveSubjectSpec::document`.
     IStatsDialer* dialer { nullptr };            ///< What re-dials after a failed sample.
     SampleReader reader { nullptr };             ///< What a sample says: the subject's reader.
     IClock* clock { nullptr };                   ///< What samples are stamped with: `SteadyClock`.
-    IExecutor* samplePool { nullptr };           ///< Where a gather blocks.
+    IExecutor* samplePool { nullptr };           ///< Where a gather or a document fetch blocks.
     IExecutor* stopWaiter { nullptr };           ///< Where the stop wait blocks: its own thread.
     IExecutor* terminalPool { nullptr };         ///< Where terminal reads block: its own thread.
     IFrameSink* sink { nullptr };                ///< Where frames go.
