@@ -12,13 +12,20 @@
 #include "CliCommand.hpp"
 #include "CliFormat.hpp"
 #include "CliVerbs.hpp"
+#include "LiveSession.hpp"
 #include "SocketExchange.hpp"
 #include "StatsGatherer.hpp"
 
+#include <FastCache/Async/PlatformReactor.hpp>
+#include <FastCache/Async/ThreadPoolExecutor.hpp>
+#include <FastCache/Core/BoundedDrain.hpp>
+#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Platform/Environment.hpp>
+#include <FastCache/Platform/StopSignal.hpp>
 #include <FastCache/Platform/Terminal.hpp>
 
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <memory>
@@ -26,6 +33,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #if defined(_WIN32)
@@ -141,6 +149,155 @@ void ReportAdvisories(Answer const& answer, bool quiet)
     return ExitCodeOf(Outcome::Usage);
 }
 
+/// A session's frames, to stdout, each flushed as it is presented.
+///
+/// Flushed per frame because a pipe is block-buffered: without it a reader downstream of
+/// `live-stats | tee` sees nothing for a buffer's worth of samples, which reads as a stalled
+/// session rather than a buffered one.
+class StdoutFrames final: public IFrameSink
+{
+  public:
+    void Present(std::string_view frame) override
+    {
+        std::cout << frame << std::flush;
+    }
+};
+
+/// The process's own Ctrl-C, installed for a session with no terminal.
+class ProcessStopSignals final: public IStopSignalInstaller
+{
+  public:
+    [[nodiscard]] std::expected<std::unique_ptr<IStopSignal>, std::string> Install() override
+    {
+        return InstallStopSignal();
+    }
+};
+
+/// The terminal a human session at a terminal draws on: this process's standard streams.
+///
+/// Make, then start: `MakeTerminalEvents` touches no terminal, and `StartTerminal` consumes what
+/// it made and acquires it on @p pool -- raw mode, then the queries the rung is decided from. A
+/// terminal that could not be made or acquired is the reason the session is refused with; this
+/// adapter decides nothing about it.
+class StandardTerminalAcquisition final: public ITerminalAcquisition
+{
+  public:
+    [[nodiscard]] Task<std::expected<StartedTerminal, std::string>> Acquire(IExecutor* pool, IExecutor* resumeOn) override
+    {
+        auto unstarted = MakeTerminalEvents(pool, resumeOn);
+        if (!unstarted.has_value())
+            co_return std::unexpected(std::move(unstarted).error());
+        co_return co_await StartTerminal(*std::move(unstarted));
+    }
+};
+
+/// Stops a reactor when it goes out of scope, however that happens.
+///
+/// Declared after the thread running the reactor, so it is destroyed first: a `jthread` joins a
+/// loop nobody stopped otherwise, and an exception out of a session would hang the process
+/// instead of ending it.
+class StopReactorOnExit
+{
+  public:
+    explicit StopReactorOnExit(IReactor& reactor) noexcept:
+        _reactor { reactor }
+    {
+    }
+
+    StopReactorOnExit(StopReactorOnExit const&) = delete;
+    StopReactorOnExit(StopReactorOnExit&&) = delete;
+    StopReactorOnExit& operator=(StopReactorOnExit const&) = delete;
+    StopReactorOnExit& operator=(StopReactorOnExit&&) = delete;
+
+    ~StopReactorOnExit()
+    {
+        _reactor.Stop();
+    }
+
+  private:
+    IReactor& _reactor;
+};
+
+/// Run a verb that watches rather than answers once, and report how it ended.
+///
+/// Acquisition only, like the rest of this file: the threads, the clock, the sink and the
+/// process's Ctrl-C, and the terminal. `RunLiveStatsSession` decides everything, and returns once the session has
+/// drained or the drain gave up.
+///
+/// **Member order is the teardown.** The reactor is stopped, its thread joined, and only then
+/// is the source destroyed, before the pools and the reactor it borrowed from -- an object a
+/// reactor owns dies with that reactor stopped.
+///
+/// **An abandonment ends the process here, without unwinding**: a sample still inside a gather
+/// holds the gatherer and the connections this stack owns, and returning would destroy them
+/// under the pool thread. The terminal and the stop request are not the ones left running --
+/// the source releases each once nothing waits on it, which a closed source's producers reach
+/// without the sample -- so what is left to do is flush, say what was abandoned, and exit with
+/// the code the session earned.
+/// @param command The parsed command.
+/// @param verb The verb; its `session` is not null.
+/// @param context What the session runs against.
+/// @param openingRemarks The connections' own remarks.
+/// @return The process exit code.
+[[nodiscard]] int RunSessionAndReport(Command const& command,
+                                      VerbSpec const& verb,
+                                      VerbContext const& context,
+                                      std::vector<std::string> const& openingRemarks)
+{
+    auto const render =
+        RenderOptions { .format = command.format, .color = UsageColor::Plain, .absentOverride = command.absentOverride };
+
+    SteadyClock clock;
+    PlatformReactor reactor { clock };
+    ThreadPoolExecutor samplePool { 1 };
+    ThreadPoolExecutor stopWaiter { 1 };
+    ThreadPoolExecutor terminalPool { 1 };
+    StdoutFrames sink;
+    ProcessStopSignals stops;
+    StandardTerminalAcquisition terminals;
+    StandardRungViews views { render, &LatestReading };
+    ThreadDrainWait drainWait;
+    std::optional<LiveEventSource> source;
+    std::jthread reactorThread { [&reactor] { reactor.Run(); } };
+    auto const stopReactor = StopReactorOnExit { reactor };
+
+    auto ending = verb.session(context,
+                               LiveSessionSeat { .reactor = &reactor,
+                                                 .clock = &clock,
+                                                 .samplePool = &samplePool,
+                                                 .stopWaiter = &stopWaiter,
+                                                 .terminalPool = &terminalPool,
+                                                 .sink = &sink,
+                                                 .streamsInteractive = StandardStreamsAreInteractive(),
+                                                 .render = render,
+                                                 .terminals = &terminals,
+                                                 .stops = &stops,
+                                                 .views = &views,
+                                                 .drainWait = &drainWait,
+                                                 .drainBound = DrainBound {},
+                                                 .source = &source });
+
+    auto& answer = ending.answer;
+    answer.advisories.insert(answer.advisories.begin(), openingRemarks.begin(), openingRemarks.end());
+
+    if (ending.kind == SessionEndKind::Abandoned)
+    {
+        std::cout.flush();
+        std::fflush(stdout);
+        ReportAdvisories(answer, command.quiet);
+        std::cerr << ProgramName << ": " << ending.line << '\n' << std::flush;
+        std::_Exit(ExitCodeOf(answer.outcome));
+    }
+
+    // A session that ran has already written everything it had to say, one frame at a time;
+    // only a refusal is rendered, exactly as any verb's refusal is.
+    if (ending.kind == SessionEndKind::Refused)
+        std::cout << RenderValue(answer.value, render);
+
+    ReportAdvisories(answer, command.quiet);
+    return ExitCodeOf(answer.outcome);
+}
+
 /// Run the verb the command named and write its answer.
 /// @param command The parsed command.
 /// @param verb The verb it named.
@@ -241,6 +398,9 @@ void ReportAdvisories(Answer const& answer, bool quiet)
                                        // And a third time: what the endpoint IS is that same cached
                                        // answer, which `live-stats` decides its subject from.
                                        .identity = &gatherer };
+
+    if (verb.session != nullptr)
+        return RunSessionAndReport(command, verb, context, openingRemarks);
 
     auto answer = RunVerb(verb, context);
 
