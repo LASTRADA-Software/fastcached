@@ -1540,6 +1540,53 @@ TEST_CASE("The series section answers the history for the range asked, and only 
     CHECK(fixture.Get("/fleet.txt", "section=series&range=nonesuch").status == "400 Bad Request");
 }
 
+TEST_CASE("The fleet document for a selection refuses an unknown key by name and is judged by its own snapshot",
+          "[node][admin][fleettext]")
+{
+    // #1391. `AnswerFleetText` is what `/fleet.txt` and the `fleet-text` verb both answer from, so
+    // what is asserted here is asserted of both doors -- by there being one function, not by
+    // comparing what two of them said.
+    Distributed::FleetSnapshot snapshot;
+    snapshot.role = Distributed::SchedulerRole::Follower;
+    snapshot.leaderEndpoint = "10.0.0.2:6674";
+
+    SECTION("an unknown section is refused with every section this build serves")
+    {
+        auto const refused = AnswerFleetText(snapshot, nullptr, "nonesuch", {});
+        REQUIRE_FALSE(refused.has_value());
+        CHECK(refused.error().refusal == FleetTextRefusal::UnknownSelector);
+        CHECK(refused.error().detail.starts_with("unknown section"));
+        for (auto const& row: Distributed::FleetSectionTable)
+            CHECK(refused.error().detail.contains(row.key));
+    }
+
+    SECTION("an unknown range is refused even for a section that draws no history")
+    {
+        auto const refused = AnswerFleetText(snapshot, nullptr, "members", "1fortnight");
+        REQUIRE_FALSE(refused.has_value());
+        CHECK(refused.error().refusal == FleetTextRefusal::UnknownSelector);
+        CHECK(refused.error().detail.starts_with("unknown range"));
+        for (auto const& row: Distributed::FleetRangeTable)
+            CHECK(refused.error().detail.contains(row.key));
+    }
+
+    SECTION("a document says whose view it is, from the snapshot it was rendered from")
+    {
+        auto const following = AnswerFleetText(snapshot, nullptr, "series", "1h");
+        REQUIRE(following.has_value());
+        CHECK_FALSE(following->leads);
+        CHECK(following->leaderEndpoint == "10.0.0.2:6674");
+        // A follower's document is no table at all, whatever section was named.
+        CHECK(following->body.starts_with("# this node does not lead the fleet"));
+
+        snapshot.role = Distributed::SchedulerRole::Leader;
+        auto const leading = AnswerFleetText(snapshot, nullptr, "series", "1h");
+        REQUIRE(leading.has_value());
+        CHECK(leading->leads);
+        CHECK(leading->body.starts_with("start\tcoverage\tbackfilled\t"));
+    }
+}
+
 TEST_CASE("A long range is not cached past its next sample", "[node][admin][chart]")
 {
     ChartFixture const fixture;

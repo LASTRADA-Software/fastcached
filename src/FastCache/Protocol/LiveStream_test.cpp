@@ -11,6 +11,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <expected>
 #include <functional>
 #include <optional>
 #include <string>
@@ -112,6 +113,12 @@ class NumberedSources final: public ILiveStatsSources
     [[nodiscard]] std::string AnsweringEndpoint() const override
     {
         return "cache.test:6380";
+    }
+
+    [[nodiscard]] std::expected<FleetTextDocument, FleetTextDeclined> FleetText(std::string_view /*section*/,
+                                                                                std::string_view /*range*/) const override
+    {
+        return std::unexpected(FleetTextDeclined { .refusal = FleetTextRefusal::NoFleet, .detail = {} });
     }
 
     mutable std::size_t captures { 0 };                 ///< Captures taken.

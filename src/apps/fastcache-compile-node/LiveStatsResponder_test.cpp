@@ -18,6 +18,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <expected>
 #include <memory>
 #include <optional>
 #include <ranges>
@@ -97,6 +98,13 @@ class ScriptedSources final: public ILiveStatsSources
     [[nodiscard]] std::string AnsweringEndpoint() const override
     {
         return "n1.test:6674";
+    }
+
+    /// @copydoc ILiveStatsSources::FleetText
+    [[nodiscard]] std::expected<FleetTextDocument, FleetTextDeclined> FleetText(std::string_view /*section*/,
+                                                                                std::string_view /*range*/) const override
+    {
+        return std::unexpected(FleetTextDeclined { .refusal = FleetTextRefusal::NoFleet, .detail = {} });
     }
 
     mutable std::size_t captures { 0 }; ///< Captures taken.

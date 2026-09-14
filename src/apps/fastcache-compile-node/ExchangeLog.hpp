@@ -146,6 +146,10 @@ inline constexpr std::array ExchangeLogTable {
                  .level = LogLevel::Info,
                  .rationale = "takes a machine out of the fleet or puts it back: rare, deliberate, and the line an "
                               "operator looks for when a machine stopped getting work" },
+    VerbLogRow { .code = CompileCacheWire::Op::FleetText,
+                 .level = LogLevel::Debug,
+                 .rationale = "a read a script or a terminal may run in a loop, as node-status is; at Info a watch "
+                              "over it would look like traffic" },
 };
 
 /// Whether every verb this build serves states a log level.

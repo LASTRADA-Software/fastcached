@@ -25,6 +25,7 @@
 #include <chrono>
 #include <concepts>
 #include <cstddef>
+#include <expected>
 #include <filesystem>
 #include <format>
 #include <fstream>
@@ -35,6 +36,7 @@
 #include <span>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -3327,6 +3329,13 @@ class SizedLiveSources final: public ILiveStatsSources
     [[nodiscard]] std::string AnsweringEndpoint() const override
     {
         return "127.0.0.1";
+    }
+
+    /// @copydoc ILiveStatsSources::FleetText
+    [[nodiscard]] std::expected<FleetTextDocument, FleetTextDeclined> FleetText(std::string_view /*section*/,
+                                                                                std::string_view /*range*/) const override
+    {
+        return std::unexpected(FleetTextDeclined { .refusal = FleetTextRefusal::NoFleet, .detail = {} });
     }
 
   private:

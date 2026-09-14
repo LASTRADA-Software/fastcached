@@ -297,6 +297,16 @@ std::string LiveStatsSourceSlot::AnsweringEndpoint() const
     return _sources != nullptr ? _sources->AnsweringEndpoint() : std::string {};
 }
 
+std::expected<FleetTextDocument, FleetTextDeclined> LiveStatsSourceSlot::FleetText(std::string_view section,
+                                                                                   std::string_view range) const
+{
+    std::shared_lock const guard { _mutex };
+    if (_sources == nullptr)
+        return std::unexpected(
+            FleetTextDeclined { .refusal = FleetTextRefusal::NoFleet, .detail = "this process is stopping" });
+    return _sources->FleetText(section, range);
+}
+
 LiveStream::LiveStream(ILiveStatsSources const& sources, IMetricsSink& metrics) noexcept:
     _sources { sources },
     _metrics { metrics }

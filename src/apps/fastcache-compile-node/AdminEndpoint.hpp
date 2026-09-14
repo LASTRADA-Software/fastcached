@@ -13,6 +13,7 @@
 #include <FastCache/Net/BlockingSocket.hpp>
 #include <FastCache/Platform/HostInfo.hpp>
 #include <FastCache/Platform/HostLoad.hpp>
+#include <FastCache/Protocol/LiveStream.hpp>
 #include <FastCache/Server/AdminCredential.hpp>
 #include <FastCache/Server/AdminHttpServer.hpp>
 
@@ -235,6 +236,26 @@ class IFleetHistoryView
     /// Whether this record is written to disk and so survives a restart.
     [[nodiscard]] virtual bool Durable() const = 0;
 };
+
+/// The fleet document for one selection: the ONE renderer `/fleet.txt` and the `fleet-text` verb
+/// answer from (#1391).
+///
+/// **One function rather than two callers of `RenderFleetText`.** A table read over `0xFC` and
+/// the same table read over HTTP must be one document, and the way to guarantee that is for there
+/// to be nowhere else either door could get one: both call this, and neither holds a renderer of
+/// its own. The keys are parsed here as well, so a section or a range is refused in one sentence
+/// whichever door it was typed at -- refused rather than defaulted, for the reason
+/// `RefusedParameter` gives.
+/// @param snapshot What `CollectFleet` gathered; the leadership the document reports is read
+///        from it, so the body and the verdict on it are one reading.
+/// @param history The history the figures and the series draw on, or null to draw none.
+/// @param sectionKey A `FleetSectionTable` key, or empty for every whole-document section.
+/// @param rangeKey A `FleetRangeTable` key, or empty for the day.
+/// @return The document, or `UnknownSelector` with every key this build serves.
+[[nodiscard]] std::expected<FleetTextDocument, FleetTextDeclined> AnswerFleetText(Distributed::FleetSnapshot const& snapshot,
+                                                                                  IFleetHistoryView const* history,
+                                                                                  std::string_view sectionKey,
+                                                                                  std::string_view rangeKey);
 
 [[nodiscard]] std::vector<AdminRoute> MakeFleetRoutes(Distributed::FleetSources sources,
                                                       AdminCredential const& credential,

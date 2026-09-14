@@ -499,6 +499,8 @@ inline constexpr std::array DeclineCauseTable {
     DeclineCauseRow { .code = CompileCacheWire::ErrorCode::EnrollmentClosed, .cause = DeclineCause::NotPermitted },
     DeclineCauseRow { .code = CompileCacheWire::ErrorCode::EnrollmentFull, .cause = DeclineCause::NotPermitted },
     DeclineCauseRow { .code = CompileCacheWire::ErrorCode::EnrollmentAlreadyCollected, .cause = DeclineCause::NotPermitted },
+    // A fleet read, which no compile reaches: the same reasoning as the enrollment rows above.
+    DeclineCauseRow { .code = CompileCacheWire::ErrorCode::UnknownFleetSelector, .cause = DeclineCause::NotPermitted },
 };
 
 /// Whether every refusal this build's wire header knows carries a classification.

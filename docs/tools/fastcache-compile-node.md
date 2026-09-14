@@ -790,6 +790,20 @@ unauthenticated.
 | `fastcache_live_subscriptions_refused_payload_too_large_total` | A `SUBSCRIBE` header declared more than the control payload the verb is bounded to, and was refused before a byte of it was read. No client of this tree at any version sends one. |
 | `fastcache_live_subscriptions_refused_endpoint_busy_total` | A subscription was refused because the `0xFC` listener's in-flight byte budget was full of other requests. The dashboard retries; a rise says the view went missing exactly when the node was busiest. |
 
+### The fleet document over `0xFC`
+
+A `fleet-text` request reads the fleet document once, one section or all of them, over `0xFC` rather than `/fleet.txt` over HTTP ([#1391](https://github.com/LASTRADA-Software/fastcached/issues/1391)) -- so a fleet table is readable from a leader that serves no admin surface at all. The text is the route's to the byte: both answer from one function, which parses the section and the range and renders the document, so neither door has a renderer of its own.
+
+It is admitted as the fleet subject of a subscription is, by the same decision: a fleet member, then the dashboard credential (or, with no `--dashboard-token-file`, this machine only), then leadership. A follower refuses `not-leader` naming the leader, and the client follows it; a node running no scheduler says the fleet is served elsewhere; a section or a range this build does not serve is `unknown-fleet-selector`, listing the ones it does. None of those three is counted -- the first two are what a healthy fleet answers a client pointed at the wrong node, and the third is a typo its typist already sees.
+
+| Counter | What a rise means |
+|---|---|
+| `fastcache_fleet_text_requests_refused_not_a_member_total` | A fleet read was refused because its peer is not a fleet member. The fleet is read by the same peers a subscription to it streams to; a burst from one host is a stranger probing the port. |
+| `fastcache_fleet_text_requests_refused_unauthenticated_total` | A fleet read was refused: a wrong or missing dashboard credential, or a remote peer while no `--dashboard-token-file` is configured. The fleet map is behind the same credential here as on `/fleet`; a burst from one host is somebody guessing. |
+| `fastcache_fleet_text_requests_refused_malformed_total` | A `fleet-text` request did not decode. No client of this tree sends one; a rise is a client of another build, or not a client at all. |
+| `fastcache_fleet_text_requests_refused_payload_too_large_total` | A `fleet-text` header declared more than the control payload the verb is bounded to, and was refused before a byte of it was read. No client of this tree at any version sends one. |
+| `fastcache_fleet_text_requests_refused_endpoint_busy_total` | A fleet read was refused because the `0xFC` listener's in-flight byte budget was full of other requests. A rise says an operator asked for the fleet exactly when the leader was busiest. |
+
 
 Read the two upstream counters beside the gauge, never on their own. They are
 cumulative, so a node with **no** shared cache and a node with one it has not yet

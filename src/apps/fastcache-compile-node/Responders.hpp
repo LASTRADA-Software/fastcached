@@ -894,6 +894,13 @@ struct SurfaceComponents
     /// FLEET subject, and that is the component's refusal to make per subject, not a missing
     /// family.
     IFrameResponder* live { nullptr };
+
+    /// Answers `FleetText`: the fleet document, read once (#1391).
+    ///
+    /// Like `live`, **never null on a built node**: a node without a scheduler has no fleet, and
+    /// saying so -- and where the fleet is served instead -- is this component's answer to give,
+    /// not a family missing at the door.
+    IFrameResponder* fleet { nullptr };
 };
 
 class MergedResponder final: public IFrameResponder
@@ -906,7 +913,8 @@ class MergedResponder final: public IFrameResponder
         _compile { components.compile },
         _node { components.node },
         _enrollment { components.enrollment },
-        _live { components.live }
+        _live { components.live },
+        _fleet { components.fleet }
     {
     }
 
@@ -948,6 +956,10 @@ class MergedResponder final: public IFrameResponder
                 // Never null on a built node, for the `Node` family's reason just above: a watcher
                 // asks what a node is doing whatever it runs.
                 return _live;
+            case CompileCacheWire::VerbFamily::Fleet:
+                // Never null on a built node, for `Live`'s reason: a reader pointed at a worker is
+                // told where the fleet is served rather than that nothing here speaks the verb.
+                return _fleet;
             case CompileCacheWire::VerbFamily::Enrollment:
                 // Legitimately null, and on most deployments it is: a node that runs no
                 // consensus has no cluster to let anybody into, so the family is refused
@@ -1243,8 +1255,8 @@ class MergedResponder final: public IFrameResponder
     /// only in which member function they read, and copy-pasted branches that differ
     /// by a name are what this codebase treats as a defect.
     ///
-    /// **It folds `_cache`, `_scheduler` and `_compile`. `_node`, `_enrollment` and `_live`
-    /// are NOT folded**, and that is stated here rather than left to be read off the loop,
+    /// **It folds `_cache`, `_scheduler` and `_compile`. `_node`, `_enrollment`, `_live` and
+    /// `_fleet` are NOT folded**, and that is stated here rather than left to be read off the loop,
     /// because both of those responders carry comments reasoning about the number they
     /// contribute -- reasoning that is sound about the value and silent about the fact
     /// that nothing reads it. Whoever changes this set should read those comments in the
@@ -1280,6 +1292,7 @@ class MergedResponder final: public IFrameResponder
     IFrameResponder* _node;
     IFrameResponder* _enrollment;
     IFrameResponder* _live;
+    IFrameResponder* _fleet;
 };
 
 } // namespace FastCache::Node

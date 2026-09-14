@@ -28,6 +28,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <expected>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -90,6 +91,12 @@ class TimedSources final: public ILiveStatsSources
     [[nodiscard]] std::string AnsweringEndpoint() const override
     {
         return "races.test:6380";
+    }
+
+    [[nodiscard]] std::expected<FleetTextDocument, FleetTextDeclined> FleetText(std::string_view /*section*/,
+                                                                                std::string_view /*range*/) const override
+    {
+        return std::unexpected(FleetTextDeclined { .refusal = FleetTextRefusal::NoFleet, .detail = {} });
     }
 
     /// Take the delay only on @p thread from now on; every other thread captures at once.
