@@ -339,6 +339,26 @@ namespace
     return ReadingOf(ScrapeOf(reading), StatsOrigin::Metrics);
 }
 
+/// A compile node's `/metrics` @p step intervals in: 16 cores registered with 16 slots and 6 running, 625 permille
+/// busy over every interval, 32 GiB of memory free, and a cache tier holding 2 of its 8 GiB.
+/// @param step How far the CPU counters have moved.
+/// @return The attempts.
+[[nodiscard]] std::vector<StatsAttempt> NodeAt(std::uint64_t step)
+{
+    auto reading = StatsReading {};
+    reading.snapshot.host = HostCapacity { .logicalCores = 16,
+                                           .configuredSlots = 16,
+                                           .totalMemoryBytes = std::uint64_t { 64 } << 30U,
+                                           .diskCapacityBytes = std::uint64_t { 512 } << 30U,
+                                           .diskFreeBytes = std::uint64_t { 41 } << 30U,
+                                           .busySlots = 6 };
+    reading.snapshot.hostLoad = HostLoadReading { .cpu = CpuTicks { .busy = 625 * step, .total = 1000 * step },
+                                                  .availableMemoryBytes = std::uint64_t { 32 } << 30U };
+    reading.snapshot.storage =
+        StorageStats { .bytesUsed = std::size_t { 2 } << 30U, .bytesLimit = std::size_t { 8 } << 30U };
+    return ReadingOf(ScrapeOf(reading), StatsOrigin::Metrics);
+}
+
 /// A cache daemon's `/metrics` at one moment, carrying @p tiers.
 /// @param items Every tier's item count; its bytes used are a hundred times that.
 /// @param tiers The `StorageTierTable` names the reading carries.
@@ -479,7 +499,15 @@ TEST_CASE("a piped cache and node stream name exactly the figures their panels d
                                         "no_slot_per_min",
                                         "lease_expired_per_min",
                                         "unknown_fingerprint_per_min",
+                                        "slots_in_flight",
+                                        "slots_available",
+                                        "slots_registered",
                                         "cache_hit_rate",
+                                        "cache_used_bytes",
+                                        "cache_limit_bytes",
+                                        "cache_fill_ratio",
+                                        "cpu_busy_ratio",
+                                        "mem_free_bytes",
                                         "scratch_free_bytes" });
 
     // A header is a promise about every row under it, so no two columns may share a name.
@@ -489,6 +517,42 @@ TEST_CASE("a piped cache and node stream name exactly the figures their panels d
         std::ranges::sort(sorted);
         CHECK(std::ranges::adjacent_find(sorted) == sorted.end());
     }
+}
+
+TEST_CASE("a piped node row carries the slots, cache fill and load its panel draws, absent until two readings",
+          "[cli][live][piped][figures]")
+{
+    // The numbers the node panel's fact lines state are its figures, so a script reads the same ones. WHAT
+    // DISTINGUISHES: `slots_available` is the scheduler's ceiling (12 of 16, bound by somebody else's CPU), which needs
+    // two adjacent readings, as does `cpu_busy_ratio`; both are absent on the first row while the levels are not.
+    std::vector<DashboardEvent> script;
+    AddSample(script, 1, NodeAt(1));
+    AddSample(script, 3, NodeAt(2));
+
+    auto const lines = Lines(Stream(std::move(script), OutputFormat::Tsv, {}, std::nullopt, &NodeFigures));
+    REQUIRE(lines.size() == 3);
+    auto const header = Fields(lines[0]);
+    auto const first = Fields(lines[1]);
+    auto const second = Fields(lines[2]);
+    REQUIRE(first.size() == header.size());
+    REQUIRE(second.size() == header.size());
+    auto const cell = [&header](std::vector<std::string> const& row, std::string_view name) {
+        auto const found = std::ranges::find(header, name);
+        REQUIRE(found != header.end());
+        return row[static_cast<std::size_t>(found - header.begin())];
+    };
+
+    CHECK(cell(first, "slots_in_flight") == "6");
+    CHECK(cell(first, "slots_registered") == "16");
+    CHECK(cell(first, "slots_available").empty());
+    CHECK(cell(first, "cpu_busy_ratio").empty());
+    CHECK(cell(first, "mem_free_bytes") == "34359738368");
+    CHECK(cell(first, "cache_used_bytes") == "2147483648");
+    CHECK(cell(first, "cache_limit_bytes") == "8589934592");
+    CHECK(cell(first, "cache_fill_ratio") == "0.2500");
+
+    CHECK(cell(second, "slots_available") == "12");
+    CHECK(cell(second, "cpu_busy_ratio") == "0.6250");
 }
 
 TEST_CASE("a piped cache row reports the panel's figures unformatted, absent until a rate can be taken",

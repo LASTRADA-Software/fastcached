@@ -748,17 +748,19 @@ TEST_CASE("every figure a panel names reads the same number off a scrape the dae
     auto tiers = TieredStorageStats {};
     for (auto& tier: tiers)
         tier = distinct();
-    auto const original =
-        CaptureStatsReading(sink,
-                            MetricsSnapshot { .storage = distinct(),
-                                              .storageTiers = tiers,
-                                              .host = HostCapacity { .logicalCores = 32,
-                                                                     .configuredSlots = 30,
-                                                                     .totalMemoryBytes = 68'719'476'736,
-                                                                     .diskCapacityBytes = 2'000'398'934'016,
-                                                                     .diskFreeBytes = 442'381'631'488,
-                                                                     .busySlots = 7 },
-                                              .uptime = Uptime { 864'017s } });
+    auto const original = CaptureStatsReading(
+        sink,
+        MetricsSnapshot { .storage = distinct(),
+                          .storageTiers = tiers,
+                          .host = HostCapacity { .logicalCores = 32,
+                                                 .configuredSlots = 30,
+                                                 .totalMemoryBytes = 68'719'476'736,
+                                                 .diskCapacityBytes = 2'000'398'934'016,
+                                                 .diskFreeBytes = 442'381'631'488,
+                                                 .busySlots = 7 },
+                          .hostLoad = HostLoadReading { .cpu = CpuTicks { .busy = 7'700'001, .total = 9'100'003 },
+                                                        .availableMemoryBytes = 21'474'836'480 },
+                          .uptime = Uptime { 864'017s } });
     auto const adapted = Unwrap(StatsReadingFromRecord(ParsePrometheus(RenderPrometheus(original)), StatsOrigin::Metrics));
     auto const noCache = StatsReading {};
 

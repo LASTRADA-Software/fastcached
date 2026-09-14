@@ -275,7 +275,25 @@ namespace
         FactCell { .label = "consensus", .fact = StatusFact::Consensus },
         FactCell { .label = "leader", .fact = StatusFact::Leader },
     };
-    constexpr auto SlotCells = std::array { FactCell { .label = "slots", .fact = StatusFact::Slots } };
+    // `6 in flight / 12 available / 16 registered`: every number a figure, so a piped stream carries each.
+    constexpr auto SlotFigures = std::array {
+        BesideFigure { .key = "slots_in_flight",
+                       .figure = { .field = HostField<&HostCapacity::busySlots>(), .format = FigureFormat::Count },
+                       .after = "in flight /",
+                       .priority = Priority::Essential },
+        BesideFigure { .key = "slots_available",
+                       .figure = { .source = FigureSource::SlotsAvailable, .format = FigureFormat::Count },
+                       .after = "available /",
+                       .lead = " ",
+                       .priority = Priority::Essential },
+        BesideFigure { .key = "slots_registered",
+                       .figure = { .field = HostField<&HostCapacity::configuredSlots>(), .format = FigureFormat::Count },
+                       .after = "registered",
+                       .lead = " ",
+                       .priority = Priority::Essential },
+    };
+    constexpr auto SlotCells =
+        std::array { FactCell { .label = "slots", .fact = StatusFact::Slots, .figures = SlotFigures } };
 
     constexpr auto CacheHits = std::array {
         BesideFigure { .key = "cache_hit_rate",
@@ -285,17 +303,43 @@ namespace
                                    .source = FigureSource::RateRatio,
                                    .format = FigureFormat::Percent },
                        .priority = Priority::High },
+        // `2.00 GiB / 8.00 GiB  ████░░░░░░░░░░░░  25.0 %`: the node's cache, used against its limit.
+        BesideFigure { .key = "cache_used_bytes",
+                       .figure = { .field = StorageField<&StorageStats::bytesUsed>(), .format = FigureFormat::Bytes } },
+        BesideFigure { .key = "cache_limit_bytes",
+                       .before = "/",
+                       .figure = { .field = StorageField<&StorageStats::bytesLimit>(), .format = FigureFormat::Bytes },
+                       .lead = " " },
+        BesideFigure { .key = "cache_fill_ratio",
+                       .figure = { .field = StorageField<&StorageStats::bytesUsed>(),
+                                   .other = StorageField<&StorageStats::bytesLimit>(),
+                                   .source = FigureSource::LevelQuotient,
+                                   .format = FigureFormat::Percent },
+                       .lead = "  ",
+                       .gauge = true },
     };
     constexpr auto CacheTierCells =
         std::array { FactCell { .label = "cache tier", .fact = StatusFact::CacheTier, .figures = CacheHits } };
 
-    constexpr auto ScratchFree = std::array {
+    // `cpu-busy 62.5 %   mem free 32.00 GiB   scratch free 41.8 GiB`: the figures the slot ceilings are made of.
+    constexpr auto HostFigures = std::array {
+        BesideFigure { .key = "cpu_busy_ratio",
+                       .before = "cpu-busy",
+                       .figure = { .field = CpuTicksField<&CpuTicks::busy>(),
+                                   .other = CpuTicksField<&CpuTicks::total>(),
+                                   .source = FigureSource::RateQuotient,
+                                   .format = FigureFormat::Percent },
+                       .priority = Priority::High },
+        BesideFigure {
+            .key = "mem_free_bytes",
+            .before = "mem free",
+            .figure = { .field = HostLoadField<&HostLoadReading::availableMemoryBytes>(), .format = FigureFormat::Bytes } },
         BesideFigure { .key = "scratch_free_bytes",
                        .before = "scratch free",
                        .figure = { .field = HostField<&HostCapacity::diskFreeBytes>(), .format = FigureFormat::Bytes },
                        .priority = Priority::Normal },
     };
-    constexpr auto HostCells = std::array { FactCell { .label = "host", .fact = StatusFact::Host, .figures = ScratchFree } };
+    constexpr auto HostCells = std::array { FactCell { .label = "host", .fact = StatusFact::Host, .figures = HostFigures } };
 
     // §4's order: who the node is; whether it is WORKING rather than merely up; its slots and what limits
     // them; then the rates; then its cache tier and the machine.
