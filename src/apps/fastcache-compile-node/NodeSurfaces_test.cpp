@@ -808,7 +808,7 @@ TEST_CASE("The dial address is the node's own member entry, which a typed --raft
     }
 }
 
-TEST_CASE("A consensus node that names itself neither way prints NOT STATED, and is still refused",
+TEST_CASE("A consensus node that names itself neither way prints NOT STATED and the flags that would state it",
           "[node][surfaces][consensus]")
 {
     // `--print-surfaces` prints a configuration the node refuses, which is its point, so it

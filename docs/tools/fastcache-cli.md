@@ -376,6 +376,10 @@ Beside them, what that worker is offering and whether anyone knows about it:
   progress, so a node running **no** scheduler reports no role at all rather than
   claiming to be in one; an `undecided` node reports the `leader` cell as absent,
   because no leader is known yet.
+- **`consensus-endpoint`** — the `host:port` this node's consensus peers DIAL it at,
+  which is the half of `--cluster-admit`'s receipt to compare against. Not `raft-port`,
+  which is the port the node BOUND, on an address that is routinely the wildcard. A node
+  running no consensus reports no such field rather than an empty one.
 
 There is deliberately no *limited-by* field beside the slot count. Which ceiling bound a
 worker's slots is the **scheduler's** conclusion — derived on the leader from what the

@@ -6,9 +6,12 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <cstddef>
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <string_view>
+#include <vector>
 
 #include <tests/ScratchPath.hpp>
 #include <tests/Unwrap.hpp>
@@ -301,6 +304,83 @@ TEST_CASE("A consensus node that names itself neither way is refused", "[node][i
     auto named = neither;
     named.raftSelf = "10.0.0.7";
     CHECK_FALSE(StartupPolicyRejection(named).has_value());
+}
+
+TEST_CASE("The startup row refuses exactly the consensus nodes whose dial address nobody stated",
+          "[node][identity][consensus]")
+{
+    // #1328: the row asks `ConsensusDialAddressOf`, the answer `--print-surfaces` prints NOT
+    // STATED from and `NodeStatus` reports. Asserted as an AGREEMENT over shapes covering every
+    // answer, because the spelling it replaced agreed with the derivation on every
+    // configuration anybody had written down -- so an expected verdict per shape cannot tell
+    // the row ASKING the derivation from the row keeping a copy of it. The expectation is its
+    // own line, apart from the agreement: a change to the derivation reddens that one, and a
+    // row that stopped asking reddens the agreement.
+    struct Shape
+    {
+        std::string_view what; ///< Which configuration, for the failure message.
+        NodeConfig cfg;        ///< The configuration as parsed.
+        bool unstated;         ///< Whether nobody stated where peers dial it.
+    };
+
+    NodeConfig worker;
+    worker.scheduler = "127.0.0.1:6674";
+    auto consensus = worker;
+    consensus.raftListen = "6680";
+
+    std::vector<Shape> shapes;
+    shapes.push_back({ .what = "no consensus port, whatever else is named",
+                       .cfg =
+                           [&worker] {
+                               auto cfg = worker;
+                               cfg.raftSelf = "10.0.0.7";
+                               return cfg;
+                           }(),
+                       .unstated = false });
+    shapes.push_back({ .what = "a consensus port and nothing else", .cfg = consensus, .unstated = true });
+    shapes.push_back({ .what = "--raft-self",
+                       .cfg =
+                           [&consensus] {
+                               auto cfg = consensus;
+                               cfg.raftSelf = "10.0.0.7";
+                               return cfg;
+                           }(),
+                       .unstated = false });
+    shapes.push_back({ .what = "a typed --raft-peer for its own id",
+                       .cfg =
+                           [&consensus] {
+                               auto cfg = consensus;
+                               cfg.nodeId = "n1";
+                               cfg.raftPeers = { Unwrap(Cluster::ParseMemberSpec("n1=10.0.0.7:6680")) };
+                               return cfg;
+                           }(),
+                       .unstated = false });
+    shapes.push_back({ .what = "a --raft-peer for another id only",
+                       .cfg =
+                           [&consensus] {
+                               auto cfg = consensus;
+                               cfg.nodeId = "n4";
+                               cfg.raftPeers = { Unwrap(Cluster::ParseMemberSpec("n1=10.0.0.1:6680")) };
+                               return cfg;
+                           }(),
+                       .unstated = true });
+
+    std::size_t refusedByTheRow = 0;
+    for (auto const& [what, cfg, unstated]: shapes)
+    {
+        INFO(what);
+        auto const dial = ConsensusDialAddressOf(cfg);
+        auto const dialUnstated = !dial.has_value() && dial.error() == ConsensusDialGap::Unstated;
+        CHECK(dialUnstated == unstated);
+
+        // WHICH refusal, by the row's own constant: a shape refused by some other row first
+        // is not this row agreeing.
+        auto const refused = StartupPolicyRejection(cfg).value_or(std::string {}) == ConsensusNamesNoSelfPeerRefusal;
+        CHECK(refused == dialUnstated);
+        refusedByTheRow += refused ? 1 : 0;
+    }
+    // Both answers were reached, so neither half of the agreement held vacuously.
+    CHECK(refusedByTheRow == 2);
 }
 
 TEST_CASE("A --raft-self that CONTRADICTS a --raft-peer for this node is refused", "[node][identity][consensus]")
