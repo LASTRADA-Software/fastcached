@@ -278,9 +278,22 @@ class HoldingExecutor final: public IExecutor
     }
 
     /// Hold the next `Submit(ParkedWork)` instead of forwarding it.
-    void HoldNextSubmit() noexcept
+    void HoldNextSubmit()
     {
-        _hold.store(true, std::memory_order_release);
+        HoldSubmitNumber(1);
+    }
+
+    /// Forward the next @p nth - 1 `Submit(ParkedWork)` calls and hold the @p nth.
+    ///
+    /// **Armed BEFORE the frame can reach the submit it names**, never between two waits: a
+    /// case that armed the hold only once an earlier wait returned lost the race whenever that
+    /// wait's own ticks ran the frame past the submit first -- the hold then waited for a submit
+    /// that had already been forwarded (found by #1433's load run).
+    /// @param nth Which submit from now to hold; 1 is the very next.
+    void HoldSubmitNumber(std::size_t nth)
+    {
+        std::scoped_lock const lock { _mutex };
+        _holdCountdown = nth;
     }
 
     /// Make the next `Submit(ParkedWork)` throw `std::bad_alloc` instead of forwarding it.
@@ -346,11 +359,17 @@ class HoldingExecutor final: public IExecutor
             _refused.fetch_add(1, std::memory_order_acq_rel);
             throw std::bad_alloc {};
         }
-        if (_hold.exchange(false, std::memory_order_acq_rel))
         {
             std::scoped_lock const lock { _mutex };
-            _held = work;
-            return;
+            if (_holdCountdown != 0)
+            {
+                _holdCountdown -= 1;
+                if (_holdCountdown == 0)
+                {
+                    _held = work;
+                    return;
+                }
+            }
         }
         _inner.Submit(work);
         _forwarded.fetch_add(1, std::memory_order_acq_rel);
@@ -358,11 +377,11 @@ class HoldingExecutor final: public IExecutor
 
   private:
     IExecutor& _inner;
-    std::atomic<bool> _hold { false };
     std::atomic<bool> _refuse { false };
     std::atomic<std::size_t> _refused { 0 };
     std::atomic<std::size_t> _forwarded { 0 };
     mutable std::mutex _mutex;
+    std::size_t _holdCountdown { 0 }; ///< Submits until the one held; 0 holds none. Under `_mutex`.
     std::optional<ParkedWork> _held;
 };
 
@@ -1169,12 +1188,18 @@ TEST_CASE("A late return from one hop back does not end the wait for the next tr
     //
     // Staged: the first hop back parks AFTER forwarding, the reactor runs the frame into the
     // next hop out, which the executor holds, and only then does the late return land.
+    //
+    // **Both stops are armed before the cycle starts.** The first hop out is forwarded and the
+    // second held whenever it arrives, because the wait for the park TICKS: a pool thread slow
+    // to park after forwarding lets those ticks run the frame into its second hop out before
+    // a hold armed afterwards could catch it.
     Fixture f;
     ThreadPoolExecutor pool { 1 };
     ParkingReactor reactor { f.reactor };
     HoldingExecutor executor { pool };
     ReaperOnceBack reaper { f.storage, f.logger };
     reactor.ParkNextSubmit(ParkingReactor::Park::AfterForwarding);
+    executor.HoldSubmitNumber(2);
     reaper->Start(reactor, executor);
     auto const state = [&] {
         return std::format("{}; {}; {}", Describe(reactor), Describe(executor), Describe(*reaper));
@@ -1186,8 +1211,7 @@ TEST_CASE("A late return from one hop back does not end the wait for the next tr
         state);
 
     // The pool thread is still inside the first hop back; the frame is queued on the inner
-    // reactor. Run it into the SECOND hop out, and hold that one.
-    executor.HoldNextSubmit();
+    // reactor. Run it into the SECOND hop out, which the executor holds -- or already holds.
     auto const heldAgain =
         parked && TickUntil(f, "the second hop out to be held on the executor", [&] { return executor.Holding(); }, state);
 
