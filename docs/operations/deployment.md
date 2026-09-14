@@ -188,7 +188,7 @@ one time it is read.
 
 So `log_timestamps` **defaults to on when running on macOS**, in both binaries and
 in every deployment, not only under launchd: a terminal run stamps too. Turn it off
-with `no_log_timestamps: true` in fastcached's configuration file, or with the
+with `no_log_timestamps: true` in either binary's configuration file, or with the
 `--no-log-timestamps` flag, which exists for this — a bare `--log-timestamps` can
 only ask for the default that is already in force.
 

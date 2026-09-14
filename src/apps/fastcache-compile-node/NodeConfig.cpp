@@ -1377,17 +1377,21 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
             // only say "on" would turn an operator's explicit "off" back on at every
             // boot.
             //
-            // **No `yamlKey`, and it is on `notFromFile` below with that reason.** The
-            // file keeps one key, `log_timestamps`, a boolean that already wins in both
-            // directions. A second key would give the file two ways to say one thing,
-            // and `apply` runs on `true` alone -- so `no_log_timestamps: false` would
-            // pass nothing while reading like it said something.
+            // **And a key, `no_log_timestamps`, for the same reason.** A file reaches
+            // this setting through the rows' own appliers, and a presence key applies on
+            // `true` alone -- so `log_timestamps: false` means "do not pass
+            // `--log-timestamps`", which is the platform default and is ON under macOS.
+            // This row was once kept out of files on the claim that `log_timestamps` "wins
+            // in both directions"; through `ApplyFileSettings` it never did, and a worker's
+            // `log_timestamps: false` left macOS stamping (#1437).
             .primary = "--no-log-timestamps",
             .arity = Arity::None,
             .apply = SetFalse<&NodeConfig::logTimestamps>(),
             .description = "do not prefix log lines with a timestamp, overriding the\n"
                            "platform default. The one way to ask for unstamped output\n"
                            "under macOS",
+            .yamlKey = "no_log_timestamps",
+            .same = FieldEq<&NodeConfig::logTimestamps>(),
         },
         { .primary = "--daemon",
           .arity = Arity::None,
@@ -1554,11 +1558,6 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
     // them from the very file the start already found is circular.
     static constexpr auto notFromFile = std::to_array<std::pair<std::string_view, std::string_view>>({
         { "--config", "names the file being read; a key for it would name a file to read while reading one" },
-        { "--no-log-timestamps",
-          "the negative spelling of a key the file already carries. `log_timestamps` is a boolean and "
-          "wins in both directions, so a second key would be two ways to say one thing -- and `apply` "
-          "runs on `true` alone, so `no_log_timestamps: false` would pass nothing while reading like it "
-          "said something. argv needs the spelling because argv cannot carry a value; a file can" },
         { "--daemon",
           "how this process was started, decided by whoever started it -- a service is already "
           "supervised, and a file that forked an operator's foreground run would take away the "
