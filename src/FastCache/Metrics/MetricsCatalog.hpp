@@ -831,6 +831,32 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
       .help = "Live-stats streams the watching client closed. The ordinary way a dashboard ends; read it "
               "against the opened count, where the difference is the streams still open.",
       .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::LiveSubscriptionsEndedByReset,
+      .prometheusName = "fastcache_live_subscriptions_ended_by_reset_total",
+      .help = "Live-stats streams whose watching client reset the connection instead of closing it. A "
+              "dashboard killed with pushes still unread does this; counted apart from the orderly close.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::LiveSubscriptionsRefusedNotAMember,
+      .prometheusName = "fastcache_live_subscriptions_refused_not_a_member_total",
+      .help = "Live-stats subscriptions refused because the peer is not a fleet member. Live stats stream to "
+              "members only, as NodeStatus answers them; a burst from one host is a stranger probing the port.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::LiveSubscriptionsRefusedMalformed,
+      .prometheusName = "fastcache_live_subscriptions_refused_malformed_total",
+      .help = "Live-stats subscriptions whose request did not decode, or named a subject this build does not "
+              "serve. No client of this tree sends one; a rise is a client of another build or no client at "
+              "all.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::LiveSubscriptionsRefusedPayloadTooLarge,
+      .prometheusName = "fastcache_live_subscriptions_refused_payload_too_large_total",
+      .help = "Live-stats subscriptions whose header declared more than the control payload the verb is bounded "
+              "to. Refused before a byte of it is read; no client of this tree at any version sends one.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::LiveSubscriptionsRefusedEndpointBusy,
+      .prometheusName = "fastcache_live_subscriptions_refused_endpoint_busy_total",
+      .help = "Live-stats subscriptions refused because the 0xFC listener's in-flight byte budget was full of "
+              "other requests. The dashboard retries; a rise says the view was lost when the node was busiest.",
+      .type = MetricType::Counter },
 } };
 
 // Checked at compile time rather than by a test, because the failure this prevents

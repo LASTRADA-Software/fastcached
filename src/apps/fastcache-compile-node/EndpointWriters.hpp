@@ -15,7 +15,7 @@ namespace FastCache::Node
 /// an explicit `= N`** -- a value on a private enum asserts a contract that does not
 /// exist. It is an argument each write names, and its ordinals are this build's alone.
 ///
-/// ## Why a table for four functions
+/// ## Why a table for five functions
 ///
 /// `FrameEndpoint`'s connection loop has an **exactly-one-writer** property: what goes
 /// out on a connection, and in what order, is decided by one statement sequence. The
@@ -29,7 +29,7 @@ namespace FastCache::Node
 /// costs is an interleaved partial write, which on this wire is a desync rather than an
 /// error -- a client reading a length out of the middle of somebody else's frame.
 ///
-/// So a write NAMES which of the sanctioned writers it is. A fifth writer is a fifth
+/// So a write NAMES which of the sanctioned writers it is. A sixth writer is a sixth
 /// row carrying its own reason, which is a thing a reviewer sees; it is not a
 /// `WriteAll` call that appeared in a helper, which is not. That is a refusal by ROW
 /// where there was previously only a refusal by absence, and the two are the same
@@ -71,6 +71,9 @@ namespace FastCache::Node
 /// a compiler checks. Stating the residue plainly is the point: a guard described as
 /// stronger than it is gets trusted for the case it does not cover.
 ///
+/// `Stream` is not concurrent with anything: it writes while the loop is suspended inside
+/// `ServeStream`, and nothing else writes a connection that is serving a subscription.
+///
 /// Exactly one of these is CONCURRENT with another: `Pulse` writes while the loop is
 /// suspended inside `IFrameResponder::Answer`, which is the one window in which the
 /// loop writes nothing. `ReclaimFromPulse` is where the socket comes back, and it runs
@@ -81,6 +84,7 @@ enum class EndpointWriter : std::uint8_t
     DeferredSweep, ///< `ExplainIfSwept`.
     Pulse,         ///< `PulseProgress`.
     AtCapacity,    ///< `RefuseAtCapacity`.
+    Stream,        ///< `ServeStream` and the `StreamSink` it hands the stream.
 
     Last, ///< Enumerator count; not a writer.
 };
@@ -96,8 +100,8 @@ struct EndpointWriterRow
 
 /// The writers this endpoint has, in enumerator order.
 ///
-/// The `rationale` is a forcing function rather than a dead field: a fifth writer that
-/// cannot be given one is a fifth writer that should not exist, and the answer is to
+/// The `rationale` is a forcing function rather than a dead field: a sixth writer that
+/// cannot be given one is a sixth writer that should not exist, and the answer is to
 /// hand the bytes back to the loop instead.
 inline constexpr EnumTable<EndpointWriter, EndpointWriterRow> EndpointWriterTable {
     { { .writer = EndpointWriter::Loop,
@@ -125,7 +129,15 @@ inline constexpr EnumTable<EndpointWriter, EndpointWriterRow> EndpointWriterTabl
         .function = "RefuseAtCapacity",
         .rationale = "A connection that never reaches the loop. Its own task rather than a "
                      "write in the accept loop, so refusing never parks that loop on a client "
-                     "which is not reading." } }
+                     "which is not reading." },
+      { .writer = EndpointWriter::Stream,
+        .name = "Stream",
+        .function = "ServeStream",
+        .rationale = "A subscription is a series of frames, not one reply, and the loop is suspended "
+                     "inside ServeStream for the whole of it, writing nothing. The stream itself never "
+                     "touches the socket: every push and the terminal reply leave through StreamSink, "
+                     "one after another, which is the loop's own rule held for the length of a "
+                     "subscription (#1399)." } }
 };
 
 static_assert(RowsInEnumeratorOrder(EndpointWriterTable, [](EndpointWriterRow const& row) { return row.writer; }));
