@@ -217,6 +217,28 @@ struct TwoReactors
 
 } // namespace
 
+TEST_CASE("A subscriber whose first capture straddles a tick boundary sends that capture and reports no gap", "[livestats]")
+{
+    // The census `One live stream on two real reactors` makes -- no more captures than ticks handed out -- went red
+    // under a loaded gate: a subscriber's baseline was captured just before a boundary, the loop's first look fell
+    // after it and captured again, and the baseline was never sent. WHAT DISTINGUISHES: the boundary is crossed
+    // INSIDE the baseline capture, deterministically. The subscriber that sends its baseline sends tick 0 and then
+    // tick 1, one capture each and no gap; the one that looks past it sends tick 1 alone, after a gap for tick 0 it
+    // had captured itself.
+    TwoReactors rig;
+    rig.sources.duringNextCapture = [&rig] {
+        rig.clock.Advance(500ms);
+    };
+    ServeCache(&rig.live, &rig.first, &rig.gate, &rig.firstReactor, &rig.firstReturned);
+    rig.firstReactor.Drain();
+
+    REQUIRE_FALSE(rig.first.snapshots.empty());
+    CHECK(rig.first.snapshots.front().first == 0);
+    CHECK(rig.metrics.Read(IMetricsSink::Counter::LiveSnapshotsSkipped) == 0);
+    CHECK(rig.sources.captures == rig.first.snapshots.size());
+    CHECK(rig.metrics.Read(IMetricsSink::Counter::LiveSnapshotsRendered) == rig.sources.captures);
+}
+
 TEST_CASE("A capture another reactor is taking is not waited for: the subscriber looks again and sends that capture",
           "[livestats]")
 {
