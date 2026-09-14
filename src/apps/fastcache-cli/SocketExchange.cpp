@@ -53,6 +53,24 @@ namespace
         return out;
     }
 
+    /// What a failed read says, in the words of what was being read.
+    struct ReadWords
+    {
+        std::string_view failed;        ///< The connection failed mid-read; the transport's context follows.
+        std::string_view closedBetween; ///< EOF with nothing pending: the peer finished between two frames.
+        std::string_view closedWithin;  ///< EOF with part of a frame pending: a truncation.
+    };
+
+    /// An exchange's answer: every RESP, memcached and one-reply `0xFC` read.
+    constexpr auto ReplyWords = ReadWords { .failed = "the connection failed while reading the reply",
+                                            .closedBetween = "the server closed the connection without answering",
+                                            .closedWithin = "the server closed the connection part-way through a reply" };
+
+    /// One frame of a subscription (#1399): it has no reply, and pushes came before whatever ended it.
+    constexpr auto StreamWords = ReadWords { .failed = "the stream was lost",
+                                             .closedBetween = "the server closed the stream",
+                                             .closedWithin = "the server closed the stream part-way through a frame" };
+
     /// Read one chunk from @p socket and append it to @p pending.
     ///
     /// **The EOF rule lives here and nowhere else.** Both wires' read loops need it and
@@ -65,20 +83,19 @@ namespace
     ///
     /// @param socket The connected socket.
     /// @param pending The buffer to append to; its emptiness is what the EOF arms read.
+    /// @param words What the read is of, as its failure says it.
     /// @return Nothing on success, or why the read did not happen.
-    [[nodiscard]] std::expected<void, ExchangeError> FillMore(ISocket* socket, std::string& pending)
+    [[nodiscard]] std::expected<void, ExchangeError> FillMore(ISocket* socket, std::string& pending, ReadWords const& words)
     {
         std::array<std::byte, ReadChunkBytes> chunk {};
         auto const got = SyncRun(ReadSome(socket, chunk));
         if (!got.has_value())
-            return std::unexpected(ExchangeError {
-                .kind = ExchangeFailure::Transport,
-                .detail = std::format("the connection failed while reading the reply ({})", got.error().context) });
+            return std::unexpected(ExchangeError { .kind = ExchangeFailure::Transport,
+                                                   .detail = std::format("{} ({})", words.failed, got.error().context) });
         if (*got == 0)
             return std::unexpected(
                 ExchangeError { .kind = ExchangeFailure::Transport,
-                                .detail = pending.empty() ? "the server closed the connection without answering"
-                                                          : "the server closed the connection part-way through a reply" });
+                                .detail = std::string { pending.empty() ? words.closedBetween : words.closedWithin } });
         pending += AsChars(std::span<std::byte const> { chunk.data(), *got });
         return {};
     }
@@ -186,7 +203,7 @@ std::expected<RespValue, ExchangeError> SocketExchange::ReadReply()
                 break;
         }
 
-        if (auto const filled = FillMore(_socket.get(), _pending); !filled.has_value())
+        if (auto const filled = FillMore(_socket.get(), _pending, ReplyWords); !filled.has_value())
             return std::unexpected(filled.error());
     }
 }
@@ -241,7 +258,7 @@ std::expected<McReply, ExchangeError> MemcachedExchange::Send(std::string_view r
                 break;
         }
 
-        if (auto const filled = FillMore(_socket.get(), _pending); !filled.has_value())
+        if (auto const filled = FillMore(_socket.get(), _pending, ReplyWords); !filled.has_value())
             return std::unexpected(filled.error());
     }
 }
@@ -302,11 +319,29 @@ std::span<std::string const> NodeExchange::Advisories() const noexcept
     return _advisories;
 }
 
-std::expected<NodeReply, ExchangeError> NodeExchange::Send(std::span<std::byte const> request)
+std::expected<void, ExchangeError> NodeExchange::Post(std::span<std::byte const> request)
 {
     if (!SyncRun(SendAll(_socket.get(), request)))
-        return std::unexpected(ExchangeError { .kind = ExchangeFailure::Transport,
-                                               .detail = "the connection failed while sending the request" });
+        return std::unexpected(
+            ExchangeError { .kind = ExchangeFailure::Transport,
+                            .detail = std::format("the connection to {} failed while sending the request", _endpoint) });
+    return {};
+}
+
+void NodeExchange::SetReceiveDeadline(std::chrono::milliseconds deadline) noexcept
+{
+    _socket->SetReceiveDeadline(deadline);
+}
+
+void NodeExchange::ShutdownWrite() noexcept
+{
+    _socket->ShutdownWrite();
+}
+
+std::expected<NodeReply, ExchangeError> NodeExchange::Send(std::span<std::byte const> request)
+{
+    if (auto posted = Post(request); !posted.has_value())
+        return std::unexpected(std::move(posted).error());
 
     // **Loop to a TERMINAL status**, never to the first frame. A reply carries a status
     // byte and no kind, so the step-over-what-you-do-not-know property is REQUEST-side
@@ -315,7 +350,7 @@ std::expected<NodeReply, ExchangeError> NodeExchange::Send(std::span<std::byte c
     // below is subject to.
     for (;;)
     {
-        auto frame = ReadFrame();
+        auto frame = ReadOne(Reading::Reply);
         if (!frame.has_value())
             return frame;
         if (CompileCacheWire::IsTerminalStatus(frame->status))
@@ -324,6 +359,11 @@ std::expected<NodeReply, ExchangeError> NodeExchange::Send(std::span<std::byte c
 }
 
 std::expected<NodeReply, ExchangeError> NodeExchange::ReadFrame()
+{
+    return ReadOne(Reading::Stream);
+}
+
+std::expected<NodeReply, ExchangeError> NodeExchange::ReadOne(Reading reading)
 {
     for (;;)
     {
@@ -350,7 +390,8 @@ std::expected<NodeReply, ExchangeError> NodeExchange::ReadFrame()
             }
         }
 
-        if (auto const filled = FillMore(_socket.get(), _pending); !filled.has_value())
+        auto const& words = reading == Reading::Stream ? StreamWords : ReplyWords;
+        if (auto const filled = FillMore(_socket.get(), _pending, words); !filled.has_value())
             return std::unexpected(filled.error());
     }
 }
