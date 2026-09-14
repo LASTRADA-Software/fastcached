@@ -5251,6 +5251,47 @@ set_tests_properties("istreambuf-iterator-selftest" PROPERTIES
     TIMEOUT 180
 )
 
+# No first-party C++ calls a range algorithm `Core/Ranges.hpp` wraps directly --
+# `std::ranges::iota` is `Ranges::Iota`, `std::ranges::fold_left` is `Ranges::FoldLeft`.
+#
+# AppleClang's own libc++ has no `std::ranges::iota`, and the one job that compiles with it,
+# `Package (macOS .pkg)`, is not a required context: PR #1392 went red there with every
+# required check green. So a direct call merges and breaks packaging afterwards, which is why
+# this is in the DEFAULT set. The wrapped set is DERIVED from the header's selection blocks,
+# the file set from git minus the third-party roots, and the header and its test are the only
+# exemption.
+add_test(
+    NAME "ranges-seam"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DGIT_EXECUTABLE=${GIT_EXECUTABLE}"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-ranges-seam.cmake"
+)
+set_tests_properties("ranges-seam" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 120
+)
+
+# And that check must be SEEN to refuse, seen to stay quiet, and seen to fail closed, over
+# synthetic trees in both enumeration modes; the run prints how many. Among them: a selection
+# block ADDED to the staged header plus a call to what it wraps, refused with no edit to the
+# check -- the case a restated list of facilities would fail -- and a file merely sharing the
+# seam test's name elsewhere, refused.
+add_test(
+    NAME "ranges-seam-selftest"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DGIT_EXECUTABLE=${GIT_EXECUTABLE}"
+        "-DFASTCACHED_SCRATCH_DIR=${CMAKE_CURRENT_BINARY_DIR}/ranges-seam-selftest"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-ranges-seam-selftest.cmake"
+)
+set_tests_properties("ranges-seam-selftest" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 180
+)
+
 # A retained wall clock is a `WallClockRef`, never a raw `IWallClock` pointer or
 # reference member (#1032). The TYPE is the guard -- `WallClockRef` refuses to be built
 # from an rvalue, and the `static_assert` pairs in `Core/WallClockRef_test.cpp` and

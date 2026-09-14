@@ -1054,6 +1054,14 @@ what differs between compilers, standard libraries, hosts and tool versions.
   that macOS already compiles it*) answers YES and is WRONG here: a grep tests a NAME while the
   hazard is a SIGNATURE. `Core/NumericText.hpp`'s `ParseFiniteDouble` is the tree's one answer,
   and it pins the C locale as well.
+- **`std::ranges::iota` and `std::ranges::fold_left` are written `Ranges::Iota` and
+  `Ranges::FoldLeft`** (`Core/Ranges.hpp`). AppleClang's own libc++ has no `ranges::iota`, and
+  the one job compiling with it, `Package (macOS .pkg)`, is NOT a required context — so a direct
+  call merges green and breaks packaging after. The seam selects by FEATURE-TEST MACRO, never a
+  compiler ID, and is the standard function object wherever the library ships it; its fallback is
+  tested on EVERY platform. `ctest -R ranges-seam` refuses a direct call and DERIVES the wrapped
+  set from the header, so the next missing facility is a selection block there — never an `#if`
+  at a call site.
 - A `char` is UTF-8 here, at run time and at compile time: every Windows executable declares the
   UTF-8 process code page and MSVC gets `/utf-8`. Converting one boundary instead would leave
   `path`, `CreateProcessA` and `getenv` on the legacy page.

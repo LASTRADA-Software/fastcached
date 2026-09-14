@@ -109,7 +109,7 @@ set(factoryShape "a line beginning `Cell TextCell(` at namespace scope")
 # house `fastcached_read_lines` splitting idiom escapes them one at a time and still
 # merges a line ending in a backslash with the next one, which hides the following
 # line and drifts every line number below it -- a FALSE GREEN, measured and recorded
-# on `fastcached_scan_lines` in `check-istreambuf-iterator.cmake`. This walks with
+# on `fastcached_scan_code_lines` in `scripts/lib/CheckCommon.cmake`. This walks with
 # `FIND`/`SUBSTRING` instead: immune to all four by construction rather than by
 # escaping them.
 #

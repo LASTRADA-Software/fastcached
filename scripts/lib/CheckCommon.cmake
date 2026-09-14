@@ -346,3 +346,127 @@ function(fastcached_decline_third_party sourceDir pathsVar declinedOut)
     set(${pathsVar} "${kept}" PARENT_SCOPE)
     set(${declinedOut} "${declined}" PARENT_SCOPE)
 endfunction()
+
+# ---------------------------------------------------------------------------
+# Scanning C++ for a USE of something, as opposed to a MENTION of it in a comment.
+#
+# Walk content line by line WITHOUT ever building a CMake list of lines, and report, per
+# line, whether @p pattern appears at all (`mention:<line>`) and whether it survives
+# comment stripping (`use:<line>`). A mention is counted BEFORE stripping, so a caller's
+# matched-nothing guard cannot be satisfied by the stripping alone.
+#
+# It was `fastcached_scan_lines` in `check-istreambuf-iterator.cmake` and moved here when
+# `check-ranges-seam.cmake` became its second caller: a second copy citing the first in a
+# comment vouches for its bugs without inheriting its fixes, and this one has had two.
+#
+# ## Why list-free
+#
+# The list-splitting idiom this was written instead of (`fastcached_read_lines`, before #495
+# split it into the two functions above) escaped `;` and `\`, blanked `[` and `]`, then split
+# on newlines into a CMake list -- and a line ending in a backslash still merged with the next
+# one, which its own comment claimed it prevented. Measured on CMake 3.28 with a four-line
+# file: no trailing backslash gave 5 elements, a line ending in `\` gave 4 with lines 2 and 3
+# merged into `two \;three`, and a line ending in `\` merged too.
+#
+# A merged line is not cosmetic for a use-scan: the merged element begins with whatever line 2
+# began with, so a `//` comment swallows the real code on line 3, the use goes unreported, and
+# every line number below it drifts. That is a false GREEN, the direction that does not get
+# investigated. It was found by the `istreambuf-iterator-selftest` case that plants list
+# structure ABOVE a violation and asserts the exact `file:line` -- an assertion on the filename
+# alone passes under the bug.
+#
+# So this walks with `FIND`/`SUBSTRING` and puts no line into a list at all: immune to `;`,
+# `\`, `[` and `]` by construction rather than by escaping them one at a time.
+# `check-tsan-scope.cmake` is list-free for the same reason.
+#
+# The walk is O(n^2) in the content's length, so a caller applies a whole-file `string(FIND)`
+# first and walks only the files that contain the token at all.
+#
+# @param content The file content.
+# @param pattern A CMake regular expression for the thing whose USE is sought.
+# @param outVar Set to a list of `mention:<line>` and `use:<line>` entries, in line order.
+function(fastcached_scan_code_lines content pattern outVar)
+    set(hits "")
+    set(rest "${content}")
+    set(lineNumber 0)
+    set(inBlockComment FALSE)
+    while(TRUE)
+        string(FIND "${rest}" "\n" newline)
+        if(newline EQUAL -1)
+            set(line "${rest}")
+        else()
+            string(SUBSTRING "${rest}" 0 ${newline} line)
+        endif()
+        string(REGEX REPLACE "\r$" "" line "${line}")
+        math(EXPR lineNumber "${lineNumber} + 1")
+
+        if(line MATCHES "${pattern}")
+            # A raw mention, comment or code. Counted before stripping, so a caller's
+            # matched-nothing guard cannot be satisfied by stripping alone.
+            list(APPEND hits "mention:${lineNumber}")
+        endif()
+
+        # Strip comments, so prose explaining the rule is not read as breaking it.
+        #
+        # The blind spot, stated rather than papered over: CMake's regex engine is
+        # greedy and has no lazy quantifier, so stripping inline `/* ... */` pairs
+        # takes everything between the FIRST `/*` and the LAST `*/` on a line. A use
+        # sitting between two block comments on one line is invisible here.
+        set(stripped "${line}")
+        set(skipLine FALSE)
+        if(inBlockComment)
+            if(NOT stripped MATCHES "\\*/")
+                set(skipLine TRUE)
+            else()
+                string(REGEX REPLACE "^.*\\*/" "" stripped "${stripped}")
+                set(inBlockComment FALSE)
+            endif()
+        endif()
+        if(NOT skipLine)
+            string(REGEX REPLACE "/\\*.*\\*/" " " stripped "${stripped}")
+
+            # Which introducer comes FIRST decides. The order is not a detail: the
+            # `/*` test used to run BEFORE `//` was stripped, so a line comment
+            # mentioning `/*` opened a block comment no `*/` ever closed, and every
+            # remaining line of that file was skipped while this still printed a
+            # clean count over lines it never read -- a false green, in the one
+            # direction the check exists to refuse.
+            #
+            # Positional rather than simply stripping `//` first, which MEASURED
+            # identical on every input tried: below the inline `/* ... */` strip
+            # above, removing `//...` removes any `/*` that followed it too, so the
+            # two orderings agree. What position buys is not a different verdict but
+            # independence -- it states the rule itself rather than being correct
+            # only while the strip above it keeps running first. A reordering is
+            # correct by PRECONDITION; this is correct by construction.
+            #
+            # Third copy of this defect: `check-cli-text-cell.cmake` and
+            # `check-markup-entities.cmake` carried it too, in walks of their own.
+            #
+            # Still blind to either introducer inside a STRING LITERAL, as every
+            # regex-shaped reader here is. That is unchanged by this.
+            string(FIND "${stripped}" "/*" blockAt)
+            string(FIND "${stripped}" "//" lineAt)
+            if(NOT blockAt EQUAL -1 AND (lineAt EQUAL -1 OR blockAt LESS lineAt))
+                string(SUBSTRING "${stripped}" 0 ${blockAt} stripped)
+                set(inBlockComment TRUE)
+            elseif(NOT lineAt EQUAL -1)
+                string(SUBSTRING "${stripped}" 0 ${lineAt} stripped)
+            endif()
+            if(stripped MATCHES "${pattern}")
+                list(APPEND hits "use:${lineNumber}")
+            endif()
+        endif()
+
+        if(newline EQUAL -1)
+            break()
+        endif()
+        math(EXPR skip "${newline} + 1")
+        string(LENGTH "${rest}" restLength)
+        if(skip GREATER_EQUAL restLength)
+            break()
+        endif()
+        string(SUBSTRING "${rest}" ${skip} -1 rest)
+    endwhile()
+    set(${outVar} "${hits}" PARENT_SCOPE)
+endfunction()
