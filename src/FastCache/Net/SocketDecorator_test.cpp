@@ -16,6 +16,7 @@
 #include <cstddef>
 #include <memory>
 #include <tuple>
+#include <utility>
 
 #include <tests/SocketDecorator.hpp>
 
@@ -24,18 +25,31 @@ using namespace FastCache;
 namespace
 {
 
-/// Await a readability watch on a socket the caller owns, and drop the socket the moment the
-/// watch resumes -- what a connection does when its watch says the peer is gone.
-/// @param owner The socket's only owner; reset from inside the resumption.
-DetachedTask WatchThenDrop(std::unique_ptr<Testing::ParkingReadableSocket>& owner)
+/// A parking fake over @p inner, held by exactly one `shared_ptr` in an allocation of its own.
+///
+/// Not `make_shared`: an object sharing its allocation with the control block stays mapped
+/// while any `weak_ptr` to it lives, so ASan would see no freed object for a late member
+/// access -- and a `weak_ptr` is how each case below observes the destruction.
+/// @param inner The socket the fake decorates.
+/// @return The only owning reference.
+template <typename Fake>
+std::shared_ptr<Fake> SoleOwner(ISocket& inner)
+{
+    return std::make_unique<Fake>(inner);
+}
+
+/// Await a readability watch on a socket this coroutine owns, and drop the socket the moment
+/// the watch resumes -- what a connection does when its watch says the peer is gone.
+/// @param owner The socket's only owning reference, moved in; reset from inside the resumption.
+DetachedTask WatchThenDrop(std::shared_ptr<Testing::ParkingReadableSocket> owner)
 {
     std::ignore = co_await owner->WaitReadable();
     owner.reset();
 }
 
-/// Write to a socket the caller owns, and drop the socket the moment the write resumes.
-/// @param owner The socket's only owner; reset from inside the resumption.
-DetachedTask WriteThenDrop(std::unique_ptr<Testing::ParkingWritableSocket>& owner)
+/// Write to a socket this coroutine owns, and drop the socket the moment the write resumes.
+/// @param owner The socket's only owning reference, moved in; reset from inside the resumption.
+DetachedTask WriteThenDrop(std::shared_ptr<Testing::ParkingWritableSocket> owner)
 {
     auto const bytes = std::array { std::byte { 0x2A } };
     std::ignore = co_await owner->Write(bytes);
@@ -49,38 +63,45 @@ TEST_CASE("A parking fake lets the coroutine it resumes destroy it", "[net][sock
     auto const pair = InMemorySocketPair::Create();
 
     // Each route resumes the awaiting coroutine inline, which destroys the socket before the
-    // call returns. Nothing after the call may touch the raw pointer.
+    // call returns. The coroutine holds the only owning reference, so the case watches it
+    // through a `weak_ptr`, and nothing after the call may touch the raw pointer.
     SECTION("a readable watch retired by Close")
     {
-        auto owner = std::make_unique<Testing::ParkingReadableSocket>(*pair.server);
+        auto owner = SoleOwner<Testing::ParkingReadableSocket>(*pair.server);
         auto* const socket = owner.get();
-        WatchThenDrop(owner);
+        std::weak_ptr<Testing::ParkingReadableSocket> const watched = owner;
+        WatchThenDrop(std::move(owner));
         REQUIRE(socket->IsWatchParked());
+        REQUIRE_FALSE(watched.expired());
 
         socket->Close();
-        CHECK(owner == nullptr);
+        CHECK(watched.expired());
     }
 
     SECTION("a readable watch retired by CancelRead")
     {
-        auto owner = std::make_unique<Testing::ParkingReadableSocket>(*pair.server);
+        auto owner = SoleOwner<Testing::ParkingReadableSocket>(*pair.server);
         auto* const socket = owner.get();
-        WatchThenDrop(owner);
+        std::weak_ptr<Testing::ParkingReadableSocket> const watched = owner;
+        WatchThenDrop(std::move(owner));
         REQUIRE(socket->IsWatchParked());
+        REQUIRE_FALSE(watched.expired());
 
         socket->CancelRead();
-        CHECK(owner == nullptr);
+        CHECK(watched.expired());
     }
 
     SECTION("a parked write retired by Close")
     {
-        auto owner = std::make_unique<Testing::ParkingWritableSocket>(*pair.server);
+        auto owner = SoleOwner<Testing::ParkingWritableSocket>(*pair.server);
         auto* const socket = owner.get();
+        std::weak_ptr<Testing::ParkingWritableSocket> const watched = owner;
         socket->StopReading();
-        WriteThenDrop(owner);
+        WriteThenDrop(std::move(owner));
         REQUIRE(socket->IsWriteParked());
+        REQUIRE_FALSE(watched.expired());
 
         socket->Close();
-        CHECK(owner == nullptr);
+        CHECK(watched.expired());
     }
 }
