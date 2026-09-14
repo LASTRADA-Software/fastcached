@@ -140,12 +140,10 @@ class IocpListener final: public IListener
 
     /// Refuse to adopt a listening descriptor, because nothing on this platform hands one over.
     ///
-    /// The factory every `PlatformListener` has, so that `FrameEndpoint::StartAdopted` is ONE
-    /// body on every platform and no consumer carries an `#if` for a question only the
-    /// listener can answer. It refuses in `Bind`'s failure convention -- a listener with
-    /// `IsBound() == false` and `BindError()` naming why -- rather than being left out: its
-    /// absence is what gave that caller a Windows arm voiding seven parameters by hand, and
-    /// a standing question about whether `[[maybe_unused]]` should replace them (#1347).
+    /// The factory `EpollListener` and `KqueueListener` have, so a `PlatformListener` caller
+    /// needs no `#if` for a question only the listener can answer (#1347). It refuses in
+    /// `Bind`'s failure convention: a listener with `IsBound() == false` and `BindError()`
+    /// naming why.
     ///
     /// **A refusal, not an adoption waiting to be written, and deliberately tracked by no
     /// issue.** Socket activation is systemd's protocol: `AdoptInheritedDescriptors` hands

@@ -1042,8 +1042,9 @@ class FrameEndpoint
     /// is why activation makes that flag mandatory and refuses at startup without it.
     ///
     /// **The descriptor is handed on, never held.** `PlatformListener::Adopt` takes
-    /// ownership including on its own failure paths, so this function neither closes
-    /// it on a refusal nor lets anything else do so. A failed adoption is a startup
+    /// ownership including on its own failure paths -- on IOCP it refuses, and an `int`
+    /// names no socket there to own -- so this function neither closes it on a refusal
+    /// nor lets anything else do so. A failed adoption is a startup
     /// refusal exactly as a failed bind is: an activated node that cannot serve the
     /// descriptor it was given is in the position that refusal exists for, and
     /// warning past it would leave a worker registering an endpoint nothing answers.
@@ -1052,7 +1053,8 @@ class FrameEndpoint
     /// @param surface Which surface to serve. Its row supplies the name used in log
     ///        lines; its address is not consulted, because the unit chose it.
     /// @param descriptor An already-bound, already-listening descriptor. Ownership
-    ///        passes to the listener built here, whether or not that succeeds.
+    ///        passes to the listener built here, whether or not that succeeds; IOCP
+    ///        refuses without one to own.
     /// @param advertisedHost The host clients are told to dial, from `--advertise`.
     ///        The only honest answer to "what address is this", since the process
     ///        cannot ask the unit and a wildcard bind names nothing dialable.

@@ -2682,8 +2682,9 @@ std::expected<std::unique_ptr<FrameEndpoint>, std::string> FrameEndpoint::StartA
     // bind, no listen and no `SO_REUSEADDR` for that reason.
     //
     // Ownership of `descriptor` passes into this call and is not ours again on any
-    // path -- the listener closes it in its destructor, including when the adoption
-    // itself failed -- so there is deliberately no `::close` anywhere below.
+    // path -- a POSIX listener closes it in its destructor, including when the adoption
+    // itself failed, and the IOCP one refuses a number that names no socket there -- so
+    // there is deliberately no `::close` anywhere below.
     auto listener = PlatformListener::Adopt(io.Reactor(), descriptor);
     if (!listener || !listener->IsBound())
         return std::unexpected { std::format("cannot serve the socket-activated descriptor ({})",
