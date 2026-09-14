@@ -1085,7 +1085,9 @@ what differs between compilers, standard libraries, hosts and tool versions.
   RECORD, at the wheel's own path (#1404). apt's `clang-tidy-22`, choco's, a PATH shim and a copied
   binary are all unidentifiable and refused; there is no fallback. Get it with
   `bash scripts/check-clang-tidy-version.sh --resolve`, which names the install command when it
-  cannot answer.
+  cannot answer. A shape that build is KNOWN to crash on is a row of
+  `check-clang-tidy-known-defects.sh`: its sites name the value first under a one-line comment
+  naming the issue, and the check stays on.
 - **The formatter's BUILD is `.clang-format-version`, and a clang-format that is not that build
   does not WRITE** — not the format-on-edit hook, not `local-gate.sh`'s `-i`. clang-format's
   `--version` line, unlike clang-tidy's, carries the snapshot, so it is compared WHOLE.

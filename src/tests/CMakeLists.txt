@@ -1627,6 +1627,34 @@ set_tests_properties("clang-tidy-version-selftest" PROPERTIES
     TIMEOUT 120
 )
 
+# A crash the declared clang-tidy build is KNOWN to have is a row of `check-clang-tidy-known-defects.sh` (#1410):
+# the tree names the value first at every site of the crashing shape rather than disable the check. This
+# default mode needs no analyser: each row's issue leads a rulebook `## Open work` entry, and every source
+# line naming a row's check names that issue too, so the change that retires a row finds every site.
+#
+# Whether the build still crashes is `--installed`, run by both clang-tidy jobs and the gate -- not a
+# ctest, for the reason `clang-tidy-version` gives (#1135).
+add_test(
+    NAME "clang-tidy-known-defects"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-clang-tidy-known-defects.sh" "${CMAKE_SOURCE_DIR}"
+)
+set_tests_properties("clang-tidy-known-defects" PROPERTIES
+    LABELS "hygiene"
+    TIMEOUT 120
+)
+
+# Every verdict of the decision (still crashing, fixed, check not live, control not parsing, a different
+# failure), `--installed` end to end over stub analysers with and without the defect, and the default mode
+# over synthetic trees in both directions.
+add_test(
+    NAME "clang-tidy-known-defects-selftest"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-clang-tidy-known-defects.sh" --self-test "${CMAKE_SOURCE_DIR}"
+)
+set_tests_properties("clang-tidy-known-defects-selftest" PROPERTIES
+    LABELS "hygiene"
+    TIMEOUT 120
+)
+
 add_test(
     NAME "script-modes"
     COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-script-modes.sh"

@@ -4125,6 +4125,10 @@ for row in "${gate_presets[@]}"; do
         tidy_path="$(bash "$(dirname "${BASH_SOURCE[0]}")/check-clang-tidy-version.sh" --resolve "$repo_root")" \
             || fail "no clang-tidy this gate can identify as the build .clang-tidy-version declares (above), and it will not fall back to whatever clang-tidy is on PATH -- a clean report from another build is a report about a different analyser; install the declared build as the lines above say"
         tidy="$tidy_path"
+        # The crashes this build is KNOWN to have, asserted against it: the sites the tree rewrote around one stay
+        # exactly as long as the build still crashes there (#1410).
+        bash "$(dirname "${BASH_SOURCE[0]}")/check-clang-tidy-known-defects.sh" --installed "$tidy_path" "$repo_root" \
+            || fail "the declared clang-tidy does not behave as check-clang-tidy-known-defects.sh records (above), so the workarounds the tree carries for it no longer describe the analyser this gate would judge with"
 
         # Asked once and HERE, beside the tool it is about, rather than per preset:
         # the header filter is a property of `.clang-tidy` and of where this

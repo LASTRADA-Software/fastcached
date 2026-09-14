@@ -1866,11 +1866,7 @@ namespace
             column.value = std::max(column.value, in.cellWidth(tile->value));
             if (withWords)
             {
-                // Named before the list, not measured inside it: clang-tidy's
-                // modernize-min-max-use-initializer-list dereferences the direct callee of every call in a
-                // `std::max({...})` list, and a call through the `cellWidth` pointer has none. The PyPI builds of
-                // 22.1.0 and 22.1.8 crash there on Linux and Windows (#1404); a build that survives it read a null
-                // pointer and was lucky.
+                // Named first: modernize-min-max-use-initializer-list crashes on a pointer call in the list (#1410).
                 auto const words = in.cellWidth(tile->words);
                 column.words = std::max({ column.words, words, tile->trend ? MinimumTrendCells : std::size_t { 0 } });
             }

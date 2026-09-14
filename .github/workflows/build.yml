@@ -742,7 +742,9 @@ jobs:
       # restates no version. `--installed` then IDENTIFIES what was installed -- the wheel's
       # METADATA says the declared version and its RECORD holds the binary's sha256 -- so a
       # green sweep below is a statement about that build and no other. `--target` keeps the
-      # binary inside the wheel's own tree, where it finds its resource headers.
+      # binary inside the wheel's own tree, where it finds its resource headers. The crashes
+      # that build is KNOWN to have are then asserted against it, so the release that fixes one
+      # goes red here, naming the workaround it retires (#1410).
       - name: "Install the declared clang-tidy"
         run: |
           set -euo pipefail
@@ -750,6 +752,7 @@ jobs:
           python3 -m pip install --no-deps --target "$site" "$(bash scripts/check-clang-tidy-version.sh --requirement "$GITHUB_WORKSPACE")"
           tidy="$(bash scripts/check-clang-tidy-version.sh --locate "$site" "$GITHUB_WORKSPACE")"
           bash scripts/run-check.sh scripts/check-clang-tidy-version.sh --installed "$tidy" "$GITHUB_WORKSPACE"
+          bash scripts/run-check.sh scripts/check-clang-tidy-known-defects.sh --installed "$tidy" "$GITHUB_WORKSPACE"
           echo "CLANG_TIDY_BIN=$tidy" >> "$GITHUB_ENV"
 
       # TLS on so the TlsSocket/TlsContext sources are also clang-tidy-checked,
@@ -1033,6 +1036,7 @@ jobs:
           python -m pip install --no-deps --target "$site" "$(bash scripts/check-clang-tidy-version.sh --requirement "$GITHUB_WORKSPACE")"
           tidy="$(bash scripts/check-clang-tidy-version.sh --locate "$site" "$GITHUB_WORKSPACE")"
           bash scripts/run-check.sh scripts/check-clang-tidy-version.sh --installed "$tidy" "$GITHUB_WORKSPACE"
+          bash scripts/run-check.sh scripts/check-clang-tidy-known-defects.sh --installed "$tidy" "$GITHUB_WORKSPACE"
           "$tidy" --version
           clang-cl --version
           echo "CLANG_TIDY_BIN=$tidy" >> "$GITHUB_ENV"

@@ -670,13 +670,24 @@ determinism rests on.
   - **The layout clause is not decoration.** The wheel's own bytes copied out of its tree pass the
     digest and the version and still analyse nothing: measured 2026-09-14, the copy reports
     `'stddef.h' file not found`, because clang-tidy resolves its resource headers relative to itself.
-  - **Measured before switching, so the switch changed no verdict.** Both analysers used one
-    apt-generated compile database: the 22.1.8 wheel against the apt snapshot CI installed
+  - **Measured before switching, and the measurement could not see a crash.** Both analysers used
+    one apt-generated compile database: the 22.1.8 wheel against the apt snapshot CI installed
     (`1:22.1.8~++20260714014902+ca7933e47d3a`).
     - Under `.clang-tidy`, 304 enabled checks each, no difference.
     - Every check both carry switched on, over 25 sampled units: 14711 diagnostic lines per side,
       identical. The same 25 units under `.clang-tidy` alone were all CLEAN on both sides, which
       could not have shown a difference.
+    - **Both comparisons read diagnostic LINES and never the exit status**, and a crashing analyser
+      prints no diagnostic line, so it scores as clean. On `a96e4e45` the gate was the real evidence,
+      because it builds every unit through the analyser and fails on its status. On the next master
+      the wheel segfaulted on a unit #1392 added, where apt, built from the same commit, exited 0.
+  - **A crash the declared build is KNOWN to have is a row of
+    `scripts/check-clang-tidy-known-defects.sh`, never a disabled check.** The tree names the
+    offending value first at every site, with a ONE-line comment naming the check and the tracking
+    issue, and each row plants the crashing shape, a named control and a unit the check reports.
+    Both CI jobs and the gate run `--installed` against the identified build, so the release that
+    fixes the defect goes red there and says what the change must remove. apt's silence on the same
+    shape is a null pointer read by luck, and it is not a reason to prefer apt: a crash fails CLOSED.
   - **One question, three askers.** `--resolve` hands a local run the binary `FASTCACHED_CLANG_TIDY`
     names, or the one installed at `${XDG_DATA_HOME:-~/.local/share}/fastcached/clang-tidy/<version>`,
     only after identifying it, and names the exact `pip install --target` command when it cannot.
@@ -5477,6 +5488,15 @@ its own directory -- and nothing checks an enumerator that is anchored under `sr
 is correct: an inclusion list naming this repository's own layout needs no roots.
 
 ## Open work
+
+- **[#1410](https://github.com/LASTRADA-Software/fastcached/issues/1410)** — the
+  declared clang-tidy build crashes in `modernize-min-max-use-initializer-list` on a call through a
+  function pointer inside a `std::max({...})` or `std::min({...})` list. The upstream check dereferences
+  every inner call's direct callee without a null test, and that line is unchanged on llvm `main`.
+  `DashboardPanel.cpp` names the value first at its one site (a census of all 684 gate units found
+  no other), and `check-clang-tidy-known-defects.sh` asserts the crash against the declared build.
+  It closes when the pin moves to a release carrying the fix: the guard's row flips red, and that
+  change removes the row, the site comments naming this issue, and this entry.
 
 - **[#829](https://github.com/LASTRADA-Software/fastcached/issues/829)** — six
   contexts are still `Undecided` in `check-merge-queue-contexts.sh`'s binding table
