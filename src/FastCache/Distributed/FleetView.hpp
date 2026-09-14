@@ -477,11 +477,19 @@ enum class CellTone : std::uint8_t
 /// @return The tone; `Plain` for a column with no freshness decoration or a name the section lacks.
 [[nodiscard]] CellTone FleetCellTone(FleetSection section, std::string_view name, std::uint64_t number);
 
+/// The tone a slot limit is dressed with, wherever it is named: a fleet table's cell, the page's chip, a node panel.
+///
+/// **The one place a limit is judged**, beside the page's chip for it: `registered` is fresh, a machine's own use or
+/// its memory is limited, a full scratch disk is an alert. A surface that dresses a limit asks here, so one limit is
+/// never an alert on one screen and merely limited on another.
+/// @param limit The limit.
+/// @return The tone.
+[[nodiscard]] CellTone SlotLimitTone(SlotLimit limit) noexcept;
+
 /// The tone the column @p name in @p section gives the text @p text.
 ///
-/// **The one place a limit is judged**, beside the page's chip for it: `registered` is fresh, a machine's
-/// own use or its memory is limited, a full scratch disk is an alert. A limit this build does not name is
-/// plain rather than a guess.
+/// A limit column's text is judged by `SlotLimitTone`. A limit this build does not name is plain rather than a
+/// guess.
 /// @param section The section the header belongs to.
 /// @param name The column's name.
 /// @param text The cell's text.
