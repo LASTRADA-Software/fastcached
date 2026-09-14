@@ -150,31 +150,51 @@ TEST_CASE("an absent figure is the marker in every format", "[cli][dashboard][gl
     for (auto const format: std::views::iota(0, static_cast<int>(FigureFormat::Last)))
     {
         auto const which = static_cast<FigureFormat>(format);
-        CHECK(FormatFigure(std::nullopt, which, "n/a") == "n/a");
-        CHECK(FormatFigure(std::numeric_limits<double>::quiet_NaN(), which, "?") == "?");
-        CHECK(FormatFigure(0.0, which, "n/a") != "n/a");
+        CHECK(FormatFigure(std::nullopt, which, "n/a").Text() == "n/a");
+        CHECK(FormatFigure(std::numeric_limits<double>::quiet_NaN(), which, "?").Text() == "?");
+        CHECK(FormatFigure(0.0, which, "n/a").Text() != "n/a");
     }
 }
 
 TEST_CASE("figures are written in their own units", "[cli][dashboard][glyphs]")
 {
-    CHECK(FormatFigure(1284991.0, FigureFormat::Count, "-") == "1 284 991");
-    CHECK(FormatFigure(0.0, FigureFormat::Count, "-") == "0");
-    CHECK(FormatFigure(999.0, FigureFormat::Count, "-") == "999");
-    CHECK(FormatFigure(1000.0, FigureFormat::Count, "-") == "1 000");
+    CHECK(FormatFigure(1284991.0, FigureFormat::Count, "-").Text() == "1 284 991");
+    CHECK(FormatFigure(0.0, FigureFormat::Count, "-").Text() == "0");
+    CHECK(FormatFigure(999.0, FigureFormat::Count, "-").Text() == "999");
+    CHECK(FormatFigure(1000.0, FigureFormat::Count, "-").Text() == "1 000");
     // A uint64 counter beyond what an integer rounding may return, written whole rather than wrapped.
-    CHECK(FormatFigure(18446744073709551615.0, FigureFormat::Count, "-") == "18 446 744 073 709 551 616");
+    CHECK(FormatFigure(18446744073709551615.0, FigureFormat::Count, "-").Text() == "18 446 744 073 709 551 616");
 
-    CHECK(FormatFigure(12480.0, FigureFormat::Rate, "-") == "12 480");
-    CHECK(FormatFigure(7.5, FigureFormat::Rate, "-") == "7.5");
-    CHECK(FormatFigure(0.942, FigureFormat::Percent, "-") == "94.2 %");
-    CHECK(FormatFigure(512.0, FigureFormat::Bytes, "-") == "512 B");
-    CHECK(FormatFigure(3.41 * 1024 * 1024 * 1024, FigureFormat::Bytes, "-") == "3.41 GiB");
-    CHECK(FormatFigure(248.1 * 1024 * 1024, FigureFormat::Bytes, "-") == "248.1 MiB");
-    CHECK(FormatFigure(1.84, FigureFormat::Seconds, "-") == "1.84 s");
+    CHECK(FormatFigure(12480.0, FigureFormat::Rate, "-").Text() == "12 480");
+    CHECK(FormatFigure(7.5, FigureFormat::Rate, "-").Text() == "7.5");
+    CHECK(FormatFigure(0.942, FigureFormat::Percent, "-").Text() == "94.2 %");
+    CHECK(FormatFigure(512.0, FigureFormat::Bytes, "-").Text() == "512 B");
+    CHECK(FormatFigure(3.41 * 1024 * 1024 * 1024, FigureFormat::Bytes, "-").Text() == "3.41 GiB");
+    CHECK(FormatFigure(248.1 * 1024 * 1024, FigureFormat::Bytes, "-").Text() == "248.1 MiB");
+    CHECK(FormatFigure(1.84, FigureFormat::Seconds, "-").Text() == "1.84 s");
     // A lease out for an hour and a half is read in hours, never as thousands of seconds.
-    CHECK(FormatFigure(90.0, FigureFormat::Seconds, "-") == "1.5 min");
-    CHECK(FormatFigure(5400.0, FigureFormat::Seconds, "-") == "1.5 h");
+    CHECK(FormatFigure(90.0, FigureFormat::Seconds, "-").Text() == "1.5 min");
+    CHECK(FormatFigure(5400.0, FigureFormat::Seconds, "-").Text() == "1.5 h");
+}
+
+TEST_CASE("a written figure splits where its number ends, and a grouping space stays in the number",
+          "[cli][dashboard][glyphs]")
+{
+    // G1 dims a unit and weights its number, so the split is what a panel dresses by. WHAT DISTINGUISHES: the
+    // grouping space in `1 284 991` is the number's while the space in `3.41 GiB` is the unit's -- a split taken at
+    // the first space passes the unit cases and cuts the count; and the absent marker is a number with no unit.
+    using Split = std::pair<std::string, std::string>;
+    auto const split = [](WrittenFigure const& figure) {
+        return Split { figure.number, figure.unit };
+    };
+    CHECK(split(FormatFigure(1284991.0, FigureFormat::Count, "-")) == Split { "1 284 991", "" });
+    CHECK(split(FormatFigure(12480.0, FigureFormat::Rate, "-")) == Split { "12 480", "" });
+    CHECK(split(FormatFigure(0.942, FigureFormat::Percent, "-")) == Split { "94.2", " %" });
+    CHECK(split(FormatFigure(512.0, FigureFormat::Bytes, "-")) == Split { "512", " B" });
+    CHECK(split(FormatFigure(1234.0 * 1024 * 1024 * 1024, FigureFormat::Bytes, "-")) == Split { "1.21", " TiB" });
+    CHECK(split(FormatFigure(1.84, FigureFormat::Seconds, "-")) == Split { "1.84", " s" });
+    CHECK(split(FormatFigure(5400.0, FigureFormat::Seconds, "-")) == Split { "1.5", " h" });
+    CHECK(split(FormatFigure(std::nullopt, FigureFormat::Bytes, "n/a")) == Split { "n/a", "" });
 }
 
 TEST_CASE("every frame line is exactly the frame's width on both text rungs", "[cli][dashboard][glyphs]")

@@ -538,9 +538,13 @@ TEST_CASE("a cache frame dresses its level and tier readings as figures, their l
              { FrameTone::Label, "no level is exported; connections_total is a TALLY" },
              { FrameTone::Label, "items" },
              { FrameTone::Label, "bytes" },
-             { FrameTone::Figure, "3.00 GiB" },
-             { FrameTone::Figure, "/ 4.00 GiB" },
-             { FrameTone::Figure, "75.0 %" },
+             // G1 dims a unit: the number is the figure run and its unit a label run, and the `/` between a
+             // reading and its limit is neither.
+             { FrameTone::Figure, "3.00" },
+             { FrameTone::Label, "GiB" },
+             { FrameTone::Figure, "4.00" },
+             { FrameTone::Figure, "75.0" },
+             { FrameTone::Label, "%" },
              { FrameTone::Label, "tier" },
              { FrameTone::Label, "index (RAM)" },
              { FrameTone::Label, "memory" },
@@ -2664,6 +2668,18 @@ namespace
     return std::nullopt;
 }
 
+/// A figure as a frame shows it, split where its number ends: `90.0 %` is `90.0` and `%`, `0.5/s` is `0.5` and `/s`,
+/// and `1 311` is all number. Read off the frame's text rather than asked of the writer, so a panel that wrote the
+/// parts into one run is caught.
+/// @param figure The figure's text.
+/// @return The number, and the unit without the blank before it.
+[[nodiscard]] std::pair<std::string, std::string> NumberAndUnit(std::string_view figure)
+{
+    auto const last = figure.find_last_of("0123456789");
+    REQUIRE(last != std::string_view::npos);
+    return { std::string { figure.substr(0, last + 1) }, Trimmed(figure.substr(last + 1)) };
+}
+
 /// §4's node presented at 80 by 24, two readings in, saying @p status about itself.
 /// @param status What the node says.
 /// @return What it presented.
@@ -2689,11 +2705,12 @@ TEST_CASE("a node panel dresses labels as labels, figures as figures, and a refu
     CHECK(ToneOver(sink, "refused/min") == FrameTone::Label);
     CHECK(ToneOver(sink, "90") == FrameTone::Alert);
     CHECK(ToneOver(sink, "no-slot") == FrameTone::Label);
-    CHECK(ToneOver(sink, "60/min") == FrameTone::Alert);
+    CHECK(ToneOver(sink, "60") == FrameTone::Alert);
+    CHECK(ToneOver(sink, "/min") == FrameTone::Label);
     CHECK(ToneOver(sink, "lease-expired") == FrameTone::Label);
-    CHECK(ToneOver(sink, "30/min") == FrameTone::Alert);
+    CHECK(ToneOver(sink, "30") == FrameTone::Alert);
     CHECK(ToneOver(sink, "unknown-fingerprint") == FrameTone::Label);
-    CHECK(ToneOver(sink, "0.0/min") == FrameTone::Figure);
+    CHECK(ToneOver(sink, "0.0") == FrameTone::Figure);
     CHECK(ToneOver(sink, "completed") == FrameTone::Label);
     // Where the caveat wraps is the layout's business (`a mean compile note too long...`), so each line's words are
     // read off the frame: from where the note begins to the edge, and the whole hanging line under it.
@@ -2767,9 +2784,9 @@ TEST_CASE("a cache rate block dresses its labels and beside words as labels and 
           "[cli][dashboard][panel][tone]")
 {
     // G1 over §3's rates, two readings in so every rate is a figure. WHAT DISTINGUISHES: a rate's label and figure
-    // are two runs; `since start` AFTER a figure is a label run as `evicted unfetched` BEFORE one is; and the figure
+    // are two runs; `since start` AFTER a figure is a label run as `evicted unfetched` BEFORE one is; the figure
     // between them is a figure run of its own, where one tone over the whole beside piece dresses words and value
-    // alike.
+    // alike; and a figure's unit (`%`, `/s`) is a label run apart from its number.
     auto sink = CollectingSink {};
     auto view = PanelView {
         CachePanel(),
@@ -2792,7 +2809,9 @@ TEST_CASE("a cache rate block dresses its labels and beside words as labels and 
         auto const line = RowLine(frame, rate.label);
         REQUIRE(line.has_value());
         CHECK(ToneOver(presented, rate.label) == FrameTone::Label);
-        CHECK(ToneOver(presented, FigureOf(Unwrap(line))) == FrameTone::Figure);
+        auto const [number, unit] = NumberAndUnit(FigureOf(Unwrap(line)));
+        CHECK(ToneOver(presented, number) == FrameTone::Figure);
+        CHECK((unit.empty() || ToneOver(presented, unit) == FrameTone::Label));
     }
     for (auto const* word: { "since start", "get", "set", "accepted", "evicted unfetched", "expired unfetched" })
     {
@@ -2805,5 +2824,8 @@ TEST_CASE("a cache rate block dresses its labels and beside words as labels and 
     auto const words = ColumnOf(Unwrap(expired), "expired unfetched ");
     REQUIRE(words.has_value());
     auto const figureFrom = Unwrap(words) + FakeCellWidth("expired unfetched ");
-    CHECK(ToneOver(presented, Trimmed(Columns(Unwrap(expired), figureFrom, 79 - figureFrom))) == FrameTone::Figure);
+    auto const [number, unit] = NumberAndUnit(Trimmed(Columns(Unwrap(expired), figureFrom, 79 - figureFrom)));
+    CHECK(ToneOver(presented, number) == FrameTone::Figure);
+    CHECK(unit == "/s");
+    CHECK(ToneOver(presented, unit) == FrameTone::Label);
 }
