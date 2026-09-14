@@ -7149,3 +7149,21 @@ if(TARGET fastcache-tui-objects AND (ENABLE_SANITIZER_ADDRESS OR ENABLE_SANITIZE
         TIMEOUT 120
     )
 endif()
+
+# ---------------------------------------------------------------------------
+# No first-party unit is compiled with a GLOBAL instruction-set flag (#1442): the check drives synthetic
+# compile databases and trees in both directions -- every refused spelling per compiler grammar, every
+# allowed Apple row, the three bracket arms, response files, a vendored unit declined, the target-pragma
+# arm with the tree's per-function attributes accepted, and the plant mode. It prints how many cases ran.
+add_test(
+    NAME "instruction-set-flags-selftest"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DFASTCACHED_SCRATCH_DIR=${CMAKE_CURRENT_BINARY_DIR}/instruction-set-flags-selftest"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-instruction-set-flags-selftest.cmake"
+)
+set_tests_properties("instruction-set-flags-selftest" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 60
+)
