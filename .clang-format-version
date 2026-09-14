@@ -1,0 +1,13 @@
+# The clang-format BUILD `Check C++ style` judges this tree with -- not just the major.
+#
+# CLANG_TOOLS_VERSION in .github/workflows/build.yml pins a MAJOR, and apt.llvm.org ships
+# rolling snapshots under one version number, so this file says which snapshot. The
+# contour-workflows format-on-edit hook writes only with a binary whose `--version` line
+# is listed here, character for character, and local-gate.sh refuses to `clang-format -i`
+# with any other (#1349).
+#
+# The version line is taken from that job's log, never from a local binary. When it is
+# wrong, `Check C++ style` says so and prints the line to put here; the major is held to
+# CLANG_TOOLS_VERSION by `ctest -R clang-format-version`.
+version: Ubuntu clang-format version 22.1.8 (++20260714014902+ca7933e47d3a-1~exp1~20260714135019.80)
+binary: clang-format-22

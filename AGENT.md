@@ -1054,12 +1054,17 @@ what differs between compilers, standard libraries, hosts and tool versions.
 - Run clang-format and clang-tidy **at the version CI pins**, in a build directory of its own;
   `PATH` resolving to an older binary reports clean in the way that means nothing.
 - **And `CLANG_TOOLS_VERSION` pins a MAJOR, not a BUILD.** apt.llvm.org ships rolling snapshots
-  under one version number, so two binaries a month apart print the same `--version` and only
-  `dpkg-query -W` tells them apart. What makes it expensive is that the remedy reads as already
-  applied — you have a binary with the right name, so the rule above looks satisfied while the
-  analyser is silent about a check it does not carry — and it invalidates every earlier verdict
+  under one version number, so two `clang-tidy` binaries a month apart print the same `--version`
+  and only `dpkg-query -W` tells them apart. What makes it expensive is that the remedy reads as
+  already applied — you have a binary with the right name, so the rule above looks satisfied while
+  the analyser is silent about a check it does not carry — and it invalidates every earlier verdict
   of that session, not just the one file. `clang-format` rides the same stream, so upgrade the
-  pair; read `apt-cache policy`, never the `--version` banner.
+  pair; read `apt-cache policy`, never `clang-tidy`'s `--version` banner.
+- **The formatter's BUILD is `.clang-format-version`, and a clang-format that is not that build
+  does not WRITE** — not the format-on-edit hook, not `local-gate.sh`'s `-i`. clang-format's
+  `--version` line, unlike clang-tidy's, carries the snapshot, so it is compared WHOLE.
+  `Check C++ style` asserts the build it installed BEFORE it formats, and
+  `ctest -R clang-format-version` holds the declared major to `CLANG_TOOLS_VERSION` (#1349).
 - A script that NAMES a tool version must name it **everywhere that version matters**. And a
   cached `find_program` result outlives every reason it was chosen, so check the pin against the
   cache, not only pass it. `ctest -R local-gate-selftest`.

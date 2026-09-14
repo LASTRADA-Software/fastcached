@@ -567,6 +567,37 @@ determinism rests on.
   hazard the bullet above names — a newer formatter reformatting code the older one
   accepted. Upgrade the pair together. No `llvm.sh` re-run is needed where the
   apt.llvm.org source is already configured; `apt-get update` surfaces the candidate.
+- **The formatter's BUILD is stated in `.clang-format-version`, and a formatter that is not
+  that build does not write.** clang-format's own `--version` line DOES carry the snapshot
+  (`Ubuntu clang-format version 22.1.8 (++20260714014902+ca7933e47d3a-1~exp1~…)`), unlike
+  clang-tidy's `LLVM version` line above, so for the formatter the banner is the
+  discriminator — compared WHOLE, since the release number alone is shared by every build
+  that matters here. Found (#1349) as the contour-workflows format-on-edit hook running
+  `clang-format -i` on every C++ edit with the first binary on `PATH` — Visual Studio's
+  22.1.3, against CI's 22.1.8 snapshot — which is the `-i`-at-another-version rule below,
+  automated and invisible. The hook now reads the declaration and writes nothing, saying
+  why, unless a candidate reports a declared build; `local-gate.sh` refuses its own `-i` the
+  same way; and `Check C++ style` asserts the formatter it installed is declared, BEFORE it
+  formats, so every green run proves the file and an apt.llvm.org roll is a red naming the
+  new build instead of a silent disagreement with every machine. That red lands on every
+  branch at once and is one line in a change of its own. The major is held to
+  `CLANG_TOOLS_VERSION` by `ctest -R clang-format-version` on the pull request that bumps it.
+
+  **Measured when it was written, and no reason to relax it**: VS 22.1.3 and PyPI's 22.1.8
+  both passed `--dry-run --Werror` over all 933 tracked C++ files on master `ce7c565d`, so
+  no build within 22.1.x disagreed with CI about THAT tree. That is a statement about one
+  tree, not about the builds — the next edit is a different tree. PyPI's wheel prints
+  `clang-format version 22.1.8` with no snapshot, so it is NOT the declared build either,
+  and the `pip download` recipe below yields a formatter for `--dry-run`, not one the hook
+  will write with.
+
+  On Windows the declared build lives in WSL, so the hook refuses there by default — the
+  correct answer, not a gap. A `clang-format-22` on the Windows `PATH` that runs
+  `wsl.exe -e clang-format-22 "$@"` (with `MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*'`) is
+  held to the declaration like any other candidate and needs no path translation, because
+  the hook formats from the file's directory on a relative path; measured at 0.42 s per
+  edit that writes, against 0.20 s for a refusal. That wrapper is one developer's machine,
+  which is why it goes on `PATH` and never into the declaration.
 - **A script that NAMES a tool version must name it everywhere that version matters, and
   the gate that says so had the defect it documents.** `local-gate.sh` resolved
   `clang-format-$V` by name, and then let the `clang-debug` preset take its analyser from
