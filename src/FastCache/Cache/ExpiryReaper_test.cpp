@@ -16,6 +16,7 @@
 #include <FastCache/Cache/StorageTestUtils.hpp>
 #include <FastCache/Core/BoundedDrain.hpp>
 #include <FastCache/Core/Clock.hpp>
+#include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 
@@ -537,6 +538,66 @@ class TickingDrainWait final: public IDrainWait
     std::exception_ptr _thrown;
 };
 
+/// How long a fixture wait's state must be quiet before its account stops calling it moving -- and
+/// how short a wait is too short for the account to say anything about that at all.
+constexpr auto ReadingWindow = std::chrono::milliseconds { 1000 };
+// A real timeout waits the whole guard, so the too-short reading is reachable only through a wait
+// clock that lies (a seam counting instead of measuring) -- never through a guard below the window.
+static_assert(TripHangGuard > ReadingWindow);
+
+/// What a fixture wait that ran out observed: the record `ReadWait` decides on.
+struct WaitReadings
+{
+    std::chrono::milliseconds elapsed;         ///< Real time the wait spent.
+    int changes;                               ///< How many times the reported state changed.
+    std::chrono::milliseconds sinceLastChange; ///< Real time since it last changed, or since the start.
+};
+
+/// What a fixture wait's account concludes. Private to this file: never stored or sent.
+enum class WaitReading : std::uint8_t
+{
+    TooShort,         ///< Shorter than the window: a stall and a slow thread cannot be told apart.
+    Moving,           ///< The state changed within the last window.
+    Stalled,          ///< The state was quiet for more than half of the wait.
+    QuietAfterMoving, ///< It moved, then went quiet for less: a backed-off cycle or a stuck thread.
+    Last,
+};
+
+/// One reading and the words the account prints for it.
+struct WaitReadingRow
+{
+    WaitReading reading;   ///< The reading this row describes.
+    std::string_view text; ///< What the account says.
+};
+
+constexpr EnumTable<WaitReading, WaitReadingRow> WaitReadingTexts { {
+    { .reading = WaitReading::TooShort, .text = "INCONCLUSIVE: too short a wait to tell a stall from a slow thread" },
+    { .reading = WaitReading::Moving, .text = "still MOVING at the guard: slow, or spinning" },
+    { .reading = WaitReading::Stalled, .text = "STALLED: nothing it reports moved for most of the wait" },
+    { .reading = WaitReading::QuietAfterMoving,
+      .text = "INCONCLUSIVE: it moved, then went quiet -- a backed-off cycle and a stuck thread both read so" },
+} };
+static_assert(RowsInEnumeratorOrder(WaitReadingTexts, &WaitReadingRow::reading));
+
+/// Decide what a fixture wait that ran out says about the threads it waited on.
+///
+/// **Four outcomes, because two would each claim the cases between them** (#1433). A wait shorter
+/// than the window cannot tell a stall from a slow thread at all, and a state that moved and then
+/// went quiet for part of the wait is what a backed-off cycle and a stuck thread BOTH look like. A
+/// pure function over the record, so every outcome is driven by a case rather than by a hung run.
+/// @param readings What the wait observed.
+/// @return The reading.
+[[nodiscard]] constexpr WaitReading ReadWait(WaitReadings const& readings) noexcept
+{
+    if (readings.elapsed < ReadingWindow)
+        return WaitReading::TooShort;
+    if (readings.sinceLastChange <= ReadingWindow)
+        return WaitReading::Moving;
+    if (readings.sinceLastChange * 2 > readings.elapsed)
+        return WaitReading::Stalled;
+    return WaitReading::QuietAfterMoving;
+}
+
 /// Tick the case's reactor until @p reached holds, for at most `TripHangGuard` of REAL time.
 ///
 /// **Bounded by time on a monotonic clock, never by a count of ticks** (#1433). What these cases
@@ -579,33 +640,23 @@ template <typename Predicate, typename State>
     if (result == DrainResult::Drained)
         return true;
     auto const ended = DefaultDrainWait().Now();
-    auto const waited = ended - started;
-    auto const quiet = ended - lastChange;
-    auto const ms = [](auto span) {
-        return std::chrono::duration_cast<std::chrono::milliseconds>(span).count();
+    auto const readings = WaitReadings {
+        .elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(ended - started),
+        .changes = changes,
+        .sinceLastChange = std::chrono::duration_cast<std::chrono::milliseconds>(ended - lastChange),
     };
-    // Four readings, because two would each claim the cases between them: a wait shorter than the
-    // window cannot tell a stall from a slow thread at all, and a state that moved and then went
-    // quiet for part of the wait is what a backed-off cycle and a stuck thread BOTH look like.
-    constexpr auto Window = 1s;
-    auto const reading =
-        waited < Window   ? "INCONCLUSIVE: too short a wait to tell a stall from a slow thread"
-        : quiet <= Window ? "still MOVING at the guard: slow, or spinning"
-        : quiet * 2 > waited
-            ? "STALLED: nothing it reports moved for most of the wait"
-            : "INCONCLUSIVE: it moved, then went quiet -- a backed-off cycle and a stuck thread both read so";
     UNSCOPED_INFO(std::format("TickUntil gave up waiting for {} after {} ms of real time and {} ticks; the reactor "
                               "holds {} submission(s) and {} timer(s). State at the end: {}. It changed {} time(s), "
                               "and nothing changed in the last {} ms: {}.",
                               what,
-                              ms(waited),
+                              readings.elapsed.count(),
                               ticking.Ticks(),
                               f.reactor.PendingSubmissions(),
                               f.reactor.PendingTimers(),
                               seen,
-                              changes,
-                              ms(quiet),
-                              reading));
+                              readings.changes,
+                              readings.sinceLastChange.count(),
+                              WaitReadingTexts.at(static_cast<std::size_t>(ReadWait(readings))).text));
     return false;
 }
 
@@ -1289,4 +1340,46 @@ TEST_CASE("A hop back that could not be handed to the reactor still brings the s
 
     CHECK(reactor.Refused() == 1);
     CHECK_FALSE(std::ranges::any_of(logger.Snapshot(), [](auto const& record) { return record.level == LogLevel::Error; }));
+}
+
+// `ReadWait` is a classifier, and a classifier nothing drives through an outcome cannot be trusted to
+// report it: each reading has its own case over a synthesised record, thresholds' edges included, so
+// no reading is known only from a run that waited out the hang guard.
+
+TEST_CASE("A fixture wait shorter than the reading window is too short to tell a stall from a slow thread",
+          "[expiry][fixture]")
+{
+    // The shape a wait clock that counts instead of measuring produces: no real time at all.
+    CHECK(ReadWait({ .elapsed = 0ms, .changes = 0, .sinceLastChange = 0ms }) == WaitReading::TooShort);
+    // Just inside the window, whatever the state did.
+    CHECK(ReadWait({ .elapsed = 999ms, .changes = 0, .sinceLastChange = 999ms }) == WaitReading::TooShort);
+    CHECK(ReadWait({ .elapsed = 999ms, .changes = 5, .sinceLastChange = 0ms }) == WaitReading::TooShort);
+}
+
+TEST_CASE("A fixture wait whose state changed within the last window was still moving", "[expiry][fixture]")
+{
+    // The cycling neuter's measured record: 18 changes, the last 542 ms before the guard.
+    CHECK(ReadWait({ .elapsed = 10000ms, .changes = 18, .sinceLastChange = 542ms }) == WaitReading::Moving);
+    // Both edges at once: a wait of exactly the window is long enough to read, and quiet of exactly
+    // the window still counts as moving.
+    CHECK(ReadWait({ .elapsed = 1000ms, .changes = 1, .sinceLastChange = 1000ms }) == WaitReading::Moving);
+    CHECK(ReadWait({ .elapsed = 10000ms, .changes = 3, .sinceLastChange = 1000ms }) == WaitReading::Moving);
+}
+
+TEST_CASE("A fixture wait quiet for more than half of it was stalled", "[expiry][fixture]")
+{
+    // The stalled neuter's measured record: quiet for 9995 ms of 10000.
+    CHECK(ReadWait({ .elapsed = 10000ms, .changes = 2, .sinceLastChange = 9995ms }) == WaitReading::Stalled);
+    // Never changed at all.
+    CHECK(ReadWait({ .elapsed = 10000ms, .changes = 0, .sinceLastChange = 10000ms }) == WaitReading::Stalled);
+    // One millisecond past half.
+    CHECK(ReadWait({ .elapsed = 10000ms, .changes = 1, .sinceLastChange = 5001ms }) == WaitReading::Stalled);
+}
+
+TEST_CASE("A fixture wait that moved and then went quiet for at most half of it is inconclusive", "[expiry][fixture]")
+{
+    // Exactly half: not MORE than half, so not stalled.
+    CHECK(ReadWait({ .elapsed = 10000ms, .changes = 4, .sinceLastChange = 5000ms }) == WaitReading::QuietAfterMoving);
+    // One millisecond past the window.
+    CHECK(ReadWait({ .elapsed = 10000ms, .changes = 7, .sinceLastChange = 1001ms }) == WaitReading::QuietAfterMoving);
 }
