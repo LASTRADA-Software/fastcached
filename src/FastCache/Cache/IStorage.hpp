@@ -124,6 +124,9 @@ struct StorageStats
     /// Populated by `WriteErrorReportingStorage`; 0 for backends not wrapped
     /// by it.
     std::uint64_t writeErrors { 0 };
+
+    /// Field by field. What a decoded live-stats reading is compared with.
+    [[nodiscard]] bool operator==(StorageStats const&) const = default;
 };
 
 /// One cache's statistics, kept apart by the tier holding them.

@@ -69,6 +69,7 @@ target_sources(FastCache
         Core/Base64.cpp
         Server/AdminCredential.cpp
         Metrics/PrometheusFormatter.cpp
+        Metrics/StatsReading.cpp
         Net/BlockingConnector.cpp
         Net/BlockingSocket.cpp
         Net/ConnectFlow.cpp
