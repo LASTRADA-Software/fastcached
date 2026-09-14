@@ -16,12 +16,14 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <bit>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <format>
 #include <optional>
 #include <ranges>
+#include <span>
 #include <utility>
 #include <vector>
 
@@ -289,6 +291,66 @@ TEST_CASE("The layout digest moves when a catalogue row moves", "[metrics][lives
 
     // And the control: the catalogue itself digests to the published layout.
     CHECK(StatsReadingWire::LayoutDigest(CounterTable) == StatsReadingLayout);
+}
+
+TEST_CASE("An IMetricsSink counter travels at its ordinal and a reordered enum is refused as a foreign layout",
+          "[metrics][livestats]")
+{
+    // instruments (#1366), via team-lead: `IMetricsSink::Counter` said its ordinals were private while this codec
+    // sends counters by position. WHAT DISTINGUISHES, in two halves. POSITION: a reading carrying ONE counter sets
+    // exactly that ordinal's bit and writes its value first -- a codec keyed by name, or by catalogue order apart
+    // from the enum, would set another bit. DETECTION: the catalogue follows the enum row for row, so a reordered
+    // enum is two swapped rows; that digest differs, and a reading stamped with it is refused `ForeignLayout`
+    // rather than decoded shifted.
+    constexpr auto Value = std::uint64_t { 0x1122'3344'5566'7788ULL };
+    constexpr auto LayoutBytes = std::size_t { 8 };
+    auto const rows = CounterTable.size();
+    auto const bitmapBytes = (rows + 7) / 8;
+    REQUIRE(rows == static_cast<std::size_t>(IMetricsSink::Counter::Last));
+
+    auto const onlyAt = [&](IMetricsSink::Counter counter) {
+        auto reading = StatsReading {};
+        reading.counters[static_cast<std::size_t>(counter)] = Value;
+        return EncodeStatsReading(reading);
+    };
+    auto const bigEndianAt = [](std::vector<std::byte> const& bytes, std::size_t at) {
+        auto value = std::uint64_t { 0 };
+        for (auto const byte: std::span { bytes }.subspan(at, 8))
+            value = (value << 8U) | std::to_integer<std::uint64_t>(byte);
+        return value;
+    };
+
+    for (auto const counter: { IMetricsSink::Counter::ConnectionsTotal,
+                               IMetricsSink::Counter::ConnectionsTotalTls,
+                               IMetricsSink::Counter::LiveSubscriptionsRefusedEndpointBusy })
+    {
+        auto const ordinal = static_cast<std::size_t>(counter);
+        CAPTURE(ordinal);
+        auto const bytes = onlyAt(counter);
+        REQUIRE(bytes.size() >= LayoutBytes + bitmapBytes + 8);
+        auto const bitmap = std::span { bytes }.subspan(LayoutBytes, bitmapBytes);
+        auto setBits = 0;
+        for (auto const byte: bitmap)
+            setBits += std::popcount(std::to_integer<unsigned>(byte));
+        CHECK(setBits == 1);
+        CHECK((bitmap[ordinal / 8] & static_cast<std::byte>(1U << (ordinal % 8))) != std::byte { 0 });
+        CHECK(bigEndianAt(bytes, LayoutBytes + bitmapBytes) == Value);
+    }
+
+    // A reorder of two neighbouring enumerators is those two catalogue rows swapped.
+    auto reordered = CounterTable;
+    std::swap(reordered[1], reordered[2]);
+    auto const foreign = StatsReadingWire::LayoutDigest(reordered);
+    REQUIRE(foreign != StatsReadingLayout);
+
+    auto bytes = onlyAt(IMetricsSink::Counter::ConnectionsTotalTls);
+    REQUIRE(DecodeStatsReading(bytes).has_value()); // the control: this build's own stamp decodes
+    for (auto const i: std::views::iota(std::size_t { 0 }, LayoutBytes))
+        bytes[i] = static_cast<std::byte>((foreign >> (8U * (LayoutBytes - 1 - i))) & 0xFFU);
+    REQUIRE(DeclaredStatsReadingLayout(bytes) == std::optional { foreign });
+    auto const refused = DecodeStatsReading(bytes);
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error() == StatsReadingFault::ForeignLayout);
 }
 
 TEST_CASE("This build's live-stats layout is the pinned one", "[metrics][livestats]")

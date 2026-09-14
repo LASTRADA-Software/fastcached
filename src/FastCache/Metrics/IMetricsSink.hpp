@@ -40,24 +40,33 @@ class IMetricsSink
     IMetricsSink& operator=(IMetricsSink&&) = delete;
     virtual ~IMetricsSink() = default;
 
-    /// **ORDINALS ARE PRIVATE. Reorder freely; nothing outside this process reads them.** (#308)
+    /// **TRANSMITTED: the ordinals travel** (#1399). A live-stats snapshot carries every counter
+    /// BY POSITION: `StatsReading::counters` is indexed by this enum and `EncodeStatsReading`
+    /// writes it in ordinal order with no name beside it. Until #1399 this said *ordinals are
+    /// private, reorder freely* (#308) -- true then, when `AtomicMetricsSink`'s array below was
+    /// the only ordinal use -- and the sentence outlived the fact.
     ///
-    /// Said out loud because silence used to mean both this and its opposite:
-    /// `Distributed::FleetMetric` indexes a history FILE and `StorageTier` crosses a
-    /// WIRE, and at their declarations all three enums looked the same. What makes this
-    /// one private is that every consumer names an ENUMERATOR -- the refusal tables, the
-    /// catalog, the fleet page's reads -- and the only ordinal use is
-    /// `AtomicMetricsSink`'s array index below, which is built and destroyed with the
-    /// process. What an operator or a peer ever sees is `MetricsCatalog`'s exported
-    /// name, which travels with the row rather than with the position.
+    /// **What keeps a reorder safe is DETECTION, not a frozen order.** `StatsReadingLayout` folds
+    /// every `MetricsCatalog` row's exported name in row order, and the catalog follows this enum
+    /// row for row (`RowsInEnumeratorOrder`). So inserting, removing or moving an enumerator
+    /// moves the digest, and a node and a client of different orders refuse each other by name
+    /// (`StatsReadingFault::ForeignLayout`) rather than reading one counter's figure as its
+    /// neighbour's. The case "An IMetricsSink counter travels at its ordinal and a reordered enum
+    /// is refused as a foreign layout" pins both halves. Before production-ready a reorder is
+    /// therefore ALLOWED: it is a layout change, so the pinned layout constant moves in the same
+    /// change, and nodes and live-stats clients upgrade together.
     ///
-    /// So a reorder here is invisible, and an omission is a build failure rather than a
-    /// silent one: `MetricsCatalog` is an `EnumTable` guarded by `RowsInEnumeratorOrder`,
-    /// so a row that stops following the enum stops compiling. `Last` is deliberately
-    /// left implicit -- only `ConnectionsTotal = 0` carries a value, which is
-    /// `readability-enum-initial-value`'s accepted only-the-first form -- because a column
-    /// of explicit ordinals would assert a contract this enum does not have, and the next
-    /// person to add a counter would preserve it.
+    /// **Not to be mistaken for "invisible".** `/metrics` and the fleet history name a counter by
+    /// the catalog's exported name and do not move -- which is why a reorder LOOKS free -- but
+    /// every live-stats client of the old order stops reading this node. Nor is the digest a
+    /// licence past the production-ready declaration, when a reorder becomes a wire break.
+    ///
+    /// **No `= N` column**, deliberately: the table indexes by value, so values stay dense and in
+    /// order whatever they say, and an insertion renumbers every later row either way -- a
+    /// column would assert a stability it cannot deliver, while the digest refuses every order
+    /// change, a snapshot field's included. Only `ConnectionsTotal = 0` carries a value
+    /// (`readability-enum-initial-value`'s accepted form), and an omission is a build failure:
+    /// `MetricsCatalog` is an `EnumTable` guarded by `RowsInEnumeratorOrder`.
     enum class Counter : std::uint8_t
     {
         ConnectionsTotal = 0,
