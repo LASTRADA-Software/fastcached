@@ -40,7 +40,7 @@ namespace
                      .left = Wire::LiveEventKind::MemberLeft },
         LiveSetRow { .facts = &LiveEventProbe::workers,
                      .joined = Wire::LiveEventKind::WorkerRegistered,
-                     .left = Wire::LiveEventKind::WorkerExpired },
+                     .left = Wire::LiveEventKind::WorkerLeft },
     };
 
     /// The scalars, in the order their events are reported.
