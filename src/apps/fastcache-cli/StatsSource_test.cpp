@@ -268,13 +268,11 @@ TEST_CASE("the build a /metrics body names round-trips through the parser to its
     // WHAT DISTINGUISHES: the client's reader against the server's own renderer, with a value carrying every
     // escape. A reader that forgot to unescape, or split the series at a quoted space, reads something else.
     constexpr std::string_view Awkward = "1.0 \"vendor\"\\build\nline";
-    auto row = InfoTable.front();
-    row.value = Awkward;
-    auto const reading = ParsePrometheus(RenderInfoMetric(row));
+    auto const reading = ParsePrometheus(RenderInfoMetric(InfoTable.front(), Awkward));
     REQUIRE(reading.fields.size() == 1);
     CHECK(VersionIn(reading, StatsOrigin::Metrics) == std::string { Awkward });
 
-    auto const real = ParsePrometheus(RenderInfoMetric(InfoTable.front()));
+    auto const real = ParsePrometheus(RenderInfoMetric(InfoTable.front(), VersionString));
     CHECK(VersionIn(real, StatsOrigin::Metrics) == std::string { VersionString });
 }
 

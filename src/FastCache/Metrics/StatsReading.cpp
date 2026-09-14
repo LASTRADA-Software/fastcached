@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#include <FastCache/Core/Version.hpp>
 #include <FastCache/Metrics/MetricsCatalog.hpp>
 #include <FastCache/Metrics/StatsReading.hpp>
 
@@ -9,7 +10,7 @@ namespace FastCache
 
 StatsReading CaptureStatsReading(IMetricsSink const& metrics, MetricsSnapshot const& snapshot)
 {
-    StatsReading reading { .counters = {}, .snapshot = snapshot };
+    StatsReading reading { .counters = {}, .snapshot = snapshot, .version = std::string { VersionString } };
     // Driven by the catalogue, not by the enum's range: the catalogue is what every encoding
     // walks, so a row is captured exactly when an encoder could ask for it. `Carries` is asked
     // before `Read` for the reason `RenderPrometheus` gives -- a skewed sink answers `Read`

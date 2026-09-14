@@ -57,8 +57,9 @@ TEST_CASE("RenderInfoMetric escapes a label value the exposition format would mi
     // A version string is operator-supplied text (`-DFASTCACHED_VERSION_STRING`), so a
     // quote in it must not end the label early and a line feed must not start a new
     // sample.
-    auto const rendered = RenderInfoMetric(InfoDescriptor {
-        .prometheusName = "x_info", .help = "h", .label = "version", .value = "1.0 \"vendor\"\\build\nline" });
+    auto const rendered = RenderInfoMetric(
+        InfoDescriptor { .prometheusName = "x_info", .help = "h", .label = "version", .value = &StatsReading::version },
+        "1.0 \"vendor\"\\build\nline");
     CHECK(rendered == "# HELP x_info h\n# TYPE x_info gauge\nx_info{version=\"1.0 \\\"vendor\\\"\\\\build\\nline\"} 1\n");
 }
 

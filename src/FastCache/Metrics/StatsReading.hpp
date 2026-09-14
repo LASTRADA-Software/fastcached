@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <string>
 #include <vector>
 
 namespace FastCache
@@ -237,11 +238,21 @@ struct StatsReading
     /// Everything else, as the snapshot provider stated it. Every absence it models stays one.
     MetricsSnapshot snapshot {};
 
+    /// The build that captured this reading, as `VersionString` spells it; empty when whoever produced the
+    /// reading did not say.
+    ///
+    /// **In the reading rather than beside one encoding**, because a live-stats panel titles itself with it
+    /// and reads every figure from this struct: `/metrics` carrying it as `fastcached_build_info` while the
+    /// binary form carried nothing would be one fact stated by one encoding only (#134, #1399). Captured,
+    /// not a constant each encoder reads, so a DECODED reading states the build that sent it rather than the
+    /// build decoding it.
+    std::string version {};
+
     /// Every counter and every block. What the round trip through the binary form must preserve.
     [[nodiscard]] bool operator==(StatsReading const&) const = default;
 };
 
-/// Read the sink and a per-call snapshot into one `StatsReading`.
+/// Read the sink and a per-call snapshot into one `StatsReading`, stamped with this build's version.
 ///
 /// The one place the counters are read, so the question #1353 asks -- does this sink carry
 /// the row at all? -- is asked once, here, rather than by every encoding.
