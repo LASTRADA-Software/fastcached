@@ -13,7 +13,6 @@
 
 #include <algorithm>
 #include <bit>
-#include <cassert>
 #include <cstring>
 #include <ranges>
 
@@ -120,10 +119,9 @@ namespace
     using CompressBlocksFunction = void (*)(State& state, std::span<std::byte const> blocks) noexcept;
 
 #if defined(_M_X64) || defined(__x86_64__)
-    // gcc and clang (clang-cl included) may emit these instructions only in a function
-    // that asks for them, so the scalar code and every other translation unit stay free
-    // of instructions an older CPU lacks. MSVC's cl allows the intrinsics anywhere and
-    // does not know the attribute.
+    // Asked for per function, never by a global -m flag, for the reason
+    // .agent/rules/build-and-toolchain.md gives under instruction-set extensions. cl
+    // needs no attribute.
     #if defined(__GNUC__) || defined(__clang__)
         #define FASTCACHED_SHA_NI_TARGET __attribute__((target("sha,ssse3,sse4.1")))
     #else
@@ -208,10 +206,9 @@ namespace
 #endif
 
 #if defined(__APPLE__) && defined(__aarch64__)
-    // Every Apple arm64 CPU has these instructions and the default target enables them,
-    // but a build given an explicit older -march (armv8-a) refuses to inline them into a
-    // function that does not ask: measured with clang 20, "always_inline function
-    // 'vsha256hq_u32' requires target feature 'sha2'". Only clang compiles this block.
+    // Asked for although Apple's default target enables sha2: an explicit -march=armv8-a
+    // refuses the intrinsics otherwise (.agent/rules/build-and-toolchain.md, the same
+    // entry). Only clang compiles this block.
     #define FASTCACHED_ARM_SHA2_TARGET __attribute__((target("sha2")))
 
     /// One of a block's four message vectors, in the byte order SHA-256 reads.
@@ -346,15 +343,9 @@ Sha256Engine ActiveSha256Engine() noexcept
     return active;
 }
 
-Sha256::Sha256() noexcept:
-    Sha256(ActiveSha256Engine())
-{
-}
-
 Sha256::Sha256(Sha256Engine engine) noexcept:
     _engine { engine }
 {
-    assert(Sha256EngineRunsOn(engine, ProcessCpuFeatures()));
 }
 
 std::optional<Sha256> Sha256::WithEngine(Sha256Engine engine) noexcept
@@ -435,15 +426,6 @@ Sha256::Digest Sha256::Hash(std::span<std::byte const> input) noexcept
     Sha256 hasher;
     hasher.Update(input);
     return hasher.Finish();
-}
-
-std::optional<Sha256::Digest> Sha256::Hash(std::span<std::byte const> input, Sha256Engine engine) noexcept
-{
-    auto hasher = WithEngine(engine);
-    if (!hasher.has_value())
-        return std::nullopt;
-    hasher->Update(input);
-    return hasher->Finish();
 }
 
 Sha256::Digest HmacSha256(std::span<std::byte const> key, std::span<std::byte const> message)

@@ -47,9 +47,7 @@ enum class Sha256Engine : std::uint8_t
 [[nodiscard]] Sha256Engine SelectSha256Engine(CpuFeatures const& features) noexcept;
 
 /// The engine this process uses by default: `SelectSha256Engine` over
-/// `DetectCpuFeatures()`, taken once. Caching it is safe for the reason
-/// `CpuFeatures` states: the CPU's features cannot change while the process runs,
-/// so the answer cannot go stale.
+/// `DetectCpuFeatures()`, taken once, which `CpuFeatures` says is safe.
 /// @return The process-wide default engine.
 [[nodiscard]] Sha256Engine ActiveSha256Engine() noexcept;
 
@@ -94,7 +92,7 @@ class Sha256
     using Digest = std::array<std::byte, DigestSize>;
 
     /// A hasher on the process's default engine (`ActiveSha256Engine`).
-    Sha256() noexcept;
+    Sha256() noexcept = default;
 
     /// A hasher on a chosen engine, or nothing when this process's CPU cannot run it.
     ///
@@ -125,12 +123,6 @@ class Sha256
     /// @return The 32-byte digest.
     [[nodiscard]] static Digest Hash(std::span<std::byte const> input) noexcept;
 
-    /// One-shot, on a chosen engine.
-    /// @param input Bytes to hash.
-    /// @param engine The engine.
-    /// @return The 32-byte digest, or `std::nullopt` when this process's CPU cannot run @p engine.
-    [[nodiscard]] static std::optional<Digest> Hash(std::span<std::byte const> input, Sha256Engine engine) noexcept;
-
   private:
     /// A hasher on @p engine, which the caller has already checked runs here.
     /// @param engine The engine.
@@ -141,7 +133,7 @@ class Sha256
     void CompressBlocks(std::span<std::byte const> blocks) noexcept;
 
     /// Which engine compresses.
-    Sha256Engine _engine;
+    Sha256Engine _engine { ActiveSha256Engine() };
 
     /// The eight working variables, in FIPS 180-4's initial state.
     std::array<std::uint32_t, 8> _state { 0x6a09e667U, 0xbb67ae85U, 0x3c6ef372U, 0xa54ff53aU,

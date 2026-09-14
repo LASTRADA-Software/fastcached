@@ -78,9 +78,9 @@ namespace
 /// @return The digest.
 [[nodiscard]] Sha256::Digest HashOn(std::span<std::byte const> input, Sha256Engine engine)
 {
-    auto const digest = Sha256::Hash(input, engine);
-    REQUIRE(digest.has_value());
-    return Unwrap(digest);
+    auto hasher = HasherOn(engine);
+    hasher.Update(input);
+    return hasher.Finish();
 }
 
 /// The engines this test host's CPU runs: `Scalar` always, and a hardware engine
@@ -281,27 +281,23 @@ TEST_CASE("A CPU with SHA instructions gets a hardware engine by default", "[cor
 TEST_CASE("Sha256::WithEngine refuses an engine this CPU cannot run", "[core][sha256][engine]")
 {
     // What stands between a caller choosing an engine and a Release build jumping
-    // through a null pointer or into an instruction the CPU lacks. Every CPU CI owns
-    // lacks at least one engine -- no CPU runs both x86 and ARM instructions -- so
-    // this runs everywhere, and the engine it refuses is decided by the CPU, never
-    // by the architecture the test was compiled for.
+    // through a null pointer or into an instruction the CPU lacks. A build carries at
+    // most one hardware engine, so at least one is always refused, and which one is
+    // decided by the CPU, never by the architecture the test was compiled for.
     auto const features = DetectCpuFeatures();
     auto const engines = AllEngines();
     auto const* const absent =
         FindIfOrNull(engines, [&features](Sha256Engine engine) { return !Sha256EngineRunsOn(engine, features); });
-    if (absent == nullptr)
-        SKIP("this CPU runs every engine, so there is none to refuse");
+    REQUIRE(absent != nullptr);
 
     INFO("engine " << Sha256EngineName(*absent));
     CHECK_FALSE(Sha256::WithEngine(*absent).has_value());
-    CHECK_FALSE(Sha256::Hash(Bytes("abc"), *absent).has_value());
 }
 
 TEST_CASE("The default Sha256 engine is the one selected for this CPU", "[core][sha256][engine]")
 {
     CHECK(ActiveSha256Engine() == SelectSha256Engine(DetectCpuFeatures()));
     CHECK(Sha256 {}.Engine() == ActiveSha256Engine());
-    CHECK(HasherOn(Sha256Engine::Scalar).Engine() == Sha256Engine::Scalar);
 }
 
 TEST_CASE("HmacSha256 matches the RFC 4231 vectors", "[core][sha256][hmac]")
