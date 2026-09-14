@@ -2290,6 +2290,20 @@ std::string RaftSelfEndpoint(NodeConfig const& cfg)
     return FormatHostPort(cfg.raftSelf, bound.front().port);
 }
 
+ConsensusDialAddress ConsensusDialAddressOf(NodeConfig const& cfg)
+{
+    if (!RunsConsensus(cfg))
+        return ConsensusDialAddress { .state = ConsensusDialState::NoConsensus, .endpoint = {} };
+
+    if (auto const* const self = ClusterSelfMember(cfg); self != nullptr && !self->raftEndpoint.empty())
+        return ConsensusDialAddress { .state = ConsensusDialState::Stated, .endpoint = self->raftEndpoint };
+
+    if (auto endpoint = RaftSelfEndpoint(cfg); !endpoint.empty())
+        return ConsensusDialAddress { .state = ConsensusDialState::Stated, .endpoint = std::move(endpoint) };
+
+    return ConsensusDialAddress { .state = ConsensusDialState::Unstated, .endpoint = {} };
+}
+
 std::string AdvertisedEndpoint(NodeConfig const& cfg)
 {
     // The flag wins whenever it was given. Written ONCE -- `main` hands the result to

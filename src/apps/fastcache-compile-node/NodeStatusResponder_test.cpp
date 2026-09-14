@@ -209,6 +209,8 @@ struct ConfigShape
     bool tlsPair { false };       ///< Name a certificate AND a key.
     bool tlsCertOnly { false };   ///< Name a certificate and no key.
     bool tlsSelfSigned { false }; ///< Ask for material to be made.
+    bool raftWildcard { false };  ///< Give `--listen-raft` a bare port, which binds the wildcard.
+    std::string_view raftSelf {}; ///< `--raft-self`, or nothing.
 };
 
 /// Build a configuration of that shape.
@@ -221,7 +223,8 @@ struct ConfigShape
     if (shape.admin)
         cfg.adminListen = std::format("127.0.0.1:{}", AdminPort);
     if (shape.raft)
-        cfg.raftListen = std::format("127.0.0.1:{}", RaftPort);
+        cfg.raftListen = shape.raftWildcard ? std::format("{}", RaftPort) : std::format("127.0.0.1:{}", RaftPort);
+    cfg.raftSelf = std::string { shape.raftSelf };
     if (shape.discovery)
         cfg.discoveryAddress = std::format("0.0.0.0:{}", DiscoveryPort);
     if (shape.tlsPair || shape.tlsCertOnly)
@@ -705,6 +708,36 @@ TEST_CASE("Each scheduler role crosses the wire as its own tag, with the leader 
     // Empty is the READING -- no leader is known -- and the role beside it is what says
     // this node was in a position to know.
     CHECK(undecided.runtime.leaderEndpoint.empty());
+}
+
+TEST_CASE("A consensus node reports the address peers DIAL, which is not the one it bound", "[node][node-status][consensus]")
+{
+    // #1328. The ordinary joiner binds the wildcard and names where it is reached, so the
+    // one reading that distinguishes the dial address from the bind is that one: a bound
+    // `127.0.0.1` fixture would print the same string under both.
+    ManualClock clock;
+    Fixture const joiner { { .raft = true, .raftWildcard = true, .raftSelf = "10.0.0.4" }, clock };
+    auto const fields = joiner.status.Describe();
+
+    CHECK(fields.runtime.consensusEndpoint == std::optional { std::format("10.0.0.4:{}", RaftPort) });
+    // The surface row goes on reporting the port it BOUND, and only that.
+    CHECK(Unwrap(SurfaceOf(fields, Wire::WireSurface::Raft)).port == RaftPort);
+
+    SECTION("and none on a node that runs no consensus, even one naming --raft-self")
+    {
+        // `RunsConsensus` is the port, never the name, so the name alone states nothing.
+        Fixture const worker { { .raftSelf = "10.0.0.4" }, clock };
+        CHECK_FALSE(worker.status.Describe().runtime.consensusEndpoint.has_value());
+    }
+
+    SECTION("and none, rather than an empty one, on a consensus node that names itself neither way")
+    {
+        // The configuration startup refuses; a status source built over it must still not
+        // engage the field with nothing in it, which the wire would read back as absent
+        // anyway and a direct reader would render as a blank address.
+        Fixture const unstated { { .raft = true, .raftWildcard = true }, clock };
+        CHECK_FALSE(unstated.status.Describe().runtime.consensusEndpoint.has_value());
+    }
 }
 
 TEST_CASE("ToolchainStateFor maps a served count onto the two states it decides", "[node][node-status][toolchains]")

@@ -477,8 +477,8 @@ foreach(docFile IN LISTS docFiles)
             endif()
             if(fenceState STREQUAL "transcript")
                 # An output row: a bare word in column one, then an address or a
-                # `-`. The `$` line, the `notes:` block and the wrapped
-                # continuation of the command all fail the two-column shape.
+                # `-`. The `$` line, the `dialled at:` and `notes:` blocks and the
+                # wrapped continuation of the command all fail the two-column shape.
                 if(line MATCHES "^([a-z]+)([ \t]+[a-z]*)?[ \t]+([^ \t]+)[ \t]")
                     math(EXPR rowsInFence "${rowsInFence} + 1")
                     set(label "${CMAKE_MATCH_1}")

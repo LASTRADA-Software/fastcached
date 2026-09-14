@@ -161,9 +161,9 @@ std::expected<std::string, std::string> InterpretClusterReply(ClusterAction acti
                                "see that yet. Ask for the cluster state again to see the result.\n"
                                "\n"
                                "Compare both lines above against the machine itself -- the id it minted into\n"
-                               "--cluster-dir, and the address it answers consensus on (--raft-self with\n"
-                               "--listen-raft). They are two spellings of one thing, and nothing else\n"
-                               "compares them.\n",
+                               "--cluster-dir, and the consensus endpoint its own --print-surfaces prints\n"
+                               "(or `fastcache-cli node` against it). They are two spellings of one thing,\n"
+                               "and nothing else compares them.\n",
                                "member id",
                                ReceiptLabelColumn,
                                receipt->memberId,

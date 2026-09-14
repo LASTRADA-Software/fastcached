@@ -519,6 +519,34 @@ std::string RenderSurfaces(NodeConfig const& cfg)
     for (auto const& line: lines)
         out += std::format("{:<{}}  {:<{}}  {}\n", line.label, labelWidth, line.address, addressWidth, line.trailer);
 
+    // **A block of its own, never a row of the table above** (#1328). Every row there is
+    // an address this node BINDS -- what goes on a firewall worksheet -- and this is the
+    // address peers DIAL, which is routinely not one of them: a bare `--listen-raft` binds
+    // the wildcard. A column or a row would read as a second bind, and comparing the bound
+    // address against `--cluster-admit`'s receipt is exactly the mistake this block exists
+    // to end. Labelled `consensus endpoint`, the receipt's own label, so the two strings an
+    // operator compares carry the same name.
+    //
+    // Indented under a heading, the shape the notes take, because COLUMN ONE belongs to the
+    // table: a column-one `label  address` line is a port to open to anybody reading a
+    // pasted transcript, and `check-node-surface-docs.cmake` reads one by that same shape.
+    auto const dial = ConsensusDialAddressOf(cfg);
+    out += "\ndialled at:\n";
+    switch (dial.state)
+    {
+        case ConsensusDialState::Stated:
+            out += std::format("  consensus endpoint  {}  -- what peers DIAL; the raft row above is what this node BINDS\n",
+                               dial.endpoint);
+            break;
+        case ConsensusDialState::NoConsensus:
+            out += "  consensus endpoint  -  (absent: this node runs no consensus, --listen-raft does not resolve)\n";
+            break;
+        case ConsensusDialState::Unstated:
+            out += "  consensus endpoint  NOT STATED -- this node runs consensus and names no address peers dial it at; "
+                   "give --raft-self, or a --raft-peer for its own id\n";
+            break;
+    }
+
     // The notes last and separately, because they are prose while the table above is
     // something an operator transcribes into firewall rules. Mixing them would rag the
     // columns for the rows that carry one -- and the compile port's note says this list

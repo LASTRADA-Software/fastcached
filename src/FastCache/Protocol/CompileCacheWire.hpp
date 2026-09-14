@@ -4511,6 +4511,20 @@ struct NodeRuntimeFields
     /// A STATE in the snapshot for `enrollment`'s reason: the refusals a cordon causes are
     /// counted, and the state is what an operator waiting to reboot polls.
     std::optional<WireCordonState> cordon {};
+
+    /// Where this node's consensus peers DIAL it (#1328), or disengaged on a node that
+    /// runs no consensus.
+    ///
+    /// **Not a surface.** `NodeStatusFields::surfaces` reports ports this node BOUND, and
+    /// a consensus bind is routinely the wildcard; this is the `host:port` a peer is told
+    /// to dial, which the leader records at admission and `--cluster-admit` echoes (#1296).
+    /// The two are compared by an operator bringing a machine in, so they travel apart.
+    ///
+    /// **Never legally empty when engaged.** Absent travels as a zero-length field, so an
+    /// engaged empty string would read back as absent -- a sender with no endpoint to state
+    /// leaves this disengaged, and a node that runs consensus always states one (a node
+    /// naming itself neither way is refused at startup).
+    std::optional<std::string> consensusEndpoint {};
 };
 
 namespace Detail
@@ -4597,6 +4611,10 @@ namespace Detail
     auto const enrollment = Detail::OptionalEnumByte(runtime.enrollment);
     auto const enrollmentPending = Detail::OptionalBigEndian(runtime.enrollmentPending);
     auto const cordon = Detail::OptionalEnumByte(runtime.cordon);
+    // Absent as zero length, the same shape every optional here takes; see the member for
+    // why an engaged endpoint is never empty.
+    auto const consensusEndpoint =
+        runtime.consensusEndpoint.has_value() ? AsBytes(*runtime.consensusEndpoint) : std::span<std::byte const> {};
 
     // Positional, so the ORDER here is the wire contract for this record. Append only:
     // an insertion shifts every later field and every peer decodes one fact as the next.
@@ -4612,7 +4630,8 @@ namespace Detail
                                 lastRegistration,
                                 enrollment,
                                 enrollmentPending,
-                                cordon });
+                                cordon,
+                                consensusEndpoint });
 }
 
 /// Read a runtime record back.
@@ -4745,6 +4764,11 @@ namespace Detail
     // No width to check and nothing to refuse: empty IS the reading here, and it means
     // no leader is known. See the member.
     out.leaderEndpoint = std::string { AsStringView(at(6)) };
+
+    // Empty is ABSENT here, unlike the leader above: an engaged endpoint is never empty,
+    // and a sender that predates the field sends fewer fields, which `at` answers empty.
+    if (auto const consensusEndpoint = at(13); !consensusEndpoint.empty())
+        out.consensusEndpoint = std::string { AsStringView(consensusEndpoint) };
 
     return out;
 }

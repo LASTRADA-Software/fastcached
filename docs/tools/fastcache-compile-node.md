@@ -1243,9 +1243,9 @@ Appended, not committed: a majority has to take it, and this leader cannot
 see that yet. Ask for the cluster state again to see the result.
 
 Compare both lines above against the machine itself -- the id it minted into
---cluster-dir, and the address it answers consensus on (--raft-self with
---listen-raft). They are two spellings of one thing, and nothing else
-compares them.
+--cluster-dir, and the consensus endpoint its own --print-surfaces prints
+(or `fastcache-cli node` against it). They are two spellings of one thing,
+and nothing else compares them.
 ```
 
 **Read both lines against the machine you are bringing in, because that comparison
@@ -1253,6 +1253,20 @@ is the whole reason they are printed.** The address typed here and the one that 
 answers consensus on — `--raft-self` together with `--listen-raft` — are two spellings
 of one address, and nothing compares them for you. The id is the same story: the
 joiner mints its own into `--cluster-dir`, and the one typed here has to match it.
+
+The machine prints its half under the same label. `fastcache-compile-node
+--print-surfaces`, run with that machine's own flags, ends its table with a
+`consensus endpoint` line, and `fastcache-cli node` against the running node reports
+it as `consensus-endpoint`:
+
+```
+consensus endpoint  10.0.0.4:6680  -- what peers DIAL; the raft row above is what this node BINDS
+```
+
+**Compare against that line, never against the `raft` row of the table.** The row is
+the address the node BINDS, and a bare `--listen-raft` binds the wildcard, so that
+comparison fails on every correctly configured machine and teaches you to ignore it.
+A node running no consensus prints the line as absent, never as an empty address.
 
 When they disagree the result is a member that is in the cluster's configuration and
 contacts nobody. At three members or more that presents as an election storm which

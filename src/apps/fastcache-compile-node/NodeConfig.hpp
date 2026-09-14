@@ -1364,6 +1364,50 @@ inline constexpr std::string_view ConsensusNamesNoSelfPeerRefusal =
 /// @return `host:port`, or empty when either half is missing.
 [[nodiscard]] std::string RaftSelfEndpoint(NodeConfig const& cfg);
 
+/// What `ConsensusDialAddressOf` could say about where this node's peers dial it.
+///
+/// Private to this process: nothing transmits or persists it -- the wire carries the
+/// endpoint as an optional, and only `Stated` has one to carry.
+enum class ConsensusDialState : std::uint8_t
+{
+    NoConsensus, ///< `--listen-raft` does not resolve, so there is nothing to dial.
+    Stated,      ///< The node names the address its peers dial it at.
+    Unstated,    ///< Consensus runs, and the node names itself neither way.
+};
+
+/// Where this node's consensus peers DIAL it, as opposed to what it BINDS.
+struct ConsensusDialAddress
+{
+    ConsensusDialState state { ConsensusDialState::NoConsensus };
+    /// `host:port` when `Stated`, and never empty then; empty otherwise.
+    std::string endpoint;
+};
+
+/// The consensus address this node tells the cluster to dial it at (#1328).
+///
+/// **A different question from the `raft` surface row, and the difference is the whole
+/// value.** The row is what this node BINDS, which is routinely the wildcard; this is
+/// what a peer DIALS, which the leader records when the node is admitted and echoes in
+/// `--cluster-admit`'s receipt (#1296). An operator comparing that receipt against the
+/// bound address compares the wrong string, so this is printed separately and labelled
+/// as the receipt labels it.
+///
+/// The node's own member entry first, because that is the pair consensus runs under and
+/// `EnrollClaim` sends: an operator's `--raft-peer` for this node, or the one
+/// `ApplyNodeIdentity` built from `--raft-self`. `RaftSelfEndpoint` second, for a
+/// configuration whose identity has not been resolved yet -- `--print-surfaces` runs
+/// before an id is minted. Where both exist and differ, the startup table refuses the
+/// configuration (`RaftSelfContradictsItsOwnPeer`); this reports the entry consensus
+/// would run under and refuses nothing.
+///
+/// **Three answers, not an empty string**: a node running no consensus has no dial
+/// address (absent is not zero), and a consensus node naming itself neither way has one
+/// nobody stated -- which the startup table refuses, and which `--print-surfaces` still
+/// has to be able to print.
+/// @param cfg The parsed configuration, with or without its identity applied.
+/// @return Which of the three, and the endpoint when there is one.
+[[nodiscard]] ConsensusDialAddress ConsensusDialAddressOf(NodeConfig const& cfg);
+
 /// Who this node admits, as one line an operator reads at startup.
 ///
 /// One spelling for two callers -- the scheduler tier's ready line and the worker's

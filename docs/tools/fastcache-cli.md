@@ -277,7 +277,9 @@ majority involved, so that much comes back:
 
 Hold both values against the machine being brought in: the id it minted into its own
 `--cluster-dir`, and the address it answers consensus on (`--raft-self` together with
-`--listen-raft`). They are two spellings of one thing and nothing else compares them.
+`--listen-raft`), which `node` against that machine reports as `consensus-endpoint` --
+never its `raft-port`, which is the port it BOUND. They are two spellings of one thing
+and nothing else compares them.
 When they disagree the member sits in the cluster's configuration and contacts
 nobody, which at three members or more presents as an election storm that then
 settles — so the symptom points at consensus rather than at the character that was

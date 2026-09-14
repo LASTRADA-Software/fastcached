@@ -280,6 +280,11 @@ set(FastCachedSurfaceSelftestCases
     # mask a numeric claim later in the same sentence.
     "claim masked by an earlier collocation|doc|The four-surface table is what the node opens.|The node surface is one of 9 surfaces here.|counts something called a surface|-"
 
+    # The block naming where peers DIAL the node (#1328) is indented under its heading
+    # and is not a port to open, so a transcript carrying it is still exactly the table.
+    # The passing direction, pinned: `RenderSurfaces` indents that block for this reader.
+    "dialled-at block is not a row|doc|~n~notes:|~n~dialled at:~n~  consensus endpoint  10.0.0.4:6680  -- what peers DIAL~n~~n~notes:|node surface docs: 4 surface(s)|CMake Error"
+
     # A fence that INVOKES the command and pastes no output is documentation of
     # the command, not a transcript of it. This is the false-positive direction:
     # the check used to report all four surfaces missing from a page that made no
