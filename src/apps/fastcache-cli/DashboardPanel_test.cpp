@@ -15,6 +15,7 @@
 #include <FastCache/Cache/StorageTier.hpp>
 #include <FastCache/Core/Ranges.hpp>
 #include <FastCache/Distributed/FleetView.hpp>
+#include <FastCache/Distributed/NodePolicy.hpp>
 #include <FastCache/Metrics/MetricsCatalog.hpp>
 #include <FastCache/Metrics/PrometheusFormatter.hpp>
 
@@ -2211,14 +2212,25 @@ namespace
 
 using NodeCounter = IMetricsSink::Counter;
 
+/// What the machine under a node reading is doing.
+struct NodeMachine
+{
+    /// Host-wide CPU busy over every interval, in permille; §4's 625 is 10 of 16 cores, 4 of them somebody else's.
+    std::uint64_t cpuPermille { 625 };
+    /// Memory a new process could obtain.
+    std::uint64_t availableMemoryBytes { std::uint64_t { 32 } << 30U };
+};
+
 /// A node reading @p step intervals in: every counter the node panel draws, moved by @p step.
 /// @param step How far the counters have moved.
 /// @param seconds When it was taken.
 /// @param status What the node said about itself, or nothing.
+/// @param machine What its machine is doing.
 /// @return The event.
 [[nodiscard]] DashboardEvent NodeSampleOf(std::uint64_t step,
                                           int seconds,
-                                          std::optional<CompileCacheWire::NodeStatusFields> status)
+                                          std::optional<CompileCacheWire::NodeStatusFields> status,
+                                          NodeMachine machine = {})
 {
     auto reading = StatsReading {};
     auto const count = [&reading](NodeCounter counter, std::uint64_t value) {
@@ -2231,7 +2243,20 @@ using NodeCounter = IMetricsSink::Counter;
     count(NodeCounter::WorkerJobsRefusedUnknownFingerprint, 0);
     count(NodeCounter::NodeCacheHits, 881 * step);
     count(NodeCounter::NodeCacheMisses, 119 * step);
-    reading.snapshot.host = HostCapacity { .diskFreeBytes = std::uint64_t { 41 } << 30U };
+    // §4's machine: 16 cores registered with 16 slots, 6 running, and by default somebody else using 4 cores' worth
+    // with room in memory and on scratch, so the CPU is what binds: 12 available.
+    reading.snapshot.host = HostCapacity { .logicalCores = 16,
+                                           .configuredSlots = 16,
+                                           .totalMemoryBytes = std::uint64_t { 64 } << 30U,
+                                           .diskCapacityBytes = std::uint64_t { 512 } << 30U,
+                                           .diskFreeBytes = std::uint64_t { 41 } << 30U,
+                                           .busySlots = 6 };
+    reading.snapshot.hostLoad =
+        HostLoadReading { .cpu = CpuTicks { .busy = machine.cpuPermille * step, .total = 1000 * step },
+                          .availableMemoryBytes = machine.availableMemoryBytes };
+    // Its cache tier holds 2 of its 8 GiB.
+    reading.snapshot.storage =
+        StorageStats { .bytesUsed = std::size_t { 2 } << 30U, .bytesLimit = std::size_t { 8 } << 30U };
     auto sample = SampleOf(SeriesOf(reading), seconds);
     sample.attempts.front().where = "build-07:9464";
     sample.nodeStatus = std::move(status);
@@ -2377,21 +2402,109 @@ TEST_CASE("a node panel says who the node is and whether it is working, as secti
     CHECK(ColumnOf(Unwrap(working), "serving") == ColumnOf(Unwrap(slots), "6 in flight"));
 }
 
-TEST_CASE("a node panel draws its slots as three numbers and what limits them, marking what no status carries",
+TEST_CASE("a node panel draws its slots as section 4 does: three numbers, the gauge, the limit and its remedy",
           "[cli][dashboard][panel][node]")
 {
-    // N4. The three numbers are in flight, available and registered; `available` and `limited-by` are
-    // `SlotCeilingsFor` over the machine's live load, which no status carries yet -- so both are the marker BY
-    // NAME, under the value column, never a missing line.
+    // N4. WHAT DISTINGUISHES: `available` and `limited-by` are the scheduler's own ceilings over the machine's load
+    // (12 of 16, bound by the CPU somebody else is using); the gauge's three parts are 6 running, 6 more available and
+    // 4 withdrawn; and the remedy is `SlotLimitTable`'s sentence, wrapped under the gauge at the value column.
     auto const frame = NodeFrameAt(80, 24, MockupNodeStatus());
     auto const slots = LineStarting(frame, "slots");
     REQUIRE(slots.has_value());
-    CHECK(Trimmed(Columns(Unwrap(slots), 1, 78))
+    CHECK(Trimmed(Columns(Unwrap(slots), 1, 78)) == "slots       6 in flight / 12 available / 16 registered");
+    auto const gauge = LineUnder(frame, "slots");
+    REQUIRE(gauge.has_value());
+    CHECK(ColumnOf(Unwrap(gauge), "\u2588") == ColumnOf(Unwrap(slots), "6 in flight"));
+    CHECK(Trimmed(Columns(Unwrap(gauge), 1, 78))
+          == "\u2588\u2588\u2588\u2588\u2588\u2588\u2592\u2592\u2592\u2592\u2592\u2592\u2591\u2591\u2591\u2591   limited-by "
+             " external-cpu");
+
+    auto const lines = Lines(frame);
+    auto const at = std::ranges::find_if(lines, [](std::string const& line) { return line.contains("limited-by"); });
+    REQUIRE(std::distance(at, lines.end()) > 2);
+    CHECK(ColumnOf(*(at + 1), "somebody") == ColumnOf(Unwrap(slots), "6 in flight"));
+    CHECK(std::format("{} {}", Trimmed(Columns(*(at + 1), 1, 78)), Trimmed(Columns(*(at + 2), 1, 78)))
+          == Distributed::TraitsFor(Distributed::SlotLimit::ExternalCpu).remedy);
+}
+
+TEST_CASE("a node's slots name no limit before two readings, and nothing to remedy when none binds",
+          "[cli][dashboard][panel][node]")
+{
+    // The ceilings take a CPU share, which one reading cannot give: `available` and `limited-by` are the marker by
+    // name, with no gauge and no remedy. And a machine nothing holds back names `registered` with no sentence under
+    // it, since there is nothing to do.
+    auto const first = NodeFramesAt({ NodeSampleOf(1, 1, MockupNodeStatus()), Tick }, 80, 24);
+    REQUIRE(first.size() == 1);
+    CHECK(ContentStarting(first.front(), "slots")
           == std::format("slots       6 in flight / {} available / 16 registered", Absent));
-    auto const under = LineUnder(frame, "slots");
-    REQUIRE(under.has_value());
-    CHECK(ColumnOf(Unwrap(under), "limited-by") == ColumnOf(Unwrap(slots), "6 in flight"));
-    CHECK(Trimmed(Columns(Unwrap(under), 1, 78)) == std::format("limited-by  {}", Absent));
+    auto const unknown = LineUnder(first.front(), "slots");
+    REQUIRE(unknown.has_value());
+    CHECK(Trimmed(Columns(Unwrap(unknown), 1, 78)) == std::format("limited-by  {}", Absent));
+    // No remedy under it: the line after `limited-by` is the blank that ends the block.
+    auto const lines = Lines(first.front());
+    auto const at = std::ranges::find_if(lines, [](std::string const& line) { return line.contains("limited-by"); });
+    REQUIRE(std::distance(at, lines.end()) > 1);
+    CHECK(Trimmed(Columns(*(at + 1), 1, 78)).empty());
+
+    // Two readings that are not ADJACENT name no limit either: the second stamped no later than the first continues no
+    // run, so the fold measured no interval and no CPU share can be taken across the pair.
+    auto const unordered =
+        NodeFramesAt({ NodeSampleOf(1, 3, MockupNodeStatus()), NodeSampleOf(2, 1, MockupNodeStatus()), Tick }, 80, 24);
+    REQUIRE(unordered.size() == 1);
+    CHECK(ContentStarting(unordered.front(), "slots")
+          == std::format("slots       6 in flight / {} available / 16 registered", Absent));
+
+    auto const idle = NodeMachine { .cpuPermille = 0 };
+    auto const frames = NodeFramesAt(
+        { NodeSampleOf(1, 1, MockupNodeStatus(), idle), NodeSampleOf(2, 3, MockupNodeStatus(), idle), Tick }, 80, 24);
+    REQUIRE(frames.size() == 1);
+    CHECK(ContentStarting(frames.front(), "slots") == "slots       6 in flight / 16 available / 16 registered");
+    auto const free = LineUnder(frames.front(), "slots");
+    REQUIRE(free.has_value());
+    CHECK(Trimmed(Columns(Unwrap(free), 1, 78)).ends_with("   limited-by  registered"));
+    // No sentence under it. Asked of the LINE after the gauge rather than of the whole remedy's text, which a wrap
+    // splits across two lines and so would be absent from the frame either way.
+    auto const freeLines = Lines(frames.front());
+    auto const gaugeLine =
+        std::ranges::find_if(freeLines, [](std::string const& line) { return line.contains("limited-by"); });
+    REQUIRE(std::distance(gaugeLine, freeLines.end()) > 1);
+    CHECK(Trimmed(Columns(*(gaugeLine + 1), 1, 78)).empty());
+}
+
+TEST_CASE("a node short of memory is limited by memory, with memory's remedy", "[cli][dashboard][panel][node]")
+{
+    // The other limit, so a panel that named the CPU whatever bound is caught: 2 GiB left supports two jobs on top of
+    // the six running, so 8 are available -- fewer than the CPU leaves -- and the gauge withdraws 8.
+    auto const tight = NodeMachine { .cpuPermille = 625, .availableMemoryBytes = std::uint64_t { 2 } << 30U };
+    auto const frames = NodeFramesAt(
+        { NodeSampleOf(1, 1, MockupNodeStatus(), tight), NodeSampleOf(2, 3, MockupNodeStatus(), tight), Tick }, 80, 24);
+    REQUIRE(frames.size() == 1);
+    auto const& frame = frames.front();
+    CHECK(ContentStarting(frame, "slots") == "slots       6 in flight / 8 available / 16 registered");
+    auto const gauge = LineUnder(frame, "slots");
+    REQUIRE(gauge.has_value());
+    CHECK(Trimmed(Columns(Unwrap(gauge), 1, 78))
+          == "\u2588\u2588\u2588\u2588\u2588\u2588\u2592\u2592\u2591\u2591\u2591\u2591\u2591\u2591\u2591\u2591   limited-by "
+             " memory");
+    CHECK(frame.contains(Distributed::TraitsFor(Distributed::SlotLimit::Memory).remedy));
+    CHECK(ContentStarting(frame, "host") == "host        cpu-busy 62.5 %   mem free 2.00 GiB   scratch free 41.00 GiB");
+}
+
+TEST_CASE("a node's slot gauge goes whole when the width cannot hold it, and the limit stays",
+          "[cli][dashboard][panel][node]")
+{
+    // A gauge cut short would be a different share, so it is all or nothing: at a width with no room for it the line
+    // under the slots names the limit alone.
+    auto const frames =
+        NodeFramesAt({ NodeSampleOf(1, 1, MockupNodeStatus()), NodeSampleOf(2, 3, MockupNodeStatus()), Tick }, 59, 40);
+    REQUIRE(frames.size() == 1);
+    // 59 columns leave the slots line its 42 cells and the gauge line one short of its 43; 40 rows, so no line goes
+    // for height.
+    auto const gauge = LineUnder(frames.front(), "slots");
+    REQUIRE(gauge.has_value());
+    CHECK(Trimmed(Columns(Unwrap(gauge), 1, 57)) == "limited-by  external-cpu");
+    // The control: at 80 the same readings draw the gauge.
+    CHECK(NodeFrameAt(80, 24, MockupNodeStatus()).contains("\u2592\u2592\u2592\u2592\u2592\u2592\u2591"));
 }
 
 TEST_CASE("a node panel draws ONE refusal total with its trend, and the split under it", "[cli][dashboard][panel][node]")
@@ -2438,16 +2551,19 @@ TEST_CASE("a node panel draws its cache tier and host below the rates, and the t
           "[cli][dashboard][panel][node]")
 {
     // N8 and N9. The tier line appears exactly when the status names the component -- not a line of markers
-    // for a tier that does not exist -- and the host line is one line of the machine's figures, the two no
-    // status carries yet marked by name.
+    // for a tier that does not exist -- with its fill off the reading's cache (2 of 8 GiB, a quarter of the gauge);
+    // and the host line is one line of the machine's figures: the CPU share between the two readings, and what
+    // memory and scratch have left.
     auto const frame = NodeFrameAt(80, 24, MockupNodeStatus());
     auto const tier = LineStarting(frame, "cache tier");
     REQUIRE(tier.has_value());
-    CHECK(Trimmed(Columns(Unwrap(tier), 1, 78)).starts_with("cache tier  hits 88.1 %"));
+    CHECK(Trimmed(Columns(Unwrap(tier), 1, 78))
+          == "cache tier  hits 88.1 %   2.00 GiB / 8.00 GiB  "
+             "\u2588\u2588\u2588\u2588\u2591\u2591\u2591\u2591\u2591\u2591\u2591\u2591\u2591\u2591\u2591\u2591  25.0 %");
     auto const host = LineStarting(frame, "host");
     REQUIRE(host.has_value());
     CHECK(Trimmed(Columns(Unwrap(host), 1, 78))
-          == std::format("host        cpu-busy {}   mem free {}   scratch free 41.00 GiB", Absent, Absent));
+          == "host        cpu-busy 62.5 %   mem free 32.00 GiB   scratch free 41.00 GiB");
     for (auto const* gone: { "cores", "memory", "slots busy", "scratch free" })
         CHECK_FALSE(LineStarting(frame, gone).has_value());
 
@@ -2484,7 +2600,8 @@ TEST_CASE("before a node says anything about itself its facts read the marker, a
     auto const& frame = frames.front();
     CHECK(ContentStarting(frame, "node-id").starts_with(std::format("node-id     {}", Absent)));
     CHECK(ContentStarting(frame, "toolchains").starts_with(std::format("toolchains  {}", Absent)));
-    CHECK(ContentStarting(frame, "slots") == std::format("slots       {}", Absent));
+    // The slots are the reading's own, since it carries the machine; one reading names no limit yet.
+    CHECK(ContentStarting(frame, "slots") == std::format("slots       6 in flight / {} available / 16 registered", Absent));
     CHECK_FALSE(LineStarting(frame, "consensus").has_value());
     CHECK_FALSE(LineStarting(frame, "cache tier").has_value());
 
@@ -2592,6 +2709,13 @@ TEST_CASE("a node panel dresses labels as labels, figures as figures, and a refu
         INFO("label " << label);
         CHECK(ToneOver(sink, label) == FrameTone::Label);
     }
+    // The slot gauge's running part is dressed by the band of what is available that runs (6 of 12, the middle);
+    // the part available and the part withdrawn are not; somebody else's CPU is worth a look, and its remedy is a label.
+    CHECK(ToneOver(sink, "\u2588\u2588\u2588\u2588\u2588\u2588") == FrameTone::LevelMid);
+    CHECK_FALSE(ToneOver(sink, "\u2592\u2592\u2592\u2592\u2592\u2592").has_value());
+    CHECK(ToneOver(sink, "limited-by") == FrameTone::Label);
+    CHECK(ToneOver(sink, "external-cpu") == FrameTone::Stale);
+    CHECK(ToneOver(sink, "somebody else is using this machine. Its own work is not the") == FrameTone::Label);
     // The ordinary states are not dressed: a run over them would be a claim that something needs looking at.
     CHECK_FALSE(ToneOver(sink, "serving 3 of 3").has_value());
     CHECK_FALSE(ToneOver(sink, "follower").has_value());
@@ -2626,6 +2750,15 @@ TEST_CASE("a node's states worth a look are dressed: a survey not done, an elect
     never.runtime.registrarsRegistered = 0;
     never.runtime.lastRegistrationSecondsAgo.reset();
     CHECK(ToneOver(NodeSinkOf(never), "0 of 1, never accepted") == FrameTone::Alert);
+
+    // A limit the machine will not recover from by itself is an alert, where somebody else's CPU is only worth a look.
+    auto const tight = NodeMachine { .cpuPermille = 625, .availableMemoryBytes = std::uint64_t { 1 } << 30U };
+    auto const memory = NodeSinkAt(
+        { NodeSampleOf(1, 1, MockupNodeStatus(), tight), NodeSampleOf(2, 3, MockupNodeStatus(), tight), Tick }, 80, 24);
+    REQUIRE(memory.frames.size() == 1);
+    CHECK(ToneOver(memory, "memory") == FrameTone::Alert);
+    // 6 running of the 7 memory leaves is the top band.
+    CHECK(ToneOver(memory, "\u2588\u2588\u2588\u2588\u2588\u2588") == FrameTone::LevelHigh);
 }
 
 TEST_CASE("a cache rate block dresses its labels and beside words as labels and its figures as figures",
