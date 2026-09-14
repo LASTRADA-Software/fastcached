@@ -1306,7 +1306,7 @@ void AdoptAllowlist(Cc::CompileJobRunner& jobs,
     // it reads -- the scrape provider, the fleet and the sampler -- is built after consensus, and
     // consensus after this surface: see `LiveStatsSourceSlot`. Declared before the surface, like
     // every responder here, so it is destroyed after it.
-    Node::LiveStatsSourceSlot liveSources;
+    LiveStatsSourceSlot liveSources;
     Node::LiveStatsResponder liveStatsResponder {
         liveSources, membership.Oracle(), dashboardCredential, nodeIo.Reactor(), metrics
     };

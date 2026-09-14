@@ -119,6 +119,16 @@ falling hit ratio mean the working set no longer fits and `--max-memory` (or
 The client side reports independently — `fastcache-cc --show-stats` gives the hit
 rate as each builder sees it, which is what actually determines build times.
 
+`fastcache-cli live-stats` pointed at the `0xFC` port draws the same reading live: the
+daemon streams its **cache** subject, the counters and snapshot `/metrics` renders, pushed
+on a fixed tick rather than scraped
+([#1399](https://github.com/LASTRADA-Software/fastcached/issues/1399)). The node and fleet
+subjects belong to a compile node, and the daemon refuses them by name. A stream is held to
+the connection's credential while it runs, not only when it opens: a connection that never
+authenticated loses its stream on the tick `--requirepass` takes effect, and one that did
+keeps it when the secret rotates. The live counters are the node's rows, described under
+[Live stats](../tools/fastcache-compile-node.md#live-stats).
+
 If you run a **compile fleet** rather than a lone cache, the leader can show you
 the whole of it on one page: see
 [Looking at the whole fleet](../tools/fastcache-compile-node.md#looking-at-the-whole-fleet).
