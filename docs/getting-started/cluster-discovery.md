@@ -6,7 +6,10 @@ how one proves it belongs before the cluster admits it.
 It is off unless you ask for it. Turn it on with `--discovery`, which needs
 `--listen-raft` and `--cluster-key-file` and is refused without them; without it a
 cluster is exactly the `--raft-peer` list an operator typed, which works and is
-the right answer for a fleet that does not change. The flags, and what a
+the right answer for a fleet that does not change. Either way every member holds the
+key: consensus itself needs it, because every connection between members proves it
+before a message is read — see
+[Raft peer authentication](../operations/cluster-communication.md#raft-peer-authentication). The flags, and what a
 deployment looks like end to end, are under
 [finding peers instead of typing them](../tools/fastcache-compile-node.md#finding-peers-instead-of-typing-them);
 where this exchange sits among everything else a fleet says to itself — and which
@@ -114,7 +117,9 @@ is a Raft decision only a leader may make, and a discovery layer that proposed
 directly would have every node on the segment proposing the same change at once.
 
 **It does not treat "seen" as "trusted".** Those are separate facts in
-`PeerDirectory`, and only a completed handshake sets the second. A peer that
+`PeerDirectory`, and only a completed handshake sets the second. Nor does a proof here
+stand in for the consensus wire's own: an admitted member still proves the key again
+on every Raft connection it opens or accepts. A peer that
 changes the endpoint it advertises **loses** its authenticated status: the proof
 covered the old endpoint, so carrying it across would admit an address nobody
 proved.
@@ -133,7 +138,7 @@ What the pre-shared key does and does not buy you:
 | Send arbitrary datagrams | Can provoke a challenge, cannot answer one. Cannot make the challenge table grow — one entry per node id, with a lifetime. |
 | Replay a captured proof | Refused: the nonce it answers has been spent. |
 | Capture a proof and re-aim it at another endpoint | Refused: the endpoint is inside the MAC. |
-| Obtain the key | **Full compromise.** They can join, be assigned compiles, and return objects cached fleet-wide. |
+| Obtain the key | **Full compromise.** They can join, be assigned compiles, and return objects cached fleet-wide — and speak on the consensus wire under any member's id, since one shared key cannot tell its holders apart. |
 
 That last row is the important one. Auto-join by shared secret is a materially
 larger blast radius than "you typed the scheduler's address", which is what the

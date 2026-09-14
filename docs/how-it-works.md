@@ -399,7 +399,11 @@ Run several and exactly one must schedule at a time — two nodes handing out th
 same machine's slots is not a degraded fleet, it is the one thing the design says
 cannot happen. Electing that one node is what **consensus** is for. It uses Raft,
 it is off until you give a node `--listen-raft`, and the node holding the election's
-outcome is called the **leader**.
+outcome is called the **leader**. Every member holds the cluster's
+`--cluster-key-file`, and a node without one refuses to start: each connection between
+members opens with a handshake proving that key, and every message after it carries a
+tag, so nothing that merely reaches the port can vote or lead
+([Raft peer authentication](operations/cluster-communication.md#raft-peer-authentication)).
 
 ### What a node does when it starts, in order
 
@@ -461,8 +465,10 @@ so a joining node must never form one.
 
 The sequence, and what you see at each step:
 
-1. Start the joiner with `--raft-join`. It names itself in `--raft-peer` plus
-   enough existing members to reach one. It logs
+1. Start the joiner with `--raft-join` and the cluster's key. It names itself in
+   `--raft-peer` plus enough existing members to reach one. (With a different key it
+   is never replicated to: every member refuses its connections, and each counts
+   `fastcache_raft_peer_connections_refused_proof_total`.) It logs
    `no cluster yet; waiting to be admitted` and then waits. That line is how you
    know the flag took effect — a node that says `1 member(s)` instead has
    bootstrapped a cluster of itself and must be stopped, its state directory

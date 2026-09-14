@@ -42,11 +42,14 @@ src/FastCache/
                 showIncludes grammars), CompileValue, PrefetchGroupManifest
   Consensus/    Raft, split into a pure state machine (RaftNode) and a coroutine
                 driver, behind IRaftStorage / IRaftTransport / IRaftStateMachine;
-                plus RaftLog, RaftWire, RaftPeerTransport/RaftPeerServer,
-                RaftMembership, and RaftClusterHarness (a whole cluster in one
-                process, against scripted partitions, loss and restarts)
+                plus RaftLog, RaftWire, RaftPeerSession (the handshake every peer
+                connection proves the cluster key with, behind IRaftPeerCredential),
+                RaftPeerTransport/RaftPeerServer, RaftMembership, and
+                RaftClusterHarness (a whole cluster in one process, against scripted
+                partitions, loss and restarts, every message authenticated)
   Cluster/      DiscoveryService + DiscoveryWire (the LAN beacon and its PSK
-                challenge), PeerDirectory, ClusterState + ClusterStateMachine,
+                challenge), PskRaftPeerCredential (the key, as the peer wire proves
+                it), PeerDirectory, ClusterState + ClusterStateMachine,
                 MembershipPolicy — who is a member, WHERE they answer, and the
                 settings every member must agree on
   Distributed/  WorkerRegistry, LeaseTable and SchedulerService — the fleet's
@@ -298,10 +301,12 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
 - A lease token is a credential, and its MAC covers the granted **endpoint**. Fields
   length-prefixed, never joined.
 - The PSK signs through ONE seam and the domain is a required PARAMETER, never a string a caller
-  remembers: `Cluster/ClusterSigning.hpp`'s `SigningDomain` and its `SigningDomainTable`.
+  remembers: `Cluster/ClusterSigning.hpp`'s `SigningDomain` and its `SigningDomainTable`. Discovery,
+  the lease and the Raft peer wire each own rows, and every verifier goes through `VerifyFields`.
 - That change moved the proof's MAC *input* and **`DiscoveryWire::CurrentVersion` deliberately
   did not move** — the datagram grammar is unchanged. "We changed the MAC, so bump the version"
-  is the tempting correction, and it is wrong.
+  is the tempting correction, and it is wrong. `RaftWire`'s did move for #1308, because a
+  handshake and a tag trailer are GRAMMAR: the question is always which of the two changed.
 - The MAC is checked before any other claim is reported on, or a named refusal is an oracle. The
   expiry bounds how long a *captured* token is useful and is **not** a capacity bound.
 - A grant is spendable **once**, at the worker it names. The spend runs LAST, so a grant refused
@@ -418,10 +423,11 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   exactly that defect. And a reload may not WIDEN admission on a node with no `--cluster-key-file`,
   which built an unchecked lease validator at startup. Asked as a TRANSITION, or it refuses the
   keyless nodes running happily today.
-- An enrollment window is openable only where a key can actually be handed over — consensus AND a
-  named `--cluster-key-file` (`EnrollmentConfigured`) — and the APPROVAL reads that key before
-  `ClusterAdmit`, which is the irreversible half. A keyless consensus node is LEGAL, so both guards
-  are owed and neither can see the other's case.
+- An enrollment window is served by a node that runs consensus (`ServesEnrollment`), and since
+  #1308 consensus IMPLIES a named `--cluster-key-file` — so the key clause that predicate used to
+  carry was DELETED rather than kept. The APPROVAL still reads the key before `ClusterAdmit`, which
+  is the irreversible half: a key file readable at boot can break later, and no configuration
+  predicate sees that.
 - A node that runs no consensus refuses the enrollment family `NoCluster`, never
   `UnimplementedVerb`: a client reads the latter as *this seed's build is too old* and is sent to
   upgrade a node that is already current. Asserted as NOT `UnimplementedVerb`, since both refuse.
@@ -476,6 +482,25 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
 - A proof only ever answers a challenge this node issued, and the nonce is spent whatever
   the outcome.
 - Discovery never changes membership: it reports who proved the key and where.
+- **Every Raft peer connection proves the cluster key before a message is read** — through
+  `Consensus::IRaftPeerCredential` over `Cluster::SignFields`, under `SigningDomain` rows of its
+  own. Consensus without `--cluster-key-file` is a STARTUP refusal, never a per-connection
+  fallback, and the server and transport take the credential as a required constructor argument.
+- The ACCEPTOR challenges first and checks the MAC before any claim in the proof — then `OwnId`
+  before `WrongTarget`. The verdict is SIGNED, refusals included, so a dialler counts
+  `wrong_target` and `own_id` by name; `ended_by_acceptor` means only a close after the proof
+  with no signed verdict. **An unsigned refusal of a key holder is a confident wrong signal.**
+- Every session frame carries a MAC over both nonces and an implicit sequence number, and a
+  verified message naming a sender other than the proven dialler closes the connection. The ids
+  are bound and the ENDPOINT deliberately is not: a shared key cannot tell holders apart, and an
+  identity in the frame is #178's question.
+- `RaftWire::CurrentVersion` and `MinSupportedVersion` are both 2: the handshake changed the
+  GRAMMAR, so the version moved — the opposite of discovery's #402, where only the MAC input did.
+  Accepting a v1 peer would be the per-connection fallback, so a fleet upgrades its consensus
+  members together.
+- `RaftClusterHarness` authenticates EVERY message through the real session objects, with a
+  REQUIRED credential factory and a nonce source apart from `_network`. An intruder case says
+  nothing without the formation case beside it staying green under the same neuter.
 - `RaftNode` reads no clock, opens no socket and draws no randomness of its own.
 - A snapshot is durable before it is acknowledged, and the configuration travels inside it.
 - A seeded draw must be identical on every standard library — `UniformInRange`, never
