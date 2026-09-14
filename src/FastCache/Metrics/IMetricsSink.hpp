@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
+#include <span>
 #include <string_view>
 
 namespace FastCache
@@ -1263,6 +1266,84 @@ class IMetricsSink
     [[nodiscard]] virtual bool Carries(Counter counter) const noexcept = 0;
 };
 
+/// How many counters this build can represent: the extent of every table keyed by `IMetricsSink::Counter`.
+///
+/// Spelled once, here rather than as `EnumeratorCount<Counter>`: this header is included by
+/// `fastcache-cc`'s `WorkerProtocol.hpp` and `CodecEnvelope.hpp`, which do not link FastCache, so
+/// pulling in `Core/EnumTable.hpp` -- and with it `<ranges>`, `<algorithm>` and `<functional>` --
+/// would be the wrong trade for one constant.
+inline constexpr std::size_t CounterCount = static_cast<std::size_t>(IMetricsSink::Counter::Last);
+
+/// The index @p counter occupies in a table keyed by `IMetricsSink::Counter`, or absent when this
+/// build has no such row.
+///
+/// **The one place in this tree that turns a `Counter` into an index** (#1366), which
+/// `ctest -R counter-index-seam` enforces. An absent answer is what `IMetricsSink::Carries`
+/// describes, and is stated there rather than here. Every table keyed by the enum reaches its rows
+/// through this -- `CounterCells` for storage, `DescriptorOf` for the catalogue -- so a new one has an
+/// obvious thing to call rather than a cast with no diagnostic.
+/// @param counter The counter a caller named.
+/// @return Its index, or `std::nullopt` at or past `Counter::Last`.
+[[nodiscard]] constexpr std::optional<std::size_t> CounterIndex(IMetricsSink::Counter counter) noexcept
+{
+    auto const index = static_cast<std::size_t>(counter);
+    if (index >= CounterCount)
+        return std::nullopt;
+    return index;
+}
+
+/// One value per `IMetricsSink::Counter`, reachable only BY the counter.
+///
+/// There is no integer subscript, deliberately: a table keyed by the enum and indexed by a
+/// hand-written cast is the shape `CounterIndex` exists to replace, and a cast whose operand is a
+/// template parameter is invisible to any text scan -- so here it does not compile instead (#1366).
+/// @tparam Cell What each counter holds.
+template <typename Cell>
+class CounterCells
+{
+  public:
+    /// The cell for @p counter.
+    /// @param counter The counter a caller named.
+    /// @return Its cell, or nullptr when this build has no row for it.
+    [[nodiscard]] constexpr Cell* Find(IMetricsSink::Counter counter) noexcept
+    {
+        auto const index = CounterIndex(counter);
+        return index.has_value() ? &_cells[*index] : nullptr;
+    }
+
+    /// The cell for @p counter.
+    /// @param counter The counter a caller named.
+    /// @return Its cell, or nullptr when this build has no row for it.
+    [[nodiscard]] constexpr Cell const* Find(IMetricsSink::Counter counter) const noexcept
+    {
+        auto const index = CounterIndex(counter);
+        return index.has_value() ? &_cells[*index] : nullptr;
+    }
+
+    /// Every cell in enumerator order, for an encoding that carries the table by POSITION.
+    ///
+    /// Not a way to reach one counter's cell: a position here means "the next row", and a caller that
+    /// computes one from a `Counter` is back to the cast this type exists to remove.
+    /// @return The cells.
+    [[nodiscard]] constexpr std::span<Cell, CounterCount> Positional() noexcept
+    {
+        return _cells;
+    }
+
+    /// Every cell in enumerator order, for an encoding that carries the table by POSITION.
+    /// @return The cells.
+    [[nodiscard]] constexpr std::span<Cell const, CounterCount> Positional() const noexcept
+    {
+        return _cells;
+    }
+
+    /// Every cell equal, in order.
+    [[nodiscard]] constexpr bool operator==(CounterCells const&) const = default;
+
+  private:
+    std::array<Cell, CounterCount> _cells {};
+};
+
 /// Default atomic-counter sink.
 ///
 /// `Counter` is a closed enum and every caller names an enumerator, so an index
@@ -1296,14 +1377,13 @@ class AtomicMetricsSink final: public IMetricsSink
     ///       written -- the alternative is an out-of-range atomic write -- and in
     ///       a RELEASE build the drop is therefore silent here by necessity,
     ///       which is exactly why `Carries` exists for callers to ask first. It
-    ///       is not silent everywhere: `CarriesCounter` asserts, so a debug build
+    ///       is not silent everywhere: `SlotOf` asserts, so a debug build
     ///       aborts at this site rather than dropping. See `Carries`' contract on
     ///       `IMetricsSink`; it is stated there rather than restated here.
     void Increment(Counter counter, std::uint64_t by = 1) noexcept override
     {
-        if (!CarriesCounter(counter))
-            return;
-        _counters[static_cast<std::size_t>(counter)].fetch_add(by, std::memory_order_relaxed);
+        if (auto* const slot = SlotOf(_counters, counter))
+            slot->fetch_add(by, std::memory_order_relaxed);
     }
 
     /// @note The `0` an unrepresentable counter reads back is indistinguishable
@@ -1314,9 +1394,8 @@ class AtomicMetricsSink final: public IMetricsSink
     ///       never reaches this `0` for a row the sink has no slot for (#1353).
     [[nodiscard]] std::uint64_t Read(Counter counter) const noexcept override
     {
-        if (!CarriesCounter(counter))
-            return 0;
-        return _counters[static_cast<std::size_t>(counter)].load(std::memory_order_relaxed);
+        auto const* const slot = SlotOf(_counters, counter);
+        return slot != nullptr ? slot->load(std::memory_order_relaxed) : 0;
     }
 
     /// @note No assert here, unlike the accessors: ASKING whether a counter is
@@ -1325,29 +1404,16 @@ class AtomicMetricsSink final: public IMetricsSink
     ///       accessor it should not call.
     [[nodiscard]] bool Carries(Counter counter) const noexcept override
     {
-        return static_cast<std::size_t>(counter) < CounterCount;
+        return CounterIndex(counter).has_value();
     }
 
   private:
-    /// How many counters this build can represent.
+    /// The slot @p counter occupies in @p counters, or nullptr when this build cannot represent it.
     ///
-    /// Spelled once. It was four `static_cast<std::size_t>(Counter::Last)` across
-    /// two accessors and the array extent, which is three chances for two of them
-    /// to stop agreeing. Deliberately NOT `EnumeratorCount<Counter>`: this header
-    /// is included by `fastcache-cc`'s `WorkerProtocol.hpp` and
-    /// `CodecEnvelope.hpp`, which do not link FastCache, so pulling in
-    /// `Core/EnumTable.hpp` -- and with it `<ranges>`, `<algorithm>` and
-    /// `<functional>` -- would be the wrong trade for one alias.
-    static constexpr std::size_t CounterCount = static_cast<std::size_t>(Counter::Last);
-
-    /// Whether this build can represent @p counter at all.
-    ///
-    /// ONE place that converts a `Counter` to an index and states the contract,
-    /// because a guard folded into the operation is self-enforcing while a guard
-    /// called alongside one needs a scan. Both accessors go through it, and a
-    /// third added later -- a `Snapshot()`, a test-only `Reset()` -- has an
-    /// obvious thing to call rather than reaching `_counters` with no diagnostic,
-    /// which is the same silence class this is about.
+    /// Both accessors go through it, and a third added later -- a `Snapshot()`, a test-only
+    /// `Reset()` -- has an obvious thing to call rather than reaching `_counters` with no
+    /// diagnostic, which is the same silence class this is about. A template so the const and the
+    /// mutable accessor share one body.
     ///
     /// The assert is a PROGRAMMER ERROR rather than a condition to handle, so a
     /// debug build aborts at the site instead of reporting one metric that will
@@ -1368,21 +1434,21 @@ class AtomicMetricsSink final: public IMetricsSink
     /// the direction where the stale definition wins; what the assert buys is the
     /// odds of somebody NOTICING, which is what was missing.
     ///
+    /// @tparam Cells `CounterCells<std::atomic<std::uint64_t>>`, const or not.
+    /// @param counters This sink's storage.
     /// @param counter The counter a caller named.
-    /// @return Whether it is inside this build's range.
-    [[nodiscard]] bool CarriesCounter(Counter counter) const noexcept
+    /// @return Its slot, or nullptr past this build's range.
+    template <typename Cells>
+    [[nodiscard]] static auto SlotOf(Cells& counters, Counter counter) noexcept -> decltype(counters.Find(counter))
     {
-        // Qualified, so this is a direct call rather than a dispatch: the
-        // accessors are hot, the class is `final`, and the question being asked
-        // here is about THIS object's own storage.
-        auto const carried = AtomicMetricsSink::Carries(counter);
-        assert(carried
+        auto* const slot = counters.Find(counter);
+        assert(slot != nullptr
                && "counter past Counter::Last -- two translation units disagree about the enum, "
                   "so this build is inconsistent rather than misused (#1332)");
-        return carried;
+        return slot;
     }
 
-    std::atomic<std::uint64_t> _counters[CounterCount] {};
+    CounterCells<std::atomic<std::uint64_t>> _counters {};
 };
 
 } // namespace FastCache

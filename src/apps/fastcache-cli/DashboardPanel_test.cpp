@@ -75,7 +75,9 @@ constexpr std::string_view Absent = "n/a";
 [[nodiscard]] StatsReading CounterReading(IMetricsSink::Counter counter, std::uint64_t value)
 {
     auto reading = StatsReading {};
-    reading.counters[static_cast<std::size_t>(counter)] = value;
+    auto* const cell = reading.counters.Find(counter);
+    REQUIRE(cell != nullptr);
+    *cell = value;
     return reading;
 }
 
@@ -89,9 +91,14 @@ constexpr std::string_view Absent = "n/a";
 [[nodiscard]] StatsReading CacheReading(std::uint64_t step, std::vector<std::string_view> const& tiers)
 {
     auto reading = StatsReading {};
-    reading.counters[static_cast<std::size_t>(IMetricsSink::Counter::ConnectionsTotal)] = 3 * step;
+    auto const count = [&reading](IMetricsSink::Counter counter, std::uint64_t value) {
+        auto* const cell = reading.counters.Find(counter);
+        REQUIRE(cell != nullptr);
+        *cell = value;
+    };
+    count(IMetricsSink::Counter::ConnectionsTotal, 3 * step);
     // The cycle's share of expiry moves slower than expiry itself, so a panel reading the one for the other differs.
-    reading.counters[static_cast<std::size_t>(IMetricsSink::Counter::ExpiryKeysReclaimed)] = step;
+    count(IMetricsSink::Counter::ExpiryKeysReclaimed, step);
     reading.snapshot.storage = StorageStats { .itemCount = 1284991,
                                               .bytesUsed = std::size_t { 3 } << 30U,
                                               .bytesLimit = std::size_t { 4 } << 30U,
@@ -628,7 +635,9 @@ TEST_CASE("an absent figure reads the same bytes on the Unicode and ASCII rungs"
     // rungs, and the rows compared DO carry the marker -- or identical lines of numbers pass.
     auto series = CacheReading(1, { "memory" });
     series.snapshot.storage.reset();
-    series.counters[static_cast<std::size_t>(IMetricsSink::Counter::ExpiryKeysReclaimed)].reset();
+    auto* const cycle = series.counters.Find(IMetricsSink::Counter::ExpiryKeysReclaimed);
+    REQUIRE(cycle != nullptr);
+    cycle->reset();
     auto const script = std::vector<DashboardEvent> { SampleOf(series, 1), Tick };
     auto const unicode = CacheFrames(script, RenderRung::Unicode);
     auto const ascii = CacheFrames(script, RenderRung::Ascii);
@@ -880,7 +889,9 @@ TEST_CASE("the node panel's per-minute rate and mean compile come from the catal
     // ten jobs is a 2 s mean, not 2000. Read from a reading stating those two counters alone.
     auto const node = [](std::uint64_t jobs, std::uint64_t millis) {
         auto reading = CounterReading(IMetricsSink::Counter::WorkerJobsCompleted, jobs);
-        reading.counters[static_cast<std::size_t>(IMetricsSink::Counter::WorkerCompileMillisTotal)] = millis;
+        auto* const cell = reading.counters.Find(IMetricsSink::Counter::WorkerCompileMillisTotal);
+        REQUIRE(cell != nullptr);
+        *cell = millis;
         return reading;
     };
     auto view = PanelView {
@@ -2628,7 +2639,9 @@ struct NodeMachine
 {
     auto reading = StatsReading {};
     auto const count = [&reading](NodeCounter counter, std::uint64_t value) {
-        reading.counters[static_cast<std::size_t>(counter)] = value;
+        auto* const cell = reading.counters.Find(counter);
+        REQUIRE(cell != nullptr);
+        *cell = value;
     };
     count(NodeCounter::WorkerJobsCompleted, 41 * step);
     count(NodeCounter::WorkerCompileMillisTotal, 75440 * step);

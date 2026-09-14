@@ -547,8 +547,8 @@ std::string RenderPrometheus(StatsReading const& reading)
     std::uint64_t omittedBySkew = 0;
     for (auto const& row: CounterTable)
     {
-        auto const& value = reading.counters[static_cast<std::size_t>(row.counter)];
-        if (!value.has_value())
+        auto const* const cell = reading.counters.Find(row.counter);
+        if (cell == nullptr || !cell->has_value())
         {
             ++omittedBySkew;
             out += std::format("# SKEW {} is in the metrics catalogue and this build's sink has no "
@@ -558,7 +558,7 @@ std::string RenderPrometheus(StatsReading const& reading)
                                row.prometheusName);
             continue;
         }
-        Append(out, Metric { .name = row.prometheusName, .help = row.help, .type = row.type, .value = *value });
+        Append(out, Metric { .name = row.prometheusName, .help = row.help, .type = row.type, .value = **cell });
     }
 
     // How many catalogue rows this build's sink could not carry, as a SERIES.

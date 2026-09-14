@@ -69,8 +69,8 @@ constexpr auto CaseCounters = std::to_array<std::pair<std::string_view, IMetrics
         return RecordValue(std::move(fields));
     fields.push_back(Field { .name = "source", .value = TextCell(model.latestStamp->source) });
     for (auto const& [name, counter]: CaseCounters)
-        if (auto const& value = model.stats->counters[static_cast<std::size_t>(counter)]; value.has_value())
-            fields.push_back(Field { .name = std::string { name }, .value = NumberCell(*value) });
+        if (auto const* const value = model.stats->counters.Find(counter); value != nullptr && value->has_value())
+            fields.push_back(Field { .name = std::string { name }, .value = NumberCell(**value) });
     return RecordValue(std::move(fields));
 }
 
@@ -84,7 +84,9 @@ constexpr auto CaseCounters = std::to_array<std::pair<std::string_view, IMetrics
     {
         auto const* const row = FindIfOrNull(CaseCounters, [name](auto const& one) { return one.first == name; });
         REQUIRE(row != nullptr);
-        reading.counters[static_cast<std::size_t>(row->second)] = value;
+        auto* const cell = reading.counters.Find(row->second);
+        REQUIRE(cell != nullptr);
+        *cell = value;
     }
     return reading;
 }

@@ -931,10 +931,10 @@ inline constexpr std::array InfoTable {
 /// @return Its descriptor, or nullptr for `Last` or an out-of-range value.
 [[nodiscard]] constexpr CounterDescriptor const* DescriptorOf(IMetricsSink::Counter counter) noexcept
 {
-    auto const index = static_cast<std::size_t>(counter);
-    if (index >= CounterTable.size())
+    auto const index = CounterIndex(counter);
+    if (!index.has_value())
         return nullptr;
-    return &CounterTable[index];
+    return &CounterTable[*index];
 }
 
 } // namespace FastCache

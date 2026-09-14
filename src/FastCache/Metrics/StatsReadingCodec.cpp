@@ -205,8 +205,11 @@ std::vector<std::byte> EncodeStatsReading(StatsReading const& reading)
     // place in the grammar and a name in `ReadingFieldNames`.
     auto const& [counters, snapshot, version] = reading;
 
-    out.Bitmap(counters.size(), [&](std::size_t i) { return counters[i].has_value(); });
-    for (auto const& value: counters)
+    // By position, which is this grammar's whole design: the digest above is what makes a position mean
+    // the same row at both ends.
+    auto const cells = counters.Positional();
+    out.Bitmap(cells.size(), [&](std::size_t i) { return cells[i].has_value(); });
+    for (auto const& value: cells)
         if (value.has_value())
             out.U64(*value);
 
@@ -294,17 +297,18 @@ std::expected<StatsReading, StatsReadingFault> DecodeStatsReading(std::span<std:
     auto const truncated = std::unexpected { StatsReadingFault::Truncated };
     auto const malformed = std::unexpected { StatsReadingFault::Malformed };
 
-    auto const counterBits = ReadBitmap(in, reading.counters.size());
+    auto const cells = reading.counters.Positional();
+    auto const counterBits = ReadBitmap(in, cells.size());
     if (!counterBits.has_value())
         return in.Ok() ? malformed : truncated;
-    for (auto const i: std::views::iota(std::size_t { 0 }, reading.counters.size()))
+    for (auto const i: std::views::iota(std::size_t { 0 }, cells.size()))
     {
         if (!(*counterBits)[i])
             continue;
         std::uint64_t value = 0;
         if (!in.ReadU64(value))
             return truncated;
-        reading.counters[i] = value;
+        cells[i] = value;
     }
 
     auto& [storage, storageTiers, host, hostLoad, upstreamConfigured, consensus, uptime] = reading.snapshot;

@@ -204,7 +204,7 @@ TEST_CASE("bench: one live-stats tick, text against binary", "[!benchmark][lives
     BENCHMARK("DecodeStatsReading (what a client does with it)")
     {
         auto const back = DecodeStatsReading(encoded);
-        return back.has_value() ? back->counters.size() : std::size_t { 0 };
+        return back.has_value() ? back->counters.Positional().size() : std::size_t { 0 };
     };
 }
 

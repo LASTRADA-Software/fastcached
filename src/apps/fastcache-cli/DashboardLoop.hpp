@@ -96,8 +96,8 @@ template <IMetricsSink::Counter Row>
 [[nodiscard]] constexpr ReadingField CounterField() noexcept
 {
     return ReadingField { .read = [](StatsReading const& reading, std::optional<StorageTier> /*tier*/) noexcept {
-        auto const& value = reading.counters[static_cast<std::size_t>(Row)];
-        return value.has_value() ? std::optional { static_cast<double>(*value) } : std::nullopt;
+        auto const* const value = reading.counters.Find(Row);
+        return value != nullptr && value->has_value() ? std::optional { static_cast<double>(**value) } : std::nullopt;
     } };
 }
 

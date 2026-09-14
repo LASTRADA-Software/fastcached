@@ -17,8 +17,9 @@ StatsReading CaptureStatsReading(IMetricsSink const& metrics, MetricsSnapshot co
     // with a zero it cannot mean.
     for (auto const& row: CounterTable)
     {
-        if (metrics.Carries(row.counter))
-            reading.counters[static_cast<std::size_t>(row.counter)] = metrics.Read(row.counter);
+        auto* const cell = reading.counters.Find(row.counter);
+        if (cell != nullptr && metrics.Carries(row.counter))
+            *cell = metrics.Read(row.counter);
     }
     return reading;
 }
