@@ -2447,7 +2447,7 @@ TEST_CASE("a cache panel's source line names the source, what was asked and wher
     auto const row = SourceRow(frames.front());
     REQUIRE(row.has_value());
     CHECK(Columns(Unwrap(row), 1, 80).starts_with(std::format("  source  metrics (/metrics at {})   ", ChromeAdmin)));
-    CHECK(Unwrap(row).ends_with(std::format("1 samples, 0 gaps {}", GlyphsFor(RenderRung::Unicode).vertical)));
+    CHECK(Unwrap(row).ends_with(std::format("1 sample, 0 gaps {}", GlyphsFor(RenderRung::Unicode).vertical)));
 }
 
 TEST_CASE("before its first reading a title bar and source line name each absent fact by the marker",
@@ -3859,6 +3859,41 @@ TEST_CASE("a heartbeat past its threshold is dressed stale and one inside it fre
               lit.spans.front(),
               [](FrameSpan const& span) { return span.tone == FrameTone::Fresh || span.tone == FrameTone::Stale; })
           == 3);
+}
+
+TEST_CASE("a count of one is singular: one machine in the title, one sample, one of one machine in the filter",
+          "[cli][dashboard][panel][fleet][parity]")
+{
+    // The owner's demo fleet is one machine, so `1 machines` was the first title he read (gallery D1). WHAT
+    // DISTINGUISHES, each spelling asked for in both numbers so neither passes by never being drawn: the title says
+    // `1 machine` over one machine and `12 machines` over twelve; the source line says `1 sample` after one sample
+    // and `2 samples` after two; a kept filter says `1 of 1 machine` and `12 of 12 machines`.
+    auto const filtered = [](std::size_t machines) {
+        auto const run = RunFleet({ FleetSampleOf(1, LeaderFleetText(machines)),
+                                    Tick,
+                                    FleetSampleOf(2, LeaderFleetText(machines)),
+                                    Tick,
+                                    KeyOf("/"),
+                                    KeyOf("b"),
+                                    KeyOf(std::string { '\r' }) },
+                                  120,
+                                  40,
+                                  UnicodeContext());
+        REQUIRE(run.frames.size() == 5);
+        return run.frames;
+    };
+    auto const one = filtered(1);
+    INFO(one.front());
+    CHECK(Lines(one.front()).front().contains("  1 machine  "));
+    CHECK(one.front().contains("1 sample, 0 gaps"));
+    CHECK(one[1].contains("2 samples, 0 gaps"));
+    CHECK(one.back().contains("filter  /b  1 of 1 machine; / edits"));
+    for (auto const& frame: one)
+        CHECK_FALSE(frame.contains("1 machines"));
+
+    auto const twelve = filtered(FleetMachines);
+    CHECK(Lines(twelve.front()).front().contains(std::format("  {} machines  ", FleetMachines)));
+    CHECK(twelve.back().contains(std::format("filter  /b  {0} of {0} machines; / edits", FleetMachines)));
 }
 
 TEST_CASE("PgDn and PgUp scroll the fleet table by the rows it shows, and the overflow line says so",
