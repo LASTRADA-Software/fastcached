@@ -33,6 +33,7 @@ set(_fc_cli_sources
     LiveStats.cpp
     MemcachedClient.cpp
     NodeClient.cpp
+    NodeSlots.cpp
     NodeStatusText.cpp
     RespClient.cpp
     SocketExchange.cpp
@@ -115,6 +116,7 @@ if(FASTCACHED_BUILD_TESTS)
         MemcachedClient_test.cpp
         MemcachedVerbs_test.cpp
         NodeClient_test.cpp
+        NodeSlots_test.cpp
         NodeVerbs_test.cpp
         RespClient_test.cpp
         StatsSource_test.cpp
