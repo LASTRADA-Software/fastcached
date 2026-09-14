@@ -4,6 +4,7 @@
 #include <FastCache/Cache/StorageTier.hpp>
 #include <FastCache/Core/Ranges.hpp>
 #include <FastCache/Metrics/MetricsCatalog.hpp>
+#include <FastCache/Platform/HostLoad.hpp>
 
 #include <algorithm>
 #include <array>
@@ -11,6 +12,7 @@
 #include <chrono>
 #include <cstddef>
 #include <format>
+#include <optional>
 #include <ranges>
 #include <utility>
 
@@ -186,6 +188,13 @@ namespace
             .store = [](HostCapacity& h, std::uint64_t v) noexcept { h.busySlots = static_cast<std::size_t>(v); } },
     };
 
+    /// The machine's CPU counters as `/metrics` spells them: busy ticks, then every tick.
+    constexpr std::string_view CpuBusyTicksSeries = "fastcache_node_cpu_busy_ticks_total";
+    /// See `CpuBusyTicksSeries`.
+    constexpr std::string_view CpuTicksSeries = "fastcache_node_cpu_ticks_total";
+    /// The memory a new process could obtain, as `/metrics` spells it.
+    constexpr std::string_view MemoryAvailableSeries = "fastcache_node_memory_available_bytes";
+
     /// The series stating whether an upstream is configured, 0 or 1.
     constexpr std::string_view UpstreamSeries = "fastcache_node_upstream_configured";
 
@@ -204,6 +213,24 @@ namespace
         return field == nullptr || (field->value.kind != CellKind::Number && field->value.kind != CellKind::Text)
                    ? std::nullopt
                    : AsUnsigned(field->value.lexical);
+    }
+
+    /// What a machine is doing, out of @p record: each figure on its own, as a scrape renders each on its own.
+    ///
+    /// The CPU is a pair or nothing: one tick counter without the other is no share of anything. **A load block
+    /// with neither figure reads back absent**, the one fact a scrape cannot state, since it renders such a block
+    /// as no series at all; a panel draws the two alike, and the subscription's binary form states it.
+    /// @param record The record.
+    /// @return The load, or nullopt when the record states no figure of it.
+    [[nodiscard]] std::optional<HostLoadReading> HostLoadIn(Value const& record)
+    {
+        auto load = HostLoadReading {};
+        auto const busy = CountIn(record, CpuBusyTicksSeries);
+        auto const total = CountIn(record, CpuTicksSeries);
+        if (busy.has_value() && total.has_value())
+            load.cpu = CpuTicks { .busy = *busy, .total = *total };
+        load.availableMemoryBytes = CountIn(record, MemoryAvailableSeries);
+        return load.cpu.has_value() || load.availableMemoryBytes.has_value() ? std::optional { load } : std::nullopt;
     }
 
     /// A block read whole out of @p record: every row of @p rows present, or no block.
@@ -253,6 +280,7 @@ namespace
             snapshot.storageTiers[static_cast<std::size_t>(tier.tier)] =
                 BlockIn(record, TierSeries, [&tier](std::string_view series) { return TierSeriesName(series, tier.name); });
         snapshot.host = BlockIn(record, HostSeries, plain);
+        snapshot.hostLoad = HostLoadIn(record);
         if (auto const upstream = CountIn(record, UpstreamSeries); upstream.has_value() && *upstream <= 1)
             snapshot.upstreamConfigured = *upstream == 1;
         if (auto const seconds = CountIn(record, UptimeSeries); seconds.has_value())

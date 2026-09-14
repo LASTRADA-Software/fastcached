@@ -6,6 +6,7 @@
 #include <FastCache/Core/Version.hpp>
 #include <FastCache/Metrics/MetricsCatalog.hpp>
 #include <FastCache/Metrics/PrometheusFormatter.hpp>
+#include <FastCache/Platform/HostLoad.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -14,9 +15,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <format>
+#include <initializer_list>
 #include <optional>
 #include <ranges>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <tests/Unwrap.hpp>
@@ -382,6 +385,8 @@ namespace
                                            .diskCapacityBytes = 2'000'398'934'016,
                                            .diskFreeBytes = 442'381'631'488,
                                            .busySlots = 7 };
+    reading.snapshot.hostLoad = HostLoadReading { .cpu = CpuTicks { .busy = 7'700'001, .total = 9'100'003 },
+                                                  .availableMemoryBytes = 21'474'836'480 };
     reading.snapshot.upstreamConfigured = true;
     reading.snapshot.uptime = Uptime { std::chrono::seconds { 864'017 } };
     reading.version = "0.4.1-dev \"build\"";
@@ -427,6 +432,7 @@ TEST_CASE("a /metrics scrape reads back as the reading the daemon rendered it fr
     CHECK(back.snapshot.storage == expected.snapshot.storage);
     CHECK(back.snapshot.storageTiers == expected.snapshot.storageTiers);
     CHECK(back.snapshot.host == original.snapshot.host);
+    CHECK(back.snapshot.hostLoad == original.snapshot.hostLoad);
     CHECK(back.snapshot.upstreamConfigured == original.snapshot.upstreamConfigured);
     CHECK(back.snapshot.uptime == original.snapshot.uptime);
     CHECK(back.version == original.version);
@@ -461,6 +467,40 @@ TEST_CASE("a block a record carries only part of reads as absent, never as zeroe
     auto const noCores = without("fastcache_node_logical_cores");
     CHECK_FALSE(noCores.snapshot.host.has_value());
     CHECK(noCores.snapshot.storage == whole.snapshot.storage);
+}
+
+TEST_CASE("a machine's load reads back figure by figure, and its CPU as a pair or not at all", "[cli][stats]")
+{
+    // A scrape renders each load figure only when it was read, so the adapter reads each on its own. WHAT
+    // DISTINGUISHES: one tick counter gone takes the CPU and leaves the memory; the memory gone leaves the CPU;
+    // both gone is no load block, and the host beside it stays either way.
+    auto const original = EveryFieldDistinct();
+    auto const whole = ReadBack(RenderPrometheus(original));
+    REQUIRE(whole.snapshot.hostLoad.has_value());
+    auto const without = [&original](std::initializer_list<std::string_view> series) {
+        auto record = ParsePrometheus(RenderPrometheus(original));
+        auto const before = record.fields.size();
+        std::erase_if(record.fields,
+                      [series](Field const& field) { return std::ranges::find(series, field.name) != series.end(); });
+        REQUIRE(record.fields.size() == before - series.size());
+        return Unwrap(StatsReadingFromRecord(record, StatsOrigin::Metrics));
+    };
+
+    auto const noTotal = without({ "fastcache_node_cpu_ticks_total" });
+    REQUIRE(noTotal.snapshot.hostLoad.has_value());
+    CHECK_FALSE(Unwrap(noTotal.snapshot.hostLoad).cpu.has_value());
+    CHECK(Unwrap(noTotal.snapshot.hostLoad).availableMemoryBytes == Unwrap(original.snapshot.hostLoad).availableMemoryBytes);
+
+    auto const noMemory = without({ "fastcache_node_memory_available_bytes" });
+    REQUIRE(noMemory.snapshot.hostLoad.has_value());
+    CHECK(Unwrap(noMemory.snapshot.hostLoad).cpu == Unwrap(original.snapshot.hostLoad).cpu);
+    CHECK_FALSE(Unwrap(noMemory.snapshot.hostLoad).availableMemoryBytes.has_value());
+
+    auto const none = without({ "fastcache_node_cpu_busy_ticks_total",
+                                "fastcache_node_cpu_ticks_total",
+                                "fastcache_node_memory_available_bytes" });
+    CHECK_FALSE(none.snapshot.hostLoad.has_value());
+    CHECK(none.snapshot.host == whole.snapshot.host);
 }
 
 TEST_CASE("each source states the part of the live model it carries, and INFO states none", "[cli][stats]")
