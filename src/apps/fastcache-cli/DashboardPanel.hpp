@@ -61,9 +61,12 @@ enum class FigureSource : std::uint8_t
 /// 8-aligned members.
 struct FigureSpec
 {
-    ReadingField field {};      ///< The primary field.
-    ReadingField other {};      ///< The second operand; see `FigureSource`.
-    double scale { 1.0 };       ///< Applied to every value: 60 turns a rate per second into one per minute.
+    ReadingField field {}; ///< The primary field.
+    ReadingField other {}; ///< The second operand; see `FigureSource`.
+    double scale { 1.0 };  ///< Applied to every value: 60 turns a rate per second into one per minute.
+    /// A present value above this is a state worth acting on, and is drawn as an alert where the terminal can
+    /// dress it (#134 G1: a refusal rate above zero); nullopt for a figure that states no alarm.
+    std::optional<double> alertAbove {};
     std::string_view suffix {}; ///< Written after a PRESENT value only, such as `/s`.
     /// Further counters whose rates a `Rate` adds beyond `other`: a total over more than two, such as
     /// every refusal. Read only by a source whose `FigureSourceTable` row takes addends.

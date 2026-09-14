@@ -523,19 +523,58 @@ namespace
         return line;
     }
 
+    /// Whether @p value is past what @p figure calls worth acting on.
+    /// @param figure The figure.
+    /// @param value Its newest value.
+    /// @return True for a present, finite value above the figure's alert threshold.
+    [[nodiscard]] bool Alarming(FigureSpec const& figure, std::optional<double> value) noexcept
+    {
+        return figure.alertAbove.has_value() && value.has_value() && std::isfinite(*value) && *value > *figure.alertAbove;
+    }
+
+    /// How a figure is dressed: an alert when it is past its threshold, @p otherwise when it is a reading that is
+    /// not, and plain for the absent marker.
+    /// @param figure The figure.
+    /// @param value Its newest value.
+    /// @param otherwise The tone of an unalarming reading; nullopt for none.
+    /// @return The tone.
+    [[nodiscard]] std::optional<FrameTone> FigureTone(FigureSpec const& figure,
+                                                      std::optional<double> value,
+                                                      std::optional<FrameTone> otherwise) noexcept
+    {
+        if (Alarming(figure, value))
+            return FrameTone::Alert;
+        // The absent marker is no figure, so it is never given a figure's weight.
+        return value.has_value() && std::isfinite(*value) ? otherwise : std::nullopt;
+    }
+
     /// A figure written beside something else, with its words around it: `completed 12 884`.
     /// @param in The frame's inputs.
     /// @param beside The figure.
-    /// @return The text.
-    [[nodiscard]] std::string BesideText(FrameInputs const& in, BesideFigure const& beside)
+    /// @return The text, dressed as an alert when the figure is past its threshold and not at all otherwise:
+    ///         one piece carries one tone, and the words and the value go for width together.
+    [[nodiscard]] Piece BesidePiece(FrameInputs const& in, BesideFigure const& beside)
     {
+        auto const value = Newest(SeriesFor(in, beside.figure, {}));
         auto text = std::string {};
         if (!beside.before.empty())
             text += std::string { beside.before } + " ";
-        text += FigureText(in, beside.figure, Newest(SeriesFor(in, beside.figure, {})));
+        text += FigureText(in, beside.figure, value);
         if (!beside.after.empty())
             text += " " + std::string { beside.after };
-        return text;
+        return Piece { .text = std::move(text),
+                       .priority = beside.priority,
+                       .tone = FigureTone(beside.figure, value, std::nullopt) };
+    }
+
+    /// @p piece with @p lead written before its text, its tone still covering only the text.
+    /// @param lead What goes before: a gap or an indent.
+    /// @param piece The piece.
+    /// @return The piece.
+    [[nodiscard]] Piece Led(std::string_view lead, Piece piece)
+    {
+        piece.text.insert(0, lead);
+        return piece;
     }
 
     /// @p text wrapped at its spaces into lines of at most @p width cells; a word wider than that is a line of its own.
@@ -638,37 +677,46 @@ namespace
         auto const drawsTrend = in.glyphs->sparkLevels.size() >= 2;
         auto const trendMinimum = in.cellWidth(TrendGap) + MinimumTrendCells;
         auto fitted = std::vector<std::vector<Piece>> {};
-        auto notes = std::vector<std::vector<std::string>> {};
+        // Where a wrapped note starts on its row, and its lines.
+        struct WrappedNote
+        {
+            std::size_t start { 0 };           ///< The cell its first line starts at, and its later lines hang at.
+            std::vector<std::string> lines {}; ///< Its lines, without the space before them.
+        };
+        auto notes = std::vector<WrappedNote> {};
         for (auto const index: std::views::iota(std::size_t { 0 }, rows.size()))
         {
             auto const& row = rows[index];
-            auto pieces =
-                std::vector<Piece> { Piece { .text = std::string { Indent } + FitRight(row.label, LabelColumns, in.cellWidth)
-                                                     + AlignRight(figures[index], figureColumns, in.cellWidth),
-                                             .priority = Priority::Essential } };
+            // The label recedes and the figure carries the weight, so they are two pieces, both essential.
+            auto pieces = std::vector<Piece> {
+                Piece { .text = std::string { Indent } + FitRight(row.label, LabelColumns, in.cellWidth),
+                        .priority = Priority::Essential,
+                        .tone = FrameTone::Label },
+                Piece { .text = AlignRight(figures[index], figureColumns, in.cellWidth),
+                        .priority = Priority::Essential,
+                        .tone = FigureTone(row.figure, Newest(series[index]), FrameTone::Figure) },
+            };
             if (drawsTrend && row.trend == Trend::Drawn)
                 pieces.push_back(Piece { .priority = row.trendPriority, .trend = true });
             for (auto const& beside: row.beside)
-                pieces.push_back(
-                    Piece { .text = std::string { PieceGap } + BesideText(in, beside), .priority = beside.priority });
+                pieces.push_back(Led(PieceGap, BesidePiece(in, beside)));
             // A row with no trend has nothing whose width the note competes with, so its note wraps under the
             // row instead of going; a row with one keeps its note a piece like any other.
             auto const wraps = row.trend == Trend::None && !row.note.empty();
             if (!row.note.empty() && !wraps)
-                pieces.push_back(
-                    Piece { .text = std::string { PieceGap } + std::string { row.note }, .priority = row.notePriority });
+                pieces.push_back(Piece { .text = std::string { PieceGap } + std::string { row.note },
+                                         .priority = row.notePriority,
+                                         .tone = FrameTone::Label });
 
             auto kept = FitPieces(std::move(pieces), budget, trendMinimum, in.cellWidth);
             if (!kept.has_value())
                 return std::unexpected(kept.error());
-            auto note = std::vector<std::string> {};
+            auto note = WrappedNote {};
             if (wraps)
             {
-                auto const start = TextWidth(*kept, in.cellWidth) + in.cellWidth(PieceGap);
-                if (budget >= start + MinimumNoteCells)
-                    note = Wrapped(row.note, budget - start, in.cellWidth);
-                for (auto const at: std::views::iota(std::size_t { 0 }, note.size()))
-                    note[at] = std::string(at == 0 ? in.cellWidth(PieceGap) : start, ' ') + note[at];
+                note.start = TextWidth(*kept, in.cellWidth) + in.cellWidth(PieceGap);
+                if (budget >= note.start + MinimumNoteCells)
+                    note.lines = Wrapped(row.note, budget - note.start, in.cellWidth);
             }
             notes.push_back(std::move(note));
             fitted.push_back(std::move(*kept));
@@ -679,9 +727,11 @@ namespace
         auto essential = std::size_t { 0 };
         for (auto const& pieces: fitted)
         {
-            essential = std::max(essential, in.cellWidth(pieces.front().text));
+            // The label and the figure are the row's first two pieces, and both essential.
+            auto const leading = std::span { pieces }.first(std::min<std::size_t>(2, pieces.size()));
+            essential = std::max(essential, TextWidth(leading, in.cellWidth));
             if (std::ranges::any_of(pieces, &Piece::trend))
-                reserve = std::max(reserve, TextWidth(std::span { pieces }.subspan(1), in.cellWidth));
+                reserve = std::max(reserve, TextWidth(std::span { pieces }.subspan(leading.size()), in.cellWidth));
         }
         auto const used = essential + in.cellWidth(TrendGap) + reserve;
         auto const trendCells = budget > used ? std::max(MinimumTrendCells, budget - used) : MinimumTrendCells;
@@ -691,14 +741,20 @@ namespace
         {
             auto const& row = rows[index];
             auto const trend = Sparkline(Window(series[index], trendCells), *in.glyphs);
-            auto item = Item { .lines = { Joined(fitted[index], trend) }, .priority = row.priority };
-            // The note's first line continues the row; the rest hang under where it began.
-            for (auto const at: std::views::iota(std::size_t { 0 }, notes[index].size()))
+            auto item = LineOf(fitted[index], trend, row.priority);
+            // The note's first line continues the row; the rest hang under where it began. Each is a Label run.
+            auto const& note = notes[index];
+            for (auto const at: std::views::iota(std::size_t { 0 }, note.lines.size()))
             {
-                if (at == 0)
-                    item.lines.front() += notes[index][at];
-                else
-                    item.lines.push_back(notes[index][at]);
+                if (at > 0)
+                    item.lines.emplace_back();
+                auto& line = item.lines.back();
+                line.append(at == 0 ? PieceGap.size() : note.start, ' ');
+                item.spans.push_back(LineSpan { .line = item.lines.size() - 1,
+                                                .byte = line.size(),
+                                                .length = note.lines[at].size(),
+                                                .tone = FrameTone::Label });
+                line += note.lines[at];
             }
             items.push_back(std::move(item));
 
@@ -708,12 +764,10 @@ namespace
             // narrow terminal keeps the total's trend.
             auto parts = std::vector<Piece> {};
             for (auto const& part: row.split)
-                parts.push_back(
-                    Piece { .text = std::string { parts.empty() ? SplitIndent : PieceGap } + BesideText(in, part),
-                            .priority = part.priority });
+                parts.push_back(Led(parts.empty() ? SplitIndent : PieceGap, BesidePiece(in, part)));
             auto kept = FitPieces(std::move(parts), budget, 0, in.cellWidth);
             if (kept.has_value() && !kept->empty())
-                items.push_back(Item { .lines = { Joined(*kept, {}) }, .priority = row.priority });
+                items.push_back(LineOf(*kept, {}, row.priority));
         }
         return items;
     }
@@ -875,10 +929,36 @@ namespace
 
     /// @p text as a fact of one piece.
     /// @param text The text.
+    /// @param tone How it is dressed; none for a reading that needs nobody.
     /// @return The fact.
-    [[nodiscard]] FactText Said(std::string text)
+    [[nodiscard]] FactText Said(std::string text, std::optional<FrameTone> tone = std::nullopt)
     {
-        return FactText { .pieces = { Piece { .text = std::move(text), .priority = Priority::Essential } }, .more = {} };
+        return FactText { .pieces = { Piece { .text = std::move(text), .priority = Priority::Essential, .tone = tone } },
+                          .more = {} };
+    }
+
+    /// How a state a node reports is dressed: a word for what it means to an operator, keyed on the wire's name.
+    struct StateTone
+    {
+        std::string_view name; ///< The state, as `NodeStatusText` spells it.
+        FrameTone tone;        ///< What it means.
+    };
+
+    /// The states worth a glance: a survey not done yet, an election under way, and a worker with nothing to
+    /// serve. A state not here -- `serving`, `follower`, `leader` -- is the ordinary one and is not dressed.
+    constexpr auto StateTones = std::to_array<StateTone>({
+        { .name = "surveying", .tone = FrameTone::Stale },
+        { .name = "undecided", .tone = FrameTone::Stale },
+        { .name = "nothing-to-serve", .tone = FrameTone::Alert },
+    });
+
+    /// The tone of the state named @p name.
+    /// @param name The state's name.
+    /// @return Its tone, or nullopt for an ordinary state.
+    [[nodiscard]] std::optional<FrameTone> ToneOfState(std::string_view name) noexcept
+    {
+        auto const* row = FindIfOrNull(StateTones, [name](StateTone const& one) { return one.name == name; });
+        return row == nullptr ? std::nullopt : std::optional<FrameTone> { row->tone };
     }
 
     /// The newest node status, or nullptr before any was read.
@@ -936,10 +1016,9 @@ namespace
               if (status == nullptr || !status->runtime.toolchains.has_value())
                   return Said(std::string { in.absent });
               auto const& runtime = status->runtime;
-              return Said(std::format("{} {} of {}",
-                                      NameOfToolchainState(*runtime.toolchains),
-                                      runtime.toolchainsServed,
-                                      runtime.toolchainsDiscovered));
+              auto const state = NameOfToolchainState(*runtime.toolchains);
+              return Said(std::format("{} {} of {}", state, runtime.toolchainsServed, runtime.toolchainsDiscovered),
+                          ToneOfState(state));
           } },
         { .fact = StatusFact::Registrars,
           .render = [](FrameInputs const& in, FactCell const& /*cell*/, std::size_t /*width*/) -> std::optional<FactText> {
@@ -948,13 +1027,20 @@ namespace
               if (status == nullptr || !status->runtime.registrarsTotal.has_value())
                   return Said(std::string { in.absent });
               auto const& runtime = status->runtime;
-              // Absent means NEVER, which is not a long time ago: a node no scheduler has accepted says so.
+              // Absent means NEVER, which is not a long time ago: a node no scheduler has accepted says so, and it
+              // is the state worth acting on; some of its registrations held and not all of them is worth a look.
+              auto const never = !runtime.lastRegistrationSecondsAgo.has_value();
+              auto tone = std::optional<FrameTone> {};
+              if (never)
+                  tone = FrameTone::Alert;
+              else if (runtime.registrarsRegistered.value_or(0) < *runtime.registrarsTotal)
+                  tone = FrameTone::Stale;
               return Said(std::format("{} of {}, {}",
                                       CountText(in, runtime.registrarsRegistered),
                                       *runtime.registrarsTotal,
-                                      runtime.lastRegistrationSecondsAgo.has_value()
-                                          ? std::format("last {}s ago", *runtime.lastRegistrationSecondsAgo)
-                                          : std::string { "never accepted" }));
+                                      never ? std::string { "never accepted" }
+                                            : std::format("last {}s ago", *runtime.lastRegistrationSecondsAgo)),
+                          tone);
           } },
         { .fact = StatusFact::Consensus,
           .render = [](FrameInputs const& in, FactCell const& /*cell*/, std::size_t /*width*/) -> std::optional<FactText> {
@@ -962,7 +1048,10 @@ namespace
               if (!RunsConsensus(status))
                   return std::nullopt;
               auto const& role = status->runtime.schedulerRole;
-              return Said(role.has_value() ? std::string { NameOfSchedulerRole(*role) } : std::string { in.absent });
+              if (!role.has_value())
+                  return Said(std::string { in.absent });
+              auto const name = NameOfSchedulerRole(*role);
+              return Said(std::string { name }, ToneOfState(name));
           } },
         { .fact = StatusFact::Leader,
           .render = [](FrameInputs const& in, FactCell const& /*cell*/, std::size_t /*width*/) -> std::optional<FactText> {
@@ -997,9 +1086,12 @@ namespace
                   return std::nullopt;
               auto fact = FactText {};
               for (auto const& figure: cell.figures)
-                  fact.pieces.push_back(
-                      Piece { .text = std::string { fact.pieces.empty() ? "" : PieceGap } + BesideText(in, figure),
-                              .priority = fact.pieces.empty() ? Priority::Essential : figure.priority });
+              {
+                  auto piece = Led(fact.pieces.empty() ? std::string_view {} : PieceGap, BesidePiece(in, figure));
+                  if (fact.pieces.empty())
+                      piece.priority = Priority::Essential;
+                  fact.pieces.push_back(std::move(piece));
+              }
               // How full the tier is: no status carries it yet, so the marker stands where the fill goes.
               fact.pieces.push_back(
                   Piece { .text = std::format("{}{} / {}", PieceGap, in.absent, in.absent), .priority = Priority::Normal });
@@ -1015,8 +1107,7 @@ namespace
               fact.pieces.push_back(
                   Piece { .text = std::format("{}mem free {}", PieceGap, in.absent), .priority = Priority::Normal });
               for (auto const& figure: cell.figures)
-                  fact.pieces.push_back(
-                      Piece { .text = std::string { PieceGap } + BesideText(in, figure), .priority = figure.priority });
+                  fact.pieces.push_back(Led(PieceGap, BesidePiece(in, figure)));
               return fact;
           } },
     } };
@@ -1092,22 +1183,29 @@ namespace
                         return std::unexpected(lead + kept.error());
                     continue;
                 }
-                auto text = std::string { Indent } + FitRight(entry.line->cells.front().label, labelColumns, in.cellWidth)
-                            + Joined(*kept, {});
+                auto pieces = std::vector<Piece> { Piece {
+                    .text = std::string { Indent } + FitRight(entry.line->cells.front().label, labelColumns, in.cellWidth),
+                    .priority = Priority::Essential,
+                    .tone = FrameTone::Label } };
+                std::ranges::move(*kept, std::back_inserter(pieces));
                 if (entry.second.has_value())
                 {
-                    auto const aligned = std::max(in.cellWidth(text), lead + firstColumns);
-                    auto second = std::string { FactGap }
-                                  + FitRight(entry.line->cells[1].label, secondLabelColumns, in.cellWidth)
-                                  + Joined(entry.second->pieces, {});
+                    auto const used = TextWidth(pieces, in.cellWidth);
+                    auto const aligned = std::max(used, lead + firstColumns);
+                    auto const secondCells =
+                        in.cellWidth(FactGap) + secondLabelColumns + TextWidth(entry.second->pieces, in.cellWidth);
                     // The second cell goes whole when it does not fit beside the first.
-                    if (aligned + in.cellWidth(second) <= budget)
+                    if (aligned + secondCells <= budget)
                     {
-                        text = FitRight(text, aligned, in.cellWidth);
-                        text += second;
+                        pieces.push_back(
+                            Piece { .text = std::string(aligned - used, ' ') + std::string { FactGap }
+                                            + FitRight(entry.line->cells[1].label, secondLabelColumns, in.cellWidth),
+                                    .priority = Priority::Essential,
+                                    .tone = FrameTone::Label });
+                        std::ranges::move(entry.second->pieces, std::back_inserter(pieces));
                     }
                 }
-                auto item = Item { .lines = { std::move(text) }, .priority = entry.line->priority };
+                auto item = LineOf(pieces, {}, entry.line->priority);
                 for (auto const& more: entry.first.more)
                     item.lines.push_back(std::string(lead, ' ') + more);
                 group.push_back(std::move(item));
