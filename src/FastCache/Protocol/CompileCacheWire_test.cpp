@@ -2127,12 +2127,12 @@ TEST_CASE("Every push kind round-trips through its own decoder")
     CHECK(Unwrap(reading).tick == 42);
     CHECK(std::ranges::equal(Unwrap(reading).body, body));
 
-    auto const event = EncodeLiveEvent(LiveEventFields { .kind = LiveEventKind::WorkerExpired, .detail = "build-07" });
+    auto const event = EncodeLiveEvent(LiveEventFields { .kind = LiveEventKind::WorkerLeft, .detail = "build-07" });
     auto const eventView = DecodePush(event);
     REQUIRE(eventView.has_value());
     auto const changed = DecodeLiveEvent(Unwrap(eventView).fields);
     REQUIRE(changed.has_value());
-    CHECK(Unwrap(changed).kind == LiveEventKind::WorkerExpired);
+    CHECK(Unwrap(changed).kind == LiveEventKind::WorkerLeft);
     CHECK(Unwrap(changed).detail == "build-07");
 
     auto const gap = EncodeLiveGap(LiveGapFields { .dropped = 3, .firstTick = 10, .lastTick = 12 });
