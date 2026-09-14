@@ -209,6 +209,20 @@ class FailingReadSocket final: public SocketDecorator
     std::size_t _remaining;
 };
 
+/// Retire a parked operation the way every transport's `Close()` does: with `Cancelled`.
+///
+/// **Call it LAST, with every member already touched** (#1430). Completing resumes the
+/// awaiting coroutine inline, and a coroutine that owns the socket may destroy it before
+/// this returns, so nothing of the socket may run afterwards. A free function, so it
+/// cannot reach a member itself; the order around it is the caller's, and both parking
+/// fakes below spell it the same way -- detach, forward, count, complete.
+/// @param parked The operation, already detached from its socket.
+inline void CompleteCancelled(IoAwaitable& parked) noexcept
+{
+    parked.Complete(
+        IoResult { std::unexpected(NetError { .code = NetErrorCode::Cancelled, .systemCode = 0, .context = {} }) });
+}
+
 /// A socket whose `WaitReadable` PARKS, the way a reactor socket's does.
 ///
 /// **The in-memory transport cannot stage this, and that is the whole reason this
@@ -235,20 +249,6 @@ class FailingReadSocket final: public SocketDecorator
 /// ordinary teardown and hide the defect behind its own bug -- but a watch retired by
 /// the connection's teardown and one retired by the caller that armed it are opposite
 /// answers about #710, and one counter would render them the same.
-/// Retire a parked operation the way every transport's `Close()` does: with `Cancelled`.
-///
-/// **Call it LAST, with every member already touched** (#1430). Completing resumes the
-/// awaiting coroutine inline, and a coroutine that owns the socket may destroy it before
-/// this returns, so nothing of the socket may run afterwards. A free function, so it
-/// cannot reach a member itself; the order around it is the caller's, and both parking
-/// fakes below spell it the same way -- detach, forward, count, complete.
-/// @param parked The operation, already detached from its socket.
-inline void CompleteCancelled(IoAwaitable& parked) noexcept
-{
-    parked.Complete(
-        IoResult { std::unexpected(NetError { .code = NetErrorCode::Cancelled, .systemCode = 0, .context = {} }) });
-}
-
 class ParkingReadableSocket final: public SocketDecorator
 {
   public:
