@@ -57,10 +57,12 @@ namespace FastCache
 /// ```
 /// u64 layout digest
 /// counter presence bitmap, ceil(rows/8) bytes; then u64 per present counter, in row order
-/// u8 presence: bit0 storage, bit1 host, bit2 upstreamConfigured, bit3 consensus
+/// u8 presence: bit0 storage, bit1 host, bit2 upstreamConfigured, bit3 consensus, bit4 hostLoad
 /// storage (if present): u64 per StorageStatsWireFields row
 /// tier presence bitmap, ceil(tiers/8) bytes; then StorageStatsWireFields per present tier
 /// host (if present): u64 per HostCapacityWireFields row
+/// hostLoad (if present): u8 presence (bit0 cpu, bit1 availableMemoryBytes);
+///                        u64 busy, u64 total (if cpu); u64 bytes (if availableMemoryBytes)
 /// upstreamConfigured (if present): u8, 0 or 1
 /// consensus (if present): u32 member count, then per member u32 length + bytes;
 ///                         u8 leader present, then u32 length + bytes; u64 term; u64 commitIndex; u8 role
@@ -145,6 +147,15 @@ namespace StatsReadingWire
                       == (HostSizeFields.size() * sizeof(std::size_t)) + (HostByteFields.size() * sizeof(std::uint64_t)),
                   "every field of HostCapacity must travel in a live-stats snapshot");
 
+    /// The fields of `HostLoadReading`, by name, in the order they travel -- the CPU counters
+    /// spelled as the two `u64`s the grammar writes rather than as the one optional holding them.
+    ///
+    /// Names rather than member pointers for the reason `ConsensusFieldNames` gives: the members
+    /// are optionals of different shapes. The encoder's structured bindings hold the count.
+    inline constexpr std::array HostLoadFieldNames { std::string_view { "cpuBusyTicks" },
+                                                     std::string_view { "cpuTotalTicks" },
+                                                     std::string_view { "availableMemoryBytes" } };
+
     /// The fields of `ConsensusStatus` and of `MetricsSnapshot`, by name, in the order they travel.
     ///
     /// Not member pointers, because the members are not all one width. Their COUNT is held to
@@ -158,9 +169,9 @@ namespace StatsReadingWire
 
     /// See `ConsensusFieldNames`.
     inline constexpr std::array SnapshotFieldNames {
-        std::string_view { "storage" },   std::string_view { "storageTiers" },
-        std::string_view { "host" },      std::string_view { "upstreamConfigured" },
-        std::string_view { "consensus" }, std::string_view { "uptime" }
+        std::string_view { "storage" },  std::string_view { "storageTiers" },       std::string_view { "host" },
+        std::string_view { "hostLoad" }, std::string_view { "upstreamConfigured" }, std::string_view { "consensus" },
+        std::string_view { "uptime" }
     };
 
     /// The fields of `StatsReading` itself, by name, in the order they travel. Held to the struct by the
@@ -172,7 +183,7 @@ namespace StatsReadingWire
     /// The grammar's own name, folded in first so a change to the grammar ABOVE with no table
     /// change still moves the digest. Bump the suffix whenever the encoder's statements change
     /// shape without a table changing.
-    inline constexpr std::string_view Grammar = "stats-reading-grammar-2";
+    inline constexpr std::string_view Grammar = "stats-reading-grammar-3";
 
     /// 64-bit FNV-1a over @p text, continuing from @p hash.
     /// @param hash The running digest.
@@ -214,6 +225,8 @@ namespace StatsReadingWire
             hash = Fold(hash, field.name);
         for (auto const& field: HostByteFields)
             hash = Fold(hash, field.name);
+        for (auto const name: HostLoadFieldNames)
+            hash = Fold(hash, name);
         for (auto const name: ConsensusFieldNames)
             hash = Fold(hash, name);
         for (auto const& row: Consensus::RoleTable)

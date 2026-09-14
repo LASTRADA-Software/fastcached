@@ -25,8 +25,11 @@
 #include <utility>
 #include <vector>
 
+#include <tests/Unwrap.hpp>
+
 using namespace FastCache;
 using namespace std::chrono_literals;
+using FastCache::Testing::Unwrap;
 
 namespace
 {
@@ -91,6 +94,8 @@ void GiveEveryCounterItsOwnValue(IMetricsSink& sink)
                                                     .diskCapacityBytes = 2'000'398'934'016,
                                                     .diskFreeBytes = 442'381'631'488,
                                                     .busySlots = 7 },
+                             .hostLoad = HostLoadReading { .cpu = CpuTicks { .busy = 7'700'001, .total = 9'100'003 },
+                                                           .availableMemoryBytes = 21'474'836'480 },
                              .upstreamConfigured = false,
                              .consensus = ConsensusStatus { .members = { "node-a1", "node-b2", "" },
                                                             .knownLeader = Consensus::NodeId { "node-b2" },
@@ -151,6 +156,78 @@ TEST_CASE("An absent block survives the binary form as absent rather than as zer
     CHECK(std::ranges::none_of(decoded->counters, [](auto const& value) { return value.has_value(); }));
     CHECK_FALSE(decoded->snapshot.storage.has_value());
     CHECK_FALSE(decoded->snapshot.consensus.has_value());
+    CHECK_FALSE(decoded->snapshot.hostLoad.has_value());
+}
+
+TEST_CASE("Each host-load figure travels absent on its own", "[metrics][livestats]")
+{
+    // A platform that will not report its CPU still reports its memory, and the other way
+    // round. A codec that tied the two together would decode a machine whose CPU could not be
+    // read into one whose CPU reads zero -- an idle machine -- or drop a memory figure it had.
+    auto const onlyMemory = StatsReading {
+        .counters = {},
+        .snapshot = MetricsSnapshot { .storage = std::nullopt,
+                                      .host = std::nullopt,
+                                      .hostLoad = HostLoadReading { .cpu = std::nullopt, .availableMemoryBytes = 4096 } }
+    };
+    auto const memoryDecoded = DecodeStatsReading(EncodeStatsReading(onlyMemory));
+    REQUIRE(memoryDecoded.has_value());
+    CHECK(*memoryDecoded == onlyMemory);
+    REQUIRE(memoryDecoded->snapshot.hostLoad.has_value());
+    CHECK_FALSE(Unwrap(memoryDecoded->snapshot.hostLoad).cpu.has_value());
+
+    auto const onlyCpu =
+        StatsReading { .counters = {},
+                       .snapshot =
+                           MetricsSnapshot { .storage = std::nullopt,
+                                             .host = std::nullopt,
+                                             .hostLoad = HostLoadReading { .cpu = CpuTicks { .busy = 3, .total = 5 },
+                                                                           .availableMemoryBytes = std::nullopt } } };
+    auto const cpuDecoded = DecodeStatsReading(EncodeStatsReading(onlyCpu));
+    REQUIRE(cpuDecoded.has_value());
+    CHECK(*cpuDecoded == onlyCpu);
+    REQUIRE(cpuDecoded->snapshot.hostLoad.has_value());
+    CHECK_FALSE(Unwrap(cpuDecoded->snapshot.hostLoad).availableMemoryBytes.has_value());
+
+    // And a block with neither is still a block: the process samples load and the platform
+    // said nothing, which is not the daemon's absence of the whole question.
+    auto const neither = StatsReading {
+        .counters = {},
+        .snapshot = MetricsSnapshot { .storage = std::nullopt, .host = std::nullopt, .hostLoad = HostLoadReading {} }
+    };
+    auto const neitherDecoded = DecodeStatsReading(EncodeStatsReading(neither));
+    REQUIRE(neitherDecoded.has_value());
+    CHECK(neitherDecoded->snapshot.hostLoad == std::optional { HostLoadReading {} });
+}
+
+TEST_CASE("A host-load presence bit this build does not know is refused as malformed", "[metrics][livestats]")
+{
+    // Only the host-load block present, so its presence byte sits at a position the grammar
+    // fixes: the digest, the empty counter bitmap, the snapshot presence byte and the empty
+    // tier bitmap come first.
+    auto const reading = StatsReading {
+        .counters = {},
+        .snapshot = MetricsSnapshot { .storage = std::nullopt, .host = std::nullopt, .hostLoad = HostLoadReading {} }
+    };
+    auto bytes = EncodeStatsReading(reading);
+    auto const bitmapBytes = [](std::size_t count) {
+        return (count + 7) / 8;
+    };
+    auto const at =
+        sizeof(std::uint64_t) + bitmapBytes(reading.counters.size()) + 1 + bitmapBytes(reading.snapshot.storageTiers.size());
+    // Positional controls: the snapshot presence byte names the host-load block alone, and the
+    // byte at `at` is that block's own presence, with neither figure set.
+    REQUIRE(bytes.size() > at);
+    REQUIRE(bytes[sizeof(std::uint64_t) + bitmapBytes(reading.counters.size())] == std::byte { 0x10 });
+    REQUIRE(bytes[at] == std::byte { 0x00 });
+
+    // The control: the untouched bytes decode, with the block present and both figures absent.
+    REQUIRE(DecodeStatsReading(bytes).has_value());
+
+    bytes[at] = std::byte { 0x04 };
+    auto const refused = DecodeStatsReading(bytes);
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error() == StatsReadingFault::Malformed);
 }
 
 TEST_CASE("A decoded reading renders the metrics body the node itself serves", "[metrics][livestats]")
@@ -222,7 +299,7 @@ TEST_CASE("This build's live-stats layout is the pinned one", "[metrics][livesta
     // client built before the change will refuse this node. Update the constant in the same
     // change, and say in its message that clients and nodes upgrade together.
     INFO(std::format("StatsReadingLayout is 0x{:016x}", StatsReadingLayout));
-    CHECK(StatsReadingLayout == 0x94b8655e745f130fULL);
+    CHECK(StatsReadingLayout == 0xffee26b16df8554cULL);
 }
 
 TEST_CASE("A truncated or padded reading is refused and never half-read", "[metrics][livestats]")

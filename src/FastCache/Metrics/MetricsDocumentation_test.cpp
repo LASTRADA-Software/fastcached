@@ -121,6 +121,10 @@ constexpr std::string_view NodePrefix = "fastcache_";
     auto snapshot = FullySpecifiedSnapshot();
     snapshot.host = HostCapacity {};
     snapshot.upstreamConfigured = true;
+    // Both load figures present, for the reason the consensus block below is populated: each of
+    // the three load series renders only when its figure was read, so an absent one would let the
+    // page lose its row unnoticed.
+    snapshot.hostLoad = HostLoadReading { .cpu = CpuTicks { .busy = 1, .total = 2 }, .availableMemoryBytes = 1 };
     // Consensus is a node-only block too, and it is populated with a member set AND
     // a leader rather than a default `ConsensusStatus`: two of its five series are
     // rendered only when there is something to name, so a default-constructed status

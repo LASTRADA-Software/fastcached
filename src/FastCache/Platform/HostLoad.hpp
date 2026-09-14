@@ -59,6 +59,8 @@ struct CpuTicks
 {
     std::uint64_t busy { 0 };  ///< Ticks spent doing anything but idling.
     std::uint64_t total { 0 }; ///< Ticks accounted for at all.
+
+    [[nodiscard]] bool operator==(CpuTicks const&) const = default;
 };
 
 /// Utilization over the interval between two readings.
