@@ -27,6 +27,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <format>
 #include <future>
 #include <memory>
@@ -380,6 +381,13 @@ class HoldingExecutor final: public IExecutor
         "hop-out work held {}, forwarded {}, refused {}", executor.Holding(), executor.Forwarded(), executor.Refused());
 }
 
+/// @return Whether @p reaper's sweep is away on its executor, in words, for a fixture wait that ran out.
+/// Nothing else: `Cycles()` is not atomic, and the executor writes it.
+[[nodiscard]] std::string Describe(ExpiryReaper const& reaper)
+{
+    return std::format("sweep away on the executor {}", reaper.AwayFromReactor());
+}
+
 /// An abandonment that RETURNS and counts, so a case can drive `Stop` past its drain ceiling
 /// and see what it did instead of watching the process end.
 ///
@@ -407,7 +415,7 @@ constexpr auto StopLook = 200ms;
 
 /// How long another thread may take before a case calls it hung. A hang guard, not a race: a
 /// thread that is merely slow gets there inside it on any host that runs this suite at all, and
-/// one that never does fails at it. Three readers: `HeldCeilingDrainWait` lets a stop drain reach
+/// one that never does fails at it. Its readers: `HeldCeilingDrainWait` lets a stop drain reach
 /// its ceiling only past it, `StopWhileAway` waits at most twice it for a released stop to end,
 /// and `TickUntil` gives every fixture wait at most it.
 constexpr auto TripHangGuard = 10s;
@@ -472,14 +480,21 @@ class HeldCeilingDrainWait final: public IDrainWait
 /// host's monotonic clock (#1433).
 ///
 /// A tick advances the manual clock a millisecond first, so the cycle's own timers fire, then
-/// yields the CPU for a moment so the thread the case waits on -- the pool, or a hop parking at a
-/// gate -- can run. The requested poll is not a duration here: the cadence is one tick.
+/// sleeps 100 us -- longer where the host's timer is coarse -- so the thread the case waits on (the
+/// pool, or a hop parking at a gate) can run. The requested poll is not a duration here: the
+/// cadence is one tick.
+///
+/// **A tick that throws is kept, not swallowed and not fatal.** `Sleep` is `noexcept`, and an
+/// exception escaping it would end the whole test binary; the wait stops at it instead and
+/// `TickUntil` rethrows it to the case, where Catch2 reports it as that case's failure.
 class TickingDrainWait final: public IDrainWait
 {
   public:
-    /// @param f The case whose clock and reactor each poll advances; must outlive this.
-    explicit TickingDrainWait(Fixture& f) noexcept:
-        _f { f }
+    /// @param clock   The case's manual clock; must outlive this.
+    /// @param reactor The reactor each poll ticks; must outlive this.
+    TickingDrainWait(ManualClock& clock, TestReactor& reactor) noexcept:
+        _clock { clock },
+        _reactor { reactor }
     {
     }
 
@@ -488,10 +503,17 @@ class TickingDrainWait final: public IDrainWait
         return DefaultDrainWait().Now();
     }
 
-    void Sleep([[maybe_unused]] std::chrono::milliseconds requested) noexcept override
+    void Sleep(std::chrono::milliseconds /*requested*/) noexcept override
     {
-        _f.clock.Advance(1ms);
-        std::ignore = _f.reactor.Tick();
+        _clock.Advance(1ms);
+        try
+        {
+            std::ignore = _reactor.Tick();
+        }
+        catch (...)
+        {
+            _thrown = std::current_exception();
+        }
         ++_ticks;
         std::this_thread::sleep_for(100us);
     }
@@ -502,17 +524,24 @@ class TickingDrainWait final: public IDrainWait
         return _ticks;
     }
 
+    /// @return What a tick threw, or null.
+    [[nodiscard]] std::exception_ptr Thrown() const noexcept
+    {
+        return _thrown;
+    }
+
   private:
-    Fixture& _f;
+    ManualClock& _clock;
+    TestReactor& _reactor;
     std::size_t _ticks { 0 };
+    std::exception_ptr _thrown;
 };
 
 /// Tick the case's reactor until @p reached holds, for at most `TripHangGuard` of REAL time.
 ///
 /// **Bounded by time on a monotonic clock, never by a count of ticks** (#1433). What these cases
-/// wait for is done by ANOTHER thread, and a count is a race a loaded host loses: 3000 ticks at
-/// 100 us was a third of a second of scheduling on a quiet host, and a busy one does not run the
-/// pool thread in that. Through `DrainWithin`, the tree's one bounded wait, which measures.
+/// wait for is done by ANOTHER thread, and a count of ticks is a race a loaded host loses. Through
+/// `DrainWithin`, the tree's one bounded wait, which measures.
 ///
 /// **A wait that ran out says what it waited for and what it found**, attached to the case's next
 /// assertion (`UNSCOPED_INFO`, since a scoped message would die here): the real time and ticks it
@@ -526,13 +555,15 @@ class TickingDrainWait final: public IDrainWait
 template <typename Predicate, typename State>
 [[nodiscard]] bool TickUntil(Fixture& f, std::string_view what, Predicate reached, State state)
 {
-    TickingDrainWait ticking { f };
+    TickingDrainWait ticking { f.clock, f.reactor };
+    // The account is timed on the host's clock directly, never through the seam the wait ran on: a
+    // seam that counted instead of measuring then shows as a wait too short to read.
     auto const started = DefaultDrainWait().Now();
     auto seen = state();
     auto lastChange = started;
     auto changes = 0;
     auto const busy = [&] {
-        if (reached())
+        if (ticking.Thrown() != nullptr || reached())
             return false;
         if (auto now = state(); now != seen)
         {
@@ -542,7 +573,10 @@ template <typename Predicate, typename State>
         }
         return true;
     };
-    if (DrainWithin(busy, DrainBound { .ceiling = TripHangGuard, .poll = 1ms }, ticking) == DrainResult::Drained)
+    auto const result = DrainWithin(busy, DrainBound { .ceiling = TripHangGuard, .poll = 1ms }, ticking);
+    if (auto const thrown = ticking.Thrown(); thrown != nullptr)
+        std::rethrow_exception(thrown);
+    if (result == DrainResult::Drained)
         return true;
     auto const ended = DefaultDrainWait().Now();
     auto const waited = ended - started;
@@ -618,6 +652,12 @@ class ReaperOnceBack
     [[nodiscard]] ExpiryReaper* operator->() const noexcept
     {
         return _reaper.get();
+    }
+
+    /// @return The owned reaper; valid until `Stop`.
+    [[nodiscard]] ExpiryReaper& operator*() const noexcept
+    {
+        return *_reaper;
     }
 
     /// @return How many times the reaper's `Stop` abandoned a frame. Zero unless a trip never came back.
@@ -962,7 +1002,7 @@ TEST_CASE("The sweep body runs on the executor it was given and not on the react
         f,
         "the sweep to reach the observer on the pool thread",
         [&] { return f.observer.entered.load(std::memory_order_acquire); },
-        [&] { return std::format("sweep away on the pool {}", reaper->AwayFromReactor()); }));
+        [&] { return Describe(*reaper); }));
 
     // **The assertion.** The sweep body did not run on the reactor's thread.
     CHECK(f.observer.sweptOn.load(std::memory_order_acquire) != reactorThread);
@@ -995,7 +1035,8 @@ TEST_CASE("Passing the reactor as the sweep executor keeps the sweep on the loop
             f,
             "the sweep to reach the observer on the reactor",
             [&] { return f.observer.entered.load(std::memory_order_acquire); },
-            [&] { return std::format("cycles {}, timers pending {}", reaper.Cycles(), f.reactor.PendingTimers()); }));
+            // `Cycles()` is not atomic: readable here only because the sweep runs on this thread.
+            [&] { return std::format("cycles {}", reaper.Cycles()); }));
         CHECK(f.observer.sweptOn.load(std::memory_order_acquire) == reactorThread);
     }
     SUCCEED("the sweep stayed on the reactor when the reactor was the executor");
@@ -1022,7 +1063,7 @@ TEST_CASE("Stopping the expiry cycle waits until the hop back has reached the re
         f,
         "the pool thread's hop back to park before forwarding",
         [&] { return reactor.Gate().WaitUntilParked(0ms); },
-        [&] { return std::format("{}; sweep away {}", Describe(reactor), reaper->AwayFromReactor()); });
+        [&] { return std::format("{}; {}", Describe(reactor), Describe(*reaper)); });
 
     auto const stop = StopWhileAway(reaper, parked, [&] { reactor.Gate().Open(); });
 
@@ -1054,7 +1095,7 @@ TEST_CASE("Stopping the expiry cycle waits for a frame handed to its executor an
         f,
         "the hop out to be held on the executor",
         [&] { return executor.Holding(); },
-        [&] { return std::format("{}; sweep away {}", Describe(executor), reaper->AwayFromReactor()); });
+        [&] { return std::format("{}; {}", Describe(executor), Describe(*reaper)); });
 
     auto const stop = StopWhileAway(reaper, held, [&] { executor.ForwardHeld(); });
 
@@ -1085,7 +1126,7 @@ TEST_CASE("A late return from one hop back does not end the wait for the next tr
     reactor.ParkNextSubmit(ParkingReactor::Park::AfterForwarding);
     reaper->Start(reactor, executor);
     auto const state = [&] {
-        return std::format("{}; {}; sweep away {}", Describe(reactor), Describe(executor), reaper->AwayFromReactor());
+        return std::format("{}; {}; {}", Describe(reactor), Describe(executor), Describe(*reaper));
     };
     auto const parked = TickUntil(
         f,
@@ -1137,6 +1178,7 @@ TEST_CASE("Stopping a cycle whose executor is its own reactor does not wait for 
         f,
         "the hop out to be handed to the reactor",
         [&] { return reactor.ParkedWorkSubmits() != 0; },
+        // `Cycles()` is not atomic: readable here only because the sweep runs on this thread.
         [&] { return std::format("{}; cycles {}", Describe(reactor), reaper->Cycles()); }));
     REQUIRE(reactor.ParkedWorkSubmits() == 1);
     REQUIRE(f.reactor.PendingSubmissions() == 1);
@@ -1173,7 +1215,7 @@ TEST_CASE("A sweep frame that never comes back is abandoned by ending the proces
         f,
         "the hop out to be held on the executor",
         [&] { return executor.Holding(); },
-        [&] { return std::format("{}; sweep away {}", Describe(executor), reaper->AwayFromReactor()); }));
+        [&] { return std::format("{}; {}", Describe(executor), Describe(*reaper)); }));
 
     reaper.reset();
 
@@ -1203,7 +1245,7 @@ TEST_CASE("A sweep that could not be handed to its executor is skipped without s
     executor.RefuseNextSubmit();
     reaper->Start(f.reactor, executor);
     auto const state = [&] {
-        return std::format("{}; sweep away {}", Describe(executor), reaper->AwayFromReactor());
+        return std::format("{}; {}", Describe(executor), Describe(*reaper));
     };
     REQUIRE(TickUntil(f, "the hop out to be refused", [&] { return executor.Refused() == 1; }, state));
     // The cycle survived it: a later sweep was handed over.
@@ -1236,7 +1278,7 @@ TEST_CASE("A hop back that could not be handed to the reactor still brings the s
         f,
         "three hop-back submits: the refused one, its retry, and the next sweep's",
         [&] { return reactor.ParkedWorkSubmits() >= 3; },
-        [&] { return std::format("{}; sweep away {}", Describe(reactor), reaper->AwayFromReactor()); }));
+        [&] { return std::format("{}; {}", Describe(reactor), Describe(*reaper)); }));
 
     // `ParkedWorkSubmits` counts a `Submit` on ARRIVAL, so the third hop back may still be inside
     // it with the count raised; `Stop`'s held drain waits for it rather than racing the ceiling.
