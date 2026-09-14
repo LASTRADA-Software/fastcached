@@ -141,6 +141,14 @@ namespace
                             .code = Wire::ErrorCode::NoCluster,
                             .why = "this endpoint is a cache and belongs to no cluster, so it opens no enrollment "
                                    "window; ask a fastcache-compile-node that runs consensus instead" },
+        // `DispatchNotPermitted` and never `UnknownOpcode`, for `Withdraw`'s reason: a compile
+        // node answers this verb, so it is served elsewhere rather than unimplemented. This
+        // daemon serves the cache subject once #1399's daemon commit lands, and the row goes
+        // with it.
+        Wire::RefusedVerb { .op = Wire::Op::Subscribe,
+                            .code = Wire::ErrorCode::DispatchNotPermitted,
+                            .why = "this endpoint is a cache and does not stream live stats yet; subscribe at a "
+                                   "fastcache-compile-node, or read this daemon's own /metrics" },
     };
 
     /// What to answer `op` with.
@@ -895,6 +903,7 @@ Task<void> CompileCacheHandler::Run(ISocket* socket,
             // sentence are decided.
             case Wire::Op::Enroll:
             case Wire::Op::EnrollControl:
+            case Wire::Op::Subscribe:
                 next = co_await HandleDistributed(socket, descriptor->code);
                 break;
         }

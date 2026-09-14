@@ -47,6 +47,9 @@ namespace
 TEST_CASE("The wire constants have their specified byte values")
 {
     CHECK(static_cast<std::uint8_t>(Magic) == 0xFC);
+    // Version 9 adds `Status::Push` and `Op::Subscribe`, the live-stats stream (#1399):
+    // a new reply status is a new grammar for every reader, so the floor moves with it.
+    //
     // Version 8 gives the CLUSTER-ADMIT reply a receipt, so the id and endpoint the
     // leader recorded come back as bytes an operator can read against the machine being
     // admitted (#1296). Version 7 gave the NODE-STATUS reply a nested runtime record
@@ -59,8 +62,8 @@ TEST_CASE("The wire constants have their specified byte values")
     // no reply body for this verb, and drops the one string the change exists to put on
     // the screen. A missing string does not announce itself as missing, so leaving the
     // floor at 7 would manufacture a quiet failure inside the fix for one.
-    CHECK(CurrentVersion == 8);
-    CHECK(MinSupportedVersion == 8);
+    CHECK(CurrentVersion == 9);
+    CHECK(MinSupportedVersion == 9);
     CHECK(RequestHeaderSize == 7);
     CHECK(ReplyHeaderSize == 5);
 
@@ -71,6 +74,8 @@ TEST_CASE("The wire constants have their specified byte values")
     CHECK(static_cast<std::uint8_t>(Status::Ok) == 0x01);
     CHECK(static_cast<std::uint8_t>(Status::Error) == 0x02);
     CHECK(static_cast<std::uint8_t>(Status::Progress) == 0x03);
+    CHECK(static_cast<std::uint8_t>(Status::Push) == 0x04);
+    CHECK(static_cast<std::uint8_t>(Op::Subscribe) == 0x12);
 
     // The BYTE, not the symbol. A constant on this wire carries two facts -- its
     // name and its value -- and a peer built from another revision of this header
@@ -100,7 +105,7 @@ TEST_CASE("EncodeFetch emits the specified bytes exactly")
     // clang-format off: the grid IS the specification -- one wire field per row.
     auto const expected = Bytes({
         0xFC,                   // magic
-        0x08,                   // version
+        0x09,                   // version
         0x02,                   // op = Fetch
         0x00, 0x00, 0x00, 0x06, // payloadLength = 6
         0x00, 0x00, 0x00, 0x02, // field[0] length = 2
@@ -119,7 +124,7 @@ TEST_CASE("EncodeStore emits the specified bytes exactly")
 
     auto const expected = Bytes({
         0xFC,                               // magic
-        0x08,                               // version
+        0x09,                               // version
         0x01,                               // op = Store
         0x00, 0x00, 0x00, 0x19,             // payloadLength = 25 = (4+1) + (4+0) + (4+1) + (4+1) + (4+2)
         0x00, 0x00, 0x00, 0x01, 0x6B,       // key           = "k"
@@ -253,7 +258,8 @@ TEST_CASE("A progress frame is a known status and is never a terminal one")
     // And the byte after it is still unknown, so the enum is a closed set rather than
     // "anything small is a status".
     CHECK(IsKnownStatus(0x03));
-    CHECK_FALSE(IsKnownStatus(0x04));
+    CHECK(IsKnownStatus(0x04));
+    CHECK_FALSE(IsKnownStatus(0x05));
 }
 
 TEST_CASE("Only COMPILE may be answered with a progress pulse")
@@ -459,7 +465,7 @@ TEST_CASE("EncodeAuth emits the specified bytes exactly")
     auto const frame = EncodeAuth(AuthRequest { .username = "bob", .secret = "hunter2" });
 
     auto const expected = Bytes({
-        0xFC, 0x08, 0x03,       // magic, version, op=Auth
+        0xFC, 0x09, 0x03,       // magic, version, op=Auth
         0x00, 0x00, 0x00, 0x12, // payload length: (4+3) + (4+7) = 18
         0x00, 0x00, 0x00, 0x03, 'b', 'o', 'b', 0x00, 0x00, 0x00, 0x07, 'h', 'u', 'n', 't', 'e', 'r', '2',
     });
@@ -1089,6 +1095,9 @@ TEST_CASE("Every verb states which family it belongs to")
     // load-bearing: it is the one verb that must not be served on a reactor, because
     // it spawns a process and blocks for seconds (#213).
     CHECK(FamilyOf(static_cast<std::uint8_t>(Op::Compile)) == VerbFamily::Compile);
+
+    // SUBSCRIBE is answered by a stream, which no request/reply component owns (#1399).
+    CHECK(FamilyOf(static_cast<std::uint8_t>(Op::Subscribe)) == VerbFamily::Live);
 }
 
 TEST_CASE("A byte that names no verb has no family")
@@ -2030,4 +2039,112 @@ TEST_CASE("An older peer's runtime record reads without the enrollment fields, a
     auto const ahead = DecodeNodeRuntime(WireFields::Encode(WireFields::FieldList { surplus }));
     REQUIRE(ahead.has_value());
     CHECK(Unwrap(ahead).toolchainsServed == 4);
+}
+
+// --- Live stats (#1399) -----------------------------------------------------
+
+TEST_CASE("Only SUBSCRIBE may be answered with a push frame")
+{
+    // `PushIsSubscribeOnly` is the compile-time half; this is what fails when a row's mask is
+    // widened by hand, the same pair `Progress` has.
+    for (auto const& row: OpTable)
+    {
+        INFO("verb " << row.name);
+        auto const pushes = (row.legalStatuses & StatusBit(Status::Push)) != 0;
+        CHECK(pushes == (row.code == Op::Subscribe));
+    }
+    CHECK_FALSE(IsTerminalStatus(Status::Push));
+    CHECK(IsLegalStatus(Op::Subscribe, Status::Ok));
+    CHECK(IsLegalStatus(Op::Subscribe, Status::Error));
+}
+
+TEST_CASE("The live-stats wire bytes are pinned")
+{
+    // The BYTE, not the symbol, for the reason the constants case above gives: a peer built from
+    // another revision of this header agrees about the values and nothing else.
+    CHECK(static_cast<std::uint8_t>(LiveSubject::Cache) == 0x00);
+    CHECK(static_cast<std::uint8_t>(LiveSubject::Node) == 0x01);
+    CHECK(static_cast<std::uint8_t>(LiveSubject::Fleet) == 0x02);
+    CHECK(static_cast<std::uint8_t>(PushKind::Subscribed) == 0x00);
+    CHECK(static_cast<std::uint8_t>(PushKind::Snapshot) == 0x01);
+    CHECK(static_cast<std::uint8_t>(PushKind::Event) == 0x02);
+    CHECK(static_cast<std::uint8_t>(PushKind::Gap) == 0x03);
+    CHECK(static_cast<std::uint8_t>(LiveEventKind::MemberJoined) == 0x00);
+    CHECK(static_cast<std::uint8_t>(LiveEventKind::EnrollmentChanged) == 0x06);
+}
+
+TEST_CASE("A SUBSCRIBE request round-trips and refuses a subject this build does not know")
+{
+    auto const request = SubscribeRequest { .subject = LiveSubject::Fleet, .cadenceMillis = 1500, .dashboardToken = "t0k" };
+    auto const frame = EncodeSubscribeRequest(request);
+    REQUIRE(frame.size() > RequestHeaderSize);
+    CHECK(frame[2] == static_cast<std::byte>(Op::Subscribe));
+
+    auto const payload = std::span { frame }.subspan(RequestHeaderSize);
+    auto const decoded = DecodeSubscribeRequest(payload);
+    REQUIRE(decoded.has_value());
+    CHECK(Unwrap(decoded).subject == LiveSubject::Fleet);
+    CHECK(Unwrap(decoded).cadenceMillis == 1500);
+    CHECK(Unwrap(decoded).dashboardToken == "t0k");
+
+    // The subject byte sits right after its field's length prefix.
+    auto unknown = std::vector<std::byte> { payload.begin(), payload.end() };
+    unknown[WireFields::FieldPrefixSize] = std::byte { 0x03 };
+    CHECK_FALSE(DecodeSubscribeRequest(unknown).has_value());
+}
+
+TEST_CASE("A granted cadence is the request clamped to the subject floor and the ceiling")
+{
+    CHECK(GrantLiveCadence(LiveSubject::Node, 0) == std::chrono::milliseconds { 500 });
+    CHECK(GrantLiveCadence(LiveSubject::Fleet, 200) == std::chrono::milliseconds { 1000 });
+    CHECK(GrantLiveCadence(LiveSubject::Cache, 2000) == std::chrono::milliseconds { 2000 });
+    CHECK(GrantLiveCadence(LiveSubject::Node, 3'600'000) == MaxLiveCadence);
+    CHECK(LiveIdleBound(std::chrono::milliseconds { 500 }) == std::chrono::milliseconds { 1500 });
+}
+
+TEST_CASE("Every push kind round-trips through its own decoder")
+{
+    auto const subscribed = EncodeLiveSubscribed(LiveSubscribedFields { .subject = LiveSubject::Node,
+                                                                        .grantedCadenceMillis = 500,
+                                                                        .statsLayout = 0x1122334455667788ULL,
+                                                                        .endpoint = "n1:6674" });
+    auto const view = DecodePush(subscribed);
+    REQUIRE(view.has_value());
+    CHECK(Unwrap(view).kind == PushKind::Subscribed);
+    auto const granted = DecodeLiveSubscribed(Unwrap(view).fields);
+    REQUIRE(granted.has_value());
+    CHECK(Unwrap(granted).grantedCadenceMillis == 500);
+    CHECK(Unwrap(granted).statsLayout == 0x1122334455667788ULL);
+    CHECK(Unwrap(granted).endpoint == "n1:6674");
+
+    auto const body = std::vector<std::byte> { std::byte { 1 }, std::byte { 2 }, std::byte { 3 } };
+    auto const snapshot = EncodeLiveSnapshot(42, body);
+    auto const snapshotView = DecodePush(snapshot);
+    REQUIRE(snapshotView.has_value());
+    CHECK(Unwrap(snapshotView).kind == PushKind::Snapshot);
+    auto const reading = DecodeLiveSnapshot(Unwrap(snapshotView).fields);
+    REQUIRE(reading.has_value());
+    CHECK(Unwrap(reading).tick == 42);
+    CHECK(std::ranges::equal(Unwrap(reading).body, body));
+
+    auto const event = EncodeLiveEvent(LiveEventFields { .kind = LiveEventKind::WorkerExpired, .detail = "build-07" });
+    auto const eventView = DecodePush(event);
+    REQUIRE(eventView.has_value());
+    auto const changed = DecodeLiveEvent(Unwrap(eventView).fields);
+    REQUIRE(changed.has_value());
+    CHECK(Unwrap(changed).kind == LiveEventKind::WorkerExpired);
+    CHECK(Unwrap(changed).detail == "build-07");
+
+    auto const gap = EncodeLiveGap(LiveGapFields { .dropped = 3, .firstTick = 10, .lastTick = 12 });
+    auto const gapView = DecodePush(gap);
+    REQUIRE(gapView.has_value());
+    auto const dropped = DecodeLiveGap(Unwrap(gapView).fields);
+    REQUIRE(dropped.has_value());
+    CHECK(Unwrap(dropped).dropped == 3);
+    CHECK(Unwrap(dropped).lastTick == 12);
+
+    // A kind byte past the last one this build knows is refused, never guessed at.
+    auto unknown = gap;
+    unknown[0] = std::byte { 0x04 };
+    CHECK_FALSE(DecodePush(unknown).has_value());
 }
