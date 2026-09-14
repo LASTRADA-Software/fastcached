@@ -19,14 +19,12 @@ namespace
 
     using namespace StatsReadingWire;
 
-    /// Presence bits of the snapshot's optional blocks, in the order the grammar lists them.
-    enum PresenceBit : std::uint8_t
-    {
-        StoragePresent = 1U << 0U,
-        HostPresent = 1U << 1U,
-        UpstreamPresent = 1U << 2U,
-        ConsensusPresent = 1U << 3U,
-    };
+    // Presence bits of the snapshot's optional blocks, in the order the grammar lists them. Named
+    // constants rather than an unscoped enum: they are bits OR-ed into one wire byte, not a choice.
+    constexpr std::uint8_t StoragePresent = 1U << 0U;   ///< `MetricsSnapshot::storage`.
+    constexpr std::uint8_t HostPresent = 1U << 1U;      ///< `MetricsSnapshot::host`.
+    constexpr std::uint8_t UpstreamPresent = 1U << 2U;  ///< `MetricsSnapshot::upstreamConfigured`.
+    constexpr std::uint8_t ConsensusPresent = 1U << 3U; ///< `MetricsSnapshot::consensus`.
 
     /// Every bit a presence byte may carry; anything else is `Malformed`.
     constexpr std::uint8_t KnownPresenceBits = StoragePresent | HostPresent | UpstreamPresent | ConsensusPresent;
@@ -115,6 +113,60 @@ namespace
         return true;
     }
 
+    /// Read a host block.
+    /// @param in The bytes, positioned at the block.
+    /// @param host Where the fields go.
+    /// @return False when the bytes end first.
+    [[nodiscard]] bool ReadHost(ByteCursor& in, HostCapacity& host)
+    {
+        for (auto const& field: HostSizeFields)
+        {
+            std::uint64_t value = 0;
+            if (!in.ReadU64(value))
+                return false;
+            host.*field.member = static_cast<std::size_t>(value);
+        }
+        for (auto const& field: HostByteFields)
+        {
+            if (!in.ReadU64(host.*field.member))
+                return false;
+        }
+        return true;
+    }
+
+    /// Read a consensus block.
+    /// @param in The bytes, positioned at the block.
+    /// @param status Where the fields go.
+    /// @return Nothing when the block read whole; otherwise why it did not.
+    [[nodiscard]] std::optional<StatsReadingFault> ReadConsensus(ByteCursor& in, ConsensusStatus& status)
+    {
+        auto& [members, knownLeader, term, commitIndex, role] = status;
+        std::uint32_t count = 0;
+        if (!in.ReadCount(count, MinMemberBytes))
+            return StatsReadingFault::Truncated;
+        // No `reserve(count)`: the count is bounded by the bytes present, not by anything this
+        // side owns, and a member is larger in memory than its four-byte minimum on the wire.
+        for ([[maybe_unused]] auto const member: std::views::iota(std::uint32_t { 0 }, count))
+        {
+            if (!in.ReadField(members.emplace_back()))
+                return StatsReadingFault::Truncated;
+        }
+        auto leaderPresent = std::uint8_t { 0 };
+        if (!in.ReadU8(leaderPresent))
+            return StatsReadingFault::Truncated;
+        if (leaderPresent > 1)
+            return StatsReadingFault::Malformed;
+        if (leaderPresent == 1 && !in.ReadField(knownLeader.emplace()))
+            return StatsReadingFault::Truncated;
+        auto roleByte = std::uint8_t { 0 };
+        if (!in.ReadU64(term.value) || !in.ReadU64(commitIndex.value) || !in.ReadU8(roleByte))
+            return StatsReadingFault::Truncated;
+        if (roleByte >= static_cast<std::uint8_t>(Consensus::Role::Last))
+            return StatsReadingFault::Malformed;
+        role = static_cast<Consensus::Role>(roleByte);
+        return std::nullopt;
+    }
+
     /// Read a bitmap over @p count items.
     [[nodiscard]] std::optional<std::vector<bool>> ReadBitmap(ByteCursor& in, std::size_t count)
     {
@@ -140,14 +192,18 @@ std::vector<std::byte> EncodeStatsReading(StatsReading const& reading)
     Writer out;
     out.U64(StatsReadingLayout);
 
-    out.Bitmap(reading.counters.size(), [&](std::size_t i) { return reading.counters[i].has_value(); });
-    for (auto const& value: reading.counters)
+    // Structured bindings here too, so a field added to `StatsReading` stops this compiling until it has a
+    // place in the grammar and a name in `ReadingFieldNames`.
+    auto const& [counters, snapshot, version] = reading;
+
+    out.Bitmap(counters.size(), [&](std::size_t i) { return counters[i].has_value(); });
+    for (auto const& value: counters)
         if (value.has_value())
             out.U64(*value);
 
     // Structured bindings, so a field added to either struct stops this compiling until it is
     // given a place in the grammar and a name in `SnapshotFieldNames` / `ConsensusFieldNames`.
-    auto const& [storage, storageTiers, host, upstreamConfigured, consensus, uptime] = reading.snapshot;
+    auto const& [storage, storageTiers, host, upstreamConfigured, consensus, uptime] = snapshot;
 
     out.U8(static_cast<std::uint8_t>((storage.has_value() ? StoragePresent : 0U) | (host.has_value() ? HostPresent : 0U)
                                      | (upstreamConfigured.has_value() ? UpstreamPresent : 0U)
@@ -187,6 +243,7 @@ std::vector<std::byte> EncodeStatsReading(StatsReading const& reading)
     }
 
     out.U64(static_cast<std::uint64_t>(uptime.value.count()));
+    out.Text(version);
     return out.Take();
 }
 
@@ -233,12 +290,8 @@ std::expected<StatsReading, StatsReadingFault> DecodeStatsReading(std::span<std:
     if ((presence & ~KnownPresenceBits) != 0)
         return malformed;
 
-    if ((presence & StoragePresent) != 0)
-    {
-        storage.emplace();
-        if (!ReadStorage(in, *storage))
-            return truncated;
-    }
+    if ((presence & StoragePresent) != 0 && !ReadStorage(in, storage.emplace()))
+        return truncated;
 
     auto const tierBits = ReadBitmap(in, storageTiers.size());
     if (!tierBits.has_value())
@@ -247,27 +300,12 @@ std::expected<StatsReading, StatsReadingFault> DecodeStatsReading(std::span<std:
     {
         if (!(*tierBits)[i])
             continue;
-        storageTiers[i].emplace();
-        if (!ReadStorage(in, *storageTiers[i]))
+        if (!ReadStorage(in, storageTiers[i].emplace()))
             return truncated;
     }
 
-    if ((presence & HostPresent) != 0)
-    {
-        host.emplace();
-        for (auto const& field: HostSizeFields)
-        {
-            std::uint64_t value = 0;
-            if (!in.ReadU64(value))
-                return truncated;
-            (*host).*field.member = static_cast<std::size_t>(value);
-        }
-        for (auto const& field: HostByteFields)
-        {
-            if (!in.ReadU64((*host).*field.member))
-                return truncated;
-        }
-    }
+    if ((presence & HostPresent) != 0 && !ReadHost(in, host.emplace()))
+        return truncated;
 
     if ((presence & UpstreamPresent) != 0)
     {
@@ -281,37 +319,17 @@ std::expected<StatsReading, StatsReadingFault> DecodeStatsReading(std::span<std:
 
     if ((presence & ConsensusPresent) != 0)
     {
-        auto& status = consensus.emplace();
-        auto& [members, knownLeader, term, commitIndex, role] = status;
-        std::uint32_t count = 0;
-        if (!in.ReadCount(count, MinMemberBytes))
-            return truncated;
-        // No `reserve(count)`: the count is bounded by the bytes present, not by anything this
-        // side owns, and a member is larger in memory than its four-byte minimum on the wire.
-        for ([[maybe_unused]] auto const member: std::views::iota(std::uint32_t { 0 }, count))
-        {
-            if (!in.ReadField(members.emplace_back()))
-                return truncated;
-        }
-        auto leaderPresent = std::uint8_t { 0 };
-        if (!in.ReadU8(leaderPresent))
-            return truncated;
-        if (leaderPresent > 1)
-            return malformed;
-        if (leaderPresent == 1 && !in.ReadField(knownLeader.emplace()))
-            return truncated;
-        auto roleByte = std::uint8_t { 0 };
-        if (!in.ReadU64(term.value) || !in.ReadU64(commitIndex.value) || !in.ReadU8(roleByte))
-            return truncated;
-        if (roleByte >= static_cast<std::uint8_t>(Consensus::Role::Last))
-            return malformed;
-        role = static_cast<Consensus::Role>(roleByte);
+        if (auto const fault = ReadConsensus(in, consensus.emplace()); fault.has_value())
+            return std::unexpected { *fault };
     }
 
     std::uint64_t seconds = 0;
     if (!in.ReadU64(seconds))
         return truncated;
     uptime = Uptime { std::chrono::seconds { static_cast<std::chrono::seconds::rep>(seconds) } };
+
+    if (!in.ReadField(reading.version))
+        return truncated;
 
     if (!in.AtEnd())
         return std::unexpected { StatsReadingFault::TrailingBytes };

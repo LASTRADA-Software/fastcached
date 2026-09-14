@@ -2,8 +2,8 @@
 #pragma once
 
 #include <FastCache/Core/EnumTable.hpp>
-#include <FastCache/Core/Version.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
+#include <FastCache/Metrics/StatsReading.hpp>
 
 #include <array>
 #include <cstddef>
@@ -797,8 +797,8 @@ static_assert(RowsInEnumeratorOrder(CounterTable, &CounterDescriptor::counter),
 /// A row here rather than a line in `PrometheusFormatter`, for the reason
 /// `CounterDescriptor` gives: the renderer walks tables, and a series spelled inside
 /// the renderer is one nothing else can enumerate. Not a `CounterDescriptor`, because
-/// a version is not a tally the sink holds -- it is known at compile time and never
-/// moves.
+/// a version is not a tally the sink holds: it is a fact the READING carries
+/// (`StatsReading::version`), so the text and the binary encoding state one fact.
 ///
 /// Why it exists at all (#134): `fastcache-cli live-stats cache` titles its panel with
 /// the daemon's version, and the scrape it reads carried none, so the title could only
@@ -806,10 +806,10 @@ static_assert(RowsInEnumeratorOrder(CounterTable, &CounterDescriptor::counter),
 /// `-DFASTCACHED_VERSION_STRING` accepts any text.
 struct InfoDescriptor
 {
-    std::string_view prometheusName; ///< Fully-qualified exported name.
-    std::string_view help;           ///< One-line `# HELP` text.
-    std::string_view label;          ///< The label the fact is carried in.
-    std::string_view value;          ///< The fact, unescaped.
+    std::string_view prometheusName;   ///< Fully-qualified exported name.
+    std::string_view help;             ///< One-line `# HELP` text.
+    std::string_view label;            ///< The label the fact is carried in.
+    std::string StatsReading::* value; ///< Where the reading holds the fact, unescaped.
 };
 
 /// Every info series this build exports, rendered once each by `PrometheusFormatter`.
@@ -817,7 +817,7 @@ inline constexpr std::array InfoTable {
     InfoDescriptor { .prometheusName = "fastcached_build_info",
                      .help = "The build this process runs: the version is the label, and the value is always 1.",
                      .label = "version",
-                     .value = VersionString },
+                     .value = &StatsReading::version },
 };
 
 /// The row describing `counter`.

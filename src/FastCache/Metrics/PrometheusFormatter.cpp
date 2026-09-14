@@ -391,13 +391,13 @@ static void AppendConsensusMetrics(std::string& out, ConsensusStatus const& stat
     }
 }
 
-std::string RenderInfoMetric(InfoDescriptor const& row)
+std::string RenderInfoMetric(InfoDescriptor const& row, std::string_view value)
 {
     // The exposition format's three label-value escapes and nothing else: a
     // backslash, a double quote and a line feed. Anything else is literal UTF-8.
     std::string escaped;
-    escaped.reserve(row.value.size());
-    for (char const c: row.value)
+    escaped.reserve(value.size());
+    for (char const c: value)
     {
         switch (c)
         {
@@ -536,11 +536,12 @@ std::string RenderPrometheus(StatsReading const& reading)
                     .type = MetricType::Gauge,
                     .value = omittedBySkew });
 
-    // What build this is. Unconditional, like uptime: every process serving this
-    // endpoint is some build, and a panel titling itself with the version has no
-    // other place to read it from (#134).
+    // What build captured this reading. Unconditional, like uptime: every process
+    // serving this endpoint is some build, and a panel titling itself with the version
+    // has no other place to read it from (#134). From the READING, so a decoded one
+    // states the build that sent it.
     for (auto const& row: InfoTable)
-        out += RenderInfoMetric(row);
+        out += RenderInfoMetric(row, reading.*row.value);
 
     // Uptime is neither the cache's nor the sink's: every process that serves
     // this endpoint has one, and a worker's is as useful as a daemon's.

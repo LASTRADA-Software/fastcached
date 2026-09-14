@@ -6,6 +6,7 @@
 #include <FastCache/Cache/IStorage.hpp>
 #include <FastCache/Cache/StorageTier.hpp>
 #include <FastCache/Consensus/RaftNode.hpp>
+#include <FastCache/Core/Version.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Metrics/MetricsCatalog.hpp>
 #include <FastCache/Metrics/PrometheusFormatter.hpp>
@@ -168,6 +169,20 @@ TEST_CASE("A decoded reading renders the metrics body the node itself serves", "
     CHECK(served.contains(std::format("# SKEW {} is", skewed->prometheusName)));
 }
 
+TEST_CASE("A decoded reading states the build that captured it, not the build decoding it", "[metrics][livestats]")
+{
+    // WHAT DISTINGUISHES: a version that is not this build's. A codec that dropped the field, or a renderer
+    // that stated the decoding build's own constant, both pass a round trip of a reading this build captured.
+    auto reading = RichReading();
+    CHECK(reading.version == VersionString);
+    reading.version = "9.9.9-another \"build\"";
+    auto const decoded = DecodeStatsReading(EncodeStatsReading(reading));
+    REQUIRE(decoded.has_value());
+    CHECK(decoded->version == reading.version);
+    CHECK(RenderPrometheus(*decoded).contains("fastcached_build_info{version=\"9.9.9-another \\\"build\\\"\"} 1\n"));
+    CHECK_FALSE(RenderPrometheus(*decoded).contains(std::format("version=\"{}\"", VersionString)));
+}
+
 TEST_CASE("A reading laid out by another build is refused by name", "[metrics][livestats]")
 {
     auto bytes = EncodeStatsReading(RichReading());
@@ -207,7 +222,7 @@ TEST_CASE("This build's live-stats layout is the pinned one", "[metrics][livesta
     // client built before the change will refuse this node. Update the constant in the same
     // change, and say in its message that clients and nodes upgrade together.
     INFO(std::format("StatsReadingLayout is 0x{:016x}", StatsReadingLayout));
-    CHECK(StatsReadingLayout == 0x556228629f723481ULL);
+    CHECK(StatsReadingLayout == 0xf6587b778e054808ULL);
 }
 
 TEST_CASE("A truncated or padded reading is refused and never half-read", "[metrics][livestats]")

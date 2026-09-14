@@ -1912,9 +1912,7 @@ constexpr std::string_view ChromeAdmin = "127.0.0.1:9464";
 /// @return The fields.
 [[nodiscard]] std::vector<Field> BuildInfoFields(std::string_view version)
 {
-    auto row = InfoTable.front();
-    row.value = version;
-    return ParsePrometheus(RenderInfoMetric(row)).fields;
+    return ParsePrometheus(RenderInfoMetric(InfoTable.front(), version)).fields;
 }
 
 /// A cache reading carrying what §3's title bar states: a version, and an uptime of `6d04:12`.
