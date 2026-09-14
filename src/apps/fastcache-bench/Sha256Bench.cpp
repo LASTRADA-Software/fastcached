@@ -12,7 +12,8 @@
 /// ran would read identically to one where the hardware engine was never tried.
 ///
 /// A figure here is a quantity under conditions. Whoever quotes one states the build,
-/// the host, its load and the sample count beside it.
+/// the host, its load and the sample count beside it, because this binary does not yet
+/// print the build that produced it; #1439 retires this sentence.
 ///
 /// `HmacSha256` is deliberately not measured here: outside `Core/Sha256` and the one
 /// signing seam, naming it is a second signing construction

@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <cassert>
 #include <cstring>
 #include <ranges>
 
@@ -300,11 +301,12 @@ namespace
     } };
     static_assert(RowsInEnumeratorOrder(EngineRows, &EngineRow::engine));
 
-    /// The row for @p engine.
-    /// @param engine The engine.
+    /// The row for @p engine, which every engine-taking function reaches the table through.
+    /// @param engine The engine; `Last` is a count, not an engine, and passing it is a programmer error.
     /// @return Its row.
     [[nodiscard]] EngineRow const& RowOf(Sha256Engine engine) noexcept
     {
+        assert(engine < Sha256Engine::Last);
         return EngineRows[static_cast<std::size_t>(engine)];
     }
 

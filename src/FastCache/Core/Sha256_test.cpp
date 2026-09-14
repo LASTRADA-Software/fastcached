@@ -183,8 +183,9 @@ TEST_CASE("Sha256 is unaffected by how input is chunked", "[core][sha256]")
 TEST_CASE("Every hardware Sha256 engine agrees with Scalar byte for byte", "[core][sha256]")
 {
     // The vectors above pin a handful of inputs; this pins the rest. Every length
-    // from zero to a few blocks past a page, then 1 MiB and 8 MiB, fed in uneven
-    // random chunks, must digest to what `Scalar` computes in one call.
+    // from zero to 1025 bytes (sixteen blocks and one byte past them), then 1 MiB
+    // and 8 MiB, fed in uneven random chunks, must digest to what `Scalar` computes
+    // in one call.
     std::vector<Sha256Engine> hardware = EnginesThisCpuRuns();
     std::erase(hardware, Sha256Engine::Scalar);
     if (hardware.empty())

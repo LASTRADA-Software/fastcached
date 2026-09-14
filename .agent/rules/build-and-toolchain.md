@@ -3205,7 +3205,9 @@ makes it anyway and says so there.
   a global `-m` flag.** That is `__attribute__((target("sha,ssse3,sse4.1")))` on gcc and clang
   (clang-cl included), and nothing on MSVC's cl, which allows the intrinsics anywhere and does not
   know the attribute. The attribute alone does not make the call safe: an attributed function runs
-  only once `Core/CpuFeatures` has said the CPU has its instructions (#1420).
+  only once `Core/CpuFeatures` has said the CPU has its instructions (#1420). **Nothing checks
+  this rule yet** (#1442, under Open work): every CI runner has the instructions, so a violation
+  passes there and dies only on a CPU without them.
   - **A global flag is wrong even when it is set on one file.** A translation unit built with
     `-msha -msse4.1` emits its own out-of-line copies of every inline function it uses:
     `std::span::subspan`, the `views::iota` iterator, and so on. The linker keeps one arbitrary
@@ -5560,6 +5562,13 @@ is correct: an inclusion list naming this repository's own layout needs no roots
   entry under "Language and ABI pitfalls" being obeyed, not a gap in it: neither platform has a CI
   leg to compile a branch for it. It closes when each has one, and that change removes the `#1432`
   comments in `Core/CpuFeatures` and this entry.
+
+- **[#1442](https://github.com/LASTRADA-Software/fastcached/issues/1442)** — the instruction-set
+  extension entry under "Language and ABI pitfalls" is prose alone. A global `-m<ext>`,
+  `-march=native` or `/arch:` on a first-party target builds and passes on every CI runner, since
+  the runners have the instructions, and dies of SIGILL only on a customer CPU without them. It
+  closes when a check over the compile database refuses those flags on first-party units, and that
+  change points the entry at the check and removes this one.
 
 - **[#1410](https://github.com/LASTRADA-Software/fastcached/issues/1410)** — the
   declared clang-tidy build crashes in `modernize-min-max-use-initializer-list` on a call through a
