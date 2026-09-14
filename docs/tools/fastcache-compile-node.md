@@ -764,6 +764,22 @@ serves unauthenticated.
 | `fastcache_node_status_requests_refused_payload_too_large_total` | A header declared more payload than these verbs may carry. Both are **fieldless**, so this came from no client of this tree at any version. Never sum it with the cache tier's row of the same name. |
 | `fastcache_node_status_requests_refused_endpoint_busy_total` | The surface had no bytes left in flight. These are the verbs somebody reaches for when a node is in trouble, so this is the node saying it is too busy to say what it is. Read it beside `fastcache_node_cache_requests_refused_endpoint_busy_total`, never summed: this says the diagnosis failed, that says why. |
 
+### Live stats
+
+`fastcache-cli live-stats` subscribes over `0xFC` and this node pushes what the dashboard draws, instead of the dashboard polling `/metrics` and `/fleet.txt` ([#1399](https://github.com/LASTRADA-Software/fastcached/issues/1399)).
+
+| Counter | What a rise means |
+|---|---|
+| `fastcache_live_subscriptions_opened_total` | A `fastcache-cli live-stats` session subscribed and was granted a stream. One per dashboard opened against this node; a climb nobody explains is a client re-subscribing in a loop rather than holding its stream. |
+| `fastcache_live_snapshots_rendered_total` | A snapshot was rendered for a subject. **Once per subject per tick, whatever the number of watchers** -- read it against the opened count: a rate that grows with the number of dashboards rather than with time is the render being paid per watcher again. |
+| `fastcache_live_snapshots_skipped_total` | A subscriber was still writing a previous snapshot when the next was due, so it was sent the newest and told how many it missed. **The node never waits for a slow watcher**; a rise is a slow link or a stalled terminal on the watching side. |
+| `fastcache_live_subscriptions_revoked_total` | A stream ended because its peer stopped passing the gate -- a reload or a replicated removal revoked a host that was still watching. Removal fails open unless something re-checks live connections; this is that re-check acting. |
+| `fastcache_live_subscriptions_ended_not_leader_total` | A fleet stream ended because this node stopped leading; the watcher was told where the new leader is and follows it. A rise with no election you know of is leadership flapping. |
+| `fastcache_live_subscriptions_refused_at_capacity_total` | A subscription was refused because the node already streams to its maximum number of watchers. Long before a team reaches it, dashboards left open everywhere do. |
+| `fastcache_live_subscriptions_refused_unauthenticated_total` | A fleet subscription was refused: a wrong or missing dashboard credential, or a remote peer while no `--dashboard-token-file` is configured. The fleet map is behind the same credential here as on `/fleet`; a burst from one host is somebody guessing. |
+| `fastcache_live_subscriptions_stalled_total` | A stream ended because a single push stayed unwritten past its bound -- the watcher stopped reading altogether, so its buffers were released rather than held. |
+| `fastcache_live_subscriptions_ended_by_client_total` | A watching client closed its stream -- the ordinary way a dashboard ends. Opened minus this, minus the ended rows above, is the streams still open. |
+
 
 Read the two upstream counters beside the gauge, never on their own. They are
 cumulative, so a node with **no** shared cache and a node with one it has not yet
