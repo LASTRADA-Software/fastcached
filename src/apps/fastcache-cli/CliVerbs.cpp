@@ -1641,8 +1641,10 @@ namespace
     /// @return The answer.
     [[nodiscard]] Answer Fleet(VerbContext const& context)
     {
-        auto const request = CompileCacheWire::EncodeFleetTextRequest(CompileCacheWire::FleetTextRequest {
-            .section = context.operands[0], .range = {}, .dashboardToken = std::string { context.dashboardToken } });
+        auto const request = CompileCacheWire::EncodeFleetTextRequest(
+            CompileCacheWire::FleetTextRequest { .section = context.operands[0],
+                                                 .range = context.options.range.value_or(std::string {}),
+                                                 .dashboardToken = std::string { context.dashboardToken } });
         auto read = AskLeader(context, request);
         if (!read.has_value())
             return std::move(read.error());
@@ -1953,7 +1955,7 @@ namespace
           .summary = "one of the leader's fleet tables, read over 0xFC from\n"
                      "the node that leads -- no admin surface, browser or JSON parser",
           .protocolCommand = "fleet-text",
-          .modifiers = Modifier::None,
+          .modifiers = Modifier::Range,
           .handler = &Fleet,
           // No fallback: an endpoint that is not a node has no fleet to report.
           .nodeFallback = nullptr,

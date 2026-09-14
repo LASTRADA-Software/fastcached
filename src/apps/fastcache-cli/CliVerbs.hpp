@@ -178,6 +178,16 @@ struct VerbOptions
     /// refused where it is parsed instead.
     std::optional<std::size_t> samples {};
 
+    /// From `--range`: the window a fleet read is rendered for, as the leader's key, or nullopt
+    /// for the leader's default day.
+    ///
+    /// **The word typed, not a `FleetRange`** (#1390): which windows exist is the leader's
+    /// table, and a leader refuses a key it does not serve with every key it does -- so this
+    /// client holds no copy to disagree with it, exactly as for the section. Never empty once
+    /// parsed: on the wire empty means *the default*, so `--range=` is refused where it is
+    /// parsed rather than read as a choice.
+    std::optional<std::string> range {};
+
     bool onlyIfAbsent { false };  ///< From `--nx`.
     bool onlyIfPresent { false }; ///< From `--xx`.
     bool raw { false };           ///< From `--raw`: write the value's bytes verbatim.
@@ -341,6 +351,7 @@ namespace Modifier
     constexpr std::uint8_t Everything = 0b1000;  ///< `--all`
     constexpr std::uint8_t Interval = 0b1'0000;  ///< `--interval`
     constexpr std::uint8_t Samples = 0b10'0000;  ///< `--samples`
+    constexpr std::uint8_t Range = 0b100'0000;   ///< `--range`
 } // namespace Modifier
 
 /// `VerbSpec::maxOperands` for a verb that takes any number.

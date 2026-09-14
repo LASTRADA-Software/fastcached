@@ -90,7 +90,7 @@ struct Admission
 /// @param resp The RESP connection, or null when none opened.
 /// @return The conclusion and the ask count.
 [[nodiscard]] Admission Admit(std::vector<std::string> const& operands,
-                              VerbOptions options,
+                              VerbOptions const& options,
                               EndpointIdentity identity,
                               IExchange* resp = nullptr)
 {

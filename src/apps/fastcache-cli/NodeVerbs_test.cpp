@@ -622,8 +622,9 @@ TEST_CASE("Every node verb declares the 0xFC wire and needs only that connection
 
         // `--ttl`, `--nx`, `--xx`, `--raw` and `--all` are keyspace concepts and a node
         // holds no keyspace, so a node verb honouring one would be a flag the parser
-        // accepts and the handler cannot act on.
-        CHECK(verb->modifiers == Modifier::None);
+        // accepts and the handler cannot act on. Those bits and no others: `fleet` honours
+        // `--range`, which is the leader's window rather than a key (#1390).
+        CHECK((verb->modifiers & (Modifier::Ttl | Modifier::Exclusivity | Modifier::Raw | Modifier::Everything)) == 0);
 
         // Every node verb names the `0xFC` verb it sends. It is what the per-verb help
         // renders and what a reader matches against `CompileCacheWire`'s own table.
@@ -1370,6 +1371,42 @@ TEST_CASE("fleet asks the node for the section named and renders the leader's ow
     auto const rendered = RenderValue(answer.value, RenderOptions { .format = OutputFormat::Json });
     CHECK(rendered.contains("toolchain"));
     CHECK(rendered.contains("gcc-13-abcdef"));
+}
+
+TEST_CASE("fleet series asks for the range given and draws a gap as an absent cell", "[cli][node][fleet]")
+{
+    // #1390. The history, one row per bucket and one column per series. The range travels as the
+    // key typed -- the leader refuses one it does not serve -- and a bucket with no reading is ABSENT
+    // in every format, never a zero a chart or a spreadsheet would read as a quiet fleet.
+    ScriptedNodeExchange node { { FleetDocumentReply("start\tcoverage\tbackfilled\tdispatched\n"
+                                                     "1757800800\t1\tno\t4\n"
+                                                     "1757801100\t0\tno\t-\n") } };
+
+    auto const* const verb = FindVerb("fleet");
+    REQUIRE(verb != nullptr);
+    auto const operands = std::vector<std::string> { "series" };
+    auto const answer = RunVerb(
+        *verb,
+        VerbContext { .operands = operands, .options = VerbOptions { .range = std::string { "7d" } }, .node = &node });
+
+    REQUIRE(answer.outcome == Outcome::Affirmative);
+    REQUIRE(node.Sent().size() == 1);
+    auto const request = FleetRequestOf(node.Sent()[0]);
+    CHECK(request.section == "series");
+    CHECK(request.range == "7d");
+
+    auto const rendered = RenderValue(answer.value, RenderOptions { .format = OutputFormat::Json });
+    CHECK(rendered.contains("dispatched"));
+    CHECK(rendered.contains("null"));
+    CHECK_FALSE(rendered.contains("\"-\""));
+
+    SECTION("and with no range the leader's default is asked for, not a key this client chose")
+    {
+        ScriptedNodeExchange defaulted { { FleetDocumentReply("start\tcoverage\tbackfilled\n") } };
+        (void) RunFleet(defaulted, nullptr, { "series" });
+        REQUIRE(defaulted.Sent().size() == 1);
+        CHECK(FleetRequestOf(defaulted.Sent()[0]).range.empty());
+    }
 }
 
 TEST_CASE("fleet turns the leader's dash into a real absent cell", "[cli][node][fleet]")

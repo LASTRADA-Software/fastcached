@@ -170,6 +170,18 @@ headline strip, one line per figure, keyed by a name rather than by a page label
 it carries is the number and its scale — never `/ 32 slots`, which a reader would have
 to parse a figure back out of.
 
+`series` is the history the dashboard's charts draw, as a table: one row per bucket of the
+window, one column per series, a bucket with no reading an absent cell rather than a zero
+([#1390](https://github.com/LASTRADA-Software/fastcached/issues/1390)). `--range` names the
+window, as the leader names it; without it the leader answers for the day. The same flag
+moves the history-derived figures of `kpi`, and a key the leader does not serve is refused
+with every key it does:
+
+```console
+$ fastcache-cli fleet series --range=7d --addr=10.0.0.7:6674 --format=csv > week.csv
+$ fastcache-cli fleet kpi --range=1mo --addr=10.0.0.7:6674
+```
+
 The section is required, and the reason is the unit: this verb's answer is one table,
 and the whole document is every section behind a marker. A default would silently pick
 one of them. (No count is written here on purpose — the set grew by one at `kpi` and a

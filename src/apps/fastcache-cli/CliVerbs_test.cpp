@@ -29,7 +29,7 @@ namespace
 [[nodiscard]] Answer Run(std::string_view name,
                          std::vector<std::string> operands,
                          ScriptedExchange& exchange,
-                         VerbOptions options = {})
+                         VerbOptions const& options = {})
 {
     auto const* const verb = FindVerb(name);
     REQUIRE(verb != nullptr);
