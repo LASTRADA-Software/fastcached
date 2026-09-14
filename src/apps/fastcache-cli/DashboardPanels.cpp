@@ -289,7 +289,7 @@ namespace
         RateRow { .label = "mean compile",
                   .key = "mean_compile_seconds",
                   .figure = MeanCompile,
-                  .note = "sum/count over this interval; no histogram exists, so no p50/p95 can be shown",
+                  .note = "Δsum/Δcount over this interval; no histogram exists, so no p50/p95 can be shown",
                   .trend = Trend::None,
                   .priority = Priority::High,
                   .notePriority = Priority::High },
