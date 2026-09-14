@@ -25,6 +25,7 @@
 #include <cstdint>
 #include <expected>
 #include <format>
+#include <initializer_list>
 #include <iterator>
 #include <optional>
 #include <ranges>
@@ -345,10 +346,12 @@ TEST_CASE("a counter that went down draws a gap and the next interval draws a ra
 TEST_CASE("a tier table keeps three blank cells between every pair of columns, heading and rows alike",
           "[cli][dashboard][panel]")
 {
-    // §3: `tier      items        used       limit    evict/s   index (RAM)`. WHAT DISTINGUISHES: the heading and
-    // each row split at runs of THREE blanks into exactly one cell per column. With a one-cell gap the 11-cell
-    // `index (RAM)` joins `evict/s` in a 12-cell column, and a 10-cell `248.00 MiB` joins the figure before it,
-    // so the count comes out one short -- while every figure is still present, which a contains() check passes.
+    // §3: `tier      items        used       limit    evict/s   index (RAM)`. WHAT DISTINGUISHES: the heading
+    // splits at runs of THREE blanks into exactly one cell per column. With a one-cell gap the 11-cell
+    // `index (RAM)` joins `evict/s` in a 12-cell column and the count comes out one short -- while every word is
+    // still present, which a contains() check passes. MEASURED by neutering the gap to one: only the heading
+    // fails. The rows are held to the same count so a row never loses a column, but their figures are nine
+    // cells or fewer (a ten-cell item count follows the tier name's padding), so they do not discriminate.
     auto const cellsOf = [](std::string_view line) {
         auto cells = std::vector<std::string> {};
         auto cell = std::string {};
@@ -390,6 +393,108 @@ TEST_CASE("a tier table keeps three blank cells between every pair of columns, h
         ++checked;
     }
     CHECK(checked == 3);
+}
+
+TEST_CASE("an 80x24 cache panel carries every label, qualifier and note section 3 draws, readings at column 15",
+          "[cli][dashboard][panel]")
+{
+    // §3 at an SSH session's floor. WHAT DISTINGUISHES: the LEVEL readings start at column 15, right after a
+    // twelve-cell label (`items       1 284 991`), and the `connected` row keeps its reason at 80 -- which a
+    // reading right-aligned into twelve more cells pushed off the line. The rest is the mockup's content held in
+    // one place: each rate's qualifier, the tier heading, the footnote and the source line, so a regression to
+    // key names or to dropping a qualifier goes red here.
+    auto const at = [](std::uint64_t step, int seconds) {
+        auto sample = SampleOf(CacheSeries(step, { "memory", "disk" }), seconds);
+        sample.attempts.front().where = "127.0.0.1:9464";
+        return sample;
+    };
+    auto view = PanelView { CachePanel(),
+                            PanelContext { .absent = std::string { Absent },
+                                           .endpoint = "127.0.0.1:6379",
+                                           .interval = 2s,
+                                           .cellWidth = &FakeCellWidth,
+                                           .rung = RenderRung::Unicode } };
+    auto sink = CollectingSink {};
+    (void) Drive(
+        { DashboardEvent { .kind = DashboardEventKind::Resize, .columns = 80, .rows = 24 }, at(1, 1), at(2, 3), Tick },
+        DashboardLimits {},
+        view,
+        sink);
+    REQUIRE(sink.frames.size() == 1);
+    auto const lines = Lines(sink.frames.front());
+    CHECK(lines.size() <= 24);
+
+    // The line whose twelve label cells read @p label, or nullopt.
+    auto const row = [&lines](std::string_view label) -> std::optional<std::string> {
+        for (auto const& line: lines)
+            if (Trimmed(Columns(line, LabelFrom, 12)) == label)
+                return line;
+        return std::nullopt;
+    };
+    constexpr auto ReadingFrom = LabelFrom + 12;
+    auto const reading = [&row](std::string_view label) {
+        auto const line = row(label);
+        return line.has_value() ? Columns(*line, ReadingFrom, 80) : std::string { "(no row)" };
+    };
+    INFO(sink.frames.front());
+    CHECK(reading("connected").starts_with(std::format("{}  no level is exported; connections_total is a TALLY", Absent)));
+    CHECK(reading("items").starts_with("1 284 991"));
+    CHECK(reading("bytes").starts_with("3.00 GiB / 4.00 GiB  "));
+    CHECK(reading("bytes").contains("75.0 %"));
+
+    auto const frame = sink.frames.front();
+    for (auto const& [label, qualifier]: std::initializer_list<std::pair<std::string_view, std::string_view>> {
+             { "hit rate", "since start" },
+             { "ops/sec", "get " },
+             { "ops/sec", "set " },
+             { "conns/sec", "accepted " },
+             { "evictions/s", "evicted unfetched " },
+             { CachePanel().rates.back().label, "expired unfetched " },
+         })
+    {
+        INFO("rate " << label << " with " << qualifier);
+        auto const line = std::ranges::find_if(
+            lines, [label](std::string const& one) { return Trimmed(Columns(one, LabelFrom, 16)).starts_with(label); });
+        REQUIRE(line != lines.end());
+        CHECK(line->contains(qualifier));
+    }
+    CHECK(frame.contains("index (RAM)"));
+    CHECK(frame.contains("tier bytes carry per-tier denominations and do not sum; no per-tier"));
+    CHECK(frame.contains("hit rate is published, deliberately."));
+    CHECK(frame.contains("source  metrics (/metrics at 127.0.0.1:9464)"));
+}
+
+TEST_CASE("a level label as wide as the label column still leaves a blank before its reading, and moves the block",
+          "[cli][dashboard][panel]")
+{
+    // WHAT DISTINGUISHES: a left-aligned reading is written straight after its label's column, so a twelve-cell
+    // label in a twelve-cell column reads `scratch free1 284 991` unless the column grows. It grows for the whole
+    // block, so the short label's reading starts in the same column rather than at the default one.
+    static constexpr auto levels = std::array {
+        LevelRow { .label = "scratch free", .key = "long", .value = { .field = { .metrics = "fastcached_items" } } },
+        LevelRow { .label = "items", .key = "items", .value = { .field = { .metrics = "fastcached_items" } } },
+    };
+    static constexpr auto spec =
+        PanelSpec { .title = "levels", .rates = {}, .levels = levels, .tierColumns = {}, .tierNote = {} };
+    auto view = PanelView {
+        spec, PanelContext { .absent = std::string { Absent }, .cellWidth = &FakeCellWidth, .rung = RenderRung::Unicode }
+    };
+    auto sink = CollectingSink {};
+    (void) Drive({ DashboardEvent { .kind = DashboardEventKind::Resize, .columns = 80, .rows = 24 },
+                   SampleOf(CacheSeries(1, {}), 1),
+                   Tick },
+                 DashboardLimits {},
+                 view,
+                 sink);
+    REQUIRE(sink.frames.size() == 1);
+    INFO(sink.frames.front());
+    auto const lines = Lines(sink.frames.front());
+    auto const starting = [&lines](std::string_view text) {
+        return std::ranges::count_if(
+            lines, [text](std::string const& line) { return Columns(line, LabelFrom, 80).starts_with(text); });
+    };
+    CHECK(starting("scratch free 1 284 991") == 1);
+    CHECK(starting("items        1 284 991") == 1);
 }
 
 TEST_CASE("a tier the endpoint does not run contributes no row", "[cli][dashboard][panel]")
