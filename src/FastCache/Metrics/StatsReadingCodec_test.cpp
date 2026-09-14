@@ -307,11 +307,13 @@ TEST_CASE("An IMetricsSink counter travels at its ordinal and a reordered enum i
     constexpr auto LayoutBytes = std::size_t { 8 };
     auto const rows = CounterTable.size();
     auto const bitmapBytes = (rows + 7) / 8;
-    REQUIRE(rows == static_cast<std::size_t>(IMetricsSink::Counter::Last));
+    REQUIRE(rows == CounterCount);
 
     auto const onlyAt = [&](IMetricsSink::Counter counter) {
         auto reading = StatsReading {};
-        reading.counters[static_cast<std::size_t>(counter)] = Value;
+        auto* const cell = reading.counters.Find(counter);
+        REQUIRE(cell != nullptr);
+        *cell = Value;
         return EncodeStatsReading(reading);
     };
     auto const bigEndianAt = [](std::vector<std::byte> const& bytes, std::size_t at) {
@@ -325,7 +327,11 @@ TEST_CASE("An IMetricsSink counter travels at its ordinal and a reordered enum i
                                IMetricsSink::Counter::ConnectionsTotalTls,
                                IMetricsSink::Counter::LiveSubscriptionsRefusedEndpointBusy })
     {
-        auto const ordinal = static_cast<std::size_t>(counter);
+        // The enumerator's ordinal IS the wire position here, which is what this case pins -- asked of the one
+        // converter rather than cast (#1366).
+        auto const index = CounterIndex(counter);
+        REQUIRE(index.has_value());
+        auto const ordinal = Unwrap(index);
         CAPTURE(ordinal);
         auto const bytes = onlyAt(counter);
         REQUIRE(bytes.size() >= LayoutBytes + bitmapBytes + 8);

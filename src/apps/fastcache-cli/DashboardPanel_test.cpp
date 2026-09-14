@@ -75,7 +75,9 @@ constexpr std::string_view Absent = "n/a";
 [[nodiscard]] StatsReading CounterReading(IMetricsSink::Counter counter, std::uint64_t value)
 {
     auto reading = StatsReading {};
-    reading.counters[static_cast<std::size_t>(counter)] = value;
+    auto* const cell = reading.counters.Find(counter);
+    REQUIRE(cell != nullptr);
+    *cell = value;
     return reading;
 }
 
@@ -633,7 +635,9 @@ TEST_CASE("an absent figure reads the same bytes on the Unicode and ASCII rungs"
     // rungs, and the rows compared DO carry the marker -- or identical lines of numbers pass.
     auto series = CacheReading(1, { "memory" });
     series.snapshot.storage.reset();
-    series.counters[static_cast<std::size_t>(IMetricsSink::Counter::ExpiryKeysReclaimed)].reset();
+    auto* const cycle = series.counters.Find(IMetricsSink::Counter::ExpiryKeysReclaimed);
+    REQUIRE(cycle != nullptr);
+    cycle->reset();
     auto const script = std::vector<DashboardEvent> { SampleOf(series, 1), Tick };
     auto const unicode = CacheFrames(script, RenderRung::Unicode);
     auto const ascii = CacheFrames(script, RenderRung::Ascii);
@@ -885,7 +889,9 @@ TEST_CASE("the node panel's per-minute rate and mean compile come from the catal
     // ten jobs is a 2 s mean, not 2000. Read from a reading stating those two counters alone.
     auto const node = [](std::uint64_t jobs, std::uint64_t millis) {
         auto reading = CounterReading(IMetricsSink::Counter::WorkerJobsCompleted, jobs);
-        reading.counters[static_cast<std::size_t>(IMetricsSink::Counter::WorkerCompileMillisTotal)] = millis;
+        auto* const cell = reading.counters.Find(IMetricsSink::Counter::WorkerCompileMillisTotal);
+        REQUIRE(cell != nullptr);
+        *cell = millis;
         return reading;
     };
     auto view = PanelView {
