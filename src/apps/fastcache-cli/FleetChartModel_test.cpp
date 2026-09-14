@@ -282,7 +282,7 @@ TEST_CASE("the chart's colour scale runs coldest to hottest in whole steps", "[c
 {
     // WHAT DISTINGUISHES: the left and right ends differ, the scale is opaque, and it has eight colours --
     // a legend of one colour, or of a smeared gradient the encoder must quantize, cannot be read as values.
-    auto const scale = FleetChartScale(80, 4);
+    auto const scale = ChartScaleRaster(80, 4);
     REQUIRE(scale.rgba.size() == std::size_t { 80 } * 4 * 4);
     auto colours = std::vector<std::uint32_t> {};
     for (auto const x: std::views::iota(std::size_t { 0 }, std::size_t { 80 }))

@@ -3121,7 +3121,7 @@ DashboardFrame PanelView::PlacedFrame(DashboardModel const& model)
                                .cellsWide = chart->imageCells,
                                .cellsHigh = chart->item.imageRows,
                                .sixel = {} });
-        place(FleetChartScale(ChartScaleCells * cell.width, cell.height),
+        place(ChartScaleRaster(ChartScaleCells * cell.width, cell.height),
               FramePlacement { .row = itemRow + chart->scaleLine,
                                .column = 2 + chart->scaleColumn,
                                .cellsWide = ChartScaleCells,

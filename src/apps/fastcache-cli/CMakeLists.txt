@@ -27,6 +27,7 @@ set(_fc_cli_sources
     DashboardSampler.cpp
     FleetChartModel.cpp
     FleetDocument.cpp
+    HistoryChart.cpp
     LiveEventSource.cpp
     LivePipedView.cpp
     LiveSession.cpp
@@ -109,6 +110,7 @@ if(FASTCACHED_BUILD_TESTS)
         DashboardSampler_test.cpp
         FleetChartModel_test.cpp
         FleetDocument_test.cpp
+        HistoryChart_test.cpp
         LiveEventSource_test.cpp
         LivePipedView_test.cpp
         LiveSession_test.cpp
