@@ -56,8 +56,9 @@ TEST_CASE("CliParser: --log-timestamps sets the value and the explicit-override 
     auto const result = FastCache::ParseCli(std::span<char const* const> { args });
     REQUIRE(result.has_value());
     REQUIRE(result->config.logTimestamps);
-    // The explicit flag is what lets a CLI --log-timestamps override the YAML
-    // value in BOTH directions (the merge in main.cpp), unlike the old one-way OR.
+    // The explicit flag is what a service registration asks before baking the flag in;
+    // precedence over a file is which applier ran last, and `ConfigMerge_test` asserts
+    // it in both polarities through the assembly.
     REQUIRE(result->logTimestampsExplicit);
 }
 
@@ -74,54 +75,9 @@ TEST_CASE("CliParser: --log-timestamps absent leaves the explicit-override flag 
     // on the platform the default exists for.
     //
     // The explicit bit above is the load-bearing half either way: it stays clear when
-    // nobody typed the flag, which is what lets a configuration file win over whatever
-    // the platform default is.
+    // nobody typed the flag, so a registration does not bake in a platform default
+    // that would then outrank the configuration file forever.
     REQUIRE(result->config.logTimestamps == FastCache::DefaultLogTimestamps);
-}
-
-TEST_CASE("CliParser: a config file outranks the platform's timestamp default", "[config][cli]")
-{
-    // **The property the platform default exists to preserve** (#496). The first
-    // attempt had the macOS installer append `--log-timestamps` to the registration
-    // instead, which set the explicit bit -- so `log_timestamps:` in the shipped
-    // reference configuration became dead on macOS: the operator edits it, kickstarts
-    // the job, and nothing changes, with no error anywhere.
-    //
-    // A default sets no explicit bit, so the file wins by ordinary precedence, in BOTH
-    // directions. Asserted through the merge rather than by reading the field, because
-    // the merge is where the injected flag would have won.
-    FastCache::Config fileCfg {};
-    FastCache::CliResult cli {};
-
-    SECTION("the file turns it off where the platform turns it on")
-    {
-        fileCfg.logTimestamps = false;
-        cli.config.logTimestamps = FastCache::DefaultLogTimestamps;
-        REQUIRE_FALSE(cli.logTimestampsExplicit);
-
-        auto const merged = FastCache::Merge(fileCfg, cli);
-        CHECK_FALSE(merged.logTimestamps);
-    }
-
-    SECTION("and on where the platform leaves it off")
-    {
-        fileCfg.logTimestamps = true;
-        cli.config.logTimestamps = FastCache::DefaultLogTimestamps;
-        REQUIRE_FALSE(cli.logTimestampsExplicit);
-
-        auto const merged = FastCache::Merge(fileCfg, cli);
-        CHECK(merged.logTimestamps);
-    }
-
-    SECTION("but a typed flag still outranks the file, which is what the bit is for")
-    {
-        fileCfg.logTimestamps = false;
-        cli.config.logTimestamps = true;
-        cli.logTimestampsExplicit = true;
-
-        auto const merged = FastCache::Merge(fileCfg, cli);
-        CHECK(merged.logTimestamps);
-    }
 }
 
 TEST_CASE("CliParser: --log-source sets the value and the explicit-override flag", "[config][cli]")
@@ -261,9 +217,9 @@ TEST_CASE("CliParser: --lru-mode parses each policy and defaults to approximate"
         auto const result = FastCache::ParseCli(std::span<char const* const> { args });
         REQUIRE(result.has_value());
         REQUIRE(result->config.lruRecency == mode);
-        // Whenever the flag was typed, the explicit-bit must be set so the
-        // CLI value wins over a YAML default in Merge — regression for the
-        // silent-drop bug that motivated this fix.
+        // Whenever the flag was typed, the explicit-bit must be set, so what
+        // reads provenance (a service registration) sees a typed default as
+        // typed — the silent-drop bug that motivated this fix.
         REQUIRE(result->lruRecencyExplicit);
     }
 }
@@ -343,8 +299,8 @@ TEST_CASE("CliParser: --storage-max-disk parses byte-size suffixes; defaults to 
         auto const result = FastCache::ParseCli(std::span<char const* const> { args });
         REQUIRE(result.has_value());
         REQUIRE(result->config.storageMaxDiskBytes == 512ULL * 1024U * 1024U);
-        // Without this bit, Merge cannot tell the parsed value from the default
-        // and drops it whenever a config file is also loaded.
+        // Without this bit, nothing reading provenance can tell the parsed value
+        // from the default, and a registration drops it.
         REQUIRE(result->storageMaxDiskBytesExplicit);
     }
     {
@@ -382,9 +338,9 @@ TEST_CASE("CliParser: --threads=0 records the explicit-set flag (regression for 
           "[config][cli][regression]")
 {
     // Regression for finding #14 — `--threads=0` happens to equal the
-    // field's default, and the old Merge gated on value comparison.
-    // The fix tracks "user typed this flag" per-flag so YAML's
-    // `threads: 8` cannot shadow an explicit `--threads=0` (auto).
+    // field's default, and the old per-field merge gated on value comparison.
+    // The bit still records "user typed this flag"; precedence over a file's
+    // `threads: 8` is now which applier ran last.
     auto const args = std::array<char const*, 1> { "--threads=0" };
     auto const result = FastCache::ParseCli(std::span<char const* const> { args });
     REQUIRE(result.has_value());
@@ -465,9 +421,9 @@ TEST_CASE("CliParser: --expiry-scan rejects zero, which PurgeBudget reads as unb
 
 TEST_CASE("CliParser: --storage-durability=batched records the explicit-set flag", "[config][cli][regression]")
 {
-    // batched is the field's default; absent an explicit-tracker the
-    // Merge step couldn't distinguish "user typed batched" from "flag
-    // absent", so a YAML override of `none` would silently win.
+    // batched is the field's default; absent an explicit-tracker nothing
+    // could distinguish "user typed batched" from "flag absent", which the
+    // old per-field merge got wrong and a registration still asks.
     auto const args = std::array<char const*, 1> { "--storage-durability=batched" };
     auto const result = FastCache::ParseCli(std::span<char const* const> { args });
     REQUIRE(result.has_value());

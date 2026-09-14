@@ -1,176 +1,101 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Config/ConfigMerge.hpp>
+#include <FastCache/Config/FileOptions.hpp>
+#include <FastCache/Config/YamlReader.hpp>
 
 #include <array>
 #include <expected>
 #include <filesystem>
 #include <format>
+#include <iterator>
+#include <ranges>
+#include <span>
 #include <string>
 #include <string_view>
 #include <unordered_set>
 #include <utility>
+#include <vector>
 
 namespace FastCache
 {
 
-namespace
-{
-
-    /// Forward `cli.<src>` into `dst.<field>` when the explicit-bit
-    /// `cli.*Explicit` is set. The pointer-to-member parameter shape is
-    /// type-safe: the compiler enforces that the explicit-bit is `bool`,
-    /// and that the source/destination fields have a common type. Adding
-    /// a new flag now means ONE row in `Merge` and one new explicit-bit
-    /// on CliResult — no separate if-arm.
-    /// @tparam T          Field type (deduced).
-    /// @param dst         Mutable destination config.
-    /// @param cli         CLI result carrying the explicit-bits + source values.
-    /// @param explicitBit Pointer-to-member into `CliResult` selecting the bit.
-    /// @param field       Pointer-to-member into `Config` selecting the field.
-    template <class T>
-    void MergeField(Config& dst, CliResult const& cli, bool CliResult::* explicitBit, T Config::* field) noexcept
-    {
-        if (cli.*explicitBit)
-            dst.*field = cli.config.*field;
-    }
-
-} // namespace
-
-Config Merge(Config fileCfg, CliResult const& cli)
-{
-    // Every typed CLI flag flows through the `MergeField` helper, which
-    // forwards `cli.config.field` into `fileCfg.field` if and only if
-    // the matching `cli.*Explicit` bit is set. Adding a new flag is a
-    // single new row + a new `*Explicit` bit on CliResult — no
-    // copy-pasted if-arm that an operator can silently forget to
-    // update (a class of regression this branch already had to retrofit
-    // four times for serviceName/lruRecency/cpuAffinity/notifyKeyspaceEvents).
-    MergeField(fileCfg, cli, &CliResult::bindAddressExplicit, &Config::bindAddress);
-    MergeField(fileCfg, cli, &CliResult::portExplicit, &Config::port);
-    MergeField(fileCfg, cli, &CliResult::maxMemoryBytesExplicit, &Config::maxMemoryBytes);
-    MergeField(fileCfg, cli, &CliResult::logLevelExplicit, &Config::logLevel);
-    MergeField(fileCfg, cli, &CliResult::serviceNameExplicit, &Config::serviceName);
-    MergeField(fileCfg, cli, &CliResult::storagePathExplicit, &Config::storagePath);
-    MergeField(fileCfg, cli, &CliResult::storageDurabilityExplicit, &Config::storageDurability);
-    MergeField(fileCfg, cli, &CliResult::storageMaxValueBytesExplicit, &Config::storageMaxValueBytes);
-    MergeField(fileCfg, cli, &CliResult::storageMaxDiskBytesExplicit, &Config::storageMaxDiskBytes);
-    MergeField(fileCfg, cli, &CliResult::workerThreadsExplicit, &Config::workerThreads);
-    MergeField(fileCfg, cli, &CliResult::storageShardsExplicit, &Config::storageShards);
-    MergeField(fileCfg, cli, &CliResult::activeExpiryIntervalMsExplicit, &Config::activeExpiryIntervalMs);
-    MergeField(fileCfg, cli, &CliResult::activeExpiryScanBudgetExplicit, &Config::activeExpiryScanBudget);
-    MergeField(fileCfg, cli, &CliResult::listenBacklogExplicit, &Config::listenBacklog);
-    MergeField(fileCfg, cli, &CliResult::logTimestampsExplicit, &Config::logTimestamps);
-    MergeField(fileCfg, cli, &CliResult::logSourceExplicit, &Config::logSource);
-    MergeField(fileCfg, cli, &CliResult::logEverythingExplicit, &Config::logEverything);
-    MergeField(fileCfg, cli, &CliResult::requirePassExplicit, &Config::requirePass);
-    MergeField(fileCfg, cli, &CliResult::authUsernameExplicit, &Config::authUsername);
-    MergeField(fileCfg, cli, &CliResult::metricsEnabledExplicit, &Config::metricsEnabled);
-    MergeField(fileCfg, cli, &CliResult::metricsBindAddressExplicit, &Config::metricsBindAddress);
-    MergeField(fileCfg, cli, &CliResult::metricsPortExplicit, &Config::metricsPort);
-    MergeField(fileCfg, cli, &CliResult::tlsEnabledExplicit, &Config::tlsEnabled);
-    MergeField(fileCfg, cli, &CliResult::tlsCertPathExplicit, &Config::tlsCertPath);
-    MergeField(fileCfg, cli, &CliResult::tlsKeyPathExplicit, &Config::tlsKeyPath);
-    MergeField(fileCfg, cli, &CliResult::notifyKeyspaceEventsExplicit, &Config::notifyKeyspaceEvents);
-    MergeField(fileCfg, cli, &CliResult::lruRecencyExplicit, &Config::lruRecency);
-    MergeField(fileCfg, cli, &CliResult::cpuAffinityExplicit, &Config::cpuAffinity);
-    MergeField(fileCfg, cli, &CliResult::compressionExplicit, &Config::compression);
-    MergeField(fileCfg, cli, &CliResult::compressionLevelExplicit, &Config::compressionLevel);
-    MergeField(fileCfg, cli, &CliResult::compressionMinBytesExplicit, &Config::compressionMinBytes);
-    MergeField(fileCfg, cli, &CliResult::memoryCompressionExplicit, &Config::memoryCompression);
-    MergeField(fileCfg, cli, &CliResult::memoryCompressionLevelExplicit, &Config::memoryCompressionLevel);
-    MergeField(fileCfg, cli, &CliResult::memoryCompressionMinBytesExplicit, &Config::memoryCompressionMinBytes);
-
-    // Three legacy "value-comparison" shapes remain because they have no
-    // explicit-bit: `configPath` and `pidfile` are non-empty when set
-    // (the parser only assigns them when the flag appears on the CLI),
-    // and `daemon` is a one-way OR (CLI `--daemon` flips on, no
-    // `--no-daemon` flag exists today — see ConfigMerge_test.cpp's
-    // daemon-flag regression for the documented surface).
-    auto const& cliCfg = cli.config;
-    if (!cliCfg.configPath.empty())
-        fileCfg.configPath = cliCfg.configPath;
-    if (cliCfg.daemon)
-        fileCfg.daemon = true;
-    if (!cliCfg.pidfile.empty())
-        fileCfg.pidfile = cliCfg.pidfile;
-
-    // Listener endpoints: any explicit CLI `--listen` / `--listen-tls` wins
-    // wholesale over whatever the YAML file declared. We deliberately do NOT
-    // append-merge — mixing partial YAML listeners with partial CLI listeners
-    // would make precedence depend on declaration order and surprise operators.
-    // An explicit CLI list is a *replacement* of the YAML list, mirroring the
-    // single-value flags above.
-    if (!cliCfg.binds.empty())
-        fileCfg.binds = cliCfg.binds;
-    return fileCfg;
-}
-
 std::expected<EffectiveConfig, ConfigError> AssembleEffectiveConfig(std::filesystem::path const& configPath,
                                                                     ConfigSources const& sources)
 {
-    EffectiveConfig assembled;
+    // One result, and every source runs the option table's appliers into it. A key
+    // in the file sets the same explicit bit its flag does, so the bits on this
+    // result mean "named anywhere" -- which is what the environment gate below asks.
+    CliResult assembled;
 
     // The FILE first, because the command line runs over it. With no path there is
-    // no file, and `YamlConfigWithPresence{}` says exactly that: compiled-in
-    // defaults, and every presence bit false.
+    // no file, and the defaults stand until argv says otherwise.
     if (!configPath.empty())
     {
-        auto loaded = ReadYamlConfigWithPresence(configPath);
-        if (!loaded.has_value())
-            return std::unexpected(std::move(loaded).error());
-        assembled.file = std::move(*loaded);
+        auto applied =
+            ReadYamlSettings(configPath).and_then([&configPath, &assembled](std::vector<YamlSetting> const& settings) {
+                return ApplyFileSettings(CliOptions(), settings, configPath, assembled);
+            });
+        if (!applied.has_value())
+            return std::unexpected(std::move(applied).error());
     }
 
-    // The command line SECOND. That is the whole of "the command line wins" -- one
-    // loop over the same fields, running after the file's, consulting the
-    // provenance the parse recorded rather than comparing values to defaults.
-    assembled.config = Merge(assembled.file.config, sources.cli);
+    // The command line SECOND, through the same appliers. A list it names REPLACES
+    // the file's rather than extending it -- `--listen` over a file's `listen_tls:`
+    // serves the command line's endpoints alone -- so those lists are emptied first,
+    // driven off the table's `clear` column.
+    std::vector<char const*> argv;
+    argv.reserve(sources.args.size());
+    std::ranges::transform(sources.args, std::back_inserter(argv), [](std::string const& arg) { return arg.c_str(); });
+    std::span<char const* const> const tokens { argv };
+    ClearListsNamedOn(CliOptions(), tokens, assembled);
+    if (auto parsed = ParseOptionsInto(CliOptions(), tokens, assembled); !parsed.has_value())
+        return std::unexpected(std::move(parsed).error());
 
-    // The file the daemon is running from, so the snapshot names it. `Merge` cannot
-    // supply this: `configPath` reaches it only from the command line, and a
-    // DISCOVERED file was never typed there.
+    // The file the daemon is running from, so the snapshot names it. A DISCOVERED
+    // file was never typed on the command line, so no applier supplied this.
     if (!configPath.empty())
         assembled.config.configPath = configPath.string();
 
     // The environment LAST, and only where neither of the two above named the
     // setting. Precedence is therefore CLI > file > environment > default, so a
     // stray `FASTCACHED_METRICS_PORT` cannot outrank a `metrics_port:` an operator
-    // wrote -- even when they wrote the compiled-in default, which the file's own
-    // presence bit is what makes distinguishable from silence.
-    if (sources.metricsPortEnv.has_value() && !sources.cli.metricsPortExplicit && !assembled.file.metricsPortExplicit)
+    // wrote -- even when they wrote the compiled-in default, which the bit the file's
+    // applier set is what makes distinguishable from silence.
+    if (sources.metricsPortEnv.has_value() && !assembled.metricsPortExplicit)
         assembled.config.metricsPort = *sources.metricsPortEnv;
 
-    return assembled;
+    return EffectiveConfig { std::move(assembled) };
 }
 
-std::expected<void, ConfigError> ValidateBindFlagShape(CliResult const& cli, std::span<BindConfig const> binds)
+std::expected<void, ConfigError> ValidateBindFlagShape(EffectiveConfig const& effective)
 {
-    if (binds.empty())
+    if (effective.Configuration().binds.empty())
         return {};
-    // Map each explicit-bit to the user-facing flag name it represents so the
-    // diagnostic names the actual flag the operator typed. Data-driven row
-    // table — adding a new legacy bind flag is one more entry here.
+    // Each legacy setting beside the flag an operator reads in the refusal. Named
+    // ANYWHERE, because a `bind:` in the file is lost to a `--listen` exactly as a
+    // `--bind` is. Data-driven row table -- adding a new legacy bind setting is one
+    // more entry here.
     struct LegacyFlag
     {
-        bool isExplicit;
+        bool CliResult::* named;
         std::string_view name;
     };
-    auto const flags = std::array<LegacyFlag, 3> { {
-        { .isExplicit = cli.bindAddressExplicit, .name = "--bind" },
-        { .isExplicit = cli.portExplicit, .name = "--port" },
-        { .isExplicit = cli.tlsEnabledExplicit, .name = "--tls" },
-    } };
-    for (auto const& f: flags)
+    constexpr auto flags = std::to_array<LegacyFlag>({
+        { .named = &CliResult::bindAddressExplicit, .name = "--bind" },
+        { .named = &CliResult::portExplicit, .name = "--port" },
+        { .named = &CliResult::tlsEnabledExplicit, .name = "--tls" },
+    });
+    for (auto const& flag: flags)
     {
-        if (f.isExplicit)
+        if (effective.Named(flag.named))
             return std::unexpected(ConfigError {
                 .code = ConfigErrorCode::ParseError,
-                .source = "listeners",
+                .source = "listen",
                 .line = 0,
-                .field = "listeners",
-                .context = std::format("{} cannot be combined with --listen / --listen-tls / YAML listeners:; "
-                                       "use one shape or the other, not both",
-                                       f.name),
+                .field = "listen",
+                .context = std::format("{} (or its key) cannot be combined with --listen / --listen-tls "
+                                       "(or listen: / listen_tls:); use one shape or the other, not both",
+                                       flag.name),
             });
     }
     return {};
@@ -191,9 +116,9 @@ std::expected<void, ConfigError> ValidateBinds(std::span<BindConfig const> binds
         {
             return std::unexpected(ConfigError {
                 .code = ConfigErrorCode::ParseError,
-                .source = "listeners",
+                .source = "listen",
                 .line = 0,
-                .field = "listeners",
+                .field = "listen",
                 .context = std::format("duplicate listener endpoint {}:{}", bind.address, bind.port),
             });
         }

@@ -3,16 +3,18 @@
 #include <FastCache/Config/Config.hpp>
 #include <FastCache/Config/ConfigMerge.hpp>
 #include <FastCache/Core/Errors/ConfigError.hpp>
+#include <FastCache/Platform/EnvironmentTestUtils.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <array>
 #include <cstdint>
+#include <expected>
 #include <filesystem>
 #include <format>
 #include <optional>
-#include <span>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -21,172 +23,380 @@
 namespace
 {
 
-/// Build a CliResult with no explicit flags set — equivalent to running the
-/// daemon with only a `--config` argument.
-[[nodiscard]] FastCache::CliResult EmptyCli() noexcept
+/// Assemble a configuration from a file this case writes and a command line, the way
+/// `main` and the reloader do.
+///
+/// Real text on both sides rather than a hand-built `CliResult`: the explicit bits are
+/// what make precedence work, and a result written out here could claim one no applier
+/// ever granted.
+/// @param scratch Where the file goes.
+/// @param file The document, or nothing for "no configuration file at all".
+/// @param args The command line, program name excluded.
+/// @param metricsPortEnv The environment fallback, already resolved.
+/// @return The assembly, or its refusal.
+[[nodiscard]] std::expected<FastCache::EffectiveConfig, FastCache::ConfigError> Assemble(
+    FastCache::Testing::ScratchDirectory const& scratch,
+    std::optional<std::string_view> file,
+    std::vector<std::string> args = {},
+    std::optional<std::uint16_t> metricsPortEnv = std::nullopt)
 {
-    return FastCache::CliResult {};
+    auto path = std::filesystem::path {};
+    if (file.has_value())
+    {
+        scratch.Write("cfg.yaml", *file);
+        path = scratch / "cfg.yaml";
+    }
+    return FastCache::AssembleEffectiveConfig(
+        path, FastCache::ConfigSources { .args = std::move(args), .metricsPortEnv = metricsPortEnv });
 }
 
 } // namespace
 
-TEST_CASE("ConfigMerge: CLI --listen wins when YAML has no listeners", "[config][merge][bind]")
+// --- AssembleEffectiveConfig ------------------------------------------------
+//
+// The one place the daemon's configuration is put together: file, then command
+// line, then environment, every source through `CliOptions()`'s own appliers.
+// `main()` calls it at startup and `ConfigReloader` calls it again on every SIGHUP,
+// so a property asserted here holds at both
+// ([#622](https://github.com/LASTRADA-Software/fastcached/issues/622)).
+
+TEST_CASE("AssembleEffectiveConfig: the file is the baseline and the command line runs over it", "[config][merge][assemble]")
 {
-    FastCache::Config fileCfg {};
-    fileCfg.bindAddress = "127.0.0.1";
-    fileCfg.port = 11211;
+    FastCache::Testing::ScratchDirectory const scratch { "fastcached-assemble-precedence" };
+    auto const assembled = Assemble(scratch, "port: 12000\nmax_memory: 4096\nlog_level: warn\n", { "--max-memory=1024" });
+    REQUIRE(assembled.has_value());
 
-    auto cli = EmptyCli();
-    cli.config.binds.push_back({ .address = "0.0.0.0", .port = 6380, .tls = true });
-
-    auto const merged = FastCache::Merge(std::move(fileCfg), cli);
-    REQUIRE(merged.binds.size() == 1);
-    REQUIRE(merged.binds[0].address == "0.0.0.0");
-    REQUIRE(merged.binds[0].port == 6380U);
-    REQUIRE(merged.binds[0].tls);
+    // Named on the command line: the command line wins.
+    CHECK(assembled->Configuration().maxMemoryBytes == 1024);
+    // Named only in the file: the file stands.
+    CHECK(assembled->Configuration().port == 12000);
+    CHECK(assembled->Configuration().logLevel == FastCache::LogLevel::Warn);
+    // And the snapshot names the file it came from, which no flag supplied.
+    CHECK(assembled->Configuration().configPath == (scratch / "cfg.yaml").string());
 }
 
-TEST_CASE("ConfigMerge: YAML binds survive when CLI provides none", "[config][merge][bind]")
+TEST_CASE("AssembleEffectiveConfig: a command line typing the default still outranks the file", "[config][merge][assemble]")
 {
-    FastCache::Config fileCfg {};
-    fileCfg.binds.push_back({ .address = "10.0.0.1", .port = 11211, .tls = false });
-    fileCfg.binds.push_back({ .address = "10.0.0.1", .port = 6380, .tls = true });
+    // The input no value comparison can answer for, and the one a per-field merge
+    // shipped wrong four times: the operator typed the compiled-in default ON PURPOSE.
+    // Precedence is which applier ran last, so the typed default wins because it ran.
+    FastCache::Testing::ScratchDirectory const scratch { "fastcached-assemble-typed-default" };
+    auto const portFlag = std::format("--port={}", FastCache::DefaultPort);
+    auto const assembled = Assemble(scratch,
+                                    "port: 12000\nstorage_shards: 4\nlru_mode: strict\n",
+                                    { portFlag, "--storage-shards=0", "--lru-mode=approximate" });
+    REQUIRE(assembled.has_value());
 
-    auto const merged = FastCache::Merge(std::move(fileCfg), EmptyCli());
-    REQUIRE(merged.binds.size() == 2);
-    REQUIRE(merged.binds[0].address == "10.0.0.1");
-    REQUIRE(merged.binds[0].port == 11211U);
-    REQUIRE_FALSE(merged.binds[0].tls);
-    REQUIRE(merged.binds[1].tls);
+    CHECK(assembled->Configuration().port == FastCache::DefaultPort);
+    CHECK(assembled->Configuration().storageShards == 0U);
+    CHECK(assembled->Configuration().lruRecency == FastCache::LruRecency::Approximate);
 }
 
-TEST_CASE("ConfigMerge: explicit CLI --listen replaces YAML listeners wholesale", "[config][merge][bind]")
+TEST_CASE("AssembleEffectiveConfig: with no file the command line stands alone", "[config][merge][assemble]")
 {
-    // YAML declared two listeners; CLI declares ONE. The CLI list replaces the
-    // YAML list entirely — we do NOT append-merge (mixing partial lists would
-    // make precedence order-dependent and surprise operators).
-    FastCache::Config fileCfg {};
-    fileCfg.binds.push_back({ .address = "10.0.0.1", .port = 11211, .tls = false });
-    fileCfg.binds.push_back({ .address = "10.0.0.1", .port = 6380, .tls = true });
+    // Including the settings no file can carry -- `--daemon`, `--pidfile` -- and the
+    // listener list, so assembling against no file is the parse itself rather than
+    // "the defaults plus the rows a file shares".
+    FastCache::Testing::ScratchDirectory const scratch { "fastcached-assemble-nofile" };
+    auto const assembled =
+        Assemble(scratch, std::nullopt, { "--daemon", "--pidfile=/run/fc.pid", "--listen=127.0.0.1:11211", "--threads=5" });
+    REQUIRE(assembled.has_value());
 
-    auto cli = EmptyCli();
-    cli.config.binds.push_back({ .address = "127.0.0.1", .port = 11211, .tls = false });
-
-    auto const merged = FastCache::Merge(std::move(fileCfg), cli);
-    REQUIRE(merged.binds.size() == 1);
-    REQUIRE(merged.binds[0].address == "127.0.0.1");
-    REQUIRE_FALSE(merged.binds[0].tls);
+    CHECK(assembled->Configuration().daemon);
+    CHECK(assembled->Configuration().pidfile == "/run/fc.pid");
+    CHECK(assembled->Configuration().workerThreads == 5);
+    REQUIRE(assembled->Configuration().binds.size() == 1);
+    CHECK(assembled->Configuration().binds.front().port == 11211);
+    // Nothing to name, so nothing is named -- a path the operator never typed must
+    // not be invented here.
+    CHECK(assembled->Configuration().configPath.empty());
 }
 
-TEST_CASE("ConfigMerge: bindAddress/port from CLI override YAML even with binds present", "[config][merge][bind]")
+TEST_CASE("AssembleEffectiveConfig: a file of nothing but comments is the defaults", "[config][merge][assemble]")
 {
-    // Legacy single-bind CLI flags are independent of `binds` and continue to
-    // override the YAML's bindAddress/port — main.cpp synthesises a BindConfig
-    // from them only when `binds` is empty.
-    FastCache::Config fileCfg {};
-    fileCfg.bindAddress = "10.0.0.1";
-    fileCfg.port = 11211;
+    // Every shipped reference configuration is this shape until somebody uncomments a
+    // line, and it must behave exactly like running with no flags.
+    FastCache::Testing::ScratchDirectory const scratch { "fastcached-assemble-comments" };
+    auto const assembled = Assemble(scratch, "# port: 6674\n# max_memory: 4g\n");
+    REQUIRE(assembled.has_value());
 
-    auto cli = EmptyCli();
-    cli.bindAddressExplicit = true;
-    cli.portExplicit = true;
-    cli.config.bindAddress = "127.0.0.1";
-    cli.config.port = 6379;
-
-    auto const merged = FastCache::Merge(std::move(fileCfg), cli);
-    REQUIRE(merged.bindAddress == "127.0.0.1");
-    REQUIRE(merged.port == 6379U);
-    REQUIRE(merged.binds.empty());
+    auto config = assembled->Configuration();
+    config.configPath.clear();
+    CHECK(config == FastCache::CliResult {}.config);
 }
 
-TEST_CASE("ConfigMerge: explicit-bit drives override even when CLI value equals default", "[config][merge]")
+TEST_CASE("AssembleEffectiveConfig: the environment applies only where nobody named the port", "[config][merge][assemble]")
 {
-    // Regression guard for the original Merge design: typed flags use the
-    // `explicit` bit, NOT value comparison. Setting --storage-shards=0 must
-    // override a YAML shards=4 even though 0 is the default.
-    FastCache::Config fileCfg {};
-    fileCfg.storageShards = 4;
+    FastCache::Testing::ScratchDirectory const scratch { "fastcached-assemble-env" };
+    constexpr std::uint16_t EnvPort = 9999;
 
-    auto cli = EmptyCli();
-    cli.storageShardsExplicit = true;
-    cli.config.storageShards = 0;
-
-    auto const merged = FastCache::Merge(std::move(fileCfg), cli);
-    REQUIRE(merged.storageShards == 0U);
-}
-
-TEST_CASE("ConfigMerge: --log-source explicit bit overrides YAML in both directions", "[config][merge]")
-{
-    // CLI --log-source must win over a YAML log_source: false, and the absence
-    // of the flag must leave a YAML log_source: true intact — the same
-    // explicit-bit contract every other typed flag uses.
+    SECTION("neither the file nor the command line named it")
     {
-        FastCache::Config fileCfg {};
-        fileCfg.logSource = false;
-        auto cli = EmptyCli();
-        cli.logSourceExplicit = true;
-        cli.config.logSource = true;
-        auto const merged = FastCache::Merge(std::move(fileCfg), cli);
-        REQUIRE(merged.logSource);
+        auto const assembled = Assemble(scratch, "log_level: warn\n", {}, EnvPort);
+        REQUIRE(assembled.has_value());
+        CHECK(assembled->Configuration().metricsPort == EnvPort);
     }
+
+    SECTION("the file named it, at the compiled-in default")
     {
-        FastCache::Config fileCfg {};
-        fileCfg.logSource = true;
-        auto const cli = EmptyCli(); // logSourceExplicit defaults to false
-        auto const merged = FastCache::Merge(std::move(fileCfg), cli);
-        REQUIRE(merged.logSource);
+        // The case a value comparison cannot answer: `metrics_port:` written out as
+        // the default is a decision, and the bit its applier set is what says so.
+        auto const assembled =
+            Assemble(scratch, std::format("metrics_port: {}\n", FastCache::DefaultMetricsPort), {}, EnvPort);
+        REQUIRE(assembled.has_value());
+        CHECK(assembled->Configuration().metricsPort == FastCache::DefaultMetricsPort);
+    }
+
+    SECTION("the command line named it")
+    {
+        auto const assembled = Assemble(scratch, "log_level: warn\n", { "--metrics-port=7777" }, EnvPort);
+        REQUIRE(assembled.has_value());
+        CHECK(assembled->Configuration().metricsPort == 7777);
     }
 }
 
-TEST_CASE("ConfigMerge: --log-everything explicit bit overrides YAML in both directions", "[config][merge]")
+TEST_CASE("AssembleEffectiveConfig: a file that is not there is FileNotFound", "[config][merge][assemble]")
 {
+    // Not `ParseError`: `YAML::BadFile` derives from `YAML::Exception`, and a general
+    // catch once sent an operator who mistyped `--config` hunting for a syntax
+    // mistake in a file that does not exist. What to DO about it stays with the
+    // caller, because a file the operator named and one the daemon merely found are
+    // not the same failure.
+    FastCache::Testing::ScratchDirectory const scratch { "fastcached-assemble-missing" };
+    auto const assembled = FastCache::AssembleEffectiveConfig(scratch / "absent.yaml", FastCache::ConfigSources {});
+    REQUIRE_FALSE(assembled.has_value());
+    CHECK(assembled.error().code == FastCache::ConfigErrorCode::FileNotFound);
+}
+
+TEST_CASE("AssembleEffectiveConfig: a file that fails anywhere is refused whole", "[config][merge][assemble]")
+{
+    // Declined, never half-applied: "some of the settings, up to the bad line" is a
+    // configuration nobody wrote. The good line comes FIRST, so a reader that applied
+    // as it went would already have taken it.
+    FastCache::Testing::ScratchDirectory const scratch { "fastcached-assemble-badkey" };
+    auto const assembled = Assemble(scratch, "port: 12000\nprot: 12000\n");
+    REQUIRE_FALSE(assembled.has_value());
+    CHECK(assembled.error().code == FastCache::ConfigErrorCode::UnknownKey);
+    CHECK(assembled.error().field == "prot");
+    CHECK(assembled.error().line == 2);
+}
+
+TEST_CASE("AssembleEffectiveConfig: a setting named in the file is named, and one nobody named is not",
+          "[config][merge][assemble]")
+{
+    // `main()` asks this for a refusal a start makes once -- the legacy single-bind
+    // triplet beside the listener list -- and it has to see a key the FILE declared,
+    // not only a flag. It used to be ten hand-kept presence bits beside the reader.
+    FastCache::Testing::ScratchDirectory const scratch { "fastcached-assemble-named" };
+    auto const assembled = Assemble(scratch, "bind: 0.0.0.0\nport: 12000\n");
+    REQUIRE(assembled.has_value());
+    CHECK(assembled->Named(&FastCache::CliResult::bindAddressExplicit));
+    CHECK(assembled->Named(&FastCache::CliResult::portExplicit));
+    CHECK_FALSE(assembled->Named(&FastCache::CliResult::tlsEnabledExplicit));
+}
+
+TEST_CASE("AssembleEffectiveConfig: a file's listen and listen_tls fill one list", "[config][merge][assemble][bind]")
+{
+    // Each key spells its flag, so a file lists `host:port` exactly as argv does --
+    // IPv6 in brackets, and quoted, because a bare `[` starts a YAML sequence.
+    FastCache::Testing::ScratchDirectory const scratch { "fastcached-assemble-listen" };
+    auto const assembled =
+        Assemble(scratch, "listen:\n  - 10.0.0.1:11211\n  - \"[::1]:11212\"\nlisten_tls: 10.0.0.1:6380\n");
+    REQUIRE(assembled.has_value());
+
+    auto const& binds = assembled->Configuration().binds;
+    REQUIRE(binds.size() == 3);
+    CHECK(binds[0].address == "10.0.0.1");
+    CHECK(binds[0].port == 11211U);
+    CHECK_FALSE(binds[0].tls);
+    CHECK(binds[1].address == "::1");
+    CHECK_FALSE(binds[1].tls);
+    CHECK(binds[2].port == 6380U);
+    CHECK(binds[2].tls);
+}
+
+TEST_CASE("AssembleEffectiveConfig: a command line naming either listener flag replaces every endpoint the file declared",
+          "[config][merge][assemble][bind]")
+{
+    // Mixing partial file endpoints with partial command-line ones would make which
+    // ports are served depend on which spelling appeared where. A TLS flag replaces the
+    // file's PLAIN listeners too, because both rows fill and clear one list.
+    FastCache::Testing::ScratchDirectory const scratch { "fastcached-assemble-listen-replace" };
+    constexpr std::string_view file = "listen: 10.0.0.1:11211\nlisten_tls: 10.0.0.1:6380\n";
+
+    SECTION("a TLS flag over both file lists")
     {
-        FastCache::Config fileCfg {};
-        fileCfg.logEverything = false;
-        auto cli = EmptyCli();
-        cli.logEverythingExplicit = true;
-        cli.config.logEverything = true;
-        auto const merged = FastCache::Merge(std::move(fileCfg), cli);
-        REQUIRE(merged.logEverything);
+        auto const assembled = Assemble(scratch, file, { "--listen-tls=127.0.0.1:6390" });
+        REQUIRE(assembled.has_value());
+        auto const& binds = assembled->Configuration().binds;
+        REQUIRE(binds.size() == 1);
+        CHECK(binds.front().address == "127.0.0.1");
+        CHECK(binds.front().port == 6390U);
+        CHECK(binds.front().tls);
     }
+
+    SECTION("a command line naming neither leaves the file's endpoints alone")
     {
-        FastCache::Config fileCfg {};
-        fileCfg.logEverything = true;
-        auto const cli = EmptyCli(); // logEverythingExplicit defaults to false
-        auto const merged = FastCache::Merge(std::move(fileCfg), cli);
-        REQUIRE(merged.logEverything);
+        // The control: without it, a clear that ran unconditionally would pass the
+        // section above for the wrong reason.
+        auto const assembled = Assemble(scratch, file, { "--threads=2" });
+        REQUIRE(assembled.has_value());
+        CHECK(assembled->Configuration().binds.size() == 2);
     }
 }
 
-TEST_CASE("ConfigMerge: --service-name explicit value overrides YAML even when CLI equals default", "[config][merge]")
+TEST_CASE("AssembleEffectiveConfig: a presence setting in a file is true or false and nothing else",
+          "[config][merge][assemble]")
 {
-    // serviceName previously used `cliCfg.serviceName != Config{}.serviceName`
-    // (value comparison against the compiled default) instead of the
-    // serviceNameExplicit bit every other field uses. Passing the default
-    // value on the CLI silently fell back to the YAML value — defying the
-    // documented "CLI overrides YAML" contract whenever the operator's
-    // explicit choice happened to match the default.
-    FastCache::Config fileCfg {};
-    fileCfg.serviceName = "yaml-name";
+    // The daemon's old reader took yaml-cpp's booleans, so `metrics: yes` and
+    // `metrics: On` were accepted -- measured on 0.2.0-568 -- while the worker's file
+    // refused both. One reader now, one rule.
+    FastCache::Testing::ScratchDirectory const scratch { "fastcached-assemble-boolean" };
+    constexpr auto spellings = std::to_array<std::string_view>({ "yes", "On", "1" });
+    for (auto const spelling: spellings)
+    {
+        INFO("spelling: " << spelling);
+        auto const assembled = Assemble(scratch, std::format("metrics: {}\n", spelling));
+        REQUIRE_FALSE(assembled.has_value());
+        CHECK(assembled.error().code == FastCache::ConfigErrorCode::TypeMismatch);
+        CHECK(assembled.error().field == "metrics");
+    }
 
-    auto cli = EmptyCli();
-    cli.serviceNameExplicit = true;
-    cli.config.serviceName = FastCache::Config {}.serviceName; // == "FastCached"
-
-    auto const merged = FastCache::Merge(std::move(fileCfg), cli);
-    REQUIRE(merged.serviceName == FastCache::Config {}.serviceName);
+    auto const on = Assemble(scratch, "metrics: true\n");
+    REQUIRE(on.has_value());
+    CHECK(on->Configuration().metricsEnabled);
 }
 
-TEST_CASE("ConfigMerge: --service-name absent leaves YAML value intact", "[config][merge]")
+TEST_CASE("AssembleEffectiveConfig: the timestamp setting is named by the flag's own key, in both polarities",
+          "[config][merge][assemble]")
 {
-    // Symmetric guard: without the explicit bit, the YAML value must win.
-    FastCache::Config fileCfg {};
-    fileCfg.serviceName = "yaml-name";
+    // The default is platform-dependent (on under macOS, #496), so a presence key alone
+    // cannot say OFF there: `log_timestamps: false` means "do not pass
+    // `--log-timestamps`", which is the platform's answer. `no_log_timestamps: true` is
+    // how a file says off, exactly as `--no-log-timestamps` is how argv says it.
+    FastCache::Testing::ScratchDirectory const scratch { "fastcached-assemble-timestamps" };
 
-    auto const cli = EmptyCli(); // serviceNameExplicit defaults to false
+    SECTION("the negative key turns it off wherever the platform turns it on")
+    {
+        auto const assembled = Assemble(scratch, "no_log_timestamps: true\n");
+        REQUIRE(assembled.has_value());
+        CHECK_FALSE(assembled->Configuration().logTimestamps);
+        CHECK(assembled->Named(&FastCache::CliResult::logTimestampsExplicit));
+    }
 
-    auto const merged = FastCache::Merge(std::move(fileCfg), cli);
-    REQUIRE(merged.serviceName == "yaml-name");
+    SECTION("the positive key turns it on wherever the platform leaves it off")
+    {
+        auto const assembled = Assemble(scratch, "log_timestamps: true\n");
+        REQUIRE(assembled.has_value());
+        CHECK(assembled->Configuration().logTimestamps);
+    }
+
+    SECTION("false on either key passes nothing, which is the platform default")
+    {
+        auto const assembled = Assemble(scratch, "log_timestamps: false\nno_log_timestamps: false\n");
+        REQUIRE(assembled.has_value());
+        // The VALUE is the platform's. The setting still reads as named, because a key
+        // in a file is the operator naming it whatever it says (`ApplyFileSettings`).
+        CHECK(assembled->Configuration().logTimestamps == FastCache::DefaultLogTimestamps);
+    }
+
+    SECTION("a typed flag still outranks the file")
+    {
+        auto const assembled = Assemble(scratch, "no_log_timestamps: true\n", { "--log-timestamps" });
+        REQUIRE(assembled.has_value());
+        CHECK(assembled->Configuration().logTimestamps);
+    }
+}
+
+TEST_CASE("AssembleEffectiveConfig: a path setting expands the environment from a file and not from argv",
+          "[config][merge][assemble]")
+{
+    // A file has no shell in front of it; argv had one. So `${NAME}` in `storage_path:`
+    // is expanded, `--storage=${NAME}` arrives as the operator's shell left it, and a
+    // secret beside it is never expanded -- a `$` in a password is part of the password.
+    FastCache::Testing::ScratchDirectory const scratch { "fastcached-assemble-expand" };
+    FastCache::Testing::ScopedEnv const root { "FC_ASSEMBLE_ROOT", "/srv/fc" };
+
+    SECTION("from a file")
+    {
+        auto const assembled = Assemble(scratch,
+                                        "storage_path: ${FC_ASSEMBLE_ROOT}/cache\ntls_cert: "
+                                        "$FC_ASSEMBLE_ROOT/c.pem\nrequirepass: \"$FC_ASSEMBLE_ROOT\"\n");
+        REQUIRE(assembled.has_value());
+        CHECK(assembled->Configuration().storagePath == "/srv/fc/cache");
+        CHECK(assembled->Configuration().tlsCertPath == "/srv/fc/c.pem");
+        CHECK(assembled->Configuration().requirePass == "$FC_ASSEMBLE_ROOT");
+    }
+
+    SECTION("from the command line")
+    {
+        auto const assembled = Assemble(scratch, std::nullopt, { "--storage=${FC_ASSEMBLE_ROOT}/cache" });
+        REQUIRE(assembled.has_value());
+        CHECK(assembled->Configuration().storagePath == "${FC_ASSEMBLE_ROOT}/cache");
+    }
+
+    SECTION("an unset variable is refused at its key and line")
+    {
+        auto const assembled = Assemble(scratch, "port: 12000\nstorage_path: ${FC_ASSEMBLE_NEVER_SET}/cache\n");
+        REQUIRE_FALSE(assembled.has_value());
+        CHECK(assembled.error().code == FastCache::ConfigErrorCode::UndefinedVariable);
+        CHECK(assembled.error().field == "storage_path");
+        CHECK(assembled.error().line == 2);
+    }
+}
+
+// --- ValidateBindFlagShape ---------------------------------------------------
+
+TEST_CASE("ValidateBindFlagShape: a legacy bind setting beside a listener is refused, from either source",
+          "[config][bind][validate]")
+{
+    // Pre-fix, main.cpp silently picked `binds` and discarded `bindAddress`. The two
+    // shapes can arrive from different SOURCES, and the value is lost the same way.
+    FastCache::Testing::ScratchDirectory const scratch { "fastcached-bind-shape" };
+    struct Mix
+    {
+        std::optional<std::string_view> file;
+        std::vector<std::string> args;
+        std::string_view named;
+    };
+    auto const mixes = std::vector<Mix> {
+        { .file = std::nullopt, .args = { "--bind=1.2.3.4", "--listen=1.2.3.4:6379" }, .named = "--bind" },
+        { .file = std::nullopt, .args = { "--port=6379", "--listen=1.2.3.4:6379" }, .named = "--port" },
+        { .file = std::nullopt, .args = { "--tls", "--listen-tls=1.2.3.4:6379" }, .named = "--tls" },
+        { .file = "bind: 1.2.3.4\n", .args = { "--listen=1.2.3.4:6379" }, .named = "--bind" },
+        { .file = "tls: true\nlisten_tls: 1.2.3.4:6379\n", .args = {}, .named = "--tls" },
+    };
+    for (auto const& mix: mixes)
+    {
+        INFO("file: " << mix.file.value_or("<none>") << " named: " << mix.named);
+        auto const assembled = Assemble(scratch, mix.file, mix.args);
+        REQUIRE(assembled.has_value());
+        auto const shape = FastCache::ValidateBindFlagShape(*assembled);
+        REQUIRE_FALSE(shape.has_value());
+        CHECK(shape.error().field == "listen");
+        CHECK(shape.error().context.contains(mix.named));
+    }
+}
+
+TEST_CASE("ValidateBindFlagShape: either shape alone is accepted", "[config][bind][validate]")
+{
+    FastCache::Testing::ScratchDirectory const scratch { "fastcached-bind-shape-alone" };
+
+    SECTION("listeners alone")
+    {
+        auto const assembled = Assemble(scratch, "listen: 1.2.3.4:6379\n", { "--listen-tls=1.2.3.4:6380" });
+        REQUIRE(assembled.has_value());
+        CHECK(FastCache::ValidateBindFlagShape(*assembled).has_value());
+    }
+
+    SECTION("the legacy triplet alone, from both sources")
+    {
+        // binds is empty, so main.cpp synthesises one from bindAddress/port/tls and
+        // nothing is silently dropped.
+        auto const assembled = Assemble(scratch, "bind: 1.2.3.4\ntls: true\n", { "--port=6379" });
+        REQUIRE(assembled.has_value());
+        CHECK(FastCache::ValidateBindFlagShape(*assembled).has_value());
+    }
 }
 
 TEST_CASE("ValidateBinds: distinct endpoints pass", "[config][bind][validate]")
@@ -211,7 +421,7 @@ TEST_CASE("ValidateBinds: duplicate {addr,port} pairs are rejected", "[config][b
     };
     auto const v = FastCache::ValidateBinds(binds);
     REQUIRE_FALSE(v.has_value());
-    REQUIRE(v.error().field == "listeners");
+    REQUIRE(v.error().field == "listen");
 }
 
 TEST_CASE("ValidateBinds: empty list is trivially valid", "[config][bind][validate]")
@@ -220,116 +430,6 @@ TEST_CASE("ValidateBinds: empty list is trivially valid", "[config][bind][valida
     // legacy fallback) — ValidateBinds itself imposes no minimum.
     std::vector<FastCache::BindConfig> binds {};
     REQUIRE(FastCache::ValidateBinds(binds).has_value());
-}
-
-TEST_CASE("ConfigMerge: --lru-mode strict overrides YAML default approximate", "[config][merge][lru]")
-{
-    // The original Merge() shipped without lruRecency/cpuAffinity propagation,
-    // so `--config foo.yaml --lru-mode=strict` silently kept the YAML default.
-    FastCache::Config fileCfg {};
-    fileCfg.lruRecency = FastCache::LruRecency::Approximate;
-
-    auto cli = EmptyCli();
-    cli.lruRecencyExplicit = true;
-    cli.config.lruRecency = FastCache::LruRecency::Strict;
-
-    auto const merged = FastCache::Merge(std::move(fileCfg), cli);
-    REQUIRE(merged.lruRecency == FastCache::LruRecency::Strict);
-}
-
-TEST_CASE("ConfigMerge: --cpu-affinity none overrides YAML default per-core", "[config][merge][cpu-affinity]")
-{
-    FastCache::Config fileCfg {};
-    fileCfg.cpuAffinity = FastCache::CpuAffinity::PerCore;
-
-    auto cli = EmptyCli();
-    cli.cpuAffinityExplicit = true;
-    cli.config.cpuAffinity = FastCache::CpuAffinity::None;
-
-    auto const merged = FastCache::Merge(std::move(fileCfg), cli);
-    REQUIRE(merged.cpuAffinity == FastCache::CpuAffinity::None);
-}
-
-TEST_CASE("ConfigMerge: --lru-mode default-value still overrides YAML when explicit", "[config][merge][lru]")
-{
-    // Mirrors the explicit-bit-not-value-comparison invariant: `--lru-mode
-    // approximate` on top of a YAML `lru_mode: strict` must win, even though
-    // approximate happens to equal the field's compiled-in default.
-    FastCache::Config fileCfg {};
-    fileCfg.lruRecency = FastCache::LruRecency::Strict;
-
-    auto cli = EmptyCli();
-    cli.lruRecencyExplicit = true;
-    cli.config.lruRecency = FastCache::LruRecency::Approximate;
-
-    auto const merged = FastCache::Merge(std::move(fileCfg), cli);
-    REQUIRE(merged.lruRecency == FastCache::LruRecency::Approximate);
-}
-
-TEST_CASE("ValidateBindFlagShape: --bind alongside --listen is rejected", "[config][bind][validate]")
-{
-    // Pre-fix, main.cpp silently picked `binds` and discarded `bindAddress`.
-    // We now fail fast and name the offending flag.
-    std::vector<FastCache::BindConfig> binds {
-        { .address = "1.2.3.4", .port = 6379, .tls = false },
-    };
-    auto cli = EmptyCli();
-    cli.bindAddressExplicit = true;
-
-    auto const result = FastCache::ValidateBindFlagShape(cli, binds);
-    REQUIRE_FALSE(result.has_value());
-    REQUIRE(result.error().field == "listeners");
-    REQUIRE(result.error().context.contains("--bind"));
-}
-
-TEST_CASE("ValidateBindFlagShape: --port alongside --listen is rejected", "[config][bind][validate]")
-{
-    std::vector<FastCache::BindConfig> binds {
-        { .address = "1.2.3.4", .port = 6379, .tls = false },
-    };
-    auto cli = EmptyCli();
-    cli.portExplicit = true;
-
-    auto const result = FastCache::ValidateBindFlagShape(cli, binds);
-    REQUIRE_FALSE(result.has_value());
-    REQUIRE(result.error().context.contains("--port"));
-}
-
-TEST_CASE("ValidateBindFlagShape: --tls alongside --listen is rejected", "[config][bind][validate]")
-{
-    // --listen-tls is the correct shape; --tls (the legacy enable bit) mixed
-    // with --listen would silently drop tlsEnabled.
-    std::vector<FastCache::BindConfig> binds {
-        { .address = "1.2.3.4", .port = 6379, .tls = true },
-    };
-    auto cli = EmptyCli();
-    cli.tlsEnabledExplicit = true;
-
-    auto const result = FastCache::ValidateBindFlagShape(cli, binds);
-    REQUIRE_FALSE(result.has_value());
-    REQUIRE(result.error().context.contains("--tls"));
-}
-
-TEST_CASE("ValidateBindFlagShape: --listen alone is accepted", "[config][bind][validate]")
-{
-    // The normal multi-listener case — only --listen / --listen-tls were typed.
-    std::vector<FastCache::BindConfig> binds {
-        { .address = "1.2.3.4", .port = 6379, .tls = false },
-    };
-    auto const cli = EmptyCli();
-    REQUIRE(FastCache::ValidateBindFlagShape(cli, binds).has_value());
-}
-
-TEST_CASE("ValidateBindFlagShape: empty binds + any legacy flag is accepted", "[config][bind][validate]")
-{
-    // Legacy single-bind path — binds is empty, so main.cpp synthesises from
-    // bindAddress/port/tlsEnabled and nothing is silently dropped.
-    std::vector<FastCache::BindConfig> binds {};
-    auto cli = EmptyCli();
-    cli.bindAddressExplicit = true;
-    cli.portExplicit = true;
-    cli.tlsEnabledExplicit = true;
-    REQUIRE(FastCache::ValidateBindFlagShape(cli, binds).has_value());
 }
 
 TEST_CASE("FormatBindSummary: single plaintext bind", "[config][bind][summary]")
@@ -366,247 +466,4 @@ TEST_CASE("FormatBindSummary: empty list renders <none>", "[config][bind][summar
     // FormatBindSummary itself stays total.
     std::vector<FastCache::BindConfig> binds {};
     REQUIRE(FastCache::FormatBindSummary(binds) == "<none>");
-}
-
-TEST_CASE("ConfigMerge: YAML lru/cpu survive when CLI did not pass the flag", "[config][merge][lru][cpu-affinity]")
-{
-    // Negative case: without the explicit bit, the YAML value must survive
-    // even if cliCfg.lruRecency happens to differ from it (it shouldn't, but
-    // it must be invisible to Merge).
-    FastCache::Config fileCfg {};
-    fileCfg.lruRecency = FastCache::LruRecency::Strict;
-    fileCfg.cpuAffinity = FastCache::CpuAffinity::None;
-
-    auto cli = EmptyCli();
-    cli.config.lruRecency = FastCache::LruRecency::Approximate; // not explicit
-    cli.config.cpuAffinity = FastCache::CpuAffinity::PerCore;   // not explicit
-
-    auto const merged = FastCache::Merge(std::move(fileCfg), cli);
-    REQUIRE(merged.lruRecency == FastCache::LruRecency::Strict);
-    REQUIRE(merged.cpuAffinity == FastCache::CpuAffinity::None);
-}
-
-TEST_CASE("ConfigMerge: explicit CLI compression flags override YAML", "[config][merge][compression]")
-{
-    FastCache::Config fileCfg {};
-    fileCfg.compression = FastCache::CompressionCodec::Zstd;
-    fileCfg.compressionLevel = 3;
-    fileCfg.compressionMinBytes = 256;
-
-    auto cli = EmptyCli();
-    cli.compressionExplicit = true;
-    cli.config.compression = FastCache::CompressionCodec::Identity;
-    cli.compressionLevelExplicit = true;
-    cli.config.compressionLevel = 12;
-    cli.compressionMinBytesExplicit = true;
-    cli.config.compressionMinBytes = 4096;
-
-    auto const merged = FastCache::Merge(std::move(fileCfg), cli);
-    REQUIRE(merged.compression == FastCache::CompressionCodec::Identity);
-    REQUIRE(merged.compressionLevel == 12);
-    REQUIRE(merged.compressionMinBytes == 4096);
-}
-
-TEST_CASE("ConfigMerge: YAML compression survives when CLI did not pass the flag", "[config][merge][compression]")
-{
-    FastCache::Config fileCfg {};
-    fileCfg.compression = FastCache::CompressionCodec::Lz4;
-    fileCfg.compressionLevel = 9;
-
-    auto cli = EmptyCli();
-    cli.config.compression = FastCache::CompressionCodec::Zstd; // not explicit
-    cli.config.compressionLevel = 1;                            // not explicit
-
-    auto const merged = FastCache::Merge(std::move(fileCfg), cli);
-    REQUIRE(merged.compression == FastCache::CompressionCodec::Lz4);
-    REQUIRE(merged.compressionLevel == 9);
-}
-
-TEST_CASE("ConfigMerge: --storage-max-disk survives a config file", "[config][merge][storage]")
-{
-    // The flag had no `*Explicit` tracker and no merge row, so it was parsed
-    // into the CLI config and then discarded by every run that also passed
-    // --config. storageMaxDiskBytes == 0 means "unbounded" to BuildLayeredShard,
-    // so the disk tier never evicted and grew until the volume filled — while
-    // the same flag *without* --config worked, which is what made it look fine.
-    FastCache::Config fileCfg {};
-    fileCfg.storageMaxDiskBytes = 1024;
-
-    auto cli = EmptyCli();
-    cli.config.storageMaxDiskBytes = 10ULL * 1024 * 1024 * 1024;
-    cli.storageMaxDiskBytesExplicit = true;
-
-    auto const merged = FastCache::Merge(std::move(fileCfg), cli);
-    REQUIRE(merged.storageMaxDiskBytes == 10ULL * 1024 * 1024 * 1024);
-}
-
-TEST_CASE("ConfigMerge: an unset --storage-max-disk leaves the config file alone", "[config][merge][storage]")
-{
-    FastCache::Config fileCfg {};
-    fileCfg.storageMaxDiskBytes = 4096;
-
-    auto const merged = FastCache::Merge(std::move(fileCfg), EmptyCli());
-    REQUIRE(merged.storageMaxDiskBytes == 4096U);
-}
-
-namespace
-{
-
-/// A parse of @p args, or a hard failure naming what would not parse.
-///
-/// The cases below drive real argv rather than setting explicit bits by hand: the
-/// bits are what makes precedence work, and a hand-written `CliResult` can claim
-/// one the parser never granted.
-/// @param args The command-line tokens, program name excluded.
-/// @return The parse.
-[[nodiscard]] FastCache::CliResult ParsedArgv(std::span<char const* const> args)
-{
-    auto parsed = FastCache::ParseCli(args);
-    REQUIRE(parsed.has_value());
-    return std::move(*parsed);
-}
-
-} // namespace
-
-// --- AssembleEffectiveConfig ------------------------------------------------
-//
-// The one place the daemon's configuration is put together: file, then command
-// line, then environment. `main()` calls it at startup and `ConfigReloader` calls
-// it again on every SIGHUP, so a property asserted here holds at both
-// ([#622](https://github.com/LASTRADA-Software/fastcached/issues/622)).
-
-TEST_CASE("AssembleEffectiveConfig: the file is the baseline and the command line runs over it", "[config][merge][assemble]")
-{
-    FastCache::Testing::ScratchDirectory const scratch { "fastcached-assemble-precedence" };
-    scratch.Write("cfg.yaml",
-                  "port: 12000\n"
-                  "max_memory: 4096\n"
-                  "log_level: warn\n");
-
-    std::array<char const*, 1> const argv { "--max-memory=1024" };
-    FastCache::ConfigSources const sources { .cli = ParsedArgv(argv), .metricsPortEnv = std::nullopt };
-    auto const assembled = FastCache::AssembleEffectiveConfig(scratch / "cfg.yaml", sources);
-    REQUIRE(assembled.has_value());
-
-    // Named on the command line: the command line wins.
-    CHECK(assembled->config.maxMemoryBytes == 1024);
-    // Named only in the file: the file stands.
-    CHECK(assembled->config.port == 12000);
-    CHECK(assembled->config.logLevel == FastCache::LogLevel::Warn);
-    // And the snapshot names the file it came from, which no flag supplied.
-    CHECK(assembled->config.configPath == (scratch / "cfg.yaml").string());
-}
-
-TEST_CASE("AssembleEffectiveConfig: with no file the command line stands alone", "[config][merge][assemble]")
-{
-    // Including the settings that reach a `Config` through no explicit bit --
-    // `--daemon`, `--pidfile` and the listener list. They are carried by `Merge`'s
-    // presence tail, so assembling against no file has to be equivalent to the parse
-    // itself rather than to "the defaults plus the explicit rows".
-    std::array<char const*, 4> const argv { "--daemon", "--pidfile=/run/fc.pid", "--listen=127.0.0.1:11211", "--threads=5" };
-    FastCache::ConfigSources const sources { .cli = ParsedArgv(argv), .metricsPortEnv = std::nullopt };
-    auto const assembled = FastCache::AssembleEffectiveConfig({}, sources);
-    REQUIRE(assembled.has_value());
-
-    CHECK(assembled->config.daemon);
-    CHECK(assembled->config.pidfile == "/run/fc.pid");
-    CHECK(assembled->config.workerThreads == 5);
-    REQUIRE(assembled->config.binds.size() == 1);
-    CHECK(assembled->config.binds.front().port == 11211);
-    // Nothing to name, so nothing is named -- a path the operator never typed must
-    // not be invented here.
-    CHECK(assembled->config.configPath.empty());
-}
-
-TEST_CASE("AssembleEffectiveConfig: the environment applies only where nobody named the port", "[config][merge][assemble]")
-{
-    FastCache::Testing::ScratchDirectory const scratch { "fastcached-assemble-env" };
-    constexpr std::uint16_t EnvPort = 9999;
-
-    SECTION("neither the file nor the command line named it")
-    {
-        scratch.Write("silent.yaml", "log_level: warn\n");
-        FastCache::ConfigSources const sources { .cli = {}, .metricsPortEnv = EnvPort };
-        auto const assembled = FastCache::AssembleEffectiveConfig(scratch / "silent.yaml", sources);
-        REQUIRE(assembled.has_value());
-        CHECK(assembled->config.metricsPort == EnvPort);
-    }
-
-    SECTION("the file named it, at the compiled-in default")
-    {
-        // The case a value comparison cannot answer: `metrics_port:` written out as
-        // the default is a decision, and the YAML presence bit is what says so.
-        scratch.Write("pinned.yaml", std::format("metrics_port: {}\n", FastCache::DefaultMetricsPort));
-        FastCache::ConfigSources const sources { .cli = {}, .metricsPortEnv = EnvPort };
-        auto const assembled = FastCache::AssembleEffectiveConfig(scratch / "pinned.yaml", sources);
-        REQUIRE(assembled.has_value());
-        CHECK(assembled->config.metricsPort == FastCache::DefaultMetricsPort);
-    }
-
-    SECTION("the command line named it")
-    {
-        scratch.Write("silent.yaml", "log_level: warn\n");
-        std::array<char const*, 1> const argv { "--metrics-port=7777" };
-        FastCache::ConfigSources const sources { .cli = ParsedArgv(argv), .metricsPortEnv = EnvPort };
-        auto const assembled = FastCache::AssembleEffectiveConfig(scratch / "silent.yaml", sources);
-        REQUIRE(assembled.has_value());
-        CHECK(assembled->config.metricsPort == 7777);
-    }
-}
-
-TEST_CASE("AssembleEffectiveConfig: a file that is not there is FileNotFound", "[config][merge][assemble]")
-{
-    // Not `ParseError`: `YAML::BadFile` derives from `YAML::Exception`, and a general
-    // catch once sent an operator who mistyped `--config` hunting for a syntax
-    // mistake in a file that does not exist. What to DO about it stays with the
-    // caller, because a file the operator named and one the daemon merely found are
-    // not the same failure.
-    FastCache::Testing::ScratchDirectory const scratch { "fastcached-assemble-missing" };
-    auto const assembled = FastCache::AssembleEffectiveConfig(scratch / "absent.yaml", FastCache::ConfigSources {});
-    REQUIRE_FALSE(assembled.has_value());
-    CHECK(assembled.error().code == FastCache::ConfigErrorCode::FileNotFound);
-}
-
-TEST_CASE("AssembleEffectiveConfig: a file that does not parse is refused whole", "[config][merge][assemble]")
-{
-    // Declined, never half-applied: "some of the settings, up to the bad line" is a
-    // configuration nobody wrote.
-    FastCache::Testing::ScratchDirectory const scratch { "fastcached-assemble-badkey" };
-    scratch.Write("bad.yaml", "prot: 12000\n");
-    auto const assembled = FastCache::AssembleEffectiveConfig(scratch / "bad.yaml", FastCache::ConfigSources {});
-    REQUIRE_FALSE(assembled.has_value());
-    CHECK(assembled.error().code == FastCache::ConfigErrorCode::UnknownKey);
-}
-
-TEST_CASE("AssembleEffectiveConfig: the file's presence bits come back with it", "[config][merge][assemble]")
-{
-    // `main()` needs them for a refusal a start makes once -- mixing the legacy
-    // single-bind triplet with `listeners:` -- and it has to see a key the FILE
-    // declared, not only a flag. Swallowing them here would have moved that check
-    // onto the command line alone.
-    FastCache::Testing::ScratchDirectory const scratch { "fastcached-assemble-presence" };
-    scratch.Write("legacy.yaml",
-                  "bind: 0.0.0.0\n"
-                  "port: 12000\n");
-    auto const assembled = FastCache::AssembleEffectiveConfig(scratch / "legacy.yaml", FastCache::ConfigSources {});
-    REQUIRE(assembled.has_value());
-    CHECK(assembled->file.bindAddressExplicit);
-    CHECK(assembled->file.portExplicit);
-    CHECK_FALSE(assembled->file.tlsEnabledExplicit);
-}
-
-TEST_CASE("ConfigMerge: the in-memory codec settings merge like every other row", "[config][merge][compression]")
-{
-    // [#623](https://github.com/LASTRADA-Software/fastcached/issues/623). These were
-    // file-only, so there was no command line for a merge to prefer -- and no
-    // registration that could carry them either.
-    FastCache::Config fileCfg {};
-    fileCfg.memoryCompressionLevel = 7;
-    fileCfg.memoryCompressionMinBytes = 128;
-
-    std::array<char const*, 2> const argv { "--memory-compression-level=9", "--memory-compression-min-bytes=1024" };
-    auto const merged = FastCache::Merge(std::move(fileCfg), ParsedArgv(argv));
-
-    CHECK(merged.memoryCompressionLevel == 9);
-    CHECK(merged.memoryCompressionMinBytes == 1024);
 }
