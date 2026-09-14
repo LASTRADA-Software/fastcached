@@ -110,6 +110,25 @@ std::string Gauge(double fraction, std::size_t width, RungGlyphs const& glyphs)
            + std::string { glyphs.gaugeClose };
 }
 
+SlotGauge SlotGaugeOf(
+    std::uint32_t inFlight, std::uint32_t available, std::uint32_t registered, std::size_t width, RungGlyphs const& glyphs)
+{
+    // Cells for @p slots of the registered ones, rounded, so a gauge of the same width reads the same share alike.
+    auto const cells = [registered, width](std::uint32_t slots) {
+        if (registered == 0)
+            return std::size_t { 0 };
+        auto const share = static_cast<double>(std::min(slots, registered)) / static_cast<double>(registered);
+        return std::min(width, static_cast<std::size_t>(std::lround(share * static_cast<double>(width))));
+    };
+    auto const running = cells(inFlight);
+    auto const offered = std::max(running, cells(available));
+    return SlotGauge { .open = std::string { glyphs.gaugeOpen },
+                       .running = Repeat(glyphs.gaugeFilled, running),
+                       .held = Repeat(glyphs.gaugeHeld, offered - running),
+                       .withdrawn = Repeat(glyphs.gaugeEmpty, width - offered),
+                       .close = std::string { glyphs.gaugeClose } };
+}
+
 std::string FormatFigure(std::optional<double> value, FigureFormat format, std::string_view absent)
 {
     if (!value.has_value() || !std::isfinite(*value))
