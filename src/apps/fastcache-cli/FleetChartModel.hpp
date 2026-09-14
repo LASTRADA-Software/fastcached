@@ -2,6 +2,7 @@
 #pragma once
 
 #include "DashboardLoop.hpp"
+#include "HistoryChart.hpp"
 
 #include <FastCache/Distributed/FleetView.hpp>
 
@@ -69,27 +70,6 @@ inline constexpr auto FleetChartMetrics = std::to_array<FleetChartMetric>({
 /// @return The points, metric by metric, in the document's row order.
 [[nodiscard]] std::vector<SeriesPoint> FleetChartPoints(FleetDocument const& document);
 
-/// A chart's pixels: RGBA, row-major, four bytes a pixel.
-struct ChartRaster
-{
-    std::vector<std::uint8_t> rgba; ///< `width * height * 4` bytes.
-    std::size_t width { 0 };        ///< Pixels across.
-    std::size_t height { 0 };       ///< Pixels down.
-};
-
-/// How many samples a chart's width can stand for: the chart draws the fewest of these that holds its history.
-///
-/// **A fixed span rather than whatever the history holds.** Sized to the history, three samples filled the
-/// whole width as three blocks, which is the "block-like in one colour or another" nobody could read. With a
-/// fixed span a sample keeps its width until the span steps up, the readings not yet taken are blank at the
-/// left, and the axis can name a span a person reads.
-inline constexpr auto ChartWindows = std::to_array<std::size_t>({ 30, 60, 120, HistoryCapacity });
-
-/// The span a chart of @p samples draws.
-/// @param samples How many history entries there are.
-/// @return The first `ChartWindows` entry holding them; the last when none does.
-[[nodiscard]] std::size_t ChartWindowFor(std::size_t samples) noexcept;
-
 /// One machine the chart draws a band for.
 struct ChartBand
 {
@@ -107,6 +87,20 @@ struct ChartBand
 [[nodiscard]] std::vector<ChartBand> FleetChartBands(std::deque<HistoryEntry> const& history,
                                                      FleetChartMetric const& metric,
                                                      std::size_t window);
+
+/// @p bands as the chart's tracks: each machine's shares of @p metric's `full` over the newest @p window samples.
+///
+/// The fleet's side of the one chart renderer (`HistoryChart.hpp`): a machine a sample did not read has no share
+/// there, which the renderer draws as nothing read, never as zero.
+/// @param history The model's history.
+/// @param metric Which figure.
+/// @param bands The machines, top to bottom.
+/// @param window How many of the newest samples count.
+/// @return One track per band, its label the machine's key; `latest` and `top` are the layout's to write.
+[[nodiscard]] std::vector<ChartTrack> FleetChartTracks(std::deque<HistoryEntry> const& history,
+                                                       FleetChartMetric const& metric,
+                                                       std::span<ChartBand const> bands,
+                                                       std::size_t window);
 
 /// How @p metric's points across @p history look for @p bands, as @p width by @p height pixels.
 ///
@@ -137,11 +131,5 @@ struct ChartBand
                                            std::size_t window,
                                            std::size_t width,
                                            std::size_t height);
-
-/// The legend's colour scale: the chart ramp's steps across @p width by @p height pixels, coldest at the left.
-/// @param width Pixels across.
-/// @param height Pixels down.
-/// @return The raster.
-[[nodiscard]] ChartRaster FleetChartScale(std::size_t width, std::size_t height);
 
 } // namespace FastCache::Cli
