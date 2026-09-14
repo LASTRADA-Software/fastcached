@@ -2842,27 +2842,28 @@ namespace
     return cells < 2 ? std::string {} : Trimmed(Columns(line, 1, cells - 2));
 }
 
-/// Where a node frame's history chart is: its title line, and every band's first line in order.
-struct NodeChartLines
+/// Where a frame's history chart is: its title line, and every band's first line in order.
+struct ChartLines
 {
     std::size_t title { 0 };           ///< The title's line.
     std::vector<std::size_t> bands {}; ///< Each band's first line.
     std::size_t axis { 0 };            ///< The axis's line.
 };
 
-/// The history chart of @p frame, found by its title and its band labels in `NodePanel().charts` order.
+/// The history chart of @p frame, found by its title and its band labels in @p spec's `charts` order.
 /// @param frame The frame.
+/// @param spec The panel that drew it.
 /// @return The lines, or nullopt for a frame with no chart.
-[[nodiscard]] std::optional<NodeChartLines> NodeChartIn(std::string_view frame)
+[[nodiscard]] std::optional<ChartLines> ChartIn(std::string_view frame, PanelSpec const& spec)
 {
     auto const lines = Lines(frame);
     auto const title =
         std::ranges::find_if(lines, [](std::string const& line) { return Inside(line).starts_with("history, last "); });
     if (title == lines.end())
         return std::nullopt;
-    auto chart = NodeChartLines { .title = static_cast<std::size_t>(title - lines.begin()), .bands = {}, .axis = 0 };
+    auto chart = ChartLines { .title = static_cast<std::size_t>(title - lines.begin()), .bands = {}, .axis = 0 };
     auto at = chart.title + 1;
-    for (auto const& row: NodePanel().charts)
+    for (auto const& row: spec.charts)
     {
         while (at < lines.size() && !Inside(lines[at]).starts_with(row.label))
         {
@@ -2880,11 +2881,19 @@ struct NodeChartLines
     return chart;
 }
 
+/// The history chart of a node @p frame.
+/// @param frame The frame.
+/// @return The lines, or nullopt for a frame with no chart.
+[[nodiscard]] std::optional<ChartLines> NodeChartIn(std::string_view frame)
+{
+    return ChartIn(frame, NodePanel());
+}
+
 /// Requires @p chart to be a whole chart -- at least two bands and an axis under them -- before a case reads its
 /// lines, so a chart missing a band fails on this assertion rather than reading past the frame.
 /// @param chart The chart found.
 /// @return The chart.
-[[nodiscard]] NodeChartLines WholeNodeChart(std::optional<NodeChartLines> const& chart)
+[[nodiscard]] ChartLines WholeChart(std::optional<ChartLines> const& chart)
 {
     REQUIRE(chart.has_value());
     REQUIRE(Unwrap(chart).bands.size() >= 2);
@@ -2917,7 +2926,7 @@ TEST_CASE("a node panel at 80x24 draws no history chart, and one with rows to sp
 
     auto const frame = NodeHistoryFrame(history, 120, 40);
     INFO(frame);
-    auto const chart = WholeNodeChart(NodeChartIn(frame));
+    auto const chart = WholeChart(NodeChartIn(frame));
     auto const lines = Lines(frame);
     REQUIRE(chart.bands.size() == NodePanel().charts.size());
     auto const refused =
@@ -2946,7 +2955,7 @@ TEST_CASE("a node's history band draws zero as the floor mark and a sample not r
     constexpr auto StillAt = 21;
     auto const frame = NodeHistoryFrame(NodeHistory(Count, FailAt, StillAt), 120, 40);
     INFO(frame);
-    auto const chart = WholeNodeChart(NodeChartIn(frame));
+    auto const chart = WholeChart(NodeChartIn(frame));
     auto const lines = Lines(frame);
     auto const first = chart.bands[0];
     auto const height = chart.bands[1] - first;
@@ -2972,14 +2981,14 @@ TEST_CASE("a taller node terminal grows taller bands, and a wider one a longer s
     auto const history = NodeHistory(24, 18, 20);
     auto const small = NodeHistoryFrame(history, 120, 40);
     auto const large = NodeHistoryFrame(history, 200, 60);
-    auto const smallChart = WholeNodeChart(NodeChartIn(small));
-    auto const largeChart = WholeNodeChart(NodeChartIn(large));
-    auto const bandHeight = [](NodeChartLines const& chart) {
+    auto const smallChart = WholeChart(NodeChartIn(small));
+    auto const largeChart = WholeChart(NodeChartIn(large));
+    auto const bandHeight = [](ChartLines const& chart) {
         return chart.bands[1] - chart.bands[0];
     };
     CHECK(bandHeight(largeChart) > bandHeight(smallChart));
     CHECK(bandHeight(largeChart) <= NodePanel().chartGrowth.bandCellsMost);
-    auto const titleOf = [](std::string const& frame, NodeChartLines const& chart) {
+    auto const titleOf = [](std::string const& frame, ChartLines const& chart) {
         // The lines are held while the title is read: a reference into a temporary `Lines` dangles.
         auto const lines = Lines(frame);
         return Inside(lines.at(chart.title));
@@ -3055,7 +3064,7 @@ TEST_CASE("on the Sixel rung a node's history is one image over its bands' rows,
     REQUIRE(!sink.frames.empty());
     auto const& frame = sink.frames.back();
     INFO(frame);
-    auto const chart = WholeNodeChart(NodeChartIn(frame));
+    auto const chart = WholeChart(NodeChartIn(frame));
     auto const& placements = sink.placements.back();
     REQUIRE(placements.size() == 2);
     auto const& image = placements.front();
@@ -3085,7 +3094,7 @@ TEST_CASE("on the ASCII rung a node's history bands are ASCII marks", "[cli][das
     (void) Drive(std::move(script), DashboardLimits {}, view, sink);
     REQUIRE(!sink.frames.empty());
     auto const& frame = sink.frames.back();
-    auto const chart = WholeNodeChart(NodeChartIn(frame));
+    auto const chart = WholeChart(NodeChartIn(frame));
     auto const lines = Lines(frame);
     auto marks = std::size_t { 0 };
     for (auto const row: std::views::iota(chart.bands.front(), chart.axis))
@@ -3094,6 +3103,193 @@ TEST_CASE("on the ASCII rung a node's history bands are ASCII marks", "[cli][das
         marks += static_cast<std::size_t>(std::ranges::count(lines[row], '#'));
     }
     CHECK(marks > 0);
+}
+
+namespace
+{
+
+/// A cache's history as the chart tests read it, both tiers as §3 draws them: @p count samples a second apart, one that read
+/// nothing at @p failAt, and one interval in which no operation happened, ending at @p stillAt.
+/// @param count How many entries the history holds, the failure included.
+/// @param failAt The entry that read nothing.
+/// @param stillAt The entry whose interval moved nothing.
+/// @return The events, a tick last.
+[[nodiscard]] std::vector<DashboardEvent> CacheHistory(int count, int failAt, int stillAt)
+{
+    auto script = std::vector<DashboardEvent> {};
+    auto step = std::uint64_t { 0 };
+    for (auto const index: std::views::iota(0, count))
+    {
+        auto const seconds = index + 1;
+        if (index == failAt)
+        {
+            script.push_back(DashboardEvent { .kind = DashboardEventKind::SampleFailed,
+                                              .at = TimePoint { std::chrono::seconds { seconds } } });
+            continue;
+        }
+        step += index == stillAt ? 0U : static_cast<std::uint64_t>(1 + (index % 3));
+        script.push_back(SampleOf(CacheSeries(step, { "memory", "disk" }), seconds));
+    }
+    script.push_back(Tick);
+    return script;
+}
+
+/// The last frame a cache panel draws for @p script at @p columns by @p rows on @p rung.
+/// @param script The events.
+/// @param columns The terminal's width.
+/// @param rows The terminal's height.
+/// @param rung The rung.
+/// @return The frame.
+[[nodiscard]] std::string CacheHistoryFrame(std::vector<DashboardEvent> script,
+                                            int columns,
+                                            int rows,
+                                            RenderRung rung = RenderRung::Unicode)
+{
+    auto const frames = FramesAt(CachePanel(), std::move(script), rung, columns, rows);
+    REQUIRE(!frames.empty());
+    return frames.back();
+}
+
+/// The line index in @p lines whose content starts with @p prefix, or `lines.size()`.
+/// @param lines A frame's lines.
+/// @param prefix The start.
+/// @return The index.
+[[nodiscard]] std::size_t IndexStarting(std::vector<std::string> const& lines, std::string_view prefix)
+{
+    auto const found =
+        std::ranges::find_if(lines, [prefix](std::string const& line) { return Inside(line).starts_with(prefix); });
+    return static_cast<std::size_t>(std::ranges::distance(lines.begin(), found));
+}
+
+} // namespace
+
+TEST_CASE("a cache panel at 80x24 draws no history chart, and one with rows to spare draws it under the rates",
+          "[cli][dashboard][panel][cache][chart]")
+{
+    // #134 C9: the cache panel's lower half was empty at 120x40. WHAT DISTINGUISHES: §3's 80x24 frame has no chart,
+    // while at 120x40 the chart is there between the last rate row and the levels, with a band per `CachePanel().charts`
+    // row in the table's order, each the same height, and the frame as tall as the terminal.
+    auto const history = CacheHistory(24, 18, 20);
+    CHECK_FALSE(ChartIn(CacheHistoryFrame(history, 80, 24), CachePanel()).has_value());
+
+    auto const frame = CacheHistoryFrame(history, 120, 40);
+    INFO(frame);
+    auto const chart = WholeChart(ChartIn(frame, CachePanel()));
+    REQUIRE(chart.bands.size() == CachePanel().charts.size());
+    auto lines = Lines(frame);
+    if (!lines.empty() && lines.back().empty())
+        lines.pop_back();
+    CHECK(lines.size() == 40);
+    CHECK(IndexStarting(lines, "expired/s") < chart.title);
+    CHECK(chart.axis < IndexStarting(lines, "items"));
+    auto const height = chart.bands[1] - chart.bands[0];
+    for (auto const index: std::views::iota(std::size_t { 1 }, chart.bands.size()))
+        CHECK(chart.bands[index] - chart.bands[index - 1] == height);
+    CHECK(chart.axis == chart.bands.back() + height);
+
+    auto const tall = WholeChart(ChartIn(CacheHistoryFrame(history, 200, 60), CachePanel()));
+    CHECK(tall.bands[1] - tall.bands[0] > height);
+}
+
+TEST_CASE("a cache's history tells an idle interval from one with no reading: zero operations, and no hit rate",
+          "[cli][dashboard][panel][cache][chart]")
+{
+    // The cache's own case of absent-is-not-zero. WHAT DISTINGUISHES, in the interval where nothing was asked: the
+    // `ops/sec` band draws the zero mark on its floor, while the `hit rate` band -- hits over gets, with no gets --
+    // is blank in EVERY row. A failed sample is blank in both.
+    constexpr auto Count = 24;
+    constexpr auto FailAt = 17;
+    constexpr auto StillAt = 21;
+    auto const frame = CacheHistoryFrame(CacheHistory(Count, FailAt, StillAt), 120, 40);
+    INFO(frame);
+    auto const chart = WholeChart(ChartIn(frame, CachePanel()));
+    auto const lines = Lines(frame);
+    auto const height = chart.bands[1] - chart.bands[0];
+    auto const cellAt = [&lines](std::size_t row, int index) {
+        auto const cells = NewestCells(lines.at(row), Count);
+        return cells.at(static_cast<std::size_t>(index));
+    };
+    auto const hitRate = chart.bands[0];
+    auto const ops = chart.bands[1];
+    CHECK(cellAt(ops + height - 1, StillAt) == "\u2581");
+    CHECK(cellAt(ops + height - 1, Count - 1) != " ");
+    for (auto const row: std::views::iota(std::size_t { 0 }, height))
+    {
+        INFO("row " << row);
+        CHECK(cellAt(hitRate + row, StillAt) == " ");
+        CHECK(cellAt(hitRate + row, FailAt) == " ");
+        CHECK(cellAt(ops + row, FailAt) == " ");
+    }
+    // A reading beside it is drawn: the hit rate before the idle interval is a bar.
+    CHECK(cellAt(hitRate + height - 1, StillAt - 1) != " ");
+}
+
+TEST_CASE("a cache's fill band is drawn against the limit, not against its own peak",
+          "[cli][dashboard][panel][cache][chart]")
+{
+    // A band whose figure has a whole of its own says so: three GiB of a four GiB limit is 75 % of a band whose top
+    // is 100 %. Scaled to its own peak the band would draw a full bar and say `to 75.0 %`, a cache at its limit.
+    auto const frame = CacheHistoryFrame(CacheHistory(24, 18, 20), 120, 40);
+    INFO(frame);
+    auto const chart = WholeChart(ChartIn(frame, CachePanel()));
+    auto const lines = Lines(frame);
+    auto const bytes = Inside(lines.at(chart.bands[2]));
+    CHECK(bytes.starts_with("fill"));
+    CHECK(bytes.contains("75.0 %"));
+    CHECK(bytes.contains("to 100.0 %"));
+}
+
+TEST_CASE("a cache's history chart grows band by band in the table's order", "[cli][dashboard][panel][cache][chart]")
+{
+    // WHAT DISTINGUISHES: at the first height that draws a chart it has the hit rate alone; one row taller it adds
+    // the operations. The table, not the rate rows' order or priority, says which band comes next.
+    auto const history = CacheHistory(24, 18, 20);
+    auto first = std::optional<int> {};
+    for (auto const rows: std::views::iota(24, 60))
+        if (ChartIn(CacheHistoryFrame(history, 120, rows), CachePanel()).has_value())
+        {
+            first = rows;
+            break;
+        }
+    REQUIRE(first.has_value());
+    auto const one = ChartIn(CacheHistoryFrame(history, 120, Unwrap(first)), CachePanel());
+    REQUIRE(one.has_value());
+    CHECK(Unwrap(one).bands.size() == 1);
+    auto const two = ChartIn(CacheHistoryFrame(history, 120, Unwrap(first) + 1), CachePanel());
+    REQUIRE(two.has_value());
+    CHECK(Unwrap(two).bands.size() == 2);
+}
+
+TEST_CASE("on the Sixel rung a cache's history is one image over its bands' rows, with its colour scale",
+          "[cli][dashboard][panel][cache][chart]")
+{
+    // WHAT DISTINGUISHES: two images, the bands' exactly as many cells high as the bands' rows and starting at the
+    // first band's row, over rows the text left blank where the image goes.
+    auto encoder = ScriptedSixelEncoder {};
+    auto view = PanelView { CachePanel(),
+                            PanelContext { .absent = std::string { Absent },
+                                           .cellWidth = &FakeCellWidth,
+                                           .sixel = &encoder,
+                                           .rung = RenderRung::Sixel } };
+    auto script = CacheHistory(24, 18, 20);
+    script.insert(
+        script.begin(),
+        DashboardEvent { .kind = DashboardEventKind::Resize, .columns = 120, .rows = 40, .cellPixels = ChartCell });
+    auto sink = CollectingSink {};
+    (void) Drive(std::move(script), DashboardLimits {}, view, sink);
+    REQUIRE(!sink.frames.empty());
+    auto const& frame = sink.frames.back();
+    INFO(frame);
+    auto const chart = WholeChart(ChartIn(frame, CachePanel()));
+    auto const& placements = sink.placements.back();
+    REQUIRE(placements.size() == 2);
+    auto const& image = placements.front();
+    CHECK(image.cellsHigh == chart.axis - chart.bands.front());
+    CHECK(image.row == chart.bands.front() + 1);
+    auto const lines = Lines(frame);
+    for (auto const row: std::views::iota(chart.bands.front(), chart.axis))
+        CHECK(Trimmed(Columns(lines[row], image.column - 1, image.cellsWide)).empty());
+    CHECK(placements.back().cellsHigh == 1);
 }
 
 TEST_CASE("a node panel draws ONE refusal total with its trend, and the split under it", "[cli][dashboard][panel][node]")
