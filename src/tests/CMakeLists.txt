@@ -1566,6 +1566,35 @@ set_tests_properties("windows-header-order-selftest" PROPERTIES
     TIMEOUT 120
 )
 
+# `.clang-format-version` names the pinned MAJOR and its `clang-format-<major>` binary
+# (#1349). The declaration states the clang-format BUILD `Check C++ style` judges with,
+# and the format-on-edit hook writes only with that build -- so a `CLANG_TOOLS_VERSION`
+# bump that leaves it behind turns the hook off on every machine, silently. Refused here
+# on the pull request that makes the bump; needs no formatter, so it is in the default set.
+#
+# Whether the INSTALLED formatter is the declared build is the script's `--installed`
+# mode, and deliberately not a ctest: only `Check C++ style` installs the pinned
+# formatter, so a registration would skip on every leg it ran on (#1135). That job runs it.
+add_test(
+    NAME "clang-format-version"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-clang-format-version.sh" "${CMAKE_SOURCE_DIR}"
+)
+set_tests_properties("clang-format-version" PROPERTIES
+    LABELS "hygiene"
+    TIMEOUT 120
+)
+
+# Both directions, with fake formatters, including the #1349 case itself -- the same
+# major at a different build -- and the shipped declaration as the accepting control.
+add_test(
+    NAME "clang-format-version-selftest"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-clang-format-version.sh" --self-test "${CMAKE_SOURCE_DIR}"
+)
+set_tests_properties("clang-format-version-selftest" PROPERTIES
+    LABELS "hygiene"
+    TIMEOUT 120
+)
+
 add_test(
     NAME "script-modes"
     COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-script-modes.sh"

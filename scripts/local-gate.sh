@@ -4130,6 +4130,13 @@ if [[ "$format" -eq 1 ]]; then
     formatter="clang-format-${tools_version}"
     command -v "$formatter" >/dev/null 2>&1 \
         || fail "$formatter not found; install it or pass --no-format"
+    # The NAME pins a major and apt.llvm.org ships rolling snapshots under it, so a
+    # machine a month behind CI holds a `clang-format-22` that is a different formatter --
+    # and this pass writes. `.clang-format-version` states the build `Check C++ style`
+    # judges with (#1349), and a formatter that is not it is refused BEFORE `-i`, never
+    # after: a refusal once the tree is rewritten is a report on a tree this gate changed.
+    bash "$(dirname "${BASH_SOURCE[0]}")/check-clang-format-version.sh" --installed "$formatter" "$repo_root" \
+        || fail "$formatter is not the clang-format build .clang-format-version declares (above), so formatting the tree with it could rewrite code Check C++ style accepts; bring it to the declared build as the lines above describe, or pass --no-format"
     # Captured and counted BEFORE the formatter is asked anything, so the two ways
     # of having no files to format are told apart and neither is reported as a
     # formatting failure. `set -uo pipefail` carries no `-e`, so an errored

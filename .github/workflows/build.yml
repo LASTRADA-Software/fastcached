@@ -345,6 +345,19 @@ jobs:
           chmod +x llvm.sh
           sudo ./llvm.sh ${{ env.CLANG_TOOLS_VERSION }}
           sudo apt-get install -y clang-format-${{ env.CLANG_TOOLS_VERSION }}
+      # `CLANG_TOOLS_VERSION` pins a MAJOR and apt.llvm.org ships rolling snapshots, so
+      # the BUILD this job judges with is stated in `.clang-format-version`, which the
+      # format-on-edit hook and `local-gate.sh` read (#1349). Asserted HERE, the one job
+      # that installs the formatter, so every green run proves the declaration names the
+      # build it judged with, and a snapshot roll is a red naming the new build rather
+      # than a silent disagreement with every developer machine.
+      #
+      # BEFORE the formatting step, deliberately: a new snapshot that reformats code
+      # would otherwise go red there first, with a diff and no explanation.
+      - name: "Check the installed clang-format is the declared build"
+        if: ${{ needs.changes.outputs.code != 'false' }}
+        run: |
+          bash scripts/run-check.sh scripts/check-clang-format-version.sh --installed "clang-format-${{ env.CLANG_TOOLS_VERSION }}" "$GITHUB_WORKSPACE"
       - name: "Run clang-format"
         if: ${{ needs.changes.outputs.code != 'false' }}
         run: |
