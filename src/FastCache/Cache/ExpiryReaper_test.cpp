@@ -314,6 +314,18 @@ class HoldingExecutor final: public IExecutor
         return std::exchange(_held, std::nullopt);
     }
 
+    /// Destroy the held work instead of running it -- for a case whose reaper is already gone, where
+    /// resuming the frame would run it on freed memory.
+    /// @return Whether anything was held.
+    bool DestroyHeld()
+    {
+        auto const work = TakeHeld();
+        if (!work.has_value())
+            return false;
+        Unwrap(work).resume.destroy();
+        return true;
+    }
+
     /// Hand the held work to the inner executor.
     void ForwardHeld()
     {
@@ -371,11 +383,11 @@ template <typename Predicate>
 ///
 /// **More permissive than the seam it stands for, and a case pays for that** (#1427). Production
 /// ends the process here because returning lets `~ExpiryReaper` free the reaper while a frame is
-/// still inside it; this returns, so the destructor completes. A case may therefore let `Stop`
-/// reach the ceiling only over a frame that is HELD, which nothing runs. A case asserting that
-/// NO abandonment happened stops through `StopOnceBack`, never a bare `reset()`: the ceiling is
-/// wall time, and a pool thread the host did not schedule in time turns that assertion into a
-/// use-after-free.
+/// still inside it; this returns, so the destructor completes. The ceiling is wall time, so where
+/// the sweep leaves on a REAL executor thread and is not held, a host that does not schedule that
+/// thread in time turns a stop into a use-after-free. Such a case owns its reaper through
+/// `ReaperOnceBack`. The other two shapes are safe as they are: a frame HELD on the executor is run
+/// by nothing, and a reactor that is its own executor never raises the count `Stop` waits on.
 class RecordingAbandonment final: public IDrainAbandonment
 {
   public:
@@ -392,6 +404,11 @@ class RecordingAbandonment final: public IDrainAbandonment
 /// until the release however long the look is, so a slow host cannot turn the fix red.
 constexpr auto StopLook = 200ms;
 
+/// How long a case waits for a frame it has RELEASED to finish coming back. A hang guard, not a
+/// race: a trip that is merely slow comes back inside it on any host that runs this suite at all,
+/// and one that never comes back fails at it.
+constexpr auto TripHangGuard = 10s;
+
 /// A cycle that sweeps every millisecond and notices a stop within one, so a case reaches a
 /// hop in a few ticks.
 constexpr ExpiryReaperOptions FastCycle { .interval = 1ms, .stopWakeBound = 1ms };
@@ -401,34 +418,69 @@ constexpr ExpiryReaperOptions FastCycleShortDrain { .interval = 1ms,
                                                     .stopWakeBound = 1ms,
                                                     .stopDrain = DrainBound { .ceiling = 20ms, .poll = 1ms } };
 
-/// Destroy @p reaper only once its frame is back on the reactor.
+/// Owns a reaper whose sweep leaves on a real executor thread, and destroys it only once that
+/// sweep is back on the reactor (#1427).
 ///
-/// **For a case that asserts the stop abandoned nothing** (#1427). `Stop` gives a frame away on
-/// the executor `stopDrain.ceiling` of WALL time and then abandons it, and a case cannot beat a
-/// wall-clock ceiling on every host: under load the pool thread is simply not scheduled within
-/// it, `RecordingAbandonment` returns, and the destructor frees the reaper `SweepOnce` is still
-/// reading. So the case controls the drain as a CONDITION instead. It has stopped ticking, which
-/// makes the trip in flight the last one; once that trip is back the frame sits on the reactor's
-/// queue and `Stop` drains at its first look, however slow the host.
+/// **The drain is a CONDITION the case controls, not a ceiling it races.** `Stop` gives a frame
+/// away on the executor `stopDrain.ceiling` of WALL time and then abandons it, and no case beats a
+/// wall-clock ceiling on every host: under load the pool thread is simply not scheduled within it,
+/// `RecordingAbandonment` returns, and the destructor frees the reaper `SweepOnce` is still
+/// reading. So this waits first. The case has stopped ticking, which makes the trip in flight the
+/// last one; once it is back the frame sits on the reactor's queue and `Stop` drains at its first
+/// look, however slow the host.
 ///
-/// A trip that never comes back is the defect these cases exist to catch, and it must be a RED,
+/// **The owner, not a call beside it**, because the destructor is the one path every exit takes:
+/// a `REQUIRE` failing above an explicit stop unwinds straight into `~unique_ptr`, which is this
+/// race again with no assertion named.
+///
+/// A trip that never comes back is the defect those cases exist to catch, and it must be a RED,
 /// never a crash: the reaper is then RELEASED, not destroyed -- leaked on purpose, because
-/// destroying it frees what the executor thread is inside -- and this answers false.
-/// @param reaper The reaper to stop; null afterwards either way.
-/// @return Whether the frame came back and the reaper was destroyed.
-[[nodiscard]] bool StopOnceBack(std::unique_ptr<ExpiryReaper>& reaper)
+/// destroying it frees what the executor thread is inside.
+class ReaperOnceBack
 {
-    // A hang guard, not a race: a trip that is merely slow comes back inside it on any host
-    // that runs this suite at all, and one that never comes back fails at it.
-    constexpr auto TripBound = DrainBound { .ceiling = 10s, .poll = 1ms };
-    if (DrainWithin([&reaper] { return reaper->AwayFromReactor(); }, TripBound) == DrainResult::Ceiling)
+  public:
+    /// @param reaper The reaper to own; declared AFTER everything it borrows, so it goes first.
+    explicit ReaperOnceBack(std::unique_ptr<ExpiryReaper> reaper) noexcept:
+        _reaper { std::move(reaper) }
     {
-        std::ignore = reaper.release();
-        return false;
     }
-    reaper.reset();
-    return true;
-}
+
+    ReaperOnceBack(ReaperOnceBack const&) = delete;
+    ReaperOnceBack(ReaperOnceBack&&) = delete;
+    ReaperOnceBack& operator=(ReaperOnceBack const&) = delete;
+    ReaperOnceBack& operator=(ReaperOnceBack&&) = delete;
+
+    ~ReaperOnceBack()
+    {
+        std::ignore = Stop();
+    }
+
+    /// @return The owned reaper; valid until `Stop`.
+    [[nodiscard]] ExpiryReaper* operator->() const noexcept
+    {
+        return _reaper.get();
+    }
+
+    /// Wait for the sweep to come back, then destroy the reaper; past the hang guard, leak it.
+    /// Idempotent: a second call finds nothing to stop.
+    /// @return Whether the sweep came back and the reaper was destroyed.
+    [[nodiscard]] bool Stop()
+    {
+        if (_reaper == nullptr)
+            return true;
+        auto const back =
+            DrainWithin([this] { return _reaper->AwayFromReactor(); }, DrainBound { .ceiling = TripHangGuard, .poll = 1ms })
+            == DrainResult::Drained;
+        if (back)
+            _reaper.reset();
+        else
+            std::ignore = _reaper.release();
+        return back;
+    }
+
+  private:
+    std::unique_ptr<ExpiryReaper> _reaper;
+};
 
 /// What a staged destruction observed.
 struct StagedDestruction
@@ -458,7 +510,7 @@ template <typename Release>
     auto const returnedBeforeRelease = destroyed.wait_for(StopLook) == std::future_status::ready;
     release();
     return { .returnedBeforeRelease = returnedBeforeRelease,
-             .finished = destroyed.wait_for(10s) == std::future_status::ready };
+             .finished = destroyed.wait_for(TripHangGuard) == std::future_status::ready };
 }
 
 } // namespace
@@ -934,9 +986,7 @@ TEST_CASE("A sweep frame that never comes back is abandoned by ending the proces
                       != std::string::npos;
     }));
     // Still held, so nothing has resumed it; this is its one and only destruction.
-    auto const held = executor.TakeHeld();
-    REQUIRE(held.has_value());
-    Unwrap(held).resume.destroy();
+    REQUIRE(executor.DestroyHeld());
 }
 
 TEST_CASE("A sweep that could not be handed to its executor is skipped without stranding the stop",
@@ -952,16 +1002,16 @@ TEST_CASE("A sweep that could not be handed to its executor is skipped without s
     RecordingAbandonment abandonment;
     ThreadPoolExecutor pool { 1 };
     HoldingExecutor executor { pool };
-    auto reaper = std::make_unique<ExpiryReaper>(f.storage, logger, FastCycleShortDrain, nullptr, abandonment);
+    ReaperOnceBack reaper { std::make_unique<ExpiryReaper>(f.storage, logger, FastCycleShortDrain, nullptr, abandonment) };
     executor.RefuseNextSubmit();
     reaper->Start(f.reactor, executor);
     REQUIRE(TickUntil(f.clock, f.reactor, [&] { return executor.Refused() == 1; }));
     // The cycle survived it: a later sweep was handed over.
     REQUIRE(TickUntil(f.clock, f.reactor, [&] { return executor.Forwarded() != 0; }));
 
-    // Once back, never raced against the drain ceiling: see `StopOnceBack`. A count the refused
-    // hand-over left raised never falls, and fails here.
-    REQUIRE(StopOnceBack(reaper));
+    // Once back, never raced against the drain ceiling: see `ReaperOnceBack`. A count the refused
+    // hand-over left raised never falls, and fails HERE -- which is this case's verdict.
+    REQUIRE(reaper.Stop());
 
     CHECK(abandonment.calls.load(std::memory_order_acquire) == 0);
     CHECK_FALSE(std::ranges::any_of(logger.Snapshot(), [](auto const& record) { return record.level == LogLevel::Error; }));
@@ -979,7 +1029,7 @@ TEST_CASE("A hop back that could not be handed to the reactor still brings the s
     RecordingAbandonment abandonment;
     ThreadPoolExecutor pool { 1 };
     ParkingReactor reactor { f.reactor };
-    auto reaper = std::make_unique<ExpiryReaper>(f.storage, logger, FastCycleShortDrain, nullptr, abandonment);
+    ReaperOnceBack reaper { std::make_unique<ExpiryReaper>(f.storage, logger, FastCycleShortDrain, nullptr, abandonment) };
     reactor.RefuseNextSubmit();
     reaper->Start(reactor, pool);
     // The refused hop back, its retry, and the NEXT sweep's hop back, which only a frame that
@@ -987,47 +1037,46 @@ TEST_CASE("A hop back that could not be handed to the reactor still brings the s
     REQUIRE(TickUntil(f.clock, f.reactor, [&] { return reactor.ParkedWorkSubmits() >= 3; }));
 
     // `ParkedWorkSubmits` counts a `Submit` on ARRIVAL, so the third hop back may still be inside
-    // it with the count raised; `StopOnceBack` waits for it rather than racing the ceiling.
-    REQUIRE(StopOnceBack(reaper));
+    // it with the count raised; `ReaperOnceBack` waits for it rather than racing the ceiling.
+    REQUIRE(reaper.Stop());
 
     CHECK(reactor.Refused() == 1);
     CHECK(abandonment.calls.load(std::memory_order_acquire) == 0);
     CHECK_FALSE(std::ranges::any_of(logger.Snapshot(), [](auto const& record) { return record.level == LogLevel::Error; }));
 }
 
-TEST_CASE("A stop that waits for the sweep to come back outlasts a pool thread slower than the drain ceiling",
+TEST_CASE("The fixture's reaper owner outlasts a pool thread slower than the drain ceiling instead of freeing under it",
           "[expiry][reaper][offreactor]")
 {
-    // #1427, deterministic. Under load the pool thread was not scheduled within the 20 ms drain
-    // ceiling, `RecordingAbandonment` returned, and `reaper.reset()` freed the reaper while
-    // `SweepOnce` was still reading it -- one run in a hundred on a loaded host. Held here
-    // instead of raced: the sweep is away for ten times the ceiling before it is let go.
+    // #1427, deterministic, and a self-test of the FIXTURE: production `Stop` still gives up at its
+    // ceiling (#1433 is about the cases that assert it). Under load the pool thread was not
+    // scheduled within the 20 ms drain ceiling, `RecordingAbandonment` returned, and
+    // `reaper.reset()` freed the reaper while `SweepOnce` was still reading it -- one run in a
+    // hundred on a loaded host. Held here instead of raced: the sweep is away for ten times the
+    // ceiling before it is let go.
     //
-    // Staged so the defect is a RED rather than a crash. If the stop has already returned when
-    // the look ends, the reaper is gone, so the held frame is DESTROYED -- as the abandonment
-    // case above destroys its own -- instead of being forwarded into freed memory.
+    // Staged so the defect is a RED rather than a crash. If the stop has already returned when the
+    // look ends, the reaper is gone, so the held frame is DESTROYED -- as the abandonment case above
+    // destroys its own -- instead of being forwarded into freed memory.
+    STATIC_REQUIRE(StopLook > FastCycleShortDrain.stopDrain.ceiling);
     Fixture f;
     CapturingLogger logger;
     RecordingAbandonment abandonment;
     ThreadPoolExecutor pool { 1 };
     HoldingExecutor executor { pool };
-    auto reaper = std::make_unique<ExpiryReaper>(f.storage, logger, FastCycleShortDrain, nullptr, abandonment);
+    ReaperOnceBack reaper { std::make_unique<ExpiryReaper>(f.storage, logger, FastCycleShortDrain, nullptr, abandonment) };
     executor.HoldNextSubmit();
     reaper->Start(f.reactor, executor);
     auto const held = TickUntil(f.clock, f.reactor, [&] { return executor.Holding(); });
 
-    auto stopped = std::async(std::launch::async, [&reaper] { return StopOnceBack(reaper); });
+    auto stopped = std::async(std::launch::async, [&reaper] { return reaper.Stop(); });
     auto const returnedWhileAway = stopped.wait_for(StopLook) == std::future_status::ready;
     if (returnedWhileAway)
-    {
-        if (auto const work = executor.TakeHeld(); work.has_value())
-            Unwrap(work).resume.destroy();
-    }
+        std::ignore = executor.DestroyHeld();
     else
         executor.ForwardHeld();
 
     REQUIRE(held);
-    STATIC_REQUIRE(StopLook > FastCycleShortDrain.stopDrain.ceiling);
     CHECK_FALSE(returnedWhileAway);
     CHECK(stopped.get());
     CHECK(abandonment.calls.load(std::memory_order_acquire) == 0);
