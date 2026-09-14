@@ -8,6 +8,7 @@
 
 #include <FastCache/Net/ISocket.hpp>
 
+#include <chrono>
 #include <cstddef>
 #include <expected>
 #include <memory>
@@ -185,14 +186,32 @@ class NodeExchange final: public INodeExchange
     /// @return The remarks, in the order they were made.
     [[nodiscard]] std::span<std::string const> Advisories() const noexcept;
 
-  private:
-    /// @param socket The connected socket.
-    /// @param endpoint What to call this connection in a diagnostic.
-    NodeExchange(std::unique_ptr<ISocket> socket, std::string endpoint) noexcept;
+    /// Send one framed request and read nothing: the first half of a stream (#1399).
+    ///
+    /// `Send` reads to a TERMINAL status, which a `SUBSCRIBE` sends only when its stream ends -- so a
+    /// stream is this, then `ReadFrame` once per frame.
+    /// @param request The framed request.
+    /// @return Nothing once it is sent, or why it could not be.
+    [[nodiscard]] std::expected<void, ExchangeError> Post(std::span<std::byte const> request);
 
     /// Read exactly one framed reply, whatever its status.
     /// @return The reply, or why there is none.
     [[nodiscard]] std::expected<NodeReply, ExchangeError> ReadFrame();
+
+    /// Wait no longer than @p deadline for each read from now on.
+    /// @param deadline The bound on one read.
+    void SetReceiveDeadline(std::chrono::milliseconds deadline) noexcept;
+
+    /// Half-close: say this end has finished sending.
+    ///
+    /// Safe while `ReadFrame` blocks on another thread -- it is one `shutdown(2)` on the descriptor,
+    /// which a blocked receive does not share state with -- and it is the ordinary way a watcher leaves.
+    void ShutdownWrite() noexcept;
+
+  private:
+    /// @param socket The connected socket.
+    /// @param endpoint What to call this connection in a diagnostic.
+    NodeExchange(std::unique_ptr<ISocket> socket, std::string endpoint) noexcept;
 
     std::unique_ptr<ISocket> _socket;
     std::string _endpoint;

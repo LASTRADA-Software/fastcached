@@ -302,11 +302,28 @@ std::span<std::string const> NodeExchange::Advisories() const noexcept
     return _advisories;
 }
 
-std::expected<NodeReply, ExchangeError> NodeExchange::Send(std::span<std::byte const> request)
+std::expected<void, ExchangeError> NodeExchange::Post(std::span<std::byte const> request)
 {
     if (!SyncRun(SendAll(_socket.get(), request)))
         return std::unexpected(ExchangeError { .kind = ExchangeFailure::Transport,
                                                .detail = "the connection failed while sending the request" });
+    return {};
+}
+
+void NodeExchange::SetReceiveDeadline(std::chrono::milliseconds deadline) noexcept
+{
+    _socket->SetReceiveDeadline(deadline);
+}
+
+void NodeExchange::ShutdownWrite() noexcept
+{
+    _socket->ShutdownWrite();
+}
+
+std::expected<NodeReply, ExchangeError> NodeExchange::Send(std::span<std::byte const> request)
+{
+    if (auto posted = Post(request); !posted.has_value())
+        return std::unexpected(std::move(posted).error());
 
     // **Loop to a TERMINAL status**, never to the first frame. A reply carries a status
     // byte and no kind, so the step-over-what-you-do-not-know property is REQUEST-side
