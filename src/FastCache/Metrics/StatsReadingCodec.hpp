@@ -65,6 +65,7 @@ namespace FastCache
 /// consensus (if present): u32 member count, then per member u32 length + bytes;
 ///                         u8 leader present, then u32 length + bytes; u64 term; u64 commitIndex; u8 role
 /// u64 uptime seconds
+/// u32 length + bytes: the version of the build that captured the reading
 /// ```
 namespace StatsReadingWire
 {
@@ -161,10 +162,16 @@ namespace StatsReadingWire
         std::string_view { "consensus" }, std::string_view { "uptime" }
     };
 
+    /// The fields of `StatsReading` itself, by name, in the order they travel. Held to the struct by the
+    /// encoder's structured binding, as `SnapshotFieldNames` is.
+    inline constexpr std::array ReadingFieldNames { std::string_view { "counters" },
+                                                    std::string_view { "snapshot" },
+                                                    std::string_view { "version" } };
+
     /// The grammar's own name, folded in first so a change to the grammar ABOVE with no table
     /// change still moves the digest. Bump the suffix whenever the encoder's statements change
     /// shape without a table changing.
-    inline constexpr std::string_view Grammar = "stats-reading-grammar-1";
+    inline constexpr std::string_view Grammar = "stats-reading-grammar-2";
 
     /// 64-bit FNV-1a over @p text, continuing from @p hash.
     /// @param hash The running digest.
@@ -211,6 +218,8 @@ namespace StatsReadingWire
         for (auto const& row: Consensus::RoleTable)
             hash = Fold(hash, row.name);
         for (auto const name: SnapshotFieldNames)
+            hash = Fold(hash, name);
+        for (auto const name: ReadingFieldNames)
             hash = Fold(hash, name);
         return hash;
     }

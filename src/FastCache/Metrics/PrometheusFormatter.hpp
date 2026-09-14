@@ -5,6 +5,7 @@
 #include <FastCache/Metrics/StatsReading.hpp>
 
 #include <string>
+#include <string_view>
 
 namespace FastCache
 {
@@ -37,9 +38,10 @@ struct InfoDescriptor;
 /// the fact escaped as a Prometheus label value.
 ///
 /// Separate from `RenderPrometheus` so the escaping can be tested with a value no
-/// build carries: the table's own value is a compile-time constant.
+/// build carries.
 /// @param row The info series to render.
+/// @param value The fact, unescaped, as the reading holds it.
 /// @return The three exposition lines.
-[[nodiscard]] std::string RenderInfoMetric(InfoDescriptor const& row);
+[[nodiscard]] std::string RenderInfoMetric(InfoDescriptor const& row, std::string_view value);
 
 } // namespace FastCache
