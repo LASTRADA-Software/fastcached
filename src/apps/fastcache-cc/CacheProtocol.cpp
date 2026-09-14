@@ -144,10 +144,16 @@ namespace
                     if (liveness != nullptr)
                         liveness->MovedForward();
                     break;
+
+                case Wire::Status::Push:
+                    // A stream's frame, legal on SUBSCRIBE alone -- a verb the launcher never
+                    // sends. One arriving here is a server answering a request it was not
+                    // asked, so it is a transport failure rather than a pulse to wait past.
+                    co_return Plain(CacheOutcomeKind::Transport);
             }
 
             // Only `Progress` reaches here; every other arm returned. Asserted by the
-            // switch having no `default`, so a fifth status is a build failure at this
+            // switch having no `default`, so a new status is a build failure at this
             // reader rather than a frame silently treated as a pulse.
             if (Wire::IsTerminalStatus(header->status))
                 co_return Plain(CacheOutcomeKind::Transport);

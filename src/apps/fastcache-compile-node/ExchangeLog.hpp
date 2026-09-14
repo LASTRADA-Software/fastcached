@@ -129,6 +129,10 @@ inline constexpr std::array ExchangeLogTable {
                  .level = LogLevel::Info,
                  .rationale = "decides who joins the fleet and hands a stranger this cluster's key; the same "
                               "audit argument as cluster-admit, on the verb that reaches further" },
+    VerbLogRow { .code = CompileCacheWire::Op::Subscribe,
+                 .level = LogLevel::Info,
+                 .rationale = "an operator opening or closing a dashboard: rare, and logged once per stream when "
+                              "it ends -- never once per push, which would be a line a second per watcher" },
 };
 
 /// Whether every verb this build serves states a log level.
