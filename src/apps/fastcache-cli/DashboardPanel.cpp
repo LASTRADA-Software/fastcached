@@ -2197,14 +2197,11 @@ namespace
     /// Cells the legend's colour scale takes: one per step of the chart's ramp, so every colour is a whole cell.
     constexpr auto ChartScaleCells = std::size_t { 8 };
 
-    /// How the Sixel chart is laid out: how many machines get a band, and how many rows of cells each.
+    /// How a history chart is laid out: how many bands, and how many rows of cells each.
     struct ChartShape
     {
-        std::size_t bands { 0 };     ///< The machines drawn, the first by name.
-        std::size_t bandCells { 1 }; ///< Rows of cells per machine.
-
-        /// Whether two shapes are the same.
-        [[nodiscard]] friend bool operator==(ChartShape const&, ChartShape const&) = default;
+        std::size_t bands { 0 };     ///< The bands drawn, the first of them first.
+        std::size_t bandCells { 1 }; ///< Rows of cells per band.
     };
 
     /// The chart as a frame draws it: its one item, and where its two images go in it.
@@ -2221,6 +2218,26 @@ namespace
         ChartShape shape {};               ///< The shape it was laid out in.
         bool pixels { false };             ///< Whether its bands are an image over blank cells, rather than text.
     };
+
+    /// Whether a chart on @p context's rung is an image: the Sixel rung, with an encoder and a cell size to lay it out in.
+    /// @param in The frame's inputs.
+    /// @param context The session facts.
+    /// @return True for pixels; false for the rung's chart marks, or for none.
+    [[nodiscard]] bool ChartIsPixels(FrameInputs const& in, PanelContext const& context) noexcept
+    {
+        return context.rung == RenderRung::Sixel && context.sixel != nullptr && in.model->cellPixels.has_value();
+    }
+
+    /// The machines the fleet chart could band: those with a reading of its figure in the span it counts them over --
+    /// the image's fixed step, or as much history as text could draw.
+    /// @param in The frame's inputs.
+    /// @param context The session facts.
+    /// @return How many machines.
+    [[nodiscard]] std::size_t FleetChartMachines(FrameInputs const& in, PanelContext const& context)
+    {
+        auto const window = ChartIsPixels(in, context) ? ChartWindowFor(in.model->history.size()) : HistoryCapacity;
+        return FleetChartBands(in.model->history, FleetChartMetrics.front(), window).size();
+    }
 
     /// A span of @p samples readings, written for the title and the axis.
     /// @param samples How many samples.
@@ -2274,9 +2291,10 @@ namespace
     /// What a history chart draws, as the one layout (`LayoutChart`) takes it from a panel.
     struct ChartSource
     {
-        std::string what {};         ///< The one figure a chart of it draws, dressed as a figure; empty for several.
-        std::string whatAfter {};    ///< Words after it and before the span: ` per machine`, or `history`.
-        std::string qualifier {};    ///< Words after the span that go first for width.
+        std::string what {};      ///< The one figure a chart of it draws, dressed as a figure; empty for several.
+        std::string whatAfter {}; ///< Words after it and before the span: ` per machine`, or `history`.
+        /// Words after the span that go first for width, given the bands drawn and the span they were taken over.
+        std::function<std::string(std::size_t drawn, std::size_t window)> qualifier {};
         std::string low {};          ///< On a pixel chart, what the scale's coldest colour stands for.
         std::string high {};         ///< On a pixel chart, what its hottest stands for.
         std::string drawn {};        ///< What a bar is, for the legend: `bar: cpu-busy`.
@@ -2350,6 +2368,10 @@ namespace
             return std::nullopt;
         block.window = pixels ? firstWindow : std::min(budget - columnsOf(), HistoryCapacity);
         block.tracks = source.tracks(block.shape.bands, block.window);
+        // A band the span it was measured over held and this span does not is no band: the rows follow the tracks.
+        block.shape.bands = std::min(block.shape.bands, block.tracks.size());
+        if (block.shape.bands == 0)
+            return std::nullopt;
         measure(block.tracks, nameCells, figureCells, topCells);
         nameCells = std::min(nameCells, budget / 3);
         block.imageColumn = columnsOf();
@@ -2367,8 +2389,9 @@ namespace
         title.push_back(Piece { .text = std::format("{}, last {}", source.whatAfter, span),
                                 .priority = Priority::Essential,
                                 .tone = FrameTone::Label });
-        if (!source.qualifier.empty())
-            title.push_back(Piece { .text = source.qualifier, .priority = Priority::Low, .tone = FrameTone::Label });
+        if (auto qualifier = source.qualifier ? source.qualifier(block.shape.bands, block.window) : std::string {};
+            !qualifier.empty())
+            title.push_back(Piece { .text = std::move(qualifier), .priority = Priority::Low, .tone = FrameTone::Label });
         auto const keptTitle = FitPieces(std::move(title), budget, 0, in.cellWidth);
         if (!keptTitle.has_value())
             return std::nullopt;
@@ -2461,14 +2484,13 @@ namespace
     {
         if (spec.charts.empty())
             return std::nullopt;
-        auto const pixels =
-            context.rung == RenderRung::Sixel && context.sixel != nullptr && in.model->cellPixels.has_value();
+        auto const pixels = ChartIsPixels(in, context);
         if (!pixels && in.glyphs->chartLevels.size() < 2)
             return std::nullopt;
         auto source = ChartSource {
             .what = {},
             .whatAfter = "history",
-            .qualifier = "; each band against its top",
+            .qualifier = [](std::size_t, std::size_t) { return std::string { "; each band against its top" }; },
             .low = "0",
             .high = "top",
             .drawn = "bar: share of its band's top",
@@ -2512,32 +2534,30 @@ namespace
                                 rows / drawn, std::size_t { 1 }, std::max<std::size_t>(1, growth.bandCellsMost)) };
     }
 
-    /// The Sixel chart laid out in @p shape, on the rung and terminal that can draw it; nothing otherwise.
+    /// The fleet chart laid out in @p shape: the first `FleetChartMetrics` row, one band per machine by name.
+    ///
+    /// Pixels where the rung can draw them, the rung's chart marks where it has those, nothing otherwise. Before any
+    /// machine reported the figure it is one line saying so, never an empty chart, which would read as a fleet with
+    /// nothing on it.
     /// @param in The frame's inputs.
     /// @param spec The document block.
     /// @param context The session facts: the rung, the encoder and the interval.
     /// @param budget The content width.
-    /// @param shape The shape, or nullopt for the one it starts in.
-    /// @return The chart -- with no bands and a line saying so, before any machine reported its figure -- or
-    ///         nullopt where it is not drawn: another rung, no cell size, or too narrow for its image.
-    [[nodiscard]] std::optional<ChartBlock> ChartBlockOf(FrameInputs const& in,
-                                                         DocumentSpec const& spec,
-                                                         PanelContext const& context,
-                                                         std::size_t budget,
-                                                         std::optional<ChartShape> shape)
+    /// @param shape How many bands, and rows of cells each.
+    /// @return The chart, or nullopt where it is not drawn: a rung with no chart marks, or too narrow.
+    [[nodiscard]] std::optional<ChartBlock> FleetChartOf(
+        FrameInputs const& in, DocumentSpec const& spec, PanelContext const& context, std::size_t budget, ChartShape shape)
     {
-        if (context.rung != RenderRung::Sixel || context.sixel == nullptr || !in.model->cellPixels.has_value()
-            || spec.chartCellsHigh == 0)
+        auto const pixels = ChartIsPixels(in, context);
+        if (!pixels && in.glyphs->chartLevels.size() < 2)
             return std::nullopt;
         auto const& metric = FleetChartMetrics.front();
-        auto const machines = FleetChartBands(in.model->history, metric, ChartWindowFor(in.model->history.size()));
-        if (machines.empty())
+        auto const machines = FleetChartMachines(in, context);
+        if (machines == 0)
         {
-            // Said rather than drawn as an empty image, which would read as a fleet with nothing on it.
             auto block = ChartBlock {};
-            block.item.priority = spec.chartPriority;
-            block.item.image = true;
-            block.pixels = true;
+            block.item.priority = Priority::Low;
+            block.pixels = pixels;
             auto const nothing = std::to_array<Piece>({
                 Piece { .text = std::string { Indent } },
                 Piece { .text = std::string { metric.key }, .tone = FrameTone::Figure },
@@ -2546,22 +2566,23 @@ namespace
             AppendLine(block.item, nothing);
             return block;
         }
-        auto const drawn =
-            shape.value_or(ChartShape { .bands = std::min(machines.size(), spec.chartCellsHigh), .bandCells = 1 });
         auto const high = ChartFigureText(in, metric, metric.full);
         auto source = ChartSource {
             .what = std::string { metric.key },
             .whatAfter = " per machine",
+            // Counted over the span the bands were taken over, which on text is the cells the chart has.
             .qualifier =
-                std::min(drawn.bands, machines.size()) < machines.size()
-                    ? std::format("; the first {} of {} by name", std::min(drawn.bands, machines.size()), machines.size())
-                    : std::string {},
+                [&in, chartMetric = &metric](std::size_t drawn, std::size_t window) {
+                    auto const of = FleetChartBands(in.model->history, *chartMetric, window).size();
+                    return drawn < of ? std::format("; the first {} of {} by name", drawn, of) : std::string {};
+                },
             .low = ChartFigureText(in, metric, 0.0),
             .high = high,
-            .drawn = std::format("bar: {}", metric.key),
+            // Every band has one scale, the metric's whole, so the legend states it once rather than a band each.
+            .drawn = pixels ? std::format("bar: {}", metric.key) : std::format("bar: {} of {}", metric.key, high),
             // The grey is the band's whole scale, behind every reading: a bar of zero leaves it bare.
-            .rest = std::format(", grey: to {}, blank: no reading", high),
-            .available = machines.size(),
+            .rest = pixels ? std::format(", grey: to {}, blank: no reading", high) : std::string { ", blank: no reading" },
+            .available = machines,
             .tracks =
                 [&in, chartMetric = &metric](std::size_t count, std::size_t window) {
                     auto bands = FleetChartBands(in.model->history, *chartMetric, window);
@@ -2572,114 +2593,36 @@ namespace
                     return tracks;
                 },
         };
-        return LayoutChart(in, source, context, budget, drawn, spec.chartPriority, spec.chartMinimumCells, true);
+        return LayoutChart(in, source, context, budget, shape, Priority::Low, spec.chartGrowth.minimumCells, pixels);
     }
 
-    /// The shape the chart grows to into @p spare rows nothing else wants.
+    /// A history chart laid out in the rows @p fitted left over, and only those: a panel's, or the fleet's.
     ///
-    /// More machines first, then taller bands, and never past `chartCellsHighMost` rows of image: a tall band
-    /// makes a bar's height readable, and more than a few rows of it adds nothing.
-    /// @param shape The shape it was fitted in.
-    /// @param machines How many machines it could band.
-    /// @param spare Rows the fitted frame left over.
-    /// @param spec The document block.
-    /// @return The grown shape; @p shape when it cannot grow.
-    [[nodiscard]] ChartShape GrownChart(ChartShape shape,
-                                        std::size_t machines,
-                                        std::size_t spare,
-                                        DocumentSpec const& spec) noexcept
-    {
-        auto const rows = std::max(shape.bands * shape.bandCells,
-                                   std::min(spec.chartCellsHighMost, (shape.bands * shape.bandCells) + spare));
-        auto const bands = std::max(shape.bands, std::min(machines, rows));
-        auto const cells = std::clamp(
-            rows / std::max<std::size_t>(1, bands), std::size_t { 1 }, std::max<std::size_t>(1, spec.chartBandCellsMost));
-        return ChartShape { .bands = bands, .bandCells = cells };
-    }
-
-    /// The Sixel chart's item, on the rung and terminal that can draw it; nothing otherwise.
-    /// @param in The frame's inputs.
-    /// @param spec The document block.
-    /// @param context The session facts: the rung, the encoder and the interval.
-    /// @param budget The content width.
-    /// @return The chart item, or none.
-    [[nodiscard]] std::vector<Item> ChartItems(FrameInputs const& in,
-                                               DocumentSpec const& spec,
-                                               PanelContext const& context,
-                                               std::size_t budget)
-    {
-        auto block = ChartBlockOf(in, spec, context, budget, std::nullopt);
-        if (!block.has_value())
-            return {};
-        return { std::move(block->item) };
-    }
-
-    /// The fleet chart grown into the rows @p fitted left over: @p items carry the grown chart and @p fitted its fit
-    /// when the grown frame still fits.
-    /// @param in The frame's inputs.
-    /// @param spec The document block.
-    /// @param context The session facts.
-    /// @param budget The content width.
+    /// **The one grow step.** It is laid out for exactly those rows -- every band a row first, then taller bands, as
+    /// @p growth bounds them -- and a refit that dropped or shrank anything the first fit kept keeps the first fit
+    /// instead, so a chart never takes a row a table, a tile or a fact could have had.
     /// @param available The rows the content may take.
-    /// @param items The frame's items; the chart item is replaced when it grows.
-    /// @param fitted The first fit; replaced when the grown frame fits.
-    /// @return The grown shape, or nullopt when the chart kept the shape it was fitted in.
-    [[nodiscard]] std::optional<ChartShape> GrowFleetChart(FrameInputs const& in,
-                                                           DocumentSpec const& spec,
-                                                           PanelContext const& context,
-                                                           std::size_t budget,
-                                                           std::size_t available,
-                                                           std::vector<Item>& items,
-                                                           FittedRows& fitted)
-    {
-        auto const spare = available - std::min(available, fitted.lines.size());
-        auto const fittedChart = ChartBlockOf(in, spec, context, budget, std::nullopt);
-        if (!fittedChart.has_value() || fittedChart->machines == 0 || spare == 0)
-            return std::nullopt;
-        auto const grown = GrownChart(fittedChart->shape, fittedChart->machines, spare, spec);
-        if (grown == fittedChart->shape)
-            return std::nullopt;
-        auto const grownChart = ChartBlockOf(in, spec, context, budget, grown);
-        if (!grownChart.has_value())
-            return std::nullopt;
-        for (auto& item: items)
-            if (item.image)
-                item = grownChart->item;
-        auto regrown = FitRows(items, available);
-        if (!regrown.has_value())
-            return std::nullopt;
-        fitted = std::move(*regrown);
-        return grown;
-    }
-
-    /// A panel's history chart laid out in the rows @p fitted left over, and only those.
-    ///
-    /// It is laid out for exactly those rows, and a refit that dropped or shrank anything the first fit kept -- the
-    /// chart is Low, and so is much under it -- keeps the first fit instead.
-    /// @param in The frame's inputs.
-    /// @param spec The panel.
-    /// @param context The session facts.
-    /// @param budget The content width.
-    /// @param available The rows the content may take.
+    /// @param growth How the chart grows.
+    /// @param bands How many bands it could draw.
+    /// @param layout The chart laid out in a shape.
     /// @param compose The frame's items with a chart item placed, or with none.
     /// @param items The frame's items; they carry the chart when it is kept.
     /// @param fitted The first fit; replaced when the chart is kept.
     /// @return The chart kept, or nullopt.
-    [[nodiscard]] std::optional<ChartBlock> GrowPanelChart(
-        FrameInputs const& in,
-        PanelSpec const& spec,
-        PanelContext const& context,
-        std::size_t budget,
+    [[nodiscard]] std::optional<ChartBlock> GrowChart(
         std::size_t available,
+        ChartGrowth const& growth,
+        std::size_t bands,
+        std::function<std::optional<ChartBlock>(ChartShape)> const& layout,
         std::function<std::vector<Item>(std::optional<Item> const&)> const& compose,
         std::vector<Item>& items,
         FittedRows& fitted)
     {
         auto const spare = available - std::min(available, fitted.lines.size());
-        auto const shape = PanelChartShape(spec.chartGrowth, spec.charts.size(), spare);
+        auto const shape = PanelChartShape(growth, bands, spare);
         if (shape.bands == 0)
             return std::nullopt;
-        auto chart = PanelChartOf(in, spec, context, budget, shape);
+        auto chart = layout(shape);
         if (!chart.has_value())
             return std::nullopt;
         auto withChart = compose(chart->item);
@@ -2692,17 +2635,19 @@ namespace
     }
 
     /// The fleet document block as one frame draws it, and where the table's scroll landed.
+    ///
+    /// Two groups, because the history chart goes between them when the rows allow one.
     struct DocumentBlock
     {
-        std::vector<Item> items {}; ///< The block, top to bottom.
+        std::vector<Item> tiles {}; ///< The headline tiles.
+        std::vector<Item> body {};  ///< The strip, the active section's table and its filter line.
         std::size_t scroll { 0 };   ///< The table's scroll, clamped to its matching rows.
     };
 
-    /// The fleet document block: the tiles, a blank, the chart, the strip, the active section's table and
-    /// its filter line.
+    /// The fleet document block: the tiles, then the strip, the active section's table and its filter line.
     /// @param in The frame's inputs.
     /// @param spec The panel.
-    /// @param context The session facts: the section the table draws, the rung and the encoder.
+    /// @param context The session facts: the section the table draws.
     /// @param state The table's filter and scroll.
     /// @param budget The content width.
     /// @return The block, nothing for a panel without one, or the cells the table's essential columns needed.
@@ -2718,25 +2663,16 @@ namespace
         auto table = SectionItems(in, context, *spec.document, state, budget);
         if (!table.has_value())
             return std::unexpected(table.error());
-        auto& items = block.items;
-        std::ranges::move(TileItems(in, *spec.document, budget), std::back_inserter(items));
-        if (!items.empty())
-            items.push_back(Blank());
-        auto chart = ChartItems(in, *spec.document, context, budget);
-        if (!chart.empty())
-        {
-            std::ranges::move(chart, std::back_inserter(items));
-            items.push_back(Blank());
-        }
-        std::ranges::move(StripItems(in, *spec.document, context.section, budget), std::back_inserter(items));
+        block.tiles = TileItems(in, *spec.document, budget);
+        std::ranges::move(StripItems(in, *spec.document, context.section, budget), std::back_inserter(block.body));
         auto filter = FilterItems(in,
                                   *spec.document,
                                   state,
                                   *table,
                                   Distributed::FleetSectionTable[static_cast<std::size_t>(context.section)].key,
                                   budget);
-        std::ranges::move(table->items, std::back_inserter(items));
-        std::ranges::move(filter, std::back_inserter(items));
+        std::ranges::move(table->items, std::back_inserter(block.body));
+        std::ranges::move(filter, std::back_inserter(block.body));
         block.scroll = table->scroll;
         return block;
     }
@@ -3276,11 +3212,13 @@ DashboardFrame PanelView::PlacedFrame(DashboardModel const& model)
     _scroll = document->scroll;
 
     // Top to bottom, a blank before every block that has something to draw. The history chart, when the rows allow
-    // one, is its own block under the rates.
+    // one, is its own block: under the rates, or on a fleet panel between the tiles and the strip.
     auto groups = std::move(*above);
-    auto const chartAt = groups.size() + 1;
-    for (auto* block: { &*rates, &*levels, &*tiers, &document->items })
+    auto const underRates = groups.size() + 1;
+    for (auto* block: { &*rates, &*levels, &*tiers, &document->tiles })
         groups.push_back(std::move(*block));
+    auto const chartAt = _spec->document.has_value() ? groups.size() : underRates;
+    groups.push_back(std::move(document->body));
     std::ranges::move(*below, std::back_inserter(groups));
     auto source = SourceLine(in, _spec->sourcePriority, budget);
     if (!source.has_value())
@@ -3312,12 +3250,28 @@ DashboardFrame PanelView::PlacedFrame(DashboardModel const& model)
     auto fitted = FitRows(items, available);
     if (!fitted.has_value())
         return tooSmall(0);
-    auto chartShape = std::optional<ChartShape> {};
-    if (available.has_value() && _spec->document.has_value() && fitted->imageLine.has_value())
-        chartShape = GrowFleetChart(in, *_spec->document, _context, budget, *available, items, *fitted);
-    auto panelChart = std::optional<ChartBlock> {};
-    if (available.has_value() && !_spec->charts.empty())
-        panelChart = GrowPanelChart(in, *_spec, _context, budget, *available, compose, items, *fitted);
+    auto chart = std::optional<ChartBlock> {};
+    if (available.has_value() && _spec->document.has_value())
+    {
+        // Before any machine reported the figure, one band's worth of rows holds the line saying so.
+        chart = GrowChart(
+            *available,
+            _spec->document->chartGrowth,
+            std::max<std::size_t>(1, FleetChartMachines(in, _context)),
+            [&](ChartShape shape) { return FleetChartOf(in, *_spec->document, _context, budget, shape); },
+            compose,
+            items,
+            *fitted);
+    }
+    else if (available.has_value() && !_spec->charts.empty())
+        chart = GrowChart(
+            *available,
+            _spec->chartGrowth,
+            _spec->charts.size(),
+            [&](ChartShape shape) { return PanelChartOf(in, *_spec, _context, budget, shape); },
+            compose,
+            items,
+            *fitted);
     if (available.has_value() && _spec->fillsHeight && fitted->lines.size() < *available)
     {
         auto const pad = *available - fitted->lines.size();
@@ -3343,9 +3297,6 @@ DashboardFrame PanelView::PlacedFrame(DashboardModel const& model)
     // The chart kept its rows: draw its two images over them, laid out exactly as its item was. The frame's
     // first row is its top edge and its first column its left edge, so a content line's frame row is its
     // index plus two and a content cell's column is its index plus two.
-    auto chart = std::move(panelChart);
-    if (!chart.has_value() && fitted->imageLine.has_value() && _spec->document.has_value())
-        chart = ChartBlockOf(in, *_spec->document, _context, budget, chartShape);
     // An image needs the cell's pixel size to be laid out at all; without one the chart keeps its text.
     if (chart.has_value() && chart->pixels && !chart->tracks.empty() && fitted->imageLine.has_value()
         && model.cellPixels.has_value() && _context.sixel != nullptr)

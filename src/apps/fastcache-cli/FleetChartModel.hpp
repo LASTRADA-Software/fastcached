@@ -25,10 +25,10 @@ struct FleetDocument;
 /// The fleet chart as data: which per-machine figure it draws, the points a reading keeps for it,
 /// and the pixels a window of history becomes.
 ///
-/// **The Sixel rung's one image** (#134, the decision on Sixel): 40 machines across a time window
-/// does not fit in text cells, so this is the figure drawn at pixel resolution, and the cache and node
-/// panels stay on their sparklines. Pure: points in, pixels out, so every rule below is a case over
-/// literals, and the encoder that turns pixels into Sixel stays behind `ISixelEncoder`.
+/// **The fleet's history chart** (#134): a band per machine across a time window, laid out by the panels' one
+/// chart layout -- pixels on the Sixel rung, the rung's chart marks below it. Pure: points in, tracks and pixels
+/// out, so every rule below is a case over literals, and the encoder that turns pixels into Sixel stays behind
+/// `ISixelEncoder`.
 
 /// One per-machine figure the fleet chart can draw.
 ///
