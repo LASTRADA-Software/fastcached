@@ -123,7 +123,7 @@ template <WholeMillisecondDuration Target>
     auto const ticks = value.count() / tick;
     if (!std::in_range<typename Target::rep>(ticks))
         return std::unexpected(DurationFault::Overflow);
-    return Target { static_cast<typename Target::rep>(ticks) };
+    return Target { static_cast<Target::rep>(ticks) };
 }
 
 /// Write a length in the longest unit that divides it exactly: `90000ms` is `90s`, `1500ms` stays `1500ms`.

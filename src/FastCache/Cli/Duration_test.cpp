@@ -79,6 +79,7 @@ TEST_CASE("A text that is not a duration is refused by the rule it breaks", "[cl
         Refusal { .text = "2 s", .fault = DurationFault::UnknownUnit },
         Refusal { .text = "1h30min", .fault = DurationFault::UnknownUnit },
         Refusal { .text = "1.5s", .fault = DurationFault::NotANumber },
+        Refusal { .text = "1,5s", .fault = DurationFault::NotANumber },
         Refusal { .text = "s", .fault = DurationFault::NotANumber },
         Refusal { .text = "+2s", .fault = DurationFault::NotANumber },
         Refusal { .text = " 2s", .fault = DurationFault::NotANumber },
