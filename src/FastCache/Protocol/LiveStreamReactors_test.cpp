@@ -544,3 +544,45 @@ TEST_CASE("One live stream on two real reactors: a parked push stalls neither th
     CHECK(rig.sinks[0]->OffReactor() == 0U);
     CHECK(rig.sinks[1]->OffReactor() == 0U);
 }
+
+TEST_CASE("One live stream on two real reactors: a capture running on one reactor never stops the other's thread",
+          "[livestats][reactor]")
+{
+    // #1399 D16. WHAT DISTINGUISHES: reactor 0's subscriber is inside a capture that takes a floor and a half when
+    // reactor 1's subscriber arrives, and captures are slow ONLY on reactor 0's thread -- so any time reactor 1's
+    // thread stops is time spent waiting on reactor 0's capture, never on one of its own. Reactor 1 must go on
+    // running: it is late by less than half a floor, and its subscriber still gets snapshots that decode.
+    //
+    // RED on a stream that holds one lock across the capture (`LiveStream::Observe` at `e0bd37dd`): reactor 1's
+    // first `Observe` blocks its thread for the rest of reactor 0's capture. Green once a subscriber that loses the
+    // tick goes on without waiting on the thread that won it.
+    constexpr auto CaptureTakes = Floor + (Floor / 2);
+    TwoReactorRig rig { CaptureTakes, 0ms };
+    rig.StartHeartbeats();
+    auto const [beating, bothBeat] =
+        WaitFor(10s, [&rig] { return rig.heartbeats[0].beats.load() > 0U && rig.heartbeats[1].beats.load() > 0U; });
+    INFO("heartbeats after " << beating.count() << " ms");
+    REQUIRE(bothBeat);
+    rig.sources.SlowOn(rig.heartbeats[0].thread.load());
+
+    rig.StartSubscriber(0);
+    auto const [capturing, begun] = WaitFor(10s, [&rig] { return rig.sources.Captures() >= 1U; });
+    INFO("reactor 0's capture began after " << capturing.count() << " ms");
+    REQUIRE(begun);
+
+    // Measured from here: what reactor 1's thread does from the moment its subscriber arrives mid-capture.
+    rig.heartbeats[1].worstMicros.store(0, std::memory_order_release);
+    rig.StartSubscriber(1);
+    auto const [waited, ran] =
+        WaitFor(20s, [&rig] { return CountOf(rig.sinks[1]->Frames(), Wire::PushKind::Snapshot) >= 4U; });
+    INFO("waited " << waited.count() << " ms");
+    REQUIRE(ran);
+    rig.stopping.store(true, std::memory_order_release);
+    REQUIRE(rig.StreamsReturned(10s));
+
+    CHECK_FALSE(TicksOf(DecodeAll(rig.sinks[1]->Frames())).empty());
+    auto const worst = std::chrono::microseconds { rig.heartbeats[1].worstMicros.load() };
+    INFO("reactor 1 worst heartbeat lateness " << worst.count() << " us over " << rig.heartbeats[1].beats.load()
+                                               << " beats");
+    CHECK(worst < Floor / 2);
+}
