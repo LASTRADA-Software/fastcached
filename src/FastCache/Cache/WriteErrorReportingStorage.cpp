@@ -176,7 +176,14 @@ std::expected<CasToken, StorageError> WriteErrorReportingStorage::Update(
 
 std::expected<void, StorageError> WriteErrorReportingStorage::Delete(std::string_view key, TimePoint now)
 {
-    return _inner.Delete(key, now);
+    // A removal is a write to the store, and one a disk can fail to persist exactly as it
+    // can a SET: forwarded unreported, a `DEL` or a `cache-drop` that did not happen was
+    // visible at no level and on no counter. `KeyNotFound` is control flow and
+    // `IsPersistenceFailure` already says so.
+    auto result = _inner.Delete(key, now);
+    if (!result.has_value())
+        ReportWriteFailure("DELETE", key, result.error());
+    return result;
 }
 
 std::expected<CasToken, StorageError> WriteErrorReportingStorage::Touch(std::string_view key,
@@ -219,7 +226,10 @@ std::expected<void, StorageError> WriteErrorReportingStorage::CompareAndDelete(s
                                                                                CasToken expected,
                                                                                TimePoint now)
 {
-    return _inner.CompareAndDelete(key, expected, now);
+    auto result = _inner.CompareAndDelete(key, expected, now);
+    if (!result.has_value())
+        ReportWriteFailure("CAS-DELETE", key, result.error());
+    return result;
 }
 
 std::expected<bool, StorageError> WriteErrorReportingStorage::ClearExpiry(std::string_view key, TimePoint now)

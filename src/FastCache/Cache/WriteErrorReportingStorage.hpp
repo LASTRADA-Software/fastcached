@@ -32,7 +32,8 @@ namespace FastCache
 /// decorator (a) logs only at `Trace` and (b) is inserted only when the log
 /// level is already `Trace` — so at the default level a disk-full write
 /// vanishes: no `storage:` line, no metric, just a store that silently did not
-/// happen. This decorator is **always** in the stack. On each value write it
+/// happen. This decorator is **always** in the stack. On each value write -- and on
+/// each removal, which a disk can fail to persist just as well -- it
 /// forwards to the inner storage and, when the result is a persistence-class
 /// failure, logs one `Warn` line (visible at the default level) and increments
 /// a counter surfaced through `Snapshot().writeErrors` — which the Prometheus

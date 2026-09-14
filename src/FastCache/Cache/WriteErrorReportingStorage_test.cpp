@@ -101,6 +101,16 @@ class StubStorage final: public FastCache::IStorage
     }
     std::expected<void, FastCache::StorageError> Delete(std::string_view /*key*/, FastCache::TimePoint /*now*/) override
     {
+        if (writeError.has_value())
+            return std::unexpected(*writeError);
+        return {};
+    }
+    std::expected<void, FastCache::StorageError> CompareAndDelete(std::string_view /*key*/,
+                                                                  FastCache::CasToken /*expected*/,
+                                                                  FastCache::TimePoint /*now*/) override
+    {
+        if (writeError.has_value())
+            return std::unexpected(*writeError);
         return {};
     }
     std::expected<FastCache::CasToken, FastCache::StorageError> Touch(std::string_view /*key*/,
@@ -252,4 +262,33 @@ TEST_CASE("WriteErrorReportingStorage counts persistence failures across write v
     auto const records = logger.Snapshot();
     REQUIRE(HasLine(records, FastCache::LogLevel::Warn, { "APPEND", "OutOfMemory" }));
     REQUIRE(HasLine(records, FastCache::LogLevel::Warn, { "INCR", "OutOfMemory" }));
+}
+
+TEST_CASE("WriteErrorReportingStorage reports a removal it could not persist, and not one that found nothing",
+          "[cache][write-errors][cache-drop]")
+{
+    // A removal is a write to the store (#1276). Forwarded unreported, a `DEL`, a memcached
+    // `delete` or a `cache-drop` that a failing disk did not persist was visible at no level
+    // and on no counter -- and after it the object is still served, so the operator who ran
+    // the repair is told it worked by the reply alone.
+    StubStorage inner;
+    FastCache::CapturingLogger logger;
+    FastCache::WriteErrorReportingStorage reporter { inner, logger };
+
+    // Nothing to remove is control flow: the ordinary answer to a repair's second run.
+    inner.writeError = FastCache::MakeStorageError(FastCache::StorageErrorCode::KeyNotFound);
+    REQUIRE_FALSE(reporter.Delete("gone", FastCache::TimePoint {}).has_value());
+    REQUIRE_FALSE(reporter.CompareAndDelete("gone", FastCache::CasToken { 1 }, FastCache::TimePoint {}).has_value());
+    CHECK(reporter.Snapshot().writeErrors == 0);
+    CHECK(logger.Snapshot().empty());
+
+    inner.writeError = FastCache::StorageError { .code = FastCache::StorageErrorCode::IoError,
+                                                 .systemCode = 5,
+                                                 .context = "input/output error" };
+    REQUIRE_FALSE(reporter.Delete("obj", FastCache::TimePoint {}).has_value());
+    REQUIRE_FALSE(reporter.CompareAndDelete("obj", FastCache::CasToken { 1 }, FastCache::TimePoint {}).has_value());
+    CHECK(reporter.Snapshot().writeErrors == 2);
+    auto const records = logger.Snapshot();
+    CHECK(HasLine(records, FastCache::LogLevel::Warn, { "storage write failed: DELETE key=obj", "IoError", "system=5" }));
+    CHECK(HasLine(records, FastCache::LogLevel::Warn, { "storage write failed: CAS-DELETE key=obj", "IoError" }));
 }
