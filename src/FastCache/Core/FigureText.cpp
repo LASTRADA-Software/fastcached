@@ -52,19 +52,27 @@ namespace
         FigureUnit { .scale = 1024.0, .name = "KiB" },
     };
 
+    /// @p number followed by the unit called @p name, a space between them.
+    /// @param number The written number.
+    /// @param name The unit.
+    /// @return The figure.
+    [[nodiscard]] WrittenFigure InUnit(std::string number, std::string_view name)
+    {
+        return WrittenFigure { .number = std::move(number), .unit = std::format(" {}", name) };
+    }
+
     /// A byte count in the largest unit it fills at least once.
     /// @param value Bytes.
-    /// @return The text.
-    [[nodiscard]] std::string Bytes(double value)
+    /// @return The figure.
+    [[nodiscard]] WrittenFigure Bytes(double value)
     {
         for (auto const& unit: ByteUnits)
         {
             auto const scaled = value / unit.scale;
             if (scaled >= 1.0)
-                return scaled < 100.0 ? std::format("{:.2f} {}", scaled, unit.name)
-                                      : std::format("{:.1f} {}", scaled, unit.name);
+                return InUnit(scaled < 100.0 ? std::format("{:.2f}", scaled) : std::format("{:.1f}", scaled), unit.name);
         }
-        return std::format("{:.0f} B", value);
+        return InUnit(std::format("{:.0f}", value), "B");
     }
 
     /// The units a duration past a minute is written in, largest first.
@@ -78,28 +86,33 @@ namespace
 
     /// A duration in seconds.
     /// @param value Seconds.
-    /// @return The text.
-    [[nodiscard]] std::string Seconds(double value)
+    /// @return The figure.
+    [[nodiscard]] WrittenFigure Seconds(double value)
     {
         for (auto const& unit: LongDurationUnits)
             if (std::fabs(value) >= unit.scale)
-                return std::format("{:.1f} {}", value / unit.scale, unit.name);
-        return std::format("{:.2f} s", value);
+                return InUnit(std::format("{:.1f}", value / unit.scale), unit.name);
+        return InUnit(std::format("{:.2f}", value), "s");
     }
 
     /// How one figure format writes a present, finite value.
     struct FigureFormatSpec
     {
-        FigureFormat format;                ///< The enumerator this row describes.
-        std::string (*write)(double value); ///< The writer.
+        FigureFormat format;                  ///< The enumerator this row describes.
+        WrittenFigure (*write)(double value); ///< The writer.
     };
 
     /// The figure formats, one row per enumerator, in enumerator order.
     constexpr EnumTable<FigureFormat, FigureFormatSpec> FigureFormatTable { {
-        { .format = FigureFormat::Count, .write = [](double value) { return Grouped(value); } },
+        { .format = FigureFormat::Count, .write = [](double value) { return WrittenFigure { .number = Grouped(value) }; } },
         { .format = FigureFormat::Rate,
-          .write = [](double value) { return std::fabs(value) >= 10.0 ? Grouped(value) : std::format("{:.1f}", value); } },
-        { .format = FigureFormat::Percent, .write = [](double value) { return std::format("{:.1f} %", value * 100.0); } },
+          .write =
+              [](double value) {
+                  return WrittenFigure { .number =
+                                             std::fabs(value) >= 10.0 ? Grouped(value) : std::format("{:.1f}", value) };
+              } },
+        { .format = FigureFormat::Percent,
+          .write = [](double value) { return InUnit(std::format("{:.1f}", value * 100.0), "%"); } },
         { .format = FigureFormat::Bytes, .write = &Bytes },
         { .format = FigureFormat::Seconds, .write = &Seconds },
     } };
@@ -108,7 +121,7 @@ namespace
                   "FigureFormatTable must hold one row per FigureFormat, in enumerator order");
 } // namespace
 
-std::string WriteFigure(double value, FigureFormat format)
+WrittenFigure WriteFigure(double value, FigureFormat format)
 {
     return FigureFormatTable[static_cast<std::size_t>(format)].write(value);
 }

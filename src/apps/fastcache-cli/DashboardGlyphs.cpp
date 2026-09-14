@@ -129,10 +129,10 @@ SlotGauge SlotGaugeOf(
                        .close = std::string { glyphs.gaugeClose } };
 }
 
-std::string FormatFigure(std::optional<double> value, FigureFormat format, std::string_view absent)
+WrittenFigure FormatFigure(std::optional<double> value, FigureFormat format, std::string_view absent)
 {
     if (!value.has_value() || !std::isfinite(*value))
-        return std::string { absent };
+        return WrittenFigure { .number = std::string { absent } };
     return WriteFigure(*value, format);
 }
 
