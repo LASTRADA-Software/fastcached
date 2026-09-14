@@ -227,24 +227,44 @@ namespace
                        .priority = Priority::Normal },
     };
 
+    /// Compiles finished per minute: the rate row's figure, and its chart band's.
+    constexpr auto CompilesPerMinute = FigureSpec { .field = CounterField<Counter::WorkerJobsCompleted>(),
+                                                    .scale = 60.0,
+                                                    .source = FigureSource::Rate,
+                                                    .format = FigureFormat::Rate };
+
+    /// A `_sum` over its `_count`: the mean compile, as the rate row and the chart band both draw it.
+    constexpr auto MeanCompile = FigureSpec { .field = CounterField<Counter::WorkerCompileMillisTotal>(),
+                                              .other = CounterField<Counter::WorkerJobsCompleted>(),
+                                              .scale = 0.001,
+                                              .source = FigureSource::RateQuotient,
+                                              .format = FigureFormat::Seconds };
+
+    /// Every refusal per minute: the three counters' rates added.
+    constexpr auto RefusedPerMinute = FigureSpec { .field = CounterField<Counter::WorkerJobsRefusedNoSlot>(),
+                                                   .scale = 60.0,
+                                                   .alertAbove = 0.0,
+                                                   .addends = RefusalAddends,
+                                                   .source = FigureSource::Rate,
+                                                   .format = FigureFormat::Rate };
+
+    /// Host-wide CPU busy: the rate of busy ticks over the rate of every tick.
+    constexpr auto CpuBusy = FigureSpec { .field = CpuTicksField<&CpuTicks::busy>(),
+                                          .other = CpuTicksField<&CpuTicks::total>(),
+                                          .source = FigureSource::RateQuotient,
+                                          .format = FigureFormat::Percent };
+
     constexpr auto NodeRates = std::array {
         RateRow { .label = "compiles/min",
                   .key = "compiles_per_min",
-                  .figure = { .field = CounterField<Counter::WorkerJobsCompleted>(),
-                              .scale = 60.0,
-                              .source = FigureSource::Rate,
-                              .format = FigureFormat::Rate },
+                  .figure = CompilesPerMinute,
                   .beside = CompilesBeside,
                   .priority = Priority::Essential },
         // A `_sum` over its `_count`: a MEAN and nothing else. No histogram exists, so no percentile
         // can be shown, and the row says so where somebody would look for one.
         RateRow { .label = "mean compile",
                   .key = "mean_compile_seconds",
-                  .figure = { .field = CounterField<Counter::WorkerCompileMillisTotal>(),
-                              .other = CounterField<Counter::WorkerJobsCompleted>(),
-                              .scale = 0.001,
-                              .source = FigureSource::RateQuotient,
-                              .format = FigureFormat::Seconds },
+                  .figure = MeanCompile,
                   .note = "sum/count over this interval; no histogram exists, so no p50/p95 can be shown",
                   .trend = Trend::None,
                   .priority = Priority::High,
@@ -253,12 +273,7 @@ namespace
         // is never drawn alone (§4). The total is the three counters' rates added, not a fourth counter.
         RateRow { .label = "refused/min",
                   .key = "refused_per_min",
-                  .figure = { .field = CounterField<Counter::WorkerJobsRefusedNoSlot>(),
-                              .scale = 60.0,
-                              .alertAbove = 0.0,
-                              .addends = RefusalAddends,
-                              .source = FigureSource::Rate,
-                              .format = FigureFormat::Rate },
+                  .figure = RefusedPerMinute,
                   .split = RefusalSplit,
                   .priority = Priority::High },
     };
@@ -323,13 +338,7 @@ namespace
 
     // `cpu-busy 62.5 %   mem free 32.00 GiB   scratch free 41.8 GiB`: the figures the slot ceilings are made of.
     constexpr auto HostFigures = std::array {
-        BesideFigure { .key = "cpu_busy_ratio",
-                       .before = "cpu-busy",
-                       .figure = { .field = CpuTicksField<&CpuTicks::busy>(),
-                                   .other = CpuTicksField<&CpuTicks::total>(),
-                                   .source = FigureSource::RateQuotient,
-                                   .format = FigureFormat::Percent },
-                       .priority = Priority::High },
+        BesideFigure { .key = "cpu_busy_ratio", .before = "cpu-busy", .figure = CpuBusy, .priority = Priority::High },
         BesideFigure {
             .key = "mem_free_bytes",
             .before = "mem free",
@@ -360,6 +369,15 @@ namespace
         FactBlock { .lines = HostLines, .place = FactPlace::BelowRates },
     };
 
+    // The history a taller terminal draws, in the order it gets rows: whether the node is doing work, whether it is
+    // turning work away, how loaded its machine is, and how long a compile takes.
+    constexpr auto NodeCharts = std::array {
+        ChartRow { .label = "compiles/min", .figure = CompilesPerMinute },
+        ChartRow { .label = "refused/min", .figure = RefusedPerMinute },
+        ChartRow { .label = "cpu-busy", .figure = CpuBusy, .top = 1.0 },
+        ChartRow { .label = "mean compile", .figure = MeanCompile },
+    };
+
     // §4: `fastcache-compile-node 0.4.1 ───── build-07:7070  up 2d11:48  every 2s  q`.
     constexpr auto NodeTitle = std::array {
         TitleFactRow { .fact = ChromeFact::Version, .side = TitleSide::Subject },
@@ -378,7 +396,8 @@ namespace
                                           .tierNotePriority = Priority::Low,
                                           .sourcePriority = Priority::High,
                                           .titleFacts = NodeTitle,
-                                          .facts = NodeFacts };
+                                          .facts = NodeFacts,
+                                          .charts = NodeCharts };
 
     // ---- fleet ------------------------------------------------------------------------------
 

@@ -2792,6 +2792,290 @@ TEST_CASE("a node's slot gauge goes whole when the width cannot hold it, and the
     CHECK(NodeFrameAt(80, 24, MockupNodeStatus()).contains("\u2592\u2592\u2592\u2592\u2592\u2592\u2591"));
 }
 
+namespace
+{
+
+/// A node's history as the chart tests read it: @p count samples two seconds apart, the work rising and falling, one
+/// sample that read nothing at @p failAt and one interval in which no counter moved, ending at @p stillAt.
+/// @param count How many entries the history holds, the failure included.
+/// @param failAt The entry that read nothing.
+/// @param stillAt The entry whose interval moved nothing.
+/// @return The events, a tick last.
+[[nodiscard]] std::vector<DashboardEvent> NodeHistory(int count, int failAt, int stillAt)
+{
+    auto script = std::vector<DashboardEvent> {};
+    auto step = std::uint64_t { 0 };
+    for (auto const index: std::views::iota(0, count))
+    {
+        auto const seconds = 2 * (index + 1);
+        if (index == failAt)
+        {
+            script.push_back(DashboardEvent { .kind = DashboardEventKind::SampleFailed,
+                                              .at = TimePoint { std::chrono::seconds { seconds } } });
+            continue;
+        }
+        step += index == stillAt ? 0U : static_cast<std::uint64_t>(1 + (index % 4));
+        script.push_back(NodeSampleOf(step, seconds, MockupNodeStatus()));
+    }
+    script.push_back(Tick);
+    return script;
+}
+
+/// The one frame a node panel draws for @p script at @p columns by @p rows, on @p rung.
+/// @param script The events.
+/// @param columns The terminal's width.
+/// @param rows The terminal's height.
+/// @return The frame.
+[[nodiscard]] std::string NodeHistoryFrame(std::vector<DashboardEvent> script, int columns, int rows)
+{
+    auto const frames = NodeFramesAt(std::move(script), columns, rows);
+    REQUIRE(!frames.empty());
+    return frames.back();
+}
+
+/// What a frame line says between its two edges, trimmed.
+/// @param line A frame line.
+/// @return Its content.
+[[nodiscard]] std::string Inside(std::string_view line)
+{
+    auto const cells = CodePoints(line).size();
+    return cells < 2 ? std::string {} : Trimmed(Columns(line, 1, cells - 2));
+}
+
+/// Where a node frame's history chart is: its title line, and every band's first line in order.
+struct NodeChartLines
+{
+    std::size_t title { 0 };           ///< The title's line.
+    std::vector<std::size_t> bands {}; ///< Each band's first line.
+    std::size_t axis { 0 };            ///< The axis's line.
+};
+
+/// The history chart of @p frame, found by its title and its band labels in `NodePanel().charts` order.
+/// @param frame The frame.
+/// @return The lines, or nullopt for a frame with no chart.
+[[nodiscard]] std::optional<NodeChartLines> NodeChartIn(std::string_view frame)
+{
+    auto const lines = Lines(frame);
+    auto const title =
+        std::ranges::find_if(lines, [](std::string const& line) { return Inside(line).starts_with("history, last "); });
+    if (title == lines.end())
+        return std::nullopt;
+    auto chart = NodeChartLines { .title = static_cast<std::size_t>(title - lines.begin()), .bands = {}, .axis = 0 };
+    auto at = chart.title + 1;
+    for (auto const& row: NodePanel().charts)
+    {
+        while (at < lines.size() && !Inside(lines[at]).starts_with(row.label))
+        {
+            if (Inside(lines[at]).ends_with("now"))
+                return chart;
+            ++at;
+        }
+        if (at == lines.size())
+            return chart;
+        chart.bands.push_back(at++);
+    }
+    while (at < lines.size() && !Inside(lines[at]).ends_with("now"))
+        ++at;
+    chart.axis = at;
+    return chart;
+}
+
+/// Requires @p chart to be a whole chart -- at least two bands and an axis under them -- before a case reads its
+/// lines, so a chart missing a band fails on this assertion rather than reading past the frame.
+/// @param chart The chart found.
+/// @return The chart.
+[[nodiscard]] NodeChartLines WholeNodeChart(std::optional<NodeChartLines> const& chart)
+{
+    REQUIRE(chart.has_value());
+    REQUIRE(Unwrap(chart).bands.size() >= 2);
+    REQUIRE(Unwrap(chart).axis > Unwrap(chart).bands.back());
+    return Unwrap(chart);
+}
+
+/// The chart cells at the right end of @p line, newest last: the @p count cells before the frame's edge and its blank.
+/// @param line A frame line.
+/// @param count How many.
+/// @return The cells, one glyph each.
+[[nodiscard]] std::vector<std::string> NewestCells(std::string_view line, std::size_t count)
+{
+    auto const points = CodePoints(line);
+    REQUIRE(points.size() >= count + 2);
+    return { points.end() - static_cast<std::ptrdiff_t>(count + 2), points.end() - 2 };
+}
+
+} // namespace
+
+TEST_CASE("a node panel at 80x24 draws no history chart, and one with rows to spare draws it under the rates",
+          "[cli][dashboard][panel][node][chart]")
+{
+    // #134: the lower half of a tall terminal was empty. WHAT DISTINGUISHES: §4's 80x24 frame is unchanged -- no chart
+    // takes a row the mockup gives to something else -- while at 120x40 the chart is there, AFTER the rates, with a
+    // band per `NodePanel().charts` row in the table's order, each the same height, an axis ending at `now` and a
+    // legend saying a blank is a sample not read.
+    auto const history = NodeHistory(24, 18, 20);
+    CHECK_FALSE(NodeChartIn(NodeHistoryFrame(history, 80, 24)).has_value());
+
+    auto const frame = NodeHistoryFrame(history, 120, 40);
+    INFO(frame);
+    auto const chart = WholeNodeChart(NodeChartIn(frame));
+    auto const lines = Lines(frame);
+    REQUIRE(chart.bands.size() == NodePanel().charts.size());
+    auto const refused =
+        std::ranges::find_if(lines, [](std::string const& line) { return Inside(line).starts_with("refused/min"); });
+    CHECK(std::cmp_less(refused - lines.begin(), chart.title));
+    auto const height = chart.bands[1] - chart.bands[0];
+    CHECK(height > 1);
+    for (auto const index: std::views::iota(std::size_t { 1 }, chart.bands.size()))
+        CHECK(chart.bands[index] - chart.bands[index - 1] == height);
+    CHECK(chart.axis == chart.bands.back() + height);
+    CHECK(Inside(lines.at(chart.axis + 1)).ends_with("blank: unread"));
+    CHECK(lines.size() <= 40);
+    // Every band's first row says what its top stands for, since a bar's height means nothing without it.
+    for (auto const band: chart.bands)
+        CHECK(lines[band].contains(" to "));
+}
+
+TEST_CASE("a node's history band draws zero as the floor mark and a sample not read as blanks",
+          "[cli][dashboard][panel][node][chart]")
+{
+    // The chart's promise, on the node. WHAT DISTINGUISHES, in the compiles/min band's floor row: the interval where
+    // no counter moved is the zero mark `▁`, the failed sample and the reading after it (no interval to take a rate
+    // over) are blanks in EVERY row of the band, and the newest cell is a bar.
+    constexpr auto Count = 24;
+    constexpr auto FailAt = 18;
+    constexpr auto StillAt = 21;
+    auto const frame = NodeHistoryFrame(NodeHistory(Count, FailAt, StillAt), 120, 40);
+    INFO(frame);
+    auto const chart = WholeNodeChart(NodeChartIn(frame));
+    auto const lines = Lines(frame);
+    auto const first = chart.bands[0];
+    auto const height = chart.bands[1] - first;
+    auto const fromRight = [](int index) {
+        return static_cast<std::size_t>((Count - 1) - index);
+    };
+    auto const floor = NewestCells(lines.at(first + height - 1), Count);
+    CHECK(floor.at(floor.size() - 1 - fromRight(StillAt)) == "\u2581");
+    CHECK(floor.back() != " ");
+    for (auto const row: std::views::iota(first, first + height))
+    {
+        auto const cells = NewestCells(lines.at(row), Count);
+        INFO("row " << row);
+        CHECK(cells.at(cells.size() - 1 - fromRight(FailAt)) == " ");
+        CHECK(cells.at(cells.size() - 1 - fromRight(FailAt + 1)) == " ");
+    }
+}
+
+TEST_CASE("a taller node terminal grows taller bands, and a wider one a longer span", "[cli][dashboard][panel][node][chart]")
+{
+    // "Widths grow history the same way": a sample is a cell, so the span the title names is the band's cells, and a
+    // wider terminal names a longer one. A taller one gives each band more rows, up to the growth's most.
+    auto const history = NodeHistory(24, 18, 20);
+    auto const small = NodeHistoryFrame(history, 120, 40);
+    auto const large = NodeHistoryFrame(history, 200, 60);
+    auto const smallChart = WholeNodeChart(NodeChartIn(small));
+    auto const largeChart = WholeNodeChart(NodeChartIn(large));
+    auto const bandHeight = [](NodeChartLines const& chart) {
+        return chart.bands[1] - chart.bands[0];
+    };
+    CHECK(bandHeight(largeChart) > bandHeight(smallChart));
+    CHECK(bandHeight(largeChart) <= NodePanel().chartGrowth.bandCellsMost);
+    auto const titleOf = [](std::string const& frame, NodeChartLines const& chart) {
+        // The lines are held while the title is read: a reference into a temporary `Lines` dangles.
+        auto const lines = Lines(frame);
+        return Inside(lines.at(chart.title));
+    };
+    auto const smallTitle = titleOf(small, smallChart);
+    auto const largeTitle = titleOf(large, largeChart);
+    CHECK(smallTitle.starts_with("history, last "));
+    CHECK(largeTitle.starts_with("history, last "));
+    CHECK(smallTitle != largeTitle);
+}
+
+TEST_CASE("a node's history chart grows band by band in the table's order", "[cli][dashboard][panel][node][chart]")
+{
+    // Which figure gets rows first is the `charts` table's order. WHAT DISTINGUISHES: at the first height that draws
+    // a chart it has the first band only, one row high; one row taller it has the first two.
+    auto const history = NodeHistory(24, 18, 20);
+    auto first = std::optional<int> {};
+    for (auto const rows: std::views::iota(24, 60))
+        if (NodeChartIn(NodeHistoryFrame(history, 120, rows)).has_value())
+        {
+            first = rows;
+            break;
+        }
+    REQUIRE(first.has_value());
+    auto const one = NodeChartIn(NodeHistoryFrame(history, 120, Unwrap(first)));
+    REQUIRE(one.has_value());
+    CHECK(Unwrap(one).bands.size() == 1);
+    auto const two = NodeChartIn(NodeHistoryFrame(history, 120, Unwrap(first) + 1));
+    REQUIRE(two.has_value());
+    CHECK(Unwrap(two).bands.size() == 2);
+}
+
+TEST_CASE("on the Sixel rung a node's history is one image over its bands' rows, with its colour scale",
+          "[cli][dashboard][panel][node][chart]")
+{
+    // The same layout drawn as pixels. WHAT DISTINGUISHES: two images -- the bands and the scale -- the bands' image
+    // exactly as many cells high as the bands' rows and starting at the first band's row, and those rows carry no text
+    // marks where the image goes.
+    auto encoder = ScriptedSixelEncoder {};
+    auto view = PanelView { NodePanel(),
+                            PanelContext { .absent = std::string { Absent },
+                                           .endpoint = "build-07:7070",
+                                           .interval = 2s,
+                                           .cellWidth = &FakeCellWidth,
+                                           .sixel = &encoder,
+                                           .rung = RenderRung::Sixel } };
+    auto script = NodeHistory(24, 18, 20);
+    script.insert(
+        script.begin(),
+        DashboardEvent { .kind = DashboardEventKind::Resize, .columns = 120, .rows = 40, .cellPixels = ChartCell });
+    auto sink = CollectingSink {};
+    (void) Drive(std::move(script), DashboardLimits {}, view, sink);
+    REQUIRE(!sink.frames.empty());
+    auto const& frame = sink.frames.back();
+    INFO(frame);
+    auto const chart = WholeNodeChart(NodeChartIn(frame));
+    auto const& placements = sink.placements.back();
+    REQUIRE(placements.size() == 2);
+    auto const& image = placements.front();
+    auto const rows = chart.axis - chart.bands.front();
+    CHECK(image.cellsHigh == rows);
+    // A frame row is its content line plus one: the top edge is line 0 of the frame text.
+    CHECK(image.row == chart.bands.front() + 1);
+    auto const lines = Lines(frame);
+    for (auto const row: std::views::iota(chart.bands.front(), chart.axis))
+        CHECK(Trimmed(Columns(lines[row], image.column - 1, image.cellsWide)).empty());
+    CHECK(placements.back().cellsHigh == 1);
+}
+
+TEST_CASE("on the ASCII rung a node's history bands are ASCII marks", "[cli][dashboard][panel][node][chart]")
+{
+    // A multi-row chart carries its heights on a rung with no sparkline, so the ASCII rung draws one, byte for byte
+    // in ASCII -- a stray UTF-8 mark is mojibake on exactly the terminal the rung serves.
+    auto view = PanelView { NodePanel(),
+                            PanelContext { .absent = std::string { Absent },
+                                           .endpoint = "build-07:7070",
+                                           .interval = 2s,
+                                           .cellWidth = &FakeCellWidth,
+                                           .rung = RenderRung::Ascii } };
+    auto script = NodeHistory(24, 18, 20);
+    script.insert(script.begin(), DashboardEvent { .kind = DashboardEventKind::Resize, .columns = 120, .rows = 40 });
+    auto sink = CollectingSink {};
+    (void) Drive(std::move(script), DashboardLimits {}, view, sink);
+    REQUIRE(!sink.frames.empty());
+    auto const& frame = sink.frames.back();
+    auto const chart = WholeNodeChart(NodeChartIn(frame));
+    auto const lines = Lines(frame);
+    auto marks = std::size_t { 0 };
+    for (auto const row: std::views::iota(chart.bands.front(), chart.axis))
+    {
+        CHECK(std::ranges::all_of(lines[row], [](char byte) { return static_cast<unsigned char>(byte) < 0x80U; }));
+        marks += static_cast<std::size_t>(std::ranges::count(lines[row], '#'));
+    }
+    CHECK(marks > 0);
+}
+
 TEST_CASE("a node panel draws ONE refusal total with its trend, and the split under it", "[cli][dashboard][panel][node]")
 {
     // N6. WHAT DISTINGUISHES: the total is the three counters' rates ADDED (2 + 1 + 0 per two seconds is

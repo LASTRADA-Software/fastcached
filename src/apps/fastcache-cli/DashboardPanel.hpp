@@ -328,6 +328,27 @@ struct FactBlock
 ///
 /// **A table that does not fit vertically ends in `+N more`** rather than losing rows silently: it
 /// shrinks, keeping its heading, before rows of its own priority are dropped.
+/// One figure a panel draws as a band of its history chart, once the terminal has rows to spare.
+///
+/// **A row, so which figures grow and in what order is data** (#134): the chart bands the first of them first, and a
+/// taller terminal gives it the next, then taller bands.
+struct ChartRow
+{
+    std::string_view label; ///< What the band is.
+    FigureSpec figure;      ///< Its figure: the series the band draws, its newest cell the figure beside it.
+    /// What the band's top stands for, when the figure has a whole of its own -- `1.0` for a share; nullopt to scale
+    /// the band to its own peak over the span it draws.
+    std::optional<double> top {};
+};
+
+/// How a panel's history chart grows into rows nothing else wants.
+struct ChartGrowth
+{
+    std::size_t cellsHighMost { 24 }; ///< The most rows its bands take together.
+    std::size_t bandCellsMost { 6 };  ///< The most rows one band grows to.
+    std::size_t minimumCells { 24 };  ///< The fewest cells across its bands are drawn in; narrower, it is not drawn.
+};
+
 struct PanelSpec
 {
     std::string_view title;                      ///< The frame's title.
@@ -347,6 +368,12 @@ struct PanelSpec
     std::optional<DocumentSpec> document {};     ///< The fleet document block; nullopt for a panel without one.
     std::span<TitleFactRow const> titleFacts {}; ///< What the title bar states beside `title`, in reading order.
     std::span<FactBlock const> facts {};         ///< Blocks of status facts; empty for a panel that reads no status.
+    /// The figures a history chart bands under the rates, in the order it grows; empty for a panel with none.
+    ///
+    /// The chart takes only rows the layout left over, after every other block has fitted: at §3's and §4's 80x24
+    /// it is not there at all, and a taller terminal draws history rather than a frame half empty.
+    std::span<ChartRow const> charts {};
+    ChartGrowth chartGrowth {}; ///< How that chart grows.
 };
 
 /// How long an endpoint has served, as a title bar states it: `2d11:48`.
