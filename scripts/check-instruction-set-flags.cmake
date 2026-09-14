@@ -374,10 +374,14 @@ endif()
 string(APPEND summary "; ${modmapsDeclined} module-map response file(s) declined")
 
 if(NOT plantUnit STREQUAL "")
+    # The plant run answers ONE question -- is a planted flag still refused -- so only the plant decides it. A real
+    # violation elsewhere in the database is the unplanted run's to report; failing here too would show one defect
+    # as two reds, the second one blaming the plant.
+    set(plantProblems "")
     if(plantedUnit STREQUAL "")
-        list(APPEND problems "plant: `${plantUnit}` is not a first-party unit of this database, so the plant was never judged")
+        list(APPEND plantProblems "plant: `${plantUnit}` is not a first-party unit of this database, so the plant was never judged")
     elseif(plantFlags STREQUAL "")
-        list(APPEND problems "plant: no PlantRows flag applies to `${plantUnit}`'s driver, so the plant was never judged")
+        list(APPEND plantProblems "plant: no PlantRows flag applies to `${plantUnit}`'s driver, so the plant was never judged")
     endif()
     # Each planted flag must have produced the refusal a real one would. That refusal is the expected outcome,
     # so it is taken out of the problems; a plant that produced none is a problem. A unit compiled by several
@@ -396,13 +400,15 @@ if(NOT plantUnit STREQUAL "")
         endforeach()
         set(problems "${kept}")
         if(NOT seen)
-            list(APPEND problems "plant: `${flag}` planted into `${plantedUnit}` was ACCEPTED -- the check cannot see the flag it exists to refuse")
+            list(APPEND plantProblems "plant: `${flag}` planted into `${plantedUnit}` was ACCEPTED -- the check cannot see the flag it exists to refuse")
         endif()
     endforeach()
+    list(LENGTH problems otherProblems)
     set(distinctFlags "${plantFlags}")
     list(REMOVE_DUPLICATES distinctFlags)
     list(JOIN distinctFlags "`, `" flagsText)
-    set(summary "plant: `${flagsText}` planted into ${plantedUnit} (${plantedEntries} entr(y/ies)) refused as it must; ${summary}")
+    set(summary "plant: `${flagsText}` planted into ${plantedUnit} (${plantedEntries} entr(y/ies)) refused as it must; ${firstParty} first-party unit(s) judged; ${otherProblems} unplanted problem(s) left to the unplanted run")
+    set(problems "${plantProblems}")
 endif()
 
 if(problems STREQUAL "")

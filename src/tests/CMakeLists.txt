@@ -7167,6 +7167,38 @@ set_tests_properties("instruction-set-flags-selftest" PROPERTIES
     TIMEOUT 60
 )
 
+# This build's own compile database, and a plant into its real Sha256.cpp entries that must be refused. Only the
+# Makefile and Ninja generators write a database (CMAKE_EXPORT_COMPILE_COMMANDS says so, and ignores the rest),
+# so under any other generator neither test is registered. Every configure preset here is Ninja.
+if(CMAKE_EXPORT_COMPILE_COMMANDS AND CMAKE_GENERATOR MATCHES "Ninja|Makefiles")
+    add_test(
+        NAME "instruction-set-flags"
+        COMMAND ${CMAKE_COMMAND}
+            "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+            "-DFASTCACHED_COMPILE_DATABASE=${CMAKE_BINARY_DIR}/compile_commands.json"
+            -P "${CMAKE_SOURCE_DIR}/scripts/check-instruction-set-flags.cmake"
+    )
+    set_tests_properties("instruction-set-flags" PROPERTIES
+        FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+        LABELS "hygiene"
+        TIMEOUT 120
+    )
+
+    add_test(
+        NAME "instruction-set-flags-plant"
+        COMMAND ${CMAKE_COMMAND}
+            "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+            "-DFASTCACHED_COMPILE_DATABASE=${CMAKE_BINARY_DIR}/compile_commands.json"
+            "-DFASTCACHED_PLANT_UNIT=src/FastCache/Core/Sha256.cpp"
+            -P "${CMAKE_SOURCE_DIR}/scripts/check-instruction-set-flags.cmake"
+    )
+    set_tests_properties("instruction-set-flags-plant" PROPERTIES
+        FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+        LABELS "hygiene"
+        TIMEOUT 120
+    )
+endif()
+
 add_test(
     NAME "target-pragmas"
     COMMAND ${CMAKE_COMMAND}

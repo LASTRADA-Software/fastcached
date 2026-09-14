@@ -150,6 +150,18 @@ fastcached_entry("${root}" "vendor/endo/tui/V.cpp" "/usr/bin/c++ -msha -c V.cpp"
 file(WRITE "${root}/build/compile_commands.json" "[${unit},${vendored}]")
 fastcached_judge(vendoredDeclined "${root}" OFF "1 unit(s) outside src/ declined (first: ${root}/vendor/endo/tui/V.cpp)")
 
+# The plant run answers only whether a planted flag is still refused: a real violation on another unit is the
+# unplanted run's red, and must not make the plant run red as well.
+fastcached_tree(plantBesideRealViolation root)
+file(WRITE "${root}/src/FastCache/Core/Other.cpp" "int Other() { return 3; }\n")
+fastcached_entry("${root}" "src/FastCache/Core/Unit.cpp" "${gxx} ${tail}" unit)
+fastcached_entry("${root}" "src/FastCache/Core/Other.cpp" "${gxx} -mavx2 -c ../src/FastCache/Core/Other.cpp" other)
+file(WRITE "${root}/build/compile_commands.json" "[${unit},${other}]")
+fastcached_judge(plantBesideRealViolation "${root}" OFF
+    "`-msha` planted into src/FastCache/Core/Unit.cpp (1 entr(y/ies)) refused as it must; 2 first-party unit(s) judged; 1 unplanted problem(s) left to the unplanted run"
+    "${plant}")
+fastcached_judge(realViolationUnplanted "${root}" ON "src/FastCache/Core/Other.cpp: `-mavx2`, because")
+
 fastcached_tree(responseClean root)
 file(WRITE "${root}/build/flags.rsp" "-O2 -DNDEBUG\n")
 fastcached_unit_database("${root}" "${gxx} @flags.rsp ${tail}")
