@@ -2200,8 +2200,9 @@ namespace
     /// How a history chart is laid out: how many bands, and how many rows of cells each.
     struct ChartShape
     {
-        std::size_t bands { 0 };     ///< The bands drawn, the first of them first.
-        std::size_t bandCells { 1 }; ///< Rows of cells per band.
+        std::size_t bands { 0 };       ///< The bands drawn, the first of them first.
+        std::size_t bandCells { 1 };   ///< Rows of cells per band.
+        std::size_t spacerCells { 0 }; ///< Blank rows after every band but the last.
     };
 
     /// The chart as a frame draws it: its one item, and where its two images go in it.
@@ -2399,10 +2400,13 @@ namespace
         AppendLine(item, *keptTitle);
 
         item.imageFirst = item.lines.size();
-        item.imageRows = block.shape.bands * block.shape.bandCells;
+        item.imageRows = (block.shape.bands * block.shape.bandCells) + ((block.shape.bands - 1) * block.shape.spacerCells);
         auto const& levels = in.glyphs->chartLevels;
         for (auto const& track: block.tracks)
         {
+            // Every band after the first starts after its spacer rows.
+            if (item.lines.size() > item.imageFirst)
+                item.lines.resize(item.lines.size() + block.shape.spacerCells);
             auto row = std::vector<Piece> {
                 Piece { .text = std::string { Indent } + FitRight(track.label, nameCells, in.cellWidth) },
                 Piece { .text = std::string { ColumnGap } + AlignRight(track.latest, figureCells, in.cellWidth),
@@ -2524,20 +2528,38 @@ namespace
         return LayoutChart(in, source, context, budget, shape, Priority::Low, spec.chartGrowth.minimumCells, pixels);
     }
 
-    /// The shape a panel's history chart takes in @p spare rows: every band a row first, then taller bands.
+    /// The fewest rows of marks a text band keeps with a spacer row under it; a band any shorter is packed.
+    constexpr auto SpacedBandCellsLeast = std::size_t { 2 };
+
+    /// The shape a history chart takes in @p spare rows: every band a row first, then taller bands.
+    ///
+    /// **Text bands are one blank row apart** (#134 F-b): stacked marks from two bands run together into one shape,
+    /// and nothing then says where one band's top is. The spacer rows come out of the rows the bands grow into, never
+    /// on top of them. A chart is spaced only while every band keeps `SpacedBandCellsLeast` rows of marks: a crowded
+    /// chart keeps its bands rather than trading one for a blank row. A pixel chart is never spaced, since its image
+    /// draws its own gap inside each band.
     /// @param growth How the chart grows.
     /// @param bands How many bands it could draw.
     /// @param spare Rows the fitted frame left over.
+    /// @param spaced Whether the bands are text marks, which are spaced where the rows allow.
     /// @return The shape; no bands where the rows cannot hold a chart.
-    [[nodiscard]] ChartShape PanelChartShape(ChartGrowth const& growth, std::size_t bands, std::size_t spare) noexcept
+    [[nodiscard]] ChartShape PanelChartShape(ChartGrowth const& growth,
+                                             std::size_t bands,
+                                             std::size_t spare,
+                                             bool spaced) noexcept
     {
         if (spare <= ChartOverheadRows || bands == 0)
-            return ChartShape { .bands = 0, .bandCells = 1 };
+            return ChartShape { .bands = 0, .bandCells = 1, .spacerCells = 0 };
         auto const rows = std::min(growth.cellsHighMost, spare - ChartOverheadRows);
         auto const drawn = std::min(bands, rows);
+        auto const between = drawn - 1;
+        auto const spacer = spaced && between > 0 && (rows - between) / drawn >= SpacedBandCellsLeast ? std::size_t { 1 }
+                                                                                                      : std::size_t { 0 };
         return ChartShape { .bands = drawn,
-                            .bandCells = std::clamp(
-                                rows / drawn, std::size_t { 1 }, std::max<std::size_t>(1, growth.bandCellsMost)) };
+                            .bandCells = std::clamp((rows - (spacer * between)) / drawn,
+                                                    std::size_t { 1 },
+                                                    std::max<std::size_t>(1, growth.bandCellsMost)),
+                            .spacerCells = spacer };
     }
 
     /// The fleet chart laid out in @p shape: the first `FleetChartMetrics` row, one band per machine by name.
@@ -2610,6 +2632,7 @@ namespace
     /// @param available The rows the content may take.
     /// @param growth How the chart grows.
     /// @param bands How many bands it could draw.
+    /// @param spaced Whether the bands are text marks, spaced where the rows allow (`PanelChartShape`).
     /// @param layout The chart laid out in a shape.
     /// @param compose The frame's items with a chart item placed, or with none.
     /// @param items The frame's items; they carry the chart when it is kept.
@@ -2619,13 +2642,14 @@ namespace
         std::size_t available,
         ChartGrowth const& growth,
         std::size_t bands,
+        bool spaced,
         std::function<std::optional<ChartBlock>(ChartShape)> const& layout,
         std::function<std::vector<Item>(std::optional<Item> const&)> const& compose,
         std::vector<Item>& items,
         FittedRows& fitted)
     {
         auto const spare = available - std::min(available, fitted.lines.size());
-        auto const shape = PanelChartShape(growth, bands, spare);
+        auto const shape = PanelChartShape(growth, bands, spare, spaced);
         if (shape.bands == 0)
             return std::nullopt;
         auto chart = layout(shape);
@@ -3264,6 +3288,7 @@ DashboardFrame PanelView::PlacedFrame(DashboardModel const& model)
             *available,
             _spec->document->chartGrowth,
             std::max<std::size_t>(1, FleetChartMachines(in, _context)),
+            !ChartIsPixels(in, _context),
             [&](ChartShape shape) { return FleetChartOf(in, *_spec->document, _context, budget, shape); },
             compose,
             items,
@@ -3274,6 +3299,7 @@ DashboardFrame PanelView::PlacedFrame(DashboardModel const& model)
             *available,
             _spec->chartGrowth,
             _spec->charts.size(),
+            !ChartIsPixels(in, _context),
             [&](ChartShape shape) { return PanelChartOf(in, *_spec, _context, budget, shape); },
             compose,
             items,
