@@ -1145,8 +1145,11 @@ TEST_CASE("A late return from one hop back does not end the wait for the next tr
 
     auto const stop = StopWhileAway(reaper, heldAgain, [&] { executor.ForwardHeld(); });
 
-    REQUIRE(parked);
+    // `heldAgain` FIRST: it is false whenever either wait ran out, and `TickUntil`'s account is an
+    // `UNSCOPED_INFO` the next assertion consumes even when it PASSES -- so a passing
+    // `REQUIRE(parked)` ahead of it would swallow the second wait's account.
     REQUIRE(heldAgain);
+    REQUIRE(parked);
     CHECK_FALSE(stop.returnedBeforeRelease);
     CHECK(stop.finished);
     CHECK(reaper.Abandonments() == 0);
