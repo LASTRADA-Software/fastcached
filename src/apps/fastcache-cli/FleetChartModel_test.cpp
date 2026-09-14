@@ -13,15 +13,19 @@
 #include <deque>
 #include <expected>
 #include <format>
+#include <optional>
 #include <ranges>
 #include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
 
+#include <tests/Unwrap.hpp>
+
 using namespace FastCache;
 using namespace FastCache::Cli;
 using namespace FastCache::Distributed;
+using FastCache::Testing::Unwrap;
 
 namespace
 {
@@ -136,38 +140,157 @@ TEST_CASE("a fleet reading carries the chart's points, taken before its parse is
     CHECK(reading.document != nullptr);
 }
 
-TEST_CASE("the chart raster is one band per machine, time across, and a gap is transparent", "[cli][fleet][chart]")
+namespace
 {
-    // WHAT DISTINGUISHES: in the middle sample machine `b` was not read, and exactly its band there is
-    // transparent while `a`'s band beside it is drawn -- a raster filling a gap with a zero's colour, or
-    // dropping the whole sample, fails one or the other; and the raster is the size it was asked for.
+
+/// The RGB of pixel (@p x, @p y).
+/// @param raster The raster.
+/// @param x Column.
+/// @param y Row.
+/// @return Red, green and blue in one number.
+[[nodiscard]] std::uint32_t RgbAt(ChartRaster const& raster, std::size_t x, std::size_t y)
+{
+    auto const at = ((y * raster.width) + x) * 4;
+    return (std::uint32_t { raster.rgba.at(at) } << 16) | (std::uint32_t { raster.rgba.at(at + 1) } << 8)
+           | std::uint32_t { raster.rgba.at(at + 2) };
+}
+
+/// How many of column @p x's pixels between rows @p top and @p floor are not the colour at row @p top.
+/// @param raster The raster.
+/// @param x Column.
+/// @param top The band's first drawn row, which is track under any bar short of full.
+/// @param floor One past the band's last row.
+/// @return The bar's height in pixels.
+[[nodiscard]] std::size_t BarAt(ChartRaster const& raster, std::size_t x, std::size_t top, std::size_t floor)
+{
+    auto bar = std::size_t { 0 };
+    for (auto const y: std::views::iota(top, floor))
+        bar += RgbAt(raster, x, y) != RgbAt(raster, x, top) ? 1 : 0;
+    return bar;
+}
+
+} // namespace
+
+TEST_CASE("the chart's span is a fixed step that holds the history, not the history's own length", "[cli][fleet][chart]")
+{
+    // #134 F14. WHAT DISTINGUISHES: three samples are drawn across thirty sample widths, not three -- the
+    // three wide blocks nobody could read -- and a history past the largest span keeps the largest.
+    CHECK(ChartWindowFor(0) == ChartWindows.front());
+    CHECK(ChartWindowFor(3) == ChartWindows.front());
+    CHECK(ChartWindowFor(ChartWindows.front()) == ChartWindows.front());
+    CHECK(ChartWindowFor(ChartWindows.front() + 1) == ChartWindows[1]);
+    CHECK(ChartWindowFor(ChartWindows.back() * 2) == ChartWindows.back());
+}
+
+TEST_CASE("the chart bands every machine the span read, by name, with its newest figure or none", "[cli][fleet][chart]")
+{
+    // WHAT DISTINGUISHES: `b` is banded although the newest sample did not read it, and its newest figure
+    // is none rather than the last one read -- a label saying 90 % for a machine that stopped reporting
+    // would be a reading nobody gave -- and `z` read before the span is not banded at all.
+    auto history = std::deque<HistoryEntry> {};
+    history.push_back(EntryOf(MachinesDocument({ { "z:1", "100" } })));
+    for (auto const index: std::views::iota(0, 2))
+    {
+        (void) index;
+        history.push_back(EntryOf(MachinesDocument({ { "c:1", "500" } })));
+    }
+    history.push_back(EntryOf(MachinesDocument({ { "b:1", "900" }, { "a:1", "100" } })));
+    history.push_back(EntryOf(MachinesDocument({ { "a:1", "300" }, { "b:1", "-" }, { "c:1", "0" } })));
+
+    auto const bands = FleetChartBands(history, FleetChartMetrics.front(), 4);
+    REQUIRE(bands.size() == 3);
+    CHECK(bands[0].subject == "a:1");
+    CHECK(bands[1].subject == "b:1");
+    CHECK(bands[2].subject == "c:1");
+    REQUIRE(bands[0].latest.has_value());
+    CHECK(std::abs(Unwrap(bands[0].latest) - 0.3) < 1e-9);
+    CHECK_FALSE(bands[1].latest.has_value());
+    CHECK(bands[2].latest == std::optional<double> { 0.0 });
+}
+
+TEST_CASE("the chart raster draws a reading as a bar over a grey track, zero as the track, and a gap as nothing",
+          "[cli][fleet][chart]")
+{
+    // #134 F14, the owner's "block-like in one colour or another". WHAT DISTINGUISHES, over two machines in a
+    // span of thirty samples, three of them read:
+    //   - the samples not yet taken, left of the readings, are transparent: the chart fills from the right;
+    //   - `b` unread in the middle sample is transparent there, while `a` beside it is drawn;
+    //   - a bar is as tall as its value: 10 % is one pixel of nine and 90 % eight, over the track;
+    //   - `a` at zero is the track alone, every pixel one colour and opaque -- visible, and not a gap;
+    //   - each band's top row is transparent, so the two machines do not merge;
+    //   - a sample that read nothing is transparent for every machine.
     auto history = std::deque<HistoryEntry> {};
     history.push_back(EntryOf(MachinesDocument({ { "a:1", "100" }, { "b:1", "900" } })));
-    history.push_back(EntryOf(MachinesDocument({ { "a:1", "200" }, { "b:1", "-" } })));
+    history.push_back(EntryOf(MachinesDocument({ { "a:1", "0" }, { "b:1", "-" } })));
     history.push_back(EntryOf(MachinesDocument({ { "a:1", "300" }, { "b:1", "800" } })));
+    auto const& metric = FleetChartMetrics.front();
+    auto const bands = FleetChartBands(history, metric, 30);
+    REQUIRE(bands.size() == 2);
 
-    constexpr auto Width = std::size_t { 30 };
+    constexpr auto Width = std::size_t { 60 };
     constexpr auto Height = std::size_t { 20 };
-    auto const raster = FleetChartRaster(history, FleetChartMetrics.front(), Width, Height);
+    auto const raster = FleetChartRaster(history, metric, bands, 30, Width, Height);
     REQUIRE(raster.width == Width);
     REQUIRE(raster.height == Height);
     REQUIRE(raster.rgba.size() == Width * Height * 4);
 
-    // Three samples of ten columns each; two bands of ten rows each, `a` above `b` by key.
-    auto const sampleMiddle = [](std::size_t sample) {
-        return (sample * 10) + 5;
+    // Thirty samples of two pixels; the three read are the last six columns. Bands of ten rows, the first transparent.
+    auto const sampleX = [](std::size_t sample) {
+        return Width - ((3 - sample) * 2);
     };
-    constexpr auto BandA = std::size_t { 5 };
-    constexpr auto BandB = std::size_t { 15 };
-    CHECK(AlphaAt(raster, sampleMiddle(0), BandA) == 0xff);
-    CHECK(AlphaAt(raster, sampleMiddle(0), BandB) == 0xff);
-    CHECK(AlphaAt(raster, sampleMiddle(1), BandA) == 0xff);
-    CHECK(AlphaAt(raster, sampleMiddle(1), BandB) == 0x00); // the gap
-    CHECK(AlphaAt(raster, sampleMiddle(2), BandB) == 0xff);
+    CHECK(AlphaAt(raster, 10, 5) == 0x00);
+    CHECK(AlphaAt(raster, sampleX(0) - 1, 5) == 0x00);
+    CHECK(AlphaAt(raster, sampleX(0), 0) == 0x00);
+    CHECK(AlphaAt(raster, sampleX(0), 10) == 0x00);
+    CHECK(AlphaAt(raster, sampleX(1), 15) == 0x00); // `b` not read
+    CHECK(AlphaAt(raster, sampleX(1), 5) == 0xff);  // `a` at zero, beside it
 
-    // A sample that read nothing at all is a gap for every machine.
+    CHECK(BarAt(raster, sampleX(0), 1, 10) == 1);
+    CHECK(BarAt(raster, sampleX(0), 11, 20) == 8);
+    CHECK(BarAt(raster, sampleX(1), 1, 10) == 0);
+    CHECK(RgbAt(raster, sampleX(1), 9) == RgbAt(raster, sampleX(0), 1)); // zero is the track
+    CHECK(RgbAt(raster, sampleX(0), 9) != RgbAt(raster, sampleX(0), 1)); // a bar is not
+
     history.push_back(HistoryEntry {});
-    auto const withFailure = FleetChartRaster(history, FleetChartMetrics.front(), 40, Height);
-    CHECK(AlphaAt(withFailure, 35, BandA) == 0x00);
-    CHECK(AlphaAt(withFailure, 25, BandA) == 0xff);
+    auto const withFailure = FleetChartRaster(history, metric, bands, 30, Width, Height);
+    CHECK(AlphaAt(withFailure, Width - 1, 5) == 0x00);
+    CHECK(AlphaAt(withFailure, Width - 1, 15) == 0x00);
+    CHECK(AlphaAt(withFailure, Width - 3, 5) == 0xff);
+}
+
+TEST_CASE("one machine at a steady load is one bar height across the span", "[cli][fleet][chart]")
+{
+    // #134 F14's own acceptance line. WHAT DISTINGUISHES: every sample column carries the same bar, of the
+    // height its value is of the band, so the image reads as a steady load and not as blocks of colour.
+    auto history = std::deque<HistoryEntry> {};
+    for (auto const index: std::views::iota(0, 30))
+    {
+        (void) index;
+        history.push_back(EntryOf(MachinesDocument({ { "a:1", "500" } })));
+    }
+    auto const& metric = FleetChartMetrics.front();
+    auto const bands = FleetChartBands(history, metric, ChartWindowFor(history.size()));
+    auto const raster = FleetChartRaster(history, metric, bands, ChartWindowFor(history.size()), 90, 24);
+    for (auto const x: std::views::iota(std::size_t { 0 }, std::size_t { 90 }))
+    {
+        INFO("column " << x);
+        CHECK(BarAt(raster, x, 1, 24) == 12); // half of the 23 rows under the gap, rounded
+    }
+}
+
+TEST_CASE("the chart's colour scale runs coldest to hottest in whole steps", "[cli][fleet][chart]")
+{
+    // WHAT DISTINGUISHES: the left and right ends differ, the scale is opaque, and it has eight colours --
+    // a legend of one colour, or of a smeared gradient the encoder must quantize, cannot be read as values.
+    auto const scale = FleetChartScale(80, 4);
+    REQUIRE(scale.rgba.size() == std::size_t { 80 } * 4 * 4);
+    auto colours = std::vector<std::uint32_t> {};
+    for (auto const x: std::views::iota(std::size_t { 0 }, std::size_t { 80 }))
+    {
+        CHECK(AlphaAt(scale, x, 3) == 0xff);
+        if (colours.empty() || colours.back() != RgbAt(scale, x, 0))
+            colours.push_back(RgbAt(scale, x, 0));
+    }
+    CHECK(colours.size() == 8);
+    CHECK(colours.front() != colours.back());
 }
