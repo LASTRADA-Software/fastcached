@@ -365,6 +365,7 @@ TEST_CASE("every modifier is refused by name on every verb that does not honour 
         { .bit = Modifier::Everything, .flag = "--all", .spelling = "--all" },
         { .bit = Modifier::Interval, .flag = "--interval", .spelling = "--interval=1000" },
         { .bit = Modifier::Samples, .flag = "--samples", .spelling = "--samples=3" },
+        { .bit = Modifier::Range, .flag = "--range", .spelling = "--range=7d" },
     });
 
     for (auto const& probe: probes)
@@ -415,6 +416,31 @@ TEST_CASE("live-stats is the one verb that honours the interval and sample modif
     auto const carriers = std::ranges::count_if(
         Verbs(), [](VerbSpec const& verb) { return (verb.modifiers & (Modifier::Interval | Modifier::Samples)) != 0; });
     CHECK(carriers == 1);
+}
+
+TEST_CASE("fleet is the one verb that honours the range modifier and takes the key as typed", "[cli][command]")
+{
+    // #1390. The mechanism watched ACCEPTING, beside the derived case above that watches every other
+    // verb refuse it -- and the key unchecked here, because which windows exist is the leader's table.
+    auto const command = Parse({ "fleet", "series", "--range=7d" });
+    CHECK(command.action == Action::RunVerb);
+    REQUIRE(command.verbOptions.range.has_value());
+    CHECK(Unwrap(command.verbOptions.range) == "7d");
+
+    auto const unknown = Parse({ "fleet", "kpi", "--range=1fortnight" });
+    CHECK(unknown.action == Action::RunVerb);
+
+    auto const carriers =
+        std::ranges::count_if(Verbs(), [](VerbSpec const& verb) { return (verb.modifiers & Modifier::Range) != 0; });
+    CHECK(carriers == 1);
+
+    SECTION("an empty key is refused as a value, since on the wire empty is the default")
+    {
+        auto const empty = Parse({ "fleet", "series", "--range=" });
+        CHECK(empty.action == Action::UsageError);
+        CHECK(empty.diagnostic.contains("expected a range key"));
+        CHECK_FALSE(empty.diagnostic.contains("means nothing"));
+    }
 }
 
 TEST_CASE("a malformed interval or sample count is refused as a value rather than as an unhonoured flag", "[cli][command]")

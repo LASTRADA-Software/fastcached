@@ -543,6 +543,25 @@ enum class Op : std::uint8_t
     /// compiles are still running. Setting the state it already has answers the same.
     Cordon = 0x13,
 
+    /// Read the leader's fleet document once: one section, or every section, for one range.
+    ///
+    /// **The one-shot twin of subscribing to the fleet**, answered with the text `/fleet.txt`
+    /// serves -- the same renderer, reached through one function both doors call -- so a terminal
+    /// reads a fleet table from a node with no admin surface at all
+    /// ([#1391](https://github.com/LASTRADA-Software/fastcached/issues/1391)). A read rather than a
+    /// stream: a subscription taken for one frame and dropped is a stream misused as a query, and it
+    /// could carry no range.
+    ///
+    /// Admitted exactly as the fleet subject of `Subscribe` is -- a member, then the dashboard
+    /// credential or this machine only, then leadership -- through one decision both answer from. A
+    /// follower refuses `NotLeader` naming the leader, which a client follows. A section or range
+    /// this build does not serve is `UnknownFleetSelector`, naming the ones it does.
+    ///
+    /// `Ok | Error` only, so no version moved: step-over is a request-side property, and an older
+    /// node answers this opcode `UnknownOpcode` by name, as `Withdraw`, `NodeStatus` and `Enroll`
+    /// were added.
+    FleetText = 0x14,
+
     /// An operator removes one key from the cache tier that answers
     /// ([#1276](https://github.com/LASTRADA-Software/fastcached/issues/1276)).
     ///
@@ -564,9 +583,9 @@ enum class Op : std::uint8_t
     /// Gated as each surface gates a write, which is what a drop is: a node's cache serves
     /// its own machine only (#287), and the daemon asks for the credential `Store` needs.
     ///
-    /// `0x13` and `0x14` were held by work on parallel branches when this byte was taken, which
-    /// is the gap above. Filling it is safe only because `EveryOpcodeIsDistinct` refuses a byte
-    /// two rows claim.
+    /// `0x13` and `0x14` were held by work on parallel branches when this byte was taken, and have
+    /// since landed as `Cordon` and `FleetText`. Taking a byte above a gap was safe only because
+    /// `EveryOpcodeIsDistinct` refuses a byte two rows claim.
     CacheDrop = 0x15,
 };
 
@@ -998,6 +1017,18 @@ enum class ErrorCode : std::uint8_t
     /// that collects successfully writes the key and exits. A rise names both causes and
     /// the RATE separates them -- one is a lost reply, a run of them is not.
     EnrollmentAlreadyCollected = 0x24,
+
+    /// A fleet read named a section or a range this build does not serve.
+    ///
+    /// **Its own code, and neither `MalformedFrame` nor `InvalidClusterChange`.** The frame was
+    /// well-formed and nothing about the cluster was asked to change: the words were a key this
+    /// build's tables do not hold, which is a client of another build or an operator's typo. The
+    /// message lists the keys this build serves, so the answer is actionable where it is read, and a
+    /// client concludes it as a usage mistake rather than as a peer speaking another protocol.
+    ///
+    /// Uncounted where it is answered: a typo is seen by whoever typed it, and a rise would mean
+    /// nothing an operator acts on.
+    UnknownFleetSelector = 0x25,
 };
 
 /// Bit for `status` within an `OpDescriptor::legalStatuses` mask.
@@ -1183,6 +1214,15 @@ enum class VerbFamily : std::uint8_t
     /// answers request/reply verbs owns: a node routes it to the live hub, and a component
     /// routing by family must not be handed a verb whose answer never returns.
     Live,
+
+    /// Reads the leader's fleet document once.
+    ///
+    /// Its own family rather than a corner of `Live`, whose one verb is a stream, or of
+    /// `Scheduler`, whose gate is membership plus the scheduler's credential: a fleet read is
+    /// answered by a component holding the dashboard credential, which is a different secret, and
+    /// with a reply rather than a stream. A node running no scheduler still owns the family and
+    /// says the fleet is served elsewhere, as the fleet subject of a subscription does.
+    Fleet,
 };
 
 /// One row of the opcode table: everything the framing layer knows about a verb.
@@ -1675,6 +1715,16 @@ inline constexpr std::array OpTable {
                    .preAuth = RequiresAuth,
                    .maxPayload = BoundedTo(MaxControlPayload),
                    .family = VerbFamily::Compile },
+
+    // The fleet document, read once (#1391). Not pre-auth, for `Subscribe`'s reason: it is the
+    // fleet map.
+    OpDescriptor { .code = Op::FleetText,
+                   .name = "fleet-text",
+                   .fieldCount = 3, // section key, range key, dashboard token
+                   .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
+                   .preAuth = RequiresAuth,
+                   .maxPayload = BoundedTo(MaxControlPayload),
+                   .family = VerbFamily::Fleet },
 };
 
 /// Whether `Status::Progress` is confined to the one verb that can be slow enough to
@@ -1857,6 +1907,9 @@ inline constexpr std::array ErrorTable {
     ErrorDescriptor { .code = ErrorCode::EnrollmentAlreadyCollected,
                       .name = "enrollment-already-collected",
                       .defaultMessage = "the cluster key for this id has already been collected" },
+    ErrorDescriptor { .code = ErrorCode::UnknownFleetSelector,
+                      .name = "unknown-fleet-selector",
+                      .defaultMessage = "this build serves no fleet section or range by that name" },
 };
 
 /// Wire bytes that once meant something and must never mean anything again.
@@ -5510,6 +5563,44 @@ struct SubscribeRequest
         return std::nullopt;
     return SubscribeRequest { .subject = static_cast<LiveSubject>(subject),
                               .cadenceMillis = *cadence,
+                              .dashboardToken = std::string { AsStringView((*fields)[2]) } };
+}
+
+/// A FLEET-TEXT request's fields: the words a reader typed, which the leader looks up.
+///
+/// **Keys rather than enumerators**, for the reason `/fleet.txt` takes them as query words: which
+/// sections and ranges exist is the SERVING build's table, so a client naming one it knows and the
+/// leader does not is answered by name (`UnknownFleetSelector`) rather than refused as a malformed
+/// frame nobody can act on.
+struct FleetTextRequest
+{
+    std::string section {}; ///< A `FleetSectionTable` key, or empty for every section.
+    std::string range {};   ///< A `FleetRangeTable` key, or empty for the default day.
+    /// The dashboard credential, or empty; a secret, so the request is the only place it travels.
+    std::string dashboardToken {};
+};
+
+/// Frame a FLEET-TEXT request.
+/// @param request What to read.
+/// @param version Version to advertise.
+/// @return The framed request.
+[[nodiscard]] inline std::vector<std::byte> EncodeFleetTextRequest(FleetTextRequest const& request,
+                                                                   WireVersion version = CurrentVersion)
+{
+    return Detail::EncodeRequest(
+        version, Op::FleetText, { AsBytes(request.section), AsBytes(request.range), AsBytes(request.dashboardToken) });
+}
+
+/// Decode a FLEET-TEXT request's payload.
+/// @param payload The request body.
+/// @return The request, or nullopt when its fields do not exactly fill it.
+[[nodiscard]] inline std::optional<FleetTextRequest> DecodeFleetTextRequest(std::span<std::byte const> payload)
+{
+    auto const fields = WireFields::SplitExactly(payload, OpFieldCount(Op::FleetText));
+    if (!fields.has_value())
+        return std::nullopt;
+    return FleetTextRequest { .section = std::string { AsStringView((*fields)[0]) },
+                              .range = std::string { AsStringView((*fields)[1]) },
                               .dashboardToken = std::string { AsStringView((*fields)[2]) } };
 }
 

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "CliVerbs.hpp"
 #include "FleetDocument.hpp"
+#include "FleetReach.hpp"
 #include "LiveSession.hpp"
 #include "LiveStats.hpp"
 #include "NodeStatusText.hpp"
@@ -13,9 +14,12 @@
 #include <cstdint>
 #include <expected>
 #include <format>
+#include <memory>
 #include <optional>
 #include <ranges>
+#include <span>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -1549,38 +1553,114 @@ namespace
                           Field { .name = "state", .value = TextCell("appended, not committed") } }));
     }
 
+    /// A reply from the node that leads, and every node asked on the way to it.
+    struct LeaderReply
+    {
+        NodeReply reply;                ///< The leader's `Ok`.
+        std::vector<std::string> asked; ///< Where the request went, in order; the last one answered.
+    };
+
+    /// How a refusal a fleet read does not follow is told.
+    /// @param context What was run.
+    /// @param endpoint Who refused.
+    /// @param reply The refusal.
+    /// @return The answer.
+    [[nodiscard]] Answer FleetRefusal(VerbContext const& context, std::string_view endpoint, NodeReply const& reply)
+    {
+        auto const code = reply.code.value_or(CompileCacheWire::ErrorCode::MalformedFrame);
+
+        // The leader's own words, as they are: they list every key this build serves, one per
+        // line, which a parenthesised suffix would mangle.
+        if (code == CompileCacheWire::ErrorCode::UnknownFleetSelector)
+        {
+            auto const said = std::string_view { reply.detail };
+            // `npos + 1` is zero, so a detail of nothing but newlines trims to nothing.
+            auto const words = said.substr(0, said.find_last_not_of('\n') + 1);
+            return Concluded(Outcome::Refused, std::format("{} refused `{}`: {}", endpoint, context.verb->name, words));
+        }
+
+        auto explained = ExplainRefusal(context.verb->name, endpoint, reply);
+        if (code == CompileCacheWire::ErrorCode::Unauthenticated)
+            explained += DashboardCredentialRemedy(!context.dashboardToken.empty());
+        return Concluded(Outcome::Refused, std::move(explained));
+    }
+
+    /// Send @p request, following `NotLeader` to the node that leads.
+    ///
+    /// **`DecideLeaderHop`, the rule a fleet subscription follows too**: a refusal naming an address
+    /// is an instruction, at most `MaxLeaderRedirects` times; anything else is relayed. The bound is
+    /// what stops two nodes each naming the other stale leader from bouncing the request forever.
+    /// @param context What to run against; `node` is the first node asked.
+    /// @param request The framed request.
+    /// @return The leader's reply with the nodes asked, or the answer to give instead.
+    [[nodiscard]] std::expected<LeaderReply, Answer> AskLeader(VerbContext const& context,
+                                                               std::span<std::byte const> request)
+    {
+        std::unique_ptr<INodeExchange> dialled;
+        auto* at = context.node;
+        std::vector<std::string> asked;
+        for (auto const hopsTaken: std::views::iota(0, MaxLeaderRedirects + 1))
+        {
+            asked.emplace_back(at->Address());
+            auto reply = at->Send(request);
+            if (!reply.has_value())
+                return std::unexpected(FromExchangeError(reply.error()));
+            if (reply->status == CompileCacheWire::Status::Ok)
+                return LeaderReply { .reply = *std::move(reply), .asked = std::move(asked) };
+
+            auto const hop =
+                DecideLeaderHop(reply->code.value_or(CompileCacheWire::ErrorCode::MalformedFrame), reply->detail, hopsTaken);
+            if (hop.kind == LeaderHopKind::NotARedirect || context.dial == nullptr)
+                return std::unexpected(FleetRefusal(context, at->Address(), *reply));
+            if (hop.kind == LeaderHopKind::Exhausted)
+                break;
+
+            auto next = context.dial->Dial(hop.next);
+            if (!next.has_value())
+                return std::unexpected(FromExchangeError(next.error()));
+            dialled = *std::move(next);
+            at = dialled.get();
+        }
+
+        // Past the bound: every node asked, in order, so an operator sees which name each other.
+        std::string path;
+        for (auto const& each: asked)
+            path += path.empty() ? each : std::format(" -> {}", each);
+        return std::unexpected(Concluded(
+            Outcome::Unreachable,
+            std::format(
+                "followed {} leader redirects without an answer ({}); none of them leads", MaxLeaderRedirects, path)));
+    }
+
     /// `fleet <section>` -- one of the leader's fleet tables, in a terminal.
     ///
-    /// The admin surface is reached through the seam rather than dialled here, so
-    /// WHERE it is stays one decision (`IAdminDocument`) and this verb stays about
-    /// what to do with the document.
+    /// One `fleet-text` request over the `0xFC` connection every node verb uses (#1391): the leader
+    /// renders the table with the function `/fleet.txt` answers from, so a node needs no admin
+    /// surface for this, and a follower's `NotLeader` is followed to the leader it names.
     /// @param context What to run against.
     /// @return The answer.
     [[nodiscard]] Answer Fleet(VerbContext const& context)
     {
-        // Not a failure to reach anything -- nothing was CONFIGURED to reach. Saying
-        // "could not reach the admin surface" would send an operator to check a
-        // listener nothing dialled, which is the three-state rule the stats ladder
-        // already keeps.
-        if (context.admin == nullptr)
-            return Concluded(Outcome::Usage, std::string { NoAdminSurface });
+        auto const request = CompileCacheWire::EncodeFleetTextRequest(
+            CompileCacheWire::FleetTextRequest { .section = context.operands[0],
+                                                 .range = context.options.range.value_or(std::string {}),
+                                                 .dashboardToken = std::string { context.dashboardToken } });
+        auto read = AskLeader(context, request);
+        if (!read.has_value())
+            return std::move(read.error());
 
-        auto const document = context.admin->FetchAdmin(std::format("/fleet.txt?section={}", context.operands[0]));
-        if (!document.has_value())
-        {
-            // WHICH kind of failure decides the exit code, and they are not the same
-            // question: nothing answered, or the leader answered and declined -- the
-            // second carries the server's own words, including the list of sections
-            // when the guess was wrong and the leader's address when this node is not
-            // it.
-            return Concluded(OutcomeOf(document.error().kind), document.error().detail);
-        }
-
-        auto table = FleetTable(*document);
+        auto table = FleetTable(CompileCacheWire::AsStringView(read->reply.payload));
         if (!table.has_value())
             return Concluded(Outcome::Protocol, std::format("the fleet table could not be read: {}", table.error()));
 
-        return Answered(*std::move(table));
+        auto answer = Answered(*std::move(table));
+        // On stderr: the table on stdout is the same whoever answered it, and a script reading it
+        // must not have to skip a line -- while an operator who named a follower still learns
+        // where the leader is.
+        if (read->asked.size() > 1)
+            answer.advisories.push_back(std::format(
+                "{} does not lead the fleet; the table is from the leader at {}", read->asked.front(), read->asked.back()));
+        return answer;
     }
 
     /// The verbs, in the order `--help` documents them.
@@ -1871,15 +1951,13 @@ namespace
           // `the fleet verb offers every section the server serves` in
           // `CliVerbs_test.cpp`, which walks that table: a section added and not
           // spelled here reddens rather than going quietly missing from the help.
-          .operands = " <kpi|machines|workers|leases|members|tiers>",
-          .summary = "one of the leader's fleet tables, read over the node's\n"
-                     "own admin surface -- no browser and no JSON parser",
-          .protocolCommand = "node-status",
-          .modifiers = Modifier::None,
+          .operands = " <kpi|machines|workers|leases|members|tiers|series>",
+          .summary = "one of the leader's fleet tables, read over 0xFC from\n"
+                     "the node that leads -- no admin surface, browser or JSON parser",
+          .protocolCommand = "fleet-text",
+          .modifiers = Modifier::Range,
           .handler = &Fleet,
-          // The 0xFC wire is what DISCOVERS the admin port, so the verb needs that
-          // connection even though the table arrives over HTTP. No fallback: an
-          // endpoint that is not a node has no fleet to report.
+          // No fallback: an endpoint that is not a node has no fleet to report.
           .nodeFallback = nullptr,
           .session = nullptr },
         { .name = "node-metrics",

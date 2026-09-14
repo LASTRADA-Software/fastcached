@@ -756,6 +756,21 @@ TEST_CASE("Every op in the table is dispatched", "[compile-cache][handler][versi
     }
 }
 
+TEST_CASE("The daemon refuses a fleet read by name and sends it to the fleet's scheduler", "[compile-cache][handler]")
+{
+    // #1391. `DispatchNotPermitted` and never `UnknownOpcode`: the fleet is served by a compile
+    // node that schedules, and a client told the verb is unknown would conclude this daemon is too
+    // old. The WORDS are the half the generic refusal lacks -- a relocated verb with no row is
+    // refused with the same code and no destination.
+    CcFixture fix;
+    auto const reply = SoleReply(Exchange(fix, Wire::EncodeFleetTextRequest(Wire::FleetTextRequest { .section = "kpi" })));
+    REQUIRE(reply.present);
+    auto const error = ErrorOf(reply);
+    REQUIRE(error.present);
+    CHECK(error.code == Wire::ErrorCode::DispatchNotPermitted);
+    CHECK(error.message.contains("--serve-scheduler"));
+}
+
 TEST_CASE("A dropped frame is logged", "[compile-cache][handler][version]")
 {
     // Every other handler reports a frame drop through the session logger; this

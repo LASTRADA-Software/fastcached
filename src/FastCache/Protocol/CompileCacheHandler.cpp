@@ -151,6 +151,13 @@ namespace
                             .code = Wire::ErrorCode::NoCluster,
                             .why = "this endpoint is a cache and belongs to no cluster, so it opens no enrollment "
                                    "window; ask a fastcache-compile-node that runs consensus instead" },
+        // `DispatchNotPermitted` with the node rows, for their reason: the fleet is served by a
+        // compile node that schedules, not unimplemented, and a client told `UnknownOpcode` would
+        // conclude this daemon is too old and step over a refusal it should act on.
+        Wire::RefusedVerb { .op = Wire::Op::FleetText,
+                            .code = Wire::ErrorCode::DispatchNotPermitted,
+                            .why = "this endpoint is a cache, not a compile node, and serves no fleet; read it from "
+                                   "the fleet's scheduler, a fastcache-compile-node --serve-scheduler" },
     };
 
     /// What to answer `op` with.
@@ -1190,6 +1197,8 @@ Task<void> CompileCacheHandler::Run(ISocket* socket,
             // sentence are decided.
             case Wire::Op::Enroll:
             case Wire::Op::EnrollControl:
+            // The fleet document, answered by the fleet's scheduler; same arm, same reason.
+            case Wire::Op::FleetText:
                 next = co_await HandleDistributed(socket, descriptor->code);
                 break;
 

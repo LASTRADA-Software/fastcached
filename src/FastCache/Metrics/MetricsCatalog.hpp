@@ -869,6 +869,31 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
       .help = "Live-stats subscriptions refused because the 0xFC listener's in-flight byte budget was full of "
               "other requests. The dashboard retries; a rise says the view was lost when the node was busiest.",
       .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::FleetTextRequestsRefusedNotAMember,
+      .prometheusName = "fastcache_fleet_text_requests_refused_not_a_member_total",
+      .help = "Fleet document reads over 0xFC refused because the peer is not a fleet member. The fleet is read "
+              "by members only, as a subscription to it is; a burst from one host is a stranger probing the port.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::FleetTextRequestsRefusedUnauthenticated,
+      .prometheusName = "fastcache_fleet_text_requests_refused_unauthenticated_total",
+      .help = "Fleet document reads over 0xFC refused for a wrong or missing dashboard credential, or from a "
+              "remote peer while no dashboard token file is configured. A burst from one host is somebody guessing.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::FleetTextRequestsRefusedMalformed,
+      .prometheusName = "fastcache_fleet_text_requests_refused_malformed_total",
+      .help = "Fleet document reads whose request did not decode. No client of this tree sends one; a rise is a "
+              "client of another build or no client at all.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::FleetTextRequestsRefusedPayloadTooLarge,
+      .prometheusName = "fastcache_fleet_text_requests_refused_payload_too_large_total",
+      .help = "Fleet document reads whose header declared more than the control payload the verb is bounded to. "
+              "Refused before a byte of it is read; no client of this tree at any version sends one.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::FleetTextRequestsRefusedEndpointBusy,
+      .prometheusName = "fastcache_fleet_text_requests_refused_endpoint_busy_total",
+      .help = "Fleet document reads refused because the 0xFC listener's in-flight byte budget was full of other "
+              "requests. A rise says an operator asked for the fleet when the leader was busiest.",
+      .type = MetricType::Counter },
 } };
 
 // Checked at compile time rather than by a test, because the failure this prevents

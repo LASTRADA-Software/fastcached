@@ -16,11 +16,13 @@
 #include <array>
 #include <chrono>
 #include <cstdint>
+#include <expected>
 #include <format>
 #include <fstream>
 #include <optional>
 #include <ranges>
 #include <sstream>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -295,6 +297,31 @@ namespace
         return out;
     }
 
+    /// The range a key names, or the day when it names none -- never a silent substitution.
+    /// @param key What the reader typed, or empty.
+    /// @return The range, or nullopt for a key this build does not serve.
+    [[nodiscard]] std::optional<Distributed::FleetRange> RangeFromKeyOrDay(std::string_view key) noexcept
+    {
+        if (key.empty())
+            return Distributed::FleetRange::Day;
+        return Distributed::FleetRangeFromKey(key);
+    }
+
+    /// The history a view of @p range draws on.
+    /// @param history The record, or null to draw none.
+    /// @param range Which window.
+    /// @return The view.
+    [[nodiscard]] Distributed::FleetHistoryView HistoryViewFor(IFleetHistoryView const* history,
+                                                               Distributed::FleetRange range)
+    {
+        Distributed::FleetHistoryView view { .range = range,
+                                             .buckets = {},
+                                             .durable = history != nullptr && history->Durable() };
+        if (history != nullptr)
+            view.buckets = history->Buckets(range);
+        return view;
+    }
+
     /// A chart tail that names nothing in the table.
     [[nodiscard]] AdminResponse NoSuchChart()
     {
@@ -356,6 +383,31 @@ namespace
     }
 } // namespace
 
+std::expected<FleetTextDocument, FleetTextDeclined> AnswerFleetText(Distributed::FleetSnapshot const& snapshot,
+                                                                    IFleetHistoryView const* history,
+                                                                    std::string_view sectionKey,
+                                                                    std::string_view rangeKey)
+{
+    auto const section = sectionKey.empty() ? std::optional<Distributed::FleetSection> { std::nullopt }
+                                            : Distributed::FleetSectionFromKey(sectionKey);
+    if (!sectionKey.empty() && !section.has_value())
+        return std::unexpected(
+            FleetTextDeclined { .refusal = FleetTextRefusal::UnknownSelector,
+                                .detail = std::format("unknown section; this build serves:\n{}", KnownSections()) });
+
+    // Asked for even when a section that ignores it was named: a parameter accepted on one section
+    // and silently dropped on another is a worse answer than refusing it everywhere.
+    auto const range = RangeFromKeyOrDay(rangeKey);
+    if (!range.has_value())
+        return std::unexpected(
+            FleetTextDeclined { .refusal = FleetTextRefusal::UnknownSelector,
+                                .detail = std::format("unknown range; this build serves: {}\n", KnownRangeKeys()) });
+
+    return FleetTextDocument { .leads = Distributed::LeadsTheFleet(snapshot),
+                               .leaderEndpoint = snapshot.leaderEndpoint,
+                               .body = Distributed::RenderFleetText(snapshot, HistoryViewFor(history, *range), section) };
+}
+
 std::vector<AdminRoute> MakeFleetRoutes(Distributed::FleetSources sources,
                                         AdminCredential const& credential,
                                         unsigned refreshSeconds,
@@ -383,20 +435,12 @@ std::vector<AdminRoute> MakeFleetRoutes(Distributed::FleetSources sources,
     };
 
     /// What the reader asked for, or the default -- never a silent substitution.
-    auto const rangeAsked = [](std::string_view query) -> std::optional<Distributed::FleetRange> {
-        auto const asked = QueryValue(query, "range");
-        if (asked.empty())
-            return Distributed::FleetRange::Day;
-        return Distributed::FleetRangeFromKey(asked);
+    auto const rangeAsked = [](std::string_view query) {
+        return RangeFromKeyOrDay(QueryValue(query, "range"));
     };
 
     auto const viewFor = [history](Distributed::FleetRange range) {
-        Distributed::FleetHistoryView view { .range = range,
-                                             .buckets = {},
-                                             .durable = history != nullptr && history->Durable() };
-        if (history != nullptr)
-            view.buckets = history->Buckets(range);
-        return view;
+        return HistoryViewFor(history, range);
     };
 
     std::vector<AdminRoute> routes;
@@ -503,31 +547,22 @@ std::vector<AdminRoute> MakeFleetRoutes(Distributed::FleetSources sources,
     // asked for, with nothing in a tab-separated document to say so. Asking for NO
     // section is not a guess and gets every section, each behind a marker naming it --
     // which is also how the accepted keys are discoverable without reading the docs.
+    //
+    // The document and both refusals are `AnswerFleetText`'s, which is also what the
+    // `fleet-text` verb answers from: this route renders nothing of its own (#1391).
     routes.push_back(AdminRoute {
         .path = "/fleet.txt",
-        .handler =
-            gated([] { return Unauthorised("text/plain; charset=utf-8", "credential required\n"); },
-                  [statusFor, rangeAsked, viewFor](Distributed::FleetSnapshot const& snapshot,
-                                                   AdminRequest const& request) -> AdminResponse {
-                      auto const asked = QueryValue(request.query, "section");
-                      auto const section = asked.empty() ? std::optional<Distributed::FleetSection> { std::nullopt }
-                                                         : Distributed::FleetSectionFromKey(asked);
-                      if (!asked.empty() && !section.has_value())
-                          return RefusedParameter("text/plain; charset=utf-8",
-                                                  std::format("unknown section; this build serves:\n{}", KnownSections()));
-                      // `range` for the `kpi` section's history-derived figures; see
-                      // the note on `/fleet.json`. Refused rather than defaulted, and
-                      // asked for even when a section that ignores it was named --
-                      // a parameter accepted on one section and silently dropped on
-                      // another is a worse answer than refusing it everywhere.
-                      auto const range = rangeAsked(request.query);
-                      if (!range.has_value())
-                          return RefusedParameter("text/plain; charset=utf-8",
-                                                  std::format("unknown range; this build serves: {}\n", KnownRangeKeys()));
-                      return AdminResponse { .status = statusFor(snapshot),
-                                             .contentType = "text/plain; charset=utf-8",
-                                             .body = Distributed::RenderFleetText(snapshot, viewFor(*range), section) };
-                  }),
+        .handler = gated(
+            [] { return Unauthorised("text/plain; charset=utf-8", "credential required\n"); },
+            [history, statusFor](Distributed::FleetSnapshot const& snapshot, AdminRequest const& request) -> AdminResponse {
+                auto answer = AnswerFleetText(
+                    snapshot, history, QueryValue(request.query, "section"), QueryValue(request.query, "range"));
+                if (!answer.has_value())
+                    return RefusedParameter("text/plain; charset=utf-8", std::move(answer.error().detail));
+                return AdminResponse { .status = statusFor(snapshot),
+                                       .contentType = "text/plain; charset=utf-8",
+                                       .body = std::move(answer->body) };
+            }),
     });
 
     routes.push_back(AdminRoute {

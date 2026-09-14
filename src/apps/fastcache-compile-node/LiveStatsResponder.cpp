@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
+#include "FleetReadGate.hpp"
 #include "LiveStatsResponder.hpp"
 
 #include <FastCache/Core/EnumTable.hpp>
-#include <FastCache/Core/HostPort.hpp>
 #include <FastCache/Protocol/SurfaceRefusal.hpp>
 
 #include <algorithm>
@@ -236,24 +236,23 @@ std::optional<std::vector<std::byte>> LiveStatsResponder::Admit(Wire::SubscribeR
     if (!LiveSubjectGates.at(static_cast<std::size_t>(request.subject)).fleetGates)
         return std::nullopt;
 
-    auto const leadership = _sources.Leadership();
-    if (!leadership.has_value())
-        return Cc::RefuseWithoutCounter(
-            FleetNotServedHere,
-            "this node runs no scheduler, so it has no fleet to stream; subscribe at the fleet's scheduler");
-
-    // The credential BEFORE leadership, so a caller without it is not told where the leader is.
-    auto const admitted = _dashboard.Required() ? _dashboard.Matches(request.dashboardToken) : IsLoopbackHost(peer);
-    if (!admitted)
-        return Cc::Refuse(_metrics,
-                          RefusedUnauthenticated,
-                          _dashboard.Required() ? "the fleet streams to a caller presenting the dashboard credential"
-                                                : "with no --dashboard-token-file the fleet streams to this machine only");
-
-    if (!leadership->leads)
-        // The message IS the leader's endpoint, or empty during an election: a client parses it.
-        return Cc::RefuseWithoutCounter(NotLeaderAtSubscribe, leadership->leaderEndpoint);
-    return std::nullopt;
+    // The decision `FleetText` answers from too; what is this surface's is which counter each
+    // refusal moves.
+    auto const verdict = DecideFleetRead(_sources.Leadership(), _dashboard, request.dashboardToken, peer);
+    switch (verdict.decision)
+    {
+        case FleetReadDecision::Admitted:
+            return std::nullopt;
+        case FleetReadDecision::NoScheduler:
+            return Cc::RefuseWithoutCounter(FleetNotServedHere, verdict.detail);
+        case FleetReadDecision::NotLeader:
+            // The message IS the leader's endpoint, or empty during an election: a client parses it.
+            return Cc::RefuseWithoutCounter(NotLeaderAtSubscribe, verdict.detail);
+        case FleetReadDecision::Unauthenticated:
+            break;
+    }
+    // `Unauthenticated`, and anything a switch cannot name: a gate fails closed.
+    return Cc::Refuse(_metrics, RefusedUnauthenticated, verdict.detail);
 }
 
 std::optional<std::vector<std::byte>> LiveStatsResponder::Recheck(Wire::LiveSubject subject, std::string_view peer) const

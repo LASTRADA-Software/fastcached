@@ -297,6 +297,16 @@ std::string LiveStatsSourceSlot::AnsweringEndpoint() const
     return _sources != nullptr ? _sources->AnsweringEndpoint() : std::string {};
 }
 
+std::expected<FleetTextDocument, FleetTextDeclined> LiveStatsSourceSlot::FleetText(std::string_view section,
+                                                                                   std::string_view range) const
+{
+    std::shared_lock const guard { _mutex };
+    if (_sources == nullptr)
+        return std::unexpected(
+            FleetTextDeclined { .refusal = FleetTextRefusal::NoFleet, .detail = "this process is stopping" });
+    return _sources->FleetText(section, range);
+}
+
 LiveStream::LiveStream(ILiveStatsSources const& sources, IMetricsSink& metrics) noexcept:
     _sources { sources },
     _metrics { metrics }
@@ -451,7 +461,10 @@ Task<std::vector<std::byte>> LiveStream::Serve(
         co_await AwaitView(subject, floor, std::numeric_limits<std::uint64_t>::max(), std::nullopt, sink, reactor);
     if (baseline.seen != Seen::Ready)
         co_return std::vector<std::byte> {}; // The process is stopping.
-    auto tick = baseline.tick;
+    // The tick the baseline was CAPTURED on, for the reason the loop reads `view.view->tick`: another reactor may
+    // have published a later tick than this one woke on, and a cadence counted from the earlier one would report
+    // the tick between them as missed.
+    auto tick = baseline.view->tick;
 
     _metrics.Increment(IMetricsSink::Counter::LiveSubscriptionsOpened);
 
@@ -486,6 +499,12 @@ Task<std::vector<std::byte>> LiveStream::Serve(
     auto eventsFrom = baseline.eventsEnd;
     auto seen = baseline.view->tick;
 
+    // The baseline is the first view this subscriber sends, not one it looks past. Looking again straddles a tick
+    // boundary whenever the push above takes long enough -- which on a loaded host is ordinary -- and the second look
+    // then takes a capture of its own while the baseline's, taken and never sent, reaches the panel as a gap: a
+    // missed cadence reported for wake-up jitter, and a capture rendered for nobody.
+    auto pending = std::optional { baseline };
+
     while (true)
     {
         if (auto end = EndedBySink(*sink); end.has_value())
@@ -494,7 +513,9 @@ Task<std::vector<std::byte>> LiveStream::Serve(
         if (auto end = gate->Recheck(subject, peer); end.has_value())
             co_return *std::move(end);
 
-        auto const view = co_await AwaitView(subject, floor, eventsFrom, seen, sink, reactor);
+        auto const view =
+            pending.has_value() ? *std::move(pending) : co_await AwaitView(subject, floor, eventsFrom, seen, sink, reactor);
+        pending.reset();
         if (view.seen == Seen::Stopped)
             co_return OrderlyEnd(); // The sources were detached: this process is stopping.
         if (view.seen == Seen::Busy)

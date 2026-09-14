@@ -507,6 +507,87 @@ TEST_CASE("The series JSON carries every key the table names", "[distributed][fl
     CHECK(json.contains("[null,1"));
 }
 
+namespace
+{
+
+/// @p text split into lines, the empty one after the final newline dropped.
+/// @param text The text.
+/// @return The lines.
+[[nodiscard]] std::vector<std::string> TextLines(std::string_view text)
+{
+    std::vector<std::string> lines;
+    for (auto const line: std::views::split(text, '\n'))
+        lines.emplace_back(line.begin(), line.end());
+    if (!lines.empty() && lines.back().empty())
+        lines.pop_back();
+    return lines;
+}
+
+/// @p line split at its tabs.
+/// @param line The line.
+/// @return The cells.
+[[nodiscard]] std::vector<std::string> TabCells(std::string_view line)
+{
+    std::vector<std::string> cells;
+    for (auto const cell: std::views::split(line, '\t'))
+        cells.emplace_back(cell.begin(), cell.end());
+    return cells;
+}
+
+} // namespace
+
+TEST_CASE("The series text is the JSON's values on their side, a gap a dash and never a zero",
+          "[distributed][fleetchart][fleettsv]")
+{
+    // #1390: a terminal with no JSON parser reads the fleet's history as this table. WHAT DISTINGUISHES:
+    // the unsampled window's row is a dash in coverage and in every series, where the idle window reads
+    // `0` for its level; the first rate after the gap is a dash, because no delta is taken across it; and
+    // a value is the JSON's own spelling, so the two documents cannot disagree about one.
+    std::vector<FleetBucket> const buckets {
+        At(0, { { FleetMetric::DispatchGranted, 10 }, { FleetMetric::JobsInFlight, 0 } }),
+        At(300'000, { { FleetMetric::DispatchGranted, 40 }, { FleetMetric::JobsInFlight, 7 } }),
+        Gap(600'000),
+        At(900'000, { { FleetMetric::DispatchGranted, 70 }, { FleetMetric::JobsInFlight, 2 } }),
+    };
+
+    std::string text;
+    AppendSeriesText(text, buckets, FleetRange::Day);
+    auto const lines = TextLines(text);
+    REQUIRE(lines.size() == 1 + buckets.size());
+
+    auto const names = FleetSeriesColumnNames();
+    REQUIRE(TabCells(lines[0]) == names);
+    auto const cell = [&lines, &names](std::size_t bucket, std::string_view column) {
+        auto const at = std::ranges::find(names, column);
+        REQUIRE(at != names.end());
+        auto const cells = TabCells(lines.at(1 + bucket));
+        REQUIRE(cells.size() == names.size());
+        return cells.at(static_cast<std::size_t>(std::distance(names.begin(), at)));
+    };
+
+    CHECK(cell(0, "start") == "0");
+    CHECK(cell(0, "in-flight") == "0");  // idle: a reading of zero
+    CHECK(cell(0, "dispatched") == "-"); // nothing before it to take a rate from
+    CHECK(cell(1, "dispatched") == "6"); // 30 compiles over five minutes
+    CHECK(cell(1, "in-flight") == "7");
+
+    // The window nobody sampled: every figure a dash, and none of them a zero.
+    CHECK(cell(2, "start") == "600000");
+    CHECK(cell(2, "backfilled") == "false");
+    for (auto const& name: names)
+    {
+        if (name == "start" || name == "backfilled")
+            continue;
+        INFO("column " << name);
+        CHECK(cell(2, name) == "-");
+    }
+
+    CHECK(cell(3, "dispatched") == "-"); // never a delta across the gap
+    CHECK(cell(3, "in-flight") == "2");
+
+    CHECK(RenderSeriesJson(buckets, FleetRange::Day).contains(R"("dispatched":[null,6,null,null])"));
+}
+
 TEST_CASE("The sparkline inherits the page's palette rather than carrying one", "[distributed][fleetchart]")
 {
     std::vector<FleetBucket> const buckets {

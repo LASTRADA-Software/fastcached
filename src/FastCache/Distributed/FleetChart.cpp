@@ -7,8 +7,10 @@
 #include <cmath>
 #include <cstdint>
 #include <format>
+#include <optional>
 #include <ranges>
 #include <string>
+#include <utility>
 
 namespace FastCache::Distributed
 {
@@ -733,11 +735,14 @@ std::string RenderSparklineSvg(std::vector<FleetBucket> const& buckets)
 
 namespace
 {
-    /// One per-bucket array the series JSON carries beside `series`.
+    /// One per-bucket array the series JSON carries beside `series`, and one column the series text
+    /// carries before them.
     struct BucketArrayRow
     {
-        std::string_view key;                      ///< Its JSON name.
-        std::string (*render)(FleetBucket const&); ///< What one bucket contributes.
+        std::string_view key; ///< Its JSON name, and its text column's.
+        /// What one bucket contributes, or nullopt where it is absent -- which each format spells its
+        /// own way (`null`, `-`), so absence is one fact here rather than one spelling per writer.
+        std::optional<std::string> (*render)(FleetBucket const&);
     };
 
     /// Every array that runs parallel to `series`, in the order they are written.
@@ -747,28 +752,49 @@ namespace
     /// silently -- the loop is written once and every row rides it.
     constexpr std::array<BucketArrayRow, 3> BucketArrayTable {
         BucketArrayRow { .key = "start",
-                         .render = [](FleetBucket const& bucket) { return std::format("{}", bucket.startMillis); } },
-        // `null` for a window nobody sampled, and never 0: a fleet that did nothing
+                         .render = [](FleetBucket const& bucket) -> std::optional<std::string> {
+                             return std::format("{}", bucket.startMillis);
+                         } },
+        // Absent for a window nobody sampled, and never 0: a fleet that did nothing
         // and a fleet nobody was watching are different facts, which is the same
         // distinction the series values themselves make.
         BucketArrayRow { .key = "coverage",
-                         .render =
-                             [](FleetBucket const& bucket) {
-                                 return bucket.present ? std::format("{}", bucket.coverage) : std::string { "null" };
-                             } },
+                         .render = [](FleetBucket const& bucket) -> std::optional<std::string> {
+                             if (!bucket.present)
+                                 return std::nullopt;
+                             return std::format("{}", bucket.coverage);
+                         } },
         // Which windows this leader did not sample itself, and holds only because the
         // machines handed their own records over. Their scheduler-scoped series are
-        // `null` throughout, because no machine can answer for a dispatch outcome.
-        BucketArrayRow {
-            .key = "backfilled",
-            .render = [](FleetBucket const& bucket) { return std::string { bucket.backfilled ? "true" : "false" }; } },
+        // absent throughout, because no machine can answer for a dispatch outcome.
+        BucketArrayRow { .key = "backfilled",
+                         .render = [](FleetBucket const& bucket) -> std::optional<std::string> {
+                             return std::string { bucket.backfilled ? "true" : "false" };
+                         } },
     };
+
+    /// One series value as both documents write it; the precision is the JSON's, so the two agree.
+    /// @param value The value.
+    /// @return The text.
+    [[nodiscard]] std::string SeriesValueText(double value)
+    {
+        return std::format("{:.4g}", value);
+    }
+
+    /// How wide one of @p range's buckets is, in seconds, for a per-minute rate.
+    /// @param range The range.
+    /// @return The width.
+    [[nodiscard]] std::int64_t BucketSecondsOf(FleetRange range)
+    {
+        return std::chrono::duration_cast<std::chrono::seconds>(FleetRangeTable[static_cast<std::size_t>(range)].bucket)
+            .count();
+    }
 } // namespace
 
 std::string RenderSeriesJson(std::vector<FleetBucket> const& buckets, FleetRange range)
 {
     auto const& row = FleetRangeTable[static_cast<std::size_t>(range)];
-    auto const seconds = std::chrono::duration_cast<std::chrono::seconds>(row.bucket).count();
+    auto const seconds = BucketSecondsOf(range);
 
     std::string out = "{";
     AppendJsonText(out, "range");
@@ -789,7 +815,7 @@ std::string RenderSeriesJson(std::vector<FleetBucket> const& buckets, FleetRange
         {
             if (index != 0)
                 out += ',';
-            out += array.render(buckets[index]);
+            out += array.render(buckets[index]).value_or("null");
         }
         out += ']';
     }
@@ -811,15 +837,55 @@ std::string RenderSeriesJson(std::vector<FleetBucket> const& buckets, FleetRange
             // average a gap into the rest, which is exactly the mistake the page
             // renders differently.
             auto const& value = values[point];
-            if (value.has_value())
-                out += std::format("{:.4g}", *value);
-            else
-                out += "null";
+            out += value.has_value() ? SeriesValueText(*value) : std::string { "null" };
         }
         out += ']';
     }
     out += "}}";
     return out;
+}
+
+std::vector<std::string> FleetSeriesColumnNames()
+{
+    std::vector<std::string> names;
+    names.reserve(BucketArrayTable.size() + FleetSeriesTable.size());
+    for (auto const& array: BucketArrayTable)
+        names.emplace_back(array.key);
+    for (auto const& series: FleetSeriesTable)
+        names.emplace_back(series.key);
+    return names;
+}
+
+void AppendSeriesText(std::string& out, std::vector<FleetBucket> const& buckets, FleetRange range)
+{
+    // The JSON's arrays turned on their side: its per-bucket arrays and its series, walked from
+    // the same two tables, so a column here and a key there cannot name different things.
+    auto const names = FleetSeriesColumnNames();
+    for (auto const index: std::views::iota(std::size_t { 0 }, names.size()))
+        out += std::format("{}{}", index == 0 ? "" : "\t", names[index]);
+    out += '\n';
+
+    auto const seconds = BucketSecondsOf(range);
+    std::vector<FleetSeriesValues> values;
+    values.reserve(FleetSeriesTable.size());
+    for (auto const& series: FleetSeriesTable)
+        values.push_back(ValuesFor(series, buckets, seconds));
+
+    // `-` for absent, as every other section writes it, and never `0`: a gap and an idle
+    // bucket are the distinction this history exists to keep.
+    for (auto const bucket: std::views::iota(std::size_t { 0 }, buckets.size()))
+    {
+        auto first = true;
+        auto const cell = [&out, &first](std::optional<std::string> const& text) {
+            out += std::exchange(first, false) ? "" : "\t";
+            out += text.value_or("-");
+        };
+        for (auto const& array: BucketArrayTable)
+            cell(array.render(buckets[bucket]));
+        for (auto const& series: values)
+            cell(series[bucket].transform(SeriesValueText));
+        out += '\n';
+    }
 }
 
 } // namespace FastCache::Distributed

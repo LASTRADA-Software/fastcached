@@ -1243,7 +1243,7 @@ namespace
     /// answer an empty document, which reads exactly like a fleet with nothing in it.
     /// @param out Appended to.
     /// @param snapshot What to render.
-    /// @param history The window the `kpi` section answers for.
+    /// @param history The window the `kpi` and `series` sections answer for.
     /// @param section Which table.
     void AppendSectionText(std::string& out,
                            FleetSnapshot const& snapshot,
@@ -1276,6 +1276,9 @@ namespace
                 return;
             case FleetSection::Tiers:
                 AppendTierText(out, snapshot);
+                return;
+            case FleetSection::Series:
+                AppendSeriesText(out, history.buckets, history.range);
                 return;
             case FleetSection::Last:
                 break;
@@ -1328,6 +1331,10 @@ std::vector<std::string> FleetColumnNames(FleetSection section, FleetSnapshot co
             }
             return names;
         }
+        case FleetSection::Series:
+            // The bucket arrays and the series, from the tables `AppendSeriesText` walks; not a
+            // `FleetColumn` set, and `tabular` says so.
+            return FleetSeriesColumnNames();
         case FleetSection::Last:
             break;
     }
@@ -1394,6 +1401,10 @@ namespace
                             return ColumnFacts { .format = column.format,
                                                  .decor = CellDecor::Plain,
                                                  .keep = ColumnKeep::Useful };
+                return std::nullopt;
+            case FleetSection::Series:
+                // Raw per-bucket values: a rate is per minute, a share a fraction, a level a count, so no
+                // column of this section has one scale a human surface could apply.
                 return std::nullopt;
             case FleetSection::Last:
                 break;
@@ -1483,10 +1494,14 @@ std::string RenderFleetText(FleetSnapshot const& snapshot,
 
     // Every section: each one behind a marker naming it, blank-line separated. This
     // is the form somebody reads with `curl`, and it is self-describing so that the
-    // keys the `section` parameter accepts can be discovered by asking for none.
+    // keys the `section` parameter accepts can be discovered by asking for none --
+    // except a section whose size is not the fleet's, which is asked for by name
+    // (`FleetSectionRow::inWhole`); the refusal naming the keys lists it.
     bool firstSection = true;
     for (auto const& row: FleetSectionTable)
     {
+        if (!row.inWhole)
+            continue;
         if (!std::exchange(firstSection, false))
             out += '\n';
         out += std::format("# {}\n", row.key);

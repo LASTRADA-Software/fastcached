@@ -301,6 +301,7 @@ enum class FleetSection : std::uint8_t
     Leases,   ///< The oldest outstanding leases, bounded as the page bounds them.
     Members,  ///< What the cluster has agreed, when this node runs one.
     Tiers,    ///< Per-tier cache figures, for the tiers some member runs.
+    Series,   ///< The fleet's history over a range: one row per bucket, one column per series.
     Last,     ///< Not a section, and has no row: the length of a table keyed by one.
 };
 
@@ -326,7 +327,19 @@ struct FleetSectionRow
     /// answer for it — and this column is what lets the coverage test say that in both
     /// directions instead of carrying a silent exception, which is the shape
     /// [#1320](https://github.com/LASTRADA-Software/fastcached/issues/1320) is about.
+    ///
+    /// **False for `Series` too**, for the same kind of reason: the page draws the history as
+    /// charts and the JSON serves it at `FleetSeriesPath`, keyed by series, so neither has a
+    /// table of these columns.
     bool tabular;
+
+    /// Whether the every-section document carries this section.
+    ///
+    /// **False for `Series` alone**, because its size is the RANGE's rather than the fleet's: a
+    /// day is 288 rows and a year 365, whatever the fleet is. The every-section document is what a
+    /// live fleet panel is pushed every second, and what somebody reads with `curl` to learn the
+    /// keys, so it carries the fleet as it is now. The history is asked for by name.
+    bool inWhole;
 };
 
 /// Every section `/fleet.txt` serves, in the order the page presents them.
@@ -341,37 +354,50 @@ inline constexpr EnumTable<FleetSection, FleetSectionRow> FleetSectionTable {
                       .one = "figure",
                       .many = "figures",
                       .summary = "the headline figures, one row each; the page's strip",
-                      .tabular = false },
+                      .tabular = false,
+                      .inWhole = true },
     FleetSectionRow { .section = FleetSection::Machines,
                       .key = "machines",
                       .one = "machine",
                       .many = "machines",
                       .summary = "one row per machine; the grain a fleet total is computed over",
-                      .tabular = true },
+                      .tabular = true,
+                      .inWhole = true },
     FleetSectionRow { .section = FleetSection::Workers,
                       .key = "workers",
                       .one = "worker",
                       .many = "workers",
                       .summary = "one row per (toolchain, endpoint) registry entry",
-                      .tabular = true },
+                      .tabular = true,
+                      .inWhole = true },
     FleetSectionRow { .section = FleetSection::Leases,
                       .key = "leases",
                       .one = "lease",
                       .many = "leases",
                       .summary = "the oldest outstanding leases, bounded as the page bounds them",
-                      .tabular = true },
+                      .tabular = true,
+                      .inWhole = true },
     FleetSectionRow { .section = FleetSection::Members,
                       .key = "members",
                       .one = "member",
                       .many = "members",
                       .summary = "what the cluster has agreed; absent when this node runs none",
-                      .tabular = true },
+                      .tabular = true,
+                      .inWhole = true },
     FleetSectionRow { .section = FleetSection::Tiers,
                       .key = "tiers",
                       .one = "tier",
                       .many = "tiers",
                       .summary = "per-tier cache figures, for the tiers some member runs",
-                      .tabular = true },
+                      .tabular = true,
+                      .inWhole = true },
+    FleetSectionRow { .section = FleetSection::Series,
+                      .key = "series",
+                      .one = "bucket",
+                      .many = "buckets",
+                      .summary = "the history over the range: a row per bucket, a column per series; by name only",
+                      .tabular = false,
+                      .inWhole = false },
 };
 static_assert(RowsInEnumeratorOrder(FleetSectionTable, &FleetSectionRow::section));
 

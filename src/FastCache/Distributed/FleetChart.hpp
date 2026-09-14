@@ -287,6 +287,22 @@ static_assert(RowsInEnumeratorOrder(FleetThemeTable, &FleetThemeRow::theme));
 /// @return An object carrying the range, the bucket starts and each series.
 [[nodiscard]] std::string RenderSeriesJson(std::vector<FleetBucket> const& buckets, FleetRange range);
 
+/// The series text's column names, in the order `AppendSeriesText` writes them: the per-bucket
+/// arrays the JSON carries beside `series`, then one per `FleetSeriesTable` row.
+/// @return The names.
+[[nodiscard]] std::vector<std::string> FleetSeriesColumnNames();
+
+/// Append every series across a range as a tab-separated table: a header row of
+/// `FleetSeriesColumnNames`, then one row per bucket, oldest first.
+///
+/// **The same values `RenderSeriesJson` carries, on their side** (#1390): a terminal has no JSON
+/// parser, and the fleet document's `series` section is this. A value that cannot be known is `-`,
+/// never `0`, exactly as the JSON's `null` -- a restart is a gap, not a spike.
+/// @param out Appended to.
+/// @param buckets The range's buckets.
+/// @param range Which range, for the per-minute rates.
+void AppendSeriesText(std::string& out, std::vector<FleetBucket> const& buckets, FleetRange range);
+
 /// One series folded across a whole range, for a KPI tile.
 ///
 /// Each kind folds the only way that is honest for it: a `Rate` to the **total** it

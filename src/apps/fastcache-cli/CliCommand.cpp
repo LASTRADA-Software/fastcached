@@ -181,6 +181,22 @@ namespace
         };
     }
 
+    /// An applier that takes `--range`'s key into the verb options.
+    ///
+    /// The key is not checked against a table here: the leader refuses one it does not serve,
+    /// naming every one it does. Empty is refused, because on the wire it means the default.
+    /// @return The applier.
+    [[nodiscard]] constexpr auto AssignRange() noexcept
+    {
+        return [](Command& command, std::string_view value) -> std::expected<void, ConfigError> {
+            if (value.empty())
+                return std::unexpected(ArgvError(
+                    ConfigErrorCode::ParseError, {}, "expected a range key such as 24h or 7d; omit the flag for the day"));
+            command.verbOptions.range = std::string { value };
+            return {};
+        };
+    }
+
     /// An applier that parses the AUTH username into the nested credential.
     /// @return The applier.
     [[nodiscard]] constexpr auto AssignUsername() noexcept
@@ -246,9 +262,9 @@ namespace
           .arity = Arity::Value,
           .operand = "=<path>",
           .apply = AssignFrom<&Command::dashboardTokenFile, ParseText>(),
-          .description = "read the dashboard credential `live-stats fleet` presents\n"
-                         "from this file; a leader that names one refuses the fleet\n"
-                         "stream to anybody without it" },
+          .description = "read the dashboard credential `fleet` and `live-stats fleet`\n"
+                         "present from this file; a leader that names one refuses\n"
+                         "the fleet to anybody without it" },
         { .primary = "--user",
           .arity = Arity::Value,
           .operand = "=<name>",
@@ -283,6 +299,12 @@ namespace
           .operand = "=<n>",
           .apply = AssignSamples(),
           .description = "`live-stats`: end after this many samples" },
+        { .primary = "--range",
+          .arity = Arity::Value,
+          .operand = "=<key>",
+          .apply = AssignRange(),
+          .description = "`fleet`: the window the history-derived figures and the\n"
+                         "series are read for, as the leader names it (24h, 7d, ...)" },
         { .primary = "--connect-timeout",
           .arity = Arity::Value,
           .operand = "=<ms>",
@@ -425,6 +447,7 @@ namespace
         { .bit = Modifier::Everything, .flag = "--all", .given = &FlagGiven<&VerbOptions::everything> },
         { .bit = Modifier::Interval, .flag = "--interval", .given = &ValueGiven<&VerbOptions::interval> },
         { .bit = Modifier::Samples, .flag = "--samples", .given = &ValueGiven<&VerbOptions::samples> },
+        { .bit = Modifier::Range, .flag = "--range", .given = &ValueGiven<&VerbOptions::range> },
     });
 
     /// One connection a verb's wire needs, and the word the help calls it.

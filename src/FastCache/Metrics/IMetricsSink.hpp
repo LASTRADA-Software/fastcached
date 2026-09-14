@@ -1245,6 +1245,17 @@ class IMetricsSink
         /// A SUBSCRIBE refused because the listener's in-flight byte budget was full. (#1399)
         LiveSubscriptionsRefusedEndpointBusy,
 
+        /// A FLEET-TEXT refused because its peer is not a fleet member. (#1391)
+        FleetTextRequestsRefusedNotAMember,
+        /// A FLEET-TEXT refused for a missing or wrong dashboard credential. (#1391)
+        FleetTextRequestsRefusedUnauthenticated,
+        /// A FLEET-TEXT whose fields did not decode. (#1391)
+        FleetTextRequestsRefusedMalformed,
+        /// A FLEET-TEXT header that declared more than the control payload it is bounded to. (#1391)
+        FleetTextRequestsRefusedPayloadTooLarge,
+        /// A FLEET-TEXT refused because the listener's in-flight byte budget was full. (#1391)
+        FleetTextRequestsRefusedEndpointBusy,
+
         Last,
     };
 

@@ -20,6 +20,7 @@
 #include "EnrollClient.hpp"
 #include "EnrollmentResponder.hpp"
 #include "EnrollmentWindow.hpp"
+#include "FleetTextResponder.hpp"
 #include "LiveStatsResponder.hpp"
 #include "LiveStatsSources.hpp"
 #include "NodeAnnounce.hpp"
@@ -1221,8 +1222,8 @@ void AdoptAllowlist(Cc::CompileJobRunner& jobs,
     LiveStatsSourceSlot liveSources;
     Node::NodeStatusResponder nodeStatusResponder { nodeStatus, liveSources, membership.Oracle(), metrics };
 
-    // The dashboard credential, read ONCE for the two surfaces that guard the fleet with it:
-    // `/fleet` over HTTP, and the fleet subject of a live-stats subscription over `0xFC`.
+    // The dashboard credential, read ONCE for the surfaces that guard the fleet with it: `/fleet`
+    // over HTTP, and over `0xFC` the fleet subject of a live-stats subscription and `fleet-text`.
     auto dashboardOrRefusal = Node::LoadDashboardCredentialOrExplain(cfg);
     if (!dashboardOrRefusal.has_value())
     {
@@ -1236,6 +1237,10 @@ void AdoptAllowlist(Cc::CompileJobRunner& jobs,
     Node::LiveStatsResponder liveStatsResponder {
         liveSources, membership.Oracle(), dashboardCredential, nodeIo.Reactor(), metrics
     };
+
+    // The fleet document read once (#1391): the same slot, and admitted by the same decision as
+    // the fleet subject of a subscription.
+    Node::FleetTextResponder fleetTextResponder { liveSources, membership.Oracle(), dashboardCredential, metrics };
 
     // The enrollment surface, built only where there is a cluster to be admitted to.
     //
@@ -1272,7 +1277,8 @@ void AdoptAllowlist(Cc::CompileJobRunner& jobs,
                                   .compile = &compileResponder,
                                   .node = &nodeStatusResponder,
                                   .enrollment = AddressOrNull(enrollmentResponder),
-                                  .live = &liveStatsResponder },
+                                  .live = &liveStatsResponder,
+                                  .fleet = &fleetTextResponder },
         activated,
         metrics,
         logger,

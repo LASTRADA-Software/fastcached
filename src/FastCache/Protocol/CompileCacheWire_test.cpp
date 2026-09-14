@@ -2323,3 +2323,68 @@ TEST_CASE("A node runtime record carries the cordon state, and absent is not ser
         CHECK(Unwrap(back).cordon == std::optional { state });
     }
 }
+
+// --- The fleet document, read once (#1391) -----------------------------------
+
+TEST_CASE("The fleet-text wire bytes are pinned and the verb is a request with a reply")
+{
+    // The BYTE, not the symbol, for the reason the constants case above gives.
+    CHECK(static_cast<std::uint8_t>(Op::FleetText) == 0x14);
+    CHECK(static_cast<std::uint8_t>(ErrorCode::UnknownFleetSelector) == 0x25);
+    CHECK(FamilyOf(static_cast<std::uint8_t>(Op::FleetText)) == VerbFamily::Fleet);
+
+    // `Ok | Error` and nothing else, which is why no version moved: an older node answers the
+    // opcode `UnknownOpcode`, and no reader meets a status it does not know.
+    CHECK(IsLegalStatus(Op::FleetText, Status::Ok));
+    CHECK(IsLegalStatus(Op::FleetText, Status::Error));
+    CHECK_FALSE(IsLegalStatus(Op::FleetText, Status::Push));
+    CHECK_FALSE(IsLegalStatus(Op::FleetText, Status::Progress));
+    CHECK_FALSE(IsLegalStatus(Op::FleetText, Status::Miss));
+
+    // The fleet map is behind a credential, so the verb is not reachable before one.
+    CHECK_FALSE(IsPreAuthAllowed(static_cast<std::uint8_t>(Op::FleetText)));
+}
+
+TEST_CASE("A FLEET-TEXT request carries its keys and its token as the words typed")
+{
+    auto const frame =
+        EncodeFleetTextRequest(FleetTextRequest { .section = "series", .range = "7d", .dashboardToken = "t0k" });
+    REQUIRE(frame.size() > RequestHeaderSize);
+    CHECK(frame[2] == static_cast<std::byte>(Op::FleetText));
+
+    auto const payload = std::span { frame }.subspan(RequestHeaderSize);
+    auto const decoded = DecodeFleetTextRequest(payload);
+    REQUIRE(decoded.has_value());
+    CHECK(Unwrap(decoded).section == "series");
+    CHECK(Unwrap(decoded).range == "7d");
+    CHECK(Unwrap(decoded).dashboardToken == "t0k");
+
+    SECTION("a key this build does not serve still decodes, so the leader can refuse it by name")
+    {
+        auto const unknown =
+            EncodeFleetTextRequest(FleetTextRequest { .section = "nope", .range = "1fortnight", .dashboardToken = {} });
+        auto const read = DecodeFleetTextRequest(std::span { unknown }.subspan(RequestHeaderSize));
+        REQUIRE(read.has_value());
+        CHECK(Unwrap(read).section == "nope");
+        CHECK(Unwrap(read).range == "1fortnight");
+    }
+
+    SECTION("empty words are the defaults, not a malformed frame")
+    {
+        auto const defaults = EncodeFleetTextRequest(FleetTextRequest {});
+        auto const read = DecodeFleetTextRequest(std::span { defaults }.subspan(RequestHeaderSize));
+        REQUIRE(read.has_value());
+        CHECK(Unwrap(read).section.empty());
+        CHECK(Unwrap(read).range.empty());
+    }
+
+    SECTION("a payload that is not exactly three fields is refused")
+    {
+        auto const twoFields = WireFields::Encode({ AsBytes("kpi"), AsBytes("1h") });
+        CHECK_FALSE(DecodeFleetTextRequest(twoFields).has_value());
+
+        auto trailing = std::vector<std::byte> { payload.begin(), payload.end() };
+        trailing.push_back(std::byte { 0x00 });
+        CHECK_FALSE(DecodeFleetTextRequest(trailing).has_value());
+    }
+}

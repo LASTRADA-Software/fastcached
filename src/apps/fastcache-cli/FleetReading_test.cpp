@@ -216,12 +216,6 @@ TEST_CASE("a piped fleet record is the newest reading's KPI strip, with its sour
     CHECK(empty.fields[0].value.kind == CellKind::Absent);
 }
 
-TEST_CASE("an admin fetch's failure is one outcome for every reader", "[cli][fleet][reading]")
-{
-    CHECK(OutcomeOf(AdminFailure::Refused) == Outcome::Refused);
-    CHECK(OutcomeOf(AdminFailure::Unreachable) == Outcome::Unreachable);
-}
-
 namespace
 {
 

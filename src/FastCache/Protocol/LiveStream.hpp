@@ -13,6 +13,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <expected>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -212,6 +213,36 @@ struct LiveLeadership
     std::string leaderEndpoint; ///< Where the leader answers, or empty during an election.
 };
 
+/// Why a fleet read was answered with no document.
+///
+/// **A PRIVATE enum**, for `PushOutcome`'s reason: nothing transmits it, and each surface maps it
+/// to a wire code of its own.
+enum class FleetTextRefusal : std::uint8_t
+{
+    /// This process has no fleet to read: it runs no scheduler, or it is stopping and its sources
+    /// are detached.
+    NoFleet,
+    /// A section or a range named nothing this build serves.
+    UnknownSelector,
+};
+
+/// A fleet read that produced no document, and the words that say why.
+struct FleetTextDeclined
+{
+    FleetTextRefusal refusal { FleetTextRefusal::NoFleet }; ///< Why.
+    std::string detail {};                                  ///< For a person; for `UnknownSelector`, what this build serves.
+};
+
+/// The fleet document for one selection, and whose view of the fleet it is.
+struct FleetTextDocument
+{
+    /// Whether the node that rendered it leads. Read from the snapshot the body was rendered from,
+    /// so a document and the leadership it is judged by cannot straddle an election.
+    bool leads { false };
+    std::string leaderEndpoint {}; ///< Where the leader answers, or empty during an election.
+    std::string body {};           ///< `RenderFleetText`'s document.
+};
+
 /// What a live-stats stream reads.
 ///
 /// A seam because every answer is ambient -- the counters, the storage, the registry, the
@@ -237,6 +268,18 @@ class ILiveStatsSources
 
     /// @return The address this process's `0xFC` surface answers on, for the dashboard's source line.
     [[nodiscard]] virtual std::string AnsweringEndpoint() const = 0;
+
+    /// Render the fleet document once, for one selection (#1391).
+    ///
+    /// On a compile node this is `Node::AnswerFleetText`, the function `/fleet.txt` answers from,
+    /// so the `fleet-text` verb and the route have one renderer by construction. Here rather than
+    /// on a seam of its own because its sources are the fleet's, which a node builds after its
+    /// `0xFC` surface is listening -- the reason this interface has a slot.
+    /// @param section A section key, or empty for every whole-document section.
+    /// @param range A range key, or empty for the default day.
+    /// @return The document, or why there is none.
+    [[nodiscard]] virtual std::expected<FleetTextDocument, FleetTextDeclined> FleetText(std::string_view section,
+                                                                                        std::string_view range) const = 0;
 };
 
 /// The sources a live stream reads, attached once they exist and detached before they go.
@@ -300,6 +343,10 @@ class LiveStatsSourceSlot final: public ILiveStatsSources
     /// @copydoc ILiveStatsSources::AnsweringEndpoint
     [[nodiscard]] std::string AnsweringEndpoint() const override;
 
+    /// @copydoc ILiveStatsSources::FleetText
+    [[nodiscard]] std::expected<FleetTextDocument, FleetTextDeclined> FleetText(std::string_view section,
+                                                                                std::string_view range) const override;
+
   private:
     mutable std::shared_mutex _mutex;
     ILiveStatsSources const* _sources { nullptr };
@@ -332,6 +379,17 @@ class CacheLiveStatsSources final: public ILiveStatsSources
     [[nodiscard]] std::string AnsweringEndpoint() const override
     {
         return _endpoint;
+    }
+
+    /// @copydoc ILiveStatsSources::FleetText
+    ///
+    /// No fleet. Unreachable in the daemon, which refuses the verb by name (`RelocatedVerbs`)
+    /// before any source is asked; answered rather than left to a caller to assume.
+    [[nodiscard]] std::expected<FleetTextDocument, FleetTextDeclined> FleetText(std::string_view /*section*/,
+                                                                                std::string_view /*range*/) const override
+    {
+        return std::unexpected(FleetTextDeclined { .refusal = FleetTextRefusal::NoFleet,
+                                                   .detail = "this process is a cache and serves no fleet" });
     }
 
   private:

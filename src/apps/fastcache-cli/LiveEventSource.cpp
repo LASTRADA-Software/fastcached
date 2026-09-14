@@ -5,9 +5,7 @@
 #include <FastCache/Async/AsyncQueue.hpp>
 #include <FastCache/Async/DeadlineTimer.hpp>
 #include <FastCache/Async/ResumeOn.hpp>
-#include <FastCache/Core/HostPort.hpp>
 #include <FastCache/Core/Ranges.hpp>
-#include <FastCache/Protocol/LeaderRedirect.hpp>
 
 #include <atomic>
 #include <cassert>
@@ -280,8 +278,7 @@ namespace
             return {};
         if (request.subject != Wire::LiveSubject::Fleet)
             return "; present the credential with --token-file";
-        return request.dashboardToken.empty() ? "; present the dashboard credential with --dashboard-token-file"
-                                              : "; the dashboard credential from --dashboard-token-file was not accepted";
+        return DashboardCredentialRemedy(!request.dashboardToken.empty());
     }
 
     /// A stream's failure, named by where it was: `<endpoint>: <why>`.
@@ -312,20 +309,24 @@ namespace
     [[nodiscard]] StreamEnd Refused(LiveEventSource::State* state, TimePoint at, LiveFrame const& frame, Endpoint* where)
     {
         auto const code = frame.code.value_or(Wire::ErrorCode::MalformedFrame);
-        if (auto const leader = LeaderRedirectTarget(code, frame.note); leader.has_value())
+        // `DecideLeaderHop`, the rule `fleet` follows too. A failed subscription is a gap, and the next
+        // attempt starts again at `--addr`.
+        auto const hop = DecideLeaderHop(code, frame.note, state->redirects);
+        switch (hop.kind)
         {
-            auto const parsed = ParseDialEndpoint(*leader);
-            if (parsed.has_value() && ++state->redirects <= MaxLeaderRedirects)
-            {
-                *where = Endpoint { .host = parsed->first, .port = parsed->second };
+            case LeaderHopKind::Follow:
+                ++state->redirects;
+                *where = hop.next;
                 return StreamEnd::Follow;
-            }
-            state->DeliverFailure(at,
-                                  Outcome::Unreachable,
-                                  std::format("followed {} leader redirects without a stream; the last named {}",
-                                              MaxLeaderRedirects,
-                                              *leader));
-            return StreamEnd::Retry;
+            case LeaderHopKind::Exhausted:
+                state->DeliverFailure(at,
+                                      Outcome::Unreachable,
+                                      std::format("followed {} leader redirects without a stream; the last named {}",
+                                                  MaxLeaderRedirects,
+                                                  hop.named));
+                return StreamEnd::Retry;
+            case LeaderHopKind::NotARedirect:
+                break;
         }
 
         auto const* const row =

@@ -70,6 +70,8 @@ add_executable(fastcache-compile-node
     NodeStatusResponder.cpp
     LiveStatsResponder.cpp
     LiveStatsSources.cpp
+    FleetReadGate.cpp
+    FleetTextResponder.cpp
     ${_fc_node_shared}
 )
 target_include_directories(fastcache-compile-node PRIVATE
@@ -159,9 +161,13 @@ if(FASTCACHED_BUILD_TESTS)
         NodeStatusResponder.cpp
         LiveStatsResponder.cpp
         LiveStatsSources.cpp
+        FleetReadGate.cpp
+        FleetTextResponder.cpp
         CompileResponder_test.cpp
         NodeStatusResponder_test.cpp
         LiveStatsResponder_test.cpp
+        FleetReadGate_test.cpp
+        FleetTextResponder_test.cpp
         DocumentedCommandLines_test.cpp
         ${_fc_node_shared}
         # The CLI's reading of a `NodeMetrics` body and of a `/metrics` one, compiled in for the

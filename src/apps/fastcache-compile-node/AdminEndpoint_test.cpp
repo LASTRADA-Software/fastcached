@@ -30,6 +30,7 @@
 #include <string>
 #include <string_view>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 #include <tests/FleetHistoryFakes.hpp>
@@ -1495,6 +1496,94 @@ TEST_CASE("An unknown section is refused rather than quietly served as another",
         // The named section alone, with no marker: a marker would be one more thing
         // every `cut` and `awk` reading this has to know to skip.
         CHECK_FALSE(served.body.contains("# "));
+    }
+}
+
+TEST_CASE("The series section answers the history for the range asked, and only when asked by name",
+          "[node][admin][dashboard]")
+{
+    // #1390. WHAT DISTINGUISHES: `section=series` is one row per bucket of the RANGE asked -- a
+    // different count for every range, so a section that ignored `range` fails all but one -- and
+    // the leader's own sampled history rather than an empty table, since the fixture's readings
+    // make a `dispatched` rate; while the every-section document carries no `# series` marker at all.
+    ChartFixture const fixture;
+
+    for (auto const& range: Distributed::FleetRangeTable)
+    {
+        INFO("range " << range.key);
+        auto const served = fixture.Get("/fleet.txt", std::format("section=series&range={}", range.key));
+        REQUIRE(served.status == "200 OK");
+        auto const rows = std::ranges::count(served.body, '\n');
+        CHECK(std::cmp_equal(rows, 1 + range.points));
+        CHECK(served.body.starts_with("start\tcoverage\tbackfilled\t"));
+    }
+
+    // Some bucket of the day holds a `dispatched` reading -- a rate, zero or not -- where a table of
+    // nothing but dashes is what a section rendered without the leader's history would be.
+    auto const names = Distributed::FleetSeriesColumnNames();
+    auto const column = std::ranges::find(names, std::string { "dispatched" });
+    REQUIRE(column != names.end());
+    auto const index = static_cast<std::size_t>(std::distance(names.begin(), column));
+    auto const day = fixture.Get("/fleet.txt", "section=series&range=24h").body;
+    auto readings = std::size_t { 0 };
+    for (auto const line: day | std::views::split('\n') | std::views::drop(1))
+    {
+        auto cells = std::vector<std::string> {};
+        for (auto const cell: line | std::views::split('\t'))
+            cells.emplace_back(cell.begin(), cell.end());
+        if (cells.size() == names.size() && cells[index] != "-")
+            ++readings;
+    }
+    CHECK(readings > 0);
+
+    CHECK_FALSE(fixture.Get("/fleet.txt").body.contains("# series\n"));
+    CHECK(fixture.Get("/fleet.txt", "section=series&range=nonesuch").status == "400 Bad Request");
+}
+
+TEST_CASE("The fleet document for a selection refuses an unknown key by name and is judged by its own snapshot",
+          "[node][admin][fleettext]")
+{
+    // #1391. `AnswerFleetText` is what `/fleet.txt` and the `fleet-text` verb both answer from, so
+    // what is asserted here is asserted of both doors -- by there being one function, not by
+    // comparing what two of them said.
+    Distributed::FleetSnapshot snapshot;
+    snapshot.role = Distributed::SchedulerRole::Follower;
+    snapshot.leaderEndpoint = "10.0.0.2:6674";
+
+    SECTION("an unknown section is refused with every section this build serves")
+    {
+        auto const refused = AnswerFleetText(snapshot, nullptr, "nonesuch", {});
+        REQUIRE_FALSE(refused.has_value());
+        CHECK(refused.error().refusal == FleetTextRefusal::UnknownSelector);
+        CHECK(refused.error().detail.starts_with("unknown section"));
+        for (auto const& row: Distributed::FleetSectionTable)
+            CHECK(refused.error().detail.contains(row.key));
+    }
+
+    SECTION("an unknown range is refused even for a section that draws no history")
+    {
+        auto const refused = AnswerFleetText(snapshot, nullptr, "members", "1fortnight");
+        REQUIRE_FALSE(refused.has_value());
+        CHECK(refused.error().refusal == FleetTextRefusal::UnknownSelector);
+        CHECK(refused.error().detail.starts_with("unknown range"));
+        for (auto const& row: Distributed::FleetRangeTable)
+            CHECK(refused.error().detail.contains(row.key));
+    }
+
+    SECTION("a document says whose view it is, from the snapshot it was rendered from")
+    {
+        auto const following = AnswerFleetText(snapshot, nullptr, "series", "1h");
+        REQUIRE(following.has_value());
+        CHECK_FALSE(following->leads);
+        CHECK(following->leaderEndpoint == "10.0.0.2:6674");
+        // A follower's document is no table at all, whatever section was named.
+        CHECK(following->body.starts_with("# this node does not lead the fleet"));
+
+        snapshot.role = Distributed::SchedulerRole::Leader;
+        auto const leading = AnswerFleetText(snapshot, nullptr, "series", "1h");
+        REQUIRE(leading.has_value());
+        CHECK(leading->leads);
+        CHECK(leading->body.starts_with("start\tcoverage\tbackfilled\t"));
     }
 }
 

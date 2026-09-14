@@ -100,6 +100,16 @@ class CapturedReadings final: public ILiveStatsSources
         return "n1.test:6674";
     }
 
+    /// @copydoc ILiveStatsSources::FleetText
+    ///
+    /// No fleet: `NodeMetrics` reads a node's own tier, and a case here that reached the fleet
+    /// document would be asserting something this responder never renders.
+    [[nodiscard]] std::expected<FleetTextDocument, FleetTextDeclined> FleetText(std::string_view /*section*/,
+                                                                                std::string_view /*range*/) const override
+    {
+        return std::unexpected(FleetTextDeclined { .refusal = FleetTextRefusal::NoFleet, .detail = {} });
+    }
+
     /// Detach the sources, as a node does once it is stopping: every capture after this answers nothing.
     void Detach() noexcept
     {

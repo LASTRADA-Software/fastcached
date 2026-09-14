@@ -9,8 +9,10 @@
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Server/AdminHttpServer.hpp>
 
+#include <expected>
 #include <optional>
 #include <string>
+#include <string_view>
 
 namespace FastCache::Node
 {
@@ -48,8 +50,10 @@ struct NodeLiveStatsParts
 /// - **Cache:** one `EncodeStatsReading` of `CaptureStatsReading(metrics, snapshot())` -- the
 ///   reading `RenderPrometheus` renders `/metrics` from, so the binary and the text are one read.
 /// - **Node:** that reading, then `EncodeNodeStatus(identity->Describe())`, as two fields.
-/// - **Fleet:** `RenderFleetText(CollectFleet(...), <the Day view>, all sections)`, byte for byte
-///   what `/fleet.txt` serves with no parameters.
+/// - **Fleet:** `AnswerFleetText` with no section and no range, the function `/fleet.txt` answers
+///   from -- so byte for byte what that route serves with no parameters.
+///
+/// `FleetText` is that same function for the selection a `fleet-text` request names.
 class NodeLiveStatsSources final: public ILiveStatsSources
 {
   public:
@@ -67,6 +71,10 @@ class NodeLiveStatsSources final: public ILiveStatsSources
     {
         return _parts.endpoint;
     }
+
+    /// @copydoc ILiveStatsSources::FleetText
+    [[nodiscard]] std::expected<FleetTextDocument, FleetTextDeclined> FleetText(std::string_view section,
+                                                                                std::string_view range) const override;
 
   private:
     NodeLiveStatsParts _parts;

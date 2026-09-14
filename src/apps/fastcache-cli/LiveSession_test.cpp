@@ -1594,26 +1594,6 @@ struct RunningSeat
     };
 }
 
-/// An admin surface that counts what it is asked and answers nothing.
-class CountingAdmin final: public IAdminDocument
-{
-  public:
-    [[nodiscard]] std::expected<std::string, AdminError> FetchAdmin(std::string_view /*path*/) override
-    {
-        ++_fetches;
-        return std::unexpected(AdminError { .kind = AdminFailure::Unreachable, .detail = "not scripted" });
-    }
-
-    /// @return How many documents were asked for.
-    [[nodiscard]] int Fetches() const noexcept
-    {
-        return _fetches;
-    }
-
-  private:
-    int _fetches { 0 };
-};
-
 /// A cache daemon, as the identification describes one.
 /// @return The identification.
 [[nodiscard]] EndpointIdentity CacheDaemon()
@@ -1864,14 +1844,12 @@ TEST_CASE("a live-stats session reaches its endpoint only through its subscripti
     auto memcached = ScriptedMemcachedExchange { {} };
     auto node = ScriptedNodeExchange { {} };
     auto ladder = ScriptedGatherer { {} };
-    auto admin = CountingAdmin {};
 
     auto context = SessionContext({}, 2, &identity);
     context.resp = &resp;
     context.memcached = &memcached;
     context.node = &node;
     context.stats = &ladder;
-    context.admin = &admin;
 
     auto const ending = seat.Run(context);
 
@@ -1882,7 +1860,6 @@ TEST_CASE("a live-stats session reaches its endpoint only through its subscripti
     CHECK(memcached.Sent().empty());
     CHECK(node.Sent().empty());
     CHECK(ladder.Calls() == 0);
-    CHECK(admin.Fetches() == 0);
 }
 
 #if !defined(_WIN32)
