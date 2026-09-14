@@ -174,3 +174,28 @@ TEST_CASE("A snapshot replaces, and an unreadable one changes nothing", "[cluste
         CHECK(watched.machine.State() == before);
     }
 }
+
+TEST_CASE("A snapshot another build encoded is refused by its version and changes nothing", "[cluster][statemachine]")
+{
+    // The unreadable-snapshot rule above, for the cause an upgrade produces. Kept rather
+    // than cleared for the same reason, and the log line names the version: *cannot
+    // decode* alone reads as damage, and sends an operator after a snapshot that is intact.
+    CapturingLogger logger;
+    ClusterStateMachine machine { logger, {} };
+    machine.Apply(Entry(1, Cmd(CommandKind::AddMember, "n1", "10.0.0.1:6675")));
+    auto const before = machine.State();
+
+    ClusterState other;
+    Apply(other, Cmd(CommandKind::AddMember, "n3", "10.0.0.3:6675"));
+    auto snapshot = Encode(other);
+    // The state's version is the first field's only byte, after its u32 length prefix.
+    REQUIRE(snapshot.size() > 4);
+    snapshot[4] = std::byte { 2 };
+    machine.RestoreSnapshot(snapshot);
+
+    CHECK(machine.State() == before);
+    auto const records = logger.Snapshot();
+    CHECK(std::ranges::any_of(records, [](auto const& record) {
+        return record.message.contains("cannot decode") && record.message.contains("version 2");
+    }));
+}

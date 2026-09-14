@@ -4,8 +4,11 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <array>
+#include <cstddef>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <tests/Unwrap.hpp>
@@ -248,7 +251,7 @@ TEST_CASE("A command round-trips, and an unknown verb is refused", "[cluster][st
     auto const original = Cmd(CommandKind::SetSetting, "lease-lifetime", "1200000");
     auto const decoded = DecodeCommand(Encode(original));
     REQUIRE(decoded.has_value());
-    CHECK(Unwrap(decoded) == original);
+    CHECK(*decoded == original);
 
     // A verb byte this build does not know is refused rather than applied as
     // whichever enumerator it happens to alias -- which would change the cluster's
@@ -257,10 +260,14 @@ TEST_CASE("A command round-trips, and an unknown verb is refused", "[cluster][st
     // The verb sits in the second byte of the first field, after that field's u32
     // length prefix.
     bytes[5] = static_cast<std::byte>(0xEE);
-    CHECK_FALSE(DecodeCommand(bytes).has_value());
+    auto const unknown = DecodeCommand(bytes);
+    REQUIRE_FALSE(unknown.has_value());
+    CHECK(unknown.error().code == ConsensusErrorCode::UnknownMessageType);
 
-    // And a payload that is not a command at all.
-    CHECK_FALSE(DecodeCommand({}).has_value());
+    // And a payload that is not a command at all, said as damage rather than as another build.
+    auto const empty = DecodeCommand({});
+    REQUIRE_FALSE(empty.has_value());
+    CHECK(empty.error().code == ConsensusErrorCode::MalformedFrame);
 }
 
 TEST_CASE("A whole state round-trips, members and settings apart", "[cluster][state][wire]")
@@ -276,16 +283,16 @@ TEST_CASE("A whole state round-trips, members and settings apart", "[cluster][st
 
     auto const restored = DecodeState(Encode(state));
     REQUIRE(restored.has_value());
-    CHECK(Unwrap(restored) == state);
-    CHECK(Unwrap(restored).members.size() == 2);
-    CHECK(Unwrap(restored).settings.size() == 1);
+    CHECK(*restored == state);
+    CHECK(restored->members.size() == 2);
+    CHECK(restored->settings.size() == 1);
 
     // An empty state is a legitimate one -- a cluster that has agreed nothing yet --
     // and must survive the round trip rather than being read as malformed.
     ClusterState const empty;
     auto const emptyBack = DecodeState(Encode(empty));
     REQUIRE(emptyBack.has_value());
-    CHECK(Unwrap(emptyBack) == empty);
+    CHECK(*emptyBack == empty);
 }
 
 TEST_CASE("A truncated snapshot is refused rather than half-read", "[cluster][state][wire]")
@@ -299,13 +306,155 @@ TEST_CASE("A truncated snapshot is refused rather than half-read", "[cluster][st
     auto bytes = Encode(state);
     REQUIRE(bytes.size() > 8);
     bytes.resize(bytes.size() - 4);
-    CHECK_FALSE(DecodeState(bytes).has_value());
+    auto const truncated = DecodeState(bytes);
+    REQUIRE_FALSE(truncated.has_value());
+    // Damage, and said as damage: the version byte is intact, so *another build wrote
+    // this* would send an operator to upgrade a machine whose snapshot is broken.
+    CHECK(truncated.error().code == ConsensusErrorCode::MalformedFrame);
 
     // A member count larger than the pairs present is the same fault reached by a
     // different route, and must fail the same way.
     auto overcounted = Encode(state);
     overcounted[8] = static_cast<std::byte>(0xFF);
-    CHECK_FALSE(DecodeState(overcounted).has_value());
+    auto const miscounted = DecodeState(overcounted);
+    REQUIRE_FALSE(miscounted.has_value());
+    CHECK(miscounted.error().code == ConsensusErrorCode::MalformedFrame);
+}
+
+TEST_CASE("A state another build encoded is refused by its version while a command keeps its own", "[cluster][state][wire]")
+{
+    // #1340 added a field to every member, so the state's version moved -- and the
+    // byte is pinned as well as the refusal, because a symbol both ends spell can
+    // only test the NAME of a wire constant. The version is the first field's only
+    // byte, after that field's u32 length prefix.
+    ClusterState state;
+    Apply(state, Cmd(CommandKind::AddMember, "n1", "10.0.0.1:6675", "10.0.0.1:7000"));
+    auto bytes = Encode(state);
+    REQUIRE(bytes.size() > 4);
+    CHECK(bytes[4] == std::byte { 3 });
+
+    // What the previous build wrote. Refused BY NAME, both versions stated, and never
+    // as `MalformedFrame`: those bytes are intact, and *damaged* is what gets a healthy
+    // snapshot deleted.
+    bytes[4] = std::byte { 2 };
+    auto const older = DecodeState(bytes);
+    REQUIRE_FALSE(older.has_value());
+    CHECK(older.error().code == ConsensusErrorCode::UnsupportedVersion);
+    CHECK(older.error().context.contains("version 2"));
+    CHECK(older.error().context.contains("reads 3"));
+
+    // The COMMAND layout did not change, so its version must not have either. A
+    // committed entry this build cannot decode is skipped, so moving this byte with the
+    // state's would make a node restarting onto its own log skip every entry in it.
+    auto command = Encode(Cmd(CommandKind::AddMember, "n1", "10.0.0.1:6675", "10.0.0.1:7000"));
+    REQUIRE(command.size() > 4);
+    CHECK(command[4] == std::byte { 2 });
+
+    // And a command another build encoded is refused by ITS version, by name, never as damage.
+    command[4] = std::byte { 3 };
+    auto const newer = DecodeCommand(command);
+    REQUIRE_FALSE(newer.has_value());
+    CHECK(newer.error().code == ConsensusErrorCode::UnsupportedVersion);
+    CHECK(newer.error().context.contains("command encoding version 3"));
+    CHECK(newer.error().context.contains("reads 2"));
+}
+
+TEST_CASE("A member's scheduler endpoint says whether it was never announced or cleared by a re-admit", "[cluster][state]")
+{
+    // #1340. Both states carry an empty endpoint, and that is right: a re-admit
+    // applies wholesale because a node that moved moved both ports. What tells them
+    // apart is what the member had BEFORE -- asserted on both sides of each pair,
+    // because a case rendering only one of them passes under the defect.
+    ClusterState state;
+    Apply(state, Cmd(CommandKind::AddMember, "quiet", "10.0.0.1:6675"));
+    Apply(state, Cmd(CommandKind::AddMember, "led", "10.0.0.2:6675", "10.0.0.2:7000"));
+
+    auto const stateOf = [&state](std::string_view id) {
+        auto const it = std::ranges::find(state.members, id, &ClusterMember::id);
+        REQUIRE(it != state.members.end());
+        return SchedulerEndpointStateOf(*it);
+    };
+
+    CHECK(stateOf("quiet") == SchedulerEndpointState::NeverAnnounced);
+    CHECK(stateOf("led") == SchedulerEndpointState::Announced);
+
+    // The recovery path's re-approval, through the verb `ClusterAdmit` sends: the
+    // endpoint goes, and the member says it went.
+    Apply(state, Cmd(CommandKind::AddMember, "led", "10.0.0.2:6675"));
+    Apply(state, Cmd(CommandKind::AddMember, "quiet", "10.0.0.1:6675"));
+    CHECK_FALSE(state.SchedulerEndpointOf("led").has_value());
+    CHECK_FALSE(state.SchedulerEndpointOf("quiet").has_value());
+    CHECK(stateOf("led") == SchedulerEndpointState::Cleared);
+    CHECK(stateOf("quiet") == SchedulerEndpointState::NeverAnnounced);
+
+    // A second re-admit -- the move after the recovery -- is still a cleared endpoint,
+    // not a member that has never said.
+    Apply(state, Cmd(CommandKind::AddMember, "led", "10.0.0.9:6675"));
+    CHECK(stateOf("led") == SchedulerEndpointState::Cleared);
+
+    // Announcing again is announced, and the next re-admit clears it again.
+    Apply(state, Cmd(CommandKind::AddMember, "led", "10.0.0.9:6675", "10.0.0.9:7000"));
+    CHECK(stateOf("led") == SchedulerEndpointState::Announced);
+
+    // A forget is a positive act, so an id admitted from absence has announced nothing
+    // -- whatever an earlier member of that name once did.
+    Apply(state, Cmd(CommandKind::RemoveMember, "led"));
+    Apply(state, Cmd(CommandKind::AddMember, "led", "10.0.0.9:6675"));
+    CHECK(stateOf("led") == SchedulerEndpointState::NeverAnnounced);
+
+    // And the three spellings are three, so no renderer reading the table can print
+    // two of them alike.
+    CHECK(SchedulerEndpointStateTable[static_cast<std::size_t>(SchedulerEndpointState::NeverAnnounced)].name
+          != SchedulerEndpointStateTable[static_cast<std::size_t>(SchedulerEndpointState::Cleared)].name);
+    CHECK(SchedulerEndpointStateTable[static_cast<std::size_t>(SchedulerEndpointState::Announced)].name
+          != SchedulerEndpointStateTable[static_cast<std::size_t>(SchedulerEndpointState::Cleared)].name);
+}
+
+TEST_CASE("A cleared scheduler endpoint survives a snapshot as cleared", "[cluster][state][wire]")
+{
+    // A snapshot is how a follower that fell behind learns the state, and a history
+    // the encoder dropped would turn every cleared member back into one that never
+    // announced -- the reporting defect, reintroduced one hop from where it was fixed.
+    ClusterState state;
+    Apply(state, Cmd(CommandKind::AddMember, "cleared", "10.0.0.1:6675", "10.0.0.1:7000"));
+    Apply(state, Cmd(CommandKind::AddMember, "cleared", "10.0.0.1:6675"));
+    Apply(state, Cmd(CommandKind::AddMember, "quiet", "10.0.0.2:6675"));
+    Apply(state, Cmd(CommandKind::SetSetting, "fleet-open", "1"));
+
+    auto const restored = DecodeState(Encode(state));
+    REQUIRE(restored.has_value());
+    CHECK(*restored == state);
+    REQUIRE(restored->members.size() == 2);
+    CHECK(SchedulerEndpointStateOf(restored->members[0]) == SchedulerEndpointState::Cleared);
+    CHECK(SchedulerEndpointStateOf(restored->members[1]) == SchedulerEndpointState::NeverAnnounced);
+    CHECK(restored->settings.size() == 1);
+}
+
+TEST_CASE("A snapshot whose scheduler endpoint history cannot be true is refused", "[cluster][state][wire]")
+{
+    // An endpoint with no announcement behind it is the one combination `Apply` never
+    // produces, and reading it would leave every renderer choosing which half to
+    // believe.
+    ClusterState const contradictory { .members = { ClusterMember { .id = "n1",
+                                                                    .raftEndpoint = "10.0.0.1:6675",
+                                                                    .schedulerEndpoint = "10.0.0.1:7000",
+                                                                    .schedulerEndpointHistory =
+                                                                        SchedulerEndpointHistory::NeverAnnounced } },
+                                       .settings = {} };
+    auto const refused = DecodeState(Encode(contradictory));
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error().code == ConsensusErrorCode::MalformedFrame);
+
+    // A history byte naming no history. With one member and no settings the byte is
+    // the encoding's last.
+    ClusterState quiet;
+    Apply(quiet, Cmd(CommandKind::AddMember, "n1", "10.0.0.1:6675"));
+    auto bytes = Encode(quiet);
+    REQUIRE(DecodeState(bytes).has_value());
+    bytes.back() = static_cast<std::byte>(EnumeratorCount<SchedulerEndpointHistory>);
+    auto const unknown = DecodeState(bytes);
+    REQUIRE_FALSE(unknown.has_value());
+    CHECK(unknown.error().code == ConsensusErrorCode::MalformedFrame);
 }
 
 TEST_CASE("Endpoints come back in the order a membership oracle wants", "[cluster][state]")
@@ -384,9 +533,9 @@ TEST_CASE("A member's two endpoints survive a snapshot apart", "[cluster][state]
 
     auto const restored = DecodeState(Encode(state));
     REQUIRE(restored.has_value());
-    CHECK(Unwrap(restored) == state);
-    CHECK(Unwrap(restored).members.size() == 2);
-    CHECK(Unwrap(restored).settings.size() == 2);
+    CHECK(*restored == state);
+    CHECK(restored->members.size() == 2);
+    CHECK(restored->settings.size() == 2);
 }
 
 TEST_CASE("An AddMember round-trips both of its endpoints", "[cluster][state][wire]")
@@ -396,7 +545,7 @@ TEST_CASE("An AddMember round-trips both of its endpoints", "[cluster][state][wi
     auto const original = Cmd(CommandKind::AddMember, "n7", "10.0.0.7:6675", "10.0.0.7:7000");
     auto const decoded = DecodeCommand(Encode(original));
     REQUIRE(decoded.has_value());
-    CHECK(Unwrap(decoded) == original);
+    CHECK(*decoded == original);
 }
 
 TEST_CASE("A peer is an identity and an address, in one token", "[cluster][state]")

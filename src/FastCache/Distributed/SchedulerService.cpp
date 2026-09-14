@@ -539,7 +539,9 @@ SchedulerReply SchedulerService::ClusterAdmit(CallerContext const& caller,
     // re-admitting a member that has moved clears whatever it had announced, and it
     // announces the new one on its next election. That is the right way round: a
     // node that moved has moved both ports, and keeping the old scheduler endpoint
-    // would redirect clients to an address that member no longer answers.
+    // would redirect clients to an address that member no longer answers. The member
+    // still records that it HAD one, so a report says *cleared* rather than *never
+    // announced* (#1340) -- which `Apply` derives, so this command carries nothing more.
     auto const command = Cluster::Command { .kind = Cluster::CommandKind::AddMember,
                                             .key = std::string { memberId },
                                             .value = std::string { raftEndpoint },

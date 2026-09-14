@@ -29,8 +29,10 @@ void ClusterStateMachine::Apply(Consensus::AppliedEntry const& entry)
         // It is reachable only from a peer running a build whose command format this
         // one does not know, which `Validate` cannot prevent because it runs on the
         // proposer.
-        _logger.Logf(
-            LogLevel::Error, "cluster: entry {} carries a command this build cannot decode; skipping it", entry.index.value);
+        _logger.Logf(LogLevel::Error,
+                     "cluster: entry {} carries a command this build cannot decode ({}); skipping it",
+                     entry.index.value,
+                     command.error().context);
         return;
     }
 
@@ -65,7 +67,13 @@ void ClusterStateMachine::RestoreSnapshot(std::span<std::byte const> state)
         // holds with nothing would turn "I cannot read your state" into "the cluster
         // has no members" -- after which this node would refuse every peer it had
         // been serving a moment earlier.
-        _logger.Logf(LogLevel::Error, "cluster: a snapshot arrived that this build cannot decode; keeping current state");
+        //
+        // The reason is named, because the two causes send an operator to different
+        // places: another build's encoding (both versions stated) is an upgrade still
+        // in progress, and bytes that are not a state at all are damage.
+        _logger.Logf(LogLevel::Error,
+                     "cluster: a snapshot arrived that this build cannot decode ({}); keeping current state",
+                     restored.error().context);
         return;
     }
 

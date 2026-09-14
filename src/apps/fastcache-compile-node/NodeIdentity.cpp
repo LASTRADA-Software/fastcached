@@ -270,7 +270,11 @@ void ApplyNodeIdentity(NodeConfig& cfg, NodeIdentity const& identity)
     // scheduler port it will ANNOUNCE is the one its listener actually binds, and that
     // is not known until it has bound. `ConsensusTier::Start` fills it in when this
     // node announces its own record, exactly as it does for a typed `--raft-peer`.
-    cfg.raftPeers.push_back(Cluster::ClusterMember { .id = identity.id, .raftEndpoint = endpoint, .schedulerEndpoint = {} });
+    cfg.raftPeers.push_back(
+        Cluster::ClusterMember { .id = identity.id,
+                                 .raftEndpoint = endpoint,
+                                 .schedulerEndpoint = {},
+                                 .schedulerEndpointHistory = Cluster::SchedulerEndpointHistory::NeverAnnounced });
 }
 
 } // namespace FastCache::Node

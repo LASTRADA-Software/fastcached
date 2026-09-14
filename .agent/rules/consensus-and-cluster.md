@@ -986,8 +986,10 @@ and it is recorded here because the question will be asked again.
 - **[#144](https://github.com/LASTRADA-Software/fastcached/issues/144)** — a
   follower answering `/fleet` names the leader but cannot link to it, because
   where a dashboard is served is local configuration and any URL it built would be
-  a guess. A third recorded endpoint was priced and refused: `StateVersion` is
-  checked on decode, so a field makes every existing snapshot and log entry
-  undecodable. It stays open because the trigger is natural — whenever
-  `ClusterState` next bumps for a reason that carries the migration on its own,
-  this rides along.
+  a guess. A third recorded endpoint was priced and refused: a node ANNOUNCES it, so
+  it rides in `AddMember` and moves `CommandVersion` — every existing log entry
+  becomes undecodable, and a committed entry that will not decode is skipped — as
+  well as `StateVersion`, which every snapshot carries. It stays open because the
+  trigger is natural — whenever the COMMAND format next bumps for a reason that
+  carries the migration on its own, this rides along. `StateVersion` moving alone is
+  not that trigger: #1340 moved it for a fact `Apply` derives, which no command carries.

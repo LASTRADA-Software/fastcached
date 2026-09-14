@@ -43,27 +43,45 @@ std::optional<ClusterMember> ParseMemberSpec(std::string_view spec)
     // types about a PEER could supply it -- the node announces its own. Saying so
     // with `{}` rather than leaving it out is what keeps a field added to the
     // middle of the struct from becoming a silent zero here.
-    return ClusterMember { .id = std::string { id }, .raftEndpoint = std::string { endpoint }, .schedulerEndpoint = {} };
+    return ClusterMember { .id = std::string { id },
+                           .raftEndpoint = std::string { endpoint },
+                           .schedulerEndpoint = {},
+                           .schedulerEndpointHistory = SchedulerEndpointHistory::NeverAnnounced };
 }
 
 namespace
 {
-    /// Wire tag in front of every encoded command and state.
+    /// Wire tag in front of every encoded command: a log entry's payload.
     ///
-    /// Versioned for the reason every other format here is: a node recovering a
-    /// snapshot written by a build that arranged the fields differently must refuse
-    /// it rather than read it as this build's arrangement. A snapshot is the one
-    /// thing that outlives a process, so a format that could not say which one wrote
-    /// it would make an upgrade a silent corruption.
-    constexpr std::uint8_t StateVersion = 2;
+    /// Versioned for the reason every other format here is: a node must refuse bytes
+    /// a build that arranged the fields differently wrote, rather than read them as
+    /// this build's arrangement.
+    ///
+    /// **Not the state's version, and the two must not become one constant again.**
+    /// They were one until #1340, which was safe only while every change moved both
+    /// layouts. A committed entry this build cannot decode is logged and SKIPPED
+    /// (`ClusterStateMachine::Apply`), so bumping this for a change that left the
+    /// command layout alone makes a node restarting onto its own log skip every entry
+    /// in it. It moves when a command's LAYOUT does. A fact `Apply` derives from
+    /// commands it already reads -- `SchedulerEndpointHistory` -- is state, and moves
+    /// `StateVersion` alone.
+    constexpr std::uint8_t CommandVersion = 2;
 
-    /// Fields one member occupies in an encoded state: id, Raft, scheduler.
+    /// Wire tag in front of every encoded state: a snapshot, and a `ClusterStatus` body.
     ///
-    /// Named because the decoder's arithmetic is otherwise three unexplained
-    /// threes, and getting one of them wrong reads every member's scheduler
-    /// endpoint as the next member's id -- which decodes, and produces a state
-    /// nothing would report as wrong.
-    constexpr std::size_t MemberFields = 3;
+    /// A snapshot is the one thing here that outlives a process, so a format that could
+    /// not say which build wrote it would make an upgrade a silent corruption. 3 added
+    /// each member's `SchedulerEndpointHistory` (#1340).
+    constexpr std::uint8_t StateVersion = 3;
+
+    /// Fields one member occupies in an encoded state: id, Raft, scheduler, and the
+    /// scheduler endpoint's history.
+    ///
+    /// Named because the decoder's arithmetic is otherwise four unexplained fours,
+    /// and getting one of them wrong reads every member's scheduler endpoint as the
+    /// next member's id -- which decodes, and produces a state nothing would report as
+    /// wrong.
+    constexpr std::size_t MemberFields = 4;
 
     /// Fields one setting occupies: name, value.
     constexpr std::size_t SettingFields = 2;
@@ -77,6 +95,19 @@ namespace
         std::ranges::sort(entries, {}, key);
     }
 } // namespace
+
+SchedulerEndpointState SchedulerEndpointStateOf(ClusterMember const& member) noexcept
+{
+    if (!member.schedulerEndpoint.empty())
+        return SchedulerEndpointState::Announced;
+    return member.schedulerEndpointHistory == SchedulerEndpointHistory::Announced ? SchedulerEndpointState::Cleared
+                                                                                  : SchedulerEndpointState::NeverAnnounced;
+}
+
+std::string_view SchedulerEndpointStateName(ClusterMember const& member) noexcept
+{
+    return SchedulerEndpointStateTable[static_cast<std::size_t>(SchedulerEndpointStateOf(member))].name;
+}
 
 std::optional<std::string> ClusterState::RaftEndpointOf(std::string_view id) const
 {
@@ -109,22 +140,27 @@ std::vector<std::string> ClusterState::Endpoints() const
 
 std::vector<std::byte> Encode(Command const& command)
 {
-    auto const header = std::array { static_cast<std::byte>(StateVersion), static_cast<std::byte>(command.kind) };
+    auto const header = std::array { static_cast<std::byte>(CommandVersion), static_cast<std::byte>(command.kind) };
     return WireFields::Encode({ std::span<std::byte const> { header },
                                 WireFields::AsBytes(command.key),
                                 WireFields::AsBytes(command.value),
                                 WireFields::AsBytes(command.schedulerEndpoint) });
 }
 
-std::optional<Command> DecodeCommand(std::span<std::byte const> payload)
+std::expected<Command, ConsensusError> DecodeCommand(std::span<std::byte const> payload)
 {
     auto const fields = WireFields::SplitExactly(payload, 4);
     if (!fields.has_value())
-        return std::nullopt;
+        return std::unexpected(MalformedWireFrame("a cluster command is not four fields"));
 
     auto const header = (*fields)[0];
-    if (header.size() != 2 || static_cast<std::uint8_t>(header[0]) != StateVersion)
-        return std::nullopt;
+    if (header.empty())
+        return std::unexpected(MalformedWireFrame("a cluster command's header is empty"));
+    if (auto const version = static_cast<std::uint8_t>(header[0]); version != CommandVersion)
+        return std::unexpected(UnsupportedWireVersion(
+            std::format("cluster command encoding version {} (this build reads {})", version, CommandVersion)));
+    if (header.size() != 2)
+        return std::unexpected(MalformedWireFrame("a cluster command's header is not two bytes"));
 
     // The verb is checked against the enum here rather than cast and switched on
     // later: a byte this build does not know is a peer speaking a vocabulary it
@@ -136,7 +172,8 @@ std::optional<Command> DecodeCommand(std::span<std::byte const> payload)
     // once, on that function; restating it here is how the two drift.
     auto const kind = Consensus::DecodeWireEnum<CommandKind>(static_cast<std::uint8_t>(header[1]));
     if (!kind.has_value())
-        return std::nullopt;
+        return std::unexpected(UnknownWireMessage(
+            std::format("cluster command verb {} this build does not know", static_cast<unsigned>(header[1]))));
 
     return Command { .kind = *kind,
                      .key = std::string { WireFields::AsStringView((*fields)[1]) },
@@ -154,13 +191,24 @@ std::vector<std::byte> Encode(ClusterState const& state)
     auto const header = std::array { static_cast<std::byte>(StateVersion) };
     auto const memberCount = WireFields::ToBigEndian<std::uint32_t>(static_cast<std::uint32_t>(state.members.size()));
 
+    // Every history byte is written before any span into them is taken, because the
+    // list below holds spans and a vector that grew under them would leave each
+    // pointing at freed storage.
+    std::vector<std::byte> histories;
+    histories.reserve(state.members.size());
+    for (auto const& member: state.members)
+        histories.push_back(static_cast<std::byte>(member.schedulerEndpointHistory));
+
     fields.emplace_back(header);
     fields.emplace_back(memberCount);
+    auto history = std::span<std::byte const> { histories };
     for (auto const& member: state.members)
     {
         fields.push_back(WireFields::AsBytes(member.id));
         fields.push_back(WireFields::AsBytes(member.raftEndpoint));
         fields.push_back(WireFields::AsBytes(member.schedulerEndpoint));
+        fields.push_back(history.first(1));
+        history = history.subspan(1);
     }
     for (auto const& setting: state.settings)
     {
@@ -170,20 +218,24 @@ std::vector<std::byte> Encode(ClusterState const& state)
     return WireFields::Encode(WireFields::FieldList { fields });
 }
 
-std::optional<ClusterState> DecodeState(std::span<std::byte const> bytes)
+std::expected<ClusterState, ConsensusError> DecodeState(std::span<std::byte const> bytes)
 {
     auto const fields = WireFields::SplitAll(bytes);
-    if (!fields.has_value() || fields->size() < 2)
-        return std::nullopt;
+    if (!fields.has_value() || fields->size() < 2 || (*fields)[0].size() != 1)
+        return std::unexpected(MalformedWireFrame("the bytes are not a cluster state"));
 
-    if ((*fields)[0].size() != 1 || static_cast<std::uint8_t>((*fields)[0][0]) != StateVersion)
-        return std::nullopt;
+    // By name, before anything else about the bytes is judged: a layout this build did
+    // not write is intact, and reading it as this build's would report damage that is
+    // not there.
+    if (auto const version = static_cast<std::uint8_t>((*fields)[0][0]); version != StateVersion)
+        return std::unexpected(UnsupportedWireVersion(
+            std::format("cluster state encoding version {} (this build reads {})", version, StateVersion)));
 
     auto const memberCount = WireFields::FromBigEndian<std::uint32_t>((*fields)[1]);
     if (!memberCount.has_value())
-        return std::nullopt;
+        return std::unexpected(MalformedWireFrame("a cluster state's member count is not four bytes"));
 
-    // Members first as triples, settings after as pairs, and BOTH shapes are checked
+    // Members first as quadruples, settings after as pairs, and BOTH shapes are checked
     // against what actually arrived. A truncated snapshot must be refused rather than
     // read as a member with an empty endpoint -- that member would be replicated
     // onward as an address nobody can dial -- and a declared member count larger than
@@ -191,7 +243,7 @@ std::optional<ClusterState> DecodeState(std::span<std::byte const> bytes)
     auto const rest = fields->size() - 2;
     auto const memberSpan = static_cast<std::size_t>(*memberCount) * MemberFields;
     if (memberSpan > rest || (rest - memberSpan) % SettingFields != 0)
-        return std::nullopt;
+        return std::unexpected(MalformedWireFrame("a cluster state's fields do not match its member count"));
 
     auto const at = [&](std::size_t index) {
         return std::string { WireFields::AsStringView((*fields)[2 + index]) };
@@ -201,8 +253,27 @@ std::optional<ClusterState> DecodeState(std::span<std::byte const> bytes)
     state.members.reserve(*memberCount);
     state.settings.reserve((rest - memberSpan) / SettingFields);
     for (std::size_t index = 0; index < memberSpan; index += MemberFields)
-        state.members.push_back(
-            ClusterMember { .id = at(index), .raftEndpoint = at(index + 1), .schedulerEndpoint = at(index + 2) });
+    {
+        auto const historyField = (*fields)[2 + index + 3];
+        auto const history =
+            historyField.size() == 1
+                ? Consensus::DecodeWireEnum<SchedulerEndpointHistory>(static_cast<std::uint8_t>(historyField[0]))
+                : std::nullopt;
+        if (!history.has_value())
+            return std::unexpected(MalformedWireFrame("a member's scheduler endpoint history names none this build knows"));
+
+        auto member = ClusterMember { .id = at(index),
+                                      .raftEndpoint = at(index + 1),
+                                      .schedulerEndpoint = at(index + 2),
+                                      .schedulerEndpointHistory = *history };
+
+        // The one combination `Apply` never produces. Read as it stands it would be a
+        // member holding an endpoint it reports never having announced, and every
+        // renderer would have to pick which half to believe.
+        if (!member.schedulerEndpoint.empty() && member.schedulerEndpointHistory == SchedulerEndpointHistory::NeverAnnounced)
+            return std::unexpected(MalformedWireFrame("a member records a scheduler endpoint it never announced"));
+        state.members.push_back(std::move(member));
+    }
     for (std::size_t index = memberSpan; index < rest; index += SettingFields)
         state.settings.push_back(Setting { .name = at(index), .value = at(index + 1) });
     return state;
@@ -216,10 +287,22 @@ void Apply(ClusterState& state, Command const& command)
             // Update in place when the id is already known. One verb for "join" and
             // "moved" because they are one intention, and removing first would leave a
             // window in which the cluster has agreed the node does not exist.
-            auto const admitted = ClusterMember { .id = command.key,
-                                                  .raftEndpoint = command.value,
-                                                  .schedulerEndpoint = command.schedulerEndpoint };
             auto const it = std::ranges::find(state.members, command.key, &ClusterMember::id);
+
+            // The endpoint is replaced wholesale and its HISTORY is not, which is what
+            // lets a report say *cleared* rather than *never announced* after a re-admit
+            // (#1340). Derived here from what the state already records, so no command
+            // carries it. Only a removal forgets it: a forget is a positive act, and an
+            // id admitted from absence has announced nothing yet.
+            auto const announcedBefore =
+                it != state.members.end() && it->schedulerEndpointHistory == SchedulerEndpointHistory::Announced;
+            auto const admitted =
+                ClusterMember { .id = command.key,
+                                .raftEndpoint = command.value,
+                                .schedulerEndpoint = command.schedulerEndpoint,
+                                .schedulerEndpointHistory = announcedBefore || !command.schedulerEndpoint.empty()
+                                                                ? SchedulerEndpointHistory::Announced
+                                                                : SchedulerEndpointHistory::NeverAnnounced };
             if (it != state.members.end())
             {
                 // Wholesale, both endpoints. A record is re-proposed only when it has

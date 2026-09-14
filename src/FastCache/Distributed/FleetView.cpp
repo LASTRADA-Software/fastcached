@@ -313,7 +313,7 @@ namespace
     // ------------------------------------------------------------ the tables
 
     /// What a member row shows.
-    constexpr std::array<FleetColumn<Cluster::ClusterMember>, 3> MemberColumns {
+    constexpr std::array<FleetColumn<Cluster::ClusterMember>, 4> MemberColumns {
         FleetColumn<Cluster::ClusterMember> {
             .name = "id",
             .help = "The member's stable identity: what consensus counts.",
@@ -334,6 +334,18 @@ namespace
             .project =
                 [](Cluster::ClusterMember const& m) {
                     return m.schedulerEndpoint.empty() ? FleetCell::Nothing() : FleetCell::Of(m.schedulerEndpoint);
+                } },
+        FleetColumn<Cluster::ClusterMember> {
+            .name = "scheduler-endpoint-state",
+            .help = "Whether that endpoint is announced, never announced, or cleared by a re-admit; it returns when "
+                    "the member next leads.",
+            .format = CellFormat::Text,
+            // Always present, and a column of its own rather than a word in the endpoint
+            // cell, so that cell stays an address or absent in the JSON (#1340). Spelled
+            // from the table `--cluster-status` and `cluster-members` read too.
+            .project =
+                [](Cluster::ClusterMember const& m) {
+                    return FleetCell::Of(std::string { Cluster::SchedulerEndpointStateName(m) });
                 } },
     };
 
