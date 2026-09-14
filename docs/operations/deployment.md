@@ -422,6 +422,7 @@ Present only when the process has a cache, which for `fastcached` is always.
 | `fastcached_evictions_total` | Entries dropped to stay inside that budget. Sustained evictions with a falling hit ratio mean the working set no longer fits. |
 | `fastcached_evicted_unfetched_total` | Entries evicted before ever being read — capacity spent on values nobody wanted. |
 | `fastcached_expired_unfetched_total` | Entries that lapsed before ever being read. |
+| `fastcached_expirations_total` | Entries removed because their TTL lapsed, whichever path removed them: a lookup or a write that met one, or the expiry cycle. The unfetched series above is the part of this nobody read, and `fastcached_expiry_keys_reclaimed_total` is the cycle's share alone. |
 | `fastcached_write_errors_total` | Value writes that failed to persist: a full disk, an I/O error, a read-only mount, a damaged store. **This one is about the disk.** See [When a store reports Corrupt](corrupt-store.md). |
 
 #### Per tier

@@ -136,6 +136,8 @@ namespace
                                     .store = [](StorageStats& s, std::uint64_t v) noexcept { s.evictedUnfetched = v; } },
         SeriesField<StorageStats> { .series = "fastcached_expired_unfetched_total",
                                     .store = [](StorageStats& s, std::uint64_t v) noexcept { s.expiredUnfetched = v; } },
+        SeriesField<StorageStats> { .series = "fastcached_expirations_total",
+                                    .store = [](StorageStats& s, std::uint64_t v) noexcept { s.expirations = v; } },
         SeriesField<StorageStats> {
             .series = "fastcached_items",
             .store = [](StorageStats& s, std::uint64_t v) noexcept { s.itemCount = static_cast<std::size_t>(v); } },

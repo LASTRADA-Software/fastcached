@@ -61,7 +61,7 @@ namespace
                        .priority = Priority::Normal },
     };
 
-    constexpr auto ReclaimedBeside = std::array {
+    constexpr auto ExpiredBeside = std::array {
         BesideFigure { .key = "expired_unfetched_per_sec",
                        .before = "expired unfetched",
                        .figure = { .field = StorageField<&StorageStats::expiredUnfetched>(),
@@ -99,14 +99,14 @@ namespace
                               .format = FigureFormat::Rate },
                   .beside = EvictionsBeside,
                   .priority = Priority::Normal },
-        // Named for what the counter counts: the active cycle's reclaims. A key that lapsed and was
-        // found on read is not in it, so calling this row `expired/s` would understate expiry.
-        RateRow { .label = "reclaimed/s",
-                  .key = "reclaimed_per_sec",
-                  .figure = { .field = CounterField<Counter::ExpiryKeysReclaimed>(),
+        // §3's `expired/s`, over every expiry whichever path found it -- a lookup, a write or the cycle's sweep --
+        // so the label says what the figure counts. The cycle's reclaims alone would understate it.
+        RateRow { .label = "expired/s",
+                  .key = "expired_per_sec",
+                  .figure = { .field = StorageField<&StorageStats::expirations>(),
                               .source = FigureSource::Rate,
                               .format = FigureFormat::Rate },
-                  .beside = ReclaimedBeside,
+                  .beside = ExpiredBeside,
                   .priority = Priority::Normal },
     };
 

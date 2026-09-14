@@ -121,7 +121,8 @@ struct Series
 {
     auto reading = StatsReading {};
     reading.counters[static_cast<std::size_t>(IMetricsSink::Counter::ConnectionsTotal)] = 3 * step;
-    reading.counters[static_cast<std::size_t>(IMetricsSink::Counter::ExpiryKeysReclaimed)] = 4 * step;
+    // The cycle's share of expiry moves slower than expiry itself, so a panel reading the one for the other differs.
+    reading.counters[static_cast<std::size_t>(IMetricsSink::Counter::ExpiryKeysReclaimed)] = step;
     reading.snapshot.storage = StorageStats { .itemCount = 1284991,
                                               .bytesUsed = std::size_t { 3 } << 30U,
                                               .bytesLimit = std::size_t { 4 } << 30U,
@@ -131,7 +132,8 @@ struct Series
                                               .getHits = 90 * step,
                                               .getMisses = 10 * step,
                                               .evictedUnfetched = step,
-                                              .expiredUnfetched = step };
+                                              .expiredUnfetched = step,
+                                              .expirations = 4 * step };
     for (auto const tier: tiers)
     {
         auto const* row = FindIfOrNull(StorageTierTable, [tier](auto const& one) { return one.name == tier; });
@@ -463,6 +465,11 @@ TEST_CASE("an 80x24 cache panel carries every label, qualifier and note section 
     INFO(sink.frames.front());
     CHECK(reading("connected").starts_with(std::format("{}  no level is exported; connections_total is a TALLY", Absent)));
     CHECK(reading("items").starts_with("1 284 991"));
+
+    // `expired/s` is every expiry (4 a step over 2 s), not the cycle's reclaims alone (1 a step).
+    auto const expired = row("expired/s");
+    REQUIRE(expired.has_value());
+    CHECK(FigureOf(Unwrap(expired)) == "2.0");
     CHECK(reading("bytes").starts_with("3.00 GiB / 4.00 GiB  "));
     CHECK(reading("bytes").contains("75.0 %"));
 

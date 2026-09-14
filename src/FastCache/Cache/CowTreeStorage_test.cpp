@@ -969,6 +969,26 @@ TEST_CASE("PurgeExpired clears all expired entries and reports the count", "[cow
     }
 }
 
+TEST_CASE("CowTreeStorage counts every expiry, whichever path removed it", "[cowstorage][stats][expiry]")
+{
+    // WHAT DISTINGUISHES: a write verb meeting a lapsed record and the sweep each count one expiry, and a live
+    // record the sweep passes over counts none.
+    TempFile tmp;
+    FastCache::CowTreeStorage::Options opts { .path = tmp.path };
+    auto storage = FastCache::CowTreeStorage::Open(opts);
+    REQUIRE(storage.has_value());
+    FastCache::ManualClock clock;
+    REQUIRE((*storage)->Set("deleted", MakeBytes("v"), 0, clock.Now() + 1ms).has_value());
+    REQUIRE((*storage)->Set("swept", MakeBytes("v"), 0, clock.Now() + 1ms).has_value());
+    REQUIRE((*storage)->Set("kept", MakeBytes("v"), 0, FastCache::TimePoint::max()).has_value());
+
+    clock.Advance(10ms);
+    REQUIRE_FALSE((*storage)->Delete("deleted", clock.Now()).has_value());
+    CHECK((*storage)->Snapshot().expirations == 1U);
+    REQUIRE((*storage)->PurgeExpired(clock.Now(), FastCache::PurgeBudget::Unbounded()).purged == 1U);
+    CHECK((*storage)->Snapshot().expirations == 2U);
+}
+
 TEST_CASE("PurgeExpired on the disk tier is bounded and resumes", "[cowstorage][purge]")
 {
     // Every step here additionally costs a `LoadEntry`, so an unbounded sweep

@@ -77,6 +77,7 @@ InMemoryLruStorage::Iterator InMemoryLruStorage::FindAlive(std::string_view key,
         {
             if (!nodeIt->entry.fetched)
                 ++_stats.expiredUnfetched;
+            ++_stats.expirations;
             RecordReclaim(_reclaim, MutationKind::Expire, nodeIt->key);
         }
         EraseAt(nodeIt);
@@ -605,6 +606,7 @@ PurgeOutcome InMemoryLruStorage::PurgeExpired(TimePoint now, PurgeBudget budget)
         {
             if (!victim->entry.fetched)
                 ++_stats.expiredUnfetched;
+            ++_stats.expirations;
             RecordReclaim(_reclaim, MutationKind::Expire, victim->key);
         }
         EraseAt(victim);
