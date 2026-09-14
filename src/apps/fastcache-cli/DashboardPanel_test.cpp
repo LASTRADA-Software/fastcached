@@ -200,10 +200,11 @@ struct Series
     return lines;
 }
 
-// Where a rate row's columns are, in the frame. Stated once here and read by every case. A wrong
-// constant makes `RowLine` find no row, and every case REQUIREs the rows it reads.
+// Where a rate row's columns are, in the frame, for a panel whose labels and figures fit the default columns: §3
+// ends a figure at column 23 and starts its trend at 26. Stated once here and read by every case. A wrong constant
+// makes `RowLine` find no row, and every case REQUIREs the rows it reads.
 constexpr auto LabelFrom = std::size_t { 3 }; // the edge and the indent
-constexpr auto LabelWidth = std::size_t { 16 };
+constexpr auto LabelWidth = std::size_t { 12 };
 constexpr auto FigureWidth = std::size_t { 9 };
 constexpr auto SparkFrom = LabelFrom + LabelWidth + FigureWidth + 2;
 
@@ -485,9 +486,13 @@ TEST_CASE("an 80x24 cache panel carries every label, qualifier and note section 
     {
         INFO("rate " << label << " with " << qualifier);
         auto const line = std::ranges::find_if(
-            lines, [label](std::string const& one) { return Trimmed(Columns(one, LabelFrom, 16)).starts_with(label); });
+            lines, [label](std::string const& one) { return Trimmed(Columns(one, LabelFrom, LabelWidth)) == label; });
         REQUIRE(line != lines.end());
         CHECK(line->contains(qualifier));
+        // §3's columns: the figure's last cell is column 23 and the two before the trend are blank. A label column
+        // of sixteen, which this block had, ends it at 27.
+        CHECK(Columns(*line, 23, 1) != " ");
+        CHECK(Columns(*line, 24, 2) == "  ");
     }
     CHECK(frame.contains("index (RAM)"));
     CHECK(frame.contains("tier bytes carry per-tier denominations and do not sum; no per-tier"));
@@ -582,6 +587,45 @@ TEST_CASE("a level label as wide as the label column still leaves a blank before
     };
     CHECK(starting("scratch free 1 284 991") == 1);
     CHECK(starting("items        1 284 991") == 1);
+}
+
+TEST_CASE("a rate label wider than the label column and a figure as wide as the figure column move the whole block",
+          "[cli][dashboard][panel]")
+{
+    // WHAT DISTINGUISHES: a fifteen-cell label takes fifteen columns rather than being cut to twelve, and a
+    // nine-cell figure in a nine-cell column still keeps a blank before it -- `rate label wide1 284 991` otherwise.
+    // Both widen the block, so the short row's figure ends in the same column as the long one's.
+    static constexpr auto rates = std::array {
+        RateRow { .label = "rate label wide",
+                  .key = "wide",
+                  .figure = { .field = StorageField<&StorageStats::itemCount>(), .source = FigureSource::Level },
+                  .trend = Trend::None },
+        RateRow { .label = "ops",
+                  .key = "ops",
+                  .figure = { .field = StorageField<&StorageStats::itemCount>(), .source = FigureSource::Level },
+                  .trend = Trend::None },
+    };
+    static constexpr auto spec =
+        PanelSpec { .title = "rates", .rates = rates, .levels = {}, .tierColumns = {}, .tierNote = {} };
+    auto view = PanelView {
+        spec, PanelContext { .absent = std::string { Absent }, .cellWidth = &FakeCellWidth, .rung = RenderRung::Unicode }
+    };
+    auto sink = CollectingSink {};
+    (void) Drive({ DashboardEvent { .kind = DashboardEventKind::Resize, .columns = 80, .rows = 24 },
+                   SampleOf(CacheSeries(1, {}), 1),
+                   Tick },
+                 DashboardLimits {},
+                 view,
+                 sink);
+    REQUIRE(sink.frames.size() == 1);
+    INFO(sink.frames.front());
+    auto const lines = Lines(sink.frames.front());
+    auto const starting = [&lines](std::string_view text) {
+        return std::ranges::count_if(
+            lines, [text](std::string const& line) { return Columns(line, LabelFrom, 80).starts_with(text); });
+    };
+    CHECK(starting("rate label wide 1 284 991") == 1);
+    CHECK(starting("ops             1 284 991") == 1);
 }
 
 TEST_CASE("a tier the endpoint does not run contributes no row", "[cli][dashboard][panel]")
@@ -2518,17 +2562,31 @@ TEST_CASE("a node panel dresses labels as labels, figures as figures, and a refu
 {
     // #134 G1 on §4's panel. WHAT DISTINGUISHES: the label and the figure of one row are two runs of two tones,
     // not one run over both; the refusal total and each refusal that moved are ALERTS while the one that did
-    // not move is not dressed at all; and a wrapped caveat is a Label run on each of its lines.
+    // not move is an ordinary figure; each refusal's name is a label run apart from its figure, inside a piece
+    // that still goes for width whole; and a wrapped caveat is a Label run on each of its lines.
     auto const sink = NodeSinkOf(MockupNodeStatus());
     CHECK(ToneOver(sink, "compiles/min") == FrameTone::Label);
     CHECK(ToneOver(sink, "1 230") == FrameTone::Figure);
     CHECK(ToneOver(sink, "refused/min") == FrameTone::Label);
     CHECK(ToneOver(sink, "90") == FrameTone::Alert);
-    CHECK(ToneOver(sink, "no-slot 60/min") == FrameTone::Alert);
-    CHECK(ToneOver(sink, "lease-expired 30/min") == FrameTone::Alert);
-    CHECK_FALSE(ToneOver(sink, "unknown-fingerprint 0.0/min").has_value());
-    CHECK(ToneOver(sink, "sum/count over this interval; no histogram") == FrameTone::Label);
-    CHECK(ToneOver(sink, "exists, so no p50/p95 can be shown") == FrameTone::Label);
+    CHECK(ToneOver(sink, "no-slot") == FrameTone::Label);
+    CHECK(ToneOver(sink, "60/min") == FrameTone::Alert);
+    CHECK(ToneOver(sink, "lease-expired") == FrameTone::Label);
+    CHECK(ToneOver(sink, "30/min") == FrameTone::Alert);
+    CHECK(ToneOver(sink, "unknown-fingerprint") == FrameTone::Label);
+    CHECK(ToneOver(sink, "0.0/min") == FrameTone::Figure);
+    CHECK(ToneOver(sink, "completed") == FrameTone::Label);
+    // Where the caveat wraps is the layout's business (`a mean compile note too long...`), so each line's words are
+    // read off the frame: from where the note begins to the edge, and the whole hanging line under it.
+    auto const& frame = sink.frames.front();
+    auto const row = RowLine(frame, "mean compile");
+    auto const under = LineUnder(frame, "mean compile");
+    REQUIRE(row.has_value());
+    REQUIRE(under.has_value());
+    auto const noteFrom = ColumnOf(Unwrap(row), "sum/count");
+    REQUIRE(noteFrom.has_value());
+    CHECK(ToneOver(sink, Trimmed(Columns(Unwrap(row), Unwrap(noteFrom), 79 - Unwrap(noteFrom)))) == FrameTone::Label);
+    CHECK(ToneOver(sink, Trimmed(Columns(Unwrap(under), 1, 78))) == FrameTone::Label);
     for (auto const* label: { "node-id", "components", "toolchains", "registrars", "consensus", "leader", "slots", "host" })
     {
         INFO("label " << label);
@@ -2568,4 +2626,49 @@ TEST_CASE("a node's states worth a look are dressed: a survey not done, an elect
     never.runtime.registrarsRegistered = 0;
     never.runtime.lastRegistrationSecondsAgo.reset();
     CHECK(ToneOver(NodeSinkOf(never), "0 of 1, never accepted") == FrameTone::Alert);
+}
+
+TEST_CASE("a cache rate block dresses its labels and beside words as labels and its figures as figures",
+          "[cli][dashboard][panel][tone]")
+{
+    // G1 over §3's rates, two readings in so every rate is a figure. WHAT DISTINGUISHES: a rate's label and figure
+    // are two runs; `since start` AFTER a figure is a label run as `evicted unfetched` BEFORE one is; and the figure
+    // between them is a figure run of its own, where one tone over the whole beside piece dresses words and value
+    // alike.
+    auto sink = CollectingSink {};
+    auto view = PanelView {
+        CachePanel(),
+        PanelContext { .absent = std::string { Absent }, .cellWidth = &FakeCellWidth, .rung = RenderRung::Unicode }
+    };
+    (void) Drive({ DashboardEvent { .kind = DashboardEventKind::Resize, .columns = 80, .rows = 24 },
+                   SampleOf(CacheSeries(1, { "memory", "disk" }), 1),
+                   SampleOf(CacheSeries(2, { "memory", "disk" }), 3),
+                   Tick },
+                 DashboardLimits {},
+                 view,
+                 sink);
+    auto const presented = Presented { .frames = sink.frames, .spans = sink.spans };
+    REQUIRE(presented.frames.size() == 1);
+    auto const& frame = presented.frames.front();
+    INFO(frame);
+    for (auto const& rate: CachePanel().rates)
+    {
+        INFO("rate " << rate.label);
+        auto const line = RowLine(frame, rate.label);
+        REQUIRE(line.has_value());
+        CHECK(ToneOver(presented, rate.label) == FrameTone::Label);
+        CHECK(ToneOver(presented, FigureOf(Unwrap(line))) == FrameTone::Figure);
+    }
+    for (auto const* word: { "since start", "get", "set", "accepted", "evicted unfetched", "expired unfetched" })
+    {
+        INFO("word " << word);
+        CHECK(ToneOver(presented, word) == FrameTone::Label);
+    }
+    // The beside figure is the line's last text, so it runs from after its words to the padding before the edge.
+    auto const expired = RowLine(frame, "expired/s");
+    REQUIRE(expired.has_value());
+    auto const words = ColumnOf(Unwrap(expired), "expired unfetched ");
+    REQUIRE(words.has_value());
+    auto const figureFrom = Unwrap(words) + FakeCellWidth("expired unfetched ");
+    CHECK(ToneOver(presented, Trimmed(Columns(Unwrap(expired), figureFrom, 79 - figureFrom))) == FrameTone::Figure);
 }
