@@ -2729,6 +2729,64 @@ struct Presented
 
 } // namespace
 
+TEST_CASE("a title bar states no uptime and no leader beside a gap, and both again with the next reading",
+          "[cli][dashboard][panel][chrome]")
+{
+    // lane-livestats, on the owner's demo: a leader killed for 16 s kept `up 0d00:13` and `leader 127.0.0.1:26674` in
+    // its titles while every figure under them read the marker. WHAT DISTINGUISHES: the frame beside the gap says
+    // `up -` and names no leader, while the frames either side of it say both -- a title reading the last reading
+    // passes the first and the last frame and fails the middle one. The node's uptime is its status's, and beside a
+    // gap the reading's own zero would stand in for it, so the node is asked as well as the cache.
+    auto const failedAt = [](std::chrono::seconds at) {
+        return DashboardEvent { .kind = DashboardEventKind::SampleFailed,
+                                .at = TimePoint { at },
+                                .outcome = Outcome::Unreachable,
+                                .note = "127.0.0.1:6674: the stream was lost (recv)" };
+    };
+
+    auto later = CacheChromeSample();
+    later.at = TimePoint { 3s };
+    auto const cache = CacheChromeFrames({ CacheChromeSample(), Tick, failedAt(2s), Tick, std::move(later), Tick }, 80);
+    REQUIRE(cache.size() == 3);
+    CHECK(TopEdge(cache[0]).ends_with(TopEnd("127.0.0.1:6379  up 6d04:12  every 2s  q quit")));
+    CHECK(TopEdge(cache[1]).ends_with(TopEnd(std::format("127.0.0.1:6379  up {}  every 2s  q quit", Absent))));
+    CHECK(TopEdge(cache[2]).ends_with(TopEnd("127.0.0.1:6379  up 6d04:12  every 2s  q quit")));
+
+    auto const node = NodeFramesAt(
+        { NodeSampleOf(1, 1, MockupNodeStatus()), Tick, failedAt(3s), Tick, NodeSampleOf(2, 5, MockupNodeStatus()), Tick },
+        120,
+        40);
+    REQUIRE(node.size() == 3);
+    CHECK(TopEdge(node[0]).contains("  up 2d11:48  "));
+    CHECK(TopEdge(node[1]).contains(std::format("  up {}  ", Absent)));
+    CHECK(TopEdge(node[2]).contains("  up 2d11:48  "));
+
+    auto view = PanelView { FleetPanel(),
+                            PanelContext { .absent = std::string { Absent },
+                                           .endpoint = "10.0.0.4:6674",
+                                           .interval = 5s,
+                                           .cellWidth = &FakeCellWidth,
+                                           .rung = RenderRung::Unicode } };
+    auto sink = CollectingSink {};
+    (void) Drive({ DashboardEvent { .kind = DashboardEventKind::Resize, .columns = 80, .rows = 40 },
+                   FleetSampleOf(1, FleetText(FleetMachines), "10.0.0.4:6674"),
+                   Tick,
+                   failedAt(6s),
+                   Tick,
+                   FleetSampleOf(11, FleetText(FleetMachines), "10.0.0.4:6674"),
+                   Tick },
+                 DashboardLimits {},
+                 view,
+                 sink,
+                 &ReadFleetSample);
+    REQUIRE(sink.frames.size() == 3);
+    auto const led = TopEnd(std::format("leader 10.0.0.4:6674  {} machines  every 5s  q", FleetMachines));
+    CHECK(TopEdge(sink.frames[0]).ends_with(led));
+    CHECK(TopEdge(sink.frames[1]).ends_with(TopEnd(std::format("10.0.0.4:6674  {} machines  every 5s  q", Absent))));
+    CHECK_FALSE(TopEdge(sink.frames[1]).contains("leader"));
+    CHECK(TopEdge(sink.frames[2]).ends_with(led));
+}
+
 namespace
 {
 
@@ -3643,6 +3701,59 @@ TEST_CASE("before a node says anything about itself its facts read the marker, a
     unaccepted.runtime.registrarsRegistered = 0;
     unaccepted.runtime.lastRegistrationSecondsAgo.reset();
     CHECK(ContentStarting(NodeFrameAt(80, 24, unaccepted), "toolchains").contains("registrars  0 of 1, never accepted"));
+}
+
+TEST_CASE("a node panel keeps the lines its node said apply beside a gap, their figures the marker",
+          "[cli][dashboard][panel][node]")
+{
+    // lane-livestats, on the owner's demo: every outage took the consensus and cache tier lines away and gave them back,
+    // moving every line under them. WHAT DISTINGUISHES: beside the gap both lines are still drawn and read the marker,
+    // where the frame before read figures -- lines asked of the newest sample's status pass the first frame and fail
+    // the second -- and a node that said it runs neither still draws neither beside a gap, so the lines are not merely
+    // drawn always.
+    auto const gapped = [](CompileCacheWire::NodeStatusFields const& status) {
+        auto frames = NodeFramesAt({ NodeSampleOf(1, 1, status),
+                                     NodeSampleOf(2, 3, status),
+                                     Tick,
+                                     DashboardEvent { .kind = DashboardEventKind::SampleFailed,
+                                                      .at = TimePoint { 5s },
+                                                      .outcome = Outcome::Unreachable,
+                                                      .note = "build-07:7070: the stream was lost (recv)" },
+                                     Tick },
+                                   80,
+                                   40);
+        REQUIRE(frames.size() == 2);
+        return frames;
+    };
+
+    auto const mockup = gapped(MockupNodeStatus());
+    CHECK(ContentStarting(mockup[0], "consensus").starts_with("consensus   follower"));
+    CHECK(ContentStarting(mockup[0], "cache tier").starts_with("cache tier  hits 88.1 %"));
+    CHECK(ContentStarting(mockup[1], "consensus").starts_with(std::format("consensus   {}", Absent)));
+    CHECK(ContentStarting(mockup[1], "consensus").ends_with(std::format("leader      {}", Absent)));
+    CHECK(ContentStarting(mockup[1], "cache tier").starts_with(std::format("cache tier  hits {}", Absent)));
+
+    auto plain = MockupNodeStatus();
+    plain.components = CompileCacheWire::NodeComponentBit::Worker;
+    plain.runtime.schedulerRole.reset();
+    plain.runtime.leaderEndpoint.clear();
+    auto const worker = gapped(plain);
+    CHECK_FALSE(LineStarting(worker[1], "consensus").has_value());
+    CHECK_FALSE(LineStarting(worker[1], "cache tier").has_value());
+    CHECK(LineStarting(worker[1], "slots").has_value());
+    CHECK(LineStarting(worker[1], "host").has_value());
+
+    // And the slots: a node that said it runs no worker draws none beside a gap, where one that runs one still does.
+    auto tierOnly = MockupNodeStatus();
+    tierOnly.components = CompileCacheWire::NodeComponentBit::CacheTier;
+    tierOnly.runtime.compileSlots.reset();
+    tierOnly.runtime.compilesInFlight.reset();
+    tierOnly.runtime.schedulerRole.reset();
+    tierOnly.runtime.leaderEndpoint.clear();
+    auto const tier = gapped(tierOnly);
+    CHECK_FALSE(LineStarting(tier[0], "slots").has_value());
+    CHECK_FALSE(LineStarting(tier[1], "slots").has_value());
+    CHECK(LineStarting(tier[1], "cache tier").has_value());
 }
 
 namespace

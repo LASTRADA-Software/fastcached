@@ -218,7 +218,8 @@ struct DashboardModel
     std::optional<Value> previous {};
 
     /// The newest reading as the live model, for a `cache` or `node` session; nullopt before one arrives and for
-    /// a subject whose reader produces none. What a title bar reads the version and the uptime from.
+    /// a subject whose reader produces none. What a title bar reads the version from; the uptime is a figure about now,
+    /// so it is read off the newest history entry, which a gap leaves without one.
     std::optional<StatsReading> stats {};
 
     /// When `latest` was taken and which source produced it; engaged exactly when `latest` is.
@@ -233,6 +234,16 @@ struct DashboardModel
     /// then draws the absent marker beside a gap, exactly as a figure does, instead of showing the
     /// last thing a node said before it stopped saying anything.
     std::optional<CompileCacheWire::NodeStatusFields> nodeStatus {};
+
+    /// The node's status as the newest sample that CARRIED one carried it, or nullopt until one did.
+    ///
+    /// **What a node is, not what it says now.** `nodeStatus` answers every figure and is empty
+    /// beside a gap; this answers only which of a node's lines apply to it -- whether it runs
+    /// consensus, a worker, a cache tier -- and a gap is not evidence that it stopped running
+    /// one. Asked of `nodeStatus` instead, a gap drew *unknown* as *does not apply*: the node's
+    /// consensus and cache tier lines went and came back with every outage, moving every line
+    /// below them.
+    std::optional<CompileCacheWire::NodeStatusFields> carriedNodeStatus {};
 
     /// The fleet document the NEWEST sample's reading carried, or null when that sample carried none.
     ///

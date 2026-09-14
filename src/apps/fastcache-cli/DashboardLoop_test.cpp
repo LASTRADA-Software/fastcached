@@ -1035,6 +1035,54 @@ TEST_CASE("the model's node status is what the newest sample carried and nothing
     CHECK(versionAt(4) == "third");
 }
 
+TEST_CASE("the model's carried node status is the newest one a sample carried, kept through samples carrying none",
+          "[cli][dashboard]")
+{
+    // What decides whether a node's line applies (lane-livestats, #134 G2). WHAT DISTINGUISHES: after a reading and
+    // after a failure that carried no status, the carried status is still `first` while `nodeStatus` is empty -- a
+    // carried status replaced as `nodeStatus` is fails exactly those two frames -- and a failure that DID carry one
+    // replaces it, so it is not the first status kept for good either.
+    auto const tick = DashboardEvent { .kind = DashboardEventKind::Tick };
+    auto withStatus = [](int seconds, std::int64_t value, std::string version) {
+        auto event = SampleAt(value, seconds);
+        event.nodeStatus = StatusNamed(std::move(version));
+        return event;
+    };
+
+    auto view = RecordingView {};
+    auto sink = CollectingSink {};
+    (void) Drive({ tick,
+                   withStatus(1, 10, "first"),
+                   tick,
+                   SampleAt(20, 2),
+                   tick,
+                   DashboardEvent { .kind = DashboardEventKind::SampleFailed, .outcome = Outcome::Unreachable },
+                   tick,
+                   DashboardEvent { .kind = DashboardEventKind::SampleFailed,
+                                    .nodeStatus = StatusNamed("while-failing"),
+                                    .outcome = Outcome::Refused },
+                   tick,
+                   withStatus(3, 30, "third"),
+                   tick },
+                 DashboardLimits {},
+                 view,
+                 sink);
+
+    auto const carriedAt = [&view](std::size_t frame) {
+        auto const& status = view.seen.at(frame).carriedNodeStatus;
+        return status.has_value() ? status->version : std::string { "<absent>" };
+    };
+    REQUIRE(view.seen.size() == 6);
+    CHECK(carriedAt(0) == "<absent>"); // nothing carried yet
+    CHECK(carriedAt(1) == "first");
+    CHECK(carriedAt(2) == "first"); // a reading that carried none
+    CHECK_FALSE(view.seen.at(2).nodeStatus.has_value());
+    CHECK(carriedAt(3) == "first"); // a failure that carried none
+    CHECK_FALSE(view.seen.at(3).nodeStatus.has_value());
+    CHECK(carriedAt(4) == "while-failing");
+    CHECK(carriedAt(5) == "third");
+}
+
 TEST_CASE("the model's granted cadence is what the newest sample carried and nothing older", "[cli][dashboard]")
 {
     // A title's `every Ns` states the grant of the stream the newest sample came from. WHAT DISTINGUISHES: a FAILED
