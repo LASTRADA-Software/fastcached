@@ -653,13 +653,16 @@ readable and silently ignored. Every rule below has already been one of them.
 
 - **The file's values and the command line's reach the same fields through the
   SAME appliers, in that order, so "the command line wins" is which loop runs
-  second.** The daemon does the other thing: `ReadYamlConfig` fills a `Config`,
-  `ParseCli` fills a `CliResult`, and `Merge` copies field by field consulting a
-  per-field explicit bit and a per-field presence bit. Four lists that have to
-  agree, none derived from the others — and the file's own comments record that a
-  flag which parsed and never merged has shipped four times. `fastcache-compile-node`
-  has one list, `NodeOptions()`, and a row that parses cannot fail to merge because
-  parsing and merging stopped being two things. `Config/FileOptions.hpp`.
+  second.** Both binaries do: `ReadYamlSettings` then `ApplyFileSettings` over the
+  binary's own table, then `ClearListsNamedOn`, then argv. `Config/FileOptions.hpp`.
+  The daemon did the other thing until #1437 — a second parser filled a `Config`
+  and `Merge` copied field by field against a per-field explicit bit and a per-field
+  presence bit, four lists none derived from the others — and **its KEYS agreed with
+  the table while its VALUES did not**: measured on 0.2.0-568, the file accepted
+  `port: 0x50`, `port: +80`, `bind: ""` and `metrics: yes`, every one refused on
+  argv. A census of keys against rows came back 34 = 34 and could not see it, which
+  is why the acceptance is a PARITY test driving every keyed row through the file
+  and argv with the same text, not a key count.
 - **And a RELOAD rebuilds the candidate the way the START built the live
   configuration, or the command line silently stops applying.** The daemon's SIGHUP
   path was `ReadYamlConfig(path)` and nothing else, so a setting in force because
@@ -694,16 +697,22 @@ readable and silently ignored. Every rule below has already been one of them.
   across lanes leaves either a flag the installer drops or a sweep nobody can make
   pass.
 - **Which key a row answers to is a COLUMN, never a derivation.** Measured on the
-  daemon: 48 flag rows, 34 of which carry a key, diverging four ways — `--storage` is
-  `storage_path`, `--expiry-scan` is `active_expiry_scan`, `--expiry-interval` is
-  `active_expiry_interval_ms` (renamed *and* carrying a unit the flag does not),
-  and `--listen`/`--listen-tls` collapse into one `listeners:`. There is no rule
-  with exceptions there, only a mapping, and a convention derived from flag names
-  would silently rename three existing keys the day somebody generalised it.
+  daemon when #1437 keyed every setting row: 48 flag rows, 36 of which carry a key,
+  diverging three ways — `--storage` is `storage_path`, `--expiry-scan` is
+  `active_expiry_scan`, `--expiry-interval` is `active_expiry_interval_ms` (renamed
+  *and* carrying a unit the flag does not). There is no rule with exceptions there,
+  only a mapping, and a convention derived from flag names would silently rename
+  those three keys the day somebody generalised it. A NESTED key cannot be a column
+  at all: the daemon's `listeners:` block became `listen:` and `listen_tls:`, lists
+  of `host:port`, rather than teaching the shallow reader a second grammar.
 - **A key naming no row is REFUSED, never ignored.** A file is read at every
   start, so a key nothing reads is a setting an operator believes is in force
   forever — the exact failure the file exists to remove, and a typo is the common
-  way to reach it.
+  way to reach it. **So is a key written twice**: the parser hands over both entries,
+  so a scalar row kept the last and a list row would append both — a value the
+  operator wrote silently discarded or doubled. And a key that is not a scalar is a
+  refusal, not a yaml-cpp exception: `? [a, b]` ended a 0.2.0-568 worker with
+  0xC0000409.
 - **A row a file may not carry is on a named list with a per-row reason, and a
   compile-time guard reads that list rather than restating it.** Two kinds live
   there and they are not the same objection: a one-shot verb (`--install-service`,
@@ -715,7 +724,10 @@ readable and silently ignored. Every rule below has already been one of them.
 - **A flag whose meaning is its PRESENCE is a boolean in the file, and `apply` runs
   on `true` alone.** The key spells the flag, so the reading is exact for both
   polarities: `raft_join: true` passes `--raft-join`, and `no_toolchain_discovery:
-  false` passes nothing, which is discovery left on. A positively-named key would
+  false` passes nothing, which is discovery left on. **So a presence setting whose
+  DEFAULT is on somewhere needs its negative row keyed too**: `log_timestamps: false`
+  passes nothing, and on macOS nothing is ON — the daemon's file says off with
+  `no_log_timestamps: true` (#1437). A positively-named key would
   need an applier no flag has — a setting reachable from a file and not from argv,
   which is the second mechanism the whole arrangement removes. Only `true` and
   `false` are accepted: YAML 1.1's `yes`/`on` are a schema this reader would have to

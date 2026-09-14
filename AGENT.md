@@ -820,7 +820,7 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
   setting refuse every reload by name and a RELOADABLE one PUBLISH a wrong value. A setting a
   FILE can carry and argv cannot is that same defect standing still, so closing one spans
   `Config/` and `Platform/` in ONE change. Which key a row answers to is a COLUMN (`yamlKey`),
-  because the mapping is not derivable. A key naming no row is REFUSED. A row a file may not
+  because the mapping is not derivable. A key naming no row, or written twice, is REFUSED. A row a file may not
   carry is on a named list with a per-row reason, and the compile-time guard READS that list.
 - A flag whose meaning is its presence is a boolean in the file and `apply` runs on `true`
   alone — the key spells the FLAG. A repeatable row APPENDS, so the command line EMPTIES the
