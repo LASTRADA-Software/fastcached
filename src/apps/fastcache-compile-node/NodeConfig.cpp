@@ -1000,11 +1000,13 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
             .arity = Arity::Value,
             .operand = "=<path>",
             .apply = AssignFrom<&NodeConfig::dashboardTokenFile, ParsePathValue>(),
-            .description = "credential the dashboard requires, as Basic or Bearer.\n"
-                           "A FILE and not a flag: a command line is readable\n"
-                           "through ps. Its own secret rather than --requirepass,\n"
-                           "which every member of the fleet already holds. Required\n"
-                           "when --admin-listen is not on loopback.",
+            .description = "credential the fleet requires: the dashboard, as Basic or\n"
+                           "Bearer, and a live-stats fleet SUBSCRIBE, which carries\n"
+                           "it in the request. Without one the fleet streams to this\n"
+                           "machine only. A FILE and not a flag: a command line is\n"
+                           "readable through ps. Its own secret rather than\n"
+                           "--requirepass, which every member of the fleet already\n"
+                           "holds. Required when --admin-listen is not on loopback.",
             .yamlKey = "dashboard_token_file",
             .same = FieldEq<&NodeConfig::dashboardTokenFile>(),
         },
@@ -3465,10 +3467,14 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
           .message = "--dashboard needs --serve-scheduler: a node that runs no scheduler never leads a fleet, "
                      "so the page could only ever say it is not the leader. The fleet-wide facts live where "
                      "leadership does." },
-        { .refuses = [](NodeConfig const& c) { return !c.dashboardTokenFile.empty() && !c.dashboard; },
-          .message = "--dashboard-token-file guards the dashboard and nothing else, and --dashboard is not set. "
-                     "A secret an operator provisioned, being read by nobody, is the silent no-op this list "
-                     "exists to refuse." },
+        // The fleet's two readers are the dashboard page and the live-stats fleet stream, and both are served
+        // only by a node that runs the scheduler -- `--dashboard` already requires it. Keyed on the scheduler
+        // rather than on `--dashboard`, which was right until the stream arrived (#1399) and then refused the
+        // one way a leader with no admin surface can admit a remote watcher.
+        { .refuses = [](NodeConfig const& c) { return !c.dashboardTokenFile.empty() && !c.serveScheduler; },
+          .message = "--dashboard-token-file guards the fleet -- the dashboard and the live-stats fleet stream -- "
+                     "and this node runs no --serve-scheduler, so it serves neither. A secret an operator "
+                     "provisioned, being read by nobody, is the silent no-op this list exists to refuse." },
         { .refuses = [](NodeConfig const& c) { return c.tlsSelfSigned && !c.tlsCertFile.empty(); },
           .message = "--tls-self-signed and --tls-cert contradict each other: one generates a certificate and "
                      "the other names one. Silently preferring either would serve an identity the operator did "
