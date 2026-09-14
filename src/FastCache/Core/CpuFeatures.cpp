@@ -94,6 +94,7 @@ CpuFeatures DetectCpuFeatures() noexcept
     std::size_t size = sizeof(present);
     features.armSha2 = ::sysctlbyname("hw.optional.arm.FEAT_SHA256", &present, &size, nullptr, 0) == 0 && present != 0;
 #endif
+    // Linux aarch64 and Windows ARM64 detect nothing until a CI leg compiles a branch for them (#1432).
 
     return features;
 }

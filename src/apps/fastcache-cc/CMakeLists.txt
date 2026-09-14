@@ -100,7 +100,9 @@ set(_fc_cc_core
 # Core/CpuFeatures.cpp is how Sha256.cpp picks its engine at run time (#1420), so it
 # rides with that row. It costs nothing the rule protects either: it reaches the
 # standard library, the compiler's own <intrin.h> or <cpuid.h> on x86-64, and
-# <sys/sysctl.h> on arm64 macOS. No windows.h.
+# <sys/sysctl.h> on arm64 macOS. No windows.h. Sha256.cpp itself now also reaches
+# Core/EnumTable.hpp and Core/Ranges.hpp, both header-only and std-only, and the
+# compiler's own <immintrin.h> or <arm_neon.h>.
 #
 # Core/Compression.cpp is the one row here that is NOT dependency-free, and it is a
 # deliberate exception to the rule the comment above states.

@@ -1,9 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
+#include <FastCache/Core/CpuFeatures.hpp>
 #include <FastCache/Core/Endian.hpp>
+#include <FastCache/Core/EnumTable.hpp>
+#include <FastCache/Core/Ranges.hpp>
 #include <FastCache/Core/Sha256.hpp>
+
+#if defined(_M_X64) || defined(__x86_64__)
+    #include <immintrin.h>
+#elif defined(__APPLE__) && defined(__aarch64__)
+    #include <arm_neon.h>
+#endif
 
 #include <algorithm>
 #include <bit>
+#include <cassert>
+#include <cstring>
 #include <ranges>
 
 namespace FastCache
@@ -56,43 +67,309 @@ namespace
     {
         return std::rotr(x, 17) ^ std::rotr(x, 19) ^ (x >> 10U);
     }
-} // namespace
 
-void Sha256::Compress(std::span<std::byte const> block) noexcept
-{
-    std::array<std::uint32_t, 64> schedule {};
+    /// The eight working variables an engine compresses into.
+    using State = std::array<std::uint32_t, 8>;
 
-    // Big-endian by definition of the algorithm, and read through the helper
-    // rather than a native-order load: a host-order read would make the digest
-    // differ between machines, which for a MAC means two peers that can never
-    // authenticate each other.
-    for (auto const index: std::views::iota(std::size_t { 0 }, std::size_t { 16 }))
-        schedule[index] = ReadBigEndian<std::uint32_t>(block.subspan(index * 4, 4));
-
-    for (auto const index: std::views::iota(std::size_t { 16 }, std::size_t { 64 }))
-        schedule[index] = SmallSigma1(schedule[index - 2]) + schedule[index - 7] + SmallSigma0(schedule[index - 15])
-                          + schedule[index - 16];
-
-    auto working = _state;
-
-    for (auto const index: std::views::iota(std::size_t { 0 }, std::size_t { 64 }))
+    /// FIPS 180-4 §6.2.2, one block at a time, spelled as the standard spells it.
+    /// The `Scalar` engine, and the reference the others are checked against.
+    /// @param state The running state.
+    /// @param blocks A whole number of 64-byte blocks.
+    void CompressBlocksScalar(State& state, std::span<std::byte const> blocks) noexcept
     {
-        auto const temp1 = working[7] + BigSigma1(working[4]) + Choose(working[4], working[5], working[6])
-                           + RoundConstants[index] + schedule[index];
-        auto const temp2 = BigSigma0(working[0]) + Majority(working[0], working[1], working[2]);
+        for (auto const blockIndex: std::views::iota(std::size_t { 0 }, blocks.size() / Sha256::BlockSize))
+        {
+            auto const block = blocks.subspan(blockIndex * Sha256::BlockSize, Sha256::BlockSize);
+            std::array<std::uint32_t, 64> schedule {};
 
-        working[7] = working[6];
-        working[6] = working[5];
-        working[5] = working[4];
-        working[4] = working[3] + temp1;
-        working[3] = working[2];
-        working[2] = working[1];
-        working[1] = working[0];
-        working[0] = temp1 + temp2;
+            // Big-endian by definition of the algorithm, and read through the helper
+            // rather than a native-order load: a host-order read would make the digest
+            // differ between machines, which for a MAC means two peers that can never
+            // authenticate each other.
+            for (auto const index: std::views::iota(std::size_t { 0 }, std::size_t { 16 }))
+                schedule[index] = ReadBigEndian<std::uint32_t>(block.subspan(index * 4, 4));
+
+            for (auto const index: std::views::iota(std::size_t { 16 }, std::size_t { 64 }))
+                schedule[index] = SmallSigma1(schedule[index - 2]) + schedule[index - 7] + SmallSigma0(schedule[index - 15])
+                                  + schedule[index - 16];
+
+            auto working = state;
+
+            for (auto const index: std::views::iota(std::size_t { 0 }, std::size_t { 64 }))
+            {
+                auto const temp1 = working[7] + BigSigma1(working[4]) + Choose(working[4], working[5], working[6])
+                                   + RoundConstants[index] + schedule[index];
+                auto const temp2 = BigSigma0(working[0]) + Majority(working[0], working[1], working[2]);
+
+                working[7] = working[6];
+                working[6] = working[5];
+                working[5] = working[4];
+                working[4] = working[3] + temp1;
+                working[3] = working[2];
+                working[2] = working[1];
+                working[1] = working[0];
+                working[0] = temp1 + temp2;
+            }
+
+            for (auto const index: std::views::iota(std::size_t { 0 }, state.size()))
+                state[index] += working[index];
+        }
     }
 
-    for (auto const index: std::views::iota(std::size_t { 0 }, _state.size()))
-        _state[index] += working[index];
+    /// An engine's code: compress whole blocks into the running state.
+    using CompressBlocksFunction = void (*)(State& state, std::span<std::byte const> blocks) noexcept;
+
+#if defined(_M_X64) || defined(__x86_64__)
+    // gcc and clang (clang-cl included) may emit these instructions only in a function
+    // that asks for them, so the scalar code and every other translation unit stay free
+    // of instructions an older CPU lacks. MSVC's cl allows the intrinsics anywhere and
+    // does not know the attribute.
+    #if defined(__GNUC__) || defined(__clang__)
+        #define FASTCACHED_SHA_NI_TARGET __attribute__((target("sha,ssse3,sse4.1")))
+    #else
+        #define FASTCACHED_SHA_NI_TARGET
+    #endif
+
+    /// One of a block's four message vectors, in the byte order SHA-256 reads.
+    /// @param block The 64-byte block.
+    /// @param index Which of its four 16-byte words.
+    /// @return The words as one vector.
+    [[nodiscard]] FASTCACHED_SHA_NI_TARGET __m128i LoadWordsX86(std::span<std::byte const> block, std::size_t index) noexcept
+    {
+        // SHA-256 reads its words big-endian; x86 loads them little-endian.
+        __m128i const byteSwap = _mm_set_epi64x(0x0c0d0e0f08090a0bLL, 0x0405060700010203LL);
+        __m128i words {};
+        std::memcpy(&words, block.subspan(index * 16, 16).data(), sizeof(words));
+        return _mm_shuffle_epi8(words, byteSwap);
+    }
+
+    /// The x86 SHA extensions, in Intel's SHA-NI construction. `_mm_sha256rnds2_epu32`
+    /// performs two rounds, the message expansion is `sha256msg1` then `sha256msg2`,
+    /// and the state is held as the two lanes that instruction wants, ABEF and CDGH.
+    /// @param state The running state.
+    /// @param blocks A whole number of 64-byte blocks.
+    FASTCACHED_SHA_NI_TARGET void CompressBlocksX86ShaNi(State& state, std::span<std::byte const> blocks) noexcept
+    {
+        __m128i high {};
+        __m128i low {};
+        std::memcpy(&high, state.data(), sizeof(high));
+        std::memcpy(&low, std::span { state }.subspan(4).data(), sizeof(low));
+        high = _mm_shuffle_epi32(high, 0xB1); // CDAB
+        low = _mm_shuffle_epi32(low, 0x1B);   // HGFE
+        __m128i abef = _mm_alignr_epi8(high, low, 8);
+        __m128i cdgh = _mm_blend_epi16(low, high, 0xF0);
+
+        for (auto const blockIndex: std::views::iota(std::size_t { 0 }, blocks.size() / Sha256::BlockSize))
+        {
+            auto const block = blocks.subspan(blockIndex * Sha256::BlockSize, Sha256::BlockSize);
+
+            // The message schedule as a window of four vectors (four words each): the
+            // block's own sixteen words first, then each vector expanded from the four
+            // before it, as the window slides.
+            auto w0 = LoadWordsX86(block, 0);
+            auto w1 = LoadWordsX86(block, 1);
+            auto w2 = LoadWordsX86(block, 2);
+            auto w3 = LoadWordsX86(block, 3);
+
+            auto const savedAbef = abef;
+            auto const savedCdgh = cdgh;
+            for (auto const index: std::views::iota(std::size_t { 0 }, RoundConstants.size() / 4))
+            {
+                auto const constants = std::span { RoundConstants }.subspan(index * 4, 4);
+                auto const message = _mm_add_epi32(w0,
+                                                   _mm_set_epi32(static_cast<int>(constants[3]),
+                                                                 static_cast<int>(constants[2]),
+                                                                 static_cast<int>(constants[1]),
+                                                                 static_cast<int>(constants[0])));
+                cdgh = _mm_sha256rnds2_epu32(cdgh, abef, message);
+                abef = _mm_sha256rnds2_epu32(abef, cdgh, _mm_shuffle_epi32(message, 0x0E));
+
+                auto const next =
+                    _mm_sha256msg2_epu32(_mm_add_epi32(_mm_sha256msg1_epu32(w0, w1), _mm_alignr_epi8(w3, w2, 4)), w3);
+                w0 = w1;
+                w1 = w2;
+                w2 = w3;
+                w3 = next;
+            }
+            abef = _mm_add_epi32(abef, savedAbef);
+            cdgh = _mm_add_epi32(cdgh, savedCdgh);
+        }
+
+        auto const feba = _mm_shuffle_epi32(abef, 0x1B);
+        auto const dchg = _mm_shuffle_epi32(cdgh, 0xB1);
+        high = _mm_blend_epi16(feba, dchg, 0xF0); // DCBA
+        low = _mm_alignr_epi8(dchg, feba, 8);     // HGFE
+        std::memcpy(state.data(), &high, sizeof(high));
+        std::memcpy(std::span { state }.subspan(4).data(), &low, sizeof(low));
+    }
+
+    #undef FASTCACHED_SHA_NI_TARGET
+
+    constexpr bool X86ShaNiCompiledIn = true;
+    constexpr CompressBlocksFunction X86ShaNiBlocks = &CompressBlocksX86ShaNi;
+#else
+    constexpr bool X86ShaNiCompiledIn = false;
+    constexpr CompressBlocksFunction X86ShaNiBlocks = nullptr;
+#endif
+
+#if defined(__APPLE__) && defined(__aarch64__)
+    // Every Apple arm64 CPU has these instructions and the default target enables them,
+    // but a build given an explicit older -march (armv8-a) refuses to inline them into a
+    // function that does not ask: measured with clang 20, "always_inline function
+    // 'vsha256hq_u32' requires target feature 'sha2'". Only clang compiles this block.
+    #define FASTCACHED_ARM_SHA2_TARGET __attribute__((target("sha2")))
+
+    /// One of a block's four message vectors, in the byte order SHA-256 reads.
+    /// @param block The 64-byte block.
+    /// @param index Which of its four 16-byte words.
+    /// @return The words as one vector.
+    [[nodiscard]] FASTCACHED_ARM_SHA2_TARGET uint32x4_t LoadWordsArm(std::span<std::byte const> block,
+                                                                     std::size_t index) noexcept
+    {
+        std::array<std::uint8_t, 16> bytes {};
+        std::memcpy(bytes.data(), block.subspan(index * 16, 16).data(), bytes.size());
+        return vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(bytes.data())));
+    }
+
+    /// The ARMv8 SHA-256 instructions. `vsha256hq_u32` and `vsha256h2q_u32` perform
+    /// four rounds between them, and the message expansion is `sha256su0` then
+    /// `sha256su1`. Compiled only where a CI leg builds it (see `CpuFeatures`).
+    /// @param state The running state.
+    /// @param blocks A whole number of 64-byte blocks.
+    FASTCACHED_ARM_SHA2_TARGET void CompressBlocksArmSha2(State& state, std::span<std::byte const> blocks) noexcept
+    {
+        uint32x4_t abcd = vld1q_u32(state.data());
+        uint32x4_t efgh = vld1q_u32(std::span { state }.subspan(4).data());
+
+        for (auto const blockIndex: std::views::iota(std::size_t { 0 }, blocks.size() / Sha256::BlockSize))
+        {
+            auto const block = blocks.subspan(blockIndex * Sha256::BlockSize, Sha256::BlockSize);
+
+            // The same window of four message vectors as the x86 engine's.
+            auto w0 = LoadWordsArm(block, 0);
+            auto w1 = LoadWordsArm(block, 1);
+            auto w2 = LoadWordsArm(block, 2);
+            auto w3 = LoadWordsArm(block, 3);
+
+            auto const savedAbcd = abcd;
+            auto const savedEfgh = efgh;
+            for (auto const index: std::views::iota(std::size_t { 0 }, RoundConstants.size() / 4))
+            {
+                auto const message = vaddq_u32(w0, vld1q_u32(std::span { RoundConstants }.subspan(index * 4, 4).data()));
+                auto const abcdBefore = abcd;
+                abcd = vsha256hq_u32(abcd, efgh, message);
+                efgh = vsha256h2q_u32(efgh, abcdBefore, message);
+
+                auto const next = vsha256su1q_u32(vsha256su0q_u32(w0, w1), w2, w3);
+                w0 = w1;
+                w1 = w2;
+                w2 = w3;
+                w3 = next;
+            }
+            abcd = vaddq_u32(abcd, savedAbcd);
+            efgh = vaddq_u32(efgh, savedEfgh);
+        }
+
+        vst1q_u32(state.data(), abcd);
+        vst1q_u32(std::span { state }.subspan(4).data(), efgh);
+    }
+
+    #undef FASTCACHED_ARM_SHA2_TARGET
+
+    constexpr bool ArmSha2CompiledIn = true;
+    constexpr CompressBlocksFunction ArmSha2Blocks = &CompressBlocksArmSha2;
+#else
+    constexpr bool ArmSha2CompiledIn = false;
+    constexpr CompressBlocksFunction ArmSha2Blocks = nullptr;
+#endif
+
+    /// One engine: whether this build carries it, what it needs of the CPU, and its code.
+    struct EngineRow
+    {
+        Sha256Engine engine;
+        std::string_view name;
+        bool compiledIn;
+        bool (*needs)(CpuFeatures const& features) noexcept;
+        CompressBlocksFunction compressBlocks;
+    };
+
+    constexpr EnumTable<Sha256Engine, EngineRow> EngineRows { {
+        { .engine = Sha256Engine::Scalar,
+          .name = "scalar",
+          .compiledIn = true,
+          .needs = [](CpuFeatures const&) noexcept { return true; },
+          .compressBlocks = &CompressBlocksScalar },
+        { .engine = Sha256Engine::X86ShaNi,
+          .name = "x86-sha-ni",
+          .compiledIn = X86ShaNiCompiledIn,
+          .needs =
+              [](CpuFeatures const& features) noexcept { return features.x86Sha && features.x86Ssse3 && features.x86Sse41; },
+          .compressBlocks = X86ShaNiBlocks },
+        { .engine = Sha256Engine::ArmSha2,
+          .name = "arm-sha2",
+          .compiledIn = ArmSha2CompiledIn,
+          .needs = [](CpuFeatures const& features) noexcept { return features.armSha2; },
+          .compressBlocks = ArmSha2Blocks },
+    } };
+    static_assert(RowsInEnumeratorOrder(EngineRows, &EngineRow::engine));
+
+    /// The row for @p engine.
+    /// @param engine The engine.
+    /// @return Its row.
+    [[nodiscard]] EngineRow const& RowOf(Sha256Engine engine) noexcept
+    {
+        return EngineRows[static_cast<std::size_t>(engine)];
+    }
+
+    /// This process's CPU, read once, for the reason `ActiveSha256Engine` states.
+    /// @return What the CPU offers.
+    [[nodiscard]] CpuFeatures const& ProcessCpuFeatures() noexcept
+    {
+        static CpuFeatures const features = DetectCpuFeatures();
+        return features;
+    }
+} // namespace
+
+std::string_view Sha256EngineName(Sha256Engine engine) noexcept
+{
+    return RowOf(engine).name;
+}
+
+bool Sha256EngineRunsOn(Sha256Engine engine, CpuFeatures const& features) noexcept
+{
+    auto const& row = RowOf(engine);
+    return row.compiledIn && row.needs(features);
+}
+
+Sha256Engine SelectSha256Engine(CpuFeatures const& features) noexcept
+{
+    // Any hardware engine beats Scalar, and a build carries at most one.
+    auto const* const hardware = FindIfOrNull(std::span { EngineRows }.subspan(1), [&features](EngineRow const& row) {
+        return row.compiledIn && row.needs(features);
+    });
+    return hardware != nullptr ? hardware->engine : Sha256Engine::Scalar;
+}
+
+Sha256Engine ActiveSha256Engine() noexcept
+{
+    static Sha256Engine const active = SelectSha256Engine(ProcessCpuFeatures());
+    return active;
+}
+
+Sha256::Sha256() noexcept:
+    Sha256(ActiveSha256Engine())
+{
+}
+
+Sha256::Sha256(Sha256Engine engine) noexcept:
+    _engine { engine }
+{
+    assert(Sha256EngineRunsOn(engine, ProcessCpuFeatures()));
+}
+
+void Sha256::CompressBlocks(std::span<std::byte const> blocks) noexcept
+{
+    RowOf(_engine).compressBlocks(_state, blocks);
 }
 
 void Sha256::Update(std::span<std::byte const> input) noexcept
@@ -111,14 +388,17 @@ void Sha256::Update(std::span<std::byte const> input) noexcept
         if (_pendingSize < BlockSize)
             return;
 
-        Compress(_pending);
+        CompressBlocks(_pending);
         _pendingSize = 0;
     }
 
-    while (input.size() >= BlockSize)
+    // Every whole block in one call, so an engine keeps its state in its own form
+    // across the run rather than converting it back per block.
+    auto const whole = input.size() - (input.size() % BlockSize);
+    if (whole != 0)
     {
-        Compress(input.first(BlockSize));
-        input = input.subspan(BlockSize);
+        CompressBlocks(input.first(whole));
+        input = input.subspan(whole);
     }
 
     std::ranges::copy(input, _pending.begin());
@@ -139,13 +419,13 @@ Sha256::Digest Sha256::Finish() noexcept
     if (_pendingSize > BlockSize - 8)
     {
         std::ranges::fill(std::span { _pending }.subspan(_pendingSize), std::byte { 0 });
-        Compress(_pending);
+        CompressBlocks(_pending);
         _pendingSize = 0;
     }
 
     std::ranges::fill(std::span { _pending }.subspan(_pendingSize, BlockSize - 8 - _pendingSize), std::byte { 0 });
     WriteBigEndian<std::uint64_t>(std::span { _pending }.subspan(BlockSize - 8, 8), bitLength);
-    Compress(_pending);
+    CompressBlocks(_pending);
 
     Digest digest {};
     for (auto const index: std::views::iota(std::size_t { 0 }, _state.size()))
@@ -155,7 +435,12 @@ Sha256::Digest Sha256::Finish() noexcept
 
 Sha256::Digest Sha256::Hash(std::span<std::byte const> input) noexcept
 {
-    Sha256 hasher;
+    return Hash(input, ActiveSha256Engine());
+}
+
+Sha256::Digest Sha256::Hash(std::span<std::byte const> input, Sha256Engine engine) noexcept
+{
+    Sha256 hasher { engine };
     hasher.Update(input);
     return hasher.Finish();
 }
