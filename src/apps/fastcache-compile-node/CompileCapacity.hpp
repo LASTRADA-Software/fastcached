@@ -14,12 +14,47 @@
 #include <cstdint>
 #include <mutex>
 #include <optional>
+#include <stop_token>
 #include <vector>
 
 #include <WorkerProtocol.hpp>
 
 namespace FastCache::Node
 {
+
+/// What `CompileCapacity::TryTakeSlot` decided about one compile.
+///
+/// Four answers rather than a `bool`, because three of them are refusals an operator
+/// acts on differently -- each is its own `CompileRefusal` row and its own counter --
+/// and the decision between them has to be made in ONE step with the take. A cordon
+/// checked beside the take rather than inside it lets a compile slip in after the
+/// cordon's own drained report, which is then a report that stopping this node abandons
+/// nothing, written while it would abandon something.
+///
+/// Private to this process: nothing transmits or persists it.
+enum class SlotAdmission : std::uint8_t
+{
+    Taken,    ///< A slot was taken; the caller owes a `ReleaseSlot`.
+    Stopping, ///< This worker has begun stopping.
+    Cordoned, ///< An operator cordoned this worker.
+    Full,     ///< Every slot is busy.
+    Last,     ///< Not a decision; `EnumTable`'s length.
+};
+
+/// How the heartbeat's wait between two rounds ended.
+///
+/// Three answers, because the caller does something different for each: a stop ends
+/// the loop, and the other two start a round -- but only one of them is an event worth
+/// asserting, since a heartbeat that merely came round again would announce a changed
+/// cordon too, a whole interval late.
+///
+/// Private to this process: nothing transmits or persists it.
+enum class HeartbeatWake : std::uint8_t
+{
+    Elapsed,       ///< The interval passed and the cordon is still what was announced.
+    CordonChanged, ///< The cordon moved away from what the last round announced.
+    Stopped,       ///< A stop was requested, before the wait or during it.
+};
 
 /// What a worker may spend on compiles at once, and how it stops.
 ///
@@ -45,6 +80,13 @@ namespace FastCache::Node
 ///     memory — which is why `EndpointBusy` is a separate refusal from `NoCapacity`.
 ///     An operator sent to buy machines over a transient byte budget is being sent
 ///     to fix something that was never wrong.
+///
+/// **And whether an operator has cordoned it** (#1303), which is admission state for the
+/// same reason the shutdown is: a cordon refuses new compiles and lets the running ones
+/// finish, so it is asked at the take and answered at the release. It lives on this
+/// object and nowhere else -- not in the configuration, not in the cluster's replicated
+/// state -- so a restart un-cordons by construction. A cordon that survived a restart
+/// would be a machine that silently never came back to the fleet.
 ///
 /// Not thread-safe by accident: it is thread-safe on purpose, because the compiles
 /// it counts run on an executor while the loop that admitted them keeps accepting.
@@ -123,12 +165,53 @@ class CompileCapacity
         std::size_t _bytes;
     };
 
-    /// Take one slot, if the cap allows.
-    /// @return True when a slot was taken; the caller then owes a `ReleaseSlot`.
-    [[nodiscard]] bool TryTakeSlot() noexcept;
+    /// Take one slot, unless this worker is stopping, is cordoned, or is full.
+    ///
+    /// Under the drain's mutex, which is what makes the cordon and the take one step: see
+    /// `SlotAdmission`.
+    /// @return `Taken` when a slot was taken, and the caller then owes a `ReleaseSlot`;
+    ///         otherwise which refusal this is.
+    [[nodiscard]] SlotAdmission TryTakeSlot() noexcept;
 
-    /// Give one slot back, and wake a drain that may be waiting on it.
+    /// Give one slot back, wake a drain that may be waiting on it, and report a cordoned
+    /// worker that has just drained.
     void ReleaseSlot() noexcept;
+
+    /// Cordon this worker, or lift its cordon.
+    ///
+    /// Idempotent: asking for the state it already has changes nothing and reports
+    /// nothing, so a script that cordons twice does not log a second drained line.
+    /// Cordoning a worker with nothing running reports it drained at once -- the report
+    /// is the moment `ReleaseSlot` would have made it, and that moment has already passed.
+    /// @param cordoned True to refuse new compiles, false to take them again.
+    /// @return The state after the request took effect.
+    CompileCacheWire::CordonFields Cordon(bool cordoned);
+
+    /// @return Whether an operator has cordoned this worker.
+    [[nodiscard]] bool IsCordoned() const noexcept;
+
+    /// @return Serving, or cordoned and whether anything is still running.
+    [[nodiscard]] CompileCacheWire::WireCordonState CordonState() const noexcept;
+
+    /// Wait out the heartbeat interval, ending early on a stop or on the cordon moving.
+    ///
+    /// A heartbeat is the only way the scheduler learns a cordon -- nothing replicates
+    /// it -- so a cordon that waited for the next scheduled round would leave this worker
+    /// leased for up to a whole interval, every job refused here and compiled locally by
+    /// its client. So `Cordon` wakes this wait (#1303).
+    ///
+    /// **The stop token and the cordon both take part in the wait**, the rule #1339 set
+    /// for this loop: a poll in slices observes either a slice late and spends a wakeup
+    /// per slice doing it. A condition variable, never `atomic::wait`, for `Drain`'s reason.
+    /// @param stop Participates in the wait; a request ends it at once.
+    /// @param announced The cordon the last round carried to the scheduler.
+    /// @param interval How long to wait when nothing changes.
+    /// @return Which of the three ENDED it: a stop wins over a cordon that moved as well,
+    ///         and a cordon that moved without waking the wait before the interval ran
+    ///         out is `Elapsed`, since the interval is what ended it.
+    [[nodiscard]] HeartbeatWake WaitForHeartbeat(std::stop_token const& stop,
+                                                 bool announced,
+                                                 std::chrono::milliseconds interval);
 
     /// Reserve @p want bytes of request payload.
     /// @param want How many bytes this request declared.
@@ -227,12 +310,19 @@ class CompileCapacity
     std::chrono::seconds _drainTimeout;
     ILogger& _logger;
 
+    /// Say that a cordoned worker has nothing running. Called under `_drainMutex`.
+    void ReportDrained() const;
+
     std::atomic<bool> _shuttingDown { false };
+    std::atomic<bool> _cordoned { false };
     std::atomic<std::size_t> _bytesInFlight { 0 };
     std::atomic<std::size_t> _inFlight { 0 };
 
     std::mutex _drainMutex;
     std::condition_variable _drained;
+    /// Notified by `Cordon` whenever the cordon moves; waited on by `WaitForHeartbeat`.
+    /// `_any` because the wait takes a stop token.
+    std::condition_variable_any _cordonMoved;
 };
 
 // --- what the compile surface refuses with, and how a stop ends -----------------
@@ -345,6 +435,32 @@ namespace CompileRefusal
     inline constexpr Cc::SurfaceRefusal Stopping {
         .code = CompileCacheWire::ErrorCode::NoCapacity,
         .counter = IMetricsSink::Counter::WorkerJobsRefusedStopping,
+    };
+    /// An operator cordoned this worker (#1303).
+    ///
+    /// `NoCapacity` on the wire for `Stopping`'s reason -- the client compiles locally
+    /// either way -- and its own counter for the reason `Stopping` has one: a stop ends by
+    /// itself and a cordon lasts until a person lifts it.
+    inline constexpr Cc::SurfaceRefusal Cordoned {
+        .code = CompileCacheWire::ErrorCode::NoCapacity,
+        .counter = IMetricsSink::Counter::WorkerJobsRefusedCordoned,
+    };
+    /// A cordon asked for from another machine.
+    ///
+    /// `NotAMember`, the code the cache tier refuses a stranger with for the same rule:
+    /// this verb serves this machine only.
+    inline constexpr Cc::SurfaceRefusal CordonNotLocal {
+        .code = CompileCacheWire::ErrorCode::NotAMember,
+        .counter = IMetricsSink::Counter::WorkerCordonsRefusedNotLocal,
+    };
+    /// A cordon whose one-byte payload would not decode.
+    ///
+    /// The worker's undecodable-payload series, which is what `Cc::WorkerProtocol` counts a
+    /// COMPILE that would not decode under: the refusal is the same one, on another verb of
+    /// the same surface.
+    inline constexpr Cc::SurfaceRefusal MalformedPayload {
+        .code = CompileCacheWire::ErrorCode::MalformedFrame,
+        .counter = IMetricsSink::Counter::WorkerFramesRefusedMalformedPayload,
     };
     /// A pre-payload decision naming a verb this build has no row for.
     inline constexpr Cc::SurfaceRefusal UnknownOpcode {

@@ -87,6 +87,19 @@ enum class EnrollAction : std::uint8_t
     Last, ///< Not an action: the length of a table keyed by one.
 };
 
+/// What an operator asked this machine's own worker to do about a cordon, instead of
+/// serving (#1303).
+///
+/// A private enum: parsed from argv and read by one early verb, and no byte of it reaches
+/// a wire or a file -- the wire has its own `CompileCacheWire::CordonAction`. `None` is the
+/// ordinary case, a worker starting up.
+enum class CordonCommand : std::uint8_t
+{
+    None = 0, ///< Serve, rather than cordon.
+    Cordon,   ///< Refuse new compiles and let the running ones finish.
+    Lift,     ///< Take compiles again.
+};
+
 /// One enrollment-administration request, as parsed from the command line.
 struct EnrollCommand
 {
@@ -769,6 +782,15 @@ struct NodeConfig
     std::string seedConfigTemplate;
 
     bool printSurfaces { false };
+
+    /// Whether to cordon this machine's own worker, or lift its cordon, instead of serving.
+    ///
+    /// A mode rather than a serving option, like `--install-service`, and for the reason
+    /// that matters most here: a cordon that a service registration or a configuration
+    /// file replayed at every start would be exactly the machine that silently never
+    /// comes back to the fleet -- which is why the cordon itself lives in the running
+    /// worker's memory and nowhere else.
+    CordonCommand cordon { CordonCommand::None };
 
     /// What to do to the cluster instead of serving, when anything.
     ///

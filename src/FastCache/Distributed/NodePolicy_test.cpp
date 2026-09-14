@@ -348,6 +348,57 @@ TEST_CASE("Naming the limit that withdrew a machine's slots", "[distributed][nod
     }
 }
 
+TEST_CASE("A cordoned machine offers nothing, and the cordon is what the report names",
+          "[distributed][nodepolicy][slotlimit][cordon]")
+{
+    // #1303. The scheduler's `Pick` skips a machine through `AvailableSlots`, so a cordon
+    // that did not reach this arithmetic would be a machine still handed work.
+    constexpr NodeCapacity machine { .logicalCores = 16,
+                                     .totalMemoryBytes = 32ULL << 30,
+                                     .nodeClass = NodeClass::Dedicated };
+
+    SECTION("an idle machine with every resource free")
+    {
+        constexpr NodeLoad idle { .inFlight = 0,
+                                  .cpuBusyPermille = std::nullopt,
+                                  .availableMemoryBytes = std::nullopt,
+                                  .freeScratchBytes = std::nullopt,
+                                  .cache = {},
+                                  .cordoned = true };
+        constexpr auto ceilings = SlotCeilingsFor(machine, 16, idle);
+        STATIC_REQUIRE(ceilings.available == 0);
+        STATIC_REQUIRE(ceilings.binding == SlotLimit::Cordoned);
+        STATIC_REQUIRE(AvailableSlots(machine, 16, idle) == 0);
+    }
+
+    SECTION("a machine whose scratch disk has also filled names the cordon, not the disk")
+    {
+        // The one exception to the first-in-enumerator-order tie rule. Scratch reaches
+        // zero here too, and naming it would send an operator to free a disk on a machine
+        // that stays out of the fleet until a person lifts the cordon.
+        constexpr NodeLoad full { .inFlight = 0,
+                                  .cpuBusyPermille = std::nullopt,
+                                  .availableMemoryBytes = std::nullopt,
+                                  .freeScratchBytes = 0,
+                                  .cache = {},
+                                  .cordoned = true };
+        constexpr auto ceilings = SlotCeilingsFor(machine, 16, full);
+        STATIC_REQUIRE(ceilings.byScratch == 0U);
+        STATIC_REQUIRE(ceilings.available == 0);
+        STATIC_REQUIRE(ceilings.binding == SlotLimit::Cordoned);
+    }
+
+    SECTION("the same machine uncordoned offers what its resources allow")
+    {
+        constexpr auto ceilings = SlotCeilingsFor(machine, 16, WithScratch(1, 640ULL << 20));
+        STATIC_REQUIRE(ceilings.available == 6);
+        STATIC_REQUIRE(ceilings.binding == SlotLimit::Scratch);
+    }
+
+    CHECK(TraitsFor(SlotLimit::Cordoned).name == "cordoned");
+    CHECK(TraitsFor(SlotLimit::Cordoned).remedy.contains("uncordon"));
+}
+
 TEST_CASE("The unfolded ceilings agree with the number the scheduler uses", "[distributed][nodepolicy][slotlimit]")
 {
     // The property that says the refactor changed nothing: `AvailableSlots` IS the

@@ -870,6 +870,18 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
             .yamlKey = "cluster_dir",
             .same = FieldEq<&NodeConfig::clusterDir>(),
         },
+        { .primary = "--cordon",
+          .arity = Arity::None,
+          .apply = SelectOutcome<&NodeConfig::cordon, CordonCommand::Cordon>(),
+          .description = "cordon the worker running on THIS machine, then exit:\n"
+                         "it refuses new compiles and finishes the running ones,\n"
+                         "and logs once it has drained. Asks this node's own\n"
+                         "--listen-node. Held in memory: a restart lifts it." },
+        { .primary = "--uncordon",
+          .arity = Arity::None,
+          .apply = SelectOutcome<&NodeConfig::cordon, CordonCommand::Lift>(),
+          .description = "lift the cordon on the worker running on this machine,\n"
+                         "then exit." },
         { .primary = "--cluster-status",
           .arity = Arity::None,
           .apply = SelectClusterAction<ClusterAction::Status>(),
@@ -1556,6 +1568,10 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
         { "--seed-config",
           "installs the file a key would be read from, then exits; a key for it would re-seed at every start" },
         { "--print-surfaces", "prints the ports and exits; a key would print them instead of serving them" },
+        { "--cordon",
+          "cordons the running worker and exits; a key would cordon it at every start, which is a machine that "
+          "never comes back to the fleet" },
+        { "--uncordon", "lifts the running worker's cordon and exits" },
         { "--cluster-status", "asks a running cluster a question and exits" },
         { "--cluster-set", "changes a running cluster's settings and exits" },
         { "--cluster-admit", "admits a member and exits" },

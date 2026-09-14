@@ -1714,3 +1714,94 @@ TEST_CASE("a node-status refused on the wire version names both versions and doe
     // The control: an unimplemented verb keeps the daemon's sentence.
     CHECK(IdentityFor(RefusalReply(Cc::UnimplementedVerb)).detail.contains("not a compile node"));
 }
+
+// ---------------------------------------------------------------------------
+// #1303: `cordon` and `uncordon` take this machine's worker out of the fleet and back.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("cordon and uncordon send the cordon verb carrying the action each names", "[cli][node][cordon]")
+{
+    // The bytes, not only the rendering: a scripted node answers both actions the same
+    // way, so a verb that sent the wrong one would render exactly as a right one.
+    for (auto const& [verb, action]: { std::pair { std::string_view { "cordon" }, Cc::CordonAction::Cordon },
+                                       std::pair { std::string_view { "uncordon" }, Cc::CordonAction::Lift } })
+    {
+        INFO("verb: " << verb);
+        ScriptedNodeExchange node { { Cc::EncodeReply(
+            Cc::Status::Ok, Cc::EncodeCordonFields({ .state = Cc::WireCordonState::Serving, .inFlight = 0 })) } };
+        (void) RunNodeVerb(verb, node);
+
+        REQUIRE(node.Sent().size() == 1);
+        CHECK(OpOf(node.Sent()[0]) == 0x13);
+        CHECK(node.Sent()[0] == Cc::EncodeCordonRequest(action));
+    }
+}
+
+TEST_CASE("cordon reports the state it left the worker in and what is still running", "[cli][node][cordon]")
+{
+    SECTION("draining names the running compiles and what `node` will say when they are gone")
+    {
+        ScriptedNodeExchange node { { Cc::EncodeReply(
+            Cc::Status::Ok, Cc::EncodeCordonFields({ .state = Cc::WireCordonState::Draining, .inFlight = 2 })) } };
+        auto const answer = RunNodeVerb("cordon", node);
+
+        CHECK(answer.outcome == Outcome::Affirmative);
+        CHECK(RequiredCell(answer, "cordon").lexical == "draining");
+        CHECK(RequiredCell(answer, "compiles-in-flight").lexical == "2");
+        CHECK(RequiredCell(answer, "compiles-in-flight").kind == CellKind::Number);
+        CHECK(AdvisoryText(answer).contains("2 compile(s) still running"));
+        // And that the cordon ends with the process, which is what an operator who
+        // expected it to persist across a reboot has to be told.
+        CHECK(AdvisoryText(answer).contains("NOT persisted"));
+    }
+
+    SECTION("drained says nothing is running, and lifting it warns of nothing")
+    {
+        ScriptedNodeExchange node { { Cc::EncodeReply(
+            Cc::Status::Ok, Cc::EncodeCordonFields({ .state = Cc::WireCordonState::Serving, .inFlight = 0 })) } };
+        auto const answer = RunNodeVerb("uncordon", node);
+
+        CHECK(RequiredCell(answer, "cordon").lexical == "serving");
+        CHECK_FALSE(AdvisoryText(answer).contains("still running"));
+        CHECK_FALSE(AdvisoryText(answer).contains("NOT persisted"));
+    }
+
+    SECTION("a reply body this build cannot read is refused, not rendered")
+    {
+        std::vector<std::byte> const noPayload;
+        ScriptedNodeExchange node { { Cc::EncodeReply(Cc::Status::Ok, noPayload) } };
+        auto const answer = RunNodeVerb("cordon", node);
+
+        CHECK(answer.outcome == Outcome::Protocol);
+        CHECK(AdvisoryText(answer).contains("cannot read"));
+    }
+}
+
+TEST_CASE("`node` renders the cordon, and says nothing on a node with no worker", "[cli][node][verbs][cordon]")
+{
+    SECTION("a cordoned worker is shown draining")
+    {
+        ScriptedNodeExchange node { { StatusReply(
+            { .version = "1.2.3",
+              .nodeId = "node-a",
+              .uptimeSeconds = 5,
+              .surfaces = {},
+              .components = Cc::NodeComponentBit::Worker,
+              .runtime = { .compileSlots = 4, .compilesInFlight = 1, .cordon = Cc::WireCordonState::Draining } }) } };
+        auto const answer = RunNodeVerb("node", node);
+        CHECK(RequiredCell(answer, "cordon").lexical == "draining");
+    }
+
+    SECTION("a node that runs no worker says NOTHING rather than a reassuring serving")
+    {
+        ScriptedNodeExchange node { { StatusReply({ .version = "1.2.3",
+                                                    .nodeId = "node-a",
+                                                    .uptimeSeconds = 5,
+                                                    .surfaces = {},
+                                                    .components = Cc::NodeComponentBit::Scheduler,
+                                                    .runtime = {} }) } };
+        auto const answer = RunNodeVerb("node", node);
+        CHECK(answer.outcome == Outcome::Affirmative);
+        CHECK(CellOf(answer, "cordon") == nullptr);
+    }
+}

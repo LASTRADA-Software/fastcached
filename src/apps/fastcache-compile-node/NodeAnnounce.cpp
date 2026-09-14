@@ -52,7 +52,8 @@ AnnounceOutcome AnnounceOnce(HeartbeatRound const& round, ISocket& client, std::
                                                                 .cpuBusyPermille = sampled.cpuBusyPermille,
                                                                 .availableMemoryBytes = sampled.availableMemoryBytes,
                                                                 .freeScratchBytes = sampled.freeScratchBytes,
-                                                                .cache = CacheLoadOf(round.cacheTier, round.metrics) });
+                                                                .cache = CacheLoadOf(round.cacheTier, round.metrics),
+                                                                .cordoned = round.capacity.IsCordoned() });
 
     // This machine's own closed buckets, so the fleet's record of it survives an
     // election. Bounded per round: a node absent for a day has 1440 to hand over and
@@ -160,6 +161,17 @@ AnnounceOutcome AnnounceOnce(HeartbeatRound const& round, ISocket& client, std::
             round.lease.fleet.Pin(registrar.ClusterId());
             ++accepted;
             ++registrations;
+
+            // A registration carries no load, so a scheduler that has just (re)admitted a
+            // CORDONED worker believes it serving until its next heartbeat -- a new leader
+            // after an election, most often, which is exactly when nothing else tells it
+            // (#1303: nothing replicates a cordon). Said at once instead, and only then: a
+            // serving worker's registration already reads as what it is.
+            //
+            // Not counted as a beat: `DescribeAnnounceRound` reads beats and registrations
+            // as a partition of the registrars, and this one already registered.
+            if (load.cordoned && registrar.Heartbeat(client, inFlight, load, round.credential.Current()).has_value())
+                handedOver = true;
         }
         else
         {

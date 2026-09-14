@@ -957,6 +957,24 @@ namespace
         return "unknown";
     }
 
+    /// What to call one cordon state.
+    /// @param state The wire tag.
+    /// @return A stable lower-case name.
+    [[nodiscard]] std::string_view NameOfCordonState(CompileCacheWire::WireCordonState state) noexcept
+    {
+        switch (state)
+        {
+            case CompileCacheWire::WireCordonState::Serving:
+                return "serving";
+            case CompileCacheWire::WireCordonState::Draining:
+                return "draining";
+            case CompileCacheWire::WireCordonState::Drained:
+                return "drained";
+        }
+        // Unreachable for `NameOfEnrollmentState`'s reason.
+        return "unknown";
+    }
+
     /// Add an optional unsigned field, or nothing at all when the node did not say.
     ///
     /// **A helper rather than four copies of the same `if`.** Each of these is a fact a
@@ -1015,6 +1033,14 @@ namespace
         // count with no in-flight figure invites the reading that the node is idle.
         AddOptionalNumber(record, "compile-slots", fields.runtime.compileSlots);
         AddOptionalNumber(record, "compiles-in-flight", fields.runtime.compilesInFlight);
+
+        // Whether an operator cordoned this worker, and whether it has drained (#1303) --
+        // the field somebody waiting to reboot this machine polls. Absent on a node that
+        // runs no worker, for the enrollment state's reason below: `serving` would be a
+        // reassuring answer about a worker that does not exist.
+        if (fields.runtime.cordon.has_value())
+            record.push_back(
+                { .name = "cordon", .value = TextCell(std::string { NameOfCordonState(*fields.runtime.cordon) }) });
 
         // Whether this node is getting through to a scheduler. `2 of 3` is ordinary
         // mid-survey and alarming an hour later, which is why both numbers are reported
@@ -1123,6 +1149,57 @@ namespace
                 std::format("{} answered node-status with a body this client cannot read", context.node->Address()));
 
         return Answered(NodeStatusRecord(*fields));
+    }
+
+    /// `cordon` or `uncordon`: take this machine's worker out of the fleet, or put it back.
+    ///
+    /// **Answered with the state the worker is in NOW**, and the running count beside it,
+    /// because the next thing an operator does is wait: `draining` with a count says what
+    /// is being waited for, and `drained` says a stop abandons nothing. Asking twice answers
+    /// the same way, so a script is never told it failed for repeating itself.
+    /// @param context What to run against.
+    /// @param action Cordon, or lift it.
+    /// @return The answer.
+    [[nodiscard]] Answer AskCordon(VerbContext const& context, CompileCacheWire::CordonAction action)
+    {
+        auto const reply = AskNode(context, CompileCacheWire::EncodeCordonRequest(action));
+        if (!reply.has_value())
+            return reply.error();
+
+        auto const fields = CompileCacheWire::DecodeCordonFields(reply->payload);
+        if (!fields.has_value())
+            return Concluded(Outcome::Protocol,
+                             std::format("{} answered {} with a body this client cannot read",
+                                         context.node->Address(),
+                                         context.verb->name));
+
+        auto answer = Answered(RecordValue(
+            { Field { .name = "cordon", .value = TextCell(std::string { NameOfCordonState(fields->state) }) },
+              Field { .name = "compiles-in-flight", .value = NumberCell(static_cast<std::uint64_t>(fields->inFlight)) } }));
+        if (fields->state == CompileCacheWire::WireCordonState::Draining)
+            answer.advisories.emplace_back(
+                std::format("{} compile(s) still running; `node` reports `cordon drained` once they have been delivered",
+                            fields->inFlight));
+        if (action == CompileCacheWire::CordonAction::Cordon)
+            answer.advisories.emplace_back(
+                "the cordon is NOT persisted: it lasts until `uncordon`, or until this node restarts and takes work again");
+        return answer;
+    }
+
+    /// `cordon` -- refuse new compiles here and let the running ones finish.
+    /// @param context What to run against.
+    /// @return The answer.
+    [[nodiscard]] Answer Cordon(VerbContext const& context)
+    {
+        return AskCordon(context, CompileCacheWire::CordonAction::Cordon);
+    }
+
+    /// `uncordon` -- take compiles here again.
+    /// @param context What to run against.
+    /// @return The answer.
+    [[nodiscard]] Answer Uncordon(VerbContext const& context)
+    {
+        return AskCordon(context, CompileCacheWire::CordonAction::Lift);
     }
 
     /// `version`, answered by a node instead of by RESP `INFO`.
@@ -1756,6 +1833,31 @@ namespace
           .protocolCommand = "node-status",
           .modifiers = Modifier::None,
           .handler = &NodeStatus,
+          .nodeFallback = nullptr,
+          .session = nullptr },
+        // Asked of the node on THIS machine: the node refuses a cordon from anywhere else,
+        // because whether a machine serves the fleet is decided on that machine (#1303).
+        { .name = "cordon",
+          .wire = Wire::Node,
+          .minOperands = 0,
+          .maxOperands = 0,
+          .operands = "",
+          .summary = "stop this machine's worker taking new compiles and let the\n"
+                     "running ones finish; lasts until uncordon or a restart",
+          .protocolCommand = "cordon",
+          .modifiers = Modifier::None,
+          .handler = &Cordon,
+          .nodeFallback = nullptr,
+          .session = nullptr },
+        { .name = "uncordon",
+          .wire = Wire::Node,
+          .minOperands = 0,
+          .maxOperands = 0,
+          .operands = "",
+          .summary = "let this machine's worker take compiles again",
+          .protocolCommand = "cordon",
+          .modifiers = Modifier::None,
+          .handler = &Uncordon,
           .nodeFallback = nullptr,
           .session = nullptr },
         { .name = "fleet",

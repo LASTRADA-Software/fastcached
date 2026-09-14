@@ -142,6 +142,10 @@ inline constexpr std::array ExchangeLogTable {
                  .level = LogLevel::Info,
                  .rationale = "an operator opening or closing a dashboard: rare, and logged once per stream when "
                               "it ends -- never once per push, which would be a line a second per watcher" },
+    VerbLogRow { .code = CompileCacheWire::Op::Cordon,
+                 .level = LogLevel::Info,
+                 .rationale = "takes a machine out of the fleet or puts it back: rare, deliberate, and the line an "
+                              "operator looks for when a machine stopped getting work" },
 };
 
 /// Whether every verb this build serves states a log level.

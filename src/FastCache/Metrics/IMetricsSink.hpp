@@ -385,6 +385,26 @@ class IMetricsSink
         /// serving the other two, so this one has to be refused in words.
         WorkerJobsRefusedStopping,
 
+        /// Jobs refused because an operator cordoned this worker (#1303).
+        ///
+        /// Its own series and not `stopping`, although both say "a node is being taken
+        /// out": a stop ends within `--drain-timeout`, while a cordon lasts until a person
+        /// lifts it, so a rise here that never ends is a machine somebody forgot. And not
+        /// `no_slot`, for `stopping`'s reason.
+        ///
+        /// It rises only between the cordon and the scheduler hearing of it -- the next
+        /// heartbeat, which a cordon sends at once -- and from clients that dial this port
+        /// directly. A steady rise therefore says the scheduler is not reading this worker's
+        /// heartbeat.
+        WorkerJobsRefusedCordoned,
+
+        /// Cordon requests refused because they came from another machine.
+        ///
+        /// Whether a machine's CPU serves the fleet is decided on that machine, so the verb
+        /// answers this machine only, exactly as the cache tier does. A rise means somebody
+        /// is trying to take a machine they are not on out of the fleet.
+        WorkerCordonsRefusedNotLocal,
+
         /// Frames refused before a job existed at all.
         ///
         /// A family of their own rather than more `WorkerJobsRefused*`, because they

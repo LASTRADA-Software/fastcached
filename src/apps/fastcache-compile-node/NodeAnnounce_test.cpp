@@ -11,10 +11,23 @@
 // what the extraction bought.
 #include "NodeAnnounce.hpp"
 
+#include <FastCache/Core/Clock.hpp>
+#include <FastCache/Core/Logger.hpp>
+#include <FastCache/Metrics/IMetricsSink.hpp>
+#include <FastCache/Platform/HostLoad.hpp>
+#include <FastCache/Protocol/CompileCacheWire.hpp>
+
 #include <catch2/catch_test_macros.hpp>
 
+#include <atomic>
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
 #include <map>
+#include <optional>
+#include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <tests/ScriptedSocket.hpp>
@@ -176,4 +189,162 @@ TEST_CASE("Adopting an empty served set retires nothing that was never registere
 
     CHECK(current.empty());
     CHECK(withdrawals.empty());
+}
+
+// --- The cordon reaches the scheduler (#1303) -------------------------------
+
+namespace
+{
+
+/// A load sampler that reports nothing, so a round reads no host at all.
+class SilentLoadSampler final: public IHostLoadSampler
+{
+  public:
+    [[nodiscard]] HostLoad Sample() override
+    {
+        return HostLoad {};
+    }
+};
+
+/// Every framed request in @p sent, in order, by its declared length.
+/// @param sent What a scripted socket was written.
+/// @return One op byte and payload per whole frame.
+[[nodiscard]] std::vector<std::pair<std::uint8_t, std::vector<std::byte>>> FramesIn(std::span<std::byte const> sent)
+{
+    std::vector<std::pair<std::uint8_t, std::vector<std::byte>>> frames;
+    while (sent.size() >= Wire::RequestHeaderSize)
+    {
+        auto const header = Wire::DecodeRequestHeader(sent);
+        if (!header.has_value())
+            break;
+        auto const whole = Wire::RequestHeaderSize + std::size_t { header->payloadLength };
+        if (sent.size() < whole)
+            break;
+        auto const payload = sent.subspan(Wire::RequestHeaderSize, header->payloadLength);
+        frames.emplace_back(header->opRaw, std::vector<std::byte> { payload.begin(), payload.end() });
+        sent = sent.subspan(whole);
+    }
+    return frames;
+}
+
+/// One heartbeat round over a worker this case can cordon, announcing to a scripted
+/// scheduler.
+struct AnnounceFixture
+{
+    NodeConfig cfg;
+    AtomicMetricsSink metrics;
+    NullLogger logger;
+    SilentLoadSampler loadSampler;
+    // The process singleton wall clock, for the reason `NodeCredential_test` gives beside
+    // the same construction: the sampler keeps the ADDRESS and reads it from its own thread.
+    FleetSampler sampler { std::nullopt,
+                           metrics,
+                           [] {
+                               return MetricsSnapshot { .storage = std::nullopt,
+                                                        .storageTiers = {},
+                                                        .host = HostCapacity { .configuredSlots = 1, .busySlots = 0 },
+                                                        .upstreamConfigured = std::nullopt,
+                                                        .uptime = {} };
+                           },
+                           DefaultSystemWallClock(),
+                           HistoryPaths {},
+                           logger };
+    CompileCapacity capacity { /*slots=*/1, /*byteBudget=*/1024ULL, std::chrono::seconds { 1 }, logger };
+    ConfiguredCredential credential { cfg, nullptr };
+    Distributed::WorkerLeaseState lease { Distributed::SchedulerTermRegressionNotice::Silent() };
+    std::atomic<bool> fleetMismatch { false };
+    Cc::CredentialNotice notice = Cc::CredentialNotice::Silent();
+    std::vector<Cc::WorkerRegistrar> registrars;
+    std::vector<Cc::WorkerRegistrar> withdrawals;
+
+    AnnounceFixture()
+    {
+        cfg.scheduler = "scheduler.example:6676";
+        registrars.push_back(Registrar(notice, "gcc-14"));
+    }
+
+    /// Announce once to a scheduler answering @p replies.
+    /// @param replies What the scheduler says, in order.
+    /// @return Every request the round sent.
+    [[nodiscard]] std::vector<std::pair<std::uint8_t, std::vector<std::byte>>> AnnounceTo(std::vector<std::byte> replies)
+    {
+        HeartbeatRound const round { .cfg = cfg,
+                                     .registrars = registrars,
+                                     .withdrawals = withdrawals,
+                                     .capacity = capacity,
+                                     .loadSampler = loadSampler,
+                                     .cacheTier = nullptr,
+                                     .metrics = metrics,
+                                     .sampler = sampler,
+                                     .credential = credential,
+                                     .lease = lease,
+                                     .fleetMismatch = fleetMismatch,
+                                     .logger = logger };
+        Testing::ScriptedSocket scheduler { std::move(replies) };
+        (void) AnnounceOnce(round, scheduler, cfg.scheduler);
+        return FramesIn(scheduler.Sent());
+    }
+};
+
+/// Whether @p frame is a HEARTBEAT whose load says cordoned.
+/// @param frame An op byte and its payload.
+/// @return The load's cordon, or nullopt when this is not a heartbeat that decodes.
+[[nodiscard]] std::optional<bool> CordonedBeat(std::pair<std::uint8_t, std::vector<std::byte>> const& frame)
+{
+    if (frame.first != static_cast<std::uint8_t>(Wire::Op::Heartbeat))
+        return std::nullopt;
+    auto const decoded = Wire::DecodeHeartbeatPayload(frame.second);
+    if (!decoded.has_value())
+        return std::nullopt;
+    return decoded->load.cordoned;
+}
+
+} // namespace
+
+TEST_CASE("A heartbeat carries the worker's cordon, and a lifted one carries serving", "[node][announce][cordon]")
+{
+    // The scheduler learns a cordon from this and from nothing else -- nothing replicates
+    // it -- so a round that sampled the load without it is a machine still handed work.
+    AnnounceFixture fix;
+    auto const registered = fix.AnnounceTo(RegisterOk("w-7"));
+    REQUIRE_FALSE(registered.empty());
+
+    (void) fix.capacity.Cordon(true);
+    auto const beat = fix.AnnounceTo(Wire::EncodeReply(Wire::Status::Ok, std::vector<std::byte> {}));
+    REQUIRE(beat.size() == 1);
+    CHECK(CordonedBeat(beat[0]) == std::optional { true });
+
+    (void) fix.capacity.Cordon(false);
+    auto const lifted = fix.AnnounceTo(Wire::EncodeReply(Wire::Status::Ok, std::vector<std::byte> {}));
+    REQUIRE(lifted.size() == 1);
+    CHECK(CordonedBeat(lifted[0]) == std::optional { false });
+}
+
+TEST_CASE("A cordoned worker that has just registered says so at once, and a serving one does not",
+          "[node][announce][cordon]")
+{
+    // A registration carries no load, so a scheduler that has just admitted a cordoned
+    // worker -- a new leader, most often -- would believe it serving for a whole interval.
+    // The control is the serving worker: a round that heartbeated after EVERY registration
+    // would pass the first section and fail this one.
+    SECTION("cordoned: the registration is followed by a heartbeat saying so")
+    {
+        AnnounceFixture fix;
+        (void) fix.capacity.Cordon(true);
+        auto const sent = fix.AnnounceTo(
+            Testing::Replies({ RegisterOk("w-7"), Wire::EncodeReply(Wire::Status::Ok, std::vector<std::byte> {}) }));
+
+        REQUIRE(sent.size() == 2);
+        CHECK(sent[0].first == static_cast<std::uint8_t>(Wire::Op::Register));
+        CHECK(CordonedBeat(sent[1]) == std::optional { true });
+    }
+
+    SECTION("serving: the registration alone")
+    {
+        AnnounceFixture fix;
+        auto const sent = fix.AnnounceTo(RegisterOk("w-7"));
+
+        REQUIRE(sent.size() == 1);
+        CHECK(sent[0].first == static_cast<std::uint8_t>(Wire::Op::Register));
+    }
 }

@@ -121,6 +121,13 @@ namespace
                             .code = Wire::ErrorCode::DispatchNotPermitted,
                             .why = "this endpoint is a cache, not a compile node; its counters are on the admin "
                                    "surface's /metrics, which needs no credential" },
+        // With the two node rows and for their reason: a cordon asks about a worker
+        // PROCESS, and this endpoint runs none. A client told this goes to the compile
+        // node on its machine, which is where a cordon is answered.
+        Wire::RefusedVerb { .op = Wire::Op::Cordon,
+                            .code = Wire::ErrorCode::DispatchNotPermitted,
+                            .why = "this endpoint is a cache and runs no compile worker to cordon; ask the "
+                                   "fastcache-compile-node on this machine" },
         // **`NoCluster`, with the four cluster rows and NOT with the two node rows
         // above.** `Enroll` is a self-service `ClusterAdmit` -- it asks to be written
         // into the replicated membership configuration, and `EnrollControl`'s `Approve`
@@ -1177,6 +1184,7 @@ Task<void> CompileCacheHandler::Run(ISocket* socket,
             // it, and it caught exactly this.
             case Wire::Op::NodeStatus:
             case Wire::Op::NodeMetrics:
+            case Wire::Op::Cordon:
             // The enrollment pair, answered by a compile node that runs consensus. Same
             // arm for the same reason: `RefusalFor` is the one place the code and the
             // sentence are decided.

@@ -154,7 +154,7 @@ class EnrollmentResponder final: public IFrameResponder
     /// thing that touches the filesystem -- reading the cluster key -- is a file a few
     /// dozen bytes long, read on the rare path where a person has just approved
     /// somebody.
-    [[nodiscard]] Task<std::vector<std::byte>> Answer(std::span<std::byte const> frame, std::string peer) override;
+    [[nodiscard]] Task<FrameReply> Answer(std::span<std::byte const> frame, std::string peer) override;
 
     /// @copydoc IFrameResponder::RefusePeer
     ///

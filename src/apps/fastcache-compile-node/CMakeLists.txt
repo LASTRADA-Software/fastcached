@@ -44,6 +44,7 @@ add_executable(fastcache-compile-node
     CacheTier.cpp
     ClusterAdminCli.cpp
     ConsensusTier.cpp
+    CordonCli.cpp
     DiscoveryTier.cpp
     EnrollClient.cpp
     EnrollmentResponder.cpp
@@ -101,6 +102,8 @@ if(FASTCACHED_BUILD_TESTS)
         ClusterAdminCli_test.cpp
         ConsensusTier.cpp
         ConsensusTier_test.cpp
+        CordonCli.cpp
+        CordonCli_test.cpp
         DiscoveryTier.cpp
         DiscoveryTier_test.cpp
         EnrollClient.cpp
@@ -149,6 +152,7 @@ if(FASTCACHED_BUILD_TESTS)
         FrameEndpoint_test.cpp
         WorkerLease.cpp
         CompileCapacity.cpp
+        CompileCapacity_test.cpp
         CompileResponder.cpp
         NodeStatusResponder.cpp
         LiveStatsResponder.cpp

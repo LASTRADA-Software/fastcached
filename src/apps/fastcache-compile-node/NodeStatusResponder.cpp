@@ -244,7 +244,7 @@ std::optional<std::vector<std::byte>> NodeStatusResponder::RefusePeer(std::strin
                       "this node reports its identity and counters to fleet members only");
 }
 
-Task<std::vector<std::byte>> NodeStatusResponder::Answer(std::span<std::byte const> frame, std::string peer)
+Task<FrameReply> NodeStatusResponder::Answer(std::span<std::byte const> frame, std::string peer)
 {
     // The verb is read back out of the frame this call was handed rather than taken on
     // the endpoint's word: `Answer` is reachable directly, which is why the gate exists
@@ -395,6 +395,11 @@ CompileCacheWire::NodeStatusFields ConfiguredNodeStatus::Describe() const
     {
         fields.runtime.compileSlots = static_cast<std::uint32_t>(_sources.capacity->Slots());
         fields.runtime.compilesInFlight = static_cast<std::uint32_t>(_sources.capacity->InFlight());
+        // The state an operator waiting to reboot polls (#1303). Read beside the in-flight
+        // figure rather than derived from it by the client, because `Drained` is this
+        // node's own claim that stopping abandons nothing -- and a client that inferred it
+        // from a zero would claim it for a worker nobody cordoned.
+        fields.runtime.cordon = _sources.capacity->CordonState();
     }
 
     // The question `components` cannot answer: a leading scheduler and a following one

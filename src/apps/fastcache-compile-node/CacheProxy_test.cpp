@@ -285,7 +285,7 @@ TEST_CASE("The node's cache answers this machine and refuses every other one", "
 
     auto const fetch = Wire::EncodeFetch("some-key");
     auto const ask = [&](std::string peer) {
-        return Wire::DecodeReplyHeader(SyncRun(responder.Answer(fetch, std::move(peer))));
+        return Wire::DecodeReplyHeader(SyncRun(responder.Answer(fetch, std::move(peer))).bytes);
     };
 
     SECTION("over loopback, which is every ordinary fastcache-cc on this box")
@@ -370,7 +370,7 @@ TEST_CASE("(#287) a fleet peer is refused this machine's cache tier, member or n
     REQUIRE_FALSE(IsLoopbackHost("10.0.0.1"));
     REQUIRE_FALSE(locality.IsThisMachine("10.0.0.1"));
 
-    auto const refused = SyncRun(responder.Answer(Wire::EncodeFetch("some-key"), "10.0.0.1"));
+    auto const refused = SyncRun(responder.Answer(Wire::EncodeFetch("some-key"), "10.0.0.1")).bytes;
     auto const header = Wire::DecodeReplyHeader(refused);
     REQUIRE(header.has_value());
     CHECK(Unwrap(header).status == Wire::Status::Error);
@@ -675,21 +675,24 @@ TEST_CASE("(#1276) a drop from another machine is refused before it removes anyt
     CachedLocalityOracle const locality { machine, fixture.clock };
     CacheResponder responder { fixture.proxy, locality, fixture.metrics };
 
-    auto const stored = SyncRun(responder.Answer(
-        Wire::EncodeStore(Wire::StoreRequest {
-            .key = "victim", .prefetchGroup = {}, .srcRoot = "/src", .buildTree = "/build", .value = Bytes("object") }),
-        "127.0.0.1"));
+    auto const stored = SyncRun(responder.Answer(Wire::EncodeStore(Wire::StoreRequest { .key = "victim",
+                                                                                        .prefetchGroup = {},
+                                                                                        .srcRoot = "/src",
+                                                                                        .buildTree = "/build",
+                                                                                        .value = Bytes("object") }),
+                                                 "127.0.0.1"))
+                            .bytes;
     REQUIRE(StatusOf(stored) == Wire::Status::Ok);
 
-    auto const refused = SyncRun(responder.Answer(Wire::EncodeCacheDrop("victim"), "10.9.9.9"));
+    auto const refused = SyncRun(responder.Answer(Wire::EncodeCacheDrop("victim"), "10.9.9.9")).bytes;
     CHECK(ErrorOf(refused) == Wire::ErrorCode::NotAMember);
     CHECK(fixture.metrics.Read(IMetricsSink::Counter::NodeCacheRequestsRefusedNotLocal) == 1);
     CHECK(fixture.local.Snapshot().deleteHits == 0);
-    CHECK(StatusOf(SyncRun(responder.Answer(Wire::EncodeFetch("victim"), "127.0.0.1"))) == Wire::Status::Ok);
+    CHECK(StatusOf(SyncRun(responder.Answer(Wire::EncodeFetch("victim"), "127.0.0.1")).bytes) == Wire::Status::Ok);
 
     // And the same request from this machine is served, so the refusal above was about WHO
     // asked rather than about the request.
-    CHECK(StatusOf(SyncRun(responder.Answer(Wire::EncodeCacheDrop("victim"), "10.0.0.7"))) == Wire::Status::Ok);
-    CHECK(StatusOf(SyncRun(responder.Answer(Wire::EncodeFetch("victim"), "127.0.0.1"))) == Wire::Status::Miss);
-    CHECK(StatusOf(SyncRun(responder.Answer(Wire::EncodeCacheDrop("victim"), "10.0.0.7"))) == Wire::Status::Miss);
+    CHECK(StatusOf(SyncRun(responder.Answer(Wire::EncodeCacheDrop("victim"), "10.0.0.7")).bytes) == Wire::Status::Ok);
+    CHECK(StatusOf(SyncRun(responder.Answer(Wire::EncodeFetch("victim"), "127.0.0.1")).bytes) == Wire::Status::Miss);
+    CHECK(StatusOf(SyncRun(responder.Answer(Wire::EncodeCacheDrop("victim"), "10.0.0.7")).bytes) == Wire::Status::Miss);
 }

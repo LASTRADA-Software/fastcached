@@ -109,7 +109,7 @@ class NodeStatusResponder final: public IFrameResponder
     }
 
     /// @copydoc IFrameResponder::Answer
-    [[nodiscard]] Task<std::vector<std::byte>> Answer(std::span<std::byte const> frame, std::string peer) override;
+    [[nodiscard]] Task<FrameReply> Answer(std::span<std::byte const> frame, std::string peer) override;
 
     /// @copydoc IFrameResponder::RefusePeer
     ///

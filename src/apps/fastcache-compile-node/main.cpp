@@ -15,6 +15,7 @@
 #include "CompileCapacity.hpp"
 #include "CompileResponder.hpp"
 #include "ConsensusTier.hpp"
+#include "CordonCli.hpp"
 #include "DiscoveryTier.hpp"
 #include "EnrollClient.hpp"
 #include "EnrollmentResponder.hpp"
@@ -143,7 +144,8 @@ constexpr std::chrono::milliseconds HeartbeatConnectTimeout { 1'000 };
 /// stop` and Ctrl-C feel immediate, long enough to cost nothing while idle.
 ///
 /// **A poll, deliberately, where the heartbeat and the enrollment ticker WAIT
-/// (`WaitForStopOr`, #1339).** Those two wait on a `std::stop_token` that another
+/// (`CompileCapacity::WaitForHeartbeat` and `WaitForStopOr`, #1339).** Those two wait
+/// on a `std::stop_token` that another
 /// thread requests; this loop waits on `DaemonControls`' flags, which a signal or
 /// console handler sets, and a handler may only store an atomic -- notifying a
 /// condition variable from one is not async-signal-safe. Nothing can wake a wait
@@ -1062,8 +1064,12 @@ void AdoptAllowlist(Cc::CompileJobRunner& jobs,
     // costs milliseconds on Windows, and a probe a stranger could provoke by asking
     // is a probe a stranger can bill this machine for. `CachedLocalityOracle`
     // carries both failure directions.
+    //
+    // And who may cordon this worker is "this machine" for the same reason (#1303):
+    // whether a machine's CPU serves the fleet is decided on that machine. One oracle,
+    // asked by both, so the two surfaces cannot disagree about which machine this is.
     auto const hostAddresses = MakeSystemHostAddresses();
-    CachedLocalityOracle const cacheLocality { *hostAddresses, cacheClock };
+    CachedLocalityOracle const locality { *hostAddresses, cacheClock };
 
     // ONE source, and every site that presents this worker's credential borrows it.
     // Declared here because the first of those sites is the cache tier immediately
@@ -1077,8 +1083,7 @@ void AdoptAllowlist(Cc::CompileJobRunner& jobs,
     // fallback -- it has no second moment for anything to arrive at.
     Node::ConfiguredCredential const credential { cfg, reloader };
 
-    auto cacheTierOrRefusal =
-        Node::StartCacheTierOrExplain(nodeIo, cfg, credential, cacheLocality, cacheClock, metrics, logger);
+    auto cacheTierOrRefusal = Node::StartCacheTierOrExplain(nodeIo, cfg, credential, locality, cacheClock, metrics, logger);
     if (!cacheTierOrRefusal.has_value())
     {
         // No flag prefix here, unlike its neighbours: this tier can fail over two
@@ -1149,7 +1154,8 @@ void AdoptAllowlist(Cc::CompileJobRunner& jobs,
     // Declared AFTER the server whose capacity it spends and BEFORE the surface
     // that routes to it, so destruction runs surface, responder, server: the
     // listener stops admitting compiles before the drain starts counting them.
-    Node::CompileResponder compileResponder { protocol, compileCapacity, membership.Oracle(), compilePool, nodeIo.Reactor(),
+    Node::CompileResponder compileResponder { protocol, compileCapacity, membership.Oracle(),
+                                              locality, compilePool,     nodeIo.Reactor(),
                                               metrics,  logger };
 
     // This node's one `0xFC` listener, opened once every component exists and holding a
@@ -1914,11 +1920,17 @@ void AdoptAllowlist(Cc::CompileJobRunner& jobs,
                                 "this machine now has no usable toolchain; serving nothing until one returns");
             }
 
+            // Read BEFORE the round, so a cordon arriving while it runs is one the wake
+            // below still sees as a change: at worst the round already carried it and the
+            // next one repeats it, which costs a heartbeat and loses nothing.
+            auto const announcedCordon = compileCapacity.IsCordoned();
             PublishRegistration(runtimeState, statusClock, registrars, AnnounceRound(round, link, heartbeatConnector));
 
             // A worker that took even part of the interval to exit would hold its port
-            // that long against a restart.
-            if (WaitForStopOr(stop, HeartbeatInterval) == WaitEnd::Stopped)
+            // that long against a restart -- and a cordon, or its lifting, reaches the
+            // scheduler at once rather than a whole interval later (#1303). Both take
+            // part in the wait; see `CompileCapacity::WaitForHeartbeat`.
+            if (compileCapacity.WaitForHeartbeat(stop, announcedCordon, HeartbeatInterval) == Node::HeartbeatWake::Stopped)
                 break;
         }
     } };
@@ -2230,6 +2242,15 @@ struct EarlyVerbRow
     return ReportOneShotVerb(RunClusterAdmin(context.cfg, context.cfg.cluster, credential));
 }
 
+/// Cordon this machine's own worker, or lift its cordon (`--cordon`, `--uncordon`).
+/// @param context The configuration.
+/// @return What the verb answered, rendered by `ReportOneShotVerb`.
+[[nodiscard]] int RunCordonVerb(EarlyVerbContext const& context)
+{
+    Node::ConfiguredCredential const credential { context.cfg, nullptr };
+    return ReportOneShotVerb(Node::RunCordonAdmin(context.cfg, context.cfg.cordon, credential));
+}
+
 /// Decide who may join, on behalf of an operator (`--enroll-*`).
 /// @param context The configuration.
 /// @return What the verb answered, rendered by `ReportOneShotVerb`.
@@ -2259,7 +2280,7 @@ struct EarlyVerbRow
 /// Each row carries the reason it sits where it does. That ordering used to be expressed
 /// by the LAYOUT of seven `if` blocks in `main` -- true, readable only by scrolling, and
 /// with nothing that made reordering them show up as a change to the thing being ordered.
-constexpr std::array<EarlyVerbRow, 7> EarlyVerbs { {
+constexpr std::array<EarlyVerbRow, 8> EarlyVerbs { {
     // **Below the logger and still above the startup table** (#582). Its refusal has to
     // reach the same terminal a start prints to, rendered the same way -- an operator
     // who meets that sentence here and again at boot should be reading one message, not
@@ -2302,6 +2323,13 @@ constexpr std::array<EarlyVerbRow, 7> EarlyVerbs { {
     // somebody else's; before the `--scheduler` and `--toolchain` checks, because a
     // cluster command needs the first and not the second.
     { .applies = [](NodeConfig const& cfg) { return cfg.cluster.action != ClusterAction::None; }, .run = &RunClusterVerb },
+
+    // An operator taking THIS machine out of the fleet or putting it back (#1303). Beside
+    // the cluster row because it is the same kind of thing -- a question put to a running
+    // node by a person at a terminal -- and before the startup table for that row's reason:
+    // it serves nothing, so the rules for a configuration this node would SERVE with do not
+    // apply. What it needs, a `--listen-node` to dial, it refuses by name itself.
+    { .applies = [](NodeConfig const& cfg) { return cfg.cordon != CordonCommand::None; }, .run = &RunCordonVerb },
 
     // An operator deciding who may join, rather than a worker starting up. Beside the
     // cluster row because it is the same kind of thing -- a question put to a running

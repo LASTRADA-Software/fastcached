@@ -74,4 +74,17 @@ namespace FastCache::Distributed::Testing
                       .freeScratchBytes = std::nullopt };
 }
 
+/// A worker an operator cordoned (#1303), still finishing what it was running.
+/// @param inFlight Jobs still running.
+/// @return The load report.
+[[nodiscard]] constexpr NodeLoad Cordoned(std::uint32_t inFlight) noexcept
+{
+    return NodeLoad { .inFlight = inFlight,
+                      .cpuBusyPermille = std::nullopt,
+                      .availableMemoryBytes = std::nullopt,
+                      .freeScratchBytes = std::nullopt,
+                      .cache = {},
+                      .cordoned = true };
+}
+
 } // namespace FastCache::Distributed::Testing

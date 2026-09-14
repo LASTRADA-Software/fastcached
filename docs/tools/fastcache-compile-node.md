@@ -1734,6 +1734,52 @@ decides.
     on. Until that lands, a drain bound converts the resulting hang into a stated
     abandonment; it does not prevent the wedge.
 
+### Taking a machine out before a reboot: the cordon
+
+A bounded stop abandons whatever outlives `--drain-timeout`, and a translation unit
+longer than the bound is exactly the compile that was about to succeed. So before a
+planned stop, **cordon** the worker first, wait for it to drain, and stop it then:
+
+```sh
+fastcache-cli cordon          # or: fastcache-compile-node --cordon
+fastcache-cli node            # poll until the cordon field reads drained
+systemctl stop fastcache-compile-node
+```
+
+A cordoned worker **refuses every new compile and lets the running ones finish.** It
+stays registered and on the fleet page, where its `limited-by` cell reads
+`cordoned` and its in-flight count falls; the scheduler stops leasing it within a
+second, because the cordon wakes the heartbeat rather than waiting out the 20-second
+interval. The node says when the last compile has been delivered, once:
+
+```
+[INFO] worker: cordoned; refusing new compiles and letting 2 running compile(s) finish
+[INFO] worker: cordoned and drained; no compile is running, so stopping this node now abandons nothing
+```
+
+`drained` means **delivered**, not merely compiled: a compile holds its slot until its
+object has been written to the client, so a stop taken on that line cuts nothing off.
+
+Three properties are deliberate:
+
+- **It is asked of this machine.** The node answers a cordon from its own machine only —
+  `--cordon` dials this node's own `--listen-node`, and `fastcache-cli cordon` must be
+  pointed at the node on the machine it runs on — and refuses
+  one from anywhere else, counted in `fastcache_worker_cordons_refused_not_local_total`.
+  Whether a machine serves the fleet is decided on that machine.
+- **It is not persisted, and a restart lifts it.** The cordon lives in the running
+  worker's memory and nowhere else: not in the configuration, not in the cluster's
+  replicated state. A cordon that survived a restart would be a machine that silently
+  never came back to the fleet. `fastcache-cli uncordon` (or `--uncordon`) lifts it
+  without one.
+- **It is not a withdrawal.** A withdrawn registration disappears from every surface; a
+  cordoned worker is visible while it drains, which is the point.
+
+A compile that reaches a cordoned worker anyway — leased in the second before the
+scheduler heard, or dialled directly — is refused `no-capacity` and compiled locally
+by its client, counted in `fastcache_worker_jobs_refused_cordoned_total`. A steady rise
+there says the scheduler is not hearing this worker's heartbeat.
+
 ### macOS and Windows
 
 ```sh
@@ -2227,6 +2273,8 @@ exposition cannot drift apart again without a red build.
 | `fastcache_worker_jobs_refused_survey_in_flight_total` | Jobs refused because this worker had not finished identifying its toolchains: it is still starting, not misconfigured. Rises only from clients dialling this port directly -- the scheduler is not offered this worker until the survey completes. |
 | `fastcache_worker_jobs_refused_not_a_member_total` | Connections refused because the caller is neither on this machine nor a cluster member. A rise means something is trying to spend a machine it has no claim on. |
 | `fastcache_worker_jobs_refused_stopping_total` | Jobs refused because this worker had begun stopping. Never sum with no_slot: that one says the fleet is too small, this one says a node is draining and a retry will land somewhere else. |
+| `fastcache_worker_jobs_refused_cordoned_total` | Jobs refused because an operator cordoned this worker. Never sum with stopping: a stop ends by itself, a cordon lasts until somebody lifts it. A steady rise says the scheduler is not hearing this worker's heartbeat. |
+| `fastcache_worker_cordons_refused_not_local_total` | Cordon requests refused because they came from another machine. A machine is cordoned from itself; a rise means somebody elsewhere is trying to take it out of the fleet. |
 
 
 **A dispatched compile whose envelope or lease did not hold.** The envelope rows are about the bytes; the lease rows are about the credential. A rise in a lease row on a healthy fleet names a clock, a cluster key or a rollout rather than a client.

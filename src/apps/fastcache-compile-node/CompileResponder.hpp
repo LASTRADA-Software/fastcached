@@ -9,6 +9,7 @@
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Distributed/MembershipOracle.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
+#include <FastCache/Platform/LocalAddresses.hpp>
 #include <FastCache/Protocol/SurfaceRefusal.hpp>
 
 #include <chrono>
@@ -68,6 +69,14 @@ namespace FastCache::Node
 /// checked where it always was, inside `Cc::WorkerProtocol`, by the validator this node
 /// chose at startup. Nothing here widens who may compile on this machine -- the merged
 /// listener is an additional door onto the same policy.
+///
+/// ## And it answers the cordon
+///
+/// `Op::Cordon` is the second verb of the `Compile` family (#1303), and it is here because
+/// it governs exactly this surface's admission: a cordoned worker refuses a new compile
+/// and lets the running ones finish. It is gated on LOCALITY rather than membership --
+/// whether a machine's CPU serves the fleet is decided on that machine -- and it is a
+/// round trip, not a compile, so every per-verb question below answers it as one.
 class CompileResponder final: public IFrameResponder
 {
   public:
@@ -77,6 +86,8 @@ class CompileResponder final: public IFrameResponder
     /// @param capacity `WorkerServer::Capacity()`, never a second one; must outlive
     ///        this.
     /// @param membership Decides who may spend this machine's CPU; must outlive this.
+    /// @param locality Decides who may cordon this worker: this machine only. Must
+    ///        outlive this.
     /// @param jobs Where a compile runs. Sized to the slot cap by the assembler, which
     ///        is what makes an admitted job always find a thread. Must outlive this.
     /// @param home Where the answer is returned from -- the reactor this surface's
@@ -101,6 +112,7 @@ class CompileResponder final: public IFrameResponder
     CompileResponder(Cc::WorkerProtocol& protocol,
                      CompileCapacity& capacity,
                      Distributed::IMembershipOracle const& membership,
+                     ILocalityOracle const& locality,
                      IExecutor& jobs,
                      IExecutor& home,
                      IMetricsSink& metrics,
@@ -109,6 +121,7 @@ class CompileResponder final: public IFrameResponder
         _protocol { protocol },
         _capacity { capacity },
         _membership { membership },
+        _locality { locality },
         _jobs { jobs },
         _home { home },
         _metrics { metrics },
@@ -121,7 +134,7 @@ class CompileResponder final: public IFrameResponder
     ///
     /// Admits, hops to the pool, compiles, hops back, answers. The two hops are the
     /// point; see the class comment for why each one is invisible when it is missing.
-    [[nodiscard]] Task<std::vector<std::byte>> Answer(std::span<std::byte const> frame, std::string peer) override;
+    [[nodiscard]] Task<FrameReply> Answer(std::span<std::byte const> frame, std::string peer) override;
 
     /// @copydoc IFrameResponder::RefusePeer
     ///
@@ -134,6 +147,10 @@ class CompileResponder final: public IFrameResponder
     /// the scheduler issued for this worker's endpoint, and that is a property of the
     /// payload rather than of the peer. It is checked where it always was, inside
     /// `Cc::WorkerProtocol`.
+    ///
+    /// A cordon is asked of LOCALITY instead, and membership is not consulted for it at
+    /// all: a fleet member is exactly who must not be able to take this machine out of the
+    /// fleet from somewhere else.
     [[nodiscard]] std::optional<std::vector<std::byte>> RefusePeer(std::string_view peer, std::uint8_t opRaw) const override;
 
     /// @copydoc IFrameResponder::AuthRequired
@@ -238,9 +255,12 @@ class CompileResponder final: public IFrameResponder
     ///
     /// The per-job bound is the grant's own `expiresAt` and tightens as soon as one is
     /// verified; `WorkerProtocol` owns that, and owns saying WHICH of the two ran out.
-    [[nodiscard]] std::chrono::milliseconds RequestTimeout(std::uint8_t /*opRaw*/) const noexcept override
+    ///
+    /// A cordon is a one-byte round trip and gets the endpoint's own window: nothing it
+    /// does runs for longer than a lock.
+    [[nodiscard]] std::chrono::milliseconds RequestTimeout(std::uint8_t opRaw) const noexcept override
     {
-        return CompileCacheWire::MaxCompileLeaseLifetime;
+        return IsCordon(opRaw) ? FrameServer::HeaderTimeout : CompileCacheWire::MaxCompileLeaseLifetime;
     }
 
     /// @copydoc IFrameResponder::MaxRequestBytes
@@ -286,12 +306,11 @@ class CompileResponder final: public IFrameResponder
     /// same frame counted one buffer twice for minutes, in a pool shared with the
     /// scheduler verbs on this listener (#448).
     ///
-    /// Verb-blind on purpose. `MergedResponder` routes by verb FAMILY, so every verb
-    /// reaching here is a compile verb, and answering per-verb would be a second
-    /// place for the family table to be restated and disagree with itself.
-    [[nodiscard]] bool HoldsOwnByteBudget(std::uint8_t /*opRaw*/) const noexcept override
+    /// A cordon charges nothing here -- it holds one byte for as long as a lock -- so the
+    /// endpoint's reservation is the only one, and it must keep it.
+    [[nodiscard]] bool HoldsOwnByteBudget(std::uint8_t opRaw) const noexcept override
     {
-        return true;
+        return !IsCordon(opRaw);
     }
 
     /// @copydoc IFrameResponder::PeerWatchCounter
@@ -308,11 +327,12 @@ class CompileResponder final: public IFrameResponder
     /// `IProcessRunner` does not have and
     /// [#661](https://github.com/LASTRADA-Software/fastcached/issues/661) is about.
     ///
-    /// Verb-blind, exactly as `HoldsOwnByteBudget` above: `MergedResponder` routes by
-    /// verb FAMILY, so every verb arriving here is a compile verb, and answering
-    /// per-verb would restate the family table somewhere it can disagree with itself.
-    [[nodiscard]] std::optional<IMetricsSink::Counter> PeerWatchCounter(std::uint8_t /*opRaw*/) const noexcept override
+    /// Not for a cordon, which is answered before a watch could see anything and is no
+    /// job for a departure to be counted against.
+    [[nodiscard]] std::optional<IMetricsSink::Counter> PeerWatchCounter(std::uint8_t opRaw) const noexcept override
     {
+        if (IsCordon(opRaw))
+            return std::nullopt;
         return IMetricsSink::Counter::WorkerJobsAbandonedClientGone;
     }
 
@@ -331,11 +351,13 @@ class CompileResponder final: public IFrameResponder
     /// there is no negotiation on this wire to agree it at run time. `CompileCacheWire`
     /// holds both numbers and asserts the relation between them.
     ///
-    /// Verb-blind, exactly as the two answers above it: `MergedResponder` routes by verb
-    /// FAMILY, so every verb arriving here is a compile verb, and answering per-verb
-    /// would restate the family table somewhere it can disagree with itself.
-    [[nodiscard]] std::optional<std::chrono::milliseconds> ProgressInterval(std::uint8_t /*opRaw*/) const noexcept override
+    /// Not for a cordon: `Status::Progress` is admitted by `Op::Compile` alone, which the
+    /// wire table asserts, and a pulse ahead of a one-byte answer would be a frame the
+    /// client refuses.
+    [[nodiscard]] std::optional<std::chrono::milliseconds> ProgressInterval(std::uint8_t opRaw) const noexcept override
     {
+        if (IsCordon(opRaw))
+            return std::nullopt;
         return _progressInterval;
     }
 
@@ -349,9 +371,22 @@ class CompileResponder final: public IFrameResponder
     }
 
   private:
+    /// @param opRaw The verb's byte.
+    /// @return Whether it is `Op::Cordon`, the one verb here that is not a compile.
+    [[nodiscard]] static constexpr bool IsCordon(std::uint8_t opRaw) noexcept
+    {
+        return opRaw == static_cast<std::uint8_t>(CompileCacheWire::Op::Cordon);
+    }
+
+    /// Cordon this worker or lift the cordon, and say what it is doing now.
+    /// @param frame The whole request, header included.
+    /// @return The `CordonFields` reply, or the refusal.
+    [[nodiscard]] std::vector<std::byte> AnswerCordon(std::span<std::byte const> frame);
+
     Cc::WorkerProtocol& _protocol;
     CompileCapacity& _capacity;
     Distributed::IMembershipOracle const& _membership;
+    ILocalityOracle const& _locality;
     IExecutor& _jobs;
     IExecutor& _home;
     IMetricsSink& _metrics;

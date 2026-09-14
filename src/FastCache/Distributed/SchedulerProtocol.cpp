@@ -327,7 +327,8 @@ Wire::LoadFields LoadToWire(NodeLoad const& load)
                               .availableMemoryBytes = load.availableMemoryBytes,
                               .freeScratchBytes = load.freeScratchBytes,
                               .cache = CacheLoadToWire(load.cache),
-                              .history = {} };
+                              .history = {},
+                              .cordoned = load.cordoned };
 }
 
 NodeLoad LoadFromWire(Wire::LoadFields const& fields, std::uint32_t inFlight)
@@ -336,7 +337,8 @@ NodeLoad LoadFromWire(Wire::LoadFields const& fields, std::uint32_t inFlight)
                       .cpuBusyPermille = fields.cpuBusyPermille,
                       .availableMemoryBytes = fields.availableMemoryBytes,
                       .freeScratchBytes = fields.freeScratchBytes,
-                      .cache = CacheLoadFromWire(fields.cache) };
+                      .cache = CacheLoadFromWire(fields.cache),
+                      .cordoned = fields.cordoned };
 }
 
 SchedulerReply SchedulerProtocol::Route(Wire::Op op, std::span<std::byte const> payload, CallerContext const& caller)

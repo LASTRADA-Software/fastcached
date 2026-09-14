@@ -348,6 +348,13 @@ struct NodeLoad
     /// `AvailableSlots` below does not read it, and must not start to. How full
     /// a node's cache is says nothing about whether it can take another compile.
     NodeCacheLoad cache {};
+
+    /// Whether an operator cordoned this worker (#1303).
+    ///
+    /// Not optional, for `inFlight`'s reason: the worker always knows whether it is
+    /// cordoned. A `bool` rather than a count or a ceiling because it is a decision, not
+    /// a resource -- `SlotCeilingsFor` turns it into a ceiling of zero, and names it.
+    bool cordoned { false };
 };
 
 namespace Detail
@@ -373,7 +380,8 @@ namespace Detail
     }
 } // namespace Detail
 
-/// Which of the four ceilings decided `AvailableSlots`.
+/// Which ceiling decided `AvailableSlots`: the registered count, one of the three
+/// resources a heartbeat reports, or an operator's cordon.
 ///
 /// `Registered` is zero, and that is the safety property rather than an ordering
 /// convenience: a breakdown nobody filled in reads as "nothing withdrew anything",
@@ -389,6 +397,9 @@ enum class SlotLimit : std::uint8_t
     Memory,
     /// What is left of its scratch filesystem.
     Scratch,
+    /// An operator cordoned it (#1303): it takes nothing new until the cordon is lifted
+    /// or the node restarts.
+    Cordoned,
     Last, ///< Not a limit, and has no row: `SlotLimitTable`'s length.
 };
 
@@ -418,6 +429,9 @@ inline constexpr EnumTable<SlotLimit, SlotLimitTraits> SlotLimitTable { {
     { .limit = SlotLimit::Scratch,
       .name = "scratch",
       .remedy = "the scratch filesystem is nearly full. A compile is budgeted at 128 MiB." },
+    { .limit = SlotLimit::Cordoned,
+      .name = "cordoned",
+      .remedy = "an operator cordoned this machine. Lift it with `fastcache-cli uncordon` there, or restart the node." },
 } };
 
 // A limit added to the enum without a row is a build failure rather than a report
@@ -481,6 +495,13 @@ struct SlotCeilings
 ///
 /// **`capacity.cache` is not read, and must not start to be**: how full a node's
 /// cache is says nothing about whether it can take another compile.
+///
+/// **A cordon is applied last and wins every tie**, which is the one exception to
+/// `SlotCeilings::binding`'s first-in-enumerator-order rule, and deliberately so. The
+/// other three limits lift themselves -- the owner stops using the machine, memory frees,
+/// a build tree is cleaned -- while a cordon lifts only when a person acts. A report
+/// naming `scratch` on a cordoned machine whose disk also filled would send an operator
+/// to free a disk and leave the machine out of the fleet with nothing saying why.
 /// @param capacity What the machine is.
 /// @param registeredSlots What `OfferableSlots` gave it at registration.
 /// @param load What it is doing now.
@@ -536,6 +557,12 @@ struct SlotCeilings
             result.available = *result.byScratch;
             result.binding = SlotLimit::Scratch;
         }
+    }
+
+    if (load.cordoned)
+    {
+        result.available = 0;
+        result.binding = SlotLimit::Cordoned;
     }
 
     return result;

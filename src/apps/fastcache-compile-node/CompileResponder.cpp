@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string_view>
 #include <utility>
@@ -28,10 +29,14 @@ namespace
     /// one added. A slot leaked once is a worker that reports itself permanently busier
     /// than it is, and the scheduler takes it out of rotation silently.
     ///
-    /// The destructor runs at the coroutine's `co_return`, which is **after** the hop
-    /// home, so the release happens on the same thread everything else about the reply
-    /// does.
-    class SlotHeld
+    /// **An `IReplyHold`, so it outlives this coroutine** (#1303). A compile is not
+    /// finished when its object is encoded but when the object has been written, and the
+    /// endpoint writes after `Answer` returns. Released at the `co_return`, a slot told a
+    /// cordoned worker it had drained -- and a stop that nothing was running -- while the
+    /// last object was still going out, so acting on either abandoned it. The endpoint
+    /// destroys the hold on its reactor thread once the write is done or abandoned, which
+    /// is the thread everything else about the reply happens on.
+    class SlotHeld final: public IReplyHold
     {
       public:
         /// @param capacity What to give the slot back to.
@@ -45,7 +50,7 @@ namespace
         SlotHeld(SlotHeld&&) = delete;
         SlotHeld& operator=(SlotHeld&&) = delete;
 
-        ~SlotHeld()
+        ~SlotHeld() override
         {
             _capacity->ReleaseSlot();
         }
@@ -53,6 +58,35 @@ namespace
       private:
         CompileCapacity* _capacity;
     };
+
+    /// One row per `SlotAdmission`: what the client is told and which counter rises.
+    struct AdmissionRow
+    {
+        SlotAdmission admission;                   ///< The decision this row answers.
+        std::optional<Cc::SurfaceRefusal> refusal; ///< The code and the counter; nothing for `Taken`.
+        std::string_view detail;                   ///< What the client is told, or empty for the code's own words.
+    };
+
+    /// What each admission decision answers.
+    ///
+    /// A table rather than three `if`s beside the take, because the decision is ONE call
+    /// (see `SlotAdmission`) and its answers differ only by row.
+    constexpr EnumTable<SlotAdmission, AdmissionRow> AdmissionTable { {
+        { .admission = SlotAdmission::Taken, .refusal = std::nullopt, .detail = {} },
+        { .admission = SlotAdmission::Stopping, .refusal = CompileRefusal::Stopping, .detail = "this worker is stopping" },
+        { .admission = SlotAdmission::Cordoned,
+          .refusal = CompileRefusal::Cordoned,
+          .detail = "this worker is cordoned: it finishes what it is running and takes nothing new" },
+        { .admission = SlotAdmission::Full, .refusal = CompileRefusal::NoCapacity, .detail = {} },
+    } };
+
+    static_assert(RowsInEnumeratorOrder(AdmissionTable, &AdmissionRow::admission),
+                  "AdmissionTable must hold one row per SlotAdmission, in enumerator order");
+    static_assert(std::ranges::all_of(AdmissionTable,
+                                      [](AdmissionRow const& row) {
+                                          return row.refusal.has_value() != (row.admission == SlotAdmission::Taken);
+                                      }),
+                  "every admission but Taken is a refusal, and Taken is none");
 
     /// Which counter each pre-payload refusal moves on this surface.
     ///
@@ -152,13 +186,16 @@ namespace
                   "a converted row must answer the code `ErrorCodeFor` names for its refusal");
 } // namespace
 
-std::optional<std::vector<std::byte>> CompileResponder::RefusePeer(std::string_view peer, std::uint8_t /*opRaw*/) const
+std::optional<std::vector<std::byte>> CompileResponder::RefusePeer(std::string_view peer, std::uint8_t opRaw) const
 {
-    // The verb is ignored: `MergedResponder` only ever routes the `Compile` family
-    // here, so every question this surface is asked is about a compile. It is taken
-    // anyway because the seam carries it -- and because a second compile-family verb
-    // would arrive here without a signature change, which is the point of the column.
-    return RefuseUnlessMember(_membership, _metrics, peer);
+    // The verb decides WHICH question, which is what the column was carried for: a
+    // compile spends this machine's CPU and asks membership, a cordon decides whether
+    // this machine's CPU serves the fleet at all and asks locality.
+    if (!IsCordon(opRaw))
+        return RefuseUnlessMember(_membership, _metrics, peer);
+    if (_locality.IsThisMachine(peer))
+        return std::nullopt;
+    return Cc::Refuse(_metrics, CompileRefusal::CordonNotLocal, "a machine is cordoned from itself");
 }
 
 std::vector<std::byte> CompileResponder::RefusalReply(Wire::PrePayloadDecision decision,
@@ -179,7 +216,7 @@ std::vector<std::byte> CompileResponder::EndpointRefusalReply(EndpointRefusal re
     return AnswerEndpointRefusal(_metrics, ErrorCodeFor(refusal), row.answer, row.rationale, detail);
 }
 
-Task<std::vector<std::byte>> CompileResponder::Answer(std::span<std::byte const> frame, std::string peer)
+Task<FrameReply> CompileResponder::Answer(std::span<std::byte const> frame, std::string peer)
 {
     // The gate is re-asked here rather than taken on the endpoint's word. `Answer` is
     // reachable directly -- which is why `CacheResponder` re-asks its own -- and a
@@ -193,21 +230,22 @@ Task<std::vector<std::byte>> CompileResponder::Answer(std::span<std::byte const>
     if (auto refusal = RefusePeer(peer, opRaw); refusal.has_value())
         co_return *std::move(refusal);
 
-    // A worker that has begun stopping admits nothing more, and says the fleet is full
-    // rather than saying nothing: `CompileCapacity::TryTakeSlot` does not itself refuse
-    // during a drain -- it counts, and the door is whoever owns the door. The accept
-    // loop's door is its listener; this one's is here. Without it a compile admitted
-    // after `~WorkerServer` began waiting would be a job the drain has already stopped
-    // counting on, started against members it is about to free.
-    if (_capacity.IsShuttingDown())
-        co_return Cc::Refuse(_metrics, CompileRefusal::Stopping, "this worker is stopping");
+    if (IsCordon(opRaw))
+        co_return AnswerCordon(frame);
 
+    // A worker that has begun stopping, or that an operator cordoned, admits nothing
+    // more, and every slot busy admits nothing either -- one decision, taken with the
+    // slot (see `SlotAdmission`). A stopping worker refuses rather than saying nothing:
+    // a compile admitted after the drain began waiting would be a job it has already
+    // stopped counting on, started against members it is about to free.
+    //
     // The cap is enforced here as well as advertised, and a job over it is REFUSED
     // rather than queued: refusing costs the client one local compile, while queueing
     // hides the overload from the scheduler that is trying to route around it.
-    if (!_capacity.TryTakeSlot())
-        co_return Cc::Refuse(_metrics, CompileRefusal::NoCapacity);
-    SlotHeld const slot { _capacity };
+    if (auto const& admitted = AdmissionTable[static_cast<std::size_t>(_capacity.TryTakeSlot())];
+        admitted.refusal.has_value())
+        co_return Cc::Refuse(_metrics, *admitted.refusal, admitted.detail);
+    auto slot = std::make_unique<SlotHeld>(_capacity);
 
     // Counted at the socket, which is what "bytes received" means to an operator sizing
     // a link: the payload as it arrived, not what it decompressed to.
@@ -296,7 +334,31 @@ Task<std::vector<std::byte>> CompileResponder::Answer(std::span<std::byte const>
         co_return std::vector<std::byte> {};
 
     _metrics.Increment(IMetricsSink::Counter::WorkerBytesReturned, static_cast<std::uint64_t>(reply->size()));
-    co_return *std::move(reply);
+
+    // The slot goes WITH the object, and is released once the endpoint has written it:
+    // see `SlotHeld`. The two early returns above release it here instead, which is right
+    // -- they close without delivering anything, so nothing is owed.
+    co_return FrameReply { *std::move(reply), std::move(slot) };
+}
+
+std::vector<std::byte> CompileResponder::AnswerCordon(std::span<std::byte const> frame)
+{
+    // The endpoint has already refused a frame whose header will not decode, whose
+    // version this build does not serve, or whose declared length disagrees with what
+    // arrived -- `DecidePrePayload` runs before any surface is asked. What is left to
+    // refuse is the one byte of payload.
+    auto const payload =
+        frame.size() < Wire::RequestHeaderSize ? std::span<std::byte const> {} : frame.subspan(Wire::RequestHeaderSize);
+    auto const action = Wire::DecodeCordonPayload(payload);
+    if (!action.has_value())
+        return Cc::Refuse(_metrics, CompileRefusal::MalformedPayload, "a cordon carries one byte: cordon, or lift");
+
+    // Answered with the state AFTER the request, and asking for the state it already has
+    // answers the same `Ok`: a cordon is idempotent, so a script that runs it twice
+    // cannot be told it failed. The running count is what an operator waiting to reboot
+    // reads next.
+    auto const fields = _capacity.Cordon(*action == Wire::CordonAction::Cordon);
+    return Wire::EncodeReply(Wire::Status::Ok, Wire::EncodeCordonFields(fields));
 }
 
 } // namespace FastCache::Node

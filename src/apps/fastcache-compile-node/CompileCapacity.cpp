@@ -47,17 +47,23 @@ std::optional<CompileCapacity::Bytes> CompileCapacity::TryTakeBytes(std::size_t 
     return std::optional<Bytes> { std::in_place, this, want };
 }
 
-bool CompileCapacity::TryTakeSlot() noexcept
+SlotAdmission CompileCapacity::TryTakeSlot() noexcept
 {
-    // Taken first and given back on refusal, rather than tested and then taken:
-    // between a test and a take, another connection can take the last slot, and two
-    // compiles then run on a worker that advertises one.
-    auto const before = _inFlight.fetch_add(1, std::memory_order_acq_rel);
-    if (before < _slots)
-        return true;
-
-    _inFlight.fetch_sub(1, std::memory_order_acq_rel);
-    return false;
+    // Tested and taken under ONE lock, the lock `Cordon` and `ReleaseSlot` hold. Between
+    // a lock-free test and a take, another connection could take the last slot -- two
+    // compiles on a worker that advertises one -- and, since #1303, an operator could
+    // cordon a worker with nothing running, be told it had drained, and have a compile
+    // start behind that report. A compile holds a slot for seconds; a mutex costs nothing
+    // beside it.
+    auto const guard = std::scoped_lock { _drainMutex };
+    if (_shuttingDown.load(std::memory_order_acquire))
+        return SlotAdmission::Stopping;
+    if (_cordoned.load(std::memory_order_acquire))
+        return SlotAdmission::Cordoned;
+    if (_inFlight.load(std::memory_order_acquire) >= _slots)
+        return SlotAdmission::Full;
+    _inFlight.fetch_add(1, std::memory_order_acq_rel);
+    return SlotAdmission::Taken;
 }
 
 void CompileCapacity::ReleaseSlot() noexcept
@@ -67,8 +73,74 @@ void CompileCapacity::ReleaseSlot() noexcept
     // predicate and not yet slept waiting for a notification that has already
     // happened.
     auto const guard = std::scoped_lock { _drainMutex };
-    _inFlight.fetch_sub(1, std::memory_order_acq_rel);
+    auto const remaining = _inFlight.fetch_sub(1, std::memory_order_acq_rel) - 1;
     _drained.notify_all();
+
+    // The LAST release under a cordon, and only that one. A release while compiles are
+    // still running says nothing an operator waiting to reboot can act on.
+    if (remaining == 0 && _cordoned.load(std::memory_order_acquire))
+        ReportDrained();
+}
+
+CompileCacheWire::CordonFields CompileCapacity::Cordon(bool cordoned)
+{
+    auto const guard = std::scoped_lock { _drainMutex };
+    auto const inFlight = _inFlight.load(std::memory_order_acquire);
+    if (_cordoned.exchange(cordoned, std::memory_order_acq_rel) != cordoned)
+    {
+        if (!cordoned)
+            _logger.Logf(LogLevel::Info, "worker: cordon lifted; taking compiles again");
+        else if (inFlight != 0)
+            _logger.Logf(LogLevel::Info,
+                         "worker: cordoned; refusing new compiles and letting {} running compile(s) finish",
+                         inFlight);
+        else
+            ReportDrained();
+        // Under the mutex the waiter's predicate reads beside, so a change cannot fall
+        // between its check and its sleep.
+        _cordonMoved.notify_all();
+    }
+    return CompileCacheWire::CordonFields { .state = CordonState(), .inFlight = static_cast<std::uint32_t>(inFlight) };
+}
+
+HeartbeatWake CompileCapacity::WaitForHeartbeat(std::stop_token const& stop,
+                                                bool announced,
+                                                std::chrono::milliseconds interval)
+{
+    // The deadline on the clock the wait itself runs on, so the answer can say what ENDED
+    // the wait rather than what the state is afterwards. A cordon that moved while the
+    // interval ran out -- nobody woke this -- is `Elapsed`: the round runs either way, and
+    // calling it `CordonChanged` would credit a wake that never happened.
+    auto const deadline = std::chrono::steady_clock::now() + interval;
+    auto guard = std::unique_lock { _drainMutex };
+    auto const moved = _cordonMoved.wait_until(
+        guard, stop, deadline, [this, announced] { return _cordoned.load(std::memory_order_acquire) != announced; });
+    if (stop.stop_requested())
+        return HeartbeatWake::Stopped;
+    return moved && std::chrono::steady_clock::now() < deadline ? HeartbeatWake::CordonChanged : HeartbeatWake::Elapsed;
+}
+
+bool CompileCapacity::IsCordoned() const noexcept
+{
+    return _cordoned.load(std::memory_order_acquire);
+}
+
+CompileCacheWire::WireCordonState CompileCapacity::CordonState() const noexcept
+{
+    if (!_cordoned.load(std::memory_order_acquire))
+        return CompileCacheWire::WireCordonState::Serving;
+    return _inFlight.load(std::memory_order_acquire) == 0 ? CompileCacheWire::WireCordonState::Drained
+                                                          : CompileCacheWire::WireCordonState::Draining;
+}
+
+void CompileCapacity::ReportDrained() const
+{
+    // The line an operator waiting to reboot this machine watches for. It says what the
+    // state MEANS rather than what the counter reads, because that is the question being
+    // asked: a slot is held until its reply has been written (see `CompileResponder`), so
+    // nothing this worker admitted is still owed to anybody.
+    _logger.Logf(LogLevel::Info,
+                 "worker: cordoned and drained; no compile is running, so stopping this node now abandons nothing");
 }
 
 void CompileCapacity::BeginShutdown() noexcept
