@@ -638,6 +638,12 @@ class ShortWindowResponder final: public IFrameResponder
         return _inner.ProgressInterval(opRaw);
     }
 
+    /// @copydoc IFrameResponder::StreamFor
+    [[nodiscard]] IFrameStream* StreamFor(std::uint8_t opRaw) noexcept override
+    {
+        return _inner.StreamFor(opRaw);
+    }
+
   private:
     IFrameResponder& _inner;
     std::chrono::milliseconds _window;

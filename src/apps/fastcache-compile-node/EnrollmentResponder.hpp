@@ -301,6 +301,14 @@ class EnrollmentResponder final: public IFrameResponder
         return std::nullopt;
     }
 
+    /// @copydoc IFrameResponder::StreamFor
+    ///
+    /// **Not a stream**: an enrollment verb is one request and one reply; a joiner polls for its decision.
+    [[nodiscard]] IFrameStream* StreamFor(std::uint8_t /*opRaw*/) noexcept override
+    {
+        return nullptr;
+    }
+
   private:
     /// Answer one `Enroll`.
     /// @param payload The request payload.

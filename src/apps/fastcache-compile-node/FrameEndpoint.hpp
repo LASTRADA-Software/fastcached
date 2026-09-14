@@ -180,6 +180,95 @@ inline constexpr std::string_view AnswerDeadlineIsTheEndpointsRationale =
     return EndpointRefusalCodes[static_cast<std::size_t>(refusal)].code;
 }
 
+/// How one push left, as the endpoint observed it.
+///
+/// **A PRIVATE enum: nothing transmits it and nothing stores it, so it states no ordinals.**
+///
+/// Three answers rather than a bool, because the surface files two of them under different
+/// counters: a push this node gave up on is a subscriber that stopped READING, and a push the
+/// transport lost is a subscriber that LEFT, or this node stopping. A bool would have to be read
+/// as "delivered, or else something", which is the shape this tree keeps having to undo.
+enum class PushOutcome : std::uint8_t
+{
+    Delivered, ///< Every byte went out.
+    Stalled,   ///< The push stayed parked past its hold, and this node closed the connection.
+    Lost,      ///< The write failed otherwise: the peer reset, or this node is stopping.
+};
+
+/// What a subscriber has done since its stream began, as the endpoint's read watch saw it.
+///
+/// **A PRIVATE enum**, for `PushOutcome`'s reason.
+enum class PeerActivity : std::uint8_t
+{
+    Quiet,    ///< Nothing, which is what a subscriber does.
+    Departed, ///< EOF: the peer said goodbye, and nobody is left to write to.
+    Reset,    ///< The peer reset the connection. Counted apart from `Departed`, as the compile surface counts them.
+    Sent,     ///< Bytes arrived: the peer wants this connection for its next request.
+};
+
+/// The endpoint's half of a stream: the one writer while it lasts, and what the read watch saw.
+///
+/// **The stream never touches the socket**, which is what keeps the endpoint's exactly-one-writer
+/// property structural (`EndpointWriters.hpp`): the endpoint writes every push, arms the sweep
+/// bound around it, and watches the read side, and the stream decides only WHAT to push and WHEN
+/// to stop. A stream holding the socket would be a second writer that has to remember all three.
+class IPushSink
+{
+  public:
+    IPushSink() = default;
+    IPushSink(IPushSink const&) = delete;
+    IPushSink(IPushSink&&) = delete;
+    IPushSink& operator=(IPushSink const&) = delete;
+    IPushSink& operator=(IPushSink&&) = delete;
+    virtual ~IPushSink() = default;
+
+    /// Write one frame, bounded.
+    ///
+    /// **The hold is the bound on a PARKED write**, and it is armed with the sweeper rather than
+    /// with a timer of the stream's own: a subscriber that stops reading fills its receive window,
+    /// the write parks, and nothing but a close retrieves a parked write. So the sweeper closes it
+    /// past @p hold, the write resumes with a failure, and the answer is `Stalled`.
+    /// @param frame A whole frame; sent in one write, so a parked one is never spliced into.
+    /// @param hold How long the write may stay parked before the connection is ended.
+    /// @return How it left.
+    [[nodiscard]] virtual Task<PushOutcome> Push(std::vector<std::byte> frame, std::chrono::milliseconds hold) = 0;
+
+    /// @return What the peer has done since the stream began. Never consumes a byte.
+    [[nodiscard]] virtual PeerActivity Activity() const noexcept = 0;
+
+    /// @return True once this endpoint is shutting down, which ends every stream.
+    [[nodiscard]] virtual bool Stopping() const noexcept = 0;
+};
+
+/// Serves one subscription for as long as it lasts.
+///
+/// **A verb answered by a stream is NOT answered by `IFrameResponder::Answer`**, and the split is
+/// an interface rather than a longer `Answer` because the two have opposite shapes: an answer is
+/// one reply the endpoint writes after the surface returns, while a stream writes for as long as
+/// the subscription lasts and the endpoint has to be the writer throughout.
+class IFrameStream
+{
+  public:
+    IFrameStream() = default;
+    IFrameStream(IFrameStream const&) = delete;
+    IFrameStream(IFrameStream&&) = delete;
+    IFrameStream& operator=(IFrameStream const&) = delete;
+    IFrameStream& operator=(IFrameStream&&) = delete;
+    virtual ~IFrameStream() = default;
+
+    /// Serve a subscription until it ends.
+    /// @param frame The whole request, header included; outlives the returned task, as
+    ///        `IFrameResponder::Answer`'s does.
+    /// @param peer The peer's host.
+    /// @param sink Where every push goes and what the peer has done; never null, and it outlives
+    ///        the returned task. A pointer because a coroutine parameter must not be a reference.
+    /// @return The terminal reply, or empty to close without one -- the answer for a peer that
+    ///         has left, and for a push that will never leave.
+    [[nodiscard]] virtual Task<std::vector<std::byte>> Serve(std::span<std::byte const> frame,
+                                                             std::string peer,
+                                                             IPushSink* sink) = 0;
+};
+
 /// Answers one framed request.
 ///
 /// The seam that lets one accept loop serve every framed surface this node exposes.
@@ -664,6 +753,19 @@ class IFrameResponder
     ///         non-positive interval is treated as nullopt, the same way every ceiling
     ///         in this tree spells *no bound*.
     [[nodiscard]] virtual std::optional<std::chrono::milliseconds> ProgressInterval(std::uint8_t opRaw) const noexcept = 0;
+
+    /// The stream that answers @p opRaw, or null when this verb is answered with one reply.
+    ///
+    /// **Per verb, and answered by the SURFACE, for `ProgressInterval`'s reason**: the endpoint
+    /// owns the socket and the order of what leaves on it, and the surface owns whether this verb
+    /// is a subscription. Only `Op::Subscribe` is (`CompileCacheWire::PushIsSubscribeOnly`).
+    ///
+    /// Pure virtual for the reason every question above is: a surface that inherited *stream*
+    /// would be asked to serve a subscription it knows nothing about, and one that inherited
+    /// *reply* for a stream verb would answer a single frame to a client waiting for a series.
+    /// @param opRaw The third header byte, as received; not necessarily a known verb.
+    /// @return The stream, which must outlive the endpoint, or null.
+    [[nodiscard]] virtual IFrameStream* StreamFor(std::uint8_t opRaw) noexcept = 0;
 };
 
 /// Accepts connections and answers framed requests on each until the peer stops.

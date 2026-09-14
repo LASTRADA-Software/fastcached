@@ -779,6 +779,11 @@ serves unauthenticated.
 | `fastcache_live_subscriptions_refused_unauthenticated_total` | A fleet subscription was refused: a wrong or missing dashboard credential, or a remote peer while no `--dashboard-token-file` is configured. The fleet map is behind the same credential here as on `/fleet`; a burst from one host is somebody guessing. |
 | `fastcache_live_subscriptions_stalled_total` | A stream ended because a single push stayed unwritten past its bound -- the watcher stopped reading altogether, so its buffers were released rather than held. |
 | `fastcache_live_subscriptions_ended_by_client_total` | A watching client closed its stream -- the ordinary way a dashboard ends. Opened minus this, minus the ended rows above, is the streams still open. |
+| `fastcache_live_subscriptions_ended_by_reset_total` | A watching client reset its connection instead of closing it -- a dashboard killed while pushes were still unread does this. Counted apart from the orderly close, because only a reset says the watcher went away abruptly. |
+| `fastcache_live_subscriptions_refused_not_a_member_total` | A subscription was refused because its peer is not a fleet member. Live stats stream to the same peers `NodeStatus` answers; a burst from one host is a stranger probing the port. |
+| `fastcache_live_subscriptions_refused_malformed_total` | A `SUBSCRIBE` did not decode, or named a subject this build does not serve. No client of this tree sends one; a rise is a client of another build, or not a client at all. |
+| `fastcache_live_subscriptions_refused_payload_too_large_total` | A `SUBSCRIBE` header declared more than the control payload the verb is bounded to, and was refused before a byte of it was read. No client of this tree at any version sends one. |
+| `fastcache_live_subscriptions_refused_endpoint_busy_total` | A subscription was refused because the `0xFC` listener's in-flight byte budget was full of other requests. The dashboard retries; a rise says the view went missing exactly when the node was busiest. |
 
 
 Read the two upstream counters beside the gauge, never on their own. They are
