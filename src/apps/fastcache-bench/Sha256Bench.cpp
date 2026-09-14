@@ -56,7 +56,7 @@ TEST_CASE("bench: Sha256::Hash per engine", "[!benchmark][sha256]")
         // mishandled its message schedule could still get right.
         std::vector<std::byte> payload(size);
         for (auto const index: std::views::iota(std::size_t { 0 }, size))
-            payload[index] = static_cast<std::byte>((index * 131U + 7U) & 0xFFU);
+            payload[index] = static_cast<std::byte>(((index * 131U) + 7U) & 0xFFU);
 
         auto const reference = Sha256::Hash(payload, Sha256Engine::Scalar);
         REQUIRE(reference.has_value());
