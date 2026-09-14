@@ -3881,8 +3881,9 @@ TEST_CASE("the fleet chart yields rows to the table, and grows into rows nothing
     auto const roomy = RunFleet({ FleetSampleOf(1, LeaderFleetText(1)), Tick }, 120, 40, context, ChartCell);
     REQUIRE(roomy.frames.size() == 1);
     REQUIRE(roomy.placements.front().size() == 2);
-    auto const& spec = Unwrap(FleetPanel().document);
-    CHECK(roomy.placements.front().front().cellsHigh == spec.chartGrowth.bandCellsMost);
+    // The one growth policy every history chart has, not a bound of the fleet's own.
+    CHECK(Unwrap(FleetPanel().document).chartGrowth.bandCellsMost == ChartGrowth {}.bandCellsMost);
+    CHECK(roomy.placements.front().front().cellsHigh == ChartGrowth {}.bandCellsMost);
     auto const lines = Lines(roomy.frames.front());
     CHECK(lines.size() == 40);
     CHECK(lines.at(38).contains(FleetReadingSource));
@@ -4124,7 +4125,8 @@ TEST_CASE("on a text rung the fleet chart is the rung's marks: a sample a cell, 
 {
     // #134 F14 below the Sixel rung, where the chart used to be missing. WHAT DISTINGUISHES, over three samples, the
     // second of which has no reading for build-02:
-    //   - three bands of one height, each naming its machine and its newest figure, and the axis right under them;
+    //   - under the tiles and over the strip, three bands of one height, each naming its machine and its newest
+    //     figure, and the axis right under them;
     //   - the span the title names is exactly the cells across the axis, so a cell is a sample;
     //   - build-02's second sample is blank in every row of its band while its neighbours are marks -- a zero drawn
     //     there would be a reading nobody gave;
@@ -4143,6 +4145,13 @@ TEST_CASE("on a text rung the fleet chart is the rung's marks: a sample a cell, 
     INFO(frame);
     auto const lines = Lines(frame);
     auto const chart = FleetTextChartIn(frame, Machines);
+    // Between the tiles and the strip: under every tile, over the section tabs.
+    for (auto const& kpi: Distributed::FleetKpis())
+    {
+        INFO("tile " << kpi.label);
+        CHECK(LineIndexHolding(frame, kpi.label) < chart.title);
+    }
+    CHECK(chart.axis + 1 < LineIndexHolding(frame, "[machines]"));
     auto const bandCells = chart.BandRows();
     CHECK(bandCells >= 2);
     for (auto const index: { std::size_t { 1 }, std::size_t { 2 } })
@@ -4200,17 +4209,17 @@ TEST_CASE("a text fleet chart bands the machines its cells read, and counts them
           "[cli][dashboard][panel][fleet][chart]")
 {
     // A text chart's span is its cells, a sample each, so a machine that reported only before its oldest cell has
-    // no band in it. WHAT DISTINGUISHES, over 40 samples in which build-03 reported only the first two, at a width
-    // whose cells hold fewer than 38 of them: two bands with the axis right under them -- rows laid out for a third
-    // band leave the axis a band too low -- no build-03 in the chart, and no "the first 2 of 3", which counts a
-    // machine the chart cannot draw.
+    // no band in it. WHAT DISTINGUISHES, over 100 samples in which build-03 reported only the first two, at a width
+    // whose cells hold fewer than 98 of them: two bands, no build-03 in the chart, and no "the first 2 of 3", which
+    // counts a machine the chart cannot draw. The title has room for that qualifier -- it is Low and goes first for
+    // width, so without the room its absence would say nothing.
     auto view = PanelView {
         FleetPanel(),
         PanelContext { .absent = std::string { Absent }, .cellWidth = &FakeCellWidth, .rung = RenderRung::Unicode }
     };
     auto script =
-        std::vector<DashboardEvent> { DashboardEvent { .kind = DashboardEventKind::Resize, .columns = 60, .rows = 60 } };
-    for (auto const second: std::views::iota(1, 41))
+        std::vector<DashboardEvent> { DashboardEvent { .kind = DashboardEventKind::Resize, .columns = 120, .rows = 60 } };
+    for (auto const second: std::views::iota(1, 101))
         script.push_back(FleetSampleOf(second,
                                        ChartText(second <= 2 ? std::vector<std::string> { "100", "900", "500" }
                                                              : std::vector<std::string> { "100", "900" })));
@@ -4227,8 +4236,10 @@ TEST_CASE("a text fleet chart bands the machines its cells read, and counts them
     auto const title = Inside(lines.at(chart.title));
     auto const lead = std::format("{} per machine, last ", FleetChartMetrics.front().key);
     REQUIRE(title.starts_with(lead));
-    CHECK(std::stoul(title.substr(lead.size())) < 38);
+    CHECK(std::stoul(title.substr(lead.size())) < 98);
     CHECK_FALSE(title.contains("by name"));
+    constexpr auto Qualifier = std::string_view { "; the first 2 of 3 by name" };
+    CHECK(FakeCellWidth(lines.at(chart.title)) - 6 >= FakeCellWidth(title) + FakeCellWidth(Qualifier));
     CHECK(chart.bands[1] - chart.bands[0] == chart.BandRows() + chart.Spacer());
     CHECK(chart.Spacer() <= 1);
     for (auto const row: std::views::iota(chart.title, chart.axis + 2))
