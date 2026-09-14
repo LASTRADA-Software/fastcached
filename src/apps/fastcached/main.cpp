@@ -74,6 +74,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <vector>
 
 namespace
 {
@@ -649,9 +650,12 @@ struct StorageBackendBundle
 /// @param sources The command line and environment fallback that, with the file,
 ///        produced @p effective. Handed to `ConfigReloader` so a SIGHUP rebuilds
 ///        the candidate the same way (#622).
+/// @param commandLine The command line ALONE, parsed: what the operator typed, as
+///        opposed to what the assembly says was named anywhere.
 int DaemonBody(FastCache::Config const& effective,
                std::span<FastCache::RejectedCandidate const> rejected,
-               FastCache::ConfigSources const& sources)
+               FastCache::ConfigSources const& sources,
+               FastCache::CliResult const& commandLine)
 {
     // A service gets the event log, everything else gets stderr. The factory answers
     // nullptr wherever there is no event log, which is how this stays one expression
@@ -719,7 +723,7 @@ int DaemonBody(FastCache::Config const& effective,
     // observation happens inside this call. `logger` outlives `reloader` -- it names
     // `consoleLogger` or `eventLogger`, both declared above it, so both are destroyed
     // after it -- which is what the subscriber's capture requires.
-    FastCache::WatchSecretExposure(reloader, sources.cli.requirePassExplicit, [&logger](std::string_view warning) {
+    FastCache::WatchSecretExposure(reloader, commandLine.requirePassExplicit, [&logger](std::string_view warning) {
         logger.Logf(FastCache::LogLevel::Warn, "{}", warning);
     });
 
@@ -1304,11 +1308,13 @@ int main(int argc, char const* const* argv)
     //
     // The precedence the assembly implements is CLI > config-file > env > default,
     // so a stray `FASTCACHED_METRICS_PORT` can never override a `metrics_port:` the
-    // operator wrote — even when they wrote the compiled-in default, which the YAML
-    // presence bit is what makes distinguishable from an absent key. A container
+    // operator wrote — even when they wrote the compiled-in default, which the
+    // explicit bit the file's applier sets is what makes distinguishable from an
+    // absent key. A container
     // that wants the env form simply omits the config/CLI value, letting both the
     // daemon and its `--healthcheck` probe agree via a single `-e ...`.
-    FastCache::ConfigSources const sources { .cli = *parsed, .metricsPortEnv = MetricsPortFromEnv() };
+    FastCache::ConfigSources const sources { .args = std::vector<std::string>(args.begin(), args.end()),
+                                             .metricsPortEnv = MetricsPortFromEnv() };
 
     auto assembled = FastCache::AssembleEffectiveConfig(configPath, sources);
     if (!assembled.has_value())
@@ -1339,15 +1345,7 @@ int main(int argc, char const* const* argv)
         assembled = FastCache::AssembleEffectiveConfig({}, sources);
     }
 
-    FastCache::Config const& effective = assembled->config;
-
-    // Aggregate "was the legacy single-bind triplet typed by the operator,
-    // CLI or YAML?" so a downstream mix-with-`listeners:` check sees both
-    // sources. Starts from the CLI explicit bits and ORs in YAML presence.
-    auto bindShapeCli = *parsed;
-    bindShapeCli.bindAddressExplicit = bindShapeCli.bindAddressExplicit || assembled->file.bindAddressExplicit;
-    bindShapeCli.portExplicit = bindShapeCli.portExplicit || assembled->file.portExplicit;
-    bindShapeCli.tlsEnabledExplicit = bindShapeCli.tlsEnabledExplicit || assembled->file.tlsEnabledExplicit;
+    FastCache::Config const& effective = assembled->Configuration();
 
     // Converting the store acts on the files and exits; it never runs the daemon
     // body. BEFORE the serving-shape checks below, and after the merge because it
@@ -1360,12 +1358,13 @@ int main(int argc, char const* const* argv)
         return MigrateConfiguredStorage(effective);
 
     // Reject shapes that would silently drop user-typed values: combining the
-    // legacy single-bind triplet (`--bind / --port / --tls` OR YAML
-    // `bind: / port: / tls:`) with `--listen / --listen-tls` (or YAML
-    // `listeners:`) makes the legacy values vanish — DaemonBody picks
-    // `binds` and discards the singletons. Validate BEFORE handing off to
-    // the daemon host (which may fork) so the error reaches the operator.
-    if (auto const shape = FastCache::ValidateBindFlagShape(bindShapeCli, effective.binds); !shape.has_value())
+    // legacy single-bind triplet (`--bind / --port / --tls` OR `bind: / port: /
+    // tls:`) with `--listen / --listen-tls` (or `listen: / listen_tls:`) makes the
+    // legacy values vanish — DaemonBody picks `binds` and discards the singletons.
+    // Asked of the assembly, which knows what was named in EITHER source. Validate
+    // BEFORE handing off to the daemon host (which may fork) so the error reaches
+    // the operator.
+    if (auto const shape = FastCache::ValidateBindFlagShape(*assembled); !shape.has_value())
     {
         std::println(std::cerr, "fastcached: {}", shape.error().context);
         return EXIT_FAILURE;
@@ -1398,7 +1397,7 @@ int main(int argc, char const* const* argv)
     // the launch arguments should hold what the operator typed, plus --config,
     // and let the file govern everything else. Registering the merged config
     // instead froze every YAML value into the supervisor's argument list at
-    // install time — and because a CLI value outranks YAML in Merge, later
+    // install time — and because a CLI value outranks the file, later
     // edits to that same file then had no effect, silently, for exactly the
     // keys the operator had bothered to set. It also copied `requirepass:` out
     // of a mode-0600 config file into a world-readable service registration.
@@ -1468,5 +1467,6 @@ int main(int argc, char const* const* argv)
     if (!host)
         host = std::make_unique<FastCache::ForegroundHost>();
 
-    return host->Run([&effective, &lookup, &sources] { return DaemonBody(effective, lookup.rejected, sources); });
+    return host->Run(
+        [&effective, &lookup, &sources, &parsed] { return DaemonBody(effective, lookup.rejected, sources, *parsed); });
 }

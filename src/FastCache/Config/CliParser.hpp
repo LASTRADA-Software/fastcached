@@ -52,13 +52,15 @@ struct CliResult
     /// YAML merge and is never baked into a service command line.
     std::string seedConfigTemplate;
 
-    /// Per-flag "user typed this on the CLI" trackers. Without these,
-    /// a user-typed value that happens to equal the field's default
-    /// (`--threads=0`, `--storage-shards=0`, `--storage-durability=batched`,
-    /// `--storage-max-value=1m`, ...) would be indistinguishable from
-    /// "flag not given" in the Merge step, so the YAML value would
-    /// silently win. Each handler in `ParseCli` sets the matching
-    /// bool when the flag appears in argv.
+    /// Per-setting "the operator named this" trackers, set by the row's
+    /// `explicitBit` whenever an applier ran for it -- from argv, or from a
+    /// configuration file through `ApplyFileSettings`. Which RESULT a bit is read
+    /// from is what says where it was named: the command-line-only parse answers
+    /// "typed on the command line" (what a service registration bakes in), the
+    /// assembled configuration answers "named anywhere" (what the environment
+    /// fallback and the listener-shape refusal ask). Without them a typed value
+    /// equal to the default (`--threads=0`, `--storage-durability=batched`) could
+    /// not be told from a setting nobody gave.
     bool bindAddressExplicit { false };
     bool portExplicit { false };
     bool maxMemoryBytesExplicit { false };
@@ -115,8 +117,9 @@ struct ConfigFileSetting
 /// Every setting a configuration file can carry.
 ///
 /// **One accessor rather than a walk every caller re-spells.** The accepted key set
-/// is the option table's `yamlKey` column, and three consumers need it — the
-/// reader's gate, the reload check, and the test that connects them.
+/// is the option table's `yamlKey` column, and the reload check needs it as a list of
+/// its own. The FILE needs no such list: `ApplyFileSettings` walks `CliOptions()`
+/// itself, so a key is accepted by the same walk that applies it.
 ///
 /// It used to be that column PLUS a second list of keys no flag could express, and
 /// the accessor existed so no consumer would walk one and be silently blind to the
@@ -128,16 +131,6 @@ struct ConfigFileSetting
 /// than to every consumer, and it is why the next such key costs nothing here.
 /// @return The settings, in table order. Never empty.
 [[nodiscard]] std::span<ConfigFileSetting const> ConfigFileSettings() noexcept;
-
-/// Whether a configuration file may carry @p key at its top level.
-///
-/// `YamlReader` asks this BEFORE its own dispatch, so "the reader accepts a key
-/// nothing declares" is impossible by construction rather than scanned for. The
-/// other direction, "a declared key the reader does not handle", is asserted by
-/// `CliOptions_test`, because only a real parse can answer it.
-/// @param key The top-level key read from the file.
-/// @return True when some setting answers to it.
-[[nodiscard]] bool ConfigFileAcceptsKey(std::string_view key) noexcept;
 
 /// Parse `argv[1..argc-1]` into a Config, driven by `CliOptions()`.
 /// @param args argv slice excluding the program name itself.

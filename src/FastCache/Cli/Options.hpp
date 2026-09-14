@@ -160,13 +160,13 @@ struct OptionSpec
     /// may not come from one.
     ///
     /// **A column rather than a derivation, because the mapping is not derivable.**
-    /// Measured on the daemon: 48 flag rows, 34 of which carry a key, diverging four
-    /// ways -- `--storage` is `storage_path`, `--expiry-scan` is `active_expiry_scan`,
-    /// `--expiry-interval` is `active_expiry_interval_ms` (renamed *and* carrying a
-    /// unit the flag does not), and `--listen`/`--listen-tls` collapse into a single
-    /// `listeners:` key. There is no rule with exceptions there, only a mapping, and
-    /// a convention derived from flag names would silently rename three existing
-    /// keys the day somebody generalised it.
+    /// Measured on the daemon when #1437 gave every setting row a key: 48 flag rows, 36
+    /// of which carry one, diverging three ways -- `--storage` is `storage_path`,
+    /// `--expiry-scan` is `active_expiry_scan`, and `--expiry-interval` is
+    /// `active_expiry_interval_ms` (renamed *and* carrying a unit the flag does not).
+    /// There is no rule with exceptions there, only a mapping, and a convention derived
+    /// from flag names would silently rename those three keys the day somebody
+    /// generalised it.
     ///
     /// Empty is a decision rather than an omission: a one-shot verb has no business
     /// in a file, because a file is read at every start and would replay one
@@ -214,7 +214,7 @@ struct OptionSpec
     ///
     /// Only repeatable rows need it, and only because their applier APPENDS. A
     /// command line naming any value for a list setting **replaces** what the file
-    /// declared rather than extending it -- the daemon's rule for `listeners:`, and
+    /// declared rather than extending it -- the daemon's rule for its listeners, and
     /// its reasoning is what decides it: mixing partial file values with partial
     /// command-line values makes precedence depend on declaration order, which is
     /// not something an operator can reason about.
