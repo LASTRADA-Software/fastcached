@@ -103,10 +103,10 @@ fastcached_document("${root}" 6 11 3 6 2 1 2 2)
 fastcached_judge(clean "${root}" OFF "12 figure(s) in vendor/VENDOR.md match the tree")
 
 fastcached_tree(wrappedAndGrouped root)
-file(WRITE "${root}/vendor/endo/tui/Big.hpp" "")
-foreach(i RANGE 1 1200)
-    file(APPEND "${root}/vendor/endo/tui/Big.hpp" "x\n")
-endforeach()
+# Built in memory and written once: an append per line is an open per line, and on DrvFs under a
+# gate's load those 1,200 opens alone outran the test's 60 s.
+string(REPEAT "x\n" 1200 big)
+file(WRITE "${root}/vendor/endo/tui/Big.hpp" "${big}")
 # Big.hpp is upstream's: 3 upstream tui files, 1,203 upstream lines -> ~1k.
 file(WRITE "${root}/vendor/VENDOR.md"
     "`src/tui` upstream is 3 files and ~1k lines; with the 3\nsupporting files below and\n"
