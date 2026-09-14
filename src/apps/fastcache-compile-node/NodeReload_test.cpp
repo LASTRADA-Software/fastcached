@@ -158,7 +158,7 @@ TEST_CASE("A member added to the file is admitted after the reload", "[node][mem
     // policy that already reaches the network changes nothing about what this node can
     // verify.
     Testing::ScratchDirectory const scratch { "node-reload-admit" };
-    auto const path = WriteConfig(scratch.Path(), std::format("fleet_member: 10.0.0.8\nfleet_member: {}\n", Revoked));
+    auto const path = WriteConfig(scratch.Path(), std::format("fleet_member:\n  - 10.0.0.8\n  - {}\n", Revoked));
 
     auto const initial = RunningNode({ "10.0.0.8" });
     NodeMembership membership { initial, membershipLog };
