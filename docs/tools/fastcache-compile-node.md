@@ -2233,7 +2233,9 @@ free the one with proportionally more of itself left takes the job.
 Two flags, one concern. `--log-level` decides *how much* — `trace`, `debug`,
 `info`, `warn`, `error`, `fatal`, default `info`. `--log-timestamps` decides
 whether each line carries *when*, as an ISO 8601 UTC instant, and is **off by
-default**. In YAML they are `log_level:` and `log_timestamps:`.
+default** except under macOS. In YAML they are `log_level:` and `log_timestamps:`,
+plus `no_log_timestamps:` for `--no-log-timestamps`, which is how to say off where the
+platform default is on: `log_timestamps: false` passes nothing and leaves that default.
 
 ```sh
 fastcache-compile-node --log-level=debug --log-timestamps

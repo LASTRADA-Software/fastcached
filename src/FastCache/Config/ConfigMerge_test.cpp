@@ -2,6 +2,8 @@
 #include <FastCache/Config/CliParser.hpp>
 #include <FastCache/Config/Config.hpp>
 #include <FastCache/Config/ConfigMerge.hpp>
+#include <FastCache/Config/FileOptions.hpp>
+#include <FastCache/Config/YamlReader.hpp>
 #include <FastCache/Core/Errors/ConfigError.hpp>
 #include <FastCache/Platform/EnvironmentTestUtils.hpp>
 
@@ -282,6 +284,37 @@ TEST_CASE("AssembleEffectiveConfig: the timestamp setting is named by the flag's
         REQUIRE(assembled.has_value());
         CHECK_FALSE(assembled->Configuration().logTimestamps);
         CHECK(assembled->Named(&FastCache::CliResult::logTimestampsExplicit));
+    }
+
+    SECTION("with the default injected, so the case discriminates off macOS too")
+    {
+        // `DefaultLogTimestamps` is ON only under macOS, so the assembled sections
+        // above assert the off direction vacuously everywhere else. The same rows,
+        // through the same file layer the assembly runs, over each default in turn.
+        for (auto const injected: { true, false })
+        {
+            INFO("default: " << injected);
+            FastCache::CliResult off;
+            off.config.logTimestamps = injected;
+            REQUIRE(FastCache::ApplyFileSettings(
+                        FastCache::CliOptions(),
+                        { FastCache::YamlSetting { .key = "no_log_timestamps", .values = { "true" }, .line = 1 } },
+                        scratch / "cfg.yaml",
+                        off)
+                        .has_value());
+            CHECK_FALSE(off.config.logTimestamps);
+
+            FastCache::CliResult untouched;
+            untouched.config.logTimestamps = injected;
+            REQUIRE(FastCache::ApplyFileSettings(
+                        FastCache::CliOptions(),
+                        { FastCache::YamlSetting { .key = "log_timestamps", .values = { "false" }, .line = 1 },
+                          FastCache::YamlSetting { .key = "no_log_timestamps", .values = { "false" }, .line = 2 } },
+                        scratch / "cfg.yaml",
+                        untouched)
+                        .has_value());
+            CHECK(untouched.config.logTimestamps == injected);
+        }
     }
 
     SECTION("the positive key turns it on wherever the platform leaves it off")

@@ -3361,6 +3361,56 @@ namespace
 }
 } // namespace
 
+TEST_CASE("A worker's file says timestamps off with the negative key, whichever default the platform has", "[node][config]")
+{
+    // The default is a compile-time constant that is ON only under macOS, so a case that
+    // started from it would discriminate on one platform and pass vacuously on the rest.
+    // Injected instead, both ways. Measured nowhere and derived from `ApplyFileSettings`:
+    // a presence key applies on `true` alone, so before this row had a key a worker's
+    // `log_timestamps: false` left macOS stamping while its own documentation said
+    // otherwise (#1437).
+    auto const path = std::filesystem::path { "/etc/n.yaml" };
+
+    SECTION("the negative key turns it off where the default is on")
+    {
+        NodeConfig cfg;
+        cfg.logTimestamps = true;
+        REQUIRE(ApplyNodeConfiguration({ Setting("no_log_timestamps", { "true" }) }, path, {}, cfg).has_value());
+        CHECK_FALSE(cfg.logTimestamps);
+    }
+
+    SECTION("false on either key passes nothing, so the default stands")
+    {
+        for (auto const injected: { true, false })
+        {
+            INFO("default: " << injected);
+            NodeConfig cfg;
+            cfg.logTimestamps = injected;
+            REQUIRE(ApplyNodeConfiguration(
+                        { Setting("log_timestamps", { "false" }), Setting("no_log_timestamps", { "false" }) }, path, {}, cfg)
+                        .has_value());
+            CHECK(cfg.logTimestamps == injected);
+        }
+    }
+
+    SECTION("the positive key turns it on where the default is off")
+    {
+        NodeConfig cfg;
+        cfg.logTimestamps = false;
+        REQUIRE(ApplyNodeConfiguration({ Setting("log_timestamps", { "true" }) }, path, {}, cfg).has_value());
+        CHECK(cfg.logTimestamps);
+    }
+
+    SECTION("a typed flag still outranks the file")
+    {
+        NodeConfig cfg;
+        cfg.logTimestamps = true;
+        auto const args = std::to_array<char const*>({ "--log-timestamps" });
+        REQUIRE(ApplyNodeConfiguration({ Setting("no_log_timestamps", { "true" }) }, path, args, cfg).has_value());
+        CHECK(cfg.logTimestamps);
+    }
+}
+
 TEST_CASE("NodeConfig: every row is reachable from a file or named as one that is not", "[node][config]")
 {
     // The compile-time guard beside the table proves this for the build; this is
