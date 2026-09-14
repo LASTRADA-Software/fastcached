@@ -284,27 +284,31 @@ class ParkingReadableSocket final: public SocketDecorator
 
     /// @copydoc ISocket::CancelRead
     ///
-    /// **Touches members after `Complete()` resumes a coroutine, which the real
-    /// transports must not do.** `RetireParked()` itself keeps the discipline -- detach,
-    /// complete, nothing after -- but the counter and the forward below run once the
-    /// awaiting coroutine has already resumed. Safe here only because this fake is a
-    /// test's stack local that no coroutine owns; a case where the resumed coroutine
-    /// owned the socket would get a use-after-free inside the instrument. Said out loud
-    /// because this class documents itself as modelling the transports' discipline, and
-    /// that is one place it deliberately does not.
+    /// Counts and forwards BEFORE it completes, and touches nothing after: the resumed
+    /// watcher may own this socket and drop it before control returns, which is the rule
+    /// every real transport's `Close()` keeps (#1430). This used to count and forward
+    /// after the completion, excused by a comment arguing no coroutine owned the fake --
+    /// true of the cases that existed, and exactly the argument #1308's own fake had been
+    /// relying on when UBSan caught it.
     void CancelRead() noexcept override
     {
-        if (RetireParked())
+        auto* const parked = TakeParked();
+        if (parked != nullptr)
             ++_watchesRetiredByCancel;
         SocketDecorator::CancelRead();
+        Retire(parked);
     }
 
     /// @copydoc ISocket::Close
+    ///
+    /// The same order as `CancelRead`, for the same reason.
     void Close() noexcept override
     {
-        if (RetireParked())
+        auto* const parked = TakeParked();
+        if (parked != nullptr)
             ++_watchesRetiredByClose;
         SocketDecorator::Close();
+        Retire(parked);
     }
 
     /// Resolve the parked watch as a reactor would when the socket becomes readable.
@@ -373,19 +377,28 @@ class ParkingReadableSocket final: public SocketDecorator
         _parked = nullptr;
     }
 
-    /// Complete a parked watch with `Cancelled`, which is what both retirement routes
-    /// deliver -- a caller's `CancelRead` and the connection's `Close`. Taking the code
-    /// as a parameter would be a knob with one setting; WHICH route retired the watch
-    /// is what the two counters record, and that is the distinction worth keeping.
-    /// @return Whether there was a parked watch to retire.
-    bool RetireParked() noexcept
+    /// Detach the parked watch, if any, so the slot is free before anything resumes.
+    /// @return The watch that was parked, or nullptr.
+    [[nodiscard]] IoAwaitable* TakeParked() noexcept
     {
-        auto* const parked = std::exchange(_parked, nullptr);
+        return std::exchange(_parked, nullptr);
+    }
+
+    /// Complete a detached watch with `Cancelled`, which is what both retirement routes
+    /// deliver -- a caller's `CancelRead` and the connection's `Close`. Taking the code as
+    /// a parameter would be a knob with one setting; WHICH route retired the watch is what
+    /// the two counters record, and that is the distinction worth keeping.
+    ///
+    /// Static, and called LAST by both routes: completing resumes the watcher inline, and
+    /// a watcher that owns this socket may destroy it, so this must not be able to reach a
+    /// member and nothing may run after it.
+    /// @param parked The watch `TakeParked` returned; nullptr completes nothing.
+    static void Retire(IoAwaitable* parked) noexcept
+    {
         if (parked == nullptr)
-            return false;
+            return;
         parked->Complete(
             IoResult { std::unexpected(NetError { .code = NetErrorCode::Cancelled, .systemCode = 0, .context = {} }) });
-        return true;
     }
 
     IoAwaitable* _parked { nullptr };
