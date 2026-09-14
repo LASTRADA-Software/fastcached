@@ -528,18 +528,6 @@ class RaftNode
     /// The term carried by any message, so the §5.1 rule can be applied once.
     [[nodiscard]] static Term TermOf(RaftMessage const& message) noexcept;
 
-    /// Who sent a message, so the §5.1 rule can say what disturbed this node.
-    ///
-    /// Every message carries exactly one member id and it is always the sender —
-    /// but spelled four different ways, so this cannot be the one-line `std::visit`
-    /// `TermOf` is. Detected rather than enumerated: eight near-identical arms
-    /// differing only in a field name is the copy-paste this codebase treats as a
-    /// defect, and a ninth message type naming its sender something else fails to
-    /// compile here rather than going quietly unattributed.
-    /// @param message The message being received.
-    /// @return The sender's id.
-    [[nodiscard]] static NodeId SenderOf(RaftMessage const& message);
-
     RaftConfig _config;
 
     /// `_config.Peers()`, computed once.

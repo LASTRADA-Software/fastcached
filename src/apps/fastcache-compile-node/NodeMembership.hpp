@@ -105,7 +105,7 @@ class NodeMembership final: public Distributed::IMembershipOracle
 {
   public:
     /// @param cfg The parsed configuration.
-    /// @param logger Where the keyless-widening refusal is reported, once.
+    /// @param logger Where an unreadable `fleet-open` row is reported, once.
     NodeMembership(NodeConfig const& cfg, ILogger& logger):
         _open {},
         _listed { cfg.fleetMembers },
@@ -114,10 +114,6 @@ class NodeMembership final: public Distributed::IMembershipOracle
         // neither copyable nor movable and the composite is declared after both.
         _admitted { { &_listed, &_cluster } },
         _logger { logger },
-        // FIXED for this process. `--cluster-key-file` carries `.same` and no
-        // `.reloadable`, so it cannot change under a running node -- which is what
-        // lets the widening guard below read it once rather than re-ask per commit.
-        _keyless { cfg.clusterKeyFile.empty() },
         _flagOpen { cfg.fleetOpen },
         _isOpen { cfg.fleetOpen }
     {
@@ -326,41 +322,14 @@ class NodeMembership final: public Distributed::IMembershipOracle
             return;
         }
 
-        auto const wanted = agreed == AgreedOpen::Open;
-
-        // **A keyless node refuses to WIDEN, and narrows freely** -- #282 arriving
-        // through a door the reload guard cannot watch. `ValidateNodeReloadable`
-        // already refuses this transition when an OPERATOR acts on this machine,
-        // because a node with no `--cluster-key-file` built an unchecked lease
-        // validator at startup and `MakeWorkerLeaseValidator` has already run. A
-        // replicated row does the same thing with **no action on this node at all**,
-        // so that guard's own reasoning applies with more force while none of its code
-        // runs.
-        //
-        // Asked as a TRANSITION, like the reload rule: a keyless node its operator has
-        // already opened is running happily today and may stay open. Only the widening
-        // is refused, and the node then stays CLOSED while the cluster says open --
-        // a divergence that fails closed and says so, which is the direction this
-        // whole path exists to choose.
-        //
-        // **It cannot move to the leader, and that is not tidiness left undone.** The
-        // leader would have to refuse `--cluster-set fleet-open=1` for the whole
-        // cluster on account of one member, and it cannot know whether any other
-        // member is keyless -- nothing replicates that, and nothing should.
-        if (wanted && !flag && _keyless)
-        {
-            if (!_warnedKeyless.exchange(true, std::memory_order_relaxed))
-                _logger.Logf(LogLevel::Warn,
-                             "this cluster has agreed {}=1, and this node has no --cluster-key-file, so it is "
-                             "STAYING CLOSED: it built a lease check at startup that verifies nothing, which is "
-                             "only safe while no machine but this one is admitted. Give --cluster-key-file and "
-                             "restart to join the open fleet.",
-                             Cluster::FleetOpenSetting);
-            _isOpen.store(false, std::memory_order_relaxed);
-            return;
-        }
-
-        _isOpen.store(wanted, std::memory_order_relaxed);
+        // No keyless-node exception, and its absence is deliberate (#1308). One stood
+        // here: a node with no `--cluster-key-file` built a lease check that verifies
+        // nothing, so a replicated `fleet-open=1` widening it was #282 through a door the
+        // reload guard cannot watch. Cluster state reaches only a node running consensus,
+        // consensus refuses to start without the key, and so every node this row can
+        // open checks the grants its new callers present. The RELOAD guard stays: a
+        // node that runs no consensus can still be keyless and be opened by its operator.
+        _isOpen.store(agreed == AgreedOpen::Open, std::memory_order_relaxed);
     }
 
     Distributed::OpenMembership _open;
@@ -377,21 +346,13 @@ class NodeMembership final: public Distributed::IMembershipOracle
     /// which it borrows.
     Distributed::AnyOfMembership _admitted;
 
-    /// Where the keyless-widening refusal is reported, once.
+    /// Where an unreadable `fleet-open` row is reported, once.
     ILogger& _logger;
-
-    /// Whether this node started with no `--cluster-key-file`. Fixed for the process;
-    /// see the constructor.
-    bool _keyless;
-
-    /// Whether this node has already said so once, so a cluster that stays open does
-    /// not fill the log with one line per commit.
-    std::atomic<bool> _warnedKeyless { false };
 
     /// What `--fleet-open` says on THIS node. Separate from `_isOpen` since #1112,
     /// which is the whole shape of that ticket: the effective answer is now a
     /// function of two inputs, and keeping the local one is what lets absence resolve
-    /// to it and what makes the widening guard a TRANSITION rather than a state.
+    /// to it.
     std::atomic<bool> _flagOpen;
 
     /// Whether this node has already reported an unreadable row, so a cluster that

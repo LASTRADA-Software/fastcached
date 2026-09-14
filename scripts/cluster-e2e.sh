@@ -25,6 +25,15 @@
 #                            for its last member re-elects on any hiccup by design
 #                            — see `wait_for_formation`, and issue #117 for the
 #                            three CI runs spent proving the algorithm right.
+#  1b. The key is proved — a node given consensus and no `--cluster-key-file` exits at
+#                          startup naming the flag, and a `--raft-join` node holding the
+#                          WRONG key is refused by every member it dials: each member's
+#                          proof-refusal counter rises, read with `fastcache-cli
+#                          node-metrics`, the joiner's own ended-by-acceptor counter
+#                          rises, and the formed cluster's leadership does not move while
+#                          it tries (#1308). The unit tests assert both ends of one
+#                          connection in one process; this is the only place the startup
+#                          refusal, the counters and a real client meet.
 #   2. Redirect is usable — a follower's refusal names the leader's SCHEDULER port,
 #                          and dialling that endpoint works. This is the defect the
 #                          two-endpoint member record exists to close: while one
@@ -53,17 +62,23 @@
 # broken" when it means "something else was listening".
 #
 # Usage:
-#   cluster-e2e.sh --node <path>
+#   cluster-e2e.sh --node <path> --cli <path>
+#
+# `--cli` is `fastcache-cli`, which section 1b reads the nodes' counters with over the
+# `0xFC` port they already serve (`node-metrics`) -- the same door an operator uses, and
+# no admin surface opened on any node for the fixture's sake.
 #
 # Exit codes: 0 = all assertions held; 1 = a failure; 77 = a prerequisite was
 # missing (skip).
 set -euo pipefail
 
 node=""
+cli=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --node) node="$2"; shift 2 ;;
+        --cli) cli="$2"; shift 2 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
@@ -71,6 +86,7 @@ done
 readonly SKIP=77
 
 [[ -n "$node" && -x "$node" ]] || { echo "fastcache-compile-node not found: '$node'; skipping"; exit "$SKIP"; }
+[[ -n "$cli" && -x "$cli" ]] || { echo "fastcache-cli not found: '$cli'; skipping"; exit "$SKIP"; }
 
 workdir="$(mktemp -d)"
 pids=()
@@ -83,13 +99,11 @@ pids=()
 # shape does, and it means these fixtures exercise the SIGNING scheduler and the
 # VERIFYING worker rather than the unchecked pair.
 #
-# The binds are loopback, which is the OTHER half of #282's rule and is why the key is
-# a choice here rather than a requirement: either a loopback bind or a loopback-only
-# policy closes the port on its own, and these nodes have the first and deliberately
-# not the second. This paragraph used to say they left the bind at the wildcard, which
-# was true of the flag it named (`--bind`, defaulting to 0.0.0.0) and became false when
-# #290 stage 3 replaced it with `--listen-node=127.0.0.1:<port>` -- a mechanical flag
-# rename carried a claim about behaviour with it.
+# And it is REQUIRED, which it was not before #1308: every node here runs consensus,
+# and consensus refuses to start without the key because every connection between
+# members proves it. The loopback binds -- the other half of #282's rule -- used to make
+# the key a choice for these nodes; they no longer do. Section 1b starts one node
+# without it, to watch that refusal happen.
 #
 # Fixed text rather than /dev/urandom: what these scripts assert has nothing to do
 # with the key's value, and a per-run secret would make a failure look like a flake.
@@ -432,33 +446,55 @@ done
 # types twice. Passing an EMPTY `--node-id=` would not test that -- that is a value
 # somebody typed -- so the flag has to be absent from the command line entirely.
 #
+# THE KEY IS A PARAMETER (#1308), for the reason the id is: section 1b starts a node
+# with none and a node with the wrong one, and a second spelling of these fourteen
+# flags for each would be the copy this function exists to prevent. `-` means no
+# `--cluster-key-file` at all, which is a different command line from an empty value
+# somebody typed.
+#
+# `node_command` builds the argv into `node_argv` and `launch_node` runs it: the one
+# leg that must watch the binary REFUSE to start cannot go through a readiness wait,
+# and it still has to be this command line.
+#
 # @param 1 index into the port/pid/log arrays
 # @param 2 slot: what its state directory and log are named after
 # @param 3 the --node-id it runs under, or `-` to let it derive one
-# @param 4.. whatever else this node's shape needs (--raft-peer, --raft-join)
-launch_node() {
-    local index="$1" slot="$2" id="$3"; shift 3
-    local log="${workdir}/${slot}.log"
-    node_logs[index]="$log"
+# @param 4 the --cluster-key-file it holds, or `-` for none
+# @param 5.. whatever else this node's shape needs (--raft-peer, --raft-join)
+node_argv=()
+node_command() {
+    local index="$1" slot="$2" id="$3" key="$4"; shift 4
 
     local named=()
     [[ "$id" == "-" ]] || named=(--node-id="$id")
+    local keyed=()
+    [[ "$key" == "-" ]] || keyed=(--cluster-key-file="$key")
 
-    "$node" \
-        ${named+"${named[@]}"} \
-        --listen-raft="127.0.0.1:${raft_ports[$index]}" \
-        "$@" \
-        --cluster-dir="${workdir}/${slot}" \
-        --serve-scheduler \
-        --listen-node="127.0.0.1:${scheduler_ports[$index]}" \
-        --fleet-open \
-        --cluster-key-file="$cluster_key" \
-        --cache-memory=0 \
-        --scheduler="127.0.0.1:${scheduler_ports[$index]}" \
-        --toolchain="/bin/sh" \
-        --advertise="127.0.0.1:${scheduler_ports[$index]}" \
-        --log-level=info \
-        > "$log" 2>&1 &
+    node_argv=(
+        "$node"
+        ${named+"${named[@]}"}
+        --listen-raft="127.0.0.1:${raft_ports[$index]}"
+        "$@"
+        --cluster-dir="${workdir}/${slot}"
+        --serve-scheduler
+        --listen-node="127.0.0.1:${scheduler_ports[$index]}"
+        --fleet-open
+        ${keyed+"${keyed[@]}"}
+        --cache-memory=0
+        --scheduler="127.0.0.1:${scheduler_ports[$index]}"
+        --toolchain="/bin/sh"
+        --advertise="127.0.0.1:${scheduler_ports[$index]}"
+        --log-level=info
+    )
+}
+
+launch_node() {
+    local index="$1" slot="$2"
+    local log="${workdir}/${slot}.log"
+    node_logs[index]="$log"
+
+    node_command "$@"
+    "${node_argv[@]}" > "$log" 2>&1 &
     pids[index]="$!"
     # Ready, not merely bound (#634). Nothing n1..n3's own callers assert needs it
     # -- `find_leader` below is a bounded retry loop and heals a node that is still
@@ -470,7 +506,7 @@ launch_node() {
 
 start_node() {
     local index="$1"
-    launch_node "$index" "n$((index + 1))" "n$((index + 1))" "${peers[@]}"
+    launch_node "$index" "n$((index + 1))" "n$((index + 1))" "$cluster_key" "${peers[@]}"
 }
 
 for index in 0 1 2; do
@@ -804,6 +840,92 @@ for round in $(seq 1 15); do
 done
 echo "cluster E2E: exactly one node answers, and keeps answering"
 
+# --- 1b. a node without the key is refused, and one with the wrong key is never heard
+
+# #1308. Every Raft connection proves the cluster key before a message is read, so the
+# two ways to be without it are two different moments: a node with NO key is refused at
+# STARTUP and never binds anything, and a node with the WRONG key starts, dials every
+# member, and is refused on every connection. Both are run here against the formed
+# cluster above, and both leave it exactly as they found it.
+#
+# Placed before section 4 because leadership stability is part of the assertion, and
+# only a FORMED cluster with nothing else happening is one whose leadership may not
+# move -- section 4's admission legitimately re-elects. The slots are appended, so the
+# later sections take their indices from the array length as they already did.
+
+# A node with no key. `run_bounded` rather than `launch_node`, because the property is
+# that it EXITS: a readiness wait would report the refusal as a node that never came up.
+# Status 2 is the startup table's refusal; a bound that expires is a node that STARTED,
+# which is the defect.
+raft_ports+=("$(free_port)")
+scheduler_ports+=("$(free_port)")
+keyless_index=$(( ${#scheduler_ports[@]} - 1 ))
+node_command "$keyless_index" keyless x8 - --raft-peer="x8=127.0.0.1:${raft_ports[$keyless_index]}" "${peers[@]}"
+keyless_status=0
+keyless_output="$(run_bounded 15 "${node_argv[@]}")" || keyless_status=$?
+[[ "$keyless_status" -eq 2 ]] ||
+    fail "a consensus node with no --cluster-key-file did not exit 2 at startup (status ${keyless_status}): ${keyless_output}"
+[[ "$keyless_output" == *"consensus needs --cluster-key-file"* ]] ||
+    fail "a consensus node with no --cluster-key-file exited without naming the flag: ${keyless_output}"
+# Nothing listens at its ports, so no helper walking the slots may ask them.
+scheduler_ports[keyless_index]=""
+echo "cluster E2E: a consensus node with no key is refused at startup, naming --cluster-key-file"
+
+# A node with the WRONG key, joining. The members' refusal counter is read first and
+# must read ZERO -- present, and zero -- because a counter that is absent satisfies no
+# floor and one already moving would let the wait below pass on somebody else's
+# refusals.
+proof_series="fastcache_raft_peer_connections_refused_proof_total"
+ended_series="fastcache_raft_peer_dials_ended_by_acceptor_total"
+for index in 0 1 2; do
+    baseline="$(node_counter_value "$cli" "127.0.0.1:${scheduler_ports[$index]}" "$proof_series")" ||
+        fail "n$((index + 1)) did not answer node-metrics"
+    [[ "$baseline" == "0" ]] ||
+        fail "n$((index + 1)) reports ${proof_series}='${baseline}' before any wrong key dialled it; expected a present 0"
+done
+
+stranger_key="${workdir}/stranger.key"
+printf 'e2e-fixture-a-key-this-cluster-does-not-hold\n' > "$stranger_key"
+raft_ports+=("$(free_port)")
+scheduler_ports+=("$(free_port)")
+stranger_index=$(( ${#scheduler_ports[@]} - 1 ))
+launch_node "$stranger_index" x9 x9 "$stranger_key" --raft-join \
+    --raft-peer="x9=127.0.0.1:${raft_ports[$stranger_index]}" "${peers[@]}"
+
+# EVERY member refuses it, not merely one: a member that admitted a wrong key would be
+# hidden inside a total.
+for index in 0 1 2; do
+    wait_for_node_counter "$cli" "127.0.0.1:${scheduler_ports[$index]}" "$proof_series" 1 "${pids[$index]}" \
+        "n$((index + 1)) refusing the wrong-key joiner" "${node_logs[$index]}" "$FormationSeconds"
+done
+wait_for_node_counter "$cli" "127.0.0.1:${scheduler_ports[$stranger_index]}" "$ended_series" 1 \
+    "${pids[$stranger_index]}" "the wrong-key joiner seeing its dials end after its proof" \
+    "${node_logs[$stranger_index]}" "$FormationSeconds"
+
+# And the cluster did not notice: the same leader, answering alone, for three seconds
+# while the joiner keeps redialling on its backoff. Asked of the three members only --
+# the joiner's slot is not one of them.
+for round in $(seq 1 15); do
+    answered=0
+    who=""
+    for index in 0 1 2; do
+        endpoint="127.0.0.1:${scheduler_ports[$index]}"
+        if [[ "$(cluster "$endpoint" --cluster-status)" == *"known settings:"* ]]; then
+            answered=$(( answered + 1 ))
+            who="$endpoint"
+        fi
+    done
+    [[ "$answered" -eq 1 ]] ||
+        fail "round ${round} with a wrong-key joiner dialling: expected exactly one node to answer, got ${answered}"
+    [[ "$who" == "$leader_endpoint" ]] ||
+        fail "round ${round}: leadership moved from ${leader_endpoint} to ${who} while a wrong-key joiner dialled"
+    sleep 0.2
+done
+
+stop_and_require_exit "${pids[$stranger_index]}" "the wrong-key joiner" 15
+scheduler_ports[stranger_index]=""
+echo "cluster E2E: a wrong-key joiner is refused by every member and the cluster's leadership does not move"
+
 # --- 2. a follower's redirect names an endpoint that works -------------------
 
 # The defect the two-endpoint member record closes. While one address was
@@ -995,6 +1117,7 @@ echo "cluster E2E: a refused setting names the flag that does the job"
 # permanently silent -- which is what this case found the first time it was run.
 raft_ports+=("$(free_port)")
 scheduler_ports+=("$(free_port)")
+n4_index=$(( ${#scheduler_ports[@]} - 1 ))
 
 # `launch_node`'s readiness wait is load-bearing here (#634). The very next
 # statement asks n4 `--cluster-status` and asserts on its REFUSAL, so a node that
@@ -1003,12 +1126,12 @@ scheduler_ports+=("$(free_port)")
 # with, which also fails to contain `known settings:`. A negative assertion cannot
 # tell "it does not lead" from "it could not answer", so what it rests on has to
 # be established before it, not by it.
-launch_node 3 n4 n4 --raft-join --raft-peer="n4=127.0.0.1:${raft_ports[3]}" "${peers[@]}"
+launch_node "$n4_index" n4 n4 "$cluster_key" --raft-join --raft-peer="n4=127.0.0.1:${raft_ports[$n4_index]}" "${peers[@]}"
 
 # It is running and it leads nothing, which is the first half of the property: a
 # node waiting to be admitted must not have formed a cluster of its own. Asked of
 # the node itself, because "no cluster" is exactly what it should answer.
-answer="$(cluster "127.0.0.1:${scheduler_ports[3]}" --cluster-status)"
+answer="$(cluster "127.0.0.1:${scheduler_ports[$n4_index]}" --cluster-status)"
 [[ "$answer" != *"known settings:"* ]] || fail "a joining node answered as a leader; it bootstrapped its own cluster"
 echo "cluster E2E: a joining node leads nothing"
 
@@ -1018,7 +1141,7 @@ echo "cluster E2E: a joining node leads nothing"
 # distinguishing assertion available at all, and this is the only place in the tree
 # that exercises it end to end: real binaries, a real wire, and the operator's own
 # command line.
-ask_leader "--cluster-admit=n4=127.0.0.1:${raft_ports[3]}" "127.0.0.1:${raft_ports[3]}" \
+ask_leader "--cluster-admit=n4=127.0.0.1:${raft_ports[$n4_index]}" "127.0.0.1:${raft_ports[$n4_index]}" \
     "the leader did not echo back the endpoint it recorded"
 
 # Admission is two steps and this waits for the second. The record commits first,
@@ -1063,10 +1186,10 @@ join_armed="$_e2e_deadline_armed"
 join_dpid="${join_armed%% *}"
 join_dmark="${join_armed#* }"
 while ! _e2e_deadline_passed "$join_dmark"; do
-    answer="$(cluster "127.0.0.1:${scheduler_ports[3]}" --cluster-status)"
+    answer="$(cluster "127.0.0.1:${scheduler_ports[$n4_index]}" --cluster-status)"
     named="$(named_endpoint "$answer")"
     if [[ "$answer" == *"known settings:"* ]]; then
-        leader_endpoint="127.0.0.1:${scheduler_ports[3]}"
+        leader_endpoint="127.0.0.1:${scheduler_ports[$n4_index]}"
         joined=1
         break
     fi
@@ -1134,7 +1257,8 @@ echo "cluster E2E: a member can be removed"
 
 # A cluster that formed once and could not re-form is one that works until the
 # first reboot. Three of four remain, which is still a majority.
-for index in 0 1 2 3; do
+for index in "${!scheduler_ports[@]}"; do
+    [[ -n "${scheduler_ports[$index]}" ]] || continue
     if [[ "127.0.0.1:${scheduler_ports[$index]}" == "$leader_endpoint" ]]; then
         kill "${pids[$index]}" >/dev/null 2>&1 || true
         for _ in $(seq 1 75); do
@@ -1267,7 +1391,7 @@ await_answer() {
 raft_ports+=("$(free_port)")
 scheduler_ports+=("$(free_port)")
 one_index=$(( ${#scheduler_ports[@]} - 1 ))
-launch_node "$one_index" m1 - --raft-self=127.0.0.1
+launch_node "$one_index" m1 - "$cluster_key" --raft-self=127.0.0.1
 
 # What it decided to BE, observed rather than assumed. Without this the whole section
 # would pass identically for a node that had been handed a name, so nothing in it
@@ -1314,7 +1438,7 @@ echo "cluster E2E: a one-member cluster commits alone"
 raft_ports+=("$(free_port)")
 scheduler_ports+=("$(free_port)")
 rival_index=$(( ${#scheduler_ports[@]} - 1 ))
-launch_node "$rival_index" m2-without-join m2 --raft-peer="m2=127.0.0.1:${raft_ports[$rival_index]}"
+launch_node "$rival_index" m2-without-join m2 "$cluster_key" --raft-peer="m2=127.0.0.1:${raft_ports[$rival_index]}"
 
 # Blanked the moment it is up, and its endpoint kept in a variable instead.
 #
@@ -1367,7 +1491,7 @@ m1_id="${m1_ids%%$'\n'*}"
 raft_ports+=("$(free_port)")
 scheduler_ports+=("$(free_port)")
 two_index=$(( ${#scheduler_ports[@]} - 1 ))
-launch_node "$two_index" m2 m2 --raft-join \
+launch_node "$two_index" m2 m2 "$cluster_key" --raft-join \
     --raft-peer="m2=127.0.0.1:${raft_ports[$two_index]}" \
     --raft-peer="${m1_id}=127.0.0.1:${raft_ports[$one_index]}"
 

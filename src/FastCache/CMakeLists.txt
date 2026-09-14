@@ -43,6 +43,7 @@ target_sources(FastCache
         Consensus/RaftLog.cpp
         Consensus/RaftNode.cpp
         Consensus/RaftPeerServer.cpp
+        Consensus/RaftPeerSession.cpp
         Consensus/RaftPeerTransport.cpp
         Core/Crc32c.cpp
         Core/FigureText.cpp

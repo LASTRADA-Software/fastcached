@@ -1082,6 +1082,51 @@ run_case() {
         echo "the counter finding named all three terminal states"
         ;;
 
+    # --- `wait_for_node_counter`, against a stub client -----------------------
+    #
+    # The `0xFC` door (#1308). Its acquisition is a CLIENT, not a listener, so the
+    # stand-in is a script that prints what `fastcache-cli node-metrics --format=kv`
+    # prints -- no perl, no port -- and each terminal state is one stub. The wait is
+    # the one `wait_for_counter` uses, so what these add is that the reader and the
+    # door name reach it: `node-metrics` in the finding, never `/metrics`.
+    node-counter-rises|node-counter-flat|node-counter-absent|node-counter-never-answered)
+        log="${scratch}/node-counter.log"
+        : > "$log"
+        stub="${scratch}/fastcache-cli-stub"
+        case "$name" in
+            node-counter-rises) printf '#!/bin/sh\nprintf "other_total=9\\nstaged_counter_total=1\\n"\n' > "$stub" ;;
+            node-counter-flat) printf '#!/bin/sh\nprintf "staged_counter_total=0\\n"\n' > "$stub" ;;
+            node-counter-absent) printf '#!/bin/sh\nprintf "other_total=3\\n"\n' > "$stub" ;;
+            node-counter-never-answered) printf '#!/bin/sh\nexit 3\n' > "$stub" ;;
+        esac
+        chmod +x "$stub"
+        sleep 30 >/dev/null 2>&1 &
+        staged=$!
+        wait_for_node_counter "$stub" 127.0.0.1:1 staged_counter_total 1 "$staged" "a stub node" "$log"
+        [ "$E2eCounterReading" = "1" ] \
+            || fail "E2eCounterReading is '${E2eCounterReading}', not the reading 1"
+        echo "wait_for_node_counter returned and handed back the reading 1"
+        ;;
+
+    # The `name=value` grammar under it: `metric_value`'s rules over the other
+    # separator, each one a way a reading goes wrong quietly.
+    node-metric-value-grammar)
+        body=$'fastcache_a_total=7\nfastcache_a_refused_total=0\n'
+        [ "$(node_metric_value "$body" fastcache_a_total)" = "7" ] \
+            || fail "a counter was not read by its exact name"
+        [ -z "$(node_metric_value "$body" fastcache_b_total)" ] \
+            || fail "an absent counter did not read empty"
+        [ "$(node_metric_value "$body" fastcache_a_refused_total)" = "0" ] \
+            || fail "a real zero did not read zero"
+        [ -z "$(node_metric_value "$body" fastcache_a)" ] \
+            || fail "a prefix of a counter name matched something"
+        [ -z "$(node_metric_value $'fastcache_a_total 7\n' fastcache_a_total)" ] \
+            || fail "a Prometheus line was read as a node-metrics one"
+        [ "$(node_metric_value $'c=1\nc=4\n' c)" = "4" ] \
+            || fail "the last reading of a repeated counter did not win"
+        echo "the node-metrics grammar refused a prefix, a Prometheus line and an absent counter"
+        ;;
+
     # --- the Prometheus grammar, against staged bodies ------------------------
     #
     # `metric_value` is pure and its grammar was driven by nothing: #643 moved it
@@ -2776,6 +2821,13 @@ cases=(
     # `metric_value` into the library and left its decisions asserted on no tree
     # (#597, which found the same gap on the fixture side before the move).
     "metric-value-grammar|0|the Prometheus grammar refused a prefix, a label and an absent series|!BUG:"
+    # The `0xFC` door (#1308): one stub client per terminal state, and the finding names
+    # the door that was asked, so `!/metrics` is the half that distinguishes.
+    "node-counter-rises|0|wait_for_node_counter returned and handed back the reading 1|!BUG:"
+    "node-counter-flat|1|of a 1s budget|never reached 1; the last reading was 0|!BUG:"
+    "node-counter-absent|1|of a 1s budget|node-metrics answered and exports no staged_counter_total series at all|!/metrics|!BUG:"
+    "node-counter-never-answered|1|of a 1s budget|nothing ever answered a node-metrics request|!/metrics|!BUG:"
+    "node-metric-value-grammar|0|the node-metrics grammar refused a prefix, a Prometheus line and an absent counter|!BUG:"
     "bounded-returns-status|0|run_bounded said 'carried' with status 3"
     "bounded-missing-command|0|a missing command: outcome=unstartable|!BUG:"
     "bounded-outcome-survives-capture|0|two subshells down, the outcome reads unstartable"

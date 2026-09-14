@@ -5,9 +5,15 @@
 #include <FastCache/Async/Cancellation.hpp>
 #include <FastCache/Async/IReactor.hpp>
 #include <FastCache/Async/Task.hpp>
+#include <FastCache/Consensus/IRaftPeerCredential.hpp>
 #include <FastCache/Consensus/IRaftTransport.hpp>
+#include <FastCache/Consensus/RaftPeerRefusals.hpp>
 #include <FastCache/Consensus/RaftTypes.hpp>
+#include <FastCache/Consensus/RaftWire.hpp>
+#include <FastCache/Core/Clock.hpp>
+#include <FastCache/Core/IRandomSource.hpp>
 #include <FastCache/Core/Logger.hpp>
+#include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Net/IConnector.hpp>
 
 #include <atomic>
@@ -19,6 +25,7 @@
 #include <mutex>
 #include <shared_mutex>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -102,6 +109,14 @@ struct PeerTransportOptions
     /// unreachable a peer happens to be. Costs one wake-up per bound per
     /// unreachable peer, each of which loads one atomic and re-parks.
     std::chrono::milliseconds stopWakeBound { 50 };
+
+    /// How long an acceptor may take to challenge and then to answer this node's proof.
+    ///
+    /// `RaftWire::HandshakeBound`, the number the accepting end holds a dialler to. A
+    /// connection that runs out of it is abandoned and counted, and the sender backs off
+    /// and redials exactly as for any dropped connection. Non-positive arms no deadline,
+    /// for a test driving a reactor nothing turns.
+    std::chrono::milliseconds handshakeBound { RaftWire::HandshakeBound };
 };
 
 /// `IRaftTransport` over real sockets, one coroutine per peer on the reactor.
@@ -139,6 +154,17 @@ struct PeerTransportOptions
 /// changes is that one component now has one lifecycle model, one socket
 /// implementation, and closes what it opened.
 ///
+/// ## A peer is sent nothing until it has proved the key (#1308)
+///
+/// Each connection runs `RaftPeerSession`'s handshake before the first message: this end
+/// answers the acceptor's challenge with a proof naming the member it dialled, and reads
+/// the acceptor's signed verdict. Only an `Accepted` verdict that verifies starts the
+/// session -- and only then does the peer count in `ConnectedPeers()` -- so an address
+/// that no longer answers as the member, or answers without the key, is sent no Raft
+/// message at all. Every other ending moves its own counter (`DiallerRefusals`), the
+/// signed refusals under their own names, so a stale address book or a shared identity
+/// is never reported as a wrong key. Every frame after the verdict carries its tag.
+///
 /// ## Send never blocks and may drop
 ///
 /// `Send` appends to a bounded queue and returns. It does not wait for a
@@ -156,6 +182,9 @@ struct PeerTransportOptions
 class RaftPeerTransport final: public IRaftTransport
 {
   public:
+    /// How often a refused dial to one peer is logged, at most. Counted every time.
+    static constexpr std::chrono::seconds RefusalReportInterval { 60 };
+
     /// Construct over its collaborators; all must outlive the transport.
     /// @param self This node's own id, so a message addressed to it is refused
     ///        rather than looped through a socket.
@@ -165,12 +194,19 @@ class RaftPeerTransport final: public IRaftTransport
     /// @param connector How to dial; injected so tests need no network. Must be
     ///        one whose sockets belong to `reactor`.
     /// @param logger Where connection state changes are reported.
+    /// @param metrics Where a refused dial is counted.
+    /// @param credential What this node's proofs are made with, and an acceptor's
+    ///        verdicts checked against.
+    /// @param random Where each connection's nonce comes from.
     /// @param options Timeouts and queue bound.
     RaftPeerTransport(NodeId self,
                       std::vector<PeerEndpoint> peers,
                       IReactor& reactor,
                       IConnector& connector,
                       ILogger& logger,
+                      IMetricsSink& metrics,
+                      IRaftPeerCredential const& credential,
+                      IRandomSource& random,
                       PeerTransportOptions options = {});
 
     RaftPeerTransport(RaftPeerTransport const&) = delete;
@@ -314,6 +350,15 @@ class RaftPeerTransport final: public IRaftTransport
         /// `Start()`.
         Task<void> sender;
 
+        /// When a refused dial to this peer may next be logged. Reactor-thread only,
+        /// like `socket`.
+        ///
+        /// Per peer, because the sender redials every `reconnectBackoff`: one address
+        /// that answers without the key would otherwise write a Warn four times a second
+        /// for as long as it stays wrong, burying every other line. The counter moves
+        /// on every refusal regardless.
+        TimePoint nextRefusalReport {};
+
         /// @param where Where to dial.
         /// @param reactor Loop the outbox posts wake-ups to.
         /// @param options Queue bound and overflow policy.
@@ -345,12 +390,23 @@ class RaftPeerTransport final: public IRaftTransport
     /// @param peer Which peer's sender it was.
     void NoteSenderThrew(NodeId const& peer) noexcept;
 
+    /// Count a refused dial, and log it at most once per `RefusalReportInterval` per peer.
+    /// Reactor thread only.
+    /// @param peer The peer that was dialled.
+    /// @param where Where it was dialled.
+    /// @param refusal Which refusal.
+    /// @param detail What was seen, for the log line.
+    void NoteDialRefusal(Peer& peer, PeerEndpoint const& where, DiallerRefusal refusal, std::string_view detail);
+
     friend struct PeerSenderAccess;
 
     NodeId _self;
     IReactor& _reactor;
     IConnector& _connector;
     ILogger& _logger;
+    IMetricsSink& _metrics;
+    IRaftPeerCredential const& _credential;
+    IRandomSource& _random;
     PeerTransportOptions _options;
 
     /// Cancelled by `RequestStop`; observed by every backoff and loop condition.

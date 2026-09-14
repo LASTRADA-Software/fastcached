@@ -34,9 +34,10 @@ namespace FastCache::Node
 ///
 /// Because it opens nothing there is no widening question and no reload to refuse,
 /// and by the time the node starts normally its `clusterKeyFile` is non-empty, so
-/// the startup guard that refuses a keyless network-facing node is satisfied forever
-/// after. That guard must keep refusing; this mode is what makes satisfying it
-/// possible without placing the key by hand on every machine first.
+/// both startup guards that refuse a keyless node -- one that faces the network and
+/// admits remote peers (#282), and one that runs consensus at all (#1308) -- are
+/// satisfied forever after. Those guards must keep refusing; this mode is what makes
+/// satisfying them possible without placing the key by hand on every machine first.
 ///
 /// **The key crosses in cleartext.** The `0xFC` wire has no TLS -- `--tls-*` cover
 /// the admin surface only -- and what a captured cluster key buys is admission to the

@@ -100,9 +100,10 @@ class IRandomSource
 /// Not cryptographic, and deliberately so — the callers are timeout jitter and
 /// tie-breaking, where predictability costs nothing an attacker on the build
 /// network could not already do more cheaply. A caller that needs unguessable
-/// bytes (a token, a nonce) needs a different seam, not a stronger engine behind
+/// bytes (a bearer token) needs a different seam, not a stronger engine behind
 /// this one, because the two have different failure modes and this one's contract
-/// promises nothing about them.
+/// promises nothing about them. A handshake nonce is NOT that caller: it needs
+/// never to repeat rather than never to be guessed, and `Core/Nonce.hpp` says why.
 class SystemRandomSource final: public IRandomSource
 {
   public:

@@ -317,12 +317,17 @@ constexpr int ExitOk = 0;
 
 /// Whether this node will serve an enrollment surface.
 ///
-/// Two clauses, and they answer different KINDS of question, which is why the
-/// configuration half lives in `NodeConfig` where a test can reach it and this
-/// one-line conjunction lives here. `EnrollmentConfigured` is the RULE -- consensus
-/// and a named cluster key file, with the history in its own doc comment -- and
-/// `tier != nullptr` is a runtime fact about what was actually built, which only this
-/// translation unit knows and which no test links.
+/// Two clauses, and they answer different KINDS of question. `RunsConsensus` is the
+/// RULE, asked of the configuration, and `tier != nullptr` is a runtime fact about
+/// what was actually built, which only this translation unit knows and which no test
+/// links.
+///
+/// **There was a third clause, a named `--cluster-key-file`, and #1308 folded it into
+/// the first.** A keyless consensus node used to be legal, and on one the window was
+/// openable and APPROVABLE while the hand-over had no key to hand over -- an approval
+/// that grew the quorum by a machine that never became anything. A consensus node
+/// without the key is now refused at startup, because no peer connection can form
+/// without it, so the clause could only ever read true where it was asked.
 ///
 /// Named rather than spelled inline because `WorkerBody` is at the
 /// cognitive-complexity ceiling the build enforces, and because the two sites that
@@ -333,7 +338,7 @@ constexpr int ExitOk = 0;
 /// @return True when both halves hold.
 [[nodiscard]] bool ServesEnrollment(NodeConfig const& cfg, Node::SchedulerTier const* tier) noexcept
 {
-    return Node::EnrollmentConfigured(cfg) && tier != nullptr;
+    return Node::RunsConsensus(cfg) && tier != nullptr;
 }
 
 /// The address held by @p slot, or nullptr when it holds nothing.
@@ -1163,24 +1168,16 @@ void AdoptAllowlist(Cc::CompileJobRunner& jobs,
     // the guard here is CONSTRUCTION rather than a case -- a test built around a second
     // copy of this expression would assert something other than what ships.
     //
-    // **The key file is the THIRD clause, and it is the one that makes the sentence
-    // above true.** A node with no `--cluster-key-file` is a legal consensus node -- the
-    // startup table refuses a keyless one only where the compile port faces the network
-    // and admits remote peers -- and on such a node this window was openable, listable
-    // and APPROVABLE, and could never admit anybody, because the hand-over reads a key
-    // file that is not configured. Worse than a refusal: `AnswerDecision` commits
-    // `SchedulerService::ClusterAdmit` before the key is ever consulted, so an approval
-    // grew the replicated configuration -- and therefore the QUORUM -- by a machine that
-    // then received `StorageWriteFailed` and never became anything. A phantom member
-    // counted towards every future election, from one operator command that looked like
-    // it worked.
+    // **A consensus node HOLDS the key, so there is no keyless window to refuse**
+    // (#1308). That used to be a third clause here, because a keyless consensus node was
+    // legal and its window was approvable while it had nothing to hand over. The startup
+    // table now refuses consensus without `--cluster-key-file`, and `ConsensusTier`
+    // refuses a key it cannot read, before this line runs.
     //
-    // Asked of the CONFIGURATION rather than of the filesystem, deliberately: this is a
-    // startup-time structural question ("could this node ever hand a key over"), and a
-    // readability probe here would be a different claim with a different lifetime -- the
-    // file can be repaired, or break, long after this line runs. The remaining window,
-    // a key file that is named and cannot be READ, is closed where it has to be, at the
-    // decision itself: the responder now reads the key BEFORE it admits anybody.
+    // What remains is a key file that was readable at boot and is not at the
+    // hand-over -- the file can break long after startup -- and that is closed where it
+    // has to be, at the decision itself: the responder reads the key BEFORE it admits
+    // anybody.
     auto const servesEnrollment = ServesEnrollment(cfg, schedulerTier.get());
 
     Node::ConfiguredNodeStatus const nodeStatus {
@@ -1339,8 +1336,13 @@ void AdoptAllowlist(Cc::CompileJobRunner& jobs,
     // Started AFTER the scheduler tier, because its observers push into it, and
     // declared after too, so it is destroyed first and cannot call into a tier that
     // has gone.
-    auto consensusOrRefusal = Node::StartConsensusOrExplain(
-        cfg, schedulerTier, nodeSurface != nullptr ? nodeSurface->BoundEndpoint() : std::string {}, membership, logger);
+    auto consensusOrRefusal =
+        Node::StartConsensusOrExplain(cfg,
+                                      schedulerTier,
+                                      nodeSurface != nullptr ? nodeSurface->BoundEndpoint() : std::string {},
+                                      membership,
+                                      metrics,
+                                      logger);
     if (!consensusOrRefusal.has_value())
     {
         // No flag prefix here, for the reason the cache tier's line below has none:

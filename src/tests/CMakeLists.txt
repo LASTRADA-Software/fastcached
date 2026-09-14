@@ -4663,13 +4663,16 @@ endif()
 # target that does not exist yet does not fail, it silently skips the test
 # forever.
 if(NOT WIN32)
-    if(NOT TARGET fastcache-compile-node)
-        message(STATUS "cluster-e2e: compile node not built — skipping")
+    # `fastcache-cli` as well since #1308: section 1b reads the nodes' refusal counters
+    # with `node-metrics`, over the port they already serve.
+    if(NOT TARGET fastcache-compile-node OR NOT TARGET fastcache-cli)
+        message(STATUS "cluster-e2e: compile node or fastcache-cli not built — skipping")
     else()
         add_test(
             NAME "cluster-e2e"
             COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/cluster-e2e.sh"
                 --node "$<TARGET_FILE:fastcache-compile-node>"
+                --cli "$<TARGET_FILE:fastcache-cli>"
         )
         # Starts three nodes that hold six ports between them and drives an
         # election, so it must not race the other server-starting smoke tests.
