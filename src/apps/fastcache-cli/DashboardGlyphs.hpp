@@ -60,8 +60,11 @@ struct RungGlyphs
 
     std::string_view gaugeOpen;   ///< What opens a gauge; empty where the fill alone is legible.
     std::string_view gaugeFilled; ///< One filled gauge cell.
-    std::string_view gaugeEmpty;  ///< One unfilled gauge cell.
-    std::string_view gaugeClose;  ///< What closes a gauge; see `gaugeOpen`.
+    /// One cell of a slot gauge's middle part: capacity that is available and not in use, between the
+    /// filled cells of what runs and the empty cells of what a limit has withdrawn.
+    std::string_view gaugeHeld;
+    std::string_view gaugeEmpty; ///< One unfilled gauge cell.
+    std::string_view gaugeClose; ///< What closes a gauge; see `gaugeOpen`.
 };
 
 /// The rungs' glyphs, one row per `RenderRung`, in enumerator order.
@@ -84,6 +87,7 @@ inline constexpr EnumTable<RenderRung, RungGlyphs> RungGlyphTable { {
       .bottomLeft = "└",
       .gaugeOpen = "",
       .gaugeFilled = "█",
+      .gaugeHeld = "▒",
       .gaugeEmpty = "░",
       .gaugeClose = "" },
     { .rung = RenderRung::Unicode,
@@ -97,6 +101,7 @@ inline constexpr EnumTable<RenderRung, RungGlyphs> RungGlyphTable { {
       .bottomLeft = "└",
       .gaugeOpen = "",
       .gaugeFilled = "█",
+      .gaugeHeld = "▒",
       .gaugeEmpty = "░",
       .gaugeClose = "" },
     { .rung = RenderRung::Ascii,
@@ -110,6 +115,7 @@ inline constexpr EnumTable<RenderRung, RungGlyphs> RungGlyphTable { {
       .bottomLeft = "+",
       .gaugeOpen = "[",
       .gaugeFilled = "#",
+      .gaugeHeld = "=",
       .gaugeEmpty = ".",
       .gaugeClose = "]" },
     { .rung = RenderRung::Piped,
@@ -123,6 +129,7 @@ inline constexpr EnumTable<RenderRung, RungGlyphs> RungGlyphTable { {
       .bottomLeft = "+",
       .gaugeOpen = "[",
       .gaugeFilled = "#",
+      .gaugeHeld = "=",
       .gaugeEmpty = ".",
       .gaugeClose = "]" },
 } };
@@ -187,6 +194,30 @@ using CellWidth = std::size_t (*)(std::string_view text) noexcept;
 /// @param glyphs The rung's glyphs.
 /// @return The gauge.
 [[nodiscard]] std::string Gauge(double fraction, std::size_t width, RungGlyphs const& glyphs);
+
+/// A slot gauge, part by part, so each part can be dressed on its own.
+struct SlotGauge
+{
+    std::string open {};      ///< What opens it on this rung.
+    std::string running {};   ///< One filled cell per share of the registered slots running.
+    std::string held {};      ///< One held cell per share available and not running.
+    std::string withdrawn {}; ///< One empty cell per share a limit has taken away.
+    std::string close {};     ///< What closes it on this rung.
+};
+
+/// A gauge @p width cells wide over @p registered slots: what runs, what is available beside it, and what is withdrawn.
+///
+/// Three parts because a node offering fewer slots than it registered has two different kinds of not-running
+/// capacity, and one of them is a problem: `██████▒▒▒▒▒▒░░░░` is 6 running, 6 more it may take, and 4 a limit took.
+/// A compile count above what is available draws no held cells, never a negative run.
+/// @param inFlight Compiles running.
+/// @param available What the node may hold right now, running ones included.
+/// @param registered What it registered with; the whole width.
+/// @param width Fill cells, excluding the rung's open and close.
+/// @param glyphs The rung's glyphs.
+/// @return The parts; every cell withdrawn for a node registered with none.
+[[nodiscard]] SlotGauge SlotGaugeOf(
+    std::uint32_t inFlight, std::uint32_t available, std::uint32_t registered, std::size_t width, RungGlyphs const& glyphs);
 
 /// How a figure is written: the library's, so a panel and the browser page write one figure alike.
 using FastCache::FigureFormat;
