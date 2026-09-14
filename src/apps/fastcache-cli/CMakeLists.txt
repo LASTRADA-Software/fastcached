@@ -32,6 +32,7 @@ set(_fc_cli_sources
     LivePipedView.cpp
     LiveSession.cpp
     LiveStats.cpp
+    LiveSubscriber.cpp
     MemcachedClient.cpp
     NodeClient.cpp
     NodeSlots.cpp
@@ -115,6 +116,7 @@ if(FASTCACHED_BUILD_TESTS)
         LivePipedView_test.cpp
         LiveSession_test.cpp
         LiveStats_test.cpp
+        LiveSubscriber_test.cpp
         MemcachedClient_test.cpp
         MemcachedVerbs_test.cpp
         NodeClient_test.cpp
