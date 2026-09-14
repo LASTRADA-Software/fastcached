@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <format>
 #include <optional>
 #include <ranges>
 #include <span>
@@ -689,7 +690,11 @@ namespace
 }
 
 /// The dial address's label as the worksheet prints it: indented under `dialled at:`.
-constexpr std::string_view DialLabel = "  consensus endpoint";
+/// @return Two spaces and `ConsensusEndpointLabel`.
+[[nodiscard]] std::string DialLabel()
+{
+    return std::format("  {}", ConsensusEndpointLabel);
+}
 
 /// The one line of @p sheet that starts with @p label.
 /// @param sheet What `RenderSurfaces` printed.
@@ -725,18 +730,18 @@ TEST_CASE("The worksheet prints the consensus address peers DIAL apart from the 
     auto const cfg = WildcardBoundWithRaftSelf();
 
     auto const dial = ConsensusDialAddressOf(cfg);
-    REQUIRE(dial.state == ConsensusDialState::Stated);
-    CHECK(dial.endpoint == "10.0.0.4:6680");
+    REQUIRE(dial.has_value());
+    CHECK(*dial == "10.0.0.4:6680");
 
     auto const sheet = RenderSurfaces(cfg);
     INFO(sheet);
     auto const raftRow = LineStarting(sheet, "raft ");
-    auto const dialLine = LineStarting(sheet, DialLabel);
+    auto const dialLine = LineStarting(sheet, DialLabel());
     REQUIRE(raftRow.has_value());
     REQUIRE(dialLine.has_value());
 
     auto const bound = AddressColumnOf(Unwrap(raftRow), "raft");
-    auto const dialled = AddressColumnOf(Unwrap(dialLine), DialLabel);
+    auto const dialled = AddressColumnOf(Unwrap(dialLine), DialLabel());
     CHECK(bound == "0.0.0.0:6680");
     CHECK(dialled == "10.0.0.4:6680");
     // The acceptance, stated as what DISTINGUISHES: the two printed addresses differ. A
@@ -752,9 +757,9 @@ TEST_CASE("The worksheet prints the consensus address peers DIAL apart from the 
     // reader of a pasted transcript -- the docs check included. So the label is indented
     // under its heading, and nothing in column one names it.
     CHECK_FALSE(LineStarting(sheet, "consensus").has_value());
-    CHECK(sheet.find("\ndialled at:\n") < sheet.find(DialLabel));
+    CHECK(sheet.find("\ndialled at:\n") < sheet.find(DialLabel()));
     CHECK(sheet.find("raft ") < sheet.find("\ndialled at:\n"));
-    CHECK(sheet.find(DialLabel) < sheet.find("\nnotes:"));
+    CHECK(sheet.find(DialLabel()) < sheet.find("\nnotes:"));
 }
 
 TEST_CASE("A node running no consensus prints its dial address as ABSENT, not as an empty one",
@@ -767,12 +772,12 @@ TEST_CASE("A node running no consensus prints its dial address as ABSENT, not as
     cfg.raftSelf = "10.0.0.4"; // named, and still nothing to dial: no consensus port
 
     auto const dial = ConsensusDialAddressOf(cfg);
-    CHECK(dial.state == ConsensusDialState::NoConsensus);
-    CHECK(dial.endpoint.empty());
+    REQUIRE_FALSE(dial.has_value());
+    CHECK(dial.error() == ConsensusDialGap::NoConsensus);
 
-    auto const line = LineStarting(RenderSurfaces(cfg), DialLabel);
+    auto const line = LineStarting(RenderSurfaces(cfg), DialLabel());
     REQUIRE(line.has_value());
-    CHECK(AddressColumnOf(Unwrap(line), DialLabel) == "-");
+    CHECK(AddressColumnOf(Unwrap(line), DialLabel()) == "-");
     CHECK(Unwrap(line).contains("absent"));
     CHECK_FALSE(Unwrap(line).contains("10.0.0.4"));
 }
@@ -788,8 +793,19 @@ TEST_CASE("The dial address is the node's own member entry, which a typed --raft
                       Cluster::ClusterMember { .id = "n2", .raftEndpoint = "10.0.0.8:6680", .schedulerEndpoint = {} } };
 
     auto const dial = ConsensusDialAddressOf(cfg);
-    CHECK(dial.state == ConsensusDialState::Stated);
-    CHECK(dial.endpoint == "10.0.0.7:6680");
+    REQUIRE(dial.has_value());
+    CHECK(*dial == "10.0.0.7:6680");
+
+    SECTION("and it wins over a --raft-self that contradicts it, which is the entry consensus would run under")
+    {
+        // The startup table refuses this pair (`NodeIdentity_test.cpp` asserts which rule);
+        // the worksheet still has to print it, and it prints the address the refusal is about.
+        auto contradicted = cfg;
+        contradicted.raftSelf = "10.0.0.4";
+        auto const reported = ConsensusDialAddressOf(contradicted);
+        REQUIRE(reported.has_value());
+        CHECK(*reported == "10.0.0.7:6680");
+    }
 }
 
 TEST_CASE("A consensus node that names itself neither way prints NOT STATED, and is still refused",
@@ -802,39 +818,11 @@ TEST_CASE("A consensus node that names itself neither way prints NOT STATED, and
     cfg.raftListen = "6680";
 
     auto const dial = ConsensusDialAddressOf(cfg);
-    CHECK(dial.state == ConsensusDialState::Unstated);
-    CHECK(dial.endpoint.empty());
+    REQUIRE_FALSE(dial.has_value());
+    CHECK(dial.error() == ConsensusDialGap::Unstated);
 
-    auto const line = LineStarting(RenderSurfaces(cfg), DialLabel);
+    auto const line = LineStarting(RenderSurfaces(cfg), DialLabel());
     REQUIRE(line.has_value());
     CHECK(Unwrap(line).contains("NOT STATED"));
     CHECK(Unwrap(line).contains("--raft-self"));
-}
-
-TEST_CASE("The startup guard against a --raft-self contradicting this node's own --raft-peer is unchanged",
-          "[node][surfaces][consensus]")
-{
-    // #1328 adds a renderer beside `RaftSelfEndpoint`; a renderer must not be able to quietly
-    // relax the refusal that shares its inputs. Asserted as WHICH refusal, by the rule's own
-    // words, since this configuration could be refused by something else and still pass a
-    // bare `has_value()`.
-    NodeConfig cfg;
-    cfg.raftListen = "6680";
-    cfg.nodeId = "n1";
-    cfg.raftSelf = "10.0.0.4";
-    cfg.raftPeers = { Cluster::ClusterMember { .id = "n1", .raftEndpoint = "10.0.0.9:6680", .schedulerEndpoint = {} } };
-
-    auto const refusal = StartupPolicyRejection(cfg);
-    REQUIRE(refusal.has_value());
-    CHECK(Unwrap(refusal).contains("--raft-self and a --raft-peer for this node's own --node-id name DIFFERENT addresses"));
-
-    // The control: agreeing, the same rule has nothing to say.
-    auto agreeing = cfg;
-    agreeing.raftPeers = { Cluster::ClusterMember { .id = "n1", .raftEndpoint = "10.0.0.4:6680", .schedulerEndpoint = {} } };
-    auto const agreed = StartupPolicyRejection(agreeing);
-    CHECK_FALSE(agreed.value_or("").contains("name DIFFERENT addresses"));
-
-    // And what the worksheet reports for the refused one is the entry consensus would run
-    // under, so the operator sees the address the refusal is about.
-    CHECK(ConsensusDialAddressOf(cfg).endpoint == "10.0.0.9:6680");
 }

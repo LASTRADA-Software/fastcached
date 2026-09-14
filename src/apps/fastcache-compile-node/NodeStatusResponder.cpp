@@ -424,11 +424,11 @@ CompileCacheWire::NodeStatusFields ConfiguredNodeStatus::Describe() const
     // `--cluster-admit` echoed, and the bound raft port is routinely the wildcard -- so
     // this is the half of that comparison nothing else reports.
     //
-    // Only `Stated` travels. `NoConsensus` is ABSENT, not an empty string; `Unstated` is
+    // Only an address travels. `NoConsensus` is ABSENT, not an empty string; `Unstated` is
     // refused by the startup table and by every reload, so a serving node cannot be in
     // it -- and were it, absent is the honest reading of an address nobody stated.
-    if (auto dial = ConsensusDialAddressOf(_cfg); dial.state == ConsensusDialState::Stated)
-        fields.runtime.consensusEndpoint = std::move(dial.endpoint);
+    if (auto dial = ConsensusDialAddressOf(_cfg); dial.has_value())
+        fields.runtime.consensusEndpoint = std::move(*dial);
 
     for (auto const& mapping: mappings)
     {

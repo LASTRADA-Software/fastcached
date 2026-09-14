@@ -18,6 +18,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <utility>
 
 namespace FastCache::Node
 {
@@ -251,19 +252,20 @@ void ApplyNodeIdentity(NodeConfig& cfg, NodeIdentity const& identity)
 
     cfg.nodeId = identity.id;
 
-    // Nothing to synthesise: either the operator named this node's own `--raft-peer`
-    // -- which they can only have done for an id they typed -- or they gave no
-    // `--raft-self`, and the startup table has already refused a consensus node that
-    // names itself neither way.
-    if (cfg.raftSelf.empty() || ClusterSelfMember(cfg) != nullptr)
+    // Nothing to synthesise when the operator named this node's own `--raft-peer`, which
+    // they can only have done for an id they typed.
+    if (ClusterSelfMember(cfg) != nullptr)
         return;
 
-    // Through `RaftSelfEndpoint`, which the startup rule that refuses a CONTRADICTING
-    // `--raft-peer` also asks: written out here as well, the two would disagree about
-    // IPv6 bracketing and that rule would refuse every reload of a node it had just
-    // accepted at startup.
-    auto const endpoint = RaftSelfEndpoint(cfg);
-    if (endpoint.empty())
+    // Through `ConsensusDialAddressOf`, the one derivation of where peers dial this node
+    // (#1328): `--print-surfaces` and `NodeStatus` report it, so building the entry any
+    // other way would let a node run under one address and print another. Its `--raft-self`
+    // half is `RaftSelfEndpoint`, which the rule refusing a CONTRADICTING `--raft-peer` also
+    // asks -- written out here, the two would disagree about IPv6 bracketing and that rule
+    // would refuse every reload of a node it had just accepted. No address is no entry: no
+    // consensus, or none stated, which the startup table has already refused.
+    auto endpoint = ConsensusDialAddressOf(cfg);
+    if (!endpoint.has_value())
         return;
 
     // `schedulerEndpoint` empty, which is what this node knows about itself here: the
@@ -272,7 +274,7 @@ void ApplyNodeIdentity(NodeConfig& cfg, NodeIdentity const& identity)
     // node announces its own record, exactly as it does for a typed `--raft-peer`.
     cfg.raftPeers.push_back(
         Cluster::ClusterMember { .id = identity.id,
-                                 .raftEndpoint = endpoint,
+                                 .raftEndpoint = std::move(*endpoint),
                                  .schedulerEndpoint = {},
                                  .schedulerEndpointHistory = Cluster::SchedulerEndpointHistory::NeverAnnounced });
 }

@@ -60,7 +60,7 @@ raft              0.0.0.0:6680  TCP
 discovery beacon  0.0.0.0:6681  UDP
 
 dialled at:
-  consensus endpoint  NOT STATED -- this node runs consensus and names no address peers dial it at; give --raft-self, or a --raft-peer for its own id
+  consensus endpoint  NOT STATED  -- this node runs consensus and names no address peers dial it at; give --raft-self, or a --raft-peer for its own id
 
 notes:
   node: a systemd .socket unit is served on this surface: the unit owns the address, …

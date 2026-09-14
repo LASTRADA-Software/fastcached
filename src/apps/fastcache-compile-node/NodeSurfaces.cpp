@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <expected>
 #include <format>
 #include <string>
 #include <string_view>
@@ -464,6 +465,44 @@ std::expected<SurfaceEndpoint, std::string> SoleEndpointOf(NodeSurface surface, 
     return std::move(endpoints.front());
 }
 
+namespace
+{
+    /// What the worksheet prints beside a consensus dial address the node HAS.
+    constexpr std::string_view StatedDialTrailer = "-- what peers DIAL; the raft row above is what this node BINDS";
+
+    /// How the worksheet prints a consensus dial address the node does not have.
+    struct DialGapCell
+    {
+        ConsensusDialGap gap;     ///< Which absence this row describes.
+        std::string_view address; ///< What stands in the address column instead of one.
+        std::string_view trailer; ///< What the absence means, and what would end it.
+    };
+
+    /// One row per absence, so a third one is a row rather than a branch.
+    constexpr EnumTable<ConsensusDialGap, DialGapCell> DialGapCells { {
+        { .gap = ConsensusDialGap::NoConsensus,
+          .address = "-",
+          .trailer = "(absent: this node runs no consensus, --listen-raft does not resolve)" },
+        { .gap = ConsensusDialGap::Unstated,
+          .address = "NOT STATED",
+          .trailer = "-- this node runs consensus and names no address peers dial it at; give --raft-self, or a "
+                     "--raft-peer for its own id" },
+    } };
+    static_assert(RowsInEnumeratorOrder(DialGapCells, &DialGapCell::gap));
+
+    /// The address column and the trailer of the worksheet's dial line.
+    /// @param dial What `ConsensusDialAddressOf` answered; must outlive the result.
+    /// @return The address or what stands in for it, and what it means.
+    [[nodiscard]] std::pair<std::string_view, std::string_view> DialColumns(
+        std::expected<std::string, ConsensusDialGap> const& dial)
+    {
+        if (dial.has_value())
+            return { *dial, StatedDialTrailer };
+        auto const& row = DialGapCells[static_cast<std::size_t>(dial.error())];
+        return { row.address, row.trailer };
+    }
+} // namespace
+
 std::string RenderSurfaces(NodeConfig const& cfg)
 {
     // Resolved ONCE per row and kept, rather than resolved again to print. Not for the
@@ -528,24 +567,12 @@ std::string RenderSurfaces(NodeConfig const& cfg)
     // operator compares carry the same name.
     //
     // Indented under a heading, the shape the notes take, because COLUMN ONE belongs to the
-    // table: a column-one `label  address` line is a port to open to anybody reading a
-    // pasted transcript, and `check-node-surface-docs.cmake` reads one by that same shape.
+    // table: a column-one `label  address` line reads as a port to open to anybody copying a
+    // pasted transcript into firewall rules -- and `check-node-surface-docs.cmake` reads a
+    // transcript by that same shape.
     auto const dial = ConsensusDialAddressOf(cfg);
-    out += "\ndialled at:\n";
-    switch (dial.state)
-    {
-        case ConsensusDialState::Stated:
-            out += std::format("  consensus endpoint  {}  -- what peers DIAL; the raft row above is what this node BINDS\n",
-                               dial.endpoint);
-            break;
-        case ConsensusDialState::NoConsensus:
-            out += "  consensus endpoint  -  (absent: this node runs no consensus, --listen-raft does not resolve)\n";
-            break;
-        case ConsensusDialState::Unstated:
-            out += "  consensus endpoint  NOT STATED -- this node runs consensus and names no address peers dial it at; "
-                   "give --raft-self, or a --raft-peer for its own id\n";
-            break;
-    }
+    auto const [address, trailer] = DialColumns(dial);
+    out += std::format("\ndialled at:\n  {}  {}  {}\n", ConsensusEndpointLabel, address, trailer);
 
     // The notes last and separately, because they are prose while the table above is
     // something an operator transcribes into firewall rules. Mixing them would rag the

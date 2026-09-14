@@ -167,7 +167,7 @@ std::expected<std::string, std::string> InterpretClusterReply(ClusterAction acti
                                "member id",
                                ReceiptLabelColumn,
                                receipt->memberId,
-                               "consensus endpoint",
+                               ConsensusEndpointLabel,
                                ReceiptLabelColumn,
                                receipt->raftEndpoint);
         }

@@ -1364,24 +1364,23 @@ inline constexpr std::string_view ConsensusNamesNoSelfPeerRefusal =
 /// @return `host:port`, or empty when either half is missing.
 [[nodiscard]] std::string RaftSelfEndpoint(NodeConfig const& cfg);
 
-/// What `ConsensusDialAddressOf` could say about where this node's peers dial it.
+/// Why `ConsensusDialAddressOf` has no address to give.
 ///
 /// Private to this process: nothing transmits or persists it -- the wire carries the
-/// endpoint as an optional, and only `Stated` has one to carry.
-enum class ConsensusDialState : std::uint8_t
+/// endpoint as an optional, and a gap is simply not sent.
+enum class ConsensusDialGap : std::uint8_t
 {
     NoConsensus, ///< `--listen-raft` does not resolve, so there is nothing to dial.
-    Stated,      ///< The node names the address its peers dial it at.
     Unstated,    ///< Consensus runs, and the node names itself neither way.
+    Last,        ///< The count, for `EnumTable`.
 };
 
-/// Where this node's consensus peers DIAL it, as opposed to what it BINDS.
-struct ConsensusDialAddress
-{
-    ConsensusDialState state { ConsensusDialState::NoConsensus };
-    /// `host:port` when `Stated`, and never empty then; empty otherwise.
-    std::string endpoint;
-};
+/// The label an operator reads the consensus dial address under, wherever it is printed.
+///
+/// ONE spelling for `--cluster-admit`'s receipt and `--print-surfaces`, because the whole
+/// value of printing the address twice is that an operator compares two strings under the
+/// same name -- and two literals are a rename away from comparing nothing.
+inline constexpr std::string_view ConsensusEndpointLabel = "consensus endpoint";
 
 /// The consensus address this node tells the cluster to dial it at (#1328).
 ///
@@ -1404,9 +1403,12 @@ struct ConsensusDialAddress
 /// address (absent is not zero), and a consensus node naming itself neither way has one
 /// nobody stated -- which the startup table refuses, and which `--print-surfaces` still
 /// has to be able to print.
+///
+/// The one derivation of this precedence: `ApplyNodeIdentity` builds the member entry
+/// from it, so the address a node runs under and the one it prints cannot disagree.
 /// @param cfg The parsed configuration, with or without its identity applied.
-/// @return Which of the three, and the endpoint when there is one.
-[[nodiscard]] ConsensusDialAddress ConsensusDialAddressOf(NodeConfig const& cfg);
+/// @return The `host:port` peers dial, or which of the two absences it is.
+[[nodiscard]] std::expected<std::string, ConsensusDialGap> ConsensusDialAddressOf(NodeConfig const& cfg);
 
 /// Who this node admits, as one line an operator reads at startup.
 ///

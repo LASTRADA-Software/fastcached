@@ -2290,18 +2290,21 @@ std::string RaftSelfEndpoint(NodeConfig const& cfg)
     return FormatHostPort(cfg.raftSelf, bound.front().port);
 }
 
-ConsensusDialAddress ConsensusDialAddressOf(NodeConfig const& cfg)
+std::expected<std::string, ConsensusDialGap> ConsensusDialAddressOf(NodeConfig const& cfg)
 {
     if (!RunsConsensus(cfg))
-        return ConsensusDialAddress { .state = ConsensusDialState::NoConsensus, .endpoint = {} };
+        return std::unexpected { ConsensusDialGap::NoConsensus };
 
-    if (auto const* const self = ClusterSelfMember(cfg); self != nullptr && !self->raftEndpoint.empty())
-        return ConsensusDialAddress { .state = ConsensusDialState::Stated, .endpoint = self->raftEndpoint };
+    // The entry exactly as `ClusterSelfMember` answers it, with no test of its own: every
+    // other reader of that entry takes it as found, and a second opinion here would be two
+    // answers for one configuration.
+    if (auto const* const self = ClusterSelfMember(cfg); self != nullptr)
+        return self->raftEndpoint;
 
     if (auto endpoint = RaftSelfEndpoint(cfg); !endpoint.empty())
-        return ConsensusDialAddress { .state = ConsensusDialState::Stated, .endpoint = std::move(endpoint) };
+        return endpoint;
 
-    return ConsensusDialAddress { .state = ConsensusDialState::Unstated, .endpoint = {} };
+    return std::unexpected { ConsensusDialGap::Unstated };
 }
 
 std::string AdvertisedEndpoint(NodeConfig const& cfg)
