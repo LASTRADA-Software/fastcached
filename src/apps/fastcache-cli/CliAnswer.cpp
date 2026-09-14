@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "CliAnswer.hpp"
 
+#include <algorithm>
 #include <cstddef>
 
 namespace FastCache::Cli
@@ -37,6 +38,19 @@ Answer Concluded(Outcome outcome, std::string advisory)
 Answer Answered(Value value, Outcome outcome)
 {
     return Answer { .value = std::move(value), .outcome = outcome };
+}
+
+void PrependRemarks(Answer& answer, std::span<std::string const> remarks)
+{
+    auto said = std::vector<std::string> {};
+    said.reserve(remarks.size() + answer.advisories.size());
+    auto const sayOnce = [&said](std::string const& remark) {
+        if (std::ranges::find(said, remark) == said.end())
+            said.push_back(remark);
+    };
+    std::ranges::for_each(remarks, sayOnce);
+    std::ranges::for_each(answer.advisories, sayOnce);
+    answer.advisories = std::move(said);
 }
 
 } // namespace FastCache::Cli
