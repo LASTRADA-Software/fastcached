@@ -14,20 +14,27 @@ namespace FastCache
 /// (`SelectSha256Engine`), so a test hands it any combination and exercises
 /// each branch on one machine, whatever that machine's CPU is.
 ///
+/// It answers what THIS PROCESS can execute, which is decided by the architecture
+/// it was compiled for: an x86-64 process under emulation on arm64 runs x86-64
+/// opcodes, and CPUID there reports what the emulator provides. That is
+/// `ToolchainHost.hpp`'s `HostFacts::architecture` question, not
+/// `NativeArchitecture()`'s, so the compiled-architecture guards in the
+/// implementation are right and must not become a query of the machine.
+///
 /// Detection exists only where a CI leg compiles and runs it: x86-64 on every
 /// leg, and arm64 macOS on the macOS leg. Everywhere else, Linux aarch64 and
 /// Windows ARM64 included, nothing is reported, so the portable scalar paths
 /// run. That is correct, only slower. A detection branch no leg compiles is
 /// one that rots with nothing to say so (#ISSUE).
 ///
-/// Dependency-free, like `Sha256`, because the launcher compiles both in
-/// rather than linking the library.
+/// In Core rather than Platform because its consumer, `Sha256`, is Core, and
+/// Core does not reach up into Platform.
 struct CpuFeatures
 {
-    bool x86Sha = false;   ///< CPUID.(EAX=7,ECX=0):EBX bit 29, the SHA extensions.
-    bool x86Ssse3 = false; ///< CPUID.1:ECX bit 9, which the SHA-NI rounds need for byte order.
-    bool x86Sse41 = false; ///< CPUID.1:ECX bit 19, which the SHA-NI rounds need for their blends.
-    bool armSha2 = false;  ///< ARMv8 SHA-256 instructions (macOS: `hw.optional.arm.FEAT_SHA256`).
+    bool x86Sha = false;   ///< The x86 SHA extensions (SHA-NI).
+    bool x86Ssse3 = false; ///< SSSE3, which the SHA-NI rounds need to reorder bytes.
+    bool x86Sse41 = false; ///< SSE4.1, which the SHA-NI rounds need for their blends.
+    bool armSha2 = false;  ///< The ARMv8 SHA-256 instructions.
 };
 
 /// Ask this process's CPU which extensions it offers.
