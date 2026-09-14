@@ -1417,6 +1417,11 @@ CellTone FleetCellTone(FleetSection section, std::string_view name, std::uint64_
     return facts.has_value() ? ToneOf(facts->decor, number) : CellTone::Plain;
 }
 
+CellTone SlotLimitTone(SlotLimit limit) noexcept
+{
+    return limit < SlotLimit::Last ? LimitDressTable[static_cast<std::size_t>(limit)].tone : CellTone::Plain;
+}
+
 CellTone FleetCellTone(FleetSection section, std::string_view name, std::string_view text)
 {
     auto const facts = FactsOf(section, name);

@@ -3571,12 +3571,33 @@ TEST_CASE("a node's states worth a look are dressed: a survey not done, an elect
     never.runtime.lastRegistrationSecondsAgo.reset();
     CHECK(ToneOver(NodeSinkOf(never), "0 of 1, never accepted") == FrameTone::Alert);
 
-    // A limit the machine will not recover from by itself is an alert, where somebody else's CPU is only worth a look.
+    // A limit is dressed by the leader's one judgement (`SlotLimitTone`), the one the fleet's workers cell and the
+    // page's chip take: memory is limited -- worth a look, as somebody else's CPU is -- where a full scratch disk is
+    // an alert and nothing withdrawn is fresh. WHAT DISTINGUISHES: the node's `memory` is exactly the fleet's tone for
+    // it, and a node that has its own table dresses it however that table says.
     auto const tight = NodeMachine { .cpuPermille = 625, .availableMemoryBytes = std::uint64_t { 1 } << 30U };
     auto const memory = NodeSinkAt(
         { NodeSampleOf(1, 1, MockupNodeStatus(), tight), NodeSampleOf(2, 3, MockupNodeStatus(), tight), Tick }, 80, 24);
     REQUIRE(memory.frames.size() == 1);
-    CHECK(ToneOver(memory, "memory") == FrameTone::Alert);
+    CHECK(Distributed::SlotLimitTone(Distributed::SlotLimit::Memory) == Distributed::CellTone::Limited);
+    CHECK(ToneOver(memory, "memory") == FrameTone::Stale);
+    auto const unloaded = NodeMachine { .cpuPermille = 0 };
+    auto const free = NodeSinkAt(
+        { NodeSampleOf(1, 1, MockupNodeStatus(), unloaded), NodeSampleOf(2, 3, MockupNodeStatus(), unloaded), Tick },
+        80,
+        24);
+    REQUIRE(free.frames.size() == 1);
+    // `registered` is also the slot line's last word, a label: the limit is the run on the gauge's line.
+    auto const freeLines = Lines(free.frames.back());
+    auto const gaugeRow =
+        std::ranges::find_if(freeLines, [](std::string const& line) { return line.contains("limited-by"); });
+    REQUIRE(gaugeRow != freeLines.end());
+    auto const row = static_cast<std::size_t>(std::ranges::distance(freeLines.begin(), gaugeRow)) + 1;
+    auto const* const limit = FindIfOrNull(free.spans.back(), [&](FrameSpan const& span) {
+        return span.row == row && freeLines[row - 1].substr(span.byte, span.length) == "registered";
+    });
+    REQUIRE(limit != nullptr);
+    CHECK(limit->tone == FrameTone::Fresh);
     // 6 running of the 7 memory leaves is the top band.
     CHECK(ToneOver(memory, "\u2588\u2588\u2588\u2588\u2588\u2588") == FrameTone::LevelHigh);
 }
