@@ -5302,13 +5302,25 @@ struct LiveGapFields
 namespace Detail
 {
     /// A push payload: the kind byte, then the kind's fields.
+    ///
+    /// Framed exactly as `EncodeReply` frames a header: the length bounded first, then a vector
+    /// of its final size written through a span. Both simpler spellings fail gcc 14's `-O3`
+    /// build once inlined into a large enough caller. `reserve` then `push_back` leaves a
+    /// reallocation it reads as freeing an offset pointer (`free-nonheap-object`), and an
+    /// unbounded `1 + size` may wrap to an empty vector whose `front()` it reports as a null
+    /// dereference. Bounded below `MaxFramePayload`, neither is reachable, and an oversized push
+    /// is refused here rather than one layer later by `EncodeReply`.
+    /// @throws std::length_error When the payload would exceed the u32 frame length.
     [[nodiscard]] inline std::vector<std::byte> EncodePush(PushKind kind, WireFields::FieldList fields)
     {
-        auto body = WireFields::Encode(fields);
-        std::vector<std::byte> payload;
-        payload.reserve(1 + body.size());
-        payload.push_back(static_cast<std::byte>(kind));
-        payload.insert(payload.end(), body.begin(), body.end());
+        auto const body = WireFields::Encode(fields);
+        if (body.size() >= MaxFramePayload)
+            throw std::length_error("compile-cache push payload exceeds the u32 wire length");
+
+        std::vector<std::byte> payload(1 + body.size());
+        std::span<std::byte> const out { payload };
+        out[0] = static_cast<std::byte>(kind);
+        std::ranges::copy(body, out.subspan(1).begin());
         return payload;
     }
 } // namespace Detail
