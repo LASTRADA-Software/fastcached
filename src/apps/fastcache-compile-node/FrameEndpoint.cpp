@@ -1794,6 +1794,8 @@ namespace
             if (co_await WriteAll(EndpointWriter::Stream, _socket.get(), frame))
             {
                 state->Rearm(_socket.get(), state->io.Reactor().Clock().Now() + hold, SweepPhase::Streaming, hold);
+                _tally.pushes += 1;
+                _tally.bytes += frame.size();
                 co_return PushOutcome::Delivered;
             }
             // A socket this node closed while it is not stopping is the sweep acting on the hold;
@@ -1818,10 +1820,17 @@ namespace
             return _state->shuttingDown.load(std::memory_order_acquire);
         }
 
+        /// @return What this sink delivered, for the stream's exchange line.
+        [[nodiscard]] Node::StreamTally Tally() const noexcept
+        {
+            return _tally;
+        }
+
       private:
         std::shared_ptr<FrameServer::State> _state;
         std::shared_ptr<ISocket> _socket;
         std::shared_ptr<PeerWatch const> _watch;
+        Node::StreamTally _tally {};
     };
 
     /// Serve a subscription on this connection until it ends, and say whether the connection
@@ -1875,7 +1884,8 @@ namespace
             frame,
             terminal,
             std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - startedAt),
-            state->namer);
+            state->namer,
+            sink.Tally());
 
         if (terminal.empty())
             co_return AfterWatch::EndConnection;
