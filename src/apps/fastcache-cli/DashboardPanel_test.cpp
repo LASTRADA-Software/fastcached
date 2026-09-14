@@ -3477,20 +3477,53 @@ TEST_CASE("a node panel draws ONE refusal total with its trend, and the split un
         CHECK_FALSE(RowLine(frame, label).has_value());
 }
 
+TEST_CASE("a mean compile note says it is a change over the interval, in ASCII on the ASCII rung",
+          "[cli][dashboard][panel][node]")
+{
+    // §4 writes `Δsum/Δcount`: the figure is a delta over the interval, so the delta is content. WHAT DISTINGUISHES:
+    // the Unicode rung draws the delta mark, and the ASCII rung draws the same note with `d` in its place -- one cell
+    // either way -- and not one byte of that line is outside ASCII.
+    auto const unicode = NodeFrameAt(120, 40, MockupNodeStatus());
+    auto const unicodeRow = RowLine(unicode, "mean compile");
+    REQUIRE(unicodeRow.has_value());
+    CHECK(Unwrap(unicodeRow).contains("Δsum/Δcount over this interval"));
+
+    auto view = PanelView { NodePanel(),
+                            PanelContext { .absent = std::string { Absent },
+                                           .endpoint = "build-07:7070",
+                                           .interval = 2s,
+                                           .cellWidth = &FakeCellWidth,
+                                           .rung = RenderRung::Ascii } };
+    auto sink = CollectingSink {};
+    (void) Drive({ DashboardEvent { .kind = DashboardEventKind::Resize, .columns = 120, .rows = 40 },
+                   NodeSampleOf(1, 1, MockupNodeStatus()),
+                   NodeSampleOf(2, 3, MockupNodeStatus()),
+                   Tick },
+                 DashboardLimits {},
+                 view,
+                 sink);
+    REQUIRE(!sink.frames.empty());
+    auto const asciiRow = RowLine(sink.frames.back(), "mean compile");
+    REQUIRE(asciiRow.has_value());
+    CHECK(Unwrap(asciiRow).contains("dsum/dcount over this interval"));
+    CHECK(std::ranges::all_of(Unwrap(asciiRow), [](char byte) { return static_cast<unsigned char>(byte) < 0x80U; }));
+    CHECK(ColumnOf(Unwrap(asciiRow), "dsum") == ColumnOf(Unwrap(unicodeRow), "Δsum"));
+}
+
 TEST_CASE("a mean compile note too long for its line wraps under where it began", "[cli][dashboard][panel][node]")
 {
     // N7. At 80 the note is two lines, the second hanging at the column the first began at, and the words
     // are the note's in order; at 120 it is one line. A note dropped for width would pass neither.
-    auto const note = std::string { "sum/count over this interval; no histogram exists, so no p50/p95 can be shown" };
+    auto const note = std::string { "Δsum/Δcount over this interval; no histogram exists, so no p50/p95 can be shown" };
     auto const narrow = NodeFrameAt(80, 24, MockupNodeStatus());
     auto const row = RowLine(narrow, "mean compile");
     auto const under = LineUnder(narrow, "mean compile");
     REQUIRE(row.has_value());
     REQUIRE(under.has_value());
     CHECK_FALSE(Unwrap(row).contains(note));
-    REQUIRE(ColumnOf(Unwrap(row), "sum/count").has_value());
-    CHECK(Trimmed(Columns(Unwrap(under), 1, Unwrap(ColumnOf(Unwrap(row), "sum/count")) - 1)).empty());
-    auto const column = Unwrap(ColumnOf(Unwrap(row), "sum/count"));
+    REQUIRE(ColumnOf(Unwrap(row), "Δsum/Δcount").has_value());
+    CHECK(Trimmed(Columns(Unwrap(under), 1, Unwrap(ColumnOf(Unwrap(row), "Δsum/Δcount")) - 1)).empty());
+    auto const column = Unwrap(ColumnOf(Unwrap(row), "Δsum/Δcount"));
     auto const first = Trimmed(Columns(Unwrap(row), column, 79 - column));
     auto const second = Trimmed(Columns(Unwrap(under), 1, 78));
     CHECK(std::format("{} {}", first, second) == note);
@@ -3634,7 +3667,7 @@ TEST_CASE("a node panel dresses labels as labels, figures as figures, and a refu
     auto const under = LineUnder(frame, "mean compile");
     REQUIRE(row.has_value());
     REQUIRE(under.has_value());
-    auto const noteFrom = ColumnOf(Unwrap(row), "sum/count");
+    auto const noteFrom = ColumnOf(Unwrap(row), "Δsum/Δcount");
     REQUIRE(noteFrom.has_value());
     CHECK(ToneOver(sink, Trimmed(Columns(Unwrap(row), Unwrap(noteFrom), 79 - Unwrap(noteFrom)))) == FrameTone::Label);
     CHECK(ToneOver(sink, Trimmed(Columns(Unwrap(under), 1, 78))) == FrameTone::Label);

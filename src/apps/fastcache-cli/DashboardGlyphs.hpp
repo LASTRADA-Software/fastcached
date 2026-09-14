@@ -74,7 +74,15 @@ struct RungGlyphs
     std::string_view gaugeHeld;
     std::string_view gaugeEmpty; ///< One unfilled gauge cell.
     std::string_view gaugeClose; ///< What closes a gauge; see `gaugeOpen`.
+
+    /// A change over an interval, as a note spells it: `Δ`, and `d` where the terminal is ASCII. A note is written
+    /// with `Δ` (`DeltaMark`) and drawn through this column, one cell either way, so the layout is the same on
+    /// every rung and no UTF-8 byte reaches an ASCII terminal.
+    std::string_view delta;
 };
+
+/// The mark a note is written with for a change over an interval, and drawn as its rung's `RungGlyphs::delta`.
+inline constexpr std::string_view DeltaMark = "Δ";
 
 /// The rungs' glyphs, one row per `RenderRung`, in enumerator order.
 ///
@@ -97,7 +105,8 @@ inline constexpr EnumTable<RenderRung, RungGlyphs> RungGlyphTable { {
       .gaugeFilled = "█",
       .gaugeHeld = "▒",
       .gaugeEmpty = "░",
-      .gaugeClose = "" },
+      .gaugeClose = "",
+      .delta = DeltaMark },
     { .rung = RenderRung::Unicode,
       .sparkLevels = BlockLevels,
       .chartLevels = BlockLevels,
@@ -112,7 +121,8 @@ inline constexpr EnumTable<RenderRung, RungGlyphs> RungGlyphTable { {
       .gaugeFilled = "█",
       .gaugeHeld = "▒",
       .gaugeEmpty = "░",
-      .gaugeClose = "" },
+      .gaugeClose = "",
+      .delta = DeltaMark },
     { .rung = RenderRung::Ascii,
       .sparkLevels = {},
       .chartLevels = AsciiChartLevels,
@@ -127,7 +137,8 @@ inline constexpr EnumTable<RenderRung, RungGlyphs> RungGlyphTable { {
       .gaugeFilled = "#",
       .gaugeHeld = "=",
       .gaugeEmpty = ".",
-      .gaugeClose = "]" },
+      .gaugeClose = "]",
+      .delta = "d" },
     { .rung = RenderRung::Piped,
       .sparkLevels = {},
       .chartLevels = {},
@@ -142,7 +153,8 @@ inline constexpr EnumTable<RenderRung, RungGlyphs> RungGlyphTable { {
       .gaugeFilled = "#",
       .gaugeHeld = "=",
       .gaugeEmpty = ".",
-      .gaugeClose = "]" },
+      .gaugeClose = "]",
+      .delta = "d" },
 } };
 
 static_assert(RowsInEnumeratorOrder(RungGlyphTable, &RungGlyphs::rung),
