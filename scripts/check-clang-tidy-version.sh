@@ -157,15 +157,23 @@ CheckStatic() {
     return 0
 }
 
-# Print the hex sha256 of $1, or nothing when no hashing tool runs here.
+# Print the hex sha256 of $1, or nothing when no hashing tool runs here or its answer is not a 64-digit hex digest.
+# The file goes in on STDIN. Named as an argument, GNU sha256sum escapes a name holding a backslash and prefixes its
+# line with `\` -- and every Windows path holds one: CI's clang-tidy-windows read `\316e...` for `D:\a\_temp/...` and
+# refused its own install, while every local run, on paths with none, passed.
 Sha256Hex() {
     local out=""
     if command -v sha256sum >/dev/null 2>&1; then
-        out="$(sha256sum "$1" 2>/dev/null)"
+        out="$(sha256sum < "$1" 2>/dev/null)"
     elif command -v shasum >/dev/null 2>&1; then
-        out="$(shasum -a 256 "$1" 2>/dev/null)"
+        out="$(shasum -a 256 < "$1" 2>/dev/null)"
     fi
-    printf '%s' "${out%% *}"
+    out="${out%% *}"
+    case "$out" in
+        *[!0-9a-f]*) out="" ;;
+    esac
+    [ "${#out}" -eq 64 ] || out=""
+    printf '%s' "$out"
 }
 
 # The lowercase hex of the digest a wheel's RECORD spells as unpadded base64url in $1 (PEP 376 / 627), or nothing when
@@ -244,7 +252,11 @@ CheckInstalled() {
     fi
     actualHex="$(Sha256Hex "$exe")"
     if [ -z "$actualHex" ]; then
-        echo "FAIL: no sha256 tool (sha256sum or shasum) runs here, so '$exe' cannot be identified -- which is not the same as being wrong, and is reported apart from it"
+        if command -v sha256sum >/dev/null 2>&1 || command -v shasum >/dev/null 2>&1; then
+            echo "FAIL: the sha256 tool here did not answer a 64-digit hex digest for '$exe', so it cannot be identified -- which is not the same as being wrong, and is reported apart from it"
+        else
+            echo "FAIL: no sha256 tool (sha256sum or shasum) runs here, so '$exe' cannot be identified -- which is not the same as being wrong, and is reported apart from it"
+        fi
         return 1
     fi
     recordedHex="$(Base64UrlToHex "$recorded")"
@@ -425,6 +437,13 @@ if [ "$Mode" = "self-test" ]; then
         --installed "$Work/site-good/clang_tidy/data/bin/clang-tidy" "$Work/good"
     Expect "--locate: the binary inside a --target site" pass "$Work/site-good/clang_tidy/data/bin/clang-tidy" \
         --locate "$Work/site-good" "$Work/good"
+
+    # A path holding a backslash, which every Windows path does (`D:\a\_temp/...` on the CI runner): named as an
+    # argument, sha256sum escaped it and prefixed the digest with `\`. A directory NAME on POSIX, a separator on Windows,
+    # and the escaping is the same either way.
+    Wheel "$Work/site\\back" 22.1.8 "$FakeDigest"
+    Expect "--installed: a path holding a backslash" pass "is clang-tidy 22.1.8, the declared build" \
+        --installed "$Work/site\\back/clang_tidy/data/bin/clang-tidy" "$Work/good"
 
     Wheel "$Work/site-exe" 22.1.8 "$FakeDigest" clang-tidy.exe
     Expect "--installed: the Windows binary name" pass "the declared build" \
