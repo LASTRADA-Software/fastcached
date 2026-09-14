@@ -3239,6 +3239,26 @@ TEST_CASE("a cache's fill band is drawn against the limit, not against its own p
     CHECK(bytes.contains("to 100.0 %"));
 }
 
+TEST_CASE("a cache's hit rate band is drawn against the whole, not against its own peak",
+          "[cli][dashboard][panel][cache][chart]")
+{
+    // The hit rate is a share, so its band's top is 100 % whatever the readings were. WHAT DISTINGUISHES: every reading
+    // here is 90 %, so a band scaled to its own peak would say `to 90.0 %` and draw every cell a full bar -- which is
+    // what a cache serving every read looks like -- while the ops/sec band, which has no whole, states its own peak.
+    auto const frame = CacheHistoryFrame(CacheHistory(24, 18, 20), 120, 40);
+    INFO(frame);
+    auto const chart = WholeChart(ChartIn(frame, CachePanel()));
+    auto const lines = Lines(frame);
+    auto const hitRate = Inside(lines.at(chart.bands[0]));
+    CHECK(hitRate.starts_with("hit rate"));
+    CHECK(hitRate.contains("90.0 %"));
+    CHECK(hitRate.contains("to 100.0 %"));
+    auto const ops = Inside(lines.at(chart.bands[1]));
+    CHECK(ops.starts_with("ops/sec"));
+    CHECK_FALSE(ops.contains("to 100.0 %"));
+    CHECK(ops.contains(" to "));
+}
+
 TEST_CASE("a cache's history chart grows band by band in the table's order", "[cli][dashboard][panel][cache][chart]")
 {
     // WHAT DISTINGUISHES: at the first height that draws a chart it has the hit rate alone; one row taller it adds
