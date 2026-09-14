@@ -19,6 +19,10 @@
 # get either wrong. It compiles to nothing on POSIX, so it costs that build a
 # translation unit and no dependency.
 #
+# Cli/Duration.cpp is the one duration grammar every time-valued setting is written in (#1402). The launcher's
+# timeout environment variables are such settings, and a second parser here would be a second answer to what `2s`
+# means. A unit table and two functions over <charconv> and <chrono>: no dependency either.
+#
 # Note what is NOT here: Core/Crc32c.cpp. It was carried for the cache key, and
 # the key no longer uses it -- Core/MurmurHash3.hpp replaced the four salted
 # CRC32C runs that gave a 128-bit-wide key 32 bits of strength (issue #63), and
@@ -31,6 +35,7 @@ set(_fc_cc_core
     "${CMAKE_SOURCE_DIR}/src/FastCache/Async/InterruptibleSleep.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/Async/IocpReactor.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/Async/KqueueReactor.cpp"
+    "${CMAKE_SOURCE_DIR}/src/FastCache/Cli/Duration.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/Cli/UsageDoc.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/CompileCache/PathCanon.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/CompileCache/CompileValue.cpp"
