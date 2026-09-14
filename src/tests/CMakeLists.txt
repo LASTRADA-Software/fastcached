@@ -6618,6 +6618,103 @@ if(FASTCACHED_BUILD_TUI AND TARGET fastcache-tui-linkprobe)
     )
 endif()
 
+# ----------------------------------------------------------------------------
+# ...and the probe must be SEEN to refuse, on every run (#1376).
+#
+# `vendor-tui-link-closure` is the accepting direction. Its refusing direction was shown once, by
+# deletion, and the paragraph above recorded it -- which is a sentence, and a sentence cannot fail.
+# A linker told to allow undefined symbols, or objects that stopped reaching the link, would leave
+# that test green over a tree missing an implementation. So this builds
+# `fastcache-tui-linkprobe-canary` -- the same probe with `platform/SignalHandler.cpp` left out, the
+# one miss that shipped -- and requires the link to FAIL naming the definition it lacks. A canary
+# that links, and one that fails for another reason, are both refusals of the GUARD, by name.
+#
+# It runs `cmake --build` on this tree, for one link: the objects are the probe's own, already built.
+# Guarded on the canary TARGET as well as the option, for the reason the block above states.
+if(FASTCACHED_BUILD_TUI AND TARGET fastcache-tui-linkprobe-canary)
+    add_test(
+        NAME "vendor-tui-link-closure-refuses"
+        COMMAND ${CMAKE_COMMAND}
+            "-DFASTCACHED_BUILD_DIR=${CMAKE_BINARY_DIR}"
+            "-DFASTCACHED_BUILD_CONFIG=$<CONFIG>"
+            "-DFASTCACHED_CANARY_TARGET=fastcache-tui-linkprobe-canary"
+            "-DFASTCACHED_CANARY_SYMBOL=SignalHandler::hasPendingSigint"
+            -P "${CMAKE_SOURCE_DIR}/scripts/check-vendor-link-canary.cmake"
+    )
+    set_tests_properties("vendor-tui-link-closure-refuses" PROPERTIES
+        FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+        LABELS "hygiene"
+        TIMEOUT 300
+    )
+endif()
+
+# The canary check's three verdicts, driven by stand-in commands: a canary that linked, one that
+# failed without naming the symbol, and one that failed naming it -- the only accepting case.
+# Unconditional: it needs no build tree and no vendored target.
+add_test(
+    NAME "vendor-tui-link-canary-selftest"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DFASTCACHED_SCRATCH_DIR=${CMAKE_CURRENT_BINARY_DIR}/vendor-tui-link-canary-selftest"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-vendor-link-canary-selftest.cmake"
+)
+set_tests_properties("vendor-tui-link-canary-selftest" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 60
+)
+
+# The probe's ROOT is derived: the configure refuses a vendored `.cpp` that no link checks
+# (`cmake/VendorLinkRoots.cmake`, called from `vendor/CMakeLists.txt`). That call can only show the
+# verdict the real tree earns, which on a good tree is acceptance -- so every home a link checks, and
+# every home it does not, is driven here over synthetic records. Unconditional: pure `cmake -P`.
+add_test(
+    NAME "vendor-link-roots-selftest"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-vendor-link-roots-selftest.cmake"
+)
+set_tests_properties("vendor-link-roots-selftest" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 60
+)
+
+# ----------------------------------------------------------------------------
+# VENDOR.md's file and line counts are the tree's (#1376).
+#
+# The copy's size, the supporting files beside `tui` and how many are headers were prose maintained by
+# hand beside a hand-maintained file set, and they drifted (`ac102948` corrected the line count after a
+# local change added a test file). Recomputed from the tree and `vendor/MANIFEST`; a stated figure that
+# differs, or a figure phrase the check cannot find, is refused. `docs-subject` as well as `hygiene`:
+# the subject is a document, and prose drifts by being edited as well as by the tree moving.
+add_test(
+    NAME "vendor-figures"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-vendor-figures.cmake"
+)
+set_tests_properties("vendor-figures" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene;docs-subject"
+    TIMEOUT 60
+)
+
+# Both directions against synthetic trees, with `ac102948`'s drift as a planted case and an accepting
+# case that wraps a figure sentence and groups thousands, so a check refusing everything cannot pass.
+add_test(
+    NAME "vendor-figures-selftest"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DFASTCACHED_SCRATCH_DIR=${CMAKE_CURRENT_BINARY_DIR}/vendor-figures-selftest"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-vendor-figures-selftest.cmake"
+)
+set_tests_properties("vendor-figures-selftest" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 60
+)
+
 # The vendored TUI runtime's own tests (#1374). Declared in `vendor/CMakeLists.txt`,
 # registered HERE because `add_subdirectory(vendor)` runs before `enable_testing()`
 # -- an `add_test` in that file builds a binary that never runs and reports nothing,

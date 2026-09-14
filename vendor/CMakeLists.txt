@@ -85,6 +85,13 @@ endif()
 # Not part of the tui tree and not header-only: Wakeup.hpp declares the class and
 # the three files below define it, one per platform, exactly as upstream selects
 # them. Linux gets an eventfd, other UNIX a self-pipe, Windows a manual-reset Event.
+# All three are NAMED whichever host configures, for the reason the terminal sets are:
+# the partition below is a statement about the tree.
+set(_fcTuiWakeupSources
+    endo/platform/windows/WindowsWakeup.cpp
+    endo/platform/linux/LinuxWakeup.cpp
+    endo/platform/posix/PosixWakeup.cpp
+)
 if(WIN32)
     list(APPEND _fcTuiSources endo/platform/windows/WindowsWakeup.cpp)
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
@@ -101,10 +108,22 @@ endif()
 # It was missing from the first two imports. Every member of the class is `static`
 # and the header declares them all without defining any, so every call site compiled
 # and the gap was invisible until something linked: two undefined symbols on Windows,
-# three on POSIX. See VENDOR.md's closure paragraph -- the twelve headers are a
-# measured closure and the implementation files beside them are hand-picked, which is
-# the part that has now been wrong twice.
+# three on POSIX (#1376). It is also the file `vendor-tui-link-closure-refuses` leaves
+# out of its canary, so the one miss that shipped is the one the guard is watched
+# catching on every run.
 list(APPEND _fcTuiSources endo/platform/SignalHandler.cpp)
+
+# What only upstream's vendored TESTS reach: two cases park `waitReadable` on a real
+# pipe rather than the scripted mock. Sources of `fastcache-tui-tests` and NOT of the
+# library, deliberately -- `fastcache-tui-linkprobe` resolves without them, which is the
+# measurement saying the production runtime does not reach them, and keeping them off
+# the library keeps `ws2_32` off it (SystemPipe's Windows implementation is a loopback
+# socket pair). Covered by the link criterion all the same: an executable compiles them,
+# and an executable's own link resolves what it references.
+set(_fcTuiTestSupportSources
+    endo/platform/SystemPipe.cpp
+    endo/platform/WinsockInit.cpp
+)
 
 # Every vendored translation unit this target does NOT build, and why. Three
 # groups, and the third is the one that needs stating: "nothing reached it" is a
@@ -170,14 +189,15 @@ list(APPEND _fcTuiSources endo/platform/SignalHandler.cpp)
 # forbidden, for a reason that is true and checkable now.
 set(_fcTuiNotBuilt
     # stb_image
-    ImageLoader.cpp ImageProvider.cpp StbImageImpl.cpp
+    endo/tui/ImageLoader.cpp endo/tui/ImageProvider.cpp endo/tui/StbImageImpl.cpp
     # unreached
-    CommandPalettePopup.cpp CommandRegistry.cpp CompletionPopup.cpp Dialog.cpp
-    FuzzyPickerPopup.cpp
-    InputField.cpp KeyBindings.cpp List.cpp LogPanel.cpp
-    QuestionComponent.cpp
-    SemanticBlockClient.cpp Spinner.cpp StatusBar.cpp
-    completer/Completer.cpp completer/FuzzyMatch.cpp completer/SmartCaseMatch.cpp
+    endo/tui/CommandPalettePopup.cpp endo/tui/CommandRegistry.cpp endo/tui/CompletionPopup.cpp
+    endo/tui/Dialog.cpp endo/tui/FuzzyPickerPopup.cpp
+    endo/tui/InputField.cpp endo/tui/KeyBindings.cpp endo/tui/List.cpp endo/tui/LogPanel.cpp
+    endo/tui/QuestionComponent.cpp
+    endo/tui/SemanticBlockClient.cpp endo/tui/Spinner.cpp endo/tui/StatusBar.cpp
+    endo/tui/completer/Completer.cpp endo/tui/completer/FuzzyMatch.cpp
+    endo/tui/completer/SmartCaseMatch.cpp
 )
 
 # The partition, asserted rather than believed.
@@ -189,11 +209,15 @@ set(_fcTuiNotBuilt
 # nothing, classified by nothing and mentioned nowhere -- exactly how
 # `HyperlinkEmitter` went unnoticed -- and the build stays green.
 #
-# Tests are excluded from the partition because this target builds none: endo's
-# test binary is upstream's, and fastcached's own suite is the one that matters
-# here.
-file(GLOB_RECURSE _fcTuiOnDisk RELATIVE "${CMAKE_CURRENT_SOURCE_DIR}/endo/tui"
-     "${CMAKE_CURRENT_SOURCE_DIR}/endo/tui/*.cpp")
+# Test translation units are excluded: each one is a ROOT that an executable links, never
+# an implementation something else needs, so "is it built" is the test registration's
+# question rather than this one's.
+#
+# Over the WHOLE vendored tree, not `endo/tui` alone (#1376). It covered `endo/tui` until
+# then, so a `.cpp` under `endo/platform` -- where every implementation this import has
+# missed actually lives -- could sit in the tree classified by nothing.
+file(GLOB_RECURSE _fcTuiOnDisk RELATIVE "${CMAKE_CURRENT_SOURCE_DIR}"
+     "${CMAKE_CURRENT_SOURCE_DIR}/endo/*.cpp")
 list(FILTER _fcTuiOnDisk EXCLUDE REGEX "(_test|test_main)\\.cpp$")
 
 # `NOT <var>` and never `<var> STREQUAL ""`: an APPEND into a misspelled name
@@ -202,44 +226,26 @@ list(FILTER _fcTuiOnDisk EXCLUDE REGEX "(_test|test_main)\\.cpp$")
 # fell into it.
 if(NOT _fcTuiOnDisk)
     message(FATAL_ERROR
-        "vendor: no vendored translation units were found under endo/tui, so the "
+        "vendor: no vendored translation units were found under endo/, so the "
         "partition below would be taken over an empty set and agree perfectly.")
 endif()
 
-# Classified = not-built + built-here + built-on-the-other-platform. The third term
-# is what makes this a statement about the tree rather than about this host.
-set(_fcTuiClassified ${_fcTuiNotBuilt})
-foreach(_src IN LISTS _fcTuiSources _fcTuiWin32Sources _fcTuiPosixSources)
-    # Only the `endo/tui/` half: the partition is a statement about that tree, and
-    # `_fcTuiSources` also carries the Wakeup implementation from `endo/platform/`,
-    # which lives outside it. Without the filter those entries survive the REPLACE
-    # unchanged and the existence check below looks for `endo/tui/endo/platform/...`.
-    if(_src MATCHES "^endo/tui/")
-        string(REPLACE "endo/tui/" "" _rel "${_src}")
-        list(APPEND _fcTuiClassified "${_rel}")
-    endif()
-endforeach()
+# Classified = built here + built on another platform + built by the vendored tests + not
+# built. The platform terms are what make this a statement about the tree rather than
+# about this host. Every list is spelled from `vendor/`, so one comparison serves them all.
+set(_fcTuiClassified
+    ${_fcTuiSources} ${_fcTuiWin32Sources} ${_fcTuiPosixSources} ${_fcTuiWakeupSources}
+    ${_fcTuiTestSupportSources} ${_fcTuiNotBuilt})
 list(REMOVE_DUPLICATES _fcTuiClassified)
 
 foreach(_src IN LISTS _fcTuiOnDisk)
-    # The partition covers endo/tui only; the Wakeup sources sit outside that tree
-    # and are named directly above, so they are not candidates here.
     if(NOT _src IN_LIST _fcTuiClassified)
         message(FATAL_ERROR
-            "vendor: endo/tui/${_src} is in the vendored tree but appears in neither "
-            "_fcTuiSources nor _fcTuiNotBuilt. An upstream re-sync added it. Decide "
-            "which it is -- build it, or name it in _fcTuiNotBuilt with the reason -- "
+            "vendor: ${_src} is in the vendored tree but no list in vendor/CMakeLists.txt "
+            "classifies it. An upstream re-sync added it. Decide which it is -- build it, "
+            "hand it to the vendored tests, or name it in _fcTuiNotBuilt with the reason -- "
             "because a source that is classified by nothing is built by nothing and "
             "mentioned nowhere, and the build stays green either way.")
-    endif()
-endforeach()
-
-foreach(_src IN LISTS _fcTuiSources)
-    if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${_src}")
-        message(FATAL_ERROR
-            "vendor: ${_src} is built by this target but is not in the tree. "
-            "If this followed an upstream re-sync, the file moved or was removed "
-            "there: update the list and record the change in vendor/VENDOR.md.")
     endif()
 endforeach()
 
@@ -273,9 +279,9 @@ endforeach()
 # comment nothing checks cannot fail.
 
 foreach(_src IN LISTS _fcTuiClassified)
-    if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/endo/tui/${_src}")
+    if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${_src}")
         message(FATAL_ERROR
-            "vendor: endo/tui/${_src} is named in this file but is not in the tree. "
+            "vendor: ${_src} is named in this file but is not in the tree. "
             "If this followed an upstream re-sync, the file moved or was removed there: "
             "update the list and record the change in vendor/VENDOR.md, rather than "
             "deleting the line, which would silently drop whatever used it.")
@@ -420,20 +426,81 @@ target_compile_features(fastcache-tui-objects PUBLIC cxx_std_23)
 # OBJECTS directly (rather than the archive) is what makes every one of them
 # participate: an archive contributes only the members something references, which
 # is precisely the leniency being tested for.
+#
+# **The criterion this probe carries (#1376):** every vendored translation unit that ANY
+# target of this build compiles is linked into an executable with nothing unresolved.
+# Headers are found by walking includes; implementation files are found by the linker,
+# never by reading. The object libraries it links are one list, below, and the walk at
+# the end of this file refuses a vendored `.cpp` that reaches neither that list nor an
+# executable of its own -- so the probe's ROOT follows the build rather than the day this
+# was written, which is the third instance #1376 records: adding test translation units
+# moved the root, and a set that was complete stopped being complete without changing.
 file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/linkprobe.cpp"
      "// Generated. See vendor/CMakeLists.txt: this exists so the linker is made to\n"
      "// resolve every symbol the vendored objects reference. It is never run.\n"
      "int main() { return 0; }\n")
-add_executable(fastcache-tui-linkprobe
-    "${CMAKE_CURRENT_BINARY_DIR}/linkprobe.cpp"
-    $<TARGET_OBJECTS:fastcache-tui-objects>
-)
+
+# The object libraries whose vendored objects no executable of their own links: the probe
+# links every one. A GLOBAL property, because the walk that reads it runs deferred, at the
+# end of the top-level configure, where this directory's variables are gone.
+set_property(GLOBAL PROPERTY FASTCACHED_TUI_LINKPROBE_OBJECT_LIBRARIES fastcache-tui-objects)
+get_property(_fcTuiProbeLibraries GLOBAL PROPERTY FASTCACHED_TUI_LINKPROBE_OBJECT_LIBRARIES)
+set(_fcTuiProbeObjects "")
+foreach(_lib IN LISTS _fcTuiProbeLibraries)
+    list(APPEND _fcTuiProbeObjects "$<TARGET_OBJECTS:${_lib}>")
+endforeach()
+
+add_executable(fastcache-tui-linkprobe "${CMAKE_CURRENT_BINARY_DIR}/linkprobe.cpp" ${_fcTuiProbeObjects})
 target_link_libraries(fastcache-tui-linkprobe PRIVATE unicode::unicode)
 set_target_properties(fastcache-tui-linkprobe PROPERTIES
     CXX_CLANG_TIDY ""
     C_CLANG_TIDY ""
     CXX_SCAN_FOR_MODULES OFF
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/linkprobe"
+)
+
+# THE CANARY: the same probe with ONE implementation left out, which must NOT link.
+#
+# The probe's accepting direction runs on every build; until #1376 its refusing direction
+# had been watched once, by hand, and a comment said so. A guard nobody watches refuse is
+# not known to work -- the linker could have been told to allow undefined symbols, or the
+# objects could have stopped reaching the link, and the probe would go on passing. So
+# `ctest -R vendor-tui-link-closure-refuses` builds this and requires the link to FAIL
+# naming the definition it lacks.
+#
+# `platform/SignalHandler.cpp` is the file left out because it is the miss that SHIPPED:
+# its header declares every member and defines none, so every caller compiled. The object
+# FILTER below matches by file STEM, because object paths are the generator's, so what is
+# asserted is the stem's: the library builds exactly ONE source with it, and that source is
+# the file named. A second `SignalHandler.cpp` elsewhere would be left out too, and a
+# renamed one would leave out nothing. Whether the filter matched at all is not knowable at
+# configure time, so a filter that removed nothing yields a canary that links, and the test
+# says so by name.
+#
+# EXCLUDE_FROM_ALL, or every build would fail by design. Never run, so it needs neither
+# the dialog suppression nor a test registration of its own beyond the build.
+set(_fcTuiCanaryOmits "endo/platform/SignalHandler.cpp")
+get_filename_component(_fcTuiCanaryStem "${_fcTuiCanaryOmits}" NAME_WE)
+set(_fcTuiCanaryHits ${_fcTuiSources})
+list(FILTER _fcTuiCanaryHits INCLUDE REGEX "(^|/)${_fcTuiCanaryStem}\\.cpp$")
+if(NOT "${_fcTuiCanaryHits}" STREQUAL "${_fcTuiCanaryOmits}")
+    message(FATAL_ERROR
+        "vendor: the link canary leaves out every object whose stem is ${_fcTuiCanaryStem}, which "
+        "must be exactly ${_fcTuiCanaryOmits}; fastcache-tui-objects builds [${_fcTuiCanaryHits}]. "
+        "Otherwise the canary either links -- and vendor-tui-link-closure-refuses reports the guard "
+        "broken when it is the canary that stopped testing anything -- or leaves out more than the "
+        "one file it names: pick a file the library builds, whose stem no other source shares.")
+endif()
+add_executable(fastcache-tui-linkprobe-canary EXCLUDE_FROM_ALL
+    "${CMAKE_CURRENT_BINARY_DIR}/linkprobe.cpp"
+    "$<FILTER:$<TARGET_OBJECTS:fastcache-tui-objects>,EXCLUDE,/${_fcTuiCanaryStem}(\\.cpp)?\\.(o|obj)$>"
+)
+target_link_libraries(fastcache-tui-linkprobe-canary PRIVATE unicode::unicode)
+set_target_properties(fastcache-tui-linkprobe-canary PROPERTIES
+    CXX_CLANG_TIDY ""
+    C_CLANG_TIDY ""
+    CXX_SCAN_FOR_MODULES OFF
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/linkprobe-canary"
 )
 
 # ----------------------------------------------------------------------------
@@ -460,20 +527,15 @@ set_target_properties(fastcache-tui-linkprobe PROPERTIES
 # whenever the TUI is on, and Catch2 is fetched under the test option, so the two are
 # independent conditions and only one of them is visible from here.
 if(TARGET Catch2::Catch2WithMain)
-    # SystemPipe and WinsockInit are sources of the TEST target and NOT of
-    # `fastcache-tui-objects`, deliberately. Only two cases reach them -- the ones
-    # that park `waitReadable` on a real pipe instead of the scripted mock -- and
-    # `fastcache-tui-linkprobe` resolves without them, which is the measurement
-    # saying the production runtime does not. Keeping them here also keeps `ws2_32`
-    # off the library: SystemPipe's Windows implementation is a loopback socket pair.
+    # `_fcTuiTestSupportSources` says why SystemPipe and WinsockInit are here and not on
+    # the library.
     add_executable(fastcache-tui-tests
         endo/tui/runtime/TuiRuntime_test.cpp
         endo/tui/runtime/Modal_test.cpp
         endo/tui/TerminalQuery_test.cpp
         endo/tui/TerminalInputWin32_test.cpp
         endo/tui/Sixel_test.cpp
-        endo/platform/SystemPipe.cpp
-        endo/platform/WinsockInit.cpp
+        ${_fcTuiTestSupportSources}
     )
     target_link_libraries(fastcache-tui-tests PRIVATE fastcache-tui Catch2::Catch2WithMain)
     if(WIN32)
@@ -495,3 +557,104 @@ if(TARGET Catch2::Catch2WithMain)
             WIN32_LEAN_AND_MEAN NOMINMAX _WIN32_WINNT=0x0A00)
     endif()
 endif()
+
+# ----------------------------------------------------------------------------
+# THE PROBE'S ROOT, DERIVED (#1376).
+#
+# The link criterion is only as complete as the set of objects it links, and that set was a
+# hand-named object library. A target added later that compiles a vendored `.cpp` somewhere
+# else -- a second object library, a static library, a source added straight to a consumer
+# -- would carry it past every guard here: a static archive resolves nothing, so the build
+# stays green and the undefined reference waits for whoever links it first. That is how all
+# three of this import's misses stayed hidden.
+#
+# So once the whole project is configured, every target under `vendor/` and `src/` is asked
+# what it compiles, and a vendored non-test `.cpp` is accepted in exactly two homes:
+#
+#   an EXECUTABLE that builds by default   its own link is a probe, and it runs every build
+#   an object library the probe links      `FASTCACHED_TUI_LINKPROBE_OBJECT_LIBRARIES`
+#
+# Anything else is refused by name, with the target -- including a source a target hands on
+# through `INTERFACE_SOURCES`, which is compiled by a consumer the walk cannot name. Deferred to the end of the top-level
+# configure because `src/` is added after this directory, and a walk that ran here would see
+# none of it and agree perfectly.
+#
+# What it does NOT cover, so nobody reads more into it: a source added through a generator
+# expression other than `$<TARGET_OBJECTS:...>` is not expanded at configure time, so it is
+# refused rather than judged if it names `endo/`; and a target outside `vendor/` and `src/`
+# (a fetched dependency) is not walked, since nothing there compiles this tree.
+#
+# The DECISION is `cmake/VendorLinkRoots.cmake`, a pure function over one record per source, so
+# `ctest -R vendor-link-roots-selftest` drives every verdict with `cmake -P`. What stays here is
+# acquisition: walking the targets and resolving each source against its target's directory.
+include("${CMAKE_CURRENT_LIST_DIR}/../cmake/VendorLinkRoots.cmake")
+
+function(_fastcached_vendor_collect_targets dir out)
+    get_property(found DIRECTORY "${dir}" PROPERTY BUILDSYSTEM_TARGETS)
+    get_property(subdirectories DIRECTORY "${dir}" PROPERTY SUBDIRECTORIES)
+    foreach(subdirectory IN LISTS subdirectories)
+        # string(FIND), never a regex: a checkout path is arbitrary text.
+        string(FIND "${subdirectory}" "${CMAKE_SOURCE_DIR}/src" atSrc)
+        string(FIND "${subdirectory}" "${CMAKE_SOURCE_DIR}/vendor" atVendor)
+        if(atSrc EQUAL 0 OR atVendor EQUAL 0)
+            _fastcached_vendor_collect_targets("${subdirectory}" nested)
+            list(APPEND found ${nested})
+        endif()
+    endforeach()
+    set(${out} "${found}" PARENT_SCOPE)
+endfunction()
+
+function(_fastcached_vendor_check_link_roots)
+    get_property(probeLibraries GLOBAL PROPERTY FASTCACHED_TUI_LINKPROBE_OBJECT_LIBRARIES)
+    _fastcached_vendor_collect_targets("${CMAKE_SOURCE_DIR}" targets)
+
+    set(records "")
+    foreach(target IN LISTS targets)
+        get_target_property(type ${target} TYPE)
+        get_target_property(sourceDir ${target} SOURCE_DIR)
+        get_target_property(excluded ${target} EXCLUDE_FROM_ALL)
+        if(excluded)
+            set(excluded 1)
+        else()
+            set(excluded 0)
+        endif()
+        # What a target compiles, carried as its TYPE, and what it hands to whatever links it, carried as
+        # `INTERFACE_SOURCES` -- the second lands in a consumer this walk cannot name, so the verdict refuses
+        # it. An INTERFACE or UTILITY target's own SOURCES are compiled by nothing, so only those types skip.
+        set(carriers "")
+        if(type MATCHES "^(EXECUTABLE|STATIC_LIBRARY|SHARED_LIBRARY|MODULE_LIBRARY|OBJECT_LIBRARY)$")
+            list(APPEND carriers "SOURCES=${type}")
+        endif()
+        if(NOT type STREQUAL "UTILITY")
+            list(APPEND carriers "INTERFACE_SOURCES=INTERFACE_SOURCES")
+        endif()
+        foreach(carrier IN LISTS carriers)
+            string(REPLACE "=" ";" carrier "${carrier}")
+            list(GET carrier 0 property)
+            list(GET carrier 1 name)
+            get_target_property(sources ${target} ${property})
+            if(NOT sources)
+                continue()
+            endif()
+            foreach(source IN LISTS sources)
+                if(NOT source MATCHES "^\\$<")
+                    cmake_path(ABSOLUTE_PATH source BASE_DIRECTORY "${sourceDir}" NORMALIZE)
+                endif()
+                list(APPEND records "${target}|${name}|${excluded}|${source}")
+            endforeach()
+        endforeach()
+    endforeach()
+
+    fastcached_vendor_link_roots_verdict(problems inProbe inExecutables
+        VENDOR_ROOT "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/endo"
+        PROBE_LIBRARIES ${probeLibraries}
+        RECORDS ${records})
+    if(problems)
+        list(JOIN problems "\n  " sentences)
+        message(FATAL_ERROR "vendor: the link criterion does not reach every vendored translation unit (#1376):\n  ${sentences}")
+    endif()
+    message(STATUS "vendor: link criterion covers ${inProbe} vendored translation unit(s) in the probe's "
+                   "object libraries and ${inExecutables} linked by their own executables")
+endfunction()
+
+cmake_language(DEFER DIRECTORY "${CMAKE_SOURCE_DIR}" CALL _fastcached_vendor_check_link_roots)
