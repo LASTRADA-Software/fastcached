@@ -611,6 +611,15 @@ namespace
         return item;
     }
 
+    /// How a figure's text is dressed: as a figure when there is a reading, plain when the text is the absent
+    /// marker, which is no figure to give weight to.
+    /// @param value The reading.
+    /// @return The tone, or none.
+    [[nodiscard]] std::optional<FrameTone> FigureTone(std::optional<double> value) noexcept
+    {
+        return value.has_value() && std::isfinite(*value) ? std::optional { FrameTone::Figure } : std::nullopt;
+    }
+
     /// The rate block, laid out for @p budget cells.
     /// @param in The frame's inputs.
     /// @param rows The panel's rate rows.
@@ -736,14 +745,21 @@ namespace
         for (auto const& row: rows)
         {
             auto const value = Newest(SeriesFor(in, row.value, {}));
-            auto pieces =
-                std::vector<Piece> { Piece { .text = std::string { Indent } + FitRight(row.label, labelColumns, in.cellWidth)
-                                                     + FigureText(in, row.value, value),
-                                             .priority = Priority::Essential } };
+            // The label and the reading are two ESSENTIAL pieces, so each is dressed as what it is (G1): a
+            // label recedes, a reading carries weight, and an absent reading is left plain.
+            auto pieces = std::vector<Piece> {
+                Piece { .text = std::string { Indent } + FitRight(row.label, labelColumns, in.cellWidth),
+                        .priority = Priority::Essential,
+                        .tone = FrameTone::Label },
+                Piece {
+                    .text = FigureText(in, row.value, value), .priority = Priority::Essential, .tone = FigureTone(value) },
+            };
             if (row.limit.has_value())
             {
                 auto const limit = Newest(SeriesFor(in, *row.limit, {}));
-                pieces.push_back(Piece { .text = " / " + FigureText(in, *row.limit, limit), .priority = row.limitPriority });
+                pieces.push_back(Piece { .text = " / " + FigureText(in, *row.limit, limit),
+                                         .priority = row.limitPriority,
+                                         .tone = FigureTone(limit) });
                 // A limit of zero is `InMemoryLruStorage`'s spelling of UNBOUNDED, so there is no
                 // proportion to draw -- and a gauge left empty would claim the store is idle.
                 auto const fraction = (value.has_value() && limit.has_value()) ? Quotient(*value, *limit) : std::nullopt;
@@ -751,15 +767,17 @@ namespace
                     pieces.push_back(
                         Piece { .text = "  " + Gauge(*fraction, GaugeCells, *in.glyphs), .priority = row.gaugePriority });
                 pieces.push_back(Piece { .text = "  " + FormatFigure(fraction, FigureFormat::Percent, in.absent),
-                                         .priority = row.limitPriority });
+                                         .priority = row.limitPriority,
+                                         .tone = FigureTone(fraction) });
             }
             if (!row.note.empty())
-                pieces.push_back(Piece { .text = "  " + std::string { row.note }, .priority = row.notePriority });
+                pieces.push_back(Piece {
+                    .text = "  " + std::string { row.note }, .priority = row.notePriority, .tone = FrameTone::Label });
 
             auto kept = FitPieces(std::move(pieces), budget, 0, in.cellWidth);
             if (!kept.has_value())
                 return std::unexpected(kept.error());
-            items.push_back(Item { .lines = { Joined(*kept, {}) }, .priority = row.priority });
+            items.push_back(LineOf(*kept, {}, row.priority));
         }
         return items;
     }
@@ -800,36 +818,55 @@ namespace
 
         auto heading =
             std::vector<Piece> { Piece { .text = std::string { Indent } + FitRight("tier", TierNameColumns, in.cellWidth),
-                                         .priority = Priority::Essential } };
+                                         .priority = Priority::Essential,
+                                         .tone = FrameTone::Label } };
         for (auto const index: std::views::iota(std::size_t { 0 }, spec.tierColumns.size()))
             heading.push_back(Piece { .text = AlignRight(spec.tierColumns[index].header, widths[index], in.cellWidth),
                                       .priority = spec.tierColumns[index].priority,
-                                      .slot = index + 1 });
+                                      .slot = index + 1,
+                                      .tone = FrameTone::Label });
         auto kept = FitPieces(std::move(heading), budget, 0, in.cellWidth);
         if (!kept.has_value())
             return std::unexpected(kept.error());
 
-        auto table = Item { .lines = { Joined(*kept, {}) }, .priority = spec.tierPriority, .table = true };
+        // The heading is a line of pieces; a row is aligned under it cell by cell, so its runs are placed where
+        // each cell's text lands: the tier's name as a label, each figure as a figure, an absent one plain.
+        auto table = LineOf(*kept, {}, spec.tierPriority);
+        table.table = true;
         for (auto const index: std::views::iota(std::size_t { 0 }, tiers.size()))
         {
-            auto row = std::string { Indent } + FitRight(tiers[index], TierNameColumns, in.cellWidth);
+            auto const line = table.lines.size();
+            auto row = std::string { Indent };
+            table.spans.push_back(
+                LineSpan { .line = line, .byte = row.size(), .length = tiers[index].size(), .tone = FrameTone::Label });
+            row += FitRight(tiers[index], TierNameColumns, in.cellWidth);
             for (auto const& piece: *kept | std::views::drop(1))
-                row += AlignRight(cells[index][piece.slot - 1], widths[piece.slot - 1], in.cellWidth);
+            {
+                auto const& text = cells[index][piece.slot - 1];
+                auto const cell = AlignRight(text, widths[piece.slot - 1], in.cellWidth);
+                if (text != in.absent)
+                    table.spans.push_back(LineSpan { .line = line,
+                                                     .byte = row.size() + (cell.size() - text.size()),
+                                                     .length = text.size(),
+                                                     .tone = FrameTone::Figure });
+                row += cell;
+            }
             table.lines.push_back(std::move(row));
         }
         items.push_back(std::move(table));
         for (auto const note: spec.tierNote)
         {
             // Prose, not a figure: a note that does not fit is dropped whole rather than cut.
-            auto fitted = FitPieces(
-                { Piece { .text = std::string { Indent } + std::string { note }, .priority = spec.tierNotePriority } },
-                budget,
-                0,
-                in.cellWidth);
+            auto fitted = FitPieces({ Piece { .text = std::string { Indent } + std::string { note },
+                                              .priority = spec.tierNotePriority,
+                                              .tone = FrameTone::Label } },
+                                    budget,
+                                    0,
+                                    in.cellWidth);
             if (!fitted.has_value())
                 return std::unexpected(fitted.error());
             if (!fitted->empty())
-                items.push_back(Item { .lines = { Joined(*fitted, {}) }, .priority = spec.tierNotePriority });
+                items.push_back(LineOf(*fitted, {}, spec.tierNotePriority));
         }
         return items;
     }

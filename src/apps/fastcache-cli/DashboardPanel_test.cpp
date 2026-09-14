@@ -464,6 +464,62 @@ TEST_CASE("an 80x24 cache panel carries every label, qualifier and note section 
     CHECK(frame.contains("source  metrics (/metrics at 127.0.0.1:9464)"));
 }
 
+TEST_CASE("a cache frame dresses its level and tier readings as figures, their labels and notes as labels, and an "
+          "absent reading not at all",
+          "[cli][dashboard][panel][tone]")
+{
+    // G1. WHAT DISTINGUISHES: each run covers exactly the words it names -- `items`, not `items       ` -- with the
+    // tone of what they are, so a figure and its label are two runs rather than one run over both; and a reading
+    // the source did not carry (`fastcached_items` removed) gets no run, where dressing the marker as a figure would
+    // give weight to a number that is not there.
+    auto series = CacheSeries(1, { "memory", "disk" });
+    std::erase_if(series, [](Series const& one) { return one.name == "fastcached_items"; });
+    auto sink = CollectingSink {};
+    auto view = PanelView {
+        CachePanel(),
+        PanelContext { .absent = std::string { Absent }, .cellWidth = &FakeCellWidth, .rung = RenderRung::Unicode }
+    };
+    (void) Drive(
+        { DashboardEvent { .kind = DashboardEventKind::Resize, .columns = 80, .rows = 24 }, SampleOf(series, 1), Tick },
+        DashboardLimits {},
+        view,
+        sink);
+    REQUIRE(sink.frames.size() == 1);
+    INFO(sink.frames.front());
+    auto const lines = Lines(sink.frames.front());
+    auto runs = std::set<std::pair<FrameTone, std::string>> {};
+    for (auto const& span: sink.spans.front())
+    {
+        auto const text = lines.at(span.row - 1).substr(span.byte, span.length);
+        CHECK_FALSE(text.starts_with(' '));
+        CHECK_FALSE(text.ends_with(' '));
+        runs.emplace(span.tone, text);
+    }
+
+    for (auto const& expected: std::initializer_list<std::pair<FrameTone, std::string>> {
+             { FrameTone::Label, "connected" },
+             { FrameTone::Label, "no level is exported; connections_total is a TALLY" },
+             { FrameTone::Label, "items" },
+             { FrameTone::Label, "bytes" },
+             { FrameTone::Figure, "3.00 GiB" },
+             { FrameTone::Figure, "/ 4.00 GiB" },
+             { FrameTone::Figure, "75.0 %" },
+             { FrameTone::Label, "tier" },
+             { FrameTone::Label, "index (RAM)" },
+             { FrameTone::Label, "memory" },
+             { FrameTone::Label, "disk" },
+             { FrameTone::Figure, "412 003" },
+             { FrameTone::Label, "tier bytes carry per-tier denominations and do not sum; no per-tier" },
+         })
+    {
+        INFO("run " << std::to_underlying(expected.first) << " " << expected.second);
+        CHECK(runs.contains(expected));
+    }
+    // The absent readings: `items` is not carried and the connected row has no field, so neither marker is a run.
+    CHECK_FALSE(std::ranges::any_of(runs, [](auto const& run) { return run.second == Absent; }));
+    CHECK(std::ranges::count_if(lines, [](std::string const& line) { return line.contains(Absent); }) >= 2);
+}
+
 TEST_CASE("a level label as wide as the label column still leaves a blank before its reading, and moves the block",
           "[cli][dashboard][panel]")
 {
