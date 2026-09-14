@@ -779,6 +779,24 @@ namespace
         return piece;
     }
 
+    /// A note as @p glyphs' rung spells it: every `DeltaMark` drawn as the rung's `delta`.
+    /// @param note The note, as a panel's table writes it.
+    /// @param glyphs The rung.
+    /// @return The text to draw.
+    [[nodiscard]] std::string NoteText(std::string_view note, RungGlyphs const& glyphs)
+    {
+        auto text = std::string {};
+        text.reserve(note.size());
+        for (auto at = note.find(DeltaMark); at != std::string_view::npos; at = note.find(DeltaMark))
+        {
+            text += note.substr(0, at);
+            text += glyphs.delta;
+            note.remove_prefix(at + DeltaMark.size());
+        }
+        text += note;
+        return text;
+    }
+
     /// @p text wrapped at its spaces into lines of at most @p width cells; a word wider than that is a line of its own.
     /// @param text Prose.
     /// @param width The cells a line may take.
@@ -926,7 +944,7 @@ namespace
             // row instead of going; a row with one keeps its note a piece like any other.
             auto const wraps = row.trend == Trend::None && !row.note.empty();
             if (!row.note.empty() && !wraps)
-                pieces.push_back(Piece { .text = std::string { PieceGap } + std::string { row.note },
+                pieces.push_back(Piece { .text = std::string { PieceGap } + NoteText(row.note, *in.glyphs),
                                          .priority = row.notePriority,
                                          .tone = FrameTone::Label });
 
@@ -938,7 +956,7 @@ namespace
             {
                 note.start = TextWidth(*kept, in.cellWidth) + in.cellWidth(PieceGap);
                 if (budget >= note.start + MinimumNoteCells)
-                    note.lines = Wrapped(row.note, budget - note.start, in.cellWidth);
+                    note.lines = Wrapped(NoteText(row.note, *in.glyphs), budget - note.start, in.cellWidth);
             }
             notes.push_back(std::move(note));
             fitted.push_back(std::move(*kept));
@@ -1049,7 +1067,7 @@ namespace
             }
             if (!row.note.empty())
                 pieces.push_back(Piece {
-                    .text = "  " + std::string { row.note }, .priority = row.notePriority, .tone = FrameTone::Label });
+                    .text = "  " + NoteText(row.note, *in.glyphs), .priority = row.notePriority, .tone = FrameTone::Label });
 
             auto kept = FitPieces(std::move(pieces), budget, 0, in.cellWidth);
             if (!kept.has_value())
