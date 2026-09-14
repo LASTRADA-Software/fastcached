@@ -1206,8 +1206,9 @@ class MergedResponder final: public IFrameResponder
     /// because both of those responders carry comments reasoning about the number they
     /// contribute -- reasoning that is sound about the value and silent about the fact
     /// that nothing reads it. Whoever changes this set should read those comments in the
-    /// same pass; whether the set is right is a question about capacity accounting on a
-    /// merged surface, not about any one responder's row, and is tracked on its own.
+    /// same pass. Those comments no longer claim a narrowing (#1338): a per-component
+    /// connection or byte ceiling has nowhere to live on one listener, one accept queue
+    /// and one byte budget, so the set stays the owners whose ceilings are the surface's.
     ///
     /// Adding the two members would change no number today: this is a MAXIMUM, and each
     /// of them was sized to be the SMALL one. A ceiling that only takes effect when it is
@@ -1215,11 +1216,11 @@ class MergedResponder final: public IFrameResponder
     /// them in would leave the comments looking addressed and the property unchanged.
     ///
     /// A max cannot narrow a busier owner's ceiling -- **except** that with every folded
-    /// owner null this answers 0, and 0 is not a small ceiling at the endpoint: the
-    /// in-flight check reads `budget != 0 && ...` (`FrameEndpoint.cpp:1657`), so zero
-    /// there means UNBOUNDED. Unreachable today, `main.cpp` setting `.compile`
-    /// unconditionally; stated narrowly because the general form of that sentence is
-    /// false and was believed.
+    /// owner null this answers 0, and 0 means different things per ceiling: no ceiling at
+    /// all for `MaxOpenConnections` and `MaxInFlightBytes`, every payload refused for
+    /// `MaxRequestBytes` -- stated at those three declarations in `FrameEndpoint.hpp`.
+    /// Unreachable today, `main.cpp` setting `.compile` unconditionally; stated narrowly
+    /// because the general form of that sentence is false and was believed.
     /// @param ceiling Which ceiling to read.
     /// @return The largest of the three folded owners; 0 when none of them is present.
     [[nodiscard]] std::size_t Largest(std::size_t (IFrameResponder::*ceiling)() const noexcept) const noexcept

@@ -19,14 +19,12 @@
 #include <array>
 #include <atomic>
 #include <chrono>
-#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
 #include <filesystem>
 #include <functional>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -416,8 +414,6 @@ class FleetSampler final: public IFleetHistoryView
     /// the series it indexes.
     std::atomic<std::int64_t> _handedThrough { -1 };
     ILogger& _logger;
-    std::mutex _wakeMutex;
-    std::condition_variable_any _wake;
     std::jthread _thread;
 };
 

@@ -651,6 +651,38 @@ TEST_CASE("The session ceilings are the largest of the components present", "[no
     CHECK(schedulerOnly.MaxInFlightBytes() == SchedulerInFlight);
 }
 
+TEST_CASE("A surface with no cache, scheduler or compile owner folds every ceiling to zero, whatever the others report",
+          "[node][merged-responder]")
+{
+    // #1338's condition: a merged surface with no cache, scheduler or compile owner. `main.cpp` cannot
+    // build that shape today -- it sets `.compile` unconditionally -- so this pins the class rather than a
+    // node. The node and enrollment owners are in no fold, so their own ceilings -- sized small, and
+    // reasoned about as if that narrowed something -- decide nothing even here. WHAT DISTINGUISHES: all
+    // three answers are ZERO rather than those owners' numbers, and zero means opposite things per
+    // ceiling (`FrameEndpoint.hpp`): no ceiling for connections and in-flight bytes, every payload
+    // refused for the request cap.
+    constexpr std::size_t NodeRequest = 4096;
+    constexpr std::size_t NodeOpen = 32;
+    constexpr std::size_t NodeInFlight = 65536;
+    NamedResponder node { "node" };
+    node.PlaceCeilings(NodeRequest, NodeOpen, NodeInFlight);
+    NamedResponder enrollment { "enrollment" };
+    enrollment.PlaceCeilings(NodeRequest, 2 * NodeOpen, 2 * NodeInFlight);
+
+    MergedResponder unfolded { SurfaceComponents { .node = &node, .enrollment = &enrollment } };
+    CHECK(unfolded.MaxRequestBytes() == 0);
+    CHECK(unfolded.MaxOpenConnections() == 0);
+    CHECK(unfolded.MaxInFlightBytes() == 0);
+
+    // The control: one folded owner beside the same two, and the fold is that owner's alone.
+    NamedResponder compile { "compile" };
+    compile.PlaceCeilings(1024, 8, 2048);
+    MergedResponder folded { SurfaceComponents { .compile = &compile, .node = &node, .enrollment = &enrollment } };
+    CHECK(folded.MaxRequestBytes() == 1024);
+    CHECK(folded.MaxOpenConnections() == 8);
+    CHECK(folded.MaxInFlightBytes() == 2048);
+}
+
 TEST_CASE("A node with neither component opens no 0xFC port", "[node][node-surface]")
 {
     // Not an error and not a silence: a node with no component for any verb family is

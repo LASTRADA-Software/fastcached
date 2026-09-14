@@ -7,6 +7,7 @@
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/HostPort.hpp>
+#include <FastCache/Core/StopAwareWait.hpp>
 #include <FastCache/Net/PlatformConnector.hpp>
 
 #include <algorithm>
@@ -465,17 +466,16 @@ std::expected<void, std::string> ConsensusTier::Launch(NodeConfig const& cfg,
     // does nothing at all in the ordinary case. What it may NOT do is run on either
     // of the other two -- a proposal is a durability write and a broadcast, and both
     // of those loops exist precisely to not be held up by one.
-    _reconcileThread = std::jthread { [this](std::stop_token stop) {
+    _reconcileThread = std::jthread { [this](std::stop_token const& stop) {
         while (!stop.stop_requested())
         {
             Reconcile();
 
-            // Interruptible, rather than a sleep this loop would have to wake from
-            // on its own schedule. A stop that had to wait out a full interval makes
-            // teardown look hung, which this repository has already paid for once as
-            // a `systemctl stop` that escalated to SIGKILL.
-            auto guard = std::unique_lock { _wakeMutex };
-            (void) _wake.wait_for(guard, stop, ReconcileInterval, [&stop] { return stop.stop_requested(); });
+            // A stop ends the wait at once: one that had to wait out a full interval makes
+            // teardown look hung, which this repository has already paid for once as a
+            // `systemctl stop` that escalated to SIGKILL.
+            if (WaitForStopOr(stop, ReconcileInterval) == WaitEnd::Stopped)
+                break;
         }
     } };
     return {};
@@ -510,11 +510,9 @@ ConsensusTier::~ConsensusTier()
     if (_driver != nullptr)
         _driver->Stop();
 
-    // Asked to stop and then woken, in that order: `request_stop` is what the
-    // predicate reads, and notifying before it would leave the loop re-checking a
-    // flag nobody had set yet and going back to sleep for a full interval.
+    // The request is the wakeup: the reconciler's wait takes part in its stop token
+    // (`WaitForStopOr`), so nothing needs notifying beside it.
     _reconcileThread.request_stop();
-    _wake.notify_all();
 }
 
 std::expected<Consensus::LogIndex, ConsensusError> ConsensusTier::Propose(Cluster::Command const& command)
