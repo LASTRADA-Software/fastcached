@@ -362,7 +362,7 @@ class StopReactorOnExit
                                                  .source = &source });
 
     auto& answer = ending.answer;
-    answer.advisories.insert(answer.advisories.begin(), openingRemarks.begin(), openingRemarks.end());
+    PrependRemarks(answer, openingRemarks);
 
     if (ending.kind == SessionEndKind::Abandoned)
     {
@@ -513,7 +513,7 @@ class StopReactorOnExit
     // The connection's own remarks come first: they are about the whole exchange
     // rather than about this one answer, and an operator reading downwards wants
     // "your credential was ignored" before "the key does not exist".
-    answer.advisories.insert(answer.advisories.begin(), openingRemarks.begin(), openingRemarks.end());
+    PrependRemarks(answer, openingRemarks);
 
     if (answer.rawPayload.has_value())
         WriteRaw(*answer.rawPayload);
