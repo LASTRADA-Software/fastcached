@@ -175,6 +175,17 @@ struct TierColumn
     Priority priority { Priority::Normal }; ///< When the column is dropped for width.
 };
 
+/// How a panel's history chart grows into rows nothing else wants: the node's and the fleet's alike.
+///
+/// The bounds are high on purpose: a tall terminal's rows are the chart's to use, and a band twelve rows high still
+/// reads as one band. They exist so a very tall terminal does not draw a band as a wall.
+struct ChartGrowth
+{
+    std::size_t cellsHighMost { 48 }; ///< The most rows its bands take together.
+    std::size_t bandCellsMost { 12 }; ///< The most rows one band grows to.
+    std::size_t minimumCells { 24 };  ///< The fewest cells across its bands are drawn in; narrower, it is not drawn.
+};
+
 /// How a panel draws the fleet document a `fleet` reading carries (#134 §5).
 ///
 /// **No column list lives here, or anywhere in this client** (#1320): a section's columns are the
@@ -187,22 +198,21 @@ struct TierColumn
 /// positional rule this replaced dropped `heartbeat-age` -- the column §5 calls the row this panel exists
 /// for -- first.
 ///
-/// **The chart is the Sixel rung's alone** (#134's decision on Sixel): on that rung, with a cell size the
-/// terminal reported and an encoder to draw it, the first `FleetChartMetrics` row is drawn per machine
-/// across a fixed span of samples, and dropped for height at `chartPriority` like any other item. On every
-/// other rung there is no chart row at all -- not blank rows, not a glyph imitation.
+/// **The chart is the panels' one history chart** (`LayoutChart`): the first `FleetChartMetrics` row per machine,
+/// as an image on the Sixel rung with a cell size and an encoder, and as the rung's chart marks on a rung that has
+/// them. A rung with neither draws no chart row at all -- not blank rows, not a glyph imitation.
 ///
 /// **The chart explains itself** (#134 F14; the owner could not tell what a band of colour meant). It is
 /// one item, so it goes whole:
 ///   - a title naming the figure and the span it covers;
 ///   - a row per machine, its name and newest figure left of the image, the band beside them;
 ///   - the time axis under the image, from how long ago its left edge is to `now`;
-///   - a legend: the colour scale as a second image between its two values, and what a bar, the grey
-///     track and a blank mean.
+///   - a legend: on the Sixel rung the colour scale as a second image between its two values, and what a bar,
+///     the grey track and a blank mean; on a text rung the zero mark, the full cell, and the top every band has.
 ///
-/// It starts at a band of one row for each of the first `chartCellsHigh` machines by name. **It yields rows
-/// to the table**: it goes before a machine row is hidden, and it grows into rows nothing else wants -- more
-/// machines first, then taller bands up to `chartBandCellsMost` -- up to `chartCellsHighMost` rows of image.
+/// **It yields rows to the table** by construction: it is laid out after the frame is fitted, in the rows nothing
+/// else wanted and only those, between the tiles and the strip -- more machines first, then taller bands, as
+/// `chartGrowth` bounds them. A frame with no rows to spare has no chart.
 ///
 /// The headline tiles are the `kpi` section's rows, in `Distributed::FleetKpis()` order, under the
 /// page's own labels and with its nouns (`of 192 slots`, `not yet resolved`); a figure the page draws a
@@ -216,10 +226,7 @@ struct TierColumn
 /// is not shown and how to reach it (`... 8 more machines; PgDn scrolls, / filters`).
 struct DocumentSpec
 {
-    std::size_t chartCellsHigh { 6 };                  ///< The most machines the chart bands before it grows.
-    std::size_t chartCellsHighMost { 16 };             ///< The most rows of image it grows to, into rows nothing else wants.
-    std::size_t chartBandCellsMost { 3 };              ///< The most rows of cells one machine's band grows to.
-    std::size_t chartMinimumCells { 24 };              ///< The fewest cells across the chart is drawn in; narrower, it goes.
+    ChartGrowth chartGrowth {};                        ///< How the chart grows: the one policy every history chart has.
     std::size_t tableRowsKept { 3 };                   ///< The rows a table keeps before the tiles go.
     Priority tilePriority { Priority::Normal };        ///< When a line of tiles goes, for height.
     Priority stripPriority { Priority::High };         ///< When the section strip goes, for height.
@@ -228,7 +235,6 @@ struct DocumentSpec
     Priority tablePriority { Priority::Essential };    ///< When the section's table goes; an essential one only shrinks.
     Priority tableShrinkPriority { Priority::Normal }; ///< When the table gives up rows down to `tableRowsKept`.
     Priority filterPriority { Priority::High };        ///< When an applied filter's line goes; while typed it stays.
-    Priority chartPriority { Priority::Low };          ///< When the Sixel chart goes, for height.
 };
 
 /// A fact a panel's title bar states about its session rather than its content (#134 §3-§5).
@@ -339,17 +345,6 @@ struct ChartRow
     /// What the band's top stands for, when the figure has a whole of its own -- `1.0` for a share; nullopt to scale
     /// the band to its own peak over the span it draws.
     std::optional<double> top {};
-};
-
-/// How a panel's history chart grows into rows nothing else wants.
-///
-/// The bounds are high on purpose: a tall terminal's rows are the chart's to use, and a band twelve rows high still
-/// reads as one band. They exist so a very tall terminal does not draw a band as a wall.
-struct ChartGrowth
-{
-    std::size_t cellsHighMost { 48 }; ///< The most rows its bands take together.
-    std::size_t bandCellsMost { 12 }; ///< The most rows one band grows to.
-    std::size_t minimumCells { 24 };  ///< The fewest cells across its bands are drawn in; narrower, it is not drawn.
 };
 
 struct PanelSpec
@@ -570,7 +565,7 @@ class PanelView final: public IDashboardView
     PanelView(PanelSpec const& spec, PanelContext context);
 
     /// @param model What is known.
-    /// @return The frame, with the fleet chart placed over it on the Sixel rung.
+    /// @return The frame, with a history chart's images placed over it on the Sixel rung.
     [[nodiscard]] DashboardFrame PlacedFrame(DashboardModel const& model) override;
 
     /// Act on a key for a document panel's table.
