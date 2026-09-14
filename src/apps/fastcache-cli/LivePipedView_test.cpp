@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "DashboardPanels.hpp"
 #include "LivePipedView.hpp"
+#include "ScrapeFixture.hpp"
 #include "ScriptedDashboardEvents.hpp"
 
 #include <FastCache/Async/TestReactor.hpp>
+#include <FastCache/Cache/StorageTier.hpp>
 #include <FastCache/Core/Clock.hpp>
+#include <FastCache/Core/Ranges.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -315,24 +318,25 @@ namespace
     return names;
 }
 
-/// A cache daemon's `INFO` counters at one moment.
-/// @param hits `keyspace_hits`.
-/// @param misses `keyspace_misses`.
-/// @param commands `total_commands_processed`.
-/// @param used `used_memory`.
+/// A cache daemon's `/metrics` at one moment: its cache block, and no catalogue counter at all.
+/// @param hits GET hits.
+/// @param misses GET misses.
+/// @param gets GET commands.
+/// @param used Bytes used.
 /// @return The attempts.
-[[nodiscard]] std::vector<StatsAttempt> InfoAt(std::uint64_t hits,
-                                               std::uint64_t misses,
-                                               std::uint64_t commands,
-                                               std::uint64_t used)
+[[nodiscard]] std::vector<StatsAttempt> CacheAt(std::uint64_t hits,
+                                                std::uint64_t misses,
+                                                std::uint64_t gets,
+                                                std::uint64_t used)
 {
-    return ReadingOf({
-        Field { .name = "keyspace_hits", .value = NumberCell(hits) },
-        Field { .name = "keyspace_misses", .value = NumberCell(misses) },
-        Field { .name = "total_commands_processed", .value = NumberCell(commands) },
-        Field { .name = "used_memory", .value = NumberCell(used) },
-        Field { .name = "maxmemory", .value = NumberCell(std::uint64_t { 8192 }) },
-    });
+    auto reading = StatsReading {};
+    reading.snapshot.storage = StorageStats { .itemCount = 12,
+                                              .bytesUsed = static_cast<std::size_t>(used),
+                                              .bytesLimit = 8192,
+                                              .cmdGet = gets,
+                                              .getHits = hits,
+                                              .getMisses = misses };
+    return ReadingOf(ScrapeOf(reading), StatsOrigin::Metrics);
 }
 
 /// A cache daemon's `/metrics` at one moment, carrying @p tiers.
@@ -341,14 +345,17 @@ namespace
 /// @return The attempts.
 [[nodiscard]] std::vector<StatsAttempt> TieredAt(std::uint64_t items, std::vector<std::string_view> const& tiers)
 {
-    auto fields = std::vector<Field> { Field { .name = "fastcached_items", .value = NumberCell(items) } };
+    auto reading = StatsReading {};
+    reading.snapshot.storage = StorageStats { .itemCount = static_cast<std::size_t>(items) };
     for (auto const tier: tiers)
     {
-        fields.push_back(Field { .name = TierSeriesName("fastcached_tier_items", tier), .value = NumberCell(items) });
-        fields.push_back(
-            Field { .name = TierSeriesName("fastcached_tier_bytes_used", tier), .value = NumberCell(items * 100) });
+        auto const* row = FindIfOrNull(StorageTierTable, [tier](auto const& one) { return one.name == tier; });
+        REQUIRE(row != nullptr);
+        reading.snapshot.storageTiers[static_cast<std::size_t>(row->tier)] =
+            StorageStats { .itemCount = static_cast<std::size_t>(items),
+                           .bytesUsed = static_cast<std::size_t>(items * 100) };
     }
-    return ReadingOf(std::move(fields), StatsOrigin::Metrics);
+    return ReadingOf(ScrapeOf(reading), StatsOrigin::Metrics);
 }
 
 /// The cell under @p name in @p row, failing the case when the header names no such column.
@@ -367,7 +374,7 @@ namespace
     return row[index];
 }
 
-constexpr auto WholeRate = FigureSpec { .field = { .metrics = "a_total", .nodeMetrics = {}, .info = {} } };
+constexpr auto WholeRate = FigureSpec { .field = CounterField<IMetricsSink::Counter::ConnectionsTotal>() };
 constexpr auto BesideNamed = std::array { BesideFigure { .key = "b", .figure = WholeRate } };
 constexpr auto BesideUnnamed = std::array { BesideFigure { .key = "", .figure = WholeRate } };
 constexpr auto BesideRepeating = std::array { BesideFigure { .key = "a", .figure = WholeRate } };
@@ -488,8 +495,8 @@ TEST_CASE("a piped cache row reports the panel's figures unformatted, absent unt
           "[cli][live][piped][figures]")
 {
     std::vector<DashboardEvent> script;
-    AddSample(script, 1, InfoAt(90, 10, 1000, 4096));
-    AddSample(script, 3, InfoAt(180, 20, 1500, 5120));
+    AddSample(script, 1, CacheAt(90, 10, 1000, 4096));
+    AddSample(script, 3, CacheAt(180, 20, 1500, 5120));
 
     auto const lines = Lines(Stream(std::move(script), OutputFormat::Tsv, {}, std::nullopt, &CacheFigures));
     REQUIRE(lines.size() == 3);
@@ -514,13 +521,15 @@ TEST_CASE("a piped cache row reports the panel's figures unformatted, absent unt
     CHECK(cell(first, "hit_rate_since_start") == "0.9000");
     CHECK(cell(first, "bytes_used") == "4096");
     CHECK(cell(first, "bytes_limit") == "8192");
-    // A figure INFO does not carry is absent rather than zero.
-    CHECK(cell(first, "items").empty());
+    // A level the reading carries is its number, and a counter it does not carry is absent rather than zero.
+    CHECK(cell(first, "items") == "12");
+    CHECK(cell(first, "conns_per_sec").empty());
 
     // Over two seconds: 90 hits of 100 lookups, and 500 commands.
     CHECK(cell(second, "hit_rate") == "0.9000");
     CHECK(cell(second, "ops_per_sec") == "250.000");
     CHECK(cell(second, "bytes_used") == "5120");
+    CHECK(cell(second, "conns_per_sec").empty());
 }
 
 TEST_CASE("a piped cache header waits for a successful reading and names exactly the tiers it carried",
@@ -557,8 +566,10 @@ TEST_CASE("a piped cache header waits for a successful reading and names exactly
 
     CHECK(CellUnder(header, first, "memory_items") == "10");
     CHECK(CellUnder(header, first, "disk_bytes_used") == "1000");
-    // A reading that does not carry a figure has it absent, never zero.
-    CHECK(CellUnder(header, first, "disk_bytes_limit").empty());
+    // A figure one reading cannot state -- a rate, before a second reading -- is absent, never zero; a tier's
+    // stated limit of zero is a reading, and reads as one.
+    CHECK(CellUnder(header, first, "disk_evictions_per_sec").empty());
+    CHECK(CellUnder(header, first, "disk_bytes_limit") == "0");
     // A tier the header named that a later reading lacks is absent under its heading.
     CHECK(CellUnder(header, second, "memory_items") == "20");
     CHECK(CellUnder(header, second, "disk_items").empty());

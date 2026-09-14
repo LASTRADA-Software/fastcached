@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "DashboardPanels.hpp"
 
-#include <FastCache/Metrics/MetricsCatalog.hpp>
+#include <FastCache/Cache/IStorage.hpp>
+#include <FastCache/Metrics/StatsReading.hpp>
 
 #include <array>
 
@@ -12,33 +13,15 @@ namespace
 {
     using Counter = IMetricsSink::Counter;
 
-    /// A catalogued counter's name in both sources that carry the catalogue.
-    /// @param counter The counter.
-    /// @return Its names; `INFO` carries no catalogue counter.
-    [[nodiscard]] constexpr FieldNames Catalogued(Counter counter) noexcept
-    {
-        auto const name = DescriptorOf(counter)->prometheusName;
-        return FieldNames { .metrics = name, .nodeMetrics = name, .info = {} };
-    }
-
-    /// A series only `/metrics` carries.
-    /// @param name Its name.
-    /// @return Its names.
-    [[nodiscard]] constexpr FieldNames MetricsOnly(std::string_view name) noexcept
-    {
-        return FieldNames { .metrics = name, .nodeMetrics = {}, .info = {} };
-    }
-
     // ---- cache ------------------------------------------------------------------------------
 
-    constexpr auto GetHits =
-        FieldNames { .metrics = "fastcached_get_hits_total", .nodeMetrics = {}, .info = "keyspace_hits" };
-    constexpr auto GetMisses =
-        FieldNames { .metrics = "fastcached_get_misses_total", .nodeMetrics = {}, .info = "keyspace_misses" };
-    constexpr auto CmdGet = MetricsOnly("fastcached_cmd_get_total");
-    constexpr auto CmdSet = MetricsOnly("fastcached_cmd_set_total");
-    constexpr auto BytesUsed = FieldNames { .metrics = "fastcached_bytes_used", .nodeMetrics = {}, .info = "used_memory" };
-    constexpr auto BytesLimit = FieldNames { .metrics = "fastcached_bytes_limit", .nodeMetrics = {}, .info = "maxmemory" };
+    // Every figure names the live model (`StatsReading`), never a series name: see `ReadingField`.
+    constexpr auto GetHits = StorageField<&StorageStats::getHits>();
+    constexpr auto GetMisses = StorageField<&StorageStats::getMisses>();
+    constexpr auto CmdGet = StorageField<&StorageStats::cmdGet>();
+    constexpr auto CmdSet = StorageField<&StorageStats::cmdSet>();
+    constexpr auto BytesUsed = StorageField<&StorageStats::bytesUsed>();
+    constexpr auto BytesLimit = StorageField<&StorageStats::bytesLimit>();
 
     constexpr auto HitRateBeside = std::array {
         BesideFigure { .key = "hit_rate_since_start",
@@ -64,14 +47,14 @@ namespace
     constexpr auto ConnsBeside = std::array {
         BesideFigure { .key = "connections_accepted",
                        .before = "accepted",
-                       .figure = { .field = Catalogued(Counter::ConnectionsTotal), .source = FigureSource::Level },
+                       .figure = { .field = CounterField<Counter::ConnectionsTotal>(), .source = FigureSource::Level },
                        .priority = Priority::Low },
     };
 
     constexpr auto EvictionsBeside = std::array {
         BesideFigure { .key = "evicted_unfetched_per_sec",
                        .before = "evicted unfetched",
-                       .figure = { .field = MetricsOnly("fastcached_evicted_unfetched_total"),
+                       .figure = { .field = StorageField<&StorageStats::evictedUnfetched>(),
                                    .suffix = "/s",
                                    .source = FigureSource::Rate,
                                    .format = FigureFormat::Rate },
@@ -81,7 +64,7 @@ namespace
     constexpr auto ReclaimedBeside = std::array {
         BesideFigure { .key = "expired_unfetched_per_sec",
                        .before = "expired unfetched",
-                       .figure = { .field = MetricsOnly("fastcached_expired_unfetched_total"),
+                       .figure = { .field = StorageField<&StorageStats::expiredUnfetched>(),
                                    .suffix = "/s",
                                    .source = FigureSource::Rate,
                                    .format = FigureFormat::Rate },
@@ -97,25 +80,21 @@ namespace
                               .format = FigureFormat::Percent },
                   .beside = HitRateBeside,
                   .priority = Priority::Essential },
-        // `INFO` has one command total rather than the get/set split, so it stands in for the sum.
         RateRow { .label = "ops/sec",
                   .key = "ops_per_sec",
-                  .figure = { .field = { .metrics = CmdGet.metrics, .nodeMetrics = {}, .info = "total_commands_processed" },
-                              .other = CmdSet,
-                              .source = FigureSource::Rate,
-                              .format = FigureFormat::Rate },
+                  .figure = { .field = CmdGet, .other = CmdSet, .source = FigureSource::Rate, .format = FigureFormat::Rate },
                   .beside = OpsBeside,
                   .priority = Priority::Essential },
         RateRow { .label = "conns/sec",
                   .key = "conns_per_sec",
-                  .figure = { .field = Catalogued(Counter::ConnectionsTotal),
+                  .figure = { .field = CounterField<Counter::ConnectionsTotal>(),
                               .source = FigureSource::Rate,
                               .format = FigureFormat::Rate },
                   .beside = ConnsBeside,
                   .priority = Priority::High },
         RateRow { .label = "evictions/s",
                   .key = "evictions_per_sec",
-                  .figure = { .field = MetricsOnly("fastcached_evictions_total"),
+                  .figure = { .field = StorageField<&StorageStats::evictions>(),
                               .source = FigureSource::Rate,
                               .format = FigureFormat::Rate },
                   .beside = EvictionsBeside,
@@ -124,7 +103,7 @@ namespace
         // found on read is not in it, so calling this row `expired/s` would understate expiry.
         RateRow { .label = "reclaimed/s",
                   .key = "reclaimed_per_sec",
-                  .figure = { .field = Catalogued(Counter::ExpiryKeysReclaimed),
+                  .figure = { .field = CounterField<Counter::ExpiryKeysReclaimed>(),
                               .source = FigureSource::Rate,
                               .format = FigureFormat::Rate },
                   .beside = ReclaimedBeside,
@@ -141,7 +120,7 @@ namespace
                    .priority = Priority::Low },
         LevelRow { .label = "items",
                    .key = "items",
-                   .value = { .field = MetricsOnly("fastcached_items") },
+                   .value = { .field = StorageField<&StorageStats::itemCount>() },
                    .priority = Priority::High },
         // The percentage outlasts the gauge beside it: the gauge is the same fact drawn, the
         // percentage is the fact.
@@ -158,26 +137,26 @@ namespace
     constexpr auto CacheTierColumns = std::array {
         TierColumn { .header = "items",
                      .key = "items",
-                     .figure = { .field = MetricsOnly("fastcached_tier_items") },
+                     .figure = { .field = StorageField<&StorageStats::itemCount>() },
                      .priority = Priority::Essential },
         TierColumn { .header = "used",
                      .key = "bytes_used",
-                     .figure = { .field = MetricsOnly("fastcached_tier_bytes_used"), .format = FigureFormat::Bytes },
+                     .figure = { .field = StorageField<&StorageStats::bytesUsed>(), .format = FigureFormat::Bytes },
                      .priority = Priority::High },
         TierColumn { .header = "limit",
                      .key = "bytes_limit",
-                     .figure = { .field = MetricsOnly("fastcached_tier_bytes_limit"), .format = FigureFormat::Bytes },
+                     .figure = { .field = StorageField<&StorageStats::bytesLimit>(), .format = FigureFormat::Bytes },
                      .priority = Priority::Normal },
         TierColumn { .header = "evict/s",
                      .key = "evictions_per_sec",
-                     .figure = { .field = MetricsOnly("fastcached_tier_evictions_total"),
+                     .figure = { .field = StorageField<&StorageStats::evictions>(),
                                  .source = FigureSource::Rate,
                                  .format = FigureFormat::Rate },
                      .priority = Priority::Low },
         // #175 made visible: a disk tier's key index is RAM no budget covers, so it outlasts evict/s.
         TierColumn { .header = "index (RAM)",
                      .key = "index_bytes",
-                     .figure = { .field = MetricsOnly("fastcached_tier_index_bytes"), .format = FigureFormat::Bytes },
+                     .figure = { .field = StorageField<&StorageStats::indexBytes>(), .format = FigureFormat::Bytes },
                      .priority = Priority::Normal },
     };
 
@@ -210,16 +189,17 @@ namespace
     constexpr auto CompilesBeside = std::array {
         BesideFigure { .key = "compiles_completed",
                        .before = "completed",
-                       .figure = { .field = Catalogued(Counter::WorkerJobsCompleted), .source = FigureSource::Level },
+                       .figure = { .field = CounterField<Counter::WorkerJobsCompleted>(), .source = FigureSource::Level },
                        .priority = Priority::Normal },
     };
 
     /// A refusal counter's rate per minute, as the split under the total writes it.
-    /// @param counter The counter.
+    /// @tparam Row The counter.
     /// @return The figure.
-    [[nodiscard]] constexpr FigureSpec RefusalsPerMinute(Counter counter) noexcept
+    template <Counter Row>
+    [[nodiscard]] constexpr FigureSpec RefusalsPerMinute() noexcept
     {
-        return FigureSpec { .field = Catalogued(counter),
+        return FigureSpec { .field = CounterField<Row>(),
                             .scale = 60.0,
                             .suffix = "/min",
                             .source = FigureSource::Rate,
@@ -227,29 +207,29 @@ namespace
     }
 
     constexpr auto RefusalAddends = std::array {
-        Catalogued(Counter::WorkerJobsRefusedLeaseExpired),
-        Catalogued(Counter::WorkerJobsRefusedUnknownFingerprint),
+        CounterField<Counter::WorkerJobsRefusedLeaseExpired>(),
+        CounterField<Counter::WorkerJobsRefusedUnknownFingerprint>(),
     };
 
     constexpr auto RefusalSplit = std::array {
         BesideFigure { .key = "no_slot_per_min",
                        .before = "no-slot",
-                       .figure = RefusalsPerMinute(Counter::WorkerJobsRefusedNoSlot),
+                       .figure = RefusalsPerMinute<Counter::WorkerJobsRefusedNoSlot>(),
                        .priority = Priority::High },
         BesideFigure { .key = "lease_expired_per_min",
                        .before = "lease-expired",
-                       .figure = RefusalsPerMinute(Counter::WorkerJobsRefusedLeaseExpired),
+                       .figure = RefusalsPerMinute<Counter::WorkerJobsRefusedLeaseExpired>(),
                        .priority = Priority::Normal },
         BesideFigure { .key = "unknown_fingerprint_per_min",
                        .before = "unknown-fingerprint",
-                       .figure = RefusalsPerMinute(Counter::WorkerJobsRefusedUnknownFingerprint),
+                       .figure = RefusalsPerMinute<Counter::WorkerJobsRefusedUnknownFingerprint>(),
                        .priority = Priority::Normal },
     };
 
     constexpr auto NodeRates = std::array {
         RateRow { .label = "compiles/min",
                   .key = "compiles_per_min",
-                  .figure = { .field = Catalogued(Counter::WorkerJobsCompleted),
+                  .figure = { .field = CounterField<Counter::WorkerJobsCompleted>(),
                               .scale = 60.0,
                               .source = FigureSource::Rate,
                               .format = FigureFormat::Rate },
@@ -259,8 +239,8 @@ namespace
         // can be shown, and the row says so where somebody would look for one.
         RateRow { .label = "mean compile",
                   .key = "mean_compile_seconds",
-                  .figure = { .field = Catalogued(Counter::WorkerCompileMillisTotal),
-                              .other = Catalogued(Counter::WorkerJobsCompleted),
+                  .figure = { .field = CounterField<Counter::WorkerCompileMillisTotal>(),
+                              .other = CounterField<Counter::WorkerJobsCompleted>(),
                               .scale = 0.001,
                               .source = FigureSource::RateQuotient,
                               .format = FigureFormat::Seconds },
@@ -272,7 +252,7 @@ namespace
         // is never drawn alone (§4). The total is the three counters' rates added, not a fourth counter.
         RateRow { .label = "refused/min",
                   .key = "refused_per_min",
-                  .figure = { .field = Catalogued(Counter::WorkerJobsRefusedNoSlot),
+                  .figure = { .field = CounterField<Counter::WorkerJobsRefusedNoSlot>(),
                               .scale = 60.0,
                               .addends = RefusalAddends,
                               .source = FigureSource::Rate,
@@ -298,8 +278,8 @@ namespace
     constexpr auto CacheHits = std::array {
         BesideFigure { .key = "cache_hit_rate",
                        .before = "hits",
-                       .figure = { .field = Catalogued(Counter::NodeCacheHits),
-                                   .other = Catalogued(Counter::NodeCacheMisses),
+                       .figure = { .field = CounterField<Counter::NodeCacheHits>(),
+                                   .other = CounterField<Counter::NodeCacheMisses>(),
                                    .source = FigureSource::RateRatio,
                                    .format = FigureFormat::Percent },
                        .priority = Priority::High },
@@ -310,7 +290,7 @@ namespace
     constexpr auto ScratchFree = std::array {
         BesideFigure { .key = "scratch_free_bytes",
                        .before = "scratch free",
-                       .figure = { .field = MetricsOnly("fastcache_node_disk_free_bytes"), .format = FigureFormat::Bytes },
+                       .figure = { .field = HostField<&HostCapacity::diskFreeBytes>(), .format = FigureFormat::Bytes },
                        .priority = Priority::Normal },
     };
     constexpr auto HostCells = std::array { FactCell { .label = "host", .fact = StatusFact::Host, .figures = ScratchFree } };

@@ -7,7 +7,9 @@
 #include "DashboardFrame.hpp"
 
 #include <FastCache/Async/Task.hpp>
+#include <FastCache/Cache/StorageTier.hpp>
 #include <FastCache/Core/Clock.hpp>
+#include <FastCache/Metrics/StatsReading.hpp>
 
 #include <cstddef>
 #include <deque>
@@ -15,6 +17,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <vector>
 
 namespace FastCache::Cli
@@ -60,6 +63,70 @@ struct SeriesPoint
     double value { 0.0 };    ///< The figure, already scaled.
 };
 
+/// Where a figure's number lives in a `StatsReading`: a catalogue counter, a field of the cache's statistics
+/// (the whole cache, or one tier of it), or a field of the machine's capacity.
+///
+/// **A panel names the MODEL, never a series name** (#134, #1399). The live model is the `StatsReading` both
+/// `/metrics` and the `0xFC` snapshot are encoded from, so a panel written against it reads the same figure
+/// whichever encoding carried it, and a source switching encodings changes no panel. Typed member pointers
+/// rather than names: a field that does not exist is a build failure, not a figure that silently reads absent.
+///
+/// Absent where the reading does not carry the block (no cache, no such tier, no host) or the counter (a sink
+/// with no slot for the row): absence stays absence, never zero.
+struct ReadingField
+{
+    /// The number, or nullopt where the reading does not carry it; null for a figure that names no field.
+    /// @param reading The reading.
+    /// @param tier The tier a tier column asks about, or nullopt for the whole cache.
+    std::optional<double> (*read)(StatsReading const& reading, std::optional<StorageTier> tier) noexcept { nullptr };
+
+    /// Whether this names a field at all.
+    /// @return False for the default, which names nothing.
+    [[nodiscard]] constexpr bool Names() const noexcept
+    {
+        return read != nullptr;
+    }
+};
+
+/// The figure a catalogue counter reads.
+/// @tparam Row The counter.
+/// @return The field.
+template <IMetricsSink::Counter Row>
+[[nodiscard]] constexpr ReadingField CounterField() noexcept
+{
+    return ReadingField { .read = [](StatsReading const& reading, std::optional<StorageTier> /*tier*/) noexcept {
+        auto const& value = reading.counters[static_cast<std::size_t>(Row)];
+        return value.has_value() ? std::optional { static_cast<double>(*value) } : std::nullopt;
+    } };
+}
+
+/// The figure one field of the cache's statistics reads: the whole cache's, or one tier's when a tier is asked.
+/// @tparam Member The field.
+/// @return The field.
+template <auto Member>
+    requires std::is_member_object_pointer_v<decltype(Member)>
+[[nodiscard]] constexpr ReadingField StorageField() noexcept
+{
+    return ReadingField { .read = [](StatsReading const& reading, std::optional<StorageTier> tier) noexcept {
+        auto const& stats =
+            tier.has_value() ? reading.snapshot.storageTiers[static_cast<std::size_t>(*tier)] : reading.snapshot.storage;
+        return stats.has_value() ? std::optional { static_cast<double>((*stats).*Member) } : std::nullopt;
+    } };
+}
+
+/// The figure one field of the machine's capacity reads.
+/// @tparam Member The field.
+/// @return The field.
+template <auto Member>
+    requires std::is_member_object_pointer_v<decltype(Member)>
+[[nodiscard]] constexpr ReadingField HostField() noexcept
+{
+    return ReadingField { .read = [](StatsReading const& reading, std::optional<StorageTier> /*tier*/) noexcept {
+        auto const& host = reading.snapshot.host;
+        return host.has_value() ? std::optional { static_cast<double>((*host).*Member) } : std::nullopt;
+    } };
+}
+
 /// One point of the dashboard's sample history: a reading, or the fact that there was none.
 ///
 /// **A failed sample is an entry, not a missing one.** The gap is the information: a history
@@ -70,6 +137,10 @@ struct HistoryEntry
 {
     /// What was read, or nullopt where the sample produced no reading.
     std::optional<Value> reading {};
+
+    /// The reading as the live model, for a `cache` or `node` sample; nullopt for a failure and for a subject
+    /// whose reader produces none. What every panel figure is read from.
+    std::optional<StatsReading> stats {};
 
     /// How long the interval ending at this entry lasted, or nullopt where none was measured.
     ///
@@ -111,6 +182,10 @@ struct DashboardModel
     /// A rate needs two readings and a gap needs to know one is missing, so the previous
     /// reading is model state rather than something a renderer recomputes.
     std::optional<Value> previous {};
+
+    /// The newest reading as the live model, for a `cache` or `node` session; nullopt before one arrives and for
+    /// a subject whose reader produces none. What a title bar reads the version and the uptime from.
+    std::optional<StatsReading> stats {};
 
     /// When `latest` was taken and which source produced it; engaged exactly when `latest` is.
     ///
@@ -191,14 +266,14 @@ struct DashboardModel
 };
 
 /// The number @p reading holds for @p field.
-///
-/// A `Number` cell and a `Text` cell alike, because which kind a figure arrives as depends on the
-/// source that reported it. Named kinds rather than excluded ones, so a kind added later is no
-/// number until somebody says it is. Text that is not a finite number is no number either.
 /// @param reading The reading, or nullopt where there was none.
-/// @param field The field's name.
-/// @return The number, or nullopt.
-[[nodiscard]] std::optional<double> NumberIn(std::optional<Value> const& reading, std::string_view field);
+/// @param field The field.
+/// @param tier The tier a tier column asks about, or nullopt for the whole cache.
+/// @return The number, or nullopt where there was no reading, the field names nothing, or the reading does not
+///         carry it.
+[[nodiscard]] std::optional<double> NumberIn(std::optional<StatsReading> const& reading,
+                                             ReadingField field,
+                                             std::optional<StorageTier> tier = std::nullopt) noexcept;
 
 /// How fast one counter rose over the interval ending at each entry of @p history, per second.
 ///
@@ -217,10 +292,12 @@ struct DashboardModel
 /// behind draws the rate that happened rather than one inflated by how far behind it was.
 ///
 /// @param history The samples, oldest first.
-/// @param field The counter's field name, as the reading spells it.
+/// @param field The counter.
+/// @param tier The tier a tier column asks about, or nullopt for the whole cache.
 /// @return Events per second per entry; nullopt where no rate can be claimed.
 [[nodiscard]] std::vector<std::optional<double>> CounterRateSeries(std::deque<HistoryEntry> const& history,
-                                                                   std::string_view field);
+                                                                   ReadingField field,
+                                                                   std::optional<StorageTier> tier = std::nullopt);
 
 /// Why the loop stopped.
 ///
@@ -258,6 +335,9 @@ struct SampleReading
 
     /// The reading. Meaningful iff `outcome` is `Affirmative`.
     Value value {};
+
+    /// The reading as the live model, for a reader of a `cache` or `node` subject; nullopt otherwise.
+    std::optional<StatsReading> stats {};
 
     /// Which source produced it, by stable name. Meaningful iff `outcome` is `Affirmative`.
     ///
