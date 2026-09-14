@@ -386,9 +386,11 @@
 # Linux when the log is going somewhere journald is not: a foreground run, a
 # redirected file, a CI artefact.
 #
-# Setting it here WINS over the platform default in both directions, including
-# turning it off on macOS.
+# Each key spells its flag, so `true` passes it and `false` passes nothing, which
+# leaves the platform default. To turn timestamps ON set `log_timestamps: true`;
+# to turn them OFF -- including on macOS -- set `no_log_timestamps: true`.
 #log_timestamps: false
+#no_log_timestamps: false
 
 # write the pid here when daemonizing (POSIX)
 #pidfile:

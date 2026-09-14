@@ -593,10 +593,12 @@ struct NodeConfig
     /// never reaches this logger at all. The four-sink table is in
     /// `.agent/rules/platform-service-and-config.md` and is not repeated here.
     ///
-    /// A DEFAULT, so `log_timestamps: false` in a configuration file still wins by
-    /// ordinary precedence. That is the difference between this and having the
-    /// installer append `--log-timestamps`, which sets the explicit bit and would
-    /// silently kill a key the shipped reference configuration documents.
+    /// A DEFAULT, so a configuration file still wins by ordinary precedence. That is the
+    /// difference between this and having the installer append `--log-timestamps`, which
+    /// sets the explicit bit and would silently kill a key the shipped reference
+    /// configuration documents. Each key is its flag: `log_timestamps: true` turns it on,
+    /// `no_log_timestamps: true` turns it off, and `false` on either passes nothing, which
+    /// leaves this default.
     ///
     /// Off elsewhere is not a claim that times do not matter there: a foreground run,
     /// a redirected file and a CI artefact are unstamped on every platform, and a
