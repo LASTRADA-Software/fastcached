@@ -195,7 +195,11 @@ namespace
     /// Columns a level row's label takes, after its indent.
     constexpr auto LevelLabelColumns = std::size_t { 12 };
 
-    /// Columns a level row's reading is right-aligned into, at the least.
+    /// Columns a level row's reading is budgeted when the minimum size is derived.
+    ///
+    /// A budget and not a pad: the reading is written straight after its label, left-aligned, as §3 draws
+    /// `items       1 284 991` and `connected   -  no level is exported`. Right-aligning it into this many
+    /// cells cost the `connected` row its reason at 80 columns (#134 C2, C7).
     constexpr auto LevelFigureColumns = std::size_t { 12 };
 
     /// Cells in a level row's gauge.
@@ -722,14 +726,20 @@ namespace
                                                                            std::span<LevelRow const> rows,
                                                                            std::size_t budget)
     {
+        // The readings start in one column, and it is never narrower than the widest label and a blank: a
+        // left-aligned reading written against its label would read as one word with it.
+        auto labelColumns = LevelLabelColumns;
+        for (auto const& row: rows)
+            labelColumns = std::max(labelColumns, in.cellWidth(row.label) + 1);
+
         auto items = std::vector<Item> {};
         for (auto const& row: rows)
         {
             auto const value = Newest(SeriesFor(in, row.value, {}));
-            auto pieces = std::vector<Piece> { Piece {
-                .text = std::string { Indent } + FitRight(row.label, LevelLabelColumns, in.cellWidth)
-                        + AlignRight(FigureText(in, row.value, value), LevelFigureColumns, in.cellWidth),
-                .priority = Priority::Essential } };
+            auto pieces =
+                std::vector<Piece> { Piece { .text = std::string { Indent } + FitRight(row.label, labelColumns, in.cellWidth)
+                                                     + FigureText(in, row.value, value),
+                                             .priority = Priority::Essential } };
             if (row.limit.has_value())
             {
                 auto const limit = Newest(SeriesFor(in, *row.limit, {}));
