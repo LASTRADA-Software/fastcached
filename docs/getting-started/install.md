@@ -35,7 +35,7 @@ sudo systemctl restart fastcached
 
 `systemctl reload fastcached` applies the reloadable subset — log level,
 memory budget, and the authentication settings — without dropping
-connections. Changing `bind`, `port`, `listeners`, any `storage*` key, or
+connections. Changing `bind`, `port`, `listen`, `listen_tls`, any `storage*` key, or
 `threads` requires a restart; a reload that touches them is rejected and
 the reason is logged.
 
@@ -327,14 +327,14 @@ Clients that cannot be re-pointed keep working: bind their port alongside ours
 rather than instead of it. In `/etc/fastcached/fastcached.yaml`:
 
 ```yaml
-listeners:
-  - address: 127.0.0.1
-    port: 6674
-  - address: 127.0.0.1
-    port: 11211
+listen:
+  - 127.0.0.1:6674
+  - 127.0.0.1:11211
 ```
 
-or on the command line, `--listen=127.0.0.1:6674 --listen=127.0.0.1:11211`.
+or on the command line, `--listen=127.0.0.1:6674 --listen=127.0.0.1:11211` — the
+same `host:port` spelling, because each key is its flag. A TLS endpoint goes under
+`listen_tls:` instead.
 Both ports then speak every protocol, not just their namesake.
 
 The admin HTTP endpoint (`/metrics`, `/healthz`) is separate and defaults to
