@@ -848,6 +848,24 @@ outright rather than drawing with a gap.
   design and a node id may be in the operator's own language. Narrowing either to
   ASCII would be a second restriction nobody announced.
 
+## A live-stats stream is counted by how it ended
+
+A subscription is the one `0xFC` exchange whose ending is not an answer, so its endings are
+the whole diagnosis ([#1399](https://github.com/LASTRADA-Software/fastcached/issues/1399)).
+
+- **Each ending is a row, named for what was OBSERVED.** A goodbye (EOF), a reset, a stall, a
+  revocation and a lost leadership are five different reasons a stream ended. Only the reset
+  and the stall are worth an alert, so folding any two of them hides that. The reset and goodbye
+  arms are proved apart the way the compile surface's are: the FIN case is load-bearing, since
+  counting every departure as a reset passes the RESET case.
+- **A stall is the SURFACE's row and neither sweep row.** On the node the sweeper cuts a parked
+  push in `SweepPhase::Streaming`, which no sweep counter counts. Counted as an answer-deadline
+  sweep, it would read as a request this node failed to answer in time.
+- **The stream's body is the `StatsReading` `/metrics` renders**, through one snapshot provider
+  per process. The daemon's admin server and its `LiveStream` take the same provider, so the
+  stream and the scrape cannot disagree about the cache. A reading in another build's layout is
+  refused by name at the grant, before any snapshot arrives, and refused again per reading.
+
 ## Open work
 
 - **[#592](https://github.com/LASTRADA-Software/fastcached/issues/592)** — whether the
