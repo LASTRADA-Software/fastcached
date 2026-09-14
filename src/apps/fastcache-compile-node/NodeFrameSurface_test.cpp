@@ -185,6 +185,19 @@ class NamedResponder final: public IFrameResponder
         return _progress;
     }
 
+    /// @copydoc IFrameResponder::StreamFor
+    [[nodiscard]] IFrameStream* StreamFor(std::uint8_t /*opRaw*/) noexcept override
+    {
+        return _stream;
+    }
+
+    /// Say which stream this fake answers with, or that it answers none.
+    /// @param stream What `StreamFor` should answer.
+    void SetStream(IFrameStream* stream) noexcept
+    {
+        _stream = stream;
+    }
+
     /// Say how often this fake pulses, or that it does not.
     /// @param interval What `ProgressInterval` should answer.
     void SetProgressInterval(std::optional<std::chrono::milliseconds> interval) noexcept
@@ -244,6 +257,7 @@ class NamedResponder final: public IFrameResponder
     bool _ownBudget { false };
     std::optional<IMetricsSink::Counter> _watchPeer {};
     std::optional<std::chrono::milliseconds> _progress {};
+    IFrameStream* _stream { nullptr };
     std::chrono::milliseconds _requestTimeout { FrameServer::HeaderTimeout };
     // Mutable because the three predicates recording into them are `const`: a
     // predicate that counted how often it was asked would otherwise have to look like

@@ -611,6 +611,8 @@ struct AdminSurface
 /// @param logger Where to announce the bound address.
 /// @return The surface (whose endpoint is null when none was asked for), or why
 ///         it could not be served.
+/// @param credential The dashboard credential, from `LoadDashboardCredentialOrExplain`; a default
+///        one when no token file is named.
 [[nodiscard]] std::expected<AdminSurface, std::string> StartAdminSurfaceOrExplain(
     NodeConfig const& cfg,
     IHostFactsSource const& host,
@@ -618,6 +620,18 @@ struct AdminSurface
     AdminHttpServer::SnapshotProvider snapshot,
     std::optional<Distributed::FleetSources> fleet,
     FleetSampler const* sampler,
+    AdminCredential const& credential,
     ILogger& logger);
+
+/// Read the dashboard credential `--dashboard-token-file` names, once, for every surface that
+/// guards the fleet with it.
+///
+/// **Once, and handed to both**, because two surfaces guard one fleet map with it -- `/fleet` over
+/// HTTP and the fleet subject of a live-stats subscription over `0xFC` -- and two reads of one file
+/// are two answers that can disagree, a few milliseconds apart, about whether the map is guarded.
+/// @param cfg The parsed configuration.
+/// @return The credential -- a default one when no file is named -- or why the file could not be
+///         used. An unreadable file is refused, never read as "no credential".
+[[nodiscard]] std::expected<AdminCredential, std::string> LoadDashboardCredentialOrExplain(NodeConfig const& cfg);
 
 } // namespace FastCache::Node

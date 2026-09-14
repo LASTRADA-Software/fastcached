@@ -620,7 +620,7 @@ TEST_CASE("An admin surface nobody asked for starts nothing at all", "[node][adm
     NodeConfig cfg;
 
     auto surface =
-        Node::StartAdminSurfaceOrExplain(cfg, scrapeHost, metrics, WorkerShapedSnapshot(), std::nullopt, nullptr, logger);
+        Node::StartAdminSurfaceOrExplain(cfg, scrapeHost, metrics, WorkerShapedSnapshot(), std::nullopt, nullptr, AdminCredential {}, logger);
     REQUIRE(surface.has_value());
     CHECK(surface->endpoint == nullptr);
 }
@@ -640,7 +640,7 @@ TEST_CASE("An admin surface reports which flag refused it", "[node][admin][dashb
         cfg.adminListen = "not-a-port";
 
         auto const surface = Node::StartAdminSurfaceOrExplain(
-            cfg, scrapeHost, metrics, WorkerShapedSnapshot(), std::nullopt, nullptr, logger);
+            cfg, scrapeHost, metrics, WorkerShapedSnapshot(), std::nullopt, nullptr, AdminCredential {}, logger);
         REQUIRE_FALSE(surface.has_value());
         CHECK(surface.error().contains("--admin-listen"));
 
@@ -663,14 +663,19 @@ TEST_CASE("An admin surface reports which flag refused it", "[node][admin][dashb
     SECTION("a credential file that cannot be read")
     {
         // The failure that must never degrade to "no credential".
+        // Read once for both surfaces that guard the fleet with it, so the refusal is the loader's.
         Testing::ScratchDirectory const scratch { "admin-surface-token" };
         NodeConfig cfg;
-        cfg.adminListen = "0"; // refused before the token is even reached
         cfg.dashboardTokenFile = (scratch.Path() / "absent").string();
 
-        auto const surface = Node::StartAdminSurfaceOrExplain(
-            cfg, scrapeHost, metrics, WorkerShapedSnapshot(), std::nullopt, nullptr, logger);
-        REQUIRE_FALSE(surface.has_value());
+        auto const credential = Node::LoadDashboardCredentialOrExplain(cfg);
+        REQUIRE_FALSE(credential.has_value());
+        CHECK(credential.error().contains("--dashboard-token-file"));
+
+        // And the control: naming no file is no credential, not a refusal.
+        auto const none = Node::LoadDashboardCredentialOrExplain(NodeConfig {});
+        REQUIRE(none.has_value());
+        CHECK_FALSE(none->Required());
     }
 }
 
@@ -702,7 +707,7 @@ TEST_CASE("An admin surface serves the fleet only when there is a fleet to read"
     SECTION("with no scheduler, /fleet is not a route")
     {
         auto surface = Node::StartAdminSurfaceOrExplain(
-            cfg, scrapeHost, metrics, WorkerShapedSnapshot(), std::nullopt, nullptr, logger);
+            cfg, scrapeHost, metrics, WorkerShapedSnapshot(), std::nullopt, nullptr, AdminCredential {}, logger);
         REQUIRE(surface.has_value());
         REQUIRE(surface->endpoint != nullptr);
         CHECK(surface->endpoint->BoundEndpoint() == std::format("127.0.0.1:{}", port));
@@ -717,6 +722,7 @@ TEST_CASE("An admin surface serves the fleet only when there is a fleet to read"
             WorkerShapedSnapshot(),
             Distributed::FleetSources { .scheduler = &scheduler, .cluster = nullptr, .metrics = &metrics },
             nullptr,
+            AdminCredential {},
             logger);
         REQUIRE(surface.has_value());
         REQUIRE(surface->endpoint != nullptr);
@@ -744,7 +750,7 @@ TEST_CASE("Asking for a generated certificate gives the surface one to serve", "
     cfg.tlsSelfSigned = true;
 
     auto surface =
-        Node::StartAdminSurfaceOrExplain(cfg, scrapeHost, metrics, WorkerShapedSnapshot(), std::nullopt, nullptr, logger);
+        Node::StartAdminSurfaceOrExplain(cfg, scrapeHost, metrics, WorkerShapedSnapshot(), std::nullopt, nullptr, AdminCredential {}, logger);
     REQUIRE(surface.has_value());
     REQUIRE(surface->endpoint != nullptr);
     REQUIRE(surface->tls != nullptr);
@@ -774,7 +780,7 @@ TEST_CASE("A surface with no TLS asked for holds no context at all", "[node][adm
     cfg.adminListen = std::format("127.0.0.1:{}", port);
 
     auto surface =
-        Node::StartAdminSurfaceOrExplain(cfg, scrapeHost, metrics, WorkerShapedSnapshot(), std::nullopt, nullptr, logger);
+        Node::StartAdminSurfaceOrExplain(cfg, scrapeHost, metrics, WorkerShapedSnapshot(), std::nullopt, nullptr, AdminCredential {}, logger);
     REQUIRE(surface.has_value());
     REQUIRE(surface->endpoint != nullptr);
 #if defined(FC_TLS_ENABLED)

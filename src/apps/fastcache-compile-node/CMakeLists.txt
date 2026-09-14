@@ -66,6 +66,8 @@ add_executable(fastcache-compile-node
     CompileCapacity.cpp
     CompileResponder.cpp
     NodeStatusResponder.cpp
+    LiveStatsResponder.cpp
+    LiveStatsSources.cpp
     ${_fc_node_shared}
 )
 target_include_directories(fastcache-compile-node PRIVATE
@@ -149,8 +151,11 @@ if(FASTCACHED_BUILD_TESTS)
         CompileCapacity.cpp
         CompileResponder.cpp
         NodeStatusResponder.cpp
+        LiveStatsResponder.cpp
+        LiveStatsSources.cpp
         CompileResponder_test.cpp
         NodeStatusResponder_test.cpp
+        LiveStatsResponder_test.cpp
         DocumentedCommandLines_test.cpp
         ${_fc_node_shared}
     )
