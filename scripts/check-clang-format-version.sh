@@ -389,11 +389,15 @@ if [ "$Mode" = "self-test" ]; then
     # The resolve cases must not see this host's own formatters, or a machine that has
     # the pinned build installed would answer a case that expects none. So they run with
     # PATH holding only fake formatters and shims for the tools this script calls.
+    # Each shim runs its tool through the PATH this self-test started with, captured into the shim, so no tool is
+    # looked up here. Looking them up with `command -v` read as GUARDING them, which told
+    # `check-unguarded-prerequisites.sh` that sed, cat and the rest are optional -- and every script using them bare
+    # became a finding. They are assumed, as everywhere else; a missing one fails the case that needs it, loudly.
     Tools="$Work/tools"
     mkdir -p "$Tools"
+    OriginalPath="$PATH"
     for tool in sed cat mktemp rm dirname mkdir chmod; do
-        real="$(command -v "$tool" 2>/dev/null)" || { echo "FAIL: self-test needs $tool"; exit "$UsageError"; }
-        printf '#!/bin/sh\nexec "%s" "$@"\n' "$real" > "$Tools/$tool"
+        printf '#!/bin/sh\nPATH="%s" exec %s "$@"\n' "$OriginalPath" "$tool" > "$Tools/$tool"
         chmod +x "$Tools/$tool"
     done
 
