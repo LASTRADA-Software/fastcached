@@ -309,6 +309,8 @@ struct FleetSectionRow
 {
     FleetSection section;     ///< The section this row describes.
     std::string_view key;     ///< What a reader asks for, and the marker in the full document.
+    std::string_view one;     ///< One of its rows, as a count of one names it: `1 machine`.
+    std::string_view many;    ///< Any other count of its rows: `0 machines`, `12 machines`.
     std::string_view summary; ///< One line, for whoever guessed the key wrong.
 
     /// Whether this section is a row TABLE on all three surfaces.
@@ -336,26 +338,38 @@ struct FleetSectionRow
 inline constexpr EnumTable<FleetSection, FleetSectionRow> FleetSectionTable {
     FleetSectionRow { .section = FleetSection::Kpi,
                       .key = "kpi",
+                      .one = "figure",
+                      .many = "figures",
                       .summary = "the headline figures, one row each; the page's strip",
                       .tabular = false },
     FleetSectionRow { .section = FleetSection::Machines,
                       .key = "machines",
+                      .one = "machine",
+                      .many = "machines",
                       .summary = "one row per machine; the grain a fleet total is computed over",
                       .tabular = true },
     FleetSectionRow { .section = FleetSection::Workers,
                       .key = "workers",
+                      .one = "worker",
+                      .many = "workers",
                       .summary = "one row per (toolchain, endpoint) registry entry",
                       .tabular = true },
     FleetSectionRow { .section = FleetSection::Leases,
                       .key = "leases",
+                      .one = "lease",
+                      .many = "leases",
                       .summary = "the oldest outstanding leases, bounded as the page bounds them",
                       .tabular = true },
     FleetSectionRow { .section = FleetSection::Members,
                       .key = "members",
+                      .one = "member",
+                      .many = "members",
                       .summary = "what the cluster has agreed; absent when this node runs none",
                       .tabular = true },
     FleetSectionRow { .section = FleetSection::Tiers,
                       .key = "tiers",
+                      .one = "tier",
+                      .many = "tiers",
                       .summary = "per-tier cache figures, for the tiers some member runs",
                       .tabular = true },
 };
