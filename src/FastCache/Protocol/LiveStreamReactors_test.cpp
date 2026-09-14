@@ -380,6 +380,17 @@ struct Decoded
     }));
 }
 
+/// Wait on the real clock until @p predicate holds or @p bound passes.
+/// @return How long it waited, and whether it held.
+template <typename Predicate>
+[[nodiscard]] std::pair<std::chrono::milliseconds, bool> WaitFor(std::chrono::milliseconds bound, Predicate predicate)
+{
+    auto const start = std::chrono::steady_clock::now();
+    while (!predicate() && std::chrono::steady_clock::now() - start < bound)
+        std::this_thread::sleep_for(10ms);
+    return { std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start), predicate() };
+}
+
 /// Two subscribers of one stream, each on its own real reactor, and a heartbeat on each.
 ///
 /// Declared so that everything a parked frame touches outlives the reactors that free it: the
@@ -443,10 +454,7 @@ struct TwoReactorRig
                 return !started.at(index) || ended.at(index).returned.load();
             });
         };
-        auto const deadline = std::chrono::steady_clock::now() + bound;
-        while (!all() && std::chrono::steady_clock::now() < deadline)
-            std::this_thread::sleep_for(5ms);
-        return all();
+        return WaitFor(bound, all).second;
     }
 
     AtomicMetricsSink metrics;
@@ -460,17 +468,6 @@ struct TwoReactorRig
     std::array<std::unique_ptr<RecordingSink>, 2> sinks {};
     std::array<ReactorThread, 2> reactors {}; ///< Last: stopped and joined before anything above goes.
 };
-
-/// Wait on the real clock until @p predicate holds or @p bound passes.
-/// @return How long it waited, and whether it held.
-template <typename Predicate>
-[[nodiscard]] std::pair<std::chrono::milliseconds, bool> WaitFor(std::chrono::milliseconds bound, Predicate predicate)
-{
-    auto const start = std::chrono::steady_clock::now();
-    while (!predicate() && std::chrono::steady_clock::now() - start < bound)
-        std::this_thread::sleep_for(10ms);
-    return { std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start), predicate() };
-}
 
 } // namespace
 
