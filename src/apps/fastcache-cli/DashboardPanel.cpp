@@ -509,7 +509,7 @@ namespace
                                                                             CellWidth cellWidth)
     {
         auto order = std::vector<std::size_t>(pieces.size());
-        std::ranges::iota(order, std::size_t { 0 });
+        Ranges::Iota(order, std::size_t { 0 });
         std::ranges::stable_sort(
             order, {}, [&pieces](std::size_t index) { return std::to_underlying(pieces[index].priority); });
 

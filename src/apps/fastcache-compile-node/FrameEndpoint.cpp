@@ -8,6 +8,7 @@
 #include <FastCache/Async/SleepUntil.hpp>
 #include <FastCache/Core/BoundedDrain.hpp>
 #include <FastCache/Core/HostPort.hpp>
+#include <FastCache/Core/Ranges.hpp>
 #include <FastCache/Net/PlatformListener.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 #include <FastCache/Protocol/Framing/LineReader.hpp>
@@ -179,7 +180,7 @@ struct SweepTally
     /// @return How many connections were swept in total, closed and deferred alike.
     [[nodiscard]] std::size_t Total() const noexcept
     {
-        return std::ranges::fold_left(swept, std::size_t { 0 }, std::plus {});
+        return Ranges::FoldLeft(swept, std::size_t { 0 }, std::plus {});
     }
 };
 
