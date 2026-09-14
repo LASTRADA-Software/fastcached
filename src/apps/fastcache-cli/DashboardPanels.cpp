@@ -395,6 +395,7 @@ namespace
                                           .tierPriority = Priority::Normal,
                                           .tierNotePriority = Priority::Low,
                                           .sourcePriority = Priority::High,
+                                          .fillsHeight = true,
                                           .titleFacts = NodeTitle,
                                           .facts = NodeFacts,
                                           .charts = NodeCharts };

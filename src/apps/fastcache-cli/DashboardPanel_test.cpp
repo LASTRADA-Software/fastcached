@@ -2928,7 +2928,7 @@ TEST_CASE("a node panel at 80x24 draws no history chart, and one with rows to sp
     for (auto const index: std::views::iota(std::size_t { 1 }, chart.bands.size()))
         CHECK(chart.bands[index] - chart.bands[index - 1] == height);
     CHECK(chart.axis == chart.bands.back() + height);
-    CHECK(Inside(lines.at(chart.axis + 1)).ends_with("blank: unread"));
+    CHECK(Inside(lines.at(chart.axis + 1)).ends_with("blank: no reading"));
     CHECK(lines.size() <= 40);
     // Every band's first row says what its top stands for, since a bar's height means nothing without it.
     for (auto const band: chart.bands)
@@ -2989,6 +2989,26 @@ TEST_CASE("a taller node terminal grows taller bands, and a wider one a longer s
     CHECK(smallTitle.starts_with("history, last "));
     CHECK(largeTitle.starts_with("history, last "));
     CHECK(smallTitle != largeTitle);
+}
+
+TEST_CASE("a node frame is as tall as the terminal, its source line on the last row", "[cli][dashboard][panel][node][chart]")
+{
+    // #134: a box that ends above the bottom of the screen reads as one that stopped drawing, and a chart's bands are
+    // whole rows each, so the rows they leave over are padded above the source line rather than left under the box.
+    // WHAT DISTINGUISHES: at every height the frame has exactly as many lines as the terminal, with the bottom edge
+    // last and the source line right above it -- a panel that did not fill its height draws fewer.
+    auto const history = NodeHistory(24, 18, 20);
+    for (auto const& [columns, rows]:
+         { std::pair { 80, 24 }, std::pair { 120, 40 }, std::pair { 200, 60 }, std::pair { 120, 43 } })
+    {
+        INFO("size " << columns << "x" << rows);
+        auto lines = Lines(NodeHistoryFrame(history, columns, rows));
+        if (!lines.empty() && lines.back().empty())
+            lines.pop_back();
+        REQUIRE(lines.size() == static_cast<std::size_t>(rows));
+        CHECK(lines.back().starts_with("\xe2\x94\x94")); // the bottom-left corner
+        CHECK(Inside(lines[lines.size() - 2]).starts_with("source"));
+    }
 }
 
 TEST_CASE("a node's history chart grows band by band in the table's order", "[cli][dashboard][panel][node][chart]")
@@ -3679,7 +3699,7 @@ TEST_CASE("the fleet chart explains itself: its figure and span, each machine's 
         Trimmed(
             Columns(legend, scale.column - 1 + scale.cellsWide, FakeCellWidth(legend) - 1 - scale.cellsWide - scale.column))
             .starts_with(figure(1000)));
-    CHECK(legend.contains(std::format("bar: {}, grey: to {}, blank: unread", metric.key, figure(1000))));
+    CHECK(legend.contains(std::format("bar: {}, grey: to {}, blank: no reading", metric.key, figure(1000))));
 }
 
 TEST_CASE("before any machine reports the chart's figure, the chart says so and draws no image",
