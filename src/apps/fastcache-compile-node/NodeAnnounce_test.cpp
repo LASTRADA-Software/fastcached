@@ -9,6 +9,7 @@
 // target (#909), so the rule *replacing the served set retires what left it* could
 // only be checked by reading, at two call sites that must not diverge. This file is
 // what the extraction bought.
+#include "EndpointDialerTestUtils.hpp"
 #include "NodeAnnounce.hpp"
 
 #include <FastCache/Core/Clock.hpp>
@@ -27,6 +28,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -259,8 +261,26 @@ struct AnnounceFixture
 
     AnnounceFixture()
     {
-        cfg.scheduler = "scheduler.example:6676";
+        cfg.schedulers = { "scheduler.example:6676" };
         registrars.push_back(Registrar(notice, "gcc-14"));
+    }
+
+    /// The round production builds, over this fixture's collaborators.
+    /// @return The round.
+    [[nodiscard]] HeartbeatRound Round()
+    {
+        return HeartbeatRound { .cfg = cfg,
+                                .registrars = registrars,
+                                .withdrawals = withdrawals,
+                                .capacity = capacity,
+                                .loadSampler = loadSampler,
+                                .cacheTier = nullptr,
+                                .metrics = metrics,
+                                .sampler = sampler,
+                                .credential = credential,
+                                .lease = lease,
+                                .fleetMismatch = fleetMismatch,
+                                .logger = logger };
     }
 
     /// Announce once to a scheduler answering @p replies.
@@ -268,23 +288,44 @@ struct AnnounceFixture
     /// @return Every request the round sent.
     [[nodiscard]] std::vector<std::pair<std::uint8_t, std::vector<std::byte>>> AnnounceTo(std::vector<std::byte> replies)
     {
-        HeartbeatRound const round { .cfg = cfg,
-                                     .registrars = registrars,
-                                     .withdrawals = withdrawals,
-                                     .capacity = capacity,
-                                     .loadSampler = loadSampler,
-                                     .cacheTier = nullptr,
-                                     .metrics = metrics,
-                                     .sampler = sampler,
-                                     .credential = credential,
-                                     .lease = lease,
-                                     .fleetMismatch = fleetMismatch,
-                                     .logger = logger };
         Testing::ScriptedSocket scheduler { std::move(replies) };
-        (void) AnnounceOnce(round, scheduler, cfg.scheduler);
+        (void) AnnounceOnce(Round(), scheduler, cfg.schedulers.front());
         return FramesIn(scheduler.Sent());
     }
 };
+
+/// A HEARTBEAT the scheduler accepted.
+/// @return The reply bytes.
+[[nodiscard]] std::vector<std::byte> HeartbeatOk()
+{
+    return Wire::EncodeReply(Wire::Status::Ok, std::vector<std::byte> {});
+}
+
+/// A `NotLeader` refusal naming @p leader.
+/// @param leader Where the refusing scheduler says the leader is.
+/// @return The reply bytes.
+[[nodiscard]] std::vector<std::byte> NotLeaderNaming(std::string_view leader)
+{
+    return Wire::EncodeErrorReply(Wire::ErrorCode::NotLeader, leader);
+}
+
+/// The op of every frame sent on dial @p index.
+/// @param dialer The dialer the round used.
+/// @param index Which dial.
+/// @return One op byte per frame, in order.
+[[nodiscard]] std::vector<std::uint8_t> OpsSentOn(Testing::ScriptedDialer const& dialer, std::size_t index)
+{
+    std::vector<std::uint8_t> ops;
+    for (auto const& frame: FramesIn(dialer.SentOn(index)))
+        ops.push_back(frame.first);
+    return ops;
+}
+
+constexpr std::string_view FirstScheduler = "scheduler-a.example:6676";
+constexpr std::string_view SecondScheduler = "scheduler-b.example:6676";
+constexpr std::string_view NamedLeader = "10.0.0.7:6676";
+constexpr auto RegisterOp = static_cast<std::uint8_t>(Wire::Op::Register);
+constexpr auto HeartbeatOp = static_cast<std::uint8_t>(Wire::Op::Heartbeat);
 
 /// Whether @p frame is a HEARTBEAT whose load says cordoned.
 /// @param frame An op byte and its payload.
@@ -347,4 +388,97 @@ TEST_CASE("A cordoned worker that has just registered says so at once, and a ser
         REQUIRE(sent.size() == 1);
         CHECK(sent[0].first == static_cast<std::uint8_t>(Wire::Op::Register));
     }
+}
+
+TEST_CASE("A heartbeat round whose first scheduler is unreachable registers with the second, in the same round",
+          "[node][announce][fallback]")
+{
+    // #1310's discrimination, at the seam production dials through. One `--scheduler`
+    // value always worked, so a round whose first entry answers proves nothing about a
+    // list: the first dial FAILS here, and the case asserts which endpoint then took the
+    // registration, and that it was the same round rather than the next one.
+    AnnounceFixture fix;
+    fix.cfg.schedulers = { std::string { FirstScheduler }, std::string { SecondScheduler } };
+    SchedulerLink link { fix.cfg.schedulers };
+
+    SECTION("the first is unreachable: the second is dialled and registers the worker")
+    {
+        Testing::ScriptedDialer dialer { { {}, RegisterOk("w-7"), HeartbeatOk() } };
+
+        CHECK(AnnounceRound(fix.Round(), link, dialer) == 1);
+        REQUIRE(dialer.Dialed()
+                == std::vector<std::string> { std::string { FirstScheduler }, std::string { SecondScheduler } });
+        CHECK(dialer.SentOn(0).empty());
+        CHECK(OpsSentOn(dialer, 1) == std::vector<std::uint8_t> { RegisterOp });
+        CHECK(fix.registrars.front().WorkerId() == "w-7");
+
+        // And the next round opens where the registration landed, rather than paying the
+        // dead first entry's connect timeout on every heartbeat.
+        CHECK(AnnounceRound(fix.Round(), link, dialer) == 1);
+        CHECK(dialer.Dialed().back() == SecondScheduler);
+        CHECK(OpsSentOn(dialer, 2) == std::vector<std::uint8_t> { HeartbeatOp });
+    }
+
+    SECTION("control: a first scheduler that answers is the only one dialled")
+    {
+        // A round that dialled every entry, or always the last, would pass the section
+        // above; it cannot pass this one.
+        Testing::ScriptedDialer dialer { { RegisterOk("w-7") } };
+
+        CHECK(AnnounceRound(fix.Round(), link, dialer) == 1);
+        CHECK(dialer.Dialed() == std::vector<std::string> { std::string { FirstScheduler } });
+        CHECK(OpsSentOn(dialer, 0) == std::vector<std::uint8_t> { RegisterOp });
+    }
+
+    SECTION("every configured scheduler unreachable: the round gives up after one dial each")
+    {
+        Testing::ScriptedDialer dialer { { {}, {} } };
+
+        CHECK(AnnounceRound(fix.Round(), link, dialer) == 0);
+        CHECK(dialer.Dialed().size() == 2);
+    }
+}
+
+TEST_CASE("A NotLeader is followed to the endpoint it names, not to the next configured scheduler",
+          "[node][announce][fallback]")
+{
+    // #1310 acceptance 4. A redirect is an instruction, and a list that started being
+    // consulted for it would dial `SecondScheduler` here and register with a follower
+    // that refuses every verb.
+    AnnounceFixture fix;
+    fix.cfg.schedulers = { std::string { FirstScheduler }, std::string { SecondScheduler } };
+    SchedulerLink link { fix.cfg.schedulers };
+    Testing::ScriptedDialer dialer { { NotLeaderNaming(NamedLeader), RegisterOk("w-7") } };
+
+    CHECK(AnnounceRound(fix.Round(), link, dialer) == 1);
+    CHECK(dialer.Dialed() == std::vector<std::string> { std::string { FirstScheduler }, std::string { NamedLeader } });
+    CHECK(OpsSentOn(dialer, 1) == std::vector<std::uint8_t> { RegisterOp });
+}
+
+TEST_CASE("A worker whose remembered leader stops answering falls back through the configured schedulers in that round",
+          "[node][announce][fallback]")
+{
+    // #1310 acceptance 4, second half: forgetting the leader reaches the configured SET,
+    // in the SAME round -- past a first entry that is itself unreachable.
+    AnnounceFixture fix;
+    fix.cfg.schedulers = { std::string { FirstScheduler }, std::string { SecondScheduler } };
+    SchedulerLink link { fix.cfg.schedulers };
+    Testing::ScriptedDialer dialer { {
+        NotLeaderNaming(NamedLeader),
+        RegisterOk("w-7"), // round one: the leader takes the registration and is remembered
+        {},                // round two: the remembered leader is gone...
+        {},                // ...and so is the first configured scheduler...
+        HeartbeatOk(),     // ...and the second answers
+    } };
+
+    REQUIRE(AnnounceRound(fix.Round(), link, dialer) == 1);
+
+    CHECK(AnnounceRound(fix.Round(), link, dialer) == 1);
+    CHECK(dialer.Dialed()
+          == std::vector<std::string> { std::string { FirstScheduler },
+                                        std::string { NamedLeader },
+                                        std::string { NamedLeader },
+                                        std::string { FirstScheduler },
+                                        std::string { SecondScheduler } });
+    CHECK(OpsSentOn(dialer, 4) == std::vector<std::uint8_t> { HeartbeatOp });
 }

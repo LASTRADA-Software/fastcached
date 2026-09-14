@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include "EndpointDialer.hpp"
 #include "NodeConfig.hpp"
 #include "NodeCredential.hpp"
 
@@ -45,10 +46,7 @@ namespace FastCache::Node
 /// Put one cluster-administration request to an already-connected scheduler.
 ///
 /// Split out of `RunClusterAdmin` so that the step which PRESENTS A CREDENTIAL can
-/// be driven against a scripted socket. The dial cannot: `RunClusterAdmin` takes a
-/// `BlockingConnector` by type on purpose -- that is what keeps "this legitimately
-/// blocks" checkable rather than a comment -- so a test reaching through it would
-/// need a listening port to say anything about the bytes that went out.
+/// be driven against a scripted socket without composing a dial around it.
 ///
 /// The credential arrives as the seam rather than as a value for the reason every
 /// other site takes it that way (#404). This verb runs once and exits, so nothing can
@@ -67,18 +65,24 @@ namespace FastCache::Node
                                                                         ICredentialSource const& credential,
                                                                         std::string_view scheduler);
 
-/// Carry out one cluster-administration request against `cfg.scheduler`.
+/// Carry out one cluster-administration request against `cfg.schedulers`.
 ///
 /// The one impure step: connect, exchange, interpret. Everything it decides lives in
 /// the functions above, which is what lets `main.cpp` -- in no test target -- hold
 /// nothing but the call.
+///
+/// Asks the FIRST configured scheduler that connects (`DialFirstReachable`), and no
+/// further: a connection that fails mid-exchange is reported, never retried elsewhere,
+/// because `--cluster-admit` may already have been proposed where it landed (#1310).
 /// @param cfg Where the scheduler is.
 /// @param request What to ask.
 /// @param credential What to present. A `FixedCredential` in production, because
 ///        these verbs run before any reloader exists and return without serving.
+/// @param dialer How each endpoint is reached; production never varies it.
 /// @return What to print, or what went wrong.
 [[nodiscard]] std::expected<std::string, std::string> RunClusterAdmin(NodeConfig const& cfg,
                                                                       ClusterRequest const& request,
-                                                                      ICredentialSource const& credential);
+                                                                      ICredentialSource const& credential,
+                                                                      IEndpointDialer& dialer = DefaultOneShotDialer());
 
 } // namespace FastCache::Node

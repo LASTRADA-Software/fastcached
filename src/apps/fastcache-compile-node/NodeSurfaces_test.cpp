@@ -39,7 +39,7 @@ namespace
     NodeConfig cfg;
     cfg.serveScheduler = true;
     cfg.nodeListen = "0.0.0.0:6675";
-    cfg.scheduler = "127.0.0.1:6675";
+    cfg.schedulers = { "127.0.0.1:6675" };
     cfg.advertise = "scheduler.internal:6675";
     cfg.fleetMembers = { "worker-01.internal" };
     cfg.toolchains = { "/usr/bin/g++" };

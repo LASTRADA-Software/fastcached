@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "ClusterAdminCli.hpp"
+#include "EndpointDialerTestUtils.hpp"
 
 #include <FastCache/Cli/Options.hpp>
 #include <FastCache/Core/Clock.hpp>
@@ -583,4 +584,65 @@ TEST_CASE("The other two cluster verbs still report exactly as they did", "[node
 
     // The same empty body that satisfies those two is refused for an admission.
     CHECK_FALSE(InterpretClusterReply(ClusterAction::Admit, {}).has_value());
+}
+
+TEST_CASE("A cluster command asks the next --scheduler when the first cannot be reached, and only then",
+          "[node][clusteradmin][fallback]")
+{
+    // #1310. The reply is the real protocol's answer to a status request, so what is
+    // asserted beyond the dials is that the SECOND endpoint's answer is what the operator
+    // is shown.
+    Fixture fixture;
+    FakeCluster cluster;
+    cluster.state = Agreed();
+    fixture.service.AdministerWith(cluster);
+    auto const answer = fixture.Ask(Ask(ClusterAction::Status));
+    REQUIRE(StatusOf(answer) == Wire::Status::Ok);
+
+    NodeConfig cfg;
+    cfg.schedulers = { "sched-a.internal:6675", "sched-b.internal:6675" };
+    ConfiguredCredential const credential { cfg, nullptr };
+
+    SECTION("the first is unreachable: the second is asked and its answer rendered")
+    {
+        Testing::ScriptedDialer dialer { { {}, answer } };
+
+        auto const rendered = RunClusterAdmin(cfg, Ask(ClusterAction::Status), credential, dialer);
+
+        INFO("result: " << rendered.value_or(rendered.error_or("")));
+        REQUIRE(rendered.has_value());
+        CHECK(rendered->contains("10.0.0.1:6675"));
+        CHECK(dialer.Dialed() == std::vector<std::string> { "sched-a.internal:6675", "sched-b.internal:6675" });
+        CHECK(dialer.SentOn(0).empty());
+        CHECK_FALSE(dialer.SentOn(1).empty());
+    }
+
+    SECTION("control: a first that answers is the only one asked")
+    {
+        Testing::ScriptedDialer dialer { { answer } };
+
+        REQUIRE(RunClusterAdmin(cfg, Ask(ClusterAction::Status), credential, dialer).has_value());
+        CHECK(dialer.Dialed() == std::vector<std::string> { "sched-a.internal:6675" });
+    }
+
+    SECTION("a first that connects and then fails is reported, never retried elsewhere")
+    {
+        // `--cluster-admit` may already have been proposed where it landed.
+        Testing::ScriptedDialer dialer { { std::vector<std::byte> { std::byte { 0xFF } } } };
+
+        auto const admitted = RunClusterAdmin(cfg, Ask(ClusterAction::Admit, "n4", "10.0.0.4:6680"), credential, dialer);
+
+        REQUIRE_FALSE(admitted.has_value());
+        CHECK(dialer.Dialed() == std::vector<std::string> { "sched-a.internal:6675" });
+    }
+
+    SECTION("none reachable: the refusal names every scheduler it tried")
+    {
+        Testing::ScriptedDialer dialer { { {}, {} } };
+
+        auto const refused = RunClusterAdmin(cfg, Ask(ClusterAction::Status), credential, dialer);
+
+        REQUIRE_FALSE(refused.has_value());
+        CHECK(refused.error().contains("sched-a.internal:6675, sched-b.internal:6675"));
+    }
 }

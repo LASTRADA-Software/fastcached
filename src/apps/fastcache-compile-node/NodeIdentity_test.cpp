@@ -27,7 +27,7 @@ namespace
 [[nodiscard]] NodeConfig ClusteredNode(std::filesystem::path const& dir)
 {
     NodeConfig cfg;
-    cfg.scheduler = "127.0.0.1:6674";
+    cfg.schedulers = { "127.0.0.1:6674" };
     cfg.raftListen = "6680";
     cfg.raftSelf = "10.0.0.7";
     cfg.clusterDir = dir;
@@ -292,7 +292,7 @@ TEST_CASE("A consensus node that names itself neither way is refused", "[node][i
     //
     // Both directions: `--raft-self` satisfies it, and its absence does not.
     NodeConfig neither;
-    neither.scheduler = "127.0.0.1:6674";
+    neither.schedulers = { "127.0.0.1:6674" };
     neither.raftListen = "6680";
     auto const refusal = StartupPolicyRejection(neither);
     REQUIRE(refusal.has_value());
@@ -309,7 +309,7 @@ TEST_CASE("A --raft-self that CONTRADICTS a --raft-peer for this node is refused
     // `--raft-self` exists for the node whose identity was derived; an operator who
     // typed the id has already said where this node answers.
     NodeConfig both;
-    both.scheduler = "127.0.0.1:6674";
+    both.schedulers = { "127.0.0.1:6674" };
     both.raftListen = "6680";
     both.nodeId = "n1";
     both.raftPeers = { Unwrap(Cluster::ParseMemberSpec("n1=10.0.0.4:6680")) };
@@ -369,7 +369,7 @@ TEST_CASE("A --raft-self without a consensus port is refused", "[node][identity]
     // `--listen-raft` there is nothing to pair the host with -- and no consensus for
     // the pair to name a member of.
     NodeConfig cfg;
-    cfg.scheduler = "127.0.0.1:6674";
+    cfg.schedulers = { "127.0.0.1:6674" };
     cfg.raftSelf = "10.0.0.7";
 
     auto const refusal = StartupPolicyRejection(cfg);
@@ -386,7 +386,7 @@ TEST_CASE("An invocation that only asks a question mints nothing", "[node][ident
     // them is entitled to leave state behind.
     auto const clustered = [] {
         NodeConfig cfg;
-        cfg.scheduler = "127.0.0.1:6674";
+        cfg.schedulers = { "127.0.0.1:6674" };
         cfg.raftListen = "6680";
         cfg.raftSelf = "10.0.0.7";
         return cfg;
@@ -416,7 +416,7 @@ TEST_CASE("An invocation that only asks a question mints nothing", "[node][ident
 
     // And a node running no consensus has no identity to keep.
     NodeConfig lone;
-    lone.scheduler = "127.0.0.1:6674";
+    lone.schedulers = { "127.0.0.1:6674" };
     CHECK(NodeIdentityNeed(lone) == IdentityNeed::None);
 }
 
@@ -431,7 +431,6 @@ TEST_CASE("A service registration bakes in the resolved identity", "[node][ident
 
     auto cfg = ClusteredNode(scratch.Path());
     cfg.advertise = "10.0.0.7:6674";
-    cfg.schedulerExplicit = true;
     cfg.advertiseExplicit = true;
     cfg.raftListenExplicit = true;
     cfg.raftSelfExplicit = true;

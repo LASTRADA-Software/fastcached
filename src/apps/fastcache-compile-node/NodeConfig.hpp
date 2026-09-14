@@ -121,7 +121,15 @@ struct EnrollCommand
 
 struct NodeConfig
 {
-    std::string scheduler; ///< host:port of the scheduler's dispatch endpoint.
+    /// host:port of the scheduler's dispatch endpoint, repeatable, in the order tried.
+    ///
+    /// A LIST because a registration replays its command line forever (#1310): one
+    /// value is one machine's address baked into every unit file of the fleet, and
+    /// retiring that machine then means re-registering every service. Several values
+    /// are fallbacks for REACHING the fleet, never several fleets -- the heartbeat walks
+    /// them in one round until one answers, and a `NotLeader` from any of them is
+    /// followed to the endpoint it names without consulting this list.
+    std::vector<std::string> schedulers;
     std::string advertise; ///< host:port clients should reach this worker on.
 
     /// fingerprint=compilerPath, repeatable. An OVERRIDE: naming any pins this
@@ -642,7 +650,6 @@ struct NodeConfig
     /// Set only by the ARGV parse: `--install-service` builds its spec from
     /// `cliOnly`, so a key in a config file never reaches these and never gets baked
     /// into a unit that would then outrank the file it came from.
-    bool schedulerExplicit { false };
     bool advertiseExplicit { false };
     bool slotsExplicit { false };
     bool nodeClassExplicit { false };

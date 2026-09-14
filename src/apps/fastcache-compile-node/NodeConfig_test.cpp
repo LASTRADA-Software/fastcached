@@ -86,7 +86,7 @@ constexpr std::string_view SelfScheduler = "127.0.0.1:6675";
 [[nodiscard]] NodeConfig Installable()
 {
     NodeConfig cfg;
-    cfg.scheduler = "cache.internal:6675";
+    cfg.schedulers = { "cache.internal:6675" };
     // BOTH halves, because since #290 stage 3 one without the other is not an
     // installable worker. `--advertise` alone leaves `--listen-node` on its loopback
     // default, so the node would tell peers to dial an address it never accepts on --
@@ -109,7 +109,6 @@ constexpr std::string_view SelfScheduler = "127.0.0.1:6675";
     // (#286), so cases that care set it themselves and say why. A fixture turning it
     // on for everybody would change what those cases are testing without their
     // authors ever seeing it.
-    cfg.schedulerExplicit = true;
     cfg.advertiseExplicit = true;
     return cfg;
 }
@@ -381,7 +380,7 @@ TEST_CASE("NodeConfig: every flag that is worker state reaches the supervisor", 
 
     // A configuration in which no field holds its default, so every emitter fires.
     NodeConfig cfg;
-    cfg.scheduler = "cache.internal:6675";
+    cfg.schedulers = { "cache.internal:6675" };
     cfg.advertise = "worker-01.internal:6674";
     cfg.nodeListen = "0.0.0.0:6674";
     cfg.toolchains = { "/usr/bin/g++", "abc123=/usr/bin/clang++" };
@@ -515,6 +514,41 @@ TEST_CASE("NodeConfig: every toolchain is re-emitted", "[node][service]")
         INFO("toolchain: " << toolchain);
         CHECK(std::ranges::contains(spec.arguments, std::format("--toolchain={}", toolchain)));
     }
+}
+
+TEST_CASE("NodeConfig: several --scheduler values are kept in order, and a registration carries every one",
+          "[node][service]")
+{
+    // #1310. A registration replays its command line forever, so one that carried the
+    // FIRST of three schedulers is the single point of re-provisioning the list exists
+    // to remove -- and it would look right on every machine until that first one is
+    // retired. Asserted as the whole ordered list at each step: parsed, emitted, and
+    // re-read by this binary's own parser the way the service reads it at a start.
+    auto const parsed = ParseNodeArgv(
+        { "--scheduler=sched-a.internal:6675", "--scheduler=sched-b.internal:6675", "--scheduler=10.0.0.9:6675" });
+    REQUIRE(parsed.has_value());
+    auto const expected = std::vector<std::string> { "sched-a.internal:6675", "sched-b.internal:6675", "10.0.0.9:6675" };
+    CHECK(parsed->schedulers == expected);
+
+    auto cfg = Installable();
+    cfg.schedulers = parsed->schedulers;
+    auto const spec = MakeNodeServiceSpec(std::filesystem::path { "fastcache-compile-node" }, cfg);
+
+    std::vector<std::string> emitted;
+    for (auto const& argument: spec.arguments)
+        if (argument.starts_with("--scheduler="))
+            emitted.push_back(argument);
+    CHECK(emitted
+          == std::vector<std::string> {
+              "--scheduler=sched-a.internal:6675", "--scheduler=sched-b.internal:6675", "--scheduler=10.0.0.9:6675" });
+
+    auto const reparsed = ReparseSpec(spec);
+    REQUIRE(reparsed.has_value());
+    CHECK(reparsed->schedulers == expected);
+
+    // And an install of that list is not refused for being a list: every rule that
+    // judges `--scheduler` judges each value.
+    CHECK_FALSE(NodeInstallRejection(cfg).has_value());
 }
 
 TEST_CASE("NodeConfig: a node with no cluster key file serves no enrollment window", "[node][config]")
@@ -704,7 +738,7 @@ TEST_CASE("NodeConfig: a registration that could not work is refused", "[node][s
     CHECK(!NodeServiceRejection(Installable()).has_value());
 
     auto noScheduler = Installable();
-    noScheduler.scheduler.clear();
+    noScheduler.schedulers.clear();
     CHECK(NodeServiceRejection(noScheduler).has_value());
 
     // No toolchain is NOT one of them any more, and that reversal is the point of
@@ -1234,7 +1268,7 @@ TEST_CASE("NodeConfig: the packaged socket-activated worker starts", "[node][pol
     // is why this case is written from the workflow's own bytes rather than from a
     // shape that seemed representative.
     NodeConfig packaged;
-    packaged.scheduler = "127.0.0.1:6675";
+    packaged.schedulers = { "127.0.0.1:6675" };
     packaged.advertise = "127.0.0.1:6676";
     packaged.toolchains = { "/usr/bin/g++" };
     // `nodeListen` keeps its default AND `nodeListenExplicit` stays false -- which is
@@ -1269,7 +1303,7 @@ TEST_CASE("NodeConfig: --advertise naming this machine at a port it does not ser
     // the fixtures below are the same shapes.
     auto const worker = [] {
         NodeConfig cfg;
-        cfg.scheduler = std::string { SchedulerEndpoint };
+        cfg.schedulers = { std::string { SchedulerEndpoint } };
         cfg.toolchains = { "/usr/bin/g++" };
         cfg.nodeListen = "6675";
         // **Set together, because a parse cannot produce one without the other.** The
@@ -1405,7 +1439,7 @@ TEST_CASE("NodeConfig: an empty --scheduler is refused at STARTUP and not only a
     // sentence they say -- which is the observable half of a duplicate
     // ([#386](https://github.com/LASTRADA-Software/fastcached/issues/386)).
     auto headless = Installable();
-    headless.scheduler.clear();
+    headless.schedulers.clear();
 
     // **The control FIRST, so one run shows the discrimination.** `NodeInstallRejection`
     // composes `NodeServiceRejection`, which has always had this row -- so it refuses an
@@ -1861,7 +1895,7 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
         {
             INFO(row.what);
             NodeConfig cfg;
-            cfg.scheduler = "scheduler.internal:6675";
+            cfg.schedulers = { "scheduler.internal:6675" };
             cfg.advertise = row.advertise;
             cfg.fleetOpen = true;
             cfg.clusterKeyFile = "cluster.key";
@@ -1879,7 +1913,7 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
         // conditions sharing one phrase is the same defect the `reason` column above
         // catches, one row further along.
         NodeConfig wildcard;
-        wildcard.scheduler = "scheduler.internal:6675";
+        wildcard.schedulers = { "scheduler.internal:6675" };
         wildcard.fleetOpen = true;
         wildcard.advertise = "0.0.0.0:6676";
 
@@ -1924,7 +1958,7 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
         // `127.0.0.1` advertising `127.0.0.1`. The fixture comment that caught it was
         // right and is why the rule is about DISAGREEMENT rather than reachability.
         NodeConfig singleMachine;
-        singleMachine.scheduler = "127.0.0.1:6675";
+        singleMachine.schedulers = { "127.0.0.1:6675" };
         singleMachine.nodeListen = "127.0.0.1:6674";
         singleMachine.advertise = "127.0.0.1:6674";
         singleMachine.fleetOpen = true;
@@ -1944,13 +1978,13 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
         // so nothing is told to dial anything. This is what an operator gets by
         // installing the package and starting a node, and it is correct.
         NodeConfig alone;
-        alone.scheduler = "127.0.0.1:6675";
+        alone.schedulers = { "127.0.0.1:6675" };
         CHECK_FALSE(StartupPolicyRejection(alone).has_value());
 
         // A node sharing its CACHE tier with listed peers and REGISTERING NOWHERE.
         // That surface is reached at `--listen-node`, so its advertise is never
         // sent to anybody and the wildcard costs it nothing -- which is why the three
-        // advertise rows are scoped to `!c.scheduler.empty()`.
+        // advertise rows are scoped to `!c.schedulers.empty()`.
         //
         // **But "registering nowhere" is not a node that starts**, and that is worth
         // knowing rather than asserting past: `--scheduler` is required of every node,
@@ -1974,7 +2008,7 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
 
         // And the worker the getting-started page documents, which names both.
         NodeConfig worker;
-        worker.scheduler = "scheduler.internal:6675";
+        worker.schedulers = { "scheduler.internal:6675" };
         // BOTH, as the getting-started page now says: --advertise alone leaves the
         // surface on loopback and the worker unreachable.
         worker.nodeListen = "0.0.0.0:6674";
@@ -1997,7 +2031,7 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
         // which is the asymmetry the tables were composed to delete -- so both paths
         // are asserted here.
         NodeConfig bare;
-        bare.scheduler = "scheduler.internal:6675";
+        bare.schedulers = { "scheduler.internal:6675" };
         bare.fleetOpen = true;
 
         auto const refusal = StartupPolicyRejection(bare);
@@ -2010,9 +2044,23 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
         // A listed member set rather than `--fleet-open` reaches the same row: the
         // admission gate is the siblings' and answers either spelling.
         NodeConfig listed;
-        listed.scheduler = "scheduler.internal:6675";
+        listed.schedulers = { "scheduler.internal:6675" };
         listed.fleetMembers = { "10.0.0.1:6674" };
         CHECK(StartupPolicyRejection(listed).has_value());
+
+        // #1310: ANY configured scheduler on another machine, not the first. The
+        // heartbeat falls back through all of them, so a loopback first entry says
+        // nothing about where this node registers once that entry stops answering.
+        NodeConfig laterRemote = bare;
+        laterRemote.schedulers = { "127.0.0.1:6675", "scheduler.internal:6675" };
+        auto const laterRefusal = StartupPolicyRejection(laterRemote);
+        REQUIRE(laterRefusal.has_value());
+        CHECK(Unwrap(laterRefusal).contains("dial ITSELF"));
+
+        // And a list that is all this machine is the single-machine fleet still.
+        NodeConfig allLocal = bare;
+        allLocal.schedulers = { "127.0.0.1:6675", "localhost:6675" };
+        CHECK_FALSE(StartupPolicyRejection(allLocal).has_value());
 
         // And an explicit loopback `--advertise` is the same configuration spelled
         // out, judged on the endpoint rather than on which flag produced it.
@@ -2038,7 +2086,7 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
         // decides this and not the bind: every address here is loopback and that is
         // correct. `dist-compile-e2e.sh` runs exactly this.
         NodeConfig singleMachine = bare;
-        singleMachine.scheduler = "127.0.0.1:6675";
+        singleMachine.schedulers = { "127.0.0.1:6675" };
         CHECK_FALSE(StartupPolicyRejection(singleMachine).has_value());
 
         // **And the same fleet written the way people actually write it.**
@@ -2051,7 +2099,7 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
         {
             INFO("--scheduler=" << spelling);
             NodeConfig sameBox = bare;
-            sameBox.scheduler = spelling;
+            sameBox.schedulers = { spelling };
             CHECK_FALSE(StartupPolicyRejection(sameBox).has_value());
         }
 
@@ -2067,7 +2115,7 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
         // only `has_value()` would pass whichever rule fired, which is the same green
         // it gave before the row existed.
         NodeConfig malformed = bare;
-        malformed.scheduler = "6675";
+        malformed.schedulers = { "6675" };
         auto const shapeRefusal = StartupPolicyRejection(malformed);
         REQUIRE(shapeRefusal.has_value());
         CHECK(Unwrap(shapeRefusal).contains("--scheduler=6675"));
@@ -2126,14 +2174,14 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
         // inline `if` in `main.cpp` and no test could see it (#386).
         NodeConfig listed;
         listed.serveScheduler = true;
-        listed.scheduler = std::string { SelfScheduler };
+        listed.schedulers = { std::string { SelfScheduler } };
         listed.fleetMembers = { "10.0.0.1:6676" };
         listed.clusterKeyFile = "cluster.key";
         CHECK_FALSE(StartupPolicyRejection(listed).has_value());
 
         NodeConfig open;
         open.serveScheduler = true;
-        open.scheduler = std::string { SelfScheduler };
+        open.schedulers = { std::string { SelfScheduler } };
         open.fleetOpen = true;
         open.clusterKeyFile = "cluster.key";
         CHECK_FALSE(StartupPolicyRejection(open).has_value());
@@ -2146,7 +2194,7 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
         joiner.raftListen = "6680";
         joiner.raftPeers = { Peer("n4=10.0.0.4:6680"), Peer("n1=10.0.0.1:6680"), Peer("n2=10.0.0.2:6680") };
         joiner.clusterKeyFile = "cluster.key";
-        joiner.scheduler = std::string { SchedulerEndpoint };
+        joiner.schedulers = { std::string { SchedulerEndpoint } };
         CHECK_FALSE(StartupPolicyRejection(joiner).has_value());
 
         // And the minimum startable worker -- a scheduler and nothing else -- is
@@ -2162,7 +2210,7 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
         // about which nodes exist that production had been contradicting all along
         // ([#386](https://github.com/LASTRADA-Software/fastcached/issues/386)).
         NodeConfig minimal;
-        minimal.scheduler = std::string { SchedulerEndpoint };
+        minimal.schedulers = { std::string { SchedulerEndpoint } };
         CHECK_FALSE(StartupPolicyRejection(minimal).has_value());
 
         // And the section's real claim, now stated rather than implied: none of the
@@ -2184,7 +2232,7 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
         // admits loopback alone, so the worker the getting-started page documents
         // refused every dispatched compile with `NotAMember`.
         NodeConfig listedWorker;
-        listedWorker.scheduler = "scheduler.internal:6675";
+        listedWorker.schedulers = { "scheduler.internal:6675" };
         listedWorker.nodeListen = "0.0.0.0:6674";
         listedWorker.advertise = "worker-01.internal:6674";
         listedWorker.fleetMembers = { "10.0.0.1:6674" };
@@ -2192,7 +2240,7 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
         CHECK_FALSE(StartupPolicyRejection(listedWorker).has_value());
 
         NodeConfig openWorker;
-        openWorker.scheduler = "scheduler.internal:6675";
+        openWorker.schedulers = { "scheduler.internal:6675" };
         openWorker.nodeListen = "0.0.0.0:6674";
         openWorker.advertise = "worker-01.internal:6674";
         openWorker.fleetOpen = true;
@@ -2209,7 +2257,7 @@ TEST_CASE("NodeConfig: a reserve of zero is re-emitted, because zero is an answe
     // that its operator told to hold nothing back would come up holding two cores
     // back on every start, with a command line that looks correct.
     NodeConfig cfg;
-    cfg.scheduler = "cache.internal:6675";
+    cfg.schedulers = { "cache.internal:6675" };
     cfg.advertise = "worker-01.internal:6676";
     cfg.toolchains = { "/usr/bin/g++" };
     cfg.reservedCores = 0;
@@ -2493,7 +2541,7 @@ TEST_CASE("A dashboard that could never show a fleet is refused at startup", "[n
     auto const servingNode = [] {
         NodeConfig cfg;
         cfg.serveScheduler = true;
-        cfg.scheduler = std::string { SelfScheduler };
+        cfg.schedulers = { std::string { SelfScheduler } };
         cfg.fleetOpen = true;
         // `--fleet-open` admits other machines, and a node that admits them has to
         // be able to check the grants they present (#282). Present here so that only
@@ -3129,7 +3177,7 @@ TEST_CASE("NodeConfig: the lease rule permits every flag provenance now emits", 
     // here -- the bind is loopback, so `CompilePortFacesTheNetwork` is false and the
     // rule permits it.
     cfg.advertise = "127.0.0.1:6674";
-    cfg.scheduler = "127.0.0.1:6675";
+    cfg.schedulers = { "127.0.0.1:6675" };
     cfg.cacheMemoryBytes = defaults.cacheMemoryBytes;
     cfg.cacheMemoryExplicit = true;
 
@@ -3224,7 +3272,7 @@ TEST_CASE("NodeConfig: a worker that admits other machines needs a key to check 
         // this was a loopback endpoint handed to a machine that could not dial it --
         // the fourth reachability row's exact subject, not the loopback fleet the
         // harnesses run. `dist-compile-e2e.sh` names 127.0.0.1 here too.
-        loopbackBound.scheduler = "127.0.0.1:6675";
+        loopbackBound.schedulers = { "127.0.0.1:6675" };
         loopbackBound.fleetOpen = true;
         CHECK_FALSE(StartupPolicyRejection(loopbackBound).has_value());
 
@@ -3320,7 +3368,7 @@ TEST_CASE("NodeConfig: a setting in the file takes effect", "[node][config]")
                                         {});
 
     REQUIRE(merged.has_value());
-    CHECK(merged->scheduler == "cache.internal:6675");
+    CHECK(merged->schedulers == std::vector<std::string> { "cache.internal:6675" });
     CHECK(merged->slots == 9);
     CHECK(merged->toolchains == std::vector<std::string> { "/usr/bin/g++", "/usr/bin/clang++" });
     CHECK_FALSE(merged->toolchainDiscovery);
@@ -3332,7 +3380,7 @@ TEST_CASE("NodeConfig: the command line wins over the file", "[node][config]")
                                         { "--scheduler=from-argv:6675" });
 
     REQUIRE(merged.has_value());
-    CHECK(merged->scheduler == "from-argv:6675");
+    CHECK(merged->schedulers == std::vector<std::string> { "from-argv:6675" });
     // And a setting the command line did NOT name is still the file's: precedence
     // is per setting, not per source.
     CHECK(merged->slots == 9);
@@ -3348,6 +3396,41 @@ TEST_CASE("NodeConfig: a command line naming a toolchain replaces the file's lis
 
     REQUIRE(merged.has_value());
     CHECK(merged->toolchains == std::vector<std::string> { "/usr/bin/tcc" });
+}
+
+TEST_CASE("NodeConfig: a command line naming --scheduler replaces the file's list, and a value spelled like it does not",
+          "[node][config]")
+{
+    // #1310. `--scheduler` became a repeatable row, and a repeatable row APPENDS -- so
+    // without the `clear` column a command line re-spelling it would EXTEND the file's
+    // list, and a node pointed at a new scheduler would keep dialling the retired one
+    // first. Each section fails under a different half of the contract.
+    std::vector<YamlSetting> const file { Setting("scheduler", { "sched-a.internal:6675", "sched-b.internal:6675" }) };
+
+    SECTION("a file's list arrives whole and in order")
+    {
+        auto const merged = FromFileAndArgv(file, {});
+        REQUIRE(merged.has_value());
+        CHECK(merged->schedulers == std::vector<std::string> { "sched-a.internal:6675", "sched-b.internal:6675" });
+    }
+
+    SECTION("a command line naming the flag replaces the file's list rather than appending to it")
+    {
+        auto const merged = FromFileAndArgv(file, { "--scheduler=sched-c.internal:6675", "--scheduler=10.0.0.9:6675" });
+        REQUIRE(merged.has_value());
+        CHECK(merged->schedulers == std::vector<std::string> { "sched-c.internal:6675", "10.0.0.9:6675" });
+    }
+
+    SECTION("a VALUE that merely looks like the flag empties nothing")
+    {
+        // `--advertise --scheduler=...` gives `--advertise` that text as its value, by
+        // the parser's own rule. A scan reading every token for a list flag's spelling
+        // would empty the file's schedulers here and leave a node dialling nobody.
+        auto const merged = FromFileAndArgv(file, { "--advertise", "--scheduler=sched-c.internal:6675" });
+        REQUIRE(merged.has_value());
+        CHECK(merged->advertise == "--scheduler=sched-c.internal:6675");
+        CHECK(merged->schedulers == std::vector<std::string> { "sched-a.internal:6675", "sched-b.internal:6675" });
+    }
 }
 
 TEST_CASE("NodeConfig: a file naming an unknown setting refuses to start", "[node][config]")
@@ -3486,7 +3569,7 @@ namespace
 [[nodiscard]] NodeConfig RunningNode()
 {
     NodeConfig cfg;
-    cfg.scheduler = std::string { SchedulerEndpoint };
+    cfg.schedulers = { std::string { SchedulerEndpoint } };
     return cfg;
 }
 
@@ -4424,7 +4507,7 @@ TEST_CASE("NodeConfig: the addresses this node DIALS are judged for shape, each 
     // discovery produces. So each direction is asserted for every row.
     auto const base = [] {
         NodeConfig cfg;
-        cfg.scheduler = std::string { SchedulerEndpoint };
+        cfg.schedulers = { std::string { SchedulerEndpoint } };
         cfg.toolchains = { "/usr/bin/g++" };
         return cfg;
     };
@@ -4441,7 +4524,7 @@ TEST_CASE("NodeConfig: the addresses this node DIALS are judged for shape, each 
 
         auto cfg = base();
         if (flag == "--scheduler")
-            cfg.scheduler = value;
+            cfg.schedulers = { value };
         else
             cfg.upstream = value;
 
@@ -4461,8 +4544,30 @@ TEST_CASE("NodeConfig: the addresses this node DIALS are judged for shape, each 
         // somewhere else to ask -- a node told to dial `6675` would ask itself. The
         // same call `--discovery` and `--advertise` already make.
         auto cfg = base();
-        cfg.scheduler = "6675";
+        cfg.schedulers = { "6675" };
         REQUIRE(StartupPolicyRejection(cfg).has_value());
+    }
+
+    SECTION("every --scheduler value is judged, not only the first, and an empty one is not skipped")
+    {
+        // #1310. A fallback that can never answer is discovered on the day it is
+        // needed, which is the day the entries before it are gone. And an EMPTY element
+        // is a value somebody typed (`--scheduler=`), where an empty scalar means the
+        // flag was never given -- so the scalar helper's "empty is not judged" would be
+        // the wrong answer here.
+        auto const bad = GENERATE(as<std::string> {}, "6675", "not an address", "");
+        INFO("second --scheduler=" << bad);
+
+        auto cfg = base();
+        cfg.schedulers = { std::string { SchedulerEndpoint }, bad };
+        auto const refusal = StartupPolicyRejection(cfg);
+        REQUIRE(refusal.has_value());
+        CHECK(Unwrap(refusal).contains(std::format("--scheduler={} is not an address to dial", bad)));
+
+        // The control: two good values are two good values.
+        auto good = base();
+        good.schedulers = { std::string { SchedulerEndpoint }, "sched-b.internal:6675" };
+        CHECK_FALSE(StartupPolicyRejection(good).has_value());
     }
 
     SECTION("a value nobody typed is not judged for shape")
@@ -4488,7 +4593,7 @@ TEST_CASE("NodeConfig: the addresses this node DIALS are judged for shape, each 
         // rather than assumed to be: an empty `--scheduler` is refused, by the other
         // rule and not by this one.
         auto missing = cfg;
-        missing.scheduler.clear();
+        missing.schedulers.clear();
         auto const required = StartupPolicyRejection(missing);
         REQUIRE(required.has_value());
         CHECK(Unwrap(required).contains("--scheduler is required"));
@@ -4532,7 +4637,7 @@ TEST_CASE("NodeConfig: the addresses this node DIALS are judged for shape, each 
         // machine, with no error at either end. #208's silent shape, one flag along.
         auto cfg = base();
         cfg.serveScheduler = true;
-        cfg.scheduler = std::string { SelfScheduler };
+        cfg.schedulers = { std::string { SelfScheduler } };
         cfg.clusterKeyFile = "/etc/fastcached/cluster.key";
         cfg.fleetMembers = { "" };
 
@@ -4732,7 +4837,7 @@ TEST_CASE("The allowlist row is reloadable, and LOCAL rather than advertised", "
     // the lists again: a reload that changes only this is accepted, and it does not
     // move what this worker advertises.
     NodeConfig previous;
-    previous.scheduler = std::string { SchedulerEndpoint };
+    previous.schedulers = { std::string { SchedulerEndpoint } };
     auto candidate = previous;
     candidate.extraAllowedArgs = { "-fno-plt" };
 
@@ -4814,7 +4919,7 @@ TEST_CASE("ObservabilityAnnouncement tells a fleet node it opens no admin surfac
     // exactly the single-machine install this remark has to stay off.
     auto const base = [] {
         NodeConfig cfg;
-        cfg.scheduler = std::string { SchedulerEndpoint };
+        cfg.schedulers = { std::string { SchedulerEndpoint } };
         return cfg;
     };
 

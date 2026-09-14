@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "CacheProtocol.hpp"
 #include "ClusterAdminCli.hpp"
-#include "EndpointDial.hpp"
 
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
@@ -223,19 +222,15 @@ std::expected<std::string, std::string> PutClusterRequest(ISocket& client,
 
 std::expected<std::string, std::string> RunClusterAdmin(NodeConfig const& cfg,
                                                         ClusterRequest const& request,
-                                                        ICredentialSource const& credential)
+                                                        ICredentialSource const& credential,
+                                                        IEndpointDialer& dialer)
 {
-    if (cfg.scheduler.empty())
+    if (cfg.schedulers.empty())
         return std::unexpected { std::string { "--scheduler names where to ask; a cluster command needs one" } };
 
-    // A one-shot CLI on the process main thread: no reactor exists here, so this
-    // legitimately blocks. `DialEndpointBlocking` takes a `BlockingConnector` by
-    // type rather than an `IConnector`, which is what keeps that fact checkable
-    // rather than a comment.
-    BlockingConnector connector { DefaultAddressResolver(), BlockingConnectorOptions { .ioTimeout = DialTimeout } };
-    auto client = Cc::DialEndpointBlocking(connector, cfg.scheduler, DialOptions { .connectTimeout = DialTimeout });
-    if (client == nullptr)
-        return std::unexpected { std::format("cannot reach the scheduler at {}", cfg.scheduler) };
+    auto reached = DialFirstReachable(dialer, cfg.schedulers, DialOptions { .connectTimeout = DialTimeout });
+    if (!reached.has_value())
+        return std::unexpected { std::format("cannot reach the scheduler at {}", JoinEndpoints(cfg.schedulers)) };
 
     // Owned here rather than threaded in: this is a one-shot CLI verb, so "once per
     // process" and "once per invocation" are the same thing, and the admin surface
@@ -246,7 +241,7 @@ std::expected<std::string, std::string> RunClusterAdmin(NodeConfig const& cfg,
     auto notice =
         Cc::CredentialNotice { [](std::string_view text) { std::cerr << "fastcache-compile-node: " << text << '\n'; } };
 
-    return PutClusterRequest(*client, notice, request, credential, cfg.scheduler);
+    return PutClusterRequest(*reached->socket, notice, request, credential, reached->endpoint);
 }
 
 } // namespace FastCache::Node

@@ -89,7 +89,7 @@ constexpr std::string_view Stranger = "10.0.0.99";
 [[nodiscard]] NodeConfig RunningNode(std::vector<std::string> members = {}, bool open = false)
 {
     NodeConfig cfg;
-    cfg.scheduler = std::string { SelfScheduler };
+    cfg.schedulers = { std::string { SelfScheduler } };
     cfg.fleetMembers = std::move(members);
     cfg.fleetOpen = open;
     return cfg;

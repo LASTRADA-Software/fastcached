@@ -8,6 +8,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace FastCache::Node
 {
@@ -68,12 +69,31 @@ constexpr int MaxAnnounceRedirects = 2;
 /// interval later: the configured endpoint is the one an operator can actually
 /// fix, and skipping a round to reach it doubles the window in which this machine
 /// is missing from the fleet.
+///
+/// ## Several configured endpoints (#1310)
+///
+/// `--scheduler` is a list, and the fallback walks it: a round that cannot get
+/// through at one configured endpoint tries the next, still in the same round, until
+/// each has been tried once. The walk starts at the configured endpoint that last
+/// ACCEPTED a round, so a fleet whose first entry was retired pays that entry's
+/// connect timeout once rather than every heartbeat -- and it wraps, so an operator's
+/// first choice is still tried in a round that begins further down.
+///
+/// **Each configured endpoint is dialled at most once per round.** A redirect target
+/// that then fails falls back to the next configured endpoint NOT yet tried, never to
+/// the one that just issued the redirect: that one answered a moment ago and would
+/// name the same unreachable leader again. Every round is therefore bounded by the
+/// list's length plus `MaxAnnounceRedirects`.
+///
+/// A `NotLeader` is an INSTRUCTION and is followed to the endpoint it names without
+/// consulting the list at all -- the list says where to start asking, never who leads.
 class SchedulerLink
 {
   public:
-    /// @param configured The `--scheduler` endpoint, which is never forgotten and
-    ///        is what this falls back to.
-    explicit SchedulerLink(std::string configured);
+    /// @param configured The `--scheduler` endpoints, in the operator's order. Never
+    ///        forgotten, and what this falls back through. Must not be empty: the
+    ///        startup table refuses a node with none before this is built.
+    explicit SchedulerLink(std::vector<std::string> configured);
 
     /// Start a heartbeat round, resetting the per-round redirect budget.
     ///
@@ -85,10 +105,6 @@ class SchedulerLink
     /// Where this round's next dial should go.
     [[nodiscard]] std::string const& Target() const noexcept;
 
-    /// Whether `Target()` is a remembered leader rather than the configured
-    /// endpoint, so a diagnostic can say which it failed to reach.
-    [[nodiscard]] bool Following() const noexcept;
-
     /// `Target()` refused `NotLeader` and named `leader`.
     /// @param leader The endpoint it named; already validated by `RedirectTarget`.
     /// @return True when the caller should dial `Target()` again, now pointing at
@@ -98,24 +114,36 @@ class SchedulerLink
 
     /// A round was accepted at `Target()`, committing it for future rounds.
     ///
-    /// Committing the configured endpoint means *forgetting* any remembered
-    /// leader, which is how a fleet that re-elects back to the original scheduler
-    /// stops paying a redirect per heartbeat.
+    /// Committing a configured endpoint means *forgetting* any remembered leader,
+    /// which is how a fleet that re-elects back to a configured scheduler stops
+    /// paying a redirect per heartbeat -- and makes it where the next round's walk
+    /// of the configured list starts.
     void Accepted();
 
     /// `Target()` could not be reached, or refused for something that is not a
     /// redirect.
-    /// @return The endpoint to try instead **right now** -- the configured one,
-    ///         when a remembered leader was what just failed -- or nothing when
-    ///         there is nothing left to fall back to this round.
+    /// @return The endpoint to try instead **right now** -- the next configured one
+    ///         this round has not tried -- or nothing when every configured endpoint
+    ///         has been tried this round.
     [[nodiscard]] std::optional<std::string> Lost();
 
   private:
-    std::string _configured;
-    /// The leader a round has been accepted at; empty until one has been.
+    /// The configured endpoint @p offset places after `_home`, wrapping.
+    /// @param offset How far along this round's walk.
+    /// @return The endpoint.
+    [[nodiscard]] std::string const& ConfiguredAt(std::size_t offset) const noexcept;
+
+    std::vector<std::string> _configured;
+    /// The leader a round has been accepted at, when that is not a configured
+    /// endpoint; empty until one has been.
     std::optional<std::string> _learned;
+    /// Index of the configured endpoint a round's walk starts at: the one that last
+    /// accepted a round, or the first.
+    std::size_t _home = 0;
     /// Where this round is dialling right now.
     std::string _current;
+    /// Configured endpoints this round has dialled as a start or a fallback.
+    std::size_t _walked = 0;
     /// Redirects followed this round.
     int _hops = 0;
 };

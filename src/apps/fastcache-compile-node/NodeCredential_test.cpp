@@ -362,7 +362,7 @@ TEST_CASE("Site 3: a registration presents the secret in force NOW", "[node][cre
     // string, which are not what this case is about and would make it fail on an
     // unrelated wire change.
     NodeConfig cfg;
-    cfg.scheduler = "scheduler.example:6676";
+    cfg.schedulers = { "scheduler.example:6676" };
 
     RotatingCredential credential { FirstSecret };
     AtomicMetricsSink metrics;
@@ -428,12 +428,12 @@ TEST_CASE("Site 3: a registration presents the secret in force NOW", "[node][cre
     };
 
     Testing::ScriptedSocket first { AcceptedThen(Wire::EncodeErrorReply(Wire::ErrorCode::NotAMember, "not today")) };
-    (void) AnnounceOnce(round, first, cfg.scheduler);
+    (void) AnnounceOnce(round, first, cfg.schedulers.front());
     CHECK(leadingAuth(first, authFor(FirstSecret).size()) == authFor(FirstSecret));
 
     credential.Rotate(SecondSecret);
     Testing::ScriptedSocket second { AcceptedThen(Wire::EncodeErrorReply(Wire::ErrorCode::NotAMember, "not today")) };
-    (void) AnnounceOnce(round, second, cfg.scheduler);
+    (void) AnnounceOnce(round, second, cfg.schedulers.front());
 
     CHECK(leadingAuth(second, authFor(SecondSecret).size()) == authFor(SecondSecret));
     // The round is `const` and was built once, before the rotation. That is the whole
@@ -458,7 +458,7 @@ TEST_CASE("The production source answers from the LIVE snapshot, not the startup
         WriteConfig(scratch.Path(), std::format("scheduler: scheduler.example:6676\nrequirepass: {}\n", SecondSecret));
 
     NodeConfig initial;
-    initial.scheduler = "scheduler.example:6676";
+    initial.schedulers = { "scheduler.example:6676" };
     initial.token = std::string { FirstSecret };
 
     NodeReloader reloader { initial, path, &Reparse, &ValidateNodeReloadable };

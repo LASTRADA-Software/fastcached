@@ -7,7 +7,6 @@
 #include <FastCache/Consensus/FileRaftStorage.hpp>
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/HostPort.hpp>
-#include <FastCache/Net/BlockingConnector.hpp>
 #include <FastCache/Platform/FileTrust.hpp>
 #include <FastCache/Protocol/LeaderRedirect.hpp>
 
@@ -19,13 +18,14 @@
 #include <format>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <ranges>
+#include <span>
 #include <string>
 #include <system_error>
 #include <utility>
 
 #include <CacheProtocol.hpp>
-#include <EndpointDial.hpp>
 
 namespace FastCache::Node
 {
@@ -146,38 +146,7 @@ namespace
         return std::string_view {};
     }
 
-    /// The dialer production uses: a real `BlockingConnector`, constructed per dial.
-    ///
-    /// **The concrete type never leaves `Dial`**, which is what preserves
-    /// `Cc::DialEndpointBlocking`'s guard. That function takes a `BlockingConnector&`
-    /// rather than an `IConnector&` because its soundness rests on the connector
-    /// resolving inline and never leaving its task suspended -- there the type IS the
-    /// rule. Injecting one level up keeps that rule intact while making the REPLIES
-    /// scriptable, which is what the enrol loop's properties are about.
-    ///
-    /// Per dial rather than once, which is what the loop did before this seam existed:
-    /// a redirect moves the endpoint, and a connector carries socket-level timeouts
-    /// for the dial it is about.
-    class BlockingEnrollDialer final: public IEnrollDialer
-    {
-      public:
-        /// @copydoc IEnrollDialer::Dial
-        [[nodiscard]] std::unique_ptr<ISocket> Dial(std::string_view endpoint, DialOptions options) override
-        {
-            // A one-shot CLI on the process main thread: no reactor exists here, so this
-            // legitimately blocks.
-            BlockingConnector connector { DefaultAddressResolver(), BlockingConnectorOptions { .ioTimeout = DialTimeout } };
-            return Cc::DialEndpointBlocking(connector, endpoint, options);
-        }
-    };
-
 } // namespace
-
-IEnrollDialer& DefaultEnrollDialer() noexcept
-{
-    static BlockingEnrollDialer instance;
-    return instance;
-}
 
 EnrollReading ReadEnrollReply(Cc::CacheOutcome const& outcome)
 {
@@ -334,27 +303,32 @@ std::string RenderEnrollmentReport(Wire::EnrollmentReport const& report)
 
 std::expected<std::string, std::string> RunEnrollAdmin(NodeConfig const& cfg,
                                                        EnrollCommand const& request,
-                                                       ICredentialSource const& credential)
+                                                       ICredentialSource const& credential,
+                                                       IEndpointDialer& dialer)
 {
-    if (cfg.scheduler.empty())
+    if (cfg.schedulers.empty())
         return std::unexpected { std::string { "--scheduler names where to ask; an enrollment command needs one" } };
 
     auto notice =
         Cc::CredentialNotice { [](std::string_view text) { std::cerr << "fastcache-compile-node: " << text << '\n'; } };
 
-    auto endpoint = cfg.scheduler;
+    auto const options = DialOptions { .connectTimeout = DialTimeout };
+    std::optional<std::string> leader;
     for (auto hop = 0; hop <= MaxRedirects; ++hop)
     {
-        // A one-shot CLI on the process main thread: no reactor exists here, so this
-        // legitimately blocks. `RunClusterAdmin`'s idiom, verbatim, because it is the
-        // same situation.
-        BlockingConnector connector { DefaultAddressResolver(), BlockingConnectorOptions { .ioTimeout = DialTimeout } };
-        auto client = Cc::DialEndpointBlocking(connector, endpoint, DialOptions { .connectTimeout = DialTimeout });
-        if (client == nullptr)
-            return std::unexpected { std::format("cannot reach the cluster at {}", endpoint) };
+        // The first ask walks the configured list and takes whichever CONNECTS; a
+        // redirect names one endpoint and is followed there, never back into the list
+        // (#1310). A fallback only where nothing was sent -- `DialFirstReachable` says
+        // why that is the line, and `--enroll-approve` is why it matters here.
+        auto const targets = leader.has_value() ? std::span<std::string const> { &*leader, 1 }
+                                                : std::span<std::string const> { cfg.schedulers };
+        auto reached = DialFirstReachable(dialer, targets, options);
+        if (!reached.has_value())
+            return std::unexpected { std::format("cannot reach the cluster at {}", JoinEndpoints(targets)) };
+        auto const& endpoint = reached->endpoint;
 
         auto const outcome =
-            SyncRun(Cc::ExchangeFramed(client.get(),
+            SyncRun(Cc::ExchangeFramed(reached->socket.get(),
                                        &notice,
                                        Wire::EncodeEnrollControl(WireVerbFor(request.action), request.subject),
                                        credential.Current()));
@@ -366,9 +340,9 @@ std::expected<std::string, std::string> RunEnrollAdmin(NodeConfig const& cfg,
         {
             // Followed rather than reported, and BOUNDED: two nodes each holding a
             // stale `_knownLeader` name each other forever.
-            if (auto const leader = Cc::RedirectTarget(outcome); leader.has_value() && hop < MaxRedirects)
+            if (auto const named = Cc::RedirectTarget(outcome); named.has_value() && hop < MaxRedirects)
             {
-                endpoint = *leader;
+                leader = *named;
                 continue;
             }
             return std::unexpected { Cc::DescribeOutcome(outcome) };
@@ -521,7 +495,7 @@ std::expected<std::string, std::string> RunEnrollClient(NodeConfig const& cfg,
                                                         ICredentialSource const& credential,
                                                         IRandomSource& random,
                                                         IDrainWait& wait,
-                                                        IEnrollDialer& dialer)
+                                                        IEndpointDialer& dialer)
 {
     // **This mode's own preconditions are refused HERE and not as `StartupPolicyRejection`
     // rows, and that is a decision rather than a missed table row.** That table judges a
@@ -646,7 +620,7 @@ std::expected<std::string, std::string> RunEnrollClient(NodeConfig const& cfg,
     while (true)
     {
         // Through the seam, so a test can script what comes BACK. The blocking dial
-        // and its `BlockingConnector` live in `BlockingEnrollDialer` above, where
+        // and its `BlockingConnector` live in `BlockingEndpointDialer`, where
         // `DialEndpointBlocking` still sees the concrete type it requires.
         auto client = dialer.Dial(seed, DialOptions { .connectTimeout = DialTimeout });
         if (client == nullptr)

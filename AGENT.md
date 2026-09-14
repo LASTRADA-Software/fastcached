@@ -369,6 +369,9 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   `Register` as well. A leader is remembered only once a round was ACCEPTED there, and a remembered
   one that stops answering falls back to `--scheduler` in the SAME round. `NotLeader` must not clear
   the worker id; `UnknownLease` must.
+- `--scheduler` is a LIST for reaching the fleet, never for choosing a leader: each value is dialled at
+  most once per round, `NotLeader` never consults it, and a one-shot verb falls back only where nothing
+  was SENT. The acceptance is a FALLBACK — assert WHICH endpoint took the request.
 - `NotLeader` is an instruction, not an answer about the fleet: a client follows it to the endpoint
   it names (`RedirectTarget`), and the RELEASE goes to whoever ISSUED the lease. Judged by PARSING
   the message, never by testing it for empty — and splitting is not parsing, so one predicate,
