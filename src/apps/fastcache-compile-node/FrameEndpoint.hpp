@@ -10,6 +10,7 @@
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Net/IListener.hpp>
 #include <FastCache/Protocol/CompileCacheAuth.hpp>
+#include <FastCache/Protocol/LiveStream.hpp>
 #include <FastCache/Protocol/SurfaceRefusal.hpp>
 
 #include <algorithm>
@@ -179,66 +180,6 @@ inline constexpr std::string_view AnswerDeadlineIsTheEndpointsRationale =
 {
     return EndpointRefusalCodes[static_cast<std::size_t>(refusal)].code;
 }
-
-/// How one push left, as the endpoint observed it.
-///
-/// **A PRIVATE enum: nothing transmits it and nothing stores it, so it states no ordinals.**
-///
-/// Three answers rather than a bool, because the surface files two of them under different
-/// counters: a push this node gave up on is a subscriber that stopped READING, and a push the
-/// transport lost is a subscriber that LEFT, or this node stopping. A bool would have to be read
-/// as "delivered, or else something", which is the shape this tree keeps having to undo.
-enum class PushOutcome : std::uint8_t
-{
-    Delivered, ///< Every byte went out.
-    Stalled,   ///< The push stayed parked past its hold, and this node closed the connection.
-    Lost,      ///< The write failed otherwise: the peer reset, or this node is stopping.
-};
-
-/// What a subscriber has done since its stream began, as the endpoint's read watch saw it.
-///
-/// **A PRIVATE enum**, for `PushOutcome`'s reason.
-enum class PeerActivity : std::uint8_t
-{
-    Quiet,    ///< Nothing, which is what a subscriber does.
-    Departed, ///< EOF: the peer said goodbye, and nobody is left to write to.
-    Reset,    ///< The peer reset the connection. Counted apart from `Departed`, as the compile surface counts them.
-    Sent,     ///< Bytes arrived: the peer wants this connection for its next request.
-};
-
-/// The endpoint's half of a stream: the one writer while it lasts, and what the read watch saw.
-///
-/// **The stream never touches the socket**, which is what keeps the endpoint's exactly-one-writer
-/// property structural (`EndpointWriters.hpp`): the endpoint writes every push, arms the sweep
-/// bound around it, and watches the read side, and the stream decides only WHAT to push and WHEN
-/// to stop. A stream holding the socket would be a second writer that has to remember all three.
-class IPushSink
-{
-  public:
-    IPushSink() = default;
-    IPushSink(IPushSink const&) = delete;
-    IPushSink(IPushSink&&) = delete;
-    IPushSink& operator=(IPushSink const&) = delete;
-    IPushSink& operator=(IPushSink&&) = delete;
-    virtual ~IPushSink() = default;
-
-    /// Write one frame, bounded.
-    ///
-    /// **The hold is the bound on a PARKED write**, and it is armed with the sweeper rather than
-    /// with a timer of the stream's own: a subscriber that stops reading fills its receive window,
-    /// the write parks, and nothing but a close retrieves a parked write. So the sweeper closes it
-    /// past @p hold, the write resumes with a failure, and the answer is `Stalled`.
-    /// @param frame A whole frame; sent in one write, so a parked one is never spliced into.
-    /// @param hold How long the write may stay parked before the connection is ended.
-    /// @return How it left.
-    [[nodiscard]] virtual Task<PushOutcome> Push(std::vector<std::byte> frame, std::chrono::milliseconds hold) = 0;
-
-    /// @return What the peer has done since the stream began. Never consumes a byte.
-    [[nodiscard]] virtual PeerActivity Activity() const noexcept = 0;
-
-    /// @return True once this endpoint is shutting down, which ends every stream.
-    [[nodiscard]] virtual bool Stopping() const noexcept = 0;
-};
 
 /// Serves one subscription for as long as it lasts.
 ///

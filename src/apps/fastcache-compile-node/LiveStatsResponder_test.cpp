@@ -225,9 +225,11 @@ DetachedTask RunStream(LiveStatsResponder* responder, std::vector<std::byte> fra
 
 /// Everything a case needs, over one manual clock.
 ///
-/// **It ends every stream it opened before any member goes**, and that is not tidiness: a stream
-/// parked on the reactor's timer holds a place under the subscription cap, and the reactor frees a
-/// parked frame when it is destroyed -- after the responder whose counter that place decrements.
+/// **It ends every stream it opened before any member goes, and it owns every responder those
+/// streams run on.** A stream resumed by that ending runs code in its responder, so a responder
+/// that is a case's own local -- destroyed before the rig when an assertion unwinds the case --
+/// would be resumed into after it is gone. Measured: two neutered builds turned a failing case
+/// into an AddressSanitizer abort that way, which reports nothing about the assertion.
 struct Rig
 {
     Rig() = default;
@@ -250,7 +252,16 @@ struct Rig
     ScriptedSources sources;
     ListedMembership membership { { std::string { Watcher }, "127.0.0.1", "10.0.0.8" } };
     LiveStatsResponder responder { sources, membership, AdminCredential {}, reactor, metrics };
+    std::deque<std::unique_ptr<LiveStatsResponder>> responders;
     std::deque<std::unique_ptr<Stream>> streams;
+
+    /// A responder of the case's own, owned here for the reason above.
+    [[nodiscard]] LiveStatsResponder& Responder(AdminCredential dashboard)
+    {
+        responders.push_back(
+            std::make_unique<LiveStatsResponder>(sources, membership, std::move(dashboard), reactor, metrics));
+        return *responders.back();
+    }
 
     /// Open a subscription and let it run as far as it can now.
     [[nodiscard]] Stream& Open(std::vector<std::byte> frame, std::string peer = std::string { Watcher })
@@ -433,18 +444,14 @@ TEST_CASE("The fleet streams to a holder of the dashboard credential, and with n
 
     SECTION("with a token file, the token decides, from anywhere")
     {
-        LiveStatsResponder guarded { rig.sources, rig.membership, AdminCredential { "s3cret" }, rig.reactor, rig.metrics };
+        auto& guarded = rig.Responder(AdminCredential { "s3cret" });
         auto const& wrong = rig.OpenOn(guarded, SubscribeFrame(Wire::LiveSubject::Fleet, 1000, "guess"), "127.0.0.1");
         CHECK(wrong.sink.frames.empty());
         CHECK(Testing::ErrorOf(wrong.reply) == Wire::ErrorCode::Unauthenticated);
 
-        auto& right = rig.OpenOn(guarded, SubscribeFrame(Wire::LiveSubject::Fleet, 1000, "s3cret"), std::string { Watcher });
+        auto const& right =
+            rig.OpenOn(guarded, SubscribeFrame(Wire::LiveSubject::Fleet, 1000, "s3cret"), std::string { Watcher });
         CHECK_FALSE(right.sink.frames.empty());
-
-        // Ended here, because this responder is the case's and goes before the rig does.
-        right.sink.stopping = true;
-        rig.RunTo(1000ms);
-        CHECK(right.finished);
     }
 
     SECTION("a follower redirects a watcher, uncounted")
@@ -602,67 +609,6 @@ TEST_CASE("Detaching the sources ends every stream in order at its next tick", "
     REQUIRE(stream.finished);
     CHECK(Testing::StatusOf(stream.reply) == Wire::Status::Ok);
     CHECK(sources.captures == 1);
-}
-
-TEST_CASE("Events are the differences between two probes, keyed and in table order", "[node][livestats]")
-{
-    LiveEventProbe before;
-    before.members = { { .key = "n1", .detail = "n1" }, { .key = "n2", .detail = "n2" } };
-    before.leadership = LiveFact { .key = "3|", .detail = "" };
-    before.survey = LiveFact { .key = "1", .detail = "1 of 4" };
-
-    auto after = before;
-    CHECK(DiffLiveEvents(before, after).empty());
-
-    // The words changed and the key did not: not an event, or a survey would be one per toolchain.
-    after.survey = LiveFact { .key = "1", .detail = "3 of 4" };
-    CHECK(DiffLiveEvents(before, after).empty());
-
-    after.members = { { .key = "n2", .detail = "n2" }, { .key = "n3", .detail = "n3" } };
-    after.leadership = LiveFact { .key = "1|n3:6674", .detail = "n3:6674" };
-    after.enrollment = LiveFact { .key = "2", .detail = "0 pending" };
-
-    auto const events = DiffLiveEvents(before, after);
-    REQUIRE(events.size() == 4);
-    CHECK(events[0].kind == Wire::LiveEventKind::MemberJoined);
-    CHECK(events[0].detail == "n3");
-    CHECK(events[1].kind == Wire::LiveEventKind::MemberLeft);
-    CHECK(events[1].detail == "n1");
-    CHECK(events[2].kind == Wire::LiveEventKind::LeadershipChanged);
-    CHECK(events[2].detail == "n3:6674");
-    // Appearing is a change: a window that did not exist and now does.
-    CHECK(events[3].kind == Wire::LiveEventKind::EnrollmentChanged);
-}
-
-TEST_CASE("A gap is whole cadences missed, never wake-up jitter", "[node][livestats]")
-{
-    LiveCursor cursor { .nextDue = 10, .ticksPerCadence = 2 };
-
-    CHECK_FALSE(DecideLiveStep(cursor, 9, false).snapshot);
-
-    auto const onTime = DecideLiveStep(cursor, 10, false);
-    CHECK(onTime.snapshot);
-    CHECK_FALSE(onTime.gap.has_value());
-    CHECK(cursor.nextDue == 12);
-
-    // One tick late is less than a cadence: jitter, and no hole in the panel.
-    auto const jitter = DecideLiveStep(cursor, 13, false);
-    CHECK(jitter.snapshot);
-    CHECK_FALSE(jitter.gap.has_value());
-    CHECK(cursor.nextDue == 15);
-
-    auto const parked = DecideLiveStep(cursor, 21, false);
-    CHECK(parked.snapshot);
-    REQUIRE(parked.gap.has_value());
-    CHECK(Unwrap(parked.gap).dropped == 3);
-    CHECK(Unwrap(parked.gap).firstTick == 15);
-    CHECK(Unwrap(parked.gap).lastTick == 19);
-
-    // An event owes a snapshot whatever the cadence says, and restarts the cadence from there.
-    auto const forced = DecideLiveStep(cursor, 22, true);
-    CHECK(forced.snapshot);
-    CHECK_FALSE(forced.gap.has_value());
-    CHECK(cursor.nextDue == 24);
 }
 
 TEST_CASE("A node status probe keys on states and leaves counts to the words", "[node][livestats]")

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Async/Task.hpp>
+#include <FastCache/Async/TestReactor.hpp>
 #include <FastCache/Auth/AuthPolicy.hpp>
 #include <FastCache/Cache/CacheEngine.hpp>
 #include <FastCache/Cache/InMemoryLruStorage.hpp>
@@ -12,9 +13,11 @@
 #include <FastCache/Distributed/LeaseTable.hpp>
 #include <FastCache/Distributed/WorkerRegistry.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
+#include <FastCache/Metrics/StatsReadingCodec.hpp>
 #include <FastCache/Net/InMemoryTransport.hpp>
 #include <FastCache/Protocol/CompileCacheHandler.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
+#include <FastCache/Protocol/LiveStream.hpp>
 #include <FastCache/Protocol/ProtocolAutodetect.hpp>
 #include <FastCache/Protocol/SessionContext.hpp>
 
@@ -34,9 +37,11 @@
 #include <vector>
 
 #include <tests/ForeignGenerationValue.hpp>
+#include <tests/SocketDecorator.hpp>
 #include <tests/Unwrap.hpp>
 
 using namespace FastCache;
+using namespace std::chrono_literals;
 using FastCache::Testing::Unwrap;
 using PathCanon::Grammar;
 namespace Wire = FastCache::CompileCacheWire;
@@ -1424,4 +1429,246 @@ TEST_CASE("A daemon refusal with nothing collecting still answers", "[protocol][
 
     auto const reply = ExchangeWith(fix, std::vector<std::byte> { frame.begin(), frame.end() }, none);
     CHECK_FALSE(reply.empty());
+}
+
+namespace
+{
+
+/// Run the handler to completion on the reactor, recording that it returned.
+DetachedTask RunHandlerOn(
+    CompileCacheHandler* handler, ISocket* socket, CacheEngine* engine, SessionContext session, bool* returned)
+{
+    co_await handler->Run(socket, engine, {}, session);
+    *returned = true;
+}
+
+/// Read exactly one reply frame the handler is known to have written.
+/// @param socket The client end.
+/// @return The frame, header included.
+Task<std::vector<std::byte>> ReadOneFrame(ISocket* socket)
+{
+    auto frame = co_await ReadExactlyN(socket, Wire::ReplyHeaderSize);
+    auto const header = Wire::DecodeReplyHeader(frame);
+    if (!header.has_value())
+        co_return frame;
+    auto const payload = co_await ReadExactlyN(socket, header->payloadLength);
+    frame.insert(frame.end(), payload.begin(), payload.end());
+    co_return frame;
+}
+
+/// The push a frame carries, or nullopt for any other reply.
+[[nodiscard]] std::optional<Wire::PushView> PushOf(std::span<std::byte const> frame)
+{
+    auto const header = Wire::DecodeReplyHeader(frame);
+    if (!header.has_value() || header->status != Wire::Status::Push)
+        return std::nullopt;
+    return Wire::DecodePush(frame.subspan(Wire::ReplyHeaderSize));
+}
+
+/// The kind of a push frame, or nullopt for any other reply.
+[[nodiscard]] std::optional<Wire::PushKind> PushKindOf(std::span<std::byte const> frame)
+{
+    auto const push = PushOf(frame);
+    return push.has_value() ? std::optional { push->kind } : std::nullopt;
+}
+
+/// A SUBSCRIBE frame at @p subject's floor.
+[[nodiscard]] std::vector<std::byte> SubscribeTo(Wire::LiveSubject subject)
+{
+    return Wire::EncodeSubscribeRequest(
+        Wire::SubscribeRequest { .subject = subject, .cadenceMillis = 500, .dashboardToken = {} });
+}
+
+/// A daemon session that streams live stats over a manual clock, and a server end whose readable
+/// wait PARKS -- which the in-memory socket never does, and a subscription is defined by.
+///
+/// Declared in the order clang-tidy's padding check asks for, and safe to unwind in it: a stream
+/// parked on the reactor's timer is freed without being resumed, and what its frame's destruction
+/// touches it owns (`LiveStream::_active`); the parking sockets go after the reactor, retiring a
+/// write or a watch that holds only its own share of what it touches, and `writes` before the
+/// `server` it wraps.
+struct StreamingRig
+{
+    CcFixture fix;
+    Testing::ParkingReadableSocket server { *fix.pair.server };
+    Testing::ParkingWritableSocket writes { server }; ///< What the handler runs on.
+    CacheLiveStatsSources const sources { metrics, [] { return MetricsSnapshot {}; }, "cache.test:6380" };
+    TestReactor reactor { fix.clock };
+    AtomicMetricsSink metrics;
+    LiveStream live { sources, metrics };
+    bool returned { false };
+
+    /// @return A session that streams through this rig.
+    [[nodiscard]] SessionContext Session() noexcept
+    {
+        SessionContext session {};
+        session.reactor = &reactor;
+        session.metrics = &metrics;
+        session.liveStats = &live;
+        return session;
+    }
+
+    /// Move the clock on and let everything due run.
+    void Advance(std::chrono::milliseconds by)
+    {
+        fix.clock.Advance(by);
+        reactor.Drain();
+    }
+};
+
+} // namespace
+
+TEST_CASE("The daemon streams the cache subject, and a goodbye ends the stream", "[compile-cache][handler][livestats]")
+{
+    StreamingRig rig;
+    REQUIRE(SyncRun(WriteBytes(rig.fix.pair.client.get(), SubscribeTo(Wire::LiveSubject::Cache))));
+    RunHandlerOn(&rig.fix.handler, &rig.writes, &rig.fix.engine, rig.Session(), &rig.returned);
+    rig.reactor.Drain();
+
+    auto const subscribed = SyncRun(ReadOneFrame(rig.fix.pair.client.get()));
+    auto const grant = PushOf(subscribed);
+    REQUIRE(grant.has_value());
+    REQUIRE(Unwrap(grant).kind == Wire::PushKind::Subscribed);
+    auto const granted = Wire::DecodeLiveSubscribed(Unwrap(grant).fields);
+    REQUIRE(granted.has_value());
+    CHECK(Unwrap(granted).statsLayout == StatsReadingLayout);
+    CHECK(Unwrap(granted).endpoint == "cache.test:6380");
+
+    // The body is the daemon's own reading, in the binary a client decodes.
+    auto const first = SyncRun(ReadOneFrame(rig.fix.pair.client.get()));
+    auto const push = PushOf(first);
+    REQUIRE(push.has_value());
+    REQUIRE(Unwrap(push).kind == Wire::PushKind::Snapshot);
+    auto const snapshot = Wire::DecodeLiveSnapshot(Unwrap(push).fields);
+    REQUIRE(snapshot.has_value());
+    CHECK(DecodeStatsReading(Unwrap(snapshot).body).has_value());
+
+    rig.Advance(500ms);
+    CHECK(PushKindOf(SyncRun(ReadOneFrame(rig.fix.pair.client.get()))) == Wire::PushKind::Snapshot);
+    REQUIRE_FALSE(rig.returned);
+
+    // The watcher is parked on the server end, as a subscriber's always is; EOF resolves it.
+    REQUIRE(rig.server.IsWatchParked());
+    rig.server.ResolveReadable(0);
+    rig.Advance(500ms);
+
+    CHECK(rig.returned);
+    CHECK(rig.metrics.Read(IMetricsSink::Counter::LiveSubscriptionsEndedByClient) == 1);
+    CHECK(rig.server.WatchesOrphaned() == 0);
+}
+
+TEST_CASE("A stream on a connection that never authenticated ends when the daemon starts requiring one",
+          "[compile-cache][handler][livestats]")
+{
+    StreamingRig rig;
+    SharedAuthSource source {};
+    auto session = rig.Session();
+    session.authSource = &source;
+
+    SECTION("a connection that proved nothing is revoked, named and counted")
+    {
+        REQUIRE(SyncRun(WriteBytes(rig.fix.pair.client.get(), SubscribeTo(Wire::LiveSubject::Cache))));
+        RunHandlerOn(&rig.fix.handler, &rig.writes, &rig.fix.engine, session, &rig.returned);
+        rig.reactor.Drain();
+        REQUIRE(PushKindOf(SyncRun(ReadOneFrame(rig.fix.pair.client.get()))) == Wire::PushKind::Subscribed);
+        REQUIRE(PushKindOf(SyncRun(ReadOneFrame(rig.fix.pair.client.get()))) == Wire::PushKind::Snapshot);
+
+        source.Store(std::make_shared<AuthPolicy const>(std::string {}, std::string { "s3cret" }));
+        rig.Advance(500ms);
+
+        auto const terminal = SoleReply(SyncRun(ReadOneFrame(rig.fix.pair.client.get())));
+        REQUIRE(terminal.present);
+        CHECK(terminal.status == Wire::Status::Error);
+        CHECK(ErrorOf(terminal).code == Wire::ErrorCode::Unauthenticated);
+        CHECK(rig.metrics.Read(IMetricsSink::Counter::LiveSubscriptionsRevoked) == 1);
+        // Retired by the handler, not left for the connection's close.
+        CHECK(rig.server.WatchesRetiredByCancel() == 1);
+        CHECK(rig.server.WatchesOrphaned() == 0);
+    }
+
+    SECTION("a connection that proved a secret keeps its stream when the secret rotates")
+    {
+        source.Store(std::make_shared<AuthPolicy const>(std::string {}, std::string { "old-secret" }));
+        REQUIRE(SyncRun(WriteBytes(rig.fix.pair.client.get(),
+                                   Concat({ AuthFrame("", "old-secret"), SubscribeTo(Wire::LiveSubject::Cache) }))));
+        RunHandlerOn(&rig.fix.handler, &rig.writes, &rig.fix.engine, session, &rig.returned);
+        rig.reactor.Drain();
+        REQUIRE(SoleReply(SyncRun(ReadOneFrame(rig.fix.pair.client.get()))).status == Wire::Status::Ok);
+        REQUIRE(PushKindOf(SyncRun(ReadOneFrame(rig.fix.pair.client.get()))) == Wire::PushKind::Subscribed);
+        REQUIRE(PushKindOf(SyncRun(ReadOneFrame(rig.fix.pair.client.get()))) == Wire::PushKind::Snapshot);
+
+        source.Store(std::make_shared<AuthPolicy const>(std::string {}, std::string { "new-secret" }));
+        rig.Advance(500ms);
+        CHECK(PushKindOf(SyncRun(ReadOneFrame(rig.fix.pair.client.get()))) == Wire::PushKind::Snapshot);
+        CHECK(rig.metrics.Read(IMetricsSink::Counter::LiveSubscriptionsRevoked) == 0);
+    }
+
+    // Ended either way, so nothing is left parked on the rig's reactor when it goes.
+    rig.server.ResolveReadable(0);
+    rig.fix.pair.client->ShutdownWrite();
+    rig.Advance(500ms);
+    CHECK(rig.returned);
+}
+
+TEST_CASE("The daemon refuses a subject it does not stream by name, and serves what follows",
+          "[compile-cache][handler][livestats]")
+{
+    StreamingRig rig;
+    auto const reply =
+        ExchangeWith(rig.fix, Concat({ SubscribeTo(Wire::LiveSubject::Fleet), FetchFrame("k") }), rig.Session());
+    auto const frames = SplitReplies(reply);
+    REQUIRE(frames.size() == 2);
+    CHECK(frames[0].status == Wire::Status::Error);
+    CHECK(ErrorOf(frames[0]).code == Wire::ErrorCode::DispatchNotPermitted);
+    CHECK(frames[1].status == Wire::Status::Miss);
+    CHECK(rig.metrics.Read(IMetricsSink::Counter::LiveSubscriptionsOpened) == 0);
+}
+
+TEST_CASE("A request pipelined behind a daemon subscription ends the stream in order, and is answered",
+          "[compile-cache][handler][livestats]")
+{
+    // Written together, so the reader holds the FETCH before the stream begins -- where a read
+    // watch would park on bytes already taken off the socket and never learn of them.
+    StreamingRig rig;
+    REQUIRE(
+        SyncRun(WriteBytes(rig.fix.pair.client.get(), Concat({ SubscribeTo(Wire::LiveSubject::Cache), FetchFrame("k") }))));
+    rig.fix.pair.client->ShutdownWrite();
+    RunHandlerOn(&rig.fix.handler, &rig.writes, &rig.fix.engine, rig.Session(), &rig.returned);
+    rig.Advance(500ms);
+
+    CHECK(rig.server.WatchesArmed() == 0);
+    REQUIRE(rig.returned);
+    REQUIRE(PushKindOf(SyncRun(ReadOneFrame(rig.fix.pair.client.get()))) == Wire::PushKind::Subscribed);
+    auto frame = SyncRun(ReadOneFrame(rig.fix.pair.client.get()));
+    while (PushKindOf(frame).has_value())
+        frame = SyncRun(ReadOneFrame(rig.fix.pair.client.get()));
+    CHECK(SoleReply(frame).status == Wire::Status::Ok);
+    CHECK(SoleReply(SyncRun(ReadOneFrame(rig.fix.pair.client.get()))).status == Wire::Status::Miss);
+}
+
+TEST_CASE("A daemon subscriber that stops reading is cut off at its hold and counted as a stall",
+          "[compile-cache][handler][livestats]")
+{
+    StreamingRig rig;
+    REQUIRE(SyncRun(WriteBytes(rig.fix.pair.client.get(), SubscribeTo(Wire::LiveSubject::Cache))));
+    RunHandlerOn(&rig.fix.handler, &rig.writes, &rig.fix.engine, rig.Session(), &rig.returned);
+    rig.reactor.Drain();
+    REQUIRE(PushKindOf(SyncRun(ReadOneFrame(rig.fix.pair.client.get()))) == Wire::PushKind::Subscribed);
+    REQUIRE(PushKindOf(SyncRun(ReadOneFrame(rig.fix.pair.client.get()))) == Wire::PushKind::Snapshot);
+
+    // The next tick's push parks at 500 ms. Its hold is the stream's, which at the cache floor is
+    // the write-stall floor itself.
+    rig.writes.StopReading();
+    rig.Advance(500ms);
+    REQUIRE(rig.writes.IsWriteParked());
+    rig.Advance(Wire::MinLiveStreamWriteStall - 1ms);
+    CHECK_FALSE(rig.returned);
+    CHECK(rig.metrics.Read(IMetricsSink::Counter::LiveSubscriptionsStalled) == 0);
+
+    rig.Advance(1ms);
+    CHECK(rig.returned);
+    CHECK(rig.writes.WritesRetiredByClose() == 1);
+    CHECK(rig.metrics.Read(IMetricsSink::Counter::LiveSubscriptionsStalled) == 1);
+    CHECK(rig.metrics.Read(IMetricsSink::Counter::LiveSubscriptionsEndedByReset) == 0);
+    CHECK(rig.metrics.Read(IMetricsSink::Counter::LiveSubscriptionsEndedByClient) == 0);
 }
