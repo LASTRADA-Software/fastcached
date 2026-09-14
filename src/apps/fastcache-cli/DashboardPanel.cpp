@@ -2627,8 +2627,10 @@ namespace
     /// A history chart laid out in the rows @p fitted left over, and only those: a panel's, or the fleet's.
     ///
     /// **The one grow step.** It is laid out for exactly those rows -- every band a row first, then taller bands, as
-    /// @p growth bounds them -- and a refit that dropped or shrank anything the first fit kept keeps the first fit
-    /// instead, so a chart never takes a row a table, a tile or a fact could have had.
+    /// @p growth bounds them -- so the chart item and its blank take no more rows than the first fit left over, and a
+    /// chart never takes a row a table, a tile or a fact could have had (`PanelChartShape` counts every row of it).
+    /// **A layout that draws fewer bands than it was offered is laid out again for the bands it drew**: a text span
+    /// can hold fewer machines than the history does, and the rows laid out for the rest would go to nobody.
     /// @param available The rows the content may take.
     /// @param growth How the chart grows.
     /// @param bands How many bands it could draw.
@@ -2653,11 +2655,13 @@ namespace
         if (shape.bands == 0)
             return std::nullopt;
         auto chart = layout(shape);
+        if (chart.has_value() && chart->shape.bands < shape.bands)
+            chart = layout(PanelChartShape(growth, chart->shape.bands, spare, spaced));
         if (!chart.has_value())
             return std::nullopt;
         auto withChart = compose(chart->item);
         auto grown = FitRows(withChart, available);
-        if (!grown.has_value() || grown->lines.size() != fitted.lines.size() + 1 + chart->item.lines.size())
+        if (!grown.has_value())
             return std::nullopt;
         items = std::move(withChart);
         fitted = std::move(*grown);
