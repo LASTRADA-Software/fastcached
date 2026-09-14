@@ -885,12 +885,25 @@ void FleetSampler::Persist()
     }
 }
 
+std::expected<AdminCredential, std::string> LoadDashboardCredentialOrExplain(NodeConfig const& cfg)
+{
+    // A file that cannot be read must not become "no credential": that is the single failure
+    // that turns a guarded fleet map into an open one.
+    if (cfg.dashboardTokenFile.empty())
+        return AdminCredential {};
+    auto read = ReadDashboardToken(cfg.dashboardTokenFile);
+    if (!read.has_value())
+        return std::unexpected { std::format("--dashboard-token-file {}", read.error()) };
+    return std::move(*read);
+}
+
 std::expected<AdminSurface, std::string> StartAdminSurfaceOrExplain(NodeConfig const& cfg,
                                                                     [[maybe_unused]] IHostFactsSource const& host,
                                                                     IMetricsSink& metrics,
                                                                     AdminHttpServer::SnapshotProvider snapshot,
                                                                     std::optional<Distributed::FleetSources> fleet,
                                                                     FleetSampler const* sampler,
+                                                                    AdminCredential const& credential,
                                                                     ILogger& logger)
 {
     AdminSurface surface;
@@ -926,18 +939,6 @@ std::expected<AdminSurface, std::string> StartAdminSurfaceOrExplain(NodeConfig c
                                              "(rebuild with -DFASTCACHED_ENABLE_TLS=ON)",
                                              cfg.tlsSelfSigned ? "--tls-self-signed" : "--tls-cert") };
 #endif
-    }
-
-    // Read once at startup. A file that cannot be read must not become "no
-    // credential": that is the single failure that turns a guarded fleet map into
-    // an open one.
-    AdminCredential credential;
-    if (!cfg.dashboardTokenFile.empty())
-    {
-        auto read = ReadDashboardToken(cfg.dashboardTokenFile);
-        if (!read.has_value())
-            return std::unexpected { std::format("--dashboard-token-file {}", read.error()) };
-        credential = std::move(*read);
     }
 
     // Contributed only when the operator asked AND there is a fleet to read. A

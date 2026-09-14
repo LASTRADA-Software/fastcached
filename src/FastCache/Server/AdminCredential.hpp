@@ -70,6 +70,19 @@ class AdminCredential
     /// @return True when the caller may proceed.
     [[nodiscard]] bool Accepts(std::string_view authorization) const;
 
+    /// Whether @p presented IS the configured secret, as a bare value rather than a header.
+    ///
+    /// For a credential that travels inside a request rather than in an `Authorization` header --
+    /// the live-stats `SUBSCRIBE`, which carries the dashboard token on the `0xFC` wire. The same
+    /// constant-time comparison `Accepts` makes, so the two doors cannot disagree about a secret.
+    ///
+    /// **False when no credential is configured**, which is the opposite of `Accepts`: there is no
+    /// secret for anything to BE, and a caller that must decide what an unguarded surface admits
+    /// has to ask `Required()` and decide that itself rather than inherit an open door.
+    /// @param presented The secret the caller presented.
+    /// @return True when a credential is configured and @p presented matches it.
+    [[nodiscard]] bool Matches(std::string_view presented) const;
+
   private:
     std::string _secret;
 };

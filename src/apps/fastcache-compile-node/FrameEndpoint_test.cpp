@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "EndpointWriters.hpp"
 #include "FrameEndpoint.hpp"
+#include "LiveStatsResponder.hpp"
 #include "NodeIoLoop.hpp"
 #include "Responders.hpp"
 
@@ -30,6 +31,7 @@
 #include <future>
 #include <memory>
 #include <optional>
+#include <ranges>
 #include <span>
 #include <sstream>
 #include <string>
@@ -366,6 +368,17 @@ class Conversation
     {
         if (_socket)
             _socket->Close();
+    }
+
+    /// Say goodbye the orderly way: finish SENDING, then read whatever the server still owes.
+    ///
+    /// What `CloseNow` cannot express to a server that is still writing: a close with that
+    /// server's bytes unread in this side's receive queue is a RESET on the wire, not a FIN.
+    /// @return Every byte the server sent before it closed.
+    [[nodiscard]] std::vector<std::byte> HalfCloseAndDrain()
+    {
+        _socket->ShutdownWrite();
+        return ReadRest();
     }
 
     ~Conversation()
@@ -828,6 +841,12 @@ class HoldableResponder final: public IFrameResponder
     {
         auto const millis = _progressMs.load(std::memory_order_acquire);
         return millis > 0 ? std::optional { std::chrono::milliseconds { millis } } : std::nullopt;
+    }
+
+    /// @copydoc IFrameResponder::StreamFor
+    [[nodiscard]] IFrameStream* StreamFor(std::uint8_t /*opRaw*/) noexcept override
+    {
+        return nullptr;
     }
 
     /// Pulse, or stop pulsing, while answering.
@@ -3278,4 +3297,185 @@ TEST_CASE("Every sanctioned writer names a function that exists and says why it 
         // grepping for a function that no longer exists.
         CHECK(code.contains(std::format("{}(", row.function)));
     }
+}
+
+namespace
+{
+/// Live-stats sources with a body of a chosen size and nothing that changes.
+class SizedLiveSources final: public ILiveStatsSources
+{
+  public:
+    /// @param bytes How large every snapshot body is.
+    explicit SizedLiveSources(std::size_t bytes):
+        _body(bytes, std::byte { 0x5A })
+    {
+    }
+
+    /// @copydoc ILiveStatsSources::Capture
+    [[nodiscard]] std::optional<LiveCapture> Capture(Wire::LiveSubject /*subject*/) const override
+    {
+        return LiveCapture { .body = _body, .probe = {} };
+    }
+
+    /// @copydoc ILiveStatsSources::Leadership
+    [[nodiscard]] std::optional<LiveLeadership> Leadership() const override
+    {
+        return std::nullopt;
+    }
+
+    /// @copydoc ILiveStatsSources::AnsweringEndpoint
+    [[nodiscard]] std::string AnsweringEndpoint() const override
+    {
+        return "127.0.0.1";
+    }
+
+  private:
+    std::vector<std::byte> _body;
+};
+
+/// A node-subject SUBSCRIBE at the floor.
+[[nodiscard]] std::vector<std::byte> SubscribeToNode()
+{
+    return Wire::EncodeSubscribeRequest(
+        Wire::SubscribeRequest { .subject = Wire::LiveSubject::Node, .cadenceMillis = 500, .dashboardToken = {} });
+}
+
+/// The push kind of a reply, or nullopt when it is not a push.
+[[nodiscard]] std::optional<Wire::PushKind> PushKindOf(std::span<std::byte const> reply)
+{
+    if (Testing::StatusOf(reply) != Wire::Status::Push)
+        return std::nullopt;
+    auto const view = Wire::DecodePush(Testing::PayloadOf(reply));
+    return view.has_value() ? std::optional { view->kind } : std::nullopt;
+}
+} // namespace
+
+TEST_CASE("A SUBSCRIBE is answered with pushes for longer than any answer window", "[node][frame][livestats]")
+{
+    // **The stream is not an answer the sweeper is timing.** Read for longer than the header
+    // window and a sweep interval together: an endpoint that left the connection armed with the
+    // window it had when the request arrived would close a healthy subscription here, and a stream
+    // that reads one frame cannot see that.
+    Fleet fleet;
+    SizedLiveSources sources { 64 };
+    LiveStatsResponder live { sources, fleet.membership, AdminCredential {}, fleet.io.Reactor(), fleet.metrics };
+
+    auto const port = FreePort();
+    auto endpoint = FrameEndpoint::Start(
+        fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), live, fleet.metrics, fleet.logger);
+    REQUIRE(endpoint.has_value());
+    fleet.Serve();
+
+    Conversation client { port };
+    REQUIRE(client.SendOnly(SubscribeToNode()));
+    CHECK(PushKindOf(client.ReadReply()) == Wire::PushKind::Subscribed);
+
+    auto const until = std::chrono::steady_clock::now() + FrameServer::HeaderTimeout + (FrameServer::SweepInterval * 2);
+    std::size_t snapshots = 0;
+    while (std::chrono::steady_clock::now() < until)
+    {
+        auto const reply = client.ReadReply();
+        REQUIRE_FALSE(reply.empty()); // the connection is still there
+        REQUIRE(PushKindOf(reply) == Wire::PushKind::Snapshot);
+        ++snapshots;
+    }
+    INFO("snapshots: " << snapshots);
+    CHECK(snapshots >= 10);
+    CHECK(fleet.metrics.Read(IMetricsSink::Counter::FrameAnswerDeadlineSweeps) == 0);
+    CHECK(fleet.metrics.Read(IMetricsSink::Counter::FrameRequestDeadlineSweeps) == 0);
+}
+
+TEST_CASE("A request sent behind a subscription ends it in order and is then served", "[node][frame][livestats]")
+{
+    Fleet fleet;
+    SizedLiveSources sources { 64 };
+    LiveStatsResponder live { sources, fleet.membership, AdminCredential {}, fleet.io.Reactor(), fleet.metrics };
+
+    auto const port = FreePort();
+    auto endpoint = FrameEndpoint::Start(
+        fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), live, fleet.metrics, fleet.logger);
+    REQUIRE(endpoint.has_value());
+    fleet.Serve();
+
+    Conversation client { port };
+    REQUIRE(client.SendOnly(SubscribeToNode()));
+    REQUIRE(PushKindOf(client.ReadReply()) == Wire::PushKind::Subscribed);
+
+    // The next request on the same connection is a second subscription: the first ends with its
+    // terminal `Ok`, every frame before which is a push, and the second then opens.
+    REQUIRE(client.SendOnly(SubscribeToNode()));
+    auto terminal = client.ReadReply();
+    for ([[maybe_unused]] auto const bound: std::views::iota(0, 32))
+    {
+        if (Testing::StatusOf(terminal) != Wire::Status::Push)
+            break;
+        terminal = client.ReadReply();
+    }
+    CHECK(Testing::StatusOf(terminal) == Wire::Status::Ok);
+    CHECK(PushKindOf(client.ReadReply()) == Wire::PushKind::Subscribed);
+    CHECK(fleet.metrics.Read(IMetricsSink::Counter::LiveSubscriptionsOpened) == 2);
+    CHECK(fleet.metrics.Read(IMetricsSink::Counter::LiveSubscriptionsEndedByClient) == 1);
+
+    // And a client that says goodbye ends the second, counted as the ordinary end. It finishes
+    // SENDING rather than closing: a close with pushes still unread in its receive queue is a
+    // reset on the wire, which the next case counts apart.
+    (void) client.HalfCloseAndDrain();
+    CHECK(WaitFor([&fleet] {
+        return fleet.metrics.Read(IMetricsSink::Counter::LiveSubscriptionsEndedByClient) == 2;
+    })); // waited for: the second stream to observe the close
+    CHECK(fleet.metrics.Read(IMetricsSink::Counter::LiveSubscriptionsEndedByReset) == 0);
+    CHECK(WaitFor([&live] { return live.ActiveSubscriptions() == 0; })); // waited for: its place to be given back
+}
+
+TEST_CASE("A subscriber that resets is counted apart from one that closes", "[node][frame][livestats]")
+{
+    // The FIN half is the case above. This is the RST half, over a real abortive close, and the
+    // two rows are asserted against each other: folding the arms passes whichever case it lands in.
+    Fleet fleet;
+    SizedLiveSources sources { 64 };
+    LiveStatsResponder live { sources, fleet.membership, AdminCredential {}, fleet.io.Reactor(), fleet.metrics };
+
+    auto const port = FreePort();
+    auto endpoint = FrameEndpoint::Start(
+        fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), live, fleet.metrics, fleet.logger);
+    REQUIRE(endpoint.has_value());
+    fleet.Serve();
+
+    Testing::AbortiveClient client { port };
+    REQUIRE(client.Connected());
+    REQUIRE(client.Send(SubscribeToNode()));
+    REQUIRE(WaitFor([&fleet] { return fleet.metrics.Read(IMetricsSink::Counter::LiveSubscriptionsOpened) == 1; }));
+    REQUIRE(client.Reset()); // the socket really was armed for an abortive close
+
+    CHECK(WaitFor([&fleet] {
+        return fleet.metrics.Read(IMetricsSink::Counter::LiveSubscriptionsEndedByReset) == 1;
+    })); // waited for: the stream to observe the reset
+    CHECK(fleet.metrics.Read(IMetricsSink::Counter::LiveSubscriptionsEndedByClient) == 0);
+}
+
+TEST_CASE("A subscriber that stops reading is cut off past its hold and counted as a stall", "[node][frame][livestats]")
+{
+    // Four mebibytes a snapshot, every half second, into a client that never reads: the kernel's
+    // buffers fill within a few pushes, a push parks, and the hold -- the wire's floor, ten
+    // seconds -- is what ends it. Counted by the SURFACE as a stall, and by neither sweep row,
+    // which would read as a request this node failed to answer in time.
+    Fleet fleet;
+    SizedLiveSources sources { 4 * 1024 * 1024 };
+    LiveStatsResponder live { sources, fleet.membership, AdminCredential {}, fleet.io.Reactor(), fleet.metrics };
+
+    auto const port = FreePort();
+    auto endpoint = FrameEndpoint::Start(
+        fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), live, fleet.metrics, fleet.logger);
+    REQUIRE(endpoint.has_value());
+    fleet.Serve();
+
+    Conversation client { port };
+    REQUIRE(client.SendOnly(SubscribeToNode()));
+
+    auto const ceiling = std::chrono::duration_cast<std::chrono::milliseconds>(Wire::MinLiveStreamWriteStall * 4);
+    CHECK(WaitFor([&fleet] { return fleet.metrics.Read(IMetricsSink::Counter::LiveSubscriptionsStalled) == 1; },
+                  ceiling)); // waited for: the parked push to outlive its hold
+    CHECK(fleet.metrics.Read(IMetricsSink::Counter::LiveSubscriptionsEndedByClient) == 0);
+    CHECK(fleet.metrics.Read(IMetricsSink::Counter::FrameAnswerDeadlineSweeps) == 0);
+    CHECK(fleet.metrics.Read(IMetricsSink::Counter::FrameRequestDeadlineSweeps) == 0);
 }

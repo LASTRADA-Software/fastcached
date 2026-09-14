@@ -73,9 +73,14 @@ bool AdminCredential::Accepts(std::string_view authorization) const
         // through to the next row: `Basic` with unreadable base64 must not then be
         // tried as a bearer token, which would let a malformed header be compared
         // verbatim against the secret.
-        return presented.has_value() && ConstantTimeEquals(*presented, _secret);
+        return presented.has_value() && Matches(*presented);
     }
     return false;
+}
+
+bool AdminCredential::Matches(std::string_view presented) const
+{
+    return Required() && ConstantTimeEquals(presented, _secret);
 }
 
 } // namespace FastCache
