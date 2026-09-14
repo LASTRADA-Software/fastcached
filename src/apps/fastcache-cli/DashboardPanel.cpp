@@ -1228,26 +1228,41 @@ namespace
     /// What stands between a slot gauge and the limit that shapes it, and between a figure and the next on a fact line.
     constexpr std::string_view FactFigureGap = "   ";
 
-    /// How a slot limit is dressed where it is named.
-    struct SlotLimitDress
+    /// The frame's word for one of the leader's cell tones.
+    struct CellToneDress
     {
-        Distributed::SlotLimit limit;  ///< The limit this row describes.
-        std::optional<FrameTone> tone; ///< How its name is dressed; none for the one that is no problem.
-        bool remedy;                   ///< Whether the panel writes `SlotLimitTable`'s remedy under it.
+        Distributed::CellTone tone;     ///< The enumerator this row describes.
+        std::optional<FrameTone> frame; ///< How the frame dresses it; none for plain.
     };
 
-    /// One row per `Distributed::SlotLimit`, in enumerator order: nothing withdrawn is not dressed and says no
-    /// remedy; somebody else using the machine is worth a look; memory or scratch running out is an alert, since
-    /// the machine will refuse work until an operator frees it.
-    constexpr EnumTable<Distributed::SlotLimit, SlotLimitDress> SlotLimitDressTable { {
-        { .limit = Distributed::SlotLimit::Registered, .tone = std::nullopt, .remedy = false },
-        { .limit = Distributed::SlotLimit::ExternalCpu, .tone = FrameTone::Stale, .remedy = true },
-        { .limit = Distributed::SlotLimit::Memory, .tone = FrameTone::Alert, .remedy = true },
-        { .limit = Distributed::SlotLimit::Scratch, .tone = FrameTone::Alert, .remedy = true },
+    /// One row per `CellTone`, in enumerator order. A limit that withdrew slots is dressed as a stale age
+    /// is: both say *look at this row*, and a terminal has fewer colours than the page's chips.
+    constexpr EnumTable<Distributed::CellTone, CellToneDress> CellToneDressTable { {
+        { .tone = Distributed::CellTone::Plain, .frame = std::nullopt },
+        { .tone = Distributed::CellTone::Fresh, .frame = FrameTone::Fresh },
+        { .tone = Distributed::CellTone::Stale, .frame = FrameTone::Stale },
+        { .tone = Distributed::CellTone::Limited, .frame = FrameTone::Stale },
+        { .tone = Distributed::CellTone::Alert, .frame = FrameTone::Alert },
     } };
 
-    static_assert(RowsInEnumeratorOrder(SlotLimitDressTable, &SlotLimitDress::limit),
-                  "SlotLimitDressTable must hold one row per SlotLimit, in enumerator order");
+    static_assert(RowsInEnumeratorOrder(CellToneDressTable, &CellToneDress::tone),
+                  "CellToneDressTable must hold one row per CellTone, in enumerator order");
+
+    /// How the frame dresses one of the leader's cell tones.
+    /// @param tone The tone.
+    /// @return The frame's tone, or nullopt for plain.
+    [[nodiscard]] std::optional<FrameTone> FrameToneOf(Distributed::CellTone tone) noexcept
+    {
+        return tone < Distributed::CellTone::Last ? CellToneDressTable[static_cast<std::size_t>(tone)].frame : std::nullopt;
+    }
+
+    /// How the frame dresses a slot limit where it is named, judged where the fleet's cells and the page judge it.
+    /// @param limit The limit.
+    /// @return The frame's tone, or nullopt for plain.
+    [[nodiscard]] std::optional<FrameTone> LimitFrameTone(Distributed::SlotLimit limit) noexcept
+    {
+        return FrameToneOf(Distributed::SlotLimitTone(limit));
+    }
 
     /// How the running part of a slot gauge is dressed: the band of what is available that runs.
     /// @param inFlight Compiles running.
@@ -1295,7 +1310,6 @@ namespace
             return { Piece { .text = label, .priority = Priority::Essential, .tone = FrameTone::Label },
                      FactWords(std::string { in.absent }) };
 
-        auto const& dress = SlotLimitDressTable[static_cast<std::size_t>(ceilings->binding)];
         auto const name = std::string { Distributed::TraitsFor(ceilings->binding).name };
         auto line = std::vector<Piece> {};
         // The gauge goes whole or not at all: part of one would be a different share, so it is laid out here rather
@@ -1317,7 +1331,7 @@ namespace
         {
             line.push_back(Piece { .text = label, .priority = Priority::Essential, .tone = FrameTone::Label });
         }
-        line.push_back(Piece { .text = name, .priority = Priority::Essential, .tone = dress.tone });
+        line.push_back(Piece { .text = name, .priority = Priority::Essential, .tone = LimitFrameTone(ceilings->binding) });
         return line;
     }
 
@@ -1451,7 +1465,8 @@ namespace
               fact.more.push_back(SlotLimitLine(in, slots, width));
               // What to do about the limit, in `SlotLimitTable`'s own words, wrapped under the gauge.
               auto const ceilings = slots.has_value() ? slots->ceilings : std::nullopt;
-              if (ceilings.has_value() && SlotLimitDressTable[static_cast<std::size_t>(ceilings->binding)].remedy)
+              // A limit that withdrew nothing needs no remedy: `registered` is the machine offering all it has.
+              if (ceilings.has_value() && ceilings->binding != Distributed::SlotLimit::Registered)
               {
                   for (auto& line: Wrapped(Distributed::TraitsFor(ceilings->binding).remedy, width, in.cellWidth))
                       fact.more.push_back(
@@ -2013,26 +2028,6 @@ namespace
                || needle.empty();
     }
 
-    /// The frame's word for one of the leader's cell tones.
-    struct CellToneDress
-    {
-        Distributed::CellTone tone;     ///< The enumerator this row describes.
-        std::optional<FrameTone> frame; ///< How the frame dresses it; none for plain.
-    };
-
-    /// One row per `CellTone`, in enumerator order. A limit that withdrew slots is dressed as a stale age
-    /// is: both say *look at this row*, and a terminal has fewer colours than the page's chips.
-    constexpr EnumTable<Distributed::CellTone, CellToneDress> CellToneDressTable { {
-        { .tone = Distributed::CellTone::Plain, .frame = std::nullopt },
-        { .tone = Distributed::CellTone::Fresh, .frame = FrameTone::Fresh },
-        { .tone = Distributed::CellTone::Stale, .frame = FrameTone::Stale },
-        { .tone = Distributed::CellTone::Limited, .frame = FrameTone::Stale },
-        { .tone = Distributed::CellTone::Alert, .frame = FrameTone::Alert },
-    } };
-
-    static_assert(RowsInEnumeratorOrder(CellToneDressTable, &CellToneDress::tone),
-                  "CellToneDressTable must hold one row per CellTone, in enumerator order");
-
     /// The tone a cell is dressed with, where its column has one.
     ///
     /// Given whether or not the terminal shows colour: the presenter decides how a tone looks, and a
@@ -2050,7 +2045,7 @@ namespace
         auto const tone = number.has_value()
                               ? Distributed::FleetCellTone(section, column, *number)
                               : Distributed::FleetCellTone(section, column, std::string_view { cell.lexical });
-        return tone < Distributed::CellTone::Last ? CellToneDressTable[static_cast<std::size_t>(tone)].frame : std::nullopt;
+        return FrameToneOf(tone);
     }
 
     /// The active section's table, walked from the header line the leader sent.
