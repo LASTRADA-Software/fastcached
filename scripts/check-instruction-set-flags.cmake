@@ -5,78 +5,58 @@
 # `-msha`, `-msse4.1`, `-march=native` or `/arch:AVX2` on a target lets the compiler use those
 # instructions anywhere in each unit it reaches -- including in the out-of-line copies of inline
 # functions the linker then hands to code that runs on every CPU. A hardware path asks for its
-# instructions per function (`__attribute__((target(...)))`) and runs only once `Core/CpuFeatures`
-# has said the CPU has them; `.agent/rules/build-and-toolchain.md` carries the rule and its reasons.
+# instructions per function and runs only once the CPU has been asked (#1420 carries the rule and
+# the one such path).
 #
-# ## Why a check, and why over the compile database
+# **No CI run can catch a violation**: the runners HAVE the instructions, so a target that gains
+# `-msha` builds and passes everywhere it is tested and dies of SIGILL on the customer CPU that lacks
+# them. So the question is asked of the flags, not of a run.
 #
-# **No CI run can catch a violation.** The runners HAVE the instructions, so a target that gains
-# `-msha` builds and passes everywhere it is tested and dies of SIGILL on the customer CPU that
-# lacks them. So the question is asked of the flags, not of a run.
+# ## Why the compile database
 #
-# The compile database is the artefact: every flag a unit is compiled with is in its `command`,
-# wherever it came from -- a preset, a `-D` on a configure line, `target_compile_options`, the
-# environment. A scan of CMake files would see only the spellings somebody thought to look for.
-# And it is asked of the database of the build that SHIPS as well as the one that tests: the
-# package jobs configure without tests, and macOS packages from a configure line no test leg
-# uses, so a step there runs this same script (`scripts/check-instruction-set-flags.sh`).
-#
-# ## What decides, as data
-#
-#   DriverRows          which grammar a unit's compiler reads, from the driver's NAME
-#   SpellingRows        per grammar, which tokens are refused or allowed, first match wins
-#   ResponseFileRows    which `@file` a command may name without this check reading it
-#   PlantRows           per grammar, the flag the plant mode puts into a real unit
-#
-# An unknown `-m` flag is REFUSED by the last Gnu row, not allowed by absence: `-m` reaches
-# instruction sets (`-msha`, `-mavx2`) and much besides, and an allowlist that did not name a flag
-# would read identically to one that had judged it. A flag that enables nothing gets a row with
-# its reason. The rows exist only for spellings something actually produces -- CMake itself on
-# Apple (`Modules/Platform/Apple-Clang.cmake`: `-mmacosx-version-min=`, and `-arch` from
-# `CMAKE_OSX_ARCHITECTURES`) -- so the first real new one arrives as a refusal.
-#
-# `-arch` is judged per VALUE: `x86_64h` is the Haswell slice and implies AVX2.
+# It is the artefact every flag reaches after CMake has merged them -- a preset, a `-D` on a configure
+# line, `CMAKE_<LANG>_FLAGS` and its `_INIT`, a toolchain file, target and per-source options,
+# generator expressions. A scan of CMake files would see only the spellings somebody thought to look
+# for. It is asked of the database of the build that SHIPS as well as of the ones that test: the
+# package jobs configure without tests, and macOS packages from a configure line no test leg uses.
 #
 # ## First-party is an inclusion list: `src/`
 #
-# Not "the source tree minus dependencies". CI points `CPM_SOURCE_CACHE` inside the workspace, so
-# every dependency's units sit under the source tree, and an exclusion rule bets on a layout this
-# repository does not control. What is outside `src/` -- dependencies, `vendor/endo`, sources
-# generated into the build tree -- is declined, counted and the first one named. A flag on a
-# first-party TARGET reaches that target's `src/` units too, so declining its generated units
-# loses nothing this rule is about.
+# Not "the source tree minus dependencies": CI points `CPM_SOURCE_CACHE` inside the workspace, so every
+# dependency's units sit under the source tree, and an exclusion rule bets on a layout this repository
+# does not control. Units outside `src/` -- dependencies, `vendor/endo`, sources generated into the
+# build tree -- are declined, counted and the first one named. A flag on a first-party TARGET reaches
+# that target's `src/` units too, so declining its generated units loses nothing this rule is about.
 #
-# ## The second arm: target pragmas
+# ## An unknown `-m` flag is refused
 #
-# `#pragma GCC target(...)` and `#pragma clang attribute ... target(...)` enable an instruction
-# set for every function after them in the unit, which is the same hazard with no flag to see.
-# So every C and C++ source under `src/` is scanned for one, outside comments.
-#
-# ## How it reads, and why
-#
-# The candidate tokens are matched in the RAW command string with `[`, `]` and `;` blanked first,
-# and never split into a CMake list of every argument: a `-DX=[a]` beside a flag would otherwise
-# merge list elements and hide the flag. No refused or allowed spelling contains those characters,
-# so blanking them changes nothing a row can match.
+# `-m` reaches instruction sets (`-msha`, `-mavx2`) and much besides, and an allowlist that did not name
+# a flag would read identically to one that had judged it. So a flag that enables nothing gets a row
+# with its reason, and a row exists only for a spelling something produces -- the first real new one
+# arrives as a refusal. `-arch` names an Apple slice and is refused for any value: `x86_64h` implies AVX2,
+# and nothing here sets `CMAKE_OSX_ARCHITECTURES`.
 #
 # ## What it does NOT cover, stated so nobody reads it as more
 #
-#   - Per-function attributes (`__attribute__((target(...)))`, `[[gnu::target]]`): the legitimate
-#     spelling, and deliberately not refused.
+#   - Per-function attributes (`__attribute__((target(...)))`, `[[gnu::target]]`): the legitimate spelling.
+#   - Target pragmas: `scripts/check-target-pragmas.cmake`, which asks the tree rather than a build.
 #   - Units outside `src/`, including vendored and dependency code.
-#   - A generator that writes no compile database (Visual Studio): the ctest is not registered.
-#   - A flag spelled inside a quoted define (`-DX="-msha"`) is REFUSED, not understood: the reader
-#     is narrower than a compiler, and errs toward refusing.
-#   - A response file named inside a response file is refused rather than followed.
+#   - Flags that never reach a compile command: a compiler's BUILD-TIME environment (cl's `CL` and `_CL_`,
+#     clang's `CCC_OVERRIDE_OPTIONS`), driver configuration files clang reads beside its binary, defaults a
+#     compiler was built with (a GCC configured `--with-arch=`), and the link line, where LTO code
+#     generation may take its own `-march`.
+#   - A generator that writes no compile database (Visual Studio).
+#   - A flag inside a quoted define (`-DX="-msha"`) is REFUSED, not understood, and a response file named
+#     inside a response file is refused rather than followed: the reader errs toward refusing.
 #
 # Usage:
 #   cmake -DFASTCACHED_SOURCE_DIR=<tree> -DFASTCACHED_COMPILE_DATABASE=<compile_commands.json>
 #         [-DFASTCACHED_PLANT_UNIT=src/<unit>] -P scripts/check-instruction-set-flags.cmake
 #
-# With FASTCACHED_PLANT_UNIT, the named unit's real command is judged as if it also carried its
-# grammar's PlantRows flag, and the run passes only when that flag is refused -- the proof, on a
-# real database, that the check still sees a planted flag on a real first-party unit. The pragma
-# arm does not run in that mode.
+# With FASTCACHED_PLANT_UNIT, each of that unit's real commands also gets its grammar's PlantRows flag,
+# and the run passes only when every planted flag is refused -- proof, on a real database, that the
+# reading still sees a flag on a real first-party unit. The planted flag goes into the command text, so
+# the extraction is exercised and not only the rows.
 #
 # The verdict is `CMake Error` in the output, never the exit code.
 
@@ -85,26 +65,27 @@ cmake_minimum_required(VERSION 3.28)
 include("${CMAKE_CURRENT_LIST_DIR}/lib/CheckCommon.cmake")
 
 foreach(required IN ITEMS FASTCACHED_SOURCE_DIR FASTCACHED_COMPILE_DATABASE)
-    if(NOT DEFINED ${required} OR "${${required}}" STREQUAL "")
+    if("${${required}}" STREQUAL "")
         message(FATAL_ERROR "instruction-set-flags: ${required} must be set")
     endif()
 endforeach()
 
-# families|reason|driver-name pattern (on the lower-cased file name, `.exe` removed). First match wins.
+# families|reason|driver-name pattern, on the lower-cased file name with `.exe` removed. First match wins.
+# `scripts/tidy-sweep.sh` classifies cl-style drivers for a different question and keeps its own pattern.
 set(DriverRows
     "Msvc,Gnu,ClangCl|clang-cl reads cl's /arch:, GCC's -m flags, and hands /clang:<flag> to the GCC grammar|^clang-cl(-[0-9.]+)?$"
     "Msvc|cl reads /arch: and -arch:|^cl$"
     "Gnu|GCC and clang read -m, -march= and -mcpu=, and Apple's clang reads -arch|^([a-z0-9_.]+-)*(clang|clang\\+\\+|gcc|g\\+\\+|cc|c\\+\\+)(-[0-9.]+)?$"
 )
 
-# family|verdict|kind|reason|spelling. First row that matches wins; a token no row matches enables nothing
-# in that grammar. kind: exact, prefix, iprefix (case-insensitive), pair (flag and value), pair-any (flag,
-# any value), unwrap (judge the rest of the token by the Gnu rows).
+# family|verdict|kind|reason|spelling. The first row matching a token wins, and a token no row matches
+# enables nothing in that grammar. Candidate tokens are EXTRACTED by a pattern derived from these rows, so
+# a new row is read as soon as it is written.
+#   verdict  allow, refuse, or unwrap (judge what follows the spelling by the Gnu rows)
+#   kind     exact, prefix, iprefix (case-insensitive prefix), or flag-value (the spelling, then one value)
 set(SpellingRows
-    "Gnu|allow|prefix|the OS API floor CMake derives from CMAKE_OSX_DEPLOYMENT_TARGET, which enables no instruction|-mmacosx-version-min="
-    "Gnu|allow|pair|the arm64 slice CMAKE_OSX_ARCHITECTURES names, whose instructions are the ARMv8 baseline|-arch arm64"
-    "Gnu|allow|pair|the x86_64 slice CMAKE_OSX_ARCHITECTURES names, which is the x86-64 baseline|-arch x86_64"
-    "Gnu|refuse|pair-any|an Apple slice no row has judged, and x86_64h for one implies AVX2|-arch"
+    "Gnu|allow|prefix|it is the OS API floor CMakeLists.txt pins through CMAKE_OSX_DEPLOYMENT_TARGET, and enables no instruction|-mmacosx-version-min="
+    "Gnu|refuse|flag-value|it names an Apple slice, and a slice can imply instructions (x86_64h implies AVX2)|-arch"
     "Gnu|refuse|prefix|it selects a CPU, and with it every instruction set that CPU has|-march="
     "Gnu|refuse|prefix|it selects a CPU, and with it every instruction set that CPU has|-mcpu="
     "Gnu|refuse|exact|it is clang's own switch for an instruction set, reached through -Xclang|-target-feature"
@@ -114,9 +95,9 @@ set(SpellingRows
     "ClangCl|unwrap|prefix|clang-cl hands what follows to the GCC grammar|/clang:"
 )
 
-# verdict|reason|extension
-set(ResponseFileRows
-    "decline|CMake writes the module map at build time from the dependency scan, and it names module files only|.modmap"
+# reason|extension of a response file this check may leave unread.
+set(DeclinedResponseFiles
+    "CMake writes the module map at build time from the dependency scan, and it names module files only|.modmap"
 )
 
 # family|flag
@@ -125,23 +106,47 @@ set(PlantRows
     "Msvc|/arch:AVX2"
 )
 
-set(plantUnit "")
-if(DEFINED FASTCACHED_PLANT_UNIT AND NOT FASTCACHED_PLANT_UNIT STREQUAL "")
-    set(plantUnit "${FASTCACHED_PLANT_UNIT}")
-endif()
+# The extraction pattern, derived from SpellingRows. A spelling is inserted unescaped, so it may hold only
+# characters a regular expression reads literally; brackets, semicolons and `|` never appear in one.
+set(tokenEnd "[^ \t\r\n\"]")
+set(CandidateAlternatives "@${tokenEnd}+")
+foreach(row IN LISTS SpellingRows)
+    fastcached_row_fields("${row}" family verdict kind reason spelling)
+    if(NOT spelling MATCHES "^[-/:=_A-Za-z0-9]+$")
+        message(FATAL_ERROR "instruction-set-flags: SpellingRows spelling `${spelling}` holds a character the derived pattern would read as regex syntax")
+    endif()
+    if(NOT verdict MATCHES "^(allow|refuse|unwrap)$")
+        message(FATAL_ERROR "instruction-set-flags: SpellingRows names an unknown verdict `${verdict}` for `${spelling}`")
+    endif()
+    set(alternative "")
+    if(kind STREQUAL "iprefix")
+        string(LENGTH "${spelling}" length)
+        math(EXPR last "${length} - 1")
+        foreach(at RANGE ${last})
+            string(SUBSTRING "${spelling}" ${at} 1 character)
+            string(TOUPPER "${character}" upper)
+            string(TOLOWER "${character}" lower)
+            if(upper STREQUAL lower)
+                string(APPEND alternative "${character}")
+            else()
+                string(APPEND alternative "[${upper}${lower}]")
+            endif()
+        endforeach()
+    else()
+        set(alternative "${spelling}")
+    endif()
+    if(kind STREQUAL "flag-value")
+        string(APPEND alternative "[ \t]+${tokenEnd}+")
+    elseif(kind MATCHES "^(exact|prefix|iprefix)$")
+        string(APPEND alternative "${tokenEnd}*")
+    else()
+        message(FATAL_ERROR "instruction-set-flags: SpellingRows names an unknown kind `${kind}` for `${spelling}`")
+    endif()
+    string(APPEND CandidateAlternatives "|${alternative}")
+endforeach()
+set(CandidatePattern "(^|[ \t\r\n\"])(${CandidateAlternatives})")
 
-set(problems "")
-set(firstParty 0)
-set(declined 0)
-set(firstDeclined "")
-set(modmapsDeclined 0)
-set(plantFound FALSE)
-set(plantedUnitShown "")
-set(plantFlags "")
-set(plantRefused "")
-
-# Lower-case on a host whose paths are case-insensitive, so a drive letter or a directory spelled
-# differently by the compiler and by the configure line still compares equal.
+# @p path with forward slashes and no `..`, lower-cased on a host whose paths are case-insensitive.
 function(fastcached_path_key path out)
     cmake_path(CONVERT "${path}" TO_CMAKE_PATH_LIST path NORMALIZE)
     if(CMAKE_HOST_WIN32)
@@ -150,10 +155,7 @@ function(fastcached_path_key path out)
     set(${out} "${path}" PARENT_SCOPE)
 endfunction()
 
-fastcached_path_key("${FASTCACHED_SOURCE_DIR}/src/" sourceRootKey)
-fastcached_path_key("${plantUnit}" plantUnitKey)
-
-# The families (a CMake list) a driver's name reads, or "" when no row names it.
+# The families (a CMake list) the driver of @p command reads, or "" when no row names it.
 function(fastcached_driver_families command familiesOut driverOut)
     string(REGEX MATCH "^[ \t]*(\"[^\"]*\"|[^ \t]+)" driver "${command}")
     string(STRIP "${driver}" driver)
@@ -173,13 +175,11 @@ function(fastcached_driver_families command familiesOut driverOut)
     set(${driverOut} "${name}" PARENT_SCOPE)
 endfunction()
 
-# The candidate tokens in @p text: anything a SpellingRow or a response file could be. Brackets and
-# semicolons are blanked first, so the returned list is safe to walk.
+# The candidate tokens in @p text. Brackets and semicolons are blanked first -- no spelling holds one -- so an
+# unbalanced bracket in a neighbouring argument cannot fuse two candidates in the returned list.
 function(fastcached_candidates text out)
     string(REGEX REPLACE "[][;]" " " text "${text}")
-    string(REGEX MATCHALL
-        "(^|[ \t\r\n\"])(-m[^ \t\r\n\"]*|-arch[ \t]+[^ \t\r\n\"]+|[-/][Aa][Rr][Cc][Hh]:[^ \t\r\n\"]*|-target-feature|/clang:[^ \t\r\n\"]*|@[^ \t\r\n\"]+)"
-        found "${text}")
+    string(REGEX MATCHALL "${CandidatePattern}" found "${text}")
     set(candidates "")
     foreach(token IN LISTS found)
         string(REGEX REPLACE "^[ \t\r\n\"]" "" token "${token}")
@@ -189,57 +189,46 @@ function(fastcached_candidates text out)
     set(${out} "${candidates}" PARENT_SCOPE)
 endfunction()
 
-# The verdict of the first SpellingRow matching @p token under @p families: "refuse|<reason>", or "".
-function(fastcached_judge_token token families out)
-    set(verdict "")
+# The reason the first SpellingRow matching @p token under @p families refuses it, or "" when none does.
+function(fastcached_refusal token families out)
+    set(refusal "")
     foreach(row IN LISTS SpellingRows)
-        fastcached_row_fields("${row}" family rowVerdict kind reason spelling)
+        fastcached_row_fields("${row}" family verdict kind reason spelling)
         list(FIND families "${family}" applies)
         if(applies EQUAL -1)
             continue()
         endif()
-        set(matches FALSE)
-        if(kind STREQUAL "exact" OR kind STREQUAL "pair")
-            if(token STREQUAL spelling)
-                set(matches TRUE)
-            endif()
-        elseif(kind STREQUAL "prefix" OR kind STREQUAL "unwrap")
-            string(FIND "${token}" "${spelling}" at)
-            if(at EQUAL 0)
-                set(matches TRUE)
-            endif()
-        elseif(kind STREQUAL "iprefix")
-            string(TOLOWER "${token}" lowerToken)
-            string(TOLOWER "${spelling}" lowerSpelling)
-            string(FIND "${lowerToken}" "${lowerSpelling}" at)
-            if(at EQUAL 0)
-                set(matches TRUE)
-            endif()
-        elseif(kind STREQUAL "pair-any")
-            string(FIND "${token}" "${spelling} " at)
-            if(at EQUAL 0)
-                set(matches TRUE)
+        set(subject "${token}")
+        set(needle "${spelling}")
+        if(kind STREQUAL "iprefix")
+            string(TOLOWER "${subject}" subject)
+            string(TOLOWER "${needle}" needle)
+        elseif(kind STREQUAL "flag-value")
+            string(APPEND needle " ")
+        endif()
+        if(kind STREQUAL "exact")
+            if(NOT subject STREQUAL needle)
+                continue()
             endif()
         else()
-            message(FATAL_ERROR "instruction-set-flags: SpellingRows names an unknown kind `${kind}` for `${spelling}`")
+            string(FIND "${subject}" "${needle}" at)
+            if(NOT at EQUAL 0)
+                continue()
+            endif()
         endif()
-        if(NOT matches)
-            continue()
-        endif()
-        if(rowVerdict STREQUAL "unwrap")
+        if(verdict STREQUAL "refuse")
+            set(refusal "${reason}")
+        elseif(verdict STREQUAL "unwrap")
             string(LENGTH "${spelling}" skip)
             string(SUBSTRING "${token}" ${skip} -1 inner)
-            fastcached_judge_token("${inner}" "Gnu" innerVerdict)
-            set(verdict "${innerVerdict}")
-        elseif(rowVerdict STREQUAL "refuse")
-            set(verdict "refuse|${reason}")
+            fastcached_refusal("${inner}" "Gnu" refusal)
         endif()
         break()
     endforeach()
-    set(${out} "${verdict}" PARENT_SCOPE)
+    set(${out} "${refusal}" PARENT_SCOPE)
 endfunction()
 
-# Judge every candidate in @p text for @p unit, appending to the lists and counter the caller names.
+# Judge every candidate in @p text for @p unit, appending to the list and counter the caller names.
 # A function and not a macro: a macro substitutes its arguments textually and re-parses them, so a
 # backslash in a Windows command would be eaten twice before a row ever saw it.
 # @p depth is 0 for a command and 1 inside a response file, which may not name another.
@@ -248,36 +237,35 @@ function(fastcached_judge_text text families unit directory depth problemsVar mo
     set(modmaps "${${modmapsVar}}")
     fastcached_candidates("${text}" candidates)
     foreach(token IN LISTS candidates)
-        string(SUBSTRING "${token}" 0 1 lead)
-        if(lead STREQUAL "@")
-            string(SUBSTRING "${token}" 1 -1 response)
-            cmake_path(GET response EXTENSION LAST_ONLY extension)
-            set(responseDeclined FALSE)
-            foreach(row IN LISTS ResponseFileRows)
-                fastcached_row_fields("${row}" rowVerdict rowReason rowExtension)
-                if(extension STREQUAL rowExtension AND rowVerdict STREQUAL "decline")
-                    set(responseDeclined TRUE)
-                endif()
-            endforeach()
-            if(responseDeclined)
-                math(EXPR modmaps "${modmaps} + 1")
-            elseif(NOT depth EQUAL 0)
-                list(APPEND found "${unit}: names `${token}` inside a response file, which this check does not follow")
-            else()
-                cmake_path(ABSOLUTE_PATH response BASE_DIRECTORY "${directory}" NORMALIZE OUTPUT_VARIABLE responsePath)
-                if(NOT EXISTS "${responsePath}" OR IS_DIRECTORY "${responsePath}")
-                    list(APPEND found "${unit}: cannot read response file `${token}` (${responsePath}), so not every flag it is compiled with can be seen")
-                else()
-                    file(READ "${responsePath}" responseText)
-                    fastcached_judge_text("${responseText}" "${families}" "${unit}" "${directory}" 1 found modmaps)
-                endif()
+        if(NOT token MATCHES "^@")
+            fastcached_refusal("${token}" "${families}" refusal)
+            if(NOT refusal STREQUAL "")
+                list(APPEND found "${unit}: `${token}`, because ${refusal}")
             endif()
             continue()
         endif()
-        fastcached_judge_token("${token}" "${families}" verdict)
-        if(NOT verdict STREQUAL "")
-            fastcached_row_fields("${verdict}" word reason)
-            list(APPEND found "${unit}: `${token}`, because ${reason}")
+        string(SUBSTRING "${token}" 1 -1 response)
+        cmake_path(GET response EXTENSION LAST_ONLY extension)
+        set(responseDeclined FALSE)
+        foreach(row IN LISTS DeclinedResponseFiles)
+            fastcached_row_fields("${row}" rowReason rowExtension)
+            if(extension STREQUAL rowExtension)
+                set(responseDeclined TRUE)
+                break()
+            endif()
+        endforeach()
+        if(responseDeclined)
+            math(EXPR modmaps "${modmaps} + 1")
+        elseif(NOT depth EQUAL 0)
+            list(APPEND found "${unit}: names `${token}` inside a response file, which this check does not follow")
+        else()
+            cmake_path(ABSOLUTE_PATH response BASE_DIRECTORY "${directory}" NORMALIZE OUTPUT_VARIABLE responsePath)
+            if(NOT EXISTS "${responsePath}" OR IS_DIRECTORY "${responsePath}")
+                list(APPEND found "${unit}: cannot read response file `${token}` (${responsePath}), so not every flag it is compiled with can be seen")
+            else()
+                file(READ "${responsePath}" responseText)
+                fastcached_judge_text("${responseText}" "${families}" "${unit}" "${directory}" 1 found modmaps)
+            endif()
         endif()
     endforeach()
     set(${problemsVar} "${found}" PARENT_SCOPE)
@@ -296,6 +284,23 @@ if(entryCount EQUAL 0)
     message(FATAL_ERROR "instruction-set-flags: `${FASTCACHED_COMPILE_DATABASE}` has no entries, so no flag has been judged")
 endif()
 
+fastcached_path_key("${FASTCACHED_SOURCE_DIR}/src/" sourceRootKey)
+string(LENGTH "${sourceRootKey}" sourceRootLength)
+set(plantUnit "${FASTCACHED_PLANT_UNIT}")
+set(plantUnitKey "")
+if(NOT plantUnit STREQUAL "")
+    fastcached_path_key("${FASTCACHED_SOURCE_DIR}/${plantUnit}" plantUnitKey)
+endif()
+
+set(problems "")
+set(firstParty 0)
+set(declined 0)
+set(firstDeclined "")
+set(modmapsDeclined 0)
+set(plantedUnit "")
+set(plantedEntries 0)
+set(plantFlags "")
+
 math(EXPR lastEntry "${entryCount} - 1")
 foreach(index RANGE ${lastEntry})
     string(JSON entry GET "${database}" ${index})
@@ -306,8 +311,14 @@ foreach(index RANGE ${lastEntry})
         list(APPEND problems "entry ${index}: has no `file` or `directory`, so which unit it compiles is unknown")
         continue()
     endif()
+    # The key decides; the name shown keeps the path's case. Lower-casing ASCII keeps the length, so one
+    # offset cuts both.
     cmake_path(ABSOLUTE_PATH unitFile BASE_DIRECTORY "${directory}" NORMALIZE OUTPUT_VARIABLE unitPath)
-    fastcached_path_key("${unitPath}" unitKey)
+    cmake_path(CONVERT "${unitPath}" TO_CMAKE_PATH_LIST unitPath NORMALIZE)
+    set(unitKey "${unitPath}")
+    if(CMAKE_HOST_WIN32)
+        string(TOLOWER "${unitKey}" unitKey)
+    endif()
     string(FIND "${unitKey}" "${sourceRootKey}" underSource)
     if(NOT underSource EQUAL 0)
         math(EXPR declined "${declined} + 1")
@@ -316,13 +327,8 @@ foreach(index RANGE ${lastEntry})
         endif()
         continue()
     endif()
-    # The key decides; the name shown is the path as written, so a Windows host does not print it lower-cased.
-    # Lower-casing ASCII keeps the length, so the same offset cuts both.
-    string(LENGTH "${sourceRootKey}" rootLength)
-    cmake_path(CONVERT "${unitPath}" TO_CMAKE_PATH_LIST shownPath NORMALIZE)
-    string(SUBSTRING "${shownPath}" ${rootLength} -1 relative)
+    string(SUBSTRING "${unitPath}" ${sourceRootLength} -1 relative)
     set(unit "src/${relative}")
-    fastcached_path_key("${unit}" unitRelativeKey)
     math(EXPR firstParty "${firstParty} + 1")
 
     if(NOT commandError STREQUAL "NOTFOUND")
@@ -335,11 +341,9 @@ foreach(index RANGE ${lastEntry})
         continue()
     endif()
 
-    # The plant goes INTO the command text, so it is found by the same extraction and judged by the
-    # same rows as a real flag; judging the flag alone would prove the rows and not the reading.
-    if(NOT plantUnit STREQUAL "" AND unitRelativeKey STREQUAL plantUnitKey)
-        set(plantFound TRUE)
-        set(plantedUnitShown "${unit}")
+    if(unitKey STREQUAL plantUnitKey)
+        set(plantedUnit "${unit}")
+        math(EXPR plantedEntries "${plantedEntries} + 1")
         foreach(plantRow IN LISTS PlantRows)
             fastcached_row_fields("${plantRow}" plantFamily plantFlag)
             list(FIND families "${plantFamily}" plantApplies)
@@ -357,22 +361,23 @@ if(firstParty EQUAL 0)
     list(APPEND problems "no entry compiles a unit under `${FASTCACHED_SOURCE_DIR}/src/` (${declined} declined), so no first-party flag has been judged")
 endif()
 
-set(declinedText "${declined} unit(s) outside src/ declined")
+set(summary "${firstParty} first-party unit(s) judged, none carries a global instruction-set flag; ${declined} unit(s) outside src/ declined")
 if(declined GREATER 0)
-    string(APPEND declinedText " (first: ${firstDeclined})")
+    string(APPEND summary " (first: ${firstDeclined})")
 endif()
+string(APPEND summary "; ${modmapsDeclined} module-map response file(s) declined")
 
 if(NOT plantUnit STREQUAL "")
-    if(NOT plantFound)
+    if(plantedUnit STREQUAL "")
         list(APPEND problems "plant: `${plantUnit}` is not a first-party unit of this database, so the plant was never judged")
     elseif(plantFlags STREQUAL "")
         list(APPEND problems "plant: no PlantRows flag applies to `${plantUnit}`'s driver, so the plant was never judged")
     endif()
-    # Each planted flag must have produced exactly the refusal a real one would; that refusal is the
-    # expected outcome, so it is taken out of the problems, and a plant that produced none is one.
-    # A unit compiled by several targets has several entries, and each was planted and must be refused.
+    # Each planted flag must have produced the refusal a real one would. That refusal is the expected outcome,
+    # so it is taken out of the problems; a plant that produced none is a problem. A unit compiled by several
+    # targets has several entries, each planted.
     foreach(flag IN LISTS plantFlags)
-        set(expectedPrefix "${plantedUnitShown}: `${flag}`, because ")
+        set(expectedPrefix "${plantedUnit}: `${flag}`, because ")
         set(kept "")
         set(seen FALSE)
         foreach(problem IN LISTS problems)
@@ -384,56 +389,25 @@ if(NOT plantUnit STREQUAL "")
             endif()
         endforeach()
         set(problems "${kept}")
-        if(seen)
-            list(APPEND plantRefused "${flag}")
-        else()
-            list(APPEND problems "plant: `${flag}` planted into `${plantUnit}` was ACCEPTED -- the check cannot see the flag it exists to refuse")
+        if(NOT seen)
+            list(APPEND problems "plant: `${flag}` planted into `${plantedUnit}` was ACCEPTED -- the check cannot see the flag it exists to refuse")
         endif()
     endforeach()
-    if(problems STREQUAL "")
-        list(LENGTH plantRefused plantedCount)
-        list(REMOVE_DUPLICATES plantRefused)
-        list(JOIN plantRefused "`, `" refusedText)
-        message(STATUS "instruction-set-flags plant: `${refusedText}` planted into ${plantedUnitShown} (${plantedCount} entr(y/ies)) refused as it must; ${firstParty} first-party unit(s) judged, ${declinedText}")
-    endif()
-else()
-    # The pragma arm: one traversal of src/, then only the files that mention a pragma at all.
-    file(GLOB_RECURSE sourceFiles LIST_DIRECTORIES false "${FASTCACHED_SOURCE_DIR}/src/*")
-    set(scanned 0)
-    foreach(path IN LISTS sourceFiles)
-        if(NOT path MATCHES "\\.(c|cc|cpp|cxx|h|hh|hpp|hxx|inl|ipp)$")
-            continue()
-        endif()
-        math(EXPR scanned "${scanned} + 1")
-        file(READ "${path}" content)
-        string(FIND "${content}" "pragma" mentionsPragma)
-        if(mentionsPragma EQUAL -1)
-            continue()
-        endif()
-        fastcached_scan_code_lines("${content}"
-            "#[ \t]*pragma[ \t]+(GCC[ \t]+target|clang[ \t]+attribute.*target)" hits)
-        cmake_path(RELATIVE_PATH path BASE_DIRECTORY "${FASTCACHED_SOURCE_DIR}" OUTPUT_VARIABLE shown)
-        foreach(hit IN LISTS hits)
-            if(hit MATCHES "^use:([0-9]+)$")
-                list(APPEND problems "${shown}:${CMAKE_MATCH_1}: a target pragma enables an instruction set for every function after it in the unit")
-            endif()
-        endforeach()
-    endforeach()
-    if(scanned EQUAL 0)
-        list(APPEND problems "no C or C++ source under `${FASTCACHED_SOURCE_DIR}/src/`, so the target-pragma arm judged nothing")
-    endif()
-    if(problems STREQUAL "")
-        message(STATUS "instruction-set-flags: ${firstParty} first-party unit(s) judged, none carries a global instruction-set flag; ${declinedText}; ${modmapsDeclined} module-map response file(s) declined; ${scanned} source(s) under src/ carry no target pragma")
-    endif()
+    set(distinctFlags "${plantFlags}")
+    list(REMOVE_DUPLICATES distinctFlags)
+    list(JOIN distinctFlags "`, `" flagsText)
+    set(summary "plant: `${flagsText}` planted into ${plantedUnit} (${plantedEntries} entr(y/ies)) refused as it must; ${summary}")
 endif()
 
-if(NOT problems STREQUAL "")
+if(problems STREQUAL "")
+    message(STATUS "instruction-set-flags: ${summary}")
+else()
     list(LENGTH problems problemCount)
     list(JOIN problems "\n  " problemText)
     message(FATAL_ERROR
         "instruction-set-flags: ${problemCount} problem(s) in `${FASTCACHED_COMPILE_DATABASE}`:\n  ${problemText}\n"
         "An instruction set is asked for per function -- __attribute__((target(...))) -- and that function runs only "
-        "once Core/CpuFeatures says the CPU has it (.agent/rules/build-and-toolchain.md, instruction-set extensions). "
-        "A flag that enables no instruction set gets a SpellingRows row with its reason; a new compiler gets a DriverRows row. "
-        "Not covered: per-function attributes, and units outside src/.")
+        "once the CPU has been asked (#1420: Core/CpuFeatures, and the instruction-set extension entry in "
+        ".agent/rules/build-and-toolchain.md). A flag that enables no instruction set gets a SpellingRows row with its "
+        "reason; a new compiler gets a DriverRows row. What this check does not cover is listed in its header.")
 endif()
