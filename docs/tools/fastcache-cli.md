@@ -686,20 +686,24 @@ Who may subscribe follows the verbs' own rules:
   streams the fleet to **this machine only**, because the fleet names every machine
   and where it answers.
 - **Only the leader serves `fleet`.** A follower answers with the leader's address,
-  and `live-stats` subscribes there instead. It follows at most three such
-  redirections in a row.
+  and `live-stats` subscribes there instead. It follows at most two such redirections
+  in a row, and the count starts again at every retry from `--addr`.
 
 What ends a session and what is only a gap:
 
 | What happened | Outcome |
 |---|---|
-| not a member, or a wrong or missing credential | the session ends, exit **4**; a credential refusal names `--token-file` or `--dashboard-token-file`, and membership is the node's `--fleet-member` |
-| the stream's layout, frame or wire version is not this build's | the session ends, exit **5**: retrying cannot succeed, and the remedy is upgrading one end |
-| no leader is known yet, the server is at its subscriber limit, the connection is lost, or the server ends the stream | a gap in the samples with its reason in a remark, then a new subscription at the next tick |
+| no leader is known yet, the server is at its subscriber limit, or the stream is lost, goes silent or is ended by the server | a gap in the samples with its reason in a remark, then a new subscription at `--addr` one interval later |
+| the server's wire version, or its set of verbs, is not this build's | the session ends, exit **5**, naming the upgrade, even after samples were read: retrying cannot succeed |
+| a frame this build cannot read | the session ends, exit **5** |
+| any other refusal, such as not a member or a wrong or missing credential | before any sample was read, the session ends, exit **4**, naming `--token-file` (cache or node), `--dashboard-token-file` (fleet) or the node's `--fleet-member`; after one, a gap and a retry |
 
-A session that never read a sample exits with the outcome of its first failure. One
-that read at least one exits **0** however it ends, since a restart the view drew as a
-gap is the view working.
+A refusal about the caller ends a session only while nothing has been read: once a
+sample was, a refusal is a moment in the view's history, such as a member being
+removed and restored by a reload, and the view keeps going. A session that read at
+least one sample exits **0** when it ends by `q`, `Ctrl-C` or `--samples`; one
+that never did exits with the outcome of its first failure. `--dashboard-token-file`
+is sent on a `fleet` subscription only.
 
 ## Authentication
 
