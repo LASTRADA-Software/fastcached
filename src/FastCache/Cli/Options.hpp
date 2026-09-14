@@ -76,6 +76,26 @@ using ConfigOf = ConfigOfImpl<Result>::type;
 template <typename Result>
 using SameFieldFn = bool (*)(ConfigOf<Result> const&, ConfigOf<Result> const&);
 
+/// How a configuration FILE spells a setting's value, before the row's applier
+/// reads it.
+///
+/// **A spelling, not a second setting.** The command line has a shell in front of it
+/// and a file has nothing, so `$HOME/cache` reaches `--storage` already expanded
+/// and reaches `storage_path:` as the eight characters an operator typed. Expanding
+/// in the file layer and nowhere else keeps the applier the one parser both sources
+/// reach -- the same arrangement as a presence flag's `true`/`false`, which is also
+/// a file-only spelling of something argv says another way.
+///
+/// **Never in the argv parser.** A service registration replays the command line
+/// the installer built from the parse, so an expansion there would register the
+/// expanded text: `$$` typed for a literal dollar would come back as `$` and the
+/// replayed service would refuse to start on a reference to a variable nobody set.
+enum class FileValue : std::uint8_t
+{
+    Literal,           ///< The file's text reaches the applier as written.
+    ExpandEnvironment, ///< `$NAME`, `${NAME}` and `$$` are expanded first; see `ExpandEnvironmentVariables`.
+};
+
 /// Whether a setting can take effect without restarting the process.
 ///
 /// **Opt-in, and that default is the guard.** The daemon's reloader used to decide
@@ -110,26 +130,6 @@ enum class Reloadable : std::uint8_t
     /// column now, so neither has such a ladder left.
     No,
     Yes, ///< Takes effect on reload.
-};
-
-/// How a configuration FILE spells a setting's value, before the row's applier
-/// reads it.
-///
-/// **A spelling, not a second setting.** The command line has a shell in front of it
-/// and a file has nothing, so `$HOME/cache` reaches `--storage` already expanded
-/// and reaches `storage_path:` as the eight characters an operator typed. Expanding
-/// in the file layer and nowhere else keeps the applier the one parser both sources
-/// reach -- the same arrangement as a presence flag's `true`/`false`, which is also
-/// a file-only spelling of something argv says another way.
-///
-/// **Never in the argv parser.** A service registration replays the command line
-/// the installer built from the parse, so an expansion there would register the
-/// expanded text: `$$` typed for a literal dollar would come back as `$` and the
-/// replayed service would refuse to start on a reference to a variable nobody set.
-enum class FileValue : std::uint8_t
-{
-    Literal,           ///< The file's text reaches the applier as written.
-    ExpandEnvironment, ///< `$NAME`, `${NAME}` and `$$` are expanded first; see `ExpandEnvironmentVariables`.
 };
 
 /// One accepted command-line option.
