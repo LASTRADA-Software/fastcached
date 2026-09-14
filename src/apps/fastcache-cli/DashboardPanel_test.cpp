@@ -4205,6 +4205,35 @@ TEST_CASE("on a text rung the fleet chart is the rung's marks: a sample a cell, 
     CHECK(marks > 0);
 }
 
+namespace
+{
+
+/// A Unicode fleet frame over 100 samples of build-01 and build-02, with build-03 in the first two when @p stale.
+/// @param stale Whether build-03 reported, long ago.
+/// @param columns The terminal's width.
+/// @param rows The terminal's height.
+/// @return The frame.
+[[nodiscard]] std::string StaleMachineFrame(bool stale, int columns, int rows)
+{
+    auto view = PanelView {
+        FleetPanel(),
+        PanelContext { .absent = std::string { Absent }, .cellWidth = &FakeCellWidth, .rung = RenderRung::Unicode }
+    };
+    auto script = std::vector<DashboardEvent> { DashboardEvent {
+        .kind = DashboardEventKind::Resize, .columns = columns, .rows = rows } };
+    for (auto const second: std::views::iota(1, 101))
+        script.push_back(FleetSampleOf(second,
+                                       ChartText(stale && second <= 2 ? std::vector<std::string> { "100", "900", "500" }
+                                                                      : std::vector<std::string> { "100", "900" })));
+    script.push_back(Tick);
+    auto sink = CollectingSink {};
+    (void) Drive(std::move(script), DashboardLimits {}, view, sink, &ReadFleetSample);
+    REQUIRE(sink.frames.size() == 1);
+    return sink.frames.front();
+}
+
+} // namespace
+
 TEST_CASE("a text fleet chart bands the machines its cells read, and counts them over those cells",
           "[cli][dashboard][panel][fleet][chart]")
 {
@@ -4213,21 +4242,7 @@ TEST_CASE("a text fleet chart bands the machines its cells read, and counts them
     // whose cells hold fewer than 98 of them: two bands, no build-03 in the chart, and no "the first 2 of 3", which
     // counts a machine the chart cannot draw. The title has room for that qualifier -- it is Low and goes first for
     // width, so without the room its absence would say nothing.
-    auto view = PanelView {
-        FleetPanel(),
-        PanelContext { .absent = std::string { Absent }, .cellWidth = &FakeCellWidth, .rung = RenderRung::Unicode }
-    };
-    auto script =
-        std::vector<DashboardEvent> { DashboardEvent { .kind = DashboardEventKind::Resize, .columns = 120, .rows = 60 } };
-    for (auto const second: std::views::iota(1, 101))
-        script.push_back(FleetSampleOf(second,
-                                       ChartText(second <= 2 ? std::vector<std::string> { "100", "900", "500" }
-                                                             : std::vector<std::string> { "100", "900" })));
-    script.push_back(Tick);
-    auto sink = CollectingSink {};
-    (void) Drive(std::move(script), DashboardLimits {}, view, sink, &ReadFleetSample);
-    REQUIRE(sink.frames.size() == 1);
-    auto const& frame = sink.frames.front();
+    auto const frame = StaleMachineFrame(true, 120, 60);
     INFO(frame);
     auto const lines = Lines(frame);
 
@@ -4244,4 +4259,62 @@ TEST_CASE("a text fleet chart bands the machines its cells read, and counts them
     CHECK(chart.Spacer() <= 1);
     for (auto const row: std::views::iota(chart.title, chart.axis + 2))
         CHECK_FALSE(lines.at(row).contains("build-03"));
+}
+
+TEST_CASE("a machine outside a text chart's span changes nothing about its rows", "[cli][dashboard][panel][fleet][chart]")
+{
+    // The grow step offers the chart a band per machine the history holds, and a text span holds fewer. WHAT
+    // DISTINGUISHES: with build-03 long gone the chart is line for line the one drawn where it never reported -- rows
+    // laid out for three bands and drawn for two leave both bands shorter -- at a height where the bands have not
+    // reached the growth's most, so taller bands are there to be had.
+    constexpr auto Read = std::to_array<std::string_view>({ "build-01:7070", "build-02:7070" });
+    auto const stale = StaleMachineFrame(true, 120, 40);
+    auto const never = StaleMachineFrame(false, 120, 40);
+    INFO(stale);
+    INFO(never);
+    auto const staleChart = FleetTextChartIn(stale, Read);
+    auto const neverChart = FleetTextChartIn(never, Read);
+    REQUIRE(neverChart.BandRows() < ChartGrowth {}.bandCellsMost);
+    CHECK(staleChart.BandRows() == neverChart.BandRows());
+    auto const staleLines = Lines(stale);
+    auto const neverLines = Lines(never);
+    REQUIRE(staleChart.title == neverChart.title);
+    REQUIRE(staleChart.axis == neverChart.axis);
+    for (auto const row: std::views::iota(staleChart.title, staleChart.axis + 2))
+    {
+        INFO("line " << row);
+        CHECK(staleLines.at(row) == neverLines.at(row));
+    }
+}
+
+TEST_CASE("at every height the fleet chart takes only rows nothing else wanted", "[cli][dashboard][panel][fleet][chart]")
+{
+    // WHAT DISTINGUISHES: the ASCII rung draws the chart in marks and the piped glyphs, alike in every other glyph,
+    // draw none. At every height from 12 to 60 rows, the ASCII frame's lines outside its chart -- blank rows
+    // aside -- are the chartless frame's, so a chart that took a row more than the first fit left over pushes a table
+    // row, a tile or the strip out at some height. At least one height draws a chart, or nothing was compared.
+    auto const kept = [](std::string const& frame) {
+        auto const lines = Lines(frame);
+        auto const [first, last] = ChartLineRange(lines);
+        auto content = std::vector<std::string> {};
+        for (auto const index: std::views::iota(std::size_t { 0 }, lines.size()))
+            if ((index < first || index >= last) && !Inside(lines[index]).empty())
+                content.push_back(lines[index]);
+        return content;
+    };
+    auto charted = std::size_t { 0 };
+    for (auto const rows: std::views::iota(12, 61))
+    {
+        auto const ascii = DrawChart(RenderRung::Ascii, std::nullopt, 100, rows);
+        auto const plain = DrawChart(RenderRung::Piped, std::nullopt, 100, rows);
+        REQUIRE(ascii.frames.size() == 1);
+        REQUIRE(plain.frames.size() == 1);
+        INFO("rows " << rows << "\n" << ascii.frames.front() << plain.frames.front());
+        auto const lines = Lines(ascii.frames.front());
+        if (ChartLineRange(lines).first < lines.size())
+            ++charted;
+        CHECK(ChartLineRange(Lines(plain.frames.front())).first == Lines(plain.frames.front()).size());
+        CHECK(kept(ascii.frames.front()) == kept(plain.frames.front()));
+    }
+    CHECK(charted > 0);
 }
