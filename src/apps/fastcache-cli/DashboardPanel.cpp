@@ -178,24 +178,26 @@ namespace
     /// is what `ContentColumns` takes away.
     constexpr auto FrameColumns = std::size_t { 3 };
 
-    /// Columns a rate row's label takes, after its indent.
-    constexpr auto LabelColumns = std::size_t { 16 };
+    /// Columns a rate row's label takes after its indent, at the least; a panel whose widest label is wider takes that
+    /// (`RateLabelColumnsFor`). §3 draws a figure ending at column 23 with a trend from 26, which is this and
+    /// `FigureColumns` (#134 C7).
+    constexpr auto LabelColumns = std::size_t { 12 };
 
-    /// Columns a rate row's figure is right-aligned into, at the least.
+    /// Columns a rate row's figure is right-aligned into, at the least. A wider figure widens the column for the
+    /// whole block, and by a blank more than the figure, so a label filling its column and a figure filling its
+    /// column never read as one word.
+    ///
+    /// Also what a LEVEL reading is budgeted when the minimum size is derived. A budget and not a pad: that reading
+    /// is written straight after its label, left-aligned, as §3 draws `items       1 284 991`, and right-aligning it
+    /// cost the `connected` row its reason at 80 columns (#134 C2, C7). One number for both blocks, so neither
+    /// claims a minimum the other's layout contradicts; a wider reading names the cells it measured.
     constexpr auto FigureColumns = std::size_t { 9 };
 
     /// The fewest cells a trend narrows to before it is dropped rather than drawn narrower.
     constexpr auto MinimumTrendCells = std::size_t { 8 };
 
-    /// Columns a level row's label takes, after its indent.
+    /// Columns a level row's label takes after its indent, at the least (`LevelLabelColumnsFor`).
     constexpr auto LevelLabelColumns = std::size_t { 12 };
-
-    /// Columns a level row's reading is budgeted when the minimum size is derived.
-    ///
-    /// A budget and not a pad: the reading is written straight after its label, left-aligned, as §3 draws
-    /// `items       1 284 991` and `connected   -  no level is exported`. Right-aligning it into this many
-    /// cells cost the `connected` row its reason at 80 columns (#134 C2, C7).
-    constexpr auto LevelFigureColumns = std::size_t { 12 };
 
     /// Cells in a level row's gauge.
     constexpr auto GaugeCells = std::size_t { 20 };
@@ -286,6 +288,15 @@ namespace
         return std::to_underlying(piece) <= std::to_underlying(other);
     }
 
+    /// A run inside one piece's text, for a piece made of parts dressed differently: `evicted unfetched 41/s` is a
+    /// label and a figure that go for width as one.
+    struct PieceRun
+    {
+        std::size_t byte { 0 };               ///< Where it starts in the piece's text.
+        std::size_t length { 0 };             ///< How many bytes it covers.
+        FrameTone tone { FrameTone::Figure }; ///< What it is.
+    };
+
     /// One droppable part of a line.
     struct Piece
     {
@@ -294,6 +305,7 @@ namespace
         std::size_t slot { 0 };                 ///< Which column it is, for a table whose rows follow its heading.
         bool trend { false };                   ///< Whether this is the trend, which narrows before it goes.
         std::optional<FrameTone> tone {};       ///< How its text is dressed, spaces around it excluded; none for plain.
+        std::vector<PieceRun> runs {};          ///< Runs within its text, for a piece whose parts differ; beside `tone`.
     };
 
     /// The pieces of a line that fit in @p budget cells.
@@ -549,31 +561,45 @@ namespace
     }
 
     /// A figure written beside something else, with its words around it: `completed 12 884`.
+    ///
+    /// ONE piece, so the words and the value go for width together, dressed in runs as what each part is (G1):
+    /// the words are labels, which recede as `since start` and `evicted unfetched` do in §3, and the value is a
+    /// figure -- an alert past its threshold, and plain when it is the absent marker.
     /// @param in The frame's inputs.
     /// @param beside The figure.
-    /// @return The text, dressed as an alert when the figure is past its threshold and not at all otherwise:
-    ///         one piece carries one tone, and the words and the value go for width together.
+    /// @return The piece.
     [[nodiscard]] Piece BesidePiece(FrameInputs const& in, BesideFigure const& beside)
     {
-        auto const value = Newest(SeriesFor(in, beside.figure, {}));
-        auto text = std::string {};
+        auto piece = Piece { .priority = beside.priority };
+        auto const part = [&piece](std::string_view text, std::optional<FrameTone> tone) {
+            if (tone.has_value() && !text.empty())
+                piece.runs.push_back(PieceRun { .byte = piece.text.size(), .length = text.size(), .tone = *tone });
+            piece.text += text;
+        };
         if (!beside.before.empty())
-            text += std::string { beside.before } + " ";
-        text += FigureText(in, beside.figure, value);
+        {
+            part(beside.before, FrameTone::Label);
+            piece.text += ' ';
+        }
+        auto const value = Newest(SeriesFor(in, beside.figure, {}));
+        part(FigureText(in, beside.figure, value), FigureTone(beside.figure, value, FrameTone::Figure));
         if (!beside.after.empty())
-            text += " " + std::string { beside.after };
-        return Piece { .text = std::move(text),
-                       .priority = beside.priority,
-                       .tone = FigureTone(beside.figure, value, std::nullopt) };
+        {
+            piece.text += ' ';
+            part(beside.after, FrameTone::Label);
+        }
+        return piece;
     }
 
-    /// @p piece with @p lead written before its text, its tone still covering only the text.
+    /// @p piece with @p lead written before its text, its tone and its runs still covering only the text.
     /// @param lead What goes before: a gap or an indent.
     /// @param piece The piece.
     /// @return The piece.
     [[nodiscard]] Piece Led(std::string_view lead, Piece piece)
     {
         piece.text.insert(0, lead);
+        for (auto& run: piece.runs)
+            run.byte += lead.size();
         return piece;
     }
 
@@ -610,7 +636,8 @@ namespace
     /// What a breakdown line under a rate row starts with: deeper than the rows, so it reads as theirs.
     constexpr std::string_view SplitIndent = "      ";
 
-    /// One line's item from its kept pieces: the joined text, and a run for every piece with a tone.
+    /// One line's item from its kept pieces: the joined text, a run for every piece with a tone, and each piece's own
+    /// runs where they land.
     ///
     /// **The one way a panel dresses a piece.** A run covers the piece's text without the spaces around it,
     /// so a gap or an alignment pad is never dressed: inverse video over padding would draw a block wider
@@ -637,6 +664,9 @@ namespace
                 item.spans.push_back(
                     LineSpan { .line = 0, .byte = line.size() + first, .length = last + 1 - first, .tone = *piece.tone });
             }
+            for (auto const& run: piece.runs)
+                item.spans.push_back(
+                    LineSpan { .line = 0, .byte = line.size() + run.byte, .length = run.length, .tone = run.tone });
             line += piece.text;
         }
         return item;
@@ -651,6 +681,20 @@ namespace
         return value.has_value() && std::isfinite(*value) ? std::optional { FrameTone::Figure } : std::nullopt;
     }
 
+    /// The columns a panel's rate labels take after the indent: its widest label, and never fewer than
+    /// `LabelColumns`. One answer for the layout and for `MinimumPanelSize`, so the size a panel names is the size
+    /// it draws.
+    /// @param rows The panel's rate rows.
+    /// @param cellWidth How wide text is.
+    /// @return The columns.
+    [[nodiscard]] std::size_t RateLabelColumnsFor(std::span<RateRow const> rows, CellWidth cellWidth)
+    {
+        auto columns = LabelColumns;
+        for (auto const& row: rows)
+            columns = std::max(columns, cellWidth(row.label));
+        return columns;
+    }
+
     /// The rate block, laid out for @p budget cells.
     /// @param in The frame's inputs.
     /// @param rows The panel's rate rows.
@@ -662,8 +706,8 @@ namespace
                                                                           std::size_t budget,
                                                                           std::size_t& reserve)
     {
-        // One figure column for the whole block, wide enough for its widest figure: the trends line
-        // up, and a figure is never cut to keep them lined up.
+        // One label column and one figure column for the whole block, so the trends line up; the figure column is
+        // wide enough for its widest figure and a blank, so a figure is never cut and never touches its label.
         auto series = std::vector<Series> {};
         auto figures = std::vector<std::string> {};
         auto figureColumns = FigureColumns;
@@ -671,8 +715,9 @@ namespace
         {
             series.push_back(SeriesFor(in, row.figure, {}));
             figures.push_back(FigureText(in, row.figure, Newest(series.back())));
-            figureColumns = std::max(figureColumns, in.cellWidth(figures.back()));
+            figureColumns = std::max(figureColumns, in.cellWidth(figures.back()) + 1);
         }
+        auto const labelColumns = RateLabelColumnsFor(rows, in.cellWidth);
 
         auto const drawsTrend = in.glyphs->sparkLevels.size() >= 2;
         auto const trendMinimum = in.cellWidth(TrendGap) + MinimumTrendCells;
@@ -689,7 +734,7 @@ namespace
             auto const& row = rows[index];
             // The label recedes and the figure carries the weight, so they are two pieces, both essential.
             auto pieces = std::vector<Piece> {
-                Piece { .text = std::string { Indent } + FitRight(row.label, LabelColumns, in.cellWidth),
+                Piece { .text = std::string { Indent } + FitRight(row.label, labelColumns, in.cellWidth),
                         .priority = Priority::Essential,
                         .tone = FrameTone::Label },
                 Piece { .text = AlignRight(figures[index], figureColumns, in.cellWidth),
@@ -772,6 +817,20 @@ namespace
         return items;
     }
 
+    /// The columns a panel's level labels take after the indent: its widest label and a blank, and never fewer than
+    /// `LevelLabelColumns`. The blank is the label column's, since a level reading is left-aligned against it and
+    /// would otherwise read as one word with its label. One answer for the layout and for `MinimumPanelSize`.
+    /// @param rows The panel's level rows.
+    /// @param cellWidth How wide text is.
+    /// @return The columns.
+    [[nodiscard]] std::size_t LevelLabelColumnsFor(std::span<LevelRow const> rows, CellWidth cellWidth)
+    {
+        auto columns = LevelLabelColumns;
+        for (auto const& row: rows)
+            columns = std::max(columns, cellWidth(row.label) + 1);
+        return columns;
+    }
+
     /// The level block, laid out for @p budget cells.
     /// @param in The frame's inputs.
     /// @param rows The panel's level rows.
@@ -781,11 +840,8 @@ namespace
                                                                            std::span<LevelRow const> rows,
                                                                            std::size_t budget)
     {
-        // The readings start in one column, and it is never narrower than the widest label and a blank: a
-        // left-aligned reading written against its label would read as one word with it.
-        auto labelColumns = LevelLabelColumns;
-        for (auto const& row: rows)
-            labelColumns = std::max(labelColumns, in.cellWidth(row.label) + 1);
+        // The readings start in one column, after the widest label and a blank.
+        auto const labelColumns = LevelLabelColumnsFor(rows, in.cellWidth);
 
         auto items = std::vector<Item> {};
         for (auto const& row: rows)
@@ -1801,12 +1857,12 @@ PanelSize MinimumPanelSize(PanelSpec const& spec, CellWidth cellWidth) noexcept
     auto rows = FrameRows;
     for (auto const& row: spec.rates)
     {
-        content = std::max(content, cellWidth(Indent) + LabelColumns + FigureColumns);
+        content = std::max(content, cellWidth(Indent) + RateLabelColumnsFor(spec.rates, cellWidth) + FigureColumns);
         rows += row.priority == Priority::Essential ? 1 : 0;
     }
     for (auto const& row: spec.levels)
     {
-        content = std::max(content, cellWidth(Indent) + LevelLabelColumns + LevelFigureColumns);
+        content = std::max(content, cellWidth(Indent) + LevelLabelColumnsFor(spec.levels, cellWidth) + FigureColumns);
         rows += row.priority == Priority::Essential ? 1 : 0;
     }
     if (!spec.tierColumns.empty())
