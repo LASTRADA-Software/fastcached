@@ -39,6 +39,50 @@ namespace
 {
     using Series = std::vector<std::optional<double>>;
 
+    /// A counted noun: a count of one is singular, so no frame says `1 machines`.
+    struct CountNoun
+    {
+        std::string_view one {};  ///< For a count of one: `machine`.
+        std::string_view many {}; ///< For every other count: `machines`.
+
+        /// @param count How many.
+        /// @return The noun @p count takes.
+        [[nodiscard]] constexpr std::string_view For(std::size_t count) const noexcept
+        {
+            return count == 1 ? one : many;
+        }
+
+        /// @return Whether there is no noun.
+        [[nodiscard]] constexpr bool empty() const noexcept
+        {
+            return many.empty();
+        }
+    };
+
+    /// Samples, as the source line and a chart's span count them.
+    constexpr auto SampleNoun = CountNoun { .one = "sample", .many = "samples" };
+
+    /// Gaps, as the source line counts them.
+    constexpr auto GapNoun = CountNoun { .one = "gap", .many = "gaps" };
+
+    /// @p count with the noun it takes: `1 machine`, `12 machines`.
+    /// @param count How many.
+    /// @param noun What is counted.
+    /// @return The text.
+    [[nodiscard]] std::string Counted(std::size_t count, CountNoun noun)
+    {
+        return std::format("{} {}", count, noun.For(count));
+    }
+
+    /// What a fleet section's rows are counted as, from the leader's one section table.
+    /// @param section The section.
+    /// @return The noun.
+    [[nodiscard]] constexpr CountNoun SectionNoun(FleetSection section) noexcept
+    {
+        auto const& row = Distributed::FleetSectionTable[static_cast<std::size_t>(section)];
+        return CountNoun { .one = row.one, .many = row.many };
+    }
+
     /// The tier a `StorageTierTable` name names, or nullopt for empty (the whole cache) and for a name no row has.
     /// @param name The name.
     /// @return The tier.
@@ -505,7 +549,7 @@ namespace
     {
         std::vector<std::string> lines {};      ///< Its lines; a table's first is its heading.
         std::vector<LineSpan> spans {};         ///< The runs of its lines a presenter dresses.
-        std::string_view noun {};               ///< What a table's rows are, for its overflow line; empty draws `+N more`.
+        CountNoun noun {};                      ///< What a table's rows are, for its overflow line; empty draws `+N more`.
         std::size_t hidden { 0 };               ///< How many of a table's rows are not shown, below those that are.
         std::size_t above { 0 };                ///< How many rows a scrolled table skipped above its first.
         std::size_t rowsKept { 0 };             ///< The rows a table keeps when it shrinks at `shrinkAt`.
@@ -573,9 +617,10 @@ namespace
     {
         if (item.noun.empty())
             return std::format("{}+{} more", Indent, item.hidden);
-        auto what = item.hidden > 0 ? std::format("{} more {}", item.hidden, item.noun) : std::string {};
+        auto what = item.hidden > 0 ? std::format("{} more {}", item.hidden, item.noun.For(item.hidden)) : std::string {};
         if (item.above > 0)
-            what += what.empty() ? std::format("{} {} above", item.above, item.noun) : std::format(", {} above", item.above);
+            what += what.empty() ? std::format("{} above", Counted(item.above, item.noun))
+                                 : std::format(", {} above", item.above);
         return std::format("{}... {}; {}", Indent, what, item.above > 0 ? ScrollBothHint : ScrollDownHint);
     }
 
@@ -2155,7 +2200,7 @@ namespace
         auto headingLine = LineOf(*kept, {}, spec.tablePriority);
         auto item = Item { .lines = std::move(headingLine.lines),
                            .spans = std::move(headingLine.spans),
-                           .noun = Distributed::FleetSectionTable[static_cast<std::size_t>(section)].key,
+                           .noun = SectionNoun(section),
                            .above = scroll,
                            .rowsKept = spec.tableRowsKept,
                            .priority = spec.tablePriority,
@@ -2190,14 +2235,14 @@ namespace
     /// @param spec The document block.
     /// @param state The filter.
     /// @param table What the filter made of the table.
-    /// @param noun What the table's rows are.
+    /// @param noun What the table's rows are counted as.
     /// @param budget The content width.
     /// @return The line's item, or none when there is no filter and none is being typed.
     [[nodiscard]] std::vector<Item> FilterItems(FrameInputs const& in,
                                                 DocumentSpec const& spec,
                                                 TableState const& state,
                                                 SectionTable const& table,
-                                                std::string_view noun,
+                                                CountNoun noun,
                                                 std::size_t budget)
     {
         if (!state.typing && state.filter.empty())
@@ -2207,7 +2252,8 @@ namespace
         auto const text =
             state.typing
                 ? std::format("{}filter  /{}_  Enter keeps, Esc clears", Indent, state.filter)
-                : std::format("{}filter  /{}  {} of {} {}; / edits", Indent, state.filter, table.matched, table.rows, noun);
+                : std::format(
+                      "{}filter  /{}  {} of {}; / edits", Indent, state.filter, table.matched, Counted(table.rows, noun));
         return { Item { .lines = { FitRight(text, std::min(budget, in.cellWidth(text)), in.cellWidth) },
                         .priority = state.typing ? Priority::Essential : spec.filterPriority } };
     }
@@ -2267,7 +2313,7 @@ namespace
     {
         constexpr auto SecondsAsMinutesFrom = std::size_t { 120 };
         if (!interval.has_value() || interval->count() <= 0)
-            return std::format("{} samples", samples);
+            return Counted(samples, SampleNoun);
         auto const seconds = ((static_cast<std::size_t>(interval->count()) * samples) + 500) / 1000;
         if (seconds < SecondsAsMinutesFrom)
             return std::format("{} s", seconds);
@@ -2725,12 +2771,7 @@ namespace
             return std::unexpected(table.error());
         block.tiles = TileItems(in, *spec.document, budget);
         std::ranges::move(StripItems(in, *spec.document, context.section, budget), std::back_inserter(block.body));
-        auto filter = FilterItems(in,
-                                  *spec.document,
-                                  state,
-                                  *table,
-                                  Distributed::FleetSectionTable[static_cast<std::size_t>(context.section)].key,
-                                  budget);
+        auto filter = FilterItems(in, *spec.document, state, *table, SectionNoun(context.section), budget);
         std::ranges::move(table->items, std::back_inserter(block.body));
         std::ranges::move(filter, std::back_inserter(block.body));
         block.scroll = table->scroll;
@@ -2775,7 +2816,8 @@ namespace
         auto const& model = *in.model;
         auto const gaps =
             std::ranges::count_if(model.history, [](HistoryEntry const& entry) { return !entry.reading.has_value(); });
-        auto const counts = std::format("{} samples, {} gap{}", model.samples, gaps, gaps == 1 ? "" : "s");
+        auto const counts =
+            std::format("{}, {}", Counted(model.samples, SampleNoun), Counted(static_cast<std::size_t>(gaps), GapNoun));
         auto kept =
             FitPieces({ Piece { .text = std::format("{}source  {}", Indent, SourceText(in)), .priority = priority },
                         Piece { .text = std::string { PieceGap } + counts, .priority = std::max(priority, Priority::Low) } },
@@ -2848,8 +2890,8 @@ namespace
           .render = [](FrameInputs const& in, PanelContext const& /*context*/) -> std::string {
               auto const* document = in.model->latestDocument.get();
               auto const* machines = document == nullptr ? nullptr : document->Section(FleetSection::Machines);
-              return machines == nullptr ? std::format("{} machines", in.absent)
-                                         : std::format("{} machines", machines->rows.size());
+              auto const noun = SectionNoun(FleetSection::Machines);
+              return machines == nullptr ? std::format("{} {}", in.absent, noun.many) : Counted(machines->rows.size(), noun);
           } },
         { .fact = ChromeFact::Interval,
           .render = [](FrameInputs const& in, PanelContext const& context) -> std::string {
