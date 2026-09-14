@@ -149,7 +149,8 @@ namespace
     /// node status, the fleet document and the granted cadence with whatever it carried.
     ///
     /// One helper for both arms -- a `Sample` and a `SampleFailed` -- so neither route can count a
-    /// sample without replacing both, or the reverse.
+    /// sample without replacing both, or the reverse. The carried status is the one thing it only
+    /// updates, since a sample that says nothing about the node is no news about what the node runs.
     /// @param model Where the count, the status and the document are kept.
     /// @param event The sample.
     /// @param document The document its reading carried; null for a failure or a reading without one.
@@ -160,6 +161,8 @@ namespace
                                          std::shared_ptr<FleetDocument const> document,
                                          DashboardLimits limits)
     {
+        if (event.nodeStatus.has_value())
+            model.carriedNodeStatus = event.nodeStatus;
         model.nodeStatus = event.nodeStatus;
         model.latestDocument = std::move(document);
         model.cadence = event.cadence;

@@ -286,7 +286,9 @@ struct TitleFactRow
 /// `StatusFactTable` from the newest `NodeStatusFields`. A fact the status does not carry renders the
 /// absent marker by name; one that does not apply to this node -- a consensus role on a node running no
 /// consensus, a cache tier on one with none -- draws no line at all, rather than a line of markers claiming
-/// the thing exists.
+/// the thing exists. **Whether it applies is asked of the newest status a sample CARRIED**
+/// (`DashboardModel::carriedNodeStatus`), never of the newest sample's: a gap carries none, and asked there
+/// *unknown* read as *does not apply*, so every outage took lines away and gave them back.
 enum class StatusFact : std::uint8_t
 {
     NodeId,     ///< Its minted identity.
