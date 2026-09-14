@@ -1439,7 +1439,7 @@ class AtomicMetricsSink final: public IMetricsSink
     /// @param counter The counter a caller named.
     /// @return Its slot, or nullptr past this build's range.
     template <typename Cells>
-    [[nodiscard]] static auto* SlotOf(Cells& counters, Counter counter) noexcept
+    [[nodiscard]] static auto SlotOf(Cells& counters, Counter counter) noexcept -> decltype(counters.Find(counter))
     {
         auto* const slot = counters.Find(counter);
         assert(slot != nullptr
