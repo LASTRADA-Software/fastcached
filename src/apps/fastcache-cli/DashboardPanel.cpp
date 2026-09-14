@@ -1280,6 +1280,14 @@ namespace
         return in.model->nodeStatus.has_value() ? &*in.model->nodeStatus : nullptr;
     }
 
+    /// The newest status a sample carried, kept through a gap: what decides whether a line applies, never what it says.
+    /// @param in The frame's inputs.
+    /// @return The status, or nullptr before any sample carried one.
+    [[nodiscard]] CompileCacheWire::NodeStatusFields const* CarriedStatusOf(FrameInputs const& in) noexcept
+    {
+        return in.model->carriedNodeStatus.has_value() ? &*in.model->carriedNodeStatus : nullptr;
+    }
+
     /// Whether @p status is of a node running consensus: its component, or a role only a scheduler reports.
     /// @param status The status, or nullptr.
     /// @return False before a status was read.
@@ -1505,13 +1513,14 @@ namespace
           } },
         { .fact = StatusFact::Consensus,
           .render = [](FrameInputs const& in, FactCell const& /*cell*/, std::size_t /*width*/) -> std::optional<FactText> {
-              auto const* status = StatusOf(in);
-              if (!RunsConsensus(status))
+              // Whether the line applies is what the node last said it runs; the role is what it says now, the marker
+              // beside a gap.
+              if (!RunsConsensus(CarriedStatusOf(in)))
                   return std::nullopt;
-              auto const& role = status->runtime.schedulerRole;
-              if (!role.has_value())
+              auto const* status = StatusOf(in);
+              if (status == nullptr || !status->runtime.schedulerRole.has_value())
                   return Said(std::string { in.absent });
-              auto const name = NameOfSchedulerRole(*role);
+              auto const name = NameOfSchedulerRole(*status->runtime.schedulerRole);
               return Said(std::string { name }, ToneOfState(name));
           } },
         { .fact = StatusFact::Leader,
@@ -1519,9 +1528,11 @@ namespace
               // Empty is a READING -- no leader is known -- so it is the marker, on the line the role is on. Except on
               // the leader itself, which names nobody because it is the one: it says so rather than drawing the
               // marker for the one fact it knows best.
-              auto const* status = StatusOf(in);
-              if (!RunsConsensus(status))
+              if (!RunsConsensus(CarriedStatusOf(in)))
                   return std::nullopt;
+              auto const* status = StatusOf(in);
+              if (status == nullptr)
+                  return Said(std::string { in.absent });
               auto const& runtime = status->runtime;
               if (!runtime.leaderEndpoint.empty())
                   return Said(runtime.leaderEndpoint);
@@ -1531,9 +1542,9 @@ namespace
           } },
         { .fact = StatusFact::Slots,
           .render = [](FrameInputs const& in, FactCell const& cell, std::size_t width) -> std::optional<FactText> {
-              // A node whose status says it runs no worker has no slots to draw.
-              auto const* status = StatusOf(in);
-              if (status != nullptr && !status->runtime.compileSlots.has_value())
+              // A node whose status said it runs no worker has no slots to draw.
+              auto const* carried = CarriedStatusOf(in);
+              if (carried != nullptr && !carried->runtime.compileSlots.has_value())
                   return std::nullopt;
               auto fact = FactFigures(in, cell);
 
@@ -1553,9 +1564,10 @@ namespace
           } },
         { .fact = StatusFact::CacheTier,
           .render = [](FrameInputs const& in, FactCell const& cell, std::size_t /*width*/) -> std::optional<FactText> {
-              // Only on a node that runs a tier: a line of markers for a tier that does not exist would be a claim.
-              auto const* status = StatusOf(in);
-              if (status == nullptr || (status->components & CompileCacheWire::NodeComponentBit::CacheTier) == 0)
+              // Only on a node that said it runs a tier: a line of markers for a tier that does not exist would be a
+              // claim. A gap is not news that it stopped, so the line stays, its figures the marker.
+              auto const* carried = CarriedStatusOf(in);
+              if (carried == nullptr || (carried->components & CompileCacheWire::NodeComponentBit::CacheTier) == 0)
                   return std::nullopt;
               return FactFigures(in, cell);
           } },
@@ -2884,16 +2896,27 @@ namespace
         std::string (*render)(FrameInputs const& in, PanelContext const& context);
     };
 
-    /// How long the endpoint has served, from whichever reading carries it.
+    /// Whether the newest sample was read: false before any sample and beside a gap.
     /// @param model What is known.
-    /// @return Seconds, or nullopt when nothing read says.
+    /// @return True when the newest history entry holds a reading.
+    [[nodiscard]] bool NewestSampleRead(DashboardModel const& model) noexcept
+    {
+        return !model.history.empty() && model.history.back().reading.has_value();
+    }
+
+    /// How long the endpoint has served, from whichever part of the NEWEST sample carries it.
+    ///
+    /// The newest sample's, never the last reading's: an uptime is a figure about now, and beside a gap it is not
+    /// known -- the last one read went on standing in the title, frozen, while the node it described was gone.
+    /// @param model What is known.
+    /// @return Seconds, or nullopt when the newest sample does not say.
     [[nodiscard]] std::optional<std::uint64_t> UptimeOf(DashboardModel const& model) noexcept
     {
         if (model.nodeStatus.has_value())
             return model.nodeStatus->uptimeSeconds;
-        if (!model.stats.has_value())
+        if (model.history.empty() || !model.history.back().stats.has_value())
             return std::nullopt;
-        return static_cast<std::uint64_t>(model.stats->snapshot.uptime.value.count());
+        return static_cast<std::uint64_t>(model.history.back().stats->snapshot.uptime.value.count());
     }
 
     /// One row per `ChromeFact`, in enumerator order.
@@ -2913,9 +2936,11 @@ namespace
           } },
         { .fact = ChromeFact::Leader,
           .render = [](FrameInputs const& in, PanelContext const& context) -> std::string {
-              // Stated as the leader's only once a reading came from it: an endpoint that has not answered as
-              // the leader has not been shown to be one, and is still where the session asks.
-              auto const led = in.model->latestStamp.has_value() && in.model->latestStamp->role == LeaderRole;
+              // Stated as the leader's only while the newest sample was read from it: an endpoint that has not
+              // answered as the leader -- yet, or since a gap -- has not been shown to be one, and is still where the
+              // session asks.
+              auto const led = NewestSampleRead(*in.model) && in.model->latestStamp.has_value()
+                               && in.model->latestStamp->role == LeaderRole;
               auto const where = context.endpoint.empty() ? in.absent : std::string_view { context.endpoint };
               return led ? std::format("{} {}", LeaderRole, where) : std::string { where };
           } },
