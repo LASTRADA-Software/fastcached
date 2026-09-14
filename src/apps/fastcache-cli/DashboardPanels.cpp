@@ -23,6 +23,25 @@ namespace
     constexpr auto BytesUsed = StorageField<&StorageStats::bytesUsed>();
     constexpr auto BytesLimit = StorageField<&StorageStats::bytesLimit>();
 
+    // The figures a cache's rate rows draw and its history chart draws again, stated once.
+    constexpr auto HitRate = FigureSpec {
+        .field = GetHits, .other = GetMisses, .source = FigureSource::RateRatio, .format = FigureFormat::Percent
+    };
+    constexpr auto OpsPerSecond =
+        FigureSpec { .field = CmdGet, .other = CmdSet, .source = FigureSource::Rate, .format = FigureFormat::Rate };
+    constexpr auto ConnsPerSecond = FigureSpec { .field = CounterField<Counter::ConnectionsTotal>(),
+                                                 .source = FigureSource::Rate,
+                                                 .format = FigureFormat::Rate };
+    constexpr auto EvictionsPerSecond = FigureSpec { .field = StorageField<&StorageStats::evictions>(),
+                                                     .source = FigureSource::Rate,
+                                                     .format = FigureFormat::Rate };
+    constexpr auto ExpiredPerSecond = FigureSpec { .field = StorageField<&StorageStats::expirations>(),
+                                                   .source = FigureSource::Rate,
+                                                   .format = FigureFormat::Rate };
+    constexpr auto BytesFill = FigureSpec {
+        .field = BytesUsed, .other = BytesLimit, .source = FigureSource::LevelQuotient, .format = FigureFormat::Percent
+    };
+
     constexpr auto HitRateBeside = std::array {
         BesideFigure { .key = "hit_rate_since_start",
                        .figure = { .field = GetHits,
@@ -74,38 +93,29 @@ namespace
     constexpr auto CacheRates = std::array {
         RateRow { .label = "hit rate",
                   .key = "hit_rate",
-                  .figure = { .field = GetHits,
-                              .other = GetMisses,
-                              .source = FigureSource::RateRatio,
-                              .format = FigureFormat::Percent },
+                  .figure = HitRate,
                   .beside = HitRateBeside,
                   .priority = Priority::Essential },
         RateRow { .label = "ops/sec",
                   .key = "ops_per_sec",
-                  .figure = { .field = CmdGet, .other = CmdSet, .source = FigureSource::Rate, .format = FigureFormat::Rate },
+                  .figure = OpsPerSecond,
                   .beside = OpsBeside,
                   .priority = Priority::Essential },
         RateRow { .label = "conns/sec",
                   .key = "conns_per_sec",
-                  .figure = { .field = CounterField<Counter::ConnectionsTotal>(),
-                              .source = FigureSource::Rate,
-                              .format = FigureFormat::Rate },
+                  .figure = ConnsPerSecond,
                   .beside = ConnsBeside,
                   .priority = Priority::High },
         RateRow { .label = "evictions/s",
                   .key = "evictions_per_sec",
-                  .figure = { .field = StorageField<&StorageStats::evictions>(),
-                              .source = FigureSource::Rate,
-                              .format = FigureFormat::Rate },
+                  .figure = EvictionsPerSecond,
                   .beside = EvictionsBeside,
                   .priority = Priority::Normal },
         // §3's `expired/s`, over every expiry whichever path found it -- a lookup, a write or the cycle's sweep --
         // so the label says what the figure counts. The cycle's reclaims alone would understate it.
         RateRow { .label = "expired/s",
                   .key = "expired_per_sec",
-                  .figure = { .field = StorageField<&StorageStats::expirations>(),
-                              .source = FigureSource::Rate,
-                              .format = FigureFormat::Rate },
+                  .figure = ExpiredPerSecond,
                   .beside = ExpiredBeside,
                   .priority = Priority::Normal },
     };
@@ -174,6 +184,17 @@ namespace
         TitleFactRow { .fact = ChromeFact::QuitWord, .priority = Priority::Low },
     };
 
+    // The history a taller terminal draws, in the order it gets rows: whether the cache is doing its job, how much it
+    // is asked, how full it is, what that fullness costs, and then the quieter rates.
+    constexpr auto CacheCharts = std::array {
+        ChartRow { .label = "hit rate", .figure = HitRate, .top = 1.0 },
+        ChartRow { .label = "ops/sec", .figure = OpsPerSecond },
+        ChartRow { .label = "fill", .figure = BytesFill, .top = 1.0 },
+        ChartRow { .label = "evictions/s", .figure = EvictionsPerSecond },
+        ChartRow { .label = "expired/s", .figure = ExpiredPerSecond },
+        ChartRow { .label = "conns/sec", .figure = ConnsPerSecond },
+    };
+
     constexpr auto CacheSpec = PanelSpec { .title = "fastcached",
                                            .rates = CacheRates,
                                            .levels = CacheLevels,
@@ -182,7 +203,9 @@ namespace
                                            .tierPriority = Priority::Normal,
                                            .tierNotePriority = Priority::Low,
                                            .sourcePriority = Priority::High,
-                                           .titleFacts = CacheTitle };
+                                           .fillsHeight = true,
+                                           .titleFacts = CacheTitle,
+                                           .charts = CacheCharts };
 
     // ---- node -------------------------------------------------------------------------------
 
