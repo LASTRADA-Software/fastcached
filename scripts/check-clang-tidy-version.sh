@@ -197,6 +197,12 @@ CheckInstalled() {
     fi
     bin="$(cd "$(dirname "$exe")" && pwd -P)"
     name="$(basename "$exe")"
+    # The Windows wheel ships only `clang-tidy.exe`, and Git Bash answers `[ -f clang-tidy ]` TRUE for it -- so a bare
+    # name there is that `.exe`, and is judged as the file RECORD lists. Measured on the win_amd64 22.1.8 wheel.
+    if [ "$name" = clang-tidy ] && [ -f "$bin/clang-tidy.exe" ]; then
+        exe="$bin/clang-tidy.exe"
+        name="clang-tidy.exe"
+    fi
     case "$name" in
         clang-tidy) suffix="" ;;
         clang-tidy.exe) suffix=".exe" ;;
@@ -294,7 +300,8 @@ Resolve() {
     else
         site="$(DefaultSite)"
         exe=""
-        for candidate in "$site/clang_tidy/data/bin/clang-tidy" "$site/clang_tidy/data/bin/clang-tidy.exe"; do
+        # `.exe` first: Git Bash answers `-f clang-tidy` true for `clang-tidy.exe`, and the name must be the recorded one.
+        for candidate in "$site/clang_tidy/data/bin/clang-tidy.exe" "$site/clang_tidy/data/bin/clang-tidy"; do
             if [ -f "$candidate" ]; then
                 exe="$candidate"
                 break
@@ -422,6 +429,18 @@ if [ "$Mode" = "self-test" ]; then
     Wheel "$Work/site-exe" 22.1.8 "$FakeDigest" clang-tidy.exe
     Expect "--installed: the Windows binary name" pass "the declared build" \
         --installed "$Work/site-exe/clang_tidy/data/bin/clang-tidy.exe" "$Work/good"
+    # Git Bash answers `-f clang-tidy` true for `clang-tidy.exe`, so --locate once printed the bare name there and
+    # --installed then looked it up in RECORD, which lists only the `.exe` -- the CI Windows leg would have refused its
+    # own install. Both spellings present stands in for that here, on any platform -- the bare decoy written FIRST,
+    # because on Git Bash a write to `clang-tidy` beside an existing `clang-tidy.exe` lands in the `.exe` (measured: it
+    # overwrote the fake binary and the digest case failed instead).
+    mkdir -p "$Work/site-both/clang_tidy/data/bin"
+    printf 'not the recorded binary\n' > "$Work/site-both/clang_tidy/data/bin/clang-tidy"
+    Wheel "$Work/site-both" 22.1.8 "$FakeDigest" clang-tidy.exe
+    Expect "--locate: the .exe when both spellings answer" pass "$Work/site-both/clang_tidy/data/bin/clang-tidy.exe" \
+        --locate "$Work/site-both" "$Work/good"
+    Expect "--installed: a bare name beside the .exe is judged as the .exe" pass "the declared build" \
+        --installed "$Work/site-both/clang_tidy/data/bin/clang-tidy" "$Work/good"
 
     Wheel "$Work/site-old" 22.1.7 "$FakeDigest"
     Expect "--installed: another release of the same major" refuse "is clang-tidy 22.1.7 (its wheel's METADATA" \
@@ -497,7 +516,8 @@ case "$Mode" in
         ;;
     locate)
         ReadDeclaration "$SourceDir/.clang-tidy-version" || exit 1
-        for candidate in "$Argument/clang_tidy/data/bin/clang-tidy" "$Argument/clang_tidy/data/bin/clang-tidy.exe"; do
+        # `.exe` first, for the reason `Resolve` gives.
+        for candidate in "$Argument/clang_tidy/data/bin/clang-tidy.exe" "$Argument/clang_tidy/data/bin/clang-tidy"; do
             if [ -f "$candidate" ]; then
                 echo "$candidate"
                 exit 0
