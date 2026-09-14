@@ -2477,7 +2477,7 @@ namespace
             .low = "0",
             .high = "top",
             .drawn = "bar: share of its band's top",
-            .rest = pixels ? ", grey: to the top, blank: unread" : ", blank: unread",
+            .rest = pixels ? ", grey: to the top, blank: no reading" : ", blank: no reading",
             .available = spec.charts.size(),
             .tracks =
                 [&in, &spec](std::size_t count, std::size_t window) {
@@ -2565,7 +2565,7 @@ namespace
             .high = high,
             .drawn = std::format("bar: {}", metric.key),
             // The grey is the band's whole scale, behind every reading: a bar of zero leaves it bare.
-            .rest = std::format(", grey: to {}, blank: unread", high),
+            .rest = std::format(", grey: to {}, blank: no reading", high),
             .available = machines.size(),
             .tracks =
                 [&in, chartMetric = &metric](std::size_t count, std::size_t window) {

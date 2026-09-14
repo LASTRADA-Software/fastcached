@@ -342,10 +342,13 @@ struct ChartRow
 };
 
 /// How a panel's history chart grows into rows nothing else wants.
+///
+/// The bounds are high on purpose: a tall terminal's rows are the chart's to use, and a band twelve rows high still
+/// reads as one band. They exist so a very tall terminal does not draw a band as a wall.
 struct ChartGrowth
 {
-    std::size_t cellsHighMost { 24 }; ///< The most rows its bands take together.
-    std::size_t bandCellsMost { 6 };  ///< The most rows one band grows to.
+    std::size_t cellsHighMost { 48 }; ///< The most rows its bands take together.
+    std::size_t bandCellsMost { 12 }; ///< The most rows one band grows to.
     std::size_t minimumCells { 24 };  ///< The fewest cells across its bands are drawn in; narrower, it is not drawn.
 };
 
