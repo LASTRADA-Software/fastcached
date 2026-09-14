@@ -23,7 +23,7 @@ it here would prove nothing.
 
 **User documentation lives in the docs site**, so there is one source of truth:
 [compile-cache-testclient reference](../../../docs/internals/compile-cache-testclient.md)
-— the `store` / `fetch` subcommands, every flag, the exit codes, and the
+— the `store` / `fetch` / `drop` subcommands, every flag, the exit codes, and the
 cross-depth validation harness.
 
 ## Privacy rule (must hold)

@@ -27,7 +27,7 @@ cmake --build --preset clang-debug --target compile-cache-testclient
 ## Usage
 
 ```
-compile-cache-testclient <store|fetch> --port N [--key K] [--prefetch-group C]
+compile-cache-testclient <store|fetch|drop> --port N [--key K] [--prefetch-group C]
     --srcroot P --buildtree Q [--compiler cl|clang-cl] [--source F] [--out OBJ]
 ```
 
@@ -78,6 +78,13 @@ and it does *not* report a toolchain path outside both roots, or a canonical
 token the region walker declined to localize, as missing — neither is this
 build's to have.
 
+### `drop`
+
+Sends one CACHE-DROP for `--key`: the endpoint removes the key from its own tier and
+nowhere else. It exists so an end-to-end case can take a stored object away while the
+launcher's direct-mode manifest that points at it stays — the state an operator creates
+by removing a wrong object, and one no launcher run can produce on its own.
+
 ## Exit codes
 
 | Code | Meaning |
@@ -85,7 +92,7 @@ build's to have.
 | `0` | Success |
 | `2` | Usage error, socket failure, malformed value, or localization failure |
 | `3` | The compiler failed during `store` |
-| `4` | FETCH miss |
+| `4` | FETCH miss, or DROP miss — there was nothing to remove, which is an answer rather than a failure |
 | `5` | FETCH hit, but at least one localized header path did not resolve on disk |
 
 Code `5` is the interesting one: it means the cache returned an entry whose

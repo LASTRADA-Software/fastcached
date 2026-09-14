@@ -257,3 +257,42 @@ TEST_CASE("A shared cache that takes the object is counted as a store", "[node][
     CHECK(fix.Count(IMetricsSink::Counter::NodeCacheUpstreamStores) == 1);
     CHECK(fix.Count(IMetricsSink::Counter::NodeCacheUpstreamStoreFailures) == 0);
 }
+
+// --- cache-drop (#1276) --------------------------------------------------------
+
+TEST_CASE("A drop removes the key from this tier, and a second drop finds nothing", "[node][cache][cache-drop]")
+{
+    // Three outcomes, and the second run of a repair is the one a `bool` would get wrong:
+    // nothing to remove is an answer, not a failure.
+    Fixture fix;
+    fix.upstream.reachable = false;
+    REQUIRE(SyncRun(fix.cache.Store("k9", Bytes("object-nine"))));
+
+    CHECK(fix.cache.Drop("k9") == CacheDropOutcome::Removed);
+    CHECK_FALSE(SyncRun(fix.cache.Fetch("k9")).has_value());
+    CHECK(fix.cache.Drop("k9") == CacheDropOutcome::Absent);
+
+    // Counted by the storage, not by a second tally beside it.
+    CHECK(fix.local.Snapshot().deleteHits == 1);
+    CHECK(fix.local.Snapshot().deleteMisses == 1);
+}
+
+TEST_CASE("A drop reaches this tier only, so a shared cache holding the key refills it", "[node][cache][cache-drop]")
+{
+    // #1276's D3, pinned in the direction that surprises: the drop is Removed, the shared
+    // cache is left holding the object, and the next miss here reads it back through. That
+    // is the rule rather than a leak -- a destructive verb reaches the endpoint its sender
+    // named -- and it is why the operator is told to drop the key upstream as well.
+    Fixture fix;
+    fix.upstream.entries["k10"] = Bytes("object-ten");
+    REQUIRE(SyncRun(fix.cache.Fetch("k10")).has_value()); // fills the local tier
+    REQUIRE(fix.upstream.fetches == 1);
+
+    CHECK(fix.cache.Drop("k10") == CacheDropOutcome::Removed);
+    CHECK(fix.upstream.entries.contains("k10"));
+
+    auto const refilled = SyncRun(fix.cache.Fetch("k10"));
+    REQUIRE(refilled.has_value());
+    CHECK(Unwrap(refilled) == Bytes("object-ten"));
+    CHECK(fix.upstream.fetches == 2);
+}

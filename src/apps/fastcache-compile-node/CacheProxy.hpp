@@ -28,7 +28,7 @@ namespace FastCache::Node
 /// machine compiled minutes ago. Pointing the launcher at its local node puts
 /// `LocalCache` in that path, and that is what makes a rebuild on a slow link free.
 ///
-/// A node answers `Store` and `Fetch` and nothing else. The scheduler's verbs
+/// A node answers `Store`, `Fetch` and `CacheDrop` and nothing else. The scheduler's verbs
 /// belong to `SchedulerProtocol` and `Compile` to `WorkerProtocol`; each refuses
 /// the others with `DispatchNotPermitted`, as a reply rather than a close, so a
 /// client that reached the wrong port learns which.

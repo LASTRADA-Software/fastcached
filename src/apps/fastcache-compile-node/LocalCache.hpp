@@ -35,6 +35,22 @@ enum class UpstreamStore : std::uint8_t
     Last
 };
 
+/// What became of one removal from this node's own tier.
+///
+/// PRIVATE: never transmitted and never persisted -- `CacheProxy` maps each to a reply
+/// status on the spot -- so its enumerators carry no explicit values.
+///
+/// Three outcomes, because two replies and a refusal hang off them and a `bool` would fold
+/// the refusal into one of the answers: `Absent` is an ordinary answer an idempotent repair
+/// gives on its second run, and `Failed` is this machine's disk, which is not the caller's
+/// key being missing.
+enum class CacheDropOutcome : std::uint8_t
+{
+    Removed, ///< This call removed it.
+    Absent,  ///< There was nothing to remove.
+    Failed,  ///< The tier could not persist the removal.
+};
+
 /// The shared cache this node reads through to, as a seam.
 ///
 /// A network client in production and a scripted double in tests, for the reason
@@ -179,6 +195,21 @@ class LocalCache
     ///         not returned: a client that retried on it would be retrying something
     ///         that is already durable where it matters.
     [[nodiscard]] Task<bool> Store(std::string_view key, std::span<std::byte const> value);
+
+    /// Remove one key from this node's own tier, and from nowhere else.
+    ///
+    /// **The upstream is not asked**, which is `Op::CacheDrop`'s rule rather than a gap
+    /// here: a destructive verb reaches the endpoint its sender named. A shared cache still
+    /// holding the key refills it on this tier's next miss, and that is the operator's
+    /// second command to run rather than this one's side effect.
+    ///
+    /// Uncounted here, because the storage counts it: `deleteHits` and `deleteMisses` are
+    /// what `/metrics` renders for this tier, and a second tally of one number is what
+    /// `IMetricsSink` refuses to carry. A failure to persist the removal is reported by
+    /// `WriteErrorReportingStorage`, which every node tier sits under.
+    /// @param key The object key.
+    /// @return Which of the three things happened.
+    [[nodiscard]] CacheDropOutcome Drop(std::string_view key);
 
   private:
     IStorage& _local;

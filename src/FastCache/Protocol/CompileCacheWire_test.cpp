@@ -76,6 +76,10 @@ TEST_CASE("The wire constants have their specified byte values")
     CHECK(static_cast<std::uint8_t>(Status::Progress) == 0x03);
     CHECK(static_cast<std::uint8_t>(Status::Push) == 0x04);
     CHECK(static_cast<std::uint8_t>(Op::Subscribe) == 0x12);
+    // Taken past the bytes parallel branches already held (#1303's cordon, the fleet text verb), so
+    // `Op` has a gap until they land. `EveryOpcodeIsDistinct` is what stops two branches that each
+    // took one byte from merging into a table where one verb is served as the other.
+    CHECK(static_cast<std::uint8_t>(Op::CacheDrop) == 0x15);
 
     // The BYTE, not the symbol. A constant on this wire carries two facts -- its
     // name and its value -- and a peer built from another revision of this header
@@ -314,6 +318,57 @@ TEST_CASE("DecodeStorePayload round-trips every field, including an empty one")
     CHECK(AsStringView(Unwrap(view).srcRoot) == "/src");
     CHECK(AsStringView(Unwrap(view).buildTree) == "/build");
     CHECK(std::ranges::equal(Unwrap(view).value, value));
+}
+
+TEST_CASE("EncodeCacheDrop emits the specified bytes exactly", "[wire][cache-drop]")
+{
+    auto const frame = EncodeCacheDrop("ab");
+
+    // clang-format off: the grid IS the specification -- one wire field per row.
+    auto const expected = Bytes({
+        0xFC,                   // magic
+        0x09,                   // version
+        0x15,                   // op = CacheDrop
+        0x00, 0x00, 0x00, 0x06, // payloadLength = 6
+        0x00, 0x00, 0x00, 0x02, // field[0] length = 2
+        0x61, 0x62,             // "ab"
+    });
+    // clang-format on
+
+    CHECK(frame == expected);
+}
+
+TEST_CASE("DecodeCacheDropPayload round-trips the key and refuses a second field", "[wire][cache-drop]")
+{
+    auto const frame = EncodeCacheDrop("the-key");
+    auto const key = DecodeCacheDropPayload(std::span<std::byte const> { frame }.subspan(RequestHeaderSize));
+    REQUIRE(key.has_value());
+    CHECK(AsStringView(Unwrap(key)) == "the-key");
+
+    // A STORE-shaped payload is five fields, not one: refused rather than read as its key.
+    auto const value = Bytes({ 0xAA });
+    auto const store = EncodeStore(StoreRequest {
+        .key = "k", .prefetchGroup = "", .srcRoot = "s", .buildTree = "b", .value = std::span<std::byte const> { value } });
+    CHECK_FALSE(DecodeCacheDropPayload(std::span<std::byte const> { store }.subspan(RequestHeaderSize)).has_value());
+}
+
+TEST_CASE("A cache drop is a Cache verb that may miss, needs the credential, and is bounded", "[wire][cache-drop]")
+{
+    // Each column decides something a surface does with the verb, so each is asserted
+    // rather than left to follow from the row. `Cache` routes it to the tier and its
+    // locality gate; `Miss` is the answer a repair's second run gets; `RequiresAuth` is the
+    // gate a daemon's writes get; and the bound is what a key-only verb may cost.
+    auto const* const row = FindOp(static_cast<std::uint8_t>(Op::CacheDrop));
+    REQUIRE(row != nullptr);
+    CHECK(row->name == "cache-drop");
+    CHECK(row->fieldCount == 1);
+    CHECK(row->family == VerbFamily::Cache);
+    CHECK(IsLegalStatus(Op::CacheDrop, Status::Miss));
+    CHECK_FALSE(IsLegalStatus(Op::CacheDrop, Status::Progress));
+    CHECK_FALSE(IsLegalStatus(Op::CacheDrop, Status::Push));
+    CHECK_FALSE(row->preAuth.Allowed());
+    CHECK(row->maxPayload.IsBounded());
+    CHECK(OpPayloadCap(static_cast<std::uint8_t>(Op::CacheDrop), 256U * 1024U * 1024U) == MaxControlPayload);
 }
 
 TEST_CASE("DecodeFetchPayload round-trips the key")
@@ -1074,6 +1129,7 @@ TEST_CASE("Every verb states which family it belongs to")
     // route the fleet's capacity requests into the cache tier.
     CHECK(FamilyOf(static_cast<std::uint8_t>(Op::Store)) == VerbFamily::Cache);
     CHECK(FamilyOf(static_cast<std::uint8_t>(Op::Fetch)) == VerbFamily::Cache);
+    CHECK(FamilyOf(static_cast<std::uint8_t>(Op::CacheDrop)) == VerbFamily::Cache);
 
     // AUTH is nobody's verb family and its own: it establishes a credential for the
     // connection, and which component owns the credential is a routing decision the

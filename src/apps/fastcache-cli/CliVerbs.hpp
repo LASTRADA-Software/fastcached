@@ -77,7 +77,8 @@ struct WireSpec
     /// which agrees on the day it is written and silently stops agreeing afterwards.
     ///
     /// It names the wire's OWN server and claims no exclusivity, deliberately. A row
-    /// carrying a `nodeFallback` -- `version` is the one today -- is also answered by a
+    /// carrying a `nodeFallback` -- which rows do is a census in `NodeVerbs_test.cpp`, not a
+    /// list here -- is also answered by a
     /// compile node, so a heading reading *the only verbs a daemon answers* would be
     /// false for it. Which verbs have that second answer is a per-verb fact and is on
     /// the verb's own page, where `NodeAnswerFor` states it in three values.

@@ -3,8 +3,13 @@
 #include <FastCache/Async/TestReactor.hpp>
 #include <FastCache/Auth/AuthPolicy.hpp>
 #include <FastCache/Cache/CacheEngine.hpp>
+#include <FastCache/Cache/CowTreeStorage.hpp>
 #include <FastCache/Cache/InMemoryLruStorage.hpp>
 #include <FastCache/Cache/LayeredStorage.hpp>
+#include <FastCache/Cache/NotifyingStorage.hpp>
+#include <FastCache/Cache/ShardedStorage.hpp>
+#include <FastCache/Cache/StorageTestUtils.hpp>
+#include <FastCache/Cache/WriteErrorReportingStorage.hpp>
 #include <FastCache/CompileCache/CompileValue.hpp>
 #include <FastCache/CompileCache/PathCanon.hpp>
 #include <FastCache/Core/Clock.hpp>
@@ -17,8 +22,12 @@
 #include <FastCache/Net/InMemoryTransport.hpp>
 #include <FastCache/Protocol/CompileCacheHandler.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
+#include <FastCache/Protocol/KeyspaceNotifier.hpp>
 #include <FastCache/Protocol/LiveStream.hpp>
 #include <FastCache/Protocol/ProtocolAutodetect.hpp>
+#include <FastCache/Protocol/PubSubRegistry.hpp>
+#include <FastCache/Protocol/RedisMutationObserver.hpp>
+#include <FastCache/Protocol/RedisTransaction.hpp>
 #include <FastCache/Protocol/SessionContext.hpp>
 
 #include <catch2/catch_test_macros.hpp>
@@ -1671,4 +1680,187 @@ TEST_CASE("A daemon subscriber that stops reading is cut off at its hold and cou
     CHECK(rig.metrics.Read(IMetricsSink::Counter::LiveSubscriptionsStalled) == 1);
     CHECK(rig.metrics.Read(IMetricsSink::Counter::LiveSubscriptionsEndedByReset) == 0);
     CHECK(rig.metrics.Read(IMetricsSink::Counter::LiveSubscriptionsEndedByClient) == 0);
+}
+
+// --- cache-drop (#1276) ---------------------------------------------------------
+//
+// The daemon SERVES the verb: it holds the key, so "unimplemented" and "served elsewhere"
+// would both be false. Every case below asserts the STORE, not only the reply, because a
+// drop whose reply was right while the object stayed readable is the failure an operator
+// running a repair could not see.
+
+namespace
+{
+
+/// Keeps what a keyspace channel was sent.
+class CapturingPushes final: public ISubscriber
+{
+  public:
+    void Deliver(PushMessage message) override
+    {
+        messages.push_back(std::move(message));
+    }
+
+    std::vector<PushMessage> messages;
+};
+
+/// Watch @p key on @p watches as a Redis client about to MULTI would.
+/// @param watches The registry the observer dirties.
+/// @param engine Where the key's current CAS is read.
+/// @param key The watched key.
+/// @return The handle, clean.
+[[nodiscard]] std::shared_ptr<WatchHandle> WatchKey(WatchRegistry& watches, CacheEngine& engine, std::string_view key)
+{
+    auto handle = std::make_shared<WatchHandle>();
+    handle->Remember(key, engine.PeekCas(key).value_or(CasToken { 0 }));
+    REQUIRE(watches.Register(handle, key));
+    REQUIRE_FALSE(handle->IsDirty());
+    return handle;
+}
+
+/// Send @p request over a fresh connection to a handler over @p engine, and read every reply.
+/// @param engine The engine the handler serves.
+/// @param request One or more frames.
+/// @param session The connection's session.
+/// @return The replies, in order.
+[[nodiscard]] std::vector<ReplyFrame> ExchangeOn(CacheEngine& engine,
+                                                 std::vector<std::byte> const& request,
+                                                 SessionContext session = {})
+{
+    InMemorySocketPair pair = InMemorySocketPair::Create();
+    CompileCacheHandler handler;
+    REQUIRE(SyncRun(WriteBytes(pair.client.get(), request)));
+    pair.client->ShutdownWrite();
+    SyncRun(handler.Run(pair.server.get(), &engine, {}, session));
+    pair.server->ShutdownWrite();
+    return SplitReplies(SyncRun(ReadAvailable(pair.client.get())));
+}
+
+} // namespace
+
+TEST_CASE("A CACHE-DROP removes the key, and a second one is a miss rather than an error",
+          "[compile-cache][handler][cache-drop]")
+{
+    CcFixture fix;
+    StoreVia(fix.engine, "dropme", "g");
+    REQUIRE(fix.engine.Get("dropme")->found);
+
+    auto const replies = ExchangeOn(
+        fix.engine, Concat({ Wire::EncodeCacheDrop("dropme"), Wire::EncodeCacheDrop("dropme"), FetchFrame("dropme") }));
+    REQUIRE(replies.size() == 3);
+    CHECK(replies[0].status == Wire::Status::Ok);
+    CHECK(replies[1].status == Wire::Status::Miss);
+    CHECK(replies[1].payload.empty());
+    CHECK(replies[2].status == Wire::Status::Miss);
+
+    // Counted by the store, which is what `/metrics` renders: no second tally.
+    CHECK(fix.storage.Snapshot().deleteHits == 1);
+    CHECK(fix.storage.Snapshot().deleteMisses == 1);
+}
+
+TEST_CASE("An unauthenticated CACHE-DROP is refused before its payload and removes nothing",
+          "[compile-cache][handler][cache-drop][auth]")
+{
+    // A drop is a write, gated as a STORE is. The ENGINE is asserted: a gate that refused after
+    // removing would satisfy the reply check alone.
+    CcFixture fix;
+    StoreVia(fix.engine, "guarded", "g");
+    auto authed = RequireSecret("", "s3cret");
+
+    auto const replies = ExchangeOn(fix.engine, Wire::EncodeCacheDrop("guarded"), authed.session);
+    REQUIRE(replies.size() == 1);
+    CHECK(ErrorOf(replies[0]).code == Wire::ErrorCode::Unauthenticated);
+    CHECK(fix.engine.Get("guarded")->found);
+
+    // And authenticated, the same request is served -- so the refusal was the credential's.
+    auto const served =
+        ExchangeOn(fix.engine, Concat({ AuthFrame("", "s3cret"), Wire::EncodeCacheDrop("guarded") }), authed.session);
+    REQUIRE(served.size() == 2);
+    CHECK(served[1].status == Wire::Status::Ok);
+    CHECK_FALSE(fix.engine.Get("guarded")->found);
+}
+
+TEST_CASE("A dropped key is gone from what a FETCH consults through the daemon's own storage chain",
+          "[compile-cache][handler][cache-drop][prefetch]")
+{
+    // The daemon's persistent composition, in `main.cpp`'s order -- `NotifyingStorage` over
+    // `WriteErrorReportingStorage` over a `ShardedStorage` of `LayeredStorage(InMemoryLru,
+    // CowTree)` shards. `BuildStorageBackend` lives in the executable and no test links it, so
+    // the chain is spelled here in that order; a bare tier would answer a question no FETCH
+    // asks. Two copies are made to exist before the drop -- the L2 record and an L1 mirror --
+    // and a group warm runs AFTER it, which is the one path that reads the key without anybody
+    // asking for it.
+    ManualClock clock;
+    Testing::TempFile shard0;
+    Testing::TempFile shard1;
+    std::vector<std::unique_ptr<IStorage>> shards;
+    for (auto const* const file: { &shard0, &shard1 })
+    {
+        auto l2 = CowTreeStorage::Open(CowTreeStorage::Options { .path = file->path });
+        REQUIRE(l2.has_value());
+        shards.push_back(std::make_unique<LayeredStorage>(std::make_unique<InMemoryLruStorage>(0), std::move(*l2)));
+    }
+    ShardedStorage sharded { std::move(shards) };
+    CapturingLogger logger;
+    WriteErrorReportingStorage reporting { sharded, logger };
+    NotifyingStorage notifying { reporting, nullptr };
+    CacheEngine engine { notifying, clock };
+
+    StoreVia(engine, "lead", "group");
+    StoreVia(engine, "member", "group");
+    // Resident in L1 as well as on disk.
+    REQUIRE(ExchangeOn(engine, FetchFrame("member")).front().status == Wire::Status::Ok);
+
+    REQUIRE(ExchangeOn(engine, Wire::EncodeCacheDrop("member")).front().status == Wire::Status::Ok);
+
+    // Fetching the leader warms the rest of its group, and the manifest still names the member.
+    REQUIRE(ExchangeOn(engine, FetchFrame("lead")).front().status == Wire::Status::Ok);
+    CHECK(ExchangeOn(engine, FetchFrame("member")).front().status == Wire::Status::Miss);
+    CHECK(reporting.Snapshot().writeErrors == 0);
+}
+
+TEST_CASE("A CACHE-DROP dirties a WATCH on the key and publishes no keyspace event",
+          "[compile-cache][handler][cache-drop][keyspace]")
+{
+    // Through the NOTIFYING decorator, as a memcached `delete` is: a Redis client that WATCHed
+    // the key must see its EXEC abort. And, like that `delete` and a `STORE`, no
+    // `__keyevent@0__:del` -- the event names belong to the Redis verbs that own them.
+    //
+    // Neutered by handing the handler an engine ONE LAYER DOWN, below `NotifyingStorage`: the
+    // key is removed exactly the same and the WATCH stays clean. That arm is kept as a SECTION
+    // rather than run once by hand, so the distinction it proves is on every run.
+    ManualClock clock;
+    InMemoryLruStorage inner { 0 };
+    PubSubRegistry registry;
+    auto const delEvents = std::make_shared<CapturingPushes>();
+    static_cast<void>(registry.Subscribe(delEvents, "__keyevent@0__:del"));
+    KeyspaceNotifier notifier { &registry, KeyspaceEvents::Keyevent | KeyspaceEvents::All };
+    WatchRegistry watches;
+    RedisMutationObserver observer { &watches, &notifier };
+    NotifyingStorage notifying { inner, &observer };
+
+    // Watched AFTER the store, because the store is itself a mutation and would dirty a watch
+    // taken before it -- which would pass the first section for the wrong reason.
+    SECTION("through the notifying decorator, as the daemon composes it")
+    {
+        CacheEngine engine { notifying, clock };
+        StoreVia(engine, "watched", "g");
+        auto const handle = WatchKey(watches, engine, "watched");
+
+        REQUIRE(ExchangeOn(engine, Wire::EncodeCacheDrop("watched")).front().status == Wire::Status::Ok);
+        CHECK_FALSE(engine.Get("watched")->found);
+        CHECK(handle->IsDirty());
+        CHECK(delEvents->messages.empty());
+    }
+
+    SECTION("one layer down, which removes the key and tells nobody")
+    {
+        CacheEngine engine { inner, clock };
+        StoreVia(engine, "watched", "g");
+        auto const handle = WatchKey(watches, engine, "watched");
+
+        REQUIRE(ExchangeOn(engine, Wire::EncodeCacheDrop("watched")).front().status == Wire::Status::Ok);
+        CHECK_FALSE(engine.Get("watched")->found);
+        CHECK_FALSE(handle->IsDirty());
+    }
 }

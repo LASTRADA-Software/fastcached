@@ -160,3 +160,11 @@ TEST_CASE("help colorizes without changing its text", "[testclient][cli][help][c
     CHECK_FALSE(HelpText(UsageColor::Plain).contains('\x1b'));
     CHECK(HelpText(UsageColor::Colored).contains('\x1b'));
 }
+
+TEST_CASE("drop selects its own action", "[testclient][cli]")
+{
+    auto const parsed = Parse({ "drop", "--port=1234", "--key", "k" });
+    REQUIRE(parsed.has_value());
+    CHECK(parsed->action == Action::Drop);
+    CHECK(parsed->key == "k");
+}

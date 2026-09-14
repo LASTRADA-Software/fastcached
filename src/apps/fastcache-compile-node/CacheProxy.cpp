@@ -154,6 +154,20 @@ namespace
                          "caller is visible and not only the ones that arrived over the wire",
         };
 
+        /// A removal the tier could not persist.
+        ///
+        /// **Uncounted here, and counted one layer down**, for `StorageWriteFailed`'s reason:
+        /// `WriteErrorReportingStorage` sits under every node tier and reports a
+        /// persistence-class failure on a removal as it does on a write -- one `Warn` line
+        /// and `fastcached_write_errors_total` -- where every caller is visible. The code is
+        /// the write code, because a removal IS a write to the store and the remedy is the
+        /// same disk.
+        constexpr Cc::UncountedRefusal StorageRemoveFailed {
+            .code = Wire::ErrorCode::StorageWriteFailed,
+            .rationale = "WriteErrorReportingStorage already reports this as fastcached_write_errors_total at the "
+                         "removal, where every caller is visible and not only the ones that arrived over the wire",
+        };
+
         /// Why a verb named by `RefusedVerbs` -- today, `AUTH` -- counts nothing.
         ///
         /// **The arm where a counter would be actively harmful.** It is what a
@@ -207,7 +221,9 @@ namespace
     // compile time rather than left to be noticed.
     static_assert(std::ranges::none_of(
                       RefusedVerbs,
-                      [](Wire::Op op) { return op == Wire::Op::Fetch || op == Wire::Op::Store; },
+                      [](Wire::Op op) {
+                          return op == Wire::Op::Fetch || op == Wire::Op::Store || op == Wire::Op::CacheDrop;
+                      },
                       &Wire::RefusedVerb::op),
                   "a refusal row for a verb this tier serves is dead: the lookup never reaches it");
 } // namespace
@@ -306,6 +322,27 @@ Task<std::vector<std::byte>> CacheProxy::Answer(std::span<std::byte const> frame
             if (!co_await _cache.Store(Wire::AsStringView(fields->key), toStore))
                 co_return Cc::RefuseWithoutCounter(TierRefusal::StorageWriteFailed);
             co_return Wire::EncodeReply(Wire::Status::Ok, {});
+        }
+        case Wire::Op::CacheDrop: {
+            // The locality gate has already run: `CacheResponder::RefusePeer` answers for
+            // every verb that reaches this tier, before the payload was read, so a caller
+            // on another machine never gets here and the key it named is untouched.
+            auto const key = Wire::DecodeCacheDropPayload(payload);
+            if (!key.has_value())
+                co_return Cc::Refuse(_metrics, TierRefusal::MalformedPayload);
+
+            switch (_cache.Drop(Wire::AsStringView(*key)))
+            {
+                case CacheDropOutcome::Removed:
+                    co_return Wire::EncodeReply(Wire::Status::Ok, {});
+                case CacheDropOutcome::Absent:
+                    // `Miss`, never `Error`: nothing to remove is what a repair's second run
+                    // finds, and see `Op::CacheDrop` for why that must not read as broken.
+                    co_return Wire::EncodeReply(Wire::Status::Miss, {});
+                case CacheDropOutcome::Failed:
+                    co_return Cc::RefuseWithoutCounter(TierRefusal::StorageRemoveFailed);
+            }
+            co_return Cc::RefuseWithoutCounter(TierRefusal::StorageRemoveFailed);
         }
         default:
             if (auto const* const row = Wire::FindRefusal(RefusedVerbs, descriptor->code); row != nullptr)

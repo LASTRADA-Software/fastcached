@@ -2,11 +2,13 @@
 #pragma once
 
 #include <FastCache/Core/Logger.hpp>
+#include <FastCache/Distributed/FleetText.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <format>
 #include <functional>
@@ -70,6 +72,12 @@ inline constexpr std::array ExchangeLogTable {
     VerbLogRow { .code = CompileCacheWire::Op::Fetch,
                  .level = LogLevel::Debug,
                  .rationale = "the highest-rate verb on this surface -- every TU asks before it compiles" },
+    VerbLogRow { .code = CompileCacheWire::Op::CacheDrop,
+                 .level = LogLevel::Debug,
+                 .rationale = "with its family, so the partition every Cache verb is held to stays exact; what an "
+                              "operator must see is a REMOVAL, which is an event rather than traffic and is "
+                              "narrated at Info by `FormatCacheRemoval` whatever this row says -- a miss and a "
+                              "refusal removed nothing and say nothing above Debug" },
     VerbLogRow { .code = CompileCacheWire::Op::Auth,
                  .level = LogLevel::Debug,
                  .rationale = "once per connection, but a connection is per TU; the outcome that MATTERS is "
@@ -349,6 +357,57 @@ struct StreamTally
                        FormatToolchainClause(opRaw, frame, namer));
 }
 
+/// The level a removal from this node's cache tier is narrated at.
+///
+/// **Info, while the exchange that caused it stays at its verb's `Debug`**, and the two are
+/// different facts rather than one fact logged twice. The exchange line says a request
+/// arrived; this says a stored object is GONE, which peer removed it and which key it was --
+/// the one question a counter cannot answer, and the one an operator reading why a machine's
+/// builds got slower asks first. At `Debug` it would be invisible at the default level; as an
+/// exception in `ExchangeLog_test`'s partition it would be the local exception the next
+/// high-rate verb walks through. Bounded by the keys that exist rather than by traffic: a key
+/// is removed once until something stores it again.
+inline constexpr LogLevel CacheRemovalLevel = LogLevel::Info;
+
+/// The removal line for one exchange, or nullopt when it removed nothing.
+///
+/// Only a `cache-drop` answered `Ok` removed anything. A `Miss` found nothing to remove -- the
+/// ordinary second run of a repair, which must stay quiet -- and a refusal is already counted
+/// by the row that answered it.
+///
+/// **The key is ESCAPED**, because it is bytes a peer chose and it lands in a journal: a
+/// newline would forge a second record and an ESC is a sequence a terminal obeys.
+/// `EscapeDelimited` is this tree's one escaper for text whose reader is a terminal.
+///
+/// Decoded here, for `FormatToolchainClause`'s reason: the responders know nothing about
+/// logging, and the two calls below are the ones `CacheProxy::Answer` makes.
+/// @param opRaw The opcode byte as it arrived.
+/// @param peer The peer's host, as the kernel reports it.
+/// @param frame The whole request frame, header included.
+/// @param reply The reply frame, empty when none was produced.
+/// @return The line, or nullopt.
+[[nodiscard]] inline std::optional<std::string> FormatCacheRemoval(std::uint8_t opRaw,
+                                                                   std::string_view peer,
+                                                                   std::span<std::byte const> frame,
+                                                                   std::span<std::byte const> reply)
+{
+    if (opRaw != static_cast<std::uint8_t>(CompileCacheWire::Op::CacheDrop) || reply.empty()
+        || reply.front() != static_cast<std::byte>(CompileCacheWire::Status::Ok))
+        return std::nullopt;
+
+    auto const header = CompileCacheWire::DecodeRequestHeader(frame);
+    if (!header.has_value() || frame.size() < CompileCacheWire::RequestHeaderSize + header->payloadLength)
+        return std::nullopt;
+    auto const key =
+        CompileCacheWire::DecodeCacheDropPayload(frame.subspan(CompileCacheWire::RequestHeaderSize, header->payloadLength));
+    if (!key.has_value())
+        return std::nullopt;
+
+    return std::format("0xFC cache-drop from {} removed key {} from this node's cache tier",
+                       peer.empty() ? std::string_view { "<unknown peer>" } : peer,
+                       Distributed::EscapeDelimited(CompileCacheWire::AsStringView(*key)));
+}
+
 /// Record one exchange, if this logger is listening at that verb's level.
 ///
 /// **A function rather than an `if` at the call site**, and that is not a style
@@ -382,9 +441,15 @@ inline void LogExchange(ILogger& logger,
     // This guard now covers a DECODE as well as a format, which is why it stays here
     // rather than being left to `Logf`: a node at the default level must not pay to
     // decode a compile payload for a line it is about to discard.
-    if (level < logger.MinLevel())
-        return;
-    logger.Log(level, FormatExchange(opRaw, peer, frame, reply, elapsed, namer, stream));
+    if (level >= logger.MinLevel())
+        logger.Log(level, FormatExchange(opRaw, peer, frame, reply, elapsed, namer, stream));
+
+    // After the exchange, and under its OWN level rather than inside the guard above: that
+    // guard answers for the verb's `Debug`, so nesting this in it would silence the removal
+    // at exactly the default level it exists to be seen at.
+    if (CacheRemovalLevel >= logger.MinLevel())
+        if (auto const removal = FormatCacheRemoval(opRaw, peer, frame, reply); removal.has_value())
+            logger.Log(CacheRemovalLevel, *removal);
 }
 
 /// How often one peer's version refusal may be reported.

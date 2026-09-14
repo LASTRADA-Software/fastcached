@@ -3,15 +3,19 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <cstddef>
 #include <span>
 #include <string>
 #include <vector>
 
+#include <tests/Unwrap.hpp>
+
 using namespace FastCache;
 using namespace FastCache::Node;
 using namespace std::chrono_literals;
+using FastCache::Testing::Unwrap;
 namespace Wire = FastCache::CompileCacheWire;
 
 namespace
@@ -190,9 +194,12 @@ class CapturingLines final: public FastCache::ILogger
     }
     [[nodiscard]] FastCache::LogLevel MinLevel() const noexcept override
     {
-        return FastCache::LogLevel::Trace;
+        return minLevel;
     }
-    void SetMinLevel(FastCache::LogLevel /*level*/) noexcept override {}
+    void SetMinLevel(FastCache::LogLevel level) noexcept override
+    {
+        minLevel = level;
+    }
 
     [[nodiscard]] std::size_t WarnCount() const
     {
@@ -201,6 +208,7 @@ class CapturingLines final: public FastCache::ILogger
     }
 
     std::vector<std::pair<FastCache::LogLevel, std::string>> lines;
+    FastCache::LogLevel minLevel { FastCache::LogLevel::Trace }; ///< What `LogExchange` is told this logger hears.
 };
 
 /// An `Error` reply carrying `code`, framed the way the wire frames one.
@@ -413,4 +421,80 @@ TEST_CASE("ExchangeLog: with no namer a compile still names its fingerprint", "[
 
     CHECK(line.contains("toolchain=631c2ecd"));
     CHECK(line.contains("unserved"));
+}
+
+// --- cache-drop (#1276) --------------------------------------------------------
+
+TEST_CASE("ExchangeLog: a removal is narrated at Info and the drop exchange stays Debug", "[node][logging][cache-drop]")
+{
+    // WHAT DISTINGUISHES: the same verb, three outcomes, and only the one that removed an
+    // object says anything at the default level. The partition case above is left untouched
+    // and still holds for this verb -- its exchange line is Debug -- which is what keeps that
+    // guard exact rather than carrying a local exception.
+    auto const drop = static_cast<std::uint8_t>(Wire::Op::CacheDrop);
+    auto const frame = Wire::EncodeCacheDrop("0123abcd");
+    CHECK(LogLevelForOp(drop) == LogLevel::Debug);
+
+    auto const infoLines = [&](std::vector<std::byte> const& reply) {
+        CapturingLines log;
+        LogExchange(log, drop, "127.0.0.1", frame, reply, 1ms);
+        std::vector<std::string> info;
+        for (auto const& [level, text]: log.lines)
+            if (level == LogLevel::Info)
+                info.push_back(text);
+        auto const debug = std::ranges::count_if(log.lines, [](auto const& l) { return l.first == LogLevel::Debug; });
+        CHECK(debug == 1); // the exchange line, on every outcome
+        return info;
+    };
+
+    SECTION("a hit removed an object, and says which, from whom")
+    {
+        auto const info = infoLines(ReplyWith(Wire::Status::Ok));
+        REQUIRE(info.size() == 1);
+        CHECK(info.front().contains("127.0.0.1"));
+        CHECK(info.front().contains("removed key 0123abcd"));
+    }
+    SECTION("a miss removed nothing and says nothing above Debug")
+    {
+        CHECK(infoLines(ReplyWith(Wire::Status::Miss)).empty());
+    }
+    SECTION("a refusal removed nothing and says nothing above Debug")
+    {
+        CHECK(infoLines(ErrorReply(Wire::ErrorCode::NotAMember, "not this machine")).empty());
+    }
+    SECTION("a node that wrote no reply removed nothing it can vouch for")
+    {
+        CHECK(infoLines({}).empty());
+    }
+}
+
+TEST_CASE("ExchangeLog: a removal is heard at the default level, which the exchange line is not",
+          "[node][logging][cache-drop]")
+{
+    // The ordering bug this guards: the removal nested inside the exchange line's own level
+    // test would be silenced at exactly Info, the level it exists to be seen at.
+    CapturingLines log;
+    log.SetMinLevel(LogLevel::Info);
+    LogExchange(log,
+                static_cast<std::uint8_t>(Wire::Op::CacheDrop),
+                "127.0.0.1",
+                Wire::EncodeCacheDrop("k"),
+                ReplyWith(Wire::Status::Ok),
+                1ms);
+    REQUIRE(log.lines.size() == 1);
+    CHECK(log.lines.front().first == LogLevel::Info);
+}
+
+TEST_CASE("ExchangeLog: a removed key a peer chose cannot forge a journal line", "[node][logging][cache-drop]")
+{
+    // A key is bytes a client picked. Unescaped, a newline in it would begin a second record
+    // that says whatever the client liked, and an ESC is a sequence an operator's terminal obeys.
+    auto const removal = FormatCacheRemoval(static_cast<std::uint8_t>(Wire::Op::CacheDrop),
+                                            "127.0.0.1",
+                                            Wire::EncodeCacheDrop("evil\nfake line\x1b[2J"),
+                                            ReplyWith(Wire::Status::Ok));
+    REQUIRE(removal.has_value());
+    CHECK_FALSE(Unwrap(removal).contains('\n'));
+    CHECK_FALSE(Unwrap(removal).contains('\x1b'));
+    CHECK(Unwrap(removal).contains(R"(\x1b)"));
 }

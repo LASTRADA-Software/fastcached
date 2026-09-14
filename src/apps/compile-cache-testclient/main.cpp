@@ -398,6 +398,32 @@ int DoFetch(TestClient::Args const& a)
     return missing == 0 ? 0 : 5;
 }
 
+// --- drop: CACHE-DROP ----------------------------------------------------------
+
+/// Remove one key from the endpoint's tier.
+///
+/// Exit codes follow `fetch`'s, so a script reads both alike: 0 is the thing happened, 4 is a
+/// MISS -- nothing was there to remove, which is an answer and not a failure -- and a refusal
+/// dies with the endpoint's own words.
+/// @param a The parsed command line.
+/// @return 0 when removed, 4 when absent.
+int DoDrop(TestClient::Args const& a)
+{
+    auto const client = Dial(a);
+    SendOrDie(*client, Wire::EncodeCacheDrop(a.key));
+
+    auto const [status, payload] = RecvReply(*client);
+    if (status == Wire::Status::Error)
+        Die("CACHE-DROP " + DescribeRefusal(payload));
+    if (status == Wire::Status::Miss)
+    {
+        std::cout << "DROP miss key=" << a.key << '\n';
+        return 4;
+    }
+    std::cout << "DROP ok key=" << a.key << '\n';
+    return 0;
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -423,6 +449,8 @@ int main(int argc, char** argv)
             return DoStore(*parsed);
         case TestClient::Action::Fetch:
             return DoFetch(*parsed);
+        case TestClient::Action::Drop:
+            return DoDrop(*parsed);
     }
     return 2;
 }

@@ -3,6 +3,7 @@
 #include <FastCache/Auth/AuthPolicy.hpp>
 #include <FastCache/CompileCache/CompileValue.hpp>
 #include <FastCache/CompileCache/PrefetchGroupManifest.hpp>
+#include <FastCache/Core/Errors/StorageError.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Protocol/CompileCacheAuth.hpp>
 #include <FastCache/Protocol/CompileCacheHandler.hpp>
@@ -596,6 +597,60 @@ namespace
         co_return Next::Continue;
     }
 
+    /// Handle one CACHE-DROP command: remove one key from this daemon's store.
+    ///
+    /// **Served, not refused.** `UnimplementedVerb` would tell a client this daemon is too
+    /// old to know the verb, and `DispatchNotPermitted` that another endpoint answers it;
+    /// both are false of a daemon that holds the key. The credential gate has already run:
+    /// `DecidePrePayload` asked for authentication exactly as it does before a `STORE`,
+    /// which is the gate a write gets here.
+    ///
+    /// Through the ENGINE, and so through `NotifyingStorage`: a Redis `WATCH` on the key is
+    /// dirtied exactly as a memcached `delete` dirties it. No keyspace event is published,
+    /// for the same reason a memcached `delete` and a `STORE` publish none -- the event
+    /// names belong to the Redis verbs that own them
+    /// (`docs/operations/known-limitations.md`).
+    ///
+    /// The prefetch-group manifest is left naming the key. Warming a group calls
+    /// `Prefetch`, which pulls a key into L1 only while L2 still holds it, so a dropped
+    /// member is a miss rather than something a warm can bring back.
+    /// @param socket   Client socket.
+    /// @param metrics  Where a malformed payload is counted.
+    /// @param engine   Cache engine.
+    /// @param payload  The request payload, by value (see HandleStore).
+    /// @return Whether the command loop should continue or abort.
+    [[nodiscard]] Task<Next> HandleCacheDrop(ISocket* socket,
+                                             IMetricsSink* metrics,
+                                             CacheEngine* engine,
+                                             std::vector<std::byte> payload)
+    {
+        auto const key = Wire::DecodeCacheDropPayload(payload);
+        if (!key.has_value())
+            co_return co_await ReplyRefused(socket,
+                                            metrics,
+                                            { .code = Wire::ErrorCode::MalformedFrame,
+                                              .counter = IMetricsSink::Counter::CacheFramesRefusedMalformedPayload },
+                                            {})
+                ? Next::Continue
+                : Next::Abort;
+
+        auto const removed = engine->Delete(BytesToString(*key));
+        if (removed.has_value())
+            co_return co_await Reply(socket, Wire::Status::Ok, {}) ? Next::Continue : Next::Abort;
+        if (removed.error().code == StorageErrorCode::KeyNotFound)
+            // `Miss`, never `Error`: see `Op::CacheDrop`.
+            co_return co_await Reply(socket, Wire::Status::Miss, {}) ? Next::Continue : Next::Abort;
+
+        co_return co_await ReplyUncounted(
+            socket,
+            { .code = Wire::ErrorCode::StorageWriteFailed,
+              .rationale = "WriteErrorReportingStorage reports a removal it could not persist as "
+                           "fastcached_write_errors_total, at the removal, where every protocol's delete is visible" },
+            {})
+            ? Next::Continue
+            : Next::Abort;
+    }
+
     /// Answer one distributed-execution verb, or refuse it when this endpoint does
     /// not serve them.
     ///
@@ -1088,6 +1143,9 @@ Task<void> CompileCacheHandler::Run(ISocket* socket,
                 break;
             case Wire::Op::Fetch:
                 next = co_await HandleFetch(socket, session.metrics, engine, &manifest, &primedGroups, std::move(*payload));
+                break;
+            case Wire::Op::CacheDrop:
+                next = co_await HandleCacheDrop(socket, session.metrics, engine, std::move(*payload));
                 break;
             case Wire::Op::Auth:
                 next = co_await HandleAuth(socket, session.metrics, policy, std::move(*payload), &credentialAccepted);
