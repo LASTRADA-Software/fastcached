@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "DashboardPanels.hpp"
+#include "NodeClient.hpp"
 
 #include <FastCache/Cache/IStorage.hpp>
 #include <FastCache/Metrics/StatsReading.hpp>
@@ -196,17 +197,21 @@ namespace
         ChartRow { .label = "conns/sec", .figure = ConnsPerSecond },
     };
 
-    constexpr auto CacheSpec = PanelSpec { .title = "fastcached",
-                                           .rates = CacheRates,
-                                           .levels = CacheLevels,
-                                           .tierColumns = CacheTierColumns,
-                                           .tierNote = CacheTierNote,
-                                           .tierPriority = Priority::Normal,
-                                           .tierNotePriority = Priority::Low,
-                                           .sourcePriority = Priority::High,
-                                           .fillsHeight = true,
-                                           .titleFacts = CacheTitle,
-                                           .charts = CacheCharts };
+    // Titled by what answered: a daemon's cache and a node's are one panel (#1399). `title` is the name before a
+    // session states one, spelled by the same table that names the server.
+    constexpr auto CacheSpec =
+        PanelSpec { .title = RemoteKindTable[static_cast<std::size_t>(RemoteKind::FastcacheWireOnly)].product,
+                    .rates = CacheRates,
+                    .levels = CacheLevels,
+                    .tierColumns = CacheTierColumns,
+                    .tierNote = CacheTierNote,
+                    .tierPriority = Priority::Normal,
+                    .tierNotePriority = Priority::Low,
+                    .sourcePriority = Priority::High,
+                    .fillsHeight = true,
+                    .titleNamesServer = true,
+                    .titleFacts = CacheTitle,
+                    .charts = CacheCharts };
 
     // ---- node -------------------------------------------------------------------------------
 
@@ -412,18 +417,19 @@ namespace
         TitleFactRow { .fact = ChromeFact::Quit, .priority = Priority::Low },
     };
 
-    constexpr auto NodeSpec = PanelSpec { .title = "fastcache-compile-node",
-                                          .rates = NodeRates,
-                                          .levels = {},
-                                          .tierColumns = {},
-                                          .tierNote = {},
-                                          .tierPriority = Priority::Normal,
-                                          .tierNotePriority = Priority::Low,
-                                          .sourcePriority = Priority::High,
-                                          .fillsHeight = true,
-                                          .titleFacts = NodeTitle,
-                                          .facts = NodeFacts,
-                                          .charts = NodeCharts };
+    constexpr auto NodeSpec =
+        PanelSpec { .title = RemoteKindTable[static_cast<std::size_t>(RemoteKind::CompileNode)].product,
+                    .rates = NodeRates,
+                    .levels = {},
+                    .tierColumns = {},
+                    .tierNote = {},
+                    .tierPriority = Priority::Normal,
+                    .tierNotePriority = Priority::Low,
+                    .sourcePriority = Priority::High,
+                    .fillsHeight = true,
+                    .titleFacts = NodeTitle,
+                    .facts = NodeFacts,
+                    .charts = NodeCharts };
 
     // ---- fleet ------------------------------------------------------------------------------
 

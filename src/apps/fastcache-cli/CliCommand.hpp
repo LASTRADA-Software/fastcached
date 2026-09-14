@@ -79,8 +79,17 @@ struct Command
     Credential credential {}; ///< From `--token-file` and `--user`.
     DialTimeouts timeouts {}; ///< From `--connect-timeout` and `--timeout`.
 
-    std::string tokenFile {};  ///< From `--token-file`; read by `main`, not here.
-    std::string diagnostic {}; ///< Why parsing failed; set iff `action == UsageError`.
+    std::string tokenFile {}; ///< From `--token-file`; read by `main`, not here.
+
+    /// From `--dashboard-token-file`; read by `main`, not here.
+    ///
+    /// Its own file rather than `--token-file`'s, and no environment variable: the dashboard
+    /// credential is not the data port's password, and a node checks it only on a fleet
+    /// subscription, so one secret standing in for the other would hand the password to whoever
+    /// may watch the fleet (#1399).
+    std::string dashboardTokenFile {};
+    std::string dashboardToken {}; ///< What `dashboardTokenFile` held; presented on a fleet subscription.
+    std::string diagnostic {};     ///< Why parsing failed; set iff `action == UsageError`.
 };
 
 /// The accepted options, in the order `--help` documents them.

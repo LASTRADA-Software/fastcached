@@ -183,13 +183,20 @@ struct RemoteKindSpec
     /// no frame came back, so nothing was established that the caller's own transport
     /// diagnostic does not already say, and there is nothing here to correct it with.
     std::optional<Outcome> established;
+
+    /// What this kind is called where one name must stand for the endpoint: a live panel's title.
+    ///
+    /// `FastcacheWireOnly` is named `fastcached` although a node older than the operator verbs
+    /// classifies the same way: a title is only drawn over a granted live-stats stream, and a
+    /// node that old grants none. Empty for a kind that is no fastcache at all.
+    std::string_view product;
 };
 
 /// What each kind establishes, one row per enumerator, in enumerator order.
 inline constexpr EnumTable<RemoteKind, RemoteKindSpec> RemoteKindTable { {
-    { .kind = RemoteKind::CompileNode, .established = Outcome::Refused },
-    { .kind = RemoteKind::FastcacheWireOnly, .established = Outcome::Refused },
-    { .kind = RemoteKind::NotFastcacheWire, .established = std::nullopt },
+    { .kind = RemoteKind::CompileNode, .established = Outcome::Refused, .product = "fastcache-compile-node" },
+    { .kind = RemoteKind::FastcacheWireOnly, .established = Outcome::Refused, .product = "fastcached" },
+    { .kind = RemoteKind::NotFastcacheWire, .established = std::nullopt, .product = "" },
 } };
 
 static_assert(RowsInEnumeratorOrder(RemoteKindTable, &RemoteKindSpec::kind),
@@ -272,29 +279,6 @@ class IEndpointIdentity
     /// What the endpoint is.
     /// @return The identification; asked once and remembered by implementations that dial.
     [[nodiscard]] virtual EndpointIdentity IdentifyEndpoint() = 0;
-};
-
-/// Where a watcher asks a node what it says about itself NOW.
-///
-/// **Asked afresh on every call, never answered from an identification.** `IEndpointIdentity`
-/// is asked once and remembered, which is right for deciding what an endpoint is and wrong for
-/// a watch: toolchains served, registrars, the scheduler role and the slots are what a node's
-/// status block exists to show moving, and a remembered answer would show the session's first
-/// moment for as long as it runs.
-class INodeStatusReader
-{
-  public:
-    INodeStatusReader() = default;
-    INodeStatusReader(INodeStatusReader const&) = delete;
-    INodeStatusReader(INodeStatusReader&&) = delete;
-    INodeStatusReader& operator=(INodeStatusReader const&) = delete;
-    INodeStatusReader& operator=(INodeStatusReader&&) = delete;
-    virtual ~INodeStatusReader() = default;
-
-    /// Ask the node for its status, one round trip.
-    /// @return What it said, or nullopt when nothing could be asked or nothing readable came back
-    ///         -- a status block draws that as absent, beside the sample's gap or reading.
-    [[nodiscard]] virtual std::optional<CompileCacheWire::NodeStatusFields> ReadNodeStatus() = 0;
 };
 
 /// What to tell an operator whose verb could not be answered by @p kind.

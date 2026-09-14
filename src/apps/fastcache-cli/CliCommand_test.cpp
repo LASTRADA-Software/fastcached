@@ -525,6 +525,28 @@ TEST_CASE("the credential comes from the environment", "[cli][command]")
     CHECK_FALSE(user.credential.Configured());
 }
 
+TEST_CASE("the dashboard credential is its own file, and no environment variable reaches it", "[cli][command]")
+{
+    // #1399 D4. WHAT DISTINGUISHES: the path lands in `dashboardTokenFile` and in NOTHING the data port presents --
+    // one flag standing in for the other would hand the password to whoever may watch the fleet -- and the
+    // control is `--token-file`, which lands in `tokenFile` and leaves the dashboard's path empty.
+    auto const dashboard = Parse({ "--dashboard-token-file=/etc/fastcached/dashboard.token", "live-stats", "fleet" });
+    CHECK(dashboard.action == Action::RunVerb);
+    CHECK(dashboard.dashboardTokenFile == "/etc/fastcached/dashboard.token");
+    CHECK(dashboard.tokenFile.empty());
+    CHECK_FALSE(dashboard.credential.Configured());
+    // Read by `main`, never here: the parse holds the path and no secret.
+    CHECK(dashboard.dashboardToken.empty());
+
+    auto const data = Parse({ "--token-file=/etc/fastcached/requirepass", "live-stats", "fleet" });
+    CHECK(data.tokenFile == "/etc/fastcached/requirepass");
+    CHECK(data.dashboardTokenFile.empty());
+
+    // No variable spells it: the environment's lesser route is not offered to a new secret.
+    for (auto const& variable: CliEnvironment())
+        CHECK_FALSE(variable.name.contains("DASHBOARD"));
+}
+
 TEST_CASE("the admin address is unset by default and says so", "[cli][command]")
 {
     // Unset means the richest stats source is not asked, which is reported as *not

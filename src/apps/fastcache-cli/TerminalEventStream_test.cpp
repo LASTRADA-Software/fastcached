@@ -38,7 +38,7 @@ namespace
 
 /// An endo event source whose wait BLOCKS until it is woken, and records where it ran.
 ///
-/// It blocks on purpose, for `TakeSample`'s reason: a source that returned at once would let a
+/// It blocks on purpose, for `TakeFrame`'s reason: a source that returned at once would let a
 /// stream that never left the reactor, or a `Close()` that never reached the wait, finish before
 /// anything could observe the difference.
 class BlockingEventSource final: public tui::runtime::EventSource

@@ -1,23 +1,26 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "DashboardPanels.hpp"
 #include "LivePipedView.hpp"
-#include "ScrapeFixture.hpp"
 #include "ScriptedDashboardEvents.hpp"
 
 #include <FastCache/Async/TestReactor.hpp>
 #include <FastCache/Cache/StorageTier.hpp>
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Ranges.hpp>
+#include <FastCache/Metrics/IMetricsSink.hpp>
+#include <FastCache/Metrics/StatsReading.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <optional>
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include <tests/Unwrap.hpp>
@@ -43,48 +46,67 @@ class StreamSink final: public IFrameSink
     std::string stream {};
 };
 
-/// A projection that reports the newest reading as it arrived, field for field.
+/// The counters the view-mechanics cases stream, in the order a row reports them, each under the name a case reads.
 ///
-/// The view's own mechanics -- the header, the rows by name, the formats -- are the subject of most
-/// cases here, and they are easiest to see over a record whose fields the case chose.
+/// Catalogue counters stand in for whatever figures a projection names: the view's own mechanics -- the header, the
+/// rows by name, the formats -- are the subject of most cases here, and they are easiest to see over fields the case
+/// chose. Distinct counters, so no two names can read one number.
+constexpr auto CaseCounters = std::to_array<std::pair<std::string_view, IMetricsSink::Counter>>({
+    { "curr_connections", IMetricsSink::Counter::ConnectionsTotal },
+    { "used_memory", IMetricsSink::Counter::ConnectionsAdmissionRejected },
+    { "a", IMetricsSink::Counter::ConnectionsTotalTls },
+    { "b", IMetricsSink::Counter::ConnectionsAdmissionRejectedTls },
+    { "c", IMetricsSink::Counter::DispatchLeasesGranted },
+});
+
+/// A projection that reports the newest reading's source, then its case counters, one field per counter it carries.
 /// @param model What is known.
-/// @return The newest reading, or an empty record.
-[[nodiscard]] Value ReadingAsIs(DashboardModel const& model)
+/// @return The source and the counters, or an empty record before a reading.
+[[nodiscard]] Value CaseCountersOf(DashboardModel const& model)
 {
-    if (!model.latest.has_value() || model.latest->shape != Shape::Record)
-        return RecordValue({});
-    return *model.latest;
+    auto fields = std::vector<Field> {};
+    if (!model.stats.has_value() || !model.latestStamp.has_value())
+        return RecordValue(std::move(fields));
+    fields.push_back(Field { .name = "source", .value = TextCell(model.latestStamp->source) });
+    for (auto const& [name, counter]: CaseCounters)
+        if (auto const& value = model.stats->counters[static_cast<std::size_t>(counter)]; value.has_value())
+            fields.push_back(Field { .name = std::string { name }, .value = NumberCell(*value) });
+    return RecordValue(std::move(fields));
 }
 
-/// A stats round `ChooseStats` accepts, with the fields named.
-/// @param fields The record's fields, in order.
-/// @param origin The source that answered.
-/// @return One attempt carrying them.
-[[nodiscard]] std::vector<StatsAttempt> ReadingOf(std::vector<Field> fields, StatsOrigin origin = StatsOrigin::Info)
+/// A reading carrying exactly the case counters named.
+/// @param counts Each counter's name in `CaseCounters` and what it reads.
+/// @return The reading.
+[[nodiscard]] StatsReading ReadingOf(std::vector<std::pair<std::string_view, std::uint64_t>> const& counts)
 {
-    return { StatsAttempt { .origin = origin, .asked = true, .record = RecordValue(std::move(fields)), .note = {} } };
+    auto reading = StatsReading {};
+    for (auto const& [name, value]: counts)
+    {
+        auto const* const row = FindIfOrNull(CaseCounters, [name](auto const& one) { return one.first == name; });
+        REQUIRE(row != nullptr);
+        reading.counters[static_cast<std::size_t>(row->second)] = value;
+    }
+    return reading;
 }
 
 /// The ordinary reading these cases stream: two counters.
 /// @param connections The first counter.
-/// @return The attempts.
-[[nodiscard]] std::vector<StatsAttempt> Reading(std::uint64_t connections)
+/// @return The reading.
+[[nodiscard]] StatsReading Reading(std::uint64_t connections)
 {
-    return ReadingOf({
-        Field { .name = "curr_connections", .value = NumberCell(connections) },
-        Field { .name = "used_memory", .value = NumberCell(std::uint64_t { 4096 }) },
-    });
+    return ReadingOf({ { "curr_connections", connections }, { "used_memory", 4096 } });
 }
 
-/// A sample that read, followed by the tick the cadence owes it.
+/// A sample that read, as a stream pushes one, followed by the tick the source owes it.
 /// @param script Where to append.
 /// @param seconds When it was taken.
-/// @param attempts What the sources said.
-void AddSample(std::vector<DashboardEvent>& script, int seconds, std::vector<StatsAttempt> attempts)
+/// @param reading What the stream pushed.
+void AddSample(std::vector<DashboardEvent>& script, int seconds, StatsReading reading)
 {
     script.push_back(DashboardEvent { .kind = DashboardEventKind::Sample,
                                       .at = TimePoint { std::chrono::seconds { seconds } },
-                                      .attempts = std::move(attempts) });
+                                      .reading = std::move(reading),
+                                      .where = "127.0.0.1:6674" });
     script.push_back(DashboardEvent { .kind = DashboardEventKind::Tick });
 }
 
@@ -119,7 +141,7 @@ void AddFailure(std::vector<DashboardEvent>& script)
                                  OutputFormat format,
                                  DashboardLimits limits = {},
                                  std::optional<std::string> absent = std::nullopt,
-                                 FigureProjection project = &ReadingAsIs)
+                                 FigureProjection project = &CaseCountersOf)
 {
     auto clock = ManualClock {};
     auto reactor = TestReactor { clock };
@@ -258,14 +280,8 @@ TEST_CASE("a later piped reading is read against the header by name", "[cli][liv
     // A header printed once is a promise about every row under it: a field it does not name is
     // dropped, and a column the reading lacks is absent rather than shifted into its neighbour.
     std::vector<DashboardEvent> script;
-    AddSample(script,
-              1,
-              ReadingOf({ Field { .name = "a", .value = NumberCell(std::uint64_t { 1 }) },
-                          Field { .name = "b", .value = NumberCell(std::uint64_t { 2 }) } }));
-    AddSample(script,
-              2,
-              ReadingOf({ Field { .name = "b", .value = NumberCell(std::uint64_t { 20 }) },
-                          Field { .name = "c", .value = NumberCell(std::uint64_t { 30 }) } }));
+    AddSample(script, 1, ReadingOf({ { "a", 1 }, { "b", 2 } }));
+    AddSample(script, 2, ReadingOf({ { "b", 20 }, { "c", 30 } }));
 
     auto const lines = Lines(Stream(std::move(script), OutputFormat::Csv));
     REQUIRE(lines.size() == 3);
@@ -318,16 +334,13 @@ namespace
     return names;
 }
 
-/// A cache daemon's `/metrics` at one moment: its cache block, and no catalogue counter at all.
+/// A cache daemon's reading at one moment: its cache block, and no catalogue counter at all.
 /// @param hits GET hits.
 /// @param misses GET misses.
 /// @param gets GET commands.
 /// @param used Bytes used.
-/// @return The attempts.
-[[nodiscard]] std::vector<StatsAttempt> CacheAt(std::uint64_t hits,
-                                                std::uint64_t misses,
-                                                std::uint64_t gets,
-                                                std::uint64_t used)
+/// @return The reading.
+[[nodiscard]] StatsReading CacheAt(std::uint64_t hits, std::uint64_t misses, std::uint64_t gets, std::uint64_t used)
 {
     auto reading = StatsReading {};
     reading.snapshot.storage = StorageStats { .itemCount = 12,
@@ -336,14 +349,14 @@ namespace
                                               .cmdGet = gets,
                                               .getHits = hits,
                                               .getMisses = misses };
-    return ReadingOf(ScrapeOf(reading), StatsOrigin::Metrics);
+    return reading;
 }
 
-/// A compile node's `/metrics` @p step intervals in: 16 cores registered with 16 slots and 6 running, 625 permille
+/// A compile node's reading @p step intervals in: 16 cores registered with 16 slots and 6 running, 625 permille
 /// busy over every interval, 32 GiB of memory free, and a cache tier holding 2 of its 8 GiB.
 /// @param step How far the CPU counters have moved.
-/// @return The attempts.
-[[nodiscard]] std::vector<StatsAttempt> NodeAt(std::uint64_t step)
+/// @return The reading.
+[[nodiscard]] StatsReading NodeAt(std::uint64_t step)
 {
     auto reading = StatsReading {};
     reading.snapshot.host = HostCapacity { .logicalCores = 16,
@@ -356,14 +369,14 @@ namespace
                                                   .availableMemoryBytes = std::uint64_t { 32 } << 30U };
     reading.snapshot.storage =
         StorageStats { .bytesUsed = std::size_t { 2 } << 30U, .bytesLimit = std::size_t { 8 } << 30U };
-    return ReadingOf(ScrapeOf(reading), StatsOrigin::Metrics);
+    return reading;
 }
 
-/// A cache daemon's `/metrics` at one moment, carrying @p tiers.
+/// A cache daemon's reading at one moment, carrying @p tiers.
 /// @param items Every tier's item count; its bytes used are a hundred times that.
 /// @param tiers The `StorageTierTable` names the reading carries.
-/// @return The attempts.
-[[nodiscard]] std::vector<StatsAttempt> TieredAt(std::uint64_t items, std::vector<std::string_view> const& tiers)
+/// @return The reading.
+[[nodiscard]] StatsReading TieredAt(std::uint64_t items, std::vector<std::string_view> const& tiers)
 {
     auto reading = StatsReading {};
     reading.snapshot.storage = StorageStats { .itemCount = static_cast<std::size_t>(items) };
@@ -375,7 +388,7 @@ namespace
             StorageStats { .itemCount = static_cast<std::size_t>(items),
                            .bytesUsed = static_cast<std::size_t>(items * 100) };
     }
-    return ReadingOf(ScrapeOf(reading), StatsOrigin::Metrics);
+    return reading;
 }
 
 /// The cell under @p name in @p row, failing the case when the header names no such column.

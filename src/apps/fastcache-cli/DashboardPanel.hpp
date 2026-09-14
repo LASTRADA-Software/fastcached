@@ -354,7 +354,8 @@ struct ChartRow
 
 struct PanelSpec
 {
-    std::string_view title;                      ///< The frame's title.
+    /// The frame's title; for a panel whose title names its server, only the name before a session states one.
+    std::string_view title;
     std::span<RateRow const> rates;              ///< The upper block.
     std::span<LevelRow const> levels;            ///< The lower block.
     std::span<TierColumn const> tierColumns;     ///< The tier block; empty for a panel without one.
@@ -368,6 +369,12 @@ struct PanelSpec
     /// panel's box the terminal's full height. The rows are padded above the source line, after the chart
     /// has grown into what it can use.
     bool fillsHeight { false };
+    /// Whether the title names WHAT ANSWERED -- `PanelContext::server` -- rather than `title`.
+    ///
+    /// True for the cache panel, which a cache daemon and a compile node both serve (#1399): a node's cache
+    /// titled `fastcached` names a process that is not there. A panel only one kind serves, or one whose
+    /// subject is not a process (`fleet`), keeps its own.
+    bool titleNamesServer { false };
     std::optional<DocumentSpec> document {};     ///< The fleet document block; nullopt for a panel without one.
     std::span<TitleFactRow const> titleFacts {}; ///< What the title bar states beside `title`, in reading order.
     std::span<FactBlock const> facts {};         ///< Blocks of status facts; empty for a panel that reads no status.
@@ -497,8 +504,10 @@ inline constexpr std::string_view TierKeySeparator = "_";
 /// without one.
 struct PanelContext
 {
-    std::string absent {};                                ///< What an absent figure reads as.
-    std::string endpoint {};                              ///< Where the samples are asked; empty when not stated.
+    std::string absent {};   ///< What an absent figure reads as.
+    std::string endpoint {}; ///< Where the samples are asked; empty when not stated.
+    /// What answered, as a title names it (`RemoteKindSpec::product`); empty when not stated.
+    std::string server {};
     std::optional<std::chrono::milliseconds> interval {}; ///< The sampling interval, when stated.
     CellWidth cellWidth { nullptr };                      ///< How many cells text occupies; must not be null.
     /// What draws an image on the Sixel rung, or null for a session with none; never owned.

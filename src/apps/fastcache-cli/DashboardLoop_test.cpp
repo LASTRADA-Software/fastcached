@@ -6,16 +6,20 @@
 
 #include <FastCache/Async/TestReactor.hpp>
 #include <FastCache/Core/Clock.hpp>
-#include <FastCache/Metrics/MetricsCatalog.hpp>
+#include <FastCache/Metrics/IMetricsSink.hpp>
+#include <FastCache/Metrics/StatsReading.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <chrono>
+#include <cstdint>
 #include <format>
 #include <memory>
 #include <optional>
 #include <ranges>
 #include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 
 #include <tests/Unwrap.hpp>
@@ -55,37 +59,17 @@ class RecordingView final: public IDashboardView
     std::vector<DashboardModel> seen {};
 };
 
-/// The catalogue counter every `Reading` carries, and the name a `/metrics` record spells it with.
+/// The catalogue counter every `Reading` carries.
 constexpr auto CountedRow = IMetricsSink::Counter::ConnectionsTotal;
 
-/// `CountedRow`'s series name.
-/// @return The name.
-[[nodiscard]] std::string CountedName()
-{
-    return std::string { DescriptorOf(CountedRow)->prometheusName };
-}
+/// The field every `Reading` carries, as the model reads it.
+constexpr auto Counter = CounterField<CountedRow>();
 
-/// A reading that `ChooseStats` will accept.
-/// @param value What the one metric reads.
-/// @return One attempt carrying it.
-[[nodiscard]] std::vector<StatsAttempt> Reading(std::int64_t value)
-{
-    auto record = Value {};
-    record.shape = Shape::Record;
-    record.fields.push_back(Field { .name = CountedName(), .value = TextCell(std::to_string(value)) });
-    return { StatsAttempt { .origin = StatsOrigin::Metrics, .asked = true, .record = std::move(record), .note = {} } };
-}
+/// Where a sample says its stream answered, unless a case names another endpoint.
+constexpr auto Here = std::string_view { "127.0.0.1:6674" };
 
-/// A reading from a named source that `ChooseStats` will accept.
-/// @param origin Which source it came from.
-/// @param value What the one metric reads.
-/// @return One attempt carrying it.
-[[nodiscard]] std::vector<StatsAttempt> ReadingFrom(StatsOrigin origin, std::int64_t value)
-{
-    auto attempts = Reading(value);
-    attempts.front().origin = origin;
-    return attempts;
-}
+/// Another endpoint: a leader a stream followed, or a process a re-subscription reached.
+constexpr auto Elsewhere = std::string_view { "10.0.0.9:7071" };
 
 /// A steady time @p seconds after the clock's epoch.
 /// @param seconds How far in.
@@ -95,11 +79,42 @@ constexpr auto CountedRow = IMetricsSink::Counter::ConnectionsTotal;
     return TimePoint { std::chrono::seconds { seconds } };
 }
 
-/// A round in which every source was asked and none answered.
-/// @return The attempts.
-[[nodiscard]] std::vector<StatsAttempt> NothingAnswered()
+/// A reading whose one counter reads @p value, captured the way a daemon captures one.
+/// @param value What `CountedRow` reads.
+/// @return The reading.
+[[nodiscard]] StatsReading Reading(std::int64_t value)
 {
-    return { StatsAttempt { .origin = StatsOrigin::Info, .asked = true, .record = std::nullopt, .note = "refused" } };
+    AtomicMetricsSink sink;
+    sink.Increment(CountedRow, static_cast<std::uint64_t>(value));
+    return CaptureStatsReading(sink, MetricsSnapshot {});
+}
+
+/// A `Sample` carrying `Reading(value)`, as a stream pushes one.
+/// @param value What the one counter reads.
+/// @param seconds When it was taken.
+/// @param where Where the stream answered.
+/// @return The event.
+[[nodiscard]] DashboardEvent SampleAt(std::int64_t value, int seconds, std::string_view where = Here)
+{
+    return DashboardEvent {
+        .kind = DashboardEventKind::Sample, .at = At(seconds), .reading = Reading(value), .where = std::string { where }
+    };
+}
+
+/// A `Sample` that carried no reading, which the stats reader refuses rather than drawing as zeroes.
+/// @param seconds When it was taken.
+/// @return The event.
+[[nodiscard]] DashboardEvent NoReadingAt(int seconds)
+{
+    return DashboardEvent { .kind = DashboardEventKind::Sample, .at = At(seconds) };
+}
+
+/// What `CountedRow` reads in @p stats.
+/// @param stats A model's or a history entry's reading.
+/// @return The number, or nullopt where there is no reading.
+[[nodiscard]] std::optional<double> CountedIn(std::optional<StatsReading> const& stats)
+{
+    return NumberIn(stats, Counter, std::nullopt);
 }
 
 } // namespace
@@ -151,10 +166,10 @@ TEST_CASE("the same event list renders byte-identical frames", "[cli][dashboard]
     // everybody regenerates has stopped being a check.
     auto const script = std::vector<DashboardEvent> {
         DashboardEvent { .kind = DashboardEventKind::Tick },
-        DashboardEvent { .kind = DashboardEventKind::Sample, .at = At(1), .attempts = Reading(10) },
+        SampleAt(10, 1),
         DashboardEvent { .kind = DashboardEventKind::Tick },
         DashboardEvent { .kind = DashboardEventKind::Resize, .columns = 100, .rows = 40 },
-        DashboardEvent { .kind = DashboardEventKind::Sample, .at = At(2), .attempts = Reading(20) },
+        SampleAt(20, 2),
         DashboardEvent { .kind = DashboardEventKind::Tick },
     };
 
@@ -182,9 +197,9 @@ TEST_CASE("the first frame has no rate and the second does", "[cli][dashboard]")
     auto view = RecordingView {};
     auto sink = CollectingSink {};
     auto const exit = Drive({ DashboardEvent { .kind = DashboardEventKind::Tick },
-                              DashboardEvent { .kind = DashboardEventKind::Sample, .at = At(1), .attempts = Reading(10) },
+                              SampleAt(10, 1),
                               DashboardEvent { .kind = DashboardEventKind::Tick },
-                              DashboardEvent { .kind = DashboardEventKind::Sample, .at = At(2), .attempts = Reading(20) },
+                              SampleAt(20, 2),
                               DashboardEvent { .kind = DashboardEventKind::Tick } },
                             DashboardLimits {},
                             view,
@@ -211,12 +226,12 @@ TEST_CASE("a failed sample breaks the run and the reading after it is not a rate
     // next reading, which is the bug.
     auto view = RecordingView {};
     auto sink = CollectingSink {};
-    (void) Drive({ DashboardEvent { .kind = DashboardEventKind::Sample, .at = At(1), .attempts = Reading(10) },
-                   DashboardEvent { .kind = DashboardEventKind::Sample, .at = At(2), .attempts = Reading(20) },
+    (void) Drive({ SampleAt(10, 1),
+                   SampleAt(20, 2),
                    DashboardEvent { .kind = DashboardEventKind::Tick },
                    DashboardEvent { .kind = DashboardEventKind::SampleFailed, .note = "refused" },
                    DashboardEvent { .kind = DashboardEventKind::Tick },
-                   DashboardEvent { .kind = DashboardEventKind::Sample, .at = At(3), .attempts = Reading(30) },
+                   SampleAt(30, 3),
                    DashboardEvent { .kind = DashboardEventKind::Tick } },
                  DashboardLimits {},
                  view,
@@ -231,10 +246,7 @@ TEST_CASE("a failed sample breaks the run and the reading after it is not a rate
     // "always broken" would satisfy every assertion above.
     auto quiet = RecordingView {};
     auto quietSink = CollectingSink {};
-    (void) Drive({ DashboardEvent { .kind = DashboardEventKind::Sample, .at = At(4), .attempts = Reading(10) },
-                   DashboardEvent { .kind = DashboardEventKind::Sample, .at = At(5), .attempts = Reading(20) },
-                   DashboardEvent { .kind = DashboardEventKind::Sample, .at = At(6), .attempts = Reading(30) },
-                   DashboardEvent { .kind = DashboardEventKind::Tick } },
+    (void) Drive({ SampleAt(10, 4), SampleAt(20, 5), SampleAt(30, 6), DashboardEvent { .kind = DashboardEventKind::Tick } },
                  DashboardLimits {},
                  quiet,
                  quietSink);
@@ -244,17 +256,12 @@ TEST_CASE("a failed sample breaks the run and the reading after it is not a rate
 
 TEST_CASE("a reading nothing answered is a gap, not a sample", "[cli][dashboard]")
 {
-    // A `Sample` whose attempts all came back empty must land where `SampleFailed`
-    // lands. Two routes, one outcome -- and they are folded through one helper precisely
-    // so they cannot drift apart, which is what this case watches.
+    // A `Sample` that carried no reading must land where `SampleFailed` lands. Two routes, one outcome -- and they are
+    // folded through one helper precisely so they cannot drift apart, which is what this case watches.
     auto view = RecordingView {};
     auto sink = CollectingSink {};
     auto const exit =
-        Drive({ DashboardEvent { .kind = DashboardEventKind::Sample, .at = At(1), .attempts = NothingAnswered() },
-                DashboardEvent { .kind = DashboardEventKind::Tick } },
-              DashboardLimits {},
-              view,
-              sink);
+        Drive({ NoReadingAt(1), DashboardEvent { .kind = DashboardEventKind::Tick } }, DashboardLimits {}, view, sink);
 
     REQUIRE(view.seen.size() == 1);
     CHECK(!view.seen[0].latest.has_value());
@@ -276,7 +283,7 @@ TEST_CASE("one good sample then failures to the end is a SUCCESS", "[cli][dashbo
     // passes only the wrong one.
     auto view = RecordingView {};
     auto sink = CollectingSink {};
-    auto const exit = Drive({ DashboardEvent { .kind = DashboardEventKind::Sample, .at = At(1), .attempts = Reading(10) },
+    auto const exit = Drive({ SampleAt(10, 1),
                               DashboardEvent { .kind = DashboardEventKind::SampleFailed, .note = "gone" },
                               DashboardEvent { .kind = DashboardEventKind::SampleFailed, .note = "gone" },
                               DashboardEvent { .kind = DashboardEventKind::Tick } },
@@ -302,10 +309,7 @@ TEST_CASE("a sample budget of N takes exactly N readings", "[cli][dashboard]")
     // miss, and stopping at N+1 consumes one the budget forbade.
     auto view = RecordingView {};
     auto sink = CollectingSink {};
-    auto const exit = Drive({ DashboardEvent { .kind = DashboardEventKind::Sample, .at = At(1), .attempts = Reading(10) },
-                              DashboardEvent { .kind = DashboardEventKind::Sample, .at = At(2), .attempts = Reading(20) },
-                              DashboardEvent { .kind = DashboardEventKind::Sample, .at = At(3), .attempts = Reading(30) },
-                              DashboardEvent { .kind = DashboardEventKind::Sample, .at = At(4), .attempts = Reading(40) } },
+    auto const exit = Drive({ SampleAt(10, 1), SampleAt(20, 2), SampleAt(30, 3), SampleAt(40, 4) },
                             DashboardLimits { .samples = 2 },
                             view,
                             sink);
@@ -318,13 +322,11 @@ TEST_CASE("a sample budget of N takes exactly N readings", "[cli][dashboard]")
     // one reading among the N keeps the run `Affirmative`.
     auto second = RecordingView {};
     auto secondSink = CollectingSink {};
-    auto const withGap =
-        Drive({ DashboardEvent { .kind = DashboardEventKind::Sample, .at = At(5), .attempts = Reading(10) },
-                DashboardEvent { .kind = DashboardEventKind::SampleFailed, .note = "gone" },
-                DashboardEvent { .kind = DashboardEventKind::Sample, .at = At(6), .attempts = Reading(20) } },
-              DashboardLimits { .samples = 2 },
-              second,
-              secondSink);
+    auto const withGap = Drive(
+        { SampleAt(10, 5), DashboardEvent { .kind = DashboardEventKind::SampleFailed, .note = "gone" }, SampleAt(20, 6) },
+        DashboardLimits { .samples = 2 },
+        second,
+        secondSink);
     CHECK(withGap.stop == DashboardStop::SampleBudget);
     CHECK(withGap.outcome == Outcome::Affirmative);
     CHECK(withGap.model.attempts == 2);
@@ -342,7 +344,7 @@ TEST_CASE("a quit arriving mid-fetch ends the run and closes the source", "[cli]
     auto view = RecordingView {};
     auto sink = CollectingSink {};
     auto const exit = Drive({ DashboardEvent { .kind = DashboardEventKind::Tick },
-                              DashboardEvent { .kind = DashboardEventKind::Sample, .at = At(1), .attempts = Reading(10) },
+                              SampleAt(10, 1),
                               DashboardEvent { .kind = DashboardEventKind::Key, .keys = "q" },
                               DashboardEvent { .kind = DashboardEventKind::Tick } },
                             DashboardLimits {},
@@ -415,14 +417,14 @@ namespace
 
 /// A `fleet` session's reader, reduced to what this file needs: the document's body.
 /// @param event The sample.
-/// @return The body as a one-field record, or the fetch's failure as an outcome.
+/// @return The body as a one-field record, or `Unreachable` for a sample that carried no document.
 [[nodiscard]] SampleReading DocumentReader(DashboardEvent const& event)
 {
-    if (!event.document.has_value() || !event.document->has_value())
+    if (!event.document.has_value())
         return SampleReading { .outcome = Outcome::Unreachable, .value = {}, .source = {} };
     auto record = Value {};
     record.shape = Shape::Record;
-    record.fields.push_back(Field { .name = "body", .value = TextCell(event.document->value()) });
+    record.fields.push_back(Field { .name = "body", .value = TextCell(*event.document) });
     return SampleReading { .outcome = Outcome::Affirmative, .value = std::move(record), .source = "fleet.txt" };
 }
 
@@ -431,13 +433,13 @@ namespace
 /// @return A reading carrying a document whose `kpi` table holds the body, or a failure.
 [[nodiscard]] SampleReading HandingReader(DashboardEvent const& event)
 {
-    if (!event.document.has_value() || !event.document->has_value())
+    if (!event.document.has_value())
         return SampleReading { .outcome = Outcome::Unreachable, .value = {}, .source = {} };
     auto document = FleetDocument {};
     document.sections.at(static_cast<std::size_t>(FleetSection::Kpi)) =
-        TableValue({ "body" }, { { TextCell(event.document->value()) } });
+        TableValue({ "body" }, { { TextCell(*event.document) } });
     return SampleReading { .outcome = Outcome::Affirmative,
-                           .value = ScalarValue(TextCell(event.document->value())),
+                           .value = ScalarValue(TextCell(*event.document)),
                            .source = "fleet.txt",
                            .note = {},
                            .document = std::make_shared<FleetDocument const>(std::move(document)) };
@@ -466,32 +468,25 @@ namespace
 
 } // namespace
 
-TEST_CASE("a reading from a different source breaks the run and the next from that source continues it", "[cli][dashboard]")
+TEST_CASE("a reading from a different endpoint breaks the run and the next from that endpoint continues it",
+          "[cli][dashboard]")
 {
-    // A change measured across two sources subtracts one vocabulary from another, so it is
-    // not a rate. WHAT DISTINGUISHES: the frame after the switch is broken, the frame after
-    // THAT is not, and a run with no switch is not broken at the same point -- without the
-    // last, "a third reading is always broken" would satisfy the first two.
+    // Every reading arrives by one source, the subscription, so a change of ENDPOINT is what says the counters now
+    // belong to another process: a stream that followed a leader, or re-subscribed where somebody else answers. A
+    // change measured across it subtracts one node's counters from another's, so it is not a rate.
+    //
+    // WHAT DISTINGUISHES: the frame after the switch is broken, the frame after THAT is not, and a run with no switch
+    // is not broken at the same point -- without the last, "a third reading is always broken" would satisfy the first
+    // two. Neutered by dropping `after.where == before.where` from `ContinuesRun`: frame 2 reads unbroken.
     auto const tick = DashboardEvent { .kind = DashboardEventKind::Tick };
-    auto sample = [](StatsOrigin origin, std::int64_t value, int seconds) {
-        return DashboardEvent { .kind = DashboardEventKind::Sample,
-                                .at = At(seconds),
-                                .attempts = ReadingFrom(origin, value) };
-    };
 
     auto view = RecordingView {};
     auto sink = CollectingSink {};
-    (void) Drive({ sample(StatsOrigin::Metrics, 10, 1),
-                   tick,
-                   sample(StatsOrigin::Metrics, 20, 2),
-                   tick,
-                   sample(StatsOrigin::NodeMetrics, 30, 3),
-                   tick,
-                   sample(StatsOrigin::NodeMetrics, 40, 4),
-                   tick },
-                 DashboardLimits {},
-                 view,
-                 sink);
+    (void) Drive(
+        { SampleAt(10, 1), tick, SampleAt(20, 2), tick, SampleAt(30, 3, Elsewhere), tick, SampleAt(40, 4, Elsewhere), tick },
+        DashboardLimits {},
+        view,
+        sink);
     REQUIRE(view.seen.size() == 4);
     CHECK(view.seen[0].BrokenRun());
     CHECK(!view.seen[1].BrokenRun());
@@ -500,15 +495,51 @@ TEST_CASE("a reading from a different source breaks the run and the next from th
 
     auto same = RecordingView {};
     auto sameSink = CollectingSink {};
-    (void) Drive({ sample(StatsOrigin::Metrics, 10, 1),
-                   sample(StatsOrigin::Metrics, 20, 2),
-                   sample(StatsOrigin::Metrics, 30, 3),
-                   tick },
-                 DashboardLimits {},
-                 same,
-                 sameSink);
+    (void) Drive({ SampleAt(10, 1), SampleAt(20, 2), SampleAt(30, 3), tick }, DashboardLimits {}, same, sameSink);
     REQUIRE(same.seen.size() == 1);
     CHECK(!same.seen[0].BrokenRun());
+}
+
+namespace
+{
+
+/// The stats reader, naming as its source whatever the sample's note says: a reader whose source changes while
+/// its endpoint does not.
+/// @param event The sample.
+/// @return `ReadStatsSample`'s reading, under another source name.
+[[nodiscard]] SampleReading SourceNamingReader(DashboardEvent const& event)
+{
+    auto reading = ReadStatsSample(event);
+    reading.source = event.note;
+    return reading;
+}
+
+} // namespace
+
+TEST_CASE("a reading from a different source breaks the run though its endpoint is the same", "[cli][dashboard]")
+{
+    // The endpoint rule is added to the source rule, never substituted for it: two vocabularies read at one address
+    // are still two vocabularies. WHAT DISTINGUISHES: the switch of source alone breaks the run, and the same source
+    // after it continues. Neutered by dropping `after.source == before.source`: frame 2 reads unbroken.
+    auto const tick = DashboardEvent { .kind = DashboardEventKind::Tick };
+    auto named = [](std::int64_t value, int seconds, std::string source) {
+        auto event = SampleAt(value, seconds);
+        event.note = std::move(source);
+        return event;
+    };
+
+    auto view = RecordingView {};
+    auto sink = CollectingSink {};
+    (void) Drive(
+        { named(10, 1, "one"), tick, named(20, 2, "one"), tick, named(30, 3, "two"), tick, named(40, 4, "two"), tick },
+        DashboardLimits {},
+        view,
+        sink,
+        &SourceNamingReader);
+    REQUIRE(view.seen.size() == 4);
+    CHECK(!view.seen[1].BrokenRun());
+    CHECK(view.seen[2].BrokenRun()); // the switch
+    CHECK(!view.seen[3].BrokenRun());
 }
 
 TEST_CASE("a reading stamped no later than the one before breaks the run", "[cli][dashboard]")
@@ -519,7 +550,7 @@ TEST_CASE("a reading stamped no later than the one before breaks the run", "[cli
     // second reading is always broken" cannot pass.
     auto const tick = DashboardEvent { .kind = DashboardEventKind::Tick };
     auto sample = [](std::int64_t value, int seconds) {
-        return DashboardEvent { .kind = DashboardEventKind::Sample, .at = At(seconds), .attempts = Reading(value) };
+        return SampleAt(value, seconds);
     };
 
     auto view = RecordingView {};
@@ -575,8 +606,7 @@ TEST_CASE("a run that only ever failed ends with the outcome its failures carrie
     // The control: one reading makes the run a success, and a refusal after it does not undo
     // that -- or "the last failure decides" would pass every assertion above.
     auto const recovered =
-        Drive({ DashboardEvent { .kind = DashboardEventKind::Sample, .at = At(1), .attempts = Reading(10) },
-                DashboardEvent { .kind = DashboardEventKind::SampleFailed, .outcome = Outcome::Refused } },
+        Drive({ SampleAt(10, 1), DashboardEvent { .kind = DashboardEventKind::SampleFailed, .outcome = Outcome::Refused } },
               DashboardLimits {},
               view,
               sink);
@@ -586,30 +616,23 @@ TEST_CASE("a run that only ever failed ends with the outcome its failures carrie
 TEST_CASE("the fold reads a sample only through the reader it was given", "[cli][dashboard]")
 {
     // The subject is chosen by which reader is passed, so the fold must not have a reading of
-    // its own to fall back on. WHAT DISTINGUISHES: a reading no stats ladder would produce --
-    // a fold that still ran `ChooseStats` itself would hold `curr_connections` here, not the
-    // marker.
+    // its own to fall back on. WHAT DISTINGUISHES: a reading the stats reader would never produce --
+    // a fold that read the event's `reading` itself would hold the counter here, not the marker.
     auto view = RecordingView {};
     auto sink = CollectingSink {};
-    auto const marked =
-        Drive({ DashboardEvent { .kind = DashboardEventKind::Sample, .at = At(1), .attempts = Reading(10) } },
-              DashboardLimits {},
-              view,
-              sink,
-              &MarkerReader);
+    auto const marked = Drive({ SampleAt(10, 1) }, DashboardLimits {}, view, sink, &MarkerReader);
     CHECK(LatestField(marked.model, "marker") == "from-the-reader");
-    CHECK(LatestField(marked.model, CountedName()).empty());
+    CHECK_FALSE(marked.model.stats.has_value());
 
-    // And a fleet session streams: a sample carrying only a document, and no attempts at all,
-    // is a reading. Under the fold that ran `ChooseStats` this was Unreachable, because an
-    // empty attempt list chooses nothing.
-    auto const fleet = Drive({ DashboardEvent { .kind = DashboardEventKind::Sample,
-                                                .at = At(1),
-                                                .document = std::expected<std::string, AdminError> { "machines 12" } } },
-                             DashboardLimits {},
-                             view,
-                             sink,
-                             &DocumentReader);
+    // And a fleet session streams: a sample carrying only a document, and no stats reading at all,
+    // is a reading. A fold that asked the stats reader itself would call it Unreachable, because
+    // the sample carries no reading.
+    auto const fleet = Drive(
+        { DashboardEvent { .kind = DashboardEventKind::Sample, .at = At(1), .document = std::string { "machines 12" } } },
+        DashboardLimits {},
+        view,
+        sink,
+        &DocumentReader);
     CHECK(fleet.outcome == Outcome::Affirmative);
     CHECK(LatestField(fleet.model, "body") == "machines 12");
     REQUIRE(fleet.model.latestStamp.has_value());
@@ -626,7 +649,7 @@ TEST_CASE("the sample that meets the budget is drawn before the run stops", "[cl
     // fix that presents a stale frame; the last frame must hold sample N, not N-1.
     auto const tick = DashboardEvent { .kind = DashboardEventKind::Tick };
     auto sample = [](std::int64_t value, int seconds) {
-        return DashboardEvent { .kind = DashboardEventKind::Sample, .at = At(seconds), .attempts = Reading(value) };
+        return SampleAt(value, seconds);
     };
 
     auto view = RecordingView {};
@@ -641,7 +664,7 @@ TEST_CASE("the sample that meets the budget is drawn before the run stops", "[cl
     CHECK(exit.model.frames == 3);
     REQUIRE(!view.seen.empty());
     CHECK(view.seen.back().samples == 3);
-    CHECK(LatestField(view.seen.back(), CountedName()) == "30");
+    CHECK(CountedIn(view.seen.back().stats) == std::optional { 30.0 });
 
     // The controls: only the stop that CONSUMED a sample owes a frame. A source running out,
     // and an operator quitting, stop without one -- or "draw on every stop" would pass above.
@@ -673,7 +696,7 @@ TEST_CASE("a stop request ends the run as a quit and is not a keystroke", "[cli]
     // outcome is the run's rather than the stop's: one reading makes it `Affirmative`.
     auto const tick = DashboardEvent { .kind = DashboardEventKind::Tick };
     auto const stop = DashboardEvent { .kind = DashboardEventKind::StopRequested };
-    auto const sample = DashboardEvent { .kind = DashboardEventKind::Sample, .at = At(1), .attempts = Reading(10) };
+    auto const sample = SampleAt(10, 1);
 
     auto view = RecordingView {};
     auto sink = CollectingSink {};
@@ -707,18 +730,6 @@ TEST_CASE("a stop request ends the run as a quit and is not a keystroke", "[cli]
 
 namespace
 {
-
-/// The field every `Reading` carries, as the model reads it.
-constexpr auto Counter = CounterField<CountedRow>();
-
-/// A `Sample` carrying one `Counter` reading, taken @p seconds in.
-/// @param value What it reads.
-/// @param seconds When it was taken.
-/// @return The event.
-[[nodiscard]] DashboardEvent SampleAt(std::int64_t value, int seconds)
-{
-    return DashboardEvent { .kind = DashboardEventKind::Sample, .at = At(seconds), .attempts = Reading(value) };
-}
 
 /// A `SampleFailed`, taken @p seconds in.
 /// @param seconds When it was attempted.
@@ -754,12 +765,7 @@ TEST_CASE("both routes to a failed reading leave an entry with no reading in the
     // and the history is a thing each must update. WHAT DISTINGUISHES: an empty entry at EACH
     // route's own position. Neutering either route drops its entry and shifts every later
     // index, so each has its own assertion rather than one count both could satisfy.
-    auto const model =
-        FinalModel({ SampleAt(10, 1),
-                     FailedAt(2),
-                     SampleAt(20, 3),
-                     DashboardEvent { .kind = DashboardEventKind::Sample, .at = At(4), .attempts = NothingAnswered() },
-                     SampleAt(30, 5) });
+    auto const model = FinalModel({ SampleAt(10, 1), FailedAt(2), SampleAt(20, 3), NoReadingAt(4), SampleAt(30, 5) });
 
     REQUIRE(model.history.size() == 5);
     CHECK(model.history[0].reading.has_value());
@@ -837,19 +843,12 @@ TEST_CASE("an interval the run did not continue has no rate though the counter r
 {
     // The run rule decides the history's intervals, not a second rule in the series. Every
     // counter here rises, so a decrease cannot be why an interval is absent -- only a change of
-    // source or a stamp no later than the one before can.
+    // endpoint or a stamp no later than the one before can.
     //
     // WHAT DISTINGUISHES: the interval at the break is absent AND the interval after it, from
-    // the same source with a later stamp, is present again.
-    auto const switched = RatesOf(
-        { DashboardEvent {
-              .kind = DashboardEventKind::Sample, .at = At(1), .attempts = ReadingFrom(StatsOrigin::Metrics, 10) },
-          DashboardEvent {
-              .kind = DashboardEventKind::Sample, .at = At(2), .attempts = ReadingFrom(StatsOrigin::Metrics, 20) },
-          DashboardEvent {
-              .kind = DashboardEventKind::Sample, .at = At(3), .attempts = ReadingFrom(StatsOrigin::NodeMetrics, 30) },
-          DashboardEvent {
-              .kind = DashboardEventKind::Sample, .at = At(4), .attempts = ReadingFrom(StatsOrigin::NodeMetrics, 40) } });
+    // the same endpoint with a later stamp, is present again.
+    auto const switched =
+        RatesOf({ SampleAt(10, 1), SampleAt(20, 2), SampleAt(30, 3, Elsewhere), SampleAt(40, 4, Elsewhere) });
     REQUIRE(switched.size() == 4);
     REQUIRE(switched[1].has_value());
     CHECK(Unwrap(switched[1]) == 10.0);
@@ -869,29 +868,18 @@ TEST_CASE("the newest history entry agrees with BrokenRun at every frame", "[cli
     // The history's intervals and `runLength` are two representations of one decision. This is
     // the case that keeps them one: at every frame, the newest entry carries a measured interval
     // exactly when `BrokenRun()` says a rate may be drawn. The script walks every way a run
-    // breaks -- both failure routes, a change of source and a stalled stamp.
+    // breaks -- both failure routes, a change of endpoint and a stalled stamp.
     auto const tick = DashboardEvent { .kind = DashboardEventKind::Tick };
-    // `SampleAt` reads `/metrics`, so this second source is the node's own verb: the change between them breaks the run.
+    // `SampleAt` answers `Here`, so these answer somewhere else: the change between them breaks the run.
     auto metrics = [](std::int64_t value, int seconds) {
-        return DashboardEvent { .kind = DashboardEventKind::Sample,
-                                .at = At(seconds),
-                                .attempts = ReadingFrom(StatsOrigin::NodeMetrics, value) };
+        return SampleAt(value, seconds, Elsewhere);
     };
 
     auto view = RecordingView {};
     auto sink = CollectingSink {};
-    (void) Drive({ tick, SampleAt(10, 1),
-                   tick, SampleAt(20, 2),
-                   tick, FailedAt(3),
-                   tick, SampleAt(30, 4),
-                   tick, SampleAt(40, 5),
-                   tick, DashboardEvent { .kind = DashboardEventKind::Sample, .at = At(6), .attempts = NothingAnswered() },
-                   tick, SampleAt(50, 7),
-                   tick, SampleAt(60, 8),
-                   tick, metrics(70, 9),
-                   tick, metrics(80, 10),
-                   tick, metrics(90, 10),
-                   tick, metrics(100, 11),
+    (void) Drive({ tick, SampleAt(10, 1), tick, SampleAt(20, 2), tick, FailedAt(3),     tick, SampleAt(30, 4),
+                   tick, SampleAt(40, 5), tick, NoReadingAt(6),  tick, SampleAt(50, 7), tick, SampleAt(60, 8),
+                   tick, metrics(70, 9),  tick, metrics(80, 10), tick, metrics(90, 10), tick, metrics(100, 11),
                    tick },
                  DashboardLimits {},
                  view,
@@ -930,12 +918,8 @@ TEST_CASE("the history keeps its bound by dropping the oldest samples", "[cli][d
     auto const model = FinalModel(std::move(script));
 
     REQUIRE(model.history.size() == HistoryCapacity);
-    auto const* first = FindField(Unwrap(model.history.front().reading), CountedName());
-    auto const* last = FindField(Unwrap(model.history.back().reading), CountedName());
-    REQUIRE(first != nullptr);
-    REQUIRE(last != nullptr);
-    CHECK(first->value.lexical == std::to_string(Extra));
-    CHECK(last->value.lexical == std::to_string(HistoryCapacity + Extra - 1));
+    CHECK(CountedIn(model.history.front().stats) == std::optional { static_cast<double>(Extra) });
+    CHECK(CountedIn(model.history.back().stats) == std::optional { static_cast<double>(HistoryCapacity + Extra - 1) });
 
     // The oldest entry kept continued its run, but the reading it was measured against has been
     // dropped: no rate can be claimed for it, and the one after it has one.
@@ -959,15 +943,14 @@ TEST_CASE("a run whose every sample fails still ends at its sample budget", "[cl
     // routes spend it: a `SampleFailed` and a `Sample` its reader could not read.
     auto view = RecordingView {};
     auto sink = CollectingSink {};
-    auto const exit =
-        Drive({ DashboardEvent { .kind = DashboardEventKind::SampleFailed, .outcome = Outcome::Unreachable },
-                DashboardEvent { .kind = DashboardEventKind::Sample, .at = At(1), .attempts = NothingAnswered() },
-                DashboardEvent { .kind = DashboardEventKind::SampleFailed, .outcome = Outcome::Refused },
-                DashboardEvent { .kind = DashboardEventKind::SampleFailed, .outcome = Outcome::Unreachable },
-                DashboardEvent { .kind = DashboardEventKind::SampleFailed, .outcome = Outcome::Unreachable } },
-              DashboardLimits { .samples = 3 },
-              view,
-              sink);
+    auto const exit = Drive({ DashboardEvent { .kind = DashboardEventKind::SampleFailed, .outcome = Outcome::Unreachable },
+                              NoReadingAt(1),
+                              DashboardEvent { .kind = DashboardEventKind::SampleFailed, .outcome = Outcome::Refused },
+                              DashboardEvent { .kind = DashboardEventKind::SampleFailed, .outcome = Outcome::Unreachable },
+                              DashboardEvent { .kind = DashboardEventKind::SampleFailed, .outcome = Outcome::Unreachable } },
+                            DashboardLimits { .samples = 3 },
+                            view,
+                            sink);
 
     CHECK(exit.stop == DashboardStop::SampleBudget);
     CHECK(exit.outcome == Outcome::Refused);
@@ -979,18 +962,20 @@ TEST_CASE("a run whose every sample fails still ends at its sample budget", "[cl
 TEST_CASE("a sample its reader could not read says why", "[cli][dashboard]")
 {
     // Whoever reports a failed sample needs the decision's account, and must not run the decision
-    // again to get it. WHAT DISTINGUISHES: the note carries the conclusion AND the source's own
-    // reason, and a reading carries none -- or "always say something" passes the first half.
-    auto const failed =
-        ReadStatsSample(DashboardEvent { .kind = DashboardEventKind::Sample, .at = At(1), .attempts = NothingAnswered() });
+    // again to get it. WHAT DISTINGUISHES: the note says the sample carried no reading, and a reading
+    // carries none -- or "always say something" passes the first half. And a reading names the
+    // endpoint its stream answered at, which is what the run rule compares: a reader that dropped it
+    // would let a rate span two processes' counters.
+    auto const failed = ReadStatsSample(NoReadingAt(1));
     CHECK(failed.outcome == Outcome::Unreachable);
-    CHECK(failed.note.contains("no stats source answered"));
-    CHECK(failed.note.contains("refused"));
+    CHECK(failed.note.contains("carried no reading"));
 
-    auto const read =
-        ReadStatsSample(DashboardEvent { .kind = DashboardEventKind::Sample, .at = At(1), .attempts = Reading(10) });
+    auto const read = ReadStatsSample(SampleAt(10, 1, Elsewhere));
     CHECK(read.outcome == Outcome::Affirmative);
     CHECK(read.note.empty());
+    CHECK(read.where == Elsewhere);
+    CHECK(read.source == SubscriptionSource);
+    CHECK(CountedIn(read.stats) == std::optional { 10.0 });
 }
 
 namespace
@@ -1016,10 +1001,9 @@ TEST_CASE("the model's node status is what the newest sample carried and nothing
     // replaces it too, since a node can answer its status while its counters cannot be read.
     auto const tick = DashboardEvent { .kind = DashboardEventKind::Tick };
     auto withStatus = [](int seconds, std::int64_t value, std::string version) {
-        return DashboardEvent { .kind = DashboardEventKind::Sample,
-                                .at = At(seconds),
-                                .attempts = Reading(value),
-                                .nodeStatus = StatusNamed(std::move(version)) };
+        auto event = SampleAt(value, seconds);
+        event.nodeStatus = StatusNamed(std::move(version));
+        return event;
     };
 
     auto view = RecordingView {};
@@ -1027,7 +1011,7 @@ TEST_CASE("the model's node status is what the newest sample carried and nothing
     (void) Drive({ tick,
                    withStatus(1, 10, "first"),
                    tick,
-                   DashboardEvent { .kind = DashboardEventKind::Sample, .at = At(2), .attempts = Reading(20) },
+                   SampleAt(20, 2),
                    tick,
                    DashboardEvent { .kind = DashboardEventKind::SampleFailed,
                                     .nodeStatus = StatusNamed("while-failing"),
@@ -1051,41 +1035,75 @@ TEST_CASE("the model's node status is what the newest sample carried and nothing
     CHECK(versionAt(4) == "third");
 }
 
-TEST_CASE("the model's fleet document is the newest reading's and nothing older", "[cli][dashboard]")
+TEST_CASE("the model's granted cadence is what the newest sample carried and nothing older", "[cli][dashboard]")
 {
-    // A fleet panel draws the newest document, so the model holds exactly that. WHAT DISTINGUISHES:
-    // a sample whose reader REFUSED it leaves the model's document null -- a rule keeping the last one
-    // draws a fleet from before the gap -- and so does a `SampleFailed`, since the same helper replaces
-    // it on both routes.
+    // A title's `every Ns` states the grant of the stream the newest sample came from. WHAT DISTINGUISHES: a FAILED
+    // sample leaves the model's cadence EMPTY -- an "update when present" rule keeps an old grant through a gap, when
+    // the next subscription may be granted another -- a later grant replaces an earlier one, and a reading no grant
+    // preceded leaves it empty too. Neutered by dropping `model.cadence = event.cadence` from `RecordSampleTaken`:
+    // frames 1 and 3 read absent. Neutered to assign only an engaged cadence: frames 2 and 4 read the old grant.
     auto const tick = DashboardEvent { .kind = DashboardEventKind::Tick };
-    auto const fleet = [](int seconds, std::string body) {
-        return DashboardEvent { .kind = DashboardEventKind::Sample,
-                                .at = At(seconds),
-                                .document = std::expected<std::string, AdminError> { std::move(body) } };
+    auto granted = [](std::int64_t value, int seconds, std::chrono::milliseconds cadence) {
+        auto event = SampleAt(value, seconds);
+        event.cadence = cadence;
+        return event;
     };
 
     auto view = RecordingView {};
     auto sink = CollectingSink {};
-    (void) Drive(
-        { tick,
-          fleet(1, "first"),
-          tick,
-          DashboardEvent { .kind = DashboardEventKind::Sample,
-                           .at = At(2),
-                           .document =
-                               std::expected<std::string, AdminError> {
-                                   std::unexpect, AdminError { .kind = AdminFailure::Refused, .detail = "follower" } } },
-          tick,
-          fleet(3, "third"),
-          tick,
-          DashboardEvent { .kind = DashboardEventKind::SampleFailed, .outcome = Outcome::Unreachable },
-          tick,
-          fleet(5, "fifth"),
-          tick },
-        DashboardLimits {},
-        view,
-        sink,
-        &HandingReader);
+    (void) Drive({ tick,
+                   granted(10, 1, std::chrono::milliseconds { 2000 }),
+                   tick,
+                   DashboardEvent { .kind = DashboardEventKind::SampleFailed, .outcome = Outcome::Unreachable },
+                   tick,
+                   granted(20, 3, std::chrono::milliseconds { 500 }),
+                   tick,
+                   SampleAt(30, 4),
+                   tick },
+                 DashboardLimits {},
+                 view,
+                 sink);
+
+    auto const cadenceAt = [&view](std::size_t frame) {
+        auto const& cadence = view.seen.at(frame).cadence;
+        return cadence.has_value() ? cadence->count() : std::chrono::milliseconds::rep { -1 };
+    };
+    REQUIRE(view.seen.size() == 5);
+    CHECK(cadenceAt(0) == -1); // nothing taken yet
+    CHECK(cadenceAt(1) == 2000);
+    CHECK(cadenceAt(2) == -1); // a failed sample carries no grant: not 2000
+    CHECK(cadenceAt(3) == 500);
+    CHECK(cadenceAt(4) == -1); // a reading no grant preceded: not 500
+}
+
+TEST_CASE("the model's fleet document is the newest reading's and nothing older", "[cli][dashboard]")
+{
+    // A fleet panel draws the newest document, so the model holds exactly that. WHAT DISTINGUISHES:
+    // a sample its reader could not read leaves the model's document null -- a rule keeping the last one
+    // draws a fleet from before the gap -- and so does a `SampleFailed`, since the same helper replaces
+    // it on both routes.
+    auto const tick = DashboardEvent { .kind = DashboardEventKind::Tick };
+    auto const fleet = [](int seconds, std::string body) {
+        return DashboardEvent { .kind = DashboardEventKind::Sample, .at = At(seconds), .document = std::move(body) };
+    };
+
+    auto view = RecordingView {};
+    auto sink = CollectingSink {};
+    (void) Drive({ tick,
+                   fleet(1, "first"),
+                   tick,
+                   DashboardEvent { .kind = DashboardEventKind::Sample, .at = At(2) },
+                   tick,
+                   fleet(3, "third"),
+                   tick,
+                   DashboardEvent { .kind = DashboardEventKind::SampleFailed, .outcome = Outcome::Unreachable },
+                   tick,
+                   fleet(5, "fifth"),
+                   tick },
+                 DashboardLimits {},
+                 view,
+                 sink,
+                 &HandingReader);
 
     auto const bodyAt = [&view](std::size_t frame) {
         auto const& document = view.seen.at(frame).latestDocument;
@@ -1097,7 +1115,7 @@ TEST_CASE("the model's fleet document is the newest reading's and nothing older"
     REQUIRE(view.seen.size() == 6);
     CHECK(bodyAt(0) == "<null>"); // nothing taken yet
     CHECK(bodyAt(1) == "first");
-    CHECK(bodyAt(2) == "<null>"); // refused by its reader: not `first`
+    CHECK(bodyAt(2) == "<null>"); // not read by its reader: not `first`
     CHECK(bodyAt(3) == "third");
     CHECK(bodyAt(4) == "<null>"); // a failed sample replaces it too
     CHECK(bodyAt(5) == "fifth");
@@ -1134,10 +1152,8 @@ TEST_CASE("after many fleet samples exactly one document is alive, and the histo
     auto script = std::vector<DashboardEvent> {};
     for (auto const second: std::views::iota(1, Samples + 1))
     {
-        script.push_back(
-            DashboardEvent { .kind = DashboardEventKind::Sample,
-                             .at = At(second),
-                             .document = std::expected<std::string, AdminError> { std::format("body-{}", second) } });
+        script.push_back(DashboardEvent {
+            .kind = DashboardEventKind::Sample, .at = At(second), .document = std::format("body-{}", second) });
         script.push_back(DashboardEvent { .kind = DashboardEventKind::Tick });
     }
 
