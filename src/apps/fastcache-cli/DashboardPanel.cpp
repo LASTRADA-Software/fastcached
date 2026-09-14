@@ -2217,6 +2217,7 @@ namespace
         std::size_t scaleLine { 0 };       ///< The item's line the scale is drawn on.
         ChartShape shape {};               ///< The shape it was laid out in.
         bool pixels { false };             ///< Whether its bands are an image over blank cells, rather than text.
+        bool ramped { false };             ///< Whether a band drawn is in the ramp, so the legend shows its scale.
     };
 
     /// Whether a chart on @p context's rung is an image: the Sixel rung, with an encoder and a cell size to lay it out in.
@@ -2435,10 +2436,14 @@ namespace
         });
         AppendLine(item, axis);
 
-        // The legend. A pixel chart: the scale's colours between the two values they run between, then what the
-        // marks mean. A text chart: its zero mark and its full cell, and that a blank is a sample not read.
+        // The legend. A pixel chart with a band in the ramp: the scale's colours between the two values they run
+        // between, then what the marks mean; with none, no scale, since no colour stands for a value. A text chart:
+        // its zero mark and its full cell, and that a blank is a sample not read.
+        block.ramped =
+            pixels
+            && std::ranges::any_of(block.tracks, [](ChartTrack const& track) { return track.paint == ChartPaint::Ramp; });
         auto legend = std::vector<Piece> { Piece { .text = std::string { Indent }, .priority = Priority::Essential } };
-        if (pixels)
+        if (block.ramped)
         {
             legend.push_back(Piece { .text = source.low, .priority = Priority::Essential, .tone = FrameTone::Label });
             legend.push_back(
@@ -2446,7 +2451,7 @@ namespace
             legend.push_back(Piece { .text = source.high, .priority = Priority::Essential, .tone = FrameTone::Label });
             block.scaleColumn = indent + in.cellWidth(source.low) + 1;
         }
-        else if (levels.size() >= 2)
+        else if (!pixels && levels.size() >= 2)
         {
             legend.push_back(Piece {
                 .text = std::format("{} zero", levels.front()), .priority = Priority::Essential, .tone = FrameTone::Label });
@@ -2510,6 +2515,7 @@ namespace
                             .latest = FigureText(in, row.figure, Newest(series)).Text(),
                             .top = "to " + FigureText(in, row.figure, top).Text(),
                             .shares = SharesOf(drawn, top.value_or(0.0)),
+                            .paint = row.paint,
                         });
                     }
                     return tracks;
@@ -3318,12 +3324,14 @@ DashboardFrame PanelView::PlacedFrame(DashboardModel const& model)
                                .cellsWide = chart->imageCells,
                                .cellsHigh = chart->item.imageRows,
                                .sixel = {} });
-        place(ChartScaleRaster(ChartScaleCells * cell.width, cell.height),
-              FramePlacement { .row = itemRow + chart->scaleLine,
-                               .column = 2 + chart->scaleColumn,
-                               .cellsWide = ChartScaleCells,
-                               .cellsHigh = 1,
-                               .sixel = {} });
+        // The scale only beside a band whose colours stand for values: a chart of plain bands states none.
+        if (chart->ramped)
+            place(ChartScaleRaster(ChartScaleCells * cell.width, cell.height),
+                  FramePlacement { .row = itemRow + chart->scaleLine,
+                                   .column = 2 + chart->scaleColumn,
+                                   .cellsWide = ChartScaleCells,
+                                   .cellsHigh = 1,
+                                   .sixel = {} });
     }
     return frame;
 }
