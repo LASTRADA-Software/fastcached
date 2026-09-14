@@ -516,8 +516,8 @@ class TickingDrainWait final: public IDrainWait
 ///
 /// **A wait that ran out says what it waited for and what it found**, attached to the case's next
 /// assertion (`UNSCOPED_INFO`, since a scoped message would die here): the real time and ticks it
-/// spent, the reactor's queues, @p state at the end, and when @p state last CHANGED -- a thread
-/// that stopped long before the guard is stalled, one still moving at the guard is slow.
+/// spent, the reactor's queues, @p state at the end, and how long @p state had been quiet -- read
+/// as MOVING, STALLED, or INCONCLUSIVE where the numbers cannot separate those.
 /// @param f       The case's clock and reactor.
 /// @param what    What the case waits for, in words.
 /// @param reached True once it has happened.
@@ -545,22 +545,33 @@ template <typename Predicate, typename State>
     if (DrainWithin(busy, DrainBound { .ceiling = TripHangGuard, .poll = 1ms }, ticking) == DrainResult::Drained)
         return true;
     auto const ended = DefaultDrainWait().Now();
+    auto const waited = ended - started;
+    auto const quiet = ended - lastChange;
     auto const ms = [](auto span) {
         return std::chrono::duration_cast<std::chrono::milliseconds>(span).count();
     };
+    // Four readings, because two would each claim the cases between them: a wait shorter than the
+    // window cannot tell a stall from a slow thread at all, and a state that moved and then went
+    // quiet for part of the wait is what a backed-off cycle and a stuck thread BOTH look like.
+    constexpr auto Window = 1s;
+    auto const reading =
+        waited < Window   ? "INCONCLUSIVE: too short a wait to tell a stall from a slow thread"
+        : quiet <= Window ? "still MOVING at the guard: slow, or spinning"
+        : quiet * 2 > waited
+            ? "STALLED: nothing it reports moved for most of the wait"
+            : "INCONCLUSIVE: it moved, then went quiet -- a backed-off cycle and a stuck thread both read so";
     UNSCOPED_INFO(std::format("TickUntil gave up waiting for {} after {} ms of real time and {} ticks; the reactor "
                               "holds {} submission(s) and {} timer(s). State at the end: {}. It changed {} time(s), "
-                              "the last {} ms into the wait, so {}.",
+                              "and nothing changed in the last {} ms: {}.",
                               what,
-                              ms(ended - started),
+                              ms(waited),
                               ticking.Ticks(),
                               f.reactor.PendingSubmissions(),
                               f.reactor.PendingTimers(),
                               seen,
                               changes,
-                              ms(lastChange - started),
-                              ended - lastChange > 1s ? "whatever it waits on is STALLED, not slow"
-                                                      : "it was still MOVING at the guard: slow, or spinning"));
+                              ms(quiet),
+                              reading));
     return false;
 }
 
