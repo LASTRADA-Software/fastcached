@@ -103,6 +103,7 @@ install(TARGETS fastcache-cli
 if(FASTCACHED_BUILD_TESTS)
     add_executable(fastcache-cli-tests
         ${_fc_cli_sources}
+        CliAnswer_test.cpp
         CliCommand_test.cpp
         CliFormat_test.cpp
         CliValue_test.cpp

@@ -7,6 +7,7 @@
 
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -137,5 +138,15 @@ struct Answer
 /// @param outcome What was concluded.
 /// @return The answer.
 [[nodiscard]] Answer Answered(Value value, Outcome outcome = Outcome::Affirmative);
+
+/// Put the connections' own remarks in front of @p answer's, saying each sentence once.
+///
+/// **One fault, one sentence.** Two connections dialled at an address nothing answers each report
+/// `cannot reach <address> (...)` word for word, and printed twice they read as two faults. So a remark
+/// identical to one already said is dropped, wherever it repeats -- a connection's, or the verb's own. A
+/// DIFFERENT sentence about the same address is kept: two dials can fail two ways.
+/// @param answer The answer; its advisories come after @p remarks.
+/// @param remarks The connections' remarks, in the order they were made.
+void PrependRemarks(Answer& answer, std::span<std::string const> remarks);
 
 } // namespace FastCache::Cli
