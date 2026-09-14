@@ -917,6 +917,9 @@ class MergedResponder final: public IFrameResponder
                 // emptiest node in the fleet, so this owner is never null in a built
                 // node the way the other three legitimately are.
                 return _node;
+            case CompileCacheWire::VerbFamily::Live:
+                // Served by the live hub, which this surface does not route to yet (#1399).
+                return nullptr;
             case CompileCacheWire::VerbFamily::Enrollment:
                 // Legitimately null, and on most deployments it is: a node that runs no
                 // consensus has no cluster to let anybody into, so the family is refused
