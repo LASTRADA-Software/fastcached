@@ -105,6 +105,30 @@ TEST_CASE("ExchangeLog: a reply that was never written is its own outcome", "[no
     CHECK(none != err);
 }
 
+TEST_CASE("ExchangeLog: a stream that pushed counts its pushes and is not a missing reply", "[node][logging]")
+{
+    // WHAT DISTINGUISHES: the same empty terminal is `no-reply (0 B out)` for a one-reply verb and `28 pushes,
+    // then closed` with the pushes' bytes for a subscription its watcher left -- the line lane-enroll read on a
+    // node that had streamed for half a minute. And a stream that ends with a terminal names that terminal.
+    auto const subscribe = static_cast<std::uint8_t>(Wire::Op::Subscribe);
+    auto const left =
+        FormatExchange(subscribe, "127.0.0.1", FrameOf(24), {}, 27502ms, {}, StreamTally { .pushes = 28, .bytes = 49000 });
+    CHECK(left.contains("-> 28 pushes, then closed (24 B in, 49000 B out, 27502 ms)"));
+    CHECK_FALSE(left.contains("no-reply"));
+
+    auto const ended = FormatExchange(subscribe,
+                                      "127.0.0.1",
+                                      FrameOf(24),
+                                      ReplyWith(Wire::Status::Ok),
+                                      900ms,
+                                      {},
+                                      StreamTally { .pushes = 2, .bytes = 100 });
+    CHECK(ended.contains("-> 2 pushes, then ok (24 B in, 101 B out, 900 ms)"));
+
+    // The control: without a tally the same empty reply is still its own outcome.
+    CHECK(FormatExchange(subscribe, "127.0.0.1", FrameOf(24), {}, 1ms).contains("-> no-reply (24 B in, 0 B out"));
+}
+
 TEST_CASE("ExchangeLog: a miss and an ok are distinguishable in the line", "[node][logging]")
 {
     // `fetch -> miss` versus `fetch -> ok` is the single most useful thing this line
