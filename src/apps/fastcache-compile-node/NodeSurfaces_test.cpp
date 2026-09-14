@@ -3,6 +3,7 @@
 
 #include <FastCache/Cli/Options.hpp>
 #include <FastCache/Core/Logger.hpp>
+#include <FastCache/Protocol/CompileCacheWire.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -690,10 +691,10 @@ namespace
 }
 
 /// The dial address's label as the worksheet prints it: indented under `dialled at:`.
-/// @return Two spaces and `ConsensusEndpointLabel`.
+/// @return Two spaces and `CompileCacheWire::ConsensusEndpointLabel`.
 [[nodiscard]] std::string DialLabel()
 {
-    return std::format("  {}", ConsensusEndpointLabel);
+    return std::format("  {}", CompileCacheWire::ConsensusEndpointLabel);
 }
 
 /// The one line of @p sheet that starts with @p label.

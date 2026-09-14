@@ -2,6 +2,7 @@
 #include "NodeSurfaces.hpp"
 
 #include <FastCache/Core/HostPort.hpp>
+#include <FastCache/Protocol/CompileCacheWire.hpp>
 
 #include <algorithm>
 #include <cstddef>
@@ -572,7 +573,7 @@ std::string RenderSurfaces(NodeConfig const& cfg)
     // transcript by that same shape.
     auto const dial = ConsensusDialAddressOf(cfg);
     auto const [address, trailer] = DialColumns(dial);
-    out += std::format("\ndialled at:\n  {}  {}  {}\n", ConsensusEndpointLabel, address, trailer);
+    out += std::format("\ndialled at:\n  {}  {}  {}\n", CompileCacheWire::ConsensusEndpointLabel, address, trailer);
 
     // The notes last and separately, because they are prose while the table above is
     // something an operator transcribes into firewall rules. Mixing them would rag the

@@ -1105,7 +1105,8 @@ namespace
         // which is the address that comparison must not be made against. Absent on a node
         // running no consensus, for the enrollment state's reason.
         if (fields.runtime.consensusEndpoint.has_value())
-            record.push_back({ .name = "consensus-endpoint", .value = TextCell(*fields.runtime.consensusEndpoint) });
+            record.push_back({ .name = std::string { CompileCacheWire::ConsensusEndpointField },
+                               .value = TextCell(*fields.runtime.consensusEndpoint) });
 
         // One field per surface the node actually opened. A surface it does not run gets
         // no field at all rather than a zero port -- the same rule the node applies when
@@ -1558,7 +1559,8 @@ namespace
         return Answered(
             RecordValue({ Field { .name = "recorded", .value = BooleanCell(true) },
                           Field { .name = "member-id-as-received", .value = TextCell(receipt->memberId) },
-                          Field { .name = "consensus-endpoint-as-recorded", .value = TextCell(receipt->raftEndpoint) },
+                          Field { .name = std::format("{}-as-recorded", CompileCacheWire::ConsensusEndpointField),
+                                  .value = TextCell(receipt->raftEndpoint) },
                           Field { .name = "state", .value = TextCell("appended, not committed") } }));
     }
 

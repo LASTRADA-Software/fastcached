@@ -4527,6 +4527,20 @@ struct NodeRuntimeFields
     std::optional<std::string> consensusEndpoint {};
 };
 
+/// What an operator reads `NodeRuntimeFields::consensusEndpoint` under, as prose: the
+/// `--cluster-admit` receipt's line and `--print-surfaces`' `dialled at:` block.
+///
+/// **One fact, in the one header both applications reach** (#1328). The whole value of printing
+/// this address on two machines is that an operator compares two strings under the same name, so
+/// a second spelling is a rename away from comparing nothing -- and the node's own header, where
+/// this lived first, is one the CLI cannot include.
+inline constexpr std::string_view ConsensusEndpointLabel = "consensus endpoint";
+
+/// The same name as a RECORD FIELD: the `node` verb's cell, and the stem of the `cluster-admit`
+/// receipt's. Kebab-case like every field of a record, and `ConsensusEndpointLabel` with its spaces
+/// hyphenated -- a relation a test holds, not one a reader is trusted to keep.
+inline constexpr std::string_view ConsensusEndpointField = "consensus-endpoint";
+
 namespace Detail
 {
     /// Bytes for an engaged optional integral, or NOTHING for a disengaged one.

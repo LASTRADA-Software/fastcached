@@ -2411,6 +2411,21 @@ TEST_CASE("A node runtime record carries the consensus address peers dial, and a
     CHECK(Unwrap(back).leaderEndpoint == "10.0.0.9:6680");
 }
 
+TEST_CASE("The consensus endpoint has one name, spelled as prose and as a record field", "[wire][consensus]")
+{
+    // The VALUES, pinned: both are text an operator types into a search or holds against a second
+    // screen, so a consistent rename keeps every in-tree test agreeing while the name they compare
+    // under silently moves.
+    CHECK(ConsensusEndpointLabel == "consensus endpoint");
+    CHECK(ConsensusEndpointField == "consensus-endpoint");
+
+    // And the RELATION, which is what keeps them one name: the field is the label, hyphenated. A
+    // rename of one alone fails here rather than in a comparison an operator makes.
+    auto hyphenated = std::string { ConsensusEndpointLabel };
+    std::ranges::replace(hyphenated, ' ', '-');
+    CHECK(hyphenated == ConsensusEndpointField);
+}
+
 TEST_CASE("The consensus address rides the runtime record's variable arity, in both directions",
           "[wire][consensus][nodestatus]")
 {

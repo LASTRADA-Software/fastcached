@@ -1375,13 +1375,6 @@ enum class ConsensusDialGap : std::uint8_t
     Last,        ///< The count, for `EnumTable`.
 };
 
-/// The label an operator reads the consensus dial address under, wherever it is printed.
-///
-/// ONE spelling for `--cluster-admit`'s receipt and `--print-surfaces`, because the whole
-/// value of printing the address twice is that an operator compares two strings under the
-/// same name -- and two literals are a rename away from comparing nothing.
-inline constexpr std::string_view ConsensusEndpointLabel = "consensus endpoint";
-
 /// The consensus address this node tells the cluster to dial it at (#1328).
 ///
 /// **A different question from the `raft` surface row, and the difference is the whole

@@ -1120,7 +1120,7 @@ TEST_CASE("cluster-admit reports what the leader RECORDED, never what is in forc
     // Distinct values, neither a substring of the other, so a transposed pair reddens
     // rather than agreeing with itself.
     CHECK(RequiredCell(answer, "member-id-as-received").lexical == "node-c");
-    CHECK(RequiredCell(answer, "consensus-endpoint-as-recorded").lexical == "10.0.0.9:6675");
+    CHECK(RequiredCell(answer, std::format("{}-as-recorded", Cc::ConsensusEndpointField)).lexical == "10.0.0.9:6675");
 
     // The ceiling, asserted on the WORD: `SchedulerService::Offer`'s own phrase, not a
     // second spelling of one state. Anything stronger here would be the confident wrong
@@ -2035,8 +2035,8 @@ TEST_CASE("`node` reports where peers dial its consensus, apart from the port it
               .components = Cc::NodeComponentBit::Scheduler,
               .runtime = { .consensusEndpoint = "10.0.0.4:6680" } }) } };
         auto const answer = RunNodeVerb("node", node);
-        CHECK(RequiredCell(answer, "consensus-endpoint").lexical == "10.0.0.4:6680");
-        CHECK(RequiredCell(answer, "consensus-endpoint").kind == CellKind::Text);
+        CHECK(RequiredCell(answer, Cc::ConsensusEndpointField).lexical == "10.0.0.4:6680");
+        CHECK(RequiredCell(answer, Cc::ConsensusEndpointField).kind == CellKind::Text);
         // Two cells, each carrying its own fact: a renderer that put the endpoint in the
         // port's place, or the port in the endpoint's, fails one of these.
         CHECK(RequiredCell(answer, "raft-port").lexical == "6680");
@@ -2052,6 +2052,6 @@ TEST_CASE("`node` reports where peers dial its consensus, apart from the port it
                                                     .runtime = {} }) } };
         auto const answer = RunNodeVerb("node", node);
         CHECK(answer.outcome == Outcome::Affirmative);
-        CHECK(CellOf(answer, "consensus-endpoint") == nullptr);
+        CHECK(CellOf(answer, Cc::ConsensusEndpointField) == nullptr);
     }
 }
