@@ -147,7 +147,7 @@ TEST_CASE("The same state directory is fine at ordinary startup, which is why th
     cfg.clusterDir = scratch.Path();
     cfg.raftListen = "7100";
     cfg.raftSelf = "198.51.100.4";
-    cfg.scheduler = "10.0.0.1:7000";
+    cfg.schedulers = { "10.0.0.1:7000" };
     cfg.nodeId = "node-a";
 
     // The startup table is what judges a serving configuration, and it is asked here

@@ -1651,6 +1651,27 @@ other moves where the outage is observed and not whether it happens.
   lost. Arriving back at the configured endpoint *forgets* the remembered one rather
   than storing it as a value equal to the default, or every diagnostic that says
   which endpoint this node is following becomes a lie.
+- **`--scheduler` is a LIST, and the fallback walks it — for REACHING the fleet,
+  never for deciding who leads** ([#1310](https://github.com/LASTRADA-Software/fastcached/issues/1310)).
+  A registration replays its command line forever, so one value was one machine's
+  address in every unit file, and retiring it meant re-registering the fleet. Three
+  rules came with the list, and each is a way the obvious version is wrong:
+  - **Each configured endpoint is dialled at most ONCE per round**, starting at the one
+    that last accepted and wrapping. A redirect target that fails falls back to the
+    next configured endpoint NOT yet tried — never to the one that issued the
+    redirect, which answered a moment ago and names the same dead leader again. The
+    single-value version re-dialled it, a spin bounded only by the hop budget.
+  - **`NotLeader` never consults the list.** It is an instruction followed to the
+    endpoint it names; a list that answered it would register a worker with a
+    follower that refuses every verb.
+  - **A one-shot verb falls back only where nothing was SENT** (`DialFirstReachable`).
+    A dial that did not connect delivered no request; a connection that failed
+    mid-exchange may already have applied `--cluster-admit` or `--enroll-approve`
+    where it landed, so it is reported and never retried at the next scheduler.
+  - The acceptance is a FALLBACK, and one value always worked, so a case listing two
+    endpoints whose first answers passes under every defect here. `AnnounceRound`
+    left `main.cpp` for exactly that: the dial is `IEndpointDialer`, the replies are
+    scripted, and the case asserts WHICH endpoint was sent the registration.
 - **`NotLeader` must not clear the worker id; `UnknownLease` must.** They are
   different sentences: one says *this scheduler is the wrong one to ask*, the other
   *the fleet has forgotten you*. The registry is replicated, so the leader a redirect
@@ -1660,11 +1681,13 @@ other moves where the outage is observed and not whether it happens.
   should spend one redirect an hour. A lifetime ceiling would follow redirects for a
   while and then silently stop, which is the same outage as never following one,
   arriving later and harder to see.
-- **The policy is a testable object; `main.cpp` gets only the dialling.**
+- **The policy is a testable object, and so is the dialling around it.**
   `SchedulerLink` is pure — no socket, no clock, no logger — because the alternative
   home for it is `main.cpp`, which is in no test target. Same reasoning that moved
   `MakeWorkerLeaseValidator` out of `main`: a decision that lives there is a decision
-  nothing can assert, and this list already records what that costs.
+  nothing can assert, and this list already records what that costs. The round that
+  dials what the link names, `AnnounceRound`, followed it out for #1310: `main.cpp`
+  holds only the call and the production `BlockingEndpointDialer`.
 
 **A node caches for itself, and what that saves is the round trip rather than the
 compile.** The shared `fastcached` holds every object, so a second copy on the node

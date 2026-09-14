@@ -29,9 +29,9 @@
 #
 # Every key is one flag, spelled with underscores instead of dashes, and there
 # is no setting that a file can express and a command line cannot. A flag on the
-# command line WINS over the same key here. For a list setting (toolchain,
-# raft_peer, fleet_member) naming any value on the command line REPLACES this
-# file's list rather than extending it.
+# command line WINS over the same key here. For a list setting (scheduler,
+# toolchain, raft_peer, fleet_member) naming any value on the command line
+# REPLACES this file's list rather than extending it.
 #
 # A flag whose meaning is its presence -- one you would pass with no value --
 # is a boolean here, and only `true` and `false` are accepted. `raft_join: true`
@@ -71,8 +71,18 @@
 
 
 # the scheduler's --listen-node endpoint. Required: a worker nothing
-# knows about serves nobody.
+# knows about serves nobody. A list: each is tried in order, in the same
+# heartbeat, until one answers -- so a fleet survives retiring one machine.
+#
+# Prefer a name that outlives any one machine -- a DNS name or a VIP you
+# control -- over a scheduler's literal address. Every worker in the fleet
+# carries this value, and a literal address makes retiring that machine an
+# edit on every one of them. Kept HERE rather than on an --install-service
+# command line, re-pointing is an edit and a restart rather than a
+# re-registration.
 #scheduler:
+#  - <host:port>
+#  - <host:port>
 
 # host:port CLIENTS should use to reach this worker. Defaults to
 # listen_node, which is wrong behind NAT or on a multi-homed host: the

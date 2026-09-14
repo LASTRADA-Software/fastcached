@@ -472,10 +472,12 @@ for months.
 Two things follow that are worth knowing when reading logs:
 
 - A remembered leader that stops answering is dropped immediately and the
-  configured `--scheduler` is tried again **in the same heartbeat**, not the next
-  one. That is the `falling back to the configured endpoint` line, and it means
-  the node was out of the fleet for a connect timeout rather than for a whole
-  interval.
+  configured `--scheduler` values are tried again **in the same heartbeat**, not the
+  next one. That is the `scheduler 10.0.0.7:6675 unreachable; trying
+  scheduler.internal:6675` line, and it means the node was out of the fleet for a
+  connect timeout rather than for a whole interval. The same line names the next
+  value when one of several `--scheduler`s does not answer; with none left to try it
+  ends at `unreachable`.
 - The chain is bounded at two hops. Two schedulers that disagree about who leads
   — a partition healing — produce `gave up following leader redirects` and the
   node simply tries again next heartbeat. Seeing that line *repeatedly* is worth
@@ -1792,6 +1794,30 @@ fastcache-compile-node --install-service \
 No `--toolchain` is needed: the registered service surveys the machine at every
 start, which is also why a toolchain *upgrade* no longer means re-registering.
 
+#### Name the scheduler by something that outlives one machine
+
+**Decide this before the rollout, not after it.** `--scheduler` is written into the
+registration of every worker in the fleet and replayed at every start. Pointed at a
+scheduler's literal address, retiring that machine means re-registering every service,
+and nothing warns you until the day it is gone. Point it at a **DNS name or a VIP you
+control** instead — `cache.internal` above, never `10.0.0.1` — and retiring the machine
+behind it is a change in one place.
+
+Two things make it cheaper still, and neither replaces a stable name:
+
+- **`--scheduler` may be given more than once.** Every value is registered, in order.
+  A node that cannot reach one tries the next **in the same heartbeat**, and the round
+  after starts wherever its registration last landed, so a retired first entry costs
+  one connect timeout rather than one per heartbeat. It is a list of ways to *reach*
+  the fleet, not a list of leaders: a `not the leader` answer is still followed to the
+  endpoint it names. The operator commands (`--cluster-*`, `--enroll-*`) ask the first
+  value that connects, and never try another once a connection was made — the request
+  may already have been applied where it landed.
+- **A `scheduler:` list in the configuration file** needs no `--scheduler` on the install
+  command line at all. The registration carries the file's *path*, so re-pointing the
+  fleet is an edit and a restart rather than a re-registration. A `--scheduler` on the
+  command line **replaces** the file's list rather than adding to it.
+
 Every other flag on that command line is **baked into the registration** and
 reused at every start, so this is also where a wrong one is expensive. An install
 is therefore judged by *every* rule a start is judged by, plus the ones below that
@@ -1826,13 +1852,13 @@ whole network rather than to loopback. `--discovery` is *sent to* an address, so
 takes `<address>:<port>` and nothing shorter.
 
 Addresses this node **dials** rather than opens — `--advertise`, `--scheduler`,
-`--upstream`, `--fleet-member` — are not checked at install today.
-Whether one *resolves* genuinely cannot be settled then: a host that is down on
-the day you install may be the right one by the time the worker boots. Whether it
-is the right *shape* could be, and is not yet
-([#208](https://github.com/LASTRADA-Software/fastcached/issues/208)) — so a typo
-in `--advertise` still installs, and the worker registers, is leased out and is
-never reached.
+`--upstream`, `--enroll-from` — are checked for *shape* at install and at startup:
+each must be `<host>:<port>`, since a bare port names no machine to dial, and every
+`--scheduler` value is checked, not only the first. `--fleet-member` is matched
+against a caller's address rather than dialled, so a bare host is legal there and
+only an empty value is refused. Whether an address *resolves* genuinely cannot be
+settled at install: a host that is down on the day you install may be the right one
+by the time the worker boots.
 
 `--requirepass` is refused too, for the reason it is on the daemon: a supervisor
 records launch arguments where every local account can read them, and for a

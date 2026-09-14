@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#include "EndpointDialerTestUtils.hpp"
 #include "EnrollClient.hpp"
 #include "NodeIdentity.hpp"
 
@@ -11,6 +12,7 @@
 #include <chrono>
 #include <cstddef>
 #include <filesystem>
+#include <format>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -454,66 +456,6 @@ TEST_CASE("A closed window with nothing waiting renders as a reading, not as an 
 namespace
 {
 
-/// Hands back one scripted socket per dial, and records where it was asked to go.
-///
-/// The seam `RunEnrollClient` takes, standing in for `BlockingEnrollDialer`. A fresh
-/// socket per dial is what production does -- the loop re-dials each poll, and a
-/// redirect moves the endpoint -- so one script per reply is the shape, not a
-/// convenience.
-///
-/// **A script that RAN OUT and a dial that FAILED are different facts, and this fake
-/// refuses to spell them the same way.** Production answers `nullptr` for a failed
-/// dial and the loop reports it as *cannot reach the seed at ...*. If exhaustion
-/// answered `nullptr` too, a case that dialled once more than its author anticipated
-/// would redden with that same sentence -- pointing a reader at the connector, at
-/// `BlockingEnrollDialer`, at anything but the property the case is named for. That
-/// is a true failure carrying a false diagnosis, which is the defect these cases
-/// exist to avoid, relocated into the scaffolding where nothing looks wrong because
-/// a fake is always more convenient than the thing it stands for.
-///
-/// So the two are separated: an EMPTY entry is a dial this script fails deliberately,
-/// and running past the end is a `FAIL` in the fake's own voice naming how far the
-/// code under test got.
-class ScriptedDialer final: public IEnrollDialer
-{
-  public:
-    /// @param replies One framed reply per dial, in order.
-    explicit ScriptedDialer(std::vector<std::vector<std::byte>> replies):
-        _replies { std::move(replies) }
-    {
-    }
-
-    /// @copydoc IEnrollDialer::Dial
-    [[nodiscard]] std::unique_ptr<ISocket> Dial(std::string_view endpoint, DialOptions /*options*/) override
-    {
-        _dialed.emplace_back(endpoint);
-        if (_next >= _replies.size())
-        {
-            FAIL("scripted dialer exhausted: the code under test dialled "
-                 << _dialed.size() << " time(s) against a script of " << _replies.size()
-                 << ". That is this fixture running out, NOT a dial failure -- read it as the loop "
-                    "going further than this case anticipated");
-            return nullptr;
-        }
-
-        auto const& frame = _replies[_next++];
-        if (frame.empty())
-            return nullptr; // A dial this script fails on purpose, which production spells the same way.
-        return std::make_unique<Testing::ScriptedSocket>(frame);
-    }
-
-    /// @return Every endpoint dialled, in order.
-    [[nodiscard]] std::vector<std::string> const& Dialed() const noexcept
-    {
-        return _dialed;
-    }
-
-  private:
-    std::vector<std::vector<std::byte>> _replies;
-    std::vector<std::string> _dialed;
-    std::size_t _next { 0 };
-};
-
 /// A wait that advances its own clock by exactly what was requested and never blocks.
 ///
 /// The pause a loop REQUESTS is exact and host-independent, which is what makes this
@@ -593,7 +535,7 @@ TEST_CASE("A node that answered on its own behalf breaks the redirect chain", "[
     cfg.raftListen = "7100";
     cfg.raftSelf = "198.51.100.4";
 
-    ScriptedDialer dialer { {
+    Testing::ScriptedDialer dialer { {
         RedirectTo("10.0.0.2:7000"),
         RedirectTo("10.0.0.3:7000"),
         Recorded(),
@@ -647,7 +589,7 @@ TEST_CASE("A consecutive redirect chain is still bounded", "[enrollment][client]
     cfg.raftListen = "7100";
     cfg.raftSelf = "198.51.100.4";
 
-    ScriptedDialer dialer { {
+    Testing::ScriptedDialer dialer { {
         RedirectTo("10.0.0.2:7000"),
         RedirectTo("10.0.0.1:7000"),
         RedirectTo("10.0.0.2:7000"),
@@ -669,4 +611,94 @@ TEST_CASE("A consecutive redirect chain is still bounded", "[enrollment][client]
     // Four dials rather than all four replies consumed: the fourth REPLY is never
     // read, because the bound is checked before the redirect is followed.
     CHECK(dialer.Dialed().size() == 4);
+}
+
+namespace
+{
+constexpr std::string_view FirstScheduler = "10.0.0.1:7000";
+constexpr std::string_view SecondScheduler = "10.0.0.2:7000";
+
+/// A leader answering `--enroll-list` with a shut window.
+/// @return The framed reply.
+[[nodiscard]] std::vector<std::byte> ShutWindow()
+{
+    return Wire::EncodeReply(Wire::Status::Ok, Wire::EncodeEnrollmentReport(Wire::EnrollmentReport {}));
+}
+
+/// An operator's node configured with both schedulers, in order.
+/// @return The configuration.
+[[nodiscard]] NodeConfig TwoSchedulers()
+{
+    NodeConfig cfg;
+    cfg.schedulers = { std::string { FirstScheduler }, std::string { SecondScheduler } };
+    return cfg;
+}
+} // namespace
+
+TEST_CASE("An enrollment command asks the next --scheduler when the first cannot be reached",
+          "[enrollment][client][fallback]")
+{
+    // #1310: the operator's verbs read the same list the heartbeat does. Asserted by
+    // WHICH endpoint was sent the request, because a verb that asked only the first
+    // passes every case whose first entry answers.
+    auto const cfg = TwoSchedulers();
+    Testing::ScriptedDialer dialer { { {}, ShutWindow() } };
+
+    auto const listed = RunEnrollAdmin(
+        cfg, EnrollCommand { .action = EnrollAction::List, .subject = {} }, ConfiguredCredential { cfg, nullptr }, dialer);
+
+    INFO("result: " << listed.value_or(listed.error_or("")));
+    REQUIRE(listed.has_value());
+    CHECK(listed->contains("closed"));
+    CHECK(dialer.Dialed() == std::vector<std::string> { std::string { FirstScheduler }, std::string { SecondScheduler } });
+    CHECK(dialer.SentOn(0).empty());
+    CHECK_FALSE(dialer.SentOn(1).empty());
+}
+
+TEST_CASE("An enrollment command that reached a scheduler is never sent to another", "[enrollment][client][fallback]")
+{
+    // The line `DialFirstReachable` draws: a fallback only where nothing was SENT.
+    // `--enroll-approve` commits `ClusterAdmit` before the key is consulted, so an
+    // approval that may have been applied where it landed must not be proposed a second
+    // time elsewhere. The first scheduler connects and then answers nothing readable; a
+    // second dial would run this script out, which the fake reports in its own voice.
+    auto const cfg = TwoSchedulers();
+    Testing::ScriptedDialer dialer { { std::vector<std::byte> { std::byte { 0xFF } } } };
+
+    auto const approved = RunEnrollAdmin(cfg,
+                                         EnrollCommand { .action = EnrollAction::Approve, .subject = "n9" },
+                                         ConfiguredCredential { cfg, nullptr },
+                                         dialer);
+
+    REQUIRE_FALSE(approved.has_value());
+    INFO("refusal: " << approved.error());
+    CHECK(approved.error().contains(FirstScheduler));
+    CHECK(dialer.Dialed() == std::vector<std::string> { std::string { FirstScheduler } });
+}
+
+TEST_CASE("An enrollment command that reaches no --scheduler names every one it tried", "[enrollment][client][fallback]")
+{
+    auto const cfg = TwoSchedulers();
+    Testing::ScriptedDialer dialer { { {}, {} } };
+
+    auto const listed = RunEnrollAdmin(
+        cfg, EnrollCommand { .action = EnrollAction::List, .subject = {} }, ConfiguredCredential { cfg, nullptr }, dialer);
+
+    REQUIRE_FALSE(listed.has_value());
+    CHECK(listed.error().contains(std::format("{}, {}", FirstScheduler, SecondScheduler)));
+}
+
+TEST_CASE("A NotLeader sends an enrollment command to the leader it names, not down the --scheduler list",
+          "[enrollment][client][fallback]")
+{
+    // A redirect is an instruction. Consulting the list for it would send the request
+    // to `SecondScheduler`, which the first has just said does not lead.
+    auto const cfg = TwoSchedulers();
+    Testing::ScriptedDialer dialer { { RedirectTo("10.0.0.9:7000"), ShutWindow() } };
+
+    auto const listed = RunEnrollAdmin(
+        cfg, EnrollCommand { .action = EnrollAction::List, .subject = {} }, ConfiguredCredential { cfg, nullptr }, dialer);
+
+    REQUIRE(listed.has_value());
+    CHECK(dialer.Dialed() == std::vector<std::string> { std::string { FirstScheduler }, "10.0.0.9:7000" });
 }

@@ -3,6 +3,13 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <initializer_list>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
 #include <tests/Unwrap.hpp>
 
 using namespace FastCache;
@@ -12,25 +19,52 @@ using FastCache::Testing::Unwrap;
 namespace
 {
 constexpr std::string_view Configured = "scheduler.example:6676";
+constexpr std::string_view Second = "scheduler-b.example:6676";
+constexpr std::string_view Third = "scheduler-c.example:6676";
 constexpr std::string_view Leader = "10.0.0.7:6676";
 constexpr std::string_view Other = "10.0.0.9:6676";
+
+/// A link configured with @p endpoints, in order.
+/// @param endpoints The `--scheduler` values.
+/// @return The link, before its first round.
+[[nodiscard]] SchedulerLink LinkTo(std::initializer_list<std::string_view> endpoints)
+{
+    std::vector<std::string> configured;
+    for (auto const endpoint: endpoints)
+        configured.emplace_back(endpoint);
+    return SchedulerLink { std::move(configured) };
+}
+
+/// Where the next round opens, which is the only thing a remembered leader DOES.
+///
+/// Asserted instead of reading a "following" flag back: a flag can be set correctly
+/// while the round still opens in the wrong place, and the opening is the behaviour.
+/// @param link The link; a round is begun on it.
+/// @return The first target of that round.
+[[nodiscard]] std::string NextRoundOpensAt(SchedulerLink& link)
+{
+    link.BeginRound();
+    return link.Target();
+}
 } // namespace
 
-TEST_CASE("A node starts at the endpoint it was configured with", "[node][schedulerlink]")
+TEST_CASE("A node starts at the first endpoint it was configured with", "[node][schedulerlink]")
 {
-    SchedulerLink link { std::string { Configured } };
+    auto link = LinkTo({ Configured, Second });
     link.BeginRound();
 
     CHECK(link.Target() == Configured);
-    CHECK_FALSE(link.Following());
 }
 
-TEST_CASE("A NotLeader redirect moves this round's target", "[node][schedulerlink]")
+TEST_CASE("A NotLeader redirect moves this round's target, never into the configured list", "[node][schedulerlink]")
 {
     // The whole of #237's worker half: before this, the refusal was logged and the
     // next dial went back to the demoted scheduler, so a worker announced itself to
     // a node that refuses `Register` and expired out of the real leader's registry.
-    SchedulerLink link { std::string { Configured } };
+    //
+    // And a redirect is an INSTRUCTION (#1310): with a second endpoint configured, the
+    // target is still the one the refusal named, not the next entry of the list.
+    auto link = LinkTo({ Configured, Second });
     link.BeginRound();
 
     REQUIRE(link.Redirect(std::string { Leader }));
@@ -41,7 +75,7 @@ TEST_CASE("The redirect chain is bounded, so two schedulers naming each other co
 {
     // Not this node's chain to trust. A partition healing, or a stale `_knownLeader`
     // on either side, can have two schedulers name each other indefinitely.
-    SchedulerLink link { std::string { Configured } };
+    auto link = LinkTo({ Configured });
     link.BeginRound();
 
     for (int hop = 0; hop < MaxAnnounceRedirects; ++hop)
@@ -56,7 +90,7 @@ TEST_CASE("The budget is per round, not per process", "[node][schedulerlink]")
     // A fleet that re-elects once an hour should spend one redirect an hour. A
     // lifetime ceiling would follow redirects for a while and then silently stop,
     // which is the same outage as never following one -- arriving later.
-    SchedulerLink link { std::string { Configured } };
+    auto link = LinkTo({ Configured });
 
     link.BeginRound();
     for (int hop = 0; hop < MaxAnnounceRedirects; ++hop)
@@ -72,19 +106,26 @@ TEST_CASE("A leader is remembered only once a round has been accepted there", "[
     // An endpoint some scheduler NAMED is a lead; an endpoint that took this node's
     // registration is a leader. Committing on the name alone would let one bad
     // redirect become the endpoint every future round starts at.
-    SchedulerLink link { std::string { Configured } };
+    SECTION("followed, never accepted: the next round opens at the configured endpoint")
+    {
+        auto link = LinkTo({ Configured });
+        link.BeginRound();
+        REQUIRE(link.Redirect(std::string { Leader }));
 
-    link.BeginRound();
-    REQUIRE(link.Redirect(std::string { Leader }));
-    CHECK_FALSE(link.Following()); // followed, not yet committed
+        CHECK(NextRoundOpensAt(link) == Configured);
+    }
 
-    link.Accepted();
-    CHECK(link.Following());
+    SECTION("followed and accepted: the next round opens at the leader")
+    {
+        // Which is what stops a steady-state fleet paying a redirect on every single
+        // heartbeat.
+        auto link = LinkTo({ Configured });
+        link.BeginRound();
+        REQUIRE(link.Redirect(std::string { Leader }));
+        link.Accepted();
 
-    // And the next round opens there, which is what stops a steady-state fleet
-    // paying a redirect on every single heartbeat.
-    link.BeginRound();
-    CHECK(link.Target() == Leader);
+        CHECK(NextRoundOpensAt(link) == Leader);
+    }
 }
 
 TEST_CASE("A redirect that is followed and then refused does not become the next round's start", "[node][schedulerlink]")
@@ -92,15 +133,18 @@ TEST_CASE("A redirect that is followed and then refused does not become the next
     // The endpoint answered -- it was reachable -- but refused for its own reasons:
     // not a member, a fingerprint it will not take. That is not a leader, and
     // starting there every round would pin this node to it.
-    SchedulerLink link { std::string { Configured } };
+    auto link = LinkTo({ Configured });
 
     link.BeginRound();
     REQUIRE(link.Redirect(std::string { Leader }));
-    CHECK(link.Lost() == std::optional { std::string { Configured } });
 
-    link.BeginRound();
-    CHECK(link.Target() == Configured);
-    CHECK_FALSE(link.Following());
+    // Nothing further this round: the one configured endpoint already answered it,
+    // with the redirect that led here, and would name the same leader again.
+    // Redialling it is a spin bounded only by the hop budget, which is what this was
+    // before #1310 made each configured endpoint a once-per-round fallback.
+    CHECK_FALSE(link.Lost().has_value());
+
+    CHECK(NextRoundOpensAt(link) == Configured);
 }
 
 TEST_CASE("A remembered leader that stops answering falls back inside the same round", "[node][schedulerlink]")
@@ -108,11 +152,10 @@ TEST_CASE("A remembered leader that stops answering falls back inside the same r
     // Not a heartbeat interval later. This machine is absent from the fleet for as
     // long as this takes, and the configured endpoint is the one still standing
     // after an election the remembered leader lost.
-    SchedulerLink link { std::string { Configured } };
+    auto link = LinkTo({ Configured });
     link.BeginRound();
     REQUIRE(link.Redirect(std::string { Leader }));
     link.Accepted();
-    REQUIRE(link.Following());
 
     link.BeginRound();
     REQUIRE(link.Target() == Leader);
@@ -121,14 +164,16 @@ TEST_CASE("A remembered leader that stops answering falls back inside the same r
     REQUIRE(fallback.has_value());
     CHECK(Unwrap(fallback) == Configured);
     CHECK(link.Target() == Configured);
-    CHECK_FALSE(link.Following());
+
+    // And forgotten, not merely stepped around for one round.
+    CHECK(NextRoundOpensAt(link) == Configured);
 }
 
 TEST_CASE("Losing the configured endpoint offers nothing further, rather than spinning", "[node][schedulerlink]")
 {
     // There is nowhere further back to fall. Returning the same endpoint again
     // would have the caller redial it inside one round forever.
-    SchedulerLink link { std::string { Configured } };
+    auto link = LinkTo({ Configured });
     link.BeginRound();
 
     CHECK_FALSE(link.Lost().has_value());
@@ -137,22 +182,87 @@ TEST_CASE("Losing the configured endpoint offers nothing further, rather than sp
 
 TEST_CASE("Being accepted back at the configured endpoint forgets the remembered leader", "[node][schedulerlink]")
 {
-    // A fleet that re-elects back to the original scheduler must stop reporting
-    // that it is following one. Storing the configured endpoint as a `_learned`
-    // equal to the default would behave identically and mislead every diagnostic.
-    SchedulerLink link { std::string { Configured } };
+    // A fleet that re-elects back to the original scheduler must stop opening its
+    // rounds anywhere else. Storing the configured endpoint as a remembered leader
+    // would open there too, which is why the last line asserts what a FAILURE there
+    // does: remembered, the whole configured list would still be untried behind it,
+    // and the same endpoint would be offered again inside the round.
+    auto link = LinkTo({ Configured });
     link.BeginRound();
     REQUIRE(link.Redirect(std::string { Leader }));
     link.Accepted();
-    REQUIRE(link.Following());
+    REQUIRE(NextRoundOpensAt(link) == Leader);
 
-    link.BeginRound();
     REQUIRE(link.Redirect(std::string { Configured }));
     link.Accepted();
 
-    CHECK_FALSE(link.Following());
+    CHECK(NextRoundOpensAt(link) == Configured);
+    CHECK_FALSE(link.Lost().has_value());
+}
+
+TEST_CASE("An unreachable first scheduler falls back to the second in the same round", "[node][schedulerlink][fallback]")
+{
+    // The discrimination #1310 asks for: one value always worked, so a list whose
+    // first entry answers proves nothing. The first is lost here and the second must
+    // be offered in the SAME round, and be the one the round is then dialling.
+    auto link = LinkTo({ Configured, Second });
     link.BeginRound();
-    CHECK(link.Target() == Configured);
+    REQUIRE(link.Target() == Configured);
+
+    auto const fallback = link.Lost();
+    REQUIRE(fallback.has_value());
+    CHECK(Unwrap(fallback) == Second);
+    CHECK(link.Target() == Second);
+
+    // Nothing after the second: every configured endpoint has been tried this round.
+    CHECK_FALSE(link.Lost().has_value());
+}
+
+TEST_CASE("A round opens at the configured endpoint that last accepted, and still wraps to the first",
+          "[node][schedulerlink][fallback]")
+{
+    // A retired first entry would otherwise cost its connect timeout on every
+    // heartbeat forever. The wrap is the other half: an operator's first choice that
+    // comes back is still tried, inside a round that began further down.
+    auto link = LinkTo({ Configured, Second, Third });
+    link.BeginRound();
+    REQUIRE(link.Lost() == std::optional { std::string { Second } });
+    link.Accepted();
+
+    link.BeginRound();
+    CHECK(link.Target() == Second);
+    CHECK(link.Lost() == std::optional { std::string { Third } });
+    CHECK(link.Lost() == std::optional { std::string { Configured } });
+    CHECK_FALSE(link.Lost().has_value());
+}
+
+TEST_CASE("A redirect target that fails falls back to a configured endpoint not yet tried",
+          "[node][schedulerlink][fallback]")
+{
+    // Never to the one that issued the redirect -- it answered a moment ago -- and
+    // never past the end of the list.
+    auto link = LinkTo({ Configured, Second });
+    link.BeginRound();
+    REQUIRE(link.Redirect(std::string { Leader }));
+
+    CHECK(link.Lost() == std::optional { std::string { Second } });
+    CHECK_FALSE(link.Lost().has_value());
+}
+
+TEST_CASE("A remembered leader that stops answering walks the whole configured list", "[node][schedulerlink][fallback]")
+{
+    // The same-round fallback of #237, over a list: the remembered leader is not a
+    // configured endpoint, so every configured one is still there to try.
+    auto link = LinkTo({ Configured, Second });
+    link.BeginRound();
+    REQUIRE(link.Redirect(std::string { Leader }));
+    link.Accepted();
+
+    link.BeginRound();
+    REQUIRE(link.Target() == Leader);
+    CHECK(link.Lost() == std::optional { std::string { Configured } });
+    CHECK(link.Lost() == std::optional { std::string { Second } });
+    CHECK_FALSE(link.Lost().has_value());
 }
 
 TEST_CASE("DescribeAnnounceRound: a steady heartbeat round does not claim a registration", "[node][scheduler]")

@@ -4,8 +4,10 @@
 #include "AdminEndpoint.hpp"
 #include "CacheTier.hpp"
 #include "CompileCapacity.hpp"
+#include "EndpointDialer.hpp"
 #include "NodeConfig.hpp"
 #include "NodeCredential.hpp"
+#include "SchedulerLink.hpp"
 
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Distributed/LeaseToken.hpp>
@@ -14,6 +16,7 @@
 #include <FastCache/Platform/HostLoad.hpp>
 
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <optional>
 #include <string>
@@ -142,5 +145,40 @@ void AdoptRegistrars(std::vector<Cc::WorkerRegistrar> rebuilt,
 ///        redirect can have moved it.
 /// @return What landed, and where to go next if anywhere.
 [[nodiscard]] AnnounceOutcome AnnounceOnce(HeartbeatRound const& round, ISocket& client, std::string_view endpoint);
+
+/// Ceiling on OPENING the heartbeat's connection to a scheduler, name resolution
+/// included.
+///
+/// Short, and separate from the exchange's I/O bound: ten seconds is a reasonable
+/// ceiling on an exchange and a very long time to wait for a TCP handshake. It is
+/// also what a retired first `--scheduler` costs every round that starts there, which
+/// is why a round's walk starts at the endpoint that last accepted (`SchedulerLink`).
+inline constexpr std::chrono::milliseconds HeartbeatConnectTimeout { 1'000 };
+
+/// Announce this machine once, following `NotLeader` to wherever it points and falling
+/// back through the configured `--scheduler` list when an endpoint cannot be reached.
+///
+/// Out of `main.cpp` for #1310, whose acceptance is a FALLBACK: a first scheduler that
+/// does not answer and a second that does, asserted by which one took the request.
+/// `main.cpp` is in no test target (#909), and a case that lists two endpoints and
+/// finds the first tried passes under every defect this could have -- one value always
+/// worked. Here the dial is a seam and the replies are scripted.
+///
+/// Every *decision* still belongs to `SchedulerLink`, which is pure and tested:
+/// which endpoint, whether the chain is spent, whether to fall back, what to
+/// remember. What lives here is the dialling, and the logging of what the link
+/// decided.
+///
+/// A free function rather than a block inside `WorkerBody` for a second reason as
+/// well: that function sits at the cognitive-complexity ceiling the build enforces --
+/// this loop pushed it to 88 against a threshold of 60 when it was first written.
+/// @param round What to announce and where to read it from.
+/// @param link Where this node believes the leader is; advanced across the round.
+/// @param dialer Dials each endpoint the link names.
+/// @return How many entries a scheduler ACCEPTED this round. Zero covers every way a
+///         round can achieve nothing -- nobody reachable, everybody refusing, a
+///         redirect chain that ran out -- which are one answer to the only question
+///         the caller asks of it: is this node getting through to a scheduler.
+[[nodiscard]] std::size_t AnnounceRound(HeartbeatRound const& round, SchedulerLink& link, IEndpointDialer& dialer);
 
 } // namespace FastCache::Node

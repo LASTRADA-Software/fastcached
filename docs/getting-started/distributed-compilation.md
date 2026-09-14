@@ -296,6 +296,11 @@ everybody else — so a worker that leaves it alone advertises an address no cli
 dial. The node refuses to start rather than registering one, but the flag is the fix
 and it is easy to leave off.
 
+**`--scheduler` names a DNS name or a VIP, never a scheduler's literal address.** Every
+worker carries that value for as long as it is installed, so decide it before the
+rollout: [Name the scheduler by something that outlives one machine](../tools/fastcache-compile-node.md#name-the-scheduler-by-something-that-outlives-one-machine)
+says why, and how several `--scheduler` values fall back to one another.
+
 That is the whole of it — but **a membership flag is not optional**, and it is
 the line people leave off. (`--fleet-open` is the one a build network that is
 already your boundary wants; `--fleet-member` is the narrower alternative,

@@ -53,7 +53,7 @@ namespace
 [[nodiscard]] NodeConfig Installable()
 {
     NodeConfig cfg;
-    cfg.scheduler = "cache.internal:6675";
+    cfg.schedulers = { "cache.internal:6675" };
     cfg.advertise = "worker-01.internal:6676";
     cfg.toolchains = { "/usr/bin/g++" };
     return cfg;

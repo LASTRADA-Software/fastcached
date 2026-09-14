@@ -46,6 +46,7 @@ add_executable(fastcache-compile-node
     ConsensusTier.cpp
     CordonCli.cpp
     DiscoveryTier.cpp
+    EndpointDialer.cpp
     EnrollClient.cpp
     EnrollmentResponder.cpp
     EnrollmentWindow.cpp
@@ -106,6 +107,7 @@ if(FASTCACHED_BUILD_TESTS)
         CordonCli_test.cpp
         DiscoveryTier.cpp
         DiscoveryTier_test.cpp
+        EndpointDialer.cpp
         EnrollClient.cpp
         EnrollClient_test.cpp
         EnrollmentResponder.cpp

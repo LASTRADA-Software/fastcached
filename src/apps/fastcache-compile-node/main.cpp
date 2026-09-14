@@ -133,9 +133,6 @@ constexpr std::uint64_t SweepEveryBeats = 45;
 /// on an exchange and a very long time to wait for a TCP handshake.
 constexpr std::chrono::milliseconds HeartbeatIoTimeout { 10'000 };
 
-/// Ceiling on OPENING that connection, name resolution included.
-constexpr std::chrono::milliseconds HeartbeatConnectTimeout { 1'000 };
-
 /// How often the stop watcher looks at the stop flag.
 ///
 /// A signal handler may portably do almost nothing -- it sets a flag -- so
@@ -423,89 +420,9 @@ void WarnWhileWindowIsOpen(Node::EnrollmentWindow& window, ILogger& logger, std:
     }
 }
 
-/// Announce this machine once, following `NotLeader` to wherever it points.
-///
-/// A function rather than a block inside `WorkerBody` for two reasons, and the
-/// second is the load-bearing one. `WorkerBody` is at the cognitive-complexity
-/// ceiling the build enforces -- this loop pushed it to 88 against a threshold of
-/// 60, which is the linter making a design point rather than a style one. That the
-/// margin in this file is zero rather than small is #1351: extractions like this one
-/// are what keep it at zero, and the next change to `main` pays for the arrival
-/// order rather than for its own complexity. And a
-/// redirect chain with a memory and a fallback is far too much behaviour to leave
-/// in the one translation unit no test reaches.
-///
-/// Every *decision* still belongs to `SchedulerLink`, which is pure and tested:
-/// which endpoint, whether the chain is spent, whether to fall back, what to
-/// remember. What lives here is the dialling, and the logging of what the link
-/// decided.
-///
-/// @param round What to announce and where to read it from.
-/// @param link Where this node believes the leader is; advanced across the round.
-/// @param connector Dials each endpoint the link names.
-/// @return How many entries a scheduler ACCEPTED this round. Zero covers every way a
-///         round can achieve nothing -- nobody reachable, everybody refusing, a
-///         redirect chain that ran out -- which are one answer to the only question
-///         the caller asks of it: is this node getting through to a scheduler.
-[[nodiscard]] std::size_t AnnounceRound(Node::HeartbeatRound const& round,
-                                        Node::SchedulerLink& link,
-                                        BlockingConnector& connector)
-{
-    for (link.BeginRound();;)
-    {
-        auto client =
-            Cc::DialEndpointBlocking(connector, link.Target(), DialOptions { .connectTimeout = HeartbeatConnectTimeout });
-        if (client == nullptr)
-        {
-            round.logger.Logf(LogLevel::Warn,
-                              "scheduler {} unreachable{}",
-                              link.Target(),
-                              link.Following() ? "; falling back to the configured endpoint" : "");
-            // A remembered leader that stopped answering is retried against the
-            // configured endpoint now rather than a heartbeat interval from now:
-            // this machine is out of the fleet for as long as it takes, and the
-            // configured endpoint is the one still standing after an election the
-            // remembered leader lost.
-            if (!link.Lost().has_value())
-                return 0;
-            continue;
-        }
-
-        auto const outcome = Node::AnnounceOnce(round, *client, link.Target());
-        if (!outcome.leader.has_value())
-        {
-            // Committed only when this endpoint actually took an entry. It answered
-            // either way, but an endpoint that refused every registrar for its own
-            // reasons -- not a member, a fingerprint it will not have -- is not a
-            // leader worth starting the next round at, and pinning to it would
-            // outlast the election that caused it.
-            if (outcome.accepted > 0)
-            {
-                link.Accepted();
-                return outcome.accepted;
-            }
-            if (!link.Lost().has_value())
-                return 0;
-            continue;
-        }
-
-        round.logger.Logf(
-            LogLevel::Info, "scheduler {} is not the leader; announcing to {} instead", link.Target(), *outcome.leader);
-        if (!link.Redirect(*outcome.leader))
-        {
-            // Two schedulers naming each other, or a leader that moved again
-            // mid-chain. Costs this round rather than the thread.
-            round.logger.Logf(LogLevel::Warn,
-                              "gave up following leader redirects after {} hop(s); retrying next heartbeat",
-                              Node::MaxAnnounceRedirects);
-            return 0;
-        }
-    }
-}
-
 /// Tell `node-status` what a finished survey concluded.
 ///
-/// A free function rather than a lambda inside `WorkerBody` for `AnnounceRound`'s
+/// A free function rather than a lambda inside `WorkerBody` for `Node::AnnounceRound`'s
 /// reason, which is build-enforced rather than stylistic: that body sits at the
 /// cognitive-complexity ceiling the linter fails the build on, and two publication
 /// closures pushed it over. The rule this carries -- which state a served count implies
@@ -1658,11 +1575,10 @@ void AdoptAllowlist(Cc::CompileJobRunner& jobs,
     // that has forgotten it answers the heartbeat by telling it to register again.
     // Splitting them would need the two halves to agree about which owns recovery.
     // A thread whose entire job is to block, which is the shape `IConnector`
-    // names as correct for a dialler that has no reactor. The connector is a
-    // `BlockingConnector` and is passed to `DialEndpointBlocking` by that type,
-    // so the `SyncRun` inside it is sound by construction rather than by comment.
-    BlockingConnector heartbeatConnector { DefaultAddressResolver(),
-                                           BlockingConnectorOptions { .ioTimeout = HeartbeatIoTimeout } };
+    // names as correct for a dialler that has no reactor. The dialer builds a
+    // `BlockingConnector` per dial and passes it to `DialEndpointBlocking` by that
+    // type, so the `SyncRun` inside it is sound by construction rather than by comment.
+    Node::BlockingEndpointDialer heartbeatDialer { HeartbeatIoTimeout };
 
     /// Set when the fleet a scheduler registered this node into is not the one the
     /// operator asserted with `--cluster-id`. Fatal for the same reason
@@ -1705,7 +1621,7 @@ void AdoptAllowlist(Cc::CompileJobRunner& jobs,
     // `beat`, touched by this one thread only, which is what makes it safe without
     // a lock of its own. It outlives the `jthread` below, which joins in its
     // destructor before any of this goes.
-    Node::SchedulerLink link { cfg.scheduler };
+    Node::SchedulerLink link { cfg.schedulers };
 
     // Set by the heartbeat thread when the initial survey answers with nothing, read
     // by this one at the return below.
@@ -1925,7 +1841,7 @@ void AdoptAllowlist(Cc::CompileJobRunner& jobs,
             // below still sees as a change: at worst the round already carried it and the
             // next one repeats it, which costs a heartbeat and loses nothing.
             auto const announcedCordon = compileCapacity.IsCordoned();
-            PublishRegistration(runtimeState, statusClock, registrars, AnnounceRound(round, link, heartbeatConnector));
+            PublishRegistration(runtimeState, statusClock, registrars, Node::AnnounceRound(round, link, heartbeatDialer));
 
             // A worker that took even part of the interval to exit would hold its port
             // that long against a restart -- and a cordon, or its lifting, reaches the

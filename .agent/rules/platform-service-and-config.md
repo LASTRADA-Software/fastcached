@@ -300,7 +300,10 @@ readable and silently ignored. Every rule below has already been one of them.
     `--advertise` was the costly one: nothing parsed it, so `--advertise=nope`
     installed, registered, heartbeated, was leased out and was never reached. The other
     two fail VISIBLY at `connect()`, which is why they were the residual rather than
-    the defect.
+    the defect. `--scheduler` is a list since #1310 and EVERY element is judged, an
+    empty one included: for a scalar, empty means never given, while an empty ELEMENT
+    is a value somebody typed — and a fallback that can never answer is found on the
+    day the entries before it are gone.
   - `--fleet-member` is NOT dialled and must not be judged as if it were. It is matched
     against a peer's source address through `HostOfEndpoint`, which keeps an
     unsplittable value WHOLE on purpose — a bare host is a legitimate spelling for a
@@ -319,7 +322,7 @@ readable and silently ignored. Every rule below has already been one of them.
   - `--bind` is deliberately in neither table. Its value is a HOST with `--port` beside
     it, and whether a host is usable is answerable only by binding it.
   - The rows carry a PREDICATE rather than a member pointer, because they are not one
-    shape: two are `std::string` and one is a repeatable list, and a table that could
+    shape: two are `std::string` and two are repeatable lists, and a table that could
     hold only scalars would have left the list to a hand-written check beside it —
     which is the fifth-place-the-map-lives failure #288 records, one flag earlier.
   - A test asserting only "refused" passes whichever rule fired. Assert WHICH: the

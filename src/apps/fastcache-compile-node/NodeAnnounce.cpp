@@ -6,6 +6,8 @@
 #include <FastCache/Distributed/SchedulerProtocol.hpp>
 #include <FastCache/Platform/DaemonControls.hpp>
 
+#include <format>
+#include <string>
 #include <utility>
 
 namespace FastCache::Node
@@ -195,6 +197,64 @@ AnnounceOutcome AnnounceOnce(HeartbeatRound const& round, ISocket& client, std::
     auto const report = DescribeAnnounceRound(beats, registrations, round.registrars.size(), leader.has_value());
     round.logger.Logf(report.level, "scheduler {}: {}", endpoint, report.message);
     return AnnounceOutcome { .accepted = accepted, .leader = std::move(leader) };
+}
+
+std::size_t AnnounceRound(HeartbeatRound const& round, SchedulerLink& link, IEndpointDialer& dialer)
+{
+    for (link.BeginRound();;)
+    {
+        auto client = dialer.Dial(link.Target(), DialOptions { .connectTimeout = HeartbeatConnectTimeout });
+        if (client == nullptr)
+        {
+            // Named BEFORE `Lost()` moves the target, and the fallback named after it:
+            // with several `--scheduler` values the sentence has to say where this node
+            // went next, which "the configured endpoint" no longer identifies (#1310).
+            auto const unreachable = link.Target();
+            auto const next = link.Lost();
+            round.logger.Logf(LogLevel::Warn,
+                              "scheduler {} unreachable{}",
+                              unreachable,
+                              next.has_value() ? std::format("; trying {}", *next) : std::string {});
+            // Another configured endpoint is tried now rather than a heartbeat interval
+            // from now: this machine is out of the fleet for as long as it takes, and a
+            // configured endpoint is the one still standing after an election the
+            // remembered leader lost, or after the machine an earlier entry named was
+            // retired.
+            if (!next.has_value())
+                return 0;
+            continue;
+        }
+
+        auto const outcome = AnnounceOnce(round, *client, link.Target());
+        if (!outcome.leader.has_value())
+        {
+            // Committed only when this endpoint actually took an entry. It answered
+            // either way, but an endpoint that refused every registrar for its own
+            // reasons -- not a member, a fingerprint it will not have -- is not a
+            // leader worth starting the next round at, and pinning to it would
+            // outlast the election that caused it.
+            if (outcome.accepted > 0)
+            {
+                link.Accepted();
+                return outcome.accepted;
+            }
+            if (!link.Lost().has_value())
+                return 0;
+            continue;
+        }
+
+        round.logger.Logf(
+            LogLevel::Info, "scheduler {} is not the leader; announcing to {} instead", link.Target(), *outcome.leader);
+        if (!link.Redirect(*outcome.leader))
+        {
+            // Two schedulers naming each other, or a leader that moved again
+            // mid-chain. Costs this round rather than the thread.
+            round.logger.Logf(LogLevel::Warn,
+                              "gave up following leader redirects after {} hop(s); retrying next heartbeat",
+                              MaxAnnounceRedirects);
+            return 0;
+        }
+    }
 }
 
 } // namespace FastCache::Node

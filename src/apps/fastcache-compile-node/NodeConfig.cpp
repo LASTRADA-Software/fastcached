@@ -634,12 +634,19 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
             .primary = "--scheduler",
             .arity = Arity::Value,
             .operand = "=<host:port>",
-            .apply = AssignFrom<&NodeConfig::scheduler, ParseText>(),
-            .explicitBit = &NodeConfig::schedulerExplicit,
+            // Repeatable, and no provenance bit: a list's default is EMPTY, so every value
+            // the command line holds is one the operator typed and the registration
+            // emits each of them. `--fleet-member`'s shape, for the same reason (#1310).
+            .apply = AppendFrom<&NodeConfig::schedulers, ParseText>(),
             .description = "the scheduler's --listen-node endpoint. Required: a\n"
-                           "worker nothing knows about serves nobody.",
+                           "worker nothing knows about serves nobody. Repeatable:\n"
+                           "each is tried in order, in the same heartbeat, until\n"
+                           "one answers -- so a fleet survives retiring one machine.\n"
+                           "Prefer a name that outlives any one machine (a DNS\n"
+                           "name or a VIP) over a scheduler's literal address.",
             .yamlKey = "scheduler",
-            .same = FieldEq<&NodeConfig::scheduler>(),
+            .same = FieldEq<&NodeConfig::schedulers>(),
+            .clear = ClearList<&NodeConfig::schedulers>(),
         },
         {
             .primary = "--advertise",
@@ -2040,7 +2047,11 @@ ServiceSpec MakeNodeServiceSpec(std::filesystem::path const& exePath, NodeConfig
     // file without touching the registration.
     emitPathIfSet("config", cfg.configPath);
 
-    emitIfExplicit("scheduler", cfg.scheduler, cfg.schedulerExplicit);
+    // EVERY value, in order, and never only the first: the registration replays this
+    // command line at each start, and a service carrying one of three schedulers is the
+    // single point of re-provisioning the list exists to remove (#1310).
+    for (auto const& scheduler: cfg.schedulers)
+        argv.push_back(std::format("--scheduler={}", scheduler));
     emitIfExplicit("advertise", cfg.advertise, cfg.advertiseExplicit);
     emitIfExplicit("slots", cfg.slots, cfg.slotsExplicit);
     emitIfExplicit("node-class", std::string { Distributed::TraitsFor(cfg.nodeClass).name }, cfg.nodeClassExplicit);
@@ -2717,14 +2728,19 @@ std::string AdvertisedEndpoint(NodeConfig const& cfg)
 /// consult -- and it is narrow: a node that schedules binds the wildcard by default,
 /// so it cannot reach this row at all, which leaves a worker registering with a
 /// scheduler on this box that it does not itself run. The refusal names the remedy.
+///
+/// **ANY value, never the first, once `--scheduler` is a list** (#1310). The heartbeat
+/// falls back through every one of them, so a loopback first entry says nothing about
+/// where this node registers the day that entry stops answering -- and the address it
+/// registered is then the one only this machine can reach.
 /// @param cfg The parsed configuration.
-/// @return Whether `--scheduler` names a host that is not this machine.
+/// @return Whether some `--scheduler` names a host that is not this machine.
 [[nodiscard]] bool SchedulerIsRemote(NodeConfig const& cfg)
 {
-    auto const endpoint = SplitHostPort(cfg.scheduler);
-    if (!endpoint.has_value())
-        return false;
-    return !IsLoopbackHost(endpoint->first) && endpoint->first != "localhost";
+    return std::ranges::any_of(cfg.schedulers, [](std::string const& scheduler) {
+        auto const endpoint = SplitHostPort(scheduler);
+        return endpoint.has_value() && !IsLoopbackHost(endpoint->first) && endpoint->first != "localhost";
+    });
 }
 
 /// Whether a worker registers an address only its own machine can reach, with a
@@ -2836,7 +2852,7 @@ std::optional<std::string> NodeServiceRejection(NodeConfig const& cfg)
     };
 
     constexpr auto Rules = std::to_array<Rule>({
-        { .refuses = [](NodeConfig const& c) { return c.scheduler.empty(); },
+        { .refuses = [](NodeConfig const& c) { return c.schedulers.empty(); },
           .message = "--scheduler is required to install a service: a worker nothing knows about serves nobody, "
                      "and the registration would start and immediately exit at every boot." },
         // Conditional, where it used to be absolute. Registering a service before
@@ -2942,7 +2958,8 @@ namespace
     /// The value of a scalar dialled-address flag when it is not an address to dial.
     ///
     /// **One helper rather than three lambdas differing only in which member they
-    /// read.** `--scheduler`, `--upstream` and `--enroll-from` all ask the identical
+    /// read.** `--upstream` and `--enroll-from` -- and `--scheduler`, before it became
+    /// the list `ElementNotAnAddressToDial` reads -- all ask the identical
     /// question, and they asked it in three copy-pasted bodies inside
     /// `StartupPolicyRejection` -- branches diverging by a name, which this codebase
     /// treats as a defect on its own. It also cost that function real
@@ -2964,6 +2981,29 @@ namespace
         if (value.empty() || ParseDialEndpoint(value).has_value())
             return std::nullopt;
         return value;
+    }
+
+    /// The first element of a repeatable dialled-address flag that is not an address
+    /// to dial.
+    ///
+    /// Not `NotAnAddressToDial` over each element, because the two disagree about
+    /// EMPTY: for a scalar it means the flag was never given, while an empty element is
+    /// a value somebody typed (`--scheduler=`) and dials nothing. A list whose every
+    /// entry is good but one is still refused -- a fallback that can never answer is
+    /// discovered on the day it is needed, which is the day the entries before it are
+    /// gone.
+    /// @tparam Field The `NodeConfig` member holding the list.
+    /// @param cfg The parsed configuration.
+    /// @return The offending element, or nothing when every element is well formed.
+    template <auto Field>
+    [[nodiscard]] std::optional<std::string> ElementNotAnAddressToDial(NodeConfig const& cfg)
+    {
+        auto const& values = cfg.*Field;
+        auto const bad = std::ranges::find_if(
+            values, [](std::string const& value) { return value.empty() || !ParseDialEndpoint(value).has_value(); });
+        if (bad == values.end())
+            return std::nullopt;
+        return *bad;
     }
 } // namespace
 
@@ -3050,12 +3090,13 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
     //
     //     Both rows are "parses when GIVEN", never "must parse", exactly as the
     //     surface loop above spells it -- and for `--scheduler` that is not because
-    //     empty is legal (a rule below requires it) but because these two questions
-    //     belong to different rules. A shape row that also demanded presence would
-    //     answer "is not an address to dial" for a flag nobody typed, which describes
-    //     the wrong problem; `--upstream` really is legitimately empty, since a
-    //     machine with no shared cache gets `NoUpstream`, and one predicate covering
-    //     both is what keeps that difference out of this loop.
+    //     an empty LIST is legal (a rule below requires one) but because these two
+    //     questions belong to different rules. A shape row that also demanded presence
+    //     would answer "is not an address to dial" for a flag nobody typed, which
+    //     describes the wrong problem; `--upstream` really is legitimately empty, since
+    //     a machine with no shared cache gets `NoUpstream`. An empty ELEMENT of the
+    //     `--scheduler` list is different again -- somebody typed it -- and is refused
+    //     here as a shape (`ElementNotAnAddressToDial`).
     //   * `--fleet-member` is NOT dialled at all. It is matched against a peer's
     //     source address through `HostOfEndpoint`, which keeps an unsplittable value
     //     WHOLE on purpose -- a bare host is a legitimate spelling for a peer whose
@@ -3079,7 +3120,7 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
         /// The first value that fails this row's grammar, or nothing when all pass.
         ///
         /// A function rather than a member pointer, because the rows are not one
-        /// shape: two are `std::string` and one is a repeatable list, and a table
+        /// shape: two are `std::string` and two are repeatable lists, and a table
         /// that could only hold scalars would have left the list to a hand-written
         /// check beside it -- which is the fifth-place-the-map-lives failure #288
         /// records, one flag earlier.
@@ -3090,7 +3131,7 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
 
     constexpr auto DialledAddresses = std::to_array<DialledAddress>({
         { .flag = "--scheduler",
-          .offender = &NotAnAddressToDial<&NodeConfig::scheduler>,
+          .offender = &ElementNotAnAddressToDial<&NodeConfig::schedulers>,
           .shape = "an address to dial, as <host>:<port>" },
         { .flag = "--upstream",
           .offender = &NotAnAddressToDial<&NodeConfig::upstream>,
@@ -3231,7 +3272,9 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
         // no membership flags is untouched, which is what keeps the one-machine
         // deployment -- no advertise, loopback clients, and correct -- working.
         { .refuses =
-              [](NodeConfig const& c) { return !c.scheduler.empty() && NamesAMembershipPolicy(c) && AdvertisesWildcard(c); },
+              [](NodeConfig const& c) {
+                  return !c.schedulers.empty() && NamesAMembershipPolicy(c) && AdvertisesWildcard(c);
+              },
           .message = "--fleet-member and --fleet-open admit peers so that they can dial this worker, and --advertise "
                      "names no address they can dial: the wildcard resolves to "
                      "the CALLER's own machine. This worker would register, heartbeat, be leased out and never be "
@@ -3281,7 +3324,7 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
         // the package.
         { .refuses =
               [](NodeConfig const& c) {
-                  return !c.scheduler.empty() && NamesAMembershipPolicy(c) && AdvertisesLoopbackFromAReachableBind(c);
+                  return !c.schedulers.empty() && NamesAMembershipPolicy(c) && AdvertisesLoopbackFromAReachableBind(c);
               },
           .message = "--fleet-member and --fleet-open admit peers so that they can dial this worker, --listen-node "
                      "accepts from the network, and --advertise names loopback -- so every peer is told to dial "
@@ -3305,7 +3348,7 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
         // load-bearing and no configuration can be answered by the wrong one.
         { .refuses =
               [](NodeConfig const& c) {
-                  return !c.scheduler.empty() && NamesAMembershipPolicy(c) && AdvertisesPastALoopbackBind(c);
+                  return !c.schedulers.empty() && NamesAMembershipPolicy(c) && AdvertisesPastALoopbackBind(c);
               },
           .message = "--advertise names an address peers can dial, but --listen-node binds loopback, so this worker "
                      "would never accept the connections it told them to make: it registers, heartbeats, is leased "
@@ -3327,7 +3370,7 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
         // revised in one place.
         //
         // The admission gate is its three siblings' for the reason they give. Their
-        // `!c.scheduler.empty()` half is not repeated: `SchedulerIsRemote` asks a
+        // `!c.schedulers.empty()` half is not repeated: `SchedulerIsRemote` asks a
         // strictly stronger question, and a clause that can never decide anything is
         // one a reader has to prove harmless every time they meet it.
         //
@@ -3597,7 +3640,7 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
         // registers with itself, which is what the documented command line does
         // (`--serve-scheduler ... --scheduler=127.0.0.1:6675`). So this is not scoped
         // the way the advertise rows are.
-        { .refuses = [](NodeConfig const& c) { return c.scheduler.empty(); },
+        { .refuses = [](NodeConfig const& c) { return c.schedulers.empty(); },
           .message = "--scheduler is required: a worker nothing knows about serves nobody. This node would start, "
                      "bind its ports and sit there -- never registering, never leased, and never sent a job, with "
                      "nothing anywhere reporting a fault. Name the scheduler's --listen-node endpoint; a node that "

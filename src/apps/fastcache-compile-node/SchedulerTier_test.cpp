@@ -50,7 +50,7 @@ struct TierFixture
 [[nodiscard]] NodeConfig ClusteredNode()
 {
     NodeConfig cfg;
-    cfg.scheduler = "127.0.0.1:6675";
+    cfg.schedulers = { "127.0.0.1:6675" };
     cfg.serveScheduler = true;
     cfg.nodeId = "n1";
     cfg.raftListen = "127.0.0.1:6680";
@@ -62,7 +62,7 @@ struct TierFixture
 [[nodiscard]] NodeConfig LoneNode()
 {
     NodeConfig cfg;
-    cfg.scheduler = "127.0.0.1:6675";
+    cfg.schedulers = { "127.0.0.1:6675" };
     cfg.serveScheduler = true;
     return cfg;
 }
@@ -149,7 +149,7 @@ TEST_CASE("The scheduler tier follows the consensus switch, not the node id", "[
         // A node whose id is derived rather than typed still runs consensus, so a role
         // IS coming and claiming term 0 in the meantime is #613 again.
         NodeConfig cfg;
-        cfg.scheduler = "127.0.0.1:6675";
+        cfg.schedulers = { "127.0.0.1:6675" };
         cfg.serveScheduler = true;
         cfg.raftListen = "127.0.0.1:6680";
         NodeMembership membership { cfg, membershipLog };
@@ -165,7 +165,7 @@ TEST_CASE("The scheduler tier follows the consensus switch, not the node id", "[
         // refusing every verb until an election that will never happen is the failure
         // the control above exists to prevent.
         NodeConfig cfg;
-        cfg.scheduler = "127.0.0.1:6675";
+        cfg.schedulers = { "127.0.0.1:6675" };
         cfg.serveScheduler = true;
         cfg.nodeId = "n1";
         NodeMembership membership { cfg, membershipLog };
