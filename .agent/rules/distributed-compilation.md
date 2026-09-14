@@ -1987,8 +1987,9 @@ spelled it the same way, which is what makes this a drift rather than a discover
     what makes one bounded drain cover both -- `~WorkerServer` waits on a count both
     doors raise -- and it is why `main.cpp` declares the worker BEFORE the surface, so
     the listener stops admitting compiles before the drain starts counting them. The
-    responder asks `IsShuttingDown()` itself, because it has no accept loop whose
-    condition would have done it.
+    responder has no accept loop whose condition would stop admission, so the stop is
+    decided by `CompileCapacity::TryTakeSlot` itself -- together with the cordon and the
+    cap, in one locked step (#1303; see *The cordon* below).
   - **A merged door is an ADDITIONAL door onto one policy, never a relaxed one.**
     Membership is the accept loop's own `RefuseUnlessMember`, moved beside the refusal
     rows rather than restated, and the lease is checked where it always was, inside
@@ -2710,6 +2711,43 @@ crossed pair (both directions, with an uncrossed control, or a client that refus
 `Dispatch` against a real `WorkerProtocol` over a real `CompileJobRunner` through the
 real framing, with an empty argument and one containing a space. That last one is the
 only thing that would catch an encoding that drops a field on the way.
+
+## The cordon (#1303)
+
+A bounded stop abandons whatever outlives `--drain-timeout`, which is exactly the compile
+that was about to succeed. A cordon refuses new compiles, lets the running ones finish,
+and reports once when nothing is left. Four rules, each of which has a plausible wrong
+version that passes an obvious test:
+
+- **The cordon is the worker PROCESS's state** (`CompileCapacity`), never a replicated
+  entry and never a configuration value: a cordon that survived a restart would be a
+  machine that silently never came back. The scheduler learns it from the heartbeat
+  (`LoadFields::cordoned`), the heartbeat loop wakes on a change, and a cordoned worker
+  heartbeats straight after a (re)registration -- a registration carries no load, and a
+  new leader after an election is exactly who would otherwise believe it serving.
+  `--cordon`/`--uncordon` are on `notFromFile` and out of every service registration.
+- **"Drained" means DELIVERED.** `FrameEndpoint` writes a reply after the responder has
+  returned it, so a slot released at `Answer`'s `co_return` made the drained report --
+  and the stop's own drain -- claim nothing was owed while an 84 MB object was still
+  going out. The slot is an `IReplyHold` carried by `FrameReply`, released by the
+  endpoint right after `WriteAll` and by scope on every `break`. A test driving the
+  responder directly must KEEP the hold to see the property (`ReplyHold::Keep`); one that
+  lets `SyncRun`'s temporary die reads zero in flight under both builds.
+- **Admission is one locked decision** (`SlotAdmission`): stop, cordon and full are
+  decided under the drain mutex together with the take. A cordon checked BESIDE the take
+  lets a compile start after the cordon's own drained report, which then reports "stopping
+  abandons nothing" while it would abandon something. A stop outranks a cordon.
+- **A cordon is asked of LOCALITY, not membership.** A fleet member elsewhere is admitted
+  to compile here and must not be able to take this machine out of the fleet. The gate is
+  per verb inside `CompileResponder::RefusePeer`, so a compile from the same peer is still
+  admitted -- the case asserting both is what separates a per-verb gate from a surface-wide
+  one.
+
+`SlotLimit::Cordoned` is applied last in `SlotCeilingsFor` and named on every tie: the
+other limits lift themselves, a cordon only when a person acts, so naming `scratch` on a
+cordoned machine whose disk also filled sends an operator to the wrong fix. The refusal a
+cordoned worker answers is `NoCapacity` on the wire -- the client compiles locally either
+way -- and its own counter, because a stop ends by itself and a cordon does not.
 
 ## The enrollment window (#1298, #1299)
 

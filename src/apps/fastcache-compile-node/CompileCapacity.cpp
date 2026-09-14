@@ -148,11 +148,6 @@ void CompileCapacity::BeginShutdown() noexcept
     _shuttingDown.store(true, std::memory_order_release);
 }
 
-bool CompileCapacity::IsShuttingDown() const noexcept
-{
-    return _shuttingDown.load(std::memory_order_acquire);
-}
-
 std::size_t CompileCapacity::InFlight() const noexcept
 {
     return _inFlight.load(std::memory_order_acquire);

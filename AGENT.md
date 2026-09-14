@@ -454,7 +454,12 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
 - A drain waits on a condition variable, never `atomic::wait` — an atomic wait can return without
   the notify and free the object the notifier is still inside. And it calls `Shutdown()` first.
 - `AvailableSlots` folds four ceilings into one; `SlotCeilingsFor` is the same arithmetic with each
-  named, and a tie names the earlier limit in enumerator order.
+  named, and a tie names the earlier limit in enumerator order — except a cordon, applied last and
+  named on every tie.
+- A cordon is the worker PROCESS's state, never replicated and never persisted, so a restart lifts it;
+  the scheduler learns it from the heartbeat. Stop, cordon and full are ONE locked decision with the
+  slot take (`SlotAdmission`), and a compile's slot rides its reply (`IReplyHold`) until the endpoint
+  has WRITTEN it — "drained" means delivered, or a stop taken on the report cuts the last object off.
 - A heartbeat age is a duration on a report, never a `TimePoint` on `WorkerInfo` — a raw instant
   invites `steady_clock::now()` and breaks every `ManualClock` test.
 - A CoW store file is claimed exclusively at `Open` and a second opener is refused by name (`InUse`).

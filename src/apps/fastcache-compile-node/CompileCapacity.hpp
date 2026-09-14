@@ -222,9 +222,6 @@ class CompileCapacity
     /// closes the door.
     void BeginShutdown() noexcept;
 
-    /// @return Whether `BeginShutdown` has been called.
-    [[nodiscard]] bool IsShuttingDown() const noexcept;
-
     /// @return How many compiles are running now.
     [[nodiscard]] std::size_t InFlight() const noexcept;
 
