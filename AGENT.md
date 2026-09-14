@@ -559,7 +559,9 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
   build that pulses none.
 - `Status::Push` is the SECOND exception, `static_assert`ed to `Op::Subscribe` alone. A stream
   is PULLED: subscribers wake on the subject's tick grid and share one capture per tick, and a
-  parked push costs that subscriber one `Gap`, never a queue. It is re-gated EVERY tick, or
+  parked push costs that subscriber one `Gap`, never a queue. No reactor waits on another's
+  capture and no subscriber waits for a CLAIMED one: it sends the newest published capture it has
+  not read, or a capture slower than a tick starves it. It is re-gated EVERY tick, or
   removal fails open. The push hold is armed from the write's START, and a client leaves by
   HALF-closing, since a close with pushes unread is a reset.
 - A stream frame a reactor frees after its owner touches only what it owns: the active count is

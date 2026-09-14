@@ -81,6 +81,15 @@ Every rule below has already been a bug.
     once, as a `Gap`, how many whole cadences it missed. A per-subscriber queue was the first
     design. It holds memory for exactly the watcher that is not reading, and its drop policy
     is a second decision about staleness that the tick grid already makes.
+  - **No reactor waits on another reactor's capture, and no subscriber waits for a CLAIMED one.**
+    The capture is shared by every reactor of a daemon, so it is claimed with an atomic exchange
+    and published under a lock held for the pointer copy alone; a lock across the capture stopped
+    every other reactor's thread for as long as a storage walk took. And a subscriber that loses
+    the claim sends the newest PUBLISHED capture it has not read, labelled and cursored by the tick
+    it was captured on. Looking again for the claimed one is the obvious repair, and it STARVES: a
+    capture slower than a tick is claimed again the moment it is published, so a subscriber on
+    another reactor finds it claimed on every look. A two-reactor case on real threads showed that
+    red after the lock was gone; `LiveStream_test` pins it on one clock.
   - **A stream is re-gated EVERY tick, not only when it opens.** Membership, leadership and
     the daemon's credential policy are all asked again, because removal is the direction that
     fails OPEN and nothing reports it. The credential is re-asked on the command loop's own
