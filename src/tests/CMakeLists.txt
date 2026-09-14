@@ -6680,6 +6680,41 @@ set_tests_properties("vendor-link-roots-selftest" PROPERTIES
     TIMEOUT 60
 )
 
+# ----------------------------------------------------------------------------
+# VENDOR.md's file and line counts are the tree's (#1376).
+#
+# The copy's size, the supporting files beside `tui` and how many are headers were prose maintained by
+# hand beside a hand-maintained file set, and they drifted (`ac102948` corrected the line count after a
+# local change added a test file). Recomputed from the tree and `vendor/MANIFEST`; a stated figure that
+# differs, or a figure phrase the check cannot find, is refused. `docs-subject` as well as `hygiene`:
+# the subject is a document, and prose drifts by being edited as well as by the tree moving.
+add_test(
+    NAME "vendor-figures"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-vendor-figures.cmake"
+)
+set_tests_properties("vendor-figures" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene;docs-subject"
+    TIMEOUT 60
+)
+
+# Both directions against synthetic trees, with `ac102948`'s drift as a planted case and an accepting
+# case that wraps a figure sentence and groups thousands, so a check refusing everything cannot pass.
+add_test(
+    NAME "vendor-figures-selftest"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DFASTCACHED_SCRATCH_DIR=${CMAKE_CURRENT_BINARY_DIR}/vendor-figures-selftest"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-vendor-figures-selftest.cmake"
+)
+set_tests_properties("vendor-figures-selftest" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 60
+)
+
 # The vendored TUI runtime's own tests (#1374). Declared in `vendor/CMakeLists.txt`,
 # registered HERE because `add_subdirectory(vendor)` runs before `enable_testing()`
 # -- an `add_test` in that file builds a binary that never runs and reports nothing,

@@ -36,22 +36,52 @@ contour, not against endo.** They were verified byte-identical between contour
 Both repositories are Apache-2.0, and so is this copy. `endo/tui` was last touched
 upstream at `37d875f8` (2026-08-15).
 
-`src/tui` upstream is 154 files and ~46k lines; with the nineteen supporting files below and
-three local changes' new test files ("Local changes") the copy is **176 files, 49,467 lines**.
+`src/tui` upstream is 154 files and ~46k lines; with the 19 supporting files below and
+3 local changes' new test files ("Local changes") the copy is **176 files, 49,467 lines**.
+Those figures, and the ones in the next section, are recomputed from the tree and `MANIFEST`
+by `ctest -R vendor-figures`, which refuses a sentence that no longer describes the copy.
 
-## The nineteen supporting files
+## The supporting files
 
-`tui` does not stand alone: it includes headers from three sibling libraries. The
-set copied here is the **measured transitive closure** of those includes — every
-non-`tui`, non-system header reachable from `src/tui`, followed until it
-terminates. It is nineteen files and 2,438 lines: thirteen headers, plus **six
+`tui` does not stand alone: it includes headers from three sibling libraries. What is
+copied here is decided in two halves by two different instruments, and only the second is
+the completeness criterion (#1376):
+
+- **The headers are the measured transitive include closure** — every non-`tui`,
+  non-system header reachable from `src/tui`, followed until it terminates.
+- **The implementation files are whatever the LINK needs.** The set is complete when every
+  vendored translation unit that any target of this build compiles links into an executable
+  with nothing unresolved. `fastcache-tui-linkprobe` is that link for the library's objects
+  and each vendored test binary is it for its own; the configure refuses a vendored `.cpp`
+  compiled anywhere no link checks, so the probe's root follows the build; and
+  `ctest -R vendor-tui-link-closure-refuses` watches the probe FAIL on every run with
+  `platform/SignalHandler.cpp` left out, because a guard nobody watches refuse is not known
+  to work.
+
+It is 19 files and 2,438 lines: 13 headers, plus **6
 implementation files** — the three per-platform implementations of
 `endo::platform::Wakeup`, which `tui/platform/TerminalInput.cpp` calls into,
 `platform/SignalHandler.cpp`, which `tui/runtime/` calls into, and
 `platform/{SystemPipe,WinsockInit}.cpp`, which only the vendored runtime TESTS
 reach. None of them reaches any further into either upstream.
 
-**Thirteen of the nineteen are header-only, and the closure has been wrong about
+That number is worth stating because the obvious estimate is an order of magnitude
+larger. `coro` and `endo-platform` are together about 12,000 lines, and "vendor the
+libraries `tui` links" would have meant taking all of it. `tui` reaches a small leaf
+set of them, so that is what is here.
+
+**What the criterion does NOT cover**, so a green probe is not read as more than it is:
+
+- **A symbol referenced only by code nobody compiles.** The `unreached` widgets
+  `vendor/CMakeLists.txt` names may need implementations this tree lacks, and nothing here
+  will say so until one of them is built — at which point the probe will.
+- **A definition a header carries inline, or a template instantiates.** The compiler
+  answers for those, and a link has nothing to add.
+- **Whether a vendored file is NEEDED.** A file nothing references links cleanly;
+  over-vendoring is not a completeness failure and this does not look for it.
+- **Behaviour.** A symbol that resolves to the wrong implementation links too.
+
+**13 of the 19 are header-only, and the closure has been wrong about
 that three times — read past the first, because they are not the same mistake.**
 
 The first: `platform/Wakeup.hpp` declares a class whose methods are defined
@@ -73,19 +103,15 @@ a file from a fixed one — adding test translation units enlarged what the clos
 is a closure OF, and a set that was complete stopped being complete without
 changing. It also cascaded one level, which neither earlier miss did.
 
-So the sentence above — *the measured transitive closure of those includes* —
-describes the thirteen headers and **cannot** describe the six `.cpp` files, which
-were hand-picked. That `plus` is the unguarded part of this criterion, and
-**a closure is only ever complete with respect to the root it was walked from**;
-an upstream project's target boundaries are invisible from inside its source tree,
-and the root moves whenever the build takes on new translation units.
-`fastcache-tui-linkprobe` found the first two and the test link found the third:
-each named its gap in one link, where reading finds none of them.
-
-That number is worth stating because the obvious estimate is an order of magnitude
-larger. `coro` and `endo-platform` are together about 12,000 lines, and "vendor the
-libraries `tui` links" would have meant taking all of it. `tui` reaches a small leaf
-set of them, so that is what is here.
+Until #1376 this section called the whole set *the measured transitive closure of
+those includes*, which describes the 13 headers and **cannot** describe the 6 `.cpp`
+files: they were hand-picked, and that was the unguarded part. **A closure is only ever
+complete with respect to the root it was walked from**; an upstream project's target
+boundaries are invisible from inside its source tree, and the root moves whenever the
+build takes on new translation units. `fastcache-tui-linkprobe` found the first two and
+the test link found the third — each named its gap in one link, where reading found none
+of them. That is why the criterion is now the link itself, over a root the build derives
+rather than one this document restates.
 
 ## Two of some things — read this before using any of it
 
