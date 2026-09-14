@@ -335,7 +335,7 @@ if(FASTCACHED_BUILD_TESTS)
     # *skipped* (#1128) -- the same two states collapsed again, silently. It stays
     # because every alternative measured worse; see the top of the top-level
     # CMakeLists, and #1152 for the fix.
-    catch_discover_tests(fastcache-cc-tests PROPERTIES SKIP_RETURN_CODE 4)
+    catch_discover_tests(fastcache-cc-tests PROPERTIES SKIP_RETURN_CODE 4 ENVIRONMENT_MODIFICATION "${FASTCACHED_ERROR_DIALOG_ENVIRONMENT}")
 
     # ---------------------------------------------------------------------
     # The end-to-end compile-cache test (`compile-cache-e2e`) used to be

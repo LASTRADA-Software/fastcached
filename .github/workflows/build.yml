@@ -1012,10 +1012,11 @@ jobs:
           MERGE_GROUP_BASE_SHA: ${{ github.event.merge_group.base_sha }}
         run: |
           set -euo pipefail
-          # Leg scope = ticket scope = check scope, from ONE table. The six units
-          # this leg covers are the rows `scripts/tidy-blind-spots.txt` says it
+          # Leg scope = ticket scope = check scope, from ONE table. The units this
+          # leg covers are the rows `scripts/tidy-blind-spots.txt` says it
           # reaches, so what is swept and what the coverage check measures cannot
-          # drift apart -- they are the same data.
+          # drift apart -- they are the same data. Their count is the notice below
+          # and is not written here: a row added to the table changes it.
           only="$(mktemp)"
           grep -v '^[[:space:]]*#' scripts/tidy-blind-spots.txt | grep . \
             | awk -F'\t' '$2 ~ /clang-tidy-windows/ { print $1 }' > "$only"

@@ -61,8 +61,6 @@
 #include <utility>
 #include <vector>
 
-#include <tests/WindowsErrorPopups.hpp>
-
 namespace
 {
 
@@ -172,10 +170,6 @@ FastCache::DetachedTask DoubleArmTheWriteSlot(FastCache::PlatformReactor* reacto
 
 int main()
 {
-    // Several canaries here exist to be SEEN aborting, so on Windows the modal CRT
-    // dialog is what happens on a successful run, not an edge case.
-    FastCache::Testing::SuppressWindowsErrorPopups();
-
     FastCache::SteadyClock clock;
     FastCache::PlatformReactor reactor { clock };
 

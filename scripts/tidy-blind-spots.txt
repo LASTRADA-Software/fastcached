@@ -24,6 +24,7 @@ src/FastCache/Net/IocpConnector.cpp	clang-tidy-windows	`#if defined(_WIN32)`
 src/FastCache/Net/IocpConnector_test.cpp	clang-tidy-windows	`#if defined(_WIN32)`
 src/FastCache/Net/IocpSocket.cpp	clang-tidy-windows	`#if defined(_WIN32)`
 src/FastCache/Net/IocpSocket_test.cpp	clang-tidy-windows	`#if defined(_WIN32)`
+src/tests/ErrorPopupsAtStartup.cpp	clang-tidy-windows	`#if defined(_MSC_VER)`: the startup object installs nothing off the MSVC CRT (#1389)
 src/FastCache/Async/KqueueReactor.cpp	none	`#if defined(__APPLE__)`; no macOS analyser leg exists
 src/FastCache/Async/KqueueReactor_test.cpp	none	`#if defined(__APPLE__)`; no macOS analyser leg exists
 src/FastCache/Net/KqueueConnector.cpp	none	`#if defined(__APPLE__)`; no macOS analyser leg exists

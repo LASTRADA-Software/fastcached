@@ -34,5 +34,5 @@ if(FASTCACHED_BUILD_TESTS)
     # and are worse; the argument is at the top of the top-level CMakeLists and the
     # fix is #1152. `catch-skip-return-code` enforces the property, and its green does
     # not mean the property is sound.
-    catch_discover_tests(compile-cache-testclient-tests PROPERTIES SKIP_RETURN_CODE 4)
+    catch_discover_tests(compile-cache-testclient-tests PROPERTIES SKIP_RETURN_CODE 4 ENVIRONMENT_MODIFICATION "${FASTCACHED_ERROR_DIALOG_ENVIRONMENT}")
 endif()

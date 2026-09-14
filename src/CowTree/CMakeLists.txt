@@ -66,10 +66,6 @@ if(FASTCACHED_BUILD_TESTS)
             Catch2::Catch2
     )
 
-    # <tests/WindowsErrorPopups.hpp>: this links CowTree rather than FastCache, and it
-    # is FastCache that carries src/ as a PUBLIC include directory.
-    target_include_directories(CowTreeTests PRIVATE "${CMAKE_SOURCE_DIR}/src")
-
     # Catch.cmake (catch_discover_tests) is placed on CMAKE_MODULE_PATH by the
     # top-level CMakeLists, regardless of whether Catch2 came from CPM source
     # or a system find_package.
@@ -81,7 +77,7 @@ if(FASTCACHED_BUILD_TESTS)
     # and are worse; the argument is at the top of the top-level CMakeLists and the
     # fix is #1152. `catch-skip-return-code` enforces the property, and its green does
     # not mean the property is sound.
-    catch_discover_tests(CowTreeTests PROPERTIES SKIP_RETURN_CODE 4)
+    catch_discover_tests(CowTreeTests PROPERTIES SKIP_RETURN_CODE 4 ENVIRONMENT_MODIFICATION "${FASTCACHED_ERROR_DIALOG_ENVIRONMENT}")
 
     # -----------------------------------------------------------------------
     # A per-case TIMEOUT for the two cases whose guard, if removed, HANGS.

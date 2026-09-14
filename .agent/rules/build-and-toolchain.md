@@ -2015,9 +2015,13 @@ live on master indefinitely with every status check green (#315).
 - **A non-zero exit is not proof.** The gate requires the runtime's own
   `subscript out of range` diagnostic, exactly as the TSan gate requires
   `data race`: a canary that died of something else is a canary proving nothing.
-- **The canary sets its own CRT report modes**, and that is load-bearing rather
-  than defensive: an unhandled debug assertion pops a modal dialog, and on a
-  runner that means the job hangs to its timeout instead of failing in a second.
+- **The canary's CRT report modes are set before it runs**, and that is load-bearing
+  rather than defensive: an unhandled debug assertion pops a modal dialog, and on a
+  runner that means the job hangs to its timeout instead of failing in a second. It
+  used to set them in its own `main`, as every program here did -- which is exactly
+  why four test binaries on `Catch2::Catch2WithMain` set nothing. The build now
+  attaches one translation unit to every executable instead; see
+  *No executable raises a modal error dialog* below (#1389).
 - **A third leg rather than replacing a Release one, and that was measured.** No
   Windows leg is the longest job in any sampled pull-request run, so this leg costs
   runner-minutes and no wall clock, and giving up a Release configuration to buy
@@ -2034,6 +2038,69 @@ live on master indefinitely with every status check green (#315).
   platform-guarded registration is indistinguishable from a lost one when you look
   at a single platform's `ctest -N`. Check a listing where it *should* be missing
   and one where it should not, and confirm a neighbouring test is still present.
+
+### No executable raises a modal error dialog, and the BUILD installs that, never each `main` (#1389)
+
+A failed `assert()`, an iterator-debug check or an `abort()` in a Debug CRT opens a dialog
+and waits for a click. That does not fail a test: it hangs it, to ctest's `TIMEOUT` on a
+desktop and to the job's limit on a runner, where it reads as a slow job. An `endo` test
+hung 58 minutes that way.
+
+`src/tests/WindowsErrorPopups.hpp` already knew how to switch it off. What it could not do
+was reach a `main` this project did not write: it was the first statement of every `main`
+here, and four test binaries link `Catch2::Catch2WithMain`, so they set nothing.
+
+- **So the build attaches it, the way `cmake/Utf8CodePage.cmake` attaches the UTF-8
+  manifest.** `cmake/ErrorPopups.cmake` walks every executable under `src/` and `vendor/`
+  and adds `src/tests/ErrorPopupsAtStartup.cpp`, whose constructor runs in the
+  `init_seg(lib)` segment: after the CRT's own initialisation, before every user static
+  initialiser, so an object that asserts while it is constructed is covered too. The
+  per-`main` calls are gone. A second mechanism for one property is how the copies drifted
+  last time.
+- **What proves it is the ARTEFACT, not the walk.** `ctest -R error-popup-coverage` reads
+  the walk's manifest, every `CTestTestfile.cmake` and `build.ninja`. An executable counts
+  as launched when its path appears in a registration -- as the command or as an argument a
+  script is handed -- or a `catch_discover_tests` include file carries its name. It is
+  covered when this configuration's link edge names the object. It refuses a launched
+  executable that is neither covered nor exempt, and it refuses whenever it cannot ask:
+  no manifest, an empty one, or an anchor that is not proven. A target defined after the
+  walk, or outside its roots, is exactly what it catches, and no `CMakeLists.txt` would
+  read wrong. **The census is NOT taken through the walk**: its first version was, and
+  dropping `vendor` from the walk's roots left the check green over an unsuppressed
+  `fastcache-tui-tests` -- a list derived by the thing it checks is exact about what that
+  thing reached and silent about the rest. It is taken at the end of configure over the
+  whole source tree; measured since, the same neuter is refused by name, and so is moving
+  the walk ahead of `src/tests`.
+- **The runtime is asked separately.** `error-popup-canary` links `Catch2WithMain` on
+  purpose and fails a Debug assert. Its gate requires the process to END, with the
+  assertion's own text, inside a bound. Measured at `1151a588`, in `cl-debug`: with the
+  object, exit 3 in under a second. With it removed, the process was alive after five
+  seconds and owned a visible window titled `Microsoft Visual C++ Runtime Library`, and
+  the gate refused at 60 s. **The assertion text was on stderr in BOTH runs** -- the dialog
+  held the process after the text was written -- so a gate that read only the text would
+  have passed the hang. It checks the process ENDED first.
+- **Product binaries count, because tests spawn them**: `fastcached`, `fastcache-cc`,
+  `fastcache-compile-node` and `fastcache-cli` are all handed to e2e scripts, and the
+  check finds them through those arguments. **But a product binary suppresses only when
+  asked**, by `FASTCACHED_SUPPRESS_ERROR_DIALOGS` in its environment: a developer running a
+  Debug `fastcached` by hand keeps the dialog and the debugger it offers, which is what a
+  Debug build is for. The first draft here suppressed in every Debug product binary and
+  took exactly that away. **Every registered test sets the variable**, so a binary a
+  fixture spawns inherits it: a deferred walk sets it on each `add_test`, and each
+  `catch_discover_tests` names `FASTCACHED_ERROR_DIALOG_ENVIRONMENT` itself, because its
+  registrations do not exist at configure time. The check reads both kinds of generated
+  registration and refuses a test that does not set it. `error-popup-product-canary` is
+  built as a product binary is, and its gate requires both directions -- routed to a file
+  with the variable, left on the dialog without -- since either alone is satisfied by a
+  wrong policy. It REPORTS the assert report mode rather than asserting, so the
+  unsuppressed direction opens no dialog on a desktop and proves something on a runner that
+  has none. This is the mechanism `endo` proved.
+- **An exemption is a reason on the target itself**, never a row in a list:
+  `set_target_properties(<t> PROPERTIES FASTCACHED_ERROR_POPUPS "<why>")`. The walk skips
+  it and the check prints the reason. Nothing is exempt today.
+- **Not covered, and not this project's to cover**: a program the build does not define.
+  The compilers the launcher spawns, `pwsh`, `git` and `cmake` itself are not in the
+  manifest and are not checked.
 
 ## What CI costs
 

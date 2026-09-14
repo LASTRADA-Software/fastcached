@@ -462,6 +462,7 @@ include(Sanitizers)
 include(Coverage)
 include(ClangTidy)
 include(Utf8CodePage)
+include(ErrorPopups)
 
 # ----------------------------------------------------------------------------
 # Test wiring is enabled early so all subdirectories (CowTree, FastCache,
@@ -617,6 +618,13 @@ endif()
 # cmake/Utf8CodePage.cmake carries why the code page is what gets declared.
 
 fastcached_declare_utf8_code_page()
+
+# ----------------------------------------------------------------------------
+# No executable raises a modal error dialog on Windows (#1389), attached by the same
+# walk and for the same reason as the code page above. cmake/ErrorPopups.cmake, which is
+# included with the other helpers so every test registration can name its variable.
+
+fastcached_suppress_error_popups()
 
 # ----------------------------------------------------------------------------
 # The `coverage` / `coverage-clean` targets, when ENABLE_COVERAGE is on. Last in

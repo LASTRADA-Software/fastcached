@@ -28,6 +28,15 @@ namespace FastCache::Testing
 /// `empty-read-buffer-canary`, `reactor-teardown-canary`), so for them the dialog is
 /// not an edge case — it is what happens on every successful run.
 ///
+/// ## Nobody calls this directly any more (#1389)
+///
+/// `cmake/ErrorPopups.cmake` attaches `ErrorPopupsAtStartup.cpp` to every executable the
+/// build defines, and that one translation unit calls this during static initialisation.
+/// It used to be the first statement of each `main` this project wrote, and four test
+/// binaries link `Catch2::Catch2WithMain` -- a `main` nobody here wrote -- so they set
+/// nothing, and an assert in any of them waited on a dialog. `ctest -R error-popup-coverage`
+/// refuses an executable a test launches whose link line lacks the object.
+///
 /// ## Why this is a shared header and not a copied block
 ///
 /// It was copied, four times, and **it had already drifted**: `src/tests/test_main.cpp`
