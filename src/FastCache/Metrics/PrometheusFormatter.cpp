@@ -152,6 +152,43 @@ static void AppendHostMetrics(std::string& out, HostCapacity const& host)
         Append(out, metric);
 }
 
+/// Render what a machine is doing right now.
+///
+/// Each figure renders only when the platform reported it: a series that is missing says the
+/// machine would not say, where a zero would say it is idle or out of memory.
+///
+/// The CPU figures are COUNTERS in platform ticks, and a tick is a different length on every
+/// platform, so neither series means anything alone. What does is the ratio of their two
+/// rates -- `rate(busy) / rate(total)` is the machine's busy share over whatever window the
+/// reader chose, which is the arithmetic `CpuBusyPermille` does over two readings.
+/// @param out Destination.
+/// @param load The machine's load.
+static void AppendHostLoadMetrics(std::string& out, HostLoadReading const& load)
+{
+    if (load.cpu.has_value())
+    {
+        Append(out,
+               Metric { .name = "fastcache_node_cpu_busy_ticks_total",
+                        .help = "Host-wide CPU ticks spent doing anything but idling, compiles included. Platform "
+                                "ticks: read only as rate() of this over rate() of fastcache_node_cpu_ticks_total.",
+                        .type = MetricType::Counter,
+                        .value = load.cpu->busy });
+        Append(out,
+               Metric { .name = "fastcache_node_cpu_ticks_total",
+                        .help = "Host-wide CPU ticks accounted for at all; the denominator of "
+                                "fastcache_node_cpu_busy_ticks_total.",
+                        .type = MetricType::Counter,
+                        .value = load.cpu->total });
+    }
+    if (load.availableMemoryBytes.has_value())
+        Append(out,
+               Metric { .name = "fastcache_node_memory_available_bytes",
+                        .help = "Memory a new process could actually obtain: available, not free, so the page cache "
+                                "the kernel hands back on demand counts.",
+                        .type = MetricType::Gauge,
+                        .value = *load.availableMemoryBytes });
+}
+
 /// Render the metrics a cache's own statistics carry.
 ///
 /// Separate from the sink's counters because the two have different *sources*,
@@ -457,6 +494,10 @@ std::string RenderPrometheus(StatsReading const& reading)
     // rather than reporting cores it does not schedule against.
     if (snapshot.host.has_value())
         AppendHostMetrics(out, *snapshot.host);
+
+    // And what it is doing now, from the same process and for the same reason.
+    if (snapshot.hostLoad.has_value())
+        AppendHostLoadMetrics(out, *snapshot.hostLoad);
 
     // And whether this node reads through to a shared cache. Only a process that
     // has an answer says anything: the daemon is the shared cache and has none.

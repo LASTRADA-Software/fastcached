@@ -2254,7 +2254,7 @@ exposition cannot drift apart again without a red build.
 **What this machine is, and how loaded it is.** Rendered only by a process that has a
 capacity to report, so a daemon emits none of them — `MetricsSnapshot::host` is absent
 there rather than zeroed, because cores a daemon does not schedule against are not a
-fact about it. These are gauges, not counters.
+fact about it. These are gauges, not counters, except the two CPU tick series.
 
 | Series | Says |
 |---|---|
@@ -2264,6 +2264,16 @@ fact about it. These are gauges, not counters.
 | `fastcache_node_disk_free_bytes` | Space on that filesystem an unprivileged process may still write. |
 | `fastcache_node_slots_configured` | Concurrent compiles this node advertises to the scheduler. |
 | `fastcache_node_slots_busy` | Compiles running right now — **sampled**, so it is a reading and not a difference of two counters. |
+| `fastcache_node_cpu_busy_ticks_total` | Host-wide CPU ticks spent doing anything but idling, this node's own compiles included. A **counter** in platform ticks, whose length differs per platform, so it means nothing alone: `rate(fastcache_node_cpu_busy_ticks_total[1m]) / rate(fastcache_node_cpu_ticks_total[1m])` is the machine's busy share. Absent when the platform would not report its CPU. |
+| `fastcache_node_cpu_ticks_total` | Host-wide CPU ticks accounted for at all: the denominator of the row above. |
+| `fastcache_node_memory_available_bytes` | Memory a new process could actually obtain: *available*, not free, so the page cache the kernel hands back on demand counts. Absent when the platform would not say. |
+
+The CPU figures are raw counters rather than a utilization on purpose. A utilization is a
+difference between two readings, so the node would have to hold the earlier one, and the
+scrape, every `fastcache-cli live-stats` subscriber and the node's own heartbeat would then
+each read whatever interval the last of them left. Every reader takes its own difference
+instead, which is also what `live-stats` does to name the limit a node's free slots are
+bound by.
 
 **What this node counts as its own cluster.** Rendered only by a node that runs
 consensus — a node started without `--listen-raft` leads itself, holds no

@@ -344,6 +344,83 @@ TEST_CASE("A node with no cache tier reports no cache", "[node][admin][cache]")
     CHECK(Unwrap(snapshot.host).busySlots == 2);
 }
 
+namespace
+{
+/// A counter source whose readings advance by a fixed step per call, so a second snapshot is
+/// seen to be a second READ rather than the first one remembered.
+class SteppingCounters final: public IHostCounterSource
+{
+  public:
+    [[nodiscard]] std::optional<CpuTicks> Cpu() override
+    {
+        ++_calls;
+        return CpuTicks { .busy = 100 * _calls, .total = 1000 * _calls };
+    }
+    [[nodiscard]] std::optional<std::uint64_t> AvailableMemoryBytes() override
+    {
+        return std::nullopt;
+    }
+    [[nodiscard]] std::optional<std::uint64_t> FreeScratchBytes() override
+    {
+        return 1;
+    }
+
+  private:
+    std::uint64_t _calls { 0 };
+};
+} // namespace
+
+TEST_CASE("A node's snapshot carries the raw load counters, read per snapshot", "[node][admin]")
+{
+    // Raw, and read again per snapshot: a utilization would need a baseline, and a baseline the
+    // scrape, every subscriber and the heartbeat all move is an interval nobody can read. Each
+    // reader differences its own two readings instead.
+    ScrapeHost host;
+    SteppingCounters counters;
+    auto const provider = MakeNodeSnapshotProvider(NodeScrapeSources { .host = &host,
+                                                                       .load = &counters,
+                                                                       .busySlots = [] { return std::size_t { 1 }; },
+                                                                       .cache = nullptr,
+                                                                       .slots = 4,
+                                                                       .scratchRoot = std::filesystem::path { "." },
+                                                                       .consensus = {} },
+                                                   std::chrono::steady_clock::now());
+
+    auto const first = provider();
+    REQUIRE(first.hostLoad.has_value());
+    CHECK(Unwrap(first.hostLoad).cpu == std::optional { CpuTicks { .busy = 100, .total = 1000 } });
+    // What the platform would not say stays unsaid, never a zero.
+    CHECK_FALSE(Unwrap(first.hostLoad).availableMemoryBytes.has_value());
+
+    auto const second = provider();
+    REQUIRE(second.hostLoad.has_value());
+    CHECK(Unwrap(second.hostLoad).cpu == std::optional { CpuTicks { .busy = 200, .total = 2000 } });
+    // And the pair is exactly what a reader needs: 10% busy over the interval between them.
+    CHECK(CpuBusyPermille(Unwrap(Unwrap(first.hostLoad).cpu), Unwrap(Unwrap(second.hostLoad).cpu))
+          == std::optional<std::uint32_t> { 100 });
+
+    // The free space a snapshot reports is the host's, not the counter source's: one figure
+    // for one fact.
+    REQUIRE(second.host.has_value());
+    CHECK(Unwrap(second.host).diskFreeBytes == 400);
+}
+
+TEST_CASE("A node snapshot with no load source carries no load block", "[node][admin]")
+{
+    ScrapeHost host;
+    auto const provider = MakeNodeSnapshotProvider(NodeScrapeSources { .host = &host,
+                                                                       .busySlots = [] { return std::size_t { 0 }; },
+                                                                       .cache = nullptr,
+                                                                       .slots = 4,
+                                                                       .scratchRoot = std::filesystem::path { "." },
+                                                                       .consensus = {} },
+                                                   std::chrono::steady_clock::now());
+    auto const snapshot = provider();
+    CHECK_FALSE(snapshot.hostLoad.has_value());
+    // The positive control: the snapshot is not simply empty.
+    CHECK(snapshot.host.has_value());
+}
+
 TEST_CASE("A scrape renders nothing for a cache the node does not have", "[node][admin][cache]")
 {
     // End to end through the renderer, because the absence has to survive it too: a

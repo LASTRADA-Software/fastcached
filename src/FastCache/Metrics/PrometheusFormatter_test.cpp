@@ -229,6 +229,58 @@ TEST_CASE("A compile node reports its size, and a cache daemon does not", "[metr
     CHECK_FALSE(withoutHost.contains("# TYPE fastcache_node_slots_busy"));
 }
 
+TEST_CASE("A compile node reports what its machine is doing, each figure only when it was read", "[metrics][prometheus]")
+{
+    // The figures a node's available slots are decided by. Each renders only when the platform
+    // answered: a missing CPU series says the machine would not say, where a zero would say it
+    // is idle -- the one reading a scheduler acts on by sending more work.
+    AtomicMetricsSink metrics;
+
+    auto const both =
+        RenderPrometheus(metrics,
+                         MetricsSnapshot { .storage = std::nullopt,
+                                           .host = std::nullopt,
+                                           .hostLoad = HostLoadReading { .cpu = CpuTicks { .busy = 4242, .total = 10000 },
+                                                                         .availableMemoryBytes = 17179869184ULL },
+                                           .uptime = Uptime { 1s } });
+    CHECK(both.contains("# TYPE fastcache_node_cpu_busy_ticks_total counter\n"));
+    CHECK(both.contains("fastcache_node_cpu_busy_ticks_total 4242\n"));
+    CHECK(both.contains("# TYPE fastcache_node_cpu_ticks_total counter\n"));
+    CHECK(both.contains("fastcache_node_cpu_ticks_total 10000\n"));
+    CHECK(both.contains("# TYPE fastcache_node_memory_available_bytes gauge\n"));
+    CHECK(both.contains("fastcache_node_memory_available_bytes 17179869184\n"));
+
+    // CPU unreadable, memory read: the CPU series are absent and the memory one is not.
+    auto const noCpu =
+        RenderPrometheus(metrics,
+                         MetricsSnapshot { .storage = std::nullopt,
+                                           .host = std::nullopt,
+                                           .hostLoad = HostLoadReading { .cpu = std::nullopt, .availableMemoryBytes = 1024 },
+                                           .uptime = Uptime { 1s } });
+    CHECK_FALSE(noCpu.contains("# TYPE fastcache_node_cpu_busy_ticks_total"));
+    CHECK_FALSE(noCpu.contains("# TYPE fastcache_node_cpu_ticks_total"));
+    CHECK(noCpu.contains("fastcache_node_memory_available_bytes 1024\n"));
+
+    // And the mirror, so the memory row is shown to be conditional on its own figure.
+    auto const noMemory =
+        RenderPrometheus(metrics,
+                         MetricsSnapshot { .storage = std::nullopt,
+                                           .host = std::nullopt,
+                                           .hostLoad = HostLoadReading { .cpu = CpuTicks { .busy = 1, .total = 2 },
+                                                                         .availableMemoryBytes = std::nullopt },
+                                           .uptime = Uptime { 1s } });
+    CHECK(noMemory.contains("fastcache_node_cpu_ticks_total 2\n"));
+    CHECK_FALSE(noMemory.contains("# TYPE fastcache_node_memory_available_bytes"));
+
+    // The daemon samples no load at all and renders none of the three.
+    auto const daemon = RenderPrometheus(
+        metrics, MetricsSnapshot { .storage = StorageStats {}, .host = std::nullopt, .uptime = Uptime { 1s } });
+    CHECK_FALSE(daemon.contains("# TYPE fastcache_node_cpu_"));
+    CHECK_FALSE(daemon.contains("# TYPE fastcache_node_memory_available_bytes"));
+    // The positive control: the daemon's scrape is not empty.
+    CHECK(daemon.contains("# TYPE fastcached_uptime_seconds"));
+}
+
 TEST_CASE("A tiered cache renders one labelled sample per tier", "[metrics][prometheus][storage-tier]")
 {
     // The numbers `MetricsSnapshot::storage` cannot carry. `LayeredStorage`

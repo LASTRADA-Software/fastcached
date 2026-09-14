@@ -25,9 +25,18 @@ namespace
     constexpr std::uint8_t HostPresent = 1U << 1U;      ///< `MetricsSnapshot::host`.
     constexpr std::uint8_t UpstreamPresent = 1U << 2U;  ///< `MetricsSnapshot::upstreamConfigured`.
     constexpr std::uint8_t ConsensusPresent = 1U << 3U; ///< `MetricsSnapshot::consensus`.
+    constexpr std::uint8_t HostLoadPresent = 1U << 4U;  ///< `MetricsSnapshot::hostLoad`.
 
     /// Every bit a presence byte may carry; anything else is `Malformed`.
-    constexpr std::uint8_t KnownPresenceBits = StoragePresent | HostPresent | UpstreamPresent | ConsensusPresent;
+    constexpr std::uint8_t KnownPresenceBits =
+        StoragePresent | HostPresent | UpstreamPresent | ConsensusPresent | HostLoadPresent;
+
+    // Presence bits inside a host-load block, in the order its figures travel.
+    constexpr std::uint8_t CpuPresent = 1U << 0U;             ///< `HostLoadReading::cpu`.
+    constexpr std::uint8_t AvailableMemoryPresent = 1U << 1U; ///< `HostLoadReading::availableMemoryBytes`.
+
+    /// Every bit a host-load presence byte may carry; anything else is `Malformed`.
+    constexpr std::uint8_t KnownHostLoadBits = CpuPresent | AvailableMemoryPresent;
 
     /// Bytes a bitmap over @p count items occupies.
     [[nodiscard]] constexpr std::size_t BitmapBytes(std::size_t count) noexcept
@@ -203,11 +212,12 @@ std::vector<std::byte> EncodeStatsReading(StatsReading const& reading)
 
     // Structured bindings, so a field added to either struct stops this compiling until it is
     // given a place in the grammar and a name in `SnapshotFieldNames` / `ConsensusFieldNames`.
-    auto const& [storage, storageTiers, host, upstreamConfigured, consensus, uptime] = snapshot;
+    auto const& [storage, storageTiers, host, hostLoad, upstreamConfigured, consensus, uptime] = snapshot;
 
     out.U8(static_cast<std::uint8_t>((storage.has_value() ? StoragePresent : 0U) | (host.has_value() ? HostPresent : 0U)
                                      | (upstreamConfigured.has_value() ? UpstreamPresent : 0U)
-                                     | (consensus.has_value() ? ConsensusPresent : 0U)));
+                                     | (consensus.has_value() ? ConsensusPresent : 0U)
+                                     | (hostLoad.has_value() ? HostLoadPresent : 0U)));
 
     if (storage.has_value())
         WriteStorage(out, *storage);
@@ -223,6 +233,21 @@ std::vector<std::byte> EncodeStatsReading(StatsReading const& reading)
             out.U64(static_cast<std::uint64_t>((*host).*field.member));
         for (auto const& field: HostByteFields)
             out.U64((*host).*field.member);
+    }
+
+    if (hostLoad.has_value())
+    {
+        auto const& [cpu, availableMemoryBytes] = *hostLoad;
+        out.U8(static_cast<std::uint8_t>((cpu.has_value() ? CpuPresent : 0U)
+                                         | (availableMemoryBytes.has_value() ? AvailableMemoryPresent : 0U)));
+        if (cpu.has_value())
+        {
+            auto const& [busy, total] = *cpu;
+            out.U64(busy);
+            out.U64(total);
+        }
+        if (availableMemoryBytes.has_value())
+            out.U64(*availableMemoryBytes);
     }
 
     if (upstreamConfigured.has_value())
@@ -282,7 +307,7 @@ std::expected<StatsReading, StatsReadingFault> DecodeStatsReading(std::span<std:
         reading.counters[i] = value;
     }
 
-    auto& [storage, storageTiers, host, upstreamConfigured, consensus, uptime] = reading.snapshot;
+    auto& [storage, storageTiers, host, hostLoad, upstreamConfigured, consensus, uptime] = reading.snapshot;
 
     auto presence = std::uint8_t { 0 };
     if (!in.ReadU8(presence))
@@ -306,6 +331,24 @@ std::expected<StatsReading, StatsReadingFault> DecodeStatsReading(std::span<std:
 
     if ((presence & HostPresent) != 0 && !ReadHost(in, host.emplace()))
         return truncated;
+
+    if ((presence & HostLoadPresent) != 0)
+    {
+        auto& [cpu, availableMemoryBytes] = hostLoad.emplace();
+        auto loadPresence = std::uint8_t { 0 };
+        if (!in.ReadU8(loadPresence))
+            return truncated;
+        if ((loadPresence & ~KnownHostLoadBits) != 0)
+            return malformed;
+        if ((loadPresence & CpuPresent) != 0)
+        {
+            auto& [busy, total] = cpu.emplace();
+            if (!in.ReadU64(busy) || !in.ReadU64(total))
+                return truncated;
+        }
+        if ((loadPresence & AvailableMemoryPresent) != 0 && !in.ReadU64(availableMemoryBytes.emplace()))
+            return truncated;
+    }
 
     if ((presence & UpstreamPresent) != 0)
     {
