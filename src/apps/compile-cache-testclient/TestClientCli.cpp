@@ -34,6 +34,10 @@ namespace
           .action = Action::Fetch,
           .summary = "FETCH <key> and validate the object and include paths\n"
                      "that come back." },
+        { .name = "drop",
+          .action = Action::Drop,
+          .summary = "CACHE-DROP <key>: exit 0 when it was removed, 4 when\n"
+                     "there was nothing to remove." },
     });
 
     /// The accepted options.
@@ -52,7 +56,7 @@ namespace
           .arity = Arity::Value,
           .operand = " <k>",
           .apply = AssignFrom<&Args::key, ParseText>(),
-          .description = "cache key to store under or fetch" },
+          .description = "cache key to store under, fetch or drop" },
         { .primary = "--prefetch-group",
           .arity = Arity::Value,
           .operand = " <id>",

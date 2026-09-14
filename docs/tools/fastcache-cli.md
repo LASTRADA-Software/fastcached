@@ -86,7 +86,7 @@ That probe runs on the **failure path only**, so an ordinary command against a
 healthy daemon pays nothing for it.
 
 A verb whose *question* a node can also answer is answered rather than explained.
-`version` is the one such verb today:
+`version` is one:
 
 ```console
 $ fastcache-cli version --addr=127.0.0.1:6674
@@ -98,8 +98,28 @@ server_kind  fastcache-compile-node
 `server_kind` is there because a node and a daemon version alike and are different
 programs; two bare version strings would read as two builds of one binary.
 
-A cache verb has no `0xFC` equivalent and never will — a compile node holds no user
-keyspace — so those are refused by name rather than retried somewhere they cannot
+`del` is the other. A node's cache tier holds compile results, and one somebody has
+found to be wrong — `FASTCACHE_VERIFY` names a `WRONG OBJECT` and its key — has to be
+removable from the machine that serves it. So `del` sends the node one `cache-drop` per
+key and keeps its RESP contract: it prints how many keys it removed, and exits 1 when
+that is none.
+
+```console
+$ fastcache-cli del 5f1c0e9a2b --addr=127.0.0.1:6674
+1
+fastcache-cli: this removed the keys from the node's own cache tier only; if the node reads through to a shared cache (--upstream), that cache still holds them and refills this tier on the next fetch, so run `del` against it as well
+```
+
+Two limits, and both are rules rather than gaps:
+
+- **Only this machine.** A node serves its cache to its own machine, so `del` run from
+  anywhere else is refused (exit 4) and removes nothing.
+- **Only this tier.** The drop is never forwarded to the shared cache the node reads
+  through to. A destructive command reaches the endpoint it was pointed at; to remove the
+  key from the shared cache, point `--addr` at that as well.
+
+Every other cache verb has no `0xFC` equivalent and never will — a compile node holds no
+user keyspace — so those are refused by name rather than retried somewhere they cannot
 work.
 
 ## Commands
@@ -250,7 +270,7 @@ would discard it silently.
 
 ### The node verbs
 
-`node` and `node-metrics` travel over `0xFC` and are the **only** verbs a
+`node` and `node-metrics` travel over `0xFC`, which is the only wire a
 `fastcache-compile-node` answers.
 
 `node` reports what the endpoint is:

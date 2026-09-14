@@ -499,6 +499,32 @@ enum class Op : std::uint8_t
     /// Replaces polling for the dashboard only: `/metrics` and `/fleet.txt` stay what browsers
     /// and Prometheus read.
     Subscribe = 0x12,
+
+    /// An operator removes one key from the cache tier that answers
+    /// ([#1276](https://github.com/LASTRADA-Software/fastcached/issues/1276)).
+    ///
+    /// The case is a stored value somebody has determined is wrong -- `FASTCACHE_VERIFY`
+    /// naming a `WRONG OBJECT` and its key is the ordinary way to learn one -- on a
+    /// `fastcache-compile-node`, which speaks no RESP and therefore has no `DEL`.
+    ///
+    /// **`Miss` is an answer, not a failure.** Dropping a key that is not there is what the
+    /// second run of a repair does, and an idempotent operation that errors on its second
+    /// run looks broken. `Ok` means this call removed it.
+    ///
+    /// **It reaches the tier that answers and nothing else.** A node never forwards it to
+    /// the shared cache it reads through to: a destructive verb reaches exactly the endpoint
+    /// its sender named, and a forward would delete from the whole fleet's cache under the
+    /// node's credential on the strength of a local command. So a node that reads through
+    /// to an upstream holding the key refills it on the next fetch, and the key must be
+    /// dropped there as well.
+    ///
+    /// Gated as each surface gates a write, which is what a drop is: a node's cache serves
+    /// its own machine only (#287), and the daemon asks for the credential `Store` needs.
+    ///
+    /// `0x13` and `0x14` were held by work on parallel branches when this byte was taken, which
+    /// is the gap above. Filling it is safe only because `EveryOpcodeIsDistinct` refuses a byte
+    /// two rows claim.
+    CacheDrop = 0x15,
 };
 
 /// Reply status, the first byte of every reply.
@@ -1439,6 +1465,17 @@ inline constexpr std::array OpTable {
                    .preAuth = RequiresAuth,
                    .maxPayload = SessionCapGoverns,
                    .family = VerbFamily::Cache },
+    // `Miss` is legal and is not a failure: see `Op::CacheDrop`. Bounded rather than left to
+    // the session cap, unlike `Fetch`, because the request carries a key and never an
+    // artefact -- a verb that cannot grow with a build has no reason to accept 256 MiB.
+    OpDescriptor { .code = Op::CacheDrop,
+                   .name = "cache-drop",
+                   .fieldCount = 1, // key
+                   .legalStatuses =
+                       static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Miss) | StatusBit(Status::Error)),
+                   .preAuth = RequiresAuth,
+                   .maxPayload = BoundedTo(MaxControlPayload),
+                   .family = VerbFamily::Cache },
     OpDescriptor { .code = Op::Auth,
                    .name = "auth",
                    .fieldCount = 2, // username, secret
@@ -1647,6 +1684,23 @@ static_assert(PreAuthVerbsAreBounded(), "a verb reachable before AUTH must decla
 }
 
 static_assert(EveryVerbHasAFamily(), "a verb belongs to a family -- see VerbFamily");
+
+/// Whether no two rows claim one wire byte.
+///
+/// **The collision this catches merges cleanly.** Verbs are added on parallel branches, each
+/// taking the next byte free on ITS base, and two enumerators on different lines of `Op` that
+/// were given the same value are no textual conflict at all. `FindOp` then answers the first
+/// row for both, so the second verb is served as the first -- a request for one operation
+/// performs another, and every in-tree test still agrees with itself, because each spells
+/// the enumerator rather than the byte.
+/// @return True when every `OpTable` row has a distinct `code`.
+[[nodiscard]] constexpr bool EveryOpcodeIsDistinct() noexcept
+{
+    return std::ranges::all_of(
+        OpTable, [](OpDescriptor const& row) { return std::ranges::count(OpTable, row.code, &OpDescriptor::code) == 1; });
+}
+
+static_assert(EveryOpcodeIsDistinct(), "two verbs claim one wire byte; the later one would be served as the earlier");
 
 /// One row of the error table: the code, its stable name, and the message sent
 /// when the caller has nothing more specific to say.
@@ -2128,6 +2182,16 @@ namespace Detail
     return Detail::EncodeRequest(version, Op::Fetch, { AsBytes(key) });
 }
 
+/// Frame a CACHE-DROP request.
+/// @param key The key to remove from the tier that answers.
+/// @param version Version to advertise; overridable so tests can offer a version
+///                the peer does not support.
+/// @return The framed request.
+[[nodiscard]] inline std::vector<std::byte> EncodeCacheDrop(std::string_view key, WireVersion version = CurrentVersion)
+{
+    return Detail::EncodeRequest(version, Op::CacheDrop, { AsBytes(key) });
+}
+
 /// Frame an AUTH request.
 /// @param request The credential to present.
 /// @param version Version to advertise; overridable so tests can offer a version
@@ -2269,6 +2333,17 @@ namespace Detail
 [[nodiscard]] inline std::optional<std::span<std::byte const>> DecodeFetchPayload(std::span<std::byte const> payload)
 {
     auto const fields = SplitFields(payload, OpFieldCount(Op::Fetch));
+    if (!fields.has_value())
+        return std::nullopt;
+    return (*fields)[0];
+}
+
+/// Split a CACHE-DROP payload into its single key field.
+/// @param payload The bytes following the request header.
+/// @return The key, or nullopt when malformed.
+[[nodiscard]] inline std::optional<std::span<std::byte const>> DecodeCacheDropPayload(std::span<std::byte const> payload)
+{
+    auto const fields = SplitFields(payload, OpFieldCount(Op::CacheDrop));
     if (!fields.has_value())
         return std::nullopt;
     return (*fields)[0];

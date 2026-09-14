@@ -2,6 +2,7 @@
 #include "LocalCache.hpp"
 
 #include <FastCache/Core/EnumTable.hpp>
+#include <FastCache/Core/Errors/StorageError.hpp>
 
 #include <cstddef>
 #include <optional>
@@ -120,6 +121,14 @@ Task<bool> LocalCache::Store(std::string_view key, std::span<std::byte const> va
         _metrics.Increment(*row.counter);
 
     co_return true;
+}
+
+CacheDropOutcome LocalCache::Drop(std::string_view key)
+{
+    auto const removed = _local.Delete(key, _clock.Now());
+    if (removed.has_value())
+        return CacheDropOutcome::Removed;
+    return removed.error().code == StorageErrorCode::KeyNotFound ? CacheDropOutcome::Absent : CacheDropOutcome::Failed;
 }
 
 } // namespace FastCache::Node

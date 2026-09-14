@@ -1170,6 +1170,61 @@ namespace
         return Answered(RecordValue(std::move(fields)));
     }
 
+    /// `del`, answered by a node's cache tier instead of by RESP `DEL` (#1276).
+    ///
+    /// One `cache-drop` per key, because the verb names one key, and the SAME contract `del`
+    /// has over RESP: the answer is how many were removed, and none is the answer *no* -- exit
+    /// 1, which is an answer and not an error, so a repair run twice reads as done twice.
+    ///
+    /// A refusal stops the loop at the key it met and says how many were removed before it.
+    /// Carrying on would send every remaining key into the same refusal -- a node that refuses
+    /// one caller for locality refuses it every key -- and would bury the one sentence that
+    /// explains why under a count.
+    ///
+    /// **The upstream advisory is unconditional, and phrased as a condition.** A node's tier
+    /// reads through to the shared cache it was given, and a drop reaches this tier only, so a
+    /// key the shared cache still holds comes back on the next fetch. Whether this node HAS
+    /// one is not on the wire; saying *if* costs a line and saying nothing costs an operator a
+    /// repair that silently undid itself.
+    /// @param context What to run against.
+    /// @return The answer.
+    [[nodiscard]] Answer DropFromNode(VerbContext const& context)
+    {
+        constexpr std::string_view UpstreamAdvisory =
+            "this removed the keys from the node's own cache tier only; if the node reads through to a shared "
+            "cache (--upstream), that cache still holds them and refills this tier on the next fetch, so run "
+            "`del` against it as well";
+
+        std::int64_t removed = 0;
+        for (auto const& key: context.operands)
+        {
+            auto const reply = context.node->Send(CompileCacheWire::EncodeCacheDrop(key));
+            auto refusal = std::optional<Answer> {};
+            if (!reply.has_value())
+                refusal = FromExchangeError(reply.error());
+            else if (reply->status == CompileCacheWire::Status::Ok)
+                ++removed;
+            else if (reply->status != CompileCacheWire::Status::Miss)
+                refusal = Concluded(Outcome::Refused, ExplainRefusal(context.verb->name, context.node->Address(), *reply));
+
+            if (refusal.has_value())
+            {
+                refusal->advisories.push_back(
+                    std::format("{} of {} key(s) were removed before `{}`", removed, context.operands.size(), key));
+                return std::move(*refusal);
+            }
+        }
+
+        auto answer = Answered(ScalarValue(NumberCell(removed)));
+        if (removed == 0)
+        {
+            answer.outcome = Outcome::Negative;
+            answer.advisories.emplace_back("no key matched");
+        }
+        answer.advisories.emplace_back(UpstreamAdvisory);
+        return answer;
+    }
+
     /// `node-metrics` -- every counter this node's build carries.
     /// @param context What to run against.
     /// @return The answer.
@@ -1498,7 +1553,9 @@ namespace
           .protocolCommand = "DEL",
           .modifiers = Modifier::None,
           .handler = &Counting,
-          .nodeFallback = nullptr,
+          // A compile node has no RESP, and its cache tier is where a wrong object an operator
+          // has to remove actually lives (#1276): one `cache-drop` per key, same count contract.
+          .nodeFallback = &DropFromNode,
           .session = nullptr },
         { .name = "exists",
           .wire = Wire::Resp,

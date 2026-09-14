@@ -31,6 +31,7 @@ enum class Action : std::uint8_t
 {
     Store,    ///< Compile, frame and STORE a value.
     Fetch,    ///< FETCH a value and validate what comes back.
+    Drop,     ///< CACHE-DROP a key and report whether it was there.
     ShowHelp, ///< Print the usage text and exit.
 };
 

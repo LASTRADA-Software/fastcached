@@ -610,3 +610,56 @@ TEST_CASE("The startup line reports the codec the tier was BUILT with", "[node][
     CHECK(MemoryCompressionOf(cfg).codec
           == (Compression::IsAvailable(CompressionCodec::Zstd) ? CompressionCodec::Zstd : CompressionCodec::Identity));
 }
+
+// --- cache-drop (#1276) ------------------------------------------------------------
+
+TEST_CASE("A dropped key is gone from every tier a fetch consults, and stays gone", "[node][cache-tier][cache-drop]")
+{
+    // Through the PRODUCTION composition -- `StartCacheTierOrExplain`'s shard, its
+    // write-error decorator, the in-memory L1 over the on-disk L2 -- and not a bare tier,
+    // because "gone" is a claim about what a FETCH reads. An L1 mirror left behind would
+    // serve the object from memory after the disk forgot it, and a removal that never
+    // reached the store file would come back when the node restarts. Both are asserted.
+    Testing::ScratchDirectory const scratch { "node-cache-drop" };
+    auto cfg = Fixture::BaseConfig();
+    cfg.cacheMemoryBytes = 4 * 1024 * 1024;
+    cfg.cacheDir = scratch.Path();
+
+    auto const ask = [](CacheTier& tier, std::vector<std::byte> const& frame) {
+        return StatusOf(SyncRun(tier.Responder().Answer(frame, "127.0.0.1")));
+    };
+
+    {
+        Fixture fixture;
+        auto started = fixture.Start(cfg);
+        REQUIRE(started.has_value());
+        auto const tier = std::move(*started);
+        REQUIRE(tier != nullptr);
+
+        std::vector<std::byte> const value(1024, std::byte { 0x5A });
+        REQUIRE(ask(*tier,
+                    Wire::EncodeStore(Wire::StoreRequest {
+                        .key = "dropped", .prefetchGroup = {}, .srcRoot = "/src", .buildTree = "/build", .value = value }))
+                == Wire::Status::Ok);
+        // A fetch BEFORE the drop, so the object is resident in L1 as well as on disk: the
+        // drop has two copies to remove, not one.
+        REQUIRE(ask(*tier, Wire::EncodeFetch("dropped")) == Wire::Status::Ok);
+
+        CHECK(ask(*tier, Wire::EncodeCacheDrop("dropped")) == Wire::Status::Ok);
+        CHECK(ask(*tier, Wire::EncodeFetch("dropped")) == Wire::Status::Miss);
+        CHECK(ask(*tier, Wire::EncodeCacheDrop("dropped")) == Wire::Status::Miss);
+
+        auto const tiers = tier->SnapshotTiers();
+        REQUIRE(At(tiers, StorageTier::Disk).has_value());
+        CHECK(Unwrap(At(tiers, StorageTier::Disk)).deleteHits == 1);
+        CHECK(Unwrap(At(tiers, StorageTier::Disk)).deleteMisses == 1);
+    }
+
+    // The same store file, reopened: the removal was persisted, not only forgotten in memory.
+    Fixture fixture;
+    auto reopened = fixture.Start(cfg);
+    REQUIRE(reopened.has_value());
+    auto const tier = std::move(*reopened);
+    REQUIRE(tier != nullptr);
+    CHECK(ask(*tier, Wire::EncodeFetch("dropped")) == Wire::Status::Miss);
+}

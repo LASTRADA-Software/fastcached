@@ -36,11 +36,12 @@ place.
 - **`SELECT db` (Redis)**: accepted as a no-op for any index — the
   reply is always `+OK`, but fastcached is a single flat keyspace, so
   the index is ignored rather than selecting a distinct database.
-- **Keyspace notifications for memcached writes**: not fired. A memcached
-  `set`/`delete`/`incr` dirties a Redis `WATCH` (the storage layer does
-  that for every protocol), but publishes no `__keyevent@0__:*` frame.
-  Memcached has no convention for keyspace events, and the event names
-  belong to the Redis verbs that own them.
+- **Keyspace notifications for memcached and `0xFC` writes**: not fired. A
+  memcached `set`/`delete`/`incr`, and a compile-cache `store` or
+  `cache-drop`, dirties a Redis `WATCH` (the storage layer does that for
+  every protocol), but publishes no `__keyevent@0__:*` frame. Neither
+  protocol has a convention for keyspace events, and the event names belong
+  to the Redis verbs that own them.
 
 ## Keyspace notification timing
 

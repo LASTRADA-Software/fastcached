@@ -733,23 +733,130 @@ TEST_CASE("A fallback that cannot reach the node still reports the client half",
     CHECK(RequiredCell(answer, "server").kind == CellKind::Absent);
 }
 
-TEST_CASE("Exactly one verb carries a 0xFC fallback today, and it is `version`", "[cli][node][fallback]")
+TEST_CASE("Exactly two verbs carry a 0xFC fallback today, `del` and `version`", "[cli][node][fallback]")
 {
     // A census, and it is the kind that has to state its PATTERN: a row gaining a
     // fallback is a decision about whether a node can answer that QUESTION, and one
     // added without a test is a verb that silently starts asking a node about a keyspace
-    // it does not have.
+    // it does not have. `del` is the second, and its question is one a node CAN answer --
+    // its cache tier holds keys an operator may have to remove (#1276) -- where `get`'s is
+    // a user keyspace no node has.
     std::vector<std::string_view> withFallback;
     for (auto const& verb: Verbs())
         if (verb.nodeFallback != nullptr)
             withFallback.push_back(verb.name);
+    std::ranges::sort(withFallback);
 
-    REQUIRE(withFallback.size() == 1);
-    CHECK(withFallback[0] == "version");
+    REQUIRE(withFallback.size() == 2);
+    CHECK(withFallback[0] == "del");
+    CHECK(withFallback[1] == "version");
 
     // And the control that says the census could have found more: every node verb was
     // examined, so an empty `Verbs()` would fail here rather than passing vacuously.
     CHECK(Verbs().size() > 20);
+}
+
+// ---------------------------------------------------------------------------------
+// `del` against a compile node (#1276)
+// ---------------------------------------------------------------------------------
+
+namespace
+{
+
+/// Run `del` with @p keys as a node fallback, the way `main` reaches it after RESP failed.
+/// @param node The scripted node.
+/// @param keys The operands.
+/// @return The answer.
+[[nodiscard]] Answer DelOnNode(ScriptedNodeExchange& node, std::vector<std::string> const& keys)
+{
+    auto const* const verb = FindVerb("del");
+    REQUIRE(verb != nullptr);
+    return RunNodeFallback(*verb,
+                           VerbContext { .operands = keys, .node = &node },
+                           RemoteKind::CompileNode,
+                           Concluded(Outcome::Unreachable, "the server closed the connection without answering"));
+}
+
+/// Whether any advisory contains @p needle.
+[[nodiscard]] bool Advises(Answer const& answer, std::string_view needle)
+{
+    return std::ranges::any_of(answer.advisories, [needle](std::string const& line) { return line.contains(needle); });
+}
+
+} // namespace
+
+TEST_CASE("`del` on a node sends one cache-drop per key and counts what was removed", "[cli][node][fallback][cache-drop]")
+{
+    ScriptedNodeExchange node {
+        { Cc::EncodeReply(Cc::Status::Ok, {}), Cc::EncodeReply(Cc::Status::Miss, {}), Cc::EncodeReply(Cc::Status::Ok, {}) }
+    };
+
+    auto const answer = DelOnNode(node, { "a", "b", "c" });
+
+    CHECK(answer.outcome == Outcome::Affirmative);
+    REQUIRE(answer.value.shape == Shape::Scalar);
+    CHECK(answer.value.scalar.lexical == "2");
+
+    // What went out: three frames, each the drop verb, each naming its key in order.
+    constexpr std::array<std::string_view, 3> Keys { "a", "b", "c" };
+    REQUIRE(node.Sent().size() == Keys.size());
+    for (auto const index: std::views::iota(std::size_t { 0 }, Keys.size()))
+    {
+        auto const& sent = node.Sent()[index];
+        auto const key = Keys[index];
+        CHECK(OpOf(sent) == static_cast<std::uint8_t>(Cc::Op::CacheDrop));
+        auto const payload = Cc::DecodeCacheDropPayload(std::span<std::byte const> { sent }.subspan(Cc::RequestHeaderSize));
+        REQUIRE(payload.has_value());
+        CHECK(Cc::AsStringView(Unwrap(payload)) == key);
+    }
+
+    // The reach is said, because it surprises: a shared cache behind the node refills it.
+    CHECK(Advises(answer, "own cache tier only"));
+    CHECK(Advises(answer, "--upstream"));
+}
+
+TEST_CASE("`del` on a node that holds none of the keys answers no, which is not a refusal",
+          "[cli][node][fallback][cache-drop]")
+{
+    // A repair's second run. `Negative` exits 1 -- an ANSWER -- where a refusal exits 4, and
+    // an operator scripting the repair must be able to tell the two apart.
+    ScriptedNodeExchange node { { Cc::EncodeReply(Cc::Status::Miss, {}), Cc::EncodeReply(Cc::Status::Miss, {}) } };
+
+    auto const answer = DelOnNode(node, { "a", "b" });
+
+    CHECK(answer.outcome == Outcome::Negative);
+    CHECK(answer.value.scalar.lexical == "0");
+    CHECK(Advises(answer, "no key matched"));
+    CHECK(node.Sent().size() == 2);
+}
+
+TEST_CASE("`del` on a node stops at a refusal, names it, and says how far it got", "[cli][node][fallback][cache-drop]")
+{
+    ScriptedNodeExchange node { { Cc::EncodeReply(Cc::Status::Ok, {}),
+                                  RefusalReply(Cc::ErrorCode::NotAMember,
+                                               "this node serves its cache to its own machine only"),
+                                  Cc::EncodeReply(Cc::Status::Ok, {}) } };
+
+    auto const answer = DelOnNode(node, { "a", "b", "c" });
+
+    CHECK(answer.outcome == Outcome::Refused);
+    // The node's own sentence, so the operator learns it is WHERE they ran it from.
+    CHECK(Advises(answer, "own machine only"));
+    CHECK(Advises(answer, "1 of 3 key(s) were removed before `b`"));
+    // And the third key was never sent: a node refusing this caller refuses every key.
+    CHECK(node.Sent().size() == 2);
+}
+
+TEST_CASE("`del` on a node too old to know the verb says so rather than miscounting", "[cli][node][fallback][cache-drop]")
+{
+    // A node built before #1276 answers `UnimplementedVerb`. Counted as a miss it would print
+    // `0` and exit 1 -- *nothing matched* -- about keys that are all still there.
+    ScriptedNodeExchange node { { RefusalReply(Cc::UnimplementedVerb, "unknown opcode 0x15") } };
+
+    auto const answer = DelOnNode(node, { "a" });
+
+    CHECK(answer.outcome == Outcome::Refused);
+    CHECK(Advises(answer, "does not implement `del`"));
 }
 
 // ---------------------------------------------------------------------------------

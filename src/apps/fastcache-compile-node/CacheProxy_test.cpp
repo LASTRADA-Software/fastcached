@@ -544,7 +544,7 @@ TEST_CASE("(#491) the cache tier counts a version skew and an undecodable body",
               == Only(IMetricsSink::Counter::NodeCacheRequestsRefusedUnsupportedVersion));
     }
 
-    SECTION("a FETCH or a STORE whose body will not decode reaches one row")
+    SECTION("a FETCH, a STORE or a CACHE-DROP whose body will not decode reaches one row")
     {
         // One row for both verbs: they carry different fields and say the same thing
         // about the peer, and an operator does one thing about it. Driven over the two
@@ -555,7 +555,7 @@ TEST_CASE("(#491) the cache tier counts a version skew and an undecodable body",
         // this would be refused as TRUNCATED -- answering the same wire code and
         // moving a different counter -- which is exactly how the compile surface's
         // equivalent test passed under the bug it was written to catch.
-        for (auto const op: { Wire::Op::Fetch, Wire::Op::Store })
+        for (auto const op: { Wire::Op::Fetch, Wire::Op::Store, Wire::Op::CacheDrop })
         {
             INFO("verb " << static_cast<unsigned>(op));
             Fixture fix;
@@ -661,4 +661,35 @@ TEST_CASE("(#491) the cache surface's uncounted arms are unreachable, swept rath
         CHECK(Wire::FamilyOf(auth) == Wire::VerbFamily::Session);
         CHECK(merged.OwnerOf(auth) == nullptr);
     }
+}
+
+TEST_CASE("(#1276) a drop from another machine is refused before it removes anything",
+          "[node][cache][cache-locality][cache-drop]")
+{
+    // The locality gate answers for every verb that reaches this tier, and a drop is the one
+    // where answering after the work would be too late: the refusal must leave the key where
+    // it was. So the case asserts the KEY, not only the refusal -- a responder that removed
+    // the key and then refused would pass every assertion about the reply.
+    Fixture fixture;
+    Testing::ScriptedHostAddresses const machine { { "10.0.0.7" } };
+    CachedLocalityOracle const locality { machine, fixture.clock };
+    CacheResponder responder { fixture.proxy, locality, fixture.metrics };
+
+    auto const stored = SyncRun(responder.Answer(
+        Wire::EncodeStore(Wire::StoreRequest {
+            .key = "victim", .prefetchGroup = {}, .srcRoot = "/src", .buildTree = "/build", .value = Bytes("object") }),
+        "127.0.0.1"));
+    REQUIRE(StatusOf(stored) == Wire::Status::Ok);
+
+    auto const refused = SyncRun(responder.Answer(Wire::EncodeCacheDrop("victim"), "10.9.9.9"));
+    CHECK(ErrorOf(refused) == Wire::ErrorCode::NotAMember);
+    CHECK(fixture.metrics.Read(IMetricsSink::Counter::NodeCacheRequestsRefusedNotLocal) == 1);
+    CHECK(fixture.local.Snapshot().deleteHits == 0);
+    CHECK(StatusOf(SyncRun(responder.Answer(Wire::EncodeFetch("victim"), "127.0.0.1"))) == Wire::Status::Ok);
+
+    // And the same request from this machine is served, so the refusal above was about WHO
+    // asked rather than about the request.
+    CHECK(StatusOf(SyncRun(responder.Answer(Wire::EncodeCacheDrop("victim"), "10.0.0.7"))) == Wire::Status::Ok);
+    CHECK(StatusOf(SyncRun(responder.Answer(Wire::EncodeFetch("victim"), "127.0.0.1"))) == Wire::Status::Miss);
+    CHECK(StatusOf(SyncRun(responder.Answer(Wire::EncodeCacheDrop("victim"), "10.0.0.7"))) == Wire::Status::Miss);
 }
