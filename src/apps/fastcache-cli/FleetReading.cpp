@@ -72,13 +72,7 @@ SampleReading ReadFleetSampleThrough(DashboardEvent const& event, FleetParser pa
             .outcome = Outcome::Unreachable, .value = {}, .source = {}, .note = "the sample carried no fleet document"
         };
 
-    auto const& fetched = *event.document;
-    if (!fetched.has_value())
-        return SampleReading {
-            .outcome = OutcomeOf(fetched.error().kind), .value = {}, .source = {}, .note = fetched.error().detail
-        };
-
-    auto parsed = parse(*fetched);
+    auto parsed = parse(*event.document);
     if (!parsed.has_value())
         return SampleReading { .outcome = Outcome::Protocol,
                                .value = {},
@@ -87,14 +81,14 @@ SampleReading ReadFleetSampleThrough(DashboardEvent const& event, FleetParser pa
 
     auto reading = SampleReading { .outcome = Outcome::Affirmative,
                                    .value = RecordValue(KpiFields(*parsed)),
-                                   .source = std::string { FleetReadingSource },
+                                   .source = std::string { SubscriptionSource },
                                    .note = {},
                                    .document = nullptr,
                                    .points = FleetChartPoints(*parsed),
-                                   .route = std::string { FleetDocumentRoute },
-                                   .where = event.documentWhere,
-                                   // Only the leader answers this document with a reading; a follower's 503
-                                   // never gets this far.
+                                   .route = std::string { SubscriptionRoute },
+                                   .where = event.where,
+                                   // Only the leader streams this subject; a follower refuses the subscription
+                                   // naming the leader, so a reading never comes from anybody else.
                                    .role = std::string { LeaderRole } };
     // The points are taken from the parse before it moves: the chart's history keeps these numbers,
     // and only the newest document is kept whole.

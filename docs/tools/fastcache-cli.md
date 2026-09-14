@@ -37,6 +37,7 @@ complaint about a flag you are no longer going to use.
 | Data port | `--addr=<host:port>`, `$FASTCACHE_ADDR`, default `127.0.0.1:6674` |
 | Admin surface | `--admin-addr=<host:port>`, `$FASTCACHE_ADMIN_ADDR` — **usually unnecessary**, see below |
 | Credential | `--token-file=<path>` (preferred) or `$FASTCACHE_TOKEN` |
+| Dashboard credential | `--dashboard-token-file=<path>`, presented by `live-stats fleet` only; no environment variable |
 
 The same `$FASTCACHE_ADDR` that `fastcache-cc` reads, so a machine configured for
 the launcher is already configured for this. A variable that is *set but empty*
@@ -48,6 +49,11 @@ machine. IPv6 literals are bracketed: `--addr=[::1]:6674`.
 Prefer `--token-file` to the environment variable. The path is not the secret;
 the file is, and an environment variable is visible to anything that can read
 this process's environment.
+
+The dashboard credential is a different secret from the data port's, and it has its
+own flag and no variable. A leader that names one (`--dashboard-token-file` on the
+node) refuses the fleet stream to a watcher that does not present it; a `cache` or
+`node` stream never asks for it.
 
 **`--admin-addr` is an override, not a requirement.** A `fastcache-compile-node`
 knows which port its admin surface bound and whether it is TLS, and it will say so
@@ -569,7 +575,7 @@ $ fastcache-cli live-stats node --format=tsv --samples=30 > node.tsv
 
 | Subject | Served by | The panel |
 |---|---|---|
-| `cache` | a `fastcached` | the hit rate, and operations, connections, evictions and expiries per second, each with its trend; connections, items and bytes in use against their limits, per storage tier |
+| `cache` | a `fastcached`, or a `fastcache-compile-node` for its own cache tier | the hit rate, and operations, connections, evictions and expiries per second, each with its trend; connections, items and bytes in use against their limits, per storage tier |
 | `node` | a `fastcache-compile-node` | compiles and refusals per minute, the mean compile and its trend; the slots in use against the slots available and the limit that bounds them; the cache tier's fill; the host's CPU and free memory; the node's identity, toolchains, registrars and the leader |
 | `fleet` | the node that leads the fleet | the headline figures as tiles; one table per section (machines, workers, leases, members, tiers); each machine's CPU over time |
 

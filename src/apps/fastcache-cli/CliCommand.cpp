@@ -242,6 +242,13 @@ namespace
           .apply = AssignFrom<&Command::tokenFile, ParseText>(),
           .description = "read the credential from this file rather than\n"
                          "$FASTCACHE_TOKEN, which is visible in the environment" },
+        { .primary = "--dashboard-token-file",
+          .arity = Arity::Value,
+          .operand = "=<path>",
+          .apply = AssignFrom<&Command::dashboardTokenFile, ParseText>(),
+          .description = "read the dashboard credential `live-stats fleet` presents\n"
+                         "from this file; a leader that names one refuses the fleet\n"
+                         "stream to anybody without it" },
         { .primary = "--user",
           .arity = Arity::Value,
           .operand = "=<name>",

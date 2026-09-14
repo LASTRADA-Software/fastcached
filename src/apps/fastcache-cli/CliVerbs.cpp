@@ -1651,9 +1651,9 @@ namespace
           .nodeFallback = nullptr,
           .session = nullptr },
         { .name = "live-stats",
-          // `Stats` because it is the one wire whose connections cover all three
-          // subjects: RESP or `/metrics` for a cache, `0xFC` for a node, and `0xFC` to
-          // discover the admin port the fleet page is fetched from (#134 §1.1).
+          // `Stats` for ADMISSION only: `0xFC` identifies the endpoint, and RESP opening
+          // beside it is what lets a refusal say *a Redis answered, a fastcache did not*.
+          // Every reading then arrives on the session's own subscription (#1399).
           .wire = Wire::Stats,
           .minOperands = 0,
           .maxOperands = 1,

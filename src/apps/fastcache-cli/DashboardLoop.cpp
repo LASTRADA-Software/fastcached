@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "DashboardLoop.hpp"
-#include "StatsSource.hpp"
 
 #include <FastCache/Core/NumericText.hpp>
 
@@ -34,6 +33,11 @@ namespace
     /// readings would describe an interval nobody measured:
     ///
     /// - a different SOURCE: two vocabularies, so their difference is a change in nothing;
+    /// - a different ENDPOINT: two processes' counters, so their difference is a change in
+    ///   nobody. Every reading now arrives by one source, the subscription, so the endpoint is
+    ///   the only thing that says a counter changed owner -- a stream that followed a leader,
+    ///   or re-subscribed where another process answers -- and a rate across that change would
+    ///   subtract one node's counters from another's (#1399);
     /// - a stamp NO LATER than the one before: an elapsed time no rate can be divided by,
     ///   which is what a loop-cached clock produces for two readings taken while its
     ///   reactor slept.
@@ -45,7 +49,7 @@ namespace
     /// @return True when the interval between them can be measured.
     [[nodiscard]] bool ContinuesRun(ReadingStamp const& before, ReadingStamp const& after) noexcept
     {
-        return after.source == before.source && after.at > before.at;
+        return after.source == before.source && after.where == before.where && after.at > before.at;
     }
 
     /// Append one sample to the history, dropping the oldest entries past the bound.
@@ -142,7 +146,7 @@ namespace
     }
 
     /// Everything a sample taken does whatever it read: it spends the budget, and it replaces the
-    /// node status and the fleet document with whatever it carried.
+    /// node status, the fleet document and the granted cadence with whatever it carried.
     ///
     /// One helper for both arms -- a `Sample` and a `SampleFailed` -- so neither route can count a
     /// sample without replacing both, or the reverse.
@@ -158,6 +162,7 @@ namespace
     {
         model.nodeStatus = event.nodeStatus;
         model.latestDocument = std::move(document);
+        model.cadence = event.cadence;
         ++model.attempts;
         return limits.samples != 0 && model.attempts >= limits.samples;
     }
@@ -203,37 +208,24 @@ std::vector<std::optional<double>> CounterRateSeries(std::deque<HistoryEntry> co
 
 SampleReading ReadStatsSample(DashboardEvent const& event)
 {
-    auto answer = ChooseStats(event.attempts);
-    if (answer.outcome != Outcome::Affirmative)
-    {
-        // The advisories ARE the account: the conclusion, then what happened to each source. One
-        // line, because whoever surfaces it writes one line per failed sample.
-        auto note = std::string {};
-        for (auto const& advisory: answer.advisories)
-            note += (note.empty() ? "" : "; ") + advisory;
-        return SampleReading { .outcome = answer.outcome, .value = {}, .source = {}, .note = std::move(note) };
-    }
-
-    // Copied out BEFORE the value moves, since the field points into it.
-    auto const* named = FindField(answer.value, StatsSourceFieldName);
-    auto source = named == nullptr ? std::string {} : named->value.lexical;
-    // Where it answered is the WINNING attempt's, found by the name the decision reported rather than
-    // decided a second time; the route is that source's own row.
-    auto reading = SampleReading {
-        .outcome = Outcome::Affirmative, .value = std::move(answer.value), .source = std::move(source), .note = {}
-    };
-    for (auto const& attempt: event.attempts)
-    {
-        auto const* row = DescriptorOf(attempt.origin);
-        if (row != nullptr && row->name == reading.source)
-        {
-            reading.route = std::string { row->route };
-            reading.where = attempt.where;
-            // The live model, read out of the record in that source's own vocabulary, once.
-            reading.stats = StatsReadingFromRecord(reading.value, attempt.origin);
-        }
-    }
-    return reading;
+    if (!event.reading.has_value())
+        // A stats sample with no reading was composed wrongly; the reading says so rather than drawing
+        // a cache of zeroes.
+        return SampleReading {
+            .outcome = Outcome::Unreachable, .value = {}, .source = {}, .note = "the sample carried no reading"
+        };
+    return SampleReading { .outcome = Outcome::Affirmative,
+                           // The figures are in `stats`. The record is empty, and engaged only because the fold
+                           // keys "a reading was taken" on it.
+                           .value = RecordValue({}),
+                           .stats = event.reading,
+                           .source = std::string { SubscriptionSource },
+                           .note = {},
+                           .document = nullptr,
+                           .points = {},
+                           .route = std::string { SubscriptionRoute },
+                           .where = event.where,
+                           .role = {} };
 }
 
 bool IsQuitKey(std::string_view keys) noexcept

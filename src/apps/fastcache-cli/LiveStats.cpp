@@ -28,32 +28,36 @@ namespace
         return keys;
     }
 
-    /// The refusal for an interval below @p spec's floor, or nothing.
+    /// The refusal for an interval outside @p spec's wire bounds, or nothing.
     ///
-    /// Names the floor, the subject it belongs to, and who pays for a sample: an
-    /// operator told only *too short* cannot tell whether the limit is a mistake or a
-    /// cost, and `fleet`'s is a cost landing on a machine they are not looking at.
-    /// @param spec The subject whose floor applies.
+    /// Names the bound, the subject it belongs to, and who pays for a snapshot: an operator told only
+    /// *too short* cannot tell whether the limit is a mistake or a cost, and `fleet`'s is a cost
+    /// landing on a machine they are not looking at. Refused rather than clamped, because the
+    /// operator TYPED the interval, and one silently replaced is a dashboard stating a cadence
+    /// nobody asked for.
+    /// @param spec The subject whose bounds apply.
     /// @param interval What the operator asked for, or nullopt when they asked for nothing.
     /// @return The refusal, or nullopt when there is nothing to refuse.
-    [[nodiscard]] std::optional<Answer> BelowFloor(LiveSubjectSpec const& spec,
-                                                   std::optional<std::chrono::milliseconds> interval)
+    [[nodiscard]] std::optional<Answer> OutsideBounds(LiveSubjectSpec const& spec,
+                                                      std::optional<std::chrono::milliseconds> interval)
     {
-        if (!interval.has_value() || *interval >= spec.minInterval)
+        if (!interval.has_value())
             return std::nullopt;
-        return Concluded(Outcome::Usage,
-                         std::format("--interval={} is below the `{}` floor of {}ms: {}",
-                                     interval->count(),
-                                     spec.key,
-                                     spec.minInterval.count(),
-                                     spec.costsWhom));
+        if (*interval < FloorOf(spec))
+            return Concluded(Outcome::Usage,
+                             std::format("--interval={} is below the `{}` floor of {}ms: {}",
+                                         interval->count(),
+                                         spec.key,
+                                         FloorOf(spec).count(),
+                                         spec.costsWhom));
+        if (*interval > CompileCacheWire::MaxLiveCadence)
+            return Concluded(Outcome::Usage,
+                             std::format("--interval={} is above the longest cadence a live-stats stream keeps, {}ms",
+                                         interval->count(),
+                                         CompileCacheWire::MaxLiveCadence.count()));
+        return std::nullopt;
     }
 
-    /// The inferrable subject an endpoint of @p kind is given.
-    ///
-    /// Derived from `servedBy`, and unique by `EveryKindInfersAtMostOneSubject`.
-    /// @param kind What the endpoint turned out to be.
-    /// @return The row, or nullptr when no inferrable subject is served by that kind.
     /// What a refusal says when RESP opened and `0xFC` identified nothing.
     ///
     /// The observation, not a remedy: the address evidently reaches SOMETHING, so *check
@@ -64,10 +68,15 @@ namespace
     constexpr std::string_view RespButUnidentified =
         "so this is not a fastcached, or one too old to identify itself over 0xFC";
 
+    /// The subject an endpoint of @p kind is given when none is named.
+    ///
+    /// The row whose `inferredAt` is @p kind: unique by `EveryKindInfersAtMostOneSubject`, and
+    /// served there by `EveryInferredSubjectIsServed`.
+    /// @param kind What the endpoint turned out to be.
+    /// @return The row, or nullptr when no subject is inferred at that kind.
     [[nodiscard]] LiveSubjectSpec const* InferredSubject(RemoteKind kind) noexcept
     {
-        return FindIfOrNull(LiveSubjectTable,
-                            [kind](LiveSubjectSpec const& row) { return row.inferrable && row.servedBy == kind; });
+        return FindOrNull(LiveSubjectTable, std::optional { kind }, &LiveSubjectSpec::inferredAt);
     }
 } // namespace
 
@@ -90,7 +99,7 @@ std::expected<LivePlan, Answer> AdmitLiveStats(VerbContext const& context)
             return std::unexpected(Concluded(
                 Outcome::Usage,
                 std::format("`{}` names nothing live-stats watches; expected one of: {}", operand, SubjectKeys())));
-        if (auto refusal = BelowFloor(*named, context.options.interval); refusal.has_value())
+        if (auto refusal = OutsideBounds(*named, context.options.interval); refusal.has_value())
             return std::unexpected(*std::move(refusal));
     }
 
@@ -165,17 +174,18 @@ std::expected<LivePlan, Answer> AdmitLiveStats(VerbContext const& context)
     // **Asserted, not requested** (#134 §1.2): the refusal names what the endpoint turned
     // out to be, because a bare *refused* leaves the operator guessing which of the two --
     // their address or their subject -- is wrong. An inferred subject matches by
-    // construction, so only a named one can be refused here.
-    if (subject->servedBy != kind)
+    // construction (`EveryInferredSubjectIsServed`), so only a named one can be refused here.
+    if (!subject->servedBy.Contains(kind))
         return std::unexpected(Concluded(
             *established, std::format("`live-stats {}` needs {}, and {}", subject->key, subject->needs, identity.detail)));
 
     // A named subject's floor was checked before asking. An INFERRED one's is known only
     // now, which is why this is the one floor refusal that costs a round trip.
-    if (auto refusal = BelowFloor(*subject, context.options.interval); refusal.has_value())
+    if (auto refusal = OutsideBounds(*subject, context.options.interval); refusal.has_value())
         return std::unexpected(*std::move(refusal));
 
     return LivePlan { .subject = subject->subject,
+                      .server = kind,
                       .interval = context.options.interval.value_or(subject->defaultInterval),
                       .samples = context.options.samples.value_or(0),
                       .endpoint = std::move(identity.detail) };

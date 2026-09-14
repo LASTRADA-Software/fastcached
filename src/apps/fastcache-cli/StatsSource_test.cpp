@@ -1,32 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "StatsSource.hpp"
 
-#include <FastCache/Cache/IStorage.hpp>
-#include <FastCache/Cache/StorageTier.hpp>
-#include <FastCache/Core/Version.hpp>
-#include <FastCache/Metrics/MetricsCatalog.hpp>
-#include <FastCache/Metrics/PrometheusFormatter.hpp>
-#include <FastCache/Platform/HostLoad.hpp>
-
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
-#include <chrono>
 #include <cstddef>
-#include <cstdint>
 #include <format>
-#include <initializer_list>
-#include <optional>
 #include <ranges>
 #include <string>
-#include <string_view>
 #include <vector>
-
-#include <tests/Unwrap.hpp>
 
 using namespace FastCache;
 using namespace FastCache::Cli;
-using FastCache::Testing::Unwrap;
 
 namespace
 {
@@ -256,63 +241,6 @@ TEST_CASE("a Prometheus body parses into numbered fields, keeping labels", "[cli
     CHECK(record.fields.size() == 3);
 }
 
-TEST_CASE("a label is read out of a series name, unescaped, whichever position it holds", "[cli][stats]")
-{
-    CHECK(LabelValue(R"(x_info{version="0.4.1"})", "version") == "0.4.1");
-    CHECK(LabelValue(R"(x_info{tier="memory",version="0.4.1"})", "version") == "0.4.1");
-    CHECK(LabelValue(R"(x_info{version="0.4.1",tier="memory"})", "tier") == "memory");
-    // The three exposition escapes, each standing for its character: a quote does not end the value.
-    CHECK(LabelValue(R"(x_info{version="1.0 \"vendor\"\\build\nline"})", "version") == "1.0 \"vendor\"\\build\nline");
-    CHECK(LabelValue(R"(x_info{version=""})", "version") == "");
-
-    // Absent, and every way of not parsing, is no value rather than a guess.
-    CHECK_FALSE(LabelValue(R"(x_info{tier="memory"})", "version").has_value());
-    CHECK_FALSE(LabelValue("x_info", "version").has_value());
-    CHECK_FALSE(LabelValue(R"(x_info{version="0.4.1)", "version").has_value());
-    CHECK_FALSE(LabelValue(R"(x_info{version="0.4.1})", "version").has_value());
-    CHECK_FALSE(LabelValue(R"(x_info{version="a\tb"})", "version").has_value());
-    CHECK_FALSE(LabelValue(R"(x_info{version=0.4.1})", "version").has_value());
-}
-
-TEST_CASE("the build a /metrics body names round-trips through the parser to its version", "[cli][stats]")
-{
-    // WHAT DISTINGUISHES: the client's reader against the server's own renderer, with a value carrying every
-    // escape. A reader that forgot to unescape, or split the series at a quoted space, reads something else.
-    constexpr std::string_view Awkward = "1.0 \"vendor\"\\build\nline";
-    auto const reading = ParsePrometheus(RenderInfoMetric(InfoTable.front(), Awkward));
-    REQUIRE(reading.fields.size() == 1);
-    CHECK(VersionIn(reading, StatsOrigin::Metrics) == std::string { Awkward });
-
-    auto const real = ParsePrometheus(RenderInfoMetric(InfoTable.front(), VersionString));
-    CHECK(VersionIn(real, StatsOrigin::Metrics) == std::string { VersionString });
-}
-
-TEST_CASE("a version is read where each source states it, and not in another source's spelling", "[cli][stats]")
-{
-    auto const buildInfo = RecordValue(
-        { Field { .name = R"(fastcached_build_info{version="0.4.1"})", .value = NumberCell(std::uint64_t { 1 }) } });
-    auto const infoField = RecordValue({ Field { .name = "fastcached_version", .value = TextCell("0.4.1") } });
-
-    CHECK(VersionIn(buildInfo, StatsOrigin::Metrics) == "0.4.1");
-    CHECK(VersionIn(infoField, StatsOrigin::Info) == "0.4.1");
-    CHECK_FALSE(VersionIn(infoField, StatsOrigin::Metrics).has_value());
-    CHECK_FALSE(VersionIn(buildInfo, StatsOrigin::Info).has_value());
-    // The counter catalogue states none; a node's version is in its status.
-    CHECK_FALSE(VersionIn(buildInfo, StatsOrigin::NodeMetrics).has_value());
-
-    // A series whose name merely begins with the build info's is another series.
-    auto const longer = RecordValue(
-        { Field { .name = R"(fastcached_build_info_extra{version="9"})", .value = NumberCell(std::uint64_t { 1 }) } });
-    CHECK_FALSE(VersionIn(longer, StatsOrigin::Metrics).has_value());
-
-    // An empty version is no version, in both shapes.
-    auto const emptyLabel =
-        RecordValue({ Field { .name = R"(fastcached_build_info{version=""})", .value = NumberCell(std::uint64_t { 1 }) } });
-    CHECK_FALSE(VersionIn(emptyLabel, StatsOrigin::Metrics).has_value());
-    CHECK_FALSE(VersionIn(RecordValue({ Field { .name = "fastcached_version", .value = TextCell("") } }), StatsOrigin::Info)
-                    .has_value());
-}
-
 TEST_CASE("an INFO body parses, classifying numbers apart from text", "[cli][stats]")
 {
     auto const body = std::string { "# Server\r\n"
@@ -355,167 +283,4 @@ TEST_CASE("an INFO field with an empty value is kept, not dropped", "[cli][stats
     REQUIRE(FindField(record, "some_key") != nullptr);
     CHECK(FindField(record, "some_key")->value.kind == CellKind::Text);
     CHECK(FindField(record, "some_key")->value.lexical.empty());
-}
-
-namespace
-{
-/// A reading whose every counter, cache field, tier field and host field is a different number, one counter the
-/// sink cannot carry, and a version: nothing below passes by reading back a default or a neighbour's field.
-/// @return The reading.
-[[nodiscard]] StatsReading EveryFieldDistinct()
-{
-    auto reading = StatsReading {};
-    auto next = std::uint64_t { 17 };
-    for (auto const& row: CounterTable)
-        reading.counters[static_cast<std::size_t>(row.counter)] = (next++ * 1'000'003);
-    reading.counters[static_cast<std::size_t>(IMetricsSink::Counter::ConnectionsAdmissionRejected)] = std::nullopt;
-    auto const distinct = [&next] {
-        auto stats = StorageStats {};
-        for (auto const member: StorageStatsSizeFields)
-            stats.*member = static_cast<std::size_t>(next++ * 7919);
-        for (auto const member: StorageStatsCounterFields)
-            stats.*member = next++ * 7919;
-        return stats;
-    };
-    reading.snapshot.storage = distinct();
-    reading.snapshot.storageTiers[0] = distinct();
-    reading.snapshot.host = HostCapacity { .logicalCores = 32,
-                                           .configuredSlots = 30,
-                                           .totalMemoryBytes = 68'719'476'736,
-                                           .diskCapacityBytes = 2'000'398'934'016,
-                                           .diskFreeBytes = 442'381'631'488,
-                                           .busySlots = 7 };
-    reading.snapshot.hostLoad = HostLoadReading { .cpu = CpuTicks { .busy = 7'700'001, .total = 9'100'003 },
-                                                  .availableMemoryBytes = 21'474'836'480 };
-    reading.snapshot.upstreamConfigured = true;
-    reading.snapshot.uptime = Uptime { std::chrono::seconds { 864'017 } };
-    reading.version = "0.4.1-dev \"build\"";
-    return reading;
-}
-
-/// The model a scrape of @p reading reads back as.
-/// @param body The scrape.
-/// @return The reading.
-[[nodiscard]] StatsReading ReadBack(std::string const& body)
-{
-    auto const reading = StatsReadingFromRecord(ParsePrometheus(body), StatsOrigin::Metrics);
-    REQUIRE(reading.has_value());
-    return Unwrap(reading);
-}
-} // namespace
-
-TEST_CASE("a /metrics scrape reads back as the reading the daemon rendered it from", "[cli][stats]")
-{
-    // The adapter is the one place a series name becomes a model field, so it must be the formatter's exact
-    // inverse over everything a panel can read. WHAT DISTINGUISHES: every field a different number, so a row
-    // storing into its neighbour's field, a missing row, a tier read as the whole cache or a counter the sink
-    // cannot carry read as zero all break the equality. The consensus block is not read back (see
-    // `StatsReadingFromRecord`), so the reading has none.
-    auto const original = EveryFieldDistinct();
-    auto const back = ReadBack(RenderPrometheus(original));
-
-    // What a scrape does not render reads back as zero, and says so here rather than hiding in the equality: the
-    // cache's own index figures, and every field of a tier but the five its series carry. No panel reads those.
-    auto expected = original;
-    auto storage = Unwrap(expected.snapshot.storage);
-    storage.indexBytes = 0;
-    storage.indexBytesAtCapacity = 0;
-    expected.snapshot.storage = storage;
-    for (auto& tier: expected.snapshot.storageTiers)
-        if (tier.has_value())
-            tier = StorageStats { .itemCount = tier->itemCount,
-                                  .bytesUsed = tier->bytesUsed,
-                                  .bytesLimit = tier->bytesLimit,
-                                  .indexBytes = tier->indexBytes,
-                                  .evictions = tier->evictions };
-    CHECK(back.counters == original.counters);
-    CHECK(back.snapshot.storage == expected.snapshot.storage);
-    CHECK(back.snapshot.storageTiers == expected.snapshot.storageTiers);
-    CHECK(back.snapshot.host == original.snapshot.host);
-    CHECK(back.snapshot.hostLoad == original.snapshot.hostLoad);
-    CHECK(back.snapshot.upstreamConfigured == original.snapshot.upstreamConfigured);
-    CHECK(back.snapshot.uptime == original.snapshot.uptime);
-    CHECK(back.version == original.version);
-    CHECK(back == expected);
-}
-
-TEST_CASE("a block a record carries only part of reads as absent, never as zeroes", "[cli][stats]")
-{
-    // A scrape renders the cache, a tier and the host whole or not at all, so a record with part of one is not a
-    // reading of that block. WHAT DISTINGUISHES: one series removed takes its block, and only its block -- the
-    // other tier and the host stay.
-    auto const original = EveryFieldDistinct();
-    auto const whole = ReadBack(RenderPrometheus(original));
-    auto const without = [&original](std::string_view series) {
-        auto record = ParsePrometheus(RenderPrometheus(original));
-        auto const before = record.fields.size();
-        std::erase_if(record.fields, [series](Field const& field) { return field.name == series; });
-        REQUIRE(record.fields.size() == before - 1);
-        return Unwrap(StatsReadingFromRecord(record, StatsOrigin::Metrics));
-    };
-
-    auto const noItems = without("fastcached_items");
-    CHECK_FALSE(noItems.snapshot.storage.has_value());
-    CHECK(noItems.snapshot.storageTiers == whole.snapshot.storageTiers);
-    CHECK(noItems.snapshot.host == whole.snapshot.host);
-
-    auto const memoryTier = std::string { StorageTierTable[0].name };
-    auto const noTierLimit = without(TierSeriesName("fastcached_tier_bytes_limit", memoryTier));
-    CHECK_FALSE(noTierLimit.snapshot.storageTiers[0].has_value());
-    CHECK(noTierLimit.snapshot.storage == whole.snapshot.storage);
-
-    auto const noCores = without("fastcache_node_logical_cores");
-    CHECK_FALSE(noCores.snapshot.host.has_value());
-    CHECK(noCores.snapshot.storage == whole.snapshot.storage);
-}
-
-TEST_CASE("a machine's load reads back figure by figure, and its CPU as a pair or not at all", "[cli][stats]")
-{
-    // A scrape renders each load figure only when it was read, so the adapter reads each on its own. WHAT
-    // DISTINGUISHES: one tick counter gone takes the CPU and leaves the memory; the memory gone leaves the CPU;
-    // both gone is no load block, and the host beside it stays either way.
-    auto const original = EveryFieldDistinct();
-    auto const whole = ReadBack(RenderPrometheus(original));
-    REQUIRE(whole.snapshot.hostLoad.has_value());
-    auto const without = [&original](std::initializer_list<std::string_view> series) {
-        auto record = ParsePrometheus(RenderPrometheus(original));
-        auto const before = record.fields.size();
-        std::erase_if(record.fields,
-                      [series](Field const& field) { return std::ranges::find(series, field.name) != series.end(); });
-        REQUIRE(record.fields.size() == before - series.size());
-        return Unwrap(StatsReadingFromRecord(record, StatsOrigin::Metrics));
-    };
-
-    auto const noTotal = without({ "fastcache_node_cpu_ticks_total" });
-    REQUIRE(noTotal.snapshot.hostLoad.has_value());
-    CHECK_FALSE(Unwrap(noTotal.snapshot.hostLoad).cpu.has_value());
-    CHECK(Unwrap(noTotal.snapshot.hostLoad).availableMemoryBytes == Unwrap(original.snapshot.hostLoad).availableMemoryBytes);
-
-    auto const noMemory = without({ "fastcache_node_memory_available_bytes" });
-    REQUIRE(noMemory.snapshot.hostLoad.has_value());
-    CHECK(Unwrap(noMemory.snapshot.hostLoad).cpu == Unwrap(original.snapshot.hostLoad).cpu);
-    CHECK_FALSE(Unwrap(noMemory.snapshot.hostLoad).availableMemoryBytes.has_value());
-
-    auto const none = without({ "fastcache_node_cpu_busy_ticks_total",
-                                "fastcache_node_cpu_ticks_total",
-                                "fastcache_node_memory_available_bytes" });
-    CHECK_FALSE(none.snapshot.hostLoad.has_value());
-    CHECK(none.snapshot.host == whole.snapshot.host);
-}
-
-TEST_CASE("each source states the part of the live model it carries, and INFO states none", "[cli][stats]")
-{
-    auto const body = RenderPrometheus(EveryFieldDistinct());
-    auto const record = ParsePrometheus(body);
-
-    // NodeMetrics carries the catalogue: the counters, and no block of the snapshot.
-    auto const node = StatsReadingFromRecord(record, StatsOrigin::NodeMetrics);
-    REQUIRE(node.has_value());
-    CHECK(Unwrap(node).counters == EveryFieldDistinct().counters);
-    CHECK_FALSE(Unwrap(node).snapshot.storage.has_value());
-    CHECK_FALSE(Unwrap(node).snapshot.host.has_value());
-
-    // INFO fills no block whole, so it states no reading at all -- not an empty one.
-    CHECK_FALSE(StatsReadingFromRecord(record, StatsOrigin::Info).has_value());
-    CHECK(StatsReadingFromRecord(record, StatsOrigin::Metrics).has_value());
 }

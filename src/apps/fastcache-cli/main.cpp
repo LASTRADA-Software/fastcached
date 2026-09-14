@@ -13,6 +13,7 @@
 #include "CliFormat.hpp"
 #include "CliVerbs.hpp"
 #include "LiveSession.hpp"
+#include "LiveSubscriber.hpp"
 #include "SixelEncoder.hpp"
 #include "SocketExchange.hpp"
 #include "StatsGatherer.hpp"
@@ -160,63 +161,6 @@ void ReportAdvisories(Answer const& answer, bool quiet)
     return command.credential.Configured() ? std::optional<std::string> { command.credential.secret } : std::nullopt;
 }
 
-/// The stats ladder over connections of its own: what a re-dial builds.
-///
-/// Owns what it opened, where the ladder in `RunAndReport` borrows the connections that
-/// frame opened. A connection that could not be opened is simply absent -- the ladder reports
-/// that rung as not answering, which is the failed sample the next re-dial follows.
-class DialedLadder final: public IDialedStats
-{
-  public:
-    /// @param command Where to dial, with what credential and timeouts.
-    /// @param wire The verb's wire, which says which connections it needs.
-    DialedLadder(Command const& command, WireSpec const& wire):
-        _resp { wire.needsResp ? SocketExchange::Open(command.cache, command.timeouts, command.credential).value_or(nullptr)
-                               : nullptr },
-        _node { wire.needsNode ? NodeExchange::Open(command.cache, command.timeouts, command.credential).value_or(nullptr)
-                               : nullptr },
-        _ladder { command.admin, command.cache, command.timeouts, AdminBearer(command), _resp.get(), _node.get() }
-    {
-    }
-
-    [[nodiscard]] std::vector<StatsAttempt> Gather() override
-    {
-        return _ladder.Gather();
-    }
-
-    [[nodiscard]] std::optional<CompileCacheWire::NodeStatusFields> ReadNodeStatus() override
-    {
-        return _ladder.ReadNodeStatus();
-    }
-
-  private:
-    std::unique_ptr<SocketExchange> _resp;
-    std::unique_ptr<NodeExchange> _node;
-    LadderGatherer _ladder;
-};
-
-/// Re-dials the endpoint a session watches, the way this invocation dialled it first.
-class LadderRedial final: public IStatsDialer
-{
-  public:
-    /// @param command Where to dial; must outlive every dial.
-    /// @param wire The verb's wire; must outlive every dial.
-    LadderRedial(Command const& command, WireSpec const& wire) noexcept:
-        _command { command },
-        _wire { wire }
-    {
-    }
-
-    [[nodiscard]] std::unique_ptr<IDialedStats> Dial() override
-    {
-        return std::make_unique<DialedLadder>(_command, _wire);
-    }
-
-  private:
-    Command const& _command;
-    WireSpec const& _wire;
-};
-
 /// A session's frames, to stdout, each flushed as it is presented.
 ///
 /// Flushed per frame because a pipe is block-buffered: without it a reader downstream of
@@ -358,8 +302,8 @@ class StopReactorOnExit
 /// is the source destroyed, before the pools and the reactor it borrowed from -- an object a
 /// reactor owns dies with that reactor stopped.
 ///
-/// **An abandonment ends the process here, without unwinding**: a sample still inside a gather
-/// holds the gatherer and the connections this stack owns, and returning would destroy them
+/// **An abandonment ends the process here, without unwinding**: a read still inside the
+/// subscription holds it and the connection this stack owns, and returning would destroy them
 /// under the pool thread. A terminal read may be parked too, so the terminal is put back through
 /// its restore handle rather than by destroying anything, before the flush and the line --
 /// `EndAbandonedSession` owns that order.
@@ -378,14 +322,16 @@ class StopReactorOnExit
 
     SteadyClock clock;
     PlatformReactor reactor { clock };
-    ThreadPoolExecutor samplePool { 1 };
+    // Declared BEFORE the pool that reads it, so it is destroyed after that pool has joined: a read
+    // still inside it when the pool drains would otherwise run on a destroyed object.
+    NodeSubscription subscription { command.timeouts, command.credential };
+    ThreadPoolExecutor streamPool { 1 };
     ThreadPoolExecutor stopWaiter { 1 };
     ThreadPoolExecutor terminalPool { 1 };
     StdoutFrames sink;
     StderrRemarks remarks { command.quiet };
     ProcessStopSignals stops;
     StandardTerminalAcquisition terminals { ResolveColor(command.color) };
-    LadderRedial redial { command, WireTable[static_cast<std::size_t>(verb.wire)] };
     // A build without the terminal library has no encoder, and its sessions never reach the Sixel
     // rung; the chart is then simply not drawn.
     auto sixel = MakeSixelEncoder();
@@ -397,10 +343,11 @@ class StopReactorOnExit
 
     auto ending = verb.session(context,
                                LiveSessionSeat { .reactor = &reactor,
-                                                 .address = std::format("{}:{}", command.cache.host, command.cache.port),
+                                                 .endpoint = command.cache,
+                                                 .dashboardToken = command.dashboardToken,
                                                  .clock = &clock,
-                                                 .dialer = &redial,
-                                                 .samplePool = &samplePool,
+                                                 .subscription = &subscription,
+                                                 .streamPool = &streamPool,
                                                  .stopWaiter = &stopWaiter,
                                                  .terminalPool = &terminalPool,
                                                  .sink = &sink,
@@ -525,10 +472,7 @@ class StopReactorOnExit
                                        .admin = &gatherer,
                                        // And a third time: what the endpoint IS is that same cached
                                        // answer, which `live-stats` decides its subject from.
-                                       .identity = &gatherer,
-                                       // And a fourth, deliberately NOT that cached answer: what a node
-                                       // says about itself now, asked afresh every time.
-                                       .nodeStatus = &gatherer };
+                                       .identity = &gatherer };
 
     if (verb.session != nullptr)
         return RunSessionAndReport(command, verb, context, openingRemarks);
@@ -634,6 +578,13 @@ int main(int argc, char* argv[])
         if (!secret.has_value())
             return ReportUsageError(secret.error());
         command.credential.secret = *secret;
+    }
+    if (!command.dashboardTokenFile.empty())
+    {
+        auto const secret = ReadSecretFile(command.dashboardTokenFile);
+        if (!secret.has_value())
+            return ReportUsageError(secret.error());
+        command.dashboardToken = *secret;
     }
 
     auto const* const verb = FindVerb(command.verb);

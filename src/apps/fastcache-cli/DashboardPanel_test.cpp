@@ -7,23 +7,24 @@
 #include "FleetDocument.hpp"
 #include "FleetReading.hpp"
 #include "LivePipedView.hpp"
-#include "ScrapeFixture.hpp"
 #include "ScriptedCellWidth.hpp"
 #include "ScriptedSixelEncoder.hpp"
-#include "StatsSource.hpp"
 
 #include <FastCache/Cache/StorageTier.hpp>
 #include <FastCache/Core/Ranges.hpp>
 #include <FastCache/Distributed/FleetView.hpp>
 #include <FastCache/Distributed/NodePolicy.hpp>
+#include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Metrics/MetricsCatalog.hpp>
-#include <FastCache/Metrics/PrometheusFormatter.hpp>
+#include <FastCache/Metrics/StatsReading.hpp>
+#include <FastCache/Metrics/StatsReadingCodec.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <expected>
 #include <format>
@@ -51,74 +52,41 @@ namespace
 /// An absent marker no figure could be mistaken for.
 constexpr std::string_view Absent = "n/a";
 
-/// One field of a scripted reading.
+/// A `Sample` carrying @p reading, taken @p seconds in, from a stream dialled at @p where.
 ///
-/// A constructor rather than an aggregate so a reading reads as a list of `{ name, value }` pairs,
-/// which is what a scrape is.
-struct Series
-{
-    /// @param seriesName The series name, labels included.
-    /// @param seriesValue Its value.
-    Series(std::string seriesName, std::uint64_t seriesValue):
-        name { std::move(seriesName) },
-        value { seriesValue }
-    {
-    }
-
-    std::string name;    ///< The series name, labels included.
-    std::uint64_t value; ///< Its value.
-};
-
-/// A `Sample` whose one stats source answered with @p series, taken @p seconds in.
-/// @param series The reading's fields.
+/// **The reading is the model a subscription carries**, built whole: a panel reads every figure from this struct, and
+/// a block is present or absent in it exactly as a capture states it.
+/// @param reading The reading.
 /// @param seconds When it was taken.
-/// @param origin Which source answered.
+/// @param where The endpoint the stream was read from; empty when the case does not say.
 /// @return The event.
-[[nodiscard]] DashboardEvent SampleOf(std::vector<Series> const& series,
-                                      int seconds,
-                                      StatsOrigin origin = StatsOrigin::Metrics)
+[[nodiscard]] DashboardEvent SampleOf(StatsReading reading, int seconds, std::string where = {})
 {
-    auto fields = std::vector<Field> {};
-    for (auto const& one: series)
-        fields.push_back(Field { .name = one.name, .value = NumberCell(one.value) });
     return DashboardEvent { .kind = DashboardEventKind::Sample,
                             .at = TimePoint { std::chrono::seconds { seconds } },
-                            .attempts = { StatsAttempt {
-                                .origin = origin, .asked = true, .record = RecordValue(std::move(fields)), .note = {} } } };
+                            .reading = std::move(reading),
+                            .where = std::move(where) };
 }
 
-/// The name of the catalogue's accepted-connections counter.
-[[nodiscard]] std::string ConnectionsTotal()
+/// A reading stating one catalogue counter and nothing else.
+/// @param counter The counter.
+/// @param value What it reads.
+/// @return The reading.
+[[nodiscard]] StatsReading CounterReading(IMetricsSink::Counter counter, std::uint64_t value)
 {
-    return std::string { DescriptorOf(IMetricsSink::Counter::ConnectionsTotal)->prometheusName };
+    auto reading = StatsReading {};
+    reading.counters[static_cast<std::size_t>(counter)] = value;
+    return reading;
 }
 
-/// The series a scrape of @p reading carries (`ScrapeOf`), as numbers.
-/// @param reading The model.
-/// @return The series.
-[[nodiscard]] std::vector<Series> SeriesOf(StatsReading const& reading)
-{
-    auto series = std::vector<Series> {};
-    for (auto const& field: ScrapeOf(reading))
-    {
-        auto value = std::uint64_t { 0 };
-        auto const& text = field.value.lexical;
-        auto const [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
-        if (field.value.kind == CellKind::Number && error == std::errc {} && end == text.data() + text.size())
-            series.emplace_back(field.name, value);
-    }
-    return series;
-}
-
-/// A full `/metrics` reading for the cache panel, every counter scaled by @p step.
+/// A full reading for the cache panel, every counter scaled by @p step.
 ///
-/// **Rendered by the daemon's formatter from a model and read back by the client's parser**, so the fixture holds
-/// what a scrape holds: a cache block whole or not at all. A record with half a block is one no daemon sends, and
-/// the live model cannot state it.
+/// A cache block is whole or absent, because the live model states nothing else: a reading with half a block is
+/// one no capture produces.
 /// @param step How far every counter has moved.
 /// @param tiers Which tiers the reading carries.
-/// @return The fields.
-[[nodiscard]] std::vector<Series> CacheSeries(std::uint64_t step, std::vector<std::string_view> const& tiers)
+/// @return The reading.
+[[nodiscard]] StatsReading CacheReading(std::uint64_t step, std::vector<std::string_view> const& tiers)
 {
     auto reading = StatsReading {};
     reading.counters[static_cast<std::size_t>(IMetricsSink::Counter::ConnectionsTotal)] = 3 * step;
@@ -146,7 +114,7 @@ struct Series
                            .indexBytes = std::size_t { 248 } << 20U,
                            .evictions = step };
     }
-    return SeriesOf(reading);
+    return reading;
 }
 
 /// A line's code points, one string each.
@@ -265,7 +233,7 @@ TEST_CASE("the first panel frame has every rate absent and the second has every 
     // §9.1 on the drawn panel. WHAT DISTINGUISHES: both directions, every rate row. A panel showing
     // `0` on frame one passes a check that frame two is present, and is the defect.
     auto const frames =
-        CacheFrames({ SampleOf(CacheSeries(1, { "memory" }), 1), Tick, SampleOf(CacheSeries(2, { "memory" }), 2), Tick },
+        CacheFrames({ SampleOf(CacheReading(1, { "memory" }), 1), Tick, SampleOf(CacheReading(2, { "memory" }), 2), Tick },
                     RenderRung::Unicode);
     REQUIRE(frames.size() == 2);
 
@@ -293,7 +261,7 @@ TEST_CASE("a gap and a real zero draw different middle cells in a panel's trend"
     // measure; the zero is a counter that did not move. WHAT DISTINGUISHES: the MIDDLE of the last
     // three cells differs, and is a space on one side and the lowest block on the other.
     auto const connections = [](std::uint64_t value) {
-        return std::vector<Series> { { ConnectionsTotal(), value } };
+        return CounterReading(IMetricsSink::Counter::ConnectionsTotal, value);
     };
 
     auto const gapped = CacheFrames({ SampleOf(connections(0), 1),
@@ -335,7 +303,7 @@ TEST_CASE("a young session's trend starts where its figure ends and fills toward
     // is a reading and every cell after the newest is blank -- a right-aligned window draws the blank run
     // first and the readings at the far end, which is the picture that read as a narrow trend pushed right.
     auto const frames = CacheFrames(
-        { SampleOf(CacheSeries(1, {}), 1), SampleOf(CacheSeries(2, {}), 2), SampleOf(CacheSeries(3, {}), 3), Tick },
+        { SampleOf(CacheReading(1, {}), 1), SampleOf(CacheReading(2, {}), 2), SampleOf(CacheReading(3, {}), 3), Tick },
         RenderRung::Unicode);
     REQUIRE(frames.size() == 1);
     auto const row = RowLine(frames[0], "ops/sec");
@@ -353,7 +321,7 @@ TEST_CASE("a counter that went down draws a gap and the next interval draws a ra
 {
     // §9.3 on the panel: no negative rate, no clamp to zero, and the FOLLOWING interval is present.
     auto const connections = [](std::uint64_t value) {
-        return std::vector<Series> { { ConnectionsTotal(), value } };
+        return CounterReading(IMetricsSink::Counter::ConnectionsTotal, value);
     };
     auto const frames = CacheFrames(
         { SampleOf(connections(100), 1), SampleOf(connections(50), 2), Tick, SampleOf(connections(60), 3), Tick },
@@ -403,7 +371,7 @@ TEST_CASE("a tier table keeps three blank cells between every pair of columns, h
         return cells;
     };
 
-    auto const frames = CacheFrames({ SampleOf(CacheSeries(1, { "memory", "disk" }), 1), Tick }, RenderRung::Unicode);
+    auto const frames = CacheFrames({ SampleOf(CacheReading(1, { "memory", "disk" }), 1), Tick }, RenderRung::Unicode);
     REQUIRE(frames.size() == 1);
     auto const lines = Lines(frames.front());
     auto const columns = CachePanel().tierColumns.size();
@@ -432,9 +400,7 @@ TEST_CASE("an 80x24 cache panel carries every label, qualifier and note section 
     // one place: each rate's qualifier, the tier heading, the footnote and the source line, so a regression to
     // key names or to dropping a qualifier goes red here.
     auto const at = [](std::uint64_t step, int seconds) {
-        auto sample = SampleOf(CacheSeries(step, { "memory", "disk" }), seconds);
-        sample.attempts.front().where = "127.0.0.1:9464";
-        return sample;
+        return SampleOf(CacheReading(step, { "memory", "disk" }), seconds, "127.0.0.1:6379");
     };
     auto view = PanelView { CachePanel(),
                             PanelContext { .absent = std::string { Absent },
@@ -498,7 +464,7 @@ TEST_CASE("an 80x24 cache panel carries every label, qualifier and note section 
     CHECK(frame.contains("index (RAM)"));
     CHECK(frame.contains("tier bytes carry per-tier denominations and do not sum; no per-tier"));
     CHECK(frame.contains("hit rate is published, deliberately."));
-    CHECK(frame.contains("source  metrics (/metrics at 127.0.0.1:9464)"));
+    CHECK(frame.contains("source  subscription (SUBSCRIBE at 127.0.0.1:6379)"));
 }
 
 TEST_CASE("a cache frame dresses its level and tier readings as figures, their labels and notes as labels, and an "
@@ -507,10 +473,10 @@ TEST_CASE("a cache frame dresses its level and tier readings as figures, their l
 {
     // G1. WHAT DISTINGUISHES: each run covers exactly the words it names -- `items`, not `items       ` -- with the
     // tone of what they are, so a figure and its label are two runs rather than one run over both; and a reading
-    // the source did not carry (`fastcached_items` removed) gets no run, where dressing the marker as a figure would
-    // give weight to a number that is not there. The absent readings here are the model's own: `connected` names no
-    // field, and one sample is no interval, so the tier's `evict/s` is absent.
-    auto const series = CacheSeries(1, { "memory", "disk" });
+    // the source did not carry gets no run, where dressing the marker as a figure would give weight to a number
+    // that is not there. The absent readings here are the model's own: `connected` names no field, and one sample
+    // is no interval, so the tier's `evict/s` is absent.
+    auto const series = CacheReading(1, { "memory", "disk" });
     auto sink = CollectingSink {};
     auto view = PanelView {
         CachePanel(),
@@ -578,7 +544,7 @@ TEST_CASE("a level label as wide as the label column still leaves a blank before
     };
     auto sink = CollectingSink {};
     (void) Drive({ DashboardEvent { .kind = DashboardEventKind::Resize, .columns = 80, .rows = 24 },
-                   SampleOf(CacheSeries(1, {}), 1),
+                   SampleOf(CacheReading(1, {}), 1),
                    Tick },
                  DashboardLimits {},
                  view,
@@ -617,7 +583,7 @@ TEST_CASE("a rate label wider than the label column and a figure as wide as the 
     };
     auto sink = CollectingSink {};
     (void) Drive({ DashboardEvent { .kind = DashboardEventKind::Resize, .columns = 80, .rows = 24 },
-                   SampleOf(CacheSeries(1, {}), 1),
+                   SampleOf(CacheReading(1, {}), 1),
                    Tick },
                  DashboardLimits {},
                  view,
@@ -646,8 +612,8 @@ TEST_CASE("a tier the endpoint does not run contributes no row", "[cli][dashboar
         return names;
     };
 
-    auto const memoryOnly = CacheFrames({ SampleOf(CacheSeries(1, { "memory" }), 1), Tick }, RenderRung::Unicode);
-    auto const both = CacheFrames({ SampleOf(CacheSeries(1, { "memory", "disk" }), 1), Tick }, RenderRung::Unicode);
+    auto const memoryOnly = CacheFrames({ SampleOf(CacheReading(1, { "memory" }), 1), Tick }, RenderRung::Unicode);
+    auto const both = CacheFrames({ SampleOf(CacheReading(1, { "memory", "disk" }), 1), Tick }, RenderRung::Unicode);
     REQUIRE(memoryOnly.size() == 1);
     REQUIRE(both.size() == 1);
 
@@ -657,14 +623,12 @@ TEST_CASE("a tier the endpoint does not run contributes no row", "[cli][dashboar
 
 TEST_CASE("an absent figure reads the same bytes on the Unicode and ASCII rungs", "[cli][dashboard][panel]")
 {
-    // §9.6. One reading, missing `fastcached_items` and the active cycle's counter, drawn on both
-    // rungs. WHAT DISTINGUISHES: every row's label-and-figure columns are byte-identical across the
-    // two rungs, and the rows compared DO carry the marker -- or identical lines of numbers pass.
-    auto series = CacheSeries(1, { "memory" });
-    std::erase_if(series, [](Series const& one) {
-        return one.name == "fastcached_items"
-               || one.name == DescriptorOf(IMetricsSink::Counter::ExpiryKeysReclaimed)->prometheusName;
-    });
+    // §9.6. One reading with no cache block -- so `items` is absent -- and no active cycle's counter, drawn on
+    // both rungs. WHAT DISTINGUISHES: every row's label-and-figure columns are byte-identical across the two
+    // rungs, and the rows compared DO carry the marker -- or identical lines of numbers pass.
+    auto series = CacheReading(1, { "memory" });
+    series.snapshot.storage.reset();
+    series.counters[static_cast<std::size_t>(IMetricsSink::Counter::ExpiryKeysReclaimed)].reset();
     auto const script = std::vector<DashboardEvent> { SampleOf(series, 1), Tick };
     auto const unicode = CacheFrames(script, RenderRung::Unicode);
     auto const ascii = CacheFrames(script, RenderRung::Ascii);
@@ -696,10 +660,11 @@ TEST_CASE("the ASCII rung keeps every figure and every absent marker the Unicode
     // tokens that are drawing rather than data -- edges, sparkline cells, gauges -- the two rungs'
     // words are the same list, in the same order. The controls: that list holds numbers and absent
     // markers, the Unicode frame drew a trend, and the ASCII frame drew none.
-    auto series = CacheSeries(2, { "memory", "disk" });
-    std::erase_if(series, [](Series const& one) { return one.name == "fastcached_items"; });
+    // The second reading carries no cache block, so `items` and every figure over the block read absent.
+    auto series = CacheReading(2, { "memory", "disk" });
+    series.snapshot.storage.reset();
     auto const script =
-        std::vector<DashboardEvent> { SampleOf(CacheSeries(1, { "memory", "disk" }), 1), SampleOf(series, 2), Tick };
+        std::vector<DashboardEvent> { SampleOf(CacheReading(1, { "memory", "disk" }), 1), SampleOf(series, 2), Tick };
     auto const unicode = CacheFrames(script, RenderRung::Unicode);
     auto const ascii = CacheFrames(script, RenderRung::Ascii);
     REQUIRE(unicode.size() == 1);
@@ -751,8 +716,8 @@ TEST_CASE("every panel line is the terminal's width and a wider terminal draws m
     // wider one -- a panel that ignored the width would pass the first half at 80 alone.
     auto const drawAt = [](int columns) {
         return CacheFrames({ DashboardEvent { .kind = DashboardEventKind::Resize, .columns = columns, .rows = 60 },
-                             SampleOf(CacheSeries(1, { "memory" }), 1),
-                             SampleOf(CacheSeries(2, { "memory" }), 2),
+                             SampleOf(CacheReading(1, { "memory" }), 1),
+                             SampleOf(CacheReading(2, { "memory" }), 2),
                              Tick },
                            RenderRung::Unicode);
     };
@@ -773,14 +738,14 @@ TEST_CASE("every panel line is the terminal's width and a wider terminal draws m
     CHECK(SparkOf(Unwrap(wideLine), "accepted").size() > SparkOf(Unwrap(narrowLine), "accepted").size());
 }
 
-TEST_CASE("every figure a panel names reads the same number off a scrape the daemon renders", "[cli][dashboard][panel]")
+TEST_CASE("every figure a panel names reads the same number off the reading a subscription carries",
+          "[cli][dashboard][panel]")
 {
-    // A panel names the MODEL, and until #1399's subscription a live session still reads `/metrics`, so the
-    // adapter between them is what connects the two. WHAT DISTINGUISHES: a reading whose every field is a
-    // different number, rendered by the real formatter and parsed by the client's own parser, reads back the SAME
-    // number for every figure a panel draws -- tier columns once per tier -- so an adapter row that is missing,
-    // or stores into its neighbour's field, reads absent or the wrong number here. The control is a figure the
-    // original carries and a reading with no cache does not.
+    // A panel names the MODEL, and a live session reads it off the wire in the binary form (#1399). WHAT
+    // DISTINGUISHES: a reading whose every field is a different number, encoded by the daemon's encoder and
+    // decoded by the client's decoder, reads back the SAME number for every figure a panel draws -- tier columns
+    // once per tier -- so a figure the codec does not carry, or carries into its neighbour's field, reads absent
+    // or the wrong number here. The control is a figure the original carries and a reading with no cache does not.
     auto sink = AtomicMetricsSink {};
     auto value = std::uint64_t { 1 };
     for (auto const& row: CounterTable)
@@ -809,7 +774,9 @@ TEST_CASE("every figure a panel names reads the same number off a scrape the dae
                           .hostLoad = HostLoadReading { .cpu = CpuTicks { .busy = 7'700'001, .total = 9'100'003 },
                                                         .availableMemoryBytes = 21'474'836'480 },
                           .uptime = Uptime { 864'017s } });
-    auto const adapted = Unwrap(StatsReadingFromRecord(ParsePrometheus(RenderPrometheus(original)), StatsOrigin::Metrics));
+    auto const decoded = DecodeStatsReading(EncodeStatsReading(original));
+    REQUIRE(decoded.has_value());
+    auto const& adapted = decoded.value();
     auto const noCache = StatsReading {};
 
     auto checked = std::size_t { 0 };
@@ -867,7 +834,7 @@ TEST_CASE("a cache that served no reads has no hit rate rather than zero percent
     auto const reads = [](std::uint64_t hits, std::uint64_t misses) {
         auto reading = StatsReading {};
         reading.snapshot.storage = StorageStats { .getHits = hits, .getMisses = misses };
-        return SeriesOf(reading);
+        return reading;
     };
     auto const idle = CacheFrames({ SampleOf(reads(50, 50), 1), SampleOf(reads(50, 50), 2), Tick }, RenderRung::Unicode);
     auto const busy = CacheFrames({ SampleOf(reads(50, 50), 1), SampleOf(reads(80, 60), 2), Tick }, RenderRung::Unicode);
@@ -894,11 +861,11 @@ TEST_CASE("a newest sample that failed shows the marker rather than the last val
         return std::string {};
     };
 
-    auto const failed = CacheFrames({ SampleOf(CacheSeries(1, { "memory" }), 1),
+    auto const failed = CacheFrames({ SampleOf(CacheReading(1, { "memory" }), 1),
                                       DashboardEvent { .kind = DashboardEventKind::SampleFailed, .at = TimePoint { 2s } },
                                       Tick },
                                     RenderRung::Unicode);
-    auto const answered = CacheFrames({ SampleOf(CacheSeries(1, { "memory" }), 1), Tick }, RenderRung::Unicode);
+    auto const answered = CacheFrames({ SampleOf(CacheReading(1, { "memory" }), 1), Tick }, RenderRung::Unicode);
     REQUIRE(failed.size() == 1);
     REQUIRE(answered.size() == 1);
 
@@ -910,25 +877,18 @@ TEST_CASE("the node panel's per-minute rate and mean compile come from the catal
 {
     // A figure's SCALE and its quotient are data in the node table, and nothing else draws them.
     // Ten jobs over two seconds is 300 per minute, not 5; twenty thousand milliseconds over those
-    // ten jobs is a 2 s mean, not 2000. Read from a `NodeMetrics` reading, whose names are the
-    // catalogue's own, so the case also proves the node table resolves that source.
+    // ten jobs is a 2 s mean, not 2000. Read from a reading stating those two counters alone.
     auto const node = [](std::uint64_t jobs, std::uint64_t millis) {
-        return std::vector<Series> {
-            { std::string { DescriptorOf(IMetricsSink::Counter::WorkerJobsCompleted)->prometheusName }, jobs },
-            { std::string { DescriptorOf(IMetricsSink::Counter::WorkerCompileMillisTotal)->prometheusName }, millis },
-        };
+        auto reading = CounterReading(IMetricsSink::Counter::WorkerJobsCompleted, jobs);
+        reading.counters[static_cast<std::size_t>(IMetricsSink::Counter::WorkerCompileMillisTotal)] = millis;
+        return reading;
     };
     auto view = PanelView {
         NodePanel(),
         PanelContext { .absent = std::string { Absent }, .cellWidth = &FakeCellWidth, .rung = RenderRung::Unicode }
     };
     auto sink = CollectingSink {};
-    (void) Drive({ SampleOf(node(10, 1000), 1, StatsOrigin::NodeMetrics),
-                   SampleOf(node(20, 21000), 3, StatsOrigin::NodeMetrics),
-                   Tick },
-                 DashboardLimits {},
-                 view,
-                 sink);
+    (void) Drive({ SampleOf(node(10, 1000), 1), SampleOf(node(20, 21000), 3), Tick }, DashboardLimits {}, view, sink);
     REQUIRE(sink.frames.size() == 1);
 
     auto const compiles = RowLine(sink.frames[0], "compiles/min");
@@ -964,7 +924,7 @@ namespace
 /// @return The events.
 [[nodiscard]] std::vector<DashboardEvent> TwoTierScript()
 {
-    return { SampleOf(CacheSeries(1, { "memory", "disk" }), 1), SampleOf(CacheSeries(2, { "memory", "disk" }), 2), Tick };
+    return { SampleOf(CacheReading(1, { "memory", "disk" }), 1), SampleOf(CacheReading(2, { "memory", "disk" }), 2), Tick };
 }
 
 /// The one frame @p script draws through the cache panel at @p columns by @p rows.
@@ -1305,13 +1265,22 @@ constexpr auto FleetMachines = std::size_t { 12 };
 
 /// A `fleet` sample carrying @p document, taken @p seconds in.
 /// @param seconds When.
-/// @param document What the fetch produced.
+/// @param document The leader's document, as its stream carried it.
+/// @param where The endpoint the stream was read from; empty when the case does not say.
 /// @return The event.
-[[nodiscard]] DashboardEvent FleetSampleOf(int seconds, std::expected<std::string, AdminError> document)
+[[nodiscard]] DashboardEvent FleetSampleOf(int seconds, std::string document, std::string where = {})
 {
     return DashboardEvent { .kind = DashboardEventKind::Sample,
                             .at = TimePoint { std::chrono::seconds { seconds } },
-                            .document = std::move(document) };
+                            .document = std::move(document),
+                            .where = std::move(where) };
+}
+
+/// A fleet frame's source text when its sample did not say where: what was asked, from the leader.
+/// @return `source  subscription (SUBSCRIBE, leader)`.
+[[nodiscard]] std::string FleetSourceText()
+{
+    return std::format("source  {} ({}, {})", SubscriptionSource, SubscriptionRoute, LeaderRole);
 }
 
 /// Draw @p script through the fleet panel, read by the fleet reader, after a `Resize`.
@@ -1517,7 +1486,7 @@ TEST_CASE("a fleet panel draws the section from the header line it was sent, a c
     CHECK(AfterWord(frame, kpis[1].label).value_or("").starts_with("47"));
     CHECK(AfterWord(frame, kpis[1].label).value_or("").contains(std::format("of 192 {}", kpis[1].ofNoun)));
     CHECK(AfterWord(frame, kpis[2].label).value_or("").starts_with("88.1 %"));
-    CHECK(frame.contains(FleetReadingSource));
+    CHECK(frame.contains(FleetSourceText()));
 }
 
 TEST_CASE("a fleet table fills its width by the leader's rank, a narrow column in room a wide one cannot use",
@@ -1624,7 +1593,7 @@ TEST_CASE("a fleet table taller than its room gives up rows before the tiles, an
     CHECK(LineStarting(frame, "endpoint").has_value());
     CHECK(frame.contains(Distributed::FleetKpis().front().label));
     CHECK(frame.contains("[machines]"));
-    CHECK(frame.contains(FleetReadingSource));
+    CHECK(frame.contains(FleetSourceText()));
     auto const shown = LinesStarting(frame, "build-");
     CHECK(frame.contains(std::format("... {} more machines; PgDn scrolls, / filters", FleetMachines - shown)));
 
@@ -1651,13 +1620,15 @@ TEST_CASE("a fleet panel drawn after a failed sample shows no table from before 
     // A leader that stopped answering is a gap, not its last fleet. WHAT DISTINGUISHES: the frame after
     // the refusal has no machine rows and the marker where the table goes, while the frame before it has
     // every row -- a panel keeping the last document passes the first half and fails the second.
-    auto const frames = FleetFramesAt(
-        { FleetSampleOf(1, FleetText(FleetMachines)),
-          Tick,
-          FleetSampleOf(2, std::unexpected(AdminError { .kind = AdminFailure::Refused, .detail = "not the leader" })),
-          Tick },
-        132,
-        40);
+    auto const frames = FleetFramesAt({ FleetSampleOf(1, FleetText(FleetMachines)),
+                                        Tick,
+                                        DashboardEvent { .kind = DashboardEventKind::SampleFailed,
+                                                         .at = TimePoint { 2s },
+                                                         .outcome = Outcome::Refused,
+                                                         .note = "not the leader" },
+                                        Tick },
+                                      132,
+                                      40);
     REQUIRE(frames.size() == 2);
     CHECK(LinesStarting(frames[0], "build-") == FleetMachines);
     CHECK(LinesStarting(frames[1], "build-") == 0);
@@ -2308,8 +2279,8 @@ TEST_CASE("the active section's tab is dressed as selected, and a letter from th
 namespace
 {
 
-/// The admin address the chrome fixtures' cache readings answered at.
-constexpr std::string_view ChromeAdmin = "127.0.0.1:9464";
+/// The endpoint the chrome fixtures' cache sessions subscribe at, and their streams answered from.
+constexpr std::string_view ChromeEndpoint = "127.0.0.1:6379";
 
 /// @p frame's top edge.
 /// @param frame The frame.
@@ -2349,31 +2320,15 @@ constexpr std::string_view ChromeAdmin = "127.0.0.1:9464";
     return std::format("{} {} {}{}", glyphs.horizontal, right, glyphs.horizontal, glyphs.topRight);
 }
 
-/// The fields a `/metrics` body stating build @p version parses into: the server's own info series, read by the
-/// parser the session reads with -- so a fixture cannot state the version in a spelling `/metrics` never sends.
-/// @param version The version the build info names.
-/// @return The fields.
-[[nodiscard]] std::vector<Field> BuildInfoFields(std::string_view version)
-{
-    return ParsePrometheus(RenderInfoMetric(InfoTable.front(), version)).fields;
-}
-
 /// A cache reading carrying what §3's title bar states: a version, and an uptime of `6d04:12`.
 /// @return The event.
 [[nodiscard]] DashboardEvent CacheChromeSample()
 {
-    constexpr auto Uptime = std::uint64_t { (6 * 24 * 60 * 60) + (4 * 60 * 60) + (12 * 60) };
-    auto sample = SampleOf(CacheSeries(1, { "memory" }), 1);
-    auto& attempt = sample.attempts.front();
-    auto fields = Unwrap(attempt.record).fields;
-    // The scrape already states an uptime; this reading's is six days and a bit.
-    auto const uptime = std::ranges::find(fields, std::string { "fastcached_uptime_seconds" }, &Field::name);
-    REQUIRE(uptime != fields.end());
-    uptime->value = NumberCell(Uptime);
-    std::ranges::copy(BuildInfoFields("0.4.1"), std::back_inserter(fields));
-    attempt.record = RecordValue(std::move(fields));
-    attempt.where = std::string { ChromeAdmin };
-    return sample;
+    constexpr auto SixDaysAndABit = std::chrono::seconds { (6 * 24 * 60 * 60) + (4 * 60 * 60) + (12 * 60) };
+    auto reading = CacheReading(1, { "memory" });
+    reading.snapshot.uptime = Uptime { SixDaysAndABit };
+    reading.version = "0.4.1";
+    return SampleOf(std::move(reading), 1, std::string { ChromeEndpoint });
 }
 
 /// The frames a cache panel asking `127.0.0.1:6379` every two seconds draws for @p script, @p columns wide.
@@ -2410,43 +2365,93 @@ TEST_CASE("a cache panel's title bar reads as section 3 draws it, its facts endi
     CHECK(top.ends_with(TopEnd("127.0.0.1:6379  up 6d04:12  every 2s  q quit")));
 }
 
-TEST_CASE("a cache panel titles itself with the version where its source states it, and in no other spelling",
+TEST_CASE("a cache panel titles itself with the version its reading carries, and with the marker for none",
           "[cli][dashboard][panel][chrome]")
 {
-    // WHAT DISTINGUISHES: each source's reading is asked in that source's spelling. A /metrics reading states the
-    // version as a LABEL of its build info and INFO as a field's VALUE; asking either in the other's spelling
-    // titles the panel `fastcached -`, which is what every cache read over /metrics drew before (#134 C1).
-    auto const titleOf = [](std::vector<Field> fields, StatsOrigin origin) {
-        auto sample = SampleOf({}, 1, origin);
-        sample.attempts.front().record = RecordValue(std::move(fields));
-        auto const frames = CacheChromeFrames({ sample, Tick }, 80);
+    // WHAT DISTINGUISHES: both directions. The version is the reading's own (`StatsReading::version`, the build that
+    // captured it), so a reading stating one titles the panel with it, and a reading stating none titles it with the
+    // marker -- never an empty word, and never a version from anywhere but the reading (#134 C1).
+    auto const titleOf = [](std::string version) {
+        auto reading = CacheReading(1, { "memory" });
+        reading.version = std::move(version);
+        auto const frames = CacheChromeFrames({ SampleOf(std::move(reading), 1), Tick }, 80);
         REQUIRE(frames.size() == 1);
         return TopEdge(frames.front());
     };
-    auto const infoField = [] {
-        return std::vector { Field { .name = "fastcached_version", .value = TextCell("0.4.1") } };
+
+    CHECK(titleOf("0.4.1").starts_with(TopStart("fastcached 0.4.1")));
+    CHECK(titleOf({}).starts_with(TopStart(std::format("fastcached {}", Absent))));
+}
+
+TEST_CASE("a cache panel is titled by the server that answered, and a panel whose subject is not a process keeps its own",
+          "[cli][dashboard][panel][chrome]")
+{
+    // #1399 D6: a compile node serves the cache subject, and titled `fastcached` the panel named a process that was not
+    // at the address. WHAT DISTINGUISHES: the same cache reading under a node's name titles itself with that name; with
+    // none stated it is `fastcached`; and the fleet panel handed a server name still says `fleet`, since its subject
+    // is the fleet rather than the process that sent it.
+    auto const titled = [](PanelSpec const& panel, std::string server, DashboardEvent sample) {
+        auto view = PanelView { panel,
+                                PanelContext { .absent = std::string { Absent },
+                                               .endpoint = "127.0.0.1:6379",
+                                               .server = std::move(server),
+                                               .interval = 2s,
+                                               .cellWidth = &FakeCellWidth,
+                                               .rung = RenderRung::Unicode } };
+        auto sink = CollectingSink {};
+        (void) Drive(
+            { DashboardEvent { .kind = DashboardEventKind::Resize, .columns = 80, .rows = 40 }, std::move(sample), Tick },
+            DashboardLimits {},
+            view,
+            sink);
+        REQUIRE(sink.frames.size() == 1);
+        return TopEdge(sink.frames.front());
     };
 
-    CHECK(titleOf(BuildInfoFields("0.4.1"), StatsOrigin::Metrics).starts_with(TopStart("fastcached 0.4.1")));
+    CHECK(titled(CachePanel(), "fastcache-compile-node", CacheChromeSample())
+              .starts_with(TopStart("fastcache-compile-node 0.4.1")));
+    CHECK(titled(CachePanel(), {}, CacheChromeSample()).starts_with(TopStart("fastcached 0.4.1")));
+    CHECK(titled(FleetPanel(), "fastcache-compile-node", CacheChromeSample()).starts_with(TopStart("fleet")));
+}
 
-    // INFO's spelling in a /metrics reading is not a version, and an INFO reading states no live reading at all
-    // (`StatsReadingFromRecord`), so even its own spelling titles nothing.
-    CHECK(titleOf(infoField(), StatsOrigin::Metrics).starts_with(TopStart(std::format("fastcached {}", Absent))));
-    CHECK(titleOf(infoField(), StatsOrigin::Info).starts_with(TopStart(std::format("fastcached {}", Absent))));
-    CHECK(titleOf(BuildInfoFields("0.4.1"), StatsOrigin::Info).starts_with(TopStart(std::format("fastcached {}", Absent))));
+TEST_CASE("a panel's title states the cadence the server granted and the asked interval while none is known",
+          "[cli][dashboard][panel][chrome]")
+{
+    // #1399 D10. The server keeps the cadence: a node whose floor is not this build's paces the stream at its own.
+    // WHAT DISTINGUISHES: asked every 2 s and granted 5 s, the title says `every 5s` -- a title reading the asked
+    // interval says `every 2s` over a stream arriving every five. And a failed sample carries no grant, so the title
+    // after it says `every 2s` again -- a title keeping the last grant passes the first half and fails the second.
+    auto granted = CacheChromeSample();
+    granted.cadence = std::chrono::milliseconds { 5000 };
+    auto const frames = CacheChromeFrames(
+        { granted, Tick, DashboardEvent { .kind = DashboardEventKind::SampleFailed, .at = TimePoint { 3s } }, Tick }, 80);
+    REQUIRE(frames.size() == 2);
+    auto const whileGranted = TopEdge(frames[0]);
+    CHECK(whileGranted.ends_with(TopEnd("127.0.0.1:6379  up 6d04:12  every 5s  q quit")));
+    CHECK_FALSE(whileGranted.contains("every 2s"));
+    auto const afterFailure = TopEdge(frames[1]);
+    CHECK(afterFailure.contains("every 2s"));
+    CHECK_FALSE(afterFailure.contains("every 5s"));
+
+    // The control: a reading that carried no grant states the asked interval from the first frame.
+    auto const ungranted = CacheChromeFrames({ CacheChromeSample(), Tick }, 80);
+    REQUIRE(ungranted.size() == 1);
+    CHECK(TopEdge(ungranted.front()).ends_with(TopEnd("127.0.0.1:6379  up 6d04:12  every 2s  q quit")));
 }
 
 TEST_CASE("a cache panel's source line names the source, what was asked and where, and counts at the edge",
           "[cli][dashboard][panel][chrome]")
 {
-    // §3: `source  metrics (/metrics at 127.0.0.1:9464)     148 samples, 1 gap`. WHAT DISTINGUISHES: the
-    // route and the address are the ANSWERING attempt's, and the counts end one blank column before the
-    // right edge rather than trailing the source.
+    // §3: `source  subscription (SUBSCRIBE at 127.0.0.1:6379)     148 samples, 1 gap`. WHAT DISTINGUISHES: the
+    // address is the one the stream was READ from, and the counts end one blank column before the right edge
+    // rather than trailing the source.
     auto const frames = CacheChromeFrames({ CacheChromeSample(), Tick }, 80);
     REQUIRE(frames.size() == 1);
     auto const row = SourceRow(frames.front());
     REQUIRE(row.has_value());
-    CHECK(Columns(Unwrap(row), 1, 80).starts_with(std::format("  source  metrics (/metrics at {})   ", ChromeAdmin)));
+    CHECK(
+        Columns(Unwrap(row), 1, 80)
+            .starts_with(std::format("  source  {} ({} at {})   ", SubscriptionSource, SubscriptionRoute, ChromeEndpoint)));
     CHECK(Unwrap(row).ends_with(std::format("1 sample, 0 gaps {}", GlyphsFor(RenderRung::Unicode).vertical)));
 }
 
@@ -2489,10 +2494,9 @@ TEST_CASE("a narrow title bar drops its facts by priority, and never the subject
 TEST_CASE("a node panel's title bar and source line read as section 4 draws them", "[cli][dashboard][panel][chrome]")
 {
     // §4: `fastcache-compile-node 0.4.1 ───── build-07:7070  up 2d11:48  every 2s  q ─┐` and
-    // `source  metrics (/metrics at build-07:9464)`. The version and the uptime come from the node's own
-    // status, which its stats record does not carry.
-    auto sample = SampleOf({ { "fastcache_node_logical_cores", 32 } }, 1);
-    sample.attempts.front().where = "build-07:9464";
+    // `source  subscription (SUBSCRIBE at build-07:7070)`. The version and the uptime come from the node's own
+    // status, which its reading here does not carry.
+    auto sample = SampleOf(StatsReading {}, 1, "build-07:7070");
     auto status = CompileCacheWire::NodeStatusFields {};
     status.version = "0.4.1";
     status.uptimeSeconds = (2 * 24 * 60 * 60) + (11 * 60 * 60) + (48 * 60);
@@ -2516,17 +2520,18 @@ TEST_CASE("a node panel's title bar and source line read as section 4 draws them
     CHECK(top.ends_with(TopEnd("build-07:7070  up 2d11:48  every 2s  q")));
     auto const row = SourceRow(sink.frames.front());
     REQUIRE(row.has_value());
-    CHECK(Columns(Unwrap(row), 1, 80).starts_with("  source  metrics (/metrics at build-07:9464)   "));
+    CHECK(Columns(Unwrap(row), 1, 80).starts_with("  source  subscription (SUBSCRIBE at build-07:7070)   "));
 }
 
 TEST_CASE("a fleet panel's title bar names the leader once it answered as one, and its source line says so",
           "[cli][dashboard][panel][chrome][fleet]")
 {
     // §5: `fleet ───── leader build-01:7071  12 machines  every 5s  q ─┐` and
-    // `source  /fleet.txt at build-01:9464 (leader)`. WHAT DISTINGUISHES: before a reading the address is
-    // not called the leader's -- nothing has shown it to be one -- and the machine count is the marker.
-    auto sample = FleetSampleOf(1, FleetText(FleetMachines));
-    sample.documentWhere = "10.0.0.4:9464";
+    // `source  subscription (SUBSCRIBE at build-01:7071, leader)` -- the cache and node panels' shape, with the
+    // role inside the brackets, sparing the address for the counts where both do not fit. WHAT DISTINGUISHES: before a
+    // reading the address is not called the leader's -- nothing has shown it to be one -- and the machine count is the
+    // marker.
+    auto sample = FleetSampleOf(1, FleetText(FleetMachines), "10.0.0.4:6674");
     auto view = PanelView { FleetPanel(),
                             PanelContext { .absent = std::string { Absent },
                                            .endpoint = "10.0.0.4:6674",
@@ -2551,7 +2556,49 @@ TEST_CASE("a fleet panel's title bar names the leader once it answered as one, a
     CHECK(after.ends_with(TopEnd(std::format("leader 10.0.0.4:6674  {} machines  every 5s  q", FleetMachines))));
     auto const row = SourceRow(sink.frames[1]);
     REQUIRE(row.has_value());
-    CHECK(Columns(Unwrap(row), 1, 80).starts_with("  source  /fleet.txt at 10.0.0.4:9464 (leader)   "));
+    // At 80 columns the address -- in the title bar already -- goes so the counts can stay (lane-livestats).
+    CHECK(Columns(Unwrap(row), 1, 80).starts_with("  source  subscription (SUBSCRIBE, leader)   "));
+    CHECK(Unwrap(row).ends_with(std::format("1 sample, 0 gaps {}", GlyphsFor(RenderRung::Unicode).vertical)));
+}
+
+TEST_CASE("at 80 columns a fleet source line spares the address before its counts, and a wider one keeps both",
+          "[cli][dashboard][panel][chrome][fleet]")
+{
+    // lane-livestats, on the owner's demo: `subscription (SUBSCRIBE at 127.0.0.1:26674, leader)` and `14 samples, 0 gaps`
+    // are 82 cells at 80 columns, and the counts went. WHAT DISTINGUISHES: at 80 the row ENDS with the counts and says
+    // `SUBSCRIBE, leader` (the title bar names the address); at 120 the same run says the address AND the counts --
+    // a line that dropped the address always would pass the first half and fail the second.
+    auto const lastSourceRow = [](int columns) {
+        auto script = std::vector<DashboardEvent> { DashboardEvent {
+            .kind = DashboardEventKind::Resize, .columns = columns, .rows = 40 } };
+        for (auto const second: std::views::iota(1, 15))
+        {
+            script.push_back(FleetSampleOf(second, FleetText(FleetMachines), "127.0.0.1:26674"));
+            script.push_back(Tick);
+        }
+        auto view = PanelView { FleetPanel(),
+                                PanelContext { .absent = std::string { Absent },
+                                               .endpoint = "127.0.0.1:26674",
+                                               .interval = 5s,
+                                               .cellWidth = &FakeCellWidth,
+                                               .rung = RenderRung::Unicode } };
+        auto sink = CollectingSink {};
+        (void) Drive(std::move(script), DashboardLimits {}, view, sink, &ReadFleetSample);
+        REQUIRE(sink.frames.size() == 14);
+        auto row = SourceRow(sink.frames.back());
+        REQUIRE(row.has_value());
+        return Unwrap(row);
+    };
+    auto const counts = std::format("14 samples, 0 gaps {}", GlyphsFor(RenderRung::Unicode).vertical);
+
+    auto const narrow = lastSourceRow(80);
+    CHECK(narrow.ends_with(counts));
+    CHECK(narrow.contains(std::format("  source  {} ({}, {})   ", SubscriptionSource, SubscriptionRoute, LeaderRole)));
+
+    auto const wide = lastSourceRow(120);
+    CHECK(wide.ends_with(counts));
+    CHECK(wide.contains(
+        std::format("  source  {} ({} at 127.0.0.1:26674, {})   ", SubscriptionSource, SubscriptionRoute, LeaderRole)));
 }
 
 namespace
@@ -2604,8 +2651,7 @@ struct NodeMachine
     // Its cache tier holds 2 of its 8 GiB.
     reading.snapshot.storage =
         StorageStats { .bytesUsed = std::size_t { 2 } << 30U, .bytesLimit = std::size_t { 8 } << 30U };
-    auto sample = SampleOf(SeriesOf(reading), seconds);
-    sample.attempts.front().where = "build-07:9464";
+    auto sample = SampleOf(std::move(reading), seconds, "build-07:7070");
     sample.nodeStatus = std::move(status);
     return sample;
 }
@@ -3277,7 +3323,7 @@ namespace
             continue;
         }
         step += index == stillAt ? 0U : static_cast<std::uint64_t>(1 + (index % 3));
-        script.push_back(SampleOf(CacheSeries(step, { "memory", "disk" }), seconds));
+        script.push_back(SampleOf(CacheReading(step, { "memory", "disk" }), seconds));
     }
     script.push_back(Tick);
     return script;
@@ -3797,8 +3843,8 @@ TEST_CASE("a cache rate block dresses its labels and beside words as labels and 
         PanelContext { .absent = std::string { Absent }, .cellWidth = &FakeCellWidth, .rung = RenderRung::Unicode }
     };
     (void) Drive({ DashboardEvent { .kind = DashboardEventKind::Resize, .columns = 80, .rows = 24 },
-                   SampleOf(CacheSeries(1, { "memory", "disk" }), 1),
-                   SampleOf(CacheSeries(2, { "memory", "disk" }), 3),
+                   SampleOf(CacheReading(1, { "memory", "disk" }), 1),
+                   SampleOf(CacheReading(2, { "memory", "disk" }), 3),
                    Tick },
                  DashboardLimits {},
                  view,
@@ -3973,7 +4019,7 @@ TEST_CASE("the fleet chart yields rows to the table, and grows into rows nothing
     CHECK(roomy.placements.front().front().cellsHigh == ChartGrowth {}.bandCellsMost);
     auto const lines = Lines(roomy.frames.front());
     CHECK(lines.size() == 40);
-    CHECK(lines.at(38).contains(FleetReadingSource));
+    CHECK(lines.at(38).contains(FleetSourceText()));
 }
 
 TEST_CASE("the Dispatched tile draws its trend across the samples, and no trend on a rung without one",
@@ -4016,7 +4062,7 @@ TEST_CASE("on a text rung the fleet frame is still the terminal's height, its so
     REQUIRE(run.frames.size() == 1);
     auto const lines = Lines(run.frames.front());
     CHECK(lines.size() == 40);
-    CHECK(lines.at(38).contains(FleetReadingSource));
+    CHECK(lines.at(38).contains(FleetSourceText()));
     CHECK(Trimmed(Columns(lines.at(37), 1, FakeCellWidth(lines.at(37)) - 2)).empty());
 }
 

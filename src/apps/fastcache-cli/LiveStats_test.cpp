@@ -48,6 +48,18 @@ namespace
                               .unreadable = false };
 }
 
+/// A kind of endpoint that serves @p row, for a case that needs the subject admitted.
+/// @param row The subject.
+/// @return The first kind, in enumerator order, in the row's `servedBy`.
+[[nodiscard]] RemoteKind AServerOf(LiveSubjectSpec const& row)
+{
+    auto const kinds = std::views::iota(std::size_t { 0 }, EnumeratorCount<RemoteKind>)
+                       | std::views::transform([](std::size_t index) { return static_cast<RemoteKind>(index); });
+    auto const served = std::ranges::find_if(kinds, [&row](RemoteKind kind) { return row.servedBy.Contains(kind); });
+    REQUIRE(served != kinds.end());
+    return *served;
+}
+
 /// An endpoint nobody could ask.
 /// @return The identification.
 [[nodiscard]] EndpointIdentity NotAsked()
@@ -198,7 +210,6 @@ TEST_CASE("a named subject the endpoint cannot serve is refused naming what the 
         std::string_view whatItIs;
     };
     auto const mismatches = std::to_array<Mismatch>({
-        { .subject = "cache", .identity = CompileNode(), .whatItIs = "is a fastcache-compile-node" },
         { .subject = "node", .identity = Daemon(), .whatItIs = "serves no node verbs" },
         { .subject = "fleet", .identity = Daemon(), .whatItIs = "serves no node verbs" },
     });
@@ -217,8 +228,30 @@ TEST_CASE("a named subject the endpoint cannot serve is refused naming what the 
     // The control: each subject against the endpoint that DOES serve it is admitted.
     // Without it, a refusal of every named subject passes the loop above.
     CHECK(Admit({ "cache" }, {}, Daemon()).result.has_value());
+    CHECK(Admit({ "cache" }, {}, CompileNode()).result.has_value());
     CHECK(Admit({ "node" }, {}, CompileNode()).result.has_value());
     CHECK(Admit({ "fleet" }, {}, CompileNode()).result.has_value());
+}
+
+TEST_CASE("a compile node is watched as its cache when that is named and is still inferred as the node", "[cli][live]")
+{
+    // #1399, lane-enroll: a node streams `cache` -- its own tier, in the daemon's grammar -- and a single `servedBy`
+    // kind refused `live-stats cache` against it. WHAT DISTINGUISHES: the named session is admitted AS the cache, and
+    // the unnamed one against the same node is still the node, which a set that inference was derived from would
+    // have made ambiguous.
+    auto const named = Admit({ "cache" }, {}, CompileNode());
+    REQUIRE(named.result.has_value());
+    CHECK(named.result->subject == LiveSubject::Cache);
+    // And the plan says a NODE answered, which is what the cache panel's title then names (D6).
+    CHECK(named.result->server == RemoteKind::CompileNode);
+    auto const daemon = Admit({ "cache" }, {}, Daemon());
+    REQUIRE(daemon.result.has_value());
+    CHECK(daemon.result->server == RemoteKind::FastcacheWireOnly);
+    CHECK(named.result->interval == LiveSubjectTable[static_cast<std::size_t>(LiveSubject::Cache)].defaultInterval);
+
+    auto const unnamed = Admit({}, {}, CompileNode());
+    REQUIRE(unnamed.result.has_value());
+    CHECK(unnamed.result->subject == LiveSubject::Node);
 }
 
 TEST_CASE("fleet is never inferred even from a node that could lead", "[cli][live]")
@@ -240,33 +273,54 @@ TEST_CASE("each subject's floor refuses one millisecond below it and accepts it 
     // §9.15, per subject and derived over the table. A case using only `cache`'s floor
     // proves nothing about the table -- so the loop takes every row, and the first check
     // makes sure the rows actually differ, or a single shared floor would pass it.
-    REQUIRE(LiveSubjectTable[static_cast<std::size_t>(LiveSubject::Fleet)].minInterval
-            != LiveSubjectTable[static_cast<std::size_t>(LiveSubject::Cache)].minInterval);
+    REQUIRE(FloorOf(LiveSubjectTable[static_cast<std::size_t>(LiveSubject::Fleet)])
+            != FloorOf(LiveSubjectTable[static_cast<std::size_t>(LiveSubject::Cache)]));
 
     for (auto const& row: LiveSubjectTable)
     {
         CAPTURE(row.key);
-        auto const identity = EndpointIdentity { .kind = row.servedBy, .detail = "scripted", .unreadable = false };
+        auto const identity = EndpointIdentity { .kind = AServerOf(row), .detail = "scripted", .unreadable = false };
         auto const operands = std::vector<std::string> { std::string { row.key } };
 
-        auto const below = Admit(operands, WithInterval(row.minInterval - 1ms), identity);
+        auto const below = Admit(operands, WithInterval(FloorOf(row) - 1ms), identity);
         REQUIRE_FALSE(below.result.has_value());
         CHECK(below.result.error().outcome == Outcome::Usage);
         CHECK(ExitCodeOf(below.result.error().outcome) == 2);
-        CHECK(RefusalText(below).contains(std::format("{}ms", row.minInterval.count())));
+        CHECK(RefusalText(below).contains(std::format("{}ms", FloorOf(row).count())));
         CHECK(RefusalText(below).contains(row.key));
 
-        auto const at = Admit(operands, WithInterval(row.minInterval), identity);
+        auto const at = Admit(operands, WithInterval(FloorOf(row)), identity);
         REQUIRE(at.result.has_value());
-        CHECK(at.result->interval == row.minInterval);
+        CHECK(at.result->interval == FloorOf(row));
     }
+}
+
+TEST_CASE("an interval above the longest cadence a stream keeps is refused and the longest is accepted", "[cli][live]")
+{
+    // DECIDED D6: the client's bounds ARE the wire's. WHAT DISTINGUISHES: one millisecond above `MaxLiveCadence` is
+    // refused as usage naming the ceiling, and the ceiling itself is admitted -- a server would otherwise clamp the
+    // operator's typed interval silently, and the title would state a cadence nobody asked for.
+    auto const operands = std::vector<std::string> { "cache" };
+    auto const identity =
+        EndpointIdentity { .kind = AServerOf(LiveSubjectTable[static_cast<std::size_t>(LiveSubject::Cache)]),
+                           .detail = "scripted",
+                           .unreadable = false };
+
+    auto const above = Admit(operands, WithInterval(CompileCacheWire::MaxLiveCadence + 1ms), identity);
+    REQUIRE_FALSE(above.result.has_value());
+    CHECK(above.result.error().outcome == Outcome::Usage);
+    CHECK(RefusalText(above).contains(std::format("{}ms", CompileCacheWire::MaxLiveCadence.count())));
+
+    auto const at = Admit(operands, WithInterval(CompileCacheWire::MaxLiveCadence), identity);
+    REQUIRE(at.result.has_value());
+    CHECK(at.result->interval == CompileCacheWire::MaxLiveCadence);
 }
 
 TEST_CASE("an inferred subject's floor applies once the subject is known", "[cli][live]")
 {
     // The one floor refusal that costs a round trip: with no operand, which floor applies
     // is unknown until the endpoint is identified.
-    auto const nodeFloor = LiveSubjectTable[static_cast<std::size_t>(LiveSubject::Node)].minInterval;
+    auto const nodeFloor = FloorOf(LiveSubjectTable[static_cast<std::size_t>(LiveSubject::Node)]);
 
     auto const below = Admit({}, WithInterval(nodeFloor - 1ms), CompileNode());
     REQUIRE_FALSE(below.result.has_value());
@@ -287,7 +341,7 @@ TEST_CASE("a refusal that needs nothing from the endpoint is decided without ask
     CHECK(RefusalText(unknown).contains("cache, node, fleet"));
     CHECK(unknown.asks == 0);
 
-    auto const fleetFloor = LiveSubjectTable[static_cast<std::size_t>(LiveSubject::Fleet)].minInterval;
+    auto const fleetFloor = FloorOf(LiveSubjectTable[static_cast<std::size_t>(LiveSubject::Fleet)]);
     auto const belowNamedFloor = Admit({ "fleet" }, WithInterval(fleetFloor - 1ms), CompileNode());
     REQUIRE_FALSE(belowNamedFloor.result.has_value());
     CHECK(belowNamedFloor.asks == 0);

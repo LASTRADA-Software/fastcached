@@ -1046,12 +1046,6 @@ class ScriptedAdmin final: public IAdminDocument
         return _answer;
     }
 
-    /// @return Nothing: the verb under test does not ask.
-    [[nodiscard]] std::string AdminAddress() override
-    {
-        return {};
-    }
-
     /// Every path this was asked for, in order.
     [[nodiscard]] std::vector<std::string> const& Asked() const noexcept
     {
@@ -1550,51 +1544,4 @@ TEST_CASE("a node-status refused on the wire version names both versions and doe
 
     // The control: an unimplemented verb keeps the daemon's sentence.
     CHECK(IdentityFor(RefusalReply(Cc::UnimplementedVerb)).detail.contains("not a compile node"));
-}
-
-TEST_CASE("a node's status is asked afresh on every read, never answered from the identification", "[cli][node][identity]")
-{
-    // A `live-stats node` status block is a live view: the identification is asked once and
-    // remembered, and a status read that came from it would repeat the session's first moment.
-    ScriptedNodeExchange node { { StatusReply({ .version = "0.2.0", .nodeId = {}, .uptimeSeconds = 5, .surfaces = {} }),
-                                  StatusReply({ .version = "0.2.0", .nodeId = {}, .uptimeSeconds = 7, .surfaces = {} }),
-                                  StatusReply({ .version = "0.2.0", .nodeId = {}, .uptimeSeconds = 9, .surfaces = {} }) },
-                                "10.0.0.4:6674" };
-    auto gatherer = GathererFor(node);
-
-    CHECK(gatherer.IdentifyEndpoint().kind == RemoteKind::CompileNode);
-    auto const first = gatherer.ReadNodeStatus();
-    auto const second = gatherer.ReadNodeStatus();
-
-    REQUIRE(first.has_value());
-    REQUIRE(second.has_value());
-    CHECK(Unwrap(first).uptimeSeconds == 7);
-    CHECK(Unwrap(second).uptimeSeconds == 9);
-    CHECK(node.Sent().size() == 3);
-}
-
-TEST_CASE("a status read from anything but a node's answer is absent", "[cli][node][identity]")
-{
-    ScriptedNodeExchange daemon { { RefusalReply(Cc::UnimplementedVerb) }, "10.0.0.4:6674" };
-    auto daemonGatherer = GathererFor(daemon);
-    CHECK_FALSE(daemonGatherer.ReadNodeStatus().has_value());
-
-    // Decided by what the reply SAYS, never by whether its body happens to decode: a reply that is
-    // not a node's `Ok` is no status even carrying bytes that read as one.
-    ScriptedNodeExchange notOk {
-        { Cc::EncodeReply(Cc::Status::Miss,
-                          Cc::EncodeNodeStatus({ .version = "0.2.0", .nodeId = {}, .uptimeSeconds = 5, .surfaces = {} })) },
-        "10.0.0.4:6674"
-    };
-    auto notOkGatherer = GathererFor(notOk);
-    CHECK_FALSE(notOkGatherer.ReadNodeStatus().has_value());
-
-    ScriptedNodeExchange unreadable { { OkWithUnreadableBody() }, "10.0.0.4:6674" };
-    auto unreadableGatherer = GathererFor(unreadable);
-    CHECK_FALSE(unreadableGatherer.ReadNodeStatus().has_value());
-
-    auto nobody =
-        LadderGatherer { Endpoint {}, Endpoint { .host = "10.0.0.4", .port = 6674 }, DialTimeouts {}, std::nullopt, nullptr,
-                         nullptr };
-    CHECK_FALSE(nobody.ReadNodeStatus().has_value());
 }
