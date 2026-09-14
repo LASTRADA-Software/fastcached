@@ -32,6 +32,17 @@ namespace FastCache::Cli
 ///
 /// Pure: shares in, pixels or text out. The encoder that turns pixels into Sixel stays behind `ISixelEncoder`.
 
+/// How a band's bars are coloured on a pixel chart. Private to a process: transmitted and persisted nowhere.
+///
+/// **A colour is a claim**, so a band makes one only where its figure has one to make. The ramp runs cold to hot,
+/// and hot reads as trouble: right for a machine's CPU or a cache's fill against its limit, and wrong for a rate
+/// scaled to its own peak, which would draw ordinary load as an alarm. Such a band's height already says its share.
+enum class ChartPaint : std::uint8_t
+{
+    Plain, ///< Every bar one neutral colour: the height is the whole claim.
+    Ramp,  ///< Each bar the ramp colour for its share, hot where a high share is a warning.
+};
+
 /// One band of a chart: what it is, its newest figure, what its top stands for, and its shares over time.
 struct ChartTrack
 {
@@ -42,6 +53,8 @@ struct ChartTrack
     std::string top {};
     /// One share per sample, oldest first: the reading's share of the top, in [0, 1]; nullopt where not read.
     std::vector<std::optional<double>> shares {};
+    /// How its bars are coloured on a pixel chart; the fleet's machines are a load against a whole, so a ramp.
+    ChartPaint paint { ChartPaint::Ramp };
 };
 
 /// A chart's pixels: RGBA, row-major, four bytes a pixel.
@@ -84,7 +97,8 @@ inline constexpr auto ChartWindows = std::to_array<std::size_t>({ 30, 60, 120, H
 ///
 /// A sample is `width / window` pixel columns wide, at least one, so the chart fills from the right as the history
 /// grows. Within a band a reading is a bar rising from the band's floor, as tall as its share of the band -- at
-/// least a pixel for any share above zero -- in the ramp colour for its share, over a grey track the band's
+/// least a pixel for any share above zero -- in the ramp colour for its share, or one neutral colour for a
+/// `ChartPaint::Plain` band, over a grey track the band's
 /// height. So zero is the track alone; a sample not read is TRANSPARENT, the terminal's background, never a colour
 /// a value could have. A band four or more pixels tall leaves its top row transparent, so neighbouring bands do not
 /// merge. Pixels no band or sample reaches are transparent.

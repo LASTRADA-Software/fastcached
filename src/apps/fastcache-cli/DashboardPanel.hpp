@@ -5,6 +5,7 @@
 #include "DashboardGlyphs.hpp"
 #include "DashboardLoop.hpp"
 #include "DashboardRung.hpp"
+#include "HistoryChart.hpp"
 #include "SixelEncoder.hpp"
 #include "StatsSource.hpp"
 
@@ -345,6 +346,9 @@ struct ChartRow
     /// What the band's top stands for, when the figure has a whole of its own -- `1.0` for a share; nullopt to scale
     /// the band to its own peak over the span it draws.
     std::optional<double> top {};
+    /// How its bars are coloured on a pixel chart: the ramp only where a high share against a real whole is a
+    /// warning, such as a machine's CPU or a cache's fill; plain otherwise, a hit rate included, where high is good.
+    ChartPaint paint { ChartPaint::Plain };
 };
 
 struct PanelSpec
