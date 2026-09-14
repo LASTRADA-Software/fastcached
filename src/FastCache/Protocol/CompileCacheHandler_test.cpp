@@ -1482,19 +1482,20 @@ Task<std::vector<std::byte>> ReadOneFrame(ISocket* socket)
 /// A daemon session that streams live stats over a manual clock, and a server end whose readable
 /// wait PARKS -- which the in-memory socket never does, and a subscription is defined by.
 ///
-/// Declared so a case an assertion unwinds tears down safely: the reactor goes before everything a
-/// stream parked on its timer reaches, the parking sockets go after it, retiring a write or a watch
-/// that holds only its own share of what it touches, and the counters go last. The sink leads for
-/// its alignment as well, which is what keeps the rig from carrying a cache line of padding.
+/// Declared in the order clang-tidy's padding check asks for, and safe to unwind in it: a stream
+/// parked on the reactor's timer is freed without being resumed, and what its frame's destruction
+/// touches it owns (`LiveStream::_active`); the parking sockets go after the reactor, retiring a
+/// write or a watch that holds only its own share of what it touches, and `writes` before the
+/// `server` it wraps.
 struct StreamingRig
 {
-    AtomicMetricsSink metrics;
     CcFixture fix;
     Testing::ParkingReadableSocket server { *fix.pair.server };
     Testing::ParkingWritableSocket writes { server }; ///< What the handler runs on.
     CacheLiveStatsSources const sources { metrics, [] { return MetricsSnapshot {}; }, "cache.test:6380" };
-    LiveStream live { sources, metrics };
     TestReactor reactor { fix.clock };
+    AtomicMetricsSink metrics;
+    LiveStream live { sources, metrics };
     bool returned { false };
 
     /// @return A session that streams through this rig.
