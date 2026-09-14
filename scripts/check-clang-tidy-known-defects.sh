@@ -120,21 +120,27 @@ Judge() {
 }
 
 # $1 = dir. Sets Sites to every source line under `src/` naming $RowCheck, one `path:line:text` per line, and
-# SourceCount to how many sources were read. Variables rather than stdout: a `$( )` would lose the count.
+# SourceCount to how many sources there are. Variables rather than stdout: a `$( )` would lose the count. Returns 1,
+# with SitesStatus set, when grep could not read the sources -- which is not the same answer as "no site".
+#
+# The lines are found by ONE recursive grep, never a shell `read` per line: that walked every line of 866 sources
+# and measured 62 s on DrvFs with the host idle, and passed ctest's 120 s under a gate's load, so the gate went red
+# on a check with nothing to report (#1410).
 SitesOf() {
-    local dir="$1" file number line
+    local dir="$1" found line
     Sites=""
-    SourceCount=0
-    while IFS= read -r file; do
-        SourceCount=$((SourceCount + 1))
-        number=0
-        while IFS= read -r line || [ -n "$line" ]; do
-            number=$((number + 1))
-            case "$line" in
-                *"$RowCheck"*) Sites="$Sites${file#"$dir"/}:$number:$line"$'\n' ;;
-            esac
-        done < "$file"
-    done < <(find "$dir/src" -type f \( -name '*.cpp' -o -name '*.hpp' -o -name '*.h' \) 2>/dev/null | LC_ALL=C sort)
+    SourceCount="$(find "$dir/src" -type f \( -name '*.cpp' -o -name '*.hpp' -o -name '*.h' \) 2>/dev/null | wc -l | tr -d ' ')"
+    SitesStatus=0
+    [ "$SourceCount" -gt 0 ] || return 0
+    # grep answers 0 for a match, 1 for none -- an ordinary empty set here -- and 2 when it could not read.
+    found="$(grep -rnF --include='*.cpp' --include='*.hpp' --include='*.h' -- "$RowCheck" "$dir/src" 2>/dev/null)"
+    SitesStatus=$?
+    [ "$SitesStatus" -le 1 ] || return 1
+    SitesStatus=0
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        Sites="$Sites${line#"$dir"/}"$'\n'
+    done <<< "$found"
 }
 
 CheckStatic() {
@@ -164,7 +170,12 @@ CheckStatic() {
                 bad=1
                 ;;
         esac
-        SitesOf "$dir"
+        if ! SitesOf "$dir"; then
+            echo "FAIL: grep could not read the sources under $dir/src (exit $SitesStatus), so which lines name '$RowCheck' is"
+            echo "      unknown -- which is not the same as none"
+            bad=1
+            continue
+        fi
         if [ "$SourceCount" -eq 0 ]; then
             echo "FAIL: no C++ source under $dir/src, so no site of '$RowCheck' could have been found"
             bad=1
