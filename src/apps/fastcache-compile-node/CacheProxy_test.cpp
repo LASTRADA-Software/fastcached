@@ -439,8 +439,8 @@ namespace
 [[nodiscard]] std::vector<std::uint64_t> AllCounters(AtomicMetricsSink const& metrics)
 {
     std::vector<std::uint64_t> readings;
-    readings.reserve(static_cast<std::size_t>(IMetricsSink::Counter::Last));
-    for (auto const idx: std::views::iota(std::size_t { 0 }, static_cast<std::size_t>(IMetricsSink::Counter::Last)))
+    readings.reserve(CounterCount);
+    for (auto const idx: std::views::iota(std::size_t { 0 }, CounterCount))
         readings.push_back(metrics.Read(static_cast<IMetricsSink::Counter>(idx)));
     return readings;
 }
@@ -464,7 +464,9 @@ namespace
 /// @return That enumerator's index, as a one-element vector.
 [[nodiscard]] std::vector<std::size_t> Only(IMetricsSink::Counter counter)
 {
-    return { static_cast<std::size_t>(counter) };
+    auto const index = CounterIndex(counter);
+    REQUIRE(index.has_value());
+    return { Unwrap(index) };
 }
 } // namespace
 

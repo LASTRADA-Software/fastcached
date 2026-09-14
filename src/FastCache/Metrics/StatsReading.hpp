@@ -3,7 +3,6 @@
 
 #include <FastCache/Cache/IStorage.hpp>
 #include <FastCache/Consensus/RaftTypes.hpp>
-#include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Platform/HostLoad.hpp>
 
@@ -269,7 +268,7 @@ struct StatsReading
     /// **Absent when this build's sink has no slot for the row**, never zero (#1353): a
     /// catalogue compiled against a newer `Counter` than the sink is a build that cannot state
     /// the figure, and a zero would be indistinguishable from an idle counter.
-    EnumTable<IMetricsSink::Counter, std::optional<std::uint64_t>> counters {};
+    CounterCells<std::optional<std::uint64_t>> counters {};
 
     /// Everything else, as the snapshot provider stated it. Every absence it models stays one.
     MetricsSnapshot snapshot {};

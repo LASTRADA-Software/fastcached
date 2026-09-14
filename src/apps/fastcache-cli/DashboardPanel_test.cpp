@@ -89,9 +89,14 @@ constexpr std::string_view Absent = "n/a";
 [[nodiscard]] StatsReading CacheReading(std::uint64_t step, std::vector<std::string_view> const& tiers)
 {
     auto reading = StatsReading {};
-    reading.counters[static_cast<std::size_t>(IMetricsSink::Counter::ConnectionsTotal)] = 3 * step;
+    auto const count = [&reading](IMetricsSink::Counter counter, std::uint64_t value) {
+        auto* const cell = reading.counters.Find(counter);
+        REQUIRE(cell != nullptr);
+        *cell = value;
+    };
+    count(IMetricsSink::Counter::ConnectionsTotal, 3 * step);
     // The cycle's share of expiry moves slower than expiry itself, so a panel reading the one for the other differs.
-    reading.counters[static_cast<std::size_t>(IMetricsSink::Counter::ExpiryKeysReclaimed)] = step;
+    count(IMetricsSink::Counter::ExpiryKeysReclaimed, step);
     reading.snapshot.storage = StorageStats { .itemCount = 1284991,
                                               .bytesUsed = std::size_t { 3 } << 30U,
                                               .bytesLimit = std::size_t { 4 } << 30U,
@@ -2628,7 +2633,9 @@ struct NodeMachine
 {
     auto reading = StatsReading {};
     auto const count = [&reading](NodeCounter counter, std::uint64_t value) {
-        reading.counters[static_cast<std::size_t>(counter)] = value;
+        auto* const cell = reading.counters.Find(counter);
+        REQUIRE(cell != nullptr);
+        *cell = value;
     };
     count(NodeCounter::WorkerJobsCompleted, 41 * step);
     count(NodeCounter::WorkerCompileMillisTotal, 75440 * step);

@@ -130,19 +130,23 @@ TEST_CASE("Every counter the sink knows reaches the scrape", "[metrics][promethe
     AtomicMetricsSink metrics;
 
     // A distinct value per counter, so a row rendering another row's value cannot
-    // pass — which a table of near-identical rows makes the likely slip.
+    // pass — which a table of near-identical rows makes the likely slip. Numbered in
+    // table order rather than derived from the enumerator, which would be a second
+    // place a `Counter` becomes a number (#1366).
+    auto written = std::uint64_t { 0 };
     for (auto const& row: CounterTable)
-        metrics.Increment(row.counter, static_cast<std::uint64_t>(row.counter) + 1);
+        metrics.Increment(row.counter, ++written);
 
     auto const body = RenderPrometheus(
         metrics, MetricsSnapshot { .storage = StorageStats {}, .host = std::nullopt, .uptime = Uptime { 0s } });
 
+    auto expected = std::uint64_t { 0 };
     for (auto const& row: CounterTable)
     {
         INFO("counter " << row.prometheusName);
         CHECK(body.contains(std::format("# HELP {} ", row.prometheusName)));
         CHECK(body.contains(std::format("# TYPE {} {}\n", row.prometheusName, TypeName(row.type))));
-        CHECK(body.contains(std::format("\n{} {}\n", row.prometheusName, static_cast<std::uint64_t>(row.counter) + 1)));
+        CHECK(body.contains(std::format("\n{} {}\n", row.prometheusName, ++expected)));
     }
 }
 

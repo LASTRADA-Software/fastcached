@@ -4974,6 +4974,53 @@ set_tests_properties("psk-signing-seam-selftest" PROPERTIES
 )
 
 # ---------------------------------------------------------------------------
+# An `IMetricsSink::Counter` becomes an index in one place, `CounterIndex`. Fails when
+# anything in `src/` -- tests included -- casts a counter to a number anywhere else, when
+# the converter's own file holds a different number of conversions than its row allows,
+# and when the scan matches nothing at all. scripts/check-counter-index-seam.cmake carries the
+# table and states what the pattern cannot see (#1366).
+#
+# Half of the rule is a type: `CounterCells` has no integer subscript, so a table of that
+# type cannot be indexed by a cast, whatever the operand is spelled. This covers the other
+# half -- a new table keyed by the enum that is not a `CounterCells`, indexed by an ordinary
+# cast that no compiler remarks on.
+#
+# Default set, no skip path: it reads the source tree and compares strings.
+add_test(
+    NAME "counter-index-seam"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-counter-index-seam.cmake"
+)
+set_tests_properties("counter-index-seam" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 60
+)
+
+# And `counter-index-seam` must be SEEN to refuse each thing it claims -- a hand-rolled cast,
+# `std::to_underlying`, a test source, a second conversion in the allowed file, a stale row,
+# a scan matching nothing, a tree it cannot read -- and to accept a comment spelling the cast
+# and a cast of `counters.size()`.
+#
+# Shown to bite, one arm at a time: disarming the vacuity refusal reddens exactly `none`,
+# the stale arm exactly `stale`, the count exactly `extra`, the word boundary exactly
+# `plural`, the `to_underlying` spelling exactly `underlying`; not stripping comments reddens
+# `prose` and every case whose converter stand-in carries a commented cast.
+add_test(
+    NAME "counter-index-seam-selftest"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DFASTCACHED_SCRATCH_DIR=${CMAKE_CURRENT_BINARY_DIR}/counter-index-seam-selftest"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-counter-index-seam-selftest.cmake"
+)
+set_tests_properties("counter-index-seam-selftest" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 120
+)
+
+# ---------------------------------------------------------------------------
 # Every `execute_process` that runs an external program during configure carries
 # a TIMEOUT.
 #

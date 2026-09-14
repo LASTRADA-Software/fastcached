@@ -128,12 +128,13 @@ TEST_CASE("Capturing a reading asks the sink whether it carries each row", "[met
 
     for (auto const& row: CounterTable)
     {
-        auto const& captured = reading.counters[static_cast<std::size_t>(row.counter)];
         INFO(row.prometheusName);
+        auto const* const captured = reading.counters.Find(row.counter);
+        REQUIRE(captured != nullptr);
         if (row.counter == missing)
-            CHECK_FALSE(captured.has_value());
+            CHECK_FALSE(captured->has_value());
         else
-            CHECK(captured == std::optional { sink.Read(row.counter) });
+            CHECK(*captured == std::optional { sink.Read(row.counter) });
     }
     CHECK(reading.snapshot == EveryBlockPresent());
 }
@@ -155,7 +156,7 @@ TEST_CASE("An absent block survives the binary form as absent rather than as zer
     auto const decoded = DecodeStatsReading(EncodeStatsReading(nothing));
     REQUIRE(decoded.has_value());
     CHECK(*decoded == nothing);
-    CHECK(std::ranges::none_of(decoded->counters, [](auto const& value) { return value.has_value(); }));
+    CHECK(std::ranges::none_of(decoded->counters.Positional(), [](auto const& value) { return value.has_value(); }));
     CHECK_FALSE(decoded->snapshot.storage.has_value());
     CHECK_FALSE(decoded->snapshot.consensus.has_value());
     CHECK_FALSE(decoded->snapshot.hostLoad.has_value());
@@ -215,12 +216,12 @@ TEST_CASE("A host-load presence bit this build does not know is refused as malfo
     auto const bitmapBytes = [](std::size_t count) {
         return (count + 7) / 8;
     };
-    auto const at =
-        sizeof(std::uint64_t) + bitmapBytes(reading.counters.size()) + 1 + bitmapBytes(reading.snapshot.storageTiers.size());
+    auto const at = sizeof(std::uint64_t) + bitmapBytes(reading.counters.Positional().size()) + 1
+                    + bitmapBytes(reading.snapshot.storageTiers.size());
     // Positional controls: the snapshot presence byte names the host-load block alone, and the
     // byte at `at` is that block's own presence, with neither figure set.
     REQUIRE(bytes.size() > at);
-    REQUIRE(bytes[sizeof(std::uint64_t) + bitmapBytes(reading.counters.size())] == std::byte { 0x10 });
+    REQUIRE(bytes[sizeof(std::uint64_t) + bitmapBytes(reading.counters.Positional().size())] == std::byte { 0x10 });
     REQUIRE(bytes[at] == std::byte { 0x00 });
 
     // The control: the untouched bytes decode, with the block present and both figures absent.
