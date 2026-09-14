@@ -146,6 +146,42 @@ namespace
         bool _claimed;
     };
 
+    /// Holds one subject's capture for as long as one subscriber takes it.
+    ///
+    /// RAII for `ActiveSubscription`'s reason: a capture ends several ways, a throwing source
+    /// included, and the exit that forgot to release would leave the subject claimed forever --
+    /// every subscriber on every reactor answered `Busy` while the surface looks healthy.
+    class CaptureClaim
+    {
+      public:
+        explicit CaptureClaim(std::atomic<bool>& capturing) noexcept:
+            _capturing { &capturing },
+            _claimed { !capturing.exchange(true, std::memory_order_acq_rel) }
+        {
+        }
+
+        ~CaptureClaim()
+        {
+            if (_claimed)
+                _capturing->store(false, std::memory_order_release);
+        }
+
+        CaptureClaim(CaptureClaim const&) = delete;
+        CaptureClaim(CaptureClaim&&) = delete;
+        CaptureClaim& operator=(CaptureClaim const&) = delete;
+        CaptureClaim& operator=(CaptureClaim&&) = delete;
+
+        /// @return Whether this subscriber holds the capture.
+        [[nodiscard]] bool Claimed() const noexcept
+        {
+            return _claimed;
+        }
+
+      private:
+        std::atomic<bool>* _capturing; ///< See `SubjectState::capturing`.
+        bool _claimed;
+    };
+
     /// The terminal reply for an orderly end: `Ok`, carrying nothing.
     [[nodiscard]] std::vector<std::byte> OrderlyEnd()
     {
@@ -267,42 +303,94 @@ LiveStream::LiveStream(ILiveStatsSources const& sources, IMetricsSink& metrics) 
 {
 }
 
-std::optional<LiveStream::TickView> LiveStream::Observe(Wire::LiveSubject subject,
-                                                        std::uint64_t tick,
-                                                        std::uint64_t eventsFrom)
+LiveStream::Observation LiveStream::Observe(Wire::LiveSubject subject,
+                                            std::uint64_t tick,
+                                            std::uint64_t eventsFrom,
+                                            std::optional<std::uint64_t> seen)
 {
-    std::scoped_lock const guard { _mutex };
     auto& state = _subjects.at(static_cast<std::size_t>(subject));
+    auto const load = [this, &state] {
+        std::scoped_lock const guard { _publish };
+        return state.published;
+    };
 
-    if (!state.tick.has_value() || *state.tick != tick)
+    auto published = load();
+    // Fresh when it is this tick's or a later one's: a reactor whose clock read came a moment
+    // before another's does not replace the newer capture with an older one.
+    if (published == nullptr || published->tick < tick)
     {
-        auto capture = _sources.Capture(subject);
-        if (!capture.has_value())
-            return std::nullopt;
-
-        // The first capture only sets the baseline: a subscriber arriving is not told that every
-        // member it can see has just joined.
-        if (state.probe.has_value())
-            for (auto& event: DiffLiveEvents(*state.probe, capture->probe))
+        CaptureClaim const claim { state.capturing };
+        if (claim.Claimed())
+        {
+            // Asked again under the claim: the previous holder may have published this tick between the
+            // look above and the claim.
+            published = load();
+            if (published == nullptr || published->tick < tick)
             {
-                state.events.push_back(std::move(event));
-                state.eventsEnd += 1;
-                if (state.events.size() > LiveEventBacklog)
-                    state.events.pop_front();
+                auto capture = _sources.Capture(subject);
+                if (!capture.has_value())
+                    return Observation { .seen = Seen::Stopped, .tick = tick };
+
+                auto next = std::make_shared<LiveView>();
+                next->tick = tick;
+                next->body = std::move(capture->body);
+                next->probe = std::move(capture->probe);
+                // The first capture only sets the baseline: a subscriber arriving is not told that every
+                // member it can see has just joined.
+                if (published != nullptr)
+                {
+                    next->events = published->events;
+                    next->eventsEnd = published->eventsEnd;
+                    for (auto& event: DiffLiveEvents(published->probe, next->probe))
+                    {
+                        next->events.push_back(std::move(event));
+                        next->eventsEnd += 1;
+                    }
+                    if (next->events.size() > LiveEventBacklog)
+                        next->events.erase(next->events.begin(),
+                                           std::next(next->events.begin(),
+                                                     static_cast<std::ptrdiff_t>(next->events.size() - LiveEventBacklog)));
+                }
+                published = std::move(next);
+                {
+                    std::scoped_lock const guard { _publish };
+                    state.published = published;
+                }
+                _metrics.Increment(IMetricsSink::Counter::LiveSnapshotsRendered);
             }
-        state.probe = std::move(capture->probe);
-        state.body = std::make_shared<std::vector<std::byte> const>(std::move(capture->body));
-        state.tick = tick;
-        _metrics.Increment(IMetricsSink::Counter::LiveSnapshotsRendered);
+        }
+        // Lost to another subscriber, on this reactor or another: see the declaration. What that one is
+        // capturing is read once published, and until then the newest capture there is -- unless this
+        // subscriber has read that one already.
+        else if (published == nullptr || (seen.has_value() && published->tick <= *seen))
+            return Observation { .seen = Seen::Busy, .tick = tick };
     }
 
-    TickView view { .body = state.body, .events = {}, .eventsEnd = state.eventsEnd };
-    auto const firstKept = state.eventsEnd - state.events.size();
+    auto observation = Observation {
+        .seen = Seen::Ready, .tick = tick, .view = published, .events = {}, .eventsEnd = published->eventsEnd
+    };
+    auto const firstKept = published->eventsEnd - published->events.size();
     auto const from = std::max(eventsFrom, firstKept);
-    if (from < state.eventsEnd)
-        view.events.assign(std::next(state.events.begin(), static_cast<std::ptrdiff_t>(from - firstKept)),
-                           state.events.end());
-    return view;
+    if (from < published->eventsEnd)
+        observation.events.assign(std::next(published->events.begin(), static_cast<std::ptrdiff_t>(from - firstKept)),
+                                  published->events.end());
+    return observation;
+}
+
+Task<LiveStream::Observation> LiveStream::AwaitView(Wire::LiveSubject subject,
+                                                    std::chrono::milliseconds floor,
+                                                    std::uint64_t eventsFrom,
+                                                    std::optional<std::uint64_t> seen,
+                                                    IPushSink const* sink,
+                                                    IReactor* reactor)
+{
+    while (true)
+    {
+        auto observation = Observe(subject, TickOf(reactor->Clock().Now(), floor), eventsFrom, seen);
+        if (observation.seen != Seen::Busy || sink->Stopping())
+            co_return observation;
+        co_await SleepUntil { .reactor = reactor, .deadline = reactor->Clock().Now() + LiveStopCheck };
+    }
 }
 
 std::optional<std::vector<std::byte>> LiveStream::EndedBySink(IPushSink const& sink) const
@@ -356,13 +444,14 @@ Task<std::vector<std::byte>> LiveStream::Serve(
     auto const floor = Wire::LiveSubjectTable.at(static_cast<std::size_t>(subject)).floor;
     auto const granted = Wire::GrantLiveCadence(subject, request->cadenceMillis);
     auto const hold = std::max(Wire::MinLiveStreamWriteStall, granted * Wire::LiveIdleCadences);
-    auto tick = TickOf(reactor->Clock().Now(), floor);
 
     // The baseline: this subscriber's event cursor starts at NOW, so it is not replayed events
     // from before it arrived.
-    auto const baseline = Observe(subject, tick, std::numeric_limits<std::uint64_t>::max());
-    if (!baseline.has_value())
+    auto const baseline =
+        co_await AwaitView(subject, floor, std::numeric_limits<std::uint64_t>::max(), std::nullopt, sink, reactor);
+    if (baseline.seen != Seen::Ready)
         co_return std::vector<std::byte> {}; // The process is stopping.
+    auto tick = baseline.tick;
 
     _metrics.Increment(IMetricsSink::Counter::LiveSubscriptionsOpened);
 
@@ -394,7 +483,8 @@ Task<std::vector<std::byte>> LiveStream::Serve(
     LiveCursor cursor { .nextDue = tick,
                         .ticksPerCadence =
                             static_cast<std::uint64_t>((granted + floor - std::chrono::milliseconds { 1 }) / floor) };
-    auto eventsFrom = baseline->eventsEnd;
+    auto eventsFrom = baseline.eventsEnd;
+    auto seen = baseline.view->tick;
 
     while (true)
     {
@@ -404,18 +494,24 @@ Task<std::vector<std::byte>> LiveStream::Serve(
         if (auto end = gate->Recheck(subject, peer); end.has_value())
             co_return *std::move(end);
 
-        tick = TickOf(reactor->Clock().Now(), floor);
-        auto const view = Observe(subject, tick, eventsFrom);
-        if (!view.has_value())
+        auto const view = co_await AwaitView(subject, floor, eventsFrom, seen, sink, reactor);
+        if (view.seen == Seen::Stopped)
             co_return OrderlyEnd(); // The sources were detached: this process is stopping.
-        eventsFrom = view->eventsEnd;
+        if (view.seen == Seen::Busy)
+            continue; // The surface began stopping while another subscriber held the claim.
+        // The tick the view was CAPTURED on, not the one this subscriber woke on: the two differ when it sends a
+        // capture another subscriber published while it looked, and both the snapshot's label and the cadence are
+        // about what was captured -- a gap for a tick whose capture is being sent would contradict itself.
+        tick = view.view->tick;
+        eventsFrom = view.eventsEnd;
+        seen = tick;
 
-        for (auto const& event: view->events)
+        for (auto const& event: view.events)
             if (auto const outcome = co_await push(Wire::EncodeLiveEvent(event)); outcome != PushOutcome::Delivered)
                 co_return failed(outcome);
 
         // An event owes the panel the state it describes, on this tick rather than at the cadence.
-        auto const step = DecideLiveStep(cursor, tick, !view->events.empty());
+        auto const step = DecideLiveStep(cursor, tick, !view.events.empty());
         if (step.gap.has_value())
         {
             _metrics.Increment(IMetricsSink::Counter::LiveSnapshotsSkipped, step.gap->dropped);
@@ -423,7 +519,7 @@ Task<std::vector<std::byte>> LiveStream::Serve(
                 co_return failed(outcome);
         }
         if (step.snapshot)
-            if (auto const outcome = co_await push(Wire::EncodeLiveSnapshot(tick, *view->body));
+            if (auto const outcome = co_await push(Wire::EncodeLiveSnapshot(tick, view.view->body));
                 outcome != PushOutcome::Delivered)
                 co_return failed(outcome);
 
