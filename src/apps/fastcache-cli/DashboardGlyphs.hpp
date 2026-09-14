@@ -222,6 +222,9 @@ struct SlotGauge
 /// How a figure is written: the library's, so a panel and the browser page write one figure alike.
 using FastCache::FigureFormat;
 
+/// A written figure's number and unit: the library's, so every surface splits a figure at one place.
+using FastCache::WrittenFigure;
+
 /// @p value written as @p format says.
 ///
 /// **Takes no rung, and that is the point** (§9.6): every rung writes a figure through this one
@@ -230,8 +233,9 @@ using FastCache::FigureFormat;
 /// @param value The value, or nullopt where nothing was reported.
 /// @param format How to write it.
 /// @param absent The resolved absent marker.
-/// @return The text; @p absent when @p value is nullopt or not finite.
-[[nodiscard]] std::string FormatFigure(std::optional<double> value, FigureFormat format, std::string_view absent);
+/// @return The number and its unit; @p absent standing as the number, with no unit, when @p value is nullopt or
+///         not finite.
+[[nodiscard]] WrittenFigure FormatFigure(std::optional<double> value, FigureFormat format, std::string_view absent);
 
 /// How many columns of content a frame @p width columns wide holds: the two edges and the blank
 /// column before the right one taken away.
