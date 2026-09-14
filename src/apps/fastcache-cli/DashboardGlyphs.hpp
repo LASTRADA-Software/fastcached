@@ -37,6 +37,12 @@ namespace FastCache::Cli
 /// with it (§6.1): a space is *nothing was read*, `▁` is *zero was read*.
 inline constexpr std::array<std::string_view, 8> BlockLevels { "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█" };
 
+/// The marks an ASCII chart stacks its bars from, lowest first: the zero mark, two partial levels, a full cell.
+///
+/// A multi-row chart carries information in ASCII where a one-row sparkline does not (§10): a column's HEIGHT is its
+/// share, whatever the marks are.
+inline constexpr std::array<std::string_view, 4> AsciiChartLevels { "_", ".", ":", "#" };
+
 /// Everything one rung draws with.
 struct RungGlyphs
 {
@@ -47,6 +53,9 @@ struct RungGlyphs
     /// Empty rather than one `#`, and that is §10's rule rather than a gap in the table: one level
     /// per cell carries no information and LOOKS like data, which is worse than no column.
     std::span<std::string_view const> sparkLevels;
+
+    /// The marks a multi-row chart stacks its bars from, lowest first; EMPTY on a rung that draws no chart.
+    std::span<std::string_view const> chartLevels;
 
     /// A sparkline cell with no reading behind it.
     std::string_view noReading;
@@ -78,6 +87,7 @@ struct RungGlyphs
 inline constexpr EnumTable<RenderRung, RungGlyphs> RungGlyphTable { {
     { .rung = RenderRung::Sixel,
       .sparkLevels = BlockLevels,
+      .chartLevels = BlockLevels,
       .noReading = " ",
       .horizontal = "─",
       .vertical = "│",
@@ -92,6 +102,7 @@ inline constexpr EnumTable<RenderRung, RungGlyphs> RungGlyphTable { {
       .gaugeClose = "" },
     { .rung = RenderRung::Unicode,
       .sparkLevels = BlockLevels,
+      .chartLevels = BlockLevels,
       .noReading = " ",
       .horizontal = "─",
       .vertical = "│",
@@ -106,6 +117,7 @@ inline constexpr EnumTable<RenderRung, RungGlyphs> RungGlyphTable { {
       .gaugeClose = "" },
     { .rung = RenderRung::Ascii,
       .sparkLevels = {},
+      .chartLevels = AsciiChartLevels,
       .noReading = " ",
       .horizontal = "-",
       .vertical = "|",
@@ -120,6 +132,7 @@ inline constexpr EnumTable<RenderRung, RungGlyphs> RungGlyphTable { {
       .gaugeClose = "]" },
     { .rung = RenderRung::Piped,
       .sparkLevels = {},
+      .chartLevels = {},
       .noReading = " ",
       .horizontal = "-",
       .vertical = "|",
