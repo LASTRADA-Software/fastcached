@@ -1593,7 +1593,7 @@ TEST_CASE("NodeConfig: consensus flags with no --listen-raft are refused rather 
     // flags are read by nobody: nothing binds, nothing dials, and nothing anywhere
     // says the operator's cluster was not configured. That is the silent no-op this
     // table already refuses for `--cluster-key-file` without `--discovery` and
-    // `--dashboard-token-file` without `--dashboard`.
+    // `--dashboard-token-file` on a node that runs no scheduler.
     //
     // The flag whose ABSENCE puts a node in that state moved at #1022. `--listen-raft`
     // used to be one of the inert flags and is now the switch; `--node-id` used to be
@@ -2509,18 +2509,31 @@ TEST_CASE("A dashboard that could never show a fleet is refused at startup", "[n
     SECTION("a credential nothing reads")
     {
         // A secret an operator went to the trouble of provisioning, read by
-        // nobody. `--cluster-key-file` used to have a sibling rule and no longer
+        // nobody: a node running no scheduler serves neither the dashboard nor the
+        // fleet stream. `--cluster-key-file` used to have a sibling rule and no longer
         // does -- its readers grew until the rule refused the configurations they
-        // needed -- and this one survives because it does not have that problem:
-        // the dashboard is either on or off, and that is a flag, not something a
-        // tier resolves at startup.
-        auto cfg = servingNode();
-        cfg.dashboard = false;
+        // needed -- and THIS rule's readers grew too (#1399), which is why it asks
+        // about the scheduler now rather than about `--dashboard`.
+        auto cfg = Installable();
         cfg.dashboardTokenFile = "dashboard.token";
 
         auto const refusal = StartupPolicyRejection(cfg);
         REQUIRE(refusal.has_value());
         CHECK(Unwrap(refusal).contains("--dashboard-token-file"));
+        CHECK(Unwrap(refusal).contains("--serve-scheduler"));
+    }
+
+    SECTION("a credential the fleet stream reads on a leader with no dashboard and no admin surface")
+    {
+        // The control, and the configuration the old rule refused: the live-stats fleet stream is served on
+        // `--listen-node` and checks this credential there, so a scheduler node with no page and no admin port
+        // still reads it -- and without it the fleet streams to loopback only.
+        auto cfg = servingNode();
+        cfg.dashboard = false;
+        cfg.adminListen.clear();
+        cfg.dashboardTokenFile = "dashboard.token";
+
+        CHECK_FALSE(StartupPolicyRejection(cfg).has_value());
     }
 
     SECTION("a certificate with no key, and a key with no certificate")
@@ -4979,8 +4992,8 @@ TEST_CASE("A compression setting that reaches no tier refuses the node", "[node]
     // A flag that configures a half this node does not build is inert, and inert is
     // invisible: the startup line drops the codec along with the half, so the one
     // surface that reports a codec says nothing at all about the one that was typed.
-    // Same shape as `--dashboard-token-file` without `--dashboard`, and refused the
-    // same way.
+    // Same shape as `--dashboard-token-file` on a node running no scheduler, and
+    // refused the same way.
     auto startable = [] {
         auto cfg = Installable();
         cfg.cacheMemoryBytes = 8ULL * 1024 * 1024;

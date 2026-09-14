@@ -888,7 +888,7 @@ as **network reachability plus membership** and size the network accordingly.
 So: keep `--serve-scheduler` off any network you would not run a compiler for,
 and put mTLS in front of every port for anything beyond a trusted build network.
 The two remaining credentials in this system are real and unaffected —
-`--dashboard-token-file` guards the fleet page, and `fastcached`'s own
+`--dashboard-token-file` guards the fleet page and the live-stats fleet stream, and `fastcached`'s own
 `--requirepass` guards the shared cache.
 
 Also worth knowing: the node's inter-node gate matches on the peer's **source
