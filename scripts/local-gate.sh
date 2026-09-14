@@ -14,9 +14,11 @@
 #
 # What it covers, and why each earns its minutes:
 #
-#   clang-format  at the version CI pins. Successive LLVM releases disagree about
-#                 formatting, so a tree clean under whatever is on PATH can still be
-#                 rejected -- for code nobody mis-wrote.
+#   clang-format  the BUILD CI formats with: PyPI's release at CLANG_FORMAT_VERSION,
+#                 declared in .clang-format-version, refused before `-i` when no binary
+#                 on PATH is it (#1349). Two builds -- even of one release number --
+#                 can disagree about formatting, so a tree clean under whatever is on
+#                 PATH can still be rejected, for code nobody mis-wrote.
 #   clang-debug   PEDANTIC + ASan + UBSan + clang-tidy, the ANALYSER pinned to the
 #                 one build .clang-tidy-version declares and identified by its wheel,
 #                 not by a name (#1404). The default agent preset, the only place sanitizers
@@ -4142,16 +4144,16 @@ for row in "${gate_presets[@]}"; do
 done
 
 if [[ "$format" -eq 1 ]]; then
-    formatter="clang-format-${tools_version}"
-    command -v "$formatter" >/dev/null 2>&1 \
-        || fail "$formatter not found; install it or pass --no-format"
-    # The NAME pins a major and apt.llvm.org ships rolling snapshots under it, so a
-    # machine a month behind CI holds a `clang-format-22` that is a different formatter --
-    # and this pass writes. `.clang-format-version` states the build `Check C++ style`
-    # judges with (#1349), and a formatter that is not it is refused BEFORE `-i`, never
-    # after: a refusal once the tree is rewritten is a report on a tree this gate changed.
-    bash "$(dirname "${BASH_SOURCE[0]}")/check-clang-format-version.sh" --installed "$formatter" "$repo_root" \
-        || fail "$formatter is not the clang-format build .clang-format-version declares (above), so formatting the tree with it could rewrite code Check C++ style accepts; bring it to the declared build as the lines above describe, or pass --no-format"
+    # The formatter is a BUILD, not a name: PyPI's clang-format at `CLANG_FORMAT_VERSION`,
+    # whose banner `.clang-format-version` declares (#1349). It used to be
+    # `clang-format-$CLANG_TOOLS_VERSION` by name -- a major on apt.llvm.org's rolling
+    # snapshot, so a machine a month behind CI held a different formatter under the right
+    # name, and this pass WRITES. Resolved by the same rule the format-on-edit hook and
+    # `Check C++ style` use -- the declared build among every clang-format on PATH -- and
+    # refused BEFORE `-i`, never after: a refusal once the tree is rewritten is a report on
+    # a tree this gate changed. The resolver prints what it found and the install commands.
+    formatter="$(bash "$(dirname "${BASH_SOURCE[0]}")/check-clang-format-version.sh" --resolve "$repo_root")" \
+        || fail "no clang-format on PATH is the build .clang-format-version declares (above), and formatting with any other could rewrite code Check C++ style accepts. Install the pinned build with one of the commands above, or pass --no-format. This refusal is about the formatter only: clang-tidy is pinned separately, by CLANG_TOOLS_VERSION, and nothing about it is examined here"
     # Captured and counted BEFORE the formatter is asked anything, so the two ways
     # of having no files to format are told apart and neither is reported as a
     # formatting failure. `set -uo pipefail` carries no `-e`, so an errored
