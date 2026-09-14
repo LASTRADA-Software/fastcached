@@ -201,6 +201,7 @@ namespace
     {
         return FigureSpec { .field = CounterField<Row>(),
                             .scale = 60.0,
+                            .alertAbove = 0.0,
                             .suffix = "/min",
                             .source = FigureSource::Rate,
                             .format = FigureFormat::Rate };
@@ -254,6 +255,7 @@ namespace
                   .key = "refused_per_min",
                   .figure = { .field = CounterField<Counter::WorkerJobsRefusedNoSlot>(),
                               .scale = 60.0,
+                              .alertAbove = 0.0,
                               .addends = RefusalAddends,
                               .source = FigureSource::Rate,
                               .format = FigureFormat::Rate },

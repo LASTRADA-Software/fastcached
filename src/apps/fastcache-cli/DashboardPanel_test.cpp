@@ -2217,12 +2217,19 @@ using NodeCounter = IMetricsSink::Counter;
     return status;
 }
 
-/// The frames a node panel asking `build-07:7070` every two seconds draws for @p script.
+/// What a panel presented: its frames, and the runs each dresses.
+struct Presented
+{
+    std::vector<std::string> frames {};           ///< Each frame's text.
+    std::vector<std::vector<FrameSpan>> spans {}; ///< Each frame's runs, index for index.
+};
+
+/// What a node panel asking `build-07:7070` every two seconds presents for @p script: its frames and their runs.
 /// @param script The events after the resize.
 /// @param columns The terminal's width.
 /// @param rows The terminal's height.
-/// @return The frames.
-[[nodiscard]] std::vector<std::string> NodeFramesAt(std::vector<DashboardEvent> script, int columns, int rows)
+/// @return What it presented.
+[[nodiscard]] Presented NodeSinkAt(std::vector<DashboardEvent> script, int columns, int rows)
 {
     script.insert(script.begin(), DashboardEvent { .kind = DashboardEventKind::Resize, .columns = columns, .rows = rows });
     auto view = PanelView { NodePanel(),
@@ -2233,7 +2240,17 @@ using NodeCounter = IMetricsSink::Counter;
                                            .rung = RenderRung::Unicode } };
     auto sink = CollectingSink {};
     (void) Drive(std::move(script), DashboardLimits {}, view, sink);
-    return sink.frames;
+    return Presented { .frames = std::move(sink.frames), .spans = std::move(sink.spans) };
+}
+
+/// The frames a node panel asking `build-07:7070` every two seconds draws for @p script.
+/// @param script The events after the resize.
+/// @param columns The terminal's width.
+/// @param rows The terminal's height.
+/// @return The frames.
+[[nodiscard]] std::vector<std::string> NodeFramesAt(std::vector<DashboardEvent> script, int columns, int rows)
+{
+    return NodeSinkAt(std::move(script), columns, rows).frames;
 }
 
 /// The one frame §4's node draws at @p columns by @p rows, two readings in.
@@ -2455,4 +2472,90 @@ TEST_CASE("the active fleet section's tab is one Selected run over exactly its b
         CHECK(Lines(sink.frames[index]).at(span.row - 1).substr(span.byte, span.length) == tab);
         CHECK(sink.frames[index].contains(tab));
     }
+}
+
+namespace
+{
+
+/// The tone of the one run of the newest frame in @p sink whose text is exactly @p text.
+/// @param sink What was presented.
+/// @param text The run's text.
+/// @return Its tone; nullopt when no run covers exactly that text.
+[[nodiscard]] std::optional<FrameTone> ToneOver(Presented const& sink, std::string_view text)
+{
+    REQUIRE(!sink.frames.empty());
+    auto const lines = Lines(sink.frames.back());
+    for (auto const& span: sink.spans.back())
+        if (span.row >= 1 && span.row <= lines.size() && lines[span.row - 1].substr(span.byte, span.length) == text)
+            return span.tone;
+    return std::nullopt;
+}
+
+/// §4's node presented at 80 by 24, two readings in, saying @p status about itself.
+/// @param status What the node says.
+/// @return What it presented.
+[[nodiscard]] Presented NodeSinkOf(CompileCacheWire::NodeStatusFields const& status)
+{
+    auto sink = NodeSinkAt({ NodeSampleOf(1, 1, status), NodeSampleOf(2, 3, status), Tick }, 80, 24);
+    REQUIRE(sink.frames.size() == 1);
+    return sink;
+}
+
+} // namespace
+
+TEST_CASE("a node panel dresses labels as labels, figures as figures, and a refusal above zero as an alert",
+          "[cli][dashboard][panel][node][tone]")
+{
+    // #134 G1 on §4's panel. WHAT DISTINGUISHES: the label and the figure of one row are two runs of two tones,
+    // not one run over both; the refusal total and each refusal that moved are ALERTS while the one that did
+    // not move is not dressed at all; and a wrapped caveat is a Label run on each of its lines.
+    auto const sink = NodeSinkOf(MockupNodeStatus());
+    CHECK(ToneOver(sink, "compiles/min") == FrameTone::Label);
+    CHECK(ToneOver(sink, "1 230") == FrameTone::Figure);
+    CHECK(ToneOver(sink, "refused/min") == FrameTone::Label);
+    CHECK(ToneOver(sink, "90") == FrameTone::Alert);
+    CHECK(ToneOver(sink, "no-slot 60/min") == FrameTone::Alert);
+    CHECK(ToneOver(sink, "lease-expired 30/min") == FrameTone::Alert);
+    CHECK_FALSE(ToneOver(sink, "unknown-fingerprint 0.0/min").has_value());
+    CHECK(ToneOver(sink, "sum/count over this interval; no histogram") == FrameTone::Label);
+    CHECK(ToneOver(sink, "exists, so no p50/p95 can be shown") == FrameTone::Label);
+    for (auto const* label: { "node-id", "components", "toolchains", "registrars", "consensus", "leader", "slots", "host" })
+    {
+        INFO("label " << label);
+        CHECK(ToneOver(sink, label) == FrameTone::Label);
+    }
+    // The ordinary states are not dressed: a run over them would be a claim that something needs looking at.
+    CHECK_FALSE(ToneOver(sink, "serving 3 of 3").has_value());
+    CHECK_FALSE(ToneOver(sink, "follower").has_value());
+    CHECK_FALSE(ToneOver(sink, "1 of 1, last 4s ago").has_value());
+}
+
+TEST_CASE("a node's states worth a look are dressed: a survey not done, an election, registrations not held",
+          "[cli][dashboard][panel][node][tone]")
+{
+    // The other direction of the case above, one state at a time, so a tone that dressed EVERY state as one colour
+    // is caught by the states that must differ.
+    auto surveying = MockupNodeStatus();
+    surveying.runtime.toolchains = CompileCacheWire::ToolchainState::Surveying;
+    surveying.runtime.toolchainsServed = 1;
+    CHECK(ToneOver(NodeSinkOf(surveying), "surveying 1 of 3") == FrameTone::Stale);
+
+    auto idle = MockupNodeStatus();
+    idle.runtime.toolchains = CompileCacheWire::ToolchainState::NothingToServe;
+    idle.runtime.toolchainsServed = 0;
+    idle.runtime.toolchainsDiscovered = 0;
+    CHECK(ToneOver(NodeSinkOf(idle), "nothing-to-serve 0 of 0") == FrameTone::Alert);
+
+    auto electing = MockupNodeStatus();
+    electing.runtime.schedulerRole = CompileCacheWire::WireSchedulerRole::Undecided;
+    CHECK(ToneOver(NodeSinkOf(electing), "undecided") == FrameTone::Stale);
+
+    auto partial = MockupNodeStatus();
+    partial.runtime.registrarsTotal = 2;
+    CHECK(ToneOver(NodeSinkOf(partial), "1 of 2, last 4s ago") == FrameTone::Stale);
+
+    auto never = MockupNodeStatus();
+    never.runtime.registrarsRegistered = 0;
+    never.runtime.lastRegistrationSecondsAgo.reset();
+    CHECK(ToneOver(NodeSinkOf(never), "0 of 1, never accepted") == FrameTone::Alert);
 }
