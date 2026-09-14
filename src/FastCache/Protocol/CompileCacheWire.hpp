@@ -5181,17 +5181,20 @@ enum class PushKind : std::uint8_t
     Snapshot = 0x01,
     /// A discrete fact changed; the subject's next snapshot follows on the same tick.
     Event = 0x02,
-    /// Snapshots this subscriber was too slow to read were dropped, OLDEST first.
+    /// Cadences this subscriber missed while a push to it stayed parked. The next snapshot is the
+    /// present: nothing is queued for a slow subscriber, so nothing was dropped in any order.
     Gap = 0x03,
 };
 
 /// A discrete change a stream reports as it happens. Explicit values: transmitted.
 enum class LiveEventKind : std::uint8_t
 {
-    MemberJoined = 0x00,      ///< A machine joined the cluster's member set.
-    MemberLeft = 0x01,        ///< A machine left the cluster's member set.
-    WorkerRegistered = 0x02,  ///< A worker registered with the scheduler.
-    WorkerExpired = 0x03,     ///< A worker stopped heartbeating and was dropped.
+    MemberJoined = 0x00,     ///< A machine joined the cluster's member set.
+    MemberLeft = 0x01,       ///< A machine left the cluster's member set.
+    WorkerRegistered = 0x02, ///< A worker registered with the scheduler.
+    /// A worker left the scheduler's registry. It expired or it withdrew: an event is a difference
+    /// between two captures, which see only that it is gone, so the name says no more than that.
+    WorkerLeft = 0x03,
     LeadershipChanged = 0x04, ///< Who leads the cluster changed.
     SurveyChanged = 0x05,     ///< The node's toolchain survey state changed.
     EnrollmentChanged = 0x06, ///< An enrollment window opened or closed.
@@ -5200,7 +5203,7 @@ enum class LiveEventKind : std::uint8_t
 /// Every event kind this build implements, as ONE list; see `KnownEnrollmentDecisions`.
 inline constexpr std::array KnownLiveEventKinds {
     LiveEventKind::MemberJoined,      LiveEventKind::MemberLeft,        LiveEventKind::WorkerRegistered,
-    LiveEventKind::WorkerExpired,     LiveEventKind::LeadershipChanged, LiveEventKind::SurveyChanged,
+    LiveEventKind::WorkerLeft,        LiveEventKind::LeadershipChanged, LiveEventKind::SurveyChanged,
     LiveEventKind::EnrollmentChanged,
 };
 
@@ -5291,9 +5294,9 @@ struct LiveEventFields
 /// `PushKind::Gap`'s fields.
 struct LiveGapFields
 {
-    std::uint64_t dropped { 0 };   ///< How many snapshots were dropped.
-    std::uint64_t firstTick { 0 }; ///< The first dropped tick.
-    std::uint64_t lastTick { 0 };  ///< The last dropped tick.
+    std::uint64_t dropped { 0 };   ///< How many of this subscriber's cadences passed without a snapshot.
+    std::uint64_t firstTick { 0 }; ///< The first tick missed.
+    std::uint64_t lastTick { 0 };  ///< The last tick missed.
 };
 
 namespace Detail
@@ -5346,7 +5349,7 @@ namespace Detail
 }
 
 /// Encode a `Gap` push's payload.
-/// @param fields What was dropped.
+/// @param fields What was missed.
 /// @return The payload.
 [[nodiscard]] inline std::vector<std::byte> EncodeLiveGap(LiveGapFields const& fields)
 {
