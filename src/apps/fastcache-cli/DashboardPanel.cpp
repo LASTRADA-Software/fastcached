@@ -2,10 +2,12 @@
 #include "DashboardPanel.hpp"
 #include "FleetChartModel.hpp"
 #include "FleetDocument.hpp"
+#include "NodeSlots.hpp"
 #include "NodeStatusText.hpp"
 
 #include <FastCache/Cache/StorageTier.hpp>
 #include <FastCache/Core/Ranges.hpp>
+#include <FastCache/Distributed/NodePolicy.hpp>
 
 #include <algorithm>
 #include <cassert>
@@ -923,8 +925,8 @@ namespace
     /// What one status fact says in a frame.
     struct FactText
     {
-        std::vector<Piece> pieces {};     ///< Its line, in pieces a narrow terminal drops by priority.
-        std::vector<std::string> more {}; ///< Lines under it, already laid out for the width it was given.
+        std::vector<Piece> pieces {};            ///< Its line, in pieces a narrow terminal drops by priority.
+        std::vector<std::vector<Piece>> more {}; ///< Lines under it, laid out for the width it was given, in pieces.
     };
 
     /// @p text as a fact of one piece.
@@ -986,6 +988,162 @@ namespace
     [[nodiscard]] std::string CountText(FrameInputs const& in, std::optional<std::uint32_t> value)
     {
         return value.has_value() ? std::to_string(*value) : std::string { in.absent };
+    }
+
+    /// Fill cells of a gauge on a fact line: §4's slots and cache tier bars.
+    constexpr auto FactGaugeCells = std::size_t { 16 };
+
+    /// What stands between a slot gauge and the limit that shapes it, and between a figure and the next on a fact line.
+    constexpr std::string_view FactFigureGap = "   ";
+
+    /// How a slot limit is dressed where it is named.
+    struct SlotLimitDress
+    {
+        Distributed::SlotLimit limit;  ///< The limit this row describes.
+        std::optional<FrameTone> tone; ///< How its name is dressed; none for the one that is no problem.
+        bool remedy;                   ///< Whether the panel writes `SlotLimitTable`'s remedy under it.
+    };
+
+    /// One row per `Distributed::SlotLimit`, in enumerator order: nothing withdrawn is not dressed and says no
+    /// remedy; somebody else using the machine is worth a look; memory or scratch running out is an alert, since
+    /// the machine will refuse work until an operator frees it.
+    constexpr EnumTable<Distributed::SlotLimit, SlotLimitDress> SlotLimitDressTable { {
+        { .limit = Distributed::SlotLimit::Registered, .tone = std::nullopt, .remedy = false },
+        { .limit = Distributed::SlotLimit::ExternalCpu, .tone = FrameTone::Stale, .remedy = true },
+        { .limit = Distributed::SlotLimit::Memory, .tone = FrameTone::Alert, .remedy = true },
+        { .limit = Distributed::SlotLimit::Scratch, .tone = FrameTone::Alert, .remedy = true },
+    } };
+
+    static_assert(RowsInEnumeratorOrder(SlotLimitDressTable, &SlotLimitDress::limit),
+                  "SlotLimitDressTable must hold one row per SlotLimit, in enumerator order");
+
+    /// How the running part of a slot gauge is dressed: the band of what is available that runs.
+    /// @param inFlight Compiles running.
+    /// @param available What the node may hold now.
+    /// @return The band; the top one for work running where nothing is available.
+    [[nodiscard]] FrameTone RunningTone(std::uint32_t inFlight, std::uint32_t available) noexcept
+    {
+        if (available == 0)
+            return inFlight == 0 ? FrameTone::LevelLow : FrameTone::LevelHigh;
+        auto const share = static_cast<double>(inFlight) / static_cast<double>(available);
+        if (share < 1.0 / 3.0)
+            return FrameTone::LevelLow;
+        return share < 2.0 / 3.0 ? FrameTone::LevelMid : FrameTone::LevelHigh;
+    }
+
+    /// The node's slots at its newest reading, its CPU differenced against the reading before when the two are adjacent.
+    ///
+    /// Adjacent is the fold's decision (`HistoryEntry::elapsed`), never re-derived here: a gap, a failure or a
+    /// change of source between the two leaves the CPU, and so the ceilings, unknown.
+    /// @param in The frame's inputs.
+    /// @return The slots, or nullopt before a reading carrying a host.
+    [[nodiscard]] std::optional<NodeSlots> NewestSlots(FrameInputs const& in)
+    {
+        auto const& history = in.model->history;
+        if (history.empty() || !history.back().stats.has_value())
+            return in.model->stats.has_value() ? NodeSlotsOf(nullptr, *in.model->stats) : std::nullopt;
+        auto const& newest = history.back();
+        auto const& latest = newest.stats;
+        auto const* previous = static_cast<StatsReading const*>(nullptr);
+        if (newest.elapsed.has_value() && history.size() >= 2)
+        {
+            auto const& before = history[history.size() - 2].stats;
+            if (before.has_value())
+                previous = &*before;
+        }
+        return latest.has_value() ? NodeSlotsOf(previous, *latest) : std::nullopt;
+    }
+
+    /// @p value as a figure piece of a fact line: essential, and plain like every figure written beside a fact.
+    /// @param in The frame's inputs.
+    /// @param value The number, or nullopt for the marker.
+    /// @param format How it is written.
+    /// @return The piece.
+    [[nodiscard]] Piece FactFigure(FrameInputs const& in, std::optional<double> value, FigureFormat format)
+    {
+        return Piece { .text = FormatFigure(value, format, in.absent), .priority = Priority::Essential };
+    }
+
+    /// @p text as a piece of a fact line, essential and plain.
+    /// @param text The words.
+    /// @return The piece.
+    [[nodiscard]] Piece FactWords(std::string text)
+    {
+        return Piece { .text = std::move(text), .priority = Priority::Essential };
+    }
+
+    /// The three numbers a slots fact states.
+    struct SlotNumbers
+    {
+        std::optional<double> inFlight {};   ///< Compiles running.
+        std::optional<double> available {};  ///< What the node may hold now; absent until the ceilings are known.
+        std::optional<double> registered {}; ///< What it registered with.
+    };
+
+    /// The numbers a slots fact states: the reading's when there is one, since the ceilings are worked out from that
+    /// same reading; a status alone gives the two it states, and `available` stays the marker until a reading says more.
+    /// @param slots The newest reading's slots, or nullopt.
+    /// @param status The newest status, or nullptr.
+    /// @return The numbers.
+    [[nodiscard]] SlotNumbers SlotNumbersOf(std::optional<NodeSlots> const& slots,
+                                            CompileCacheWire::NodeStatusFields const* status) noexcept
+    {
+        auto const count = [](std::uint32_t value) {
+            return std::optional { static_cast<double>(value) };
+        };
+        if (slots.has_value())
+            return SlotNumbers { .inFlight = count(slots->inFlight),
+                                 .available = slots->ceilings.has_value() ? count(slots->ceilings->available) : std::nullopt,
+                                 .registered = count(slots->registered) };
+        auto numbers = SlotNumbers {};
+        if (status == nullptr)
+            return numbers;
+        if (status->runtime.compilesInFlight.has_value())
+            numbers.inFlight = count(*status->runtime.compilesInFlight);
+        if (status->runtime.compileSlots.has_value())
+            numbers.registered = count(*status->runtime.compileSlots);
+        return numbers;
+    }
+
+    /// The line under a slots fact: the gauge, when it fits, and the limit that binds, or the marker while none is known.
+    /// @param in The frame's inputs.
+    /// @param slots The slots, or nullopt when only a status spoke.
+    /// @param width The cells the line may take.
+    /// @return The line's pieces.
+    [[nodiscard]] std::vector<Piece> SlotLimitLine(FrameInputs const& in,
+                                                   std::optional<NodeSlots> const& slots,
+                                                   std::size_t width)
+    {
+        auto const label = std::string { "limited-by" } + std::string { FactGap };
+        auto const ceilings = slots.has_value() ? slots->ceilings : std::nullopt;
+        if (!ceilings.has_value())
+            return { Piece { .text = label, .priority = Priority::Essential, .tone = FrameTone::Label },
+                     FactWords(std::string { in.absent }) };
+
+        auto const& dress = SlotLimitDressTable[static_cast<std::size_t>(ceilings->binding)];
+        auto const name = std::string { Distributed::TraitsFor(ceilings->binding).name };
+        auto line = std::vector<Piece> {};
+        // The gauge goes whole or not at all: part of one would be a different share, so it is laid out here rather
+        // than left for the width to take piece by piece.
+        auto const gauge = SlotGaugeOf(slots->inFlight, ceilings->available, slots->registered, FactGaugeCells, *in.glyphs);
+        auto const gaugeCells = in.cellWidth(gauge.open + gauge.running + gauge.held + gauge.withdrawn + gauge.close);
+        if (gaugeCells + in.cellWidth(FactFigureGap) + in.cellWidth(label) + in.cellWidth(name) <= width)
+        {
+            line.push_back(FactWords(gauge.open));
+            line.push_back(Piece { .text = gauge.running,
+                                   .priority = Priority::Essential,
+                                   .tone = RunningTone(slots->inFlight, ceilings->available) });
+            line.push_back(FactWords(gauge.held));
+            line.push_back(FactWords(gauge.withdrawn + gauge.close));
+            line.push_back(Piece {
+                .text = std::string { FactFigureGap } + label, .priority = Priority::Essential, .tone = FrameTone::Label });
+        }
+        else
+        {
+            line.push_back(Piece { .text = label, .priority = Priority::Essential, .tone = FrameTone::Label });
+        }
+        line.push_back(Piece { .text = name, .priority = Priority::Essential, .tone = dress.tone });
+        return line;
     }
 
     /// What a leading node's `leader` reads: it names no endpoint because it is the leader.
@@ -1072,20 +1230,30 @@ namespace
               return Said(std::string { in.absent });
           } },
         { .fact = StatusFact::Slots,
-          .render = [](FrameInputs const& in, FactCell const& /*cell*/, std::size_t /*width*/) -> std::optional<FactText> {
+          .render = [](FrameInputs const& in, FactCell const& /*cell*/, std::size_t width) -> std::optional<FactText> {
+              // A node whose status says it runs no worker has no slots to draw.
               auto const* status = StatusOf(in);
-              if (status == nullptr)
-                  return Said(std::string { in.absent });
-              auto const& runtime = status->runtime;
-              if (!runtime.compileSlots.has_value())
+              if (status != nullptr && !status->runtime.compileSlots.has_value())
                   return std::nullopt;
-              // What is available right now and which ceiling binds it are `Distributed::SlotCeilingsFor` over the
-              // machine's live load, which no status carries: both are the marker, by name, until one does.
-              auto fact = Said(std::format("{} in flight / {} available / {} registered",
-                                           CountText(in, runtime.compilesInFlight),
-                                           in.absent,
-                                           *runtime.compileSlots));
-              fact.more.push_back(std::format("limited-by  {}", in.absent));
+              auto const slots = NewestSlots(in);
+              if (status == nullptr && !slots.has_value())
+                  return Said(std::string { in.absent });
+
+              auto const numbers = SlotNumbersOf(slots, status);
+              auto fact = FactText {};
+              fact.pieces = { FactFigure(in, numbers.inFlight, FigureFormat::Count),   FactWords(" in flight / "),
+                              FactFigure(in, numbers.available, FigureFormat::Count),  FactWords(" available / "),
+                              FactFigure(in, numbers.registered, FigureFormat::Count), FactWords(" registered") };
+              fact.more.push_back(SlotLimitLine(in, slots, width));
+
+              // What to do about the limit, in `SlotLimitTable`'s own words, wrapped under the gauge.
+              auto const ceilings = slots.has_value() ? slots->ceilings : std::nullopt;
+              if (ceilings.has_value() && SlotLimitDressTable[static_cast<std::size_t>(ceilings->binding)].remedy)
+              {
+                  for (auto& line: Wrapped(Distributed::TraitsFor(ceilings->binding).remedy, width, in.cellWidth))
+                      fact.more.push_back(
+                          { Piece { .text = std::move(line), .priority = Priority::Essential, .tone = FrameTone::Label } });
+              }
               return fact;
           } },
         { .fact = StatusFact::CacheTier,
@@ -1101,20 +1269,44 @@ namespace
                       piece.priority = Priority::Essential;
                   fact.pieces.push_back(std::move(piece));
               }
-              // How full the tier is: no status carries it yet, so the marker stands where the fill goes.
+              // How full the tier is, off the newest reading's cache: used / limit, the gauge and its share. A limit of
+              // zero is `InMemoryLruStorage`'s spelling of UNBOUNDED, so there is no share to draw, and no gauge.
+              auto const& storage = in.model->stats.has_value() ? in.model->stats->snapshot.storage : std::nullopt;
+              auto const used = storage.transform([](StorageStats const& s) { return static_cast<double>(s.bytesUsed); });
+              auto const limit = storage.transform([](StorageStats const& s) { return static_cast<double>(s.bytesLimit); });
+              auto const share = used.has_value() && limit.has_value() ? Quotient(*used, *limit) : std::nullopt;
+              fact.pieces.push_back(Piece { .text = std::string { PieceGap }
+                                                    + FormatFigure(used, FigureFormat::Bytes, in.absent) + " / "
+                                                    + FormatFigure(limit, FigureFormat::Bytes, in.absent),
+                                            .priority = Priority::Normal });
+              if (share.has_value())
+                  fact.pieces.push_back(Piece { .text = std::string { FactGap } + Gauge(*share, FactGaugeCells, *in.glyphs),
+                                                .priority = Priority::Low });
               fact.pieces.push_back(
-                  Piece { .text = std::format("{}{} / {}", PieceGap, in.absent, in.absent), .priority = Priority::Normal });
+                  Piece { .text = std::string { FactGap } + FormatFigure(share, FigureFormat::Percent, in.absent),
+                          .priority = Priority::Normal });
               return fact;
           } },
         { .fact = StatusFact::Host,
           .render = [](FrameInputs const& in, FactCell const& cell, std::size_t /*width*/) -> std::optional<FactText> {
-              // CPU busy and memory free are what the node samples for its heartbeat, and no status carries
-              // them yet: named, with the marker, so the line has the shape it will have.
+              // CPU busy is the share between the two newest adjacent readings, and memory free is the newest reading's
+              // own: the figures the slot ceilings above are worked out from, so the two lines cannot disagree.
+              auto const slots = NewestSlots(in);
+              auto const busy = slots.has_value() ? slots->cpuBusyPermille : std::nullopt;
+              auto const memory = slots.has_value() ? slots->availableMemoryBytes : std::nullopt;
               auto fact = FactText {};
               fact.pieces.push_back(
-                  Piece { .text = std::format("cpu-busy {}", in.absent), .priority = Priority::Essential });
-              fact.pieces.push_back(
-                  Piece { .text = std::format("{}mem free {}", PieceGap, in.absent), .priority = Priority::Normal });
+                  Piece { .text = "cpu-busy "
+                                  + FormatFigure(busy.transform([](std::uint32_t permille) { return permille / 1000.0; }),
+                                                 FigureFormat::Percent,
+                                                 in.absent),
+                          .priority = Priority::Essential });
+              fact.pieces.push_back(Piece {
+                  .text = std::string { PieceGap } + "mem free "
+                          + FormatFigure(memory.transform([](std::uint64_t bytes) { return static_cast<double>(bytes); }),
+                                         FigureFormat::Bytes,
+                                         in.absent),
+                  .priority = Priority::Normal });
               for (auto const& figure: cell.figures)
                   fact.pieces.push_back(Led(PieceGap, BesidePiece(in, figure)));
               return fact;
@@ -1215,8 +1407,22 @@ namespace
                     }
                 }
                 auto item = LineOf(pieces, {}, entry.line->priority);
-                for (auto const& more: entry.first.more)
-                    item.lines.push_back(std::string(lead, ' ') + more);
+                // A line under the fact hangs at the value column, fitted to the value's budget like the fact itself;
+                // its runs move with it.
+                for (auto& more: entry.first.more)
+                {
+                    auto fitted = FitPieces(std::move(more), valueBudget, 0, in.cellWidth);
+                    if (!fitted.has_value() || fitted->empty())
+                        continue;
+                    auto under = LineOf(*fitted, {}, entry.line->priority);
+                    for (auto span: under.spans)
+                    {
+                        span.line = item.lines.size();
+                        span.byte += lead;
+                        item.spans.push_back(span);
+                    }
+                    item.lines.push_back(std::string(lead, ' ') + under.lines.front());
+                }
                 group.push_back(std::move(item));
             }
             if (!group.empty())
