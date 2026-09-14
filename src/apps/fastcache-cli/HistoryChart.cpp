@@ -42,6 +42,10 @@ namespace
     /// the ramp. With the ramp's eight it is nine colours, inside the 16 a chart is encoded with.
     constexpr auto Track = RampColour { .red = 0x5f, .green = 0x66, .blue = 0x73 };
 
+    /// A plain band's bars: a light slate, no step of the ramp and brighter than the track, so a plain bar is never
+    /// read as a share on the scale nor lost against the track. Ten colours with the ramp and the track.
+    constexpr auto PlainBar = RampColour { .red = 0xb4, .green = 0xbe, .blue = 0xcc };
+
     /// A band this many pixels tall or taller leaves its top row transparent, between it and the band above.
     constexpr auto BandGapFrom = std::size_t { 4 };
 
@@ -129,7 +133,7 @@ ChartRaster ChartBandsRaster(std::span<ChartTrack const> tracks, std::size_t win
             auto bar = static_cast<std::size_t>(std::lround(fraction * static_cast<double>(inner)));
             if (fraction > 0.0)
                 bar = std::max<std::size_t>(bar, 1);
-            auto const colour = ColourOf(fraction);
+            auto const colour = tracks[band].paint == ChartPaint::Ramp ? ColourOf(fraction) : PlainBar;
             for (auto const y: std::views::iota(floor - inner, floor))
                 for (auto const x: std::views::iota(left, left + sampleWidth))
                     Paint(raster, x, y, y >= floor - bar ? colour : Track);

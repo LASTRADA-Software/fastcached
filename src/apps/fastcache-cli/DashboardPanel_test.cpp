@@ -3135,6 +3135,52 @@ TEST_CASE("on the Sixel rung a node's history is one image over its bands' rows,
     CHECK(placements.back().cellsHigh == 1);
 }
 
+TEST_CASE("a pixel chart with no band in the ramp places no colour scale and states none",
+          "[cli][dashboard][panel][node][chart]")
+{
+    // A scale says which colour stands for which share, so it belongs beside a band coloured that way and nowhere
+    // else. WHAT DISTINGUISHES: the node's own table, whose cpu-busy band is in the ramp, places the bands and the
+    // scale (the case above); the same panel with every band plain places the bands alone, and its legend has no
+    // `0 ... top` around a scale.
+    static auto const plainCharts = [] {
+        auto charts = std::vector<ChartRow>(NodePanel().charts.begin(), NodePanel().charts.end());
+        for (auto& row: charts)
+            row.paint = ChartPaint::Plain;
+        return charts;
+    }();
+    static auto const plainPanel = [] {
+        auto spec = NodePanel();
+        spec.charts = plainCharts;
+        return spec;
+    }();
+    REQUIRE(std::ranges::any_of(NodePanel().charts, [](ChartRow const& row) { return row.paint == ChartPaint::Ramp; }));
+
+    auto encoder = ScriptedSixelEncoder {};
+    auto view = PanelView { plainPanel,
+                            PanelContext { .absent = std::string { Absent },
+                                           .endpoint = "build-07:7070",
+                                           .interval = 2s,
+                                           .cellWidth = &FakeCellWidth,
+                                           .sixel = &encoder,
+                                           .rung = RenderRung::Sixel } };
+    auto script = NodeHistory(24, 18, 20);
+    script.insert(
+        script.begin(),
+        DashboardEvent { .kind = DashboardEventKind::Resize, .columns = 120, .rows = 40, .cellPixels = ChartCell });
+    auto sink = CollectingSink {};
+    (void) Drive(std::move(script), DashboardLimits {}, view, sink);
+    REQUIRE(!sink.frames.empty());
+    auto const& frame = sink.frames.back();
+    INFO(frame);
+    auto const chart = WholeChart(ChartIn(frame, plainPanel));
+    auto const& placements = sink.placements.back();
+    REQUIRE(placements.size() == 1);
+    CHECK(placements.front().cellsHigh == chart.axis - chart.bands.front());
+    auto const legend = Inside(Lines(frame).at(chart.axis + 1));
+    CHECK(legend.starts_with("bar: share of its band's top"));
+    CHECK_FALSE(legend.contains(" top  bar"));
+}
+
 TEST_CASE("on the ASCII rung a node's history bands are ASCII marks", "[cli][dashboard][panel][node][chart]")
 {
     // A multi-row chart carries its heights on a rung with no sparkline, so the ASCII rung draws one, byte for byte

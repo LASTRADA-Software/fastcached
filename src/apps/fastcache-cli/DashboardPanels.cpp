@@ -185,11 +185,12 @@ namespace
     };
 
     // The history a taller terminal draws, in the order it gets rows: whether the cache is doing its job, how much it
-    // is asked, how full it is, what that fullness costs, and then the quieter rates.
+    // is asked, how full it is, what that fullness costs, and then the quieter rates. Only fill is in the ramp: a
+    // cache near its limit is the one share here where hot means look, and a hit rate is best at its top.
     constexpr auto CacheCharts = std::array {
         ChartRow { .label = "hit rate", .figure = HitRate, .top = 1.0 },
         ChartRow { .label = "ops/sec", .figure = OpsPerSecond },
-        ChartRow { .label = "fill", .figure = BytesFill, .top = 1.0 },
+        ChartRow { .label = "fill", .figure = BytesFill, .top = 1.0, .paint = ChartPaint::Ramp },
         ChartRow { .label = "evictions/s", .figure = EvictionsPerSecond },
         ChartRow { .label = "expired/s", .figure = ExpiredPerSecond },
         ChartRow { .label = "conns/sec", .figure = ConnsPerSecond },
@@ -393,11 +394,12 @@ namespace
     };
 
     // The history a taller terminal draws, in the order it gets rows: whether the node is doing work, whether it is
-    // turning work away, how loaded its machine is, and how long a compile takes.
+    // turning work away, how loaded its machine is, and how long a compile takes. Only cpu-busy is in the ramp: the
+    // rates are scaled to their own peak, where the top is the busiest moment rather than a warning.
     constexpr auto NodeCharts = std::array {
         ChartRow { .label = "compiles/min", .figure = CompilesPerMinute },
         ChartRow { .label = "refused/min", .figure = RefusedPerMinute },
-        ChartRow { .label = "cpu-busy", .figure = CpuBusy, .top = 1.0 },
+        ChartRow { .label = "cpu-busy", .figure = CpuBusy, .top = 1.0, .paint = ChartPaint::Ramp },
         ChartRow { .label = "mean compile", .figure = MeanCompile },
     };
 

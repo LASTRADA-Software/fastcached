@@ -83,6 +83,36 @@ TEST_CASE("a band's shares are its readings against its top, clamped, and a top 
     CHECK_FALSE(PeakOf(std::vector<std::optional<double>> { std::nullopt }).has_value());
 }
 
+TEST_CASE("a pixel chart colours a ramp band's bars by their share, and a plain band's bars all alike",
+          "[cli][dashboard][chart]")
+{
+    // A colour is a claim. WHAT DISTINGUISHES: in the ramp band a low bar and a full bar differ in colour, and in the
+    // plain band -- the same shares -- they are one colour, which is neither the grey track nor any ramp step drawn.
+    auto const shares = std::vector<std::optional<double>> { 0.25, 1.0 };
+    auto const tracks = std::vector<ChartTrack> {
+        ChartTrack { .label = "ramp", .latest = {}, .top = {}, .shares = shares, .paint = ChartPaint::Ramp },
+        ChartTrack { .label = "plain", .latest = {}, .top = {}, .shares = shares, .paint = ChartPaint::Plain },
+    };
+    // Two bands of 8 pixels, two samples of 2 pixels: each band's floor row is its 8th.
+    auto const raster = ChartBandsRaster(tracks, 2, 4, 16);
+    auto const colourAt = [&raster](std::size_t x, std::size_t y) {
+        auto const at = ((y * raster.width) + x) * 4;
+        return std::to_array({ raster.rgba[at], raster.rgba[at + 1], raster.rgba[at + 2], raster.rgba[at + 3] });
+    };
+    auto const rampLow = colourAt(0, 7);
+    auto const rampFull = colourAt(2, 7);
+    auto const plainLow = colourAt(0, 15);
+    auto const plainFull = colourAt(2, 15);
+    REQUIRE(rampLow[3] == 0xff);
+    REQUIRE(plainLow[3] == 0xff);
+    CHECK(rampLow != rampFull);
+    CHECK(plainLow == plainFull);
+    CHECK(plainLow != rampLow);
+    CHECK(plainLow != rampFull);
+    // The plain bar is not the track: above the low bar, the band's track is grey.
+    CHECK(plainLow != colourAt(0, 9));
+}
+
 TEST_CASE("a pixel chart draws each track's bar in its own band, and a sample not read as nothing",
           "[cli][dashboard][chart]")
 {
