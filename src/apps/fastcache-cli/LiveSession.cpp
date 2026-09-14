@@ -144,12 +144,11 @@ Task<std::expected<LiveSessionRun, Answer>> RunComposedSession(LiveSessionParts 
     auto run = LiveSessionRun {};
     auto const& subject = LiveSubjectTable[static_cast<std::size_t>(parts.plan.subject)];
     auto sourceParts = LiveSourceParts { .reactor = parts.reactor,
-                                         .gatherer = parts.gatherer,
-                                         .status = subject.readsNodeStatus ? parts.status : nullptr,
-                                         .admin = parts.admin,
-                                         .document = std::string { subject.document },
-                                         .dialer = parts.dialer,
-                                         .pool = parts.samplePool,
+                                         .subscription = parts.subscription,
+                                         .subject = subject.wire,
+                                         .endpoint = parts.endpoint,
+                                         .dashboardToken = std::move(parts.dashboardToken),
+                                         .pool = parts.streamPool,
                                          .clock = parts.clock,
                                          .interval = parts.plan.interval,
                                          .terminal = nullptr,
@@ -204,7 +203,7 @@ Task<std::expected<LiveSessionRun, Answer>> RunComposedSession(LiveSessionParts 
     }
 
     // Once, and before the first event: see `IRungViews`.
-    auto const view = parts.views->For(rung, parts.plan, parts.address);
+    auto const view = parts.views->For(rung, parts.plan, EndpointText(parts.endpoint));
     if (view == nullptr)
     {
         // Released before refusing, closed first as its contract asks: nothing reads it, and an
@@ -279,32 +278,33 @@ void FailureRemarks::Observe(DashboardEvent const& event)
             return;
     }
 
+    // The reason verbatim: each producer writes a sentence that stands alone, naming who refused or
+    // where the stream broke. A prefix of this class's own misnamed the commonest reason -- a refusal
+    // is an answer, not a sample that read nothing.
     if (reason.has_value() && reason != _failing)
-        _sink->Remark(std::format("a sample read nothing: {}", OneLine(*reason)));
+        _sink->Remark(OneLine(*reason));
     _failing = std::move(reason);
 }
 
-std::string DescribeAbandonment(std::string_view endpoint, std::optional<Duration> sampleAge)
+std::string DescribeAbandonment(std::string_view endpoint, std::optional<Duration> readAge)
 {
-    if (!sampleAge.has_value())
-        return std::format("gave up waiting for the live-stats session to finish: no sample from {} was out, so a "
-                           "terminal read or the stop watch did not end",
+    if (!readAge.has_value())
+        return std::format("gave up waiting for the live-stats session to finish: no read of the stream from {} was "
+                           "out, so a terminal read or the stop watch did not end",
                            endpoint);
-    return std::format("gave up waiting for a sample from {} that had been out for {} ms; the exit status is "
-                       "what the session had already earned",
+    return std::format("gave up waiting for the stream from {} to close: its read had been out for {} ms; the exit "
+                       "status is what the session had already earned",
                        endpoint,
-                       std::chrono::duration_cast<std::chrono::milliseconds>(*sampleAge).count());
+                       std::chrono::duration_cast<std::chrono::milliseconds>(*readAge).count());
 }
 
-std::optional<std::string> DrainSession(LiveEventSource const& source,
-                                        std::string_view endpoint,
-                                        DrainBound bound,
-                                        IDrainWait& wait)
+std::optional<std::string> DrainSession(LiveEventSource const& source, DrainBound bound, IDrainWait& wait)
 {
     if (DrainWithin([&source] { return !source.IsDrained(); }, bound, wait) == DrainResult::Drained)
         return std::nullopt;
-    auto const since = source.SampleOutstandingSince();
-    return DescribeAbandonment(endpoint, since.has_value() ? std::optional<Duration> { wait.Now() - *since } : std::nullopt);
+    auto const since = source.ReadOutstandingSince();
+    return DescribeAbandonment(source.StreamingEndpoint(),
+                               since.has_value() ? std::optional<Duration> { wait.Now() - *since } : std::nullopt);
 }
 
 StandardRungViews::StandardRungViews(RenderOptions render, CellWidth cellWidth, ISixelEncoder* sixel):
@@ -329,13 +329,15 @@ std::unique_ptr<IDashboardView> StandardRungViews::For(RenderRung rung, LivePlan
     // operator named one: the same text on every rung (§9.6).
     auto absent = _render.absentOverride.value_or(
         std::string { FormatTable[static_cast<std::size_t>(OutputFormat::Human)].absentText });
-    return std::make_unique<PanelView>(panel(),
-                                       PanelContext { .absent = std::move(absent),
-                                                      .endpoint = std::string { address },
-                                                      .interval = plan.interval,
-                                                      .cellWidth = _cellWidth,
-                                                      .sixel = _sixel,
-                                                      .rung = rung });
+    return std::make_unique<PanelView>(
+        panel(),
+        PanelContext { .absent = std::move(absent),
+                       .endpoint = std::string { address },
+                       .server = std::string { RemoteKindTable[static_cast<std::size_t>(plan.server)].product },
+                       .interval = plan.interval,
+                       .cellWidth = _cellWidth,
+                       .sixel = _sixel,
+                       .rung = rung });
 }
 
 SessionEnding RunLiveStatsSession(VerbContext const& context, LiveSessionSeat const& seat)
@@ -344,33 +346,20 @@ SessionEnding RunLiveStatsSession(VerbContext const& context, LiveSessionSeat co
     if (!plan.has_value())
         return RefusedEnding(std::move(plan).error());
 
+    // Every subject streams through the one door, so there is no second door to be missing and
+    // nothing to refuse for want of one: whether this caller may watch is the node's answer.
+    assert(seat.subscription != nullptr && "every session reads the stream `main` dialled");
     auto const& subject = LiveSubjectTable[static_cast<std::size_t>(plan->subject)];
 
-    // What `RunVerb` asks of every row before its handler, asked here because a session is
-    // not reached through `RunVerb`: a sample would otherwise ask nothing. Asked of the door
-    // this subject's samples go through and of no other, so a fleet session is not refused for
-    // a stats ladder it never reads.
-    if (subject.document.empty() && context.stats == nullptr)
-        return RefusedEnding(
-            Concluded(Outcome::Unreachable, std::string { WireTable[static_cast<std::size_t>(Wire::Stats)].unavailable }));
-    if (subject.readsNodeStatus && context.nodeStatus == nullptr)
-        return RefusedEnding(
-            Concluded(Outcome::Unreachable, std::string { WireTable[static_cast<std::size_t>(Wire::Node)].unavailable }));
-    if (!subject.document.empty() && context.admin == nullptr)
-        return RefusedEnding(Concluded(Outcome::Usage, std::string { NoAdminSurface }));
-
-    auto const endpoint = plan->endpoint;
     auto parts = LiveSessionParts {
         .plan = *std::move(plan),
-        .address = seat.address,
+        .endpoint = seat.endpoint,
+        .dashboardToken = seat.dashboardToken,
         .reactor = seat.reactor,
-        .gatherer = context.stats,
-        .status = context.nodeStatus,
-        .admin = context.admin,
-        .dialer = seat.dialer,
+        .subscription = seat.subscription,
         .reader = subject.reader,
         .clock = seat.clock,
-        .samplePool = seat.samplePool,
+        .streamPool = seat.streamPool,
         .stopWaiter = seat.stopWaiter,
         .terminalPool = seat.terminalPool,
         .sink = seat.sink,
@@ -395,7 +384,7 @@ SessionEnding RunLiveStatsSession(VerbContext const& context, LiveSessionSeat co
     // still running when it closed -- here, off the reactor, which must keep turning for it.
     auto abandoned = std::optional<std::string> {};
     if (seat.source->has_value())
-        abandoned = DrainSession(**seat.source, endpoint, seat.drainBound, *seat.drainWait);
+        abandoned = DrainSession(**seat.source, seat.drainBound, *seat.drainWait);
 
     // A loop that threw earned nothing, and an abandonment must not unwind: it ends with the
     // outcome of a run that read nothing.

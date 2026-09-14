@@ -12,13 +12,7 @@ namespace FastCache::Cli
 {
 
 /// @file FleetReading.hpp
-/// What a `fleet` session's sample reads as: the leader's KPI strip, and the whole `/fleet.txt` parsed once.
-
-/// The source name a fleet reading carries, which no stats source shares.
-inline constexpr std::string_view FleetReadingSource = "fleet.txt";
-
-/// The document a `fleet` session asks the leader for, and the route its source line names.
-inline constexpr std::string_view FleetDocumentRoute = "/fleet.txt";
+/// What a `fleet` session's sample reads as: the leader's KPI strip, and the whole fleet document parsed once.
 
 /// How a fleet reader parses the leader's document: `ParseFleetDocument`, or a test's counting stand-in.
 using FleetParser = std::expected<FleetDocument, std::string> (*)(std::string_view document);
@@ -33,14 +27,13 @@ using FleetParser = std::expected<FleetDocument, std::string> (*)(std::string_vi
 /// text 256 times over, and a piped record takes the strip without a parser. A document that cannot
 /// be parsed never becomes a reading at all.
 ///
-/// - A fetch that produced no document is the fetch's own outcome (`OutcomeOf`): `Unreachable`
-///   when nothing answered, `Refused` when the leader -- or a follower naming it -- declined, with
-///   the server's words as the note.
+/// - A sample that carried no document is `Unreachable`: the stream's source composes every fleet
+///   reading with one, so its absence is a composition fault, never a fleet of nothing. Whether the
+///   leader could be reached or refused the watcher is the source's to say, as a failed sample.
 /// - A document that does not parse is `Protocol`, naming what the parser refused -- a body naming
-///   no section among them, since an empty fleet is a claim only a leader can make. A follower
-///   itself answers the route `503`, naming its leader, which is `Refused`.
+///   no section among them, since an empty fleet is a claim only a leader can make.
 /// @param event A `Sample` of a `fleet` session.
-/// @return The KPI record from `FleetReadingSource` with the document's parse, or why there is none.
+/// @return The KPI record, sourced from the subscription, with the document's parse, or why there is none.
 [[nodiscard]] SampleReading ReadFleetSample(DashboardEvent const& event);
 
 /// `ReadFleetSample`, through @p parse: the seam that lets a test count how often a sample is parsed.

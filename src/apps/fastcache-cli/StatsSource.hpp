@@ -5,7 +5,6 @@
 #include "CliValue.hpp"
 
 #include <FastCache/Core/EnumTable.hpp>
-#include <FastCache/Metrics/StatsReading.hpp>
 
 #include <cstdint>
 #include <optional>
@@ -62,21 +61,6 @@ enum class StatsOrigin : std::uint8_t
     Last,
 };
 
-/// Where a reading from one source states the version of the endpoint it read.
-///
-/// **Two shapes, because the two vocabularies differ**: `INFO` carries the version as a field's VALUE
-/// (`fastcached_version:0.4.1`), while `/metrics` carries it as a LABEL of an info series whose value
-/// is always 1 (`fastcached_build_info{version="0.4.1"} 1`), and `ParsePrometheus` keeps labels in the
-/// field name. A row per source rather than a name a panel looks up in any reading: a panel asking
-/// `INFO`'s spelling of a `/metrics` reading titled every cache `fastcached -` (#134).
-struct VersionPlace
-{
-    /// The field, or the info series' name without its labels; empty where the source states no version.
-    std::string_view field {};
-    /// The label carrying the version; empty when the field's value is the version itself.
-    std::string_view label {};
-};
-
 /// One origin's fixed properties.
 struct StatsOriginSpec
 {
@@ -88,7 +72,6 @@ struct StatsOriginSpec
     /// What choosing it costs, as the TAIL of a sentence the emitter opens by naming
     /// the source and the field count it observed. Empty when nothing.
     std::string_view caveat;
-    VersionPlace version {}; ///< Where its reading states the endpoint's version.
 };
 
 /// The origins, one row per enumerator, in enumerator order -- which is ladder order.
@@ -97,9 +80,7 @@ inline constexpr EnumTable<StatsOrigin, StatsOriginSpec> StatsOriginTable { {
       .name = "metrics",
       .route = "/metrics",
       .what = "the admin surface's /metrics endpoint",
-      .caveat = "",
-      .version = { .field = "fastcached_build_info", .label = "version" } },
-    // No version: the counter catalogue carries none, and a node states its version in its status.
+      .caveat = "" },
     { .origin = StatsOrigin::NodeMetrics,
       .name = "node-metrics",
       .route = "NodeMetrics",
@@ -111,8 +92,7 @@ inline constexpr EnumTable<StatsOrigin, StatsOriginSpec> StatsOriginTable { {
       .route = "INFO",
       .what = "RESP INFO on the data port",
       .caveat = "start the daemon with its metrics listener enabled, or pass "
-                "--admin-addr, for the full counter set",
-      .version = { .field = "fastcached_version" } },
+                "--admin-addr, for the full counter set" },
 } };
 
 static_assert(RowsInEnumeratorOrder(StatsOriginTable, &StatsOriginSpec::origin),
@@ -167,51 +147,6 @@ inline constexpr std::string_view StatsSourceFieldName = "source";
 /// @param body The response body.
 /// @return A record in the order the series appeared.
 [[nodiscard]] Value ParsePrometheus(std::string_view body);
-
-/// One label's value out of a series name as `ParsePrometheus` keeps it: `name{a="x",b="y"}`.
-///
-/// Unescaped the way the exposition format escapes a label value -- `\\`, `\"` and `\n` -- so a
-/// quote inside the value neither ends it early nor survives as a backslash.
-/// @param series The series name, labels included.
-/// @param label The label to read.
-/// @return Its value; nullopt when @p series carries no such label or its label set does not parse.
-[[nodiscard]] std::optional<std::string> LabelValue(std::string_view series, std::string_view label);
-
-/// @p base labelled for one tier, as `/metrics` spells a per-tier series and `ParsePrometheus` keeps it.
-/// @param base The unlabelled series name.
-/// @param tier The tier's `StorageTierTable` name.
-/// @return `base{tier="<tier>"}`.
-[[nodiscard]] std::string TierSeriesName(std::string_view base, std::string_view tier);
-
-/// The live model a ladder record states, read in @p origin's own vocabulary.
-///
-/// **The one place a series name becomes a model field** (#134): every panel reads the `StatsReading`, so the
-/// names `/metrics` renders are spelled here and nowhere in a panel. Transitional by design: #1399's
-/// subscription delivers a decoded `StatsReading` and this adapter, with the ladder's live-stats use, goes.
-///
-/// Per source, because each states a different part of the model:
-/// - `/metrics` states what a scrape renders: every counter, the cache and each tier, the host, whether an
-///   upstream is configured, the uptime and the version. A scrape does not render the cache's own index figures
-///   or a tier's command counters, so those read back as zero, and no panel reads them. A consensus block is not
-///   read back (no panel draws it from here; the node's status carries it).
-/// - `NodeMetrics` states the counters.
-/// - `INFO` states no reading at all. Its handful of fields cannot fill a cache's statistics, a block half
-///   filled with zeroes would be a reading of an empty cache, and a reading with no uptime would state a
-///   process that has served for zero seconds. A live session with only `INFO` draws every figure absent.
-///
-/// A block is present only when the record carries EVERY series of it, since a scrape renders a block whole or
-/// not at all; a counter is present when the record carries its row.
-/// @param record The chosen record.
-/// @param origin The source that produced it.
-/// @return The reading, the version empty where the source states none; nullopt for a source that states none.
-[[nodiscard]] std::optional<StatsReading> StatsReadingFromRecord(Value const& record, StatsOrigin origin);
-
-/// The version of the endpoint @p reading came from, read where @p origin states it
-/// (`StatsOriginSpec::version`).
-/// @param reading A record one source produced.
-/// @param origin The source that produced it.
-/// @return The version; nullopt when that source states none or this reading carries none.
-[[nodiscard]] std::optional<std::string> VersionIn(Value const& reading, StatsOrigin origin);
 
 /// Parse a RESP `INFO` body into a record.
 ///

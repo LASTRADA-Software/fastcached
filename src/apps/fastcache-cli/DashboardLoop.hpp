@@ -11,6 +11,7 @@
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Metrics/StatsReading.hpp>
 
+#include <chrono>
 #include <cstddef>
 #include <deque>
 #include <memory>
@@ -47,7 +48,7 @@ struct ReadingStamp
     TimePoint at {};       ///< When it was taken, on the steady clock.
     std::string source {}; ///< Which source produced it, by stable name.
     std::string route {};  ///< What was asked there, as the source line names it; see `SampleReading::route`.
-    std::string where {};  ///< The `host:port` that answered; empty when the reader did not say.
+    std::string where {};  ///< The `host:port` that answered; a change of it breaks a run.
     std::string role {};   ///< What the answering endpoint is to its subject, such as `leader`; usually empty.
 };
 
@@ -179,8 +180,8 @@ struct HistoryEntry
     ///
     /// **The fold's decision, recorded rather than re-derived.** Engaged exactly when this reading
     /// continued the run of the entry before it -- the decision that moved `runLength` past one --
-    /// so a first reading, a failure, a change of source and a stamp no later than the one before
-    /// all leave it disengaged. A series that re-applied the run rule to stored stamps would be a
+    /// so a first reading, a failure, a change of source or of endpoint, and a stamp no later than the
+    /// one before all leave it disengaged. A series that re-applied the run rule to stored stamps would be a
     /// second copy of that rule, free to disagree with the first.
     std::optional<Duration> elapsed {};
 
@@ -242,12 +243,20 @@ struct DashboardModel
     /// document only, and 256 copies of a whole fleet would be memory nobody reads.
     std::shared_ptr<FleetDocument const> latestDocument {};
 
+    /// The cadence the server granted the stream the NEWEST sample came from, or nullopt when that
+    /// sample carried none.
+    ///
+    /// Replaced by every sample taken, exactly as `nodeStatus` is. A failed sample carries no grant --
+    /// the stream it would have come from is gone -- so a panel then states the interval that was
+    /// asked for, which is what the next subscription asks for again.
+    std::optional<std::chrono::milliseconds> cadence {};
+
     /// How many readings in a row belong to one measurable run.
     ///
     /// **A counter rather than a flag, because the rules turned out to be one.** A rate
     /// needs two readings (so the first reading of a session has none), and it must not
-    /// span anything that makes the interval unmeasurable: a failure, a change of source,
-    /// or a stamp no later than the one before. Written as flags those are conditions that
+    /// span anything that makes the interval unmeasurable: a failure, a change of source or of
+    /// endpoint, or a stamp no later than the one before. Written as flags those are conditions that
     /// have to agree, and the first version of this file got one wrong in the direction
     /// nothing notices: it cleared the flag on the reading straight after a failure,
     /// drawing a rate over an interval where the source was down. One counter, one rule.
@@ -399,13 +408,17 @@ struct SampleReading
     /// reader that reads none.
     std::vector<SeriesPoint> points {};
 
-    /// What was asked, as a panel's source line names it: `/metrics`, `INFO`, `/fleet.txt`.
+    /// What was asked, as a panel's source line names it: `SUBSCRIBE`.
     ///
     /// **The reader's own spelling**, from the table that already names its source, so the source line
     /// cannot name a route the reader did not take. Meaningful iff `outcome` is `Affirmative`.
     std::string route {};
 
     /// The `host:port` that answered, or empty when the reader does not know it.
+    ///
+    /// Part of the reading for the reason `source` is: a change of endpoint breaks the run. Every reading
+    /// arrives by the one subscription source, so this is what says the counters now belong to another
+    /// process -- a leader followed, or a re-subscription somebody else answered.
     std::string where {};
 
     /// What the answering endpoint is to the subject, when that is part of the reading: `leader` for a
@@ -415,8 +428,8 @@ struct SampleReading
 
 /// Turns one session's raw `Sample` payload into a reading.
 ///
-/// **Injected, so the fold never branches on a subject.** A `cache` or `node` session reads
-/// `attempts` through the stats ladder and a `fleet` session reads `document`; the loop calls
+/// **Injected, so the fold never branches on a subject.** A `cache` or `node` session reads the
+/// decoded `reading` and a `fleet` session parses `document`; the loop calls
 /// whichever reader it was given and cannot tell them apart. That keeps the choice in the
 /// deterministic half, where a loop fixture reaches it.
 ///
@@ -426,12 +439,12 @@ struct SampleReading
 /// than a comment asking.
 using SampleReader = SampleReading (*)(DashboardEvent const& event);
 
-/// The reader for a `cache` or `node` session: the stats ladder's own decision.
+/// The reader for a `cache` or `node` session: the reading the subscription pushed, as it is.
 ///
-/// `ChooseStats` over the event's attempts, which is what the fold ran inline before a reader
-/// was injected -- moved, not rewritten, so a `cache` session sees the decision it always saw.
+/// Nothing to decide: the stream's grant refused a layout this build cannot read, so a sample that
+/// carries a reading carries one this client's panels can draw.
 /// @param event The `Sample`.
-/// @return The chosen record and its source, or why nothing could be chosen.
+/// @return The reading and where it answered, or why there is none.
 [[nodiscard]] SampleReading ReadStatsSample(DashboardEvent const& event);
 
 /// Where a rendered frame goes.

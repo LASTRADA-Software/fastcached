@@ -2,6 +2,7 @@
 #pragma once
 
 #include "CliAnswer.hpp"
+#include "CliEndpoint.hpp"
 #include "DashboardEvent.hpp"
 #include "DashboardGlyphs.hpp"
 #include "DashboardLoop.hpp"
@@ -9,8 +10,8 @@
 #include "LiveEventSource.hpp"
 #include "LivePipedView.hpp"
 #include "LiveStats.hpp"
+#include "LiveSubscriber.hpp"
 #include "SixelEncoder.hpp"
-#include "StatsSource.hpp"
 #include "TerminalEvents.hpp"
 
 #include <FastCache/Async/IExecutor.hpp>
@@ -94,7 +95,7 @@ class IRungViews
 
     /// @param rung The rung decided for this session.
     /// @param plan What was admitted: the subject whose panel is drawn, and the interval it states.
-    /// @param address Where the samples are asked, as a frame names it.
+    /// @param address Where the stream is read, as a frame names it.
     /// @return Its view, or null for a rung this build has no view for -- which refuses the
     ///         session by name rather than drawing it through some other rung's view.
     [[nodiscard]] virtual std::unique_ptr<IDashboardView> For(RenderRung rung,
@@ -128,7 +129,8 @@ class IRemarkSink
 ///
 /// **The reason is the decision's own account, never a second one**: `SampleReading::note` for a
 /// `Sample` its reader could not read, asked of the very reader the loop is given (it is pure, so
-/// both ask one question and get one answer), and `DashboardEvent::note` for a `SampleFailed`.
+/// both ask one question and get one answer), and `DashboardEvent::note` for a `SampleFailed`. It is
+/// remarked verbatim, on one line, so each producer's note is a sentence that stands on its own.
 class FailureRemarks final: public IDashboardEventSource
 {
   public:
@@ -157,15 +159,13 @@ class FailureRemarks final: public IDashboardEventSource
 struct LiveSessionParts
 {
     LivePlan plan {};                            ///< What was admitted.
-    std::string address {};                      ///< The endpoint this invocation dialled, as a frame names it.
+    Endpoint endpoint {};                        ///< Where the session subscribes: `--addr`.
+    std::string dashboardToken {};               ///< What a fleet subscription presents; empty for none.
     IReactor* reactor { nullptr };               ///< Where the session runs.
-    IStatsGatherer* gatherer { nullptr };        ///< What each sample asks, until one fails.
-    INodeStatusReader* status { nullptr };       ///< What a node sample asks for its status; see `readsNodeStatus`.
-    IAdminDocument* admin { nullptr };           ///< What a document sample asks; see `LiveSubjectSpec::document`.
-    IStatsDialer* dialer { nullptr };            ///< What re-dials after a failed sample.
+    ILiveSubscription* subscription { nullptr }; ///< The stream every reading arrives on.
     SampleReader reader { nullptr };             ///< What a sample says: the subject's reader.
-    IClock* clock { nullptr };                   ///< What samples are stamped with: `SteadyClock`.
-    IExecutor* samplePool { nullptr };           ///< Where a gather or a document fetch blocks.
+    IClock* clock { nullptr };                   ///< What readings are stamped with: `SteadyClock`.
+    IExecutor* streamPool { nullptr };           ///< Where a dial or a stream read blocks.
     IExecutor* stopWaiter { nullptr };           ///< Where the stop wait blocks: its own thread.
     IExecutor* terminalPool { nullptr };         ///< Where terminal reads block: its own thread.
     IFrameSink* sink { nullptr };                ///< Where a piped session's frames go; never an interactive one's.
@@ -214,36 +214,33 @@ struct LiveSessionRun
 
 /// The stderr line for a closed session whose source did not drain within its bound.
 ///
-/// A sample that is out has an age, and the age is the part an operator can act on: a scrape
-/// out for five seconds against a one-second timeout says the timeout is not being honoured.
-/// With no sample out something else did not finish, and inventing an age for it would send
-/// them to the wrong place. Pure, so the wording is tested apart from the drain.
-/// @param endpoint Where the samples were asked.
-/// @param sampleAge How long the sample still out had been out, or nullopt when none was.
+/// A read that is out has an age, and the age is the part an operator can act on: closing the
+/// session half-closes the stream, a node answers that by closing, and a read still out seconds
+/// later says the node never did -- nor did the idle bound its grant set. With no read out
+/// something else did not finish, and inventing an age for it would send them to the wrong place.
+/// Pure, so the wording is tested apart from the drain.
+/// @param endpoint Where the stream was read.
+/// @param readAge How long the dial or read still out had been out, or nullopt when none was.
 /// @return The line, naming what is being abandoned.
-[[nodiscard]] std::string DescribeAbandonment(std::string_view endpoint, std::optional<Duration> sampleAge);
+[[nodiscard]] std::string DescribeAbandonment(std::string_view endpoint, std::optional<Duration> readAge);
 
 /// Wait for a closed session's source to drain, within @p bound.
 ///
 /// **`DrainWithin` -- this tree's one bounded shutdown drain -- on the CALLING thread, which
-/// must not be the reactor's.** The reactor has to keep running for a returning sample to land,
+/// must not be the reactor's.** The reactor has to keep running for a returning read to land,
 /// and a poll on it would stall exactly that; on a thread with nothing else to do at shutdown it
 /// is how every other drain here waits.
 ///
 /// **On an abandonment the caller ends the process WITHOUT unwinding**, after restoring what it
-/// changed, flushing, and writing the line: a sample still inside `Gather()` holds the gatherer,
-/// the pool and the connections the caller's stack owns, and returning destroys them under that
-/// thread. It exits with the code the session already earned, which this never touches.
-/// @param source The closed source.
-/// @param endpoint Where the samples were asked.
+/// changed, flushing, and writing the line: a read still inside `ILiveSubscription::Read` holds the
+/// subscription, the pool and the connection the caller's stack owns, and returning destroys them
+/// under that thread. It exits with the code the session already earned, which this never touches.
+/// @param source The closed source; its `StreamingEndpoint()` is what the line names.
 /// @param bound The ceiling, and how often to look.
 /// @param wait The drain's clock and its sleep; injected so a test spends no real time. Its
 ///        clock must count from the reactor clock's epoch, which `steady_clock` does.
 /// @return Nothing when the source drained, or the abandonment line when the bound was spent.
-[[nodiscard]] std::optional<std::string> DrainSession(LiveEventSource const& source,
-                                                      std::string_view endpoint,
-                                                      DrainBound bound,
-                                                      IDrainWait& wait);
+[[nodiscard]] std::optional<std::string> DrainSession(LiveEventSource const& source, DrainBound bound, IDrainWait& wait);
 
 /// The views this build draws through: the subject's figures as a record stream on the `Piped`
 /// rung, in `--format`, and the subject's panel on every interactive rung.
@@ -277,14 +274,15 @@ class StandardRungViews final: public IRungViews
 ///
 /// **The reactor must already be running, on a thread that is not the caller's**:
 /// `RunLiveStatsSession` blocks its caller until the session ends and then drains on it, and
-/// a drain on the reactor's own thread would stall the sample it is waiting for.
+/// a drain on the reactor's own thread would stall the read it is waiting for.
 struct LiveSessionSeat
 {
     IReactor* reactor { nullptr };               ///< Running on a thread of its own.
-    std::string address {};                      ///< The endpoint this invocation dialled, as a frame names it.
-    IClock* clock { nullptr };                   ///< What samples are stamped with: `SteadyClock`.
-    IStatsDialer* dialer { nullptr };            ///< What re-dials the endpoint after a failed sample.
-    IExecutor* samplePool { nullptr };           ///< Where a gather blocks.
+    Endpoint endpoint {};                        ///< Where the session subscribes: `--addr`.
+    std::string dashboardToken {};               ///< From `--dashboard-token-file`; empty for none.
+    IClock* clock { nullptr };                   ///< What readings are stamped with: `SteadyClock`.
+    ILiveSubscription* subscription { nullptr }; ///< The stream, dialled with this invocation's credential.
+    IExecutor* streamPool { nullptr };           ///< Where a dial or a stream read blocks.
     IExecutor* stopWaiter { nullptr };           ///< Where the stop wait blocks.
     IExecutor* terminalPool { nullptr };         ///< Where terminal reads block.
     IFrameSink* sink { nullptr };                ///< Where a piped session's frames go: stdout.

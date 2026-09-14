@@ -35,7 +35,7 @@ namespace FastCache::Cli
 /// **The events suspend on READINESS, never on a timer.** Each wait is endo's
 /// `TerminalEventSource::wait`: `::poll(2)` on POSIX, `WaitForMultipleObjects` on Windows. That
 /// wait BLOCKS, so it runs on the pool and the result is handed back: the same two-hop
-/// `TakeSample` uses, for the same reason. On the reactor it would stall ticks, samples and quit
+/// `TakeFrame` uses, for the same reason. On the reactor it would stall ticks, samples and quit
 /// together.
 
 /// A terminal that has not been acquired yet. It has nothing to call; `StartTerminal` consumes it.
@@ -130,7 +130,7 @@ struct StartedTerminal
 ///
 /// Touches no terminal, so a composition may call it and never start the result.
 ///
-/// Pointers rather than references, matching `TakeSample`: siblings composed the same way, and
+/// Pointers rather than references, matching `TakeFrame`: siblings composed the same way, and
 /// every coroutine parameter in this tree is a pointer. None may be null, and both must outlive the
 /// result and everything started from it.
 ///

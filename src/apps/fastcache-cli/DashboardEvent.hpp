@@ -3,20 +3,18 @@
 
 #include "CliAnswer.hpp"
 #include "DashboardFrame.hpp"
-#include "SocketExchange.hpp"
-#include "StatsSource.hpp"
 
 #include <FastCache/Async/Task.hpp>
 #include <FastCache/Core/Clock.hpp>
+#include <FastCache/Metrics/StatsReading.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
 #include <chrono>
 #include <cstdint>
-#include <expected>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <type_traits>
-#include <vector>
 
 namespace FastCache::Cli
 {
@@ -83,24 +81,29 @@ struct DashboardEvent
     /// stored here at all.
     TimePoint at {};
 
-    /// `Sample`, `cache` and `node` sessions: what each stats source said.
+    /// `Sample`, `cache` and `node` sessions: the reading the stream pushed, decoded into the one
+    /// model `/metrics` renders from (#1399).
     ///
-    /// The RAW attempts rather than an already-chosen record, so the decision -- every source
-    /// silent, the rich one down and the thin one up, one never asked -- is made by the reader
-    /// the fold was given, inside the deterministic half where a fixture can reach it, instead
-    /// of behind a socket.
-    std::vector<StatsAttempt> attempts {};
+    /// **Decoded, never a record to interpret.** Every panel figure is read from this struct, and the
+    /// binary it came from was refused at the grant when it was laid out by another build -- so there is
+    /// no second vocabulary for a reader to translate and no series name anywhere between the node and
+    /// the panel. Disengaged on a `fleet` sample, and on a sample the composition built wrongly, which
+    /// the reader refuses rather than drawing as zeroes.
+    std::optional<StatsReading> reading {};
 
-    /// `Sample`, `fleet` session: what the leader's admin document fetch produced.
+    /// `Sample`, `fleet` session: the leader's `RenderFleetText` document, whole, as the stream pushed it.
     ///
-    /// Raw for the reason `attempts` is: success or failure, it is the reader's to interpret. A
-    /// `/fleet.txt` answer is a table rather than a stats attempt, so without its own member a
-    /// fleet session could not stream at all. Disengaged on a `cache` or `node` sample.
-    std::optional<std::expected<std::string, AdminError>> document {};
+    /// Raw rather than parsed, so whether it is a fleet at all is the reader's decision, in the
+    /// deterministic half. Disengaged on a `cache` or `node` sample.
+    std::optional<std::string> document {};
 
-    /// `Sample`, `fleet` session: the `host:port` the document was asked at, or empty when the fetch
-    /// resolved no admin surface. What a panel's source line names as `/fleet.txt at <where>`.
-    std::string documentWhere {};
+    /// `Sample`: the endpoint the stream was dialled at -- `--addr`, or the leader a `NotLeader` named.
+    /// What a panel's source line names, and what a rate requires two readings to share.
+    std::string where {};
+
+    /// `Sample`: the cadence the server keeps, as its grant said, which is what the title's
+    /// `every Ns` states -- nullopt for a sample no grant preceded.
+    std::optional<std::chrono::milliseconds> cadence {};
 
     /// `Sample` and `SampleFailed`, `node` session: what the node said about itself when this
     /// sample was taken, or nullopt when the sample carried no status.
@@ -147,6 +150,12 @@ struct DashboardEvent
     /// drawn from the old cell size would be the wrong size in the new grid.
     std::optional<CellPixelSize> cellPixels {};
 };
+
+/// The source a live-stats reading names: every subject's readings arrive by subscription.
+inline constexpr std::string_view SubscriptionSource = "subscription";
+
+/// What was asked, as a panel's source line names it: `subscription (SUBSCRIBE at <where>)`.
+inline constexpr std::string_view SubscriptionRoute = "SUBSCRIBE";
 
 /// A wall `time_point` cannot be stored as when a reading was taken.
 static_assert(std::is_same_v<decltype(DashboardEvent::at)::clock, std::chrono::steady_clock>,

@@ -5,13 +5,18 @@
 #include <FastCache/Async/AsyncQueue.hpp>
 #include <FastCache/Async/DeadlineTimer.hpp>
 #include <FastCache/Async/ResumeOn.hpp>
+#include <FastCache/Core/HostPort.hpp>
+#include <FastCache/Core/Ranges.hpp>
+#include <FastCache/Protocol/LeaderRedirect.hpp>
 
-#include <algorithm>
 #include <atomic>
 #include <cassert>
-#include <cstddef>
+#include <chrono>
+#include <cstdint>
 #include <expected>
+#include <format>
 #include <limits>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -22,99 +27,8 @@ namespace FastCache::Cli
 
 namespace
 {
-    /// One document sample, and when it was taken.
-    struct DocumentOutcome
-    {
-        std::expected<std::string, AdminError> document { std::unexpected(AdminError {}) }; ///< What the fetch produced.
-        std::string where {};                                                               ///< Where it was asked.
-        TimePoint takenAt {};                                                               ///< When it answered.
-    };
+    namespace Wire = CompileCacheWire;
 
-    /// Fetch one admin document off the reactor and come back: `TakeSample`'s two hops.
-    ///
-    /// The same shape for the same reasons, and stamped in the same place -- on the pool, the
-    /// moment the fetch returns -- so a rate over documents is divided by the time the fetches took.
-    /// @param admin What to ask.
-    /// @param path The document; by value, for the coroutine frame.
-    /// @param clock What stamps it; reads its source on every call.
-    /// @param pool Where the blocking fetch runs.
-    /// @param resumeOn Where the caller resumes.
-    /// @return The document, and when it arrived.
-    Task<DocumentOutcome> TakeDocument(
-        IAdminDocument* admin, std::string path, IClock* clock, IExecutor* pool, IExecutor* resumeOn)
-    {
-        auto outcome = DocumentOutcome {};
-        co_await ResumeOn { *pool };
-        outcome.document = admin->FetchAdmin(path);
-        outcome.takenAt = clock->Now();
-        outcome.where = admin->AdminAddress();
-        co_await ResumeOn { *resumeOn };
-        co_return outcome;
-    }
-
-    /// Asks the gatherer it holds, dialling a new one first when the last round failed.
-    ///
-    /// Read and written only by the gathers, which run one at a time on the pool: the cadence
-    /// never starts a sample before the previous one has come back.
-    class RedialingGatherer final: public IStatsGatherer
-    {
-      public:
-        /// @param first What to ask until a round fails.
-        /// @param status What to ask for the node's status until then; null for never.
-        /// @param dialer What dials a replacement; null for never.
-        RedialingGatherer(IStatsGatherer* first, INodeStatusReader* status, IStatsDialer* dialer) noexcept:
-            _current { first },
-            _status { status },
-            _dialer { dialer },
-            _readsStatus { status != nullptr }
-        {
-        }
-
-        [[nodiscard]] std::vector<StatsAttempt> Gather() override
-        {
-            if (_lastFailed && _dialer != nullptr)
-            {
-                _dialed = _dialer->Dial();
-                _current = _dialed.get();
-                if (_readsStatus)
-                    _status = _dialed.get();
-            }
-            // In the same hop and BEFORE the counters: `TakeSample` stamps the moment `Gather()`
-            // returns, and every rate is divided by the time between two stamps, so a round trip
-            // read after the counters would put its own jitter into every rate's denominator.
-            if (_status != nullptr)
-                _lastStatus = _status->ReadNodeStatus();
-            auto attempts = _current->Gather();
-            // Failed by the reader's own decision rather than by a second reading of the
-            // attempts: a round the ladder cannot choose a record from is the round that
-            // renders as a gap, and exactly that round is the one worth a re-dial.
-            _lastFailed = ChooseStats(attempts).outcome != Outcome::Affirmative;
-            return attempts;
-        }
-
-        /// The status the last gather read, handed over once.
-        ///
-        /// Written on the pool and taken on the reactor after `TakeSample` has hopped back, which
-        /// the executor's hand-off orders; the cadence never starts a gather before taking this.
-        /// @return The status, or nullopt when none was read.
-        [[nodiscard]] std::optional<CompileCacheWire::NodeStatusFields> TakeStatus() noexcept
-        {
-            return std::exchange(_lastStatus, std::nullopt);
-        }
-
-      private:
-        IStatsGatherer* _current;
-        INodeStatusReader* _status;
-        IStatsDialer* _dialer;
-        std::unique_ptr<IDialedStats> _dialed {};
-        std::optional<CompileCacheWire::NodeStatusFields> _lastStatus {};
-        bool _readsStatus;
-        bool _lastFailed { false };
-    };
-} // namespace
-
-namespace
-{
     /// Presents through a source's presenter while it exists, and drops frames after.
     class GatedFrames final: public IFrameSink
     {
@@ -134,6 +48,18 @@ namespace
       private:
         std::unique_ptr<IFrameSink> const* _presenter;
     };
+
+    /// How one stream ended, which decides what the source does next.
+    ///
+    /// TRANSMITTED/PERSISTED: no. Private; enumerators may be inserted.
+    enum class StreamEnd : std::uint8_t
+    {
+        Retry,  ///< Subscribe again at `--addr`, one interval from now.
+        Follow, ///< Subscribe again at once, at the leader a refusal named.
+        Finish, ///< End the session: nothing was read, and waiting cannot change the answer.
+        Closed, ///< The source was closed while the stream ran.
+        Last,
+    };
 } // namespace
 
 /// Shared by the source and its producers.
@@ -141,8 +67,8 @@ namespace
 /// Every member is read and written on the reactor's thread only -- the producers resume
 /// there before touching any of it, and `LiveSourceParts::reactor` states the same of the
 /// caller -- except the two that are atomic, which a drain reads from another thread, and
-/// `gatherer`, which a sample uses on the pool between two hand-offs and never at once with
-/// the reactor.
+/// `parts.subscription`, which a read uses on the pool between two hand-offs and which
+/// `Close()` may only LEAVE, the one call it allows from another thread.
 struct LiveEventSource::State
 {
     explicit State(LiveSourceParts from):
@@ -150,7 +76,6 @@ struct LiveEventSource::State
         events { *parts.reactor, AsyncQueueOptions {} },
         finished { *parts.reactor, AsyncQueueOptions {} },
         due { *parts.reactor, AsyncQueueOptions {} },
-        gatherer { parts.gatherer, parts.status, parts.dialer },
         presents { parts.frames != nullptr },
         frames { &parts.frames }
     {
@@ -163,10 +88,10 @@ struct LiveEventSource::State
     /// What `Next()` hands out, and whether the session is closed: only `Close()` closes it.
     ///
     /// **Unbounded, because every producer is self-limiting and a drop would be a lie.**
-    /// The cadence waits for one sample before starting the next, and the forwarders await
-    /// each read before asking for another, so none can outrun a consumer that draws a frame
-    /// per tick. And what a bound would displace is a sample the budget counts or a quit
-    /// key -- either one lost silently is a session that miscounts or cannot be left.
+    /// The stream awaits each read before asking for another, and the forwarders await each
+    /// read before asking for the next, so none can outrun a consumer that draws a frame per
+    /// tick. And what a bound would displace is a sample the budget counts or a quit key --
+    /// either one lost silently is a session that miscounts or cannot be left.
     AsyncQueue<DashboardEvent> events;
 
     /// Closed when the last producer ends; nothing is ever pushed to it.
@@ -175,21 +100,14 @@ struct LiveEventSource::State
     /// this tree's one way to park a coroutine until something else says so.
     AsyncQueue<std::monostate> finished;
 
-    /// Where the cadence waits between samples: the timer pushes when the next sample is
-    /// due, and `Close()` closes it.
+    /// Where the stream waits before subscribing again: the timer pushes when the wait is up,
+    /// and `Close()` closes it.
     ///
-    /// **The wait is a `DeadlineTimer` feeding this queue rather than a `SleepUntil`**,
-    /// because a sleep can be taken back only by whoever holds the sleeping frame's handle
-    /// -- which the coroutine cannot hand out without copying `DeadlineTimer`'s own
-    /// machinery. Here closing the queue wakes the cadence on the reactor's next turn, it
-    /// leaves through its own tail like every other exit, and its timer's destructor takes
-    /// the pending deadline off the heap.
+    /// **A `DeadlineTimer` feeding this queue rather than a `SleepUntil`**, because a sleep can
+    /// be taken back only by whoever holds the sleeping frame's handle. Closing the queue wakes
+    /// the stream on the reactor's next turn, it leaves through its own tail like every other
+    /// exit, and its timer's destructor takes the pending deadline off the heap.
     AsyncQueue<std::monostate> due;
-
-    /// What every sample asks: `parts.gatherer`, re-dialled through `parts.dialer` after a
-    /// failure. Held here because a sample still on the pool when the source is destroyed is
-    /// still inside it, and this state outlives the source for exactly that long.
-    RedialingGatherer gatherer;
 
     /// Whether the source was given a presenter at all, which `Frames()` answers by.
     bool presents;
@@ -199,14 +117,26 @@ struct LiveEventSource::State
 
     int producers { 0 };
 
+    /// Whether any reading has been delivered, which decides whether a refusal ends the session.
+    bool readSomething { false };
+
+    /// Consecutive `NotLeader` redirects followed without a grant.
+    int redirects { 0 };
+
     /// Whether the last producer has ended, for a drain that cannot park on `finished`.
     std::atomic<bool> drained { false };
 
-    /// When the outstanding sample started, in the reactor clock's ticks, or `NoSample`.
-    std::atomic<TimePoint::rep> sampleSince { NoSample };
+    /// When the outstanding dial or read started, in the source clock's ticks, or `NoRead`.
+    std::atomic<TimePoint::rep> readSince { NoRead };
 
-    /// `sampleSince` when no sample is out. No real reading of a steady clock is this.
-    static constexpr auto NoSample = std::numeric_limits<TimePoint::rep>::min();
+    /// Guards `streaming`, which a drain reads from another thread.
+    mutable std::mutex streamingGuard;
+
+    /// The endpoint the stream dials now: `--addr`, or a leader it followed.
+    std::string streaming;
+
+    /// `readSince` when nothing is out. No real reading of a steady clock is this.
+    static constexpr auto NoRead = std::numeric_limits<TimePoint::rep>::min();
 
     /// Whether the session is closed.
     /// @return True once `Close()` has run.
@@ -222,6 +152,59 @@ struct LiveEventSource::State
         (void) events.Push(std::move(event));
     }
 
+    /// Queue a sample outcome for `Next()`, and the frame it owes.
+    /// @param event A `Sample` or a `SampleFailed`.
+    void DeliverSample(DashboardEvent event)
+    {
+        Deliver(std::move(event));
+        Deliver(DashboardEvent { .kind = DashboardEventKind::Tick });
+    }
+
+    /// Queue a failed sample and the frame it owes.
+    /// @param at When the failure was observed.
+    /// @param outcome What it means as an outcome.
+    /// @param note Why, for a person.
+    void DeliverFailure(TimePoint at, Outcome outcome, std::string note)
+    {
+        DeliverSample(DashboardEvent {
+            .kind = DashboardEventKind::SampleFailed, .at = at, .outcome = outcome, .note = std::move(note) });
+    }
+
+    /// The request every subscription sends.
+    ///
+    /// **The dashboard credential rides a FLEET request only.** A node checks it for that subject
+    /// alone, and a secret sent where nothing checks it is a secret handed to whatever answers
+    /// `--addr` -- or to any address a redirect names -- for nothing.
+    /// @return It.
+    [[nodiscard]] Wire::SubscribeRequest Request() const
+    {
+        return Wire::SubscribeRequest {
+            .subject = parts.subject,
+            .cadenceMillis = static_cast<std::uint32_t>(parts.interval.count()),
+            .dashboardToken = parts.subject == Wire::LiveSubject::Fleet ? parts.dashboardToken : std::string {},
+        };
+    }
+
+    /// Name the endpoint the stream now dials, for a drain that reads it from another thread.
+    /// @param where The endpoint.
+    void StreamingAt(Endpoint const& where)
+    {
+        auto const lock = std::scoped_lock { streamingGuard };
+        streaming = EndpointText(where);
+    }
+
+    /// Mark a dial or read as out, for `ReadOutstandingSince()`.
+    void MarkOut() noexcept
+    {
+        readSince.store(parts.clock->Now().time_since_epoch().count(), std::memory_order_release);
+    }
+
+    /// Mark that nothing is out any more.
+    void MarkBack() noexcept
+    {
+        readSince.store(NoRead, std::memory_order_release);
+    }
+
     /// One producer has ended; the last one says so to both kinds of waiter.
     void ProducerEnded() noexcept
     {
@@ -234,78 +217,265 @@ struct LiveEventSource::State
 
 namespace
 {
-    /// A cadence deadline has come: say so to the queue the cadence waits on.
+    /// A re-subscription is due: say so to the queue the stream waits on.
     /// @param due The source's `due` queue.
-    void SampleDue(void* due)
+    void SubscriptionDue(void* due)
     {
         (void) static_cast<AsyncQueue<std::monostate>*>(due)->Push(std::monostate {});
     }
 
-    /// Take one sample through whichever door the session samples, as the event it becomes.
+    /// What a refusal of a subscription leaves the session to do.
     ///
-    /// One step for both doors, so the cadence around it -- the stamp of when a sample is out,
-    /// the tick, the deadline -- is written once.
-    /// @param state The source's state; the cadence holds it alive.
-    /// @return The `Sample` or `SampleFailed` to deliver.
-    Task<DashboardEvent> SampleOnce(LiveEventSource::State* state)
+    /// TRANSMITTED/PERSISTED: no. Private; enumerators may be inserted.
+    enum class RefusalCourse : std::uint8_t
     {
-        auto const& parts = state->parts;
-        if (!parts.document.empty())
-        {
-            auto fetched = co_await TakeDocument(parts.admin, parts.document, parts.clock, parts.pool, parts.reactor);
-            // Success or failure, the document is the reader's to interpret: a refusal carries the
-            // leader's own words, and the reader decides which outcome that is.
-            co_return DashboardEvent { .kind = DashboardEventKind::Sample,
-                                       .at = fetched.takenAt,
-                                       .document = std::move(fetched.document),
-                                       .documentWhere = std::move(fetched.where) };
-        }
+        Wait,         ///< A later attempt can outlive it: a gap, and a retry after an interval.
+        Caller,       ///< About this caller: ends a session that has read nothing, a gap in one that has.
+        Incompatible, ///< This client and that node cannot stream at all: ends the session whatever was read.
+        Last,
+    };
 
-        auto sample = co_await TakeSample(&state->gatherer, parts.clock, parts.pool, parts.reactor);
-        auto status = state->gatherer.TakeStatus();
-        if (sample.attempts.empty())
-            // Nothing could be asked at all. A failure the loop counts and draws as a gap -- never
-            // a reading with nothing in it, which the reader would have to guess about.
-            co_return DashboardEvent { .kind = DashboardEventKind::SampleFailed,
-                                       .at = sample.takenAt,
-                                       .nodeStatus = std::move(status),
-                                       .outcome = Outcome::Unreachable,
-                                       .note = "no stats source could be asked" };
-        co_return DashboardEvent { .kind = DashboardEventKind::Sample,
-                                   .at = sample.takenAt,
-                                   .attempts = std::move(sample.attempts),
-                                   .nodeStatus = std::move(status) };
+    /// One refusal code a subscription treats other than as `Caller`.
+    struct StreamRefusalRow
+    {
+        Wire::ErrorCode code; ///< What the node refused with.
+        Outcome outcome;      ///< What the gap it draws means.
+        RefusalCourse course; ///< What the session does next.
+        std::string_view why; ///< Appended to the note, naming what the operator can change; empty for nothing.
+    };
+
+    /// The refusals that are not about the caller. Every other code is `Caller`, `Refused`: the safe
+    /// default, because a code nobody enumerated read as *wait* would retry forever against a node
+    /// that has said no.
+    constexpr auto StreamRefusalRows = std::to_array<StreamRefusalRow>({
+        // `NotLeader` naming an address never reaches this table: it is followed. Naming nobody, no
+        // leader is known yet, and one will be.
+        { .code = Wire::ErrorCode::NotLeader, .outcome = Outcome::Unreachable, .course = RefusalCourse::Wait, .why = "" },
+        { .code = Wire::ErrorCode::EndpointBusy, .outcome = Outcome::Unreachable, .course = RefusalCourse::Wait, .why = "" },
+        { .code = Wire::ErrorCode::UnsupportedVersion,
+          .outcome = Outcome::Protocol,
+          .course = RefusalCourse::Incompatible,
+          .why = "; this client and that node speak different 0xFC wire versions, so upgrade them together" },
+        { .code = Wire::UnimplementedVerb,
+          .outcome = Outcome::Protocol,
+          .course = RefusalCourse::Incompatible,
+          .why = "; that node is older than live-stats subscriptions, so upgrade it" },
+    });
+
+    /// The remedy an otherwise unlisted refusal names, as the tail of its note; empty for none.
+    ///
+    /// **What THIS client can change, never a restatement of the node's detail**, which the note already
+    /// carries. A fleet refusal therefore turns on whether the request carried the dashboard credential:
+    /// without one, where to pass it; with one, that it was not accepted -- which is true both of a wrong
+    /// secret and of a leader that names no `--dashboard-token-file` and streams to its own machine only,
+    /// two cases one code cannot tell apart and the node's detail does.
+    /// @param code What the node refused with.
+    /// @param request What was asked.
+    /// @return The remedy.
+    [[nodiscard]] std::string_view CallerRemedy(Wire::ErrorCode code, Wire::SubscribeRequest const& request) noexcept
+    {
+        if (code == Wire::ErrorCode::NotAMember)
+            return "; add this machine to that node's --fleet-member list";
+        if (code != Wire::ErrorCode::Unauthenticated)
+            return {};
+        if (request.subject != Wire::LiveSubject::Fleet)
+            return "; present the credential with --token-file";
+        return request.dashboardToken.empty() ? "; present the dashboard credential with --dashboard-token-file"
+                                              : "; the dashboard credential from --dashboard-token-file was not accepted";
     }
 
-    /// Sample, deliver, park until the next deadline; until closed.
+    /// A stream's failure, named by where it was: `<endpoint>: <why>`.
     ///
-    /// **The deadline is the later of the cadence grid and now.** On the grid, a sample
-    /// that took 300 ms of a 2 s interval does not push every later one 300 ms back. Never
-    /// before now, so a sample slower than the interval is followed by the next at once
-    /// rather than by one per interval it overran: a burst of back-dated samples would
-    /// all read the same moment and make a rate out of nothing.
+    /// For an account that does not name the endpoint itself -- a read that broke, an end, a frame this
+    /// client cannot read -- so a remark says whose stream it was, which after a leader redirect is not
+    /// `--addr`. A dial's and an AUTH refusal's accounts already name it and are delivered as they are.
+    /// @param where Where the stream was.
+    /// @param why What happened.
+    /// @return The note.
+    [[nodiscard]] std::string AtEndpoint(Endpoint const& where, std::string_view why)
+    {
+        return std::format("{}: {}", EndpointText(where), why);
+    }
+
+    /// Decide what a refusal means for the session, and say so in the history.
+    ///
+    /// **A `NotLeader` naming an address is an instruction, not a failure**: the stream follows it at
+    /// once, bounded by `MaxLeaderRedirects`. A refusal a later attempt can outlive -- no leader known
+    /// yet, a node at its subscription cap -- is a gap and a retry. Anything else is about this
+    /// client's address or credential: it ends a session that has read nothing, and is a gap in one
+    /// that has, because a node that revoked a watcher a minute ago may admit it again (§9.17).
+    /// @param state The source.
+    /// @param at When the refusal arrived.
+    /// @param frame The refusal.
+    /// @param where Who refused; replaced by the leader it named when this returns `Follow`.
+    /// @return What the source does next.
+    [[nodiscard]] StreamEnd Refused(LiveEventSource::State* state, TimePoint at, LiveFrame const& frame, Endpoint* where)
+    {
+        auto const code = frame.code.value_or(Wire::ErrorCode::MalformedFrame);
+        if (auto const leader = LeaderRedirectTarget(code, frame.note); leader.has_value())
+        {
+            auto const parsed = ParseDialEndpoint(*leader);
+            if (parsed.has_value() && ++state->redirects <= MaxLeaderRedirects)
+            {
+                *where = Endpoint { .host = parsed->first, .port = parsed->second };
+                return StreamEnd::Follow;
+            }
+            state->DeliverFailure(at,
+                                  Outcome::Unreachable,
+                                  std::format("followed {} leader redirects without a stream; the last named {}",
+                                              MaxLeaderRedirects,
+                                              *leader));
+            return StreamEnd::Retry;
+        }
+
+        auto const* const row =
+            FindIfOrNull(StreamRefusalRows, [code](StreamRefusalRow const& each) { return each.code == code; });
+        auto const outcome = row != nullptr ? row->outcome : Outcome::Refused;
+        auto const course = row != nullptr ? row->course : RefusalCourse::Caller;
+        auto const why = row != nullptr ? row->why : CallerRemedy(code, state->Request());
+        state->DeliverFailure(
+            at, outcome, std::format("{} refused the subscription: {}{}", EndpointText(*where), frame.note, why));
+        switch (course)
+        {
+            case RefusalCourse::Wait:
+                return StreamEnd::Retry;
+            case RefusalCourse::Caller:
+                return state->readSomething ? StreamEnd::Retry : StreamEnd::Finish;
+            case RefusalCourse::Incompatible:
+            case RefusalCourse::Last:
+                break;
+        }
+        return StreamEnd::Finish;
+    }
+
+    /// Deliver a reading, stamped when its frame arrived.
+    /// @param state The source.
+    /// @param at When the frame arrived.
+    /// @param frame The reading.
+    /// @param where Where the stream answers.
+    /// @param cadence What its grant said the server keeps.
+    void DeliverReading(LiveEventSource::State* state,
+                        TimePoint at,
+                        LiveFrame frame,
+                        Endpoint const& where,
+                        std::optional<std::chrono::milliseconds> cadence)
+    {
+        state->readSomething = true;
+        state->DeliverSample(DashboardEvent { .kind = DashboardEventKind::Sample,
+                                              .at = at,
+                                              .reading = std::move(frame.reading),
+                                              .document = std::move(frame.document),
+                                              .where = EndpointText(where),
+                                              .cadence = cadence,
+                                              .nodeStatus = std::move(frame.nodeStatus) });
+    }
+
+    /// Open one stream at @p where and read it until it ends.
+    ///
+    /// Every frame is read by `TakeFrame`, off the reactor and back, so the terminal and the stop
+    /// request are heard while a read is out.
+    /// @param state The source; the stream holds it alive.
+    /// @param where Where to subscribe; replaced by the leader when this returns `Follow`.
+    /// @return How the stream ended.
+    Task<StreamEnd> ReadStream(LiveEventSource::State* state, Endpoint* where)
+    {
+        auto const& parts = state->parts;
+
+        state->StreamingAt(*where);
+        state->MarkOut();
+        auto const opened = co_await OpenStream(parts.subscription, *where, state->Request(), parts.pool, parts.reactor);
+        state->MarkBack();
+        if (state->Closed())
+            co_return StreamEnd::Closed;
+        if (!opened.has_value())
+        {
+            state->DeliverFailure(parts.clock->Now(), Outcome::Unreachable, opened.error().detail);
+            co_return StreamEnd::Retry;
+        }
+
+        auto cadence = std::optional<std::chrono::milliseconds> {};
+        while (!state->Closed())
+        {
+            state->MarkOut();
+            auto outcome = co_await TakeFrame(parts.subscription, parts.clock, parts.pool, parts.reactor);
+            state->MarkBack();
+            // Closed while the read was on the pool: what it brought back describes a session that
+            // has already ended.
+            if (state->Closed())
+                co_return StreamEnd::Closed;
+            if (!outcome.frame.has_value())
+            {
+                state->DeliverFailure(
+                    outcome.takenAt, Outcome::Unreachable, AtEndpoint(*where, outcome.frame.error().detail));
+                co_return StreamEnd::Retry;
+            }
+
+            auto frame = ReadLiveFrame(parts.subject, *outcome.frame);
+            switch (frame.kind)
+            {
+                case LiveFrameKind::Granted:
+                    cadence = std::chrono::milliseconds { frame.granted.grantedCadenceMillis };
+                    state->redirects = 0;
+                    // A snapshot comes every cadence whether or not anything changed, so that long a
+                    // silence is a stream that has died, not a quiet one.
+                    parts.subscription->ExpectEvery(*cadence);
+                    break;
+                case LiveFrameKind::Reading:
+                    DeliverReading(state, outcome.takenAt, std::move(frame), *where, cadence);
+                    break;
+                case LiveFrameKind::Event:
+                case LiveFrameKind::Gap:
+                    // The same tick's reading follows an event, and a gap is the interval between two
+                    // readings the fold already measures: neither is news on its own.
+                    break;
+                case LiveFrameKind::Ended:
+                    state->DeliverFailure(outcome.takenAt, Outcome::Unreachable, AtEndpoint(*where, frame.note));
+                    co_return StreamEnd::Retry;
+                case LiveFrameKind::Refused:
+                    co_return Refused(state, outcome.takenAt, frame, where);
+                case LiveFrameKind::Unreadable:
+                case LiveFrameKind::Last:
+                    state->DeliverFailure(outcome.takenAt, Outcome::Protocol, AtEndpoint(*where, frame.note));
+                    co_return StreamEnd::Finish;
+            }
+        }
+        co_return StreamEnd::Closed;
+    }
+
+    /// Subscribe, read, and subscribe again after an interval; until closed or finished.
     /// @param shared The source's state; held so it outlives the source if need be.
-    DetachedTask RunCadence(std::shared_ptr<LiveEventSource::State> shared)
+    DetachedTask RunStream(std::shared_ptr<LiveEventSource::State> shared)
     {
         auto const& parts = shared->parts;
         co_await ResumeOn { *parts.reactor };
 
-        auto deadline = parts.reactor->Clock().Now();
+        auto where = parts.endpoint;
         while (!shared->Closed())
         {
-            shared->sampleSince.store(parts.clock->Now().time_since_epoch().count(), std::memory_order_release);
-            auto sample = co_await SampleOnce(shared.get());
-            shared->sampleSince.store(LiveEventSource::State::NoSample, std::memory_order_release);
-            // Closed while the sample was on the pool: the closed queue refuses the reading,
-            // which describes a session that has already ended, and the closed `due` ends
-            // the loop below without a wait.
-            shared->Deliver(std::move(sample));
-            shared->Deliver(DashboardEvent { .kind = DashboardEventKind::Tick });
+            auto const end = co_await ReadStream(shared.get(), &where);
+            if (end == StreamEnd::Closed)
+                break;
+            if (end == StreamEnd::Finish)
+            {
+                shared->Deliver(
+                    DashboardEvent { .kind = DashboardEventKind::Detached, .note = std::string { StreamFinishedNote } });
+                break;
+            }
+            if (end == StreamEnd::Follow)
+                continue;
 
-            deadline = std::max(deadline + parts.interval, parts.reactor->Clock().Now());
-            // A zero poll interval: `Close()` wakes this through `due`, so the timer never
-            // needs to look at anything before its deadline.
-            auto const timer = DeadlineTimer { *parts.reactor, deadline, &SampleDue, &shared->due, Duration::zero() };
+            // A stream that failed starts again where the operator pointed, not at a leader it once
+            // followed: that leader may be the one that went away. And with its redirects counted
+            // afresh, or a session that once ran out of them could never follow one again.
+            where = parts.endpoint;
+            shared->redirects = 0;
+            // A zero poll interval: `Close()` wakes this through `due`, so the timer never needs to
+            // look at anything before its deadline.
+            auto const timer = DeadlineTimer { *parts.reactor,
+                                               parts.reactor->Clock().Now() + parts.interval,
+                                               &SubscriptionDue,
+                                               &shared->due,
+                                               Duration::zero() };
             if (!(co_await shared->due.Pop()).has_value())
                 break;
         }
@@ -337,7 +507,7 @@ namespace
                 shared->Deliver(DashboardEvent { .kind = DashboardEventKind::Tick });
         }
         // Released here, on the reactor, as soon as nothing reads it: destroying it is what
-        // restores the terminal, and a sample still on the pool is no reason to leave an
+        // restores the terminal, and a read still on the pool is no reason to leave an
         // operator's terminal in raw mode. Closed first, because a terminal that went away
         // on its own was never closed, and its contract asks for that before destruction. Its
         // presenter goes first: nothing may be drawn once the operator's screen is back.
@@ -358,7 +528,7 @@ namespace
         auto const wake = co_await parts.stop->Stopped(parts.stopWaiter, parts.reactor);
 
         // Released as soon as nothing waits on it, which is what puts the previous signal
-        // disposition back: a sample stuck on the pool is no reason to keep Ctrl-C redirected
+        // disposition back: a read stuck on the pool is no reason to keep Ctrl-C redirected
         // at a watch that has ended.
         parts.stop.reset();
 
@@ -385,13 +555,14 @@ namespace
 LiveEventSource::LiveEventSource(LiveSourceParts parts):
     _state { std::make_shared<State>(std::move(parts)) }
 {
-    // Zero would make every deadline `now`, and the cadence would gather back to back --
-    // never blocking the reactor, and never letting the endpoint rest either. Admission
-    // refuses anything below a subject's floor, so this is a caller's mistake, not input.
+    // Zero would ask the server for its floor and re-subscribe back to back after a failure --
+    // never blocking the reactor, and never letting the endpoint rest either. Admission refuses
+    // anything below a subject's floor, so this is a caller's mistake, not input.
     assert(_state->parts.interval > std::chrono::milliseconds::zero());
+    assert(_state->parts.subscription != nullptr);
 
     ++_state->producers;
-    RunCadence(_state);
+    RunStream(_state);
     if (_state->parts.terminal != nullptr)
     {
         ++_state->producers;
@@ -415,7 +586,7 @@ Task<DashboardEvent> LiveEventSource::Next()
     auto const state = _state;
     auto event = co_await state->events.Pop();
     if (!event.has_value())
-        co_return DashboardEvent { .kind = DashboardEventKind::Detached, .note = "the live-stats session was closed" };
+        co_return DashboardEvent { .kind = DashboardEventKind::Detached, .note = std::string { SessionClosedNote } };
     co_return *std::move(event);
 }
 
@@ -426,6 +597,9 @@ void LiveEventSource::Close() noexcept
         return;
     state.events.Close();
     state.due.Close();
+    // The one call allowed while a read is on the pool: a half-close, which the node answers by
+    // closing, and that close is what returns the read.
+    state.parts.subscription->Leave();
     if (state.parts.terminal != nullptr)
         state.parts.terminal->Close();
     if (state.parts.stop != nullptr)
@@ -437,12 +611,18 @@ bool LiveEventSource::IsDrained() const noexcept
     return _state->drained.load(std::memory_order_acquire);
 }
 
-std::optional<TimePoint> LiveEventSource::SampleOutstandingSince() const noexcept
+std::optional<TimePoint> LiveEventSource::ReadOutstandingSince() const noexcept
 {
-    auto const since = _state->sampleSince.load(std::memory_order_acquire);
-    if (since == State::NoSample)
+    auto const since = _state->readSince.load(std::memory_order_acquire);
+    if (since == State::NoRead)
         return std::nullopt;
     return TimePoint { TimePoint::duration { since } };
+}
+
+std::string LiveEventSource::StreamingEndpoint() const
+{
+    auto const lock = std::scoped_lock { _state->streamingGuard };
+    return _state->streaming.empty() ? EndpointText(_state->parts.endpoint) : _state->streaming;
 }
 
 IFrameSink* LiveEventSource::Frames() noexcept

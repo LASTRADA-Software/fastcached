@@ -358,6 +358,20 @@ namespace
         CellWidth cellWidth;         ///< How wide text is.
     };
 
+    /// The interval readings arrive at: what the server granted, or what was asked while no grant is known.
+    ///
+    /// The grant wins because the server keeps the cadence (#1399): a node whose floor is not this build's
+    /// paces the stream at its own, and a title stating the asked interval would misstate every span drawn
+    /// from the readings.
+    /// @param in The frame's inputs.
+    /// @param context The panel's context.
+    /// @return The interval, when either states one.
+    [[nodiscard]] std::optional<std::chrono::milliseconds> ReadingInterval(FrameInputs const& in,
+                                                                           PanelContext const& context) noexcept
+    {
+        return in.model->cadence.has_value() ? in.model->cadence : context.interval;
+    }
+
     /// @p figure's series for this frame.
     /// @param in The frame's inputs.
     /// @param figure The figure.
@@ -2446,7 +2460,7 @@ namespace
         block.imageCells = budget - block.imageColumn;
         if (!pixels)
             block.window = std::min(block.window, block.imageCells);
-        auto const span = WindowText(block.window, context.interval);
+        auto const span = WindowText(block.window, ReadingInterval(in, context));
 
         // The title: what the chart draws, over how long, and what else it says where there is room.
         auto title = std::vector<Piece> { Piece { .text = std::string { Indent }, .priority = Priority::Essential } };
@@ -2778,24 +2792,34 @@ namespace
         return block;
     }
 
+    /// How much of where a source line says the source answered.
+    enum class SourceWhere : std::uint8_t
+    {
+        Named,   ///< `SUBSCRIBE at <where>`, when the reading said.
+        Omitted, ///< `SUBSCRIBE` alone: the title bar names the address, so it is the part a narrow line spares.
+    };
+
     /// Which source answered, as the source line names it.
     ///
-    /// `metrics (/metrics at 127.0.0.1:9464)`: the source, and in brackets what was asked where. A reading
-    /// from an endpoint with a role in its subject reads the other way round, because the route IS the
-    /// source there: `/fleet.txt at build-01:9464 (leader)`. Each part the reader did not say is left out
-    /// rather than guessed, and before any reading the whole of it is the absent marker.
+    /// `subscription (SUBSCRIBE at 127.0.0.1:6674)`: the source, and in brackets what was asked where. A
+    /// reading from an endpoint with a role in its subject adds the role in the same brackets, so every
+    /// panel reads one way: `subscription (SUBSCRIBE at build-01:7071, leader)`. Each part the reader did not
+    /// say is left out rather than guessed, and before any reading the whole of it is the absent marker.
     /// @param in The frame's inputs.
+    /// @param where Whether the address is said.
     /// @return The text.
-    [[nodiscard]] std::string SourceText(FrameInputs const& in)
+    [[nodiscard]] std::string SourceText(FrameInputs const& in, SourceWhere where)
     {
         if (!in.model->latestStamp.has_value())
             return std::string { in.absent };
         auto const& stamp = *in.model->latestStamp;
         if (stamp.route.empty())
             return stamp.source;
-        auto const asked = stamp.where.empty() ? stamp.route : std::format("{} at {}", stamp.route, stamp.where);
+        auto const asked = stamp.where.empty() || where == SourceWhere::Omitted
+                               ? stamp.route
+                               : std::format("{} at {}", stamp.route, stamp.where);
         if (!stamp.role.empty())
-            return std::format("{} ({})", asked, stamp.role);
+            return std::format("{} ({}, {})", stamp.source, asked, stamp.role);
         return std::format("{} ({})", stamp.source, asked);
     }
 
@@ -2804,6 +2828,11 @@ namespace
     ///
     /// The counts go first for width -- they describe the run, the source says what the run is of -- and
     /// what is kept is laid out right-aligned, so the counts stay in one place as the source's text changes.
+    ///
+    /// **But the address goes before the counts do** (#1399): it is in the title bar already, and a fleet
+    /// line naming `SUBSCRIBE at <where>, leader` is 82 cells with its counts at 80 columns. So the line is
+    /// fitted with the address, then without it, and only a line that keeps no counts either way drops them
+    /// -- saying the address, which is then the most the room holds.
     /// @param in The frame's inputs.
     /// @param priority When the line goes; the counts go before it.
     /// @param budget The content width.
@@ -2818,12 +2847,21 @@ namespace
             std::ranges::count_if(model.history, [](HistoryEntry const& entry) { return !entry.reading.has_value(); });
         auto const counts =
             std::format("{}, {}", Counted(model.samples, SampleNoun), Counted(static_cast<std::size_t>(gaps), GapNoun));
-        auto kept =
-            FitPieces({ Piece { .text = std::format("{}source  {}", Indent, SourceText(in)), .priority = priority },
-                        Piece { .text = std::string { PieceGap } + counts, .priority = std::max(priority, Priority::Low) } },
-                      budget,
-                      0,
-                      in.cellWidth);
+        auto const fitted = [&](SourceWhere where) {
+            return FitPieces(
+                { Piece { .text = std::format("{}source  {}", Indent, SourceText(in, where)), .priority = priority },
+                  Piece { .text = std::string { PieceGap } + counts, .priority = std::max(priority, Priority::Low) } },
+                budget,
+                0,
+                in.cellWidth);
+        };
+        auto kept = fitted(SourceWhere::Named);
+        if (kept.has_value() && kept->size() < 2)
+        {
+            auto spared = fitted(SourceWhere::Omitted);
+            if (spared.has_value() && spared->size() == 2)
+                kept = std::move(spared);
+        }
         if (!kept.has_value())
             return std::unexpected(kept.error());
         if (kept->empty())
@@ -2895,9 +2933,9 @@ namespace
           } },
         { .fact = ChromeFact::Interval,
           .render = [](FrameInputs const& in, PanelContext const& context) -> std::string {
-              return context.interval.has_value()
-                         ? std::format("every {}s", std::chrono::duration<double> { *context.interval }.count())
-                         : std::format("every {}", in.absent);
+              auto const interval = ReadingInterval(in, context);
+              return interval.has_value() ? std::format("every {}s", std::chrono::duration<double> { *interval }.count())
+                                          : std::format("every {}", in.absent);
           } },
         { .fact = ChromeFact::Quit,
           .render = [](FrameInputs const& /*in*/, PanelContext const& /*context*/) -> std::string { return "q"; } },
@@ -2907,6 +2945,15 @@ namespace
 
     static_assert(RowsInEnumeratorOrder(ChromeFactTable, &ChromeFactSpec::fact),
                   "ChromeFactTable must hold one row per ChromeFact, in enumerator order");
+
+    /// The subject a title bar names: what answered for a panel titled by its server, when a session said.
+    /// @param spec The panel.
+    /// @param context The session's facts.
+    /// @return The title.
+    [[nodiscard]] std::string_view TitleOf(PanelSpec const& spec, PanelContext const& context) noexcept
+    {
+        return spec.titleNamesServer && !context.server.empty() ? std::string_view { context.server } : spec.title;
+    }
 
     /// A title bar's two halves.
     struct TitleText
@@ -2934,7 +2981,8 @@ namespace
         constexpr auto Chrome = std::size_t { 9 };
         constexpr auto SubjectSlot = std::size_t { 0 };
         constexpr auto FactsSlot = std::size_t { 1 };
-        auto pieces = std::vector<Piece> { Piece { .text = std::string { spec.title }, .priority = Priority::Essential } };
+        auto pieces =
+            std::vector<Piece> { Piece { .text = std::string { TitleOf(spec, context) }, .priority = Priority::Essential } };
         for (auto const& row: spec.titleFacts)
         {
             auto const beside = row.side == TitleSide::Subject;
@@ -2948,7 +2996,7 @@ namespace
         if (!kept.has_value())
         {
             // Not even the subject fits; the frame cuts it.
-            title.subject = std::string { spec.title };
+            title.subject = std::string { TitleOf(spec, context) };
             return title;
         }
         for (auto const& piece: *kept)
@@ -3278,7 +3326,7 @@ DashboardFrame PanelView::PlacedFrame(DashboardModel const& model)
     auto const minimum = MinimumPanelSize(*_spec, in.cellWidth);
     auto const tooSmall = [&](std::size_t neededColumns) {
         return DashboardFrame { .text = TooSmall(
-                                    _spec->title,
+                                    TitleOf(*_spec, _context),
                                     PanelSize { .columns = std::max(minimum.columns, neededColumns), .rows = minimum.rows },
                                     columns,
                                     reportedRows,

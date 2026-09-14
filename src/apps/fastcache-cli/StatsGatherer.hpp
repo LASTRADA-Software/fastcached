@@ -18,7 +18,7 @@ namespace FastCache::Cli
 /// The impure half of the ladder, kept apart from `StatsSource.hpp`'s decision so that
 /// `ChooseStats` -- which is where all the interesting behaviour is -- needs no socket
 /// to test. This class does the opposite: it is all socket and no decision.
-class LadderGatherer final: public IStatsGatherer, public IAdminDocument, public IEndpointIdentity, public INodeStatusReader
+class LadderGatherer final: public IStatsGatherer, public IAdminDocument, public IEndpointIdentity
 {
   public:
     /// @param admin Where `/metrics` is; an unconfigured endpoint means *do not ask*,
@@ -54,24 +54,12 @@ class LadderGatherer final: public IStatsGatherer, public IAdminDocument, public
     /// @return The body, or why there is none.
     [[nodiscard]] std::expected<std::string, AdminError> FetchAdmin(std::string_view path) override;
 
-    /// @return The resolved admin surface as `host:port`, or empty when none resolves.
-    [[nodiscard]] std::string AdminAddress() override;
-
     /// What the endpoint is, typed.
     ///
     /// The same single `NodeStatus` round trip the ladder's rungs share, so a verb asking
     /// this and then gathering pays for one identification, not two.
     /// @return The identification.
     [[nodiscard]] EndpointIdentity IdentifyEndpoint() override;
-
-    /// What the node says about itself now: a `NodeStatus` round trip of its own, every call.
-    ///
-    /// Never the identification's cached fields -- see `INodeStatusReader`. Over the same `0xFC`
-    /// connection the ladder's rungs use, so a session's status and its counters come from one
-    /// place.
-    /// @return The node's status, or nullopt for no connection, a reply that is not a node's, or
-    ///         a body this client cannot read.
-    [[nodiscard]] std::optional<CompileCacheWire::NodeStatusFields> ReadNodeStatus() override;
 
   private:
     /// Both views of one identification, decided together.

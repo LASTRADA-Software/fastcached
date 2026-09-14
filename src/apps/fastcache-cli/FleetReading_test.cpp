@@ -13,6 +13,7 @@
 #include <ranges>
 #include <string>
 #include <string_view>
+#include <utility>
 
 using namespace FastCache;
 using namespace FastCache::Cli;
@@ -21,12 +22,24 @@ using namespace FastCache::Distributed;
 namespace
 {
 
-/// A `fleet` sample carrying @p fetched.
-/// @param fetched What the document fetch produced.
+/// Where every fleet sample here says its stream answered: the leader it was dialled at.
+constexpr auto Leader = std::string_view { "10.0.0.9:7071" };
+
+/// A `fleet` sample carrying @p document, as the leader's stream pushed it.
+/// @param document The document, whole.
 /// @return The event.
-[[nodiscard]] DashboardEvent FleetSample(std::expected<std::string, AdminError> fetched)
+[[nodiscard]] DashboardEvent FleetSample(std::string document)
 {
-    return DashboardEvent { .kind = DashboardEventKind::Sample, .document = std::move(fetched) };
+    return DashboardEvent { .kind = DashboardEventKind::Sample,
+                            .document = std::move(document),
+                            .where = std::string { Leader } };
+}
+
+/// A `fleet` sample that carried no document: a composition fault, since every fleet reading is pushed with one.
+/// @return The event.
+[[nodiscard]] DashboardEvent DocumentlessSample()
+{
+    return DashboardEvent { .kind = DashboardEventKind::Sample, .where = std::string { Leader } };
 }
 
 /// A leader's whole document, from the leader's own renderer.
@@ -49,7 +62,6 @@ TEST_CASE("a fleet reading's value is the leader's KPI strip, never the document
     auto const reading = ReadFleetSample(FleetSample(document));
 
     REQUIRE(reading.outcome == Outcome::Affirmative);
-    CHECK(reading.source == FleetReadingSource);
     CHECK(reading.note.empty());
     REQUIRE(reading.value.shape == Shape::Record);
     CHECK(reading.value.fields.size() >= FleetKpiKeys().size());
@@ -59,7 +71,25 @@ TEST_CASE("a fleet reading's value is the leader's KPI strip, never the document
         CHECK(field.value.lexical.size() < document.size() / 4);
 }
 
-TEST_CASE("a fleet reading hands over the document it parsed, and a refused one hands over none", "[cli][fleet][reading]")
+TEST_CASE("a fleet reading names the subscription it came from and the leader that pushed it", "[cli][fleet][reading]")
+{
+    // A panel's source line and the run rule both read these. WHAT DISTINGUISHES: `where` is the SAMPLE's -- the
+    // endpoint the stream was dialled at, which after a redirect is the leader rather than `--addr` -- so a reader
+    // that named a constant, or dropped it, fails; and the source and route are the subscription's, never a fetch's.
+    auto const reading = ReadFleetSample(FleetSample(LeaderDocument()));
+    REQUIRE(reading.outcome == Outcome::Affirmative);
+    CHECK(reading.source == SubscriptionSource);
+    CHECK(reading.route == SubscriptionRoute);
+    CHECK(reading.where == Leader);
+    CHECK(reading.role == LeaderRole);
+
+    auto moved = FleetSample(LeaderDocument());
+    moved.where = "10.0.0.10:7071";
+    CHECK(ReadFleetSample(moved).where == "10.0.0.10:7071");
+}
+
+TEST_CASE("a fleet reading hands over the document it parsed, and a sample that is not a reading hands over none",
+          "[cli][fleet][reading]")
 {
     // Parsed once, here, so a panel draws the parse instead of parsing again every frame. WHAT
     // DISTINGUISHES: the document arrives AND is this text's parse -- every section the text's own
@@ -91,9 +121,7 @@ TEST_CASE("a fleet reading hands over the document it parsed, and a refused one 
     snapshot.role = SchedulerRole::Follower;
     snapshot.leaderEndpoint = "10.0.0.9:7071";
     CHECK(ReadFleetSample(FleetSample(RenderFleetText(snapshot, FleetHistoryView {}, std::nullopt))).document == nullptr);
-    CHECK(
-        ReadFleetSample(FleetSample(std::unexpected(AdminError { .kind = AdminFailure::Refused, .detail = "no" }))).document
-        == nullptr);
+    CHECK(ReadFleetSample(DocumentlessSample()).document == nullptr);
 }
 
 TEST_CASE("a fleet document that does not parse is a protocol failure naming what was refused", "[cli][fleet][reading]")
@@ -113,20 +141,16 @@ TEST_CASE("a fleet document that does not parse is a protocol failure naming wha
     }
 }
 
-TEST_CASE("a fleet fetch that produced no document keeps the fetch's own outcome and words", "[cli][fleet][reading]")
+TEST_CASE("a fleet sample that carried no document is unreachable, never a fleet of nothing", "[cli][fleet][reading]")
 {
-    auto const refused = ReadFleetSample(FleetSample(
-        std::unexpected(AdminError { .kind = AdminFailure::Refused, .detail = "not the leader; ask 10.0.0.9:7071" })));
-    CHECK(refused.outcome == Outcome::Refused);
-    CHECK(refused.note.contains("10.0.0.9:7071"));
-
-    auto const silent = ReadFleetSample(
-        FleetSample(std::unexpected(AdminError { .kind = AdminFailure::Unreachable, .detail = "connection refused" })));
-    CHECK(silent.outcome == Outcome::Unreachable);
-    CHECK(silent.note.contains("connection refused"));
-
-    auto const composedWrongly = ReadFleetSample(DashboardEvent { .kind = DashboardEventKind::Sample });
-    CHECK(composedWrongly.outcome != Outcome::Affirmative);
+    // Whether the leader could be reached, or refused the watcher, is the source's to say, as a failed sample; a
+    // `Sample` with no document can only be one composed wrongly. WHAT DISTINGUISHES: `Unreachable` and its own
+    // words, where a document that does not parse is `Protocol` -- a reader that parsed an empty text would answer
+    // `Protocol` here, and one that drew an empty fleet would answer `Affirmative`.
+    auto const composedWrongly = ReadFleetSample(DocumentlessSample());
+    CHECK(composedWrongly.outcome == Outcome::Unreachable);
+    CHECK(composedWrongly.note.contains("carried no fleet document"));
+    CHECK(composedWrongly.value.shape == Shape::Empty);
 }
 
 TEST_CASE("a piped fleet record is the newest reading's KPI strip, with its source first", "[cli][fleet][reading]")
@@ -134,13 +158,13 @@ TEST_CASE("a piped fleet record is the newest reading's KPI strip, with its sour
     auto const document = LeaderDocument();
     auto model = DashboardModel {};
     model.latest = ReadFleetSample(FleetSample(document)).value;
-    model.latestStamp = ReadingStamp { .at = {}, .source = std::string { FleetReadingSource } };
+    model.latestStamp = ReadingStamp { .at = {}, .source = std::string { SubscriptionSource } };
 
     auto const record = FleetKpiFigures(model);
     REQUIRE(record.shape == Shape::Record);
     REQUIRE_FALSE(record.fields.empty());
     CHECK(record.fields[0].name == "source");
-    CHECK(record.fields[0].value.lexical == FleetReadingSource);
+    CHECK(record.fields[0].value.lexical == SubscriptionSource);
 
     // The strip as the leader writes it on its own: read through the one-section form rather than the
     // whole document, so a record taking the wrong column or dropping a row cannot agree with it.
@@ -218,7 +242,7 @@ std::size_t parsesTaken = 0;
 TEST_CASE("a fleet sample is parsed exactly once by its reader", "[cli][fleet][reading]")
 {
     // The seam the parse-once property is measured through. WHAT DISTINGUISHES: one call reads one
-    // parse, a refused fetch reads none -- and the piped record drawn from that reading parses nothing
+    // parse, a sample with no document reads none -- and the piped record drawn from that reading parses nothing
     // more, so a record that re-parsed the text would move the count.
     parsesTaken = 0;
     auto const reading = ReadFleetSampleThrough(FleetSample(LeaderDocument()), &CountingParse);
@@ -227,12 +251,11 @@ TEST_CASE("a fleet sample is parsed exactly once by its reader", "[cli][fleet][r
 
     auto model = DashboardModel {};
     model.latest = reading.value;
-    model.latestStamp = ReadingStamp { .at = {}, .source = std::string { FleetReadingSource } };
+    model.latestStamp = ReadingStamp { .at = {}, .source = std::string { SubscriptionSource } };
     auto const record = FleetKpiFigures(model);
     CHECK(record.fields.size() == reading.value.fields.size() + 1);
     CHECK(parsesTaken == 1);
 
-    (void) ReadFleetSampleThrough(FleetSample(std::unexpected(AdminError { .kind = AdminFailure::Refused, .detail = "no" })),
-                                  &CountingParse);
+    (void) ReadFleetSampleThrough(DocumentlessSample(), &CountingParse);
     CHECK(parsesTaken == 1);
 }

@@ -129,9 +129,9 @@ TEST_CASE("a fleet reading carries the chart's points, taken before its parse is
     // The reader is where points come from. WHAT DISTINGUISHES: the reading carries one point per machine
     // the document read, with their subjects -- a reader taking them after the parse moved into `document`
     // reads a moved-from document and carries none -- and it still hands the document over.
-    auto const reading = ReadFleetSample(DashboardEvent {
-        .kind = DashboardEventKind::Sample,
-        .document = std::expected<std::string, AdminError> { MachinesText({ { "a:1", "500" }, { "b:1", "250" } }) } });
+    auto const reading = ReadFleetSample(
+        DashboardEvent { .kind = DashboardEventKind::Sample,
+                         .document = std::optional<std::string> { MachinesText({ { "a:1", "500" }, { "b:1", "250" } }) } });
     REQUIRE(reading.outcome == Outcome::Affirmative);
     REQUIRE(reading.points.size() == 2);
     CHECK(reading.points[0].subject == "a:1");

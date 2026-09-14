@@ -3,20 +3,24 @@
 
 /// @file LiveSourceRig.hpp
 /// The deterministic rig every `live-stats` session test runs a `LiveEventSource` on: a
-/// session reactor, a second one standing in for each pool, one manual clock, and the fakes
-/// the source composes. Shared because the source's own cases and the session runner's
+/// session reactor, a second one standing in for each pool, one manual clock, a scripted
+/// subscription, and the fakes the source composes. Shared because the source's own cases and the session runner's
 /// drive the same object, and a second copy of a fixture is a second place for it to be
 /// wrong.
 
 #include "DashboardFrame.hpp"
 #include "DashboardLoop.hpp"
 #include "LiveEventSource.hpp"
-#include "ScriptedExchange.hpp"
+#include "LiveSubscriber.hpp"
 #include "ScriptedStopSignal.hpp"
 
 #include <FastCache/Async/AsyncQueue.hpp>
 #include <FastCache/Async/TestReactor.hpp>
 #include <FastCache/Core/Clock.hpp>
+#include <FastCache/Core/WireFields.hpp>
+#include <FastCache/Metrics/IMetricsSink.hpp>
+#include <FastCache/Metrics/StatsReading.hpp>
+#include <FastCache/Metrics/StatsReadingCodec.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
 #include <catch2/catch_test_macros.hpp>
@@ -25,10 +29,12 @@
 #include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <expected>
 #include <format>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -41,44 +47,34 @@ namespace FastCache::Cli::Testing
 
 using FastCache::Testing::Unwrap;
 
-/// The interval every case samples at.
+/// The interval every case asks the server for, and waits before subscribing again.
 inline constexpr auto Interval = std::chrono::milliseconds { 2000 };
 
-/// A reading `ChooseStats` accepts, so a sample counts against a budget.
-/// @return One answered attempt.
-[[nodiscard]] inline std::vector<StatsAttempt> Reading()
+/// Where every rig's session subscribes first: its `--addr`.
+inline constexpr auto RigHost = std::string_view { "127.0.0.1" };
+
+/// The port half of `RigHost`'s endpoint.
+inline constexpr std::uint16_t RigPort = 6674;
+
+/// What a scripted stream answers a read past its last frame: the silence a real stream's idle bound ends.
+inline constexpr auto SilentStream = std::string_view { "the stream went silent past its idle bound" };
+
+/// The endpoint a rig's session subscribes at.
+/// @return `RigHost:RigPort`.
+[[nodiscard]] inline Endpoint RigEndpoint()
 {
-    return { StatsAttempt { .origin = StatsOrigin::Info,
-                            .asked = true,
-                            .record = RecordValue({ Field { .name = "curr_connections", .value = TextCell("10") } }),
-                            .note = {} } };
+    return Endpoint { .host = std::string { RigHost }, .port = RigPort };
 }
 
-/// A round in which the source was asked and did not answer: what a dead connection gives.
-/// @return The attempts.
-[[nodiscard]] inline std::vector<StatsAttempt> NothingAnswered()
+/// A reading a case can tell from another by one counter's value.
+/// @param opened What `LiveSubscriptionsOpened` reads.
+/// @return The reading, captured by the daemon's own capture.
+[[nodiscard]] inline StatsReading ReadingOpened(std::uint64_t opened)
 {
-    return { StatsAttempt { .origin = StatsOrigin::Info, .asked = true, .record = std::nullopt, .note = "closed" } };
+    AtomicMetricsSink sink;
+    sink.Increment(IMetricsSink::Counter::LiveSubscriptionsOpened, opened);
+    return CaptureStatsReading(sink, MetricsSnapshot {});
 }
-
-/// A gatherer whose connection dies after its first answer, as a daemon's does when it restarts.
-class DyingGatherer final: public IStatsGatherer
-{
-  public:
-    [[nodiscard]] std::vector<StatsAttempt> Gather() override
-    {
-        return ++_calls == 1 ? Reading() : NothingAnswered();
-    }
-
-    /// @return How many gathers it served.
-    [[nodiscard]] int Calls() const noexcept
-    {
-        return _calls;
-    }
-
-  private:
-    int _calls { 0 };
-};
 
 /// A node status naming @p version, which is all these cases tell statuses apart by.
 /// @param version The version it names.
@@ -90,80 +86,202 @@ class DyingGatherer final: public IStatsGatherer
     return status;
 }
 
-/// A node that answers every status read with a status naming the read: `read-1`, `read-2`, ...
+/// @param payload A push's payload.
+/// @return The reply a stream carries it in.
+[[nodiscard]] inline NodeReply PushFrame(std::vector<std::byte> payload)
+{
+    return NodeReply {
+        .status = CompileCacheWire::Status::Push, .payload = std::move(payload), .code = std::nullopt, .detail = {}
+    };
+}
+
+/// A grant, in this build's layout for a stats subject and none for the fleet.
+/// @param subject What was granted.
+/// @param cadence The cadence the server keeps.
+/// @return The grant, as a reply.
+[[nodiscard]] inline NodeReply GrantFrame(CompileCacheWire::LiveSubject subject,
+                                          std::chrono::milliseconds cadence = Interval)
+{
+    return PushFrame(CompileCacheWire::EncodeLiveSubscribed(CompileCacheWire::LiveSubscribedFields {
+        .subject = subject,
+        .grantedCadenceMillis = static_cast<std::uint32_t>(cadence.count()),
+        .statsLayout = subject == CompileCacheWire::LiveSubject::Fleet ? std::uint64_t { 0 } : StatsReadingLayout,
+        .endpoint = "rig.test:6674" }));
+}
+
+/// A cache snapshot carrying @p reading.
+/// @param reading The reading.
+/// @param tick The tick it was captured on.
+/// @return The snapshot, as a reply.
+[[nodiscard]] inline NodeReply CacheReadingFrame(StatsReading const& reading, std::uint64_t tick = 1)
+{
+    return PushFrame(CompileCacheWire::EncodeLiveSnapshot(tick, EncodeStatsReading(reading)));
+}
+
+/// A node snapshot: @p reading, then the node's status on the same tick.
+/// @param reading The reading.
+/// @param status The node's status.
+/// @param tick The tick it was captured on.
+/// @return The snapshot, as a reply.
+[[nodiscard]] inline NodeReply NodeReadingFrame(StatsReading const& reading,
+                                                CompileCacheWire::NodeStatusFields const& status,
+                                                std::uint64_t tick = 1)
+{
+    auto const encoded = EncodeStatsReading(reading);
+    auto const described = CompileCacheWire::EncodeNodeStatus(status);
+    auto const body =
+        WireFields::Encode({ std::span<std::byte const> { encoded }, std::span<std::byte const> { described } });
+    return PushFrame(CompileCacheWire::EncodeLiveSnapshot(tick, body));
+}
+
+/// A fleet snapshot: the leader's document, whole.
+/// @param document The document.
+/// @param tick The tick it was captured on.
+/// @return The snapshot, as a reply.
+[[nodiscard]] inline NodeReply FleetDocumentFrame(std::string_view document, std::uint64_t tick = 1)
+{
+    return PushFrame(CompileCacheWire::EncodeLiveSnapshot(tick, CompileCacheWire::AsBytes(document)));
+}
+
+/// The refusal a server ends a stream with, or refuses one with.
+/// @param code What it refused with.
+/// @param detail What it said.
+/// @return The refusal, as a reply.
+[[nodiscard]] inline NodeReply RefusalFrame(CompileCacheWire::ErrorCode code, std::string detail)
+{
+    return NodeReply { .status = CompileCacheWire::Status::Error, .payload = {}, .code = code, .detail = std::move(detail) };
+}
+
+/// The orderly end a server closes a stream with.
+/// @return The end, as a reply.
+[[nodiscard]] inline NodeReply EndedFrame()
+{
+    return NodeReply { .status = CompileCacheWire::Status::Ok, .payload = {}, .code = std::nullopt, .detail = {} };
+}
+
+/// One scripted answer to a `Read`.
+using ScriptedFrame = std::expected<NodeReply, ExchangeError>;
+
+/// What one `Open` dials into: whether the dial succeeds, and what its stream then answers.
+struct ScriptedStream
+{
+    std::optional<ExchangeError> refused {}; ///< Set for a dial that fails; the stream then answers nothing.
+    std::vector<ScriptedFrame> frames {};    ///< Each read's answer, in order; past the last, `SilentStream`.
+};
+
+/// A cache stream: its grant, then one snapshot per reading, ticks counted from 1.
+/// @param readings The readings, in order.
+/// @return The stream.
+[[nodiscard]] inline ScriptedStream CacheStream(std::vector<StatsReading> const& readings)
+{
+    auto stream = ScriptedStream { .refused = std::nullopt, .frames = { GrantFrame(CompileCacheWire::LiveSubject::Cache) } };
+    auto tick = std::uint64_t { 0 };
+    for (auto const& reading: readings)
+        stream.frames.emplace_back(CacheReadingFrame(reading, ++tick));
+    return stream;
+}
+
+/// A dial that fails, as a node that is down does.
+/// @param why What the dial says.
+/// @return The stream.
+[[nodiscard]] inline ScriptedStream RefusedDial(std::string why = "connection refused")
+{
+    return ScriptedStream { .refused = ExchangeError { .kind = ExchangeFailure::Unreachable, .detail = std::move(why) },
+                            .frames = {} };
+}
+
+/// A subscription answering from a script: one `ScriptedStream` per `Open`, the last repeated.
 ///
-/// Numbered so a case can tell a status read with THIS sample from one remembered from an earlier.
-class CountingNodeStatus final: public INodeStatusReader
+/// **Every call runs where the source runs it**: `Open` and `Read` on the rig's pool reactor, so a case
+/// decides when a read HAPPENS by draining that reactor; `Leave` from `Close()`, on the session's. Both
+/// reactors are drained on one thread, so only `Leave` needs to be safe from another, and it is atomic.
+class ScriptedSubscription final: public ILiveSubscription
 {
   public:
-    [[nodiscard]] std::optional<CompileCacheWire::NodeStatusFields> ReadNodeStatus() override
-    {
-        return NodeStatusNamed(std::format("read-{}", ++_reads));
-    }
-
-    /// @return How many statuses were read.
-    [[nodiscard]] int Reads() const noexcept
-    {
-        return _reads.load();
-    }
-
-  private:
-    std::atomic<int> _reads { 0 };
-};
-
-/// What one scripted dial opened: fixed attempts, and a status naming the dial.
-class ScriptedDialed final: public IDialedStats
-{
-  public:
-    /// @param attempts What every gather reports.
-    /// @param name What every status read's version says.
-    ScriptedDialed(std::vector<StatsAttempt> attempts, std::string name):
-        _attempts { std::move(attempts) },
-        _name { std::move(name) }
+    /// @param streams What each dial opens; the last is repeated for every dial past it.
+    explicit ScriptedSubscription(std::vector<ScriptedStream> streams):
+        _streams { std::move(streams) }
     {
     }
 
-    [[nodiscard]] std::vector<StatsAttempt> Gather() override
+    [[nodiscard]] std::expected<void, ExchangeError> Open(Endpoint const& where,
+                                                          CompileCacheWire::SubscribeRequest const& request) override
     {
-        return _attempts;
+        _dialled.push_back(where);
+        _requests.push_back(request);
+        _current = _streams.empty() ? ScriptedStream {} : _streams[std::min(_opens, _streams.size() - 1)];
+        ++_opens;
+        _next = 0;
+        if (_current.refused.has_value())
+            return std::unexpected(*_current.refused);
+        return {};
     }
 
-    [[nodiscard]] std::optional<CompileCacheWire::NodeStatusFields> ReadNodeStatus() override
+    [[nodiscard]] std::expected<NodeReply, ExchangeError> Read() override
     {
-        return NodeStatusNamed(_name);
+        ++_reads;
+        if (_current.refused.has_value() || _next >= _current.frames.size())
+            return std::unexpected(
+                ExchangeError { .kind = ExchangeFailure::Unreachable, .detail = std::string { SilentStream } });
+        return _current.frames[_next++];
     }
 
-  private:
-    std::vector<StatsAttempt> _attempts;
-    std::string _name;
-};
-
-/// Dials gatherers from a script, counting the dials.
-class ScriptedDialer final: public IStatsDialer
-{
-  public:
-    /// @param answers Whether each dial's gatherer answers; the last is repeated.
-    explicit ScriptedDialer(std::vector<bool> answers):
-        _answers { std::move(answers) }
+    void ExpectEvery(std::chrono::milliseconds cadence) override
     {
+        _expected.push_back(cadence);
     }
 
-    [[nodiscard]] std::unique_ptr<IDialedStats> Dial() override
+    void Leave() noexcept override
     {
-        auto const answers = _answers[std::min(_dials, _answers.size() - 1)];
-        ++_dials;
-        return std::make_unique<ScriptedDialed>(answers ? Reading() : NothingAnswered(), std::format("dialled-{}", _dials));
+        _leaves.fetch_add(1, std::memory_order_acq_rel);
     }
 
     /// @return How many dials were made.
-    [[nodiscard]] std::size_t Dials() const noexcept
+    [[nodiscard]] std::size_t Opens() const noexcept
     {
-        return _dials;
+        return _opens;
+    }
+
+    /// @return How many reads were made, across every stream.
+    [[nodiscard]] std::size_t Reads() const noexcept
+    {
+        return _reads;
+    }
+
+    /// @return How many times the source left.
+    [[nodiscard]] int Leaves() const noexcept
+    {
+        return _leaves.load(std::memory_order_acquire);
+    }
+
+    /// @return Where each dial went, in order.
+    [[nodiscard]] std::vector<Endpoint> const& Dialled() const noexcept
+    {
+        return _dialled;
+    }
+
+    /// @return What each dial asked for, in order.
+    [[nodiscard]] std::vector<CompileCacheWire::SubscribeRequest> const& Requests() const noexcept
+    {
+        return _requests;
+    }
+
+    /// @return Every silence bound the source set, in order.
+    [[nodiscard]] std::vector<std::chrono::milliseconds> const& Expected() const noexcept
+    {
+        return _expected;
     }
 
   private:
-    std::vector<bool> _answers;
-    std::size_t _dials { 0 };
+    std::vector<Endpoint> _dialled {};
+    std::vector<CompileCacheWire::SubscribeRequest> _requests {};
+    std::vector<std::chrono::milliseconds> _expected {};
+    std::vector<ScriptedStream> _streams;
+    ScriptedStream _current {};
+    std::size_t _opens { 0 };
+    std::size_t _next { 0 };
+    std::size_t _reads { 0 };
+    std::atomic<int> _leaves { 0 };
 };
 
 /// What became of a terminal a source owned.
@@ -277,45 +395,6 @@ class SpokenTerminal final: public IDashboardEventSource
     TerminalRelease* _release;
 };
 
-/// An admin surface answering one scripted document to every fetch, and remembering each path.
-///
-/// Read and written on whichever rig reactor runs the fetch; the rig drains them on one thread.
-class ScriptedDocument final: public IAdminDocument
-{
-  public:
-    /// @param answer What every fetch returns.
-    explicit ScriptedDocument(std::expected<std::string, AdminError> answer):
-        _answer { std::move(answer) }
-    {
-    }
-
-    [[nodiscard]] std::expected<std::string, AdminError> FetchAdmin(std::string_view path) override
-    {
-        _asked.emplace_back(path);
-        return _answer;
-    }
-
-    /// @return Where this surface says it answers.
-    [[nodiscard]] std::string AdminAddress() override
-    {
-        return std::string { ScriptedAdminAddress };
-    }
-
-    /// The address every scripted surface answers at, so a case can find it in a source line.
-    static constexpr std::string_view ScriptedAdminAddress = "127.0.0.1:9464";
-
-    /// Every path this was asked for, in order.
-    /// @return The paths.
-    [[nodiscard]] std::vector<std::string> const& Asked() const noexcept
-    {
-        return _asked;
-    }
-
-  private:
-    std::expected<std::string, AdminError> _answer;
-    std::vector<std::string> _asked;
-};
-
 /// A view whose frame is the sample count, which is all these cases read.
 class CountView final: public IDashboardView
 {
@@ -340,17 +419,16 @@ class CountSink final: public IFrameSink
 
 /// A reactor for the session, one more standing in for each pool, one clock for all of them.
 ///
-/// **The pool is a `TestReactor` so a case decides when a gather RUNS.** A real pool
-/// would run it at once, and "a keystroke arrives while a sample is outstanding" would
-/// then be a race rather than an input.
+/// **The pool is a `TestReactor` so a case decides when a dial or a read RUNS.** A real pool
+/// would run it at once, and "a keystroke arrives while a read is outstanding" would then be a
+/// race rather than an input.
 struct Rig
 {
     ManualClock clock {};
     TestReactor reactor { clock };
     TestReactor pool { clock };
     TestReactor stopWaiter { clock };
-    ScriptedGatherer gatherer { Reading() };
-    CountingNodeStatus status {};
+    ScriptedSubscription subscription { { CacheStream({ ReadingOpened(1) }) } };
     CountView view {};
     CountSink sink {};
 
@@ -368,16 +446,15 @@ struct Rig
     /// Whether the source has released `stop`.
     bool stopReleased { false };
 
-    /// A source over this rig, with no terminal.
+    /// A cache source over this rig, with no terminal.
     /// @return The parts.
     [[nodiscard]] LiveSourceParts Parts()
     {
         return LiveSourceParts { .reactor = &reactor,
-                                 .gatherer = &gatherer,
-                                 .status = nullptr,
-                                 .admin = nullptr,
-                                 .document = {},
-                                 .dialer = nullptr,
+                                 .subscription = &subscription,
+                                 .subject = CompileCacheWire::LiveSubject::Cache,
+                                 .endpoint = RigEndpoint(),
+                                 .dashboardToken = {},
                                  .pool = &pool,
                                  .clock = &clock,
                                  .interval = Interval,
@@ -411,7 +488,10 @@ struct Rig
         return parts;
     }
 
-    /// Run everything runnable, gathers included, until nothing is.
+    /// Run everything runnable, dials and reads included, until nothing is.
+    ///
+    /// Terminates because every scripted stream ends: past its last frame a read answers
+    /// `SilentStream`, and the source then waits one interval on the clock before dialling again.
     void Settle()
     {
         auto progressed = true;
@@ -471,7 +551,19 @@ struct Rig
     return event.has_value() ? event->kind : DashboardEventKind::Last;
 }
 
-/// The next event, when one is already due without running a gather.
+/// Whether @p event is the source ending ITSELF, never the `Detached` a closed source answers.
+///
+/// **`NextDue` closes a source that has nothing due**, and a read of a closed source is `Detached` too -- so a
+/// case asserting only the kind passes for a source that armed a retry instead of finishing (K4 survived that
+/// way). The note is what separates the two.
+/// @param event The event.
+/// @return Whether it is the source's own end.
+[[nodiscard]] inline bool FinishedItself(std::optional<DashboardEvent> const& event)
+{
+    return event.has_value() && event->kind == DashboardEventKind::Detached && event->note == StreamFinishedNote;
+}
+
+/// The next event, when one is already due without running a dial or a read.
 ///
 /// **Never returns with a read still parked**: a `Task` destroyed while suspended is
 /// undefined, so an event that did not arrive closes the source and settles, and the
