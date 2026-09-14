@@ -7223,3 +7223,15 @@ set_tests_properties("target-pragmas-selftest" PROPERTIES
     LABELS "hygiene"
     TIMEOUT 60
 )
+
+# The Package jobs configure what ships with tests off, so no ctest reads their database; a step there runs this
+# wrapper, which turns the check's OUTPUT into clean, refused or did-not-conclude. Its self-test drives all three,
+# a cmake that never started among them, under the interpreter a Package job's step uses on each platform.
+add_test(
+    NAME "instruction-set-flags-wrapper-selftest"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-instruction-set-flags.sh" --self-test --cmake "${CMAKE_COMMAND}"
+)
+set_tests_properties("instruction-set-flags-wrapper-selftest" PROPERTIES
+    LABELS "hygiene"
+    TIMEOUT 120
+)
