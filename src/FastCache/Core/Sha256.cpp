@@ -175,12 +175,9 @@ namespace
             auto const savedCdgh = cdgh;
             for (auto const index: std::views::iota(std::size_t { 0 }, RoundConstants.size() / 4))
             {
-                auto const constants = std::span { RoundConstants }.subspan(index * 4, 4);
-                auto const message = _mm_add_epi32(w0,
-                                                   _mm_set_epi32(static_cast<int>(constants[3]),
-                                                                 static_cast<int>(constants[2]),
-                                                                 static_cast<int>(constants[1]),
-                                                                 static_cast<int>(constants[0])));
+                __m128i constants {};
+                std::memcpy(&constants, std::span { RoundConstants }.subspan(index * 4, 4).data(), sizeof(constants));
+                auto const message = _mm_add_epi32(w0, constants);
                 cdgh = _mm_sha256rnds2_epu32(cdgh, abef, message);
                 abef = _mm_sha256rnds2_epu32(abef, cdgh, _mm_shuffle_epi32(message, 0x0E));
 
@@ -205,10 +202,8 @@ namespace
 
     #undef FASTCACHED_SHA_NI_TARGET
 
-    constexpr bool X86ShaNiCompiledIn = true;
     constexpr CompressBlocksFunction X86ShaNiBlocks = &CompressBlocksX86ShaNi;
 #else
-    constexpr bool X86ShaNiCompiledIn = false;
     constexpr CompressBlocksFunction X86ShaNiBlocks = nullptr;
 #endif
 
@@ -276,19 +271,17 @@ namespace
 
     #undef FASTCACHED_ARM_SHA2_TARGET
 
-    constexpr bool ArmSha2CompiledIn = true;
     constexpr CompressBlocksFunction ArmSha2Blocks = &CompressBlocksArmSha2;
 #else
-    constexpr bool ArmSha2CompiledIn = false;
     constexpr CompressBlocksFunction ArmSha2Blocks = nullptr;
 #endif
 
-    /// One engine: whether this build carries it, what it needs of the CPU, and its code.
+    /// One engine: what it needs of the CPU, and its code, which is null where this build
+    /// does not carry it.
     struct EngineRow
     {
         Sha256Engine engine;
         std::string_view name;
-        bool compiledIn;
         bool (*needs)(CpuFeatures const& features) noexcept;
         CompressBlocksFunction compressBlocks;
     };
@@ -296,18 +289,15 @@ namespace
     constexpr EnumTable<Sha256Engine, EngineRow> EngineRows { {
         { .engine = Sha256Engine::Scalar,
           .name = "scalar",
-          .compiledIn = true,
           .needs = [](CpuFeatures const&) noexcept { return true; },
           .compressBlocks = &CompressBlocksScalar },
         { .engine = Sha256Engine::X86ShaNi,
           .name = "x86-sha-ni",
-          .compiledIn = X86ShaNiCompiledIn,
           .needs =
               [](CpuFeatures const& features) noexcept { return features.x86Sha && features.x86Ssse3 && features.x86Sse41; },
           .compressBlocks = X86ShaNiBlocks },
         { .engine = Sha256Engine::ArmSha2,
           .name = "arm-sha2",
-          .compiledIn = ArmSha2CompiledIn,
           .needs = [](CpuFeatures const& features) noexcept { return features.armSha2; },
           .compressBlocks = ArmSha2Blocks },
     } };
@@ -321,7 +311,7 @@ namespace
         return EngineRows[static_cast<std::size_t>(engine)];
     }
 
-    /// This process's CPU, read once, for the reason `ActiveSha256Engine` states.
+    /// This process's CPU, read once, which `CpuFeatures` says is safe.
     /// @return What the CPU offers.
     [[nodiscard]] CpuFeatures const& ProcessCpuFeatures() noexcept
     {
@@ -338,14 +328,14 @@ std::string_view Sha256EngineName(Sha256Engine engine) noexcept
 bool Sha256EngineRunsOn(Sha256Engine engine, CpuFeatures const& features) noexcept
 {
     auto const& row = RowOf(engine);
-    return row.compiledIn && row.needs(features);
+    return row.compressBlocks != nullptr && row.needs(features);
 }
 
 Sha256Engine SelectSha256Engine(CpuFeatures const& features) noexcept
 {
     // Any hardware engine beats Scalar, and a build carries at most one.
     auto const* const hardware = FindIfOrNull(std::span { EngineRows }.subspan(1), [&features](EngineRow const& row) {
-        return row.compiledIn && row.needs(features);
+        return Sha256EngineRunsOn(row.engine, features);
     });
     return hardware != nullptr ? hardware->engine : Sha256Engine::Scalar;
 }

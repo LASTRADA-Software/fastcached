@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#include <FastCache/Core/CpuFeatures.hpp>
-
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -12,6 +10,8 @@
 
 namespace FastCache
 {
+
+struct CpuFeatures;
 
 /// Which implementation compresses SHA-256 blocks.
 ///
