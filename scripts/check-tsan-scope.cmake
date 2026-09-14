@@ -125,6 +125,7 @@ set(FastCachedTsanScope
     "src/FastCache/Cache/ExpiryReaper_test.cpp"
     "src/FastCache/Cache/ShardedStorage_test.cpp"
     "src/FastCache/Core/Clock_test.cpp"
+    "src/FastCache/Protocol/LiveStreamReactors_test.cpp"
     "src/FastCache/Protocol/RedisRespSocket_test.cpp"
     "src/FastCache/Server/ReactorServerLoop_test.cpp"
     "src/FastCache/Server/ReadinessAnnouncer_test.cpp"
