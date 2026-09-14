@@ -6,10 +6,12 @@
 #include <FastCache/Async/Task.hpp>
 #include <FastCache/Cache/IStorage.hpp>
 #include <FastCache/Cache/ReclaimLog.hpp>
+#include <FastCache/Core/BoundedDrain.hpp>
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -85,6 +87,13 @@ struct ExpiryReaperOptions
     /// This does NOT move the sweep off the reactor, which is the other half of
     /// #946 and a decision of its own.
     Duration sweepStallCeiling { std::chrono::milliseconds { 50 } };
+
+    /// How long `ExpiryReaper::Stop` waits for the frame to come back from its executor.
+    ///
+    /// Past it the frame is abandoned through `IDrainAbandonment`, which in production ends the
+    /// process. The default is `DrainBound`'s, as for every other shutdown drain here; a test
+    /// shortens it to drive the abandonment.
+    DrainBound stopDrain {};
 };
 
 static_assert(ExpiryReaperOptions::DefaultPurgeBudget <= ReclaimLog::DefaultCapacity,
@@ -147,7 +156,12 @@ class ExpiryReaper
     /// @param logger  Where a swept cycle is reported at Debug.
     /// @param options Pacing and ceilings.
     /// @param metrics Counter sink, or nullptr.
-    ExpiryReaper(IStorage& storage, ILogger& logger, ExpiryReaperOptions options, IMetricsSink* metrics = nullptr) noexcept;
+    /// @param abandonment What `Stop` does with a frame that does not come back in time.
+    ExpiryReaper(IStorage& storage,
+                 ILogger& logger,
+                 ExpiryReaperOptions options,
+                 IMetricsSink* metrics = nullptr,
+                 IDrainAbandonment& abandonment = DefaultDrainAbandonment()) noexcept;
 
     ~ExpiryReaper()
     {
@@ -179,6 +193,11 @@ class ExpiryReaper
     /// `CancelPending` is what makes taking it back decidable rather than a
     /// guess -- true means this call removed it and we are now its only owner.
     /// Idempotent; the destructor calls it.
+    ///
+    /// Waits at most `stopDrain` for a frame away on the executor, and past that ABANDONS it
+    /// rather than destroying it: the frame's code reaches into this reaper, so freeing it frees
+    /// a coroutine another thread is still inside. In production `IDrainAbandonment` ends the
+    /// process; a seam that returns -- only a test's -- gets the frame released, and owns it.
     void Stop() noexcept;
 
     /// Sweep until `token` is cancelled.
@@ -206,22 +225,46 @@ class ExpiryReaper
     /// @return What the sweep did.
     PurgeOutcome SweepOnce(TimePoint now);
 
-    /// Whether a sweep body is executing right now.
+    /// Whether the task's frame is away from the reactor right now.
     ///
-    /// **The one fact `Stop` cannot do without.** Once the sweep runs on a pool the
-    /// task's frame is, for that interval, not parked on the reactor -- so
-    /// `CancelPending` cannot retract it and `~Task` would destroy a frame the pool
-    /// thread is still inside. Reading this is how `Stop` waits for that window to
-    /// close before it reclaims anything.
+    /// **The one fact `Stop` cannot do without.** While the sweep is handed to another
+    /// executor the frame is not parked on the reactor, so `CancelPending` cannot retract
+    /// it and `~Task` would destroy a frame another thread is still inside. Reading this is
+    /// how `Stop` waits for that interval to close before it reclaims anything.
     ///
-    /// Set on the pool immediately before the sweep and cleared immediately after,
-    /// so it brackets exactly the interval in which the frame is unreachable from
-    /// the reactor. It is NOT "a cycle is running": between sweeps the frame is
-    /// parked on the reactor's timer and perfectly reclaimable.
-    /// @return True while the sweep body is on the executor.
-    [[nodiscard]] bool Sweeping() const noexcept
+    /// **The interval is the whole trip, not the sweep body** (#1397). It opens on the
+    /// reactor thread immediately BEFORE the hop out -- once the frame is handed to the
+    /// executor, nothing on the reactor can take it back -- and closes on the executor
+    /// thread only AFTER the hop back's `Submit` has returned, when the frame is either
+    /// queued on the reactor or already running there. Bracketing the body alone leaves both
+    /// hops uncovered, and a stop landing in either frees a frame the executor is still inside.
+    ///
+    /// A COUNT rather than a flag, because the close is late by design: the reactor may
+    /// resume the frame and send it away again before the executor thread returns from the
+    /// previous hop's `Submit`, and clearing a flag then would erase the new trip.
+    ///
+    /// Never raised when the executor IS the reactor: that frame does not leave, and a
+    /// count raised for a hop still queued on a reactor whose loop has returned would never
+    /// fall, turning every stop into a wait for the drain ceiling. "Is" means the same
+    /// OBJECT. **A decorator over the reactor is a different object and is counted**, and
+    /// that is the safe side of the trade. Stopped with its hop out still queued on a loop that
+    /// has returned, its count never falls: `Stop` waits out `stopDrain`, logs an Error saying
+    /// the sweep did not come back from its executor, and **the process ends with
+    /// `AbandonedDrainExitCode`**. Treating the decorator as the reactor instead would skip the
+    /// wait for an executor that may really be elsewhere, which is this defect back again as a
+    /// use-after-free. Nothing can tell the two apart from an `IExecutor&`, so to keep the sweep
+    /// on the loop, pass the reactor itself and never a wrapper around it.
+    ///
+    /// A hand-over that THROWS keeps the count true in both directions: a hop out that could
+    /// not be handed over lowers it again, since the frame never left, and a hop back that
+    /// could not be handed over keeps it raised and is retried, since the frame never returned.
+    ///
+    /// It is NOT "a cycle is running": between sweeps the frame is parked on the reactor's
+    /// timer and reclaimable.
+    /// @return True while the frame is on its way to, on, or on its way back from the executor.
+    [[nodiscard]] bool AwayFromReactor() const noexcept
     {
-        return _sweeping.load(std::memory_order_acquire);
+        return _awayFromReactor.load(std::memory_order_acquire) != 0;
     }
 
     /// @return How many sweeps have run.
@@ -262,6 +305,7 @@ class ExpiryReaper
     IStorage& _storage;
     ILogger& _logger;
     IMetricsSink* _metrics;
+    IDrainAbandonment& _abandonment;
     ExpiryReaperOptions _options;
     Duration _interval;
 
@@ -277,8 +321,9 @@ class ExpiryReaper
 
     /// Set by `Start`; the reactor `Stop` reclaims the frame from.
     IReactor* _reactor { nullptr };
-    /// See `Sweeping()`. Atomic because `Stop` reads it from another thread.
-    std::atomic<bool> _sweeping { false };
+    /// See `AwayFromReactor()`. Atomic because the executor lowers it and `Stop` reads it,
+    /// each from its own thread.
+    std::atomic<std::uint32_t> _awayFromReactor { 0 };
     CancellationSource _source;
     Task<void> _task;
 };

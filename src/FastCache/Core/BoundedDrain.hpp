@@ -6,6 +6,7 @@
 #include <chrono>
 #include <concepts>
 #include <cstdint>
+#include <cstdlib>
 #include <thread>
 
 namespace FastCache
@@ -140,6 +141,58 @@ template <std::predicate Predicate>
         wait.Sleep(bound.poll);
     }
     return DrainResult::Drained;
+}
+
+/// The exit status of a process that ended because a bounded drain ran out -- the ONE value
+/// every abandoned drain in this tree exits with, the compile drain's (#239) included.
+///
+/// Distinct from every ordinary failure, so a supervisor's log tells "stopped with work still
+/// running" from a crash. 75 is `EX_TEMPFAIL` from `sysexits.h` -- not a standard this project
+/// otherwise uses, but the closest thing to a shared vocabulary for "this was not clean, and
+/// retrying is reasonable", and unambiguous beside a compiler's own exit codes.
+inline constexpr int AbandonedDrainExitCode = 75;
+
+/// What a teardown does with work still outstanding when `DrainWithin` answers `Ceiling`.
+///
+/// **There is no safe way to carry on**, which is why this is a seam rather than a branch.
+/// Outstanding work borrows members of the object being torn down, so returning frees them
+/// underneath it, and destroying the work instead frees code another thread is still running.
+/// Production therefore ends the process -- `std::_Exit`, which runs no destructor that could
+/// reach either -- the shape `CompileCapacity::Drain` gives an abandoned compile drain (#239).
+/// A test supplies an implementation that RETURNS, to watch the ceiling being reached; what
+/// the caller does then is part of the caller's own contract.
+class IDrainAbandonment
+{
+  public:
+    IDrainAbandonment() = default;
+    IDrainAbandonment(IDrainAbandonment const&) = delete;
+    IDrainAbandonment(IDrainAbandonment&&) = delete;
+    IDrainAbandonment& operator=(IDrainAbandonment const&) = delete;
+    IDrainAbandonment& operator=(IDrainAbandonment&&) = delete;
+    virtual ~IDrainAbandonment() = default;
+
+    /// Abandon the work a drain gave up on. Production does not return.
+    virtual void Abandon() noexcept = 0;
+};
+
+/// Production `IDrainAbandonment`: ends the process with `AbandonedDrainExitCode`.
+class EndProcessOnAbandonedDrain final: public IDrainAbandonment
+{
+  public:
+    [[noreturn]] void Abandon() noexcept override
+    {
+        // `_Exit`, not `exit`: static destructors would run the same teardown this is avoiding.
+        std::_Exit(AbandonedDrainExitCode);
+    }
+};
+
+/// Process-singleton `EndProcessOnAbandonedDrain`. Mirrors `DefaultDrainWait()`; tests pass
+/// their own.
+/// @return Reference to a singleton EndProcessOnAbandonedDrain with static storage.
+[[nodiscard]] inline IDrainAbandonment& DefaultDrainAbandonment() noexcept
+{
+    static EndProcessOnAbandonedDrain instance;
+    return instance;
 }
 
 } // namespace FastCache
