@@ -68,6 +68,7 @@ target_sources(FastCache
         Core/BufferPool.cpp
         Core/Base64.cpp
         Server/AdminCredential.cpp
+        Metrics/IMetricsSink.cpp
         Metrics/PrometheusFormatter.cpp
         Metrics/StatsReading.cpp
         Metrics/StatsReadingCodec.cpp

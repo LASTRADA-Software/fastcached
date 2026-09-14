@@ -5087,6 +5087,59 @@ set_tests_properties("counter-index-seam-selftest" PROPERTIES
 )
 
 # ---------------------------------------------------------------------------
+# A unit compiled against a different `IMetricsSink::Counter` fails to LINK (#1361).
+#
+# Builds a fixture project with this build's compiler and generator, in Debug and Release:
+# a control against a byte-identical copy of the header must link, and a unit against a
+# copy with one enumerator inserted before `Last` must fail naming `RequireExtent`.
+# No single-TU test can observe a cross-TU skew, and what the guard claims is what a
+# LINKER keeps, so it is watched with the tool rather than reasoned about: the header
+# records which shapes of the guard linked a skewed unit on which compiler.
+#
+# Invokes the compiler, so it is given minutes; starts no daemon and opens no socket, so it
+# is in the default set with the other hygiene checks. `SKIP: ` where the fixture cannot
+# configure at all -- a Windows shell that is not a Developer shell has a `cl.exe` that
+# cannot compile, the reason compile-cache-caveat gives.
+add_test(
+    NAME "counter-extent-link"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DFASTCACHED_SCRATCH_DIR=${CMAKE_CURRENT_BINARY_DIR}/counter-extent-link"
+        "-DFASTCACHED_CXX_COMPILER=${CMAKE_CXX_COMPILER}"
+        "-DFASTCACHED_MAKE_PROGRAM=${CMAKE_MAKE_PROGRAM}"
+        "-DFASTCACHED_GENERATOR=${CMAKE_GENERATOR}"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-counter-extent-link.cmake"
+)
+set_tests_properties("counter-extent-link" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    SKIP_REGULAR_EXPRESSION "SKIP: "
+    LABELS "hygiene"
+    TIMEOUT 600
+)
+
+# And `counter-extent-link` must be SEEN to refuse: the guard removed from the header (the
+# skewed unit links), the definition renamed (the control cannot link, which must not read as
+# the guard working), and no `Last,` to place the skew at. Shown to bite, one arm at a time:
+# reading a successful skewed link as a pass reddens exactly `noanchor`, dropping the control
+# exactly `nodefinition`, dropping the anchor refusal exactly `noplace`.
+add_test(
+    NAME "counter-extent-link-selftest"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DFASTCACHED_SCRATCH_DIR=${CMAKE_CURRENT_BINARY_DIR}/counter-extent-link-selftest"
+        "-DFASTCACHED_CXX_COMPILER=${CMAKE_CXX_COMPILER}"
+        "-DFASTCACHED_MAKE_PROGRAM=${CMAKE_MAKE_PROGRAM}"
+        "-DFASTCACHED_GENERATOR=${CMAKE_GENERATOR}"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-counter-extent-link-selftest.cmake"
+)
+set_tests_properties("counter-extent-link-selftest" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    SKIP_REGULAR_EXPRESSION "SKIP: "
+    LABELS "hygiene"
+    TIMEOUT 600
+)
+
+# ---------------------------------------------------------------------------
 # Every `execute_process` that runs an external program during configure carries
 # a TIMEOUT.
 #

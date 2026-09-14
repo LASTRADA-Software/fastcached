@@ -38,6 +38,7 @@ set(_fc_cc_core
     "${CMAKE_SOURCE_DIR}/src/FastCache/Core/Compression.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/Core/SecureBytes.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/Core/Sha256.cpp"
+    "${CMAKE_SOURCE_DIR}/src/FastCache/Metrics/IMetricsSink.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/Net/SocketAddress.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/Net/BlockingSocket.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/Net/BlockingConnector.cpp"
