@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "LiveSubscriber.hpp"
 #include "SocketExchange.hpp"
+#include "StatsSource.hpp"
 
 #include <FastCache/Core/WireFields.hpp>
 #include <FastCache/Metrics/StatsReadingCodec.hpp>
@@ -34,25 +35,6 @@ namespace
         return LiveFrame { .kind = LiveFrameKind::Unreadable, .note = std::move(note) };
     }
 
-    /// Why a reading did not decode, as the tail of a sentence that names the subject.
-    /// @param fault What the codec said.
-    /// @return The words.
-    [[nodiscard]] std::string_view DescribeFault(StatsReadingFault fault) noexcept
-    {
-        switch (fault)
-        {
-            case StatsReadingFault::ForeignLayout:
-                return "is laid out by a build other than this client's; upgrade the older of the two";
-            case StatsReadingFault::Truncated:
-                return "ends before its layout does";
-            case StatsReadingFault::Malformed:
-                return "carries a value its layout has no meaning for";
-            case StatsReadingFault::TrailingBytes:
-                return "carries bytes past the end of its layout";
-        }
-        return "cannot be read";
-    }
-
     /// A reading's figures, or the frame saying why there are none.
     /// @param subject The subject, for the words.
     /// @param bytes One `EncodeStatsReading` field.
@@ -63,7 +45,7 @@ namespace
         auto reading = DecodeStatsReading(bytes);
         if (!reading.has_value())
             return std::unexpected(
-                Unreadable(std::format("a {} reading {}", KeyOf(subject), DescribeFault(reading.error()))));
+                Unreadable(std::format("a {} reading {}", KeyOf(subject), DescribeReadingFault(reading.error()))));
         return *std::move(reading);
     }
 

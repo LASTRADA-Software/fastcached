@@ -47,6 +47,9 @@ namespace
 TEST_CASE("The wire constants have their specified byte values")
 {
     CHECK(static_cast<std::uint8_t>(Magic) == 0xFC);
+    // Version 10 makes the NODE-METRICS reply a `StatsReading` (#1406): the body of an existing
+    // verb changed shape, which no reader can step over.
+    //
     // Version 9 adds `Status::Push` and `Op::Subscribe`, the live-stats stream (#1399):
     // a new reply status is a new grammar for every reader, so the floor moves with it.
     //
@@ -62,8 +65,8 @@ TEST_CASE("The wire constants have their specified byte values")
     // no reply body for this verb, and drops the one string the change exists to put on
     // the screen. A missing string does not announce itself as missing, so leaving the
     // floor at 7 would manufacture a quiet failure inside the fix for one.
-    CHECK(CurrentVersion == 9);
-    CHECK(MinSupportedVersion == 9);
+    CHECK(CurrentVersion == 10);
+    CHECK(MinSupportedVersion == 10);
     CHECK(RequestHeaderSize == 7);
     CHECK(ReplyHeaderSize == 5);
 
@@ -109,7 +112,7 @@ TEST_CASE("EncodeFetch emits the specified bytes exactly")
     // clang-format off: the grid IS the specification -- one wire field per row.
     auto const expected = Bytes({
         0xFC,                   // magic
-        0x09,                   // version
+        0x0A,                   // version
         0x02,                   // op = Fetch
         0x00, 0x00, 0x00, 0x06, // payloadLength = 6
         0x00, 0x00, 0x00, 0x02, // field[0] length = 2
@@ -128,7 +131,7 @@ TEST_CASE("EncodeStore emits the specified bytes exactly")
 
     auto const expected = Bytes({
         0xFC,                               // magic
-        0x09,                               // version
+        0x0A,                               // version
         0x01,                               // op = Store
         0x00, 0x00, 0x00, 0x19,             // payloadLength = 25 = (4+1) + (4+0) + (4+1) + (4+1) + (4+2)
         0x00, 0x00, 0x00, 0x01, 0x6B,       // key           = "k"
@@ -327,7 +330,7 @@ TEST_CASE("EncodeCacheDrop emits the specified bytes exactly", "[wire][cache-dro
     // clang-format off: the grid IS the specification -- one wire field per row.
     auto const expected = Bytes({
         0xFC,                   // magic
-        0x09,                   // version
+        0x0A,                   // version
         0x15,                   // op = CacheDrop
         0x00, 0x00, 0x00, 0x06, // payloadLength = 6
         0x00, 0x00, 0x00, 0x02, // field[0] length = 2
@@ -520,7 +523,7 @@ TEST_CASE("EncodeAuth emits the specified bytes exactly")
     auto const frame = EncodeAuth(AuthRequest { .username = "bob", .secret = "hunter2" });
 
     auto const expected = Bytes({
-        0xFC, 0x09, 0x03,       // magic, version, op=Auth
+        0xFC, 0x0A, 0x03,       // magic, version, op=Auth
         0x00, 0x00, 0x00, 0x12, // payload length: (4+3) + (4+7) = 18
         0x00, 0x00, 0x00, 0x03, 'b', 'o', 'b', 0x00, 0x00, 0x00, 0x07, 'h', 'u', 'n', 't', 'e', 'r', '2',
     });

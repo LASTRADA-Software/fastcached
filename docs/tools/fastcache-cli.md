@@ -352,10 +352,14 @@ worker's slots is the **scheduler's** conclusion — derived on the leader from 
 worker reported plus its live load — and a worker recomputing it would be a second
 spelling of that arithmetic that can disagree with the first.
 
-`node-metrics` reports every counter the endpoint's build carries, **zeroes
-included**. A counter is a tally, so zero is the truth about events that never
-happened; dropping the zero rows would make *nothing happened* and *this build has
-no such counter* the same answer.
+`node-metrics` reports every figure the node's `/metrics` renders, with no admin
+surface in between: every counter its build carries, **zeroes included**, and the
+cache tier's storage and per-tier series and the host figures beside them. The node
+answers one reading and this client renders it with the renderer `/metrics` uses, so
+the two cannot list different fields. A counter is a tally, so zero is the truth about
+events that never happened; dropping the zero rows would make *nothing happened* and
+*this build has no such counter* the same answer. A reading laid out by a build other
+than this client's is refused by name and exits `protocol`, rather than being misread.
 
 Both are gated on **fleet membership** rather than on a credential, which is what
 keeps them usable on a single-machine install: the credential on that listener
@@ -536,7 +540,7 @@ field of its own output:
 | `source` | Where | Size |
 |---|---|---|
 | `metrics` | the admin surface's `/metrics` | 137 series, measured against a node here |
-| `node-metrics` | the node's own `NodeMetrics` verb over `0xFC` | 99 counters, same node |
+| `node-metrics` | the node's own `NodeMetrics` verb over `0xFC` | the same series as `metrics`, by construction |
 | `info` | RESP `INFO` on the data port | 7 fields |
 
 `/metrics` needs no credential — it is served above the dashboard's
@@ -545,11 +549,11 @@ listener, and it is on a different port. Against a node that port is **discovere
 over `0xFC`; `--admin-addr` is only needed when the discovered answer is wrong for
 your topology.
 
-`node-metrics` sits below `/metrics` because it is *narrower*, not worse: it carries
-the counter catalogue and not the storage or per-tier series the Prometheus renderer
-adds. It sits above `INFO` because it is an order of magnitude wider than seven
-fields — and it is the only rung that answers at all against a
-`fastcache-compile-node`.
+`node-metrics` sits below `/metrics` by precedence only: both carry the node's one
+reading, and this rung renders it with the renderer `/metrics` uses, so the two report
+the same fields. It sits above `INFO` because it is every figure rather than seven —
+and it is the only rung that answers at all against a `fastcache-compile-node` with no
+admin surface.
 
 Against a node with no admin surface at all:
 
@@ -558,7 +562,6 @@ $ fastcache-cli stats --format=kv
 source=node-metrics
 fastcached_connections_total=0
 ...
-fastcache-cli: the node's own NodeMetrics verb over 0xFC returned 99 field(s); this is the counter catalogue only; /metrics adds the storage and per-tier series
 fastcache-cli: the admin surface's /metrics endpoint was not asked: 127.0.0.1:36751 runs no admin surface. Start the node with --admin-listen to open one: it is off unless asked for, so a node without one is configured rather than broken
 ```
 

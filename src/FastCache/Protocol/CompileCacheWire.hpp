@@ -153,7 +153,16 @@ using WireVersion = std::uint8_t;
 /// wire, and a version-8 launcher is refused by a version-9 node rather than served; on this
 /// project's one installation that is one rebuild of both binaries
 /// ([#332](https://github.com/LASTRADA-Software/fastcached/issues/332)).
-inline constexpr WireVersion CurrentVersion = 9;
+///
+/// **10 made the NODE-METRICS reply a `StatsReading`** instead of the counter catalogue as
+/// `name value` pairs, so it carries every figure `/metrics` does
+/// ([#1406](https://github.com/LASTRADA-Software/fastcached/issues/1406)). The body of an
+/// existing verb changed shape, which no reader can step over: a version-9 client would read
+/// the reading as malformed rows and report a node whose answer it could not read, and a
+/// version-10 client would read a version-9 node's rows as a reading laid out by another build.
+/// Both are wrong sentences about the right machine; `UnsupportedVersion` naming the range is
+/// the right one.
+inline constexpr WireVersion CurrentVersion = 10;
 
 /// The oldest version this build still accepts. Equal to `CurrentVersion` while
 /// only one version exists; widen the range when a second one ships and this
@@ -286,7 +295,11 @@ inline constexpr WireVersion CurrentVersion = 9;
 ///
 /// Version 9 moves it for version 3's reason: `Status::Push` is a status an older reader
 /// refuses, so accepting a version-8 request would answer it in a grammar it cannot read.
-inline constexpr WireVersion MinSupportedVersion = 9;
+///
+/// Version 10 moves it for version 7's: `NodeMetrics` answers one shape and takes no version,
+/// so a floor of 9 would accept a version-9 request and answer it with a body that version has
+/// no reading for.
+inline constexpr WireVersion MinSupportedVersion = 10;
 
 /// Size of the fixed request header: magic, version, op, payload length.
 inline constexpr std::size_t RequestHeaderSize = WireFrame::HeaderSize;
@@ -431,11 +444,20 @@ enum class Op : std::uint8_t
     /// runs no admin surface* from *it runs one whose port I could not read*.
     NodeStatus = 0x0E,
 
-    /// Operator asks this node for its own counters.
+    /// Operator asks this node for its figures.
     ///
     /// The same figures `/metrics` serves, over the wire an operator is already
     /// connected on -- which is what lets `--admin-addr` stop being required, since the
     /// admin surface may also be off entirely while this one is by definition up.
+    ///
+    /// **The reply is one `EncodeStatsReading`** (`Metrics/StatsReadingCodec.hpp`): the
+    /// reading `/metrics` renders -- every counter, and the storage, tier, host and
+    /// consensus blocks beside them -- captured once and encoded as a live-stats cache
+    /// subject streams it. It was the counter catalogue alone, as `name value` pairs, so a
+    /// node with no admin surface showed none of its cache tier's figures
+    /// ([#1406](https://github.com/LASTRADA-Software/fastcached/issues/1406)). A client
+    /// renders it through the same `RenderPrometheus`, and a client of another layout is
+    /// refused by the digest the encoding starts with rather than misreading it.
     NodeMetrics = 0x0F,
 
     // Runtime enrollment. A window an operator opens on the seed so a fresh keyless

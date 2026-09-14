@@ -10,6 +10,7 @@
 #include <FastCache/Distributed/SchedulerService.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
+#include <FastCache/Protocol/LiveStream.hpp>
 
 #include <chrono>
 #include <cstdint>
@@ -94,15 +95,20 @@ class NodeStatusResponder final: public IFrameResponder
 {
   public:
     /// @param identity What this node knows about itself; must outlive this.
+    /// @param readings Where `NodeMetrics` reads the node's figures: the live-stats sources, whose
+    ///        cache-subject capture is the reading `/metrics` renders. The node's slot, since the
+    ///        snapshot provider is built after this surface listens. Must outlive this.
     /// @param membership Who may ask; must outlive this. Bound once, by reference,
     ///        the way every surface binds it -- an implementation that re-asked for
     ///        an oracle per request could never see `--fleet-open` change, and a test
     ///        that re-acquired it would pass under exactly that defect.
     /// @param metrics Where a refusal is counted; must outlive this.
     NodeStatusResponder(INodeStatusSource const& identity,
+                        ILiveStatsSources const& readings,
                         Distributed::IMembershipOracle const& membership,
                         IMetricsSink& metrics) noexcept:
         _identity { identity },
+        _readings { readings },
         _membership { membership },
         _metrics { metrics }
     {
@@ -175,9 +181,10 @@ class NodeStatusResponder final: public IFrameResponder
 
     /// @copydoc IFrameResponder::RequestTimeout
     ///
-    /// The endpoint's own header window. These verbs read nothing and compute nothing:
-    /// `Describe()` resolves a handful of surface rows and `node-metrics` walks a fixed
-    /// table, so a window sized for a cache round trip is already generous. Anything
+    /// The endpoint's own header window. These verbs read no body and wait on nothing:
+    /// `Describe()` resolves a handful of surface rows and `node-metrics` takes the one
+    /// reading a `/metrics` scrape takes, so a window sized for a cache round trip is
+    /// already generous. Anything
     /// longer would hand a slow-loris the compile window for a verb that cannot use it,
     /// which is the trade `MergedResponder::RequestTimeout` declines to make
     /// surface-wide.
@@ -279,6 +286,7 @@ class NodeStatusResponder final: public IFrameResponder
 
   private:
     INodeStatusSource const& _identity;
+    ILiveStatsSources const& _readings;
     Distributed::IMembershipOracle const& _membership;
     IMetricsSink& _metrics;
 };

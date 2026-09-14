@@ -1,12 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "StatsSource.hpp"
 
+#include <FastCache/Core/WireFields.hpp>
+#include <FastCache/Metrics/IMetricsSink.hpp>
+#include <FastCache/Metrics/PrometheusFormatter.hpp>
+#include <FastCache/Metrics/StatsReading.hpp>
+#include <FastCache/Metrics/StatsReadingCodec.hpp>
+
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
+#include <cstdint>
 #include <format>
 #include <ranges>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -283,4 +292,73 @@ TEST_CASE("an INFO field with an empty value is kept, not dropped", "[cli][stats
     REQUIRE(FindField(record, "some_key") != nullptr);
     CHECK(FindField(record, "some_key")->value.kind == CellKind::Text);
     CHECK(FindField(record, "some_key")->value.lexical.empty());
+}
+
+TEST_CASE("a NodeMetrics body reads back as the record the /metrics rung parses, the cache tier included",
+          "[cli][stats][node-metrics]")
+{
+    // #1406. WHAT DISTINGUISHES: the storage figures. The counter catalogue alone -- what this body
+    // was -- carries `fastcache_worker_jobs_completed_total` too, so a case asserting only a counter
+    // passes under the defect; `fastcached_items` and `fastcached_delete_hits_total` are the half a
+    // node with no admin surface could not show.
+    auto sink = AtomicMetricsSink {};
+    sink.Increment(IMetricsSink::Counter::WorkerJobsCompleted, 12);
+    auto snapshot = MetricsSnapshot {};
+    snapshot.storage = StorageStats { .itemCount = 3, .deleteHits = 2, .deleteMisses = 1 };
+    auto const reading = CaptureStatsReading(sink, snapshot);
+
+    auto const record = DecodeNodeMetrics(EncodeStatsReading(reading));
+    REQUIRE(record.has_value());
+    REQUIRE(record->shape == Shape::Record);
+
+    auto const lexicalOf = [&record](std::string_view name) -> std::string {
+        auto const* field = FindField(*record, name);
+        INFO(name);
+        REQUIRE(field != nullptr);
+        return field->value.lexical;
+    };
+    CHECK(lexicalOf("fastcached_items") == "3");
+    CHECK(lexicalOf("fastcached_delete_hits_total") == "2");
+    CHECK(lexicalOf("fastcached_delete_misses_total") == "1");
+    CHECK(lexicalOf("fastcache_worker_jobs_completed_total") == "12");
+    // A counter is a tally, so a zero row is PRESENT.
+    CHECK(lexicalOf("fastcache_worker_jobs_started_total") == "0");
+
+    // That this is the record the node's `/metrics` route would have given is asserted against the two
+    // production acquisitions on one node, in `CacheTier_test`: rendered from this same reading on both
+    // sides, a comparison here could not fail.
+
+    SECTION("and a reading laid out by another build is refused by name, never read")
+    {
+        auto bytes = EncodeStatsReading(reading);
+        bytes[7] ^= std::byte { 0x01 };
+        auto const refused = DecodeNodeMetrics(bytes);
+        REQUIRE_FALSE(refused.has_value());
+        CHECK(refused.error() == StatsReadingFault::ForeignLayout);
+        CHECK(DescribeReadingFault(refused.error()).contains("laid out by a build other than this client's"));
+    }
+
+    SECTION("and a reading cut short is refused as truncated")
+    {
+        auto const bytes = EncodeStatsReading(reading);
+        auto const refused = DecodeNodeMetrics(std::span { bytes }.first(sizeof(std::uint64_t) + 4));
+        REQUIRE_FALSE(refused.has_value());
+        CHECK(refused.error() == StatsReadingFault::Truncated);
+        CHECK(DescribeReadingFault(refused.error()) == "ends before its layout does");
+    }
+
+    SECTION("and the counters-only body this verb answered before is refused by name, never read as rows")
+    {
+        // Version 9's shape: the catalogue as `name value` pairs. Read as a reading, its leading bytes
+        // are not this build's layout digest -- which is what keeps a mismatched pair of builds from
+        // reporting a column of nonsense figures.
+        auto const name = std::string_view { "fastcache_worker_jobs_completed_total" };
+        auto const value = std::array<std::byte, 8> { std::byte { 12 } };
+        auto const row = WireFields::Encode({ std::as_bytes(std::span { name }), std::span<std::byte const> { value } });
+        auto const oldBody = WireFields::Encode(
+            WireFields::FieldList { std::vector<std::span<std::byte const>> { std::span<std::byte const> { row } } });
+        auto const refused = DecodeNodeMetrics(oldBody);
+        REQUIRE_FALSE(refused.has_value());
+        CHECK(refused.error() == StatsReadingFault::ForeignLayout);
+    }
 }

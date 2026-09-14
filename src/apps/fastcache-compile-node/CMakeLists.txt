@@ -164,10 +164,17 @@ if(FASTCACHED_BUILD_TESTS)
         LiveStatsResponder_test.cpp
         DocumentedCommandLines_test.cpp
         ${_fc_node_shared}
+        # The CLI's reading of a `NodeMetrics` body and of a `/metrics` one, compiled in for the
+        # reason the launcher's sources are: one case holds the two doors a node's figures leave by
+        # against each other, through the code each client reads them with (#1406).
+        "${CMAKE_SOURCE_DIR}/src/apps/fastcache-cli/CliAnswer.cpp"
+        "${CMAKE_SOURCE_DIR}/src/apps/fastcache-cli/CliValue.cpp"
+        "${CMAKE_SOURCE_DIR}/src/apps/fastcache-cli/StatsSource.cpp"
     )
     target_include_directories(fastcache-compile-node-tests PRIVATE
         "${CMAKE_SOURCE_DIR}/src"
-        "${CMAKE_SOURCE_DIR}/src/apps/fastcache-cc")
+        "${CMAKE_SOURCE_DIR}/src/apps/fastcache-cc"
+        "${CMAKE_SOURCE_DIR}/src/apps/fastcache-cli")
     target_link_libraries(fastcache-compile-node-tests PRIVATE FastCache Catch2::Catch2)
     # The launchd label the macOS uninstaller boots this worker's job out by,
     # handed to the test so it compares the packaging's value against the one the

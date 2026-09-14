@@ -1302,7 +1302,7 @@ namespace
         return answer;
     }
 
-    /// `node-metrics` -- every counter this node's build carries.
+    /// `node-metrics` -- every figure the node's `/metrics` renders, over `0xFC` (#1406).
     /// @param context What to run against.
     /// @return The answer.
     [[nodiscard]] Answer NodeMetrics(VerbContext const& context)
@@ -1311,13 +1311,14 @@ namespace
         if (!reply.has_value())
             return reply.error();
 
-        auto record = DecodeNodeCounters(reply->payload);
+        auto record = DecodeNodeMetrics(reply->payload);
         if (!record.has_value())
-            return Concluded(
-                Outcome::Protocol,
-                std::format("{} answered node-metrics with a body this client cannot read", context.node->Address()));
+            return Concluded(Outcome::Protocol,
+                             std::format("{} answered node-metrics with a reading that {}",
+                                         context.node->Address(),
+                                         DescribeReadingFault(record.error())));
 
-        return Answered(std::move(*record));
+        return Answered(*std::move(record));
     }
 
     // -----------------------------------------------------------------------------
@@ -1886,7 +1887,7 @@ namespace
           .minOperands = 0,
           .maxOperands = 0,
           .operands = "",
-          .summary = "every counter the endpoint's build carries, zeroes\n"
+          .summary = "every figure the node's /metrics renders, zeroes\n"
                      "included -- a counter is a tally, so zero is a reading",
           .protocolCommand = "node-metrics",
           .modifiers = Modifier::None,

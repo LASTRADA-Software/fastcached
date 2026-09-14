@@ -8,7 +8,10 @@
 #include <FastCache/Core/WireFrame.hpp>
 #include <FastCache/Distributed/MembershipOracle.hpp>
 #include <FastCache/Metrics/MetricsCatalog.hpp>
+#include <FastCache/Metrics/StatsReading.hpp>
+#include <FastCache/Metrics/StatsReadingCodec.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
+#include <FastCache/Protocol/LiveStream.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -60,6 +63,53 @@ class ListedMembership final: public Distributed::IMembershipOracle
 
   private:
     std::vector<std::string> _members;
+};
+
+/// The live-stats sources `NodeMetrics` reads, over a snapshot a case scripts.
+///
+/// **The production capture, not a stand-in for it**: `Capture(Cache)` is `CaptureCacheSubject`, the
+/// function the node's own sources call, so what a case reads back is what a node would send.
+class CapturedReadings final: public ILiveStatsSources
+{
+  public:
+    /// @param metrics The counters a capture reads; must outlive this.
+    /// @param scripted What the snapshot provider states.
+    CapturedReadings(IMetricsSink const& metrics, MetricsSnapshot scripted) noexcept:
+        _snapshot { std::move(scripted) },
+        _metrics { metrics }
+    {
+    }
+
+    /// @copydoc ILiveStatsSources::Capture
+    [[nodiscard]] std::optional<LiveCapture> Capture(Wire::LiveSubject subject) const override
+    {
+        if (!_attached || subject != Wire::LiveSubject::Cache)
+            return std::nullopt;
+        return CaptureCacheSubject(_metrics, _snapshot);
+    }
+
+    /// @copydoc ILiveStatsSources::Leadership
+    [[nodiscard]] std::optional<LiveLeadership> Leadership() const override
+    {
+        return std::nullopt;
+    }
+
+    /// @copydoc ILiveStatsSources::AnsweringEndpoint
+    [[nodiscard]] std::string AnsweringEndpoint() const override
+    {
+        return "n1.test:6674";
+    }
+
+    /// Detach the sources, as a node does once it is stopping: every capture after this answers nothing.
+    void Detach() noexcept
+    {
+        _attached = false;
+    }
+
+  private:
+    MetricsSnapshot _snapshot;
+    IMetricsSink const& _metrics;
+    bool _attached { true };
 };
 
 /// The peer every `AnswerNow` below arrives from.
@@ -663,7 +713,8 @@ TEST_CASE("NodeStatus answers a member with what the node is", "[node][node-stat
     AtomicMetricsSink metrics;
     ListedMembership const membership { { std::string { CallerAddress } } };
     Fixture const fixture { { .admin = true, .raft = true }, clock, { .cacheTier = true, .worker = true } };
-    NodeStatusResponder responder { fixture.status, membership, metrics };
+    CapturedReadings const readings { metrics, {} };
+    NodeStatusResponder responder { fixture.status, readings, membership, metrics };
 
     clock.Advance(5s);
     auto const reply = AnswerNow(responder, HeaderFor(Wire::Op::NodeStatus));
@@ -685,18 +736,22 @@ TEST_CASE("NodeStatus answers a member with what the node is", "[node][node-stat
     CHECK(Unwrap(SurfaceOf(described, Wire::WireSurface::Raft)).port == RaftPort);
 }
 
-TEST_CASE("NodeMetrics reports every counter this build carries, zeroes included", "[node][node-status]")
+TEST_CASE("NodeMetrics answers the reading /metrics renders, the cache tier's figures and every zero included",
+          "[node][node-status][node-metrics]")
 {
-    // **A counter is a tally, so zero is the truth about events that never happened.**
-    // Dropping a zero row would make *nothing happened* and *this build has no such
-    // counter* one answer, which is the one distinction a client reading these has no
-    // other way to make -- and it is the failure a fixture that pre-moves a few counters
-    // cannot see, since every row it checks is non-zero by construction.
+    // #1406. WHAT DISTINGUISHES: the storage block. A reply of the counter catalogue alone -- what this
+    // verb answered before -- carries the counters too, so a case asserting only a counter passes
+    // under the defect; the tier's items and delete hits are the half a node with no admin surface
+    // could not see.
     ManualClock clock;
     AtomicMetricsSink metrics;
     ListedMembership const membership { { std::string { CallerAddress } } };
     Fixture const fixture { {}, clock };
-    NodeStatusResponder responder { fixture.status, membership, metrics };
+
+    auto snapshot = MetricsSnapshot {};
+    snapshot.storage = StorageStats { .itemCount = 3, .deleteHits = 2, .deleteMisses = 1 };
+    CapturedReadings readings { metrics, snapshot };
+    NodeStatusResponder responder { fixture.status, readings, membership, metrics };
 
     metrics.Increment(IMetricsSink::Counter::WorkerJobsCompleted, 7);
 
@@ -705,31 +760,38 @@ TEST_CASE("NodeMetrics reports every counter this build carries, zeroes included
     REQUIRE(header.has_value());
     REQUIRE(Unwrap(header).status == Wire::Status::Ok);
 
-    auto const outer = WireFields::SplitAll(PayloadOf(reply, Unwrap(header)));
-    REQUIRE(outer.has_value());
-    // Derived from the table, never a literal: a hand-written expectation would go stale
-    // the day a counter is added, and would go stale SILENTLY in the direction that reads
-    // as passing.
-    REQUIRE(Unwrap(outer).size() == CounterTable.size());
+    auto const decoded = DecodeStatsReading(PayloadOf(reply, Unwrap(header)));
+    REQUIRE(decoded.has_value());
+    auto const& reading = decoded.value();
 
-    std::optional<std::uint64_t> completed;
-    std::size_t zeroes = 0;
-    for (auto const& row: Unwrap(outer))
+    // The whole reading, compared as one value: every counter, every block, the version. Derived
+    // from a capture of the same sink and snapshot rather than from a list of expected figures,
+    // which would go stale silently the day a figure is added.
+    CHECK(reading == CaptureStatsReading(metrics, snapshot));
+
+    REQUIRE(reading.snapshot.storage.has_value());
+    CHECK(Unwrap(reading.snapshot.storage).itemCount == 3);
+    CHECK(Unwrap(reading.snapshot.storage).deleteHits == 2);
+    CHECK(Unwrap(reading.snapshot.storage).deleteMisses == 1);
+
+    // A counter is a tally, so zero is the truth about events that never happened: rows that read
+    // zero are PRESENT, not dropped.
+    auto const* const completed = reading.counters.Find(IMetricsSink::Counter::WorkerJobsCompleted);
+    REQUIRE(completed != nullptr);
+    CHECK(*completed == std::optional<std::uint64_t> { 7 });
+    auto const zeroes = std::ranges::count(reading.counters.Positional(), std::optional<std::uint64_t> { 0 });
+    CHECK(static_cast<std::size_t>(zeroes) == CounterTable.size() - 1);
+
+    SECTION("and a node whose sources are detached is stopping, and says so uncounted")
     {
-        auto const pair = WireFields::SplitExactly(row, 2);
-        REQUIRE(pair.has_value());
-        auto const name = Wire::AsStringView(Unwrap(pair)[0]);
-        auto const value = Wire::DecodeU64Field(Unwrap(pair)[1]);
-        REQUIRE(value.has_value());
-        if (name == "fastcache_worker_jobs_completed_total")
-            completed = value;
-        if (Unwrap(value) == 0)
-            ++zeroes;
+        readings.Detach();
+        auto const refused = ShapeOf(AnswerNow(responder, HeaderFor(Wire::Op::NodeMetrics)));
+        CHECK(refused.status == Wire::Status::Error);
+        CHECK(refused.code == Wire::ErrorCode::EndpointBusy);
+        CHECK(std::ranges::all_of(CounterTable, [&metrics](auto const& row) {
+            return row.counter == IMetricsSink::Counter::WorkerJobsCompleted || metrics.Read(row.counter) == 0;
+        }));
     }
-
-    CHECK(completed == std::optional<std::uint64_t> { 7 });
-    // The property the row count alone cannot assert: rows that read zero are PRESENT.
-    CHECK(zeroes == CounterTable.size() - 1);
 }
 
 TEST_CASE("The operator verbs are refused by name to a non-member, and counted once", "[node][node-status]")
@@ -738,7 +800,8 @@ TEST_CASE("The operator verbs are refused by name to a non-member, and counted o
     AtomicMetricsSink metrics;
     ListedMembership const membership { { "10.0.0.9" } };
     Fixture const fixture { { .admin = true }, clock };
-    NodeStatusResponder responder { fixture.status, membership, metrics };
+    CapturedReadings const readings { metrics, {} };
+    NodeStatusResponder responder { fixture.status, readings, membership, metrics };
 
     // `CallerAddress` is not on that list.
     auto const shape = ShapeOf(AnswerNow(responder, HeaderFor(Wire::Op::NodeStatus)));
@@ -769,7 +832,7 @@ TEST_CASE("The operator verbs are refused by name to a non-member, and counted o
     SECTION("and a listed member is served, so the gate is not simply refusing everyone")
     {
         ListedMembership const listed { { std::string { CallerAddress } } };
-        NodeStatusResponder served { fixture.status, listed, metrics };
+        NodeStatusResponder served { fixture.status, readings, listed, metrics };
         CHECK(ShapeOf(AnswerNow(served, HeaderFor(Wire::Op::NodeStatus))).status == Wire::Status::Ok);
         CHECK(metrics.Read(IMetricsSink::Counter::NodeStatusRequestsRefusedNotAMember) == 1);
     }
@@ -790,7 +853,8 @@ TEST_CASE("A verb this component does not own is UnimplementedVerb and is not co
     AtomicMetricsSink metrics;
     ListedMembership const membership { { std::string { CallerAddress } } };
     Fixture const fixture { {}, clock };
-    NodeStatusResponder responder { fixture.status, membership, metrics };
+    CapturedReadings const readings { metrics, {} };
+    NodeStatusResponder responder { fixture.status, readings, membership, metrics };
 
     auto const shape = ShapeOf(AnswerNow(responder, HeaderFor(Wire::Op::Fetch)));
     CHECK(shape.status == Wire::Status::Error);
@@ -819,7 +883,8 @@ TEST_CASE("The operator surface requires no credential, so a plain worker can an
     AtomicMetricsSink metrics;
     ListedMembership const membership { { std::string { CallerAddress } } };
     Fixture const fixture { {}, clock };
-    NodeStatusResponder const responder { fixture.status, membership, metrics };
+    CapturedReadings const readings { metrics, {} };
+    NodeStatusResponder const responder { fixture.status, readings, membership, metrics };
 
     auto const opRaw = static_cast<std::uint8_t>(Wire::Op::NodeStatus);
     CHECK_FALSE(responder.AuthRequired(opRaw));
@@ -853,7 +918,8 @@ TEST_CASE("A frame-ceiling probe against the operator verbs is counted; an unkno
     AtomicMetricsSink metrics;
     ListedMembership const membership { { std::string { CallerAddress } } };
     Fixture const fixture { {}, clock };
-    NodeStatusResponder const responder { fixture.status, membership, metrics };
+    CapturedReadings const readings { metrics, {} };
+    NodeStatusResponder const responder { fixture.status, readings, membership, metrics };
 
     auto const opRaw = static_cast<std::uint8_t>(Wire::Op::NodeStatus);
 
@@ -886,7 +952,8 @@ TEST_CASE("MergedResponder routes the Node family to the node responder and nowh
     AtomicMetricsSink metrics;
     ListedMembership const membership { { std::string { CallerAddress } } };
     Fixture const fixture { {}, clock };
-    NodeStatusResponder node { fixture.status, membership, metrics };
+    CapturedReadings const readings { metrics, {} };
+    NodeStatusResponder node { fixture.status, readings, membership, metrics };
 
     MergedResponder responder { SurfaceComponents { .node = &node } };
     CHECK(ShapeOf(AnswerNow(responder, HeaderFor(Wire::Op::NodeStatus))).status == Wire::Status::Ok);

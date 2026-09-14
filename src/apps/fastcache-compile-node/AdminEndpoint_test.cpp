@@ -34,11 +34,13 @@
 
 #include <tests/FleetHistoryFakes.hpp>
 #include <tests/ScratchPath.hpp>
+#include <tests/ScriptedHostFacts.hpp>
 #include <tests/Unwrap.hpp>
 
 using namespace FastCache;
 using namespace FastCache::Node;
 using namespace std::chrono_literals;
+using FastCache::Testing::ScriptedHostFacts;
 using FastCache::Testing::Unwrap;
 
 namespace
@@ -275,39 +277,6 @@ TEST_CASE("Destroying the endpoint stops it, with nothing to remember", "[node][
     CHECK(again->IsBound());
 }
 
-namespace
-{
-/// A machine a test can describe, standing in for the one it runs on.
-///
-/// A second, smaller copy of `NodeConfig_test`'s `FakeHost`: that one lives in its
-/// file's anonymous namespace and reports no disk at all, which is precisely what
-/// this case needs to see. Two copies rather than a shared header, and worth
-/// lifting if a third appears.
-class ScrapeHost final: public IHostFactsSource
-{
-  public:
-    [[nodiscard]] HostFacts const& Facts() const override
-    {
-        return _facts;
-    }
-    [[nodiscard]] std::uint32_t LogicalCores() const override
-    {
-        return 4;
-    }
-    [[nodiscard]] std::uint64_t TotalMemoryBytes() const override
-    {
-        return 8ULL << 30;
-    }
-    [[nodiscard]] DiskSpace SpaceOn(std::filesystem::path const& /*path*/) const override
-    {
-        return DiskSpace { .capacityBytes = 1000, .freeBytes = 400 };
-    }
-
-  private:
-    HostFacts _facts;
-};
-} // namespace
-
 TEST_CASE("A node with no cache tier reports no cache", "[node][admin][cache]")
 {
     // The branch this factory exists to have covered. While it lived in `main.cpp`
@@ -318,7 +287,7 @@ TEST_CASE("A node with no cache tier reports no cache", "[node][admin][cache]")
     // Absent here is the truth rather than a placeholder: a node whose every cache
     // half was turned off has none, and a default-constructed `StorageStats` would
     // state an empty unbounded cache as a fact.
-    ScrapeHost host;
+    ScriptedHostFacts host;
     auto const provider = MakeNodeSnapshotProvider(NodeScrapeSources { .host = &host,
                                                                        .busySlots = [] { return std::size_t { 2 }; },
                                                                        .cache = nullptr,
@@ -375,7 +344,7 @@ TEST_CASE("A node's snapshot says whether its worker is cordoned, read per snaps
 {
     // #1303. Sampled per scrape like `busySlots`, because a cordon moves while the node runs:
     // a value captured once would describe the machine before the operator acted.
-    ScrapeHost host;
+    ScriptedHostFacts host;
     std::atomic<bool> cordoned { false };
     auto const provider = MakeNodeSnapshotProvider(NodeScrapeSources { .host = &host,
                                                                        .busySlots = [] { return std::size_t { 1 }; },
@@ -399,7 +368,7 @@ TEST_CASE("A node's snapshot carries the raw load counters, read per snapshot", 
     // Raw, and read again per snapshot: a utilization would need a baseline, and a baseline the
     // scrape, every subscriber and the heartbeat all move is an interval nobody can read. Each
     // reader differences its own two readings instead.
-    ScrapeHost host;
+    ScriptedHostFacts host;
     SteppingCounters counters;
     auto const provider = MakeNodeSnapshotProvider(NodeScrapeSources { .host = &host,
                                                                        .load = &counters,
@@ -431,7 +400,7 @@ TEST_CASE("A node's snapshot carries the raw load counters, read per snapshot", 
 
 TEST_CASE("A node snapshot with no load source carries no load block", "[node][admin]")
 {
-    ScrapeHost host;
+    ScriptedHostFacts host;
     auto const provider = MakeNodeSnapshotProvider(NodeScrapeSources { .host = &host,
                                                                        .busySlots = [] { return std::size_t { 0 }; },
                                                                        .cache = nullptr,
@@ -450,7 +419,7 @@ TEST_CASE("A scrape renders nothing for a cache the node does not have", "[node]
     // End to end through the renderer, because the absence has to survive it too: a
     // `fastcached_items 0` line says the cache is empty, which is a different claim
     // from a node that has none, and a dashboard reads the first as a fact.
-    ScrapeHost host;
+    ScriptedHostFacts host;
     AtomicMetricsSink metrics;
     auto const provider = MakeNodeSnapshotProvider(NodeScrapeSources { .host = &host,
                                                                        .busySlots = [] { return std::size_t { 0 }; },
@@ -480,7 +449,7 @@ TEST_CASE("A scrape renders no consensus series for a node that runs none", "[no
     // DOES run consensus and counts nobody is the #388 state and must render. The
     // two are told apart by whether the block is here at all, which is what the next
     // case asserts from the other side.
-    ScrapeHost host;
+    ScriptedHostFacts host;
     AtomicMetricsSink metrics;
     auto const provider = MakeNodeSnapshotProvider(NodeScrapeSources { .host = &host,
                                                                        .busySlots = [] { return std::size_t { 0 }; },
@@ -505,7 +474,7 @@ TEST_CASE("A node that runs consensus reports what IT counts, per scrape", "[nod
     // the election before last. `busySlots` is a callable for the same reason and
     // this is the stronger case of it, since a stale role is read as a fact about
     // who leads.
-    ScrapeHost host;
+    ScriptedHostFacts host;
     AtomicMetricsSink metrics;
     auto reads = std::size_t { 0 };
     auto const provider =
@@ -717,7 +686,7 @@ TEST_CASE("An admin surface nobody asked for starts nothing at all", "[node][adm
     // refused by StartupPolicyRejection long before this runs.
     AtomicMetricsSink metrics;
     NullLogger logger;
-    ScrapeHost const scrapeHost;
+    ScriptedHostFacts const scrapeHost;
     NodeConfig cfg;
 
     auto surface = Node::StartAdminSurfaceOrExplain(
@@ -733,7 +702,7 @@ TEST_CASE("An admin surface reports which flag refused it", "[node][admin][dashb
     // bad-spelling case already holds.
     AtomicMetricsSink metrics;
     NullLogger logger;
-    ScrapeHost const scrapeHost;
+    ScriptedHostFacts const scrapeHost;
 
     SECTION("a listen spelling that is not an endpoint")
     {
@@ -787,7 +756,7 @@ TEST_CASE("An admin surface serves the fleet only when there is a fleet to read"
     // offers no fleet route, rather than one answering with an empty fleet.
     AtomicMetricsSink metrics;
     NullLogger logger;
-    ScrapeHost const scrapeHost;
+    ScriptedHostFacts const scrapeHost;
     ManualClock clock;
     ManualWallClock wallClock;
     Distributed::SchedulerService scheduler { clock, wallClock, metrics, logger, {}, {} };
@@ -838,7 +807,7 @@ TEST_CASE("Asking for a generated certificate gives the surface one to serve", "
     // comes up holding a certificate.
     AtomicMetricsSink metrics;
     NullLogger logger;
-    ScrapeHost const scrapeHost;
+    ScriptedHostFacts const scrapeHost;
 
     auto probe = BlockingListener::Bind("127.0.0.1", 0);
     REQUIRE(probe);
@@ -869,7 +838,7 @@ TEST_CASE("A surface with no TLS asked for holds no context at all", "[node][adm
     // and asking for none leaves the admin port exactly as plaintext as it was.
     AtomicMetricsSink metrics;
     NullLogger logger;
-    ScrapeHost const scrapeHost;
+    ScriptedHostFacts const scrapeHost;
 
     auto probe = BlockingListener::Bind("127.0.0.1", 0);
     REQUIRE(probe);
