@@ -391,8 +391,9 @@ static void AppendConsensusMetrics(std::string& out, ConsensusStatus const& stat
     }
 }
 
-std::string RenderPrometheus(IMetricsSink const& metrics, MetricsSnapshot const& snapshot)
+std::string RenderPrometheus(StatsReading const& reading)
 {
+    auto const& snapshot = reading.snapshot;
     std::string out;
     // Each metric renders ~3 lines (HELP/TYPE/value); ~200 bytes is a per-row
     // estimate, so one reserve avoids some of the reallocations the += loop would
@@ -447,7 +448,8 @@ std::string RenderPrometheus(IMetricsSink const& metrics, MetricsSnapshot const&
     // live counters used to be absent here, including all five the distributed-
     // compilation guide tells an operator to read.
     //
-    // ASKED before read, and that is the whole of #1353. `CounterTable` is
+    // ASKED before read, and that is the whole of #1353 -- asked once, by
+    // `CaptureStatsReading`, which records a row this sink cannot carry as absent. `CounterTable` is
     // `static_assert`ed to cover every enumerator, so within ONE build the
     // question cannot fail -- but this loop's build and the sink's need not be the
     // same one. On a skewed build the catalogue carries a row the sink has no slot
@@ -468,7 +470,8 @@ std::string RenderPrometheus(IMetricsSink const& metrics, MetricsSnapshot const&
     std::uint64_t omittedBySkew = 0;
     for (auto const& row: CounterTable)
     {
-        if (!metrics.Carries(row.counter))
+        auto const& value = reading.counters[static_cast<std::size_t>(row.counter)];
+        if (!value.has_value())
         {
             ++omittedBySkew;
             out += std::format("# SKEW {} is in the metrics catalogue and this build's sink has no "
@@ -478,9 +481,7 @@ std::string RenderPrometheus(IMetricsSink const& metrics, MetricsSnapshot const&
                                row.prometheusName);
             continue;
         }
-        Append(
-            out,
-            Metric { .name = row.prometheusName, .help = row.help, .type = row.type, .value = metrics.Read(row.counter) });
+        Append(out, Metric { .name = row.prometheusName, .help = row.help, .type = row.type, .value = *value });
     }
 
     // How many catalogue rows this build's sink could not carry, as a SERIES.
@@ -512,6 +513,11 @@ std::string RenderPrometheus(IMetricsSink const& metrics, MetricsSnapshot const&
                     .value = static_cast<std::uint64_t>(snapshot.uptime.value.count()) });
 
     return out;
+}
+
+std::string RenderPrometheus(IMetricsSink const& metrics, MetricsSnapshot const& snapshot)
+{
+    return RenderPrometheus(CaptureStatsReading(metrics, snapshot));
 }
 
 } // namespace FastCache
