@@ -1294,6 +1294,47 @@ class IMetricsSink
 /// would be the wrong trade for one constant.
 inline constexpr std::size_t CounterCount = static_cast<std::size_t>(IMetricsSink::Counter::Last);
 
+namespace CounterSkew
+{
+    /// A type that is different for every counter count, so a function taking one is a different linker
+    /// symbol for every count.
+    /// @tparam Count The count.
+    template <std::size_t Count>
+    struct Extent
+    {
+    };
+
+    /// The link-time half of the counter-skew guard (#1361). Defined exactly once, in `Metrics/IMetricsSink.cpp`,
+    /// for the count THAT file was compiled against.
+    ///
+    /// A unit compiled against a different `Counter` asks for a different symbol, and the link fails naming this
+    /// function and the count the stale unit saw -- rather than succeeding with two extents of every table keyed by
+    /// the enum, which is an ODR violation no run-time check is sound against (see `AtomicMetricsSink::SlotOf`).
+    ///
+    /// The count is a PARAMETER type, never a return type: a return type is not part of a function's mangled name
+    /// on Linux, so two counts would name one symbol and link silently.
+    /// @return true.
+    [[nodiscard]] bool RequireExtent(Extent<CounterCount> /*extent*/) noexcept;
+} // namespace CounterSkew
+
+/// Every unit that includes this header asks, at static initialisation, for the counter count it was compiled
+/// against (#1361).
+///
+/// `static`, and that is the mechanism rather than style. With internal linkage every such unit owns its own
+/// initializer calling `CounterSkew::RequireExtent`, and that call survives every optimisation level: the callee
+/// is external and its result unknown to the compiler. `ctest -R counter-extent-link` builds a unit against a copy
+/// of this header with one more enumerator, in Debug and Release, and requires the link to fail.
+///
+/// The two tempting shapes both LINK a skewed unit, measured with that fixture on 2026-09-14 (MSVC 14.51, g++ and
+/// clang++-22 on Ubuntu 24.04):
+/// - `inline` instead of `static` is one COMDAT whose name carries no count. clang++ linked the skewed unit in
+///   Debug and Release, because the linker kept the healthy unit's copy; MSVC and g++ happened not to.
+/// - Referencing the function without calling it (`&CounterSkew::RequireExtent != nullptr`) is folded away.
+///   g++ and clang++ linked it in both configurations, MSVC in Release.
+///
+/// Costs one no-op call per including unit, once, at start-up; nothing on any path that counts.
+[[maybe_unused]] static bool const CounterExtentLinked = CounterSkew::RequireExtent({});
+
 /// The index @p counter occupies in a table keyed by `IMetricsSink::Counter`, or absent when this
 /// build has no such row.
 ///
