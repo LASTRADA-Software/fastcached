@@ -357,6 +357,13 @@ Sha256::Sha256(Sha256Engine engine) noexcept:
     assert(Sha256EngineRunsOn(engine, ProcessCpuFeatures()));
 }
 
+std::optional<Sha256> Sha256::WithEngine(Sha256Engine engine) noexcept
+{
+    if (!Sha256EngineRunsOn(engine, ProcessCpuFeatures()))
+        return std::nullopt;
+    return Sha256 { engine };
+}
+
 void Sha256::CompressBlocks(std::span<std::byte const> blocks) noexcept
 {
     RowOf(_engine).compressBlocks(_state, blocks);
@@ -425,14 +432,18 @@ Sha256::Digest Sha256::Finish() noexcept
 
 Sha256::Digest Sha256::Hash(std::span<std::byte const> input) noexcept
 {
-    return Hash(input, ActiveSha256Engine());
-}
-
-Sha256::Digest Sha256::Hash(std::span<std::byte const> input, Sha256Engine engine) noexcept
-{
-    Sha256 hasher { engine };
+    Sha256 hasher;
     hasher.Update(input);
     return hasher.Finish();
+}
+
+std::optional<Sha256::Digest> Sha256::Hash(std::span<std::byte const> input, Sha256Engine engine) noexcept
+{
+    auto hasher = WithEngine(engine);
+    if (!hasher.has_value())
+        return std::nullopt;
+    hasher->Update(input);
+    return hasher->Finish();
 }
 
 Sha256::Digest HmacSha256(std::span<std::byte const> key, std::span<std::byte const> message)

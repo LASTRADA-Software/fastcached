@@ -4,6 +4,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -95,9 +96,14 @@ class Sha256
     /// A hasher on the process's default engine (`ActiveSha256Engine`).
     Sha256() noexcept;
 
-    /// A hasher on a chosen engine.
-    /// @param engine The engine; it must run on this process's CPU (`Sha256EngineRunsOn`).
-    explicit Sha256(Sha256Engine engine) noexcept;
+    /// A hasher on a chosen engine, or nothing when this process's CPU cannot run it.
+    ///
+    /// The only way to choose one. An engine the CPU lacks comes back as an absent
+    /// hasher, where a constructor that merely asserted would, in a Release build,
+    /// call through a null pointer or execute an instruction the CPU does not have.
+    /// @param engine The engine.
+    /// @return The hasher, or `std::nullopt` when `Sha256EngineRunsOn` says no here.
+    [[nodiscard]] static std::optional<Sha256> WithEngine(Sha256Engine engine) noexcept;
 
     /// The engine this hasher compresses with.
     /// @return The engine.
@@ -121,11 +127,15 @@ class Sha256
 
     /// One-shot, on a chosen engine.
     /// @param input Bytes to hash.
-    /// @param engine The engine; it must run on this process's CPU.
-    /// @return The 32-byte digest.
-    [[nodiscard]] static Digest Hash(std::span<std::byte const> input, Sha256Engine engine) noexcept;
+    /// @param engine The engine.
+    /// @return The 32-byte digest, or `std::nullopt` when this process's CPU cannot run @p engine.
+    [[nodiscard]] static std::optional<Digest> Hash(std::span<std::byte const> input, Sha256Engine engine) noexcept;
 
   private:
+    /// A hasher on @p engine, which the caller has already checked runs here.
+    /// @param engine The engine.
+    explicit Sha256(Sha256Engine engine) noexcept;
+
     /// Compress whole blocks into the running state, with this hasher's engine.
     /// @param blocks A whole number of BlockSize-byte blocks.
     void CompressBlocks(std::span<std::byte const> blocks) noexcept;

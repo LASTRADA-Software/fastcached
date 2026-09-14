@@ -3201,6 +3201,34 @@ makes it anyway and says so there.
     compile naming its own table. A completeness guard that has never been seen
     to fail is exactly the thing this entry is about.
 
+- **An instruction-set extension is used only inside a function that asks for it, never enabled by
+  a global `-m` flag.** That is `__attribute__((target("sha,ssse3,sse4.1")))` on gcc and clang
+  (clang-cl included), and nothing on MSVC's cl, which allows the intrinsics anywhere and does not
+  know the attribute. Which engine runs is decided at run time from `Core/CpuFeatures` (#1420).
+  - **A global flag is wrong even when it is set on one file.** A translation unit built with
+    `-msha -msse4.1` emits its own out-of-line copies of every inline function it uses:
+    `std::span::subspan`, the `views::iota` iterator, and so on. The linker keeps one arbitrary
+    copy for the whole program. The scalar fallback, running on a CPU without those instructions,
+    can then execute the copy that has them and die of SIGILL. The attribute keeps the
+    instructions inside the attributed bodies. It also needs no per-source flag in each target
+    that compiles the file, and `Core/Sha256.cpp` is compiled by two (the library and the
+    launcher).
+  - **The attribute is not inherited by what the function contains.** A lambda inside an
+    attributed function is a separate function, so gcc refuses to inline an intrinsic into it.
+    A helper is its own attributed function.
+  - **gcc refuses `std::array<__m128i, N>`** ("ignoring attributes on template argument"),
+    because the vector type carries attributes. A sliding window of named vectors is the
+    portable spelling.
+  - **A default target that enables an extension is not a reason to omit the attribute.** Every
+    Apple arm64 CPU has the SHA-256 instructions and the default target enables them, but a build
+    given an explicit `-march=armv8-a` refuses to inline `vsha256hq_u32` into a function that did
+    not ask. Measured with clang 20: "always_inline function 'vsha256hq_u32' requires target
+    feature 'sha2'".
+  - **A hardware path exists only where a CI leg compiles and runs it.** Detection and the ARM
+    engine are compiled for arm64 macOS alone. Linux aarch64 and Windows ARM64 run the scalar
+    path, which is correct and slower, until they have a leg (#1432). A branch no leg compiles
+    rots with nothing to report it.
+
 ## What a `char` is
 
 - **Every Windows executable declares UTF-8 as its process code page, and the

@@ -25,7 +25,8 @@ namespace FastCache
 /// leg, and arm64 macOS on the macOS leg. Everywhere else, Linux aarch64 and
 /// Windows ARM64 included, nothing is reported, so the portable scalar paths
 /// run. That is correct, only slower. A detection branch no leg compiles is
-/// one that rots with nothing to say so (#1432).
+/// one that rots with nothing to say so (#1432). ARM64EC defines `_M_X64` as well,
+/// so such a build would take the x86 branches; no preset targets it.
 ///
 /// In Core rather than Platform because its consumer, `Sha256`, is Core, and
 /// Core does not reach up into Platform.

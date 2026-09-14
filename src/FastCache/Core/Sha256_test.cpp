@@ -20,7 +20,10 @@
 #include <string_view>
 #include <vector>
 
+#include <tests/Unwrap.hpp>
+
 using namespace FastCache;
+using FastCache::Testing::Unwrap;
 
 namespace
 {
@@ -59,6 +62,27 @@ namespace
     return engines;
 }
 
+/// A hasher on @p engine, which the caller has checked this CPU runs.
+/// @param engine The engine.
+/// @return The hasher.
+[[nodiscard]] Sha256 HasherOn(Sha256Engine engine)
+{
+    auto const hasher = Sha256::WithEngine(engine);
+    REQUIRE(hasher.has_value());
+    return Unwrap(hasher);
+}
+
+/// @p input's digest on @p engine, which the caller has checked this CPU runs.
+/// @param input Bytes to hash.
+/// @param engine The engine.
+/// @return The digest.
+[[nodiscard]] Sha256::Digest HashOn(std::span<std::byte const> input, Sha256Engine engine)
+{
+    auto const digest = Sha256::Hash(input, engine);
+    REQUIRE(digest.has_value());
+    return Unwrap(digest);
+}
+
 /// The engines this test host's CPU runs: `Scalar` always, and a hardware engine
 /// where this build carries it and the CPU has its instructions. Every
 /// known-answer and differential case runs on each, in the default set, for the
@@ -87,12 +111,11 @@ TEST_CASE("Sha256 matches the FIPS 180-4 vectors", "[core][sha256]")
     INFO("engine " << Sha256EngineName(engine));
 
     std::vector<std::byte> const millionA(1'000'000, std::byte { 'a' });
-    CHECK(HexDigest(Sha256::Hash({}, engine)) == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
-    CHECK(HexDigest(Sha256::Hash(Bytes("abc"), engine))
-          == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
-    CHECK(HexDigest(Sha256::Hash(Bytes("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"), engine))
+    CHECK(HexDigest(HashOn({}, engine)) == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+    CHECK(HexDigest(HashOn(Bytes("abc"), engine)) == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    CHECK(HexDigest(HashOn(Bytes("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"), engine))
           == "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1");
-    CHECK(HexDigest(Sha256::Hash(millionA, engine)) == "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0");
+    CHECK(HexDigest(HashOn(millionA, engine)) == "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0");
 }
 
 TEST_CASE("Sha256 pads correctly at every block boundary", "[core][sha256]")
@@ -115,11 +138,11 @@ TEST_CASE("Sha256 pads correctly at every block boundary", "[core][sha256]")
 
         INFO("length " << length);
 
-        Sha256 incremental { engine };
+        auto incremental = HasherOn(engine);
         for (auto const& byte: input)
             incremental.Update(std::span { &byte, 1 });
 
-        CHECK(HexDigest(incremental.Finish()) == HexDigest(Sha256::Hash(input, engine)));
+        CHECK(HexDigest(incremental.Finish()) == HexDigest(HashOn(input, engine)));
     }
 }
 
@@ -134,7 +157,7 @@ TEST_CASE("Sha256 is unaffected by how input is chunked", "[core][sha256]")
     auto const engine = GENERATE(from_range(EnginesThisCpuRuns()));
     INFO("engine " << Sha256EngineName(engine));
 
-    auto const oneShot = HexDigest(Sha256::Hash(input, engine));
+    auto const oneShot = HexDigest(HashOn(input, engine));
 
     for (auto const chunk: { std::size_t { 1 },
                              std::size_t { 7 },
@@ -145,7 +168,7 @@ TEST_CASE("Sha256 is unaffected by how input is chunked", "[core][sha256]")
                              std::size_t { 999 } })
     {
         INFO("chunk " << chunk);
-        Sha256 hasher { engine };
+        auto hasher = HasherOn(engine);
         std::span<std::byte const> remaining { input };
         while (!remaining.empty())
         {
@@ -190,13 +213,13 @@ TEST_CASE("Every hardware Sha256 engine agrees with Scalar byte for byte", "[cor
     for (auto const length: lengths)
     {
         auto const input = std::span<std::byte const> { buffer }.first(length);
-        auto const reference = Sha256::Hash(input, Sha256Engine::Scalar);
+        auto const reference = HashOn(input, Sha256Engine::Scalar);
 
         for (auto const engine: hardware)
         {
             INFO("engine " << Sha256EngineName(engine) << ", length " << length);
 
-            Sha256 chunked { engine };
+            auto chunked = HasherOn(engine);
             auto remaining = input;
             while (!remaining.empty())
             {
@@ -205,7 +228,7 @@ TEST_CASE("Every hardware Sha256 engine agrees with Scalar byte for byte", "[cor
                 remaining = remaining.subspan(take);
             }
             CHECK(chunked.Finish() == reference);
-            CHECK(Sha256::Hash(input, engine) == reference);
+            CHECK(HashOn(input, engine) == reference);
         }
     }
 }
@@ -255,11 +278,30 @@ TEST_CASE("A CPU with SHA instructions gets a hardware engine by default", "[cor
     CHECK(ActiveSha256Engine() != Sha256Engine::Scalar);
 }
 
+TEST_CASE("Sha256::WithEngine refuses an engine this CPU cannot run", "[core][sha256][engine]")
+{
+    // What stands between a caller choosing an engine and a Release build jumping
+    // through a null pointer or into an instruction the CPU lacks. Every CPU CI owns
+    // lacks at least one engine -- no CPU runs both x86 and ARM instructions -- so
+    // this runs everywhere, and the engine it refuses is decided by the CPU, never
+    // by the architecture the test was compiled for.
+    auto const features = DetectCpuFeatures();
+    auto const engines = AllEngines();
+    auto const* const absent =
+        FindIfOrNull(engines, [&features](Sha256Engine engine) { return !Sha256EngineRunsOn(engine, features); });
+    if (absent == nullptr)
+        SKIP("this CPU runs every engine, so there is none to refuse");
+
+    INFO("engine " << Sha256EngineName(*absent));
+    CHECK_FALSE(Sha256::WithEngine(*absent).has_value());
+    CHECK_FALSE(Sha256::Hash(Bytes("abc"), *absent).has_value());
+}
+
 TEST_CASE("The default Sha256 engine is the one selected for this CPU", "[core][sha256][engine]")
 {
     CHECK(ActiveSha256Engine() == SelectSha256Engine(DetectCpuFeatures()));
     CHECK(Sha256 {}.Engine() == ActiveSha256Engine());
-    CHECK(Sha256 { Sha256Engine::Scalar }.Engine() == Sha256Engine::Scalar);
+    CHECK(HasherOn(Sha256Engine::Scalar).Engine() == Sha256Engine::Scalar);
 }
 
 TEST_CASE("HmacSha256 matches the RFC 4231 vectors", "[core][sha256][hmac]")
