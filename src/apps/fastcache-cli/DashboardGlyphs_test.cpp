@@ -137,7 +137,7 @@ TEST_CASE("the ASCII rung's glyphs are all ASCII", "[cli][dashboard][glyphs]")
     auto const pieces =
         std::vector<std::string_view> { ascii.noReading,   ascii.horizontal,  ascii.vertical,   ascii.topLeft,
                                         ascii.topRight,    ascii.bottomRight, ascii.bottomLeft, ascii.gaugeOpen,
-                                        ascii.gaugeFilled, ascii.gaugeEmpty,  ascii.gaugeClose };
+                                        ascii.gaugeFilled, ascii.gaugeHeld,   ascii.gaugeEmpty, ascii.gaugeClose };
     for (auto const piece: pieces)
         for (auto const byte: piece)
             CHECK(static_cast<unsigned char>(byte) < 0x80U);
@@ -223,6 +223,30 @@ TEST_CASE("fitting text measures cells, not bytes or code points", "[cli][dashbo
     CHECK(FakeCellWidth(FitRight(wideA + wideB + "c", 3, &FakeCellWidth)) == 3);
     CHECK(FitRight(combining + "x", 2, &FakeCellWidth) == combining + "x");
     CHECK(AlignRight(wideA, 4, &FakeCellWidth) == "  " + wideA);
+}
+
+TEST_CASE("a slot gauge draws what runs, what is available beside it, and what a limit withdrew", "[cli][dashboard][glyphs]")
+{
+    // WHAT DISTINGUISHES: three runs of three glyphs whose lengths are the three shares, so a gauge drawing
+    // `available` from the left edge, or folding withdrawn into held, reads a different string.
+    auto const& ascii = GlyphsFor(RenderRung::Ascii);
+    auto const joined = [](SlotGauge const& gauge) {
+        return gauge.open + gauge.running + gauge.held + gauge.withdrawn + gauge.close;
+    };
+    CHECK(joined(SlotGaugeOf(6, 12, 16, 16, ascii)) == "[######======....]");
+    // Nothing withdrawn: the node offers every slot it registered.
+    CHECK(joined(SlotGaugeOf(3, 8, 8, 8, ascii)) == "[###=====]");
+    // More running than is available now (a limit arrived under running work): no held cells, never fewer running.
+    auto const over = SlotGaugeOf(6, 2, 16, 16, ascii);
+    CHECK(over.running == "######");
+    CHECK(over.held.empty());
+    CHECK(over.withdrawn == "..........");
+    // A node registered with no slots draws its whole width withdrawn rather than dividing by zero.
+    CHECK(joined(SlotGaugeOf(0, 0, 0, 4, ascii)) == "[....]");
+    // The width is kept on the Unicode rung, each glyph one cell.
+    auto const unicode = SlotGaugeOf(6, 12, 16, 16, GlyphsFor(RenderRung::Unicode));
+    CHECK(FakeCellWidth(unicode.running + unicode.held + unicode.withdrawn) == 16);
+    CHECK(unicode.held == "▒▒▒▒▒▒");
 }
 
 TEST_CASE("a gauge fills in proportion and keeps its width", "[cli][dashboard][glyphs]")
