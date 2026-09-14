@@ -186,7 +186,14 @@ SUPPRESSIONS="${REPO_ROOT}/.tsan-suppressions"
 # `Cache/ShardedStorage_test.cpp` (the tree's one explicit concurrency stress
 # case), `[expiry]` for `Cache/ExpiryReaper_test.cpp`, `[clock]` for
 # `Core/Clock_test.cpp`, `[pubsub]` for `Protocol/RedisRespSocket_test.cpp`,
-# `[server]` for the two threaded `Server/` files.
+# `[server]` for the two threaded `Server/` files. `[reactor]` also reaches
+# `Protocol/LiveStreamReactors_test.cpp`, one live-stats stream served on two real
+# reactors (#1399) -- and `[livestats]` is deliberately NOT a row: its other cases
+# drive one `TestReactor` on one thread, where ThreadSanitizer has no second thread
+# to observe, so the tag would lengthen the run and read as race coverage it is not.
+# Measured on 78582087, Linux, clang-tsan, `-DFASTCACHED_ENABLE_TLS=ON`, Catch2's own
+# `matching test cases` line: this expression 903, with `[livestats]` added 921 --
+# the 18 it would add are exactly its cases outside every tag here, 0 of them threaded.
 #
 # MEASURED 2026-09-11 on 9c5cc374, Linux, with `-DFASTCACHED_ENABLE_TLS=ON` --
 # what the clang-tsan job passes, and the condition that decides the number:
