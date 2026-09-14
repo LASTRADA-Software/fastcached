@@ -9,7 +9,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <optional>
 #include <span>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -75,22 +77,71 @@ struct ChartRaster
     std::size_t height { 0 };       ///< Pixels down.
 };
 
-/// How @p metric's points across @p history look as a heatmap of @p width by @p height pixels.
+/// How many samples a chart's width can stand for: the chart draws the fewest of these that holds its history.
 ///
-/// **One band per machine, time across, the newest at the right edge.** Machines are ordered by key,
-/// so a machine keeps its band from frame to frame; a sample gets `width / samples` pixel columns,
-/// at least one, and a history longer than the width shows its newest `width` samples. A machine a
-/// sample carried no point for -- including a sample that read nothing at all -- is TRANSPARENT there:
-/// the gap the terminal's background shows through, never a colour a value could have. Pixels no band
-/// or sample reaches are transparent too.
+/// **A fixed span rather than whatever the history holds.** Sized to the history, three samples filled the
+/// whole width as three blocks, which is the "block-like in one colour or another" nobody could read. With a
+/// fixed span a sample keeps its width until the span steps up, the readings not yet taken are blank at the
+/// left, and the axis can name a span a person reads.
+inline constexpr auto ChartWindows = std::to_array<std::size_t>({ 30, 60, 120, HistoryCapacity });
+
+/// The span a chart of @p samples draws.
+/// @param samples How many history entries there are.
+/// @return The first `ChartWindows` entry holding them; the last when none does.
+[[nodiscard]] std::size_t ChartWindowFor(std::size_t samples) noexcept;
+
+/// One machine the chart draws a band for.
+struct ChartBand
+{
+    std::string subject {};          ///< The machine's key, as the document names it.
+    std::optional<double> latest {}; ///< Its scaled figure in the newest sample; none when that sample did not read it.
+};
+
+/// Every machine @p metric has a point for in the newest @p window samples of @p history, in key order.
+///
+/// Key order, so a machine keeps its band from frame to frame as others come and go.
 /// @param history The model's history.
 /// @param metric Which figure.
-/// @param width Pixels across; at least one.
-/// @param height Pixels down; at least one.
+/// @param window How many of the newest samples count.
+/// @return The bands; empty when no sample read the figure.
+[[nodiscard]] std::vector<ChartBand> FleetChartBands(std::deque<HistoryEntry> const& history,
+                                                     FleetChartMetric const& metric,
+                                                     std::size_t window);
+
+/// How @p metric's points across @p history look for @p bands, as @p width by @p height pixels.
+///
+/// **One band per machine, in @p bands' order, time across with the newest sample at the right edge.** A
+/// sample is `width / window` pixel columns wide, at least one, so the chart fills from the right as the
+/// history grows.
+///
+/// **Within a band a reading is a bar rising from the band's floor**, as tall as the value is of
+/// `metric.full` -- at least a pixel for any value above zero -- in the ramp colour for it, over a grey
+/// track the band's height. So:
+///   - zero is the track alone;
+///   - a machine a sample did not read is TRANSPARENT there, including a sample that read nothing at all:
+///     the terminal's background, never a colour a value could have;
+///   - one machine at a steady load is a bar of one height across time.
+///
+/// A band four or more pixels tall leaves its top row transparent, so neighbouring machines do not merge.
+/// Pixels no band or sample reaches are transparent.
+/// @param history The model's history.
+/// @param metric Which figure.
+/// @param bands The machines, top to bottom.
+/// @param window The samples the width stands for; see `ChartWindowFor`.
+/// @param width Pixels across.
+/// @param height Pixels down.
 /// @return The raster.
 [[nodiscard]] ChartRaster FleetChartRaster(std::deque<HistoryEntry> const& history,
                                            FleetChartMetric const& metric,
+                                           std::span<ChartBand const> bands,
+                                           std::size_t window,
                                            std::size_t width,
                                            std::size_t height);
+
+/// The legend's colour scale: the chart ramp's steps across @p width by @p height pixels, coldest at the left.
+/// @param width Pixels across.
+/// @param height Pixels down.
+/// @return The raster.
+[[nodiscard]] ChartRaster FleetChartScale(std::size_t width, std::size_t height);
 
 } // namespace FastCache::Cli

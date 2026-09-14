@@ -189,11 +189,20 @@ struct TierColumn
 ///
 /// **The chart is the Sixel rung's alone** (#134's decision on Sixel): on that rung, with a cell size the
 /// terminal reported and an encoder to draw it, the first `FleetChartMetrics` row is drawn per machine
-/// across the history as one image over at least `chartCellsHigh` rows of blank cells, placed in the
-/// frame and dropped for height at `chartPriority` like any other item. **It yields rows to the table**:
-/// it goes before a machine row is hidden, and it grows into rows nothing else wants, up to
-/// `chartCellsHighMost`. On every other rung there is no chart row at all -- not blank rows, not a glyph
-/// imitation.
+/// across a fixed span of samples, and dropped for height at `chartPriority` like any other item. On every
+/// other rung there is no chart row at all -- not blank rows, not a glyph imitation.
+///
+/// **The chart explains itself** (#134 F14; the owner could not tell what a band of colour meant). It is
+/// one item, so it goes whole:
+///   - a title naming the figure and the span it covers;
+///   - a row per machine, its name and newest figure left of the image, the band beside them;
+///   - the time axis under the image, from how long ago its left edge is to `now`;
+///   - a legend: the colour scale as a second image between its two values, and what a bar, the grey
+///     track and a blank mean.
+///
+/// It starts at a band of one row for each of the first `chartCellsHigh` machines by name. **It yields rows
+/// to the table**: it goes before a machine row is hidden, and it grows into rows nothing else wants -- more
+/// machines first, then taller bands up to `chartBandCellsMost` -- up to `chartCellsHighMost` rows of image.
 ///
 /// The headline tiles are the `kpi` section's rows, in `Distributed::FleetKpis()` order, under the
 /// page's own labels and with its nouns (`of 192 slots`, `not yet resolved`); a figure the page draws a
@@ -207,8 +216,9 @@ struct TierColumn
 /// is not shown and how to reach it (`... 8 more machines; PgDn scrolls, / filters`).
 struct DocumentSpec
 {
-    std::size_t chartCellsHigh { 6 };                  ///< The fewest rows of cells the Sixel chart covers.
-    std::size_t chartCellsHighMost { 16 };             ///< The most it grows to, into rows nothing else wants.
+    std::size_t chartCellsHigh { 6 };                  ///< The most machines the chart bands before it grows.
+    std::size_t chartCellsHighMost { 16 };             ///< The most rows of image it grows to, into rows nothing else wants.
+    std::size_t chartBandCellsMost { 3 };              ///< The most rows of cells one machine's band grows to.
     std::size_t chartMinimumCells { 24 };              ///< The fewest cells across the chart is drawn in; narrower, it goes.
     std::size_t tableRowsKept { 3 };                   ///< The rows a table keeps before the tiles go.
     Priority tilePriority { Priority::Normal };        ///< When a line of tiles goes, for height.
