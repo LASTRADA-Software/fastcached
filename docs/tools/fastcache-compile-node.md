@@ -1383,6 +1383,13 @@ knows** — because the question an operator usually has is "what *can* I set", 
 report listing only what somebody had already set would answer it wrongly by
 omission.
 
+A member with no scheduler endpoint says why: `scheduler=- (never-announced)` is a
+member that has not led, which is ordinary, and `scheduler=- (cleared)` is one whose
+endpoint a `--cluster-admit` (or an enrollment re-approval) wiped. Re-admitting
+replaces both of a member's endpoints, because a node that moved moved both ports; a
+cleared endpoint comes back when that member next leads. The fleet page's
+`scheduler-endpoint-state` column says the same.
+
 ### `lease-lifetime`: telling the fleet your translation units are long
 
 ```sh

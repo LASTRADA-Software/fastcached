@@ -192,6 +192,11 @@ address, never by whether it is empty: an empty one never reaches the wire.
 (`ClusterStatus`) and report different halves of its answer, because each is a
 table in its own right and this tool's unit is a table `--format=json` can carry.
 
+In `cluster-members`, `scheduler` is an address or absent, and `scheduler-state`
+says which: `announced`, `never-announced` (a member that has not led, which is
+ordinary), or `cleared` (a re-admit wiped the endpoint it had; it returns when that
+member next leads).
+
 `cluster-settings` lists **every setting this build knows**, whether or not the
 cluster has agreed one — the question is usually *what can I set*, and a report
 showing only what somebody already set answers it wrongly by omission. A setting

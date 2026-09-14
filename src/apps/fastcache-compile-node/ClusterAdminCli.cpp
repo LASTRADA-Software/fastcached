@@ -73,11 +73,15 @@ std::string RenderClusterState(Cluster::ClusterState const& state)
         // that merely showed no rows would read as a rendering problem.
         out += "  (none)\n";
     for (auto const& member: state.members)
-        out += std::format("  {:<{}} raft={} scheduler={}\n",
-                           member.id,
-                           IdColumn,
-                           member.raftEndpoint,
-                           member.schedulerEndpoint.empty() ? std::string { Absent } : member.schedulerEndpoint);
+    {
+        // An absent endpoint says WHY (#1340): a member that never led and one a
+        // re-admit cleared both carry none, and only the second had one to lose. The
+        // word comes from the table every member renderer spells it from.
+        auto const scheduler = member.schedulerEndpoint.empty()
+                                   ? std::format("{} ({})", Absent, Cluster::SchedulerEndpointStateName(member))
+                                   : member.schedulerEndpoint;
+        out += std::format("  {:<{}} raft={} scheduler={}\n", member.id, IdColumn, member.raftEndpoint, scheduler);
+    }
 
     out += std::format("settings ({}):\n", state.settings.size());
     if (state.settings.empty())
@@ -107,8 +111,11 @@ std::expected<std::string, std::string> InterpretClusterReply(ClusterAction acti
             if (!state.has_value())
                 // A leader running a build whose state format this one does not know.
                 // Refused rather than rendered as an empty cluster, which is what a
-                // partial read would look like and would be read as a fact.
-                return std::unexpected { std::string { "the leader's reply is in a format this build cannot read" } };
+                // partial read would look like and would be read as a fact -- and the
+                // decoder's reason travels with it, so a version mismatch names both
+                // versions rather than reading as damage.
+                return std::unexpected { std::format("the leader's reply is in a format this build cannot read: {}",
+                                                     state.error().context) };
             return RenderClusterState(*state);
         }
 

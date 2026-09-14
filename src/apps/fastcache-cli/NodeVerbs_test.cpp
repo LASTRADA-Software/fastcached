@@ -809,11 +809,19 @@ TEST_CASE("cluster-members reports who the cluster agreed on, and an unled membe
     // The two states a `schedulerEndpoint` has, side by side in one reply. A member that
     // has never led carries none -- a leader announces its own record on election -- so
     // the empty string is the ORDINARY case and rendering it as a value would hand an
-    // operator an address to paste that reaches nothing.
-    ScriptedNodeExchange node { { ClusterStatusReply(
-        { .members = { { .id = "node-a", .raftEndpoint = "10.0.0.7:6675", .schedulerEndpoint = "10.0.0.7:6674" },
-                       { .id = "node-b", .raftEndpoint = "10.0.0.8:6675", .schedulerEndpoint = {} } },
-          .settings = {} }) } };
+    // operator an address to paste that reaches nothing. Built through `Apply`, which is how a
+    // leader acquires the state this reply carries: a member literal with an endpoint and no
+    // announcement recorded is a state `DecodeState` refuses, because `Apply` never makes it.
+    Cluster::ClusterState state;
+    Apply(state,
+          Cluster::Command { .kind = Cluster::CommandKind::AddMember,
+                             .key = "node-a",
+                             .value = "10.0.0.7:6675",
+                             .schedulerEndpoint = "10.0.0.7:6674" });
+    Apply(state,
+          Cluster::Command {
+              .kind = Cluster::CommandKind::AddMember, .key = "node-b", .value = "10.0.0.8:6675", .schedulerEndpoint = {} });
+    ScriptedNodeExchange node { { ClusterStatusReply(state) } };
 
     auto const answer = RunNodeVerb("cluster-members", node);
     CHECK(answer.outcome == Outcome::Affirmative);
@@ -835,6 +843,43 @@ TEST_CASE("cluster-members reports who the cluster agreed on, and an unled membe
     // TSV field collapses under `IFS=$'\t' read` and shifts every field after it.
     CHECK(rows[1][id].lexical == "node-b");
     CHECK(rows[1][scheduler].kind == CellKind::Absent);
+}
+
+TEST_CASE("cluster-members says which absence a scheduler endpoint is: never announced or cleared", "[cli][node][cluster]")
+{
+    // #1340. Both members' `scheduler` cell is ABSENT, and must stay so -- only one of
+    // them ever had an address, and a re-admit applied wholesale took it. So the
+    // discrimination is in `scheduler-state`, asserted on BOTH rows: a case rendering one
+    // of them passes on a build where both read alike. Built through `Apply`, which is how
+    // a leader acquires the state this reply carries.
+    Cluster::ClusterState state;
+    auto const admit = [&state](std::string id, std::string raft, std::string scheduler) {
+        Apply(state,
+              Cluster::Command { .kind = Cluster::CommandKind::AddMember,
+                                 .key = std::move(id),
+                                 .value = std::move(raft),
+                                 .schedulerEndpoint = std::move(scheduler) });
+    };
+    admit("node-b", "10.0.0.8:6675", {});
+    admit("node-c", "10.0.0.9:6675", "10.0.0.9:6674");
+    admit("node-c", "10.0.0.9:6675", {});
+
+    ScriptedNodeExchange node { { ClusterStatusReply(state) } };
+    auto const answer = RunNodeVerb("cluster-members", node);
+    CHECK(answer.outcome == Outcome::Affirmative);
+
+    auto const& rows = RowsOf(answer);
+    REQUIRE(rows.size() == 2);
+    auto const id = ColumnOf(answer, "id");
+    auto const scheduler = ColumnOf(answer, "scheduler");
+    auto const schedulerState = ColumnOf(answer, "scheduler-state");
+
+    CHECK(rows[0][id].lexical == "node-b");
+    CHECK(rows[1][id].lexical == "node-c");
+    CHECK(rows[0][scheduler].kind == CellKind::Absent);
+    CHECK(rows[1][scheduler].kind == CellKind::Absent);
+    CHECK(rows[0][schedulerState].lexical == "never-announced");
+    CHECK(rows[1][schedulerState].lexical == "cleared");
 }
 
 TEST_CASE("cluster-settings names every key this build knows, set or not", "[cli][node][cluster]")
@@ -995,6 +1040,23 @@ TEST_CASE("a cluster reply this build cannot read is REFUSED, not rendered as an
     auto const answer = RunNodeVerb("cluster-members", node);
     CHECK(answer.outcome == Outcome::Protocol);
     CHECK(AdvisoryText(answer).contains("cannot read"));
+}
+
+TEST_CASE("a cluster reply another build encoded is refused by its version", "[cli][node][cluster]")
+{
+    // The same refusal as above, for the cause an upgrade produces -- and it says so,
+    // because *cannot read* alone fits a damaged body too and the two send an operator
+    // to different machines.
+    auto body = Cluster::Encode(Cluster::ClusterState { .members = {}, .settings = {} });
+    // The state's version is the first field's only byte, after its u32 length prefix.
+    REQUIRE(body.size() > 4);
+    body[4] = std::byte { 2 };
+    ScriptedNodeExchange node { { Cc::EncodeReply(Cc::Status::Ok, body) } };
+
+    auto const answer = RunNodeVerb("cluster-members", node);
+    CHECK(answer.outcome == Outcome::Protocol);
+    CHECK(AdvisoryText(answer).contains("cannot read"));
+    CHECK(AdvisoryText(answer).contains("version 2"));
 }
 
 TEST_CASE("the cluster verbs send the opcodes the wire table names", "[cli][node][cluster]")

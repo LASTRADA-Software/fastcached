@@ -1314,11 +1314,16 @@ namespace
             // election -- so it is a member that has not said, never a member reachable
             // at the empty string. A blank cell would read as a rendering fault, and a
             // zero would be a claim.
+            //
+            // And `scheduler-state` says which absence (#1340): never announced, or
+            // cleared by a re-admit. A column of its own rather than a word in the
+            // endpoint cell, so `scheduler` stays an address or ABSENT in every format.
             rows.push_back({ TextCell(member.id),
                              TextCell(member.raftEndpoint),
-                             member.schedulerEndpoint.empty() ? AbsentCell() : TextCell(member.schedulerEndpoint) });
+                             member.schedulerEndpoint.empty() ? AbsentCell() : TextCell(member.schedulerEndpoint),
+                             TextCell(std::string { Cluster::SchedulerEndpointStateName(member) }) });
 
-        return TableValue({ "id", "raft", "scheduler" }, std::move(rows));
+        return TableValue({ "id", "raft", "scheduler", "scheduler-state" }, std::move(rows));
     }
 
     /// Every setting this build knows, with what the cluster has agreed for it.
@@ -1377,9 +1382,13 @@ namespace
             // A leader running a build whose state format this one does not know.
             // REFUSED rather than rendered as an empty cluster: a partial read looks
             // exactly like a fleet that admits nobody, and that would be read as a fact.
-            return std::unexpected(Concluded(
-                Outcome::Protocol,
-                std::format("{} answered cluster-status with a body this client cannot read", context.node->Address())));
+            // The decoder's reason rides along, so another build's encoding is named by
+            // its version rather than reading as damage.
+            return std::unexpected(
+                Concluded(Outcome::Protocol,
+                          std::format("{} answered cluster-status with a body this client cannot read: {}",
+                                      context.node->Address(),
+                                      state.error().context)));
 
         return std::move(*state);
     }

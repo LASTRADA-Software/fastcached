@@ -572,6 +572,40 @@ TEST_CASE("A node running no cluster reports no members rather than an empty clu
     CHECK(RenderFleetJson(snapshot, NoHistory()).contains(R"("members":[])"));
 }
 
+TEST_CASE("A member that never announced and one a re-admit cleared render differently", "[distributed][fleetview]")
+{
+    // #1340. Both carry no scheduler endpoint -- the endpoint cell is absent for both,
+    // and must stay so -- and only one of them ever had an address to lose. Built
+    // through `Apply`, which is how a leader acquires the state this page reads; a
+    // literal would assert the representation rather than what the cluster records.
+    auto snapshot = LeadingSnapshot();
+    Cluster::ClusterState state;
+    Apply(state,
+          Cluster::Command {
+              .kind = Cluster::CommandKind::AddMember, .key = "quiet", .value = "10.0.0.1:6675", .schedulerEndpoint = {} });
+    Apply(state,
+          Cluster::Command { .kind = Cluster::CommandKind::AddMember,
+                             .key = "moved",
+                             .value = "10.0.0.2:6675",
+                             .schedulerEndpoint = "10.0.0.2:6676" });
+    Apply(state,
+          Cluster::Command {
+              .kind = Cluster::CommandKind::AddMember, .key = "moved", .value = "10.0.0.2:6675", .schedulerEndpoint = {} });
+    snapshot.cluster = state;
+
+    // The text section: one row each, and the rows differ in the state column while
+    // both endpoint cells are the absent marker. Members sort by id, so `moved` first.
+    auto const members = RenderFleetText(snapshot, NoHistory(), FleetSection::Members);
+    INFO(members);
+    CHECK(members.contains("moved\t10.0.0.2:6675\t-\tcleared\n"));
+    CHECK(members.contains("quiet\t10.0.0.1:6675\t-\tnever-announced\n"));
+
+    // And the JSON, where the endpoint stays `null` for both rather than becoming a word.
+    auto const json = RenderFleetJson(snapshot, NoHistory());
+    CHECK(json.contains(R"("scheduler-endpoint":null,"scheduler-endpoint-state":"cleared")"));
+    CHECK(json.contains(R"("scheduler-endpoint":null,"scheduler-endpoint-state":"never-announced")"));
+}
+
 TEST_CASE("A hostile fingerprint cannot escape the page or the document", "[distributed][fleetview][security]")
 {
     // Every value here came off a wire: a fingerprint and an endpoint are whatever

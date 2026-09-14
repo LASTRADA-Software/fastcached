@@ -226,6 +226,50 @@ TEST_CASE("A status request round-trips through the real protocol", "[node][clus
     CHECK(rendered->contains("fleet-open"));
 }
 
+TEST_CASE("A status report says whether an absent scheduler endpoint was never announced or cleared", "[node][clusteradmin]")
+{
+    // #1340. Both members carry no scheduler endpoint, and one of them HAD one until a
+    // re-admit applied wholesale. Read back through the reply body, because that is how
+    // the report acquires the state: a history the encoder dropped would render both
+    // alike from here and from nowhere else.
+    Cluster::ClusterState state;
+    Apply(state, Cmd(Cluster::CommandKind::AddMember, "quiet", "10.0.0.1:6680"));
+    Apply(state, Cmd(Cluster::CommandKind::AddMember, "moved", "10.0.0.2:6680", "10.0.0.2:6675"));
+    Apply(state, Cmd(Cluster::CommandKind::AddMember, "moved", "10.0.0.2:6680"));
+
+    auto const rendered = InterpretClusterReply(ClusterAction::Status, Cluster::Encode(state));
+    REQUIRE(rendered.has_value());
+
+    auto const lineOf = [&rendered](std::string_view id) {
+        auto const at = rendered->find(std::string { "  " } + std::string { id } + " ");
+        REQUIRE(at != std::string::npos);
+        return rendered->substr(at, rendered->find('\n', at) - at);
+    };
+    auto const quiet = lineOf("quiet");
+    auto const moved = lineOf("moved");
+    INFO(*rendered);
+
+    // What distinguishes, on each side, and the dash both still carry.
+    CHECK(quiet.contains("scheduler=- (never-announced)"));
+    CHECK(moved.contains("scheduler=- (cleared)"));
+    CHECK(quiet.substr(quiet.find("scheduler=")) != moved.substr(moved.find("scheduler=")));
+}
+
+TEST_CASE("A status reply another build encoded is refused by its version", "[node][clusteradmin]")
+{
+    // Not *a format this build cannot read* and nothing more: that sentence fits a
+    // damaged body as well, and the two send an operator to different machines.
+    auto body = Cluster::Encode(Agreed());
+    // The state's version is the first field's only byte, after its u32 length prefix.
+    REQUIRE(body.size() > 4);
+    body[4] = std::byte { 2 };
+
+    auto const refused = InterpretClusterReply(ClusterAction::Status, body);
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error().contains("cannot read"));
+    CHECK(refused.error().contains("version 2"));
+}
+
 TEST_CASE("A change reaches the cluster as the command it names", "[node][clusteradmin]")
 {
     Fixture fixture;

@@ -131,11 +131,12 @@ fault.
     had once, in its other spelling: a follower redirected clients to the leader's
     *consensus* port, which speaks nothing a client understands. That is also why
     a `dashboardEndpoint` on `ClusterMember` was refused rather than added --
-    `Cluster::ClusterState` is versioned and its decoder refuses any other version,
-    so a field costs a `StateVersion` bump that makes every existing on-disk
-    snapshot and log entry undecodable, and a half-upgraded cluster unable to apply
-    each other's entries. That is a consensus-format migration bought for a
-    diagnostic page.
+    a node announces it, so it travels in a command as well as in the state, and
+    both are versioned with decoders refusing any other version: the field costs a
+    `CommandVersion` bump that makes every existing log entry undecodable and a
+    half-upgraded cluster unable to apply each other's entries, plus a
+    `StateVersion` bump for every snapshot. That is a consensus-format migration
+    bought for a diagnostic page.
 - **The columns are a table every renderer walks, and the test asserts over the
   table.** The page, the JSON and `/fleet.txt` take one spelling per column -- it is
   the header cell, the JSON key *and* the text column -- so they cannot drift apart,

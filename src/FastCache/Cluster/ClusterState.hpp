@@ -2,6 +2,7 @@
 #pragma once
 
 #include <FastCache/Consensus/RaftTypes.hpp>
+#include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/Errors/ConsensusError.hpp>
 
 #include <algorithm>
@@ -18,6 +19,31 @@
 
 namespace FastCache::Cluster
 {
+
+/// Whether a member has ever had a scheduler endpoint recorded.
+///
+/// **Persisted and transmitted**: one byte per member, in a snapshot and in every
+/// `ClusterStatus` reply. The ordinals are explicit and append only, and `Last` never
+/// travels.
+///
+/// It exists because an empty `schedulerEndpoint` is two states (#1340). A member
+/// that has never led has not said, which is ordinary. A member whose endpoint a
+/// re-admit cleared HAD said, and `AddMember` wiped it wholesale -- right for a move,
+/// and reachable without one, because enrollment recovery re-approves through the same
+/// verb. The causes differ and so do the remedies, and the endpoint alone cannot tell
+/// them apart.
+///
+/// **A history rather than a three-state status**, because *announced* is already what
+/// a non-empty endpoint says: storing it a second time would be a second source of
+/// truth, while this records only what the endpoint cannot. `Apply` is the one writer,
+/// and `DecodeState` refuses the one combination `Apply` never produces -- an endpoint
+/// with no announcement behind it.
+enum class SchedulerEndpointHistory : std::uint8_t
+{
+    NeverAnnounced = 0, ///< No endpoint recorded since this id was admitted from absence.
+    Announced = 1,      ///< An endpoint was recorded at least once; empty now means cleared.
+    Last = 2,           ///< Not a history, and never travels. See `DecodeWireEnum`.
+};
 
 /// One member of the cluster, as the replicated state records it.
 ///
@@ -54,10 +80,57 @@ struct ClusterMember
     /// matters, and a leader announces its own record on election -- so the value is
     /// absent exactly for the members whose value nobody needs, and a bootstrap peer
     /// that has never led carries none rather than carrying a guess.
+    ///
+    /// Empty has a second cause, which `schedulerEndpointHistory` tells apart: a
+    /// re-admit clears it. A reader reporting WHY it is empty asks
+    /// `SchedulerEndpointStateOf`, never this field and a second guess.
     std::string schedulerEndpoint;
+
+    /// Whether `schedulerEndpoint` has ever held a value since this id was admitted.
+    SchedulerEndpointHistory schedulerEndpointHistory { SchedulerEndpointHistory::NeverAnnounced };
 
     [[nodiscard]] friend bool operator==(ClusterMember const&, ClusterMember const&) = default;
 };
+
+/// What a member's scheduler endpoint is, as a reader asks it.
+///
+/// Derived from `ClusterMember` and never stored or sent, so its ordinals carry no
+/// contract. It is the one question every renderer of a member asks, so the fleet page,
+/// `--cluster-status` and `fastcache-cli cluster-members` cannot answer it three ways.
+enum class SchedulerEndpointState : std::uint8_t
+{
+    Announced,      ///< Recorded: where clients reach the fleet while this member leads.
+    NeverAnnounced, ///< Never recorded. A member that has not led; the ordinary case.
+    Cleared,        ///< Recorded once and wiped by a re-admit; it returns when the member next leads.
+    Last,           ///< Not a state, and has no row: the length of a table keyed by one.
+};
+
+/// How one `SchedulerEndpointState` is spelled.
+struct SchedulerEndpointStateRow
+{
+    SchedulerEndpointState state; ///< The state this row describes.
+    std::string_view name;        ///< Its one spelling: a table cell, a JSON value and a report word alike.
+};
+
+/// One row per `SchedulerEndpointState`, in enumerator order.
+inline constexpr EnumTable<SchedulerEndpointState, SchedulerEndpointStateRow> SchedulerEndpointStateTable { {
+    { .state = SchedulerEndpointState::Announced, .name = "announced" },
+    { .state = SchedulerEndpointState::NeverAnnounced, .name = "never-announced" },
+    { .state = SchedulerEndpointState::Cleared, .name = "cleared" },
+} };
+
+static_assert(RowsInEnumeratorOrder(SchedulerEndpointStateTable, &SchedulerEndpointStateRow::state),
+              "SchedulerEndpointStateTable must hold one row per SchedulerEndpointState, in enumerator order");
+
+/// Which of the three states `member`'s scheduler endpoint is in.
+/// @param member The member.
+/// @return Announced when an endpoint is recorded; otherwise what its history says.
+[[nodiscard]] SchedulerEndpointState SchedulerEndpointStateOf(ClusterMember const& member) noexcept;
+
+/// The spelling of `member`'s scheduler endpoint state, from `SchedulerEndpointStateTable`.
+/// @param member The member.
+/// @return The row's name.
+[[nodiscard]] std::string_view SchedulerEndpointStateName(ClusterMember const& member) noexcept;
 
 /// Parse one `<id>=<host>:<port>` member specification.
 ///
@@ -353,10 +426,12 @@ struct ClusterState
 
     /// Where clients reach the fleet while `id` leads, if it has said.
     ///
-    /// Absent for a member that is not known **and** for one that has never
-    /// announced itself, which are deliberately the same answer here: both mean
-    /// there is nowhere to send a client, and a caller that told them apart would
-    /// have nothing different to do about it.
+    /// Absent for a member that is not known, for one that has never announced
+    /// itself **and** for one a re-admit cleared, which are deliberately the same
+    /// answer here: all three mean there is nowhere to send a client, and a caller
+    /// routing one would have nothing different to do about any of them. Telling the
+    /// last two apart is a question for a person reading a report, and
+    /// `SchedulerEndpointStateOf` answers it.
     /// @param id The member.
     /// @return Its scheduler endpoint, or nullopt.
     [[nodiscard]] std::optional<std::string> SchedulerEndpointOf(std::string_view id) const;
@@ -416,9 +491,10 @@ struct Command
     /// than leaving it. That is the right way round: a member is re-admitted when its
     /// record has changed, and a node that moved has moved both ports -- keeping the
     /// old scheduler endpoint would redirect clients to an address that member no
-    /// longer answers, which is worse than redirecting them nowhere. Refused for the
-    /// other two verbs, because a field a verb ignores is a field somebody
-    /// misunderstood.
+    /// longer answers, which is worse than redirecting them nowhere. The member keeps
+    /// the fact that it had one (`SchedulerEndpointHistory`), which `Apply` derives
+    /// rather than this command carrying it. Refused for the other two verbs, because a
+    /// field a verb ignores is a field somebody misunderstood.
     std::string schedulerEndpoint;
 
     [[nodiscard]] friend bool operator==(Command const&, Command const&) = default;
@@ -430,9 +506,15 @@ struct Command
 [[nodiscard]] std::vector<std::byte> Encode(Command const& command);
 
 /// Read a command back.
+///
+/// Refused **by name**, in the three ways a peer-wire frame is: another build's encoding is
+/// `UnsupportedVersion` with both versions stated, a verb this build does not know is
+/// `UnknownMessageType`, and only bytes that are not a command are `MalformedFrame`. A
+/// committed entry that will not decode is skipped, so the reason is what the log line
+/// says -- *upgrade that node* and *these bytes are damaged* are different remedies.
 /// @param payload The entry's payload.
-/// @return The command, or nullopt when it is malformed or names an unknown verb.
-[[nodiscard]] std::optional<Command> DecodeCommand(std::span<std::byte const> payload);
+/// @return The command; or why it is not one.
+[[nodiscard]] std::expected<Command, ConsensusError> DecodeCommand(std::span<std::byte const> payload);
 
 /// Serialize a whole state, for a snapshot.
 /// @param state The state.
@@ -440,9 +522,15 @@ struct Command
 [[nodiscard]] std::vector<std::byte> Encode(ClusterState const& state);
 
 /// Read a whole state back.
-/// @param bytes A snapshot previously produced by `Encode`.
-/// @return The state, or nullopt when the bytes are malformed.
-[[nodiscard]] std::optional<ClusterState> DecodeState(std::span<std::byte const> bytes);
+///
+/// A state another build encoded is refused **by name** -- `UnsupportedVersion`, with
+/// both versions in the context -- and never as `MalformedFrame`. The version is how a
+/// mismatch is detected, and a reader told only *malformed* is sent looking for damage
+/// in bytes that are intact.
+/// @param bytes A snapshot or a `ClusterStatus` body previously produced by `Encode`.
+/// @return The state; `UnsupportedVersion` for another build's encoding, `MalformedFrame`
+///         for bytes that are not a state.
+[[nodiscard]] std::expected<ClusterState, ConsensusError> DecodeState(std::span<std::byte const> bytes);
 
 /// Apply one command, in place.
 ///
