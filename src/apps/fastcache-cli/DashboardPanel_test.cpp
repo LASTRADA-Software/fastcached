@@ -2038,9 +2038,9 @@ TEST_CASE("below the Sixel rung, or without a cell size, the fleet chart is text
           "[cli][dashboard][panel][fleet][chart]")
 {
     // One layout, two ways to draw its bands. WHAT DISTINGUISHES: the Unicode frame asks the encoder for nothing and
-    // places nothing, yet its chart title is there and its strip sits on exactly the Sixel frame's row -- a text
-    // chart laid out apart from the image one would move it -- and a Sixel rung with no cell size draws exactly the
-    // Unicode frame, since no size is ever guessed.
+    // places nothing, yet its chart title is there, on the Sixel frame's row, and its strip is lower only by its
+    // spacer rows -- and a Sixel rung with no cell size draws exactly the Unicode frame, since no size is ever
+    // guessed.
     auto const sixel = DrawChart(RenderRung::Sixel, ChartCell, 100, 60);
     auto const unicode = DrawChart(RenderRung::Unicode, ChartCell, 100, 60);
     auto const unmeasured = DrawChart(RenderRung::Sixel, std::nullopt, 100, 60);
@@ -2050,7 +2050,12 @@ TEST_CASE("below the Sixel rung, or without a cell size, the fleet chart is text
     CHECK(unicode.requests.empty());
     CHECK(unicode.placements.at(0).empty());
     CHECK(unicode.frames[0].contains(std::format("{} per machine, last ", FleetChartMetrics.front().key)));
-    CHECK(LineIndexHolding(unicode.frames[0], "[machines]") == LineIndexHolding(sixel.frames.at(0), "[machines]"));
+    // The same layout: the title on the same row, and the strip lower by exactly the text chart's two spacer rows,
+    // one between each two of its three bands (#134 F-b) -- here the bands are at their tallest on both rungs, so the
+    // spacers are rows the image left over. A text chart laid out apart from the image one would move either.
+    CHECK(LineIndexHolding(unicode.frames[0], " per machine, last ")
+          == LineIndexHolding(sixel.frames.at(0), " per machine, last "));
+    CHECK(LineIndexHolding(unicode.frames[0], "[machines]") == LineIndexHolding(sixel.frames.at(0), "[machines]") + 2);
     CHECK(unmeasured.requests.empty());
     CHECK(unmeasured.placements.at(0).empty());
     CHECK(unmeasured.frames[0] == unicode.frames[0]);
@@ -2905,6 +2910,20 @@ struct ChartLines
     std::size_t title { 0 };           ///< The title's line.
     std::vector<std::size_t> bands {}; ///< Each band's first line.
     std::size_t axis { 0 };            ///< The axis's line.
+
+    /// Rows of marks per band, read off the last band, which runs to the axis with no spacer under it.
+    /// @return The rows.
+    [[nodiscard]] std::size_t BandRows() const noexcept
+    {
+        return axis - bands.back();
+    }
+
+    /// Blank rows between two bands: how far apart the first two start, less a band's rows.
+    /// @return The rows; zero for a chart of one band.
+    [[nodiscard]] std::size_t Spacer() const noexcept
+    {
+        return bands.size() < 2 ? 0 : (bands[1] - bands[0]) - std::min(bands[1] - bands[0], BandRows());
+    }
 };
 
 /// The history chart of @p frame, found by its title and its band labels in @p spec's `charts` order.
@@ -2989,11 +3008,15 @@ TEST_CASE("a node panel at 80x24 draws no history chart, and one with rows to sp
     auto const refused =
         std::ranges::find_if(lines, [](std::string const& line) { return Inside(line).starts_with("refused/min"); });
     CHECK(std::cmp_less(refused - lines.begin(), chart.title));
-    auto const height = chart.bands[1] - chart.bands[0];
+    // Every band the same height, and one blank row apart (#134 F-b): stacked marks from two bands would run together.
+    auto const height = chart.BandRows();
     CHECK(height > 1);
+    CHECK(chart.Spacer() == 1);
     for (auto const index: std::views::iota(std::size_t { 1 }, chart.bands.size()))
-        CHECK(chart.bands[index] - chart.bands[index - 1] == height);
-    CHECK(chart.axis == chart.bands.back() + height);
+    {
+        CHECK(chart.bands[index] - chart.bands[index - 1] == height + 1);
+        CHECK(Inside(lines.at(chart.bands[index] - 1)).empty());
+    }
     CHECK(Inside(lines.at(chart.axis + 1)).ends_with("blank: no reading"));
     CHECK(lines.size() <= 40);
     // Every band's first row says what its top stands for, since a bar's height means nothing without it.
@@ -3015,7 +3038,7 @@ TEST_CASE("a node's history band draws zero as the floor mark and a sample not r
     auto const chart = WholeChart(NodeChartIn(frame));
     auto const lines = Lines(frame);
     auto const first = chart.bands[0];
-    auto const height = chart.bands[1] - first;
+    auto const height = chart.BandRows();
     auto const fromRight = [](int index) {
         return static_cast<std::size_t>((Count - 1) - index);
     };
@@ -3041,7 +3064,7 @@ TEST_CASE("a taller node terminal grows taller bands, and a wider one a longer s
     auto const smallChart = WholeChart(NodeChartIn(small));
     auto const largeChart = WholeChart(NodeChartIn(large));
     auto const bandHeight = [](ChartLines const& chart) {
-        return chart.bands[1] - chart.bands[0];
+        return chart.BandRows();
     };
     CHECK(bandHeight(largeChart) > bandHeight(smallChart));
     CHECK(bandHeight(largeChart) <= NodePanel().chartGrowth.bandCellsMost);
@@ -3096,6 +3119,8 @@ TEST_CASE("a node's history chart grows band by band in the table's order", "[cl
     auto const two = NodeChartIn(NodeHistoryFrame(history, 120, Unwrap(first) + 1));
     REQUIRE(two.has_value());
     CHECK(Unwrap(two).bands.size() == 2);
+    // Two one-row bands are packed: a spacer would cost a band the row it is drawn in.
+    CHECK(Unwrap(two).bands[1] - Unwrap(two).bands[0] == 1);
 }
 
 TEST_CASE("on the Sixel rung a node's history is one image over its bands' rows, with its colour scale",
@@ -3127,6 +3152,8 @@ TEST_CASE("on the Sixel rung a node's history is one image over its bands' rows,
     auto const& image = placements.front();
     auto const rows = chart.axis - chart.bands.front();
     CHECK(image.cellsHigh == rows);
+    // An image is not spaced: its bands draw their own gap, so the rows it covers are the bands' rows alone.
+    CHECK(rows == chart.bands.size() * chart.BandRows());
     // A frame row is its content line plus one: the top edge is line 0 of the frame text.
     CHECK(image.row == chart.bands.front() + 1);
     auto const lines = Lines(frame);
@@ -3285,13 +3312,12 @@ TEST_CASE("a cache panel at 80x24 draws no history chart, and one with rows to s
     CHECK(lines.size() == 40);
     CHECK(IndexStarting(lines, "expired/s") < chart.title);
     CHECK(chart.axis < IndexStarting(lines, "items"));
-    auto const height = chart.bands[1] - chart.bands[0];
+    auto const height = chart.BandRows();
     for (auto const index: std::views::iota(std::size_t { 1 }, chart.bands.size()))
-        CHECK(chart.bands[index] - chart.bands[index - 1] == height);
-    CHECK(chart.axis == chart.bands.back() + height);
+        CHECK(chart.bands[index] - chart.bands[index - 1] == height + chart.Spacer());
 
     auto const tall = WholeChart(ChartIn(CacheHistoryFrame(history, 200, 60), CachePanel()));
-    CHECK(tall.bands[1] - tall.bands[0] > height);
+    CHECK(tall.BandRows() > height);
 }
 
 TEST_CASE("a cache's history tells an idle interval from one with no reading: zero operations, and no hit rate",
@@ -3307,7 +3333,7 @@ TEST_CASE("a cache's history tells an idle interval from one with no reading: ze
     INFO(frame);
     auto const chart = WholeChart(ChartIn(frame, CachePanel()));
     auto const lines = Lines(frame);
-    auto const height = chart.bands[1] - chart.bands[0];
+    auto const height = chart.BandRows();
     auto const cellAt = [&lines](std::size_t row, int index) {
         auto const cells = NewestCells(lines.at(row), Count);
         return cells.at(static_cast<std::size_t>(index));
@@ -3408,6 +3434,7 @@ TEST_CASE("on the Sixel rung a cache's history is one image over its bands' rows
     REQUIRE(placements.size() == 2);
     auto const& image = placements.front();
     CHECK(image.cellsHigh == chart.axis - chart.bands.front());
+    CHECK(image.cellsHigh == chart.bands.size() * chart.BandRows());
     CHECK(image.row == chart.bands.front() + 1);
     auto const lines = Lines(frame);
     for (auto const row: std::views::iota(chart.bands.front(), chart.axis))
@@ -4065,22 +4092,14 @@ TEST_CASE("before any machine reports the chart's figure, the chart says so on e
 namespace
 {
 
-/// Where a fleet frame's text chart is: the title's line, each machine band's first line, and the axis's line.
-struct FleetTextChart
-{
-    std::size_t title { 0 };           ///< The title's line.
-    std::vector<std::size_t> bands {}; ///< Each band's first line, top to bottom.
-    std::size_t axis { 0 };            ///< The axis's line.
-};
-
 /// The text chart in @p frame over @p machines, found by its title and then each machine's first band line.
 /// @param frame The frame.
 /// @param machines The bands' labels, top to bottom.
 /// @return The lines; the case fails where a line is missing.
-[[nodiscard]] FleetTextChart FleetTextChartIn(std::string_view frame, std::span<std::string_view const> machines)
+[[nodiscard]] ChartLines FleetTextChartIn(std::string_view frame, std::span<std::string_view const> machines)
 {
     auto const lines = Lines(frame);
-    auto chart = FleetTextChart { .title = LineIndexHolding(frame, " per machine, last "), .bands = {}, .axis = 0 };
+    auto chart = ChartLines { .title = LineIndexHolding(frame, " per machine, last "), .bands = {}, .axis = 0 };
     REQUIRE(chart.title < lines.size());
     for (auto const machine: machines)
     {
@@ -4124,10 +4143,13 @@ TEST_CASE("on a text rung the fleet chart is the rung's marks: a sample a cell, 
     INFO(frame);
     auto const lines = Lines(frame);
     auto const chart = FleetTextChartIn(frame, Machines);
-    auto const bandCells = chart.bands[1] - chart.bands[0];
-    CHECK(bandCells >= 1);
-    CHECK(chart.bands[2] - chart.bands[1] == bandCells);
-    CHECK(chart.axis == chart.bands[2] + bandCells);
+    auto const bandCells = chart.BandRows();
+    CHECK(bandCells >= 2);
+    for (auto const index: { std::size_t { 1 }, std::size_t { 2 } })
+    {
+        CHECK(chart.bands[index] - chart.bands[index - 1] == bandCells + 1);
+        CHECK(Inside(lines.at(chart.bands[index] - 1)).empty());
+    }
     for (auto const index: std::views::iota(std::size_t { 0 }, Machines.size()))
     {
         INFO("band " << Machines[index]);
@@ -4207,8 +4229,8 @@ TEST_CASE("a text fleet chart bands the machines its cells read, and counts them
     REQUIRE(title.starts_with(lead));
     CHECK(std::stoul(title.substr(lead.size())) < 38);
     CHECK_FALSE(title.contains("by name"));
-    auto const bandCells = chart.bands[1] - chart.bands[0];
-    CHECK(chart.axis == chart.bands[1] + bandCells);
+    CHECK(chart.bands[1] - chart.bands[0] == chart.BandRows() + chart.Spacer());
+    CHECK(chart.Spacer() <= 1);
     for (auto const row: std::views::iota(chart.title, chart.axis + 2))
         CHECK_FALSE(lines.at(row).contains("build-03"));
 }

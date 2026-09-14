@@ -206,7 +206,8 @@ struct ChartGrowth
 /// **The chart explains itself** (#134 F14; the owner could not tell what a band of colour meant). It is
 /// one item, so it goes whole:
 ///   - a title naming the figure and the span it covers;
-///   - a row per machine, its name and newest figure left of the image, the band beside them;
+///   - a row per machine, its name and newest figure left of the image, the band beside them -- on a text rung
+///     one blank row apart where every band keeps two rows of marks;
 ///   - the time axis under the image, from how long ago its left edge is to `now`;
 ///   - a legend: on the Sixel rung the colour scale as a second image between its two values, and what a bar,
 ///     the grey track and a blank mean; on a text rung the zero mark, the full cell, and the top every band has.
