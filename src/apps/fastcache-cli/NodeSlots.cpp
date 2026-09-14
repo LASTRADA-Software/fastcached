@@ -50,17 +50,41 @@ std::optional<NodeSlots> NodeSlotsOf(StatsReading const* previous, StatsReading 
                              .cpuBusyPermille = std::nullopt,
                              .availableMemoryBytes = std::nullopt };
 
+    // A cordon is KNOWN from one reading, whatever the CPU says, and it binds whatever the
+    // resources say (#1303) -- so the two early returns below, which exist because a limit
+    // cannot be named yet, do not apply to it. Stating nothing for a cordoned node would tell
+    // an operator nothing holds it back while the scheduler gives it no work at all.
+    auto const cordoned = host.cordoned != 0;
+    auto const cordonOnly = [&] {
+        return Distributed::SlotCeilingsFor(Distributed::NodeCapacity { .logicalCores = Saturated(host.logicalCores) },
+                                            slots.registered,
+                                            Distributed::NodeLoad { .inFlight = slots.inFlight,
+                                                                    .cpuBusyPermille = std::nullopt,
+                                                                    .availableMemoryBytes = std::nullopt,
+                                                                    .freeScratchBytes = host.diskFreeBytes,
+                                                                    .cache = {},
+                                                                    .cordoned = true });
+    };
+
     // A reading carrying no load says nothing the ceilings are made of, which is not the same as
     // a platform that will not say: the scheduler has figures here and the panel has none.
     if (!now.snapshot.hostLoad.has_value())
+    {
+        if (cordoned)
+            slots.ceilings = cordonOnly();
         return slots;
+    }
     auto const& load = *now.snapshot.hostLoad;
 
     auto const cpu = CpuShareOf(previous, load);
     slots.cpuBusyPermille = cpu.permille;
     slots.availableMemoryBytes = load.availableMemoryBytes;
     if (cpu.owed && !cpu.permille.has_value())
+    {
+        if (cordoned)
+            slots.ceilings = cordonOnly();
         return slots;
+    }
 
     // Exactly the scheduler's inputs: the cores the CPU ceiling scales by, the slots the node
     // registered with, and the load a heartbeat would carry. Free scratch is the host's figure,
@@ -71,7 +95,8 @@ std::optional<NodeSlots> NodeSlotsOf(StatsReading const* previous, StatsReading 
                                                                           .cpuBusyPermille = cpu.permille,
                                                                           .availableMemoryBytes = load.availableMemoryBytes,
                                                                           .freeScratchBytes = host.diskFreeBytes,
-                                                                          .cache = {} });
+                                                                          .cache = {},
+                                                                          .cordoned = cordoned });
     return slots;
 }
 

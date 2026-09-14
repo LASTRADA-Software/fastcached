@@ -82,6 +82,10 @@ struct NodeScrapeSources
     /// demanded one could only be exercised by standing a server up. It is also a
     /// gauge sampled per scrape, which is exactly what a callable is.
     std::function<std::size_t()> busySlots;
+    /// Whether an operator has cordoned this node's worker (#1303); a callable for
+    /// `busySlots`' reason. Empty reads as not cordoned, which is what a scrape of a node
+    /// whose worker nobody wired is.
+    std::function<bool()> cordoned {};
     /// The node's cache, or **null** when it runs none.
     CacheTier const* cache {};
     /// Concurrent compiles this node advertises.

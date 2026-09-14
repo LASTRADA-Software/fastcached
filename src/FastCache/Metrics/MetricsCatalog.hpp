@@ -273,6 +273,18 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
               "no_slot: that one says the fleet is too small, this one says a node is "
               "draining and a retry will land somewhere else.",
       .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::WorkerJobsRefusedCordoned,
+      .prometheusName = "fastcache_worker_jobs_refused_cordoned_total",
+      .help = "Jobs refused because an operator cordoned this worker. Never sum with "
+              "stopping: a stop ends by itself, a cordon lasts until somebody lifts it. "
+              "A steady rise says the scheduler is not hearing this worker's heartbeat.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::WorkerCordonsRefusedNotLocal,
+      .prometheusName = "fastcache_worker_cordons_refused_not_local_total",
+      .help = "Cordon requests refused because they came from another machine. A "
+              "machine is cordoned from itself; a rise means somebody elsewhere is "
+              "trying to take it out of the fleet.",
+      .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::WorkerFramesRefusedUnsupportedVersion,
       .prometheusName = "fastcache_worker_frames_refused_unsupported_version_total",
       .help = "Frames refused for naming a protocol version this build does not "

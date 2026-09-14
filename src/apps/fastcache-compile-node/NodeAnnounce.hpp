@@ -57,7 +57,7 @@ struct HeartbeatRound
     /// already running, and a queue that kept retrying would outlive the fact it
     /// describes and grow without bound on a node whose scheduler is unreachable.
     std::vector<Cc::WorkerRegistrar>& withdrawals;
-    CompileCapacity const& capacity; ///< For the in-flight count.
+    CompileCapacity const& capacity; ///< For the in-flight count and the cordon.
     IHostLoadSampler& loadSampler;   ///< CPU, memory and scratch.
     CacheTier const* cacheTier;      ///< Null on a node with no cache.
     IMetricsSink const& metrics;     ///< Where the cache figures are read.

@@ -140,7 +140,7 @@ the help renders `Verbs()` grouped by `WireSpec::heading`, and
 | Write | `set`, `del`, `incr`, `decr`, `incrby`, `decrby`, `expire`, `persist`, `flush` |
 | Read (memcached) | `gat`, `gats`, `inspect`, `mc-stats` |
 | Write (memcached) | `touch`, `add`, `replace`, `append`, `prepend`, `cas`, `cache-memlimit` |
-| Node (`0xFC`) | `node`, `node-metrics`, `fleet` |
+| Node (`0xFC`) | `node`, `node-metrics`, `fleet`, `cordon`, `uncordon` |
 | Cluster (`0xFC`) | `cluster-members`, `cluster-settings`, `cluster-set`, `cluster-forget`, `cluster-admit` |
 
 ### The fleet verb

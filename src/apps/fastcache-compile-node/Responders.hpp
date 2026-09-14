@@ -336,7 +336,7 @@ class SchedulerResponder final: public IFrameResponder
     /// layer kept pure so every capacity and expiry rule is a `ManualClock` unit
     /// test -- so this is a one-line adapter, and a responder that costs a frame
     /// allocation and no round trip is a legitimate thing to be.
-    [[nodiscard]] Task<std::vector<std::byte>> Answer(std::span<std::byte const> frame, std::string peer) override
+    [[nodiscard]] Task<FrameReply> Answer(std::span<std::byte const> frame, std::string peer) override
     {
         co_return _protocol.Answer(frame, Context(std::move(peer)));
     }
@@ -599,7 +599,7 @@ class CacheResponder final: public IFrameResponder
     }
 
     /// @copydoc IFrameResponder::Answer
-    [[nodiscard]] Task<std::vector<std::byte>> Answer(std::span<std::byte const> frame, std::string peer) override
+    [[nodiscard]] Task<FrameReply> Answer(std::span<std::byte const> frame, std::string peer) override
     {
         // Refused as a *reply*, never by closing: a client that cannot tell a policy
         // refusal from a dead host retries forever and reports a flaky network, which
@@ -965,7 +965,7 @@ class MergedResponder final: public IFrameResponder
     /// Reachable directly as well as through the endpoint, so it decodes the header
     /// itself rather than taking anybody's word for the verb -- the same reason
     /// `CacheResponder::Answer` re-asks its own gate.
-    [[nodiscard]] Task<std::vector<std::byte>> Answer(std::span<std::byte const> frame, std::string peer) override
+    [[nodiscard]] Task<FrameReply> Answer(std::span<std::byte const> frame, std::string peer) override
     {
         auto const header = CompileCacheWire::DecodeRequestHeader(frame);
         if (!header.has_value())

@@ -181,6 +181,61 @@ inline constexpr std::string_view AnswerDeadlineIsTheEndpointsRationale =
     return EndpointRefusalCodes[static_cast<std::size_t>(refusal)].code;
 }
 
+/// Something a reply keeps held until the endpoint has finished with it.
+///
+/// **The endpoint writes a reply AFTER the responder has returned it**, so whatever must
+/// last until the reply has been delivered cannot be released by the responder's own
+/// scope -- that scope has ended by the time the first byte is written. The compile
+/// worker's slot is the case that needs it (#1303): a cordon's drained report and a stop's
+/// drain both read the slot count as *nothing this worker owes anybody*, and a slot
+/// released at the responder's `co_return` made that claim while a multi-megabyte object
+/// was still going out, so stopping on it abandoned the one compile the wait was for.
+///
+/// So the hold travels WITH the reply, and the endpoint destroys it once the write has
+/// finished or been abandoned. That is every path out of one request, and none of them
+/// carries a release of its own to forget.
+class IReplyHold
+{
+  public:
+    IReplyHold() = default;
+    IReplyHold(IReplyHold const&) = delete;
+    IReplyHold(IReplyHold&&) = delete;
+    IReplyHold& operator=(IReplyHold const&) = delete;
+    IReplyHold& operator=(IReplyHold&&) = delete;
+    /// Releases whatever was held.
+    virtual ~IReplyHold() = default;
+};
+
+/// What a responder answers with: the reply, and what stays held until it is written.
+struct FrameReply
+{
+    /// A reply that holds nothing, which is every surface's but the compile worker's.
+    ///
+    /// Implicit on purpose, so a surface that holds nothing goes on answering
+    /// `co_return bytes;`. The conversion cannot lose anything, because there is nothing
+    /// on the other side of it to lose.
+    /// @param reply The encoded reply, or empty to close without answering.
+    FrameReply(std::vector<std::byte> reply = {}) noexcept:
+        bytes { std::move(reply) }
+    {
+    }
+
+    /// A reply that holds something until it has been written.
+    /// @param reply The encoded reply, or empty to close without answering.
+    /// @param held Released once the endpoint has written or abandoned the reply.
+    FrameReply(std::vector<std::byte> reply, std::unique_ptr<IReplyHold> held) noexcept:
+        bytes { std::move(reply) },
+        hold { std::move(held) }
+    {
+    }
+
+    /// The encoded reply, or empty to close without answering.
+    std::vector<std::byte> bytes;
+
+    /// What stays held until the reply has been written or abandoned; null for nothing.
+    std::unique_ptr<IReplyHold> hold;
+};
+
 /// Serves one subscription for as long as it lasts.
 ///
 /// **A verb answered by a stream is NOT answered by `IFrameResponder::Answer`**, and the split is
@@ -251,8 +306,9 @@ class IFrameResponder
     ///        responder holds it across a suspension, so a view would make its
     ///        lifetime a rule at each implementation instead of a fact.
     /// @return The encoded reply, or empty to close without answering -- which is
-    ///         only ever right when the peer is not speaking this protocol at all.
-    [[nodiscard]] virtual Task<std::vector<std::byte>> Answer(std::span<std::byte const> frame, std::string peer) = 0;
+    ///         only ever right when the peer is not speaking this protocol at all --
+    ///         and whatever must stay held until the endpoint has written it.
+    [[nodiscard]] virtual Task<FrameReply> Answer(std::span<std::byte const> frame, std::string peer) = 0;
 
     /// May this peer send at all, before a byte of its payload is taken?
     ///

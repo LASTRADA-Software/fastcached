@@ -1050,6 +1050,38 @@ TEST_CASE("A memory-bound worker is not dressed as a busy one", "[distributed][f
     CHECK_FALSE(html.contains(R"(<span class="chip chip--cpu">memory</span>)"));
 }
 
+TEST_CASE("A cordoned worker is shown draining, named by its cordon on every surface", "[distributed][fleetview][cordon]")
+{
+    // #1303. A cordon keeps the worker on the page -- that is how an operator watches it
+    // drain -- so what distinguishes it is the `limited-by` cell naming the cordon, with its
+    // in-flight beside it, and the page's own chip rather than the one a default would pick.
+    auto snapshot = LeadingSnapshot();
+    auto load = NodeLoad {};
+    load.inFlight = 2;
+    load.cordoned = true;
+
+    snapshot.workers = { WorkerReport { .info = WorkerInfo { .id = "w1",
+                                                             .fingerprint = "gcc-13-abcdef",
+                                                             .endpoint = "10.0.0.2:7100",
+                                                             .slots = 8,
+                                                             .inFlight = 2,
+                                                             .capacity = snapshot.nodes[0].capacity,
+                                                             .load = load,
+                                                             .codecs = {} },
+                                        .heartbeatAge = std::chrono::milliseconds { 30 } } };
+
+    auto const html = RenderFleetHtml(snapshot, NoHistory(), 0);
+    CHECK(html.contains(R"(<span class="chip chip--cordoned">cordoned</span>)"));
+
+    auto const text = RenderFleetText(snapshot, NoHistory(), FleetSection::Workers);
+    CHECK(text.contains("cordoned"));
+    CHECK(FleetCellTone(FleetSection::Workers, "limited-by", std::string_view { "cordoned" }) == CellTone::Limited);
+
+    // And the same worker uncordoned is not: the cell follows the load, not the section.
+    snapshot.workers[0].info.load.cordoned = false;
+    CHECK_FALSE(RenderFleetText(snapshot, NoHistory(), FleetSection::Workers).contains("cordoned"));
+}
+
 TEST_CASE("A chart with nothing to report renders a dash, not its markup", "[distributed][fleetview]")
 {
     // `AbsentText` IS markup -- the entity for an en dash -- and every path that

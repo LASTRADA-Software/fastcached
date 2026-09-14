@@ -188,7 +188,7 @@ LiveStatsResponder::LiveStatsResponder(ILiveStatsSources const& sources,
 {
 }
 
-Task<std::vector<std::byte>> LiveStatsResponder::Answer(std::span<std::byte const> frame, std::string peer)
+Task<FrameReply> LiveStatsResponder::Answer(std::span<std::byte const> frame, std::string peer)
 {
     auto const header = Wire::DecodeRequestHeader(frame);
     auto const opRaw = header.has_value() ? header->opRaw : std::uint8_t { 0xFF };

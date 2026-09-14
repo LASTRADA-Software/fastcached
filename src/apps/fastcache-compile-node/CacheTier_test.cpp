@@ -405,15 +405,18 @@ TEST_CASE("The memory tier compresses only when a codec is named", "[node][cache
         auto const tier = std::move(*started);
         REQUIRE(tier != nullptr);
 
-        auto const stored = SyncRun(tier->Responder().Answer(
-            Wire::EncodeStore(Wire::StoreRequest {
-                .key = "object", .prefetchGroup = {}, .srcRoot = "/src", .buildTree = "/build", .value = payload }),
-            "127.0.0.1"));
+        auto const stored =
+            SyncRun(
+                tier->Responder().Answer(
+                    Wire::EncodeStore(Wire::StoreRequest {
+                        .key = "object", .prefetchGroup = {}, .srcRoot = "/src", .buildTree = "/build", .value = payload }),
+                    "127.0.0.1"))
+                .bytes;
         REQUIRE(StatusOf(stored) == Wire::Status::Ok);
 
         // And it must still be READABLE: a tier that compressed and could not decode
         // would shrink exactly as convincingly.
-        auto const fetched = SyncRun(tier->Responder().Answer(Wire::EncodeFetch("object"), "127.0.0.1"));
+        auto const fetched = SyncRun(tier->Responder().Answer(Wire::EncodeFetch("object"), "127.0.0.1")).bytes;
         REQUIRE(StatusOf(fetched) == Wire::Status::Ok);
 
         auto const tiers = tier->SnapshotTiers();
@@ -468,15 +471,19 @@ TEST_CASE("The disk tier compresses with the codec the node names", "[node][cach
             auto const tier = std::move(*started);
             REQUIRE(tier != nullptr);
 
-            auto const stored = SyncRun(tier->Responder().Answer(
-                Wire::EncodeStore(Wire::StoreRequest {
-                    .key = "object", .prefetchGroup = {}, .srcRoot = "/src", .buildTree = "/build", .value = payload }),
-                "127.0.0.1"));
+            auto const stored =
+                SyncRun(tier->Responder().Answer(Wire::EncodeStore(Wire::StoreRequest { .key = "object",
+                                                                                        .prefetchGroup = {},
+                                                                                        .srcRoot = "/src",
+                                                                                        .buildTree = "/build",
+                                                                                        .value = payload }),
+                                                 "127.0.0.1"))
+                    .bytes;
             REQUIRE(StatusOf(stored) == Wire::Status::Ok);
 
             // Still readable: a tier that compressed and could not decode would
             // shrink the file exactly as convincingly.
-            auto const fetched = SyncRun(tier->Responder().Answer(Wire::EncodeFetch("object"), "127.0.0.1"));
+            auto const fetched = SyncRun(tier->Responder().Answer(Wire::EncodeFetch("object"), "127.0.0.1")).bytes;
             REQUIRE(StatusOf(fetched) == Wire::Status::Ok);
 
             // The budget is denominated in logical bytes whatever the codec, which is
@@ -626,7 +633,7 @@ TEST_CASE("A dropped key is gone from every tier a fetch consults, and stays gon
     cfg.cacheDir = scratch.Path();
 
     auto const ask = [](CacheTier& tier, std::vector<std::byte> const& frame) {
-        return StatusOf(SyncRun(tier.Responder().Answer(frame, "127.0.0.1")));
+        return StatusOf(SyncRun(tier.Responder().Answer(frame, "127.0.0.1")).bytes);
     };
 
     {

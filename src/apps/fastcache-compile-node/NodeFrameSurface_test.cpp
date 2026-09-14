@@ -79,7 +79,7 @@ class NamedResponder final: public IFrameResponder
     {
     }
 
-    [[nodiscard]] Task<std::vector<std::byte>> Answer(std::span<std::byte const> /*frame*/, std::string /*peer*/) override
+    [[nodiscard]] Task<FrameReply> Answer(std::span<std::byte const> /*frame*/, std::string /*peer*/) override
     {
         _answered.push_back(_name);
         co_return Wire::EncodeErrorReply(Wire::ErrorCode::MalformedValue, _name);
@@ -298,7 +298,7 @@ class NamedResponder final: public IFrameResponder
 /// @return The reply.
 [[nodiscard]] std::vector<std::byte> AnswerNow(MergedResponder& responder, std::span<std::byte const> frame)
 {
-    return SyncRun(responder.Answer(frame, std::string { "127.0.0.1" }));
+    return SyncRun(responder.Answer(frame, std::string { "127.0.0.1" })).bytes;
 }
 
 /// A config naming a free loopback port, and that port.
@@ -485,7 +485,7 @@ TEST_CASE("(#290) one peer on one listener has a FETCH refused and a COMPILE adm
     CompileCapacity capacity { 1, WorkerMaxRequestBytes, std::chrono::seconds { 5 }, logger };
 
     CacheResponder cacheResponder { proxy, locality, metrics };
-    CompileResponder compileResponder { protocol, capacity, membership, pool, io.Reactor(), metrics, logger };
+    CompileResponder compileResponder { protocol, capacity, membership, locality, pool, io.Reactor(), metrics, logger };
     MergedResponder responder { SurfaceComponents { .cache = &cacheResponder, .compile = &compileResponder } };
 
     constexpr auto* peer = "10.0.0.1";

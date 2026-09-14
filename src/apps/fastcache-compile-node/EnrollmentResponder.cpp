@@ -104,7 +104,7 @@ std::expected<SecureByteBuffer, std::string> FileClusterKeySource::ClusterKey() 
     return ReadClusterKey(_path);
 }
 
-Task<std::vector<std::byte>> EnrollmentResponder::Answer(std::span<std::byte const> frame, std::string peer)
+Task<FrameReply> EnrollmentResponder::Answer(std::span<std::byte const> frame, std::string peer)
 {
     auto const header = Wire::DecodeRequestHeader(frame);
     if (!header.has_value())

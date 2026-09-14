@@ -2154,7 +2154,12 @@ namespace
                 // peer's own dribbling in it. A steady clock, because this measures a
                 // duration rather than naming an instant.
                 auto const startedAt = std::chrono::steady_clock::now();
-                auto const reply = co_await state->responder.Answer(frame, peer);
+
+                // Not `const`: what the reply HOLDS is released below, the moment it has been
+                // written, and on every `break` in between by going out of scope -- see
+                // `IReplyHold`, which carries why a compile's slot cannot be released any
+                // earlier than that.
+                auto reply = co_await state->responder.Answer(frame, peer);
 
                 // **The one place this node says anything about a client**, and it is
                 // here because here is where every verb on every surface has already
@@ -2174,7 +2179,7 @@ namespace
                     decoded->opRaw,
                     peer,
                     frame,
-                    reply,
+                    reply.bytes,
                     std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - startedAt),
                     state->namer);
 
@@ -2184,7 +2189,7 @@ namespace
                 // Said once per peer per interval; `NoteVersionRefusal` owns the whole
                 // decision because `ServeConnection` is at the complexity ceiling.
                 Node::NoteVersionRefusal(
-                    state->logger, state->versionRefusals, peer, reply, std::chrono::steady_clock::now());
+                    state->logger, state->versionRefusals, peer, reply.bytes, std::chrono::steady_clock::now());
 
                 // **Before every write below, and there are three of them.** The pulse is
                 // the only writer while the responder answers; this is where that stops
@@ -2229,11 +2234,17 @@ namespace
                 // Nothing to deliver, or nobody left to deliver it to -- see
                 // `AbandonIfPeerGone`, which carries both arms and counts them apart.
 
-                if (co_await AbandonIfPeerGone(state, socket.get(), watch, !reply.empty()))
+                if (co_await AbandonIfPeerGone(state, socket.get(), watch, !reply.bytes.empty()))
                     break;
 
-                if (!co_await WriteAll(EndpointWriter::Loop, socket.get(), reply))
+                if (!co_await WriteAll(EndpointWriter::Loop, socket.get(), reply.bytes))
                     break;
+
+                // Delivered, so whatever the reply held is owed to nobody now. Released HERE
+                // rather than at the end of the iteration, because the watch below can still
+                // suspend and a slot held across it would keep a cordoned worker reporting
+                // itself busy after its last object has left.
+                reply.hold.reset();
 
                 // **The watch is settled AFTER the reply, never before it**, and that
                 // ordering is the whole of it: `WriteAll` suspends -- an object is

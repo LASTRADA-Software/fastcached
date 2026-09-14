@@ -276,6 +276,24 @@ TEST_CASE("NodeConfig: --migrate-cache is a mode, and never reaches a service re
     CHECK(std::ranges::any_of(spec.arguments, [](std::string const& arg) { return FlagMatches(arg, "--cache-dir"); }));
 }
 
+TEST_CASE("NodeConfig: --cordon is a mode, and never reaches a service registration", "[node][config][cordon]")
+{
+    // #1303. A registration replays its arguments at every start, so a cordon baked into
+    // one would re-cordon the worker at every boot -- the machine that silently never comes
+    // back, which is why the cordon lives in the running worker's memory and nowhere else.
+    auto const parsed = ParseNodeArgv({ "--cordon", "--cache-dir=/var/cache/fastcache-node" });
+    REQUIRE(parsed.has_value());
+    auto const& cfg = *parsed;
+    REQUIRE(cfg.cordon == CordonCommand::Cordon);
+
+    auto const spec = MakeNodeServiceSpec(std::filesystem::path { "fastcache-compile-node" }, cfg);
+    CHECK(std::ranges::none_of(spec.arguments, [](std::string const& arg) {
+        return FlagMatches(arg, "--cordon") || FlagMatches(arg, "--uncordon");
+    }));
+    // The flag beside it is carried, so this cannot pass by emitting nothing.
+    CHECK(std::ranges::any_of(spec.arguments, [](std::string const& arg) { return FlagMatches(arg, "--cache-dir"); }));
+}
+
 TEST_CASE("NodeConfig: every flag that is worker state reaches the supervisor", "[node][service]")
 {
     // The daemon's equivalent case exists because its table once stopped after
@@ -326,6 +344,11 @@ TEST_CASE("NodeConfig: every flag that is worker state reaches the supervisor", 
         "--cluster-set",
         "--cluster-forget",
         "--cluster-admit",
+        // The cordon, for the same rule with the consequence #1303 names: a registration
+        // carrying one would re-cordon the worker at every boot -- a machine that silently
+        // never comes back to the fleet.
+        "--cordon",
+        "--uncordon",
         // Same rule, applied to the store rather than to the cluster: a worker
         // that converted its store at every boot would replay one operator's
         // decision forever, on a store that after the first run has nothing
@@ -3346,6 +3369,9 @@ TEST_CASE("NodeConfig: a file may not name a one-shot verb or a startup fact", "
                             "uninstall_service",
                             "migrate_cache",
                             "cluster_forget",
+                            // #1303: a cordon a file replayed at every start is a machine that never comes back.
+                            "cordon",
+                            "uncordon",
                             "service_name",
                             "service_scope",
                             "daemon",

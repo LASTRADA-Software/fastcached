@@ -132,6 +132,7 @@ namespace StatsReadingWire
         Field<HostCapacity, std::size_t> { .name = "logicalCores", .member = &HostCapacity::logicalCores },
         Field<HostCapacity, std::size_t> { .name = "configuredSlots", .member = &HostCapacity::configuredSlots },
         Field<HostCapacity, std::size_t> { .name = "busySlots", .member = &HostCapacity::busySlots },
+        Field<HostCapacity, std::size_t> { .name = "cordoned", .member = &HostCapacity::cordoned },
     };
 
     /// The `std::uint64_t` half of `HostCapacity`.

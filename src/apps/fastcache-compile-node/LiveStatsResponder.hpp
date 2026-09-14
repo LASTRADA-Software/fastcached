@@ -55,7 +55,7 @@ class LiveStatsResponder final: public IFrameResponder, public IFrameStream, pri
     ///
     /// Reached only by a caller that does not stream, since the endpoint asks `StreamFor` first:
     /// such a caller cannot carry a subscription, so it is told the verb is not served that way.
-    [[nodiscard]] Task<std::vector<std::byte>> Answer(std::span<std::byte const> frame, std::string peer) override;
+    [[nodiscard]] Task<FrameReply> Answer(std::span<std::byte const> frame, std::string peer) override;
 
     /// @copydoc IFrameResponder::RefusePeer
     [[nodiscard]] std::optional<std::vector<std::byte>> RefusePeer(std::string_view peer, std::uint8_t opRaw) const override;

@@ -474,6 +474,43 @@ TEST_CASE("A heartbeat's load reaches the registry and changes what is picked", 
     CHECK(fixture.metrics.Read(IMetricsSink::Counter::DispatchLeasesNoCapacity) == 0);
 }
 
+TEST_CASE("A heartbeat's cordon reaches the registry, and lifting it brings the worker back",
+          "[distributed][scheduler][protocol][cordon]")
+{
+    // #1303, end to end through the framing, for the reason the case above is: the encoder,
+    // the decoder, the mapping and the registry's store could each drop the cordon silently,
+    // and the symptom of any of them is a fleet leasing a machine an operator is draining.
+    Fixture fixture;
+
+    auto const registration = Wire::EncodeRegister(Wire::RegisterRequest {
+        .fingerprint = "gcc-14",
+        .endpoint = "10.0.0.2:7100",
+        .slots = 0,
+        .acceptedCodecs = {},
+        .capacity = Wire::CapacityFields {
+            .logicalCores = 8, .totalMemoryBytes = 0, .nodeClassRaw = 1, .reservedCores = std::nullopt } });
+    REQUIRE(StatusOf(fixture.protocol.Answer(registration, Insider)) == Wire::Status::Ok);
+    auto const live = fixture.service.Workers().LiveWorkers();
+    REQUIRE(live.size() == 1);
+
+    auto const beat = [&](bool cordoned) {
+        Wire::LoadFields load {};
+        load.cordoned = cordoned;
+        return fixture.protocol.Answer(Wire::EncodeHeartbeat(live[0].id, 0, load), Insider);
+    };
+    auto const lease = [&](std::string_view key) {
+        return fixture.protocol.Answer(
+            Wire::EncodeLease(Wire::LeaseRequest { .fingerprint = "gcc-14", .key = key, .acceptedCodecs = {} }), Insider);
+    };
+
+    REQUIRE(StatusOf(beat(true)) == Wire::Status::Ok);
+    // Eight slots free and none offered: withdrawn, not a fleet too small.
+    CHECK(ErrorOf(lease("k1")) == Wire::ErrorCode::Withdrawn);
+
+    REQUIRE(StatusOf(beat(false)) == Wire::Status::Ok);
+    CHECK(StatusOf(lease("k2")) == Wire::Status::Ok);
+}
+
 TEST_CASE("The two halves of the cache-capacity mapping agree", "[distributed][scheduler][protocol][cache]")
 {
     // The transposition hazard here is of a different kind from cores and memory:

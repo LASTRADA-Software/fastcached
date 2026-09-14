@@ -6,6 +6,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <cstddef>
 #include <optional>
@@ -381,6 +382,60 @@ TEST_CASE("A fleet that is unavailable is a different refusal from one that is s
         REQUIRE_FALSE(picked.has_value());
         CHECK(picked.error() == PickError::Withdrawn);
     }
+}
+
+TEST_CASE("A cordoned worker is passed over, stays visible, and returns when the cordon lifts",
+          "[distributed][registry][cordon]")
+{
+    // #1303, through the registry rather than the policy function: the path that would go
+    // on sending work to a machine an operator is draining if the heartbeat's cordon were
+    // recorded and never consulted.
+    Fixture fix;
+    auto const desk = fix.registry.Register(
+        WorkerRegistration { .fingerprint = Gcc13,
+                             .endpoint = "10.0.0.1:6676",
+                             .slots = 4,
+                             .codecs = {},
+                             .capacity = NodeCapacity { .logicalCores = 8, .nodeClass = NodeClass::Dedicated } });
+    auto const server = fix.registry.Register(
+        WorkerRegistration { .fingerprint = Gcc13,
+                             .endpoint = "10.0.0.2:6676",
+                             .slots = 2,
+                             .codecs = {},
+                             .capacity = NodeCapacity { .logicalCores = 4, .nodeClass = NodeClass::Dedicated } });
+
+    // Four free against two: with nothing cordoned, the bigger machine wins.
+    auto const idle = fix.registry.Pick(Gcc13);
+    REQUIRE(idle.has_value());
+    CHECK(idle->id == desk);
+
+    // Cordoned with one compile still running and three slots free on paper -- which is
+    // exactly the state a slot count alone would keep handing work.
+    REQUIRE(fix.registry.Heartbeat(desk, Cordoned(1)));
+    auto const shifted = fix.registry.Pick(Gcc13);
+    REQUIRE(shifted.has_value());
+    CHECK(shifted->id == server);
+
+    // Still registered and still reported, with what it is draining: a cordon is not a
+    // withdrawal, and a machine that vanished from the page could not be watched drain.
+    auto const reports = fix.registry.LiveWorkerReports();
+    auto const drained = std::ranges::find_if(reports, [&desk](WorkerReport const& r) { return r.info.id == desk; });
+    REQUIRE(drained != reports.end());
+    CHECK(drained->info.load.cordoned);
+    CHECK(drained->info.inFlight == 1);
+
+    // With only the cordoned machine left serving this toolchain, the refusal is the
+    // actionable one -- some machines are unavailable -- not a fleet too small.
+    REQUIRE(fix.registry.Heartbeat(server, Busy(2)));
+    auto const refused = fix.registry.Pick(Gcc13);
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error() == PickError::Withdrawn);
+
+    // And lifting it is a heartbeat like any other.
+    REQUIRE(fix.registry.Heartbeat(desk, Busy(0)));
+    auto const recovered = fix.registry.Pick(Gcc13);
+    REQUIRE(recovered.has_value());
+    CHECK(recovered->id == desk);
 }
 
 TEST_CASE("One machine serving two toolchains is one node's cache", "[distributed][registry][cache]")

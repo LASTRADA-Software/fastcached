@@ -230,7 +230,7 @@ struct Seed
                                                std::span<std::byte const> frame,
                                                std::string_view peer)
 {
-    return SyncRun(responder.Answer(frame, std::string { peer }));
+    return SyncRun(responder.Answer(frame, std::string { peer })).bytes;
 }
 
 /// The payload of a reply.

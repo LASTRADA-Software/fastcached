@@ -500,6 +500,27 @@ enum class Op : std::uint8_t
     /// and Prometheus read.
     Subscribe = 0x12,
 
+    /// An operator on this machine cordons its worker, or lifts the cordon (#1303).
+    ///
+    /// **A cordon refuses new compiles and lets the running ones finish**, so a machine
+    /// can be taken out of the fleet before a reboot without abandoning a compile that was
+    /// about to succeed -- which is what a bounded shutdown does to any translation unit
+    /// longer than `--drain-timeout`. The node keeps serving everything else.
+    ///
+    /// **A property of the worker PROCESS, and nothing replicates it.** The scheduler
+    /// learns it from the worker's own heartbeat (`LoadFields::cordoned`), so a new leader
+    /// learns it from the next one, and a restart un-cordons by construction: a cordon
+    /// that survived a restart would be a machine that silently never came back.
+    ///
+    /// Not `Withdraw`, which REMOVES a registration: a cordoned machine stays registered
+    /// and visible, draining, and `Pick` skips it through `SlotLimit::Cordoned`.
+    ///
+    /// Answered from the `Compile` family because it governs exactly that family's
+    /// admission; a node running no worker has nothing to cordon and answers the family's
+    /// not-served sentence. The reply is `CordonFields`: the state now, and how many
+    /// compiles are still running. Setting the state it already has answers the same.
+    Cordon = 0x13,
+
     /// An operator removes one key from the cache tier that answers
     /// ([#1276](https://github.com/LASTRADA-Software/fastcached/issues/1276)).
     ///
@@ -1622,6 +1643,16 @@ inline constexpr std::array OpTable {
                    .preAuth = RequiresAuth,
                    .maxPayload = BoundedTo(MaxControlPayload),
                    .family = VerbFamily::Live },
+
+    // The cordon (#1303). Gated on locality by the compile surface rather than on a
+    // credential: see `CompileResponder::RefusePeer`.
+    OpDescriptor { .code = Op::Cordon,
+                   .name = "cordon",
+                   .fieldCount = 1, // cordon or lift
+                   .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
+                   .preAuth = RequiresAuth,
+                   .maxPayload = BoundedTo(MaxControlPayload),
+                   .family = VerbFamily::Compile },
 };
 
 /// Whether `Status::Progress` is confined to the one verb that can be slow enough to
@@ -3492,6 +3523,16 @@ struct LoadFields
     /// Empty on almost every heartbeat: a bucket closes once a minute and a heartbeat
     /// goes every twenty seconds.
     std::vector<HistoryBucketFields> history;
+
+    /// Whether an operator cordoned this worker (#1303): it takes no new compile, and the
+    /// scheduler must not pick it.
+    ///
+    /// **A heartbeat fact, and that is what keeps the cordon unreplicated.** It is the
+    /// worker's own process state, restated every beat, so a new leader learns it from the
+    /// next one and a restarted worker -- which is not cordoned -- corrects every registry
+    /// that believed it was. Absent travels as a zero-length field and reads as serving,
+    /// which is what a peer older than this field is.
+    bool cordoned { false };
 };
 
 /// Frame a live-load record as one nested field list.
@@ -3510,12 +3551,14 @@ struct LoadFields
     auto const scratch = WireFields::ToBigEndian<std::uint64_t>(load.freeScratchBytes.value_or(0));
     auto const cache = EncodeCacheLoad(load.cache);
     auto const history = EncodeHistoryBuckets(load.history);
+    auto constexpr Cordoned = std::array { std::byte { 1 } };
     return WireFields::Encode(
         { load.cpuBusyPermille.has_value() ? std::span<std::byte const> { cpu } : std::span<std::byte const> {},
           load.availableMemoryBytes.has_value() ? std::span<std::byte const> { memory } : std::span<std::byte const> {},
           load.freeScratchBytes.has_value() ? std::span<std::byte const> { scratch } : std::span<std::byte const> {},
           std::span<std::byte const> { cache },
-          std::span<std::byte const> { history } });
+          std::span<std::byte const> { history },
+          load.cordoned ? std::span<std::byte const> { Cordoned } : std::span<std::byte const> {} });
 }
 
 /// Read a live-load record back.
@@ -3568,6 +3611,15 @@ struct LoadFields
     if (!history.has_value())
         return std::nullopt;
     out.history = std::move(*history);
+    // One byte when cordoned; absent from a serving worker and from any peer older than
+    // the field. Any other width, or a byte that is not the one the encoder writes, is a
+    // shape this build does not know and is refused rather than read as either answer.
+    if (auto const cordoned = at(5); !cordoned.empty())
+    {
+        if (cordoned.size() != 1 || cordoned[0] != std::byte { 1 })
+            return std::nullopt;
+        out.cordoned = true;
+    }
     return out;
 }
 
@@ -4250,6 +4302,21 @@ enum class WireEnrollmentState : std::uint8_t
     Open = 0x02,   ///< Accepting requests right now.
 };
 
+/// Whether this node's worker is taking new compiles (#1303).
+///
+/// A tri-state where it is reported, and DISENGAGED on a node that runs no worker, for
+/// `WireEnrollmentState`'s reason: absent is not serving. `Draining` and `Drained` are
+/// both cordoned, and the difference is the one an operator waiting to reboot acts on --
+/// `Drained` says no compile is running, so stopping this node abandons nothing.
+///
+/// Explicit values because these bytes are transmitted.
+enum class WireCordonState : std::uint8_t
+{
+    Serving = 0x01,  ///< Not cordoned: admitting compiles. A restart's answer.
+    Draining = 0x02, ///< Cordoned, with compiles still running.
+    Drained = 0x03,  ///< Cordoned, and nothing is running.
+};
+
 /// What a node's live components report about themselves, as opposed to what its
 /// configuration asked for.
 ///
@@ -4362,6 +4429,13 @@ struct NodeRuntimeFields
     /// a non-zero count under `Closed` is what a window closed with people still
     /// waiting would look like, and there is no such state, so it is a bug report.
     std::optional<std::uint32_t> enrollmentPending {};
+
+    /// Whether the worker is cordoned, and if so whether it has drained (#1303); disengaged
+    /// on a node that runs no worker.
+    ///
+    /// A STATE in the snapshot for `enrollment`'s reason: the refusals a cordon causes are
+    /// counted, and the state is what an operator waiting to reboot polls.
+    std::optional<WireCordonState> cordon {};
 };
 
 namespace Detail
@@ -4447,6 +4521,7 @@ namespace Detail
     auto const lastRegistration = Detail::OptionalBigEndian(runtime.lastRegistrationSecondsAgo);
     auto const enrollment = Detail::OptionalEnumByte(runtime.enrollment);
     auto const enrollmentPending = Detail::OptionalBigEndian(runtime.enrollmentPending);
+    auto const cordon = Detail::OptionalEnumByte(runtime.cordon);
 
     // Positional, so the ORDER here is the wire contract for this record. Append only:
     // an insertion shifts every later field and every peer decodes one fact as the next.
@@ -4461,7 +4536,8 @@ namespace Detail
                                 total,
                                 lastRegistration,
                                 enrollment,
-                                enrollmentPending });
+                                enrollmentPending,
+                                cordon });
 }
 
 /// Read a runtime record back.
@@ -4574,6 +4650,23 @@ namespace Detail
         }
     }
 
+    if (auto const cordon = at(12); !cordon.empty())
+    {
+        if (cordon.size() != 1)
+            return std::nullopt;
+        // Skipped rather than refused when unnamed, for the enrollment state's reason.
+        switch (static_cast<WireCordonState>(cordon[0]))
+        {
+            case WireCordonState::Serving:
+            case WireCordonState::Draining:
+            case WireCordonState::Drained:
+                out.cordon = static_cast<WireCordonState>(cordon[0]);
+                break;
+            default:
+                break;
+        }
+    }
+
     // No width to check and nothing to refuse: empty IS the reading here, and it means
     // no leader is known. See the member.
     out.leaderEndpoint = std::string { AsStringView(at(6)) };
@@ -4629,6 +4722,80 @@ namespace NodeComponentBit
 [[nodiscard]] inline std::vector<std::byte> EncodeNodeMetricsRequest(WireVersion version = CurrentVersion)
 {
     return Detail::EncodeRequest(version, Op::NodeMetrics, {});
+}
+
+/// What a CORDON asks for: cordon the worker, or lift the cordon.
+///
+/// Explicit values because these bytes are transmitted.
+enum class CordonAction : std::uint8_t
+{
+    Lift = 0x00,   ///< Take compiles again.
+    Cordon = 0x01, ///< Refuse new compiles; let the running ones finish.
+};
+
+/// Frame a CORDON request.
+/// @param action Cordon, or lift it.
+/// @param version Version to advertise.
+/// @return The framed request.
+[[nodiscard]] inline std::vector<std::byte> EncodeCordonRequest(CordonAction action, WireVersion version = CurrentVersion)
+{
+    auto const byte = std::array { static_cast<std::byte>(action) };
+    return Detail::EncodeRequest(version, Op::Cordon, { std::span<std::byte const> { byte } });
+}
+
+/// Read a CORDON payload.
+/// @param payload The bytes following the request header.
+/// @return The action, or nullopt for a payload that is not one byte naming one.
+[[nodiscard]] inline std::optional<CordonAction> DecodeCordonPayload(std::span<std::byte const> payload)
+{
+    auto const fields = SplitFields(payload, OpFieldCount(Op::Cordon));
+    if (!fields.has_value() || (*fields)[0].size() != 1)
+        return std::nullopt;
+    switch (static_cast<CordonAction>((*fields)[0][0]))
+    {
+        case CordonAction::Lift:
+        case CordonAction::Cordon:
+            return static_cast<CordonAction>((*fields)[0][0]);
+    }
+    return std::nullopt;
+}
+
+/// What a CORDON is answered with: the worker's state now, and what is still running.
+struct CordonFields
+{
+    WireCordonState state { WireCordonState::Serving }; ///< After the request took effect.
+    std::uint32_t inFlight { 0 };                       ///< Compiles still running.
+};
+
+/// Encode a CORDON reply body.
+/// @param fields The state and the running count.
+/// @return The body, to be carried by an `Ok` reply.
+[[nodiscard]] inline std::vector<std::byte> EncodeCordonFields(CordonFields const& fields)
+{
+    auto const state = std::array { static_cast<std::byte>(fields.state) };
+    auto const inFlight = WireFields::ToBigEndian<std::uint32_t>(fields.inFlight);
+    return WireFields::Encode({ std::span<std::byte const> { state }, std::span<std::byte const> { inFlight } });
+}
+
+/// Read a CORDON reply body.
+/// @param body The `Ok` reply's payload.
+/// @return The fields, or nullopt when the body is not a state this build names and a count.
+[[nodiscard]] inline std::optional<CordonFields> DecodeCordonFields(std::span<std::byte const> body)
+{
+    auto const parts = WireFields::SplitExactly(body, 2);
+    if (!parts.has_value() || (*parts)[0].size() != 1)
+        return std::nullopt;
+    auto const inFlight = WireFields::FromBigEndian<std::uint32_t>((*parts)[1]);
+    if (!inFlight.has_value())
+        return std::nullopt;
+    switch (static_cast<WireCordonState>((*parts)[0][0]))
+    {
+        case WireCordonState::Serving:
+        case WireCordonState::Draining:
+        case WireCordonState::Drained:
+            return CordonFields { .state = static_cast<WireCordonState>((*parts)[0][0]), .inFlight = *inFlight };
+    }
+    return std::nullopt;
 }
 
 /// Encode a `NodeStatus` reply body.

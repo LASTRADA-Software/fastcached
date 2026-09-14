@@ -92,7 +92,7 @@ constexpr std::uint32_t DiscoveryPort = 9103;
 /// @return The reply bytes.
 [[nodiscard]] std::vector<std::byte> AnswerNow(IFrameResponder& responder, std::span<std::byte const> frame)
 {
-    return SyncRun(responder.Answer(frame, std::string { CallerAddress }));
+    return SyncRun(responder.Answer(frame, std::string { CallerAddress })).bytes;
 }
 
 /// The bytes following a reply header.
@@ -509,8 +509,8 @@ TEST_CASE("A node reports the compile slots it offers and the ones in use", "[no
     CHECK(fixture.status.Describe().runtime.compileSlots == std::optional<std::uint32_t> { 4 });
     CHECK(fixture.status.Describe().runtime.compilesInFlight == std::optional<std::uint32_t> { 0 });
 
-    REQUIRE(capacity.TryTakeSlot());
-    REQUIRE(capacity.TryTakeSlot());
+    REQUIRE(capacity.TryTakeSlot() == SlotAdmission::Taken);
+    REQUIRE(capacity.TryTakeSlot() == SlotAdmission::Taken);
     CHECK(fixture.status.Describe().runtime.compilesInFlight == std::optional<std::uint32_t> { 2 });
     // The cap does not move with the load, which is the other half of reporting both.
     CHECK(fixture.status.Describe().runtime.compileSlots == std::optional<std::uint32_t> { 4 });

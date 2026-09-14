@@ -56,6 +56,18 @@ struct HostCapacity
     /// average and wrong at exactly the moment somebody is looking.
     std::size_t busySlots { 0 };
 
+    /// 1 while an operator has cordoned this node's worker, 0 otherwise (#1303).
+    ///
+    /// A gauge beside `busySlots` because the two are read together: a cordoned node with
+    /// compiles running is draining, and one with none is safe to stop. A `size_t` rather
+    /// than a `bool` so the struct stays one run of 8-byte fields -- the live-stats codec's
+    /// completeness check is a size comparison -- and so it renders as the 0/1 gauge an
+    /// alert (`fastcache_node_cordoned == 1 for 1d`) is written against.
+    ///
+    /// Without it a dashboard reads the cordoned node's free slots as capacity the fleet
+    /// has, while the scheduler -- which hears the cordon in the heartbeat -- gives it none.
+    std::size_t cordoned { 0 };
+
     [[nodiscard]] bool operator==(HostCapacity const&) const = default;
 };
 

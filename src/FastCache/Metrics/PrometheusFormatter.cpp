@@ -146,6 +146,11 @@ static void AppendHostMetrics(std::string& out, HostCapacity const& host)
                          "counters, which are incremented separately.",
                  .type = Gauge,
                  .value = static_cast<std::uint64_t>(host.busySlots) },
+        Metric { .name = "fastcache_node_cordoned",
+                 .help = "1 while an operator has cordoned this node's worker: it takes no new "
+                         "compile and finishes the running ones. 0 otherwise; a restart clears it.",
+                 .type = Gauge,
+                 .value = static_cast<std::uint64_t>(host.cordoned) },
     };
 
     for (auto const& metric: table)

@@ -129,6 +129,45 @@ TEST_CASE("A machine short of memory is limited by memory, and scratch by scratc
     }
 }
 
+TEST_CASE("A cordoned node offers nothing and is limited by its cordon, as the scheduler names it",
+          "[cli][node-slots][cordon]")
+{
+    // #1303. The panel names what the fleet is acting on, and the fleet gives a cordoned node
+    // no work whatever its CPU, memory and scratch say.
+    auto host = SixteenCores();
+    host.cordoned = 1;
+
+    SECTION("with two readings, the scheduler's own answer")
+    {
+        auto const previous = ReadingOf(host, Ticks(1000, 10000));
+        auto const slots = NodeSlotsOf(&previous, ReadingOf(host, Ticks(1000, 11000)));
+        REQUIRE(slots.has_value());
+        REQUIRE(Unwrap(slots).ceilings.has_value());
+        CHECK(Unwrap(Unwrap(slots).ceilings).available == 0);
+        CHECK(Unwrap(Unwrap(slots).ceilings).binding == Distributed::SlotLimit::Cordoned);
+    }
+
+    SECTION("with ONE reading, because a cordon is known from one")
+    {
+        // The CPU ceiling still cannot be computed, which is why an uncordoned node says
+        // nothing here -- the case below -- but that uncertainty cannot un-cordon a node.
+        auto const slots = NodeSlotsOf(nullptr, ReadingOf(host, Ticks(1000, 10000)));
+        REQUIRE(slots.has_value());
+        REQUIRE(Unwrap(slots).ceilings.has_value());
+        CHECK(Unwrap(Unwrap(slots).ceilings).binding == Distributed::SlotLimit::Cordoned);
+    }
+
+    SECTION("and the same node uncordoned is limited by nothing it reports")
+    {
+        host.cordoned = 0;
+        auto const previous = ReadingOf(host, Ticks(0, 10000));
+        auto const slots = NodeSlotsOf(&previous, ReadingOf(host, Ticks(0, 11000)));
+        REQUIRE(slots.has_value());
+        REQUIRE(Unwrap(slots).ceilings.has_value());
+        CHECK(Unwrap(Unwrap(slots).ceilings).binding != Distributed::SlotLimit::Cordoned);
+    }
+}
+
 TEST_CASE("A node's first reading names no limit, because its CPU cannot be read from one", "[cli][node-slots]")
 {
     // The platform reports CPU, so the scheduler has a CPU ceiling and the panel, with one reading,

@@ -171,6 +171,7 @@ namespace
         { .limit = SlotLimit::ExternalCpu, .chipClass = "chip--cpu", .tone = CellTone::Limited },
         { .limit = SlotLimit::Memory, .chipClass = "chip--memory", .tone = CellTone::Limited },
         { .limit = SlotLimit::Scratch, .chipClass = "chip--scratch", .tone = CellTone::Alert },
+        { .limit = SlotLimit::Cordoned, .chipClass = "chip--cordoned", .tone = CellTone::Limited },
     } };
 
     static_assert(RowsInEnumeratorOrder(LimitDressTable, &LimitDress::limit),
@@ -1594,6 +1595,7 @@ th[title] { text-decoration:underline dotted var(--line); text-underline-offset:
 .chip--cpu { background:var(--warn-soft); color:var(--warn); }
 .chip--memory { background:var(--accent-soft); color:var(--accent); }
 .chip--scratch { background:var(--crit-soft); color:var(--crit); }
+.chip--cordoned { background:var(--sunk); color:var(--ink); border-color:var(--line); }
 .chip--registered { background:var(--ok-soft); color:var(--ok); }
 .bar { display:inline-flex; align-items:center; gap:.45rem; }
 .bar-track { width:54px; height:6px; border-radius:2px; background:var(--sunk);

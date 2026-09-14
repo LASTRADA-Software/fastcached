@@ -233,6 +233,26 @@ TEST_CASE("A compile node reports its size, and a cache daemon does not", "[metr
     CHECK_FALSE(withoutHost.contains("# TYPE fastcache_node_slots_busy"));
 }
 
+TEST_CASE("A compile node says whether its worker is cordoned, as a gauge that reads zero when it is not",
+          "[metrics][prometheus][cordon]")
+{
+    // #1303. Present on every node that reports a host, and ZERO when not cordoned: unlike a
+    // figure the platform may withhold, a worker always knows whether it is cordoned, so an
+    // absent series would say this node could not tell -- which is never true.
+    AtomicMetricsSink metrics;
+    auto const render = [&metrics](std::size_t cordoned) {
+        return RenderPrometheus(
+            metrics,
+            MetricsSnapshot { .storage = std::nullopt,
+                              .host = HostCapacity { .configuredSlots = 4, .busySlots = 1, .cordoned = cordoned },
+                              .uptime = Uptime { 1s } });
+    };
+
+    CHECK(render(1).contains("fastcache_node_cordoned 1"));
+    CHECK(render(0).contains("fastcache_node_cordoned 0"));
+    CHECK(render(0).contains("# TYPE fastcache_node_cordoned gauge"));
+}
+
 TEST_CASE("A compile node reports what its machine is doing, each figure only when it was read", "[metrics][prometheus]")
 {
     // The figures a node's available slots are decided by. Each renders only when the platform

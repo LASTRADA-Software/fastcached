@@ -22,6 +22,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -97,6 +98,28 @@ class ThreadRecordingRunner final: public Cc::IProcessRunner
     std::atomic<std::size_t> _runs { 0 };
 };
 
+/// Answers `IsThisMachine` for exactly one host.
+///
+/// A stand-in rather than `CachedLocalityOracle`, because what these cases ask is WHICH
+/// question the responder puts, not how this machine's addresses are found.
+class ThisMachineIs final: public ILocalityOracle
+{
+  public:
+    /// @param host The one host that is this machine.
+    explicit ThisMachineIs(std::string host):
+        _host { std::move(host) }
+    {
+    }
+
+    [[nodiscard]] bool IsThisMachine(std::string_view host) const override
+    {
+        return host == _host;
+    }
+
+  private:
+    std::string _host;
+};
+
 /// Everything a compile responder needs, and nothing that decides a thread.
 ///
 /// The two executors are deliberately NOT members: which one is the reactor and which
@@ -108,11 +131,17 @@ struct Fixture
     Cc::CompileJobRunner jobs;
     AtomicMetricsSink metrics;
     Cc::WorkerProtocol protocol;
-    NullLogger logger;
+    /// Captured rather than discarded, because a cordon's drained report is a LINE.
+    CapturingLogger logger;
 
     /// Admits everybody. The anti-leeching rule has its own case, which substitutes a
     /// listed oracle for exactly that reason.
     Distributed::OpenMembership membership;
+
+    /// This machine is `127.0.0.1` and nothing else, which is what a cordon asks. The
+    /// cordon's own locality case uses a member that is NOT this machine, so a gate asking
+    /// membership instead would admit it.
+    ThisMachineIs locality { "127.0.0.1" };
 
     Fixture():
         jobs { runner, scratch.Path(), { { "gcc-13", "g++" } }, Cc::ToolchainSurvey::Completed() },
@@ -197,6 +226,15 @@ struct Answered
     std::thread::id startedOn;  ///< The thread the request was handed over on.
     std::thread::id returnedOn; ///< The thread the reply came back on.
     std::vector<std::byte> reply;
+    /// What the reply still holds; null unless the case asked to keep it.
+    std::unique_ptr<IReplyHold> hold;
+};
+
+/// Whether `AnswerFrom` lets go of what a reply holds before handing the answer over.
+enum class ReplyHold : std::uint8_t
+{
+    Release, ///< As the endpoint does once the reply is written.
+    Keep,    ///< Stands in for a reply that has not been written yet.
 };
 
 /// Ask @p responder for one answer, starting on @p reactor, and record the threads.
@@ -213,7 +251,8 @@ struct Answered
 [[nodiscard]] Answered AnswerFrom(CompileResponder& responder,
                                   IExecutor& reactor,
                                   std::vector<std::byte> frame,
-                                  std::string peer = "127.0.0.1")
+                                  std::string peer = "127.0.0.1",
+                                  ReplyHold holding = ReplyHold::Release)
 {
     std::promise<Answered> done;
     auto future = done.get_future();
@@ -224,6 +263,7 @@ struct Answered
        IExecutor* loop,
        std::vector<std::byte> request,
        std::string caller,
+       ReplyHold keep,
        std::promise<Answered> out) -> DetachedTask {
         co_await ResumeOn { *loop };
         auto const startedOn = std::this_thread::get_id();
@@ -233,10 +273,17 @@ struct Answered
         // it borrows, and the same way the endpoint's own connection task holds it.
         auto reply = co_await target->Answer(request, std::move(caller));
 
-        out.set_value(
-            Answered { .startedOn = startedOn, .returnedOn = std::this_thread::get_id(), .reply = std::move(reply) });
+        // What the reply held is released BEFORE the answer is handed over, as the
+        // endpoint releases it once the reply is written: released after, a case reading
+        // the slot count the moment `future.get()` returns would race this frame's end.
+        if (keep == ReplyHold::Release)
+            reply.hold.reset();
+        out.set_value(Answered { .startedOn = startedOn,
+                                 .returnedOn = std::this_thread::get_id(),
+                                 .reply = std::move(reply.bytes),
+                                 .hold = std::move(reply.hold) });
         co_return;
-    }(&responder, &reactor, std::move(frame), std::move(peer), std::move(done));
+    }(&responder, &reactor, std::move(frame), std::move(peer), holding, std::move(done));
     return future.get();
 }
 
@@ -266,7 +313,9 @@ TEST_CASE("A compile leaves the reactor and the reply comes back to it", "[node]
     CompileCapacity capacity {
         /*slots=*/2, /*byteBudget=*/64ULL * 1024ULL * 1024ULL, std::chrono::seconds { 5 }, fix.logger
     };
-    CompileResponder responder { fix.protocol, capacity, fix.membership, jobs, reactor, fix.metrics, fix.logger };
+    CompileResponder responder {
+        fix.protocol, capacity, fix.membership, fix.locality, jobs, reactor, fix.metrics, fix.logger
+    };
 
     auto const reactorThread = ThreadOf(reactor);
     auto const jobsThread = ThreadOf(jobs);
@@ -306,7 +355,9 @@ TEST_CASE("A refusal is answered on the reactor without reaching the pool", "[no
     ThreadPoolExecutor reactor { 1 };
     ThreadPoolExecutor jobs { 1 };
     CompileCapacity capacity { /*slots=*/0, /*byteBudget=*/1024ULL, std::chrono::seconds { 5 }, fix.logger };
-    CompileResponder responder { fix.protocol, capacity, fix.membership, jobs, reactor, fix.metrics, fix.logger };
+    CompileResponder responder {
+        fix.protocol, capacity, fix.membership, fix.locality, jobs, reactor, fix.metrics, fix.logger
+    };
 
     auto const reactorThread = ThreadOf(reactor);
     auto const answered = AnswerFrom(responder, reactor, CompileFrame());
@@ -330,7 +381,7 @@ TEST_CASE("The merged surface applies the worker's own membership rule", "[node]
     ThreadPoolExecutor jobs { 1 };
     CompileCapacity capacity { /*slots=*/2, /*byteBudget=*/1024ULL * 1024ULL, std::chrono::seconds { 5 }, fix.logger };
     Distributed::ClusterMembership const listed { { "10.0.0.1:6676" } };
-    CompileResponder responder { fix.protocol, capacity, listed, jobs, reactor, fix.metrics, fix.logger };
+    CompileResponder responder { fix.protocol, capacity, listed, fix.locality, jobs, reactor, fix.metrics, fix.logger };
 
     auto const stranger = AnswerFrom(responder, reactor, CompileFrame(), "10.9.9.9");
     CHECK(ErrorOf(stranger.reply) == Wire::ErrorCode::NotAMember);
@@ -358,7 +409,9 @@ TEST_CASE("A stopping worker admits no more compiles", "[node][compile-responder
     ThreadPoolExecutor reactor { 1 };
     ThreadPoolExecutor jobs { 1 };
     CompileCapacity capacity { /*slots=*/4, /*byteBudget=*/1024ULL * 1024ULL, std::chrono::seconds { 5 }, fix.logger };
-    CompileResponder responder { fix.protocol, capacity, fix.membership, jobs, reactor, fix.metrics, fix.logger };
+    CompileResponder responder {
+        fix.protocol, capacity, fix.membership, fix.locality, jobs, reactor, fix.metrics, fix.logger
+    };
 
     capacity.BeginShutdown();
     auto const answered = AnswerFrom(responder, reactor, CompileFrame());
@@ -395,7 +448,9 @@ TEST_CASE("A compile declaring more than the budget is refused, not charged", "[
     ThreadPoolExecutor reactor { 1 };
     ThreadPoolExecutor jobs { 1 };
     CompileCapacity capacity { /*slots=*/2, Budget, std::chrono::seconds { 5 }, fix.logger };
-    CompileResponder responder { fix.protocol, capacity, fix.membership, jobs, reactor, fix.metrics, fix.logger };
+    CompileResponder responder {
+        fix.protocol, capacity, fix.membership, fix.locality, jobs, reactor, fix.metrics, fix.logger
+    };
 
     auto const enveloped = Wire::EncodeCodecEnvelope(NoSuchCodec, Declared, Wire::AsBytes(Compressed));
     auto const frame = Wire::EncodeCompile(Wire::CompileRequest { .leaseToken = "l1",
@@ -438,7 +493,8 @@ TEST_CASE("The compile surface requires no connection credential", "[node][compi
     ThreadPoolExecutor reactor { 1 };
     ThreadPoolExecutor jobs { 1 };
     CompileCapacity capacity { /*slots=*/1, /*byteBudget=*/1024ULL, std::chrono::seconds { 5 }, fix.logger };
-    CompileResponder const responder { fix.protocol, capacity, fix.membership, jobs, reactor, fix.metrics, fix.logger };
+    CompileResponder const responder { fix.protocol, capacity, fix.membership, fix.locality,
+                                       jobs,         reactor,  fix.metrics,    fix.logger };
 
     CHECK_FALSE(responder.AuthRequired(static_cast<std::uint8_t>(Wire::Op::Compile)));
 
@@ -468,7 +524,9 @@ TEST_CASE("The merged router sends a compile to the compile responder", "[node][
     ThreadPoolExecutor reactor { 1 };
     ThreadPoolExecutor jobs { 1 };
     CompileCapacity capacity { /*slots=*/2, /*byteBudget=*/1024ULL * 1024ULL, std::chrono::seconds { 5 }, fix.logger };
-    CompileResponder compile { fix.protocol, capacity, fix.membership, jobs, reactor, fix.metrics, fix.logger };
+    CompileResponder compile {
+        fix.protocol, capacity, fix.membership, fix.locality, jobs, reactor, fix.metrics, fix.logger
+    };
     MergedResponder merged { SurfaceComponents { .compile = &compile } };
 
     CHECK(merged.OwnerOf(static_cast<std::uint8_t>(Wire::Op::Compile)) == &compile);
@@ -566,7 +624,7 @@ class ShortWindowResponder final: public IFrameResponder
     {
     }
 
-    [[nodiscard]] Task<std::vector<std::byte>> Answer(std::span<std::byte const> frame, std::string peer) override
+    [[nodiscard]] Task<FrameReply> Answer(std::span<std::byte const> frame, std::string peer) override
     {
         co_return co_await _inner.Answer(frame, std::move(peer));
     }
@@ -968,7 +1026,8 @@ struct MergedWorker
         //
         // It is NOT what makes these cases correct -- see the destructor.
         capacity { 2, WorkerMaxRequestBytes, std::chrono::seconds { 5 }, fix.logger },
-        responder { protocol, capacity, fix.membership, pool, io.Reactor(), fix.metrics, fix.logger, progressInterval }
+        responder { protocol,     capacity,    fix.membership, fix.locality,    pool,
+                    io.Reactor(), fix.metrics, fix.logger,     progressInterval }
     {
     }
 
@@ -1515,4 +1574,203 @@ TEST_CASE("The merged listener counts the frame it refuses without reading", "[n
     CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerFramesRefusedPayloadTooLarge) == 1);
 
     REQUIRE(DrainedWithin(worker.capacity, std::chrono::seconds { 5 }));
+}
+
+// --- The cordon (#1303) -----------------------------------------------------
+
+namespace
+{
+
+/// How many times @p logger has seen a cordoned worker report it has drained.
+/// @param logger The capture.
+/// @return The count.
+[[nodiscard]] std::size_t DrainedReports(CapturingLogger const& logger)
+{
+    auto const records = logger.Snapshot();
+    return static_cast<std::size_t>(std::ranges::count_if(
+        records, [](CapturingLogger::Record const& record) { return record.message.contains("cordoned and drained"); }));
+}
+
+/// Ask a worker behind @p port to cordon itself, or to lift it, and read back its state.
+/// @param port Where the endpoint listens.
+/// @param action Cordon, or lift it.
+/// @return The worker's state after the request.
+[[nodiscard]] Wire::CordonFields CordonOver(std::uint16_t port, Wire::CordonAction action)
+{
+    auto const reply = Exchange(port, Wire::EncodeCordonRequest(action));
+    REQUIRE(StatusOf(reply) == Wire::Status::Ok);
+    auto const fields = Wire::DecodeCordonFields(std::span<std::byte const> { reply }.subspan(Wire::ReplyHeaderSize));
+    REQUIRE(fields.has_value());
+    return Unwrap(fields);
+}
+
+} // namespace
+
+TEST_CASE("A cordoned worker refuses a new compile while the one it was running is delivered",
+          "[node][compile-responder][cordon]")
+{
+    // #1303's acceptance, end to end over a real socket and the merged router. Three
+    // claims, each of which a plausible wrong build fails and the others do not:
+    //
+    //   * the new compile is refused FOR THE CORDON -- its counter moves, `no_slot` and
+    //     `stopping` do not -- with a slot free, so a refusal decided by the slot count
+    //     cannot produce it;
+    //   * the compile admitted BEFORE the cordon runs to completion and its object reaches
+    //     the client, which is what a bounded stop fails to do and a cordon exists for;
+    //   * the drained report is written once, and only after that object has gone out.
+    Fixture fix;
+    NodeIoLoop io;
+    MergedWorker worker { fix, io };
+    MergedResponder merged { SurfaceComponents { .compile = &worker.responder } };
+
+    auto const port = FreePort();
+    auto endpoint = FrameEndpoint::Start(io, NodeSurface::Node, ConfigForPort(port), merged, fix.metrics, fix.logger);
+    REQUIRE(endpoint.has_value());
+    io.Start();
+
+    auto running = std::async(std::launch::async, [port] { return Exchange(port, CompileFrame()); });
+    REQUIRE(worker.runner.WaitForStarted(1));
+    REQUIRE(worker.capacity.InFlight() == 1);
+
+    auto const cordoned = CordonOver(port, Wire::CordonAction::Cordon);
+    CHECK(cordoned.state == Wire::WireCordonState::Draining);
+    CHECK(cordoned.inFlight == 1);
+    CHECK(DrainedReports(fix.logger) == 0);
+
+    // One slot of two is free, so only the cordon can refuse this.
+    auto const refused = Exchange(port, CompileFrame());
+    CHECK(ErrorOf(refused) == Wire::ErrorCode::NoCapacity);
+    CHECK(CounterReaching(fix.metrics, IMetricsSink::Counter::WorkerJobsRefusedCordoned, 1) == 1);
+    CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsRefusedNoSlot) == 0);
+    CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsRefusedStopping) == 0);
+    CHECK(DrainedReports(fix.logger) == 0);
+
+    worker.runner.Release();
+    auto const delivered = running.get();
+    REQUIRE_FALSE(delivered.empty());
+    CHECK(StatusOf(delivered) == Wire::Status::Ok);
+    auto const result = Wire::DecodeCompileResult(std::span<std::byte const> { delivered }.subspan(Wire::ReplyHeaderSize));
+    REQUIRE(result.has_value());
+    CHECK(Unwrap(result).exitCode == 0);
+
+    CHECK(DrainedWithin(worker.capacity, std::chrono::seconds { 5 }));
+    CHECK(DrainedReports(fix.logger) == 1);
+    CHECK(worker.capacity.CordonState() == Wire::WireCordonState::Drained);
+
+    // Lifted over the same wire, and the worker takes compiles again.
+    CHECK(CordonOver(port, Wire::CordonAction::Lift).state == Wire::WireCordonState::Serving);
+    auto again = std::async(std::launch::async, [port] { return Exchange(port, CompileFrame()); });
+    REQUIRE(worker.runner.WaitForStarted(2));
+    CHECK(StatusOf(again.get()) == Wire::Status::Ok);
+
+    CHECK(DrainedWithin(worker.capacity, std::chrono::seconds { 5 }));
+    worker.capacity.Drain();
+}
+
+TEST_CASE("A compile's slot is held until its reply has been written, so drained means delivered",
+          "[node][compile-responder][cordon]")
+{
+    // The ordering the case above cannot pin, because over a socket the write and the
+    // release land within a scheduling quantum of each other. `Answer` hands the endpoint
+    // the object AND the slot; the endpoint lets go of the slot once the object has been
+    // written. So between the two -- the stretch in which an 84 MB object is still going
+    // out -- the worker is not drained, and a cordoned one must not say it is.
+    Fixture fix;
+    ThreadPoolExecutor reactor { 1 };
+    ThreadPoolExecutor jobs { 1 };
+    CompileCapacity capacity {
+        /*slots=*/2, /*byteBudget=*/64ULL * 1024ULL * 1024ULL, std::chrono::seconds { 5 }, fix.logger
+    };
+    CompileResponder responder {
+        fix.protocol, capacity, fix.membership, fix.locality, jobs, reactor, fix.metrics, fix.logger
+    };
+
+    auto answered = AnswerFrom(responder, reactor, CompileFrame(), "127.0.0.1", ReplyHold::Keep);
+    REQUIRE(StatusOf(answered.reply) == Wire::Status::Ok);
+    REQUIRE(answered.hold != nullptr);
+
+    // Answered, and not yet written.
+    CHECK(capacity.InFlight() == 1);
+    CHECK(capacity.Cordon(true).state == Wire::WireCordonState::Draining);
+    CHECK(DrainedReports(fix.logger) == 0);
+
+    // Written.
+    answered.hold.reset();
+    CHECK(capacity.InFlight() == 0);
+    CHECK(capacity.CordonState() == Wire::WireCordonState::Drained);
+    CHECK(DrainedReports(fix.logger) == 1);
+}
+
+TEST_CASE("A cordon is answered for this machine only, whatever the peer's membership", "[node][compile-responder][cordon]")
+{
+    // The gate follows the VERB. A compile spends this machine's CPU and asks membership;
+    // a cordon decides whether this machine serves the fleet at all and asks locality --
+    // so a fleet member elsewhere, admitted to compile here, is refused a cordon. The
+    // fixture admits every peer to compile, which is what makes a gate asking membership
+    // for the cordon pass the peer that must be refused.
+    Fixture fix;
+    ThreadPoolExecutor reactor { 1 };
+    ThreadPoolExecutor jobs { 1 };
+    CompileCapacity capacity { /*slots=*/2, /*byteBudget=*/1024ULL * 1024ULL, std::chrono::seconds { 5 }, fix.logger };
+    CompileResponder responder {
+        fix.protocol, capacity, fix.membership, fix.locality, jobs, reactor, fix.metrics, fix.logger
+    };
+
+    constexpr std::string_view Member = "10.0.0.1";
+    auto const cordon = static_cast<std::uint8_t>(Wire::Op::Cordon);
+    auto const compile = static_cast<std::uint8_t>(Wire::Op::Compile);
+
+    auto const remote =
+        AnswerFrom(responder, reactor, Wire::EncodeCordonRequest(Wire::CordonAction::Cordon), std::string { Member });
+    CHECK(ErrorOf(remote.reply) == Wire::ErrorCode::NotAMember);
+    CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerCordonsRefusedNotLocal) == 1);
+    CHECK_FALSE(capacity.IsCordoned());
+    // Refused at the door too, on the peer alone, before a payload byte is read -- and
+    // counted there, since the door is where the endpoint asks it.
+    CHECK(responder.RefusePeer(Member, cordon).has_value());
+    CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerCordonsRefusedNotLocal) == 2);
+
+    // The same peer is still admitted to compile: the locality gate is the cordon's, not
+    // the surface's.
+    CHECK_FALSE(responder.RefusePeer(Member, compile).has_value());
+    auto const compiled = AnswerFrom(responder, reactor, CompileFrame(), std::string { Member });
+    CHECK(StatusOf(compiled.reply) == Wire::Status::Ok);
+    CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsRefusedNotAMember) == 0);
+
+    // And this machine is answered, with the state it is in now.
+    auto const local = AnswerFrom(responder, reactor, Wire::EncodeCordonRequest(Wire::CordonAction::Cordon), "127.0.0.1");
+    REQUIRE(StatusOf(local.reply) == Wire::Status::Ok);
+    auto const fields = Wire::DecodeCordonFields(std::span<std::byte const> { local.reply }.subspan(Wire::ReplyHeaderSize));
+    REQUIRE(fields.has_value());
+    CHECK(Unwrap(fields).state == Wire::WireCordonState::Drained);
+    CHECK(capacity.IsCordoned());
+    CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerCordonsRefusedNotLocal) == 2);
+}
+
+TEST_CASE("A cordon is a round trip, not a compile, to every question the endpoint asks",
+          "[node][compile-responder][cordon]")
+{
+    // A cordon answered under a compile's per-verb answers would carry a pulse the client
+    // refuses (`Status::Progress` is `Op::Compile`'s alone), an hour-long window, a peer
+    // watch counting a departure against a job that does not exist, and a byte budget
+    // nobody charges. The compile's answers are asserted beside it, so a responder that
+    // answered every verb one way fails one half whichever way it chose.
+    Fixture fix;
+    ThreadPoolExecutor reactor { 1 };
+    ThreadPoolExecutor jobs { 1 };
+    CompileCapacity capacity { /*slots=*/1, /*byteBudget=*/1024ULL, std::chrono::seconds { 5 }, fix.logger };
+    CompileResponder const responder { fix.protocol, capacity, fix.membership, fix.locality,
+                                       jobs,         reactor,  fix.metrics,    fix.logger };
+
+    auto const cordon = static_cast<std::uint8_t>(Wire::Op::Cordon);
+    auto const compile = static_cast<std::uint8_t>(Wire::Op::Compile);
+
+    CHECK_FALSE(responder.ProgressInterval(cordon).has_value());
+    CHECK(responder.ProgressInterval(compile).has_value());
+    CHECK_FALSE(responder.PeerWatchCounter(cordon).has_value());
+    CHECK(responder.PeerWatchCounter(compile).has_value());
+    CHECK_FALSE(responder.HoldsOwnByteBudget(cordon));
+    CHECK(responder.HoldsOwnByteBudget(compile));
+    CHECK(responder.RequestTimeout(cordon) == FrameServer::HeaderTimeout);
+    CHECK(responder.RequestTimeout(compile) == Wire::MaxCompileLeaseLifetime);
 }

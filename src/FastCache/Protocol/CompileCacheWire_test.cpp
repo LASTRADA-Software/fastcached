@@ -2204,3 +2204,119 @@ TEST_CASE("Every push kind round-trips through its own decoder")
     unknown[0] = std::byte { 0x04 };
     CHECK_FALSE(DecodePush(unknown).has_value());
 }
+
+// --- The cordon (#1303) -----------------------------------------------------
+
+TEST_CASE("The cordon verb occupies the byte it was assigned, in the compile family", "[wire][cordon]")
+{
+    // The value as well as the name, for the reason the enrollment bytes are pinned: a
+    // consistent renumbering keeps every in-tree test agreeing while a deployed CLI breaks.
+    CHECK(static_cast<std::uint8_t>(Op::Cordon) == 0x13);
+    CHECK(std::ranges::count(OpTable, Op::Cordon, &OpDescriptor::code) == 1);
+
+    // The compile family, because what a cordon governs is that family's admission -- so
+    // a node running no worker answers it the family's not-served sentence.
+    CHECK(FamilyOf(static_cast<std::uint8_t>(Op::Cordon)) == VerbFamily::Compile);
+    CHECK_FALSE(IsPreAuthAllowed(static_cast<std::uint8_t>(Op::Cordon)));
+
+    // And the three states are the bytes a CLI of another build reads.
+    CHECK(static_cast<std::uint8_t>(WireCordonState::Serving) == 0x01);
+    CHECK(static_cast<std::uint8_t>(WireCordonState::Draining) == 0x02);
+    CHECK(static_cast<std::uint8_t>(WireCordonState::Drained) == 0x03);
+    CHECK(static_cast<std::uint8_t>(CordonAction::Lift) == 0x00);
+    CHECK(static_cast<std::uint8_t>(CordonAction::Cordon) == 0x01);
+}
+
+TEST_CASE("A cordon request carries one action byte, and anything else is refused", "[wire][cordon]")
+{
+    for (auto const action: { CordonAction::Cordon, CordonAction::Lift })
+    {
+        auto const frame = EncodeCordonRequest(action);
+        auto const header = DecodeRequestHeader(frame);
+        REQUIRE(header.has_value());
+        CHECK(Unwrap(header).opRaw == 0x13);
+        auto const payload = std::span<std::byte const> { frame }.subspan(RequestHeaderSize);
+        CHECK(DecodeCordonPayload(payload) == std::optional { action });
+    }
+
+    // A byte naming no action is refused rather than read as either: a cordon a client
+    // did not ask for is a machine silently out of the fleet, and a lift it did not ask
+    // for is one silently back in.
+    auto const unnamed = std::array { std::byte { 0x02 } };
+    CHECK_FALSE(DecodeCordonPayload(WireFields::Encode({ std::span<std::byte const> { unnamed } })).has_value());
+    auto const wide = std::array { std::byte { 0x00 }, std::byte { 0x01 } };
+    CHECK_FALSE(DecodeCordonPayload(WireFields::Encode({ std::span<std::byte const> { wide } })).has_value());
+    CHECK_FALSE(DecodeCordonPayload({}).has_value());
+}
+
+TEST_CASE("A cordon reply round-trips every state and its count, and refuses a state it cannot name", "[wire][cordon]")
+{
+    // A different count per state, so an encoder that dropped either half cannot agree
+    // with all three.
+    for (auto const& sent: { CordonFields { .state = WireCordonState::Serving, .inFlight = 5 },
+                             CordonFields { .state = WireCordonState::Draining, .inFlight = 2 },
+                             CordonFields { .state = WireCordonState::Drained, .inFlight = 0 } })
+    {
+        auto const back = DecodeCordonFields(EncodeCordonFields(sent));
+        REQUIRE(back.has_value());
+        CHECK(Unwrap(back).state == sent.state);
+        CHECK(Unwrap(back).inFlight == sent.inFlight);
+    }
+
+    auto const unnamed = std::array { std::byte { 0x7F } };
+    auto const count = WireFields::ToBigEndian<std::uint32_t>(1);
+    CHECK_FALSE(DecodeCordonFields(
+                    WireFields::Encode({ std::span<std::byte const> { unnamed }, std::span<std::byte const> { count } }))
+                    .has_value());
+    CHECK_FALSE(DecodeCordonFields({}).has_value());
+}
+
+TEST_CASE("A heartbeat carries the cordon, and a record without it is a serving worker", "[wire][cordon]")
+{
+    LoadFields cordoned {};
+    cordoned.cordoned = true;
+    auto const back = DecodeLoad(EncodeLoad(cordoned));
+    REQUIRE(back.has_value());
+    CHECK(Unwrap(back).cordoned);
+
+    // Serving travels as an EMPTY field, and a record that stops before it -- five fields,
+    // what a build without the cordon emits -- decodes as serving too.
+    auto const serving = DecodeLoad(EncodeLoad(LoadFields {}));
+    REQUIRE(serving.has_value());
+    CHECK_FALSE(Unwrap(serving).cordoned);
+
+    // The encoding is kept in a local: `SplitAll` hands back spans INTO it.
+    auto const encoded = EncodeLoad(cordoned);
+    auto const parts = WireFields::SplitAll(encoded);
+    REQUIRE(parts.has_value());
+    REQUIRE(Unwrap(parts).size() == 6);
+    auto const five = std::vector<std::span<std::byte const>> { Unwrap(parts).begin(), Unwrap(parts).begin() + 5 };
+    auto const shorter = DecodeLoad(WireFields::Encode(WireFields::FieldList { five }));
+    REQUIRE(shorter.has_value());
+    CHECK_FALSE(Unwrap(shorter).cordoned);
+
+    // Any byte but the one the encoder writes is a shape this build does not know, and is
+    // refused rather than read as either answer.
+    auto odd = std::vector<std::span<std::byte const>> { Unwrap(parts).begin(), Unwrap(parts).begin() + 5 };
+    auto const two = std::array { std::byte { 0x02 } };
+    odd.emplace_back(two);
+    CHECK_FALSE(DecodeLoad(WireFields::Encode(WireFields::FieldList { odd })).has_value());
+}
+
+TEST_CASE("A node runtime record carries the cordon state, and absent is not serving", "[wire][cordon][nodestatus]")
+{
+    // Absent on a node that runs no worker, for the enrollment window's reason: `Serving`
+    // there would be a reassuring answer about a worker that does not exist.
+    auto const silent = DecodeNodeRuntime(EncodeNodeRuntime(NodeRuntimeFields {}));
+    REQUIRE(silent.has_value());
+    CHECK_FALSE(Unwrap(silent).cordon.has_value());
+
+    for (auto const state: { WireCordonState::Serving, WireCordonState::Draining, WireCordonState::Drained })
+    {
+        NodeRuntimeFields sent {};
+        sent.cordon = state;
+        auto const back = DecodeNodeRuntime(EncodeNodeRuntime(sent));
+        REQUIRE(back.has_value());
+        CHECK(Unwrap(back).cordon == std::optional { state });
+    }
+}
