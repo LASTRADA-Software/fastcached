@@ -324,7 +324,7 @@ TEST_CASE("The startup row refuses exactly the consensus nodes whose dial addres
     };
 
     NodeConfig worker;
-    worker.scheduler = "127.0.0.1:6674";
+    worker.schedulers = { "127.0.0.1:6674" };
     auto consensus = worker;
     consensus.raftListen = "6680";
 
