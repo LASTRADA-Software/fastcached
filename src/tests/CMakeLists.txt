@@ -1595,6 +1595,66 @@ set_tests_properties("clang-format-version-selftest" PROPERTIES
     TIMEOUT 120
 )
 
+# `.clang-tidy-version` names the ONE clang-tidy build both tidy jobs and the local gate judge
+# with -- an exact PyPI release, because apt's `clang-tidy-<major>` names a family of snapshots
+# that print one banner and disagree about findings (#1404, #1198). This refuses a declaration
+# that is not an exact release, names another package, or has a major other than
+# `CLANG_TOOLS_VERSION`'s. Needs no analyser, so it is in the default set.
+#
+# Whether an INSTALLED analyser is that build is the `--installed` mode -- its wheel's METADATA
+# version and the binary's sha256 against RECORD -- and deliberately not a ctest: only the two
+# tidy jobs and the gate have the analyser, so a registration would skip everywhere (#1135).
+add_test(
+    NAME "clang-tidy-version"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-clang-tidy-version.sh" "${CMAKE_SOURCE_DIR}"
+)
+set_tests_properties("clang-tidy-version" PROPERTIES
+    LABELS "hygiene"
+    TIMEOUT 120
+)
+
+# Both directions over synthetic wheel layouts: the declared wheel accepted (and its Windows
+# binary name), and refused -- another release, a binary whose bytes are not the ones RECORD
+# lists, the wheel's binary copied out of its tree, a distribution's analyser, nothing installed.
+# Shown to bite: disarming the digest, version, layout, pin or no-fallback clause each reddens
+# exactly its own case.
+add_test(
+    NAME "clang-tidy-version-selftest"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-clang-tidy-version.sh" --self-test "${CMAKE_SOURCE_DIR}"
+)
+set_tests_properties("clang-tidy-version-selftest" PROPERTIES
+    LABELS "hygiene"
+    TIMEOUT 120
+)
+
+# A crash the declared clang-tidy build is KNOWN to have is a row of `check-clang-tidy-known-defects.sh` (#1410):
+# the tree names the value first at every site of the crashing shape rather than disable the check. This
+# default mode needs no analyser: each row's issue leads a rulebook `## Open work` entry, and every source
+# line naming a row's check names that issue too, so the change that retires a row finds every site.
+#
+# Whether the build still crashes is `--installed`, run by both clang-tidy jobs and the gate -- not a
+# ctest, for the reason `clang-tidy-version` gives (#1135).
+add_test(
+    NAME "clang-tidy-known-defects"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-clang-tidy-known-defects.sh" "${CMAKE_SOURCE_DIR}"
+)
+set_tests_properties("clang-tidy-known-defects" PROPERTIES
+    LABELS "hygiene"
+    TIMEOUT 120
+)
+
+# Every verdict of the decision (still crashing, fixed, check not live, control not parsing, a different
+# failure), `--installed` end to end over stub analysers with and without the defect, and the default mode
+# over synthetic trees in both directions.
+add_test(
+    NAME "clang-tidy-known-defects-selftest"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-clang-tidy-known-defects.sh" --self-test "${CMAKE_SOURCE_DIR}"
+)
+set_tests_properties("clang-tidy-known-defects-selftest" PROPERTIES
+    LABELS "hygiene"
+    TIMEOUT 120
+)
+
 add_test(
     NAME "script-modes"
     COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-script-modes.sh"

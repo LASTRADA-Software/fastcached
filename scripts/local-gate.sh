@@ -18,7 +18,8 @@
 #                 formatting, so a tree clean under whatever is on PATH can still be
 #                 rejected -- for code nobody mis-wrote.
 #   clang-debug   PEDANTIC + ASan + UBSan + clang-tidy, the ANALYSER pinned to the
-#                 same version. The default agent preset, the only place sanitizers
+#                 one build .clang-tidy-version declares and identified by its wheel,
+#                 not by a name (#1404). The default agent preset, the only place sanitizers
 #                 run at all, and the only preset here that tidies anything -- which
 #                 is why the other one says so out loud rather than leaving a reader
 #                 to infer that the gate's tidy coverage is both.
@@ -190,6 +191,10 @@ done
 # was written down and not carried one call further, so the gate's own comment
 # documented the defect it had. The pin now reaches the configure, and the run
 # prints which binary it used.
+#
+# This major now names the FORMATTER only. The analyser is a build, declared in
+# .clang-tidy-version and resolved below (#1404), because a major names a family of
+# analysers that disagree.
 tools_version="${CLANG_TOOLS_VERSION:-22}"
 
 # Render one line per configuration: what it did, including having done nothing.
@@ -4107,13 +4112,23 @@ fi
 # Only demanded when some preset in the table actually tidies. A gate that refused
 # to start over a tool none of its configurations use would be a gate people stop
 # running.
+#
+# And resolved to a BUILD, not a name (#1404). `clang-tidy-<major>` names a family: apt.llvm.org's snapshots all print
+# one `--version` banner, and two of them disagreed on 19 findings in one file (#1198). `.clang-tidy-version` declares
+# the one build CI judges with, and `check-clang-tidy-version.sh --resolve` hands back a binary only once its wheel's
+# METADATA says that version and its RECORD holds the binary's sha256 -- otherwise it refuses, naming the install
+# command for this machine, and so does this gate.
 tidy=""
 tidy_path=""
 for row in "${gate_presets[@]}"; do
     if [[ "${row#*|}" == "tidy" ]]; then
-        tidy="clang-tidy-${tools_version}"
-        tidy_path="$(command -v "$tidy" 2>/dev/null || true)"
-        [[ -n "$tidy_path" ]] || fail "$tidy not found, and this gate will not fall back to whatever clang-tidy is on PATH; install it (pip download clang-tidy==${tools_version}.1.0) or set CLANG_TOOLS_VERSION"
+        tidy_path="$(bash "$(dirname "${BASH_SOURCE[0]}")/check-clang-tidy-version.sh" --resolve "$repo_root")" \
+            || fail "no clang-tidy this gate can identify as the build .clang-tidy-version declares (above), and it will not fall back to whatever clang-tidy is on PATH -- a clean report from another build is a report about a different analyser; install the declared build as the lines above say"
+        tidy="$tidy_path"
+        # The crashes this build is KNOWN to have, asserted against it: the sites the tree rewrote around one stay
+        # exactly as long as the build still crashes there (#1410).
+        bash "$(dirname "${BASH_SOURCE[0]}")/check-clang-tidy-known-defects.sh" --installed "$tidy_path" "$repo_root" \
+            || fail "the declared clang-tidy does not behave as check-clang-tidy-known-defects.sh records (above), so the workarounds the tree carries for it no longer describe the analyser this gate would judge with"
 
         # Asked once and HERE, beside the tool it is about, rather than per preset:
         # the header filter is a property of `.clang-tidy` and of where this
@@ -4241,7 +4256,7 @@ run_preset() {
     done
     if [[ "$analyser" == "tidy" ]]; then
         configure+=("-DCLANG_TIDY_EXE=${tidy_path}")
-        echo "== $preset: clang-tidy pinned to $tidy ($tidy_path)"
+        echo "== $preset: clang-tidy pinned to the declared build, $tidy_path"
     else
         echo "== $preset: no clang-tidy (ENABLE_TIDY is off in this preset)"
     fi

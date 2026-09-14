@@ -26,15 +26,18 @@
 # under-approximation costs a red build on master for code a pull request was
 # told was clean.
 #
-# Getting the pinned binary (no root needed; see
-# .agent/rules/build-and-toolchain.md):
+# Getting the pinned binary (no root needed): the ONE build `.clang-tidy-version`
+# declares, as the PyPI wheel it names (#1404), into the site this script and
+# `local-gate.sh` look in when `TIDY` is unset:
 #
-#   pip download "clang-tidy==${CLANG_TOOLS_VERSION}.1.0" -d /tmp/ct --no-deps
-#   python3 -m zipfile -e /tmp/ct/clang_tidy-*.whl /tmp/ct22
-#   chmod +x /tmp/ct22/clang_tidy/data/bin/clang-tidy    # the wheel loses the bit
+#   python3 -m pip install --target "${XDG_DATA_HOME:-$HOME/.local/share}/fastcached/clang-tidy/<version>" \
+#       "$(bash scripts/check-clang-tidy-version.sh --requirement)"
 #
-# Run it from where it was unpacked, or through a wrapper that does: clang-tidy
-# resolves its resource headers relative to the binary.
+# A host whose python3 has no pip can unzip the wheel into that directory instead
+# (`python3 -m zipfile -e <wheel> <dir>`, then `chmod +x` the binary, which the zip
+# loses). Run the binary from where it sits: clang-tidy resolves its resource headers
+# relative to itself, and the identity check below reads the wheel's METADATA and
+# RECORD beside it.
 #
 # And the database is configured **through the preset the CI job configures**,
 # with CI's own flags, into a directory of its own:
@@ -76,7 +79,7 @@
 # to the ANALYSER (`TIDY=`, above); the configuring compiler is whatever `PATH`
 # offers, and nothing here checks it.
 #
-# Usage:  [TIDY=clang-tidy-22] [DB=out/build/tidy22] [BASE=origin/master] \
+# Usage:  [TIDY=<the declared clang-tidy build>] [DB=out/build/tidy22] [BASE=origin/master] \
 #         [JOBS=4] scripts/tidy-sweep.sh [--all|--ci|--self-test]
 #
 #   --all        sweep every translation unit in the database, whatever changed.
@@ -184,7 +187,7 @@ case "$(InterpreterVerdict "${BASH_VERSINFO[0]:-}" "${BASH_VERSINFO[1]:-0}" "$se
         ;;
 esac
 
-TIDY="${TIDY:-clang-tidy-${CLANG_TOOLS_VERSION:-22}}"
+TIDY="${TIDY:-}"
 DB="${DB:-out/build/tidy22}"
 BASE="${BASE:-origin/master}"
 # getconf rather than nproc alone: this runs on macOS too, where nproc does not
@@ -332,6 +335,7 @@ CiScopeFor() {
 # sources themselves. A README typo must not cost a full sweep.
 SweepEverythingWhen=(
     "*.clang-tidy"                 # the check list and every check's options
+    "*.clang-tidy-version"         # WHICH analyser judges (#1404): a new build can report in any unit
     "*.clang-format"               # a reformat can move a finding's line
     "CMakePresets.json"            # the flags the database is generated from
     "*CMakeLists.txt"              # ditto
@@ -1623,6 +1627,17 @@ if [[ "$mode" == ci ]]; then
     fi
 fi
 
+# The analyser is a BUILD, not a name (#1404): `.clang-tidy-version` declares it, and a binary counts only when its
+# wheel's METADATA says that version and its RECORD holds the binary's sha256. `TIDY` unset asks `--resolve` for the
+# local install; `TIDY` set -- which is how both CI jobs call this -- is checked the same way, so no path through the
+# sweep judges with an analyser it cannot identify. Asked only here, after `--self-test` has returned: that needs none.
+if [[ -z "$TIDY" ]]; then
+    TIDY="$(bash "${repo_root}/scripts/check-clang-tidy-version.sh" --resolve "$repo_root")" \
+        || fatal "no clang-tidy this sweep can identify as the build .clang-tidy-version declares (above); install it as the lines above say, or name one in TIDY"
+else
+    bash "${repo_root}/scripts/check-clang-tidy-version.sh" --installed "$TIDY" "$repo_root" \
+        || fatal "TIDY=$TIDY is not the clang-tidy build .clang-tidy-version declares (above)"
+fi
 command -v "$TIDY" >/dev/null 2>&1 || fatal "$TIDY is not on PATH"
 "$TIDY" --version >/dev/null 2>&1 || fatal "$TIDY will not run"
 [[ -f "${DB}/compile_commands.json" ]] || fatal "no compile database at ${DB}"

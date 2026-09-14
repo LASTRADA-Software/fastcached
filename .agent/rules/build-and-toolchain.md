@@ -579,7 +579,9 @@ determinism rests on.
   code nobody mis-wrote, and one no local run catches unless it uses the same version. Name the
   version explicitly rather than relying on `PATH`:
   `git ls-files '*.h' '*.hpp' '*.cpp' | xargs clang-format-$V --dry-run --Werror --style=file`,
-  and `-DCMAKE_CXX_CLANG_TIDY=clang-tidy-$V` **in a build directory of its own**. Found three
+  and, for the analyser, the build `.clang-tidy-version` declares
+  (`-DCMAKE_CXX_CLANG_TIDY="$(bash scripts/check-clang-tidy-version.sh --resolve)"`, see the
+  bullet on the analyser's BUILD below) **in a build directory of its own**. Found three
   times in one branch: four files reformatted by 22 after 20 had passed them, four
   `find(...) != npos` tests that only 22 reports as `readability-container-contains`, and five
   `std::lock_guard`s that only 22 reports as `modernize-use-scoped-lock`. **The preset alone is
@@ -616,6 +618,10 @@ determinism rests on.
   hazard the bullet above names — a newer formatter reformatting code the older one
   accepted. Upgrade the pair together. No `llvm.sh` re-run is needed where the
   apt.llvm.org source is already configured; `apt-get update` surfaces the candidate.
+
+  For the ANALYSER this stopped being the remedy (#1404): it is no longer apt's
+  `clang-tidy-<major>` at all, for the reasons in the bullet on the analyser's BUILD below.
+  The measurement above is why.
 - **The formatter's BUILD is stated in `.clang-format-version`, and a formatter that is not
   that build does not write.** clang-format's own `--version` line DOES carry the snapshot
   (`Ubuntu clang-format version 22.1.8 (++20260714014902+ca7933e47d3a-1~exp1~…)`), unlike
@@ -647,13 +653,61 @@ determinism rests on.
   the hook formats from the file's directory on a relative path; measured at 0.42 s per
   edit that writes, against 0.20 s for a refusal. That wrapper is one developer's machine,
   which is why it goes on `PATH` and never into the declaration.
+- **The analyser's BUILD is `.clang-tidy-version`: an exact PyPI release, identified by its
+  wheel, never by a name or a banner (#1404).** The formatter's remedy does not transfer:
+  `clang-tidy-22 --version` prints `Ubuntu LLVM version 22.1.8` for every apt snapshot, so there
+  is no banner to compare, and `dpkg-query` can tell snapshots apart but not pin one — apt.llvm.org
+  keeps only the newest, so a dpkg pin turns every mirror roll into a red on every branch that no
+  developer can ever install back. PyPI's `clang-tidy` release is immutable, installs on Linux,
+  macOS and Windows, and is the same analyser on all three, which also ended `clang-tidy-windows`
+  judging with 22.1.0 while Linux judged with a 22.1.8 snapshot.
+  - **A binary IS the declared build when its wheel says so, and not otherwise**:
+    - it sits at `<site>/clang_tidy/data/bin/clang-tidy[.exe]`;
+    - exactly one `clang_tidy-*.dist-info` beside it has `Version:` equal to the declaration;
+    - that dist-info's RECORD holds the binary's sha256.
+    `scripts/check-clang-tidy-version.sh --installed` decides it. Anything else — apt's,
+    choco's, pip's PATH shim, a copied binary — is UNIDENTIFIABLE, a refusal of its own.
+  - **The layout clause is not decoration.** The wheel's own bytes copied out of its tree pass the
+    digest and the version and still analyse nothing: measured 2026-09-14, the copy reports
+    `'stddef.h' file not found`, because clang-tidy resolves its resource headers relative to itself.
+  - **Measured before switching, and the measurement could not see a crash.** Both analysers used
+    one apt-generated compile database: the 22.1.8 wheel against the apt snapshot CI installed
+    (`1:22.1.8~++20260714014902+ca7933e47d3a`).
+    - Under `.clang-tidy`, 304 enabled checks each, no difference.
+    - Every check both carry switched on, over 25 sampled units: 14711 diagnostic lines per side,
+      identical. The same 25 units under `.clang-tidy` alone were all CLEAN on both sides, which
+      could not have shown a difference.
+    - **Both comparisons read diagnostic LINES and never the exit status**, and a crashing analyser
+      prints no diagnostic line, so it scores as clean. On `a96e4e45` the gate was the real evidence,
+      because it builds every unit through the analyser and fails on its status. On the next master
+      the wheel segfaulted on a unit #1392 added, where apt, built from the same commit, exited 0.
+  - **A crash the declared build is KNOWN to have is a row of
+    `scripts/check-clang-tidy-known-defects.sh`, never a disabled check.** The tree names the
+    offending value first at every site, with a ONE-line comment naming the check and the tracking
+    issue, and each row plants the crashing shape, a named control and a unit the check reports.
+    Both CI jobs and the gate run `--installed` against the identified build, so the release that
+    fixes the defect goes red there and says what the change must remove. apt's silence on the same
+    shape is a null pointer read by luck, and it is not a reason to prefer apt: a crash fails CLOSED.
+  - **One question, three askers.** `--resolve` hands a local run the binary `FASTCACHED_CLANG_TIDY`
+    names, or the one installed at `${XDG_DATA_HOME:-~/.local/share}/fastcached/clang-tidy/<version>`,
+    only after identifying it, and names the exact `pip install --target` command when it cannot.
+    `local-gate.sh` passes that binary to the configure. `tidy-sweep.sh` resolves or checks its
+    `TIDY` the same way. Both CI jobs install with `--requirement` and check with `--installed`
+    before the sweep. There is no fallback to a `clang-tidy` on `PATH` anywhere: that is the
+    analyser nothing can identify.
+  - **The COMPILERS stay where they were.** The build legs use apt's clang, and the Windows
+    database uses choco's `clang-cl`, now at the declared release. The analyser brings its own
+    frontend and resource headers.
+  - `.clang-tidy-version` is a `SweepEverythingWhen` row, because a new analyser can report in any
+    unit. `ctest -R clang-tidy-version` holds its major to `CLANG_TOOLS_VERSION`.
 - **A script that NAMES a tool version must name it everywhere that version matters, and
   the gate that says so had the defect it documents.** `local-gate.sh` resolved
   `clang-format-$V` by name, and then let the `clang-debug` preset take its analyser from
   `PATH` -- with the paragraph above written in its own header, four lines from the code that
   ignored it. An argument carried one call short is the shape to look for: the reasoning is
   present, correct, and applied to one of the two tools it was written about. The gate now
-  resolves `clang-tidy-$V` to an absolute path, **before anything is built**, refuses by name
+  resolves the analyser to an absolute path, **before anything is built** -- since #1404 the
+  declared BUILD through `check-clang-tidy-version.sh --resolve`, not `clang-tidy-$V` -- refuses by name
   when it is absent rather than falling back, passes it to the configure, and prints which
   binary it used -- and none of that is loosened by `--no-format`, which names the other tool.
   - **A cached `find_program` result outlives every reason it was chosen**, so the pin has to
@@ -2385,12 +2439,12 @@ makes it anyway and says so there.
   gap and it is not new — the diff-scoped pull-request sweep has always had it — but
   it is why this reads "only where the include graph is complete" rather than "never".
 
-  What is left beyond that is the analyser drifting under us — apt.llvm.org publishing
-  a new `clang-tidy-22`. The diff-scoped PULL REQUEST sweep catches such drift only
-  where it lands inside the scope it already sweeps, which is a fraction of it and was
-  a fraction of it before this change too; a deliberate version bump escalates anyway,
-  because `CLANG_TOOLS_VERSION` lives in `build.yml`, itself a `SweepEverythingWhen`
-  row. Drift therefore surfaces at the master push, and failing that at the next
+  What was left beyond that was the analyser drifting under us — apt.llvm.org publishing
+  a new `clang-tidy-22`. Since #1404 it cannot drift: the analyser is the PyPI build
+  `.clang-tidy-version` declares, identified before every sweep, and changing that file is
+  itself a `SweepEverythingWhen` row, as `build.yml` is for `CLANG_TOOLS_VERSION`. Before
+  that, the diff-scoped PULL REQUEST sweep caught drift only where it landed inside the
+  scope it already swept. Drift therefore surfaces at the master push, and failing that at the next
   pull request whose change escalates — 8 of 19 sampled, so hours rather than weeks.
   It is a check that MOVED, not one that was lost.
 
@@ -5434,6 +5488,15 @@ its own directory -- and nothing checks an enumerator that is anchored under `sr
 is correct: an inclusion list naming this repository's own layout needs no roots.
 
 ## Open work
+
+- **[#1410](https://github.com/LASTRADA-Software/fastcached/issues/1410)** — the
+  declared clang-tidy build crashes in `modernize-min-max-use-initializer-list` on a call through a
+  function pointer inside a `std::max({...})` or `std::min({...})` list. The upstream check dereferences
+  every inner call's direct callee without a null test, and that line is unchanged on llvm `main`.
+  `DashboardPanel.cpp` names the value first at its one site (a census of all 684 gate units found
+  no other), and `check-clang-tidy-known-defects.sh` asserts the crash against the declared build.
+  It closes when the pin moves to a release carrying the fix: the guard's row flips red, and that
+  change removes the row, the site comments naming this issue, and this entry.
 
 - **[#829](https://github.com/LASTRADA-Software/fastcached/issues/829)** — six
   contexts are still `Undecided` in `check-merge-queue-contexts.sh`'s binding table

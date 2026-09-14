@@ -1865,8 +1865,11 @@ namespace
             column.label = std::max(column.label, in.cellWidth(tile->label));
             column.value = std::max(column.value, in.cellWidth(tile->value));
             if (withWords)
-                column.words = std::max(
-                    { column.words, in.cellWidth(tile->words), tile->trend ? MinimumTrendCells : std::size_t { 0 } });
+            {
+                // Named first: modernize-min-max-use-initializer-list crashes on a pointer call in the list (#1410).
+                auto const words = in.cellWidth(tile->words);
+                column.words = std::max({ column.words, words, tile->trend ? MinimumTrendCells : std::size_t { 0 } });
+            }
         }
         return column;
     }
