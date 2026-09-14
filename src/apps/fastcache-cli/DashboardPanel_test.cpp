@@ -1952,23 +1952,27 @@ TEST_CASE("at the Sixel rung the fleet chart is one image exactly the size of th
     auto const drawing = DrawChart(RenderRung::Sixel, ChartCell, 100, 60);
     REQUIRE(drawing.frames.size() == 1);
     REQUIRE(drawing.placements.size() == 1);
-    REQUIRE(drawing.placements[0].size() == 1);
-    REQUIRE(drawing.requests.size() == 1);
+    REQUIRE(drawing.placements[0].size() == 2);
+    REQUIRE(drawing.requests.size() == 2);
+    auto const lines = Lines(drawing.frames[0]);
+    for (auto const image: { std::size_t { 0 }, std::size_t { 1 } })
+    {
+        INFO("image " << image);
+        auto const& placement = drawing.placements[0][image];
+        auto const& request = drawing.requests[image];
+        CHECK(request.width == placement.cellsWide * ChartCell.width);
+        CHECK(request.height == placement.cellsHigh * ChartCell.height);
+        CHECK(placement.sixel == std::format("sixel:{}x{}", request.width, request.height));
+        REQUIRE(placement.row + placement.cellsHigh - 1 <= lines.size());
+        for (auto const row: std::views::iota(placement.row, placement.row + placement.cellsHigh))
+        {
+            INFO("frame row " << row);
+            CHECK(Trimmed(Columns(lines[row - 1], placement.column - 1, placement.cellsWide)).empty());
+        }
+    }
     auto const& placement = drawing.placements[0][0];
     auto const& request = drawing.requests[0];
-    CHECK(request.width == placement.cellsWide * ChartCell.width);
-    CHECK(request.height == placement.cellsHigh * ChartCell.height);
-    CHECK(placement.cellsHigh >= Unwrap(FleetPanel().document).chartCellsHigh);
     CHECK(placement.cellsHigh <= Unwrap(FleetPanel().document).chartCellsHighMost);
-    CHECK(placement.sixel == std::format("sixel:{}x{}", request.width, request.height));
-
-    auto const lines = Lines(drawing.frames[0]);
-    REQUIRE(placement.row + placement.cellsHigh - 1 <= lines.size());
-    for (auto const row: std::views::iota(placement.row, placement.row + placement.cellsHigh))
-    {
-        INFO("frame row " << row);
-        CHECK(Trimmed(Columns(lines[row - 1], placement.column - 1, placement.cellsWide)).empty());
-    }
     auto drawn = std::size_t { 0 };
     for (auto const pixel: std::views::iota(std::size_t { 0 }, request.pixels.size() / 4))
         drawn += request.pixels[(pixel * 4) + 3] != 0 ? 1 : 0;
@@ -1987,10 +1991,11 @@ TEST_CASE("below the Sixel rung, or without a cell size, the fleet panel draws n
     auto const unmeasured = DrawChart(RenderRung::Sixel, std::nullopt, 100, 60);
     REQUIRE(unicode.frames.size() == 1);
     REQUIRE(unmeasured.frames.size() == 1);
-    REQUIRE(sixel.placements.at(0).size() == 1);
+    REQUIRE(sixel.placements.at(0).size() == 2);
     CHECK(unicode.requests.empty());
     CHECK(unicode.placements.at(0).empty());
-    CHECK(LineIndexHolding(unicode.frames[0], "[machines]") + sixel.placements[0][0].cellsHigh + 1
+    // The chart's item is its title, its bands, its axis and its legend; then a blank.
+    CHECK(LineIndexHolding(unicode.frames[0], "[machines]") + 1 + sixel.placements[0][0].cellsHigh + 2 + 1
           == LineIndexHolding(sixel.frames.at(0), "[machines]"));
     CHECK(unmeasured.requests.empty());
     CHECK(unmeasured.placements.at(0).empty());
@@ -2013,7 +2018,7 @@ TEST_CASE("the fleet chart goes for height before the tiles, and below its width
     REQUIRE(shortest.has_value());
     auto const without = DrawChart(RenderRung::Sixel, ChartCell, 100, Unwrap(shortest));
     CHECK(without.frames.at(0).contains(Distributed::FleetKpis().front().label));
-    CHECK(DrawChart(RenderRung::Sixel, ChartCell, 100, Unwrap(shortest) + 1).placements.at(0).size() == 1);
+    CHECK(DrawChart(RenderRung::Sixel, ChartCell, 100, Unwrap(shortest) + 1).placements.at(0).size() == 2);
 
     auto const narrow = DrawChart(RenderRung::Sixel, ChartCell, 24, 60);
     CHECK(narrow.placements.at(0).empty());
@@ -3190,7 +3195,7 @@ TEST_CASE("the fleet chart yields rows to the table, and grows into rows nothing
 {
     // #134 F12 and F13. WHAT DISTINGUISHES: at 80x24 with twelve machines the Sixel rung draws NO chart and
     // every machine row, where a chart kept at the table's cost would hide rows; with one machine at
-    // 120x40 the chart is drawn taller than its minimum, the frame is the terminal's height, and the
+    // 120x40 its band grows to the tallest a band gets, the frame is the terminal's height, and the
     // source line sits on its last content row.
     auto encoder = ScriptedSixelEncoder {};
     auto context = UnicodeContext();
@@ -3204,9 +3209,9 @@ TEST_CASE("the fleet chart yields rows to the table, and grows into rows nothing
 
     auto const roomy = RunFleet({ FleetSampleOf(1, LeaderFleetText(1)), Tick }, 120, 40, context, ChartCell);
     REQUIRE(roomy.frames.size() == 1);
-    REQUIRE(roomy.placements.front().size() == 1);
+    REQUIRE(roomy.placements.front().size() == 2);
     auto const& spec = Unwrap(FleetPanel().document);
-    CHECK(roomy.placements.front().front().cellsHigh > spec.chartCellsHigh);
+    CHECK(roomy.placements.front().front().cellsHigh == spec.chartBandCellsMost);
     auto const lines = Lines(roomy.frames.front());
     CHECK(lines.size() == 40);
     CHECK(lines.at(38).contains(FleetReadingSource));
@@ -3337,4 +3342,75 @@ TEST_CASE("a worker's limit is toned by the leader, and a table's heading, key h
     REQUIRE(end != std::string::npos);
     auto const words = line.substr(at, end + Last.size() - at);
     CHECK(TonesOver(run, 1, words, words) == std::vector<FrameTone> { FrameTone::Label });
+}
+
+TEST_CASE("the fleet chart explains itself: its figure and span, each machine's newest figure, a time axis and a scale",
+          "[cli][dashboard][panel][fleet][chart][parity]")
+{
+    // #134 F14: the owner saw bands of colour and could not tell what they meant. WHAT DISTINGUISHES, each
+    // against that frame:
+    //   - the row above the image names the figure and the span its width covers;
+    //   - each band's row names its machine and its newest figure left of the image, `-` for the machine the
+    //     newest sample did not read, so no figure is a reading nobody gave;
+    //   - the row under the image runs from how long ago its left edge is to `now`, under the image exactly;
+    //   - the legend's scale is an image of its own between the two values it runs between, over blank cells.
+    auto const drawing = DrawChart(RenderRung::Sixel, ChartCell, 100, 60);
+    REQUIRE(drawing.placements.at(0).size() == 2);
+    auto const& chart = drawing.placements[0][0];
+    auto const& scale = drawing.placements[0][1];
+    auto const lines = Lines(drawing.frames.at(0));
+    auto const& metric = FleetChartMetrics.front();
+    auto const window = ChartWindows.front();
+
+    auto const title = Trimmed(Columns(lines.at(chart.row - 2), 1, FakeCellWidth(lines.at(chart.row - 2)) - 2));
+    CHECK(title == std::format("{} per machine, last {} samples", metric.key, window));
+
+    auto const figure = [](std::uint64_t permille) {
+        return Distributed::HumanFleetFigure(permille, Distributed::CellFormat::Permille);
+    };
+    auto const bandCells = chart.cellsHigh / 3;
+    REQUIRE(bandCells * 3 == chart.cellsHigh);
+    auto const expected = std::to_array<std::pair<std::string_view, std::string>>(
+        { { "build-01:7070", figure(300) }, { "build-02:7070", figure(800) }, { "build-03:7070", figure(700) } });
+    for (auto const index: std::views::iota(std::size_t { 0 }, expected.size()))
+    {
+        auto const& row = lines.at(chart.row - 1 + (index * bandCells));
+        auto const label = Trimmed(Columns(row, 1, chart.column - 2));
+        INFO("band " << index << ": " << label);
+        CHECK(label.starts_with(expected[index].first));
+        CHECK(label.ends_with(expected[index].second));
+    }
+
+    auto const& axis = lines.at(chart.row - 1 + chart.cellsHigh);
+    auto const under = Columns(axis, chart.column - 1, chart.cellsWide);
+    CHECK(under.starts_with(std::format("-{} samples", window)));
+    CHECK(under.ends_with("now"));
+
+    auto const& legend = lines.at(scale.row - 1);
+    CHECK(scale.row == chart.row + chart.cellsHigh + 1);
+    CHECK(scale.cellsHigh == 1);
+    CHECK(Trimmed(Columns(legend, scale.column - 1, scale.cellsWide)).empty());
+    CHECK(Trimmed(Columns(legend, 1, scale.column - 2)).ends_with(figure(0)));
+    CHECK(
+        Trimmed(
+            Columns(legend, scale.column - 1 + scale.cellsWide, FakeCellWidth(legend) - 1 - scale.cellsWide - scale.column))
+            .starts_with(figure(1000)));
+    CHECK(legend.contains(std::format("bar: {}, grey: to {}, blank: unread", metric.key, figure(1000))));
+}
+
+TEST_CASE("before any machine reports the chart's figure, the chart says so and draws no image",
+          "[cli][dashboard][panel][fleet][chart][parity]")
+{
+    // WHAT DISTINGUISHES: an empty image would read as a fleet with nothing on it; the line names the figure
+    // and says nobody reported it, and nothing is placed or encoded.
+    auto encoder = ScriptedSixelEncoder {};
+    auto context = UnicodeContext();
+    context.rung = RenderRung::Sixel;
+    context.sixel = &encoder;
+    auto const run = RunFleet({ FleetSampleOf(1, FleetText(3)), Tick }, 100, 60, context, ChartCell);
+    REQUIRE(run.frames.size() == 1);
+    CHECK(run.placements.front().empty());
+    CHECK(encoder.Requests().empty());
+    CHECK(run.frames.front().contains(
+        std::format("{} per machine: no machine has reported it yet", FleetChartMetrics.front().key)));
 }
