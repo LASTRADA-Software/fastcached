@@ -34,7 +34,9 @@
 # a flag would read identically to one that had judged it. So a flag that enables nothing gets a row
 # with its reason, and a row exists only for a spelling something produces -- the first real new one
 # arrives as a refusal. `-arch` names an Apple slice and is refused for any value: `x86_64h` implies AVX2,
-# and nothing here sets `CMAKE_OSX_ARCHITECTURES`.
+# and nothing here sets `CMAKE_OSX_ARCHITECTURES`. A target triple (`--target=`, `-target`, `-Xclang -triple`)
+# is refused for the same reason, and nothing here sets `CMAKE_<LANG>_COMPILER_TARGET`; so is clang's
+# `-Xclang -target-cpu`, which is `-march=` one layer down.
 #
 # ## What it does NOT cover, stated so nobody reads it as more
 #
@@ -89,6 +91,10 @@ set(SpellingRows
     "Gnu|refuse|prefix|it selects a CPU, and with it every instruction set that CPU has|-march="
     "Gnu|refuse|prefix|it selects a CPU, and with it every instruction set that CPU has|-mcpu="
     "Gnu|refuse|exact|it is clang's own switch for an instruction set, reached through -Xclang|-target-feature"
+    "Gnu|refuse|exact|it is clang's own switch for a CPU, reached through -Xclang, and selects every instruction set that CPU has|-target-cpu"
+    "Gnu|refuse|exact|it is clang's own switch for a target triple, reached through -Xclang, and a triple can imply instructions (x86_64h implies AVX2)|-triple"
+    "Gnu|refuse|prefix|it names a target triple, and a triple can imply instructions (x86_64h implies AVX2)|--target="
+    "Gnu|refuse|flag-value|it names a target triple, and a triple can imply instructions (x86_64h implies AVX2)|-target"
     "Gnu|refuse|prefix|it is an -m flag no row has judged, and -m reaches instruction sets such as -msha and -mavx2|-m"
     "Msvc|refuse|iprefix|it enables an instruction set for the whole translation unit|/arch:"
     "Msvc|refuse|iprefix|it is cl's other spelling of /arch:|-arch:"
