@@ -3100,6 +3100,25 @@ TEST_CASE("a node frame is as tall as the terminal, its source line on the last 
     }
 }
 
+TEST_CASE("a node panel draws no history chart until a band has a reading, however many rows it has",
+          "[cli][dashboard][panel][node][chart]")
+{
+    // Captured at 80x24: the first frames, drawn before any reading while the status facts are still short, laid a
+    // chart into the rows those facts claimed a moment later -- a chart of nothing that flashed up and vanished.
+    // WHAT DISTINGUISHES: at 120x40, a frame before any sample and a frame after ONE sample (a rate needs two) draw no
+    // chart; the frame after the second sample does.
+    auto const frames = NodeFramesAt(
+        { Tick, NodeSampleOf(1, 2, MockupNodeStatus()), Tick, NodeSampleOf(3, 4, MockupNodeStatus()), Tick }, 120, 40);
+    REQUIRE(frames.size() >= 3);
+    for (auto const index: std::views::iota(std::size_t { 0 }, frames.size() - 1))
+    {
+        INFO("frame " << index << "\n" << frames[index]);
+        CHECK_FALSE(NodeChartIn(frames[index]).has_value());
+    }
+    INFO(frames.back());
+    CHECK(NodeChartIn(frames.back()).has_value());
+}
+
 TEST_CASE("a node's history chart grows band by band in the table's order", "[cli][dashboard][panel][node][chart]")
 {
     // Which figure gets rows first is the `charts` table's order. WHAT DISTINGUISHES: at the first height that draws
