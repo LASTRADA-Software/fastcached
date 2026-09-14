@@ -2149,6 +2149,16 @@ TEST_CASE("a node panel draws its cache tier and host below the rates, and the t
     plain.runtime.leaderEndpoint.clear();
     plain.nodeId.clear();
     auto const worker = NodeFrameAt(80, 24, plain);
+
+    // A leader names no leader: it is the one, and says so where a follower names the address.
+    auto leading = MockupNodeStatus();
+    leading.runtime.schedulerRole = CompileCacheWire::WireSchedulerRole::Leader;
+    leading.runtime.leaderEndpoint.clear();
+    CHECK(ContentStarting(NodeFrameAt(80, 24, leading), "consensus").ends_with("leader      this node"));
+    auto electing = MockupNodeStatus();
+    electing.runtime.schedulerRole = CompileCacheWire::WireSchedulerRole::Undecided;
+    electing.runtime.leaderEndpoint.clear();
+    CHECK(ContentStarting(NodeFrameAt(80, 24, electing), "consensus").ends_with(std::format("leader      {}", Absent)));
     CHECK_FALSE(LineStarting(worker, "cache tier").has_value());
     CHECK_FALSE(LineStarting(worker, "consensus").has_value());
     CHECK(LineStarting(worker, "host").has_value());

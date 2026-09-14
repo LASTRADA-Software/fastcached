@@ -941,6 +941,9 @@ namespace
         return value.has_value() ? std::to_string(*value) : std::string { in.absent };
     }
 
+    /// What a leading node's `leader` reads: it names no endpoint because it is the leader.
+    constexpr std::string_view SelfLeader = "this node";
+
     /// What renders one status fact.
     struct StatusFactSpec
     {
@@ -1008,12 +1011,18 @@ namespace
           } },
         { .fact = StatusFact::Leader,
           .render = [](FrameInputs const& in, FactCell const& /*cell*/, std::size_t /*width*/) -> std::optional<FactText> {
-              // Empty is a READING -- no leader is known -- so it is the marker, on the line the role is on.
+              // Empty is a READING -- no leader is known -- so it is the marker, on the line the role is on. Except on
+              // the leader itself, which names nobody because it is the one: it says so rather than drawing the
+              // marker for the one fact it knows best.
               auto const* status = StatusOf(in);
               if (!RunsConsensus(status))
                   return std::nullopt;
-              auto const& leader = status->runtime.leaderEndpoint;
-              return Said(leader.empty() ? std::string { in.absent } : leader);
+              auto const& runtime = status->runtime;
+              if (!runtime.leaderEndpoint.empty())
+                  return Said(runtime.leaderEndpoint);
+              if (runtime.schedulerRole == CompileCacheWire::WireSchedulerRole::Leader)
+                  return Said(std::string { SelfLeader });
+              return Said(std::string { in.absent });
           } },
         { .fact = StatusFact::Slots,
           .render = [](FrameInputs const& in, FactCell const& /*cell*/, std::size_t /*width*/) -> std::optional<FactText> {
