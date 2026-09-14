@@ -3,6 +3,7 @@
 #include "FleetDocument.hpp"
 
 #include <FastCache/Core/NumericText.hpp>
+#include <FastCache/Core/Ranges.hpp>
 
 #include <algorithm>
 #include <cmath>
@@ -10,7 +11,9 @@
 #include <map>
 #include <optional>
 #include <ranges>
+#include <span>
 #include <string>
+#include <vector>
 
 namespace FastCache::Cli
 {
@@ -37,6 +40,27 @@ namespace
         { .red = 0xe9, .green = 0x7f, .blue = 0x2a },
         { .red = 0xd6, .green = 0x3a, .blue = 0x2f },
     });
+
+    /// The track under every reading: a neutral grey, so a reading of zero is visible and is no step of
+    /// the ramp. With the ramp's eight it is nine colours, inside the 16 a chart is encoded with.
+    constexpr auto Track = RampColour { .red = 0x5f, .green = 0x66, .blue = 0x73 };
+
+    /// A band this many pixels tall or taller leaves its top row transparent, between it and the band above.
+    constexpr auto BandGapFrom = std::size_t { 4 };
+
+    /// Paint one pixel of @p raster opaque.
+    /// @param raster The raster.
+    /// @param x Column; inside the raster.
+    /// @param y Row; inside the raster.
+    /// @param colour The colour.
+    void Paint(ChartRaster& raster, std::size_t x, std::size_t y, RampColour colour) noexcept
+    {
+        auto const at = ((y * raster.width) + x) * 4;
+        raster.rgba[at] = colour.red;
+        raster.rgba[at + 1] = colour.green;
+        raster.rgba[at + 2] = colour.blue;
+        raster.rgba[at + 3] = 0xff;
+    }
 
     /// The ramp colour a scaled value stands for.
     /// @param value The scaled value.
@@ -89,53 +113,88 @@ std::vector<SeriesPoint> FleetChartPoints(FleetDocument const& document)
     return points;
 }
 
+std::size_t ChartWindowFor(std::size_t samples) noexcept
+{
+    auto const* const window = FindIfOrNull(ChartWindows, [samples](std::size_t span) { return span >= samples; });
+    return window != nullptr ? *window : ChartWindows.back();
+}
+
+std::vector<ChartBand> FleetChartBands(std::deque<HistoryEntry> const& history,
+                                       FleetChartMetric const& metric,
+                                       std::size_t window)
+{
+    auto found = std::map<std::string, std::optional<double>> {};
+    auto const shown = std::min(history.size(), window);
+    for (auto const index: std::views::iota(history.size() - shown, history.size()))
+        for (auto const& point: history[index].points)
+            if (point.series == metric.key)
+                found.try_emplace(point.subject);
+    if (!history.empty())
+        for (auto const& point: history.back().points)
+            if (point.series == metric.key)
+                found[point.subject] = point.value;
+
+    auto bands = std::vector<ChartBand> {};
+    bands.reserve(found.size());
+    for (auto& [subject, latest]: found)
+        bands.push_back(ChartBand { .subject = subject, .latest = latest });
+    return bands;
+}
+
 ChartRaster FleetChartRaster(std::deque<HistoryEntry> const& history,
                              FleetChartMetric const& metric,
+                             std::span<ChartBand const> bands,
+                             std::size_t window,
                              std::size_t width,
                              std::size_t height)
 {
     auto raster = ChartRaster { .rgba = std::vector<std::uint8_t>(width * height * 4, 0), .width = width, .height = height };
-    if (width == 0 || height == 0 || history.empty())
+    if (width == 0 || height == 0 || history.empty() || bands.empty() || window == 0)
         return raster;
 
-    // The newest samples that fit, oldest first, each as its own machine-to-value map.
-    auto const shown = std::min(history.size(), width);
-    auto samples = std::vector<std::map<std::string, double>>(shown);
-    auto bands = std::map<std::string, std::size_t> {};
-    for (auto const index: std::views::iota(std::size_t { 0 }, shown))
-        for (auto const& point: history[history.size() - shown + index].points)
-            if (point.series == metric.key)
-            {
-                samples[index][point.subject] = point.value;
-                bands.try_emplace(point.subject, 0);
-            }
-    if (bands.empty())
-        return raster;
-
-    // Bands in key order, so a machine keeps its band as others come and go.
-    auto next = std::size_t { 0 };
-    for (auto& [subject, band]: bands)
-        band = next++;
-
+    // The newest samples the width holds, right-aligned: the oldest of them `shown` sample widths from the edge.
+    auto const sampleWidth = std::max<std::size_t>(1, width / window);
+    auto const shown = std::min({ history.size(), window, width / sampleWidth });
     auto const bandHeight = std::max<std::size_t>(1, height / bands.size());
-    auto const sampleWidth = std::max<std::size_t>(1, width / shown);
-    auto const left = width - std::min(width, sampleWidth * shown); // the newest sample ends at the right edge
+    auto const gap = bandHeight >= BandGapFrom ? std::size_t { 1 } : std::size_t { 0 };
+    auto const inner = bandHeight - gap;
     for (auto const sample: std::views::iota(std::size_t { 0 }, shown))
-        for (auto const& [subject, value]: samples[sample])
+    {
+        auto const& entry = history[history.size() - shown + sample];
+        auto const left = width - ((shown - sample) * sampleWidth);
+        for (auto const band: std::views::iota(std::size_t { 0 }, bands.size()))
         {
-            auto const band = bands.at(subject);
-            auto const colour = ColourOf(value, metric.full);
-            for (auto const y: std::views::iota(band * bandHeight, std::min(height, (band + 1) * bandHeight)))
-                for (auto const x:
-                     std::views::iota(left + (sample * sampleWidth), std::min(width, left + ((sample + 1) * sampleWidth))))
-                {
-                    auto const at = ((y * width) + x) * 4;
-                    raster.rgba[at] = colour.red;
-                    raster.rgba[at + 1] = colour.green;
-                    raster.rgba[at + 2] = colour.blue;
-                    raster.rgba[at + 3] = 0xff;
-                }
+            auto const floor = (band + 1) * bandHeight;
+            if (floor > height)
+                break;
+            auto const* const point = FindIfOrNull(entry.points, [&](SeriesPoint const& candidate) {
+                return candidate.series == metric.key && candidate.subject == bands[band].subject;
+            });
+            if (point == nullptr)
+                continue;
+            auto const fraction =
+                metric.full > 0.0 && std::isfinite(point->value) ? std::clamp(point->value / metric.full, 0.0, 1.0) : 0.0;
+            auto bar = static_cast<std::size_t>(std::lround(fraction * static_cast<double>(inner)));
+            if (fraction > 0.0)
+                bar = std::max<std::size_t>(bar, 1);
+            auto const colour = ColourOf(point->value, metric.full);
+            for (auto const y: std::views::iota(floor - inner, floor))
+                for (auto const x: std::views::iota(left, left + sampleWidth))
+                    Paint(raster, x, y, y >= floor - bar ? colour : Track);
         }
+    }
+    return raster;
+}
+
+ChartRaster FleetChartScale(std::size_t width, std::size_t height)
+{
+    auto raster = ChartRaster { .rgba = std::vector<std::uint8_t>(width * height * 4, 0), .width = width, .height = height };
+    for (auto const x: std::views::iota(std::size_t { 0 }, width))
+    {
+        auto const& colour = Ramp[std::min(Ramp.size() - 1, (x * Ramp.size()) / width)];
+        for (auto const y: std::views::iota(std::size_t { 0 }, height))
+            Paint(raster, x, y, colour);
+    }
     return raster;
 }
 

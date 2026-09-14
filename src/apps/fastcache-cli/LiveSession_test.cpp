@@ -630,6 +630,10 @@ TEST_CASE("an interactive live-stats fleet session draws the fleet panel, and it
     Rig rig;
     auto leader = Distributed::FleetSnapshot {};
     leader.role = Distributed::SchedulerRole::Leader;
+    // One machine with a CPU reading, so the chart has a band to draw.
+    leader.nodes.emplace_back();
+    leader.nodes.back().endpoint = "10.0.0.9:7070";
+    leader.nodes.back().load.cpuBusyPermille = 250;
     ScriptedDocument admin { Distributed::RenderFleetText(leader, Distributed::FleetHistoryView {}, std::nullopt) };
     ScriptedSixelEncoder sixel;
     auto views = StandardRungViews { RenderOptions { .format = OutputFormat::Human }, &FakeCellWidth, &sixel };
@@ -658,8 +662,8 @@ TEST_CASE("an interactive live-stats fleet session draws the fleet panel, and it
     // composition: the source's fetch, the reader and the panel.
     CHECK(presented.last.contains(std::format("/fleet.txt at {} (leader)", ScriptedDocument::ScriptedAdminAddress)));
     CHECK(presented.last.contains(Distributed::FleetKpis().front().label));
-    // The fleet chart's image, placed in the frame and handed to the terminal's presenter.
-    REQUIRE(presented.placements.size() == 1);
+    // The fleet chart's image and its scale, placed in the frame and handed to the terminal's presenter.
+    REQUIRE(presented.placements.size() == 2);
     CHECK(presented.placements.front().sixel.starts_with("sixel:"));
 
     composition.terminals.Spoken()->Say(DashboardEvent { .kind = DashboardEventKind::Key, .keys = "q" });
