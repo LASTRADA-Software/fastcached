@@ -2,6 +2,7 @@
 #pragma once
 
 #include <FastCache/Cli/Options.hpp>
+#include <FastCache/Config/EnvExpand.hpp>
 #include <FastCache/Config/YamlReader.hpp>
 #include <FastCache/Core/Errors/ConfigError.hpp>
 
@@ -122,7 +123,15 @@ template <typename Result>
                     continue;
             }
 
-            if (auto applied = (*row->apply)(result, value); !applied.has_value())
+            // A file has no shell in front of it, so a path row's environment
+            // references are expanded HERE and never in the applier -- see `FileValue`
+            // for why the command line must not expand them too.
+            auto spelled = row->fileValue == FileValue::ExpandEnvironment
+                               ? ExpandEnvironmentVariables(value, setting.key)
+                               : std::expected<std::string, ConfigError> { value };
+            auto applied = std::move(spelled).and_then(
+                [&row, &result](std::string const& text) { return (*row->apply)(result, text); });
+            if (!applied.has_value())
             {
                 auto error = std::move(applied).error();
                 error.source = path.string();

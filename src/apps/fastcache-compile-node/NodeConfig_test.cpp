@@ -3713,6 +3713,24 @@ TEST_CASE("One save touching both is refused whole, and names every unreloadable
     CHECK_FALSE(std::ranges::contains(changed, std::string_view { "--log-level" }));
 }
 
+TEST_CASE("A worker's file naming a key twice is refused, where it used to keep the last", "[node][config][reload]")
+{
+    // Measured before the change on a 0.2.0-568 worker: `listen_node:` twice and
+    // `--print-surfaces` served the SECOND address, with nothing said about the first.
+    // A refusal is the intended change for this binary -- the shared reader answers
+    // for both, and under a list setting the same repetition would have APPENDED.
+    Testing::ScratchDirectory const scratch { "node-config-duplicate-key" };
+    auto const path =
+        WriteRunnableNodeConfigFile(scratch.Path(), "listen_node: 127.0.0.1:41001\nlisten_node: 127.0.0.1:41002\n");
+
+    auto const candidate = ReparseNodeConfig(path);
+    REQUIRE_FALSE(candidate.has_value());
+    CHECK(candidate.error().code == ConfigErrorCode::ParseError);
+    CHECK(candidate.error().field == "listen_node");
+    CHECK(candidate.error().line == 3);
+    CHECK(candidate.error().context.contains("first at line 2"));
+}
+
 TEST_CASE("A file that fails halfway is declined, never half-applied", "[node][config][reload]")
 {
     // The clause nobody would think to write. A document whose first key is good and
