@@ -338,31 +338,43 @@ jobs:
       # failure with clang-format skipped beneath it. Adding `edited` here instead
       # would have re-run the whole matrix for a prose edit.
 
-      - name: "Install clang-format"
+      # The one formatter build, from the one place it is stated: `.clang-format-version`
+      # declares a PyPI release by its banner, and `--requirement` derives the pip
+      # requirement from it, so this step restates no version (#1407). Never apt.llvm.org:
+      # that source pins a major and ships rolling snapshots under it, so the build this job
+      # judged with changed whenever the mirror did (#1349).
+      #
+      # Into a venv of its own, because the runner's system python is
+      # externally-managed (PEP 668) and refuses a plain `pip install`; the venv's bin/ goes
+      # on PATH because the format-on-edit hook's rule -- the declared build among every
+      # clang-format on PATH -- is what the formatting step below resolves by.
+      - name: "Install the declared clang-format"
         if: ${{ needs.changes.outputs.code != 'false' }}
         run: |
-          wget https://apt.llvm.org/llvm.sh
-          chmod +x llvm.sh
-          sudo ./llvm.sh ${{ env.CLANG_TOOLS_VERSION }}
-          sudo apt-get install -y clang-format-${{ env.CLANG_TOOLS_VERSION }}
-      # `CLANG_TOOLS_VERSION` pins a MAJOR and apt.llvm.org ships rolling snapshots, so
-      # the BUILD this job judges with is stated in `.clang-format-version`, which the
-      # format-on-edit hook and `local-gate.sh` read (#1349). Asserted HERE, the one job
-      # that installs the formatter, so every green run proves the declaration names the
-      # build it judged with, and a snapshot roll is a red naming the new build rather
-      # than a silent disagreement with every developer machine.
-      #
-      # BEFORE the formatting step, deliberately: a new snapshot that reformats code
-      # would otherwise go red there first, with a diff and no explanation.
+          set -euo pipefail
+          requirement="$(bash scripts/check-clang-format-version.sh --requirement "$GITHUB_WORKSPACE")"
+          python3 -m venv "$RUNNER_TEMP/clang-format"
+          "$RUNNER_TEMP/clang-format/bin/pip" install --disable-pip-version-check "$requirement"
+          echo "$RUNNER_TEMP/clang-format/bin" >> "$GITHUB_PATH"
+      # The installed build is the one `.clang-format-version` declares -- asserted
+      # here, the one job that installs the formatter, so every green run proves the
+      # declaration the format-on-edit hook and `local-gate.sh` write by. BEFORE the
+      # formatting step, so a disagreement is named rather than arriving as a diff.
       - name: "Check the installed clang-format is the declared build"
         if: ${{ needs.changes.outputs.code != 'false' }}
         run: |
-          bash scripts/run-check.sh scripts/check-clang-format-version.sh --installed "clang-format-${{ env.CLANG_TOOLS_VERSION }}" "$GITHUB_WORKSPACE"
+          bash scripts/run-check.sh scripts/check-clang-format-version.sh --installed "$RUNNER_TEMP/clang-format/bin/clang-format" "$GITHUB_WORKSPACE"
+      # The formatter is RESOLVED the way `local-gate.sh` resolves it -- the declared
+      # build among every clang-format on PATH, which on this runner includes the
+      # image's own -- so this job exercises the gate's choice rather than a path the
+      # gate never takes.
       - name: "Run clang-format"
         if: ${{ needs.changes.outputs.code != 'false' }}
         run: |
+          formatter="$(bash scripts/check-clang-format-version.sh --resolve "$GITHUB_WORKSPACE")"
+          echo "formatting with $formatter"
           git ls-files '*.h' '*.hpp' '*.cpp' \
-            | xargs clang-format-${{ env.CLANG_TOOLS_VERSION }} --dry-run --Werror --style=file
+            | xargs "$formatter" --dry-run --Werror --style=file
 
       # Here rather than only as a ctest, because this is the one job that installs
       # the pinned clang-format. Registered as a ctest too, where it SKIPS on a host

@@ -1083,8 +1083,7 @@ what differs between compilers, standard libraries, hosts and tool versions.
   and only `dpkg-query -W` tells them apart. What makes it expensive is that the remedy reads as
   already applied — you have a binary with the right name, so the rule above looks satisfied while
   the analyser is silent about a check it does not carry — and it invalidates every earlier verdict
-  of that session, not just the one file. For `clang-format` read `apt-cache policy`, never a
-  banner you have not compared whole.
+  of that session, not just the one file.
 - **So the analyser is a BUILD: `.clang-tidy-version`, an exact PyPI `clang-tidy` release, and a
   binary counts only when its WHEEL identifies it** — METADATA version plus the binary's sha256 in
   RECORD, at the wheel's own path (#1404). apt's `clang-tidy-22`, choco's, a PATH shim and a copied
@@ -1093,11 +1092,14 @@ what differs between compilers, standard libraries, hosts and tool versions.
   cannot answer. A shape that build is KNOWN to crash on is a row of
   `check-clang-tidy-known-defects.sh`: its sites name the value first under a one-line comment
   naming the issue, and the check stays on.
-- **The formatter's BUILD is `.clang-format-version`, and a clang-format that is not that build
-  does not WRITE** — not the format-on-edit hook, not `local-gate.sh`'s `-i`. clang-format's
-  `--version` line, unlike clang-tidy's, carries the snapshot, so it is compared WHOLE.
-  `Check C++ style` asserts the build it installed BEFORE it formats, and
-  `ctest -R clang-format-version` holds the declared major to `CLANG_TOOLS_VERSION` (#1349).
+- **The formatter is a BUILD too: `.clang-format-version` declares ONE PyPI clang-format release by
+  its banner, and a clang-format that is not that build does not WRITE** — not the format-on-edit
+  hook, not `local-gate.sh`'s `-i`. The banner is compared WHOLE, so the apt snapshot of the same
+  number is refused too. The file is the one statement of the version: `Check C++ style` installs
+  what `--requirement` derives from it, and `ctest -R clang-format-version` holds it to one bare
+  release whose major is `CLANG_TOOLS_VERSION`. Which binary is ONE resolver,
+  `check-clang-format-version.sh --resolve` (`FASTCACHED_CLANG_FORMAT`, else every `clang-format` on
+  `PATH`), never a `clang-format-$V` name (#1349, #1407).
 - A script that NAMES a tool version must name it **everywhere that version matters**. And a
   cached `find_program` result outlives every reason it was chosen, so check the pin against the
   cache, not only pass it. `ctest -R local-gate-selftest`.
@@ -1335,10 +1337,10 @@ what differs between compilers, standard libraries, hosts and tool versions.
   ROWS is wrong for exactly the table that motivated it. The marker is MANDATORY with `none` as the
   opt-out, because opt-in is silent about a table that never opted in. And the figure that describes
   a table is the one NEAREST it.
-- `clang-format -i` at any version but the pinned one silently reformats code the pinned one already
-  accepted; run an older binary as `--dry-run` only. Both pinned tools ship on PyPI, so "the distro
-  only has an older one" is not a reason to use it. An older clang-tidy is worse than a laxer one: it
-  is *silent* about checks that do not exist in it yet.
+- `clang-format -i` at any build but the pinned one silently reformats code the pinned one already
+  accepted; run another binary as `--dry-run` only. The pinned formatter IS a PyPI build and
+  clang-tidy ships there too, so "the distro only has an older one" is not a reason to use it. An
+  older clang-tidy is worse than a laxer one: it is *silent* about checks that do not exist in it yet.
 - A clang-tidy sweep that cannot prove the tool ran is worth nothing and reads like success —
   `scripts/tidy-sweep.sh` canaries it first and treats a failure to execute as fatal, never as "no
   findings".
@@ -1909,10 +1911,12 @@ ordinary answers, so neither can carry "there was no probe".
   for good, because a reference build turns the compiler cache off with a `-D` and
   `option()` never overrides a cache entry (#487).
 - **`clang-format` and `clang-tidy` after every change — at the version CI pins**
-  (`$CLANG_TOOLS_VERSION` in `.github/workflows/build.yml`). Successive LLVM
-  releases disagree with each other, so a tree clean under whichever binary is on
-  `PATH` can still be rejected. Name the version explicitly and use a build
-  directory of its own; the `clang-debug` preset is **not** that sweep.
+  (`.clang-format-version` and `.clang-tidy-version`, each an exact PyPI release). Successive LLVM
+  releases disagree with each other, so a
+  tree clean under whichever binary is on `PATH` can still be rejected. Format through
+  `scripts/check-clang-format-version.sh --resolve`, resolve clang-tidy through
+  `scripts/check-clang-tidy-version.sh --resolve`
+  and use a build directory of its own; the `clang-debug` preset is **not** that sweep.
 - **`clang-tidy` reports must be fixed at the source.** Never silence with `NOLINT`. The `clang-debug` preset enables `clang-tidy` at whatever version `PATH` resolves to, which is why **`scripts/local-gate.sh` passes `-DCLANG_TIDY_EXE=` the declared build `check-clang-tidy-version.sh --resolve` identifies, and refuses to start when there is none** rather than letting the preset pick — so running the preset by hand is not the sweep CI enforces.
 - **No `g_`-prefix on globals either — and the rule lives in `.clang-tidy`, not only here.** A file-scope or `thread_local` name is spelled like any other name of its kind: `CamelCase` if it is a constant, `camelBack` if it is mutable. There is no "forbid this prefix" option in `readability-identifier-naming` (its `...Prefix` keys only ever *require* one), so the `GlobalVariableCase`/`GlobalConstantCase`/`StaticVariableCase` rows are what reject `g_foo` — and with `WarningsAsErrors: "*"` that is a build failure rather than a review comment. A function-local `static` is `camelBack` whether or not it is `const`: `StaticConstantCase` is left unset precisely so a local constant falls back to that, which keeps `g_` rejected there without demanding PascalCase for locals that are `static` only for their lifetime. The prefix is a substitute for a naming convention rather than one, and it makes ambient state read as normal; if a bare name looks wrong at the call site, that is the "inject it" rule above telling you something.
 - **No `k`-prefix on identifiers.** Do not use the Google-style `kFoo` prefix for constants, enumerators, or any other symbol — it violates the project `.clang-tidy` naming convention. Use `Foo` (PascalCase) for constants/enumerators and `foo`/`fooBar` for locals and members instead.

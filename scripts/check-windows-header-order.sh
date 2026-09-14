@@ -30,17 +30,20 @@
 # still sort `<windows.h>` first*. It reads no source file and has nothing to say about
 # any of them.
 #
-# ## Why it refuses a formatter it was not pinned to
+# ## Why it judges only with the declared formatter build
 #
-# Successive clang-format releases disagree about include ordering, so a verdict from an
-# unpinned binary describes a tool nobody runs. A missing formatter is a **skip** -- an
-# external prerequisite, the same shape as the other `smoke` checks -- but a formatter of
-# the WRONG version is a **refusal**, because a wrong verdict is worse than no verdict and
-# this one would be wrong in the reassuring direction.
+# clang-format builds disagree about include ordering -- successive releases, and even two
+# builds of one release number -- so a verdict from any other binary describes a tool
+# nobody runs. The formatter is RESOLVED exactly as `local-gate.sh` and `Check C++ style`
+# resolve it, through `check-clang-format-version.sh --resolve`: the build
+# `.clang-format-version` declares, among every clang-format on PATH (#1349). There is one
+# answer to "which binary", and this script does not keep a second one.
 #
-# The pinned version is READ from `.github/workflows/build.yml`, never restated here. Two
-# scripts already spell `${CLANG_TOOLS_VERSION:-22}` as a fallback default; a third copy
-# is a third thing to be wrong when CI's pin moves.
+# No declared build on this machine is a **skip** -- an external prerequisite, the same
+# shape as the other `smoke` checks, and never a finding about the source. Judging with the
+# wrong build would most likely PASS, the direction that gets believed, so the check
+# declines to judge rather than judging wrongly. An UNUSABLE declaration is a refusal: that
+# is a defect in the tree, not a missing tool.
 #
 # ## How the probe avoids the tree
 #
@@ -73,67 +76,19 @@ if [ ! -f "$SourceDir/.clang-format" ]; then
     exit "$UsageError"
 fi
 
-Workflow="$SourceDir/.github/workflows/build.yml"
-
-# The pinned major, read from the one place CI states it.
-PinnedVersion=""
-if [ -f "$Workflow" ]; then
-    PinnedVersion="$(sed -n 's/^[[:space:]]*CLANG_TOOLS_VERSION:[[:space:]]*"\{0,1\}\([0-9][0-9]*\)"\{0,1\}[[:space:]]*$/\1/p' "$Workflow" | sed -n '1p')"
-fi
-if [ -z "$PinnedVersion" ]; then
-    # Not a skip: the check cannot know what to enforce, which is a defect in the
-    # check or in the workflow rather than a missing tool on this machine.
-    echo "FAIL: could not read CLANG_TOOLS_VERSION from $Workflow" >&2
-    exit 1
-fi
-
-# Prefer the explicitly versioned binary, exactly as `local-gate.sh` does, then a bare
-# one -- but a bare one is ACCEPTED only once its version confirms it is the pinned
-# major, never merely because it exists. That fallback used to be unconditional, and
-# it is what took every Linux build leg red: those runners carry clang-format 18 and
-# only the `Check C++ style` job installs the pinned one, so this check picked 18,
-# found the wrong major and reported the TREE as bad (#1135).
-#
-# A machine carrying ONLY some other version has no pinned formatter, which is the
-# `SKIP_RETURN_CODE 77` state this registration already declares -- not a finding
-# about the source. The distinction is the whole fix: *the tool is missing* and *the
-# tree is wrong* are two states, and one of them was being reported as the other.
-#
-# Which version was seen is NAMED in the skip. A skip that does not say what it found
-# reads as "clang-format is not installed" on a machine that has three of them.
-ReadMajor() { # $1 -> the major version, or empty
-    "$1" --version 2>&1 | sed -n 's/.*clang-format version \([0-9][0-9]*\).*/\1/p' | sed -n '1p'
-}
-
-Formatter=""
-Seen=""
-for candidate in "clang-format-$PinnedVersion" "clang-format"; do
-    command -v "$candidate" >/dev/null 2>&1 || continue
-    candidateVersion="$(ReadMajor "$candidate")"
-    if [ -z "$candidateVersion" ]; then
-        echo "FAIL: could not read a version from '$candidate --version'" >&2
-        exit 1
-    fi
-    Seen="$Seen $candidate=$candidateVersion"
-    if [ "$candidateVersion" = "$PinnedVersion" ]; then
-        Formatter="$candidate"
-        break
-    fi
-done
-if [ -z "$Formatter" ]; then
-    if [ -z "$Seen" ]; then
-        echo "SKIP: no clang-format on PATH (this check needs the pinned clang-format-$PinnedVersion)"
-    else
-        # NOT a refusal. Judging include order with the wrong major would describe a
-        # tool nobody runs, and would most likely PASS -- the direction that gets
-        # believed -- so the check declines to judge rather than judging wrongly.
-        echo "SKIP: no clang-format at the pinned major $PinnedVersion (found:$Seen)."
-        echo "      Install clang-format-$PinnedVersion (pip download clang-format==$PinnedVersion.1.0)"
-        echo "      to have this check actually run here."
-    fi
+# Which formatter, answered by the one resolver. It names what it found and how to install
+# the declared build on stderr; a skip that did not say what it found would read as
+# "clang-format is not installed" on a machine that has three of them.
+Formatter="$(bash "$(dirname "$0")/check-clang-format-version.sh" --resolve "$SourceDir")"
+resolveStatus=$?
+if [ "$resolveStatus" -eq "$SkipMissingTool" ]; then
+    echo "SKIP: no clang-format on PATH is the declared build (above), so include ordering is not judged here"
     exit "$SkipMissingTool"
 fi
-FoundVersion="$PinnedVersion"
+if [ "$resolveStatus" -ne 0 ] || [ -z "$Formatter" ]; then
+    echo "FAIL: the formatter could not be resolved (exit $resolveStatus, above)" >&2
+    exit 1
+fi
 
 # Every one of these sorts BEFORE "windows.h" alphabetically, so each would be placed
 # in front of it by the generic bucket. `processthreadsapi.h` is the one that actually
@@ -250,7 +205,7 @@ if [ "$SelfTest" = "yes" ]; then
 fi
 
 if AssertOrdering ".clang-format" "want-first" "shipped configuration"; then
-    echo "ok: <windows.h> sorts ahead of every probe SDK header ($Formatter $FoundVersion, CI pin $PinnedVersion)"
+    echo "ok: <windows.h> sorts ahead of every probe SDK header ($Formatter)"
     exit 0
 fi
 exit 1

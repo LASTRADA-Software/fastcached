@@ -1536,10 +1536,10 @@ set_tests_properties("selftest-registered-selftest" PROPERTIES
 # `<windows.h>` first, reads no source file, and has nothing to say about any of them.
 #
 # `smoke` and `SKIP_RETURN_CODE 77` because it needs a real clang-format, which is the
-# shape this repository already uses for an external prerequisite. A formatter of the
-# WRONG version is a refusal rather than a skip -- successive releases disagree about
-# include order, so that verdict would describe a tool nobody runs, and it would be
-# wrong in the reassuring direction.
+# shape this repository already uses for an external prerequisite. It judges only with
+# the declared formatter BUILD, resolved by `check-clang-format-version.sh --resolve`
+# (#1349); a machine without that build SKIPS rather than judging with another, whose
+# verdict would describe a tool nobody runs and be wrong in the reassuring direction.
 add_test(
     NAME "windows-header-order"
     COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-windows-header-order.sh" "${CMAKE_SOURCE_DIR}"
@@ -1566,11 +1566,13 @@ set_tests_properties("windows-header-order-selftest" PROPERTIES
     TIMEOUT 120
 )
 
-# `.clang-format-version` names the pinned MAJOR and its `clang-format-<major>` binary
-# (#1349). The declaration states the clang-format BUILD `Check C++ style` judges with,
-# and the format-on-edit hook writes only with that build -- so a `CLANG_TOOLS_VERSION`
-# bump that leaves it behind turns the hook off on every machine, silently. Refused here
-# on the pull request that makes the bump; needs no formatter, so it is in the default set.
+# `.clang-format-version` is the ONE statement of the clang-format build: exactly one
+# bare PyPI release banner, `clang-format version X.Y.Z`, whose major is the
+# `CLANG_TOOLS_VERSION` build.yml pins (#1349, #1407). A second declared build is one the
+# format-on-edit hook would write with, a snapshot banner names a build no installer can ask
+# for, and a major bump that leaves the formatter behind is refused on the pull request that
+# makes it. `Check C++ style` installs what `--requirement` derives from the file, so no
+# workflow restates the version. Needs no formatter, so it is in the default set.
 #
 # Whether the INSTALLED formatter is the declared build is the script's `--installed`
 # mode, and deliberately not a ctest: only `Check C++ style` installs the pinned
@@ -1584,8 +1586,12 @@ set_tests_properties("clang-format-version" PROPERTIES
     TIMEOUT 120
 )
 
-# Both directions, with fake formatters, including the #1349 case itself -- the same
-# major at a different build -- and the shipped declaration as the accepting control.
+# Both directions, with fake formatters: a PLANTED major mismatch as the positive control,
+# a second declared build, the snapshot / vendor / suffixed / short banners, the requirement
+# derived and refused, the #1349 case itself -- the pinned release number from another
+# source -- the resolver finding the declared build behind another clang-format, honouring
+# and never stepping over FASTCACHED_CLANG_FORMAT, and naming the install commands (a
+# pip-less host's included) when there is none; the shipped declaration accepts.
 add_test(
     NAME "clang-format-version-selftest"
     COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-clang-format-version.sh" --self-test "${CMAKE_SOURCE_DIR}"

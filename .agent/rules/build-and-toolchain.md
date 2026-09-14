@@ -571,14 +571,16 @@ determinism rests on.
     Windows leg answers a different question, not a weaker version of the same one.
     Four in four tickets is recorded rather than one anecdote, because a rule argued
     from a single instance reads as an accident.
-- **`clang-format` and `clang-tidy` after every change — at the version CI pins.** Both jobs
-  run the `$CLANG_TOOLS_VERSION` binary (`.github/workflows/build.yml`), and successive LLVM
-  releases do not agree with each other: the style job compares against a *newer formatter*,
+- **`clang-format` and `clang-tidy` after every change — at the build CI pins.** The style
+  job runs the PyPI clang-format release `.clang-format-version` declares, and the clang-tidy
+  jobs the PyPI clang-tidy release `.clang-tidy-version` declares (the bullets on each build
+  below); successive LLVM releases do not agree with each other: the style job compares
+  against a *newer formatter*,
   and the clang-tidy job enables *checks that did not exist* in an older one. So a tree that is
   clean under whichever binary happens to be on `PATH` can still be rejected — a red build for
   code nobody mis-wrote, and one no local run catches unless it uses the same version. Name the
   version explicitly rather than relying on `PATH`:
-  `git ls-files '*.h' '*.hpp' '*.cpp' | xargs clang-format-$V --dry-run --Werror --style=file`,
+  `git ls-files '*.h' '*.hpp' '*.cpp' | xargs "$(bash scripts/check-clang-format-version.sh --resolve)" --dry-run --Werror --style=file`,
   and, for the analyser, the build `.clang-tidy-version` declares
   (`-DCMAKE_CXX_CLANG_TIDY="$(bash scripts/check-clang-tidy-version.sh --resolve)"`, see the
   bullet on the analyser's BUILD below) **in a build directory of its own**. Found three
@@ -614,45 +616,77 @@ determinism rests on.
   moved in that month, so the whole changed set is re-swept rather than the one file
   re-checked.
 
-  `clang-format-22` rides the same stream and was equally stale, which is the mirror
+  `clang-format-22` rode the same stream and was equally stale, which is the mirror
   hazard the bullet above names — a newer formatter reformatting code the older one
-  accepted. Upgrade the pair together. No `llvm.sh` re-run is needed where the
-  apt.llvm.org source is already configured; `apt-get update` surfaces the candidate.
+  accepted. No `llvm.sh` re-run is needed where the apt.llvm.org source is already
+  configured; `apt-get update` surfaces the candidate. **Both tools have since left that
+  stream**: the formatter (next bullet) and the analyser (#1404, the bullet on the analyser's
+  BUILD below). The measurement above is why.
+- **The formatter is ONE exact build — the PyPI clang-format release `.clang-format-version`
+  declares — and a clang-format that is not that build does not write.** Found (#1349) as the
+  contour-workflows format-on-edit hook running `clang-format -i` on every C++ edit with the
+  first binary on `PATH` — Visual Studio's 22.1.3, against the 22.1.8 snapshot `Check C++
+  style` then installed from apt.llvm.org — which is the `-i`-at-another-version rule below,
+  automated and invisible.
 
-  For the ANALYSER this stopped being the remedy (#1404): it is no longer apt's
-  `clang-tidy-<major>` at all, for the reasons in the bullet on the analyser's BUILD below.
-  The measurement above is why.
-- **The formatter's BUILD is stated in `.clang-format-version`, and a formatter that is not
-  that build does not write.** clang-format's own `--version` line DOES carry the snapshot
-  (`Ubuntu clang-format version 22.1.8 (++20260714014902+ca7933e47d3a-1~exp1~…)`), unlike
-  clang-tidy's `LLVM version` line above, so for the formatter the banner is the
-  discriminator — compared WHOLE, since the release number alone is shared by every build
-  that matters here. Found (#1349) as the contour-workflows format-on-edit hook running
-  `clang-format -i` on every C++ edit with the first binary on `PATH` — Visual Studio's
-  22.1.3, against CI's 22.1.8 snapshot — which is the `-i`-at-another-version rule below,
-  automated and invisible. The hook now reads the declaration and writes nothing, saying
-  why, unless a candidate reports a declared build; `local-gate.sh` refuses its own `-i` the
-  same way; and `Check C++ style` asserts the formatter it installed is declared, BEFORE it
-  formats, so every green run proves the file and an apt.llvm.org roll is a red naming the
-  new build instead of a silent disagreement with every machine. That red lands on every
-  branch at once and is one line in a change of its own. The major is held to
-  `CLANG_TOOLS_VERSION` by `ctest -R clang-format-version` on the pull request that bumps it.
+  **The first remedy declared the snapshot and was replaced before it merged**, and why is
+  the rule: a declaration of a build CI does not control is a statement about a mirror.
+  `CLANG_TOOLS_VERSION` pins a major and apt.llvm.org rolls snapshots under it, so every pull
+  request would have gone red at the next snapshot for a reason unrelated to its change, and
+  every developer machine would have had to chase the mirror to format at all. A PyPI release
+  is one build with one banner, `clang-format version 22.1.8`, installable natively on Linux,
+  macOS and Windows. So:
 
-  **Measured when it was written, and no reason to relax it**: VS 22.1.3 and PyPI's 22.1.8
-  both passed `--dry-run --Werror` over all 933 tracked C++ files on master `ce7c565d`, so
-  no build within 22.1.x disagreed with CI about THAT tree. That is a statement about one
-  tree, not about the builds — the next edit is a different tree. PyPI's wheel prints
-  `clang-format version 22.1.8` with no snapshot, so it is NOT the declared build either,
-  and the `pip download` recipe below yields a formatter for `--dry-run`, not one the hook
-  will write with.
+  - **`.clang-format-version` is the ONE statement of the version (#1407).** It first shipped
+    beside a `CLANG_FORMAT_VERSION` in `build.yml` that a ctest held equal to it — two copies
+    kept in step, where the analyser's `.clang-tidy-version` had one. So the workflow now asks
+    `check-clang-format-version.sh --requirement` for `clang-format==X.Y.Z`, derived from the
+    banner. `ctest -R clang-format-version` holds the file to exactly ONE build, spelled as a
+    bare release banner `clang-format version X.Y.Z` — a second build is one the hook would
+    WRITE with, and a vendor prefix or build suffix names a build no installer can ask for —
+    whose major is `CLANG_TOOLS_VERSION`, the same hold `.clang-tidy-version` has, so the
+    formatter cannot be left behind by a toolchain bump. `binary:` lines stay legal: the
+    grammar is the hook's, and this check is only ever stricter than it.
+  - `Check C++ style` installs that requirement into a venv (the runner's python is
+    externally-managed) and asserts it is the declared build BEFORE formatting.
+  - Which binary is **one resolver**, `check-clang-format-version.sh --resolve`:
+    `FASTCACHED_CLANG_FORMAT` when set — the only candidate then, refused rather than stepped
+    over when it is not the declared build — else the declared build among EVERY clang-format
+    on `PATH`, as the hook resolves. `Check C++ style`, `local-gate.sh` and the windows.h check
+    all format through it; none keeps a `clang-format-$V` of its own. With none present the gate
+    REFUSES before `-i` and prints the install commands; the windows.h check skips. There is no
+    default install site, unlike the analyser's: the hook never takes a path, so a second
+    resolution rule would let the gate format where the hook refuses.
+  - **The banner is identity enough for a formatter**, where the analyser needs its wheel's
+    RECORD: a bare release banner is printed by builds of that release tag, and a formatter
+    resolves no resource headers relative to itself, so the copied-binary hazard has no
+    formatter counterpart.
+  - The banner is compared WHOLE. Two builds of one release number are different formatters:
+    the apt snapshot prints `Ubuntu clang-format version 22.1.8 (++20260714014902+…)`, so it is
+    refused exactly like the IDE's 22.1.3.
+  - **clang-tidy is a build of its own**, declared in `.clang-tidy-version` and identified by its
+    wheel rather than its banner: the next bullet (#1404).
 
-  On Windows the declared build lives in WSL, so the hook refuses there by default — the
-  correct answer, not a gap. A `clang-format-22` on the Windows `PATH` that runs
-  `wsl.exe -e clang-format-22 "$@"` (with `MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*'`) is
-  held to the declaration like any other candidate and needs no path translation, because
-  the hook formats from the file's directory on a relative path; measured at 0.42 s per
-  edit that writes, against 0.20 s for a refusal. That wrapper is one developer's machine,
-  which is why it goes on `PATH` and never into the declaration.
+  **Measured 2026-09-14 on master `ce7c565d`, on this Windows host and its WSL image:** PyPI's
+  22.1.8 prints `clang-format version 22.1.8` from both the Windows and the manylinux wheel,
+  and passes `--dry-run --Werror` over all 950 tracked C++ files, as the apt snapshot and VS
+  22.1.3 also did — so no build disagreed about THAT tree, which is a statement about one tree
+  and not about the builds. **And on `a96e4e45`, over all 778 tracked first-party C++ files**
+  (`git ls-files '*.cpp' '*.hpp' '*.h'` outside `vendor/`), as they are and with leading
+  whitespace stripped and space runs collapsed: the manylinux wheel against the apt snapshot
+  (`ca7933e47d3a`, which is the `llvmorg-22.1.8` tag commit) 778/778 byte-identical both ways,
+  and the manylinux wheel against the win_amd64 wheel 778/778 identical both ways, raw bytes.
+  Controls: every output non-empty, every run exit 0, the as-is output equal to the file for all
+  778, and the scrambled output differing from the file for 350, where both builds re-derived the
+  same layout. Because the snapshot IS the tag, that shows two builds of one source agreeing —
+  it says nothing about the NEXT snapshot, which is the reason for leaving apt, not against it.
+
+  A Windows host now formats natively: `python -m pip install --user clang-format==<release>`
+  puts the declared build in the user Scripts directory, which must be on `PATH` for the hook
+  to see it. Ubuntu 24.04's python refuses `pip install --user` (PEP 668), and this repository's
+  WSL image has neither pip nor venv, so there the route is `pipx`, a venv (apt's `pipx` /
+  `python3-venv`), or the wheel another host downloads with `--platform manylinux_2_27_x86_64`,
+  unzipped — the resolver's refusal prints each.
 - **The analyser's BUILD is `.clang-tidy-version`: an exact PyPI release, identified by its
   wheel, never by a name or a banner (#1404).** The formatter's remedy does not transfer:
   `clang-tidy-22 --version` prints `Ubuntu LLVM version 22.1.8` for every apt snapshot, so there
@@ -2962,18 +2996,21 @@ makes it anyway and says so there.
   So: run a non-pinned binary as `--dry-run` on the lines **you** added, never with
   `-i`, and never let it touch a file you are only passing through.
 
-  **"The apt mirror has no `clang-format-22`" is not a reason to format with 18.**
-  LLVM ships the official binaries on PyPI, so the pinned version is one download
-  away on any host with outbound HTTPS and no root:
+  **"The distro has no clang-format 22" is not a reason to format with 18.** The
+  pinned formatter IS the PyPI build `.clang-format-version` declares, so it is one install
+  away on any host with outbound HTTPS and no root -- `bash
+  scripts/check-clang-format-version.sh --resolve` prints the commands when it finds
+  none. Where no pip is available at all, the wheel is a zip, fetched by any host that
+  has pip (add `--platform manylinux_2_27_x86_64 --only-binary=:all:` from another OS):
 
   ```sh
-  pip download "clang-format==${CLANG_TOOLS_VERSION}.1.0" -d /tmp/cf --no-deps
-  python3 -m zipfile -e /tmp/cf/clang_format-*.whl /tmp/cf22
-  install -m755 /tmp/cf22/clang_format/data/bin/clang-format ~/.local/bin/clang-format-22
+  pip download "$(bash scripts/check-clang-format-version.sh --requirement)" -d /tmp/cf --no-deps
+  python3 -m zipfile -e /tmp/cf/clang_format-*.whl /tmp/cf-whl
+  install -m755 /tmp/cf-whl/clang_format/data/bin/clang-format ~/.local/bin/clang-format
   ```
 
-  With that on `PATH`, `scripts/local-gate.sh` finds it by name and the whole tree
-  can be formatted exactly as `Check C++ style` will judge it -- which is strictly
+  With that on `PATH`, `scripts/local-gate.sh` resolves it by its banner and the whole
+  tree can be formatted exactly as `Check C++ style` will judge it -- which is strictly
   better than hand-matching a style guide and then finding out in CI. Reach for the
   byte-for-byte restore above only when even this is unavailable.
 
