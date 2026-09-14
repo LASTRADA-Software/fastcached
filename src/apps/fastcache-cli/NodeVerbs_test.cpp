@@ -6,6 +6,10 @@
 
 #include <FastCache/Cluster/ClusterState.hpp>
 #include <FastCache/Core/Ranges.hpp>
+#include <FastCache/Metrics/IMetricsSink.hpp>
+#include <FastCache/Metrics/MetricsCatalog.hpp>
+#include <FastCache/Metrics/StatsReading.hpp>
+#include <FastCache/Metrics/StatsReadingCodec.hpp>
 #include <FastCache/Net/BlockingSocket.hpp>
 
 #include <catch2/catch_test_macros.hpp>
@@ -111,6 +115,19 @@ namespace
     auto const header = Cc::DecodeRequestHeader(request);
     REQUIRE(header.has_value());
     return Unwrap(header).opRaw;
+}
+
+/// A `NodeMetrics` reply as a node sends it: one encoded `StatsReading`.
+/// @param jobsCompleted What `WorkerJobsCompleted` reads; every other counter reads zero.
+/// @param storage The cache tier's figures the reading carries.
+/// @return The framed reply.
+[[nodiscard]] std::vector<std::byte> NodeMetricsReply(std::uint64_t jobsCompleted, StorageStats storage)
+{
+    auto sink = AtomicMetricsSink {};
+    sink.Increment(IMetricsSink::Counter::WorkerJobsCompleted, jobsCompleted);
+    auto snapshot = MetricsSnapshot {};
+    snapshot.storage = storage;
+    return Cc::EncodeReply(Cc::Status::Ok, EncodeStatsReading(CaptureStatsReading(sink, snapshot)));
 }
 
 } // namespace
@@ -426,17 +443,11 @@ TEST_CASE("`node` reports a component bit this client has no name for", "[cli][n
     CHECK(RequiredCell(answer, "components").lexical.contains("unknown(0x80)"));
 }
 
-TEST_CASE("`node-metrics` reports every counter the node sent", "[cli][node][verbs]")
+TEST_CASE("`node-metrics` reports every figure the node's reading carries", "[cli][node][verbs]")
 {
-    auto const row = [](std::string_view name, std::uint64_t value) {
-        return WireFields::Encode({ Cc::AsBytes(name), std::span<std::byte const> { Cc::EncodeU64Field(value) } });
-    };
-    auto const busy = row("fastcache_worker_jobs_completed_total", 12);
-    auto const idle = row("fastcache_worker_jobs_refused_no_capacity_total", 0);
-    auto const payload =
-        WireFields::Encode(WireFields::FieldList { std::vector<std::span<std::byte const>> { busy, idle } });
-
-    ScriptedNodeExchange node { { Cc::EncodeReply(Cc::Status::Ok, payload) } };
+    // #1406: the cache tier's figures beside the counters. A node answering the counter catalogue
+    // alone would satisfy the counter and the zero, and fail the storage rows.
+    ScriptedNodeExchange node { { NodeMetricsReply(12, StorageStats { .itemCount = 3, .deleteHits = 2 }) } };
 
     auto const answer = RunNodeVerb("node-metrics", node);
     CHECK(answer.outcome == Outcome::Affirmative);
@@ -444,10 +455,40 @@ TEST_CASE("`node-metrics` reports every counter the node sent", "[cli][node][ver
     CHECK(OpOf(node.Sent()[0]) == static_cast<std::uint8_t>(Cc::Op::NodeMetrics));
 
     CHECK(RequiredCell(answer, "fastcache_worker_jobs_completed_total").lexical == "12");
+    CHECK(RequiredCell(answer, "fastcached_items").lexical == "3");
+    CHECK(RequiredCell(answer, "fastcached_delete_hits_total").lexical == "2");
 
     // The zero row is PRESENT, which is the property a reading of only the non-zero
     // counter cannot see.
-    CHECK(RequiredCell(answer, "fastcache_worker_jobs_refused_no_capacity_total").lexical == "0");
+    CHECK(RequiredCell(answer, "fastcache_worker_jobs_started_total").lexical == "0");
+
+    // And every catalogue counter is a field named by its `prometheusName`, which is what this verb's
+    // counters were named before it carried a reading: a script reading `--format=kv` keys (the
+    // cluster end-to-end fixture does) keeps its keys, and gains the tier's beside them.
+    for (auto const& row: CounterTable)
+    {
+        INFO(row.prometheusName);
+        CHECK(CellOf(answer, row.prometheusName) != nullptr);
+    }
+}
+
+TEST_CASE("`node-metrics` against a node of the previous wire version is refused by that node, by name",
+          "[cli][node][verbs]")
+{
+    // What a version-9 node really answers (#1406). A reply header carries no version, so this client
+    // never meets a version-9 BODY: the node's request check refuses the version-10 frame first, as
+    // `UnsupportedVersion` naming its range. That refusal is the realistic old-build case, and it
+    // must reach the operator as a refusal that names both versions -- not as an unreadable reading.
+    ScriptedNodeExchange node { { RefusalReply(Cc::ErrorCode::UnsupportedVersion,
+                                               "unsupported wire version 10; this server speaks 9..9") } };
+
+    auto const answer = RunNodeVerb("node-metrics", node);
+    REQUIRE(node.Sent().size() == 1);
+    CHECK(static_cast<std::uint8_t>(node.Sent()[0][1]) == Cc::CurrentVersion);
+    CHECK(answer.outcome == Outcome::Refused);
+    REQUIRE(answer.advisories.size() == 1);
+    CHECK(answer.advisories[0].contains("this server speaks 9..9"));
+    CHECK_FALSE(answer.advisories[0].contains("reading"));
 }
 
 TEST_CASE("A node verb's refusal is reported by name and exits `refused`", "[cli][node][verbs]")
@@ -514,12 +555,17 @@ TEST_CASE("A node verb separates *nothing answered* from *the answer was unreada
         CHECK(answer.advisories[0].contains("cannot read"));
     }
 
-    SECTION("and node-metrics does the same with its own body")
+    SECTION("and node-metrics does the same with its own body, naming why the reading would not decode")
     {
-        ScriptedNodeExchange node { { Cc::EncodeReply(Cc::Status::Ok,
-                                                      Cc::AsBytes(std::string_view { "\xFF\xFE not fields" })) } };
+        // A well-framed reply whose reading another build laid out: the digest the encoding starts
+        // with differs, so only the reading decode fails.
+        auto body = EncodeStatsReading(StatsReading {});
+        body[7] ^= std::byte { 0x01 };
+        ScriptedNodeExchange node { { Cc::EncodeReply(Cc::Status::Ok, body) } };
         auto const answer = RunNodeVerb("node-metrics", node);
         CHECK(answer.outcome == Outcome::Protocol);
+        REQUIRE(answer.advisories.size() == 1);
+        CHECK(answer.advisories[0].contains("answered node-metrics with a reading that is laid out by a build other"));
     }
 }
 
@@ -1665,12 +1711,8 @@ TEST_CASE("a compile node answers stats through the ladder's node-metrics rung",
     // that cell knew a node could answer -- yet a node answers it, through the rung that
     // asks the node for its own counters. Asserting only what the page SAYS would prove the text
     // changed; this proves the text is true.
-    auto const counter = WireFields::Encode(
-        { Cc::AsBytes("fastcache_worker_jobs_completed_total"), std::span<std::byte const> { Cc::EncodeU64Field(12) } });
-    auto const payload = WireFields::Encode(WireFields::FieldList { std::vector<std::span<std::byte const>> { counter } });
-
     ScriptedNodeExchange node { { StatusReply({ .version = "0.2.0", .nodeId = {}, .uptimeSeconds = 5, .surfaces = {} }),
-                                  Cc::EncodeReply(Cc::Status::Ok, payload) },
+                                  NodeMetricsReply(12, StorageStats { .itemCount = 3 }) },
                                 "10.0.0.4:6674" };
     auto gatherer = GathererFor(node);
 
@@ -1681,6 +1723,9 @@ TEST_CASE("a compile node answers stats through the ladder's node-metrics rung",
     CHECK(answer.outcome == Outcome::Affirmative);
     CHECK(RequiredCell(answer, "source").lexical == "node-metrics");
     CHECK(RequiredCell(answer, "fastcache_worker_jobs_completed_total").lexical == "12");
+    // And the cache tier's figure, which the rung's old counters-only body could not carry (#1406) --
+    // so `stats` against a node reads the same fields `/metrics` would have given it.
+    CHECK(RequiredCell(answer, "fastcached_items").lexical == "3");
 }
 
 TEST_CASE("a node whose description this client cannot read is a node it cannot read", "[cli][node][identity]")

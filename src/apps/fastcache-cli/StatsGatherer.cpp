@@ -267,21 +267,16 @@ StatsAttempt LadderGatherer::AskNodeMetrics()
         return attempt;
     }
 
-    auto record = DecodeNodeCounters(reply->payload);
+    // A reading that decodes renders every catalogue counter, so a decoded record is never empty:
+    // the layout digest, not a row count, is what refuses a body this client cannot read.
+    auto record = DecodeNodeMetrics(reply->payload);
     if (!record.has_value())
     {
-        attempt.note = std::format("{} answered node-metrics with a body this client cannot read", _node->Address());
+        attempt.note = std::format(
+            "{} answered node-metrics with a reading that {}", _node->Address(), DescribeReadingFault(record.error()));
         return attempt;
     }
-    if (record->fields.empty())
-    {
-        // A successful reply with no rows is not a reading. Saying so keeps it from
-        // being reported as an empty but successful scrape, which a dashboard would draw
-        // as a node of zeroes.
-        attempt.note = std::format("{} answered node-metrics with no counters", _node->Address());
-        return attempt;
-    }
-    attempt.record = std::move(*record);
+    attempt.record = *std::move(record);
     return attempt;
 }
 

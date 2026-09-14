@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "StatsSource.hpp"
 
+#include <FastCache/Metrics/PrometheusFormatter.hpp>
+
 #include <algorithm>
 #include <charconv>
 #include <cstddef>
@@ -84,6 +86,28 @@ StatsOriginSpec const* DescriptorOf(StatsOrigin origin) noexcept
     if (index >= StatsOriginTable.size())
         return nullptr;
     return &StatsOriginTable[index];
+}
+
+std::string_view DescribeReadingFault(StatsReadingFault fault) noexcept
+{
+    switch (fault)
+    {
+        case StatsReadingFault::ForeignLayout:
+            return "is laid out by a build other than this client's; upgrade the older of the two";
+        case StatsReadingFault::Truncated:
+            return "ends before its layout does";
+        case StatsReadingFault::Malformed:
+            return "carries a value its layout has no meaning for";
+        case StatsReadingFault::TrailingBytes:
+            return "carries bytes past the end of its layout";
+    }
+    return "cannot be read";
+}
+
+std::expected<Value, StatsReadingFault> DecodeNodeMetrics(std::span<std::byte const> payload)
+{
+    return DecodeStatsReading(payload).transform(
+        [](StatsReading const& reading) { return ParsePrometheus(RenderPrometheus(reading)); });
 }
 
 Value ParsePrometheus(std::string_view body)

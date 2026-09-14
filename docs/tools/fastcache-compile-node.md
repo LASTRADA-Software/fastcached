@@ -732,8 +732,11 @@ Eight counters on `/metrics`, and the splits are the point:
 members**, and `fastcache-cli node` / `fastcache-cli node-metrics` are what read
 them. They report what this process is — version, minted identity, uptime, the
 components it actually started, the ports it opened, and **how far its worker has
-got in identifying the toolchains it will serve** — and every counter this build
-carries.
+got in identifying the toolchains it will serve** — and, through `node-metrics`, the
+reading `/metrics` renders: every counter this build carries, the cache tier's storage
+and per-tier figures, and the host figures beside them. It is one reading in the
+encoding a live-stats cache subscription streams, so a node with no `--admin-listen`
+still shows what its cache tier holds and how many drops it has served.
 
 That last one is the answer to *why is this node not taking any work*, and it is
 the reason these verbs are worth reaching for on a default install: a node serves
@@ -757,8 +760,8 @@ They are gated on membership rather than on a credential, and that is deliberate
 the credential on this listener belongs to the scheduler, so a node running none has
 none to check, and demanding one would leave these permanently unanswerable on a
 single-machine install. Loopback is always a member; a remote caller needs
-`--fleet-member`. What they hand over is strictly less than `/metrics` already
-serves unauthenticated.
+`--fleet-member`. What they hand over is no more than `/metrics` already serves
+unauthenticated.
 
 | Counter | What a rise means |
 |---|---|

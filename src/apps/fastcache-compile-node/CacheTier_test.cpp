@@ -1,20 +1,31 @@
 // SPDX-License-Identifier: Apache-2.0
+#include "AdminEndpoint.hpp"
 #include "CacheTier.hpp"
+#include "LiveStatsSources.hpp"
 #include "NodeIoLoop.hpp"
+#include "NodeStatusResponder.hpp"
+#include "StatsSource.hpp"
 
 #include <FastCache/Async/Task.hpp>
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Compression.hpp>
 #include <FastCache/Core/Logger.hpp>
+#include <FastCache/Distributed/MembershipOracle.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
+#include <FastCache/Metrics/StatsReadingCodec.hpp>
 #include <FastCache/Net/BlockingSocket.hpp>
+#include <FastCache/Net/InMemoryTransport.hpp>
 #include <FastCache/Platform/LocalAddresses.hpp>
 #include <FastCache/Platform/LocalAddressesTestUtils.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
+#include <FastCache/Server/AdminHttpServer.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <array>
+#include <charconv>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
@@ -31,6 +42,7 @@
 #include <vector>
 
 #include <tests/ScratchPath.hpp>
+#include <tests/ScriptedHostFacts.hpp>
 #include <tests/Unwrap.hpp>
 #include <tests/WireReply.hpp>
 
@@ -135,6 +147,122 @@ template <typename Table>
 {
     return std::vector<std::byte>(bytes, std::byte { 0x41 });
 }
+
+/// A node identity nothing reads: `NodeMetrics` answers the cache subject, which is the counters and
+/// the snapshot only.
+class NoIdentity final: public INodeStatusSource
+{
+  public:
+    [[nodiscard]] Wire::NodeStatusFields Describe() const override
+    {
+        return {};
+    }
+};
+
+/// Write all of @p bytes.
+/// @param socket Where; must outlive the task.
+/// @param bytes What; must outlive the task.
+/// @return Whether every byte was taken.
+[[nodiscard]] Task<bool> WriteWhole(ISocket* socket, std::span<std::byte const> bytes)
+{
+    auto const written = co_await socket->Write(bytes);
+    co_return written.has_value() && *written == bytes.size();
+}
+
+/// Everything @p socket delivers until its peer has finished sending.
+/// @param socket Where; must outlive the task, and its peer must already be closed.
+/// @return The bytes, as text.
+[[nodiscard]] Task<std::string> ReadToEnd(ISocket* socket)
+{
+    std::string text;
+    std::vector<std::byte> chunk(64 * 1024);
+    while (true)
+    {
+        auto const read = co_await socket->Read(chunk);
+        if (!read.has_value() || *read == 0)
+            co_return text;
+        for (auto const byte: std::span<std::byte const> { chunk }.first(*read))
+            text.push_back(static_cast<char>(byte));
+    }
+}
+
+/// The two doors a node's figures leave by -- `/metrics` and `NodeMetrics` -- assembled over ONE
+/// snapshot provider the way `main.cpp` assembles them: the provider `MakeNodeSnapshotProvider`
+/// builds, handed to the admin route and, through the live-stats sources, to the responder.
+///
+/// Over a scripted machine and held load counters, so the two doors asked in turn describe one
+/// machine: the system's figures move between two reads, which would be a difference neither door
+/// has. The tier is the case's own, started by `StartCacheTierOrExplain`.
+class MetricsDoors
+{
+  public:
+    /// @param tier The node's cache; must outlive this.
+    /// @param metrics The node's counters; must outlive this.
+    MetricsDoors(CacheTier const& tier, IMetricsSink& metrics):
+        _metrics { metrics },
+        _provider { MakeNodeSnapshotProvider(NodeScrapeSources { .host = &_host,
+                                                                 .load = &_load,
+                                                                 .busySlots = [] { return std::size_t { 2 }; },
+                                                                 .cache = &tier,
+                                                                 .slots = 4,
+                                                                 .scratchRoot = {},
+                                                                 .consensus = {} },
+                                             std::chrono::steady_clock::now()) },
+        _sources { NodeLiveStatsParts { .metrics = &metrics,
+                                        .snapshot = _provider,
+                                        .identity = &_identity,
+                                        .fleet = {},
+                                        .history = nullptr,
+                                        .endpoint = {} } },
+        _responder { _identity, _sources, _membership, metrics }
+    {
+    }
+
+    MetricsDoors(MetricsDoors const&) = delete;
+    MetricsDoors(MetricsDoors&&) = delete;
+    MetricsDoors& operator=(MetricsDoors const&) = delete;
+    MetricsDoors& operator=(MetricsDoors&&) = delete;
+    ~MetricsDoors() = default;
+
+    /// The body `GET /metrics` is served, through the admin surface's own request handler.
+    /// @return The Prometheus text, headers stripped.
+    [[nodiscard]] std::string MetricsRoute()
+    {
+        auto pair = InMemorySocketPair::Create();
+        auto const request = std::string_view { "GET /metrics HTTP/1.1\r\n\r\n" };
+        REQUIRE(SyncRun(WriteWhole(pair.client.get(), Wire::AsBytes(request))));
+        pair.client->ShutdownWrite();
+        SteadyClock clock;
+        SyncRun(ServeAdminHttp(pair.server.get(), &_metrics, _provider, &clock));
+        pair.server->Close();
+
+        auto const response = SyncRun(ReadToEnd(pair.client.get()));
+        REQUIRE(response.starts_with("HTTP/1.1 200 OK\r\n"));
+        auto const bodyAt = response.find("\r\n\r\n");
+        REQUIRE(bodyAt != std::string::npos);
+        return response.substr(bodyAt + 4);
+    }
+
+    /// The reading `NodeMetrics` answers, as the bytes after the reply header.
+    /// @return The reply body.
+    [[nodiscard]] std::vector<std::byte> NodeMetricsBody()
+    {
+        auto const reply = SyncRun(_responder.Answer(Wire::EncodeNodeMetricsRequest(), "127.0.0.1")).bytes;
+        REQUIRE(StatusOf(reply) == Wire::Status::Ok);
+        auto const body = Testing::PayloadOf(reply);
+        return { body.begin(), body.end() };
+    }
+
+  private:
+    Testing::ScriptedHostFacts _host;
+    Testing::FixedHostCounters _load;
+    NoIdentity _identity;
+    Distributed::OpenMembership _membership;
+    IMetricsSink& _metrics;
+    AdminHttpServer::SnapshotProvider _provider;
+    NodeLiveStatsSources _sources;
+    NodeStatusResponder _responder;
+};
 
 } // namespace
 
@@ -669,4 +797,107 @@ TEST_CASE("A dropped key is gone from every tier a fetch consults, and stays gon
     auto const tier = std::move(*reopened);
     REQUIRE(tier != nullptr);
     CHECK(ask(*tier, Wire::EncodeFetch("dropped")) == Wire::Status::Miss);
+}
+
+TEST_CASE("NodeMetrics reads back as the series the node's own /metrics route serves", "[node][cache-tier][node-metrics]")
+{
+    // #1406. The two PRODUCTION acquisitions of one node, compared: the admin route's body as the
+    // `/metrics` rung parses it, and the `NodeMetrics` verb as the CLI decodes it. Each is derived
+    // from the node, never from a reading the case made, so a figure one door carries and the other
+    // does not is a difference here rather than a gap both sides share.
+    auto cfg = Fixture::BaseConfig();
+    cfg.cacheMemoryBytes = 4 * 1024 * 1024;
+    cfg.upstream = "127.0.0.1:1";
+
+    Fixture fixture;
+    auto started = fixture.Start(cfg);
+    REQUIRE(started.has_value());
+    auto const tier = std::move(*started);
+    REQUIRE(tier != nullptr);
+    fixture.metrics.Increment(IMetricsSink::Counter::WorkerJobsCompleted, 7);
+
+    MetricsDoors doors { *tier, fixture.metrics };
+    auto const secondsOf = [](std::string_view lexical) {
+        auto seconds = std::uint64_t { 0 };
+        REQUIRE(std::from_chars(lexical.data(), lexical.data() + lexical.size(), seconds).ec == std::errc {});
+        return seconds;
+    };
+    auto const scraped = Cli::ParsePrometheus(doors.MetricsRoute());
+    auto const asked = Cli::DecodeNodeMetrics(doors.NodeMetricsBody());
+    REQUIRE(asked.has_value());
+
+    // The figures that were missing from this verb, and a counter, required present on BOTH sides:
+    // two empty records agree perfectly, and so do two that lost the same block.
+    constexpr auto Required =
+        std::array<std::string_view, 7> { "fastcache_worker_jobs_completed_total", "fastcached_items",
+                                          "fastcached_delete_hits_total",          "fastcached_tier_items{tier=\"memory\"}",
+                                          "fastcache_node_logical_cores",          "fastcache_node_cpu_busy_ticks_total",
+                                          "fastcache_node_upstream_configured" };
+    for (auto const name: Required)
+    {
+        INFO(name);
+        CHECK(Cli::FindField(scraped, name) != nullptr);
+        CHECK(Cli::FindField(*asked, name) != nullptr);
+    }
+
+    // Then the whole set, both directions, value for value.
+    CHECK(asked->fields.size() == scraped.fields.size());
+    for (auto const& field: scraped.fields)
+    {
+        INFO(field.name);
+        auto const* ours = Cli::FindField(*asked, field.name);
+        REQUIRE(ours != nullptr);
+        // The uptime is read off the process clock per call, so a second acquisition can be a second
+        // later: the one figure whose difference is the MOMENT asked and not the door.
+        if (field.name == "fastcached_uptime_seconds")
+            CHECK(secondsOf(field.value.lexical) <= secondsOf(ours->value.lexical));
+        else
+            CHECK(ours->value.lexical == field.value.lexical);
+    }
+    for (auto const& field: asked->fields)
+    {
+        INFO(field.name);
+        CHECK(Cli::FindField(scraped, field.name) != nullptr);
+    }
+}
+
+TEST_CASE("A dropped key moves the delete figures NodeMetrics reads, with no admin surface in between",
+          "[node][cache-tier][cache-drop][node-metrics]")
+{
+    // #1406, through the reading a node answers: `cache-drop` answers `Ok` or `Miss` and nothing else,
+    // so this verb is how an operator on the `0xFC` port alone sees that a drop landed; a reply of the
+    // counter catalogue alone has no delete figures to show it.
+    auto cfg = Fixture::BaseConfig();
+    cfg.cacheMemoryBytes = 4 * 1024 * 1024;
+
+    Fixture fixture;
+    auto started = fixture.Start(cfg);
+    REQUIRE(started.has_value());
+    auto const tier = std::move(*started);
+    REQUIRE(tier != nullptr);
+    MetricsDoors doors { *tier, fixture.metrics };
+
+    auto const deleteFigures = [&doors] {
+        auto const reading = DecodeStatsReading(doors.NodeMetricsBody());
+        REQUIRE(reading.has_value());
+        REQUIRE(reading->snapshot.storage.has_value());
+        return std::pair { reading->snapshot.storage->deleteHits, reading->snapshot.storage->deleteMisses };
+    };
+    auto const ask = [&tier](std::vector<std::byte> const& frame) {
+        return StatusOf(SyncRun(tier->Responder().Answer(frame, "127.0.0.1")).bytes);
+    };
+
+    // The control: nothing dropped yet reads zero, so the figures below are the drops' and not a
+    // number the reading always carried.
+    CHECK(deleteFigures() == std::pair { std::uint64_t { 0 }, std::uint64_t { 0 } });
+
+    std::vector<std::byte> const value(64, std::byte { 0x5A });
+    REQUIRE(ask(Wire::EncodeStore(Wire::StoreRequest {
+                .key = "dropped", .prefetchGroup = {}, .srcRoot = "/src", .buildTree = "/build", .value = value }))
+            == Wire::Status::Ok);
+    REQUIRE(ask(Wire::EncodeCacheDrop("dropped")) == Wire::Status::Ok);
+    CHECK(deleteFigures() == std::pair { std::uint64_t { 1 }, std::uint64_t { 0 } });
+
+    REQUIRE(ask(Wire::EncodeCacheDrop("dropped")) == Wire::Status::Miss);
+    CHECK(deleteFigures() == std::pair { std::uint64_t { 1 }, std::uint64_t { 1 } });
 }

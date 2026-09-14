@@ -5,8 +5,11 @@
 #include "CliValue.hpp"
 
 #include <FastCache/Core/EnumTable.hpp>
+#include <FastCache/Metrics/StatsReadingCodec.hpp>
 
+#include <cstddef>
 #include <cstdint>
+#include <expected>
 #include <optional>
 #include <span>
 #include <string>
@@ -43,14 +46,14 @@ enum class StatsOrigin : std::uint8_t
     /// does need the daemon to have been started with its metrics listener enabled,
     /// and it is on a different port from the data plane.
     Metrics,
-    /// The node's own `NodeMetrics` verb over `0xFC`. Every counter its build carries,
-    /// zeroes included, and it needs no second port and no credential a plain worker
-    /// cannot check.
+    /// The node's own `NodeMetrics` verb over `0xFC`. The reading `/metrics` renders, over
+    /// the wire every node verb uses, so it needs no second port and no credential a plain
+    /// worker cannot check (#1406).
     ///
-    /// **Below `/metrics` because it is narrower, not because it is worse**: it carries
-    /// the counter catalogue and NOT the storage series or the per-tier ones, which the
-    /// Prometheus renderer adds. Above `INFO` because it is an order of magnitude wider
-    /// than seven fields -- and it is the only rung that answers at all against a
+    /// **Below `/metrics` by precedence only**: both carry one reading, and the record this
+    /// rung reports is `ParsePrometheus` of it rendered by `RenderPrometheus`, so the two
+    /// produce the same fields by construction. Above `INFO` because it is every figure
+    /// rather than seven -- and it is the only rung that answers at all against a
     /// `fastcache-compile-node`, which speaks no RESP.
     NodeMetrics,
     /// RESP `INFO` on the data port. Always present, and a small fixed set of
@@ -85,8 +88,7 @@ inline constexpr EnumTable<StatsOrigin, StatsOriginSpec> StatsOriginTable { {
       .name = "node-metrics",
       .route = "NodeMetrics",
       .what = "the node's own NodeMetrics verb over 0xFC",
-      .caveat = "this is the counter catalogue only; /metrics adds the storage and "
-                "per-tier series" },
+      .caveat = "" },
     { .origin = StatsOrigin::Info,
       .name = "info",
       .route = "INFO",
@@ -147,6 +149,26 @@ inline constexpr std::string_view StatsSourceFieldName = "source";
 /// @param body The response body.
 /// @return A record in the order the series appeared.
 [[nodiscard]] Value ParsePrometheus(std::string_view body);
+
+/// Why a live-stats reading did not decode, as the tail of a sentence that names what carried it.
+///
+/// One set of words for both readers of a reading -- `node-metrics` and a live-stats stream -- so a
+/// layout mismatch reads the same whichever door met it.
+/// @param fault What the codec said.
+/// @return The words.
+[[nodiscard]] std::string_view DescribeReadingFault(StatsReadingFault fault) noexcept;
+
+/// Read a `NodeMetrics` body back as a record.
+///
+/// **The record the `/metrics` rung would have produced, by construction** (#1406): the body is
+/// the node's `StatsReading`, rendered here by the `RenderPrometheus` its `/metrics` renders with
+/// and read back by `ParsePrometheus`, the parser that rung uses. So no list of figures is kept in
+/// this client to fall behind the node's, and `stats` reports the same fields whichever rung
+/// answered. Two callers -- the `node-metrics` verb and that rung -- so one decoder.
+/// @param payload The reply body: one `EncodeStatsReading`.
+/// @return The record, or why the reading would not decode -- a layout other than this build's
+///         is refused by name, never read.
+[[nodiscard]] std::expected<Value, StatsReadingFault> DecodeNodeMetrics(std::span<std::byte const> payload);
 
 /// Parse a RESP `INFO` body into a record.
 ///

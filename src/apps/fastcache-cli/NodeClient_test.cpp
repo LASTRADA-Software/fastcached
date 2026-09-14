@@ -204,62 +204,6 @@ TEST_CASE("A framed reply decodes into what a handler reads", "[cli][node][codec
     }
 }
 
-TEST_CASE("A NodeMetrics body decodes into a record that keeps its zeroes", "[cli][node][codec]")
-{
-    // **A counter is a tally, so zero is the truth about events that never happened.**
-    // The node goes out of its way to send every row; a client that dropped the zeroes
-    // would undo exactly the distinction that encoding preserved, and no round-trip test
-    // that only checks a non-zero counter can see it.
-    auto const row = [](std::string_view name, std::uint64_t value) {
-        return WireFields::Encode({ Wire::AsBytes(name), std::span<std::byte const> { Wire::EncodeU64Field(value) } });
-    };
-
-    auto const a = row("fastcache_a_total", 7);
-    auto const b = row("fastcache_b_total", 0);
-    auto const payload = WireFields::Encode(WireFields::FieldList { std::vector<std::span<std::byte const>> { a, b } });
-
-    auto const record = DecodeNodeCounters(payload);
-    REQUIRE(record.has_value());
-    REQUIRE(Unwrap(record).shape == Shape::Record);
-    REQUIRE(Unwrap(record).fields.size() == 2);
-
-    // Order is preserved, because the node sends them in catalogue order and an operator
-    // diffing two nodes' output wants the same rows on the same lines.
-    CHECK(Unwrap(record).fields[0].name == "fastcache_a_total");
-    CHECK(Unwrap(record).fields[0].value.lexical == "7");
-    CHECK(Unwrap(record).fields[1].name == "fastcache_b_total");
-    CHECK(Unwrap(record).fields[1].value.kind == CellKind::Number);
-    CHECK(Unwrap(record).fields[1].value.lexical == "0");
-
-    SECTION("and a counter name that is not text is refused rather than repaired")
-    {
-        // One byte that is not UTF-8 makes `--format=json` unparseable for the whole
-        // record, which is the fleet page's own rule arriving on another wire. Refused,
-        // never substituted -- a repair is the failure that is quiet.
-        auto const bad = row(std::string_view { "\xFF\xFE" }, 1);
-        auto const broken = WireFields::Encode(WireFields::FieldList { std::vector<std::span<std::byte const>> { bad } });
-        CHECK_FALSE(DecodeNodeCounters(broken).has_value());
-    }
-
-    SECTION("and a row that is not a name/value pair is refused")
-    {
-        auto const lonely = WireFields::Encode({ Wire::AsBytes(std::string_view { "only-a-name" }) });
-        auto const broken = WireFields::Encode(WireFields::FieldList { std::vector<std::span<std::byte const>> { lonely } });
-        CHECK_FALSE(DecodeNodeCounters(broken).has_value());
-    }
-
-    SECTION("and an empty body is an empty record rather than a failure")
-    {
-        // A node with no counters is not a node that answered badly. The ladder's rung
-        // is what decides an empty reading is unusable; the codec's job is to say what
-        // arrived.
-        auto const empty =
-            DecodeNodeCounters(WireFields::Encode(WireFields::FieldList { std::vector<std::span<std::byte const>> {} }));
-        REQUIRE(empty.has_value());
-        CHECK(Unwrap(empty).fields.empty());
-    }
-}
-
 TEST_CASE("A probe tells the three kinds of endpoint apart", "[cli][node][probe]")
 {
     // **Three states, and the third is the one that gets collapsed.** A client that can

@@ -3,7 +3,6 @@
 #include "NodeSurfaces.hpp"
 
 #include <FastCache/Core/EnumTable.hpp>
-#include <FastCache/Metrics/MetricsCatalog.hpp>
 #include <FastCache/Protocol/SurfaceRefusal.hpp>
 
 #include <algorithm>
@@ -16,33 +15,12 @@ namespace FastCache::Node
 
 namespace
 {
-    /// Encode every counter this build carries as `name value` pairs.
-    ///
-    /// Walks `CounterTable` rather than a hand-picked list, for the reason the
-    /// Prometheus renderer does: a counter added to the table and forgotten here would
-    /// be a series an operator was told to scrape and that is exported nowhere.
-    ///
-    /// **Every row is emitted, including the zeroes.** A counter is a tally, so zero is
-    /// the truth about events that never happened -- dropping a zero row would make
-    /// *nothing happened* and *this build has no such counter* the same answer, which is
-    /// the one distinction a client reading these has no other way to make.
-    /// @param metrics The sink to read.
-    /// @return The payload.
-    [[nodiscard]] std::vector<std::byte> EncodeCounters(IMetricsSink const& metrics)
-    {
-        std::vector<std::vector<std::byte>> rows;
-        rows.reserve(CounterTable.size());
-        for (auto const& row: CounterTable)
-            rows.push_back(WireFields::Encode(
-                { CompileCacheWire::AsBytes(row.prometheusName),
-                  std::span<std::byte const> { CompileCacheWire::EncodeU64Field(metrics.Read(row.counter)) } }));
-
-        std::vector<std::span<std::byte const>> views;
-        views.reserve(rows.size());
-        for (auto const& row: rows)
-            views.emplace_back(row);
-        return WireFields::Encode(WireFields::FieldList { views });
-    }
+    /// A `NodeMetrics` asked of a node whose sources are detached: it is stopping.
+    constexpr Cc::UncountedRefusal NodeIsStopping {
+        .code = CompileCacheWire::ErrorCode::EndpointBusy,
+        .rationale = "a node in its last moments before exit, once per request that reaches it then; a rise would say "
+                     "only that somebody asked while it stopped, which its own log already says",
+    };
 
     /// One row of `WireRoles`.
     struct WireRoleRow
@@ -269,8 +247,16 @@ Task<FrameReply> NodeStatusResponder::Answer(std::span<std::byte const> frame, s
         case CompileCacheWire::Op::NodeStatus:
             co_return CompileCacheWire::EncodeReply(CompileCacheWire::Status::Ok,
                                                     CompileCacheWire::EncodeNodeStatus(_identity.Describe()));
-        case CompileCacheWire::Op::NodeMetrics:
-            co_return CompileCacheWire::EncodeReply(CompileCacheWire::Status::Ok, EncodeCounters(_metrics));
+        case CompileCacheWire::Op::NodeMetrics: {
+            // The reading `/metrics` renders -- every counter and every block of the snapshot beside
+            // them -- in the encoding a live-stats cache subject streams (#1406). ONE capture, so the
+            // verb, the page and the stream cannot be three readings of this node, and a client of
+            // another layout is refused by name by the digest the encoding starts with.
+            auto capture = _readings.Capture(CompileCacheWire::LiveSubject::Cache);
+            if (!capture.has_value())
+                co_return Cc::RefuseWithoutCounter(NodeIsStopping, "this node is stopping");
+            co_return CompileCacheWire::EncodeReply(CompileCacheWire::Status::Ok, capture->body);
+        }
         default:
             break;
     }

@@ -1213,7 +1213,13 @@ void AdoptAllowlist(Cc::CompileJobRunner& jobs,
     // `membership.Oracle()` bound once, by reference, the way every surface binds it: an
     // implementation re-asking for an oracle per request could never see `--fleet-open`
     // change, and a test that re-acquired it would pass under exactly that defect.
-    Node::NodeStatusResponder nodeStatusResponder { nodeStatus, membership.Oracle(), metrics };
+    //
+    // What live stats and `NodeMetrics` read, built against a SLOT, because what they read -- the
+    // scrape provider, the fleet and the sampler -- is built after consensus, and consensus after
+    // this surface: see `LiveStatsSourceSlot`. Declared before every responder reading it, so it is
+    // destroyed after them.
+    LiveStatsSourceSlot liveSources;
+    Node::NodeStatusResponder nodeStatusResponder { nodeStatus, liveSources, membership.Oracle(), metrics };
 
     // The dashboard credential, read ONCE for the two surfaces that guard the fleet with it:
     // `/fleet` over HTTP, and the fleet subject of a live-stats subscription over `0xFC`.
@@ -1225,11 +1231,8 @@ void AdoptAllowlist(Cc::CompileJobRunner& jobs,
     }
     auto const dashboardCredential = std::move(*dashboardOrRefusal);
 
-    // Live stats as a subscription rather than a poll (#1399). Built against a SLOT, because what
-    // it reads -- the scrape provider, the fleet and the sampler -- is built after consensus, and
-    // consensus after this surface: see `LiveStatsSourceSlot`. Declared before the surface, like
-    // every responder here, so it is destroyed after it.
-    LiveStatsSourceSlot liveSources;
+    // Live stats as a subscription rather than a poll (#1399), reading the slot declared above.
+    // Declared before the surface, like every responder here, so it is destroyed after it.
     Node::LiveStatsResponder liveStatsResponder {
         liveSources, membership.Oracle(), dashboardCredential, nodeIo.Reactor(), metrics
     };

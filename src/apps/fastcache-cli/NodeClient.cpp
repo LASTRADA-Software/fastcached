@@ -180,38 +180,6 @@ std::string ExplainRemoteKind(std::string_view verb, std::string_view endpoint, 
     return {};
 }
 
-std::optional<Value> DecodeNodeCounters(std::span<std::byte const> payload)
-{
-    auto const rows = WireFields::SplitAll(payload);
-    if (!rows.has_value())
-        return std::nullopt;
-
-    std::vector<Field> fields;
-    fields.reserve(rows->size());
-    for (auto const& row: *rows)
-    {
-        auto const pair = WireFields::SplitExactly(row, 2);
-        if (!pair.has_value())
-            return std::nullopt;
-        auto const value = Wire::DecodeU64Field((*pair)[1]);
-        if (!value.has_value())
-            return std::nullopt;
-
-        // The name is text the NODE chose, so it goes through the one UTF-8 gate rather
-        // than being trusted: a counter name that is not text would make `--format=json`
-        // unparseable for the whole record, which is the fleet page's own rule arriving
-        // on a different wire.
-        auto const name = Wire::AsStringView((*pair)[0]);
-        auto cell = TextCell(std::string { name });
-        if (cell.kind != CellKind::Text)
-            return std::nullopt;
-
-        fields.push_back({ .name = std::string { name }, .value = NumberCell(*value) });
-    }
-
-    return RecordValue(std::move(fields));
-}
-
 std::expected<NodeReply, ExchangeError> DecodeNodeReply(std::span<std::byte const> bytes)
 {
     auto const header = Wire::DecodeReplyHeader(bytes);

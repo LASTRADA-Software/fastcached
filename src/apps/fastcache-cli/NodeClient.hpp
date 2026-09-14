@@ -292,20 +292,6 @@ class IEndpointIdentity
 ///         already know.
 [[nodiscard]] std::string ExplainRemoteKind(std::string_view verb, std::string_view endpoint, RemoteKind kind);
 
-/// Read a `NodeMetrics` body back as a record.
-///
-/// Lives here rather than in the verb handler because TWO callers need it: the
-/// `node-metrics` verb and the stats ladder's `0xFC` rung, which is the rung that makes
-/// `stats` work against a node at all. A second copy would be a second place for the
-/// field naming to drift, and the field names are what an operator greps.
-///
-/// **Every row the node sent is reported, zeroes included.** A counter is a tally, so
-/// zero is the truth about events that never happened; dropping the zero rows here
-/// would undo the one distinction the encoder went out of its way to preserve.
-/// @param payload The reply body.
-/// @return The record in the order the node sent it, or nullopt when malformed.
-[[nodiscard]] std::optional<Value> DecodeNodeCounters(std::span<std::byte const> payload);
-
 /// Read one framed reply out of @p bytes.
 ///
 /// **Loops to a TERMINAL status at the transport layer, never here.** This decodes one
