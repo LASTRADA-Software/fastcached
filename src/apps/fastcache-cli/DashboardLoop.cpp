@@ -105,10 +105,13 @@ namespace
                                  ? std::optional<Duration> { stamp.at - model.latestStamp->at }
                                  : std::optional<Duration> {};
         model.runLength = elapsed.has_value() ? model.runLength + 1 : 1;
-        RecordHistory(model,
-                      HistoryEntry { .reading = reading.value, .elapsed = elapsed, .points = std::move(reading.points) });
+        RecordHistory(
+            model,
+            HistoryEntry {
+                .reading = reading.value, .stats = reading.stats, .elapsed = elapsed, .points = std::move(reading.points) });
         model.previous = std::move(model.latest);
         model.latest = std::move(reading.value);
+        model.stats = std::move(reading.stats);
         model.latestStamp = std::move(stamp);
         ++model.samples;
     }
@@ -116,18 +119,20 @@ namespace
     /// The rate of @p field over the interval from @p before to @p entry, per second.
     /// @param before The entry the interval starts at.
     /// @param entry The entry the interval ends at.
-    /// @param field The counter's field name.
+    /// @param field The counter.
+    /// @param tier The tier asked about, or nullopt for the whole cache.
     /// @return The rate, or nullopt where `CounterRateSeries` says none can be claimed.
     [[nodiscard]] std::optional<double> RateInto(HistoryEntry const& before,
                                                  HistoryEntry const& entry,
-                                                 std::string_view field)
+                                                 ReadingField field,
+                                                 std::optional<StorageTier> tier)
     {
         // Non-positive is refused here as well as by the fold, so a hand-built entry cannot
         // divide by zero: the fold never records one, and this function does not rely on that.
         if (!entry.elapsed.has_value() || entry.elapsed->count() <= 0)
             return std::nullopt;
-        auto const from = NumberIn(before.reading, field);
-        auto const to = NumberIn(entry.reading, field);
+        auto const from = NumberIn(before.stats, field, tier);
+        auto const to = NumberIn(entry.stats, field, tier);
         if (!from.has_value() || !to.has_value() || *to < *from)
             return std::nullopt;
         return (*to - *from) / std::chrono::duration<double> { *entry.elapsed }.count();
@@ -175,25 +180,21 @@ namespace
 
 } // namespace
 
-std::optional<double> NumberIn(std::optional<Value> const& reading, std::string_view field)
+std::optional<double> NumberIn(std::optional<StatsReading> const& reading,
+                               ReadingField field,
+                               std::optional<StorageTier> tier) noexcept
 {
-    if (!reading.has_value())
-        return std::nullopt;
-    auto const* found = FindField(*reading, field);
-    if (found == nullptr || (found->value.kind != CellKind::Number && found->value.kind != CellKind::Text))
-        return std::nullopt;
-    auto parsed = 0.0;
-    if (!ParseFiniteDouble(found->value.lexical, parsed))
-        return std::nullopt;
-    return parsed;
+    return reading.has_value() && field.Names() ? field.read(*reading, tier) : std::nullopt;
 }
 
-std::vector<std::optional<double>> CounterRateSeries(std::deque<HistoryEntry> const& history, std::string_view field)
+std::vector<std::optional<double>> CounterRateSeries(std::deque<HistoryEntry> const& history,
+                                                     ReadingField field,
+                                                     std::optional<StorageTier> tier)
 {
     auto series = std::vector<std::optional<double>> {};
     series.reserve(history.size());
     for (auto const index: std::views::iota(std::size_t { 0 }, history.size()))
-        series.push_back(index == 0 ? std::optional<double> {} : RateInto(history[index - 1], history[index], field));
+        series.push_back(index == 0 ? std::optional<double> {} : RateInto(history[index - 1], history[index], field, tier));
     return series;
 }
 
@@ -225,6 +226,8 @@ SampleReading ReadStatsSample(DashboardEvent const& event)
         {
             reading.route = std::string { row->route };
             reading.where = attempt.where;
+            // The live model, read out of the record in that source's own vocabulary, once.
+            reading.stats = StatsReadingFromRecord(reading.value, attempt.origin);
         }
     }
     return reading;

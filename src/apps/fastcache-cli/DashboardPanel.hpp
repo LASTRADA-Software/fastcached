@@ -42,24 +42,6 @@ namespace FastCache::Cli
 /// is the newest entry, so the figure beside a gap is the absent marker rather than the last value
 /// read before the source went away (§9.17 draws a failure as a gap, not as a frozen number).
 
-/// A field's name in each stats source, empty where that source does not carry it.
-///
-/// Per source because the three vocabularies are different: `/metrics` and `NodeMetrics` share the
-/// catalogue's names, while `INFO` spells its seven fields its own way. A figure a source does not
-/// carry renders absent -- a 7-field reading is not a 102-field reading with 95 zeroes.
-struct FieldNames
-{
-    std::string_view metrics {};     ///< `/metrics`.
-    std::string_view nodeMetrics {}; ///< The node's `NodeMetrics` verb.
-    std::string_view info {};        ///< RESP `INFO`.
-};
-
-/// @p names' spelling in @p origin.
-/// @param names The names.
-/// @param origin A source below `Last`.
-/// @return The name, empty where the source does not carry the field.
-[[nodiscard]] std::string_view NameIn(FieldNames const& names, StatsOrigin origin) noexcept;
-
 /// How a figure is made from its fields.
 ///
 /// TRANSMITTED/PERSISTED: no. Private; enumerators may be inserted.
@@ -79,13 +61,13 @@ enum class FigureSource : std::uint8_t
 /// 8-aligned members.
 struct FigureSpec
 {
-    FieldNames field {};        ///< The primary field.
-    FieldNames other {};        ///< The second operand; see `FigureSource`.
+    ReadingField field {};      ///< The primary field.
+    ReadingField other {};      ///< The second operand; see `FigureSource`.
     double scale { 1.0 };       ///< Applied to every value: 60 turns a rate per second into one per minute.
     std::string_view suffix {}; ///< Written after a PRESENT value only, such as `/s`.
     /// Further counters whose rates a `Rate` adds beyond `other`: a total over more than two, such as
     /// every refusal. Read only by a source whose `FigureSourceTable` row takes addends.
-    std::span<FieldNames const> addends {};
+    std::span<ReadingField const> addends {};
     FigureSource source { FigureSource::Level }; ///< How it is made.
     FigureFormat format { FigureFormat::Count }; ///< How it is written.
 };
@@ -333,9 +315,6 @@ struct PanelSpec
 /// @return The text, without the `up` a title bar puts in front of it.
 [[nodiscard]] std::string UptimeText(std::uint64_t seconds);
 
-/// The `/metrics` series a cache states how long it has served in.
-inline constexpr std::string_view CacheUptimeField = "fastcached_uptime_seconds";
-
 /// A terminal size, in cells.
 struct PanelSize
 {
@@ -457,11 +436,6 @@ struct PanelContext
     RenderRung rung { RenderRung::Ascii }; ///< What the frame is drawn with; last with `section`, so they pad nothing.
 };
 
-/// The source a model's newest reading came from.
-/// @param model What is known.
-/// @return The source, or nullopt before any reading or for a source this client does not name.
-[[nodiscard]] std::optional<StatsOrigin> OriginOf(DashboardModel const& model) noexcept;
-
 /// @p figure's value at every entry of @p history, oldest first, already scaled.
 ///
 /// One element per entry, like `CounterRateSeries`, so every row's series lines up with every
@@ -470,13 +444,11 @@ struct PanelContext
 /// positive -- a cache that served no reads has no hit rate, rather than one of 0 %.
 /// @param history The samples.
 /// @param figure The figure.
-/// @param origin The source whose names apply.
-/// @param label A `tier` label value to select one tier's series, or empty for the unlabelled one.
+/// @param tier A `StorageTierTable` name to read one tier's figure, or empty for the whole cache's.
 /// @return The series.
 [[nodiscard]] std::vector<std::optional<double>> FigureSeries(std::deque<HistoryEntry> const& history,
                                                               FigureSpec const& figure,
-                                                              StatsOrigin origin,
-                                                              std::string_view label);
+                                                              std::string_view tier = {});
 
 /// The machine name of @p column's figure in @p tier: `<tier>_<column>`.
 ///
@@ -490,20 +462,13 @@ struct PanelContext
 /// The tiers @p spec draws a tier row for from @p reading, in `StorageTierTable` order.
 ///
 /// **A tier the cache does not run has no row** (§9.5) -- not a row of absent markers, which would
-/// claim the tier exists and reported nothing. Presence is asked of the reading's series for the
-/// FIRST tier column, which the daemon omits entirely for a tier it lacks. One answer for the panel
-/// and the piped record, so the two cannot disagree about which tiers exist.
+/// claim the tier exists and reported nothing. Presence is the reading's own: a tier's statistics are
+/// in `MetricsSnapshot::storageTiers` exactly when the cache runs it. One answer for the panel and the
+/// piped record, so the two cannot disagree about which tiers exist.
 /// @param spec The panel.
 /// @param reading A reading.
-/// @param origin The source it came from, whose names apply.
-/// @return The tiers' names; empty for a panel without a tier block or a source that names none.
-[[nodiscard]] std::vector<std::string_view> TiersIn(PanelSpec const& spec, Value const& reading, StatsOrigin origin);
-
-/// The series name a labelled per-tier sample is exported under.
-/// @param base The unlabelled series name.
-/// @param tier The tier's `StorageTierTable` name.
-/// @return `base{tier="<tier>"}`.
-[[nodiscard]] std::string TierSeriesName(std::string_view base, std::string_view tier);
+/// @return The tiers' names; empty for a panel without a tier block.
+[[nodiscard]] std::vector<std::string_view> TiersIn(PanelSpec const& spec, StatsReading const& reading);
 
 /// The fleet section a keystroke switches a document panel's table to, from @p active.
 ///
