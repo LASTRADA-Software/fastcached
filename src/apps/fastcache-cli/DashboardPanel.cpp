@@ -2496,6 +2496,14 @@ namespace
         auto const pixels = ChartIsPixels(in, context);
         if (!pixels && in.glyphs->chartLevels.size() < 2)
             return std::nullopt;
+        // A chart with no reading in any band draws nothing but blanks, and laid out before the first readings it takes
+        // rows the status facts claim a moment later -- a chart that flashes up and vanishes. It waits for a reading.
+        auto const readAnything = std::ranges::any_of(spec.charts, [&in](ChartRow const& row) {
+            return std::ranges::any_of(SeriesFor(in, row.figure, {}),
+                                       [](std::optional<double> const& value) { return value.has_value(); });
+        });
+        if (!readAnything)
+            return std::nullopt;
         auto source = ChartSource {
             .what = {},
             .whatAfter = "history",
