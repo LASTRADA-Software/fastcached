@@ -2,6 +2,7 @@
 #pragma once
 
 #include "CliAnswer.hpp"
+#include "CliEndpoint.hpp"
 #include "CliValue.hpp"
 #include "RespClient.hpp"
 
@@ -11,6 +12,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -133,6 +135,27 @@ class INodeExchange
     /// parameter rather than at the accessor.
     /// @return The endpoint text.
     [[nodiscard]] virtual std::string_view Address() const = 0;
+};
+
+/// How a verb reaches a node it did not dial first: the leader a `NotLeader` named (#1391).
+///
+/// A seam for `INodeExchange`'s reason -- a verb that opened its own socket could not be tested
+/// without one -- and because following a redirect is where a verb would otherwise reach for
+/// `NodeExchange::Open` directly.
+class INodeDialer
+{
+  public:
+    INodeDialer() = default;
+    INodeDialer(INodeDialer const&) = delete;
+    INodeDialer(INodeDialer&&) = delete;
+    INodeDialer& operator=(INodeDialer const&) = delete;
+    INodeDialer& operator=(INodeDialer&&) = delete;
+    virtual ~INodeDialer() = default;
+
+    /// Dial @p endpoint as this invocation's own node connection was dialled.
+    /// @param endpoint Where to dial.
+    /// @return The open connection, or why there is none.
+    [[nodiscard]] virtual std::expected<std::unique_ptr<INodeExchange>, ExchangeError> Dial(Endpoint const& endpoint) = 0;
 };
 
 /// What an endpoint turned out to be, when a cache verb could not reach it.

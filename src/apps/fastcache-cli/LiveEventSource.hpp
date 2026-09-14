@@ -4,6 +4,7 @@
 #include "CliEndpoint.hpp"
 #include "DashboardEvent.hpp"
 #include "DashboardLoop.hpp"
+#include "FleetReach.hpp"
 #include "LiveSubscriber.hpp"
 
 #include <FastCache/Async/IExecutor.hpp>
@@ -37,13 +38,6 @@ namespace FastCache::Cli
 /// pushes one; nothing here polls. What this source decides is what to do when a stream ends:
 /// follow a `NotLeader` to the leader it names, subscribe again after one interval, or end the
 /// session when nothing has been read and waiting cannot help.
-
-/// How many `NotLeader` redirects one subscription follows before it counts as failed.
-///
-/// Two, as a lease and a registration bound theirs: a leader that moved while the redirect was in
-/// flight is one more hop, and a pair of nodes each naming the other stale leader is not a leader
-/// at all. The failed subscription is a gap, and the next attempt starts again at `--addr`.
-inline constexpr int MaxLeaderRedirects = 2;
 
 /// The `Detached` a source delivers when its stream cannot be read and waiting cannot help.
 ///

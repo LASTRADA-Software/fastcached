@@ -460,19 +460,21 @@ class StopReactorOnExit
     auto gatherer =
         LadderGatherer { command.admin, command.cache, command.timeouts, AdminBearer(command), resp.get(), node.get() };
 
+    // A leader a `NotLeader` names is dialled as `--addr` was: the same timeouts, the same credential.
+    auto nodeDialer = NodeDialer { command.timeouts, command.credential };
+
     auto const context = VerbContext { .operands = command.operands,
                                        .options = command.verbOptions,
                                        .resp = resp.get(),
                                        .memcached = memcached.get(),
                                        .node = node.get(),
                                        .stats = &gatherer,
-                                       // The same object twice, deliberately: it holds the one cached
-                                       // answer to "what is this endpoint", which both the stats ladder
-                                       // and any verb reaching the admin surface are asking about.
-                                       .admin = &gatherer,
-                                       // And a third time: what the endpoint IS is that same cached
-                                       // answer, which `live-stats` decides its subject from.
-                                       .identity = &gatherer };
+                                       // The same object twice, deliberately: what the endpoint IS is the
+                                       // one cached answer the stats ladder also reads, which `live-stats`
+                                       // decides its subject from.
+                                       .identity = &gatherer,
+                                       .dial = &nodeDialer,
+                                       .dashboardToken = command.dashboardToken };
 
     if (verb.session != nullptr)
         return RunSessionAndReport(command, verb, context, openingRemarks);

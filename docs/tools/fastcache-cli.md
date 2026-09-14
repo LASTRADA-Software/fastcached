@@ -37,7 +37,7 @@ complaint about a flag you are no longer going to use.
 | Data port | `--addr=<host:port>`, `$FASTCACHE_ADDR`, default `127.0.0.1:6674` |
 | Admin surface | `--admin-addr=<host:port>`, `$FASTCACHE_ADMIN_ADDR` — **usually unnecessary**, see below |
 | Credential | `--token-file=<path>` (preferred) or `$FASTCACHE_TOKEN` |
-| Dashboard credential | `--dashboard-token-file=<path>`, presented by `live-stats fleet` only; no environment variable |
+| Dashboard credential | `--dashboard-token-file=<path>`, presented by `fleet` and `live-stats fleet` only; no environment variable |
 
 The same `$FASTCACHE_ADDR` that `fastcache-cc` reads, so a machine configured for
 the launcher is already configured for this. A variable that is *set but empty*
@@ -52,8 +52,8 @@ this process's environment.
 
 The dashboard credential is a different secret from the data port's, and it has its
 own flag and no variable. A leader that names one (`--dashboard-token-file` on the
-node) refuses the fleet stream to a watcher that does not present it; a `cache` or
-`node` stream never asks for it.
+node) refuses the fleet -- the `fleet` verb and the `live-stats fleet` stream alike -- to
+a caller that does not present it; a `cache` or `node` stream never asks for it.
 
 **`--admin-addr` is an override, not a requirement.** A `fastcache-compile-node`
 knows which port its admin surface bound and whether it is TLS, and it will say so
@@ -150,20 +150,20 @@ to be reachable from a browser and from nowhere else. `/fleet.json` is the only 
 door and it needs a JSON parser the operator supplies; `jq` is not on a Windows build
 box, and this tool has no JSON *parser* of its own — it only emits one.
 
-`fleet <section>` asks the node's **admin** surface for `/fleet.txt` and renders that
-section as a table, so `--format` works on it exactly as on every other verb:
+`fleet <section>` reads that section from the leader with one `fleet-text` request over
+the same `0xFC` connection every other node verb uses, and renders it as a table, so
+`--format` works on it exactly as on every other verb:
 
 ```console
 $ fastcache-cli fleet workers --addr=10.0.0.7:6674 --format=json
 $ fastcache-cli fleet machines --addr=10.0.0.7:6674 | column -t
 ```
 
-**It needs no second address.** The node reports which port its admin surface bound,
-over the same `0xFC` connection every other node verb uses, so `--admin-addr` is an
-override for deployments that rewrite ports rather than something to supply. A node
-running no admin surface, one serving it over TLS this client cannot speak, and one
-naming the port already being talked `0xFC` to are each refused **by name** — none of
-them is "the fleet is down".
+**It needs no admin surface and no second address**
+([#1391](https://github.com/LASTRADA-Software/fastcached/issues/1391)). The text is the one
+`/fleet.txt` serves -- the leader renders both from one function -- but it arrives over
+`0xFC`, so a leader started without `--admin-listen`, or serving its admin surface over TLS,
+answers it all the same.
 
 `kpi` is one of the sections, and it is the one that is not a row table: the page's
 headline strip, one line per figure, keyed by a name rather than by a page label. What
@@ -178,15 +178,31 @@ with the accepted keys and what each holds, and that refusal is relayed verbatim
 
 ```console
 $ fastcache-cli fleet worker --addr=10.0.0.7:6674
-fastcache-cli: /fleet.txt?section=worker answered HTTP 400: unknown section; this build serves:
+fastcache-cli: 10.0.0.7:6674 refused `fleet`: unknown section; this build serves:
   machines  one row per machine; the grain a fleet total is computed over
   workers   one row per (toolchain, endpoint) registry entry
   ...
 ```
 
 **The leader answers it and nobody else can**, exactly as for the page: a follower's
-registry holds whatever registered against *it*, so it replies `503` naming the leader,
-and that is relayed too rather than reported as an unreachable fleet.
+registry holds whatever registered against *it*, so it refuses `NotLeader` naming the
+leader. That is an instruction, and this verb **follows** it -- at most twice, the bound
+`live-stats fleet` keeps too, so two nodes each naming the other stale leader cannot bounce
+the request forever. The table on stdout is the leader's; the hop is said on stderr, so a
+script is not handed a line to skip:
+
+```console
+$ fastcache-cli fleet workers --addr=10.0.0.8:6674
+fastcache-cli: 10.0.0.8:6674 does not lead the fleet; the table is from the leader at 10.0.0.7:6674
+id	toolchain	...
+```
+
+An election in progress names no leader, and is relayed as that rather than followed; past
+the bound, the refusal names every node asked, in order.
+
+Reading the fleet needs what `live-stats fleet` needs: a fleet member, and the dashboard
+credential when the leader names one (`--dashboard-token-file`) -- or, with none, this
+client on the leader's own machine.
 
 Cells arrive as the leader escaped them. A display name holding a tab is `\t` here and
 not a real tab — text a peer chose cannot be allowed to forge a column boundary.

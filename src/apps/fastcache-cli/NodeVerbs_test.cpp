@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "CliFormat.hpp"
 #include "CliVerbs.hpp"
+#include "FleetReach.hpp"
 #include "ScriptedExchange.hpp"
 #include "StatsGatherer.hpp"
 
@@ -19,7 +20,9 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <expected>
 #include <format>
+#include <memory>
 #include <optional>
 #include <ranges>
 #include <span>
@@ -1235,75 +1238,134 @@ TEST_CASE("the cluster verbs send the opcodes the wire table names", "[cli][node
 }
 
 // ---------------------------------------------------------------------------
-// #1300: `fleet` relays one of the leader's tables into a terminal.
+// #1300, #1391: `fleet` relays one of the leader's tables into a terminal, read over 0xFC.
 // ---------------------------------------------------------------------------
 
 namespace
 {
 
-/// An admin surface that answers one scripted document.
+/// A node connection a dialler hands out while the case keeps the scripted one it forwards to.
 ///
-/// A fake rather than a real one because the verb's subject is the DOCUMENT: where the
-/// surface is, whether it is TLS and whether the port collides are `ResolveAdmin`'s
-/// questions and are tested where they are decided.
-class ScriptedAdmin final: public IAdminDocument
+/// `INodeDialer::Dial` gives its connection away, and a case still has to read what was sent
+/// on it afterwards.
+class BorrowedNode final: public INodeExchange
 {
   public:
-    /// @param answer What `FetchAdmin` returns, whatever it is asked for.
-    explicit ScriptedAdmin(std::expected<std::string, AdminError> answer):
-        _answer { std::move(answer) }
+    /// @param node The scripted connection; it must outlive this.
+    explicit BorrowedNode(ScriptedNodeExchange& node) noexcept:
+        _node { &node }
     {
     }
 
-    [[nodiscard]] std::expected<std::string, AdminError> FetchAdmin(std::string_view path) override
+    [[nodiscard]] std::expected<NodeReply, ExchangeError> Send(std::span<std::byte const> request) override
     {
-        _asked.emplace_back(path);
-        return _answer;
+        return _node->Send(request);
     }
 
-    /// Every path this was asked for, in order.
-    [[nodiscard]] std::vector<std::string> const& Asked() const noexcept
+    [[nodiscard]] std::string_view Address() const override
     {
-        return _asked;
+        return _node->Address();
     }
 
   private:
-    std::expected<std::string, AdminError> _answer;
-    std::vector<std::string> _asked;
+    ScriptedNodeExchange* _node;
 };
 
-/// Run `fleet` against a scripted admin surface.
-/// @param admin What the surface answers.
+/// A dialler answering from scripted nodes keyed by address, recording every dial.
+class ScriptedDialer final: public INodeDialer
+{
+  public:
+    /// @param nodes The nodes it can reach; each must outlive this. A dial to any other address fails.
+    explicit ScriptedDialer(std::vector<ScriptedNodeExchange*> nodes):
+        _nodes { std::move(nodes) }
+    {
+    }
+
+    [[nodiscard]] std::expected<std::unique_ptr<INodeExchange>, ExchangeError> Dial(Endpoint const& endpoint) override
+    {
+        auto const address = EndpointText(endpoint);
+        _dialled.push_back(address);
+        for (auto* const node: _nodes)
+            if (node->Address() == address)
+                return std::make_unique<BorrowedNode>(*node);
+        return std::unexpected(
+            ExchangeError { .kind = ExchangeFailure::Unreachable, .detail = std::format("cannot reach {}", address) });
+    }
+
+    /// Every address dialled, in order.
+    [[nodiscard]] std::vector<std::string> const& Dialled() const noexcept
+    {
+        return _dialled;
+    }
+
+  private:
+    std::vector<ScriptedNodeExchange*> _nodes;
+    std::vector<std::string> _dialled;
+};
+
+/// A leader's `Ok` carrying @p document.
+[[nodiscard]] ScriptedNodeExchange::Outcome FleetDocumentReply(std::string_view document)
+{
+    return Cc::EncodeReply(Cc::Status::Ok, Cc::AsBytes(document));
+}
+
+/// A refusal of @p code saying @p message.
+[[nodiscard]] ScriptedNodeExchange::Outcome Refusal(Cc::ErrorCode code, std::string_view message)
+{
+    return Cc::EncodeErrorReply(code, message);
+}
+
+/// Run `fleet` against @p node, following redirects through @p dial.
+/// @param node The first node asked.
+/// @param dial How a leader is reached, or null.
 /// @param operands The positional arguments.
+/// @param token The dashboard credential, or empty.
 /// @return The answer.
-[[nodiscard]] Answer RunFleet(IAdminDocument* admin, std::vector<std::string> const& operands)
+[[nodiscard]] Answer RunFleet(INodeExchange& node,
+                              INodeDialer* dial,
+                              std::vector<std::string> const& operands,
+                              std::string_view token = {})
 {
     auto const* const verb = FindVerb("fleet");
     REQUIRE(verb != nullptr);
-    // A node connection the verb never sends on: the wire column requires one to be
-    // OPEN, because that is what discovers the admin port in production, and the
-    // discovery itself lives behind the seam this fake replaces.
-    ScriptedNodeExchange node { {} };
-    return RunVerb(*verb, VerbContext { .operands = operands, .node = &node, .admin = admin });
+    return RunVerb(*verb, VerbContext { .operands = operands, .node = &node, .dial = dial, .dashboardToken = token });
+}
+
+/// The FLEET-TEXT request frame @p frame carries.
+[[nodiscard]] Cc::FleetTextRequest FleetRequestOf(std::vector<std::byte> const& frame)
+{
+    REQUIRE(frame.size() >= Cc::RequestHeaderSize);
+    REQUIRE(frame[2] == static_cast<std::byte>(Cc::Op::FleetText));
+    auto const request = Cc::DecodeFleetTextRequest(std::span { frame }.subspan(Cc::RequestHeaderSize));
+    REQUIRE(request.has_value());
+    return Unwrap(request);
+}
+
+/// Whether any of @p answer's remarks contains @p needle.
+[[nodiscard]] bool Remarks(Answer const& answer, std::string_view needle)
+{
+    return std::ranges::any_of(answer.advisories, [needle](std::string const& line) { return line.contains(needle); });
 }
 
 } // namespace
 
-TEST_CASE("fleet renders the section the leader sent, with the leader's own columns", "[cli][node][fleet]")
+TEST_CASE("fleet asks the node for the section named and renders the leader's own columns", "[cli][node][fleet]")
 {
-    // The columns come off the document and are never named here: they are
-    // `FleetColumn`'s, decided on the leader, and a list in this binary would be a
-    // second place for them to be spelled.
-    ScriptedAdmin admin { std::string { "id\ttoolchain\tslots\nw1\tgcc-13-abcdef\t8\n" } };
+    // The columns come off the document and are never named here: they are `FleetColumn`'s,
+    // decided on the leader, and a list in this binary would be a second place to spell them.
+    ScriptedNodeExchange node { { FleetDocumentReply("id\ttoolchain\tslots\nw1\tgcc-13-abcdef\t8\n") } };
 
-    auto const answer = RunFleet(&admin, { "workers" });
+    auto const answer = RunFleet(node, nullptr, { "workers" }, "s3cret");
 
     CHECK(answer.outcome == Outcome::Affirmative);
-    // The section reaches the surface as a query parameter rather than being filtered
-    // here -- filtering client-side would need this binary to know which columns belong
-    // to which section, which is the mapping it is deliberately without.
-    REQUIRE(admin.Asked().size() == 1);
-    CHECK(admin.Asked()[0] == "/fleet.txt?section=workers");
+    CHECK(answer.advisories.empty());
+    // The section travels as the word typed rather than being checked here: which sections exist is
+    // the leader's table, and this binary deliberately holds no copy to disagree with it.
+    REQUIRE(node.Sent().size() == 1);
+    auto const request = FleetRequestOf(node.Sent()[0]);
+    CHECK(request.section == "workers");
+    CHECK(request.range.empty());
+    CHECK(request.dashboardToken == "s3cret");
 
     auto const rendered = RenderValue(answer.value, RenderOptions { .format = OutputFormat::Json });
     CHECK(rendered.contains("toolchain"));
@@ -1312,133 +1374,193 @@ TEST_CASE("fleet renders the section the leader sent, with the leader's own colu
 
 TEST_CASE("fleet turns the leader's dash into a real absent cell", "[cli][node][fleet]")
 {
-    // Not text that happens to look absent: `--absent` and JSON `null` have to behave
-    // here as they do for every other verb, and a `-` left as text would render as the
-    // string "-" in JSON where every other absence is `null`.
-    ScriptedAdmin admin { std::string { "id\tlast-picked-age\nw1\t-\n" } };
+    // Not text that happens to look absent: `--absent` and JSON `null` have to behave here as
+    // they do for every other verb.
+    ScriptedNodeExchange node { { FleetDocumentReply("id\tlast-picked-age\nw1\t-\n") } };
 
-    auto const answer = RunFleet(&admin, { "workers" });
+    auto const answer = RunFleet(node, nullptr, { "workers" });
 
     REQUIRE(answer.outcome == Outcome::Affirmative);
     auto const rendered = RenderValue(answer.value, RenderOptions { .format = OutputFormat::Json });
     CHECK(rendered.contains("null"));
-    // And the dash is GONE rather than both present -- otherwise this passes against a
-    // renderer that emitted the text and a null side by side.
+    // And the dash is GONE rather than both present.
     CHECK_FALSE(rendered.contains("\"-\""));
 }
 
 TEST_CASE("fleet keeps the escaping the leader applied", "[cli][node][fleet]")
 {
-    // A tab a peer put in its own display name arrives spelled, and stays spelled. This
-    // tool is a RELAY rather than a second author of the leader's rule: unescaping here
-    // would re-derive one convention in two binaries, free to drift, and would put a
-    // real tab back into a cell that `--format=csv` carries raw and the human format
-    // prints into its own aligned columns.
-    ScriptedAdmin admin { std::string { "endpoint\tname\n10.0.0.2:7100\tbuild\\tnode\n" } };
+    // A tab a peer put in its own display name arrives spelled, and stays spelled: this tool is a
+    // RELAY rather than a second author of the leader's rule.
+    ScriptedNodeExchange node { { FleetDocumentReply("endpoint\tname\n10.0.0.2:7100\tbuild\\tnode\n") } };
 
-    auto const answer = RunFleet(&admin, { "machines" });
+    auto const answer = RunFleet(node, nullptr, { "machines" });
 
     REQUIRE(answer.outcome == Outcome::Affirmative);
     auto const rendered = RenderValue(answer.value, RenderOptions { .format = OutputFormat::Tsv });
 
-    // **What distinguishes moved when #1327 landed, and this is the assertion that
-    // followed it.** The cell holds a backslash and a `t` -- that is what the leader
-    // sent -- so this client's own TSV writer, now that it escapes rather than passing
-    // text through, DOUBLES that backslash. A build that unescaped the leader's text
-    // would hold a real tab, which the same writer would spell as a single `\t`.
-    //
-    // So the two hypotheses differ in the output by one backslash, and neither shifts a
-    // column any more. The tab count below was the load-bearing half before #1327 and
-    // is now the weaker one: it still refuses an invented column, but an unescaping
-    // client would pass it, because the writer would spell the tab it had introduced.
+    // The cell holds a backslash and a `t`, which this client's TSV writer doubles; a build that
+    // unescaped the leader's text would hold a real tab, which the writer spells as a single `\t`.
     CHECK(rendered.contains("build\\\\tnode"));
     CHECK_FALSE(rendered.contains("build\\tnode"));
     CHECK(std::ranges::count(rendered, '\t') == std::ranges::count(std::string_view { "endpoint\tname" }, '\t') * 2);
 }
 
-TEST_CASE("fleet relays a refusal as a refusal, not as an unreachable fleet", "[cli][node][fleet]")
+TEST_CASE("fleet follows a follower to the leader it names and says so on stderr alone", "[cli][node][fleet]")
 {
-    // The discrimination this verb exists to keep: a leader that ANSWERED and declined
-    // is a different exit code from nothing answering, and the server's words carry the
-    // accepted keys. Reported as unreachable, an operator goes to check a listener that
-    // is running perfectly and never reads the sentence naming their typo.
-    ScriptedAdmin admin { std::unexpected(
-        AdminError { .kind = AdminFailure::Refused,
-                     .detail = "/fleet.txt?section=worker answered HTTP 400: unknown section; this build serves:" }) };
+    // #1391. A follower's registry is a fraction presented as the whole, so it answers NotLeader
+    // naming the leader -- an instruction, which this verb follows rather than relays. The same
+    // request goes to the leader, and the table on stdout is the leader's with nothing added.
+    ScriptedNodeExchange follower { { Refusal(Cc::ErrorCode::NotLeader, "10.0.0.2:6674") }, "10.0.0.7:6674" };
+    ScriptedNodeExchange leader { { FleetDocumentReply("id\tslots\nw1\t8\n") }, "10.0.0.2:6674" };
+    ScriptedDialer dial { { &leader } };
 
-    auto const answer = RunFleet(&admin, { "worker" });
+    auto const answer = RunFleet(follower, &dial, { "workers" }, "s3cret");
 
-    CHECK(answer.outcome == Outcome::Refused);
-    CHECK(std::ranges::any_of(answer.advisories, [](std::string const& line) { return line.contains("unknown section"); }));
+    CHECK(answer.outcome == Outcome::Affirmative);
+    CHECK(dial.Dialled() == std::vector<std::string> { "10.0.0.2:6674" });
+    REQUIRE(leader.Sent().size() == 1);
+    REQUIRE(follower.Sent().size() == 1);
+    CHECK(leader.Sent()[0] == follower.Sent()[0]);
+    CHECK(RenderValue(answer.value, RenderOptions { .format = OutputFormat::Json }).contains("w1"));
+
+    // One remark naming both, so an operator who pointed at a follower learns where the leader is.
+    REQUIRE(answer.advisories.size() == 1);
+    CHECK(answer.advisories[0].contains("10.0.0.7:6674 does not lead the fleet"));
+    CHECK(answer.advisories[0].contains("10.0.0.2:6674"));
 }
 
-TEST_CASE("fleet reports a surface it could not reach as unreachable", "[cli][node][fleet]")
+TEST_CASE("fleet stops following at the bound and names every node it asked", "[cli][node][fleet]")
 {
-    // The other half of the same discrimination, asserted separately: without this the
-    // case above passes against a verb that answers `Refused` for everything.
-    ScriptedAdmin admin { std::unexpected(
-        AdminError { .kind = AdminFailure::Unreachable, .detail = "10.0.0.7:6674 runs no admin surface" }) };
+    // Three nodes each naming the next as leader, the last naming the first: no leader at all.
+    // Bounded by `MaxLeaderRedirects`, which the fleet subscription follows too.
+    REQUIRE(MaxLeaderRedirects == 2);
+    ScriptedNodeExchange first { { Refusal(Cc::ErrorCode::NotLeader, "10.0.0.2:6674") }, "10.0.0.1:6674" };
+    ScriptedNodeExchange second { { Refusal(Cc::ErrorCode::NotLeader, "10.0.0.3:6674") }, "10.0.0.2:6674" };
+    ScriptedNodeExchange third { { Refusal(Cc::ErrorCode::NotLeader, "10.0.0.1:6674") }, "10.0.0.3:6674" };
+    ScriptedDialer dial { { &first, &second, &third } };
 
-    auto const answer = RunFleet(&admin, { "workers" });
+    auto const answer = RunFleet(first, &dial, { "workers" });
 
     CHECK(answer.outcome == Outcome::Unreachable);
-    CHECK(std::ranges::any_of(answer.advisories, [](std::string const& line) { return line.contains("no admin surface"); }));
+    CHECK(dial.Dialled() == std::vector<std::string> { "10.0.0.2:6674", "10.0.0.3:6674" });
+    CHECK(Remarks(answer, "followed 2 leader redirects"));
+    CHECK(Remarks(answer, "10.0.0.1:6674 -> 10.0.0.2:6674 -> 10.0.0.3:6674"));
 }
 
-TEST_CASE("fleet with no admin surface available says so rather than dialling nothing", "[cli][node][fleet]")
+TEST_CASE("fleet relays a NotLeader that names nobody rather than dialling it", "[cli][node][fleet]")
 {
-    // Nothing was CONFIGURED to ask, which is not the same as asking and failing -- the
-    // three-state rule the stats ladder already keeps, at a verb that could otherwise
-    // dereference a null.
-    auto const answer = RunFleet(nullptr, { "workers" });
+    // An election: the refusal carries no address, which is a different fact from somebody else
+    // leading, and there is nothing to follow.
+    ScriptedNodeExchange node { { Refusal(Cc::ErrorCode::NotLeader, {}) } };
+    ScriptedDialer dial { {} };
 
-    CHECK(answer.outcome == Outcome::Usage);
-    // **And it names no flag, deliberately.** #1329 gave `ResolveAdmin`'s absent-surface
-    // arm a `--admin-listen` remedy, and the wrong version of that change is the one
-    // that suggests itself here: the two sentences read almost identically. They are not
-    // the same state. `main.cpp` sets `.admin` unconditionally in the only `VerbContext`
-    // production builds, so this arm is unreachable in the shipped binary -- naming a
-    // flag would assert a CONFIGURATION cause for something only a programming error can
-    // produce. Pinned as an absence, because that is the direction nothing else checks.
-    CHECK(std::ranges::none_of(answer.advisories, [](std::string const& line) { return line.contains("--admin-listen"); }));
+    auto const answer = RunFleet(node, &dial, { "workers" });
+
+    CHECK(answer.outcome == Outcome::Refused);
+    CHECK(dial.Dialled().empty());
+    CHECK(Remarks(answer, "no leader is known"));
+
+    SECTION("and a leader line that does not parse as an address is relayed in one line, never dialled")
+    {
+        // Splitting is not parsing: `SplitHostPort` would read `no leader: try again` as a host and a
+        // port of ` try again`. The one predicate `DecideLeaderHop` asks refuses it.
+        ScriptedNodeExchange unparseable { { Refusal(Cc::ErrorCode::NotLeader, "no leader: try again") } };
+        ScriptedDialer none { {} };
+        auto const relayed = RunFleet(unparseable, &none, { "workers" });
+        CHECK(relayed.outcome == Outcome::Refused);
+        CHECK(none.Dialled().empty());
+        REQUIRE(relayed.advisories.size() == 1);
+        CHECK(relayed.advisories[0].contains("no leader is known"));
+        CHECK_FALSE(relayed.advisories[0].contains('\n'));
+    }
+
+    SECTION("and with no dialler a named leader is relayed rather than followed")
+    {
+        ScriptedNodeExchange follower { { Refusal(Cc::ErrorCode::NotLeader, "10.0.0.2:6674") } };
+        auto const relayed = RunFleet(follower, nullptr, { "workers" });
+        CHECK(relayed.outcome == Outcome::Refused);
+        CHECK(Remarks(relayed, "ask 10.0.0.2:6674 instead"));
+    }
+}
+
+TEST_CASE("fleet relays the leader's list of sections for a key it does not serve", "[cli][node][fleet]")
+{
+    // The leader's words, one key per line, as they arrived -- not folded into a parenthesised
+    // suffix -- and a refusal, which is a different exit code from nothing answering.
+    ScriptedNodeExchange node { { Refusal(Cc::ErrorCode::UnknownFleetSelector,
+                                          "unknown section; this build serves:\n  kpi       the headline figures\n") } };
+
+    auto const answer = RunFleet(node, nullptr, { "worker" });
+
+    CHECK(answer.outcome == Outcome::Refused);
+    REQUIRE(answer.advisories.size() == 1);
+    CHECK(answer.advisories[0].contains("unknown section; this build serves:\n  kpi"));
+    CHECK_FALSE(answer.advisories[0].ends_with('\n'));
+    CHECK_FALSE(answer.advisories[0].contains("unknown-fleet-selector ("));
+}
+
+TEST_CASE("fleet names the dashboard credential flag when the leader refuses the caller", "[cli][node][fleet]")
+{
+    auto const refusal =
+        Refusal(Cc::ErrorCode::Unauthenticated, "the fleet is served to a caller presenting the dashboard credential");
+
+    ScriptedNodeExchange bare { { refusal } };
+    auto const withoutToken = RunFleet(bare, nullptr, { "workers" });
+    CHECK(withoutToken.outcome == Outcome::Refused);
+    CHECK(Remarks(withoutToken, "present the dashboard credential with --dashboard-token-file"));
+
+    // WHAT DISTINGUISHES: a presented credential that was refused is not told to present one.
+    ScriptedNodeExchange guarded { { refusal } };
+    auto const withToken = RunFleet(guarded, nullptr, { "workers" }, "guess");
+    CHECK(Remarks(withToken, "was not accepted"));
+    CHECK_FALSE(Remarks(withToken, "present the dashboard credential with"));
+}
+
+TEST_CASE("fleet reports a node or a leader it could not reach as unreachable", "[cli][node][fleet]")
+{
+    ScriptedNodeExchange silent { { NodeFailure(ExchangeFailure::Unreachable, "cannot reach 10.0.0.7:6674") } };
+    auto const unreached = RunFleet(silent, nullptr, { "workers" });
+    CHECK(unreached.outcome == Outcome::Unreachable);
+    CHECK(Remarks(unreached, "cannot reach 10.0.0.7:6674"));
+
+    // A leader that does not answer is the leader's address in the remark, not the follower's.
+    ScriptedNodeExchange follower { { Refusal(Cc::ErrorCode::NotLeader, "10.0.0.9:6674") } };
+    ScriptedDialer dial { {} };
+    auto const leaderGone = RunFleet(follower, &dial, { "workers" });
+    CHECK(leaderGone.outcome == Outcome::Unreachable);
+    CHECK(Remarks(leaderGone, "cannot reach 10.0.0.9:6674"));
 }
 
 TEST_CASE("fleet refuses a table whose row does not match its header", "[cli][node][fleet]")
 {
-    // Reachable, and the reason is the transport: `HttpGet` sends `Connection: close`
-    // and reads to EOF, so a transfer cut short arrives as a complete-looking body
-    // whose last line is half a row. Every renderer then walks `row[index]` across the
-    // HEADER's columns -- an out-of-range read on a vector, not a narrow table.
-    ScriptedAdmin admin { std::string { "id\ttoolchain\tslots\nw1\tgcc-13\n" } };
+    // Every renderer walks `row[index]` across the HEADER's columns, so a short row is refused
+    // rather than read past its end.
+    ScriptedNodeExchange node { { FleetDocumentReply("id\ttoolchain\tslots\nw1\tgcc-13\n") } };
 
-    auto const answer = RunFleet(&admin, { "workers" });
+    auto const answer = RunFleet(node, nullptr, { "workers" });
 
-    // `Protocol` and not `Refused`: nothing declined anything. Bytes arrived that this
-    // client cannot read as a table, which is a different thing to tell an operator.
+    // `Protocol` and not `Refused`: nothing declined anything.
     CHECK(answer.outcome == Outcome::Protocol);
-    CHECK(std::ranges::any_of(answer.advisories, [](std::string const& line) { return line.contains("header names 3"); }));
+    CHECK(Remarks(answer, "header names 3"));
 }
 
 TEST_CASE("fleet refuses a document with no header line", "[cli][node][fleet]")
 {
-    // An empty SECTION still renders its header -- that is why the renderer emits one
-    // for a table with no rows at all. A document without one is not an empty fleet,
-    // it is a body this client cannot read, and rendering it as a table with no
-    // columns would show an operator an empty result for a question that failed.
-    ScriptedAdmin admin { std::string {} };
+    // An empty SECTION still renders its header, so a document without one is not an empty fleet.
+    ScriptedNodeExchange node { { FleetDocumentReply({}) } };
 
-    auto const answer = RunFleet(&admin, { "workers" });
+    auto const answer = RunFleet(node, nullptr, { "workers" });
 
     CHECK(answer.outcome == Outcome::Protocol);
-    CHECK(std::ranges::any_of(answer.advisories, [](std::string const& line) { return line.contains("no header line"); }));
+    CHECK(Remarks(answer, "no header line"));
 }
 
 // ---------------------------------------------------------------------------
 // #1329: `ResolveAdmin`'s "runs no admin surface" arm says what to SET.
 //
-// The first tests `LadderGatherer` has ever had. `ScriptedAdmin` above says these
-// questions "are tested where they are decided", which was true of none of them: the
-// class was constructed only in `main.cpp`.
+// The first tests `LadderGatherer` has ever had: the class was constructed only in `main.cpp`.
+// Asked through `Gather`'s `/metrics` rung, the one caller `ResolveAdmin` has since `fleet`
+// moved onto 0xFC (#1391).
 // ---------------------------------------------------------------------------
 
 namespace
@@ -1460,6 +1582,19 @@ namespace
                             nullptr,         &node };
 }
 
+/// What the `/metrics` rung says it did not ask, for a gatherer.
+/// @param gatherer The gatherer to run.
+/// @return The rung's note; the rung must not have asked.
+[[nodiscard]] std::string MetricsNoteOf(LadderGatherer& gatherer)
+{
+    auto const attempts = gatherer.Gather();
+    auto const* const metrics =
+        FindIfOrNull(attempts, [](StatsAttempt const& attempt) { return attempt.origin == StatsOrigin::Metrics; });
+    REQUIRE(metrics != nullptr);
+    REQUIRE_FALSE(metrics->asked);
+    return metrics->note;
+}
+
 /// What `ResolveAdmin` refuses with, for a node reporting @p surfaces.
 /// @param surfaces Every surface the node says it opened.
 /// @param cachePort The port this invocation is already talking `0xFC` to.
@@ -1471,9 +1606,7 @@ namespace
         "10.0.0.4:6674"
     };
     auto gatherer = GathererFor(node, cachePort);
-    auto const document = gatherer.FetchAdmin("/fleet.txt?section=workers");
-    REQUIRE_FALSE(document.has_value());
-    return document.error().detail;
+    return MetricsNoteOf(gatherer);
 }
 
 } // namespace
@@ -1506,24 +1639,20 @@ TEST_CASE("the other three admin arms name no flag, because none of them is a no
     // positive direction cannot see it.
     ScriptedNodeExchange silent { { NodeFailure(ExchangeFailure::Transport, "connection refused") }, "10.0.0.4:6674" };
     auto silentGatherer = GathererFor(silent);
-    auto const undiscovered = silentGatherer.FetchAdmin("/fleet.txt?section=workers");
-    REQUIRE_FALSE(undiscovered.has_value());
+    auto const undiscovered = MetricsNoteOf(silentGatherer);
 
     auto const tls = AdminRefusalFor({ Cc::SurfaceReport { .surface = Cc::WireSurface::Admin, .port = 9000, .tls = true } });
     auto const collides = AdminRefusalFor({ Cc::SurfaceReport { .surface = Cc::WireSurface::Admin, .port = 6674 } });
 
-    CHECK_FALSE(undiscovered.error().detail.contains("--admin-listen"));
+    CHECK_FALSE(undiscovered.contains("--admin-listen"));
     CHECK_FALSE(tls.contains("--admin-listen"));
     CHECK_FALSE(collides.contains("--admin-listen"));
 }
 
 TEST_CASE("the stats ladder relays the same remedy when it skips /metrics", "[cli][node][stats][admin]")
 {
-    // **One sentence, two callers**, and the ticket's acceptance says to CHECK this
-    // rather than assume it. `fleet` renders `ResolveAdmin`'s words as the whole
-    // answer; the ladder folds the same string into "<source> was not asked: <note>".
-    // A remedy that only reads correctly in one of the two renderings is half a fix,
-    // and nothing short of a case that drives both can tell.
+    // The note the cases above read, as the ladder renders it: folded into "<source> was not
+    // asked: <note>". A remedy that only reads correctly as the bare note is half a fix.
     ScriptedNodeExchange node {
         { StatusReply({ .version = "0.2.0",
                         .nodeId = {},
@@ -1690,17 +1819,22 @@ TEST_CASE("an endpoint is identified once however many callers ask", "[cli][node
 {
     // A verb asking what the endpoint is, and a rung then reading the same fact, must pay
     // ONE node-status round trip between them -- a second is a second request a daemon
-    // refuses. `FetchAdmin` stands in for the rung: this node reports no admin surface,
-    // so it reads the identification and dials nothing.
-    ScriptedNodeExchange node { { StatusReply({ .version = "0.2.0", .nodeId = {}, .uptimeSeconds = 5, .surfaces = {} }) },
+    // refuses. The `/metrics` rung reads the identification: this node reports no admin
+    // surface, so it dials nothing.
+    ScriptedNodeExchange node { { StatusReply({ .version = "0.2.0", .nodeId = {}, .uptimeSeconds = 5, .surfaces = {} }),
+                                  NodeFailure(ExchangeFailure::Transport, "the node-metrics verb went unanswered") },
                                 "10.0.0.4:6674" };
     auto gatherer = GathererFor(node);
 
     CHECK(gatherer.IdentifyEndpoint().kind == RemoteKind::CompileNode);
     CHECK(gatherer.IdentifyEndpoint().kind == RemoteKind::CompileNode);
-    CHECK_FALSE(gatherer.FetchAdmin("/fleet.txt?section=workers").has_value());
+    (void) MetricsNoteOf(gatherer);
 
-    CHECK(node.Sent().size() == 1);
+    // Counted by VERB, since the node-metrics rung sends its own request on the same connection.
+    auto const statusRequests = std::ranges::count_if(node.Sent(), [](std::vector<std::byte> const& frame) {
+        return frame.size() > 2 && frame[2] == static_cast<std::byte>(Cc::Op::NodeStatus);
+    });
+    CHECK(statusRequests == 1);
     CHECK(node.Unused() == 0);
 }
 
@@ -1718,7 +1852,7 @@ TEST_CASE("a compile node answers stats through the ladder's node-metrics rung",
 
     auto const* const stats = FindVerb("stats");
     REQUIRE(stats != nullptr);
-    auto const answer = RunVerb(*stats, VerbContext { .node = &node, .stats = &gatherer, .admin = &gatherer });
+    auto const answer = RunVerb(*stats, VerbContext { .node = &node, .stats = &gatherer });
 
     CHECK(answer.outcome == Outcome::Affirmative);
     CHECK(RequiredCell(answer, "source").lexical == "node-metrics");

@@ -88,7 +88,7 @@ struct Command
     /// subscription, so one secret standing in for the other would hand the password to whoever
     /// may watch the fleet (#1399).
     std::string dashboardTokenFile {};
-    std::string dashboardToken {}; ///< What `dashboardTokenFile` held; presented on a fleet subscription.
+    std::string dashboardToken {}; ///< What `dashboardTokenFile` held; presented by `fleet` and a fleet subscription.
     std::string diagnostic {};     ///< Why parsing failed; set iff `action == UsageError`.
 };
 
