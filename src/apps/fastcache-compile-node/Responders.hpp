@@ -509,6 +509,15 @@ class SchedulerResponder final: public IFrameResponder
         return std::nullopt;
     }
 
+    /// @copydoc IFrameResponder::StreamFor
+    ///
+    /// **Not a stream**: every scheduler verb is one decision and one reply; the fleet a watcher follows is
+    /// the live-stats component's subscription, which reads this scheduler rather than being it.
+    [[nodiscard]] IFrameStream* StreamFor(std::uint8_t /*opRaw*/) noexcept override
+    {
+        return nullptr;
+    }
+
   private:
     /// Who is asking, as both the gate and the early refusal need it.
     ///
@@ -794,6 +803,15 @@ class CacheResponder final: public IFrameResponder
         return std::nullopt;
     }
 
+    /// @copydoc IFrameResponder::StreamFor
+    ///
+    /// **Not a stream**: a cache exchange is one round trip, and live stats for this machine are the live-stats
+    /// component's subscription, not a tier's.
+    [[nodiscard]] IFrameStream* StreamFor(std::uint8_t /*opRaw*/) noexcept override
+    {
+        return nullptr;
+    }
+
   private:
     CacheProxy& _proxy;
     ILocalityOracle const& _locality;
@@ -868,6 +886,14 @@ struct SurfaceComponents
     /// admit anybody should not be openable, which is why this is a component a node
     /// may not run rather than a surface that is always present and always refuses.
     IFrameResponder* enrollment { nullptr };
+
+    /// Answers `Subscribe`: live stats as a stream rather than a poll (#1399).
+    ///
+    /// Like `node`, **never null on a built node**, and for its reason: watching a node must not
+    /// depend on which components it runs. What a node without a scheduler cannot serve is the
+    /// FLEET subject, and that is the component's refusal to make per subject, not a missing
+    /// family.
+    IFrameResponder* live { nullptr };
 };
 
 class MergedResponder final: public IFrameResponder
@@ -879,7 +905,8 @@ class MergedResponder final: public IFrameResponder
         _scheduler { components.scheduler },
         _compile { components.compile },
         _node { components.node },
-        _enrollment { components.enrollment }
+        _enrollment { components.enrollment },
+        _live { components.live }
     {
     }
 
@@ -917,6 +944,10 @@ class MergedResponder final: public IFrameResponder
                 // emptiest node in the fleet, so this owner is never null in a built
                 // node the way the other three legitimately are.
                 return _node;
+            case CompileCacheWire::VerbFamily::Live:
+                // Never null on a built node, for the `Node` family's reason just above: a watcher
+                // asks what a node is doing whatever it runs.
+                return _live;
             case CompileCacheWire::VerbFamily::Enrollment:
                 // Legitimately null, and on most deployments it is: a node that runs no
                 // consensus has no cluster to let anybody into, so the family is refused
@@ -1128,6 +1159,17 @@ class MergedResponder final: public IFrameResponder
         return owner != nullptr ? owner->ProgressInterval(opRaw) : std::nullopt;
     }
 
+    /// @copydoc IFrameResponder::StreamFor
+    ///
+    /// **Routed to the owner**, for the reason every line above it is: whether a verb is a
+    /// subscription is a property of the VERB and of the surface that serves it. A verb nobody owns
+    /// is not a stream; it is unreachable, `RefusePeer` having already refused it.
+    [[nodiscard]] IFrameStream* StreamFor(std::uint8_t opRaw) noexcept override
+    {
+        auto* const owner = OwnerOf(opRaw);
+        return owner != nullptr ? owner->StreamFor(opRaw) : nullptr;
+    }
+
   private:
     /// What a verb this node serves nowhere is answered with.
     ///
@@ -1201,8 +1243,8 @@ class MergedResponder final: public IFrameResponder
     /// only in which member function they read, and copy-pasted branches that differ
     /// by a name are what this codebase treats as a defect.
     ///
-    /// **It folds `_cache`, `_scheduler` and `_compile`. `_node` and `_enrollment` are
-    /// NOT folded**, and that is stated here rather than left to be read off the loop,
+    /// **It folds `_cache`, `_scheduler` and `_compile`. `_node`, `_enrollment` and `_live`
+    /// are NOT folded**, and that is stated here rather than left to be read off the loop,
     /// because both of those responders carry comments reasoning about the number they
     /// contribute -- reasoning that is sound about the value and silent about the fact
     /// that nothing reads it. Whoever changes this set should read those comments in the
@@ -1237,6 +1279,7 @@ class MergedResponder final: public IFrameResponder
     IFrameResponder* _compile;
     IFrameResponder* _node;
     IFrameResponder* _enrollment;
+    IFrameResponder* _live;
 };
 
 } // namespace FastCache::Node

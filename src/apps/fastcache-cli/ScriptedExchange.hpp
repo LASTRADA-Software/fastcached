@@ -304,6 +304,38 @@ class ScriptedNodeExchange final: public INodeExchange
     return std::unexpected(ExchangeError { .kind = failure, .detail = std::move(detail) });
 }
 
+/// An endpoint identity that answers one fixed identification, and counts the asks.
+///
+/// The count is half the point: a refusal that needs no endpoint -- a subject word that
+/// names nothing, a named subject's floor -- must be decided without asking, and only a
+/// fake that says how often it was asked can show that.
+class ScriptedIdentity final: public IEndpointIdentity
+{
+  public:
+    /// @param identity What to answer every time.
+    explicit ScriptedIdentity(EndpointIdentity identity):
+        _identity { std::move(identity) }
+    {
+    }
+
+    [[nodiscard]] EndpointIdentity IdentifyEndpoint() override
+    {
+        ++_calls;
+        return _identity;
+    }
+
+    /// How many times it was asked.
+    /// @return The count.
+    [[nodiscard]] int Calls() const noexcept
+    {
+        return _calls;
+    }
+
+  private:
+    EndpointIdentity _identity;
+    int _calls { 0 };
+};
+
 /// A gatherer that answers from a fixed list.
 class ScriptedGatherer final: public IStatsGatherer
 {
@@ -331,5 +363,23 @@ class ScriptedGatherer final: public IStatsGatherer
     std::vector<StatsAttempt> _attempts;
     int _calls { 0 };
 };
+
+/// Every advisory joined, for a `contains` check.
+///
+/// A refusal's sentence is an ADVISORY here rather than a field of `Answer` -- remarks
+/// go to stderr in every format so stdout stays parseable -- and which advisory carries
+/// it is not a property worth pinning.
+/// @param answer The answer.
+/// @return The advisories, newline separated.
+[[nodiscard]] inline std::string AdvisoryText(Answer const& answer)
+{
+    std::string out;
+    for (auto const& advisory: answer.advisories)
+    {
+        out += advisory;
+        out.push_back('\n');
+    }
+    return out;
+}
 
 } // namespace FastCache::Cli::Testing

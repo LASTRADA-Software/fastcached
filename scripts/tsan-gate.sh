@@ -161,13 +161,23 @@ SUPPRESSIONS="${REPO_ROOT}/.tsan-suppressions"
 # shellcheck source=lib/e2e-common.sh
 . "${REPO_ROOT}/scripts/lib/e2e-common.sh"
 
-# The scope. One row per binary: the executable, and the Catch2 tag expression it
-# is run with (empty means the whole binary). Adding a concurrency-bearing target
-# is adding a row.
+# The scope. One row per binary: the executable, the Catch2 tag expression it is run
+# with (empty means the whole binary), and what it LINKS. Adding a concurrency-bearing
+# target is adding a row.
 #
 # `scripts/check-tsan-scope.cmake` PARSES this table -- keep the
-# `"name|tagExpression"` shape, or that check fails by name rather than silently
-# enforcing an empty scope.
+# `"name|tagExpression|links"` shape, or that check fails by name rather than silently
+# enforcing an empty scope. The tag expression is everything between the FIRST `|`
+# and the LAST, so an expression may hold a `|` of its own; a declaration may not.
+#
+# THE LINKS COLUMN is a declaration `AssertLinkedLibrariesInstrumented` holds the
+# build to (#134): `first-party` when the binary links a static library this
+# project builds, or `none: <reason>` when it does not. A row declaring
+# `first-party` whose link edge reads EMPTY is refused -- a broken read of the build
+# graph, or a renamed library -- and so is a row declaring `none` that reads a
+# library, since a stale `none` is how an uninstrumented library would come back.
+# A rule concluding from "some row linked something" could see neither: the row
+# that read wrong passes as long as another row read right.
 #
 # Which tag reaches which threaded file, so that a tag removed here is removed
 # knowing what stops being sanitized (#316). Every `Net/` test file carries
@@ -176,7 +186,14 @@ SUPPRESSIONS="${REPO_ROOT}/.tsan-suppressions"
 # `Cache/ShardedStorage_test.cpp` (the tree's one explicit concurrency stress
 # case), `[expiry]` for `Cache/ExpiryReaper_test.cpp`, `[clock]` for
 # `Core/Clock_test.cpp`, `[pubsub]` for `Protocol/RedisRespSocket_test.cpp`,
-# `[server]` for the two threaded `Server/` files.
+# `[server]` for the two threaded `Server/` files. `[reactor]` also reaches
+# `Protocol/LiveStreamReactors_test.cpp`, one live-stats stream served on two real
+# reactors (#1399) -- and `[livestats]` is deliberately NOT a row: its other cases
+# drive one `TestReactor` on one thread, where ThreadSanitizer has no second thread
+# to observe, so the tag would lengthen the run and read as race coverage it is not.
+# Measured on 78582087, Linux, clang-tsan, `-DFASTCACHED_ENABLE_TLS=ON`, Catch2's own
+# `matching test cases` line: this expression 903, with `[livestats]` added 921 --
+# the 18 it would add are exactly its cases outside every tag here, 0 of them threaded.
 #
 # MEASURED 2026-09-11 on 9c5cc374, Linux, with `-DFASTCACHED_ENABLE_TLS=ON` --
 # what the clang-tsan job passes, and the condition that decides the number:
@@ -247,9 +264,10 @@ SUPPRESSIONS="${REPO_ROOT}/.tsan-suppressions"
 # the OBJECTS that answer, and the reading was controlled in both directions -- a
 # plain TU compiled without the flag reads 0 and the same TU with it reads 1.
 TARGETS=(
-    "FastCacheTest|[async],[consensus],[distributed],[reactor],[task],[net],[tls],[sharded],[expiry],[clock],[pubsub],[server]"
-    "fastcache-compile-node-tests|"
-    "fastcache-cc-tests|"
+    "FastCacheTest|[async],[consensus],[distributed],[reactor],[task],[net],[tls],[sharded],[expiry],[clock],[pubsub],[server]|first-party"
+    "fastcache-compile-node-tests||first-party"
+    "fastcache-cc-tests||none: the launcher does not link the FastCache library, it compiles its few shared sources in"
+    "fastcache-cli-tests||first-party"
 )
 
 # What this gate DID, one entry per row of TARGETS above.
@@ -618,42 +636,52 @@ ${matches}
 # is used and what makes it safe there.
 # ---------------------------------------------------------------------------
 
+# Whether one object carries the undefined `__tsan_init` reference: status 0 when it
+# does, 1 when it does not. An object `nm` cannot read is a REFUSAL, never either
+# answer. One reader for a row's own objects and for its libraries' objects, so the
+# two questions cannot drift into reading the symbol table two different ways.
+# @param 1 whose question this is, for the refusal
+# @param 2 the object
+ObjectCarriesTsanInit() {
+    local name="$1" obj="$2" undefined nm_rc=0
+    # `nm` into a variable and match with `case`, never `nm | grep -q`. Under
+    # `set -o pipefail` a `grep -q` that matches EARLY closes the pipe, `nm`
+    # dies of SIGPIPE, and the pipeline reports failure -- so an instrumented
+    # object is diagnosed as an uninstrumented one, ON THE SUCCESS PATH.
+    #
+    # Measured while writing this, in the census scripts that produced the
+    # numbers above: it is not merely a false negative, it is RACY. `printf`
+    # sometimes wins the exit race and sometimes does not, so two runs over
+    # the same 135 objects returned 129 and 108, and a listing built the same
+    # way named 27 offenders against a true 6. A deterministic wrong answer
+    # gets caught by whoever checks it once; a racy one gets blamed on the
+    # subject.
+    undefined="$(nm --undefined-only --no-demangle "$obj" 2>/dev/null)" || nm_rc=$?
+    if [[ "$nm_rc" -ne 0 ]]; then
+        fatal "${name}: nm could not read ${obj}; cannot verify instrumentation.
+    An unreadable object is not an uninstrumented one, so this refuses rather
+    than guessing which it was."
+    fi
+    case "$undefined" in
+        *__tsan_init*) return 0 ;;
+    esac
+    return 1
+}
+
 AssertInstrumented() {
     local name="$1" path objdir
     path="$(BinaryPath "$name")"
     [[ -f "$path" ]] || fatal "${name}: not built (looked in ${BUILD_DIR}/target). Build it before running this gate."
     objdir="$(ObjectDir "$name")"
 
-    local total=0 uninstrumented=0 offenders="" obj undefined nm_rc
+    local total=0 uninstrumented=0 offenders="" obj
     while IFS= read -r obj; do
         total=$(( total + 1 ))
-        # `nm` into a variable and match with `case`, never `nm | grep -q`. Under
-        # `set -o pipefail` a `grep -q` that matches EARLY closes the pipe, `nm`
-        # dies of SIGPIPE, and the pipeline reports failure -- so an instrumented
-        # object is diagnosed as an uninstrumented one, ON THE SUCCESS PATH.
-        #
-        # Measured while writing this, in the census scripts that produced the
-        # numbers above: it is not merely a false negative, it is RACY. `printf`
-        # sometimes wins the exit race and sometimes does not, so two runs over
-        # the same 135 objects returned 129 and 108, and a listing built the same
-        # way named 27 offenders against a true 6. A deterministic wrong answer
-        # gets caught by whoever checks it once; a racy one gets blamed on the
-        # subject.
-        nm_rc=0
-        undefined="$(nm --undefined-only --no-demangle "$obj" 2>/dev/null)" || nm_rc=$?
-        if [[ "$nm_rc" -ne 0 ]]; then
-            fatal "${name}: nm could not read ${obj}; cannot verify instrumentation.
-    An unreadable object is not an uninstrumented one, so this refuses rather
-    than guessing which it was."
-        fi
-        case "$undefined" in
-            *__tsan_init*) ;;
-            *)
-                uninstrumented=$(( uninstrumented + 1 ))
-                offenders="${offenders}        ${obj}
+        if ! ObjectCarriesTsanInit "$name" "$obj"; then
+            uninstrumented=$(( uninstrumented + 1 ))
+            offenders="${offenders}        ${obj}
 "
-                ;;
-        esac
+        fi
     done < <(find "$objdir" -name '*.o')
 
     # An empty object directory is not a clean bill: it is a target whose objects
@@ -673,6 +701,158 @@ ${offenders}    The BINARY may still carry a defined __tsan_init -- the link pul
     See cmake/portable/Sanitizers.cmake for the precedent."
     fi
     note "${name}: instrumented (${total} object files)"
+}
+
+# ---------------------------------------------------------------------------
+# Question one, continued: are the first-party LIBRARIES a row links instrumented?
+#
+# `AssertInstrumented` reads the objects in the row's own `<target>.dir`, and a binary
+# is more than those. The vendored TUI went unsanitized in every sanitizer
+# configuration (#134) -- its targets were declared before the directory-scoped
+# sanitizer options -- while this gate printed "fastcache-cli-tests: instrumented
+# (31 object files)": true of the 31, and silent about the static library holding
+# the half of that binary the row exists for.
+#
+# DERIVED, never listed. The libraries are the static archives on the row's own link
+# edge, read from ninja's record of the build (`ninja -t query`), and each archive's
+# objects are the inputs of ITS edge. A hand list of "FastCache and the TUI" is exact
+# about the libraries it knows and silent about the next one, which is precisely how
+# the TUI escaped the object check above.
+#
+# Which archives are FIRST-PARTY is also derived: an archive this build produced is
+# third-party exactly when it sits under a dependency's binary directory as CPM
+# recorded it in `CMakeCache.txt` (`CPM_PACKAGE_<name>_BINARY_DIR`). Those stay
+# uninstrumented on purpose. A path this build did not produce -- an absolute one,
+# a system library -- is not asked about at all. So the classification is an
+# INCLUSION by the build's own record rather than a pattern like `_deps/`: an
+# archive nobody recorded as a dependency is treated as ours and checked, which
+# fails CLOSED.
+#
+# A row linking no first-party archive is ordinary -- `fastcache-cc-tests` compiles
+# its few shared sources in rather than linking the library -- so it is REPORTED by
+# name rather than refused. What is refused is the derivation coming back empty for
+# EVERY row (`AssertSomeRowLinksALibrary`), and a link edge ninja cannot describe.
+# ---------------------------------------------------------------------------
+
+# The explicit and implicit inputs ninja records for one build output, one per line;
+# order-only inputs are not linked and are left out.
+# @param 1 the output, relative to the build directory
+EdgeInputs() {
+    local output="$1" query rc=0
+    query="$(cd "$BUILD_DIR" && ninja -t query "$output" 2>&1)" || rc=$?
+    if [[ "$rc" -ne 0 ]]; then
+        fatal "ninja -t query ${output} failed in ${BUILD_DIR} (exit ${rc}), so what it is built from cannot be derived:
+${query}"
+    fi
+    printf '%s\n' "$query" | awk '
+        /^  input:/     { reading = 1; next }
+        /^  outputs:/   { reading = 0 }
+        !reading        { next }
+        /^    \| /      { print $2; next }
+        /^    [^ |]/    { print $1 }'
+}
+
+# A row's fields. The tag expression runs from the first `|` to the last, so it may
+# hold a `|` itself; the name and the declaration may not.
+# @param 1 the row
+RowName() { printf '%s' "${1%%|*}"; }
+RowTags() {
+    local middle="${1#*|}"
+    printf '%s' "${middle%|*}"
+}
+RowLinks() {
+    local middle="${1#*|}"
+    [[ "$middle" == *"|"* ]] || fatal "the TARGETS row \"$1\" declares nothing about what it links.
+    A row is \"name|tagExpression|links\", and links is first-party or none: <reason>."
+    printf '%s' "${1##*|}"
+}
+
+# @param 1 the row name
+# @param 2 its links declaration, `first-party` or `none: <reason>`
+AssertLinkedLibrariesInstrumented() {
+    local name="$1" declared="$2" inputs input build recorded dependencyDir isDependency
+    local objects obj total uninstrumented offenders libraries="" count=0
+    build="$(cd "$BUILD_DIR" && pwd -P)"
+    [[ -f "${BUILD_DIR}/CMakeCache.txt" ]] \
+        || fatal "${name}: no ${BUILD_DIR}/CMakeCache.txt, so which linked archives are dependencies cannot be read."
+    recorded="$(sed -n 's/^CPM_PACKAGE_[A-Za-z0-9_]*_BINARY_DIR:INTERNAL=//p' "${BUILD_DIR}/CMakeCache.txt")"
+
+    inputs="$(EdgeInputs "target/${name}")"
+    if [[ -z "$inputs" ]]; then
+        fatal "${name}: ninja records no inputs for target/${name}, so what it links cannot be derived.
+    Every binary is linked from its own objects at least, so an empty answer is this
+    reader having stopped matching ninja's output, not a binary that links nothing."
+    fi
+
+    while IFS= read -r input; do
+        case "$input" in
+            /*) continue ;;
+            *.a) ;;
+            *) continue ;;
+        esac
+        isDependency=0
+        while IFS= read -r dependencyDir; do
+            [[ -n "$dependencyDir" ]] || continue
+            case "${build}/${input}" in
+                "${dependencyDir%/}/"*) isDependency=1 ;;
+            esac
+        done <<< "$recorded"
+        [[ "$isDependency" -eq 0 ]] || continue
+
+        objects="$(EdgeInputs "$input")"
+        total=0
+        uninstrumented=0
+        offenders=""
+        while IFS= read -r obj; do
+            case "$obj" in
+                *.o) ;;
+                *) continue ;;
+            esac
+            total=$(( total + 1 ))
+            if ! ObjectCarriesTsanInit "$name" "${BUILD_DIR}/${obj}"; then
+                uninstrumented=$(( uninstrumented + 1 ))
+                offenders="${offenders}        ${obj}
+"
+            fi
+        done <<< "$objects"
+
+        [[ "$total" -gt 0 ]] \
+            || fatal "${name}: links the first-party library ${input}, and ninja records no object inputs for it, so nothing proves it was instrumented."
+        if [[ "$uninstrumented" -ne 0 ]]; then
+            fatal "${name}: links the first-party library ${input}, and ${uninstrumented} of ${total} of its object files were built WITHOUT ThreadSanitizer instrumentation:
+${offenders}    The row's OWN objects passed, so this is a LIBRARY the sanitizer flags did not
+    reach -- a target declared before \`include(Sanitizers)\` is the way the vendored
+    TUI got here (#134). Give it the flags from the module's own variables, as the
+    top-level CMakeLists.txt does for \`vendor/\`, rather than exempting the library."
+        fi
+        libraries="${libraries} ${input} (${total})"
+        count=$(( count + 1 ))
+    done <<< "$inputs"
+
+    case "$declared" in
+        first-party)
+            if [[ "$count" -eq 0 ]]; then
+                fatal "${name}: its TARGETS row declares it links first-party libraries, and ninja's record of its link names none.
+    Either the build graph was misread -- in which case nothing below would have been
+    checked, silently -- or the library it linked was renamed or dropped. If the binary
+    really links none now, say so in the row: none: <reason>."
+            fi
+            note "${name}: linked first-party libraries instrumented:${libraries}"
+            ;;
+        "none: "?*)
+            if [[ "$count" -ne 0 ]]; then
+                fatal "${name}: its TARGETS row declares it links no first-party library (${declared#none: }), and it links:${libraries}
+    A stale \"none\" is exactly how an uninstrumented library would come back unasked.
+    They were checked and are instrumented, but the declaration is refused: change the
+    row to first-party."
+            fi
+            note "${name}: links no first-party static library, as its row declares (${declared#none: })"
+            ;;
+        *)
+            fatal "${name}: its TARGETS row declares \"${declared}\" about what it links.
+    The declaration is first-party, or none: followed by the reason."
+            ;;
+    esac
 }
 
 # ---------------------------------------------------------------------------
@@ -1035,6 +1215,22 @@ cat "$arg"
 STUB
     chmod +x "${stub}/nm"
 
+    # The second stub. `ninja` is called as `ninja -t query <output>` from inside the
+    # build directory, and answers what `StageQuery` wrote for that output; an output
+    # nobody staged exits non-zero, which is how a link edge ninja cannot describe is
+    # staged.
+    cat > "${stub}/ninja" <<'STUB'
+#!/bin/bash
+for arg in "$@"; do :; done
+file=".staged-query/$(printf '%s' "$arg" | tr '/' '_')"
+if [[ ! -f "$file" ]]; then
+    echo "ninja: error: unknown target '$arg'" >&2
+    exit 1
+fi
+cat "$file"
+STUB
+    chmod +x "${stub}/ninja"
+
     # The verdict, shared by both drivers below. Split out rather than written
     # twice: the `!`-prefix matching is the only fiddly part of this fixture, and
     # a second copy of it would be a second thing to get wrong in the direction
@@ -1232,6 +1428,150 @@ STUB
     rm -f "${BUILD_DIR}/target/FastCacheTest"
     Case "binary-not-built" 1 "not built"
 
+    # -----------------------------------------------------------------------
+    # AssertLinkedLibrariesInstrumented, against staged link graphs.
+    #
+    # The same object staging as above, plus what `ninja -t query` would answer for
+    # the row's link edge and for each archive's, and a `CMakeCache.txt` carrying the
+    # CPM binary-directory records the classification reads.
+
+    # @param 1 the output  @param 2 explicit inputs, space-separated  @param 3 implicit inputs
+    StageQuery() {
+        local output="$1" explicit="$2" implicit="$3" file item
+        mkdir -p "${BUILD_DIR}/.staged-query"
+        file="${BUILD_DIR}/.staged-query/$(printf '%s' "$output" | tr '/' '_')"
+        {
+            printf '%s:\n  input: STAGED_RULE\n' "$output"
+            for item in $explicit; do printf '    %s\n' "$item"; done
+            for item in $implicit; do printf '    | %s\n' "$item"; done
+            printf '    || %s\n' "order-only-never-linked.a"
+            printf '  outputs:\n'
+        } > "$file"
+    }
+
+    # @param 1 the archive  @param 2.. `name:kind` objects, kinds as `Stage` takes them
+    StageArchive() {
+        local archive="$1"; shift
+        local dir="${archive%.a}.dir" spec obj kind objects=""
+        mkdir -p "${BUILD_DIR}/${dir}"
+        for spec in ${1+"$@"}; do
+            obj="${spec%%:*}"; kind="${spec#*:}"
+            case "$kind" in
+                instrumented) printf '%s\n' "                 U __tsan_init" > "${BUILD_DIR}/${dir}/${obj}.o" ;;
+                plain)        printf '%s\n' "                 U _ZSt4cout" > "${BUILD_DIR}/${dir}/${obj}.o" ;;
+            esac
+            objects="${objects} ${dir}/${obj}.o"
+        done
+        StageQuery "$archive" "$objects" ""
+    }
+
+    # @param 1 case name  @param 2 the row's links declaration  @param 3 expected exit status
+    # @param 4.. patterns
+    LinkCase() {
+        local name="$1" declared="$2" want="$3"; shift 3
+        local out rc=0
+        out="$(PATH="${stub}:$PATH" AssertLinkedLibrariesInstrumented "$SelfTestTarget" "$declared" 2>&1)" || rc=$?
+        Expect "$name" "$want" "$rc" "$out" "$@"
+    }
+
+    echo
+    echo "== AssertLinkedLibrariesInstrumented, against staged link graphs"
+
+    # THE CASE #134 IS ABOUT: the row's own objects are fine, and a library it links is
+    # not. The object check above passes this tree.
+    Stage fastcache-cli-tests own:instrumented
+    printf '%s\n' "CPM_PACKAGE_Catch2_BINARY_DIR:INTERNAL=$(cd "$BUILD_DIR" && pwd -P)/_deps/catch2-build" > "${BUILD_DIR}/CMakeCache.txt"
+    StageArchive "vendor/libtui.a" a:instrumented b:plain
+    StageQuery "target/fastcache-cli-tests" "own.o" "vendor/libtui.a"
+    LinkCase "linked-library-uninstrumented" first-party 1 \
+        "links the first-party library vendor/libtui.a" "1 of 2 of its object files were built WITHOUT" \
+        "vendor/libtui.dir/b.o" "!vendor/libtui.dir/a.o"
+
+    # Its accepting twin, in a tree that also carries everything the classification must
+    # step over: a recorded dependency's archive that is NOT instrumented, and a system
+    # library by absolute path. Watched passing, so the refusal above is not a check
+    # that refuses everything.
+    Stage fastcache-cli-tests own:instrumented
+    printf '%s\n' "CPM_PACKAGE_Catch2_BINARY_DIR:INTERNAL=$(cd "$BUILD_DIR" && pwd -P)/_deps/catch2-build" > "${BUILD_DIR}/CMakeCache.txt"
+    StageArchive "vendor/libtui.a" a:instrumented b:instrumented
+    StageArchive "libFirst.a" c:instrumented
+    StageArchive "_deps/catch2-build/libCatch2.a" d:plain
+    StageQuery "target/fastcache-cli-tests" "own.o" "libFirst.a vendor/libtui.a _deps/catch2-build/libCatch2.a /usr/lib/libssl.so /usr/lib/libsys.a"
+    LinkCase "linked-libraries-instrumented" first-party 0 \
+        "linked first-party libraries instrumented: libFirst.a (1) vendor/libtui.a (2)" \
+        "!WITHOUT" "!libCatch2" "!libssl" "!libsys"
+
+    # The classification is the BUILD'S RECORD, not the path: the same archive under
+    # `_deps/` with no CPM record is ours as far as anything can tell, so it is checked
+    # -- and refused. A `_deps/` pattern would have waved it through.
+    Stage fastcache-cli-tests own:instrumented
+    : > "${BUILD_DIR}/CMakeCache.txt"
+    StageArchive "_deps/catch2-build/libCatch2.a" d:plain
+    StageQuery "target/fastcache-cli-tests" "own.o" "_deps/catch2-build/libCatch2.a"
+    LinkCase "unrecorded-dependency-is-checked" first-party 1 \
+        "links the first-party library _deps/catch2-build/libCatch2.a"
+
+    # The declaration, both ways and both mismatches. A row declaring none that links
+    # none is accepted and says why; a row declaring first-party that reads empty is
+    # refused -- the misread graph a count across rows could not see -- and so is a
+    # stale none that reads a library, even an instrumented one.
+    Stage fastcache-cc-tests own:instrumented
+    : > "${BUILD_DIR}/CMakeCache.txt"
+    StageQuery "target/fastcache-cc-tests" "own.o" "/usr/lib/libssl.so"
+    LinkCase "row-declaring-none-links-none" "none: compiles its sources in" 0 \
+        "fastcache-cc-tests: links no first-party static library, as its row declares (compiles its sources in)" "!WITHOUT"
+
+    Stage fastcache-cli-tests own:instrumented
+    : > "${BUILD_DIR}/CMakeCache.txt"
+    StageQuery "target/fastcache-cli-tests" "own.o" "/usr/lib/libssl.so"
+    LinkCase "row-declaring-first-party-reads-none" first-party 1 \
+        "declares it links first-party libraries, and ninja's record of its link names none"
+
+    Stage fastcache-cc-tests own:instrumented
+    : > "${BUILD_DIR}/CMakeCache.txt"
+    StageArchive "libFirst.a" c:instrumented
+    StageQuery "target/fastcache-cc-tests" "own.o" "libFirst.a"
+    LinkCase "row-declaring-none-links-a-library" "none: compiles its sources in" 1 \
+        "declares it links no first-party library (compiles its sources in), and it links: libFirst.a (1)"
+
+    Stage fastcache-cc-tests own:instrumented
+    : > "${BUILD_DIR}/CMakeCache.txt"
+    StageQuery "target/fastcache-cc-tests" "own.o" ""
+    LinkCase "row-declaring-something-else" "none:" 1 "declares \"none:\" about what it links"
+
+    Stage fastcache-cli-tests own:instrumented
+    : > "${BUILD_DIR}/CMakeCache.txt"
+    LinkCase "link-edge-ninja-cannot-describe" first-party 1 "ninja -t query target/fastcache-cli-tests failed"
+
+    Stage fastcache-cli-tests own:instrumented
+    : > "${BUILD_DIR}/CMakeCache.txt"
+    StageQuery "target/fastcache-cli-tests" "" ""
+    LinkCase "link-edge-with-no-inputs" first-party 1 "ninja records no inputs for target/fastcache-cli-tests"
+
+    Stage fastcache-cli-tests own:instrumented
+    : > "${BUILD_DIR}/CMakeCache.txt"
+    StageQuery "libEmpty.a" "" ""
+    StageQuery "target/fastcache-cli-tests" "own.o" "libEmpty.a"
+    LinkCase "library-with-no-objects" first-party 1 "ninja records no object inputs for it"
+
+    Stage fastcache-cli-tests own:instrumented
+    rm -f "${BUILD_DIR}/CMakeCache.txt"
+    StageQuery "target/fastcache-cli-tests" "own.o" ""
+    LinkCase "no-cache-to-classify-with" first-party 1 "no ${BUILD_DIR}/CMakeCache.txt"
+
+    # The row's fields: a tag expression holding a `|` of its own still leaves the
+    # declaration as the last field, and a row with no declaration is refused.
+    RowCase() {
+        local name="$1" row="$2" want="$3"; shift 3
+        local out rc=0
+        out="$( (links="$(RowLinks "$row")" || exit 1
+                 printf '%s/%s/%s' "$(RowName "$row")" "$(RowTags "$row")" "$links") 2>&1)" || rc=$?
+        Expect "$name" "$want" "$rc" "$out" "$@"
+    }
+    RowCase "row-fields-around-a-bar-in-the-tags" "T|[a]|[b]|first-party" 0 "T/[a]|[b]/first-party"
+    RowCase "row-fields-whole-binary" "T||none: why" 0 "T//none: why"
+    RowCase "row-with-no-links-declaration" "T|[a]" 1 "declares nothing about what it links"
+
     echo
     echo "== the bound's outcomes, against staged artefacts"
 
@@ -1373,7 +1713,7 @@ STUB
     # three rows, and the third must come back `not-run` rather than aborting the
     # render under `set -u`.
     Expect "verdict-pairs-are-derived-from-the-table" 0 0 \
-        "$(TARGETS=("FastCacheTest|[async]" "fastcache-compile-node-tests|" "a-third-target|[new]")
+        "$(TARGETS=("FastCacheTest|[async]|first-party" "fastcache-compile-node-tests||first-party" "a-third-target|[new]|none: staged")
            TargetVerdicts=("clean" "clean")
            TargetPairs)" \
         "FastCacheTest=clean" "fastcache-compile-node-tests=clean" "a-third-target=not-run"
@@ -1504,6 +1844,7 @@ fi
 [[ -d "$BUILD_DIR" ]] || fatal "build directory not found: ${BUILD_DIR}"
 [[ -f "$SUPPRESSIONS" ]] || fatal "suppressions file not found: ${SUPPRESSIONS}"
 command -v nm >/dev/null || fatal "nm is required to verify instrumentation"
+command -v ninja >/dev/null || fatal "ninja is required to read what each binary links (ninja -t query)"
 # No companion check for the bound. There used to be one -- `timeout(1) is
 # required` -- and deleting it is not a relaxation: `run_bounded` is bash, so
 # there is no binary whose absence could leave this gate running an unbounded
@@ -1595,13 +1936,17 @@ note "compile lines carrying -fsanitize=thread: $(grep -c -- '-fsanitize=thread'
 # full sanitized run wastes the whole of that run.
 AssertInstrumented tsan-canary
 for row in "${TARGETS[@]}"; do
-    AssertInstrumented "${row%%|*}"
+    # An assignment, so a row RowLinks refuses ends the gate here: a refusal inside
+    # an argument's command substitution would be swallowed by the call around it.
+    links="$(RowLinks "$row")"
+    AssertInstrumented "$(RowName "$row")"
+    AssertLinkedLibrariesInstrumented "$(RowName "$row")" "$links"
 done
 
 AssertCanaryFires
 
 for row in "${TARGETS[@]}"; do
-    RunTarget "${row%%|*}" "${row#*|}"
+    RunTarget "$(RowName "$row")" "$(RowTags "$row")"
 done
 
 # No literal here. The per-target table the EXIT trap prints IS the green

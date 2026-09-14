@@ -45,6 +45,7 @@ target_sources(FastCache
         Consensus/RaftPeerServer.cpp
         Consensus/RaftPeerTransport.cpp
         Core/Crc32c.cpp
+        Core/FigureText.cpp
         Core/PathKind.cpp
         Core/SecureBytes.cpp
         Core/Sha256.cpp
@@ -68,6 +69,8 @@ target_sources(FastCache
         Core/Base64.cpp
         Server/AdminCredential.cpp
         Metrics/PrometheusFormatter.cpp
+        Metrics/StatsReading.cpp
+        Metrics/StatsReadingCodec.cpp
         Net/BlockingConnector.cpp
         Net/BlockingSocket.cpp
         Net/ConnectFlow.cpp
@@ -94,12 +97,14 @@ target_sources(FastCache
         Platform/PosixDaemonHost.cpp
         Platform/Registry.cpp
         Platform/ServiceControl.cpp
+        Platform/StopSignal.cpp
         Platform/Terminal.cpp
         Platform/WindowsEventLogger.cpp
         Platform/WindowsServiceHost.cpp
         Net/InMemoryTransport.cpp
         Protocol/Framing/LineReader.cpp
         Protocol/CompileCacheHandler.cpp
+        Protocol/LiveStream.cpp
         Protocol/MemcachedBinary.cpp
         Protocol/MemcachedMeta.cpp
         Protocol/MemcachedText.cpp
@@ -206,6 +211,7 @@ target_sources(FastCache
             Core/SecureBytes.hpp
             Core/Compression.hpp
             Core/Endian.hpp
+            Core/FigureText.hpp
             Core/Markup.hpp
             Core/StringHash.hpp
             Core/Utf8.hpp

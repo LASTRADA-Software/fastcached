@@ -268,6 +268,15 @@ class NodeStatusResponder final: public IFrameResponder
         return std::nullopt;
     }
 
+    /// @copydoc IFrameResponder::StreamFor
+    ///
+    /// **Not a stream**: `NodeStatus` and `NodeMetrics` are the one-shot answers; the same figures as a series
+    /// are `Op::Subscribe`, served by the live-stats component.
+    [[nodiscard]] IFrameStream* StreamFor(std::uint8_t /*opRaw*/) noexcept override
+    {
+        return nullptr;
+    }
+
   private:
     INodeStatusSource const& _identity;
     Distributed::IMembershipOracle const& _membership;

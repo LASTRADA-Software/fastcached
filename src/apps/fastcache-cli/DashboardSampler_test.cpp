@@ -9,6 +9,10 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <atomic>
+#include <chrono>
+#include <coroutine>
+#include <cstddef>
+#include <expected>
 #include <optional>
 #include <thread>
 #include <vector>
@@ -22,23 +26,33 @@ using FastCache::Testing::Unwrap;
 namespace
 {
 
-/// A gatherer that records which thread asked it and blocks while it does.
+/// A stream whose reads record which thread asked and block while they do.
 ///
-/// It blocks on purpose. A gatherer that returned instantly would let a broken
-/// implementation -- one that never left the reactor -- finish before anything could
-/// observe the difference, so the case would pass for the wrong reason.
-class RecordingGatherer final: public IStatsGatherer
+/// It blocks on purpose. A read that returned instantly would let a broken implementation -- one that
+/// never left the reactor -- finish before anything could observe the difference, so the case would
+/// pass for the wrong reason.
+class RecordingSubscription final: public ILiveSubscription
 {
   public:
-    [[nodiscard]] std::vector<StatsAttempt> Gather() override
+    [[nodiscard]] std::expected<void, ExchangeError> Open(Endpoint const& /*where*/,
+                                                          CompileCacheWire::SubscribeRequest const& /*request*/) override
+    {
+        return {};
+    }
+
+    [[nodiscard]] std::expected<NodeReply, ExchangeError> Read() override
     {
         calledOn = std::this_thread::get_id();
         ++calls;
         entered.store(true, std::memory_order_release);
         while (!release.load(std::memory_order_acquire))
             std::this_thread::yield();
-        return { StatsAttempt { .origin = StatsOrigin::Info, .asked = true, .record = std::nullopt, .note = "probe" } };
+        return NodeReply { .status = CompileCacheWire::Status::Ok };
     }
+
+    void ExpectEvery(std::chrono::milliseconds /*cadence*/) override {}
+
+    void Leave() noexcept override {}
 
     std::thread::id calledOn {};
     std::size_t calls { 0 };
@@ -46,23 +60,87 @@ class RecordingGatherer final: public IStatsGatherer
     std::atomic<bool> release { false };
 };
 
-/// Take one reading, writing the result where the caller can read it.
+/// Take one frame, writing the result where the caller can read it.
 ///
-/// Pointers and a named coroutine, for the reason the production signatures use
-/// them: a lambda coroutine loses its closure at the first suspension, and this one
-/// suspends immediately.
-/// @param gatherer The ladder.
-/// @param pool Where the gather runs.
+/// Pointers and a named coroutine, for the reason the production signatures use them: a lambda
+/// coroutine loses its closure at the first suspension, and this one suspends immediately.
+/// @param subscription The stream.
+/// @param clock What stamps the frame.
+/// @param pool Where the read runs.
 /// @param resumeOn Where to come back.
 /// @param out Where to put the result.
 /// @return The task to submit.
-[[nodiscard]] Task<void> TakeOnce(IStatsGatherer* gatherer,
-                                  IExecutor* pool,
-                                  IExecutor* resumeOn,
-                                  std::optional<SampleOutcome>* out)
+[[nodiscard]] Task<void> TakeOnce(
+    ILiveSubscription* subscription, IClock* clock, IExecutor* pool, IExecutor* resumeOn, std::optional<FrameOutcome>* out)
 {
-    *out = co_await TakeSample(gatherer, pool, resumeOn);
+    *out = co_await TakeFrame(subscription, clock, pool, resumeOn);
 }
+
+/// A stream during whose read time passes, by a known amount.
+///
+/// It does not block: the property it serves is WHEN the stamp is read, not whether the reactor stays
+/// free, and a read that returns promptly keeps the case about one thing.
+class TimedSubscription final: public ILiveSubscription
+{
+  public:
+    TimedSubscription(ManualClock& clock, Duration during):
+        _clock { clock },
+        _during { during }
+    {
+    }
+
+    [[nodiscard]] std::expected<void, ExchangeError> Open(Endpoint const& /*where*/,
+                                                          CompileCacheWire::SubscribeRequest const& /*request*/) override
+    {
+        return {};
+    }
+
+    [[nodiscard]] std::expected<NodeReply, ExchangeError> Read() override
+    {
+        _clock.Advance(_during);
+        return NodeReply { .status = CompileCacheWire::Status::Ok };
+    }
+
+    void ExpectEvery(std::chrono::milliseconds /*cadence*/) override {}
+
+    void Leave() noexcept override {}
+
+  private:
+    ManualClock& _clock;
+    Duration _during;
+};
+
+/// An executor that makes the queue take time before it hands work on.
+///
+/// Stands in for the reactor's own latency: the delay between a continuation being posted
+/// and the reactor running it, which is real and which must not become part of a reading.
+class SlowQueue final: public IExecutor
+{
+  public:
+    SlowQueue(ManualClock& clock, Duration delay, IExecutor& inner):
+        _clock { clock },
+        _delay { delay },
+        _inner { inner }
+    {
+    }
+
+    void Submit(std::coroutine_handle<> handle) override
+    {
+        _clock.Advance(_delay);
+        _inner.Submit(handle);
+    }
+
+    void Submit(ParkedWork work) override
+    {
+        _clock.Advance(_delay);
+        _inner.Submit(work);
+    }
+
+  private:
+    ManualClock& _clock;
+    Duration _delay;
+    IExecutor& _inner;
+};
 
 /// Record which thread an executor runs work on.
 /// @param pool The executor to hop onto.
@@ -78,35 +156,35 @@ class RecordingGatherer final: public IStatsGatherer
 
 } // namespace
 
-TEST_CASE("a stats reading is gathered off the reactor and delivered back onto it", "[cli][dashboard][sampler]")
+TEST_CASE("a stream frame is read off the reactor and delivered back onto it", "[cli][dashboard][sampler]")
 {
-    // `Gather()` is synchronous and does socket I/O, so on the reactor it would stall
+    // `Read()` is synchronous and does socket I/O, so on the reactor it would stall
     // ticks, input and quit together. The hop is the fix and the hop back is what makes
     // the fix safe to use.
     //
-    // WHAT DISTINGUISHES: the THREAD IDENTITIES. A sample arriving proves nothing -- an
-    // implementation that dropped both hops and called `Gather()` inline would produce
-    // exactly the same reading, and every assertion about the reading would still pass.
-    // So this case asserts three things about WHERE, and the reading only incidentally.
+    // WHAT DISTINGUISHES: the THREAD IDENTITIES. A frame arriving proves nothing -- an
+    // implementation that dropped both hops and called `Read()` inline would produce
+    // exactly the same frame, and every assertion about the frame would still pass.
+    // So this case asserts three things about WHERE, and the frame only incidentally.
     auto clock = ManualClock {};
     auto reactor = TestReactor { clock };
     auto pool = ThreadPoolExecutor { 1 };
-    auto gatherer = RecordingGatherer {};
+    auto subscription = RecordingSubscription {};
 
     auto const driverThread = std::this_thread::get_id();
-    auto result = std::optional<SampleOutcome> {};
-    auto task = TakeOnce(&gatherer, &pool, &reactor, &result);
+    auto result = std::optional<FrameOutcome> {};
+    auto task = TakeOnce(&subscription, &clock, &pool, &reactor, &result);
 
     reactor.Submit(task.Native());
     reactor.Drain();
 
-    // The gather is now parked on the pool, blocking. The reactor has run out of work,
-    // which is itself the point: the loop is FREE while a reading is outstanding.
-    while (!gatherer.entered.load(std::memory_order_acquire))
+    // The read is now parked on the pool, blocking. The reactor has run out of work,
+    // which is itself the point: the loop is FREE while a frame is outstanding.
+    while (!subscription.entered.load(std::memory_order_acquire))
         std::this_thread::yield();
     CHECK(!result.has_value());
 
-    gatherer.release.store(true, std::memory_order_release);
+    subscription.release.store(true, std::memory_order_release);
 
     // Resumption comes back through the reactor, so it only happens when the reactor
     // runs. Draining until it does is what proves the return hop exists at all: without
@@ -115,12 +193,12 @@ TEST_CASE("a stats reading is gathered off the reactor and delivered back onto i
         reactor.Drain();
 
     REQUIRE(result.has_value());
-    CHECK(gatherer.calls == 1);
-    CHECK(Unwrap(result).gatheredOn != driverThread); // it left the reactor
-    CHECK(Unwrap(result).gatheredOn == gatherer.calledOn);
+    CHECK(subscription.calls == 1);
+    CHECK(Unwrap(result).readOn != driverThread); // it left the reactor
+    CHECK(Unwrap(result).readOn == subscription.calledOn);
     CHECK(Unwrap(result).resumedOn == driverThread); // and came back
-    CHECK(Unwrap(result).resumedOn != result->gatheredOn);
-    CHECK(Unwrap(result).attempts.size() == 1);
+    CHECK(Unwrap(result).resumedOn != result->readOn);
+    CHECK(Unwrap(result).frame.has_value());
 }
 
 TEST_CASE("the sampler's thread identities are not equal by construction", "[cli][dashboard][sampler]")
@@ -132,15 +210,58 @@ TEST_CASE("the sampler's thread identities are not equal by construction", "[cli
     //
     // Measured rather than assumed, because it is a property of the HARNESS, and a
     // premise nobody wrote down is the one that quietly stops holding.
-    auto pool = ThreadPoolExecutor { 1 };
+    //
+    // DECLARATION ORDER IS LOAD-BEARING, and the next tidy-up must not reorder it. `marker`
+    // completes on the POOL thread, and `ran` is its last statement rather than its end: the
+    // frame is still being written on the way to `final_suspend` when the wait below returns.
+    // Declared BEFORE `pool`, the task is destroyed AFTER the pool has joined its thread, so the
+    // frame is freed once nothing is inside it. The other way round, `~Task` frees the frame
+    // while the pool thread is still in it -- a data race under TSan and a heap-use-after-free
+    // when it lands. An `optional` only because the task needs the pool's address, which does
+    // not exist yet where the task has to be declared.
     auto poolThread = std::atomic<std::thread::id> {};
     auto ran = std::atomic<bool> { false };
+    auto marker = std::optional<Task<void>> {};
+    auto pool = ThreadPoolExecutor { 1 };
 
-    auto marker = MarkThread(&pool, &poolThread, &ran);
-    pool.Submit(marker.Native());
+    pool.Submit(marker.emplace(MarkThread(&pool, &poolThread, &ran)).Native());
 
     while (!ran.load(std::memory_order_acquire))
         std::this_thread::yield();
 
     CHECK(poolThread.load(std::memory_order_acquire) != std::this_thread::get_id());
+}
+
+TEST_CASE("a frame is stamped after its read returns and before the hop back", "[cli][dashboard][sampler]")
+{
+    // The stamp is a rate's denominator, so WHERE it is read is the whole property: before
+    // the read it would exclude the time the frame took to arrive, and after the hop back
+    // it would include however long the reactor queue took to resume the caller.
+    //
+    // WHAT DISTINGUISHES: time passes on BOTH sides of the correct line -- 5 s inside the
+    // read and 7 s in the queue -- so each misplacement produces its own wrong answer.
+    // Stamped before the read reads the start; stamped after the hop reads 12 s. Only the
+    // right line reads exactly 5 s, and an assertion of "later than the start" would pass
+    // for the second mistake.
+    constexpr auto InsideRead = Duration { std::chrono::seconds { 5 } };
+    constexpr auto InQueue = Duration { std::chrono::seconds { 7 } };
+
+    auto clock = ManualClock {};
+    auto const start = clock.Now();
+    auto reactor = TestReactor { clock };
+    auto pool = ThreadPoolExecutor { 1 };
+    auto subscription = TimedSubscription { clock, InsideRead };
+    auto queue = SlowQueue { clock, InQueue, reactor };
+
+    auto result = std::optional<FrameOutcome> {};
+    auto task = TakeOnce(&subscription, &clock, &pool, &queue, &result);
+    reactor.Submit(task.Native());
+    while (!result.has_value())
+        reactor.Drain();
+
+    REQUIRE(result.has_value());
+    CHECK(Unwrap(result).takenAt == start + InsideRead);
+    // And the queue delay really happened, or the case above would pass on a line that
+    // cannot tell "after the hop" from "before it".
+    CHECK(clock.Now() == start + InsideRead + InQueue);
 }

@@ -3,7 +3,9 @@
 
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
+#include <FastCache/Metrics/StatsReading.hpp>
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <string_view>
@@ -780,6 +782,81 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
               "is a joiner whose reply was lost, a run of them is somebody answering to an id an "
               "operator approved. Both are fixed by approving that machine again.",
       .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::LiveSubscriptionsOpened,
+      .prometheusName = "fastcache_live_subscriptions_opened_total",
+      .help = "Live-stats subscriptions this process granted. One per dashboard opened against it; a steady climb "
+              "with no operator watching is a client re-subscribing in a loop.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::LiveSnapshotsRendered,
+      .prometheusName = "fastcache_live_snapshots_rendered_total",
+      .help = "Live-stats snapshots rendered. Once per subject per tick, however many subscribers are watching "
+              "it: this rising with the NUMBER of watchers rather than with time is the render being paid per "
+              "watcher, which is the cost a subscription exists to remove.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::LiveSnapshotsSkipped,
+      .prometheusName = "fastcache_live_snapshots_skipped_total",
+      .help = "Live-stats snapshots a subscriber was too slow to receive. The node sends the newest and tells "
+              "the subscriber how many it skipped; it never waits for it. A rise is a watcher on a slow link or "
+              "a stalled terminal, not a node problem.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::LiveSubscriptionsRevoked,
+      .prometheusName = "fastcache_live_subscriptions_revoked_total",
+      .help = "Live-stats streams ended because the peer no longer passes this node's gate -- a reload or a "
+              "replicated removal revoked it. Removal fails open unless something re-checks, and this is that "
+              "check acting.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::LiveSubscriptionsEndedNotLeader,
+      .prometheusName = "fastcache_live_subscriptions_ended_not_leader_total",
+      .help = "Live-stats fleet streams ended because this node stopped leading. Each watcher was told the new "
+              "leader and follows it; a rise without an election is leadership flapping.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::LiveSubscriptionsRefusedAtCapacity,
+      .prometheusName = "fastcache_live_subscriptions_refused_at_capacity_total",
+      .help = "Live-stats subscriptions refused because this process already streams to as many watchers as it "
+              "serves. A dashboard left open on every workstation reaches this long before a real team does.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::LiveSubscriptionsRefusedUnauthenticated,
+      .prometheusName = "fastcache_live_subscriptions_refused_unauthenticated_total",
+      .help = "Live-stats fleet subscriptions refused for a missing or wrong dashboard credential, or from a "
+              "remote peer where no credential is configured. The fleet map is behind the dashboard credential "
+              "over 0xFC exactly as it is over HTTP; a burst from one host is somebody guessing.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::LiveSubscriptionsStalled,
+      .prometheusName = "fastcache_live_subscriptions_stalled_total",
+      .help = "Live-stats streams ended because a push stayed unwritten past its bound: the watcher stopped "
+              "reading altogether. The node drops the connection rather than hold its buffers.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::LiveSubscriptionsEndedByClient,
+      .prometheusName = "fastcache_live_subscriptions_ended_by_client_total",
+      .help = "Live-stats streams the watching client closed. The ordinary way a dashboard ends; read it "
+              "against the opened count, where the difference is the streams still open.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::LiveSubscriptionsEndedByReset,
+      .prometheusName = "fastcache_live_subscriptions_ended_by_reset_total",
+      .help = "Live-stats streams whose watching client reset the connection instead of closing it. A "
+              "dashboard killed with pushes still unread does this; counted apart from the orderly close.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::LiveSubscriptionsRefusedNotAMember,
+      .prometheusName = "fastcache_live_subscriptions_refused_not_a_member_total",
+      .help = "Live-stats subscriptions refused because the peer is not a fleet member. Live stats stream to "
+              "members only, as NodeStatus answers them; a burst from one host is a stranger probing the port.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::LiveSubscriptionsRefusedMalformed,
+      .prometheusName = "fastcache_live_subscriptions_refused_malformed_total",
+      .help = "Live-stats subscriptions whose request did not decode, or named a subject this build does not "
+              "serve. No client of this tree sends one; a rise is a client of another build or no client at "
+              "all.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::LiveSubscriptionsRefusedPayloadTooLarge,
+      .prometheusName = "fastcache_live_subscriptions_refused_payload_too_large_total",
+      .help = "Live-stats subscriptions whose header declared more than the control payload the verb is bounded "
+              "to. Refused before a byte of it is read; no client of this tree at any version sends one.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::LiveSubscriptionsRefusedEndpointBusy,
+      .prometheusName = "fastcache_live_subscriptions_refused_endpoint_busy_total",
+      .help = "Live-stats subscriptions refused because the 0xFC listener's in-flight byte budget was full of "
+              "other requests. The dashboard retries; a rise says the view was lost when the node was busiest.",
+      .type = MetricType::Counter },
 } };
 
 // Checked at compile time rather than by a test, because the failure this prevents
@@ -788,6 +865,35 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
 // precisely the step that was missed.
 static_assert(RowsInEnumeratorOrder(CounterTable, &CounterDescriptor::counter),
               "CounterTable must hold one row per IMetricsSink::Counter, in enumerator order");
+
+/// A fact about the BUILD this process runs, exported as a Prometheus info series:
+/// one sample whose value is always 1 and whose label carries the fact.
+///
+/// A row here rather than a line in `PrometheusFormatter`, for the reason
+/// `CounterDescriptor` gives: the renderer walks tables, and a series spelled inside
+/// the renderer is one nothing else can enumerate. Not a `CounterDescriptor`, because
+/// a version is not a tally the sink holds: it is a fact the READING carries
+/// (`StatsReading::version`), so the text and the binary encoding state one fact.
+///
+/// Why it exists at all (#134): `fastcache-cli live-stats cache` titles its panel with
+/// the daemon's version, and the scrape it reads carried none, so the title could only
+/// say `-`. The label is the version verbatim; the renderer escapes it, since
+/// `-DFASTCACHED_VERSION_STRING` accepts any text.
+struct InfoDescriptor
+{
+    std::string_view prometheusName;   ///< Fully-qualified exported name.
+    std::string_view help;             ///< One-line `# HELP` text.
+    std::string_view label;            ///< The label the fact is carried in.
+    std::string StatsReading::* value; ///< Where the reading holds the fact, unescaped.
+};
+
+/// Every info series this build exports, rendered once each by `PrometheusFormatter`.
+inline constexpr std::array InfoTable {
+    InfoDescriptor { .prometheusName = "fastcached_build_info",
+                     .help = "The build this process runs: the version is the label, and the value is always 1.",
+                     .label = "version",
+                     .value = &StatsReading::version },
+};
 
 /// The row describing `counter`.
 ///

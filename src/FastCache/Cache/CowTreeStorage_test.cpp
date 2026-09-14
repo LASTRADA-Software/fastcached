@@ -2,6 +2,7 @@
 #include <FastCache/Cache/CowTreeStorage.hpp>
 #include <FastCache/Cache/StorageTestUtils.hpp>
 #include <FastCache/Core/Clock.hpp>
+#include <FastCache/Core/Ranges.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
@@ -467,7 +468,7 @@ TEST_CASE("Many small entries fit and read back across reopen", "[cowstorage][sh
         FastCache::ManualClock clock;
         // Shuffle the iteration order so the test exercises non-trivial tree paths.
         std::vector<int> order(N);
-        std::ranges::iota(order, 0);
+        FastCache::Ranges::Iota(order, 0);
         // Deterministic seed via seed_seq for reproducibility;
         // bugprone-random-generator-seed only flags direct literal seeding.
         std::seed_seq seed { 0x12345678U, 0x9ABCDEF0U, 0x0FEDCBA9U, 0x87654321U };
@@ -967,6 +968,26 @@ TEST_CASE("PurgeExpired clears all expired entries and reports the count", "[cow
         REQUIRE(got.has_value());
         REQUIRE(got->found);
     }
+}
+
+TEST_CASE("CowTreeStorage counts every expiry, whichever path removed it", "[cowstorage][stats][expiry]")
+{
+    // WHAT DISTINGUISHES: a write verb meeting a lapsed record and the sweep each count one expiry, and a live
+    // record the sweep passes over counts none.
+    TempFile tmp;
+    FastCache::CowTreeStorage::Options opts { .path = tmp.path };
+    auto storage = FastCache::CowTreeStorage::Open(opts);
+    REQUIRE(storage.has_value());
+    FastCache::ManualClock clock;
+    REQUIRE((*storage)->Set("deleted", MakeBytes("v"), 0, clock.Now() + 1ms).has_value());
+    REQUIRE((*storage)->Set("swept", MakeBytes("v"), 0, clock.Now() + 1ms).has_value());
+    REQUIRE((*storage)->Set("kept", MakeBytes("v"), 0, FastCache::TimePoint::max()).has_value());
+
+    clock.Advance(10ms);
+    REQUIRE_FALSE((*storage)->Delete("deleted", clock.Now()).has_value());
+    CHECK((*storage)->Snapshot().expirations == 1U);
+    REQUIRE((*storage)->PurgeExpired(clock.Now(), FastCache::PurgeBudget::Unbounded()).purged == 1U);
+    CHECK((*storage)->Snapshot().expirations == 2U);
 }
 
 TEST_CASE("PurgeExpired on the disk tier is bounded and resumes", "[cowstorage][purge]")

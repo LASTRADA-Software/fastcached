@@ -12,6 +12,7 @@
 #include <functional>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <ranges>
 #include <span>
 #include <string>
@@ -129,6 +130,10 @@ inline constexpr std::array ExchangeLogTable {
                  .level = LogLevel::Info,
                  .rationale = "decides who joins the fleet and hands a stranger this cluster's key; the same "
                               "audit argument as cluster-admit, on the verb that reaches further" },
+    VerbLogRow { .code = CompileCacheWire::Op::Subscribe,
+                 .level = LogLevel::Info,
+                 .rationale = "an operator opening or closing a dashboard: rare, and logged once per stream when "
+                              "it ends -- never once per push, which would be a line a second per watcher" },
 };
 
 /// Whether every verb this build serves states a log level.
@@ -306,16 +311,31 @@ using ToolchainNamer = std::function<std::string(std::string_view fingerprint)>;
     return std::format(" toolchain={} ({})", fingerprint, compiler.empty() ? "unserved" : compiler);
 }
 
+/// What a stream pushed before its terminal reply, for the one line a subscription logs at its end.
+struct StreamTally
+{
+    std::size_t pushes { 0 }; ///< Push frames delivered.
+    std::size_t bytes { 0 };  ///< Their bytes, reply headers included.
+};
+
 /// @return The line to log.
+///
+/// **A stream is not a missing reply.** A subscription answers with pushes and then, maybe, one terminal:
+/// with @p stream given, the line says how many pushes left and ends `then closed` where no terminal was
+/// written, and its bytes out count the pushes. Without it, a stream that pushed for half a minute and
+/// was left by its watcher read `no-reply (0 B out)` -- the outcome of a node that answered nothing.
+/// @param stream What a subscription pushed; nullopt for every one-reply verb.
 [[nodiscard]] inline std::string FormatExchange(std::uint8_t opRaw,
                                                 std::string_view peer,
                                                 std::span<std::byte const> frame,
                                                 std::span<std::byte const> reply,
                                                 std::chrono::milliseconds elapsed,
-                                                ToolchainNamer const& namer = {})
+                                                ToolchainNamer const& namer = {},
+                                                std::optional<StreamTally> stream = std::nullopt)
 {
-    auto const status =
-        reply.empty() ? std::string { "no-reply" } : ExchangeStatusName(static_cast<std::uint8_t>(reply.front()));
+    auto const answered = reply.empty() ? std::string { stream.has_value() ? "closed" : "no-reply" }
+                                        : ExchangeStatusName(static_cast<std::uint8_t>(reply.front()));
+    auto const status = stream.has_value() ? std::format("{} pushes, then {}", stream->pushes, answered) : answered;
     // The byte count is taken FROM the span rather than passed beside it, so the
     // length and the bytes it describes cannot come to disagree.
     return std::format("{} {} from {} -> {} ({} B in, {} B out, {} ms){}",
@@ -324,7 +344,7 @@ using ToolchainNamer = std::function<std::string(std::string_view fingerprint)>;
                        peer.empty() ? std::string_view { "<unknown peer>" } : peer,
                        status,
                        frame.size(),
-                       reply.size(),
+                       reply.size() + (stream.has_value() ? stream->bytes : 0),
                        elapsed.count(),
                        FormatToolchainClause(opRaw, frame, namer));
 }
@@ -348,13 +368,15 @@ using ToolchainNamer = std::function<std::string(std::string_view fingerprint)>;
 /// @param reply   The reply frame, empty when none was produced.
 /// @param elapsed How long the responder took.
 /// @param namer   Resolves a fingerprint to a compiler; empty names nothing.
+/// @param stream  What a subscription pushed before @p reply; nullopt for a one-reply verb.
 inline void LogExchange(ILogger& logger,
                         std::uint8_t opRaw,
                         std::string_view peer,
                         std::span<std::byte const> frame,
                         std::span<std::byte const> reply,
                         std::chrono::milliseconds elapsed,
-                        ToolchainNamer const& namer = {})
+                        ToolchainNamer const& namer = {},
+                        std::optional<StreamTally> stream = std::nullopt)
 {
     auto const level = LogLevelForOp(opRaw);
     // This guard now covers a DECODE as well as a format, which is why it stays here
@@ -362,7 +384,7 @@ inline void LogExchange(ILogger& logger,
     // decode a compile payload for a line it is about to discard.
     if (level < logger.MinLevel())
         return;
-    logger.Log(level, FormatExchange(opRaw, peer, frame, reply, elapsed, namer));
+    logger.Log(level, FormatExchange(opRaw, peer, frame, reply, elapsed, namer, stream));
 }
 
 /// How often one peer's version refusal may be reported.

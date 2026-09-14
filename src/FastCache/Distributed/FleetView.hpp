@@ -4,6 +4,7 @@
 #include <FastCache/Cache/StorageTier.hpp>
 #include <FastCache/Cluster/ClusterState.hpp>
 #include <FastCache/Core/EnumTable.hpp>
+#include <FastCache/Core/FigureText.hpp>
 #include <FastCache/Distributed/FleetHistory.hpp>
 #include <FastCache/Distributed/SchedulerService.hpp>
 #include <FastCache/Distributed/WorkerRegistry.hpp>
@@ -308,6 +309,8 @@ struct FleetSectionRow
 {
     FleetSection section;     ///< The section this row describes.
     std::string_view key;     ///< What a reader asks for, and the marker in the full document.
+    std::string_view one;     ///< One of its rows, as a count of one names it: `1 machine`.
+    std::string_view many;    ///< Any other count of its rows: `0 machines`, `12 machines`.
     std::string_view summary; ///< One line, for whoever guessed the key wrong.
 
     /// Whether this section is a row TABLE on all three surfaces.
@@ -335,26 +338,38 @@ struct FleetSectionRow
 inline constexpr EnumTable<FleetSection, FleetSectionRow> FleetSectionTable {
     FleetSectionRow { .section = FleetSection::Kpi,
                       .key = "kpi",
+                      .one = "figure",
+                      .many = "figures",
                       .summary = "the headline figures, one row each; the page's strip",
                       .tabular = false },
     FleetSectionRow { .section = FleetSection::Machines,
                       .key = "machines",
+                      .one = "machine",
+                      .many = "machines",
                       .summary = "one row per machine; the grain a fleet total is computed over",
                       .tabular = true },
     FleetSectionRow { .section = FleetSection::Workers,
                       .key = "workers",
+                      .one = "worker",
+                      .many = "workers",
                       .summary = "one row per (toolchain, endpoint) registry entry",
                       .tabular = true },
     FleetSectionRow { .section = FleetSection::Leases,
                       .key = "leases",
+                      .one = "lease",
+                      .many = "leases",
                       .summary = "the oldest outstanding leases, bounded as the page bounds them",
                       .tabular = true },
     FleetSectionRow { .section = FleetSection::Members,
                       .key = "members",
+                      .one = "member",
+                      .many = "members",
                       .summary = "what the cluster has agreed; absent when this node runs none",
                       .tabular = true },
     FleetSectionRow { .section = FleetSection::Tiers,
                       .key = "tiers",
+                      .one = "tier",
+                      .many = "tiers",
                       .summary = "per-tier cache figures, for the tiers some member runs",
                       .tabular = true },
 };
@@ -364,6 +379,144 @@ static_assert(RowsInEnumeratorOrder(FleetSectionTable, &FleetSectionRow::section
 /// @param key The `section` value, as typed.
 /// @return The section, or absent when nothing is called that.
 [[nodiscard]] std::optional<FleetSection> FleetSectionFromKey(std::string_view key) noexcept;
+
+/// What SCALE one of the fleet document's integers is in, and so how a person reads it.
+///
+/// A machine-readable surface ignores it for a column -- a column's scale is a property of the
+/// column name, which a consumer already has -- and NAMES it for a headline figure, where the name
+/// alone cannot say whether `853` is a count or eight-hundred-and-fifty-three thousandths.
+///
+/// Public because a HUMAN surface other than the page reads it too: the terminal fleet panel writes
+/// a `/fleet.txt` cell through `FleetColumnFormat` and `HumanFleetFigure`, so a byte column is
+/// `93.65 GiB` there exactly as on the page, and no client carries a list of which column is which.
+///
+/// Transmitted by NAME only (`CellFormatTable::name`, a headline figure's unit), so the enumerator
+/// values bind nothing; the explicit `= 0` is `EnumTable`'s anchor rather than a contract.
+enum class CellFormat : std::uint8_t
+{
+    Count = 0,
+    Bytes,
+    Permille,
+    Millis,
+    Text,
+    Last,
+};
+
+/// One scale: what it is called where a machine reads it, and how a person is shown it.
+struct CellFormatRow
+{
+    CellFormat format;     ///< The enumerator this row describes.
+    std::string_view name; ///< Its machine spelling.
+    double scale { 1.0 };  ///< Applied before writing: a thousandth is a fraction, a millisecond a thousandth of a second.
+    std::optional<FigureFormat> figure {}; ///< How the scaled value is written; nullopt to show the text as sent.
+};
+
+/// One spelling and one writing per scale, so the word a consumer parses, the arm that renders it and
+/// what a person reads cannot be attached to different formats.
+inline constexpr EnumTable<CellFormat, CellFormatRow> CellFormatTable {
+    CellFormatRow { .format = CellFormat::Count, .name = "count", .scale = 1.0, .figure = FigureFormat::Count },
+    CellFormatRow { .format = CellFormat::Bytes, .name = "bytes", .scale = 1.0, .figure = FigureFormat::Bytes },
+    // Thousandths, not percent: the cell carries an integer, so a percentage with one decimal has to
+    // be scaled somewhere and the name is where a reader finds out which. `853` is 85.3 %.
+    CellFormatRow { .format = CellFormat::Permille, .name = "permille", .scale = 0.001, .figure = FigureFormat::Percent },
+    CellFormatRow { .format = CellFormat::Millis, .name = "milliseconds", .scale = 0.001, .figure = FigureFormat::Seconds },
+    CellFormatRow { .format = CellFormat::Text, .name = "text", .scale = 1.0, .figure = std::nullopt },
+};
+static_assert(RowsInEnumeratorOrder(CellFormatTable, &CellFormatRow::format));
+
+/// The scale a headline figure's unit column names.
+/// @param name The unit, as the document spells it.
+/// @return The scale, or absent for a name no row spells.
+[[nodiscard]] std::optional<CellFormat> CellFormatFromName(std::string_view name) noexcept;
+
+/// The scale of the column @p name in @p section, looked up in the tables the renderers walk.
+///
+/// **The one answer to "how does this column read"**, for a client that has only the header line of
+/// `/fleet.txt` in front of it. Every section's tables are consulted exactly as `FleetColumnNames`
+/// consults them; a tier column is recognised by its tier and suffix, as `TierColumnName` composes it.
+/// `Kpi` has no scale per column -- each of its rows names its own unit -- so it answers absent there.
+/// @param section The section the header belongs to.
+/// @param name The column's name, as the header spells it.
+/// @return The scale, or absent for a name that section does not render.
+[[nodiscard]] std::optional<CellFormat> FleetColumnFormat(FleetSection section, std::string_view name);
+
+/// How long a column is kept by a human surface too narrow to draw every column.
+///
+/// **The leader's decision, as a column of its tables**, because which columns matter is a property of
+/// the column -- `heartbeat-age` is the one that tells a live row from a dead one, `class` is detail --
+/// and a client deciding it from position or from a list of its own is the second description of the
+/// columns #1320 removed. The page and the machine-readable surfaces draw every column and ignore it.
+///
+/// Transmitted and persisted nowhere: a query's answer inside one process. Declaration order IS the keep
+/// order, so a rank is inserted at its place in it.
+enum class ColumnKeep : std::uint8_t
+{
+    Identity, ///< Says which row a line is; never dropped.
+    Vital,    ///< What the section exists to show; dropped last.
+    Useful,   ///< The default.
+    Detail,   ///< Dropped first.
+    Last,     ///< Not a rank, and has no row.
+};
+
+/// How long the column @p name in @p section is kept, looked up in the tables the renderers walk.
+///
+/// The same door as `FleetColumnFormat`, over the same tables, so the two cannot answer for different
+/// column sets.
+/// @param section The section the header belongs to.
+/// @param name The column's name, as the header spells it.
+/// @return The rank, or absent for a name that section does not render.
+[[nodiscard]] std::optional<ColumnKeep> FleetColumnKeep(FleetSection section, std::string_view name);
+
+/// How a human surface tints one cell: the page's pill colour, as a word a terminal can also act on.
+///
+/// Transmitted and persisted nowhere. `Plain` is also the answer for an absent cell, since a green
+/// pill where nobody reported is a healthy reading nobody gave.
+enum class CellTone : std::uint8_t
+{
+    Plain,   ///< No tint.
+    Fresh,   ///< A heartbeat or lease age still inside its threshold, or a worker nothing holds back.
+    Stale,   ///< Past it: stop trusting the rest of the row.
+    Limited, ///< A ceiling other than the registered one withdrew slots: somebody's machine, or its memory.
+    Alert,   ///< A figure that should be zero is not, or a limit that stops work outright.
+    Last,    ///< Not a tone.
+};
+
+/// The tone the column @p name in @p section gives the value @p number.
+///
+/// **The one place a freshness threshold is applied**: the page's pill and the terminal panel's
+/// colour both ask here, so a heartbeat cannot be amber on one and green on the other.
+/// @param section The section the header belongs to.
+/// @param name The column's name.
+/// @param number The cell's integer, in the column's scale.
+/// @return The tone; `Plain` for a column with no freshness decoration or a name the section lacks.
+[[nodiscard]] CellTone FleetCellTone(FleetSection section, std::string_view name, std::uint64_t number);
+
+/// The tone a slot limit is dressed with, wherever it is named: a fleet table's cell, the page's chip, a node panel.
+///
+/// **The one place a limit is judged**, beside the page's chip for it: `registered` is fresh, a machine's own use or
+/// its memory is limited, a full scratch disk is an alert. A surface that dresses a limit asks here, so one limit is
+/// never an alert on one screen and merely limited on another.
+/// @param limit The limit.
+/// @return The tone.
+[[nodiscard]] CellTone SlotLimitTone(SlotLimit limit) noexcept;
+
+/// The tone the column @p name in @p section gives the text @p text.
+///
+/// A limit column's text is judged by `SlotLimitTone`. A limit this build does not name is plain rather than a
+/// guess.
+/// @param section The section the header belongs to.
+/// @param name The column's name.
+/// @param text The cell's text.
+/// @return The tone; `Plain` for a column with no text decoration or a name the section lacks.
+[[nodiscard]] CellTone FleetCellTone(FleetSection section, std::string_view name, std::string_view text);
+
+/// One number of the fleet document written for a PERSON: the page's cell and the terminal panel's.
+///
+/// Never for a machine-readable surface: `/fleet.txt` and `/fleet.json` carry the integer.
+/// @param number The integer the document carries.
+/// @param format Its scale.
+/// @return The text; the integer as written for a scale with no figure format (`Text`).
+[[nodiscard]] std::string HumanFleetFigure(std::uint64_t number, CellFormat format);
 
 /// Every column name @p section renders for @p snapshot, in the order all three
 /// surfaces walk them.
@@ -415,6 +568,25 @@ static_assert(RowsInEnumeratorOrder(FleetSectionTable, &FleetSectionRow::section
 /// reworded; the key is what a scraper keyed on `/fleet.json` depends on.
 /// @return A view of the static table; never empty.
 [[nodiscard]] std::span<std::string_view const> FleetKpiKeys() noexcept;
+
+/// What a human surface other than the page needs to write one headline figure.
+///
+/// The page's `KpiTable` row, minus its projection: `/fleet.txt` carries each figure's key, value, unit
+/// and denominator, and this carries the words around them, so a terminal tile reads *Compiling now 47
+/// of 192 slots* from the same table the page writes *Compiling now 47 / 192 slots* from.
+struct FleetKpiText
+{
+    std::string_view key;    ///< The machine key; `FleetKpiKeys()` in the same order.
+    std::string_view label;  ///< What the page calls the tile.
+    std::string_view ofNoun; ///< What the denominator counts (`slots`), or empty for a figure with none.
+    std::string_view note;   ///< Words for a figure with no denominator (`not yet resolved`), or empty.
+    bool sparkline;          ///< Whether the figure carries a trend.
+    bool alertAboveZero;     ///< Whether any value above zero is worth an operator's eye, as a refusal share is.
+};
+
+/// Every headline figure's words, in the order the strip presents them.
+/// @return A view of the static table; never empty.
+[[nodiscard]] std::span<FleetKpiText const> FleetKpis() noexcept;
 
 /// Render a fleet snapshot as tab-separated text.
 ///

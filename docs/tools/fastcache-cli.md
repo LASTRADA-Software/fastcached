@@ -37,6 +37,7 @@ complaint about a flag you are no longer going to use.
 | Data port | `--addr=<host:port>`, `$FASTCACHE_ADDR`, default `127.0.0.1:6674` |
 | Admin surface | `--admin-addr=<host:port>`, `$FASTCACHE_ADMIN_ADDR` — **usually unnecessary**, see below |
 | Credential | `--token-file=<path>` (preferred) or `$FASTCACHE_TOKEN` |
+| Dashboard credential | `--dashboard-token-file=<path>`, presented by `live-stats fleet` only; no environment variable |
 
 The same `$FASTCACHE_ADDR` that `fastcache-cc` reads, so a machine configured for
 the launcher is already configured for this. A variable that is *set but empty*
@@ -48,6 +49,11 @@ machine. IPv6 literals are bracketed: `--addr=[::1]:6674`.
 Prefer `--token-file` to the environment variable. The path is not the secret;
 the file is, and an environment variable is visible to anything that can read
 this process's environment.
+
+The dashboard credential is a different secret from the data port's, and it has its
+own flag and no variable. A leader that names one (`--dashboard-token-file` on the
+node) refuses the fleet stream to a watcher that does not present it; a `cache` or
+`node` stream never asks for it.
 
 **`--admin-addr` is an override, not a requirement.** A `fastcache-compile-node`
 knows which port its admin surface bound and whether it is TLS, and it will say so
@@ -110,7 +116,7 @@ the help renders `Verbs()` grouped by `WireSpec::heading`, and
 
 | | |
 |---|---|
-| Read | `get`, `mget`, `exists`, `ttl`, `info`, `stats`, `version`, `ping`, `echo` |
+| Read | `get`, `mget`, `exists`, `ttl`, `info`, `stats`, `live-stats`, `version`, `ping`, `echo` |
 | Write | `set`, `del`, `incr`, `decr`, `incrby`, `decrby`, `expire`, `persist`, `flush` |
 | Read (memcached) | `gat`, `gats`, `inspect`, `mc-stats` |
 | Write (memcached) | `touch`, `add`, `replace`, `append`, `prepend`, `cas`, `cache-memlimit` |
@@ -459,16 +465,20 @@ classification.
 
 ## Exit codes
 
-Six outcomes, because one code cannot answer six questions:
+One code per outcome, because one code cannot answer several questions. The rows are
+`OutcomeTable`'s, word for word — `--help` renders that table, and
+`ctest -R cli-exit-code-docs` refuses this listing the moment a code, a name or a meaning
+differs from it:
 
 | | | |
 |--:|---|---|
 | 0 | `ok` | the command was answered |
-| 1 | `no` | answered, and the answer is no — a miss, or no such key |
+| 1 | `no` | the command was answered and the answer is no (a miss, or no such key) |
 | 2 | `usage` | the command line was wrong; nothing was sent |
 | 3 | `unreachable` | the server could not be reached, or the connection failed |
 | 4 | `refused` | the server answered and declined |
-| 5 | `protocol` | the reply could not be read; the peer may not be a `fastcached` |
+| 5 | `protocol` | the reply could not be read; the peer may not be a fastcached |
+| 6 | `local` | this machine could not carry the command out; the server is not implicated |
 
 The pairs that matter:
 
@@ -476,6 +486,10 @@ The pairs that matter:
   gives up on the other cannot be written if they agree.
 - **4 against 5** — the server said no, versus the server said something this
   client could not read. Different people fix those.
+- **4 against 6** — the server declined, versus this machine could not do it.
+  `live-stats` on a terminal it cannot draw on exits **6**: nothing at the server
+  is wrong, and the remedy — redirecting the output, for one line per sample — is
+  on this machine.
 - **3 against 4, pointed at a compile node** — a `fastcache-compile-node` serves no
   keyspace, so `get` there cannot work and never will. It exits **4**, not 3: the
   endpoint answered, and `3` is the code that reads as *retry, the daemon may be
@@ -550,6 +564,158 @@ numbers am I looking at* is a question a script asks too: a dashboard that canno
 tell a 127-series scrape from a 7-field reply will draw the missing 120 as
 zeroes.
 
+## `live-stats`
+
+`stats` answers once. `live-stats` keeps answering: it draws one subject on the
+terminal and redraws it at every sample, or, with its output redirected, writes one
+row per sample for a script.
+
+```console
+$ fastcache-cli live-stats                              # cache or node, whichever --addr is
+$ fastcache-cli live-stats fleet --addr=10.0.0.7:6674   # the fleet, from the node that leads it
+$ fastcache-cli live-stats node --format=tsv --samples=30 > node.tsv
+```
+
+### Three subjects, three panels
+
+| Subject | Served by | The panel |
+|---|---|---|
+| `cache` | a `fastcached`, or a `fastcache-compile-node` for its own cache tier | the hit rate, and operations, connections, evictions and expiries per second, each with its trend; connections, items and bytes in use against their limits, per storage tier |
+| `node` | a `fastcache-compile-node` | compiles and refusals per minute, the mean compile and its trend; the slots in use against the slots available and the limit that bounds them; the cache tier's fill; the host's CPU and free memory; the node's identity, toolchains, registrars and the leader |
+| `fleet` | the node that leads the fleet | the headline figures as tiles; one table per section (machines, workers, leases, members, tiers); each machine's CPU over time |
+
+The subject may be left out, and then it is what `--addr` is: a `fastcached` is
+watched as `cache`, and a compile node as `node`. **`fleet` is never inferred.** The
+node at `--addr` is a node whichever question is asked of it, and the whole fleet is
+a different question from that one machine, so it is asked for by name.
+
+A panel is laid out for the terminal it is drawn on and again whenever the terminal
+is resized. At 80x24 it draws the layout the panel was designed at. A taller terminal
+gives the rows nothing else wants to a **history chart**: the node's compiles per
+minute first, then its refusals, its CPU and its mean compile. Every band gets a row
+before any band gets a second one. A wider terminal draws a longer span, one sample
+per cell. The chart carries the same explanations at every size:
+
+- a title with the span it covers;
+- each band's newest figure and what its top stands for;
+- a time axis ending at `now`;
+- a legend.
+
+A terminal smaller than a panel's minimum gets one line, `needs <columns>x<rows>, have
+<columns>x<rows>`, rather than a frame with pieces missing.
+
+### Keys
+
+| Key | What it does |
+|---|---|
+| `q`, `Q`, `Esc`, `Ctrl-C` | quit, restoring the terminal |
+| `Tab`, `→` / `←` | the fleet's next / previous section |
+| `1` … `9` | the fleet's sections by position |
+| `m` `w` `l` `c` `t` | the fleet's sections by name: machines, workers, leases, members (`c`, for cluster: `m` is taken) and tiers |
+| `PgDn` / `PgUp`, `Home` | scroll the fleet's table a page, or back to its top |
+| `/` | filter the fleet's table: type, `Enter` keeps the filter, `Esc` clears it, `Backspace` edits it |
+
+A section starts at its top with no filter. The filter keeps the rows with a cell
+containing the typed text, ignoring ASCII case, and the table says how many rows of
+how many it kept. While a filter is being typed, every key is text except
+`Ctrl-C`, so a `q` in a machine's name does not end the session.
+
+### How it draws: Sixel, Unicode, ASCII
+
+What the terminal can draw is asked once, when the session starts, and decides
+the glyphs every panel draws with for the rest of it.
+
+| Rung | When | Charts |
+|---|---|---|
+| Sixel | the terminal advertises Sixel graphics **and** reports its cell size in pixels | an image over the chart's rows, with a colour scale in the legend |
+| Unicode | the locale names UTF-8 (`LC_ALL`, then `LC_CTYPE`, then `LANG`; on Windows, the console's output code page is 65001) | rows of block elements, `▁` for zero |
+| ASCII | anything else, including a locale that says nothing | rows of `_ . : #`, `_` for zero |
+
+A terminal that advertises Sixel but does not report its cell size gets one of the
+text rungs. An image cannot be sized in cells without the pixel size, and a guessed
+size would draw over the text around the image.
+
+On every rung **zero is not absence**. A reading of zero draws the floor mark. A
+sample that was not read, because the server did not answer or an interval could
+not be measured across a restart, leaves its cells blank. A figure nobody reported
+is drawn as `-`, or as the `--absent` text.
+
+### Piped: one row per sample
+
+When stdout is not a terminal, or `--format` names anything but `human`, nothing is
+drawn. Each sample becomes one record in the format asked for: a header row once,
+then one row per sample for `human`, `tsv` and `csv`, one JSON document per line
+for `json`, and one block per sample for `kv`. The keys are the figures the panel
+draws, under the names the panel's table gives them, so a script and the screen
+never disagree about what a figure is called.
+
+- **The header is written after the first sample that was read**, and its columns
+  never move after that. A figure the server did not report in a later sample is an
+  absent cell, not a missing column.
+- **A sample that failed is a row of absent cells**, so the time between rows stays
+  the interval. A failure before anything was read writes nothing.
+- Remarks, such as a sample that failed and why, go to stderr, as for every verb.
+
+`--samples=<n>` ends the run after `n` samples. Without it the run ends at `q` or
+`Ctrl-C` on a terminal, or at `Ctrl-C` when piped.
+
+`--interval=<ms>` sets the time between samples. It defaults to 2000 for `cache`
+and `node` and 5000 for `fleet`. It must lie between the subject's floor (500 for
+`cache` and `node`, 1000 for `fleet`) and 60000; a value outside is refused before
+anything is sent, naming the bound, rather than quietly changed. The title's
+`every` states the cadence the server **granted**. A server of another build that
+grants a different one says so in a remark.
+
+### Where the samples come from
+
+`live-stats` **subscribes over the `0xFC` wire** on `--addr`, the port `node` and
+`fleet` already use. The server pushes a sample at every tick until the session
+ends. Nothing is polled and no HTTP is spoken:
+
+- **no `--admin-listen` is needed** on the node, and no `/metrics` or `/fleet.txt` is
+  fetched;
+- a `cache` or `node` sample is a binary snapshot of the same model `/metrics`
+  renders as text, a small fraction of the text's size;
+- a `fleet` sample is the leader's fleet text, the same body `/fleet.txt` serves.
+
+A `fastcached` serves the `cache` subject. It refuses `node` and `fleet` by name,
+since it is not a compile node.
+
+Who may subscribe follows the verbs' own rules:
+
+- **`cache` and `node`** are served to **fleet members**, exactly as `node` and
+  `node-metrics` are. Loopback is always a member, and a remote client is refused
+  `not-a-member` until the node names it with `--fleet-member`. Membership is asked
+  again at every tick, so a member removed by a reload stops receiving samples. On a
+  daemon with `--requirepass`, a session that never authenticated loses its stream
+  when the password takes effect.
+- **`fleet`** needs the dashboard's credential when the node was started with
+  `--dashboard-token-file`: pass the same secret with
+  `fastcache-cli live-stats fleet --dashboard-token-file=<path>`. It is its own
+  flag, never `--token-file`, because the dashboard's credential is a secret of its
+  own on the node, and it has no environment variable. A node with no token file
+  streams the fleet to **this machine only**, because the fleet names every machine
+  and where it answers.
+- **Only the leader serves `fleet`.** A follower answers with the leader's address,
+  and `live-stats` subscribes there instead. It follows at most two such redirections
+  in a row, and the count starts again at every retry from `--addr`.
+
+What ends a session and what is only a gap:
+
+| What happened | Outcome |
+|---|---|
+| no leader is known yet, the server is at its subscriber limit, or the stream is lost, goes silent or is ended by the server | a gap in the samples with its reason in a remark, then a new subscription at `--addr` one interval later |
+| the server's wire version, or its set of verbs, is not this build's | the session ends, exit **5**, naming the upgrade, even after samples were read: retrying cannot succeed |
+| a frame this build cannot read | the session ends, exit **5** |
+| any other refusal, such as not a member or a wrong or missing credential | before any sample was read, the session ends, exit **4**, naming `--token-file` (cache or node), `--dashboard-token-file` (fleet) or the node's `--fleet-member`; after one, a gap and a retry |
+
+A refusal about the caller ends a session only while nothing has been read: once a
+sample was, a refusal is a moment in the view's history, such as a member being
+removed and restored by a reload, and the view keeps going. A session that read at
+least one sample exits **0** when it ends by `q`, `Ctrl-C` or `--samples`; one
+that never did exits with the outcome of its first failure. `--dashboard-token-file`
+is sent on a `fleet` subscription only.
+
 ## Authentication
 
 `--requirepass` on the daemon gates the RESP surface. Present the credential with
@@ -616,7 +782,8 @@ Stated so it is not rediscovered:
 - **The memcached verbs are not routed over the binary protocol.** That protocol
   has SASL and would let them work under `--requirepass`, and doing so is out of
   scope here rather than impossible.
-- **No REPL and no live view yet.** One command per invocation, which composes
-  with `watch`, `ssh` and a pipe.
+- **No REPL.** One command per invocation, which composes with `ssh` and a pipe;
+  `live-stats` is the one command that keeps running, and it still answers one
+  subject.
 - `CONFIG GET` and `CLIENT LIST` are deliberately not exposed: the daemon answers
   both with stubs, and relaying a stub as fact is worse than not offering it.

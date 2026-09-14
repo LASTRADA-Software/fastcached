@@ -13,13 +13,6 @@ namespace FastCache::Cli
 
 namespace
 {
-    /// The field naming which source answered.
-    ///
-    /// On stdout rather than only in a remark: *which numbers am I looking at* is a
-    /// question a script asks too, and a dashboard that cannot tell a 102-counter
-    /// reading from a 7-field one will draw the second as if the missing 95 were zero.
-    constexpr std::string_view SourceFieldName = "source";
-
     /// Split @p text into lines, tolerating both LF and CRLF.
     /// @param text The body.
     /// @return The lines, without terminators.
@@ -153,8 +146,9 @@ Answer ChooseStats(std::span<StatsAttempt const> attempts)
         auto chosen = *attempt->record;
         // The source is prepended rather than appended so it is the first thing a
         // human sees and the first key in the JSON object.
-        chosen.fields.insert(chosen.fields.begin(),
-                             Field { .name = std::string { SourceFieldName }, .value = TextCell(std::string { row.name }) });
+        chosen.fields.insert(
+            chosen.fields.begin(),
+            Field { .name = std::string { StatsSourceFieldName }, .value = TextCell(std::string { row.name }) });
 
         auto answer = Answered(std::move(chosen));
         if (!row.caveat.empty())

@@ -8,7 +8,9 @@
 
 #include <FastCache/Net/ISocket.hpp>
 
+#include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <expected>
 #include <memory>
 #include <optional>
@@ -185,14 +187,48 @@ class NodeExchange final: public INodeExchange
     /// @return The remarks, in the order they were made.
     [[nodiscard]] std::span<std::string const> Advisories() const noexcept;
 
+    /// Send one framed request and read nothing: the first half of a stream (#1399).
+    ///
+    /// `Send` reads to a TERMINAL status, which a `SUBSCRIBE` sends only when its stream ends -- so a
+    /// stream is this, then `ReadFrame` once per frame.
+    /// @param request The framed request.
+    /// @return Nothing once it is sent, or why it could not be.
+    [[nodiscard]] std::expected<void, ExchangeError> Post(std::span<std::byte const> request);
+
+    /// Read exactly one frame of a STREAM, whatever its status.
+    ///
+    /// A failure is told in a stream's words -- `the stream was lost`, `the server closed the stream` -- and
+    /// never `Send`'s: a subscription has no reply, so *closed without answering* after thirty pushes names
+    /// a fault it did not have.
+    /// @return The frame, or why there is none.
+    [[nodiscard]] std::expected<NodeReply, ExchangeError> ReadFrame();
+
+    /// Wait no longer than @p deadline for each read from now on.
+    /// @param deadline The bound on one read.
+    void SetReceiveDeadline(std::chrono::milliseconds deadline) noexcept;
+
+    /// Half-close: say this end has finished sending.
+    ///
+    /// Safe while `ReadFrame` blocks on another thread -- it is one `shutdown(2)` on the descriptor,
+    /// which a blocked receive does not share state with -- and it is the ordinary way a watcher leaves.
+    void ShutdownWrite() noexcept;
+
   private:
     /// @param socket The connected socket.
     /// @param endpoint What to call this connection in a diagnostic.
     NodeExchange(std::unique_ptr<ISocket> socket, std::string endpoint) noexcept;
 
-    /// Read exactly one framed reply, whatever its status.
-    /// @return The reply, or why there is none.
-    [[nodiscard]] std::expected<NodeReply, ExchangeError> ReadFrame();
+    /// What one read is of, for the words its failure is told in. Private to this class; never transmitted.
+    enum class Reading : std::uint8_t
+    {
+        Reply,  ///< One exchange's answer, which `Send` reads.
+        Stream, ///< One frame of a subscription, which `ReadFrame` reads.
+    };
+
+    /// Read exactly one frame.
+    /// @param reading What the frame is part of.
+    /// @return The frame, or why there is none.
+    [[nodiscard]] std::expected<NodeReply, ExchangeError> ReadOne(Reading reading);
 
     std::unique_ptr<ISocket> _socket;
     std::string _endpoint;
@@ -229,6 +265,16 @@ struct AdminError
     AdminFailure kind { AdminFailure::Unreachable }; ///< Which way it failed.
     std::string detail;                              ///< What to tell the operator.
 };
+
+/// What an admin fetch that produced no document means as an outcome.
+///
+/// One mapping for every reader of the admin surface. Nothing answered is `Unreachable`; a surface
+/// that answered and declined -- a follower naming its leader, a section it does not have -- is
+/// `Refused`, and the server's own words stay in `AdminError::detail`. They are different exit
+/// codes with different remedies, so the choice is made once rather than per caller.
+/// @param failure Which way the fetch failed.
+/// @return The outcome.
+[[nodiscard]] Outcome OutcomeOf(AdminFailure failure) noexcept;
 
 /// Fetch one document from the endpoint's own admin surface.
 ///

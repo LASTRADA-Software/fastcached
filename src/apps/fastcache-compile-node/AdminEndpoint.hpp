@@ -12,6 +12,7 @@
 #include <FastCache/Metrics/PrometheusFormatter.hpp>
 #include <FastCache/Net/BlockingSocket.hpp>
 #include <FastCache/Platform/HostInfo.hpp>
+#include <FastCache/Platform/HostLoad.hpp>
 #include <FastCache/Server/AdminCredential.hpp>
 #include <FastCache/Server/AdminHttpServer.hpp>
 
@@ -64,6 +65,15 @@ struct NodeScrapeSources
     /// The same source the advertised capacity came from, so a scrape and a
     /// registration cannot disagree about the machine they describe.
     IHostFactsSource const* host {};
+    /// Where the machine's moving figures come from -- CPU counters and available memory --
+    /// or **null** for a snapshot that carries no load.
+    ///
+    /// A counter source rather than an `IHostLoadSampler`, and that is the whole design: a
+    /// sampler holds the previous CPU reading, so the scrape, every live subscription and the
+    /// heartbeat would each see the interval the last of them left. The raw counters travel
+    /// instead and every reader differences its own two readings (`HostLoadReading`). Its
+    /// own instance, never the heartbeat sampler's source, which that sampler owns.
+    IHostCounterSource* load {};
     /// How many compiles are running right now.
     ///
     /// A callable rather than a `WorkerServer const*`, and the reason is testing
@@ -607,6 +617,8 @@ struct AdminSurface
 /// @param logger Where to announce the bound address.
 /// @return The surface (whose endpoint is null when none was asked for), or why
 ///         it could not be served.
+/// @param credential The dashboard credential, from `LoadDashboardCredentialOrExplain`; a default
+///        one when no token file is named.
 [[nodiscard]] std::expected<AdminSurface, std::string> StartAdminSurfaceOrExplain(
     NodeConfig const& cfg,
     IHostFactsSource const& host,
@@ -614,6 +626,18 @@ struct AdminSurface
     AdminHttpServer::SnapshotProvider snapshot,
     std::optional<Distributed::FleetSources> fleet,
     FleetSampler const* sampler,
+    AdminCredential const& credential,
     ILogger& logger);
+
+/// Read the dashboard credential `--dashboard-token-file` names, once, for every surface that
+/// guards the fleet with it.
+///
+/// **Once, and handed to both**, because two surfaces guard one fleet map with it -- `/fleet` over
+/// HTTP and the fleet subject of a live-stats subscription over `0xFC` -- and two reads of one file
+/// are two answers that can disagree, a few milliseconds apart, about whether the map is guarded.
+/// @param cfg The parsed configuration.
+/// @return The credential -- a default one when no file is named -- or why the file could not be
+///         used. An unreadable file is refused, never read as "no credential".
+[[nodiscard]] std::expected<AdminCredential, std::string> LoadDashboardCredentialOrExplain(NodeConfig const& cfg);
 
 } // namespace FastCache::Node

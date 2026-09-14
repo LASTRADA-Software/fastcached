@@ -183,13 +183,20 @@ struct RemoteKindSpec
     /// no frame came back, so nothing was established that the caller's own transport
     /// diagnostic does not already say, and there is nothing here to correct it with.
     std::optional<Outcome> established;
+
+    /// What this kind is called where one name must stand for the endpoint: a live panel's title.
+    ///
+    /// `FastcacheWireOnly` is named `fastcached` although a node older than the operator verbs
+    /// classifies the same way: a title is only drawn over a granted live-stats stream, and a
+    /// node that old grants none. Empty for a kind that is no fastcache at all.
+    std::string_view product;
 };
 
 /// What each kind establishes, one row per enumerator, in enumerator order.
 inline constexpr EnumTable<RemoteKind, RemoteKindSpec> RemoteKindTable { {
-    { .kind = RemoteKind::CompileNode, .established = Outcome::Refused },
-    { .kind = RemoteKind::FastcacheWireOnly, .established = Outcome::Refused },
-    { .kind = RemoteKind::NotFastcacheWire, .established = std::nullopt },
+    { .kind = RemoteKind::CompileNode, .established = Outcome::Refused, .product = "fastcache-compile-node" },
+    { .kind = RemoteKind::FastcacheWireOnly, .established = Outcome::Refused, .product = "fastcached" },
+    { .kind = RemoteKind::NotFastcacheWire, .established = std::nullopt, .product = "" },
 } };
 
 static_assert(RowsInEnumeratorOrder(RemoteKindTable, &RemoteKindSpec::kind),
@@ -200,6 +207,19 @@ static_assert(RowsInEnumeratorOrder(RemoteKindTable, &RemoteKindSpec::kind),
 /// @return The outcome it proves, or nothing when it proves nothing new.
 [[nodiscard]] std::optional<Outcome> EstablishedBy(RemoteKind kind) noexcept;
 
+/// What a reply to `NodeStatus` establishes about the endpoint that sent it.
+///
+/// **The one classification, and there are two askers.** `ProbeRemote` asks on the
+/// failure path; `LadderGatherer` asks once and caches the answer, because two rungs of
+/// the stats ladder and `live-stats`' subject inference all need the same fact. They
+/// used to decide it separately -- the probe returned a `RemoteKind`, the gatherer
+/// returned a sentence -- which is one decision written twice, free to drift apart the
+/// day either is edited. Both classify through this now, so an endpoint the probe calls
+/// a compile node is one the gatherer calls a compile node.
+/// @param reply What the endpoint sent, or why nothing came back.
+/// @return What that makes it.
+[[nodiscard]] RemoteKind ClassifyNodeStatusReply(std::expected<NodeReply, ExchangeError> const& reply) noexcept;
+
 /// Ask an endpoint what it is.
 ///
 /// One round trip, on the FAILURE path only: the common case never pays for it, which
@@ -208,6 +228,58 @@ static_assert(RowsInEnumeratorOrder(RemoteKindTable, &RemoteKindSpec::kind),
 /// @param node The `0xFC` connection to ask on.
 /// @return What it turned out to be.
 [[nodiscard]] RemoteKind ProbeRemote(INodeExchange& node);
+
+/// What an endpoint is, as far as a verb must know before it asks anything else.
+///
+/// **Typed, because the untyped version collapsed three states into one.** The answer
+/// used to be `std::expected<NodeStatusFields, std::string>`, whose error side carried
+/// *no `0xFC` connection was opened*, *nothing came back* and *it speaks `0xFC` and
+/// serves no node verbs* as three sentences of one type -- distinguishable only by their
+/// wording. A verb that must decide from them (`live-stats` inferring its subject) would
+/// have had to match on prose, and the one it must never confuse is the first: an
+/// endpoint nobody could ask is not a cache, and inferring `cache` for it reports
+/// *`INFO` did not answer* against a port that may speak no RESP at all.
+struct EndpointIdentity
+{
+    /// What it turned out to be, or nullopt when no `0xFC` connection was opened.
+    ///
+    /// **Disengaged rather than a fourth enumerator.** `RemoteKind` classifies an answer,
+    /// and *nobody could ask* is the absence of one -- `ProbeRemote` can never return it,
+    /// and `RemoteKindTable`'s `established` column has nothing to say about it.
+    std::optional<RemoteKind> kind {};
+
+    /// The identification in words for a person, naming the address.
+    std::string detail {};
+
+    /// Whether this is a compile node whose own description this client could not read.
+    ///
+    /// **Still a node** -- `kind` says so, and a verb inferring a subject must not drift to
+    /// `cache` for a port that speaks no RESP -- but not one this client can watch: a node
+    /// answering `NodeStatus` in a shape this build cannot decode is, overwhelmingly, a node on
+    /// another `0xFC` wire version, and every exchange a session would take with it is suspect
+    /// for the same reason. A field rather than a sentence, so a verb deciding whether to start
+    /// asks it instead of matching on `detail`.
+    bool unreadable { false };
+};
+
+/// Where a verb learns what the endpoint is.
+///
+/// Injected, like every other collaborator a verb reaches: `LadderGatherer` implements it
+/// from the identification it already caches, so asking costs no second round trip.
+class IEndpointIdentity
+{
+  public:
+    IEndpointIdentity() = default;
+    IEndpointIdentity(IEndpointIdentity const&) = delete;
+    IEndpointIdentity(IEndpointIdentity&&) = delete;
+    IEndpointIdentity& operator=(IEndpointIdentity const&) = delete;
+    IEndpointIdentity& operator=(IEndpointIdentity&&) = delete;
+    virtual ~IEndpointIdentity() = default;
+
+    /// What the endpoint is.
+    /// @return The identification; asked once and remembered by implementations that dial.
+    [[nodiscard]] virtual EndpointIdentity IdentifyEndpoint() = 0;
+};
 
 /// What to tell an operator whose verb could not be answered by @p kind.
 ///

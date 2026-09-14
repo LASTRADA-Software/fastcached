@@ -5251,6 +5251,47 @@ set_tests_properties("istreambuf-iterator-selftest" PROPERTIES
     TIMEOUT 180
 )
 
+# No first-party C++ calls a range algorithm `Core/Ranges.hpp` wraps directly --
+# `std::ranges::iota` is `Ranges::Iota`, `std::ranges::fold_left` is `Ranges::FoldLeft`.
+#
+# AppleClang's own libc++ has no `std::ranges::iota`, and the one job that compiles with it,
+# `Package (macOS .pkg)`, is not a required context: PR #1392 went red there with every
+# required check green. So a direct call merges and breaks packaging afterwards, which is why
+# this is in the DEFAULT set. The wrapped set is DERIVED from the header's selection blocks,
+# the file set from git minus the third-party roots, and the header and its test are the only
+# exemption.
+add_test(
+    NAME "ranges-seam"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DGIT_EXECUTABLE=${GIT_EXECUTABLE}"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-ranges-seam.cmake"
+)
+set_tests_properties("ranges-seam" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 120
+)
+
+# And that check must be SEEN to refuse, seen to stay quiet, and seen to fail closed, over
+# synthetic trees in both enumeration modes; the run prints how many. Among them: a selection
+# block ADDED to the staged header plus a call to what it wraps, refused with no edit to the
+# check -- the case a restated list of facilities would fail -- and a file merely sharing the
+# seam test's name elsewhere, refused.
+add_test(
+    NAME "ranges-seam-selftest"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DGIT_EXECUTABLE=${GIT_EXECUTABLE}"
+        "-DFASTCACHED_SCRATCH_DIR=${CMAKE_CURRENT_BINARY_DIR}/ranges-seam-selftest"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-ranges-seam-selftest.cmake"
+)
+set_tests_properties("ranges-seam-selftest" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 180
+)
+
 # A retained wall clock is a `WallClockRef`, never a raw `IWallClock` pointer or
 # reference member (#1032). The TYPE is the guard -- `WallClockRef` refuses to be built
 # from an rvalue, and the `static_assert` pairs in `Core/WallClockRef_test.cpp` and
@@ -6368,6 +6409,47 @@ set_tests_properties("cli-text-cell-selftest" PROPERTIES
     TIMEOUT 180
 )
 
+# fastcache-cli asks neither the environment nor the terminal anything itself (#134 §9.11).
+#
+# `live-stats` is HANDED what a terminal can draw (`TerminalCapabilities`) and reads the
+# environment only through `Platform/Environment` from `main`. A `getenv`, `isatty`,
+# `ioctl` or `GetConsoleMode` under `src/apps/fastcache-cli/` draws the right frame on the
+# machine it was tested on and passes every behavioural test, so the clause is a scan.
+# Exemptions are rows with reasons in `scripts/cli-ambient-read-exemptions.txt`, and a row
+# that no longer describes the tree is refused. It fails closed: the same scanner must
+# recognise a read in `src/FastCache/Platform/`, where these calls live.
+#
+# DEFAULT set: no compiler, no daemon, no socket.
+add_test(
+    NAME "cli-ambient-reads"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DGIT_EXECUTABLE=${GIT_EXECUTABLE}"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-cli-ambient-reads.cmake"
+)
+set_tests_properties("cli-ambient-reads" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 120
+)
+
+# And that check must be seen to refuse a planted read of each token, to accept prose, and
+# to refuse a stale, reasonless or malformed exemption row -- in both enumeration modes,
+# since a synthetic tree takes the directory walk while CI takes git.
+add_test(
+    NAME "cli-ambient-reads-selftest"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DGIT_EXECUTABLE=${GIT_EXECUTABLE}"
+        "-DFASTCACHED_SCRATCH_DIR=${CMAKE_CURRENT_BINARY_DIR}/cli-ambient-reads-selftest"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-cli-ambient-reads-selftest.cmake"
+)
+set_tests_properties("cli-ambient-reads-selftest" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 180
+)
+
 # ----------------------------------------------------------------------------
 # vendor/ is still byte-for-byte what was imported (#134).
 #
@@ -6448,6 +6530,10 @@ endif()
 # A third pins the readiness half: "Runtime delivers a scripted input event to a
 # waiting flow" wakes on a pushed key with no clock advancing and no timer anywhere,
 # which is what fails against any `SleepUntil(now + interval)` implementation.
+#
+# The same binary carries endo's `TerminalQuery_test.cpp` (#1375, a declared local change):
+# queries keep the input they read, time out on an injected clock, and say NotAsked or NoReply
+# rather than returning a value that stands for both.
 #
 # ONE ctest entry running the whole binary rather than `catch_discover_tests`,
 # deliberately: per-case registration would put upstream's case names into this
@@ -6645,4 +6731,131 @@ else()
         "only an MSVC Debug CRT raises the assert dialog this canary proves gone, and this build is not one")
     fastcached_register_skipped_test("error-popup-product-canary"
         "only an MSVC Debug CRT has an assert report mode to route, and this build is not one")
+endif()
+
+# The vendored vocabulary stays in vendor/ (#1377). Building endo's `runtime/` (#1374) put
+# `coro::Task`, `coro::Cancellation` and `endo::platform::IClock` into the link beside our
+# own, and the vendored include root is exposed PUBLIC with `coro/` and `platform/` beside
+# `tui/`, so no arrangement of the target can keep first-party code out of them. Fails when
+# anything under src/, tests included, reaches `<coro/...>` or `<platform/Clock.hpp>`, by
+# spelling or through a vendored header, outside the adapter layer's exemption rows.
+# scripts/check-vendor-vocabulary.cmake carries the tables and says in its refusal what the
+# rule does not cover.
+#
+# Default set, for net-boundary's reason: no daemon, no socket, no compiler, and no skip path,
+# since the source tree and vendor/ are both present in an exported tarball. Its zero has a
+# positive control: a vendored header known to reach `coro/` is walked by the same reader and
+# must be seen to reach it, or the run refuses rather than reporting a clean src/.
+add_test(
+    NAME "vendor-vocabulary"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-vendor-vocabulary.cmake"
+)
+set_tests_properties("vendor-vocabulary" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 60
+)
+
+# The shipped tree reaches none of the vocabulary, so the real run only ever shows the
+# accepting direction. Everything about refusing is shown here, over synthesised trees
+# under a scratch directory: every forbidden spelling, the closure at one and two hops, a
+# first-party file shadowing a vendored one, both ways an exemption row goes stale, a dead
+# control, and a scan of nothing. Each case has been WATCHED to fail: every mutant of the check
+# tried reddens exactly the cases it should and no others, and the unmutated check reddens none.
+add_test(
+    NAME "vendor-vocabulary-selftest"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DFASTCACHED_SCRATCH_DIR=${CMAKE_CURRENT_BINARY_DIR}/vendor-vocabulary-selftest"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-vendor-vocabulary-selftest.cmake"
+)
+set_tests_properties("vendor-vocabulary-selftest" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 60
+)
+
+# `vendor-verbatim` told a declared local change from an accidental edit only in its refusal
+# TEXT: regenerating the manifest silenced it for any edit, declared or not (found landing
+# #1375, the first local change this tree carries). The manifest now records each file's
+# upstream hash and a regeneration carries it forward, and every file that differs from
+# upstream must be named by a row of VENDOR.md's "Local changes" table. This drives synthetic
+# trees through edits, regenerations, declarations and re-syncs, and asserts WHICH verdict each
+# gets. Each case has been watched to fail under a mutant of the check that removes what it pins.
+add_test(
+    NAME "vendor-verbatim-selftest"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DFASTCACHED_SCRATCH_DIR=${CMAKE_CURRENT_BINARY_DIR}/vendor-verbatim-selftest"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-vendor-verbatim-selftest.cmake"
+)
+set_tests_properties("vendor-verbatim-selftest" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 120
+)
+
+# ---------------------------------------------------------------------------
+# The exit codes the fastcache-cli page lists are OutcomeTable's, code, name and meaning.
+#
+# `--help` renders the table and cannot drift; the operator page restated six codes and
+# their count by hand, and #134 added a seventh. Reads `OutcomeTable`'s literal in
+# `src/apps/fastcache-cli/CliAnswer.hpp` and the `## Exit codes` section of
+# `docs/tools/fastcache-cli.md`, so renaming either is a refusal here, by design.
+add_test(
+    NAME "cli-exit-code-docs"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-cli-exit-code-docs.sh"
+            "${CMAKE_SOURCE_DIR}"
+)
+set_tests_properties("cli-exit-code-docs" PROPERTIES
+    LABELS "hygiene;docs-subject"
+    TIMEOUT 60
+)
+
+# And the verdicts, against synthetic trees: every way the two can disagree, a decoy
+# beside each bounded read, and both ways the reader can fail to LOOK.
+add_test(
+    NAME "cli-exit-code-docs-selftest"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-cli-exit-code-docs.sh" --self-test
+)
+set_tests_properties("cli-exit-code-docs-selftest" PROPERTIES
+    LABELS "hygiene"
+    TIMEOUT 60
+)
+
+# The vendored TUI is sanitized in the OBJECTS, not only on a compile line (#134). Until the
+# target-by-target block after `include(Sanitizers)` in the top-level CMakeLists.txt, every
+# `vendor/` target was declared before the directory-scoped sanitizer options and built with none,
+# while the configure printed "Enabling". This reads the objects `fastcache-tui-objects` produced
+# for the undefined init reference each enabled sanitizer leaves, beside a CONTROL object compiled
+# in the same configuration with `-fno-sanitize=all`, which must come back without it -- so the
+# reader is watched saying "absent" as well as "present". ASan and TSan only: UBSan leaves no
+# per-object init to read, and MSVC has no `nm`.
+if(TARGET fastcache-tui-objects AND (ENABLE_SANITIZER_ADDRESS OR ENABLE_SANITIZER_THREAD) AND NOT MSVC AND CMAKE_NM)
+    add_library(sanitizer-absent-probe OBJECT SanitizerAbsentProbe.cpp)
+    target_compile_options(sanitizer-absent-probe PRIVATE -fno-sanitize=all)
+    set(_fcSanitizerInitSymbols "")
+    if(ENABLE_SANITIZER_ADDRESS)
+        list(APPEND _fcSanitizerInitSymbols "__asan_init")
+    endif()
+    if(ENABLE_SANITIZER_THREAD)
+        list(APPEND _fcSanitizerInitSymbols "__tsan_init")
+    endif()
+    list(JOIN _fcSanitizerInitSymbols "|" _fcSanitizerInitSymbols)
+    add_test(
+        NAME "vendor-sanitized"
+        COMMAND ${CMAKE_COMMAND}
+            "-DFASTCACHED_NM=${CMAKE_NM}"
+            "-DFASTCACHED_SYMBOLS=${_fcSanitizerInitSymbols}"
+            "-DFASTCACHED_INSTRUMENTED=$<JOIN:$<TARGET_OBJECTS:fastcache-tui-objects>,|>"
+            "-DFASTCACHED_UNINSTRUMENTED=$<JOIN:$<TARGET_OBJECTS:sanitizer-absent-probe>,|>"
+            -P "${CMAKE_SOURCE_DIR}/scripts/check-sanitized-objects.cmake"
+    )
+    set_tests_properties("vendor-sanitized" PROPERTIES
+        FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+        LABELS "hygiene"
+        TIMEOUT 120
+    )
 endif()

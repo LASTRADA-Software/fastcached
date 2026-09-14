@@ -422,6 +422,7 @@ Present only when the process has a cache, which for `fastcached` is always.
 | `fastcached_evictions_total` | Entries dropped to stay inside that budget. Sustained evictions with a falling hit ratio mean the working set no longer fits. |
 | `fastcached_evicted_unfetched_total` | Entries evicted before ever being read — capacity spent on values nobody wanted. |
 | `fastcached_expired_unfetched_total` | Entries that lapsed before ever being read. |
+| `fastcached_expirations_total` | Entries removed because their TTL lapsed, whichever path removed them: a lookup or a write that met one, or the expiry cycle. The unfetched series above is the part of this nobody read, and `fastcached_expiry_keys_reclaimed_total` is the cycle's share alone. |
 | `fastcached_write_errors_total` | Value writes that failed to persist: a full disk, an I/O error, a read-only mount, a damaged store. **This one is about the disk.** See [When a store reports Corrupt](corrupt-store.md). |
 
 #### Per tier
@@ -515,6 +516,7 @@ is where they are explained one by one.
 | Series | Says |
 |---|---|
 | `fastcached_uptime_seconds` | Seconds since this process started. A gauge; a reset is a restart. |
+| `fastcached_build_info` | The build this process runs, as `fastcached_build_info{version="0.4.1"} 1`. The value is always 1 and the version is the label, so a query joins on it rather than reading a number. |
 | `fastcached_metrics_catalogue_skew` | How many counters this build's metrics catalogue names that its sink has no slot for. A gauge, and **zero on any correctly built process** -- a nonzero reading means the catalogue and the sink were compiled against different versions of the counter enum, so the binary is inconsistent and every counter at the affected ordinals is missing from this scrape rather than reading zero. Alert on `> 0`. |
 
 This table is checked against the exposition the daemon actually renders — see

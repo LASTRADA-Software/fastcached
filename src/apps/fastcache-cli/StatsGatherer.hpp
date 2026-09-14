@@ -2,6 +2,7 @@
 #pragma once
 
 #include "CliEndpoint.hpp"
+#include "NodeClient.hpp"
 #include "RespClient.hpp"
 #include "StatsSource.hpp"
 
@@ -17,7 +18,7 @@ namespace FastCache::Cli
 /// The impure half of the ladder, kept apart from `StatsSource.hpp`'s decision so that
 /// `ChooseStats` -- which is where all the interesting behaviour is -- needs no socket
 /// to test. This class does the opposite: it is all socket and no decision.
-class LadderGatherer final: public IStatsGatherer, public IAdminDocument
+class LadderGatherer final: public IStatsGatherer, public IAdminDocument, public IEndpointIdentity
 {
   public:
     /// @param admin Where `/metrics` is; an unconfigured endpoint means *do not ask*,
@@ -47,13 +48,35 @@ class LadderGatherer final: public IStatsGatherer, public IAdminDocument
     ///
     /// Public because a VERB needs it, where `ResolveAdmin` below stays private: the
     /// address is this class's business and the document is the caller's. It reuses
-    /// the identity `Identify()` already cached, so a verb pays no second `NodeStatus`
+    /// the identity `Identified()` already cached, so a verb pays no second `NodeStatus`
     /// round trip for asking.
     /// @param path An absolute path, query string included.
     /// @return The body, or why there is none.
     [[nodiscard]] std::expected<std::string, AdminError> FetchAdmin(std::string_view path) override;
 
+    /// What the endpoint is, typed.
+    ///
+    /// The same single `NodeStatus` round trip the ladder's rungs share, so a verb asking
+    /// this and then gathering pays for one identification, not two.
+    /// @return The identification.
+    [[nodiscard]] EndpointIdentity IdentifyEndpoint() override;
+
   private:
+    /// Both views of one identification, decided together.
+    ///
+    /// ONE cache rather than two beside each other, because they describe one fact: the
+    /// fields the admin rung reads and the kind a verb decides a subject from are written
+    /// in the same statement, so they cannot describe two different answers. The reason
+    /// there are no fields is `endpoint.detail`, held once.
+    struct Identification
+    {
+        /// The node's own description, or nullopt when there is none -- what the rungs read.
+        std::optional<CompileCacheWire::NodeStatusFields> fields;
+
+        /// What the endpoint is, typed, and in words -- what a verb reads.
+        EndpointIdentity endpoint;
+    };
+
     /// What the endpoint is, asked ONCE and remembered.
     ///
     /// **One round trip serves two rungs**, and that is not an optimisation -- it is
@@ -68,8 +91,8 @@ class LadderGatherer final: public IStatsGatherer, public IAdminDocument
     /// rather than *did not answer* against a daemon -- an endpoint that cannot serve a
     /// verb was not consulted about it, and saying otherwise sends an operator to check
     /// a component that is not there.
-    /// @return The node's own description, or why there is none.
-    [[nodiscard]] std::expected<CompileCacheWire::NodeStatusFields, std::string> const& Identify();
+    /// @return Both views of the identification.
+    [[nodiscard]] Identification const& Identified();
 
     /// Where the admin surface is, asking the node when the operator named nowhere.
     ///
@@ -104,9 +127,10 @@ class LadderGatherer final: public IStatsGatherer, public IAdminDocument
     std::optional<std::string> _bearer;
     IExchange* _resp;
     INodeExchange* _node;
-    /// `Identify`'s answer, computed on first use. Cached because it is the SAME fact
-    /// for both rungs and a second ask is a second request a daemon refuses.
-    std::optional<std::expected<CompileCacheWire::NodeStatusFields, std::string>> _identity;
+    /// `Identified`'s answer, computed on first use. Cached because it is the SAME fact
+    /// for both rungs and for a verb's subject, and a second ask is a second request a
+    /// daemon refuses.
+    std::optional<Identification> _identification;
 };
 
 } // namespace FastCache::Cli

@@ -344,6 +344,83 @@ TEST_CASE("A node with no cache tier reports no cache", "[node][admin][cache]")
     CHECK(Unwrap(snapshot.host).busySlots == 2);
 }
 
+namespace
+{
+/// A counter source whose readings advance by a fixed step per call, so a second snapshot is
+/// seen to be a second READ rather than the first one remembered.
+class SteppingCounters final: public IHostCounterSource
+{
+  public:
+    [[nodiscard]] std::optional<CpuTicks> Cpu() override
+    {
+        ++_calls;
+        return CpuTicks { .busy = 100 * _calls, .total = 1000 * _calls };
+    }
+    [[nodiscard]] std::optional<std::uint64_t> AvailableMemoryBytes() override
+    {
+        return std::nullopt;
+    }
+    [[nodiscard]] std::optional<std::uint64_t> FreeScratchBytes() override
+    {
+        return 1;
+    }
+
+  private:
+    std::uint64_t _calls { 0 };
+};
+} // namespace
+
+TEST_CASE("A node's snapshot carries the raw load counters, read per snapshot", "[node][admin]")
+{
+    // Raw, and read again per snapshot: a utilization would need a baseline, and a baseline the
+    // scrape, every subscriber and the heartbeat all move is an interval nobody can read. Each
+    // reader differences its own two readings instead.
+    ScrapeHost host;
+    SteppingCounters counters;
+    auto const provider = MakeNodeSnapshotProvider(NodeScrapeSources { .host = &host,
+                                                                       .load = &counters,
+                                                                       .busySlots = [] { return std::size_t { 1 }; },
+                                                                       .cache = nullptr,
+                                                                       .slots = 4,
+                                                                       .scratchRoot = std::filesystem::path { "." },
+                                                                       .consensus = {} },
+                                                   std::chrono::steady_clock::now());
+
+    auto const first = provider();
+    REQUIRE(first.hostLoad.has_value());
+    CHECK(Unwrap(first.hostLoad).cpu == std::optional { CpuTicks { .busy = 100, .total = 1000 } });
+    // What the platform would not say stays unsaid, never a zero.
+    CHECK_FALSE(Unwrap(first.hostLoad).availableMemoryBytes.has_value());
+
+    auto const second = provider();
+    REQUIRE(second.hostLoad.has_value());
+    CHECK(Unwrap(second.hostLoad).cpu == std::optional { CpuTicks { .busy = 200, .total = 2000 } });
+    // And the pair is exactly what a reader needs: 10% busy over the interval between them.
+    CHECK(CpuBusyPermille(Unwrap(Unwrap(first.hostLoad).cpu), Unwrap(Unwrap(second.hostLoad).cpu))
+          == std::optional<std::uint32_t> { 100 });
+
+    // The free space a snapshot reports is the host's, not the counter source's: one figure
+    // for one fact.
+    REQUIRE(second.host.has_value());
+    CHECK(Unwrap(second.host).diskFreeBytes == 400);
+}
+
+TEST_CASE("A node snapshot with no load source carries no load block", "[node][admin]")
+{
+    ScrapeHost host;
+    auto const provider = MakeNodeSnapshotProvider(NodeScrapeSources { .host = &host,
+                                                                       .busySlots = [] { return std::size_t { 0 }; },
+                                                                       .cache = nullptr,
+                                                                       .slots = 4,
+                                                                       .scratchRoot = std::filesystem::path { "." },
+                                                                       .consensus = {} },
+                                                   std::chrono::steady_clock::now());
+    auto const snapshot = provider();
+    CHECK_FALSE(snapshot.hostLoad.has_value());
+    // The positive control: the snapshot is not simply empty.
+    CHECK(snapshot.host.has_value());
+}
+
 TEST_CASE("A scrape renders nothing for a cache the node does not have", "[node][admin][cache]")
 {
     // End to end through the renderer, because the absence has to survive it too: a
@@ -619,8 +696,8 @@ TEST_CASE("An admin surface nobody asked for starts nothing at all", "[node][adm
     ScrapeHost const scrapeHost;
     NodeConfig cfg;
 
-    auto surface =
-        Node::StartAdminSurfaceOrExplain(cfg, scrapeHost, metrics, WorkerShapedSnapshot(), std::nullopt, nullptr, logger);
+    auto surface = Node::StartAdminSurfaceOrExplain(
+        cfg, scrapeHost, metrics, WorkerShapedSnapshot(), std::nullopt, nullptr, AdminCredential {}, logger);
     REQUIRE(surface.has_value());
     CHECK(surface->endpoint == nullptr);
 }
@@ -640,7 +717,7 @@ TEST_CASE("An admin surface reports which flag refused it", "[node][admin][dashb
         cfg.adminListen = "not-a-port";
 
         auto const surface = Node::StartAdminSurfaceOrExplain(
-            cfg, scrapeHost, metrics, WorkerShapedSnapshot(), std::nullopt, nullptr, logger);
+            cfg, scrapeHost, metrics, WorkerShapedSnapshot(), std::nullopt, nullptr, AdminCredential {}, logger);
         REQUIRE_FALSE(surface.has_value());
         CHECK(surface.error().contains("--admin-listen"));
 
@@ -663,14 +740,19 @@ TEST_CASE("An admin surface reports which flag refused it", "[node][admin][dashb
     SECTION("a credential file that cannot be read")
     {
         // The failure that must never degrade to "no credential".
+        // Read once for both surfaces that guard the fleet with it, so the refusal is the loader's.
         Testing::ScratchDirectory const scratch { "admin-surface-token" };
         NodeConfig cfg;
-        cfg.adminListen = "0"; // refused before the token is even reached
         cfg.dashboardTokenFile = (scratch.Path() / "absent").string();
 
-        auto const surface = Node::StartAdminSurfaceOrExplain(
-            cfg, scrapeHost, metrics, WorkerShapedSnapshot(), std::nullopt, nullptr, logger);
-        REQUIRE_FALSE(surface.has_value());
+        auto const credential = Node::LoadDashboardCredentialOrExplain(cfg);
+        REQUIRE_FALSE(credential.has_value());
+        CHECK(credential.error().contains("--dashboard-token-file"));
+
+        // And the control: naming no file is no credential, not a refusal.
+        auto const none = Node::LoadDashboardCredentialOrExplain(NodeConfig {});
+        REQUIRE(none.has_value());
+        CHECK_FALSE(none->Required());
     }
 }
 
@@ -702,7 +784,7 @@ TEST_CASE("An admin surface serves the fleet only when there is a fleet to read"
     SECTION("with no scheduler, /fleet is not a route")
     {
         auto surface = Node::StartAdminSurfaceOrExplain(
-            cfg, scrapeHost, metrics, WorkerShapedSnapshot(), std::nullopt, nullptr, logger);
+            cfg, scrapeHost, metrics, WorkerShapedSnapshot(), std::nullopt, nullptr, AdminCredential {}, logger);
         REQUIRE(surface.has_value());
         REQUIRE(surface->endpoint != nullptr);
         CHECK(surface->endpoint->BoundEndpoint() == std::format("127.0.0.1:{}", port));
@@ -717,6 +799,7 @@ TEST_CASE("An admin surface serves the fleet only when there is a fleet to read"
             WorkerShapedSnapshot(),
             Distributed::FleetSources { .scheduler = &scheduler, .cluster = nullptr, .metrics = &metrics },
             nullptr,
+            AdminCredential {},
             logger);
         REQUIRE(surface.has_value());
         REQUIRE(surface->endpoint != nullptr);
@@ -743,8 +826,8 @@ TEST_CASE("Asking for a generated certificate gives the surface one to serve", "
     cfg.adminListen = std::format("127.0.0.1:{}", port);
     cfg.tlsSelfSigned = true;
 
-    auto surface =
-        Node::StartAdminSurfaceOrExplain(cfg, scrapeHost, metrics, WorkerShapedSnapshot(), std::nullopt, nullptr, logger);
+    auto surface = Node::StartAdminSurfaceOrExplain(
+        cfg, scrapeHost, metrics, WorkerShapedSnapshot(), std::nullopt, nullptr, AdminCredential {}, logger);
     REQUIRE(surface.has_value());
     REQUIRE(surface->endpoint != nullptr);
     REQUIRE(surface->tls != nullptr);
@@ -773,8 +856,8 @@ TEST_CASE("A surface with no TLS asked for holds no context at all", "[node][adm
     NodeConfig cfg;
     cfg.adminListen = std::format("127.0.0.1:{}", port);
 
-    auto surface =
-        Node::StartAdminSurfaceOrExplain(cfg, scrapeHost, metrics, WorkerShapedSnapshot(), std::nullopt, nullptr, logger);
+    auto surface = Node::StartAdminSurfaceOrExplain(
+        cfg, scrapeHost, metrics, WorkerShapedSnapshot(), std::nullopt, nullptr, AdminCredential {}, logger);
     REQUIRE(surface.has_value());
     REQUIRE(surface->endpoint != nullptr);
 #if defined(FC_TLS_ENABLED)

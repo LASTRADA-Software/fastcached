@@ -44,6 +44,7 @@
 #include <FastCache/Platform/Terminal.hpp>
 #include <FastCache/Platform/WindowsEventLogger.hpp>
 #include <FastCache/Protocol/KeyspaceNotifier.hpp>
+#include <FastCache/Protocol/LiveStream.hpp>
 #include <FastCache/Protocol/PubSubRegistry.hpp>
 #include <FastCache/Protocol/RedisMutationObserver.hpp>
 #include <FastCache/Protocol/RedisTransaction.hpp>
@@ -1139,6 +1140,41 @@ int DaemonBody(FastCache::Config const& effective,
     serverOpts.tlsContext = tlsContext.get(); // null unless --tls is active
 #endif
 
+    // What `/metrics` reports beside the counters, as ONE provider: the admin endpoint renders it
+    // and a live-stats subscription streams it (#1399), so the two cannot disagree about this
+    // cache. Uptime reads `steadyClock`, not the cached one the engine uses: the cached clock only
+    // advances when a reactor completes a loop iteration, so a daemon sitting idle would report a
+    // frozen uptime until the next request arrived.
+    auto const startedAt = steadyClock.Now();
+    FastCache::AdminHttpServer::SnapshotProvider const snapshotProvider = [&engine, &steadyClock, startedAt] {
+        return FastCache::MetricsSnapshot {
+            .storage = engine.Snapshot(),
+            // What the merged view above had to leave out. With `--storage` the backend is an
+            // in-memory tier over a CoW tree, and `LayeredStorage::Snapshot()` reports the tree's
+            // item count, bytes and budget alone -- so the RAM tier an operator sized with
+            // `--memory` has never appeared on this scrape at all.
+            .storageTiers = engine.SnapshotTiers(),
+            // Absent, and said out loud rather than left to the default: this is a cache, not a
+            // compile node, and cores it does not schedule against are noise on its scrape. Naming
+            // the field is also what keeps a field added to the middle of the struct from silently
+            // defaulting here.
+            .host = std::nullopt,
+            .uptime = FastCache::Uptime { std::chrono::duration_cast<std::chrono::seconds>(steadyClock.Now() - startedAt) },
+        };
+    };
+
+    // Live stats over `0xFC`: the cache subject, streamed. Declared before the reactors run and
+    // after everything its provider reads, so it outlives every connection and is outlived by
+    // what it captures. The endpoint named is the first bind, which is where `0xFC` answers.
+    FastCache::CacheLiveStatsSources const liveSources {
+        metrics,
+        snapshotProvider,
+        serverOpts.binds.empty() ? std::string {}
+                                 : std::format("{}:{}", serverOpts.binds.front().address, serverOpts.binds.front().port)
+    };
+    FastCache::LiveStream liveStream { liveSources, metrics };
+    serverOpts.session.liveStats = &liveStream;
+
     // Optional admin HTTP endpoint (/metrics, /healthz) on its own port and
     // thread. A blocking listener is plenty for scrape-rate traffic; SetTimeouts
     // below makes the accept loop poll so Shutdown() is observed even on POSIX
@@ -1171,37 +1207,8 @@ int DaemonBody(FastCache::Config const& effective,
             // pair, which is two places for one decision to drift.
             adminListener->SetTimeouts(FastCache::AdminHttpServer::AcceptPoll, FastCache::AdminHttpServer::RequestTimeout);
 
-            // Uptime reads `steadyClock`, not the cached one the engine uses.
-            // The cached clock only advances when a reactor completes a loop
-            // iteration, so a daemon sitting idle would report a frozen uptime
-            // until the next request arrived. This runs on the admin thread at
-            // scrape rate, where a real clock read costs nothing worth saving.
-            auto const adminStartedAt = steadyClock.Now();
-            adminServer = std::make_unique<FastCache::AdminHttpServer>(
-                *adminListener,
-                metrics,
-                [&engine, &steadyClock, adminStartedAt] {
-                    return FastCache::MetricsSnapshot {
-                        .storage = engine.Snapshot(),
-                        // What the merged view above had to leave out. With
-                        // `--storage` the backend is an in-memory tier over a CoW
-                        // tree, and `LayeredStorage::Snapshot()` reports the
-                        // tree's item count, bytes and budget alone -- so the RAM
-                        // tier an operator sized with `--memory` has never
-                        // appeared on this scrape at all.
-                        .storageTiers = engine.SnapshotTiers(),
-                        // Absent, and said out loud rather than left to the default:
-                        // this is a cache, not a compile node, and cores it does not
-                        // schedule against are noise on its scrape. Naming the field
-                        // is also what keeps a field added to the middle of the
-                        // struct from silently defaulting here.
-                        .host = std::nullopt,
-                        .uptime = FastCache::Uptime { std::chrono::duration_cast<std::chrono::seconds>(steadyClock.Now()
-                                                                                                       - adminStartedAt) },
-                    };
-                },
-                logger,
-                steadyClock);
+            adminServer =
+                std::make_unique<FastCache::AdminHttpServer>(*adminListener, metrics, snapshotProvider, logger, steadyClock);
             adminThread = std::jthread { [&adminServer] {
                 FC_THREAD_NAME("fc-admin");
                 FastCache::SyncRun(adminServer->Run());

@@ -1483,7 +1483,10 @@ void CowTreeStorage::ReclaimDeadRecord(std::string_view key, CacheEntry const& e
     // copy of that string -- so recording first is what keeps the ordering from
     // being a precondition a future caller has to know about.
     if (entry.expiry <= now)
+    {
+        ++_stats.expirations;
         RecordReclaim(_reclaim, MutationKind::Expire, key);
+    }
     // Ignored, as on the delete path: the record is already unreachable to
     // every caller, so a failure to erase it costs disk space and nothing else.
     // Reporting an I/O error out of a verb whose answer is "that key is not
@@ -2143,7 +2146,10 @@ PurgeOutcome CowTreeStorage::PurgeExpired(TimePoint now, PurgeBudget budget)
         // failed above took the `continue`, and an event for a key still being
         // served is worse than no event.
         if (victim.lapsed)
+        {
+            ++_stats.expirations;
             RecordReclaim(_reclaim, MutationKind::Expire, victim.key);
+        }
         ++outcome.purged;
     }
     return outcome;

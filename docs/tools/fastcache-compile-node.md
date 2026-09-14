@@ -764,6 +764,27 @@ serves unauthenticated.
 | `fastcache_node_status_requests_refused_payload_too_large_total` | A header declared more payload than these verbs may carry. Both are **fieldless**, so this came from no client of this tree at any version. Never sum it with the cache tier's row of the same name. |
 | `fastcache_node_status_requests_refused_endpoint_busy_total` | The surface had no bytes left in flight. These are the verbs somebody reaches for when a node is in trouble, so this is the node saying it is too busy to say what it is. Read it beside `fastcache_node_cache_requests_refused_endpoint_busy_total`, never summed: this says the diagnosis failed, that says why. |
 
+### Live stats
+
+`fastcache-cli live-stats` subscribes over `0xFC` and this node pushes what the dashboard draws, instead of the dashboard polling `/metrics` and `/fleet.txt` ([#1399](https://github.com/LASTRADA-Software/fastcached/issues/1399)).
+
+| Counter | What a rise means |
+|---|---|
+| `fastcache_live_subscriptions_opened_total` | A `fastcache-cli live-stats` session subscribed and was granted a stream. One per dashboard opened against this node; a climb nobody explains is a client re-subscribing in a loop rather than holding its stream. |
+| `fastcache_live_snapshots_rendered_total` | A snapshot was rendered for a subject. **Once per subject per tick, whatever the number of watchers** -- read it against the opened count: a rate that grows with the number of dashboards rather than with time is the render being paid per watcher again. |
+| `fastcache_live_snapshots_skipped_total` | A subscriber was still writing a previous snapshot when the next was due, so it was sent the newest and told how many it missed. **The node never waits for a slow watcher**; a rise is a slow link or a stalled terminal on the watching side. |
+| `fastcache_live_subscriptions_revoked_total` | A stream ended because its peer stopped passing the gate -- a reload or a replicated removal revoked a host that was still watching. Removal fails open unless something re-checks live connections; this is that re-check acting. |
+| `fastcache_live_subscriptions_ended_not_leader_total` | A fleet stream ended because this node stopped leading; the watcher was told where the new leader is and follows it. A rise with no election you know of is leadership flapping. |
+| `fastcache_live_subscriptions_refused_at_capacity_total` | A subscription was refused because the node already streams to its maximum number of watchers. Long before a team reaches it, dashboards left open everywhere do. |
+| `fastcache_live_subscriptions_refused_unauthenticated_total` | A fleet subscription was refused: a wrong or missing dashboard credential, or a remote peer while no `--dashboard-token-file` is configured. The fleet map is behind the same credential here as on `/fleet`; a burst from one host is somebody guessing. |
+| `fastcache_live_subscriptions_stalled_total` | A stream ended because a single push stayed unwritten past its bound -- the watcher stopped reading altogether, so its buffers were released rather than held. |
+| `fastcache_live_subscriptions_ended_by_client_total` | A watching client closed its stream -- the ordinary way a dashboard ends. Opened minus this, minus the ended rows above, is the streams still open. |
+| `fastcache_live_subscriptions_ended_by_reset_total` | A watching client reset its connection instead of closing it -- a dashboard killed while pushes were still unread does this. Counted apart from the orderly close, because only a reset says the watcher went away abruptly. |
+| `fastcache_live_subscriptions_refused_not_a_member_total` | A subscription was refused because its peer is not a fleet member. Live stats stream to the same peers `NodeStatus` answers; a burst from one host is a stranger probing the port. |
+| `fastcache_live_subscriptions_refused_malformed_total` | A `SUBSCRIBE` did not decode, or named a subject this build does not serve. No client of this tree sends one; a rise is a client of another build, or not a client at all. |
+| `fastcache_live_subscriptions_refused_payload_too_large_total` | A `SUBSCRIBE` header declared more than the control payload the verb is bounded to, and was refused before a byte of it was read. No client of this tree at any version sends one. |
+| `fastcache_live_subscriptions_refused_endpoint_busy_total` | A subscription was refused because the `0xFC` listener's in-flight byte budget was full of other requests. The dashboard retries; a rise says the view went missing exactly when the node was busiest. |
+
 
 Read the two upstream counters beside the gauge, never on their own. They are
 cumulative, so a node with **no** shared cache and a node with one it has not yet
@@ -2261,7 +2282,7 @@ exposition cannot drift apart again without a red build.
 **What this machine is, and how loaded it is.** Rendered only by a process that has a
 capacity to report, so a daemon emits none of them — `MetricsSnapshot::host` is absent
 there rather than zeroed, because cores a daemon does not schedule against are not a
-fact about it. These are gauges, not counters.
+fact about it. These are gauges, not counters, except the two CPU tick series.
 
 | Series | Says |
 |---|---|
@@ -2271,6 +2292,16 @@ fact about it. These are gauges, not counters.
 | `fastcache_node_disk_free_bytes` | Space on that filesystem an unprivileged process may still write. |
 | `fastcache_node_slots_configured` | Concurrent compiles this node advertises to the scheduler. |
 | `fastcache_node_slots_busy` | Compiles running right now — **sampled**, so it is a reading and not a difference of two counters. |
+| `fastcache_node_cpu_busy_ticks_total` | Host-wide CPU ticks spent doing anything but idling, this node's own compiles included. A **counter** in platform ticks, whose length differs per platform, so it means nothing alone: `rate(fastcache_node_cpu_busy_ticks_total[1m]) / rate(fastcache_node_cpu_ticks_total[1m])` is the machine's busy share. Absent when the platform would not report its CPU. |
+| `fastcache_node_cpu_ticks_total` | Host-wide CPU ticks accounted for at all: the denominator of the row above. |
+| `fastcache_node_memory_available_bytes` | Memory a new process could actually obtain: *available*, not free, so the page cache the kernel hands back on demand counts. Absent when the platform would not say. |
+
+The CPU figures are raw counters rather than a utilization on purpose. A utilization is a
+difference between two readings, so the node would have to hold the earlier one, and the
+scrape, every `fastcache-cli live-stats` subscriber and the node's own heartbeat would then
+each read whatever interval the last of them left. Every reader takes its own difference
+instead, which is also what `live-stats` does to name the limit a node's free slots are
+bound by.
 
 **What this node counts as its own cluster.** Rendered only by a node that runs
 consensus — a node started without `--listen-raft` leads itself, holds no

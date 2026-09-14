@@ -360,6 +360,33 @@ TEST_CASE("InMemoryLruStorage counts expired_unfetched only for never-read victi
     REQUIRE(stats.expiredUnfetched == 1U); // only the unread k2
 }
 
+TEST_CASE("InMemoryLruStorage counts every expiry, whichever path removed it, and no flush", "[cache][stats][expiry]")
+{
+    // WHAT DISTINGUISHES: one expiry per path -- a lookup meeting a lapsed entry, and the sweep -- each counted
+    // once whether or not it was read, while `expiredUnfetched` counts only the unread one; and a generation
+    // flush, which also makes entries unreachable, counts nothing.
+    FastCache::InMemoryLruStorage storage { 0, 0, FastCache::LruMode::Strict };
+    FastCache::ManualClock clock;
+    auto const expiry = clock.Now() + 1s;
+    REQUIRE(storage.Set("read", MakeBytes("a"), 0, expiry).has_value());
+    REQUIRE(storage.Set("unread", MakeBytes("b"), 0, expiry).has_value());
+    REQUIRE(storage.Get("read", clock.Now())->found);
+
+    clock.Advance(2s);
+    REQUIRE_FALSE(storage.Get("read", clock.Now())->found); // the lookup removes it
+    REQUIRE(storage.Snapshot().expirations == 1U);
+    REQUIRE(storage.PurgeExpired(clock.Now(), FastCache::PurgeBudget::Unbounded()).purged == 1U);
+
+    auto const stats = storage.Snapshot();
+    CHECK(stats.expirations == 2U);
+    CHECK(stats.expiredUnfetched == 1U);
+
+    REQUIRE(storage.Set("flushed", MakeBytes("c"), 0, FastCache::TimePoint::max()).has_value());
+    storage.FlushWithGeneration(clock.Now());
+    REQUIRE(storage.PurgeExpired(clock.Now(), FastCache::PurgeBudget::Unbounded()).purged == 1U);
+    CHECK(storage.Snapshot().expirations == 2U);
+}
+
 TEST_CASE("InMemoryLruStorage: a bounded sweep resumes instead of restarting", "[cache][purge]")
 {
     // Live entries at the FRONT of the LRU (written last), lapsed ones behind

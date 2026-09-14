@@ -507,6 +507,55 @@ determinism rests on.
     dead code today and says so at the site, because a reader who works that out alone
     reads it as a defect.
 
+  - **And "macOS already compiles it" names TWO standard libraries.** `macOS-clang-release`
+    builds with Homebrew's LLVM and its current libc++; `Package (macOS .pkg)` builds with
+    AppleClang over Apple's OWN, older libc++ -- the split *Packaging and coverage stay on
+    pull requests* below records, and the one `views::enumerate` fell into. PR #1392 added
+    `std::ranges::iota` (in `DashboardPanel.cpp`) and `std::ranges::fold_left` (in
+    `FrameEndpoint.cpp`), went green on every required context including
+    `macOS-clang-release`, and the package job answered `error: no member named 'iota' in
+    namespace 'std::ranges'` (run 34824219289). That job is **not a required context**, so
+    the remedy above -- *grep for it and see that macOS already compiles it* -- can be
+    satisfied by the wrong macOS, and the failure lands after the merge, on whoever packages. A build also stops at its first failure, so the `fold_left`
+    behind the `iota` was never reached: fixing the reported site alone would have moved the
+    red one file along.
+
+    The owner's call was to KEEP the C++23 spelling rather than retreat to `std::iota` and
+    `std::accumulate`, so `Core/Ranges.hpp` carries a seam: `Ranges::Iota` and
+    `Ranges::FoldLeft`. What makes it the right shape, and what to keep if it is extended:
+    - **Selected by the feature-test macro from `<version>`, never by compiler ID or
+      version.** The macro is the library's own statement of what it ships. Where it is
+      defined the seam is an object of the standard function object's own TYPE, so nothing
+      changes on a leg that already built; where it is not, the seam is a transcription of
+      [numeric.iota] / [alg.fold] with the standard's constraints and return types.
+    - **A facility can be present with its macro ABSENT, and that is harmless.** Measured on
+      libc++ 22: `__cpp_lib_ranges_iota` defined, `__cpp_lib_ranges_fold` not, although
+      `fold_left` is implemented -- inferred to wait for the whole P2322 family. So every
+      libc++ build selects the `FoldLeft` fallback, which means `macOS-clang-release` RUNS it.
+    - **The fallback is compiled and tested on EVERY platform**, under `Ranges::Detail`,
+      and held to agree with the standard facility wherever one exists. A fallback compiled
+      only where it is selected is compiled only on the leg nobody builds locally.
+      `FC_RANGES_FORCE_FALLBACK`, as a WHOLE-BUILD define only (a per-TU define is an ODR
+      violation), selects it everywhere so a Linux or Windows build can compile the real call
+      sites against it -- the only local stand-in for Apple's libc++.
+    - **A copy of the function object, not a reference, and `Iota` rather than `iota`.**
+      clang-tidy files a `constexpr auto const&` under global VARIABLES (camelBack) because a
+      reference type is not const-qualified; a copy is a global CONSTANT. The alternative, an
+      `IgnoredRegexp` in `.clang-tidy`, would be a second list of seam names, and the case
+      difference is what lets a case-sensitive scan tell `Ranges::Iota` from `ranges::iota`.
+    - **Enforced, unlike the bullet above:** `ctest -R ranges-seam`, in the default set,
+      refuses a direct `std::ranges::<name>` in first-party C++ for every name the header
+      wraps. The difference from `from_chars` is that here a NAME is the hazard, so a scan
+      sees exactly it. The wrapped set is DERIVED from the header's selection blocks -- a
+      restated list catches a facility leaving and is blind to one arriving -- and the file set
+      from `git ls-files` minus `scripts/lib/third-party-roots.txt`. Its line walk is
+      `fastcached_scan_code_lines` in `scripts/lib/CheckCommon.cmake`, moved there from
+      `check-istreambuf-iterator.cmake` when this became its second caller.
+
+    **The next missing facility is a selection block in `Core/Ranges.hpp`, never an `#if`
+    at a call site**: a guard at the site re-derives the selection per file, and the arm a
+    local build never compiles is the arm that breaks.
+
   - **And the mirror holds: a Windows verification is green about a smaller set of
     questions than it looks.** The paragraph above counts what a Linux-only gate
     misses; this direction is measured too. One session's four tickets produced
@@ -5220,6 +5269,22 @@ The set is DERIVED from the `catch_discover_tests(` registrations, and each memb
 either a `TARGETS` row or carries a **written exemption**. Three shapes are refused: an
 empty reason, a row naming a binary nothing registers, and a row that is also a `TARGETS`
 row.
+
+**And an exemption's CLAIM is re-taken on every run, because a reason nobody re-measures
+goes false in silence.** `fastcache-cli-tests` stayed exempt as "single-threaded -- no
+source names `std::thread`" after #134 gave it a thread pool and two suites asserting on
+thread identities; the check went on passing, since a reason was only required to be
+non-empty. So a row is `target|directory|reason`, and the check scans the directory for
+the primitives in `FastCachedTsanThreadPrimitives` (`ThreadPoolExecutor` among them, which
+is how this tree reaches a thread without spelling one), refusing a hit outside a comment,
+a missing directory, and one holding no source.
+
+That is the thread census the paragraph above declines to trust, used in the ONE direction
+where its errors are cheap: a false positive refuses an exemption and costs a sanitized
+binary that did not strictly need it, never a hidden race; a false negative -- a thread
+spawned through a helper defined elsewhere -- leaves the row as unverified as it was
+before. **A clean scan proves the written claim, not a single-threaded binary**, and the
+refusal says so rather than letting a green run read as the stronger statement.
 
 #1209's own hand census listed **four** test binaries where the tree registers **six**.
 That is why this is a check and not a review item: the person writing the ticket, looking

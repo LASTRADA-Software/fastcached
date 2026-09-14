@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "CliVerbs.hpp"
+#include "FleetDocument.hpp"
+#include "LiveSession.hpp"
+#include "LiveStats.hpp"
+#include "NodeStatusText.hpp"
 
 #include <FastCache/Cluster/ClusterState.hpp>
 
@@ -915,58 +919,6 @@ namespace
         return answer;
     }
 
-    /// Which `NodeComponentBit` each reported component name stands for.
-    ///
-    /// A table because the set grows: a bit this build does not name is reported under
-    /// its NUMBER rather than dropped, so an older client meeting a newer node says
-    /// *there is something here I do not know about* instead of quietly under-reporting
-    /// what the node runs.
-    struct ComponentBit
-    {
-        std::uint32_t bit;     ///< The mask bit.
-        std::string_view name; ///< What to call it.
-    };
-
-    constexpr std::array<ComponentBit, 4> ComponentBits { {
-        { .bit = CompileCacheWire::NodeComponentBit::CacheTier, .name = "cache-tier" },
-        { .bit = CompileCacheWire::NodeComponentBit::Worker, .name = "worker" },
-        { .bit = CompileCacheWire::NodeComponentBit::Scheduler, .name = "scheduler" },
-        { .bit = CompileCacheWire::NodeComponentBit::Consensus, .name = "consensus" },
-    } };
-
-    /// The components @p mask names, as a comma-separated list.
-    ///
-    /// **An empty MASK renders as the word `none` rather than as an absent cell**: a
-    /// node that runs no component is a reading, not a missing one, and the two must
-    /// not render alike.
-    /// @param mask What the node reported.
-    /// @return The list.
-    [[nodiscard]] std::string DescribeComponents(std::uint32_t mask)
-    {
-        std::string out;
-        std::uint32_t named = 0;
-        for (auto const& row: ComponentBits)
-            if ((mask & row.bit) != 0)
-            {
-                named |= row.bit;
-                if (!out.empty())
-                    out += ", ";
-                out += row.name;
-            }
-
-        // Whatever is left is a component this build has no name for. Reported as the
-        // residual mask, because *some bits I do not understand* is a fact an operator
-        // can act on -- upgrade the client -- and silence is not.
-        if (auto const unknown = mask & ~named; unknown != 0)
-        {
-            if (!out.empty())
-                out += ", ";
-            out += std::format("unknown(0x{:x})", unknown);
-        }
-
-        return out.empty() ? std::string { "none" } : out;
-    }
-
     /// What to call one reported surface.
     /// @param surface The wire tag.
     /// @return A stable lower-case name.
@@ -985,46 +937,6 @@ namespace
         // one rather than refusing the whole reply, which is what lets an older client
         // read a newer node at all. Closed anyway, because falling off the end of a
         // function returning a view is a dangling one.
-        return "unknown";
-    }
-
-    /// What to call one toolchain-survey state.
-    /// @param state The wire tag.
-    /// @return A stable lower-case name.
-    [[nodiscard]] std::string_view NameOfToolchainState(CompileCacheWire::ToolchainState state) noexcept
-    {
-        switch (state)
-        {
-            case CompileCacheWire::ToolchainState::Surveying:
-                return "surveying";
-            case CompileCacheWire::ToolchainState::Serving:
-                return "serving";
-            case CompileCacheWire::ToolchainState::NothingToServe:
-                return "nothing-to-serve";
-        }
-        // Unreachable for the reason `NameOfSurface`'s tail is: `DecodeNodeRuntime`
-        // leaves a state this build has no name for DISENGAGED rather than passing it
-        // through, so nothing but a named one arrives. Closed anyway -- falling off the
-        // end of a function returning a view is a dangling one.
-        return "unknown";
-    }
-
-    /// What to call one scheduler role.
-    /// @param role The wire tag.
-    /// @return A stable lower-case name.
-    [[nodiscard]] std::string_view NameOfSchedulerRole(CompileCacheWire::WireSchedulerRole role) noexcept
-    {
-        switch (role)
-        {
-            case CompileCacheWire::WireSchedulerRole::Follower:
-                return "follower";
-            case CompileCacheWire::WireSchedulerRole::Undecided:
-                return "undecided";
-            case CompileCacheWire::WireSchedulerRole::Leader:
-                return "leader";
-        }
-        // Unreachable for `NameOfSurface`'s reason: `DecodeNodeRuntime` leaves a role
-        // this build has no name for disengaged rather than passing it through.
         return "unknown";
     }
 
@@ -1504,86 +1416,6 @@ namespace
                           Field { .name = "state", .value = TextCell("appended, not committed") } }));
     }
 
-    /// One `/fleet.txt` section, as a table.
-    ///
-    /// The header line names the columns and every later line is a row, which is the
-    /// whole grammar -- there is no column list here, and there must not be: the
-    /// leader decided them from `FleetColumn`, and a second list in this binary would
-    /// be a place for the two to disagree.
-    ///
-    /// A cell of `-` becomes the real `Absent`, so `--absent` and the JSON `null`
-    /// behave as they do for every other verb rather than a dash being text that
-    /// happens to look absent. Everything else stays TEXT, escaping included: this
-    /// client has no model of which columns are numbers, and inventing one would be a
-    /// second description of the same columns.
-    /// @param document One section's rendering.
-    /// @return The table.
-    [[nodiscard]] std::expected<Value, std::string> FleetTable(std::string_view document)
-    {
-        std::vector<std::string> columns;
-        std::vector<std::vector<Cell>> rows;
-
-        auto const split = [](std::string_view line) {
-            std::vector<std::string_view> fields;
-            while (true)
-            {
-                auto const at = line.find('\t');
-                if (at == std::string_view::npos)
-                    break;
-                fields.push_back(line.substr(0, at));
-                line.remove_prefix(at + 1);
-            }
-            fields.push_back(line);
-            return fields;
-        };
-
-        bool header = true;
-        while (!document.empty())
-        {
-            auto const end = document.find('\n');
-            auto const line = document.substr(0, end);
-            document = end == std::string_view::npos ? std::string_view {} : document.substr(end + 1);
-
-            // A trailing newline leaves an empty tail, which is not a row of one empty
-            // cell. Skipped rather than rendered, or every table gains a blank row.
-            if (line.empty())
-                continue;
-
-            if (header)
-            {
-                for (auto const& field: split(line))
-                    columns.emplace_back(field);
-                header = false;
-                continue;
-            }
-
-            auto const fields = split(line);
-
-            // Every renderer walks `row[index]` for each of the HEADER's columns, so a
-            // short row is an out-of-range read rather than a narrow table. Refused
-            // rather than padded: padding presents truncated data as complete, and an
-            // `Absent` cell claims nobody reported the value when in fact it was
-            // reported and lost.
-            if (fields.size() != columns.size())
-                return std::unexpected(std::format(
-                    "row {} carries {} field(s) where the header names {}", rows.size() + 1, fields.size(), columns.size()));
-
-            std::vector<Cell> row;
-            row.reserve(columns.size());
-            for (auto const& field: fields)
-                row.push_back(field == "-" ? AbsentCell() : TextCell(std::string { field }));
-            rows.push_back(std::move(row));
-        }
-
-        // No header at all is not an empty fleet -- an empty SECTION still renders its
-        // header line, which is the whole reason the renderer emits one for a table
-        // with no rows. A document without one is not a table this client can read.
-        if (columns.empty())
-            return std::unexpected("the document carries no header line");
-
-        return TableValue(std::move(columns), std::move(rows));
-    }
-
     /// `fleet <section>` -- one of the leader's fleet tables, in a terminal.
     ///
     /// The admin surface is reached through the seam rather than dialled here, so
@@ -1598,7 +1430,7 @@ namespace
         // listener nothing dialled, which is the three-state rule the stats ladder
         // already keeps.
         if (context.admin == nullptr)
-            return Concluded(Outcome::Usage, "no admin surface is available to this invocation");
+            return Concluded(Outcome::Usage, std::string { NoAdminSurface });
 
         auto const document = context.admin->FetchAdmin(std::format("/fleet.txt?section={}", context.operands[0]));
         if (!document.has_value())
@@ -1608,15 +1440,7 @@ namespace
             // second carries the server's own words, including the list of sections
             // when the guess was wrong and the leader's address when this node is not
             // it.
-            switch (document.error().kind)
-            {
-                case AdminFailure::Refused:
-                    return Concluded(Outcome::Refused, document.error().detail);
-                case AdminFailure::Unreachable:
-                case AdminFailure::Last:
-                    break;
-            }
-            return Concluded(Outcome::Unreachable, document.error().detail);
+            return Concluded(OutcomeOf(document.error().kind), document.error().detail);
         }
 
         auto table = FleetTable(*document);
@@ -1641,7 +1465,8 @@ namespace
           // rather than left to default -- clang and gcc reject the omission under
           // this project's pedantic flags and MSVC does not say a word, which is a
           // shape that builds clean on Windows and fails four CI legs.
-          .nodeFallback = nullptr },
+          .nodeFallback = nullptr,
+          .session = nullptr },
         { .name = "mget",
           .wire = Wire::Resp,
           .minOperands = 1,
@@ -1651,7 +1476,8 @@ namespace
           .protocolCommand = "MGET",
           .modifiers = Modifier::None,
           .handler = &FetchMany,
-          .nodeFallback = nullptr },
+          .nodeFallback = nullptr,
+          .session = nullptr },
         { .name = "set",
           .wire = Wire::Resp,
           .minOperands = 2,
@@ -1661,7 +1487,8 @@ namespace
           .protocolCommand = "SET",
           .modifiers = Modifier::Ttl | Modifier::Exclusivity,
           .handler = &Store,
-          .nodeFallback = nullptr },
+          .nodeFallback = nullptr,
+          .session = nullptr },
         { .name = "del",
           .wire = Wire::Resp,
           .minOperands = 1,
@@ -1671,7 +1498,8 @@ namespace
           .protocolCommand = "DEL",
           .modifiers = Modifier::None,
           .handler = &Counting,
-          .nodeFallback = nullptr },
+          .nodeFallback = nullptr,
+          .session = nullptr },
         { .name = "exists",
           .wire = Wire::Resp,
           .minOperands = 1,
@@ -1681,7 +1509,8 @@ namespace
           .protocolCommand = "EXISTS",
           .modifiers = Modifier::None,
           .handler = &Counting,
-          .nodeFallback = nullptr },
+          .nodeFallback = nullptr,
+          .session = nullptr },
         { .name = "incr",
           .wire = Wire::Resp,
           .minOperands = 1,
@@ -1691,7 +1520,8 @@ namespace
           .protocolCommand = "INCR",
           .modifiers = Modifier::None,
           .handler = &Counting,
-          .nodeFallback = nullptr },
+          .nodeFallback = nullptr,
+          .session = nullptr },
         { .name = "decr",
           .wire = Wire::Resp,
           .minOperands = 1,
@@ -1701,7 +1531,8 @@ namespace
           .protocolCommand = "DECR",
           .modifiers = Modifier::None,
           .handler = &Counting,
-          .nodeFallback = nullptr },
+          .nodeFallback = nullptr,
+          .session = nullptr },
         { .name = "incrby",
           .wire = Wire::Resp,
           .minOperands = 2,
@@ -1711,7 +1542,8 @@ namespace
           .protocolCommand = "INCRBY",
           .modifiers = Modifier::None,
           .handler = &Counting,
-          .nodeFallback = nullptr },
+          .nodeFallback = nullptr,
+          .session = nullptr },
         { .name = "decrby",
           .wire = Wire::Resp,
           .minOperands = 2,
@@ -1721,7 +1553,8 @@ namespace
           .protocolCommand = "DECRBY",
           .modifiers = Modifier::None,
           .handler = &Counting,
-          .nodeFallback = nullptr },
+          .nodeFallback = nullptr,
+          .session = nullptr },
         { .name = "ttl",
           .wire = Wire::Resp,
           .minOperands = 1,
@@ -1732,7 +1565,8 @@ namespace
           .protocolCommand = "TTL",
           .modifiers = Modifier::None,
           .handler = &Lifetime,
-          .nodeFallback = nullptr },
+          .nodeFallback = nullptr,
+          .session = nullptr },
         { .name = "expire",
           .wire = Wire::Resp,
           .minOperands = 2,
@@ -1742,7 +1576,8 @@ namespace
           .protocolCommand = "EXPIRE",
           .modifiers = Modifier::None,
           .handler = &Flagged,
-          .nodeFallback = nullptr },
+          .nodeFallback = nullptr,
+          .session = nullptr },
         { .name = "persist",
           .wire = Wire::Resp,
           .minOperands = 1,
@@ -1752,7 +1587,8 @@ namespace
           .protocolCommand = "PERSIST",
           .modifiers = Modifier::None,
           .handler = &Flagged,
-          .nodeFallback = nullptr },
+          .nodeFallback = nullptr,
+          .session = nullptr },
         { .name = "flush",
           .wire = Wire::Resp,
           .minOperands = 0,
@@ -1762,7 +1598,8 @@ namespace
           .protocolCommand = "FLUSHDB",
           .modifiers = Modifier::Everything,
           .handler = &Flush,
-          .nodeFallback = nullptr },
+          .nodeFallback = nullptr,
+          .session = nullptr },
         { .name = "ping",
           .wire = Wire::Resp,
           .minOperands = 0,
@@ -1772,7 +1609,8 @@ namespace
           .protocolCommand = "PING",
           .modifiers = Modifier::None,
           .handler = &Echoed,
-          .nodeFallback = nullptr },
+          .nodeFallback = nullptr,
+          .session = nullptr },
         { .name = "echo",
           .wire = Wire::Resp,
           .minOperands = 1,
@@ -1782,7 +1620,8 @@ namespace
           .protocolCommand = "ECHO",
           .modifiers = Modifier::None,
           .handler = &Echoed,
-          .nodeFallback = nullptr },
+          .nodeFallback = nullptr,
+          .session = nullptr },
         { .name = "info",
           .wire = Wire::Resp,
           .minOperands = 0,
@@ -1792,7 +1631,8 @@ namespace
           .protocolCommand = "INFO",
           .modifiers = Modifier::None,
           .handler = &Info,
-          .nodeFallback = nullptr },
+          .nodeFallback = nullptr,
+          .session = nullptr },
         { .name = "version",
           .wire = Wire::Resp,
           .minOperands = 0,
@@ -1805,7 +1645,8 @@ namespace
           // The one row with a fallback today. A node answers *what are you running*
           // as readily as a daemon does, and this is the verb an operator reaches for
           // first when an address does not behave.
-          .nodeFallback = &VersionsFromNode },
+          .nodeFallback = &VersionsFromNode,
+          .session = nullptr },
         { .name = "stats",
           .wire = Wire::Stats,
           .minOperands = 0,
@@ -1816,7 +1657,28 @@ namespace
           .protocolCommand = "",
           .modifiers = Modifier::None,
           .handler = &Stats,
-          .nodeFallback = nullptr },
+          .nodeFallback = nullptr,
+          .session = nullptr },
+        { .name = "live-stats",
+          // `Stats` for ADMISSION only: `0xFC` identifies the endpoint, and RESP opening
+          // beside it is what lets a refusal say *a Redis answered, a fastcache did not*.
+          // Every reading then arrives on the session's own subscription (#1399).
+          .wire = Wire::Stats,
+          .minOperands = 0,
+          .maxOperands = 1,
+          // Derived from `LiveSubjectTable` at compile time, unlike `fleet`'s list below,
+          // because #134 §1 asks for exactly that and a derived list cannot drift where a
+          // test only notices after it has.
+          .operands = LiveSubjectOperands,
+          .summary = "watch a cache, a node or the fleet, one sample per interval;\n"
+                     "the subject is inferred when not named, and `fleet` never is",
+          .protocolCommand = "",
+          .modifiers = Modifier::Interval | Modifier::Samples,
+          .handler = &LiveStatsVerb,
+          // No second attempt exists to make: identifying the endpoint IS the subject
+          // decision, and it happens before any sample (#134 §1.3).
+          .nodeFallback = nullptr,
+          .session = &RunLiveStatsSession },
 
         // The `0xFC` verbs. These are the ONLY ones a `fastcache-compile-node` answers:
         // that binary speaks no RESP and no memcached text, so every row above this
@@ -1837,7 +1699,8 @@ namespace
           .protocolCommand = "node-status",
           .modifiers = Modifier::None,
           .handler = &NodeStatus,
-          .nodeFallback = nullptr },
+          .nodeFallback = nullptr,
+          .session = nullptr },
         { .name = "fleet",
           .wire = Wire::Node,
           .minOperands = 1,
@@ -1857,7 +1720,8 @@ namespace
           // The 0xFC wire is what DISCOVERS the admin port, so the verb needs that
           // connection even though the table arrives over HTTP. No fallback: an
           // endpoint that is not a node has no fleet to report.
-          .nodeFallback = nullptr },
+          .nodeFallback = nullptr,
+          .session = nullptr },
         { .name = "node-metrics",
           .wire = Wire::Node,
           .minOperands = 0,
@@ -1868,7 +1732,8 @@ namespace
           .protocolCommand = "node-metrics",
           .modifiers = Modifier::None,
           .handler = &NodeMetrics,
-          .nodeFallback = nullptr },
+          .nodeFallback = nullptr,
+          .session = nullptr },
 
         // The cluster verbs. FIVE rows over FOUR wire verbs, because `ClusterStatus`
         // answers two questions an operator asks separately -- who is in the cluster,
@@ -1887,7 +1752,8 @@ namespace
           .protocolCommand = "cluster-status",
           .modifiers = Modifier::None,
           .handler = &ClusterMembers,
-          .nodeFallback = nullptr },
+          .nodeFallback = nullptr,
+          .session = nullptr },
         { .name = "cluster-settings",
           .wire = Wire::Node,
           .minOperands = 0,
@@ -1898,7 +1764,8 @@ namespace
           .protocolCommand = "cluster-status",
           .modifiers = Modifier::None,
           .handler = &ClusterSettings,
-          .nodeFallback = nullptr },
+          .nodeFallback = nullptr,
+          .session = nullptr },
         { .name = "cluster-set",
           .wire = Wire::Node,
           .minOperands = 2,
@@ -1909,7 +1776,8 @@ namespace
           .protocolCommand = "cluster-set",
           .modifiers = Modifier::None,
           .handler = &ClusterSet,
-          .nodeFallback = nullptr },
+          .nodeFallback = nullptr,
+          .session = nullptr },
         { .name = "cluster-forget",
           .wire = Wire::Node,
           .minOperands = 1,
@@ -1919,7 +1787,8 @@ namespace
           .protocolCommand = "cluster-forget",
           .modifiers = Modifier::None,
           .handler = &ClusterForget,
-          .nodeFallback = nullptr },
+          .nodeFallback = nullptr,
+          .session = nullptr },
         { .name = "cluster-admit",
           .wire = Wire::Node,
           .minOperands = 2,
@@ -1929,7 +1798,8 @@ namespace
           .protocolCommand = "cluster-admit",
           .modifiers = Modifier::None,
           .handler = &ClusterAdmit,
-          .nodeFallback = nullptr },
+          .nodeFallback = nullptr,
+          .session = nullptr },
 
         // The memcached text verbs. Everything below this line is unavailable against a
         // daemon with `--requirepass` set, because that protocol has no AUTH verb --
@@ -1944,7 +1814,8 @@ namespace
           .protocolCommand = "touch",
           .modifiers = Modifier::None,
           .handler = &Touch,
-          .nodeFallback = nullptr },
+          .nodeFallback = nullptr,
+          .session = nullptr },
         { .name = "gat",
           .wire = Wire::Memcached,
           .minOperands = 2,
@@ -1955,7 +1826,8 @@ namespace
           .protocolCommand = "gat",
           .modifiers = Modifier::None,
           .handler = &FetchAndTouch,
-          .nodeFallback = nullptr },
+          .nodeFallback = nullptr,
+          .session = nullptr },
         { .name = "gats",
           .wire = Wire::Memcached,
           .minOperands = 2,
@@ -1965,7 +1837,8 @@ namespace
           .protocolCommand = "gats",
           .modifiers = Modifier::None,
           .handler = &FetchAndTouch,
-          .nodeFallback = nullptr },
+          .nodeFallback = nullptr,
+          .session = nullptr },
         { .name = "add",
           .wire = Wire::Memcached,
           .minOperands = 2,
@@ -1975,7 +1848,8 @@ namespace
           .protocolCommand = "add",
           .modifiers = Modifier::Ttl,
           .handler = &StoreText,
-          .nodeFallback = nullptr },
+          .nodeFallback = nullptr,
+          .session = nullptr },
         { .name = "replace",
           .wire = Wire::Memcached,
           .minOperands = 2,
@@ -1985,7 +1859,8 @@ namespace
           .protocolCommand = "replace",
           .modifiers = Modifier::Ttl,
           .handler = &StoreText,
-          .nodeFallback = nullptr },
+          .nodeFallback = nullptr,
+          .session = nullptr },
         { .name = "append",
           .wire = Wire::Memcached,
           .minOperands = 2,
@@ -1996,7 +1871,8 @@ namespace
           .protocolCommand = "append",
           .modifiers = Modifier::None,
           .handler = &StoreText,
-          .nodeFallback = nullptr },
+          .nodeFallback = nullptr,
+          .session = nullptr },
         { .name = "prepend",
           .wire = Wire::Memcached,
           .minOperands = 2,
@@ -2006,7 +1882,8 @@ namespace
           .protocolCommand = "prepend",
           .modifiers = Modifier::None,
           .handler = &StoreText,
-          .nodeFallback = nullptr },
+          .nodeFallback = nullptr,
+          .session = nullptr },
         { .name = "cas",
           .wire = Wire::Memcached,
           .minOperands = 3,
@@ -2017,7 +1894,8 @@ namespace
           .protocolCommand = "cas",
           .modifiers = Modifier::Ttl,
           .handler = &StoreText,
-          .nodeFallback = nullptr },
+          .nodeFallback = nullptr,
+          .session = nullptr },
         { .name = "inspect",
           .wire = Wire::Memcached,
           .minOperands = 1,
@@ -2028,7 +1906,8 @@ namespace
           .protocolCommand = "me",
           .modifiers = Modifier::None,
           .handler = &Inspect,
-          .nodeFallback = nullptr },
+          .nodeFallback = nullptr,
+          .session = nullptr },
         { .name = "mc-stats",
           .wire = Wire::Memcached,
           .minOperands = 0,
@@ -2044,7 +1923,8 @@ namespace
           .protocolCommand = "stats",
           .modifiers = Modifier::None,
           .handler = &TextStats,
-          .nodeFallback = nullptr },
+          .nodeFallback = nullptr,
+          .session = nullptr },
         { .name = "cache-memlimit",
           .wire = Wire::Memcached,
           .minOperands = 1,
@@ -2055,7 +1935,8 @@ namespace
           .protocolCommand = "cache_memlimit",
           .modifiers = Modifier::None,
           .handler = &MemoryLimit,
-          .nodeFallback = nullptr },
+          .nodeFallback = nullptr,
+          .session = nullptr },
     });
 } // namespace
 

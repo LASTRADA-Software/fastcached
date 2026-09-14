@@ -7,12 +7,15 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <format>
 #include <optional>
 #include <ranges>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include <tests/Unwrap.hpp>
@@ -337,6 +340,106 @@ TEST_CASE("the modifiers each verb does honour are accepted", "[cli][command]")
     CHECK(command.verbOptions.onlyIfAbsent);
 }
 
+TEST_CASE("every modifier is refused by name on every verb that does not honour it", "[cli][command]")
+{
+    // §9.19, derived over the WHOLE table rather than spot-checked: a new verb is a row,
+    // and a row that honours a modifier by accident is refused nowhere a sample would
+    // look. A probe per FLAG rather than per bit, because each modifier row states whether
+    // it was given through its own predicate, and the defect worth catching is a row
+    // reading ANOTHER row's field: `--xx` reading `onlyIfAbsent` leaves `ping --xx`
+    // accepted in silence. WHAT DISTINGUISHES is the flag and the verb the refusal names.
+    //
+    // Each verb is given exactly its minimum operand count, so the modifier is the only
+    // thing that can refuse -- `ParseCommand` checks arity before applicability.
+    struct Probe
+    {
+        std::uint8_t bit;
+        std::string_view flag;
+        std::string_view spelling;
+    };
+    auto const probes = std::to_array<Probe>({
+        { .bit = Modifier::Ttl, .flag = "--ttl", .spelling = "--ttl=30" },
+        { .bit = Modifier::Exclusivity, .flag = "--nx", .spelling = "--nx" },
+        { .bit = Modifier::Exclusivity, .flag = "--xx", .spelling = "--xx" },
+        { .bit = Modifier::Raw, .flag = "--raw", .spelling = "--raw" },
+        { .bit = Modifier::Everything, .flag = "--all", .spelling = "--all" },
+        { .bit = Modifier::Interval, .flag = "--interval", .spelling = "--interval=1000" },
+        { .bit = Modifier::Samples, .flag = "--samples", .spelling = "--samples=3" },
+    });
+
+    for (auto const& probe: probes)
+    {
+        auto checked = std::size_t { 0 };
+        for (auto const& verb: Verbs())
+        {
+            if ((verb.modifiers & probe.bit) != 0)
+                continue;
+
+            auto argv = std::vector<std::string> { std::string { verb.name } };
+            argv.insert(argv.end(), verb.minOperands, std::string { "x" });
+            argv.emplace_back(probe.spelling);
+
+            CAPTURE(verb.name, probe.flag);
+            auto const command = ParseCommand(argv);
+            CHECK(command.action == Action::UsageError);
+            CHECK(command.diagnostic.contains(std::format("{} means nothing for `{}`", probe.flag, verb.name)));
+            ++checked;
+        }
+
+        // Per probe: a modifier every verb honoured would check nothing for itself and
+        // pass, however many the other probes checked.
+        CAPTURE(probe.flag);
+        CHECK(checked > 0);
+    }
+}
+
+TEST_CASE("live-stats is the one verb that honours the interval and sample modifiers", "[cli][command]")
+{
+    // §9.19's other half: the mechanism watched ACCEPTING. Without it a check refusing
+    // both flags on every verb would pass the derived case above -- which is exactly what
+    // the tree looked like before this row existed.
+    auto const command = Parse({ "live-stats", "--interval=2000", "--samples=3" });
+    CHECK(command.action == Action::RunVerb);
+    REQUIRE(command.verbOptions.interval.has_value());
+    CHECK(Unwrap(command.verbOptions.interval) == std::chrono::milliseconds { 2000 });
+    REQUIRE(command.verbOptions.samples.has_value());
+    CHECK(Unwrap(command.verbOptions.samples) == 3);
+
+    // With a subject named, the operand stays an operand and the modifier stays a modifier.
+    auto const named = Parse({ "live-stats", "fleet", "--interval=5000" });
+    CHECK(named.action == Action::RunVerb);
+    CHECK(named.operands == std::vector<std::string> { "fleet" });
+
+    // "Set on this row alone" (#134 §1.5) is the property, so it is counted rather than
+    // assumed: a second row honouring either bit is a verb where the flags quietly apply.
+    auto const carriers = std::ranges::count_if(
+        Verbs(), [](VerbSpec const& verb) { return (verb.modifiers & (Modifier::Interval | Modifier::Samples)) != 0; });
+    CHECK(carriers == 1);
+}
+
+TEST_CASE("a malformed interval or sample count is refused as a value rather than as an unhonoured flag", "[cli][command]")
+{
+    // WHAT DISTINGUISHES is the sentence. `ping` honours neither flag, so every one of
+    // these would be a usage error even with no value grammar at all -- refused as
+    // *means nothing for `ping`*. Asserting only `UsageError` passes with the zero check
+    // deleted; asserting the value's own complaint does not.
+    auto const expectValueRefusal = [](std::string_view flag, std::string_view complaint) {
+        CAPTURE(flag);
+        auto const command = Parse({ "ping", flag });
+        CHECK(command.action == Action::UsageError);
+        CHECK(command.diagnostic.contains(complaint));
+        CHECK_FALSE(command.diagnostic.contains("means nothing"));
+    };
+
+    expectValueRefusal("--interval=soon", "whole number");
+    expectValueRefusal("--interval=-1", "whole number");
+    expectValueRefusal("--samples=many", "whole number");
+
+    // Zero is a well-formed count and still refused: `DashboardLimits` spells *no bound*
+    // as zero, so accepting it would turn `--samples=0` into *run forever*.
+    expectValueRefusal("--samples=0", "at least one sample");
+}
+
 TEST_CASE("nx and xx together are refused", "[cli][command]")
 {
     auto const command = Parse({ "set", "k", "v", "--nx", "--xx" });
@@ -422,6 +525,28 @@ TEST_CASE("the credential comes from the environment", "[cli][command]")
     CHECK_FALSE(user.credential.Configured());
 }
 
+TEST_CASE("the dashboard credential is its own file, and no environment variable reaches it", "[cli][command]")
+{
+    // #1399 D4. WHAT DISTINGUISHES: the path lands in `dashboardTokenFile` and in NOTHING the data port presents --
+    // one flag standing in for the other would hand the password to whoever may watch the fleet -- and the
+    // control is `--token-file`, which lands in `tokenFile` and leaves the dashboard's path empty.
+    auto const dashboard = Parse({ "--dashboard-token-file=/etc/fastcached/dashboard.token", "live-stats", "fleet" });
+    CHECK(dashboard.action == Action::RunVerb);
+    CHECK(dashboard.dashboardTokenFile == "/etc/fastcached/dashboard.token");
+    CHECK(dashboard.tokenFile.empty());
+    CHECK_FALSE(dashboard.credential.Configured());
+    // Read by `main`, never here: the parse holds the path and no secret.
+    CHECK(dashboard.dashboardToken.empty());
+
+    auto const data = Parse({ "--token-file=/etc/fastcached/requirepass", "live-stats", "fleet" });
+    CHECK(data.tokenFile == "/etc/fastcached/requirepass");
+    CHECK(data.dashboardTokenFile.empty());
+
+    // No variable spells it: the environment's lesser route is not offered to a new secret.
+    for (auto const& variable: CliEnvironment())
+        CHECK_FALSE(variable.name.contains("DASHBOARD"));
+}
+
 TEST_CASE("the admin address is unset by default and says so", "[cli][command]")
 {
     // Unset means the richest stats source is not asked, which is reported as *not
@@ -441,6 +566,7 @@ TEST_CASE("every outcome has a distinct exit code", "[cli][command]")
     // The pairs the table's own documentation promises to keep apart.
     CHECK(ExitCodeOf(Outcome::Negative) != ExitCodeOf(Outcome::Unreachable));
     CHECK(ExitCodeOf(Outcome::Refused) != ExitCodeOf(Outcome::Protocol));
+    CHECK(ExitCodeOf(Outcome::Local) != ExitCodeOf(Outcome::Refused));
     CHECK(ExitCodeOf(Outcome::Affirmative) == 0);
     CHECK(ExitCodeOf(Outcome::Usage) == 2);
 }
@@ -674,8 +800,9 @@ TEST_CASE("a verb's page states which modifiers it honours, from the table", "[c
 
 TEST_CASE("the ttl row does not disturb the applicability refusal", "[cli][command][help]")
 {
-    // The row it gained carries a NULL member pointer, which `UnhonouredModifier` reads
-    // through. A control: both directions still answer as they did.
+    // `--ttl` carries a VALUE, so whether it was given is a comparison against
+    // `TtlUnset` rather than a flag -- the one row shaped unlike its neighbours, and the
+    // one a predicate table is likeliest to get wrong. A control: both directions answer.
     CHECK(Parse({ "set", "k", "v", "--ttl", "5" }).action == Action::RunVerb);
 
     auto const refused = Parse({ "get", "k", "--ttl", "5" });
@@ -712,6 +839,36 @@ TEST_CASE("a verb's page says what a compile node does with it", "[cli][command]
     CHECK(cell(nodePage) != cell(getPage));
     CHECK(cell(versionPage) != cell(getPage));
     CHECK(cell(nodePage) != cell(versionPage));
+}
+
+TEST_CASE("a stats-wire verb's page does not say a compile node refuses it", "[cli][command][help]")
+{
+    // A compile node ANSWERS the stats wire -- `stats` through the ladder's node-metrics
+    // rung, `live-stats` through its node and fleet subjects -- and the stats wire is
+    // neither the node wire nor a row carrying a fallback, which were the only two ways
+    // the cell knew. So both pages said *refused by name*, on the page written to stop an
+    // operator dialling a machine to find out. That the node answers is asserted
+    // separately, against a scripted node, beside the node verbs.
+    //
+    // Derived over the table, and compared against a verb a node really does refuse, so a
+    // renderer that says the same thing for all of them fails rather than contains a word.
+    auto const* const get = FindVerb("get");
+    REQUIRE(get != nullptr);
+    REQUIRE(get->nodeFallback == nullptr);
+    auto const refused = CellOf(HelpTopicText(*get), "on a compile node");
+    REQUIRE_FALSE(refused.empty());
+
+    auto checked = 0;
+    for (auto const& verb: Verbs())
+    {
+        if (verb.wire != Wire::Stats)
+            continue;
+        INFO(verb.name);
+        CHECK(CellOf(HelpTopicText(verb), "on a compile node") != refused);
+        ++checked;
+    }
+    // `stats` and `live-stats` today; zero would make the loop above assert nothing.
+    CHECK(checked >= 2);
 }
 
 TEST_CASE("a verb that sends no single command says so rather than rendering absent", "[cli][command][help]")
@@ -773,7 +930,8 @@ namespace
                       .protocolCommand = "",
                       .modifiers = Modifier::None,
                       .handler = nullptr,
-                      .nodeFallback = nullptr };
+                      .nodeFallback = nullptr,
+                      .session = nullptr };
 }
 
 /// Where @p verb's row begins in @p text.
@@ -905,13 +1063,26 @@ TEST_CASE("a wire with no verbs gets no group and a wire with one still does", "
         CHECK(group.heading == WireTable[static_cast<std::size_t>(group.wire)].heading);
     }
 
-    // And the ACCEPTING direction from the real table rather than a synthetic one:
-    // `stats` is this tree's single-verb wire, and a grouping that dropped a group it
-    // thought too small would lose it while every other assertion here stayed green.
+    // And the ACCEPTING direction from the real table rather than a synthetic one: every
+    // wire the table has verbs on gets a group holding exactly those verbs, the smallest
+    // included -- a grouping that dropped a group it thought too small would lose one
+    // while every other assertion here stayed green.
+    //
+    // COUNTED per wire from the table, never a literal and never a named wire. This case
+    // used to say `== 1` beside a comment calling `stats` the single-verb wire, and
+    // `live-stats` is that wire's second row (#134 §1.1) -- a premise about a table's
+    // size that became false the moment the table grew, reddening a case whose property
+    // had not changed.
     auto const real = GroupVerbsByWire(Verbs());
-    auto const single = std::ranges::find(real, Wire::Stats, &VerbGroup::wire);
-    REQUIRE(single != real.end());
-    CHECK(single->verbs.size() == 1);
+    for (auto const& spec: WireTable)
+    {
+        INFO("wire: " << spec.name);
+        auto const rows = std::ranges::count(Verbs(), spec.wire, &VerbSpec::wire);
+        auto const group = std::ranges::find(real, spec.wire, &VerbGroup::wire);
+        CHECK((group != real.end()) == (rows > 0));
+        if (group != real.end())
+            CHECK(std::cmp_equal(group->verbs.size(), rows));
+    }
 }
 
 TEST_CASE("the help prints each wire's heading above that wire's own verbs", "[cli][command][help]")

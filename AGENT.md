@@ -557,6 +557,15 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
   `SettleWatch`'s rule on the write side. A test that reads one framed reply cannot see a
   frame emitted AFTER it, and "every frame but the last is a pulse" passes vacuously on a
   build that pulses none.
+- `Status::Push` is the SECOND exception, `static_assert`ed to `Op::Subscribe` alone. A stream
+  is PULLED: subscribers wake on the subject's tick grid and share one capture per tick, and a
+  parked push costs that subscriber one `Gap`, never a queue. No reactor waits on another's
+  capture and no subscriber waits for a CLAIMED one: it sends the newest published capture it has
+  not read, or a capture slower than a tick starves it. It is re-gated EVERY tick, or
+  removal fails open. The push hold is armed from the write's START, and a client leaves by
+  HALF-closing, since a close with pushes unread is a reset.
+- A stream frame a reactor frees after its owner touches only what it owns: the active count is
+  a `shared_ptr` the frame holds, never a member of the component it outlives.
 - Which verbs are reachable before authentication is a *column of the table*, and the gate
   runs before the payload is buffered.
 - A pre-auth verb carries its own payload ceiling, `static_assert`ed so a new one cannot
@@ -854,6 +863,9 @@ converting a store. Before `Cache/CowTreeStorage`, `CowTree/`.
 — counters and scrape surfaces. Before `Metrics/`, `/metrics`, `/healthz`.
 - A counter is a row in `MetricsCatalog`, `static_assert`ed to cover every enumerator; the
   renderer walks the table rather than a hand-picked list.
+- A live stream's ending is a row named for what was OBSERVED (goodbye, reset, stall, revoked,
+  not leader), and a stall is the surface's row, never an answer-deadline sweep. Its body is the
+  `StatsReading` `/metrics` renders, through ONE snapshot provider per process.
 - A refusal's wire code and its counter are one row — one fact, two audiences. `Refuse` takes
   the row, so there is no argument to pass a bare `ErrorCode` to, and every refusal on the
   surface goes through it, including the ones that already counted. The row is the REFUSAL,
@@ -1042,6 +1054,14 @@ what differs between compilers, standard libraries, hosts and tool versions.
   that macOS already compiles it*) answers YES and is WRONG here: a grep tests a NAME while the
   hazard is a SIGNATURE. `Core/NumericText.hpp`'s `ParseFiniteDouble` is the tree's one answer,
   and it pins the C locale as well.
+- **`std::ranges::iota` and `std::ranges::fold_left` are written `Ranges::Iota` and
+  `Ranges::FoldLeft`** (`Core/Ranges.hpp`). AppleClang's own libc++ has no `ranges::iota`, and
+  the one job compiling with it, `Package (macOS .pkg)`, is NOT a required context — so a direct
+  call merges green and breaks packaging after. The seam selects by FEATURE-TEST MACRO, never a
+  compiler ID, and is the standard function object wherever the library ships it; its fallback is
+  tested on EVERY platform. `ctest -R ranges-seam` refuses a direct call and DERIVES the wrapped
+  set from the header, so the next missing facility is a selection block there — never an `#if`
+  at a call site.
 - A `char` is UTF-8 here, at run time and at compile time: every Windows executable declares the
   UTF-8 process code page and MSVC gets `/utf-8`. Converting one boundary instead would leave
   `path`, `CreateProcessA` and `getenv` on the legacy page.

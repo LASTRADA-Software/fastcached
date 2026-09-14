@@ -140,7 +140,20 @@ using WireVersion = std::uint8_t;
 /// A RECEIPT and not a confirmation, which is a constraint on the shape as much as on
 /// the wording: see `ClusterAdmitReceipt`. Exact arity of two, like every other reply
 /// body here.
-inline constexpr WireVersion CurrentVersion = 8;
+///
+/// **9 added `Status::Push` and `Op::Subscribe`**: a live-stats session subscribes on a
+/// connection of its own and the node PUSHES what the dashboard draws, instead of the
+/// dashboard polling `/metrics` and `/fleet.txt` over HTTP
+/// ([#1399](https://github.com/LASTRADA-Software/fastcached/issues/1399)). A reply carries a
+/// status byte and no kind, and `DecodeReplyHeader` refuses a status it does not know, so a
+/// new status is a new reply grammar for every reader and the floor moves with it -- the
+/// version-3 argument exactly.
+///
+/// **Every node and every `fastcache-cc` upgrade together.** A launcher is a reader of this
+/// wire, and a version-8 launcher is refused by a version-9 node rather than served; on this
+/// project's one installation that is one rebuild of both binaries
+/// ([#332](https://github.com/LASTRADA-Software/fastcached/issues/332)).
+inline constexpr WireVersion CurrentVersion = 9;
 
 /// The oldest version this build still accepts. Equal to `CurrentVersion` while
 /// only one version exists; widen the range when a second one ships and this
@@ -270,7 +283,10 @@ inline constexpr WireVersion CurrentVersion = 8;
 /// again: one installation
 /// ([#332](https://github.com/LASTRADA-Software/fastcached/issues/332)), both binaries
 /// shipped together, and the stop-upgrade-start procedure that page already carries.
-inline constexpr WireVersion MinSupportedVersion = 8;
+///
+/// Version 9 moves it for version 3's reason: `Status::Push` is a status an older reader
+/// refuses, so accepting a version-8 request would answer it in a grammar it cannot read.
+inline constexpr WireVersion MinSupportedVersion = 9;
 
 /// Size of the fixed request header: magic, version, op, payload length.
 inline constexpr std::size_t RequestHeaderSize = WireFrame::HeaderSize;
@@ -465,6 +481,24 @@ enum class Op : std::uint8_t
     /// when one is configured -- because it decides who joins the fleet. It is the half
     /// of this pair that carries the authority; `Enroll` carries only a request.
     EnrollControl = 0x11,
+
+    /// Subscribe to what a live-stats panel draws, on a connection of its own.
+    ///
+    /// **The one request answered by a STREAM.** The node answers with `Status::Push` frames --
+    /// first `PushKind::Subscribed`, then a `Snapshot` every granted cadence and an `Event`
+    /// whenever a discrete fact changes -- and ends the stream with exactly one terminal reply:
+    /// `Ok` when it stops for its own orderly reason, `Error` naming why otherwise (`NotLeader`
+    /// after a demotion, `NotAMember` after a reload revoked the peer). A client that is done
+    /// closes the connection; there is no unsubscribe verb, because EOF already says it.
+    ///
+    /// **Its own connection, always.** A stream is a writer on the socket for as long as it
+    /// lives, and a second request on the same connection would put a second writer beside it
+    /// -- the one-writer rule the endpoint is built on. So a subscribed connection carries no
+    /// further request, and bytes arriving on one end it.
+    ///
+    /// Replaces polling for the dashboard only: `/metrics` and `/fleet.txt` stay what browsers
+    /// and Prometheus read.
+    Subscribe = 0x12,
 };
 
 /// Reply status, the first byte of every reply.
@@ -511,6 +545,16 @@ enum class Status : std::uint8_t
     /// probes perfectly while nothing above it does. Silence is what separates those,
     /// and silence is only measurable against something that would otherwise be said.
     Progress = 0x03,
+
+    /// A frame of a subscription's stream. Payload is `[u8 PushKind][fields]`. **Not** an
+    /// outcome: zero or more precede exactly one terminal status, like `Progress`.
+    ///
+    /// **The second exception to one-reply-per-request, and bounded the same way**: legal on
+    /// `Op::Subscribe` alone, `static_assert`ed by `PushIsSubscribeOnly`, never the last frame
+    /// of an exchange. It is a separate status rather than a `Progress` with a payload because
+    /// `Progress` is defined as carrying NOTHING -- a reader that ignores its payload is correct
+    /// by contract -- and a stream's frames are the answer itself.
+    Push = 0x04,
 };
 
 /// Whether @p raw is a status byte this build understands.
@@ -522,7 +566,7 @@ enum class Status : std::uint8_t
 /// @return True when it names a `Status`.
 [[nodiscard]] constexpr bool IsKnownStatus(std::uint8_t raw) noexcept
 {
-    constexpr std::array Known { Status::Miss, Status::Ok, Status::Error, Status::Progress };
+    constexpr std::array Known { Status::Miss, Status::Ok, Status::Error, Status::Progress, Status::Push };
     return std::ranges::any_of(Known, [raw](Status status) { return static_cast<std::uint8_t>(status) == raw; });
 }
 
@@ -533,10 +577,10 @@ enum class Status : std::uint8_t
 /// cache and worker exchanges, the admin CLI, and the protocol test client — and a
 /// reader that does not ask it treats the first progress frame as the answer.
 /// @param status The reply status.
-/// @return True for `Miss`, `Ok` and `Error`; false for `Progress`.
+/// @return True for `Miss`, `Ok` and `Error`; false for `Progress` and `Push`.
 [[nodiscard]] constexpr bool IsTerminalStatus(Status status) noexcept
 {
-    return status != Status::Progress;
+    return status != Status::Progress && status != Status::Push;
 }
 
 /// Why a command was refused. Travels as the first payload byte of an `Error`
@@ -1063,6 +1107,13 @@ enum class VerbFamily : std::uint8_t
     /// consult membership for `Enroll` opens exactly one door and leaves every existing
     /// gate answering what it answered before, which is checkable rather than argued.
     Enrollment,
+
+    /// Streams what a live-stats panel draws.
+    ///
+    /// Its own family because its one verb is answered by a stream, which no component that
+    /// answers request/reply verbs owns: a node routes it to the live hub, and a component
+    /// routing by family must not be handed a verb whose answer never returns.
+    Live,
 };
 
 /// One row of the opcode table: everything the framing layer knows about a verb.
@@ -1521,6 +1572,19 @@ inline constexpr std::array OpTable {
                    .preAuth = RequiresAuth,
                    .maxPayload = BoundedTo(MaxControlPayload),
                    .family = VerbFamily::Enrollment },
+
+    // Live stats (#1399). Not pre-auth: a dashboard reads the fleet, which is exactly what
+    // an unauthenticated stranger must not be shown.
+    OpDescriptor { .code = Op::Subscribe,
+                   .name = "subscribe",
+                   .fieldCount = 3, // subject, cadence, dashboard token
+                   // `Push` for the stream; `Ok` for a stream the node ends for its own orderly
+                   // reason; `Error` for a refusal at subscribe time or a revocation mid-stream.
+                   .legalStatuses =
+                       static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error) | StatusBit(Status::Push)),
+                   .preAuth = RequiresAuth,
+                   .maxPayload = BoundedTo(MaxControlPayload),
+                   .family = VerbFamily::Live },
 };
 
 /// Whether `Status::Progress` is confined to the one verb that can be slow enough to
@@ -1539,6 +1603,21 @@ inline constexpr std::array OpTable {
 }
 
 static_assert(ProgressIsCompileOnly(), "a progress pulse turns a reply into a stream; only COMPILE is long enough to");
+
+/// Whether `Status::Push` is confined to the one verb whose answer is a stream.
+///
+/// `ProgressIsCompileOnly`'s twin, for the second status that turns a reply into a stream: a
+/// verb that acquires it acquires a reader that loops and a writer that outlives the request,
+/// and that is a decision rather than something to inherit by editing a mask.
+/// @return True when `Op::Subscribe` is the only row admitting `Push`.
+[[nodiscard]] constexpr bool PushIsSubscribeOnly() noexcept
+{
+    return std::ranges::all_of(OpTable, [](OpDescriptor const& row) {
+        return row.code == Op::Subscribe || (row.legalStatuses & StatusBit(Status::Push)) == 0;
+    });
+}
+
+static_assert(PushIsSubscribeOnly(), "a push frame is a stream's; only SUBSCRIBE is answered by one");
 
 /// Whether every verb reachable before authentication declares a payload bound.
 ///
@@ -5004,6 +5083,377 @@ struct EnrollmentReport
                                                           .decision = static_cast<EnrollmentDecision>(decision[0]) });
     }
     return report;
+}
+
+// ---- Live stats (#1399) ------------------------------------------------------------------
+
+/// What a subscription is about. Explicit values because these bytes are transmitted; no
+/// trailing `Last`, for `EnrollmentDecision`'s reason.
+enum class LiveSubject : std::uint8_t
+{
+    /// A cache's figures: every counter, the storage block and its tiers. Served by a node with
+    /// a cache tier and by `fastcached`.
+    Cache = 0x00,
+    /// A compile node's figures: the cache's plus its host, consensus and `NodeStatusFields`.
+    Node = 0x01,
+    /// The fleet as the leader renders it. Leader-pinned: a follower refuses with `NotLeader`.
+    Fleet = 0x02,
+};
+
+/// One subject's wire facts.
+struct LiveSubjectRow
+{
+    LiveSubject subject;             ///< The subject this row describes.
+    std::string_view key;            ///< Its name in a refusal and on a command line.
+    std::chrono::milliseconds floor; ///< The shortest cadence the server grants.
+};
+
+/// Every subject this build serves, with the cadence floor the server clamps a request to.
+///
+/// **The floors are a server's, never a client's**: a watcher asking for less gets the floor
+/// and is told so in `PushKind::Subscribed`. Fleet's floor is the highest because its render
+/// scales with the machines, but it is no longer paid per watcher -- the leader renders once per
+/// tick and every subscriber shares the bytes -- which is why it sits below the 2000 ms a polling
+/// dashboard needed.
+inline constexpr std::array LiveSubjectTable {
+    LiveSubjectRow { .subject = LiveSubject::Cache, .key = "cache", .floor = std::chrono::milliseconds { 500 } },
+    LiveSubjectRow { .subject = LiveSubject::Node, .key = "node", .floor = std::chrono::milliseconds { 500 } },
+    LiveSubjectRow { .subject = LiveSubject::Fleet, .key = "fleet", .floor = std::chrono::milliseconds { 1000 } },
+};
+
+/// The row describing @p raw, or nullptr for a subject this build does not know.
+/// @param raw The subject byte, as received.
+/// @return The row, or nullptr.
+[[nodiscard]] constexpr LiveSubjectRow const* FindLiveSubject(std::uint8_t raw) noexcept
+{
+    // A loop returning the row's address rather than `find_if`, for `FindOp`'s reason: an
+    // iterator over a `std::array` is a raw pointer on two standard libraries and a class on
+    // MSVC's, so naming it `auto*` compiles on one platform only.
+    for (auto const& row: LiveSubjectTable)
+        if (static_cast<std::uint8_t>(row.subject) == raw)
+            return &row;
+    return nullptr;
+}
+
+/// The longest cadence the server grants. A subscriber asking for more gets this.
+inline constexpr std::chrono::milliseconds MaxLiveCadence { 60'000 };
+
+/// How many granted cadences a client waits in silence before it calls the stream dead.
+///
+/// A snapshot is sent every granted cadence whether or not anything changed, which is what
+/// makes silence measurable at all -- the pulse/idle pair's argument (#245). Three, so one
+/// frame delayed by a loaded host is not a disconnect.
+inline constexpr int LiveIdleCadences = 3;
+
+/// The client's bound on silence for a stream granted @p cadence.
+/// @param cadence What `PushKind::Subscribed` granted.
+/// @return How long a client waits for the next frame.
+[[nodiscard]] constexpr std::chrono::milliseconds LiveIdleBound(std::chrono::milliseconds cadence) noexcept
+{
+    return cadence * LiveIdleCadences;
+}
+
+static_assert(std::ranges::all_of(LiveSubjectTable,
+                                  [](LiveSubjectRow const& row) {
+                                      return row.floor.count() > 0 && row.floor <= MaxLiveCadence;
+                                  }),
+              "every live subject's floor must be a real cadence the server can grant");
+
+/// Live subscriptions one node serves at once; the next is refused `EndpointBusy`.
+inline constexpr std::size_t MaxLiveSubscriptions = 64;
+
+/// The shortest a single push may stay parked in a write before the connection is ended.
+///
+/// A reader that has stopped reading fills its socket buffer and parks the writer. The node
+/// renders on its own clock, so the ticks that subscriber misses meanwhile are told to it as one
+/// gap and nothing queues behind it, but the connection and its kernel buffers are held until
+/// this bound. The bound applied is the larger of this and
+/// `LiveIdleCadences` granted cadences, so a slow cadence is not cut shorter than its own idle
+/// bound.
+inline constexpr std::chrono::milliseconds MinLiveStreamWriteStall { 10'000 };
+
+/// What a `Status::Push` frame carries. Explicit values because these bytes are transmitted.
+enum class PushKind : std::uint8_t
+{
+    /// The stream's first frame: what was granted. Exactly once, first.
+    Subscribed = 0x00,
+    /// The subject's figures at one tick.
+    Snapshot = 0x01,
+    /// A discrete fact changed; the subject's next snapshot follows on the same tick.
+    Event = 0x02,
+    /// Cadences this subscriber missed while a push to it stayed parked. The next snapshot is the
+    /// present: nothing is queued for a slow subscriber, so nothing was dropped in any order.
+    Gap = 0x03,
+};
+
+/// A discrete change a stream reports as it happens. Explicit values: transmitted.
+enum class LiveEventKind : std::uint8_t
+{
+    MemberJoined = 0x00,     ///< A machine joined the cluster's member set.
+    MemberLeft = 0x01,       ///< A machine left the cluster's member set.
+    WorkerRegistered = 0x02, ///< A worker registered with the scheduler.
+    /// A worker left the scheduler's registry. It expired or it withdrew: an event is a difference
+    /// between two captures, which see only that it is gone, so the name says no more than that.
+    WorkerLeft = 0x03,
+    LeadershipChanged = 0x04, ///< Who leads the cluster changed.
+    SurveyChanged = 0x05,     ///< The node's toolchain survey state changed.
+    EnrollmentChanged = 0x06, ///< An enrollment window opened or closed.
+};
+
+/// Every event kind this build implements, as ONE list; see `KnownEnrollmentDecisions`.
+inline constexpr std::array KnownLiveEventKinds {
+    LiveEventKind::MemberJoined,      LiveEventKind::MemberLeft,        LiveEventKind::WorkerRegistered,
+    LiveEventKind::WorkerLeft,        LiveEventKind::LeadershipChanged, LiveEventKind::SurveyChanged,
+    LiveEventKind::EnrollmentChanged,
+};
+
+/// A SUBSCRIBE request's fields.
+struct SubscribeRequest
+{
+    LiveSubject subject { LiveSubject::Node }; ///< What to stream.
+    std::uint32_t cadenceMillis { 0 };         ///< The cadence asked for; the server clamps it.
+    /// The dashboard credential, or empty. Checked for `Fleet` when the node configures one; a
+    /// credential is a secret, so the request is the only place it travels.
+    std::string dashboardToken {};
+};
+
+/// Frame a SUBSCRIBE request.
+/// @param request What to subscribe to.
+/// @param version Version to advertise.
+/// @return The framed request.
+[[nodiscard]] inline std::vector<std::byte> EncodeSubscribeRequest(SubscribeRequest const& request,
+                                                                   WireVersion version = CurrentVersion)
+{
+    auto const subject = std::array { static_cast<std::byte>(request.subject) };
+    return Detail::EncodeRequest(version,
+                                 Op::Subscribe,
+                                 { std::span<std::byte const> { subject },
+                                   std::span<std::byte const> { EncodeU32Field(request.cadenceMillis) },
+                                   AsBytes(request.dashboardToken) });
+}
+
+/// Decode a SUBSCRIBE request's payload.
+/// @param payload The request body.
+/// @return The request, or nullopt when malformed or naming a subject this build does not know.
+[[nodiscard]] inline std::optional<SubscribeRequest> DecodeSubscribeRequest(std::span<std::byte const> payload)
+{
+    auto const fields = WireFields::SplitExactly(payload, 3);
+    if (!fields.has_value() || (*fields)[0].size() != 1)
+        return std::nullopt;
+    auto const subject = std::to_integer<std::uint8_t>((*fields)[0][0]);
+    auto const cadence = DecodeU32Field((*fields)[1]);
+    if (FindLiveSubject(subject) == nullptr || !cadence.has_value())
+        return std::nullopt;
+    return SubscribeRequest { .subject = static_cast<LiveSubject>(subject),
+                              .cadenceMillis = *cadence,
+                              .dashboardToken = std::string { AsStringView((*fields)[2]) } };
+}
+
+/// The cadence a server grants for @p subject when asked for @p asked.
+/// @param subject The subject.
+/// @param asked The cadence requested, in milliseconds; zero asks for the floor.
+/// @return The requested cadence clamped to `[floor, MaxLiveCadence]`.
+[[nodiscard]] constexpr std::chrono::milliseconds GrantLiveCadence(LiveSubject subject, std::uint32_t asked) noexcept
+{
+    auto const* const row = FindLiveSubject(static_cast<std::uint8_t>(subject));
+    auto const floor = row != nullptr ? row->floor : MaxLiveCadence;
+    return std::clamp(std::chrono::milliseconds { asked }, floor, MaxLiveCadence);
+}
+
+/// `PushKind::Subscribed`'s fields.
+struct LiveSubscribedFields
+{
+    LiveSubject subject { LiveSubject::Node }; ///< What is being streamed.
+    std::uint32_t grantedCadenceMillis { 0 };  ///< The cadence the server will keep.
+    /// The stats layout digest a `Cache` or `Node` snapshot is encoded in; zero for `Fleet`,
+    /// whose body is text. A client of another layout refuses the stream here, by name, before a
+    /// single snapshot arrives.
+    std::uint64_t statsLayout { 0 };
+    std::string endpoint {}; ///< The address the server answers on, for the dashboard's source line.
+};
+
+/// `PushKind::Snapshot`'s fields.
+///
+/// The body's grammar is the SUBJECT's and not this header's: `Fleet` is `RenderFleetText`'s
+/// document, `Cache` is one `EncodeStatsReading` field, and `Node` is two fields --
+/// `EncodeStatsReading` then `EncodeNodeStatus`. This header stays dependency-free, so the stats
+/// codec lives in `Metrics/StatsReadingCodec.hpp`.
+struct LiveSnapshotView
+{
+    std::uint64_t tick { 0 };           ///< The server tick this reading belongs to.
+    std::span<std::byte const> body {}; ///< The subject's encoding; borrows the frame.
+};
+
+/// `PushKind::Event`'s fields.
+struct LiveEventFields
+{
+    LiveEventKind kind { LiveEventKind::MemberJoined }; ///< What changed.
+    std::string detail {};                              ///< Who or what, for a person to read.
+};
+
+/// `PushKind::Gap`'s fields.
+struct LiveGapFields
+{
+    std::uint64_t dropped { 0 };   ///< How many of this subscriber's cadences passed without a snapshot.
+    std::uint64_t firstTick { 0 }; ///< The first tick missed.
+    std::uint64_t lastTick { 0 };  ///< The last tick missed.
+};
+
+namespace Detail
+{
+    /// A push payload: the kind byte, then the kind's fields.
+    ///
+    /// Framed exactly as `EncodeReply` frames a header: the length bounded first, then a vector
+    /// of its final size written through a span. Both simpler spellings fail gcc 14's `-O3`
+    /// build once inlined into a large enough caller. `reserve` then `push_back` leaves a
+    /// reallocation it reads as freeing an offset pointer (`free-nonheap-object`), and an
+    /// unbounded `1 + size` may wrap to an empty vector whose `front()` it reports as a null
+    /// dereference. Bounded below `MaxFramePayload`, neither is reachable, and an oversized push
+    /// is refused here rather than one layer later by `EncodeReply`.
+    /// @throws std::length_error When the payload would exceed the u32 frame length.
+    [[nodiscard]] inline std::vector<std::byte> EncodePush(PushKind kind, WireFields::FieldList fields)
+    {
+        auto const body = WireFields::Encode(fields);
+        if (body.size() >= MaxFramePayload)
+            throw std::length_error("compile-cache push payload exceeds the u32 wire length");
+
+        std::vector<std::byte> payload(1 + body.size());
+        std::span<std::byte> const out { payload };
+        out[0] = static_cast<std::byte>(kind);
+        std::ranges::copy(body, out.subspan(1).begin());
+        return payload;
+    }
+} // namespace Detail
+
+/// Encode a `Subscribed` push's payload.
+/// @param fields What was granted.
+/// @return The payload.
+[[nodiscard]] inline std::vector<std::byte> EncodeLiveSubscribed(LiveSubscribedFields const& fields)
+{
+    auto const subject = std::array { static_cast<std::byte>(fields.subject) };
+    auto const cadence = EncodeU32Field(fields.grantedCadenceMillis);
+    auto const layout = EncodeU64Field(fields.statsLayout);
+    return Detail::EncodePush(PushKind::Subscribed,
+                              WireFields::AsFields({ std::span<std::byte const> { subject },
+                                                     std::span<std::byte const> { cadence },
+                                                     std::span<std::byte const> { layout },
+                                                     AsBytes(fields.endpoint) }));
+}
+
+/// Encode a `Snapshot` push's payload.
+/// @param tick The server tick.
+/// @param body The subject's encoding.
+/// @return The payload.
+[[nodiscard]] inline std::vector<std::byte> EncodeLiveSnapshot(std::uint64_t tick, std::span<std::byte const> body)
+{
+    auto const at = EncodeU64Field(tick);
+    return Detail::EncodePush(PushKind::Snapshot, WireFields::AsFields({ std::span<std::byte const> { at }, body }));
+}
+
+/// Encode an `Event` push's payload.
+/// @param fields What changed.
+/// @return The payload.
+[[nodiscard]] inline std::vector<std::byte> EncodeLiveEvent(LiveEventFields const& fields)
+{
+    auto const kind = std::array { static_cast<std::byte>(fields.kind) };
+    return Detail::EncodePush(PushKind::Event,
+                              WireFields::AsFields({ std::span<std::byte const> { kind }, AsBytes(fields.detail) }));
+}
+
+/// Encode a `Gap` push's payload.
+/// @param fields What was missed.
+/// @return The payload.
+[[nodiscard]] inline std::vector<std::byte> EncodeLiveGap(LiveGapFields const& fields)
+{
+    auto const dropped = EncodeU64Field(fields.dropped);
+    auto const first = EncodeU64Field(fields.firstTick);
+    auto const last = EncodeU64Field(fields.lastTick);
+    return Detail::EncodePush(PushKind::Gap,
+                              WireFields::AsFields({ std::span<std::byte const> { dropped },
+                                                     std::span<std::byte const> { first },
+                                                     std::span<std::byte const> { last } }));
+}
+
+/// The kind of a push payload, and the bytes after it.
+struct PushView
+{
+    PushKind kind { PushKind::Subscribed }; ///< What the frame carries.
+    std::span<std::byte const> fields {};   ///< The kind's fields; borrows the frame.
+};
+
+/// Split a push payload into its kind and fields.
+/// @param payload A `Status::Push` frame's payload.
+/// @return The view, or nullopt when empty or naming a kind this build does not know.
+[[nodiscard]] inline std::optional<PushView> DecodePush(std::span<std::byte const> payload)
+{
+    if (payload.empty() || std::to_integer<std::uint8_t>(payload[0]) > static_cast<std::uint8_t>(PushKind::Gap))
+        return std::nullopt;
+    return PushView { .kind = static_cast<PushKind>(std::to_integer<std::uint8_t>(payload[0])),
+                      .fields = payload.subspan(1) };
+}
+
+/// Decode a `Subscribed` push's fields.
+/// @param fields `PushView::fields`.
+/// @return The fields, or nullopt when malformed.
+[[nodiscard]] inline std::optional<LiveSubscribedFields> DecodeLiveSubscribed(std::span<std::byte const> fields)
+{
+    auto const parts = WireFields::SplitExactly(fields, 4);
+    if (!parts.has_value() || (*parts)[0].size() != 1)
+        return std::nullopt;
+    auto const subject = std::to_integer<std::uint8_t>((*parts)[0][0]);
+    auto const cadence = DecodeU32Field((*parts)[1]);
+    auto const layout = DecodeU64Field((*parts)[2]);
+    if (FindLiveSubject(subject) == nullptr || !cadence.has_value() || !layout.has_value())
+        return std::nullopt;
+    return LiveSubscribedFields { .subject = static_cast<LiveSubject>(subject),
+                                  .grantedCadenceMillis = *cadence,
+                                  .statsLayout = *layout,
+                                  .endpoint = std::string { AsStringView((*parts)[3]) } };
+}
+
+/// Decode a `Snapshot` push's fields.
+/// @param fields `PushView::fields`.
+/// @return A view borrowing @p fields, or nullopt when malformed.
+[[nodiscard]] inline std::optional<LiveSnapshotView> DecodeLiveSnapshot(std::span<std::byte const> fields)
+{
+    auto const parts = WireFields::SplitExactly(fields, 2);
+    if (!parts.has_value())
+        return std::nullopt;
+    auto const tick = DecodeU64Field((*parts)[0]);
+    if (!tick.has_value())
+        return std::nullopt;
+    return LiveSnapshotView { .tick = *tick, .body = (*parts)[1] };
+}
+
+/// Decode an `Event` push's fields.
+/// @param fields `PushView::fields`.
+/// @return The fields, or nullopt when malformed or naming a kind this build does not know.
+[[nodiscard]] inline std::optional<LiveEventFields> DecodeLiveEvent(std::span<std::byte const> fields)
+{
+    auto const parts = WireFields::SplitExactly(fields, 2);
+    if (!parts.has_value() || (*parts)[0].size() != 1)
+        return std::nullopt;
+    auto const raw = std::to_integer<std::uint8_t>((*parts)[0][0]);
+    if (!std::ranges::any_of(KnownLiveEventKinds,
+                             [raw](LiveEventKind kind) { return static_cast<std::uint8_t>(kind) == raw; }))
+        return std::nullopt;
+    return LiveEventFields { .kind = static_cast<LiveEventKind>(raw), .detail = std::string { AsStringView((*parts)[1]) } };
+}
+
+/// Decode a `Gap` push's fields.
+/// @param fields `PushView::fields`.
+/// @return The fields, or nullopt when malformed.
+[[nodiscard]] inline std::optional<LiveGapFields> DecodeLiveGap(std::span<std::byte const> fields)
+{
+    auto const parts = WireFields::SplitExactly(fields, 3);
+    if (!parts.has_value())
+        return std::nullopt;
+    auto const dropped = DecodeU64Field((*parts)[0]);
+    auto const first = DecodeU64Field((*parts)[1]);
+    auto const last = DecodeU64Field((*parts)[2]);
+    if (!dropped.has_value() || !first.has_value() || !last.has_value())
+        return std::nullopt;
+    return LiveGapFields { .dropped = *dropped, .firstTick = *first, .lastTick = *last };
 }
 
 } // namespace FastCache::CompileCacheWire

@@ -19,8 +19,9 @@ cmake_minimum_required(VERSION 3.28)
 # The ticket enumerated the test binaries by hand and its table listed four. This
 # tree registers SIX with `catch_discover_tests`, five of them in a default
 # configuration; `fastcache-cli-tests` and `CowTreeTests` were in neither the
-# table nor any row. Neither is threaded, so the ticket's conclusion survived its
-# census -- but a hand list is exact about what it knows and silent about what it
+# table nor any row. Neither was threaded then, so the ticket's conclusion survived
+# its census (`fastcache-cli-tests` stopped being so with #134 and is a gate row
+# now) -- but a hand list is exact about what it knows and silent about what it
 # does not, and that silence reads identically to complete coverage (#492). The
 # census was written by whoever understood the gap best, and it still missed two.
 #
@@ -47,13 +48,35 @@ cmake_minimum_required(VERSION 3.28)
 # would wave through the next one, which is the argument `test-name-hygiene`
 # already makes for its own exemption rows.
 #
+# ## An exemption's claim is RE-MEASURED on every run
+#
+# Every exemption this table has carried rested on one claim: *no source under
+# this directory names a thread primitive*. That claim was written down with a
+# date and then never read again, and it went false -- `fastcache-cli-tests`
+# stayed exempt as "single-threaded" after #134 gave it a thread pool and two
+# suites asserting on thread identities, and this check went on passing, because
+# a reason was a string it only required to be non-empty.
+#
+# So a row names the DIRECTORY its claim is about, and the check scans it: a row
+# whose directory names a primitive in `FastCachedTsanThreadPrimitives` outside a
+# comment is refused, and so is a directory that is missing or holds no C++
+# source, since a claim about nothing verifies nothing.
+#
+# This is the thread CENSUS the section above declines to trust, and it is used
+# here in the one direction where its errors are cheap. Its false positive -- a
+# primitive NAMED by something that spawns nothing, `std::thread::id` for one --
+# refuses an exemption, and the remedy for that is to sanitize a binary that did
+# not strictly need it: a slower CI job, never a hidden race. Its false negative
+# -- a thread spawned through a helper defined outside the directory -- leaves
+# the row exactly as unverified as it was before this scan existed.
+#
 # ## What this check does NOT claim
 #
-# That the exempt binaries are unthreaded FOREVER. A reason here is a measurement
-# with a date, not an invariant; a binary that grows a thread keeps its exemption
-# until somebody notices. What the check guarantees is narrower and is the part
-# that actually failed: a NEW test binary cannot arrive with nobody having
-# decided.
+# That a clean scan proves an exempt binary single-threaded. It proves the
+# written claim still holds, which is weaker: the helper case above passes it.
+# What the check guarantees is that a NEW test binary cannot arrive with nobody
+# having decided, and that a decision resting on a claim cannot outlive the claim
+# where the claim is the kind a scan can re-take.
 #
 # Usage:
 #   cmake -DFASTCACHED_SOURCE_DIR=<dir> -P scripts/check-tsan-binaries.cmake
@@ -98,7 +121,11 @@ if(NOT FastCachedTsanGateTargets)
 endif()
 
 # ---------------------------------------------------------------------------
-# The exemptions. One row per binary: `"target|reason"`.
+# The exemptions. One row per binary: `"target|directory|reason"`.
+#
+# `directory` is the source directory the reason's claim is about, relative to
+# the source root and under `src/`. It is SCANNED, not recorded: see "An
+# exemption's claim is RE-MEASURED on every run" above.
 #
 # The reason is a forcing function rather than a dead field: it is what a reader
 # meeting a red run has to disagree with, and it is what makes a stale row visible
@@ -112,10 +139,29 @@ endif()
 # `carries no |` is a true description of a symptom whose cause is somewhere else.
 # ---------------------------------------------------------------------------
 set(FastCachedTsanBinaryExemptions
-    "compile-cache-testclient-tests|FASTCACHED_BUILD_TESTCLIENT is default OFF, so the clang-tsan configure does not declare this target at all, and no source under src/apps/compile-cache-testclient names std::thread, std::jthread, std::async or pthread (measured 2026-09-11 over *.cpp and *.hpp, not only the test sources)"
-    "fastcache-cli-tests|the operator client is single-threaded -- no source under src/apps/fastcache-cli names std::thread, std::jthread, std::async or pthread (measured 2026-09-11 over *.cpp and *.hpp)"
-    "CowTreeTests|no source under src/CowTree names std::thread, std::jthread, std::async or pthread (measured 2026-09-11 over *.cpp and *.hpp). The CoW store's concurrency question is a SECOND PROCESS -- an exclusive flock taken at Open, refusing the second opener by name -- which is not a data race and which ThreadSanitizer cannot observe from inside one process"
+    "compile-cache-testclient-tests|src/apps/compile-cache-testclient|FASTCACHED_BUILD_TESTCLIENT is default OFF, so the clang-tsan configure does not declare this target at all, and its sources name no thread primitive"
+    "CowTreeTests|src/CowTree|its sources name no thread primitive. The CoW store's concurrency question is a SECOND PROCESS -- an exclusive flock taken at Open, refusing the second opener by name -- which is not a data race and which ThreadSanitizer cannot observe from inside one process"
 )
+
+# The names an exempt directory must not contain, outside a comment.
+#
+# `ThreadPoolExecutor` is here because it is how this tree's own code reaches a
+# thread without spelling one: a suite that builds a pool and asserts which
+# thread a coroutine resumed on names neither `std::thread` nor `std::jthread`
+# in its spawning, and that is precisely the shape the stale CLI row missed.
+# Matched as whole identifiers, so `std::this_thread` and a longer name that
+# merely begins with one of these are not hits.
+set(FastCachedTsanThreadPrimitives
+    "std::thread"
+    "std::jthread"
+    "std::async"
+    "pthread_create"
+    "ThreadPoolExecutor"
+)
+
+# How many hits a refusal lists before counting the rest. One is enough to act
+# on; the count says how far the claim is from true, in the same unit it lists.
+set(FastCachedTsanClaimHitsShown 8)
 
 # Set by `check-tsan-binaries-selftest.cmake` alone, so that it can stage its
 # trees from the row set above and from the gate table this file just read,
@@ -217,6 +263,7 @@ endif()
 # ---------------------------------------------------------------------------
 set(exemptTargets "")
 set(problems "")
+set(scannedSourceCount 0)
 
 foreach(exemptionRow IN LISTS FastCachedTsanBinaryExemptions)
     string(FIND "${exemptionRow}" "|" exemptionBar)
@@ -229,13 +276,32 @@ foreach(exemptionRow IN LISTS FastCachedTsanBinaryExemptions)
         continue()
     endif()
     string(SUBSTRING "${exemptionRow}" 0 ${exemptionBar} exemptTarget)
-    math(EXPR exemptionReasonStart "${exemptionBar} + 1")
-    string(SUBSTRING "${exemptionRow}" ${exemptionReasonStart} -1 exemptReason)
+    math(EXPR exemptionRestStart "${exemptionBar} + 1")
+    string(SUBSTRING "${exemptionRow}" ${exemptionRestStart} -1 exemptionRest)
+    string(FIND "${exemptionRest}" "|" exemptionSecondBar)
+    if(exemptionSecondBar EQUAL -1)
+        string(APPEND problems
+            "  the exemption row for `${exemptTarget}` carries one `|` where a row "
+            "is `target|directory|reason`. The directory is what the reason's claim "
+            "is about, and this check scans it\n")
+        continue()
+    endif()
+    string(SUBSTRING "${exemptionRest}" 0 ${exemptionSecondBar} exemptDirectory)
+    string(STRIP "${exemptDirectory}" exemptDirectory)
+    math(EXPR exemptionReasonStart "${exemptionSecondBar} + 1")
+    string(SUBSTRING "${exemptionRest}" ${exemptionReasonStart} -1 exemptReason)
     string(STRIP "${exemptReason}" exemptReason)
 
     if(exemptTarget STREQUAL "")
         string(APPEND problems
             "  an exemption row names no binary before its `|`\n")
+        continue()
+    endif()
+    if(NOT exemptDirectory MATCHES "^src/" OR exemptDirectory MATCHES "(^|/)[.][.](/|$)")
+        string(APPEND problems
+            "  `${exemptTarget}` is exempt about the directory `${exemptDirectory}`, "
+            "which is not a path under `src/`. The claim is scanned, so it has to "
+            "name the binary's own sources\n")
         continue()
     endif()
     if(exemptReason STREQUAL "")
@@ -258,6 +324,99 @@ foreach(exemptionRow IN LISTS FastCachedTsanBinaryExemptions)
         string(APPEND problems
             "  `${exemptTarget}` is BOTH a TARGETS row in scripts/tsan-gate.sh and "
             "exempt here. It is sanitized; delete the exemption\n")
+        continue()
+    endif()
+
+    # The claim, re-taken.
+    set(claimRoot "${FASTCACHED_SOURCE_DIR}/${exemptDirectory}")
+    if(NOT IS_DIRECTORY "${claimRoot}")
+        string(APPEND problems
+            "  `${exemptTarget}` is exempt about `${exemptDirectory}`, which does not "
+            "exist. Point the row at the binary's sources, or delete it\n")
+        continue()
+    endif()
+    file(GLOB_RECURSE claimSources LIST_DIRECTORIES false
+        "${claimRoot}/*.cpp" "${claimRoot}/*.cc" "${claimRoot}/*.hpp" "${claimRoot}/*.h")
+    list(SORT claimSources)
+    list(LENGTH claimSources claimSourceCount)
+    if(claimSourceCount EQUAL 0)
+        string(APPEND problems
+            "  `${exemptTarget}` is exempt about `${exemptDirectory}`, which holds no "
+            "C++ source. A claim about an empty directory verifies nothing\n")
+        continue()
+    endif()
+    math(EXPR scannedSourceCount "${scannedSourceCount} + ${claimSourceCount}")
+
+    set(claimHits "")
+    set(claimHitCount 0)
+    foreach(claimSource IN LISTS claimSources)
+        file(READ "${claimSource}" claimContent)
+        # Whole-file first: every file in these directories is read, and walking
+        # one by line only when a raw FIND says a primitive is somewhere in it keeps
+        # the clean case -- nearly all of them -- to one read and a few FINDs.
+        set(claimMaybe FALSE)
+        foreach(primitive IN LISTS FastCachedTsanThreadPrimitives)
+            string(FIND "${claimContent}" "${primitive}" primitiveAt)
+            if(NOT primitiveAt EQUAL -1)
+                set(claimMaybe TRUE)
+                break()
+            endif()
+        endforeach()
+        if(NOT claimMaybe)
+            continue()
+        endif()
+
+        file(RELATIVE_PATH claimRelative "${FASTCACHED_SOURCE_DIR}" "${claimSource}")
+        set(claimLineNumber 0)
+        while(NOT claimContent STREQUAL "")
+            string(FIND "${claimContent}" "\n" claimNewline)
+            if(claimNewline EQUAL -1)
+                set(claimLine "${claimContent}")
+                set(claimContent "")
+            else()
+                string(SUBSTRING "${claimContent}" 0 ${claimNewline} claimLine)
+                math(EXPR claimNewline "${claimNewline} + 1")
+                string(SUBSTRING "${claimContent}" ${claimNewline} -1 claimContent)
+            endif()
+            math(EXPR claimLineNumber "${claimLineNumber} + 1")
+
+            # A COMMENT IS NOT A CALL SITE: a line that is a `//` comment or the
+            # body of a `/* */` block, leading blanks allowed.
+            if(claimLine MATCHES "^[ \t]*(//|/[*]|[*])")
+                continue()
+            endif()
+            foreach(primitive IN LISTS FastCachedTsanThreadPrimitives)
+                string(FIND "${claimLine}" "${primitive}" primitiveAt)
+                if(primitiveAt EQUAL -1)
+                    continue()
+                endif()
+                string(REPLACE "." "[.]" primitivePattern "${primitive}")
+                if(claimLine MATCHES "(^|[^A-Za-z0-9_])${primitivePattern}([^A-Za-z0-9_]|$)")
+                    math(EXPR claimHitCount "${claimHitCount} + 1")
+                    if(claimHitCount LESS_EQUAL FastCachedTsanClaimHitsShown)
+                        string(APPEND claimHits "      ${claimRelative}:${claimLineNumber} names ${primitive}\n")
+                    endif()
+                endif()
+            endforeach()
+        endwhile()
+    endforeach()
+
+    if(claimHitCount GREATER FastCachedTsanClaimHitsShown)
+        math(EXPR claimHitsHidden "${claimHitCount} - ${FastCachedTsanClaimHitsShown}")
+        string(APPEND claimHits
+            "      and ${claimHitsHidden} more of ${claimHitCount} (line, primitive) hit(s), not listed\n")
+    endif()
+    if(NOT claimHits STREQUAL "")
+        string(APPEND problems
+            "  `${exemptTarget}` is exempt because its sources under `${exemptDirectory}` "
+            "name no thread primitive, and that NO LONGER HOLDS:\n${claimHits}"
+            "    A binary that names one is sanitized, not exempted. Run it under "
+            "ThreadSanitizer FIRST, then make it a `TARGETS` row in scripts/tsan-gate.sh, "
+            "add it to the clang-tsan job's build step in .github/workflows/build.yml, "
+            "and delete this row. Rewording the reason does not answer this: the scan "
+            "reads the directory, not the reason. What a clean scan would NOT have "
+            "established is that the binary is single-threaded -- a thread spawned "
+            "through a helper defined outside the directory passes it\n")
         continue()
     endif()
 
@@ -316,4 +475,5 @@ string(REPLACE ";" ", " renderedExempt "${exemptTargets}")
 message("tsan binaries: ${registeredCount} Catch2 binary(ies) registered across "
         "${scanCount} CMakeLists.txt file(s); ${gatedCount} sanitized "
         "(${renderedGateTargets}); ${exemptCount} exempt with a written reason "
-        "(${renderedExempt})")
+        "(${renderedExempt}), whose ${scannedSourceCount} source(s) name no thread "
+        "primitive")

@@ -469,6 +469,9 @@ if(TARGET Catch2::Catch2WithMain)
     add_executable(fastcache-tui-tests
         endo/tui/runtime/TuiRuntime_test.cpp
         endo/tui/runtime/Modal_test.cpp
+        endo/tui/TerminalQuery_test.cpp
+        endo/tui/TerminalInputWin32_test.cpp
+        endo/tui/Sixel_test.cpp
         endo/platform/SystemPipe.cpp
         endo/platform/WinsockInit.cpp
     )

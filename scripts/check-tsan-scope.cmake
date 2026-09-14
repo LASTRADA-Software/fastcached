@@ -125,6 +125,7 @@ set(FastCachedTsanScope
     "src/FastCache/Cache/ExpiryReaper_test.cpp"
     "src/FastCache/Cache/ShardedStorage_test.cpp"
     "src/FastCache/Core/Clock_test.cpp"
+    "src/FastCache/Protocol/LiveStreamReactors_test.cpp"
     "src/FastCache/Protocol/RedisRespSocket_test.cpp"
     "src/FastCache/Server/ReactorServerLoop_test.cpp"
     "src/FastCache/Server/ReadinessAnnouncer_test.cpp"
@@ -137,11 +138,13 @@ set(FastCachedTsanGate "${FASTCACHED_SOURCE_DIR}/scripts/tsan-gate.sh")
 # ---------------------------------------------------------------------------
 # Parse the tag expressions out of the gate's TARGETS table.
 #
-# A row is "name|tagExpression"; an empty expression means the binary is run
-# whole, which selects everything and so contributes no constraint. Every failure
-# to parse is fatal, because a scope this cannot read must not read as an empty
-# scope -- the whole file exists because "nothing was checked" and "everything is
-# fine" look identical otherwise.
+# A row is "name|tagExpression|links"; an empty expression means the binary is run
+# whole, which selects everything and so contributes no constraint. The expression
+# is everything between the FIRST `|` and the LAST, so it may hold a `|` of its own.
+# `links` is what `tsan-gate.sh` holds the build's link graph to (#134):
+# `first-party`, or `none: <reason>`. Every failure to parse is fatal, because a
+# scope this cannot read must not read as an empty scope -- the whole file exists
+# because "nothing was checked" and "everything is fine" look identical otherwise.
 
 if(NOT EXISTS "${FastCachedTsanGate}")
     message(FATAL_ERROR
@@ -226,8 +229,8 @@ endif()
 # Sliced by POSITION rather than matched with a regex naming a quote character,
 # for the same reason the table is walked with FIND/SUBSTRING above: this reader
 # stays free of the escaping the surrounding file argues against, and a row is
-# `"name|tagExpression"` by construction -- the parser refuses the table outright
-# if it is not.
+# `"name|tagExpression|links"` by construction -- the parser refuses the table
+# outright if it is not.
 set(FastCachedTsanGateTargets "")
 foreach(row IN LISTS targetRows)
     string(LENGTH "${row}" rowLength)
@@ -235,7 +238,7 @@ foreach(row IN LISTS targetRows)
         message(FATAL_ERROR
             "check-tsan-scope: the TARGETS table in ${FastCachedTsanGate} holds "
             "an empty row.\n"
-            "Every row is `\"name|tagExpression\"`; an empty one is a row that "
+            "Every row is `\"name|tagExpression|links\"`; an empty one is a row that "
             "names no binary, which would silently shrink the sanitized scope. "
             "The rule lives in ${CMAKE_CURRENT_LIST_FILE}.")
     endif()
@@ -245,7 +248,7 @@ foreach(row IN LISTS targetRows)
     if(rowBar EQUAL -1)
         message(FATAL_ERROR
             "check-tsan-scope: the TARGETS row ${row} carries no `|`.\n"
-            "A row is `\"name|tagExpression\"` and the separator is what tells a "
+            "A row is `\"name|tagExpression|links\"` and the separator is what tells a "
             "binary name from a tag expression -- a row without one would be read "
             "as a target called `${rowName}` run with no tags, which is a "
             "different and much wider scope than whoever wrote it meant. The rule "
@@ -263,9 +266,32 @@ endforeach()
 
 set(FastCachedTsanScopeTags "")
 foreach(row IN LISTS targetRows)
-    # "name|[a],[b]" -> [a],[b] -> a;b
+    # "name|[a],[b]|links" -> [a],[b] -> a;b
     string(REGEX REPLACE "^\"[^|]*\\|" "" rowTags "${row}")
     string(REGEX REPLACE "\"$" "" rowTags "${rowTags}")
+    string(FIND "${rowTags}" "|" rowLastBar REVERSE)
+    if(rowLastBar EQUAL -1)
+        message(FATAL_ERROR
+            "check-tsan-scope: the TARGETS row ${row} declares nothing about what it "
+            "links.\n"
+            "A row is `\"name|tagExpression|links\"`, and links is `first-party` when "
+            "the binary links a static library this project builds, or `none: <reason>` "
+            "when it does not. scripts/tsan-gate.sh holds the build's link graph to it, "
+            "so a row that says nothing would let a misread graph pass. The rule lives "
+            "in ${CMAKE_CURRENT_LIST_FILE}.")
+    endif()
+    math(EXPR rowLinksStart "${rowLastBar} + 1")
+    string(SUBSTRING "${rowTags}" ${rowLinksStart} -1 rowLinks)
+    string(SUBSTRING "${rowTags}" 0 ${rowLastBar} rowTags)
+    if(NOT rowLinks STREQUAL "first-party" AND NOT rowLinks MATCHES "^none: .*[^ ]")
+        message(FATAL_ERROR
+            "check-tsan-scope: the TARGETS row ${row} declares `${rowLinks}` about what "
+            "it links.\n"
+            "The declaration is `first-party`, or `none: ` followed by the reason the "
+            "binary links no library of this project's. A `none` with no reason is "
+            "`forgot` spelled in the vocabulary of `decided`. The rule lives in "
+            "${CMAKE_CURRENT_LIST_FILE}.")
+    endif()
     string(REGEX MATCHALL "\\[([A-Za-z0-9_-]+)\\]" rowTagMatches "${rowTags}")
     foreach(tagMatch IN LISTS rowTagMatches)
         string(REGEX REPLACE "^\\[|\\]$" "" tag "${tagMatch}")

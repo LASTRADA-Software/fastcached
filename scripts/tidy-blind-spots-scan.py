@@ -16,7 +16,36 @@
 import json, os, subprocess, sys
 db = json.load(open(os.environ["DB"]))
 nm, repo = os.environ["NM_BIN"], os.environ["REPO"]
+
+
+def address_sanitized(cmd):
+    """Whether AddressSanitizer is ON for this compile, the LAST flag deciding.
+
+    The two-symbol signature below is the sanitizer's, so it measures only an object the
+    sanitizer instrumented. A unit compiled with it turned off -- `sanitizer-absent-probe`,
+    the vendor-sanitized control, is `-fno-sanitize=all` ON PURPOSE -- defines exactly its
+    own code, and one small function is 1 symbol: scored, it read as blind while clang-tidy
+    reads its source like any other. Order matters because target options follow the
+    directory-scoped `-fsanitize=address`, and a later `-fsanitize=` turns it back on.
+
+    The exemption is THE COMPILE LINE DISABLED THE SANITIZER, read from the command, and
+    nothing else. It is not "objects with few symbols": an instrumented object with one
+    symbol is exactly what the signature exists to call blind, and it still is.
+    """
+    on = False
+    for token in cmd:
+        if token.startswith("-fsanitize="):
+            if "address" in token.split("=", 1)[1].split(","):
+                on = True
+        elif token.startswith("-fno-sanitize="):
+            values = token.split("=", 1)[1].split(",")
+            if "all" in values or "address" in values:
+                on = False
+    return on
+
+
 best = {}
+unmeasured = set()
 for e in db:
     src = e["file"]
     cmd = e["command"].split()
@@ -39,7 +68,16 @@ for e in db:
     # denylist is exact about what it knows and silent about what it does not.
     if not key.startswith("src" + os.sep):
         continue
+    if not address_sanitized(cmd):
+        unmeasured.add(key)
+        continue
     best[key] = min(best.get(key, 1 << 30), n)
+# Named, never dropped: a unit this cannot measure is a third answer beside blind and
+# analysed. A unit measured by ANOTHER, sanitized compile keeps that measurement.
+for key in sorted(unmeasured - best.keys()):
+    print(f"NOTE {key}: not measured -- the compile line disabled the sanitizer, so "
+          f"AddressSanitizer's empty-object signature does not apply to its object. That is the "
+          f"whole exemption: an instrumented object with few symbols is still scored", file=sys.stderr)
 if not best:
     print("!ERROR no objects found; run this after a build", file=sys.stderr)
     sys.exit(2)

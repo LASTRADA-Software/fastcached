@@ -12,13 +12,24 @@
 #include "CliCommand.hpp"
 #include "CliFormat.hpp"
 #include "CliVerbs.hpp"
+#include "LiveSession.hpp"
+#include "LiveSubscriber.hpp"
+#include "SixelEncoder.hpp"
 #include "SocketExchange.hpp"
 #include "StatsGatherer.hpp"
+#include "TerminalCellWidth.hpp"
 
+#include <FastCache/Async/PlatformReactor.hpp>
+#include <FastCache/Async/ThreadPoolExecutor.hpp>
+#include <FastCache/Core/BoundedDrain.hpp>
+#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Platform/Environment.hpp>
+#include <FastCache/Platform/StopSignal.hpp>
 #include <FastCache/Platform/Terminal.hpp>
 
 #include <cstdio>
+#include <cstdlib>
+#include <format>
 #include <fstream>
 #include <iostream>
 #include <memory>
@@ -26,6 +37,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #if defined(_WIN32)
@@ -141,6 +153,232 @@ void ReportAdvisories(Answer const& answer, bool quiet)
     return ExitCodeOf(Outcome::Usage);
 }
 
+/// The credential the admin surface is presented, when one was configured.
+/// @param command The parsed command.
+/// @return The bearer, or nullopt.
+[[nodiscard]] std::optional<std::string> AdminBearer(Command const& command)
+{
+    return command.credential.Configured() ? std::optional<std::string> { command.credential.secret } : std::nullopt;
+}
+
+/// A session's frames, to stdout, each flushed as it is presented.
+///
+/// Flushed per frame because a pipe is block-buffered: without it a reader downstream of
+/// `live-stats | tee` sees nothing for a buffer's worth of samples, which reads as a stalled
+/// session rather than a buffered one.
+class StdoutFrames final: public IFrameSink
+{
+  public:
+    // Text alone: a pipe draws no image, and the piped view places none.
+    void PresentPlaced(DashboardFrame const& frame) override
+    {
+        std::cout << frame.text << std::flush;
+    }
+};
+
+/// A piped session's remarks, to stderr as they happen, unless `--quiet`.
+class StderrRemarks final: public IRemarkSink
+{
+  public:
+    /// @param quiet Whether remarks are suppressed.
+    explicit StderrRemarks(bool quiet) noexcept:
+        _quiet { quiet }
+    {
+    }
+
+    void Remark(std::string_view line) override
+    {
+        if (_quiet)
+            return;
+        std::cerr << ProgramName << ": " << line << '\n' << std::flush;
+    }
+
+  private:
+    bool _quiet;
+};
+
+/// The process's own Ctrl-C, installed for a session with no terminal.
+class ProcessStopSignals final: public IStopSignalInstaller
+{
+  public:
+    [[nodiscard]] std::expected<std::unique_ptr<IStopSignal>, std::string> Install() override
+    {
+        return InstallStopSignal();
+    }
+};
+
+/// The terminal a human session at a terminal draws on: this process's standard streams.
+///
+/// Make, then start: `MakeTerminalEvents` touches no terminal, and `StartTerminal` consumes what
+/// it made and acquires it on @p pool -- raw mode, then the queries the rung is decided from. A
+/// terminal that could not be made or acquired is the reason the session is refused with; this
+/// adapter decides nothing about it.
+class StandardTerminalAcquisition final: public ITerminalAcquisition
+{
+  public:
+    /// @param colour `--color`, resolved once by `ResolveColor`: what the capability record says of colour.
+    explicit StandardTerminalAcquisition(UsageColor colour) noexcept:
+        _colour { colour }
+    {
+    }
+
+    [[nodiscard]] Task<std::expected<StartedTerminal, std::string>> Acquire(IExecutor* pool, IExecutor* resumeOn) override
+    {
+        auto unstarted = MakeTerminalEvents(pool, resumeOn, _colour);
+        if (!unstarted.has_value())
+            co_return std::unexpected(std::move(unstarted).error());
+        co_return co_await StartTerminal(*std::move(unstarted));
+    }
+
+  private:
+    UsageColor _colour;
+};
+
+/// How this process ends once its session was abandoned: flushed, told, and gone without unwinding.
+class ProcessAbandonedExit final: public IAbandonedExit
+{
+  public:
+    /// @param quiet Whether remarks are suppressed.
+    explicit ProcessAbandonedExit(bool quiet) noexcept:
+        _quiet { quiet }
+    {
+    }
+
+    void Flush() override
+    {
+        std::cout.flush();
+        std::fflush(stdout);
+    }
+
+    void Say(Answer const& answer, std::string_view line) override
+    {
+        ReportAdvisories(answer, _quiet);
+        std::cerr << ProgramName << ": " << line << '\n' << std::flush;
+    }
+
+    void Exit(int code) override
+    {
+        std::_Exit(code);
+    }
+
+  private:
+    bool _quiet;
+};
+
+/// Stops a reactor when it goes out of scope, however that happens.
+///
+/// Declared after the thread running the reactor, so it is destroyed first: a `jthread` joins a
+/// loop nobody stopped otherwise, and an exception out of a session would hang the process
+/// instead of ending it.
+class StopReactorOnExit
+{
+  public:
+    explicit StopReactorOnExit(IReactor& reactor) noexcept:
+        _reactor { reactor }
+    {
+    }
+
+    StopReactorOnExit(StopReactorOnExit const&) = delete;
+    StopReactorOnExit(StopReactorOnExit&&) = delete;
+    StopReactorOnExit& operator=(StopReactorOnExit const&) = delete;
+    StopReactorOnExit& operator=(StopReactorOnExit&&) = delete;
+
+    ~StopReactorOnExit()
+    {
+        _reactor.Stop();
+    }
+
+  private:
+    IReactor& _reactor;
+};
+
+/// Run a verb that watches rather than answers once, and report how it ended.
+///
+/// Acquisition only, like the rest of this file: the threads, the clock, the sink and the
+/// process's Ctrl-C, and the terminal. `RunLiveStatsSession` decides everything, and returns once the session has
+/// drained or the drain gave up.
+///
+/// **Member order is the teardown.** The reactor is stopped, its thread joined, and only then
+/// is the source destroyed, before the pools and the reactor it borrowed from -- an object a
+/// reactor owns dies with that reactor stopped.
+///
+/// **An abandonment ends the process here, without unwinding**: a read still inside the
+/// subscription holds it and the connection this stack owns, and returning would destroy them
+/// under the pool thread. A terminal read may be parked too, so the terminal is put back through
+/// its restore handle rather than by destroying anything, before the flush and the line --
+/// `EndAbandonedSession` owns that order.
+/// @param command The parsed command.
+/// @param verb The verb; its `session` is not null.
+/// @param context What the session runs against.
+/// @param openingRemarks The connections' own remarks.
+/// @return The process exit code.
+[[nodiscard]] int RunSessionAndReport(Command const& command,
+                                      VerbSpec const& verb,
+                                      VerbContext const& context,
+                                      std::vector<std::string> const& openingRemarks)
+{
+    auto const render =
+        RenderOptions { .format = command.format, .color = UsageColor::Plain, .absentOverride = command.absentOverride };
+
+    SteadyClock clock;
+    PlatformReactor reactor { clock };
+    // Declared BEFORE the pool that reads it, so it is destroyed after that pool has joined: a read
+    // still inside it when the pool drains would otherwise run on a destroyed object.
+    NodeSubscription subscription { command.timeouts, command.credential };
+    ThreadPoolExecutor streamPool { 1 };
+    ThreadPoolExecutor stopWaiter { 1 };
+    ThreadPoolExecutor terminalPool { 1 };
+    StdoutFrames sink;
+    StderrRemarks remarks { command.quiet };
+    ProcessStopSignals stops;
+    StandardTerminalAcquisition terminals { ResolveColor(command.color) };
+    // A build without the terminal library has no encoder, and its sessions never reach the Sixel
+    // rung; the chart is then simply not drawn.
+    auto sixel = MakeSixelEncoder();
+    StandardRungViews views { render, &TerminalCellWidth, sixel.has_value() ? sixel->get() : nullptr };
+    ThreadDrainWait drainWait;
+    std::optional<LiveEventSource> source;
+    std::jthread reactorThread { [&reactor] { reactor.Run(); } };
+    auto const stopReactor = StopReactorOnExit { reactor };
+
+    auto ending = verb.session(context,
+                               LiveSessionSeat { .reactor = &reactor,
+                                                 .endpoint = command.cache,
+                                                 .dashboardToken = command.dashboardToken,
+                                                 .clock = &clock,
+                                                 .subscription = &subscription,
+                                                 .streamPool = &streamPool,
+                                                 .stopWaiter = &stopWaiter,
+                                                 .terminalPool = &terminalPool,
+                                                 .sink = &sink,
+                                                 .remarks = &remarks,
+                                                 .streamsInteractive = StandardStreamsAreInteractive(),
+                                                 .render = render,
+                                                 .terminals = &terminals,
+                                                 .stops = &stops,
+                                                 .views = &views,
+                                                 .drainWait = &drainWait,
+                                                 .drainBound = DrainBound {},
+                                                 .source = &source });
+
+    auto& answer = ending.answer;
+    PrependRemarks(answer, openingRemarks);
+
+    if (ending.kind == SessionEndKind::Abandoned)
+    {
+        auto exit = ProcessAbandonedExit { command.quiet };
+        EndAbandonedSession(ending, exit);
+    }
+
+    // A session that ran has already written everything it had to say, one frame at a time;
+    // only a refusal is rendered, exactly as any verb's refusal is.
+    if (ending.kind == SessionEndKind::Refused)
+        std::cout << RenderValue(answer.value, render);
+
+    ReportAdvisories(answer, command.quiet);
+    return ExitCodeOf(answer.outcome);
+}
+
 /// Run the verb the command named and write its answer.
 /// @param command The parsed command.
 /// @param verb The verb it named.
@@ -219,14 +457,8 @@ void ReportAdvisories(Answer const& answer, bool quiet)
         }
     }
 
-    auto gatherer = LadderGatherer {
-        command.admin,
-        command.cache,
-        command.timeouts,
-        command.credential.Configured() ? std::optional<std::string> { command.credential.secret } : std::nullopt,
-        resp.get(),
-        node.get()
-    };
+    auto gatherer =
+        LadderGatherer { command.admin, command.cache, command.timeouts, AdminBearer(command), resp.get(), node.get() };
 
     auto const context = VerbContext { .operands = command.operands,
                                        .options = command.verbOptions,
@@ -237,7 +469,13 @@ void ReportAdvisories(Answer const& answer, bool quiet)
                                        // The same object twice, deliberately: it holds the one cached
                                        // answer to "what is this endpoint", which both the stats ladder
                                        // and any verb reaching the admin surface are asking about.
-                                       .admin = &gatherer };
+                                       .admin = &gatherer,
+                                       // And a third time: what the endpoint IS is that same cached
+                                       // answer, which `live-stats` decides its subject from.
+                                       .identity = &gatherer };
+
+    if (verb.session != nullptr)
+        return RunSessionAndReport(command, verb, context, openingRemarks);
 
     auto answer = RunVerb(verb, context);
 
@@ -252,8 +490,13 @@ void ReportAdvisories(Answer const& answer, bool quiet)
     // client cannot read as a reply, and reporting *the reply could not be read* for a
     // binary that speaks another protocol entirely sends an operator hunting a codec
     // bug.
+    //
+    // And only for a wire that did not dial `0xFC` itself. One that did either holds that
+    // connection, so its verb has had the node's answer already, or failed to open it --
+    // and a second dial to the same address spends another connect timeout to learn what
+    // the first one said.
     auto const unanswered = answer.outcome == Outcome::Unreachable || answer.outcome == Outcome::Protocol;
-    if (unanswered && verb.wire != Wire::Node && node == nullptr)
+    if (unanswered && !wire.needsNode)
     {
         if (auto probe = NodeExchange::Open(command.cache, command.timeouts, command.credential); probe.has_value())
         {
@@ -270,7 +513,7 @@ void ReportAdvisories(Answer const& answer, bool quiet)
     // The connection's own remarks come first: they are about the whole exchange
     // rather than about this one answer, and an operator reading downwards wants
     // "your credential was ignored" before "the key does not exist".
-    answer.advisories.insert(answer.advisories.begin(), openingRemarks.begin(), openingRemarks.end());
+    PrependRemarks(answer, openingRemarks);
 
     if (answer.rawPayload.has_value())
         WriteRaw(*answer.rawPayload);
@@ -335,6 +578,13 @@ int main(int argc, char* argv[])
         if (!secret.has_value())
             return ReportUsageError(secret.error());
         command.credential.secret = *secret;
+    }
+    if (!command.dashboardTokenFile.empty())
+    {
+        auto const secret = ReadSecretFile(command.dashboardTokenFile);
+        if (!secret.has_value())
+            return ReportUsageError(secret.error());
+        command.dashboardToken = *secret;
     }
 
     auto const* const verb = FindVerb(command.verb);

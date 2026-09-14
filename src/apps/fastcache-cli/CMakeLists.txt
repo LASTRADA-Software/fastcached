@@ -25,17 +25,66 @@ set(_fc_cli_sources
     CliVerbs.cpp
     DashboardLoop.cpp
     DashboardSampler.cpp
+    FleetChartModel.cpp
+    FleetDocument.cpp
+    HistoryChart.cpp
+    LiveEventSource.cpp
+    LivePipedView.cpp
+    LiveSession.cpp
+    LiveStats.cpp
+    LiveSubscriber.cpp
     MemcachedClient.cpp
     NodeClient.cpp
+    NodeSlots.cpp
+    NodeStatusText.cpp
     RespClient.cpp
     SocketExchange.cpp
     StatsGatherer.cpp
     StatsSource.cpp
+    TerminalCapabilities.cpp
+    DashboardGlyphs.cpp
+    DashboardPanel.cpp
+    DashboardPanels.cpp
+    FleetReading.cpp
 )
+
+# The terminal half of the dashboard's input (#1372) is the one place this binary meets the
+# vendored TUI, so it is built only where that library is. With `FASTCACHED_BUILD_TUI` off,
+# `MakeTerminalEvents` still links, and refuses by saying why, so a caller asking for a
+# terminal gets a reason rather than a link error.
+if(TARGET fastcache-tui)
+    list(APPEND _fc_cli_sources TerminalEventStream.cpp TerminalEvents.cpp)
+    set(_fc_cli_tui_tests TerminalEventStream_test.cpp TerminalEvents_test.cpp)
+else()
+    list(APPEND _fc_cli_sources TerminalEventsUnavailable.cpp)
+    set(_fc_cli_tui_tests "")
+endif()
+
+# The Sixel rung's encoder follows the same split: `EndoSixelEncoder.cpp` is the one file that
+# includes the vendored `<tui/Sixel.hpp>`, and a build without it refuses by saying why.
+if(TARGET fastcache-tui)
+    list(APPEND _fc_cli_sources EndoSixelEncoder.cpp)
+    list(APPEND _fc_cli_tui_tests SixelEncoder_test.cpp)
+else()
+    list(APPEND _fc_cli_sources SixelEncoderUnavailable.cpp)
+endif()
+
+# How many cells text takes on a terminal is the vendored `tui::stringWidth`, reached through
+# `TerminalCellWidth.cpp` alone. A build without the library has no terminal session to lay a frame
+# out for, so its twin measures nothing: it names the build and ends the process.
+if(TARGET fastcache-tui)
+    list(APPEND _fc_cli_sources TerminalCellWidth.cpp)
+    list(APPEND _fc_cli_tui_tests TerminalCellWidth_test.cpp)
+else()
+    list(APPEND _fc_cli_sources TerminalCellWidthUnavailable.cpp)
+endif()
 
 add_executable(fastcache-cli main.cpp ${_fc_cli_sources})
 target_include_directories(fastcache-cli PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 target_link_libraries(fastcache-cli PRIVATE FastCache)
+if(TARGET fastcache-tui)
+    target_link_libraries(fastcache-cli PRIVATE fastcache-tui)
+endif()
 
 # The version is compiled in from the git tag rather than read at runtime, so
 # `fastcache-cli version` cannot report a value that has drifted from the build. The
@@ -54,21 +103,39 @@ install(TARGETS fastcache-cli
 if(FASTCACHED_BUILD_TESTS)
     add_executable(fastcache-cli-tests
         ${_fc_cli_sources}
+        CliAnswer_test.cpp
         CliCommand_test.cpp
         CliFormat_test.cpp
         CliValue_test.cpp
         CliVerbs_test.cpp
         DashboardLoop_test.cpp
         DashboardSampler_test.cpp
+        FleetChartModel_test.cpp
+        FleetDocument_test.cpp
+        HistoryChart_test.cpp
+        LiveEventSource_test.cpp
+        LivePipedView_test.cpp
+        LiveSession_test.cpp
+        LiveStats_test.cpp
+        LiveSubscriber_test.cpp
         MemcachedClient_test.cpp
         MemcachedVerbs_test.cpp
         NodeClient_test.cpp
+        NodeSlots_test.cpp
         NodeVerbs_test.cpp
         RespClient_test.cpp
         StatsSource_test.cpp
+        TerminalCapabilities_test.cpp
+        DashboardGlyphs_test.cpp
+        DashboardPanel_test.cpp
+        FleetReading_test.cpp
+        ${_fc_cli_tui_tests}
     )
     target_include_directories(fastcache-cli-tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
     target_link_libraries(fastcache-cli-tests PRIVATE FastCache Catch2::Catch2WithMain)
+    if(TARGET fastcache-tui)
+        target_link_libraries(fastcache-cli-tests PRIVATE fastcache-tui)
+    endif()
     target_compile_definitions(fastcache-cli-tests PRIVATE FASTCACHE_CLI_VERSION="${FASTCACHED_VERSION_STRING}")
     include(Catch)
     # `SKIP_RETURN_CODE 4` tells ctest a Catch2 skip is a skip and not a failure

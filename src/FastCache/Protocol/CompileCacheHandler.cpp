@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#include <FastCache/Async/DeadlineTimer.hpp>
 #include <FastCache/Auth/AuthPolicy.hpp>
 #include <FastCache/CompileCache/CompileValue.hpp>
 #include <FastCache/CompileCache/PrefetchGroupManifest.hpp>
@@ -7,6 +8,7 @@
 #include <FastCache/Protocol/CompileCacheHandler.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 #include <FastCache/Protocol/Framing/LineReader.hpp>
+#include <FastCache/Protocol/LiveStream.hpp>
 #include <FastCache/Protocol/SurfaceRefusal.hpp>
 
 #include <cstddef>
@@ -638,6 +640,233 @@ namespace
             : Next::Abort;
     }
 
+    /// What a subscriber's read watch learned while its stream ran.
+    ///
+    /// Plain members: the watcher and the handler share the connection's one reactor thread. Shared
+    /// for LIFETIME, because the watcher can still be parked when the handler moves on.
+    struct SubscriberWatch
+    {
+        bool finished { false }; ///< The wait has resolved and given the read slot back.
+        bool gone { false };     ///< EOF or a reset.
+        bool abortive { false }; ///< That departure was a reset.
+
+        /// The handler retired this watch; what the retirement delivers is not the peer's doing.
+        bool retired { false };
+    };
+
+    /// Watch a subscriber's read side, once.
+    ///
+    /// **It reads and never writes**, so the handler stays the only writer on the connection.
+    /// One wake, then done: a subscriber that sent bytes has asked for something else, and one
+    /// whose wait answered EOF or an error has left.
+    /// @param socket The connection; the handler retires this wait with `CancelRead` before it
+    ///        reads the socket again or returns, so the wait never outlives the socket.
+    /// @param watch Where the answer is left.
+    DetachedTask WatchSubscriber(ISocket* socket, std::shared_ptr<SubscriberWatch> watch)
+    {
+        auto const readable = co_await socket->WaitReadable();
+        if (!watch->retired)
+        {
+            watch->gone = !readable.has_value() || *readable == 0;
+            watch->abortive = !readable.has_value();
+        }
+        watch->finished = true;
+    }
+
+    /// What a push's hold closed, if it expired.
+    struct PushHold
+    {
+        ISocket* socket { nullptr }; ///< The connection to close.
+        bool expired { false };      ///< Whether the hold ran out and closed it.
+    };
+
+    /// End a connection whose push stayed parked past its hold.
+    ///
+    /// The close is the only thing that retrieves a parked write, which resumes with a failure;
+    /// the flag is what tells that failure apart from the peer resetting.
+    /// @param state The push's `PushHold`.
+    void ExpirePushHold(void* state)
+    {
+        auto* const hold = static_cast<PushHold*>(state);
+        hold->expired = true;
+        hold->socket->Close();
+    }
+
+    /// The daemon's half of a stream: every push written here, bounded by a timer of its own.
+    ///
+    /// A timer per push rather than a sweeper, because this handler has none: the daemon's
+    /// connections are bounded by the peer and by `--max-connections`, not by a deadline table.
+    class DaemonPushSink final: public IPushSink
+    {
+      public:
+        /// @param socket The connection.
+        /// @param reactor The connection's reactor, which runs the hold.
+        /// @param watch The read watch armed for the stream.
+        DaemonPushSink(ISocket* socket, IReactor* reactor, std::shared_ptr<SubscriberWatch const> watch) noexcept:
+            _socket { socket },
+            _reactor { reactor },
+            _watch { std::move(watch) }
+        {
+        }
+
+        /// @copydoc IPushSink::Push
+        [[nodiscard]] Task<PushOutcome> Push(std::vector<std::byte> frame, std::chrono::milliseconds hold) override
+        {
+            PushHold state { .socket = _socket, .expired = false };
+            DeadlineTimer const timer { *_reactor, _reactor->Clock().Now() + hold, &ExpirePushHold, &state };
+            if (co_await WriteAll(_socket, frame))
+                co_return PushOutcome::Delivered;
+            co_return state.expired ? PushOutcome::Stalled : PushOutcome::Lost;
+        }
+
+        /// @copydoc IPushSink::Activity
+        [[nodiscard]] PeerActivity Activity() const noexcept override
+        {
+            if (!_watch->finished)
+                return PeerActivity::Quiet;
+            if (!_watch->gone)
+                return PeerActivity::Sent;
+            return _watch->abortive ? PeerActivity::Reset : PeerActivity::Departed;
+        }
+
+        /// @copydoc IPushSink::Stopping
+        ///
+        /// **Never**, and that is not an omission: the daemon stops by stopping its reactors,
+        /// which free a stream parked on its timer without resuming it. Nothing is counted and
+        /// nothing is written, which is the right answer for a process going away.
+        [[nodiscard]] bool Stopping() const noexcept override
+        {
+            return false;
+        }
+
+      private:
+        ISocket* _socket;
+        IReactor* _reactor;
+        std::shared_ptr<SubscriberWatch const> _watch;
+    };
+
+    /// A subject this daemon does not stream: the node and the fleet are a compile node's.
+    constexpr Cc::UncountedRefusal SubjectServedElsewhere {
+        .code = Wire::ErrorCode::DispatchNotPermitted,
+        .rationale = "a misdirection a healthy fleet produces whenever a dashboard is pointed at the cache daemon, "
+                     "answered with where to go instead; DispatchNotPermitted and not UnimplementedVerb because a "
+                     "compile node serves the subject, so it is served elsewhere rather than unimplemented",
+    };
+
+    /// A stream whose connection no longer passes the credential the live policy now requires.
+    constexpr Cc::SurfaceRefusal Revoked { .code = Wire::ErrorCode::Unauthenticated,
+                                           .counter = IMetricsSink::Counter::LiveSubscriptionsRevoked };
+
+    /// Who the daemon streams to.
+    ///
+    /// **The credential is decided before the payload is read** -- `SUBSCRIBE` is `RequiresAuth`
+    /// in `OpTable`, so a policy that asks for one has already been answered by
+    /// `DecidePrePayload` -- and **re-asked every tick**, on the rotation exception's terms: a
+    /// connection that proved a secret keeps its stream when the secret rotates, and one that never
+    /// presented any loses it the tick the policy starts requiring one. The same two directions
+    /// the command loop's own gate takes, per command.
+    class DaemonLiveGate final: public ILiveGate
+    {
+      public:
+        /// @param session The connection's session: the live policy and the sink.
+        /// @param credentialAccepted Whether this connection proved a credential.
+        DaemonLiveGate(SessionContext const* session, bool const* credentialAccepted) noexcept:
+            _session { session },
+            _credentialAccepted { credentialAccepted }
+        {
+        }
+
+        /// @copydoc ILiveGate::RefuseWatcher
+        [[nodiscard]] std::optional<std::vector<std::byte>> RefuseWatcher(std::string_view /*peer*/) const override
+        {
+            return std::nullopt;
+        }
+
+        /// @copydoc ILiveGate::Admit
+        [[nodiscard]] std::optional<std::vector<std::byte>> Admit(Wire::SubscribeRequest const& request,
+                                                                  std::string_view /*peer*/) const override
+        {
+            if (request.subject == Wire::LiveSubject::Cache)
+                return std::nullopt;
+            return Cc::RefuseWithoutCounter(
+                SubjectServedElsewhere,
+                "this daemon streams the cache subject only; subscribe to a node or the fleet at a fastcache-compile-node");
+        }
+
+        /// @copydoc ILiveGate::Recheck
+        [[nodiscard]] std::optional<std::vector<std::byte>> Recheck(Wire::LiveSubject /*subject*/,
+                                                                    std::string_view /*peer*/) const override
+        {
+            auto const policy = _session->CurrentAuth();
+            if (policy == nullptr || !policy->Enabled() || *_credentialAccepted)
+                return std::nullopt;
+            return Cc::Refuse(
+                _session->metrics, Revoked, "this daemon now requires a credential this connection never presented");
+        }
+
+      private:
+        SessionContext const* _session;
+        bool const* _credentialAccepted;
+    };
+
+    /// The connection state a subscription borrows from the command loop.
+    struct SubscribeContext
+    {
+        ISocket* socket { nullptr };                ///< The connection.
+        ByteReader const* reader { nullptr };       ///< Its reader, for what it has already buffered.
+        SessionContext const* session { nullptr };  ///< Its session.
+        bool const* credentialAccepted { nullptr }; ///< Whether it proved a credential.
+    };
+
+    /// A daemon that streams no live stats, which a `SUBSCRIBE` is told by name.
+    constexpr Cc::UncountedRefusal NoLiveStats {
+        .code = Wire::ErrorCode::DispatchNotPermitted,
+        .rationale = "a process built or run without live stats answers every subscription this way, which is its "
+                     "configuration rather than an event; the daemon body always wires one, so this is a harness's answer",
+    };
+
+    /// Serve one `SUBSCRIBE` on this connection until the stream ends.
+    ///
+    /// **The handler stays the one writer**: the stream pushes through `DaemonPushSink`, and the
+    /// terminal reply is written here once it returns. The read watch is retired with
+    /// `CancelRead` before this returns, which is what lets the command loop read the socket
+    /// again -- or return, and have `Connection` close it -- with nothing parked on its read slot.
+    /// @param context The connection state borrowed from the loop.
+    /// @param frame The whole request, header included.
+    /// @return Whether the command loop continues.
+    [[nodiscard]] Task<Next> HandleSubscribe(SubscribeContext context, std::vector<std::byte> frame)
+    {
+        auto* const socket = context.socket;
+        auto const* const session = context.session;
+        if (session->liveStats == nullptr || session->reactor == nullptr)
+            co_return co_await ReplyUncounted(
+                socket, NoLiveStats, "this daemon streams no live stats; read /metrics on its admin surface")
+                ? Next::Continue
+                : Next::Abort;
+
+        // A peer that already pipelined bytes has asked for something else before the stream
+        // began, so there is nothing to watch for: the stream ends at once, in order.
+        auto watch = std::make_shared<SubscriberWatch>();
+        if (!context.reader->Buffered().empty())
+            watch->finished = true;
+        else
+            WatchSubscriber(socket, watch);
+
+        DaemonPushSink sink { socket, session->reactor, watch };
+        DaemonLiveGate const gate { session, context.credentialAccepted };
+        auto const terminal =
+            co_await session->liveStats->Serve(frame, socket->PeerAddress(), &sink, &gate, session->reactor);
+
+        if (!watch->finished)
+        {
+            watch->retired = true;
+            socket->CancelRead();
+        }
+        if (terminal.empty())
+            co_return Next::Abort;
+        co_return co_await WriteAll(socket, terminal) ? Next::Continue : Next::Abort;
+    }
+
 } // namespace
 
 Task<void> CompileCacheHandler::Run(ISocket* socket,
@@ -897,6 +1126,19 @@ Task<void> CompileCacheHandler::Run(ISocket* socket,
             case Wire::Op::EnrollControl:
                 next = co_await HandleDistributed(socket, descriptor->code);
                 break;
+
+            // Live stats: the cache subject, streamed. The payload is the request, so the whole
+            // frame is handed on rather than re-framed.
+            case Wire::Op::Subscribe: {
+                std::vector<std::byte> frame { headerBytes->begin(), headerBytes->end() };
+                frame.insert(frame.end(), payload->begin(), payload->end());
+                next = co_await HandleSubscribe(SubscribeContext { .socket = socket,
+                                                                   .reader = &reader,
+                                                                   .session = &session,
+                                                                   .credentialAccepted = &credentialAccepted },
+                                                std::move(frame));
+                break;
+            }
         }
 
         if (next == Next::Abort)

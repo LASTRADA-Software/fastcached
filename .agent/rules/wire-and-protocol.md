@@ -29,8 +29,9 @@ Every rule below has already been a bug.
   is deliberately **no handshake**, because the launcher opens a fresh connection
   per *operation* and a HELLO would cost 2–4 round trips per translation unit on
   the exact path this list already records regressions on.
-- **A reply is one frame per request, and `Status::Progress` is the one exception --
-  bounded to exactly one verb, carrying nothing, and paid for with a version step.**
+- **A reply is one frame per request, and `Status::Progress` is the first of two exceptions --
+  bounded to exactly one verb, carrying nothing, and paid for with a version step.** The
+  second is `Status::Push`, below, bounded the same way.
   A dispatched compile is bounded by how long a COMPILER runs, so its client's total
   deadline is minutes by construction and was therefore also how long a worker whose
   process had stopped making progress went unnoticed. Keepalive (#247) answers a dead
@@ -66,6 +67,51 @@ Every rule below has already been a bug.
     forever is alive and never finishing, which is what the exchange's total budget has
     always been for, and a frame count beside it would be two ceilings on one thing
     that could never be converted into each other.
+- **`Status::Push` is the second exception: a `SUBSCRIBE` is answered by a stream of pushes
+  and then exactly one terminal**
+  ([#1399](https://github.com/LASTRADA-Software/fastcached/issues/1399)). `Ok` is an orderly
+  end, an `Error` names why the stream was refused or revoked, and a close is the watcher
+  having left, reset or stalled. The version moved to 9 at both ends for `Progress`'s reason.
+  - **Which verb admits it is the same column**, `static_assert`ed by `PushIsSubscribeOnly`.
+    A verb that acquires a push acquires a reader that loops and a writer that outlives the
+    request, which is a decision, not something to inherit by widening a mask.
+  - **A subscriber is PULLED, never queued.** Every subscriber wakes on its subject's tick
+    grid, re-gates, and reads one capture per subject per tick, so rendering costs once per tick
+    however many watch. A subscriber whose push parked wakes on the current tick and is told
+    once, as a `Gap`, how many whole cadences it missed. A per-subscriber queue was the first
+    design. It holds memory for exactly the watcher that is not reading, and its drop policy
+    is a second decision about staleness that the tick grid already makes.
+  - **No reactor waits on another reactor's capture, and no subscriber waits for a CLAIMED one.**
+    The capture is shared by every reactor of a daemon, so it is claimed with an atomic exchange
+    and published under a lock held for the pointer copy alone; a lock across the capture stopped
+    every other reactor's thread for as long as a storage walk took. And a subscriber that loses
+    the claim sends the newest PUBLISHED capture it has not read, labelled and cursored by the tick
+    it was captured on. Looking again for the claimed one is the obvious repair, and it STARVES: a
+    capture slower than a tick is claimed again the moment it is published, so a subscriber on
+    another reactor finds it claimed on every look. A two-reactor case on real threads showed that
+    red after the lock was gone; `LiveStream_test` pins it on one clock.
+  - **A stream is re-gated EVERY tick, not only when it opens.** Membership, leadership and
+    the daemon's credential policy are all asked again, because removal is the direction that
+    fails OPEN and nothing reports it. The credential is re-asked on the command loop's own
+    rotation terms: a connection that proved a secret keeps its stream when the secret
+    rotates, and one that never presented one loses it once a policy requires it.
+  - **The push hold is armed from the write's START**, and it is
+    `max(MinLiveStreamWriteStall, LiveIdleCadences x granted)`. The client's silence bound is
+    `LiveIdleBound(granted)`, the same pair of numbers in `CompileCacheWire`. Armed from the
+    previous write's END instead, a parked push is cut up to one cadence early, and a real-socket
+    case cannot see a difference that small. The node's before-write arm survives a neuter for
+    exactly that reason, and the daemon's sink pins its bound on a manual clock.
+  - **A request pipelined behind a subscription ends it in order (`Ok`) and is then served.**
+    On the daemon the read watch is not armed when the reader already holds bytes: a watch
+    parks on the socket, and bytes already taken off it never wake that watch.
+  - **A client leaves by HALF-closing.** The surface counts EOF as the watcher's goodbye. A
+    close with pushes still unread in the client's receive queue is an RST on the wire, which
+    the surface counts as a reset, the alertable ending.
+  - **A stream frame a reactor frees after its owner touches only what it owns.** A stream
+    parked on a timer is freed when its reactor is destroyed, and the node declares its reactor
+    before the component that serves streams. A subscription place decrementing a counter held
+    BY VALUE in that component was a use-after-free at shutdown, found by a neuter whose failing
+    case unwound through it. The active count is therefore a `shared_ptr` each frame holds.
 - **The wire's two grammars are shared, and both live in `Core/` for the same
   reason.** `Core/WireFields` is the payload — a run of `[u32 length][bytes]` —
   and `Core/WireFrame` is the seven bytes in front of it:

@@ -115,6 +115,15 @@ struct StorageStats
     std::uint64_t evictedUnfetched { 0 };
     std::uint64_t expiredUnfetched { 0 };
 
+    /// Entries removed because their TTL lapsed, whichever path removed them: a lookup or a write that met a
+    /// lapsed entry, or the expiry cycle's sweep. `expiredUnfetched` is the part of this nobody read.
+    ///
+    /// Counted where the tier reports the reclaim as an `Expire` event, so the counter and the keyspace
+    /// notifications are one fact: a generation flush makes entries unreachable too, and is neither. Without
+    /// it, the only expiry count a dashboard had was `ExpiryKeysReclaimed`, the SWEEP's share, so a cache whose
+    /// clients re-read their keys showed almost no expiry at all (#134).
+    std::uint64_t expirations { 0 };
+
     /// Value writes (SET/ADD/REPLACE/APPEND/PREPEND/CAS/INCR/UPDATE) that
     /// failed to persist because the storage could not accept them: a full
     /// disk or I/O error (`IoError`), an exhausted memory budget
@@ -124,6 +133,9 @@ struct StorageStats
     /// Populated by `WriteErrorReportingStorage`; 0 for backends not wrapped
     /// by it.
     std::uint64_t writeErrors { 0 };
+
+    /// Field by field. What a decoded live-stats reading is compared with.
+    [[nodiscard]] bool operator==(StorageStats const&) const = default;
 };
 
 /// One cache's statistics, kept apart by the tier holding them.
@@ -158,11 +170,13 @@ inline constexpr std::array StorageStatsSizeFields {
 /// Separate from the size fields only because the two groups have different
 /// types; both are summed the same way.
 inline constexpr std::array StorageStatsCounterFields {
-    &StorageStats::evictions,    &StorageStats::cmdGet,    &StorageStats::cmdSet,           &StorageStats::cmdTouch,
-    &StorageStats::cmdFlush,     &StorageStats::getHits,   &StorageStats::getMisses,        &StorageStats::deleteHits,
-    &StorageStats::deleteMisses, &StorageStats::incrHits,  &StorageStats::incrMisses,       &StorageStats::decrHits,
-    &StorageStats::decrMisses,   &StorageStats::touchHits, &StorageStats::touchMisses,      &StorageStats::casHits,
-    &StorageStats::casMisses,    &StorageStats::casBadval, &StorageStats::evictedUnfetched, &StorageStats::expiredUnfetched,
+    &StorageStats::evictions,        &StorageStats::cmdGet,           &StorageStats::cmdSet,
+    &StorageStats::cmdTouch,         &StorageStats::cmdFlush,         &StorageStats::getHits,
+    &StorageStats::getMisses,        &StorageStats::deleteHits,       &StorageStats::deleteMisses,
+    &StorageStats::incrHits,         &StorageStats::incrMisses,       &StorageStats::decrHits,
+    &StorageStats::decrMisses,       &StorageStats::touchHits,        &StorageStats::touchMisses,
+    &StorageStats::casHits,          &StorageStats::casMisses,        &StorageStats::casBadval,
+    &StorageStats::evictedUnfetched, &StorageStats::expiredUnfetched, &StorageStats::expirations,
     &StorageStats::writeErrors,
 };
 

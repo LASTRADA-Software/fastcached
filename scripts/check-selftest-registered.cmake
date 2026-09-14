@@ -114,8 +114,8 @@ include("${CMAKE_CURRENT_LIST_DIR}/lib/CheckCommon.cmake")
 #
 # It is the EIGHTH copy of that walk under `scripts/` -- `check-tsan-scope`,
 # `check-test-names`, `check-corrupt-store-diagnostics`, `check-bind-failure-seam`,
-# `check-worker-refusals-counted`, `check-istreambuf-iterator` (wrapped as
-# `fastcached_scan_lines`) and `check-tools-page-installed-set` (wrapped as
+# `check-worker-refusals-counted`, `scripts/lib/CheckCommon.cmake` (wrapped as
+# `fastcached_scan_code_lines`) and `check-tools-page-installed-set` (wrapped as
 # `fc_capture_lines`) already carry one, and neither wrapper is a drop-in here.
 # **#495 is the ticket for consolidating them and this is not it.** The citation is what
 # keeps this copy inside that ticket's audit rather than hiding from it -- an

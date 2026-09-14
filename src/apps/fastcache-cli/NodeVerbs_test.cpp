@@ -5,12 +5,17 @@
 #include "StatsGatherer.hpp"
 
 #include <FastCache/Cluster/ClusterState.hpp>
+#include <FastCache/Core/Ranges.hpp>
+#include <FastCache/Net/BlockingSocket.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <format>
 #include <optional>
 #include <ranges>
 #include <span>
@@ -784,24 +789,6 @@ namespace
     return static_cast<std::size_t>(std::ranges::distance(answer.value.columns.begin(), at));
 }
 
-/// Every advisory joined, for a `contains` check.
-///
-/// A refusal's sentence is an ADVISORY here rather than a field of `Answer` -- remarks
-/// go to stderr in every format so stdout stays parseable -- and which advisory carries
-/// it is not a property worth pinning.
-/// @param answer The answer.
-/// @return The advisories, newline separated.
-[[nodiscard]] std::string AdvisoryText(Answer const& answer)
-{
-    std::string out;
-    for (auto const& advisory: answer.advisories)
-    {
-        out += advisory;
-        out.push_back('\n');
-    }
-    return out;
-}
-
 } // namespace
 
 TEST_CASE("cluster-members reports who the cluster agreed on, and an unled member as ABSENT", "[cli][node][cluster]")
@@ -1402,4 +1389,221 @@ TEST_CASE("the stats ladder relays the same remedy when it skips /metrics", "[cl
     CHECK(std::ranges::any_of(answer.advisories, [](std::string const& line) {
         return line.contains("was not asked") && line.contains("--admin-listen");
     }));
+}
+
+TEST_CASE("the stats ladder records where it asked each source, and no address for one it did not ask", "[cli][node][stats]")
+{
+    // A panel's source line names the address that ANSWERED, so each attempt carries its own: the node's
+    // `0xFC` address for node-metrics, the cache's for INFO, an IPv6 literal bracketed so its port reads.
+    // WHAT DISTINGUISHES: /metrics was not asked, and an address beside it would name a listener nothing
+    // dialled -- and node-metrics was asked and failed, which still says where.
+    ScriptedNodeExchange node {
+        { StatusReply({ .version = "0.2.0",
+                        .nodeId = {},
+                        .uptimeSeconds = 5,
+                        .surfaces = { Cc::SurfaceReport { .surface = Cc::WireSurface::Raft, .port = 6680 } } }),
+          NodeFailure(ExchangeFailure::Transport, "the node-metrics verb went unanswered") },
+        "10.0.0.4:6674"
+    };
+    ScriptedExchange resp { Answers({ Bulk("fastcached_version:0.4.1\r\n") }) };
+    auto gatherer =
+        LadderGatherer { Endpoint {}, Endpoint { .host = "fd00::9", .port = 6379 }, DialTimeouts {}, std::nullopt, &resp,
+                         &node };
+
+    auto const attempts = gatherer.Gather();
+    auto const whereOf = [&attempts](StatsOrigin origin) {
+        auto const* attempt = FindIfOrNull(attempts, [origin](StatsAttempt const& one) { return one.origin == origin; });
+        return attempt == nullptr ? std::optional<std::string> {} : std::optional<std::string> { attempt->where };
+    };
+    CHECK(whereOf(StatsOrigin::Metrics) == std::string {});
+    CHECK(whereOf(StatsOrigin::NodeMetrics) == std::string { "10.0.0.4:6674" });
+    CHECK(whereOf(StatsOrigin::Info) == std::string { "[fd00::9]:6379" });
+}
+
+TEST_CASE("the stats ladder records where it asked /metrics, whatever the scrape then did", "[cli][node][stats]")
+{
+    // The /metrics rung's address, which the case above cannot reach: that rung only asks an admin surface it
+    // can DIAL. So this one gives it a real one -- a loopback listener this process holds, which accepts into
+    // its backlog and never answers -- and a read bound short enough that the scrape gives up at once. WHAT
+    // DISTINGUISHES: the attempt was asked and failed, and still says where; nothing about the address comes
+    // from the reply, because there is none.
+    auto listener = BlockingListener::Bind("127.0.0.1", 0);
+    if (listener == nullptr || !listener->IsBound() || listener->BoundPort() == 0)
+        SKIP("this host would not bind a loopback listener on any port; the /metrics rung cannot be dialled here");
+    auto const admin = Endpoint { .host = "127.0.0.1", .port = listener->BoundPort() };
+    auto gatherer =
+        LadderGatherer { admin,
+                         Endpoint { .host = "10.0.0.4", .port = 6674 },
+                         DialTimeouts { .connect = std::chrono::seconds { 5 }, .io = std::chrono::milliseconds { 50 } },
+                         std::nullopt,
+                         nullptr,
+                         nullptr };
+
+    auto const attempts = gatherer.Gather();
+    auto const* metrics = FindIfOrNull(attempts, [](StatsAttempt const& one) { return one.origin == StatsOrigin::Metrics; });
+    REQUIRE(metrics != nullptr);
+    CHECK(metrics->asked);
+    CHECK_FALSE(metrics->record.has_value());
+    CHECK(metrics->where == std::format("127.0.0.1:{}", admin.port));
+}
+
+// ---------------------------------------------------------------------------
+// #134: an endpoint's identity, TYPED.
+//
+// `live-stats` infers its subject from what the endpoint is. The gatherer used to answer
+// that only as `std::expected<NodeStatusFields, std::string>`, whose error side held
+// three different states as three sentences of one type -- so a verb deciding from it
+// would have been matching prose.
+// ---------------------------------------------------------------------------
+
+namespace
+{
+
+/// A node-status reply that says `Ok` and carries a body no decoder can read.
+///
+/// The fourth arm, and the one where two classifiers would most naturally drift: the
+/// STATUS says compile node while the fields say nothing, so a second copy of the
+/// decision that keyed on "did the fields decode" would call it something else.
+/// @return The reply frame.
+[[nodiscard]] std::vector<std::byte> OkWithUnreadableBody()
+{
+    auto const garbage = std::to_array({ std::byte { 0xFF } });
+    return Cc::EncodeReply(Cc::Status::Ok, garbage);
+}
+
+/// The identity a gatherer reports for one scripted reply.
+/// @param reply What the endpoint answers node-status with.
+/// @return The identification.
+[[nodiscard]] EndpointIdentity IdentityFor(ScriptedNodeExchange::Outcome reply)
+{
+    ScriptedNodeExchange node { { std::move(reply) }, "10.0.0.4:6674" };
+    auto gatherer = GathererFor(node);
+    return gatherer.IdentifyEndpoint();
+}
+
+} // namespace
+
+TEST_CASE("an endpoint's identity keeps its four states apart by type", "[cli][node][identity]")
+{
+    // THE state that must not collapse is the first: nobody could ask. Inferring `cache`
+    // for it reports *INFO did not answer* against a port that may speak no RESP.
+    auto notAskedGatherer =
+        LadderGatherer { Endpoint {}, Endpoint { .host = "10.0.0.4", .port = 6674 }, DialTimeouts {}, std::nullopt, nullptr,
+                         nullptr };
+    auto const notAsked = notAskedGatherer.IdentifyEndpoint();
+    auto const silent = IdentityFor(NodeFailure(ExchangeFailure::Transport, "the server closed the connection"));
+    auto const daemon = IdentityFor(RefusalReply(Cc::UnimplementedVerb));
+    auto const node = IdentityFor(StatusReply({ .version = "0.2.0", .nodeId = {}, .uptimeSeconds = 5, .surfaces = {} }));
+
+    CHECK_FALSE(notAsked.kind.has_value());
+    CHECK(silent.kind == RemoteKind::NotFastcacheWire);
+    CHECK(daemon.kind == RemoteKind::FastcacheWireOnly);
+    CHECK(node.kind == RemoteKind::CompileNode);
+
+    // Each answered state names the endpoint, which is what a refusal quoting it needs.
+    for (auto const& identity: { silent, daemon, node })
+        CHECK(identity.detail.contains("10.0.0.4:6674"));
+    CHECK(notAsked.detail.contains("no 0xFC connection"));
+}
+
+TEST_CASE("the identity and the probe classify every reply the same way", "[cli][node][identity]")
+{
+    // Two askers, one decision. Driven over every reply shape, and the unreadable `Ok`
+    // body is the row that distinguishes: it is a compile node by status and nothing by
+    // fields, which is exactly where a second copy of the decision would part company.
+    auto const replies = std::to_array<ScriptedNodeExchange::Outcome>({
+        StatusReply({ .version = "0.2.0", .nodeId = {}, .uptimeSeconds = 5, .surfaces = {} }),
+        OkWithUnreadableBody(),
+        RefusalReply(Cc::UnimplementedVerb),
+        RefusalReply(Cc::ErrorCode::NotAMember),
+        NodeFailure(ExchangeFailure::Transport, "the server closed the connection"),
+    });
+
+    for (auto const& reply: replies)
+    {
+        ScriptedNodeExchange probed { { reply } };
+        auto const probe = ProbeRemote(probed);
+        auto const identity = IdentityFor(reply);
+        CAPTURE(static_cast<int>(probe), identity.detail);
+        CHECK(identity.kind == probe);
+    }
+
+    // And the unreadable body is still a NODE, not merely consistent with the probe: a
+    // probe and an identity that both drifted to `FastcacheWireOnly` would agree.
+    CHECK(IdentityFor(OkWithUnreadableBody()).kind == RemoteKind::CompileNode);
+}
+
+TEST_CASE("an endpoint is identified once however many callers ask", "[cli][node][identity]")
+{
+    // A verb asking what the endpoint is, and a rung then reading the same fact, must pay
+    // ONE node-status round trip between them -- a second is a second request a daemon
+    // refuses. `FetchAdmin` stands in for the rung: this node reports no admin surface,
+    // so it reads the identification and dials nothing.
+    ScriptedNodeExchange node { { StatusReply({ .version = "0.2.0", .nodeId = {}, .uptimeSeconds = 5, .surfaces = {} }) },
+                                "10.0.0.4:6674" };
+    auto gatherer = GathererFor(node);
+
+    CHECK(gatherer.IdentifyEndpoint().kind == RemoteKind::CompileNode);
+    CHECK(gatherer.IdentifyEndpoint().kind == RemoteKind::CompileNode);
+    CHECK_FALSE(gatherer.FetchAdmin("/fleet.txt?section=workers").has_value());
+
+    CHECK(node.Sent().size() == 1);
+    CHECK(node.Unused() == 0);
+}
+
+TEST_CASE("a compile node answers stats through the ladder's node-metrics rung", "[cli][node][stats]")
+{
+    // The FACT a verb page's "on a compile node" cell must agree with. `stats` is on the
+    // `Stats` wire, carries no fallback and is not a node verb -- once the only two ways
+    // that cell knew a node could answer -- yet a node answers it, through the rung that
+    // asks the node for its own counters. Asserting only what the page SAYS would prove the text
+    // changed; this proves the text is true.
+    auto const counter = WireFields::Encode(
+        { Cc::AsBytes("fastcache_worker_jobs_completed_total"), std::span<std::byte const> { Cc::EncodeU64Field(12) } });
+    auto const payload = WireFields::Encode(WireFields::FieldList { std::vector<std::span<std::byte const>> { counter } });
+
+    ScriptedNodeExchange node { { StatusReply({ .version = "0.2.0", .nodeId = {}, .uptimeSeconds = 5, .surfaces = {} }),
+                                  Cc::EncodeReply(Cc::Status::Ok, payload) },
+                                "10.0.0.4:6674" };
+    auto gatherer = GathererFor(node);
+
+    auto const* const stats = FindVerb("stats");
+    REQUIRE(stats != nullptr);
+    auto const answer = RunVerb(*stats, VerbContext { .node = &node, .stats = &gatherer, .admin = &gatherer });
+
+    CHECK(answer.outcome == Outcome::Affirmative);
+    CHECK(RequiredCell(answer, "source").lexical == "node-metrics");
+    CHECK(RequiredCell(answer, "fastcache_worker_jobs_completed_total").lexical == "12");
+}
+
+TEST_CASE("a node whose description this client cannot read is a node it cannot read", "[cli][node][identity]")
+{
+    // Still a node -- a verb inferring a subject must not drift to `cache` -- and flagged, so a
+    // verb deciding whether to start asks a field. The control beside it: a readable node is not.
+    auto const unreadable = IdentityFor(OkWithUnreadableBody());
+    CHECK(unreadable.kind == RemoteKind::CompileNode);
+    CHECK(unreadable.unreadable);
+    CHECK(unreadable.detail.contains("cannot read"));
+
+    auto const readable = IdentityFor(StatusReply({ .version = "0.2.0", .nodeId = {}, .uptimeSeconds = 5, .surfaces = {} }));
+    CHECK_FALSE(readable.unreadable);
+
+    // A refusal is not a node at all, and says nothing about a description.
+    CHECK_FALSE(IdentityFor(RefusalReply(Cc::UnimplementedVerb)).unreadable);
+}
+
+TEST_CASE("a node-status refused on the wire version names both versions and does not deny a node", "[cli][node][identity]")
+{
+    // Refused before the verb was read, so nothing says whether a node is there: the sentence
+    // names this client's wire and carries the server's own range, and never claims "not a
+    // compile node", which is what every other refusal is worded as.
+    auto const refused =
+        IdentityFor(RefusalReply(Cc::ErrorCode::UnsupportedVersion, "unsupported wire version 8; this server speaks 6..6"));
+    CHECK(refused.kind == RemoteKind::FastcacheWireOnly);
+    CHECK(refused.detail.contains(std::format("0xFC wire {}", static_cast<unsigned>(Cc::CurrentVersion))));
+    CHECK(refused.detail.contains("this server speaks 6..6"));
+    CHECK_FALSE(refused.detail.contains("not a compile node"));
+
+    // The control: an unimplemented verb keeps the daemon's sentence.
+    CHECK(IdentityFor(RefusalReply(Cc::UnimplementedVerb)).detail.contains("not a compile node"));
 }

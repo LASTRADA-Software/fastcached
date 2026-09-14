@@ -74,16 +74,12 @@
 #
 # ## Reading lines
 #
-# NOT through the house `fastcached_read_lines` splitting idiom, and that is a finding
-# rather than a preference: writing this check's selftest showed that reader merges a
-# line ending in a backslash with the next one, which its own comment claims it
-# prevents. The measurement and the consequences are on `fastcached_scan_lines` below.
-#
-# Consolidating the copies of that idiom remains
-# [#495](https://github.com/LASTRADA-Software/fastcached/issues/495), and REPAIRING it
-# is not this ticket either -- it is two other checks' reader, and absorbing it here
-# would close one ticket by swallowing another, which `check-glob-traversals.cmake`
-# says in its own comment.
+# NOT through a list-splitting idiom, and that is a finding rather than a preference:
+# writing this check's selftest showed the house reader of the day merged a line ending
+# in a backslash with the next one, which its own comment claimed it prevented. The walk
+# this check wrote instead now lives in `scripts/lib/CheckCommon.cmake` as
+# `fastcached_scan_code_lines`, with the measurement and the consequences, because
+# `check-ranges-seam.cmake` became its second caller.
 #
 # Runs as `cmake -P`: it reads files, compares strings and reports. See
 # `check-script-check-signals.cmake` for why such a check reports failure through its
@@ -96,6 +92,8 @@
 
 cmake_minimum_required(VERSION 3.28)
 
+include("${CMAKE_CURRENT_LIST_DIR}/lib/CheckCommon.cmake")
+
 if(NOT DEFINED FASTCACHED_SOURCE_DIR)
     message(FATAL_ERROR "FASTCACHED_SOURCE_DIR must be set")
 endif()
@@ -104,119 +102,9 @@ endif()
 # the matched-nothing guard, and the thing named in the failure text.
 set(bannedToken "istreambuf_iterator")
 
-# Walk the file line by line WITHOUT ever building a CMake list of lines.
-#
-# The house idiom for this (`fastcached_read_lines`, in `check-succeed-not-skip.cmake`
-# and `check-catch-skip-return-code.cmake`) escapes `;` and `\`, blanks `[` and `]`,
-# then splits on newlines into a CMake list. Its own comment says *"Backslashes are
-# escaped first, or a line ending in one merges with the next"* -- and that is the one
-# case the escaping does not actually cover. Measured on CMake 3.28 with a four-line
-# file: no trailing backslash gives 5 elements, a line ending in `\` gives 4 with lines
-# 2 and 3 merged into `two \;three`, and a line ending in `\\` merges too.
-#
-# A merged line is not a cosmetic problem for THIS check: the merged element begins
-# with whatever line 2 began with, so a `//` comment swallows the real code on line 3,
-# the use goes unreported, and every line number below it drifts. That is a false
-# GREEN, which is the direction that does not get investigated. It was found by the
-# selftest case that plants list structure ABOVE a violation and asserts the exact
-# `file:line` -- an assertion on the filename alone passes under the bug.
-#
-# So this walks with `FIND`/`SUBSTRING` and puts no line into a list at all: immune to
-# `;`, `\`, `[` and `]` by construction rather than by escaping them one at a time.
-# `check-tsan-scope.cmake` is list-free for the same reason.
-#
-# The walk is O(n^2) in the file's length, which is why the caller applies a
-# whole-file test first: 669 of this tree's 677 sources contain the token nowhere and
-# are never walked at all.
-#
-# The defect in the shared helper is NOT repaired here -- it is two other checks'
-# reader and this is not their ticket. It is reported separately.
-function(fastcached_scan_lines content outVar)
-    set(hits "")
-    set(rest "${content}")
-    set(lineNumber 0)
-    set(inBlockComment FALSE)
-    while(TRUE)
-        string(FIND "${rest}" "\n" newline)
-        if(newline EQUAL -1)
-            set(line "${rest}")
-        else()
-            string(SUBSTRING "${rest}" 0 ${newline} line)
-        endif()
-        string(REGEX REPLACE "\r$" "" line "${line}")
-        math(EXPR lineNumber "${lineNumber} + 1")
-
-        if(line MATCHES "${bannedToken}")
-            # A raw mention, comment or code. Counted before stripping, so the
-            # matched-nothing guard below cannot be satisfied by stripping alone.
-            list(APPEND hits "mention:${lineNumber}")
-        endif()
-
-        # Strip comments, so prose explaining the rule is not read as breaking it.
-        #
-        # The blind spot, stated rather than papered over: CMake's regex engine is
-        # greedy and has no lazy quantifier, so stripping inline `/* ... */` pairs
-        # takes everything between the FIRST `/*` and the LAST `*/` on a line. A use
-        # sitting between two block comments on one line is invisible here.
-        set(stripped "${line}")
-        set(skipLine FALSE)
-        if(inBlockComment)
-            if(NOT stripped MATCHES "\\*/")
-                set(skipLine TRUE)
-            else()
-                string(REGEX REPLACE "^.*\\*/" "" stripped "${stripped}")
-                set(inBlockComment FALSE)
-            endif()
-        endif()
-        if(NOT skipLine)
-            string(REGEX REPLACE "/\\*.*\\*/" " " stripped "${stripped}")
-
-            # Which introducer comes FIRST decides. The order is not a detail: the
-            # `/*` test used to run BEFORE `//` was stripped, so a line comment
-            # mentioning `/*` opened a block comment no `*/` ever closed, and every
-            # remaining line of that file was skipped while this still printed a
-            # clean count over lines it never read -- a false green, in the one
-            # direction the check exists to refuse.
-            #
-            # Positional rather than simply stripping `//` first, which MEASURED
-            # identical on every input tried: below the inline `/* ... */` strip
-            # above, removing `//...` removes any `/*` that followed it too, so the
-            # two orderings agree. What position buys is not a different verdict but
-            # independence -- it states the rule itself rather than being correct
-            # only while the strip above it keeps running first. A reordering is
-            # correct by PRECONDITION; this is correct by construction.
-            #
-            # Third copy of this defect: `check-cli-text-cell.cmake` and
-            # `check-markup-entities.cmake` carried it too. Consolidating the
-            # line-walking idiom is #495 and is not this ticket.
-            #
-            # Still blind to either introducer inside a STRING LITERAL, as every
-            # regex-shaped reader here is. That is unchanged by this.
-            string(FIND "${stripped}" "/*" blockAt)
-            string(FIND "${stripped}" "//" lineAt)
-            if(NOT blockAt EQUAL -1 AND (lineAt EQUAL -1 OR blockAt LESS lineAt))
-                string(SUBSTRING "${stripped}" 0 ${blockAt} stripped)
-                set(inBlockComment TRUE)
-            elseif(NOT lineAt EQUAL -1)
-                string(SUBSTRING "${stripped}" 0 ${lineAt} stripped)
-            endif()
-            if(stripped MATCHES "${bannedToken}")
-                list(APPEND hits "use:${lineNumber}")
-            endif()
-        endif()
-
-        if(newline EQUAL -1)
-            break()
-        endif()
-        math(EXPR skip "${newline} + 1")
-        string(LENGTH "${rest}" restLength)
-        if(skip GREATER_EQUAL restLength)
-            break()
-        endif()
-        string(SUBSTRING "${rest}" ${skip} -1 rest)
-    endwhile()
-    set(${outVar} "${hits}" PARENT_SCOPE)
-endfunction()
+# The line walk is `fastcached_scan_code_lines` in `scripts/lib/CheckCommon.cmake`, which
+# carries the measurement behind it: why it builds no CMake list, and the comment-ordering
+# false green it has already had.
 
 # Which C++ this REPOSITORY owns, asked of git rather than inferred from directory
 # names. A dependency cache is untracked by construction, whatever a package manager
@@ -315,7 +203,7 @@ foreach(relative IN LISTS sourceFiles)
         continue()
     endif()
 
-    fastcached_scan_lines("${wholeFile}" hits)
+    fastcached_scan_code_lines("${wholeFile}" "${bannedToken}" hits)
     foreach(hit IN LISTS hits)
         if(hit MATCHES "^mention:([0-9]+)$")
             math(EXPR mentionCount "${mentionCount} + 1")

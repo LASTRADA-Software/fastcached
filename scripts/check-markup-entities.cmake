@@ -110,7 +110,7 @@ set(ExemptionTable
 # house splitting idiom merges a line ending in a backslash with the next one, which
 # hides the following line and drifts every line number below it. `FIND`/`SUBSTRING` is
 # immune to all four by construction. The measurement and the consequences are on
-# `fastcached_scan_lines` in `check-istreambuf-iterator.cmake`; consolidating the copies
+# `fastcached_scan_code_lines` in `scripts/lib/CheckCommon.cmake`; consolidating the copies
 # is #495 and is not this ticket.
 function(fastcached_scan_entities content outHits)
     set(hits "")

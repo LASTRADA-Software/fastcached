@@ -36,7 +36,7 @@ namespace
 
     /// How many rows `AppendStorageMetrics` emits, for the one `reserve`.
     /// A loose estimate by design — it only sizes a buffer.
-    constexpr std::size_t StorageMetricCount = 24;
+    constexpr std::size_t StorageMetricCount = 25;
 
     /// Append one metric's three exposition lines to `out`.
     /// @param out Destination.
@@ -152,6 +152,43 @@ static void AppendHostMetrics(std::string& out, HostCapacity const& host)
         Append(out, metric);
 }
 
+/// Render what a machine is doing right now.
+///
+/// Each figure renders only when the platform reported it: a series that is missing says the
+/// machine would not say, where a zero would say it is idle or out of memory.
+///
+/// The CPU figures are COUNTERS in platform ticks, and a tick is a different length on every
+/// platform, so neither series means anything alone. What does is the ratio of their two
+/// rates -- `rate(busy) / rate(total)` is the machine's busy share over whatever window the
+/// reader chose, which is the arithmetic `CpuBusyPermille` does over two readings.
+/// @param out Destination.
+/// @param load The machine's load.
+static void AppendHostLoadMetrics(std::string& out, HostLoadReading const& load)
+{
+    if (load.cpu.has_value())
+    {
+        Append(out,
+               Metric { .name = "fastcache_node_cpu_busy_ticks_total",
+                        .help = "Host-wide CPU ticks spent doing anything but idling, compiles included. Platform "
+                                "ticks: read only as rate() of this over rate() of fastcache_node_cpu_ticks_total.",
+                        .type = MetricType::Counter,
+                        .value = load.cpu->busy });
+        Append(out,
+               Metric { .name = "fastcache_node_cpu_ticks_total",
+                        .help = "Host-wide CPU ticks accounted for at all; the denominator of "
+                                "fastcache_node_cpu_busy_ticks_total.",
+                        .type = MetricType::Counter,
+                        .value = load.cpu->total });
+    }
+    if (load.availableMemoryBytes.has_value())
+        Append(out,
+               Metric { .name = "fastcache_node_memory_available_bytes",
+                        .help = "Memory a new process could actually obtain: available, not free, so the page cache "
+                                "the kernel hands back on demand counts.",
+                        .type = MetricType::Gauge,
+                        .value = *load.availableMemoryBytes });
+}
+
 /// Render the metrics a cache's own statistics carry.
 ///
 /// Separate from the sink's counters because the two have different *sources*,
@@ -247,6 +284,10 @@ static void AppendStorageMetrics(std::string& out, StorageStats const& stats)
                  .help = "Entries that expired before ever being read.",
                  .type = Counter,
                  .value = stats.expiredUnfetched },
+        Metric { .name = "fastcached_expirations_total",
+                 .help = "Entries removed because their TTL lapsed, by a lookup, a write or the expiry cycle.",
+                 .type = Counter,
+                 .value = stats.expirations },
         Metric { .name = "fastcached_items",
                  .help = "Live entries currently stored.",
                  .type = Gauge,
@@ -391,8 +432,41 @@ static void AppendConsensusMetrics(std::string& out, ConsensusStatus const& stat
     }
 }
 
-std::string RenderPrometheus(IMetricsSink const& metrics, MetricsSnapshot const& snapshot)
+std::string RenderInfoMetric(InfoDescriptor const& row, std::string_view value)
 {
+    // The exposition format's three label-value escapes and nothing else: a
+    // backslash, a double quote and a line feed. Anything else is literal UTF-8.
+    std::string escaped;
+    escaped.reserve(value.size());
+    for (char const c: value)
+    {
+        switch (c)
+        {
+            case '\\':
+                escaped += "\\\\";
+                break;
+            case '"':
+                escaped += "\\\"";
+                break;
+            case '\n':
+                escaped += "\\n";
+                break;
+            default:
+                escaped += c;
+                break;
+        }
+    }
+    return std::format("# HELP {0} {1}\n# TYPE {0} {2}\n{0}{{{3}=\"{4}\"}} 1\n",
+                       row.prometheusName,
+                       row.help,
+                       TypeName(MetricType::Gauge),
+                       row.label,
+                       escaped);
+}
+
+std::string RenderPrometheus(StatsReading const& reading)
+{
+    auto const& snapshot = reading.snapshot;
     std::string out;
     // Each metric renders ~3 lines (HELP/TYPE/value); ~200 bytes is a per-row
     // estimate, so one reserve avoids some of the reallocations the += loop would
@@ -408,7 +482,7 @@ std::string RenderPrometheus(IMetricsSink const& metrics, MetricsSnapshot const&
     // it, so a realloc already happens on every scrape. That is pre-existing and
     // deliberately left alone here rather than retuned in a change about skew --
     // a corrected estimate would want measuring, not guessing.
-    out.reserve((StorageMetricCount + CounterTable.size() + 2) * 200);
+    out.reserve((StorageMetricCount + CounterTable.size() + InfoTable.size() + 2) * 200);
 
     // Only when there is a cache. A worker running this same endpoint would
     // otherwise report an empty, unbounded one — zeroes that read as facts.
@@ -424,6 +498,10 @@ std::string RenderPrometheus(IMetricsSink const& metrics, MetricsSnapshot const&
     // rather than reporting cores it does not schedule against.
     if (snapshot.host.has_value())
         AppendHostMetrics(out, *snapshot.host);
+
+    // And what it is doing now, from the same process and for the same reason.
+    if (snapshot.hostLoad.has_value())
+        AppendHostLoadMetrics(out, *snapshot.hostLoad);
 
     // And whether this node reads through to a shared cache. Only a process that
     // has an answer says anything: the daemon is the shared cache and has none.
@@ -447,7 +525,8 @@ std::string RenderPrometheus(IMetricsSink const& metrics, MetricsSnapshot const&
     // live counters used to be absent here, including all five the distributed-
     // compilation guide tells an operator to read.
     //
-    // ASKED before read, and that is the whole of #1353. `CounterTable` is
+    // ASKED before read, and that is the whole of #1353 -- asked once, by
+    // `CaptureStatsReading`, which records a row this sink cannot carry as absent. `CounterTable` is
     // `static_assert`ed to cover every enumerator, so within ONE build the
     // question cannot fail -- but this loop's build and the sink's need not be the
     // same one. On a skewed build the catalogue carries a row the sink has no slot
@@ -468,7 +547,8 @@ std::string RenderPrometheus(IMetricsSink const& metrics, MetricsSnapshot const&
     std::uint64_t omittedBySkew = 0;
     for (auto const& row: CounterTable)
     {
-        if (!metrics.Carries(row.counter))
+        auto const& value = reading.counters[static_cast<std::size_t>(row.counter)];
+        if (!value.has_value())
         {
             ++omittedBySkew;
             out += std::format("# SKEW {} is in the metrics catalogue and this build's sink has no "
@@ -478,9 +558,7 @@ std::string RenderPrometheus(IMetricsSink const& metrics, MetricsSnapshot const&
                                row.prometheusName);
             continue;
         }
-        Append(
-            out,
-            Metric { .name = row.prometheusName, .help = row.help, .type = row.type, .value = metrics.Read(row.counter) });
+        Append(out, Metric { .name = row.prometheusName, .help = row.help, .type = row.type, .value = *value });
     }
 
     // How many catalogue rows this build's sink could not carry, as a SERIES.
@@ -503,6 +581,13 @@ std::string RenderPrometheus(IMetricsSink const& metrics, MetricsSnapshot const&
                     .type = MetricType::Gauge,
                     .value = omittedBySkew });
 
+    // What build captured this reading. Unconditional, like uptime: every process
+    // serving this endpoint is some build, and a panel titling itself with the version
+    // has no other place to read it from (#134). From the READING, so a decoded one
+    // states the build that sent it.
+    for (auto const& row: InfoTable)
+        out += RenderInfoMetric(row, reading.*row.value);
+
     // Uptime is neither the cache's nor the sink's: every process that serves
     // this endpoint has one, and a worker's is as useful as a daemon's.
     Append(out,
@@ -512,6 +597,11 @@ std::string RenderPrometheus(IMetricsSink const& metrics, MetricsSnapshot const&
                     .value = static_cast<std::uint64_t>(snapshot.uptime.value.count()) });
 
     return out;
+}
+
+std::string RenderPrometheus(IMetricsSink const& metrics, MetricsSnapshot const& snapshot)
+{
+    return RenderPrometheus(CaptureStatsReading(metrics, snapshot));
 }
 
 } // namespace FastCache

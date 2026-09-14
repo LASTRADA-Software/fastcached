@@ -105,6 +105,8 @@ if(ENDO_TESTING)
         MarkdownImage_test.cpp
         MarkdownHtml_test.cpp
         TerminalProtocols_test.cpp
+        TerminalQuery_test.cpp
+        TerminalInputWin32_test.cpp
         QuestionComponent_test.cpp
         StyledText_test.cpp
         TreeTableView_test.cpp
@@ -112,6 +114,7 @@ if(ENDO_TESTING)
         VtParser_test.cpp
         ImageLoader_test.cpp
         SemanticBlockClient_test.cpp
+        Sixel_test.cpp
         runtime/TuiRuntime_test.cpp
         runtime/Modal_test.cpp
     )

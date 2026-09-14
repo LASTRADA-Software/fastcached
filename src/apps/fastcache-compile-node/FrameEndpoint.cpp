@@ -8,6 +8,7 @@
 #include <FastCache/Async/SleepUntil.hpp>
 #include <FastCache/Core/BoundedDrain.hpp>
 #include <FastCache/Core/HostPort.hpp>
+#include <FastCache/Core/Ranges.hpp>
 #include <FastCache/Net/PlatformListener.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 #include <FastCache/Protocol/Framing/LineReader.hpp>
@@ -18,9 +19,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <format>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <ranges>
 #include <span>
 #include <thread>
 #include <utility>
@@ -45,7 +48,7 @@ namespace
     /// was the only writer because it was the only thing that wrote -- so a lane
     /// reducing the loop's complexity by extracting the nearest block could turn it
     /// into an agreement between two functions with nothing saying so. A write now says
-    /// which sanctioned writer it is, so a fifth one is a row in `EndpointWriterTable`
+    /// which sanctioned writer it is, so a sixth one is a row in `EndpointWriterTable`
     /// with a reason beside it rather than a call that appeared in a helper.
     /// `EndpointWriters.hpp` carries the argument, and is explicit that this DECLARES
     /// the property rather than enforcing it.
@@ -118,7 +121,37 @@ enum class SweepPhase : std::uint8_t
     AwaitingRequest,
     /// Waiting to answer a verb the peer named: `IFrameResponder::RequestTimeout`.
     AwaitingAnswer,
+    /// Serving a subscription, bounded by one push's hold: `IPushSink::Push`.
+    Streaming,
+
+    Last, ///< The count. See `Core/EnumTable.hpp`.
 };
+
+/// What a sweep in one phase says, and which counter says it.
+struct SweepPhaseRow
+{
+    SweepPhase phase {}; ///< Which window expired.
+
+    /// What rises, or nothing where the SURFACE counts it.
+    ///
+    /// Disengaged for `Streaming` and that is the division of labour rather than a gap: a
+    /// stream swept past its hold is a subscriber that stopped reading, which is the live-stats
+    /// surface's event, and it learns of it from the push that fails (`PushOutcome::Stalled`)
+    /// and files it under its own row. Counted here as well, one stall would rise in two
+    /// series -- and filed under either answer-deadline row, it would read as a request this
+    /// node failed to answer in time, which is the opposite finding.
+    std::optional<IMetricsSink::Counter> counter {};
+};
+
+/// Every phase, in enumerator order.
+constexpr EnumTable<SweepPhase, SweepPhaseRow> SweepPhaseTable { {
+    { .phase = SweepPhase::AwaitingRequest, .counter = IMetricsSink::Counter::FrameRequestDeadlineSweeps },
+    { .phase = SweepPhase::AwaitingAnswer, .counter = IMetricsSink::Counter::FrameAnswerDeadlineSweeps },
+    { .phase = SweepPhase::Streaming, .counter = std::nullopt },
+} };
+
+static_assert(RowsInEnumeratorOrder(SweepPhaseTable, &SweepPhaseRow::phase),
+              "SweepPhaseTable must hold one row per SweepPhase, in enumerator order");
 
 /// What one sweep closed, split by why.
 ///
@@ -127,13 +160,27 @@ enum class SweepPhase : std::uint8_t
 /// signal that is correct, present, and emitted where nothing scrapes it.
 struct SweepTally
 {
-    std::size_t awaitingRequest { 0 }; ///< Swept before naming a verb.
-    std::size_t awaitingAnswer { 0 };  ///< Swept while an answer was owed.
+    /// How many were swept, per phase.
+    EnumTable<SweepPhase, std::size_t> swept {};
+
+    /// @param phase Which window expired.
+    /// @return How many were swept in @p phase.
+    [[nodiscard]] std::size_t& For(SweepPhase phase) noexcept
+    {
+        return swept.at(static_cast<std::size_t>(phase));
+    }
+
+    /// @param phase Which window expired.
+    /// @return How many were swept in @p phase.
+    [[nodiscard]] std::size_t Count(SweepPhase phase) const noexcept
+    {
+        return swept.at(static_cast<std::size_t>(phase));
+    }
 
     /// @return How many connections were swept in total, closed and deferred alike.
     [[nodiscard]] std::size_t Total() const noexcept
     {
-        return awaitingRequest + awaitingAnswer;
+        return Ranges::FoldLeft(swept, std::size_t { 0 }, std::plus {});
     }
 };
 
@@ -493,10 +540,9 @@ struct FrameServer::State
             // for the launcher's deadline: the close resumes a coroutine inline, so a
             // tally written afterwards is written after that coroutine has already
             // observed the socket shut.
-            auto& seen = entry.phase == SweepPhase::AwaitingRequest ? tally.awaitingRequest : tally.awaitingAnswer;
-            seen += 1;
-            metrics.Increment(entry.phase == SweepPhase::AwaitingRequest ? IMetricsSink::Counter::FrameRequestDeadlineSweeps
-                                                                         : IMetricsSink::Counter::FrameAnswerDeadlineSweeps);
+            tally.For(entry.phase) += 1;
+            if (auto const& row = SweepPhaseTable[static_cast<std::size_t>(entry.phase)]; row.counter.has_value())
+                metrics.Increment(*row.counter);
             if (!entry.explainBy.has_value())
                 entry.socket->Close();
         }
@@ -787,6 +833,13 @@ namespace
         /// True when the peer is gone: EOF, a reset, or a socket error.
         bool gone { false };
 
+        /// True when that departure was abortive rather than graceful.
+        ///
+        /// Read only by a stream (`StreamSink::Activity`), which files the two under different
+        /// counters for the reason `PeerDeparture` gives; an answer's watch reaches that split
+        /// through `RecordDeparture`'s table instead.
+        bool abortive { false };
+
         /// True once the connection has asked this watch what it learned.
         ///
         /// **What separates a departure the connection could act on from one it could
@@ -909,6 +962,7 @@ namespace
     void RecordDeparture(FrameServer::State& state, ISocket const* socket, PeerWatch& watch, PeerDeparture cause)
     {
         watch.gone = true;
+        watch.abortive = cause == PeerDeparture::Abortive;
         state.metrics.Increment(IMetricsSink::Counter::FramePeerWatchDeparturesObserved);
         if (watch.consulted || state.ClosedLocally(socket))
             return;
@@ -1705,6 +1759,149 @@ namespace
         co_return (co_await reader->Skip(declaredLength)).has_value();
     }
 
+    /// The endpoint's half of one subscription: every push goes out here, bounded, and the
+    /// read watch is reported from here.
+    ///
+    /// Lives in `ServeStream`'s frame for exactly as long as the stream is awaited, which is
+    /// what makes a plain pointer to it safe to hand the stream: nothing else holds one.
+    class StreamSink final: public IPushSink
+    {
+      public:
+        /// @param state The server state: the sweeper, the clock and the shutdown flag.
+        /// @param socket The connection this stream writes.
+        /// @param watch The read watch armed for the stream; finished already when the peer had
+        ///        pipelined bytes before it began.
+        StreamSink(std::shared_ptr<FrameServer::State> state,
+                   std::shared_ptr<ISocket> socket,
+                   std::shared_ptr<PeerWatch const> watch) noexcept:
+            _state { std::move(state) },
+            _socket { std::move(socket) },
+            _watch { std::move(watch) }
+        {
+        }
+
+        /// @copydoc IPushSink::Push
+        ///
+        /// **Armed before the write AND after it.** Before, so a write that parks is swept past
+        /// @p hold; after, so the sleep until the next push is covered by a fresh bound rather
+        /// than by whatever was left of the one a slow write used up -- a stream swept while it
+        /// sleeps would be a subscriber cut off for having been slow a moment ago, not for being
+        /// stuck. Pushes are at most one granted cadence apart and a hold is never shorter than
+        /// `CompileCacheWire::LiveIdleCadences` of them, so the second arm always covers the gap.
+        [[nodiscard]] Task<PushOutcome> Push(std::vector<std::byte> frame, std::chrono::milliseconds hold) override
+        {
+            auto* const state = _state.get();
+            state->Rearm(_socket.get(), state->io.Reactor().Clock().Now() + hold, SweepPhase::Streaming, hold);
+            if (co_await WriteAll(EndpointWriter::Stream, _socket.get(), frame))
+            {
+                state->Rearm(_socket.get(), state->io.Reactor().Clock().Now() + hold, SweepPhase::Streaming, hold);
+                _tally.pushes += 1;
+                _tally.bytes += frame.size();
+                co_return PushOutcome::Delivered;
+            }
+            // A socket this node closed while it is not stopping is the sweep acting on the hold;
+            // anything else is the peer resetting or the node going away, which the stream files
+            // differently. The same question `AbandonIfPeerGone` asks, for its reason.
+            co_return state->ClosedLocally(_socket.get()) && !Stopping() ? PushOutcome::Stalled : PushOutcome::Lost;
+        }
+
+        /// @copydoc IPushSink::Activity
+        [[nodiscard]] PeerActivity Activity() const noexcept override
+        {
+            if (!_watch->finished)
+                return PeerActivity::Quiet;
+            if (!_watch->gone)
+                return PeerActivity::Sent;
+            return _watch->abortive ? PeerActivity::Reset : PeerActivity::Departed;
+        }
+
+        /// @copydoc IPushSink::Stopping
+        [[nodiscard]] bool Stopping() const noexcept override
+        {
+            return _state->shuttingDown.load(std::memory_order_acquire);
+        }
+
+        /// @return What this sink delivered, for the stream's exchange line.
+        [[nodiscard]] Node::StreamTally Tally() const noexcept
+        {
+            return _tally;
+        }
+
+      private:
+        std::shared_ptr<FrameServer::State> _state;
+        std::shared_ptr<ISocket> _socket;
+        std::shared_ptr<PeerWatch const> _watch;
+        Node::StreamTally _tally {};
+    };
+
+    /// Serve a subscription on this connection until it ends, and say whether the connection
+    /// goes on.
+    ///
+    /// **The one writer for as long as the stream lasts** (`EndpointWriter::Stream`): the loop is
+    /// suspended here and writes nothing, every push leaves through `StreamSink`, and the terminal
+    /// reply leaves here once the stream returns. A stream is not a longer answer, so it is not
+    /// bracketed by `EnterResponder`: a sweep that finds a push parked past its hold must CLOSE the
+    /// socket, because the close is the only thing that retrieves a parked write. The deferral that
+    /// mark buys is for a connection that is not parked on its socket, and this one is.
+    ///
+    /// **The read watch is the existing one, armed CONSULTED**, so a subscriber leaving is observed
+    /// (`FramePeerWatchDeparturesObserved`) and never filed as a delivery abandoned mid-answer: a
+    /// subscriber's EOF is the ordinary end of a subscription, and the stream counts it itself. A
+    /// peer that pipelined bytes before the stream began has already asked for something else, so
+    /// no watch is armed -- it could learn nothing new -- and the stream sees `Sent` at once.
+    /// @param shared The server state.
+    /// @param socket The connection, shared with the watch and the sink for their lifetimes.
+    /// @param stream The surface's stream; outlives the endpoint.
+    /// @param frame The whole request; owned here so it outlives the stream.
+    /// @param opRaw The verb, as received.
+    /// @param peer The peer's host.
+    /// @param readerHoldsBytes Whether the connection's reader already holds a pipelined request.
+    /// @return Whether this connection may serve another request: only when the peer is still
+    ///         there with one of its own, which is `SettleWatch`'s answer after any reply.
+    Task<AfterWatch> ServeStream(std::shared_ptr<FrameServer::State> shared,
+                                 std::shared_ptr<ISocket> socket,
+                                 IFrameStream* stream,
+                                 std::vector<std::byte> frame,
+                                 std::uint8_t opRaw,
+                                 std::string peer,
+                                 bool readerHoldsBytes)
+    {
+        auto* const state = shared.get();
+        auto watch = std::make_shared<PeerWatch>(
+            PeerWatch { .finished = readerHoldsBytes, .gone = false, .abortive = false, .consulted = true, .counter = {} });
+        if (!readerHoldsBytes)
+            WatchPeer(shared, socket, watch);
+
+        StreamSink sink { shared, socket, watch };
+        auto const startedAt = std::chrono::steady_clock::now();
+        auto const terminal = co_await stream->Serve(frame, peer, &sink);
+
+        // Once per subscription, at its end, at the level `ExchangeLogTable` gives the verb: a
+        // subscription is an operator action, and nothing is logged per push.
+        Node::LogExchange(
+            state->logger,
+            opRaw,
+            peer,
+            frame,
+            terminal,
+            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - startedAt),
+            state->namer,
+            sink.Tally());
+
+        if (terminal.empty())
+            co_return AfterWatch::EndConnection;
+
+        // One small frame, so the header window rather than a push's hold: a peer that stopped
+        // reading has already had a whole hold.
+        state->Rearm(socket.get(),
+                     state->io.Reactor().Clock().Now() + FrameServer::HeaderTimeout,
+                     SweepPhase::Streaming,
+                     FrameServer::HeaderTimeout);
+        if (!co_await WriteAll(EndpointWriter::Stream, socket.get(), terminal))
+            co_return AfterWatch::EndConnection;
+        co_return co_await SettleWatch(&state->io.Reactor(), watch);
+    }
+
     /// Serve one connection: read a frame, answer it, repeat until the peer or the
     /// surface is done.
     ///
@@ -1903,6 +2100,18 @@ namespace
                 // and what a broken invariant would cost.
                 if (state->responder.HoldsOwnByteBudget(decoded->opRaw))
                     bytes.Release();
+
+                // A verb answered by a STREAM rather than one reply. `ServeStream` is the writer for
+                // as long as the subscription lasts, and carries why it arms no pulse, no deferral
+                // and a consulted watch (#1399).
+                if (auto* const stream = state->responder.StreamFor(decoded->opRaw); stream != nullptr)
+                {
+                    if (co_await ServeStream(
+                            shared, socket, stream, std::move(frame), decoded->opRaw, peer, !reader.Buffered().empty())
+                        == AfterWatch::EndConnection)
+                        break;
+                    continue;
+                }
 
                 // Armed only when the reader holds nothing: a peer that has just
                 // pipelined a request has proved it is there, which is the entire
@@ -2148,11 +2357,13 @@ namespace
             auto const now = state->io.Reactor().Clock().Now();
             if (auto const swept = state->CloseOverdue(now); swept.Total() != 0)
                 state->logger.Logf(LogLevel::Debug,
-                                   "{}: swept {} connection(s): {} before a verb was named, {} with an answer owed",
+                                   "{}: swept {} connection(s): {} before a verb was named, {} with an answer owed, "
+                                   "{} streaming with a push parked past its hold",
                                    state->what,
                                    swept.Total(),
-                                   swept.awaitingRequest,
-                                   swept.awaitingAnswer);
+                                   swept.Count(SweepPhase::AwaitingRequest),
+                                   swept.Count(SweepPhase::AwaitingAnswer),
+                                   swept.Count(SweepPhase::Streaming));
 
             // Run AFTER the sweep, on the same instant. A deferral created a moment
             // ago cannot expire in the same turn, and running this first would only

@@ -31,46 +31,77 @@ LadderGatherer::LadderGatherer(Endpoint admin,
 {
 }
 
-std::expected<CompileCacheWire::NodeStatusFields, std::string> const& LadderGatherer::Identify()
+LadderGatherer::Identification const& LadderGatherer::Identified()
 {
-    if (_identity.has_value())
-        return *_identity;
+    if (_identification.has_value())
+        return *_identification;
+
+    // The one place both views are written, in one statement, so the fields a rung reads
+    // and the kind a verb reads cannot describe two different answers.
+    auto const remember = [this](std::optional<RemoteKind> kind,
+                                 std::string detail,
+                                 std::optional<CompileCacheWire::NodeStatusFields> fields =
+                                     std::nullopt) -> Identification const& {
+        auto const unreadable = kind == RemoteKind::CompileNode && !fields.has_value();
+        return _identification.emplace(Identification {
+            .fields = std::move(fields),
+            .endpoint = EndpointIdentity { .kind = kind, .detail = std::move(detail), .unreadable = unreadable } });
+    };
 
     if (_node == nullptr)
-    {
-        _identity = std::unexpected(std::string { "no 0xFC connection was opened" });
-        return *_identity;
-    }
+        return remember(std::nullopt, "no 0xFC connection was opened");
 
     auto const reply = _node->Send(CompileCacheWire::EncodeNodeStatusRequest());
+
+    // The KIND is the classifier's -- the one `ProbeRemote` uses -- so the probe and this
+    // cache cannot disagree about what an endpoint is. Everything below chooses a
+    // sentence and reads fields; none of it decides the kind.
+    auto const kind = ClassifyNodeStatusReply(reply);
+
     if (!reply.has_value())
     {
         // Whatever is on that port did not frame a reply. Worded as what it IS rather
         // than as a failed scrape: this is a fact about the endpoint, and the rungs
         // below turn it into *was not asked*.
-        _identity = std::unexpected(std::format("{} is not a compile node ({})", _node->Address(), reply.error().detail));
-        return *_identity;
+        return remember(kind, std::format("{} is not a compile node ({})", _node->Address(), reply.error().detail));
     }
-    if (reply->status != CompileCacheWire::Status::Ok)
+    if (kind != RemoteKind::CompileNode && reply->code == CompileCacheWire::ErrorCode::UnsupportedVersion)
+    {
+        // Refused on the WIRE VERSION, before the verb was read: nothing is known about
+        // whether a node is there, so this must not say it is not one. The server's own
+        // words name the range it speaks, and this client's version is the other half.
+        return remember(kind,
+                        std::format("{} refused this client's 0xFC wire {}: {}",
+                                    _node->Address(),
+                                    static_cast<unsigned>(CompileCacheWire::CurrentVersion),
+                                    reply->detail.empty() ? std::string { "no range given" } : reply->detail));
+    }
+    if (kind != RemoteKind::CompileNode)
     {
         // It framed a refusal, so it speaks `0xFC` -- and has no operator component.
         // That is the ORDINARY answer from `fastcached`, which serves the compile-cache
         // verbs on this same wire, so it must not read as a fault.
-        _identity = std::unexpected(
-            std::format("{} speaks 0xFC and serves no node verbs, so it is not a compile node", _node->Address()));
-        return *_identity;
+        return remember(
+            kind, std::format("{} speaks 0xFC and serves no node verbs, so it is not a compile node", _node->Address()));
     }
 
     auto fields = CompileCacheWire::DecodeNodeStatus(reply->payload);
     if (!fields.has_value())
     {
-        _identity =
-            std::unexpected(std::format("{} answered node-status with a body this client cannot read", _node->Address()));
-        return *_identity;
+        // It said `Ok`, so it IS a compile node, and the classifier agrees. A node whose
+        // own description this client cannot read -- a newer encoding, most likely -- is
+        // still a node: the kind stays `CompileNode`, so a verb deciding a subject shows
+        // it a node's view rather than inferring `cache` for an endpoint that speaks no
+        // RESP. Only the fields are missing, and the rungs still read that as a reason.
+        return remember(kind, std::format("{} answered node-status with a body this client cannot read", _node->Address()));
     }
 
-    _identity = *std::move(fields);
-    return *_identity;
+    return remember(kind, std::format("{} is a fastcache-compile-node", _node->Address()), std::move(fields));
+}
+
+EndpointIdentity LadderGatherer::IdentifyEndpoint()
+{
+    return Identified().endpoint;
 }
 
 std::expected<Endpoint, std::string> LadderGatherer::ResolveAdmin()
@@ -81,12 +112,14 @@ std::expected<Endpoint, std::string> LadderGatherer::ResolveAdmin()
     if (_admin.Configured())
         return _admin;
 
-    auto const& identity = Identify();
-    if (!identity.has_value())
-        return std::unexpected(std::format("no admin address is known and none could be discovered: {}", identity.error()));
+    auto const& identified = Identified();
+    if (!identified.fields.has_value())
+        return std::unexpected(
+            std::format("no admin address is known and none could be discovered: {}", identified.endpoint.detail));
+    auto const& identity = *identified.fields;
 
     auto const admin = std::ranges::find(
-        identity->surfaces, CompileCacheWire::WireSurface::Admin, &CompileCacheWire::SurfaceReport::surface);
+        identity.surfaces, CompileCacheWire::WireSurface::Admin, &CompileCacheWire::SurfaceReport::surface);
 
     // **Absent, and that is an ANSWER rather than a failure to get one.** A node that
     // opened no admin surface said so; telling an operator the scrape *failed* would
@@ -105,7 +138,7 @@ std::expected<Endpoint, std::string> LadderGatherer::ResolveAdmin()
     // its endpoint with `--admin-listen` alone and wants no dashboard at all. The
     // necessary condition both callers share is the only remedy a shared sentence can
     // state without being wrong for one of them.
-    if (admin == identity->surfaces.end())
+    if (admin == identity.surfaces.end())
         return std::unexpected(std::format("{} runs no admin surface. Start the node with --admin-listen to open "
                                            "one: it is off unless asked for, so a node without one is configured "
                                            "rather than broken",
@@ -179,6 +212,7 @@ StatsAttempt LadderGatherer::AskMetrics()
     }
 
     attempt.asked = true;
+    attempt.where = EndpointText(*admin);
     auto const response = HttpGet(*admin, MetricsPath, _timeouts, _bearer);
     if (!response.has_value())
     {
@@ -213,13 +247,14 @@ StatsAttempt LadderGatherer::AskNodeMetrics()
     // consulted about it, and reporting *did not answer* would send an operator to check
     // a component that is not there. Against a plain `fastcached` this is the ordinary
     // path and must be quiet.
-    if (auto const& identity = Identify(); !identity.has_value())
+    if (auto const& identified = Identified(); !identified.fields.has_value())
     {
-        attempt.note = identity.error();
+        attempt.note = identified.endpoint.detail;
         return attempt;
     }
 
     attempt.asked = true;
+    attempt.where = std::string { _node->Address() };
     auto const reply = _node->Send(CompileCacheWire::EncodeNodeMetricsRequest());
     if (!reply.has_value())
     {
@@ -261,6 +296,7 @@ StatsAttempt LadderGatherer::AskInfo()
     }
 
     attempt.asked = true;
+    attempt.where = EndpointText(_cache);
     auto const reply = Call(*_resp, { "INFO" });
     if (!reply.has_value())
     {

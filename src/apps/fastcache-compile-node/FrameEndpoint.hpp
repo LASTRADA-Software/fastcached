@@ -10,6 +10,7 @@
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Net/IListener.hpp>
 #include <FastCache/Protocol/CompileCacheAuth.hpp>
+#include <FastCache/Protocol/LiveStream.hpp>
 #include <FastCache/Protocol/SurfaceRefusal.hpp>
 
 #include <algorithm>
@@ -179,6 +180,35 @@ inline constexpr std::string_view AnswerDeadlineIsTheEndpointsRationale =
 {
     return EndpointRefusalCodes[static_cast<std::size_t>(refusal)].code;
 }
+
+/// Serves one subscription for as long as it lasts.
+///
+/// **A verb answered by a stream is NOT answered by `IFrameResponder::Answer`**, and the split is
+/// an interface rather than a longer `Answer` because the two have opposite shapes: an answer is
+/// one reply the endpoint writes after the surface returns, while a stream writes for as long as
+/// the subscription lasts and the endpoint has to be the writer throughout.
+class IFrameStream
+{
+  public:
+    IFrameStream() = default;
+    IFrameStream(IFrameStream const&) = delete;
+    IFrameStream(IFrameStream&&) = delete;
+    IFrameStream& operator=(IFrameStream const&) = delete;
+    IFrameStream& operator=(IFrameStream&&) = delete;
+    virtual ~IFrameStream() = default;
+
+    /// Serve a subscription until it ends.
+    /// @param frame The whole request, header included; outlives the returned task, as
+    ///        `IFrameResponder::Answer`'s does.
+    /// @param peer The peer's host.
+    /// @param sink Where every push goes and what the peer has done; never null, and it outlives
+    ///        the returned task. A pointer because a coroutine parameter must not be a reference.
+    /// @return The terminal reply, or empty to close without one -- the answer for a peer that
+    ///         has left, and for a push that will never leave.
+    [[nodiscard]] virtual Task<std::vector<std::byte>> Serve(std::span<std::byte const> frame,
+                                                             std::string peer,
+                                                             IPushSink* sink) = 0;
+};
 
 /// Answers one framed request.
 ///
@@ -664,6 +694,19 @@ class IFrameResponder
     ///         non-positive interval is treated as nullopt, the same way every ceiling
     ///         in this tree spells *no bound*.
     [[nodiscard]] virtual std::optional<std::chrono::milliseconds> ProgressInterval(std::uint8_t opRaw) const noexcept = 0;
+
+    /// The stream that answers @p opRaw, or null when this verb is answered with one reply.
+    ///
+    /// **Per verb, and answered by the SURFACE, for `ProgressInterval`'s reason**: the endpoint
+    /// owns the socket and the order of what leaves on it, and the surface owns whether this verb
+    /// is a subscription. Only `Op::Subscribe` is (`CompileCacheWire::PushIsSubscribeOnly`).
+    ///
+    /// Pure virtual for the reason every question above is: a surface that inherited *stream*
+    /// would be asked to serve a subscription it knows nothing about, and one that inherited
+    /// *reply* for a stream verb would answer a single frame to a client waiting for a series.
+    /// @param opRaw The third header byte, as received; not necessarily a known verb.
+    /// @return The stream, which must outlive the endpoint, or null.
+    [[nodiscard]] virtual IFrameStream* StreamFor(std::uint8_t opRaw) noexcept = 0;
 };
 
 /// Accepts connections and answers framed requests on each until the peer stops.

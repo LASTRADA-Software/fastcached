@@ -90,7 +90,12 @@ stage() {
         # The staged database carries `-fsanitize=address` because the check requires
         # it: the empty-object signature is the sanitizer's, and a staged tree that
         # omitted it would exercise the precondition instead of the comparison.
-        entries="$entries{\"directory\":\"$work/build\",\"command\":\"c++ $sanflag -c $work/$rel -o obj/$rel.o\",\"file\":\"$work/$rel\"}"
+        #
+        # `unsanitized` names ONE unit whose compile appends `unsanitizedFlags` after the
+        # sanitizer flag, the way a target option follows a directory-scoped one.
+        extra=""
+        [[ "$rel" == "${unsanitized:-}" ]] && extra=" ${unsanitizedFlags:-}"
+        entries="$entries{\"directory\":\"$work/build\",\"command\":\"c++ $sanflag$extra -c $work/$rel -o obj/$rel.o\",\"file\":\"$work/$rel\"}"
     done
     printf '[%s]' "$entries" > "$work/build/compile_commands.json"
 }
@@ -139,6 +144,27 @@ sanflag=""
 stage "$(printf '# empty\n')" "$ctrl" 50 "src/FastCache/Net/IocpSocket.cpp" 2
 run_case no_sanitizer refuse "no AddressSanitizer"
 sanflag="-fsanitize=address"
+
+# A unit compiled with the sanitizer turned OFF is not measured by its signature (#134
+# CI): `sanitizer-absent-probe` is the vendor-sanitized control, `-fno-sanitize=all` on
+# purpose, one function and 1 symbol. Scored, it read as blind -- a refusal naming a unit
+# clang-tidy does read. It is named as unmeasured instead, and the two cases after it keep
+# that from being a blanket skip or a symbol-count rule: the SAME one-symbol object compiled
+# WITH the sanitizer is refused as blind, and so is one whose line turns it back on.
+unsanitized="src/tests/SanitizerAbsentProbe.cpp"
+unsanitizedFlags="-fno-sanitize=all"
+stage "$(printf '# empty\n')" "$ctrl" 50 "src/tests/SanitizerAbsentProbe.cpp" 1
+run_case sanitizer_off_is_unmeasured pass "SanitizerAbsentProbe.cpp: not measured -- the compile line disabled the sanitizer"
+unsanitized=""
+unsanitizedFlags=""
+stage "$(printf '# empty\n')" "$ctrl" 50 "src/tests/SanitizerAbsentProbe.cpp" 1
+run_case one_symbol_with_sanitizer_is_blind refuse "SanitizerAbsentProbe.cpp' is analysed by nothing and is not in"
+unsanitized="src/tests/SanitizerAbsentProbe.cpp"
+unsanitizedFlags="-fno-sanitize=all -fsanitize=address"
+stage "$(printf '# empty\n')" "$ctrl" 50 "src/tests/SanitizerAbsentProbe.cpp" 1
+run_case sanitizer_back_on_is_scored refuse "SanitizerAbsentProbe.cpp' is analysed by nothing and is not in"
+unsanitized=""
+unsanitizedFlags=""
 
 # The reached-by column. A row may name a leg that EXISTS, or `none`; naming one
 # that does not is a claim of coverage nothing provides, and it fails silently --
