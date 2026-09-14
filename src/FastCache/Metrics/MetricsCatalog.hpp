@@ -780,6 +780,55 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
               "is a joiner whose reply was lost, a run of them is somebody answering to an id an "
               "operator approved. Both are fixed by approving that machine again.",
       .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::LiveSubscriptionsOpened,
+      .prometheusName = "fastcache_live_subscriptions_opened_total",
+      .help = "Live-stats subscriptions this process granted. One per dashboard opened against it; a steady climb "
+              "with no operator watching is a client re-subscribing in a loop.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::LiveSnapshotsRendered,
+      .prometheusName = "fastcache_live_snapshots_rendered_total",
+      .help = "Live-stats snapshots rendered. Once per subject per tick, however many subscribers are watching "
+              "it: this rising with the NUMBER of watchers rather than with time is the render being paid per "
+              "watcher, which is the cost a subscription exists to remove.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::LiveSnapshotsSkipped,
+      .prometheusName = "fastcache_live_snapshots_skipped_total",
+      .help = "Live-stats snapshots a subscriber was too slow to receive. The node sends the newest and tells "
+              "the subscriber how many it skipped; it never waits for it. A rise is a watcher on a slow link or "
+              "a stalled terminal, not a node problem.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::LiveSubscriptionsRevoked,
+      .prometheusName = "fastcache_live_subscriptions_revoked_total",
+      .help = "Live-stats streams ended because the peer no longer passes this node's gate -- a reload or a "
+              "replicated removal revoked it. Removal fails open unless something re-checks, and this is that "
+              "check acting.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::LiveSubscriptionsEndedNotLeader,
+      .prometheusName = "fastcache_live_subscriptions_ended_not_leader_total",
+      .help = "Live-stats fleet streams ended because this node stopped leading. Each watcher was told the new "
+              "leader and follows it; a rise without an election is leadership flapping.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::LiveSubscriptionsRefusedAtCapacity,
+      .prometheusName = "fastcache_live_subscriptions_refused_at_capacity_total",
+      .help = "Live-stats subscriptions refused because this process already streams to as many watchers as it "
+              "serves. A dashboard left open on every workstation reaches this long before a real team does.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::LiveSubscriptionsRefusedUnauthenticated,
+      .prometheusName = "fastcache_live_subscriptions_refused_unauthenticated_total",
+      .help = "Live-stats fleet subscriptions refused for a missing or wrong dashboard credential, or from a "
+              "remote peer where no credential is configured. The fleet map is behind the dashboard credential "
+              "over 0xFC exactly as it is over HTTP; a burst from one host is somebody guessing.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::LiveSubscriptionsStalled,
+      .prometheusName = "fastcache_live_subscriptions_stalled_total",
+      .help = "Live-stats streams ended because a push stayed unwritten past its bound: the watcher stopped "
+              "reading altogether. The node drops the connection rather than hold its buffers.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::LiveSubscriptionsEndedByClient,
+      .prometheusName = "fastcache_live_subscriptions_ended_by_client_total",
+      .help = "Live-stats streams the watching client closed. The ordinary way a dashboard ends; read it "
+              "against the opened count, where the difference is the streams still open.",
+      .type = MetricType::Counter },
 } };
 
 // Checked at compile time rather than by a test, because the failure this prevents

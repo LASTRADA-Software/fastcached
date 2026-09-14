@@ -1184,6 +1184,25 @@ class IMetricsSink
         /// are fixed by one operator approving the machine again.
         EnrollmentRequestsRefusedAlreadyCollected,
 
+        /// A live-stats stream this node granted and began pushing to. (#1399)
+        LiveSubscriptionsOpened,
+        /// A snapshot rendered for a live-stats subject, once per subject per tick however many watch it. (#1399)
+        LiveSnapshotsRendered,
+        /// A snapshot a slow subscriber never received, sent to it as a gap. (#1399)
+        LiveSnapshotsSkipped,
+        /// A live stream ended because re-gating refused its peer. (#1399)
+        LiveSubscriptionsRevoked,
+        /// A fleet stream ended because this node stopped leading. (#1399)
+        LiveSubscriptionsEndedNotLeader,
+        /// A live subscription refused because the node already streams to its maximum. (#1399)
+        LiveSubscriptionsRefusedAtCapacity,
+        /// A fleet subscription refused for a missing or wrong dashboard credential. (#1399)
+        LiveSubscriptionsRefusedUnauthenticated,
+        /// A live stream ended because one push stayed unwritten past its bound. (#1399)
+        LiveSubscriptionsStalled,
+        /// A live stream the watching client closed. (#1399)
+        LiveSubscriptionsEndedByClient,
+
         Last,
     };
 
