@@ -19,14 +19,13 @@ namespace
 
     using namespace StatsReadingWire;
 
-    /// Presence bits of the snapshot's optional blocks, in the order the grammar lists them.
-    enum PresenceBit : std::uint8_t
-    {
-        StoragePresent = 1U << 0U,
-        HostPresent = 1U << 1U,
-        UpstreamPresent = 1U << 2U,
-        ConsensusPresent = 1U << 3U,
-    };
+    // Presence bits of the snapshot's optional blocks, in the order the grammar lists them. Typed
+    // constants rather than an unscoped enum: GCC's `-Wextra` refuses an enumerator and a plain
+    // integer as the two arms of one conditional, which is exactly how a presence byte is built.
+    constexpr std::uint8_t StoragePresent = 1U << 0U;   ///< `MetricsSnapshot::storage`.
+    constexpr std::uint8_t HostPresent = 1U << 1U;      ///< `MetricsSnapshot::host`.
+    constexpr std::uint8_t UpstreamPresent = 1U << 2U;  ///< `MetricsSnapshot::upstreamConfigured`.
+    constexpr std::uint8_t ConsensusPresent = 1U << 3U; ///< `MetricsSnapshot::consensus`.
 
     /// Every bit a presence byte may carry; anything else is `Malformed`.
     constexpr std::uint8_t KnownPresenceBits = StoragePresent | HostPresent | UpstreamPresent | ConsensusPresent;
