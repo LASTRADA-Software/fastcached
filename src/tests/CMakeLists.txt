@@ -2842,9 +2842,10 @@ set_tests_properties("tsan-scope-hygiene" PROPERTIES
 # check working and with the check having quietly stopped reading -- #317 is exactly
 # that, a file-level match reporting COVERED over a case that had left the scope.
 #
-# The trees are staged from the check's own `FastCachedTsanScope` and copies of the
+# The tree is staged from the check's own `FastCachedTsanScope` and copies of the
 # real `scripts/tsan-gate.sh` and root `CMakeLists.txt`, so the cases drive the
 # shipped table and the shipped tag expression rather than a second copy of either.
+# It is staged once and restored after each case (#1423).
 add_test(
     NAME "tsan-scope-selftest"
     COMMAND ${CMAKE_COMMAND}
