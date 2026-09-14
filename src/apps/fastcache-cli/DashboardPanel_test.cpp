@@ -989,15 +989,53 @@ namespace
     return widest;
 }
 
-/// The frame line whose content starts with @p prefix after the edge and indent, or nullopt.
+/// Where a fleet frame's history chart is, from its title to its legend.
+///
+/// A band's first line names its machine exactly as a table row does, so a case that finds or counts the table's
+/// rows by machine name reads around these lines -- or it counts a chart band as a machine row.
+/// @param lines The frame's lines.
+/// @return The chart's first line and the line after its legend; both the line count for a frame with no chart.
+[[nodiscard]] std::pair<std::size_t, std::size_t> ChartLineRange(std::vector<std::string> const& lines)
+{
+    auto const title = static_cast<std::size_t>(
+        std::ranges::find_if(lines, [](std::string const& line) { return line.contains(" per machine, last "); })
+        - lines.begin());
+    auto axis = title;
+    while (axis < lines.size())
+    {
+        auto const cells = CodePoints(lines[axis]).size();
+        if (cells >= 2 && Trimmed(Columns(lines[axis], 1, cells - 2)).ends_with("now"))
+            break;
+        ++axis;
+    }
+    if (axis == lines.size())
+        return { lines.size(), lines.size() };
+    return { title, std::min(lines.size(), axis + 2) };
+}
+
+/// The indices of @p frame's lines outside its history chart, top to bottom.
+/// @param lines The frame's lines.
+/// @return The indices.
+[[nodiscard]] std::vector<std::size_t> LinesOutsideChart(std::vector<std::string> const& lines)
+{
+    auto const [first, last] = ChartLineRange(lines);
+    auto indices = std::vector<std::size_t> {};
+    for (auto const index: std::views::iota(std::size_t { 0 }, lines.size()))
+        if (index < first || index >= last)
+            indices.push_back(index);
+    return indices;
+}
+
+/// The frame line outside its chart whose content starts with @p prefix after the edge and indent, or nullopt.
 /// @param frame The frame.
 /// @param prefix The start.
 /// @return The line.
 [[nodiscard]] std::optional<std::string> LineStarting(std::string_view frame, std::string_view prefix)
 {
-    for (auto const& line: Lines(frame))
-        if (Columns(line, LabelFrom, FakeCellWidth(prefix)) == prefix)
-            return line;
+    auto const lines = Lines(frame);
+    for (auto const index: LinesOutsideChart(lines))
+        if (Columns(lines[index], LabelFrom, FakeCellWidth(prefix)) == prefix)
+            return lines[index];
     return std::nullopt;
 }
 
@@ -1383,15 +1421,29 @@ constexpr auto FleetMachines = std::size_t { 12 };
     return static_cast<std::size_t>(found - lines.begin());
 }
 
-/// How many lines of @p frame start, after the edge and indent, with @p prefix.
+/// How many lines of @p frame outside its chart start, after the edge and indent, with @p prefix.
 /// @param frame The frame.
 /// @param prefix The start.
 /// @return The count.
 [[nodiscard]] std::size_t LinesStarting(std::string_view frame, std::string_view prefix)
 {
-    return static_cast<std::size_t>(std::ranges::count_if(Lines(frame), [prefix](std::string const& line) {
-        return Columns(line, LabelFrom, FakeCellWidth(prefix)) == prefix;
+    auto const lines = Lines(frame);
+    return static_cast<std::size_t>(std::ranges::count_if(LinesOutsideChart(lines), [&](std::size_t index) {
+        return Columns(lines[index], LabelFrom, FakeCellWidth(prefix)) == prefix;
     }));
+}
+
+/// The index of the first line of @p frame outside its chart holding @p text.
+/// @param frame The frame.
+/// @param text What to find.
+/// @return The index; the line count when none holds it.
+[[nodiscard]] std::size_t TableLineIndexHolding(std::string_view frame, std::string_view text)
+{
+    auto const lines = Lines(frame);
+    for (auto const index: LinesOutsideChart(lines))
+        if (lines[index].contains(text))
+            return index;
+    return lines.size();
 }
 
 } // namespace
@@ -1633,7 +1685,7 @@ namespace
     return RenderFleetText(snapshot, Distributed::FleetHistoryView {}, std::nullopt);
 }
 
-/// The cell under @p heading in the row of @p frame whose first cell starts with @p rowStart, trimmed.
+/// The cell under @p heading in the row of @p frame, outside its chart, whose first cell starts with @p rowStart, trimmed.
 ///
 /// Every column after the first aligns on its last cell, so a cell ends where its heading does, and it
 /// starts after the two-space gap before it.
@@ -1646,9 +1698,12 @@ namespace
                                                    std::string_view rowStart)
 {
     auto const lines = Lines(frame);
+    auto const outside = LinesOutsideChart(lines);
     auto const headingPoints = CodePoints(heading).size();
-    for (auto const& header: lines)
+    // The chart's title names its figure as a heading does, so the heading is looked for outside it too.
+    for (auto const headerAt: outside)
     {
+        auto const& header = lines[headerAt];
         auto const points = CodePoints(header);
         for (auto const start: std::views::iota(std::size_t { 1 }, points.size()))
         {
@@ -1656,13 +1711,13 @@ namespace
             if (Columns(header, start, headingPoints) != heading || points[start - 1] != " "
                 || (end < points.size() && points[end] != " "))
                 continue;
-            auto const row = std::ranges::find_if(lines, [rowStart](std::string const& line) {
-                return Trimmed(Columns(line, LabelFrom, FakeCellWidth(line))).starts_with(rowStart);
+            auto const row = std::ranges::find_if(outside, [&](std::size_t index) {
+                return Trimmed(Columns(lines[index], LabelFrom, FakeCellWidth(lines[index]))).starts_with(rowStart);
             });
-            if (row == lines.end())
+            if (row == outside.end())
                 return std::nullopt;
             // Back from the heading's last column to the gap before the cell.
-            auto const cell = Columns(*row, 0, end);
+            auto const cell = Columns(lines[*row], 0, end);
             auto const gap = cell.rfind("  ");
             return Trimmed(gap == std::string::npos ? std::string_view { cell } : std::string_view { cell }.substr(gap));
         }
@@ -1972,20 +2027,20 @@ TEST_CASE("at the Sixel rung the fleet chart is one image exactly the size of th
     }
     auto const& placement = drawing.placements[0][0];
     auto const& request = drawing.requests[0];
-    CHECK(placement.cellsHigh <= Unwrap(FleetPanel().document).chartCellsHighMost);
+    CHECK(placement.cellsHigh <= Unwrap(FleetPanel().document).chartGrowth.cellsHighMost);
     auto drawn = std::size_t { 0 };
     for (auto const pixel: std::views::iota(std::size_t { 0 }, request.pixels.size() / 4))
         drawn += request.pixels[(pixel * 4) + 3] != 0 ? 1 : 0;
     CHECK(drawn > 0);
 }
 
-TEST_CASE("below the Sixel rung, or without a cell size, the fleet panel draws no chart and keeps no rows for one",
+TEST_CASE("below the Sixel rung, or without a cell size, the fleet chart is text in the rows the image had",
           "[cli][dashboard][panel][fleet][chart]")
 {
-    // WHAT DISTINGUISHES: the Unicode frame asks the encoder for nothing and places nothing, and its strip
-    // sits HIGHER than the Sixel one's by the chart's rows and their blank -- blank rows left behind would be
-    // the chart faked; both frames are the terminal's height, so the count of lines cannot say it -- and a
-    // Sixel rung with no cell size draws exactly the Unicode frame, since no size is ever guessed.
+    // One layout, two ways to draw its bands. WHAT DISTINGUISHES: the Unicode frame asks the encoder for nothing and
+    // places nothing, yet its chart title is there and its strip sits on exactly the Sixel frame's row -- a text
+    // chart laid out apart from the image one would move it -- and a Sixel rung with no cell size draws exactly the
+    // Unicode frame, since no size is ever guessed.
     auto const sixel = DrawChart(RenderRung::Sixel, ChartCell, 100, 60);
     auto const unicode = DrawChart(RenderRung::Unicode, ChartCell, 100, 60);
     auto const unmeasured = DrawChart(RenderRung::Sixel, std::nullopt, 100, 60);
@@ -1994,9 +2049,8 @@ TEST_CASE("below the Sixel rung, or without a cell size, the fleet panel draws n
     REQUIRE(sixel.placements.at(0).size() == 2);
     CHECK(unicode.requests.empty());
     CHECK(unicode.placements.at(0).empty());
-    // The chart's item is its title, its bands, its axis and its legend; then a blank.
-    CHECK(LineIndexHolding(unicode.frames[0], "[machines]") + 1 + sixel.placements[0][0].cellsHigh + 2 + 1
-          == LineIndexHolding(sixel.frames.at(0), "[machines]"));
+    CHECK(unicode.frames[0].contains(std::format("{} per machine, last ", FleetChartMetrics.front().key)));
+    CHECK(LineIndexHolding(unicode.frames[0], "[machines]") == LineIndexHolding(sixel.frames.at(0), "[machines]"));
     CHECK(unmeasured.requests.empty());
     CHECK(unmeasured.placements.at(0).empty());
     CHECK(unmeasured.frames[0] == unicode.frames[0]);
@@ -2005,9 +2059,10 @@ TEST_CASE("below the Sixel rung, or without a cell size, the fleet panel draws n
 TEST_CASE("the fleet chart goes for height before the tiles, and below its width it is not drawn",
           "[cli][dashboard][panel][fleet][chart]")
 {
-    // The chart is an item in the drop order like any other. WHAT DISTINGUISHES: at the tallest height
-    // without the chart, the headline tiles are still there -- the chart went first -- and at a width
-    // under the chart's minimum there is no image while the table still draws.
+    // The chart takes only rows nothing else wants. WHAT DISTINGUISHES: at the tallest height without the
+    // chart, the headline tiles are still there -- the chart went first -- one row taller it is back with one
+    // band, and its title says which of the three machines that is; at a width under the chart's minimum there
+    // is no image while the table still draws.
     auto shortest = std::optional<int> {};
     for (auto const rows: std::views::iota(8, 61) | std::views::reverse)
         if (DrawChart(RenderRung::Sixel, ChartCell, 100, rows).placements.at(0).empty())
@@ -2018,7 +2073,9 @@ TEST_CASE("the fleet chart goes for height before the tiles, and below its width
     REQUIRE(shortest.has_value());
     auto const without = DrawChart(RenderRung::Sixel, ChartCell, 100, Unwrap(shortest));
     CHECK(without.frames.at(0).contains(Distributed::FleetKpis().front().label));
-    CHECK(DrawChart(RenderRung::Sixel, ChartCell, 100, Unwrap(shortest) + 1).placements.at(0).size() == 2);
+    auto const oneBand = DrawChart(RenderRung::Sixel, ChartCell, 100, Unwrap(shortest) + 1);
+    CHECK(oneBand.placements.at(0).size() == 2);
+    CHECK(oneBand.frames.at(0).contains("; the first 1 of 3 by name"));
 
     auto const narrow = DrawChart(RenderRung::Sixel, ChartCell, 24, 60);
     CHECK(narrow.placements.at(0).empty());
@@ -3664,7 +3721,7 @@ TEST_CASE("a heartbeat past its threshold is dressed stale and one inside it fre
     auto const& frame = lit.frames.front();
 
     auto const toneOn = [&](std::string_view rowStart) -> std::optional<FrameTone> {
-        auto const row = LineIndexHolding(frame, rowStart) + 1;
+        auto const row = TableLineIndexHolding(frame, rowStart) + 1;
         auto const cell = CellUnder(frame, "heartbeat-age", rowStart);
         for (auto const& span: lit.spans.front())
             if (span.row == row && cell.has_value() && SpanText(frame, span) == Unwrap(cell))
@@ -3752,7 +3809,7 @@ TEST_CASE("the fleet chart yields rows to the table, and grows into rows nothing
     REQUIRE(roomy.frames.size() == 1);
     REQUIRE(roomy.placements.front().size() == 2);
     auto const& spec = Unwrap(FleetPanel().document);
-    CHECK(roomy.placements.front().front().cellsHigh == spec.chartBandCellsMost);
+    CHECK(roomy.placements.front().front().cellsHigh == spec.chartGrowth.bandCellsMost);
     auto const lines = Lines(roomy.frames.front());
     CHECK(lines.size() == 40);
     CHECK(lines.at(38).contains(FleetReadingSource));
@@ -3788,12 +3845,12 @@ TEST_CASE("the Dispatched tile draws its trend across the samples, and no trend 
     CHECK(blocks(AfterWord(plain.frames.front(), trended->label).value_or("")) == 0);
 }
 
-TEST_CASE("without a chart the fleet frame is still the terminal's height, its source line at the bottom",
+TEST_CASE("on a text rung the fleet frame is still the terminal's height, its source line at the bottom",
           "[cli][dashboard][panel][fleet][parity]")
 {
     // #134 F13 on the rungs with no image. WHAT DISTINGUISHES: one machine at 120x40 fills forty rows with
     // the source on the last content row -- the frame the owner saw ended halfway down the screen -- and
-    // the blank rows are above the source line, not below it.
+    // the rows the chart did not grow into are blank above the source line, not below it.
     auto const run = RunFleet({ FleetSampleOf(1, LeaderFleetText(1)), Tick }, 120, 40, UnicodeContext());
     REQUIRE(run.frames.size() == 1);
     auto const lines = Lines(run.frames.front());
@@ -3939,19 +3996,173 @@ TEST_CASE("the fleet chart explains itself: its figure and span, each machine's 
     CHECK(legend.contains(std::format("bar: {}, grey: to {}, blank: no reading", metric.key, figure(1000))));
 }
 
-TEST_CASE("before any machine reports the chart's figure, the chart says so and draws no image",
+TEST_CASE("before any machine reports the chart's figure, the chart says so on every rung and draws no image",
           "[cli][dashboard][panel][fleet][chart][parity]")
 {
-    // WHAT DISTINGUISHES: an empty image would read as a fleet with nothing on it; the line names the figure
-    // and says nobody reported it, and nothing is placed or encoded.
+    // WHAT DISTINGUISHES: an empty chart would read as a fleet with nothing on it; the line names the figure
+    // and says nobody reported it, on the Sixel rung and on the Unicode one alike, and nothing is placed or encoded.
     auto encoder = ScriptedSixelEncoder {};
     auto context = UnicodeContext();
     context.rung = RenderRung::Sixel;
     context.sixel = &encoder;
+    auto const said = std::format("{} per machine: no machine has reported it yet", FleetChartMetrics.front().key);
     auto const run = RunFleet({ FleetSampleOf(1, FleetText(3)), Tick }, 100, 60, context, ChartCell);
     REQUIRE(run.frames.size() == 1);
     CHECK(run.placements.front().empty());
     CHECK(encoder.Requests().empty());
-    CHECK(run.frames.front().contains(
-        std::format("{} per machine: no machine has reported it yet", FleetChartMetrics.front().key)));
+    CHECK(run.frames.front().contains(said));
+    auto const text = RunFleet({ FleetSampleOf(1, FleetText(3)), Tick }, 100, 60, UnicodeContext());
+    REQUIRE(text.frames.size() == 1);
+    CHECK(text.frames.front().contains(said));
+}
+
+namespace
+{
+
+/// Where a fleet frame's text chart is: the title's line, each machine band's first line, and the axis's line.
+struct FleetTextChart
+{
+    std::size_t title { 0 };           ///< The title's line.
+    std::vector<std::size_t> bands {}; ///< Each band's first line, top to bottom.
+    std::size_t axis { 0 };            ///< The axis's line.
+};
+
+/// The text chart in @p frame over @p machines, found by its title and then each machine's first band line.
+/// @param frame The frame.
+/// @param machines The bands' labels, top to bottom.
+/// @return The lines; the case fails where a line is missing.
+[[nodiscard]] FleetTextChart FleetTextChartIn(std::string_view frame, std::span<std::string_view const> machines)
+{
+    auto const lines = Lines(frame);
+    auto chart = FleetTextChart { .title = LineIndexHolding(frame, " per machine, last "), .bands = {}, .axis = 0 };
+    REQUIRE(chart.title < lines.size());
+    for (auto const machine: machines)
+    {
+        // The chart is above the table, so a machine's first line after the title is its band.
+        auto at = chart.title + 1;
+        while (at < lines.size() && !Inside(lines[at]).starts_with(machine))
+            ++at;
+        REQUIRE(at < lines.size());
+        chart.bands.push_back(at);
+    }
+    chart.axis = chart.title + 1;
+    while (chart.axis < lines.size() && !Inside(lines[chart.axis]).ends_with("now"))
+        ++chart.axis;
+    REQUIRE(chart.axis < lines.size());
+    return chart;
+}
+
+} // namespace
+
+TEST_CASE("on a text rung the fleet chart is the rung's marks: a sample a cell, a blank for no reading, and a legend",
+          "[cli][dashboard][panel][fleet][chart][parity]")
+{
+    // #134 F14 below the Sixel rung, where the chart used to be missing. WHAT DISTINGUISHES, over three samples, the
+    // second of which has no reading for build-02:
+    //   - three bands of one height, each naming its machine and its newest figure, and the axis right under them;
+    //   - the span the title names is exactly the cells across the axis, so a cell is a sample;
+    //   - build-02's second sample is blank in every row of its band while its neighbours are marks -- a zero drawn
+    //     there would be a reading nobody gave;
+    //   - the legend names the zero mark and the full cell, and that every band's top is the metric's whole;
+    //   - on the ASCII rung the same rows are ASCII marks, byte for byte.
+    auto const figure = [](std::uint64_t permille) {
+        return Distributed::HumanFleetFigure(permille, Distributed::CellFormat::Permille);
+    };
+    auto const& metric = FleetChartMetrics.front();
+    constexpr auto Machines = std::to_array<std::string_view>({ "build-01:7070", "build-02:7070", "build-03:7070" });
+    auto const newest = std::to_array({ figure(300), figure(800), figure(700) });
+
+    auto const drawing = DrawChart(RenderRung::Unicode, std::nullopt, 100, 60);
+    REQUIRE(drawing.frames.size() == 1);
+    auto const& frame = drawing.frames.front();
+    INFO(frame);
+    auto const lines = Lines(frame);
+    auto const chart = FleetTextChartIn(frame, Machines);
+    auto const bandCells = chart.bands[1] - chart.bands[0];
+    CHECK(bandCells >= 1);
+    CHECK(chart.bands[2] - chart.bands[1] == bandCells);
+    CHECK(chart.axis == chart.bands[2] + bandCells);
+    for (auto const index: std::views::iota(std::size_t { 0 }, Machines.size()))
+    {
+        INFO("band " << Machines[index]);
+        CHECK(Inside(lines.at(chart.bands[index])).contains(newest[index]));
+    }
+
+    auto const title = Inside(lines.at(chart.title));
+    auto const lead = std::format("{} per machine, last ", metric.key);
+    REQUIRE(title.starts_with(lead));
+    REQUIRE(title.ends_with(" samples"));
+    auto const span = title.substr(lead.size(), title.size() - lead.size() - std::string_view { " samples" }.size());
+    auto const axis = Inside(lines.at(chart.axis));
+    CHECK(axis.starts_with(std::format("-{} samples", span)));
+    CHECK(std::to_string(CodePoints(axis).size()) == span);
+
+    for (auto const row: std::views::iota(chart.bands[1], chart.bands[1] + bandCells))
+    {
+        INFO("build-02 row " << row);
+        auto const cells = NewestCells(lines.at(row), 3);
+        CHECK(cells[1] == " ");
+    }
+    auto const floorOf = [&](std::size_t band) {
+        return NewestCells(lines.at(chart.bands[band] + bandCells - 1), 3);
+    };
+    CHECK(floorOf(1)[0] != " ");
+    CHECK(floorOf(1)[2] != " ");
+    CHECK(std::ranges::none_of(floorOf(0), [](std::string const& cell) { return cell == " "; }));
+
+    auto const legend = Inside(lines.at(chart.axis + 1));
+    CHECK(legend.contains(std::format("{} zero", BlockLevels.front())));
+    CHECK(legend.contains(std::format("{} the top", BlockLevels.back())));
+    CHECK(legend.contains(std::format("bar: {} of {}, blank: no reading", metric.key, figure(1000))));
+
+    auto const ascii = DrawChart(RenderRung::Ascii, std::nullopt, 100, 60);
+    REQUIRE(ascii.frames.size() == 1);
+    auto const asciiLines = Lines(ascii.frames.front());
+    auto const asciiChart = FleetTextChartIn(ascii.frames.front(), Machines);
+    auto marks = std::size_t { 0 };
+    for (auto const row: std::views::iota(asciiChart.bands.front(), asciiChart.axis))
+    {
+        CHECK(std::ranges::all_of(asciiLines.at(row), [](char byte) { return static_cast<unsigned char>(byte) < 0x80U; }));
+        marks += static_cast<std::size_t>(std::ranges::count(asciiLines.at(row), '#'));
+    }
+    CHECK(marks > 0);
+}
+
+TEST_CASE("a text fleet chart bands the machines its cells read, and counts them over those cells",
+          "[cli][dashboard][panel][fleet][chart]")
+{
+    // A text chart's span is its cells, a sample each, so a machine that reported only before its oldest cell has
+    // no band in it. WHAT DISTINGUISHES, over 40 samples in which build-03 reported only the first two, at a width
+    // whose cells hold fewer than 38 of them: two bands with the axis right under them -- rows laid out for a third
+    // band leave the axis a band too low -- no build-03 in the chart, and no "the first 2 of 3", which counts a
+    // machine the chart cannot draw.
+    auto view = PanelView {
+        FleetPanel(),
+        PanelContext { .absent = std::string { Absent }, .cellWidth = &FakeCellWidth, .rung = RenderRung::Unicode }
+    };
+    auto script =
+        std::vector<DashboardEvent> { DashboardEvent { .kind = DashboardEventKind::Resize, .columns = 60, .rows = 60 } };
+    for (auto const second: std::views::iota(1, 41))
+        script.push_back(FleetSampleOf(second,
+                                       ChartText(second <= 2 ? std::vector<std::string> { "100", "900", "500" }
+                                                             : std::vector<std::string> { "100", "900" })));
+    script.push_back(Tick);
+    auto sink = CollectingSink {};
+    (void) Drive(std::move(script), DashboardLimits {}, view, sink, &ReadFleetSample);
+    REQUIRE(sink.frames.size() == 1);
+    auto const& frame = sink.frames.front();
+    INFO(frame);
+    auto const lines = Lines(frame);
+
+    constexpr auto Read = std::to_array<std::string_view>({ "build-01:7070", "build-02:7070" });
+    auto const chart = FleetTextChartIn(frame, Read);
+    auto const title = Inside(lines.at(chart.title));
+    auto const lead = std::format("{} per machine, last ", FleetChartMetrics.front().key);
+    REQUIRE(title.starts_with(lead));
+    CHECK(std::stoul(title.substr(lead.size())) < 38);
+    CHECK_FALSE(title.contains("by name"));
+    auto const bandCells = chart.bands[1] - chart.bands[0];
+    CHECK(chart.axis == chart.bands[1] + bandCells);
+    for (auto const row: std::views::iota(chart.title, chart.axis + 2))
+        CHECK_FALSE(lines.at(row).contains("build-03"));
 }
