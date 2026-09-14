@@ -7,6 +7,7 @@
 #include "FleetDocument.hpp"
 #include "FleetReading.hpp"
 #include "LivePipedView.hpp"
+#include "ScrapeFixture.hpp"
 #include "ScriptedCellWidth.hpp"
 #include "ScriptedSixelEncoder.hpp"
 #include "StatsSource.hpp"
@@ -91,35 +92,58 @@ struct Series
     return std::string { DescriptorOf(IMetricsSink::Counter::ConnectionsTotal)->prometheusName };
 }
 
+/// The series a scrape of @p reading carries (`ScrapeOf`), as numbers.
+/// @param reading The model.
+/// @return The series.
+[[nodiscard]] std::vector<Series> SeriesOf(StatsReading const& reading)
+{
+    auto series = std::vector<Series> {};
+    for (auto const& field: ScrapeOf(reading))
+    {
+        auto value = std::uint64_t { 0 };
+        auto const& text = field.value.lexical;
+        auto const [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
+        if (field.value.kind == CellKind::Number && error == std::errc {} && end == text.data() + text.size())
+            series.emplace_back(field.name, value);
+    }
+    return series;
+}
+
 /// A full `/metrics` reading for the cache panel, every counter scaled by @p step.
+///
+/// **Rendered by the daemon's formatter from a model and read back by the client's parser**, so the fixture holds
+/// what a scrape holds: a cache block whole or not at all. A record with half a block is one no daemon sends, and
+/// the live model cannot state it.
 /// @param step How far every counter has moved.
 /// @param tiers Which tiers the reading carries.
 /// @return The fields.
 [[nodiscard]] std::vector<Series> CacheSeries(std::uint64_t step, std::vector<std::string_view> const& tiers)
 {
-    auto series = std::vector<Series> {
-        { "fastcached_get_hits_total", 90 * step },
-        { "fastcached_get_misses_total", 10 * step },
-        { "fastcached_cmd_get_total", 100 * step },
-        { "fastcached_cmd_set_total", 5 * step },
-        { ConnectionsTotal(), 3 * step },
-        { "fastcached_evictions_total", 2 * step },
-        { "fastcached_evicted_unfetched_total", step },
-        { "fastcached_expired_unfetched_total", step },
-        { std::string { DescriptorOf(IMetricsSink::Counter::ExpiryKeysReclaimed)->prometheusName }, 4 * step },
-        { "fastcached_items", 1284991 },
-        { "fastcached_bytes_used", std::uint64_t { 3 } << 30U },
-        { "fastcached_bytes_limit", std::uint64_t { 4 } << 30U },
-    };
+    auto reading = StatsReading {};
+    reading.counters[static_cast<std::size_t>(IMetricsSink::Counter::ConnectionsTotal)] = 3 * step;
+    reading.counters[static_cast<std::size_t>(IMetricsSink::Counter::ExpiryKeysReclaimed)] = 4 * step;
+    reading.snapshot.storage = StorageStats { .itemCount = 1284991,
+                                              .bytesUsed = std::size_t { 3 } << 30U,
+                                              .bytesLimit = std::size_t { 4 } << 30U,
+                                              .evictions = 2 * step,
+                                              .cmdGet = 100 * step,
+                                              .cmdSet = 5 * step,
+                                              .getHits = 90 * step,
+                                              .getMisses = 10 * step,
+                                              .evictedUnfetched = step,
+                                              .expiredUnfetched = step };
     for (auto const tier: tiers)
     {
-        series.emplace_back(TierSeriesName("fastcached_tier_items", tier), 412003);
-        series.emplace_back(TierSeriesName("fastcached_tier_bytes_used", tier), std::uint64_t { 800 } << 20U);
-        series.emplace_back(TierSeriesName("fastcached_tier_bytes_limit", tier), std::uint64_t { 1 } << 30U);
-        series.emplace_back(TierSeriesName("fastcached_tier_evictions_total", tier), step);
-        series.emplace_back(TierSeriesName("fastcached_tier_index_bytes", tier), std::uint64_t { 248 } << 20U);
+        auto const* row = FindIfOrNull(StorageTierTable, [tier](auto const& one) { return one.name == tier; });
+        REQUIRE(row != nullptr);
+        reading.snapshot.storageTiers[static_cast<std::size_t>(row->tier)] =
+            StorageStats { .itemCount = 412003,
+                           .bytesUsed = std::size_t { 800 } << 20U,
+                           .bytesLimit = std::size_t { 1 } << 30U,
+                           .indexBytes = std::size_t { 248 } << 20U,
+                           .evictions = step };
     }
-    return series;
+    return SeriesOf(reading);
 }
 
 /// A line's code points, one string each.
@@ -471,9 +495,9 @@ TEST_CASE("a cache frame dresses its level and tier readings as figures, their l
     // G1. WHAT DISTINGUISHES: each run covers exactly the words it names -- `items`, not `items       ` -- with the
     // tone of what they are, so a figure and its label are two runs rather than one run over both; and a reading
     // the source did not carry (`fastcached_items` removed) gets no run, where dressing the marker as a figure would
-    // give weight to a number that is not there.
-    auto series = CacheSeries(1, { "memory", "disk" });
-    std::erase_if(series, [](Series const& one) { return one.name == "fastcached_items"; });
+    // give weight to a number that is not there. The absent readings here are the model's own: `connected` names no
+    // field, and one sample is no interval, so the tier's `evict/s` is absent.
+    auto const series = CacheSeries(1, { "memory", "disk" });
     auto sink = CollectingSink {};
     auto view = PanelView {
         CachePanel(),
@@ -515,7 +539,7 @@ TEST_CASE("a cache frame dresses its level and tier readings as figures, their l
         INFO("run " << std::to_underlying(expected.first) << " " << expected.second);
         CHECK(runs.contains(expected));
     }
-    // The absent readings: `items` is not carried and the connected row has no field, so neither marker is a run.
+    // The absent readings: the connected row has no field and one sample has no rate, so no marker is a run.
     CHECK_FALSE(std::ranges::any_of(runs, [](auto const& run) { return run.second == Absent; }));
     CHECK(std::ranges::count_if(lines, [](std::string const& line) { return line.contains(Absent); }) >= 2);
 }
@@ -527,8 +551,8 @@ TEST_CASE("a level label as wide as the label column still leaves a blank before
     // label in a twelve-cell column reads `scratch free1 284 991` unless the column grows. It grows for the whole
     // block, so the short label's reading starts in the same column rather than at the default one.
     static constexpr auto levels = std::array {
-        LevelRow { .label = "scratch free", .key = "long", .value = { .field = { .metrics = "fastcached_items" } } },
-        LevelRow { .label = "items", .key = "items", .value = { .field = { .metrics = "fastcached_items" } } },
+        LevelRow { .label = "scratch free", .key = "long", .value = { .field = StorageField<&StorageStats::itemCount>() } },
+        LevelRow { .label = "items", .key = "items", .value = { .field = StorageField<&StorageStats::itemCount>() } },
     };
     static constexpr auto spec =
         PanelSpec { .title = "levels", .rates = {}, .levels = levels, .tierColumns = {}, .tierNote = {} };
@@ -693,51 +717,62 @@ TEST_CASE("every panel line is the terminal's width and a wider terminal draws m
     CHECK(SparkOf(Unwrap(wideLine), "accepted").size() > SparkOf(Unwrap(narrowLine), "accepted").size());
 }
 
-TEST_CASE("every series a panel names is one the daemon's formatter emits", "[cli][dashboard][panel]")
+TEST_CASE("every figure a panel names reads the same number off a scrape the daemon renders", "[cli][dashboard][panel]")
 {
-    // The storage, tier and host series are named in `PrometheusFormatter.cpp`, file-local, so the
-    // panels spell them again. This is what connects the two spellings: a real snapshot rendered by
-    // the real formatter, parsed by the client's own parser, must carry every `/metrics` name a
-    // panel reads -- tier columns once per tier -- and every `NodeMetrics` name must be a catalogue
-    // name. The control is a name that must NOT be found, so a lookup that finds everything fails.
+    // A panel names the MODEL, and until #1399's subscription a live session still reads `/metrics`, so the
+    // adapter between them is what connects the two. WHAT DISTINGUISHES: a reading whose every field is a
+    // different number, rendered by the real formatter and parsed by the client's own parser, reads back the SAME
+    // number for every figure a panel draws -- tier columns once per tier -- so an adapter row that is missing,
+    // or stores into its neighbour's field, reads absent or the wrong number here. The control is a figure the
+    // original carries and a reading with no cache does not.
     auto sink = AtomicMetricsSink {};
+    auto value = std::uint64_t { 1 };
+    for (auto const& row: CounterTable)
+        sink.Increment(row.counter, (value++ * 1'000'003) + 17);
+    auto const distinct = [&value] {
+        auto stats = StorageStats {};
+        for (auto const member: StorageStatsSizeFields)
+            stats.*member = static_cast<std::size_t>(value++ * 7919);
+        for (auto const member: StorageStatsCounterFields)
+            stats.*member = value++ * 7919;
+        return stats;
+    };
     auto tiers = TieredStorageStats {};
     for (auto& tier: tiers)
-        tier = StorageStats {};
-    auto const body = RenderPrometheus(
-        sink,
-        MetricsSnapshot {
-            .storage = StorageStats {}, .storageTiers = tiers, .host = HostCapacity {}, .uptime = Uptime { 0s } });
-    auto const record = ParsePrometheus(body);
-    auto const emitted = [&record](std::string_view name) {
-        return FindField(record, name) != nullptr;
-    };
-    REQUIRE(!emitted("fastcached_no_such_series"));
-
-    auto catalogue = std::set<std::string_view> {};
-    for (auto const& row: CounterTable)
-        catalogue.insert(row.prometheusName);
+        tier = distinct();
+    auto const original =
+        CaptureStatsReading(sink,
+                            MetricsSnapshot { .storage = distinct(),
+                                              .storageTiers = tiers,
+                                              .host = HostCapacity { .logicalCores = 32,
+                                                                     .configuredSlots = 30,
+                                                                     .totalMemoryBytes = 68'719'476'736,
+                                                                     .diskCapacityBytes = 2'000'398'934'016,
+                                                                     .diskFreeBytes = 442'381'631'488,
+                                                                     .busySlots = 7 },
+                                              .uptime = Uptime { 864'017s } });
+    auto const adapted = Unwrap(StatsReadingFromRecord(ParsePrometheus(RenderPrometheus(original)), StatsOrigin::Metrics));
+    auto const noCache = StatsReading {};
 
     auto checked = std::size_t { 0 };
-    auto const check = [&](FieldNames const& names, std::string_view tier) {
-        if (!names.metrics.empty())
-        {
-            auto const name = tier.empty() ? std::string { names.metrics } : TierSeriesName(names.metrics, tier);
-            INFO("/metrics series " << name);
-            CHECK(emitted(name));
-            ++checked;
-        }
-        if (!names.nodeMetrics.empty())
-        {
-            INFO("NodeMetrics name " << names.nodeMetrics);
-            CHECK(catalogue.contains(names.nodeMetrics));
-            ++checked;
-        }
+    auto const check = [&](ReadingField field, std::string_view tierName) {
+        if (!field.Names())
+            return;
+        auto const* row = FindIfOrNull(StorageTierTable, [tierName](auto const& tier) { return tier.name == tierName; });
+        auto const tier = row == nullptr ? std::optional<StorageTier> {} : std::optional { row->tier };
+        auto const expected = field.read(original, tier);
+        INFO("figure " << checked << " tier " << tierName);
+        REQUIRE(expected.has_value());
+        CHECK(field.read(adapted, tier) == expected);
+        ++checked;
     };
     auto const checkFigure = [&](FigureSpec const& figure, std::string_view tier) {
         check(figure.field, tier);
         check(figure.other, tier);
+        for (auto const addend: figure.addends)
+            check(addend, tier);
     };
+    CHECK_FALSE(CachePanel().levels[1].value.field.read(noCache, std::nullopt).has_value());
 
     for (auto const* panel: { &CachePanel(), &NodePanel() })
     {
@@ -746,6 +781,8 @@ TEST_CASE("every series a panel names is one the daemon's formatter emits", "[cl
             checkFigure(row.figure, {});
             for (auto const& beside: row.beside)
                 checkFigure(beside.figure, {});
+            for (auto const& part: row.split)
+                checkFigure(part.figure, {});
         }
         for (auto const& row: panel->levels)
         {
@@ -756,6 +793,11 @@ TEST_CASE("every series a panel names is one the daemon's formatter emits", "[cl
         for (auto const& column: panel->tierColumns)
             for (auto const& tier: StorageTierTable)
                 checkFigure(column.figure, tier.name);
+        for (auto const& block: panel->facts)
+            for (auto const& line: block.lines)
+                for (auto const& cell: line.cells)
+                    for (auto const& figure: cell.figures)
+                        checkFigure(figure.figure, {});
     }
     CHECK(checked >= 30);
 }
@@ -765,7 +807,9 @@ TEST_CASE("a cache that served no reads has no hit rate rather than zero percent
     // A ratio over nothing is not a ratio. WHAT DISTINGUISHES: two readings with no new hit and no
     // new miss show the marker, and the control -- the same counters moving -- shows a percentage.
     auto const reads = [](std::uint64_t hits, std::uint64_t misses) {
-        return std::vector<Series> { { "fastcached_get_hits_total", hits }, { "fastcached_get_misses_total", misses } };
+        auto reading = StatsReading {};
+        reading.snapshot.storage = StorageStats { .getHits = hits, .getMisses = misses };
+        return SeriesOf(reading);
     };
     auto const idle = CacheFrames({ SampleOf(reads(50, 50), 1), SampleOf(reads(50, 50), 2), Tick }, RenderRung::Unicode);
     auto const busy = CacheFrames({ SampleOf(reads(50, 50), 1), SampleOf(reads(80, 60), 2), Tick }, RenderRung::Unicode);
@@ -1923,7 +1967,10 @@ constexpr std::string_view ChromeAdmin = "127.0.0.1:9464";
     auto sample = SampleOf(CacheSeries(1, { "memory" }), 1);
     auto& attempt = sample.attempts.front();
     auto fields = Unwrap(attempt.record).fields;
-    fields.push_back(Field { .name = std::string { CacheUptimeField }, .value = NumberCell(Uptime) });
+    // The scrape already states an uptime; this reading's is six days and a bit.
+    auto const uptime = std::ranges::find(fields, std::string { "fastcached_uptime_seconds" }, &Field::name);
+    REQUIRE(uptime != fields.end());
+    uptime->value = NumberCell(Uptime);
     std::ranges::copy(BuildInfoFields("0.4.1"), std::back_inserter(fields));
     attempt.record = RecordValue(std::move(fields));
     attempt.where = std::string { ChromeAdmin };
@@ -1982,10 +2029,11 @@ TEST_CASE("a cache panel titles itself with the version where its source states 
     };
 
     CHECK(titleOf(BuildInfoFields("0.4.1"), StatsOrigin::Metrics).starts_with(TopStart("fastcached 0.4.1")));
-    CHECK(titleOf(infoField(), StatsOrigin::Info).starts_with(TopStart("fastcached 0.4.1")));
 
-    // The other source's spelling in each reading is not a version.
+    // INFO's spelling in a /metrics reading is not a version, and an INFO reading states no live reading at all
+    // (`StatsReadingFromRecord`), so even its own spelling titles nothing.
     CHECK(titleOf(infoField(), StatsOrigin::Metrics).starts_with(TopStart(std::format("fastcached {}", Absent))));
+    CHECK(titleOf(infoField(), StatsOrigin::Info).starts_with(TopStart(std::format("fastcached {}", Absent))));
     CHECK(titleOf(BuildInfoFields("0.4.1"), StatsOrigin::Info).starts_with(TopStart(std::format("fastcached {}", Absent))));
 }
 
@@ -2112,14 +2160,6 @@ namespace
 
 using NodeCounter = IMetricsSink::Counter;
 
-/// A catalogued counter's exported name.
-/// @param counter The counter.
-/// @return Its name.
-[[nodiscard]] std::string CounterName(NodeCounter counter)
-{
-    return std::string { DescriptorOf(counter)->prometheusName };
-}
-
 /// A node reading @p step intervals in: every counter the node panel draws, moved by @p step.
 /// @param step How far the counters have moved.
 /// @param seconds When it was taken.
@@ -2129,15 +2169,19 @@ using NodeCounter = IMetricsSink::Counter;
                                           int seconds,
                                           std::optional<CompileCacheWire::NodeStatusFields> status)
 {
-    auto sample = SampleOf({ { CounterName(NodeCounter::WorkerJobsCompleted), 41 * step },
-                             { CounterName(NodeCounter::WorkerCompileMillisTotal), 75440 * step },
-                             { CounterName(NodeCounter::WorkerJobsRefusedNoSlot), 2 * step },
-                             { CounterName(NodeCounter::WorkerJobsRefusedLeaseExpired), step },
-                             { CounterName(NodeCounter::WorkerJobsRefusedUnknownFingerprint), 0 },
-                             { CounterName(NodeCounter::NodeCacheHits), 881 * step },
-                             { CounterName(NodeCounter::NodeCacheMisses), 119 * step },
-                             { "fastcache_node_disk_free_bytes", std::uint64_t { 41 } << 30U } },
-                           seconds);
+    auto reading = StatsReading {};
+    auto const count = [&reading](NodeCounter counter, std::uint64_t value) {
+        reading.counters[static_cast<std::size_t>(counter)] = value;
+    };
+    count(NodeCounter::WorkerJobsCompleted, 41 * step);
+    count(NodeCounter::WorkerCompileMillisTotal, 75440 * step);
+    count(NodeCounter::WorkerJobsRefusedNoSlot, 2 * step);
+    count(NodeCounter::WorkerJobsRefusedLeaseExpired, step);
+    count(NodeCounter::WorkerJobsRefusedUnknownFingerprint, 0);
+    count(NodeCounter::NodeCacheHits, 881 * step);
+    count(NodeCounter::NodeCacheMisses, 119 * step);
+    reading.snapshot.host = HostCapacity { .diskFreeBytes = std::uint64_t { 41 } << 30U };
+    auto sample = SampleOf(SeriesOf(reading), seconds);
     sample.attempts.front().where = "build-07:9464";
     sample.nodeStatus = std::move(status);
     return sample;

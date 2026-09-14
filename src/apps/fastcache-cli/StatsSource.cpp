@@ -1,11 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "StatsSource.hpp"
 
+#include <FastCache/Cache/StorageTier.hpp>
 #include <FastCache/Core/Ranges.hpp>
+#include <FastCache/Metrics/MetricsCatalog.hpp>
 
 #include <algorithm>
 #include <array>
 #include <charconv>
+#include <chrono>
 #include <cstddef>
 #include <format>
 #include <ranges>
@@ -79,6 +82,213 @@ namespace
         auto const last = text.find_last_not_of(" \t");
         return text.substr(first, last - first + 1);
     }
+
+    /// One `/metrics` series that is a field of a struct in the live model, and where the number goes.
+    /// @tparam Struct The struct the field belongs to.
+    template <typename Struct>
+    struct SeriesField
+    {
+        std::string_view series;                                   ///< The series name, unlabelled.
+        void (*store)(Struct& into, std::uint64_t value) noexcept; ///< Where its number goes.
+    };
+
+    /// The cache's statistics as `/metrics` spells them, one row per `StorageStats` field a scrape renders.
+    constexpr auto StorageSeries = std::array {
+        SeriesField<StorageStats> { .series = "fastcached_cmd_get_total",
+                                    .store = [](StorageStats& s, std::uint64_t v) noexcept { s.cmdGet = v; } },
+        SeriesField<StorageStats> { .series = "fastcached_cmd_set_total",
+                                    .store = [](StorageStats& s, std::uint64_t v) noexcept { s.cmdSet = v; } },
+        SeriesField<StorageStats> { .series = "fastcached_cmd_touch_total",
+                                    .store = [](StorageStats& s, std::uint64_t v) noexcept { s.cmdTouch = v; } },
+        SeriesField<StorageStats> { .series = "fastcached_cmd_flush_total",
+                                    .store = [](StorageStats& s, std::uint64_t v) noexcept { s.cmdFlush = v; } },
+        SeriesField<StorageStats> { .series = "fastcached_get_hits_total",
+                                    .store = [](StorageStats& s, std::uint64_t v) noexcept { s.getHits = v; } },
+        SeriesField<StorageStats> { .series = "fastcached_get_misses_total",
+                                    .store = [](StorageStats& s, std::uint64_t v) noexcept { s.getMisses = v; } },
+        SeriesField<StorageStats> { .series = "fastcached_delete_hits_total",
+                                    .store = [](StorageStats& s, std::uint64_t v) noexcept { s.deleteHits = v; } },
+        SeriesField<StorageStats> { .series = "fastcached_delete_misses_total",
+                                    .store = [](StorageStats& s, std::uint64_t v) noexcept { s.deleteMisses = v; } },
+        SeriesField<StorageStats> { .series = "fastcached_incr_hits_total",
+                                    .store = [](StorageStats& s, std::uint64_t v) noexcept { s.incrHits = v; } },
+        SeriesField<StorageStats> { .series = "fastcached_incr_misses_total",
+                                    .store = [](StorageStats& s, std::uint64_t v) noexcept { s.incrMisses = v; } },
+        SeriesField<StorageStats> { .series = "fastcached_decr_hits_total",
+                                    .store = [](StorageStats& s, std::uint64_t v) noexcept { s.decrHits = v; } },
+        SeriesField<StorageStats> { .series = "fastcached_decr_misses_total",
+                                    .store = [](StorageStats& s, std::uint64_t v) noexcept { s.decrMisses = v; } },
+        SeriesField<StorageStats> { .series = "fastcached_touch_hits_total",
+                                    .store = [](StorageStats& s, std::uint64_t v) noexcept { s.touchHits = v; } },
+        SeriesField<StorageStats> { .series = "fastcached_touch_misses_total",
+                                    .store = [](StorageStats& s, std::uint64_t v) noexcept { s.touchMisses = v; } },
+        SeriesField<StorageStats> { .series = "fastcached_cas_hits_total",
+                                    .store = [](StorageStats& s, std::uint64_t v) noexcept { s.casHits = v; } },
+        SeriesField<StorageStats> { .series = "fastcached_cas_misses_total",
+                                    .store = [](StorageStats& s, std::uint64_t v) noexcept { s.casMisses = v; } },
+        SeriesField<StorageStats> { .series = "fastcached_cas_badval_total",
+                                    .store = [](StorageStats& s, std::uint64_t v) noexcept { s.casBadval = v; } },
+        SeriesField<StorageStats> { .series = "fastcached_write_errors_total",
+                                    .store = [](StorageStats& s, std::uint64_t v) noexcept { s.writeErrors = v; } },
+        SeriesField<StorageStats> { .series = "fastcached_evictions_total",
+                                    .store = [](StorageStats& s, std::uint64_t v) noexcept { s.evictions = v; } },
+        SeriesField<StorageStats> { .series = "fastcached_evicted_unfetched_total",
+                                    .store = [](StorageStats& s, std::uint64_t v) noexcept { s.evictedUnfetched = v; } },
+        SeriesField<StorageStats> { .series = "fastcached_expired_unfetched_total",
+                                    .store = [](StorageStats& s, std::uint64_t v) noexcept { s.expiredUnfetched = v; } },
+        SeriesField<StorageStats> {
+            .series = "fastcached_items",
+            .store = [](StorageStats& s, std::uint64_t v) noexcept { s.itemCount = static_cast<std::size_t>(v); } },
+        SeriesField<StorageStats> {
+            .series = "fastcached_bytes_used",
+            .store = [](StorageStats& s, std::uint64_t v) noexcept { s.bytesUsed = static_cast<std::size_t>(v); } },
+        SeriesField<StorageStats> {
+            .series = "fastcached_bytes_limit",
+            .store = [](StorageStats& s, std::uint64_t v) noexcept { s.bytesLimit = static_cast<std::size_t>(v); } },
+    };
+
+    /// One tier's statistics as `/metrics` spells them, each series labelled with the tier.
+    constexpr auto TierSeries = std::array {
+        SeriesField<StorageStats> {
+            .series = "fastcached_tier_items",
+            .store = [](StorageStats& s, std::uint64_t v) noexcept { s.itemCount = static_cast<std::size_t>(v); } },
+        SeriesField<StorageStats> {
+            .series = "fastcached_tier_bytes_used",
+            .store = [](StorageStats& s, std::uint64_t v) noexcept { s.bytesUsed = static_cast<std::size_t>(v); } },
+        SeriesField<StorageStats> {
+            .series = "fastcached_tier_bytes_limit",
+            .store = [](StorageStats& s, std::uint64_t v) noexcept { s.bytesLimit = static_cast<std::size_t>(v); } },
+        SeriesField<StorageStats> { .series = "fastcached_tier_evictions_total",
+                                    .store = [](StorageStats& s, std::uint64_t v) noexcept { s.evictions = v; } },
+        SeriesField<StorageStats> {
+            .series = "fastcached_tier_index_bytes",
+            .store = [](StorageStats& s, std::uint64_t v) noexcept { s.indexBytes = static_cast<std::size_t>(v); } },
+    };
+
+    /// The machine's capacity as `/metrics` spells it.
+    constexpr auto HostSeries = std::array {
+        SeriesField<HostCapacity> {
+            .series = "fastcache_node_logical_cores",
+            .store = [](HostCapacity& h, std::uint64_t v) noexcept { h.logicalCores = static_cast<std::size_t>(v); } },
+        SeriesField<HostCapacity> { .series = "fastcache_node_memory_total_bytes",
+                                    .store = [](HostCapacity& h, std::uint64_t v) noexcept { h.totalMemoryBytes = v; } },
+        SeriesField<HostCapacity> { .series = "fastcache_node_disk_capacity_bytes",
+                                    .store = [](HostCapacity& h, std::uint64_t v) noexcept { h.diskCapacityBytes = v; } },
+        SeriesField<HostCapacity> { .series = "fastcache_node_disk_free_bytes",
+                                    .store = [](HostCapacity& h, std::uint64_t v) noexcept { h.diskFreeBytes = v; } },
+        SeriesField<HostCapacity> {
+            .series = "fastcache_node_slots_configured",
+            .store = [](HostCapacity& h, std::uint64_t v) noexcept { h.configuredSlots = static_cast<std::size_t>(v); } },
+        SeriesField<HostCapacity> {
+            .series = "fastcache_node_slots_busy",
+            .store = [](HostCapacity& h, std::uint64_t v) noexcept { h.busySlots = static_cast<std::size_t>(v); } },
+    };
+
+    /// The series stating whether an upstream is configured, 0 or 1.
+    constexpr std::string_view UpstreamSeries = "fastcache_node_upstream_configured";
+
+    /// The series stating the uptime in seconds.
+    constexpr std::string_view UptimeSeries = "fastcached_uptime_seconds";
+
+    /// The unsigned number @p record holds for @p name, or nullopt where it holds none.
+    /// @param record The record.
+    /// @param name The field.
+    /// @return The number.
+    [[nodiscard]] std::optional<std::uint64_t> CountIn(Value const& record, std::string_view name)
+    {
+        auto const* field = FindField(record, name);
+        // A `Number` cell and a `Text` cell alike: which kind a figure arrives as is the parser's, and text that is
+        // not exactly an unsigned integer is no number either.
+        return field == nullptr || (field->value.kind != CellKind::Number && field->value.kind != CellKind::Text)
+                   ? std::nullopt
+                   : AsUnsigned(field->value.lexical);
+    }
+
+    /// A block read whole out of @p record: every row of @p rows present, or no block.
+    /// @param record The record.
+    /// @param rows The block's series.
+    /// @param name How a row's series is spelled in the record, labelled or not.
+    /// @return The block, or nullopt when any row is missing.
+    template <typename Struct, std::size_t N, typename Name>
+    [[nodiscard]] std::optional<Struct> BlockIn(Value const& record,
+                                                std::array<SeriesField<Struct>, N> const& rows,
+                                                Name name)
+    {
+        auto block = Struct {};
+        for (auto const& row: rows)
+        {
+            auto const value = CountIn(record, name(row.series));
+            if (!value.has_value())
+                return std::nullopt;
+            row.store(block, *value);
+        }
+        return block;
+    }
+
+    /// A reading holding every catalogue counter @p record carries by its series name, and nothing else.
+    /// @param record The record.
+    /// @return The reading.
+    [[nodiscard]] StatsReading CountersIn(Value const& record)
+    {
+        auto reading = StatsReading {};
+        for (auto const& row: CounterTable)
+            reading.counters[static_cast<std::size_t>(row.counter)] = CountIn(record, row.prometheusName);
+        return reading;
+    }
+
+    /// The whole live model a `/metrics` record states.
+    /// @param record The record.
+    /// @return The reading.
+    [[nodiscard]] std::optional<StatsReading> FromMetrics(Value const& record)
+    {
+        auto reading = CountersIn(record);
+        auto const plain = [](std::string_view series) {
+            return std::string { series };
+        };
+        auto& snapshot = reading.snapshot;
+        snapshot.storage = BlockIn(record, StorageSeries, plain);
+        for (auto const& tier: StorageTierTable)
+            snapshot.storageTiers[static_cast<std::size_t>(tier.tier)] =
+                BlockIn(record, TierSeries, [&tier](std::string_view series) { return TierSeriesName(series, tier.name); });
+        snapshot.host = BlockIn(record, HostSeries, plain);
+        if (auto const upstream = CountIn(record, UpstreamSeries); upstream.has_value() && *upstream <= 1)
+            snapshot.upstreamConfigured = *upstream == 1;
+        if (auto const seconds = CountIn(record, UptimeSeries); seconds.has_value())
+            snapshot.uptime = Uptime { std::chrono::seconds { static_cast<std::chrono::seconds::rep>(*seconds) } };
+        return reading;
+    }
+
+    /// The counters a `NodeMetrics` record states, by their catalogue names.
+    /// @param record The record.
+    /// @return The reading.
+    [[nodiscard]] std::optional<StatsReading> FromNodeMetrics(Value const& record)
+    {
+        return CountersIn(record);
+    }
+
+    /// No reading: `INFO` states no block of the model whole, and no uptime; see `StatsReadingFromRecord`.
+    /// @return Nothing.
+    [[nodiscard]] std::optional<StatsReading> FromInfo(Value const& /*record*/)
+    {
+        return std::nullopt;
+    }
+
+    /// How one source's record becomes the live model.
+    struct RecordReader
+    {
+        StatsOrigin origin;                                       ///< The enumerator this row describes.
+        std::optional<StatsReading> (*read)(Value const& record); ///< What the record states, the version aside.
+    };
+
+    /// One row per `StatsOrigin`, in enumerator order.
+    constexpr EnumTable<StatsOrigin, RecordReader> RecordReaderTable { {
+        { .origin = StatsOrigin::Metrics, .read = &FromMetrics },
+        { .origin = StatsOrigin::NodeMetrics, .read = &FromNodeMetrics },
+        { .origin = StatsOrigin::Info, .read = &FromInfo },
+    } };
+
+    static_assert(RowsInEnumeratorOrder(RecordReaderTable, &RecordReader::origin),
+                  "RecordReaderTable must hold one row per StatsOrigin, in enumerator order");
 
     /// One escape the exposition format writes inside a label value.
     struct LabelEscape
@@ -165,6 +375,19 @@ std::optional<std::string> LabelValue(std::string_view series, std::string_view 
             return std::nullopt;
     }
     return std::nullopt;
+}
+
+std::string TierSeriesName(std::string_view base, std::string_view tier)
+{
+    return std::format("{}{{tier=\"{}\"}}", base, tier);
+}
+
+std::optional<StatsReading> StatsReadingFromRecord(Value const& record, StatsOrigin origin)
+{
+    auto reading = RecordReaderTable[static_cast<std::size_t>(origin)].read(record);
+    if (reading.has_value())
+        reading->version = VersionIn(record, origin).value_or(std::string {});
+    return reading;
 }
 
 std::optional<std::string> VersionIn(Value const& reading, StatsOrigin origin)

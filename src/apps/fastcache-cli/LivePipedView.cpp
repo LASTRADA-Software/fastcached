@@ -80,64 +80,51 @@ namespace
     /// The newest cell of @p figure's series: what the panel draws for it now.
     /// @param figure The figure.
     /// @param model What is known.
-    /// @param origin The newest reading's source.
     /// @param tier A tier's name for a tier column's figure, or empty.
     /// @return The value, or absent.
-    [[nodiscard]] Cell NewestCell(FigureSpec const& figure,
-                                  DashboardModel const& model,
-                                  std::optional<StatsOrigin> origin,
-                                  std::string_view tier = {})
+    [[nodiscard]] Cell NewestCell(FigureSpec const& figure, DashboardModel const& model, std::string_view tier = {})
     {
-        if (!origin.has_value() || model.history.empty())
+        if (model.history.empty())
             return AbsentCell();
-        auto const series = FigureSeries(model.history, figure, *origin, tier);
+        auto const series = FigureSeries(model.history, figure, tier);
         return series.empty() || !series.back().has_value() ? AbsentCell() : RawFigureCell(*series.back(), figure.format);
     }
 
-    /// Whether @p names names the field in any source: a figure there is something to read.
-    /// @param names The names.
-    /// @return True when one source carries it.
-    [[nodiscard]] bool NamesAnything(FieldNames const& names) noexcept
-    {
-        return !names.metrics.empty() || !names.nodeMetrics.empty() || !names.info.empty();
-    }
 } // namespace
 
 Value PanelFigures(PanelSpec const& panel, DashboardModel const& model)
 {
-    auto const origin = OriginOf(model);
     auto fields = std::vector<Field> {};
     fields.push_back(Field { .name = "source",
                              .value = model.latestStamp.has_value() ? TextCell(model.latestStamp->source) : AbsentCell() });
 
     for (auto const& row: panel.rates)
     {
-        fields.push_back(Field { .name = std::string { row.key }, .value = NewestCell(row.figure, model, origin) });
+        fields.push_back(Field { .name = std::string { row.key }, .value = NewestCell(row.figure, model) });
         for (auto const& beside: row.beside)
-            fields.push_back(
-                Field { .name = std::string { beside.key }, .value = NewestCell(beside.figure, model, origin) });
+            fields.push_back(Field { .name = std::string { beside.key }, .value = NewestCell(beside.figure, model) });
         for (auto const& part: row.split)
-            fields.push_back(Field { .name = std::string { part.key }, .value = NewestCell(part.figure, model, origin) });
+            fields.push_back(Field { .name = std::string { part.key }, .value = NewestCell(part.figure, model) });
     }
     for (auto const& row: panel.levels)
     {
-        if (!NamesAnything(row.value.field))
+        if (!row.value.field.Names())
             continue;
-        fields.push_back(Field { .name = std::string { row.key }, .value = NewestCell(row.value, model, origin) });
+        fields.push_back(Field { .name = std::string { row.key }, .value = NewestCell(row.value, model) });
         if (row.limit.has_value())
-            fields.push_back(Field { .name = std::string { row.limitKey }, .value = NewestCell(*row.limit, model, origin) });
+            fields.push_back(Field { .name = std::string { row.limitKey }, .value = NewestCell(*row.limit, model) });
     }
     for (auto const& block: panel.facts)
         for (auto const& line: block.lines)
             for (auto const& cell: line.cells)
                 for (auto const& figure: cell.figures)
                     fields.push_back(
-                        Field { .name = std::string { figure.key }, .value = NewestCell(figure.figure, model, origin) });
-    if (origin.has_value() && model.latest.has_value())
-        for (auto const tier: TiersIn(panel, *model.latest, *origin))
+                        Field { .name = std::string { figure.key }, .value = NewestCell(figure.figure, model) });
+    if (model.stats.has_value())
+        for (auto const tier: TiersIn(panel, *model.stats))
             for (auto const& column: panel.tierColumns)
-                fields.push_back(Field { .name = TierFigureKey(tier, column.key),
-                                         .value = NewestCell(column.figure, model, origin, tier) });
+                fields.push_back(
+                    Field { .name = TierFigureKey(tier, column.key), .value = NewestCell(column.figure, model, tier) });
     return RecordValue(std::move(fields));
 }
 

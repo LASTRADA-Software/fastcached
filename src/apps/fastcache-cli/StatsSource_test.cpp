@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "StatsSource.hpp"
 
+#include <FastCache/Cache/IStorage.hpp>
+#include <FastCache/Cache/StorageTier.hpp>
 #include <FastCache/Core/Version.hpp>
 #include <FastCache/Metrics/MetricsCatalog.hpp>
 #include <FastCache/Metrics/PrometheusFormatter.hpp>
@@ -8,14 +10,20 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <format>
+#include <optional>
 #include <ranges>
 #include <string>
 #include <vector>
 
+#include <tests/Unwrap.hpp>
+
 using namespace FastCache;
 using namespace FastCache::Cli;
+using FastCache::Testing::Unwrap;
 
 namespace
 {
@@ -344,4 +352,130 @@ TEST_CASE("an INFO field with an empty value is kept, not dropped", "[cli][stats
     REQUIRE(FindField(record, "some_key") != nullptr);
     CHECK(FindField(record, "some_key")->value.kind == CellKind::Text);
     CHECK(FindField(record, "some_key")->value.lexical.empty());
+}
+
+namespace
+{
+/// A reading whose every counter, cache field, tier field and host field is a different number, one counter the
+/// sink cannot carry, and a version: nothing below passes by reading back a default or a neighbour's field.
+/// @return The reading.
+[[nodiscard]] StatsReading EveryFieldDistinct()
+{
+    auto reading = StatsReading {};
+    auto next = std::uint64_t { 17 };
+    for (auto const& row: CounterTable)
+        reading.counters[static_cast<std::size_t>(row.counter)] = (next++ * 1'000'003);
+    reading.counters[static_cast<std::size_t>(IMetricsSink::Counter::ConnectionsAdmissionRejected)] = std::nullopt;
+    auto const distinct = [&next] {
+        auto stats = StorageStats {};
+        for (auto const member: StorageStatsSizeFields)
+            stats.*member = static_cast<std::size_t>(next++ * 7919);
+        for (auto const member: StorageStatsCounterFields)
+            stats.*member = next++ * 7919;
+        return stats;
+    };
+    reading.snapshot.storage = distinct();
+    reading.snapshot.storageTiers[0] = distinct();
+    reading.snapshot.host = HostCapacity { .logicalCores = 32,
+                                           .configuredSlots = 30,
+                                           .totalMemoryBytes = 68'719'476'736,
+                                           .diskCapacityBytes = 2'000'398'934'016,
+                                           .diskFreeBytes = 442'381'631'488,
+                                           .busySlots = 7 };
+    reading.snapshot.upstreamConfigured = true;
+    reading.snapshot.uptime = Uptime { std::chrono::seconds { 864'017 } };
+    reading.version = "0.4.1-dev \"build\"";
+    return reading;
+}
+
+/// The model a scrape of @p reading reads back as.
+/// @param body The scrape.
+/// @return The reading.
+[[nodiscard]] StatsReading ReadBack(std::string const& body)
+{
+    auto const reading = StatsReadingFromRecord(ParsePrometheus(body), StatsOrigin::Metrics);
+    REQUIRE(reading.has_value());
+    return Unwrap(reading);
+}
+} // namespace
+
+TEST_CASE("a /metrics scrape reads back as the reading the daemon rendered it from", "[cli][stats]")
+{
+    // The adapter is the one place a series name becomes a model field, so it must be the formatter's exact
+    // inverse over everything a panel can read. WHAT DISTINGUISHES: every field a different number, so a row
+    // storing into its neighbour's field, a missing row, a tier read as the whole cache or a counter the sink
+    // cannot carry read as zero all break the equality. The consensus block is not read back (see
+    // `StatsReadingFromRecord`), so the reading has none.
+    auto const original = EveryFieldDistinct();
+    auto const back = ReadBack(RenderPrometheus(original));
+
+    // What a scrape does not render reads back as zero, and says so here rather than hiding in the equality: the
+    // cache's own index figures, and every field of a tier but the five its series carry. No panel reads those.
+    auto expected = original;
+    auto storage = Unwrap(expected.snapshot.storage);
+    storage.indexBytes = 0;
+    storage.indexBytesAtCapacity = 0;
+    expected.snapshot.storage = storage;
+    for (auto& tier: expected.snapshot.storageTiers)
+        if (tier.has_value())
+            tier = StorageStats { .itemCount = tier->itemCount,
+                                  .bytesUsed = tier->bytesUsed,
+                                  .bytesLimit = tier->bytesLimit,
+                                  .indexBytes = tier->indexBytes,
+                                  .evictions = tier->evictions };
+    CHECK(back.counters == original.counters);
+    CHECK(back.snapshot.storage == expected.snapshot.storage);
+    CHECK(back.snapshot.storageTiers == expected.snapshot.storageTiers);
+    CHECK(back.snapshot.host == original.snapshot.host);
+    CHECK(back.snapshot.upstreamConfigured == original.snapshot.upstreamConfigured);
+    CHECK(back.snapshot.uptime == original.snapshot.uptime);
+    CHECK(back.version == original.version);
+    CHECK(back == expected);
+}
+
+TEST_CASE("a block a record carries only part of reads as absent, never as zeroes", "[cli][stats]")
+{
+    // A scrape renders the cache, a tier and the host whole or not at all, so a record with part of one is not a
+    // reading of that block. WHAT DISTINGUISHES: one series removed takes its block, and only its block -- the
+    // other tier and the host stay.
+    auto const original = EveryFieldDistinct();
+    auto const whole = ReadBack(RenderPrometheus(original));
+    auto const without = [&original](std::string_view series) {
+        auto record = ParsePrometheus(RenderPrometheus(original));
+        auto const before = record.fields.size();
+        std::erase_if(record.fields, [series](Field const& field) { return field.name == series; });
+        REQUIRE(record.fields.size() == before - 1);
+        return Unwrap(StatsReadingFromRecord(record, StatsOrigin::Metrics));
+    };
+
+    auto const noItems = without("fastcached_items");
+    CHECK_FALSE(noItems.snapshot.storage.has_value());
+    CHECK(noItems.snapshot.storageTiers == whole.snapshot.storageTiers);
+    CHECK(noItems.snapshot.host == whole.snapshot.host);
+
+    auto const memoryTier = std::string { StorageTierTable[0].name };
+    auto const noTierLimit = without(TierSeriesName("fastcached_tier_bytes_limit", memoryTier));
+    CHECK_FALSE(noTierLimit.snapshot.storageTiers[0].has_value());
+    CHECK(noTierLimit.snapshot.storage == whole.snapshot.storage);
+
+    auto const noCores = without("fastcache_node_logical_cores");
+    CHECK_FALSE(noCores.snapshot.host.has_value());
+    CHECK(noCores.snapshot.storage == whole.snapshot.storage);
+}
+
+TEST_CASE("each source states the part of the live model it carries, and INFO states none", "[cli][stats]")
+{
+    auto const body = RenderPrometheus(EveryFieldDistinct());
+    auto const record = ParsePrometheus(body);
+
+    // NodeMetrics carries the catalogue: the counters, and no block of the snapshot.
+    auto const node = StatsReadingFromRecord(record, StatsOrigin::NodeMetrics);
+    REQUIRE(node.has_value());
+    CHECK(Unwrap(node).counters == EveryFieldDistinct().counters);
+    CHECK_FALSE(Unwrap(node).snapshot.storage.has_value());
+    CHECK_FALSE(Unwrap(node).snapshot.host.has_value());
+
+    // INFO fills no block whole, so it states no reading at all -- not an empty one.
+    CHECK_FALSE(StatsReadingFromRecord(record, StatsOrigin::Info).has_value());
+    CHECK(StatsReadingFromRecord(record, StatsOrigin::Metrics).has_value());
 }

@@ -28,35 +28,14 @@ namespace
 {
     using Series = std::vector<std::optional<double>>;
 
-    /// Which member of `FieldNames` one source's name is.
-    struct OriginField
+    /// The tier a `StorageTierTable` name names, or nullopt for empty (the whole cache) and for a name no row has.
+    /// @param name The name.
+    /// @return The tier.
+    [[nodiscard]] std::optional<StorageTier> TierNamed(std::string_view name) noexcept
     {
-        StatsOrigin origin;                  ///< The enumerator this row describes.
-        std::string_view FieldNames::* name; ///< Its member.
-    };
-
-    /// One row per `StatsOrigin`, in enumerator order, so a fourth source is a member and a row
-    /// rather than a new arm somewhere a name is looked up.
-    constexpr EnumTable<StatsOrigin, OriginField> OriginFieldTable { {
-        { .origin = StatsOrigin::Metrics, .name = &FieldNames::metrics },
-        { .origin = StatsOrigin::NodeMetrics, .name = &FieldNames::nodeMetrics },
-        { .origin = StatsOrigin::Info, .name = &FieldNames::info },
-    } };
-
-    static_assert(RowsInEnumeratorOrder(OriginFieldTable, &OriginField::origin),
-                  "OriginFieldTable must hold one row per StatsOrigin, in enumerator order");
-
-    /// The series name @p names gives in @p origin, labelled for one tier when @p label is set.
-    /// @param names The names.
-    /// @param origin The source.
-    /// @param label A tier's name, or empty.
-    /// @return The name, or empty where the source does not carry the field.
-    [[nodiscard]] std::string ResolvedName(FieldNames const& names, StatsOrigin origin, std::string_view label)
-    {
-        auto const base = NameIn(names, origin);
-        if (base.empty())
-            return {};
-        return label.empty() ? std::string { base } : TierSeriesName(base, label);
+        auto const* row =
+            name.empty() ? nullptr : FindIfOrNull(StorageTierTable, [name](auto const& tier) { return tier.name == name; });
+        return row == nullptr ? std::nullopt : std::optional { row->tier };
     }
 
     /// Two series combined cell by cell; a cell is absent wherever either operand is.
@@ -107,33 +86,36 @@ namespace
 
     /// Each entry's reading of one field.
     /// @param history The samples.
-    /// @param name The field; empty yields an absent series.
+    /// @param field The field; one naming nothing yields an absent series.
+    /// @param tier The tier asked about, or nullopt for the whole cache.
     /// @return The series.
-    [[nodiscard]] Series Levels(std::deque<HistoryEntry> const& history, std::string const& name)
+    [[nodiscard]] Series Levels(std::deque<HistoryEntry> const& history, ReadingField field, std::optional<StorageTier> tier)
     {
         auto series = Series(history.size());
-        if (name.empty())
-            return series;
         for (auto const index: std::views::iota(std::size_t { 0 }, history.size()))
-            series[index] = NumberIn(history[index].reading, name);
+            series[index] = NumberIn(history[index].stats, field, tier);
         return series;
     }
 
     /// Each entry's rate of one counter.
     /// @param history The samples.
-    /// @param name The counter; empty yields an absent series.
+    /// @param field The counter; one naming nothing yields an absent series.
+    /// @param tier The tier asked about, or nullopt for the whole cache.
     /// @return The series.
-    [[nodiscard]] Series Rates(std::deque<HistoryEntry> const& history, std::string const& name)
+    [[nodiscard]] Series Rates(std::deque<HistoryEntry> const& history, ReadingField field, std::optional<StorageTier> tier)
     {
-        return name.empty() ? Series(history.size()) : CounterRateSeries(history, name);
+        return CounterRateSeries(history, field, tier);
     }
 
     /// How one `FigureSource` is computed.
     struct FigureSourceSpec
     {
         FigureSource source; ///< The enumerator this row describes.
-        /// The computation, over the resolved primary and second field names.
-        Series (*compute)(std::deque<HistoryEntry> const& history, std::string const& field, std::string const& other);
+        /// The computation, over the primary and second fields, for the whole cache or one tier.
+        Series (*compute)(std::deque<HistoryEntry> const& history,
+                          ReadingField field,
+                          ReadingField other,
+                          std::optional<StorageTier> tier);
         /// Whether a figure's `addends` add their rates to what `compute` made.
         bool takesAddends { false };
     };
@@ -142,31 +124,44 @@ namespace
     constexpr EnumTable<FigureSource, FigureSourceSpec> FigureSourceTable { {
         { .source = FigureSource::Level,
           .compute = [](std::deque<HistoryEntry> const& history,
-                        std::string const& field,
-                        std::string const& /*other*/) { return Levels(history, field); } },
+                        ReadingField field,
+                        ReadingField /*other*/,
+                        std::optional<StorageTier> tier) { return Levels(history, field, tier); } },
         { .source = FigureSource::LevelRatio,
           .compute =
-              [](std::deque<HistoryEntry> const& history, std::string const& field, std::string const& other) {
-                  return Pairwise(Levels(history, field), Levels(history, other), &Proportion);
+              [](std::deque<HistoryEntry> const& history,
+                 ReadingField field,
+                 ReadingField other,
+                 std::optional<StorageTier> tier) {
+                  return Pairwise(Levels(history, field, tier), Levels(history, other, tier), &Proportion);
               } },
         { .source = FigureSource::Rate,
           .compute =
-              [](std::deque<HistoryEntry> const& history, std::string const& field, std::string const& other) {
+              [](std::deque<HistoryEntry> const& history,
+                 ReadingField field,
+                 ReadingField other,
+                 std::optional<StorageTier> tier) {
                   // A second counter is an ADDEND only when named: `ops/sec` is gets plus sets. An
                   // unnamed one must not turn the rate absent, so it is not paired at all.
-                  return other.empty() ? Rates(history, field)
-                                       : Pairwise(Rates(history, field), Rates(history, other), &Sum);
+                  return !other.Names() ? Rates(history, field, tier)
+                                        : Pairwise(Rates(history, field, tier), Rates(history, other, tier), &Sum);
               },
           .takesAddends = true },
         { .source = FigureSource::RateRatio,
           .compute =
-              [](std::deque<HistoryEntry> const& history, std::string const& field, std::string const& other) {
-                  return Pairwise(Rates(history, field), Rates(history, other), &Proportion);
+              [](std::deque<HistoryEntry> const& history,
+                 ReadingField field,
+                 ReadingField other,
+                 std::optional<StorageTier> tier) {
+                  return Pairwise(Rates(history, field, tier), Rates(history, other, tier), &Proportion);
               } },
         { .source = FigureSource::RateQuotient,
           .compute =
-              [](std::deque<HistoryEntry> const& history, std::string const& field, std::string const& other) {
-                  return Pairwise(Rates(history, field), Rates(history, other), &Quotient);
+              [](std::deque<HistoryEntry> const& history,
+                 ReadingField field,
+                 ReadingField other,
+                 std::optional<StorageTier> tier) {
+                  return Pairwise(Rates(history, field, tier), Rates(history, other, tier), &Quotient);
               } },
     } };
 
@@ -226,23 +221,20 @@ namespace
     /// What one frame is drawn from, looked up once.
     struct FrameInputs
     {
-        DashboardModel const* model;       ///< What is known.
-        std::optional<StatsOrigin> origin; ///< Whose names apply; nullopt before any reading.
-        RungGlyphs const* glyphs;          ///< What to draw with.
-        std::string_view absent;           ///< The absent marker.
-        CellWidth cellWidth;               ///< How wide text is.
+        DashboardModel const* model; ///< What is known.
+        RungGlyphs const* glyphs;    ///< What to draw with.
+        std::string_view absent;     ///< The absent marker.
+        CellWidth cellWidth;         ///< How wide text is.
     };
 
-    /// @p figure's series for this frame, or an absent series when no source applies.
+    /// @p figure's series for this frame.
     /// @param in The frame's inputs.
     /// @param figure The figure.
-    /// @param label A tier label, or empty.
+    /// @param tier A tier's name, or empty for the whole cache.
     /// @return The series; never empty while the history is not.
-    [[nodiscard]] Series SeriesFor(FrameInputs const& in, FigureSpec const& figure, std::string_view label)
+    [[nodiscard]] Series SeriesFor(FrameInputs const& in, FigureSpec const& figure, std::string_view tier)
     {
-        if (!in.origin.has_value())
-            return Series(in.model->history.size());
-        return FigureSeries(in.model->history, figure, *in.origin, label);
+        return FigureSeries(in.model->history, figure, tier);
     }
 
     /// The newest cell of @p series.
@@ -794,10 +786,10 @@ namespace
                                                                           std::size_t budget)
     {
         auto items = std::vector<Item> {};
-        if (spec.tierColumns.empty() || !in.origin.has_value() || !in.model->latest.has_value())
+        if (spec.tierColumns.empty() || !in.model->stats.has_value())
             return items;
 
-        auto const tiers = TiersIn(spec, *in.model->latest, *in.origin);
+        auto const tiers = TiersIn(spec, *in.model->stats);
         if (tiers.empty())
             return items;
 
@@ -1518,16 +1510,6 @@ namespace
         std::string (*render)(FrameInputs const& in, PanelContext const& context);
     };
 
-    /// A text field of the newest reading, or nullptr when it carries none.
-    /// @param model What is known.
-    /// @param name The field.
-    /// @return The field's lexical form, or nullptr.
-    [[nodiscard]] std::string const* NewestText(DashboardModel const& model, std::string_view name) noexcept
-    {
-        auto const* field = model.latest.has_value() ? FindField(*model.latest, name) : nullptr;
-        return field == nullptr || field->value.kind == CellKind::Absent ? nullptr : &field->value.lexical;
-    }
-
     /// How long the endpoint has served, from whichever reading carries it.
     /// @param model What is known.
     /// @return Seconds, or nullopt when nothing read says.
@@ -1535,26 +1517,21 @@ namespace
     {
         if (model.nodeStatus.has_value())
             return model.nodeStatus->uptimeSeconds;
-        auto const* text = NewestText(model, CacheUptimeField);
-        if (text == nullptr)
+        if (!model.stats.has_value())
             return std::nullopt;
-        auto seconds = std::uint64_t { 0 };
-        auto const [end, error] = std::from_chars(text->data(), text->data() + text->size(), seconds);
-        return error == std::errc {} && end == text->data() + text->size() ? std::optional { seconds } : std::nullopt;
+        return static_cast<std::uint64_t>(model.stats->snapshot.uptime.value.count());
     }
 
     /// One row per `ChromeFact`, in enumerator order.
     constexpr auto ChromeFactTable = EnumTable<ChromeFact, ChromeFactSpec> { {
         { .fact = ChromeFact::Version,
           .render = [](FrameInputs const& in, PanelContext const& /*context*/) -> std::string {
-              // A node says it in its status; a cache's reading says it where its source states it (a field of
-              // INFO, a label of /metrics' build info). Neither is invented.
+              // A node says it in its status; a cache's reading carries the build that captured it. Neither is
+              // invented, and an empty one is no version.
               if (in.model->nodeStatus.has_value() && !in.model->nodeStatus->version.empty())
                   return in.model->nodeStatus->version;
-              auto const version = in.origin.has_value() && in.model->latest.has_value()
-                                       ? VersionIn(*in.model->latest, *in.origin)
-                                       : std::nullopt;
-              return version.value_or(std::string { in.absent });
+              auto const& stats = in.model->stats;
+              return stats.has_value() && !stats->version.empty() ? stats->version : std::string { in.absent };
           } },
         { .fact = ChromeFact::Endpoint,
           .render = [](FrameInputs const& in, PanelContext const& context) -> std::string {
@@ -1674,54 +1651,35 @@ std::string UptimeText(std::uint64_t seconds)
     return std::format("{}d{:02}:{:02}", seconds / PerDay, (seconds % PerDay) / PerHour, (seconds % PerHour) / PerMinute);
 }
 
-std::string_view NameIn(FieldNames const& names, StatsOrigin origin) noexcept
-{
-    return names.*(OriginFieldTable[static_cast<std::size_t>(origin)].name);
-}
-
 std::string TierFigureKey(std::string_view tier, std::string_view column)
 {
     return std::format("{}{}{}", tier, TierKeySeparator, column);
 }
 
-std::vector<std::string_view> TiersIn(PanelSpec const& spec, Value const& reading, StatsOrigin origin)
+std::vector<std::string_view> TiersIn(PanelSpec const& spec, StatsReading const& reading)
 {
     auto tiers = std::vector<std::string_view> {};
     if (spec.tierColumns.empty())
         return tiers;
-    auto const name = NameIn(spec.tierColumns.front().figure.field, origin);
-    if (name.empty())
-        return tiers;
     for (auto const& tier: StorageTierTable)
-        if (FindField(reading, TierSeriesName(name, tier.name)) != nullptr)
+        if (reading.snapshot.storageTiers[static_cast<std::size_t>(tier.tier)].has_value())
             tiers.push_back(tier.name);
     return tiers;
 }
 
-std::string TierSeriesName(std::string_view base, std::string_view tier)
-{
-    return std::format("{}{{tier=\"{}\"}}", base, tier);
-}
-
-std::optional<StatsOrigin> OriginOf(DashboardModel const& model) noexcept
-{
-    if (!model.latestStamp.has_value())
-        return std::nullopt;
-    auto const* row = FindIfOrNull(StatsOriginTable,
-                                   [&model](StatsOriginSpec const& spec) { return spec.name == model.latestStamp->source; });
-    return row == nullptr ? std::nullopt : std::optional<StatsOrigin> { row->origin };
-}
-
 std::vector<std::optional<double>> FigureSeries(std::deque<HistoryEntry> const& history,
                                                 FigureSpec const& figure,
-                                                StatsOrigin origin,
-                                                std::string_view label)
+                                                std::string_view tier)
 {
+    // A tier name no row has reads nothing, rather than silently reading the whole cache.
+    auto const tierAsked = TierNamed(tier);
+    if (!tier.empty() && !tierAsked.has_value())
+        return Series(history.size());
     auto const& row = FigureSourceTable[static_cast<std::size_t>(figure.source)];
-    auto series = row.compute(history, ResolvedName(figure.field, origin, label), ResolvedName(figure.other, origin, label));
+    auto series = row.compute(history, figure.field, figure.other, tierAsked);
     if (row.takesAddends)
         for (auto const& addend: figure.addends)
-            series = Pairwise(series, Rates(history, ResolvedName(addend, origin, label)), &Sum);
+            series = Pairwise(series, Rates(history, addend, tierAsked), &Sum);
     for (auto& cell: series)
         if (cell.has_value())
             *cell *= figure.scale;
@@ -1836,11 +1794,8 @@ bool PanelView::Key(std::string_view keys)
 
 DashboardFrame PanelView::PlacedFrame(DashboardModel const& model)
 {
-    auto const in = FrameInputs { .model = &model,
-                                  .origin = OriginOf(model),
-                                  .glyphs = _glyphs,
-                                  .absent = _context.absent,
-                                  .cellWidth = _context.cellWidth };
+    auto const in =
+        FrameInputs { .model = &model, .glyphs = _glyphs, .absent = _context.absent, .cellWidth = _context.cellWidth };
     auto const columns = model.columns > 0 ? static_cast<std::size_t>(model.columns) : DefaultColumns;
     auto const reportedRows = model.rows > 0 ? static_cast<std::size_t>(model.rows) : std::size_t { 0 };
     auto const available =

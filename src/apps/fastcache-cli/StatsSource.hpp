@@ -5,6 +5,7 @@
 #include "CliValue.hpp"
 
 #include <FastCache/Core/EnumTable.hpp>
+#include <FastCache/Metrics/StatsReading.hpp>
 
 #include <cstdint>
 #include <optional>
@@ -175,6 +176,35 @@ inline constexpr std::string_view StatsSourceFieldName = "source";
 /// @param label The label to read.
 /// @return Its value; nullopt when @p series carries no such label or its label set does not parse.
 [[nodiscard]] std::optional<std::string> LabelValue(std::string_view series, std::string_view label);
+
+/// @p base labelled for one tier, as `/metrics` spells a per-tier series and `ParsePrometheus` keeps it.
+/// @param base The unlabelled series name.
+/// @param tier The tier's `StorageTierTable` name.
+/// @return `base{tier="<tier>"}`.
+[[nodiscard]] std::string TierSeriesName(std::string_view base, std::string_view tier);
+
+/// The live model a ladder record states, read in @p origin's own vocabulary.
+///
+/// **The one place a series name becomes a model field** (#134): every panel reads the `StatsReading`, so the
+/// names `/metrics` renders are spelled here and nowhere in a panel. Transitional by design: #1399's
+/// subscription delivers a decoded `StatsReading` and this adapter, with the ladder's live-stats use, goes.
+///
+/// Per source, because each states a different part of the model:
+/// - `/metrics` states what a scrape renders: every counter, the cache and each tier, the host, whether an
+///   upstream is configured, the uptime and the version. A scrape does not render the cache's own index figures
+///   or a tier's command counters, so those read back as zero, and no panel reads them. A consensus block is not
+///   read back (no panel draws it from here; the node's status carries it).
+/// - `NodeMetrics` states the counters.
+/// - `INFO` states no reading at all. Its handful of fields cannot fill a cache's statistics, a block half
+///   filled with zeroes would be a reading of an empty cache, and a reading with no uptime would state a
+///   process that has served for zero seconds. A live session with only `INFO` draws every figure absent.
+///
+/// A block is present only when the record carries EVERY series of it, since a scrape renders a block whole or
+/// not at all; a counter is present when the record carries its row.
+/// @param record The chosen record.
+/// @param origin The source that produced it.
+/// @return The reading, the version empty where the source states none; nullopt for a source that states none.
+[[nodiscard]] std::optional<StatsReading> StatsReadingFromRecord(Value const& record, StatsOrigin origin);
 
 /// The version of the endpoint @p reading came from, read where @p origin states it
 /// (`StatsOriginSpec::version`).

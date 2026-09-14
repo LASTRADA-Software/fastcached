@@ -6,6 +6,7 @@
 
 #include <FastCache/Async/TestReactor.hpp>
 #include <FastCache/Core/Clock.hpp>
+#include <FastCache/Metrics/MetricsCatalog.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -54,6 +55,16 @@ class RecordingView final: public IDashboardView
     std::vector<DashboardModel> seen {};
 };
 
+/// The catalogue counter every `Reading` carries, and the name a `/metrics` record spells it with.
+constexpr auto CountedRow = IMetricsSink::Counter::ConnectionsTotal;
+
+/// `CountedRow`'s series name.
+/// @return The name.
+[[nodiscard]] std::string CountedName()
+{
+    return std::string { DescriptorOf(CountedRow)->prometheusName };
+}
+
 /// A reading that `ChooseStats` will accept.
 /// @param value What the one metric reads.
 /// @return One attempt carrying it.
@@ -61,8 +72,8 @@ class RecordingView final: public IDashboardView
 {
     auto record = Value {};
     record.shape = Shape::Record;
-    record.fields.push_back(Field { .name = "curr_connections", .value = TextCell(std::to_string(value)) });
-    return { StatsAttempt { .origin = StatsOrigin::Info, .asked = true, .record = std::move(record), .note = {} } };
+    record.fields.push_back(Field { .name = CountedName(), .value = TextCell(std::to_string(value)) });
+    return { StatsAttempt { .origin = StatsOrigin::Metrics, .asked = true, .record = std::move(record), .note = {} } };
 }
 
 /// A reading from a named source that `ChooseStats` will accept.
@@ -474,9 +485,9 @@ TEST_CASE("a reading from a different source breaks the run and the next from th
                    tick,
                    sample(StatsOrigin::Metrics, 20, 2),
                    tick,
-                   sample(StatsOrigin::Info, 30, 3),
+                   sample(StatsOrigin::NodeMetrics, 30, 3),
                    tick,
-                   sample(StatsOrigin::Info, 40, 4),
+                   sample(StatsOrigin::NodeMetrics, 40, 4),
                    tick },
                  DashboardLimits {},
                  view,
@@ -587,7 +598,7 @@ TEST_CASE("the fold reads a sample only through the reader it was given", "[cli]
               sink,
               &MarkerReader);
     CHECK(LatestField(marked.model, "marker") == "from-the-reader");
-    CHECK(LatestField(marked.model, "curr_connections").empty());
+    CHECK(LatestField(marked.model, CountedName()).empty());
 
     // And a fleet session streams: a sample carrying only a document, and no attempts at all,
     // is a reading. Under the fold that ran `ChooseStats` this was Unreachable, because an
@@ -630,7 +641,7 @@ TEST_CASE("the sample that meets the budget is drawn before the run stops", "[cl
     CHECK(exit.model.frames == 3);
     REQUIRE(!view.seen.empty());
     CHECK(view.seen.back().samples == 3);
-    CHECK(LatestField(view.seen.back(), "curr_connections") == "30");
+    CHECK(LatestField(view.seen.back(), CountedName()) == "30");
 
     // The controls: only the stop that CONSUMED a sample owes a frame. A source running out,
     // and an operator quitting, stop without one -- or "draw on every stop" would pass above.
@@ -697,8 +708,8 @@ TEST_CASE("a stop request ends the run as a quit and is not a keystroke", "[cli]
 namespace
 {
 
-/// The field every `Reading` carries.
-constexpr std::string_view Counter = "curr_connections";
+/// The field every `Reading` carries, as the model reads it.
+constexpr auto Counter = CounterField<CountedRow>();
 
 /// A `Sample` carrying one `Counter` reading, taken @p seconds in.
 /// @param value What it reads.
@@ -835,9 +846,10 @@ TEST_CASE("an interval the run did not continue has no rate though the counter r
               .kind = DashboardEventKind::Sample, .at = At(1), .attempts = ReadingFrom(StatsOrigin::Metrics, 10) },
           DashboardEvent {
               .kind = DashboardEventKind::Sample, .at = At(2), .attempts = ReadingFrom(StatsOrigin::Metrics, 20) },
-          DashboardEvent { .kind = DashboardEventKind::Sample, .at = At(3), .attempts = ReadingFrom(StatsOrigin::Info, 30) },
           DashboardEvent {
-              .kind = DashboardEventKind::Sample, .at = At(4), .attempts = ReadingFrom(StatsOrigin::Info, 40) } });
+              .kind = DashboardEventKind::Sample, .at = At(3), .attempts = ReadingFrom(StatsOrigin::NodeMetrics, 30) },
+          DashboardEvent {
+              .kind = DashboardEventKind::Sample, .at = At(4), .attempts = ReadingFrom(StatsOrigin::NodeMetrics, 40) } });
     REQUIRE(switched.size() == 4);
     REQUIRE(switched[1].has_value());
     CHECK(Unwrap(switched[1]) == 10.0);
@@ -859,10 +871,11 @@ TEST_CASE("the newest history entry agrees with BrokenRun at every frame", "[cli
     // exactly when `BrokenRun()` says a rate may be drawn. The script walks every way a run
     // breaks -- both failure routes, a change of source and a stalled stamp.
     auto const tick = DashboardEvent { .kind = DashboardEventKind::Tick };
+    // `SampleAt` reads `/metrics`, so this second source is the node's own verb: the change between them breaks the run.
     auto metrics = [](std::int64_t value, int seconds) {
         return DashboardEvent { .kind = DashboardEventKind::Sample,
                                 .at = At(seconds),
-                                .attempts = ReadingFrom(StatsOrigin::Metrics, value) };
+                                .attempts = ReadingFrom(StatsOrigin::NodeMetrics, value) };
     };
 
     auto view = RecordingView {};
@@ -917,8 +930,8 @@ TEST_CASE("the history keeps its bound by dropping the oldest samples", "[cli][d
     auto const model = FinalModel(std::move(script));
 
     REQUIRE(model.history.size() == HistoryCapacity);
-    auto const* first = FindField(Unwrap(model.history.front().reading), Counter);
-    auto const* last = FindField(Unwrap(model.history.back().reading), Counter);
+    auto const* first = FindField(Unwrap(model.history.front().reading), CountedName());
+    auto const* last = FindField(Unwrap(model.history.back().reading), CountedName());
     REQUIRE(first != nullptr);
     REQUIRE(last != nullptr);
     CHECK(first->value.lexical == std::to_string(Extra));
