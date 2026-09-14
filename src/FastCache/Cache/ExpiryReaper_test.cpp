@@ -1057,7 +1057,10 @@ TEST_CASE("The fixture's reaper owner outlasts a pool thread slower than the dra
     //
     // Staged so the defect is a RED rather than a crash. If the stop has already returned when the
     // look ends, the reaper is gone, so the held frame is DESTROYED -- as the abandonment case above
-    // destroys its own -- instead of being forwarded into freed memory.
+    // destroys its own -- instead of being forwarded into freed memory. An abandonment already
+    // counted says the same while the stopping thread is merely slow to RETURN, which is the one
+    // way a loaded host could otherwise forward into a reaper about to be freed: so the look asks
+    // both, and waits for the stop to finish before destroying anything.
     STATIC_REQUIRE(StopLook > FastCycleShortDrain.stopDrain.ceiling);
     Fixture f;
     CapturingLogger logger;
@@ -1070,14 +1073,20 @@ TEST_CASE("The fixture's reaper owner outlasts a pool thread slower than the dra
     auto const held = TickUntil(f.clock, f.reactor, [&] { return executor.Holding(); });
 
     auto stopped = std::async(std::launch::async, [&reaper] { return reaper.Stop(); });
-    auto const returnedWhileAway = stopped.wait_for(StopLook) == std::future_status::ready;
-    if (returnedWhileAway)
+    auto const gaveUpWhileAway =
+        stopped.wait_for(StopLook) == std::future_status::ready || abandonment.calls.load(std::memory_order_acquire) != 0;
+    if (gaveUpWhileAway)
+    {
+        stopped.wait();
         std::ignore = executor.DestroyHeld();
+    }
     else
+    {
         executor.ForwardHeld();
+    }
 
     REQUIRE(held);
-    CHECK_FALSE(returnedWhileAway);
+    CHECK_FALSE(gaveUpWhileAway);
     CHECK(stopped.get());
     CHECK(abandonment.calls.load(std::memory_order_acquire) == 0);
     CHECK_FALSE(std::ranges::any_of(logger.Snapshot(), [](auto const& record) { return record.level == LogLevel::Error; }));
