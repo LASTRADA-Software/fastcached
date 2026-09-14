@@ -104,6 +104,7 @@ target_sources(FastCache
         Net/InMemoryTransport.cpp
         Protocol/Framing/LineReader.cpp
         Protocol/CompileCacheHandler.cpp
+        Protocol/LiveStream.cpp
         Protocol/MemcachedBinary.cpp
         Protocol/MemcachedMeta.cpp
         Protocol/MemcachedText.cpp

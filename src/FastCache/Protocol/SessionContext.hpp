@@ -17,6 +17,7 @@ class IStreamWaiterRegistry; // Protocol/IStreamWaiterRegistry.hpp — blocking 
 class IMetricsSink;          // Metrics/IMetricsSink.hpp — counter sink for protocol outcomes.
 class WatchRegistry;         // Protocol/RedisTransaction.hpp — process-wide WATCH registry for Redis transactions.
 class KeyspaceNotifier;      // Protocol/KeyspaceNotifier.hpp — Redis keyspace notification publisher.
+class LiveStream;            // Protocol/LiveStream.hpp — the live-stats subscriptions this process serves.
 
 /// Per-server, immutable context handed to every protocol handler's command
 /// loop. Bundles the optional collaborators a connection needs beyond its
@@ -91,6 +92,14 @@ struct SessionContext
     /// null-object default, since a silently-discarding sink and a genuinely
     /// absent one would then be indistinguishable at the call site.
     IMetricsSink* metrics { nullptr };
+
+    /// The live-stats subscriptions this process serves over `0xFC`, or null when it serves
+    /// none -- and a `SUBSCRIBE` is then refused by name rather than streamed.
+    ///
+    /// One per process and shared by every connection on every reactor, because what makes a
+    /// subscription cheap is ONE capture per subject per tick however many watch
+    /// (`LiveStream`). Owned by the daemon body, which declares it before the reactors run.
+    LiveStream* liveStats { nullptr };
 
     /// Maximum size, in bytes, of a single length-prefixed protocol payload (a
     /// RESP bulk string). Bounds how many bytes one command may push before the

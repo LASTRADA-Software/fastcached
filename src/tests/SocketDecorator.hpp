@@ -396,4 +396,102 @@ class ParkingReadableSocket final: public SocketDecorator
     std::size_t _watchesResolved { 0 };
 };
 
+/// A socket whose writes PARK once a case says the peer has stopped reading.
+///
+/// **The in-memory pipe cannot stage this either, and for the mirror reason.** A full
+/// `InMemoryPipe` refuses a write with `WouldBlock` at once; a reactor socket facing a
+/// peer that stopped reading ARMS the write and suspends, and the suspended write is
+/// what a stall is. A bound on that suspension -- a hold a push may not outlast -- is
+/// reachable only through a write that stays parked until something retrieves it.
+///
+/// **Only `Close()` retrieves a parked write**, which is the transports' own rule: there
+/// is no `CancelWrite`, so a parked write is completed with a failure at `Close` and at
+/// nothing else. Until `StopReading`, every write is forwarded.
+class ParkingWritableSocket final: public SocketDecorator
+{
+  public:
+    /// @param inner The socket reads and unparked writes are forwarded to; must outlive this.
+    explicit ParkingWritableSocket(ISocket& inner) noexcept:
+        SocketDecorator { inner }
+    {
+    }
+
+    ParkingWritableSocket(ParkingWritableSocket const&) = delete;
+    ParkingWritableSocket(ParkingWritableSocket&&) = delete;
+    ParkingWritableSocket& operator=(ParkingWritableSocket const&) = delete;
+    ParkingWritableSocket& operator=(ParkingWritableSocket&&) = delete;
+
+    /// Retires a write a case left parked, for `ParkingReadableSocket`'s reason: a frame
+    /// never completed is a frame never freed.
+    ~ParkingWritableSocket() override
+    {
+        ParkingWritableSocket::Close();
+    }
+
+    /// From now on every write parks, as against a peer whose receive window has closed.
+    void StopReading() noexcept
+    {
+        _stopped = true;
+    }
+
+    /// @copydoc ISocket::Write
+    [[nodiscard]] IoAwaitable Write(std::span<std::byte const> buffer) override
+    {
+        return _stopped ? Park() : SocketDecorator::Write(buffer);
+    }
+
+    /// @copydoc ISocket::WriteVectored
+    [[nodiscard]] IoAwaitable WriteVectored(std::span<std::span<std::byte const> const> segments,
+                                            std::shared_ptr<void const> keepAlive = {}) override
+    {
+        return _stopped ? Park() : SocketDecorator::WriteVectored(segments, std::move(keepAlive));
+    }
+
+    /// @copydoc ISocket::Close
+    ///
+    /// Counts before it completes, and touches nothing after: the resumed writer may be
+    /// what destroys this socket next.
+    void Close() noexcept override
+    {
+        auto* const parked = std::exchange(_parked, nullptr);
+        SocketDecorator::Close();
+        if (parked == nullptr)
+            return;
+        ++_writesRetiredByClose;
+        parked->Complete(
+            IoResult { std::unexpected(NetError { .code = NetErrorCode::Cancelled, .systemCode = 0, .context = {} }) });
+    }
+
+    /// @return Whether a write is parked right now.
+    [[nodiscard]] bool IsWriteParked() const noexcept
+    {
+        return _parked != nullptr;
+    }
+
+    /// @return How many parked writes `Close` retrieved.
+    [[nodiscard]] std::size_t WritesRetiredByClose() const noexcept
+    {
+        return _writesRetiredByClose;
+    }
+
+  private:
+    /// @return An awaitable recorded at its final address, which only `Close` completes.
+    [[nodiscard]] IoAwaitable Park() noexcept
+    {
+        IoAwaitable awaitable;
+        awaitable.SetSuspendCallback(&OnWriteSuspended, this);
+        return awaitable;
+    }
+
+    /// @param awaitable The writer's awaitable, at its final address (#734).
+    static void OnWriteSuspended(IoAwaitable* awaitable, std::coroutine_handle<> /*handle*/) noexcept
+    {
+        static_cast<ParkingWritableSocket*>(awaitable->CallbackState())->_parked = awaitable;
+    }
+
+    IoAwaitable* _parked { nullptr };
+    bool _stopped { false };
+    std::size_t _writesRetiredByClose { 0 };
+};
+
 } // namespace FastCache::Testing
