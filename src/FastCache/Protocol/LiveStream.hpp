@@ -394,8 +394,18 @@ inline constexpr std::chrono::milliseconds LiveStopCheck { 100 };
 
 /// Serves subscriptions: the per-subject tick cache, the cap, and the loop every stream runs.
 ///
-/// One per process, shared by every connection on every reactor: the cache is behind a mutex, and
-/// a stream sleeps on the reactor its own connection runs on.
+/// One per process, shared by every connection on every reactor, and a stream sleeps on the reactor
+/// its own connection runs on.
+///
+/// **No reactor waits on another reactor's capture.** A capture reads the storage stats, which takes
+/// every shard lock in turn, so holding one process-wide lock across it would stall every other
+/// reactor with a subscriber due on that tick for as long as the slowest shard writer held its lock.
+/// Instead a subscriber at a stale tick CLAIMS the capture with a compare-exchange and takes it on
+/// its own reactor -- paying the shard-lock waits one command pays -- and publishes the result as an
+/// immutable `LiveView`. A subscriber that loses the claim does not wait for it: it looks again one
+/// `LiveStopCheck` later and reads what the winner published. The lock that remains guards a
+/// pointer copy and nothing else. Nothing hops threads, so no stream's frame is ever resumed on a
+/// reactor other than its own, whose teardown order its surface already owns.
 class LiveStream
 {
   public:
@@ -429,32 +439,77 @@ class LiveStream
     }
 
   private:
-    /// One subject's shared state: the capture cached for a tick, and the events since.
+    /// One capture of one subject, published whole and never written after it is shared.
+    struct LiveView
+    {
+        std::uint64_t tick { 0 };                                 ///< The tick it was captured on.
+        std::vector<std::byte> body {};                           ///< The snapshot body every subscriber sends.
+        LiveEventProbe probe {};                                  ///< What the next capture is diffed against.
+        std::vector<CompileCacheWire::LiveEventFields> events {}; ///< The newest `LiveEventBacklog`, oldest first.
+        std::uint64_t eventsEnd { 0 };                            ///< Sequence number one past the newest event.
+    };
+
+    /// One subject's shared state: the newest published view, and whether a capture is being taken.
     struct SubjectState
     {
-        std::optional<std::uint64_t> tick {};                    ///< The tick `body` was captured on.
-        std::shared_ptr<std::vector<std::byte> const> body {};   ///< Shared by every subscriber on that tick.
-        std::optional<LiveEventProbe> probe {};                  ///< What the next capture is diffed against.
-        std::deque<CompileCacheWire::LiveEventFields> events {}; ///< The newest `LiveEventBacklog`.
-        std::uint64_t eventsEnd { 0 };                           ///< Sequence number one past the newest event.
+        std::shared_ptr<LiveView const> published {}; ///< Null before the first capture; copied under `_publish`.
+        std::atomic<bool> capturing { false };        ///< Claimed by the one subscriber taking the capture.
+    };
+
+    /// What an observation found.
+    ///
+    /// TRANSMITTED/PERSISTED: no. Private; enumerators may be inserted.
+    enum class Seen : std::uint8_t
+    {
+        Ready,   ///< The tick's view, or the newest one this subscriber has not seen: send it.
+        Busy,    ///< Another subscriber is taking a capture, and none is newer than the last seen: look again shortly.
+        Stopped, ///< The sources can no longer answer: the process is stopping.
     };
 
     /// What one subscriber reads on one tick.
-    struct TickView
+    struct Observation
     {
-        std::shared_ptr<std::vector<std::byte> const> body;    ///< This tick's snapshot body.
-        std::vector<CompileCacheWire::LiveEventFields> events; ///< The events it has not read yet.
-        std::uint64_t eventsEnd { 0 };                         ///< Where its event cursor moves to.
+        Seen seen { Seen::Stopped };                              ///< Whether there is a view.
+        std::uint64_t tick { 0 };                                 ///< The tick the subscriber looked on.
+        std::shared_ptr<LiveView const> view {};                  ///< The view, when `Ready`; carries its capture tick.
+        std::vector<CompileCacheWire::LiveEventFields> events {}; ///< The events the subscriber has not read.
+        std::uint64_t eventsEnd { 0 };                            ///< Where its event cursor moves to.
     };
 
-    /// Capture @p subject for @p tick once, and hand every subscriber on that tick the same bytes.
+    /// Read @p subject's view for @p tick, capturing it when this subscriber wins the claim.
+    ///
+    /// **A subscriber that loses the claim sends the newest published view it has not seen**, rather
+    /// than waiting for the capture in progress. Waiting would be fair only against a capture shorter
+    /// than a tick: one that is slower is claimed again the moment it is published, and a subscriber
+    /// on another reactor that looks every `LiveStopCheck` then finds it claimed every time, for as
+    /// long as the stream runs.
     /// @param subject Which subject.
     /// @param tick The current tick.
     /// @param eventsFrom The subscriber's event cursor.
-    /// @return The tick's view, or nullopt when the sources can no longer answer.
-    [[nodiscard]] std::optional<TickView> Observe(CompileCacheWire::LiveSubject subject,
-                                                  std::uint64_t tick,
-                                                  std::uint64_t eventsFrom);
+    /// @param seen The tick of the newest view this subscriber has read, or nullopt before its first.
+    /// @return The observation.
+    [[nodiscard]] Observation Observe(CompileCacheWire::LiveSubject subject,
+                                      std::uint64_t tick,
+                                      std::uint64_t eventsFrom,
+                                      std::optional<std::uint64_t> seen);
+
+    /// Observe until there is a view or the sources stop, stepping `LiveStopCheck` while another
+    /// subscriber holds the claim, so a stream never waits on another reactor's capture.
+    ///
+    /// Parameters are pointers for `Serve`'s reason.
+    /// @param subject Which subject.
+    /// @param floor The subject's tick length.
+    /// @param eventsFrom The subscriber's event cursor.
+    /// @param seen The tick of the newest view this subscriber has read, or nullopt before its first.
+    /// @param sink The surface, asked whether it is stopping between looks.
+    /// @param reactor Where the stream sleeps between looks.
+    /// @return A `Ready` or `Stopped` observation, or `Busy` when the surface began stopping meanwhile.
+    [[nodiscard]] Task<Observation> AwaitView(CompileCacheWire::LiveSubject subject,
+                                              std::chrono::milliseconds floor,
+                                              std::uint64_t eventsFrom,
+                                              std::optional<std::uint64_t> seen,
+                                              IPushSink const* sink,
+                                              IReactor* reactor);
 
     /// The terminal reply for what the sink saw, or nullopt when the peer is still watching.
     /// @param sink What the surface saw.
@@ -474,8 +529,8 @@ class LiveStream
     /// else a frame's destruction touches it owns.
     std::shared_ptr<std::atomic<std::size_t>> _active { std::make_shared<std::atomic<std::size_t>>(0) };
 
-    /// Guards `_subjects`: a daemon's streams run on several reactors.
-    std::mutex _mutex;
+    /// Guards the `published` pointers and nothing else: never held across a capture.
+    std::mutex _publish;
 
     /// One per `CompileCacheWire::LiveSubjectTable` row, in its order.
     std::array<SubjectState, CompileCacheWire::LiveSubjectTable.size()> _subjects {};
