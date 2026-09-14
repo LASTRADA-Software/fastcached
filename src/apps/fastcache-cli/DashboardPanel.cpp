@@ -1991,6 +1991,8 @@ namespace
         { .section = FleetSection::Leases, .key = "l" },
         { .section = FleetSection::Members, .key = "c" },
         { .section = FleetSection::Tiers, .key = "t" },
+        // Not a tab: the history is not in the document a live panel is pushed.
+        { .section = FleetSection::Series, .key = {} },
     } };
 
     static_assert(RowsInEnumeratorOrder(SectionHotkeyTable, &SectionHotkey::section),

@@ -202,7 +202,10 @@ TEST_CASE("Every fleet column reaches the page, the JSON and the text", "[distri
         {
             INFO("column " << name);
             CHECK(sectionText.contains(name));
-            CHECK(text.contains(name));
+            // The every-section document carries only the sections sized by the fleet;
+            // the history is asked for by name, so its columns are not owed there.
+            if (row.inWhole)
+                CHECK(text.contains(name));
             // Only a TABULAR section's column names are also page headers and JSON
             // keys. `kpi` is one value per named figure: the page draws a strip with
             // no `<th>` anywhere and the JSON keys by figure, so its four text columns
@@ -1832,18 +1835,28 @@ TEST_CASE("A named section renders its table alone, with no marker to skip", "[d
     CHECK_FALSE(workers.contains("cache-hit-rate"));
 }
 
-TEST_CASE("Asking for no section renders every one behind a marker naming it", "[distributed][fleetview][fleettsv]")
+TEST_CASE("Asking for no section renders every whole-document section behind a marker, and the history not at all",
+          "[distributed][fleetview][fleettsv]")
 {
     // The self-describing form, which is what makes the accepted keys discoverable
     // by asking for none -- a reader who guessed a section wrong does not have to
-    // find the documentation to learn the right spelling.
+    // find the documentation to learn the right spelling. WHAT DISTINGUISHES: both
+    // directions of `inWhole`, with at least one of each, so a document that dropped a
+    // section and one that grew the history both fail.
     auto const whole = RenderFleetText(LeadingSnapshot(), NoHistory(), std::nullopt);
 
+    auto carried = std::size_t { 0 };
+    auto askedByName = std::size_t { 0 };
     for (auto const& row: FleetSectionTable)
     {
         INFO("section " << row.key);
-        CHECK(whole.contains(std::string { "# " } + std::string { row.key } + "\n"));
+        auto const marker = std::string { "# " } + std::string { row.key } + "\n";
+        CHECK(whole.contains(marker) == row.inWhole);
+        ++(row.inWhole ? carried : askedByName);
     }
+    CHECK(carried > 1);
+    CHECK(askedByName > 0);
+    CHECK_FALSE(FleetSectionTable[static_cast<std::size_t>(FleetSection::Series)].inWhole);
 }
 
 TEST_CASE("An absent cell in the text rendering is a dash, never a blank and never a zero",

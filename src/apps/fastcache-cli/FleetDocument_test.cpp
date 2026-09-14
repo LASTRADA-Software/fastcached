@@ -56,10 +56,18 @@ TEST_CASE("the whole fleet document reads back one table per section the leader 
     // Every section the table names, each carrying exactly the header its own section form
     // renders: the whole document and `?section=` are two walks one parser must agree with.
     auto checked = std::size_t { 0 };
+    auto absent = std::size_t { 0 };
     for (auto const& row: FleetSectionTable)
     {
         INFO("section " << row.key);
         auto const* const table = parsed->Section(row.section);
+        // The history is not in the whole document; it is asked for by name.
+        if (!row.inWhole)
+        {
+            CHECK(table == nullptr);
+            ++absent;
+            continue;
+        }
         REQUIRE(table != nullptr);
         auto const alone = FleetTable(RenderFleetText(Leader(), FleetHistoryView {}, row.section));
         REQUIRE(alone.has_value());
@@ -67,7 +75,8 @@ TEST_CASE("the whole fleet document reads back one table per section the leader 
         CHECK(table->rows.size() == alone->rows.size());
         ++checked;
     }
-    CHECK(checked == FleetSectionTable.size());
+    CHECK(checked + absent == FleetSectionTable.size());
+    CHECK(checked > 1);
 
     // The strip arrives computed, one row per figure (#1302).
     auto const* const kpi = parsed->Section(FleetSection::Kpi);

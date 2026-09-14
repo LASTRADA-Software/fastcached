@@ -2636,6 +2636,26 @@ sub-line: a consumer handed those would have to parse the figure back out of a l
 from thousandths — `853` is 85.3%. `of` is the denominator as its own number for the
 two figures that have one (`compiling-now`, `never-picked`) and `null` for the rest.
 
+### The history, as text
+
+The `series` section is `/fleet/series.json` on its side: one row per bucket of the
+range asked for, oldest first. Its columns are the bucket's `start` in milliseconds,
+its `coverage`, whether it was `backfilled`, and then one column per series the charts
+draw, under the keys the JSON uses:
+
+```sh
+curl -s -u ":$TOKEN" "localhost:6677/fleet.txt?section=series&range=7d" | cut -f1,4
+```
+
+A bucket nobody sampled is `-` in every figure, and so is a rate that cannot be taken
+because the bucket before it was not sampled. It is **never `0`**: a fleet that did
+nothing and a fleet nobody was watching are different facts, and a restart is a gap,
+not a spike. `range` is refused when it names nothing, exactly as for `kpi`.
+
+It is the one section the every-section document leaves out. Its size is the range's
+rather than the fleet's (a day is 288 rows, whatever the fleet is), so it is asked for
+by name.
+
 Three of the seven are derived from the **history** rather than the snapshot, so both
 surfaces take `range` exactly as the page does, and refuse an unknown one for the same
 reason. A figure the range cannot answer is `null` / `-` and **never `0`**: a fleet
