@@ -224,27 +224,24 @@
 #tls_key: /etc/fastcached/server.key
 
 # Multiple listeners in one process, e.g. plaintext on a private interface and
-# TLS on a public one. When `listeners` is set it supersedes bind/port above.
-# TLS listeners share the tls_cert/tls_key pair (no per-listener SNI).
+# TLS on a public one. Each is `host:port`, exactly as `--listen` and
+# `--listen-tls` take it; an IPv6 address goes in brackets and in quotes, because
+# a bare `[` starts a YAML list. Setting either key supersedes bind/port above,
+# and a command line naming either flag replaces BOTH lists. TLS listeners share
+# the tls_cert/tls_key pair (no per-listener SNI).
 #
 # This is also how to keep serving clients you cannot re-point: adding
 # memcached's 11211 (or redis's 6379) serves them alongside 6674 from the one
 # process — and because the protocol is auto-detected, each of those ports still
 # speaks every protocol, not just its namesake.
 #
-# ONE `listeners:` key, with every endpoint under it. Both uses above are entries
-# in this one list rather than a block each, because uncommenting two blocks that
-# both say `listeners:` is a duplicate YAML mapping key — which the parser
-# resolves by silently keeping one, so you would get some of the ports you wrote
-# and no error at all. `ctest -R daemon-config-reference` refuses that shape.
-#listeners:
-#  - address: 127.0.0.1
-#    port: 6674
-#  - address: "::"
-#    port: 6675
-#    tls: true
-#  - address: 127.0.0.1
-#    port: 11211
+# Each key once, with every endpoint of its kind under it. A key written twice is
+# refused at start, naming both lines.
+#listen:
+#  - 127.0.0.1:6674
+#  - 127.0.0.1:11211
+#listen_tls:
+#  - "[::]:6675"
 
 # --- Observability ----------------------------------------------------------
 
@@ -267,9 +264,11 @@
 # Linux when the log is going somewhere journald is not: a foreground run, a
 # redirected file, a CI artefact.
 #
-# Setting it here WINS over the platform default in both directions, including
-# turning it off on macOS.
+# Each key spells its flag, so `true` passes it and `false` passes nothing, which
+# leaves the platform default. To turn timestamps ON set `log_timestamps: true`;
+# to turn them OFF -- including on macOS -- set `no_log_timestamps: true`.
 #log_timestamps: false
+#no_log_timestamps: false
 
 # Prefix connection-scoped log lines with the client IP.
 #log_source: false

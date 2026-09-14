@@ -391,6 +391,7 @@ namespace
           .explicitBit = &CliResult::tlsCertPathExplicit,
           .description = "PEM certificate (chain) file for --tls / --listen-tls",
           .yamlKey = "tls_cert",
+          .fileValue = FileValue::ExpandEnvironment,
           .same = FieldEq<&Config::tlsCertPath>() },
         { .primary = "--tls-key",
           .arity = Arity::Value,
@@ -399,6 +400,7 @@ namespace
           .explicitBit = &CliResult::tlsKeyPathExplicit,
           .description = "PEM private key file for --tls / --listen-tls",
           .yamlKey = "tls_key",
+          .fileValue = FileValue::ExpandEnvironment,
           .same = FieldEq<&Config::tlsKeyPath>() },
         { .primary = "--listen",
           .arity = Arity::Value,
@@ -407,14 +409,23 @@ namespace
           .description = "additional plaintext listener; repeatable. Use [::1]:{port} for IPv6 literals.\n"
                          "When given, supersedes --bind/--port — every endpoint must be listed.\n"
                          "Also how to keep serving legacy clients: add their port here.",
-          .yamlKey = "listeners",
-          .same = FieldEq<&Config::binds>() },
+          .yamlKey = "listen",
+          .same = FieldEq<&Config::binds>(),
+          .clear = ClearList<&Config::binds>() },
+        // Both listener rows fill ONE list and both clear it, so a command line naming
+        // either flag replaces every endpoint the file declared, plain and TLS alike --
+        // the rule `listeners:` had, kept now that each key spells its own flag. Mixing
+        // partial file endpoints with partial command-line ones would make which ports
+        // are served depend on which spelling happened to appear where.
         { .primary = "--listen-tls",
           .arity = Arity::Value,
           .operand = "=<host:port>",
           .apply = AppendFrom<&Config::binds, ParseListen<TlsListener>>(),
           .description = "additional TLS listener; repeatable. Shares --tls-cert / --tls-key.\n"
-                         "Needs a build with OpenSSL (FC_TLS_ENABLED)" },
+                         "Needs a build with OpenSSL (FC_TLS_ENABLED)",
+          .yamlKey = "listen_tls",
+          .same = FieldEq<&Config::binds>(),
+          .clear = ClearList<&Config::binds>() },
         { .primary = "--notify-keyspace-events",
           .arity = Arity::Value,
           .operand = "=<flags>",
@@ -443,19 +454,21 @@ namespace
         // forever, and a flag that can only say "on" turns an operator's explicit
         // "off" back on at every boot.
         //
-        // No `yamlKey`, deliberately. The file keeps ONE key, `log_timestamps`, which
-        // is a boolean and wins in both directions already. A `no_log_timestamps` key
-        // would give a file two ways to say one thing -- and the worse half is that
-        // `apply` runs on `true` alone, so `no_log_timestamps: false` would pass
-        // nothing while reading like it said something. The negative spelling is a
-        // CLI-only affordance because argv is the only place that cannot carry a
-        // value.
+        // And it has a key, `no_log_timestamps`, for the same reason. A file reaches
+        // this setting through the rows' own appliers, and a presence flag's applier
+        // runs on `true` alone -- so `log_timestamps: false` means "do not pass
+        // `--log-timestamps`", which is the platform default and is ON under macOS.
+        // The key spells the flag; `no_log_timestamps: true` is how a file says off.
+        // Rejected: making `false` on the positive key run this row's applier, which
+        // is a second meaning for one key that no other presence flag has.
         { .primary = "--no-log-timestamps",
           .apply = SetFalse<&Config::logTimestamps>(),
           .explicitBit = &CliResult::logTimestampsExplicit,
           .description = "do not prefix log lines with a timestamp, overriding the\n"
                          "platform default. The one way to ask for unstamped output\n"
-                         "under macOS" },
+                         "under macOS",
+          .yamlKey = "no_log_timestamps",
+          .same = FieldEq<&Config::logTimestamps>() },
         { .primary = "--log-source",
           .apply = SetTrue<&Config::logSource>(),
           .explicitBit = &CliResult::logSourceExplicit,
@@ -476,6 +489,7 @@ namespace
           .explicitBit = &CliResult::storagePathExplicit,
           .description = "persist cache to a CoW-tree file (default: in-memory only)",
           .yamlKey = "storage_path",
+          .fileValue = FileValue::ExpandEnvironment,
           .same = FieldEq<&Config::storagePath>() },
         { .primary = "--storage-durability",
           .arity = Arity::Value,
@@ -749,8 +763,6 @@ namespace
     /// a setting an operator can put in a file and nothing guards.
     constexpr auto NotInAConfigFile = std::to_array<std::pair<std::string_view, std::string_view>>({
         { "--config", "names the file being read; reading it back out of that file is circular" },
-        { "--listen-tls", "the `listeners:` key carries `tls` per entry, so one key spells both flags" },
-        { "--no-log-timestamps", "argv's only way to say `off`; the file's `log_timestamps` says it with `false`" },
         { "--daemon", "describes how this process was started, not what it serves" },
         { "--install-service", "a one-shot verb; a file would re-register at every start" },
         { "--uninstall-service", "a one-shot verb; a file would deregister at every start" },
@@ -982,15 +994,6 @@ std::span<OptionSpec<CliResult> const> CliOptions() noexcept
 std::span<ConfigFileSetting const> ConfigFileSettings() noexcept
 {
     return FileSettings;
-}
-
-bool ConfigFileAcceptsKey(std::string_view key) noexcept
-{
-    // Never the empty string: a row with no `yamlKey` would otherwise answer to a
-    // key nobody can spell, which is the kind of accident that reads as coverage.
-    if (key.empty())
-        return false;
-    return std::ranges::any_of(ConfigFileSettings(), [key](ConfigFileSetting const& setting) { return setting.key == key; });
 }
 
 std::expected<std::uint16_t, ConfigError> ParsePort(std::string_view sv)

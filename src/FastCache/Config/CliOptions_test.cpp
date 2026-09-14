@@ -9,15 +9,18 @@
 // one flag touches only its own tracker" could not be stated at all.
 #include <FastCache/Cli/UsageTestUtils.hpp>
 #include <FastCache/Config/CliParser.hpp>
-#include <FastCache/Config/YamlReader.hpp>
+#include <FastCache/Config/ConfigMerge.hpp>
+#include <FastCache/Core/Ranges.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <expected>
 #include <format>
+#include <optional>
 #include <ranges>
 #include <span>
 #include <string>
@@ -113,6 +116,124 @@ constexpr auto Samples = std::to_array<FlagSample>({
         if (spec.explicitBit != nullptr)
             trackers.push_back(spec.explicitBit);
     return trackers;
+}
+
+/// A spelling one file-carried row is driven with besides its accepted sample.
+struct FileSpelling
+{
+    std::string_view flag; ///< The row's primary spelling.
+    std::string_view text; ///< Text to hand the row, accepted or not.
+};
+
+/// Spellings that must reach the configuration identically from a file and from argv.
+///
+/// **Refusals mostly, and chosen where two parsers disagreed.** The first rows are the
+/// ones measured accepted by the daemon's old file reader and refused by argv; the rest
+/// are each row's own edges. A path, a secret or free text accepts anything, so its row
+/// carries the empty string, which a second parser could as easily have refused.
+///
+/// No `$`: a path row expands environment references from a file and deliberately not
+/// from argv (`FileValue`), which `ConfigMerge_test` asserts on its own.
+constexpr auto FileSpellings = std::to_array<FileSpelling>({
+    { .flag = "--port", .text = "0x50" },
+    { .flag = "--port", .text = "+80" },
+    { .flag = "--port", .text = "0" },
+    { .flag = "--port", .text = "65536" },
+    { .flag = "--bind", .text = "" },
+    { .flag = "--bind", .text = "a b" },
+    { .flag = "--threads", .text = "0x10" },
+    { .flag = "--threads", .text = "-1" },
+    { .flag = "--listen-backlog", .text = "0x10" },
+    { .flag = "--listen-backlog", .text = "0" },
+    { .flag = "--expiry-interval", .text = "0x10" },
+    { .flag = "--expiry-interval", .text = "+5" },
+    { .flag = "--expiry-interval", .text = "0" },
+    { .flag = "--expiry-interval", .text = "86400001" },
+    { .flag = "--expiry-scan", .text = "0" },
+    { .flag = "--expiry-scan", .text = "1e3" },
+    { .flag = "--storage-shards", .text = "0x2" },
+    { .flag = "--max-memory", .text = "64k" },
+    { .flag = "--max-memory", .text = "5x" },
+    { .flag = "--max-memory", .text = "50%" },
+    { .flag = "--metrics-port", .text = "0" },
+    { .flag = "--metrics-port", .text = " 9999" },
+    { .flag = "--metrics-bind", .text = "" },
+    { .flag = "--log-level", .text = "Info" },
+    { .flag = "--log-level", .text = "verbose" },
+    { .flag = "--requirepass", .text = "" },
+    { .flag = "--auth-username", .text = "" },
+    { .flag = "--tls-cert", .text = "" },
+    { .flag = "--tls-key", .text = "" },
+    { .flag = "--listen", .text = "127.0.0.1" },
+    { .flag = "--listen", .text = "127.0.0.1:0" },
+    { .flag = "--listen", .text = "::1:6674" },
+    { .flag = "--listen", .text = "[::1]:6674" },
+    { .flag = "--listen-tls", .text = "[::1]:70000" },
+    { .flag = "--listen-tls", .text = "" },
+    { .flag = "--notify-keyspace-events", .text = "" },
+    { .flag = "--storage", .text = "" },
+    { .flag = "--storage-durability", .text = "FSYNC" },
+    { .flag = "--storage-max-value", .text = "1.5m" },
+    { .flag = "--storage-max-disk", .text = "-1" },
+    { .flag = "--compression", .text = "brotli" },
+    { .flag = "--compression-level", .text = "0" },
+    { .flag = "--compression-level", .text = "23" },
+    { .flag = "--compression-min-bytes", .text = "4q" },
+    { .flag = "--memory-compression", .text = "" },
+    { .flag = "--memory-compression-level", .text = "+3" },
+    { .flag = "--memory-compression-min-bytes", .text = "0x10" },
+    { .flag = "--lru-mode", .text = "exact" },
+    { .flag = "--cpu-affinity", .text = "per_core" },
+});
+
+/// Which door a setting arrives through.
+enum class Source : std::uint8_t
+{
+    File,        ///< A configuration file naming the row's key.
+    CommandLine, ///< The row's flag on the command line.
+};
+
+/// @param text Text to put in a YAML document as one double-quoted scalar.
+/// @return The quoted scalar, so every spelling arrives as the text itself and never
+///         as whatever YAML would have made of it bare.
+[[nodiscard]] std::string YamlQuoted(std::string_view text)
+{
+    auto quoted = std::string { "\"" };
+    for (auto const c: text)
+    {
+        if (c == '"' || c == '\\')
+            quoted += '\\';
+        quoted += c;
+    }
+    quoted += '"';
+    return quoted;
+}
+
+/// Assemble a configuration naming one row once, through one door.
+///
+/// Through `AssembleEffectiveConfig` for both, because that is what `main` and the
+/// reloader call: a helper that applied the file layer directly would pass while the
+/// daemon did something else.
+/// @param scratch Where the file goes.
+/// @param spec The row.
+/// @param text The value; ignored for a presence flag, which a file spells `true`.
+/// @param source Which door.
+/// @return The assembly, or its refusal.
+[[nodiscard]] std::expected<EffectiveConfig, ConfigError> AssembleFrom(FastCache::Testing::ScratchDirectory const& scratch,
+                                                                       OptionSpec<CliResult> const& spec,
+                                                                       std::string_view text,
+                                                                       Source source)
+{
+    auto const presence = spec.arity == Arity::None;
+    if (source == Source::CommandLine)
+    {
+        auto token = presence ? std::string { spec.primary } : std::format("{}={}", spec.primary, text);
+        return AssembleEffectiveConfig({}, ConfigSources { .args = { std::move(token) }, .metricsPortEnv = std::nullopt });
+    }
+
+    scratch.Write("setting.yaml",
+                  std::format("{}: {}\n", spec.yamlKey, presence ? std::string { "true" } : YamlQuoted(text)));
+    return AssembleEffectiveConfig(scratch / "setting.yaml", ConfigSources {});
 }
 
 } // namespace
@@ -293,58 +414,114 @@ TEST_CASE("a flag before --help is still applied", "[config][cli][options]")
     CHECK(parsed->config.port == 4321);
 }
 
-TEST_CASE("every key a configuration file may carry is one the reader handles", "[config][cli][options][reload]")
+TEST_CASE("every setting a file can carry reaches the configuration exactly as its flag does",
+          "[config][cli][options][file]")
 {
-    // **The forward half of the accepted-key set, and it needs a real parse.**
-    // `ApplyEntry` refuses anything `ConfigFileAcceptsKey` does not declare, which
-    // makes "the reader accepts an undeclared key" impossible; nothing in that
-    // arrangement notices the opposite mistake -- a key DECLARED here with no arm
-    // in the reader. Such a key would pass the gate, fall through the ladder, and
-    // read to an operator as a setting that is in force
-    // ([#406](https://github.com/LASTRADA-Software/fastcached/issues/406)).
+    // **The property #1437 exists for, driven over the whole table.** The daemon's file
+    // used to be parsed by a second reader with yaml-cpp's own conversions, and measured
+    // on 0.2.0-568 it accepted `port: 0x50`, `port: +80`, `bind: ""`, `bind: "a b"`,
+    // `threads: 0x10` and `active_expiry_interval_ms: +5` -- every one refused on argv.
     //
-    // The value is deliberately arbitrary. What is asked is whether the reader has
-    // an arm for the key at all, and only the fall-through answers `UnknownKey` --
-    // a value an arm rejects gives `TypeMismatch` or `OutOfRange`, which is an arm
-    // doing its job.
-    FastCache::Testing::ScratchDirectory const scratch { "fastcached-declared-keys" };
+    // Each row is driven with its accepted sample AND with every spelling below, once as
+    // a file and once as a command line, and the two must agree: both refuse with the
+    // same code, or both accept with the same configuration and the same provenance.
+    // Agreement alone would pass a table that refused everything, which is what the
+    // accepted sample is for.
+    FastCache::Testing::ScratchDirectory const scratch { "fastcached-file-argv-parity" };
 
-    // Neither the source nor the projection may be empty: two empty lists agree
-    // perfectly, and this case would then pass by finding nothing on either side.
-    // The source is named here rather than inferred from the projection.
-    REQUIRE(!CliOptions().empty());
-    REQUIRE(!ConfigFileSettings().empty());
-
-    // One path, rewritten per key: 34 file creations prove nothing 34 rewrites do
-    // not, and `INFO` already says which key failed. `ScratchDirectory::Write`
-    // rather than a bare `ofstream`, because it THROWS on a failed write -- a
-    // silently unwritten file makes `ReadYamlConfig` answer `FileNotFound`, which
-    // this case's assertion accepts, so every key would pass by finding nothing.
-    for (auto const& setting: ConfigFileSettings())
+    auto keyed = std::size_t { 0 };
+    for (auto const& spec: CliOptions())
     {
-        INFO("key: " << setting.key);
-        scratch.Write("declared.yaml", std::format("{}: 1\n", setting.key));
-        auto const read = ReadYamlConfig(scratch / "declared.yaml");
-        CHECK((read.has_value() || read.error().code != ConfigErrorCode::UnknownKey));
+        if (spec.yamlKey.empty())
+            continue;
+        ++keyed;
+
+        auto texts = std::vector<std::string_view> {};
+        for (auto const& sample: Samples)
+            if (sample.flag == spec.primary)
+                texts.push_back(sample.value);
+        REQUIRE(texts.size() == 1);
+        for (auto const& spelling: FileSpellings)
+            if (spelling.flag == spec.primary)
+                texts.push_back(spelling.text);
+
+        // A value row with nothing but its accepted sample would assert agreement on the
+        // one input both sides were always going to accept.
+        INFO("row: " << spec.primary);
+        CHECK((spec.arity == Arity::None || texts.size() > 1));
+
+        for (auto const text: texts)
+        {
+            INFO("text: `" << text << "`");
+            auto const fromFile = AssembleFrom(scratch, spec, text, Source::File);
+            auto const fromArgv = AssembleFrom(scratch, spec, text, Source::CommandLine);
+            REQUIRE(fromFile.has_value() == fromArgv.has_value());
+            if (!fromFile.has_value())
+            {
+                CHECK(fromFile.error().code == fromArgv.error().code);
+                continue;
+            }
+            // The snapshot names the file it came from and a command line names none:
+            // the one difference between the two doors that is correct.
+            auto fileConfig = fromFile->Configuration();
+            fileConfig.configPath.clear();
+            CHECK(fileConfig == fromArgv->Configuration());
+            if (spec.explicitBit != nullptr)
+            {
+                CHECK(fromFile->Named(spec.explicitBit));
+                CHECK(fromArgv->Named(spec.explicitBit));
+            }
+        }
+    }
+
+    // Two empty walks agree perfectly, so the walk must have found the rows it is about.
+    CHECK(keyed == ConfigFileSettings().size());
+    CHECK(keyed > 30);
+}
+
+TEST_CASE("every spelling above names a row a file can carry", "[config][cli][options][file]")
+{
+    // The table is written by hand, so a row renamed out from under it would leave its
+    // spellings asserting nothing -- driven at no row, and silently.
+    for (auto const& spelling: FileSpellings)
+    {
+        INFO("flag: " << spelling.flag);
+        auto const* const row = FindIfOrNull(
+            CliOptions(), [&spelling](OptionSpec<CliResult> const& spec) { return spec.primary == spelling.flag; });
+        REQUIRE(row != nullptr);
+        CHECK_FALSE(row->yamlKey.empty());
+        CHECK(row->arity == Arity::Value);
     }
 }
 
-TEST_CASE("a key no option row declares is refused", "[config][cli][options][reload]")
+TEST_CASE("a key no option row declares is refused, and so is every key a release retired", "[config][cli][options][file]")
 {
-    // The gate's own direction. A key a file carries and nothing reads is a
-    // setting an operator believes is in force forever, which is why an unknown
-    // key is refused rather than ignored. `memory_compression` is in the case
-    // because it was the last key a file could carry and no flag could express
-    // (#623): it now answers to `--memory-compression` like everything else, and
-    // the refusals below are the gate rather than an accident of the ladder.
-    CHECK(ConfigFileAcceptsKey("port"));
-    CHECK(ConfigFileAcceptsKey("memory_compression"));
-    CHECK_FALSE(ConfigFileAcceptsKey("prot"));
-    CHECK_FALSE(ConfigFileAcceptsKey(""));
-    // A FLAG spelling is not a key: the two vocabularies are separate on purpose,
-    // and a reader accepting both would document neither.
-    CHECK_FALSE(ConfigFileAcceptsKey("--port"));
-    CHECK_FALSE(ConfigFileAcceptsKey("storage"));
+    // A key a file carries and nothing reads is a setting an operator believes is in
+    // force forever. The walk that applies a key is the walk that refuses one, so there
+    // is no gate to disagree with the appliers.
+    //
+    // The retired keys are the sharper half: `listeners` is where the daemon's endpoints
+    // lived until they became `listen:` and `listen_tls:`, and a file still naming it
+    // must be told so at start rather than serve the defaults.
+    FastCache::Testing::ScratchDirectory const scratch { "fastcached-unknown-keys" };
+    constexpr auto keys = std::to_array<std::string_view>({
+        "prot",
+        "--port",
+        "storage",
+        "listeners",
+        "execution_model",
+        "threading_model",
+        "roles",
+    });
+    for (auto const key: keys)
+    {
+        INFO("key: " << key);
+        scratch.Write("unknown.yaml", std::format("\"{}\": 1\n", key));
+        auto const assembled = AssembleEffectiveConfig(scratch / "unknown.yaml", ConfigSources {});
+        REQUIRE_FALSE(assembled.has_value());
+        CHECK(assembled.error().code == ConfigErrorCode::UnknownKey);
+        CHECK(assembled.error().field == key);
+    }
 }
 
 TEST_CASE("every setting a file can carry can be compared", "[config][cli][options][reload]")

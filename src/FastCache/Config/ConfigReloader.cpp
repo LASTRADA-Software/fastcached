@@ -19,7 +19,7 @@ ConfigReloader::ConfigReloader(Config initial, std::filesystem::path configPath,
     ConfigReloaderOf<Config> { std::move(initial),
                                std::move(configPath),
                                // The SAME assembly the start ran, with the same sources -- not
-                               // `ReadYamlConfig(path)`, which is the file and nothing else. A reload built
+                               // a re-read of the file, which is the file and nothing else. A reload built
                                // that way republished every setting the file did not mention at its
                                // built-in default, so `--max-memory=8g` came back as a fraction of host RAM
                                // and the storage evicted down to it, with no line anywhere naming the flag
@@ -27,12 +27,12 @@ ConfigReloader::ConfigReloader(Config initial, std::filesystem::path configPath,
                                // and a reload can run at any moment on the signal thread.
                                [sources = std::move(sources)](
                                    std::filesystem::path const& path) -> std::expected<Config, ConfigError> {
-                                   // By value rather than by rvalue reference: the file's
-                                   // presence bits are a START's question, so only the
+                                   // By value rather than by rvalue reference: which settings
+                                   // were NAMED is a START's question, so only the
                                    // configuration is carried on, and a parameter this
-                                   // moves a MEMBER out of is one nothing moves from.
+                                   // moves out of is one nothing else moves from.
                                    return AssembleEffectiveConfig(path, sources).transform([](EffectiveConfig assembled) {
-                                       return std::move(assembled.config);
+                                       return std::move(assembled).TakeConfiguration();
                                    });
                                },
                                &ConfigReloader::ValidateImmutable }

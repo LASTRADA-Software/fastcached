@@ -188,7 +188,7 @@ class ConfigReloaderOf
 /// **The domain is what a FILE can express, and that is not an approximation of
 /// "every field".** A field no key can set — `daemon`, `pidfile`, `serviceName` —
 /// reaches the live configuration and every candidate through the *same*
-/// `ConfigSources::cli`, so the two cannot disagree about it however the file is
+/// `ConfigSources::args`, so the two cannot disagree about it however the file is
 /// edited. A row walked for those would be a guard that fires only when nothing is
 /// wrong. Do not "complete" this by walking rows with no key.
 ///
@@ -198,7 +198,7 @@ class ConfigReloaderOf
 /// its own. Same conclusion, opposite reason, and the old reason no longer holds.
 ///
 /// **What this used to cost, and no longer does.** The candidate was
-/// `ReadYamlConfig(path)` alone, so a setting in force because somebody passed a
+/// a re-read of the file alone, so a setting in force because somebody passed a
 /// flag — or set `FASTCACHED_METRICS_PORT` — and that the file did not mention
 /// arrived here as a setting being changed back to its default: refused by name for
 /// an immutable one, and for a reloadable one *published*, which is how
