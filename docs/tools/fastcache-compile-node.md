@@ -2340,6 +2340,7 @@ fact about it. These are gauges, not counters, except the two CPU tick series.
 | `fastcache_node_disk_free_bytes` | Space on that filesystem an unprivileged process may still write. |
 | `fastcache_node_slots_configured` | Concurrent compiles this node advertises to the scheduler. |
 | `fastcache_node_slots_busy` | Compiles running right now — **sampled**, so it is a reading and not a difference of two counters. |
+| `fastcache_node_cordoned` | 1 while an operator has cordoned this node's worker, 0 otherwise. Read beside `fastcache_node_slots_busy`: cordoned with compiles running is draining, cordoned with none is safe to stop. A restart clears it, so `== 1` for a day is a machine somebody forgot. |
 | `fastcache_node_cpu_busy_ticks_total` | Host-wide CPU ticks spent doing anything but idling, this node's own compiles included. A **counter** in platform ticks, whose length differs per platform, so it means nothing alone: `rate(fastcache_node_cpu_busy_ticks_total[1m]) / rate(fastcache_node_cpu_ticks_total[1m])` is the machine's busy share. Absent when the platform would not report its CPU. |
 | `fastcache_node_cpu_ticks_total` | Host-wide CPU ticks accounted for at all: the denominator of the row above. |
 | `fastcache_node_memory_available_bytes` | Memory a new process could actually obtain: *available*, not free, so the page cache the kernel hands back on demand counts. Absent when the platform would not say. |

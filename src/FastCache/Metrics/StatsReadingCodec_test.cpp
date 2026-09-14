@@ -95,7 +95,8 @@ void GiveEveryCounterItsOwnValue(IMetricsSink& sink)
                                                     .totalMemoryBytes = 68'719'476'736,
                                                     .diskCapacityBytes = 2'000'398'934'016,
                                                     .diskFreeBytes = 442'381'631'488,
-                                                    .busySlots = 7 },
+                                                    .busySlots = 7,
+                                                    .cordoned = 1 },
                              .hostLoad = HostLoadReading { .cpu = CpuTicks { .busy = 7'700'001, .total = 9'100'003 },
                                                            .availableMemoryBytes = 21'474'836'480 },
                              .upstreamConfigured = false,
@@ -368,7 +369,7 @@ TEST_CASE("This build's live-stats layout is the pinned one", "[metrics][livesta
     // client built before the change will refuse this node. Update the constant in the same
     // change, and say in its message that clients and nodes upgrade together.
     INFO(std::format("StatsReadingLayout is 0x{:016x}", StatsReadingLayout));
-    CHECK(StatsReadingLayout == 0xccca5d7d655f1195ULL);
+    CHECK(StatsReadingLayout == 0x0a99b422fa6c3e06ULL);
 }
 
 TEST_CASE("A truncated or padded reading is refused and never half-read", "[metrics][livestats]")

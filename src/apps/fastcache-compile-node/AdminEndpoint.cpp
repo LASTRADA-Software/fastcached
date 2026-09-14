@@ -44,12 +44,14 @@ AdminHttpServer::SnapshotProvider MakeNodeSnapshotProvider(NodeScrapeSources sou
             // the composite reports the on-disk store alone, so the in-memory tier
             // an operator sized with `--cache-memory` would otherwise be invisible.
             .storageTiers = sources.cache != nullptr ? sources.cache->SnapshotTiers() : TieredStorageStats {},
-            .host = HostCapacity { .logicalCores = sources.host->LogicalCores(),
-                                   .configuredSlots = sources.slots,
-                                   .totalMemoryBytes = sources.host->TotalMemoryBytes(),
-                                   .diskCapacityBytes = static_cast<std::uint64_t>(disk.capacityBytes),
-                                   .diskFreeBytes = static_cast<std::uint64_t>(disk.freeBytes),
-                                   .busySlots = sources.busySlots() },
+            .host =
+                HostCapacity { .logicalCores = sources.host->LogicalCores(),
+                               .configuredSlots = sources.slots,
+                               .totalMemoryBytes = sources.host->TotalMemoryBytes(),
+                               .diskCapacityBytes = static_cast<std::uint64_t>(disk.capacityBytes),
+                               .diskFreeBytes = static_cast<std::uint64_t>(disk.freeBytes),
+                               .busySlots = sources.busySlots(),
+                               .cordoned = sources.cordoned && sources.cordoned() ? std::size_t { 1 } : std::size_t { 0 } },
             // Raw counters rather than a utilization, so no reader's interval is cut by
             // another's; see `NodeScrapeSources::load`.
             .hostLoad =

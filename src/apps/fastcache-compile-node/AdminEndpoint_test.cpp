@@ -15,6 +15,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -369,6 +370,29 @@ class SteppingCounters final: public IHostCounterSource
     std::uint64_t _calls { 0 };
 };
 } // namespace
+
+TEST_CASE("A node's snapshot says whether its worker is cordoned, read per snapshot", "[node][admin][cordon]")
+{
+    // #1303. Sampled per scrape like `busySlots`, because a cordon moves while the node runs:
+    // a value captured once would describe the machine before the operator acted.
+    ScrapeHost host;
+    std::atomic<bool> cordoned { false };
+    auto const provider = MakeNodeSnapshotProvider(NodeScrapeSources { .host = &host,
+                                                                       .busySlots = [] { return std::size_t { 1 }; },
+                                                                       .cordoned = [&cordoned] { return cordoned.load(); },
+                                                                       .cache = nullptr,
+                                                                       .slots = 4,
+                                                                       .scratchRoot = std::filesystem::path { "." },
+                                                                       .consensus = {} },
+                                                   std::chrono::steady_clock::now());
+
+    REQUIRE(provider().host.has_value());
+    CHECK(Unwrap(provider().host).cordoned == 0);
+    cordoned.store(true);
+    CHECK(Unwrap(provider().host).cordoned == 1);
+    cordoned.store(false);
+    CHECK(Unwrap(provider().host).cordoned == 0);
+}
 
 TEST_CASE("A node's snapshot carries the raw load counters, read per snapshot", "[node][admin]")
 {
