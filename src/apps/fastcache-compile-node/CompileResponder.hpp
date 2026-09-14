@@ -339,6 +339,15 @@ class CompileResponder final: public IFrameResponder
         return _progressInterval;
     }
 
+    /// @copydoc IFrameResponder::StreamFor
+    ///
+    /// **Not a stream**: a compile is long, and its liveness is `ProgressInterval`'s pulse ahead of ONE reply,
+    /// never a series a client reads as it arrives.
+    [[nodiscard]] IFrameStream* StreamFor(std::uint8_t /*opRaw*/) noexcept override
+    {
+        return nullptr;
+    }
+
   private:
     Cc::WorkerProtocol& _protocol;
     CompileCapacity& _capacity;

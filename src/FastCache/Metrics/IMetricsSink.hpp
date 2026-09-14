@@ -1202,6 +1202,16 @@ class IMetricsSink
         LiveSubscriptionsStalled,
         /// A live stream the watching client closed. (#1399)
         LiveSubscriptionsEndedByClient,
+        /// A live stream whose watching client reset the connection rather than closing it. (#1399)
+        LiveSubscriptionsEndedByReset,
+        /// A live subscription refused because its peer is not a fleet member. (#1399)
+        LiveSubscriptionsRefusedNotAMember,
+        /// A SUBSCRIBE whose fields did not decode, or that named a subject this build does not serve. (#1399)
+        LiveSubscriptionsRefusedMalformed,
+        /// A SUBSCRIBE header that declared more than the control payload it is bounded to. (#1399)
+        LiveSubscriptionsRefusedPayloadTooLarge,
+        /// A SUBSCRIBE refused because the listener's in-flight byte budget was full. (#1399)
+        LiveSubscriptionsRefusedEndpointBusy,
 
         Last,
     };

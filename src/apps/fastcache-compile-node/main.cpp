@@ -19,6 +19,8 @@
 #include "EnrollClient.hpp"
 #include "EnrollmentResponder.hpp"
 #include "EnrollmentWindow.hpp"
+#include "LiveStatsResponder.hpp"
+#include "LiveStatsSources.hpp"
 #include "NodeAnnounce.hpp"
 #include "NodeConfig.hpp"
 #include "NodeCredential.hpp"
@@ -1297,6 +1299,25 @@ void AdoptAllowlist(Cc::CompileJobRunner& jobs,
     // change, and a test that re-acquired it would pass under exactly that defect.
     Node::NodeStatusResponder nodeStatusResponder { nodeStatus, membership.Oracle(), metrics };
 
+    // The dashboard credential, read ONCE for the two surfaces that guard the fleet with it:
+    // `/fleet` over HTTP, and the fleet subject of a live-stats subscription over `0xFC`.
+    auto dashboardOrRefusal = Node::LoadDashboardCredentialOrExplain(cfg);
+    if (!dashboardOrRefusal.has_value())
+    {
+        logger.Logf(LogLevel::Error, "{}; refusing to start", dashboardOrRefusal.error());
+        return ExitUsage;
+    }
+    auto const dashboardCredential = std::move(*dashboardOrRefusal);
+
+    // Live stats as a subscription rather than a poll (#1399). Built against a SLOT, because what
+    // it reads -- the scrape provider, the fleet and the sampler -- is built after consensus, and
+    // consensus after this surface: see `LiveStatsSourceSlot`. Declared before the surface, like
+    // every responder here, so it is destroyed after it.
+    Node::LiveStatsSourceSlot liveSources;
+    Node::LiveStatsResponder liveStatsResponder {
+        liveSources, membership.Oracle(), dashboardCredential, nodeIo.Reactor(), metrics
+    };
+
     // The enrollment surface, built only where there is a cluster to be admitted to.
     //
     // An `optional` rather than a null pointer with a branch at the call site, because
@@ -1331,7 +1352,8 @@ void AdoptAllowlist(Cc::CompileJobRunner& jobs,
                                   .scheduler = schedulerTier != nullptr ? &schedulerTier->Responder() : nullptr,
                                   .compile = &compileResponder,
                                   .node = &nodeStatusResponder,
-                                  .enrollment = AddressOrNull(enrollmentResponder) },
+                                  .enrollment = AddressOrNull(enrollmentResponder),
+                                  .live = &liveStatsResponder },
         activated,
         metrics,
         logger,
@@ -1498,8 +1520,20 @@ void AdoptAllowlist(Cc::CompileJobRunner& jobs,
     if (schedulerTier != nullptr)
         schedulerTier->SetHistorySink(&sampler.Received());
 
-    auto surfaceOrRefusal =
-        Node::StartAdminSurfaceOrExplain(cfg, *host, metrics, std::move(snapshotProvider), fleetSources, &sampler, logger);
+    // What a live-stats stream reads: the same provider, fleet and sampler the admin surface is
+    // handed below, so a panel and `/metrics` cannot disagree about this machine. The attachment
+    // is declared AFTER all of them and so detaches before the first of them is destroyed, on
+    // every way out of this function -- including the surface outliving them, which it does.
+    Node::NodeLiveStatsSources const nodeLiveSources { Node::NodeLiveStatsParts { .metrics = &metrics,
+                                                                                  .snapshot = snapshotProvider,
+                                                                                  .identity = &nodeStatus,
+                                                                                  .fleet = fleetSources,
+                                                                                  .history = &sampler,
+                                                                                  .endpoint = advertise } };
+    auto const liveSourcesAttached = liveSources.Attach(nodeLiveSources);
+
+    auto surfaceOrRefusal = Node::StartAdminSurfaceOrExplain(
+        cfg, *host, metrics, std::move(snapshotProvider), fleetSources, &sampler, dashboardCredential, logger);
 
     // Fatal here and not in the daemon, which is a real difference between the two
     // binaries rather than a defect in either; the row says why
