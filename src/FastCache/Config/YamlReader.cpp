@@ -4,6 +4,7 @@
 #include <FastCache/Config/CompressionValues.hpp>
 #include <FastCache/Config/EnvExpand.hpp>
 #include <FastCache/Config/YamlReader.hpp>
+#include <FastCache/Core/Ranges.hpp>
 #include <FastCache/Platform/HostMemory.hpp>
 
 #include <yaml-cpp/yaml.h>
@@ -820,9 +821,29 @@ std::expected<std::vector<YamlSetting>, ConfigError> ReadYamlSettings(std::files
     std::vector<YamlSetting> settings;
     for (auto const& kv: *root)
     {
+        // Asked before the key is read as text, because reading a map or a sequence
+        // as text THROWS -- and nothing above this catches it, so `? [a, b]` ended a
+        // worker with an unhandled exception rather than a refusal naming the line.
+        if (!kv.first.IsScalar())
+            return std::unexpected(MakeError(ConfigErrorCode::ParseError, path, {}, "non-scalar key", YamlLine(kv.first)));
+
         auto const key = kv.first.as<std::string>();
         auto const& value = kv.second;
         YamlSetting setting { .key = key, .values = {}, .line = YamlLine(kv.first) };
+
+        // A key written twice is refused by name. The document is still a map to the
+        // parser, which hands over BOTH entries, so each caller would otherwise decide
+        // what a repetition means by accident: a scalar row keeps the LAST value and a
+        // list row APPENDS both -- two silent answers, neither of them anything the
+        // operator can see, and the first of them discards a value somebody wrote.
+        if (auto const* const earlier = FindOrNull(settings, key, &YamlSetting::key); earlier != nullptr)
+            return std::unexpected(MakeError(ConfigErrorCode::ParseError,
+                                             path,
+                                             key,
+                                             std::format("named twice (first at line {}); a repeated key would "
+                                                         "silently keep one of the values written",
+                                                         earlier->line),
+                                             setting.line));
 
         if (value.IsScalar())
             setting.values.push_back(value.as<std::string>());

@@ -453,6 +453,35 @@ TEST_CASE("YamlReader: a nested sequence element is refused rather than flattene
     CHECK(settings.error().code == FastCache::ConfigErrorCode::TypeMismatch);
 }
 
+TEST_CASE("YamlReader: a key written twice is refused by name, not resolved", "[config][yaml]")
+{
+    // Neither answer a caller could give is one the operator can see: a scalar keeps
+    // the LAST value and a list appends BOTH. Whichever was meant, the file says two
+    // things, so the reader says which key and where.
+    auto const path = WriteTempYaml("settings-duplicate", "alpha: one\nbeta: 2\nalpha: three\n");
+    auto const settings = FastCache::ReadYamlSettings(path);
+
+    REQUIRE_FALSE(settings.has_value());
+    CHECK(settings.error().code == FastCache::ConfigErrorCode::ParseError);
+    CHECK(settings.error().field == "alpha");
+    CHECK(settings.error().line == 3);
+    CHECK(settings.error().context.contains("first at line 1"));
+}
+
+TEST_CASE("YamlReader: a key that is not a scalar is refused rather than thrown", "[config][yaml]")
+{
+    // Reading a sequence as text throws inside yaml-cpp, and nothing above the reader
+    // catches it: measured on a 0.2.0-568 worker, this document ended the process
+    // with an unhandled exception (0xC0000409) instead of naming the line.
+    auto const path = WriteTempYaml("settings-sequence-key", "? [a, b]\n: 1\n");
+    auto const settings = FastCache::ReadYamlSettings(path);
+
+    REQUIRE_FALSE(settings.has_value());
+    CHECK(settings.error().code == FastCache::ConfigErrorCode::ParseError);
+    CHECK(settings.error().context == "non-scalar key");
+    CHECK(settings.error().line == 1);
+}
+
 TEST_CASE("YamlReader: a document that is not a map is refused", "[config][yaml]")
 {
     auto const path = WriteTempYaml("settings-scalar-doc", "just a string\n");

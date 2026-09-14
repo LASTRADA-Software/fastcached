@@ -112,6 +112,26 @@ enum class Reloadable : std::uint8_t
     Yes, ///< Takes effect on reload.
 };
 
+/// How a configuration FILE spells a setting's value, before the row's applier
+/// reads it.
+///
+/// **A spelling, not a second setting.** The command line has a shell in front of it
+/// and a file has nothing, so `$HOME/cache` reaches `--storage` already expanded
+/// and reaches `storage_path:` as the eight characters an operator typed. Expanding
+/// in the file layer and nowhere else keeps the applier the one parser both sources
+/// reach -- the same arrangement as a presence flag's `true`/`false`, which is also
+/// a file-only spelling of something argv says another way.
+///
+/// **Never in the argv parser.** A service registration replays the command line
+/// the installer built from the parse, so an expansion there would register the
+/// expanded text: `$$` typed for a literal dollar would come back as `$` and the
+/// replayed service would refuse to start on a reference to a variable nobody set.
+enum class FileValue : std::uint8_t
+{
+    Literal,           ///< The file's text reaches the applier as written.
+    ExpandEnvironment, ///< `$NAME`, `${NAME}` and `$$` are expanded first; see `ExpandEnvironmentVariables`.
+};
+
 /// One accepted command-line option.
 ///
 /// The single source of truth for a binary's CLI: the parser matches these rows
@@ -167,6 +187,14 @@ struct OptionSpec
     /// so re-reading it would leave the scheduler dispatching against a set this
     /// worker no longer serves.
     Reloadable reloadable { Reloadable::No };
+
+    /// How a configuration file spells this setting's value. `Literal` unless the row
+    /// is a path a file may write with environment references.
+    ///
+    /// Declared beside `reloadable` rather than at the end of the row: every byte-wide
+    /// member of a struct lives in one run, or each one stranded between two 8-aligned
+    /// members costs seven bytes of padding and the analyser's budget fails the build.
+    FileValue fileValue { FileValue::Literal };
 
     /// Whether two configurations agree about this row's field.
     ///
@@ -230,10 +258,15 @@ template <typename Result>
     // The alternative, a positively-named key with an applier no flag has, is a
     // setting reachable from a file and not from argv -- two mechanisms for one
     // setting, which is the shape this column exists to remove.
+    //
+    // A file spelling other than `Literal` is a column only a FILE reads, so a row no
+    // file can reach carrying one is a row somebody believes a file expands; and only a
+    // value can be expanded, a presence flag's `true` having nothing in it to expand.
     auto const fileRowsOk = std::ranges::all_of(table, [](OptionSpec<Result> const& spec) {
         if (spec.yamlKey.empty())
-            return spec.clear == nullptr;
-        return spec.apply != nullptr && spec.select == nullptr && spec.flow == ParseFlow::Continue;
+            return spec.clear == nullptr && spec.fileValue == FileValue::Literal;
+        return spec.apply != nullptr && spec.select == nullptr && spec.flow == ParseFlow::Continue
+               && (spec.fileValue == FileValue::Literal || spec.arity == Arity::Value);
     });
     if (!fileRowsOk)
         return false;

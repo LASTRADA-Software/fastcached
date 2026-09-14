@@ -106,6 +106,11 @@ struct YamlSetting
 /// nothing read. The daemon's own `listeners:` is nested, which is why that reader
 /// stays where it is rather than being rebuilt on this.
 ///
+/// A top-level key written twice is a `ParseError` naming the key and both lines.
+/// The parser hands over both entries, and without the refusal a scalar setting
+/// would keep the last one written while a list setting appended both -- a value
+/// the operator wrote either discarded or doubled, and nothing saying which.
+///
 /// An empty document is success carrying nothing, because a fully-commented
 /// reference file is a legitimate and expected configuration.
 /// @param path Filesystem path of the YAML file.
