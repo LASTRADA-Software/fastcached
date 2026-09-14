@@ -1092,13 +1092,14 @@ what differs between compilers, standard libraries, hosts and tool versions.
   cannot answer. A shape that build is KNOWN to crash on is a row of
   `check-clang-tidy-known-defects.sh`: its sites name the value first under a one-line comment
   naming the issue, and the check stays on.
-- **The formatter is a BUILD too: PyPI's clang-format at `CLANG_FORMAT_VERSION`, one
-  exact build, and a clang-format that is not that build does not WRITE** — not the format-on-edit
-  hook, not `local-gate.sh`'s `-i`. `.clang-format-version` declares its banner, compared WHOLE, so
-  the apt snapshot of the same number is refused too. Which binary is ONE resolver,
-  `check-clang-format-version.sh --resolve`, never a `clang-format-$V` name; `Check C++ style` asserts
-  the build it installed BEFORE formatting, and `ctest -R clang-format-version` holds the
-  declaration to the pin in both directions (#1349).
+- **The formatter is a BUILD too: `.clang-format-version` declares ONE PyPI clang-format release by
+  its banner, and a clang-format that is not that build does not WRITE** — not the format-on-edit
+  hook, not `local-gate.sh`'s `-i`. The banner is compared WHOLE, so the apt snapshot of the same
+  number is refused too. The file is the one statement of the version: `Check C++ style` installs
+  what `--requirement` derives from it, and `ctest -R clang-format-version` holds it to one bare
+  release whose major is `CLANG_TOOLS_VERSION`. Which binary is ONE resolver,
+  `check-clang-format-version.sh --resolve` (`FASTCACHED_CLANG_FORMAT`, else every `clang-format` on
+  `PATH`), never a `clang-format-$V` name (#1349, #1407).
 - A script that NAMES a tool version must name it **everywhere that version matters**. And a
   cached `find_program` result outlives every reason it was chosen, so check the pin against the
   cache, not only pass it. `ctest -R local-gate-selftest`.
@@ -1910,8 +1911,8 @@ ordinary answers, so neither can carry "there was no probe".
   for good, because a reference build turns the compiler cache off with a `-D` and
   `option()` never overrides a cache entry (#487).
 - **`clang-format` and `clang-tidy` after every change — at the version CI pins**
-  (`$CLANG_FORMAT_VERSION`, an exact PyPI release, and `$CLANG_TOOLS_VERSION`, both in
-  `.github/workflows/build.yml`). Successive LLVM releases disagree with each other, so a
+  (`.clang-format-version` and `.clang-tidy-version`, each an exact PyPI release). Successive LLVM
+  releases disagree with each other, so a
   tree clean under whichever binary is on `PATH` can still be rejected. Format through
   `scripts/check-clang-format-version.sh --resolve`, resolve clang-tidy through
   `scripts/check-clang-tidy-version.sh --resolve`

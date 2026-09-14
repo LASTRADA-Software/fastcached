@@ -135,13 +135,6 @@ env:
   # Measured locally on the full suite: 649s -> 131s at eight jobs.
   CTEST_PARALLEL_LEVEL: 4
   CLANG_TOOLS_VERSION: "22"
-  # The clang-format BUILD `Check C++ style` judges with -- an exact PyPI release, never
-  # a major on apt.llvm.org's rolling snapshot, where two builds a month apart share one
-  # version number and can format one file differently (#1349). The one place this
-  # version is stated: `.clang-format-version` declares its banner for the
-  # format-on-edit hook and `local-gate.sh`, and `ctest -R clang-format-version` holds
-  # the two equal. clang-tidy is NOT this pin; it stays on `CLANG_TOOLS_VERSION`.
-  CLANG_FORMAT_VERSION: "22.1.8"
   GCC_VERSION: "14"
   CPM_SOURCE_CACHE: ${{ github.workspace }}/.cache/CPM
   # Read by every packaging job's configure step. ON turns "no reachable tag"
@@ -345,20 +338,23 @@ jobs:
       # failure with clang-format skipped beneath it. Adding `edited` here instead
       # would have re-run the whole matrix for a prose edit.
 
-      # From PyPI at the EXACT version `CLANG_FORMAT_VERSION` names, never apt.llvm.org:
-      # that source pins a major and ships rolling snapshots under it, so the build this
-      # job judged with changed whenever the mirror did, and a declaration of it would
-      # turn every pull request red at the next snapshot for a reason unrelated to the
-      # change (#1349). A PyPI release is one build, installable natively on every
-      # platform a developer formats on.
+      # The one formatter build, from the one place it is stated: `.clang-format-version`
+      # declares a PyPI release by its banner, and `--requirement` derives the pip
+      # requirement from it, so this step restates no version (#1407). Never apt.llvm.org:
+      # that source pins a major and ships rolling snapshots under it, so the build this job
+      # judged with changed whenever the mirror did (#1349).
       #
       # Into a venv of its own, because the runner's system python is
-      # externally-managed (PEP 668) and refuses a plain `pip install`.
-      - name: "Install clang-format ${{ env.CLANG_FORMAT_VERSION }}"
+      # externally-managed (PEP 668) and refuses a plain `pip install`; the venv's bin/ goes
+      # on PATH because the format-on-edit hook's rule -- the declared build among every
+      # clang-format on PATH -- is what the formatting step below resolves by.
+      - name: "Install the declared clang-format"
         if: ${{ needs.changes.outputs.code != 'false' }}
         run: |
+          set -euo pipefail
+          requirement="$(bash scripts/check-clang-format-version.sh --requirement "$GITHUB_WORKSPACE")"
           python3 -m venv "$RUNNER_TEMP/clang-format"
-          "$RUNNER_TEMP/clang-format/bin/pip" install --disable-pip-version-check "clang-format==${{ env.CLANG_FORMAT_VERSION }}"
+          "$RUNNER_TEMP/clang-format/bin/pip" install --disable-pip-version-check "$requirement"
           echo "$RUNNER_TEMP/clang-format/bin" >> "$GITHUB_PATH"
       # The installed build is the one `.clang-format-version` declares -- asserted
       # here, the one job that installs the formatter, so every green run proves the

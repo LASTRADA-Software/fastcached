@@ -1566,11 +1566,13 @@ set_tests_properties("windows-header-order-selftest" PROPERTIES
     TIMEOUT 120
 )
 
-# `.clang-format-version` declares EXACTLY the banner of the clang-format build
-# `CLANG_FORMAT_VERSION` pins -- that one, and no other (#1349). The pin in `build.yml` is
-# the one statement of the version; the declaration is what the format-on-edit hook and
-# `local-gate.sh` can read, so a bump of one without the other is refused on the pull
-# request that makes it. Needs no formatter, so it is in the default set.
+# `.clang-format-version` is the ONE statement of the clang-format build: exactly one
+# bare PyPI release banner, `clang-format version X.Y.Z`, whose major is the
+# `CLANG_TOOLS_VERSION` build.yml pins (#1349, #1407). A second declared build is one the
+# format-on-edit hook would write with, a snapshot banner names a build no installer can ask
+# for, and a major bump that leaves the formatter behind is refused on the pull request that
+# makes it. `Check C++ style` installs what `--requirement` derives from the file, so no
+# workflow restates the version. Needs no formatter, so it is in the default set.
 #
 # Whether the INSTALLED formatter is the declared build is the script's `--installed`
 # mode, and deliberately not a ctest: only `Check C++ style` installs the pinned
@@ -1584,11 +1586,12 @@ set_tests_properties("clang-format-version" PROPERTIES
     TIMEOUT 120
 )
 
-# Both directions, with fake formatters: a PLANTED mismatch between pin and declaration
-# as the positive control, a second declared build beside the pinned one, the #1349 case
-# itself -- the pinned release number from another source -- the resolver finding the
-# declared build behind another clang-format and naming the install commands when there
-# is none, and the shipped declaration as the accepting control.
+# Both directions, with fake formatters: a PLANTED major mismatch as the positive control,
+# a second declared build, the snapshot / vendor / suffixed / short banners, the requirement
+# derived and refused, the #1349 case itself -- the pinned release number from another
+# source -- the resolver finding the declared build behind another clang-format, honouring
+# and never stepping over FASTCACHED_CLANG_FORMAT, and naming the install commands (a
+# pip-less host's included) when there is none; the shipped declaration accepts.
 add_test(
     NAME "clang-format-version-selftest"
     COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-clang-format-version.sh" --self-test "${CMAKE_SOURCE_DIR}"

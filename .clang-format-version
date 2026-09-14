@@ -1,15 +1,15 @@
-# The clang-format BUILD `Check C++ style` judges this tree with (#1349).
+# The clang-format BUILD `Check C++ style` judges this tree with (#1349, #1407), and the
+# ONE place its version is stated.
 #
-# It is PyPI's clang-format at CLANG_FORMAT_VERSION in .github/workflows/build.yml --
-# one release, one build, the same banner and the same output on Linux, macOS and
-# Windows. The contour-workflows format-on-edit hook writes only with a binary whose
-# `--version` line is listed here, character for character, and local-gate.sh refuses to
-# `clang-format -i` with any other.
+# It is PyPI's clang-format release -- one build, the same banner and the same output on
+# Linux, macOS and Windows. The contour-workflows format-on-edit hook writes only with a
+# binary whose `--version` line is listed here, character for character, and local-gate.sh
+# refuses to `clang-format -i` with any other. `Check C++ style` installs the requirement
+# `check-clang-format-version.sh --requirement` derives from this line.
 #
-# Derived, never edited on its own: `ctest -R clang-format-version` refuses this file
-# unless it declares exactly `clang-format version <CLANG_FORMAT_VERSION>`, so a version
-# bump is one change to build.yml and this line together.
+# `ctest -R clang-format-version` holds it to exactly one bare release banner whose major is
+# CLANG_TOOLS_VERSION, so bumping the toolchain's major and this line is one change.
 #
 # To install that build, run `bash scripts/check-clang-format-version.sh --resolve`: when
-# no clang-format on PATH is it, the refusal prints the install commands for this pin.
+# no clang-format on PATH is it, the refusal prints the install commands for this release.
 version: clang-format version 22.1.8
