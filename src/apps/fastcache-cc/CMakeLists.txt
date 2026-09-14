@@ -36,6 +36,7 @@ set(_fc_cc_core
     "${CMAKE_SOURCE_DIR}/src/FastCache/CompileCache/CompileValue.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/Core/Base64.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/Core/Compression.cpp"
+    "${CMAKE_SOURCE_DIR}/src/FastCache/Core/CpuFeatures.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/Core/SecureBytes.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/Core/Sha256.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/Metrics/IMetricsSink.cpp"
@@ -95,6 +96,11 @@ set(_fc_cc_core
 # alone. No vcpkg package, no OpenSSL -- which is the point of having SHA-256 in this
 # tree at all, since FASTCACHED_ENABLE_TLS is off by default and peer authentication
 # is not optional.
+#
+# Core/CpuFeatures.cpp is how Sha256.cpp picks its engine at run time (#1420), so it
+# rides with that row. It costs nothing the rule protects either: it reaches the
+# standard library, the compiler's own <intrin.h> or <cpuid.h> on x86-64, and
+# <sys/sysctl.h> on arm64 macOS. No windows.h.
 #
 # Core/Compression.cpp is the one row here that is NOT dependency-free, and it is a
 # deliberate exception to the rule the comment above states.
