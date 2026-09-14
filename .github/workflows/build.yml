@@ -2355,11 +2355,10 @@ jobs:
         # which is where the "only on a tag run" reasoning is written down.
         run: cmake --preset gcc-release -DFASTCACHED_BUILD_TESTS=OFF -DFASTCACHED_PACKAGE_ROOT_PREFIX=ON -DFASTCACHED_REQUIRE_EXACT_VERSION=${{ env.FASTCACHED_REQUIRE_EXACT_VERSION }}
 
-      # Tests are off here, so no ctest reads this configuration's compile database: the build that SHIPS is asked
-      # directly, before the long build, whether any first-party unit carries a global instruction-set flag (#1442).
-      # The wrapper reads the check's output and says clean, refused, or did not conclude.
+      # Why this step, why before Build, and why it reports without gating: the header of
+      # scripts/check-instruction-set-flags.sh (#1442).
       - name: "No global instruction-set flag in what ships"
-        run: bash scripts/check-instruction-set-flags.sh out/build/gcc-release/compile_commands.json
+        run: bash scripts/run-check.sh scripts/check-instruction-set-flags.sh out/build/gcc-release/compile_commands.json
 
       - name: "Build"
         run: cmake --build --preset gcc-release --target fastcached fastcache-cc fastcache-compile-node fastcache-cli
@@ -2913,10 +2912,10 @@ jobs:
             -DFASTCACHED_MACOS_NOTARY_STALL_IS_FATAL="${{ steps.notary.outputs.stall_is_fatal }}" \
             -DFASTCACHED_REQUIRE_EXACT_VERSION=${{ env.FASTCACHED_REQUIRE_EXACT_VERSION }}
 
-      # This configure line is used by no test leg and has tests off, so nothing else ever reads its compile
-      # database: the build that SHIPS is asked directly, before the long build (#1442).
+      # Why this step, why before Build, and why it reports without gating: the header of
+      # scripts/check-instruction-set-flags.sh (#1442).
       - name: "No global instruction-set flag in what ships"
-        run: bash scripts/check-instruction-set-flags.sh out/build/macos-package/compile_commands.json
+        run: bash scripts/run-check.sh scripts/check-instruction-set-flags.sh out/build/macos-package/compile_commands.json
 
       - name: "Build"
         run: cmake --build out/build/macos-package --target fastcached fastcache-cc fastcache-compile-node fastcache-cli
@@ -3232,11 +3231,12 @@ jobs:
         # which is where the "only on a tag run" reasoning is written down.
         run: cmake --preset cl-release -DALLOW_SCCACHE_FALLBACK=ON -DFASTCACHED_BUILD_TESTS=OFF -DFASTCACHED_REQUIRE_EXACT_VERSION=${{ env.FASTCACHED_REQUIRE_EXACT_VERSION }}
 
-      # Tests are off here, so no ctest reads this configuration's compile database: the build that SHIPS is asked
-      # directly, before the long build (#1442). Git Bash, where the wrapper converts its own paths for cmake.
+      # Why this step, why before Build, and why it reports without gating: the header of
+      # scripts/check-instruction-set-flags.sh (#1442). Git Bash, because the wrapper converts its own paths for the
+      # native cmake.
       - name: "No global instruction-set flag in what ships"
         shell: bash
-        run: bash scripts/check-instruction-set-flags.sh out/build/cl-release/compile_commands.json
+        run: bash scripts/run-check.sh scripts/check-instruction-set-flags.sh out/build/cl-release/compile_commands.json
 
       - name: "Build"
         run: cmake --build --preset cl-release --target fastcached fastcache-cc fastcache-compile-node fastcache-cli

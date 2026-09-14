@@ -133,7 +133,7 @@ set(UnitCases
     "versionedDriver|ON|`-mavx2`, because||/usr/bin/x86_64-linux-gnu-g++-14 -O2 -mavx2 ${tail}"
     "unknownDriver|ON|compiled by `icpx`, a driver DriverRows does not name||/opt/intel/bin/icpx -O2 ${tail}"
     "responseUnreadable|ON|cannot read response file `@missing.rsp`||${gxx} @missing.rsp ${tail}"
-    "plantUnitAbsent|ON|is not a first-party unit of this database, so the plant was never judged|-DFASTCACHED_PLANT_UNIT=src/FastCache/Core/Elsewhere.cpp|${gxx} ${tail}"
+    "plantUnitAbsent|ON|so the plant was never judged The plant is a flag this check places itself and must refuse, so nothing in the tree needs changing|-DFASTCACHED_PLANT_UNIT=src/FastCache/Core/Elsewhere.cpp|${gxx} ${tail}"
 )
 foreach(row IN LISTS UnitCases)
     fastcached_row_fields("${row}" caseName caseRefuses caseExpected caseExtra caseCommand)
@@ -161,6 +161,8 @@ fastcached_judge(plantBesideRealViolation "${root}" OFF
     "`-msha` planted into src/FastCache/Core/Unit.cpp (1 entr(y/ies)) refused as it must; 2 first-party unit(s) judged; 1 unplanted problem(s) left to the unplanted run"
     "${plant}")
 fastcached_judge(realViolationUnplanted "${root}" ON "src/FastCache/Core/Other.cpp: `-mavx2`, because")
+# A refusal of the TREE sends its reader to the tree; the plant runs above send theirs to the check.
+fastcached_judge(realViolationRemedy "${root}" ON "An instruction set is asked for per function")
 
 fastcached_tree(responseClean root)
 file(WRITE "${root}/build/flags.rsp" "-O2 -DNDEBUG\n")

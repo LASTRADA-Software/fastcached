@@ -7,17 +7,27 @@
 # ## Why a step, and why this wrapper
 #
 # The ctests `instruction-set-flags` and `instruction-set-flags-plant` read the database of every configuration that
-# runs ctest. The Package jobs configure what SHIPS with tests off, and macOS packages from a configure line no test
-# leg uses, so no ctest ever reads their database. A step there asks the same check of the build that ships.
+# runs ctest. The Package jobs configure what SHIPS with tests off, and macOS packages from a configure line and a
+# compiler (AppleClang) no test leg uses, so no ctest ever reads their database. A step after each Package job's
+# Configure asks both of those questions of the build that ships, before the long build.
+#
+# That step REPORTS and gates no merge: no Package job is a required context (.agent/rules/packaging-and-release.md),
+# so a red one shows on the pull request, in the merge-group report and at release, while the required test legs gate
+# through the ctests. The Docker job configures too and is not asked, because its image goes to no registry.
 #
 # A step is judged by its exit status, and a `cmake -P` check must not be: `message(WARNING)` exits 0, and a script
-# that never ran is a `CMake Error` too. So this reads the output and says which of THREE things happened:
+# that never ran is a `CMake Error` too. So this reads the output of two runs -- the database as it is, and the same
+# database with a flag the check must refuse planted into the real commands of `plant_unit` below -- and says which
+# of THREE things happened:
 #
-#   0  clean             the check printed its own summary, and no CMake Error or CMake Warning
-#   1  refused           the check printed its own `instruction-set-flags:` verdict in a CMake Error
+#   0  clean             the unplanted run printed its summary, the plant run printed its plant summary, and
+#                        neither printed a CMake Error or a CMake Warning
+#   1  refused           the unplanted run printed its own `instruction-set-flags:` verdict in a CMake Error: a flag,
+#                        or a database it cannot judge, and its own words say which
 #   2  did not conclude  anything else -- cmake missing or not starting, the script missing, an error that is not the
-#                        check's verdict, a warning, no summary. Nothing was judged, and this says so rather than
-#                        passing or blaming the tree.
+#                        check's verdict, a warning, no summary, or a plant run that did not pass, which leaves a
+#                        clean reading of THIS database never shown able to fail. Nothing was judged, and this says
+#                        so rather than passing or blaming the tree.
 #
 # cmake's own exit status is printed and decides nothing.
 #
@@ -31,19 +41,24 @@ set -u
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cmake_command="cmake"
+# A first-party unit every shipping configuration compiles, as the `instruction-set-flags-plant` ctest plants.
+plant_unit="src/FastCache/Core/Sha256.cpp"
 
 # A path as the native cmake reads it. Git Bash hands POSIX spellings (`/d/a/...`) to a Windows program only through
 # its argument conversion, which the call below switches off, so the conversion is done here, explicitly.
 # @param 1 A path as this shell spells it.
 NativePath() {
-    case "$(uname -s)" in
-        MINGW* | MSYS* | CYGWIN*) cygpath -m "$1" ;;
+    case "${OSTYPE:-}" in
+        msys* | cygwin*) cygpath -m "$1" ;;
         *) printf '%s\n' "$1" ;;
     esac
 }
+native_root="$(NativePath "$repo_root")"
 
-# The outcome of one run, from its output alone. PURE, so every branch is a self-test case.
+# The outcome of one run, from its output alone.
 # @param 1 The check's combined output.
+# @param 2 The run's summary up to its first varying part, after `-- instruction-set-flags: `.
+# @param 3 The run's summary text after that part.
 # @return echoes clean, refused or inconclusive
 Classify() {
     local flat
@@ -54,7 +69,7 @@ Classify() {
     # The check spells every verdict `instruction-set-flags: <text>` -- a colon and a space. Its own file name,
     # `check-instruction-set-flags.cmake:<line>`, does not match that.
     case "$flat" in *"instruction-set-flags: "*) verdict="yes" ;; esac
-    case "$flat" in *"-- instruction-set-flags: "*" first-party unit(s) judged, none carries a global instruction-set flag"*) summary="yes" ;; esac
+    case "$flat" in *"-- instruction-set-flags: $2"*"$3"*) summary="yes" ;; esac
     if [ "$error" = "no" ] && [ "$warning" = "no" ] && [ "$summary" = "yes" ]; then
         echo "clean"
     elif [ "$error" = "yes" ] && [ "$verdict" = "yes" ]; then
@@ -64,41 +79,48 @@ Classify() {
     fi
 }
 
-# Run the check over @p database and print its output, then one verdict line; return 0, 1 or 2.
-# @param 1 The compile database.
-RunAndJudge() {
-    local database="$1" output status outcome
+# Run the check once, print its output and a line naming the outcome, and leave that outcome in `outcome`.
+# @param 1 The run's name. @param 2 and 3 Its summary, as Classify takes it. @param 4 The compile database.
+# @param 5.. Further -D arguments.
+RunOnce() {
+    local label="$1" summaryHead="$2" summaryTail="$3" database="$4" output status
+    shift 4
     output="$(MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' "$cmake_command" \
-        "-DFASTCACHED_SOURCE_DIR=$(NativePath "$repo_root")" \
+        "-DFASTCACHED_SOURCE_DIR=${native_root}" \
         "-DFASTCACHED_COMPILE_DATABASE=$(NativePath "$database")" \
-        -P "$(NativePath "${repo_root}/scripts/check-instruction-set-flags.cmake")" 2>&1)"
+        ${1+"$@"} \
+        -P "${native_root}/scripts/check-instruction-set-flags.cmake" 2>&1)"
     status=$?
     printf '%s\n' "$output"
-    outcome="$(Classify "$output")"
-    case "$outcome" in
-        clean)
-            echo "check-instruction-set-flags: clean -- ${database} (cmake exited ${status})"
-            return 0
-            ;;
-        refused)
-            echo "check-instruction-set-flags: REFUSED -- ${database} carries a global instruction-set flag, or cannot be judged; the check's own words are above (cmake exited ${status})"
-            return 1
-            ;;
-        *)
-            echo "check-instruction-set-flags: DID NOT CONCLUDE -- neither the check's summary nor its verdict was printed, so NOTHING was judged; this is not a finding about ${database} (cmake exited ${status})"
-            return 2
-            ;;
-    esac
+    outcome="$(Classify "$output" "$summaryHead" "$summaryTail")"
+    echo "check-instruction-set-flags: the ${label} run was ${outcome} (cmake exited ${status})"
 }
 
-# One compile database compiling the real src/FastCache/Core/Sha256.cpp with @p flags.
+# Run both halves over @p database and print one verdict line; return 0, 1 or 2.
+# @param 1 The compile database.
+RunAndJudge() {
+    local database="$1" unplanted
+    RunOnce unplanted "" " first-party unit(s) judged, none carries a global instruction-set flag" "$database"
+    unplanted="$outcome"
+    RunOnce plant "plant: " " refused as it must; " "$database" "-DFASTCACHED_PLANT_UNIT=${plant_unit}"
+    if [ "$unplanted" = "refused" ]; then
+        echo "check-instruction-set-flags: REFUSED -- ${database} carries a global instruction-set flag, or cannot be judged; the unplanted run's own words are above"
+        return 1
+    fi
+    if [ "$unplanted" = "clean" ] && [ "$outcome" = "clean" ]; then
+        echo "check-instruction-set-flags: clean -- ${database}, and a flag planted into ${plant_unit} was refused as it must be"
+        return 0
+    fi
+    echo "check-instruction-set-flags: DID NOT CONCLUDE -- the unplanted run was ${unplanted} and the plant run ${outcome} (a plant run is refused when the flag it planted was NOT), so NOTHING was judged; this is not a finding about ${database}"
+    return 2
+}
+
+# One compile database compiling the real `plant_unit` with @p flags.
 # @param 1 Where to write it.
 # @param 2 Extra flags.
 WriteDatabase() {
-    local root
-    root="$(NativePath "$repo_root")"
-    printf '[{"directory": "%s/build", "file": "%s/src/FastCache/Core/Sha256.cpp", "command": "/usr/bin/g++ -O2 %s -c ../src/FastCache/Core/Sha256.cpp"}]\n' \
-        "$root" "$root" "$2" > "$1"
+    printf '[{"directory": "%s/build", "file": "%s/%s", "command": "/usr/bin/g++ -O2 %s -c ../%s"}]\n' \
+        "$native_root" "$native_root" "$plant_unit" "$2" "$plant_unit" > "$1"
 }
 
 SelfTest() {
@@ -118,24 +140,40 @@ SelfTest() {
             printf '  %s: exited %s, wanted %s\n%s\n' "$name" "$got" "$want" "$out"
         fi
     }
-    # @param 1 Case name. @param 2 Expected outcome. @param 3 Output to classify.
-    ExpectClass() {
-        local got
-        got="$(Classify "$3")"
-        ran=$((ran + 1))
-        if [ "$got" != "$2" ]; then
-            failures=$((failures + 1))
-            printf '  %s: classified %s, wanted %s\n' "$1" "$got" "$2"
-        fi
-    }
 
     WriteDatabase "$tmp/clean.json" "-DNDEBUG"
     WriteDatabase "$tmp/sha.json" "-msha"
 
-    # A cmake that prints what a check never would: the wrapper must not read it as either verdict.
-    printf '#!/bin/bash\necho "-- instruction-set-flags: 1 first-party unit(s) judged, none carries a global instruction-set flag"\necho "CMake Warning at x.cmake:1 (message):"\necho "  something else"\nexit 0\n' > "$tmp/warns"
-    printf '#!/bin/bash\necho "CMake Error: Error processing file: /nowhere/check-instruction-set-flags.cmake"\nexit 1\n' > "$tmp/foreign-error"
-    chmod +x "$tmp/warns" "$tmp/foreign-error"
+    # Stand-in cmakes, each answering the plant run apart from the unplanted one, printing what the check never would.
+    cat > "$tmp/warns" <<'EOF'
+#!/bin/bash
+case "$*" in
+    *FASTCACHED_PLANT_UNIT*) echo '-- instruction-set-flags: plant: `-msha` planted into src/FastCache/Core/Sha256.cpp (1 entr(y/ies)) refused as it must; 1 first-party unit(s) judged; 0 unplanted problem(s) left to the unplanted run' ;;
+    *) echo '-- instruction-set-flags: 1 first-party unit(s) judged, none carries a global instruction-set flag; 0 unit(s) outside src/ declined' ;;
+esac
+echo 'CMake Warning at x.cmake:1 (message):'
+echo '  something else'
+exit 0
+EOF
+    cat > "$tmp/foreign-error" <<'EOF'
+#!/bin/bash
+echo 'CMake Error: Error processing file: /nowhere/check-instruction-set-flags.cmake'
+exit 1
+EOF
+    cat > "$tmp/plant-accepted" <<'EOF'
+#!/bin/bash
+case "$*" in
+    *FASTCACHED_PLANT_UNIT*)
+        echo 'CMake Error at /r/scripts/check-instruction-set-flags.cmake:419 (message):'
+        echo '  instruction-set-flags: 1 problem(s) in `db`:'
+        echo '    plant: `-msha` planted into `src/FastCache/Core/Sha256.cpp` was ACCEPTED -- the check cannot see the flag it exists to refuse'
+        exit 1
+        ;;
+esac
+echo '-- instruction-set-flags: 1 first-party unit(s) judged, none carries a global instruction-set flag; 0 unit(s) outside src/ declined'
+exit 0
+EOF
+    chmod +x "$tmp/warns" "$tmp/foreign-error" "$tmp/plant-accepted"
 
     local self="${repo_root}/scripts/check-instruction-set-flags.sh"
     Expect cleanDatabase 0 bash "$self" --cmake "$cmake_command" "$tmp/clean.json"
@@ -144,16 +182,8 @@ SelfTest() {
     Expect cmakeNeverStarted 2 bash "$self" --cmake "$tmp/no-such-cmake" "$tmp/clean.json"
     Expect warningBesideSummary 2 bash "$self" --cmake "$tmp/warns" "$tmp/clean.json"
     Expect errorNotTheChecks 2 bash "$self" --cmake "$tmp/foreign-error" "$tmp/clean.json"
+    Expect plantAccepted 2 bash "$self" --cmake "$tmp/plant-accepted" "$tmp/clean.json"
     Expect noArguments 2 bash "$self"
-
-    ExpectClass classifyClean clean "-- instruction-set-flags: 3 first-party unit(s) judged, none carries a global instruction-set flag; 0 unit(s) outside src/ declined"
-    ExpectClass classifyRefused refused "CMake Error at /r/scripts/check-instruction-set-flags.cmake:400 (message):
-  instruction-set-flags: 1 problem(s) in
-  \`db\`:
-    src/a.cpp: \`-msha\`, because it is an -m flag no row has judged"
-    ExpectClass classifyFileNameIsNotAVerdict inconclusive "CMake Error at /r/scripts/check-instruction-set-flags.cmake:12 (foo):
-  Unknown CMake command \"foo\"."
-    ExpectClass classifyEmpty inconclusive ""
 
     if [ "$failures" -ne 0 ]; then
         echo "check-instruction-set-flags --self-test: ${ran} case(s) ran, ${failures} did not judge as they must"

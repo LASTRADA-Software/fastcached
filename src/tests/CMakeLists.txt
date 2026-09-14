@@ -7153,7 +7153,8 @@ endif()
 # ---------------------------------------------------------------------------
 # No first-party unit enables an instruction set for the whole unit (#1442): by a flag in a compile
 # database, or by a target pragma in the tree. Each self-test drives its check in both directions and
-# prints how many cases ran.
+# prints how many cases ran. The Package jobs ask the flags check through
+# scripts/check-instruction-set-flags.sh, whose header says why; its self-test is the wrapper's.
 add_test(
     NAME "instruction-set-flags-selftest"
     COMMAND ${CMAKE_COMMAND}
@@ -7168,9 +7169,8 @@ set_tests_properties("instruction-set-flags-selftest" PROPERTIES
 )
 
 # This build's own compile database, and a plant into its real Sha256.cpp entries that must be refused. Only the
-# Makefile and Ninja generators write a database (CMAKE_EXPORT_COMPILE_COMMANDS says so, and ignores the rest),
-# so under any other generator neither test is registered. Every configure preset here is Ninja.
-if(CMAKE_EXPORT_COMPILE_COMMANDS AND CMAKE_GENERATOR MATCHES "Ninja|Makefiles")
+# Makefile and Ninja generators write a database; every configure preset here is Ninja.
+if(CMAKE_GENERATOR MATCHES "Ninja|Makefiles")
     add_test(
         NAME "instruction-set-flags"
         COMMAND ${CMAKE_COMMAND}
@@ -7197,7 +7197,21 @@ if(CMAKE_EXPORT_COMPILE_COMMANDS AND CMAKE_GENERATOR MATCHES "Ninja|Makefiles")
         LABELS "hygiene"
         TIMEOUT 120
     )
+else()
+    foreach(name IN ITEMS "instruction-set-flags" "instruction-set-flags-plant")
+        fastcached_register_skipped_test("${name}"
+            "the ${CMAKE_GENERATOR} generator writes no compile database, so no flag of this build was judged")
+    endforeach()
 endif()
+
+add_test(
+    NAME "instruction-set-flags-wrapper-selftest"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-instruction-set-flags.sh" --self-test --cmake "${CMAKE_COMMAND}"
+)
+set_tests_properties("instruction-set-flags-wrapper-selftest" PROPERTIES
+    LABELS "hygiene"
+    TIMEOUT 120
+)
 
 add_test(
     NAME "target-pragmas"
@@ -7222,16 +7236,4 @@ set_tests_properties("target-pragmas-selftest" PROPERTIES
     FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
     LABELS "hygiene"
     TIMEOUT 60
-)
-
-# The Package jobs configure what ships with tests off, so no ctest reads their database; a step there runs this
-# wrapper, which turns the check's OUTPUT into clean, refused or did-not-conclude. Its self-test drives all three,
-# a cmake that never started among them, under the interpreter a Package job's step uses on each platform.
-add_test(
-    NAME "instruction-set-flags-wrapper-selftest"
-    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-instruction-set-flags.sh" --self-test --cmake "${CMAKE_COMMAND}"
-)
-set_tests_properties("instruction-set-flags-wrapper-selftest" PROPERTIES
-    LABELS "hygiene"
-    TIMEOUT 120
 )

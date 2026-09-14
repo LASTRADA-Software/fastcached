@@ -17,8 +17,8 @@
 # It is the artefact every flag reaches after CMake has merged them -- a preset, a `-D` on a configure
 # line, `CMAKE_<LANG>_FLAGS` and its `_INIT`, a toolchain file, target and per-source options,
 # generator expressions. A scan of CMake files would see only the spellings somebody thought to look
-# for. It is asked of the database of the build that SHIPS as well as of the ones that test: the
-# package jobs configure without tests, and macOS packages from a configure line no test leg uses.
+# for. It is asked of the database of the build that SHIPS as well as of the ones that test:
+# `scripts/check-instruction-set-flags.sh` says why, and runs it from the package jobs.
 #
 # ## First-party is an inclusion list: `src/`
 #
@@ -416,10 +416,21 @@ if(problems STREQUAL "")
 else()
     list(LENGTH problems problemCount)
     list(JOIN problems "\n  " problemText)
+    # Only plant problems reach a plant run's refusal, and the tree cannot cause one, so it must not be sent there.
+    if(plantUnit STREQUAL "")
+        string(CONCAT remedy
+            "An instruction set is asked for per function -- __attribute__((target(...))) -- and that function runs only "
+            "once the CPU has been asked (#1420: Core/CpuFeatures, and the instruction-set extension entry in "
+            ".agent/rules/build-and-toolchain.md). A flag that enables no instruction set gets a SpellingRows row with its "
+            "reason; a new compiler gets a DriverRows row. What this check does not cover is listed in its header.")
+    else()
+        string(CONCAT remedy
+            "The plant is a flag this check places itself and must refuse, so nothing in the tree needs changing: a plant "
+            "ACCEPTED is a defect in this check's reading (the extraction pattern derived from SpellingRows, or a row), and "
+            "a plant never judged means FASTCACHED_PLANT_UNIT names no first-party unit this database compiles, or no "
+            "PlantRows flag fits its driver. A real flag in the tree is the unplanted run's to report.")
+    endif()
     message(FATAL_ERROR
         "instruction-set-flags: ${problemCount} problem(s) in `${FASTCACHED_COMPILE_DATABASE}`:\n  ${problemText}\n"
-        "An instruction set is asked for per function -- __attribute__((target(...))) -- and that function runs only "
-        "once the CPU has been asked (#1420: Core/CpuFeatures, and the instruction-set extension entry in "
-        ".agent/rules/build-and-toolchain.md). A flag that enables no instruction set gets a SpellingRows row with its "
-        "reason; a new compiler gets a DriverRows row. What this check does not cover is listed in its header.")
+        "${remedy}")
 endif()
