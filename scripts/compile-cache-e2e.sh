@@ -36,6 +36,11 @@
 #                           every one of them, and an empty manifest validates
 #                           against anything: an edited header served the previous
 #                           object under a zero exit code, permanently.
+#   2c. Dropped object    — the operator's repair after 2b names a wrong object: the
+#                           key is dropped over CACHE-DROP while its direct-mode
+#                           manifest stands. The next compile must MISS, recompile
+#                           and store, and the one after must HIT (#1276). Runs with
+#                           2b, so it needs --testclient.
 #
 # The PowerShell counterpart (src/apps/fastcache-cc/run-launcher-e2e.ps1) asserts
 # the same contract against cl / clang-cl on Windows — except case 7, which has no
@@ -269,12 +274,71 @@ EOF
         || fail "verification left its scratch copy in the build tree"
     echo "   the wrong object was named, and the freshly compiled one was used"
 
-    # The entry is deliberately NOT repaired, here or by the launcher: which side
-    # of the disagreement is wrong is not knowable from one machine, and a
-    # launcher that overwrote the fleet's entry from a host whose own environment
-    # is the anomaly would turn one bad build into everyone's. Nothing below
-    # fetches this key -- the two later compiles of the same source run with an
-    # unreachable daemon and with `-coverage`, which keys differently.
+    # --- 2c: the operator removes the wrong object; its manifest stays (#1276) ---
+    # The repair the case above leaves to a person: `FASTCACHE_VERIFY` named the key,
+    # and CACHE-DROP takes that key away. What must follow is a MISS and a recompile,
+    # never a wrong or a failed build -- and the load-bearing part is that the
+    # launcher's direct-mode MANIFEST still stands, pointing at the key that is now
+    # gone. `ValidateManifest` asserts the dependencies and never that the object
+    # exists, so a launcher that trusted a validated manifest to have an object behind
+    # it is exactly what this state would catch.
+    #
+    # The manifest's presence is ASSERTED before the recompile, because without it the
+    # case would exercise the other direction -- no manifest, an ordinary miss -- and
+    # pass while proving nothing about this one.
+    echo "== a dropped object whose manifest stands must recompile, then hit again =="
+    manifest_keys="$(sed -n 's/^fastcache-cc: MANIFEST stored key=\([^ ]*\).*/\1/p' "${workdir}/miss.log")"
+    manifest_key="${manifest_keys%%$'\n'*}"
+    [[ -n "$manifest_key" ]] || fail "could not read the manifest key out of the first compile's trace"
+
+    # `|| drop_rc=$?`, never a bare `$?` on the next line: this script runs under `set -e`,
+    # so the miss below -- exit 4, an ANSWER -- would end the whole run before it was read.
+    drop_rc=0
+    "$testclient" drop --host 127.0.0.1 --port "$port" --key "$planted_key" > "${workdir}/drop-1.log" 2>&1 || drop_rc=$?
+    [[ "$drop_rc" -eq 0 ]] || { cat "${workdir}/drop-1.log" >&2; fail "dropping the planted key exited ${drop_rc}, not 0"; }
+    grep -q "DROP ok key=${planted_key}" "${workdir}/drop-1.log" || fail "the drop did not report removing the key"
+
+    # A second drop is a MISS, which is an answer: exit 4, never a refusal.
+    drop_rc=0
+    "$testclient" drop --host 127.0.0.1 --port "$port" --key "$planted_key" > "${workdir}/drop-2.log" 2>&1 || drop_rc=$?
+    [[ "$drop_rc" -eq 4 ]] || { cat "${workdir}/drop-2.log" >&2; fail "a second drop exited ${drop_rc}, not 4 (a miss)"; }
+
+    manifest_rc=0
+    "$testclient" fetch --host 127.0.0.1 --port "$port" --key "$manifest_key" \
+        --srcroot "$proj" --buildtree "${proj}/build" > "${workdir}/manifest-fetch.log" 2>&1 || manifest_rc=$?
+    # Present means SERVED -- exit 0 and its own line -- rather than "not a miss": a socket
+    # failure also exits non-4, and would otherwise read as a manifest that is there.
+    [[ "$manifest_rc" -eq 0 ]] && grep -q "FETCH ok key=${manifest_key}" "${workdir}/manifest-fetch.log" \
+        || { cat "${workdir}/manifest-fetch.log" >&2; fail "the manifest was not served (exit ${manifest_rc}), so the recompile below would not exercise a manifest without its object"; }
+
+    rm -f "${proj}/build/a.o" "${proj}/build/a.d"
+    "$launcher" "$compiler" -std=c++23 -MD -MF "${proj}/build/a.d" -c "${proj}/a.cpp" -o "${proj}/build/a.o" \
+        2> "${workdir}/dropped.log" \
+        || { cat "${workdir}/dropped.log" >&2; fail "the compile after the drop returned non-zero"; }
+    grep '^fastcache-cc:' "${workdir}/dropped.log" || true
+    if grep -q "fastcache-cc: HIT" "${workdir}/dropped.log"; then
+        fail "the compile after the drop was served from the cache, so the drop removed nothing a fetch reads"
+    fi
+    grep -q "STORED key=${planted_key}" "${workdir}/dropped.log" \
+        || fail "the compile after the drop did not store a fresh object under the dropped key"
+    cmp "${workdir}/expected.o" "${proj}/build/a.o" || fail "the recompiled object differs from the one compiled first"
+
+    rm -f "${proj}/build/a.o" "${proj}/build/a.d"
+    "$launcher" "$compiler" -std=c++23 -MD -MF "${proj}/build/a.d" -c "${proj}/a.cpp" -o "${proj}/build/a.o" \
+        2> "${workdir}/redropped-hit.log" \
+        || { cat "${workdir}/redropped-hit.log" >&2; fail "the compile after the repair returned non-zero"; }
+    grep -q "fastcache-cc: HIT" "${workdir}/redropped-hit.log" \
+        || fail "the compile after the repair was not served, so the repair left the cache cold"
+    cmp "${workdir}/expected.o" "${proj}/build/a.o" || fail "the repaired entry serves a different object"
+    echo "   the manifest outlived its object, the launcher recompiled, and the repaired entry hits"
+
+    # The entry is deliberately NOT repaired by the LAUNCHER: which side of the
+    # disagreement is wrong is not knowable from one machine, and a launcher that
+    # overwrote the fleet's entry from a host whose own environment is the anomaly
+    # would turn one bad build into everyone's. A person decides, and 2c above is what
+    # that person's repair does. Nothing below fetches this key -- the two later
+    # compiles of the same source run with an unreachable daemon and with `-coverage`,
+    # which keys differently.
     rm -f "${proj}/build/a.o" "${proj}/build/a.d" "${proj}/wrong.cpp"
 else
     # Said out loud rather than skipped in silence: FASTCACHED_BUILD_TESTCLIENT is
