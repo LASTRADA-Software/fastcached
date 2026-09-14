@@ -36,7 +36,7 @@ namespace
 
     /// How many rows `AppendStorageMetrics` emits, for the one `reserve`.
     /// A loose estimate by design — it only sizes a buffer.
-    constexpr std::size_t StorageMetricCount = 24;
+    constexpr std::size_t StorageMetricCount = 25;
 
     /// Append one metric's three exposition lines to `out`.
     /// @param out Destination.
@@ -247,6 +247,10 @@ static void AppendStorageMetrics(std::string& out, StorageStats const& stats)
                  .help = "Entries that expired before ever being read.",
                  .type = Counter,
                  .value = stats.expiredUnfetched },
+        Metric { .name = "fastcached_expirations_total",
+                 .help = "Entries removed because their TTL lapsed, by a lookup, a write or the expiry cycle.",
+                 .type = Counter,
+                 .value = stats.expirations },
         Metric { .name = "fastcached_items",
                  .help = "Live entries currently stored.",
                  .type = Gauge,

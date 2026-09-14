@@ -465,7 +465,7 @@ TEST_CASE("a piped cache and node stream name exactly the figures their panels d
                                         "connections_accepted",
                                         "evictions_per_sec",
                                         "evicted_unfetched_per_sec",
-                                        "reclaimed_per_sec",
+                                        "expired_per_sec",
                                         "expired_unfetched_per_sec",
                                         "items",
                                         "bytes_used",

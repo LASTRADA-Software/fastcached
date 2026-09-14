@@ -115,6 +115,7 @@ namespace StatsReadingWire
         Field<StorageStats, std::uint64_t> { .name = "casBadval", .member = &StorageStats::casBadval },
         Field<StorageStats, std::uint64_t> { .name = "evictedUnfetched", .member = &StorageStats::evictedUnfetched },
         Field<StorageStats, std::uint64_t> { .name = "expiredUnfetched", .member = &StorageStats::expiredUnfetched },
+        Field<StorageStats, std::uint64_t> { .name = "expirations", .member = &StorageStats::expirations },
         Field<StorageStats, std::uint64_t> { .name = "writeErrors", .member = &StorageStats::writeErrors },
     };
 
