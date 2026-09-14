@@ -26,7 +26,8 @@ sent. A loud, immediate, named refusal is the better failure.
 
 Version 9 is such a step: it adds the live-stats stream `fastcache-cli live-stats`
 subscribes to ([#1399](https://github.com/LASTRADA-Software/fastcached/issues/1399)), and
-every node, every `fastcache-cc` and every `fastcache-cli` has to move to it together.
+every node, every `fastcached` serving `0xFC`, every `fastcache-cc` and every
+`fastcache-cli` has to move to it together.
 
 What makes it a *fleet* problem rather than a daemon problem is that a fleet has more
 than one process. A cache daemon is upgraded, restarted, and done; twenty nodes cannot
