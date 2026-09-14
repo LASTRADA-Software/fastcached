@@ -1451,8 +1451,15 @@ void AdoptAllowlist(Cc::CompileJobRunner& jobs,
     // must report NO cache rather than an empty one, and that branch has to be
     // reachable from a test. Held in a local because the sampler and the scrape
     // surface both read it, and they must not disagree about the machine.
+    //
+    // The load source is the snapshot's own and holds no baseline, so the scrape, the
+    // sampler and every live subscription read the same raw counters without taking an
+    // interval from the heartbeat's sampler, which owns a separate one. No scratch root:
+    // the free space a snapshot reports is `host`'s, on the same filesystem.
+    auto const scrapeLoad = MakeSystemCounterSource();
     auto snapshotProvider = Node::MakeNodeSnapshotProvider(
         Node::NodeScrapeSources { .host = host.get(),
+                                  .load = scrapeLoad.get(),
                                   .busySlots = [&compileCapacity] { return compileCapacity.InFlight(); },
                                   .cache = cacheTier.get(),
                                   .slots = slots,

@@ -12,6 +12,7 @@
 #include <FastCache/Metrics/PrometheusFormatter.hpp>
 #include <FastCache/Net/BlockingSocket.hpp>
 #include <FastCache/Platform/HostInfo.hpp>
+#include <FastCache/Platform/HostLoad.hpp>
 #include <FastCache/Server/AdminCredential.hpp>
 #include <FastCache/Server/AdminHttpServer.hpp>
 
@@ -66,6 +67,15 @@ struct NodeScrapeSources
     /// The same source the advertised capacity came from, so a scrape and a
     /// registration cannot disagree about the machine they describe.
     IHostFactsSource const* host {};
+    /// Where the machine's moving figures come from -- CPU counters and available memory --
+    /// or **null** for a snapshot that carries no load.
+    ///
+    /// A counter source rather than an `IHostLoadSampler`, and that is the whole design: a
+    /// sampler holds the previous CPU reading, so the scrape, every live subscription and the
+    /// heartbeat would each see the interval the last of them left. The raw counters travel
+    /// instead and every reader differences its own two readings (`HostLoadReading`). Its
+    /// own instance, never the heartbeat sampler's source, which that sampler owns.
+    IHostCounterSource* load {};
     /// How many compiles are running right now.
     ///
     /// A callable rather than a `WorkerServer const*`, and the reason is testing

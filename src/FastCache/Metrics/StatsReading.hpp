@@ -5,6 +5,7 @@
 #include <FastCache/Consensus/RaftTypes.hpp>
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
+#include <FastCache/Platform/HostLoad.hpp>
 
 #include <chrono>
 #include <cstddef>
@@ -57,6 +58,33 @@ struct HostCapacity
     std::size_t busySlots { 0 };
 
     [[nodiscard]] bool operator==(HostCapacity const&) const = default;
+};
+
+/// What a machine is doing right now, in the form every consumer can difference itself.
+///
+/// The moving half of `HostCapacity`, and a block of its own rather than more fields there,
+/// because every field here can be absent where every field there cannot: a platform that
+/// will not report its CPU leaves `cpu` disengaged, and that is a different claim from an
+/// idle machine (`HostLoad` argues it at length).
+///
+/// **CPU travels as the raw cumulative counters, never as a utilization.** A utilization is
+/// the difference between two readings, so something has to hold the earlier one -- and a
+/// node serving `/metrics`, several live subscriptions and its own heartbeat would have them
+/// cutting each other's intervals, each seeing whatever slice the last reader left. Raw
+/// counters leave the baseline with the reader: `CpuBusyPermille(previous.cpu, now.cpu)` over
+/// two readings it holds itself, which is the rule a history already follows (a counter is
+/// stored raw; the rate is taken at render).
+///
+/// Free scratch space is not here: `HostCapacity::diskFreeBytes` already reads the scratch
+/// filesystem, and a second figure for one fact is a second thing to be wrong.
+struct HostLoadReading
+{
+    /// The machine's cumulative CPU counters, or absent when the platform would not say.
+    std::optional<CpuTicks> cpu {};
+    /// Memory a new process could actually obtain, or absent when the platform would not say.
+    std::optional<std::uint64_t> availableMemoryBytes {};
+
+    [[nodiscard]] bool operator==(HostLoadReading const&) const = default;
 };
 
 /// What a node believes about its OWN consensus configuration.
@@ -170,6 +198,14 @@ struct MetricsSnapshot
     /// daemon leaves it absent: it is not a compile node, and reporting cores it
     /// does not schedule against would be noise.
     std::optional<HostCapacity> host;
+    /// What this machine is doing right now, absent when the process samples no load.
+    ///
+    /// Absent for the daemon for the reason `host` is, and present on a compile node -- whose
+    /// available slots are decided by exactly these figures (`Distributed::SlotCeilingsFor`),
+    /// so a dashboard that could not see them could name no reason a node offers fewer slots
+    /// than it registered. Each figure inside is absent on its own when the platform would not
+    /// report it. See `HostLoadReading`.
+    std::optional<HostLoadReading> hostLoad {};
 
     /// Whether this node has a shared cache to read through to, absent when the
     /// question does not apply.

@@ -673,7 +673,10 @@ The worker also reports what the machine **is** — `fastcache_node_logical_core
 `fastcache_node_memory_total_bytes`, `fastcache_node_disk_capacity_bytes`,
 `fastcache_node_disk_free_bytes`, `fastcache_node_slots_configured` and
 `fastcache_node_slots_busy`. Those are gauges: "is this node pulling its weight"
-is not answerable without knowing how big it is.
+is not answerable without knowing how big it is. Beside them is what the machine is
+**doing** — `fastcache_node_memory_available_bytes`, and the CPU as two tick counters,
+`fastcache_node_cpu_busy_ticks_total` over `fastcache_node_cpu_ticks_total`, whose rates
+divide into the busy share.
 
 And what its **cache tier** is doing — `fastcache_node_cache_hits_total` and
 `..._misses_total` for the tier itself, `..._upstream_hits_total` for what the
