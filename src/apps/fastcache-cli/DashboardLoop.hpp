@@ -127,6 +127,39 @@ template <auto Member>
     } };
 }
 
+/// The figure one of the machine's cumulative CPU counters reads.
+///
+/// A counter in platform ticks, so it means nothing alone: a panel takes the RATE of busy over the rate of all ticks
+/// (`FigureSource::RateQuotient`), the same share `CpuBusyPermille` takes over two readings.
+/// @tparam Member `CpuTicks::busy` or `CpuTicks::total`.
+/// @return The field.
+template <auto Member>
+    requires std::is_member_object_pointer_v<decltype(Member)>
+[[nodiscard]] constexpr ReadingField CpuTicksField() noexcept
+{
+    return ReadingField { .read = [](StatsReading const& reading, std::optional<StorageTier> /*tier*/) noexcept {
+        auto const& load = reading.snapshot.hostLoad;
+        return load.has_value() && load->cpu.has_value() ? std::optional { static_cast<double>((*load->cpu).*Member) }
+                                                         : std::nullopt;
+    } };
+}
+
+/// The figure one field of what the machine is doing reads, each absent on its own where the platform did not say.
+/// @tparam Member A `std::optional` member of `HostLoadReading` other than the CPU counters.
+/// @return The field.
+template <auto Member>
+    requires std::is_member_object_pointer_v<decltype(Member)>
+[[nodiscard]] constexpr ReadingField HostLoadField() noexcept
+{
+    return ReadingField { .read = [](StatsReading const& reading, std::optional<StorageTier> /*tier*/) noexcept {
+        auto const& load = reading.snapshot.hostLoad;
+        if (!load.has_value())
+            return std::optional<double> {};
+        auto const& value = (*load).*Member;
+        return value.has_value() ? std::optional { static_cast<double>(*value) } : std::nullopt;
+    } };
+}
+
 /// One point of the dashboard's sample history: a reading, or the fact that there was none.
 ///
 /// **A failed sample is an entry, not a missing one.** The gap is the information: a history

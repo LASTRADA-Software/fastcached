@@ -47,11 +47,13 @@ namespace FastCache::Cli
 /// TRANSMITTED/PERSISTED: no. Private; enumerators may be inserted.
 enum class FigureSource : std::uint8_t
 {
-    Level,        ///< `field` as read. A reading of now.
-    LevelRatio,   ///< `field / (field + other)` as read: a since-start proportion.
-    Rate,         ///< How fast `field` rose, plus how fast `other` rose when `other` is named.
-    RateRatio,    ///< `rate(field) / (rate(field) + rate(other))`: a proportion over each interval.
-    RateQuotient, ///< `rate(field) / rate(other)`: a `_sum` over its `_count`, over each interval.
+    Level,          ///< `field` as read. A reading of now.
+    LevelRatio,     ///< `field / (field + other)` as read: a since-start proportion.
+    Rate,           ///< How fast `field` rose, plus how fast `other` rose when `other` is named.
+    RateRatio,      ///< `rate(field) / (rate(field) + rate(other))`: a proportion over each interval.
+    RateQuotient,   ///< `rate(field) / rate(other)`: a `_sum` over its `_count`, over each interval.
+    LevelQuotient,  ///< `field / other` as read: a fill against its limit, absent for a limit of zero (unbounded).
+    SlotsAvailable, ///< What a node may hold now: the scheduler's slot ceilings over each reading and the one before.
     Last,
 };
 
@@ -100,11 +102,16 @@ enum class Priority : std::uint8_t
 /// A figure written beside a row's own, with words around it.
 struct BesideFigure
 {
-    std::string_view key;                   ///< Its machine name; see `PanelKeysAreWhole`.
-    std::string_view before {};             ///< Words before the value.
-    FigureSpec figure {};                   ///< The value.
-    std::string_view after {};              ///< Words after the value.
+    std::string_view key;       ///< Its machine name; see `PanelKeysAreWhole`.
+    std::string_view before {}; ///< Words before the value.
+    FigureSpec figure {};       ///< The value.
+    std::string_view after {};  ///< Words after the value.
+    /// What stands before it on a fact line when it is not the line's first figure; empty for the gap between
+    /// figures. A single space joins it to the figure before, as `/ 8.00 GiB` continues `2.00 GiB`.
+    std::string_view lead {};
     Priority priority { Priority::Normal }; ///< When it is dropped for width.
+    /// Whether a fact line draws a gauge of the value before it: the value is a share of something whole.
+    bool gauge { false };
 };
 
 /// Whether a row draws its series as a sparkline.
