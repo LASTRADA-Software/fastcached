@@ -109,6 +109,44 @@ namespace
         return CounterRateSeries(history, field, tier);
     }
 
+    /// The node's slots at history entry @p index, its CPU differenced against the entry before when the two are adjacent.
+    ///
+    /// Adjacent is the fold's decision (`HistoryEntry::elapsed`), never re-derived here: a gap, a failure or a change
+    /// of source between the two leaves the CPU, and so the ceilings, unknown.
+    /// @param history The samples, oldest first.
+    /// @param index Which entry.
+    /// @return The slots, or nullopt for an entry with no reading or a reading carrying no host.
+    [[nodiscard]] std::optional<NodeSlots> SlotsAt(std::deque<HistoryEntry> const& history, std::size_t index)
+    {
+        auto const& entry = history[index];
+        auto const& now = entry.stats;
+        if (!now.has_value())
+            return std::nullopt;
+        auto const* previous = static_cast<StatsReading const*>(nullptr);
+        if (entry.elapsed.has_value() && index > 0)
+        {
+            auto const& before = history[index - 1].stats;
+            if (before.has_value())
+                previous = &*before;
+        }
+        return NodeSlotsOf(previous, *now);
+    }
+
+    /// What the node may hold at each entry: `Distributed::SlotCeilingsFor`'s `available`, absent where it cannot be known.
+    /// @param history The samples, oldest first.
+    /// @return One value per entry.
+    [[nodiscard]] Series AvailableSlots(std::deque<HistoryEntry> const& history)
+    {
+        auto series = Series(history.size());
+        for (auto const index: std::views::iota(std::size_t { 0 }, history.size()))
+        {
+            auto const slots = SlotsAt(history, index);
+            if (slots.has_value() && slots->ceilings.has_value())
+                series[index] = static_cast<double>(slots->ceilings->available);
+        }
+        return series;
+    }
+
     /// How one `FigureSource` is computed.
     struct FigureSourceSpec
     {
@@ -165,6 +203,19 @@ namespace
                  std::optional<StorageTier> tier) {
                   return Pairwise(Rates(history, field, tier), Rates(history, other, tier), &Quotient);
               } },
+        { .source = FigureSource::LevelQuotient,
+          .compute =
+              [](std::deque<HistoryEntry> const& history,
+                 ReadingField field,
+                 ReadingField other,
+                 std::optional<StorageTier> tier) {
+                  return Pairwise(Levels(history, field, tier), Levels(history, other, tier), &Quotient);
+              } },
+        { .source = FigureSource::SlotsAvailable,
+          .compute = [](std::deque<HistoryEntry> const& history,
+                        ReadingField /*field*/,
+                        ReadingField /*other*/,
+                        std::optional<StorageTier> /*tier*/) { return AvailableSlots(history); } },
     } };
 
     static_assert(RowsInEnumeratorOrder(FigureSourceTable, &FigureSourceSpec::source),
@@ -1087,37 +1138,13 @@ namespace
         return share < 2.0 / 3.0 ? FrameTone::LevelMid : FrameTone::LevelHigh;
     }
 
-    /// The node's slots at its newest reading, its CPU differenced against the reading before when the two are adjacent.
-    ///
-    /// Adjacent is the fold's decision (`HistoryEntry::elapsed`), never re-derived here: a gap, a failure or a
-    /// change of source between the two leaves the CPU, and so the ceilings, unknown.
+    /// The node's slots at its newest entry: the ones the slots fact's figures are the newest cells of.
     /// @param in The frame's inputs.
-    /// @return The slots, or nullopt before a reading carrying a host.
+    /// @return The slots, or nullopt when the newest entry holds no reading carrying a host.
     [[nodiscard]] std::optional<NodeSlots> NewestSlots(FrameInputs const& in)
     {
         auto const& history = in.model->history;
-        if (history.empty() || !history.back().stats.has_value())
-            return in.model->stats.has_value() ? NodeSlotsOf(nullptr, *in.model->stats) : std::nullopt;
-        auto const& newest = history.back();
-        auto const& latest = newest.stats;
-        auto const* previous = static_cast<StatsReading const*>(nullptr);
-        if (newest.elapsed.has_value() && history.size() >= 2)
-        {
-            auto const& before = history[history.size() - 2].stats;
-            if (before.has_value())
-                previous = &*before;
-        }
-        return latest.has_value() ? NodeSlotsOf(previous, *latest) : std::nullopt;
-    }
-
-    /// @p value as a figure piece of a fact line: essential, and plain like every figure written beside a fact.
-    /// @param in The frame's inputs.
-    /// @param value The number, or nullopt for the marker.
-    /// @param format How it is written.
-    /// @return The piece.
-    [[nodiscard]] Piece FactFigure(FrameInputs const& in, std::optional<double> value, FigureFormat format)
-    {
-        return Piece { .text = FormatFigure(value, format, in.absent), .priority = Priority::Essential };
+        return history.empty() ? std::nullopt : SlotsAt(history, history.size() - 1);
     }
 
     /// @p text as a piece of a fact line, essential and plain.
@@ -1126,39 +1153,6 @@ namespace
     [[nodiscard]] Piece FactWords(std::string text)
     {
         return Piece { .text = std::move(text), .priority = Priority::Essential };
-    }
-
-    /// The three numbers a slots fact states.
-    struct SlotNumbers
-    {
-        std::optional<double> inFlight {};   ///< Compiles running.
-        std::optional<double> available {};  ///< What the node may hold now; absent until the ceilings are known.
-        std::optional<double> registered {}; ///< What it registered with.
-    };
-
-    /// The numbers a slots fact states: the reading's when there is one, since the ceilings are worked out from that
-    /// same reading; a status alone gives the two it states, and `available` stays the marker until a reading says more.
-    /// @param slots The newest reading's slots, or nullopt.
-    /// @param status The newest status, or nullptr.
-    /// @return The numbers.
-    [[nodiscard]] SlotNumbers SlotNumbersOf(std::optional<NodeSlots> const& slots,
-                                            CompileCacheWire::NodeStatusFields const* status) noexcept
-    {
-        auto const count = [](std::uint32_t value) {
-            return std::optional { static_cast<double>(value) };
-        };
-        if (slots.has_value())
-            return SlotNumbers { .inFlight = count(slots->inFlight),
-                                 .available = slots->ceilings.has_value() ? count(slots->ceilings->available) : std::nullopt,
-                                 .registered = count(slots->registered) };
-        auto numbers = SlotNumbers {};
-        if (status == nullptr)
-            return numbers;
-        if (status->runtime.compilesInFlight.has_value())
-            numbers.inFlight = count(*status->runtime.compilesInFlight);
-        if (status->runtime.compileSlots.has_value())
-            numbers.registered = count(*status->runtime.compileSlots);
-        return numbers;
     }
 
     /// The line under a slots fact: the gauge, when it fits, and the limit that binds, or the marker while none is known.
@@ -1200,6 +1194,40 @@ namespace
         }
         line.push_back(Piece { .text = name, .priority = Priority::Essential, .tone = dress.tone });
         return line;
+    }
+
+    /// A fact cell's figures laid out as one line: each with its words, joined by its own lead, a gauge before a share.
+    ///
+    /// **The numbers a fact line states are its cell's figures**, the same series a piped stream writes under their
+    /// keys, so a figure on the screen and the column a script reads cannot disagree. The first figure is essential;
+    /// a gauge goes before the others do.
+    /// @param in The frame's inputs.
+    /// @param cell The cell.
+    /// @return The line.
+    [[nodiscard]] FactText FactFigures(FrameInputs const& in, FactCell const& cell)
+    {
+        auto fact = FactText {};
+        for (auto const& figure: cell.figures)
+        {
+            // The first figure starts the line; a later one is joined by its own lead, or by the gap between figures.
+            auto lead = figure.lead.empty() ? PieceGap : figure.lead;
+            if (fact.pieces.empty())
+                lead = {};
+            if (figure.gauge)
+            {
+                if (auto const share = Newest(SeriesFor(in, figure.figure, {})); share.has_value() && std::isfinite(*share))
+                {
+                    fact.pieces.push_back(Piece { .text = std::string { lead } + Gauge(*share, FactGaugeCells, *in.glyphs),
+                                                  .priority = Priority::Low });
+                    lead = FactGap;
+                }
+            }
+            auto piece = Led(lead, BesidePiece(in, figure));
+            if (fact.pieces.empty())
+                piece.priority = Priority::Essential;
+            fact.pieces.push_back(std::move(piece));
+        }
+        return fact;
     }
 
     /// What a leading node's `leader` reads: it names no endpoint because it is the leader.
@@ -1286,22 +1314,16 @@ namespace
               return Said(std::string { in.absent });
           } },
         { .fact = StatusFact::Slots,
-          .render = [](FrameInputs const& in, FactCell const& /*cell*/, std::size_t width) -> std::optional<FactText> {
+          .render = [](FrameInputs const& in, FactCell const& cell, std::size_t width) -> std::optional<FactText> {
               // A node whose status says it runs no worker has no slots to draw.
               auto const* status = StatusOf(in);
               if (status != nullptr && !status->runtime.compileSlots.has_value())
                   return std::nullopt;
+              auto fact = FactFigures(in, cell);
+
+              // Under the numbers: the gauge and the limit, off the same newest entry the `available` figure is.
               auto const slots = NewestSlots(in);
-              if (status == nullptr && !slots.has_value())
-                  return Said(std::string { in.absent });
-
-              auto const numbers = SlotNumbersOf(slots, status);
-              auto fact = FactText {};
-              fact.pieces = { FactFigure(in, numbers.inFlight, FigureFormat::Count),   FactWords(" in flight / "),
-                              FactFigure(in, numbers.available, FigureFormat::Count),  FactWords(" available / "),
-                              FactFigure(in, numbers.registered, FigureFormat::Count), FactWords(" registered") };
               fact.more.push_back(SlotLimitLine(in, slots, width));
-
               // What to do about the limit, in `SlotLimitTable`'s own words, wrapped under the gauge.
               auto const ceilings = slots.has_value() ? slots->ceilings : std::nullopt;
               if (ceilings.has_value() && SlotLimitDressTable[static_cast<std::size_t>(ceilings->binding)].remedy)
@@ -1314,58 +1336,15 @@ namespace
           } },
         { .fact = StatusFact::CacheTier,
           .render = [](FrameInputs const& in, FactCell const& cell, std::size_t /*width*/) -> std::optional<FactText> {
+              // Only on a node that runs a tier: a line of markers for a tier that does not exist would be a claim.
               auto const* status = StatusOf(in);
               if (status == nullptr || (status->components & CompileCacheWire::NodeComponentBit::CacheTier) == 0)
                   return std::nullopt;
-              auto fact = FactText {};
-              for (auto const& figure: cell.figures)
-              {
-                  auto piece = Led(fact.pieces.empty() ? std::string_view {} : PieceGap, BesidePiece(in, figure));
-                  if (fact.pieces.empty())
-                      piece.priority = Priority::Essential;
-                  fact.pieces.push_back(std::move(piece));
-              }
-              // How full the tier is, off the newest reading's cache: used / limit, the gauge and its share. A limit of
-              // zero is `InMemoryLruStorage`'s spelling of UNBOUNDED, so there is no share to draw, and no gauge.
-              auto const& storage = in.model->stats.has_value() ? in.model->stats->snapshot.storage : std::nullopt;
-              auto const used = storage.transform([](StorageStats const& s) { return static_cast<double>(s.bytesUsed); });
-              auto const limit = storage.transform([](StorageStats const& s) { return static_cast<double>(s.bytesLimit); });
-              auto const share = used.has_value() && limit.has_value() ? Quotient(*used, *limit) : std::nullopt;
-              fact.pieces.push_back(Piece { .text = std::string { PieceGap }
-                                                    + FormatFigure(used, FigureFormat::Bytes, in.absent) + " / "
-                                                    + FormatFigure(limit, FigureFormat::Bytes, in.absent),
-                                            .priority = Priority::Normal });
-              if (share.has_value())
-                  fact.pieces.push_back(Piece { .text = std::string { FactGap } + Gauge(*share, FactGaugeCells, *in.glyphs),
-                                                .priority = Priority::Low });
-              fact.pieces.push_back(
-                  Piece { .text = std::string { FactGap } + FormatFigure(share, FigureFormat::Percent, in.absent),
-                          .priority = Priority::Normal });
-              return fact;
+              return FactFigures(in, cell);
           } },
         { .fact = StatusFact::Host,
           .render = [](FrameInputs const& in, FactCell const& cell, std::size_t /*width*/) -> std::optional<FactText> {
-              // CPU busy is the share between the two newest adjacent readings, and memory free is the newest reading's
-              // own: the figures the slot ceilings above are worked out from, so the two lines cannot disagree.
-              auto const slots = NewestSlots(in);
-              auto const busy = slots.has_value() ? slots->cpuBusyPermille : std::nullopt;
-              auto const memory = slots.has_value() ? slots->availableMemoryBytes : std::nullopt;
-              auto fact = FactText {};
-              fact.pieces.push_back(
-                  Piece { .text = "cpu-busy "
-                                  + FormatFigure(busy.transform([](std::uint32_t permille) { return permille / 1000.0; }),
-                                                 FigureFormat::Percent,
-                                                 in.absent),
-                          .priority = Priority::Essential });
-              fact.pieces.push_back(Piece {
-                  .text = std::string { PieceGap } + "mem free "
-                          + FormatFigure(memory.transform([](std::uint64_t bytes) { return static_cast<double>(bytes); }),
-                                         FigureFormat::Bytes,
-                                         in.absent),
-                  .priority = Priority::Normal });
-              for (auto const& figure: cell.figures)
-                  fact.pieces.push_back(Led(PieceGap, BesidePiece(in, figure)));
-              return fact;
+              return FactFigures(in, cell);
           } },
     } };
 
