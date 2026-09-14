@@ -1595,6 +1595,38 @@ set_tests_properties("clang-format-version-selftest" PROPERTIES
     TIMEOUT 120
 )
 
+# `.clang-tidy-version` names the ONE clang-tidy build both tidy jobs and the local gate judge
+# with -- an exact PyPI release, because apt's `clang-tidy-<major>` names a family of snapshots
+# that print one banner and disagree about findings (#1404, #1198). This refuses a declaration
+# that is not an exact release, names another package, or has a major other than
+# `CLANG_TOOLS_VERSION`'s. Needs no analyser, so it is in the default set.
+#
+# Whether an INSTALLED analyser is that build is the `--installed` mode -- its wheel's METADATA
+# version and the binary's sha256 against RECORD -- and deliberately not a ctest: only the two
+# tidy jobs and the gate have the analyser, so a registration would skip everywhere (#1135).
+add_test(
+    NAME "clang-tidy-version"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-clang-tidy-version.sh" "${CMAKE_SOURCE_DIR}"
+)
+set_tests_properties("clang-tidy-version" PROPERTIES
+    LABELS "hygiene"
+    TIMEOUT 120
+)
+
+# Both directions over synthetic wheel layouts: the declared wheel accepted (and its Windows
+# binary name), and refused -- another release, a binary whose bytes are not the ones RECORD
+# lists, the wheel's binary copied out of its tree, a distribution's analyser, nothing installed.
+# Shown to bite: disarming the digest, version, layout, pin or no-fallback clause each reddens
+# exactly its own case.
+add_test(
+    NAME "clang-tidy-version-selftest"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-clang-tidy-version.sh" --self-test "${CMAKE_SOURCE_DIR}"
+)
+set_tests_properties("clang-tidy-version-selftest" PROPERTIES
+    LABELS "hygiene"
+    TIMEOUT 120
+)
+
 add_test(
     NAME "script-modes"
     COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-script-modes.sh"

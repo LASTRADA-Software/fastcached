@@ -1,0 +1,15 @@
+# The clang-tidy BUILD this tree is judged with -- by the `clang-tidy` and `clang-tidy-windows` jobs and by
+# local-gate.sh -- as one exact, installable release rather than a major (#1404).
+#
+# A PyPI wheel, not apt.llvm.org's `clang-tidy-<major>`. apt ships rolling snapshots under one version number and keeps
+# only the newest, and `clang-tidy --version` prints the same banner for every one of them. So a major names a family
+# of analysers that disagree: two snapshots a month apart disagreed on 19 findings in one file (#1198). A PyPI release
+# is immutable, and the same release installs on Linux, macOS and Windows.
+#
+# A binary counts as this build only when it sits in an installed `clang-tidy` wheel whose METADATA says this version
+# AND whose RECORD holds the binary's sha256 -- `scripts/check-clang-tidy-version.sh --installed <exe>`. Install it with
+#     python3 -m pip install --target <dir> "$(bash scripts/check-clang-tidy-version.sh --requirement)"
+# and use <dir>/clang_tidy/data/bin/clang-tidy (`--locate <dir>` prints it). The major is held to CLANG_TOOLS_VERSION
+# in .github/workflows/build.yml by `ctest -R clang-tidy-version`.
+package: clang-tidy
+version: 22.1.8
