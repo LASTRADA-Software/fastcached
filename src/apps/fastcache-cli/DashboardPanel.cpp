@@ -300,17 +300,17 @@ namespace
         return series.empty() ? std::nullopt : series.back();
     }
 
-    /// One figure's text, with its suffix when it is present.
+    /// One figure written, its suffix part of its unit when it is present: `41` and `/s`.
     /// @param in The frame's inputs.
     /// @param figure The figure.
     /// @param value Its value.
-    /// @return The text.
-    [[nodiscard]] std::string FigureText(FrameInputs const& in, FigureSpec const& figure, std::optional<double> value)
+    /// @return The number and its unit.
+    [[nodiscard]] WrittenFigure FigureText(FrameInputs const& in, FigureSpec const& figure, std::optional<double> value)
     {
-        auto text = FormatFigure(value, figure.format, in.absent);
+        auto written = FormatFigure(value, figure.format, in.absent);
         if (value.has_value() && std::isfinite(*value))
-            text += figure.suffix;
-        return text;
+            written.unit += figure.suffix;
+        return written;
     }
 
     /// The newest @p cells of @p series, from the trend's first cell: a session younger than the trend
@@ -613,6 +613,23 @@ namespace
         return value.has_value() && std::isfinite(*value) ? otherwise : std::nullopt;
     }
 
+    /// @p figure written onto the end of @p piece, dressed as G1 says: its number as @p tone, and its unit, which
+    /// recedes, as a label. A figure with no tone -- the absent marker -- is written plain, unit and all.
+    /// @param piece The piece.
+    /// @param figure The figure.
+    /// @param tone How its number is dressed.
+    void AppendFigure(Piece& piece, WrittenFigure const& figure, std::optional<FrameTone> tone)
+    {
+        if (tone.has_value() && !figure.number.empty())
+            piece.runs.push_back(PieceRun { .byte = piece.text.size(), .length = figure.number.size(), .tone = *tone });
+        piece.text += figure.number;
+        auto const unit = figure.unit.find_first_not_of(' ');
+        if (tone.has_value() && unit != std::string::npos)
+            piece.runs.push_back(PieceRun {
+                .byte = piece.text.size() + unit, .length = figure.unit.size() - unit, .tone = FrameTone::Label });
+        piece.text += figure.unit;
+    }
+
     /// A figure written beside something else, with its words around it: `completed 12 884`.
     ///
     /// ONE piece, so the words and the value go for width together, dressed in runs as what each part is (G1):
@@ -635,7 +652,7 @@ namespace
             piece.text += ' ';
         }
         auto const value = Newest(SeriesFor(in, beside.figure, {}));
-        part(FigureText(in, beside.figure, value), FigureTone(beside.figure, value, FrameTone::Figure));
+        AppendFigure(piece, FigureText(in, beside.figure, value), FigureTone(beside.figure, value, FrameTone::Figure));
         if (!beside.after.empty())
         {
             piece.text += ' ';
@@ -762,13 +779,13 @@ namespace
         // One label column and one figure column for the whole block, so the trends line up; the figure column is
         // wide enough for its widest figure and a blank, so a figure is never cut and never touches its label.
         auto series = std::vector<Series> {};
-        auto figures = std::vector<std::string> {};
+        auto figures = std::vector<WrittenFigure> {};
         auto figureColumns = FigureColumns;
         for (auto const& row: rows)
         {
             series.push_back(SeriesFor(in, row.figure, {}));
             figures.push_back(FigureText(in, row.figure, Newest(series.back())));
-            figureColumns = std::max(figureColumns, in.cellWidth(figures.back()) + 1);
+            figureColumns = std::max(figureColumns, in.cellWidth(figures.back().Text()) + 1);
         }
         auto const labelColumns = RateLabelColumnsFor(rows, in.cellWidth);
 
@@ -790,10 +807,11 @@ namespace
                 Piece { .text = std::string { Indent } + FitRight(row.label, labelColumns, in.cellWidth),
                         .priority = Priority::Essential,
                         .tone = FrameTone::Label },
-                Piece { .text = AlignRight(figures[index], figureColumns, in.cellWidth),
-                        .priority = Priority::Essential,
-                        .tone = FigureTone(row.figure, Newest(series[index]), FrameTone::Figure) },
+                // Right-aligned into the figure column: the pad, then the number and its unit.
+                Piece { .text = std::string(figureColumns - in.cellWidth(figures[index].Text()), ' '),
+                        .priority = Priority::Essential },
             };
+            AppendFigure(pieces.back(), figures[index], FigureTone(row.figure, Newest(series[index]), FrameTone::Figure));
             if (drawsTrend && row.trend == Trend::Drawn)
                 pieces.push_back(Piece { .priority = row.trendPriority, .trend = true });
             for (auto const& beside: row.beside)
@@ -906,24 +924,22 @@ namespace
                 Piece { .text = std::string { Indent } + FitRight(row.label, labelColumns, in.cellWidth),
                         .priority = Priority::Essential,
                         .tone = FrameTone::Label },
-                Piece {
-                    .text = FigureText(in, row.value, value), .priority = Priority::Essential, .tone = FigureTone(value) },
+                Piece { .priority = Priority::Essential },
             };
+            AppendFigure(pieces.back(), FigureText(in, row.value, value), FigureTone(value));
             if (row.limit.has_value())
             {
                 auto const limit = Newest(SeriesFor(in, *row.limit, {}));
-                pieces.push_back(Piece { .text = " / " + FigureText(in, *row.limit, limit),
-                                         .priority = row.limitPriority,
-                                         .tone = FigureTone(limit) });
+                pieces.push_back(Piece { .text = " / ", .priority = row.limitPriority });
+                AppendFigure(pieces.back(), FigureText(in, *row.limit, limit), FigureTone(limit));
                 // A limit of zero is `InMemoryLruStorage`'s spelling of UNBOUNDED, so there is no
                 // proportion to draw -- and a gauge left empty would claim the store is idle.
                 auto const fraction = (value.has_value() && limit.has_value()) ? Quotient(*value, *limit) : std::nullopt;
                 if (fraction.has_value())
                     pieces.push_back(
                         Piece { .text = "  " + Gauge(*fraction, GaugeCells, *in.glyphs), .priority = row.gaugePriority });
-                pieces.push_back(Piece { .text = "  " + FormatFigure(fraction, FigureFormat::Percent, in.absent),
-                                         .priority = row.limitPriority,
-                                         .tone = FigureTone(fraction) });
+                pieces.push_back(Piece { .text = "  ", .priority = row.limitPriority });
+                AppendFigure(pieces.back(), FormatFigure(fraction, FigureFormat::Percent, in.absent), FigureTone(fraction));
             }
             if (!row.note.empty())
                 pieces.push_back(Piece {
@@ -958,15 +974,21 @@ namespace
 
         // Each column is as wide as its widest cell and the gap before it, so a figure is never cut to fit
         // the column and no two columns read as one: `evict/s index (RAM)` is three headings or two.
-        auto cells = std::vector<std::vector<std::string>>(tiers.size());
+        struct Cell
+        {
+            WrittenFigure figure;        ///< What it writes.
+            std::optional<double> value; ///< What it reads, so an absent one is not dressed.
+        };
+        auto cells = std::vector<std::vector<Cell>>(tiers.size());
         auto widths = std::vector<std::size_t> {};
         for (auto const& column: spec.tierColumns)
         {
             auto width = std::max(TierFigureColumns, in.cellWidth(column.header) + TierColumnGap);
             for (auto const index: std::views::iota(std::size_t { 0 }, tiers.size()))
             {
-                cells[index].push_back(FigureText(in, column.figure, Newest(SeriesFor(in, column.figure, tiers[index]))));
-                width = std::max(width, in.cellWidth(cells[index].back()) + TierColumnGap);
+                auto const value = Newest(SeriesFor(in, column.figure, tiers[index]));
+                cells[index].push_back(Cell { .figure = FigureText(in, column.figure, value), .value = value });
+                width = std::max(width, in.cellWidth(cells[index].back().figure.Text()) + TierColumnGap);
             }
             widths.push_back(width);
         }
@@ -984,29 +1006,26 @@ namespace
         if (!kept.has_value())
             return std::unexpected(kept.error());
 
-        // The heading is a line of pieces; a row is aligned under it cell by cell, so its runs are placed where
-        // each cell's text lands: the tier's name as a label, each figure as a figure, an absent one plain.
+        // The heading is a line of pieces, and so is each row under it, cell for kept cell: the tier's name as a
+        // label, each figure right-aligned into its column as a figure and its unit, an absent one plain.
         auto table = LineOf(*kept, {}, spec.tierPriority);
         table.table = true;
         for (auto const index: std::views::iota(std::size_t { 0 }, tiers.size()))
         {
-            auto const line = table.lines.size();
-            auto row = std::string { Indent };
-            table.spans.push_back(
-                LineSpan { .line = line, .byte = row.size(), .length = tiers[index].size(), .tone = FrameTone::Label });
-            row += FitRight(tiers[index], TierNameColumns, in.cellWidth);
+            auto row = std::vector<Piece> { Piece { .text = std::string { Indent }
+                                                            + FitRight(tiers[index], TierNameColumns, in.cellWidth),
+                                                    .tone = FrameTone::Label } };
             for (auto const& piece: *kept | std::views::drop(1))
             {
-                auto const& text = cells[index][piece.slot - 1];
-                auto const cell = AlignRight(text, widths[piece.slot - 1], in.cellWidth);
-                if (text != in.absent)
-                    table.spans.push_back(LineSpan { .line = line,
-                                                     .byte = row.size() + (cell.size() - text.size()),
-                                                     .length = text.size(),
-                                                     .tone = FrameTone::Figure });
-                row += cell;
+                auto const& cell = cells[index][piece.slot - 1];
+                row.push_back(Piece { .text = std::string(widths[piece.slot - 1] - in.cellWidth(cell.figure.Text()), ' ') });
+                AppendFigure(row.back(), cell.figure, FigureTone(cell.value));
             }
-            table.lines.push_back(std::move(row));
+            auto drawn = LineOf(row, {}, spec.tierPriority);
+            for (auto const& span: drawn.spans)
+                table.spans.push_back(
+                    LineSpan { .line = table.lines.size(), .byte = span.byte, .length = span.length, .tone = span.tone });
+            table.lines.push_back(std::move(drawn.lines.front()));
         }
         items.push_back(std::move(table));
         for (auto const note: spec.tierNote)

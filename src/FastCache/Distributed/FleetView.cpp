@@ -1313,7 +1313,7 @@ std::string HumanFleetFigure(std::uint64_t number, CellFormat format)
     auto const& row = CellFormatTable[static_cast<std::size_t>(format)];
     if (!row.figure.has_value())
         return std::format("{}", number);
-    return WriteFigure(static_cast<double>(number) * row.scale, *row.figure);
+    return WriteFigure(static_cast<double>(number) * row.scale, *row.figure).Text();
 }
 
 std::string RenderFleetText(FleetSnapshot const& snapshot,

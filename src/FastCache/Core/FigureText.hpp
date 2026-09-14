@@ -29,13 +29,31 @@ enum class FigureFormat : std::uint8_t
     Last,
 };
 
+/// A figure written for a person, in its two parts: the number, and the unit written after it.
+///
+/// **Two parts because a surface dresses them differently** -- #134's G1 gives a number weight and dims its
+/// unit -- and only the writer knows where one ends and the other begins. Reading `1 284 991` or `3.41 GiB` back
+/// apart would be a second grammar of the same figure, and the grouping space would pass for the unit's.
+struct WrittenFigure
+{
+    std::string number {}; ///< The digits, sign, grouping and decimal point: `94.2`, `1 284 991`.
+    std::string unit {};   ///< What follows the number, the space before it included: ` %`, ` GiB`; empty for none.
+
+    /// The figure as a person reads it.
+    /// @return The number and the unit.
+    [[nodiscard]] std::string Text() const
+    {
+        return number + unit;
+    }
+};
+
 /// @p value, present and finite, written as @p format says.
 ///
 /// Absence is the caller's to spell, because the marker differs per surface (`-` in a terminal,
 /// `&ndash;` on a page); a caller that has no value does not call this.
 /// @param value The value; finite.
 /// @param format How to write it.
-/// @return The text.
-[[nodiscard]] std::string WriteFigure(double value, FigureFormat format);
+/// @return The number and its unit.
+[[nodiscard]] WrittenFigure WriteFigure(double value, FigureFormat format);
 
 } // namespace FastCache
