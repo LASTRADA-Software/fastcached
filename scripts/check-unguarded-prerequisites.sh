@@ -104,10 +104,19 @@ Blank() {
                 if (c == "\\") { out = out "  "; i++; continue }
                 if (c == "'"'"'" && !dq) { sq = 1; out = out " "; continue }
                 if (c == "\"") { dq = !dq; out = out " "; continue }
+                # ENTERING `$(` saves the double-quote state and starts the substitution
+                # unquoted; its `)` restores the state. Tracking only the depth left `dq`
+                # set inside `"$( ... )"`, so a `'"'"'` there opened nothing and a `"` inside
+                # a single-quoted sed program toggled `dq` for the REST OF THE FILE -- every
+                # guard and invocation after it was blanked as text, and the check passed
+                # over them (#1416). A `)` inside a string within the substitution is text.
                 if (c == "$" && substr(s, i + 1, 1) == "(") {
-                    sub_depth++; out = out "$("; i++; continue
+                    sub_depth++; dq_saved[sub_depth] = dq; dq = 0
+                    out = out "$("; i++; continue
                 }
-                if (c == ")" && sub_depth > 0) { sub_depth--; out = out ")"; continue }
+                if (c == ")" && sub_depth > 0 && !dq) {
+                    dq = dq_saved[sub_depth]; sub_depth--; out = out ")"; continue
+                }
                 # A ${...} or $name inside double quotes is an EXPANSION the shell
                 # performs, not inert text, so it survives the blanking. Dropping it
                 # erased `for tool in "${RequiredTools[@]}"` and with it the indirection
@@ -591,7 +600,74 @@ fixturetool 5 foo
 BARE
     _st_case "same-text-outside-a-heredoc-IS-flagged" "$hn" 1 "uses 'fixturetool' unguarded"
 
-    # 4. AN EMPTY FILE SET IS REFUSED. The hand audit this replaces once enumerated
+    # 4. A COMMAND SUBSTITUTION RESTARTS QUOTING (#1416). Each tree reuses 3's guarding
+    #    a.sh, and b.sh guards jq and then runs fixturetool bare AFTER a substitution --
+    #    so the finding exists only if the blanker still reads code after that line.
+    #    4a is the shape that hid #1405's guards: a single-quoted sed program holding an
+    #    ODD number of `"`, inside `"$( ... )"`. 4b is the even-count control, flagged
+    #    by the pre-fix code too. 4c nests one substitution inside another ahead of the odd
+    #    quotes, 4d puts a `)` inside a string within the substitution, and 4e is the
+    #    restore half: text inside the OUTER quotes after the `)` stays text, so it must
+    #    not be flagged.
+    local sq="${tmp}/substitution-odd"
+    _st_stage "$sq"
+    cp "${hd}/scripts/a.sh" "${sq}/scripts/a.sh"
+    cat > "${sq}/scripts/b.sh" <<'ODD'
+#!/usr/bin/env bash
+set -uo pipefail
+pin="$(sed -n 's/^x:"\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' f)"
+command -v jq >/dev/null 2>&1 || exit 77
+fixturetool 5 foo
+ODD
+    _st_case "odd-quotes-in-a-substitution-hide-nothing" "$sq" 1 "b.sh guards a prerequisite and then"
+
+    local se="${tmp}/substitution-even"
+    _st_stage "$se"
+    cp "${hd}/scripts/a.sh" "${se}/scripts/a.sh"
+    cat > "${se}/scripts/b.sh" <<'EVEN'
+#!/usr/bin/env bash
+set -uo pipefail
+pin="$(sed -n 's/^x:"\(.*\)"$/\1/p' f)"
+command -v jq >/dev/null 2>&1 || exit 77
+fixturetool 5 foo
+EVEN
+    _st_case "even-quotes-in-a-substitution-control" "$se" 1 "b.sh guards a prerequisite and then"
+
+    local sn="${tmp}/substitution-nested"
+    _st_stage "$sn"
+    cp "${hd}/scripts/a.sh" "${sn}/scripts/a.sh"
+    cat > "${sn}/scripts/b.sh" <<'NESTED'
+#!/usr/bin/env bash
+set -uo pipefail
+v="$(printf '%s' "$(date)" | sed 's/"a/b/')"
+command -v jq >/dev/null 2>&1 || exit 77
+fixturetool 5 foo
+NESTED
+    _st_case "nested-substitution-hides-nothing" "$sn" 1 "b.sh guards a prerequisite and then"
+
+    local sp="${tmp}/substitution-paren-in-string"
+    _st_stage "$sp"
+    cp "${hd}/scripts/a.sh" "${sp}/scripts/a.sh"
+    cat > "${sp}/scripts/b.sh" <<'PAREN'
+#!/usr/bin/env bash
+set -uo pipefail
+command -v jq >/dev/null 2>&1 || exit 77
+msg="$(jq -r ".x)" f); fixturetool 5 foo"
+PAREN
+    _st_case "a-paren-in-a-string-does-not-close-the-substitution" "$sp" 0 "no script guards one prerequisite"
+
+    local sr="${tmp}/substitution-restore"
+    _st_stage "$sr"
+    cp "${hd}/scripts/a.sh" "${sr}/scripts/a.sh"
+    cat > "${sr}/scripts/b.sh" <<'RESTORE'
+#!/usr/bin/env bash
+set -uo pipefail
+command -v jq >/dev/null 2>&1 || exit 77
+msg="$(jq -r .x f); fixturetool 5 foo"
+RESTORE
+    _st_case "text-after-a-substitution-stays-text" "$sr" 0 "no script guards one prerequisite"
+
+    # 5. AN EMPTY FILE SET IS REFUSED. The hand audit this replaces once enumerated
     #    nothing and reported it as success.
     local mt="${tmp}/empty"
     rm -rf "$mt"; mkdir -p "${mt}/scripts"
