@@ -241,10 +241,93 @@ jobs:
               ;;
           esac
 
+  # Picks a self-hosted lastrada-docker runner for the Linux legs below when one
+  # is registered, online, and idle; falls back to the GitHub-hosted label
+  # otherwise. The runners are ORGANISATION-level (one fleet serves fastcached,
+  # morph and Lightweight), so this queries the org endpoint -- the repo
+  # endpoint returns zero for them and every run would silently go GitHub-hosted
+  # with no error anywhere.
+  #
+  # GITHUB_TOKEN can't call the runners API, so this needs RUNNER_STATUS_TOKEN:
+  # a PAT with organisation self-hosted-runner read access (admin:org, or
+  # fine-grained "Self-hosted runners: Read-only" on LASTRADA-Software), stored
+  # as a repo secret. This repo does not have that secret yet -- until a
+  # maintainer adds it, RUNNER_STATUS_TOKEN reads empty and every run below
+  # falls back to ubuntu-24.04, same as today. Forked-repo PRs don't get repo
+  # secrets at all (the token comes through empty), which this treats the same
+  # way: fall back to GitHub-hosted. A failed curl, or a 200 response whose body
+  # is missing or the wrong shape for `.runners`, are treated the same way too --
+  # each `|| { ...; exit 0; }` below degrades to the fallback rather than letting
+  # `set -e` abort the step and leave `runs_on` unset, which would fail every
+  # job that reads it instead of quietly running on GitHub-hosted.
+  probe-self-hosted:
+    name: "Probe self-hosted runner"
+    runs-on: ubuntu-24.04
+    outputs:
+      runs_on: ${{ steps.probe.outputs.runs_on }}
+    steps:
+      - name: "Check for an idle lastrada-docker runner"
+        id: probe
+        env:
+          RUNNER_STATUS_TOKEN: ${{ secrets.RUNNER_STATUS_TOKEN }}
+        run: |
+          set -euo pipefail
+          fallback='["ubuntu-24.04"]'
+
+          if [ -z "${RUNNER_STATUS_TOKEN}" ]; then
+            echo "No RUNNER_STATUS_TOKEN (e.g. a forked-repo PR, or the secret not added yet) -- using GitHub-hosted."
+            echo "runs_on=${fallback}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          runners=$(curl -fsSL \
+            -H "Authorization: Bearer ${RUNNER_STATUS_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/orgs/LASTRADA-Software/actions/runners") || {
+              echo "Runners API call failed -- using GitHub-hosted."
+              echo "runs_on=${fallback}" >> "$GITHUB_OUTPUT"
+              exit 0
+            }
+
+          online=$(echo "${runners}" | jq '[(.runners // [])[] |
+            select(.status == "online" and .busy == false and
+                   (.labels | map(.name) | contains(["lastrada-docker"])))] | length') || {
+              echo "Malformed runners response -- using GitHub-hosted."
+              echo "runs_on=${fallback}" >> "$GITHUB_OUTPUT"
+              exit 0
+            }
+
+          if ! [[ "${online}" =~ ^[0-9]+$ ]]; then
+            online=0
+          fi
+
+          if [ "${online}" -gt 0 ]; then
+            echo "Found an idle lastrada-docker runner -- using self-hosted."
+            echo 'runs_on=["self-hosted", "Linux", "X64", "lastrada-docker"]' >> "$GITHUB_OUTPUT"
+          else
+            echo "No idle lastrada-docker runner -- using GitHub-hosted."
+            echo "runs_on=${fallback}" >> "$GITHUB_OUTPUT"
+          fi
+
   linux:
     name: "Linux-${{ matrix.preset }}"
-    runs-on: ubuntu-24.04
-    needs: changes
+    needs: [changes, probe-self-hosted]
+    runs-on: ${{ fromJSON(needs.probe-self-hosted.outputs.runs_on) }}
+    env:
+      # Only set on the self-hosted path: host.docker.internal does not resolve
+      # on a GitHub-hosted VM (it is not a Docker container), and an address
+      # that is merely unreachable rather than refusing the connection stalls
+      # fastcache-cc's TCP connect for up to ~2m30s per matrix leg
+      # (CompileCache.cmake's own measured worst case) instead of failing fast
+      # -- so this must stay empty on that path, not just "wrong but harmless".
+      FASTCACHE_ADDR: ${{ contains(needs.probe-self-hosted.outputs.runs_on, 'self-hosted') && 'host.docker.internal:6674' || '' }}
+      # FASTCACHE_AUTO_INSTALL is a plain CMake option(), not something
+      # CompileCache.cmake reads from the environment the way it does
+      # FASTCACHE_ADDR -- an env var of this name is silently ignored, only
+      # -DFASTCACHE_AUTO_INSTALL=ON on the cmake command line reaches it. This
+      # is that flag, precomputed once so the Configure step below can just
+      # splice it in.
+      FASTCACHE_AUTO_INSTALL_FLAG: ${{ contains(needs.probe-self-hosted.outputs.runs_on, 'self-hosted') && '-DFASTCACHE_AUTO_INSTALL=ON' || '' }}
     # A job-level condition on a MATRIX job is the shape #300 warns about, and
     # this is the one form of it that is safe: `!cancelled()` is false only while
     # the RUN is being cancelled, so the matrix always expands and every leg
@@ -271,8 +354,17 @@ jobs:
           key: cpm-${{ runner.os }}-${{ matrix.preset }}-${{ hashFiles('CMakeLists.txt') }}
           restore-keys: cpm-${{ runner.os }}-${{ matrix.preset }}-
 
+      # Skipped on the self-hosted path: CompileCache.cmake's
+      # FASTCACHE_AUTO_INSTALL only fetches fastcache-cc when NONE of
+      # fastcache-cc/sccache/ccache are already on PATH ("only when there is
+      # nothing else to use" -- see that file's own comment on the guard).
+      # Installing ccache unconditionally, as this step used to, would
+      # permanently defeat auto-install regardless of
+      # FASTCACHE_AUTO_INSTALL=ON: ccache would always be present, so the
+      # auto-install guard's `AND NOT CCACHE` would always be false. The
+      # GitHub-hosted fallback still gets ccache exactly as before.
       - name: "ccache"
-        if: ${{ needs.changes.outputs.code != 'false' }}
+        if: ${{ needs.changes.outputs.code != 'false' && !contains(needs.probe-self-hosted.outputs.runs_on, 'self-hosted') }}
         uses: hendrikmuhs/ccache-action@v1.2
         with:
           key: ${{ runner.os }}-${{ matrix.preset }}
@@ -319,6 +411,7 @@ jobs:
         run: >-
           cmake --preset ${{ matrix.preset }} -DFASTCACHED_ENABLE_TLS=ON
           -DFASTCACHED_BUILD_BENCHMARKS=ON -DFASTCACHED_BUILD_TESTCLIENT=ON
+          $FASTCACHE_AUTO_INSTALL_FLAG
 
       - name: "Build"
         if: ${{ needs.changes.outputs.code != 'false' }}
@@ -366,9 +459,18 @@ jobs:
   # would run all twenty jobs to re-answer a question the merge just answered.
   clang-tidy:
     name: "clang-tidy"
-    runs-on: ubuntu-24.04
-    needs: changes
+    needs: [changes, probe-self-hosted]
+    runs-on: ${{ fromJSON(needs.probe-self-hosted.outputs.runs_on) }}
     if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
+    env:
+      # See the `linux` job's identical env block for why FASTCACHE_ADDR is
+      # conditional, and why FASTCACHE_AUTO_INSTALL has to be a -D flag
+      # (FASTCACHE_AUTO_INSTALL_FLAG) rather than an env var of that name --
+      # CompileCache.cmake declares it as a plain option(), which CMake never
+      # reads from the environment. This job builds nothing, but the Configure
+      # step still runs CompileCache.cmake, so it gets the same wiring.
+      FASTCACHE_ADDR: ${{ contains(needs.probe-self-hosted.outputs.runs_on, 'self-hosted') && 'host.docker.internal:6674' || '' }}
+      FASTCACHE_AUTO_INSTALL_FLAG: ${{ contains(needs.probe-self-hosted.outputs.runs_on, 'self-hosted') && '-DFASTCACHE_AUTO_INSTALL=ON' || '' }}
     steps:
       # fetch-depth: 0 is load-bearing here for a second reason beyond the one
       # at the top of this file: the sweep diffs against the pull request's base
@@ -427,6 +529,7 @@ jobs:
           cmake --preset clang-debug -DENABLE_TIDY=OFF
           -DCMAKE_CXX_SCAN_FOR_MODULES=OFF -DFASTCACHED_ENABLE_TLS=ON
           -DFASTCACHED_BUILD_BENCHMARKS=ON -DFASTCACHED_BUILD_TESTCLIENT=ON
+          $FASTCACHE_AUTO_INSTALL_FLAG
 
       # Which translation units the sweep picks is the part of it that can fail
       # SILENTLY: it has no output of its own to be wrong in, it just sweeps too
@@ -461,9 +564,17 @@ jobs:
   # difference from what this job used to be.
   clang-asan-ubsan:
     name: "clang-asan-ubsan"
-    runs-on: ubuntu-24.04
-    needs: changes
+    needs: [changes, probe-self-hosted]
+    runs-on: ${{ fromJSON(needs.probe-self-hosted.outputs.runs_on) }}
     if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
+    env:
+      # See the `linux` job's identical env block for why FASTCACHE_ADDR is
+      # conditional, and why FASTCACHE_AUTO_INSTALL has to be a -D flag
+      # (FASTCACHE_AUTO_INSTALL_FLAG) rather than an env var of that name --
+      # CompileCache.cmake declares it as a plain option(), which CMake never
+      # reads from the environment.
+      FASTCACHE_ADDR: ${{ contains(needs.probe-self-hosted.outputs.runs_on, 'self-hosted') && 'host.docker.internal:6674' || '' }}
+      FASTCACHE_AUTO_INSTALL_FLAG: ${{ contains(needs.probe-self-hosted.outputs.runs_on, 'self-hosted') && '-DFASTCACHE_AUTO_INSTALL=ON' || '' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -494,7 +605,12 @@ jobs:
       # own ref and can never be read by master or by another pull request, so it
       # only ever helps a repeat push to the same branch; restoring from master's
       # entry, which is what actually gives the 90% hit rate, still works.
+      #
+      # Skipped on the self-hosted path: see the `linux` job's identical
+      # ccache step for why (installing ccache unconditionally would
+      # permanently defeat fastcache-cc auto-install).
       - name: "ccache"
+        if: ${{ !contains(needs.probe-self-hosted.outputs.runs_on, 'self-hosted') }}
         uses: hendrikmuhs/ccache-action@v1.2
         with:
           key: ${{ runner.os }}-clang-debug
@@ -525,6 +641,7 @@ jobs:
           cmake --preset clang-debug -DENABLE_TIDY=OFF
           -DCMAKE_CXX_SCAN_FOR_MODULES=OFF -DFASTCACHED_ENABLE_TLS=ON
           -DFASTCACHED_BUILD_BENCHMARKS=ON -DFASTCACHED_BUILD_TESTCLIENT=ON
+          $FASTCACHE_AUTO_INSTALL_FLAG
 
       - name: "Build"
         run: cmake --build --preset clang-debug
@@ -533,7 +650,12 @@ jobs:
       # very bottom of a collapsed log, an hour of scrollback away from the build
       # they describe. `Cleanups` is the number that decides `max-size` above, so
       # it is printed here, next to the build it belongs to.
+      #
+      # Skipped on the self-hosted path: ccache is never installed there (see
+      # the "ccache" step above), so `ccache --show-stats` would just fail
+      # "command not found".
       - name: "Report ccache effectiveness"
+        if: ${{ !contains(needs.probe-self-hosted.outputs.runs_on, 'self-hosted') }}
         run: ccache --show-stats --verbose
 
       - name: "Test"
@@ -583,9 +705,17 @@ jobs:
   # week later has a week of commits to bisect through.
   clang-tsan:
     name: "clang-tsan"
-    runs-on: ubuntu-24.04
-    needs: changes
+    needs: [changes, probe-self-hosted]
+    runs-on: ${{ fromJSON(needs.probe-self-hosted.outputs.runs_on) }}
     if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
+    env:
+      # See the `linux` job's identical env block for why FASTCACHE_ADDR is
+      # conditional, and why FASTCACHE_AUTO_INSTALL has to be a -D flag
+      # (FASTCACHE_AUTO_INSTALL_FLAG) rather than an env var of that name --
+      # CompileCache.cmake declares it as a plain option(), which CMake never
+      # reads from the environment.
+      FASTCACHE_ADDR: ${{ contains(needs.probe-self-hosted.outputs.runs_on, 'self-hosted') && 'host.docker.internal:6674' || '' }}
+      FASTCACHE_AUTO_INSTALL_FLAG: ${{ contains(needs.probe-self-hosted.outputs.runs_on, 'self-hosted') && '-DFASTCACHE_AUTO_INSTALL=ON' || '' }}
     # The gate bounds each test binary itself, which names the target that stalled;
     # this bounds the build as well, so a hang anywhere in the job stops in an hour
     # rather than at GitHub's six-hour default. Every wait is bounded.
@@ -631,7 +761,12 @@ jobs:
       # whether 512M is enough; raise it when `Cleanups` is non-zero, not before.
       # `save` only on a push, so pull-request runs read master's entry without
       # each writing their own.
+      #
+      # Skipped on the self-hosted path: see the `linux` job's identical
+      # ccache step for why (installing ccache unconditionally would
+      # permanently defeat fastcache-cc auto-install).
       - name: "ccache"
+        if: ${{ !contains(needs.probe-self-hosted.outputs.runs_on, 'self-hosted') }}
         uses: hendrikmuhs/ccache-action@v1.2
         with:
           key: ${{ runner.os }}-clang-tsan
@@ -669,6 +804,7 @@ jobs:
         run: >-
           cmake --preset clang-tsan
           -DCMAKE_CXX_SCAN_FOR_MODULES=OFF -DFASTCACHED_ENABLE_TLS=ON
+          $FASTCACHE_AUTO_INSTALL_FLAG
 
       # Only the targets the gate runs — but do not read that as "the scope makes
       # this job cheap". `FastCacheTest` is one binary carrying every library
@@ -683,7 +819,11 @@ jobs:
           cmake --build --preset clang-tsan --target
           FastCacheTest fastcache-compile-node-tests tsan-canary
 
+      # Skipped on the self-hosted path: ccache is never installed there (see
+      # the "ccache" step above), so `ccache --show-stats` would just fail
+      # "command not found".
       - name: "Report ccache effectiveness"
+        if: ${{ !contains(needs.probe-self-hosted.outputs.runs_on, 'self-hosted') }}
         run: ccache --show-stats --verbose
 
       # Every refusal has a message of its own, because each is fixed somewhere
@@ -709,8 +849,8 @@ jobs:
   # had a chance to move yet — see issue #149.
   coverage:
     name: "Code coverage"
-    runs-on: ubuntu-24.04
-    needs: changes
+    needs: [changes, probe-self-hosted]
+    runs-on: ${{ fromJSON(needs.probe-self-hosted.outputs.runs_on) }}
     if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     # Read here rather than in each step's `if`, because the `secrets` context is
     # not available in a step-level condition while `env` is. Empty on a pull
@@ -722,6 +862,14 @@ jobs:
       # Spelled once: three steps read out of it, and a preset rename that moved
       # the directory would otherwise leave two of them silently finding nothing.
       COVERAGE_DIR: out/build/clang-coverage/coverage
+      # Wired for consistency with the other self-hosted jobs, but inert here:
+      # the clang-coverage preset already sets USE_COMPILER_CACHE=OFF (see the
+      # "No ccache step here" comment below), which short-circuits
+      # CompileCache.cmake before it ever reads FASTCACHE_ADDR or probes a
+      # daemon -- so moving this job to the fleet buys it CPU/RAM parity only,
+      # not compile caching.
+      FASTCACHE_ADDR: ${{ contains(needs.probe-self-hosted.outputs.runs_on, 'self-hosted') && 'host.docker.internal:6674' || '' }}
+      FASTCACHE_AUTO_INSTALL_FLAG: ${{ contains(needs.probe-self-hosted.outputs.runs_on, 'self-hosted') && '-DFASTCACHE_AUTO_INSTALL=ON' || '' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -768,7 +916,7 @@ jobs:
       # would report 0% for code the suite was never meant to reach and pull the
       # figure down while looking like rigour.
       - name: "Configure"
-        run: cmake --preset clang-coverage -DFASTCACHED_ENABLE_TLS=ON
+        run: cmake --preset clang-coverage -DFASTCACHED_ENABLE_TLS=ON $FASTCACHE_AUTO_INSTALL_FLAG
 
       - name: "Build"
         run: cmake --build --preset clang-coverage
@@ -2368,6 +2516,7 @@ jobs:
       - changes
       - check-clang-format
       - check-release-gate
+      - probe-self-hosted
       - linux
       - clang-tidy
       - clang-asan-ubsan
