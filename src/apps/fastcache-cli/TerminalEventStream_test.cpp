@@ -210,8 +210,12 @@ struct DeviceRecord
 [[nodiscard]] std::size_t Occurrences(std::string_view haystack, std::string_view needle)
 {
     auto count = std::size_t { 0 };
-    for (auto at = haystack.find(needle); at != std::string_view::npos; at = haystack.find(needle, at + needle.size()))
+    auto at = haystack.find(needle);
+    while (at != std::string_view::npos)
+    {
         ++count;
+        at = haystack.find(needle, at + needle.size());
+    }
     return count;
 }
 

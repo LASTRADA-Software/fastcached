@@ -3,6 +3,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <ranges>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -104,7 +105,7 @@ TEST_CASE("incomplete is distinct from malformed at every truncation point", "[c
     // a reply* are opposite diagnoses, and collapsing them makes a slow network look
     // like a broken server. Every proper prefix of a valid reply must say Incomplete.
     std::string_view const whole = "*2\r\n$3\r\nabc\r\n:7\r\n";
-    for (std::size_t length = 0; length < whole.size(); ++length)
+    for (auto const length: std::views::iota(std::size_t { 0 }, whole.size()))
     {
         auto const parsed = ParseReply(whole.substr(0, length));
         CHECK(parsed.state == ParseState::Incomplete);
@@ -179,7 +180,7 @@ TEST_CASE("nesting deeper than the cap is refused rather than recursing", "[cli]
     // the bound that makes a hostile reply a refusal rather than a crash.
     ParseLimits const shallow { .maxDepth = 3 };
     std::string deep;
-    for (auto index = 0; index < 10; ++index)
+    for ([[maybe_unused]] auto const index: std::views::iota(0, 10))
         deep += "*1\r\n";
     deep += ":1\r\n";
     CHECK(ParseReply(deep, shallow).state == ParseState::Malformed);

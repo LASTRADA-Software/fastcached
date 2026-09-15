@@ -1370,11 +1370,13 @@ constexpr auto FleetMachines = std::size_t { 12 };
 /// @return True when the heading carries it, bounded by spaces or the line's ends.
 [[nodiscard]] bool HeadingNames(std::string_view heading, std::string_view name)
 {
-    for (auto at = heading.find(name); at != std::string_view::npos; at = heading.find(name, at + 1))
+    auto at = heading.find(name);
+    while (at != std::string_view::npos)
     {
         auto const end = at + name.size();
         if ((at == 0 || heading[at - 1] == ' ') && (end == heading.size() || heading[end] == ' '))
             return true;
+        at = heading.find(name, at + 1);
     }
     return false;
 }

@@ -3,6 +3,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <ranges>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -219,7 +220,7 @@ TEST_CASE("memcached: a partial reply is incomplete, never malformed", "[cli][me
     // Every prefix of a real reply must ask for more bytes rather than be refused --
     // otherwise a reply split across two reads is a spurious protocol error.
     static constexpr auto whole = "VALUE k 0 5\r\nhello\r\nEND\r\n"sv;
-    for (std::size_t cut = 1; cut < whole.size(); ++cut)
+    for (auto const cut: std::views::iota(std::size_t { 1 }, whole.size()))
     {
         auto const result = ParseMemcachedReply(whole.substr(0, cut));
         INFO("cut at " << cut);
