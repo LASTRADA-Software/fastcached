@@ -160,11 +160,28 @@ struct NodeConfig
     /// `NodeServiceRejection` still refuses to register a service that provably
     /// cannot start, which is the guard that used to apply unconditionally.
     bool toolchainDiscovery { true };
-    /// Concurrent compiles, or 0 to size the machine from `nodeClass` and its
-    /// hardware. Enforced here as well as advertised, through the one shared
-    /// `Distributed::OfferableSlots`: two implementations of that arithmetic is how
-    /// a worker comes to accept more jobs than the scheduler believes it has.
-    std::uint32_t slots { 0 };
+    /// How hard this machine may be driven. See `Distributed::NodeClass`.
+    ///
+    /// Defaults to `Workstation`, which is the safe answer rather than the common
+    /// one: a node whose class nobody set is somebody's desktop until proven
+    /// otherwise, and getting that backwards is a failure the person experiences as
+    /// "my editor stutters" and never connects to a build fleet.
+    ///
+    /// Beside `toolchainDiscovery` for LAYOUT: a byte-wide member between the two
+    /// 4-aligned `optional`s and `drainTimeoutSeconds` below cost the struct past the
+    /// padding budget clang-tidy enforces once `slots` became an `optional` (#206).
+    Distributed::NodeClass nodeClass { Distributed::NodeClass::Workstation };
+    /// Concurrent compiles this node offers the fleet, when the operator named a number.
+    ///
+    /// Absent sizes the machine from `nodeClass` and its hardware. A count is enforced
+    /// here as well as advertised, through the one shared `Distributed::OfferableSlots`:
+    /// two implementations of that arithmetic is how a worker comes to accept more jobs
+    /// than the scheduler believes it has.
+    ///
+    /// An `optional` because `OfferableSlots` takes one and its zero is a count: the
+    /// field's old zero-means-derive would size every default node to nothing (#206).
+    /// The `optional` is this row's provenance, so it needs no bit.
+    std::optional<std::uint32_t> slots;
 
     /// Cores held back from the fleet, when the operator named a number.
     ///
@@ -196,14 +213,6 @@ struct NodeConfig
     /// one can say so, rather than discovering the change as a behaviour they cannot
     /// turn off.
     std::uint32_t drainTimeoutSeconds { 30 };
-
-    /// How hard this machine may be driven. See `Distributed::NodeClass`.
-    ///
-    /// Defaults to `Workstation`, which is the safe answer rather than the common
-    /// one: a node whose class nobody set is somebody's desktop until proven
-    /// otherwise, and getting that backwards is a failure the person experiences as
-    /// "my editor stutters" and never connects to a build fleet.
-    Distributed::NodeClass nodeClass { Distributed::NodeClass::Workstation };
 
     /// Where the admin endpoint listens, or empty to leave it off.
     ///
@@ -653,7 +662,6 @@ struct NodeConfig
     /// `cliOnly`, so a key in a config file never reaches these and never gets baked
     /// into a unit that would then outrank the file it came from.
     bool advertiseExplicit { false };
-    bool slotsExplicit { false };
     bool nodeClassExplicit { false };
     bool adminListenExplicit { false };
     bool cacheDiskBytesExplicit { false };

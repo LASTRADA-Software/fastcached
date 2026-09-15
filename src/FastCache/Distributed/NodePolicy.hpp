@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <concepts>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -256,7 +257,7 @@ inline constexpr std::uint64_t MemoryBudgetPerJobBytes = 1ULL << 30;
 /// Two rules, and which one applies is decided by whether the operator named a
 /// number:
 ///
-///   - **They did not** (`advertisedSlots == 0`): derive it. The core count,
+///   - **They did not** (`operatorSlots` absent): derive it. The core count,
 ///     clamped by what the memory supports, minus the class's reserve.
 ///   - **They did**: use it, untouched. `--slots` is set by the person whose
 ///     machine this is, so it is not a hint to be clamped by a heuristic written
@@ -265,23 +266,33 @@ inline constexpr std::uint64_t MemoryBudgetPerJobBytes = 1ULL << 30;
 ///     subtracting the reserve on top of it would mean `--slots 4` on a
 ///     workstation quietly offered two, which is not what the flag says.
 ///
-/// Never zero, and that is the load-bearing half. A node offering no slots would
-/// register, match every lease for its toolchain, never be picked, and be
-/// indistinguishable at the client from a fleet that is permanently busy -- the
-/// diagnosis an operator would then chase is "buy more machines" for a node that
-/// is sitting idle. Guaranteeing it here is what lets the scheduler stop
-/// hand-checking for it, and what lets the pick comparison divide by a slot count.
+/// **Absent rather than zero is "derive", and that is #206.** Zero used to be this
+/// function's spelling of "the operator named nothing", which left no way to say
+/// "offer nothing" at all -- and made the obvious spelling of it, `--slots=0`, the one
+/// value that would have produced a FULL worker. The two answers now have two
+/// representations, so a zero can only ever mean zero, which fails closed. The one
+/// place a zero still means "derive" is the REGISTER wire field, and it is converted
+/// there once (`WorkerRegistry`'s `RequestedSlots`) rather than at each reader.
+///
+/// Never zero when derived, and that is the load-bearing half. A node offering no
+/// slots would register, match every lease for its toolchain, never be picked, and
+/// be indistinguishable at the client from a fleet that is permanently busy -- the
+/// diagnosis an operator would then chase is "buy more machines" for a node that is
+/// sitting idle. An operator who ASKS for zero gets zero here, and never reaches
+/// here in practice: such a node runs no worker component and registers nothing
+/// (`Node::RunsWorker`), so no registration carries the zero.
 ///
 /// A machine that reported no core count is treated as having one. Refusing to
 /// schedule onto it would punish a worker for a fact it merely failed to collect,
 /// and one slot is the answer that is never wrong by much.
 /// @param capacity What the machine says about itself.
-/// @param advertisedSlots What the operator asked for, or 0 to derive it.
-/// @return Concurrent jobs to offer; never zero.
-[[nodiscard]] constexpr std::uint32_t OfferableSlots(NodeCapacity const& capacity, std::uint32_t advertisedSlots) noexcept
+/// @param operatorSlots What the operator asked for, or absent to derive it.
+/// @return Concurrent jobs to offer; never zero unless the operator said zero.
+[[nodiscard]] constexpr std::uint32_t OfferableSlots(NodeCapacity const& capacity,
+                                                     std::optional<std::uint32_t> operatorSlots) noexcept
 {
-    if (advertisedSlots != 0)
-        return advertisedSlots;
+    if (operatorSlots.has_value())
+        return *operatorSlots;
 
     auto ceiling = capacity.logicalCores == 0 ? 1U : capacity.logicalCores;
 
@@ -311,6 +322,29 @@ inline constexpr std::uint64_t MemoryBudgetPerJobBytes = 1ULL << 30;
     // must offer one, not 4294967295.
     return reserve >= ceiling ? 1U : ceiling - reserve;
 }
+
+/// **Refused for a bare integer** (#206). A plain count converts silently to the
+/// `optional` above, and it did: the node's own `slots` field, whose zero meant
+/// "derive", compiled against the new signature and sized every default node to zero
+/// slots, with nothing failing but a test that happened to ask. A caller states which
+/// answer it means -- `std::nullopt` to derive, `std::optional<std::uint32_t> { n }` for
+/// a count -- or it does not compile.
+/// @param capacity What the machine says about itself.
+/// @param operatorSlots A bare integer, which is the mistake this overload exists to refuse.
+/// @return Nothing; deleted.
+[[nodiscard]] constexpr std::uint32_t OfferableSlots(NodeCapacity const& capacity,
+                                                     std::integral auto operatorSlots) noexcept = delete;
+
+/// Whether `OfferableSlots` accepts @p Slots as the operator's count.
+template <typename Slots>
+concept OfferableSlotsAccepts = requires(NodeCapacity const& capacity, Slots slots) {
+    { OfferableSlots(capacity, slots) } -> std::same_as<std::uint32_t>;
+};
+
+static_assert(OfferableSlotsAccepts<std::optional<std::uint32_t>> && OfferableSlotsAccepts<std::nullopt_t>,
+              "OfferableSlots takes the optional count, and std::nullopt to derive");
+static_assert(!OfferableSlotsAccepts<std::uint32_t> && !OfferableSlotsAccepts<int> && !OfferableSlotsAccepts<bool>,
+              "a bare integer must not reach OfferableSlots' optional by conversion -- see its deleted overload");
 
 /// Disk a single job is budgeted at on the worker's scratch filesystem.
 ///

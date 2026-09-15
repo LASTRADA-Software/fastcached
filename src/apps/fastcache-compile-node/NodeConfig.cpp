@@ -76,9 +76,12 @@ namespace
     }
 
     /// A positive slot count.
+    ///
+    /// Zero is refused: read as a count it would run a worker that offers nothing, and
+    /// deriving the count is the field's ABSENCE rather than a number.
     /// @param sv Text to parse.
     /// @return The count, or why it is not one.
-    [[nodiscard]] std::expected<std::uint32_t, ConfigError> ParseSlots(std::string_view sv)
+    [[nodiscard]] std::expected<std::optional<std::uint32_t>, ConfigError> ParseSlots(std::string_view sv)
     {
         auto value = 0U;
         auto const* const begin = sv.data();
@@ -87,7 +90,7 @@ namespace
         if (ec != std::errc {} || ptr != end || value == 0)
             return std::unexpected(
                 ArgvError(ConfigErrorCode::OutOfRange, "slots", std::format("must be a positive count: {}", sv)));
-        return value;
+        return std::optional<std::uint32_t> { value };
     }
 
     /// A node class, by the name `NodeClassTable` spells it.
@@ -737,7 +740,6 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
             .arity = Arity::Value,
             .operand = "=<n>",
             .apply = AssignFrom<&NodeConfig::slots, ParseSlots>(),
-            .explicitBit = &NodeConfig::slotsExplicit,
             .description = "concurrent compiles. Default: derived from this\n"
                            "machine's cores and memory, less what --node-class\n"
                            "reserves. A number given here is the answer and is\n"
@@ -2056,7 +2058,8 @@ ServiceSpec MakeNodeServiceSpec(std::filesystem::path const& exePath, NodeConfig
     for (auto const& scheduler: cfg.schedulers)
         argv.push_back(std::format("--scheduler={}", scheduler));
     emitIfExplicit("advertise", cfg.advertise, cfg.advertiseExplicit);
-    emitIfExplicit("slots", cfg.slots, cfg.slotsExplicit);
+    if (cfg.slots.has_value())
+        argv.push_back(std::format("--slots={}", *cfg.slots));
     emitIfExplicit("node-class", std::string { Distributed::TraitsFor(cfg.nodeClass).name }, cfg.nodeClassExplicit);
     // Emitted on presence, because the difference this flag carries IS presence: a
     // reserve of zero the operator typed and a reserve nobody mentioned are

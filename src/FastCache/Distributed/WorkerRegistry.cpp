@@ -26,6 +26,24 @@ bool WorkerRegistry::IsLive(Entry const& entry, TimePoint now) const noexcept
     return std::chrono::duration_cast<std::chrono::milliseconds>(now - entry.lastSeen) <= _heartbeatTimeout;
 }
 
+namespace
+{
+    /// The count a registration asks for, in `OfferableSlots`' vocabulary.
+    ///
+    /// **The one place a zero means "derive".** REGISTER carries the count as a plain
+    /// integer whose zero has always meant *the worker named nothing*, and a worker
+    /// running this build sends what its own `OfferableSlots` computed, which is never
+    /// zero -- a node told to offer nothing registers nothing (#206). So the wire's
+    /// zero is converted HERE, once, rather than letting a zero reach a function whose
+    /// zero now means zero.
+    /// @param registration What the worker sent.
+    /// @return The operator's count, or absent to derive it from the capacity record.
+    [[nodiscard]] std::optional<std::uint32_t> RequestedSlots(WorkerRegistration const& registration) noexcept
+    {
+        return registration.slots == 0 ? std::nullopt : std::optional { registration.slots };
+    }
+} // namespace
+
 std::string WorkerRegistry::Register(WorkerRegistration const& registration)
 {
     std::scoped_lock const guard { _mutex };
@@ -42,7 +60,7 @@ std::string WorkerRegistry::Register(WorkerRegistration const& registration)
     });
     if (existing != _workers.end())
     {
-        existing->second.info.slots = OfferableSlots(registration.capacity, registration.slots);
+        existing->second.info.slots = OfferableSlots(registration.capacity, RequestedSlots(registration));
         existing->second.info.capacity = registration.capacity;
         existing->second.info.codecs = registration.codecs;
         // Refreshed, not kept. This is the path a machine takes when it restarts,
@@ -96,24 +114,25 @@ std::string WorkerRegistry::Register(WorkerRegistration const& registration)
     }
 
     auto id = std::format("w{}", _nextId++);
-    _workers.emplace(id,
-                     Entry { .info = WorkerInfo { .id = id,
-                                                  .fingerprint = std::string { registration.fingerprint },
-                                                  .endpoint = std::string { registration.endpoint },
-                                                  .version = std::string { registration.version },
-                                                  .toolchainLabel = std::string { registration.toolchainLabel },
-                                                  .displayName = std::string { registration.displayName },
-                                                  .slots = OfferableSlots(registration.capacity, registration.slots),
-                                                  .inFlight = 0,
-                                                  .capacity = registration.capacity,
-                                                  .load = {},
-                                                  .codecs = registration.codecs },
-                             .lastSeen = now,
-                             .registeredAt = now,
-                             // Disengaged, not `now`: nothing has been sent here yet,
-                             // and a fresh registration claiming it was just picked is
-                             // the exact false reassurance #1297 exists to remove.
-                             .lastPickedAt = std::nullopt });
+    _workers.emplace(
+        id,
+        Entry { .info = WorkerInfo { .id = id,
+                                     .fingerprint = std::string { registration.fingerprint },
+                                     .endpoint = std::string { registration.endpoint },
+                                     .version = std::string { registration.version },
+                                     .toolchainLabel = std::string { registration.toolchainLabel },
+                                     .displayName = std::string { registration.displayName },
+                                     .slots = OfferableSlots(registration.capacity, RequestedSlots(registration)),
+                                     .inFlight = 0,
+                                     .capacity = registration.capacity,
+                                     .load = {},
+                                     .codecs = registration.codecs },
+                .lastSeen = now,
+                .registeredAt = now,
+                // Disengaged, not `now`: nothing has been sent here yet,
+                // and a fresh registration claiming it was just picked is
+                // the exact false reassurance #1297 exists to remove.
+                .lastPickedAt = std::nullopt });
     return id;
 }
 
@@ -180,9 +199,10 @@ namespace
             return candidateFree > incumbentFree;
 
         // candidateFree/candidate.slots > incumbentFree/incumbent.slots, without
-        // the division. Both slot counts are non-zero here because `OfferableSlots`
-        // never yields zero -- which is why that guarantee is stated at the function
-        // rather than left as something each caller happens to observe. The
+        // the division -- so a zero slot count could not fault here, and none arrives
+        // anyway: `Pick` skips every entry with no free slot before comparing it, and
+        // a registration's count is never zero, because a derived one never is and a
+        // node told to offer nothing registers nothing (#206). The
         // denominator is the REGISTERED count deliberately: it asks "how much of this
         // machine is left", and a denominator that shrank with the machine's live
         // load would make a busy workstation look proportionally emptier the busier
