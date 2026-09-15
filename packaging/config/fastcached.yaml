@@ -108,12 +108,13 @@
 
 # --- Expiry -----------------------------------------------------------------
 
-# How often the active expiry cycle sweeps for entries whose TTL has lapsed,
-# in milliseconds. redis's `hz` is the analogue. 0 disables the cycle, leaving
-# expiry entirely access-driven: an untouched key that lapses then keeps its
-# memory until eviction reaches it and publishes no `expired` keyspace event.
-# The cycle backs off towards 30s while it finds nothing to reclaim.
-#active_expiry_interval_ms: 1000
+# How often the active expiry cycle sweeps for entries whose TTL has lapsed: a
+# whole number and a unit (ms, s, min, h, d); a bare number is refused. redis's
+# `hz` is the analogue. 0s disables the cycle, leaving expiry entirely
+# access-driven: an untouched key that lapses then keeps its memory until
+# eviction reaches it and publishes no `expired` keyspace event. The cycle backs
+# off towards 30s while it finds nothing to reclaim.
+#active_expiry_interval: 1s
 
 # Entries one sweep examines per shard before it stops and resumes next time.
 # This is the bound on how long a sweep holds a shard's exclusive lock, so the

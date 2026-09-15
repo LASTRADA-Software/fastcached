@@ -22,6 +22,13 @@
 namespace FastCache
 {
 
+/// The longest memcached `exptime` read as a length of time; anything past it is a UNIX timestamp.
+///
+/// memcached's own rule, and the one `CacheEngine::ExpiryFromExptime` applies. Public because a
+/// CLIENT has to know it too: `fastcache-cli` refuses a `--ttl` past it rather than sending a
+/// length the server would read as a date in 1970 -- a key expired on arrival, reported stored.
+inline constexpr std::chrono::seconds MemcachedRelativeExptimeCeiling = std::chrono::days { 30 };
+
 /// Command-level facade over IStorage. Owns the TTL semantics (translating
 /// memcached's seconds-or-unix-timestamp `exptime` into absolute TimePoints
 /// via IClock) and the encoding-specific conversions. The protocol handlers

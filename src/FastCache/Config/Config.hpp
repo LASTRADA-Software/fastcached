@@ -6,6 +6,7 @@
 #include <FastCache/Platform/HostMemory.hpp>
 
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -35,13 +36,13 @@ inline constexpr std::uint16_t DefaultPort { 6674 };
 /// protocols.
 inline constexpr std::uint16_t DefaultMetricsPort { 9259 };
 
-/// Default period of the active expiry sweep, in milliseconds. 0 would disable it.
+/// Default period of the active expiry sweep. Zero would disable it.
 ///
 /// Spelled here and `static_assert`ed against `ExpiryReaperOptions` where the
 /// two meet, rather than written twice: `Config` must not depend on `Cache/`,
 /// and two independently-maintained copies of a default is how the CLI's
 /// advertised default stops matching what the daemon actually does.
-inline constexpr std::uint32_t DefaultActiveExpiryIntervalMs { 1000 };
+inline constexpr std::chrono::milliseconds DefaultActiveExpiryInterval { 1000 };
 
 /// Default number of entries one expiry sweep examines per shard.
 inline constexpr std::size_t DefaultActiveExpiryScanBudget { 512 };
@@ -203,16 +204,17 @@ struct Config
     /// value at runtime (min(16, hardware_concurrency)).
     std::size_t storageShards { 0 };
 
-    /// How often the active expiry cycle sweeps, in milliseconds. 0 disables it.
+    /// How often the active expiry cycle sweeps. Zero disables it.
     ///
     /// Without a sweep, expiry is entirely access-driven: a key whose TTL
     /// lapses and which nobody touches again keeps its memory and never
     /// publishes an `expired` keyspace event. redis's `hz` is the analogue.
     ///
-    /// Milliseconds rather than a `Duration`, because a config field is
-    /// compared, merged, round-tripped through YAML and printed back to an
-    /// operator, and every one of those is simpler on a plain integer.
-    std::uint32_t activeExpiryIntervalMs { DefaultActiveExpiryIntervalMs };
+    /// A `std::chrono` type rather than a count of milliseconds, because the unit is
+    /// part of the value an operator types (`250ms`, `1s`) and of what a registration
+    /// writes back (`FormatDuration`); a bare integer field is what let the flag and
+    /// its file key disagree about which unit a number was in (#1402).
+    std::chrono::milliseconds activeExpiryInterval { DefaultActiveExpiryInterval };
 
     /// Entries one sweep examines per shard before it stops and resumes next
     /// time. The bound on how long the cycle holds a shard's exclusive lock.

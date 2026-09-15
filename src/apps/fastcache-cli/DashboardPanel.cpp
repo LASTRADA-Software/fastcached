@@ -7,6 +7,7 @@
 #include "NodeStatusText.hpp"
 
 #include <FastCache/Cache/StorageTier.hpp>
+#include <FastCache/Cli/Duration.hpp>
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/NumericText.hpp>
 #include <FastCache/Core/Ranges.hpp>
@@ -2976,7 +2977,7 @@ namespace
         { .fact = ChromeFact::Interval,
           .render = [](FrameInputs const& in, PanelContext const& context) -> std::string {
               auto const interval = ReadingInterval(in, context);
-              return interval.has_value() ? std::format("every {}s", std::chrono::duration<double> { *interval }.count())
+              return interval.has_value() ? std::format("every {}", FormatDuration(*interval))
                                           : std::format("every {}", in.absent);
           } },
         { .fact = ChromeFact::Quit,

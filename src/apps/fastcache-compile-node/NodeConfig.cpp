@@ -5,6 +5,7 @@
 #include "NodeToolchains.hpp"
 
 #include <FastCache/Cache/StorageTier.hpp>
+#include <FastCache/Cli/Duration.hpp>
 #include <FastCache/Cluster/ClusterState.hpp>
 #include <FastCache/Config/ByteSize.hpp>
 #include <FastCache/Config/CompressionValues.hpp>
@@ -140,23 +141,17 @@ namespace
         return std::optional<std::uint32_t> { value };
     }
 
-    /// Parse `--drain-timeout`, in seconds.
+    /// Parse `--drain-timeout`, a duration kept in whole seconds.
     ///
     /// Zero is accepted and means "wait forever", which is a different answer from
     /// not passing the flag -- and is what this program did before the flag existed,
-    /// so it has to stay sayable.
+    /// so it has to stay sayable. A value finer than a second (`1500ms`) is refused
+    /// by `ParseDurationValue` rather than rounded to a bound nobody typed.
     /// @param sv Text to parse.
-    /// @return The seconds, or why it is not a count of them.
-    [[nodiscard]] std::expected<std::uint32_t, ConfigError> ParseDrainTimeout(std::string_view sv)
+    /// @return The duration, or why it is not one this setting keeps.
+    [[nodiscard]] std::expected<std::chrono::seconds, ConfigError> ParseDrainTimeout(std::string_view sv)
     {
-        auto value = 0U;
-        auto const* const begin = sv.data();
-        auto const* const end = std::next(begin, static_cast<std::ptrdiff_t>(sv.size()));
-        auto const [ptr, ec] = std::from_chars(begin, end, value);
-        if (ec != std::errc {} || ptr != end)
-            return std::unexpected(
-                ArgvError(ConfigErrorCode::OutOfRange, "drain-timeout", std::format("not a number of seconds: {}", sv)));
-        return value;
+        return ParseDurationValue<std::chrono::seconds>(sv);
     }
 
     /// An applier for a flag that names an enrollment action, and its operand when it
@@ -817,16 +812,17 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
         {
             .primary = "--drain-timeout",
             .arity = Arity::Value,
-            .operand = "=<seconds>",
-            .apply = AssignFrom<&NodeConfig::drainTimeoutSeconds, ParseDrainTimeout>(),
-            .explicitBit = &NodeConfig::drainTimeoutSecondsExplicit,
-            .description = "seconds a stop waits for compiles still running\n"
-                           "before giving up and saying what it abandoned;\n"
-                           "0 waits forever. Unbounded, the supervisor\n"
+            .operand = "=<duration>",
+            .apply = AssignFrom<&NodeConfig::drainTimeout, ParseDrainTimeout>(),
+            .explicitBit = &NodeConfig::drainTimeoutExplicit,
+            .description = "how long a stop waits for compiles still running\n"
+                           "before giving up and saying what it abandoned\n"
+                           "(default 30s); 0s waits forever. Whole seconds, in\n"
+                           "one of {duration-units}. Unbounded, the supervisor\n"
                            "decides instead and answers with SIGKILL and no\n"
                            "diagnostic.",
-            .yamlKey = "drain_timeout_seconds",
-            .same = FieldEq<&NodeConfig::drainTimeoutSeconds>(),
+            .yamlKey = "drain_timeout",
+            .same = FieldEq<&NodeConfig::drainTimeout>(),
             .component = &WorkerComponent,
         },
         {
@@ -2204,7 +2200,7 @@ ServiceSpec MakeNodeServiceSpec(std::filesystem::path const& exePath, NodeConfig
         argv.emplace_back("--fleet-open");
     for (auto const& member: cfg.fleetMembers)
         argv.push_back(std::format("--fleet-member={}", member));
-    emitIfExplicit("drain-timeout", cfg.drainTimeoutSeconds, cfg.drainTimeoutSecondsExplicit);
+    emitIfExplicit("drain-timeout", FormatDuration(cfg.drainTimeout), cfg.drainTimeoutExplicit);
     emitIfExplicit("log-level", LogLevelName(cfg.logLevel), cfg.logLevelExplicit);
 
     // **Both spellings, because the DEFAULT is platform-dependent** (#496, #507).
@@ -3871,7 +3867,10 @@ std::string HelpText(UsageColor color)
         { .subject = "fastcache-compile-node - a compile worker for fastcached distributed builds." },
         { .title = "OPTIONS", .blocks = allBlocks.subspan(0, 1) },
     });
-    return RenderUsage({ .sections = sections }, color);
+    auto const substitutions = std::to_array<UsageSubstitution>({
+        { .token = "{duration-units}", .value = DurationUnitList() },
+    });
+    return RenderUsage({ .sections = sections }, color, substitutions);
 }
 
 } // namespace FastCache::Node

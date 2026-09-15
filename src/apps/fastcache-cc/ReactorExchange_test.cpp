@@ -665,7 +665,7 @@ TEST_CASE("A pulse pushes the idle bound out, so a worker that keeps reporting i
 
 TEST_CASE("A budget of zero arms no deadline at all")
 {
-    // What `FASTCACHE_TIMEOUT_MS=0` has always been documented to mean, and what the
+    // What `FASTCACHE_TIMEOUT=0s` has always been documented to mean, and what the
     // arithmetic alone would NOT do: a zero total puts the deadline at `Now()`, so
     // every exchange would be closed on the reactor's next turn. A knob that reads
     // as "turn the ceiling off" would have turned the cache off instead -- silently,

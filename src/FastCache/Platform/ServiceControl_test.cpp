@@ -286,6 +286,35 @@ TEST_CASE("ServiceControl: an explicitly emptied path is registered, not absolut
     CHECK(reparsed->config.storagePath.empty());
 }
 
+TEST_CASE("ServiceControl: a registered duration is read back by the daemon as the same length", "[platform][service]")
+{
+    // #1402. A registration replays its command line forever, so a duration is written in the
+    // grammar the flag reads, and only the daemon's own parser can say it was. WHAT
+    // DISTINGUISHES: `1500ms`, which no larger unit divides, and `2min`, which one does. A
+    // registration writing the bare count re-parses as "names no unit" for both; one rounding to
+    // a coarser unit loses the first.
+    for (auto const text: { std::string_view { "1500ms" }, std::string_view { "2min" } })
+    {
+        INFO("typed: " << text);
+        auto const flag = std::format("--expiry-interval={}", text);
+        auto const args = std::array<char const*, 1> { flag.c_str() };
+        auto const typed = FastCache::ParseCli(std::span<char const* const> { args });
+        REQUIRE(typed.has_value());
+
+        std::string token;
+        for (auto const& arg: BuildServiceArgv(std::filesystem::path { "fastcached" }, *typed, EmitDaemonFlag::No))
+            if (arg.starts_with("--expiry-interval="))
+                token = arg;
+        REQUIRE(!token.empty());
+
+        auto const replay = std::array<char const*, 1> { token.c_str() };
+        auto const reparsed = FastCache::ParseCli(std::span<char const* const> { replay });
+        REQUIRE(reparsed.has_value());
+        CHECK(reparsed->config.activeExpiryInterval == typed->config.activeExpiryInterval);
+        CHECK(reparsed->activeExpiryIntervalExplicit);
+    }
+}
+
 TEST_CASE("ServiceControl: the launchd label is reverse-DNS and lowercased", "[platform][service][launchd]")
 {
     FastCache::Config cfg {};
@@ -1401,7 +1430,7 @@ TEST_CASE("ServiceControl: every flag that can reach a registration does, one ro
         { .flag = "--threads", .value = "5" },
         { .flag = "--listen-backlog", .value = "64" },
         { .flag = "--storage-shards", .value = "7" },
-        { .flag = "--expiry-interval", .value = "250" },
+        { .flag = "--expiry-interval", .value = "250ms" },
         { .flag = "--expiry-scan", .value = "64" },
         { .flag = "--pidfile", .value = "fastcached.pid" },
         { .flag = "--service-name", .value = "MyCache" },

@@ -251,7 +251,7 @@ TEST_CASE("Detail::StartExpiryCycle reclaims an untouched lapsed key through the
 
 TEST_CASE("Detail::StartExpiryCycle honours a zero interval by starting nothing", "[server][reactor-loop][expiry]")
 {
-    // `--expiry-interval=0` is how an operator asks for the pre-#162 behaviour.
+    // `--expiry-interval=0s` is how an operator asks for the pre-#162 behaviour.
     // "Off" has to mean a coroutine that ended: one parked forever on a
     // deadline nothing will move is a frame the reactor has to outlive.
     using namespace std::chrono_literals;

@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#include <FastCache/Cli/Duration.hpp>
 #include <FastCache/Cluster/ClusterState.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
@@ -6,7 +7,9 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstddef>
+#include <format>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -108,7 +111,7 @@ TEST_CASE("A setting this build does not know is refused, not stored", "[cluster
     // A key nobody knows would otherwise be replicated to every node, snapshotted and
     // carried across restarts while doing nothing -- and the only symptom would be
     // that the thing the operator configured did not happen.
-    CHECK(Validate(Cmd(CommandKind::SetSetting, "lease-lifetime", "1200000")).has_value());
+    CHECK(Validate(Cmd(CommandKind::SetSetting, "lease-lifetime", "20min")).has_value());
     CHECK(Validate(Cmd(CommandKind::SetSetting, "fleet-open", "1")).has_value());
 
     CHECK(Refused(Cmd(CommandKind::SetSetting, "upsteam", "typo")).contains("upsteam"));
@@ -248,7 +251,7 @@ TEST_CASE("Applying is total, and admitting a known member moves it", "[cluster]
 TEST_CASE("A command round-trips, and an unknown verb is refused", "[cluster][state][wire]")
 {
     // Every field a different value, so a transposition cannot survive.
-    auto const original = Cmd(CommandKind::SetSetting, "lease-lifetime", "1200000");
+    auto const original = Cmd(CommandKind::SetSetting, "lease-lifetime", "20min");
     auto const decoded = DecodeCommand(Encode(original));
     REQUIRE(decoded.has_value());
     CHECK(*decoded == original);
@@ -279,7 +282,7 @@ TEST_CASE("A whole state round-trips, members and settings apart", "[cluster][st
     ClusterState state;
     Apply(state, Cmd(CommandKind::AddMember, "n1", "10.0.0.1:6675"));
     Apply(state, Cmd(CommandKind::AddMember, "n2", "10.0.0.2:6675"));
-    Apply(state, Cmd(CommandKind::SetSetting, "lease-lifetime", "1200000"));
+    Apply(state, Cmd(CommandKind::SetSetting, "lease-lifetime", "20min"));
 
     auto const restored = DecodeState(Encode(state));
     REQUIRE(restored.has_value());
@@ -516,7 +519,7 @@ TEST_CASE("A verb that has no scheduler endpoint may not carry one", "[cluster][
     // the proposer because that is the only place anything can be refused.
     CHECK(Validate(Cmd(CommandKind::AddMember, "n1", "10.0.0.1:6675", "10.0.0.1:7000")).has_value());
     CHECK_FALSE(Validate(Cmd(CommandKind::RemoveMember, "n1", {}, "10.0.0.1:7000")).has_value());
-    CHECK_FALSE(Validate(Cmd(CommandKind::SetSetting, "lease-lifetime", "1200000", "10.0.0.1:7000")).has_value());
+    CHECK_FALSE(Validate(Cmd(CommandKind::SetSetting, "lease-lifetime", "20min", "10.0.0.1:7000")).has_value());
 }
 
 TEST_CASE("A member's two endpoints survive a snapshot apart", "[cluster][state][wire]")
@@ -528,7 +531,7 @@ TEST_CASE("A member's two endpoints survive a snapshot apart", "[cluster][state]
     ClusterState state;
     Apply(state, Cmd(CommandKind::AddMember, "n1", "10.0.0.1:6675", "10.0.0.1:7000"));
     Apply(state, Cmd(CommandKind::AddMember, "n2", "10.0.0.2:6675"));
-    Apply(state, Cmd(CommandKind::SetSetting, "lease-lifetime", "1200000"));
+    Apply(state, Cmd(CommandKind::SetSetting, "lease-lifetime", "20min"));
     Apply(state, Cmd(CommandKind::SetSetting, "fleet-open", "1"));
 
     auto const restored = DecodeState(Encode(state));
@@ -613,24 +616,27 @@ TEST_CASE("A lease lifetime the cluster may not agree on is refused, and one it 
     // this ticket delivering nothing while looking delivered.
     SECTION("a value the cluster may agree on")
     {
-        CHECK(Validate(Cmd(CommandKind::SetSetting, std::string { LeaseLifetimeSetting }, "1800000")).has_value());
+        CHECK(Validate(Cmd(CommandKind::SetSetting, std::string { LeaseLifetimeSetting }, "30min")).has_value());
+        CHECK(ParseLeaseLifetime("30min") == std::chrono::milliseconds { std::chrono::minutes { 30 } });
 
-        // The two ends of the legal range, exactly. Inside-the-range values alone would
-        // pass against a validator whose bounds are off by any amount.
+        // The two ends of the legal range, exactly, in the text `FormatDuration` writes --
+        // which is the text the refusals below print for an operator to type back.
+        // Inside-the-range values alone would pass against a validator whose bounds are
+        // off by any amount.
         CHECK(Validate(Cmd(CommandKind::SetSetting,
                            std::string { LeaseLifetimeSetting },
-                           std::to_string(Wire::MaxCompileLeaseLifetime.count())))
+                           FormatDuration(Wire::MaxCompileLeaseLifetime)))
                   .has_value());
         CHECK(Validate(Cmd(CommandKind::SetSetting,
                            std::string { LeaseLifetimeSetting },
-                           std::to_string(Wire::DefaultCompileIdleTimeout.count() + 1)))
+                           FormatDuration(Wire::DefaultCompileIdleTimeout + std::chrono::milliseconds { 1 })))
                   .has_value());
 
         // The shipped default must itself be settable, or an operator cannot type the
         // value their fleet is already running.
         CHECK(Validate(Cmd(CommandKind::SetSetting,
                            std::string { LeaseLifetimeSetting },
-                           std::to_string(Wire::DefaultCompileLeaseTimeout.count())))
+                           FormatDuration(Wire::DefaultCompileLeaseTimeout)))
                   .has_value());
     }
 
@@ -642,8 +648,8 @@ TEST_CASE("A lease lifetime the cluster may not agree on is refused, and one it 
         // what `MaxCompileLeaseLifetime` argues is acceptable.
         auto const refusal = Refused(Cmd(CommandKind::SetSetting,
                                          std::string { LeaseLifetimeSetting },
-                                         std::to_string(Wire::MaxCompileLeaseLifetime.count() + 1)));
-        CHECK(refusal.contains(std::to_string(Wire::MaxCompileLeaseLifetime.count())));
+                                         FormatDuration(Wire::MaxCompileLeaseLifetime + std::chrono::milliseconds { 1 })));
+        CHECK(refusal.contains(std::format("at most {}", FormatDuration(Wire::MaxCompileLeaseLifetime))));
         // The REASON travels, because an operator meeting a bare "too large" has no way
         // to know this is a replay bound rather than a number somebody rounded.
         CHECK(refusal.contains("replayable"));
@@ -658,19 +664,22 @@ TEST_CASE("A lease lifetime the cluster may not agree on is refused, and one it 
         // failure the build-time assertion exists to prevent, reachable at run time.
         CHECK(Refused(Cmd(CommandKind::SetSetting,
                           std::string { LeaseLifetimeSetting },
-                          std::to_string(Wire::DefaultCompileIdleTimeout.count())))
+                          FormatDuration(Wire::DefaultCompileIdleTimeout)))
                   .contains("silence"));
-        CHECK_FALSE(Refused(Cmd(CommandKind::SetSetting, std::string { LeaseLifetimeSetting }, "1")).empty());
+        CHECK(Refused(Cmd(CommandKind::SetSetting, std::string { LeaseLifetimeSetting }, "1ms")).contains("silence"));
     }
 
-    SECTION("what is not a number at all")
+    SECTION("what is not a duration")
     {
-        // Parsed WHOLE. `from_chars` stops at the first byte it cannot read, so a
-        // prefix-parse would adopt 600000 from "600000ms" -- a number the operator did
-        // not write, accepted silently, replicated to the whole fleet.
-        CHECK_FALSE(Refused(Cmd(CommandKind::SetSetting, std::string { LeaseLifetimeSetting }, "600000ms")).empty());
-        CHECK_FALSE(Refused(Cmd(CommandKind::SetSetting, std::string { LeaseLifetimeSetting }, "600 000")).empty());
-        CHECK_FALSE(Refused(Cmd(CommandKind::SetSetting, std::string { LeaseLifetimeSetting }, "-1")).empty());
+        // A bare number is refused BY NAME, and it is the case with history: this setting
+        // read `600000` as milliseconds, so an operator typing what the old documentation
+        // said is told the grammar rather than handed a lifetime of a different length.
+        CHECK(
+            Refused(Cmd(CommandKind::SetSetting, std::string { LeaseLifetimeSetting }, "600000")).contains("names no unit"));
+        // Parsed WHOLE: trailing or inner text is a refusal, never a prefix adopted.
+        CHECK_FALSE(Refused(Cmd(CommandKind::SetSetting, std::string { LeaseLifetimeSetting }, "10min later")).empty());
+        CHECK_FALSE(Refused(Cmd(CommandKind::SetSetting, std::string { LeaseLifetimeSetting }, "600 000ms")).empty());
+        CHECK(Refused(Cmd(CommandKind::SetSetting, std::string { LeaseLifetimeSetting }, "-1s")).contains("negative"));
         CHECK_FALSE(Refused(Cmd(CommandKind::SetSetting, std::string { LeaseLifetimeSetting }, "")).empty());
     }
 

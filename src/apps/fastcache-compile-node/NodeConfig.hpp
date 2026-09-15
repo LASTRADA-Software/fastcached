@@ -169,7 +169,7 @@ struct NodeConfig
     /// "my editor stutters" and never connects to a build fleet.
     ///
     /// Beside `toolchainDiscovery` for LAYOUT: a byte-wide member between the two
-    /// 4-aligned `optional`s and `drainTimeoutSeconds` below cost the struct past the
+    /// 4-aligned `optional`s and `drainTimeout` below cost the struct past the
     /// padding budget clang-tidy enforces once `slots` became an `optional` (#206).
     Distributed::NodeClass nodeClass { Distributed::NodeClass::Workstation };
     /// Concurrent compiles this node offers the fleet, when the operator named a number.
@@ -216,7 +216,7 @@ struct NodeConfig
     /// stays reachable so an operator who prefers the supervisor's timeout to this
     /// one can say so, rather than discovering the change as a behaviour they cannot
     /// turn off.
-    std::uint32_t drainTimeoutSeconds { 30 };
+    std::chrono::seconds drainTimeout { 30 };
 
     /// Where the admin endpoint listens, or empty to leave it off.
     ///
@@ -676,7 +676,7 @@ struct NodeConfig
     bool discoveryAddressExplicit { false };
     bool discoveryReplyPortExplicit { false };
     bool upstreamExplicit { false };
-    bool drainTimeoutSecondsExplicit { false };
+    bool drainTimeoutExplicit { false };
     bool logLevelExplicit { false };
     bool compressionExplicit { false };
     bool compressionLevelExplicit { false };

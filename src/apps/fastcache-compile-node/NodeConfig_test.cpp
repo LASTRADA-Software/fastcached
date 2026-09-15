@@ -7,6 +7,7 @@
 #include <FastCache/Cache/CowTreeStorage.hpp>
 #include <FastCache/Cache/InMemoryLruStorage.hpp>
 #include <FastCache/Cache/StorageTier.hpp>
+#include <FastCache/Cli/Duration.hpp>
 #include <FastCache/Cli/Options.hpp>
 #include <FastCache/Cluster/ClusterState.hpp>
 #include <FastCache/Config/ConfigReloader.hpp>
@@ -447,7 +448,7 @@ TEST_CASE("NodeConfig: every flag that is worker state reaches the supervisor", 
     // platform where that default is true (#496).
     cfg.logTimestamps = !FastCache::DefaultLogTimestamps;
     cfg.pidfile = "worker.pid";
-    cfg.drainTimeoutSeconds = 90;
+    cfg.drainTimeout = std::chrono::seconds { 90 };
     // Worker state like any other, and the one that supplies most of the rest: a
     // registration that dropped it would come back at every boot knowing only what
     // was typed alongside --install-service, which for a package install is close
@@ -479,6 +480,25 @@ TEST_CASE("NodeConfig: every flag that is worker state reaches the supervisor", 
         auto const emitted = std::ranges::any_of(
             spec.arguments, [&option](std::string const& arg) { return FlagMatches(arg, option.primary); });
         CHECK(emitted);
+    }
+}
+
+TEST_CASE("NodeConfig: a registered drain timeout is read back as the same length", "[node][service]")
+{
+    // #1402, the worker's half of the daemon's round trip. `--drain-timeout` keeps whole seconds and
+    // a registration writes it in the grammar the flag reads. `90s` is a length no larger unit
+    // divides and `2h` one that does: a registration writing the bare count fails both on the way
+    // back, and only the worker's own parser can say so.
+    for (auto const length: { std::chrono::seconds { 90 }, std::chrono::seconds { std::chrono::hours { 2 } } })
+    {
+        INFO("seconds: " << length.count());
+        auto cfg = Installable();
+        cfg.drainTimeout = length;
+        cfg.drainTimeoutExplicit = true;
+        auto const reparsed = ReparseSpec(MakeNodeServiceSpec(std::filesystem::path { "fastcache-compile-node" }, cfg));
+        REQUIRE(reparsed.has_value());
+        CHECK(reparsed->drainTimeout == length);
+        CHECK(reparsed->drainTimeoutExplicit);
     }
 }
 
@@ -3158,21 +3178,34 @@ TEST_CASE("The drain bound is an operator's to set, zero included", "[node][conf
     // compiles legitimately run -- and a compile-time answer on a binary whose
     // `--install-service` replays its command line forever is one nobody can move
     // afterwards (#239).
-    CHECK(NodeConfig {}.drainTimeoutSeconds == 30);
+    CHECK(NodeConfig {}.drainTimeout == std::chrono::seconds { 30 });
 
-    auto const set = ParseNodeArgv({ "--drain-timeout=90" });
+    auto const set = ParseNodeArgv({ "--drain-timeout=90s" });
     REQUIRE(set.has_value());
-    CHECK(set->drainTimeoutSeconds == 90);
+    CHECK(set->drainTimeout == std::chrono::seconds { 90 });
+
+    // Any unit that lands on a whole second, because the setting keeps seconds.
+    auto const minutes = ParseNodeArgv({ "--drain-timeout=2min" });
+    REQUIRE(minutes.has_value());
+    CHECK(minutes->drainTimeout == std::chrono::seconds { 120 });
 
     // Zero is a real answer and a DIFFERENT one from omitting the flag: it is what
     // this did before the bound existed, kept sayable for an operator who would
     // rather have the supervisor decide.
-    auto const forever = ParseNodeArgv({ "--drain-timeout=0" });
+    auto const forever = ParseNodeArgv({ "--drain-timeout=0s" });
     REQUIRE(forever.has_value());
-    CHECK(forever->drainTimeoutSeconds == 0);
+    CHECK(forever->drainTimeout == std::chrono::seconds::zero());
 
-    // Refused by the row's own grammar rather than clamped somewhere downstream.
+    // Refused by the row's own grammar rather than clamped somewhere downstream: not
+    // a duration, a bare number (which was seconds here and milliseconds on the
+    // daemon's expiry interval), and a value finer than the second the field keeps.
     CHECK_FALSE(ParseNodeArgv({ "--drain-timeout=soon" }).has_value());
+    auto const bare = ParseNodeArgv({ "--drain-timeout=90" });
+    REQUIRE_FALSE(bare.has_value());
+    CHECK(bare.error().context.contains("names no unit"));
+    auto const fine = ParseNodeArgv({ "--drain-timeout=1500ms" });
+    REQUIRE_FALSE(fine.has_value());
+    CHECK(fine.error().context.contains("not a whole number of 1s"));
 }
 
 TEST_CASE("NodeConfig: a cluster key is never refused for having no reader", "[node][policy][lease]")
@@ -5533,7 +5566,7 @@ constexpr auto WorkerSettingSamples = std::to_array<WorkerSettingSample>({
     { .flag = "--node-class", .value = "dedicated" },
     // Not the default, so this section is about the column; typing the DEFAULT is the
     // provenance case below.
-    { .flag = "--drain-timeout", .value = "45" },
+    { .flag = "--drain-timeout", .value = "45s" },
     { .flag = "--reserve-cores", .value = "2" },
 });
 
@@ -5605,15 +5638,15 @@ TEST_CASE("NodeConfig: a worker-only setting typed at its default is still named
     // #206. Whether a setting was NAMED is provenance: the bit the parse records, or a
     // field empty by type. Never the value compared against a default, which cannot see
     // the operator who typed the default -- and a node running no worker told
-    // `--drain-timeout=30` has named a worker's setting exactly as one told `=45` has.
+    // `--drain-timeout=30s` has named a worker's setting exactly as one told `=45s` has.
     NodeConfig const defaults;
 
     SECTION("a row carrying a bit, typed at its default")
     {
-        auto const typed = std::format("--drain-timeout={}", defaults.drainTimeoutSeconds);
+        auto const typed = std::format("--drain-timeout={}", FormatDuration(defaults.drainTimeout));
         auto const named = ParseNodeArgv({ "--slots=0", typed.c_str() });
         REQUIRE(named.has_value());
-        REQUIRE(named->drainTimeoutSeconds == defaults.drainTimeoutSeconds);
+        REQUIRE(named->drainTimeout == defaults.drainTimeout);
         auto const refusal = StartupPolicyRejection(*named);
         REQUIRE(refusal.has_value());
         CHECK(Unwrap(refusal).starts_with("--drain-timeout configures the worker"));

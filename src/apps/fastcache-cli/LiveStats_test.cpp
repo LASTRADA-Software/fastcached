@@ -3,6 +3,7 @@
 #include "LiveStats.hpp"
 #include "ScriptedExchange.hpp"
 
+#include <FastCache/Cli/Duration.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
 #include <catch2/catch_test_macros.hpp>
@@ -286,7 +287,9 @@ TEST_CASE("each subject's floor refuses one millisecond below it and accepts it 
         REQUIRE_FALSE(below.result.has_value());
         CHECK(below.result.error().outcome == Outcome::Usage);
         CHECK(ExitCodeOf(below.result.error().outcome) == 2);
-        CHECK(RefusalText(below).contains(std::format("{}ms", FloorOf(row).count())));
+        // Both lengths in the grammar the flag reads, so the refusal can be pasted back.
+        CHECK(RefusalText(below).contains(std::format("--interval={}", FormatDuration(FloorOf(row) - 1ms))));
+        CHECK(RefusalText(below).contains(std::format("floor of {}", FormatDuration(FloorOf(row)))));
         CHECK(RefusalText(below).contains(row.key));
 
         auto const at = Admit(operands, WithInterval(FloorOf(row)), identity);
@@ -309,7 +312,7 @@ TEST_CASE("an interval above the longest cadence a stream keeps is refused and t
     auto const above = Admit(operands, WithInterval(CompileCacheWire::MaxLiveCadence + 1ms), identity);
     REQUIRE_FALSE(above.result.has_value());
     CHECK(above.result.error().outcome == Outcome::Usage);
-    CHECK(RefusalText(above).contains(std::format("{}ms", CompileCacheWire::MaxLiveCadence.count())));
+    CHECK(RefusalText(above).contains(std::format("keeps, {}", FormatDuration(CompileCacheWire::MaxLiveCadence))));
 
     auto const at = Admit(operands, WithInterval(CompileCacheWire::MaxLiveCadence), identity);
     REQUIRE(at.result.has_value());

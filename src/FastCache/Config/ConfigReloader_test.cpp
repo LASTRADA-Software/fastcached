@@ -178,7 +178,7 @@ TEST_CASE("ConfigReloader::Reload rejects changes to the active expiry cycle", "
                                 "bind: 127.0.0.1\n"
                                 "port: 11740\n"
                                 "max_memory: 1024\n"
-                                "active_expiry_interval_ms: 1000\n");
+                                "active_expiry_interval: 1s\n");
     FastCache::Config initial {
         .maxMemoryBytes = 1024,
         .bindAddress = "127.0.0.1",
@@ -191,14 +191,14 @@ TEST_CASE("ConfigReloader::Reload rejects changes to the active expiry cycle", "
     // plausibly try, and the one that would look most like it had worked.
     {
         std::ofstream out { path, std::ios::trunc };
-        out << "bind: 127.0.0.1\nport: 11740\nmax_memory: 1024\nactive_expiry_interval_ms: 0\n";
+        out << "bind: 127.0.0.1\nport: 11740\nmax_memory: 1024\nactive_expiry_interval: 0s\n";
     }
 
     auto const result = reloader.Reload();
     REQUIRE_FALSE(result.has_value());
     REQUIRE(result.error().code == FastCache::ConfigErrorCode::ImmutableChanged);
-    REQUIRE(result.error().field == "active_expiry_interval_ms");
-    REQUIRE(reloader.Current()->activeExpiryIntervalMs == FastCache::DefaultActiveExpiryIntervalMs);
+    REQUIRE(result.error().field == "active_expiry_interval");
+    REQUIRE(reloader.Current()->activeExpiryInterval == FastCache::DefaultActiveExpiryInterval);
 
     // The scan budget is its own field and its own rejection, so a change to it
     // cannot ride in unnoticed behind an unchanged interval.

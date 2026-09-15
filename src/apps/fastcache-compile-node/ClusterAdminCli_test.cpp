@@ -137,7 +137,7 @@ struct Fixture
     Cluster::ClusterState state;
     Apply(state, Cmd(Cluster::CommandKind::AddMember, "n1", "10.0.0.1:6680", "10.0.0.1:6675"));
     Apply(state, Cmd(Cluster::CommandKind::AddMember, "n2", "10.0.0.2:6680"));
-    Apply(state, Cmd(Cluster::CommandKind::SetSetting, "lease-lifetime", "1200000"));
+    Apply(state, Cmd(Cluster::CommandKind::SetSetting, "lease-lifetime", "20min"));
     return state;
 }
 } // namespace
@@ -175,10 +175,10 @@ TEST_CASE("Each cluster flag selects its action and carries its operand", "[node
     // to a second row nobody would remember to add.
     CHECK(ParsedFrom({ "--cluster-status" }).cluster.action == ClusterAction::Status);
 
-    auto const set = ParsedFrom({ "--cluster-set=lease-lifetime=1200000" });
+    auto const set = ParsedFrom({ "--cluster-set=lease-lifetime=20min" });
     CHECK(set.cluster.action == ClusterAction::Set);
     CHECK(set.cluster.key == "lease-lifetime");
-    CHECK(set.cluster.value == "1200000");
+    CHECK(set.cluster.value == "20min");
 
     auto const forget = ParsedFrom({ "--cluster-forget=n3" });
     CHECK(forget.cluster.action == ClusterAction::Forget);
@@ -223,7 +223,7 @@ TEST_CASE("A status request round-trips through the real protocol", "[node][clus
     CHECK(rendered->contains("n1"));
     CHECK(rendered->contains("10.0.0.1:6675"));
     CHECK(rendered->contains("scheduler=-"));
-    CHECK(rendered->contains("1200000"));
+    CHECK(rendered->contains("20min"));
     CHECK(rendered->contains("fleet-open"));
 }
 
@@ -277,11 +277,11 @@ TEST_CASE("A change reaches the cluster as the command it names", "[node][cluste
     FakeCluster cluster;
     fixture.service.AdministerWith(cluster);
 
-    CHECK(StatusOf(fixture.Ask(Ask(ClusterAction::Set, "lease-lifetime", "1200000"))) == Wire::Status::Ok);
+    CHECK(StatusOf(fixture.Ask(Ask(ClusterAction::Set, "lease-lifetime", "20min"))) == Wire::Status::Ok);
     CHECK(StatusOf(fixture.Ask(Ask(ClusterAction::Forget, "n3"))) == Wire::Status::Ok);
 
     REQUIRE(cluster.proposed.size() == 2);
-    CHECK(cluster.proposed[0] == Cmd(Cluster::CommandKind::SetSetting, "lease-lifetime", "1200000"));
+    CHECK(cluster.proposed[0] == Cmd(Cluster::CommandKind::SetSetting, "lease-lifetime", "20min"));
     CHECK(cluster.proposed[1] == Cmd(Cluster::CommandKind::RemoveMember, "n3"));
 }
 

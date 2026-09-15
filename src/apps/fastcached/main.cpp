@@ -1054,17 +1054,14 @@ int DaemonBody(FastCache::Config const& effective,
         return EXIT_FAILURE;
     }
     serverOpts.listenBacklog = effective.listenBacklog;
-    // The active expiry cycle. Config carries milliseconds because that is what
-    // survives a merge, a YAML round trip and a `--help` line; the reaper wants
-    // a Duration. The two defaults are asserted equal rather than trusted:
+    // The active expiry cycle. The two defaults are asserted equal rather than trusted:
     // `Config` cannot include `Cache/`, so the number is written in both places,
     // and a `--help` line advertising a default the daemon does not use is
     // exactly the kind of drift nothing else would catch.
-    static_assert(
-        FastCache::DefaultActiveExpiryIntervalMs
-        == std::chrono::duration_cast<std::chrono::milliseconds>(FastCache::ExpiryReaperOptions {}.interval).count());
+    static_assert(FastCache::DefaultActiveExpiryInterval
+                  == std::chrono::duration_cast<std::chrono::milliseconds>(FastCache::ExpiryReaperOptions {}.interval));
     static_assert(FastCache::DefaultActiveExpiryScanBudget == FastCache::ExpiryReaperOptions::DefaultScanBudget);
-    serverOpts.expiry.interval = std::chrono::milliseconds { effective.activeExpiryIntervalMs };
+    serverOpts.expiry.interval = effective.activeExpiryInterval;
     serverOpts.expiry.scanBudget = effective.activeExpiryScanBudget;
     // One reactor per core (each single-threaded, connections pinned). One
     // reactor = a single event loop; N reactors scale across cores without any

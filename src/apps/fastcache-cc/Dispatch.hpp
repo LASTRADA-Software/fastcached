@@ -104,7 +104,7 @@ class IEndpointExchange
 /// needs the worker to say it is still there — an idle bound of seconds against a
 /// total that stays long. That is a wire change tracked as #245.
 ///
-/// It is `FASTCACHE_DISPATCH_TIMEOUT_MS` at run time, and `fastcache-cc` is one
+/// It is `FASTCACHE_DISPATCH_TIMEOUT` at run time, and `fastcache-cc` is one
 /// process per translation unit, so the variable IS the runtime knob: the next
 /// compile reads it. Nothing has to be reloaded, and nothing has to be restarted.
 constexpr std::chrono::milliseconds DefaultDispatchTotal = CompileCacheWire::DefaultCompileLeaseTimeout;
@@ -125,7 +125,7 @@ constexpr std::chrono::milliseconds DefaultDispatchTotal = CompileCacheWire::Def
 /// one into a fleet that refuses healthy workers is a build failure rather than a
 /// support ticket.
 ///
-/// It is `FASTCACHE_DISPATCH_IDLE_MS` at run time, and zero turns it off -- which
+/// It is `FASTCACHE_DISPATCH_IDLE` at run time, and zero turns it off -- which
 /// restores exactly the pre-#245 behaviour, one flat deadline, for an operator who
 /// would rather have that than a fleet whose workers they do not trust to pulse.
 constexpr std::chrono::milliseconds DefaultDispatchIdle = CompileCacheWire::DefaultCompileIdleTimeout;
@@ -202,7 +202,7 @@ struct DispatchBudgetKnobs
 /// gained `keepAlive` (#247). The copy silently overwrote `KeepAlive::Yes` with the
 /// control leg's `No`, so no shipped launcher has ever armed keepalive on the one
 /// exchange it exists for, and a worker whose host vanished still cost the full
-/// `FASTCACHE_DISPATCH_TIMEOUT_MS`. Nothing could see it: the default member
+/// `FASTCACHE_DISPATCH_TIMEOUT`. Nothing could see it: the default member
 /// initializer above was the only statement of the intent, `main.cpp` is in no test
 /// target, and the docs described the unarmed behaviour, so code and prose agreed
 /// by accident.
@@ -234,7 +234,7 @@ struct DispatchBudgetKnobs
 /// the one place an operator watches. So a dispatched compile's total comes from the
 /// grant in hand, never from this process's configuration.
 ///
-/// That is why `FASTCACHE_DISPATCH_TIMEOUT_MS` no longer decides a dispatched compile:
+/// That is why `FASTCACHE_DISPATCH_TIMEOUT` no longer decides a dispatched compile:
 /// **a client-side knob overriding the fleet's agreed bound is a worker-side override
 /// wearing a client's clothes**, and the ticket forbids one of those exactly one
 /// machine along. It stays as the fallback below and as the bound on the paths that

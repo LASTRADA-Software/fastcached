@@ -145,10 +145,11 @@
 # one.
 #node_class:
 
-# seconds a stop waits for compiles still running before giving up and
-# saying what it abandoned; 0 waits forever. Unbounded, the supervisor
-# decides instead and answers with SIGKILL and no diagnostic.
-#drain_timeout_seconds:
+# how long a stop waits for compiles still running before giving up and
+# saying what it abandoned (default 30s); 0s waits forever. Whole seconds, in
+# one of ms, s, min, h, d. Unbounded, the supervisor decides instead and
+# answers with SIGKILL and no diagnostic.
+#drain_timeout:
 
 # cores never offered to the fleet, overriding what the node class reserves.
 # 0 is a real answer and is not the same as omitting the flag. Ignored when

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "LiveStats.hpp"
 
+#include <FastCache/Cli/Duration.hpp>
 #include <FastCache/Core/Ranges.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
@@ -45,16 +46,16 @@ namespace
             return std::nullopt;
         if (*interval < FloorOf(spec))
             return Concluded(Outcome::Usage,
-                             std::format("--interval={} is below the `{}` floor of {}ms: {}",
-                                         interval->count(),
+                             std::format("--interval={} is below the `{}` floor of {}: {}",
+                                         FormatDuration(*interval),
                                          spec.key,
-                                         FloorOf(spec).count(),
+                                         FormatDuration(FloorOf(spec)),
                                          spec.costsWhom));
         if (*interval > CompileCacheWire::MaxLiveCadence)
             return Concluded(Outcome::Usage,
-                             std::format("--interval={} is above the longest cadence a live-stats stream keeps, {}ms",
-                                         interval->count(),
-                                         CompileCacheWire::MaxLiveCadence.count()));
+                             std::format("--interval={} is above the longest cadence a live-stats stream keeps, {}",
+                                         FormatDuration(*interval),
+                                         FormatDuration(CompileCacheWire::MaxLiveCadence)));
         return std::nullopt;
     }
 

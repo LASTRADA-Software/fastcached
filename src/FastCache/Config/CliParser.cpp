@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#include <FastCache/Cli/Duration.hpp>
 #include <FastCache/Config/ByteSize.hpp>
 #include <FastCache/Config/CliParser.hpp>
 #include <FastCache/Config/CompressionValues.hpp>
@@ -87,23 +88,23 @@ namespace
         return ParsePositiveInt(sv, "storage-shards");
     }
 
-    /// A day, in milliseconds. Not a limit anybody reaches on purpose; it is
-    /// here so a figure typed in the wrong unit is refused rather than silently
-    /// turning the cycle off for the life of the process.
-    constexpr std::size_t ExpiryIntervalCeilingMs = 86'400'000;
+    /// A day. Not a limit anybody reaches on purpose; it is here so a figure typed
+    /// wildly wrong is refused rather than silently turning the cycle off for the life
+    /// of the process.
+    constexpr std::chrono::milliseconds ExpiryIntervalCeiling = std::chrono::days { 1 };
 
-    [[nodiscard]] std::expected<std::uint32_t, ConfigError> ParseExpiryInterval(std::string_view sv)
+    [[nodiscard]] std::expected<std::chrono::milliseconds, ConfigError> ParseExpiryInterval(std::string_view sv)
     {
-        // Zero is meaningful here -- it disables the cycle -- so it is accepted
+        // Zero is meaningful here -- it disables the cycle -- so `0s` is accepted
         // rather than rejected as a degenerate count.
-        return ParsePositiveInt(sv, "expiry-interval")
-            .and_then([](std::size_t value) -> std::expected<std::uint32_t, ConfigError> {
-                if (value > ExpiryIntervalCeilingMs)
-                    return std::unexpected(
-                        ArgvError(ConfigErrorCode::OutOfRange,
-                                  "expiry-interval",
-                                  std::format("out of range (0..{}): {}", ExpiryIntervalCeilingMs, value)));
-                return static_cast<std::uint32_t>(value);
+        return ParseDurationValue<std::chrono::milliseconds>(sv).and_then(
+            [sv](std::chrono::milliseconds value) -> std::expected<std::chrono::milliseconds, ConfigError> {
+                if (value > ExpiryIntervalCeiling)
+                    return std::unexpected(ArgvError(
+                        ConfigErrorCode::OutOfRange,
+                        "expiry-interval",
+                        std::format("`{}` is longer than the ceiling of {}", sv, FormatDuration(ExpiryIntervalCeiling))));
+                return value;
             });
     }
 
@@ -660,15 +661,16 @@ namespace
           .same = FieldEq<&Config::storageShards>() },
         { .primary = "--expiry-interval",
           .arity = Arity::Value,
-          .operand = "=<ms>",
-          .apply = AssignFrom<&Config::activeExpiryIntervalMs, ParseExpiryInterval>(),
-          .explicitBit = &CliResult::activeExpiryIntervalMsExplicit,
-          .description = "how often to sweep for entries whose TTL has lapsed (default 1000; 0 disables).\n"
+          .operand = "=<duration>",
+          .apply = AssignFrom<&Config::activeExpiryInterval, ParseExpiryInterval>(),
+          .explicitBit = &CliResult::activeExpiryIntervalExplicit,
+          .description = "how often to sweep for entries whose TTL has lapsed (default {expiry-interval};\n"
+                         "0s disables). A duration: a whole number and one of {duration-units}.\n"
                          "without it expiry is purely access-driven, so a key nobody touches again is\n"
                          "never reclaimed and fires no `expired` keyspace event.\n"
                          "backs off while there is nothing to reclaim",
-          .yamlKey = "active_expiry_interval_ms",
-          .same = FieldEq<&Config::activeExpiryIntervalMs>() },
+          .yamlKey = "active_expiry_interval",
+          .same = FieldEq<&Config::activeExpiryInterval>() },
         { .primary = "--expiry-scan",
           .arity = Arity::Value,
           .operand = "=<N>",
@@ -928,6 +930,8 @@ namespace
         return {
             { .token = "{port}", .value = std::format("{}", DefaultPort) },
             { .token = "{metrics-port}", .value = std::format("{}", DefaultMetricsPort) },
+            { .token = "{expiry-interval}", .value = FormatDuration(DefaultActiveExpiryInterval) },
+            { .token = "{duration-units}", .value = DurationUnitList() },
             { .token = "{config-defaults}", .value = FormatDefaultConfigLocations() },
         };
     }

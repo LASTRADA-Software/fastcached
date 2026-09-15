@@ -245,8 +245,17 @@ TEST_CASE("set sends the modifiers it was given and nothing it was not", "[cli][
     SECTION("with a ttl")
     {
         ScriptedExchange exchange { Answers({ Simple("OK") }) };
-        (void) Run("set", { "k", "v" }, exchange, VerbOptions { .ttlSeconds = 30 });
+        (void) Run("set", { "k", "v" }, exchange, VerbOptions { .ttl = std::chrono::seconds { 30 } });
         CHECK(exchange.Sent()[0] == std::vector<std::string> { "SET", "k", "v", "EX", "30" });
+    }
+    SECTION("with a ttl past memcached's bound, which RESP carries as a length")
+    {
+        // The control for the memcached refusal: the bound is that WIRE's, so a check written
+        // against the verb or the value would refuse this too.
+        ScriptedExchange exchange { Answers({ Simple("OK") }) };
+        auto const answer = Run("set", { "k", "v" }, exchange, VerbOptions { .ttl = std::chrono::days { 31 } });
+        CHECK(answer.outcome == Outcome::Affirmative);
+        CHECK(exchange.Sent()[0] == std::vector<std::string> { "SET", "k", "v", "EX", "2678400" });
     }
     SECTION("only if absent")
     {

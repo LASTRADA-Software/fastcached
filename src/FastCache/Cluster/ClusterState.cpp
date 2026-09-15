@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#include <FastCache/Cli/Duration.hpp>
 #include <FastCache/Cluster/ClusterState.hpp>
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/HostPort.hpp>
@@ -345,24 +346,15 @@ std::expected<std::chrono::milliseconds, std::string> ParseLeaseLifetime(std::st
 {
     namespace Wire = CompileCacheWire;
 
-    // Parsed whole, so trailing text is a refusal rather than something `from_chars`
-    // silently stops at: "600000ms" and "600 000" are both things an operator types,
-    // and adopting the prefix of either would set a number they did not write.
-    //
-    // The bounds are spelled into the call rather than hoisted into an `end` local
-    // because `bugprone-suspicious-stringview-data-usage` refuses the hoisted form, and
-    // `WarningsAsErrors` makes that a build failure rather than a comment. The check
-    // looks for `size()` in the same call as `data()`; an `end` computed one line above
-    // is a bound it cannot see. There is no defect in either spelling -- `from_chars`
-    // takes two pointers and reads no terminator -- so this is the analyser's rule being
-    // obeyed, not a hazard being avoided.
-    std::uint64_t millis = 0;
-    auto const parsed = std::from_chars(value.data(), value.data() + value.size(), millis);
-    if (parsed.ec != std::errc {} || parsed.ptr != value.data() + value.size())
-        return std::unexpected(
-            std::format("{} is milliseconds, as digits: {}", LeaseLifetimeSetting, value.empty() ? "(empty)" : value));
+    // The grammar every other length an operator types is read in (#1402), whole: a
+    // number and a unit, nothing trailing. A bare number is refused by name -- this
+    // setting read `1200000` as milliseconds, and a value committed that way is now
+    // unreadable, which `SchedulerService::AgreedLeaseLifetime` degrades on and says so.
+    auto const parsed = ParseDuration(value);
+    if (!parsed.has_value())
+        return std::unexpected(std::format("{}: {}", LeaseLifetimeSetting, DescribeDurationFault(parsed.error(), value)));
 
-    auto const asked = std::chrono::milliseconds { millis };
+    auto const asked = *parsed;
 
     // The relation `CompileCacheWire`'s static_assert can no longer cover, asked here
     // because here is where a value first exists. An idle bound at or above the total
@@ -370,23 +362,22 @@ std::expected<std::chrono::milliseconds, std::string> ParseLeaseLifetime(std::st
     // as stopped -- and the client would give up on silence before the lease it is
     // waiting on could possibly expire, which makes the total bound nothing.
     if (asked <= Wire::DefaultCompileIdleTimeout)
-        return std::unexpected(
-            std::format("{} must exceed the {} ms a client tolerates in silence, or a healthy worker's own "
-                        "jitter reads as a dead one; asked for {} ms",
-                        LeaseLifetimeSetting,
-                        Wire::DefaultCompileIdleTimeout.count(),
-                        asked.count()));
+        return std::unexpected(std::format("{} must exceed the {} a client tolerates in silence, or a healthy worker's own "
+                                           "jitter reads as a dead one; asked for {}",
+                                           LeaseLifetimeSetting,
+                                           FormatDuration(Wire::DefaultCompileIdleTimeout),
+                                           FormatDuration(asked)));
 
     // REFUSED, never clamped: see `SettingSpec::refuse`. The ceiling's own reasons are
     // on `MaxCompileLeaseLifetime` and are about replay and about how long a member may
     // hold a compile socket, neither of which an operator can be expected to derive.
     if (asked > Wire::MaxCompileLeaseLifetime)
         return std::unexpected(
-            std::format("{} may be at most {} ms, since it bounds the window a captured grant is replayable in "
-                        "across a worker restart; asked for {} ms",
+            std::format("{} may be at most {}, since it bounds the window a captured grant is replayable in "
+                        "across a worker restart; asked for {}",
                         LeaseLifetimeSetting,
-                        Wire::MaxCompileLeaseLifetime.count(),
-                        asked.count()));
+                        FormatDuration(Wire::MaxCompileLeaseLifetime),
+                        FormatDuration(asked)));
 
     return asked;
 }

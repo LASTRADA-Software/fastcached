@@ -236,9 +236,33 @@ TEST_CASE("a cas token that is not a whole number is refused before anything is 
 TEST_CASE("Naming --ttl reaches the storage verbs that honour it", "[cli][verbs][memcached]")
 {
     auto exchange = ScriptedMemcachedExchange { { "STORED\r\n" } };
-    auto const answer = Run("add", { "k", "v" }, exchange, VerbOptions { .ttlSeconds = 90 });
+    auto const answer = Run("add", { "k", "v" }, exchange, VerbOptions { .ttl = std::chrono::seconds { 90 } });
     CHECK(answer.outcome == Outcome::Affirmative);
     CHECK(exchange.Sent().front() == "add k 0 90 1\r\nv\r\n");
+}
+
+TEST_CASE("a --ttl memcached would read as a date is refused before anything is sent", "[cli][verbs][memcached]")
+{
+    // memcached reads an exptime past 30 days as a UNIX timestamp, so `--ttl=31d` would store a
+    // key that expired in 1970 and answer STORED. WHAT DISTINGUISHES: the bound itself is sent as a
+    // length and one second past it is refused with nothing on the wire -- a ceiling off by one in
+    // either direction fails one half.
+    SECTION("at the bound")
+    {
+        auto exchange = ScriptedMemcachedExchange { { "STORED\r\n" } };
+        auto const answer = Run("add", { "k", "v" }, exchange, VerbOptions { .ttl = std::chrono::days { 30 } });
+        CHECK(answer.outcome == Outcome::Affirmative);
+        CHECK(exchange.Sent().front() == "add k 0 2592000 1\r\nv\r\n");
+    }
+    SECTION("one second past it")
+    {
+        auto exchange = ScriptedMemcachedExchange { { "STORED\r\n" } };
+        auto const answer = Run("add", { "k", "v" }, exchange, VerbOptions { .ttl = std::chrono::seconds { 2'592'001 } });
+        CHECK(answer.outcome == Outcome::Usage);
+        CHECK(Mentions(answer, "--ttl=2592001s"));
+        CHECK(Mentions(answer, "at most 30d"));
+        CHECK(exchange.Sent().empty());
+    }
 }
 
 TEST_CASE("append and prepend do not accept --ttl, because the server ignores it", "[cli][verbs][memcached]")

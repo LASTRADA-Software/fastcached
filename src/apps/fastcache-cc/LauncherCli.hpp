@@ -4,6 +4,7 @@
 #include <FastCache/Cli/Options.hpp>
 #include <FastCache/Cli/UsageDoc.hpp>
 
+#include <chrono>
 #include <cstdint>
 #include <span>
 #include <string>
@@ -157,10 +158,10 @@ namespace EnvName
     constexpr std::string_view Verbose = "FASTCACHE_VERBOSE";
     constexpr std::string_view NoStats = "FASTCACHE_NO_STATS";
     constexpr std::string_view NoDirect = "FASTCACHE_NO_DIRECT";
-    constexpr std::string_view TimeoutMs = "FASTCACHE_TIMEOUT_MS";
-    constexpr std::string_view DispatchTimeoutMs = "FASTCACHE_DISPATCH_TIMEOUT_MS";
-    constexpr std::string_view DispatchIdleMs = "FASTCACHE_DISPATCH_IDLE_MS";
-    constexpr std::string_view ConnectTimeoutMs = "FASTCACHE_CONNECT_TIMEOUT_MS";
+    constexpr std::string_view Timeout = "FASTCACHE_TIMEOUT";
+    constexpr std::string_view DispatchTimeout = "FASTCACHE_DISPATCH_TIMEOUT";
+    constexpr std::string_view DispatchIdle = "FASTCACHE_DISPATCH_IDLE";
+    constexpr std::string_view ConnectTimeout = "FASTCACHE_CONNECT_TIMEOUT";
     constexpr std::string_view MaxStoreBytes = "FASTCACHE_MAX_STORE_BYTES";
     constexpr std::string_view Scheduler = "FASTCACHE_SCHEDULER";
     constexpr std::string_view Token = "FASTCACHE_TOKEN";
@@ -186,6 +187,19 @@ struct EnvVarSpec
     std::string_view name;    ///< The variable, spelled exactly as it is read.
     std::string_view summary; ///< Help text; '\n' starts a continuation line.
 };
+
+/// Read the duration a timeout variable carries: `500ms`, `10min`, and `0s` for "no bound".
+///
+/// **Anything else falls back rather than failing the compile**, for `EnvUnsigned`'s reason in
+/// `main.cpp`: a typo in a build-system variable must not break the build. That includes a bare
+/// number, which is how these variables were spelled while their names ended in `_MS` (#1402) --
+/// so the rename and the grammar arrive together, and a stale `FASTCACHE_TIMEOUT_MS` is simply
+/// not read. Here rather than in `main.cpp`, which is in no test target.
+/// @param text The variable's value; empty when it is unset or set but empty.
+/// @param fallback What an unusable value reads as.
+/// @return The duration, or @p fallback.
+[[nodiscard]] std::chrono::milliseconds EnvironmentDuration(std::string_view text,
+                                                            std::chrono::milliseconds fallback) noexcept;
 
 /// The `FASTCACHE_*` variables, in the order `--help` documents them.
 /// @return A view of the static table; never empty.

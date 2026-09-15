@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "CliCommand.hpp"
 
+#include <FastCache/Cli/Duration.hpp>
 #include <FastCache/Cli/UsageTestUtils.hpp>
 
 #include <catch2/catch_test_macros.hpp>
@@ -314,7 +315,7 @@ TEST_CASE("a modifier a verb does not honour is refused, not ignored", "[cli][co
     CHECK(raw.diagnostic.contains("--raw"));
     CHECK(raw.diagnostic.contains("set"));
 
-    auto const ttl = Parse({ "get", "k", "--ttl=30" });
+    auto const ttl = Parse({ "get", "k", "--ttl=30s" });
     CHECK(ttl.action == Action::UsageError);
     CHECK(ttl.diagnostic.contains("--ttl"));
 
@@ -330,13 +331,13 @@ TEST_CASE("the modifiers each verb does honour are accepted", "[cli][command]")
     // The positive control. Without it, a check that refused every modifier
     // everywhere would pass the case above.
     CHECK(Parse({ "get", "k", "--raw" }).action == Action::RunVerb);
-    CHECK(Parse({ "set", "k", "v", "--ttl=30" }).action == Action::RunVerb);
+    CHECK(Parse({ "set", "k", "v", "--ttl=30s" }).action == Action::RunVerb);
     CHECK(Parse({ "set", "k", "v", "--nx" }).action == Action::RunVerb);
     CHECK(Parse({ "set", "k", "v", "--xx" }).action == Action::RunVerb);
     CHECK(Parse({ "flush", "--all" }).action == Action::RunVerb);
 
-    auto const command = Parse({ "set", "k", "v", "--ttl=30", "--nx" });
-    CHECK(command.verbOptions.ttlSeconds == 30);
+    auto const command = Parse({ "set", "k", "v", "--ttl=30s", "--nx" });
+    CHECK(command.verbOptions.ttl == std::chrono::seconds { 30 });
     CHECK(command.verbOptions.onlyIfAbsent);
 }
 
@@ -358,12 +359,12 @@ TEST_CASE("every modifier is refused by name on every verb that does not honour 
         std::string_view spelling;
     };
     auto const probes = std::to_array<Probe>({
-        { .bit = Modifier::Ttl, .flag = "--ttl", .spelling = "--ttl=30" },
+        { .bit = Modifier::Ttl, .flag = "--ttl", .spelling = "--ttl=30s" },
         { .bit = Modifier::Exclusivity, .flag = "--nx", .spelling = "--nx" },
         { .bit = Modifier::Exclusivity, .flag = "--xx", .spelling = "--xx" },
         { .bit = Modifier::Raw, .flag = "--raw", .spelling = "--raw" },
         { .bit = Modifier::Everything, .flag = "--all", .spelling = "--all" },
-        { .bit = Modifier::Interval, .flag = "--interval", .spelling = "--interval=1000" },
+        { .bit = Modifier::Interval, .flag = "--interval", .spelling = "--interval=1s" },
         { .bit = Modifier::Samples, .flag = "--samples", .spelling = "--samples=3" },
         { .bit = Modifier::Range, .flag = "--range", .spelling = "--range=7d" },
     });
@@ -399,15 +400,23 @@ TEST_CASE("live-stats is the one verb that honours the interval and sample modif
     // §9.19's other half: the mechanism watched ACCEPTING. Without it a check refusing
     // both flags on every verb would pass the derived case above -- which is exactly what
     // the tree looked like before this row existed.
-    auto const command = Parse({ "live-stats", "--interval=2000", "--samples=3" });
+    auto const command = Parse({ "live-stats", "--interval=2s", "--samples=3" });
     CHECK(command.action == Action::RunVerb);
     REQUIRE(command.verbOptions.interval.has_value());
     CHECK(Unwrap(command.verbOptions.interval) == std::chrono::milliseconds { 2000 });
+    auto const fine = Parse({ "live-stats", "--interval=500ms" });
+    CHECK(fine.action == Action::RunVerb);
+    CHECK(Unwrap(fine.verbOptions.interval) == std::chrono::milliseconds { 500 });
+    // A bare number was milliseconds here and seconds on `--ttl`, which is the defect (#1402). Asked on the verb
+    // that honours the flag, so the refusal is the value's and not the applicability check's.
+    auto const bare = Parse({ "live-stats", "--interval=2000" });
+    CHECK(bare.action == Action::UsageError);
+    CHECK(bare.diagnostic.contains("names no unit"));
     REQUIRE(command.verbOptions.samples.has_value());
     CHECK(Unwrap(command.verbOptions.samples) == 3);
 
     // With a subject named, the operand stays an operand and the modifier stays a modifier.
-    auto const named = Parse({ "live-stats", "fleet", "--interval=5000" });
+    auto const named = Parse({ "live-stats", "fleet", "--interval=5s" });
     CHECK(named.action == Action::RunVerb);
     CHECK(named.operands == std::vector<std::string> { "fleet" });
 
@@ -457,8 +466,8 @@ TEST_CASE("a malformed interval or sample count is refused as a value rather tha
         CHECK_FALSE(command.diagnostic.contains("means nothing"));
     };
 
-    expectValueRefusal("--interval=soon", "whole number");
-    expectValueRefusal("--interval=-1", "whole number");
+    expectValueRefusal("--interval=soon", "is not a duration");
+    expectValueRefusal("--interval=-1s", "is negative");
     expectValueRefusal("--samples=many", "whole number");
 
     // Zero is a well-formed count and still refused: `DashboardLimits` spells *no bound*
@@ -473,18 +482,38 @@ TEST_CASE("nx and xx together are refused", "[cli][command]")
     CHECK(command.diagnostic.contains("contradict"));
 }
 
-TEST_CASE("a ttl that is not a number is refused", "[cli][command]")
+TEST_CASE("a ttl that is not a whole number of seconds above zero is refused by what is wrong with it", "[cli][command]")
 {
-    CHECK(Parse({ "set", "k", "v", "--ttl=soon" }).action == Action::UsageError);
-    CHECK(Parse({ "set", "k", "v", "--ttl=-5" }).action == Action::UsageError);
+    // WHAT DISTINGUISHES is the sentence: every one of these is a `UsageError` whichever rule
+    // refuses it, so each asserts its own.
+    auto const expectRefusal = [](std::string_view spelling, std::string_view complaint) {
+        CAPTURE(spelling);
+        auto const command = Parse({ "set", "k", "v", spelling });
+        CHECK(command.action == Action::UsageError);
+        CHECK(command.diagnostic.contains(complaint));
+    };
+    expectRefusal("--ttl=soon", "is not a duration");
+    expectRefusal("--ttl=-5s", "is negative");
+    expectRefusal("--ttl=90", "names no unit");
+    // Both wires carry whole seconds, so a finer value is refused rather than rounded.
+    expectRefusal("--ttl=500ms", "not a whole number of 1s");
+    // Zero is never-expiring on memcached and refused by RESP.
+    expectRefusal("--ttl=0s", "no expiry at all");
+
+    CHECK(Parse({ "set", "k", "v", "--ttl=1h" }).verbOptions.ttl == std::chrono::hours { 1 });
 }
 
 TEST_CASE("the timeouts parse into their own fields", "[cli][command]")
 {
-    auto const command = Parse({ "--connect-timeout=250", "--timeout=750", "ping" });
+    auto const command = Parse({ "--connect-timeout=250ms", "--timeout=2s", "ping" });
     CHECK(command.action == Action::RunVerb);
     CHECK(command.timeouts.connect == std::chrono::milliseconds { 250 });
-    CHECK(command.timeouts.io == std::chrono::milliseconds { 750 });
+    CHECK(command.timeouts.io == std::chrono::milliseconds { 2000 });
+
+    auto const bare = Parse({ "--timeout=750", "ping" });
+    CHECK(bare.action == Action::UsageError);
+    CHECK(bare.diagnostic.contains("--timeout"));
+    CHECK(bare.diagnostic.contains("names no unit"));
 }
 
 TEST_CASE("the environment seeds the defaults", "[cli][command]")
@@ -826,12 +855,12 @@ TEST_CASE("a verb's page states which modifiers it honours, from the table", "[c
 
 TEST_CASE("the ttl row does not disturb the applicability refusal", "[cli][command][help]")
 {
-    // `--ttl` carries a VALUE, so whether it was given is a comparison against
-    // `TtlUnset` rather than a flag -- the one row shaped unlike its neighbours, and the
-    // one a predicate table is likeliest to get wrong. A control: both directions answer.
-    CHECK(Parse({ "set", "k", "v", "--ttl", "5" }).action == Action::RunVerb);
+    // `--ttl` carries a VALUE, so whether it was given is an engaged optional rather than
+    // a flag -- the shape a predicate table is likeliest to get wrong. A control: both
+    // directions answer.
+    CHECK(Parse({ "set", "k", "v", "--ttl", "5s" }).action == Action::RunVerb);
 
-    auto const refused = Parse({ "get", "k", "--ttl", "5" });
+    auto const refused = Parse({ "get", "k", "--ttl", "5s" });
     CHECK(refused.action == Action::UsageError);
     CHECK(refused.diagnostic.contains("--ttl"));
 }
