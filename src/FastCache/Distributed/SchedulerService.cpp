@@ -547,8 +547,7 @@ SchedulerReply SchedulerService::OfferClientVerb(CallerContext const& caller,
     if (_admin == nullptr)
         return Refuse(Wire::ErrorCode::NoCluster);
 
-    return Offer(Cluster::Command {
-        .kind = kind, .key = std::string { host }, .value = {}, .schedulerEndpoint = {} });
+    return Offer(Cluster::Command { .kind = kind, .key = std::string { host }, .value = {}, .schedulerEndpoint = {} });
 }
 
 SchedulerReply SchedulerService::ClusterAdmit(CallerContext const& caller,

@@ -29,17 +29,11 @@ namespace
     /// A table rather than three `case` labels so the membership test below is
     /// derived from it: a verb that reaches this class without a row is refused
     /// rather than served, which is the direction a mistake has to fail in.
-    constexpr std::array SchedulerOps { Wire::Op::Register,
-                                        Wire::Op::Heartbeat,
-                                        Wire::Op::Withdraw,
-                                        Wire::Op::Lease,
-                                        Wire::Op::Release,
-                                        Wire::Op::ClusterStatus,
-                                        Wire::Op::ClusterSet,
-                                        Wire::Op::ClusterForget,
-                                        Wire::Op::ClusterAdmit,
-                                        Wire::Op::ClusterAdmitClient,
-                                        Wire::Op::ClusterForgetClient };
+    constexpr std::array SchedulerOps {
+        Wire::Op::Register,     Wire::Op::Heartbeat,          Wire::Op::Withdraw,           Wire::Op::Lease,
+        Wire::Op::Release,      Wire::Op::ClusterStatus,      Wire::Op::ClusterSet,         Wire::Op::ClusterForget,
+        Wire::Op::ClusterAdmit, Wire::Op::ClusterAdmitClient, Wire::Op::ClusterForgetClient
+    };
 
     /// Whether this scheduler serves @p op at all.
     /// @param op The verb, already resolved against `OpTable`.

@@ -96,10 +96,14 @@ enum class Membership : std::uint8_t
 {
     switch (membership)
     {
-        case Membership::Forgotten: return 2;
-        case Membership::Member: return 1;
-        case Membership::Outsider: return 0;
-        case Membership::Last: break;
+        case Membership::Forgotten:
+            return 2;
+        case Membership::Member:
+            return 1;
+        case Membership::Outsider:
+            return 0;
+        case Membership::Last:
+            break;
     }
     return 0;
 }
@@ -560,7 +564,6 @@ class SchedulerService
     [[nodiscard]] SchedulerReply OfferClientVerb(CallerContext const& caller,
                                                  Cluster::CommandKind kind,
                                                  std::string_view host);
-
 
     /// Where handed-over history goes; null until the admin surface sets one.
     IFleetHistorySink* _history { nullptr };

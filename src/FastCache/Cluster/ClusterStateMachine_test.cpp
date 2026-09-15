@@ -156,8 +156,8 @@ TEST_CASE("A committed verb this build does not know is skipped by name, and the
     // behind by an upgrade learns which entry it did not apply and why.
     auto const records = logger.Snapshot();
     CHECK(std::ranges::any_of(records, [unknownVerb](auto const& record) {
-        return record.message.contains("entry 1") &&
-               record.message.contains(std::format("verb {} this build does not know", unknownVerb));
+        return record.message.contains("entry 1")
+               && record.message.contains(std::format("verb {} this build does not know", unknownVerb));
     }));
 
     machine.Apply(Entry(2, Cmd(CommandKind::AddMember, "n1", "10.0.0.1:6675")));
