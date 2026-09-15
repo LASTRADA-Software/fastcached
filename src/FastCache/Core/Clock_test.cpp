@@ -5,8 +5,11 @@
 
 #include <atomic>
 #include <chrono>
+#include <string>
 #include <thread>
 #include <vector>
+
+#include <tests/BoundedWait.hpp>
 
 using namespace std::chrono_literals;
 
@@ -99,14 +102,17 @@ TEST_CASE("CachedClock concurrent refreshes converge on the newest sample", "[cl
 
     std::atomic<bool> go { false };
     std::atomic<bool> regressed { false };
+    // Bounded (#1446): a case that ends before opening the gate -- a thread that failed to
+    // start -- must end red, not with every worker spinning under the joins.
+    FastCache::Testing::OffThreadWaits waits;
     constexpr int WorkerCount = 8;
     std::vector<std::jthread> workers;
     workers.reserve(WorkerCount);
     for (int worker = 0; worker < WorkerCount; ++worker)
     {
         workers.emplace_back([&] {
-            while (!go.load(std::memory_order_acquire))
-                std::this_thread::yield();
+            if (!waits.WaitForFlag("the start gate to open", go, [] { return std::string { "the gate is shut" }; }))
+                return;
             auto previous = clock.Now();
             for (int i = 0; i < 20'000; ++i)
             {
@@ -121,6 +127,7 @@ TEST_CASE("CachedClock concurrent refreshes converge on the newest sample", "[cl
     go.store(true, std::memory_order_release);
     workers.clear(); // jthread joins on destruction
 
+    CHECK(waits.AllReached());
     CHECK_FALSE(regressed.load());
     auto const published = clock.Now();
     REQUIRE(published <= source.Now());
