@@ -13,6 +13,7 @@
 
 #include <coroutine>
 #include <cstddef>
+#include <ranges>
 
 using namespace FastCache;
 
@@ -47,7 +48,7 @@ struct SyncCompleter
 [[nodiscard]] Task<std::size_t> AwaitMany(SyncCompleter* completer, int count)
 {
     std::size_t total = 0;
-    for (int i = 0; i < count; ++i)
+    for ([[maybe_unused]] auto const i: std::views::iota(0, count))
     {
         auto const result = co_await completer->MakeRead();
         total += result.value_or(0);

@@ -63,7 +63,7 @@ std::vector<std::byte> RandomBytes(std::size_t size, std::uint64_t seed)
     std::mt19937_64 rng { seed };
     std::vector<std::byte> out;
     out.reserve(size);
-    for (std::size_t i = 0; i < size; ++i)
+    for ([[maybe_unused]] auto const i: std::views::iota(std::size_t { 0 }, size))
         out.push_back(static_cast<std::byte>(static_cast<std::uint8_t>(rng() & 0xFFU)));
     return out;
 }
@@ -250,7 +250,7 @@ TEST_CASE("Every single byte 0x00..0xFF roundtrips across reopen", "[cowstorage]
 {
     TempFile tmp;
     WithOpenStorage(tmp.path, [&](FastCache::CowTreeStorage& storage) {
-        for (int b = 0; b < 256; ++b)
+        for (auto const b: std::views::iota(0, 256))
         {
             auto const key = std::format("k-{:02x}", b);
             std::vector<std::byte> value { static_cast<std::byte>(static_cast<std::uint8_t>(b)) };
@@ -264,7 +264,7 @@ TEST_CASE("Every single byte 0x00..0xFF roundtrips across reopen", "[cowstorage]
 
     WithOpenStorage(tmp.path, [&](FastCache::CowTreeStorage& storage) {
         FastCache::ManualClock clock;
-        for (int b = 0; b < 256; ++b)
+        for (auto const b: std::views::iota(0, 256))
         {
             auto const key = std::format("k-{:02x}", b);
             auto got = storage.Get(key, clock.Now());
@@ -281,7 +281,7 @@ TEST_CASE("All-byte-values blob roundtrips across reopen", "[cowstorage][roundtr
     TempFile tmp;
     std::vector<std::byte> blob;
     blob.reserve(256);
-    for (int i = 0; i < 256; ++i)
+    for (auto const i: std::views::iota(0, 256))
         blob.push_back(static_cast<std::byte>(static_cast<std::uint8_t>(i)));
 
     WithOpenStorage(tmp.path, [&](FastCache::CowTreeStorage& storage) {
@@ -387,7 +387,7 @@ TEST_CASE("Flags roundtrip across reopen", "[cowstorage][roundtrip][metadata]")
     constexpr std::uint32_t kFlags[] { 0U, 1U, 0xDEADBEEFU, std::numeric_limits<std::uint32_t>::max() };
 
     WithOpenStorage(tmp.path, [&](FastCache::CowTreeStorage& storage) {
-        for (std::size_t i = 0; i < std::size(kFlags); ++i)
+        for (auto const i: std::views::iota(std::size_t { 0 }, std::size(kFlags)))
         {
             auto const key = std::format("flag-{}", i);
             REQUIRE(storage.Set(key, MakeBytes("v"), kFlags[i], FastCache::TimePoint::max()).has_value());
@@ -396,7 +396,7 @@ TEST_CASE("Flags roundtrip across reopen", "[cowstorage][roundtrip][metadata]")
 
     WithOpenStorage(tmp.path, [&](FastCache::CowTreeStorage& storage) {
         FastCache::ManualClock clock;
-        for (std::size_t i = 0; i < std::size(kFlags); ++i)
+        for (auto const i: std::views::iota(std::size_t { 0 }, std::size(kFlags)))
         {
             auto got = storage.Get(std::format("flag-{}", i), clock.Now());
             REQUIRE(got.has_value());
@@ -438,7 +438,7 @@ TEST_CASE("CAS tokens are strictly monotonic within a session", "[cowstorage][ca
     REQUIRE(storage.has_value());
 
     FastCache::CasToken last { 0 };
-    for (int i = 0; i < 10; ++i)
+    for (auto const i: std::views::iota(0, 10))
     {
         auto const cas = (*storage)->Set(std::format("k-{}", i), MakeBytes("v"), 0, FastCache::TimePoint::max());
         REQUIRE(cas.has_value());
@@ -456,7 +456,7 @@ TEST_CASE("Many small entries fit and read back across reopen", "[cowstorage][sh
     constexpr int N = 1000;
     TempFile tmp;
     WithOpenStorage(tmp.path, [&](FastCache::CowTreeStorage& storage) {
-        for (int i = 0; i < N; ++i)
+        for (auto const i: std::views::iota(0, N))
         {
             auto const key = std::format("key-{:05d}", i);
             auto const value = std::format("value-{:05d}", i);
@@ -928,7 +928,7 @@ TEST_CASE("Get on an expired entry does NOT mutate the tree (no BeginWrite from 
 
     // Issue several Gets back-to-back; none should return found, none
     // should mutate the tree visibly to subsequent Gets.
-    for (int i = 0; i < 5; ++i)
+    for ([[maybe_unused]] auto const i: std::views::iota(0, 5))
     {
         auto got = (*storage)->Get("k", clock.Now());
         REQUIRE(got.has_value());
@@ -953,16 +953,16 @@ TEST_CASE("PurgeExpired clears all expired entries and reports the count", "[cow
     FastCache::ManualClock clock;
     auto const shortExpiry = clock.Now() + 1ms;
 
-    for (int i = 0; i < 6; ++i)
+    for (auto const i: std::views::iota(0, 6))
         REQUIRE((*storage)->Set(std::format("expire-{}", i), MakeBytes("v"), 0, shortExpiry).has_value());
-    for (int i = 0; i < 4; ++i)
+    for (auto const i: std::views::iota(0, 4))
         REQUIRE((*storage)->Set(std::format("keep-{}", i), MakeBytes("v"), 0, FastCache::TimePoint::max()).has_value());
 
     clock.Advance(10ms);
     auto const purged = (*storage)->PurgeExpired(clock.Now(), FastCache::PurgeBudget::Unbounded()).purged;
     REQUIRE(purged == 6U);
 
-    for (int i = 0; i < 4; ++i)
+    for (auto const i: std::views::iota(0, 4))
     {
         auto got = (*storage)->Get(std::format("keep-{}", i), clock.Now());
         REQUIRE(got.has_value());
@@ -1044,7 +1044,7 @@ TEST_CASE("EvictToFit drops LRU tail when over maxBytes", "[cowstorage][eviction
 
     // Insert until total bytes exceeds the cap; the cap+eviction model
     // is best-effort soft.
-    for (int i = 0; i < 50; ++i)
+    for (auto const i: std::views::iota(0, 50))
     {
         auto const value = std::format("v-{:08d}", i); // 10 bytes each
         REQUIRE((*storage)->Set(std::format("k-{:03d}", i), MakeBytes(value), 0, FastCache::TimePoint::max()).has_value());
@@ -1069,7 +1069,7 @@ TEST_CASE("Resize shrinks budget and triggers immediate eviction", "[cowstorage]
     auto storage = FastCache::CowTreeStorage::Open(opts);
     REQUIRE(storage.has_value());
 
-    for (int i = 0; i < 100; ++i)
+    for (auto const i: std::views::iota(0, 100))
         REQUIRE((*storage)
                     ->Set(std::format("k-{:03d}", i),
                           RandomBytes(64, static_cast<std::uint64_t>(i)),
@@ -1096,7 +1096,7 @@ TEST_CASE("Three Open/Close cycles preserve every entry", "[cowstorage][persist]
 
     auto write = [&] {
         WithOpenStorage(tmp.path, [&](FastCache::CowTreeStorage& storage) {
-            for (int i = 0; i < N; ++i)
+            for (auto const i: std::views::iota(0, N))
                 REQUIRE(storage
                             .Set(std::format("k-{:04d}", i),
                                  MakeBytes(std::format("v-{:04d}", i)),
@@ -1109,7 +1109,7 @@ TEST_CASE("Three Open/Close cycles preserve every entry", "[cowstorage][persist]
     auto verify = [&] {
         WithOpenStorage(tmp.path, [&](FastCache::CowTreeStorage& storage) {
             FastCache::ManualClock clock;
-            for (int i = 0; i < N; ++i)
+            for (auto const i: std::views::iota(0, N))
             {
                 auto got = storage.Get(std::format("k-{:04d}", i), clock.Now());
                 REQUIRE(got.has_value());
@@ -1132,33 +1132,33 @@ TEST_CASE("Mixed Set/Update/Delete script replays identically across a mid-scrip
 
     // Phase 1: Set 20 keys, update 10 of them, delete 5.
     WithOpenStorage(tmp.path, [&](FastCache::CowTreeStorage& storage) {
-        for (int i = 0; i < 20; ++i)
+        for (auto const i: std::views::iota(0, 20))
             REQUIRE(storage.Set(std::format("k-{}", i), MakeBytes(std::format("v0-{}", i)), 0, FastCache::TimePoint::max())
                         .has_value());
-        for (int i = 0; i < 10; ++i)
+        for (auto const i: std::views::iota(0, 10))
             REQUIRE(storage.Set(std::format("k-{}", i), MakeBytes(std::format("v1-{}", i)), 0, FastCache::TimePoint::max())
                         .has_value());
-        for (int i = 15; i < 20; ++i)
+        for (auto const i: std::views::iota(15, 20))
             REQUIRE(storage.Delete(std::format("k-{}", i), clock.Now()).has_value());
     });
 
     // Phase 2: After reopen, verify the expected state.
     WithOpenStorage(tmp.path, [&](FastCache::CowTreeStorage& storage) {
-        for (int i = 0; i < 10; ++i)
+        for (auto const i: std::views::iota(0, 10))
         {
             auto got = storage.Get(std::format("k-{}", i), clock.Now());
             REQUIRE(got.has_value());
             REQUIRE(got->found);
             REQUIRE(Decode(got->entry.ValueBytes()) == std::format("v1-{}", i));
         }
-        for (int i = 10; i < 15; ++i)
+        for (auto const i: std::views::iota(10, 15))
         {
             auto got = storage.Get(std::format("k-{}", i), clock.Now());
             REQUIRE(got.has_value());
             REQUIRE(got->found);
             REQUIRE(Decode(got->entry.ValueBytes()) == std::format("v0-{}", i));
         }
-        for (int i = 15; i < 20; ++i)
+        for (auto const i: std::views::iota(15, 20))
         {
             auto got = storage.Get(std::format("k-{}", i), clock.Now());
             REQUIRE(got.has_value());
@@ -3018,7 +3018,7 @@ TEST_CASE("Reclaiming a corrupted overflow chain never frees another key's pages
 
     auto liveOverflowPages = [&](std::uint64_t maxScan) {
         std::vector<std::uint64_t> ids;
-        for (std::uint64_t i = 1; i <= maxScan; ++i)
+        for (auto const i: std::views::iota(std::uint64_t { 1 }, maxScan + 1))
         {
             auto const view = store.Read(CowTree::PageId { i });
             if (view.has_value() && LooksLikeOverflowPage(*view, store.PageSize()))
@@ -3115,7 +3115,7 @@ std::vector<std::byte> CompressibleBytes(std::size_t size)
     static constexpr std::string_view pattern = "fastcached-compresses-this-well-0123456789 ";
     std::vector<std::byte> out;
     out.reserve(size);
-    for (std::size_t i = 0; i < size; ++i)
+    for (auto const i: std::views::iota(std::size_t { 0 }, size))
         out.push_back(static_cast<std::byte>(static_cast<unsigned char>(pattern[i % pattern.size()])));
     return out;
 }

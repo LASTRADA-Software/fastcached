@@ -161,7 +161,7 @@ TEST_CASE("A node that cannot name itself is never desired", "[node][discovery]"
 
     // Four rounds is well over the three legs a handshake takes, so this fails as
     // "it was admitted" rather than as "it had not finished yet".
-    for (auto round = 0; round < 4; ++round)
+    for ([[maybe_unused]] auto const round: std::views::iota(0, 4))
     {
         CHECK(good.tier->Step(Step));
         CHECK(nameless.tier->Step(Step));
@@ -194,7 +194,7 @@ TEST_CASE("A node holding the wrong key is never admitted", "[node][discovery]")
     wrong.front() = std::byte { 0xFF };
     Peer stranger { bus, "n2", std::move(wrong) };
 
-    for (auto round = 0; round < 6; ++round)
+    for ([[maybe_unused]] auto const round: std::views::iota(0, 6))
     {
         CHECK(honest.tier->Step(Step));
         CHECK(stranger.tier->Step(Step));
@@ -227,7 +227,7 @@ TEST_CASE("Two nodes on one host find and prove each other", "[node][discovery]"
     // answers the challenge it was given, then checks the proof it was sent. The
     // extra rounds are slack: a shared-port socket looks at one of its halves and
     // waits on the other, so a datagram can need one more step to be reached.
-    for (auto round = 0; round < 8; ++round)
+    for ([[maybe_unused]] auto const round: std::views::iota(0, 8))
     {
         CHECK(first.tier->Step(Step));
         CHECK(second.tier->Step(Step));
@@ -261,7 +261,7 @@ TEST_CASE("Two fleets on one segment ignore each other at the node's discovery t
     auto const theirs = DiscoveryTier::Over(
         bus.Open(DatagramAddress { .host = "n2", .port = TestBeaconPort }), std::move(otherConfig), {}, otherLogger);
 
-    for (auto round = 0; round < 6; ++round)
+    for ([[maybe_unused]] auto const round: std::views::iota(0, 6))
     {
         CHECK(ours.tier->Step(Step));
         CHECK(theirs->Step(Step));

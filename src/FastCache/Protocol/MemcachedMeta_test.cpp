@@ -16,6 +16,7 @@
 #include <array>
 #include <chrono>
 #include <cstddef>
+#include <ranges>
 #include <span>
 #include <string>
 #include <string_view>
@@ -62,7 +63,7 @@ FastCache::Task<std::string> ReadAvailable(FastCache::ISocket* socket)
         auto const r = co_await socket->Read(std::span<std::byte> { chunk.data(), chunk.size() });
         if (!r.has_value() || *r == 0)
             break;
-        for (std::size_t i = 0; i < *r; ++i)
+        for (auto const i: std::views::iota(std::size_t { 0 }, *r))
             out.push_back(static_cast<char>(chunk[i]));
         if (*r < chunk.size())
             break;

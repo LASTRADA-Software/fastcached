@@ -20,14 +20,18 @@
 #include <mutex>
 #include <optional>
 #include <random>
+#include <ranges>
 #include <span>
 #include <string>
 #include <thread>
 #include <utility>
 #include <vector>
 
+#include <tests/BoundedWait.hpp>
+
 using FastCache::Testing::Decode;
 using FastCache::Testing::MakeBytes;
+using FastCache::Testing::WaitUntil;
 
 namespace
 {
@@ -36,7 +40,7 @@ std::unique_ptr<FastCache::ShardedStorage> MakeSharded(std::size_t shardCount)
 {
     std::vector<std::unique_ptr<FastCache::IStorage>> shards;
     shards.reserve(shardCount);
-    for (std::size_t i = 0; i < shardCount; ++i)
+    for ([[maybe_unused]] auto const i: std::views::iota(std::size_t { 0 }, shardCount))
         shards.emplace_back(std::make_unique<FastCache::InMemoryLruStorage>());
     return std::make_unique<FastCache::ShardedStorage>(std::move(shards));
 }
@@ -193,20 +197,45 @@ class SharedReadParkableStorage final: public ParkableStorage
     }
 };
 
-/// Wait up to `timeoutMs` for `predicate` to become true; busy-spins
-/// on a 1ms interval. Returns true if the predicate became true.
-template <class Pred>
-bool WaitFor(Pred const& predicate, int timeoutMs = 2000)
+/// Releases every park it names when it goes, so a failed assertion cannot leave a thread parked
+/// under a join.
+///
+/// A `REQUIRE` that fires while a reader or writer is parked unwinds through the case's threads: a
+/// `std::thread` still joinable there is `std::terminate`, which takes the report with it, and a
+/// `std::jthread` joins a thread nobody will release. So the threads are `std::jthread`s declared
+/// first, and this is declared AFTER them: it is destroyed, and opens the parks, before they join.
+/// `Release` clears the park flags for good, so a thread that reaches its park afterwards passes
+/// straight through.
+class ReleaseParksOnUnwind
 {
-    using namespace std::chrono;
-    auto const deadline = steady_clock::now() + milliseconds { timeoutMs };
-    while (steady_clock::now() < deadline)
+  public:
+    /// @param parks The shards whose parks to open.
+    explicit ReleaseParksOnUnwind(std::vector<ParkableStorage*> parks) noexcept:
+        _parks { std::move(parks) }
     {
-        if (predicate())
-            return true;
-        std::this_thread::sleep_for(milliseconds { 1 });
     }
-    return predicate();
+
+    ReleaseParksOnUnwind(ReleaseParksOnUnwind const&) = delete;
+    ReleaseParksOnUnwind(ReleaseParksOnUnwind&&) = delete;
+    ReleaseParksOnUnwind& operator=(ReleaseParksOnUnwind const&) = delete;
+    ReleaseParksOnUnwind& operator=(ReleaseParksOnUnwind&&) = delete;
+
+    ~ReleaseParksOnUnwind()
+    {
+        for (auto* park: _parks)
+            park->Release();
+    }
+
+  private:
+    std::vector<ParkableStorage*> _parks;
+};
+
+/// What a parkable shard has let in, for a wait's account.
+/// @param park The shard.
+/// @return Its reads and writes in flight, in words.
+[[nodiscard]] std::string Describe(ParkableStorage const& park)
+{
+    return std::format("reads in flight {}, writes in flight {}", park.readInFlight.load(), park.writeInFlight.load());
 }
 
 } // namespace
@@ -221,7 +250,7 @@ TEST_CASE("ShardedStorage: a bounded sweep rotates across shards", "[sharded][pu
     std::vector<ParkableStorage*> raw;
     std::vector<std::unique_ptr<FastCache::IStorage>> shards;
     shards.reserve(ShardCount);
-    for (std::size_t i = 0; i < ShardCount; ++i)
+    for ([[maybe_unused]] auto const i: std::views::iota(std::size_t { 0 }, ShardCount))
     {
         auto shard = std::make_unique<ParkableStorage>();
         raw.push_back(shard.get());
@@ -231,7 +260,7 @@ TEST_CASE("ShardedStorage: a bounded sweep rotates across shards", "[sharded][pu
     FastCache::ManualClock clock;
 
     // A ceiling of one entry reaches exactly one shard per call.
-    for (std::size_t i = 0; i < ShardCount; ++i)
+    for ([[maybe_unused]] auto const i: std::views::iota(std::size_t { 0 }, ShardCount))
     {
         auto const outcome = storage.PurgeExpired(clock.Now(), FastCache::PurgeBudget { .maxScanned = 1 });
         CHECK_FALSE(outcome.completedPass); // Shards were left unvisited.
@@ -326,7 +355,7 @@ TEST_CASE("ShardedStorage spreads keys evenly over every shard, including non-po
     {
         auto const storage = MakeSharded(shardCount);
         std::vector<int> perShard(shardCount, 0);
-        for (int i = 0; i < KeyCount; ++i)
+        for (auto const i: std::views::iota(0, KeyCount))
         {
             auto const index = storage->ShardIndexFor(std::format("key-{}", i));
             REQUIRE(index < shardCount);
@@ -353,7 +382,7 @@ TEST_CASE("ShardedStorage Snapshot aggregates per-shard stats", "[sharded]")
     FastCache::ManualClock clock;
 
     // Insert across shards.
-    for (int i = 0; i < 16; ++i)
+    for (auto const i: std::views::iota(0, 16))
         REQUIRE(storage->Set(std::format("k-{}", i), MakeBytes("v"), 0, FastCache::TimePoint::max()).has_value());
 
     auto const stats = storage->Snapshot();
@@ -369,7 +398,7 @@ TEST_CASE("ShardedStorage Resize splits the total budget evenly across shards", 
     std::vector<FastCache::InMemoryLruStorage*> observers;
     shards.reserve(shardCount);
     observers.reserve(shardCount);
-    for (std::size_t i = 0; i < shardCount; ++i)
+    for ([[maybe_unused]] auto const i: std::views::iota(std::size_t { 0 }, shardCount))
     {
         auto shard = std::make_unique<FastCache::InMemoryLruStorage>(64);
         observers.push_back(shard.get());
@@ -393,12 +422,12 @@ TEST_CASE("ShardedStorage FlushWithGeneration invalidates entries in every shard
     auto storage = MakeSharded(4);
     FastCache::ManualClock clock;
 
-    for (int i = 0; i < 16; ++i)
+    for (auto const i: std::views::iota(0, 16))
         REQUIRE(storage->Set(std::format("k-{}", i), MakeBytes("v"), 0, FastCache::TimePoint::max()).has_value());
 
     storage->FlushWithGeneration(clock.Now());
 
-    for (int i = 0; i < 16; ++i)
+    for (auto const i: std::views::iota(0, 16))
     {
         auto const got = storage->Get(std::format("k-{}", i), clock.Now());
         REQUIRE(got.has_value());
@@ -422,14 +451,21 @@ TEST_CASE("Concurrent same-shard Gets serialise for a non-shared-read backend", 
     FastCache::ShardedStorage storage { std::move(shards) };
     FastCache::ManualClock clock;
 
+    std::jthread reader1;
+    std::jthread reader2;
+    ReleaseParksOnUnwind const release { { park } }; // after the threads, so it opens the park before they join
+
     // First reader: parks inside Get while holding the unique lock.
-    std::thread reader1 { [&] { (void) storage.Get("any-key", clock.Now()); } };
-    REQUIRE(WaitFor([&] { return park->readInFlight.load() == 1; }));
+    reader1 = std::jthread { [&] { (void) storage.Get("any-key", clock.Now()); } };
+    REQUIRE(WaitUntil(
+        "the first reader to park inside Get",
+        [&] { return park->readInFlight.load() == 1; },
+        [&] { return Describe(*park); }));
 
     // Second reader on the same shard: must block on the unique lock
     // and therefore not reach the stub while reader1 is still parked
     // inside Get. We confirm with a brief grace window.
-    std::thread reader2 { [&] { (void) storage.Get("another-key", clock.Now()); } };
+    reader2 = std::jthread { [&] { (void) storage.Get("another-key", clock.Now()); } };
     using namespace std::chrono_literals;
     std::this_thread::sleep_for(50ms);
     REQUIRE(park->readInFlight.load() == 1);
@@ -456,12 +492,18 @@ TEST_CASE("Concurrent same-shard Gets run in parallel for a shared-read backend"
     FastCache::ShardedStorage storage { std::move(shards) };
     FastCache::ManualClock clock;
 
-    std::thread reader1 { [&] { (void) storage.Get("key-a", clock.Now()); } };
-    std::thread reader2 { [&] { (void) storage.Get("key-b", clock.Now()); } };
+    std::jthread reader1;
+    std::jthread reader2;
+    ReleaseParksOnUnwind const release { { park } }; // after the threads, so it opens the park before they join
+    reader1 = std::jthread { [&] { (void) storage.Get("key-a", clock.Now()); } };
+    reader2 = std::jthread { [&] { (void) storage.Get("key-b", clock.Now()); } };
 
     // Both readers must reach the stub concurrently while parked — proving the
     // shared lock admits them simultaneously.
-    REQUIRE(WaitFor([&] { return park->readInFlight.load() == 2; }));
+    REQUIRE(WaitUntil(
+        "both readers to be inside Get at once",
+        [&] { return park->readInFlight.load() == 2; },
+        [&] { return Describe(*park); }));
 
     park->Release();
     reader1.join();
@@ -491,19 +533,21 @@ TEST_CASE("ShardedStorage concurrent Get/Set over real storage is race-free", "[
         return "k" + std::to_string(k) + "-v" + std::to_string(v);
     };
     constexpr int ValuesPerKey = 4;
-    for (int k = 0; k < KeyCount; ++k)
+    for (auto const k: std::views::iota(0, KeyCount))
         REQUIRE(storage->Set(keyOf(k), MakeBytes(valueOf(k, 0)), 0, FastCache::TimePoint::max()).has_value());
 
     constexpr int ThreadCount = 8;
-    constexpr int OpsPerThread = 5000;
     std::atomic<bool> torn { false };
     std::vector<std::thread> threads;
     threads.reserve(ThreadCount);
-    for (int t = 0; t < ThreadCount; ++t)
+    for (auto const t: std::views::iota(0, ThreadCount))
     {
         threads.emplace_back([&, t] {
+            // Declared where it is read: declared outside this lambda, its only reader, GCC 14.2
+            // reported it as set but not used (-Werror=unused-but-set-variable).
+            constexpr int OpsPerThread = 5000;
             std::mt19937 rng { static_cast<std::uint32_t>(0x9E37 + t) };
-            for (int i = 0; i < OpsPerThread; ++i)
+            for ([[maybe_unused]] auto const i: std::views::iota(0, OpsPerThread))
             {
                 int const k = static_cast<int>(rng() % KeyCount);
                 if ((rng() & 1U) != 0U)
@@ -518,7 +562,7 @@ TEST_CASE("ShardedStorage concurrent Get/Set over real storage is race-free", "[
                     {
                         auto const text = Decode(got->entry.ValueBytes());
                         bool legal = false;
-                        for (int v = 0; v < ValuesPerKey; ++v)
+                        for (auto const v: std::views::iota(0, ValuesPerKey))
                             legal = legal || text == valueOf(k, v);
                         if (!legal)
                             torn.store(true);
@@ -532,7 +576,7 @@ TEST_CASE("ShardedStorage concurrent Get/Set over real storage is race-free", "[
 
     REQUIRE_FALSE(torn.load());
     // Every key still resolves to a legal value after the storm.
-    for (int k = 0; k < KeyCount; ++k)
+    for (auto const k: std::views::iota(0, KeyCount))
     {
         auto const got = storage->Get(keyOf(k), clock.Now());
         REQUIRE(got.has_value());
@@ -558,8 +602,10 @@ TEST_CASE("Cross-shard Gets run in parallel (sharding preserves read parallelism
     // Find two keys, one per shard.
     std::string keyShard0;
     std::string keyShard1;
-    for (int i = 0; keyShard0.empty() || keyShard1.empty(); ++i)
+    for (auto const i: std::views::iota(0))
     {
+        if (!keyShard0.empty() && !keyShard1.empty())
+            break;
         auto k = std::format("probe-{}", i);
         if (storage.ShardIndexFor(k) == 0 && keyShard0.empty())
             keyShard0 = k;
@@ -569,9 +615,15 @@ TEST_CASE("Cross-shard Gets run in parallel (sharding preserves read parallelism
 
     // Two readers on distinct shards must both reach the stub
     // simultaneously — sharding's whole point.
-    std::thread reader0 { [&] { (void) storage.Get(keyShard0, clock.Now()); } };
-    std::thread reader1 { [&] { (void) storage.Get(keyShard1, clock.Now()); } };
-    REQUIRE(WaitFor([&] { return park0->readInFlight.load() == 1 && park1->readInFlight.load() == 1; }));
+    std::jthread reader0;
+    std::jthread reader1;
+    ReleaseParksOnUnwind const release { { park0, park1 } }; // after the threads, so it opens the parks before they join
+    reader0 = std::jthread { [&] { (void) storage.Get(keyShard0, clock.Now()); } };
+    reader1 = std::jthread { [&] { (void) storage.Get(keyShard1, clock.Now()); } };
+    REQUIRE(WaitUntil(
+        "a reader inside Get on each shard",
+        [&] { return park0->readInFlight.load() == 1 && park1->readInFlight.load() == 1; },
+        [&] { return std::format("shard 0: {}; shard 1: {}", Describe(*park0), Describe(*park1)); }));
 
     park0->Release();
     park1->Release();
@@ -597,8 +649,10 @@ TEST_CASE("A writer excludes readers on the same shard but not across shards", "
     // Find a key that lives in shard 0 vs shard 1.
     std::string keyShard0;
     std::string keyShard1;
-    for (int i = 0; keyShard0.empty() || keyShard1.empty(); ++i)
+    for (auto const i: std::views::iota(0))
     {
+        if (!keyShard0.empty() && !keyShard1.empty())
+            break;
         auto k = std::format("probe-{}", i);
         if (storage.ShardIndexFor(k) == 0 && keyShard0.empty())
             keyShard0 = k;
@@ -606,14 +660,22 @@ TEST_CASE("A writer excludes readers on the same shard but not across shards", "
             keyShard1 = k;
     }
 
+    std::atomic<bool> sameShardReadEntered { false }; // before the threads that write it
+    std::jthread writer;
+    std::jthread sameShardReader;
+    std::jthread otherShardReader;
+    ReleaseParksOnUnwind const release { { park0, park1 } }; // after the threads, so it opens the parks before they join
+
     // Writer parks inside Set on shard 0, holding the exclusive lock.
-    std::thread writer { [&] { (void) storage.Set(keyShard0, MakeBytes("v"), 0, FastCache::TimePoint::max()); } };
-    REQUIRE(WaitFor([&] { return park0->writeInFlight.load() == 1; }));
+    writer = std::jthread { [&] { (void) storage.Set(keyShard0, MakeBytes("v"), 0, FastCache::TimePoint::max()); } };
+    REQUIRE(WaitUntil(
+        "the writer to park inside Set on shard 0",
+        [&] { return park0->writeInFlight.load() == 1; },
+        [&] { return Describe(*park0); }));
 
     // A reader on the same shard MUST block — until the writer releases,
     // readInFlight on shard 0 stays at 0.
-    std::atomic<bool> sameShardReadEntered { false };
-    std::thread sameShardReader { [&] {
+    sameShardReader = std::jthread { [&] {
         (void) storage.Get(keyShard0, clock.Now());
         sameShardReadEntered = true;
     } };
@@ -626,12 +688,18 @@ TEST_CASE("A writer excludes readers on the same shard but not across shards", "
     // A reader on a DIFFERENT shard must proceed immediately — it should
     // reach the inner stub (where parkGet=true holds it) without being
     // blocked by the unrelated writer on shard 0.
-    std::thread otherShardReader { [&] { (void) storage.Get(keyShard1, clock.Now()); } };
-    REQUIRE(WaitFor([&] { return park1->readInFlight.load() == 1; }));
+    otherShardReader = std::jthread { [&] { (void) storage.Get(keyShard1, clock.Now()); } };
+    REQUIRE(WaitUntil(
+        "the other shard's reader to reach Get past the writer",
+        [&] { return park1->readInFlight.load() == 1; },
+        [&] { return Describe(*park1); }));
 
     // Release the writer; the same-shard reader can then proceed too.
     park0->Release();
-    REQUIRE(WaitFor([&] { return sameShardReadEntered.load(); }));
+    REQUIRE(WaitUntil(
+        "the same-shard reader to get in once the writer let go",
+        [&] { return sameShardReadEntered.load(); },
+        [&] { return std::format("shard 0: {}", Describe(*park0)); }));
 
     park1->Release();
     writer.join();
@@ -658,7 +726,7 @@ TEST_CASE("Concurrent random workload matches std::map oracle", "[sharded][concu
         std::uniform_int_distribution<int> opDist { 0, 9 };
         std::uniform_int_distribution<int> keyDist { 0, 31 };
 
-        for (int i = 0; i < opsPerThread; ++i)
+        for (auto const i: std::views::iota(0, opsPerThread))
         {
             auto const op = opDist(rng);
             auto const key = std::format("k-{:02d}", keyDist(rng));
@@ -685,7 +753,7 @@ TEST_CASE("Concurrent random workload matches std::map oracle", "[sharded][concu
 
     std::vector<std::thread> threads;
     threads.reserve(threadCount);
-    for (int i = 0; i < threadCount; ++i)
+    for (auto const i: std::views::iota(0, threadCount))
         threads.emplace_back(worker, 0xC0DE0000U + static_cast<unsigned>(i));
     for (auto& t: threads)
         t.join();
@@ -706,13 +774,13 @@ TEST_CASE("Concurrent random workload matches std::map oracle", "[sharded][concu
     // Final pass: every key sees a deterministic last-write so we can
     // assert exact equality.
     FastCache::ManualClock clock;
-    for (int i = 0; i < 32; ++i)
+    for (auto const i: std::views::iota(0, 32))
     {
         auto const key = std::format("k-{:02d}", i);
         auto const val = std::format("final-{}", i);
         REQUIRE(storage->Set(key, MakeBytes(val), 0, FastCache::TimePoint::max()).has_value());
     }
-    for (int i = 0; i < 32; ++i)
+    for (auto const i: std::views::iota(0, 32))
     {
         auto const key = std::format("k-{:02d}", i);
         auto const got = storage->Get(key, clock.Now());

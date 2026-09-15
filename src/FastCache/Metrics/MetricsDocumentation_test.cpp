@@ -16,6 +16,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include <tests/Unwrap.hpp>
@@ -145,8 +146,10 @@ constexpr std::string_view NodePrefix = "fastcache_";
 {
     std::set<std::string> names;
     constexpr std::string_view Marker = "# HELP ";
-    for (std::size_t at = exposition.find(Marker); at != std::string_view::npos; at = exposition.find(Marker, at + 1))
+    auto next = exposition.find(Marker);
+    while (next != std::string_view::npos)
     {
+        auto const at = std::exchange(next, exposition.find(Marker, next + 1));
         auto const nameStart = at + Marker.size();
         auto const nameEnd = exposition.find(' ', nameStart);
         if (nameEnd == std::string_view::npos)
@@ -175,8 +178,10 @@ constexpr std::string_view NodePrefix = "fastcache_";
 [[nodiscard]] std::set<std::string> DocumentedSeriesIn(std::string_view text, std::string_view prefix)
 {
     std::set<std::string> names;
-    for (std::size_t at = text.find(prefix); at != std::string_view::npos; at = text.find(prefix, at + 1))
+    auto next = text.find(prefix);
+    while (next != std::string_view::npos)
     {
+        auto const at = std::exchange(next, text.find(prefix, next + 1));
         auto end = at;
         while (end < text.size() && (std::isalnum(static_cast<unsigned char>(text[end])) != 0 || text[end] == '_'))
             ++end;

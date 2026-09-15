@@ -12,12 +12,17 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <format>
 #include <memory>
 #include <span>
+#include <string>
 #include <thread>
 #include <vector>
 
 #include <tests/AbortiveClient.hpp>
+#include <tests/BoundedWait.hpp>
+
+using FastCache::Testing::OffThreadWaits;
 
 /// What `ISocket::WaitReadable` reports, on a REAL socket, on this platform.
 ///
@@ -126,18 +131,15 @@ FastCache::DetachedTask ObserveOne(FastCache::PlatformReactor* reactor,
     co_return;
 }
 
-/// Wait, bounded, for @p flag.
-/// @param flag What is being waited for.
-/// @return True when it was set inside the bound.
-[[nodiscard]] bool WaitForFlag(std::atomic<bool> const& flag)
+/// What the observer has reached, for a wait's account.
+/// @param observed The observation.
+/// @return Its milestones, in words.
+[[nodiscard]] std::string Describe(Observation const& observed)
 {
-    for (auto spin = 0; spin < 2000; ++spin)
-    {
-        if (flag.load(std::memory_order_acquire))
-            return true;
-        std::this_thread::sleep_for(std::chrono::milliseconds { 5 });
-    }
-    return flag.load(std::memory_order_acquire);
+    return std::format("observer armed {}, resolved {}, reply sent {}",
+                       observed.arming.load(std::memory_order_acquire),
+                       observed.resolved.load(std::memory_order_acquire),
+                       observed.replySent.load(std::memory_order_acquire));
 }
 
 } // namespace
@@ -162,8 +164,10 @@ TEST_CASE("WaitReadable reports zero when a parked peer closes gracefully", "[ne
     // Recorded here, asserted on the main thread: a `REQUIRE` that fires inside a
     // `jthread` body is `std::terminate`, not a failed case.
     std::atomic<bool> unresolvedBeforeClose { false };
+    // Declared before the client, so it outlives the thread that waits through it.
+    OffThreadWaits waits;
 
-    std::jthread client { [port, &observed, &unresolvedBeforeClose] {
+    std::jthread client { [port, &observed, &unresolvedBeforeClose, &waits] {
         FastCache::BlockingConnector connector;
         auto socket = FastCache::SyncRun(
             connector.Connect("127.0.0.1", port, FastCache::DialOptions { .connectTimeout = std::chrono::seconds { 5 } }));
@@ -173,7 +177,8 @@ TEST_CASE("WaitReadable reports zero when a parked peer closes gracefully", "[ne
         // Waited for: the server to reach its await. **Then recorded still unresolved**
         // -- without that, a `WaitReadable` that answered synchronously would test the
         // other path entirely and this case would pass having never parked anything.
-        (void) WaitForFlag(observed.arming);
+        (void) waits.WaitForFlag(
+            "the observer to arm its WaitReadable", observed.arming, [&observed] { return Describe(observed); });
         unresolvedBeforeClose.store(!observed.resolved.load(std::memory_order_acquire), std::memory_order_relaxed);
 
         // A full, graceful close: FIN, not RST.
@@ -183,6 +188,8 @@ TEST_CASE("WaitReadable reports zero when a parked peer closes gracefully", "[ne
     reactor.Run();
     client.join();
 
+    // First, while the accounts of any wait that ran out are still attached.
+    CHECK(waits.AllReached());
     CHECK(unresolvedBeforeClose.load(std::memory_order_relaxed));
     REQUIRE(observed.resolved.load(std::memory_order_acquire));
     REQUIRE(observed.hasValue.load(std::memory_order_relaxed)); // EOF is not an error.
@@ -207,15 +214,18 @@ TEST_CASE("WaitReadable reports non-zero for pending data and consumes none of i
 
     // As above: recorded on the client thread, asserted on the main one.
     std::atomic<bool> unresolvedBeforeWrite { false };
+    // Declared before the client, so it outlives the thread that waits through it.
+    OffThreadWaits waits;
 
-    std::jthread client { [port, &observed, &unresolvedBeforeWrite] {
+    std::jthread client { [port, &observed, &unresolvedBeforeWrite, &waits] {
         FastCache::BlockingConnector connector;
         auto socket = FastCache::SyncRun(
             connector.Connect("127.0.0.1", port, FastCache::DialOptions { .connectTimeout = std::chrono::seconds { 5 } }));
         if (!socket.has_value())
             return;
 
-        (void) WaitForFlag(observed.arming);
+        (void) waits.WaitForFlag(
+            "the observer to arm its WaitReadable", observed.arming, [&observed] { return Describe(observed); });
         unresolvedBeforeWrite.store(!observed.resolved.load(std::memory_order_acquire), std::memory_order_relaxed);
 
         std::array<std::byte, 1> const payload { std::byte { 0x7A } };
@@ -225,13 +235,15 @@ TEST_CASE("WaitReadable reports non-zero for pending data and consumes none of i
 
         // Held open until the server has finished, so the close cannot race the
         // observation and turn this into the EOF case.
-        (void) WaitForFlag(observed.resolved);
+        (void) waits.WaitForFlag("the observer to resolve", observed.resolved, [&observed] { return Describe(observed); });
         (*socket)->Close();
     } };
 
     reactor.Run();
     client.join();
 
+    // First, while the accounts of any wait that ran out are still attached.
+    CHECK(waits.AllReached());
     CHECK(unresolvedBeforeWrite.load(std::memory_order_relaxed));
     REQUIRE(observed.resolved.load(std::memory_order_acquire));
     REQUIRE(observed.hasValue.load(std::memory_order_relaxed));
@@ -319,14 +331,17 @@ TEST_CASE("A half-closed peer still receives what it is owed", "[net][socket][wa
     std::atomic<bool> unresolvedBeforeHalfClose { false };
 
     std::vector<std::byte> received;
-    std::jthread client { [port, &observed, &received, &openAfterHalfClose, &unresolvedBeforeHalfClose] {
+    // Declared before the client, so it outlives the thread that waits through it.
+    OffThreadWaits waits;
+    std::jthread client { [port, &observed, &received, &openAfterHalfClose, &unresolvedBeforeHalfClose, &waits] {
         FastCache::BlockingConnector connector;
         auto socket = FastCache::SyncRun(
             connector.Connect("127.0.0.1", port, FastCache::DialOptions { .connectTimeout = std::chrono::seconds { 5 } }));
         if (!socket.has_value())
             return;
 
-        (void) WaitForFlag(observed.arming);
+        (void) waits.WaitForFlag(
+            "the observer to arm its WaitReadable", observed.arming, [&observed] { return Describe(observed); });
         unresolvedBeforeHalfClose.store(!observed.resolved.load(std::memory_order_acquire), std::memory_order_relaxed);
 
         // **Half-close, not close.** The read half stays open, which is the whole
@@ -340,7 +355,8 @@ TEST_CASE("A half-closed peer still receives what it is owed", "[net][socket][wa
         // reactor -- and a test that hangs reports nothing at all. Waiting here and
         // closing anyway lets the server unpark, the reactor return, and the
         // assertions below say what was actually wrong.
-        if (!WaitForFlag(observed.resolved))
+        if (!waits.WaitForFlag(
+                "the observer to see the half-close", observed.resolved, [&observed] { return Describe(observed); }))
         {
             (*socket)->Close();
             return;
@@ -359,6 +375,8 @@ TEST_CASE("A half-closed peer still receives what it is owed", "[net][socket][wa
     reactor.Run();
     client.join();
 
+    // First, while the accounts of any wait that ran out are still attached.
+    CHECK(waits.AllReached());
     REQUIRE(observed.resolved.load(std::memory_order_acquire));
     REQUIRE(observed.hasValue.load(std::memory_order_relaxed));
 
@@ -409,7 +427,9 @@ TEST_CASE("MEASURED: WaitReadable on an abortive close", "[net][socket][waitread
 
     std::atomic<bool> unresolvedBeforeReset { false };
     std::atomic<bool> resetArmed { false };
-    std::jthread client { [port, &observed, &unresolvedBeforeReset, &resetArmed] {
+    // Declared before the client, so it outlives the thread that waits through it.
+    OffThreadWaits waits;
+    std::jthread client { [port, &observed, &unresolvedBeforeReset, &resetArmed, &waits] {
         // One shared implementation of the abortive close, in `src/tests/`, because a
         // second consumer arrived with #817's coverage work. The assertion below --
         // that this really does report an ERROR and not a `0` -- is what guards every
@@ -419,7 +439,8 @@ TEST_CASE("MEASURED: WaitReadable on an abortive close", "[net][socket][waitread
         if (!peer.Connected())
             return;
 
-        (void) WaitForFlag(observed.arming);
+        (void) waits.WaitForFlag(
+            "the observer to arm its WaitReadable", observed.arming, [&observed] { return Describe(observed); });
         unresolvedBeforeReset.store(!observed.resolved.load(std::memory_order_acquire), std::memory_order_relaxed);
 
         resetArmed.store(peer.Reset(), std::memory_order_relaxed);
@@ -428,6 +449,8 @@ TEST_CASE("MEASURED: WaitReadable on an abortive close", "[net][socket][waitread
     reactor.Run();
     client.join();
 
+    // First, while the accounts of any wait that ran out are still attached.
+    CHECK(waits.AllReached());
     CHECK(unresolvedBeforeReset.load(std::memory_order_relaxed));
 
     // **What `Reset` REPORTED, asserted rather than discarded.** A `setsockopt` that

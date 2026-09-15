@@ -14,6 +14,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <ranges>
 #include <span>
 #include <string>
 #include <utility>
@@ -253,7 +254,7 @@ TEST_CASE("A header decodes only when the reader is in sync", "[consensus][raft]
 
     SECTION("a short buffer is refused")
     {
-        for (auto shortLength = std::size_t { 0 }; shortLength < RaftWire::HeaderSize; ++shortLength)
+        for (auto const shortLength: std::views::iota(std::size_t { 0 }, RaftWire::HeaderSize))
         {
             auto const partial = std::span<std::byte const> { frame }.first(shortLength);
             CHECK_FALSE(RaftWire::DecodeHeader(partial).has_value());

@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
+#include <ranges>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -46,7 +47,7 @@ TEST_CASE("The hash reports nothing until its interval has elapsed", "[node][too
     CapturingLogger logger;
     ToolchainHashProgress progress { 100, Interval, clock, logger };
 
-    for (auto i = 0; i < 50; ++i)
+    for ([[maybe_unused]] auto const i: std::views::iota(0, 50))
         progress.Observe();
 
     CHECK(progress.Done() == 50);
@@ -86,7 +87,7 @@ TEST_CASE("The reported rate is the window's, not the average", "[node][toolchai
     CapturingLogger logger;
     ToolchainHashProgress progress { 2'000, Interval, clock, logger };
 
-    for (auto i = 0; i < 900; ++i)
+    for ([[maybe_unused]] auto const i: std::views::iota(0, 900))
         progress.Observe();
     clock.Advance(Interval);
     progress.Observe();
@@ -96,7 +97,7 @@ TEST_CASE("The reported rate is the window's, not the average", "[node][toolchai
     // 901 files in one second.
     CHECK(lines.front().contains("901 file/s over the last 1s"));
 
-    for (auto i = 0; i < 9; ++i)
+    for ([[maybe_unused]] auto const i: std::views::iota(0, 9))
         progress.Observe();
     clock.Advance(Interval);
     progress.Observe();
@@ -123,9 +124,9 @@ TEST_CASE("Concurrent observers produce one line per interval, not one per threa
 
     std::vector<std::jthread> threads;
     threads.reserve(8);
-    for (auto i = 0; i < 8; ++i)
+    for ([[maybe_unused]] auto const i: std::views::iota(0, 8))
         threads.emplace_back([&progress] {
-            for (auto n = 0; n < 25; ++n)
+            for ([[maybe_unused]] auto const n: std::views::iota(0, 25))
                 progress.Observe();
         });
     threads.clear();

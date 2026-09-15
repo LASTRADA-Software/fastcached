@@ -438,7 +438,8 @@ TEST_CASE("SecretExposureWatcher: the daemon attaches it, and that is asserted",
     REQUIRE(source.is_open());
 
     std::string code;
-    for (std::string line; std::getline(source, line);)
+    std::string line;
+    while (std::getline(source, line))
     {
         auto const first = line.find_first_not_of(" \t");
         if (first != std::string::npos && line.compare(first, 2, "//") == 0)

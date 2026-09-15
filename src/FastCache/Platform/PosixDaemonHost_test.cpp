@@ -96,7 +96,7 @@ constexpr std::array CallSites {
 
     auto depth = 1;
     auto const open = start + Call.size();
-    for (auto index = open; index < text.size(); ++index)
+    for (auto const index: std::views::iota(open, text.size()))
     {
         if (text[index] == '(')
             ++depth;

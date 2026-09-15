@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <format>
+#include <ranges>
 #include <span>
 #include <string>
 #include <string_view>
@@ -59,7 +60,7 @@ FastCache::Task<std::string> ReadAvailable(FastCache::ISocket* socket)
             break;
         if (*result == 0)
             break;
-        for (std::size_t i = 0; i < *result; ++i)
+        for (auto const i: std::views::iota(std::size_t { 0 }, *result))
             out.push_back(static_cast<char>(chunk[i]));
         if (*result < chunk.size())
             break;
@@ -117,7 +118,7 @@ TEST_CASE("memcached-text get round-trips a large (64 KiB) value via the gather 
     TextFixture fix;
     constexpr std::size_t Size = 64U * 1024U;
     std::string value(Size, '\0');
-    for (std::size_t i = 0; i < Size; ++i)
+    for (auto const i: std::views::iota(std::size_t { 0 }, Size))
         value[i] = static_cast<char>('A' + (i % 26));
 
     auto const request = std::format("set big 0 0 {}\r\n{}\r\nget big\r\n", Size, value);
@@ -335,15 +336,15 @@ TEST_CASE("memcached-text gat returns every key in a large multi-key request (re
     // a multi-key gat/get; every key must now be returned.
     TextFixture fix;
     std::string req;
-    for (int i = 0; i < 20; ++i)
+    for (auto const i: std::views::iota(0, 20))
         req += std::format("set k{} 0 60 1\r\nV\r\n", i);
     req += "gat 120";
-    for (int i = 0; i < 20; ++i)
+    for (auto const i: std::views::iota(0, 20))
         req += std::format(" k{}", i);
     req += "\r\n";
 
     auto const response = Exchange(fix, req);
-    for (int i = 0; i < 20; ++i)
+    for (auto const i: std::views::iota(0, 20))
         REQUIRE(response.contains(std::format("VALUE k{} 0 1", i)));
 }
 

@@ -912,8 +912,12 @@ TEST_CASE("ServiceControl: the plist is a well-formed document", "[platform][ser
     // Every opened element is closed.
     auto const count = [&plist](std::string_view needle) {
         std::size_t n = 0;
-        for (std::size_t pos = plist.find(needle); pos != std::string::npos; pos = plist.find(needle, pos + 1))
+        auto pos = plist.find(needle);
+        while (pos != std::string::npos)
+        {
             ++n;
+            pos = plist.find(needle, pos + 1);
+        }
         return n;
     };
     REQUIRE(count("<dict>") == count("</dict>"));

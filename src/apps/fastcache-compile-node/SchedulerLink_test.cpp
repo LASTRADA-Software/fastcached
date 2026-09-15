@@ -5,6 +5,7 @@
 
 #include <initializer_list>
 #include <optional>
+#include <ranges>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -78,7 +79,7 @@ TEST_CASE("The redirect chain is bounded, so two schedulers naming each other co
     auto link = LinkTo({ Configured });
     link.BeginRound();
 
-    for (int hop = 0; hop < MaxAnnounceRedirects; ++hop)
+    for ([[maybe_unused]] auto const hop: std::views::iota(0, MaxAnnounceRedirects))
         CHECK(link.Redirect(std::string { Leader }));
 
     // Spent: the caller gives up until the next round rather than looping.
@@ -93,7 +94,7 @@ TEST_CASE("The budget is per round, not per process", "[node][schedulerlink]")
     auto link = LinkTo({ Configured });
 
     link.BeginRound();
-    for (int hop = 0; hop < MaxAnnounceRedirects; ++hop)
+    for ([[maybe_unused]] auto const hop: std::views::iota(0, MaxAnnounceRedirects))
         REQUIRE(link.Redirect(std::string { Leader }));
     REQUIRE_FALSE(link.Redirect(std::string { Other }));
 

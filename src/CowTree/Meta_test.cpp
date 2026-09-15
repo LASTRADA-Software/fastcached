@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <ranges>
 #include <vector>
 
 #include <CowTree/Bytes.hpp>
@@ -54,7 +55,7 @@ TEST_CASE("Meta CRC catches every single-byte mutation in encoded payload", "[me
     std::vector<std::byte> page(meta.pageSize, std::byte { 0 });
     REQUIRE(CowTree::EncodeMeta({ page.data(), page.size() }, meta).has_value());
 
-    for (std::size_t i = 0; i < CowTree::MetaEncodedSize - sizeof(std::uint32_t); ++i)
+    for (auto const i: std::views::iota(std::size_t { 0 }, CowTree::MetaEncodedSize - sizeof(std::uint32_t)))
     {
         auto copy = page;
         copy[i] = std::byte { static_cast<std::uint8_t>(static_cast<std::uint8_t>(copy[i]) ^ 0xFFU) };

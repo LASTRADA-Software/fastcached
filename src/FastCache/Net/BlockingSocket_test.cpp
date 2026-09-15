@@ -17,6 +17,7 @@
 #if !defined(_WIN32)
     #include <sys/socket.h>
 
+    #include <algorithm>
     #include <csignal>
 #endif
 
@@ -25,6 +26,7 @@
 #include <cstddef>
 #include <future>
 #include <memory>
+#include <ranges>
 #include <span>
 #include <string>
 #include <string_view>
@@ -142,9 +144,9 @@ TEST_CASE("A write to a peer that hung up fails instead of killing the process",
     constexpr int MaxChunks = 64; // 16 MiB is far past any loopback send buffer
     std::vector<std::byte> const chunk(ChunkBytes, std::byte { 0xAB });
 
-    bool reported = false;
-    for (int i = 0; i < MaxChunks && !reported; ++i)
-        reported = !SyncRun(WriteOnce(client->get(), std::span<std::byte const> { chunk })).has_value();
+    bool const reported = std::ranges::any_of(std::views::iota(0, MaxChunks), [&](int /*chunk*/) {
+        return !SyncRun(WriteOnce(client->get(), std::span<std::byte const> { chunk })).has_value();
+    });
 
     CHECK(reported);
 }

@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <ranges>
 #include <span>
 #include <string>
 #include <string_view>
@@ -60,7 +61,7 @@ TEST_CASE("A shared-port socket receives on both of its halves", "[net][datagram
     REQUIRE(peer->Send(DatagramBytes("proof"), node->BoundAddress()).has_value());
 
     std::vector<std::string> heard;
-    for (auto attempt = 0; attempt < 2; ++attempt)
+    for ([[maybe_unused]] auto const attempt: std::views::iota(0, 2))
     {
         auto const received = node->Receive(10ms);
         REQUIRE(received.has_value());
@@ -131,7 +132,7 @@ TEST_CASE("Closing a shared-port socket stops its receive loop", "[net][datagram
 
     node->Close();
 
-    for (auto attempt = 0; attempt < 2; ++attempt)
+    for ([[maybe_unused]] auto const attempt: std::views::iota(0, 2))
     {
         auto const result = node->Receive(10ms);
         REQUIRE_FALSE(result.has_value());
@@ -187,11 +188,11 @@ TEST_CASE("A shared-port socket drains a backlog as fast as it is asked", "[net]
     // rather than the 1ms asked for. Eight of each gives 8s against 0.13s, and
     // the ceiling sits between them with room for a loaded runner on both sides.
     constexpr auto Backlog = 16;
-    for (auto sent = 0; sent < Backlog; ++sent)
+    for ([[maybe_unused]] auto const sent: std::views::iota(0, Backlog))
         REQUIRE(peer->Send(DatagramBytes("proof"), node->BoundAddress()).has_value());
 
     auto const startedAt = std::chrono::steady_clock::now();
-    for (auto drained = 0; drained < Backlog; ++drained)
+    for ([[maybe_unused]] auto const drained: std::views::iota(0, Backlog))
     {
         auto const received = node->Receive(2s);
         REQUIRE(received.has_value());
@@ -215,7 +216,7 @@ TEST_CASE("A shared-port socket polls each half however small the timeout", "[ne
     REQUIRE(peer->Send(DatagramBytes("proof"), node->BoundAddress()).has_value());
 
     std::vector<std::string> heard;
-    for (auto attempt = 0; attempt < 2; ++attempt)
+    for ([[maybe_unused]] auto const attempt: std::views::iota(0, 2))
     {
         auto const received = node->Receive(0ms);
         REQUIRE(received.has_value());

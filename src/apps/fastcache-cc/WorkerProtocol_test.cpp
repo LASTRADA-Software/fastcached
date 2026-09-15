@@ -975,7 +975,7 @@ TEST_CASE("A runner refusal counts as started and never as completed", "[worker-
     // "off by one once".
     Fixture fix;
 
-    for (int i = 0; i < 3; ++i)
+    for ([[maybe_unused]] auto const i: std::views::iota(0, 3))
     {
         auto const refused = fix.worker.Answer(CompileFrame("clang-19"));
         REQUIRE(refused.has_value());

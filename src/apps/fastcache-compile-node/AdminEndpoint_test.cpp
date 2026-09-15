@@ -1248,9 +1248,10 @@ struct ChartFixture
     [[nodiscard]] static bool DrawsALine(std::string_view svg)
     {
         constexpr std::string_view attribute = R"( d=")";
-        for (std::size_t at = svg.find(attribute); at != std::string_view::npos;
-             at = svg.find(attribute, at + attribute.size()))
+        auto next = svg.find(attribute);
+        while (next != std::string_view::npos)
         {
+            auto const at = std::exchange(next, svg.find(attribute, next + attribute.size()));
             auto const open = at + attribute.size();
             auto const close = svg.find('"', open);
             // `return` rather than `break`, and they are the same answer here: no

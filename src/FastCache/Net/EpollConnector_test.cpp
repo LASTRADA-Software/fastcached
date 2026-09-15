@@ -21,6 +21,7 @@
     #include <cstdint>
     #include <memory>
     #include <optional>
+    #include <ranges>
     #include <span>
     #include <string>
     #include <vector>
@@ -181,7 +182,7 @@ TEST_CASE("A dial that must wait for readiness still ends on the reactor", "[net
     // Backlog fillers, deliberately never accepted. Raw sockets, because the
     // point is to occupy the kernel's queue rather than to talk.
     std::vector<FastCache::Detail::OwnedNativeSocket> fillers;
-    for (auto attempt = 0; attempt < 64; ++attempt)
+    for ([[maybe_unused]] auto const attempt: std::views::iota(0, 64))
     {
         FastCache::Detail::OwnedNativeSocket filler { static_cast<FastCache::Detail::NativeSocket>(
             ::socket(AF_INET, SOCK_STREAM, 0)) };
@@ -208,7 +209,7 @@ TEST_CASE("A dial that must wait for readiness still ends on the reactor", "[net
         // Draining runs concurrently with the dial, so whichever way the kernel
         // decides to treat the overflowing SYN, the dial eventually completes.
         auto drain = [](FastCache::EpollListener* accepting, int count) -> FastCache::DetachedTask {
-            for (auto taken = 0; taken < count; ++taken)
+            for ([[maybe_unused]] auto const taken: std::views::iota(0, count))
             {
                 auto accepted = co_await accepting->Accept();
                 if (!accepted.has_value())

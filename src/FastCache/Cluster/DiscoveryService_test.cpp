@@ -15,6 +15,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <ranges>
 #include <string>
 #include <vector>
 
@@ -205,7 +206,7 @@ TEST_CASE("Two nodes on one host share a beacon port and still prove the key", "
     // of steps: a challenge one side issues is an answer the other has to see, so
     // each needs a turn after the other has had one. Four rounds is well over the
     // three legs a handshake takes.
-    for (auto round = 0; round < 4; ++round)
+    for ([[maybe_unused]] auto const round: std::views::iota(0, 4))
     {
         Drain(first);
         Drain(second);
@@ -267,7 +268,7 @@ TEST_CASE("A peer that cannot name itself is never challenged", "[cluster][disco
     // wrong: one unauthenticated datagram provokes it, so anything on the segment
     // can drive it at line rate without ever holding the cluster key, which is a
     // disk-exhaustion hole reached from outside the fleet.
-    for (auto round = 0; round < 5; ++round)
+    for ([[maybe_unused]] auto const round: std::views::iota(0, 5))
     {
         REQUIRE(rogue.service.SendBeacon());
         CHECK(listener.service.PumpOnce(1ms) == DiscoveryEvent::Ignored);
@@ -502,7 +503,7 @@ TEST_CASE("A challenge expires rather than accumulating", "[cluster][discovery][
 
     // Repeated beacons from one source replace that source's entry rather than
     // adding to it.
-    for (auto attempt = 0; attempt < 5; ++attempt)
+    for ([[maybe_unused]] auto const attempt: std::views::iota(0, 5))
     {
         REQUIRE(noisy->Send(beacon, AtEndpoint("10.0.0.1:7000")).has_value());
         REQUIRE(watcher.service.PumpOnce(1ms) == DiscoveryEvent::PeerSeen);

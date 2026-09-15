@@ -13,15 +13,22 @@
 #include <coroutine>
 #include <cstddef>
 #include <expected>
+#include <format>
 #include <optional>
+#include <string>
 #include <thread>
+#include <tuple>
 #include <vector>
 
+#include <tests/BoundedWait.hpp>
 #include <tests/Unwrap.hpp>
 
 using namespace FastCache;
 using namespace FastCache::Cli;
+using FastCache::Testing::DrainUntil;
+using FastCache::Testing::OffThreadWaits;
 using FastCache::Testing::Unwrap;
+using FastCache::Testing::WaitUntil;
 
 namespace
 {
@@ -30,7 +37,8 @@ namespace
 ///
 /// It blocks on purpose. A read that returned instantly would let a broken implementation -- one that
 /// never left the reactor -- finish before anything could observe the difference, so the case would
-/// pass for the wrong reason.
+/// pass for the wrong reason. **Bounded** (#1446): a case that fails before releasing it must end red,
+/// not with the pool's join waiting on a read nothing will release.
 class RecordingSubscription final: public ILiveSubscription
 {
   public:
@@ -45,8 +53,8 @@ class RecordingSubscription final: public ILiveSubscription
         calledOn = std::this_thread::get_id();
         ++calls;
         entered.store(true, std::memory_order_release);
-        while (!release.load(std::memory_order_acquire))
-            std::this_thread::yield();
+        std::ignore = waits.WaitForFlag(
+            "the case to release the read", release, [] { return std::string { "the read is still held" }; });
         return NodeReply { .status = CompileCacheWire::Status::Ok };
     }
 
@@ -58,6 +66,7 @@ class RecordingSubscription final: public ILiveSubscription
     std::size_t calls { 0 };
     std::atomic<bool> entered { false };
     std::atomic<bool> release { false };
+    OffThreadWaits waits; ///< The read's wait for `release`, run on the pool thread.
 };
 
 /// Take one frame, writing the result where the caller can read it.
@@ -179,9 +188,19 @@ TEST_CASE("a stream frame is read off the reactor and delivered back onto it", "
     reactor.Drain();
 
     // The read is now parked on the pool, blocking. The reactor has run out of work,
-    // which is itself the point: the loop is FREE while a frame is outstanding.
-    while (!subscription.entered.load(std::memory_order_acquire))
-        std::this_thread::yield();
+    // which is itself the point: the loop is FREE while a frame is outstanding. A CHECK,
+    // not a REQUIRE: the read is released below either way, so a failure here cannot leave
+    // the pool's join waiting on it.
+    auto const state = [&subscription, &result] {
+        return std::format("read entered {}, released {}, frame back {}",
+                           subscription.entered.load(std::memory_order_acquire),
+                           subscription.release.load(std::memory_order_acquire),
+                           result.has_value());
+    };
+    CHECK(WaitUntil(
+        "the read to enter on the pool thread",
+        [&subscription] { return subscription.entered.load(std::memory_order_acquire); },
+        state));
     CHECK(!result.has_value());
 
     subscription.release.store(true, std::memory_order_release);
@@ -189,15 +208,26 @@ TEST_CASE("a stream frame is read off the reactor and delivered back onto it", "
     // Resumption comes back through the reactor, so it only happens when the reactor
     // runs. Draining until it does is what proves the return hop exists at all: without
     // it the task would have completed on the pool thread with no reactor turn.
-    while (!result.has_value())
-        reactor.Drain();
+    //
+    // Twice the guard, because the read's own wait for the release is one guard long: a read
+    // nothing released gives up first, the frame still comes back, and the red below then names
+    // the release -- measured the other way round, both waits ended within a millisecond of each
+    // other and the frame's won, naming the symptom instead.
+    REQUIRE(DrainUntil(
+        reactor,
+        "the frame to come back through the reactor",
+        [&result] { return result.has_value(); },
+        state,
+        2 * FastCache::Testing::WaitHangGuard));
+    // The read has returned, so its own wait has concluded: first, while its account is attached.
+    CHECK(subscription.waits.AllReached());
 
     REQUIRE(result.has_value());
     CHECK(subscription.calls == 1);
     CHECK(Unwrap(result).readOn != driverThread); // it left the reactor
     CHECK(Unwrap(result).readOn == subscription.calledOn);
     CHECK(Unwrap(result).resumedOn == driverThread); // and came back
-    CHECK(Unwrap(result).resumedOn != result->readOn);
+    CHECK(Unwrap(result).resumedOn != Unwrap(result).readOn);
     CHECK(Unwrap(result).frame.has_value());
 }
 
@@ -226,8 +256,10 @@ TEST_CASE("the sampler's thread identities are not equal by construction", "[cli
 
     pool.Submit(marker.emplace(MarkThread(&pool, &poolThread, &ran)).Native());
 
-    while (!ran.load(std::memory_order_acquire))
-        std::this_thread::yield();
+    REQUIRE(WaitUntil(
+        "the marker to run on the pool thread",
+        [&ran] { return ran.load(std::memory_order_acquire); },
+        [] { return std::string { "the marker has not run" }; }));
 
     CHECK(poolThread.load(std::memory_order_acquire) != std::this_thread::get_id());
 }
@@ -256,8 +288,14 @@ TEST_CASE("a frame is stamped after its read returns and before the hop back", "
     auto result = std::optional<FrameOutcome> {};
     auto task = TakeOnce(&subscription, &clock, &pool, &queue, &result);
     reactor.Submit(task.Native());
-    while (!result.has_value())
-        reactor.Drain();
+    REQUIRE(DrainUntil(
+        reactor,
+        "the stamped frame to come back through the slow queue",
+        [&result] { return result.has_value(); },
+        [&clock, start] {
+            return std::format("{} ms of manual time passed",
+                               std::chrono::duration_cast<std::chrono::milliseconds>(clock.Now() - start).count());
+        }));
 
     REQUIRE(result.has_value());
     CHECK(Unwrap(result).takenAt == start + InsideRead);

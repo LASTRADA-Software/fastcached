@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
+#include <ranges>
 #include <span>
 #include <string>
 #include <vector>
@@ -265,7 +266,7 @@ TEST_CASE("NoteVersionRefusal: a build's every translation unit produces one lin
     RefusalThrottle throttle;
     auto const t0 = std::chrono::steady_clock::time_point {};
 
-    for (auto i = 0; i < 1000; ++i)
+    for ([[maybe_unused]] auto const i: std::views::iota(0, 1000))
         NoteVersionRefusal(log, throttle, "10.0.0.4", ErrorReply(Wire::ErrorCode::UnsupportedVersion, "supported 5..5"), t0);
     CHECK(log.WarnCount() == 1);
 

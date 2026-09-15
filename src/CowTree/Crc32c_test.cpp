@@ -4,6 +4,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <ranges>
 #include <string_view>
 
 #include <CowTree/Bytes.hpp>
@@ -54,11 +55,11 @@ TEST_CASE("Crc32c streaming matches one-shot", "[crc32c]")
 TEST_CASE("Crc32c detects single-byte flips", "[crc32c]")
 {
     std::array<std::byte, 16> buf {};
-    for (std::size_t i = 0; i < buf.size(); ++i)
+    for (auto const i: std::views::iota(std::size_t { 0 }, buf.size()))
         buf[i] = static_cast<std::byte>(i);
     auto const base = CowTree::Crc32c::Compute({ buf.data(), buf.size() });
 
-    for (std::size_t i = 0; i < buf.size(); ++i)
+    for (auto const i: std::views::iota(std::size_t { 0 }, buf.size()))
     {
         auto copy = buf;
         copy[i] = std::byte { static_cast<std::uint8_t>(static_cast<std::uint8_t>(copy[i]) ^ 0xFFU) };

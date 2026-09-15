@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <ranges>
 #include <set>
 #include <vector>
 
@@ -55,7 +56,7 @@ TEST_CASE("An inverted range collapses to the low bound rather than misbehaving"
 
     CHECK(scripted.UniformInRange(90, 10) == 90);
 
-    for (auto i = 0; i < 100; ++i)
+    for ([[maybe_unused]] auto const i: std::views::iota(0, 100))
         CHECK(system.UniformInRange(90, 10) == 90);
 }
 
@@ -72,7 +73,7 @@ TEST_CASE("The system source stays inside the requested range", "[core][random]"
 {
     SystemRandomSource source { 0xC0FFEE };
 
-    for (auto i = 0; i < 500; ++i)
+    for ([[maybe_unused]] auto const i: std::views::iota(0, 500))
     {
         auto const drawn = source.UniformInRange(100, 110);
         CHECK(drawn >= 100);
@@ -89,7 +90,7 @@ TEST_CASE("The system source is reproducible from a seed", "[core][random]")
 
     auto const drawsOf = [](SystemRandomSource& source) {
         auto values = std::vector<std::uint64_t> {};
-        for (auto i = 0; i < 16; ++i)
+        for ([[maybe_unused]] auto const i: std::views::iota(0, 16))
             values.push_back(source.UniformInRange(0, 1'000'000));
         return values;
     };
@@ -105,7 +106,7 @@ TEST_CASE("The system source actually varies across a range", "[core][random]")
     SystemRandomSource source { 7 };
     auto seen = std::set<std::uint64_t> {};
 
-    for (auto i = 0; i < 200; ++i)
+    for ([[maybe_unused]] auto const i: std::views::iota(0, 200))
         seen.insert(source.UniformInRange(0, 99));
 
     CHECK(seen.size() > 50);
@@ -126,7 +127,7 @@ TEST_CASE("A seeded draw sequence is the same on every platform", "[core][random
     SystemRandomSource source { 12345 };
 
     auto drawn = std::vector<std::uint64_t> {};
-    for (auto index = 0; index < 8; ++index)
+    for ([[maybe_unused]] auto const index: std::views::iota(0, 8))
         drawn.push_back(source.UniformInRange(150, 300));
 
     CHECK(drawn == std::vector<std::uint64_t> { 241, 252, 293, 297, 203, 157, 270, 203 });
@@ -142,7 +143,7 @@ TEST_CASE("A draw covers its whole range and never leaves it", "[core][random]")
 
     auto low = false;
     auto high = false;
-    for (auto index = 0; index < 20000; ++index)
+    for ([[maybe_unused]] auto const index: std::views::iota(0, 20000))
     {
         auto const value = source.UniformInRange(7, 11);
         REQUIRE(value >= 7);
@@ -163,7 +164,7 @@ TEST_CASE("Adjacent seeds do not draw in lockstep", "[core][random]")
     // range by masking them made five nodes draw near-identical first timeouts,
     // campaign together, and split the vote round after round.
     auto first = std::vector<std::uint64_t> {};
-    for (auto seed = std::uint64_t { 3000 }; seed < 3005; ++seed)
+    for (auto const seed: std::views::iota(std::uint64_t { 3000 }, std::uint64_t { 3005 }))
     {
         SystemRandomSource source { seed };
         first.push_back(source.UniformInRange(150, 300));

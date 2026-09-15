@@ -36,8 +36,12 @@ namespace
 [[nodiscard]] std::size_t Occurrences(std::string_view haystack, std::string_view needle)
 {
     auto found = std::size_t { 0 };
-    for (auto at = haystack.find(needle); at != std::string_view::npos; at = haystack.find(needle, at + needle.size()))
+    auto at = haystack.find(needle);
+    while (at != std::string_view::npos)
+    {
         ++found;
+        at = haystack.find(needle, at + needle.size());
+    }
     return found;
 }
 } // namespace
@@ -347,9 +351,13 @@ TEST_CASE("A tiered cache renders one labelled sample per tier", "[metrics][prom
         {
             INFO("series " << name);
             auto count = 0;
-            for (auto pos = body.find(std::format("# TYPE {} ", name)); pos != std::string::npos;
-                 pos = body.find(std::format("# TYPE {} ", name), pos + 1))
+            auto const heading = std::format("# TYPE {} ", name);
+            auto pos = body.find(heading);
+            while (pos != std::string::npos)
+            {
                 ++count;
+                pos = body.find(heading, pos + 1);
+            }
             CHECK(count == 1);
         }
     }

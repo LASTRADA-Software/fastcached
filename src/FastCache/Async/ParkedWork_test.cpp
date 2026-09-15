@@ -43,9 +43,13 @@
 #include <chrono>
 #include <coroutine>
 #include <cstdint>
+#include <ranges>
+#include <string>
 #include <thread>
 #include <tuple>
 #include <utility>
+
+#include <tests/BoundedWait.hpp>
 
 using namespace FastCache;
 using namespace std::chrono_literals;
@@ -276,8 +280,10 @@ struct ManualDriver
     {
         // Stepped rather than jumped so a wait that polls in sub-steps still makes
         // progress, and bounded so a regression fails rather than hangs.
-        for (auto step = 0; step < 100 && !predicate(); ++step)
+        for ([[maybe_unused]] auto const step: std::views::iota(0, 100))
         {
+            if (predicate())
+                break;
             clock.Advance(window / 10 + 1ms);
             std::ignore = reactor.Drain();
         }
@@ -325,12 +331,11 @@ struct PlatformDriver
 
         // Bounded, and generous rather than tuned: what is being waited for is one
         // timer on an idle reactor, so a slow runner is the only thing that can make
-        // this long.
-        auto const deadline = std::chrono::steady_clock::now() + 10s;
-        while (!predicate() && std::chrono::steady_clock::now() < deadline)
-            std::this_thread::sleep_for(1ms);
-
-        auto const settled = predicate();
+        // this long. Its account reaches the caller's assertion: `Quiesce` asserts nothing.
+        auto const settled =
+            FastCache::Testing::WaitUntil("the frame to complete on the platform reactor's own thread",
+                                          std::move(predicate),
+                                          [] { return std::string { "the reactor is running on its worker thread" }; });
         Quiesce();
         return settled;
     }

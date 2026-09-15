@@ -331,7 +331,8 @@ struct ReplyFields
 {
     auto const& bytes = fleet.SentTo(std::string { endpoint });
     std::vector<std::span<std::byte const>> frames;
-    for (std::size_t offset = 0; offset + Wire::RequestHeaderSize <= bytes.size();)
+    std::size_t offset = 0;
+    while (offset + Wire::RequestHeaderSize <= bytes.size())
     {
         auto const rest = std::span<std::byte const> { bytes }.subspan(offset);
         auto const header = Wire::DecodeRequestHeader(rest);

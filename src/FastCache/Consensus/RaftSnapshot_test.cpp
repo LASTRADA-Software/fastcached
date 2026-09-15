@@ -15,6 +15,7 @@
 #include <chrono>
 #include <cstddef>
 #include <optional>
+#include <ranges>
 #include <string>
 #include <variant>
 #include <vector>
@@ -82,7 +83,7 @@ struct LeaderWithLog
             RequestVoteResponse { .term = Term { .value = 1 }, .decision = VoteDecision::Granted, .voterId = "n2" },
             At(ElectionMin.count()));
 
-        for (auto index = std::size_t { 0 }; index < count; ++index)
+        for (auto const index: std::views::iota(std::size_t { 0 }, count))
             (void) node.Propose(BytesFromString("v" + std::to_string(index)), At(200));
 
         Acknowledge(node.Log().LastIndex());
@@ -111,7 +112,7 @@ TEST_CASE("A compacted log still answers about its boundary", "[consensus][raft]
     // cannot look up -- and every append across the boundary would be refused
     // forever.
     RaftLog log;
-    for (auto term = std::uint64_t { 1 }; term <= 5; ++term)
+    for (auto const term: std::views::iota(std::uint64_t { 1 }, std::uint64_t { 6 }))
         (void) log.Append(LogEntry { .term = Term { .value = term }, .kind = EntryKind::Command, .payload = {} });
 
     REQUIRE(log.Compact(LogIndex { .value = 3 }));
@@ -172,7 +173,7 @@ TEST_CASE("A truncation cannot reach into a snapshot", "[consensus][raft][snapsh
     // of applied state -- so a conflicting suffix must never be able to discard
     // them.
     RaftLog log;
-    for (auto term = std::uint64_t { 1 }; term <= 3; ++term)
+    for (auto const term: std::views::iota(std::uint64_t { 1 }, std::uint64_t { 4 }))
         (void) log.Append(LogEntry { .term = Term { .value = term }, .kind = EntryKind::Command, .payload = {} });
     REQUIRE(log.Compact(LogIndex { .value = 2 }));
 
@@ -214,7 +215,7 @@ TEST_CASE("A leader sends a snapshot to a follower it can no longer replay to", 
     REQUIRE(fix.node.SnapshotIndex() > LogIndex::BeforeFirst());
 
     // A follower rejects far enough back that what it needs is gone.
-    for (auto attempt = 0; attempt < 10; ++attempt)
+    for ([[maybe_unused]] auto const attempt: std::views::iota(0, 10))
         (void) fix.node.Receive(AppendEntriesResponse { .term = Term { .value = 1 },
                                                         .result = AppendResult::Rejected,
                                                         .matchIndex = LogIndex::BeforeFirst(),
@@ -590,7 +591,7 @@ TEST_CASE("A recovered log that still covers its snapshot is reconciled", "[cons
     // has to come up correctly from it rather than treat it as corruption.
     ScriptedRandomSource random { { 0 } };
     auto entries = std::vector<LogEntry> {};
-    for (auto term = std::uint64_t { 1 }; term <= 5; ++term)
+    for (auto const term: std::views::iota(std::uint64_t { 1 }, std::uint64_t { 6 }))
         entries.push_back(LogEntry { .term = Term { .value = term }, .kind = EntryKind::Command, .payload = {} });
 
     auto const recovered =

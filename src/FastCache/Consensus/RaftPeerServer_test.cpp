@@ -28,6 +28,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <ranges>
 #include <span>
 #include <string>
 #include <thread>
@@ -331,14 +332,14 @@ TEST_CASE("Several messages on one connection all arrive", "[consensus][raft][pe
     // one frame per connection would work in every single-message test and
     // deliver one heartbeat per reconnect in a real cluster.
     Dialler dialler;
-    for (auto term = std::uint64_t { 1 }; term <= 5; ++term)
+    for (auto const term: std::views::iota(std::uint64_t { 1 }, std::uint64_t { 6 }))
         dialler.Send(VoteFrame(term));
 
     RecordingSink sink;
     auto const served = RunOnce(dialler.Wire(), sink);
 
     REQUIRE(sink.received.size() == 5);
-    for (auto index = std::size_t { 0 }; index < 5; ++index)
+    for (auto const index: std::views::iota(std::size_t { 0 }, std::size_t { 5 }))
         CHECK(std::get<RequestVoteResponse>(sink.received[index]).term == Term { .value = index + 1 });
     CHECK(served.server->DeliveredMessages() == 5);
 }

@@ -10,6 +10,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <expected>
+#include <format>
 #include <mutex>
 #include <optional>
 #include <set>
@@ -19,10 +20,12 @@
 #include <tuple>
 #include <vector>
 
+#include <tests/BoundedWait.hpp>
 #include <tests/FrameSentinel.hpp>
 #include <tests/Unwrap.hpp>
 
 using namespace std::chrono_literals;
+using FastCache::Testing::WaitUntil;
 
 namespace
 {
@@ -134,22 +137,87 @@ FastCache::Task<void> Lookup(FastCache::IAsyncAddressResolver* resolver,
     co_return;
 }
 
-/// Drain until the task finishes or the budget runs out.
+/// What the reactor holds, for a wait's account.
+/// @param reactor The case's reactor.
+/// @return Its pending submissions, in words.
+[[nodiscard]] std::string Describe(FastCache::TestReactor const& reactor)
+{
+    return std::format("{} submission(s) pending on the reactor", reactor.PendingSubmissions());
+}
+
+/// Drain until the task finishes or the hang guard runs out.
 ///
 /// Bounded rather than looping forever: a hand-back that never arrives is the
 /// defect these cases exist to catch, and an unbounded wait would report it as a
-/// suite timeout naming nothing.
-bool DrainUntil(FastCache::TestReactor& reactor, std::optional<FastCache::ResolveResult> const& out)
+/// suite timeout naming nothing. Bounded by real TIME rather than a count of 1 ms
+/// sleeps (#1446): the hand-back comes from a resolver thread, and a count is a race
+/// a loaded host loses and a coarse timer stretches.
+/// @param reactor Drained once per poll, which is what runs the hand-back.
+/// @param out     The lookup's result, once it has one.
+/// @param what    Which lookup, in words.
+/// @return Whether the lookup finished within the guard.
+[[nodiscard]] bool DrainUntil(FastCache::TestReactor& reactor,
+                              std::optional<FastCache::ResolveResult> const& out,
+                              std::string_view what)
 {
-    for (auto attempt = 0; attempt < 2000; ++attempt)
-    {
-        reactor.Drain();
-        if (out.has_value())
-            return true;
-        std::this_thread::sleep_for(1ms);
-    }
-    return false;
+    return FastCache::Testing::DrainUntil(
+        reactor, what, [&out] { return out.has_value(); }, [&reactor] { return Describe(reactor); });
 }
+
+/// What the scripted resolver has been asked, for a wait's account.
+/// @param inner The resolver.
+/// @return Its call count, in words.
+[[nodiscard]] std::string Describe(ScriptedResolver const& inner)
+{
+    return std::format("the resolver has been called {} time(s)", inner.Calls());
+}
+
+/// Opens the gate, stops the resolver and runs every hand-back to its end, however the case around
+/// it ends.
+///
+/// **A failed `REQUIRE` while the worker is held is otherwise a HANG** -- measured, by a neuter that
+/// made the full-queue case's dequeue wait fail (#1446): unwinding reaches `~ThreadedAddressResolver`,
+/// whose `Stop()` joins the worker the gate is holding, and the release lives in `~ScriptedResolver`,
+/// which runs after it. Reordering those two is not enough on its own either: the lookups' frames are
+/// declared later and so freed FIRST, and `Stop()` then settles an abandoned lookup into a frame that
+/// is gone.
+///
+/// So this is declared AFTER every lookup and its result, and is destroyed before any of them: the
+/// gate opens, `Stop()` settles what is queued into frames still alive and joins the worker, and the
+/// reactor runs each hand-back to its end. All three are idempotent, so the happy path, which has done
+/// each already, is unchanged.
+class SettleBeforeUnwind
+{
+  public:
+    /// @param inner    The gate holding the worker.
+    /// @param resolver The resolver whose worker it holds.
+    /// @param reactor  Where the hand-backs are resumed.
+    SettleBeforeUnwind(ScriptedResolver& inner,
+                       FastCache::ThreadedAddressResolver& resolver,
+                       FastCache::TestReactor& reactor) noexcept:
+        _inner { inner },
+        _resolver { resolver },
+        _reactor { reactor }
+    {
+    }
+
+    SettleBeforeUnwind(SettleBeforeUnwind const&) = delete;
+    SettleBeforeUnwind(SettleBeforeUnwind&&) = delete;
+    SettleBeforeUnwind& operator=(SettleBeforeUnwind const&) = delete;
+    SettleBeforeUnwind& operator=(SettleBeforeUnwind&&) = delete;
+
+    ~SettleBeforeUnwind()
+    {
+        _inner.Release();
+        _resolver.Stop();
+        std::ignore = _reactor.Drain();
+    }
+
+  private:
+    ScriptedResolver& _inner;
+    FastCache::ThreadedAddressResolver& _resolver;
+    FastCache::TestReactor& _reactor;
+};
 
 /// Unblocks and joins a thread running `ThreadedAddressResolver::Stop()`, however
 /// the case around it ends.
@@ -230,7 +298,7 @@ TEST_CASE("A name is resolved off the calling thread and handed back through the
     reactor.Submit(task.Native());
     reactor.Drain();
 
-    REQUIRE(DrainUntil(reactor, out));
+    REQUIRE(DrainUntil(reactor, out, "the lookup to be handed back"));
     REQUIRE(out.has_value());
     CHECK(FastCache::Testing::Unwrap(out).has_value());
     CHECK(resolver.Offloaded() == 1);
@@ -270,10 +338,16 @@ TEST_CASE("A full queue is refused rather than waited on", "[net][resolve]")
     FastCache::ThreadedAddressResolver resolver { inner,
                                                   FastCache::ThreadedResolverOptions { .threads = 1, .maxQueueDepth = 1 } };
 
-    // One lookup occupies the single worker; the next fills the single queue slot.
     std::optional<FastCache::ResolveResult> first;
-    auto firstTask = Lookup(&resolver, "one.example.com", 1, &reactor, &first);
-    reactor.Submit(firstTask.Native());
+    std::optional<FastCache::ResolveResult> second;
+    std::optional<FastCache::ResolveResult> third;
+    std::optional<FastCache::Task<void>> firstTask;
+    std::optional<FastCache::Task<void>> secondTask;
+    std::optional<FastCache::Task<void>> thirdTask;
+    SettleBeforeUnwind const settle { inner, resolver, reactor }; // after every lookup, so destroyed before them
+
+    // One lookup occupies the single worker; the next fills the single queue slot.
+    reactor.Submit(firstTask.emplace(Lookup(&resolver, "one.example.com", 1, &reactor, &first)).Native());
     reactor.Drain();
 
     // Wait for the worker to actually DEQUEUE the first job before offering the
@@ -281,19 +355,17 @@ TEST_CASE("A full queue is refused rather than waited on", "[net][resolve]")
     // occupying the single queue slot, so the second would be the one refused and
     // the third would be quietly accepted -- the case would then be asserting the
     // opposite of what it says.
-    for (auto attempt = 0; attempt < 2000 && inner.Calls() == 0; ++attempt)
-        std::this_thread::sleep_for(1ms);
+    REQUIRE(WaitUntil(
+        "the worker to dequeue the first lookup",
+        [&inner] { return inner.Calls() != 0; },
+        [&inner] { return Describe(inner); }));
     REQUIRE(inner.Calls() == 1);
 
-    std::optional<FastCache::ResolveResult> second;
-    auto secondTask = Lookup(&resolver, "two.example.com", 2, &reactor, &second);
-    reactor.Submit(secondTask.Native());
+    reactor.Submit(secondTask.emplace(Lookup(&resolver, "two.example.com", 2, &reactor, &second)).Native());
     reactor.Drain();
     REQUIRE_FALSE(second.has_value()); // queued, not refused
 
-    std::optional<FastCache::ResolveResult> third;
-    auto thirdTask = Lookup(&resolver, "three.example.com", 3, &reactor, &third);
-    reactor.Submit(thirdTask.Native());
+    reactor.Submit(thirdTask.emplace(Lookup(&resolver, "three.example.com", 3, &reactor, &third)).Native());
     reactor.Drain();
 
     REQUIRE(third.has_value());
@@ -304,8 +376,8 @@ TEST_CASE("A full queue is refused rather than waited on", "[net][resolve]")
     CHECK(resolver.Refused() == 1);
 
     inner.Release();
-    REQUIRE(DrainUntil(reactor, first));
-    REQUIRE(DrainUntil(reactor, second));
+    REQUIRE(DrainUntil(reactor, first, "the first lookup to be handed back"));
+    REQUIRE(DrainUntil(reactor, second, "the queued second lookup to be handed back"));
 }
 
 TEST_CASE("Stopping resumes a queued lookup rather than stranding it", "[net][resolve]")
@@ -325,16 +397,20 @@ TEST_CASE("Stopping resumes a queued lookup rather than stranding it", "[net][re
                                                   FastCache::ThreadedResolverOptions { .threads = 1, .maxQueueDepth = 8 } };
 
     std::optional<FastCache::ResolveResult> first;
-    auto firstTask = Lookup(&resolver, "one.example.com", 1, &reactor, &first);
-    reactor.Submit(firstTask.Native());
+    std::optional<FastCache::ResolveResult> queued;
+    std::optional<FastCache::Task<void>> firstTask;
+    std::optional<FastCache::Task<void>> queuedTask;
+    SettleBeforeUnwind const settle { inner, resolver, reactor }; // after every lookup, so destroyed before them
+
+    reactor.Submit(firstTask.emplace(Lookup(&resolver, "one.example.com", 1, &reactor, &first)).Native());
     reactor.Drain();
-    for (auto attempt = 0; attempt < 2000 && inner.Calls() == 0; ++attempt)
-        std::this_thread::sleep_for(1ms);
+    REQUIRE(WaitUntil(
+        "the worker to dequeue the in-flight lookup",
+        [&inner] { return inner.Calls() != 0; },
+        [&inner] { return Describe(inner); }));
     REQUIRE(inner.Calls() == 1);
 
-    std::optional<FastCache::ResolveResult> queued;
-    auto queuedTask = Lookup(&resolver, "two.example.com", 2, &reactor, &queued);
-    reactor.Submit(queuedTask.Native());
+    reactor.Submit(queuedTask.emplace(Lookup(&resolver, "two.example.com", 2, &reactor, &queued)).Native());
     reactor.Drain();
     REQUIRE_FALSE(queued.has_value());
 
@@ -355,8 +431,10 @@ TEST_CASE("Stopping resumes a queued lookup rather than stranding it", "[net][re
     std::thread stopper { [&resolver] { resolver.Stop(); } };
     GateReleasingJoin const finish { inner, stopper }; // after `stopper`, so destroyed before it
 
-    for (auto attempt = 0; attempt < 2000 && reactor.PendingSubmissions() == 0; ++attempt)
-        std::this_thread::sleep_for(1ms);
+    REQUIRE(WaitUntil(
+        "Stop() to settle the queued lookup",
+        [&reactor] { return reactor.PendingSubmissions() != 0; },
+        [&reactor] { return Describe(reactor); }));
     REQUIRE(reactor.PendingSubmissions() == 1); // the abandoned lookup, settled by Stop()
 
     // Explicit here as well as in `finish`, because the REST of this case depends
@@ -365,12 +443,12 @@ TEST_CASE("Stopping resumes a queued lookup rather than stranding it", "[net][re
     inner.Release();
     stopper.join();
 
-    REQUIRE(DrainUntil(reactor, queued));
+    REQUIRE(DrainUntil(reactor, queued, "the queued lookup to be settled as cancelled"));
     REQUIRE(FastCache::Testing::Unwrap(queued).error().code == FastCache::NetErrorCode::Cancelled);
 
     // The in-flight one is driven to completion too, so no frame is destroyed
     // suspended when this scope ends.
-    REQUIRE(DrainUntil(reactor, first));
+    REQUIRE(DrainUntil(reactor, first, "the in-flight lookup to be handed back"));
     CHECK(reactor.PendingSubmissions() == 0);
 }
 

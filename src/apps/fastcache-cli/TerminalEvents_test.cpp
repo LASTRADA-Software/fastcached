@@ -8,11 +8,15 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <chrono>
+#include <concepts>
 #include <expected>
+#include <format>
 #include <memory>
 #include <string>
 #include <thread>
+#include <utility>
 
+#include <tests/BoundedWait.hpp>
 #include <tests/ScopedPipeStdin.hpp>
 
 using namespace FastCache;
@@ -24,22 +28,23 @@ namespace
 
 /// Drain @p reactor until @p done, failing by name if it never happens.
 ///
-/// Bounded on the MONOTONIC clock, so a start that never resumes is a red naming what it waited
-/// for rather than a ctest timeout naming nothing.
+/// Bounded on the MONOTONIC clock, through the tree's one test wait, so a stream that never resumes is a
+/// red naming what it waited for rather than a ctest timeout naming nothing. Thirty seconds, the bound
+/// these cases were written with.
 /// @param reactor The reactor resumptions come back through.
 /// @param done The condition waited for.
 /// @param what What it means if it never becomes true.
-template <typename Condition>
+template <std::predicate Condition>
 void DrainUntil(TestReactor& reactor, Condition done, char const* what)
 {
-    auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
-    while (!done())
-    {
-        if (std::chrono::steady_clock::now() > deadline)
-            FAIL(what);
-        reactor.Drain();
-        std::this_thread::yield();
-    }
+    // Out of the REQUIRE: its macro spells the expression twice, so a move inside it reads as a use after move.
+    auto const reached = FastCache::Testing::DrainUntil(
+        reactor,
+        what,
+        std::move(done),
+        [&reactor] { return std::format("{} submission(s) pending on the reactor", reactor.PendingSubmissions()); },
+        std::chrono::seconds { 30 });
+    REQUIRE(reached);
 }
 
 /// Start @p terminal, writing the result where the caller can read it.

@@ -11,7 +11,13 @@
     #include <atomic>
     #include <chrono>
     #include <coroutine>
+    #include <format>
+    #include <ranges>
+    #include <string>
     #include <thread>
+    #include <tuple>
+
+    #include <tests/BoundedWait.hpp>
 
 namespace
 {
@@ -37,7 +43,7 @@ struct YieldAwaitable
 // spells the same seam `ISocket*` / `IClock*` for the same reason.
 FastCache::DetachedTask Worker(FastCache::IReactor* reactor, std::atomic<int>* counter, int yields)
 {
-    for (auto i = 0; i < yields; ++i)
+    for ([[maybe_unused]] auto const i: std::views::iota(0, yields))
     {
         counter->fetch_add(1, std::memory_order_relaxed);
         co_await YieldAwaitable { *reactor };
@@ -70,13 +76,20 @@ TEST_CASE("IocpReactor::Submit resumes a coroutine on the reactor thread", "[rea
     // The worker is now suspended on its first YieldAwaitable. Tell the
     // reactor to stop once the counter has reached 3 by polling on a
     // separate thread.
-    std::jthread stopper { [&reactor, &counter] {
-        while (counter.load(std::memory_order_relaxed) < 3)
-            std::this_thread::sleep_for(std::chrono::milliseconds { 1 });
+    FastCache::Testing::OffThreadWaits waits;
+    std::jthread stopper { [&reactor, &counter, &waits] {
+        // Bounded (#1446): a worker that never counts to three still has its reactor stopped, so the
+        // case ends red rather than in a `Run()` that never returns.
+        std::ignore = waits.Wait(
+            "the worker to count to three",
+            [&counter] { return counter.load(std::memory_order_relaxed) >= 3; },
+            [&counter] { return std::format("counter {}", counter.load(std::memory_order_relaxed)); });
         reactor.Stop();
     } };
 
     reactor.Run();
+    stopper.join();
+    CHECK(waits.AllReached());
     REQUIRE(counter.load(std::memory_order_relaxed) == 3);
 }
 

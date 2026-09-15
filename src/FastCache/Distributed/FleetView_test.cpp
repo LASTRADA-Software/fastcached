@@ -115,8 +115,12 @@ constexpr auto DiskIndex = static_cast<std::size_t>(StorageTier::Disk);
     if (needle.empty())
         return 0;
     std::size_t count = 0;
-    for (auto at = haystack.find(needle); at != std::string_view::npos; at = haystack.find(needle, at + needle.size()))
+    auto at = haystack.find(needle);
+    while (at != std::string_view::npos)
+    {
         ++count;
+        at = haystack.find(needle, at + needle.size());
+    }
     return count;
 }
 

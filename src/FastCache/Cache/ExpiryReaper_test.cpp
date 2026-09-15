@@ -16,7 +16,6 @@
 #include <FastCache/Cache/StorageTestUtils.hpp>
 #include <FastCache/Core/BoundedDrain.hpp>
 #include <FastCache/Core/Clock.hpp>
-#include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 
@@ -25,10 +24,10 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <concepts>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
-#include <exception>
 #include <format>
 #include <future>
 #include <memory>
@@ -43,11 +42,16 @@
 #include <utility>
 #include <vector>
 
+#include <tests/BoundedWait.hpp>
 #include <tests/Unwrap.hpp>
 
 using namespace std::chrono_literals;
 using FastCache::Testing::MakeBytes;
 using FastCache::Testing::Unwrap;
+using FastCache::Testing::WaitHangGuard;
+using FastCache::Testing::WaitOptions;
+using FastCache::Testing::WaitRest;
+using FastCache::Testing::WaitUntil;
 
 namespace
 {
@@ -433,13 +437,6 @@ class RecordingAbandonment final: public IDrainAbandonment
 /// release however long the look is, so a slow host cannot turn the fix red.
 constexpr auto StopLook = 200ms;
 
-/// How long another thread may take before a case calls it hung. A hang guard, not a race: a
-/// thread that is merely slow gets there inside it on any host that runs this suite at all, and
-/// one that never does fails at it. Its readers: `HeldCeilingDrainWait` lets a stop drain reach
-/// its ceiling only past it, `StopWhileAway` waits at most twice it for a released stop to end,
-/// and `TickUntil` gives every fixture wait at most it.
-constexpr auto TripHangGuard = 10s;
-
 /// A cycle that sweeps every millisecond and notices a stop within one, so a case reaches a hop in a
 /// few ticks -- with a stop drain short enough for a case to wait out.
 constexpr ExpiryReaperOptions FastCycleShortDrain { .interval = 1ms,
@@ -469,7 +466,7 @@ static_assert(StopLook > FastCycleHeldDrain.stopDrain.ceiling);
 /// abandonment -- freeing a reaper under a live frame. Held, the wait ends when the frame comes
 /// back, which is the fact the stop exists to wait for.
 ///
-/// **Past `TripHangGuard` of real time the clock jumps beyond any ceiling**, so a frame that truly
+/// **Past `WaitHangGuard` of real time the clock jumps beyond any ceiling**, so a frame that truly
 /// never comes back still ends the drain -- at the ceiling, through the abandonment, as a red. The
 /// guard starts at the drain's first look, not at construction, so a slow set-up does not spend it.
 class HeldCeilingDrainWait final: public IDrainWait
@@ -484,7 +481,7 @@ class HeldCeilingDrainWait final: public IDrainWait
             firstRep = real.time_since_epoch().count();
         auto const first = TimePoint { TimePoint::duration { firstRep } };
         // Monotonic both sides of the guard: frozen at `first`, then real time a day ahead.
-        return real - first < TripHangGuard ? first : real + std::chrono::hours { 24 };
+        return real - first < WaitHangGuard ? first : real + std::chrono::hours { 24 };
     }
 
     void Sleep(std::chrono::milliseconds requested) noexcept override
@@ -496,187 +493,38 @@ class HeldCeilingDrainWait final: public IDrainWait
     mutable std::atomic<TimePoint::rep> _firstLook { 0 };
 };
 
-/// The drain seam a fixture wait runs on: each poll TICKS the case's reactor, and time is the
-/// host's monotonic clock (#1433).
+/// Tick the case's reactor until @p reached holds, for at most `WaitHangGuard` of real time.
 ///
-/// A tick advances the manual clock a millisecond first, so the cycle's own timers fire, then
-/// sleeps 100 us -- longer where the host's timer is coarse -- so the thread the case waits on (the
-/// pool, or a hop parking at a gate) can run. The requested poll is not a duration here: the
-/// cadence is one tick.
-///
-/// **A tick that throws is kept, not swallowed and not fatal.** `Sleep` is `noexcept`, and an
-/// exception escaping it would end the whole test binary; the wait stops at it instead and
-/// `TickUntil` rethrows it to the case, where Catch2 reports it as that case's failure.
-class TickingDrainWait final: public IDrainWait
-{
-  public:
-    /// @param clock   The case's manual clock; must outlive this.
-    /// @param reactor The reactor each poll ticks; must outlive this.
-    TickingDrainWait(ManualClock& clock, TestReactor& reactor) noexcept:
-        _clock { clock },
-        _reactor { reactor }
-    {
-    }
-
-    [[nodiscard]] TimePoint Now() const noexcept override
-    {
-        return DefaultDrainWait().Now();
-    }
-
-    void Sleep(std::chrono::milliseconds /*requested*/) noexcept override
-    {
-        _clock.Advance(1ms);
-        try
-        {
-            std::ignore = _reactor.Tick();
-        }
-        catch (...)
-        {
-            _thrown = std::current_exception();
-        }
-        ++_ticks;
-        std::this_thread::sleep_for(100us);
-    }
-
-    /// @return How many ticks the wait has run.
-    [[nodiscard]] std::size_t Ticks() const noexcept
-    {
-        return _ticks;
-    }
-
-    /// @return What a tick threw, or null.
-    [[nodiscard]] std::exception_ptr Thrown() const noexcept
-    {
-        return _thrown;
-    }
-
-  private:
-    ManualClock& _clock;
-    TestReactor& _reactor;
-    std::size_t _ticks { 0 };
-    std::exception_ptr _thrown;
-};
-
-/// How long a fixture wait's state must be quiet before its account stops calling it moving -- and
-/// how short a wait is too short for the account to say anything about that at all.
-constexpr auto ReadingWindow = std::chrono::milliseconds { 1000 };
-// A real timeout waits the whole guard, so the too-short reading is reachable only through a wait
-// clock that lies (a seam counting instead of measuring) -- never through a guard below the window.
-static_assert(TripHangGuard > ReadingWindow);
-
-/// What a fixture wait that ran out observed: the record `ReadWait` decides on.
-struct WaitReadings
-{
-    std::chrono::milliseconds elapsed;         ///< Real time the wait spent.
-    int changes;                               ///< How many times the reported state changed.
-    std::chrono::milliseconds sinceLastChange; ///< Real time since it last changed, or since the start.
-};
-
-/// What a fixture wait's account concludes. Private to this file: never stored or sent.
-enum class WaitReading : std::uint8_t
-{
-    TooShort,         ///< Shorter than the window: a stall and a slow thread cannot be told apart.
-    Moving,           ///< The state changed within the last window.
-    Stalled,          ///< The state was quiet for more than half of the wait.
-    QuietAfterMoving, ///< It moved, then went quiet for less: a backed-off cycle or a stuck thread.
-    Last,
-};
-
-/// One reading and the words the account prints for it.
-struct WaitReadingRow
-{
-    WaitReading reading;   ///< The reading this row describes.
-    std::string_view text; ///< What the account says.
-};
-
-constexpr EnumTable<WaitReading, WaitReadingRow> WaitReadingTexts { {
-    { .reading = WaitReading::TooShort, .text = "INCONCLUSIVE: too short a wait to tell a stall from a slow thread" },
-    { .reading = WaitReading::Moving, .text = "still MOVING at the guard: slow, or spinning" },
-    { .reading = WaitReading::Stalled, .text = "STALLED: nothing it reports moved for most of the wait" },
-    { .reading = WaitReading::QuietAfterMoving,
-      .text = "INCONCLUSIVE: it moved, then went quiet -- a backed-off cycle and a stuck thread both read so" },
-} };
-static_assert(RowsInEnumeratorOrder(WaitReadingTexts, &WaitReadingRow::reading));
-
-/// Decide what a fixture wait that ran out says about the threads it waited on.
-///
-/// **Four outcomes, because two would each claim the cases between them** (#1433). A wait shorter
-/// than the window cannot tell a stall from a slow thread at all, and a state that moved and then
-/// went quiet for part of the wait is what a backed-off cycle and a stuck thread BOTH look like. A
-/// pure function over the record, so every outcome is driven by a case rather than by a hung run.
-/// @param readings What the wait observed.
-/// @return The reading.
-[[nodiscard]] constexpr WaitReading ReadWait(WaitReadings const& readings) noexcept
-{
-    if (readings.elapsed < ReadingWindow)
-        return WaitReading::TooShort;
-    if (readings.sinceLastChange <= ReadingWindow)
-        return WaitReading::Moving;
-    if (readings.sinceLastChange * 2 > readings.elapsed)
-        return WaitReading::Stalled;
-    return WaitReading::QuietAfterMoving;
-}
-
-/// Tick the case's reactor until @p reached holds, for at most `TripHangGuard` of REAL time.
-///
-/// **Bounded by time on a monotonic clock, never by a count of ticks** (#1433). What these cases
-/// wait for is done by ANOTHER thread, and a count of ticks is a race a loaded host loses. Through
-/// `DrainWithin`, the tree's one bounded wait, which measures.
-///
-/// **A wait that ran out says what it waited for and what it found**, attached to the case's next
-/// assertion (`UNSCOPED_INFO`, since a scoped message would die here): the real time and ticks it
-/// spent, the reactor's queues, @p state at the end, and how long @p state had been quiet -- read
-/// as MOVING, STALLED, or INCONCLUSIVE where the numbers cannot separate those.
+/// `WaitUntil` (`tests/BoundedWait.hpp`) with this fixture's step: each poll advances the manual
+/// clock a millisecond, so the cycle's own timers fire, and ticks the reactor. The reactor's queues
+/// go in the account as untracked context, because a cycle that re-arms every millisecond flips
+/// them on every tick and would read as always moving.
 /// @param f       The case's clock and reactor.
 /// @param what    What the case waits for, in words.
 /// @param reached True once it has happened.
 /// @param state   What the threads involved have done so far, in words.
 /// @return Whether @p reached held within the guard.
-template <typename Predicate, typename State>
+template <std::predicate Predicate, typename State>
 [[nodiscard]] bool TickUntil(Fixture& f, std::string_view what, Predicate reached, State state)
 {
-    TickingDrainWait ticking { f.clock, f.reactor };
-    // The account is timed on the host's clock directly, never through the seam the wait ran on: a
-    // seam that counted instead of measuring then shows as a wait too short to read.
-    auto const started = DefaultDrainWait().Now();
-    auto seen = state();
-    auto lastChange = started;
-    auto changes = 0;
-    auto const busy = [&] {
-        if (ticking.Thrown() != nullptr || reached())
-            return false;
-        if (auto now = state(); now != seen)
-        {
-            seen = std::move(now);
-            lastChange = DefaultDrainWait().Now();
-            ++changes;
-        }
-        return true;
-    };
-    auto const result = DrainWithin(busy, DrainBound { .ceiling = TripHangGuard, .poll = 1ms }, ticking);
-    if (auto const thrown = ticking.Thrown(); thrown != nullptr)
-        std::rethrow_exception(thrown);
-    if (result == DrainResult::Drained)
-        return true;
-    auto const ended = DefaultDrainWait().Now();
-    auto const readings = WaitReadings {
-        .elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(ended - started),
-        .changes = changes,
-        .sinceLastChange = std::chrono::duration_cast<std::chrono::milliseconds>(ended - lastChange),
-    };
-    UNSCOPED_INFO(std::format("TickUntil gave up waiting for {} after {} ms of real time and {} ticks; the reactor "
-                              "holds {} submission(s) and {} timer(s). State at the end: {}. It changed {} time(s), "
-                              "and nothing changed in the last {} ms: {}.",
-                              what,
-                              readings.elapsed.count(),
-                              ticking.Ticks(),
-                              f.reactor.PendingSubmissions(),
-                              f.reactor.PendingTimers(),
-                              seen,
-                              readings.changes,
-                              readings.sinceLastChange.count(),
-                              WaitReadingTexts.at(static_cast<std::size_t>(ReadWait(readings))).text));
-    return false;
+    return WaitUntil(what,
+                     std::move(reached),
+                     std::move(state),
+                     WaitOptions {
+                         .step =
+                             [&f] {
+                                 f.clock.Advance(1ms);
+                                 std::ignore = f.reactor.Tick();
+                             },
+                         .context =
+                             [&f] {
+                                 return std::format("the reactor holds {} submission(s) and {} timer(s)",
+                                                    f.reactor.PendingSubmissions(),
+                                                    f.reactor.PendingTimers());
+                             },
+                         .bound = WaitHangGuard,
+                         .rest = WaitRest,
+                     });
 }
 
 /// Owns a reaper whose sweep leaves on a real executor thread: its stop drain runs on a held clock,
@@ -790,10 +638,10 @@ template <typename Release>
     auto stopped = std::async(std::launch::async, [&reaper] { std::ignore = reaper.Stop(); });
     auto const returnedBeforeRelease = stopped.wait_for(StopLook) == std::future_status::ready;
     release();
-    // Twice the guard: a trip that never returns ends the held drain at `TripHangGuard`, and that
+    // Twice the guard: a trip that never returns ends the held drain at `WaitHangGuard`, and that
     // must be what this reports rather than a look that gave up first.
     return { .returnedBeforeRelease = returnedBeforeRelease,
-             .finished = stopped.wait_for(2 * TripHangGuard) == std::future_status::ready };
+             .finished = stopped.wait_for(2 * WaitHangGuard) == std::future_status::ready };
 }
 
 } // namespace
@@ -1006,7 +854,7 @@ TEST_CASE("The scan budget is adapted from measured sweep cost, not trusted", "[
     {
         // `PurgeBudget` spells "no ceiling" as 0, so a budget that decayed to it would
         // become an unbounded scan -- the exact opposite of this mechanism's purpose.
-        for (int i = 0; i < 40; ++i)
+        for ([[maybe_unused]] auto const i: std::views::iota(0, 40))
             reaper.AdaptScanBudget(std::chrono::seconds { 5 });
         CHECK(reaper.CurrentScanBudget() >= 8);
         CHECK(reaper.CurrentScanBudget() > 0);
@@ -1016,7 +864,7 @@ TEST_CASE("The scan budget is adapted from measured sweep cost, not trusted", "[
     {
         reaper.AdaptScanBudget(std::chrono::seconds { 5 }); // 256
         REQUIRE(reaper.CurrentScanBudget() == 256);
-        for (int i = 0; i < 50; ++i)
+        for ([[maybe_unused]] auto const i: std::views::iota(0, 50))
             reaper.AdaptScanBudget(std::chrono::milliseconds { 1 });
         // The configured value is the operator's ceiling: this only ever takes budget
         // AWAY from it, so no amount of headroom may exceed it.
@@ -1364,46 +1212,4 @@ TEST_CASE("A hop back that could not be handed to the reactor still brings the s
 
     CHECK(reactor.Refused() == 1);
     CHECK_FALSE(std::ranges::any_of(logger.Snapshot(), [](auto const& record) { return record.level == LogLevel::Error; }));
-}
-
-// `ReadWait` is a classifier, and a classifier nothing drives through an outcome cannot be trusted to
-// report it: each reading has its own case over a synthesised record, thresholds' edges included, so
-// no reading is known only from a run that waited out the hang guard.
-
-TEST_CASE("A fixture wait shorter than the reading window is too short to tell a stall from a slow thread",
-          "[expiry][fixture]")
-{
-    // The shape a wait clock that counts instead of measuring produces: no real time at all.
-    CHECK(ReadWait({ .elapsed = 0ms, .changes = 0, .sinceLastChange = 0ms }) == WaitReading::TooShort);
-    // Just inside the window, whatever the state did.
-    CHECK(ReadWait({ .elapsed = 999ms, .changes = 0, .sinceLastChange = 999ms }) == WaitReading::TooShort);
-    CHECK(ReadWait({ .elapsed = 999ms, .changes = 5, .sinceLastChange = 0ms }) == WaitReading::TooShort);
-}
-
-TEST_CASE("A fixture wait whose state changed within the last window was still moving", "[expiry][fixture]")
-{
-    // The cycling neuter's measured record: 18 changes, the last 542 ms before the guard.
-    CHECK(ReadWait({ .elapsed = 10000ms, .changes = 18, .sinceLastChange = 542ms }) == WaitReading::Moving);
-    // Both edges at once: a wait of exactly the window is long enough to read, and quiet of exactly
-    // the window still counts as moving.
-    CHECK(ReadWait({ .elapsed = 1000ms, .changes = 1, .sinceLastChange = 1000ms }) == WaitReading::Moving);
-    CHECK(ReadWait({ .elapsed = 10000ms, .changes = 3, .sinceLastChange = 1000ms }) == WaitReading::Moving);
-}
-
-TEST_CASE("A fixture wait quiet for more than half of it was stalled", "[expiry][fixture]")
-{
-    // The stalled neuter's measured record: quiet for 9995 ms of 10000.
-    CHECK(ReadWait({ .elapsed = 10000ms, .changes = 2, .sinceLastChange = 9995ms }) == WaitReading::Stalled);
-    // Never changed at all.
-    CHECK(ReadWait({ .elapsed = 10000ms, .changes = 0, .sinceLastChange = 10000ms }) == WaitReading::Stalled);
-    // One millisecond past half.
-    CHECK(ReadWait({ .elapsed = 10000ms, .changes = 1, .sinceLastChange = 5001ms }) == WaitReading::Stalled);
-}
-
-TEST_CASE("A fixture wait that moved and then went quiet for at most half of it is inconclusive", "[expiry][fixture]")
-{
-    // Exactly half: not MORE than half, so not stalled.
-    CHECK(ReadWait({ .elapsed = 10000ms, .changes = 4, .sinceLastChange = 5000ms }) == WaitReading::QuietAfterMoving);
-    // One millisecond past the window.
-    CHECK(ReadWait({ .elapsed = 10000ms, .changes = 7, .sinceLastChange = 1001ms }) == WaitReading::QuietAfterMoving);
 }

@@ -1542,6 +1542,11 @@ and what they may assume.
   verdict is a place to ask somebody ELSE**: the next move is a different instrument, not a better
   reading of the same one — asked on the FAILURE PATH, every command `|| true`, because a
   diagnostic on an already-failed case must explain the verdict and never change it.
+- A C++ test waits through `src/tests/BoundedWait.hpp`: `WaitUntil` on the case's thread,
+  `OffThreadWaits` on a helper thread (Catch2's messages belong to the case's thread), never a
+  counted or unbounded poll. `ctest -R test-loops` refuses an atomic-polling `while` and every
+  C-style `for` in tests. **Neuter a new wait and watch the teardown**: two such failures in #1446
+  were hangs and aborts, not reds.
 - A **cumulative** figure cannot answer a question about **now**, and a duty cycle over the same
   window is the same number divided by the same constant. Draw the verdict from a RECENT window
   and print the totals as evidence only. No magnitude bar calibrates, but **zero does not vary**,

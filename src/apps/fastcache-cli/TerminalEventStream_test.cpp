@@ -11,8 +11,10 @@
 
 #include <atomic>
 #include <chrono>
+#include <concepts>
 #include <condition_variable>
 #include <expected>
+#include <format>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -25,6 +27,7 @@
 #include <utility>
 #include <vector>
 
+#include <tests/BoundedWait.hpp>
 #include <tests/Unwrap.hpp>
 #include <tui/InputEvent.hpp>
 #include <tui/runtime/testing/MockEventSource.hpp>
@@ -121,23 +124,23 @@ struct WakeOnExit
 
 /// Drain @p reactor until @p done, failing by name if it never happens.
 ///
-/// Bounded on the MONOTONIC clock, so a stream that never resumes -- a `Close()` that did not
-/// reach the parked wait -- is a red naming what it waited for rather than a ctest timeout
-/// naming nothing.
+/// Bounded on the MONOTONIC clock, through the tree's one test wait, so a stream that never resumes is a
+/// red naming what it waited for rather than a ctest timeout naming nothing. Thirty seconds, the bound
+/// these cases were written with.
 /// @param reactor The reactor resumptions come back through.
 /// @param done The condition waited for.
 /// @param what What it means if it never becomes true.
-template <typename Condition>
+template <std::predicate Condition>
 void DrainUntil(TestReactor& reactor, Condition done, char const* what)
 {
-    auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
-    while (!done())
-    {
-        if (std::chrono::steady_clock::now() > deadline)
-            FAIL(what);
-        reactor.Drain();
-        std::this_thread::yield();
-    }
+    // Out of the REQUIRE: its macro spells the expression twice, so a move inside it reads as a use after move.
+    auto const reached = FastCache::Testing::DrainUntil(
+        reactor,
+        what,
+        std::move(done),
+        [&reactor] { return std::format("{} submission(s) pending on the reactor", reactor.PendingSubmissions()); },
+        std::chrono::seconds { 30 });
+    REQUIRE(reached);
 }
 
 /// Take one event, writing it and the thread it was delivered on where the caller can read them.
@@ -207,8 +210,12 @@ struct DeviceRecord
 [[nodiscard]] std::size_t Occurrences(std::string_view haystack, std::string_view needle)
 {
     auto count = std::size_t { 0 };
-    for (auto at = haystack.find(needle); at != std::string_view::npos; at = haystack.find(needle, at + needle.size()))
+    auto at = haystack.find(needle);
+    while (at != std::string_view::npos)
+    {
         ++count;
+        at = haystack.find(needle, at + needle.size());
+    }
     return count;
 }
 

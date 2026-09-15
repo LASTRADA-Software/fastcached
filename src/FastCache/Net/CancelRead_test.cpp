@@ -13,8 +13,14 @@
 #include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <format>
 #include <span>
+#include <string>
 #include <thread>
+
+#include <tests/BoundedWait.hpp>
+
+using FastCache::Testing::OffThreadWaits;
 
 /// What `ISocket::CancelRead` does to a PARKED read, on a REAL socket, on this
 /// platform.
@@ -221,18 +227,15 @@ FastCache::DetachedTask CancelWithNothingParked(FastCache::PlatformReactor* reac
     co_return;
 }
 
-/// Wait, bounded, for @p flag.
-/// @param flag What is being waited for.
-/// @return True when it was set inside the bound.
-[[nodiscard]] bool WaitForFlag(std::atomic<bool> const& flag)
+/// What the exchange has reached, for a wait's account.
+/// @param observed The reader's observation.
+/// @return Its milestones, in words.
+[[nodiscard]] std::string Describe(Observation const& observed)
 {
-    for (auto spin = 0; spin < 2000; ++spin)
-    {
-        if (flag.load(std::memory_order_acquire))
-            return true;
-        std::this_thread::sleep_for(std::chrono::milliseconds { 5 });
-    }
-    return flag.load(std::memory_order_acquire);
+    return std::format("reader armed {}, first read resolved {}, exchange finished {}",
+                       observed.arming.load(std::memory_order_acquire),
+                       observed.firstResolved.load(std::memory_order_acquire),
+                       observed.finished.load(std::memory_order_acquire));
 }
 
 } // namespace
@@ -278,8 +281,10 @@ TEST_CASE("CancelRead retrieves a parked read and leaves the socket usable", "[n
     // Recorded here and asserted on the main thread: a `REQUIRE` firing inside a
     // `jthread` body is `std::terminate`, not a failed case.
     std::atomic<bool> connected { false };
+    // Declared before the client, so it outlives the thread that waits through it.
+    OffThreadWaits waits;
 
-    std::jthread client { [port, &observed, &connected] {
+    std::jthread client { [port, &observed, &connected, &waits] {
         FastCache::BlockingConnector connector;
         auto socket = FastCache::SyncRun(
             connector.Connect("127.0.0.1", port, FastCache::DialOptions { .connectTimeout = std::chrono::seconds { 5 } }));
@@ -290,7 +295,8 @@ TEST_CASE("CancelRead retrieves a parked read and leaves the socket usable", "[n
         // Nothing is sent until the first read has been cancelled, which is what makes
         // that read park rather than complete. Then two bytes, so the read issued after
         // the cancel has something to return.
-        if (!WaitForFlag(observed.firstResolved))
+        if (!waits.WaitForFlag(
+                "the parked first read to be cancelled", observed.firstResolved, [&observed] { return Describe(observed); }))
             return;
 
         std::array<std::byte, 2> const payload { std::byte { 'o' }, std::byte { 'k' } };
@@ -298,13 +304,15 @@ TEST_CASE("CancelRead retrieves a parked read and leaves the socket usable", "[n
             co_return (co_await s->Write(std::span<std::byte const> { p })).has_value();
         }((*socket).get(), payload));
 
-        (void) WaitForFlag(observed.finished);
+        (void) waits.WaitForFlag("the exchange to finish", observed.finished, [&observed] { return Describe(observed); });
         (*socket)->Close();
     } };
 
     reactor.Run();
     client.join();
 
+    // First, while the accounts of any wait that ran out are still attached.
+    CHECK(waits.AllReached());
     REQUIRE(connected.load(std::memory_order_acquire));
     REQUIRE(observed.finished.load(std::memory_order_acquire));
 
@@ -348,8 +356,10 @@ TEST_CASE("CancelRead with nothing parked disturbs nothing", "[net][socket][canc
     CancelWithNothingParked(&reactor, listener.get(), &observed);
 
     std::atomic<bool> connected { false };
+    // Declared before the client, so it outlives the thread that waits through it.
+    OffThreadWaits waits;
 
-    std::jthread client { [port, &observed, &connected] {
+    std::jthread client { [port, &observed, &connected, &waits] {
         FastCache::BlockingConnector connector;
         auto socket = FastCache::SyncRun(
             connector.Connect("127.0.0.1", port, FastCache::DialOptions { .connectTimeout = std::chrono::seconds { 5 } }));
@@ -360,7 +370,8 @@ TEST_CASE("CancelRead with nothing parked disturbs nothing", "[net][socket][canc
         // Written only once the server has cancelled and armed, so the read under test
         // is one that PARKED and was then satisfied -- not one that found bytes already
         // waiting and never suspended at all.
-        if (!WaitForFlag(observed.arming))
+        if (!waits.WaitForFlag(
+                "the reader to cancel twice and arm", observed.arming, [&observed] { return Describe(observed); }))
             return;
 
         std::array<std::byte, 3> const payload { std::byte { 'y' }, std::byte { 'e' }, std::byte { 's' } };
@@ -368,13 +379,15 @@ TEST_CASE("CancelRead with nothing parked disturbs nothing", "[net][socket][canc
             co_return (co_await s->Write(std::span<std::byte const> { p })).has_value();
         }((*socket).get(), payload));
 
-        (void) WaitForFlag(observed.finished);
+        (void) waits.WaitForFlag("the exchange to finish", observed.finished, [&observed] { return Describe(observed); });
         (*socket)->Close();
     } };
 
     reactor.Run();
     client.join();
 
+    // First, while the accounts of any wait that ran out are still attached.
+    CHECK(waits.AllReached());
     REQUIRE(connected.load(std::memory_order_acquire));
     REQUIRE(observed.finished.load(std::memory_order_acquire));
 

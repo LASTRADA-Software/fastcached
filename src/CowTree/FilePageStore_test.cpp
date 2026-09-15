@@ -474,7 +474,7 @@ TEST_CASE("Durability=Batched coalesces fsyncs across commits (group commit)", "
 
     CowTree::CowTree tree { **store };
     REQUIRE(tree.Open().has_value());
-    for (int i = 0; i < 10; ++i) // fewer than the group-commit flush interval
+    for (auto const i: std::views::iota(0, 10)) // fewer than the group-commit flush interval
     {
         auto const key = "k" + std::to_string(i);
         auto txn = tree.BeginWrite();
@@ -512,7 +512,7 @@ TEST_CASE("Durability=Batched defers freed-page reuse until the flush boundary",
     // Cross the flush interval (64 meta writes) so the freeing becomes durable
     // and the pending page graduates to the reusable free list.
     CowTree::Meta meta;
-    for (std::uint64_t i = 1; i <= 64; ++i)
+    for (auto const i: std::views::iota(std::uint64_t { 1 }, std::uint64_t { 65 }))
     {
         meta.txnId = i;
         REQUIRE(pages.WriteMeta(meta).has_value());
@@ -536,7 +536,7 @@ TEST_CASE("Durability=Batched flushes buffered writes on graceful close", "[file
         REQUIRE(store.has_value());
         CowTree::CowTree tree { **store };
         REQUIRE(tree.Open().has_value());
-        for (int i = 0; i < 5; ++i) // fewer than the flush interval -> only the dtor flush persists these
+        for (auto const i: std::views::iota(0, 5)) // fewer than the flush interval -> only the dtor flush persists these
         {
             auto const key = "k" + std::to_string(i);
             auto txn = tree.BeginWrite();
@@ -569,7 +569,7 @@ TEST_CASE("Durability=Batched defers meta-slot writes until the flush boundary",
     CowTree::CowTree tree { **store };
     REQUIRE(tree.Open().has_value());
 
-    for (int i = 0; i < 10; ++i) // fewer than the flush interval
+    for (auto const i: std::views::iota(0, 10)) // fewer than the flush interval
     {
         auto const key = "k" + std::to_string(i);
         auto txn = tree.BeginWrite();
@@ -603,7 +603,7 @@ TEST_CASE("Durability=Batched: a crash inside the unflushed window reopens consi
         REQUIRE(store.has_value());
         CowTree::CowTree tree { **store };
         REQUIRE(tree.Open().has_value());
-        for (int i = 0; i < 10; ++i) // < flush interval -> nothing durable yet
+        for (auto const i: std::views::iota(0, 10)) // < flush interval -> nothing durable yet
         {
             auto const key = "k" + std::to_string(i);
             auto txn = tree.BeginWrite();
@@ -638,7 +638,7 @@ TEST_CASE("Durability=Batched: commits flushed before a crash survive it", "[fil
         REQUIRE(store.has_value());
         CowTree::CowTree tree { **store };
         REQUIRE(tree.Open().has_value());
-        for (int i = 0; i < 80; ++i) // > flush interval (64): the first window is made durable
+        for (auto const i: std::views::iota(0, 80)) // > flush interval (64): the first window is made durable
         {
             auto const key = "k" + std::to_string(i);
             auto txn = tree.BeginWrite();
@@ -918,7 +918,7 @@ TEST_CASE("The store descriptor does not survive an exec", "[filestore][lock]")
     // rather than by asking the store, because the point is what any inherited
     // copy would look like, not what the member happens to hold.
     bool found = false;
-    for (int fd = 0; fd < 256; ++fd)
+    for (auto const fd: std::views::iota(0, 256))
     {
         struct stat here {};
         if (::fstat(fd, &here) != 0)

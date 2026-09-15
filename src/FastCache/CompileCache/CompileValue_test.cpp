@@ -372,11 +372,11 @@ TEST_CASE("A generation that moved the framing is refused, not stored verbatim")
         v.push_back(std::byte { 0x07 }); // the new field, low byte
         constexpr std::string_view obj = "OBJECT";
         auto const len = static_cast<std::uint32_t>(obj.size());
-        for (int shift = 24; shift >= 0; shift -= 8)
+        for (auto const shift: { 24U, 16U, 8U, 0U })
             v.push_back(static_cast<std::byte>((len >> shift) & 0xFFU));
         for (char const c: obj)
             v.push_back(static_cast<std::byte>(c));
-        for (int i = 0; i < 4; ++i)
+        for ([[maybe_unused]] auto const i: std::views::iota(0, 4))
             v.push_back(std::byte { 0x00 }); // region count 0
         return v;
     };
@@ -418,7 +418,7 @@ TEST_CASE("The reserved generation range is the boundary between a stored value 
     // that can decide the answer.
     auto const unparseable = [](std::uint8_t leading) {
         std::vector<std::byte> v { static_cast<std::byte>(leading) };
-        for (int i = 0; i < 6; ++i)
+        for ([[maybe_unused]] auto const i: std::views::iota(0, 6))
             v.push_back(std::byte { 0xFF }); // a length no frame this short can supply
         return v;
     };

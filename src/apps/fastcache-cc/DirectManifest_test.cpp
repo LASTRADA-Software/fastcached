@@ -101,7 +101,7 @@ TEST_CASE("DecodeManifest rejects truncated input")
 {
     auto encoded = EncodeManifest(SampleManifest());
     // Every prefix short of the whole is structurally incomplete; none may parse.
-    for (std::size_t length = 0; length < encoded.size(); ++length)
+    for (auto const length: std::views::iota(std::size_t { 0 }, encoded.size()))
     {
         auto const decoded = DecodeManifest(std::string_view { encoded }.substr(0, length));
         CHECK_FALSE(decoded.has_value());

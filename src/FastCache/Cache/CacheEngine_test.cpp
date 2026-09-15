@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <limits>
 #include <optional>
+#include <ranges>
 #include <span>
 #include <string>
 #include <utility>
@@ -346,7 +347,7 @@ TEST_CASE("CacheEngine stream: XCLAIM JUSTID does not bump the delivery counter"
 
     std::vector<StreamId> const ids { StreamId { .ms = 1, .seq = 0 } };
     // JUSTID claims (idle 0) repeatedly; delivery count must stay 1.
-    for (int i = 0; i < 3; ++i)
+    for ([[maybe_unused]] auto const i: std::views::iota(0, 3))
         REQUIRE(fix.engine.StreamClaim("s", "g1", "c2", /*minIdleMs*/ 0, ids, /*justId*/ true, /*force*/ false).has_value());
     auto const pend = fix.engine.StreamPendingRange("s", "g1", StreamId::Min(), StreamId::Max(), 0, std::nullopt, 0);
     REQUIRE(pend.has_value());

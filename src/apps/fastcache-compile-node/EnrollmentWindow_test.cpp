@@ -97,7 +97,7 @@ TEST_CASE("The pending list refuses past its bound and keeps the machine that ar
     EnrollmentWindow window { clock };
     REQUIRE(window.Open() == EnrollControlOutcome::Done);
 
-    for (std::size_t index = 0; index < MaxPendingEnrollments; ++index)
+    for (auto const index: std::views::iota(std::size_t { 0 }, MaxPendingEnrollments))
         REQUIRE(Offer(window, std::format("joiner-{}", index)) == EnrollDecision::Pending);
     REQUIRE(window.Summary().second == MaxPendingEnrollments);
 
@@ -133,7 +133,7 @@ TEST_CASE("A flooder fills the list and the genuine joiner is refused and RECORD
     EnrollmentWindow window { clock };
     REQUIRE(window.Open() == EnrollControlOutcome::Done);
 
-    for (std::size_t index = 0; index < MaxPendingEnrollments; ++index)
+    for (auto const index: std::views::iota(std::size_t { 0 }, MaxPendingEnrollments))
         REQUIRE(window.Offer(std::format("junk-{}", index), "10.0.0.9:7100", "203.0.113.7") == EnrollDecision::Pending);
 
     // The real machine arrives second and is not merely refused -- it leaves NO ROW, so

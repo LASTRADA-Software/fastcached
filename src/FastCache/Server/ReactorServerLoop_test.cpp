@@ -20,6 +20,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <format>
 #include <memory>
 #include <optional>
 #include <ranges>
@@ -29,6 +30,7 @@
 #include <thread>
 #include <vector>
 
+#include <tests/BoundedWait.hpp>
 #include <tests/Unwrap.hpp>
 
 TEST_CASE("RunReactorServer rejects a TLS-flagged bind when no TLS context is configured",
@@ -339,9 +341,8 @@ struct ArmProgress
 struct ServerRun
 {
     std::vector<FastCache::CapturingLogger::Record> log; ///< Every record, in order.
-    std::chrono::milliseconds waited { 0 };              ///< Measured cost of the readiness wait.
+    FastCache::Testing::WaitOutcome ready {};            ///< The readiness wait: whether the line arrived, and its cost.
     int exitCode { EXIT_FAILURE };                       ///< What the loop returned.
-    bool sawReady { false };                             ///< Whether the readiness line ever arrived.
 };
 
 /// Positions of the records whose message contains `needle`.
@@ -456,20 +457,12 @@ void CheckReadinessComplete(std::vector<FastCache::CapturingLogger::Record> cons
     ServerRun run;
     std::thread server { [&] { run.exitCode = FastCache::RunReactorServer(options, engine, logger); } };
 
-    auto const startedAt = std::chrono::steady_clock::now();
-    auto elapsed = [startedAt] {
-        return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - startedAt);
-    };
-    while (elapsed() < bound)
-    {
-        if (!IndicesContaining(logger.Snapshot(), ReadyMarker).empty())
-        {
-            run.sawReady = true;
-            break;
-        }
-        std::this_thread::sleep_for(5ms);
-    }
-    run.waited = elapsed();
+    // Every 5 ms rather than the helper's default rest: each look copies the whole log.
+    run.ready = FastCache::Testing::WaitUntilOutcome(
+        "the readiness line",
+        [&logger] { return !IndicesContaining(logger.Snapshot(), ReadyMarker).empty(); },
+        [&logger] { return std::format("{} record(s) logged", logger.Snapshot().size()); },
+        FastCache::Testing::WaitOptions { .step = {}, .context = {}, .bound = bound, .rest = 5ms });
 
     FastCache::DaemonControls::Instance().RequestStop();
     server.join();
@@ -497,8 +490,8 @@ TEST_CASE("RunReactorServer announces readiness only after every accept loop is 
     options.reactorThreads = 1;
 
     auto const run = RunUntilReady(options);
-    INFO("waited " << run.waited.count() << "ms for the readiness line");
-    REQUIRE(run.sawReady);
+    INFO("waited " << run.ready.elapsed.count() << "ms for the readiness line");
+    REQUIRE(FastCache::Testing::Reached(run.ready));
     CHECK(run.exitCode == EXIT_SUCCESS);
 
     CheckReadinessComplete(run.log);
@@ -546,8 +539,8 @@ TEST_CASE("RunReactorServer waits for every reactor's accept loops before announ
     options.reactorThreads = 2;
 
     auto const run = RunUntilReady(options);
-    INFO("waited " << run.waited.count() << "ms for the readiness line");
-    REQUIRE(run.sawReady);
+    INFO("waited " << run.ready.elapsed.count() << "ms for the readiness line");
+    REQUIRE(FastCache::Testing::Reached(run.ready));
     CHECK(run.exitCode == EXIT_SUCCESS);
 
     CheckReadinessComplete(run.log);
@@ -574,8 +567,8 @@ TEST_CASE("The daemon's readiness marker keeps the exact bytes its out-of-tree w
     options.reactorThreads = 1;
 
     auto const run = RunUntilReady(options);
-    INFO("waited " << run.waited.count() << "ms for the readiness line");
-    REQUIRE(run.sawReady);
+    INFO("waited " << run.ready.elapsed.count() << "ms for the readiness line");
+    REQUIRE(FastCache::Testing::Reached(run.ready));
 
     auto const ready = IndicesContaining(run.log, ReadyMarker);
     REQUIRE(ready.size() == 1);

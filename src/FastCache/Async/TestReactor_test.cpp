@@ -11,6 +11,7 @@
 #include <chrono>
 #include <coroutine>
 #include <cstddef>
+#include <ranges>
 #include <thread>
 #include <vector>
 
@@ -54,7 +55,7 @@ struct SleepAwaitable
 
 FastCache::Task<void> CountYields(FastCache::IReactor* reactor, int* counter, int times)
 {
-    for (auto i = 0; i < times; ++i)
+    for ([[maybe_unused]] auto const i: std::views::iota(0, times))
     {
         ++(*counter);
         co_await YieldAwaitable { reactor };
@@ -203,17 +204,17 @@ TEST_CASE("TestReactor accepts Submit and Schedule from many threads", "[reactor
     std::atomic<int> resumed { 0 };
     std::vector<FastCache::Task<void>> tasks;
     tasks.reserve(Producers * PerProducer);
-    for (std::size_t i = 0; i < Producers * PerProducer; ++i)
+    for ([[maybe_unused]] auto const i: std::views::iota(std::size_t { 0 }, Producers * PerProducer))
         tasks.push_back(Increment(&resumed));
 
     std::barrier start { static_cast<std::ptrdiff_t>(Producers) };
     std::vector<std::jthread> threads;
     threads.reserve(Producers);
-    for (std::size_t p = 0; p < Producers; ++p)
+    for (auto const p: std::views::iota(std::size_t { 0 }, Producers))
     {
         threads.emplace_back([&, p] {
             start.arrive_and_wait();
-            for (std::size_t i = 0; i < PerProducer; ++i)
+            for (auto const i: std::views::iota(std::size_t { 0 }, PerProducer))
             {
                 auto& task = tasks[(p * PerProducer) + i];
                 // Half through the ready queue and half through the timer heap,

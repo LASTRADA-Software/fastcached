@@ -120,7 +120,7 @@ TEST_CASE("Many keys span multiple pages and remain accessible", "[cowtree]")
     REQUIRE(tree.Open().has_value());
 
     constexpr int N = 200;
-    for (int i = 0; i < N; ++i)
+    for (auto const i: std::views::iota(0, N))
     {
         auto k = std::format("key-{:04d}", i);
         auto v = std::format("val-{:04d}", i);
@@ -128,7 +128,7 @@ TEST_CASE("Many keys span multiple pages and remain accessible", "[cowtree]")
     }
 
     auto reader = tree.BeginRead();
-    for (int i = 0; i < N; ++i)
+    for (auto const i: std::views::iota(0, N))
     {
         auto k = std::format("key-{:04d}", i);
         auto got = reader.Get(B(k));
@@ -153,7 +153,7 @@ TEST_CASE("Random workload tracks std::map oracle", "[cowtree][fuzz]")
     std::uniform_int_distribution<int> opDist { 0, 9 };
     std::uniform_int_distribution<int> keyDist { 0, 99 };
 
-    for (int iter = 0; iter < 2000; ++iter)
+    for (auto const iter: std::views::iota(0, 2000))
     {
         auto const op = opDist(rng);
         auto const key = std::format("k-{:02d}", keyDist(rng));
