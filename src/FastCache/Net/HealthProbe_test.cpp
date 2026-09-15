@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Async/Task.hpp>
 #include <FastCache/Cache/IStorage.hpp>
+#include <FastCache/Core/BoundedDrain.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Net/BlockingSocket.hpp>
@@ -240,9 +241,10 @@ struct Rendezvous
 
 /// Wait until `ready()` answers true, or the bound expires.
 ///
-/// The elapsed time is MEASURED off `steady_clock` rather than derived from the number
-/// of polls: `n * RendezvousPoll` is what the loop asked for, and a sleep costs what the
-/// host's timer granularity says. It is also deliberately not the wall clock -- WSL2
+/// Through `DrainWithin`, the tree's one bounded wait (#1446), and the elapsed time is
+/// MEASURED off `steady_clock` rather than derived from the number of polls:
+/// `n * RendezvousPoll` is what the loop asked for, and a sleep costs what the host's
+/// timer granularity says. It is also deliberately not the wall clock -- WSL2
 /// steps `CLOCK_REALTIME` both ways, so a duration read from it is not a duration
 /// ([#1058](https://github.com/LASTRADA-Software/fastcached/issues/1058)).
 /// The bound is checked BETWEEN attempts, so the worst case is the bound plus one
@@ -259,18 +261,12 @@ template <typename Predicate>
 [[nodiscard]] Rendezvous WaitUntilReady(Predicate ready)
 {
     auto const start = std::chrono::steady_clock::now();
-    auto const deadline = start + RendezvousBound;
-    for (;;)
-    {
-        auto const held = ready();
-        auto const now = std::chrono::steady_clock::now();
-        auto const waited = std::chrono::duration_cast<std::chrono::milliseconds>(now - start);
-        if (held)
-            return Rendezvous { .ready = true, .waited = waited };
-        if (now >= deadline)
-            return Rendezvous { .ready = false, .waited = waited };
-        std::this_thread::sleep_for(RendezvousPoll);
-    }
+    auto const drained =
+        DrainWithin([&ready] { return !ready(); }, DrainBound { .ceiling = RendezvousBound, .poll = RendezvousPoll });
+    return Rendezvous {
+        .ready = drained == DrainResult::Drained,
+        .waited = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start),
+    };
 }
 
 /// Whether a TCP connect to a loopback port SUCCEEDS, sending nothing.
