@@ -11,9 +11,10 @@
 /// skipped by name, never silently left out. A table that listed only the engines that
 /// ran would read identically to one where the hardware engine was never tried.
 ///
-/// A figure here is a quantity under conditions. Whoever quotes one states the build,
-/// the host, its load and the sample count beside it, because this binary does not yet
-/// print the build that produced it; #1439 retires this sentence.
+/// A figure here is a quantity under conditions. The BUILD is now printed for the whole
+/// binary before any case runs, and every figure is marked with what that build makes of it
+/// (`BuildBannerListener.cpp`, #1439); whoever quotes a figure still states the host, its load
+/// and the sample count, which no binary can read off itself.
 ///
 /// `HmacSha256` is deliberately not measured here: outside `Core/Sha256` and the one
 /// signing seam, naming it is a second signing construction
@@ -59,7 +60,7 @@ constexpr std::array<std::size_t, 4> PayloadSizes { 64, 4096, std::size_t { 1 } 
 
 TEST_CASE("bench: Sha256 digest per engine", "[!benchmark][sha256]")
 {
-    std::cout << std::format("sha256 bench: default engine {}\n", Sha256EngineName(ActiveSha256Engine()));
+    std::cerr << std::format("sha256 bench: default engine {}\n", Sha256EngineName(ActiveSha256Engine()));
 
     for (auto const size: PayloadSizes)
     {
@@ -79,7 +80,7 @@ TEST_CASE("bench: Sha256 digest per engine", "[!benchmark][sha256]")
             auto const hasher = Sha256::WithEngine(engine);
             if (!hasher.has_value())
             {
-                std::cout << std::format("sha256 bench: {} skipped, not supported by this CPU\n", name);
+                std::cerr << std::format("sha256 bench: {} skipped, not supported by this CPU\n", name);
                 continue;
             }
 

@@ -81,7 +81,7 @@ TEST_CASE("bench: StreamCodec::Decode over a large honest stream", "[!benchmark]
     REQUIRE(StreamCodec::Decode(blob, check).has_value());
     REQUIRE(check.entries.size() == BenchEntries);
 
-    std::cout << std::format(
+    std::cerr << std::format(
         "stream bench: {} entries x {} fields, blob {} bytes\n", BenchEntries, BenchFieldsPerEntry, blob.size());
 
     BENCHMARK("Decode")

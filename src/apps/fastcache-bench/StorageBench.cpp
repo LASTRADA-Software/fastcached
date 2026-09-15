@@ -395,6 +395,6 @@ TEST_CASE("storage lookup scaling across threads", "[bench][scaling]")
         // second invocation and parses exactly this line shape (SCALING_LINE
         // there); the two spellings are the whole interface between them and
         // have to move together.
-        std::cout << std::format("SCALING threads={} ops_per_sec={:.0f}\n", threadCount, opsPerSecond);
+        std::cerr << std::format("SCALING threads={} ops_per_sec={:.0f}\n", threadCount, opsPerSecond);
     }
 }
