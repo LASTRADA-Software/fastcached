@@ -696,7 +696,7 @@ TEST_CASE("The worker reports a term regression without claiming to know its cau
         // Every dispatched compile learns a term, so `Unchanged` is what a healthy
         // fleet produces on every single job. A notice that spoke for those would be
         // noise, and noise is how the one line that matters gets missed.
-        for (auto attempt = 0; attempt < 500; ++attempt)
+        for ([[maybe_unused]] auto const attempt: std::views::iota(0, 500))
         {
             CHECK_FALSE(notice.Observe(TermChange { .transition = TermTransition::Unchanged, .previous = 7, .current = 7 }));
             CHECK_FALSE(notice.Observe(TermChange { .transition = TermTransition::Advanced, .previous = 7, .current = 8 }));

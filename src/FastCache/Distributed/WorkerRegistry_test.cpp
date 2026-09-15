@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cstddef>
 #include <optional>
+#include <ranges>
 #include <string>
 #include <vector>
 
@@ -249,9 +250,9 @@ TEST_CASE("A big machine with more running jobs still wins on headroom", "[distr
 
     // The server is carrying four times the laptop's load and is still the better
     // place for the next job.
-    for (auto job = 0; job < 8; ++job)
+    for ([[maybe_unused]] auto const job: std::views::iota(0, 8))
         fix.registry.JobStarted(server);
-    for (auto job = 0; job < 2; ++job)
+    for ([[maybe_unused]] auto const job: std::views::iota(0, 2))
         fix.registry.JobStarted(laptop);
 
     auto const picked = fix.registry.Pick(Gcc13);
@@ -268,9 +269,9 @@ TEST_CASE("Equal headroom is broken by which machine has more of itself left", "
     auto const big = fix.registry.Register(Announce(Gcc13, "10.0.0.1:6676", 64));
     auto const small = fix.registry.Register(Announce(Gcc13, "10.0.0.2:6676", 8));
 
-    for (auto job = 0; job < 60; ++job)
+    for ([[maybe_unused]] auto const job: std::views::iota(0, 60))
         fix.registry.JobStarted(big);
-    for (auto job = 0; job < 4; ++job)
+    for ([[maybe_unused]] auto const job: std::views::iota(0, 4))
         fix.registry.JobStarted(small);
 
     auto const picked = fix.registry.Pick(Gcc13);
@@ -287,7 +288,7 @@ TEST_CASE("A full machine is never picked however large it is", "[distributed][r
     auto const big = fix.registry.Register(Announce(Gcc13, "10.0.0.1:6676", 64));
     auto const small = fix.registry.Register(Announce(Gcc13, "10.0.0.2:6676", 2));
 
-    for (auto job = 0; job < 64; ++job)
+    for ([[maybe_unused]] auto const job: std::views::iota(0, 64))
         fix.registry.JobStarted(big);
 
     auto const picked = fix.registry.Pick(Gcc13);
