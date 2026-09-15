@@ -2026,6 +2026,10 @@ jobs:
       - name: "Assert sccache actually handled the build"
         if: ${{ needs.changes.outputs.code != 'false' }}
         shell: pwsh
+        # mozilla-actions/sccache-action exports it to the job; the step names it, so what this step reads is
+        # visible in the step (#1448).
+        env:
+          SCCACHE_PATH: ${{ env.SCCACHE_PATH }}
         run: |
           & $env:SCCACHE_PATH --show-stats
           $stats = & $env:SCCACHE_PATH --show-stats --stats-format=json | ConvertFrom-Json
@@ -2268,6 +2272,10 @@ jobs:
       # proved in one is a cache two of them can lose in silence.
       - name: "Assert sccache actually handled the build"
         shell: pwsh
+        # mozilla-actions/sccache-action exports it to the job; the step names it, so what this step reads is
+        # visible in the step (#1448).
+        env:
+          SCCACHE_PATH: ${{ env.SCCACHE_PATH }}
         run: |
           & $env:SCCACHE_PATH --show-stats
           $stats = & $env:SCCACHE_PATH --show-stats --stats-format=json | ConvertFrom-Json
@@ -3244,6 +3252,10 @@ jobs:
       # Same assertion as the `windows` job, where the reasoning is written out.
       - name: "Assert sccache actually handled the build"
         shell: pwsh
+        # mozilla-actions/sccache-action exports it to the job; the step names it, so what this step reads is
+        # visible in the step (#1448).
+        env:
+          SCCACHE_PATH: ${{ env.SCCACHE_PATH }}
         run: |
           & $env:SCCACHE_PATH --show-stats
           $stats = & $env:SCCACHE_PATH --show-stats --stats-format=json | ConvertFrom-Json

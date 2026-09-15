@@ -1295,7 +1295,9 @@ what differs between compilers, standard libraries, hosts and tool versions.
   inside the step that cannot run is a rule satisfied by prose. So the rule is per STEP, and it
   covers EVERY `run:` and not only the `set -u` ones: without `-u` the name expands to EMPTY and the
   branch is taken the wrong way silently, which is worse. The runner vocabulary is an ALLOWLIST, the
-  model of bash is deliberately narrower than bash, and the refusal names the STEP.
+  model of each SHELL is deliberately narrower than that shell and chosen per step, the files are a
+  GLOB, every `run:` key is COUNTED by a walk that knows no steps, and the refusal names the STEP.
+  `ctest -R workflow-step-env`.
 - Every check whose SUBJECT is documentation was skipped on exactly the change it exists to catch,
   because `code=false` is right for a compiler and backwards for prose. Prose drifts by being
   EDITED. The set is the `docs-subject` ctest LABEL, read out of `src/tests/CMakeLists.txt` and

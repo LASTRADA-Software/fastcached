@@ -4501,9 +4501,11 @@ grep -q 'FASTCACHED_REPORT_ONLY_IF_NEW' <<< "$(NonComment "$Workflow")"
 a **whole-file** grep — and the line satisfying it is inside the step that cannot run. A
 rule satisfied by a line that never executes is the same defect as a rule satisfied by
 prose, which that file's own header records making twice. **So the rule is per STEP and
-never whole-file; that is the whole of it.** `StepEnvComplete` refuses a `run:` block
-reading a name that neither its own `env:`, the workflow- or job-level `env:`, the
-script's own assignments, nor a named allowlist of runner variables supplies.
+never whole-file; that is the whole of it.** `scripts/check-workflow-step-env.sh`
+(`ctest -R workflow-step-env`) refuses a `run:` step reading a name that neither its own
+`env:`, its job's or the workflow's `env:`, the script's own assignments, nor a named
+allowlist of runner and shell variables supplies. A name an earlier step or an action
+exported is not on that list: the step names it in its own `env:` (below).
 
 It applies to **every** `run:`, not only the ones turning on `set -u`. Without `-u` an
 undefined name expands to EMPTY and the branch is silently taken the wrong way, which is
@@ -4528,17 +4530,46 @@ Four things that shaped the guard rather than decorating it:
 - The self-test's `correct` fixture **modelled the defect**: it emitted a reporter step
   reading `$EVENT` with no `env:` at all, and called that the correct workflow. A
   fixture more permissive than the thing it stands for, vouching for the bug it was
-  built beside. Its `no-event-env` sibling is now the positive control, and every
-  whole-file rule still passes on that fixture — which is precisely how the shipped
+  built beside. Its `no-event-env` sibling became the positive control, and every
+  whole-file rule still passed on that fixture — which is precisely how the shipped
   workflow passed them for its entire life, so a green run of the other twelve cases
-  says nothing about this one.
+  said nothing about this one. It lives on as `siblingStepEnv` in the step-env check's
+  self-test, beside the rule it controls.
 
-The scan is **one workflow's**, not the repository's: 28 `run:` blocks across six
-workflow files are outside it, and generalising it is
-[#1175](https://github.com/LASTRADA-Software/fastcached/issues/1175) rather than a wider
-glob bolted on here. What it cannot see is stated in its own header — `eval`, indirect
-expansion, a name an action's `outputs` supply through a `${{ }}` that is substituted
-before bash sees it, a sourced file, and `${#arr[@]}`.
+The scan was **one workflow's** for its first life, inside `check-merge-group-report.sh`:
+exact about the three steps it knew and silent about the rest of the tree's `run:` steps,
+which reads identically to complete coverage. It walks every workflow file as a glob now
+(#1448, #1175), and generalising it was not a wider glob but a MODEL of each shell:
+
+- The shell is DERIVED per step — its `shell:`, the job's or workflow's
+  `defaults.run.shell`, else the runner default for a literal `runs-on` — and a step
+  whose shell cannot be derived, or has no model, is refused. Run over `build.yml` at
+  fa8fb0c3, the one-workflow model refused 13 PowerShell steps for `$LASTEXITCODE` and
+  `$null`, and 4 bash steps for `{ c=$?; }`, all falsely; PowerShell reads the
+  environment only as `$env:NAME`, case-insensitively.
+- Job-level `env:` reaches that job's steps only. The first model kept one file-wide set,
+  harmless over a one-job file and too permissive over `build.yml`.
+- A folded `run: >` is a run. The first model never read one, silently.
+- A name an earlier step or an action EXPORTED reaches a later step at run time and is
+  still refused until the step names it — `NAME: ${{ env.NAME }}`, which the tree already
+  wrote for `CLANG_TIDY_BIN`. Modelling every `$GITHUB_ENV` spelling and every action's
+  exports would be a row per action; the row says where the name comes from, in the step.
+- The reader refuses a line it cannot place — a flow mapping, an alias, a quoted key, a
+  second document — rather than skipping it, and a clean run is shown able to fail on the
+  REAL files: `workflow-step-env-plant` appends a read of an undefined name to the end of
+  every step, through the same lexer, and passes only when every step refuses it.
+- **The plant cannot see a step the reader never placed**, and nor can anything else the
+  reader computes: a step whose keys sit at a column it does not look at reads as a step
+  reading nothing, which is clean. So every `run:` key outside a scalar is COUNTED by a
+  second walk that knows no steps, both numbers are printed per file, and a key the reader
+  did not place is refused by line. Its positive control is on the real tree: the
+  `- run: ${RUN_URL}` lines inside `merge-group-report.yml`'s heredocs are text, not keys.
+- A tracked composite action has `run:` steps under the same rule and none is read, so one
+  is refused by NAME rather than left outside a pass that reads as complete. The file set
+  is `git ls-files -z`: a plain listing QUOTES a path holding a byte outside ASCII, and
+  `*/action.yml` then misses it.
+
+What it cannot see is stated in its own header.
 
 **A Windows leg that cannot start processes reports six red smoke tests, not a
 runner fault** ([#966](https://github.com/LASTRADA-Software/fastcached/issues/966)).
@@ -5572,6 +5603,15 @@ is correct: an inclusion list naming this repository's own layout needs no roots
   entry under "Language and ABI pitfalls" being obeyed, not a gap in it: neither platform has a CI
   leg to compile a branch for it. It closes when each has one, and that change removes the `#1432`
   comments in `Core/CpuFeatures` and this entry.
+
+- **[#1460](https://github.com/LASTRADA-Software/fastcached/issues/1460)** — the
+  per-step env check accepts a `NAME: ${{ env.NAME }}` row as naming where an exported name
+  comes from, and reads nothing on its right: a `${{ env.X }}` naming no workflow, job or
+  step `env:`, no earlier `$GITHUB_ENV` write and no action export substitutes EMPTY with no
+  error, so a typo'd row passes. The same holds for a `${{ env.X }}` anywhere in a step's
+  `run:`, `with:`, `if:` or `env:` values. It closes when expressions are read against those
+  sources, with a writer table, an action-export table refused when stale in either direction,
+  and the plant added to every step's `env:` values.
 
 - **[#1410](https://github.com/LASTRADA-Software/fastcached/issues/1410)** — the
   declared clang-tidy build crashes in `modernize-min-max-use-initializer-list` on a call through a
