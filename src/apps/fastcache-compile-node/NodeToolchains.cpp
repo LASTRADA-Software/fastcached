@@ -374,13 +374,6 @@ std::optional<DiscoveredToolchains> DiscoverToolchainEntries(NodeConfig const& c
                                                              ILogger& logger,
                                                              SurveyVoice voice)
 {
-    // A node that runs no worker (#206) is not asked. Searching would spawn every
-    // compiler on the machine to build a set nothing reads, and log a count an operator
-    // would take for this node's worker; the startup table has already refused the
-    // toolchain flags on it, so there is no operator list to honour either.
-    if (!RunsWorker(cfg))
-        return DiscoveredToolchains { .entries = {}, .source = ToolchainSource::NothingToSearch, .unaskable = 0 };
-
     // One fact, stated once. The set is the machine's when the operator named none
     // and there is something to ask -- which is also what decides whether the count
     // at the end is worth saying out loud, and which of three refusals is honest

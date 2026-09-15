@@ -91,9 +91,8 @@ enum class ToolchainSource : std::uint8_t
     MachineSearched,
     /// Every entry came from a `--toolchain`. The operator's list wins whole.
     OperatorNamed,
-    /// `--no-toolchain-discovery` and no `--toolchain`, or `--slots=0`, which runs no
-    /// worker at all (#206): this node was told to serve nothing, which is a
-    /// configuration answer rather than a search result.
+    /// `--no-toolchain-discovery` and no `--toolchain`: this worker was told to
+    /// serve nothing, which is a configuration answer rather than a search result.
     NothingToSearch,
 };
 
