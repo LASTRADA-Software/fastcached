@@ -20,6 +20,7 @@
 #include <expected>
 #include <new>
 #include <optional>
+#include <ranges>
 #include <span>
 #include <string>
 #include <vector>
@@ -36,7 +37,7 @@ FastCache::Task<std::string> ReadResponse(FastCache::ISocket* socket)
         auto const result = co_await socket->Read(std::span<std::byte> { chunk.data(), chunk.size() });
         if (!result.has_value() || *result == 0)
             break;
-        for (std::size_t i = 0; i < *result; ++i)
+        for (auto const i: std::views::iota(std::size_t { 0 }, *result))
             out.push_back(static_cast<char>(chunk[i]));
         if (*result < chunk.size())
             break;
