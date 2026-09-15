@@ -105,11 +105,13 @@ ExpiryReaper::ExpiryReaper(IStorage& storage,
                            ILogger& logger,
                            ExpiryReaperOptions options,
                            IMetricsSink* metrics,
-                           IDrainAbandonment& abandonment) noexcept:
+                           IDrainAbandonment& abandonment,
+                           IDrainWait& drainWait) noexcept:
     _storage { storage },
     _logger { logger },
     _metrics { metrics },
     _abandonment { abandonment },
+    _drainWait { drainWait },
     _options { options },
     _interval { _options.interval },
     _scanBudget { _options.scanBudget }
@@ -145,7 +147,7 @@ void ExpiryReaper::Stop() noexcept
     // measures the sleep it ASKED for and a sleep costs what the host's timer
     // granularity says. Past the bound the frame is ABANDONED, never destroyed; the
     // declaration of `Stop` says why.
-    if (DrainWithin([this] { return AwayFromReactor(); }, _options.stopDrain) == DrainResult::Ceiling)
+    if (DrainWithin([this] { return AwayFromReactor(); }, _options.stopDrain, _drainWait) == DrainResult::Ceiling)
     {
         _logger.Logf(LogLevel::Error,
                      "expiry: the sweep did not come back from its executor within {} ms of the cycle stopping; "

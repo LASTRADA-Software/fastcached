@@ -157,11 +157,15 @@ class ExpiryReaper
     /// @param options Pacing and ceilings.
     /// @param metrics Counter sink, or nullptr.
     /// @param abandonment What `Stop` does with a frame that does not come back in time.
+    /// @param drainWait Where `Stop`'s drain takes its clock and its blocking. Production's is real
+    ///        time; a test supplies one whose clock it controls, so a ceiling it is not asserting on
+    ///        is a condition rather than a race against the host (#1433). Must outlive this reaper.
     ExpiryReaper(IStorage& storage,
                  ILogger& logger,
                  ExpiryReaperOptions options,
                  IMetricsSink* metrics = nullptr,
-                 IDrainAbandonment& abandonment = DefaultDrainAbandonment()) noexcept;
+                 IDrainAbandonment& abandonment = DefaultDrainAbandonment(),
+                 IDrainWait& drainWait = DefaultDrainWait()) noexcept;
 
     ~ExpiryReaper()
     {
@@ -306,6 +310,7 @@ class ExpiryReaper
     ILogger& _logger;
     IMetricsSink* _metrics;
     IDrainAbandonment& _abandonment;
+    IDrainWait& _drainWait;
     ExpiryReaperOptions _options;
     Duration _interval;
 
