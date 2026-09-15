@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#include <FastCache/Core/MachineName.hpp>
 #include <FastCache/Distributed/FleetChart.hpp>
 #include <FastCache/Distributed/FleetText.hpp>
 
@@ -772,6 +773,8 @@ namespace
                              return std::string { bucket.backfilled ? "true" : "false" };
                          } },
     };
+    static_assert(std::ranges::all_of(BucketArrayTable, [](BucketArrayRow const& row) { return IsKebabName(row.key); }),
+                  "every per-bucket array a fleet document gives a program must be named in kebab-case");
 
     /// One series value as both documents write it; the precision is the JSON's, so the two agree.
     /// @param value The value.

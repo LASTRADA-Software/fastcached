@@ -716,6 +716,10 @@ for `json`, and one block per sample for `kv`. The keys are the figures the pane
 draws, under the names the panel's table gives them, so a script and the screen
 never disagree about what a figure is called.
 
+Every key is kebab-case, the spelling the leader's fleet columns use: `hit-rate`,
+`cpu-busy-ratio`, and a cache tier's figures as the tier and the key joined,
+`memory-bytes-used`. A key spelled any other way does not build.
+
 - **The header is written after the first sample that was read**, and its columns
   never move after that. A figure the server did not report in a later sample is an
   absent cell, not a missing column.

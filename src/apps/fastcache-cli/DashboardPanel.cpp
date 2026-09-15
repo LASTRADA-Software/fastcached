@@ -3083,6 +3083,16 @@ std::string TierFigureKey(std::string_view tier, std::string_view column)
     return std::format("{}{}{}", tier, TierKeySeparator, column);
 }
 
+MachineNameTable PanelMachineNames(std::string_view table, PanelSpec const& panel)
+{
+    auto named = MachineNameTable { .table = table, .names = {} };
+    ForEachFigureKey(panel, [&named](std::string_view key) { named.names.emplace_back(key); });
+    for (auto const& tier: StorageTierTable)
+        for (auto const& column: panel.tierColumns)
+            named.names.push_back(TierFigureKey(tier.name, column.key));
+    return named;
+}
+
 std::vector<std::string_view> TiersIn(PanelSpec const& spec, StatsReading const& reading)
 {
     auto tiers = std::vector<std::string_view> {};

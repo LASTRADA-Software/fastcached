@@ -68,8 +68,8 @@ using FigureProjection = Value (*)(DashboardModel const& model);
 /// Fields in panel order, each named by the row's own machine `key` -- never by its label, which is
 /// worded for the screen: `source`, then each rate row followed by the figures beside it, then each
 /// level row followed by its limit (`limitKey`), then, for each tier the newest reading carries
-/// (`TiersIn`, the panel's own answer), every tier column as `TierFigureKey`: `memory_items`,
-/// `disk_bytes_used`. A level row naming no field exists to say why there is nothing to draw, and
+/// (`TiersIn`, the panel's own answer), every tier column as `TierFigureKey`: `memory-items`,
+/// `disk-bytes-used`. A level row naming no field exists to say why there is nothing to draw, and
 /// has no field here. With no reading there are no tiers, which is why `PipedRecordView` writes its
 /// header from a reading.
 /// @param panel The panel.

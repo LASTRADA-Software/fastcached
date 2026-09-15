@@ -2,6 +2,7 @@
 #include <FastCache/Cli/Duration.hpp>
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/FigureText.hpp>
+#include <FastCache/Core/MachineName.hpp>
 #include <FastCache/Core/Ranges.hpp>
 #include <FastCache/Distributed/FleetChart.hpp>
 #include <FastCache/Distributed/FleetText.hpp>
@@ -637,10 +638,13 @@ namespace
                          } },
     };
 
+    /// What joins a tier's name to a tier column's suffix.
+    constexpr std::string_view TierColumnSeparator = "-";
+
     /// The name a tier column carries, e.g. `memory-items`.
     [[nodiscard]] std::string TierColumnName(StorageTier tier, std::string_view suffix)
     {
-        return std::format("{}-{}", StorageTierTable[static_cast<std::size_t>(tier)].name, suffix);
+        return std::format("{}{}{}", StorageTierTable[static_cast<std::size_t>(tier)].name, TierColumnSeparator, suffix);
     }
 
     /// What the tier table's first column is called.
@@ -651,6 +655,39 @@ namespace
     /// it a fourth -- at which point the name a caller is told to expect and the name a
     /// renderer emits are different strings that happen to agree.
     constexpr std::string_view TierEndpointColumn = "endpoint";
+
+    /// Whether every name @p columns gives a program is kebab-case.
+    /// @param columns A column table.
+    /// @return True when each `name` is.
+    template <typename Subject, std::size_t N>
+    [[nodiscard]] constexpr bool ColumnNamesAreKebab(std::array<FleetColumn<Subject>, N> const& columns) noexcept
+    {
+        return std::ranges::all_of(columns, [](FleetColumn<Subject> const& column) { return IsKebabName(column.name); });
+    }
+
+    /// Whether every name the fleet documents' tables give a program is spelled the one way a program reads a
+    /// name: kebab-case, through the predicate the CLI's piped keys are held to as well (#1445) -- the column
+    /// tables, a tier column as it is JOINED from its tier and suffix, the section keys, the lease outcomes and the
+    /// series. The headline figures' keys are asserted beside `KpiTable` and the bucket arrays' beside theirs, where
+    /// those tables are; `FleetMachineNameTables` is the run-time walk over all of them.
+    /// @return True when every name is.
+    [[nodiscard]] consteval bool FleetNamesAreKebab() noexcept
+    {
+        auto whole = ColumnNamesAreKebab(MemberColumns) && ColumnNamesAreKebab(NodeColumns)
+                     && ColumnNamesAreKebab(WorkerColumns) && ColumnNamesAreKebab(LeaseColumns)
+                     && IsKebabName(TierEndpointColumn);
+        for (auto const& tier: StorageTierTable)
+            for (auto const& column: TierColumns)
+                whole = whole && IsKebabJoin({ tier.name, TierColumnSeparator, column.suffix });
+        whole =
+            whole && std::ranges::all_of(FleetSectionTable, [](FleetSectionRow const& row) { return IsKebabName(row.key); });
+        whole =
+            whole && std::ranges::all_of(LeaseOutcomeTable, [](LeaseOutcomeRow const& row) { return IsKebabName(row.key); });
+        whole =
+            whole && std::ranges::all_of(FleetSeriesTable, [](FleetSeriesRow const& row) { return IsKebabName(row.key); });
+        return whole;
+    }
+    static_assert(FleetNamesAreKebab(), "every name a fleet document gives a program must be kebab-case");
 
     /// Whether any member reports this tier.
     [[nodiscard]] bool AnyNodeHasTier(std::vector<NodeReport> const& nodes, StorageTier tier)
@@ -2049,24 +2086,25 @@ footer { margin-top:2.4rem; padding-top:1rem; border-top:1px solid var(--line);
                  .sparkline = false },
     };
 
-    /// Every tile states a key, and no two share one.
+    /// Every tile states a key, no two share one, and each is kebab-case.
     ///
     /// A row that forgets `key` is still a row, at the right position, with a label --
     /// it just renders a machine-readable figure under an empty name, which collides
     /// with the next row that forgets one. Neither `RowsInEnumeratorOrder` nor any
     /// render-time check can see that, and there is no reason a tile could have for
-    /// being unnamed, so the type system answers it.
-    /// @return True when every key is non-empty and distinct.
+    /// being unnamed, so the type system answers it. The spelling is the one every other
+    /// name a program reads is held to (`IsKebabName`, #1445), and it implies non-empty.
+    /// @return True when every key is kebab-case and distinct.
     [[nodiscard]] consteval bool EveryKpiIsKeyed()
     {
         return std::ranges::all_of(std::views::iota(std::size_t { 0 }, KpiTable.size()), [](std::size_t outer) {
-            if (KpiTable[outer].key.empty())
+            if (!IsKebabName(KpiTable[outer].key))
                 return false;
             return std::ranges::none_of(std::views::iota(outer + 1, KpiTable.size()),
                                         [outer](std::size_t inner) { return KpiTable[outer].key == KpiTable[inner].key; });
         });
     }
-    static_assert(EveryKpiIsKeyed(), "every KpiTable row needs its own non-empty machine key");
+    static_assert(EveryKpiIsKeyed(), "every KpiTable row needs its own kebab-case machine key");
 
     /// Each row's words, so `FleetKpis` can hand out a view of something static.
     constexpr auto KpiTexts = [] {
@@ -2369,6 +2407,29 @@ footer { margin-top:2.4rem; padding-top:1rem; border-top:1px solid var(--line);
 std::span<std::string_view const> FleetKpiKeys() noexcept
 {
     return KpiKeys;
+}
+
+std::vector<MachineNameTable> FleetMachineNameTables()
+{
+    // Every section's names with every tier composed, as the renderers compose them: a tier no member runs has no
+    // column, so the snapshot says they all do.
+    auto snapshot = FleetSnapshot {};
+    snapshot.tiersPresent.fill(true);
+
+    auto tables = std::vector<MachineNameTable> {};
+    for (auto const& row: FleetSectionTable)
+        tables.push_back(MachineNameTable { .table = row.key, .names = FleetColumnNames(row.section, snapshot) });
+
+    auto const keysOf = [](std::string_view table, auto const& keys) {
+        auto named = MachineNameTable { .table = table, .names = {} };
+        for (auto const key: keys)
+            named.names.emplace_back(key);
+        return named;
+    };
+    tables.push_back(keysOf("fleet-sections", FleetSectionTable | std::views::transform(&FleetSectionRow::key)));
+    tables.push_back(keysOf("kpi-keys", FleetKpiKeys()));
+    tables.push_back(keysOf("lease-outcomes", LeaseOutcomeTable | std::views::transform(&LeaseOutcomeRow::key)));
+    return tables;
 }
 
 std::span<FleetKpiText const> FleetKpis() noexcept

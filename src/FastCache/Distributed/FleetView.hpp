@@ -5,6 +5,7 @@
 #include <FastCache/Cluster/ClusterState.hpp>
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/FigureText.hpp>
+#include <FastCache/Core/MachineName.hpp>
 #include <FastCache/Distributed/FleetHistory.hpp>
 #include <FastCache/Distributed/SchedulerService.hpp>
 #include <FastCache/Distributed/WorkerRegistry.hpp>
@@ -594,6 +595,16 @@ enum class CellTone : std::uint8_t
 /// reworded; the key is what a scraper keyed on `/fleet.json` depends on.
 /// @return A view of the static table; never empty.
 [[nodiscard]] std::span<std::string_view const> FleetKpiKeys() noexcept;
+
+/// Every name the fleet documents give a program, table by table, as a run-time walk.
+///
+/// **Derived from the tables the renderers walk**, never a list: each section's names through `FleetColumnNames`
+/// with every tier composed (so the column tables, the tier columns, the `kpi` columns and the series and bucket
+/// arrays), then the section keys, the headline figures' keys and the lease outcomes' keys. Each of those tables
+/// `static_assert`s its own spelling; this is what a case plants a misspelled name into, one table at a time, to
+/// watch `MisspelledMachineName` refuse it and name the table (#1445).
+/// @return One table per source of names, in the order above.
+[[nodiscard]] std::vector<MachineNameTable> FleetMachineNameTables();
 
 /// What a human surface other than the page needs to write one headline figure.
 ///

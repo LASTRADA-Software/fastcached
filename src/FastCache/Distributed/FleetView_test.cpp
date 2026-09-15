@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Cache/StorageTier.hpp>
 #include <FastCache/Core/Clock.hpp>
+#include <FastCache/Core/MachineName.hpp>
 #include <FastCache/Core/Ranges.hpp>
 #include <FastCache/Core/Utf8.hpp>
 #include <FastCache/Distributed/FleetChart.hpp>
@@ -444,6 +445,44 @@ TEST_CASE("Every column a section renders states how long a narrow surface keeps
     CHECK(FleetColumnKeep(FleetSection::Machines, "version") == ColumnKeep::Detail);
     CHECK_FALSE(FleetColumnKeep(FleetSection::Machines, "zeta-column").has_value());
     CHECK_FALSE(FleetColumnKeep(FleetSection::Kpi, "value").has_value());
+}
+
+TEST_CASE("Every name a fleet document gives a program is kebab-case, and a misspelled one is refused naming its table",
+          "[distributed][fleetview][names]")
+{
+    // Each table `static_assert`s its own spelling, which can only be watched refusing by breaking the build; this is
+    // the run-time half, over the walk derived from the same tables (#1445). WHAT DISTINGUISHES: a camelCase name
+    // planted in ONE table is refused and the refusal names THAT table -- a check that looked at three of the
+    // tables would pass the plants in the other two, and one that refused without saying where would pass none.
+    auto const tables = FleetMachineNameTables();
+    CHECK(MisspelledMachineName(tables) == std::nullopt);
+
+    // The control: every source of names is walked, the composed tier names among them, and none is empty.
+    auto sources = std::vector<std::string_view> {};
+    for (auto const& table: tables)
+    {
+        INFO("table " << table.table);
+        CHECK_FALSE(table.names.empty());
+        sources.push_back(table.table);
+    }
+    for (auto const& row: FleetSectionTable)
+        CHECK(std::ranges::find(sources, row.key) != sources.end());
+    for (auto const source: { "fleet-sections", "kpi-keys", "lease-outcomes" })
+        CHECK(std::ranges::find(sources, std::string_view { source }) != sources.end());
+    auto const* const tiers = FindIfOrNull(tables, [](MachineNameTable const& table) { return table.table == "tiers"; });
+    REQUIRE(tiers != nullptr);
+    CHECK(std::ranges::find(tiers->names, "disk-index-ram") != tiers->names.end());
+
+    for (auto const index: std::views::iota(std::size_t { 0 }, tables.size()))
+    {
+        auto planted = tables;
+        planted[index].names.emplace_back("plantedCamelCase");
+        auto const refusal = MisspelledMachineName(planted);
+        INFO("planted in " << planted[index].table);
+        REQUIRE(refusal.has_value());
+        CHECK(refusal->contains(std::format("table `{}`", planted[index].table)));
+        CHECK(refusal->contains("`plantedCamelCase`"));
+    }
 }
 
 TEST_CASE("An age's tone is one threshold, asked by the page and every other surface", "[distributed][fleetview][tone]")
