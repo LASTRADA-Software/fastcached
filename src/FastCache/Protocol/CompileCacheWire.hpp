@@ -1163,6 +1163,11 @@ inline constexpr PayloadCap SessionCapGoverns { 0 };
 /// So the grouping becomes a column. It says which family a verb BELONGS to, never
 /// which process serves it: `fastcached` and a node both answer `Cache` verbs, and
 /// what differs is which of them has a component for the family, not the taxonomy.
+///
+/// **Private: in-process only.** A verb's family is read off `OpTable` at each end and is
+/// never transmitted or persisted, so the enumerator order is free and appending a family
+/// shifts nothing on the wire. The one explicit value is `Unset`'s zero, which is
+/// load-bearing for the reason stated on it; no other enumerator carries one.
 enum class VerbFamily : std::uint8_t
 {
     /// Not a family. Zero is deliberately unusable, so a row added without a family
@@ -1223,6 +1228,12 @@ enum class VerbFamily : std::uint8_t
     /// with a reply rather than a stream. A node running no scheduler still owns the family and
     /// says the fleet is served elsewhere, as the fleet subject of a subscription does.
     Fleet,
+
+    /// The count, not a family: what sizes a table with one row per family
+    /// (`Core/EnumTable.hpp`), so appending a family fails the build of every such table
+    /// until it has a row. Never in `OpTable`, which `EveryVerbHasAFamily` would not catch
+    /// by itself, so `NoVerbIsInTheCountFamily` does.
+    Last,
 };
 
 /// One row of the opcode table: everything the framing layer knows about a verb.
@@ -1787,6 +1798,15 @@ static_assert(PreAuthVerbsAreBounded(), "a verb reachable before AUTH must decla
 }
 
 static_assert(EveryVerbHasAFamily(), "a verb belongs to a family -- see VerbFamily");
+
+/// Whether no verb names `VerbFamily::Last`, which is a count rather than a family.
+/// @return True when every row names a real family.
+[[nodiscard]] constexpr bool NoVerbIsInTheCountFamily() noexcept
+{
+    return std::ranges::none_of(OpTable, [](OpDescriptor const& row) { return row.family == VerbFamily::Last; });
+}
+
+static_assert(NoVerbIsInTheCountFamily(), "VerbFamily::Last is the count, not a family a verb can belong to");
 
 /// Whether no two rows claim one wire byte.
 ///

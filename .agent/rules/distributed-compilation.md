@@ -1772,6 +1772,22 @@ Six more about what the tier IS and who gets to see it:
   fleet-page machine, since both the Machines rows and the history handover ride
   worker registration, and its `/metrics` and history read 0 slots rather than absent
   (#1440).
+  **The worker is `WorkerTier`, null on such a node** (#1387): no idle pool thread, no
+  capacity sized to zero, no validator. It owns the `SchedulerLink`, so a worker cannot
+  exist without one and a start that reaches it with no `--scheduler` is refused by
+  name rather than heartbeating nowhere. **And a node running no worker may run only
+  consensus**, which reached two answers written for "every node has a compile
+  component": the merged listener's bind predicate (`AnswersAnyFamily`) and its
+  session-ceiling fold (`MergedResponder::Largest`) both count the never-null operator
+  families -- node, live and fleet -- or such a node names a port it does not bind -- or
+  binds one whose ceilings fold to zero and closes every connection, `--node-status`
+  included. The second was found only by a test that EXCHANGED a frame over the bound
+  port; the bind alone passed. The bind, the fold and the connection sum all read
+  `FamilyRoutes`, one row per `VerbFamily` with a presence column and a ceilings column
+  that a new family must STATE (`EveryFamilyIsClassified`), because a hand-written list
+  of members beside the router was silent about `Fleet` when that family landed. The
+  `OnEveryBuiltNode` owners' connection allowances ADD, since they coexist on every port
+  while the live subscriptions are all held.
 - **A store that will not open is always fatal; a port that will not bind is fatal
   only when the operator typed the address.** The two leave `CacheTier` through one
   `std::string`, so `StartCacheTierOrExplain` opens the store itself rather than

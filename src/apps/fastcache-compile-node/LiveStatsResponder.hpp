@@ -103,8 +103,10 @@ class LiveStatsResponder final: public IFrameResponder, public IFrameStream, pri
 
     /// @copydoc IFrameResponder::MaxOpenConnections
     ///
-    /// The subscription cap. Not folded by `MergedResponder::Largest`, like the node component's;
-    /// the cap that bites is the one this responder enforces itself, with a counted refusal.
+    /// The subscription cap. ADDED by `MergedResponder` to the other operator families', so a node
+    /// running nothing else still admits `--node-status` and a fleet read while every subscription is
+    /// held; the cap that bites on subscriptions is the one this responder enforces itself, with a
+    /// counted refusal.
     [[nodiscard]] std::size_t MaxOpenConnections() const noexcept override
     {
         return CompileCacheWire::MaxLiveSubscriptions;
