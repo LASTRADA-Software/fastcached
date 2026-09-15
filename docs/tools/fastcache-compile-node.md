@@ -1988,6 +1988,10 @@ wins" stays a question of which pass ran second. If the file will not parse, or
 changes a setting that cannot change at runtime, **nothing is applied** and the
 refusal names every offending setting. You saved once; you get one answer.
 
+A key written twice is refused the same way, at startup and at a reload, naming both
+lines. It used to keep the second silently — two `listen_node:` lines served the second
+address — so a list is written as one key with every value under it.
+
 <!-- reloadable-for: fastcache-compile-node -->
 
 | Reloadable | Requires a restart |

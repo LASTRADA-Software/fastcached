@@ -33,6 +33,10 @@
 # toolchain, raft_peer, fleet_member) naming any value on the command line
 # REPLACES this file's list rather than extending it.
 #
+# Write a list as ONE key with every value under it. A key written twice is
+# refused at startup and at a reload, naming both lines; it used to keep the
+# second silently, so a worker served an address its file also contradicted.
+#
 # A flag whose meaning is its presence -- one you would pass with no value --
 # is a boolean here, and only `true` and `false` are accepted. `raft_join: true`
 # is `--raft-join`; `raft_join: false` is not passing it. Read
