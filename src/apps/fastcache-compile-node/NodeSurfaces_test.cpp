@@ -758,9 +758,15 @@ TEST_CASE("The worksheet prints the consensus address peers DIAL apart from the 
     // reader of a pasted transcript -- the docs check included. So the label is indented
     // under its heading, and nothing in column one names it.
     CHECK_FALSE(LineStarting(sheet, "consensus").has_value());
-    CHECK(sheet.find("\ndialled at:\n") < sheet.find(DialLabel()));
-    CHECK(sheet.find("raft ") < sheet.find("\ndialled at:\n"));
-    CHECK(sheet.find(DialLabel()) < sheet.find("\nnotes:"));
+    // Each heading FOUND before it is compared: a missing one is `npos`, greater than every
+    // position, so "`raft` comes before it" would hold on a worksheet that printed no heading.
+    auto const heading = sheet.find("\ndialled at:\n");
+    auto const notes = sheet.find("\nnotes:");
+    REQUIRE(heading != std::string::npos);
+    REQUIRE(notes != std::string::npos);
+    CHECK(heading < sheet.find(DialLabel()));
+    CHECK(sheet.find("raft ") < heading);
+    CHECK(sheet.find(DialLabel()) < notes);
 }
 
 TEST_CASE("A node running no consensus prints its dial address as ABSENT, not as an empty one",

@@ -297,6 +297,7 @@ enum class StatusFact : std::uint8_t
     Registrars, ///< `1 of 1, last 4s ago`: its registrations, and when one was last accepted.
     Consensus,  ///< Its scheduler role; only on a node running consensus.
     Leader,     ///< The leader it knows about; beside `Consensus`.
+    DialledAt,  ///< Where consensus peers dial it; under `Consensus`, only on a node running consensus.
     Slots,      ///< In flight, available and registered, and what limits them; only on a node running a worker.
     CacheTier,  ///< Its cache tier's hit rate and fill; only on a node running one.
     Host,       ///< The machine: CPU busy, memory free, scratch free.

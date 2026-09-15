@@ -1540,6 +1540,18 @@ namespace
                   return Said(std::string { SelfLeader });
               return Said(std::string { in.absent });
           } },
+        { .fact = StatusFact::DialledAt,
+          .render = [](FrameInputs const& in, FactCell const& /*cell*/, std::size_t /*width*/) -> std::optional<FactText> {
+              // The address the admission receipt asks an operator to compare, as the node states it -- not the raft
+              // BIND, which under a bare `--listen-raft` is the wildcard (#1418). Disengaged on a node that runs
+              // consensus is a build older than the field (#1328), so it is the marker, never a blank.
+              if (!RunsConsensus(CarriedStatusOf(in)))
+                  return std::nullopt;
+              auto const* status = StatusOf(in);
+              if (status == nullptr || !status->runtime.consensusEndpoint.has_value())
+                  return Said(std::string { in.absent });
+              return Said(*status->runtime.consensusEndpoint);
+          } },
         { .fact = StatusFact::Slots,
           .render = [](FrameInputs const& in, FactCell const& cell, std::size_t width) -> std::optional<FactText> {
               // A node whose status said it runs no worker has no slots to draw.
