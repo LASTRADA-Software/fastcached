@@ -4501,9 +4501,10 @@ grep -q 'FASTCACHED_REPORT_ONLY_IF_NEW' <<< "$(NonComment "$Workflow")"
 a **whole-file** grep — and the line satisfying it is inside the step that cannot run. A
 rule satisfied by a line that never executes is the same defect as a rule satisfied by
 prose, which that file's own header records making twice. **So the rule is per STEP and
-never whole-file; that is the whole of it.** `StepEnvComplete` refuses a `run:` block
-reading a name that neither its own `env:`, the workflow- or job-level `env:`, the
-script's own assignments, nor a named allowlist of runner variables supplies.
+never whole-file; that is the whole of it.** `scripts/check-workflow-step-env.sh`
+(`ctest -R workflow-step-env`) refuses a `run:` step reading a name that neither its own
+`env:`, its job's or the workflow's `env:`, an export by an EARLIER step of the same job,
+the script's own assignments, nor a named allowlist of runner variables supplies.
 
 It applies to **every** `run:`, not only the ones turning on `set -u`. Without `-u` an
 undefined name expands to EMPTY and the branch is silently taken the wrong way, which is
@@ -4528,17 +4529,33 @@ Four things that shaped the guard rather than decorating it:
 - The self-test's `correct` fixture **modelled the defect**: it emitted a reporter step
   reading `$EVENT` with no `env:` at all, and called that the correct workflow. A
   fixture more permissive than the thing it stands for, vouching for the bug it was
-  built beside. Its `no-event-env` sibling is now the positive control, and every
-  whole-file rule still passes on that fixture — which is precisely how the shipped
+  built beside. Its `no-event-env` sibling became the positive control, and every
+  whole-file rule still passed on that fixture — which is precisely how the shipped
   workflow passed them for its entire life, so a green run of the other twelve cases
-  says nothing about this one.
+  said nothing about this one. It lives on as `siblingStepEnv` in the step-env check's
+  self-test, beside the rule it controls.
 
-The scan is **one workflow's**, not the repository's: 28 `run:` blocks across six
-workflow files are outside it, and generalising it is
-[#1175](https://github.com/LASTRADA-Software/fastcached/issues/1175) rather than a wider
-glob bolted on here. What it cannot see is stated in its own header — `eval`, indirect
-expansion, a name an action's `outputs` supply through a `${{ }}` that is substituted
-before bash sees it, a sourced file, and `${#arr[@]}`.
+The scan was **one workflow's** for its first life, inside `check-merge-group-report.sh`:
+exact about the three steps it knew and silent about the rest of the tree's `run:` steps,
+which reads identically to complete coverage. It walks every workflow file as a glob now
+(#1448, #1175), and generalising it was not a wider glob but a MODEL of each shell:
+
+- The shell is DERIVED per step — its `shell:`, the job's or workflow's
+  `defaults.run.shell`, else the runner default for a literal `runs-on` — and a step
+  whose shell cannot be derived, or has no model, is refused. Read by the bash model, a
+  PowerShell step's `$LASTEXITCODE` and `$null` were thirteen false refusals; PowerShell
+  reads the environment only as `$env:NAME`, case-insensitively.
+- Job-level `env:` reaches that job's steps only. The first model kept one file-wide set,
+  harmless over a one-job file and too permissive over `build.yml`.
+- A folded `run: >` is a run. The first model never read one, silently.
+- A clean run is shown able to fail on the REAL files: `workflow-step-env-plant` appends a
+  read of an undefined name to the end of every step, through the same lexer, and passes
+  only when every step refuses it — so a body the lexer leaves inside a quote or a heredoc
+  is found, rather than every read after it passing unseen.
+
+What it cannot see is stated in its own header — `eval`, indirect expansion, a name
+supplied through a `${{ }}` that is substituted before the shell sees it, a sourced file,
+`${#arr[@]}`, and an export to `$GITHUB_ENV` or by an action it has no model or row for.
 
 **A Windows leg that cannot start processes reports six red smoke tests, not a
 runner fault** ([#966](https://github.com/LASTRADA-Software/fastcached/issues/966)).

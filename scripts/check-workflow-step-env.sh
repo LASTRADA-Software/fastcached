@@ -771,6 +771,8 @@ jobs:
       - run: echo "$TOOL_BIN"
 WF
 
+    # A workflow's bash is the runner's, not macOS's 3.2, so the staged script names what a workflow may use.
+    # bash32-scan: data-begin
     Case bashAssignments 0 '1 read as bash' <<'WF'
 jobs:
   a:
@@ -798,6 +800,7 @@ jobs:
             $ENV.X
           '
 WF
+    # bash32-scan: data-end
 
     Case pwshModel 0 '0 read as bash, 2 as PowerShell' <<'WF'
 env:

@@ -3057,6 +3057,38 @@ if(NOT WIN32)
 endif()
 
 # ---------------------------------------------------------------------------
+# Every workflow `run:` step reads only environment names it can see (#1448, #1175; the rule is #1174's). The check
+# walks .github/workflows/ as a glob. The plant appends a read of an undefined name to the end of every step and
+# passes only when every one refuses it, so a clean run of the real files has been shown able to fail. Registered on
+# every platform: it reads text with bash and awk, and runs under Git Bash as it does under bash.
+add_test(
+    NAME "workflow-step-env"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-workflow-step-env.sh"
+)
+set_tests_properties("workflow-step-env" PROPERTIES
+    LABELS "hygiene"
+    TIMEOUT 60
+)
+
+add_test(
+    NAME "workflow-step-env-plant"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-workflow-step-env.sh" --plant
+)
+set_tests_properties("workflow-step-env-plant" PROPERTIES
+    LABELS "hygiene"
+    TIMEOUT 60
+)
+
+add_test(
+    NAME "workflow-step-env-selftest"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-workflow-step-env.sh" --self-test
+)
+set_tests_properties("workflow-step-env-selftest" PROPERTIES
+    LABELS "hygiene"
+    TIMEOUT 120
+)
+
+# ---------------------------------------------------------------------------
 # The checks whose SUBJECT is documentation are still runnable from a bare
 # checkout, and there is still at least one of them (#687).
 #
