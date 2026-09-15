@@ -426,8 +426,10 @@ foreach(docFile IN LISTS docFiles)
     set(fenceState "")
     set(seenInFence "")
     set(rowsInFence 0)
+    set(commandLine FALSE)
     foreach(line IN LISTS docLines)
         if(line MATCHES "^[ \t]*```")
+            set(commandLine FALSE)
             if(fenceState STREQUAL "transcript" AND rowsInFence EQUAL 0)
                 # A fence that INVOKES `--print-surfaces` and pastes none of its
                 # output is documentation of the command, not a transcript of it.
@@ -469,7 +471,20 @@ foreach(docFile IN LISTS docFiles)
         endif()
 
         if(NOT fenceState STREQUAL "")
-            if(line MATCHES "print-surfaces")
+            # A transcript is a fence whose COMMAND invokes `--print-surfaces`: a `$` line, or
+            # an indented line continuing it (the backslash itself is blanked by the
+            # tokeniser, and an output row starts in column one, so indentation is what is
+            # left to tell them apart). A fence that only MENTIONS the flag is the output of
+            # something else -- `--cluster-admit`'s receipt tells an operator to run it -- and
+            # matching the flag anywhere read that receipt's prose as surface rows (#1328).
+            set(previousWasCommand "${commandLine}")
+            set(commandLine FALSE)
+            if(line MATCHES "^[ \t]*[$] ")
+                set(commandLine TRUE)
+            elseif(previousWasCommand AND line MATCHES "^[ \t]+[^ \t]")
+                set(commandLine TRUE)
+            endif()
+            if(commandLine AND line MATCHES "print-surfaces")
                 set(fenceState "transcript")
                 set(seenInFence "")
                 set(rowsInFence 0)
@@ -477,8 +492,8 @@ foreach(docFile IN LISTS docFiles)
             endif()
             if(fenceState STREQUAL "transcript")
                 # An output row: a bare word in column one, then an address or a
-                # `-`. The `$` line, the `notes:` block and the wrapped
-                # continuation of the command all fail the two-column shape.
+                # `-`. The `$` line, the `dialled at:` and `notes:` blocks and the
+                # wrapped continuation of the command all fail the two-column shape.
                 if(line MATCHES "^([a-z]+)([ \t]+[a-z]*)?[ \t]+([^ \t]+)[ \t]")
                     math(EXPR rowsInFence "${rowsInFence} + 1")
                     set(label "${CMAKE_MATCH_1}")

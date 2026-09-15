@@ -2388,3 +2388,89 @@ TEST_CASE("A FLEET-TEXT request carries its keys and its token as the words type
         CHECK_FALSE(DecodeFleetTextRequest(trailing).has_value());
     }
 }
+
+// --- The consensus dial address (#1328) -------------------------------------
+
+TEST_CASE("A node runtime record carries the consensus address peers dial, and absent is not empty",
+          "[wire][consensus][nodestatus]")
+{
+    // Absent on a node that runs no consensus. A zero-length field is how every optional in
+    // this record says so, which is why an engaged endpoint is never empty.
+    auto const silent = DecodeNodeRuntime(EncodeNodeRuntime(NodeRuntimeFields {}));
+    REQUIRE(silent.has_value());
+    CHECK_FALSE(Unwrap(silent).consensusEndpoint.has_value());
+
+    NodeRuntimeFields sent {};
+    sent.consensusEndpoint = "10.0.0.4:6680";
+    sent.leaderEndpoint = "10.0.0.9:6680";
+    auto const back = DecodeNodeRuntime(EncodeNodeRuntime(sent));
+    REQUIRE(back.has_value());
+    CHECK(Unwrap(back).consensusEndpoint == std::optional<std::string> { "10.0.0.4:6680" });
+    // Two text fields in one record, so each is asserted where the OTHER would be read if
+    // an index were shared: the leader is not this node, and neither is its dial address.
+    CHECK(Unwrap(back).leaderEndpoint == "10.0.0.9:6680");
+}
+
+TEST_CASE("The consensus endpoint has one name, spelled as prose and as a record field", "[wire][consensus]")
+{
+    // The VALUES, pinned: both are text an operator types into a search or holds against a second
+    // screen, so a consistent rename keeps every in-tree test agreeing while the name they compare
+    // under silently moves.
+    CHECK(ConsensusEndpointLabel == "consensus endpoint");
+    CHECK(ConsensusEndpointField == "consensus-endpoint");
+
+    // And the RELATION, which is what keeps them one name: the field is the label, hyphenated. A
+    // rename of one alone fails here rather than in a comparison an operator makes.
+    auto hyphenated = std::string { ConsensusEndpointLabel };
+    std::ranges::replace(hyphenated, ' ', '-');
+    CHECK(hyphenated == ConsensusEndpointField);
+}
+
+TEST_CASE("The consensus address rides the runtime record's variable arity, in both directions",
+          "[wire][consensus][nodestatus]")
+{
+    // **Why the field costs no wire version**, proved rather than inherited from the
+    // enrollment case above: the decoder answers an index past the end as empty and ignores
+    // a surplus. Three arities, because a decoder that expected EXACTLY fourteen would pass
+    // the round trip and fail both of the others.
+    NodeRuntimeFields sent {};
+    sent.toolchainsServed = 4;
+    sent.cordon = WireCordonState::Draining;
+    sent.consensusEndpoint = "10.0.0.4:6680";
+    // Kept in a local: `SplitAll` hands back spans INTO it.
+    auto const emitted = EncodeNodeRuntime(sent);
+    auto const parts = WireFields::SplitAll(emitted);
+    REQUIRE(parts.has_value());
+    // Fourteen: thirteen that predate #1328 and the endpoint. Pinned, since every cut below
+    // is counted from it and a record that grew would move what "older" means.
+    REQUIRE(Unwrap(parts).size() == 14);
+
+    SECTION("thirteen fields, as a build before #1328 emits: disengaged, and the cordon still read")
+    {
+        auto const older = std::vector<std::span<std::byte const>> { Unwrap(parts).begin(), Unwrap(parts).begin() + 13 };
+        auto const back = DecodeNodeRuntime(WireFields::Encode(WireFields::FieldList { older }));
+        REQUIRE(back.has_value());
+        CHECK_FALSE(Unwrap(back).consensusEndpoint.has_value());
+        // The field before it survives the cut, so the cut is where it was meant to be.
+        CHECK(Unwrap(back).cordon == std::optional { WireCordonState::Draining });
+        CHECK(Unwrap(back).toolchainsServed == 4);
+    }
+
+    SECTION("fourteen fields: engaged")
+    {
+        auto const current = std::vector<std::span<std::byte const>> { Unwrap(parts).begin(), Unwrap(parts).end() };
+        auto const back = DecodeNodeRuntime(WireFields::Encode(WireFields::FieldList { current }));
+        REQUIRE(back.has_value());
+        CHECK(Unwrap(back).consensusEndpoint == std::optional<std::string> { "10.0.0.4:6680" });
+    }
+
+    SECTION("fifteen fields, from a build ahead of this one: the surplus is skipped")
+    {
+        auto ahead = std::vector<std::span<std::byte const>> { Unwrap(parts).begin(), Unwrap(parts).end() };
+        auto const extra = AsBytes(std::string_view { "a fact from the future" });
+        ahead.emplace_back(extra);
+        auto const back = DecodeNodeRuntime(WireFields::Encode(WireFields::FieldList { ahead }));
+        REQUIRE(back.has_value());
+        CHECK(Unwrap(back).consensusEndpoint == std::optional<std::string> { "10.0.0.4:6680" });
+    }
+}

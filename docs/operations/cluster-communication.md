@@ -698,6 +698,9 @@ admin             -             not served; set --admin-listen
 raft              0.0.0.0:6680  TCP
 discovery beacon  0.0.0.0:6681  UDP
 
+dialled at:
+  consensus endpoint  10.0.0.7:6680  -- what peers DIAL; the raft row above is what this node BINDS
+
 notes:
   …
 ```

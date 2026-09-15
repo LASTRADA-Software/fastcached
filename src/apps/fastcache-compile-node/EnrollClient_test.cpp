@@ -562,7 +562,10 @@ TEST_CASE("A node that answered on its own behalf breaks the redirect chain", "[
     // from the `Waiting`/`Closed` arm and all three of these flip together.
     CHECK(outcome.error().contains("refused this machine"));
     CHECK_FALSE(outcome.error().contains("gave up after"));
-    CHECK(dialer.Dialed().size() == 6);
+    // REQUIRE, and last of the three so the two above still report: the reads below take
+    // `front()` and `back()`, and on a run that dialled nothing a CHECK here let them read an
+    // empty vector -- the process died mid-report and took every later case's verdict with it.
+    REQUIRE(dialer.Dialed().size() == 6);
 
     // And it followed each redirect to the endpoint the reply named rather than
     // re-asking the seed, which is what makes the five above a chain at all.

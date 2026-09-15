@@ -1098,6 +1098,16 @@ namespace
             AddOptionalNumber(record, "enrollment-pending", fields.runtime.enrollmentPending);
         }
 
+        // **Where peers DIAL this node's consensus port** (#1328) -- the half of
+        // `--cluster-admit`'s receipt an operator holds against the machine being brought
+        // in. Named as the receipt names it, and deliberately not a `*-port` field below:
+        // those are what the node BOUND, and a consensus bind is routinely the wildcard,
+        // which is the address that comparison must not be made against. Absent on a node
+        // running no consensus, for the enrollment state's reason.
+        if (fields.runtime.consensusEndpoint.has_value())
+            record.push_back({ .name = std::string { CompileCacheWire::ConsensusEndpointField },
+                               .value = TextCell(*fields.runtime.consensusEndpoint) });
+
         // One field per surface the node actually opened. A surface it does not run gets
         // no field at all rather than a zero port -- the same rule the node applies when
         // encoding, held on both sides so neither can quietly invent a number.
@@ -1549,7 +1559,8 @@ namespace
         return Answered(
             RecordValue({ Field { .name = "recorded", .value = BooleanCell(true) },
                           Field { .name = "member-id-as-received", .value = TextCell(receipt->memberId) },
-                          Field { .name = "consensus-endpoint-as-recorded", .value = TextCell(receipt->raftEndpoint) },
+                          Field { .name = std::format("{}-as-recorded", CompileCacheWire::ConsensusEndpointField),
+                                  .value = TextCell(receipt->raftEndpoint) },
                           Field { .name = "state", .value = TextCell("appended, not committed") } }));
     }
 

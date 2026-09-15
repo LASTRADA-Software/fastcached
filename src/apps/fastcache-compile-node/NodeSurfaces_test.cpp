@@ -3,11 +3,15 @@
 
 #include <FastCache/Cli/Options.hpp>
 #include <FastCache/Core/Logger.hpp>
+#include <FastCache/Protocol/CompileCacheWire.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
 #include <cstddef>
+#include <format>
+#include <optional>
+#include <ranges>
 #include <span>
 #include <string>
 #include <string_view>
@@ -662,4 +666,164 @@ TEST_CASE("An opener handed a tolerated verdict blames itself, not the port", "[
     // operator spends the night on a port that was never the problem.
     CHECK(message.contains("defect in this binary"));
     CHECK_FALSE(message.contains("refusing to start"));
+}
+
+// ---------------------------------------------------------------------------
+// #1328: the consensus address peers DIAL, printed apart from the one the node BINDS.
+
+namespace
+{
+
+/// A consensus node that binds the wildcard and names where peers dial it.
+///
+/// **The distinguishing fixture, and the one that does not suggest itself.** A bind
+/// and a dial address that coincide -- `--listen-raft=10.0.0.4:6680 --raft-self=10.0.0.4`
+/// -- print the same string under both readings, so a worksheet that printed the bound
+/// address as the dial address would pass. A bare `--listen-raft` binds the wildcard,
+/// which is the ordinary deployment and the one where the two differ.
+/// @return The configuration.
+[[nodiscard]] NodeConfig WildcardBoundWithRaftSelf()
+{
+    NodeConfig cfg;
+    cfg.raftListen = "6680";
+    cfg.raftSelf = "10.0.0.4";
+    return cfg;
+}
+
+/// The dial address's label as the worksheet prints it: indented under `dialled at:`.
+/// @return Two spaces and `CompileCacheWire::ConsensusEndpointLabel`.
+[[nodiscard]] std::string DialLabel()
+{
+    return std::format("  {}", CompileCacheWire::ConsensusEndpointLabel);
+}
+
+/// The one line of @p sheet that starts with @p label.
+/// @param sheet What `RenderSurfaces` printed.
+/// @param label The line's leading words.
+/// @return The line, or nothing when no line starts so.
+[[nodiscard]] std::optional<std::string> LineStarting(std::string_view sheet, std::string_view label)
+{
+    for (auto const line: std::views::split(sheet, '\n'))
+    {
+        auto const text = std::string_view { line.begin(), line.end() };
+        if (text.starts_with(label))
+            return std::string { text };
+    }
+    return std::nullopt;
+}
+
+/// The address column of a worksheet line: the first word after its label.
+/// @param line One line of the worksheet.
+/// @param label The line's label, which may itself contain spaces.
+/// @return The address column.
+[[nodiscard]] std::string AddressColumnOf(std::string_view line, std::string_view label)
+{
+    auto rest = line.substr(label.size());
+    rest.remove_prefix(std::min(rest.find_first_not_of(' '), rest.size()));
+    return std::string { rest.substr(0, rest.find(' ')) };
+}
+
+} // namespace
+
+TEST_CASE("The worksheet prints the consensus address peers DIAL apart from the one the node BINDS",
+          "[node][surfaces][consensus]")
+{
+    auto const cfg = WildcardBoundWithRaftSelf();
+
+    auto const dial = ConsensusDialAddressOf(cfg);
+    REQUIRE(dial.has_value());
+    CHECK(*dial == "10.0.0.4:6680");
+
+    auto const sheet = RenderSurfaces(cfg);
+    INFO(sheet);
+    auto const raftRow = LineStarting(sheet, "raft ");
+    auto const dialLine = LineStarting(sheet, DialLabel());
+    REQUIRE(raftRow.has_value());
+    REQUIRE(dialLine.has_value());
+
+    auto const bound = AddressColumnOf(Unwrap(raftRow), "raft");
+    auto const dialled = AddressColumnOf(Unwrap(dialLine), DialLabel());
+    CHECK(bound == "0.0.0.0:6680");
+    CHECK(dialled == "10.0.0.4:6680");
+    // The acceptance, stated as what DISTINGUISHES: the two printed addresses differ. A
+    // worksheet printing the bound address twice passes every other line of this case
+    // that reads only one of them.
+    CHECK(dialled != bound);
+    // And the line says which is which, because the comparison is the whole value.
+    CHECK(Unwrap(dialLine).contains("DIAL"));
+    CHECK(Unwrap(dialLine).contains("BINDS"));
+
+    // A block of its own, never a row of the bound-address table: the table's rows are
+    // what a firewall worksheet is transcribed from, and a row is a COLUMN-ONE line to every
+    // reader of a pasted transcript -- the docs check included. So the label is indented
+    // under its heading, and nothing in column one names it.
+    CHECK_FALSE(LineStarting(sheet, "consensus").has_value());
+    CHECK(sheet.find("\ndialled at:\n") < sheet.find(DialLabel()));
+    CHECK(sheet.find("raft ") < sheet.find("\ndialled at:\n"));
+    CHECK(sheet.find(DialLabel()) < sheet.find("\nnotes:"));
+}
+
+TEST_CASE("A node running no consensus prints its dial address as ABSENT, not as an empty one",
+          "[node][surfaces][consensus]")
+{
+    // `RunsConsensus` is false iff `--listen-raft` does not resolve, and that is a real
+    // deployment: a plain worker. Absent is not zero -- an empty address column would read
+    // as "the node dials nowhere", which is a different fact from "there is no consensus".
+    NodeConfig cfg;
+    cfg.raftSelf = "10.0.0.4"; // named, and still nothing to dial: no consensus port
+
+    auto const dial = ConsensusDialAddressOf(cfg);
+    REQUIRE_FALSE(dial.has_value());
+    CHECK(dial.error() == ConsensusDialGap::NoConsensus);
+
+    auto const line = LineStarting(RenderSurfaces(cfg), DialLabel());
+    REQUIRE(line.has_value());
+    CHECK(AddressColumnOf(Unwrap(line), DialLabel()) == "-");
+    CHECK(Unwrap(line).contains("absent"));
+    CHECK_FALSE(Unwrap(line).contains("10.0.0.4"));
+}
+
+TEST_CASE("The dial address is the node's own member entry, which a typed --raft-peer states", "[node][surfaces][consensus]")
+{
+    // The pair consensus runs under and `EnrollClaim` sends. No `--raft-self` here, so a
+    // derivation that asked `RaftSelfEndpoint` alone would report nothing.
+    NodeConfig cfg;
+    cfg.raftListen = "6680";
+    cfg.nodeId = "n1";
+    cfg.raftPeers = { Cluster::ClusterMember { .id = "n1", .raftEndpoint = "10.0.0.7:6680", .schedulerEndpoint = {} },
+                      Cluster::ClusterMember { .id = "n2", .raftEndpoint = "10.0.0.8:6680", .schedulerEndpoint = {} } };
+
+    auto const dial = ConsensusDialAddressOf(cfg);
+    REQUIRE(dial.has_value());
+    CHECK(*dial == "10.0.0.7:6680");
+
+    SECTION("and it wins over a --raft-self that contradicts it, which is the entry consensus would run under")
+    {
+        // The startup table refuses this pair (`NodeIdentity_test.cpp` asserts which rule);
+        // the worksheet still has to print it, and it prints the address the refusal is about.
+        auto contradicted = cfg;
+        contradicted.raftSelf = "10.0.0.4";
+        auto const reported = ConsensusDialAddressOf(contradicted);
+        REQUIRE(reported.has_value());
+        CHECK(*reported == "10.0.0.7:6680");
+    }
+}
+
+TEST_CASE("A consensus node that names itself neither way prints NOT STATED and the flags that would state it",
+          "[node][surfaces][consensus]")
+{
+    // `--print-surfaces` prints a configuration the node refuses, which is its point, so it
+    // has to be able to say that nobody stated this address -- neither an address nor an
+    // absence would be true.
+    NodeConfig cfg;
+    cfg.raftListen = "6680";
+
+    auto const dial = ConsensusDialAddressOf(cfg);
+    REQUIRE_FALSE(dial.has_value());
+    CHECK(dial.error() == ConsensusDialGap::Unstated);
+
+    auto const line = LineStarting(RenderSurfaces(cfg), DialLabel());
+    REQUIRE(line.has_value());
+    CHECK(Unwrap(line).contains("NOT STATED"));
+    CHECK(Unwrap(line).contains("--raft-self"));
 }

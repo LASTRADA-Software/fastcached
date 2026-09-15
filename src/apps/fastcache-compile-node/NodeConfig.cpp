@@ -2290,6 +2290,23 @@ std::string RaftSelfEndpoint(NodeConfig const& cfg)
     return FormatHostPort(cfg.raftSelf, bound.front().port);
 }
 
+std::expected<std::string, ConsensusDialGap> ConsensusDialAddressOf(NodeConfig const& cfg)
+{
+    if (!RunsConsensus(cfg))
+        return std::unexpected { ConsensusDialGap::NoConsensus };
+
+    // The entry exactly as `ClusterSelfMember` answers it, with no test of its own: every
+    // other reader of that entry takes it as found, and a second opinion here would be two
+    // answers for one configuration.
+    if (auto const* const self = ClusterSelfMember(cfg); self != nullptr)
+        return self->raftEndpoint;
+
+    if (auto endpoint = RaftSelfEndpoint(cfg); !endpoint.empty())
+        return endpoint;
+
+    return std::unexpected { ConsensusDialGap::Unstated };
+}
+
 std::string AdvertisedEndpoint(NodeConfig const& cfg)
 {
     // The flag wins whenever it was given. Written ONCE -- `main` hands the result to
@@ -3423,7 +3440,12 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
                   // flag into a member -- which is what keeps this rule a pure function
                   // of the command line and lets `--install-service` reach it, and is
                   // also why the rule cannot simply look for the member afterwards.
-                  return RunsConsensus(c) && ClusterSelfMember(c) == nullptr && c.raftSelf.empty();
+                  //
+                  // Through `ConsensusDialAddressOf` (#1328) rather than a spelling of its
+                  // own: the worksheet prints NOT STATED from that answer, and a node it
+                  // prints so must be exactly a node this row refuses.
+                  auto const dial = ConsensusDialAddressOf(c);
+                  return !dial.has_value() && dial.error() == ConsensusDialGap::Unstated;
               },
           .message = ConsensusNamesNoSelfPeerRefusal },
         // Two ways to say one thing. `--raft-self` exists because a MINTED identity

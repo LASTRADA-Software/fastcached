@@ -1120,7 +1120,7 @@ TEST_CASE("cluster-admit reports what the leader RECORDED, never what is in forc
     // Distinct values, neither a substring of the other, so a transposed pair reddens
     // rather than agreeing with itself.
     CHECK(RequiredCell(answer, "member-id-as-received").lexical == "node-c");
-    CHECK(RequiredCell(answer, "consensus-endpoint-as-recorded").lexical == "10.0.0.9:6675");
+    CHECK(RequiredCell(answer, std::format("{}-as-recorded", Cc::ConsensusEndpointField)).lexical == "10.0.0.9:6675");
 
     // The ceiling, asserted on the WORD: `SchedulerService::Offer`'s own phrase, not a
     // second spelling of one state. Anything stronger here would be the confident wrong
@@ -2019,5 +2019,39 @@ TEST_CASE("`node` renders the cordon, and says nothing on a node with no worker"
         auto const answer = RunNodeVerb("node", node);
         CHECK(answer.outcome == Outcome::Affirmative);
         CHECK(CellOf(answer, "cordon") == nullptr);
+    }
+}
+
+TEST_CASE("`node` reports where peers dial its consensus, apart from the port it bound", "[cli][node][verbs][consensus]")
+{
+    // #1328: the half of `--cluster-admit`'s receipt an operator holds against the joiner.
+    SECTION("a consensus node names the address, and the raft port stays the BOUND port")
+    {
+        ScriptedNodeExchange node { { StatusReply(
+            { .version = "1.2.3",
+              .nodeId = "node-a",
+              .uptimeSeconds = 5,
+              .surfaces = { { .surface = Cc::WireSurface::Raft, .port = 6680, .tls = false } },
+              .components = Cc::NodeComponentBit::Scheduler,
+              .runtime = { .consensusEndpoint = "10.0.0.4:6680" } }) } };
+        auto const answer = RunNodeVerb("node", node);
+        CHECK(RequiredCell(answer, Cc::ConsensusEndpointField).lexical == "10.0.0.4:6680");
+        CHECK(RequiredCell(answer, Cc::ConsensusEndpointField).kind == CellKind::Text);
+        // Two cells, each carrying its own fact: a renderer that put the endpoint in the
+        // port's place, or the port in the endpoint's, fails one of these.
+        CHECK(RequiredCell(answer, "raft-port").lexical == "6680");
+    }
+
+    SECTION("a node running no consensus has no such field, rather than an empty one")
+    {
+        ScriptedNodeExchange node { { StatusReply({ .version = "1.2.3",
+                                                    .nodeId = "node-a",
+                                                    .uptimeSeconds = 5,
+                                                    .surfaces = {},
+                                                    .components = Cc::NodeComponentBit::Worker,
+                                                    .runtime = {} }) } };
+        auto const answer = RunNodeVerb("node", node);
+        CHECK(answer.outcome == Outcome::Affirmative);
+        CHECK(CellOf(answer, Cc::ConsensusEndpointField) == nullptr);
     }
 }

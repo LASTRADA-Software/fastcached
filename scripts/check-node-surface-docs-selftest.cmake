@@ -280,6 +280,21 @@ set(FastCachedSurfaceSelftestCases
     # mask a numeric claim later in the same sentence.
     "claim masked by an earlier collocation|doc|The four-surface table is what the node opens.|The node surface is one of 9 surfaces here.|counts something called a surface|-"
 
+    # The block naming where peers DIAL the node (#1328) is indented under its heading
+    # and is not a port to open, so a transcript carrying it is still exactly the table.
+    # The passing direction, pinned: `RenderSurfaces` indents that block for this reader.
+    "dialled-at block is not a row|doc|~n~notes:|~n~dialled at:~n~  consensus endpoint  10.0.0.4:6680  -- what peers DIAL~n~~n~notes:|node surface docs: 4 surface(s)|CMake Error"
+
+    # A fence that MENTIONS the flag without invoking it is the output of something
+    # else -- `--cluster-admit`'s receipt tells an operator to run it. Matching the flag
+    # anywhere in a fence read the receipt's `and nothing else compares them.` as a row
+    # and reported all four surfaces missing (#1328).
+    "a mention is not an invocation|doc|<!-- extra -->|```~n~Compare against what --print-surfaces prints~n~and nothing else compares them.~n~```|node surface docs: 4 surface(s)|CMake Error"
+
+    # The other direction of the same rule: a command wrapped so the flag lands on its
+    # indented continuation is still a transcript, and still held to the table.
+    "flag on a continuation line|doc|$ fastcache-compile-node --print-surfaces --listen-node 6675 --listen-raft 6680 --discovery 255.255.255.255:6681~n~node              0.0.0.0:6675  TCP~n~|$ fastcache-compile-node --listen-node 6675 --listen-raft 6680~n~      --print-surfaces --discovery 255.255.255.255:6681~n~|does not list the `node` surface|-"
+
     # A fence that INVOKES the command and pastes no output is documentation of
     # the command, not a transcript of it. This is the false-positive direction:
     # the check used to report all four surfaces missing from a page that made no
@@ -453,7 +468,10 @@ if(failures)
         "node-surface-docs does not refuse what it claims to refuse:\n  - ${rendered}\n")
 endif()
 
+# Both halves derived, as the refusal count already was: this said "a baseline, a
+# false-positive guard" in words, which stopped being true at the third acceptance case.
+math(EXPR acceptanceCases "${casesRun} - ${refusalCases}")
 message(STATUS
-    "node surface docs selftest: ${casesRun} of ${caseCount} case(s) ran -- a baseline, a "
-    "false-positive guard and ${refusalCases} refusals, each seen to follow a mutation that was "
-    "asserted applied")
+    "node surface docs selftest: ${casesRun} of ${caseCount} case(s) ran -- ${acceptanceCases} "
+    "acceptance case(s), the baseline among them, and ${refusalCases} refusals, each seen to "
+    "follow a mutation that was asserted applied")

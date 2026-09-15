@@ -59,11 +59,19 @@ admin             -             not served; set --admin-listen
 raft              0.0.0.0:6680  TCP
 discovery beacon  0.0.0.0:6681  UDP
 
+dialled at:
+  consensus endpoint  NOT STATED  -- this node runs consensus and names no address peers dial it at; give --raft-self, or a --raft-peer for its own id
+
 notes:
-  node: a systemd .socket unit is NOT yet served on this surface; one 0xFC port
-        for the cache verbs, this node's own compile verbs, and …
+  node: a systemd .socket unit is served on this surface: the unit owns the address, …
   …
 ```
+
+The `dialled at:` block is not a port to open. It is the address peers dial for
+consensus -- routinely not the `raft` row, because a bare `--listen-raft` binds the
+wildcard -- and it is the one to compare against `--cluster-admit`'s receipt (see
+[Membership at runtime](#membership-at-runtime)). This invocation names none, so the
+block says so; with `--raft-peer n1=10.0.0.7:6680` added it reads `10.0.0.7:6680`.
 
 The `notes:` block is part of the output, not an afterthought: it carries the facts a
 column cannot, including the one that says this list can be **wrong** for the compile
@@ -1243,9 +1251,9 @@ Appended, not committed: a majority has to take it, and this leader cannot
 see that yet. Ask for the cluster state again to see the result.
 
 Compare both lines above against the machine itself -- the id it minted into
---cluster-dir, and the address it answers consensus on (--raft-self with
---listen-raft). They are two spellings of one thing, and nothing else
-compares them.
+--cluster-dir, and the consensus endpoint its own --print-surfaces prints
+(or `fastcache-cli node` against it). They are two spellings of one thing,
+and nothing else compares them.
 ```
 
 **Read both lines against the machine you are bringing in, because that comparison
@@ -1253,6 +1261,23 @@ is the whole reason they are printed.** The address typed here and the one that 
 answers consensus on — `--raft-self` together with `--listen-raft` — are two spellings
 of one address, and nothing compares them for you. The id is the same story: the
 joiner mints its own into `--cluster-dir`, and the one typed here has to match it.
+
+The machine prints its half under the same label. `fastcache-compile-node
+--print-surfaces`, run with that machine's own flags, follows its table with a
+`dialled at:` block naming the `consensus endpoint`, and `fastcache-cli node` against
+the running node reports it as `consensus-endpoint`:
+
+```
+dialled at:
+  consensus endpoint  10.0.0.4:6680  -- what peers DIAL; the raft row above is what this node BINDS
+```
+
+**Compare against that line, never against the `raft` row of the table.** The row is
+the address the node BINDS, and a bare `--listen-raft` binds the wildcard, so that
+comparison fails on every correctly configured machine and teaches you to ignore it.
+A node running no consensus prints the line as absent, never as an empty address, and
+one running consensus that names itself neither way prints `NOT STATED` and the two
+flags that would state it.
 
 When they disagree the result is a member that is in the cluster's configuration and
 contacts nobody. At three members or more that presents as an election storm which
