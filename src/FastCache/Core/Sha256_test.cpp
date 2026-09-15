@@ -57,8 +57,8 @@ namespace
 [[nodiscard]] std::vector<Sha256Engine> AllEngines()
 {
     std::vector<Sha256Engine> engines;
-    for (auto const index: std::views::iota(std::size_t { 0 }, EnumeratorCount<Sha256Engine>))
-        engines.push_back(static_cast<Sha256Engine>(index));
+    for (auto const engine: Enumerators<Sha256Engine>())
+        engines.push_back(engine);
     return engines;
 }
 

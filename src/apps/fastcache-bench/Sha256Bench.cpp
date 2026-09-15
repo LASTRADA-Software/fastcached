@@ -73,9 +73,8 @@ TEST_CASE("bench: Sha256 digest per engine", "[!benchmark][sha256]")
         // Scalar is the reference: it comes first and runs everywhere. Were it ever not
         // first, every engine's check below would fail rather than pass unchecked.
         std::optional<Sha256::Digest> reference;
-        for (auto const engineIndex: std::views::iota(std::size_t { 0 }, EnumeratorCount<Sha256Engine>))
+        for (auto const engine: Enumerators<Sha256Engine>())
         {
-            auto const engine = static_cast<Sha256Engine>(engineIndex);
             auto const name = std::format("{} {} bytes", Sha256EngineName(engine), size);
             auto const hasher = Sha256::WithEngine(engine);
             if (!hasher.has_value())

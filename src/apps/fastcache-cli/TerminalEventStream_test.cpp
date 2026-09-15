@@ -5,6 +5,7 @@
 #include <FastCache/Async/TestReactor.hpp>
 #include <FastCache/Async/ThreadPoolExecutor.hpp>
 #include <FastCache/Core/Clock.hpp>
+#include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/Utf8.hpp>
 
 #include <catch2/catch_test_macros.hpp>
@@ -1602,10 +1603,9 @@ TEST_CASE("every tone has a palette row, and a record that allows no colour dres
     auto coloured = TerminalCapabilities {};
     coloured.colour = ColourAnswer::Supported;
     auto const plain = TerminalCapabilities {};
-    for (auto const index: std::views::iota(std::size_t { 0 }, static_cast<std::size_t>(FrameTone::Last)))
+    for (auto const tone: Enumerators<FrameTone>())
     {
-        auto const tone = static_cast<FrameTone>(index);
-        INFO("tone " << index);
+        INFO("tone " << static_cast<std::size_t>(tone));
         REQUIRE(PaletteFor(tone, coloured) != nullptr);
         CHECK(PaletteFor(tone, coloured)->tone == tone);
         CHECK(PaletteFor(tone, plain) == nullptr);
