@@ -305,6 +305,7 @@ set(firstDeclined "")
 set(modmapsDeclined 0)
 set(plantedUnit "")
 set(plantedEntries 0)
+set(plantUnreadable 0)
 set(plantFlags "")
 
 math(EXPR lastEntry "${entryCount} - 1")
@@ -337,13 +338,21 @@ foreach(index RANGE ${lastEntry})
     set(unit "src/${relative}")
     math(EXPR firstParty "${firstParty} + 1")
 
+    # A plant-unit entry that cannot be read is counted apart: the plant run drops the problem that says why, so
+    # without the count it would report the unit as absent from a database that compiles it.
     if(NOT commandError STREQUAL "NOTFOUND")
         list(APPEND problems "${unit}: its entry has no `command`, so the flags it is compiled with cannot be read")
+        if(unitKey STREQUAL plantUnitKey)
+            math(EXPR plantUnreadable "${plantUnreadable} + 1")
+        endif()
         continue()
     endif()
     fastcached_driver_families("${command}" families driver)
     if(families STREQUAL "")
         list(APPEND problems "${unit}: compiled by `${driver}`, a driver DriverRows does not name, so which flags enable instructions is unknown -- add a row saying which grammar it reads")
+        if(unitKey STREQUAL plantUnitKey)
+            math(EXPR plantUnreadable "${plantUnreadable} + 1")
+        endif()
         continue()
     endif()
 
@@ -378,7 +387,9 @@ if(NOT plantUnit STREQUAL "")
     # violation elsewhere in the database is the unplanted run's to report; failing here too would show one defect
     # as two reds, the second one blaming the plant.
     set(plantProblems "")
-    if(plantedUnit STREQUAL "")
+    if(plantedUnit STREQUAL "" AND plantUnreadable GREATER 0)
+        list(APPEND plantProblems "plant: `${plantUnit}` is in this database, but none of its ${plantUnreadable} entr(y/ies) could be read (no `command`, or a driver DriverRows does not name), so the plant was never judged -- the unplanted run names why")
+    elseif(plantedUnit STREQUAL "")
         list(APPEND plantProblems "plant: `${plantUnit}` is not a first-party unit of this database, so the plant was never judged")
     elseif(plantFlags STREQUAL "")
         list(APPEND plantProblems "plant: no PlantRows flag applies to `${plantUnit}`'s driver, so the plant was never judged")
@@ -427,8 +438,8 @@ else()
         string(CONCAT remedy
             "The plant is a flag this check places itself and must refuse, so nothing in the tree needs changing: a plant "
             "ACCEPTED is a defect in this check's reading (the extraction pattern derived from SpellingRows, or a row), and "
-            "a plant never judged means FASTCACHED_PLANT_UNIT names no first-party unit this database compiles, or no "
-            "PlantRows flag fits its driver. A real flag in the tree is the unplanted run's to report.")
+            "a plant never judged means FASTCACHED_PLANT_UNIT names no first-party unit this database compiles, its entries "
+            "cannot be read, or no PlantRows flag fits its driver. A real flag in the tree is the unplanted run's to report.")
     endif()
     message(FATAL_ERROR
         "instruction-set-flags: ${problemCount} problem(s) in `${FASTCACHED_COMPILE_DATABASE}`:\n  ${problemText}\n"

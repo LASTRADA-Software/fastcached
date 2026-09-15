@@ -133,6 +133,7 @@ set(UnitCases
     "versionedDriver|ON|`-mavx2`, because||/usr/bin/x86_64-linux-gnu-g++-14 -O2 -mavx2 ${tail}"
     "unknownDriver|ON|compiled by `icpx`, a driver DriverRows does not name||/opt/intel/bin/icpx -O2 ${tail}"
     "responseUnreadable|ON|cannot read response file `@missing.rsp`||${gxx} @missing.rsp ${tail}"
+    "plantUnitUnreadable|ON|is in this database, but none of its 1 entr(y/ies) could be read|${plant}|/opt/intel/bin/icpx -O2 ${tail}"
     "plantUnitAbsent|ON|so the plant was never judged The plant is a flag this check places itself and must refuse, so nothing in the tree needs changing|-DFASTCACHED_PLANT_UNIT=src/FastCache/Core/Elsewhere.cpp|${gxx} ${tail}"
 )
 foreach(row IN LISTS UnitCases)
