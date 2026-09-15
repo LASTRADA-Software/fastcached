@@ -64,8 +64,11 @@ native_root="$(NativePath "$repo_root")"
 # @param 3 The run's summary text after that part.
 # @return echoes clean, refused or inconclusive
 Classify() {
-    local flat
-    flat="$(printf '%s' "$1" | tr '\r\n\t' '   ' | tr -s ' ')"
+    # CMake wraps a diagnostic, so the output is read with every run of whitespace folded to one space. In the shell
+    # itself: three forks per run are most of the self-test's time under Git Bash.
+    local whitespace=$'\r\n\t' flat
+    flat="${1//[$whitespace]/ }"
+    while [[ "$flat" == *"  "* ]]; do flat="${flat//  / }"; done
     local error="no" warning="no" verdict="no" summary="no"
     case "$flat" in *"CMake Error"*) error="yes" ;; esac
     case "$flat" in *"CMake Warning"*) warning="yes" ;; esac

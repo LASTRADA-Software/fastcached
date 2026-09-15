@@ -61,10 +61,11 @@
 #
 # The cut rests on a claim about CMake's WRITER, not about JSON: CMake puts each entry's closing brace alone at the
 # start of a line, so `\n},` can end an entry and nothing else -- a JSON string cannot hold a raw line break, and a
-# CMake entry holds no nested object. The claim is checked before it is used: the document must hold a line break,
-# as many line-leading `}` as it has entries, and every batch must parse on its own (a cut inside an entry leaves
-# that entry's braces unbalanced, so it cannot). A database laid out any other way is read whole -- exactly as
-# correctly, and quadratically -- and every run says which path it took, `parse: batched (N batch(es))` or
+# CMake entry holds no nested object. The claim is checked before it is used: the document must hold as many
+# line-leading `}` as it has entries (one with no line break at all holds none), and every batch must parse on its
+# own (a cut inside an entry leaves that entry's braces unbalanced, so it cannot). A database laid out any other way
+# is read whole -- exactly as correctly, and quadratically -- and every run says which path it took,
+# `parse: batched (N batch(es))` or
 # `parse: whole-document (fallback: <reason>)`, so a fast path that stopped engaging is visible rather than slow.
 #
 # Usage:
@@ -131,11 +132,15 @@ set(PlantRows
     "Msvc|/arch:AVX2"
 )
 
-# The extraction pattern, derived from SpellingRows. A spelling is inserted unescaped, so it may hold only
-# characters a regular expression reads literally; brackets, semicolons and `|` never appear in one.
+# What each row's kind MEANS is decided here, once: `SpellingMatcher<N>` is row N's anchored pattern over one
+# normalised candidate token, and the extraction pattern is the same spelling followed by what may end the token.
+# A spelling is inserted unescaped, so it may hold only characters a regular expression reads literally; brackets,
+# semicolons and `|` never appear in one.
 set(tokenEnd "[^ \t\r\n\"]")
 set(CandidateAlternatives "@${tokenEnd}+")
+set(rowIndex -1)
 foreach(row IN LISTS SpellingRows)
+    math(EXPR rowIndex "${rowIndex} + 1")
     fastcached_row_fields("${row}" family verdict kind reason spelling)
     if(NOT spelling MATCHES "^[-/:=_A-Za-z0-9]+$")
         message(FATAL_ERROR "instruction-set-flags: SpellingRows spelling `${spelling}` holds a character the derived pattern would read as regex syntax")
@@ -163,9 +168,16 @@ foreach(row IN LISTS SpellingRows)
     else()
         set(alternative "${spelling}")
     endif()
+    # A candidate reaches a matcher with its whitespace folded to one space, so a flag-value row matches its spelling
+    # followed by a value or standing alone.
     if(kind STREQUAL "flag-value")
+        set(SpellingMatcher${rowIndex} "^${alternative}( |$)")
         string(APPEND alternative "[ \t\r\n]+${tokenEnd}+")
-    elseif(kind MATCHES "^(exact|prefix|iprefix)$")
+    elseif(kind STREQUAL "exact")
+        set(SpellingMatcher${rowIndex} "^${alternative}$")
+        string(APPEND alternative "${tokenEnd}*")
+    elseif(kind MATCHES "^(prefix|iprefix)$")
+        set(SpellingMatcher${rowIndex} "^${alternative}")
         string(APPEND alternative "${tokenEnd}*")
     else()
         message(FATAL_ERROR "instruction-set-flags: SpellingRows names an unknown kind `${kind}` for `${spelling}`")
@@ -174,9 +186,14 @@ foreach(row IN LISTS SpellingRows)
 endforeach()
 set(CandidatePattern "(^|[ \t\r\n\"])(${CandidateAlternatives})")
 
-# @p path with forward slashes and no `..`, lower-cased on a host whose paths are case-insensitive.
+# @p path with forward slashes and no `..`, lower-cased on a host whose paths are case-insensitive. The key decides;
+# the optional third argument receives the same path in its own case, for a name shown to a reader. Lower-casing
+# ASCII keeps the length, so one offset cuts both.
 function(fastcached_path_key path out)
     cmake_path(CONVERT "${path}" TO_CMAKE_PATH_LIST path NORMALIZE)
+    if(ARGC GREATER 2)
+        set(${ARGV2} "${path}" PARENT_SCOPE)
+    endif()
     if(CMAKE_HOST_WIN32)
         string(TOLOWER "${path}" path)
     endif()
@@ -220,31 +237,13 @@ endfunction()
 # The reason the first SpellingRow matching @p token under @p families refuses it, or "" when none does.
 function(fastcached_refusal token families out)
     set(refusal "")
+    set(rowIndex -1)
     foreach(row IN LISTS SpellingRows)
+        math(EXPR rowIndex "${rowIndex} + 1")
         fastcached_row_fields("${row}" family verdict kind reason spelling)
         list(FIND families "${family}" applies)
-        if(applies EQUAL -1)
+        if(applies EQUAL -1 OR NOT token MATCHES "${SpellingMatcher${rowIndex}}")
             continue()
-        endif()
-        set(subject "${token}")
-        set(needle "${spelling}")
-        if(kind STREQUAL "iprefix")
-            string(TOLOWER "${subject}" subject)
-            string(TOLOWER "${needle}" needle)
-        elseif(kind STREQUAL "flag-value")
-            string(APPEND needle " ")
-        endif()
-        if(kind STREQUAL "exact")
-            if(NOT subject STREQUAL needle)
-                continue()
-            endif()
-        elseif(kind STREQUAL "flag-value" AND subject STREQUAL spelling)
-            # The spelling alone: its value is a token of its own, and the row refuses any value.
-        else()
-            string(FIND "${subject}" "${needle}" at)
-            if(NOT at EQUAL 0)
-                continue()
-            endif()
         endif()
         if(verdict STREQUAL "refuse")
             set(refusal "${reason}")
@@ -258,12 +257,15 @@ function(fastcached_refusal token families out)
     set(${out} "${refusal}" PARENT_SCOPE)
 endfunction()
 
-# Judge every candidate in @p text for @p unit, appending to the list and counter the caller names.
+# Judge every candidate in @p text for @p unit, appending to the lists and counter the caller names: a problem's
+# text to @p problemsVar, and each refused token as `<unit>|<token>` to @p refusedVar, which is what the plant is
+# decided from -- never the wording of a problem.
 # A function and not a macro: a macro substitutes its arguments textually and re-parses them, so a
 # backslash in a Windows command would be eaten twice before a row ever saw it.
 # @p depth is 0 for a command and 1 inside a response file, which may not name another.
-function(fastcached_judge_text text families unit directory depth problemsVar modmapsVar)
+function(fastcached_judge_text text families unit directory depth problemsVar refusedVar modmapsVar)
     set(found "${${problemsVar}}")
+    set(refused "${${refusedVar}}")
     set(modmaps "${${modmapsVar}}")
     fastcached_candidates("${text}" candidates)
     foreach(token IN LISTS candidates)
@@ -271,6 +273,7 @@ function(fastcached_judge_text text families unit directory depth problemsVar mo
             fastcached_refusal("${token}" "${families}" refusal)
             if(NOT refusal STREQUAL "")
                 list(APPEND found "${unit}: `${token}`, because ${refusal}")
+                list(APPEND refused "${unit}|${token}")
             endif()
             continue()
         endif()
@@ -294,11 +297,12 @@ function(fastcached_judge_text text families unit directory depth problemsVar mo
                 list(APPEND found "${unit}: cannot read response file `${token}` (${responsePath}), so not every flag it is compiled with can be seen")
             else()
                 file(READ "${responsePath}" responseText)
-                fastcached_judge_text("${responseText}" "${families}" "${unit}" "${directory}" 1 found modmaps)
+                fastcached_judge_text("${responseText}" "${families}" "${unit}" "${directory}" 1 found refused modmaps)
             endif()
         endif()
     endforeach()
     set(${problemsVar} "${found}" PARENT_SCOPE)
+    set(${refusedVar} "${refused}" PARENT_SCOPE)
     set(${modmapsVar} "${modmaps}" PARENT_SCOPE)
 endfunction()
 
@@ -318,15 +322,10 @@ endif()
 # `batchEntries<N>` its length; the whole-document fallback is one batch holding the document itself.
 set(BatchBytes 65536)
 set(parseFallback "")
-string(FIND "${database}" "\n" lineBreak)
-if(lineBreak EQUAL -1)
-    set(parseFallback "the document holds no line break")
-else()
-    string(REGEX MATCHALL "\n}" entryEnds "${database}")
-    list(LENGTH entryEnds entryEndCount)
-    if(NOT entryEndCount EQUAL entryCount)
-        set(parseFallback "${entryEndCount} line(s) start with `}` against ${entryCount} entries")
-    endif()
+string(REGEX MATCHALL "\n}" entryEnds "${database}")
+list(LENGTH entryEnds entryEndCount)
+if(NOT entryEndCount EQUAL entryCount)
+    set(parseFallback "${entryEndCount} line(s) start with `}` against ${entryCount} entries")
 endif()
 set(batchCount 0)
 if(parseFallback STREQUAL "")
@@ -383,6 +382,7 @@ if(NOT plantUnit STREQUAL "")
 endif()
 
 set(problems "")
+set(refusedTokens "")
 set(firstParty 0)
 set(declined 0)
 set(firstDeclined "")
@@ -405,14 +405,8 @@ foreach(batch RANGE 1 ${batchCount})
             list(APPEND problems "entry ${index}: has no `file` or `directory`, so which unit it compiles is unknown")
             continue()
         endif()
-        # The key decides; the name shown keeps the path's case. Lower-casing ASCII keeps the length, so one
-        # offset cuts both.
         cmake_path(ABSOLUTE_PATH unitFile BASE_DIRECTORY "${directory}" NORMALIZE OUTPUT_VARIABLE unitPath)
-        cmake_path(CONVERT "${unitPath}" TO_CMAKE_PATH_LIST unitPath NORMALIZE)
-        set(unitKey "${unitPath}")
-        if(CMAKE_HOST_WIN32)
-            string(TOLOWER "${unitKey}" unitKey)
-        endif()
+        fastcached_path_key("${unitPath}" unitKey unitPath)
         string(FIND "${unitKey}" "${sourceRootKey}" underSource)
         if(NOT underSource EQUAL 0)
             math(EXPR declined "${declined} + 1")
@@ -427,16 +421,17 @@ foreach(batch RANGE 1 ${batchCount})
 
         # A plant-unit entry that cannot be read is counted apart: the plant run drops the problem that says why, so
         # without the count it would report the unit as absent from a database that compiles it.
+        set(unreadable "")
         if(NOT commandError STREQUAL "NOTFOUND")
-            list(APPEND problems "${unit}: its entry has no `command`, so the flags it is compiled with cannot be read")
-            if(unitKey STREQUAL plantUnitKey)
-                math(EXPR plantUnreadable "${plantUnreadable} + 1")
+            set(unreadable "its entry has no `command`, so the flags it is compiled with cannot be read")
+        else()
+            fastcached_driver_families("${command}" families driver)
+            if(families STREQUAL "")
+                set(unreadable "compiled by `${driver}`, a driver DriverRows does not name, so which flags enable instructions is unknown -- add a row saying which grammar it reads")
             endif()
-            continue()
         endif()
-        fastcached_driver_families("${command}" families driver)
-        if(families STREQUAL "")
-            list(APPEND problems "${unit}: compiled by `${driver}`, a driver DriverRows does not name, so which flags enable instructions is unknown -- add a row saying which grammar it reads")
+        if(NOT unreadable STREQUAL "")
+            list(APPEND problems "${unit}: ${unreadable}")
             if(unitKey STREQUAL plantUnitKey)
                 math(EXPR plantUnreadable "${plantUnreadable} + 1")
             endif()
@@ -456,7 +451,7 @@ foreach(batch RANGE 1 ${batchCount})
             endforeach()
         endif()
 
-        fastcached_judge_text("${command}" "${families}" "${unit}" "${directory}" 0 problems modmapsDeclined)
+        fastcached_judge_text("${command}" "${families}" "${unit}" "${directory}" 0 problems refusedTokens modmapsDeclined)
     endforeach()
 endforeach()
 
@@ -482,27 +477,19 @@ if(NOT plantUnit STREQUAL "")
     elseif(plantFlags STREQUAL "")
         list(APPEND plantProblems "plant: no PlantRows flag applies to `${plantUnit}`'s driver, so the plant was never judged")
     endif()
-    # Each planted flag must have produced the refusal a real one would. That refusal is the expected outcome,
-    # so it is taken out of the problems; a plant that produced none is a problem. A unit compiled by several
-    # targets has several entries, each planted.
+    # Each planted flag must have produced the refusal a real one would. That refusal is the expected outcome, so
+    # one refusal of that token on that unit is spent per planted flag, and does not count as an unplanted problem;
+    # a plant that produced none is a problem. A unit compiled by several targets has several entries, each planted.
+    list(LENGTH problems otherProblems)
     foreach(flag IN LISTS plantFlags)
-        set(expectedPrefix "${plantedUnit}: `${flag}`, because ")
-        set(kept "")
-        set(seen FALSE)
-        foreach(problem IN LISTS problems)
-            string(FIND "${problem}" "${expectedPrefix}" at)
-            if(at EQUAL 0 AND NOT seen)
-                set(seen TRUE)
-            else()
-                list(APPEND kept "${problem}")
-            endif()
-        endforeach()
-        set(problems "${kept}")
-        if(NOT seen)
+        list(FIND refusedTokens "${plantedUnit}|${flag}" at)
+        if(at EQUAL -1)
             list(APPEND plantProblems "plant: `${flag}` planted into `${plantedUnit}` was ACCEPTED -- the check cannot see the flag it exists to refuse")
+        else()
+            list(REMOVE_AT refusedTokens ${at})
+            math(EXPR otherProblems "${otherProblems} - 1")
         endif()
     endforeach()
-    list(LENGTH problems otherProblems)
     set(distinctFlags "${plantFlags}")
     list(REMOVE_DUPLICATES distinctFlags)
     list(JOIN distinctFlags "`, `" flagsText)

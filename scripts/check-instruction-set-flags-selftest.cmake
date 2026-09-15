@@ -138,6 +138,7 @@ set(UnitCases
     "targetFeature|ON|`-target-feature`, because it is clang's own switch||${clangxx} -Xclang -target-feature -Xclang +sha ${tail}"
     "targetCpu|ON|`-target-cpu`, because it is clang's own switch for a CPU||${clangxx} -Xclang -target-cpu -Xclang haswell ${tail}"
     "cc1Triple|ON|`-triple`, because it is clang's own switch for a target triple||${clangxx} -Xclang -triple -Xclang x86_64h-apple-macosx ${tail}"
+    "exactRowIsTheWholeToken|OFF|${judged}||${clangxx} -triple-probe ${tail}"
     "targetTripleJoined|ON|`--target=x86_64h-apple-macosx`, because it names a target triple||${clangxx} --target=x86_64h-apple-macosx ${tail}"
     "targetTripleSeparate|ON|`-target x86_64h-apple-macosx`, because it names a target triple||${clangxx} -target x86_64h-apple-macosx ${tail}"
     "msvcArch|ON|`/arch:AVX2`, because it enables an instruction set||${cl} /arch:AVX2 ${tail}"
@@ -263,7 +264,7 @@ endfunction()
 
 # layout|reason the run must name
 set(FallbackLayouts
-    "noLineBreak|the document holds no line break"
+    "noLineBreak|0 line(s) start with `}` against 1 entries"
     "entryEndsDisagree|2 line(s) start with `}` against 1 entries"
     "batchUnparseable|batch 1 does not parse on its own"
 )
