@@ -13,6 +13,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <ranges>
 #include <span>
 #include <stdexcept>
 #include <string_view>
@@ -54,7 +55,7 @@ TEST_CASE("A field list round-trips through the grammar", "[core][wirefields]")
     REQUIRE(split.has_value());
     auto const parsed = Unwrap(split);
     REQUIRE(parsed.size() == texts.size());
-    for (auto index = std::size_t { 0 }; index < texts.size(); ++index)
+    for (auto const index: std::views::iota(std::size_t { 0 }, texts.size()))
         CHECK(WireFields::AsStringView(parsed[index]) == texts[index]);
 }
 

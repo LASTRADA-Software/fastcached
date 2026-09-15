@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <memory>
 #include <optional>
+#include <ranges>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -80,7 +81,7 @@ struct Arena
     {
         auto const* const base = reinterpret_cast<std::byte const*>(storage.data());
         auto const* const target = reinterpret_cast<std::byte const*>(pointer);
-        for (std::size_t i = 0; i < handouts.size(); ++i)
+        for (auto const i: std::views::iota(std::size_t { 0 }, handouts.size()))
         {
             auto const [offset, length] = handouts[i];
             if (target >= base + offset && target < base + offset + length)
@@ -171,7 +172,7 @@ using ObservableBuffer = std::vector<std::byte, ObservableAllocator>;
 /// satisfied by anything the secret itself contains.
 constexpr std::array<std::byte, 32> SecretMaterial = [] {
     std::array<std::byte, 32> out {};
-    for (std::size_t i = 0; i < out.size(); ++i)
+    for (auto const i: std::views::iota(std::size_t { 0 }, out.size()))
         out[i] = static_cast<std::byte>(0xA5U ^ (i + 1U));
     return out;
 }();

@@ -5,6 +5,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <ranges>
 #include <string>
 #include <thread>
 #include <vector>
@@ -108,13 +109,13 @@ TEST_CASE("CachedClock concurrent refreshes converge on the newest sample", "[cl
     constexpr int WorkerCount = 8;
     std::vector<std::jthread> workers;
     workers.reserve(WorkerCount);
-    for (int worker = 0; worker < WorkerCount; ++worker)
+    for ([[maybe_unused]] auto const worker: std::views::iota(0, WorkerCount))
     {
         workers.emplace_back([&] {
             if (!waits.WaitForFlag("the start gate to open", go, [] { return std::string { "the gate is shut" }; }))
                 return;
             auto previous = clock.Now();
-            for (int i = 0; i < 20'000; ++i)
+            for ([[maybe_unused]] auto const i: std::views::iota(0, 20'000))
             {
                 clock.Refresh();
                 auto const observed = clock.Now();

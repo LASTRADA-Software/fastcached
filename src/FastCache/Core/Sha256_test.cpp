@@ -43,10 +43,10 @@ namespace
     constexpr std::string_view Digits = "0123456789abcdef";
     std::vector<std::byte> out;
     out.reserve(hex.size() / 2);
-    for (std::size_t at = 0; at + 1 < hex.size(); at += 2)
+    for (auto const pair: std::views::iota(std::size_t { 0 }, hex.size() / 2))
     {
-        auto const hi = Digits.find(hex[at]);
-        auto const lo = Digits.find(hex[at + 1]);
+        auto const hi = Digits.find(hex[2 * pair]);
+        auto const lo = Digits.find(hex[(2 * pair) + 1]);
         out.push_back(static_cast<std::byte>((hi << 4U) | lo));
     }
     return out;

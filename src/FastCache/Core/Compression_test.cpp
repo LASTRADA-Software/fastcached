@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <random>
+#include <ranges>
 #include <span>
 #include <string_view>
 #include <vector>
@@ -32,7 +33,7 @@ std::vector<std::byte> RandomBytes(std::size_t size, std::uint64_t seed)
     std::mt19937_64 rng { seed };
     std::vector<std::byte> out;
     out.reserve(size);
-    for (std::size_t i = 0; i < size; ++i)
+    for ([[maybe_unused]] auto const i: std::views::iota(std::size_t { 0 }, size))
         out.push_back(static_cast<std::byte>(static_cast<std::uint8_t>(rng() & 0xFFU)));
     return out;
 }
