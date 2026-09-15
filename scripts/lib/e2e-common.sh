@@ -2506,10 +2506,45 @@ _e2e_bounded_pauses=(0.01 0.01 0.02 0.05 0.1)
 # How long a TERM is given before KILL, in seconds.
 _e2e_bounded_grace=2
 
+# How long the whole escalation is WATCHED for, in seconds, measured from the TERM. A
+# DIAGNOSTIC, never a bound: nothing waits on it, no verdict is taken from it, and it
+# cannot end anything early.
+#
+# It exists because the ways the escalation can overrun are fixed by DIFFERENT PEOPLE and
+# were indistinguishable from each other and from the total (#1454):
+#
+#   * the grace loop outlasting its own deadline, or the KILL going out late -- an
+#     unbounded step inside the thing that exists to bound one, which is this function;
+#   * a `wait` that outlasts a KILL -- the HOST not scheduling this shell, since a KILL
+#     cannot be ignored.
+#
+# DERIVED, not picked: the grace plus one second, and the second is the scheduling
+# allowance for the KILL and the reap, which are one syscall each. So a reading of `slow`
+# at any stage means that stage spent a whole second more than every step in it needs.
+_e2e_bounded_escalation_watch=$(( _e2e_bounded_grace + 1 ))
+
+# What each stage of the escalation did. NAMED, for the reason `E2eBoundFinished` above is
+# named: a bare string compared against a literal fails OPEN, and under `set -u` a
+# misspelled name stops the run and says where.
+#
+# The three readings are CUMULATIVE -- all three are taken against one watch armed where
+# the TERM went out -- so a late KILL is necessarily followed by a late reap, and the FIRST
+# stage reading slow is the one that spent the time. That is stated in the line they are
+# printed on, because a reader meeting `reap-slow` beside `kill-slow` would otherwise have
+# two subjects and no order between them.
+E2eBoundGraceExpired="grace-expired"
+E2eBoundGraceObeyed="grace-obeyed"
+E2eBoundGraceSlow="grace-slow"
+E2eBoundKillPrompt="kill-prompt"
+E2eBoundKillSlow="kill-slow"
+E2eBoundReapPrompt="reap-prompt"
+E2eBoundReapSlow="reap-slow"
+
 run_bounded() {
     local seconds="$1"; shift
     local capture pid status=0 exceeded=0 tick=0
     local armed="" dpid="" dmark="" pause="" requestedMs=0
+    local wpid="" wmark="" graceOutcome="" killOutcome="" reapOutcome=""
 
     # Written FIRST, and the write is CHECKED. `e2e_bound_outcome` reads absence as
     # "nothing was bounded", which is only sound if a failed write cannot also
@@ -2600,6 +2635,23 @@ run_bounded() {
         # changes that fixture's own signal handling. Every caller here spawns a
         # single client process; a caller that would not must not use this.
         kill -TERM "$pid" 2>/dev/null || true
+
+        # The watch, armed HERE -- where the TERM goes out -- so that all three readings
+        # below share one origin and one meter. Two earlier shapes were written and
+        # discarded: a watch armed after the KILL cannot see a KILL sent late, and one
+        # armed at the end of the grace cannot see a grace loop that outlasted its own
+        # deadline. Both are delays this function would be responsible for, so an
+        # instrument blind to them reports the HOST for every overrun.
+        #
+        # One watch rather than one per stage because arming is a FORK, and a fork delayed
+        # by the very starvation being measured makes the stage after it look prompt: the
+        # meter would be part of the subject. Its own fork is paid only on the escalation
+        # path, which is already the slow one.
+        _e2e_deadline_arm "$_e2e_bounded_escalation_watch"
+        armed="$_e2e_deadline_armed"
+        wpid="${armed%% *}"
+        wmark="${armed#* }"
+
         _e2e_deadline_arm "$_e2e_bounded_grace"
         armed="$_e2e_deadline_armed"
         dpid="${armed%% *}"
@@ -2607,11 +2659,38 @@ run_bounded() {
         while kill -0 "$pid" 2>/dev/null && ! _e2e_deadline_passed "$dmark"; do
             sleep "$_e2e_poll_pause"
         done
+        # THREE answers about the grace, not two, and the third is the one nothing could
+        # say: the child left on its own, the grace expired as designed, or the loop was
+        # still in here after the whole escalation watch -- which is this function taking
+        # an unbounded step inside the thing that exists to bound one. Read before the
+        # disarm removes the grace marker, because afterwards a child that left during the
+        # grace and one about to be killed are both simply gone.
+        if _e2e_deadline_passed "$wmark"; then
+            graceOutcome="$E2eBoundGraceSlow"
+        elif _e2e_deadline_passed "$dmark"; then
+            graceOutcome="$E2eBoundGraceExpired"
+        else
+            graceOutcome="$E2eBoundGraceObeyed"
+        fi
         _e2e_deadline_disarm "$dpid" "$dmark"
+
         kill -KILL "$pid" 2>/dev/null || true
+        if _e2e_deadline_passed "$wmark"; then
+            killOutcome="$E2eBoundKillSlow"
+        else
+            killOutcome="$E2eBoundKillPrompt"
+        fi
     fi
 
     wait "$pid" 2>/dev/null || status=$?
+    if [ -n "$wmark" ]; then
+        if _e2e_deadline_passed "$wmark"; then
+            reapOutcome="$E2eBoundReapSlow"
+        else
+            reapOutcome="$E2eBoundReapPrompt"
+        fi
+        _e2e_deadline_disarm "$wpid" "$wmark"
+    fi
     cat "$capture"
     rm -f "$capture"
 
@@ -2641,6 +2720,14 @@ run_bounded() {
             printf '   run_bounded: the %ss bound expired having asked for %sms of pauses, so the loop paced as intended and the WORK did not finish
 '                 "$seconds" "$requestedMs" >&2
         fi
+        # And the ESCALATION, as its own line and for the reason the line above is
+        # printed either way: silence must not be one of the answers. The three readings
+        # are cumulative against one %ss watch armed at the TERM, so the first one reading
+        # slow is where the time went -- said here rather than left to a reader who meets
+        # `kill-slow` and `reap-slow` together and has to guess which is the subject.
+        printf '   run_bounded: escalation: TERM at the %ss bound, then %s, %s, %s -- all three against ONE %ss watch armed at the TERM, so they are cumulative and the FIRST reading slow is where the time went
+'             "$seconds" "$graceOutcome" "$killOutcome" "$reapOutcome" \
+            "$_e2e_bounded_escalation_watch" >&2
         printf '%s' "$E2eBoundOutcomeExceeded" > "$(_e2e_bound_outcome_path)"
         return "$E2eBoundExceeded"
     fi

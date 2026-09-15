@@ -3160,9 +3160,15 @@ elif [ "$bounded_floor" -ne 1 ]; then
     note_failure "bounded-clock"
 elif [ "$bounded_over" -eq 1 ]; then
     echo "FAIL bounded-clock: a 1s bound over a TERM-ignoring child took more than" >&2
-    echo "     10s of MONOTONIC time (realtime read ${bounded_took}s);" >&2
-    echo "     the bound is waiting for a child that will not die, which is an" >&2
-    echo "     unbounded wait inside the thing that exists to bound one" >&2
+    echo "     10s of MONOTONIC time (realtime read ${bounded_took}s); read the" >&2
+    echo "     escalation line below, which says WHICH of the three intervals spent" >&2
+    echo "     it -- a late KILL is the helper and a slow reap is the host, and the" >&2
+    echo "     total cannot tell them apart (#1454)" >&2
+    # THE OUTPUT, which the other two arms of this case already print and this one did
+    # not. The branch that fires was the branch that said least: `run_bounded`'s own
+    # escalation line is on the case's stderr, captured in `$out`, and discarding it left
+    # a reader with one number and two opposite diagnoses to choose between.
+    printf '%s\n' "$out" | sed 's/^/     | /' >&2
     note_failure "bounded-clock"
 fi
 
