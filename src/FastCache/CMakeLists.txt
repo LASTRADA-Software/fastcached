@@ -45,6 +45,7 @@ target_sources(FastCache
         Consensus/RaftPeerServer.cpp
         Consensus/RaftPeerSession.cpp
         Consensus/RaftPeerTransport.cpp
+        Core/CpuFeatures.cpp
         Core/Crc32c.cpp
         Core/FigureText.cpp
         Core/PathKind.cpp

@@ -4,12 +4,52 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
 
 namespace FastCache
 {
+
+struct CpuFeatures;
+
+/// Which implementation compresses SHA-256 blocks.
+///
+/// Private to this process and never transmitted or persisted: every engine
+/// produces the same digest, so which one ran is invisible on the wire. Hence no
+/// explicit enumerator values, and a new engine may go anywhere after `Scalar`.
+enum class Sha256Engine : std::uint8_t
+{
+    Scalar,   ///< Portable FIPS 180-4. The fallback everywhere, and the reference every other engine is checked against.
+    X86ShaNi, ///< The x86 SHA extensions; needs SSSE3 and SSE4.1 as well.
+    ArmSha2,  ///< The ARMv8 SHA-256 instructions.
+    Last,
+};
+
+/// A short name for an engine, for test output and benchmark labels.
+/// @param engine The engine.
+/// @return Its name.
+[[nodiscard]] std::string_view Sha256EngineName(Sha256Engine engine) noexcept;
+
+/// Whether @p engine can run on a CPU offering @p features: this build carries
+/// its code, and the CPU has every instruction it uses. `Scalar` always can.
+/// @param engine The engine.
+/// @param features What the CPU offers.
+/// @return True when the engine may be used there.
+[[nodiscard]] bool Sha256EngineRunsOn(Sha256Engine engine, CpuFeatures const& features) noexcept;
+
+/// The engine a CPU offering @p features should use: a hardware engine that runs
+/// on it, else `Scalar`. A pure function, so every branch is testable on one
+/// machine by handing it features the machine does not have.
+/// @param features What the CPU offers.
+/// @return The engine to use.
+[[nodiscard]] Sha256Engine SelectSha256Engine(CpuFeatures const& features) noexcept;
+
+/// The engine this process uses by default: `SelectSha256Engine` over
+/// `DetectCpuFeatures()`, taken once, which `CpuFeatures` says is safe.
+/// @return The process-wide default engine.
+[[nodiscard]] Sha256Engine ActiveSha256Engine() noexcept;
 
 /// SHA-256 (FIPS 180-4).
 ///
@@ -31,6 +71,15 @@ namespace FastCache
 /// `char` (which is signed on x86-64 Linux and unsigned on aarch64), block loads
 /// go through `ReadBigEndian` rather than a native-order read, and rotation uses
 /// `std::rotr` rather than a shift pair that is UB at zero.
+///
+/// **Every engine must produce the same digest, byte for byte.** The digest is a
+/// contract between MACHINES: lease grants, discovery proofs and cluster signing
+/// are tags one node computes and another checks. A node whose CPU has the SHA
+/// instructions and one whose CPU has not run different engines, so an engine that
+/// is wrong makes those two refuse each other, and the refusal reads as a wrong
+/// cluster key. `Sha256_test.cpp` guards that with the published vectors and a
+/// byte-for-byte comparison against `Scalar`, on every engine the test host's CPU
+/// runs, in the default test set.
 class Sha256
 {
   public:
@@ -42,7 +91,24 @@ class Sha256
 
     using Digest = std::array<std::byte, DigestSize>;
 
-    Sha256() = default;
+    /// A hasher on the process's default engine (`ActiveSha256Engine`).
+    Sha256() noexcept = default;
+
+    /// A hasher on a chosen engine, or nothing when this process's CPU cannot run it.
+    ///
+    /// The only way to choose one. An engine the CPU lacks comes back as an absent
+    /// hasher, where a constructor that merely asserted would, in a Release build,
+    /// call through a null pointer or execute an instruction the CPU does not have.
+    /// @param engine The engine.
+    /// @return The hasher, or `std::nullopt` when `Sha256EngineRunsOn` says no here.
+    [[nodiscard]] static std::optional<Sha256> WithEngine(Sha256Engine engine) noexcept;
+
+    /// The engine this hasher compresses with.
+    /// @return The engine.
+    [[nodiscard]] Sha256Engine Engine() const noexcept
+    {
+        return _engine;
+    }
 
     /// Absorb more input. May be called any number of times.
     /// @param input Bytes to hash.
@@ -58,9 +124,16 @@ class Sha256
     [[nodiscard]] static Digest Hash(std::span<std::byte const> input) noexcept;
 
   private:
-    /// Compress one 64-byte block into the running state.
-    /// @param block Exactly BlockSize bytes.
-    void Compress(std::span<std::byte const> block) noexcept;
+    /// A hasher on @p engine, which the caller has already checked runs here.
+    /// @param engine The engine.
+    explicit Sha256(Sha256Engine engine) noexcept;
+
+    /// Compress whole blocks into the running state, with this hasher's engine.
+    /// @param blocks A whole number of BlockSize-byte blocks.
+    void CompressBlocks(std::span<std::byte const> blocks) noexcept;
+
+    /// Which engine compresses.
+    Sha256Engine _engine { ActiveSha256Engine() };
 
     /// The eight working variables, in FIPS 180-4's initial state.
     std::array<std::uint32_t, 8> _state { 0x6a09e667U, 0xbb67ae85U, 0x3c6ef372U, 0xa54ff53aU,

@@ -1173,6 +1173,10 @@ what differs between compilers, standard libraries, hosts and tool versions.
   or scan for a VALUE and name no iterator.
 - A return type is not part of a function's mangled name on Linux, so two functions differing
   only in return type silently collide.
+- An instruction-set extension is used only inside a function that asks for it
+  (`__attribute__((target(...)))`), never through a global `-m` flag: a flagged TU's inline copies
+  can reach a fallback path on a CPU without the instructions. And that function runs only once
+  `Core/CpuFeatures` says the CPU has them.
 - `cmake/portable/CompileCache.cmake` stays stock-CMake-only and must never fail a configure.
   `check_<lang>_compiler_flag` is a hard error for a language the project has not ENABLED, and a
   bad flag in `CMAKE_<LANG>_FLAGS` fails the ABI check — so ask `ENABLED_LANGUAGES` first, and

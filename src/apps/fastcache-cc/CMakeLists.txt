@@ -36,6 +36,7 @@ set(_fc_cc_core
     "${CMAKE_SOURCE_DIR}/src/FastCache/CompileCache/CompileValue.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/Core/Base64.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/Core/Compression.cpp"
+    "${CMAKE_SOURCE_DIR}/src/FastCache/Core/CpuFeatures.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/Core/SecureBytes.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/Core/Sha256.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/Metrics/IMetricsSink.cpp"
@@ -90,11 +91,14 @@ set(_fc_cc_core
 # what it needs rather than in one that discovers it cannot.
 #
 # They cost nothing the rule above protects. Sha256.hpp reaches only the standard
-# library; Sha256.cpp adds Core/Endian.hpp, which is header-only and std-only and
-# was already here through CompileCacheWire.hpp. Base64 reaches the standard library
-# alone. No vcpkg package, no OpenSSL -- which is the point of having SHA-256 in this
-# tree at all, since FASTCACHED_ENABLE_TLS is off by default and peer authentication
-# is not optional.
+# library; Sha256.cpp adds Core/Endian.hpp (already here through
+# CompileCacheWire.hpp), Core/EnumTable.hpp and Core/Ranges.hpp, all header-only and
+# std-only, and the compiler's own <immintrin.h> or <arm_neon.h>. Core/CpuFeatures.cpp
+# is how Sha256.cpp picks its engine at run time (#1420), and reaches the compiler's
+# own <intrin.h> or <cpuid.h> on x86-64 and <sys/sysctl.h> on arm64 macOS -- no
+# windows.h. Base64 reaches the standard library alone. No vcpkg package, no OpenSSL
+# -- which is the point of having SHA-256 in this tree at all, since
+# FASTCACHED_ENABLE_TLS is off by default and peer authentication is not optional.
 #
 # Core/Compression.cpp is the one row here that is NOT dependency-free, and it is a
 # deliberate exception to the rule the comment above states.
