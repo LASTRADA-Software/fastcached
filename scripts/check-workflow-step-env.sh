@@ -61,11 +61,17 @@
 # ## What it does NOT cover, so that nobody reads a pass as more than it is
 #
 # A name reached by `eval` or indirect expansion; one a sourced file defines; one supplied through a `${{ }}`
-# expression (substituted, so invisible here); `${#arr[@]}`. Two known residuals, each its own issue:
+# expression (substituted, so invisible here); `${#arr[@]}`. One known residual, with an issue of its own: the
+# `NAME: ${{ env.NAME }}` row itself -- a typo'd `${{ env.X }}` on the right of it is unchecked until #1460.
 #
-#   * the `NAME: ${{ env.NAME }}` row itself -- a typo'd `${{ env.X }}` on the right of it is unchecked until #1460;
-#   * ORDER inside a script -- a name the script assigns counts as defined for the whole script, so `echo "$X"` above
-#     `X=1` passes until #1461. Loop bodies, functions and traps make order a question this reader cannot answer yet.
+# ## Where in a script a name has to be defined
+#
+# A definition is a LINE (#1461). A read is judged against the scopes, the allowlist, and what the script defines at
+# or ABOVE the read's own line -- not against the whole script, which is what bash would have to be for the looser
+# model to be right. Relaxed to the whole script inside a LOOP body, which runs again, and a FUNCTION body, which
+# runs wherever it is called. A `trap` handler needs no relaxation and getting to that answer was the work: see the
+# section on it beside `define()`. The grain is a line, so a read and an assignment on ONE line are not ordered
+# against each other, and for PowerShell the relaxation is every brace-enclosed block. Both limits are stated there.
 #
 # bash 3.2 and a POSIX awk: this runs on macOS's `/bin/bash` and BSD awk.
 
@@ -111,7 +117,9 @@ unresolved-shell|The shell could not be derived: no \`shell:\` on the step, no \
 unreadable-run|The \`run:\` value is not a string this check can read: an alias, a tag, a flow collection, or a quoted scalar that does not close on its own line, has text after its closing quote, or holds a YAML escape other than \`\\\\\"\`, \`\\\\\\\\\` or \`\\\\/\`. YAML quoting is not shell quoting, and a quote read as the shell would read it hides the reads inside it. Write the script as a block scalar (\`run: |\`), or as a plain or quoted string on one line.
 unreadable-env|The \`env:\` is not a block mapping this check can read. Write one \`NAME: value\` row per line.
 unreadable-yaml|This check places every line of a workflow by its indentation, and cannot place this one -- a flow mapping, an alias, a quoted key, or a second document -- so no step around it can be judged. Write it as a block mapping; if the construct is needed, teach the reader and add a case.
-unplaced-run|Every \`run:\` key outside a scalar is counted without the reader and must be a script the reader placed in a step (or a \`defaults.run\`), so a step whose keys the reader stopped recognising is refused here rather than read as clean. If this is a step's script, the reader misplaced the step: teach it, with a case. If it is not one -- an action input or an \`env:\` row named \`run\` -- the reader has no place for it either: teach it where the key sits, with a case. Never rename a script key to get past this."
+unplaced-run|Every \`run:\` key outside a scalar is counted without the reader and must be a script the reader placed in a step (or a \`defaults.run\`), so a step whose keys the reader stopped recognising is refused here rather than read as clean. If this is a step's script, the reader misplaced the step: teach it, with a case. If it is not one -- an action input or an \`env:\` row named \`run\` -- the reader has no place for it either: teach it where the key sits, with a case. Never rename a script key to get past this.
+order|A step's script is read in ORDER, because bash is: the name is expanded where the line stands, so a read above the line that assigns it dies there under \`set -u\` and expands EMPTY without it, taking a branch the wrong way (#1174, #1461). Move the assignment above the read, or give the step's \`env:\` a row for it. A read inside a LOOP body or a FUNCTION body is judged against the whole script instead -- a loop body runs again and a function body runs where it is called -- so this is a read at the script's top level.
+unreadable-construct|This check follows a step's loops and functions to know where ordering applies, and lost the one it was inside: the \`do\`/\`done\` pairs, or a function's braces, do not balance in the CODE the lexer left. A \`do\`, a \`done\` or a brace inside a string or a heredoc is masked and cannot cause this. Write the construct so it balances, or teach the reader the shape, with a case."
 
 # The tables as awk takes them: a -v value may not hold a newline on BSD awk.
 Flatten() { printf '%s' "$1" | tr '\n' "$2"; }
@@ -193,7 +201,7 @@ Scan() {
     # A here-string opens where the CODE of a line ends in `@` and a quote, so the opener is looked for in what the
     # lexer returns: a comment ending in one opens nothing, and the lines after it are still code.
     function pwshVisible(s,   t, before, out) {
-        t = trim(s)
+        t = trim(s); lexCode = ""
         if (hereString == "single") { if (substr(t, 1, 2) == sq "@") hereString = ""; return "" }
         if (hereString == "double") { if (substr(t, 1, 2) == "\"@") { hereString = ""; return "" } return s }
         before = lexState
@@ -224,7 +232,7 @@ Scan() {
         if (t ~ /^(export|readonly|local|declare|typeset)[ \t]/) {
             sub(/^(export|readonly|local|declare|typeset)[ \t]+(-[A-Za-z]+[ \t]+)*/, "", t)
             while (match(t, /^[A-Za-z_][A-Za-z0-9_]*/)) {
-                defs[substr(t, RSTART, RLENGTH)] = 1
+                define(substr(t, RSTART, RLENGTH))
                 rest = substr(t, RSTART + RLENGTH)
                 sub(/^(\+?=([^ \t]*))/, "", rest)
                 if (rest !~ /^[ \t]/) break
@@ -252,22 +260,22 @@ Scan() {
                 chain[++nchain] = name
                 rest = substr(rest, RLENGTH + 1)
             }
-            if (rest == "" || rest ~ /^[;&|)}#]/) for (name in chain) defs[chain[name]] = 1
+            if (rest == "" || rest ~ /^[;&|)}#]/) for (name in chain) define(chain[name])
         }
         # bash32-scan: data-begin
         if (match(s, /(mapfile|readarray)[ \t]+(-[A-Za-z]+([ \t]+[^ \t-][^ \t]*)?[ \t]+)*[A-Za-z_][A-Za-z0-9_]*/)) {
         # bash32-scan: data-end
             rest = substr(s, RSTART, RLENGTH)
-            if (match(rest, /[A-Za-z_][A-Za-z0-9_]*$/)) defs[substr(rest, RSTART, RLENGTH)] = 1
+            if (match(rest, /[A-Za-z_][A-Za-z0-9_]*$/)) define(substr(rest, RSTART, RLENGTH))
         }
         if (match(s, /(^|[^A-Za-z0-9_])for[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]+in([ \t]|$)/)) {
             rest = substr(s, RSTART, RLENGTH)
             sub(/^[^A-Za-z0-9_]*for[ \t]+/, "", rest)
-            if (match(rest, /^[A-Za-z_][A-Za-z0-9_]*/)) defs[substr(rest, RSTART, RLENGTH)] = 1
+            if (match(rest, /^[A-Za-z_][A-Za-z0-9_]*/)) define(substr(rest, RSTART, RLENGTH))
         }
         if (match(s, /(^|[^A-Za-z0-9_])getopts[ \t]+[^ \t]+[ \t]+[A-Za-z_][A-Za-z0-9_]*/)) {
             rest = substr(s, RSTART, RLENGTH)
-            if (match(rest, /[A-Za-z_][A-Za-z0-9_]*$/)) defs[substr(rest, RSTART, RLENGTH)] = 1
+            if (match(rest, /[A-Za-z_][A-Za-z0-9_]*$/)) define(substr(rest, RSTART, RLENGTH))
         }
         rest = s
         while (match(rest, /(^|[^A-Za-z0-9_])read[ \t]+/)) {
@@ -277,11 +285,11 @@ Scan() {
                 rest = substr(rest, RLENGTH + 1)
                 # -a takes the ARRAY it reads into, which is a name; -d, -n, -N, -p, -t and -u take a value, which is
                 # not one.
-                if (t ~ /a[ \t]+$/ && match(rest, /^[A-Za-z_][A-Za-z0-9_]*/)) defs[substr(rest, 1, RLENGTH)] = 1
+                if (t ~ /a[ \t]+$/ && match(rest, /^[A-Za-z_][A-Za-z0-9_]*/)) define(substr(rest, 1, RLENGTH))
                 if (t ~ /[adnNptu][ \t]+$/ && match(rest, /^[^ \t]+[ \t]*/)) rest = substr(rest, RLENGTH + 1)
             }
             while (match(rest, /^[A-Za-z_][A-Za-z0-9_]*/)) {
-                defs[substr(rest, RSTART, RLENGTH)] = 1
+                define(substr(rest, RSTART, RLENGTH))
                 rest = substr(rest, RSTART + RLENGTH)
                 if (rest !~ /^[ \t]/) break
                 sub(/^[ \t]+/, "", rest)
@@ -293,7 +301,7 @@ Scan() {
         while (match(s, /\$\{?[A-Za-z_][A-Za-z0-9_]*/)) {
             name = substr(s, RSTART, RLENGTH)
             sub(/^\$\{?/, "", name)
-            refs[name] = 1
+            noteRef(name)
             s = substr(s, RSTART + RLENGTH)
         }
     }
@@ -305,9 +313,86 @@ Scan() {
             name = toupper(substr(s, RSTART, RLENGTH))
             sub(/^\$\{?ENV:/, "", name)
             rest = substr(s, RSTART + RLENGTH)
-            if (rest ~ /^\}?[ \t]*=[^=]/) defs[name] = 1
-            else refs[name] = 1
+            if (rest ~ /^\}?[ \t]*=[^=]/) define(name)
+            else noteRef(name)
             s = rest
+        }
+    }
+
+    # ---- where in a script a name is defined ---------------------------------------------------------------------
+    # A definition is a LINE, and a read is judged against what is defined at or above its own line, because that is
+    # what bash does: a script reading `$X` above `X=1` dies on that line under `set -u`, and without `-u` expands it
+    # EMPTY and takes a branch the wrong way, which is the worse half of #1174.
+    #
+    # Two constructs take the meaning out of a line number, and they are the whole of the relaxation:
+    #
+    #   * a LOOP body runs AGAIN, so an assignment at its end reaches a read at its start on the next iteration;
+    #   * a FUNCTION body runs wherever it is CALLED, which may be below every assignment its caller makes.
+    #
+    # A read inside either is judged against the whole script -- which is what EVERY read was judged against before
+    # #1461, so the ordering strengthens the top level and can refuse nothing inside a construct that passed before.
+    #
+    # A `trap` handler needs no rule, and that is a finding rather than an omission. A single-quoted handler is not
+    # expanded at all, so the lexer has already masked its `$` and no read is seen in it; a double-quoted one is
+    # expanded WHERE `trap` IS CALLED, so ordering is already the right answer there. Both are cases, because a
+    # relaxation that could never fire is worse than none -- nothing would ever say it had stopped working.
+    #
+    # The grain is a LINE, so a read and an assignment on ONE line are not ordered against each other: a one-line
+    # loop (`for x in a; do echo "$X"; X=1; done`) is accepted. Stated rather than closed -- a finer grain would have
+    # to interleave the construct walk with the read walk, and this tree has never held the shape.
+    function define(name) { if (!(name in defs)) defs[name] = curLine }
+    # A STRICT read outranks a loose one for the same name, and the FIRST strict read wins, because it is the one
+    # that fails: -1 means judged against the whole script, and any other value means judged at that line.
+    function noteRef(name) {
+        if (loose) { if (!(name in refs)) refs[name] = -1; return }
+        if (!(name in refs) || refs[name] == -1 || refs[name] > curLine) refs[name] = curLine
+    }
+    # How many times the reserved word @p w stands in COMMAND position in @p code. It is reserved only there:
+    # `echo done` is an argument, and counting it would close a loop that never opened.
+    function countWord(code, w,   n, t, re) {
+        n = 0; t = code
+        re = "(^|[;&|(){])[ \t]*" w "([ \t;&|)}]|$)"
+        while (match(t, re)) { n++; t = substr(t, RSTART + RLENGTH - 1) }
+        return n
+    }
+    function countChar(code, ch,   n, i, len) {
+        n = 0; len = length(code)
+        for (i = 1; i <= len; i++) if (substr(code, i, 1) == ch) n++
+        return n
+    }
+    # A bash function declaration whose body starts at the brace or on the line below. `f() { echo; }` written on one
+    # line is not one: it IS that line, which the grain note above covers.
+    function isFnOpen(code) {
+        return (code ~ /^[ \t]*([A-Za-z_][A-Za-z0-9_]*[ \t]*\(\)|function[ \t]+[A-Za-z_][A-Za-z0-9_]*([ \t]*\(\))?)[ \t]*\{?[ \t]*$/)
+    }
+    # Whether the line about to be read lies inside a construct. Asked BEFORE the tokens of that line are counted, so
+    # the OPENING line of a construct is judged strictly -- the reads it carries happen once, before the body.
+    function looseHere(fold) {
+        if (fold) return (pwBrace > 0)
+        return (loopDepth > 0 || fnStarted)
+    }
+    # Carry the construct state across the line just read, over the CODE the lexer left, so a `do`, a `done` or a
+    # brace inside a string or a heredoc is masked and moves nothing.
+    #
+    # In PowerShell the loops and the functions are brace-delimited, and so are the `if` blocks, so every
+    # brace-enclosed block counts as a construct there: telling one from another needs a parser this reader does not
+    # have, and the cost is that PowerShell ordering is enforced at the top level of a script only. No pwsh step in
+    # this tree assigns an environment name at all -- measured, `$env:NAME =` appears nowhere under
+    # `.github/workflows` -- so that half is carried by cases rather than by the files.
+    function advance(code, fold) {
+        if (code == "") return
+        if (fold) {
+            pwBrace += countChar(code, "{") - countChar(code, "}")
+            if (pwBrace < 0) { pwBrace = 0; constructBroken = "a `}` with no `{`" }
+            return
+        }
+        loopDepth += countWord(code, "do") - countWord(code, "done")
+        if (loopDepth < 0) { loopDepth = 0; constructBroken = "a `done` with no `do`" }
+        if (!inFn && isFnOpen(code)) { inFn = 1; fnBrace = 0; fnStarted = 0 }
+        if (inFn) {
+            fnBrace += countChar(code, "{") - countChar(code, "}")
+            if (fnBrace > 0) fnStarted = 1
+            if (fnStarted && fnBrace <= 0) { inFn = 0; fnStarted = 0 }
         }
     }
 
@@ -326,7 +411,7 @@ Scan() {
     # The names a step of @p model can see: every scope, its own assignments, and its shell family allowlist.
     # PowerShell compares them upper-cased, as Windows does.
     function admit(src, fold,   k) { for (k in src) visible[fold ? toupper(k) : k] = 1 }
-    function flush(   model, i, name, missing, n, fold, t) {
+    function flush(   model, i, name, missing, n, fold, t, at, code) {
         if (!inStep) return
         inStep = 0
         if (pass < 2) return
@@ -336,30 +421,47 @@ Scan() {
         if (model == "?") { refuse(stepLine, "unresolved-shell", "runs-on `" runsOn "`"); return }
         if (substr(model, 1, 1) == "!") { refuse(stepLine, "unknown-shell", "shell `" substr(model, 2) "`"); return }
         split("", defs); split("", refs); split("", visible); lexState = ""; heredocEnd = ""; hereString = ""
+        loopDepth = 0; inFn = 0; fnBrace = 0; fnStarted = 0; pwBrace = 0; constructBroken = ""
         models[model]++
         fold = (model == "pwsh")
         # The plant is one more line, read LAST and by the same lexer, so a body that leaves a quote, a heredoc or a
         # here-string open hides it -- which is what the plant exists to catch.
-        if (plant) body[nbody++] = fold ? "$null = $env:" PlantName : ": \"$" PlantName "\""
+        if (plant) { bodyAt[nbody] = stepLine; body[nbody++] = fold ? "$null = $env:" PlantName : ": \"$" PlantName "\"" }
         # No line is skipped for starting with `#`: the lexer ends a comment itself, and inside a heredoc or a
         # here-string such a line is text that expands -- a Markdown heading in a report body. A heredoc line is
         # text, too, so `NAME=$NAME` written into a file assigns nothing.
         for (i = 0; i < nbody; i++) {
-            if (fold) pwshScan(pwshVisible(body[i]))
-            else { t = bashVisible(body[i]); if (lexCode != "") bashDefs(lexCode); bashRefs(t) }
+            curLine = i
+            loose = looseHere(fold)
+            if (fold) { t = pwshVisible(body[i]); code = lexCode; pwshScan(t) }
+            else { t = bashVisible(body[i]); code = lexCode; if (code != "") bashDefs(code); bashRefs(t) }
+            advance(code, fold)
         }
+        if (constructBroken == "" && (inFn || loopDepth != 0))
+            constructBroken = inFn ? "a function whose braces never close" : "a `do` with no `done`"
         if (plant) {
             printf "PLANTED\t%d\t%s\t%d\n", stepLine, stepName, (PlantName in refs)
             delete refs[PlantName]
         }
-        admit(stepEnv, fold); admit(jobEnv, fold); admit(workflowEnv, fold); admit(defs, fold)
+        # `defs` is deliberately NOT admitted into `visible`: a scope and the allowlist hold for a whole script
+        # while an assignment holds from its own line down, and folding the two throws that line away.
+        admit(stepEnv, fold); admit(jobEnv, fold); admit(workflowEnv, fold)
         if (fold) admit(windowsSet, fold); else admit(bashSet, fold)
         missing = ""; n = 0
-        for (name in refs) if (!(name in visible)) missing = missing (n++ ? ", " : "") (fold ? "$env:" : "$") name
+        for (name in refs) {
+            if (name in visible) continue
+            at = refs[name]
+            if (!(name in defs)) { missing = missing (n++ ? ", " : "") (fold ? "$env:" : "$") name; continue }
+            if (at == -1 || defs[name] <= at) continue
+            # Refused at the line of the READ rather than at the line of the step, because the remedy is a line to
+            # move, and a step can be a hundred lines long.
+            refuse(bodyAt[at], "order", "reads " (fold ? "$env:" : "$") name " here, and this script assigns it further down, at line " bodyAt[defs[name]])
+        }
         if (n) refuse(stepLine, "undefined", "reads " missing)
+        if (constructBroken != "") refuse(stepLine, "unreadable-construct", constructBroken)
     }
     function resetStep() {
-        split("", stepEnv); split("", body)
+        split("", stepEnv); split("", body); split("", bodyAt)
         nbody = 0; hasRun = 0; inStep = 1; stepName = "(unnamed)"; stepLine = FNR; stepShell = ""; stepKeyIndent = -1
     }
     # The `env:`, `defaults` and `runs-on` may follow its `steps:`, so the second pass starts each job from what the
@@ -454,7 +556,7 @@ Scan() {
         # A block scalar, or a plain scalar continuing, owns every blank or more-indented line after its key.
         if (blockOwner >= 0) {
             if (blank || ind > blockOwner) {
-                if (blockKind == "run") body[nbody++] = blank ? line : substr(line, blockOwner + 1)
+                if (blockKind == "run") { bodyAt[nbody] = FNR; body[nbody++] = blank ? line : substr(line, blockOwner + 1) }
                 next
             }
             blockOwner = -1
@@ -558,7 +660,7 @@ Scan() {
                     value = t
                 }
                 hasRun = 1
-                body[nbody++] = value
+                bodyAt[nbody] = FNR; body[nbody++] = value
                 # A plain scalar continues on more-indented lines, including one whose first line is empty.
                 blockOwner = ind; blockKind = "run"
             }
@@ -1134,6 +1236,71 @@ jobs:
       - run: echo visible
 WF
 
+    # ---- ORDER (#1461) -- a read judged at its own line -----------------------------------------------------------
+
+    # The shape the ticket opened on. The refusal is reported at the READ, and names the assignment it is above.
+    Case orderTopLevelRead 1 ':7 step "reads above its own assignment": reads $TARGET here, and this script assigns it further down, at line 8' <<'WF'
+jobs:
+  j:
+    runs-on: ubuntu-latest
+    steps:
+      - name: "reads above its own assignment"
+        run: |
+          echo "$TARGET"
+          TARGET=release
+          echo "$TARGET"
+WF
+
+    # A DOUBLE-quoted trap handler is expanded where `trap` is CALLED, so ordering is already the right answer for
+    # it -- the pair of this case and `orderTrapSingleQuoted` below is why no trap relaxation exists.
+    Case orderTrapDoubleQuoted 1 ':7 step "a double-quoted trap handler expands where trap is called": reads $reaper here, and this script assigns it further down, at line 8' <<'WF'
+jobs:
+  j:
+    runs-on: ubuntu-latest
+    steps:
+      - name: "a double-quoted trap handler expands where trap is called"
+        run: |
+          trap "echo $reaper" EXIT
+          reaper=1
+WF
+
+    # PowerShell reaches the same judgement through its own scanner, and the name is folded as Windows folds it.
+    Case orderPwshRead 1 ':8 step "a PowerShell read above its own assignment": reads $env:LATER here, and this script assigns it further down, at line 9' <<'WF'
+jobs:
+  j:
+    runs-on: windows-2022
+    steps:
+      - name: "a PowerShell read above its own assignment"
+        shell: pwsh
+        run: |
+          Write-Host $env:LATER
+          $env:LATER = "x"
+WF
+
+    # Losing the construct is a REFUSAL, not a fall back to judging the script as if it had none: a reader that
+    # cannot say where a loop ends cannot say which reads are ordered, and the looser answer is the silent one.
+    Case constructDoneWithNoDo 1 'a `done` with no `do`' <<'WF'
+jobs:
+  j:
+    runs-on: ubuntu-latest
+    steps:
+      - name: "a done with no do"
+        run: |
+          echo one
+          done
+WF
+
+    Case constructFunctionNeverCloses 1 'a function whose braces never close' <<'WF'
+jobs:
+  j:
+    runs-on: ubuntu-latest
+    steps:
+      - name: "a function whose braces never close"
+        run: |
+          emit() {
+            echo hello
+WF
+
     Case noRunStepAtAll 1 'not one `run:` step read' < /dev/null
     Case noWorkflowFile 1 'no workflow file under' plain nofile
 
@@ -1271,6 +1438,108 @@ jobs:
       - run: |
           $local = 1
           Write-Host $local
+WF
+
+    # ---- ORDER (#1461) -- what the ordering must NOT refuse -------------------------------------------------------
+    #
+    # Every refusing case above has its twin here, the same script with the order or the quoting that makes it
+    # legitimate: a model that refused everything would pass the refusing half on its own.
+
+    # The first half of the remedy: move the assignment above the read.
+    Case orderAssignThenRead 0 '1 run step(s), 1 read as bash' <<'WF'
+jobs:
+  j:
+    runs-on: ubuntu-latest
+    steps:
+      - name: "the assignment above the read"
+        run: |
+          TARGET=release
+          echo "$TARGET"
+WF
+
+    # The second half of it, tested because a remedy nobody has followed is not known to work: the same script as
+    # `orderTopLevelRead`, with the row the refusal asks for.
+    Case orderRemedyStepEnv 0 '1 run step(s), 1 read as bash' <<'WF'
+jobs:
+  j:
+    runs-on: ubuntu-latest
+    steps:
+      - name: "the step env carries it"
+        env:
+          TARGET: release
+        run: |
+          echo "$TARGET"
+          TARGET=other
+WF
+
+    # A loop body runs AGAIN, so the assignment at its end reaches the read at its start.
+    Case orderLoopBody 0 '1 run step(s), 1 read as bash' <<'WF'
+jobs:
+  j:
+    runs-on: ubuntu-latest
+    steps:
+      - name: "a loop body sees what its own next turn assigns"
+        run: |
+          for path in a b
+          do
+            echo "$previous"
+            previous="$path"
+          done
+WF
+
+    # A function body runs where it is CALLED, which is below the assignment its caller makes.
+    Case orderFunctionBody 0 '1 run step(s), 1 read as bash' <<'WF'
+jobs:
+  j:
+    runs-on: ubuntu-latest
+    steps:
+      - name: "a function body sees what its caller assigns before the call"
+        run: |
+          emit() {
+            echo "$subject"
+          }
+          subject=one
+          emit
+WF
+
+    # The twin of `orderTrapDoubleQuoted`: single quotes are not expanded, so the lexer masks the `$` and there is
+    # no read in the handler to order at all. This is the whole of why `trap` needs no relaxation.
+    Case orderTrapSingleQuoted 0 '1 run step(s), 1 read as bash' <<'WF'
+jobs:
+  j:
+    runs-on: ubuntu-latest
+    steps:
+      - name: "a single-quoted trap handler is not expanded, so no read is seen in it"
+        run: |
+          trap 'echo "$reaper"' EXIT
+          reaper=1
+WF
+
+    # The grain, pinned as a PASSING case so that the limit stays a decision: a read and an assignment on ONE line
+    # are not ordered against each other. Delete this case and the limit becomes an accident.
+    Case orderOneLineLoopGrain 0 '1 run step(s), 1 read as bash' <<'WF'
+jobs:
+  j:
+    runs-on: ubuntu-latest
+    steps:
+      - name: "the grain is a line"
+        run: |
+          for x in a b; do echo "$seen"; seen=1; done
+WF
+
+    # And PowerShell's limit, pinned the same way: every brace-enclosed block is a construct there.
+    Case orderPwshBraceBlock 0 '1 run step(s), 0 read as bash, 1 as PowerShell' <<'WF'
+jobs:
+  j:
+    runs-on: windows-2022
+    steps:
+      - name: "a PowerShell brace block is a construct"
+        shell: pwsh
+        run: |
+          foreach ($i in 1..2) {
+            Write-Host $env:LATER
+            $env:LATER = "x"
+          }
 WF
 
     # ---- the plant ----------------------------------------------------------------------------------------------

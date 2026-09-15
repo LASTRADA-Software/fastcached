@@ -1312,7 +1312,9 @@ what differs between compilers, standard libraries, hosts and tool versions.
   branch is taken the wrong way silently, which is worse. The runner vocabulary is an ALLOWLIST, the
   model of each SHELL is deliberately narrower than that shell and chosen per step, the files are a
   GLOB, every `run:` key is COUNTED by a walk that knows no steps, and the refusal names the STEP.
-  `ctest -R workflow-step-env`.
+  And a read is judged at its OWN line — loosened to the whole script only inside a LOOP body, which
+  runs again, and a FUNCTION body, which runs where it is called. A `trap` handler needs no
+  loosening, which is a finding rather than an omission. `ctest -R workflow-step-env`.
 - Every check whose SUBJECT is documentation was skipped on exactly the change it exists to catch,
   because `code=false` is right for a compiler and backwards for prose. Prose drifts by being
   EDITED. The set is the `docs-subject` ctest LABEL, read out of `src/tests/CMakeLists.txt` and
