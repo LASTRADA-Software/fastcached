@@ -417,6 +417,28 @@ struct ClusterState
     /// Settings, sorted by name for the same reason.
     std::vector<Setting> settings;
 
+    /// Hosts the cluster admits as CLIENTS, sorted and unique (#1309).
+    ///
+    /// A client -- a developer's laptop, a CI runner, anything running `fastcache-cc`
+    /// against the fleet -- never joins consensus, so it had no replicated route at all:
+    /// it was admitted only by each node's `--fleet-member` list, and removing one meant
+    /// a reload on every machine. Host only, because that is all admission compares: a
+    /// caller dials from an ephemeral port.
+    std::vector<std::string> clients;
+
+    /// Hosts the cluster has FORGOTTEN, sorted and unique (#1309): a tombstone per host.
+    ///
+    /// **Recorded, because absence cannot say it.** A host missing from `members` and
+    /// `clients` is the ordinary state of every machine a node's own list names, so a
+    /// forget that only erased would leave nothing a node could narrow its local list
+    /// by -- and a local list is exactly where a decommissioned machine lingers. Written
+    /// by `ForgetClient` and by `RemoveMember` (the removed member's consensus host),
+    /// cleared by `AdmitClient` and `AddMember` for that host.
+    ///
+    /// **Bounded by the distinct hosts ever forgotten and not re-admitted**, never by
+    /// traffic: nothing but a committed command adds one, and a re-admit removes one.
+    std::vector<std::string> forgotten;
+
     [[nodiscard]] friend bool operator==(ClusterState const&, ClusterState const&) = default;
 
     /// The consensus endpoint recorded for `id`, if any.
@@ -449,6 +471,19 @@ struct ClusterState
     /// this one is guaranteed to be there at all.
     /// @return The endpoints, which is what `Distributed::ClusterMembership` takes.
     [[nodiscard]] std::vector<std::string> Endpoints() const;
+
+    /// Whether the cluster admits `host` as a client.
+    ///
+    /// Through `SameHost`, the one comparison admission makes, so a client recorded as
+    /// `10.0.0.1` is the one a dual-stack listener reports as `::ffff:10.0.0.1`.
+    /// @param host A caller's host, without a port.
+    /// @return True when a `clients` entry names the same machine.
+    [[nodiscard]] bool AdmitsClient(std::string_view host) const;
+
+    /// Whether the cluster has forgotten `host` and not admitted it again.
+    /// @param host A caller's host, without a port.
+    /// @return True when a `forgotten` entry names the same machine.
+    [[nodiscard]] bool HasForgotten(std::string_view host) const;
 };
 
 /// What a command does to the state.
@@ -457,10 +492,19 @@ struct ClusterState
 /// receiver switches on and an unknown verb is refused rather than mistaken for a
 /// known one.
 ///
-/// **Append only.** The numeric values are a wire contract twice over -- the byte a
-/// peer decodes, and the index of a table keyed by this enum -- so reordering these
-/// silently remaps every verb a running fleet has already replicated. `Last` is the
-/// count and never travels.
+/// **Transmitted and persisted, and append only.** The numeric values are a wire contract
+/// twice over -- the byte a peer decodes and a log entry keeps, and the index of a table
+/// keyed by this enum -- so reordering these silently remaps every verb a running fleet
+/// has already replicated. Every value is written out, because on an enum like this one
+/// that is the enforcement; `Last` is the count and never travels.
+///
+/// **A verb is added without moving `CommandVersion`**, because the layout did not
+/// change, and that has a consequence a fleet mid-upgrade lives with: a member running a
+/// build that predates a verb meets its committed entries and SKIPS them by name
+/// (`ClusterStateMachine::Apply`), applying the rest of the log around them. So it holds
+/// the state as if that command had never been proposed -- which for #1309's two verbs
+/// means such a member admits no replicated client (closed, and healed by the upgrade)
+/// and ignores a client forget (OPEN for that host, until it is upgraded).
 enum class CommandKind : std::uint8_t
 {
     /// Add a member, or update the endpoint of one already present.
@@ -469,8 +513,23 @@ enum class CommandKind : std::uint8_t
     /// same identity and a new address, and making the operator remove it first
     /// would leave a window in which the cluster has agreed it does not exist.
     AddMember = 0,
-    RemoveMember,
-    SetSetting,
+    RemoveMember = 1,
+    SetSetting = 2,
+
+    /// Admit a client host to the fleet, clearing any tombstone for it (#1309).
+    ///
+    /// The replicated counterpart of a `--fleet-member` entry, for a machine that never
+    /// joins consensus. Also the route BACK for a member that was forgotten and now
+    /// serves as a plain worker or client: its forget tombstoned its host.
+    AdmitClient = 3,
+
+    /// Forget a client host: stop admitting it and record that it was forgotten (#1309).
+    ///
+    /// A POSITIVE act, and recorded as one, because a node's own `--fleet-member` list
+    /// may still name the host -- a tombstone is what lets every node refuse it with one
+    /// committed entry rather than a reload on each machine.
+    ForgetClient = 4,
+
     Last, ///< Not a verb, and has no row: the length of a table keyed by one.
 };
 
@@ -479,7 +538,8 @@ struct Command
 {
     CommandKind kind { CommandKind::AddMember };
     /// The member id for `AddMember`/`RemoveMember`, the setting name for
-    /// `SetSetting`.
+    /// `SetSetting`, the client's host (a port, if given, is ignored) for
+    /// `AdmitClient`/`ForgetClient`.
     std::string key;
     /// The consensus endpoint for `AddMember`, the value for `SetSetting`, empty
     /// otherwise.
@@ -563,6 +623,11 @@ void Apply(ClusterState& state, Command const& command);
 /// One rule for every verb alike would refuse the one id an operator most needs to
 /// type, and that member would count towards quorum forever -- which is the trap
 /// #159 records.
+///
+/// `AdmitClient` and `ForgetClient` constrain their host, which both record: it must
+/// name a machine, and it must not be this one's loopback -- a caller on the node's own
+/// machine is always admitted to it, so a record about loopback would be accepted,
+/// replicated and snapshotted while deciding nothing.
 /// @param command The change.
 /// @return Nothing when it may be proposed, or why it may not.
 [[nodiscard]] std::expected<void, ConsensusError> Validate(Command const& command);

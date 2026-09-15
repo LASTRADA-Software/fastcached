@@ -326,29 +326,30 @@ TEST_CASE("A truncated snapshot is refused rather than half-read", "[cluster][st
 
 TEST_CASE("A state another build encoded is refused by its version while a command keeps its own", "[cluster][state][wire]")
 {
-    // #1340 added a field to every member, so the state's version moved -- and the
-    // byte is pinned as well as the refusal, because a symbol both ends spell can
-    // only test the NAME of a wire constant. The version is the first field's only
-    // byte, after that field's u32 length prefix.
+    // #1309 added the admitted clients and the forgotten hosts, so the state's version
+    // moved -- and the byte is pinned as well as the refusal, because a symbol both ends
+    // spell can only test the NAME of a wire constant. The version is the first field's
+    // only byte, after that field's u32 length prefix.
     ClusterState state;
     Apply(state, Cmd(CommandKind::AddMember, "n1", "10.0.0.1:6675", "10.0.0.1:7000"));
     auto bytes = Encode(state);
     REQUIRE(bytes.size() > 4);
-    CHECK(bytes[4] == std::byte { 3 });
+    CHECK(bytes[4] == std::byte { 4 });
 
     // What the previous build wrote. Refused BY NAME, both versions stated, and never
     // as `MalformedFrame`: those bytes are intact, and *damaged* is what gets a healthy
     // snapshot deleted.
-    bytes[4] = std::byte { 2 };
+    bytes[4] = std::byte { 3 };
     auto const older = DecodeState(bytes);
     REQUIRE_FALSE(older.has_value());
     CHECK(older.error().code == ConsensusErrorCode::UnsupportedVersion);
-    CHECK(older.error().context.contains("version 2"));
-    CHECK(older.error().context.contains("reads 3"));
+    CHECK(older.error().context.contains("version 3"));
+    CHECK(older.error().context.contains("reads 4"));
 
-    // The COMMAND layout did not change, so its version must not have either. A
-    // committed entry this build cannot decode is skipped, so moving this byte with the
-    // state's would make a node restarting onto its own log skip every entry in it.
+    // The COMMAND layout did not change -- #1309 added verbs, not fields -- so its version
+    // must not have either. A committed entry this build cannot decode is skipped, so
+    // moving this byte with the state's would make a node restarting onto its own log skip
+    // every entry in it.
     auto command = Encode(Cmd(CommandKind::AddMember, "n1", "10.0.0.1:6675", "10.0.0.1:7000"));
     REQUIRE(command.size() > 4);
     CHECK(command[4] == std::byte { 2 });
@@ -443,7 +444,9 @@ TEST_CASE("A snapshot whose scheduler endpoint history cannot be true is refused
                                                                     .schedulerEndpoint = "10.0.0.1:7000",
                                                                     .schedulerEndpointHistory =
                                                                         SchedulerEndpointHistory::NeverAnnounced } },
-                                       .settings = {} };
+                                       .settings = {},
+                                       .clients = {},
+                                       .forgotten = {} };
     auto const refused = DecodeState(Encode(contradictory));
     REQUIRE_FALSE(refused.has_value());
     CHECK(refused.error().code == ConsensusErrorCode::MalformedFrame);
@@ -692,4 +695,139 @@ TEST_CASE("A lease lifetime the cluster may not agree on is refused, and one it 
         // column is run unconditionally.
         CHECK(Validate(Cmd(CommandKind::SetSetting, "fleet-open", "not-a-number")).has_value());
     }
+}
+
+TEST_CASE("Forgetting a client records that it was forgotten, and admitting it again clears that",
+          "[cluster][state][forget]")
+{
+    // #1309. A local `--fleet-member` list may still name a host the cluster has
+    // forgotten, and a node can only refuse it if the forget left something behind:
+    // absence from `clients` is also the state of every host a list names and the cluster
+    // never admitted, so an erase alone decides nothing.
+    ClusterState state;
+    Apply(state, Cmd(CommandKind::AdmitClient, "10.0.0.7"));
+    CHECK(state.AdmitsClient("10.0.0.7"));
+    CHECK_FALSE(state.HasForgotten("10.0.0.7"));
+
+    Apply(state, Cmd(CommandKind::ForgetClient, "10.0.0.7"));
+    CHECK_FALSE(state.AdmitsClient("10.0.0.7"));
+    CHECK(state.HasForgotten("10.0.0.7"));
+    CHECK(state.forgotten == std::vector<std::string> { "10.0.0.7" });
+
+    // The control: a host nobody forgot is not forgotten, including one the cluster never
+    // admitted -- which is every host a local list names.
+    CHECK_FALSE(state.HasForgotten("10.0.0.8"));
+
+    // A re-admit is the route back, and it clears the tombstone rather than leaving a
+    // host both admitted and forgotten for a reader to pick between.
+    Apply(state, Cmd(CommandKind::AdmitClient, "10.0.0.7"));
+    CHECK(state.AdmitsClient("10.0.0.7"));
+    CHECK_FALSE(state.HasForgotten("10.0.0.7"));
+    CHECK(state.forgotten.empty());
+
+    // By host: a port is not something a caller is matched on, and the dual-stack spelling
+    // of the same machine is the same entry rather than a second one.
+    Apply(state, Cmd(CommandKind::ForgetClient, "10.0.0.7:6674"));
+    CHECK(state.HasForgotten("::ffff:10.0.0.7"));
+    Apply(state, Cmd(CommandKind::ForgetClient, "::ffff:10.0.0.7"));
+    CHECK(state.forgotten.size() == 1);
+}
+
+TEST_CASE("Forgetting a member records its host as forgotten, and admitting that host again clears it",
+          "[cluster][state][forget]")
+{
+    // The decommission this ticket is for: a member is forgotten, and every node whose
+    // own list still names its machine must be able to refuse it. The command carries an
+    // id only, so the host comes from the record being removed.
+    ClusterState state;
+    Apply(state, Cmd(CommandKind::AddMember, "n1", "10.0.0.1:6675"));
+    Apply(state, Cmd(CommandKind::AddMember, "n2", "10.0.0.2:6675"));
+
+    Apply(state, Cmd(CommandKind::RemoveMember, "n1"));
+    CHECK(state.HasForgotten("10.0.0.1"));
+    CHECK_FALSE(state.HasForgotten("10.0.0.2"));
+
+    // Forgetting an id that is not a member leaves nothing: there is no host to derive,
+    // and a tombstone for a guess would refuse a machine nobody forgot.
+    Apply(state, Cmd(CommandKind::RemoveMember, "nobody"));
+    CHECK(state.forgotten.size() == 1);
+
+    // Re-admitting a member at that host clears it; so would `AdmitClient`, the route a
+    // demoted member takes back as a plain worker.
+    Apply(state, Cmd(CommandKind::AddMember, "n1", "10.0.0.1:6675"));
+    CHECK_FALSE(state.HasForgotten("10.0.0.1"));
+
+    Apply(state, Cmd(CommandKind::RemoveMember, "n2"));
+    Apply(state, Cmd(CommandKind::AdmitClient, "10.0.0.2"));
+    CHECK_FALSE(state.HasForgotten("10.0.0.2"));
+
+    // Never loopback: a caller on a node's own machine is admitted whatever a list says,
+    // so a tombstone for it could narrow nothing -- and every member of a one-machine
+    // cluster answers on loopback.
+    Apply(state, Cmd(CommandKind::AddMember, "local", "127.0.0.1:6675"));
+    Apply(state, Cmd(CommandKind::RemoveMember, "local"));
+    CHECK_FALSE(state.HasForgotten("127.0.0.1"));
+}
+
+TEST_CASE("Each cluster verb keeps the byte a log entry already carries", "[cluster][state][wire][forget]")
+{
+    // The BYTE, not the symbol: every caller in this tree spells the enumerator, so a
+    // consistent renumbering stays green here while every log a fleet has already written
+    // decodes as a different verb. And the two client verbs sit above the byte every
+    // build before them treats as unknown, which is what makes such a build SKIP them
+    // rather than apply one as something else.
+    auto const byteOf = [](CommandKind kind) {
+        auto const bytes = Encode(Cmd(kind, "10.0.0.7"));
+        // The verb sits in the second byte of the first field, after that field's u32
+        // length prefix.
+        REQUIRE(bytes.size() > 5);
+        return static_cast<unsigned>(bytes[5]);
+    };
+    CHECK(byteOf(CommandKind::AddMember) == 0U);
+    CHECK(byteOf(CommandKind::RemoveMember) == 1U);
+    CHECK(byteOf(CommandKind::SetSetting) == 2U);
+    CHECK(byteOf(CommandKind::AdmitClient) == 3U);
+    CHECK(byteOf(CommandKind::ForgetClient) == 4U);
+}
+
+TEST_CASE("A client command names a machine that is not this one, and nothing else", "[cluster][state][forget]")
+{
+    CHECK(Validate(Cmd(CommandKind::AdmitClient, "10.0.0.7")).has_value());
+    CHECK(Validate(Cmd(CommandKind::ForgetClient, "ci-runner-3.example:6674")).has_value());
+
+    CHECK(Refused(Cmd(CommandKind::AdmitClient, ":6674")).contains("must name a host"));
+    CHECK(Refused(Cmd(CommandKind::ForgetClient, "127.0.0.1")).contains("loopback"));
+    CHECK(Refused(Cmd(CommandKind::AdmitClient, "::1")).contains("loopback"));
+    CHECK(Refused(Cmd(CommandKind::ForgetClient, "10.0.0.7", "extra")).contains("nothing else"));
+    CHECK(Refused(Cmd(CommandKind::AdmitClient, "10.0.0.7", {}, "10.0.0.7:7000")).contains("nothing else"));
+
+    // Recorded, so it has to be text: the host is printed by every renderer of the state.
+    CHECK(Refused(Cmd(CommandKind::AdmitClient, "10.0.0.\x80")).contains("a client host"));
+}
+
+TEST_CASE("Clients and forgotten hosts survive a snapshot apart from each other", "[cluster][state][wire][forget]")
+{
+    // Both groups are lists of hosts, so a count read wrongly would silently turn an
+    // admitted client into a forgotten one -- a machine refused everywhere after a
+    // follower restores a snapshot.
+    ClusterState state;
+    Apply(state, Cmd(CommandKind::AddMember, "n1", "10.0.0.1:6675"));
+    Apply(state, Cmd(CommandKind::SetSetting, "fleet-open", "0"));
+    Apply(state, Cmd(CommandKind::AdmitClient, "10.0.0.5"));
+    Apply(state, Cmd(CommandKind::AdmitClient, "10.0.0.6"));
+    Apply(state, Cmd(CommandKind::ForgetClient, "10.0.0.9"));
+
+    auto const restored = DecodeState(Encode(state));
+    REQUIRE(restored.has_value());
+    CHECK(*restored == state);
+    CHECK(restored->clients == std::vector<std::string> { "10.0.0.5", "10.0.0.6" });
+    CHECK(restored->forgotten == std::vector<std::string> { "10.0.0.9" });
+
+    // A count that claims more hosts than the bytes carry is damage, said as damage.
+    auto bytes = Encode(state);
+    auto shortened = bytes;
+    shortened.resize(shortened.size() - 1);
+    auto const truncated = DecodeState(shortened);
+    REQUIRE_FALSE(truncated.has_value());
+    CHECK(truncated.error().code == ConsensusErrorCode::MalformedFrame);
 }

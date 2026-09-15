@@ -42,7 +42,7 @@ namespace
 /// @return The state.
 [[nodiscard]] ClusterState StateOf(std::vector<ClusterMember> members)
 {
-    return ClusterState { .members = std::move(members), .settings = {} };
+    return ClusterState { .members = std::move(members), .settings = {}, .clients = {}, .forgotten = {} };
 }
 
 /// `MembershipProposals`, spelled without the span conversion at every call.
