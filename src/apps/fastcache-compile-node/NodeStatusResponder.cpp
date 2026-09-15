@@ -333,8 +333,9 @@ CompileCacheWire::NodeStatusFields ConfiguredNodeStatus::Describe() const
 
     // **The `Worker` bit above and this reading answer DIFFERENT questions, and that is
     // the whole of #1295 rather than a nuance.** The bit says *this node has a worker
-    // component*, which on this binary is a constant and a true one -- it compiles, that
-    // is what it is for. This says *is that worker serving yet*, which is not a constant
+    // component*, which is false only on a node started with `--slots=0` (#206) -- and
+    // there this source is not wired at all, so the reading below is absent rather than
+    // a worker surveying nothing forever. This says *is that worker serving yet*, which is not a constant
     // at all: a node serves while it identifies its toolchains, so between start and the
     // heartbeat thread's first completed round it runs a worker that can honour nothing.
     // One `bool` reported both, so the state an operator most needs to see was the one

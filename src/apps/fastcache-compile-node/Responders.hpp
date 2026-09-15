@@ -6,6 +6,7 @@
 
 #include <FastCache/Auth/AuthPolicy.hpp>
 #include <FastCache/Core/EnumTable.hpp>
+#include <FastCache/Core/Ranges.hpp>
 #include <FastCache/Distributed/MembershipOracle.hpp>
 #include <FastCache/Distributed/SchedulerProtocol.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
@@ -903,28 +904,175 @@ struct SurfaceComponents
     IFrameResponder* fleet { nullptr };
 };
 
+/// Whether a verb family's owner is there on a built node. In-process only, never
+/// transmitted or persisted, so its order is free.
+enum class FamilyPresence : std::uint8_t
+{
+    /// Not a classification. **The one explicit value in this private enum, and it is
+    /// load-bearing:** a row that does not state the column is value-initialised to zero,
+    /// so zero must mean unclassified for `EveryFamilyIsClassified` to refuse it rather
+    /// than let it take the first real answer. No other enumerator carries a value.
+    Unstated = 0,
+    NoOwner,              ///< No component answers the family on any node.
+    WhenItsComponentRuns, ///< Null on a node that does not run the family's component.
+    /// Never null on a built node: the family does not depend on WHICH components a node
+    /// runs. These owners coexist on every port, so their connection allowances ADD.
+    OnEveryBuiltNode,
+};
+
+/// Whether the merged listener reads a family owner's session ceilings. In-process only,
+/// never transmitted or persisted, so its order is free.
+enum class SessionCeilings : std::uint8_t
+{
+    Unstated = 0, ///< Not a classification. Explicitly zero for `FamilyPresence::Unstated`'s reason.
+    Folded,       ///< Its three ceilings take part in `MergedResponder`'s fold.
+    NotRead,      ///< The surface never consults them; the row says why.
+};
+
+/// One verb family's route on the merged `0xFC` listener.
+struct FamilyRoute
+{
+    CompileCacheWire::VerbFamily family;         ///< The family this row describes.
+    IFrameResponder* SurfaceComponents::* owner; ///< The member that answers it, or null for none.
+    FamilyPresence presence;                     ///< Whether that owner exists on a built node.
+    SessionCeilings ceilings;                    ///< Whether the surface reads its ceilings.
+};
+
+/// **The merged listener's one routing table** (#206): which component answers each verb
+/// family, whether that component is on every built node, and whether its ceilings are the
+/// surface's. `MergedResponder` routes every frame through it, `AnswersAnyFamily` decides
+/// the bind from it, and the ceiling fold and the connection sum iterate its columns --
+/// so no one of them can keep a list of members that the next family is missing from.
+inline constexpr EnumTable<CompileCacheWire::VerbFamily, FamilyRoute> FamilyRoutes { {
+    { .family = CompileCacheWire::VerbFamily::Unset,
+      .owner = nullptr,
+      .presence = FamilyPresence::NoOwner,
+      .ceilings = SessionCeilings::NotRead },
+    // `Session` follows the scheduler, because the credential is the scheduler's: the cache
+    // requires none, so an `AUTH` routed to it would be answered "no policy" and a peer
+    // holding the scheduler's secret could never present it.
+    { .family = CompileCacheWire::VerbFamily::Session,
+      .owner = &SurfaceComponents::scheduler,
+      .presence = FamilyPresence::WhenItsComponentRuns,
+      .ceilings = SessionCeilings::Folded },
+    { .family = CompileCacheWire::VerbFamily::Cache,
+      .owner = &SurfaceComponents::cache,
+      .presence = FamilyPresence::WhenItsComponentRuns,
+      .ceilings = SessionCeilings::Folded },
+    { .family = CompileCacheWire::VerbFamily::Scheduler,
+      .owner = &SurfaceComponents::scheduler,
+      .presence = FamilyPresence::WhenItsComponentRuns,
+      .ceilings = SessionCeilings::Folded },
+    { .family = CompileCacheWire::VerbFamily::Compile,
+      .owner = &SurfaceComponents::compile,
+      .presence = FamilyPresence::WhenItsComponentRuns,
+      .ceilings = SessionCeilings::Folded },
+    // *What do you serve?* must work on whatever a node runs, so this owner is never null
+    // on a built node the way the component families' legitimately are.
+    { .family = CompileCacheWire::VerbFamily::Node,
+      .owner = &SurfaceComponents::node,
+      .presence = FamilyPresence::OnEveryBuiltNode,
+      .ceilings = SessionCeilings::Folded },
+    // Legitimately null, and on most deployments it is: a node that runs no consensus has no
+    // cluster to let anybody into, so the family is refused at the door with the sentence
+    // every unserved family gets. Its ceilings are NOT read, and `EnrollmentResponder` says
+    // why at each of them: it exists only beside a scheduler, whose ceilings are larger, and
+    // folding it in would make a later raise of its number widen every surface on the port.
+    { .family = CompileCacheWire::VerbFamily::Enrollment,
+      .owner = &SurfaceComponents::enrollment,
+      .presence = FamilyPresence::WhenItsComponentRuns,
+      .ceilings = SessionCeilings::NotRead },
+    // For `Node`'s reason: a watcher asks what a node is doing whatever it runs.
+    { .family = CompileCacheWire::VerbFamily::Live,
+      .owner = &SurfaceComponents::live,
+      .presence = FamilyPresence::OnEveryBuiltNode,
+      .ceilings = SessionCeilings::Folded },
+    // For `Live`'s reason: a reader pointed at a worker is told where the fleet is served
+    // rather than that nothing here speaks the verb.
+    { .family = CompileCacheWire::VerbFamily::Fleet,
+      .owner = &SurfaceComponents::fleet,
+      .presence = FamilyPresence::OnEveryBuiltNode,
+      .ceilings = SessionCeilings::Folded },
+} };
+
+static_assert(RowsInEnumeratorOrder(FamilyRoutes, &FamilyRoute::family),
+              "one FamilyRoutes row per VerbFamily, in enumerator order");
+
+/// Whether every family states both columns, and states them consistently.
+///
+/// A new `VerbFamily` gets a row or `RowsInEnumeratorOrder` fails; this is what makes that
+/// row SAY whether its owner is on every node and whether its ceilings are read, rather
+/// than inherit whichever answer a zero spells. An owner that is null exactly when the row
+/// says there is none, and no two every-node rows naming one member, because the connection
+/// sum would count that owner twice.
+/// @return True when the table is classified.
+[[nodiscard]] consteval bool EveryFamilyIsClassified() noexcept
+{
+    auto const stated = std::ranges::all_of(FamilyRoutes, [](FamilyRoute const& row) {
+        return row.presence != FamilyPresence::Unstated && row.ceilings != SessionCeilings::Unstated
+               && (row.owner == nullptr) == (row.presence == FamilyPresence::NoOwner);
+    });
+    auto const distinctEveryNodeOwners = std::ranges::all_of(FamilyRoutes, [](FamilyRoute const& row) {
+        return row.presence != FamilyPresence::OnEveryBuiltNode
+               || std::ranges::count_if(FamilyRoutes, [&row](FamilyRoute const& other) {
+                      return other.presence == FamilyPresence::OnEveryBuiltNode && other.owner == row.owner;
+                  }) == 1;
+    });
+    return stated && distinctEveryNodeOwners;
+}
+
+static_assert(EveryFamilyIsClassified(),
+              "every FamilyRoutes row states its presence and its ceilings, and every-node owners are distinct");
+
+/// The component of @p components that answers @p family, or nullptr when this node serves
+/// it nowhere. `FamilyRoutes` is the table; this reads it.
+/// @param components What the listener routes to.
+/// @param family The family a verb belongs to.
+/// @return The owner, or nullptr.
+[[nodiscard]] constexpr IFrameResponder* FamilyOwner(SurfaceComponents const& components,
+                                                     CompileCacheWire::VerbFamily family) noexcept
+{
+    auto const index = static_cast<std::size_t>(family);
+    if (index >= FamilyRoutes.size())
+        return nullptr;
+    auto const& row = FamilyRoutes[index];
+    return row.owner == nullptr ? nullptr : components.*row.owner;
+}
+
+/// Whether @p components give the node's `0xFC` listener anything to answer.
+///
+/// **Every family counts, the operator verbs and live stats included** (#206). A node
+/// running consensus and nothing else -- no worker, no cache tier, no scheduler -- is a
+/// legitimate member, and `--node-status` and a live subscription are how it is watched
+/// without an admin surface; a predicate reading only the cache, scheduler and compile
+/// components bound no port for it while `--print-surfaces` named one. The operator
+/// families are never null on a built node, so on every configuration the startup table
+/// accepts this answers yes and the ROW decides, which is what `--print-surfaces` reads.
+///
+/// Asked of the VERBS through `FamilyRoutes` rather than of a list of members: a list is
+/// exact about the families it names and silent about the next one to arrive.
+/// @param components What the listener would route to.
+/// @return True when some verb has a component to answer it.
+[[nodiscard]] constexpr bool AnswersAnyFamily(SurfaceComponents const& components) noexcept
+{
+    return std::ranges::any_of(CompileCacheWire::OpTable,
+                               [&components](auto const& row) { return FamilyOwner(components, row.family) != nullptr; });
+}
+
 class MergedResponder final: public IFrameResponder
 {
   public:
     /// @param components What to route to; every non-null member must outlive this.
     explicit MergedResponder(SurfaceComponents const& components) noexcept:
-        _cache { components.cache },
-        _scheduler { components.scheduler },
-        _compile { components.compile },
-        _node { components.node },
-        _enrollment { components.enrollment },
-        _live { components.live },
-        _fleet { components.fleet }
+        _components { components }
     {
     }
 
     /// The component that owns @p opRaw, or nullptr when this node serves it nowhere.
     ///
-    /// `Session` follows the scheduler, because the credential is the scheduler's: the
-    /// cache requires none, so an `AUTH` routed to it would be answered "no policy" and
-    /// a peer holding the scheduler's secret could never present it.
+    /// `FamilyRoutes` is the table; this reads the verb's family off the header byte.
     ///
-    /// `Compile` is a row here like any other, and that was the second half of #290 --
+    /// `Compile` is a row there like any other, and that was the second half of #290 --
     /// but the routing was never the work. It is served by `CompileResponder`, which
     /// hops onto an executor before it compiles and back onto the reactor before it
     /// answers: a compile blocks for seconds, and neither running it on this reactor
@@ -937,39 +1085,7 @@ class MergedResponder final: public IFrameResponder
     /// @return The owner, or nullptr.
     [[nodiscard]] IFrameResponder* OwnerOf(std::uint8_t opRaw) const noexcept
     {
-        switch (CompileCacheWire::FamilyOf(opRaw))
-        {
-            case CompileCacheWire::VerbFamily::Cache:
-                return _cache;
-            case CompileCacheWire::VerbFamily::Session:
-            case CompileCacheWire::VerbFamily::Scheduler:
-                return _scheduler;
-            case CompileCacheWire::VerbFamily::Compile:
-                return _compile;
-            case CompileCacheWire::VerbFamily::Node:
-                // Answerable by a node that runs no component at all, which is the
-                // whole point of the family: *what do you serve?* must work on the
-                // emptiest node in the fleet, so this owner is never null in a built
-                // node the way the other three legitimately are.
-                return _node;
-            case CompileCacheWire::VerbFamily::Live:
-                // Never null on a built node, for the `Node` family's reason just above: a watcher
-                // asks what a node is doing whatever it runs.
-                return _live;
-            case CompileCacheWire::VerbFamily::Fleet:
-                // Never null on a built node, for `Live`'s reason: a reader pointed at a worker is
-                // told where the fleet is served rather than that nothing here speaks the verb.
-                return _fleet;
-            case CompileCacheWire::VerbFamily::Enrollment:
-                // Legitimately null, and on most deployments it is: a node that runs no
-                // consensus has no cluster to let anybody into, so the family is refused
-                // at the door with the sentence every unserved family gets rather than
-                // by a surface that exists only to say no.
-                return _enrollment;
-            case CompileCacheWire::VerbFamily::Unset:
-                return nullptr;
-        }
-        return nullptr;
+        return FamilyOwner(_components, CompileCacheWire::FamilyOf(opRaw));
     }
 
     /// @copydoc IFrameResponder::Answer
@@ -1025,9 +1141,9 @@ class MergedResponder final: public IFrameResponder
     /// refused at the door.
     [[nodiscard]] CredentialOutcome CheckCredential(std::span<std::byte const> payload) const override
     {
-        if (_scheduler == nullptr)
+        if (_components.scheduler == nullptr)
             return CredentialOutcome::NoPolicy;
-        return _scheduler->CheckCredential(payload);
+        return _components.scheduler->CheckCredential(payload);
     }
 
     /// @copydoc IFrameResponder::RefusalReply
@@ -1107,9 +1223,22 @@ class MergedResponder final: public IFrameResponder
     /// The largest, not the sum and not the smallest. This one surface now carries both
     /// populations -- every local `fastcache-cc` and every peer in the fleet -- and the
     /// smaller ceiling would close the port to one population because the other exists.
+    ///
+    /// **Except the operator families, whose allowances ADD** (#206). They are on every
+    /// node and they coexist: an operator's `--node-status` or `fleet` read must still
+    /// connect while every live subscription is held. On a node running only consensus
+    /// their largest alone was the live cap, so the port refused new connections exactly
+    /// when the subscriptions were full and the live responder's own counted refusal never
+    /// fired. Their sum is below every other owner's ceiling, so no other node's number
+    /// moves.
     [[nodiscard]] std::size_t MaxOpenConnections() const noexcept override
     {
-        return Largest(&IFrameResponder::MaxOpenConnections);
+        std::size_t coexisting = 0;
+        for (auto const& row: FamilyRoutes)
+            if (auto const* const owner = row.owner == nullptr ? nullptr : _components.*row.owner;
+                row.presence == FamilyPresence::OnEveryBuiltNode && owner != nullptr)
+                coexisting += owner->MaxOpenConnections();
+        return std::max(Largest(&IFrameResponder::MaxOpenConnections), coexisting);
     }
 
     /// @copydoc IFrameResponder::MaxInFlightBytes
@@ -1183,6 +1312,40 @@ class MergedResponder final: public IFrameResponder
     }
 
   private:
+    /// A verb family this node may run no component for, refused with its own code rather
+    /// than `UnimplementedVerb`. See `UnservedReply` for why each row exists.
+    struct UnservedFamily
+    {
+        CompileCacheWire::VerbFamily family; ///< Whose verbs this row answers.
+        Cc::UncountedRefusal refusal;        ///< What the client is told, and why nothing rises.
+        std::string_view detail;             ///< Words for the operator who sent it.
+    };
+
+    /// Every family with an answer of its own; any other unserved family is unimplemented.
+    static constexpr auto UnservedFamilies = std::to_array<UnservedFamily>({
+        { .family = CompileCacheWire::VerbFamily::Enrollment,
+          .refusal = { .code = CompileCacheWire::ErrorCode::NoCluster,
+                       .rationale = "what a node without consensus answers every enrolment attempt aimed at it, which "
+                                    "is an ordinary misdirection rather than an event; counted, it would bury the scan "
+                                    "it would be read for, exactly as the unserved-family answer below would" },
+          .detail = "this node runs no consensus, so it belongs to no cluster and there is nothing here to join; ask a "
+                    "node that runs consensus -- --node-status names the components a node serves" },
+        { .family = CompileCacheWire::VerbFamily::Compile,
+          .refusal = { .code = CompileCacheWire::NoCompileWorker::Code,
+                       .rationale = "what a node running no worker answers a compile or a cordon aimed at it: nothing "
+                                    "leases this node, so each one is a person or a script at the wrong machine, "
+                                    "which is a misdirection rather than an event a series should count" },
+          .detail = "this endpoint runs no compile worker: it was started with --slots=0, so nothing here compiles "
+                    "and there is nothing to cordon; ask a node that runs one -- --node-status names the components "
+                    "a node serves" },
+    });
+
+    // The compile row says `CompileCacheWire::NoCompileWorker`'s fact, which the daemon answers too, so
+    // neither endpoint can reword it or move its code without the other (#206).
+    static_assert(CompileCacheWire::SaysNoCompileWorker(
+        FindOrNull(UnservedFamilies, CompileCacheWire::VerbFamily::Compile, &UnservedFamily::family)->refusal.code,
+        FindOrNull(UnservedFamilies, CompileCacheWire::VerbFamily::Compile, &UnservedFamily::family)->detail));
+
     /// What a verb this node serves nowhere is answered with.
     ///
     /// A sentence rather than a bare code, because the operator action differs from
@@ -1226,20 +1389,23 @@ class MergedResponder final: public IFrameResponder
     /// Taking the verb rather than being duplicated at the four call sites is the point:
     /// `Answer`, `RefusePeer`, `RefusalReply` and `EndpointRefusalReply` all reach an
     /// unowned verb, and a per-family answer chosen at each of them is four places to
-    /// forget it. Both refusals stay UNCOUNTED for the reason above -- a node that runs
-    /// no consensus answers this for every enrolment attempt anybody ever points at it.
+    /// forget it. Every refusal here stays UNCOUNTED for the reason above -- a node that
+    /// runs no consensus answers this for every enrolment attempt anybody ever points at it.
+    ///
+    /// **The compile family is the second row, since #206 gave a node the means to run no
+    /// worker** (`--slots=0`). Its verbs are not unimplemented there either: `--cordon`
+    /// aimed at such a node would otherwise read *this node is too old to know the verb*,
+    /// which sends an operator to upgrade a machine that is current. It takes
+    /// `DispatchNotPermitted` through `CompileCacheWire::NoCompileWorker`, the one definition the daemon's
+    /// cordon and compile rows reach too -- so the two endpoints send one code for one
+    /// condition, as the enrollment row does with `NoCluster`.
     /// @param opRaw The third header byte, as received.
     /// @return The encoded refusal.
     [[nodiscard]] static std::vector<std::byte> UnservedReply(std::uint8_t opRaw)
     {
-        if (CompileCacheWire::FamilyOf(opRaw) == CompileCacheWire::VerbFamily::Enrollment)
-            return Cc::RefuseWithoutCounter(
-                { .code = CompileCacheWire::ErrorCode::NoCluster,
-                  .rationale = "what a node without consensus answers every enrolment attempt aimed at it, which is "
-                               "an ordinary misdirection rather than an event; counted, it would bury the scan it "
-                               "would be read for, exactly as the unserved-family answer below would" },
-                "this node runs no consensus, so it belongs to no cluster and there is nothing here to join; ask a "
-                "node that runs consensus -- --node-status names the components a node serves");
+        auto const family = CompileCacheWire::FamilyOf(opRaw);
+        if (auto const* const row = FindOrNull(UnservedFamilies, family, &UnservedFamily::family))
+            return Cc::RefuseWithoutCounter(row->refusal, row->detail);
 
         return Cc::RefuseWithoutCounter({ .code = CompileCacheWire::UnimplementedVerb,
                                           .rationale =
@@ -1249,50 +1415,39 @@ class MergedResponder final: public IFrameResponder
                                         "this node serves no component for that verb family");
     }
 
-    /// The largest value reported by the three owners this folds, for one ceiling.
+    /// The largest value reported by the owners this folds, for one ceiling.
     ///
     /// One helper rather than three near-identical folds: the three ceilings differ
     /// only in which member function they read, and copy-pasted branches that differ
     /// by a name are what this codebase treats as a defect.
     ///
-    /// **It folds `_cache`, `_scheduler` and `_compile`. `_node`, `_enrollment`, `_live` and
-    /// `_fleet` are NOT folded**, and that is stated here rather than left to be read off the loop,
-    /// because both of those responders carry comments reasoning about the number they
-    /// contribute -- reasoning that is sound about the value and silent about the fact
-    /// that nothing reads it. Whoever changes this set should read those comments in the
-    /// same pass. Those comments no longer claim a narrowing (#1338): a per-component
-    /// connection or byte ceiling has nowhere to live on one listener, one accept queue
-    /// and one byte budget, so the set stays the owners whose ceilings are the surface's.
+    /// **It folds every owner whose `FamilyRoutes` row says `SessionCeilings::Folded`**:
+    /// today everything but `enrollment`, whose row and whose responder say why. A
+    /// per-component connection or byte ceiling has nowhere to live on one listener, one
+    /// accept queue and one byte budget (#1338), so a small number here is never a
+    /// narrowing, and a larger one widens every surface on the port.
     ///
-    /// Adding the two members would change no number today: this is a MAXIMUM, and each
-    /// of them was sized to be the SMALL one. A ceiling that only takes effect when it is
-    /// the largest is the opposite of the case those two were written for, so folding
-    /// them in would leave the comments looking addressed and the property unchanged.
-    ///
-    /// A max cannot narrow a busier owner's ceiling -- **except** that with every folded
-    /// owner null this answers 0, and 0 means different things per ceiling: no ceiling at
-    /// all for `MaxOpenConnections` and `MaxInFlightBytes`, every payload refused for
-    /// `MaxRequestBytes` -- stated at those three declarations in `FrameEndpoint.hpp`.
-    /// Unreachable today, `main.cpp` setting `.compile` unconditionally; stated narrowly
-    /// because the general form of that sentence is false and was believed.
+    /// **The `OnEveryBuiltNode` owners are what keep this from answering 0.** With every
+    /// folded owner absent it did, and 0 means different things per ceiling -- no ceiling
+    /// at all for `MaxOpenConnections` and `MaxInFlightBytes`, every payload refused for
+    /// `MaxRequestBytes`, stated at those three declarations in `FrameEndpoint.hpp`. That was
+    /// unreachable while `main.cpp` set `.compile` unconditionally, and #206 reached it: a
+    /// `--slots=0` node running only consensus bound this port and closed every connection
+    /// it accepted, `--node-status` included. They are sized as the SMALL owners, so on any
+    /// node running a cache, a scheduler or a worker they change no number.
     /// @param ceiling Which ceiling to read.
-    /// @return The largest of the three folded owners; 0 when none of them is present.
+    /// @return The largest of the folded owners present; never 0 on a built node.
     [[nodiscard]] std::size_t Largest(std::size_t (IFrameResponder::*ceiling)() const noexcept) const noexcept
     {
         std::size_t out = 0;
-        for (auto const* const owner: { _cache, _scheduler, _compile })
-            if (owner != nullptr)
+        for (auto const& row: FamilyRoutes)
+            if (auto const* const owner = row.owner == nullptr ? nullptr : _components.*row.owner;
+                row.ceilings == SessionCeilings::Folded && owner != nullptr)
                 out = std::max(out, (owner->*ceiling)());
         return out;
     }
 
-    IFrameResponder* _cache;
-    IFrameResponder* _scheduler;
-    IFrameResponder* _compile;
-    IFrameResponder* _node;
-    IFrameResponder* _enrollment;
-    IFrameResponder* _live;
-    IFrameResponder* _fleet;
+    SurfaceComponents _components;
 };
 
 } // namespace FastCache::Node

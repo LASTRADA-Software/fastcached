@@ -35,9 +35,9 @@ not limited to the cores of the machine running it. Workers register with **one
 of their own** — a node started with `--serve-scheduler`, never `fastcached` —
 and clients are handed one on a miss.
 
-It is the fleet's only binary and wears several hats: every node compiles, holds
-a cache tier of its own by default, and may additionally schedule, run consensus
-and serve the fleet dashboard. What it never does is write to the shared cache —
+It is the fleet's only binary and wears several hats: a node compiles unless
+started with `--slots=0`, holds a cache tier of its own by default, and may
+additionally schedule, run consensus and serve the fleet dashboard. What it never does is write to the shared cache —
 it is given no credentials for it, and the object goes back to the client, which
 stores it. A job names a *toolchain fingerprint*, never a program, and the worker
 maps that to a compiler it discovered on its own machine; that is what keeps a

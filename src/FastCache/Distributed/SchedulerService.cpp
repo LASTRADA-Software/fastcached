@@ -646,9 +646,10 @@ SchedulerReply SchedulerService::Register(CallerContext const& caller, WorkerReg
     // own hardware", which is the *preferred* spelling -- a node that computed its
     // own slot count would be the one place a workstation's reserve could be got
     // wrong with nothing downstream able to tell. The failure the refusal protected
-    // against is closed by construction instead: `OfferableSlots` never returns
-    // zero, so no registration can produce a worker that matches leases and is
-    // never picked.
+    // against is closed by construction instead: the wire's zero is a request to
+    // derive (`RequestedSlots`) and a derived count is never zero, so no registration
+    // can produce a worker that matches leases and is never picked. An operator's
+    // zero (#206) never registers at all.
 
     // Measured, deliberately NOT refused (#242).
     //

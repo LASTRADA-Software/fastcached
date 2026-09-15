@@ -33,7 +33,9 @@ constexpr std::string_view Other = "10.0.0.9:6676";
     std::vector<std::string> configured;
     for (auto const endpoint: endpoints)
         configured.emplace_back(endpoint);
-    return SchedulerLink { std::move(configured) };
+    auto const link = SchedulerLink::For(std::move(configured));
+    REQUIRE(link.has_value());
+    return Unwrap(link);
 }
 
 /// Where the next round opens, which is the only thing a remembered leader DOES.
@@ -48,6 +50,20 @@ constexpr std::string_view Other = "10.0.0.9:6676";
     return link.Target();
 }
 } // namespace
+
+TEST_CASE("A link is built only from a list that names a scheduler", "[node][schedulerlink]")
+{
+    // #206 made an empty `--scheduler` list a legal configuration -- a node running no
+    // worker names none -- so the link is not a thing that exists for it. The factory
+    // answers nothing rather than a link over nothing, whose first round would read the
+    // first element of an empty list.
+    CHECK_FALSE(SchedulerLink::For({}).has_value());
+
+    // The control, and what a real link opens at.
+    auto link = SchedulerLink::For({ std::string { Configured }, std::string { Second } });
+    REQUIRE(link.has_value());
+    CHECK(Unwrap(link).Target() == Configured);
+}
 
 TEST_CASE("A node starts at the first endpoint it was configured with", "[node][schedulerlink]")
 {

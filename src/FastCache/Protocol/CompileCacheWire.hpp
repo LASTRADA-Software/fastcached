@@ -1163,6 +1163,11 @@ inline constexpr PayloadCap SessionCapGoverns { 0 };
 /// So the grouping becomes a column. It says which family a verb BELONGS to, never
 /// which process serves it: `fastcached` and a node both answer `Cache` verbs, and
 /// what differs is which of them has a component for the family, not the taxonomy.
+///
+/// **Private: in-process only.** A verb's family is read off `OpTable` at each end and is
+/// never transmitted or persisted, so the enumerator order is free and appending a family
+/// shifts nothing on the wire. The one explicit value is `Unset`'s zero, which is
+/// load-bearing for the reason stated on it; no other enumerator carries one.
 enum class VerbFamily : std::uint8_t
 {
     /// Not a family. Zero is deliberately unusable, so a row added without a family
@@ -1223,6 +1228,12 @@ enum class VerbFamily : std::uint8_t
     /// with a reply rather than a stream. A node running no scheduler still owns the family and
     /// says the fleet is served elsewhere, as the fleet subject of a subscription does.
     Fleet,
+
+    /// The count, not a family: what sizes a table with one row per family
+    /// (`Core/EnumTable.hpp`), so appending a family fails the build of every such table
+    /// until it has a row. Never in `OpTable`, which `EveryVerbHasAFamily` would not catch
+    /// by itself, so `NoVerbIsInTheCountFamily` does.
+    Last,
 };
 
 /// One row of the opcode table: everything the framing layer knows about a verb.
@@ -1788,6 +1799,15 @@ static_assert(PreAuthVerbsAreBounded(), "a verb reachable before AUTH must decla
 
 static_assert(EveryVerbHasAFamily(), "a verb belongs to a family -- see VerbFamily");
 
+/// Whether no verb names `VerbFamily::Last`, which is a count rather than a family.
+/// @return True when every row names a real family.
+[[nodiscard]] constexpr bool NoVerbIsInTheCountFamily() noexcept
+{
+    return std::ranges::none_of(OpTable, [](OpDescriptor const& row) { return row.family == VerbFamily::Last; });
+}
+
+static_assert(NoVerbIsInTheCountFamily(), "VerbFamily::Last is the count, not a family a verb can belong to");
+
 /// Whether no two rows claim one wire byte.
 ///
 /// **The collision this catches merges cleanly.** Verbs are added on parallel branches, each
@@ -1945,6 +1965,55 @@ inline constexpr std::array<std::uint8_t, 1> RetiredErrorCodes { 0x06 };
 static_assert(NoRetiredErrorCodeIsReused(),
               "a retired wire code must never be reassigned -- a peer built against an older header still reports it "
               "under its old name (0x06 was canonicalization-failed; see issues #59, #69)");
+
+/// What a compile-family verb is told at an endpoint that runs no compile worker.
+///
+/// **One fact, reached from two endpoints** (#206). The daemon is a cache and never ran
+/// a worker; a compile node started with `--slots=0` runs none. Both are asked the same
+/// question -- a `--cordon`, a compile somebody sent by hand -- and a client that met two
+/// codes for one condition would be sent two remedies, which is what `NoCluster` already
+/// avoids for the enrollment family.
+///
+/// `DispatchNotPermitted`, because these verbs are SERVED ELSEWHERE rather than
+/// unimplemented -- by the fleet's workers, or by the node on the daemon's own machine --
+/// and *a verb another port answers stays `DispatchNotPermitted`*. `UnimplementedVerb`
+/// would tell the operator who sent `--cordon` that this build is too old to know the
+/// verb. A launcher does not retry `NotPermitted`, which is right for both.
+///
+/// A STEM rather than a sentence, because the remedy is each endpoint's own: the daemon
+/// sends an operator to the compile node on this machine, a node running no worker to a
+/// node that runs one. Each table that answers these verbs asserts its row against this
+/// at compile time (`SaysNoCompileWorker`), so neither the code nor the fact can be
+/// changed at one endpoint alone.
+///
+/// **Shared DATA, not a way to answer**, which is why it sits here beside `ErrorTable`
+/// rather than in `SurfaceRefusal.hpp`: that header holds exactly the functions a surface
+/// refuses THROUGH, and `worker-refusals-counted` derives that set from it. A code and a
+/// stem both endpoints read are the kind of fact this header already carries per code.
+struct NoCompileWorker
+{
+    /// What the client acts on.
+    static constexpr ErrorCode Code = ErrorCode::DispatchNotPermitted;
+    /// How every such refusal's words begin; the endpoint completes it with its remedy.
+    static constexpr std::string_view Stem = "this endpoint runs no compile worker";
+};
+
+/// Whether a refusal says `NoCompileWorker`'s fact, in its code and in its words.
+/// @param code The code the refusal sends.
+/// @param message The words it sends.
+/// @return True when both are `NoCompileWorker`'s.
+[[nodiscard]] constexpr bool SaysNoCompileWorker(ErrorCode code, std::string_view message) noexcept
+{
+    return code == NoCompileWorker::Code && message.starts_with(NoCompileWorker::Stem);
+}
+
+/// Whether a surface's refusal row says `NoCompileWorker`'s fact.
+/// @param row The row.
+/// @return True when its code and its words are `NoCompileWorker`'s.
+[[nodiscard]] constexpr bool SaysNoCompileWorker(RefusedVerb const& row) noexcept
+{
+    return SaysNoCompileWorker(row.code, row.why);
+}
 
 /// Verbs that legitimately carry no fields at all.
 ///

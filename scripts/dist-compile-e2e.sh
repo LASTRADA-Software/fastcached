@@ -519,8 +519,15 @@ started_port=""
 start_node() {
     local tag="$1" host="$2" port="$3"
     shift 3
-    local log="${workdir}/${tag}.log" pid=""
-    "$node" "$stated_drain" --cluster-key-file="$cluster_key" \
+    local log="${workdir}/${tag}.log" pid="" arg=""
+    # The stated drain is a WORKER's setting, so a node running none (`--slots=0`,
+    # #206) is not handed it: it refuses a worker-only setting by name, and it has no
+    # compile to drain.
+    local drain=("$stated_drain")
+    for arg in ${@+"$@"}; do
+        if [ "$arg" = "--slots=0" ]; then drain=(); fi
+    done
+    "$node" ${drain[@]+"${drain[@]}"} --cluster-key-file="$cluster_key" \
         --listen-node="${host}:${port}" --advertise="${host}:${port}" \
         ${@+"$@"} > "$log" 2>&1 &
     pid=$!
@@ -860,12 +867,13 @@ if [[ "$mode" == "membership" ]]; then
     # @param 2 dispatch (`--listen-node`) port
     start_membership_scheduler() {
         local tag="$1" dispatch="$2"
+        # `--slots=0`: it runs no worker, so every lease lands on the worker under
+        # test and it names no `--scheduler` of its own to register with (#206).
         start_node "$tag" "$lan_address" "$dispatch" \
             "$no_local_cache" \
             --serve-scheduler \
             --fleet-member="$lan_address" \
-            --scheduler="${lan_address}:${dispatch}" \
-            --toolchain="scheduler-only=${compiler}" --slots=1 --log-level=debug
+            --slots=0 --log-level=debug
         wait_for_log "scheduling for the fleet" "$started_pid" "$tag" "$started_log"
     }
 
@@ -1294,19 +1302,18 @@ export FASTCACHE_ADDR="127.0.0.1:${cache_port}"
 # configuration, so it is refused at startup rather than discovered later as a
 # fleet that silently distributes nothing.
 #
-# It names a toolchain nothing here compiles with, deliberately. Every node is
-# both a peer and a possible scheduler, so it always registers as a worker too --
-# and a second MATCHING worker would make "which worker ran this job" a race,
-# which the cases below assert against by reading one worker's counters. That a
-# scheduler CAN also take work is the point of the architecture; it is simply not
-# what these cases are measuring.
+# It runs no worker, deliberately (`--slots=0`, #206). A scheduler is a worker
+# too unless told otherwise, and a second MATCHING worker would make "which
+# worker ran this job" a race, which the cases below assert against by reading
+# one worker's counters. That a scheduler CAN also take work is the point of the
+# architecture; it is simply not what these cases are measuring. Running none, it
+# registers with nobody, so it names no --scheduler of its own either.
 dispatch_port="$(free_port)"
 
 start_node "scheduler" 127.0.0.1 "$dispatch_port" \
     "$no_local_cache" \
     --serve-scheduler --fleet-open \
-    --scheduler="127.0.0.1:${dispatch_port}" \
-    --toolchain="scheduler-only=${compiler}" --slots=1 --log-level=debug
+    --slots=0 --log-level=debug
 scheduler_pid="$started_pid"
 
 wait_for_log "scheduling for the fleet" "$scheduler_pid" "scheduler" "${workdir}/scheduler.log"
@@ -1470,9 +1477,9 @@ echo "== case 3: fingerprint isolation"
 # one registered with it. Reusing the first scheduler would leave the matching
 # worker available and the case would pass without testing anything.
 #
-# The scheduler node names a toolchain nothing here uses, for the same reason:
-# a scheduler that also served the real compiler would be a second matching
-# worker, which is exactly what this case must not have.
+# The scheduler node runs no worker (`--slots=0`, #206), for the same reason: a
+# scheduler that also served the real compiler would be a second matching worker,
+# which is exactly what this case must not have.
 iso_cache_port="$(free_port)"
 iso_dispatch_port="$(free_port)"
 start_daemon "iso-daemon" 127.0.0.1 "$iso_cache_port" --log-level=info
@@ -1481,9 +1488,7 @@ iso_daemon_pid="$started_pid"
 start_node "iso-scheduler" 127.0.0.1 "$iso_dispatch_port" \
     "$no_local_cache" \
     --serve-scheduler --fleet-open \
-    --scheduler="127.0.0.1:${iso_dispatch_port}" \
-    --toolchain="also-not-the-compiler-this-client-uses=${compiler}" \
-    --slots=1 --log-level=debug
+    --slots=0 --log-level=debug
 
 iso_worker_port="$(free_port)"
 start_node "iso-worker" 127.0.0.1 "$iso_worker_port" \
@@ -1573,16 +1578,13 @@ cap_dispatch_port="$(free_port)"
 start_daemon "cap-daemon" 127.0.0.1 "$cap_cache_port" --log-level=info
 cap_daemon_pid="$started_pid"
 
-# The scheduler node names a toolchain nothing here compiles with, deliberately.
-# Every node is both a peer and a possible scheduler, so it always registers as a
-# worker too -- and a second MATCHING worker would give this fleet two slots when
-# the whole point of the case is that it has one.
+# The scheduler node runs no worker, deliberately (`--slots=0`, #206). A scheduler
+# is a worker too unless told otherwise, and a second MATCHING worker would give
+# this fleet two slots when the whole point of the case is that it has one.
 start_node "cap-scheduler" 127.0.0.1 "$cap_dispatch_port" \
     "$no_local_cache" \
     --serve-scheduler --fleet-open \
-    --scheduler="127.0.0.1:${cap_dispatch_port}" \
-    --toolchain="not-the-compiler-under-test=${compiler}" \
-    --slots=1 --log-level=debug
+    --slots=0 --log-level=debug
 
 cap_worker_port="$(free_port)"
 start_node "cap-worker" 127.0.0.1 "$cap_worker_port" \
@@ -1727,11 +1729,12 @@ cache_upstream_port="$(free_port)"
 start_daemon "tier-upstream" 127.0.0.1 "$cache_upstream_port" --log-level=info
 tier_upstream_pid="$started_pid"
 
+# A node that only caches, which is `--slots=0` (#206): no worker, so nothing to
+# register and no toolchain to name.
 start_node "tier-node" 127.0.0.1 "$cache_node_port" \
     --cache-memory=64m \
     --upstream="127.0.0.1:${cache_upstream_port}" \
-    --scheduler="127.0.0.1:${dispatch_port}" \
-    --toolchain="cache-node-only=${compiler}" --slots=1 --log-level=debug
+    --slots=0 --log-level=debug
 
 write_source "${proj}/nine.cpp" "casenine"
 "$compiler" -std=c++17 -O1 -c "${proj}/nine.cpp" -o "${proj}/build/nine-ref.o"     || fail "the case 9 reference compile failed"
@@ -1852,14 +1855,13 @@ echo "== case 11: a black-holed upstream does not stall a second client"
 
 blackhole_node_port="$(free_port)"
 
-# `--scheduler` is required whenever a worker surface is configured -- a worker
-# nothing knows about serves nobody, and the node refuses to start rather than
-# looking healthy. It points at the scheduler this run already has.
+# A node that only caches (`--slots=0`, #206). It runs no worker, so it names no
+# `--scheduler` to register with and no toolchain -- which it had to, a worker
+# nothing knows about being refused at startup, until a node could run none.
 start_node "blackhole-node" 127.0.0.1 "$blackhole_node_port" \
     --cache-memory=64m \
     --upstream="192.0.2.1:6674" \
-    --scheduler="127.0.0.1:${dispatch_port}" \
-    --toolchain="blackhole-node=${compiler}" --slots=1 --log-level=info
+    --slots=0 --log-level=info
 
 write_source "${proj}/eleven_a.cpp" "caseelevena"
 write_source "${proj}/eleven_b.cpp" "caseelevenb"

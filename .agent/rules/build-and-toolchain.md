@@ -5708,15 +5708,3 @@ is correct: an inclusion list naming this repository's own layout needs no roots
   recorded before it fires because the natural response to that refusal will be
   *the check is broken*, and it will not be: a red gate reads as "my branch is bad"
   rather than as an instrument asking a question nobody has answered yet.
-
-- **[#1387](https://github.com/LASTRADA-Software/fastcached/issues/1387)** —
-  `fastcache-compile-node`'s `WorkerBody` measures **59** against
-  `readability-function-cognitive-complexity.Threshold` of 60 under `WarningsAsErrors: "*"`,
-  so the next change adding one point to the worker's startup fails the build — and **the cost
-  lands on the wrong person**, since every contributor who spent the margin saw a passing
-  build. #1351 closed the same hazard for `main` (60 to 37, by making seven early-exit verbs a
-  table) and deliberately left `WorkerBody` untouched, recording it unchanged so the headroom
-  was visibly not bought by moving work sideways. Measured on `b5ff67f1` with the tool BUILD
-  named in the ticket. Not a request to raise the threshold: the threshold is global and cannot
-  hold a per-function margin, so a comment claiming one is maintained is worse than the bare
-  number.

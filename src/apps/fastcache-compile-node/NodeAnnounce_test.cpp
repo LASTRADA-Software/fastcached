@@ -33,9 +33,11 @@
 #include <vector>
 
 #include <tests/ScriptedSocket.hpp>
+#include <tests/Unwrap.hpp>
 
 using namespace FastCache;
 using namespace FastCache::Node;
+using FastCache::Testing::Unwrap;
 
 namespace
 {
@@ -340,6 +342,16 @@ constexpr auto HeartbeatOp = static_cast<std::uint8_t>(Wire::Op::Heartbeat);
     return decoded->load.cordoned;
 }
 
+/// The link a worker configured with @p schedulers holds.
+/// @param schedulers A non-empty `--scheduler` list.
+/// @return The link; the case fails when none could be built.
+[[nodiscard]] SchedulerLink LinkOver(std::vector<std::string> const& schedulers)
+{
+    auto const link = SchedulerLink::For(schedulers);
+    REQUIRE(link.has_value());
+    return Unwrap(link);
+}
+
 } // namespace
 
 TEST_CASE("A heartbeat carries the worker's cordon, and a lifted one carries serving", "[node][announce][cordon]")
@@ -399,7 +411,7 @@ TEST_CASE("A heartbeat round whose first scheduler is unreachable registers with
     // registration, and that it was the same round rather than the next one.
     AnnounceFixture fix;
     fix.cfg.schedulers = { std::string { FirstScheduler }, std::string { SecondScheduler } };
-    SchedulerLink link { fix.cfg.schedulers };
+    auto link = LinkOver(fix.cfg.schedulers);
 
     SECTION("the first is unreachable: the second is dialled and registers the worker")
     {
@@ -447,7 +459,7 @@ TEST_CASE("A NotLeader is followed to the endpoint it names, not to the next con
     // that refuses every verb.
     AnnounceFixture fix;
     fix.cfg.schedulers = { std::string { FirstScheduler }, std::string { SecondScheduler } };
-    SchedulerLink link { fix.cfg.schedulers };
+    auto link = LinkOver(fix.cfg.schedulers);
     Testing::ScriptedDialer dialer { { NotLeaderNaming(NamedLeader), RegisterOk("w-7") } };
 
     CHECK(AnnounceRound(fix.Round(), link, dialer) == 1);
@@ -462,7 +474,7 @@ TEST_CASE("A worker whose remembered leader stops answering falls back through t
     // in the SAME round -- past a first entry that is itself unreachable.
     AnnounceFixture fix;
     fix.cfg.schedulers = { std::string { FirstScheduler }, std::string { SecondScheduler } };
-    SchedulerLink link { fix.cfg.schedulers };
+    auto link = LinkOver(fix.cfg.schedulers);
     Testing::ScriptedDialer dialer { {
         NotLeaderNaming(NamedLeader),
         RegisterOk("w-7"), // round one: the leader takes the registration and is remembered

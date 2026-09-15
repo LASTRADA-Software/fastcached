@@ -144,12 +144,13 @@ namespace
                 // a dispatched compile arrives HERE and a node whose only component is
                 // its worker has nowhere else to answer.
                 //
-                // That leaves no configuration in which this port is not served. A node
-                // refuses to start with no toolchain to serve, so every node that runs
-                // answers compile verbs -- which is why the two-component test that
-                // stood here is gone rather than gaining a third clause. A predicate
-                // whose every branch returns the same answer is one that will drift
-                // away from the truth without anything noticing.
+                // That leaves no configuration in which this port is not served. Every
+                // node answers `--node-status` and live stats here, whatever else it runs
+                // -- a node started with `--slots=0` and running only consensus included
+                // (#206) -- and `StartNodeSurfaceOrExplain` counts those families too
+                // (`AnswersAnyFamily`), so the listener binds what this row names. A
+                // predicate whose every branch returns the same answer is one that will
+                // drift away from the truth without anything noticing.
                 //
                 // What that test used to protect is still true and now belongs to the
                 // components rather than to the port: `--cache-memory 0` with no
@@ -170,10 +171,10 @@ namespace
                     "--serve-scheduler -- the scheduler verbs. A bare "
                     "port binds loopback on a worker and the wildcard on a scheduler, because peers are "
                     "elsewhere by definition -- and the cache verbs answer this machine alone whichever it is, "
-                    "so widening it admits nobody new to them. Not bound at all by a node that neither holds a "
-                    "cache tier nor schedules. Scheduling is answered only while this node LEADS; a follower "
-                    "redirects and an election in progress refuses, so the port is open on every member whether "
-                    "or not it is answering today",
+                    "so widening it admits nobody new to them. Bound by every node that starts, whatever "
+                    "components it runs: --node-status and live stats are answered here. Scheduling is answered "
+                    "only while this node LEADS; a follower redirects and an election in progress refuses, so "
+                    "the port is open on every member whether or not it is answering today",
         },
         SurfaceRow {
             .surface = NodeSurface::Admin,

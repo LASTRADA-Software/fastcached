@@ -15,6 +15,7 @@
 #include <FastCache/Config/YamlReader.hpp>
 #include <FastCache/Core/Compression.hpp>
 #include <FastCache/Core/Logger.hpp>
+#include <FastCache/Core/Ranges.hpp>
 #include <FastCache/Platform/ServiceControl.hpp>
 
 #include <catch2/catch_test_macros.hpp>
@@ -666,6 +667,7 @@ TEST_CASE("NodeConfig: a discovery-off registration comes back with it still off
     // and nothing anywhere would say the registration had changed meaning.
     auto pinned = Installable();
     pinned.toolchainDiscovery = false;
+    pinned.toolchainDiscoveryExplicit = true;
     auto const spec = MakeNodeServiceSpec("/usr/bin/fastcache-compile-node", pinned);
     CHECK(std::ranges::contains(spec.arguments, "--no-toolchain-discovery"));
 
@@ -2317,17 +2319,38 @@ TEST_CASE("NodeConfig: a node class is parsed by name and refused by name", "[no
     CHECK(wrong.error().context.contains("dedicated"));
 }
 
-TEST_CASE("NodeConfig: a reserve of zero parses, unlike a slot count of zero", "[node][cli]")
+TEST_CASE("NodeConfig: a slot count of zero parses, and is a different answer from omitting it", "[node][cli]")
 {
-    // The two flags differ deliberately. Zero slots is a worker that can do nothing
-    // and is refused; zero reserved cores is a real instruction -- drive this machine
-    // to its last core -- and is distinct from not passing the flag at all.
-    auto const none = ParseNodeArgv({ "--scheduler=s:1", "--toolchain=/usr/bin/cc", "--reserve-cores=0" });
-    REQUIRE(none.has_value());
-    REQUIRE(none->reservedCores.has_value());
-    CHECK(Unwrap(none->reservedCores) == 0U);
+    // #206. Zero slots used to be refused, because zero was this field's own spelling of
+    // "derive from the machine" -- which left no way to offer the fleet nothing at all.
+    // That answer is now the field's ABSENCE, so zero means what it says: a node running
+    // no worker. Three values, and the pair that matters is the last two, since a build
+    // folding them back together passes the other two.
+    auto const omitted = ParseNodeArgv({ "--scheduler=s:1" });
+    REQUIRE(omitted.has_value());
+    CHECK_FALSE(omitted->slots.has_value());
+    CHECK(RunsWorker(*omitted));
 
-    CHECK_FALSE(ParseNodeArgv({ "--scheduler=s:1", "--toolchain=/usr/bin/cc", "--slots=0" }).has_value());
+    auto const four = ParseNodeArgv({ "--scheduler=s:1", "--slots=4" });
+    REQUIRE(four.has_value());
+    CHECK(four->slots == std::optional<std::uint32_t> { 4 });
+    CHECK(RunsWorker(*four));
+
+    auto const none = ParseNodeArgv({ "--slots=0", "--serve-scheduler" });
+    REQUIRE(none.has_value());
+    CHECK(none->slots == std::optional<std::uint32_t> { 0 });
+    CHECK_FALSE(RunsWorker(*none));
+
+    // A reserve of zero is the same shape one flag over, and it is still its own
+    // instruction: drive this machine to its last core.
+    auto const reserve = ParseNodeArgv({ "--scheduler=s:1", "--toolchain=/usr/bin/cc", "--reserve-cores=0" });
+    REQUIRE(reserve.has_value());
+    CHECK(reserve->reservedCores == std::optional<std::uint32_t> { 0 });
+
+    // What is not a number is still refused, and says what it was given.
+    auto const junk = ParseNodeArgv({ "--scheduler=s:1", "--slots=many" });
+    REQUIRE_FALSE(junk.has_value());
+    CHECK(junk.error().context.contains("many"));
 }
 
 TEST_CASE("NodeConfig: the discovery reply port is pinned by name and needs discovery", "[node][cli]")
@@ -2388,6 +2411,47 @@ TEST_CASE("NodeConfig: the discovery reply port is pinned by name and needs disc
     auto const refusal = StartupPolicyRejection(collided);
     REQUIRE(refusal.has_value());
     CHECK(Unwrap(refusal).contains("--discovery-reply-port"));
+}
+
+TEST_CASE("NodeConfig: a node told to offer nothing is never sized as a worker", "[node][capacity]")
+{
+    // #206, in the direction a mistake fails. `OfferableSlots` DERIVES a count when the
+    // operator named none, so a `--slots=0` that reached it as "named nothing" would
+    // build a full worker on the machine an operator had just excluded -- registered,
+    // leased and compiling, with nothing anywhere saying so. `WorkerSlotsOf` is the one
+    // door from the flag to that function, and on this node it answers nothing at all.
+    NodeConfig cfg;
+    cfg.nodeClass = Distributed::NodeClass::Dedicated;
+    FakeHost const server { 16, 64ULL << 30 };
+    auto const capacity = NodeCapacityOf(cfg, server, NoCacheTier);
+
+    // The control: the same machine naming nothing is a sixteen-slot worker, so the
+    // absent answer below is the flag's doing and not the machine's.
+    CHECK(WorkerSlotsOf(cfg, capacity) == std::optional<std::uint32_t> { 16 });
+
+    cfg.slots = 4;
+    CHECK(WorkerSlotsOf(cfg, capacity) == std::optional<std::uint32_t> { 4 });
+
+    cfg.slots = 0;
+    CHECK_FALSE(RunsWorker(cfg));
+    CHECK_FALSE(WorkerSlotsOf(cfg, capacity).has_value());
+}
+
+TEST_CASE("NodeConfig: a node running no worker says so on its readiness line", "[node][capacity]")
+{
+    // #206. The line an operator reads to confirm a node came up said "0 slot(s) as a
+    // workstation node, identifying 0 toolchain(s)" on a node running no worker, which
+    // describes a worker serving nothing rather than the machine that was configured.
+    NodeConfig cfg;
+    cfg.nodeClass = Distributed::NodeClass::Dedicated;
+
+    // The worker's words are unchanged: `dist-compile-e2e.sh` reads a derived slot count
+    // out of "<n> slot(s) as a dedicated node".
+    CHECK(WorkerReadinessPhrase(cfg, 16, 3) == "16 slot(s) as a dedicated node, identifying 3 toolchain(s)");
+
+    auto const none = WorkerReadinessPhrase(cfg, std::nullopt, 0);
+    CHECK(none == "running no worker");
+    CHECK_FALSE(none.contains("slot(s)"));
 }
 
 TEST_CASE("NodeConfig: a node is sized from its hardware and its class", "[node][capacity]")
@@ -3467,6 +3531,23 @@ TEST_CASE("NodeConfig: a setting in the file takes effect", "[node][config]")
     CHECK(merged->slots == 9);
     CHECK(merged->toolchains == std::vector<std::string> { "/usr/bin/g++", "/usr/bin/clang++" });
     CHECK_FALSE(merged->toolchainDiscovery);
+}
+
+TEST_CASE("NodeConfig: a file's slots: 0 runs no worker, exactly as the flag does", "[node][config]")
+{
+    // The same applier from both sources, which is the rule a file follows -- so a file
+    // cannot be the one place zero still means "derive" (#206).
+    auto const fromFile = FromFileAndArgv({ Setting("slots", { "0" }), Setting("serve_scheduler", { "true" }) }, {});
+    REQUIRE(fromFile.has_value());
+    CHECK(fromFile->slots == std::optional<std::uint32_t> { 0 });
+    CHECK_FALSE(RunsWorker(*fromFile));
+
+    // And a count on the command line still wins over the file's zero, which is the
+    // precedence every other setting has.
+    auto const overridden = FromFileAndArgv({ Setting("slots", { "0" }) }, { "--scheduler=s:1", "--slots=8" });
+    REQUIRE(overridden.has_value());
+    CHECK(overridden->slots == std::optional<std::uint32_t> { 8 });
+    CHECK(RunsWorker(*overridden));
 }
 
 TEST_CASE("NodeConfig: the command line wins over the file", "[node][config]")
@@ -5411,4 +5492,266 @@ TEST_CASE("A registration carries the codec by name, not by number", "[node][con
 
     auto const spec = MakeNodeServiceSpec("/usr/bin/fastcache-compile-node", *parsed);
     CHECK(std::ranges::any_of(spec.arguments, [](std::string const& arg) { return arg == "--memory-compression=zstd"; }));
+}
+
+namespace
+{
+
+/// A machine that only schedules (#206): no worker, a scheduler, a member list, and
+/// the default cache tier. Everything a worker would need -- a `--scheduler` to
+/// register with, an `--advertise`, a toolchain -- deliberately absent.
+[[nodiscard]] NodeConfig SchedulerOnly()
+{
+    NodeConfig cfg;
+    cfg.slots = 0;
+    cfg.serveScheduler = true;
+    cfg.nodeListen = "0.0.0.0:6674";
+    cfg.fleetMembers = { "10.0.0.2" };
+    return cfg;
+}
+
+} // namespace
+
+namespace
+{
+
+/// A value that names one worker-only setting, for the case below.
+struct WorkerSettingSample
+{
+    std::string_view flag;  ///< The row's `primary`.
+    std::string_view value; ///< A value its parser accepts; empty for a flag without one.
+};
+
+/// One sample per worker-only row, because naming a setting takes a VALUE and no column
+/// carries one. The SET under test is still the column's: the case walks the union of
+/// these and the scoped rows, so a row scoped with no sample here and a sample whose row
+/// is not scoped both turn that flag's own section red.
+constexpr auto WorkerSettingSamples = std::to_array<WorkerSettingSample>({
+    { .flag = "--toolchain", .value = "/usr/bin/g++" },
+    { .flag = "--allow-compile-arg", .value = "-fno-semantic-interposition" },
+    { .flag = "--no-toolchain-discovery", .value = {} },
+    { .flag = "--node-class", .value = "dedicated" },
+    // Not the default, so this section is about the column; typing the DEFAULT is the
+    // provenance case below.
+    { .flag = "--drain-timeout", .value = "45" },
+    { .flag = "--reserve-cores", .value = "2" },
+});
+
+/// @p flag spelled on a command line, with its sample value when it takes one.
+/// @param sample The sample.
+/// @return The argument.
+[[nodiscard]] std::string Spelled(WorkerSettingSample const& sample)
+{
+    return sample.value.empty() ? std::string { sample.flag } : std::format("{}={}", sample.flag, sample.value);
+}
+
+} // namespace
+
+TEST_CASE("NodeConfig: a node running no worker is refused every setting only a worker reads", "[node][config][policy]")
+{
+    // #206. A setting only the worker reads is inert on a node running none: accepted, and
+    // reaching nothing. The set is `NodeOptions()`'s component column, refused by ONE
+    // generated rule, and each flag is its own section so a row that loses its column
+    // fails by name.
+    std::vector<std::string_view> flags;
+    for (auto const& spec: NodeOptions())
+        if (spec.component == &WorkerComponent)
+            flags.push_back(spec.primary);
+    for (auto const& sample: WorkerSettingSamples)
+        if (std::ranges::find(flags, sample.flag) == flags.end())
+            flags.push_back(sample.flag);
+    // The walk found the column at all: an empty set would pass every section vacuously.
+    REQUIRE(flags.size() >= WorkerSettingSamples.size());
+
+    // The two bases, each accepted on its own, so a refusal below is the flag's doing.
+    // A node running no worker needs something else to run, and the default cache tier is
+    // that; the worker needs a scheduler and, for `--no-toolchain-discovery`, a toolchain.
+    auto const noWorkerBase = ParseNodeArgv({ "--slots=0" });
+    REQUIRE(noWorkerBase.has_value());
+    REQUIRE_FALSE(StartupPolicyRejection(*noWorkerBase).has_value());
+    auto const workerBase = ParseNodeArgv({ "--scheduler=s:1", "--toolchain=/usr/bin/g++" });
+    REQUIRE(workerBase.has_value());
+    REQUIRE_FALSE(StartupPolicyRejection(*workerBase).has_value());
+
+    for (auto const flag: flags)
+    {
+        DYNAMIC_SECTION(flag)
+        {
+            auto const* const sample = FindOrNull(WorkerSettingSamples, flag, &WorkerSettingSample::flag);
+            REQUIRE(sample != nullptr);
+            auto const* const row = FindOrNull(NodeOptions(), flag, &OptionSpec<NodeConfig>::primary);
+            REQUIRE(row != nullptr);
+            CHECK(row->component == &WorkerComponent);
+
+            auto const spelled = Spelled(*sample);
+            auto const noWorker = ParseNodeArgv({ "--slots=0", spelled.c_str() });
+            REQUIRE(noWorker.has_value());
+            auto const refusal = StartupPolicyRejection(*noWorker);
+            REQUIRE(refusal.has_value());
+            // WHICH refusal: the generated one, naming this flag.
+            CHECK(Unwrap(refusal) == UnrunComponentRefusal(*row));
+            CHECK(NodeInstallRejection(*noWorker) == refusal);
+
+            // The control: the same flag on a worker is an ordinary setting.
+            auto const worker = ParseNodeArgv({ "--scheduler=s:1", "--toolchain=/usr/bin/g++", spelled.c_str() });
+            REQUIRE(worker.has_value());
+            CHECK_FALSE(StartupPolicyRejection(*worker).has_value());
+        }
+    }
+}
+
+TEST_CASE("NodeConfig: a worker-only setting typed at its default is still named", "[node][config][policy]")
+{
+    // #206. Whether a setting was NAMED is provenance: the bit the parse records, or a
+    // field empty by type. Never the value compared against a default, which cannot see
+    // the operator who typed the default -- and a node running no worker told
+    // `--drain-timeout=30` has named a worker's setting exactly as one told `=45` has.
+    NodeConfig const defaults;
+
+    SECTION("a row carrying a bit, typed at its default")
+    {
+        auto const typed = std::format("--drain-timeout={}", defaults.drainTimeoutSeconds);
+        auto const named = ParseNodeArgv({ "--slots=0", typed.c_str() });
+        REQUIRE(named.has_value());
+        REQUIRE(named->drainTimeoutSeconds == defaults.drainTimeoutSeconds);
+        auto const refusal = StartupPolicyRejection(*named);
+        REQUIRE(refusal.has_value());
+        CHECK(Unwrap(refusal).starts_with("--drain-timeout configures the worker"));
+
+        auto const classed = ParseNodeArgv({ "--slots=0", "--node-class=workstation" });
+        REQUIRE(classed.has_value());
+        REQUIRE(classed->nodeClass == defaults.nodeClass);
+        auto const classRefusal = StartupPolicyRejection(*classed);
+        REQUIRE(classRefusal.has_value());
+        CHECK(Unwrap(classRefusal).starts_with("--node-class configures the worker"));
+    }
+
+    SECTION("a row empty by type, given the value zero")
+    {
+        auto const named = ParseNodeArgv({ "--slots=0", "--reserve-cores=0" });
+        REQUIRE(named.has_value());
+        auto const refusal = StartupPolicyRejection(*named);
+        REQUIRE(refusal.has_value());
+        CHECK(Unwrap(refusal).starts_with("--reserve-cores configures the worker"));
+    }
+
+    SECTION("a default configuration names none of them")
+    {
+        // What makes presence provenance for the rows carrying no bit: their field is
+        // empty until named, which `EmptyByType` cannot see -- it checks the TYPE. This is
+        // the check that does, and a default that were not empty is refused here by name.
+        for (auto const& spec: NodeOptions())
+            if (spec.component != nullptr)
+            {
+                INFO("flag: " << spec.primary);
+                CHECK_FALSE(NamesSetting(spec, defaults));
+            }
+
+        // The planted row that proves it: a string whose type can be empty and whose
+        // default is not, scoped through `PresentIn`. It compiles, and this reading refuses it.
+        constexpr OptionSpec<NodeConfig> planted { .primary = "--planted",
+                                                   .description = "a scoped row whose default is a value",
+                                                   .component = &WorkerComponent,
+                                                   .present = PresentIn<&NodeConfig::clusterId>() };
+        REQUIRE_FALSE(defaults.clusterId.empty());
+        CHECK(NamesSetting(planted, defaults));
+    }
+}
+
+TEST_CASE("NodeConfig: a file's no_toolchain_discovery: false names no worker setting", "[node][config][policy]")
+{
+    // #206 review. A presence flag's `false` in a file passes nothing, and provenance
+    // follows the applier: it sets no bit. With the bit set, `slots: 0` beside it was
+    // refused for a worker setting nobody gave, at start and at every reload.
+    auto const off = FromFileAndArgv({ Setting("slots", { "0" }), Setting("no_toolchain_discovery", { "false" }) }, {});
+    REQUIRE(off.has_value());
+    CHECK_FALSE(off->toolchainDiscoveryExplicit);
+    CHECK(off->toolchainDiscovery);
+    CHECK_FALSE(StartupPolicyRejection(*off).has_value());
+    // And nothing reaches a registration built from it.
+    auto const spec = MakeNodeServiceSpec("/usr/bin/fastcache-compile-node", *off);
+    CHECK_FALSE(std::ranges::contains(spec.arguments, "--no-toolchain-discovery"));
+
+    // The control: `true` IS the flag, on a node running no worker.
+    auto const on = FromFileAndArgv({ Setting("slots", { "0" }), Setting("no_toolchain_discovery", { "true" }) }, {});
+    REQUIRE(on.has_value());
+    CHECK(on->toolchainDiscoveryExplicit);
+    auto const refusal = StartupPolicyRejection(*on);
+    REQUIRE(refusal.has_value());
+    CHECK(Unwrap(refusal).starts_with("--no-toolchain-discovery configures the worker"));
+}
+
+TEST_CASE("NodeConfig: a node running no worker may name a scheduler", "[node][config][policy]")
+{
+    // #206. On a node running no worker `--scheduler` registers nothing: it is where the
+    // `--cluster-*` and `--enroll-*` commands run on this machine ask, and a machine-wide
+    // file carries it for them. So a scheduling machine naming its own scheduler starts
+    // and installs -- on a wildcard bind with a member list, which is the shape the four
+    // advertise rows judge for a worker.
+    auto schedulerOnly = SchedulerOnly();
+    schedulerOnly.schedulers = { std::string { SelfScheduler } };
+    CHECK_FALSE(StartupPolicyRejection(schedulerOnly).has_value());
+    CHECK_FALSE(NodeInstallRejection(schedulerOnly).has_value());
+
+    // The control: the same configuration running a worker IS judged by those rows, which
+    // is what keeps the case from passing because nothing looks at this shape at all.
+    auto worker = schedulerOnly;
+    worker.slots.reset();
+    auto const workerRefusal = StartupPolicyRejection(worker);
+    REQUIRE(workerRefusal.has_value());
+    CHECK(Unwrap(workerRefusal).contains("--advertise names no address they can dial"));
+
+    // And a worker with no scheduler is still refused, by the table's last row.
+    auto unregistered = Installable();
+    unregistered.schedulers.clear();
+    auto const refusal = StartupPolicyRejection(unregistered);
+    REQUIRE(refusal.has_value());
+    CHECK(Unwrap(refusal).starts_with("--scheduler is required"));
+}
+
+TEST_CASE("NodeConfig: a node running nothing at all is refused", "[node][config][policy]")
+{
+    auto nothing = SchedulerOnly();
+    nothing.serveScheduler = false;
+    nothing.fleetMembers.clear();
+    nothing.cacheMemoryBytes = 0;
+    auto const refusal = StartupPolicyRejection(nothing);
+    REQUIRE(refusal.has_value());
+    CHECK(Unwrap(refusal) == NodeRunsNothingRefusal);
+
+    // Any ONE component is enough, and a cache alone is an ordinary cache node.
+    auto cacheOnly = nothing;
+    cacheOnly.cacheMemoryBytes = 64ULL << 20;
+    CHECK_FALSE(StartupPolicyRejection(cacheOnly).has_value());
+}
+
+TEST_CASE("NodeConfig: the install rows that ask for a worker's settings skip a node running none", "[node][config][policy]")
+{
+    // No `--scheduler`, no `--advertise`, no toolchain -- the three install rows a worker
+    // must satisfy -- and the registration is accepted.
+    CHECK_FALSE(NodeInstallRejection(SchedulerOnly()).has_value());
+
+    auto worker = Installable();
+    worker.schedulers.clear();
+    auto const workerRefusal = NodeInstallRejection(worker);
+    REQUIRE(workerRefusal.has_value());
+    CHECK(Unwrap(workerRefusal).starts_with("--scheduler is required to install a service"));
+}
+
+TEST_CASE("NodeConfig: a registration replays --slots=0, and omits a count nobody typed", "[node][service]")
+{
+    // A registration replays its command line at every boot, and the two spellings here
+    // are opposite machines since #206: omitted is a worker sized from its hardware, and
+    // zero is a node that runs none. A registration that dropped the zero would turn a
+    // scheduler-only box into a worker at its first reboot.
+    auto const worker = MakeNodeServiceSpec(std::filesystem::path { "fastcache-compile-node" }, Installable());
+    CHECK_FALSE(std::ranges::any_of(worker.arguments, [](std::string const& arg) { return FlagMatches(arg, "--slots"); }));
+
+    auto const spec = MakeNodeServiceSpec(std::filesystem::path { "fastcache-compile-node" }, SchedulerOnly());
+    CHECK(std::ranges::contains(spec.arguments, std::string { "--slots=0" }));
+
+    auto const reparsed = ReparseSpec(spec);
+    REQUIRE(reparsed.has_value());
+    CHECK(reparsed->slots == std::optional<std::uint32_t> { 0 });
+    CHECK_FALSE(RunsWorker(*reparsed));
 }

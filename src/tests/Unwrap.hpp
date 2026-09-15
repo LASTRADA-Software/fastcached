@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <concepts>
+#include <cstdlib>
 #include <optional>
 
 namespace FastCache::Testing
@@ -43,6 +45,7 @@ namespace FastCache::Testing
 /// @param value The optional to read.
 /// @return A reference to its value, or to a shared default-constructed one.
 template <typename T>
+    requires std::default_initializable<T>
 [[nodiscard]] T const& Unwrap(std::optional<T> const& value)
 {
     // A single shared instance rather than a temporary, because a reference to a
@@ -50,6 +53,24 @@ template <typename T>
     // `REQUIRE` that precedes every call fails the test first.
     static T const absent {};
     return value.has_value() ? *value : absent;
+}
+
+/// `Unwrap` for a type that has no default value to stand in for an absent one.
+///
+/// A type whose construction is guarded -- `Node::SchedulerLink`, which cannot be built
+/// from an empty list (#206) -- offers nothing a shared `absent` instance could be. The
+/// guard the analysis needs is the same one, and an empty optional here is unreachable
+/// for the same reason: the `REQUIRE` before every call has already failed the test, so
+/// what would follow is not an assertion but a defect in the case itself, and it stops.
+/// @param value The optional, already `REQUIRE`d to hold a value.
+/// @return A reference to its value.
+template <typename T>
+    requires(!std::default_initializable<T>)
+[[nodiscard]] T const& Unwrap(std::optional<T> const& value)
+{
+    if (!value.has_value())
+        std::abort();
+    return *value;
 }
 
 } // namespace FastCache::Testing

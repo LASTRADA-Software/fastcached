@@ -67,14 +67,13 @@ std::expected<std::unique_ptr<NodeFrameSurface>, std::string> StartNodeSurfaceOr
     // that would not open has already stopped startup, and a tier the row expects but
     // that does not exist would leave this listener answering `UnimplementedVerb` to
     // every FETCH behind an open port.
-    // **`node` is deliberately NOT one of the conditions.** It is non-null on every
-    // built node, so including it here would make this guard unsatisfiable and open a
-    // port on a node that serves nothing -- the operator verbs are worth answering on a
-    // node that is doing something, not a reason to start listening. A node with no
-    // components still serves no port, exactly as before this family existed.
-    if (components.cache == nullptr && components.scheduler == nullptr && components.compile == nullptr)
+    //
+    // Every family counts (`AnswersAnyFamily`), the operator verbs included: a node
+    // running only consensus is watched through them, and the startup table has already
+    // refused a node that runs nothing at all (#206).
+    if (!AnswersAnyFamily(components))
     {
-        logger.Logf(LogLevel::Info, "no cache tier, no scheduler and no worker; serving no 0xFC port");
+        logger.Logf(LogLevel::Info, "no component answers any verb family; serving no 0xFC port");
         return std::unique_ptr<NodeFrameSurface> {};
     }
     // Asked BEFORE the row, because under activation the row answers about a flag

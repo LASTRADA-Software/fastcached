@@ -224,11 +224,10 @@ class EnrollmentResponder final: public IFrameResponder
     /// regardless of anything on this page: the 1024-byte cap is enforced per VERB.
     ///
     /// It called this "the SURFACE's ceiling". It is not one:
-    /// `MergedResponder::Largest` folds `_cache`, `_scheduler` and `_compile`, and this
-    /// responder is not among them, so on the merged listener this number is not
-    /// consulted. Saying *surface* of a value the surface never reads is the kind of
-    /// claim that makes the pre-auth bound look like it rests here, when it rests on the
-    /// verb's own row.
+    /// `MergedResponder::Largest` folds every owner but this one, so on the merged
+    /// listener this number is not consulted. Saying *surface* of a value the surface
+    /// never reads is the kind of claim that makes the pre-auth bound look like it rests
+    /// here, when it rests on the verb's own row.
     [[nodiscard]] std::size_t MaxRequestBytes() const noexcept override
     {
         return CompileCacheWire::MaxControlPayload;
@@ -237,10 +236,10 @@ class EnrollmentResponder final: public IFrameResponder
     /// A handful: one operator and however many machines are enrolling at once.
     ///
     /// **This number protects nothing, and must not be read as a narrowing.**
-    /// `MergedResponder::Largest` folds `_cache`, `_scheduler` and `_compile`; this
-    /// responder is in no fold, so on the merged listener nothing reads it. And `Largest`
-    /// is a MAXIMUM: folded in, a small value here would still change nothing, while a
-    /// larger one would widen the connection cap of the cache and compile surfaces too.
+    /// `MergedResponder::Largest` folds every owner but this one, so on the merged
+    /// listener nothing reads it. And `Largest` is a MAXIMUM: folded in, a small value
+    /// here would still change nothing, while a larger one would widen the connection cap
+    /// of the cache and compile surfaces too.
     /// Two edits that each read as reasonable compose into exactly that -- folding this
     /// member in (looks like the obvious repair, changes nothing) and then raising the
     /// number (looks like tuning, widens three surfaces).
@@ -248,8 +247,9 @@ class EnrollmentResponder final: public IFrameResponder
     /// **A per-component narrowing is not expressible at this seam at all.**
     /// `RequestTimeout` and `HoldsOwnByteBudget` route to the owner because they are
     /// properties of the VERB. Connections and in-flight bytes are properties of one
-    /// listener, one accept queue and one byte budget, so they cannot be per-component
-    /// and a max is the only coherent fold over them. The number below is this
+    /// listener, one accept queue and one byte budget, so they cannot be per-component:
+    /// the surface folds them, a maximum over the owners a node may or may not run and a
+    /// sum only over the operator families every node runs side by side. The number below is this
     /// responder's own honest answer and nothing more; it is a pure virtual, so it
     /// cannot simply be dropped.
     ///

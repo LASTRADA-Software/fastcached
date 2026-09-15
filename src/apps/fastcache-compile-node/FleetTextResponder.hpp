@@ -103,7 +103,8 @@ class FleetTextResponder final: public IFrameResponder
     /// @copydoc IFrameResponder::MaxOpenConnections
     ///
     /// `NodeStatusResponder`'s modest figure, for its reason: a terminal opens one connection and
-    /// closes it.
+    /// closes it. ADDED by `MergedResponder` to the other operator families', for that responder's
+    /// reason too: the three coexist on every port.
     [[nodiscard]] std::size_t MaxOpenConnections() const noexcept override
     {
         return 32;

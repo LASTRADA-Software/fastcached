@@ -4,6 +4,9 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <cstdint>
+#include <optional>
+
 using namespace FastCache::Distributed;
 using namespace FastCache::Distributed::Testing;
 
@@ -16,7 +19,7 @@ TEST_CASE("A machine nobody classified is treated as somebody's desk", "[distrib
     constexpr NodeCapacity unclassified { .logicalCores = 8 };
 
     CHECK(unclassified.nodeClass == NodeClass::Workstation);
-    CHECK(OfferableSlots(unclassified, 0) == 6); // 8 cores, 2 held back
+    CHECK(OfferableSlots(unclassified, std::nullopt) == 6); // 8 cores, 2 held back
 }
 
 TEST_CASE("A dedicated machine is driven to its limit", "[distributed][nodepolicy]")
@@ -25,7 +28,7 @@ TEST_CASE("A dedicated machine is driven to its limit", "[distributed][nodepolic
     // whole reason the class exists rather than one reserve for everybody.
     constexpr NodeCapacity server { .logicalCores = 64, .nodeClass = NodeClass::Dedicated };
 
-    CHECK(OfferableSlots(server, 0) == 64);
+    CHECK(OfferableSlots(server, std::nullopt) == 64);
 }
 
 TEST_CASE("A small workstation still offers one slot", "[distributed][nodepolicy]")
@@ -33,13 +36,13 @@ TEST_CASE("A small workstation still offers one slot", "[distributed][nodepolicy
     // Saturating rather than wrapping. A two-core workstation reserving two cores
     // must offer one, not 4294967295 -- and a node that offered ZERO would register,
     // heartbeat, never be picked, and look exactly like a fleet that is permanently
-    // busy. That is the failure the zero-slot registration refusal exists to
-    // prevent, arriving by arithmetic instead of by configuration.
+    // busy. A derived count therefore saturates at one; the only zero is an
+    // operator's, and a node given that registers nothing at all (#206).
     constexpr NodeCapacity dualCore { .logicalCores = 2 };
-    CHECK(OfferableSlots(dualCore, 0) == 1);
+    CHECK(OfferableSlots(dualCore, std::nullopt) == 1);
 
     constexpr NodeCapacity singleCore { .logicalCores = 1 };
-    CHECK(OfferableSlots(singleCore, 0) == 1);
+    CHECK(OfferableSlots(singleCore, std::nullopt) == 1);
 }
 
 TEST_CASE("A machine that reported no cores is treated as having one", "[distributed][nodepolicy]")
@@ -47,7 +50,7 @@ TEST_CASE("A machine that reported no cores is treated as having one", "[distrib
     // Refusing to schedule onto it would punish a worker for a fact it merely failed
     // to collect. One slot is the answer that is never wrong by much.
     constexpr NodeCapacity silent { .logicalCores = 0, .nodeClass = NodeClass::Dedicated };
-    CHECK(OfferableSlots(silent, 0) == 1);
+    CHECK(OfferableSlots(silent, std::nullopt) == 1);
 }
 
 TEST_CASE("An explicit slot count is the answer, not a hint", "[distributed][nodepolicy]")
@@ -63,14 +66,27 @@ TEST_CASE("An explicit slot count is the answer, not a hint", "[distributed][nod
     constexpr NodeCapacity workstation { .logicalCores = 16 };
     constexpr NodeCapacity server { .logicalCores = 16, .nodeClass = NodeClass::Dedicated };
 
-    CHECK(OfferableSlots(server, 4) == 4);
-    CHECK(OfferableSlots(workstation, 4) == 4);
-    CHECK(OfferableSlots(server, 64) == 64);
+    CHECK(OfferableSlots(server, std::optional<std::uint32_t> { 4 }) == 4);
+    CHECK(OfferableSlots(workstation, std::optional<std::uint32_t> { 4 }) == 4);
+    CHECK(OfferableSlots(server, std::optional<std::uint32_t> { 64 }) == 64);
 
     // Including past what the memory would otherwise allow: an operator who names a
     // number has overridden the heuristic, not asked it to arbitrate.
     constexpr NodeCapacity cramped { .logicalCores = 64, .totalMemoryBytes = 4ULL << 30 };
-    CHECK(OfferableSlots(cramped, 32) == 32);
+    CHECK(OfferableSlots(cramped, std::optional<std::uint32_t> { 32 }) == 32);
+}
+
+TEST_CASE("An operator's zero offers zero slots rather than a derived count", "[distributed][nodepolicy]")
+{
+    // #206. Zero used to be this function's spelling of "the operator named nothing",
+    // so the obvious way to ask for a node that offers nothing -- `--slots=0` -- was the
+    // one value that produced a FULL worker. Absent and zero are now two values, and the
+    // pair below is what separates them: a build that folded them back together passes
+    // the derived half and fails the zero, in the direction that fails closed.
+    constexpr NodeCapacity server { .logicalCores = 16, .nodeClass = NodeClass::Dedicated };
+
+    CHECK(OfferableSlots(server, std::nullopt) == 16);
+    CHECK(OfferableSlots(server, std::optional<std::uint32_t> { 0 }) == 0);
 }
 
 TEST_CASE("A machine with more cores than memory is sized by its memory", "[distributed][nodepolicy]")
@@ -81,14 +97,14 @@ TEST_CASE("A machine with more cores than memory is sized by its memory", "[dist
     // locally, so distribution appears to work while making the build slower than
     // not distributing at all.
     constexpr NodeCapacity cramped { .logicalCores = 64, .totalMemoryBytes = 8ULL << 30, .nodeClass = NodeClass::Dedicated };
-    CHECK(OfferableSlots(cramped, 0) == 8);
+    CHECK(OfferableSlots(cramped, std::nullopt) == 8);
 
     // The reserve comes off AFTER the clamp, which is what the operator's promise
     // means: two threads stay out of the fleet's hands whichever ceiling bound
     // first. Subtracting before would let the memory clamp satisfy the promise on
     // paper while the machine still ran a compile on every core.
     constexpr NodeCapacity crampedDesk { .logicalCores = 64, .totalMemoryBytes = 8ULL << 30 };
-    CHECK(OfferableSlots(crampedDesk, 0) == 6);
+    CHECK(OfferableSlots(crampedDesk, std::nullopt) == 6);
 }
 
 TEST_CASE("Memory only ever lowers the count, and silence lowers nothing", "[distributed][nodepolicy]")
@@ -97,14 +113,14 @@ TEST_CASE("Memory only ever lowers the count, and silence lowers nothing", "[dis
     // must not bind there -- a clamp that fires on healthy machines is one nobody
     // can trust when it fires on a sick one.
     constexpr NodeCapacity ample { .logicalCores = 16, .totalMemoryBytes = 64ULL << 30, .nodeClass = NodeClass::Dedicated };
-    CHECK(OfferableSlots(ample, 0) == 16);
+    CHECK(OfferableSlots(ample, std::nullopt) == 16);
 
     // Absent is not zero. A machine that could not read its own memory is scheduled
     // on its other properties; reading "0 bytes" literally would clamp every such
     // node to one slot for a fact it merely failed to collect.
     CHECK_FALSE(MemorySlotCeiling(0).has_value());
     constexpr NodeCapacity silent { .logicalCores = 16, .totalMemoryBytes = 0, .nodeClass = NodeClass::Dedicated };
-    CHECK(OfferableSlots(silent, 0) == 16);
+    CHECK(OfferableSlots(silent, std::nullopt) == 16);
 
     // And a machine with less than one budget's worth still offers one rather than
     // none, for the reason every other floor here exists.
@@ -129,15 +145,15 @@ TEST_CASE("An explicit reserve overrides the class default", "[distributed][node
     // knows their machine must be able to say so. `reserveIsExplicit` is what tells
     // "leave 0 free" apart from "did not say", which a bare 0 cannot.
     constexpr NodeCapacity generous { .logicalCores = 16, .reservedCores = 8, .reserveIsExplicit = true };
-    CHECK(OfferableSlots(generous, 0) == 8);
+    CHECK(OfferableSlots(generous, std::nullopt) == 8);
 
     constexpr NodeCapacity none { .logicalCores = 16, .reservedCores = 0, .reserveIsExplicit = true };
-    CHECK(OfferableSlots(none, 0) == 16);
+    CHECK(OfferableSlots(none, std::nullopt) == 16);
 
     // And a workstation that did NOT say still gets the class default rather than
     // the zero its field happens to hold.
     constexpr NodeCapacity silent { .logicalCores = 16 };
-    CHECK(OfferableSlots(silent, 0) == 14);
+    CHECK(OfferableSlots(silent, std::nullopt) == 14);
 }
 
 TEST_CASE("A class is named, and an unknown name is refused", "[distributed][nodepolicy]")
@@ -158,7 +174,7 @@ TEST_CASE("A machine somebody else is using withdraws that capacity", "[distribu
     // two cores free permanently; this is what happens when its owner starts using
     // six more of them.
     constexpr NodeCapacity desk { .logicalCores = 16 };
-    constexpr auto registered = OfferableSlots(desk, 0); // 14
+    constexpr auto registered = OfferableSlots(desk, std::nullopt); // 14
     static_assert(registered == 14);
 
     // Half the machine busy, nothing of it ours: eight of the sixteen cores are
@@ -206,7 +222,7 @@ TEST_CASE("A saturated machine withdraws entirely, and may reach zero", "[distri
     constexpr NodeCapacity desk { .logicalCores = 8 };
     constexpr auto hammered = WithCpu(0, 1000);
 
-    CHECK(AvailableSlots(desk, OfferableSlots(desk, 0), hammered) == 0);
+    CHECK(AvailableSlots(desk, OfferableSlots(desk, std::nullopt), hammered) == 0);
 }
 
 TEST_CASE("A worker whose scratch disk has filled stops being offered work", "[distributed][nodepolicy]")
@@ -445,13 +461,13 @@ TEST_CASE("Slots are budgeted against memory a compile can have, not all of it",
     constexpr NodeCapacity greedy {
         .logicalCores = 64, .totalMemoryBytes = 32 * Gib, .reservedMemoryBytes = 8 * Gib, .nodeClass = NodeClass::Dedicated
     };
-    CHECK(OfferableSlots(greedy, 0) == 24U);
+    CHECK(OfferableSlots(greedy, std::nullopt) == 24U);
 
     // Same machine, no cache tier: nothing is held back, so nothing is subtracted.
     // This is the arithmetic every node had before the field existed, and it is what
     // a peer too old to report one still gets.
     constexpr NodeCapacity lean { .logicalCores = 64, .totalMemoryBytes = 32 * Gib, .nodeClass = NodeClass::Dedicated };
-    CHECK(OfferableSlots(lean, 0) == 32U);
+    CHECK(OfferableSlots(lean, std::nullopt) == 32U);
 }
 
 TEST_CASE("A cache budgeted above the machine's RAM floors the slots rather than freeing them",
@@ -466,13 +482,13 @@ TEST_CASE("A cache budgeted above the machine's RAM floors the slots rather than
     constexpr NodeCapacity impossible {
         .logicalCores = 16, .totalMemoryBytes = 16 * Gib, .reservedMemoryBytes = 64 * Gib, .nodeClass = NodeClass::Dedicated
     };
-    CHECK(OfferableSlots(impossible, 0) == 1U);
+    CHECK(OfferableSlots(impossible, std::nullopt) == 1U);
 
     // Exactly equal is the same claim: nothing left to compile with.
     constexpr NodeCapacity exact {
         .logicalCores = 16, .totalMemoryBytes = 16 * Gib, .reservedMemoryBytes = 16 * Gib, .nodeClass = NodeClass::Dedicated
     };
-    CHECK(OfferableSlots(exact, 0) == 1U);
+    CHECK(OfferableSlots(exact, std::nullopt) == 1U);
 }
 
 TEST_CASE("A machine that did not state its memory is still scheduled on its cores", "[distributed][policy][memory]")
@@ -483,7 +499,7 @@ TEST_CASE("A machine that did not state its memory is still scheduled on its cor
     constexpr NodeCapacity quiet {
         .logicalCores = 12, .totalMemoryBytes = 0, .reservedMemoryBytes = 4ULL << 30, .nodeClass = NodeClass::Dedicated
     };
-    CHECK(OfferableSlots(quiet, 0) == 12U);
+    CHECK(OfferableSlots(quiet, std::nullopt) == 12U);
 }
 
 TEST_CASE("An explicit slot count is still a ceiling nothing raises or lowers", "[distributed][policy][memory]")
@@ -494,5 +510,5 @@ TEST_CASE("An explicit slot count is still a ceiling nothing raises or lowers", 
     constexpr NodeCapacity capacity {
         .logicalCores = 64, .totalMemoryBytes = 32 * Gib, .reservedMemoryBytes = 8 * Gib, .nodeClass = NodeClass::Dedicated
     };
-    CHECK(OfferableSlots(capacity, 40) == 40U);
+    CHECK(OfferableSlots(capacity, std::optional<std::uint32_t> { 40 }) == 40U);
 }

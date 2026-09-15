@@ -12,6 +12,7 @@
 #include <FastCache/Protocol/LiveStream.hpp>
 #include <FastCache/Protocol/SurfaceRefusal.hpp>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <format>
@@ -78,10 +79,12 @@ namespace
                             .code = Wire::ErrorCode::DispatchNotPermitted,
                             .why = "this endpoint is a cache and no longer schedules; run the fleet's scheduler with "
                                    "fastcache-compile-node --serve-scheduler and point clients at it" },
+        // With the cordon row below, `Wire::NoCompileWorker`'s fact: a node started with
+        // `--slots=0` refuses both verbs for the same reason and with the same code (#206).
         Wire::RefusedVerb { .op = Wire::Op::Compile,
-                            .code = Wire::ErrorCode::DispatchNotPermitted,
-                            .why = "this endpoint is a cache and does not execute compiles; send the job to the worker "
-                                   "endpoint the lease named" },
+                            .code = Wire::NoCompileWorker::Code,
+                            .why = "this endpoint runs no compile worker: it is a cache and does not execute compiles, "
+                                   "so send the job to the worker endpoint the lease named" },
         Wire::RefusedVerb { .op = Wire::Op::Release,
                             .code = Wire::ErrorCode::DispatchNotPermitted,
                             .why = "this endpoint is a cache and no longer schedules; run the fleet's scheduler with "
@@ -125,9 +128,9 @@ namespace
         // PROCESS, and this endpoint runs none. A client told this goes to the compile
         // node on its machine, which is where a cordon is answered.
         Wire::RefusedVerb { .op = Wire::Op::Cordon,
-                            .code = Wire::ErrorCode::DispatchNotPermitted,
-                            .why = "this endpoint is a cache and runs no compile worker to cordon; ask the "
-                                   "fastcache-compile-node on this machine" },
+                            .code = Wire::NoCompileWorker::Code,
+                            .why = "this endpoint runs no compile worker: it is a cache, so there is nothing here to "
+                                   "cordon; ask the fastcache-compile-node on this machine" },
         // **`NoCluster`, with the four cluster rows and NOT with the two node rows
         // above.** `Enroll` is a self-service `ClusterAdmit` -- it asks to be written
         // into the replicated membership configuration, and `EnrollControl`'s `Approve`
@@ -159,6 +162,25 @@ namespace
                             .why = "this endpoint is a cache, not a compile node, and serves no fleet; read it from "
                                    "the fleet's scheduler, a fastcache-compile-node --serve-scheduler" },
     };
+
+    /// Whether every compile-family verb has a row here saying `Wire::NoCompileWorker`'s fact.
+    ///
+    /// A node running no worker answers the whole family with that fact, so neither
+    /// endpoint can reword it or move its code without the other (#206). Walked over
+    /// `OpTable`'s family column rather than naming the verbs, so a compile verb added
+    /// there without a row here fails the build instead of reaching the generic refusal.
+    /// @return True when every such verb has its row.
+    [[nodiscard]] constexpr bool EveryCompileVerbSaysNoCompileWorker() noexcept
+    {
+        return std::ranges::all_of(Wire::OpTable, [](Wire::OpDescriptor const& verb) {
+            if (verb.family != Wire::VerbFamily::Compile)
+                return true;
+            auto const* const row = Wire::FindRefusal(RelocatedVerbs, verb.code);
+            return row != nullptr && Wire::SaysNoCompileWorker(*row);
+        });
+    }
+
+    static_assert(EveryCompileVerbSaysNoCompileWorker());
 
     /// What to answer `op` with.
     ///

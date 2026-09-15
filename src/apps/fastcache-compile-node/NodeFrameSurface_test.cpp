@@ -5,10 +5,12 @@
 #include "NodeConfig.hpp"
 #include "NodeFrameSurface.hpp"
 #include "NodeIoLoop.hpp"
+#include "NodeSurfaces.hpp"
 #include "Responders.hpp"
 
 #include <FastCache/Async/Task.hpp>
 #include <FastCache/Async/ThreadPoolExecutor.hpp>
+#include <FastCache/Cache/CacheEngine.hpp>
 #include <FastCache/Cache/InMemoryLruStorage.hpp>
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/HostPort.hpp>
@@ -16,10 +18,15 @@
 #include <FastCache/Core/WireFrame.hpp>
 #include <FastCache/Distributed/MembershipOracle.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
+#include <FastCache/Net/BlockingConnector.hpp>
 #include <FastCache/Net/BlockingSocket.hpp>
+#include <FastCache/Net/InMemoryTransport.hpp>
+#include <FastCache/Net/TcpClient.hpp>
 #include <FastCache/Platform/LocalAddresses.hpp>
 #include <FastCache/Platform/LocalAddressesTestUtils.hpp>
+#include <FastCache/Protocol/CompileCacheHandler.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
+#include <FastCache/Protocol/SessionContext.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -40,6 +47,7 @@
 #include <format>
 #include <memory>
 #include <optional>
+#include <ranges>
 #include <span>
 #include <string>
 #include <string_view>
@@ -534,13 +542,16 @@ TEST_CASE("A verb no component serves is refused as unimplemented", "[node][merg
     CHECK(ErrorOf(fetch) == Wire::UnimplementedVerb);
     CHECK(scheduler.Answered().empty());
 
-    // COMPILE is refused the same way when this node runs no worker to route it to.
-    // It is not a family this listener cannot carry -- `CompileResponder` owns it since
-    // #290's second half -- so the refusal is about a MISSING COMPONENT exactly as the
-    // cache one above is, and a node passing a null one gets the honest code.
+    // COMPILE is NOT refused that way, since #206 gave a node the means to run no worker
+    // (`--slots=0`). The verb is not unimplemented on such a node, it is served by the
+    // nodes that run one -- and `UnimplementedVerb` would tell whoever sent `--cordon`
+    // here that this build is too old to know the verb. It gets the code the daemon
+    // answers a cordon with for the same fact, so the two endpoints give one remedy.
+    // Both verbs of the family, because the cordon is the one an operator actually sends.
     NamedResponder cache { "cache" };
     MergedResponder both { SurfaceComponents { .cache = &cache, .scheduler = &scheduler } };
-    CHECK(ErrorOf(AnswerNow(both, HeaderFor(Wire::Op::Compile))) == Wire::UnimplementedVerb);
+    CHECK(ErrorOf(AnswerNow(both, HeaderFor(Wire::Op::Compile))) == Wire::ErrorCode::DispatchNotPermitted);
+    CHECK(ErrorOf(AnswerNow(both, HeaderFor(Wire::Op::Cordon))) == Wire::ErrorCode::DispatchNotPermitted);
 
     // **And none of them is counted, which was decided rather than left out** (#447).
     // Every other refusal on this listener is an event; this one is the answer ordinary
@@ -550,6 +561,52 @@ TEST_CASE("A verb no component serves is refused as unimplemented", "[node][merg
     // build and a port scan would be invisible inside it. That is this ticket's own
     // failure reached from the other side: a series nothing can be read out of is no
     // better than one that never moves.
+}
+
+TEST_CASE("The daemon and a node running no worker refuse a cordon with one code and one fact", "[node][merged-responder]")
+{
+    // #206. Two endpoints meet the same question -- a `--cordon` aimed at a machine that
+    // compiles nothing -- and one condition must not reach a client as two codes, or as
+    // two different facts. Both tables are checked against `Wire::NoCompileWorker` when
+    // they compile; this asks the SURFACES, on the wire, because a refusal is decided by
+    // the call that sends it and a table nothing routes to asserts nothing.
+    auto const cordon = Wire::EncodeCordonRequest(Wire::CordonAction::Cordon);
+
+    // The daemon, which is a cache.
+    ManualClock clock;
+    InMemoryLruStorage storage { 0 };
+    CacheEngine engine { storage, clock };
+    auto const pair = InMemorySocketPair::Create();
+    CompileCacheHandler daemon;
+    REQUIRE(SyncRun(SendAll(pair.client.get(), cordon)));
+    pair.client->ShutdownWrite();
+    SyncRun(daemon.Run(pair.server.get(), &engine, {}, SessionContext {}));
+    // One framed reply, read as the header declares it: the header, then its payload.
+    auto const daemonHead = SyncRun(RecvExactly(pair.client.get(), Wire::ReplyHeaderSize));
+    REQUIRE(daemonHead.has_value());
+    auto const daemonHeader = Wire::DecodeReplyHeader(Unwrap(daemonHead));
+    REQUIRE(daemonHeader.has_value());
+    auto const daemonPayload = SyncRun(RecvExactly(pair.client.get(), Unwrap(daemonHeader).payloadLength));
+    REQUIRE(daemonPayload.has_value());
+    auto daemonReply = Unwrap(daemonHead);
+    daemonReply.insert(daemonReply.end(), Unwrap(daemonPayload).begin(), Unwrap(daemonPayload).end());
+
+    // A node started with `--slots=0`, which builds no compile component.
+    NamedResponder cache { "cache" };
+    NamedResponder scheduler { "scheduler" };
+    MergedResponder node { SurfaceComponents { .cache = &cache, .scheduler = &scheduler } };
+    auto const nodeReply = AnswerNow(node, cordon);
+
+    auto const daemonCode = ErrorOf(daemonReply);
+    auto const nodeCode = ErrorOf(nodeReply);
+    REQUIRE(daemonCode.has_value());
+    REQUIRE(nodeCode.has_value());
+    CHECK(daemonCode == nodeCode);
+
+    // And the same FACT in words, each finished with its own endpoint's remedy.
+    CHECK(MessageOf(daemonReply).starts_with(Wire::NoCompileWorker::Stem));
+    CHECK(MessageOf(nodeReply).starts_with(Wire::NoCompileWorker::Stem));
+    CHECK(MessageOf(daemonReply) != MessageOf(nodeReply));
 }
 
 TEST_CASE("An unowned verb is refused before its payload is read", "[node][merged-responder]")
@@ -625,9 +682,13 @@ TEST_CASE("A refusal is counted against the component that owned the verb", "[no
     // It moves no counter, and that is deliberate: see `UnservedReply`, and the case
     // above for why counting an answer ordinary traffic produces continuously would
     // bury the thing a counter here would be read for.
+    //
+    // The compile family's unserved answer is `DispatchNotPermitted` since #206 -- a node
+    // running no worker serves those verbs elsewhere rather than not at all -- and it is
+    // still the unserved answer, never the pre-payload decision this call was handed.
     auto const orphan =
         responder.RefusalReply(Wire::PrePayloadDecision::PayloadTooLarge, static_cast<std::uint8_t>(Wire::Op::Compile), {});
-    CHECK(ErrorOf(orphan) == Wire::UnimplementedVerb);
+    CHECK(ErrorOf(orphan) == Wire::ErrorCode::DispatchNotPermitted);
     CHECK(cache.Refusals().size() == 1);
     CHECK(scheduler.Refusals().size() == 1);
 }
@@ -665,46 +726,63 @@ TEST_CASE("The session ceilings are the largest of the components present", "[no
     CHECK(schedulerOnly.MaxInFlightBytes() == SchedulerInFlight);
 }
 
-TEST_CASE("A surface with no cache, scheduler or compile owner folds every ceiling to zero, whatever the others report",
-          "[node][merged-responder]")
+TEST_CASE("A surface serving only the node families folds their ceilings rather than zero", "[node][merged-responder]")
 {
-    // #1338's condition: a merged surface with no cache, scheduler or compile owner. `main.cpp` cannot
-    // build that shape today -- it sets `.compile` unconditionally -- so this pins the class rather than a
-    // node. The node and enrollment owners are in no fold, so their own ceilings -- sized small, and
-    // reasoned about as if that narrowed something -- decide nothing even here. WHAT DISTINGUISHES: all
-    // three answers are ZERO rather than those owners' numbers, and zero means opposite things per
-    // ceiling (`FrameEndpoint.hpp`): no ceiling for connections and in-flight bytes, every payload
-    // refused for the request cap.
-    constexpr std::size_t NodeRequest = 4096;
-    constexpr std::size_t NodeOpen = 32;
-    constexpr std::size_t NodeInFlight = 65536;
+    // #1338's shape, and #206 made it reachable: a `--slots=0` node running only consensus builds
+    // the operator components and nothing else. While the fold covered only the cache,
+    // scheduler and compile owners, every ceiling came out ZERO -- and zero is every payload
+    // refused for the request cap (`FrameEndpoint.hpp`) -- so that node bound its port and closed
+    // every connection, `--node-status` included. WHAT DISTINGUISHES: the answers come from three
+    // different operator owners, so dropping any one of them from the fold moves a number, and the
+    // enrollment owner, sized larger than all three, stays out.
     NamedResponder node { "node" };
-    node.PlaceCeilings(NodeRequest, NodeOpen, NodeInFlight);
+    node.PlaceCeilings(4096, 32, 65536);
+    NamedResponder live { "live" };
+    live.PlaceCeilings(2048, 64, 32768);
+    NamedResponder fleet { "fleet" };
+    fleet.PlaceCeilings(1024, 16, 98304);
     NamedResponder enrollment { "enrollment" };
-    enrollment.PlaceCeilings(NodeRequest, 2 * NodeOpen, 2 * NodeInFlight);
+    enrollment.PlaceCeilings(8192, 128, 131072);
 
-    MergedResponder unfolded { SurfaceComponents { .node = &node, .enrollment = &enrollment } };
-    CHECK(unfolded.MaxRequestBytes() == 0);
-    CHECK(unfolded.MaxOpenConnections() == 0);
-    CHECK(unfolded.MaxInFlightBytes() == 0);
+    MergedResponder watched { SurfaceComponents {
+        .node = &node, .enrollment = &enrollment, .live = &live, .fleet = &fleet } };
+    CHECK(watched.MaxRequestBytes() == 4096);
+    // Connections ADD for the families that coexist on every port; see the case holding them.
+    CHECK(watched.MaxOpenConnections() == 32 + 64 + 16);
+    CHECK(watched.MaxInFlightBytes() == 98304);
 
-    // The control: one folded owner beside the same two, and the fold is that owner's alone.
+    // The control: a worker beside them, larger than all, is the fold -- the operator families are
+    // sized as the SMALL owners and change no number where anything else runs.
     NamedResponder compile { "compile" };
-    compile.PlaceCeilings(1024, 8, 2048);
-    MergedResponder folded { SurfaceComponents { .compile = &compile, .node = &node, .enrollment = &enrollment } };
-    CHECK(folded.MaxRequestBytes() == 1024);
-    CHECK(folded.MaxOpenConnections() == 8);
-    CHECK(folded.MaxInFlightBytes() == 2048);
+    compile.PlaceCeilings(1U << 20U, 256, 1U << 22U);
+    MergedResponder worker { SurfaceComponents {
+        .compile = &compile, .node = &node, .enrollment = &enrollment, .live = &live, .fleet = &fleet } };
+    CHECK(worker.MaxRequestBytes() == 1U << 20U);
+    CHECK(worker.MaxOpenConnections() == 256);
+    CHECK(worker.MaxInFlightBytes() == 1U << 22U);
 }
 
-TEST_CASE("A node with neither component opens no 0xFC port", "[node][node-surface]")
+TEST_CASE("The listener binds for a surface holding any one component, the fleet document included", "[node][node-surface]")
 {
-    // Not an error and not a silence: a node with no component for any verb family is
-    // a supported shape, and a port opened for it would answer `UnimplementedVerb` to
-    // everything. In the production binary it is now unreachable -- a node always runs
-    // a worker, so a compile responder is always passed -- and the predicate stays
-    // honest rather than being narrowed to the two components that can still be
-    // absent.
+    // #206: the bind predicate is asked of the routing table, never of a list of members, so a
+    // component that owns some verb answers yes whichever it is. One member at a time, because a
+    // surface holding several passes whichever one a list forgot.
+    NamedResponder owner { "owner" };
+    CHECK_FALSE(AnswersAnyFamily(SurfaceComponents {}));
+    CHECK(AnswersAnyFamily(SurfaceComponents { .cache = &owner }));
+    CHECK(AnswersAnyFamily(SurfaceComponents { .scheduler = &owner }));
+    CHECK(AnswersAnyFamily(SurfaceComponents { .compile = &owner }));
+    CHECK(AnswersAnyFamily(SurfaceComponents { .node = &owner }));
+    CHECK(AnswersAnyFamily(SurfaceComponents { .enrollment = &owner }));
+    CHECK(AnswersAnyFamily(SurfaceComponents { .live = &owner }));
+    CHECK(AnswersAnyFamily(SurfaceComponents { .fleet = &owner }));
+}
+
+TEST_CASE("A node with no component at all opens no 0xFC port", "[node][node-surface]")
+{
+    // Not an error and not a silence: a listener with no component for any verb family
+    // would answer `UnimplementedVerb` to everything. Unreachable in the production
+    // binary, where the operator verbs and live stats are always passed.
     NodeIoLoop io;
     CapturingLogger logger;
     AtomicMetricsSink metrics;
@@ -748,6 +826,124 @@ TEST_CASE("A node whose only component is its worker opens the 0xFC port", "[nod
     // looking for a configuration problem that is not there.
     CHECK_FALSE(Logged(logger, "no cache tier and no scheduler"));
     CHECK_FALSE(Logged(logger, "--listen-node is empty"));
+}
+
+TEST_CASE("A node running only consensus opens the 0xFC port it is watched through", "[node][node-surface]")
+{
+    // #206 review. No worker, no cache tier, no scheduler: the components such a node
+    // builds are the operator verbs, live stats and the fleet document, and a predicate that read only the
+    // other three bound nothing -- so `--node-status` had nowhere to connect while
+    // `--print-surfaces` named the port. Both halves are asserted: the row names it, and
+    // the listener binds it and answers there.
+    NodeIoLoop io;
+    CapturingLogger logger;
+    AtomicMetricsSink metrics;
+    NamedResponder node { "node" };
+    NamedResponder live { "live" };
+    NamedResponder fleet { "fleet" };
+    auto [cfg, port] = BaseConfig();
+    cfg.slots = 0;
+    cfg.cacheMemoryBytes = 0;
+    cfg.cacheDir.clear();
+    REQUIRE_FALSE(cfg.serveScheduler);
+
+    // What `--print-surfaces` names for this configuration.
+    auto const named = RowFor(NodeSurface::Node).Resolve(cfg);
+    REQUIRE(named.size() == 1);
+    CHECK(named.front().port == port);
+
+    auto surface = StartNodeSurfaceOrExplain(
+        io, cfg, SurfaceComponents { .node = &node, .live = &live, .fleet = &fleet }, std::nullopt, metrics, logger);
+    REQUIRE(surface.has_value());
+    REQUIRE(*surface != nullptr);
+    CHECK_FALSE(Logged(logger, "serving no 0xFC port"));
+    io.Start();
+
+    // And it answers there: a NodeStatus frame reaches the operator verbs.
+    BlockingConnector connector;
+    auto socket =
+        SyncRun(connector.Connect("127.0.0.1", port, DialOptions { .connectTimeout = std::chrono::seconds { 5 } }));
+    REQUIRE(socket.has_value());
+    auto const request = HeaderFor(Wire::Op::NodeStatus);
+    REQUIRE(SyncRun(SendAll(socket->get(), request)));
+    auto const head = SyncRun(RecvExactly(socket->get(), Wire::ReplyHeaderSize));
+    REQUIRE(head.has_value());
+    auto const header = Wire::DecodeReplyHeader(Unwrap(head));
+    REQUIRE(header.has_value());
+    auto const payload = SyncRun(RecvExactly(socket->get(), Unwrap(header).payloadLength));
+    REQUIRE(payload.has_value());
+    auto reply = Unwrap(head);
+    reply.insert(reply.end(), Unwrap(payload).begin(), Unwrap(payload).end());
+    CHECK(MessageOf(reply) == "node");
+}
+
+TEST_CASE("A node running only consensus still answers its status with every live subscription held", "[node][node-surface]")
+{
+    // #206 review. The operator families coexist on one port, so their connection
+    // allowances add: folded as a maximum, a node running only consensus had exactly the
+    // live cap, and `--node-status` could not connect once every subscription was held.
+    // Every connection is held after a frame on it was ANSWERED, so each is known to have
+    // been accepted and counted before the next exchange is tried. The node family's
+    // allowance is then filled as well, so the fleet read connects only if ITS allowance
+    // was added too.
+    constexpr std::size_t NodeOpen = 32;
+    constexpr std::size_t LiveOpen = 64;
+    constexpr std::size_t FleetOpen = 32;
+    NodeIoLoop io;
+    CapturingLogger logger;
+    AtomicMetricsSink metrics;
+    NamedResponder node { "node" };
+    node.PlaceCeilings(CompileCacheWire::MaxControlPayload, NodeOpen, 16 * CompileCacheWire::MaxControlPayload);
+    NamedResponder live { "live" };
+    live.PlaceCeilings(CompileCacheWire::MaxControlPayload, LiveOpen, 16 * CompileCacheWire::MaxControlPayload);
+    NamedResponder fleet { "fleet" };
+    fleet.PlaceCeilings(CompileCacheWire::MaxControlPayload, FleetOpen, 16 * CompileCacheWire::MaxControlPayload);
+    auto [cfg, port] = BaseConfig();
+    cfg.slots = 0;
+    cfg.cacheMemoryBytes = 0;
+    cfg.cacheDir.clear();
+
+    auto surface = StartNodeSurfaceOrExplain(
+        io, cfg, SurfaceComponents { .node = &node, .live = &live, .fleet = &fleet }, std::nullopt, metrics, logger);
+    REQUIRE(surface.has_value());
+    REQUIRE(*surface != nullptr);
+    io.Start();
+
+    BlockingConnector connector;
+    auto const listenPort = port;
+    auto const exchange = [&connector, listenPort](std::vector<std::unique_ptr<ISocket>>& held, Wire::Op op) {
+        auto socket = SyncRun(
+            connector.Connect("127.0.0.1", listenPort, DialOptions { .connectTimeout = std::chrono::seconds { 5 } }));
+        if (!socket.has_value())
+            return std::string {};
+        auto const request = HeaderFor(op);
+        if (!SyncRun(SendAll(socket->get(), request)))
+            return std::string {};
+        auto head = SyncRun(RecvExactly(socket->get(), Wire::ReplyHeaderSize));
+        if (!head.has_value())
+            return std::string {};
+        auto const header = Wire::DecodeReplyHeader(Unwrap(head));
+        if (!header.has_value())
+            return std::string {};
+        auto const payload = SyncRun(RecvExactly(socket->get(), Unwrap(header).payloadLength));
+        if (!payload.has_value())
+            return std::string {};
+        auto reply = Unwrap(head);
+        reply.insert(reply.end(), Unwrap(payload).begin(), Unwrap(payload).end());
+        held.push_back(std::move(*socket));
+        return MessageOf(reply);
+    };
+
+    std::vector<std::unique_ptr<ISocket>> subscriptions;
+    for ([[maybe_unused]] auto const index: std::views::iota(std::size_t { 0 }, LiveOpen))
+        REQUIRE(exchange(subscriptions, Wire::Op::Subscribe) == "live");
+
+    std::vector<std::unique_ptr<ISocket>> status;
+    for ([[maybe_unused]] auto const index: std::views::iota(std::size_t { 0 }, NodeOpen))
+        REQUIRE(exchange(status, Wire::Op::NodeStatus) == "node");
+
+    std::vector<std::unique_ptr<ISocket>> reads;
+    CHECK(exchange(reads, Wire::Op::FleetText) == "fleet");
 }
 
 TEST_CASE("An emptied --listen-node closes the port and says so", "[node][node-surface]")

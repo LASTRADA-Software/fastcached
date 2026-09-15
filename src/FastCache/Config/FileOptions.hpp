@@ -45,10 +45,12 @@ namespace FastCache
 ///
 /// Each setting is matched to the row whose `yamlKey` it names, and every value it
 /// carried is passed to that row's `apply` -- once for a scalar, once per element
-/// for a sequence. The row's `explicitBit` is then set, because a key in a file is
-/// the operator naming the setting; which instance of the result that bit is read
-/// from is what distinguishes "named it anywhere" from "typed it on the command
-/// line" (see the node's `main`).
+/// for a sequence. The row's `explicitBit` is then set when a value was APPLIED,
+/// because that is the operator naming the setting; which instance of the result that
+/// bit is read from is what distinguishes "named it anywhere" from "typed it on the
+/// command line" (see the node's `main`). A presence flag's `false` applies nothing and
+/// so names nothing: `no_toolchain_discovery: false` is the flag not passed, and a bit
+/// set for it would refuse a node for a setting nobody gave (#206).
 ///
 /// A key naming no row is refused rather than ignored. A file is read at every
 /// start, so a key nothing reads is a setting an operator believes is in force
@@ -108,6 +110,7 @@ template <typename Result>
             return std::unexpected(
                 fileError(ConfigErrorCode::TypeMismatch, setting.key, "setting takes one value, not a list", setting.line));
 
+        auto appliedAny = false;
         for (auto const& value: setting.values)
         {
             // A flag whose meaning is its PRESENCE is spelled as a boolean here, and
@@ -140,9 +143,11 @@ template <typename Result>
                 error.field = std::string { setting.key };
                 return std::unexpected(std::move(error));
             }
+            appliedAny = true;
         }
 
-        if (row->explicitBit != nullptr)
+        // Provenance follows the applier: what applied nothing named nothing.
+        if (row->explicitBit != nullptr && appliedAny)
             result.*row->explicitBit = true;
     }
     return {};

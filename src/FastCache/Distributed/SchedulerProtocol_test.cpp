@@ -371,7 +371,7 @@ TEST_CASE("An unstated reserve survives as unstated, not as zero", "[distributed
     auto const back = CapacityFromWire(CapacityToWire(quiet));
     REQUIRE(back.has_value());
     CHECK_FALSE(Unwrap(back).reserveIsExplicit);
-    CHECK(OfferableSlots(Unwrap(back), 0) == 14);
+    CHECK(OfferableSlots(Unwrap(back), std::nullopt) == 14);
 }
 
 TEST_CASE("A registration naming a node class this build lacks is refused", "[distributed][scheduler][protocol]")
@@ -932,7 +932,7 @@ TEST_CASE("Memory a node holds back survives the wire", "[distributed][scheduler
     // sizes itself, but `slots = 0` asks the scheduler to -- and a scheduler
     // budgeting jobs against RAM the node already spent on its own cache would
     // over-commit exactly the machines that bothered to report it.
-    CHECK(OfferableSlots(Unwrap(back), 0) == OfferableSlots(original, 0));
+    CHECK(OfferableSlots(Unwrap(back), std::nullopt) == OfferableSlots(original, std::nullopt));
 }
 
 TEST_CASE("A peer too old to report held-back memory schedules as it always did",

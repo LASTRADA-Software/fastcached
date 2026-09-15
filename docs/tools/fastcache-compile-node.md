@@ -591,8 +591,8 @@ one job per gigabyte of RAM, and its own cache is resident memory that is not go
 to yield — so a 64-thread host with 32 GiB used to offer 32 slots *and* hold 8 GiB
 of cache, which is forty gigabytes of promises on a thirty-two gigabyte machine. It
 now offers 24. The figure travels with the registration, so a node that asks the
-scheduler to size it (`--slots 0`) gets the same answer at the other end, and a
-peer too old to report it is sized exactly as it always was.
+scheduler to size it (by naming no `--slots`) gets the same answer at the other end,
+and a peer too old to report it is sized exactly as it always was.
 
 **What is subtracted is what the tier actually holds, not what you asked for.** A
 node that ends up with no tier subtracts nothing and offers the whole machine. Two
@@ -2171,6 +2171,25 @@ exactly one at a time — the cap could never be reached, the
 `fastcache_worker_jobs_refused_no_slot_total` counter could never move, and a
 saturated fleet reported `1 / 30 compiling`.
 
+**`--slots=0` is not a number of compiles: it is no worker at all.** Zero used to be
+refused, because it was how the node spelled "derive this from the machine" — which
+left no way to offer the fleet nothing, and made the obvious spelling the one value
+that would have produced a full worker. Deriving is now what omitting the flag does,
+so zero means what it says. Such a node surveys no compilers, claims no scratch
+directory, registers with no scheduler and is never leased; `--node-status` reports it
+with no worker component and no slot figures, and a `--cordon` sent to it is refused
+as a node that runs no worker rather than as a verb its build does not know. It
+refuses to start with any setting only a worker reads — `--toolchain`,
+`--allow-compile-arg` or `--drain-timeout`, say — and names the setting, and it
+refuses when it would run nothing else either. `--scheduler` is not among them: on
+such a node it registers nothing and only tells the `--cluster-*` and `--enroll-*`
+commands run on the machine where to ask. Until #1440 lands, its `/metrics` and
+history still read 0 slots rather than no worker.
+
+It is a cluster **member** when it runs consensus and not one of the fleet page's
+**machines**, which are built from worker registrations, and its own history is not
+handed to a leader, which rides the worker's heartbeat ([#1440](https://github.com/LASTRADA-Software/fastcached/issues/1440)).
+
 Slots bound CPU; they do not bound memory, and the two are separate questions now
 that compiles run side by side. A worker also caps the payload bytes all its jobs
 are reading at once at 256 MiB — one request's worth, so ordinary translation units
@@ -2294,8 +2313,8 @@ tell that the process is alive but not that it is *answering*, which is the stat
 a wedged worker is in. It is what `systemd`'s and Kubernetes' probes want.
 
 **A node that works for other machines and has no `--admin-listen` says so once, at
-startup.** Nothing is wrong with such a node — it registers, caches and compiles
-exactly as configured — but nothing off its own machine can see any of that, so over a
+startup.** Nothing is wrong with such a node — it does exactly what it was
+configured to do — but nothing off its own machine can see any of that, so over a
 fleet this is opt-in monitoring whose failure mode is silence
 ([#1304](https://github.com/LASTRADA-Software/fastcached/issues/1304)):
 

@@ -1751,6 +1751,43 @@ Six more about what the tier IS and who gets to see it:
   the cache appearing to work better and better on the way. Both halves off (no
   `--cache-dir` either) means no tier at all, said out loud rather than left to
   produce a cache port answering out of nothing.
+- **`--slots=0` means NO WORKER, and zero used to be how `OfferableSlots` spelled
+  DERIVE** (#206). The obvious way to keep a machine out of the work was therefore the
+  one value that built a full worker, so it was refused, and operators gave schedulers
+  a toolchain identity nothing could match -- which still registered, and under a
+  fingerprint a client did compute took the work anyway. Absent now derives and zero
+  runs none, and the flag reaches `OfferableSlots` only through `WorkerSlotsOf`, which
+  answers NOTHING for a node running no worker: the fail-open direction is a derived
+  count on the machine an operator excluded. `RunsWorker` is the one predicate. Such a
+  node surveys nothing, registers nothing and starts no heartbeat thread; its compile
+  family is refused `DispatchNotPermitted`, the code the daemon already answers a
+  cordon with for the same fact, never `UnimplementedVerb`. **A setting only the
+  worker reads names the worker in `NodeOptions()`'s `component` column, and ONE
+  generated rule refuses it on a node running none** -- never a `!RunsWorker(c) &&`
+  row per flag, and a rule ABOUT a worker carries the `scope` column rather than a
+  pasted `RunsWorker(c) &&`. Six such conjuncts were written by hand in the branch that
+  introduced them, and it dropped one (the reload widening rule). `--scheduler` is NOT
+  worker-only: `RunClusterAdmin` and `RunEnrollAdmin` read it, so a no-worker node keeps
+  it and registers nothing. **Stated loss:** it is a cluster member and not a
+  fleet-page machine, since both the Machines rows and the history handover ride
+  worker registration, and its `/metrics` and history read 0 slots rather than absent
+  (#1440).
+  **The worker is `WorkerTier`, null on such a node** (#1387): no idle pool thread, no
+  capacity sized to zero, no validator. It owns the `SchedulerLink`, so a worker cannot
+  exist without one and a start that reaches it with no `--scheduler` is refused by
+  name rather than heartbeating nowhere. **And a node running no worker may run only
+  consensus**, which reached two answers written for "every node has a compile
+  component": the merged listener's bind predicate (`AnswersAnyFamily`) and its
+  session-ceiling fold (`MergedResponder::Largest`) both count the never-null operator
+  families -- node, live and fleet -- or such a node names a port it does not bind -- or
+  binds one whose ceilings fold to zero and closes every connection, `--node-status`
+  included. The second was found only by a test that EXCHANGED a frame over the bound
+  port; the bind alone passed. The bind, the fold and the connection sum all read
+  `FamilyRoutes`, one row per `VerbFamily` with a presence column and a ceilings column
+  that a new family must STATE (`EveryFamilyIsClassified`), because a hand-written list
+  of members beside the router was silent about `Fleet` when that family landed. The
+  `OnEveryBuiltNode` owners' connection allowances ADD, since they coexist on every port
+  while the live subscriptions are all held.
 - **A store that will not open is always fatal; a port that will not bind is fatal
   only when the operator typed the address.** The two leave `CacheTier` through one
   `std::string`, so `StartCacheTierOrExplain` opens the store itself rather than
@@ -2634,8 +2671,8 @@ the pair is indistinguishable again.
     escape hatch exists without a flag — which is also what the end-to-end fixture
     uses as its control.
   - **The claim belongs to the WORKER tier.** A machine that schedules and compiles
-    nothing has no use for a root and must not fail to start for want of one (#206),
-    so the claim is conditional on serving compiles and says so.
+    nothing -- `--slots=0` -- has no use for a root and must not fail to start for want
+    of one (#206), so the claim is conditional on serving compiles and says so.
   - **Counted where a counter can be read.** Reclamation gets
     `WorkerScratchRootsReclaimed`; the refusal to claim does not, because that path
     exits the process and nothing would ever scrape it — an operator learns of it by

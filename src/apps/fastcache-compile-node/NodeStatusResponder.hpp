@@ -200,11 +200,9 @@ class NodeStatusResponder final: public IFrameResponder
     /// that here would be wrong rather than tight: this is a SESSION cap, and
     /// `OpPayloadCap` is what applies the per-verb bound.
     ///
-    /// It said this was "the SESSION cap the endpoint folds across owners with
-    /// `Largest`". It is not folded: `MergedResponder::Largest` covers `_cache`,
-    /// `_scheduler` and `_compile`, and this responder is neither. On the merged
-    /// listener nothing reads this number; it is the answer given when this responder is
-    /// asked directly, and it stays the honest one either way.
+    /// Folded by `MergedResponder::Largest`, where it is the number only on a node whose
+    /// every other folded owner is absent -- one running consensus and nothing else (#206).
+    /// Anywhere a cache, a scheduler or a worker runs, theirs is larger.
     [[nodiscard]] std::size_t MaxRequestBytes() const noexcept override
     {
         return CompileCacheWire::MaxControlPayload;
@@ -216,14 +214,11 @@ class NodeStatusResponder final: public IFrameResponder
     /// connection and closes it, and a diagnostic port with hundreds of descriptors is
     /// a port worth exhausting.
     ///
-    /// It claimed this "decides the ceiling on a node serving nothing else". **It
-    /// decides nothing today** -- `MergedResponder::Largest` does not fold this
-    /// responder, so on the merged listener this 32 is never consulted, including on the
-    /// node serving nothing else. The value is kept because it is the right one for this
-    /// surface to report; what is wrong is a comment that described a consequence the
-    /// mechanism cannot deliver, which is the more durable half of the defect: the
-    /// number could be corrected by anyone reading it, and the false consequence read as
-    /// a reason not to look.
+    /// ADDED by `MergedResponder` to the other operator families' -- live stats and the
+    /// fleet document -- because they coexist on every port: on a node serving nothing but
+    /// these families the port admits all of their allowances at once, and anywhere a
+    /// cache, a scheduler or a worker runs their larger ceiling governs and this changes
+    /// nothing. Raising it would widen every surface on the port, never only this one.
     [[nodiscard]] std::size_t MaxOpenConnections() const noexcept override
     {
         return 32;
@@ -234,11 +229,8 @@ class NodeStatusResponder final: public IFrameResponder
     /// A handful of control payloads -- the right budget for what these verbs can
     /// actually spend.
     ///
-    /// It said "folded with `Largest`, so on any node holding a tier the cache's budget
-    /// governs and this contributes nothing; it matters only where this is the largest
-    /// owner". The first half was the correct conclusion for the wrong reason and the
-    /// second half is false: this responder is in no fold, so it contributes nothing
-    /// anywhere on the merged surface, not only where a tier outweighs it.
+    /// Folded with `Largest`, so it governs only where no cache, scheduler or worker
+    /// runs, and everywhere else contributes nothing.
     [[nodiscard]] std::size_t MaxInFlightBytes() const noexcept override
     {
         return CompileCacheWire::MaxControlPayload * 16;

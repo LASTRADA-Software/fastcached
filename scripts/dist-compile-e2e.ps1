@@ -994,10 +994,11 @@ try {
         # with no member list refuses everybody, which is the right default and not a
         # working configuration, so it is refused at startup.
         #
-        # It names a toolchain nothing here compiles with, deliberately. Every node is
-        # both a peer and a possible scheduler, so it always registers as a worker too
-        # -- and a second MATCHING worker would make "which worker ran this job" a race
-        # that the cases below assert against by reading one worker's counters.
+        # It runs no worker, deliberately (`--slots=0`, #206). A scheduler is a worker
+        # too unless told otherwise, and a second MATCHING worker would make "which
+        # worker ran this job" a race that the cases below assert against by reading
+        # one worker's counters. Running none, it registers with nobody, so it names no
+        # --scheduler of its own either.
         # One port: since #290 stage 3 the compile verbs arrive on --listen-node
         # beside the cache and scheduler verbs, so this node's worker half answers on
         # $dispatchPort too and --advertise names that. The dedicated compile port it
@@ -1006,9 +1007,8 @@ try {
         $scheduler = Start-Background $Node @(
             $NoLocalCache, "--cluster-key-file=$clusterKey",
             "--serve-scheduler", "--listen-node=127.0.0.1:$dispatchPort", "--fleet-open",
-            "--scheduler=127.0.0.1:$dispatchPort",
             "--advertise=127.0.0.1:$dispatchPort",
-            "--toolchain=scheduler-only=$((Get-Command $cc).Source)", "--slots=1",
+            "--slots=0",
             "--log-level=debug") $schedLog
         $procs += $scheduler
         Wait-ForReady Node $dispatchPort $scheduler "scheduler" $schedLog
@@ -1240,16 +1240,14 @@ int Entry(void) { return Helper((int) sizeof(size_t)); }
         Wait-ForReady Daemon $isoCache $isoDaemon "isolation daemon" $isoDaemonLog
 
         # A second SCHEDULER as well, so the mismatched worker is the only one
-        # registered with it -- and it too serves a toolchain nothing here uses, or it
-        # would BE a matching worker and the case would pass without testing anything.
+        # registered with it -- and it runs no worker (`--slots=0`, #206), or it would
+        # BE a matching worker and the case would pass without testing anything.
         $isoSchedLog = Join-Path $scratch "iso-scheduler.log"
         $isoScheduler = Start-Background $Node @(
             $NoLocalCache, "--cluster-key-file=$clusterKey",
             "--serve-scheduler", "--listen-node=127.0.0.1:$isoDispatch", "--fleet-open",
-            "--scheduler=127.0.0.1:$isoDispatch",
             "--advertise=127.0.0.1:$isoDispatch",
-            "--toolchain=also-not-the-compiler-this-client-uses=$((Get-Command $cc).Source)",
-            "--slots=1", "--log-level=debug") $isoSchedLog
+            "--slots=0", "--log-level=debug") $isoSchedLog
         $procs += $isoScheduler
         Wait-ForReady Node $isoDispatch $isoScheduler "isolation scheduler" $isoSchedLog
 

@@ -268,7 +268,7 @@ struct WorkerRegistration
     /// What a person calls the machine; empty means it did not say. Advisory only --
     /// see `WorkerInfo::displayName` (#1024).
     std::string_view displayName {};
-    std::uint32_t slots {};           ///< Concurrent job limit it asks for; 0 to derive.
+    std::uint32_t slots {};           ///< Concurrent job limit it asks for; 0 to derive (the wire's spelling).
     std::vector<std::uint8_t> codecs; ///< What it can decode.
 
     /// What the machine is, as far as scheduling onto it is concerned.

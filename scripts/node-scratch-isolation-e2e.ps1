@@ -646,7 +646,7 @@ function ConvertTo-QuotedArgs([string[]]$arguments) {
 # What the serving wait says when it gives up.
 #
 # A FUNCTION rather than a literal at the throw site, because a self-test cannot
-# reach `Wait-ForNodeUp`: that is defined inside the run body, and `-SelfTest`
+# reach `Wait-ForNodeServing`: that is defined inside the run body, and `-SelfTest`
 # exits well before the script gets there. Pulling the message out is what makes
 # it addressable at all -- the same split this file already made for the verdict,
 # and for the same reason.
@@ -667,6 +667,47 @@ function ConvertTo-QuotedArgs([string[]]$arguments) {
 # @param name the node whose wait gave up
 function Get-NodeNotServingMessage([string]$name) {
     "$name never reported serving. That marker is logged after the port is bound and accepting, so the port being open says nothing about this wait; the stage not reached is between the accept start and the ready line."
+}
+
+# The words a node's ready line carries when it runs no worker (`--slots=0`, #206).
+#
+# The node builds that line in `main.cpp` from `ReadinessMarkerText(ReadinessMarker::CompileNode)`
+# followed by `Node::WorkerReadinessPhrase` (`NodeConfig.cpp`), whose no-worker answer is exactly
+# these bytes. This is the ONE place the fixture spells them: reword the node's phrase and
+# this is the line to follow, and the self-test's no-worker case goes red until it is.
+$NoWorkerReadyPhrase = "running no worker"
+
+# Whether to wait for a node's toolchain survey, decided from its ready line and from
+# what the fixture started the node to be (#206).
+#
+# **A pure function over those two**, so the self-test drives every arm; the waits only
+# acquire the line. It exists because the survey wait cannot tell "no survey is coming"
+# from "the survey stalled": a scheduler started with `--slots=0` never logs a fingerprint,
+# and waiting on one ended 120 s later as `VERDICT: BLOCKED -- the signature of a hang`
+# about a process that had nothing to do. A confident wrong verdict is worse than none.
+# Asked here instead, right after READY, a node that runs a worker the fixture did not
+# expect -- or runs none when it did -- is a MISMATCH, named at the READY bound with both
+# sides of it, because no amount of waiting reconciles a fixture with a configuration.
+#
+# @param name the node, for the message
+# @param readyLine the node's ready line as it logged it
+# @param expectWorker whether the fixture started this node to run a worker
+# @return a record: `Decision` is "Survey", "NoSurvey" or "Mismatch", and `Message` says
+#         what was decided and why
+function Get-SurveyDecision([string]$name, [string]$readyLine, [bool]$expectWorker) {
+    $runsNoWorker = $readyLine.Contains($NoWorkerReadyPhrase)
+    if ($expectWorker -and -not $runsNoWorker) {
+        return [pscustomobject]@{ Decision = "Survey"; Message = "$name runs a worker, as expected, so its toolchain survey is waited for" }
+    }
+    if (-not $expectWorker -and $runsNoWorker) {
+        return [pscustomobject]@{ Decision = "NoSurvey"; Message = "$name runs no worker, as expected, so there is no toolchain survey to wait for" }
+    }
+    $expected = if ($expectWorker) { "to run a worker" } else { "to run no worker" }
+    $observed = if ($runsNoWorker) { "says `"$NoWorkerReadyPhrase`"" } else { "does not say `"$NoWorkerReadyPhrase`"" }
+    return [pscustomobject]@{
+        Decision = "Mismatch"
+        Message  = "$name was started $expected, but its ready line ${observed}: the fixture and the node's configuration disagree, which no wait can settle. Ready line: $readyLine"
+    }
 }
 
 function Invoke-SelfTest {
@@ -923,7 +964,7 @@ function Invoke-SelfTest {
     #
     # ROUTE, stated because it decides what this does and does not cover: this
     # exercises the MESSAGE as a pure function, not the wait. Whether
-    # `Wait-ForNodeUp` reaches this text on a real timeout is covered by the
+    # `Wait-ForNodeServing` reaches this text on a real timeout is covered by the
     # `throw (Get-NodeNotServingMessage $name)` at its call site being the only
     # thing it can throw there -- there is no literal left to drift. What is NOT
     # covered is the wait's own polling, which needs a real process and a real
@@ -956,6 +997,47 @@ function Invoke-SelfTest {
             $failures++
             Write-Host ("FAIL  {0}: {1}" -f $case.Name, ($problems -join "; "))
             Write-Host $case.Text
+        }
+    }
+
+    # --- whether a node's survey is waited for at all (#206) --------------------
+    #
+    # A fourth subject: a DECISION over a ready line and an expectation, driven through
+    # `Get-SurveyDecision` exactly as the waits call it. Both directions of each question,
+    # so a decision that always surveys, or never throws, fails a row rather than passing
+    # the two it happens to agree with. The ready lines are the node's own shape
+    # (`main.cpp`'s ready line, `WorkerReadinessPhrase`).
+    $workerReady = "[INFO] compile node ready on 127.0.0.1:22207, advertising 127.0.0.1:22207, 1 slot(s) as a workstation node, identifying 1 toolchain(s), every caller admitted"
+    $noWorkerReady = "[INFO] compile node ready on 127.0.0.1:22207, advertising 127.0.0.1:22207, running no worker, every caller admitted"
+    $surveyCases = @(
+        @{  Name = "a worker expected and reported is surveyed"
+            Got = (Get-SurveyDecision "workerA" $workerReady $true)
+            Decision = "Survey"; Expect = @() }
+        @{  Name = "no worker expected and none reported is not surveyed"
+            Got = (Get-SurveyDecision "sched" $noWorkerReady $false)
+            Decision = "NoSurvey"; Expect = @("sched runs no worker") }
+        @{  Name = "a worker expected but none reported is a named mismatch"
+            Got = (Get-SurveyDecision "workerA" $noWorkerReady $true)
+            Decision = "Mismatch"
+            Expect = @("workerA was started to run a worker", "says `"running no worker`"", $noWorkerReady) }
+        @{  Name = "no worker expected but one reported is a named mismatch"
+            Got = (Get-SurveyDecision "sched" $workerReady $false)
+            Decision = "Mismatch"
+            Expect = @("sched was started to run no worker", "does not say `"running no worker`"", $workerReady) }
+    )
+
+    foreach ($case in $surveyCases) {
+        $problems = [System.Collections.Generic.List[string]]::new()
+        if ($case.Got.Decision -ne $case.Decision) { $problems.Add("decided $($case.Got.Decision), expected $($case.Decision)") }
+        foreach ($wanted in @($case.Expect)) {
+            if (-not "$($case.Got.Message)".Contains($wanted)) { $problems.Add("message lacks `"$wanted`"") }
+        }
+        if ($problems.Count -eq 0) {
+            Write-Host ("PASS  {0}" -f $case.Name)
+        } else {
+            $failures++
+            Write-Host ("FAIL  {0}: {1}" -f $case.Name, ($problems -join "; "))
+            Write-Host $case.Got.Message
         }
     }
 
@@ -1028,7 +1110,7 @@ function Invoke-SelfTest {
         }
     }
 
-    $total = $cases.Count + $messageCases.Count + $boundCases.Count
+    $total = $cases.Count + $messageCases.Count + $surveyCases.Count + $boundCases.Count
     if ($failures -gt 0) {
         Write-Host ("node-scratch-isolation-e2e -SelfTest: {0} of {1} cases FAILED" -f $failures, $total)
         return 1
@@ -1158,24 +1240,39 @@ function Invoke-Phase([string]$label, [bool]$separateTempForB) {
         # rather than arrived at by omission. The SURVEY wait covers a step that
         # reports every `$ProgressCadenceSeconds`, so silence there means something
         # (#1157).
-        function Wait-ForNodeUp([string]$name, $proc, [int]$readySeconds, [int]$surveySeconds, [int]$surveyIdleSeconds) {
-            if (-not (Wait-ForLogLine (Join-Path $phaseDir "$name.err.log") "compile node ready" $readySeconds "$name to report serving on its compile port" $proc 0)) {
+        #
+        # Not every node HAS the second stage: one running no worker (`--slots=0`, #206)
+        # surveys nothing and never logs a fingerprint. So the caller states what it
+        # started the node to be, and `Get-SurveyDecision` reads the ready line against
+        # that -- survey, no survey, or a mismatch refused by name at the READY bound.
+        function Wait-ForNodeServing([string]$name, $proc, [int]$readySeconds) {
+            $log = Join-Path $phaseDir "$name.err.log"
+            if (-not (Wait-ForLogLine $log "compile node ready" $readySeconds "$name to report serving on its compile port" $proc 0)) {
                 # States what was and was not established, and stops. A bound port is
                 # NOT evidence this succeeded, so the message must not point at one.
                 throw (Get-NodeNotServingMessage $name)
             }
+            # The line itself, for the decision: the wait above has just seen it.
+            return (@((Get-Content -Raw $log -ErrorAction SilentlyContinue) -split "`r?`n") |
+                    Where-Object { $_.Contains("compile node ready") } | Select-Object -Last 1)
+        }
+        function Wait-ForNodeUp([string]$name, $proc, [bool]$expectWorker, [int]$readySeconds, [int]$surveySeconds, [int]$surveyIdleSeconds) {
+            $readyLine = Wait-ForNodeServing $name $proc $readySeconds
+            $decision = Get-SurveyDecision $name "$readyLine" $expectWorker
+            if ($decision.Decision -eq "Mismatch") { throw $decision.Message }
+            Write-Host ("  " + $decision.Message)
+            if ($decision.Decision -eq "NoSurvey") { return }
             if (-not (Wait-ForLogLine (Join-Path $phaseDir "$name.err.log") "serving .* as " $surveySeconds "$name to finish its toolchain survey" $proc $surveyIdleSeconds)) {
                 throw "$name did not finish its toolchain survey"
             }
         }
 
-        # The scheduler's own worker serves a fingerprint no client asks for, so every
-        # lease has to land on worker A or worker B.
+        # The scheduler runs no worker (`--slots=0`, #206), so every lease has to land on
+        # worker A or worker B -- and it names no --scheduler, having nothing to register.
         $schedProc = Start-NodeIn "sched" @(
             "--serve-scheduler", "--listen-node=127.0.0.1:$schedPort", "--fleet-open",
-            "--scheduler=127.0.0.1:$schedPort",
             "--advertise=127.0.0.1:$schedPort",
-            "--toolchain=scheduler-only=$Compiler", "--slots=1",
+            "--slots=0",
             "--admin-listen=127.0.0.1:$adminPort") $null
         $procs += $schedProc
 
@@ -1231,18 +1328,16 @@ function Invoke-Phase([string]$label, [bool]$separateTempForB) {
         # So it is the other possibility: one walker now costs more than the ceiling on
         # that runner. What the ceiling is set from, and why it is no longer the thing
         # that catches a wedge, is at `$SurveySeconds` near the top of this file.
-        # The scheduler's toolchain is PINNED (`<name>=<compiler>`), so its survey is
-        # not a walk at all: a non-empty fingerprint on the entry skips the probe
-        # entirely, measured at 0 s on the run that filed #1157. Hence a short ceiling
-        # and no idle bound -- there is no cadence to measure silence against.
-        Wait-ForNodeUp "sched" $schedProc 180 120 0
+        # The scheduler runs no worker, so it has no survey to wait for: it is waited
+        # for as SERVING, and its ready line must say so. The survey bounds are unused.
+        Wait-ForNodeUp "sched" $schedProc $false 180 0 0
 
         $workerAProc = Start-NodeIn "workerA" @(
             "--scheduler=127.0.0.1:$schedPort", "--listen-node=127.0.0.1:$workerA",
             "--advertise=127.0.0.1:$workerA",
             "--toolchain=$Compiler", "--slots=1") $null
         $procs += $workerAProc
-        Wait-ForNodeUp "workerA" $workerAProc 120 $SurveySeconds $SurveyIdleSeconds
+        Wait-ForNodeUp "workerA" $workerAProc $true 120 $SurveySeconds $SurveyIdleSeconds
 
         $bTemp = if ($separateTempForB) { Join-Path $phaseDir "tempB" } else { $null }
         $workerBProc = Start-NodeIn "workerB" @(
@@ -1250,7 +1345,7 @@ function Invoke-Phase([string]$label, [bool]$separateTempForB) {
             "--advertise=127.0.0.1:$workerB",
             "--toolchain=$Compiler", "--slots=1") $bTemp
         $procs += $workerBProc
-        Wait-ForNodeUp "workerB" $workerBProc 120 $SurveySeconds $SurveyIdleSeconds
+        Wait-ForNodeUp "workerB" $workerBProc $true 120 $SurveySeconds $SurveyIdleSeconds
 
         # Asked of the SCHEDULER, bounded, and it says what it waited for. A worker
         # logging "compile node ready" says that worker is serving -- its own surface
@@ -1263,12 +1358,13 @@ function Invoke-Phase([string]$label, [bool]$separateTempForB) {
         # the reasoning that the walk had moved with it, which was half right: the
         # walk did move past the bind, but each node is waited for individually above
         # and is surveyed before the next one starts, so by the time control reaches
-        # this line all three identities exist. What remains is the first heartbeat,
+        # this line both workers' identities exist. What remains is the first heartbeat,
         # which is a round trip. A budget sized for the walk would hide a scheduler
         # that never hears a registration behind ten minutes of nothing.
         $registrationBudget = 120
         $deadline = (Get-Date).AddSeconds($registrationBudget); $regs = 0
-        while ((Get-Date) -lt $deadline -and $regs -lt 3) {
+        # TWO registrations: the scheduler runs no worker, so it registers nothing.
+        while ((Get-Date) -lt $deadline -and $regs -lt 2) {
             Start-Sleep -Milliseconds 700
             try {
                 $text = (Invoke-WebRequest -Uri "http://127.0.0.1:$adminPort/metrics" -TimeoutSec 5).Content
@@ -1277,8 +1373,8 @@ function Invoke-Phase([string]$label, [bool]$separateTempForB) {
                 }
             } catch { }
         }
-        if ($regs -lt 3) {
-            Write-Host "waited ${registrationBudget}s for three worker registrations at the scheduler; saw $regs (all three nodes had bound their ports AND finished their toolchain surveys, so this covers the first heartbeat only)"
+        if ($regs -lt 2) {
+            Write-Host "waited ${registrationBudget}s for two worker registrations at the scheduler; saw $regs (the scheduler was serving and both workers had finished their toolchain surveys, so this covers the first heartbeat only)"
             foreach ($n in @("sched", "workerA", "workerB")) {
                 Write-Host "--- $n"; Get-Content (Join-Path $phaseDir "$n.err.log") -Tail 20 -ErrorAction SilentlyContinue
             }
