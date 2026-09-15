@@ -138,6 +138,10 @@ fastcached_tree(pragmaBehindBlockComment root)
 file(WRITE "${root}/src/FastCache/Core/Fast.cpp" "#pragma/**/GCC target(\"avx2\")\n")
 fastcached_judge(pragmaBehindBlockComment "${root}" ON "src/FastCache/Core/Fast.cpp:1: a target pragma")
 
+fastcached_tree(pragmaInConfiguredTemplate root)
+file(WRITE "${root}/src/FastCache/Core/Version.hpp.in" "#pragma once\n#pragma GCC target(\"avx2\")\n")
+fastcached_judge(pragmaInConfiguredTemplate "${root}" ON "src/FastCache/Core/Version.hpp.in:2: a target pragma")
+
 fastcached_tree(noSources root)
 file(REMOVE "${root}/src/FastCache/Core/Unit.cpp")
 file(WRITE "${root}/src/README.md" "#pragma GCC target(\"sha\") in prose\n")

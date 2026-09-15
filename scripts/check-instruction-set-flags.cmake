@@ -36,7 +36,8 @@
 # arrives as a refusal. `-arch` names an Apple slice and is refused for any value: `x86_64h` implies AVX2,
 # and nothing here sets `CMAKE_OSX_ARCHITECTURES`. A target triple (`--target=`, `-target`, `-Xclang -triple`)
 # is refused for the same reason, and nothing here sets `CMAKE_<LANG>_COMPILER_TARGET`; so is clang's
-# `-Xclang -target-cpu`, which is `-march=` one layer down.
+# `-Xclang -target-cpu`, which is `-march=` one layer down. Every other spelling of a refused flag is read as
+# the flag it spells: clang's `-Xclang=<flag>`, clang-cl's `-clang:` beside `/clang:`, GCC's `--machine-<ext>`.
 #
 # ## What it does NOT cover, stated so nobody reads it as more
 #
@@ -115,10 +116,13 @@ set(SpellingRows
     "Gnu|refuse|exact|it is clang's own switch for a target triple, reached through -Xclang, and a triple can imply instructions (x86_64h implies AVX2)|-triple"
     "Gnu|refuse|prefix|it names a target triple, and a triple can imply instructions (x86_64h implies AVX2)|--target="
     "Gnu|refuse|flag-value|it names a target triple, and a triple can imply instructions (x86_64h implies AVX2)|-target"
+    "Gnu|unwrap|prefix|clang reads -Xclang=<flag> as -Xclang <flag>, handing the flag to its frontend|-Xclang="
+    "Gnu|refuse|prefix|it is GCC's long spelling of -m (--machine-sha and --machine=sha are -msha)|--machine"
     "Gnu|refuse|prefix|it is an -m flag no row has judged, and -m reaches instruction sets such as -msha and -mavx2|-m"
     "Msvc|refuse|iprefix|it enables an instruction set for the whole translation unit|/arch:"
     "Msvc|refuse|iprefix|it is cl's other spelling of /arch:|-arch:"
     "ClangCl|unwrap|prefix|clang-cl hands what follows to the GCC grammar|/clang:"
+    "ClangCl|unwrap|prefix|clang-cl reads every cl option with a dash as well, so this is /clang:|-clang:"
 )
 
 # reason|extension of a response file this check may leave unread.
@@ -168,11 +172,12 @@ foreach(row IN LISTS SpellingRows)
     else()
         set(alternative "${spelling}")
     endif()
-    # A candidate reaches a matcher with its whitespace folded to one space, so a flag-value row matches its spelling
-    # followed by a value or standing alone.
+    # A candidate reaches a matcher with its whitespace folded to one space and its quotes removed, so a flag-value row
+    # matches its spelling followed by a value or standing alone. Either half of the pair may be quoted (`"-arch"
+    # "x86_64h"`), which a single token never needs to be extracted.
     if(kind STREQUAL "flag-value")
         set(SpellingMatcher${rowIndex} "^${alternative}( |$)")
-        string(APPEND alternative "[ \t\r\n]+${tokenEnd}+")
+        string(APPEND alternative "\"?[ \t\r\n]+\"?${tokenEnd}+")
     elseif(kind STREQUAL "exact")
         set(SpellingMatcher${rowIndex} "^${alternative}$")
         string(APPEND alternative "${tokenEnd}*")
@@ -228,6 +233,7 @@ function(fastcached_candidates text out)
     set(candidates "")
     foreach(token IN LISTS found)
         string(REGEX REPLACE "^[ \t\r\n\"]" "" token "${token}")
+        string(REPLACE "\"" "" token "${token}")
         string(REGEX REPLACE "[ \t\r\n]+" " " token "${token}")
         list(APPEND candidates "${token}")
     endforeach()
