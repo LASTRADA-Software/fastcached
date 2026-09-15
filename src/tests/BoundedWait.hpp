@@ -1,7 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <FastCache/Async/IReactor.hpp>
+#include <FastCache/Async/ResumeOn.hpp>
+#include <FastCache/Async/SleepUntil.hpp>
+#include <FastCache/Async/Task.hpp>
 #include <FastCache/Core/BoundedDrain.hpp>
+#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/EnumTable.hpp>
 
 #include <catch2/catch_message.hpp>
@@ -45,9 +50,9 @@ inline constexpr auto WaitRest = std::chrono::microseconds { 100 };
 /// What a wait that ran out observed: the record `ReadWait` decides on.
 struct WaitReadings
 {
-    std::chrono::milliseconds elapsed;         ///< Real time the wait spent.
+    std::chrono::milliseconds elapsed;         ///< Time the wait spent, on the clock it was bounded by.
     int changes;                               ///< How many times the reported state changed.
-    std::chrono::milliseconds sinceLastChange; ///< Real time since it last changed, or since the start.
+    std::chrono::milliseconds sinceLastChange; ///< Time since it last changed, or since the start, on that clock.
 };
 
 /// What a wait's account concludes. Private to the tests: never stored or sent.
@@ -170,9 +175,57 @@ struct WaitOptions
 struct WaitOutcome
 {
     bool reached;                      ///< Whether the predicate held within the bound.
-    std::chrono::milliseconds elapsed; ///< Real time the wait took, measured on the host's monotonic clock.
+    std::chrono::milliseconds elapsed; ///< Time the wait took, on the clock it was bounded by.
     std::string account; ///< Empty when reached; otherwise what was waited for, what was found, and its reading.
 };
+
+/// The words that differ between a wait on a thread and a wait on a reactor: who gave up, on which
+/// clock, and in what steps.
+struct WaitVoice
+{
+    std::string_view waiter; ///< The helper that gave up.
+    std::string_view clock;  ///< The clock its bound was read from, as the account phrases it.
+    std::string_view steps;  ///< What it counts once per look.
+};
+
+/// `WaitUntil`'s voice: real time, in polls.
+inline constexpr WaitVoice ThreadWaitVoice { .waiter = "WaitUntil", .clock = "of real time", .steps = "poll(s)" };
+
+/// `AwaitUntil`'s voice: the reactor's clock, in turns.
+inline constexpr WaitVoice ReactorWaitVoice { .waiter = "AwaitUntil",
+                                              .clock = "on the reactor's clock",
+                                              .steps = "turn(s)" };
+
+/// The account of a wait that ran out, one wording for both helpers.
+/// @param voice    Who gave up, on which clock, in what steps.
+/// @param what     What was waited for, in words.
+/// @param readings What the wait observed.
+/// @param steps    How many looks it took.
+/// @param seen     The state it last read.
+/// @param context  The untracked context, when the case gave one.
+/// @return The account.
+[[nodiscard]] inline std::string GaveUpAccount(WaitVoice voice,
+                                               std::string_view what,
+                                               WaitReadings const& readings,
+                                               std::size_t steps,
+                                               std::string_view seen,
+                                               std::function<std::string()> const& context)
+{
+    return std::format("{} gave up waiting for {} after {} ms {} and {} {}. State at the end: {}{}{}. It changed {} "
+                       "time(s), and nothing changed in the last {} ms: {}.",
+                       voice.waiter,
+                       what,
+                       readings.elapsed.count(),
+                       voice.clock,
+                       steps,
+                       voice.steps,
+                       seen,
+                       context ? "; " : "",
+                       context ? context() : std::string {},
+                       readings.changes,
+                       readings.sinceLastChange.count(),
+                       WaitReadingTexts.at(static_cast<std::size_t>(ReadWait(readings))).text);
+}
 
 /// Wait until @p reached holds, for at most `options.bound` of REAL time, and say what was found.
 ///
@@ -231,17 +284,7 @@ template <std::predicate Predicate, typename State>
     return WaitOutcome {
         .reached = false,
         .elapsed = elapsed,
-        .account = std::format("WaitUntil gave up waiting for {} after {} ms of real time and {} poll(s). State at the "
-                               "end: {}{}{}. It changed {} time(s), and nothing changed in the last {} ms: {}.",
-                               what,
-                               readings.elapsed.count(),
-                               polling.Polls(),
-                               seen,
-                               options.context ? "; " : "",
-                               options.context ? options.context() : std::string {},
-                               readings.changes,
-                               readings.sinceLastChange.count(),
-                               WaitReadingTexts.at(static_cast<std::size_t>(ReadWait(readings))).text),
+        .account = GaveUpAccount(ThreadWaitVoice, what, readings, polling.Polls(), seen, options.context),
     };
 }
 
@@ -297,14 +340,92 @@ template <typename Reactor, std::predicate Predicate, typename State>
                      });
 }
 
-/// Waits a thread other than the case's runs, with the accounts of any that ran out carried to the case.
+/// How a coroutine waits on its reactor, beyond what it waits for.
+struct ReactorWaitOptions
+{
+    std::function<std::string()> context; ///< Printed once in an account and never tracked for change.
+    Duration bound = std::chrono::duration_cast<Duration>(WaitHangGuard); ///< Reactor-clock time the wait may take.
+    /// Zero yields one reactor turn between looks; anything else sleeps that long on the reactor's clock.
+    Duration rest = Duration::zero();
+};
+
+/// Await, on @p reactor, until @p reached holds, for at most `options.bound` of the REACTOR's clock, and
+/// say what was found (#1453).
+///
+/// **For a coroutine, which must not block the thread it runs on**: `WaitUntil` sleeps its thread, and a
+/// coroutine on a reactor that did so would stall the very loop that has to make @p reached true. So
+/// this parks between looks -- `ResumeOn` or `SleepFor`, both through the reactor, so a teardown frees
+/// the chain from its root (`Detail::UnownedRootOf`, #1025) -- and reads its bound off `reactor->Clock()`,
+/// the clock its sleeps already use: a `ManualClock` case bounds it on manual time.
+///
+/// The account and its reading are `WaitUntilOutcome`'s, in `ReactorWaitVoice`, with durations from the
+/// reactor's clock. Touches no Catch2 state: keep the outcome with `OffThreadWaits::Keep` and assert
+/// `AllReached()` on the case's thread.
+///
+/// **A wait that ran out must end what it was guarding.** The code after it assumed @p reached, so the
+/// caller returns -- or releases what it holds -- instead of carrying on.
+/// @param reactor The reactor the awaiting coroutine runs on; a pointer, as every coroutine here takes one:
+///                a reference parameter is a dangling reference waiting for a caller that outlives it less.
+/// @param what    What is waited for, in words.
+/// @param reached True once it has happened.
+/// @param state   What the parties involved have done so far, in words.
+/// @param options The untracked context, the bound and the rest.
+/// @return Whether @p reached held within the bound, and the account when it did not.
+template <std::predicate Predicate, typename State>
+[[nodiscard]] Task<WaitOutcome> AwaitUntil(
+    IReactor* reactor, std::string what, Predicate reached, State state, ReactorWaitOptions options = {})
+{
+    auto const& clock = reactor->Clock();
+    auto const started = clock.Now();
+    std::string seen = state();
+    auto lastChange = started;
+    auto changes = 0;
+    std::size_t turns = 0;
+    while (!reached())
+    {
+        auto const now = clock.Now();
+        if (now - started >= options.bound)
+        {
+            auto const readings = WaitReadings {
+                .elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - started),
+                .changes = changes,
+                .sinceLastChange = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastChange),
+            };
+            co_return WaitOutcome {
+                .reached = false,
+                .elapsed = readings.elapsed,
+                .account = GaveUpAccount(ReactorWaitVoice, what, readings, turns, seen, options.context),
+            };
+        }
+        if (std::string current = state(); current != seen)
+        {
+            seen = std::move(current);
+            lastChange = now;
+            ++changes;
+        }
+        ++turns;
+        if (options.rest == Duration::zero())
+            co_await ResumeOn { *reactor };
+        else
+            co_await SleepFor(*reactor, options.rest);
+    }
+    co_return WaitOutcome {
+        .reached = true,
+        .elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(clock.Now() - started),
+        .account = {},
+    };
+}
+
+/// Waits run somewhere other than the case's own thread -- a helper thread, or a coroutine on a reactor --
+/// with the accounts of any that ran out carried to the case.
 ///
 /// **Catch2's assertions and messages belong to the thread running the case**: a message from a
 /// helper thread races the case's own Catch2 state, which inside the TSan scope is a reported race and
-/// outside it a torn message. So a helper thread waits through `Wait`, which touches no Catch2 state,
-/// and the case asserts `AllReached()` once that thread is joined -- as its FIRST assertion after the
-/// join, because a wait that ran out is the reason every later assertion would fail, and Catch2 clears
-/// the accounts at the next assertion.
+/// outside it a torn message. So a helper thread waits through `Wait`, and a coroutine keeps what
+/// `AwaitUntil` found through `Keep`, neither touching Catch2 state; the case asserts `AllReached()` once
+/// that thread is joined or that reactor has stopped -- as its FIRST assertion after, because a wait that
+/// ran out is the reason every later assertion would fail, and Catch2 clears the accounts at the next
+/// assertion.
 ///
 /// A step that throws on a helper thread ends the binary, as any exception escaping a thread does: give
 /// a wait there no step that can throw.
@@ -320,7 +441,14 @@ class OffThreadWaits
     template <std::predicate Predicate, typename State>
     [[nodiscard]] bool Wait(std::string_view what, Predicate reached, State state, WaitOptions const& options = {})
     {
-        auto outcome = WaitUntilOutcome(what, std::move(reached), std::move(state), options);
+        return Keep(WaitUntilOutcome(what, std::move(reached), std::move(state), options));
+    }
+
+    /// Keep what a wait already run found -- `AwaitUntil` on a reactor -- with its account when it ran out. Any thread.
+    /// @param outcome What the wait found.
+    /// @return Whether that wait reached what it waited for.
+    [[nodiscard]] bool Keep(WaitOutcome outcome)
+    {
         if (!outcome.reached)
         {
             std::scoped_lock const lock { _mutex };

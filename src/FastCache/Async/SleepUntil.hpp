@@ -81,10 +81,17 @@ struct SleepUntil
 /// `ParkedWork::abandon` name a root that covers it.
 ///
 /// Three waits do this (`InterruptibleSleepUntil`, `DeadlineTimer`,
-/// `ExpiryReaper`) and each has to inline its own loop rather than delegate it,
-/// because awaiting a nested `Task` parks the INNER coroutine's handle and the
-/// handle a teardown has to name would then not be the caller's own. The
-/// arithmetic is the part they can share, and it had drifted into three copies.
+/// `ExpiryReaper`). Awaiting a nested `Task` parks the INNER coroutine's handle, so
+/// a wait whose parked handle something else must take back with `CancelPending`
+/// -- `DeadlineTimer` and `ExpiryReaper` both do -- inlines its loop, since
+/// only the frame that parked can name that handle. A TEARDOWN is no reason to:
+/// since #1025 a reactor frees what it will never resume from the chain's root
+/// (`Detail::UnownedRootOf`), which the nested frame names as well as the caller
+/// would. Shown by `ParkedWork_test.cpp`'s "An abandoned await chain is freed from
+/// its root rather than the frame parked" and by `BoundedWait_test.cpp`'s "A reactor
+/// torn down while a coroutine waits in AwaitUntil frees that coroutine's chain
+/// once". The arithmetic is the part they can share, and it had drifted into three
+/// copies.
 ///
 /// A non-positive `wakeBound` means "do not poll", not "spin": a zero-length
 /// step resolves as already-ready and would turn the loop into a busy reactor
