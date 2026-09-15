@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Async/PlatformReactor.hpp>
-#include <FastCache/Async/SleepUntil.hpp>
 #include <FastCache/Async/Task.hpp>
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Net/BlockingConnector.hpp>
@@ -20,7 +19,12 @@
 
 #include <tests/BoundedWait.hpp>
 
+using FastCache::Testing::AwaitUntil;
 using FastCache::Testing::OffThreadWaits;
+using FastCache::Testing::ReactorWaitOptions;
+using FastCache::Testing::WaitHangGuard;
+using FastCache::Testing::WaitOptions;
+using FastCache::Testing::WaitRest;
 
 /// What `ISocket::CancelRead` does to a PARKED read, on a REAL socket, on this
 /// platform.
@@ -165,17 +169,40 @@ FastCache::DetachedTask ReadParkThenReadAgain(FastCache::PlatformReactor* reacto
     co_return;
 }
 
+/// What the exchange has reached, for a wait's account.
+/// @param observed The reader's observation.
+/// @return Its milestones, in words.
+[[nodiscard]] std::string Describe(Observation const& observed)
+{
+    return std::format("reader armed {}, first read resolved {}, exchange finished {}",
+                       observed.arming.load(std::memory_order_acquire),
+                       observed.firstResolved.load(std::memory_order_acquire),
+                       observed.finished.load(std::memory_order_acquire));
+}
+
 /// Cancel the reader's parked read, ONCE, from the reactor thread.
 ///
 /// Once, not twice -- see the file header. A second call here would cancel the read
 /// the reader armed when this one resumed it inline, which is what the first draft did
 /// and what it measured.
+///
+/// Waits for the reader to arm through `AwaitUntil`, bounded on the reactor's clock
+/// (#1453): a reader that never arms is a red naming what was waited for, not a case
+/// that spins until ctest kills it. **A wait that ran out ends this task there** -- the
+/// cancel it guards would retrieve a read that never parked -- and the client's own wait
+/// for the cancel then runs out after it and closes the socket, which ends the reader.
 /// @param reactor The loop both tasks run on.
 /// @param out The reader's observation; must outlive the task.
-FastCache::DetachedTask CancelWhenParked(FastCache::PlatformReactor* reactor, Observation* out)
+/// @param waits Keeps the wait's account for the case; must outlive the task.
+FastCache::DetachedTask CancelWhenParked(FastCache::PlatformReactor* reactor, Observation* out, OffThreadWaits* waits)
 {
-    while (!out->arming.load(std::memory_order_acquire))
-        co_await FastCache::SleepFor(*reactor, std::chrono::milliseconds { 1 });
+    if (!waits->Keep(co_await AwaitUntil(
+            reactor,
+            "the reader to arm its first read",
+            [out] { return out->arming.load(std::memory_order_acquire); },
+            [out] { return Describe(*out); },
+            ReactorWaitOptions { .context = {}, .bound = WaitHangGuard, .rest = std::chrono::milliseconds { 1 } })))
+        co_return;
 
     // Recorded BEFORE the cancel: the reader set `arming` and then suspended, and this
     // task only runs because it did, so a resolved read here would mean the read never
@@ -227,17 +254,6 @@ FastCache::DetachedTask CancelWithNothingParked(FastCache::PlatformReactor* reac
     co_return;
 }
 
-/// What the exchange has reached, for a wait's account.
-/// @param observed The reader's observation.
-/// @return Its milestones, in words.
-[[nodiscard]] std::string Describe(Observation const& observed)
-{
-    return std::format("reader armed {}, first read resolved {}, exchange finished {}",
-                       observed.arming.load(std::memory_order_acquire),
-                       observed.firstResolved.load(std::memory_order_acquire),
-                       observed.finished.load(std::memory_order_acquire));
-}
-
 } // namespace
 
 TEST_CASE("CancelRead retrieves a parked read and leaves the socket usable", "[net][socket][cancelread]")
@@ -274,15 +290,16 @@ TEST_CASE("CancelRead retrieves a parked read and leaves the socket usable", "[n
     auto const port = listener->BoundPort();
     REQUIRE(port != 0);
 
+    // Declared before the reactor's tasks and the client, so it outlives both the coroutine
+    // and the thread that wait through it.
+    OffThreadWaits waits;
     Observation observed;
     ReadParkThenReadAgain(&reactor, listener.get(), &observed);
-    CancelWhenParked(&reactor, &observed);
+    CancelWhenParked(&reactor, &observed, &waits);
 
     // Recorded here and asserted on the main thread: a `REQUIRE` firing inside a
     // `jthread` body is `std::terminate`, not a failed case.
     std::atomic<bool> connected { false };
-    // Declared before the client, so it outlives the thread that waits through it.
-    OffThreadWaits waits;
 
     std::jthread client { [port, &observed, &connected, &waits] {
         FastCache::BlockingConnector connector;
@@ -295,8 +312,15 @@ TEST_CASE("CancelRead retrieves a parked read and leaves the socket usable", "[n
         // Nothing is sent until the first read has been cancelled, which is what makes
         // that read park rather than complete. Then two bytes, so the read issued after
         // the cancel has something to return.
+        //
+        // Twice the guard: this waits on the reactor task's own bounded wait for the
+        // reader to arm, and two waits with one bound give up together and name the
+        // symptom -- this one -- rather than the cause.
         if (!waits.WaitForFlag(
-                "the parked first read to be cancelled", observed.firstResolved, [&observed] { return Describe(observed); }))
+                "the parked first read to be cancelled",
+                observed.firstResolved,
+                [&observed] { return Describe(observed); },
+                WaitOptions { .step = {}, .context = {}, .bound = 2 * WaitHangGuard, .rest = WaitRest }))
             return;
 
         std::array<std::byte, 2> const payload { std::byte { 'o' }, std::byte { 'k' } };

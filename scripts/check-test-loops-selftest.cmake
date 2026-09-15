@@ -87,8 +87,6 @@ set(canaryFile
         ;
 }
 ")
-set(cancelFile "void Wait(Out* out) { while (!out->arming.load(std::memory_order_acquire)) Sleep(); }\n")
-set(frameFile "void Hold() { while (_held.load(std::memory_order_acquire)) Sleep(); }\n")
 set(liveFile "void Beat(std::atomic<bool>* stopping) { while (!stopping->load(std::memory_order_acquire)) Sleep(); }\n")
 
 # ---------------------------------------------------------------------------
@@ -126,10 +124,8 @@ function(fastcached_stage_and_run name target from to outOutput outApplied)
         "src/FastCache/Core/Clean_test.cpp"
         "src/tests/Helper.hpp"
         "src/tests/TsanCanary.cpp"
-        "src/FastCache/Net/CancelRead_test.cpp"
-        "src/apps/fastcache-compile-node/FrameEndpoint_test.cpp"
         "src/FastCache/Protocol/LiveStreamReactors_test.cpp")
-    set(texts cleanFile helperHeader canaryFile cancelFile frameFile liveFile)
+    set(texts cleanFile helperHeader canaryFile liveFile)
     list(LENGTH files stagedCount)
     math(EXPR lastStaged "${stagedCount} - 1")
     foreach(index RANGE 0 ${lastStaged})
@@ -220,12 +216,12 @@ endfunction()
 set(FastCachedTestLoopCases
     # The baseline, in both enumeration modes. Every refusal below is evidence only if
     # these pass -- and they pass only while every exemption row still matches its site.
-    "baseline via walk|none|-|-|no C-style loop && directory walk (no git index) && 6 exempted site(s) in 4 row(s)|CMake Error"
+    "baseline via walk|none|-|-|no C-style loop && directory walk (no git index) && 4 exempted site(s) in 2 row(s)|CMake Error"
     "baseline via git|none-git|-|-|no C-style loop && git ls-files|CMake Error"
     # A tree inside another checkout is walked, not read from that checkout's index, which
     # knows none of it. Asking "inside a work tree" instead of "at its top" refused every
     # case when ctest staged them under the gate's build directory.
-    "baseline nested in another checkout|none-nested|-|-|no C-style loop && directory walk (no git index) && 6 exempted site(s) in 4 row(s)|CMake Error"
+    "baseline nested in another checkout|none-nested|-|-|no C-style loop && directory walk (no git index) && 4 exempted site(s) in 2 row(s)|CMake Error"
     "a counting loop nested in another checkout|newfile-nested|src/FastCache/Core/Fresh_test.cpp|int F()~n~{~n~    for (int i = 0~sc~ i < 3~sc~ ++i)~n~        Use(i)~sc~~n~}~n~|src/FastCache/Core/Fresh_test.cpp:3: a C-style for loop && directory walk (no git index)|-"
 
     # THE RED ARM.
@@ -239,6 +235,13 @@ set(FastCachedTestLoopCases
     "a loop in a shared helper header|file1|inline int Helper() { return 0~sc~ }|inline int Helper() { int n = 0~sc~ for (int i = 0~sc~ i < 2~sc~ ++i) n += i~sc~ return n~sc~ }|src/tests/Helper.hpp:3: a C-style for loop|-"
     "an atomic polled in a while|newfile|src/FastCache/Core/Spin_test.cpp|void F(std::atomic<bool> const& go)~n~{~n~    while (!go.load(std::memory_order_acquire))~n~        std::this_thread::yield()~sc~~n~}~n~|src/FastCache/Core/Spin_test.cpp:3: a while loop polling an atomic|-"
     "an atomic polled through a pointer|newfile|src/FastCache/Core/Spin_test.cpp|void F(std::atomic<bool>* done)~n~{~n~    while (Count() < 3 && !done->load())~n~        Step()~sc~~n~}~n~|src/FastCache/Core/Spin_test.cpp:3: a while loop polling an atomic|-"
+    # A coroutine parking until a plain flag holds: no atomic, so only this rule sees it (#1453's
+    # EpollConnector and IocpConnector shape).
+    "a coroutine parking a turn at a time|newfile|src/FastCache/Net/Park_test.cpp|DetachedTask F(IReactor* loop, bool const* done)~n~{~n~    while (!*done)~n~        co_await FastCache::ResumeOn { *loop }~sc~~n~}~n~|src/FastCache/Net/Park_test.cpp:3: a coroutine polling on its reactor && test-loops: 1 site(s) break the loop rules|-"
+    "a coroutine sleeping in a braced body|newfile|src/FastCache/Net/Park_test.cpp|Task<int> F(IReactor* reactor, Held const* held)~n~{~n~    while (held->Is(Order::Acquire))~n~    {~n~        co_await SleepFor(*reactor, std::chrono::milliseconds { 1 })~sc~~n~        Note()~sc~~n~    }~n~    co_return 0~sc~~n~}~n~|src/FastCache/Net/Park_test.cpp:3: a coroutine polling on its reactor|-"
+    # Both rules match a coroutine parking until an atomic flips (#1453's CancelRead and FrameEndpoint
+    # shape), and it is ONE site: counted twice, the refusal would overstate what is wrong.
+    "a coroutine parking until an atomic flips is one site|newfile|src/FastCache/Net/Park_test.cpp|DetachedTask F(IReactor* reactor, std::atomic<bool> const* armed)~n~{~n~    while (!armed->load(std::memory_order_acquire))~n~        co_await SleepUntil { .reactor = reactor, .deadline = reactor->Clock().Now() + Step }~sc~~n~}~n~|src/FastCache/Net/Park_test.cpp:3: a coroutine polling on its reactor && test-loops: 1 site(s) break the loop rules|a while loop polling an atomic"
 
     # A violation BEHIND a comment: prose above it and a trailing comment on its own line
     # must not hide it, and the line number must survive list structure planted above it.
@@ -258,12 +261,16 @@ set(FastCachedTestLoopCases
     "a counting loop whose init holds a lambda|newfile|src/FastCache/Core/Fresh_test.cpp|void F()~n~{~n~    for (auto f = ~lb~~rb~ { return 0~sc~ }~sc~ f() < 3~sc~)~n~        Use()~sc~~n~}~n~|src/FastCache/Core/Fresh_test.cpp:3: a C-style for loop|-"
     "a counting loop whose condition calls a lambda|newfile|src/FastCache/Core/Fresh_test.cpp|void F(int n)~n~{~n~    for (int i = 0~sc~ i < Pick(n, ~lb~~rb~ { return 1~sc~ })~sc~ ++i)~n~        Use(i)~sc~~n~}~n~|src/FastCache/Core/Fresh_test.cpp:3: a C-style for loop|-"
     "a while that polls no atomic|newfile|src/FastCache/Core/While_test.cpp|void F(std::istream& in)~n~{~n~    std::string line~sc~~n~    while (std::getline(in, line))~n~        Use(line)~sc~~n~}~n~|no C-style loop|CMake Error"
+    "a coroutine that works before it parks|newfile|src/FastCache/Net/Beat_test.cpp|DetachedTask Beat(IReactor* reactor, Beats* beats)~n~{~n~    while (!beats->stopping)~n~    {~n~        auto const deadline = reactor->Clock().Now() + Step~sc~~n~        co_await SleepUntil { .reactor = reactor, .deadline = deadline }~sc~~n~    }~n~}~n~|no C-style loop|CMake Error"
+    "a coroutine reading until its peer is done|newfile|src/FastCache/Net/Read_test.cpp|Task<int> Drain(ISocket* socket, std::span<std::byte> buffer)~n~{~n~    auto eof = false~sc~~n~    while (!eof)~n~        eof = (co_await socket->Read(buffer)).value_or(0) == 0~sc~~n~    co_return 0~sc~~n~}~n~|no C-style loop|CMake Error"
+    "a coroutine parking a fixed number of turns|newfile|src/FastCache/Net/Turns_test.cpp|DetachedTask F(IReactor* loop, int turns)~n~{~n~    for (auto const turn: std::views::iota(0, turns))~n~        co_await ResumeOn { *loop }~sc~~n~}~n~|no C-style loop|CMake Error"
+    "a coroutine awaiting a name that only begins like a park|newfile|src/FastCache/Net/Name_test.cpp|DetachedTask F(IReactor* loop, bool const* done)~n~{~n~    while (!*done)~n~        co_await ResumeOnce(loop)~sc~~n~}~n~|no C-style loop|CMake Error"
     "a function merely named for|newfile|src/FastCache/Core/Name_test.cpp|int transform_for(int a)~sc~~n~int platform(int b)~sc~~n~int x = transform_for(1)~sc~~n~|no C-style loop|CMake Error"
 
     # EXEMPTIONS, both directions.
-    "the exempted text in another file is not exempt|newfile|src/FastCache/Core/Copy_test.cpp|void Wait(Out* out)~n~{~n~    while (!out->arming.load(std::memory_order_acquire))~n~        Sleep()~sc~~n~}~n~|src/FastCache/Core/Copy_test.cpp:3: a while loop polling an atomic|-"
-    "a second site in an exempted file needs its own row|file3|Sleep()~sc~ }|Sleep()~sc~ }~n~void Other(std::atomic<bool>& ready) { while (!ready.load()) Sleep()~sc~ }|src/FastCache/Net/CancelRead_test.cpp:2: a while loop polling an atomic|-"
-    "an exemption whose site is gone is STALE|file3|while (!out->arming.load(std::memory_order_acquire)) Sleep()~sc~|WaitUntilArmed()~sc~|matching no site && out->arming.load( && STALE|-"
+    "the exempted text in another file is not exempt|newfile|src/FastCache/Core/Copy_test.cpp|void Beat(std::atomic<bool>* stopping)~n~{~n~    while (!stopping->load(std::memory_order_acquire))~n~        Sleep()~sc~~n~}~n~|src/FastCache/Core/Copy_test.cpp:3: a while loop polling an atomic|-"
+    "a second site in an exempted file needs its own row|file3|Sleep()~sc~ }|Sleep()~sc~ }~n~void Other(std::atomic<bool>& ready) { while (!ready.load()) Sleep()~sc~ }|src/FastCache/Protocol/LiveStreamReactors_test.cpp:2: a while loop polling an atomic|-"
+    "an exemption whose site is gone is STALE|file3|while (!stopping->load(std::memory_order_acquire)) Sleep()~sc~|BeatUntilStopped()~sc~|matching no site && stopping->load( && STALE|-"
 
     # --- fails CLOSED ---
     "a scope row that matches nothing|noheader|-|-|matched no file && src/tests/*.hpp|-"

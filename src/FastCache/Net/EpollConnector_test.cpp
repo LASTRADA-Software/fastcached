@@ -5,7 +5,6 @@
 
     #include <FastCache/Async/DeadlineTimer.hpp>
     #include <FastCache/Async/EpollReactor.hpp>
-    #include <FastCache/Async/ResumeOn.hpp>
     #include <FastCache/Async/Task.hpp>
     #include <FastCache/Core/Clock.hpp>
     #include <FastCache/Net/EpollSocket.hpp>
@@ -19,16 +18,24 @@
     #include <chrono>
     #include <cstddef>
     #include <cstdint>
+    #include <format>
     #include <memory>
     #include <optional>
     #include <ranges>
     #include <span>
     #include <string>
+    #include <tuple>
     #include <vector>
 
     #include <arpa/inet.h>
     #include <netinet/in.h>
+    #include <tests/BoundedWait.hpp>
     #include <tests/Unwrap.hpp>
+
+using FastCache::Testing::AwaitUntil;
+using FastCache::Testing::OffThreadWaits;
+using FastCache::Testing::ReactorWaitOptions;
+using FastCache::Testing::WaitHangGuard;
 
 using namespace std::chrono_literals;
 
@@ -74,7 +81,8 @@ FastCache::DetachedTask DriveExchange(FastCache::EpollReactor* loop,
                                       FastCache::EpollListener* server,
                                       std::uint16_t port,
                                       std::optional<FastCache::SocketResult>* out,
-                                      std::vector<std::byte>* seen)
+                                      std::vector<std::byte>* seen,
+                                      OffThreadWaits* waits)
 {
     // Armed before the dial, so the accept is already pending when the SYN
     // arrives rather than racing it.
@@ -101,8 +109,16 @@ FastCache::DetachedTask DriveExchange(FastCache::EpollReactor* loop,
             // what has to wake it -- through the reactor.
             (void) co_await FastCache::SendAll(peer, payload);
 
-            while (!readDone)
-                co_await FastCache::ResumeOn { *loop };
+            // Bounded on the reactor's clock (#1453), below the watchdog's 15 s, so a read that never
+            // returns is a red naming what was waited for rather than a stopped loop and a short echo.
+            // A wait that ran out goes straight on to what follows, which is only releasing: closing
+            // what this task holds and stopping the loop is how it ends either way.
+            std::ignore = waits->Keep(co_await AwaitUntil(
+                loop,
+                "the parked read to return the payload",
+                [done = &readDone] { return *done; },
+                [done = &readDone, seen] { return std::format("read done {}, {} byte(s) seen", *done, seen->size()); },
+                ReactorWaitOptions { .context = {}, .bound = WaitHangGuard, .rest = FastCache::Duration::zero() }));
 
             peer->Close();
         }
@@ -123,6 +139,9 @@ TEST_CASE("A reactor dial connects and then actually transfers bytes", "[net][ep
     // and which EpollSocket ignores. The result would be a socket the reactor
     // never watches, whose every read parks forever, with nothing logged. A dial
     // that only asserted success would pass against exactly that.
+    //
+    // Declared before the reactor, so it outlives every task that keeps an account in it.
+    OffThreadWaits waits;
     FastCache::SteadyClock clock;
     FastCache::EpollReactor reactor { clock };
 
@@ -136,7 +155,7 @@ TEST_CASE("A reactor dial connects and then actually transfers bytes", "[net][ep
     std::optional<FastCache::SocketResult> dialed;
     std::vector<std::byte> echoed;
 
-    DriveExchange(&reactor, &connector, listener.get(), listener->BoundPort(), &dialed, &echoed);
+    DriveExchange(&reactor, &connector, listener.get(), listener->BoundPort(), &dialed, &echoed, &waits);
 
     // Bounded, not merely expected to finish. The defect this case exists for --
     // a socket the reactor never watches, because the dial's own handler was
@@ -149,6 +168,8 @@ TEST_CASE("A reactor dial connects and then actually transfers bytes", "[net][ep
 
     reactor.Run();
 
+    // First, while the account of a wait that ran out is still attached.
+    CHECK(waits.AllReached());
     REQUIRE(dialed.has_value());
     auto const& outcome = FastCache::Testing::Unwrap(dialed);
     INFO("dial outcome: " << (outcome.has_value() ? std::string { "connected" } : outcome.error().ToString()));

@@ -5,7 +5,6 @@
 #include "NodeIoLoop.hpp"
 #include "Responders.hpp"
 
-#include <FastCache/Async/SleepUntil.hpp>
 #include <FastCache/Auth/AuthPolicy.hpp>
 #include <FastCache/Core/BoundedDrain.hpp>
 #include <FastCache/Core/Clock.hpp>
@@ -42,11 +41,14 @@
 #include <vector>
 
 #include <tests/AbortiveClient.hpp>
+#include <tests/BoundedWait.hpp>
 #include <tests/Unwrap.hpp>
 #include <tests/WireReply.hpp>
 
 using namespace FastCache;
 using namespace FastCache::Node;
+using FastCache::Testing::AwaitUntil;
+using FastCache::Testing::ReactorWaitOptions;
 using FastCache::Testing::Unwrap;
 using namespace std::chrono_literals;
 
@@ -653,8 +655,28 @@ class HoldableResponder final: public IFrameResponder
             _sawEntry.store(true, std::memory_order_release);
         }
         _entered.fetch_add(1, std::memory_order_acq_rel);
-        while (_held.load(std::memory_order_acquire))
-            co_await FastCache::SleepFor(*_reactor, std::chrono::milliseconds { 1 });
+        // Bounded on the reactor's clock (#1453). **A hold that ran out goes no further than the
+        // reply the endpoint is still owed**: the plain `Miss`, counted as returned so a case
+        // waiting for the answer sees it, with no payload built -- and the account `Release()`
+        // asserts. Kept BEFORE this answer counts itself out of the hold, because that count is
+        // what `Release()` waits on before it reads the accounts.
+        if (_held.load(std::memory_order_acquire))
+        {
+            _insideHold.fetch_add(1, std::memory_order_acq_rel);
+            auto const bound = std::chrono::milliseconds { _holdBoundMs.load(std::memory_order_acquire) };
+            auto const released = _waits.Keep(co_await AwaitUntil(
+                _reactor,
+                "the case to release the answer's hold",
+                [this] { return !_held.load(std::memory_order_acquire); },
+                [this] { return std::format("{} answer(s) entered, {} returned", Entered(), Answered()); },
+                ReactorWaitOptions { .context = {}, .bound = bound, .rest = std::chrono::milliseconds { 1 } }));
+            _insideHold.fetch_sub(1, std::memory_order_acq_rel);
+            if (!released)
+            {
+                _answered.fetch_add(1, std::memory_order_acq_rel);
+                co_return Wire::EncodeReply(Wire::Status::Miss, {});
+            }
+        }
         _answered.fetch_add(1, std::memory_order_acq_rel);
         if (auto const size = _replyPayloadBytes.load(std::memory_order_acquire); size != 0)
             co_return Wire::EncodeReply(Wire::Status::Ok, std::vector<std::byte>(size, std::byte { 0x5A }));
@@ -908,6 +930,52 @@ class HoldableResponder final: public IFrameResponder
         _held.store(held, std::memory_order_release);
     }
 
+    /// End a hold, and assert that no held answer had already given up waiting for it (#1453).
+    ///
+    /// **Asserted HERE, on the case's thread, and not later.** It waits for every answer inside
+    /// the hold to leave it -- promptly after a release that lands, at the hold's bound after one
+    /// that does not -- and then asserts the accounts, before the case asserts anything the
+    /// released answer does. Measured under a release that never lands: asserted in this
+    /// responder's destructor instead, four of the fifteen holding cases failed a `REQUIRE` on a
+    /// symptom first -- a delivery not recorded, a pipelined request not entered -- and unwound
+    /// past the account, and three ended before their hold's bound with no account at all, so
+    /// they stayed green.
+    ///
+    /// A case whose `REQUIRE` fails INSIDE the held window never gets here, and should not: that
+    /// failure is the cause, and the hold then gives up at its bound and answers the endpoint.
+    void Release()
+    {
+        Hold(false);
+        auto const bound =
+            std::chrono::milliseconds { _holdBoundMs.load(std::memory_order_acquire) } + FastCache::Testing::WaitHangGuard;
+        auto const left = FastCache::Testing::WaitUntil(
+            "every held answer to leave its hold",
+            [this] { return _insideHold.load(std::memory_order_acquire) == 0; },
+            [this] {
+                return std::format("{} answer(s) inside the hold, {} entered, {} returned",
+                                   _insideHold.load(std::memory_order_acquire),
+                                   Entered(),
+                                   Answered());
+            },
+            FastCache::Testing::WaitOptions {
+                .step = {}, .context = {}, .bound = bound, .rest = FastCache::Testing::WaitRest });
+        CHECK(left);
+        CHECK(_waits.AllReached());
+    }
+
+    /// How long a held answer waits for `Release()`, on the reactor's clock, before it gives up.
+    ///
+    /// `WaitHangGuard` unless a case's held window legitimately lasts seconds -- the two
+    /// sweep cases that wait out `FrameServer::HeaderTimeout` inside it, with 30 s and 60 s
+    /// waits: the hold is the outer wait there, and an outer wait with the shorter bound would
+    /// give up first and name the symptom rather than the cause. Every other held window waits
+    /// only for an answer to be entered or a 50 ms window to be swept.
+    /// @param bound The bound for every answer held after this call.
+    void HoldAtMost(std::chrono::milliseconds bound) noexcept
+    {
+        _holdBoundMs.store(bound.count(), std::memory_order_release);
+    }
+
     void Limit(std::size_t concurrent, std::size_t budget) noexcept
     {
         _concurrent = concurrent;
@@ -992,6 +1060,12 @@ class HoldableResponder final: public IFrameResponder
   private:
     FastCache::IReactor* _reactor { nullptr };
     std::atomic<bool> _held { false };
+    /// Milliseconds, because the case sets it and the reactor thread reads it.
+    std::atomic<std::chrono::milliseconds::rep> _holdBoundMs { FastCache::Testing::WaitHangGuard.count() };
+    /// Answers waiting inside a hold right now, which `Release()` waits to reach zero.
+    std::atomic<std::size_t> _insideHold { 0 };
+    /// The accounts of held answers that gave up, asserted by `Release()`.
+    FastCache::Testing::OffThreadWaits _waits;
     std::atomic<bool> _refusePeers { false };
     /// The one verb to refuse, or -1. An `int` because `std::atomic<std::optional<>>`
     /// is not lock-free and this is read on the accept path.
@@ -1471,7 +1545,7 @@ TEST_CASE("A held answer does not stop another client being served", "[node][fra
     REQUIRE(WaitFor([&responder] { return responder.Entered() >= 2; })); // waited for: the second answer to begin
     CHECK(responder.Entered() == 2);
 
-    responder.Hold(false);
+    responder.Release();
 
     // Bounded, so a regression reports as this assertion rather than as a suite
     // timeout naming nothing.
@@ -1814,7 +1888,7 @@ TEST_CASE("A self-accounting surface stops holding the endpoint's budget while i
     // ticket is about. Read from outside, so the two are independent observations.
     CHECK((*endpoint)->InFlightBytes() == 0);
 
-    responder.Hold(false);
+    responder.Release();
     REQUIRE(client.wait_for(15s) == std::future_status::ready);
     CHECK_FALSE(client.get().empty());
 }
@@ -1856,7 +1930,7 @@ TEST_CASE("A surface that does not account for itself keeps the endpoint's budge
     CHECK(Unwrap(atEntry) == declared);
     CHECK((*endpoint)->InFlightBytes() == declared);
 
-    responder.Hold(false);
+    responder.Release();
     REQUIRE(client.wait_for(15s) == std::future_status::ready);
     CHECK_FALSE(client.get().empty());
 }
@@ -1909,7 +1983,7 @@ TEST_CASE("A long self-accounting answer does not refuse the small verbs sharing
     REQUIRE(WaitFor([&responder] { return responder.Entered() >= 3; })); // waited for: the third answer to begin
     CHECK(responder.Entered() == 3);
 
-    responder.Hold(false);
+    responder.Release();
     REQUIRE(firstBig.wait_for(15s) == std::future_status::ready);
     REQUIRE(secondBig.wait_for(15s) == std::future_status::ready);
     REQUIRE(small.wait_for(15s) == std::future_status::ready);
@@ -1953,6 +2027,8 @@ TEST_CASE("A peer swept before naming a verb and one swept owing an answer are c
     // header window is a constant of the surface and is not shortened, which is why
     // this case costs `FrameServer::HeaderTimeout`.
     responder.PlaceRequestTimeout(50ms);
+    // Past this case's 60 s wait for both sweeps, which runs inside the held window.
+    responder.HoldAtMost(90s);
     responder.Hold(true);
 
     auto const port = FreePort();
@@ -2002,7 +2078,7 @@ TEST_CASE("A peer swept before naming a verb and one swept owing an answer are c
 
     (*silent)->Close();
     (*owed)->Close();
-    responder.Hold(false);
+    responder.Release();
 }
 
 TEST_CASE("The explanation grace scales with the verb's own window", "[node][frame][sweep]")
@@ -2078,6 +2154,9 @@ TEST_CASE("A peer swept inside the surface is told why, and one swept on the soc
     // lease timeout. The responder owns this number in production too, so shortening
     // it exercises the real mechanism rather than a test seam.
     responder.PlaceRequestTimeout(50ms);
+    // Past this case's 30 s wait to enter and 60 s wait for both sweeps, which run inside
+    // the held window.
+    responder.HoldAtMost(90s);
     responder.Hold(true);
 
     auto const port = FreePort();
@@ -2135,7 +2214,7 @@ TEST_CASE("A peer swept inside the surface is told why, and one swept on the soc
     // Released only now, so `Answer` returns AFTER the sweep. This is the instant the
     // whole design is about: the connection is holding a perfectly good reply and owes
     // its peer a refusal, and exactly one of them may reach the socket.
-    responder.Hold(false);
+    responder.Release();
 
     // ARM ONE's whole byte stream, to EOF. `ReadOneReply` would not do: it stops at
     // the first frame, so it cannot see a second one spliced in behind -- and "the
@@ -2249,7 +2328,7 @@ TEST_CASE("A client that vanishes mid-answer is noticed, and its object is not w
     INFO("watch saw the departure=" << seen << " after " << seenMs.count() << "ms");
     REQUIRE(seen);
 
-    responder.Hold(false);
+    responder.Release();
 
     // **TWO further waits, because they are two diagnoses**, and one `REQUIRE` over
     // the counter alone could not tell them apart: `WaitFor(...)` expanding to
@@ -2349,7 +2428,7 @@ TEST_CASE("A client that RESETS mid-answer is noticed, and its object is not wri
         return fleet.metrics.Read(IMetricsSink::Counter::FramePeerWatchDeparturesObserved) == observedBefore + 1;
     })); // waited for: the watcher to reach its verdict
 
-    responder.Hold(false);
+    responder.Release();
 
     // And the compile still completed, which is the half the title claims and the
     // watcher cannot show. Bounded, and asserted after the release because that is
@@ -2550,7 +2629,7 @@ TEST_CASE("A connection this node sweeps is not filed as a peer departure", "[no
     // Released, so `ExplainIfSwept` writes the deferred refusal and the loop breaks --
     // past the guard's scope and into the close, which is the close whose effect on
     // the watcher is this case's subject.
-    responder.Hold(false);
+    responder.Release();
 
     // **Which of the two guards suppresses the count here is measured, not pinned, and
     // the difference matters.** `ExplanationGraceFor(50ms)` is `max(window,
@@ -2630,7 +2709,7 @@ TEST_CASE("A connection this node closes at SHUTDOWN is not filed as a peer depa
     }));
 
     // Released only now, so the answer returns AFTER the close and the drain completes.
-    responder.Hold(false);
+    responder.Release();
     stopper.join();
 
     // The verdict. `consulted` is false because the connection never left the responder
@@ -2673,7 +2752,7 @@ TEST_CASE("A request pipelined while a watched answer runs is still served", "[n
     // the bytes the watcher takes in order to tell EOF from data, and they must come
     // back to the one reader allowed to parse this stream.
     REQUIRE(client.SendOnly(Fetch("second-request-key-with-a-non-empty-payload")));
-    responder.Hold(false);
+    responder.Release();
 
     CHECK_FALSE(client.ReadReply().empty());
 
@@ -2715,7 +2794,7 @@ TEST_CASE("A watched answer to a client that simply waits is delivered whole", "
     auto client = std::async(std::launch::async, [port, &request] { return Exchange(port, request); });
     REQUIRE(WaitFor([&responder] { return responder.Entered() == 1; })); // waited for: the answer to begin
 
-    responder.Hold(false);
+    responder.Release();
     REQUIRE(client.wait_for(WatchWait) == std::future_status::ready); // waited for: the reply
 
     auto const reply = client.get();
@@ -2754,7 +2833,7 @@ TEST_CASE("A pulsed answer is preceded by pulses and ends with the reply", "[nod
     // Several intervals, so what is asserted is a CADENCE rather than one frame that
     // could have been an accident of scheduling.
     std::this_thread::sleep_for(Interval * 8);
-    responder.Hold(false);
+    responder.Release();
 
     auto const stream = client.ReadRest();
     REQUIRE_FALSE(stream.empty());
@@ -2804,7 +2883,7 @@ TEST_CASE("A surface that asks for no pulse writes exactly one frame", "[node][f
     // The same wall-clock hold the case above uses, so the difference between them is
     // the cadence and not the timing.
     std::this_thread::sleep_for(160ms);
-    responder.Hold(false);
+    responder.Release();
 
     auto const stream = client.ReadRest();
     auto const statuses = StatusSequence(stream);
@@ -2880,7 +2959,7 @@ TEST_CASE("A socket this node closed itself is not filed as a client that walked
     CHECK(silence.empty());
 
     // And only now does the answer come back, to a socket this node closed itself.
-    responder.Hold(false);
+    responder.Release();
     REQUIRE(WaitFor([&responder] { return responder.Answered() == 1; })); // waited for: the answer to return
 
     CHECK(fleet.metrics.Read(IMetricsSink::Counter::WorkerJobsAbandonedClientGone) == 0);

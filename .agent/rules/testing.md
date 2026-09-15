@@ -1007,9 +1007,19 @@ hand-rolled deadline loops, and -- twice -- not bounding at all.
   are the RED-into-HANG rule above, and both were only visible once the wait could be made to
   fail -- so neuter a new wait, and watch what the case does after it.
 
-`ctest -R test-loops` refuses a `while` that polls an atomic in a test, along with any C-style
-`for`; its header says what it does not cover. A coroutine waiting on its own reactor cannot
-block that thread and is bounded on the reactor's clock instead (#1453).
+- **`AwaitUntil` in a coroutine on a reactor, and a wait that ran out STOPS the coroutine.** A
+  coroutine cannot block its own reactor thread in `WaitUntil`, so it parks between looks and
+  is bounded on the reactor's clock (#1453) -- a `ManualClock` reactor's bound is manual time,
+  asserted exactly. Its outcome goes to `OffThreadWaits::Keep`, and where that answers false the
+  coroutine `co_return`s or releases only what it holds: running on as if the wait had held
+  asserts, writes or cancels against a state that never arrived, and the account then names the
+  symptom rather than the wait. A test FAKE that waits inside an answer settles the reply it
+  still owes (`FrameEndpoint_test`'s held responder returns a counted `Miss`) and asserts its
+  accounts where every case using it reaches -- its destructor, skipped while a failure unwinds.
+
+`ctest -R test-loops` refuses a `while` that polls an atomic in a test, a coroutine `while`
+whose body opens by parking on its reactor, and any C-style `for`; its header says what it
+does not cover, and the coroutine rule reads only the one shape #1453's census found.
 
 ## The POSIX fixtures share one helper library, and a bound is read from a clock
 
