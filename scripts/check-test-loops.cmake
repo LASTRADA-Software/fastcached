@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
-# The tests' loops: no C-style `for`, and no `while` that polls an atomic.
+# The tests' loops: no C-style `for`, no `while` that polls an atomic, and no coroutine
+# `while` that does nothing but park on its reactor until something holds.
 #
 # ## Why a check and not a sentence
 #
@@ -20,6 +21,11 @@
 # blocking read spun unbounded). The tree's one test wait is `src/tests/BoundedWait.hpp`:
 # `WaitUntil` on the case's thread, `OffThreadWaits` on a helper thread.
 #
+# The third is the same wait run by a COROUTINE, which cannot block its own reactor thread in
+# `WaitUntil` and so parked a turn or a millisecond at a time with no bound at all: four tests
+# did (#1453), two of them on a plain `bool` the atomic rule cannot see. Their wait is
+# `AwaitUntil`, bounded on the reactor's own clock.
+#
 # ## What it matches
 #
 # Over the file with its comments removed and its newlines kept
@@ -32,14 +38,17 @@
 #     lambda body -- is read as one element, so the `;` inside it are not the header's: a
 #     counting loop whose init or condition holds a lambda is still refused, and a range-for
 #     whose init-statement or range holds one is still quiet;
-#   * a `while (` whose condition calls `.load(` or `->load(`.
+#   * a `while (` whose condition calls `.load(` or `->load(`;
+#   * a `while (` whose body STARTS with `co_await` of `SleepFor`, `SleepUntil` or `ResumeOn`,
+#     braced or not, whatever its condition reads. A site both rules match is one site,
+#     reported by this rule.
 #
 # ## What it does NOT cover, said here so nobody over-applies it
 #
 #   * A `while` that is not polling an atomic -- stepping through `find()` or `getline()`, or
-#     reading until a peer is done -- is ordinary and stays. So is a `while` a COROUTINE runs
-#     on a reactor; those are refused here only when they poll an atomic, and the four that
-#     do are #1453's, bounded on the reactor's own clock rather than through `WaitUntil`.
+#     reading until a peer is done -- is ordinary and stays. So is a coroutine `while` that
+#     WORKS before it parks, as a heartbeat beats and then sleeps, and a `for` that parks a
+#     fixed number of turns: neither is waiting for something to hold.
 #   * `vendor/` is not scanned: it is another project's code, changed upstream.
 #   * Non-test sources are #1452, whose change adds its row to the scope table below.
 #   * A token inside a STRING LITERAL reads as code, as in every regex-shaped reader here.
@@ -53,6 +62,12 @@
 #     (`for (auto const sep = ";"; auto const& item: items)`), because literals read as code:
 #     that header holds two `;` as this reader counts them. C++ has no other way to put a
 #     second `;` in a range-for's header outside a brace or parenthesis group.
+#   * The coroutine rule FAILS OPEN on a wait spelled any other way: a park that is not the
+#     body's first statement (`while (!done) { ++turns; co_await ResumeOn { *loop }; }`), a
+#     park through a coroutine of another name, a `do ... while`, a coroutine that awaits
+#     ITSELF until the condition holds, and a condition nested three parentheses deep or
+#     holding a lambda. It reads the one shape #1453's census found, all four times; a wait
+#     spelled another way is left to review rather than guessed at by a wider pattern.
 #
 # ## Exemptions
 #
@@ -91,14 +106,13 @@ set(FastCachedTestLoopScope
 #
 # rule|file|text the matched header contains|reason
 #
-# `rule` is `loop` or `spin`. The text is matched against the header as the scan read it,
-# from its keyword to its second `;` (a loop) or its `load(` (a spin). None of the four
+# `rule` is `loop`, `spin` or `poll`. The text is matched against the header as the scan read
+# it, from its keyword to its second `;` (a loop), its `load(` (a spin) or the name of the
+# park that opens its body and the character after it (a poll). None of the four
 # fields may contain `|` or `;`, and the text may not contain `[` or `]`: these rows are a
 # CMake list. Checked below rather than left as a comment nothing reads.
 set(FastCachedTestLoopExemptions
     "loop|src/tests/TsanCanary.cpp|for (|The ThreadSanitizer canary's loops are its race: a change to this file is judged by a RATE over a few hundred runs (scripts/tsan-canary-rate.sh), never by a green run, and rewriting three loops would re-open that measurement for a spelling."
-    "spin|src/FastCache/Net/CancelRead_test.cpp|out->arming.load(|A coroutine on the reactor waiting for the reader to arm: it cannot block its own reactor thread in WaitUntil, and its reactor-clock bound is #1453."
-    "spin|src/apps/fastcache-compile-node/FrameEndpoint_test.cpp|_held.load(|A handler coroutine held until the case releases it, sleeping on its own reactor: its reactor-clock bound is #1453."
     "spin|src/FastCache/Protocol/LiveStreamReactors_test.cpp|stopping->load(|Not a wait: a heartbeat coroutine that beats until the case says stop, and whose frame the rig's reactors free when a case ends early."
 )
 
@@ -109,7 +123,12 @@ set(braceGroup "\\{[^{}]*\\}")
 set(innerParens "\\(([^;(){}]|${braceGroup})*\\)")
 set(headerElement "([^;(){}]|${braceGroup}|\\(([^;(){}]|${innerParens}|${braceGroup})*\\))")
 set(loopPattern "(^|[^A-Za-z0-9_])for[ \t\r\n]*\\(${headerElement}*;${headerElement}*;")
-set(spinPattern "(^|[^A-Za-z0-9_])while[ \t\r\n]*\\(([^;(){}]|\\(([^;(){}]|\\([^;(){}]*\\))*\\))*(\\.|->)load[ \t\r\n]*\\(")
+set(whileCondition "([^;(){}]|\\(([^;(){}]|\\([^;(){}]*\\))*\\))*")
+set(spinPattern "(^|[^A-Za-z0-9_])while[ \t\r\n]*\\(${whileCondition}(\\.|->)load[ \t\r\n]*\\(")
+# The condition, its closing `)`, an optional `{`, then the park -- qualified or not -- and one
+# character that ends its name, so `ResumeOnce` is not `ResumeOn`.
+set(pollPattern
+    "(^|[^A-Za-z0-9_])while[ \t\r\n]*\\(${whileCondition}\\)[ \t\r\n]*\\{?[ \t\r\n]*co_await[ \t\r\n]+([A-Za-z_][A-Za-z0-9_]*[ \t\r\n]*::[ \t\r\n]*)*(SleepFor|SleepUntil|ResumeOn)[^A-Za-z0-9_]")
 
 # ---------------------------------------------------------------------------
 # Exemption rows, checked for shape before anything is decided from them.
@@ -126,8 +145,8 @@ foreach(row IN LISTS FastCachedTestLoopExemptions)
     list(GET fields 1 exemptFile)
     list(GET fields 2 exemptText)
     list(GET fields 3 exemptReason)
-    if(NOT exemptRule MATCHES "^(loop|spin)$")
-        message(FATAL_ERROR "test-loops: exemption rule `${exemptRule}` is neither `loop` nor `spin`:\n  ${row}")
+    if(NOT exemptRule MATCHES "^(loop|spin|poll)$")
+        message(FATAL_ERROR "test-loops: exemption rule `${exemptRule}` is not `loop`, `spin` or `poll`:\n  ${row}")
     endif()
     if(exemptText MATCHES "[][]" OR exemptText STREQUAL "" OR exemptReason STREQUAL "")
         message(FATAL_ERROR
@@ -239,7 +258,10 @@ foreach(relative IN LISTS sourceFiles)
     list(LENGTH anyFor anyForCount)
     math(EXPR loopsSeen "${loopsSeen} + ${anyForCount}")
 
-    foreach(rule loop spin)
+    # `poll` before `spin`, and each `while` it decides is not decided again: a coroutine
+    # parking until an atomic flips matches both, and is one site to convert, not two.
+    set(pollSites "")
+    foreach(rule loop poll spin)
         set(rest "${code}")
         set(consumed 0)
         while(TRUE)
@@ -260,6 +282,13 @@ foreach(relative IN LISTS sourceFiles)
             list(LENGTH newlines newlineCount)
             math(EXPR lineNumber "${newlineCount} + 1")
 
+            set(decided FALSE)
+            if(rule STREQUAL "poll")
+                list(APPEND pollSites ${absolute})
+            elseif(rule STREQUAL "spin" AND absolute IN_LIST pollSites)
+                set(decided TRUE)
+            endif()
+
             set(exempted FALSE)
             foreach(index RANGE 0 ${exemptionCount})
                 if(index EQUAL exemptionCount)
@@ -274,7 +303,8 @@ foreach(relative IN LISTS sourceFiles)
                     endif()
                 endif()
             endforeach()
-            if(exempted)
+            if(decided)
+            elseif(exempted)
                 math(EXPR exemptedCount "${exemptedCount} + 1")
             else()
                 # Text, not a list: a loop's header holds its own `;`, which a CMake list would
@@ -283,6 +313,8 @@ foreach(relative IN LISTS sourceFiles)
                 math(EXPR violationCount "${violationCount} + 1")
                 if(rule STREQUAL "loop")
                     string(APPEND violations "\n  ${relative}:${lineNumber}: a C-style for loop: ${shown}")
+                elseif(rule STREQUAL "poll")
+                    string(APPEND violations "\n  ${relative}:${lineNumber}: a coroutine polling on its reactor: ${shown}")
                 else()
                     string(APPEND violations "\n  ${relative}:${lineNumber}: a while loop polling an atomic: ${shown}")
                 endif()
@@ -327,11 +359,17 @@ if(violationCount GREATER 0)
     message("A `while` polling an atomic is a wait. Wait through src/tests/BoundedWait.hpp:")
     message("`WaitUntil` on the case's thread, `OffThreadWaits` on a helper thread (asserted")
     message("with `AllReached()` after the join). It bounds the wait on a monotonic clock and")
-    message("says what it waited for when it gives up. A coroutine waiting on its own reactor")
-    message("cannot block that thread: bound it on the reactor's clock instead (#1453).")
+    message("says what it waited for when it gives up.")
     message("")
-    message("Neither rule reaches a `while` that does not poll an atomic, `vendor/`, or")
-    message("non-test sources (#1452). A site that must stay takes a row in")
+    message("A coroutine parking on its reactor until something holds is the same wait, and it")
+    message("cannot block its own reactor thread: `co_await AwaitUntil(reactor, what, reached,")
+    message("state, options)` from the same header, bounded on the reactor's clock, its outcome")
+    message("kept with `OffThreadWaits::Keep`. Where `Keep` answers false the wait ran out, so the")
+    message("coroutine stops there -- `co_return`, or release only what it holds -- rather than")
+    message("run on as if what it waited for had happened.")
+    message("")
+    message("No rule reaches a `while` that does not wait, a coroutine `while` that works before")
+    message("it parks, `vendor/`, or non-test sources (#1452). A site that must stay takes a row in")
     message("FastCachedTestLoopExemptions in ${CMAKE_CURRENT_LIST_FILE}, with its reason.")
     message("")
     message("Enumerated ${fileCount} file(s) via ${scanSource}.")
@@ -348,5 +386,6 @@ if(NOT staleRows STREQUAL "")
 endif()
 
 message(STATUS
-    "test-loops: ${loopsSeen} `for (` across ${fileCount} file(s) via ${scanSource}, no C-style loop and no "
-    "atomic-polling while outside ${exemptedCount} exempted site(s) in ${exemptionCount} row(s)")
+    "test-loops: ${loopsSeen} `for (` across ${fileCount} file(s) via ${scanSource}, no C-style loop, no "
+    "atomic-polling while and no coroutine polling on its reactor outside ${exemptedCount} exempted site(s) "
+    "in ${exemptionCount} row(s)")
