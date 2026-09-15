@@ -249,7 +249,7 @@ TEST_CASE("A probe tells the three kinds of endpoint apart", "[cli][node][probe]
         Cli::Testing::ScriptedNodeExchange node { { Refusal(Wire::UnimplementedVerb, {}) } };
         (void) ProbeRemote(node);
         REQUIRE(node.Sent().size() == 1);
-        auto const header = Wire::DecodeRequestHeader(node.Sent()[0]);
+        auto const header = Wire::DecodeRequestHeader(SentFrame(node));
         REQUIRE(header.has_value());
         CHECK(Unwrap(header).opRaw == static_cast<std::uint8_t>(Wire::Op::NodeStatus));
     }

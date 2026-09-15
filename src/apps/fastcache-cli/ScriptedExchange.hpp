@@ -6,6 +6,8 @@
 #include "RespClient.hpp"
 #include "StatsSource.hpp"
 
+#include <catch2/catch_test_macros.hpp>
+
 #include <cstddef>
 #include <initializer_list>
 #include <string>
@@ -27,6 +29,33 @@ namespace FastCache::Cli::Testing
 /// was sent so a test can assert the *request*, and it runs out of answers rather than
 /// repeating the last one -- a fake that answers forever makes an extra round trip
 /// invisible.
+
+/// The frame a case expects a scripted exchange to have sent, REQUIRED to exist.
+///
+/// **Every read of a frame one of these exchanges recorded goes through this, never through
+/// `Sent().front()` or `Sent()[i]`.** A case asserting a reply with `CHECK` and then reading
+/// the frame the subject sent carries on past a failed check -- and a subject that refused
+/// sends nothing, so the read is past the end of an empty vector: undefined behaviour rather
+/// than a red. Measured on #1402: a neuter that refused one store killed the CLI suite with
+/// SIGSEGV, and 296 of its 623 cases never ran (#1457). Here the `REQUIRE` fails before any
+/// element is read, naming the frame it expected and how many were sent, and the binary goes on.
+/// Called inside a `CHECK` -- the usual spelling, `CHECK(SentFrame(x) == ...)` -- the thrown
+/// failure is reported a second time as that check's unexpected exception and the case carries
+/// on past it; that is noise, never a read past the end.
+///
+/// A template over the three scripted exchanges, whose `Sent()` hold RESP arguments, memcached
+/// text and `0xFC` frames respectively. It asserts only that the frame EXISTS; a case that
+/// means "exactly one was sent" says so with its own `REQUIRE` on the size.
+/// @param exchange The exchange the subject talked to.
+/// @param index Which frame, counting from 0.
+/// @return That frame.
+template <typename Exchange>
+[[nodiscard]] auto const& SentFrame(Exchange const& exchange, std::size_t index = 0)
+{
+    INFO("expected frame #" << index << " to have been sent; " << exchange.Sent().size() << " were");
+    REQUIRE(exchange.Sent().size() > index);
+    return exchange.Sent()[index];
+}
 
 /// Build a bulk-string reply.
 /// @param text The payload.
