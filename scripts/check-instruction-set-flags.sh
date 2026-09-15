@@ -115,12 +115,12 @@ RunAndJudge() {
     return 2
 }
 
-# One compile database compiling the real `plant_unit` with @p flags.
+# One compile database compiling the real `plant_unit` with @p flags, laid out as CMake writes one.
 # @param 1 Where to write it.
 # @param 2 Extra flags.
 WriteDatabase() {
-    printf '[{"directory": "%s/build", "file": "%s/%s", "command": "/usr/bin/g++ -O2 %s -c ../%s"}]\n' \
-        "$native_root" "$native_root" "$plant_unit" "$2" "$plant_unit" > "$1"
+    printf '[\n{\n  "directory": "%s/build",\n  "command": "/usr/bin/g++ -O2 %s -c ../%s",\n  "file": "%s/%s"\n}\n]\n' \
+        "$native_root" "$2" "$plant_unit" "$native_root" "$plant_unit" > "$1"
 }
 
 SelfTest() {

@@ -49,7 +49,7 @@ function(fastcached_entry root file command out)
         string(REPLACE "\\" "\\\\" ${field} "${${field}}")
         string(REPLACE "\"" "\\\"" ${field} "${${field}}")
     endforeach()
-    set(${out} "{\"directory\": \"${root}/build\", \"file\": \"${root}/${file}\", \"command\": \"${command}\"}" PARENT_SCOPE)
+    set(${out} "{\n  \"directory\": \"${root}/build\",\n  \"command\": \"${command}\",\n  \"file\": \"${root}/${file}\"\n}" PARENT_SCOPE)
 endfunction()
 
 # A database of the first-party unit compiled by @p command, plus the vendored unit compiled cleanly.
@@ -60,8 +60,10 @@ function(fastcached_unit_database root command)
 endfunction()
 
 # Run the check; @p refuses says which side it must land on, @p expected is text the output must hold.
-# ARGN is passed to the check as extra -D arguments.
-function(fastcached_judge name root refuses expected)
+# @p parse is the path the run must report taking -- `batched (N batch(es))`, `whole-document (fallback: <reason>`,
+# or `unread` for a database refused before any path was chosen. A case states which path it exercised, or a fast
+# path that silently stopped engaging would pass every case. ARGN is passed to the check as extra -D arguments.
+function(fastcached_judge name root refuses parse expected)
     execute_process(
         COMMAND "${CMAKE_COMMAND}" "-DFASTCACHED_SOURCE_DIR=${root}"
                 "-DFASTCACHED_COMPILE_DATABASE=${root}/build/compile_commands.json" ${ARGN} -P "${check}"
@@ -77,6 +79,19 @@ function(fastcached_judge name root refuses expected)
         set(refused ON)
     endif()
     string(FIND "${flat}" "${expected}" said)
+    if(parse STREQUAL "unread")
+        string(FIND "${flat}" "parse: " parsed)
+        set(pathTaken TRUE)
+        if(NOT parsed EQUAL -1)
+            set(pathTaken FALSE)
+        endif()
+    else()
+        string(FIND "${flat}" "parse: ${parse}" parsed)
+        set(pathTaken FALSE)
+        if(NOT parsed EQUAL -1)
+            set(pathTaken TRUE)
+        endif()
+    endif()
     set(problem "")
     if(refuses AND NOT refused)
         set(problem "accepted, and must refuse")
@@ -84,6 +99,8 @@ function(fastcached_judge name root refuses expected)
         set(problem "refused, and must accept")
     elseif(said EQUAL -1)
         set(problem "reached the right side for the wrong reason: no `${expected}`")
+    elseif(NOT pathTaken)
+        set(problem "reached the right verdict by another parse path: not `parse: ${parse}`")
     endif()
     math(EXPR ran "${ran} + 1")
     set(ran "${ran}" PARENT_SCOPE)
@@ -143,7 +160,7 @@ foreach(row IN LISTS UnitCases)
     fastcached_row_fields("${row}" caseName caseRefuses caseExpected caseExtra caseCommand)
     fastcached_tree(${caseName} root)
     fastcached_unit_database("${root}" "${caseCommand}")
-    fastcached_judge(${caseName} "${root}" ${caseRefuses} "${caseExpected}" ${caseExtra})
+    fastcached_judge(${caseName} "${root}" ${caseRefuses} "batched (1 batch(es))" "${caseExpected}" ${caseExtra})
 endforeach()
 
 # ---------------------------------------------------------------- cases that need more than one command
@@ -151,8 +168,8 @@ endforeach()
 fastcached_tree(vendoredDeclined root)
 fastcached_entry("${root}" "src/FastCache/Core/Unit.cpp" "${gxx} ${tail}" unit)
 fastcached_entry("${root}" "vendor/endo/tui/V.cpp" "/usr/bin/c++ -msha -c V.cpp" vendored)
-file(WRITE "${root}/build/compile_commands.json" "[${unit},${vendored}]")
-fastcached_judge(vendoredDeclined "${root}" OFF "1 unit(s) outside src/ declined (first: ${root}/vendor/endo/tui/V.cpp)")
+file(WRITE "${root}/build/compile_commands.json" "[\n${unit},\n${vendored}\n]\n")
+fastcached_judge(vendoredDeclined "${root}" OFF "batched (1 batch(es))" "1 unit(s) outside src/ declined (first: ${root}/vendor/endo/tui/V.cpp)")
 
 # The plant run answers only whether a planted flag is still refused: a real violation on another unit is the
 # unplanted run's red, and must not make the plant run red as well.
@@ -160,63 +177,116 @@ fastcached_tree(plantBesideRealViolation root)
 file(WRITE "${root}/src/FastCache/Core/Other.cpp" "int Other() { return 3; }\n")
 fastcached_entry("${root}" "src/FastCache/Core/Unit.cpp" "${gxx} ${tail}" unit)
 fastcached_entry("${root}" "src/FastCache/Core/Other.cpp" "${gxx} -mavx2 -c ../src/FastCache/Core/Other.cpp" other)
-file(WRITE "${root}/build/compile_commands.json" "[${unit},${other}]")
-fastcached_judge(plantBesideRealViolation "${root}" OFF
+file(WRITE "${root}/build/compile_commands.json" "[\n${unit},\n${other}\n]\n")
+fastcached_judge(plantBesideRealViolation "${root}" OFF "batched (1 batch(es))"
     "`-msha` planted into src/FastCache/Core/Unit.cpp (1 entr(y/ies)) refused as it must; 2 first-party unit(s) judged; 1 unplanted problem(s) left to the unplanted run"
     "${plant}")
-fastcached_judge(realViolationUnplanted "${root}" ON "src/FastCache/Core/Other.cpp: `-mavx2`, because")
+fastcached_judge(realViolationUnplanted "${root}" ON "batched (1 batch(es))" "src/FastCache/Core/Other.cpp: `-mavx2`, because")
 # A refusal of the TREE sends its reader to the tree; the plant runs above send theirs to the check.
-fastcached_judge(realViolationRemedy "${root}" ON "An instruction set is asked for per function")
+fastcached_judge(realViolationRemedy "${root}" ON "batched (1 batch(es))" "An instruction set is asked for per function")
 
 fastcached_tree(responseClean root)
 file(WRITE "${root}/build/flags.rsp" "-O2 -DNDEBUG\n")
 fastcached_unit_database("${root}" "${gxx} @flags.rsp ${tail}")
-fastcached_judge(responseClean "${root}" OFF "${judged}")
+fastcached_judge(responseClean "${root}" OFF "batched (1 batch(es))" "${judged}")
 
 fastcached_tree(responseFlag root)
 file(WRITE "${root}/build/flags.rsp" "-O2\n-msha\n")
 fastcached_unit_database("${root}" "${gxx} @flags.rsp ${tail}")
-fastcached_judge(responseFlag "${root}" ON "`-msha`, because")
+fastcached_judge(responseFlag "${root}" ON "batched (1 batch(es))" "`-msha`, because")
 
 # One argument per line, as a response file may be written: the flag and its value are still a pair.
 fastcached_tree(responseArchOnTwoLines root)
 file(WRITE "${root}/build/flags.rsp" "-O2\n-arch\nx86_64h\n")
 fastcached_unit_database("${root}" "${gxx} @flags.rsp ${tail}")
-fastcached_judge(responseArchOnTwoLines "${root}" ON "`-arch x86_64h`, because it names an Apple slice")
+fastcached_judge(responseArchOnTwoLines "${root}" ON "batched (1 batch(es))" "`-arch x86_64h`, because it names an Apple slice")
 
 fastcached_tree(responseNested root)
 file(WRITE "${root}/build/outer.rsp" "-O2 @inner.rsp\n")
 file(WRITE "${root}/build/inner.rsp" "-O2\n")
 fastcached_unit_database("${root}" "${gxx} @outer.rsp ${tail}")
-fastcached_judge(responseNested "${root}" ON "names `@inner.rsp` inside a response file")
+fastcached_judge(responseNested "${root}" ON "batched (1 batch(es))" "names `@inner.rsp` inside a response file")
 
 # An unbalanced bracket INSIDE a candidate token. Without the blanking, CMake's list parser fuses the two
 # candidates into one element and `-msha` is never named -- which is what the blanking is for. Not a table
 # row: the rows are a CMake list, and this bracket would fuse them.
 fastcached_tree(bracketInCandidate root)
 fastcached_unit_database("${root}" "${gxx} -mfoo=[x -msha ${tail}")
-fastcached_judge(bracketInCandidate "${root}" ON "`-msha`, because")
+fastcached_judge(bracketInCandidate "${root}" ON "batched (1 batch(es))" "`-msha`, because")
 
 fastcached_tree(emptyDatabase root)
 file(WRITE "${root}/build/compile_commands.json" "[]\n")
-fastcached_judge(emptyDatabase "${root}" ON "has no entries, so no flag has been judged")
+fastcached_judge(emptyDatabase "${root}" ON unread "has no entries, so no flag has been judged")
 
 fastcached_tree(noFirstParty root)
 fastcached_entry("${root}" "vendor/endo/tui/V.cpp" "/usr/bin/c++ -O2 -c V.cpp" vendored)
-file(WRITE "${root}/build/compile_commands.json" "[${vendored}]")
-fastcached_judge(noFirstParty "${root}" ON "no entry compiles a unit under")
+file(WRITE "${root}/build/compile_commands.json" "[\n${vendored}\n]\n")
+fastcached_judge(noFirstParty "${root}" ON "batched (1 batch(es))" "no entry compiles a unit under")
 
 fastcached_tree(unparseable root)
 file(WRITE "${root}/build/compile_commands.json" "[{\"directory\": \n")
-fastcached_judge(unparseable "${root}" ON "cannot be parsed as a compile database")
+fastcached_judge(unparseable "${root}" ON unread "cannot be parsed as a compile database")
 
 fastcached_tree(noCommand root)
 file(WRITE "${root}/build/compile_commands.json"
-    "[{\"directory\": \"${root}/build\", \"file\": \"${root}/src/FastCache/Core/Unit.cpp\", \"arguments\": [\"g++\", \"-msha\"]}]")
-fastcached_judge(noCommand "${root}" ON "its entry has no `command`")
+    "[\n{\n  \"directory\": \"${root}/build\",\n  \"arguments\": [\"g++\", \"-msha\"],\n  \"file\": \"${root}/src/FastCache/Core/Unit.cpp\"\n}\n]\n")
+fastcached_judge(noCommand "${root}" ON "batched (1 batch(es))" "its entry has no `command`")
 
 fastcached_tree(missingDatabase root)
-fastcached_judge(missingDatabase "${root}" ON "does not exist, so no flag has been judged")
+fastcached_judge(missingDatabase "${root}" ON unread "does not exist, so no flag has been judged")
+
+# ---------------------------------------------------------------- the parse paths
+#
+# A database CMake did not lay out is read whole, and must be judged exactly as the batched reading would: each
+# layout below reaches the fallback for its own reason, refuses a real `-msha`, and passes a plant.
+
+# @p layout names the fixture; @p flags go on the first-party command.
+function(fastcached_layout root layout flags)
+    set(command "${gxx} ${flags} ${tail}")
+    set(unitPath "${root}/src/FastCache/Core/Unit.cpp")
+    set(vendored "{\n  \"directory\": \"${root}/build\",\n  \"command\": \"/usr/bin/c++ -O2 -c V.cpp\",\n  \"file\": \"${root}/vendor/endo/tui/V.cpp\"\n}")
+    if(layout STREQUAL "noLineBreak")
+        set(text "[{\"directory\": \"${root}/build\", \"command\": \"${command}\", \"file\": \"${unitPath}\"}]")
+    elseif(layout STREQUAL "entryEndsDisagree")
+        # A nested object whose closing brace starts a line: one more line-leading `}` than entries.
+        set(text "[\n{\n  \"directory\": \"${root}/build\",\n  \"extra\": {\n  \"a\": 1\n},\n  \"command\": \"${command}\",\n  \"file\": \"${unitPath}\"\n}\n]\n")
+    elseif(layout STREQUAL "batchUnparseable")
+        # The counts agree -- the nested object's `}` stands in for the unit's own, which ends its last line -- and
+        # the padding carries the unit's real end past the first batch, so the cut lands inside the nested object.
+        string(REPEAT "-DPAD=0123456789 " 6000 pad)
+        set(text "[\n{\n  \"directory\": \"${root}/build\",\n  \"file\": \"${unitPath}\",\n  \"extra\": {\n  \"a\": 1\n},\n  \"command\": \"${gxx} ${pad}${flags} ${tail}\"},\n${vendored}\n]\n")
+    else()
+        message(FATAL_ERROR "no layout `${layout}`")
+    endif()
+    file(WRITE "${root}/build/compile_commands.json" "${text}")
+endfunction()
+
+# layout|reason the run must name
+set(FallbackLayouts
+    "noLineBreak|the document holds no line break"
+    "entryEndsDisagree|2 line(s) start with `}` against 1 entries"
+    "batchUnparseable|batch 1 does not parse on its own"
+)
+foreach(row IN LISTS FallbackLayouts)
+    fastcached_row_fields("${row}" layout reason)
+    fastcached_tree(${layout}Refused root)
+    fastcached_layout("${root}" ${layout} "-msha")
+    fastcached_judge(${layout}Refused "${root}" ON "whole-document (fallback: ${reason}" "src/FastCache/Core/Unit.cpp: `-msha`, because")
+    fastcached_tree(${layout}Plant root)
+    fastcached_layout("${root}" ${layout} "")
+    fastcached_judge(${layout}Plant "${root}" OFF "whole-document (fallback: ${reason}"
+        "`-msha` planted into src/FastCache/Core/Unit.cpp (1 entr(y/ies)) refused as it must" "${plant}")
+endforeach()
+
+# CMake's layout across real cuts: three entries of about 41 KB against a BatchBytes of 64 KB make three batches, and
+# the flag sits in the last one, which only a cut that kept every entry whole can reach.
+fastcached_tree(batchedAcrossCuts root)
+string(REPEAT "-DPAD=0123456789 " 2400 pad)
+fastcached_entry("${root}" "src/FastCache/Core/Unit.cpp" "${gxx} ${pad}${tail}" first)
+fastcached_entry("${root}" "src/FastCache/Core/Second.cpp" "${gxx} ${pad}-c ../src/FastCache/Core/Second.cpp" second)
+fastcached_entry("${root}" "src/FastCache/Core/Third.cpp" "${gxx} ${pad}-msha -c ../src/FastCache/Core/Third.cpp" third)
+file(WRITE "${root}/build/compile_commands.json" "[\n${first},\n${second},\n${third}\n]\n")
+fastcached_judge(batchedAcrossCuts "${root}" ON "batched (3 batch(es))" "src/FastCache/Core/Third.cpp: `-msha`, because")
 
 if(NOT mismatches STREQUAL "")
     message(FATAL_ERROR "instruction-set-flags-selftest: ${ran} case(s) ran, and these did not judge as they must:${mismatches}")
