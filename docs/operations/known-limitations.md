@@ -55,8 +55,8 @@ lapses.** Everything below follows from that.
 
 - **An active expiry cycle sweeps on a timer**, so a key that lapses and is
   never touched again is still reclaimed and still reported — redis's `hz` is
-  the analogue. It runs every `active_expiry_interval_ms` milliseconds (`1000`
-  by default), examines `active_expiry_scan` entries per shard per sweep
+  the analogue. It runs every `active_expiry_interval` (`1s` by default),
+  examines `active_expiry_scan` entries per shard per sweep
   (`512`), and resumes where the last sweep stopped rather than restarting at
   the front, so its cost per cycle is fixed rather than proportional to how
   much is cached.
@@ -66,7 +66,7 @@ lapses.** Everything below follows from that.
   **The delay is therefore bounded, not zero.** An `expired` event for an
   untouched key arrives at the next sweep that reaches it, which on a cache
   larger than one scan budget is several cycles rather than one. Setting
-  `active_expiry_interval_ms: 0` (or `--expiry-interval=0`) turns the cycle
+  `active_expiry_interval: 0s` (or `--expiry-interval=0s`) turns the cycle
   off and leaves expiry purely access-driven, which is what the daemon did
   before it had one.
 

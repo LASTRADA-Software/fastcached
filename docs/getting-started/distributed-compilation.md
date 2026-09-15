@@ -411,10 +411,10 @@ some node running `--serve-scheduler`. Unset it and every miss compiles
 locally again — the behaviour without this feature, and the way to turn it off
 for one build.
 
-`FASTCACHE_DISPATCH_TIMEOUT_MS` is how long the client will wait for one remote
+`FASTCACHE_DISPATCH_TIMEOUT` is how long the client will wait for one remote
 compile, measured from the request to the last byte of the reply — the dial has
-its own `FASTCACHE_CONNECT_TIMEOUT_MS`. It defaults to **600000** (ten minutes)
-and is deliberately not the cache's `FASTCACHE_TIMEOUT_MS`: a worker writes nothing
+its own `FASTCACHE_CONNECT_TIMEOUT`. It defaults to **`10min`** and is deliberately
+not the cache's `FASTCACHE_TIMEOUT`: a worker writes nothing
 until the compiler has finished, so the client waits out the whole compile in a
 single read, and while the two shared one number every translation unit taking
 longer than ten seconds was abandoned and rebuilt locally — precisely the ones
@@ -422,13 +422,14 @@ worth distributing ([#223](https://github.com/LASTRADA-Software/fastcached/issue
 Ten minutes because that is `LeaseTable`'s own lease timeout: waiting longer
 means waiting on a lease the scheduler has already reclaimed.
 
-`FASTCACHE_DISPATCH_IDLE_MS` is the companion knob and the one that answers the
-other question: how long the worker may say **nothing**. It defaults to **30000**
-(thirty seconds). A worker writes a five-byte progress frame every few seconds
+`FASTCACHE_DISPATCH_IDLE` is the companion knob and the one that answers the
+other question: how long the worker may say **nothing**. It defaults to **`30s`**. A worker writes a five-byte progress frame every few seconds
 while a compile is running, so the client measures *silence* rather than
 *duration* — which is what lets this be seconds while the total above stays
 minutes ([#245](https://github.com/LASTRADA-Software/fastcached/issues/245)).
-Setting it to `0` turns it off and restores one flat deadline.
+Setting it to `0s` turns it off and restores one flat deadline. All four are
+durations — a whole number and a unit (`ms`, `s`, `min`, `h`, `d`); a bare number is
+not one and is ignored, so the launcher runs under the default.
 
 Both are **runtime** settings: the launcher is one process per translation unit,
 so exporting a new value is all it takes and the next compile uses it. Nothing
@@ -446,8 +447,8 @@ against a worker that has stopped, for the reason in the next box.
     |---|---|---|
     | process exits, crashes, is killed | the client's own parked read — FIN or RST | immediately |
     | host vanishes: powered off, unplugged, suspended, VPN dropped | TCP keepalive on the compile dial | ~16 s on Linux and macOS, ~30 s on Windows |
-    | host answers while the process makes no progress | the missing progress frames — `FASTCACHE_DISPATCH_IDLE_MS` | ~30 s |
-    | compiler runs longer than anybody is prepared to wait | `FASTCACHE_DISPATCH_TIMEOUT_MS` | at the deadline |
+    | host answers while the process makes no progress | the missing progress frames — `FASTCACHE_DISPATCH_IDLE` | ~30 s |
+    | compiler runs longer than anybody is prepared to wait | `FASTCACHE_DISPATCH_TIMEOUT` | at the deadline |
 
     In every one of them the client hands the lease back and compiles locally, so
     nothing is lost and the key is **not** pinned for the scheduler's lease timeout.

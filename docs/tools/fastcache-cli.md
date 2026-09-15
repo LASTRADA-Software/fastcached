@@ -298,6 +298,16 @@ nothing. `--ttl`, `--nx` and `--xx` belong to `set`; `--raw` to `get`; `--all` t
 `prepend`, whose server-side path takes no expiry at all — accepting it there
 would discard it silently.
 
+Every length of time the tool takes — `--ttl`, `--interval`, `--connect-timeout`
+and `--timeout` — is a **duration**: a whole number and one unit of `ms`, `s`,
+`min`, `h` or `d`, as in `90s`, `500ms` or `7d`. A bare number is refused, because
+it meant milliseconds on one flag and seconds on the next. `--ttl` keeps whole
+seconds, so `--ttl=1500ms` is refused rather than rounded, and `--ttl=0s` is refused
+because memcached reads zero as *never expires* — leave the flag off for that. Over
+memcached `--ttl` is at most `30d`: the protocol reads a longer expiry as a date, so
+`add k v --ttl=31d` is refused before anything is sent, while `set` over RESP carries
+it as a length.
+
 ### The node verbs
 
 `node` and `node-metrics` travel over `0xFC`, which is the only wire a
@@ -716,10 +726,10 @@ never disagree about what a figure is called.
 `--samples=<n>` ends the run after `n` samples. Without it the run ends at `q` or
 `Ctrl-C` on a terminal, or at `Ctrl-C` when piped.
 
-`--interval=<ms>` sets the time between samples. It defaults to 2000 for `cache`
-and `node` and 5000 for `fleet`. It must lie between the subject's floor (500 for
-`cache` and `node`, 1000 for `fleet`) and 60000; a value outside is refused before
-anything is sent, naming the bound, rather than quietly changed. The title's
+`--interval=<duration>` sets the time between samples. It defaults to `2s` for
+`cache` and `node` and `5s` for `fleet`. It must lie between the subject's floor
+(`500ms` for `cache` and `node`, `1s` for `fleet`) and `1min`; a value outside is
+refused before anything is sent, naming the bound, rather than quietly changed. The title's
 `every` states the cadence the server **granted**. A server of another build that
 grants a different one says so in a remark.
 

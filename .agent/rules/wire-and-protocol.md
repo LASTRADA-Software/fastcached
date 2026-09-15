@@ -2164,7 +2164,7 @@ consequence rather than a precaution.
   only the first may back off. A pass that stopped early has entries it has not
   looked at yet.
 - **Zero means opposite things in the two knobs, and both are load-bearing.**
-  `--expiry-interval=0` disables the cycle, which is a real thing to ask for, and
+  `--expiry-interval=0s` disables the cycle, which is a real thing to ask for, and
   a disabled cycle is a coroutine that *ends* rather than one parked forever on a
   deadline nothing will move. `--expiry-scan=0` is what `PurgeBudget` spells as
   *no ceiling* — sweep the whole keyspace under the shard lock — so it is refused.

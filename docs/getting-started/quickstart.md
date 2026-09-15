@@ -18,7 +18,7 @@ the wire format is detected per connection.
 [fastcache-cli](../tools/fastcache-cli.md) for the full reference:
 
 ```sh
-$ fastcache-cli set greeting hello --ttl 60
+$ fastcache-cli set greeting hello --ttl 60s
 $ fastcache-cli get greeting
 hello
 $ fastcache-cli ttl greeting

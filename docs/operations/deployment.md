@@ -450,7 +450,7 @@ published per tier and stays on the unlabelled series above.
 
 | Series | Says |
 |---|---|
-| `fastcached_expiry_cycles_total` | Sweeps the active expiry cycle has run. Flat on a daemon serving traffic means the cycle is disabled (`--expiry-interval=0`) or wedged, which otherwise looks exactly like nothing having expired. |
+| `fastcached_expiry_cycles_total` | Sweeps the active expiry cycle has run. Flat on a daemon serving traffic means the cycle is disabled (`--expiry-interval=0s`) or wedged, which otherwise looks exactly like nothing having expired. |
 | `fastcached_expiry_keys_reclaimed_total` | Entries that cycle reclaimed — keys that lapsed and that nothing would have touched again, so no other path would ever have freed them. |
 | `fastcached_keyspace_reclaim_events_dropped_total` | Reclaimed keys whose `expired`/`evicted` keyspace event was never published, because one call reclaimed more at once than the notification buffer holds. Any rise means a subscriber's view is incomplete. |
 

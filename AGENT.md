@@ -787,7 +787,7 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
 - A bounded sweep resumes from a cursor and `ShardedStorage` rotates its starting shard, or
   everything past the first budget never expires. That cursor outlives the call, so a tier gets
   exactly one erase point.
-- `--expiry-interval=0` disables the cycle (a coroutine that *ends*); `--expiry-scan=0` is
+- `--expiry-interval=0s` disables the cycle (a coroutine that *ends*); `--expiry-scan=0` is
   `PurgeBudget`'s spelling of *no ceiling* and is refused.
 - On disk a read may not reclaim and a write must: `Get`/`Peek` can hold a shared lock, every
   write verb holds the exclusive one. Reporting without erasing is worse than neither — the

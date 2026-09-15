@@ -1172,7 +1172,7 @@ live in the `fastcached` this state merely names.
 | Setting | Means |
 | --- | --- |
 | `fleet-open` | `1` to admit every caller to the fleet, `0` for members only |
-| `lease-lifetime` | milliseconds a compile lease lives end to end |
+| `lease-lifetime` | how long a compile lease lives end to end, as a duration (`20min`) |
 
 A key the build does not know is **refused when it is proposed**, not stored. The
 alternative is a typo replicated to every node, snapshotted, carried across
@@ -1461,11 +1461,14 @@ cleared endpoint comes back when that member next leads. The fleet page's
 ### `lease-lifetime`: telling the fleet your translation units are long
 
 ```sh
-fastcache-compile-node --scheduler=10.0.0.1:6675 --cluster-set=lease-lifetime=2400000
+fastcache-compile-node --scheduler=10.0.0.1:6675 --cluster-set=lease-lifetime=40min
 ```
 
-Milliseconds. The default is 600000 (ten minutes) and the ceiling is 3600000 (one
-hour).
+A duration: a whole number and one of `ms`, `s`, `min`, `h`, `d`. The default is
+`10min` and the ceiling is `1h`. A bare number is refused when it is set; a value
+committed while this setting was a count of milliseconds (`2400000`) is no longer
+readable, so the scheduler grants the default and says so once in its log, naming
+the value — set it again in the new spelling.
 
 **It is the lifetime of a LEASE, end to end — not how long a compiler may run.** The
 span it covers is the whole dispatched job: uploading the preprocessed translation
@@ -1745,7 +1748,7 @@ A stopping worker has to wait for something: a compile legitimately holds its sl
 for seconds, and abandoning one loses work a client is still waiting on. So a stop
 closes the port first, then waits for the compiles already running.
 
-That wait is bounded by **`--drain-timeout`**, 30 seconds by default, and the node
+That wait is bounded by **`--drain-timeout`**, `30s` by default, and the node
 says what it is waiting for while it waits:
 
 ```
@@ -1769,7 +1772,7 @@ SCM stop timeout, which reads as *"the service is hung"* rather than *"a compile
 still running"*. Exiting on our own terms puts the count and the bound in the log
 instead.
 
-`--drain-timeout=0` waits forever, which is what the node did before the bound
+`--drain-timeout=0s` waits forever, which is what the node did before the bound
 existed. Use it if you would rather your supervisor's own timeout be the one that
 decides.
 
