@@ -3361,6 +3361,29 @@ namespace
 }
 } // namespace
 
+TEST_CASE("A setting a worker's file names reads as named exactly as one typed on its command line", "[node][config]")
+{
+    // A key in the FILE is the operator naming the setting, and the worker reads that
+    // provenance off the MERGED configuration: `CacheTier` asks `cacheMemoryExplicit`
+    // whether a tier was configured at all, and a `listen_node:` pinned at its default is
+    // a different instruction from one nobody wrote. Nothing held the worker to it:
+    // neutering the bit in `ApplyFileSettings` turned seven daemon cases red and no node
+    // case (#1437). The listener is given AT its default, so value equality cannot stand in
+    // for the bit.
+    auto const named =
+        FromFileAndArgv({ Setting("cache_memory", { "1g" }), Setting("listen_node", { "127.0.0.1:6674" }) }, {});
+    REQUIRE(named.has_value());
+    CHECK(named->cacheMemoryExplicit);
+    CHECK(named->nodeListen == NodeConfig {}.nodeListen);
+    CHECK(named->nodeListenExplicit);
+
+    // The control: a row the file did not name stays unnamed, or a bit set for every row
+    // would pass the half above.
+    auto const silent = FromFileAndArgv({ Setting("cache_memory", { "1g" }) }, {});
+    REQUIRE(silent.has_value());
+    CHECK_FALSE(silent->nodeListenExplicit);
+}
+
 TEST_CASE("A worker's file says timestamps off with the negative key, whichever default the platform has", "[node][config]")
 {
     // The default is a compile-time constant that is ON only under macOS, so a case that
