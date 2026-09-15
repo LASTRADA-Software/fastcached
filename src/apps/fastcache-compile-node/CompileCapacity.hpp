@@ -2,7 +2,6 @@
 #pragma once
 
 #include <FastCache/Core/Logger.hpp>
-#include <FastCache/Distributed/MembershipOracle.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 #include <FastCache/Protocol/SurfaceRefusal.hpp>
@@ -15,6 +14,7 @@
 #include <mutex>
 #include <optional>
 #include <stop_token>
+#include <string_view>
 #include <vector>
 
 #include <WorkerProtocol.hpp>
@@ -497,25 +497,21 @@ namespace CompileRefusal
     };
 } // namespace CompileRefusal
 
-/// Refuse a caller with no claim on this machine's CPU, or admit it.
+/// What this surface answers a caller with no claim on its CPU.
 ///
-/// **The one implementation of the anti-leeching rule**, asked by both doors into this
-/// worker: `WorkerServer`'s accept loop and, since #290, `CompileResponder` on the
-/// merged `0xFC` listener. Written twice it would be two policies that agree today, on
-/// a question whose wrong answer is "this machine ran a stranger's compiler for them".
+/// The row and the sentence; the DECISION is `Node::RefuseUnlessMember`
+/// (`MembershipGate.hpp`), which every surface on this node shares. Kept beside the
+/// other compile rows rather than inlined at the call site because there is more than
+/// one door into this worker -- `WorkerServer`'s accept loop and, since #290,
+/// `CompileResponder` on the merged `0xFC` listener -- and two doors spelling the
+/// anti-leeching refusal by hand would be two policies that agree today, on a question
+/// whose wrong answer is "this machine ran a stranger's compiler for them".
 ///
-/// Answered on the peer's HOST alone, which is what lets both callers ask it before a
-/// payload byte is read -- a caller with no claim here must not be able to make this
-/// process buffer a multi-megabyte preprocessed translation unit on the way to being
-/// refused. It is a *reply* rather than a close, so a misconfigured peer learns which
-/// of the two it is instead of seeing a connection it cannot tell from a dead host.
-///
-/// @param membership Decides who may spend this machine's CPU.
-/// @param metrics Where the refusal is counted, exactly once.
-/// @param peer The caller's peer host.
-/// @return The encoded refusal, or nullopt when the caller is admitted.
-[[nodiscard]] std::optional<std::vector<std::byte>> RefuseUnlessMember(Distributed::IMembershipOracle const& membership,
-                                                                       IMetricsSink& metrics,
-                                                                       std::string_view peer);
+/// It is a *reply* rather than a close, so a misconfigured peer learns which of the two
+/// it is instead of seeing a connection it cannot tell from a dead host. And it is
+/// decided on the peer's HOST alone, which is what lets both doors ask before a payload
+/// byte is read: a caller with no claim here must not be able to make this process
+/// buffer a multi-megabyte preprocessed translation unit on the way to being refused.
+inline constexpr std::string_view NotAMemberWhy = "this worker compiles for its own machine and its cluster";
 
 } // namespace FastCache::Node

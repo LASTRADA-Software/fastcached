@@ -2026,3 +2026,63 @@ TEST_CASE("The two verbs that share Offer answer exactly as they did", "[distrib
     REQUIRE(admit.status == Wire::Status::Ok);
     CHECK_FALSE(admit.payload.empty());
 }
+
+TEST_CASE("A client forget warns that older members will ignore it; an admit says nothing",
+          "[distributed][scheduler][forget]")
+{
+    // #1309. The two verbs were added without moving `CommandVersion`, so a member on an
+    // older build DECODES the entry and meets a verb byte it lacks -- it skips by name
+    // and holds the state as if nothing had been proposed.
+    //
+    // **The silence on the admit is the assertion**, not decoration. Both directions are
+    // the same skip, and they are not the same event: an admit that is skipped fails
+    // CLOSED, so that client is simply not admitted at that member and the upgrade heals
+    // it, while a forget that is skipped fails OPEN and the member goes on serving a host
+    // the fleet agreed to stop serving. A case asserting only that the forget warns is
+    // green under an implementation that warns on both -- which would train an operator
+    // to ignore the line that matters.
+    Admitting fleet;
+
+    auto const admit = fleet.Service().ClusterAdmitClient(Insider, "10.0.0.7");
+    REQUIRE(admit.status == Wire::Status::Ok);
+    CHECK(fleet.leading.logger.Snapshot().empty());
+
+    auto const forget = fleet.Service().ClusterForgetClient(Insider, "10.0.0.7");
+    REQUIRE(forget.status == Wire::Status::Ok);
+
+    auto const records = fleet.leading.logger.Snapshot();
+    REQUIRE(records.size() == 1);
+    CHECK(records.front().level == LogLevel::Warn);
+
+    // It names the host, or an operator forgetting three machines cannot tell which line
+    // is about which.
+    CHECK(records.front().message.contains("10.0.0.7"));
+
+    // It says where the evidence is, because this side cannot produce it: the leader
+    // cannot tell which builds carry the verb, so it sends the reader to the members'
+    // own logs rather than naming members from a version string it would be guessing at.
+    CHECK(records.front().message.contains("its own log"));
+
+    // And it names a remedy that exists. `--fleet-member` is the per-node list, and
+    // dropping the host there is what closes the gap on a member that cannot apply the
+    // entry at all.
+    CHECK(records.front().message.contains("--fleet-member"));
+}
+
+TEST_CASE("Each client forget warns again, because each is about a different host", "[distributed][scheduler][forget]")
+{
+    // Not `_warnedLeaseLifetime`'s shape. That one states a fact about the cluster's
+    // configuration, where a repeat says nothing new and a once-per-process latch is
+    // right. A forget is a decision about one host, so an operator retiring three
+    // machines is owed three lines -- and a latch here would report the first and go
+    // quiet for the two that followed, which reads as two forgets that were safe.
+    Admitting fleet;
+
+    for (auto const* const host: { "10.0.0.7", "10.0.0.8", "10.0.0.9" })
+        REQUIRE(fleet.Service().ClusterForgetClient(Insider, host).status == Wire::Status::Ok);
+
+    auto const records = fleet.leading.logger.Snapshot();
+    REQUIRE(records.size() == 3);
+    for (auto const* const host: { "10.0.0.7", "10.0.0.8", "10.0.0.9" })
+        CHECK(std::ranges::any_of(records, [host](auto const& record) { return record.message.contains(host); }));
+}

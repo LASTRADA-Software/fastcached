@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#include "MembershipGate.hpp"
 #include "NodeStatusResponder.hpp"
 #include "NodeSurfaces.hpp"
 
@@ -214,12 +215,12 @@ std::vector<std::byte> NodeStatusResponder::EndpointRefusalReply(EndpointRefusal
 
 std::optional<std::vector<std::byte>> NodeStatusResponder::RefusePeer(std::string_view peer, std::uint8_t /*opRaw*/) const
 {
-    if (_membership.Classify(peer) == Distributed::Membership::Member)
-        return std::nullopt;
-    return Cc::Refuse(_metrics,
-                      { .code = CompileCacheWire::ErrorCode::NotAMember,
-                        .counter = IMetricsSink::Counter::NodeStatusRequestsRefusedNotAMember },
-                      "this node reports its identity and counters to fleet members only");
+    return RefuseUnlessMember(_membership,
+                              _metrics,
+                              peer,
+                              { .code = CompileCacheWire::ErrorCode::NotAMember,
+                                .counter = IMetricsSink::Counter::NodeStatusRequestsRefusedNotAMember },
+                              "this node reports its identity and counters to fleet members only");
 }
 
 Task<FrameReply> NodeStatusResponder::Answer(std::span<std::byte const> frame, std::string peer)

@@ -425,11 +425,18 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
 - Cluster membership is one ROUTE to admission, never the whole policy: `--fleet-member` admits
   *clients*, which never join consensus, so what the cluster agrees is **added** and never
   substituted — composed at the `IMembershipOracle` seam (`AnyOfMembership`). Absence from
-  `ClusterState` is not removal, a forget is a positive act, and revoking a host on both lists is a
-  **reload**. Pinned by a test in the *worsen* direction; `NodeMembership::Adopt` is the SECOND
+  `ClusterState` is not removal, a forget is a positive act, and revoking a MEMBER on both lists is
+  a **reload**. Pinned by a test in the *worsen* direction; `NodeMembership::Adopt` is the SECOND
   publisher and writes only `--fleet-member`'s list.
+- A CLIENT is revoked by a replicated TOMBSTONE, `--cluster-forget-client`, which outranks every
+  admission route including `--fleet-open`: `Membership::Forgotten`, `PrecedenceOf`, and a fold
+  rather than `any_of` — which flattened it to `Outsider` so no counted refusal could fire.
+  Published from `PublishCluster` and never from `Adopt`; loopback is never forgotten.
 - REMOVAL is the direction a live admission path has to get right, and the direction a test skips:
-  adding a member fails CLOSED and self-heals, removing one fails **OPEN** and nothing reports it.
+  adding a member fails CLOSED and self-heals, removing one fails **OPEN**. A client forget now
+  REPORTS — its own counter, apart from a stranger's, because the two are opposite diagnoses — and
+  the same asymmetry decides the logging: an older member skips the entry either way, so the forget
+  warns and the admit is SILENT, and that silence is the assertion.
   So `NodeMembership` IS the oracle rather than handing one out — surfaces bind an
   `IMembershipOracle const&` once, and a test that re-asks `Oracle()` after a reload passes under
   exactly that defect. And a reload may not WIDEN admission on a node with no `--cluster-key-file`,

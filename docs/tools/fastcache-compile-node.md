@@ -512,6 +512,34 @@ offending id, so a check covering it would make a member that reached replicated
 state through an older peer impossible to remove — and it would count towards
 quorum forever.
 
+**`--cluster-forget-client` is exempt for the same reason, and
+`--cluster-admit-client` is not.** The admit commits a host every renderer of the
+cluster's state prints, so it is checked where you are watching; the forget's operand
+is the offending host, and gating it would leave a client recorded by a peer that did
+not check it being served forever.
+
+### Admitting and forgetting a client
+
+A client — a laptop, a CI runner, anything running `fastcache-cc` — never joins
+consensus, so it has no member id. These two verbs take a **host**:
+
+```sh
+fastcache-compile-node --scheduler=scheduler.internal:6675 --cluster-admit-client=10.0.0.7
+fastcache-compile-node --scheduler=scheduler.internal:6675 --cluster-forget-client=10.0.0.7
+```
+
+A port is ignored: admission compares a host, because a client dials from an ephemeral
+one. The forget records a **tombstone** rather than erasing an entry, which is what lets
+it reach a node whose own `--fleet-member` list still names the machine — that list is
+per-node configuration and no membership change speaks for it. The refusal such a host
+then gets is counted as `fastcache_node_requests_refused_host_forgotten_total`, apart
+from a stranger's, because *a host you removed* and *a host nobody listed* are opposite
+diagnoses.
+
+A member on a build older than these verbs skips the committed entry and goes on serving
+the host, which the leader warns about at forget time; that member records the skip in
+its own log, naming the entry it did not apply.
+
 ## A cache of its own
 
 A node can hold a cache tier in front of the shared `fastcached`, and point the
@@ -776,6 +804,26 @@ unauthenticated.
 | `fastcache_node_status_requests_refused_not_a_member_total` | An operator verb was refused because the caller is not a fleet member. Unlike the cache tier's not-local refusal this is not ordinary on any deployment: a steady rise is a member list that has fallen behind whoever is running `fastcache-cli`, and a burst from one host is somebody scanning. |
 | `fastcache_node_status_requests_refused_payload_too_large_total` | A header declared more payload than these verbs may carry. Both are **fieldless**, so this came from no client of this tree at any version. Never sum it with the cache tier's row of the same name. |
 | `fastcache_node_status_requests_refused_endpoint_busy_total` | The surface had no bytes left in flight. These are the verbs somebody reaches for when a node is in trouble, so this is the node saying it is too busy to say what it is. Read it beside `fastcache_node_cache_requests_refused_endpoint_busy_total`, never summed: this says the diagnosis failed, that says why. |
+
+#### A host the cluster has forgotten
+
+One counter for the whole node rather than one per surface, because the answer does not
+depend on which door the caller knocked at:
+
+| Counter | What a rise means |
+|---|---|
+| `fastcache_node_requests_refused_host_forgotten_total` | A host the cluster agreed to **forget** asked this node for something -- a compile, the fleet tables, live stats, `node`, an enrollment verb. It means a machine somebody decommissioned is still configured to use this fleet, and the remedy is at that machine or at the cluster (admit it again), never on this node. |
+
+**Never sum it with a `..._refused_not_a_member_total` row**, and it does not double-count
+into one: a forgotten host is refused through this counter *instead*, so the
+`not_a_member` rows keep meaning what they always did -- a host nobody ever listed. The
+two are opposite diagnoses. A stranger is something to go and investigate; a forgotten
+host is something an operator already decided, and a rise means the other end has not
+been told.
+
+Zero is the ordinary reading, including on a node with no cluster at all, which never
+classifies anybody as forgotten. It is an honest zero rather than an absence: the series
+is rendered by every node.
 
 ### Live stats
 

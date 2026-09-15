@@ -145,7 +145,9 @@ TEST_CASE("Every fleet column reaches the page, the JSON and the text", "[distri
     snapshot.cluster =
         Cluster::ClusterState { .members = { Cluster::ClusterMember {
                                     .id = "n1", .raftEndpoint = "10.0.0.2:6675", .schedulerEndpoint = "10.0.0.2:6676" } },
-                                .settings = {} };
+                                .settings = {},
+                                .clients = {},
+                                .forgotten = {} };
     snapshot.workers = { WorkerReport { .info = WorkerInfo { .id = "w1",
                                                              .fingerprint = "gcc-13-abcdef",
                                                              .endpoint = "10.0.0.2:7100",
@@ -1630,7 +1632,9 @@ TEST_CASE("A peer that got its bytes past the door cannot make the whole fleet's
     snapshot.cluster = Cluster::ClusterState { .members = { Cluster::ClusterMember { .id = "n\x80\x80",
                                                                                      .raftEndpoint = "10.0.0.2:6675\xC3",
                                                                                      .schedulerEndpoint = "\xE2\x82" } },
-                                               .settings = {} };
+                                               .settings = {},
+                                               .clients = {},
+                                               .forgotten = {} };
     snapshot.workers = { WorkerReport { .info = WorkerInfo { .id = "w1",
                                                              .fingerprint = "gcc-13-ab\x80\x80",
                                                              .endpoint = "10.0.0.2:7100\xFF",

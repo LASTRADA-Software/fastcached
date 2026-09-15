@@ -170,6 +170,7 @@ if(FASTCACHED_BUILD_TESTS)
         NodeStatusResponder_test.cpp
         LiveStatsResponder_test.cpp
         FleetReadGate_test.cpp
+        MembershipGate_test.cpp
         FleetTextResponder_test.cpp
         DocumentedCommandLines_test.cpp
         ${_fc_node_shared}

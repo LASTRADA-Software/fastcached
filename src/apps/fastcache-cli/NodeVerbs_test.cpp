@@ -1033,7 +1033,7 @@ TEST_CASE("cluster-settings names every key this build knows, set or not", "[cli
     REQUIRE_FALSE(Cluster::SettingTable.empty());
     auto const known = std::string { Cluster::SettingTable[0].name };
 
-    ScriptedNodeExchange node { { ClusterStatusReply({ .members = {}, .settings = {} }) } };
+    ScriptedNodeExchange node { { ClusterStatusReply({ .members = {}, .settings = {}, .clients = {}, .forgotten = {} }) } };
 
     auto const answer = RunNodeVerb("cluster-settings", node);
     CHECK(answer.outcome == Outcome::Affirmative);
@@ -1058,8 +1058,10 @@ TEST_CASE("cluster-settings keeps a setting this build does not know", "[cli][no
     // client's table has never heard of. Dropping the row would hide a live fact
     // because the READER is the older binary -- and the operator would be told the
     // cluster agrees something it does not.
-    ScriptedNodeExchange node { { ClusterStatusReply(
-        { .members = {}, .settings = { { .name = "a-key-from-a-newer-build", .value = "7" } } }) } };
+    ScriptedNodeExchange node { { ClusterStatusReply({ .members = {},
+                                                       .settings = { { .name = "a-key-from-a-newer-build", .value = "7" } },
+                                                       .clients = {},
+                                                       .forgotten = {} }) } };
 
     auto const answer = RunNodeVerb("cluster-settings", node);
     CHECK(answer.outcome == Outcome::Affirmative);
@@ -1191,7 +1193,7 @@ TEST_CASE("a cluster reply another build encoded is refused by its version", "[c
     // The same refusal as above, for the cause an upgrade produces -- and it says so,
     // because *cannot read* alone fits a damaged body too and the two send an operator
     // to different machines.
-    auto body = Cluster::Encode(Cluster::ClusterState { .members = {}, .settings = {} });
+    auto body = Cluster::Encode(Cluster::ClusterState { .members = {}, .settings = {}, .clients = {}, .forgotten = {} });
     // The state's version is the first field's only byte, after its u32 length prefix.
     REQUIRE(body.size() > 4);
     body[4] = std::byte { 2 };
@@ -1223,7 +1225,8 @@ TEST_CASE("the cluster verbs send the opcodes the wire table names", "[cli][node
            Expectation { .verb = "cluster-admit", .operands = { "node-c", "10.0.0.9:6675" }, .op = Cc::Op::ClusterAdmit } })
     {
         INFO("verb: " << expectation.verb);
-        ScriptedNodeExchange node { { ClusterStatusReply({ .members = {}, .settings = {} }) } };
+        ScriptedNodeExchange node { { ClusterStatusReply(
+            { .members = {}, .settings = {}, .clients = {}, .forgotten = {} }) } };
         (void) RunNodeVerb(expectation.verb, node, expectation.operands);
 
         REQUIRE(node.Sent().size() == 1);

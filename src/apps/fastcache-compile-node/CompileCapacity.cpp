@@ -205,11 +205,11 @@ void CompileCapacity::Drain()
 
 // --- moved with their declarations when the dedicated compile port went ---------
 //
-// Both were defined in `WorkerServer.cpp` because that is where the accept loop
-// was. Neither is about accepting: the drain decision is arithmetic over this
-// object's counters, and the membership refusal is what any door onto the compile
-// verbs answers a stranger with -- `CompileResponder` on the merged surface is the
-// only caller left.
+// It was defined in `WorkerServer.cpp` because that is where the accept loop was, and
+// it is not about accepting: the drain decision is arithmetic over this object's
+// counters. The membership refusal moved with it and has since gone one step further,
+// to `MembershipGate.hpp` -- it was never about compiling either, and four other
+// surfaces were spelling the same decision by hand (#1309).
 
 DrainAction NextDrainAction(std::size_t outstanding,
                             std::chrono::steady_clock::duration waited,
@@ -220,21 +220,6 @@ DrainAction NextDrainAction(std::size_t outstanding,
     if (timeout == std::chrono::seconds::zero())
         return DrainAction::Report;
     return waited >= timeout ? DrainAction::Abandon : DrainAction::Report;
-}
-
-std::optional<std::vector<std::byte>> RefuseUnlessMember(Distributed::IMembershipOracle const& membership,
-                                                         IMetricsSink& metrics,
-                                                         std::string_view peer)
-{
-    if (membership.Classify(peer) == Distributed::Membership::Member)
-        return std::nullopt;
-
-    // This machine and this cluster's members. Everyone else is refused as a *reply*
-    // rather than by closing, so a misconfigured peer learns which of the two it is
-    // instead of seeing a connection it cannot tell from a dead host. Without this the
-    // port accepted anybody who could route to it and ran their compiler for them,
-    // which on a widened `--listen-node` is the network.
-    return Cc::Refuse(metrics, CompileRefusal::NotAMember, "this worker compiles for its own machine and its cluster");
 }
 
 } // namespace FastCache::Node

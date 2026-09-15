@@ -372,6 +372,12 @@ enum class Op : std::uint8_t
     ClusterSet = 0x09,    ///< Operator changes a replicated setting.
     ClusterForget = 0x0A, ///< Operator removes a member.
     ClusterAdmit = 0x0B,  ///< Operator adds a member, or moves one.
+    /// Operator admits a CLIENT host: a machine that may ask the fleet for capacity and
+    /// never joins consensus. Not `ClusterAdmit`, which admits a MEMBER (#1309).
+    ClusterAdmitClient = 0x16,
+    /// Operator forgets a client host. A positive act, which is what `--fleet-member`
+    /// removal is not: absence from a list on one node decommissions nothing (#1309).
+    ClusterForgetClient = 0x17,
 
     /// Client tells the scheduler the job it leased has ended, however it ended.
     ///
@@ -1647,6 +1653,20 @@ inline constexpr std::array OpTable {
     OpDescriptor { .code = Op::ClusterAdmit,
                    .name = "cluster-admit",
                    .fieldCount = 2, // member id, consensus endpoint
+                   .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
+                   .preAuth = RequiresAuth,
+                   .maxPayload = BoundedTo(MaxControlPayload),
+                   .family = VerbFamily::Scheduler },
+    OpDescriptor { .code = Op::ClusterAdmitClient,
+                   .name = "cluster-admit-client",
+                   .fieldCount = 1, // client host
+                   .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
+                   .preAuth = RequiresAuth,
+                   .maxPayload = BoundedTo(MaxControlPayload),
+                   .family = VerbFamily::Scheduler },
+    OpDescriptor { .code = Op::ClusterForgetClient,
+                   .name = "cluster-forget-client",
+                   .fieldCount = 1, // client host
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
                    .preAuth = RequiresAuth,
                    .maxPayload = BoundedTo(MaxControlPayload),
@@ -3975,6 +3995,43 @@ struct ClusterSetView
 [[nodiscard]] inline std::optional<std::span<std::byte const>> DecodeClusterForgetPayload(std::span<std::byte const> payload)
 {
     auto const fields = SplitFields(payload, OpFieldCount(Op::ClusterForget));
+    if (!fields.has_value())
+        return std::nullopt;
+    return (*fields)[0];
+}
+
+/// Frame a CLUSTER-ADMIT-CLIENT or CLUSTER-FORGET-CLIENT request.
+///
+/// One encoder for both, because the payload is one host either way and two copies of a
+/// framing differing only by an op code is the repetition the op TABLE exists to remove.
+/// The verb is a template parameter rather than an argument, so naming a third one does not
+/// compile -- and this header stays dependency-free, which a `<cassert>` for a run-time
+/// check would not.
+///
+/// @tparam op `Op::ClusterAdmitClient` or `Op::ClusterForgetClient`. A TEMPLATE parameter, so
+///         a third verb is a compile error rather than a run-time assert -- the obligation here
+///         is to name one of two verbs, which the type system can hold.
+/// @param host The client host, as the peer's source address spells it.
+/// @param version Version to advertise.
+/// @return The framed request.
+template <Op op>
+    requires(op == Op::ClusterAdmitClient || op == Op::ClusterForgetClient)
+[[nodiscard]] inline std::vector<std::byte> EncodeClusterClientVerb(std::string_view host,
+                                                                    WireVersion version = CurrentVersion)
+{
+    return Detail::EncodeRequest(version, op, { AsBytes(host) });
+}
+
+/// Split a CLUSTER-ADMIT-CLIENT or CLUSTER-FORGET-CLIENT payload.
+/// @tparam op Which of the two verbs the payload belongs to, held the same way.
+/// @param payload The bytes following the request header.
+/// @return The client host, or nullopt when malformed.
+template <Op op>
+    requires(op == Op::ClusterAdmitClient || op == Op::ClusterForgetClient)
+[[nodiscard]] inline std::optional<std::span<std::byte const>> DecodeClusterClientVerbPayload(
+    std::span<std::byte const> payload)
+{
+    auto const fields = SplitFields(payload, OpFieldCount(op));
     if (!fields.has_value())
         return std::nullopt;
     return (*fields)[0];

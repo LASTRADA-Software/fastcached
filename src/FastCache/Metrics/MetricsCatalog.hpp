@@ -489,6 +489,14 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
               "from one host is somebody scanning. Zero on a node nobody has asked, which is the "
               "common case and is not evidence the gate works.",
       .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::NodeRequestsRefusedHostForgotten,
+      .prometheusName = "fastcache_node_requests_refused_host_forgotten_total",
+      .help = "Requests refused on any surface because the cluster has forgotten "
+              "the calling host. A rise means a machine somebody decommissioned is "
+              "still configured to use this fleet. Never sum with the "
+              "not_a_member rows: those are hosts nobody listed, this one is a "
+              "host an operator removed.",
+      .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::NodeStatusRequestsRefusedPayloadTooLarge,
       .prometheusName = "fastcache_node_status_requests_refused_payload_too_large_total",
       .help = "Operator verbs refused because the header declared more payload than they may "

@@ -60,13 +60,53 @@ enum class SchedulerRole : std::uint8_t
 /// The anti-leeching decision, named for what it *is* rather than for the check
 /// that produces it. Zero is `Outsider` so a default-constructed request cannot
 /// accidentally be admitted: the direction a mistake has to fail in.
+/// A private, in-process enum: no wire and no file carries it, so the explicit `= 0` is
+/// the only value spelled and the rest may be reordered freely.
+///
+/// `Forgotten` is not a weaker `Outsider`: it says a host was a member and a POSITIVE act
+/// removed it (#1309). Every decision here tests for `Member`, so a third value fails
+/// closed at all of them; what it buys is the DISTINCTION, which is what a per-surface
+/// counted refusal and an operator's remedy need. `PrecedenceOf` is why it survives being
+/// composed -- see `AnyOfMembership`.
 enum class Membership : std::uint8_t
 {
     /// Not a cluster member. Still served the cache; never handed a worker.
     Outsider = 0,
     /// An authenticated member of this cluster.
     Member,
+    /// A host a `--cluster-forget-client` removed. Refused, and counted apart from an
+    /// ordinary outsider, because a decommissioned machine still dialling is an event.
+    Forgotten,
+    /// The count, for a table over this enum.
+    Last,
 };
+
+/// Which answer wins when several oracles disagree: **forgotten beats member beats
+/// outsider**.
+///
+/// A forget has to outrank a listing, or the decommissioning case this exists for cannot
+/// work: a host named by `--fleet-member` on a node that has not been reconfigured is
+/// exactly the host an operator has just forgotten in the cluster. The composer folds on
+/// this rather than `any_of`, which flattened every non-`Member` answer to `Outsider` and
+/// destroyed the distinction with no diagnostic.
+///
+/// @param membership An answer.
+/// @return Its rank, higher winning.
+[[nodiscard]] constexpr std::uint8_t PrecedenceOf(Membership membership) noexcept
+{
+    switch (membership)
+    {
+        case Membership::Forgotten:
+            return 2;
+        case Membership::Member:
+            return 1;
+        case Membership::Outsider:
+            return 0;
+        case Membership::Last:
+            break;
+    }
+    return 0;
+}
 
 /// Everything the scheduler needs to know about the caller, gathered by the
 /// transport before it asks.
@@ -413,6 +453,31 @@ class SchedulerService
     /// @return `Ok` once the entry is appended, or a refusal.
     [[nodiscard]] SchedulerReply ClusterForget(CallerContext const& caller, std::string_view memberId);
 
+    /// An operator admits a CLIENT host: a machine that may ask this fleet for capacity and
+    /// never joins consensus.
+    ///
+    /// Gated exactly as `ClusterForget` is -- leadership, membership and the credential --
+    /// because what it changes is replicated state. It is a separate verb from
+    /// `ClusterAdmit` rather than a flag on it: a member is counted by the quorum and a
+    /// client never is, so one verb answering both would make the quorum's membership
+    /// depend on a field (#1309).
+    ///
+    /// @param caller Who asked, and what the transport already established about them.
+    /// @param host The client host, as a peer's source address spells it.
+    /// @return The reply to send.
+    [[nodiscard]] SchedulerReply ClusterAdmitClient(CallerContext const& caller, std::string_view host);
+
+    /// An operator forgets a client host.
+    ///
+    /// The positive act that `--fleet-member` removal is not: dropping a host from a list on
+    /// one node decommissions it nowhere else, which is the fail-OPEN direction #1309 exists
+    /// to close. The cluster records the forget, and every member refuses that host.
+    ///
+    /// @param caller Who asked, and what the transport already established about them.
+    /// @param host The client host to forget.
+    /// @return The reply to send.
+    [[nodiscard]] SchedulerReply ClusterForgetClient(CallerContext const& caller, std::string_view host);
+
     /// Add a member to the cluster, or record that one has moved.
     ///
     /// The counterpart `ClusterForget` had none of, and its absence was the reason
@@ -489,6 +554,17 @@ class SchedulerService
     }
 
   private:
+    /// Put a client verb to consensus: the two client verbs differ only by their command
+    /// kind, so the gate, the no-cluster refusal and the offer are written once.
+    ///
+    /// @param caller Who asked.
+    /// @param kind `AdmitClient` or `ForgetClient`.
+    /// @param host The client host the command records.
+    /// @return The reply to send.
+    [[nodiscard]] SchedulerReply OfferClientVerb(CallerContext const& caller,
+                                                 Cluster::CommandKind kind,
+                                                 std::string_view host);
+
     /// Where handed-over history goes; null until the admin surface sets one.
     IFleetHistorySink* _history { nullptr };
 

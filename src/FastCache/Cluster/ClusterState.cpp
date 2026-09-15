@@ -65,15 +65,18 @@ namespace
     /// command layout alone makes a node restarting onto its own log skip every entry
     /// in it. It moves when a command's LAYOUT does. A fact `Apply` derives from
     /// commands it already reads -- `SchedulerEndpointHistory` -- is state, and moves
-    /// `StateVersion` alone.
+    /// `StateVersion` alone. So does a new VERB (#1309's `AdmitClient`/`ForgetClient`):
+    /// the layout is unchanged, and a build that lacks the verb refuses its byte by name
+    /// as `UnknownMessageType` rather than as another encoding.
     constexpr std::uint8_t CommandVersion = 2;
 
     /// Wire tag in front of every encoded state: a snapshot, and a `ClusterStatus` body.
     ///
     /// A snapshot is the one thing here that outlives a process, so a format that could
     /// not say which build wrote it would make an upgrade a silent corruption. 3 added
-    /// each member's `SchedulerEndpointHistory` (#1340).
-    constexpr std::uint8_t StateVersion = 3;
+    /// each member's `SchedulerEndpointHistory` (#1340). 4 added the admitted clients and
+    /// the forgotten hosts, and states every group's count up front (#1309).
+    constexpr std::uint8_t StateVersion = 4;
 
     /// Fields one member occupies in an encoded state: id, Raft, scheduler, and the
     /// scheduler endpoint's history.
@@ -86,6 +89,32 @@ namespace
 
     /// Fields one setting occupies: name, value.
     constexpr std::size_t SettingFields = 2;
+
+    /// Fields in front of the groups: the version, then the member, setting, client and
+    /// forgotten-host counts.
+    constexpr std::size_t StateHeaderFields = 5;
+
+    /// Record `host` in a sorted host list, unless an entry already names the same machine.
+    ///
+    /// Unique by `SameHost`, the comparison admission makes, so `::ffff:10.0.0.1` and
+    /// `10.0.0.1` are one entry rather than two a forget would have to find separately.
+    /// @param hosts The list, sorted.
+    /// @param host The host to record.
+    void InsertHost(std::vector<std::string>& hosts, std::string_view host)
+    {
+        if (std::ranges::any_of(hosts, [host](std::string const& entry) { return SameHost(entry, host); }))
+            return;
+        hosts.emplace_back(host);
+        std::ranges::sort(hosts);
+    }
+
+    /// Remove every entry naming the same machine as `host`.
+    /// @param hosts The list.
+    /// @param host The host to remove.
+    void EraseHost(std::vector<std::string>& hosts, std::string_view host)
+    {
+        std::erase_if(hosts, [host](std::string const& entry) { return SameHost(entry, host); });
+    }
 
     /// Keep a sorted-by-key vector's ordering after an insertion.
     /// @param entries The vector to sort.
@@ -139,6 +168,16 @@ std::vector<std::string> ClusterState::Endpoints() const
     return out;
 }
 
+bool ClusterState::AdmitsClient(std::string_view host) const
+{
+    return std::ranges::any_of(clients, [host](std::string const& entry) { return SameHost(entry, host); });
+}
+
+bool ClusterState::HasForgotten(std::string_view host) const
+{
+    return std::ranges::any_of(forgotten, [host](std::string const& entry) { return SameHost(entry, host); });
+}
+
 std::vector<std::byte> Encode(Command const& command)
 {
     auto const header = std::array { static_cast<std::byte>(CommandVersion), static_cast<std::byte>(command.kind) };
@@ -190,7 +229,13 @@ std::vector<std::byte> Encode(ClusterState const& state)
     // already refuses a layout this build did not write.
     std::vector<std::span<std::byte const>> fields;
     auto const header = std::array { static_cast<std::byte>(StateVersion) };
-    auto const memberCount = WireFields::ToBigEndian<std::uint32_t>(static_cast<std::uint32_t>(state.members.size()));
+    auto const countOf = [](std::size_t size) {
+        return WireFields::ToBigEndian<std::uint32_t>(static_cast<std::uint32_t>(size));
+    };
+    auto const memberCount = countOf(state.members.size());
+    auto const settingCount = countOf(state.settings.size());
+    auto const clientCount = countOf(state.clients.size());
+    auto const forgottenCount = countOf(state.forgotten.size());
 
     // Every history byte is written before any span into them is taken, because the
     // list below holds spans and a vector that grew under them would leave each
@@ -202,6 +247,9 @@ std::vector<std::byte> Encode(ClusterState const& state)
 
     fields.emplace_back(header);
     fields.emplace_back(memberCount);
+    fields.emplace_back(settingCount);
+    fields.emplace_back(clientCount);
+    fields.emplace_back(forgottenCount);
     auto history = std::span<std::byte const> { histories };
     for (auto const& member: state.members)
     {
@@ -216,13 +264,17 @@ std::vector<std::byte> Encode(ClusterState const& state)
         fields.push_back(WireFields::AsBytes(setting.name));
         fields.push_back(WireFields::AsBytes(setting.value));
     }
+    for (auto const& client: state.clients)
+        fields.push_back(WireFields::AsBytes(client));
+    for (auto const& host: state.forgotten)
+        fields.push_back(WireFields::AsBytes(host));
     return WireFields::Encode(WireFields::FieldList { fields });
 }
 
 std::expected<ClusterState, ConsensusError> DecodeState(std::span<std::byte const> bytes)
 {
     auto const fields = WireFields::SplitAll(bytes);
-    if (!fields.has_value() || fields->size() < 2 || (*fields)[0].size() != 1)
+    if (!fields.has_value() || fields->empty() || (*fields)[0].size() != 1)
         return std::unexpected(MalformedWireFrame("the bytes are not a cluster state"));
 
     // By name, before anything else about the bytes is judged: a layout this build did
@@ -232,30 +284,39 @@ std::expected<ClusterState, ConsensusError> DecodeState(std::span<std::byte cons
         return std::unexpected(UnsupportedWireVersion(
             std::format("cluster state encoding version {} (this build reads {})", version, StateVersion)));
 
+    if (fields->size() < StateHeaderFields)
+        return std::unexpected(MalformedWireFrame("a cluster state does not state its four counts"));
     auto const memberCount = WireFields::FromBigEndian<std::uint32_t>((*fields)[1]);
-    if (!memberCount.has_value())
-        return std::unexpected(MalformedWireFrame("a cluster state's member count is not four bytes"));
+    auto const settingCount = WireFields::FromBigEndian<std::uint32_t>((*fields)[2]);
+    auto const clientCount = WireFields::FromBigEndian<std::uint32_t>((*fields)[3]);
+    auto const forgottenCount = WireFields::FromBigEndian<std::uint32_t>((*fields)[4]);
+    if (!memberCount.has_value() || !settingCount.has_value() || !clientCount.has_value() || !forgottenCount.has_value())
+        return std::unexpected(MalformedWireFrame("a cluster state's counts are not four bytes each"));
 
-    // Members first as quadruples, settings after as pairs, and BOTH shapes are checked
-    // against what actually arrived. A truncated snapshot must be refused rather than
-    // read as a member with an empty endpoint -- that member would be replicated
-    // onward as an address nobody can dial -- and a declared member count larger than
-    // the fields present is the same fault stated by the other end.
-    auto const rest = fields->size() - 2;
-    auto const memberSpan = static_cast<std::size_t>(*memberCount) * MemberFields;
-    if (memberSpan > rest || (rest - memberSpan) % SettingFields != 0)
-        return std::unexpected(MalformedWireFrame("a cluster state's fields do not match its member count"));
+    // Members as quadruples, settings as pairs, then clients and forgotten hosts one field
+    // each -- and the TOTAL is checked against what actually arrived. A truncated snapshot
+    // must be refused rather than read as a member with an empty endpoint -- that member
+    // would be replicated onward as an address nobody can dial -- and a declared count
+    // larger than the fields present is the same fault stated by the other end. 64-bit
+    // arithmetic, so four counts near `UINT32_MAX` cannot wrap into agreement.
+    auto const memberSpan = std::uint64_t { *memberCount } * MemberFields;
+    auto const settingSpan = std::uint64_t { *settingCount } * SettingFields;
+    auto const expected = StateHeaderFields + memberSpan + settingSpan + *clientCount + *forgottenCount;
+    if (expected != fields->size())
+        return std::unexpected(MalformedWireFrame("a cluster state's fields do not match its counts"));
 
     auto const at = [&](std::size_t index) {
-        return std::string { WireFields::AsStringView((*fields)[2 + index]) };
+        return std::string { WireFields::AsStringView((*fields)[StateHeaderFields + index]) };
     };
 
     ClusterState state;
     state.members.reserve(*memberCount);
-    state.settings.reserve((rest - memberSpan) / SettingFields);
+    state.settings.reserve(*settingCount);
+    state.clients.reserve(*clientCount);
+    state.forgotten.reserve(*forgottenCount);
     for (std::size_t index = 0; index < memberSpan; index += MemberFields)
     {
-        auto const historyField = (*fields)[2 + index + 3];
+        auto const historyField = (*fields)[StateHeaderFields + index + 3];
         auto const history =
             historyField.size() == 1
                 ? Consensus::DecodeWireEnum<SchedulerEndpointHistory>(static_cast<std::uint8_t>(historyField[0]))
@@ -275,8 +336,14 @@ std::expected<ClusterState, ConsensusError> DecodeState(std::span<std::byte cons
             return std::unexpected(MalformedWireFrame("a member records a scheduler endpoint it never announced"));
         state.members.push_back(std::move(member));
     }
-    for (std::size_t index = memberSpan; index < rest; index += SettingFields)
+    auto const settingsEnd = memberSpan + settingSpan;
+    for (std::size_t index = memberSpan; index < settingsEnd; index += SettingFields)
         state.settings.push_back(Setting { .name = at(index), .value = at(index + 1) });
+    auto const clientsEnd = settingsEnd + *clientCount;
+    for (std::size_t index = settingsEnd; index < clientsEnd; ++index)
+        state.clients.push_back(at(index));
+    for (std::size_t index = clientsEnd; index < clientsEnd + *forgottenCount; ++index)
+        state.forgotten.push_back(at(index));
     return state;
 }
 
@@ -304,6 +371,9 @@ void Apply(ClusterState& state, Command const& command)
                                 .schedulerEndpointHistory = announcedBefore || !command.schedulerEndpoint.empty()
                                                                 ? SchedulerEndpointHistory::Announced
                                                                 : SchedulerEndpointHistory::NeverAnnounced };
+            // Admitting a member at a host re-admits that host: a forget it carries is
+            // over (#1309).
+            EraseHost(state.forgotten, HostOfEndpoint(command.value));
             if (it != state.members.end())
             {
                 // Wholesale, both endpoints. A record is re-proposed only when it has
@@ -317,9 +387,36 @@ void Apply(ClusterState& state, Command const& command)
             SortByKey(state.members, &ClusterMember::id);
             return;
         }
-        case CommandKind::RemoveMember:
-            std::erase_if(state.members, [&](auto const& member) { return member.id == command.key; });
+        case CommandKind::RemoveMember: {
+            auto const it = std::ranges::find(state.members, command.key, &ClusterMember::id);
+            if (it == state.members.end())
+                return;
+            // A forget is a positive act, so it leaves a TOMBSTONE for the member's host
+            // (#1309): a node whose own `--fleet-member` list still names that machine is
+            // then refused it, rather than serving a decommissioned member until every
+            // list is edited. Derived HERE, from the record being removed, so the command
+            // carries nothing new. Never for loopback, which is always this machine's own
+            // and a tombstone could never narrow.
+            auto host = std::string { HostOfEndpoint(it->raftEndpoint) };
+            state.members.erase(it);
+            if (!IsLoopbackHost(host))
+                InsertHost(state.forgotten, host);
             return;
+        }
+
+        case CommandKind::AdmitClient: {
+            auto const host = HostOfEndpoint(command.key);
+            InsertHost(state.clients, host);
+            EraseHost(state.forgotten, host);
+            return;
+        }
+
+        case CommandKind::ForgetClient: {
+            auto const host = HostOfEndpoint(command.key);
+            EraseHost(state.clients, host);
+            InsertHost(state.forgotten, host);
+            return;
+        }
 
         case CommandKind::SetSetting: {
             auto const it = std::ranges::find(state.settings, command.key, &Setting::name);
@@ -420,6 +517,12 @@ namespace
         { .name = "a cluster setting's value", .project = [](Command const& c) -> std::string_view { return c.value; } },
     } };
 
+    /// What `AdmitClient` and `ForgetClient` record: the host, as an entry in `clients`
+    /// or in `forgotten`, which every renderer of the state prints.
+    constexpr std::array<TextField<Command>, 1> ClientHostText { {
+        { .name = "a client host", .project = [](Command const& c) -> std::string_view { return c.key; } },
+    } };
+
     /// Which strings each verb records, in one place.
     struct CommandTextRow
     {
@@ -436,6 +539,8 @@ namespace
         { .kind = CommandKind::AddMember, .fields = AddMemberText },
         { .kind = CommandKind::RemoveMember, .fields = {} },
         { .kind = CommandKind::SetSetting, .fields = SetSettingText },
+        { .kind = CommandKind::AdmitClient, .fields = ClientHostText },
+        { .kind = CommandKind::ForgetClient, .fields = ClientHostText },
     } };
 
     static_assert(RowsInEnumeratorOrder(CommandTextFields, &CommandTextRow::kind),
@@ -510,6 +615,30 @@ std::expected<void, ConsensusError> Validate(Command const& command)
                         return std::unexpected(InvalidConfiguration(*std::move(reason)));
                 return {};
             }
+
+        case CommandKind::AdmitClient:
+        case CommandKind::ForgetClient: {
+            if (!command.value.empty() || !command.schedulerEndpoint.empty())
+                return std::unexpected(InvalidConfiguration("a client command carries a host and nothing else"));
+            auto const host = HostOfEndpoint(command.key);
+            if (host.empty())
+                return std::unexpected(InvalidConfiguration("a client command must name a host"));
+            // A caller on a node's own machine is admitted to that node whatever any
+            // list says (`ClusterMembership::Classify`), so an ADMIT about loopback
+            // would be accepted, replicated and snapshotted while deciding nothing.
+            //
+            // A FORGET about loopback is the opposite and is the reason this refusal
+            // must not be relaxed on the strength of the sentence above: since #1309 a
+            // tombstone OUTRANKS every admission route, so an entry naming loopback
+            // would refuse the local builds a node exists to serve, on every surface at
+            // once. `Distributed::ForgottenVerdicts` guards it a second time, because a
+            // rule enforced only here is one a later route can reach around -- and the
+            // consequence is invisible from this end.
+            if (IsLoopbackHost(host))
+                return std::unexpected(InvalidConfiguration(
+                    std::format("{} is loopback, which every node always admits from its own machine", host)));
+            return {};
+        }
 
         // The count rather than a verb; falls out to the refusal below.
         case CommandKind::Last:

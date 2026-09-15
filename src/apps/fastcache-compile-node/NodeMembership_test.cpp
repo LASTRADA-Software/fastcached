@@ -238,3 +238,97 @@ TEST_CASE("A row value this build cannot read falls back to the flag", "[node][m
     membership.PublishCluster(OpenSetTo("yes"));
     CHECK(membership.Oracle().Classify("10.9.9.9") == Membership::Member);
 }
+
+TEST_CASE("A cluster forget outranks the host an operator listed", "[node][membership][forget]")
+{
+    // #1309, and the direction that fails OPEN: a client is removed by editing
+    // `--fleet-member` on every other machine in the fleet, and missing one leaves it
+    // serving a retired host indefinitely, with admission succeeding being the ordinary
+    // case and nothing to report.
+    //
+    // A WIRING case, as the #251 one above is: the oracles are asserted where they
+    // live. What only this layer can be wrong about is whether the tombstones reach the
+    // participants at all -- and `_forgotten` being published from `PublishCluster` and
+    // never from `Adopt` is exactly the kind of routing that compiles either way.
+    NodeConfig cfg;
+    cfg.nodeId = "node-a";
+    cfg.fleetMembers = { "10.0.0.1:6676", "10.0.0.2:6676" };
+
+    NodeMembership membership { cfg, membershipLog };
+    REQUIRE(membership.Oracle().Classify("10.0.0.1") == Membership::Member);
+
+    FastCache::Cluster::ClusterState state;
+    state.forgotten = { "10.0.0.1" };
+    membership.PublishCluster(state);
+
+    // The listed host is now refused, and refused AS FORGOTTEN -- not as an outsider,
+    // which is what the old `any_of` fold answered and what makes the refusal
+    // indistinguishable from a stranger's on every surface.
+    CHECK(membership.Oracle().Classify("10.0.0.1") == Membership::Forgotten);
+
+    // The control, and it is what makes the line above mean anything: the other listed
+    // host is untouched. A `PublishCluster` that had emptied the operator's list would
+    // pass the assertion above and fail this one.
+    CHECK(membership.Oracle().Classify("10.0.0.2") == Membership::Member);
+
+    // And a host nobody listed is still a stranger rather than a forget: the two
+    // refusals must stay distinguishable in both directions.
+    CHECK(membership.Oracle().Classify("10.9.9.9") == Membership::Outsider);
+}
+
+TEST_CASE("A re-admit is what lifts a forget, and a reload is not", "[node][membership][forget]")
+{
+    NodeConfig cfg;
+    cfg.nodeId = "node-a";
+    cfg.fleetMembers = { "10.0.0.1:6676" };
+
+    NodeMembership membership { cfg, membershipLog };
+
+    FastCache::Cluster::ClusterState state;
+    state.forgotten = { "10.0.0.1" };
+    membership.PublishCluster(state);
+    REQUIRE(membership.Oracle().Classify("10.0.0.1") == Membership::Forgotten);
+
+    // A reload must NOT lift it. `Adopt` writes `--fleet-member`'s list and only that,
+    // and a host named there is exactly the host a forget is about -- so an
+    // implementation that rebuilt the participants from the configuration would erase
+    // every tombstone agreed since startup, on the first SIGHUP, and the fleet would
+    // start serving the decommissioned machine again with nothing to say why.
+    membership.Adopt(cfg);
+    CHECK(membership.Oracle().Classify("10.0.0.1") == Membership::Forgotten);
+
+    // What does lift it is the cluster agreeing to admit the host again, which reaches
+    // here as a committed state without the tombstone.
+    state.forgotten = {};
+    membership.PublishCluster(state);
+    CHECK(membership.Oracle().Classify("10.0.0.1") == Membership::Member);
+}
+
+TEST_CASE("A forget reaches an open node too", "[node][membership][forget]")
+{
+    // The decision `--fleet-open` forces, and the one door a forget could have been
+    // left out of. The flag says "I have not enumerated who may use this fleet" -- a
+    // blanket over hosts nobody named. A forget names one. Letting the blanket win
+    // would make a local flag resurrect a machine the cluster positively removed, on
+    // exactly the node nobody has reconfigured yet.
+    NodeConfig cfg;
+    cfg.nodeId = "node-a";
+    cfg.fleetOpen = true;
+
+    NodeMembership membership { cfg, membershipLog };
+
+    // The control first, because the whole case rests on this node being open at all: a
+    // fixture that had failed to open would report `Forgotten` below for the ordinary
+    // reason and prove nothing.
+    REQUIRE(membership.Oracle().Classify("10.9.9.9") == Membership::Member);
+
+    FastCache::Cluster::ClusterState state;
+    state.forgotten = { "10.0.0.1" };
+    membership.PublishCluster(state);
+
+    CHECK(membership.Oracle().Classify("10.0.0.1") == Membership::Forgotten);
+
+    // And the blanket still covers everybody else, so the forget narrowed exactly one
+    // host rather than closing the node.
+    CHECK(membership.Oracle().Classify("10.9.9.9") == Membership::Member);
+}

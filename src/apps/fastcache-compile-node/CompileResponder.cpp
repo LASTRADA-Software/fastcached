@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "CompileResponder.hpp"
+#include "MembershipGate.hpp"
 
 #include <FastCache/Async/ResumeOn.hpp>
 #include <FastCache/Core/EnumTable.hpp>
@@ -192,7 +193,7 @@ std::optional<std::vector<std::byte>> CompileResponder::RefusePeer(std::string_v
     // compile spends this machine's CPU and asks membership, a cordon decides whether
     // this machine's CPU serves the fleet at all and asks locality.
     if (!IsCordon(opRaw))
-        return RefuseUnlessMember(_membership, _metrics, peer);
+        return RefuseUnlessMember(_membership, _metrics, peer, CompileRefusal::NotAMember, NotAMemberWhy);
     if (_locality.IsThisMachine(peer))
         return std::nullopt;
     return Cc::Refuse(_metrics, CompileRefusal::CordonNotLocal, "a machine is cordoned from itself");

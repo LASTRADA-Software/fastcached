@@ -646,3 +646,83 @@ TEST_CASE("A cluster command asks the next --scheduler when the first cannot be 
         CHECK(refused.error().contains("sched-a.internal:6675, sched-b.internal:6675"));
     }
 }
+
+TEST_CASE("The two client flags select their action and carry a host", "[node][clusteradmin][forget]")
+{
+    // #1309. A CLIENT, so a bare host: it never joins consensus and has no id for
+    // `--cluster-admit` to name.
+    auto const admit = ParsedFrom({ "--cluster-admit-client=10.0.0.7" });
+    CHECK(admit.cluster.action == ClusterAction::AdmitClient);
+    CHECK(admit.cluster.key == "10.0.0.7");
+    CHECK(admit.cluster.value.empty());
+
+    auto const forget = ParsedFrom({ "--cluster-forget-client=ci-runner-3.example" });
+    CHECK(forget.cluster.action == ClusterAction::ForgetClient);
+    CHECK(forget.cluster.key == "ci-runner-3.example");
+
+    // An endpoint is accepted and reaches the wire whole; `Cluster::Validate` is where
+    // the port is dropped, so the flag is not a second place that decision is made.
+    CHECK(ParsedFrom({ "--cluster-forget-client=10.0.0.7:6674" }).cluster.key == "10.0.0.7:6674");
+
+    // Both refuse an empty operand, naming themselves rather than the flag beside them:
+    // a parser that stamped one spelling for both would send an operator to the wrong
+    // flag, and the two differ by six characters.
+    for (auto const* const spelling: { "--cluster-admit-client=", "--cluster-forget-client=" })
+    {
+        NodeConfig cfg;
+        std::vector<char const*> const argv { spelling };
+        auto const parsed = ParseOptionsInto(NodeOptions(), std::span<char const* const> { argv }, cfg);
+        REQUIRE_FALSE(parsed.has_value());
+        INFO("spelling " << spelling);
+        // `field` names the flag and `context` carries the reason -- two fields, because
+        // an operator needs both and a message that merges them can only be searched.
+        // Asserting the NAME is what catches the copy-paste these two flags invite: they
+        // differ by six characters, and a wrong stamp sends somebody to the other one.
+        CHECK(parsed.error().field.contains(std::string_view { spelling }.substr(2, 20)));
+        CHECK(parsed.error().context.contains("names no host"));
+    }
+}
+
+TEST_CASE("A client ADMIT is text-gated and a client FORGET is deliberately not", "[node][clusteradmin][forget]")
+{
+    // **The assertion is the asymmetry**, and it is issue #159's trap one verb along.
+    // An admit COMMITS a host every renderer of the state prints, so text that is not
+    // UTF-8 is refused where the operator is watching. A forget's operand IS the
+    // offending host -- so gating it would make a client recorded by a peer that did
+    // not check it permanently unremovable, and it would go on being served forever.
+    //
+    // A test asserting only that both parse, or only that both refuse, passes under
+    // either half being wrong. What distinguishes them is that one refuses this input
+    // and the other takes it.
+    auto const* const bad = "--cluster-admit-client=\xffhost";
+    NodeConfig admitCfg;
+    std::vector<char const*> const admitArgv { bad };
+    CHECK_FALSE(ParseOptionsInto(NodeOptions(), std::span<char const* const> { admitArgv }, admitCfg).has_value());
+
+    NodeConfig forgetCfg;
+    std::vector<char const*> const forgetArgv { "--cluster-forget-client=\xffhost" };
+    auto const forgetParsed = ParseOptionsInto(NodeOptions(), std::span<char const* const> { forgetArgv }, forgetCfg);
+    REQUIRE(forgetParsed.has_value());
+    CHECK(forgetCfg.cluster.action == ClusterAction::ForgetClient);
+    CHECK(forgetCfg.cluster.key == "\xffhost");
+}
+
+TEST_CASE("Each client verb encodes as its own op, over one encoder", "[node][clusteradmin][forget]")
+{
+    // The bytes, not the symbol: both ends spell `Op::ClusterAdmitClient`, so a test
+    // comparing the enumerator to itself cannot see a value that moved. The op sits in
+    // the request header, which `DecodeRequestHeader` reads back.
+    auto const admit = EncodeClusterRequest(Ask(ClusterAction::AdmitClient, "10.0.0.7"));
+    auto const admitHeader = Wire::DecodeRequestHeader(admit);
+    REQUIRE(admitHeader.has_value());
+    CHECK(Unwrap(admitHeader).opRaw == 0x16);
+
+    auto const forget = EncodeClusterRequest(Ask(ClusterAction::ForgetClient, "10.0.0.7"));
+    auto const forgetHeader = Wire::DecodeRequestHeader(forget);
+    REQUIRE(forgetHeader.has_value());
+    CHECK(Unwrap(forgetHeader).opRaw == 0x17);
+
+    // And they are not the same frame, which is what a shared encoder could get wrong
+    // while both cases above still passed.
+    CHECK(admit != forget);
+}

@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <format>
 #include <ranges>
 #include <string>
 #include <utility>
@@ -123,6 +124,47 @@ TEST_CASE("An entry this build cannot decode is skipped, not fatal", "[cluster][
     // And the ordering is intact: the next entry applies normally.
     machine.Apply(Entry(2, Cmd(CommandKind::AddMember, "n1", "10.0.0.1:6675")));
     CHECK(machine.State().members.size() == 1);
+}
+
+TEST_CASE("A committed verb this build does not know is skipped by name, and the log goes on applying",
+          "[cluster][statemachine][forget]")
+{
+    // #1309 added two verbs without moving `CommandVersion`, so a member running an older
+    // build DECODES the layout and meets a verb byte it lacks. That is this case: the
+    // first byte past `Last` is exactly what `AdmitClient` is to a build that predates it,
+    // and the byte pins in `ClusterState_test.cpp` hold the two in step.
+    //
+    // What it must not do is crash, wedge, or apply the byte as whichever verb it aliases.
+    // Skipping leaves such a member without the change -- no replicated client admitted,
+    // and a client forget ignored -- and the rest of the log still applies around it.
+    CapturingLogger logger;
+    std::vector<ClusterState> published;
+    ClusterStateMachine machine { logger, [&published](ClusterState const& state) { published.push_back(state); } };
+
+    auto payload = Encode(Cmd(CommandKind::SetSetting, "fleet-open", "1"));
+    // The verb sits in the second byte of the first field, after that field's u32 length
+    // prefix.
+    REQUIRE(payload.size() > 5);
+    auto const unknownVerb = static_cast<unsigned>(CommandKind::Last);
+    payload[5] = static_cast<std::byte>(unknownVerb);
+    machine.Apply(Consensus::AppliedEntry { .index = Consensus::LogIndex { .value = 1 }, .payload = payload });
+
+    CHECK(machine.State() == ClusterState {});
+    CHECK(published.empty());
+
+    // Named: the index, and the verb byte, so an operator reading the log of a member left
+    // behind by an upgrade learns which entry it did not apply and why.
+    auto const records = logger.Snapshot();
+    CHECK(std::ranges::any_of(records, [unknownVerb](auto const& record) {
+        return record.message.contains("entry 1")
+               && record.message.contains(std::format("verb {} this build does not know", unknownVerb));
+    }));
+
+    machine.Apply(Entry(2, Cmd(CommandKind::AddMember, "n1", "10.0.0.1:6675")));
+    machine.Apply(Entry(3, Cmd(CommandKind::SetSetting, "fleet-open", "1")));
+    CHECK(machine.State().members.size() == 1);
+    CHECK(machine.State().settings.size() == 1);
+    CHECK(published.size() == 2);
 }
 
 TEST_CASE("A snapshot round-trips through the machine", "[cluster][statemachine]")

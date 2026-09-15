@@ -118,6 +118,12 @@ inline constexpr std::array ExchangeLogTable {
     VerbLogRow { .code = CompileCacheWire::Op::ClusterAdmit,
                  .level = LogLevel::Info,
                  .rationale = "adds or moves a member; same audit argument as cluster-set" },
+    VerbLogRow { .code = CompileCacheWire::Op::ClusterAdmitClient,
+                 .level = LogLevel::Info,
+                 .rationale = "admits a client host; same audit argument as cluster-admit" },
+    VerbLogRow { .code = CompileCacheWire::Op::ClusterForgetClient,
+                 .level = LogLevel::Info,
+                 .rationale = "decommissions a client host, and an operator asked about it later needs the line" },
     VerbLogRow { .code = CompileCacheWire::Op::Compile,
                  .level = LogLevel::Info,
                  .rationale = "seconds of somebody's CPU, one per distributed TU; the heaviest thing this node "

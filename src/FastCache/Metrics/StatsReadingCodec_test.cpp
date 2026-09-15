@@ -369,7 +369,7 @@ TEST_CASE("This build's live-stats layout is the pinned one", "[metrics][livesta
     // client built before the change will refuse this node. Update the constant in the same
     // change, and say in its message that clients and nodes upgrade together.
     INFO(std::format("StatsReadingLayout is 0x{:016x}", StatsReadingLayout));
-    CHECK(StatsReadingLayout == 0x632e76c28c589cd5ULL);
+    CHECK(StatsReadingLayout == 0x944ced6e24959f65ULL);
 }
 
 TEST_CASE("A truncated or padded reading is refused and never half-read", "[metrics][livestats]")

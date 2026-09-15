@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "FleetReadGate.hpp"
 #include "LiveStatsResponder.hpp"
+#include "MembershipGate.hpp"
 
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Protocol/SurfaceRefusal.hpp>
@@ -205,9 +206,8 @@ std::optional<std::vector<std::byte>> LiveStatsResponder::RefusePeer(std::string
 
 std::optional<std::vector<std::byte>> LiveStatsResponder::RefuseWatcher(std::string_view peer) const
 {
-    if (_membership.Classify(peer) == Distributed::Membership::Member)
-        return std::nullopt;
-    return Cc::Refuse(_metrics, RefusedNotAMember, "this node streams its live stats to fleet members only");
+    return RefuseUnlessMember(
+        _membership, _metrics, peer, RefusedNotAMember, "this node streams its live stats to fleet members only");
 }
 
 std::vector<std::byte> LiveStatsResponder::RefusalReply(Wire::PrePayloadDecision decision,
@@ -259,8 +259,12 @@ std::optional<std::vector<std::byte>> LiveStatsResponder::Recheck(Wire::LiveSubj
 {
     // Re-asked every tick of the bound oracle, which is the whole defence against removal failing
     // open.
-    if (_membership.Classify(peer) != Distributed::Membership::Member)
-        return Cc::Refuse(_metrics, Revoked, "this peer is no longer a fleet member");
+    // Through the same gate as the door, so a stream ENDS for the reason the door would
+    // have refused it -- and a forget names itself rather than arriving as the generic
+    // revocation, which is what an operator watching a subscriber drop needs to read.
+    if (auto refusal = RefuseUnlessMember(_membership, _metrics, peer, Revoked, "this peer is no longer a fleet member");
+        refusal.has_value())
+        return refusal;
 
     if (LiveSubjectGates.at(static_cast<std::size_t>(subject)).fleetGates)
         if (auto const leadership = _sources.Leadership(); !leadership.has_value() || !leadership->leads)

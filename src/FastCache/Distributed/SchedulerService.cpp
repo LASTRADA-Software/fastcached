@@ -528,6 +528,57 @@ SchedulerReply SchedulerService::ClusterForget(CallerContext const& caller, std:
         .kind = Cluster::CommandKind::RemoveMember, .key = std::string { memberId }, .value = {}, .schedulerEndpoint = {} });
 }
 
+SchedulerReply SchedulerService::ClusterAdmitClient(CallerContext const& caller, std::string_view host)
+{
+    return OfferClientVerb(caller, Cluster::CommandKind::AdmitClient, host);
+}
+
+SchedulerReply SchedulerService::ClusterForgetClient(CallerContext const& caller, std::string_view host)
+{
+    return OfferClientVerb(caller, Cluster::CommandKind::ForgetClient, host);
+}
+
+SchedulerReply SchedulerService::OfferClientVerb(CallerContext const& caller,
+                                                 Cluster::CommandKind kind,
+                                                 std::string_view host)
+{
+    if (auto refusal = Gate(caller); refusal.has_value())
+        return std::move(*refusal);
+    if (_admin == nullptr)
+        return Refuse(Wire::ErrorCode::NoCluster);
+
+    auto reply = Offer(Cluster::Command { .kind = kind, .key = std::string { host }, .value = {}, .schedulerEndpoint = {} });
+
+    // Said on the FORGET and deliberately not on the admit, and the asymmetry is the
+    // whole reason this line exists. A member whose build predates these verbs skips
+    // the committed entry by name (`ClusterStateMachine::Apply`) and holds the state as
+    // if it had never been proposed. For an admit that fails CLOSED -- the client is
+    // simply not admitted there, and the upgrade heals it. For a forget it fails OPEN:
+    // that member goes on serving a host the fleet has agreed to stop serving, and
+    // admission succeeding is the ordinary case, so nothing else reports it.
+    //
+    // It names NO members, and that is a limit rather than an omission. `WorkerInfo`
+    // carries a version string, and deciding from one which builds implement a verb is a
+    // model of this fleet more permissive than the fleet -- it would produce confident
+    // wrong agreement, which is worse than the vague right answer. What the leader can
+    // say is the consequence and WHERE the evidence lands: the member that skipped the
+    // entry logs it itself, naming the index and the verb byte. So an operator is sent to
+    // the members' own logs rather than to a claim this side cannot support.
+    //
+    // Once per offer rather than once per process: each forget is a separate decision
+    // about a separate host, and a operator who forgets three machines needs to be told
+    // three times. `_warnedLeaseLifetime` above is the opposite case -- one fact about
+    // the cluster's configuration, where a repeat says nothing new.
+    if (kind == Cluster::CommandKind::ForgetClient && reply.status == Wire::Status::Ok)
+        _logger.Logf(LogLevel::Warn,
+                     "forgetting client host {}: any member running a build without this verb SKIPS the entry and "
+                     "goes on serving that host -- such a member says so in its own log, naming the entry it did not "
+                     "apply; upgrade it, or drop the host from its --fleet-member list",
+                     host);
+
+    return reply;
+}
+
 SchedulerReply SchedulerService::ClusterAdmit(CallerContext const& caller,
                                               std::string_view memberId,
                                               std::string_view raftEndpoint)
