@@ -720,6 +720,19 @@ Every key is kebab-case, the spelling the leader's fleet columns use: `hit-rate`
 `cpu-busy-ratio`, and a cache tier's figures as the tier and the key joined,
 `memory-bytes-used`. A key spelled any other way does not build.
 
+**A share is a fraction in 0..1, on every subject.** A hit rate, a fill, cpu-busy:
+`0.7500` is three reads served of four, and `hit-rate` means the same thing whether
+it came from `cache`, `node` or `fleet`. Percentages are a rendering for a person --
+the terminal panels and the leader's HTML page show `75.0 %` from the same value --
+and no machine-read surface writes one.
+
+Until [#1445](https://github.com/LASTRADA-Software/fastcached/issues/1445) the fleet
+subject wrote a share as a per-mille integer (`750`) while `cache` and `node` wrote a
+fraction, with no unit in either header, so a script reading two subjects compared
+`750` with `0.74`. `/fleet.json` carries a `schema` number for that reason: the
+values changed MEANING rather than shape, which a reader cannot otherwise detect. An
+absent `schema` is generation 1, the per-mille generation.
+
 - **The header is written after the first sample that was read**, and its columns
   never move after that. A figure the server did not report in a later sample is an
   absent cell, not a missing column.

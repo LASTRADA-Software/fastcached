@@ -443,6 +443,43 @@ constexpr void ForEachFigureKey(PanelSpec const& panel, Visit const& visit)
                     visit(figure.key);
 }
 
+/// Call @p visit with the machine key of every figure @p panel writes as a SHARE, in panel order.
+///
+/// **The same walk as `ForEachFigureKey`, block for block**, so a figure in a block one of them
+/// forgot is a figure the other forgets too -- a share walk that covered fewer blocks than the key
+/// walk would report full coverage over a subset, which is the shape that reads as coverage and is
+/// not. `FigureFormat::Percent` is what makes a figure a share; the tier columns are walked by the
+/// caller, which is where the tier names are.
+/// @param panel The panel.
+/// @param visit Called with each share figure's key.
+template <typename Visit>
+constexpr void ForEachShareKey(PanelSpec const& panel, Visit const& visit)
+{
+    auto const shared = [&visit](std::string_view key, FigureSpec const& figure) {
+        if (figure.format == FigureFormat::Percent)
+            visit(key);
+    };
+    for (auto const& row: panel.rates)
+    {
+        shared(row.key, row.figure);
+        for (auto const& beside: row.beside)
+            shared(beside.key, beside.figure);
+        for (auto const& part: row.split)
+            shared(part.key, part.figure);
+    }
+    for (auto const& row: panel.levels)
+    {
+        shared(row.key, row.value);
+        if (row.limit.has_value())
+            shared(row.limitKey, *row.limit);
+    }
+    for (auto const& block: panel.facts)
+        for (auto const& line: block.lines)
+            for (auto const& cell: line.cells)
+                for (auto const& figure: cell.figures)
+                    shared(figure.key, figure.figure);
+}
+
 /// What joins a tier's name to a tier column's key in the machine name of that tier's figure.
 ///
 /// A hyphen, so the joined name is kebab-case like every other key a program reads (`PanelKeysAreWhole` judges the

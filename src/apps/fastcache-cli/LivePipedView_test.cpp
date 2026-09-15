@@ -7,7 +7,9 @@
 #include <FastCache/Cache/StorageTier.hpp>
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/MachineName.hpp>
+#include <FastCache/Core/NumericText.hpp>
 #include <FastCache/Core/Ranges.hpp>
+#include <FastCache/Distributed/FleetView.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Metrics/StatsReading.hpp>
 
@@ -508,7 +510,7 @@ TEST_CASE("a panel key a program reads is kebab-case like the leader's fleet col
         auto const refusal = MisspelledMachineName(planted);
         INFO("planted in " << planted[index].table);
         REQUIRE(refusal.has_value());
-        CHECK(refusal->contains(std::format("table `{}`", planted[index].table)));
+        CHECK(Unwrap(refusal).contains(std::format("table `{}`", planted[index].table)));
     }
 }
 
@@ -708,4 +710,84 @@ TEST_CASE("a tier that first appears after the piped header gains no column", "[
     CHECK(std::ranges::none_of(header, [](std::string const& name) { return name.starts_with("disk-"); }));
     CHECK(Fields(lines[2]).size() == header.size());
     CHECK(CellUnder(header, Fields(lines[2]), "memory-items") == "20");
+}
+
+TEST_CASE("every share a machine reads is a fraction in 0..1, on all three subjects", "[cli][live][piped][figures][scale]")
+{
+    // #1445's acceptance. A share -- a hit rate, a fill, cpu-busy -- was written in three scales with
+    // no unit in any header: the node and cache panels wrote `0.7403`, the leader's fleet tables wrote
+    // `853`, and the series section wrote a fraction again. A script reading two subjects compared 853
+    // with 0.74 and nothing anywhere said which was which.
+    //
+    // WHAT DISTINGUISHES: the bound. A case asserting a share is *written* passes under every one of
+    // those three spellings; only `0 <= v <= 1` separates a fraction from a per-mille, and it separates
+    // them for EVERY share rather than the one somebody thought to pin.
+    //
+    // Derived from the panels rather than a list: `ForEachShareKey` walks the same blocks as
+    // `ForEachFigureKey`, so a share in a block a list forgot is still asked about here.
+    auto const shareKeysOf = [](PanelSpec const& panel) {
+        std::vector<std::string_view> keys;
+        ForEachShareKey(panel, [&keys](std::string_view key) { keys.push_back(key); });
+        return keys;
+    };
+
+    // The control first: a walk that found no share would make every check below vacuous, and that is
+    // exactly how this case would rot if a panel's formats were reworked.
+    auto const cacheShares = shareKeysOf(CachePanel());
+    auto const nodeShares = shareKeysOf(NodePanel());
+    REQUIRE_FALSE(cacheShares.empty());
+    REQUIRE_FALSE(nodeShares.empty());
+
+    // 90 hits of 100 lookups, twice, so every rate has an interval to be taken over: a known share of
+    // exactly 0.9, which is `0.9000` as a fraction and would be `900` as a per-mille.
+    std::vector<DashboardEvent> script;
+    AddSample(script, 1, CacheAt(90, 10, 1000, 4096));
+    AddSample(script, 3, CacheAt(180, 20, 1500, 5120));
+    auto const lines = Lines(Stream(std::move(script), OutputFormat::Tsv, {}, std::nullopt, &CacheFigures));
+    REQUIRE(lines.size() == 3);
+    auto const header = Fields(lines[0]);
+    auto const row = Fields(lines[2]);
+    REQUIRE(row.size() == header.size());
+
+    auto const inUnitRange = [](std::string const& text) {
+        auto value = 0.0;
+        REQUIRE(ParseFiniteDouble(text, value));
+        INFO("value " << text);
+        CHECK(value >= 0.0);
+        CHECK(value <= 1.0);
+    };
+
+    auto asked = 0U;
+    for (auto const key: cacheShares)
+    {
+        auto const found = std::ranges::find(header, key);
+        if (found == header.end())
+            continue; // A figure this panel draws that this reading did not carry.
+        auto const& cell = row[static_cast<std::size_t>(found - header.begin())];
+        if (cell.empty())
+            continue; // Absent stays absent; a share nobody could compute is not a share out of range.
+        inUnitRange(cell);
+        ++asked;
+    }
+    // Absence of a failure is not the presence of a check: a run where every share happened to be
+    // absent would pass every line above without testing anything.
+    CHECK(asked > 0);
+    CHECK(row[static_cast<std::size_t>(std::ranges::find(header, "hit-rate") - header.begin())] == "0.9000");
+
+    // And the leader's own documents, which are the surface that carried the per-mille. `HitRateOf`
+    // computes 3 of 4 as the fraction it is; `750` is what this asserted against before #1445.
+    auto snapshot = Distributed::FleetSnapshot {};
+    snapshot.role = Distributed::SchedulerRole::Leader;
+    snapshot.nodes.push_back(Distributed::NodeReport {});
+    snapshot.nodes.front().endpoint = "build-01:7070";
+    snapshot.nodes.front().load.cache.hits = 3;
+    snapshot.nodes.front().load.cache.misses = 1;
+
+    auto const json = Distributed::RenderFleetJson(snapshot, Distributed::FleetHistoryView {});
+    CHECK(json.contains(R"("cache-hit-rate":0.7500)"));
+    CHECK_FALSE(json.contains(R"("cache-hit-rate":750)"));
+
+    // The document says which generation it is, because the meaning of that value changed rather than
+    // its shape: a reader that does not know cannot tell 0.75 from a hit rate of under one percent.
+    CHECK(json.contains(std::format(R"("schema":{})", Distributed::FleetJsonSchema)));
 }

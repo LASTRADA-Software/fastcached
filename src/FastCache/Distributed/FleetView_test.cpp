@@ -302,13 +302,19 @@ TEST_CASE("Outstanding leases are listed, and the truncation is visible", "[dist
     CHECK(json.contains(R"("age":90000)"));
 }
 
-TEST_CASE("The page writes a figure as every human surface does, and the text and the JSON keep the integer",
+TEST_CASE("The page writes a figure as every human surface does; a count stays whole and a share is a fraction",
           "[distributed][fleetview][units]")
 {
     // One writer per scale (`HumanFleetFigure` over `WriteFigure`), shared with the terminal fleet panel.
-    // WHAT DISTINGUISHES: the page's memory cell is exactly the shared writer's `93.65 GiB` and its CPU
-    // cell `71.5 %` -- a page keeping a byte formatter of its own draws `93.6 GiB` beside the panel's
-    // `93.65 GiB` -- while `/fleet.txt` and `/fleet.json` carry `100552671232` and `715` untouched.
+    // The page's memory cell is exactly the shared writer's `93.65 GiB` and its CPU cell `71.5 %` -- a page
+    // keeping a byte formatter of its own draws `93.6 GiB` beside the panel's `93.65 GiB`.
+    //
+    // WHAT DISTINGUISHES, and it is the PAIR rather than either half: the machine surfaces carry a byte
+    // count as the integer it is and a share as the FRACTION it is. This case asserted `715` for the share
+    // until #1445 -- a per-mille integer, read by scripts that also read a fraction from the CLI's piped
+    // output, with no unit in either header. Asserting only the fraction would pass under a change that
+    // made every cell fractional and turned a byte count into `1.005526712320e11`; asserting only the
+    // count is what this case used to do, and it passed throughout the defect.
     auto snapshot = LeadingSnapshot();
     snapshot.nodes.front().capacity.totalMemoryBytes = 100552671232ULL;
     snapshot.nodes.front().load.cpuBusyPermille = 715;
@@ -318,11 +324,18 @@ TEST_CASE("The page writes a figure as every human surface does, and the text an
     CHECK(html.contains(">71.5 %<"));
     CHECK(HumanFleetFigure(100552671232ULL, CellFormat::Bytes) == "93.65 GiB");
 
+    // A person reads the same percentage, from the fraction the cell now carries.
+    CHECK(HumanShareFigure(0.715) == "71.5 %");
+
     auto const text = RenderFleetText(snapshot, NoHistory(), FleetSection::Machines);
     CHECK(text.contains("\t100552671232\t"));
-    CHECK(text.contains("\t715\t"));
+    CHECK(text.contains("\t0.7150\t"));
+    CHECK_FALSE(text.contains("\t715\t"));
     CHECK_FALSE(text.contains("GiB"));
-    CHECK(RenderFleetJson(snapshot, NoHistory()).contains(":100552671232"));
+
+    auto const json = RenderFleetJson(snapshot, NoHistory());
+    CHECK(json.contains(":100552671232"));
+    CHECK(json.contains(":0.7150"));
 }
 
 TEST_CASE("A complete lease listing does not claim to be truncated", "[distributed][fleetview]")
@@ -467,8 +480,8 @@ TEST_CASE("Every name a fleet document gives a program is kebab-case, and a miss
     }
     for (auto const& row: FleetSectionTable)
         CHECK(std::ranges::find(sources, row.key) != sources.end());
-    for (auto const source: { "fleet-sections", "kpi-keys", "lease-outcomes" })
-        CHECK(std::ranges::find(sources, std::string_view { source }) != sources.end());
+    for (auto const source: std::array<std::string_view, 3> { "fleet-sections", "kpi-keys", "lease-outcomes" })
+        CHECK(std::ranges::find(sources, source) != sources.end());
     auto const* const tiers = FindIfOrNull(tables, [](MachineNameTable const& table) { return table.table == "tiers"; });
     REQUIRE(tiers != nullptr);
     CHECK(std::ranges::find(tiers->names, "disk-index-ram") != tiers->names.end());
@@ -480,8 +493,8 @@ TEST_CASE("Every name a fleet document gives a program is kebab-case, and a miss
         auto const refusal = MisspelledMachineName(planted);
         INFO("planted in " << planted[index].table);
         REQUIRE(refusal.has_value());
-        CHECK(refusal->contains(std::format("table `{}`", planted[index].table)));
-        CHECK(refusal->contains("`plantedCamelCase`"));
+        CHECK(Unwrap(refusal).contains(std::format("table `{}`", planted[index].table)));
+        CHECK(Unwrap(refusal).contains("`plantedCamelCase`"));
     }
 }
 
@@ -590,7 +603,7 @@ TEST_CASE("A cache serving no reads has no hit rate rather than a rate of zero",
 
     snapshot.nodes[0].load.cache.hits = 750;
     snapshot.nodes[0].load.cache.misses = 250;
-    CHECK(RenderFleetJson(snapshot, NoHistory()).contains(R"("cache-hit-rate":750)"));
+    CHECK(RenderFleetJson(snapshot, NoHistory()).contains(R"("cache-hit-rate":0.7500)"));
 }
 
 TEST_CASE("A tier's key index is reported as the RAM it is", "[distributed][fleetview][storage-tier]")
@@ -1325,7 +1338,7 @@ TEST_CASE("The headline figures travel as numbers rather than as the page's labe
     CHECK(json.contains(R"("of":)"));
     // The scale travels too: the key alone cannot say whether a hit rate of 853 is a
     // count or eight-hundred-and-fifty-three thousandths.
-    CHECK(json.contains(R"("unit":"permille")"));
+    CHECK(json.contains(R"("unit":"share")"));
     CHECK(json.contains(R"("unit":"milliseconds")"));
 }
 

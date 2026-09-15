@@ -1257,9 +1257,11 @@ constexpr auto FleetMachines = std::size_t { 12 };
         text += (index == 0 ? "" : "\t") + kpiColumns[index];
     text += "\n";
     // The first three figures carry what the tile cases read: a grouped count, a denominator, and a
-    // per-mille share. The rest are ones.
+    // share. The rest are ones. The share is a FRACTION with a unit of `share`, which is what the
+    // leader publishes since #1445 -- it was `881` and `permille` here, and a fixture that kept the
+    // old spelling would go on proving the panel can read a document nobody sends.
     constexpr auto LeadingFigures =
-        std::to_array<std::string_view>({ "12884\tcount\t-", "47\tcount\t192", "881\tpermille\t-" });
+        std::to_array<std::string_view>({ "12884\tcount\t-", "47\tcount\t192", "0.8810\tshare\t-" });
     auto const keys = Distributed::FleetKpiKeys();
     for (auto const index: std::views::iota(std::size_t { 0 }, keys.size()))
     {
@@ -1762,7 +1764,7 @@ TEST_CASE("every column a leader renders has a scale the panel finds, and a colu
     CHECK(known > 20);
     CHECK_FALSE(Distributed::FleetColumnFormat(FleetSection::Machines, "zeta-column").has_value());
     CHECK(Distributed::FleetColumnFormat(FleetSection::Machines, "memory") == Distributed::CellFormat::Bytes);
-    CHECK(Distributed::FleetColumnFormat(FleetSection::Machines, "cpu-busy") == Distributed::CellFormat::Permille);
+    CHECK(Distributed::FleetColumnFormat(FleetSection::Machines, "cpu-busy") == Distributed::CellFormat::Share);
 }
 
 TEST_CASE("a piped fleet record carries the leader's integers, never the panel's written figures",
@@ -1777,7 +1779,7 @@ TEST_CASE("a piped fleet record carries the leader's integers, never the panel's
     auto stream = std::string {};
     for (auto const& frame: sink.frames)
         stream += frame;
-    CHECK(stream.contains("\t881\t"));
+    CHECK(stream.contains("\t0.8810\t"));
     CHECK(stream.contains("\t12884\t"));
     CHECK_FALSE(stream.contains("%"));
     CHECK_FALSE(stream.contains("12 884"));
@@ -1968,9 +1970,12 @@ struct ChartDrawing
     auto sink = CollectingSink {};
     (void) Drive(
         { DashboardEvent { .kind = DashboardEventKind::Resize, .columns = columns, .rows = rows, .cellPixels = cellPixels },
-          FleetSampleOf(1, ChartText({ "100", "900", "500" })),
-          FleetSampleOf(2, ChartText({ "200", "-", "600" })),
-          FleetSampleOf(3, ChartText({ "300", "800", "700" })),
+          // The document's own vocabulary: a share is a fraction since #1445, so these are the
+          // bytes a leader sends rather than the per-mille integers it used to. `-` stays the
+          // absent marker, which is the one cell in here whose spelling did not change.
+          FleetSampleOf(1, ChartText({ "0.1000", "0.9000", "0.5000" })),
+          FleetSampleOf(2, ChartText({ "0.2000", "-", "0.6000" })),
+          FleetSampleOf(3, ChartText({ "0.3000", "0.8000", "0.7000" })),
           Tick },
         DashboardLimits {},
         view,
@@ -4363,13 +4368,16 @@ TEST_CASE("the fleet chart explains itself: its figure and span, each machine's 
     auto const title = Trimmed(Columns(lines.at(chart.row - 2), 1, FakeCellWidth(lines.at(chart.row - 2)) - 2));
     CHECK(title == std::format("{} per machine, last {} samples", metric.key, window));
 
-    auto const figure = [](std::uint64_t permille) {
-        return Distributed::HumanFleetFigure(permille, Distributed::CellFormat::Permille);
+    // A share reaches a reader as a fraction, so the expected text is built from one. Calling
+    // `HumanFleetFigure(881, Share)` is what this did, and with the format's scale now 1.0 that
+    // asks for 88100 % -- the helper has to speak the document's vocabulary, not the wire's.
+    auto const figure = [](double share) {
+        return Distributed::HumanShareFigure(share);
     };
     auto const bandCells = chart.cellsHigh / 3;
     REQUIRE(bandCells * 3 == chart.cellsHigh);
     auto const expected = std::to_array<std::pair<std::string_view, std::string>>(
-        { { "build-01:7070", figure(300) }, { "build-02:7070", figure(800) }, { "build-03:7070", figure(700) } });
+        { { "build-01:7070", figure(0.300) }, { "build-02:7070", figure(0.800) }, { "build-03:7070", figure(0.700) } });
     for (auto const index: std::views::iota(std::size_t { 0 }, expected.size()))
     {
         auto const& row = lines.at(chart.row - 1 + (index * bandCells));
@@ -4392,8 +4400,8 @@ TEST_CASE("the fleet chart explains itself: its figure and span, each machine's 
     CHECK(
         Trimmed(
             Columns(legend, scale.column - 1 + scale.cellsWide, FakeCellWidth(legend) - 1 - scale.cellsWide - scale.column))
-            .starts_with(figure(1000)));
-    CHECK(legend.contains(std::format("bar: {}, grey: to {}, blank: no reading", metric.key, figure(1000))));
+            .starts_with(figure(1.000)));
+    CHECK(legend.contains(std::format("bar: {}, grey: to {}, blank: no reading", metric.key, figure(1.000))));
 }
 
 TEST_CASE("before any machine reports the chart's figure, the chart says so on every rung and draws no image",
@@ -4458,12 +4466,15 @@ TEST_CASE("on a text rung the fleet chart is the rung's marks: a sample a cell, 
     //     there would be a reading nobody gave;
     //   - the legend names the zero mark and the full cell, and that every band's top is the metric's whole;
     //   - on the ASCII rung the same rows are ASCII marks, byte for byte.
-    auto const figure = [](std::uint64_t permille) {
-        return Distributed::HumanFleetFigure(permille, Distributed::CellFormat::Permille);
+    // A share reaches a reader as a fraction, so the expected text is built from one. Calling
+    // `HumanFleetFigure(881, Share)` is what this did, and with the format's scale now 1.0 that
+    // asks for 88100 % -- the helper has to speak the document's vocabulary, not the wire's.
+    auto const figure = [](double share) {
+        return Distributed::HumanShareFigure(share);
     };
     auto const& metric = FleetChartMetrics.front();
     constexpr auto Machines = std::to_array<std::string_view>({ "build-01:7070", "build-02:7070", "build-03:7070" });
-    auto const newest = std::to_array({ figure(300), figure(800), figure(700) });
+    auto const newest = std::to_array({ figure(0.300), figure(0.800), figure(0.700) });
 
     auto const drawing = DrawChart(RenderRung::Unicode, std::nullopt, 100, 60);
     REQUIRE(drawing.frames.size() == 1);
@@ -4516,7 +4527,7 @@ TEST_CASE("on a text rung the fleet chart is the rung's marks: a sample a cell, 
     auto const legend = Inside(lines.at(chart.axis + 1));
     CHECK(legend.contains(std::format("{} zero", BlockLevels.front())));
     CHECK(legend.contains(std::format("{} the top", BlockLevels.back())));
-    CHECK(legend.contains(std::format("bar: {} of {}, blank: no reading", metric.key, figure(1000))));
+    CHECK(legend.contains(std::format("bar: {} of {}, blank: no reading", metric.key, figure(1.000))));
 
     auto const ascii = DrawChart(RenderRung::Ascii, std::nullopt, 100, 60);
     REQUIRE(ascii.frames.size() == 1);
