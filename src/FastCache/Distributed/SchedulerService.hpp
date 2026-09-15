@@ -449,6 +449,31 @@ class SchedulerService
     /// @return `Ok` once the entry is appended, or a refusal.
     [[nodiscard]] SchedulerReply ClusterForget(CallerContext const& caller, std::string_view memberId);
 
+    /// An operator admits a CLIENT host: a machine that may ask this fleet for capacity and
+    /// never joins consensus.
+    ///
+    /// Gated exactly as `ClusterForget` is -- leadership, membership and the credential --
+    /// because what it changes is replicated state. It is a separate verb from
+    /// `ClusterAdmit` rather than a flag on it: a member is counted by the quorum and a
+    /// client never is, so one verb answering both would make the quorum's membership
+    /// depend on a field (#1309).
+    ///
+    /// @param caller Who asked, and what the transport already established about them.
+    /// @param host The client host, as a peer's source address spells it.
+    /// @return The reply to send.
+    [[nodiscard]] SchedulerReply ClusterAdmitClient(CallerContext const& caller, std::string_view host);
+
+    /// An operator forgets a client host.
+    ///
+    /// The positive act that `--fleet-member` removal is not: dropping a host from a list on
+    /// one node decommissions it nowhere else, which is the fail-OPEN direction #1309 exists
+    /// to close. The cluster records the forget, and every member refuses that host.
+    ///
+    /// @param caller Who asked, and what the transport already established about them.
+    /// @param host The client host to forget.
+    /// @return The reply to send.
+    [[nodiscard]] SchedulerReply ClusterForgetClient(CallerContext const& caller, std::string_view host);
+
     /// Add a member to the cluster, or record that one has moved.
     ///
     /// The counterpart `ClusterForget` had none of, and its absence was the reason
@@ -525,6 +550,18 @@ class SchedulerService
     }
 
   private:
+    /// Put a client verb to consensus: the two client verbs differ only by their command
+    /// kind, so the gate, the no-cluster refusal and the offer are written once.
+    ///
+    /// @param caller Who asked.
+    /// @param kind `AdmitClient` or `ForgetClient`.
+    /// @param host The client host the command records.
+    /// @return The reply to send.
+    [[nodiscard]] SchedulerReply OfferClientVerb(CallerContext const& caller,
+                                                 Cluster::CommandKind kind,
+                                                 std::string_view host);
+
+
     /// Where handed-over history goes; null until the admin surface sets one.
     IFleetHistorySink* _history { nullptr };
 

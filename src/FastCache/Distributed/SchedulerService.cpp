@@ -528,6 +528,29 @@ SchedulerReply SchedulerService::ClusterForget(CallerContext const& caller, std:
         .kind = Cluster::CommandKind::RemoveMember, .key = std::string { memberId }, .value = {}, .schedulerEndpoint = {} });
 }
 
+SchedulerReply SchedulerService::ClusterAdmitClient(CallerContext const& caller, std::string_view host)
+{
+    return OfferClientVerb(caller, Cluster::CommandKind::AdmitClient, host);
+}
+
+SchedulerReply SchedulerService::ClusterForgetClient(CallerContext const& caller, std::string_view host)
+{
+    return OfferClientVerb(caller, Cluster::CommandKind::ForgetClient, host);
+}
+
+SchedulerReply SchedulerService::OfferClientVerb(CallerContext const& caller,
+                                                 Cluster::CommandKind kind,
+                                                 std::string_view host)
+{
+    if (auto refusal = Gate(caller); refusal.has_value())
+        return std::move(*refusal);
+    if (_admin == nullptr)
+        return Refuse(Wire::ErrorCode::NoCluster);
+
+    return Offer(Cluster::Command {
+        .kind = kind, .key = std::string { host }, .value = {}, .schedulerEndpoint = {} });
+}
+
 SchedulerReply SchedulerService::ClusterAdmit(CallerContext const& caller,
                                               std::string_view memberId,
                                               std::string_view raftEndpoint)

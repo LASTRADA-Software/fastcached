@@ -1200,6 +1200,8 @@ Task<void> CompileCacheHandler::Run(ISocket* socket,
             case Wire::Op::ClusterStatus:
             case Wire::Op::ClusterSet:
             case Wire::Op::ClusterForget:
+            case Wire::Op::ClusterAdmitClient:
+            case Wire::Op::ClusterForgetClient:
             case Wire::Op::ClusterAdmit:
             // The operator verbs, answered by a compile node and refused HERE by name.
             // Sharing the arm above is right rather than convenient: `HandleDistributed`
