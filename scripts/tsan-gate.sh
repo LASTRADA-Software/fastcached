@@ -185,7 +185,13 @@ SUPPRESSIONS="${REPO_ROOT}/.tsan-suppressions"
 # picking threaded files out of it. The rest are per-file: `[sharded]` for
 # `Cache/ShardedStorage_test.cpp` (the tree's one explicit concurrency stress
 # case), `[expiry]` for `Cache/ExpiryReaper_test.cpp`, `[clock]` for
-# `Core/Clock_test.cpp`, `[pubsub]` for `Protocol/RedisRespSocket_test.cpp`,
+# `Core/Clock_test.cpp`, `[wait]` for `Core/BoundedWait_test.cpp` (#1446: the one
+# test wait every threaded case above now goes through, and a case that waits on a
+# helper thread to prove its account reaches the case's own thread. The other eight
+# cases there are single-threaded, and a file row selects the whole file. Run under
+# TSan before the row was added, on 300729f2, Linux, clang-tsan, with the gate's own
+# TSAN_OPTIONS: 9 cases, 0 warnings, and the canary red at exit 66 in the same run),
+# `[pubsub]` for `Protocol/RedisRespSocket_test.cpp`,
 # `[server]` for the two threaded `Server/` files. `[reactor]` also reaches
 # `Protocol/LiveStreamReactors_test.cpp`, one live-stats stream served on two real
 # reactors (#1399) -- and `[livestats]` is deliberately NOT a row: its other cases
@@ -264,7 +270,7 @@ SUPPRESSIONS="${REPO_ROOT}/.tsan-suppressions"
 # the OBJECTS that answer, and the reading was controlled in both directions -- a
 # plain TU compiled without the flag reads 0 and the same TU with it reads 1.
 TARGETS=(
-    "FastCacheTest|[async],[consensus],[distributed],[reactor],[task],[net],[tls],[sharded],[expiry],[clock],[pubsub],[server]|first-party"
+    "FastCacheTest|[async],[consensus],[distributed],[reactor],[task],[net],[tls],[sharded],[expiry],[clock],[wait],[pubsub],[server]|first-party"
     "fastcache-compile-node-tests||first-party"
     "fastcache-cc-tests||none: the launcher does not link the FastCache library, it compiles its few shared sources in"
     "fastcache-cli-tests||first-party"
