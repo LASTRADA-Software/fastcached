@@ -71,6 +71,10 @@
 
 set -uo pipefail
 
+# Which files are this project's own is ONE answer, and an enumerator that does not ask takes vendored source
+# as first-party (#1370). `CompositeActions` lists what git tracks, so it asks.
+. "$(dirname "${BASH_SOURCE[0]}")/lib/third-party-roots.sh"
+
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 workflows_dir="${repo_root}/.github/workflows"
 
@@ -657,7 +661,7 @@ Judge() {
 # @param 1 The repository root.
 # @return 0 when no composite action is tracked, 1 otherwise.
 CompositeActions() {
-    local root="$1" listed status file using tracked=0 actions=0 refused=0
+    local root="$1" listed status file using firstParty declined summary tracked=0 actions=0 refused=0
     # NUL-separated: a plain listing QUOTES a path holding a byte outside ASCII, and `*/action.yml` misses
     # `".../action.yml"`. pipefail keeps git's status rather than tr's.
     listed="$(git -C "$root" ls-files -z 2>&1 | tr '\0' '\n')"
@@ -666,6 +670,14 @@ CompositeActions() {
         echo "  FAIL: git ls-files exited ${status} in ${root}, so no tracked composite action could be looked for: ${listed}"
         return 1
     fi
+    # A vendored action is not this project's to judge, and a roots file that cannot be read is a REFUSAL:
+    # read as nothing, every `action.yml` under vendor/ would be refused as one of ours (#1370).
+    if ! firstParty="$(first_party_paths "$root" "$listed")"; then
+        echo "  FAIL: the third-party roots of ${root} could not be read (the reader says why above), so a vendored composite action cannot be told from one of ours"
+        return 1
+    fi
+    declined="$(third_party_paths "$root" "$listed")"
+    listed="$firstParty"
     while IFS= read -r file; do
         [ -n "$file" ] || continue
         tracked=$((tracked + 1))
@@ -696,7 +708,8 @@ CompositeActions() {
         echo "  FAIL: git ls-files listed no tracked file in ${root} -- a listing of nothing is not a repository without actions"
         return 1
     fi
-    echo "workflow-step-env: actions: ${tracked} tracked file(s) listed by git ls-files, ${actions} action file(s), ${refused} refused"
+    summary="$(third_party_declined_summary "tracked file(s)" "$declined")"
+    echo "workflow-step-env: actions: ${tracked} first-party tracked file(s) listed by git ls-files, ${actions} action file(s), ${refused} refused${summary:+ -- ${summary}}"
     [ "$refused" -eq 0 ]
 }
 
@@ -1327,6 +1340,13 @@ WF
     ActionCase() {
         local name="$1" want="$2" expect="$3" how="${4:-function}" out got
         mkdir -p "$tmp/$name"
+        # A case tree is a repository, so it owns the one answer to what is third-party. Staged here rather than per
+        # case, because a case that forgot it would refuse for the wrong reason; `rootsUnreadable` is the case that
+        # deliberately has none.
+        if [ ! -e "$tmp/$name/scripts/lib/third-party-roots.txt" ] && [ "$name" != rootsUnreadable ]; then
+            mkdir -p "$tmp/$name/scripts/lib" && printf 'vendor/endo
+' > "$tmp/$name/scripts/lib/third-party-roots.txt"
+        fi
         if [ "$how" = script ]; then
             out="$(GIT_CEILING_DIRECTORIES="$tmp" bash "$tmp/$name/scripts/check-workflow-step-env.sh" 2>&1)"
         else
@@ -1373,12 +1393,29 @@ runs:
   using: composite
   steps: []
 ACTION
-    ActionCase untrackedComposite 0 '2 tracked file(s) listed by git ls-files, 1 action file(s), 0 refused'
+    ActionCase untrackedComposite 0 '2 first-party tracked file(s) listed by git ls-files, 1 action file(s), 0 refused'
 
     Stage unreadableUsing action.yml <<'ACTION'
 runs: { using: composite, steps: [] }
 ACTION
     ActionCase unreadableUsing 1 '`runs.using` reads ``'
+
+    # A composite action under a third-party root is not this project's to judge: DECLINED, and named.
+    Stage vendoredComposite README.md <<< "readme"
+    Stage vendoredComposite vendor/endo/.github/actions/build/action.yml <<'ACTION'
+runs:
+  using: composite
+  steps: []
+ACTION
+    ActionCase vendoredComposite 0 'declined 1 third-party tracked file(s)'
+
+    # And the roots file is load-bearing: read as nothing, the case above would be refused as one of ours.
+    Stage rootsUnreadable README.md <<< "readme"
+    Stage rootsUnreadable vendor/endo/.github/actions/build/action.yml <<'ACTION'
+runs:
+  using: composite
+ACTION
+    ActionCase rootsUnreadable 1 'third-party roots of'
 
     Stage nothingTracked notes.txt untracked <<< "not tracked"
     ActionCase nothingTracked 1 'listed no tracked file'
@@ -1387,6 +1424,7 @@ ACTION
 
     # The unplanted run asks, not only the function: a clean workflow beside a tracked composite action is refused.
     Stage askedByTheRun scripts/check-workflow-step-env.sh < "${BASH_SOURCE[0]}"
+    Stage askedByTheRun scripts/lib/third-party-roots.sh < "$(dirname "${BASH_SOURCE[0]}")/lib/third-party-roots.sh"
     Stage askedByTheRun .github/workflows/wf.yml <<'WF'
 jobs:
   a:
