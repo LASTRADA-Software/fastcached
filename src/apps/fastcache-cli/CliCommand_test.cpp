@@ -161,6 +161,23 @@ TEST_CASE("the help text substitutes the default address rather than printing th
     CHECK_FALSE(help.contains("{addr}"));
 }
 
+TEST_CASE("the help text states the durations it takes and how to ask for no expiry", "[cli][command]")
+{
+    // #1402. The dial defaults are formatted from `DialTimeouts` through tokens, so the help
+    // cannot state a default the tool does not use; and `--ttl=0s` is refused, so the page
+    // has to say what to do instead or the refusal is the first an operator hears of it.
+    auto const help = HelpText();
+    CHECK(help.contains(std::format("default {}", FormatDuration(DialTimeouts {}.connect))));
+    CHECK(help.contains(std::format("default {}", FormatDuration(DialTimeouts {}.io))));
+    CHECK(help.contains(DurationUnitList()));
+    CHECK(help.contains("leave the flag off for no expiry"));
+    for (auto const* token: { "{duration-units}", "{connect-timeout}", "{io-timeout}" })
+    {
+        CAPTURE(token);
+        CHECK_FALSE(help.contains(token));
+    }
+}
+
 TEST_CASE("colour changes no column in the help text", "[cli][command]")
 {
     auto const plain = HelpText(UsageColor::Plain);

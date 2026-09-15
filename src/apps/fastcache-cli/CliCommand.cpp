@@ -279,7 +279,8 @@ namespace
           .operand = "=<duration>",
           .apply = AssignTtl(),
           .description = "expiry for `set`, in whole seconds of one of\n"
-                         "{duration-units}: 90s, 1h, 7d" },
+                         "{duration-units}: 90s, 1h, 7d. 0s is refused;\n"
+                         "leave the flag off for no expiry" },
         { .primary = "--nx",
           .apply = SetVerbFlag<&VerbOptions::onlyIfAbsent>(),
           .description = "`set` only if the key does not exist" },

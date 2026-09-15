@@ -198,7 +198,7 @@ struct NodeConfig
     /// somebody's desktop becoming unusable.
     std::optional<std::uint32_t> reservedCores;
 
-    /// Seconds a stop waits for compiles still running, or 0 to wait forever.
+    /// How long a stop waits for compiles still running, in whole seconds, or zero to wait forever.
     ///
     /// A stopping worker has to wait for something: a compile legitimately holds its
     /// slot for seconds, and abandoning one loses work a client is still waiting on.
@@ -212,7 +212,7 @@ struct NodeConfig
     /// and a compile-time answer on a binary whose `--install-service` replays its
     /// command line forever is a value nobody can move afterwards.
     ///
-    /// Zero is "wait forever", which is what this did before the flag existed. It
+    /// Zero (`0s`) is "wait forever", which is what this did before the flag existed. It
     /// stays reachable so an operator who prefers the supervisor's timeout to this
     /// one can say so, rather than discovering the change as a behaviour they cannot
     /// turn off.

@@ -238,6 +238,7 @@ TEST_CASE("Naming --ttl reaches the storage verbs that honour it", "[cli][verbs]
     auto exchange = ScriptedMemcachedExchange { { "STORED\r\n" } };
     auto const answer = Run("add", { "k", "v" }, exchange, VerbOptions { .ttl = std::chrono::seconds { 90 } });
     CHECK(answer.outcome == Outcome::Affirmative);
+    REQUIRE(exchange.Sent().size() == 1);
     CHECK(exchange.Sent().front() == "add k 0 90 1\r\nv\r\n");
 }
 
@@ -252,6 +253,9 @@ TEST_CASE("a --ttl memcached would read as a date is refused before anything is 
         auto exchange = ScriptedMemcachedExchange { { "STORED\r\n" } };
         auto const answer = Run("add", { "k", "v" }, exchange, VerbOptions { .ttl = std::chrono::days { 30 } });
         CHECK(answer.outcome == Outcome::Affirmative);
+        // Asked before `front()`: a refusal sends nothing, and reading the first of nothing is a crash that
+        // takes every later case in the binary with it rather than a red naming this one.
+        REQUIRE(exchange.Sent().size() == 1);
         CHECK(exchange.Sent().front() == "add k 0 2592000 1\r\nv\r\n");
     }
     SECTION("one second past it")
