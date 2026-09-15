@@ -4610,6 +4610,16 @@ inline constexpr std::string_view ConsensusEndpointLabel = "consensus endpoint";
 /// hyphenated -- a relation a test holds, not one a reader is trusted to keep.
 inline constexpr std::string_view ConsensusEndpointField = "consensus-endpoint";
 
+/// The heading this address is shown under where it is not the only thing on the line:
+/// `--print-surfaces`' `dialled at:` block, and the `live-stats` node panel's fact line.
+///
+/// A second name beside `ConsensusEndpointLabel` rather than that label, because it answers a
+/// different question -- *which address is this*, set against the ports a node BINDS -- and
+/// because the panel's first-label column is shared by every line of the panel: an 18-cell label
+/// there moves every value on nodes that run no consensus at all (#1418). One spelling for both
+/// places, so the worksheet and the panel an operator holds side by side say the same words.
+inline constexpr std::string_view ConsensusEndpointHeading = "dialled at";
+
 namespace Detail
 {
     /// Bytes for an engaged optional integral, or NOTHING for a disengaged one.

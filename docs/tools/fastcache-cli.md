@@ -638,7 +638,7 @@ $ fastcache-cli live-stats node --format=tsv --samples=30 > node.tsv
 | Subject | Served by | The panel |
 |---|---|---|
 | `cache` | a `fastcached`, or a `fastcache-compile-node` for its own cache tier | the hit rate, and operations, connections, evictions and expiries per second, each with its trend; connections, items and bytes in use against their limits, per storage tier |
-| `node` | a `fastcache-compile-node` | compiles and refusals per minute, the mean compile and its trend; the slots in use against the slots available and the limit that bounds them; the cache tier's fill; the host's CPU and free memory; the node's identity, toolchains, registrars and the leader |
+| `node` | a `fastcache-compile-node` | compiles and refusals per minute, the mean compile and its trend; the slots in use against the slots available and the limit that bounds them; the cache tier's fill; the host's CPU and free memory; the node's identity, toolchains, registrars and the leader; on a consensus node, `dialled at` — the address its peers dial, the string `--cluster-admit`'s receipt asks you to compare |
 | `fleet` | the node that leads the fleet | the headline figures as tiles; one table per section (machines, workers, leases, members, tiers); each machine's CPU over time |
 
 The subject may be left out, and then it is what `--addr` is: a `fastcached` is

@@ -2868,6 +2868,60 @@ TEST_CASE("a node panel says who the node is and whether it is working, as secti
     CHECK(ColumnOf(Unwrap(working), "serving") == ColumnOf(Unwrap(slots), "6 in flight"));
 }
 
+TEST_CASE("a consensus node's panel says where its peers dial it apart from the leader it knows",
+          "[cli][dashboard][panel][node]")
+{
+    // #1418. WHAT DISTINGUISHES: the dial address differs from the leader's endpoint in the same status, so a row
+    // rendering the leader's field reads `build-01:7071` here and fails.
+    auto status = MockupNodeStatus();
+    status.runtime.consensusEndpoint = "10.0.0.4:6680";
+    auto const frame = NodeFrameAt(80, 30, status);
+
+    auto const dialled = LineStarting(frame, "dialled at");
+    REQUIRE(dialled.has_value());
+    CHECK(Trimmed(Columns(Unwrap(dialled), 1, 78)) == "dialled at  10.0.0.4:6680");
+    CHECK_FALSE(Unwrap(dialled).contains("build-01:7071"));
+    // The leader's line beside it is unchanged.
+    auto const consensus = LineStarting(frame, "consensus");
+    REQUIRE(consensus.has_value());
+    CHECK(Unwrap(consensus).contains("leader      build-01:7071"));
+    // And the label cost no geometry: its value starts in the one value column every first label shares.
+    auto const working = LineStarting(frame, "toolchains");
+    REQUIRE(working.has_value());
+    CHECK(ColumnOf(Unwrap(working), "serving") == ColumnOf(Unwrap(dialled), "10.0.0.4:6680"));
+}
+
+TEST_CASE("a node that runs no consensus draws no dial address even when its status carries one",
+          "[cli][dashboard][panel][node]")
+{
+    // The gate is what the node last said it RUNS, not whether the field is engaged: the endpoint is set here, so a row
+    // keyed on the field alone draws it and fails. Running no consensus is BOTH halves `RunsConsensus` reads: no
+    // component, and no scheduler role.
+    namespace Bits = CompileCacheWire::NodeComponentBit;
+    auto status = MockupNodeStatus();
+    status.components = Bits::CacheTier | Bits::Worker;
+    status.runtime.schedulerRole.reset();
+    status.runtime.leaderEndpoint.clear();
+    status.runtime.consensusEndpoint = "10.0.0.4:6680";
+    auto const frame = NodeFrameAt(80, 30, status);
+    CHECK_FALSE(LineStarting(frame, "dialled at").has_value());
+    CHECK_FALSE(frame.contains("10.0.0.4:6680"));
+    // The control: the line that proves this frame is a node panel at all.
+    CHECK(LineStarting(frame, "toolchains").has_value());
+}
+
+TEST_CASE("a consensus node whose status states no dial address draws the absent marker, not a blank",
+          "[cli][dashboard][panel][node]")
+{
+    // A build older than #1328 sends no field; a blank would read as an empty address, which no node has.
+    auto status = MockupNodeStatus();
+    status.runtime.consensusEndpoint.reset();
+    auto const frame = NodeFrameAt(80, 30, status);
+    auto const dialled = LineStarting(frame, "dialled at");
+    REQUIRE(dialled.has_value());
+    CHECK(Trimmed(Columns(Unwrap(dialled), 1, 78)) == std::format("dialled at  {}", Absent));
+}
+
 TEST_CASE("a node panel draws its slots as section 4 does: three numbers, the gauge, the limit and its remedy",
           "[cli][dashboard][panel][node]")
 {

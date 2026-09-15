@@ -2418,6 +2418,7 @@ TEST_CASE("The consensus endpoint has one name, spelled as prose and as a record
     // under silently moves.
     CHECK(ConsensusEndpointLabel == "consensus endpoint");
     CHECK(ConsensusEndpointField == "consensus-endpoint");
+    CHECK(ConsensusEndpointHeading == "dialled at");
 
     // And the RELATION, which is what keeps them one name: the field is the label, hyphenated. A
     // rename of one alone fails here rather than in a comparison an operator makes.

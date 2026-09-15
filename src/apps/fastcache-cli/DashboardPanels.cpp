@@ -4,6 +4,7 @@
 
 #include <FastCache/Cache/IStorage.hpp>
 #include <FastCache/Metrics/StatsReading.hpp>
+#include <FastCache/Protocol/CompileCacheWire.hpp>
 
 #include <array>
 
@@ -319,6 +320,12 @@ namespace
         FactCell { .label = "consensus", .fact = StatusFact::Consensus },
         FactCell { .label = "leader", .fact = StatusFact::Leader },
     };
+    // Where consensus peers DIAL the node, under the heading `--print-surfaces` prints the same address beside
+    // (#1418). A first cell, so its label is no wider than `toolchains`: the first-label column is shared by every
+    // line of the panel, whether the line applies or not.
+    constexpr auto DialledCells = std::array {
+        FactCell { .label = CompileCacheWire::ConsensusEndpointHeading, .fact = StatusFact::DialledAt },
+    };
     // `6 in flight / 12 available / 16 registered`: every number a figure, so a piped stream carries each.
     constexpr auto SlotFigures = std::array {
         BesideFigure { .key = "slots_in_flight",
@@ -385,6 +392,8 @@ namespace
     constexpr auto WorkingLines = std::array {
         FactLine { .cells = WorkingCells, .priority = Priority::High },
         FactLine { .cells = ConsensusCells, .priority = Priority::Normal },
+        // Low: under height it goes before any line section 4 draws.
+        FactLine { .cells = DialledCells, .priority = Priority::Low },
     };
     constexpr auto SlotLines = std::array { FactLine { .cells = SlotCells, .priority = Priority::High } };
     constexpr auto CacheTierLines = std::array { FactLine { .cells = CacheTierCells, .priority = Priority::Normal } };
