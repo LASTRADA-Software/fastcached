@@ -895,6 +895,14 @@ std::unique_ptr<IocpListener> IocpListener::Bind(
     return listener;
 }
 
+std::unique_ptr<IocpListener> IocpListener::Adopt(IocpReactor& reactor, int /*descriptor*/)
+{
+    std::unique_ptr<IocpListener> listener { new IocpListener {} };
+    listener->_impl = std::make_shared<Impl>(reactor);
+    listener->_impl->bindError = "adopt: socket activation is not available on this platform";
+    return listener;
+}
+
 bool IocpListener::IsBound() const noexcept
 {
     return _impl && _impl->listenSock != InvalidSocketValue;

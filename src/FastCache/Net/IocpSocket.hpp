@@ -138,6 +138,25 @@ class IocpListener final: public IListener
                                                             int backlog = 511,
                                                             IAddressResolver& resolver = DefaultAddressResolver());
 
+    /// Refuse to adopt a listening descriptor, because nothing on this platform hands one over.
+    ///
+    /// The factory `EpollListener` and `KqueueListener` have, so a `PlatformListener` caller
+    /// needs no `#if` for a question only the listener can answer (#1347). It refuses in
+    /// `Bind`'s failure convention: a listener with `IsBound() == false` and `BindError()`
+    /// naming why.
+    ///
+    /// **A refusal, not an adoption waiting to be written, and deliberately tracked by no
+    /// issue.** Socket activation is systemd's protocol: `AdoptInheritedDescriptors` hands
+    /// nothing back on Windows, so no production caller arrives here, and an `int` could not
+    /// carry a Win64 `SOCKET` if one did. A real adopt would be code with no supervisor to
+    /// hand it anything and nothing to test it against; a Windows activation mechanism, if
+    /// one is ever wired up, designs its own factory around the handle it actually delivers.
+    /// @param reactor The reactor the listener would have been driven by.
+    /// @param descriptor Not consulted, and not owned: it names no Windows socket, so there is
+    ///        nothing to close on this path, unlike the POSIX factories.
+    /// @return A listener with `IsBound() == false` whose `BindError()` names the refusal.
+    [[nodiscard]] static std::unique_ptr<IocpListener> Adopt(IocpReactor& reactor, int descriptor);
+
     ~IocpListener() override;
 
     [[nodiscard]] AcceptAwaitable Accept() override;

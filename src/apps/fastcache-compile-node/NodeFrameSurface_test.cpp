@@ -1063,6 +1063,20 @@ TEST_CASE("A socket-activated node serves the descriptor it was handed", "[node]
     CHECK_FALSE(Logged(logger, "listening on"));
 }
 
+#endif
+
+/// Why each platform's listener cannot serve the `-1` the case below hands over.
+///
+/// Per platform because the REASON differs while the refusal must not, and the reason is
+/// what distinguishes: `socket-activated` is in the refusal everywhere, so a case asserting
+/// only that would pass on Windows for the POSIX reason. Windows has no socket activation,
+/// so its listener refuses before it looks at the descriptor at all (#1347).
+#if defined(_WIN32)
+constexpr std::string_view UnservableDescriptorCause = "socket activation is not available on this platform";
+#else
+constexpr std::string_view UnservableDescriptorCause = "adopt: not a descriptor";
+#endif
+
 TEST_CASE("A socket-activated descriptor that cannot be served is fatal", "[node][node-surface]")
 {
     // The same answer a failed bind gets, and for the same reason: an activated node
@@ -1091,9 +1105,8 @@ TEST_CASE("A socket-activated descriptor that cannot be served is fatal", "[node
         StartNodeSurfaceOrExplain(io, cfg, SurfaceComponents { .cache = &cache }, std::optional { -1 }, metrics, logger);
     REQUIRE_FALSE(refused.has_value());
     CHECK(refused.error().contains("socket-activated"));
+    CHECK(refused.error().contains(UnservableDescriptorCause));
 }
-
-#endif
 
 TEST_CASE("A node port that cannot be bound is fatal however it was configured", "[node][node-surface]")
 {

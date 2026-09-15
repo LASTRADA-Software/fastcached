@@ -244,6 +244,24 @@ TEST_CASE("An IocpListener destroyed without Close releases its listening socket
     rebound->Close();
 }
 
+TEST_CASE("An IocpListener refuses to adopt a descriptor by name", "[net][iocp][listener]")
+{
+    // #1347. Nothing on this platform hands a listening socket over, so `Adopt` exists to
+    // refuse in `Bind`'s convention -- which is what lets `FrameEndpoint::StartAdopted` be
+    // one body everywhere. Asserted by the SENTENCE, because an unbound listener with an
+    // empty or borrowed error is what a factory that forgot to say anything looks like.
+    FastCache::SteadyClock clock;
+    FastCache::IocpReactor reactor { clock };
+
+    // The descriptor systemd would hand over first. Not a Windows socket, and not owned.
+    constexpr int FirstActivatedDescriptor = 3;
+    auto const listener = FastCache::IocpListener::Adopt(reactor, FirstActivatedDescriptor);
+    REQUIRE(listener);
+    CHECK_FALSE(listener->IsBound());
+    CHECK(listener->BoundPort() == 0);
+    CHECK(listener->BindError() == "adopt: socket activation is not available on this platform");
+}
+
 namespace
 {
 
