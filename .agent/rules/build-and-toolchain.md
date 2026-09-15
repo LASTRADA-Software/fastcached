@@ -4632,6 +4632,29 @@ which reads identically to complete coverage. It walks every workflow file as a 
   is refused by NAME rather than left outside a pass that reads as complete. The file set
   is `git ls-files -z`: a plain listing QUOTES a path holding a byte outside ASCII, and
   `*/action.yml` then misses it.
+- **A definition is a LINE** (#1461). The first model counted a name as defined by a step if
+  the step assigned it ANYWHERE, so `echo "$X"` above `X=1` passed — a model LOOSER than
+  bash, in the check whose whole purpose is that a loose model waves through the one read
+  that matters. A read is judged against what is defined at or above its own line, loosened
+  to the whole script inside a LOOP body, which runs again, and a FUNCTION body, which runs
+  wherever it is called. **Losing the construct is a REFUSAL** (`unreadable-construct`), not
+  a fall back to judging the script as if it had none: a reader that cannot say where a loop
+  ends cannot say which reads are ordered, and the looser answer is the silent one.
+- **And `trap`, the third shape the ticket named, needs NO relaxation — that is a finding,
+  not an omission.** A single-quoted handler is not expanded at all, so the lexer has
+  already masked its `$` and no read is seen in it; a double-quoted one is expanded WHERE
+  `trap` IS CALLED, so ordering is already the right answer there. Writing the relaxation
+  anyway would have added an arm that could never fire, and nothing would ever have said it
+  had stopped working. What the pair of cases pins instead is the DISCRIMINATION: single
+  quotes accepted, double quotes refused. Neutering the mask reddens the single-quote case
+  along with four pre-existing ones, which is what says the answer rests on the lexer.
+- Two limits are pinned as PASSING cases rather than left to be rediscovered: the grain is a
+  LINE, so a read and an assignment on ONE line are not ordered against each other
+  (`for x in a; do echo "$X"; X=1; done` is accepted), and for PowerShell the relaxation is
+  every brace-enclosed block, because its loops, its functions and its `if` blocks are all
+  brace-delimited. Delete either case and the limit stops being a decision. No pwsh step in
+  this tree assigns an environment name at all — `$env:NAME =` appears nowhere under
+  `.github/workflows` — so that half is carried by the cases and by nothing else.
 
 What it cannot see is stated in its own header.
 
