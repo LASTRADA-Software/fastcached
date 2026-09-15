@@ -756,7 +756,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - run: |
-          make AS_ARGUMENT=1 install
+          echo AS_ARGUMENT=1
           echo "$AS_ARGUMENT"
 WF
 
