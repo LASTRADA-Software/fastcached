@@ -209,6 +209,20 @@ class FailingReadSocket final: public SocketDecorator
     std::size_t _remaining;
 };
 
+/// Retire a parked operation the way every transport's `Close()` does: with `Cancelled`.
+///
+/// **Call it LAST, with every member already touched** (#1430). Completing resumes the
+/// awaiting coroutine inline, and a coroutine that owns the socket may destroy it before
+/// this returns, so nothing of the socket may run afterwards. A free function, so it
+/// cannot reach a member itself; the order around it is the caller's, and both parking
+/// fakes below spell it the same way -- detach, forward, count, complete.
+/// @param parked The operation, already detached from its socket.
+inline void CompleteCancelled(IoAwaitable& parked) noexcept
+{
+    parked.Complete(
+        IoResult { std::unexpected(NetError { .code = NetErrorCode::Cancelled, .systemCode = 0, .context = {} }) });
+}
+
 /// A socket whose `WaitReadable` PARKS, the way a reactor socket's does.
 ///
 /// **The in-memory transport cannot stage this, and that is the whole reason this
@@ -284,27 +298,28 @@ class ParkingReadableSocket final: public SocketDecorator
 
     /// @copydoc ISocket::CancelRead
     ///
-    /// **Touches members after `Complete()` resumes a coroutine, which the real
-    /// transports must not do.** `RetireParked()` itself keeps the discipline -- detach,
-    /// complete, nothing after -- but the counter and the forward below run once the
-    /// awaiting coroutine has already resumed. Safe here only because this fake is a
-    /// test's stack local that no coroutine owns; a case where the resumed coroutine
-    /// owned the socket would get a use-after-free inside the instrument. Said out loud
-    /// because this class documents itself as modelling the transports' discipline, and
-    /// that is one place it deliberately does not.
+    /// Completes last; see `CompleteCancelled`.
     void CancelRead() noexcept override
     {
-        if (RetireParked())
-            ++_watchesRetiredByCancel;
+        auto* const parked = std::exchange(_parked, nullptr);
         SocketDecorator::CancelRead();
+        if (parked == nullptr)
+            return;
+        ++_watchesRetiredByCancel;
+        CompleteCancelled(*parked);
     }
 
     /// @copydoc ISocket::Close
+    ///
+    /// Completes last; see `CompleteCancelled`.
     void Close() noexcept override
     {
-        if (RetireParked())
-            ++_watchesRetiredByClose;
+        auto* const parked = std::exchange(_parked, nullptr);
         SocketDecorator::Close();
+        if (parked == nullptr)
+            return;
+        ++_watchesRetiredByClose;
+        CompleteCancelled(*parked);
     }
 
     /// Resolve the parked watch as a reactor would when the socket becomes readable.
@@ -373,21 +388,6 @@ class ParkingReadableSocket final: public SocketDecorator
         _parked = nullptr;
     }
 
-    /// Complete a parked watch with `Cancelled`, which is what both retirement routes
-    /// deliver -- a caller's `CancelRead` and the connection's `Close`. Taking the code
-    /// as a parameter would be a knob with one setting; WHICH route retired the watch
-    /// is what the two counters record, and that is the distinction worth keeping.
-    /// @return Whether there was a parked watch to retire.
-    bool RetireParked() noexcept
-    {
-        auto* const parked = std::exchange(_parked, nullptr);
-        if (parked == nullptr)
-            return false;
-        parked->Complete(
-            IoResult { std::unexpected(NetError { .code = NetErrorCode::Cancelled, .systemCode = 0, .context = {} }) });
-        return true;
-    }
-
     IoAwaitable* _parked { nullptr };
     std::size_t _watchesArmed { 0 };
     std::size_t _watchesOrphaned { 0 };
@@ -449,8 +449,7 @@ class ParkingWritableSocket final: public SocketDecorator
 
     /// @copydoc ISocket::Close
     ///
-    /// Counts before it completes, and touches nothing after: the resumed writer may be
-    /// what destroys this socket next.
+    /// Completes last; see `CompleteCancelled`.
     void Close() noexcept override
     {
         auto* const parked = std::exchange(_parked, nullptr);
@@ -458,8 +457,7 @@ class ParkingWritableSocket final: public SocketDecorator
         if (parked == nullptr)
             return;
         ++_writesRetiredByClose;
-        parked->Complete(
-            IoResult { std::unexpected(NetError { .code = NetErrorCode::Cancelled, .systemCode = 0, .context = {} }) });
+        CompleteCancelled(*parked);
     }
 
     /// @return Whether a write is parked right now.

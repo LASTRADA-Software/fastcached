@@ -5441,9 +5441,16 @@ answer that looks right:
 Every way of losing the question is a **REFUSAL**: a header that never closes, one past a
 line bound, a scope holding no case at all.
 
-`scripts/check-tsan-scope-selftest.cmake` drives 20 cases over trees staged from the REAL
+`scripts/check-tsan-scope-selftest.cmake` drives its cases over a tree staged from the REAL
 scope table and copies of the REAL gate and root `CMakeLists.txt`. It `include()`s the
-check for its table rather than keeping one. It is a sibling script rather than a `-D`
+check for its table rather than keeping one.
+
+That is ONE tree, staged once and restored after each case (#1423). A tree per case took
+the test to 116 s of its 120 s on DrvFs under a gate's load. The shared tree has a hazard
+the per-case trees did not: a change nobody recorded outlives its case, and a later write
+to the same path hides it. So a case changes the tree only through helpers that record the
+path, each helper first requires the path to be at its baseline, and the last case accepts
+the restored tree. A leak is refused, never inherited. It is a sibling script rather than a `-D`
 mode because that is what every other `cmake -P` check here does, and because
 `check-selftest-registered` reads argument dispatch — a `-D` mode is invisible to it.
 
