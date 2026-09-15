@@ -183,7 +183,7 @@ Shape() {
 # ---------------------------------------------------------------------------
 # Self-test.
 SelfTest() {
-    local scratch status=0 cases=0
+    local scratch status=0 cases=0 out
     scratch="$(mktemp -d)" || { echo "cannot create a scratch directory" >&2; exit 2; }
     # shellcheck disable=SC2064  # expand $scratch now, not at trap time
     trap "rm -rf '$scratch'" EXIT
@@ -552,12 +552,9 @@ STUB
                 echo "          HEAD_BRANCH: \${{ github.event.workflow_run.head_branch }}"
                 echo "        run: scripts/ci-merge-group-report.sh x y z \"\$HEAD_BRANCH\""
             }
-            # The reporter step, and its `env:` is the case rather than scenery.
-            # This fixture shipped WITHOUT it, modelling the exact defect as the
-            # CORRECT workflow: `$EVENT` read where nothing defines it, which is
-            # #1174 -- so the baseline vouched for the bug. A fixture more
-            # permissive than the thing it stands for. The positive control for
-            # that rule is `siblingStepEnv` in check-workflow-step-env.sh now.
+            # The reporter step carries its own `env:`. This fixture once shipped
+            # without it, modelling #1174 as the CORRECT workflow, so the baseline
+            # is held to the per-step rule below rather than trusted.
             [[ "$steps" != "no-reporter" ]] && {
                 echo "      - name: \"Open or update one report per unreported failure\""
                 echo "        env:"
@@ -635,6 +632,19 @@ STUB
     # satisfied by the settings rather than by the prose beside them.
     GenerateWorkflow "${scratch}/wf-nocomment.yml" workflow_run cancelled plain issues both no
     ShapeCase "the correct shape passes with no comments at all" want-pass "${scratch}/wf-nocomment.yml"
+
+    # The baseline passes the per-step env rule the shipped workflow is held to, asked of the check that owns the
+    # rule rather than restated here (#1174, #1448).
+    cases=$((cases + 1))
+    mkdir -p "${scratch}/step-env"
+    cp "${scratch}/wf-nocomment.yml" "${scratch}/step-env/wf.yml"
+    if out="$(bash scripts/check-workflow-step-env.sh --workflows "${scratch}/step-env" 2>&1)"; then
+        echo "  ok    (want-pass) the correct shape passes the per-step env rule"
+    else
+        echo "  FAIL  (want-pass) the correct shape passes the per-step env rule" >&2
+        printf '%s\n' "$out" | sed 's/^/        /' >&2
+        status=1
+    fi
 
     # The count is printed rather than compared against a number restated here:
     # a second copy of the expected total is a second thing to be wrong. What it

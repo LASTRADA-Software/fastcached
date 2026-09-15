@@ -4542,20 +4542,23 @@ which reads identically to complete coverage. It walks every workflow file as a 
 
 - The shell is DERIVED per step — its `shell:`, the job's or workflow's
   `defaults.run.shell`, else the runner default for a literal `runs-on` — and a step
-  whose shell cannot be derived, or has no model, is refused. Read by the bash model, a
-  PowerShell step's `$LASTEXITCODE` and `$null` were thirteen false refusals; PowerShell
-  reads the environment only as `$env:NAME`, case-insensitively.
+  whose shell cannot be derived, or has no model, is refused. Run over `build.yml` at
+  fa8fb0c3, the one-workflow model refused 13 PowerShell steps for `$LASTEXITCODE` and
+  `$null`, and 4 bash steps for `{ c=$?; }`, all falsely; PowerShell reads the
+  environment only as `$env:NAME`, case-insensitively.
 - Job-level `env:` reaches that job's steps only. The first model kept one file-wide set,
   harmless over a one-job file and too permissive over `build.yml`.
 - A folded `run: >` is a run. The first model never read one, silently.
-- A clean run is shown able to fail on the REAL files: `workflow-step-env-plant` appends a
-  read of an undefined name to the end of every step, through the same lexer, and passes
-  only when every step refuses it — so a body the lexer leaves inside a quote or a heredoc
-  is found, rather than every read after it passing unseen.
+- A name an earlier step or an action EXPORTED reaches a later step at run time and is
+  still refused until the step names it — `NAME: ${{ env.NAME }}`, which the tree already
+  wrote for `CLANG_TIDY_BIN`. Modelling every `$GITHUB_ENV` spelling and every action's
+  exports would be a row per action; the row says where the name comes from, in the step.
+- The reader refuses a line it cannot place — a flow mapping, an alias, a quoted key, a
+  second document — rather than skipping it, and a clean run is shown able to fail on the
+  REAL files: `workflow-step-env-plant` appends a read of an undefined name to the end of
+  every step, through the same lexer, and passes only when every step refuses it.
 
-What it cannot see is stated in its own header — `eval`, indirect expansion, a name
-supplied through a `${{ }}` that is substituted before the shell sees it, a sourced file,
-`${#arr[@]}`, and an export to `$GITHUB_ENV` or by an action it has no model or row for.
+What it cannot see is stated in its own header.
 
 **A Windows leg that cannot start processes reports six red smoke tests, not a
 runner fault** ([#966](https://github.com/LASTRADA-Software/fastcached/issues/966)).
