@@ -117,6 +117,7 @@ Scan() {
         return t
     }
     function refuse(at, kind, detail) {
+        if (pass < 2) return
         printf "REFUSE\t%d\t%s\t%s\t%s\t%s\n", at, stepName, kind, detail, remedy[kind]
     }
 
@@ -131,6 +132,9 @@ Scan() {
             c = substr(s, i, 1)
             if (lexState == "single") { if (c == sq) lexState = ""; out = out (c == "$" ? "_" : c); continue }
             if (c == esc) { i++; continue }
+            # A `#` starting a word outside any quote begins a comment in both shells, so the rest of the line is
+            # neither a read nor a quote -- an apostrophe in `# do not` must not open a string that hides the step.
+            if (lexState == "" && c == "#" && (i == 1 || substr(s, i - 1, 1) ~ /[ \t;]/)) break
             if (lexState == "" && c == sq) lexState = "single"
             else if (c == "\"") lexState = (lexState == "double") ? "" : "double"
             else if (heredocs && lexState == "" && substr(s, i, 2) == "<<" && substr(s, i + 2, 1) != "<" && (i == 1 || substr(s, i - 1, 1) != "<"))
@@ -168,7 +172,20 @@ Scan() {
     }
 
     # ---- bash ----------------------------------------------------------------------------------------------------
-    function bashDefs(s,   t, rest, name) {
+    # The position just past the shell word @p r starts with: quotes, `$( )`, `( )` and `${ }` keep it going.
+    function wordEnd(r,   i, n, c, q, depth) {
+        n = length(r); q = ""; depth = 0
+        for (i = 1; i <= n; i++) {
+            c = substr(r, i, 1)
+            if (q != "") { if (c == q) q = ""; continue }
+            if (c == "\"" || c == sq) { q = c; continue }
+            if (c == "(" || c == "{") { depth++; continue }
+            if ((c == ")" || c == "}") && depth > 0) { depth--; continue }
+            if (depth == 0 && (c == " " || c == "\t" || c == ";" || c == "&" || c == "|" || c == ")" || c == "}")) return i
+        }
+        return n + 1
+    }
+    function bashDefs(s,   t, rest, name, nchain) {
         t = s
         sub(/^[ \t]+/, "", t)
         if (t ~ /^(export|readonly|local|declare|typeset)[ \t]/) {
@@ -184,13 +201,25 @@ Scan() {
         }
         # An assignment in COMMAND position only: at the start, or after `;`, `&&`, `||`, `|`, `{`, `(`, `!`,
         # `then`, `do` or `else`. A word followed by `=` anywhere else is an argument, such as `--port=1`.
+        # And only when nothing but a command separator follows the run of assignments: `CC=clang make` hands CC to
+        # make alone, and a later `$CC` still reads an unset name.
         rest = s
         while (match(rest, /(^|[;&|({!][ \t]*|(^|[ \t;])(then|do|else)[ \t]+)[ \t]*[A-Za-z_][A-Za-z0-9_]*\+?=/)) {
             name = substr(rest, RSTART, RLENGTH)
             sub(/\+?=$/, "", name)
             sub(/^.*[^A-Za-z0-9_]/, "", name)
-            defs[name] = 1
+            split("", chain); nchain = 1; chain[1] = name
             rest = substr(rest, RSTART + RLENGTH)
+            while (1) {
+                rest = substr(rest, wordEnd(rest))
+                sub(/^[ \t]+/, "", rest)
+                if (!match(rest, /^[A-Za-z_][A-Za-z0-9_]*\+?=/)) break
+                name = substr(rest, 1, RLENGTH)
+                sub(/\+?=$/, "", name)
+                chain[++nchain] = name
+                rest = substr(rest, RLENGTH + 1)
+            }
+            if (rest == "" || rest ~ /^[;&|)}#]/) for (name in chain) defs[chain[name]] = 1
         }
         # bash32-scan: data-begin
         if (match(s, /(mapfile|readarray)[ \t]+(-[A-Za-z]+([ \t]+[^ \t-][^ \t]*)?[ \t]+)*[A-Za-z_][A-Za-z0-9_]*/)) {
@@ -267,6 +296,7 @@ Scan() {
     function flush(   model, i, name, missing, n, fold, t) {
         if (!inStep) return
         inStep = 0
+        if (pass < 2) return
         if (!hasRun) return
         scanned++
         model = resolveShell()
@@ -295,20 +325,32 @@ Scan() {
     }
     function resetStep() {
         split("", stepEnv); split("", body)
-        nbody = 0; hasRun = 0; inStep = 1; stepName = "(unnamed)"; stepLine = NR; stepShell = ""
+        nbody = 0; hasRun = 0; inStep = 1; stepName = "(unnamed)"; stepLine = FNR; stepShell = ""; stepKeyIndent = -1
     }
-    function resetJob() {
+    # The `env:`, `defaults` and `runs-on` may follow its `steps:`, so the second pass starts each job from what the
+    # first pass found anywhere in that job.
+    function resetJob(   k, kp) {
         split("", jobEnv)
-        jobShell = ""; runsOn = ""; inSteps = 0; itemIndent = -1; jobKeyIndent = -1; stepName = "(job)"
+        jobShell = ""; runsOn = ""; inSteps = 0; itemIndent = -1; jobKeyIndent = -1; stepName = "(job)"; jobStart = FNR
+        if (pass < 2) return
+        for (k in jobEnvAt) { split(k, kp, SUBSEP); if (kp[1] == jobStart) jobEnv[kp[2]] = 1 }
+        if (jobStart in jobShellAt) jobShell = jobShellAt[jobStart]
+        if (jobStart in runsOnAt) runsOn = runsOnAt[jobStart]
+    }
+    # Every state the reader carries, reset at the start of each pass. The workflow scope is not: `env:` and
+    # `defaults` may follow `jobs:`, and the first pass is what the second one reads them from.
+    function resetAll() {
+        inStep = 0; inJobs = 0; jobIndent = -1; blockOwner = -1; inEnv = 0; inDefaults = 0; defaultsRun = -1
+        inRunsOnList = 0; seenContent = 0; resetJob(); stepName = "(workflow)"
     }
     # An `env:` key opens a block mapping of @p scope, or is refused when it carries anything else.
     function openEnv(scope) {
-        if (value != "" && value != "{}") { refuse(NR, "unreadable-env", scope " `env: " value "`"); return }
+        if (value != "" && value != "{}") { refuse(FNR, "unreadable-env", scope " `env: " value "`"); return }
         inEnv = 1; envIndent = ind; envScope = scope
     }
     function addEnv(name) {
         if (envScope == "workflow") workflowEnv[name] = 1
-        else if (envScope == "job") jobEnv[name] = 1
+        else if (envScope == "job") { jobEnv[name] = 1; jobEnvAt[jobStart, name] = 1 }
         else stepEnv[name] = 1
     }
 
@@ -318,9 +360,10 @@ Scan() {
         n = split(windowsNames, p, " "); for (i = 1; i <= n; i++) if (p[i] != "") windowsSet[p[i]] = 1
         n = split(shells, p, " "); for (i = 1; i <= n; i++) if (split(p[i], q, "|") == 2) shellModel[q[1]] = q[2]
         n = split(remedies, p, "\036"); for (i = 1; i <= n; i++) if ((k = index(p[i], "|")) > 0) remedy[substr(p[i], 1, k - 1)] = substr(p[i], k + 1)
-        inStep = 0; inJobs = 0; jobIndent = -1; blockOwner = -1; inEnv = 0; inDefaults = 0; defaultsRun = -1
-        workflowShell = ""; seenContent = 0; resetJob(); stepName = "(workflow)"
+        pass = 0; workflowShell = ""; resetAll()
     }
+
+    FNR == 1 { pass++; resetAll() }
 
     {
         line = $0
@@ -338,7 +381,7 @@ Scan() {
         }
         if (blank || line ~ /^[ \t]*#/) next
         if (line ~ /^(---|\.\.\.)([ \t]|$)/) {
-            if (seenContent) refuse(NR, "unreadable-yaml", "a document marker after the first document")
+            if (seenContent) refuse(FNR, "unreadable-yaml", "a document marker after the first document")
             next
         }
         seenContent = 1
@@ -354,7 +397,7 @@ Scan() {
 
         stepItem = 0
         if (isItem) {
-            if (inRunsOnList) { t = line; sub(/^[ ]*-[ \t]*/, "", t); runsOn = runsOn " " unquote(trim(t)); next }
+            if (inRunsOnList) { t = line; sub(/^[ ]*-[ \t]*/, "", t); runsOn = runsOn " " unquote(trim(t)); runsOnAt[jobStart] = runsOn; next }
             if (inSteps && (itemIndent < 0 || ind == itemIndent)) {
                 if (itemIndent < 0) itemIndent = ind
                 flush(); resetStep(); stepItem = 1
@@ -362,13 +405,15 @@ Scan() {
             sub(/-/, " ", line)
             ind = indentOf(line)
             if (line ~ /^[ \t]*$/) next
+            # The keys of a step sit where its first key does, however many spaces follow the dash.
+            if (stepItem) stepKeyIndent = ind
         }
 
         if (!match(line, /^[ ]*[A-Za-z_][A-Za-z0-9_.-]*[ \t]*:([ \t]|$)/)) {
             # A scalar list item (a `needs:` or `branches:` entry) is placed; a step that is not a mapping, and any
             # other line, is not.
             if (isItem && !stepItem) next
-            refuse(NR, "unreadable-yaml", (stepItem ? "a step written as `" : "`") trim(line) "`")
+            refuse(FNR, "unreadable-yaml", (stepItem ? "a step written as `" : "`") trim(line) "`")
             next
         }
         key = substr(line, RSTART, RLENGTH)
@@ -379,7 +424,8 @@ Scan() {
 
         # A block scalar indicator hands the lines after it to the block; any other inline value may continue as a
         # plain scalar on more-indented lines, which are its text and never keys.
-        stepKey = (inStep && inSteps && ind == itemIndent + 2)
+        if (inStep && inSteps && stepKeyIndent < 0 && ind > itemIndent) stepKeyIndent = ind
+        stepKey = (inStep && inSteps && ind == stepKeyIndent)
         if (value ~ /^[|>][-+0-9]*$/) {
             blockOwner = ind
             blockKind = (stepKey && key == "run") ? "run" : "skip"
@@ -394,14 +440,14 @@ Scan() {
         if (ind == 0) {
             if (key == "env") openEnv("workflow")
             else if (key == "defaults") { inDefaults = 1; defaultsIndent = 0 }
-            else if (key == "jobs") { if (value != "") refuse(NR, "unreadable-yaml", "`jobs: " value "`"); else { inJobs = 1; jobIndent = -1 } }
+            else if (key == "jobs") { if (value != "") refuse(FNR, "unreadable-yaml", "`jobs: " value "`"); else { inJobs = 1; jobIndent = -1 } }
             next
         }
 
         if (inDefaults) {
             if (key == "run" && value == "") { defaultsRun = ind; next }
             if (defaultsRun >= 0 && ind > defaultsRun && key == "shell") {
-                if (defaultsIndent == 0) workflowShell = unquote(value); else jobShell = unquote(value)
+                if (defaultsIndent == 0) workflowShell = unquote(value); else { jobShell = unquote(value); jobShellAt[jobStart] = jobShell }
             }
             next
         }
@@ -413,8 +459,8 @@ Scan() {
         if (ind == jobKeyIndent) {
             if (key == "env") openEnv("job")
             else if (key == "defaults") { inDefaults = 1; defaultsIndent = ind }
-            else if (key == "runs-on") { if (value == "") { inRunsOnList = 1; runsOnIndent = ind; runsOn = ""; blockOwner = -1 } else runsOn = unquote(value) }
-            else if (key == "steps") { if (value != "") refuse(NR, "unreadable-yaml", "`steps: " value "`"); else { inSteps = 1; stepsIndent = ind; itemIndent = -1 } }
+            else if (key == "runs-on") { if (value == "") { inRunsOnList = 1; runsOnIndent = ind; runsOn = ""; blockOwner = -1 } else { runsOn = unquote(value); runsOnAt[jobStart] = runsOn } }
+            else if (key == "steps") { if (value != "") refuse(FNR, "unreadable-yaml", "`steps: " value "`"); else { inSteps = 1; stepsIndent = ind; itemIndent = -1 } }
             next
         }
         if (!stepKey) next
@@ -422,7 +468,7 @@ Scan() {
         else if (key == "shell") stepShell = trim(unquote(value))
         else if (key == "env") openEnv("step")
         else if (key == "run") {
-            if (c == "*" || c == "&" || c == "!" || c == "[" || c == "{") refuse(NR, "unreadable-run", "`run: " value "`")
+            if (c == "*" || c == "&" || c == "!" || c == "[" || c == "{") refuse(FNR, "unreadable-run", "`run: " value "`")
             else {
                 hasRun = 1
                 body[nbody++] = unquote(value)
@@ -433,7 +479,7 @@ Scan() {
     }
 
     END { flush(); printf "STEPS\t%d\t%d\t%d\n", scanned, models["bash"], models["pwsh"] }
-    ' "$1"
+    ' "$1" "$1"
 }
 
 # Judge every workflow under @p dir; print one line per file and per refusal; return 0 clean, 1 refused.
@@ -754,6 +800,60 @@ jobs:
           "$ON_THE_NEXT_LINE"
 WF
 
+    # More than one space after the dash moves every key of the step, and the step is still read.
+    Case wideDashStep 1 'step "wide": reads $AFTER_A_WIDE_DASH' <<'WF'
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    steps:
+      -   name: "wide"
+          run: echo "$AFTER_A_WIDE_DASH"
+WF
+
+    # A job may name its shell after its steps; the steps are still read by that shell.
+    Case defaultsAfterSteps 1 'reads $BASH_ON_WINDOWS' <<'WF'
+jobs:
+  w:
+    runs-on: windows-2025
+    steps:
+      - run: echo "$BASH_ON_WINDOWS"
+    defaults:
+      run:
+        shell: bash
+WF
+
+    # An apostrophe in a trailing comment opens no string, in either shell.
+    Case bashTrailingComment 1 'reads $AFTER_THE_COMMENT' <<'WF'
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          echo hi # do not, won't
+          echo "$AFTER_THE_COMMENT"
+WF
+
+    Case pwshTrailingComment 1 'reads $env:AFTER_THE_COMMENT' <<'WF'
+jobs:
+  w:
+    runs-on: windows-2025
+    steps:
+      - run: |
+          Write-Host hi # won't
+          Write-Host $env:AFTER_THE_COMMENT
+WF
+
+    # A prefix assignment belongs to the command it prefixes, not to the lines after it.
+    Case prefixAssignment 1 'reads $CC' <<'WF'
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          CC=clang make
+          echo "$CC"
+WF
+
     Case noRunStepAtAll 1 'not one `run:` step read' < /dev/null
     Case noWorkflowFile 1 'no workflow file under' plain nofile
 
@@ -781,6 +881,19 @@ jobs:
         env:
           TOOL_BIN: ${{ env.TOOL_BIN }}
         run: echo "$TOOL_BIN"
+WF
+
+    # Job and workflow keys that follow the steps still reach them.
+    Case keysAfterSteps 0 '1 run step(s), 1 read as bash' <<'WF'
+jobs:
+  a:
+    steps:
+      - run: echo "$JOB_AFTER $WORKFLOW_AFTER"
+    env:
+      JOB_AFTER: 1
+    runs-on: ubuntu-latest
+env:
+  WORKFLOW_AFTER: 1
 WF
 
     # A workflow's bash is the runner's, not macOS's 3.2, so the staged script names what a workflow may use.
