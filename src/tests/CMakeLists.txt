@@ -7149,3 +7149,100 @@ if(TARGET fastcache-tui-objects AND (ENABLE_SANITIZER_ADDRESS OR ENABLE_SANITIZE
         TIMEOUT 120
     )
 endif()
+
+# ---------------------------------------------------------------------------
+# No first-party unit enables an instruction set for the whole unit (#1442): by a flag in a compile
+# database, or by a target pragma in the tree. Each self-test drives its check in both directions and
+# prints how many cases ran. The Package jobs ask the flags check through
+# scripts/check-instruction-set-flags.sh, whose header says why; its self-test is the wrapper's.
+add_test(
+    NAME "instruction-set-flags-selftest"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DFASTCACHED_SCRATCH_DIR=${CMAKE_CURRENT_BINARY_DIR}/instruction-set-flags-selftest"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-instruction-set-flags-selftest.cmake"
+)
+# TIMEOUT 300 against a ~9.5 s warm run, which is deliberate and is not slack. The
+# check spawns `cmake -P` per case and stages a compile database for each, so its cost
+# is processes rather than work, and it loses to contention rather than slowing down
+# gracefully: measured 9522 ms and 9994 ms warm on an idle host (its neighbours are
+# target-pragmas 5176 ms, target-pragmas-selftest 1174 ms, the wrapper self-test 632 ms
+# and the flags check itself 683 ms), and observed exceeding 60 s inside
+# `scripts/local-gate.sh`, whose `ctest --parallel 8` runs it beside the other
+# process-heavy hygiene checks while a build finishes. A budget is the wrong place to
+# notice that, so the figure is stated here rather than left to be re-derived.
+set_tests_properties("instruction-set-flags-selftest" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 300
+)
+
+# This build's own compile database, and a plant into its real Sha256.cpp entries that must be refused. Only the
+# Makefile and Ninja generators write a database; every configure preset here is Ninja.
+if(CMAKE_GENERATOR MATCHES "Ninja|Makefiles")
+    add_test(
+        NAME "instruction-set-flags"
+        COMMAND ${CMAKE_COMMAND}
+            "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+            "-DFASTCACHED_COMPILE_DATABASE=${CMAKE_BINARY_DIR}/compile_commands.json"
+            -P "${CMAKE_SOURCE_DIR}/scripts/check-instruction-set-flags.cmake"
+    )
+    set_tests_properties("instruction-set-flags" PROPERTIES
+        FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+        LABELS "hygiene"
+        TIMEOUT 120
+    )
+
+    add_test(
+        NAME "instruction-set-flags-plant"
+        COMMAND ${CMAKE_COMMAND}
+            "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+            "-DFASTCACHED_COMPILE_DATABASE=${CMAKE_BINARY_DIR}/compile_commands.json"
+            "-DFASTCACHED_PLANT_UNIT=src/FastCache/Core/Sha256.cpp"
+            -P "${CMAKE_SOURCE_DIR}/scripts/check-instruction-set-flags.cmake"
+    )
+    set_tests_properties("instruction-set-flags-plant" PROPERTIES
+        FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+        LABELS "hygiene"
+        TIMEOUT 120
+    )
+else()
+    foreach(name IN ITEMS "instruction-set-flags" "instruction-set-flags-plant")
+        fastcached_register_skipped_test("${name}"
+            "the ${CMAKE_GENERATOR} generator writes no compile database, so no flag of this build was judged")
+    endforeach()
+endif()
+
+add_test(
+    NAME "instruction-set-flags-wrapper-selftest"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-instruction-set-flags.sh" --self-test --cmake "${CMAKE_COMMAND}"
+)
+set_tests_properties("instruction-set-flags-wrapper-selftest" PROPERTIES
+    LABELS "hygiene"
+    TIMEOUT 120
+)
+
+add_test(
+    NAME "target-pragmas"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-target-pragmas.cmake"
+)
+set_tests_properties("target-pragmas" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 60
+)
+
+add_test(
+    NAME "target-pragmas-selftest"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DFASTCACHED_SCRATCH_DIR=${CMAKE_CURRENT_BINARY_DIR}/target-pragmas-selftest"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-target-pragmas-selftest.cmake"
+)
+set_tests_properties("target-pragmas-selftest" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 60
+)

@@ -1184,7 +1184,7 @@ what differs between compilers, standard libraries, hosts and tool versions.
 - An instruction-set extension is used only inside a function that asks for it
   (`__attribute__((target(...)))`), never through a global `-m` flag: a flagged TU's inline copies
   can reach a fallback path on a CPU without the instructions. And that function runs only once
-  `Core/CpuFeatures` says the CPU has them.
+  `Core/CpuFeatures` says the CPU has them. `ctest -R instruction-set-flags`.
 - `cmake/portable/CompileCache.cmake` stays stock-CMake-only and must never fail a configure.
   `check_<lang>_compiler_flag` is a hard error for a language the project has not ENABLED, and a
   bad flag in `CMAKE_<LANG>_FLAGS` fails the ABI check — so ask `ENABLED_LANGUAGES` first, and
