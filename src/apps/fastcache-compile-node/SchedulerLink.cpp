@@ -2,18 +2,23 @@
 #include "SchedulerLink.hpp"
 
 #include <algorithm>
-#include <cassert>
 #include <iterator>
 #include <utility>
 
 namespace FastCache::Node
 {
 
-SchedulerLink::SchedulerLink(std::vector<std::string> configured):
-    _configured { std::move(configured) }
+std::optional<SchedulerLink> SchedulerLink::For(std::vector<std::string> configured)
 {
-    assert(!_configured.empty() && "the startup table refuses a node with no --scheduler");
-    _current = _configured.front();
+    if (configured.empty())
+        return std::nullopt;
+    return SchedulerLink { std::move(configured) };
+}
+
+SchedulerLink::SchedulerLink(std::vector<std::string> configured):
+    _configured { std::move(configured) },
+    _current { _configured.front() }
+{
 }
 
 std::string const& SchedulerLink::ConfiguredAt(std::size_t offset) const noexcept

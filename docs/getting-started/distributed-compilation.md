@@ -226,19 +226,26 @@ error naming where the scheduler went, so a client configured for the old layout
 tells you what to fix instead of failing mysteriously.
 
 No `--toolchain` is needed: the node surveys the machine at startup and serves
-what it finds. Note that the scheduler therefore also registers as a worker —
+what it finds. A scheduler is therefore also a worker unless told otherwise —
 every node is a peer, and being the one that schedules is a role rather than a
-different program. There is no configuration that offers **zero** slots
-([#206](https://github.com/LASTRADA-Software/fastcached/issues/206)); if you want
-this machine kept out of the work, give it an identity nothing dispatches to:
+different program.
+
+To keep a machine out of the work — a small always-on box, a VM whose cores belong
+to something else — give it **`--slots=0`**. It then runs no worker at all: it
+surveys no compilers, claims no scratch directory, registers nothing and is never
+sent a compile, so it takes no `--scheduler`, `--toolchain` or
+`--no-toolchain-discovery` either, and refuses to start if given one. What it can
+still run is the scheduler, consensus and a cache tier; a node running none of
+those is refused too.
 
 ```sh
---no-toolchain-discovery --toolchain=scheduler-only=/nonexistent
+fastcache-compile-node --serve-scheduler --slots=0 \
+    --listen-node=0.0.0.0:6674 --fleet-member=10.0.0.21 ...
 ```
 
-An operator-pinned `<fingerprint>=<compiler>` is deliberately not probed, so that
-registers a toolchain no client can match. One machine leading a fleet of many is
-the only shape this is worth doing for.
+Such a machine shows among the cluster's **members** when it runs consensus, and
+not among the fleet page's **machines**, which are built from worker registrations;
+its own history is not handed to a leader either ([#1440](https://github.com/LASTRADA-Software/fastcached/issues/1440)).
 
 Once several nodes run, exactly one of them must schedule at a time, which is
 what consensus decides — `--node-id`, `--listen-raft` and `--raft-peer`, with the
@@ -810,7 +817,8 @@ have — but it looks like a cold cache the first time a fleet upgrades past it.
   workstation, none on a dedicated node). A number you give it overrides all
   three. Whatever it resolves to is advertised *and* enforced locally from one
   calculation, so a worker cannot end up fuller and slower than the scheduler
-  believes at the same moment. See
+  believes at the same moment. `--slots=0` is not a count: it runs no worker at
+  all (see [The scheduler](#the-scheduler) above). See
   [the worker's own page](../tools/fastcache-compile-node.md#capacity).
 - **`--node-class` defaults to `workstation`,** which is the safe answer rather
   than the common one: a node nobody classified is somebody's desktop until

@@ -75,10 +75,11 @@ namespace
         return static_cast<std::uint16_t>(value);
     }
 
-    /// A positive slot count.
+    /// A slot count, which may be zero.
     ///
-    /// Zero is refused: read as a count it would run a worker that offers nothing, and
-    /// deriving the count is the field's ABSENCE rather than a number.
+    /// Zero is accepted since #206 and means this node runs no worker (`RunsWorker`);
+    /// it used to be refused because it was the field's own spelling of "derive". That
+    /// answer is now the field's ABSENCE, so the two cannot be confused.
     /// @param sv Text to parse.
     /// @return The count, or why it is not one.
     [[nodiscard]] std::expected<std::optional<std::uint32_t>, ConfigError> ParseSlots(std::string_view sv)
@@ -87,9 +88,8 @@ namespace
         auto const* const begin = sv.data();
         auto const* const end = std::next(begin, static_cast<std::ptrdiff_t>(sv.size()));
         auto const [ptr, ec] = std::from_chars(begin, end, value);
-        if (ec != std::errc {} || ptr != end || value == 0)
-            return std::unexpected(
-                ArgvError(ConfigErrorCode::OutOfRange, "slots", std::format("must be a positive count: {}", sv)));
+        if (ec != std::errc {} || ptr != end)
+            return std::unexpected(ArgvError(ConfigErrorCode::OutOfRange, "slots", std::format("not a slot count: {}", sv)));
         return std::optional<std::uint32_t> { value };
     }
 
@@ -746,7 +746,10 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
                            "not clamped or reduced further. Advertised to the\n"
                            "scheduler AND enforced here: a worker that accepted\n"
                            "more would be fuller and slower than the scheduler\n"
-                           "believes, at the same moment.",
+                           "believes, at the same moment. 0 runs NO worker: the\n"
+                           "node surveys nothing, registers nothing and is never\n"
+                           "sent a compile -- a machine that only schedules or\n"
+                           "caches.",
             .yamlKey = "slots",
             .same = FieldEq<&NodeConfig::slots>(),
         },
@@ -1785,7 +1788,8 @@ std::optional<std::string> AllowlistAnnouncement(AllowlistMoment moment,
 std::optional<std::string> ObservabilityAnnouncement(NodeConfig const& cfg)
 {
     // The single-machine install says nothing, and this is the clause that keeps it
-    // quiet: `--scheduler` is required of every shape, so it is no evidence of a fleet.
+    // quiet: a worker names `--scheduler` on one machine too, so that is no evidence of
+    // a fleet.
     if (!AdmitsRemotePeers(cfg))
         return std::nullopt;
 
@@ -1800,8 +1804,8 @@ std::optional<std::string> ObservabilityAnnouncement(NodeConfig const& cfg)
     return std::string {
         "this node works for machines other than this one and opens no admin surface: /healthz, /metrics and the "
         "fleet dashboard are all served on --admin-listen, which is off unless asked for. The node is configured "
-        "rather than broken -- it registers, caches and compiles exactly as told -- but with no admin surface there "
-        "is nothing to probe it through: no /healthz for a supervisor on this machine, and nothing to scrape from "
+        "rather than broken -- it does exactly what it was told -- but with no admin surface there is nothing to "
+        "probe it through: no /healthz for a supervisor on this machine, and nothing to scrape from "
         "any other. --admin-listen=<port> opens it, and a bare port "
         "binds loopback; the dashboard needs --dashboard beside it."
     };
@@ -1916,9 +1920,15 @@ std::expected<void, ConfigError> ValidateNodeReloadable(NodeConfig const& previo
         // including to NARROW. Only the transition is refused, and the remedy an
         // operator needs -- give the node a key, or restart it -- is what the message
         // says.
+        //
+        // Scoped to a node that runs a worker, as every startup row about the lease check
+        // is: one started with `--slots=0` built no validator and serves no compile verb,
+        // so widening its admission opens no compile port (#206). `--slots` is not
+        // reloadable, so `previous` and `candidate` agree on it here.
         { .refuses =
               [](NodeConfig const& previous, NodeConfig const& candidate) {
-                  return candidate.clusterKeyFile.empty() && AdmitsRemotePeers(candidate) && !AdmitsRemotePeers(previous);
+                  return RunsWorker(previous) && candidate.clusterKeyFile.empty() && AdmitsRemotePeers(candidate)
+                         && !AdmitsRemotePeers(previous);
               },
           .message = "a reload may not widen --fleet-member or --fleet-open on a node with no --cluster-key-file: "
                      "this worker chose its lease check at startup and built one that verifies nothing, which is "
@@ -2015,6 +2025,13 @@ ServiceSpec MakeNodeServiceSpec(std::filesystem::path const& exePath, NodeConfig
             argv.emplace_back(std::format("--{}={}", flag, value));
     };
 
+    /// Emit a flag whose `optional` IS its provenance: absent and zero are different
+    /// instructions, so a present value is emitted whatever it is.
+    auto const emitIfPresent = [&argv](std::string_view flag, auto const& value) {
+        if (value.has_value())
+            argv.emplace_back(std::format("--{}={}", flag, *value));
+    };
+
     /// Emit a path flag, made absolute.
     ///
     /// A service does not inherit the installing shell's working directory, so a
@@ -2058,15 +2075,15 @@ ServiceSpec MakeNodeServiceSpec(std::filesystem::path const& exePath, NodeConfig
     for (auto const& scheduler: cfg.schedulers)
         argv.push_back(std::format("--scheduler={}", scheduler));
     emitIfExplicit("advertise", cfg.advertise, cfg.advertiseExplicit);
-    if (cfg.slots.has_value())
-        argv.push_back(std::format("--slots={}", *cfg.slots));
+    // On presence, for `--reserve-cores`' reason below: since #206 a zero is the
+    // instruction that runs no worker.
+    emitIfPresent("slots", cfg.slots);
     emitIfExplicit("node-class", std::string { Distributed::TraitsFor(cfg.nodeClass).name }, cfg.nodeClassExplicit);
     // Emitted on presence, because the difference this flag carries IS presence: a
     // reserve of zero the operator typed and a reserve nobody mentioned are
     // different instructions. The `optional` is this row's provenance bit, and it
     // predates the ones the other rows now carry.
-    if (cfg.reservedCores.has_value())
-        argv.push_back(std::format("--reserve-cores={}", *cfg.reservedCores));
+    emitIfPresent("reserve-cores", cfg.reservedCores);
     emitIfExplicit("admin-listen", cfg.adminListen, cfg.adminListenExplicit);
     if (cfg.dashboard)
         argv.emplace_back("--dashboard");
@@ -2257,6 +2274,26 @@ Cluster::ClusterMember const* ClusterSelfMember(NodeConfig const& cfg) noexcept
 {
     auto const self = std::ranges::find(cfg.raftPeers, cfg.nodeId, &Cluster::ClusterMember::id);
     return self != cfg.raftPeers.end() ? std::to_address(self) : nullptr;
+}
+
+bool RunsWorker(NodeConfig const& cfg) noexcept
+{
+    return cfg.slots != 0U;
+}
+
+bool ConfiguresCacheTier(NodeConfig const& cfg) noexcept
+{
+    // The same two halves `StartCacheTierOrExplain` declines on, and it asks THIS rather
+    // than spelling them, so the table and the tier cannot disagree about whether a tier
+    // was asked for.
+    return !RowFor(NodeSurface::Node).Resolve(cfg).empty() && (cfg.cacheMemoryBytes != 0 || !cfg.cacheDir.empty());
+}
+
+std::optional<std::uint32_t> WorkerSlotsOf(NodeConfig const& cfg, Distributed::NodeCapacity const& capacity) noexcept
+{
+    if (!RunsWorker(cfg))
+        return std::nullopt;
+    return Distributed::OfferableSlots(capacity, cfg.slots);
 }
 
 bool RunsConsensus(NodeConfig const& cfg) noexcept
@@ -2828,6 +2865,16 @@ std::string AdvertisedEndpoint(NodeConfig const& cfg)
     return std::ranges::any_of(nodePort, [](SurfaceEndpoint const& endpoint) { return !IsLoopbackHost(endpoint.host); });
 }
 
+std::string WorkerReadinessPhrase(NodeConfig const& cfg, std::optional<std::uint32_t> workerSlots, std::size_t toolchains)
+{
+    if (!workerSlots.has_value())
+        return "running no worker";
+    return std::format("{} slot(s) as a {} node, identifying {} toolchain(s)",
+                       *workerSlots,
+                       Distributed::TraitsFor(cfg.nodeClass).name,
+                       toolchains);
+}
+
 std::string AdmissionSummary(NodeConfig const& cfg)
 {
     if (cfg.fleetOpen)
@@ -2867,7 +2914,10 @@ std::optional<std::string> NodeServiceRejection(NodeConfig const& cfg)
     };
 
     constexpr auto Rules = std::to_array<Rule>({
-        { .refuses = [](NodeConfig const& c) { return c.schedulers.empty(); },
+        // The three worker rows ask of a WORKER (#206): a node running none registers
+        // nowhere, surveys nothing and advertises no compile port, and the startup table
+        // says what is wrong with naming those flags on it.
+        { .refuses = [](NodeConfig const& c) { return RunsWorker(c) && c.schedulers.empty(); },
           .message = "--scheduler is required to install a service: a worker nothing knows about serves nobody, "
                      "and the registration would start and immediately exit at every boot." },
         // Conditional, where it used to be absolute. Registering a service before
@@ -2875,11 +2925,11 @@ std::optional<std::string> NodeServiceRejection(NodeConfig const& cfg)
         // node answers that at boot. What still cannot work is discovery turned OFF
         // with nothing named, and that is refused here, where an operator is
         // watching, rather than at every boot where nobody is.
-        { .refuses = [](NodeConfig const& c) { return c.toolchains.empty() && !c.toolchainDiscovery; },
+        { .refuses = [](NodeConfig const& c) { return RunsWorker(c) && c.toolchains.empty() && !c.toolchainDiscovery; },
           .message = "--toolchain is required alongside --no-toolchain-discovery: with both, a worker has nothing to "
                      "serve, so it would register and then refuse every job the scheduler sends it. Drop "
                      "--no-toolchain-discovery to let the machine answer at boot instead." },
-        { .refuses = [](NodeConfig const& c) { return c.advertise.empty(); },
+        { .refuses = [](NodeConfig const& c) { return RunsWorker(c) && c.advertise.empty(); },
           .message = "--advertise is required to install a service: without it the registration bakes in "
                      "whatever --listen-node resolves to, which defaults to loopback on a worker and is not an "
                      "address another machine can dial. Such a worker "
@@ -3198,7 +3248,19 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
         // consult. Since #403 made both its flags reloadable, that was reachable --
         // the reload was accepted and the heartbeat thread then quietly emptied the
         // served set, leaving a live worker registering nothing.
-        { .refuses = [](NodeConfig const& c) { return c.toolchains.empty() && !c.toolchainDiscovery; },
+        // Before the row below, which names the same flags for a WORKER: a node that runs
+        // none is told that, rather than that its worker has nothing to serve (#206).
+        { .refuses = [](NodeConfig const& c) { return !RunsWorker(c) && (!c.toolchains.empty() || !c.toolchainDiscovery); },
+          .message = NoWorkerNamesToolchainsRefusal },
+        // And one naming a scheduler to register with: the list configures nothing, which
+        // is the `--discovery-reply-port` row's shape. Up HERE rather than beside the
+        // "--scheduler is required" row, because every advertise and membership row between
+        // the two describes what a worker REGISTERS -- first match wins, and a node that
+        // registers nowhere must be told that before it is told about an address it never
+        // registers.
+        { .refuses = [](NodeConfig const& c) { return !RunsWorker(c) && !c.schedulers.empty(); },
+          .message = NoWorkerNamesSchedulerRefusal },
+        { .refuses = [](NodeConfig const& c) { return RunsWorker(c) && c.toolchains.empty() && !c.toolchainDiscovery; },
           .message = "--no-toolchain-discovery was given and no --toolchain: a worker with none would register "
                      "and then refuse every job the scheduler sent it." },
         // A cache the operator NAMED, on a node that serves no surface to reach it
@@ -3600,9 +3662,12 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
         //
         // See #303, which asks the same question of the scheduler and should take
         // this shape rather than "is a key configured".
+        //
+        // A node running no worker (#206) serves no compile verbs and checks no lease, so
+        // the question does not arise for it; what its scheduler signs is #303's.
         { .refuses =
               [](NodeConfig const& c) {
-                  return c.clusterKeyFile.empty() && CompilePortFacesTheNetwork(c) && AdmitsRemotePeers(c);
+                  return RunsWorker(c) && c.clusterKeyFile.empty() && CompilePortFacesTheNetwork(c) && AdmitsRemotePeers(c);
               },
           .message = "a node that admits peers on other machines needs --cluster-key-file: the scheduler signs "
                      "the lease a client presents to a worker, and without the key this node cannot check that "
@@ -3633,6 +3698,14 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
                      "map of every member's hostname, endpoint and capacity, and an operator who bound it to "
                      "the network is publishing that to whoever asks. A bare port binds loopback and needs no "
                      "credential." },
+        // And one that then runs nothing at all. Asked of the configuration, like every
+        // row here, so an install is refused rather than a boot: `ConfiguresCacheTier` is
+        // the tier's own question, and `RunsConsensus` the consensus tier's.
+        { .refuses =
+              [](NodeConfig const& c) {
+                  return !RunsWorker(c) && !c.serveScheduler && !RunsConsensus(c) && !ConfiguresCacheTier(c);
+              },
+          .message = NodeRunsNothingRefusal },
         // **LAST, and the position is a decision rather than an appending.** An empty
         // `--scheduler` is the least specific rule in this table: it says a required
         // field is missing, where every row above says something about the particular
@@ -3672,7 +3745,10 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
         // registers with itself, which is what the documented command line does
         // (`--serve-scheduler ... --scheduler=127.0.0.1:6675`). So this is not scoped
         // the way the advertise rows are.
-        { .refuses = [](NodeConfig const& c) { return c.schedulers.empty(); },
+        //
+        // Asked of a WORKER since #206: on a node running none, naming a scheduler is the
+        // mistake and not omitting one, and `NoWorkerNamesSchedulerRefusal` answers it above.
+        { .refuses = [](NodeConfig const& c) { return RunsWorker(c) && c.schedulers.empty(); },
           .message = "--scheduler is required: a worker nothing knows about serves nobody. This node would start, "
                      "bind its ports and sit there -- never registering, never leased, and never sent a job, with "
                      "nothing anywhere reporting a fault. Name the scheduler's --listen-node endpoint; a node that "

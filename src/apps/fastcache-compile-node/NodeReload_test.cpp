@@ -55,17 +55,26 @@ constexpr std::string_view SelfScheduler = "127.0.0.1:6675";
 constexpr std::string_view Revoked = "10.0.0.7";
 constexpr std::string_view Stranger = "10.0.0.99";
 
-/// Write @p body to a configuration file this case owns.
+/// Write @p text, verbatim, to a configuration file this case owns.
+/// @param dir Scratch directory.
+/// @param text The whole file.
+/// @return The path written.
+[[nodiscard]] std::filesystem::path WriteFile(std::filesystem::path const& dir, std::string_view text)
+{
+    std::filesystem::create_directories(dir);
+    auto const path = dir / "node.yaml";
+    std::ofstream out { path, std::ios::binary | std::ios::trunc };
+    out << text;
+    return path;
+}
+
+/// Write @p body to a worker's configuration file this case owns.
 /// @param dir Scratch directory.
 /// @param body The keys this case is about; the scheduler line is added.
 /// @return The path written.
 [[nodiscard]] std::filesystem::path WriteConfig(std::filesystem::path const& dir, std::string_view body)
 {
-    std::filesystem::create_directories(dir);
-    auto const path = dir / "node.yaml";
-    std::ofstream out { path, std::ios::binary | std::ios::trunc };
-    out << std::format("scheduler: {}\n{}", SelfScheduler, body);
-    return path;
+    return WriteFile(dir, std::format("scheduler: {}\n{}", SelfScheduler, body));
 }
 
 /// Read @p path into a fresh configuration, exactly as the worker's reloader does.
@@ -238,6 +247,33 @@ TEST_CASE("A reload may not widen admission on a node that cannot check a lease"
     // words; the case below asserts the other side of the same distinction.
     CHECK(sink.str().contains("may not widen"));
     CHECK(reloader.Current()->fleetMembers.empty());
+}
+
+TEST_CASE("A node running no worker may widen admission without a key", "[node][membership][reload][revocation]")
+{
+    // The case above guards the lease check a WORKER chose at startup, and a node started
+    // with `--slots=0` chose none: it builds no validator and serves no compile verb, so
+    // admitting a remote peer opens no compile port (#206). Refusing it would turn away a
+    // keyless scheduling or caching machine for a reason about a worker it does not run.
+    //
+    // No `scheduler:` line, because a node running no worker registers nowhere.
+    Testing::ScratchDirectory const scratch { "node-reload-no-worker-widen" };
+    auto const path = WriteFile(scratch.Path(), std::format("slots: 0\nfleet_member: {}\n", Revoked));
+
+    NodeConfig initial;
+    initial.slots = 0;
+    REQUIRE(initial.clusterKeyFile.empty());
+    REQUIRE_FALSE(RunsWorker(initial));
+
+    auto const candidate = Reparse(path);
+    REQUIRE(candidate.has_value());
+    // The premise: the widening shape the case above refuses on a worker.
+    REQUIRE(AdmitsRemotePeers(*candidate));
+    REQUIRE_FALSE(AdmitsRemotePeers(initial));
+
+    auto const outcome = ValidateNodeReloadable(initial, *candidate);
+    INFO((outcome.has_value() ? std::string {} : outcome.error().context));
+    CHECK(outcome.has_value());
 }
 
 TEST_CASE("A widening refusal names every setting that may not change", "[node][membership][reload][revocation]")

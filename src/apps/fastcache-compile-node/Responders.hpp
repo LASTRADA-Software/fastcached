@@ -6,6 +6,7 @@
 
 #include <FastCache/Auth/AuthPolicy.hpp>
 #include <FastCache/Core/EnumTable.hpp>
+#include <FastCache/Core/Ranges.hpp>
 #include <FastCache/Distributed/MembershipOracle.hpp>
 #include <FastCache/Distributed/SchedulerProtocol.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
@@ -1183,6 +1184,40 @@ class MergedResponder final: public IFrameResponder
     }
 
   private:
+    /// A verb family this node may run no component for, refused with its own code rather
+    /// than `UnimplementedVerb`. See `UnservedReply` for why each row exists.
+    struct UnservedFamily
+    {
+        CompileCacheWire::VerbFamily family; ///< Whose verbs this row answers.
+        Cc::UncountedRefusal refusal;        ///< What the client is told, and why nothing rises.
+        std::string_view detail;             ///< Words for the operator who sent it.
+    };
+
+    /// Every family with an answer of its own; any other unserved family is unimplemented.
+    static constexpr auto UnservedFamilies = std::to_array<UnservedFamily>({
+        { .family = CompileCacheWire::VerbFamily::Enrollment,
+          .refusal = { .code = CompileCacheWire::ErrorCode::NoCluster,
+                       .rationale = "what a node without consensus answers every enrolment attempt aimed at it, which "
+                                    "is an ordinary misdirection rather than an event; counted, it would bury the scan "
+                                    "it would be read for, exactly as the unserved-family answer below would" },
+          .detail = "this node runs no consensus, so it belongs to no cluster and there is nothing here to join; ask a "
+                    "node that runs consensus -- --node-status names the components a node serves" },
+        { .family = CompileCacheWire::VerbFamily::Compile,
+          .refusal = { .code = CompileCacheWire::NoCompileWorker::Code,
+                       .rationale = "what a node running no worker answers a compile or a cordon aimed at it: nothing "
+                                    "leases this node, so each one is a person or a script at the wrong machine, "
+                                    "which is a misdirection rather than an event a series should count" },
+          .detail = "this endpoint runs no compile worker: it was started with --slots=0, so nothing here compiles "
+                    "and there is nothing to cordon; ask a node that runs one -- --node-status names the components "
+                    "a node serves" },
+    });
+
+    // The compile row says `CompileCacheWire::NoCompileWorker`'s fact, which the daemon answers too, so
+    // neither endpoint can reword it or move its code without the other (#206).
+    static_assert(CompileCacheWire::SaysNoCompileWorker(
+        FindOrNull(UnservedFamilies, CompileCacheWire::VerbFamily::Compile, &UnservedFamily::family)->refusal.code,
+        FindOrNull(UnservedFamilies, CompileCacheWire::VerbFamily::Compile, &UnservedFamily::family)->detail));
+
     /// What a verb this node serves nowhere is answered with.
     ///
     /// A sentence rather than a bare code, because the operator action differs from
@@ -1226,20 +1261,23 @@ class MergedResponder final: public IFrameResponder
     /// Taking the verb rather than being duplicated at the four call sites is the point:
     /// `Answer`, `RefusePeer`, `RefusalReply` and `EndpointRefusalReply` all reach an
     /// unowned verb, and a per-family answer chosen at each of them is four places to
-    /// forget it. Both refusals stay UNCOUNTED for the reason above -- a node that runs
-    /// no consensus answers this for every enrolment attempt anybody ever points at it.
+    /// forget it. Every refusal here stays UNCOUNTED for the reason above -- a node that
+    /// runs no consensus answers this for every enrolment attempt anybody ever points at it.
+    ///
+    /// **The compile family is the second row, since #206 gave a node the means to run no
+    /// worker** (`--slots=0`). Its verbs are not unimplemented there either: `--cordon`
+    /// aimed at such a node would otherwise read *this node is too old to know the verb*,
+    /// which sends an operator to upgrade a machine that is current. It takes
+    /// `DispatchNotPermitted` through `CompileCacheWire::NoCompileWorker`, the one definition the daemon's
+    /// cordon and compile rows reach too -- so the two endpoints send one code for one
+    /// condition, as the enrollment row does with `NoCluster`.
     /// @param opRaw The third header byte, as received.
     /// @return The encoded refusal.
     [[nodiscard]] static std::vector<std::byte> UnservedReply(std::uint8_t opRaw)
     {
-        if (CompileCacheWire::FamilyOf(opRaw) == CompileCacheWire::VerbFamily::Enrollment)
-            return Cc::RefuseWithoutCounter(
-                { .code = CompileCacheWire::ErrorCode::NoCluster,
-                  .rationale = "what a node without consensus answers every enrolment attempt aimed at it, which is "
-                               "an ordinary misdirection rather than an event; counted, it would bury the scan it "
-                               "would be read for, exactly as the unserved-family answer below would" },
-                "this node runs no consensus, so it belongs to no cluster and there is nothing here to join; ask a "
-                "node that runs consensus -- --node-status names the components a node serves");
+        auto const family = CompileCacheWire::FamilyOf(opRaw);
+        if (auto const* const row = FindOrNull(UnservedFamilies, family, &UnservedFamily::family))
+            return Cc::RefuseWithoutCounter(row->refusal, row->detail);
 
         return Cc::RefuseWithoutCounter({ .code = CompileCacheWire::UnimplementedVerb,
                                           .rationale =

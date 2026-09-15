@@ -27,7 +27,9 @@ did not both finish inside 90 seconds, and the fixture failed having never reach
 compile. The one node that did register was the scheduler, because
 `--toolchain=scheduler-only=<cc>` names its fingerprint explicitly and is therefore
 never probed — and *that* asymmetry, visible only in the log, is what identified the
-cause. The budget was not careless; it was measured on the wrong machine.
+cause. (That trick is gone since #206: a scheduler kept out of the work is
+`--slots=0`, which surveys and registers nothing.) The budget was not careless; it
+was measured on the wrong machine.
 
 Two things fixed it, and the second is the one that generalises: the nodes are
 started one at a time, and each wait names the node it is waiting for and dumps that

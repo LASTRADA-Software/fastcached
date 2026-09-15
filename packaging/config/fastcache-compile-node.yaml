@@ -131,7 +131,9 @@
 # memory, less what --node-class reserves. A number given here is the answer
 # and is not clamped or reduced further. Advertised to the scheduler AND
 # enforced here: a worker that accepted more would be fuller and slower than
-# the scheduler believes, at the same moment.
+# the scheduler believes, at the same moment. 0 runs NO worker: the node
+# surveys nothing, registers nothing and is never sent a compile -- a machine
+# that only schedules or caches.
 #slots:
 
 # how hard this machine may be driven (default: workstation). A workstation

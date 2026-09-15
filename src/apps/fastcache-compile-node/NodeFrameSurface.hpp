@@ -117,11 +117,13 @@ class NodeFrameSurface
 ///
 /// @param io The loop this surface accepts and answers on.
 /// @param cfg What the operator asked for.
-/// @param components What to route to. `compile` is never null in this binary -- a node
-///        compiles, that is what it is -- so the "no component at all" outcome below is
-///        reachable only from a test. The predicate stays honest rather than being
-///        narrowed to the two that can still be absent: a component this function
-///        stopped asking about is a listener opened for verbs nobody answers.
+/// @param components What to route to. `compile` is null on a node running no worker
+///        (`--slots=0`, #206), and the "no component at all" outcome below is still
+///        reachable only from a test: the startup table refuses a node that runs no
+///        worker, no scheduler, no consensus and no cache tier (`NodeRunsNothingRefusal`)
+///        before any of them is built. The predicate stays honest rather than trusting
+///        that row: a component this function stopped asking about is a listener
+///        opened for verbs nobody answers.
 ///
 ///        **A worker with no tier and no scheduler still opens this port**, because
 ///        since #290 stage 3 it is the only place its compiles can arrive. That is the

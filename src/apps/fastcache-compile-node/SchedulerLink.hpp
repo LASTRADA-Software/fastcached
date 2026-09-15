@@ -90,10 +90,21 @@ constexpr int MaxAnnounceRedirects = 2;
 class SchedulerLink
 {
   public:
+    /// A link over @p configured, or nothing when it names no scheduler.
+    ///
+    /// **A factory rather than a constructor with a precondition, because an empty list
+    /// is a legal CONFIGURATION** (#206): a node running no worker names no scheduler. A
+    /// constructor that assumed otherwise would hold only because of WHERE `WorkerBody`
+    /// builds it, and breaking that reads the first element of nothing in a release
+    /// build. So the link cannot be built from an empty list, and a caller handles "no
+    /// scheduler" where it decides whether a worker runs.
+    ///
+    /// On a configuration the startup table accepts, the answer is present exactly when
+    /// `RunsWorker` is true, which `NodeConfig_test` asserts.
     /// @param configured The `--scheduler` endpoints, in the operator's order. Never
-    ///        forgotten, and what this falls back through. Must not be empty: the
-    ///        startup table refuses a node with none before this is built.
-    explicit SchedulerLink(std::vector<std::string> configured);
+    ///        forgotten, and what this falls back through.
+    /// @return The link, or nothing when @p configured is empty.
+    [[nodiscard]] static std::optional<SchedulerLink> For(std::vector<std::string> configured);
 
     /// Start a heartbeat round, resetting the per-round redirect budget.
     ///
@@ -128,6 +139,9 @@ class SchedulerLink
     [[nodiscard]] std::optional<std::string> Lost();
 
   private:
+    /// @param configured The `--scheduler` endpoints; non-empty, which `For` ensures.
+    explicit SchedulerLink(std::vector<std::string> configured);
+
     /// The configured endpoint @p offset places after `_home`, wrapping.
     /// @param offset How far along this round's walk.
     /// @return The endpoint.

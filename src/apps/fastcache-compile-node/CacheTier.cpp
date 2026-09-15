@@ -413,7 +413,7 @@ std::expected<std::unique_ptr<CacheTier>, std::string> StartCacheTierOrExplain(N
     // declines to bind. **Which sentence** an operator gets is this function's own,
     // because a row resolving to nothing cannot say which of two reasons applied, and
     // the two send an operator to different flags.
-    if (RowFor(NodeSurface::Node).Resolve(cfg).empty() || (cfg.cacheMemoryBytes == 0 && cfg.cacheDir.empty()))
+    if (!ConfiguresCacheTier(cfg))
     {
         if (cfg.nodeListen.empty())
         {

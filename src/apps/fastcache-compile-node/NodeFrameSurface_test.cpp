@@ -9,6 +9,7 @@
 
 #include <FastCache/Async/Task.hpp>
 #include <FastCache/Async/ThreadPoolExecutor.hpp>
+#include <FastCache/Cache/CacheEngine.hpp>
 #include <FastCache/Cache/InMemoryLruStorage.hpp>
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/HostPort.hpp>
@@ -17,9 +18,13 @@
 #include <FastCache/Distributed/MembershipOracle.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Net/BlockingSocket.hpp>
+#include <FastCache/Net/InMemoryTransport.hpp>
+#include <FastCache/Net/TcpClient.hpp>
 #include <FastCache/Platform/LocalAddresses.hpp>
 #include <FastCache/Platform/LocalAddressesTestUtils.hpp>
+#include <FastCache/Protocol/CompileCacheHandler.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
+#include <FastCache/Protocol/SessionContext.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -534,13 +539,16 @@ TEST_CASE("A verb no component serves is refused as unimplemented", "[node][merg
     CHECK(ErrorOf(fetch) == Wire::UnimplementedVerb);
     CHECK(scheduler.Answered().empty());
 
-    // COMPILE is refused the same way when this node runs no worker to route it to.
-    // It is not a family this listener cannot carry -- `CompileResponder` owns it since
-    // #290's second half -- so the refusal is about a MISSING COMPONENT exactly as the
-    // cache one above is, and a node passing a null one gets the honest code.
+    // COMPILE is NOT refused that way, since #206 gave a node the means to run no worker
+    // (`--slots=0`). The verb is not unimplemented on such a node, it is served by the
+    // nodes that run one -- and `UnimplementedVerb` would tell whoever sent `--cordon`
+    // here that this build is too old to know the verb. It gets the code the daemon
+    // answers a cordon with for the same fact, so the two endpoints give one remedy.
+    // Both verbs of the family, because the cordon is the one an operator actually sends.
     NamedResponder cache { "cache" };
     MergedResponder both { SurfaceComponents { .cache = &cache, .scheduler = &scheduler } };
-    CHECK(ErrorOf(AnswerNow(both, HeaderFor(Wire::Op::Compile))) == Wire::UnimplementedVerb);
+    CHECK(ErrorOf(AnswerNow(both, HeaderFor(Wire::Op::Compile))) == Wire::ErrorCode::DispatchNotPermitted);
+    CHECK(ErrorOf(AnswerNow(both, HeaderFor(Wire::Op::Cordon))) == Wire::ErrorCode::DispatchNotPermitted);
 
     // **And none of them is counted, which was decided rather than left out** (#447).
     // Every other refusal on this listener is an event; this one is the answer ordinary
@@ -550,6 +558,52 @@ TEST_CASE("A verb no component serves is refused as unimplemented", "[node][merg
     // build and a port scan would be invisible inside it. That is this ticket's own
     // failure reached from the other side: a series nothing can be read out of is no
     // better than one that never moves.
+}
+
+TEST_CASE("The daemon and a node running no worker refuse a cordon with one code and one fact", "[node][merged-responder]")
+{
+    // #206. Two endpoints meet the same question -- a `--cordon` aimed at a machine that
+    // compiles nothing -- and one condition must not reach a client as two codes, or as
+    // two different facts. Both tables are checked against `Wire::NoCompileWorker` when
+    // they compile; this asks the SURFACES, on the wire, because a refusal is decided by
+    // the call that sends it and a table nothing routes to asserts nothing.
+    auto const cordon = Wire::EncodeCordonRequest(Wire::CordonAction::Cordon);
+
+    // The daemon, which is a cache.
+    ManualClock clock;
+    InMemoryLruStorage storage { 0 };
+    CacheEngine engine { storage, clock };
+    auto const pair = InMemorySocketPair::Create();
+    CompileCacheHandler daemon;
+    REQUIRE(SyncRun(SendAll(pair.client.get(), cordon)));
+    pair.client->ShutdownWrite();
+    SyncRun(daemon.Run(pair.server.get(), &engine, {}, SessionContext {}));
+    // One framed reply, read as the header declares it: the header, then its payload.
+    auto const daemonHead = SyncRun(RecvExactly(pair.client.get(), Wire::ReplyHeaderSize));
+    REQUIRE(daemonHead.has_value());
+    auto const daemonHeader = Wire::DecodeReplyHeader(Unwrap(daemonHead));
+    REQUIRE(daemonHeader.has_value());
+    auto const daemonPayload = SyncRun(RecvExactly(pair.client.get(), Unwrap(daemonHeader).payloadLength));
+    REQUIRE(daemonPayload.has_value());
+    auto daemonReply = Unwrap(daemonHead);
+    daemonReply.insert(daemonReply.end(), Unwrap(daemonPayload).begin(), Unwrap(daemonPayload).end());
+
+    // A node started with `--slots=0`, which builds no compile component.
+    NamedResponder cache { "cache" };
+    NamedResponder scheduler { "scheduler" };
+    MergedResponder node { SurfaceComponents { .cache = &cache, .scheduler = &scheduler } };
+    auto const nodeReply = AnswerNow(node, cordon);
+
+    auto const daemonCode = ErrorOf(daemonReply);
+    auto const nodeCode = ErrorOf(nodeReply);
+    REQUIRE(daemonCode.has_value());
+    REQUIRE(nodeCode.has_value());
+    CHECK(daemonCode == nodeCode);
+
+    // And the same FACT in words, each finished with its own endpoint's remedy.
+    CHECK(MessageOf(daemonReply).starts_with(Wire::NoCompileWorker::Stem));
+    CHECK(MessageOf(nodeReply).starts_with(Wire::NoCompileWorker::Stem));
+    CHECK(MessageOf(daemonReply) != MessageOf(nodeReply));
 }
 
 TEST_CASE("An unowned verb is refused before its payload is read", "[node][merged-responder]")
@@ -625,9 +679,13 @@ TEST_CASE("A refusal is counted against the component that owned the verb", "[no
     // It moves no counter, and that is deliberate: see `UnservedReply`, and the case
     // above for why counting an answer ordinary traffic produces continuously would
     // bury the thing a counter here would be read for.
+    //
+    // The compile family's unserved answer is `DispatchNotPermitted` since #206 -- a node
+    // running no worker serves those verbs elsewhere rather than not at all -- and it is
+    // still the unserved answer, never the pre-payload decision this call was handed.
     auto const orphan =
         responder.RefusalReply(Wire::PrePayloadDecision::PayloadTooLarge, static_cast<std::uint8_t>(Wire::Op::Compile), {});
-    CHECK(ErrorOf(orphan) == Wire::UnimplementedVerb);
+    CHECK(ErrorOf(orphan) == Wire::ErrorCode::DispatchNotPermitted);
     CHECK(cache.Refusals().size() == 1);
     CHECK(scheduler.Refusals().size() == 1);
 }

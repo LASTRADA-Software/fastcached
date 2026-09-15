@@ -341,6 +341,10 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   host a bare port falls back to. `--print-surfaces` prints the RESOLVED configuration.
   `--advertise` is not a surface — it is told, not opened.
 - `--cache-memory 0` means no tier. Zero is how `InMemoryLruStorage` spells *unbounded*.
+- `--slots=0` means no WORKER, and `OfferableSlots` DERIVES from an absent count, so the flag
+  reaches it only through `WorkerSlotsOf` -- a leak is a full worker on the excluded machine. Such a
+  node registers nothing: a cluster member, not a fleet-page machine, handing over no history
+  (#1440).
 - What a node holds back from compiles is what its tier **built**, never what a flag asked for —
   so capacity is derived *below* the tier startup. Which tiers cost RAM is a column of
   `StorageTierTable`, and a present zero is *unbounded*, not nothing. A disk tier's key index is

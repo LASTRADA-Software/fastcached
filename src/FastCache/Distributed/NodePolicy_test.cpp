@@ -36,8 +36,8 @@ TEST_CASE("A small workstation still offers one slot", "[distributed][nodepolicy
     // Saturating rather than wrapping. A two-core workstation reserving two cores
     // must offer one, not 4294967295 -- and a node that offered ZERO would register,
     // heartbeat, never be picked, and look exactly like a fleet that is permanently
-    // busy. That is the failure the zero-slot registration refusal exists to
-    // prevent, arriving by arithmetic instead of by configuration.
+    // busy. A derived count therefore saturates at one; the only zero is an
+    // operator's, and a node given that registers nothing at all (#206).
     constexpr NodeCapacity dualCore { .logicalCores = 2 };
     CHECK(OfferableSlots(dualCore, std::nullopt) == 1);
 

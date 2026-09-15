@@ -1751,6 +1751,20 @@ Six more about what the tier IS and who gets to see it:
   the cache appearing to work better and better on the way. Both halves off (no
   `--cache-dir` either) means no tier at all, said out loud rather than left to
   produce a cache port answering out of nothing.
+- **`--slots=0` means NO WORKER, and zero used to be how `OfferableSlots` spelled
+  DERIVE** (#206). The obvious way to keep a machine out of the work was therefore the
+  one value that built a full worker, so it was refused, and operators gave schedulers
+  a toolchain identity nothing could match -- which still registered, and under a
+  fingerprint a client did compute took the work anyway. Absent now derives and zero
+  runs none, and the flag reaches `OfferableSlots` only through `WorkerSlotsOf`, which
+  answers NOTHING for a node running no worker: the fail-open direction is a derived
+  count on the machine an operator excluded. `RunsWorker` is the one predicate. Such a
+  node surveys nothing, registers nothing and starts no heartbeat thread; its compile
+  family is refused `DispatchNotPermitted`, the code the daemon already answers a
+  cordon with for the same fact, never `UnimplementedVerb`; and `--scheduler`,
+  `--toolchain` and `--no-toolchain-discovery` are refused on it by name. **Stated
+  loss:** it is a cluster member and not a fleet-page machine, since both the Machines
+  rows and the history handover ride worker registration (#1440).
 - **A store that will not open is always fatal; a port that will not bind is fatal
   only when the operator typed the address.** The two leave `CacheTier` through one
   `std::string`, so `StartCacheTierOrExplain` opens the store itself rather than
@@ -2634,8 +2648,8 @@ the pair is indistinguishable again.
     escape hatch exists without a flag — which is also what the end-to-end fixture
     uses as its control.
   - **The claim belongs to the WORKER tier.** A machine that schedules and compiles
-    nothing has no use for a root and must not fail to start for want of one (#206),
-    so the claim is conditional on serving compiles and says so.
+    nothing -- `--slots=0` -- has no use for a root and must not fail to start for want
+    of one (#206), so the claim is conditional on serving compiles and says so.
   - **Counted where a counter can be read.** Reclamation gets
     `WorkerScratchRootsReclaimed`; the refusal to claim does not, because that path
     exits the process and nothing would ever scrape it — an operator learns of it by

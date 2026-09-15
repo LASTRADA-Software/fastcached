@@ -86,6 +86,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <format>
+#include <functional>
 #include <iostream>
 #include <map>
 #include <optional>
@@ -729,9 +730,9 @@ void AdoptAllowlist(Cc::CompileJobRunner& jobs,
     //
     // `servesCompiles` rather than an unconditional claim: a machine scheduling for
     // a fleet and compiling nothing has no use for a scratch root and must not fail
-    // to start for want of one. Every node serves compiles today, so this is always
-    // true -- named anyway, so that when a node can offer zero slots (#206) the
-    // claim is already conditional rather than something somebody has to remember.
+    // to start for want of one. That machine exists since #206 -- `--slots=0` runs no
+    // worker, and `DiscoverToolchainEntries` answers it with an empty set -- which is
+    // why this was named conditional before anything could make it false.
     //
     // Asked of what was DISCOVERED, not of what is served: since #365 nothing is
     // served yet at this point, and reading the served map here would have claimed no
@@ -1040,7 +1041,14 @@ void AdoptAllowlist(Cc::CompileJobRunner& jobs,
     auto const host = MakeSystemHostFacts();
     auto const capacity =
         Node::NodeCapacityOf(cfg, *host, Node::CacheCapacityOf(cacheTier.get()), Node::IndexReserveBytesOf(cacheTier.get()));
-    auto const slots = Distributed::OfferableSlots(capacity, cfg.slots);
+
+    // Through `WorkerSlotsOf`, never `OfferableSlots` directly -- its header says which
+    // way the other spelling fails (#206). Absent means this node runs no worker, which
+    // decides every worker-shaped thing below. The zero the pool and the capacity are
+    // sized to on such a node admits nothing, and nothing asks it to.
+    auto const workerSlots = Node::WorkerSlotsOf(cfg, capacity);
+    auto const runsWorker = workerSlots.has_value();
+    auto const slots = workerSlots.value_or(0);
 
     // Sized to the slot cap, which is what makes an admitted job always find a
     // thread: the cap admits at most `slots` at once, so one is free by
@@ -1099,15 +1107,13 @@ void AdoptAllowlist(Cc::CompileJobRunner& jobs,
     // the flag that asked for it would report a component that is not there; the pointer
     // is what actually started.
     //
-    // `worker` is a literal `true` and that is not a shortcut: this binary compiles, that
-    // is what it is for, and `compileResponder` above is unconditional. A predicate here
-    // would be one nothing could make false.
-    //
-    // **That was the whole complaint in #1295, and the fix is NOT to make this bit
-    // conditional.** The bit answers *does this node have a worker component*, and
-    // `true` is the correct answer to it. The question it was being read for is *is that
-    // worker serving anything yet*, which is a different question with three answers, and
-    // it is now `runtimeState` below rather than a fourth reading of this bool.
+    // `worker` answers *does this node have a worker component*, and since #206 that has
+    // two answers: `--slots=0` runs none. It was a literal `true` until then, because
+    // nothing could make it false -- #1295 asked for it to be conditional and #1315
+    // declined, rightly, because what #1295 was really reading it for is *is that worker
+    // serving anything yet*: a different question with three answers, which is
+    // `runtimeState` below rather than a fourth reading of this bool. The bit is the
+    // component, never the state, whichever way it answers.
     //
     // `consensus` is the exception, and it is the STRONGER answer rather than a weaker
     // one: the tier is constructed BELOW this point, so there is no pointer to read, and
@@ -1187,7 +1193,7 @@ void AdoptAllowlist(Cc::CompileJobRunner& jobs,
         std::string { VersionString },
         cfg.nodeId,
         Node::NodeComponents { .cacheTier = cacheTier != nullptr,
-                               .worker = true,
+                               .worker = runsWorker,
                                .scheduler = schedulerTier != nullptr,
                                .consensus = Node::RunsConsensus(cfg) },
         // `capacity`, `scheduler` and `enrollment` are read LIVE; only `runtime` is
@@ -1199,8 +1205,12 @@ void AdoptAllowlist(Cc::CompileJobRunner& jobs,
         // cluster reports NOTHING about a window rather than reporting one that is shut,
         // because a reassuring `closed` for a thing that does not exist is exactly the
         // reading that stops an operator looking.
-        Node::NodeRuntimeSources { .runtime = &runtimeState,
-                                   .capacity = &compileCapacity,
+        //
+        // The worker's two readings are wired only where there is a worker: a node running
+        // none reports no toolchains and no slots at the CELL, which is *no worker* rather
+        // than a worker surveying nothing forever (#206).
+        Node::NodeRuntimeSources { .runtime = AddressWhen(runsWorker, runtimeState),
+                                   .capacity = AddressWhen(runsWorker, compileCapacity),
                                    .scheduler = ServiceOrNull(schedulerTier.get()),
                                    .enrollment = AddressWhen(servesEnrollment, enrollmentWindow) },
     };
@@ -1271,7 +1281,9 @@ void AdoptAllowlist(Cc::CompileJobRunner& jobs,
         // answers *served nowhere* for traffic this node is holding a tier for.
         Node::SurfaceComponents { .cache = cacheTier != nullptr ? &cacheTier->Responder() : nullptr,
                                   .scheduler = schedulerTier != nullptr ? &schedulerTier->Responder() : nullptr,
-                                  .compile = &compileResponder,
+                                  // Absent on a node running no worker (#206): the router then
+                                  // answers the compile family's refusal for a node without one.
+                                  .compile = AddressWhen(runsWorker, compileResponder),
                                   .node = &nodeStatusResponder,
                                   .enrollment = AddressOrNull(enrollmentResponder),
                                   .live = &liveStatsResponder,
@@ -1626,14 +1638,6 @@ void AdoptAllowlist(Cc::CompileJobRunner& jobs,
     // Null only when this worker has no configuration file at all.
     ConfigReloaderOf<NodeConfig>::Snapshot actedOn = reloader != nullptr ? reloader->Current() : nullptr;
 
-    // Where this node believes the scheduler's leader is. Declared out here so it
-    // survives across rounds -- remembering the leader is the whole reason a
-    // steady-state fleet does not spend a redirect on every heartbeat -- and, like
-    // `beat`, touched by this one thread only, which is what makes it safe without
-    // a lock of its own. It outlives the `jthread` below, which joins in its
-    // destructor before any of this goes.
-    Node::SchedulerLink link { cfg.schedulers };
-
     // Set by the heartbeat thread when the initial survey answers with nothing, read
     // by this one at the return below.
     //
@@ -1652,7 +1656,7 @@ void AdoptAllowlist(Cc::CompileJobRunner& jobs,
     // already logged which, and the exit code is what a supervisor reads.
     std::atomic<bool> surveyFoundNothing { false };
 
-    std::jthread const heartbeat { [&](std::stop_token const& stop) {
+    auto const heartbeatBody = [&](std::stop_token const& stop, Node::SchedulerLink& link) {
         // The initial survey, and it runs HERE rather than at startup because it is
         // the expensive half: a full walk of every include tree, measured over 300 s
         // on a cold Windows runner (#354). Off the startup path, the node has already
@@ -1861,7 +1865,28 @@ void AdoptAllowlist(Cc::CompileJobRunner& jobs,
             if (compileCapacity.WaitForHeartbeat(stop, announcedCordon, HeartbeatInterval) == Node::HeartbeatWake::Stopped)
                 break;
         }
-    } };
+    };
+
+    // Started only where there is a worker. Everything the thread does is the worker's --
+    // the survey, the registrations, the re-survey sweep, the history handover riding the
+    // heartbeat -- and on a node running none its first act would be to find nothing to
+    // serve and stop the process (#206). Declared as an `optional` for the enrollment
+    // watch's reason above: a thread whose body returned at once would still be a thread.
+    //
+    // Where this node believes the scheduler's leader is: declared out here so it survives
+    // across rounds -- remembering the leader is the whole reason a steady-state fleet does
+    // not spend a redirect on every heartbeat -- and handed to the one thread that touches
+    // it, which is what makes it safe without a lock of its own. It outlives that thread,
+    // which joins in its destructor before any of this goes.
+    //
+    // A link exists only for a non-empty `--scheduler` list (`SchedulerLink::For`), and on
+    // a configuration the startup table accepts that is exactly a node that runs a worker.
+    // Both are asked here, at the one place that decides whether the thread starts, so the
+    // dereference below is checked where it happens rather than by where it was declared.
+    auto link = Node::SchedulerLink::For(cfg.schedulers);
+    std::optional<std::jthread> heartbeat;
+    if (runsWorker && link.has_value())
+        heartbeat.emplace(heartbeatBody, std::ref(*link));
 
     // Installed only once the listener is up and the heartbeat is running, so a
     // stop arriving during startup cannot close a listener that does not exist yet.
@@ -1904,18 +1929,16 @@ void AdoptAllowlist(Cc::CompileJobRunner& jobs,
                 // Four fixtures in two languages wait on these bytes and this build recompiles
                 // none of them, so a reword breaks them by TIMEOUT rather than by a failed
                 // build (#654). Referencing the row is what makes a rename a compile error.
-                "{} on {}, advertising {}, {} slot(s) as a {} node, identifying {} toolchain(s), {}",
+                "{} on {}, advertising {}, {}, {}",
                 ReadinessMarkerText(ReadinessMarker::CompileNode),
                 listeningOn,
                 advertise,
-                slots,
-                Distributed::TraitsFor(cfg.nodeClass).name,
-                // The count this node is BRINGING UP, not the count it is serving:
-                // the survey runs on the heartbeat thread and has almost certainly
-                // not finished when this prints (#365). Reading `toolchains` here
-                // would race that thread as well as understate it -- and a ready
+                // The toolchain count this node is BRINGING UP, not the count it is
+                // serving: the survey runs on the heartbeat thread and has almost
+                // certainly not finished when this prints (#365). Reading `toolchains`
+                // here would race that thread as well as understate it -- and a ready
                 // line is a statement about starting anyway.
-                startupToolchainCount,
+                Node::WorkerReadinessPhrase(cfg, workerSlots, startupToolchainCount),
                 Node::AdmissionSummary(cfg));
 
     // **Main waits here now, and there is no accept loop to interrupt.** This was

@@ -357,6 +357,32 @@ TEST_CASE("NodeToolchains: an unclassifiable compiler is named at survey time", 
     CHECK_FALSE(Logged(known, "cannot classify"));
 }
 
+TEST_CASE("NodeToolchains: a node running no worker is not surveyed", "[node][toolchains]")
+{
+    // #206. `--slots=0` runs no worker, so the machine is not asked: a search would spawn
+    // every compiler it found to build a set nothing reads, and log a count an operator
+    // would take for this node's worker. The CALL COUNT is the assertion, because an
+    // empty set is also what a machine with no compilers produces.
+    auto cfg = Startable();
+    cfg.slots = 0;
+    FixedDiscovery discovery { { Candidate("/opt/real/g++") } };
+    SpawnScript runner;
+    CapturingLogger logger;
+
+    auto const discovered = DiscoverToolchainEntries(cfg, &discovery, runner, logger);
+    REQUIRE(discovered.has_value());
+    CHECK(Unwrap(discovered).entries.empty());
+    CHECK(Unwrap(discovered).source == ToolchainSource::NothingToSearch);
+    CHECK(discovery.Calls() == 0);
+
+    // The control: the same configuration running a worker asks the machine.
+    cfg.slots.reset();
+    auto const worker = DiscoverToolchainEntries(cfg, &discovery, runner, logger);
+    REQUIRE(worker.has_value());
+    CHECK(discovery.Calls() == 1);
+    CHECK_FALSE(Unwrap(worker).entries.empty());
+}
+
 TEST_CASE("NodeToolchains: the two halves compose into what the whole survey answers", "[node][toolchains]")
 {
     // The split is by COST, not by policy (#365): node startup runs the cheap half

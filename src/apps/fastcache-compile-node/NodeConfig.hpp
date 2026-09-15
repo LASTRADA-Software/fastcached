@@ -13,6 +13,7 @@
 #include <FastCache/Platform/HostMemory.hpp>
 #include <FastCache/Platform/ServiceControl.hpp>
 
+#include <cstddef>
 #include <cstdint>
 #include <expected>
 #include <filesystem>
@@ -178,9 +179,12 @@ struct NodeConfig
     /// two implementations of that arithmetic is how a worker comes to accept more jobs
     /// than the scheduler believes it has.
     ///
-    /// An `optional` because `OfferableSlots` takes one and its zero is a count: the
-    /// field's old zero-means-derive would size every default node to nothing (#206).
-    /// The `optional` is this row's provenance, so it needs no bit.
+    /// **Zero is a real answer, and it is the absence of a worker component** (#206):
+    /// see `RunsWorker`. It is the sizing value rather than a `--no-worker` beside it for
+    /// #1022's reason -- a boolean beside the value is a second thing that can disagree
+    /// with it -- and the same shape `--cache-memory 0` already has for the cache tier.
+    /// An `optional` for `reservedCores`' reason: absent and zero are different
+    /// instructions, and the `optional` is this row's provenance, so it needs no bit.
     std::optional<std::uint32_t> slots;
 
     /// Cores held back from the fleet, when the operator named a number.
@@ -881,6 +885,20 @@ struct NodeConfig
                                                        Distributed::NodeCacheCapacity const& cache,
                                                        std::uint64_t indexReserveBytes = 0);
 
+/// The slots this node's worker offers, or nothing when it runs no worker.
+///
+/// **The one door from `--slots` to `OfferableSlots`, and the reason it exists is the
+/// direction a mistake fails in** (#206). `OfferableSlots` derives a count when the
+/// operator named none, so a `--slots=0` that reached it as "named nothing" would build
+/// a FULL worker on the machine an operator had just excluded -- registered, leased and
+/// compiling, with nothing anywhere saying so. Asked here, a node that runs no worker
+/// has no slot count at all, and `WorkerBody` builds no worker from an absent one.
+/// @param cfg The parsed configuration.
+/// @param capacity What `NodeCapacityOf` made of this machine.
+/// @return The count to advertise and enforce, or absent when `RunsWorker` is false.
+[[nodiscard]] std::optional<std::uint32_t> WorkerSlotsOf(NodeConfig const& cfg,
+                                                         Distributed::NodeCapacity const& capacity) noexcept;
+
 /// Build a configuration from a file and a command line, in that order.
 ///
 /// The whole of "the command line wins": the file's values and the command
@@ -1305,6 +1323,30 @@ inline constexpr std::string_view ConsensusNeedsClusterKeyRefusal =
     "nor hear anybody. Give every member the same key file -- generate one with `head -c 32 /dev/urandom | base64`, "
     "or run --enroll-from against a member to be handed it -- or drop --listen-raft to run one machine alone";
 
+/// Why `--slots=0` refuses the toolchain flags (#206).
+///
+/// A named constant because a test asserts WHICH refusal answered, and this row and the
+/// "--no-toolchain-discovery with no --toolchain" row both name toolchain flags: a
+/// case matching on the flag passes whichever of the two fires.
+inline constexpr std::string_view NoWorkerNamesToolchainsRefusal =
+    "--slots=0 runs no worker, and --toolchain and --no-toolchain-discovery choose the compilers a worker "
+    "serves: the setting would be accepted and reach nothing. Drop the toolchain flags, or give --slots a count "
+    "to run a worker.";
+
+/// Why `--slots=0` refuses `--scheduler` (#206).
+///
+/// The flag-that-configures-nothing shape `--discovery-reply-port` without `--discovery`
+/// has: a worker registers at the endpoints it names, and a node running no worker
+/// registers nowhere, so a list it carried would read as a fleet this machine is in.
+inline constexpr std::string_view NoWorkerNamesSchedulerRefusal =
+    "--slots=0 runs no worker, and --scheduler is where a worker registers: this node registers nowhere, so the "
+    "endpoints would be accepted and reach nothing. Drop --scheduler, or give --slots a count to run a worker.";
+
+/// Why a node with no worker, no scheduler, no consensus and no cache tier is refused.
+inline constexpr std::string_view NodeRunsNothingRefusal =
+    "--slots=0 runs no worker, and this node runs no scheduler, no consensus and no cache tier either: it would "
+    "start and serve nobody. Add --serve-scheduler or a cache tier, or give --slots a count to run a worker.";
+
 /// The `--raft-peer` entry `--node-id` names, if the list names it at all.
 ///
 /// The predicate behind `ConsensusNamesNoSelfPeerRefusal`, shared for the reason that
@@ -1357,6 +1399,40 @@ inline constexpr std::string_view ConsensusNeedsClusterKeyRefusal =
 /// @param cfg The parsed configuration.
 /// @return True when a consensus driver will run and report a role.
 [[nodiscard]] bool RunsConsensus(NodeConfig const& cfg) noexcept;
+
+/// Whether this node runs a compile worker: surveys its toolchains, claims a scratch
+/// root, serves the compile verbs and registers with a scheduler.
+///
+/// **`--slots=0` is the one configuration that says no** (#206). A machine that should
+/// only schedule -- a small always-on box, a VM whose cores belong to something else --
+/// used to be given a toolchain identity no client could match, because every node was
+/// a worker and there was no way to offer the fleet nothing. That trick still
+/// registered, and under a fingerprint a client DID compute it took the work the
+/// operator believed they had excluded.
+///
+/// A mode on a value rather than on a port, because the worker has had no port of its
+/// own since #290 -- the compile verbs share the node's `0xFC` listener -- and never on
+/// the absence of a name (#1022): neither an empty `--scheduler` nor an empty toolchain
+/// set may carry it, since both are ordinary states a worker passes through.
+///
+/// Such a node registers NOTHING, so it is never picked and the registry never sees a
+/// zero slot count. It appears under a cluster's members when it runs consensus, and not
+/// among the fleet page's machines, which are built from worker registrations; its
+/// history is not handed to a leader either, because that rides the worker heartbeat.
+/// @param cfg The parsed configuration.
+/// @return True unless the operator asked for zero slots.
+[[nodiscard]] bool RunsWorker(NodeConfig const& cfg) noexcept;
+
+/// Whether this configuration asks for a cache tier: a port to serve it on, and memory
+/// or a directory to keep objects in.
+///
+/// The configuration half of what `StartCacheTierOrExplain` builds. A tier can still
+/// fail to start -- a directory that will not open refuses the node -- so this is what
+/// the startup table may ask before any tier exists, never a substitute for the
+/// pointer that says what actually started.
+/// @param cfg The parsed configuration.
+/// @return True when a cache tier will be built unless starting it fails.
+[[nodiscard]] bool ConfiguresCacheTier(NodeConfig const& cfg) noexcept;
 
 /// The member endpoint `--raft-self` and `--listen-raft` name between them.
 ///
@@ -1437,6 +1513,21 @@ enum class ConsensusDialGap : std::uint8_t
 /// @param cfg The parsed configuration.
 /// @return A phrase naming who this node admits.
 [[nodiscard]] std::string AdmissionSummary(NodeConfig const& cfg);
+
+/// What the readiness line says about this node's worker.
+///
+/// A node running no worker says exactly that, rather than "0 slot(s) ... identifying 0
+/// toolchain(s)", which describes a worker that serves nothing: a different machine from
+/// the one the operator configured (#206). The worker's words are a fixture's input --
+/// `dist-compile-e2e.sh` reads a derived slot count out of them -- so they are pinned by
+/// `NodeConfig_test` rather than left to the line that prints them.
+/// @param cfg The parsed configuration; its node class names the worker.
+/// @param workerSlots What `WorkerSlotsOf` answered, absent on a node running no worker.
+/// @param toolchains How many toolchains the worker is bringing up.
+/// @return The phrase.
+[[nodiscard]] std::string WorkerReadinessPhrase(NodeConfig const& cfg,
+                                                std::optional<std::uint32_t> workerSlots,
+                                                std::size_t toolchains);
 
 /// One path-valued worker flag whose file holds a secret.
 ///

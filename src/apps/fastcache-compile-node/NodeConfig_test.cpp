@@ -3,6 +3,7 @@
 #include "NodeConfig.hpp"
 #include "NodeSurfaces.hpp"
 #include "NodeToolchains.hpp"
+#include "SchedulerLink.hpp"
 
 #include <FastCache/Cache/CowTreeStorage.hpp>
 #include <FastCache/Cache/InMemoryLruStorage.hpp>
@@ -2317,17 +2318,38 @@ TEST_CASE("NodeConfig: a node class is parsed by name and refused by name", "[no
     CHECK(wrong.error().context.contains("dedicated"));
 }
 
-TEST_CASE("NodeConfig: a reserve of zero parses, unlike a slot count of zero", "[node][cli]")
+TEST_CASE("NodeConfig: a slot count of zero parses, and is a different answer from omitting it", "[node][cli]")
 {
-    // The two flags differ deliberately. Zero slots is a worker that can do nothing
-    // and is refused; zero reserved cores is a real instruction -- drive this machine
-    // to its last core -- and is distinct from not passing the flag at all.
-    auto const none = ParseNodeArgv({ "--scheduler=s:1", "--toolchain=/usr/bin/cc", "--reserve-cores=0" });
-    REQUIRE(none.has_value());
-    REQUIRE(none->reservedCores.has_value());
-    CHECK(Unwrap(none->reservedCores) == 0U);
+    // #206. Zero slots used to be refused, because zero was this field's own spelling of
+    // "derive from the machine" -- which left no way to offer the fleet nothing at all.
+    // That answer is now the field's ABSENCE, so zero means what it says: a node running
+    // no worker. Three values, and the pair that matters is the last two, since a build
+    // folding them back together passes the other two.
+    auto const omitted = ParseNodeArgv({ "--scheduler=s:1" });
+    REQUIRE(omitted.has_value());
+    CHECK_FALSE(omitted->slots.has_value());
+    CHECK(RunsWorker(*omitted));
 
-    CHECK_FALSE(ParseNodeArgv({ "--scheduler=s:1", "--toolchain=/usr/bin/cc", "--slots=0" }).has_value());
+    auto const four = ParseNodeArgv({ "--scheduler=s:1", "--slots=4" });
+    REQUIRE(four.has_value());
+    CHECK(four->slots == std::optional<std::uint32_t> { 4 });
+    CHECK(RunsWorker(*four));
+
+    auto const none = ParseNodeArgv({ "--slots=0", "--serve-scheduler" });
+    REQUIRE(none.has_value());
+    CHECK(none->slots == std::optional<std::uint32_t> { 0 });
+    CHECK_FALSE(RunsWorker(*none));
+
+    // A reserve of zero is the same shape one flag over, and it is still its own
+    // instruction: drive this machine to its last core.
+    auto const reserve = ParseNodeArgv({ "--scheduler=s:1", "--toolchain=/usr/bin/cc", "--reserve-cores=0" });
+    REQUIRE(reserve.has_value());
+    CHECK(reserve->reservedCores == std::optional<std::uint32_t> { 0 });
+
+    // What is not a number is still refused, and says what it was given.
+    auto const junk = ParseNodeArgv({ "--scheduler=s:1", "--slots=many" });
+    REQUIRE_FALSE(junk.has_value());
+    CHECK(junk.error().context.contains("many"));
 }
 
 TEST_CASE("NodeConfig: the discovery reply port is pinned by name and needs discovery", "[node][cli]")
@@ -2388,6 +2410,47 @@ TEST_CASE("NodeConfig: the discovery reply port is pinned by name and needs disc
     auto const refusal = StartupPolicyRejection(collided);
     REQUIRE(refusal.has_value());
     CHECK(Unwrap(refusal).contains("--discovery-reply-port"));
+}
+
+TEST_CASE("NodeConfig: a node told to offer nothing is never sized as a worker", "[node][capacity]")
+{
+    // #206, in the direction a mistake fails. `OfferableSlots` DERIVES a count when the
+    // operator named none, so a `--slots=0` that reached it as "named nothing" would
+    // build a full worker on the machine an operator had just excluded -- registered,
+    // leased and compiling, with nothing anywhere saying so. `WorkerSlotsOf` is the one
+    // door from the flag to that function, and on this node it answers nothing at all.
+    NodeConfig cfg;
+    cfg.nodeClass = Distributed::NodeClass::Dedicated;
+    FakeHost const server { 16, 64ULL << 30 };
+    auto const capacity = NodeCapacityOf(cfg, server, NoCacheTier);
+
+    // The control: the same machine naming nothing is a sixteen-slot worker, so the
+    // absent answer below is the flag's doing and not the machine's.
+    CHECK(WorkerSlotsOf(cfg, capacity) == std::optional<std::uint32_t> { 16 });
+
+    cfg.slots = 4;
+    CHECK(WorkerSlotsOf(cfg, capacity) == std::optional<std::uint32_t> { 4 });
+
+    cfg.slots = 0;
+    CHECK_FALSE(RunsWorker(cfg));
+    CHECK_FALSE(WorkerSlotsOf(cfg, capacity).has_value());
+}
+
+TEST_CASE("NodeConfig: a node running no worker says so on its readiness line", "[node][capacity]")
+{
+    // #206. The line an operator reads to confirm a node came up said "0 slot(s) as a
+    // workstation node, identifying 0 toolchain(s)" on a node running no worker, which
+    // describes a worker serving nothing rather than the machine that was configured.
+    NodeConfig cfg;
+    cfg.nodeClass = Distributed::NodeClass::Dedicated;
+
+    // The worker's words are unchanged: `dist-compile-e2e.sh` reads a derived slot count
+    // out of "<n> slot(s) as a dedicated node".
+    CHECK(WorkerReadinessPhrase(cfg, 16, 3) == "16 slot(s) as a dedicated node, identifying 3 toolchain(s)");
+
+    auto const none = WorkerReadinessPhrase(cfg, std::nullopt, 0);
+    CHECK(none == "running no worker");
+    CHECK_FALSE(none.contains("slot(s)"));
 }
 
 TEST_CASE("NodeConfig: a node is sized from its hardware and its class", "[node][capacity]")
@@ -3467,6 +3530,23 @@ TEST_CASE("NodeConfig: a setting in the file takes effect", "[node][config]")
     CHECK(merged->slots == 9);
     CHECK(merged->toolchains == std::vector<std::string> { "/usr/bin/g++", "/usr/bin/clang++" });
     CHECK_FALSE(merged->toolchainDiscovery);
+}
+
+TEST_CASE("NodeConfig: a file's slots: 0 runs no worker, exactly as the flag does", "[node][config]")
+{
+    // The same applier from both sources, which is the rule a file follows -- so a file
+    // cannot be the one place zero still means "derive" (#206).
+    auto const fromFile = FromFileAndArgv({ Setting("slots", { "0" }), Setting("serve_scheduler", { "true" }) }, {});
+    REQUIRE(fromFile.has_value());
+    CHECK(fromFile->slots == std::optional<std::uint32_t> { 0 });
+    CHECK_FALSE(RunsWorker(*fromFile));
+
+    // And a count on the command line still wins over the file's zero, which is the
+    // precedence every other setting has.
+    auto const overridden = FromFileAndArgv({ Setting("slots", { "0" }) }, { "--scheduler=s:1", "--slots=8" });
+    REQUIRE(overridden.has_value());
+    CHECK(overridden->slots == std::optional<std::uint32_t> { 8 });
+    CHECK(RunsWorker(*overridden));
 }
 
 TEST_CASE("NodeConfig: the command line wins over the file", "[node][config]")
@@ -5411,4 +5491,134 @@ TEST_CASE("A registration carries the codec by name, not by number", "[node][con
 
     auto const spec = MakeNodeServiceSpec("/usr/bin/fastcache-compile-node", *parsed);
     CHECK(std::ranges::any_of(spec.arguments, [](std::string const& arg) { return arg == "--memory-compression=zstd"; }));
+}
+
+namespace
+{
+
+/// A machine that only schedules (#206): no worker, a scheduler, a member list, and
+/// the default cache tier. Everything a worker would need -- a `--scheduler` to
+/// register with, an `--advertise`, a toolchain -- deliberately absent.
+[[nodiscard]] NodeConfig SchedulerOnly()
+{
+    NodeConfig cfg;
+    cfg.slots = 0;
+    cfg.serveScheduler = true;
+    cfg.nodeListen = "0.0.0.0:6674";
+    cfg.fleetMembers = { "10.0.0.2" };
+    return cfg;
+}
+
+} // namespace
+
+TEST_CASE("NodeConfig: a node running no worker is refused the flags only a worker reads", "[node][config][policy]")
+{
+    // #206. Each row below has a WORKER twin that must keep firing, so each section
+    // carries that control: a rule re-scoped by making it vanish would pass the refusal
+    // half and fail the control.
+    auto const schedulerOnly = SchedulerOnly();
+    REQUIRE_FALSE(StartupPolicyRejection(schedulerOnly).has_value());
+
+    SECTION("a toolchain flag")
+    {
+        auto named = schedulerOnly;
+        named.toolchains = { "/usr/bin/g++" };
+        auto const refusal = StartupPolicyRejection(named);
+        REQUIRE(refusal.has_value());
+        CHECK(Unwrap(refusal) == NoWorkerNamesToolchainsRefusal);
+
+        auto blind = schedulerOnly;
+        blind.toolchainDiscovery = false;
+        auto const blindRefusal = StartupPolicyRejection(blind);
+        REQUIRE(blindRefusal.has_value());
+        CHECK(Unwrap(blindRefusal) == NoWorkerNamesToolchainsRefusal);
+
+        // The worker's own sentence is still the worker's.
+        auto worker = blind;
+        worker.slots.reset();
+        worker.schedulers = { std::string { SelfScheduler } };
+        auto const workerRefusal = StartupPolicyRejection(worker);
+        REQUIRE(workerRefusal.has_value());
+        CHECK(Unwrap(workerRefusal).starts_with("--no-toolchain-discovery was given and no --toolchain"));
+    }
+
+    SECTION("a scheduler to register with")
+    {
+        auto named = schedulerOnly;
+        named.schedulers = { "10.0.0.9:6674" };
+        auto const refusal = StartupPolicyRejection(named);
+        REQUIRE(refusal.has_value());
+        CHECK(Unwrap(refusal) == NoWorkerNamesSchedulerRefusal);
+
+        // A worker naming none is still refused, and for the opposite reason.
+        auto worker = Installable();
+        worker.schedulers.clear();
+        auto const workerRefusal = StartupPolicyRejection(worker);
+        REQUIRE(workerRefusal.has_value());
+        CHECK(Unwrap(workerRefusal).starts_with("--scheduler is required"));
+    }
+
+    SECTION("nothing to run at all")
+    {
+        auto nothing = schedulerOnly;
+        nothing.serveScheduler = false;
+        nothing.fleetMembers.clear();
+        nothing.cacheMemoryBytes = 0;
+        auto const refusal = StartupPolicyRejection(nothing);
+        REQUIRE(refusal.has_value());
+        CHECK(Unwrap(refusal) == NodeRunsNothingRefusal);
+
+        // Any ONE component is enough, and a cache alone is an ordinary cache node.
+        auto cacheOnly = nothing;
+        cacheOnly.cacheMemoryBytes = 64ULL << 20;
+        CHECK_FALSE(StartupPolicyRejection(cacheOnly).has_value());
+    }
+
+    SECTION("the install-time rows that ask for a worker's flags")
+    {
+        // No `--scheduler`, no `--advertise`, no toolchain -- the three install rows a
+        // worker must satisfy -- and the registration is accepted.
+        CHECK_FALSE(NodeInstallRejection(schedulerOnly).has_value());
+
+        auto worker = Installable();
+        worker.schedulers.clear();
+        auto const workerRefusal = NodeInstallRejection(worker);
+        REQUIRE(workerRefusal.has_value());
+        CHECK(Unwrap(workerRefusal).starts_with("--scheduler is required to install a service"));
+    }
+}
+
+TEST_CASE("NodeConfig: a scheduler link exists exactly for a node that runs a worker", "[node][config][policy]")
+{
+    // #206. `WorkerBody` starts its heartbeat only when both say yes, and on a
+    // configuration the startup table ACCEPTS the two must agree -- a worker always names
+    // a scheduler and a node running none may not. Asserted here, over accepted
+    // configurations, because main.cpp is the one translation unit no test reaches.
+    auto const worker = Installable();
+    REQUIRE_FALSE(StartupPolicyRejection(worker).has_value());
+    CHECK(RunsWorker(worker));
+    CHECK(SchedulerLink::For(worker.schedulers).has_value());
+
+    auto const schedulerOnly = SchedulerOnly();
+    REQUIRE_FALSE(StartupPolicyRejection(schedulerOnly).has_value());
+    CHECK_FALSE(RunsWorker(schedulerOnly));
+    CHECK_FALSE(SchedulerLink::For(schedulerOnly.schedulers).has_value());
+}
+
+TEST_CASE("NodeConfig: a registration replays --slots=0, and omits a count nobody typed", "[node][service]")
+{
+    // A registration replays its command line at every boot, and the two spellings here
+    // are opposite machines since #206: omitted is a worker sized from its hardware, and
+    // zero is a node that runs none. A registration that dropped the zero would turn a
+    // scheduler-only box into a worker at its first reboot.
+    auto const worker = MakeNodeServiceSpec(std::filesystem::path { "fastcache-compile-node" }, Installable());
+    CHECK_FALSE(std::ranges::any_of(worker.arguments, [](std::string const& arg) { return FlagMatches(arg, "--slots"); }));
+
+    auto const spec = MakeNodeServiceSpec(std::filesystem::path { "fastcache-compile-node" }, SchedulerOnly());
+    CHECK(std::ranges::contains(spec.arguments, std::string { "--slots=0" }));
+
+    auto const reparsed = ReparseSpec(spec);
+    REQUIRE(reparsed.has_value());
+    CHECK(reparsed->slots == std::optional<std::uint32_t> { 0 });
+    CHECK_FALSE(RunsWorker(*reparsed));
 }

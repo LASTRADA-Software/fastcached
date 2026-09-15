@@ -1946,6 +1946,55 @@ static_assert(NoRetiredErrorCodeIsReused(),
               "a retired wire code must never be reassigned -- a peer built against an older header still reports it "
               "under its old name (0x06 was canonicalization-failed; see issues #59, #69)");
 
+/// What a compile-family verb is told at an endpoint that runs no compile worker.
+///
+/// **One fact, reached from two endpoints** (#206). The daemon is a cache and never ran
+/// a worker; a compile node started with `--slots=0` runs none. Both are asked the same
+/// question -- a `--cordon`, a compile somebody sent by hand -- and a client that met two
+/// codes for one condition would be sent two remedies, which is what `NoCluster` already
+/// avoids for the enrollment family.
+///
+/// `DispatchNotPermitted`, because these verbs are SERVED ELSEWHERE rather than
+/// unimplemented -- by the fleet's workers, or by the node on the daemon's own machine --
+/// and *a verb another port answers stays `DispatchNotPermitted`*. `UnimplementedVerb`
+/// would tell the operator who sent `--cordon` that this build is too old to know the
+/// verb. A launcher does not retry `NotPermitted`, which is right for both.
+///
+/// A STEM rather than a sentence, because the remedy is each endpoint's own: the daemon
+/// sends an operator to the compile node on this machine, a node running no worker to a
+/// node that runs one. Each table that answers these verbs asserts its row against this
+/// at compile time (`SaysNoCompileWorker`), so neither the code nor the fact can be
+/// changed at one endpoint alone.
+///
+/// **Shared DATA, not a way to answer**, which is why it sits here beside `ErrorTable`
+/// rather than in `SurfaceRefusal.hpp`: that header holds exactly the functions a surface
+/// refuses THROUGH, and `worker-refusals-counted` derives that set from it. A code and a
+/// stem both endpoints read are the kind of fact this header already carries per code.
+struct NoCompileWorker
+{
+    /// What the client acts on.
+    static constexpr ErrorCode Code = ErrorCode::DispatchNotPermitted;
+    /// How every such refusal's words begin; the endpoint completes it with its remedy.
+    static constexpr std::string_view Stem = "this endpoint runs no compile worker";
+};
+
+/// Whether a refusal says `NoCompileWorker`'s fact, in its code and in its words.
+/// @param code The code the refusal sends.
+/// @param message The words it sends.
+/// @return True when both are `NoCompileWorker`'s.
+[[nodiscard]] constexpr bool SaysNoCompileWorker(ErrorCode code, std::string_view message) noexcept
+{
+    return code == NoCompileWorker::Code && message.starts_with(NoCompileWorker::Stem);
+}
+
+/// Whether a surface's refusal row says `NoCompileWorker`'s fact.
+/// @param row The row.
+/// @return True when its code and its words are `NoCompileWorker`'s.
+[[nodiscard]] constexpr bool SaysNoCompileWorker(RefusedVerb const& row) noexcept
+{
+    return SaysNoCompileWorker(row.code, row.why);
+}
+
 /// Verbs that legitimately carry no fields at all.
 ///
 /// Zero is also what a row that forgot its `fieldCount` would hold, and such a row

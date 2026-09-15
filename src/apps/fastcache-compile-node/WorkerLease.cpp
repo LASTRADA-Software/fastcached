@@ -24,6 +24,13 @@ std::expected<Cc::LeaseValidator, std::string> MakeWorkerLeaseValidator(NodeConf
                                                                         IMetricsSink& metrics,
                                                                         ILogger& logger)
 {
+    // A node running no worker (#206) serves no compile verb, so no grant reaches a
+    // validator: the router has no compile component to hand one to, and the capacity
+    // behind it is sized to zero and admits nothing. Said nowhere, deliberately -- both
+    // lines below describe a node that COMPILES, and would be read as this one doing so.
+    if (!RunsWorker(cfg))
+        return Cc::UncheckedLeaseValidator();
+
     if (cfg.clusterKeyFile.empty())
     {
         // The half `StartupPolicyRejection` cannot decide. It reads `--bind`, which

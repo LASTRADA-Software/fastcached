@@ -1,4 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
+#include "NodeConfig.hpp"
+
+#include <FastCache/Distributed/NodePolicy.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
 #include <catch2/catch_test_macros.hpp>
@@ -50,6 +53,19 @@ constexpr std::string_view Key = "obj-abcdef";
                                  .sourceRootReplacement = {} };
 }
 
+/// Ask @p scheduler for a lease on `Key`, and return what it answered.
+/// @param fleet The fleet.
+/// @param scheduler Who to ask.
+/// @return The exchange's outcome, hit or refusal.
+[[nodiscard]] Cc::CacheOutcome AskForLease(Testing::FleetHarness& fleet, std::string_view scheduler)
+{
+    return fleet.Exchange(
+        scheduler,
+        Wire::EncodeLease(Wire::LeaseRequest { .fingerprint = Toolchain, .key = Key, .acceptedCodecs = {} }),
+        Cc::Credential {},
+        Cc::ExchangeBudget {});
+}
+
 /// Take a lease for `Key` from @p scheduler the way a second client would.
 ///
 /// Through the harness's own exchange rather than by calling `SchedulerService`
@@ -61,15 +77,30 @@ constexpr std::string_view Key = "obj-abcdef";
 /// @return The granted token.
 [[nodiscard]] std::string LeaseFrom(Testing::FleetHarness& fleet, std::string_view scheduler)
 {
-    auto const outcome =
-        fleet.Exchange(scheduler,
-                       Wire::EncodeLease(Wire::LeaseRequest { .fingerprint = Toolchain, .key = Key, .acceptedCodecs = {} }),
-                       Cc::Credential {},
-                       Cc::ExchangeBudget {});
+    auto const outcome = AskForLease(fleet, scheduler);
     REQUIRE(outcome.IsHit());
     auto const grant = Wire::DecodeLeaseGrant(outcome.value);
     REQUIRE(grant.has_value());
     return std::string { Wire::AsStringView(Unwrap(grant).leaseToken) };
+}
+
+/// Put a node into @p fleet the way `WorkerBody` would: registered as a worker exactly
+/// when `WorkerSlotsOf` gives it a slot count, and not at all otherwise.
+///
+/// Through the function `WorkerBody` decides with rather than a copy of its condition,
+/// because the case is about that decision: a node whose count is absent starts no
+/// heartbeat thread, so nothing ever registers it (#206).
+/// @param fleet The fleet.
+/// @param endpoint Where the node answers.
+/// @param cfg Its configuration.
+/// @param capacity What the machine is.
+void JoinAsConfigured(Testing::FleetHarness& fleet,
+                      std::string_view endpoint,
+                      Node::NodeConfig const& cfg,
+                      Distributed::NodeCapacity const& capacity)
+{
+    if (auto const slots = Node::WorkerSlotsOf(cfg, capacity))
+        fleet.RegisterWorker(SchedulerA, endpoint, Toolchain, *slots);
 }
 
 } // namespace
@@ -244,4 +275,48 @@ TEST_CASE("A lease outliving its holder stops suppressing its key once time move
     // Nothing releases it -- this is the client that died.
     fleet.Step(Distributed::LeaseTable::DefaultLeaseTimeout + std::chrono::seconds { 1 });
     CHECK_FALSE(fleet.IsInFlight(SchedulerA, Key));
+}
+
+TEST_CASE("A node running no worker is never leased, and a worker beside it still is", "[node][fleet]")
+{
+    // #206, both directions. The scheduler-only machine is the one an operator excluded
+    // from the work, and it shares the toolchain fingerprint with the worker beside it --
+    // which is the NORMAL case, and the one the old fake-toolchain trick could not cover.
+    Testing::FleetHarness fleet;
+    fleet.AddScheduler(std::string { SchedulerA });
+    fleet.ElectLeader(SchedulerA);
+
+    Node::NodeConfig schedulerOnly;
+    schedulerOnly.slots = 0;
+    schedulerOnly.serveScheduler = true;
+    // A small always-on box, so that if it WERE registered it would still lose every
+    // pick to the worker below -- which is what keeps the second section from going red
+    // for the first section's reason.
+    Distributed::NodeCapacity const smallBox { .logicalCores = 2 };
+
+    Node::NodeConfig worker;
+    Distributed::NodeCapacity const buildServer { .logicalCores = 16, .nodeClass = Distributed::NodeClass::Dedicated };
+
+    SECTION("alone, the fleet has no worker for the toolchain")
+    {
+        JoinAsConfigured(fleet, SchedulerA, schedulerOnly, smallBox);
+
+        auto const outcome = AskForLease(fleet, SchedulerA);
+        REQUIRE_FALSE(outcome.IsHit());
+        // `NoWorker` -- *the fleet has none* -- and not `NoCapacity` or `Withdrawn`, which
+        // is what a registered node offering zero, or a cordoned one, would be answered.
+        CHECK(outcome.code == Wire::ErrorCode::NoWorker);
+    }
+
+    SECTION("beside a worker, the worker takes the lease")
+    {
+        JoinAsConfigured(fleet, SchedulerA, schedulerOnly, smallBox);
+        JoinAsConfigured(fleet, Worker, worker, buildServer);
+
+        auto const outcome = AskForLease(fleet, SchedulerA);
+        REQUIRE(outcome.IsHit());
+        auto const grant = Wire::DecodeLeaseGrant(outcome.value);
+        REQUIRE(grant.has_value());
+        CHECK(Wire::AsStringView(Unwrap(grant).endpoint) == Worker);
+    }
 }
