@@ -667,6 +667,7 @@ struct NodeConfig
     /// into a unit that would then outrank the file it came from.
     bool advertiseExplicit { false };
     bool nodeClassExplicit { false };
+    bool toolchainDiscoveryExplicit { false };
     bool adminListenExplicit { false };
     bool cacheDiskBytesExplicit { false };
     bool raftListenExplicit { false };
@@ -1323,25 +1324,6 @@ inline constexpr std::string_view ConsensusNeedsClusterKeyRefusal =
     "nor hear anybody. Give every member the same key file -- generate one with `head -c 32 /dev/urandom | base64`, "
     "or run --enroll-from against a member to be handed it -- or drop --listen-raft to run one machine alone";
 
-/// Why `--slots=0` refuses the toolchain flags (#206).
-///
-/// A named constant because a test asserts WHICH refusal answered, and this row and the
-/// "--no-toolchain-discovery with no --toolchain" row both name toolchain flags: a
-/// case matching on the flag passes whichever of the two fires.
-inline constexpr std::string_view NoWorkerNamesToolchainsRefusal =
-    "--slots=0 runs no worker, and --toolchain and --no-toolchain-discovery choose the compilers a worker "
-    "serves: the setting would be accepted and reach nothing. Drop the toolchain flags, or give --slots a count "
-    "to run a worker.";
-
-/// Why `--slots=0` refuses `--scheduler` (#206).
-///
-/// The flag-that-configures-nothing shape `--discovery-reply-port` without `--discovery`
-/// has: a worker registers at the endpoints it names, and a node running no worker
-/// registers nowhere, so a list it carried would read as a fleet this machine is in.
-inline constexpr std::string_view NoWorkerNamesSchedulerRefusal =
-    "--slots=0 runs no worker, and --scheduler is where a worker registers: this node registers nowhere, so the "
-    "endpoints would be accepted and reach nothing. Drop --scheduler, or give --slots a count to run a worker.";
-
 /// Why a node with no worker, no scheduler, no consensus and no cache tier is refused.
 inline constexpr std::string_view NodeRunsNothingRefusal =
     "--slots=0 runs no worker, and this node runs no scheduler, no consensus and no cache tier either: it would "
@@ -1416,12 +1398,30 @@ inline constexpr std::string_view NodeRunsNothingRefusal =
 /// set may carry it, since both are ordinary states a worker passes through.
 ///
 /// Such a node registers NOTHING, so it is never picked and the registry never sees a
-/// zero slot count. It appears under a cluster's members when it runs consensus, and not
-/// among the fleet page's machines, which are built from worker registrations; its
-/// history is not handed to a leader either, because that rides the worker heartbeat.
+/// zero slot count. It may still name `--scheduler`, which then tells only the cluster
+/// and enrollment commands run on this machine where to ask. It appears under a cluster's members when it runs consensus,
+/// and not among the fleet page's machines, which are built from worker registrations; its history is not handed to a leader
+/// either, because that rides the worker heartbeat.
 /// @param cfg The parsed configuration.
 /// @return True unless the operator asked for zero slots.
 [[nodiscard]] bool RunsWorker(NodeConfig const& cfg) noexcept;
+
+/// The worker, as the component column of `NodeOptions()` and the scope column of the
+/// startup, install and reload rules name it.
+inline constexpr OptionComponent<NodeConfig> WorkerComponent {
+    .name = "worker",
+    .runs = &RunsWorker,
+    .absentBecause = "--slots=0 runs none",
+    .remedy = "give --slots a count to run one",
+};
+
+/// What a node is told when it names a setting only a component it does not run reads.
+///
+/// ONE sentence for every such row, generated from the row and its component, because
+/// the rule is one rule: the setting would be accepted and reach nothing (#206).
+/// @param spec A row of `NodeOptions()` whose `component` is not null.
+/// @return The refusal.
+[[nodiscard]] std::string UnrunComponentRefusal(OptionSpec<NodeConfig> const& spec);
 
 /// Whether this configuration asks for a cache tier: a port to serve it on, and memory
 /// or a directory to keep objects in.

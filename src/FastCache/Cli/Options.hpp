@@ -6,6 +6,7 @@
 #include <FastCache/Core/Utf8.hpp>
 
 #include <algorithm>
+#include <concepts>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
@@ -96,6 +97,38 @@ enum class FileValue : std::uint8_t
     ExpandEnvironment, ///< `$NAME`, `${NAME}` and `$$` are expanded first; see `ExpandEnvironmentVariables`.
 };
 
+/// Whether a configuration holds any value in one field. See `OptionSpec::present`.
+template <typename Result>
+using PresentFieldFn = bool (*)(ConfigOf<Result> const&);
+
+/// The type a pointer-to-member names, for constraining a factory on its field.
+template <typename Pointer>
+struct MemberTypeOf;
+
+/// @copydoc MemberTypeOf
+template <typename Class, typename Member>
+struct MemberTypeOf<Member Class::*>
+{
+    using type = Member; ///< The member's type.
+};
+
+/// A field whose type CAN be empty: an `optional`, or anything with `empty()`.
+///
+/// **It checks the TYPE and not the DEFAULT**, so it only says that "present" is
+/// expressible for the field. Presence is provenance only when the field is also EMPTY
+/// BY DEFAULT -- no operator can type an empty list or a disengaged `optional`, so any
+/// value such a field holds is one somebody named -- and a `std::string` defaulting to
+/// a value passes this concept while its default can be typed back. What refuses that
+/// is the binary's test that a default configuration names none of its scoped rows
+/// (`NodeConfig_test`), which carries a planted row proving it does.
+template <typename T>
+concept EmptyByType = requires(T const& value) {
+    { value.empty() } -> std::convertible_to<bool>;
+} || requires(T const& value) {
+    { value.has_value() } -> std::convertible_to<bool>;
+    { value.value() };
+};
+
 /// Whether a setting can take effect without restarting the process.
 ///
 /// **Opt-in, and that default is the guard.** The daemon's reloader used to decide
@@ -130,6 +163,25 @@ enum class Reloadable : std::uint8_t
     /// column now, so neither has such a ladder left.
     No,
     Yes, ///< Takes effect on reload.
+};
+
+/// A part of a binary that a configuration may leave out, and that some settings
+/// configure alone.
+///
+/// **A column rather than a conjunct each rule remembers.** A setting only one component
+/// reads is inert on a configuration that does not run that component: accepted, and
+/// reaching nothing. Refusing it was six hand-pasted predicates on the node's rule
+/// tables, and the branch that introduced them dropped one (#206). A row that names its
+/// component is refused by ONE generated rule, so the next such setting is covered by
+/// being written down rather than by somebody remembering the rule.
+/// @tparam Config The configuration the component is decided from.
+template <typename Config>
+struct OptionComponent
+{
+    std::string_view name;                ///< What the component is called, e.g. `worker`.
+    bool (*runs)(Config const&) noexcept; ///< Whether a configuration runs it.
+    std::string_view absentBecause;       ///< The setting that turned it off, said as a clause.
+    std::string_view remedy;              ///< How to run it instead, said as a clause.
 };
 
 /// One accepted command-line option.
@@ -219,6 +271,25 @@ struct OptionSpec
     /// command-line values makes precedence depend on declaration order, which is
     /// not something an operator can reason about.
     ApplyFlag<Result> clear { nullptr };
+
+    /// The component this setting configures alone, or null for a setting every
+    /// configuration reads.
+    ///
+    /// A binary refuses a row naming one on a configuration that does not run that
+    /// component: the value would be accepted and reach nothing. Whether the operator
+    /// NAMED the setting is `NamesSetting`'s question, so a row carrying this also
+    /// carries an `explicitBit` or a `present`, which `TableIsWellFormed` requires.
+    OptionComponent<ConfigOf<Result>> const* component { nullptr };
+
+    /// Whether this row's field holds a value, for a field that is empty BY TYPE until
+    /// named (`PresentIn`), or null.
+    ///
+    /// Provenance for exactly the rows that need no `explicitBit`, and never a
+    /// comparison against a default: a default can be TYPED, and a comparison cannot see
+    /// the operator who typed it. `PresentIn` refuses to compile for a field whose type
+    /// cannot be empty (`EmptyByType`); a field that can be and is not EMPTY BY DEFAULT is
+    /// refused by the binary's default-configuration test instead, and carries the bit.
+    PresentFieldFn<Result> present { nullptr };
 };
 
 /// Check at compile time that a table says what it must.
@@ -271,6 +342,14 @@ template <typename Result>
     if (!fileRowsOk)
         return false;
 
+    // A row scoped to a component is refused when it was NAMED, so it must be able to
+    // say whether it was: by the bit the parse records, or by a field empty by type.
+    auto const componentRowsOk = std::ranges::all_of(table, [](OptionSpec<Result> const& spec) {
+        return spec.component == nullptr || spec.explicitBit != nullptr || spec.present != nullptr;
+    });
+    if (!componentRowsOk)
+        return false;
+
     auto const indices = std::views::iota(std::size_t { 0 }, table.size());
     return std::ranges::all_of(indices, [table, indices](std::size_t a) {
         return std::ranges::all_of(indices | std::views::drop(a + 1), [table, a](std::size_t b) {
@@ -281,6 +360,22 @@ template <typename Result>
                    && (table[a].yamlKey.empty() || table[a].yamlKey != table[b].yamlKey);
         });
     });
+}
+
+/// Whether @p cfg carries a value the operator gave for @p spec's setting.
+///
+/// The row's `explicitBit` where it has one, and otherwise its `present`: never the
+/// value compared against a default, which cannot see the operator who typed the default.
+/// @param spec The row.
+/// @param cfg The configuration to ask.
+/// @return True when the setting was named; false for a row that can say neither.
+template <typename Result>
+    requires std::same_as<Result, ConfigOf<Result>>
+[[nodiscard]] bool NamesSetting(OptionSpec<Result> const& spec, Result const& cfg)
+{
+    if (spec.explicitBit != nullptr)
+        return cfg.*spec.explicitBit;
+    return spec.present != nullptr && spec.present(cfg);
 }
 
 /// Build a ConfigError attributed to the command line.
@@ -411,6 +506,24 @@ template <auto Field>
 {
     return [](auto const& previous, auto const& candidate) -> bool {
         return previous.*Field == candidate.*Field;
+    };
+}
+
+/// A presence test for `OptionSpec::present`, over a field whose type can be empty.
+///
+/// Constrained on `EmptyByType`, so a `bool` or an enum does not compile with one. The
+/// field must also be empty by DEFAULT, which the type cannot say: see `EmptyByType`.
+/// @return The test, usable as an OptionSpec::present in a `constexpr` table.
+template <auto Field>
+    requires EmptyByType<typename MemberTypeOf<std::remove_cvref_t<decltype(Field)>>::type>
+[[nodiscard]] constexpr auto PresentIn() noexcept
+{
+    return [](auto const& cfg) -> bool {
+        auto const& value = TargetOf<Field>(cfg);
+        if constexpr (requires { value.empty(); })
+            return !value.empty();
+        else
+            return value.has_value();
     };
 }
 

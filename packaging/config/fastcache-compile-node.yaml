@@ -74,9 +74,11 @@
 # The full reasoning for each setting is in that help output.
 
 
-# the scheduler's --listen-node endpoint. Required: a worker nothing
+# the scheduler's --listen-node endpoint. Required of a worker: one nothing
 # knows about serves nobody. A list: each is tried in order, in the same
 # heartbeat, until one answers -- so a fleet survives retiring one machine.
+# On a node running no worker (slots: 0) it registers nothing and only names
+# where the --cluster-* and --enroll-* commands ask.
 #
 # Prefer a name that outlives any one machine -- a DNS name or a VIP you
 # control -- over a scheduler's literal address. Every worker in the fleet
@@ -133,7 +135,8 @@
 # enforced here: a worker that accepted more would be fuller and slower than
 # the scheduler believes, at the same moment. 0 runs NO worker: the node
 # surveys nothing, registers nothing and is never sent a compile -- a machine
-# that only schedules or caches.
+# that only schedules or caches. Until #1440 such a node's /metrics and history
+# still read 0 slots.
 #slots:
 
 # how hard this machine may be driven (default: workstation). A workstation

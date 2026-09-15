@@ -1761,10 +1761,17 @@ Six more about what the tier IS and who gets to see it:
   count on the machine an operator excluded. `RunsWorker` is the one predicate. Such a
   node surveys nothing, registers nothing and starts no heartbeat thread; its compile
   family is refused `DispatchNotPermitted`, the code the daemon already answers a
-  cordon with for the same fact, never `UnimplementedVerb`; and `--scheduler`,
-  `--toolchain` and `--no-toolchain-discovery` are refused on it by name. **Stated
-  loss:** it is a cluster member and not a fleet-page machine, since both the Machines
-  rows and the history handover ride worker registration (#1440).
+  cordon with for the same fact, never `UnimplementedVerb`. **A setting only the
+  worker reads names the worker in `NodeOptions()`'s `component` column, and ONE
+  generated rule refuses it on a node running none** -- never a `!RunsWorker(c) &&`
+  row per flag, and a rule ABOUT a worker carries the `scope` column rather than a
+  pasted `RunsWorker(c) &&`. Six such conjuncts were written by hand in the branch that
+  introduced them, and it dropped one (the reload widening rule). `--scheduler` is NOT
+  worker-only: `RunClusterAdmin` and `RunEnrollAdmin` read it, so a no-worker node keeps
+  it and registers nothing. **Stated loss:** it is a cluster member and not a
+  fleet-page machine, since both the Machines rows and the history handover ride
+  worker registration, and its `/metrics` and history read 0 slots rather than absent
+  (#1440).
 - **A store that will not open is always fatal; a port that will not bind is fatal
   only when the operator typed the address.** The two leave `CacheTier` through one
   `std::string`, so `StartCacheTierOrExplain` opens the store itself rather than

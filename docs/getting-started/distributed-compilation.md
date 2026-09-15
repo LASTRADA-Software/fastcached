@@ -233,10 +233,13 @@ different program.
 To keep a machine out of the work — a small always-on box, a VM whose cores belong
 to something else — give it **`--slots=0`**. It then runs no worker at all: it
 surveys no compilers, claims no scratch directory, registers nothing and is never
-sent a compile, so it takes no `--scheduler`, `--toolchain` or
-`--no-toolchain-discovery` either, and refuses to start if given one. What it can
-still run is the scheduler, consensus and a cache tier; a node running none of
-those is refused too.
+sent a compile, so a setting only a worker reads — `--toolchain` or `--node-class`,
+say — refuses to start it, by name. `--scheduler` it may keep: on such a node it
+registers nothing and only tells the `--cluster-*` and `--enroll-*` commands where
+to ask. What it can still run is the scheduler, consensus and a cache tier; a node
+running none of those is refused too. Until
+[#1440](https://github.com/LASTRADA-Software/fastcached/issues/1440) its `/metrics`
+and history still read 0 slots.
 
 ```sh
 fastcache-compile-node --serve-scheduler --slots=0 \

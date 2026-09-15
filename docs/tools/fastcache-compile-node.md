@@ -2179,8 +2179,12 @@ so zero means what it says. Such a node surveys no compilers, claims no scratch
 directory, registers with no scheduler and is never leased; `--node-status` reports it
 with no worker component and no slot figures, and a `--cordon` sent to it is refused
 as a node that runs no worker rather than as a verb its build does not know. It
-refuses to start with `--scheduler`, `--toolchain` or `--no-toolchain-discovery`,
-which only a worker reads, and when it would run nothing else either.
+refuses to start with any setting only a worker reads — `--toolchain`,
+`--allow-compile-arg` or `--drain-timeout`, say — and names the setting, and it
+refuses when it would run nothing else either. `--scheduler` is not among them: on
+such a node it registers nothing and only tells the `--cluster-*` and `--enroll-*`
+commands run on the machine where to ask. Until #1440 lands, its `/metrics` and
+history still read 0 slots rather than no worker.
 
 It is a cluster **member** when it runs consensus and not one of the fleet page's
 **machines**, which are built from worker registrations, and its own history is not

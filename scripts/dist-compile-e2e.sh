@@ -519,8 +519,15 @@ started_port=""
 start_node() {
     local tag="$1" host="$2" port="$3"
     shift 3
-    local log="${workdir}/${tag}.log" pid=""
-    "$node" "$stated_drain" --cluster-key-file="$cluster_key" \
+    local log="${workdir}/${tag}.log" pid="" arg=""
+    # The stated drain is a WORKER's setting, so a node running none (`--slots=0`,
+    # #206) is not handed it: it refuses a worker-only setting by name, and it has no
+    # compile to drain.
+    local drain=("$stated_drain")
+    for arg in ${@+"$@"}; do
+        if [ "$arg" = "--slots=0" ]; then drain=(); fi
+    done
+    "$node" ${drain[@]+"${drain[@]}"} --cluster-key-file="$cluster_key" \
         --listen-node="${host}:${port}" --advertise="${host}:${port}" \
         ${@+"$@"} > "$log" 2>&1 &
     pid=$!

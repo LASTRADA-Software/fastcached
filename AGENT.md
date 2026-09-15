@@ -344,7 +344,8 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
 - `--slots=0` means no WORKER, and `OfferableSlots` DERIVES from an absent count, so the flag
   reaches it only through `WorkerSlotsOf` -- a leak is a full worker on the excluded machine. Such a
   node registers nothing: a cluster member, not a fleet-page machine, handing over no history
-  (#1440).
+  (#1440). A worker-only setting is `NodeOptions()`'s `component` column and a worker rule is the
+  `scope` column -- never a pasted `RunsWorker(c) &&`. `--scheduler` is not worker-only.
 - What a node holds back from compiles is what its tier **built**, never what a flag asked for —
   so capacity is derived *below* the tier startup. Which tiers cost RAM is a column of
   `StorageTierTable`, and a present zero is *unbounded*, not nothing. A disk tier's key index is
