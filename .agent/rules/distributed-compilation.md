@@ -497,13 +497,42 @@ Consequences that are each load-bearing:
     - **Addition is dynamic; REMOVAL is the direction that fails open**
       ([#265](https://github.com/LASTRADA-Software/fastcached/issues/265),
       [#405](https://github.com/LASTRADA-Software/fastcached/issues/405)).
-      `AnyOfMembership` admits whoever ANY participant admits, so a host on both lists is
+      `AnyOfMembership` folds its participants, and a host on both lists is
       not revoked by `--cluster-forget`: that takes it out of the quorum and it keeps the
-      right to spend that machine's CPU and read its cache tier. Revoking it is a config
-      change on every node that lists it — which #265 recorded as needing a **restart**
-      and which is a **reload** since #405, `--fleet-member` and `--fleet-open` both
-      being `Reloadable::Yes` now. Under `--fleet-open` a forget still revokes nothing,
-      which is the flag working; dropping the flag and reloading is what closes the node.
+      right to spend that machine's CPU and read its cache tier. Revoking it that way is a
+      config change on every node that lists it — which #265 recorded as needing a
+      **restart** and which is a **reload** since #405, `--fleet-member` and
+      `--fleet-open` both being `Reloadable::Yes` now.
+      - **For a CLIENT that gap is closed, and by a different verb**
+        ([#1309](https://github.com/LASTRADA-Software/fastcached/issues/1309)).
+        `--cluster-forget` names a member *id*; `--cluster-forget-client` names a *host*
+        and records a TOMBSTONE, which is why it reaches a list consensus does not own.
+        `Membership` grew `Forgotten`, `PrecedenceOf` makes it outrank `Member`, and
+        `AnyOfMembership` folds on that precedence rather than admitting on `any_of` —
+        the old fold flattened every non-`Member` answer to `Outsider`, so a forget
+        reached no surface as itself and no counted refusal could fire. The safety
+        survived and the DISTINCTION did not, with nothing to warn anybody.
+      - **The forget reaches an open node too**, and that is a decision about what
+        `--fleet-open` MEANS: it says *I have not enumerated who may use this fleet* — a
+        blanket over hosts nobody named — and a forget names one. Letting the blanket win
+        would make a local flag resurrect a machine the cluster positively removed, on
+        exactly the node nobody has reconfigured yet. The directions are not comparable:
+        honouring the forget wrongly refuses a machine, fails closed, and is visible from
+        the refused end. A MEMBER forget still revokes nothing under the flag, because
+        there is no set to remove anybody from; dropping the flag and reloading is what
+        closes the node to everybody.
+      - **The tombstone is published from `PublishCluster` and never from `Adopt`.** A
+        forget is the cluster's fact, and a reload that rebuilt the participants from a
+        config file would erase every tombstone agreed since startup — #251's shape in
+        the one direction where the erasure fails open.
+      - **This machine is never forgotten.** `ForgottenVerdicts::onLoopback` is
+        `Outsider`, which is silence rather than an opinion. `Cluster::Validate` already
+        refuses a loopback host to `ForgetClient`, so the guard is never reached — a
+        reason it is never REACHED, not a reason to leave it out, because the consequence
+        is a node refusing the local builds it exists for, on every surface at once, with
+        nothing saying why. The refusal's own reason in `Validate` was corrected with it:
+        it said such a record decides nothing, which stopped being true the moment a
+        tombstone started outranking every admission route.
       - **The asymmetry did not go away, it moved.** Adding a member fails CLOSED: the
         machine is refused until the reload lands, which is annoying, self-healing and
         visible from the machine being refused. Removing one fails **OPEN**: a revoked
@@ -511,6 +540,24 @@ Consequences that are each load-bearing:
         is the ordinary case. Only the second is worth a live path, and it is the one a
         test naturally skips — so the acceptance is the removal, and the addition case
         is there only to stop a change that satisfies the easy half from passing.
+        - **It moved AGAIN with #1309's client forget, and the same asymmetry decides
+          what gets logged.** A member on a build predating the verbs skips the committed
+          entry by name: for `AdmitClient` that fails closed and the upgrade heals it, for
+          `ForgetClient` it fails open. So the forget warns at offer time and the admit is
+          SILENT, and that silence is what the case asserts — one that checked only that
+          the forget warns is green under an implementation warning on both, which trains
+          whoever reads the log to ignore the line that matters. The warning names no
+          members: a version string cannot say which builds implement a verb, and a model
+          of the fleet more permissive than the fleet produces confident wrong agreement,
+          so it states the consequence and sends the reader to the members' own logs,
+          where the skip is recorded with its index and verb byte.
+        - **The refusal is counted APART from a stranger's**, one counter for every
+          surface (`NodeRequestsRefusedHostForgotten`). A host an operator removed and a
+          host nobody ever listed are opposite diagnoses — one is to investigate, the
+          other is already decided and means the far end has not been told. One counter
+          and not six because the remedy is the host's, never the door's: split per
+          surface it would have to be summed by hand to answer the only question anybody
+          asks of it, and five of six would sit at zero looking like coverage.
       - **`NodeMembership` IS the oracle rather than handing one out, and that is what
         makes `--fleet-open` live at all.** Surfaces take an `IMembershipOracle const&`
         once, at construction, and hold it for their lifetime; an `Oracle()` returning

@@ -512,6 +512,34 @@ offending id, so a check covering it would make a member that reached replicated
 state through an older peer impossible to remove — and it would count towards
 quorum forever.
 
+**`--cluster-forget-client` is exempt for the same reason, and
+`--cluster-admit-client` is not.** The admit commits a host every renderer of the
+cluster's state prints, so it is checked where you are watching; the forget's operand
+is the offending host, and gating it would leave a client recorded by a peer that did
+not check it being served forever.
+
+### Admitting and forgetting a client
+
+A client — a laptop, a CI runner, anything running `fastcache-cc` — never joins
+consensus, so it has no member id. These two verbs take a **host**:
+
+```sh
+fastcache-compile-node --scheduler=scheduler.internal:6675 --cluster-admit-client=10.0.0.7
+fastcache-compile-node --scheduler=scheduler.internal:6675 --cluster-forget-client=10.0.0.7
+```
+
+A port is ignored: admission compares a host, because a client dials from an ephemeral
+one. The forget records a **tombstone** rather than erasing an entry, which is what lets
+it reach a node whose own `--fleet-member` list still names the machine — that list is
+per-node configuration and no membership change speaks for it. The refusal such a host
+then gets is counted as `fastcache_node_requests_refused_host_forgotten_total`, apart
+from a stranger's, because *a host you removed* and *a host nobody listed* are opposite
+diagnoses.
+
+A member on a build older than these verbs skips the committed entry and goes on serving
+the host, which the leader warns about at forget time; that member records the skip in
+its own log, naming the entry it did not apply.
+
 ## A cache of its own
 
 A node can hold a cache tier in front of the shared `fastcached`, and point the
