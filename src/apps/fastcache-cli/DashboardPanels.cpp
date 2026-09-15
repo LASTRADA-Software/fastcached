@@ -45,7 +45,7 @@ namespace
     };
 
     constexpr auto HitRateBeside = std::array {
-        BesideFigure { .key = "hit_rate_since_start",
+        BesideFigure { .key = "hit-rate-since-start",
                        .figure = { .field = GetHits,
                                    .other = GetMisses,
                                    .source = FigureSource::LevelRatio,
@@ -55,25 +55,25 @@ namespace
     };
 
     constexpr auto OpsBeside = std::array {
-        BesideFigure { .key = "get_per_sec",
+        BesideFigure { .key = "get-per-sec",
                        .before = "get",
                        .figure = { .field = CmdGet, .source = FigureSource::Rate, .format = FigureFormat::Rate },
                        .priority = Priority::Low },
-        BesideFigure { .key = "set_per_sec",
+        BesideFigure { .key = "set-per-sec",
                        .before = "set",
                        .figure = { .field = CmdSet, .source = FigureSource::Rate, .format = FigureFormat::Rate },
                        .priority = Priority::Low },
     };
 
     constexpr auto ConnsBeside = std::array {
-        BesideFigure { .key = "connections_accepted",
+        BesideFigure { .key = "connections-accepted",
                        .before = "accepted",
                        .figure = { .field = CounterField<Counter::ConnectionsTotal>(), .source = FigureSource::Level },
                        .priority = Priority::Low },
     };
 
     constexpr auto EvictionsBeside = std::array {
-        BesideFigure { .key = "evicted_unfetched_per_sec",
+        BesideFigure { .key = "evicted-unfetched-per-sec",
                        .before = "evicted unfetched",
                        .figure = { .field = StorageField<&StorageStats::evictedUnfetched>(),
                                    .suffix = "/s",
@@ -83,7 +83,7 @@ namespace
     };
 
     constexpr auto ExpiredBeside = std::array {
-        BesideFigure { .key = "expired_unfetched_per_sec",
+        BesideFigure { .key = "expired-unfetched-per-sec",
                        .before = "expired unfetched",
                        .figure = { .field = StorageField<&StorageStats::expiredUnfetched>(),
                                    .suffix = "/s",
@@ -94,29 +94,29 @@ namespace
 
     constexpr auto CacheRates = std::array {
         RateRow { .label = "hit rate",
-                  .key = "hit_rate",
+                  .key = "hit-rate",
                   .figure = HitRate,
                   .beside = HitRateBeside,
                   .priority = Priority::Essential },
         RateRow { .label = "ops/sec",
-                  .key = "ops_per_sec",
+                  .key = "ops-per-sec",
                   .figure = OpsPerSecond,
                   .beside = OpsBeside,
                   .priority = Priority::Essential },
         RateRow { .label = "conns/sec",
-                  .key = "conns_per_sec",
+                  .key = "conns-per-sec",
                   .figure = ConnsPerSecond,
                   .beside = ConnsBeside,
                   .priority = Priority::High },
         RateRow { .label = "evictions/s",
-                  .key = "evictions_per_sec",
+                  .key = "evictions-per-sec",
                   .figure = EvictionsPerSecond,
                   .beside = EvictionsBeside,
                   .priority = Priority::Normal },
         // §3's `expired/s`, over every expiry whichever path found it -- a lookup, a write or the cycle's sweep --
         // so the label says what the figure counts. The cycle's reclaims alone would understate it.
         RateRow { .label = "expired/s",
-                  .key = "expired_per_sec",
+                  .key = "expired-per-sec",
                   .figure = ExpiredPerSecond,
                   .beside = ExpiredBeside,
                   .priority = Priority::Normal },
@@ -137,10 +137,10 @@ namespace
         // The percentage outlasts the gauge beside it: the gauge is the same fact drawn, the
         // percentage is the fact.
         LevelRow { .label = "bytes",
-                   .key = "bytes_used",
+                   .key = "bytes-used",
                    .value = { .field = BytesUsed, .format = FigureFormat::Bytes },
                    .limit = FigureSpec { .field = BytesLimit, .format = FigureFormat::Bytes },
-                   .limitKey = "bytes_limit",
+                   .limitKey = "bytes-limit",
                    .priority = Priority::Essential,
                    .limitPriority = Priority::High,
                    .gaugePriority = Priority::Low },
@@ -152,22 +152,22 @@ namespace
                      .figure = { .field = StorageField<&StorageStats::itemCount>() },
                      .priority = Priority::Essential },
         TierColumn { .header = "used",
-                     .key = "bytes_used",
+                     .key = "bytes-used",
                      .figure = { .field = StorageField<&StorageStats::bytesUsed>(), .format = FigureFormat::Bytes },
                      .priority = Priority::High },
         TierColumn { .header = "limit",
-                     .key = "bytes_limit",
+                     .key = "bytes-limit",
                      .figure = { .field = StorageField<&StorageStats::bytesLimit>(), .format = FigureFormat::Bytes },
                      .priority = Priority::Normal },
         TierColumn { .header = "evict/s",
-                     .key = "evictions_per_sec",
+                     .key = "evictions-per-sec",
                      .figure = { .field = StorageField<&StorageStats::evictions>(),
                                  .source = FigureSource::Rate,
                                  .format = FigureFormat::Rate },
                      .priority = Priority::Low },
         // #175 made visible: a disk tier's key index is RAM no budget covers, so it outlasts evict/s.
         TierColumn { .header = "index (RAM)",
-                     .key = "index_bytes",
+                     .key = "index-bytes",
                      .figure = { .field = StorageField<&StorageStats::indexBytes>(), .format = FigureFormat::Bytes },
                      .priority = Priority::Normal },
     };
@@ -217,7 +217,7 @@ namespace
     // ---- node -------------------------------------------------------------------------------
 
     constexpr auto CompilesBeside = std::array {
-        BesideFigure { .key = "compiles_completed",
+        BesideFigure { .key = "compiles-completed",
                        .before = "completed",
                        .figure = { .field = CounterField<Counter::WorkerJobsCompleted>(), .source = FigureSource::Level },
                        .priority = Priority::Normal },
@@ -243,15 +243,15 @@ namespace
     };
 
     constexpr auto RefusalSplit = std::array {
-        BesideFigure { .key = "no_slot_per_min",
+        BesideFigure { .key = "no-slot-per-min",
                        .before = "no-slot",
                        .figure = RefusalsPerMinute<Counter::WorkerJobsRefusedNoSlot>(),
                        .priority = Priority::High },
-        BesideFigure { .key = "lease_expired_per_min",
+        BesideFigure { .key = "lease-expired-per-min",
                        .before = "lease-expired",
                        .figure = RefusalsPerMinute<Counter::WorkerJobsRefusedLeaseExpired>(),
                        .priority = Priority::Normal },
-        BesideFigure { .key = "unknown_fingerprint_per_min",
+        BesideFigure { .key = "unknown-fingerprint-per-min",
                        .before = "unknown-fingerprint",
                        .figure = RefusalsPerMinute<Counter::WorkerJobsRefusedUnknownFingerprint>(),
                        .priority = Priority::Normal },
@@ -286,14 +286,14 @@ namespace
 
     constexpr auto NodeRates = std::array {
         RateRow { .label = "compiles/min",
-                  .key = "compiles_per_min",
+                  .key = "compiles-per-min",
                   .figure = CompilesPerMinute,
                   .beside = CompilesBeside,
                   .priority = Priority::Essential },
         // A `_sum` over its `_count`: a MEAN and nothing else. No histogram exists, so no percentile
         // can be shown, and the row says so where somebody would look for one.
         RateRow { .label = "mean compile",
-                  .key = "mean_compile_seconds",
+                  .key = "mean-compile-seconds",
                   .figure = MeanCompile,
                   .note = "Δsum/Δcount over this interval; no histogram exists, so no p50/p95 can be shown",
                   .trend = Trend::None,
@@ -302,7 +302,7 @@ namespace
         // ONE total with its trend, and the split under it: each refusal has a different fix, so the total
         // is never drawn alone (§4). The total is the three counters' rates added, not a fourth counter.
         RateRow { .label = "refused/min",
-                  .key = "refused_per_min",
+                  .key = "refused-per-min",
                   .figure = RefusedPerMinute,
                   .split = RefusalSplit,
                   .priority = Priority::High },
@@ -328,16 +328,16 @@ namespace
     };
     // `6 in flight / 12 available / 16 registered`: every number a figure, so a piped stream carries each.
     constexpr auto SlotFigures = std::array {
-        BesideFigure { .key = "slots_in_flight",
+        BesideFigure { .key = "slots-in-flight",
                        .figure = { .field = HostField<&HostCapacity::busySlots>(), .format = FigureFormat::Count },
                        .after = "in flight /",
                        .priority = Priority::Essential },
-        BesideFigure { .key = "slots_available",
+        BesideFigure { .key = "slots-available",
                        .figure = { .source = FigureSource::SlotsAvailable, .format = FigureFormat::Count },
                        .after = "available /",
                        .lead = " ",
                        .priority = Priority::Essential },
-        BesideFigure { .key = "slots_registered",
+        BesideFigure { .key = "slots-registered",
                        .figure = { .field = HostField<&HostCapacity::configuredSlots>(), .format = FigureFormat::Count },
                        .after = "registered",
                        .lead = " ",
@@ -347,7 +347,7 @@ namespace
         std::array { FactCell { .label = "slots", .fact = StatusFact::Slots, .figures = SlotFigures } };
 
     constexpr auto CacheHits = std::array {
-        BesideFigure { .key = "cache_hit_rate",
+        BesideFigure { .key = "cache-hit-rate",
                        .before = "hits",
                        .figure = { .field = CounterField<Counter::NodeCacheHits>(),
                                    .other = CounterField<Counter::NodeCacheMisses>(),
@@ -355,13 +355,13 @@ namespace
                                    .format = FigureFormat::Percent },
                        .priority = Priority::High },
         // `2.00 GiB / 8.00 GiB  ████░░░░░░░░░░░░  25.0 %`: the node's cache, used against its limit.
-        BesideFigure { .key = "cache_used_bytes",
+        BesideFigure { .key = "cache-used-bytes",
                        .figure = { .field = StorageField<&StorageStats::bytesUsed>(), .format = FigureFormat::Bytes } },
-        BesideFigure { .key = "cache_limit_bytes",
+        BesideFigure { .key = "cache-limit-bytes",
                        .before = "/",
                        .figure = { .field = StorageField<&StorageStats::bytesLimit>(), .format = FigureFormat::Bytes },
                        .lead = " " },
-        BesideFigure { .key = "cache_fill_ratio",
+        BesideFigure { .key = "cache-fill-ratio",
                        .figure = { .field = StorageField<&StorageStats::bytesUsed>(),
                                    .other = StorageField<&StorageStats::bytesLimit>(),
                                    .source = FigureSource::LevelQuotient,
@@ -374,12 +374,12 @@ namespace
 
     // `cpu-busy 62.5 %   mem free 32.00 GiB   scratch free 41.8 GiB`: the figures the slot ceilings are made of.
     constexpr auto HostFigures = std::array {
-        BesideFigure { .key = "cpu_busy_ratio", .before = "cpu-busy", .figure = CpuBusy, .priority = Priority::High },
+        BesideFigure { .key = "cpu-busy-ratio", .before = "cpu-busy", .figure = CpuBusy, .priority = Priority::High },
         BesideFigure {
-            .key = "mem_free_bytes",
+            .key = "mem-free-bytes",
             .before = "mem free",
             .figure = { .field = HostLoadField<&HostLoadReading::availableMemoryBytes>(), .format = FigureFormat::Bytes } },
-        BesideFigure { .key = "scratch_free_bytes",
+        BesideFigure { .key = "scratch-free-bytes",
                        .before = "scratch free",
                        .figure = { .field = HostField<&HostCapacity::diskFreeBytes>(), .format = FigureFormat::Bytes },
                        .priority = Priority::Normal },
@@ -462,10 +462,10 @@ namespace
                                            .document = DocumentSpec {},
                                            .titleFacts = FleetTitle };
 
-    static_assert(PanelKeysAreWhole(CacheSpec), "every cache panel figure needs its own machine key");
-    static_assert(PanelKeysAreWhole(NodeSpec), "every node panel figure needs its own machine key");
+    static_assert(PanelKeysAreWhole(CacheSpec), "every cache panel figure needs its own kebab-case machine key");
+    static_assert(PanelKeysAreWhole(NodeSpec), "every node panel figure needs its own kebab-case machine key");
     // No figure rows today; asserted anyway, so a row added to it states its key like any other panel's.
-    static_assert(PanelKeysAreWhole(FleetSpec), "every fleet panel figure needs its own machine key");
+    static_assert(PanelKeysAreWhole(FleetSpec), "every fleet panel figure needs its own kebab-case machine key");
 
 } // namespace
 

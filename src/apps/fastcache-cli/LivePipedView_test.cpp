@@ -6,7 +6,10 @@
 #include <FastCache/Async/TestReactor.hpp>
 #include <FastCache/Cache/StorageTier.hpp>
 #include <FastCache/Core/Clock.hpp>
+#include <FastCache/Core/MachineName.hpp>
+#include <FastCache/Core/NumericText.hpp>
 #include <FastCache/Core/Ranges.hpp>
+#include <FastCache/Distributed/FleetView.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Metrics/StatsReading.hpp>
 
@@ -15,8 +18,11 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
+#include <format>
 #include <optional>
+#include <ranges>
 #include <span>
 #include <string>
 #include <string_view>
@@ -420,16 +426,20 @@ constexpr auto RatesUnnamedBeside =
 constexpr auto RatesRepeating =
     std::array { RateRow { .label = "a/s", .key = "a", .figure = WholeRate, .beside = BesideRepeating } };
 constexpr auto LevelsLimitNamed =
-    std::array { LevelRow { .label = "c", .key = "c", .value = WholeRate, .limit = WholeRate, .limitKey = "c_limit" } };
+    std::array { LevelRow { .label = "c", .key = "c", .value = WholeRate, .limit = WholeRate, .limitKey = "c-limit" } };
 constexpr auto LevelsRepeatingARate = std::array { LevelRow { .label = "c", .key = "b", .value = WholeRate } };
-// `<tier>_<key>` for `TiersNamed`'s column in each tier: a figure key a program could not tell apart.
+// `<tier>-<key>` for `TiersNamed`'s column in each tier: a figure key a program could not tell apart.
 constexpr auto LevelsNamingAMemoryTierFigure =
-    std::array { LevelRow { .label = "c", .key = "memory_a", .value = WholeRate } };
-constexpr auto LevelsNamingADiskTierFigure = std::array { LevelRow { .label = "c", .key = "disk_a", .value = WholeRate } };
+    std::array { LevelRow { .label = "c", .key = "memory-a", .value = WholeRate } };
+constexpr auto LevelsNamingADiskTierFigure = std::array { LevelRow { .label = "c", .key = "disk-a", .value = WholeRate } };
 constexpr auto LevelsLimitUnnamed =
     std::array { LevelRow { .label = "c", .key = "c", .value = WholeRate, .limit = WholeRate } };
 constexpr auto LevelsKeyWithoutLimit =
-    std::array { LevelRow { .label = "c", .key = "c", .value = WholeRate, .limitKey = "c_limit" } };
+    std::array { LevelRow { .label = "c", .key = "c", .value = WholeRate, .limitKey = "c-limit" } };
+// The spelling the piped keys had before #1445, beside kebab-case columns in the leader's fleet document.
+constexpr auto LevelsSnakeCased = std::array { LevelRow { .label = "c", .key = "cache_hit_rate", .value = WholeRate } };
+constexpr auto LevelsKebabCased = std::array { LevelRow { .label = "c", .key = "cache-hit-rate", .value = WholeRate } };
+constexpr auto TiersSnakeCased = std::array { TierColumn { .header = "items", .key = "bytes_used", .figure = WholeRate } };
 constexpr auto TiersNamed = std::array { TierColumn { .header = "items", .key = "a", .figure = WholeRate } };
 constexpr auto TiersUnnamed = std::array { TierColumn { .header = "items", .key = "", .figure = WholeRate } };
 constexpr auto TiersRepeating = std::array { TierColumn { .header = "items", .key = "items", .figure = WholeRate },
@@ -472,16 +482,48 @@ TEST_CASE("a panel names every figure once for a program and never by its label"
     STATIC_REQUIRE_FALSE(PanelKeysAreWhole(SpecOf(RatesNamed, LevelsNamingADiskTierFigure, TiersNamed)));
 }
 
+TEST_CASE("a panel key a program reads is kebab-case like the leader's fleet columns", "[cli][live][piped][figures]")
+{
+    // Asked at RUN time, on purpose: the panels' `static_assert` makes a snake key in a real panel a build failure, so
+    // only a planted key can show the predicate refusing. WHAT DISTINGUISHES: `cache_hit_rate` and `cache-hit-rate`
+    // differ in nothing but the spelling, and only the second is whole; a tier column is judged as the name it JOINS
+    // into, so a snake column key is refused though no key in the panel is spelled that way whole.
+    CHECK(PanelKeysAreWhole(SpecOf(RatesNamed, LevelsKebabCased, TiersNamed)));
+    CHECK_FALSE(PanelKeysAreWhole(SpecOf(RatesNamed, LevelsSnakeCased, TiersNamed)));
+    CHECK_FALSE(PanelKeysAreWhole(SpecOf(RatesNamed, LevelsKebabCased, TiersSnakeCased)));
+    CHECK(PanelKeysAreWhole(CachePanel()));
+    CHECK(PanelKeysAreWhole(NodePanel()));
+    CHECK(PanelKeysAreWhole(FleetPanel()));
+
+    // And through the one refusal the leader's fleet tables use: a camelCase key planted in ONE panel's names is
+    // refused naming THAT panel. The control is that the panels' own names pass, the joined tier names among them.
+    auto const panels = std::vector<MachineNameTable> { PanelMachineNames("cache panel", CachePanel()),
+                                                        PanelMachineNames("node panel", NodePanel()),
+                                                        PanelMachineNames("fleet panel", FleetPanel()) };
+    CHECK(MisspelledMachineName(panels) == std::nullopt);
+    CHECK(std::ranges::find(panels[0].names, "memory-bytes-used") != panels[0].names.end());
+    CHECK(std::ranges::find(panels[1].names, "cpu-busy-ratio") != panels[1].names.end());
+    for (auto const index: std::views::iota(std::size_t { 0 }, panels.size()))
+    {
+        auto planted = panels;
+        planted[index].names.emplace_back("plantedCamelCase");
+        auto const refusal = MisspelledMachineName(planted);
+        INFO("planted in " << planted[index].table);
+        REQUIRE(refusal.has_value());
+        CHECK(Unwrap(refusal).contains(std::format("table `{}`", planted[index].table)));
+    }
+}
+
 TEST_CASE("a tier figure's machine name is the tier and the column key joined, and nothing else is",
           "[cli][live][piped][figures]")
 {
-    CHECK(TierFigureKey("disk", "bytes_used") == "disk_bytes_used");
-    CHECK(IsTierFigureKey(TierFigureKey("disk", "bytes_used"), "disk", "bytes_used"));
-    CHECK_FALSE(IsTierFigureKey("disk_bytes_used", "disk", "bytes"));
-    CHECK_FALSE(IsTierFigureKey("disk_bytes_used", "memory", "bytes_used"));
-    CHECK_FALSE(IsTierFigureKey("diskXbytes_used", "disk", "bytes_used"));
-    CHECK_FALSE(IsTierFigureKey("bytes_used_disk", "disk", "bytes_used"));
-    CHECK_FALSE(IsTierFigureKey("disk_x_bytes_used", "disk", "bytes_used"));
+    CHECK(TierFigureKey("disk", "bytes-used") == "disk-bytes-used");
+    CHECK(IsTierFigureKey(TierFigureKey("disk", "bytes-used"), "disk", "bytes-used"));
+    CHECK_FALSE(IsTierFigureKey("disk-bytes-used", "disk", "bytes"));
+    CHECK_FALSE(IsTierFigureKey("disk-bytes-used", "memory", "bytes-used"));
+    CHECK_FALSE(IsTierFigureKey("diskXbytes-used", "disk", "bytes-used"));
+    CHECK_FALSE(IsTierFigureKey("bytes-used-disk", "disk", "bytes-used"));
+    CHECK_FALSE(IsTierFigureKey("disk-x-bytes-used", "disk", "bytes-used"));
 }
 
 TEST_CASE("a piped cache and node stream name exactly the figures their panels draw", "[cli][live][piped][figures]")
@@ -491,39 +533,39 @@ TEST_CASE("a piped cache and node stream name exactly the figures their panels d
     auto const model = DashboardModel {};
     CHECK(NamesOf(CacheFigures(model))
           == std::vector<std::string> { "source",
-                                        "hit_rate",
-                                        "hit_rate_since_start",
-                                        "ops_per_sec",
-                                        "get_per_sec",
-                                        "set_per_sec",
-                                        "conns_per_sec",
-                                        "connections_accepted",
-                                        "evictions_per_sec",
-                                        "evicted_unfetched_per_sec",
-                                        "expired_per_sec",
-                                        "expired_unfetched_per_sec",
+                                        "hit-rate",
+                                        "hit-rate-since-start",
+                                        "ops-per-sec",
+                                        "get-per-sec",
+                                        "set-per-sec",
+                                        "conns-per-sec",
+                                        "connections-accepted",
+                                        "evictions-per-sec",
+                                        "evicted-unfetched-per-sec",
+                                        "expired-per-sec",
+                                        "expired-unfetched-per-sec",
                                         "items",
-                                        "bytes_used",
-                                        "bytes_limit" });
+                                        "bytes-used",
+                                        "bytes-limit" });
     CHECK(NamesOf(NodeFigures(model))
           == std::vector<std::string> { "source",
-                                        "compiles_per_min",
-                                        "compiles_completed",
-                                        "mean_compile_seconds",
-                                        "refused_per_min",
-                                        "no_slot_per_min",
-                                        "lease_expired_per_min",
-                                        "unknown_fingerprint_per_min",
-                                        "slots_in_flight",
-                                        "slots_available",
-                                        "slots_registered",
-                                        "cache_hit_rate",
-                                        "cache_used_bytes",
-                                        "cache_limit_bytes",
-                                        "cache_fill_ratio",
-                                        "cpu_busy_ratio",
-                                        "mem_free_bytes",
-                                        "scratch_free_bytes" });
+                                        "compiles-per-min",
+                                        "compiles-completed",
+                                        "mean-compile-seconds",
+                                        "refused-per-min",
+                                        "no-slot-per-min",
+                                        "lease-expired-per-min",
+                                        "unknown-fingerprint-per-min",
+                                        "slots-in-flight",
+                                        "slots-available",
+                                        "slots-registered",
+                                        "cache-hit-rate",
+                                        "cache-used-bytes",
+                                        "cache-limit-bytes",
+                                        "cache-fill-ratio",
+                                        "cpu-busy-ratio",
+                                        "mem-free-bytes",
+                                        "scratch-free-bytes" });
 
     // A header is a promise about every row under it, so no two columns may share a name.
     for (auto const& names: { NamesOf(CacheFigures(model)), NamesOf(NodeFigures(model)) })
@@ -538,8 +580,8 @@ TEST_CASE("a piped node row carries the slots, cache fill and load its panel dra
           "[cli][live][piped][figures]")
 {
     // The numbers the node panel's fact lines state are its figures, so a script reads the same ones. WHAT
-    // DISTINGUISHES: `slots_available` is the scheduler's ceiling (12 of 16, bound by somebody else's CPU), which needs
-    // two adjacent readings, as does `cpu_busy_ratio`; both are absent on the first row while the levels are not.
+    // DISTINGUISHES: `slots-available` is the scheduler's ceiling (12 of 16, bound by somebody else's CPU), which needs
+    // two adjacent readings, as does `cpu-busy-ratio`; both are absent on the first row while the levels are not.
     std::vector<DashboardEvent> script;
     AddSample(script, 1, NodeAt(1));
     AddSample(script, 3, NodeAt(2));
@@ -557,17 +599,17 @@ TEST_CASE("a piped node row carries the slots, cache fill and load its panel dra
         return row[static_cast<std::size_t>(found - header.begin())];
     };
 
-    CHECK(cell(first, "slots_in_flight") == "6");
-    CHECK(cell(first, "slots_registered") == "16");
-    CHECK(cell(first, "slots_available").empty());
-    CHECK(cell(first, "cpu_busy_ratio").empty());
-    CHECK(cell(first, "mem_free_bytes") == "34359738368");
-    CHECK(cell(first, "cache_used_bytes") == "2147483648");
-    CHECK(cell(first, "cache_limit_bytes") == "8589934592");
-    CHECK(cell(first, "cache_fill_ratio") == "0.2500");
+    CHECK(cell(first, "slots-in-flight") == "6");
+    CHECK(cell(first, "slots-registered") == "16");
+    CHECK(cell(first, "slots-available").empty());
+    CHECK(cell(first, "cpu-busy-ratio").empty());
+    CHECK(cell(first, "mem-free-bytes") == "34359738368");
+    CHECK(cell(first, "cache-used-bytes") == "2147483648");
+    CHECK(cell(first, "cache-limit-bytes") == "8589934592");
+    CHECK(cell(first, "cache-fill-ratio") == "0.2500");
 
-    CHECK(cell(second, "slots_available") == "12");
-    CHECK(cell(second, "cpu_busy_ratio") == "0.6250");
+    CHECK(cell(second, "slots-available") == "12");
+    CHECK(cell(second, "cpu-busy-ratio") == "0.6250");
 }
 
 TEST_CASE("a piped cache row reports the panel's figures unformatted, absent until a rate can be taken",
@@ -595,20 +637,20 @@ TEST_CASE("a piped cache row reports the panel's figures unformatted, absent unt
 
     // One reading has no interval: every rate is absent -- never 0, which would claim a server that
     // did nothing -- while what was read as a level is there.
-    CHECK(cell(first, "hit_rate").empty());
-    CHECK(cell(first, "ops_per_sec").empty());
-    CHECK(cell(first, "hit_rate_since_start") == "0.9000");
-    CHECK(cell(first, "bytes_used") == "4096");
-    CHECK(cell(first, "bytes_limit") == "8192");
+    CHECK(cell(first, "hit-rate").empty());
+    CHECK(cell(first, "ops-per-sec").empty());
+    CHECK(cell(first, "hit-rate-since-start") == "0.9000");
+    CHECK(cell(first, "bytes-used") == "4096");
+    CHECK(cell(first, "bytes-limit") == "8192");
     // A level the reading carries is its number, and a counter it does not carry is absent rather than zero.
     CHECK(cell(first, "items") == "12");
-    CHECK(cell(first, "conns_per_sec").empty());
+    CHECK(cell(first, "conns-per-sec").empty());
 
     // Over two seconds: 90 hits of 100 lookups, and 500 commands.
-    CHECK(cell(second, "hit_rate") == "0.9000");
-    CHECK(cell(second, "ops_per_sec") == "250.000");
-    CHECK(cell(second, "bytes_used") == "5120");
-    CHECK(cell(second, "conns_per_sec").empty());
+    CHECK(cell(second, "hit-rate") == "0.9000");
+    CHECK(cell(second, "ops-per-sec") == "250.000");
+    CHECK(cell(second, "bytes-used") == "5120");
+    CHECK(cell(second, "conns-per-sec").empty());
 }
 
 TEST_CASE("a piped cache header waits for a successful reading and names exactly the tiers it carried",
@@ -630,28 +672,28 @@ TEST_CASE("a piped cache header waits for a successful reading and names exactly
     // After the panel's own fifteen, tier by tier in `StorageTierTable` order, column by column.
     REQUIRE(header.size() == 25);
     CHECK(std::vector<std::string>(header.begin() + 15, header.end())
-          == std::vector<std::string> { "memory_items",
-                                        "memory_bytes_used",
-                                        "memory_bytes_limit",
-                                        "memory_evictions_per_sec",
-                                        "memory_index_bytes",
-                                        "disk_items",
-                                        "disk_bytes_used",
-                                        "disk_bytes_limit",
-                                        "disk_evictions_per_sec",
-                                        "disk_index_bytes" });
+          == std::vector<std::string> { "memory-items",
+                                        "memory-bytes-used",
+                                        "memory-bytes-limit",
+                                        "memory-evictions-per-sec",
+                                        "memory-index-bytes",
+                                        "disk-items",
+                                        "disk-bytes-used",
+                                        "disk-bytes-limit",
+                                        "disk-evictions-per-sec",
+                                        "disk-index-bytes" });
     CHECK(first.size() == header.size());
     CHECK(second.size() == header.size());
 
-    CHECK(CellUnder(header, first, "memory_items") == "10");
-    CHECK(CellUnder(header, first, "disk_bytes_used") == "1000");
+    CHECK(CellUnder(header, first, "memory-items") == "10");
+    CHECK(CellUnder(header, first, "disk-bytes-used") == "1000");
     // A figure one reading cannot state -- a rate, before a second reading -- is absent, never zero; a tier's
     // stated limit of zero is a reading, and reads as one.
-    CHECK(CellUnder(header, first, "disk_evictions_per_sec").empty());
-    CHECK(CellUnder(header, first, "disk_bytes_limit") == "0");
+    CHECK(CellUnder(header, first, "disk-evictions-per-sec").empty());
+    CHECK(CellUnder(header, first, "disk-bytes-limit") == "0");
     // A tier the header named that a later reading lacks is absent under its heading.
-    CHECK(CellUnder(header, second, "memory_items") == "20");
-    CHECK(CellUnder(header, second, "disk_items").empty());
+    CHECK(CellUnder(header, second, "memory-items") == "20");
+    CHECK(CellUnder(header, second, "disk-items").empty());
 }
 
 TEST_CASE("a tier that first appears after the piped header gains no column", "[cli][live][piped][figures]")
@@ -664,8 +706,88 @@ TEST_CASE("a tier that first appears after the piped header gains no column", "[
     REQUIRE(lines.size() == 3);
     auto const header = Fields(lines[0]);
     CHECK(header.size() == 20);
-    CHECK(header.back() == "memory_index_bytes");
-    CHECK(std::ranges::none_of(header, [](std::string const& name) { return name.starts_with("disk_"); }));
+    CHECK(header.back() == "memory-index-bytes");
+    CHECK(std::ranges::none_of(header, [](std::string const& name) { return name.starts_with("disk-"); }));
     CHECK(Fields(lines[2]).size() == header.size());
-    CHECK(CellUnder(header, Fields(lines[2]), "memory_items") == "20");
+    CHECK(CellUnder(header, Fields(lines[2]), "memory-items") == "20");
+}
+
+TEST_CASE("every share a machine reads is a fraction in 0..1, on all three subjects", "[cli][live][piped][figures][scale]")
+{
+    // #1445's acceptance. A share -- a hit rate, a fill, cpu-busy -- was written in three scales with
+    // no unit in any header: the node and cache panels wrote `0.7403`, the leader's fleet tables wrote
+    // `853`, and the series section wrote a fraction again. A script reading two subjects compared 853
+    // with 0.74 and nothing anywhere said which was which.
+    //
+    // WHAT DISTINGUISHES: the bound. A case asserting a share is *written* passes under every one of
+    // those three spellings; only `0 <= v <= 1` separates a fraction from a per-mille, and it separates
+    // them for EVERY share rather than the one somebody thought to pin.
+    //
+    // Derived from the panels rather than a list: `ForEachShareKey` walks the same blocks as
+    // `ForEachFigureKey`, so a share in a block a list forgot is still asked about here.
+    auto const shareKeysOf = [](PanelSpec const& panel) {
+        std::vector<std::string_view> keys;
+        ForEachShareKey(panel, [&keys](std::string_view key) { keys.push_back(key); });
+        return keys;
+    };
+
+    // The control first: a walk that found no share would make every check below vacuous, and that is
+    // exactly how this case would rot if a panel's formats were reworked.
+    auto const cacheShares = shareKeysOf(CachePanel());
+    auto const nodeShares = shareKeysOf(NodePanel());
+    REQUIRE_FALSE(cacheShares.empty());
+    REQUIRE_FALSE(nodeShares.empty());
+
+    // 90 hits of 100 lookups, twice, so every rate has an interval to be taken over: a known share of
+    // exactly 0.9, which is `0.9000` as a fraction and would be `900` as a per-mille.
+    std::vector<DashboardEvent> script;
+    AddSample(script, 1, CacheAt(90, 10, 1000, 4096));
+    AddSample(script, 3, CacheAt(180, 20, 1500, 5120));
+    auto const lines = Lines(Stream(std::move(script), OutputFormat::Tsv, {}, std::nullopt, &CacheFigures));
+    REQUIRE(lines.size() == 3);
+    auto const header = Fields(lines[0]);
+    auto const row = Fields(lines[2]);
+    REQUIRE(row.size() == header.size());
+
+    auto const inUnitRange = [](std::string const& text) {
+        auto value = 0.0;
+        REQUIRE(ParseFiniteDouble(text, value));
+        INFO("value " << text);
+        CHECK(value >= 0.0);
+        CHECK(value <= 1.0);
+    };
+
+    auto asked = 0U;
+    for (auto const key: cacheShares)
+    {
+        auto const found = std::ranges::find(header, key);
+        if (found == header.end())
+            continue; // A figure this panel draws that this reading did not carry.
+        auto const& cell = row[static_cast<std::size_t>(found - header.begin())];
+        if (cell.empty())
+            continue; // Absent stays absent; a share nobody could compute is not a share out of range.
+        inUnitRange(cell);
+        ++asked;
+    }
+    // Absence of a failure is not the presence of a check: a run where every share happened to be
+    // absent would pass every line above without testing anything.
+    CHECK(asked > 0);
+    CHECK(row[static_cast<std::size_t>(std::ranges::find(header, "hit-rate") - header.begin())] == "0.9000");
+
+    // And the leader's own documents, which are the surface that carried the per-mille. `HitRateOf`
+    // computes 3 of 4 as the fraction it is; `750` is what this asserted against before #1445.
+    auto snapshot = Distributed::FleetSnapshot {};
+    snapshot.role = Distributed::SchedulerRole::Leader;
+    snapshot.nodes.push_back(Distributed::NodeReport {});
+    snapshot.nodes.front().endpoint = "build-01:7070";
+    snapshot.nodes.front().load.cache.hits = 3;
+    snapshot.nodes.front().load.cache.misses = 1;
+
+    auto const json = Distributed::RenderFleetJson(snapshot, Distributed::FleetHistoryView {});
+    CHECK(json.contains(R"("cache-hit-rate":0.7500)"));
+    CHECK_FALSE(json.contains(R"("cache-hit-rate":750)"));
+
+    // The document says which generation it is, because the meaning of that value changed rather than
+    // its shape: a reader that does not know cannot tell 0.75 from a hit rate of under one percent.
+    CHECK(json.contains(std::format(R"("schema":{})", Distributed::FleetJsonSchema)));
 }

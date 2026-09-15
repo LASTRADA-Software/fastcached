@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Cache/StorageTier.hpp>
 #include <FastCache/Core/Clock.hpp>
+#include <FastCache/Core/MachineName.hpp>
 #include <FastCache/Core/Ranges.hpp>
 #include <FastCache/Core/Utf8.hpp>
 #include <FastCache/Distributed/FleetChart.hpp>
@@ -301,13 +302,19 @@ TEST_CASE("Outstanding leases are listed, and the truncation is visible", "[dist
     CHECK(json.contains(R"("age":90000)"));
 }
 
-TEST_CASE("The page writes a figure as every human surface does, and the text and the JSON keep the integer",
+TEST_CASE("The page writes a figure as every human surface does; a count stays whole and a share is a fraction",
           "[distributed][fleetview][units]")
 {
     // One writer per scale (`HumanFleetFigure` over `WriteFigure`), shared with the terminal fleet panel.
-    // WHAT DISTINGUISHES: the page's memory cell is exactly the shared writer's `93.65 GiB` and its CPU
-    // cell `71.5 %` -- a page keeping a byte formatter of its own draws `93.6 GiB` beside the panel's
-    // `93.65 GiB` -- while `/fleet.txt` and `/fleet.json` carry `100552671232` and `715` untouched.
+    // The page's memory cell is exactly the shared writer's `93.65 GiB` and its CPU cell `71.5 %` -- a page
+    // keeping a byte formatter of its own draws `93.6 GiB` beside the panel's `93.65 GiB`.
+    //
+    // WHAT DISTINGUISHES, and it is the PAIR rather than either half: the machine surfaces carry a byte
+    // count as the integer it is and a share as the FRACTION it is. This case asserted `715` for the share
+    // until #1445 -- a per-mille integer, read by scripts that also read a fraction from the CLI's piped
+    // output, with no unit in either header. Asserting only the fraction would pass under a change that
+    // made every cell fractional and turned a byte count into `1.005526712320e11`; asserting only the
+    // count is what this case used to do, and it passed throughout the defect.
     auto snapshot = LeadingSnapshot();
     snapshot.nodes.front().capacity.totalMemoryBytes = 100552671232ULL;
     snapshot.nodes.front().load.cpuBusyPermille = 715;
@@ -317,11 +324,18 @@ TEST_CASE("The page writes a figure as every human surface does, and the text an
     CHECK(html.contains(">71.5 %<"));
     CHECK(HumanFleetFigure(100552671232ULL, CellFormat::Bytes) == "93.65 GiB");
 
+    // A person reads the same percentage, from the fraction the cell now carries.
+    CHECK(HumanShareFigure(0.715) == "71.5 %");
+
     auto const text = RenderFleetText(snapshot, NoHistory(), FleetSection::Machines);
     CHECK(text.contains("\t100552671232\t"));
-    CHECK(text.contains("\t715\t"));
+    CHECK(text.contains("\t0.7150\t"));
+    CHECK_FALSE(text.contains("\t715\t"));
     CHECK_FALSE(text.contains("GiB"));
-    CHECK(RenderFleetJson(snapshot, NoHistory()).contains(":100552671232"));
+
+    auto const json = RenderFleetJson(snapshot, NoHistory());
+    CHECK(json.contains(":100552671232"));
+    CHECK(json.contains(":0.7150"));
 }
 
 TEST_CASE("A complete lease listing does not claim to be truncated", "[distributed][fleetview]")
@@ -446,6 +460,44 @@ TEST_CASE("Every column a section renders states how long a narrow surface keeps
     CHECK_FALSE(FleetColumnKeep(FleetSection::Kpi, "value").has_value());
 }
 
+TEST_CASE("Every name a fleet document gives a program is kebab-case, and a misspelled one is refused naming its table",
+          "[distributed][fleetview][names]")
+{
+    // Each table `static_assert`s its own spelling, which can only be watched refusing by breaking the build; this is
+    // the run-time half, over the walk derived from the same tables (#1445). WHAT DISTINGUISHES: a camelCase name
+    // planted in ONE table is refused and the refusal names THAT table -- a check that looked at three of the
+    // tables would pass the plants in the other two, and one that refused without saying where would pass none.
+    auto const tables = FleetMachineNameTables();
+    CHECK(MisspelledMachineName(tables) == std::nullopt);
+
+    // The control: every source of names is walked, the composed tier names among them, and none is empty.
+    auto sources = std::vector<std::string_view> {};
+    for (auto const& table: tables)
+    {
+        INFO("table " << table.table);
+        CHECK_FALSE(table.names.empty());
+        sources.push_back(table.table);
+    }
+    for (auto const& row: FleetSectionTable)
+        CHECK(std::ranges::find(sources, row.key) != sources.end());
+    for (auto const source: std::array<std::string_view, 3> { "fleet-sections", "kpi-keys", "lease-outcomes" })
+        CHECK(std::ranges::find(sources, source) != sources.end());
+    auto const* const tiers = FindIfOrNull(tables, [](MachineNameTable const& table) { return table.table == "tiers"; });
+    REQUIRE(tiers != nullptr);
+    CHECK(std::ranges::find(tiers->names, "disk-index-ram") != tiers->names.end());
+
+    for (auto const index: std::views::iota(std::size_t { 0 }, tables.size()))
+    {
+        auto planted = tables;
+        planted[index].names.emplace_back("plantedCamelCase");
+        auto const refusal = MisspelledMachineName(planted);
+        INFO("planted in " << planted[index].table);
+        REQUIRE(refusal.has_value());
+        CHECK(Unwrap(refusal).contains(std::format("table `{}`", planted[index].table)));
+        CHECK(Unwrap(refusal).contains("`plantedCamelCase`"));
+    }
+}
+
 TEST_CASE("An age's tone is one threshold, asked by the page and every other surface", "[distributed][fleetview][tone]")
 {
     // #134 F9. WHAT DISTINGUISHES: the boundary itself, on both sides, for both age columns -- a lease
@@ -551,7 +603,7 @@ TEST_CASE("A cache serving no reads has no hit rate rather than a rate of zero",
 
     snapshot.nodes[0].load.cache.hits = 750;
     snapshot.nodes[0].load.cache.misses = 250;
-    CHECK(RenderFleetJson(snapshot, NoHistory()).contains(R"("cache-hit-rate":750)"));
+    CHECK(RenderFleetJson(snapshot, NoHistory()).contains(R"("cache-hit-rate":0.7500)"));
 }
 
 TEST_CASE("A tier's key index is reported as the RAM it is", "[distributed][fleetview][storage-tier]")
@@ -1286,7 +1338,7 @@ TEST_CASE("The headline figures travel as numbers rather than as the page's labe
     CHECK(json.contains(R"("of":)"));
     // The scale travels too: the key alone cannot say whether a hit rate of 853 is a
     // count or eight-hundred-and-fifty-three thousandths.
-    CHECK(json.contains(R"("unit":"permille")"));
+    CHECK(json.contains(R"("unit":"share")"));
     CHECK(json.contains(R"("unit":"milliseconds")"));
 }
 

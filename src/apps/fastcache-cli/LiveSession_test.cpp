@@ -1635,8 +1635,8 @@ TEST_CASE("a piped live-stats session runs to its budget, drains, and exits with
     auto const stream = seat.Stream();
     CHECK(std::ranges::count(stream, '\n') == 2);
     // The cache panel's figures, named as the panel labels them.
-    CHECK(stream.starts_with("source\thit_rate\t"));
-    CHECK(stream.contains("\tbytes_limit\n"));
+    CHECK(stream.starts_with("source\thit-rate\t"));
+    CHECK(stream.contains("\tbytes-limit\n"));
     // The row is the subscription's.
     CHECK(stream.contains(std::format("\n{}\t", SubscriptionSource)));
     CHECK((seat.source.has_value() && seat.source->IsDrained()));

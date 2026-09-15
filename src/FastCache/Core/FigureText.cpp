@@ -119,11 +119,36 @@ namespace
 
     static_assert(RowsInEnumeratorOrder(FigureFormatTable, &FigureFormatSpec::format),
                   "FigureFormatTable must hold one row per FigureFormat, in enumerator order");
+
+    /// How one figure format is written for a program rather than a person.
+    struct MachineFigureRow
+    {
+        FigureFormat format; ///< The enumerator this row describes.
+        int decimals;        ///< How many digits follow the decimal point; zero writes no point at all.
+    };
+
+    /// One row per `FigureFormat`, in enumerator order: whole numbers stay whole, and a share keeps the digits
+    /// its page percentage is drawn from and one more.
+    constexpr EnumTable<FigureFormat, MachineFigureRow> MachineFigureTable { {
+        { .format = FigureFormat::Count, .decimals = 0 },
+        { .format = FigureFormat::Rate, .decimals = 3 },
+        { .format = FigureFormat::Percent, .decimals = 4 },
+        { .format = FigureFormat::Bytes, .decimals = 0 },
+        { .format = FigureFormat::Seconds, .decimals = 3 },
+    } };
+
+    static_assert(RowsInEnumeratorOrder(MachineFigureTable, &MachineFigureRow::format),
+                  "MachineFigureTable must hold one row per FigureFormat, in enumerator order");
 } // namespace
 
 WrittenFigure WriteFigure(double value, FigureFormat format)
 {
     return FigureFormatTable[static_cast<std::size_t>(format)].write(value);
+}
+
+std::string WriteMachineFigure(double value, FigureFormat format)
+{
+    return std::format("{:.{}f}", value, MachineFigureTable[static_cast<std::size_t>(format)].decimals);
 }
 
 } // namespace FastCache

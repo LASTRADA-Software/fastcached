@@ -2,6 +2,8 @@
 #include <FastCache/Cli/Duration.hpp>
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/FigureText.hpp>
+#include <FastCache/Core/MachineName.hpp>
+#include <FastCache/Core/NumericText.hpp>
 #include <FastCache/Core/Ranges.hpp>
 #include <FastCache/Distributed/FleetChart.hpp>
 #include <FastCache/Distributed/FleetText.hpp>
@@ -54,11 +56,30 @@ namespace
         {
             Absent = 0,
             Number,
+            /// A share in 0..1, carried as the fraction it is (#1445).
+            ///
+            /// **A fourth kind rather than a scaled `Number`**, which is what this was:
+            /// a share travelled as an integer per-mille because `number` is integral,
+            /// and the scale then had to be undone somewhere. It was undone on the
+            /// human side and NOT on the machine side, so `/fleet.json` and
+            /// `/fleet.txt` published `853` where the CLI's own piped output published
+            /// `0.7403` for the same kind of figure -- one concept, two scales, no unit
+            /// in either header.
+            ///
+            /// Dividing at emission instead would fix the scale and keep a lie: a true
+            /// share of 1/3 reaches an integer per-mille as `333` and comes back as
+            /// `0.3330`, whose last digit is wrong rather than absent. The carrier has
+            /// to hold what was measured.
+            Share,
             Text,
         };
 
         Kind kind { Kind::Absent };
         std::uint64_t number { 0 };
+        /// Meaningful for `Share` alone. Not folded into `number`: a byte count needs
+        /// all 64 bits and a `double` carries 53 exactly, so one field for both would
+        /// trade a silent rounding of large caches for a tidier struct.
+        double share { 0.0 };
         std::string text {};
 
         [[nodiscard]] static FleetCell Nothing() noexcept
@@ -67,11 +88,18 @@ namespace
         }
         [[nodiscard]] static FleetCell Of(std::uint64_t value) noexcept
         {
-            return FleetCell { .kind = Kind::Number, .number = value, .text = {} };
+            return FleetCell { .kind = Kind::Number, .number = value, .share = 0.0, .text = {} };
         }
         [[nodiscard]] static FleetCell Of(std::string value)
         {
-            return FleetCell { .kind = Kind::Text, .number = 0, .text = std::move(value) };
+            return FleetCell { .kind = Kind::Text, .number = 0, .share = 0.0, .text = std::move(value) };
+        }
+        /// A share, as the fraction it was measured as.
+        /// @param value The share in 0..1.
+        /// @return The cell.
+        [[nodiscard]] static FleetCell OfShare(double value) noexcept
+        {
+            return FleetCell { .kind = Kind::Share, .number = 0, .share = value, .text = {} };
         }
         /// An optional's value, or the absence it already carries.
         template <typename T>
@@ -221,6 +249,8 @@ namespace
             return std::string { AbsentText };
         if (cell.kind == FleetCell::Kind::Text)
             return EscapeHtml(cell.text);
+        if (cell.kind == FleetCell::Kind::Share)
+            return EscapeHtml(HumanShareFigure(cell.share));
         // Through the one writer the terminal fleet panel uses too, so a figure reads the same on both.
         return EscapeHtml(HumanFleetFigure(cell.number, format));
     }
@@ -235,6 +265,9 @@ namespace
                 break;
             case FleetCell::Kind::Number:
                 out += std::format("{}", cell.number);
+                break;
+            case FleetCell::Kind::Share:
+                out += WriteMachineFigure(cell.share, FigureFormat::Percent);
                 break;
             case FleetCell::Kind::Text:
                 AppendJsonString(out, cell.text);
@@ -254,7 +287,11 @@ namespace
         auto const total = *cache.hits + *cache.misses;
         if (total == 0)
             return FleetCell::Nothing();
-        return FleetCell::Of(static_cast<std::uint64_t>((*cache.hits * 1000) / total));
+        // The fraction as measured. `(hits * 1000) / total` in integers is what this was,
+        // and it discarded the precision at the ONE place that had it: 3 hits of 4 became
+        // `750`, which no reader could turn back into `0.75` without knowing the scale
+        // (#1445).
+        return FleetCell::OfShare(static_cast<double>(*cache.hits) / static_cast<double>(total));
     }
 
     // ------------------------------------------------------------ the tables
@@ -371,9 +408,18 @@ namespace
                 } },
         FleetColumn<NodeReport> { .name = "cpu-busy",
                                   .help = "Host-wide CPU in use, this fleet's work included. Absent when unread.",
-                                  .format = CellFormat::Permille,
+                                  .format = CellFormat::Share,
                                   .keep = ColumnKeep::Vital,
-                                  .project = [](NodeReport const& n) { return FleetCell::Maybe(n.load.cpuBusyPermille); } },
+                                  // `cpuBusyPermille` stays a per-mille on the WIRE -- it is what a worker
+                                  // reports, and #1445 is about what a DOCUMENT publishes. The conversion
+                                  // is here, once, where the wire's vocabulary meets the document's.
+                                  .project =
+                                      [](NodeReport const& n) {
+                                          return n.load.cpuBusyPermille.has_value()
+                                                     ? FleetCell::OfShare(static_cast<double>(*n.load.cpuBusyPermille)
+                                                                          / 1000.0)
+                                                     : FleetCell::Nothing();
+                                      } },
         FleetColumn<NodeReport> {
             .name = "memory-available",
             .help = "Memory a new compile could get. Absent when unread.",
@@ -387,7 +433,7 @@ namespace
                                   .project = [](NodeReport const& n) { return FleetCell::Maybe(n.load.freeScratchBytes); } },
         FleetColumn<NodeReport> { .name = "cache-hit-rate",
                                   .help = "Reads this node's cache served. Absent when it has served none.",
-                                  .format = CellFormat::Permille,
+                                  .format = CellFormat::Share,
                                   .project = [](NodeReport const& n) { return HitRateOf(n.load.cache); } },
         FleetColumn<NodeReport> {
             .name = "heartbeat-age",
@@ -637,10 +683,13 @@ namespace
                          } },
     };
 
+    /// What joins a tier's name to a tier column's suffix.
+    constexpr std::string_view TierColumnSeparator = "-";
+
     /// The name a tier column carries, e.g. `memory-items`.
     [[nodiscard]] std::string TierColumnName(StorageTier tier, std::string_view suffix)
     {
-        return std::format("{}-{}", StorageTierTable[static_cast<std::size_t>(tier)].name, suffix);
+        return std::format("{}{}{}", StorageTierTable[static_cast<std::size_t>(tier)].name, TierColumnSeparator, suffix);
     }
 
     /// What the tier table's first column is called.
@@ -651,6 +700,39 @@ namespace
     /// it a fourth -- at which point the name a caller is told to expect and the name a
     /// renderer emits are different strings that happen to agree.
     constexpr std::string_view TierEndpointColumn = "endpoint";
+
+    /// Whether every name @p columns gives a program is kebab-case.
+    /// @param columns A column table.
+    /// @return True when each `name` is.
+    template <typename Subject, std::size_t N>
+    [[nodiscard]] constexpr bool ColumnNamesAreKebab(std::array<FleetColumn<Subject>, N> const& columns) noexcept
+    {
+        return std::ranges::all_of(columns, [](FleetColumn<Subject> const& column) { return IsKebabName(column.name); });
+    }
+
+    /// Whether every name the fleet documents' tables give a program is spelled the one way a program reads a
+    /// name: kebab-case, through the predicate the CLI's piped keys are held to as well (#1445) -- the column
+    /// tables, a tier column as it is JOINED from its tier and suffix, the section keys, the lease outcomes and the
+    /// series. The headline figures' keys are asserted beside `KpiTable` and the bucket arrays' beside theirs, where
+    /// those tables are; `FleetMachineNameTables` is the run-time walk over all of them.
+    /// @return True when every name is.
+    [[nodiscard]] consteval bool FleetNamesAreKebab() noexcept
+    {
+        auto whole = ColumnNamesAreKebab(MemberColumns) && ColumnNamesAreKebab(NodeColumns)
+                     && ColumnNamesAreKebab(WorkerColumns) && ColumnNamesAreKebab(LeaseColumns)
+                     && IsKebabName(TierEndpointColumn);
+        for (auto const& tier: StorageTierTable)
+            for (auto const& column: TierColumns)
+                whole = whole && IsKebabJoin({ tier.name, TierColumnSeparator, column.suffix });
+        whole =
+            whole && std::ranges::all_of(FleetSectionTable, [](FleetSectionRow const& row) { return IsKebabName(row.key); });
+        whole =
+            whole && std::ranges::all_of(LeaseOutcomeTable, [](LeaseOutcomeRow const& row) { return IsKebabName(row.key); });
+        whole =
+            whole && std::ranges::all_of(FleetSeriesTable, [](FleetSeriesRow const& row) { return IsKebabName(row.key); });
+        return whole;
+    }
+    static_assert(FleetNamesAreKebab(), "every name a fleet document gives a program must be kebab-case");
 
     /// Whether any member reports this tier.
     [[nodiscard]] bool AnyNodeHasTier(std::vector<NodeReport> const& nodes, StorageTier tier)
@@ -884,6 +966,9 @@ namespace
             case FleetCell::Kind::Number:
                 out += std::format("{}", cell.number);
                 break;
+            case FleetCell::Kind::Share:
+                out += WriteMachineFigure(cell.share, FigureFormat::Percent);
+                break;
             case FleetCell::Kind::Text:
                 out += EscapeDelimited(cell.text);
                 break;
@@ -1061,6 +1146,11 @@ std::string RenderFleetJson(FleetSnapshot const& snapshot, FleetHistoryView cons
     std::string out;
     out.reserve(4096);
     out += '{';
+
+    // FIRST, so a reader that streams can decide what it is reading before it reaches a
+    // value whose meaning the generation settles.
+    AppendJsonString(out, "schema");
+    out += std::format(":{},", FleetJsonSchema);
 
     AppendJsonString(out, "role");
     out += ':';
@@ -1444,6 +1534,36 @@ CellTone FleetCellTone(FleetSection section, std::string_view name, std::string_
     return dress != nullptr ? dress->tone : CellTone::Plain;
 }
 
+std::optional<std::string> HumanFigureFromMachineText(std::string_view lexical, CellFormat format)
+{
+    // `ParseFiniteDouble` and not `from_chars`: libc++ before macOS 26.0 has no
+    // floating-point overload, so the obvious spelling compiles on two standard
+    // libraries and fails to BUILD on the one leg CI runs this on.
+    auto value = 0.0;
+    if (!ParseFiniteDouble(lexical, value))
+        return std::nullopt;
+
+    // A share is the only fractional format, and it is asked of the TABLE rather than
+    // compared against the enumerator here, so a second fractional format added later
+    // needs no edit at this site.
+    if (CellFormatTable[static_cast<std::size_t>(format)].figure == FigureFormat::Percent)
+        return HumanShareFigure(value);
+
+    // Everything else is integral on the wire. A value with a fractional part is not a
+    // cell of this format, so the caller is told rather than handed a rounded answer.
+    if (value < 0.0 || value != std::floor(value))
+        return std::nullopt;
+    return HumanFleetFigure(static_cast<std::uint64_t>(value), format);
+}
+
+std::string HumanShareFigure(double share)
+{
+    // A person is shown a percentage and a program is given the fraction, from the ONE
+    // value the cell carries -- which is the point of carrying the fraction. The two
+    // spellings cannot drift apart because neither is stored.
+    return WriteFigure(share, FigureFormat::Percent).Text();
+}
+
 std::string HumanFleetFigure(std::uint64_t number, CellFormat format)
 {
     auto const& row = CellFormatTable[static_cast<std::size_t>(format)];
@@ -1814,18 +1934,19 @@ footer { margin-top:2.4rem; padding-top:1rem; border-top:1px solid var(--line);
         return FleetCell::Of(static_cast<std::uint64_t>(std::llround(*value)));
     }
 
-    /// A percentage as a per-mille cell.
+    /// A percentage as a share cell.
     ///
-    /// The cell carries an integer, so a share with one decimal has to be scaled: 85.3 %
-    /// travels as `853` under `CellFormat::Permille`, which is the same shape every
-    /// percentage COLUMN on this page already uses rather than a second convention.
-    /// @param share The share as a percentage, absent when it cannot be computed.
+    /// **Takes a percentage and stores a fraction**, which is the one conversion left:
+    /// every caller here computes a percentage because that is what the page showed, and
+    /// every machine surface publishes a fraction since #1445. Doing it once, here,
+    /// is what stops a second convention appearing at a column.
+    /// @param share The share as a percentage (0..100), absent when it cannot be computed.
     /// @return The cell.
-    [[nodiscard]] FleetCell PermilleCell(std::optional<double> share)
+    [[nodiscard]] FleetCell ShareCell(std::optional<double> share)
     {
         if (!share.has_value())
             return FleetCell::Nothing();
-        return FleetCell::Of(static_cast<std::uint64_t>(std::llround(*share * 10.0)));
+        return FleetCell::OfShare(*share / 100.0);
     }
 
     /// Whether this fleet has been asked to compile nothing at all.
@@ -1912,18 +2033,18 @@ footer { margin-top:2.4rem; padding-top:1rem; border-top:1px solid var(--line);
         // The `%` moved out of the page's `<small>` and into the cell, because
         // `CellAsText` already renders a per-mille cell as `85.3 %` and two places
         // spelling one suffix is the drift this table exists to prevent.
-        return KpiReadout { .value = PermilleCell(FoldedSeries("hit-rate", history)),
+        return KpiReadout { .value = ShareCell(FoldedSeries("hit-rate", history)),
                             .of = FleetCell::Nothing(),
-                            .format = CellFormat::Permille,
+                            .format = CellFormat::Share,
                             .unit = {},
                             .sub = std::format("over the last {}", RangeKeyOf(history)) };
     }
 
     KpiReadout KpiRefused(FleetSnapshot const& /*snapshot*/, FleetHistoryView const& history)
     {
-        return KpiReadout { .value = PermilleCell(RefusedShare(history)),
+        return KpiReadout { .value = ShareCell(RefusedShare(history)),
                             .of = FleetCell::Nothing(),
-                            .format = CellFormat::Permille,
+                            .format = CellFormat::Share,
                             .unit = {},
                             .sub = "of dispatch decisions" };
     }
@@ -2049,24 +2170,25 @@ footer { margin-top:2.4rem; padding-top:1rem; border-top:1px solid var(--line);
                  .sparkline = false },
     };
 
-    /// Every tile states a key, and no two share one.
+    /// Every tile states a key, no two share one, and each is kebab-case.
     ///
     /// A row that forgets `key` is still a row, at the right position, with a label --
     /// it just renders a machine-readable figure under an empty name, which collides
     /// with the next row that forgets one. Neither `RowsInEnumeratorOrder` nor any
     /// render-time check can see that, and there is no reason a tile could have for
-    /// being unnamed, so the type system answers it.
-    /// @return True when every key is non-empty and distinct.
+    /// being unnamed, so the type system answers it. The spelling is the one every other
+    /// name a program reads is held to (`IsKebabName`, #1445), and it implies non-empty.
+    /// @return True when every key is kebab-case and distinct.
     [[nodiscard]] consteval bool EveryKpiIsKeyed()
     {
         return std::ranges::all_of(std::views::iota(std::size_t { 0 }, KpiTable.size()), [](std::size_t outer) {
-            if (KpiTable[outer].key.empty())
+            if (!IsKebabName(KpiTable[outer].key))
                 return false;
             return std::ranges::none_of(std::views::iota(outer + 1, KpiTable.size()),
                                         [outer](std::size_t inner) { return KpiTable[outer].key == KpiTable[inner].key; });
         });
     }
-    static_assert(EveryKpiIsKeyed(), "every KpiTable row needs its own non-empty machine key");
+    static_assert(EveryKpiIsKeyed(), "every KpiTable row needs its own kebab-case machine key");
 
     /// Each row's words, so `FleetKpis` can hand out a view of something static.
     constexpr auto KpiTexts = [] {
@@ -2369,6 +2491,29 @@ footer { margin-top:2.4rem; padding-top:1rem; border-top:1px solid var(--line);
 std::span<std::string_view const> FleetKpiKeys() noexcept
 {
     return KpiKeys;
+}
+
+std::vector<MachineNameTable> FleetMachineNameTables()
+{
+    // Every section's names with every tier composed, as the renderers compose them: a tier no member runs has no
+    // column, so the snapshot says they all do.
+    auto snapshot = FleetSnapshot {};
+    snapshot.tiersPresent.fill(true);
+
+    auto tables = std::vector<MachineNameTable> {};
+    for (auto const& row: FleetSectionTable)
+        tables.push_back(MachineNameTable { .table = row.key, .names = FleetColumnNames(row.section, snapshot) });
+
+    auto const keysOf = [](std::string_view table, auto const& keys) {
+        auto named = MachineNameTable { .table = table, .names = {} };
+        for (auto const key: keys)
+            named.names.emplace_back(key);
+        return named;
+    };
+    tables.push_back(keysOf("fleet-sections", FleetSectionTable | std::views::transform(&FleetSectionRow::key)));
+    tables.push_back(keysOf("kpi-keys", FleetKpiKeys()));
+    tables.push_back(keysOf("lease-outcomes", LeaseOutcomeTable | std::views::transform(&LeaseOutcomeRow::key)));
+    return tables;
 }
 
 std::span<FleetKpiText const> FleetKpis() noexcept

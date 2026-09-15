@@ -11,6 +11,7 @@
 
 #include <FastCache/Cache/StorageTier.hpp>
 #include <FastCache/Core/EnumTable.hpp>
+#include <FastCache/Core/MachineName.hpp>
 #include <FastCache/Distributed/FleetView.hpp>
 
 #include <array>
@@ -442,14 +443,54 @@ constexpr void ForEachFigureKey(PanelSpec const& panel, Visit const& visit)
                     visit(figure.key);
 }
 
+/// Call @p visit with the machine key of every figure @p panel writes as a SHARE, in panel order.
+///
+/// **The same walk as `ForEachFigureKey`, block for block**, so a figure in a block one of them
+/// forgot is a figure the other forgets too -- a share walk that covered fewer blocks than the key
+/// walk would report full coverage over a subset, which is the shape that reads as coverage and is
+/// not. `FigureFormat::Percent` is what makes a figure a share; the tier columns are walked by the
+/// caller, which is where the tier names are.
+/// @param panel The panel.
+/// @param visit Called with each share figure's key.
+template <typename Visit>
+constexpr void ForEachShareKey(PanelSpec const& panel, Visit const& visit)
+{
+    auto const shared = [&visit](std::string_view key, FigureSpec const& figure) {
+        if (figure.format == FigureFormat::Percent)
+            visit(key);
+    };
+    for (auto const& row: panel.rates)
+    {
+        shared(row.key, row.figure);
+        for (auto const& beside: row.beside)
+            shared(beside.key, beside.figure);
+        for (auto const& part: row.split)
+            shared(part.key, part.figure);
+    }
+    for (auto const& row: panel.levels)
+    {
+        shared(row.key, row.value);
+        if (row.limit.has_value())
+            shared(row.limitKey, *row.limit);
+    }
+    for (auto const& block: panel.facts)
+        for (auto const& line: block.lines)
+            for (auto const& cell: line.cells)
+                for (auto const& figure: cell.figures)
+                    shared(figure.key, figure.figure);
+}
+
 /// What joins a tier's name to a tier column's key in the machine name of that tier's figure.
-inline constexpr std::string_view TierKeySeparator = "_";
+///
+/// A hyphen, so the joined name is kebab-case like every other key a program reads (`PanelKeysAreWhole` judges the
+/// join, not only its halves).
+inline constexpr std::string_view TierKeySeparator = "-";
 
 /// Whether @p key is the machine name `TierFigureKey` gives @p column's figure in @p tier.
 /// @param key A machine name.
 /// @param tier A `StorageTierTable` name.
 /// @param column A tier column's key.
-/// @return True when @p key is `<tier>_<column>`.
+/// @return True when @p key is `<tier>-<column>`.
 [[nodiscard]] constexpr bool IsTierFigureKey(std::string_view key, std::string_view tier, std::string_view column) noexcept
 {
     return key.size() == tier.size() + TierKeySeparator.size() + column.size() && key.starts_with(tier)
@@ -464,9 +505,12 @@ inline constexpr std::string_view TierKeySeparator = "_";
 /// this is the check that none is missing and none repeats: the rate and level keys, beside
 /// figures and limits included, are one namespace; the tier columns' keys are unique among
 /// themselves, and no figure key spells a tier column's figure in any `StorageTierTable` tier
-/// (`<tier>_<key>`), which is how a program meets them beside the others. A level row's
-/// `limitKey` is named exactly when it has a limit. `static_assert`ed beside every panel, so a row
-/// added without one fails the build on every compiler.
+/// (`<tier>-<key>`), which is how a program meets them beside the others. A level row's
+/// `limitKey` is named exactly when it has a limit. And every name a program meets is kebab-case
+/// (`IsKebabName`), the tier figures' as they are JOINED: the one spelling the leader's fleet columns
+/// are held to as well, so a script reading both reads one convention (#1445). `static_assert`ed
+/// beside every panel, so a row added without one, or spelled another way, fails the build on every
+/// compiler.
 /// @param panel The panel.
 /// @return True when the keys are whole.
 [[nodiscard]] constexpr bool PanelKeysAreWhole(PanelSpec const& panel) noexcept
@@ -474,7 +518,7 @@ inline constexpr std::string_view TierKeySeparator = "_";
     auto whole = true;
     auto position = std::size_t { 0 };
     ForEachFigureKey(panel, [&panel, &whole, &position](std::string_view key) {
-        whole = whole && !key.empty();
+        whole = whole && IsKebabName(key);
         auto earlier = std::size_t { 0 };
         ForEachFigureKey(panel, [&whole, &earlier, position, key](std::string_view other) {
             whole = whole && !(earlier < position && other == key);
@@ -489,6 +533,8 @@ inline constexpr std::string_view TierKeySeparator = "_";
         whole = whole && !panel.tierColumns[index].key.empty();
         for (auto const earlier: std::views::iota(std::size_t { 0 }, index))
             whole = whole && panel.tierColumns[earlier].key != panel.tierColumns[index].key;
+        for (auto const& tier: StorageTierTable)
+            whole = whole && IsKebabJoin({ tier.name, TierKeySeparator, panel.tierColumns[index].key });
         for (auto const& tier: StorageTierTable)
             ForEachFigureKey(panel, [&whole, &panel, index, &tier](std::string_view key) {
                 whole = whole && !IsTierFigureKey(key, tier.name, panel.tierColumns[index].key);
@@ -534,7 +580,7 @@ struct PanelContext
                                                               FigureSpec const& figure,
                                                               std::string_view tier = {});
 
-/// The machine name of @p column's figure in @p tier: `<tier>_<column>`.
+/// The machine name of @p column's figure in @p tier: `<tier>-<column>`.
 ///
 /// A program reads a tier's figures beside the panel's others, so they need names that cannot meet
 /// one of those; `PanelKeysAreWhole` refuses a panel where one would.
@@ -542,6 +588,16 @@ struct PanelContext
 /// @param column A tier column's key.
 /// @return The name.
 [[nodiscard]] std::string TierFigureKey(std::string_view tier, std::string_view column);
+
+/// Every name @p panel gives a program, as a run-time walk: each figure key, and each tier column's key joined to
+/// every `StorageTierTable` tier by `TierFigureKey`.
+///
+/// `PanelKeysAreWhole` holds the same names at build time; this is what a case plants a misspelled key into to watch
+/// `MisspelledMachineName` refuse it and name the panel (#1445).
+/// @param table What the panel is called in a refusal; static storage.
+/// @param panel The panel.
+/// @return The names.
+[[nodiscard]] MachineNameTable PanelMachineNames(std::string_view table, PanelSpec const& panel);
 
 /// The tiers @p spec draws a tier row for from @p reading, in `StorageTierTable` order.
 ///

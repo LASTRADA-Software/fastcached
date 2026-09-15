@@ -5,6 +5,7 @@
 #include <FastCache/Cluster/ClusterState.hpp>
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/FigureText.hpp>
+#include <FastCache/Core/MachineName.hpp>
 #include <FastCache/Distributed/FleetHistory.hpp>
 #include <FastCache/Distributed/SchedulerService.hpp>
 #include <FastCache/Distributed/WorkerRegistry.hpp>
@@ -422,7 +423,7 @@ enum class CellFormat : std::uint8_t
 {
     Count = 0,
     Bytes,
-    Permille,
+    Share,
     Millis,
     Text,
     Last,
@@ -442,9 +443,10 @@ struct CellFormatRow
 inline constexpr EnumTable<CellFormat, CellFormatRow> CellFormatTable {
     CellFormatRow { .format = CellFormat::Count, .name = "count", .scale = 1.0, .figure = FigureFormat::Count },
     CellFormatRow { .format = CellFormat::Bytes, .name = "bytes", .scale = 1.0, .figure = FigureFormat::Bytes },
-    // Thousandths, not percent: the cell carries an integer, so a percentage with one decimal has to
-    // be scaled somewhere and the name is where a reader finds out which. `853` is 85.3 %.
-    CellFormatRow { .format = CellFormat::Permille, .name = "permille", .scale = 0.001, .figure = FigureFormat::Percent },
+    // A FRACTION in 0..1, and `scale` is 1.0 because there is nothing left to undo: since #1445 the cell
+    // carries the share as measured (`FleetCell::Kind::Share`) rather than an integer per-mille, so the
+    // machine surfaces publish `0.8530` where they published `853`. The name is what a reader checks.
+    CellFormatRow { .format = CellFormat::Share, .name = "share", .scale = 1.0, .figure = FigureFormat::Percent },
     CellFormatRow { .format = CellFormat::Millis, .name = "milliseconds", .scale = 0.001, .figure = FigureFormat::Seconds },
     CellFormatRow { .format = CellFormat::Text, .name = "text", .scale = 1.0, .figure = std::nullopt },
 };
@@ -544,6 +546,49 @@ enum class CellTone : std::uint8_t
 /// @return The text; the integer as written for a scale with no figure format (`Text`).
 [[nodiscard]] std::string HumanFleetFigure(std::uint64_t number, CellFormat format);
 
+/// What generation of `/fleet.json` this build writes.
+///
+/// **The document had no version until #1445 needed one.** That change moved a share from an
+/// integer per-mille to a fraction, which is a change of MEANING rather than of shape: a
+/// reader that does not know about it parses `0.8530` happily and draws a hit rate of under
+/// one percent. A missing field cannot be told from an old one, so a reader treats an absent
+/// `schema` as generation 1 -- the per-mille generation -- which is what every document this
+/// project has ever written was.
+///
+/// Bumped when the MEANING of a value changes, not when a key is added: a reader that meets
+/// a key it does not know ignores it, exactly as a `0xFC` surface steps over a verb it has
+/// no row for, and bumping for an addition would refuse readers that are still correct.
+inline constexpr unsigned FleetJsonSchema = 2;
+
+/// One machine-written cell, as a PERSON reads it.
+///
+/// **The door a client reads a document through, so no client carries a parse rule.** The
+/// CLI had two: `HumanCellText` took the cell as an INTEGER and fell back to showing the
+/// raw text when that failed, and `ChartFigureText` divided by the format's scale and
+/// rounded. Both were right while every machine cell was integral, and both broke the
+/// moment a share started travelling as `0.8530` -- one showed the fraction unformatted,
+/// the other rounded it to zero and wrote `0.0 %` (#1445).
+///
+/// Which formats carry a fraction is the library's business, because the library is what
+/// writes them. A caller passes the bytes it was sent and the column's format, and gets
+/// back what a person should see.
+/// @param lexical The value exactly as the document carried it.
+/// @param format The column's format.
+/// @return The written figure, or nullopt when @p lexical is not a value of that format --
+///         which a caller shows as sent rather than guessing at.
+[[nodiscard]] std::optional<std::string> HumanFigureFromMachineText(std::string_view lexical, CellFormat format);
+
+/// One share, as a PERSON reads it.
+///
+/// Beside `HumanFleetFigure` rather than inside it, because a share no longer arrives as
+/// an integer to be scaled: the cell carries the fraction it was measured as, so there is
+/// no `std::uint64_t` for the older signature to take (#1445). Both are the writers the
+/// terminal fleet panel uses too, so a figure reads the same on the page and in a
+/// terminal.
+/// @param share The share, in 0..1.
+/// @return The percentage a person is shown.
+[[nodiscard]] std::string HumanShareFigure(double share);
+
 /// Every column name @p section renders for @p snapshot, in the order all three
 /// surfaces walk them.
 ///
@@ -594,6 +639,16 @@ enum class CellTone : std::uint8_t
 /// reworded; the key is what a scraper keyed on `/fleet.json` depends on.
 /// @return A view of the static table; never empty.
 [[nodiscard]] std::span<std::string_view const> FleetKpiKeys() noexcept;
+
+/// Every name the fleet documents give a program, table by table, as a run-time walk.
+///
+/// **Derived from the tables the renderers walk**, never a list: each section's names through `FleetColumnNames`
+/// with every tier composed (so the column tables, the tier columns, the `kpi` columns and the series and bucket
+/// arrays), then the section keys, the headline figures' keys and the lease outcomes' keys. Each of those tables
+/// `static_assert`s its own spelling; this is what a case plants a misspelled name into, one table at a time, to
+/// watch `MisspelledMachineName` refuse it and name the table (#1445).
+/// @return One table per source of names, in the order above.
+[[nodiscard]] std::vector<MachineNameTable> FleetMachineNameTables();
 
 /// What a human surface other than the page needs to write one headline figure.
 ///

@@ -113,9 +113,11 @@ TEST_CASE("every chart metric reads columns the leader's machines table actually
 TEST_CASE("a document gives one chart point per machine it read, and none for a machine it did not", "[cli][fleet][chart]")
 {
     // WHAT DISTINGUISHES: an absent figure gives NO point -- the chart then draws a gap -- rather than a
-    // point of zero, which would draw an unread machine as an idle one; and a value is scaled, so 853
-    // thousandths is 0.853.
-    auto const points = FleetChartPoints(MachinesDocument({ { "a:1", "853" }, { "b:1", "-" }, { "c:1", "0" } }));
+    // point of zero, which would draw an unread machine as an idle one. The value needs no scaling: the
+    // document carries a share as the fraction it is since #1445, where it used to send `853` and this
+    // model divided by a thousand. A zero is still a READING and still gives a point, which is the half
+    // an absent-versus-zero case gets wrong by only asserting the absence.
+    auto const points = FleetChartPoints(MachinesDocument({ { "a:1", "0.8530" }, { "b:1", "-" }, { "c:1", "0.0000" } }));
     REQUIRE(points.size() == 2);
     CHECK(points[0].series == FleetChartMetrics.front().key);
     CHECK(points[0].subject == "a:1");
@@ -129,9 +131,9 @@ TEST_CASE("a fleet reading carries the chart's points, taken before its parse is
     // The reader is where points come from. WHAT DISTINGUISHES: the reading carries one point per machine
     // the document read, with their subjects -- a reader taking them after the parse moved into `document`
     // reads a moved-from document and carries none -- and it still hands the document over.
-    auto const reading = ReadFleetSample(
-        DashboardEvent { .kind = DashboardEventKind::Sample,
-                         .document = std::optional<std::string> { MachinesText({ { "a:1", "500" }, { "b:1", "250" } }) } });
+    auto const reading = ReadFleetSample(DashboardEvent {
+        .kind = DashboardEventKind::Sample,
+        .document = std::optional<std::string> { MachinesText({ { "a:1", "0.5000" }, { "b:1", "0.2500" } }) } });
     REQUIRE(reading.outcome == Outcome::Affirmative);
     REQUIRE(reading.points.size() == 2);
     CHECK(reading.points[0].subject == "a:1");
@@ -188,14 +190,14 @@ TEST_CASE("the chart bands every machine the span read, by name, with its newest
     // is none rather than the last one read -- a label saying 90 % for a machine that stopped reporting
     // would be a reading nobody gave -- and `z` read before the span is not banded at all.
     auto history = std::deque<HistoryEntry> {};
-    history.push_back(EntryOf(MachinesDocument({ { "z:1", "100" } })));
+    history.push_back(EntryOf(MachinesDocument({ { "z:1", "0.1000" } })));
     for (auto const index: std::views::iota(0, 2))
     {
         (void) index;
-        history.push_back(EntryOf(MachinesDocument({ { "c:1", "500" } })));
+        history.push_back(EntryOf(MachinesDocument({ { "c:1", "0.5000" } })));
     }
-    history.push_back(EntryOf(MachinesDocument({ { "b:1", "900" }, { "a:1", "100" } })));
-    history.push_back(EntryOf(MachinesDocument({ { "a:1", "300" }, { "b:1", "-" }, { "c:1", "0" } })));
+    history.push_back(EntryOf(MachinesDocument({ { "b:1", "0.9000" }, { "a:1", "0.1000" } })));
+    history.push_back(EntryOf(MachinesDocument({ { "a:1", "0.3000" }, { "b:1", "-" }, { "c:1", "0.0000" } })));
 
     auto const bands = FleetChartBands(history, FleetChartMetrics.front(), 4);
     REQUIRE(bands.size() == 3);
@@ -220,9 +222,9 @@ TEST_CASE("the chart raster draws a reading as a bar over a grey track, zero as 
     //   - each band's top row is transparent, so the two machines do not merge;
     //   - a sample that read nothing is transparent for every machine.
     auto history = std::deque<HistoryEntry> {};
-    history.push_back(EntryOf(MachinesDocument({ { "a:1", "100" }, { "b:1", "900" } })));
-    history.push_back(EntryOf(MachinesDocument({ { "a:1", "0" }, { "b:1", "-" } })));
-    history.push_back(EntryOf(MachinesDocument({ { "a:1", "300" }, { "b:1", "800" } })));
+    history.push_back(EntryOf(MachinesDocument({ { "a:1", "0.1000" }, { "b:1", "0.9000" } })));
+    history.push_back(EntryOf(MachinesDocument({ { "a:1", "0.0000" }, { "b:1", "-" } })));
+    history.push_back(EntryOf(MachinesDocument({ { "a:1", "0.3000" }, { "b:1", "0.8000" } })));
     auto const& metric = FleetChartMetrics.front();
     auto const bands = FleetChartBands(history, metric, 30);
     REQUIRE(bands.size() == 2);
@@ -266,7 +268,7 @@ TEST_CASE("one machine at a steady load is one bar height across the span", "[cl
     for (auto const index: std::views::iota(0, 30))
     {
         (void) index;
-        history.push_back(EntryOf(MachinesDocument({ { "a:1", "500" } })));
+        history.push_back(EntryOf(MachinesDocument({ { "a:1", "0.5000" } })));
     }
     auto const& metric = FleetChartMetrics.front();
     auto const bands = FleetChartBands(history, metric, ChartWindowFor(history.size()));

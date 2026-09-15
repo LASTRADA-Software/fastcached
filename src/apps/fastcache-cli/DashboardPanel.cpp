@@ -1761,10 +1761,12 @@ namespace
     {
         if (cell.kind == CellKind::Absent)
             return std::string { in.absent };
-        auto const number = CellInteger(cell);
-        if (!format.has_value() || !number.has_value())
+        if (!format.has_value())
             return cell.lexical;
-        return Distributed::HumanFleetFigure(*number, *format);
+        // One door, so this panel carries no rule about which formats are integral: it
+        // used to ask `CellInteger` and show the raw text when that failed, which is
+        // exactly what a share travelling as `0.8530` hit (#1445).
+        return Distributed::HumanFigureFromMachineText(cell.lexical, *format).value_or(cell.lexical);
     }
 
     /// The scale of each column of a section's header, in the leader's own column tables.
@@ -2377,11 +2379,21 @@ namespace
         if (!scaled.has_value())
             return std::string { in.absent };
         auto const format = Distributed::FleetColumnFormat(metric.section, metric.valueColumn);
-        auto const scale = format.has_value() ? Distributed::CellFormatTable[static_cast<std::size_t>(*format)].scale : 0.0;
-        if (!format.has_value() || scale <= 0.0)
+        if (!format.has_value())
             return std::format("{}", *scaled);
-        return Distributed::HumanFleetFigure(static_cast<std::uint64_t>(std::llround(std::max(0.0, *scaled) / scale)),
-                                             *format);
+        // Through the same door, by writing the value the way the document would have
+        // carried it. The arithmetic this replaces divided by the format's scale and
+        // rounded to an integer, which turned a `cpu-busy` of 0.182 into `0.0 %` the
+        // moment a share stopped being an integer per-mille (#1445).
+        auto const& row = Distributed::CellFormatTable[static_cast<std::size_t>(*format)];
+        // A `Text` column carries no figure writer, so there is nothing to write the value AS: it shows as it
+        // stands, which is the answer the unknown-format arm above already gives. `FleetView`'s own machine-text
+        // writer asks the same question at the same place, so the two cannot disagree about a Text column.
+        if (!row.figure.has_value())
+            return std::format("{}", *scaled);
+        auto const asDocument = row.scale > 0.0 ? std::max(0.0, *scaled) / row.scale : std::max(0.0, *scaled);
+        return Distributed::HumanFigureFromMachineText(WriteMachineFigure(asDocument, *row.figure), *format)
+            .value_or(std::format("{}", *scaled));
     }
 
     /// Append one line built from @p pieces to @p item, with the runs its pieces carry.
@@ -3081,6 +3093,16 @@ std::string UptimeText(std::uint64_t seconds)
 std::string TierFigureKey(std::string_view tier, std::string_view column)
 {
     return std::format("{}{}{}", tier, TierKeySeparator, column);
+}
+
+MachineNameTable PanelMachineNames(std::string_view table, PanelSpec const& panel)
+{
+    auto named = MachineNameTable { .table = table, .names = {} };
+    ForEachFigureKey(panel, [&named](std::string_view key) { named.names.emplace_back(key); });
+    for (auto const& tier: StorageTierTable)
+        for (auto const& column: panel.tierColumns)
+            named.names.push_back(TierFigureKey(tier.name, column.key));
+    return named;
 }
 
 std::vector<std::string_view> TiersIn(PanelSpec const& spec, StatsReading const& reading)
