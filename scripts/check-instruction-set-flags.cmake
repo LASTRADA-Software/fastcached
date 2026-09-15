@@ -46,7 +46,7 @@
 #   - Flags that never reach a compile command: a compiler's BUILD-TIME environment (cl's `CL` and `_CL_`,
 #     clang's `CCC_OVERRIDE_OPTIONS`), driver configuration files clang reads beside its binary, defaults a
 #     compiler was built with (a GCC configured `--with-arch=`), and the link line, where LTO code
-#     generation may take its own `-march`.
+#     generation may take its own `-march`. Asking the compiler itself is #1447.
 #   - A generator that writes no compile database (Visual Studio).
 #   - A flag inside a quoted define (`-DX="-msha"`) is REFUSED, not understood, and a response file named
 #     inside a response file is refused rather than followed: the reader errs toward refusing.
@@ -84,7 +84,10 @@ set(DriverRows
 # enables nothing in that grammar. Candidate tokens are EXTRACTED by a pattern derived from these rows, so
 # a new row is read as soon as it is written.
 #   verdict  allow, refuse, or unwrap (judge what follows the spelling by the Gnu rows)
-#   kind     exact, prefix, iprefix (case-insensitive prefix), or flag-value (the spelling, then one value)
+#   kind     exact, prefix, iprefix (case-insensitive prefix), or flag-value (the spelling, then one value). A
+#            flag-value row also judges its spelling ALONE, because the value can arrive as a token of its own --
+#            clang-cl's `/clang:-arch /clang:x86_64h` hands the pair over one `/clang:` at a time -- so it must
+#            refuse whatever the value is.
 set(SpellingRows
     "Gnu|allow|prefix|it is the OS API floor CMakeLists.txt pins through CMAKE_OSX_DEPLOYMENT_TARGET, and enables no instruction|-mmacosx-version-min="
     "Gnu|refuse|flag-value|it names an Apple slice, and a slice can imply instructions (x86_64h implies AVX2)|-arch"
@@ -124,6 +127,9 @@ foreach(row IN LISTS SpellingRows)
     if(NOT verdict MATCHES "^(allow|refuse|unwrap)$")
         message(FATAL_ERROR "instruction-set-flags: SpellingRows names an unknown verdict `${verdict}` for `${spelling}`")
     endif()
+    if(kind STREQUAL "flag-value" AND NOT verdict STREQUAL "refuse")
+        message(FATAL_ERROR "instruction-set-flags: SpellingRows row `${spelling}` is flag-value and does not refuse, but its value may arrive in a token of its own, where the row cannot read it")
+    endif()
     set(alternative "")
     if(kind STREQUAL "iprefix")
         string(LENGTH "${spelling}" length)
@@ -142,7 +148,7 @@ foreach(row IN LISTS SpellingRows)
         set(alternative "${spelling}")
     endif()
     if(kind STREQUAL "flag-value")
-        string(APPEND alternative "[ \t]+${tokenEnd}+")
+        string(APPEND alternative "[ \t\r\n]+${tokenEnd}+")
     elseif(kind MATCHES "^(exact|prefix|iprefix)$")
         string(APPEND alternative "${tokenEnd}*")
     else()
@@ -189,7 +195,7 @@ function(fastcached_candidates text out)
     set(candidates "")
     foreach(token IN LISTS found)
         string(REGEX REPLACE "^[ \t\r\n\"]" "" token "${token}")
-        string(REGEX REPLACE "[ \t]+" " " token "${token}")
+        string(REGEX REPLACE "[ \t\r\n]+" " " token "${token}")
         list(APPEND candidates "${token}")
     endforeach()
     set(${out} "${candidates}" PARENT_SCOPE)
@@ -216,6 +222,8 @@ function(fastcached_refusal token families out)
             if(NOT subject STREQUAL needle)
                 continue()
             endif()
+        elseif(kind STREQUAL "flag-value" AND subject STREQUAL spelling)
+            # The spelling alone: its value is a token of its own, and the row refuses any value.
         else()
             string(FIND "${subject}" "${needle}" at)
             if(NOT at EQUAL 0)

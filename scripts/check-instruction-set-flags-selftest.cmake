@@ -128,6 +128,9 @@ set(UnitCases
     "msvcArchCapitals|ON|`/ARCH:AVX2`, because it enables an instruction set||${cl} /ARCH:AVX2 ${tail}"
     "clangClGccFlag|ON|`-msha`, because it is an -m flag no row has judged||${clangcl} -msha ${tail}"
     "clangClForwarded|ON|`/clang:-msha`, because it is an -m flag no row has judged||${clangcl} /clang:-msha ${tail}"
+    "clangClArchSeparate|ON|`/clang:-arch`, because it names an Apple slice||${clangcl} /clang:-arch /clang:x86_64h ${tail}"
+    "clangClTargetSeparate|ON|`/clang:-target`, because it names a target triple||${clangcl} /clang:-target /clang:x86_64h-apple-macosx ${tail}"
+    "clangClArchLookalike|OFF|${judged}||${clangcl} /clang:-archive-member ${tail}"
     "quotedFlag|ON|`-msha`, because||${gxx} \"-msha\" ${tail}"
     "behindBracket|ON|`-msha`, because||${gxx} -DWIDTHS=[a] -msha ${tail}"
     "versionedDriver|ON|`-mavx2`, because||/usr/bin/x86_64-linux-gnu-g++-14 -O2 -mavx2 ${tail}"
@@ -174,6 +177,12 @@ fastcached_tree(responseFlag root)
 file(WRITE "${root}/build/flags.rsp" "-O2\n-msha\n")
 fastcached_unit_database("${root}" "${gxx} @flags.rsp ${tail}")
 fastcached_judge(responseFlag "${root}" ON "`-msha`, because")
+
+# One argument per line, as a response file may be written: the flag and its value are still a pair.
+fastcached_tree(responseArchOnTwoLines root)
+file(WRITE "${root}/build/flags.rsp" "-O2\n-arch\nx86_64h\n")
+fastcached_unit_database("${root}" "${gxx} @flags.rsp ${tail}")
+fastcached_judge(responseArchOnTwoLines "${root}" ON "`-arch x86_64h`, because it names an Apple slice")
 
 fastcached_tree(responseNested root)
 file(WRITE "${root}/build/outer.rsp" "-O2 @inner.rsp\n")
