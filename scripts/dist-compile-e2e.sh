@@ -427,7 +427,7 @@ export FASTCACHE_VERBOSE=1
 # happen: it widens the window in which a genuinely wedged worker still passes, which
 # is exactly what `stop_and_require_exit` exists to catch.
 worker_drain_seconds=5
-stated_drain="--drain-timeout=${worker_drain_seconds}"
+stated_drain="--drain-timeout=${worker_drain_seconds}s"
 stop_bound_seconds=$(( worker_drain_seconds + 5 ))
 
 # And the daemon's own, which is NOT derived from the above. `fastcached` takes no

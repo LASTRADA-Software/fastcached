@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#include <FastCache/Cli/Duration.hpp>
 #include <FastCache/Config/DefaultConfigPath.hpp>
 #include <FastCache/Core/Markup.hpp>
 #include <FastCache/Core/PathKind.hpp>
@@ -236,6 +237,13 @@ namespace
     {
         return std::format("{}", value);
     }
+    /// A duration is written in the grammar the flag reads, so a registration replays
+    /// what the operator typed rather than a count in a unit the flag no longer takes.
+    template <WholeMillisecondDuration T>
+    [[nodiscard]] std::string FlagValue(T value)
+    {
+        return FormatDuration(std::chrono::duration_cast<std::chrono::milliseconds>(value));
+    }
     /// @}
 } // namespace
 
@@ -329,7 +337,7 @@ std::vector<std::string> BuildServiceArgv(std::filesystem::path const& exePath,
     emitIfExplicit("storage-max-value", cfg.storageMaxValueBytes, cli.storageMaxValueBytesExplicit);
     emitIfExplicit("storage-max-disk", cfg.storageMaxDiskBytes, cli.storageMaxDiskBytesExplicit);
     emitIfExplicit("storage-shards", cfg.storageShards, cli.storageShardsExplicit);
-    emitIfExplicit("expiry-interval", cfg.activeExpiryIntervalMs, cli.activeExpiryIntervalMsExplicit);
+    emitIfExplicit("expiry-interval", cfg.activeExpiryInterval, cli.activeExpiryIntervalExplicit);
     emitIfExplicit("expiry-scan", cfg.activeExpiryScanBudget, cli.activeExpiryScanBudgetExplicit);
     emitIfExplicit("threads", cfg.workerThreads, cli.workerThreadsExplicit);
     emitIfExplicit("cpu-affinity", cfg.cpuAffinity, cli.cpuAffinityExplicit);

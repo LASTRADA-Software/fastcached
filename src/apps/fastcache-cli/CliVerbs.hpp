@@ -8,6 +8,7 @@
 #include "SocketExchange.hpp"
 #include "StatsSource.hpp"
 
+#include <FastCache/Cache/CacheEngine.hpp>
 #include <FastCache/Core/EnumTable.hpp>
 
 #include <algorithm>
@@ -108,6 +109,14 @@ struct WireSpec
     /// gets the general sentence, and this is only what a particular one adds to it.
     std::string_view binaryNote;
 
+    /// The longest `--ttl` this wire carries as a length of time, or nullopt where it has no such bound.
+    ///
+    /// A COLUMN because the bound is the PROTOCOL's: memcached reads an `exptime` past 30 days as a
+    /// UNIX timestamp, so `--ttl=31d` sent there stores a key that expired in 1970 and the server
+    /// answers `STORED`. RESP's `EX` has no second reading. Refused before anything is sent rather
+    /// than clamped, because the operator typed the length and a clamp is a different one.
+    std::optional<std::chrono::seconds> relativeTtlCeiling;
+
     /// Whether this wire can present a credential at all.
     ///
     /// **False for `Memcached`, and that is a property of the PROTOCOL rather than of
@@ -149,17 +158,15 @@ struct WireSpec
     bool needsNode;
 };
 
-/// The value `VerbOptions::ttlSeconds` carries when the operator named no TTL.
-///
-/// A named sentinel rather than a bare `-1`, because `-1` is also a *meaningful* TTL
-/// answer from the server (`the key exists and has no expiry`), and the two must not
-/// be confusable at a glance.
-constexpr std::int64_t TtlUnset = -1;
-
 /// Modifiers a verb reads from the command line.
 struct VerbOptions
 {
-    std::int64_t ttlSeconds { TtlUnset }; ///< From `--ttl`; `TtlUnset` when not given.
+    /// From `--ttl`: the expiry a store sends, or nullopt when not given.
+    ///
+    /// Optional rather than a sentinel: `-1` used to stand for *not given*, and `-1` is also a
+    /// meaningful TTL answer from a server (*the key exists and has no expiry*). Whole seconds,
+    /// because both wires carry seconds; a finer value is refused by the parse, never rounded.
+    std::optional<std::chrono::seconds> ttl {};
 
     /// From `--interval`: how long between samples, or nullopt when not given.
     ///
@@ -234,6 +241,7 @@ inline constexpr EnumTable<Wire, WireSpec> WireTable { {
       .nodeAnswer = "",
       .available = [](VerbContext const& context) { return context.resp != nullptr; },
       .binaryNote = "",
+      .relativeTtlCeiling = std::nullopt,
       .authenticable = true,
       .needsResp = true,
       .needsMemcached = false,
@@ -245,6 +253,7 @@ inline constexpr EnumTable<Wire, WireSpec> WireTable { {
       .nodeAnswer = "",
       .available = [](VerbContext const& context) { return context.memcached != nullptr; },
       .binaryNote = "a memcached key is a byte string, so this is ordinary rather than a fault",
+      .relativeTtlCeiling = MemcachedRelativeExptimeCeiling,
       .authenticable = false,
       .needsResp = false,
       .needsMemcached = true,
@@ -256,6 +265,7 @@ inline constexpr EnumTable<Wire, WireSpec> WireTable { {
       .nodeAnswer = "answered: this is a node verb",
       .available = [](VerbContext const& context) { return context.node != nullptr; },
       .binaryNote = "",
+      .relativeTtlCeiling = std::nullopt,
       // `AUTH` IS a `0xFC` verb, unlike on the memcached wire -- so this wire can
       // present a credential and a refusal about one is about the credential.
       .authenticable = true,
@@ -269,6 +279,7 @@ inline constexpr EnumTable<Wire, WireSpec> WireTable { {
       .nodeAnswer = "answered: a compile node reports its own counters",
       .available = [](VerbContext const& context) { return context.stats != nullptr; },
       .binaryNote = "",
+      .relativeTtlCeiling = std::nullopt,
       .authenticable = true,
       .needsResp = true,
       .needsMemcached = false,

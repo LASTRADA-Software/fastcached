@@ -97,7 +97,7 @@ TEST_CASE("touch reports TOUCHED and NOT_FOUND differently", "[cli][verbs][memca
     auto hit = ScriptedMemcachedExchange { { "TOUCHED\r\n" } };
     auto const touched = Run("touch", { "k", "60" }, hit);
     CHECK(touched.outcome == Outcome::Affirmative);
-    CHECK(hit.Sent().front() == "touch k 60\r\n");
+    CHECK(SentFrame(hit) == "touch k 60\r\n");
     CHECK(hit.Unused() == 0);
 
     auto miss = ScriptedMemcachedExchange { { "NOT_FOUND\r\n" } };
@@ -125,7 +125,7 @@ TEST_CASE("gat sends the expiry first, as the wire does", "[cli][verbs][memcache
     auto exchange = ScriptedMemcachedExchange { { "VALUE a 0 1\r\nx\r\nEND\r\n" } };
     auto const answer = Run("gat", { "60", "a" }, exchange);
     CHECK(answer.outcome == Outcome::Affirmative);
-    CHECK(exchange.Sent().front() == "gat 60 a\r\n");
+    CHECK(SentFrame(exchange) == "gat 60 a\r\n");
 }
 
 TEST_CASE("gat says how many keys came back, because the wire skips misses", "[cli][verbs][memcached]")
@@ -182,7 +182,7 @@ TEST_CASE("the storage verbs differ only by the word they send", "[cli][verbs][m
         auto const answer = Run(one.verb, { "k", "v" }, exchange);
         INFO(one.verb);
         CHECK(answer.outcome == Outcome::Affirmative);
-        CHECK(exchange.Sent().front() == one.header);
+        CHECK(SentFrame(exchange) == one.header);
     }
 }
 
@@ -199,7 +199,7 @@ TEST_CASE("cas sends its token and reports EXISTS as a changed value", "[cli][ve
     auto stored = ScriptedMemcachedExchange { { "STORED\r\n" } };
     auto const ok = Run("cas", { "k", "v", "42" }, stored);
     CHECK(ok.outcome == Outcome::Affirmative);
-    CHECK(stored.Sent().front() == "cas k 0 0 1 42\r\nv\r\n");
+    CHECK(SentFrame(stored) == "cas k 0 0 1 42\r\nv\r\n");
 
     auto changed = ScriptedMemcachedExchange { { "EXISTS\r\n" } };
     auto const stale = Run("cas", { "k", "v", "42" }, changed);
@@ -220,7 +220,7 @@ TEST_CASE("a cas token of zero is sent, not dropped", "[cli][verbs][memcached]")
     auto exchange = ScriptedMemcachedExchange { { "STORED\r\n" } };
     auto const answer = Run("cas", { "k", "v", "0" }, exchange);
     CHECK(answer.outcome == Outcome::Affirmative);
-    CHECK(exchange.Sent().front() == "cas k 0 0 1 0\r\nv\r\n");
+    CHECK(SentFrame(exchange) == "cas k 0 0 1 0\r\nv\r\n");
 }
 
 TEST_CASE("a cas token that is not a whole number is refused before anything is sent", "[cli][verbs][memcached]")
@@ -236,9 +236,33 @@ TEST_CASE("a cas token that is not a whole number is refused before anything is 
 TEST_CASE("Naming --ttl reaches the storage verbs that honour it", "[cli][verbs][memcached]")
 {
     auto exchange = ScriptedMemcachedExchange { { "STORED\r\n" } };
-    auto const answer = Run("add", { "k", "v" }, exchange, VerbOptions { .ttlSeconds = 90 });
+    auto const answer = Run("add", { "k", "v" }, exchange, VerbOptions { .ttl = std::chrono::seconds { 90 } });
     CHECK(answer.outcome == Outcome::Affirmative);
-    CHECK(exchange.Sent().front() == "add k 0 90 1\r\nv\r\n");
+    CHECK(SentFrame(exchange) == "add k 0 90 1\r\nv\r\n");
+}
+
+TEST_CASE("a --ttl memcached would read as a date is refused before anything is sent", "[cli][verbs][memcached]")
+{
+    // memcached reads an exptime past 30 days as a UNIX timestamp, so `--ttl=31d` would store a
+    // key that expired in 1970 and answer STORED. WHAT DISTINGUISHES: the bound itself is sent as a
+    // length and one second past it is refused with nothing on the wire -- a ceiling off by one in
+    // either direction fails one half.
+    SECTION("at the bound")
+    {
+        auto exchange = ScriptedMemcachedExchange { { "STORED\r\n" } };
+        auto const answer = Run("add", { "k", "v" }, exchange, VerbOptions { .ttl = std::chrono::days { 30 } });
+        CHECK(answer.outcome == Outcome::Affirmative);
+        CHECK(SentFrame(exchange) == "add k 0 2592000 1\r\nv\r\n");
+    }
+    SECTION("one second past it")
+    {
+        auto exchange = ScriptedMemcachedExchange { { "STORED\r\n" } };
+        auto const answer = Run("add", { "k", "v" }, exchange, VerbOptions { .ttl = std::chrono::seconds { 2'592'001 } });
+        CHECK(answer.outcome == Outcome::Usage);
+        CHECK(Mentions(answer, "--ttl=2592001s"));
+        CHECK(Mentions(answer, "at most 30d"));
+        CHECK(exchange.Sent().empty());
+    }
 }
 
 TEST_CASE("append and prepend do not accept --ttl, because the server ignores it", "[cli][verbs][memcached]")
@@ -285,7 +309,7 @@ TEST_CASE("inspect renames the me inspector's flags and keeps unknown ones", "[c
     auto exchange = ScriptedMemcachedExchange { { "ME mykey exp=-1 la=3 cas=9 fetch=1 cls=1 size=11 novel=7\r\n" } };
     auto const answer = Run("inspect", { "mykey" }, exchange);
     CHECK(answer.outcome == Outcome::Affirmative);
-    CHECK(exchange.Sent().front() == "me mykey\r\n");
+    CHECK(SentFrame(exchange) == "me mykey\r\n");
     REQUIRE(answer.value.shape == Shape::Record);
 
     // The renamed ones a reader came for...
@@ -329,7 +353,7 @@ TEST_CASE("mc-stats returns a name/value table and keeps a value with spaces", "
     auto exchange = ScriptedMemcachedExchange { { "STAT curr_items 3\r\nSTAT growth_factor 1.25 approx\r\nEND\r\n" } };
     auto const answer = Run("mc-stats", { "settings" }, exchange);
     CHECK(answer.outcome == Outcome::Affirmative);
-    CHECK(exchange.Sent().front() == "stats settings\r\n");
+    CHECK(SentFrame(exchange) == "stats settings\r\n");
     REQUIRE(answer.value.shape == Shape::Table);
     REQUIRE(answer.value.rows.size() == 2);
     CHECK(answer.value.rows[0][0].lexical == "curr_items");
@@ -341,7 +365,7 @@ TEST_CASE("mc-stats with no family asks for the default set", "[cli][verbs][memc
     auto exchange = ScriptedMemcachedExchange { { "STAT cmd_get 1\r\nEND\r\n" } };
     auto const answer = Run("mc-stats", {}, exchange);
     CHECK(answer.outcome == Outcome::Affirmative);
-    CHECK(exchange.Sent().front() == "stats\r\n");
+    CHECK(SentFrame(exchange) == "stats\r\n");
 }
 
 TEST_CASE("an empty stats family renders an empty table, not nothing", "[cli][verbs][memcached]")
@@ -376,7 +400,7 @@ TEST_CASE("cache-memlimit says the new limit is not persisted", "[cli][verbs][me
     auto exchange = ScriptedMemcachedExchange { { "OK\r\n" } };
     auto const answer = Run("cache-memlimit", { "512" }, exchange);
     CHECK(answer.outcome == Outcome::Affirmative);
-    CHECK(exchange.Sent().front() == "cache_memlimit 512\r\n");
+    CHECK(SentFrame(exchange) == "cache_memlimit 512\r\n");
     CHECK(Mentions(answer, "NOT persisted"));
 }
 

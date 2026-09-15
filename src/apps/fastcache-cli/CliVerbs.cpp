@@ -6,6 +6,7 @@
 #include "LiveStats.hpp"
 #include "NodeStatusText.hpp"
 
+#include <FastCache/Cli/Duration.hpp>
 #include <FastCache/Cluster/ClusterState.hpp>
 
 #include <algorithm>
@@ -286,16 +287,44 @@ namespace
         return answer;
     }
 
+    /// The expiry a store sends: `--ttl`, refused where the verb's wire would read it as something else.
+    ///
+    /// Asked of the wire's `relativeTtlCeiling` column rather than of the verb, so both store paths --
+    /// RESP's `EX` and memcached's `exptime` -- take one rule, and only a wire that has a bound refuses.
+    /// @param context The invocation.
+    /// @return The expiry to send, nullopt when none was named, or the refusal.
+    [[nodiscard]] std::expected<std::optional<std::chrono::seconds>, Answer> TtlToSend(VerbContext const& context)
+    {
+        auto const& wire = WireTable[static_cast<std::size_t>(context.verb->wire)];
+        auto const& ttl = context.options.ttl;
+        if (ttl.has_value() && wire.relativeTtlCeiling.has_value() && *ttl > *wire.relativeTtlCeiling)
+        {
+            auto const ceiling = FormatDuration(*wire.relativeTtlCeiling);
+            return std::unexpected(
+                Concluded(Outcome::Usage,
+                          std::format("`--ttl={}`: the {} wire reads an expiry past {} as a date, not a length of time, so "
+                                      "`--ttl` is at most {} there",
+                                      FormatDuration(*ttl),
+                                      wire.name,
+                                      ceiling,
+                                      ceiling)));
+        }
+        return ttl;
+    }
+
     /// `set <key> <value>`: store, honouring `--ttl`, `--nx` and `--xx`.
     /// @param context The invocation.
     /// @return The answer.
     [[nodiscard]] Answer Store(VerbContext const& context)
     {
+        auto ttl = TtlToSend(context);
+        if (!ttl.has_value())
+            return std::move(ttl.error());
         auto argv = CommandWithOperands(context);
-        if (context.options.ttlSeconds != TtlUnset)
+        if (ttl->has_value())
         {
             argv.emplace_back("EX");
-            argv.emplace_back(std::format("{}", context.options.ttlSeconds));
+            argv.emplace_back(std::format("{}", (*ttl)->count()));
         }
         if (context.options.onlyIfAbsent)
             argv.emplace_back("NX");
@@ -804,11 +833,15 @@ namespace
                 Outcome::Usage,
                 std::format("`{}` is not a cas token; `inspect <key>` reports the current one", context.operands[2]));
 
-        auto const ttl = context.options.ttlSeconds == TtlUnset ? std::int64_t { 0 } : context.options.ttlSeconds;
+        auto ttl = TtlToSend(context);
+        if (!ttl.has_value())
+            return std::move(ttl.error());
+        // No `--ttl` is an `exptime` of 0, which memcached reads as *never expires*.
+        auto const exptime = ttl->value_or(std::chrono::seconds::zero()).count();
         auto reply =
             AskMemcached(context,
                          EncodeMemcachedStorage(
-                             context.verb->protocolCommand, context.operands[0], 0, ttl, context.operands[1], casToken));
+                             context.verb->protocolCommand, context.operands[0], 0, exptime, context.operands[1], casToken));
         if (!reply.has_value())
             return std::move(reply.error());
         return FromMemcachedStatus(context, *reply);

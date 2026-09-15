@@ -18,15 +18,6 @@
 namespace FastCache
 {
 
-namespace
-{
-
-    /// memcached's threshold: any exptime above 30 days is interpreted as a
-    /// UNIX timestamp.
-    constexpr std::uint32_t ExptimeAbsoluteThreshold = 60U * 60U * 24U * 30U;
-
-} // namespace
-
 CacheEngine::CacheEngine(IStorage& storage, IClock& clock, WallClockRef wallClock, IMetricsSink* metrics) noexcept:
     _storage { storage },
     _clock { clock },
@@ -41,7 +32,7 @@ TimePoint CacheEngine::ExpiryFromExptime(std::uint32_t exptime) const noexcept
         return TimePoint::max();
 
     auto const now = _clock.Now();
-    if (exptime <= ExptimeAbsoluteThreshold)
+    if (std::chrono::seconds { exptime } <= MemcachedRelativeExptimeCeiling)
         return now + std::chrono::seconds { exptime };
 
     // Absolute UNIX timestamp. Anchor against the injected wall clock so

@@ -134,7 +134,7 @@ TEST_CASE("get sends GET and reports the value", "[cli][verbs]")
     // The request is asserted, not just the answer: a handler that sent the wrong
     // command would still produce a plausible-looking result.
     REQUIRE(exchange.Sent().size() == 1);
-    CHECK(exchange.Sent()[0] == std::vector<std::string> { "GET", "k" });
+    CHECK(SentFrame(exchange) == std::vector<std::string> { "GET", "k" });
 
     CHECK(answer.outcome == Outcome::Affirmative);
     REQUIRE(answer.value.shape == Shape::Scalar);
@@ -198,7 +198,7 @@ TEST_CASE("mget pairs every key with its value and marks the misses absent", "[c
     auto const answer = Run("mget", { "a", "b", "c" }, exchange);
 
     REQUIRE(exchange.Sent().size() == 1);
-    CHECK(exchange.Sent()[0] == std::vector<std::string> { "MGET", "a", "b", "c" });
+    CHECK(SentFrame(exchange) == std::vector<std::string> { "MGET", "a", "b", "c" });
 
     REQUIRE(answer.value.shape == Shape::Table);
     CHECK(answer.value.columns == std::vector<std::string> { "key", "value" });
@@ -238,21 +238,30 @@ TEST_CASE("set sends the modifiers it was given and nothing it was not", "[cli][
     {
         ScriptedExchange exchange { Answers({ Simple("OK") }) };
         auto const answer = Run("set", { "k", "v" }, exchange);
-        CHECK(exchange.Sent()[0] == std::vector<std::string> { "SET", "k", "v" });
+        CHECK(SentFrame(exchange) == std::vector<std::string> { "SET", "k", "v" });
         CHECK(answer.outcome == Outcome::Affirmative);
         CHECK(answer.value.shape == Shape::Empty);
     }
     SECTION("with a ttl")
     {
         ScriptedExchange exchange { Answers({ Simple("OK") }) };
-        (void) Run("set", { "k", "v" }, exchange, VerbOptions { .ttlSeconds = 30 });
-        CHECK(exchange.Sent()[0] == std::vector<std::string> { "SET", "k", "v", "EX", "30" });
+        (void) Run("set", { "k", "v" }, exchange, VerbOptions { .ttl = std::chrono::seconds { 30 } });
+        CHECK(SentFrame(exchange) == std::vector<std::string> { "SET", "k", "v", "EX", "30" });
+    }
+    SECTION("with a ttl past memcached's bound, which RESP carries as a length")
+    {
+        // The control for the memcached refusal: the bound is that WIRE's, so a check written
+        // against the verb or the value would refuse this too.
+        ScriptedExchange exchange { Answers({ Simple("OK") }) };
+        auto const answer = Run("set", { "k", "v" }, exchange, VerbOptions { .ttl = std::chrono::days { 31 } });
+        CHECK(answer.outcome == Outcome::Affirmative);
+        CHECK(SentFrame(exchange) == std::vector<std::string> { "SET", "k", "v", "EX", "2678400" });
     }
     SECTION("only if absent")
     {
         ScriptedExchange exchange { Answers({ Simple("OK") }) };
         (void) Run("set", { "k", "v" }, exchange, VerbOptions { .onlyIfAbsent = true });
-        CHECK(exchange.Sent()[0] == std::vector<std::string> { "SET", "k", "v", "NX" });
+        CHECK(SentFrame(exchange) == std::vector<std::string> { "SET", "k", "v", "NX" });
     }
 }
 
@@ -273,7 +282,7 @@ TEST_CASE("del reports the count and calls zero a negative answer", "[cli][verbs
     {
         ScriptedExchange exchange { Answers({ Integer(2) }) };
         auto const answer = Run("del", { "a", "b" }, exchange);
-        CHECK(exchange.Sent()[0] == std::vector<std::string> { "DEL", "a", "b" });
+        CHECK(SentFrame(exchange) == std::vector<std::string> { "DEL", "a", "b" });
         CHECK(answer.outcome == Outcome::Affirmative);
         CHECK(answer.value.scalar.lexical == "2");
     }
@@ -294,7 +303,7 @@ TEST_CASE("an incr that lands on zero is not a negative answer", "[cli][verbs]")
     // so this is the case that keeps them apart.
     ScriptedExchange exchange { Answers({ Integer(0) }) };
     auto const answer = Run("incr", { "k" }, exchange);
-    CHECK(exchange.Sent()[0] == std::vector<std::string> { "INCR", "k" });
+    CHECK(SentFrame(exchange) == std::vector<std::string> { "INCR", "k" });
     CHECK(answer.outcome == Outcome::Affirmative);
     CHECK(answer.value.scalar.lexical == "0");
 }
@@ -322,7 +331,7 @@ TEST_CASE("the arithmetic family each send their own command", "[cli][verbs]")
         ScriptedExchange exchange { Answers({ Integer(1) }) };
         (void) Run(expectation.verb, expectation.operands, exchange);
         REQUIRE(exchange.Sent().size() == 1);
-        CHECK(exchange.Sent()[0] == expectation.sent);
+        CHECK(SentFrame(exchange) == expectation.sent);
     }
 }
 
@@ -336,7 +345,7 @@ TEST_CASE("ttl reports its three states distinguishably on stdout", "[cli][verbs
     {
         ScriptedExchange exchange { Answers({ Integer(45) }) };
         auto const answer = Run("ttl", { "k" }, exchange);
-        CHECK(exchange.Sent()[0] == std::vector<std::string> { "TTL", "k" });
+        CHECK(SentFrame(exchange) == std::vector<std::string> { "TTL", "k" });
         CHECK(answer.outcome == Outcome::Affirmative);
         REQUIRE(FindField(answer.value, "exists") != nullptr);
         CHECK(FindField(answer.value, "exists")->value.lexical == "true");
@@ -370,14 +379,14 @@ TEST_CASE("expire and persist report whether they changed anything", "[cli][verb
     {
         ScriptedExchange exchange { Answers({ Integer(1) }) };
         auto const answer = Run("expire", { "k", "30" }, exchange);
-        CHECK(exchange.Sent()[0] == std::vector<std::string> { "EXPIRE", "k", "30" });
+        CHECK(SentFrame(exchange) == std::vector<std::string> { "EXPIRE", "k", "30" });
         CHECK(answer.outcome == Outcome::Affirmative);
     }
     SECTION("it did not")
     {
         ScriptedExchange exchange { Answers({ Integer(0) }) };
         auto const answer = Run("persist", { "k" }, exchange);
-        CHECK(exchange.Sent()[0] == std::vector<std::string> { "PERSIST", "k" });
+        CHECK(SentFrame(exchange) == std::vector<std::string> { "PERSIST", "k" });
         CHECK(answer.outcome == Outcome::Negative);
     }
 }
@@ -388,14 +397,14 @@ TEST_CASE("flush picks its command from --all", "[cli][verbs]")
     {
         ScriptedExchange exchange { Answers({ Simple("OK") }) };
         auto const answer = Run("flush", {}, exchange);
-        CHECK(exchange.Sent()[0] == std::vector<std::string> { "FLUSHDB" });
+        CHECK(SentFrame(exchange) == std::vector<std::string> { "FLUSHDB" });
         CHECK(answer.outcome == Outcome::Affirmative);
     }
     SECTION("every database")
     {
         ScriptedExchange exchange { Answers({ Simple("OK") }) };
         (void) Run("flush", {}, exchange, VerbOptions { .everything = true });
-        CHECK(exchange.Sent()[0] == std::vector<std::string> { "FLUSHALL" });
+        CHECK(SentFrame(exchange) == std::vector<std::string> { "FLUSHALL" });
     }
 }
 
@@ -403,12 +412,12 @@ TEST_CASE("ping and echo report what came back", "[cli][verbs]")
 {
     ScriptedExchange ping { Answers({ Simple("PONG") }) };
     auto const pinged = Run("ping", {}, ping);
-    CHECK(ping.Sent()[0] == std::vector<std::string> { "PING" });
+    CHECK(SentFrame(ping) == std::vector<std::string> { "PING" });
     CHECK(pinged.value.scalar.lexical == "PONG");
 
     ScriptedExchange echo { Answers({ Bulk("shout") }) };
     auto const echoed = Run("echo", { "shout" }, echo);
-    CHECK(echo.Sent()[0] == std::vector<std::string> { "ECHO", "shout" });
+    CHECK(SentFrame(echo) == std::vector<std::string> { "ECHO", "shout" });
     CHECK(echoed.value.scalar.lexical == "shout");
 }
 
@@ -417,7 +426,7 @@ TEST_CASE("info parses the payload into a record", "[cli][verbs]")
     ScriptedExchange exchange { Answers({ Bulk("# Server\r\nfastcached_version:1.2.3\r\nused_memory:9\r\n") }) };
     auto const answer = Run("info", {}, exchange);
 
-    CHECK(exchange.Sent()[0] == std::vector<std::string> { "INFO" });
+    CHECK(SentFrame(exchange) == std::vector<std::string> { "INFO" });
     CHECK(answer.outcome == Outcome::Affirmative);
     REQUIRE(FindField(answer.value, "fastcached_version") != nullptr);
     CHECK(FindField(answer.value, "fastcached_version")->value.lexical == "1.2.3");

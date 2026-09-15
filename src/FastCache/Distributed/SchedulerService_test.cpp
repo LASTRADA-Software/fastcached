@@ -1729,7 +1729,7 @@ TEST_CASE("A lease is granted for as long as the CLUSTER agreed, not for as long
     {
         // The case the ticket is about: a site says its translation units are long, in
         // the one place every member reads.
-        cluster.Set(Cluster::LeaseLifetimeSetting, "2400000");
+        cluster.Set(Cluster::LeaseLifetimeSetting, "40min");
         fleet.service.AdministerWith(cluster);
 
         auto const granted = fleet.service.Lease(Insider, Ask("gcc-14", "key-1"));
@@ -1747,12 +1747,30 @@ TEST_CASE("A lease is granted for as long as the CLUSTER agreed, not for as long
         // -- taking the max of the setting and the default, say -- passes every
         // assertion above. A fleet of small translation units may legitimately want a
         // shorter lease, and nothing in this ticket argues otherwise.
-        cluster.Set(Cluster::LeaseLifetimeSetting, "120000");
+        cluster.Set(Cluster::LeaseLifetimeSetting, "2min");
         fleet.service.AdministerWith(cluster);
 
         auto const granted = fleet.service.Lease(Insider, Ask("gcc-14", "key-1"));
         REQUIRE(granted.status == Wire::Status::Ok);
         CHECK(LifetimeOf(granted) == std::chrono::milliseconds { 120'000 });
+    }
+
+    SECTION("a value committed before the setting took a unit serves under the default and says why")
+    {
+        // #1402 decision (b): `2400000` was forty minutes in milliseconds and is now a bare
+        // number. One installation exists, so the value is NOT migrated; it degrades to the
+        // default like any unreadable value, and the line says what to do about it -- the
+        // grammar -- rather than only that something is wrong.
+        cluster.Set(Cluster::LeaseLifetimeSetting, "2400000");
+        fleet.service.AdministerWith(cluster);
+
+        auto const granted = fleet.service.Lease(Insider, Ask("gcc-14", "key-1"));
+        REQUIRE(granted.status == Wire::Status::Ok);
+        CHECK(LifetimeOf(granted) == Wire::DefaultCompileLeaseTimeout);
+        auto const said = fleet.logger.Snapshot();
+        CHECK(std::ranges::any_of(said, [](auto const& record) {
+            return record.message.contains("names no unit") && record.message.contains(Cluster::LeaseLifetimeSetting);
+        }));
     }
 
     SECTION("a value this build cannot read serves under the default and says so once")
@@ -1994,7 +2012,7 @@ TEST_CASE("The two verbs that share Offer answer exactly as they did", "[distrib
     // that carries an ADDRESS, which is the thing two machines can spell differently.
     Admitting fleet;
 
-    auto const set = fleet.Service().ClusterSet(Insider, Cluster::LeaseLifetimeSetting, "2400000");
+    auto const set = fleet.Service().ClusterSet(Insider, Cluster::LeaseLifetimeSetting, "40min");
     REQUIRE(set.status == Wire::Status::Ok);
     CHECK(set.payload.empty());
 

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "CompileCapacity.hpp"
 
+#include <FastCache/Cli/Duration.hpp>
 #include <FastCache/Core/BoundedDrain.hpp>
 
 #include <chrono>
@@ -179,9 +180,9 @@ void CompileCapacity::Drain()
 
             case DrainAction::Abandon:
                 _logger.Logf(LogLevel::Error,
-                             "worker: giving up after {}s with {} compile(s) still running; ending now rather than "
+                             "worker: giving up after {} with {} compile(s) still running; ending now rather than "
                              "waiting for the supervisor to kill this process without saying why (#239)",
-                             _drainTimeout.count(),
+                             FormatDuration(_drainTimeout),
                              _inFlight.load(std::memory_order_acquire));
 
                 // NOT a return. A running compile holds a pointer into this object --

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "CliCommand.hpp"
 
+#include <FastCache/Cli/Duration.hpp>
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/HostPort.hpp>
 
@@ -112,51 +113,54 @@ namespace
         };
     }
 
-    /// An applier that parses milliseconds into a nested `DialTimeouts` member.
+    /// An applier that parses a duration into a nested `DialTimeouts` member.
     ///
     /// A bespoke applier because the target is two levels down (`timeouts.connect`),
     /// which `AssignFrom`'s member pointer cannot name.
     /// @return The applier.
     template <auto Field>
-    [[nodiscard]] constexpr auto AssignMilliseconds() noexcept
+    [[nodiscard]] constexpr auto AssignTimeout() noexcept
     {
         return [](Command& command, std::string_view value) -> std::expected<void, ConfigError> {
-            auto const parsed = ParseCount(value);
-            if (!parsed.has_value())
-                return std::unexpected(parsed.error());
-            (command.timeouts.*Field) = std::chrono::milliseconds { *parsed };
-            return {};
+            return ParseDurationValue<std::chrono::milliseconds>(value).transform(
+                [&command](std::chrono::milliseconds parsed) { (command.timeouts.*Field) = parsed; });
         };
     }
 
-    /// An applier that parses a TTL in seconds into the verb options.
+    /// An applier that parses `--ttl` into the verb options: whole seconds, and never zero.
+    ///
+    /// **Zero is refused rather than sent.** memcached reads an `exptime` of 0 as *never
+    /// expires* and RESP refuses `EX 0`, so the value spelled like the shortest expiry
+    /// means the longest on one wire and an error on the other. Leaving the flag off is
+    /// how to ask for no expiry, on both.
     /// @return The applier.
     [[nodiscard]] constexpr auto AssignTtl() noexcept
     {
         return [](Command& command, std::string_view value) -> std::expected<void, ConfigError> {
-            auto const parsed = ParseCount(value);
+            auto parsed = ParseDurationValue<std::chrono::seconds>(value);
             if (!parsed.has_value())
-                return std::unexpected(parsed.error());
-            command.verbOptions.ttlSeconds = *parsed;
+                return std::unexpected(std::move(parsed).error());
+            if (*parsed == std::chrono::seconds::zero())
+                return std::unexpected(ArgvError(ConfigErrorCode::OutOfRange,
+                                                 {},
+                                                 std::format("`{}` is no expiry at all: memcached reads zero as never "
+                                                             "expiring and RESP refuses it; leave the flag off instead",
+                                                             value)));
+            command.verbOptions.ttl = *parsed;
             return {};
         };
     }
 
-    /// An applier that parses `--interval`'s milliseconds into the verb options.
+    /// An applier that parses `--interval`'s duration into the verb options.
     ///
-    /// Milliseconds rather than a duration with units, matching `--timeout` and
-    /// `--connect-timeout`: one convention in one tool, and there is no duration parser in
-    /// this tree to share. Whether the value is ALLOWED is not decided here -- that
-    /// depends on the subject, whose floor this parser cannot see.
+    /// Whether the value is ALLOWED is not decided here -- that depends on the subject,
+    /// whose floor this parser cannot see.
     /// @return The applier.
     [[nodiscard]] constexpr auto AssignInterval() noexcept
     {
         return [](Command& command, std::string_view value) -> std::expected<void, ConfigError> {
-            auto const parsed = ParseCount(value);
-            if (!parsed.has_value())
-                return std::unexpected(parsed.error());
-            command.verbOptions.interval = std::chrono::milliseconds { *parsed };
-            return {};
+            return ParseDurationValue<std::chrono::milliseconds>(value).transform(
+                [&command](std::chrono::milliseconds parsed) { command.verbOptions.interval = parsed; });
         };
     }
 
@@ -272,9 +276,11 @@ namespace
           .description = "username for the two-argument AUTH form; rarely needed" },
         { .primary = "--ttl",
           .arity = Arity::Value,
-          .operand = "=<seconds>",
+          .operand = "=<duration>",
           .apply = AssignTtl(),
-          .description = "expiry for `set`" },
+          .description = "expiry for `set`, in whole seconds of one of\n"
+                         "{duration-units}: 90s, 1h, 7d. 0s is refused;\n"
+                         "leave the flag off for no expiry" },
         { .primary = "--nx",
           .apply = SetVerbFlag<&VerbOptions::onlyIfAbsent>(),
           .description = "`set` only if the key does not exist" },
@@ -290,10 +296,10 @@ namespace
           .description = "`flush` clears every database, not just the current one" },
         { .primary = "--interval",
           .arity = Arity::Value,
-          .operand = "=<ms>",
+          .operand = "=<duration>",
           .apply = AssignInterval(),
-          .description = "`live-stats`: time between samples; each subject has\n"
-                         "its own default and its own floor" },
+          .description = "`live-stats`: time between samples (2s, 500ms); each\n"
+                         "subject has its own default and its own floor" },
         { .primary = "--samples",
           .arity = Arity::Value,
           .operand = "=<n>",
@@ -307,14 +313,14 @@ namespace
                          "series are read for, as the leader names it (24h, 7d, ...)" },
         { .primary = "--connect-timeout",
           .arity = Arity::Value,
-          .operand = "=<ms>",
-          .apply = AssignMilliseconds<&DialTimeouts::connect>(),
-          .description = "cap on establishing the connection (default 5000)" },
+          .operand = "=<duration>",
+          .apply = AssignTimeout<&DialTimeouts::connect>(),
+          .description = "cap on establishing the connection (default {connect-timeout})" },
         { .primary = "--timeout",
           .arity = Arity::Value,
-          .operand = "=<ms>",
-          .apply = AssignMilliseconds<&DialTimeouts::io>(),
-          .description = "cap on each read and write (default 10000)" },
+          .operand = "=<duration>",
+          .apply = AssignTimeout<&DialTimeouts::io>(),
+          .description = "cap on each read and write (default {io-timeout})" },
         { .primary = "--help",
           .alias = "-h",
           .select = SelectOutcome<&Command::action, Action::ShowHelp>(),
@@ -438,9 +444,7 @@ namespace
     /// modifier list, so a modifier without one would be refused nowhere and documented
     /// nowhere, with nothing to say it was missing.
     constexpr auto Modifiers = std::to_array<ModifierSpec>({
-        { .bit = Modifier::Ttl,
-          .flag = "--ttl",
-          .given = [](VerbOptions const& options) { return options.ttlSeconds != TtlUnset; } },
+        { .bit = Modifier::Ttl, .flag = "--ttl", .given = &ValueGiven<&VerbOptions::ttl> },
         { .bit = Modifier::Exclusivity, .flag = "--nx", .given = &FlagGiven<&VerbOptions::onlyIfAbsent> },
         { .bit = Modifier::Exclusivity, .flag = "--xx", .given = &FlagGiven<&VerbOptions::onlyIfPresent> },
         { .bit = Modifier::Raw, .flag = "--raw", .given = &FlagGiven<&VerbOptions::raw> },
@@ -988,6 +992,9 @@ std::string HelpText(UsageColor color)
 
     auto const substitutions = std::to_array<UsageSubstitution>({
         { .token = "{addr}", .value = "127.0.0.1:6674" },
+        { .token = "{duration-units}", .value = DurationUnitList() },
+        { .token = "{connect-timeout}", .value = FormatDuration(DialTimeouts {}.connect) },
+        { .token = "{io-timeout}", .value = FormatDuration(DialTimeouts {}.io) },
     });
 
     return RenderUsage({ .sections = sections }, color, substitutions);

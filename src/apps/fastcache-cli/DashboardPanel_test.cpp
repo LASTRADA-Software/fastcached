@@ -2452,6 +2452,19 @@ TEST_CASE("a panel's title states the cadence the server granted and the asked i
     CHECK(TopEdge(ungranted.front()).ends_with(TopEnd("127.0.0.1:6379  up 6d04:12  every 2s  q quit")));
 }
 
+TEST_CASE("a panel's title writes a cadence in the grammar --interval reads", "[cli][dashboard][panel][chrome]")
+{
+    // #1402. WHAT DISTINGUISHES is a cadence that is not a whole number of seconds: every other case here grants 2s
+    // or 5s, which a count of seconds and a duration spell alike. `500ms` is what an operator can type back as
+    // `--interval=500ms`; `0.5s` is refused by that flag.
+    auto subSecond = CacheChromeSample();
+    subSecond.cadence = std::chrono::milliseconds { 500 };
+    auto const frames = CacheChromeFrames({ subSecond, Tick }, 80);
+    REQUIRE(frames.size() == 1);
+    CHECK(TopEdge(frames.front()).contains("every 500ms"));
+    CHECK_FALSE(TopEdge(frames.front()).contains("0.5s"));
+}
+
 TEST_CASE("a cache panel's source line names the source, what was asked and where, and counts at the edge",
           "[cli][dashboard][panel][chrome]")
 {

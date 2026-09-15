@@ -348,6 +348,16 @@ TEST_CASE("A lease whose worker has gone renders an absence, not a blank", "[dis
     CHECK(RenderFleetHtml(snapshot, NoHistory(), 10).contains("&ndash;"));
 }
 
+TEST_CASE("The fleet page states its refresh as a duration", "[distributed][fleetview]")
+{
+    // #1402: one grammar for every length an operator reads or types. A count with a detached unit (`10 s`) is the
+    // spelling nothing parses; `10s` is what `--interval` and `--drain-timeout` read.
+    auto const html = RenderFleetHtml(LeadingSnapshot(), NoHistory(), 10);
+    CHECK(html.contains("this page refreshes every 10s"));
+    // The control: no refresh, no sentence -- a footer written unconditionally would pass the half above.
+    CHECK_FALSE(RenderFleetHtml(LeadingSnapshot(), NoHistory(), 0).contains("refreshes every"));
+}
+
 TEST_CASE("A fleet holding no leases renders an empty table, not a broken one", "[distributed][fleetview]")
 {
     auto snapshot = LeadingSnapshot();

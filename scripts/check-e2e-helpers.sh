@@ -3401,7 +3401,7 @@ x && timeout 5 foo
 y; gtimeout 5 foo
 CANARY
 cat > "${canary_dir}/must-not-catch.sh" <<'CANARY'
-stated_drain="--drain-timeout=${worker_drain_seconds}"
+stated_drain="--drain-timeout=${worker_drain_seconds}s"
 readonly DialTimeout=10
 echo "timeout ${endpoint}" >> "$probe_log"
 cases=("wait-timeout-silent|1|logged NOTHING")

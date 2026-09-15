@@ -1075,7 +1075,7 @@ commit_setting() {
         fail "${what}: ${key}=${value} was accepted and never became visible within ${ReplicationSeconds}s ($(probe_summary "$mark"))"
 }
 
-commit_setting lease-lifetime 1200000 "a setting accepted by the leader never became visible on it"
+commit_setting lease-lifetime 20min "a setting accepted by the leader never became visible on it"
 echo "cluster E2E: a setting replicates"
 
 # A setting nobody has heard of is refused where the operator is watching, rather
@@ -1410,7 +1410,7 @@ find_leader "the one-member cluster with a DERIVED identity to lead itself"
     fail "the one-member cluster is led from ${leader_endpoint}, which is not the only node in it"
 echo "cluster E2E: one node derives its own identity, bootstraps a cluster of itself and leads it"
 
-commit_setting lease-lifetime 1500000 "a one-member cluster cannot commit"
+commit_setting lease-lifetime 25min "a one-member cluster cannot commit"
 echo "cluster E2E: a one-member cluster commits alone"
 
 # The mistake `--raft-join` exists to prevent, made on purpose.
@@ -1547,7 +1547,7 @@ echo "cluster E2E: the second member is replicated to, and names ${leader_endpoi
 # visible only once a majority of TWO holds it, which is both nodes. A cluster whose
 # second member was admitted and cannot be reached fails exactly here, and passes
 # everything above.
-commit_setting lease-lifetime 1800000 "the cluster stopped committing when its quorum grew from one to two"
+commit_setting lease-lifetime 30min "the cluster stopped committing when its quorum grew from one to two"
 echo "cluster E2E: the cluster still commits with two members, so the quorum moved from 1 to 2 without stalling"
 
 # What the probing actually cost, on the SUCCESS path.

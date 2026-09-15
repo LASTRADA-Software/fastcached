@@ -277,7 +277,7 @@ inline constexpr std::string_view FleetOpenSetting = "fleet-open";
 /// Declared here and defined in the translation unit, so this header does not have to
 /// include the wire constants it bounds against; `SettingTable` only needs an address.
 ///
-/// @param value Milliseconds, as the operator typed them.
+/// @param value A duration (`20min`), as the operator typed it.
 /// @return The lifetime, or a sentence naming why it may not be set.
 [[nodiscard]] std::expected<std::chrono::milliseconds, std::string> ParseLeaseLifetime(std::string_view value);
 
@@ -286,7 +286,7 @@ inline constexpr std::string_view FleetOpenSetting = "fleet-open";
 /// The `SettingSpec::refuse` adapter over `ParseLeaseLifetime`. Separate only because
 /// the column answers *may this be set* and a reader wants the value.
 ///
-/// @param value Milliseconds, as the operator typed them.
+/// @param value A duration (`20min`), as the operator typed it.
 /// @return Why it may not be set, or nullopt when it may.
 [[nodiscard]] std::optional<std::string> RefuseLeaseLifetime(std::string_view value);
 
@@ -302,8 +302,8 @@ inline constexpr std::array<SettingSpec, 2> SettingTable {
                   .summary = R"('1' to admit every caller to the fleet, '0' for members only)",
                   .readBy = "NodeMembership::AgreedOpenness" },
     SettingSpec { .name = LeaseLifetimeSetting,
-                  .summary = "milliseconds a compile lease lives END TO END -- upload, wait for a slot, "
-                             "compile, and the object coming back -- not how long a compiler may run",
+                  .summary = "how long a compile lease lives END TO END, as a duration (20min) -- upload, wait "
+                             "for a slot, compile, and the object coming back -- not how long a compiler may run",
                   .refuse = &RefuseLeaseLifetime,
                   .readBy = "SchedulerService::AgreedLeaseLifetime" },
 };

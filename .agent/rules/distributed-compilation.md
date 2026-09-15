@@ -612,7 +612,7 @@ Consequences that are each load-bearing:
   Measured at 23.5 s of worker CPU and 84 MB returned to a client that had already
   given up (#223). `DispatchBudgets` is the split — `control` for the scheduler's
   `LEASE`/`RELEASE`, `compile` for the worker — and the two knobs are
-  `FASTCACHE_TIMEOUT_MS` and `FASTCACHE_DISPATCH_TIMEOUT_MS`. Four things about the
+  `FASTCACHE_TIMEOUT` and `FASTCACHE_DISPATCH_TIMEOUT`. Four things about the
   shape are load-bearing:
   - **A per-call socket ceiling is not a bound, and the seam is where that becomes
     sayable.** `SO_RCVTIMEO` bounds one `recv`, so a peer dribbling a byte before each

@@ -2,11 +2,14 @@
 #include "Dispatch.hpp"
 #include "LauncherCli.hpp"
 
+#include <FastCache/Cli/Duration.hpp>
 #include <FastCache/Cli/UsageTestUtils.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <array>
+#include <chrono>
+#include <format>
 #include <span>
 #include <string>
 #include <string_view>
@@ -14,6 +17,7 @@
 
 using namespace FastCache::Cc;
 using FastCache::Arity;
+using FastCache::FormatDuration;
 using FastCache::UsageColor;
 using FastCache::Testing::StripAnsi;
 
@@ -348,22 +352,22 @@ TEST_CASE("the help text documents every environment variable the launcher reads
                              "FASTCACHE_VERBOSE",
                              "FASTCACHE_NO_STATS",
                              "FASTCACHE_NO_DIRECT",
-                             "FASTCACHE_CONNECT_TIMEOUT_MS",
-                             "FASTCACHE_TIMEOUT_MS",
+                             "FASTCACHE_CONNECT_TIMEOUT",
+                             "FASTCACHE_TIMEOUT",
                              // Not a spelling variant of the row above it: a cache
                              // exchange and a remote compile are bounded by
                              // different things, and one knob moving both is the
                              // defect #223 records. A `contains` for the shorter
                              // name does not match the longer one, so dropping
                              // either row is caught here.
-                             "FASTCACHE_DISPATCH_TIMEOUT_MS",
+                             "FASTCACHE_DISPATCH_TIMEOUT",
                              // Nor is THIS one a variant of the row above it, and the
                              // same `contains` argument applies in the other direction:
                              // the total bounds how long a compile may take and this
                              // bounds how long the worker may say nothing, which is the
                              // split #245 exists for. A build that documented one and
                              // read the other would read exactly like a working one.
-                             "FASTCACHE_DISPATCH_IDLE_MS",
+                             "FASTCACHE_DISPATCH_IDLE",
                              "FASTCACHE_MAX_STORE_BYTES",
                              "FASTCACHE_SCHEDULER",
                              "FASTCACHE_TOKEN",
@@ -422,14 +426,34 @@ TEST_CASE("the help text tells an operator where to find their msvc_deps_prefix"
     CHECK(help.contains("build.ninja"));
 }
 
-TEST_CASE("the help text states the dispatch deadline the launcher actually uses")
+TEST_CASE("the help text states the dispatch deadlines the launcher actually uses")
 {
-    // The number in an `EnvVarSpec` summary is prose in a `constexpr` table, so it
-    // cannot be formatted from the constant -- which makes it exactly the kind of
-    // second statement that drifts. An operator who reads "600000" and gets ten
-    // seconds has been told something false about a knob whose whole purpose is
-    // that one deadline could not serve two conversations (#223).
+    // Formatted from the constants through usage tokens rather than written into the
+    // summaries, because a number in prose is the second statement that drifts. An
+    // operator who reads "10min" and gets ten seconds has been told something false
+    // about a knob whose whole purpose is that one deadline could not serve two
+    // conversations (#223).
     auto const help = HelpText();
     INFO(help);
-    CHECK(help.contains(std::to_string(DefaultDispatchTotal.count())));
+    CHECK(help.contains(std::format("default {}", FormatDuration(DefaultDispatchTotal))));
+    CHECK(help.contains(std::format("default {}", FormatDuration(DefaultDispatchIdle))));
+    // A token nobody spliced prints its own braces, and reads as a default of "{dispatch-idle}".
+    CHECK_FALSE(help.contains("{dispatch-timeout}"));
+    CHECK_FALSE(help.contains("{dispatch-idle}"));
+}
+
+TEST_CASE("a launcher deadline variable reads a duration and falls back on anything else")
+{
+    // WHAT DISTINGUISHES is the bare number: it was the ONLY spelling while these names
+    // ended in `_MS`, so a reader still taking it would read `2000` as two seconds here
+    // and as something else wherever a unit is implied. The fallback is distinct from
+    // every value parsed below, so a reader answering one spelling's parse for another
+    // cannot pass.
+    auto const fallback = std::chrono::milliseconds { 7'777 };
+    CHECK(EnvironmentDuration("500ms", fallback) == std::chrono::milliseconds { 500 });
+    CHECK(EnvironmentDuration("10min", fallback) == std::chrono::minutes { 10 });
+    CHECK(EnvironmentDuration("0s", fallback) == std::chrono::milliseconds::zero());
+    CHECK(EnvironmentDuration("2000", fallback) == fallback);
+    CHECK(EnvironmentDuration("", fallback) == fallback);
+    CHECK(EnvironmentDuration("soon", fallback) == fallback);
 }

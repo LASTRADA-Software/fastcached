@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#include <FastCache/Cli/Duration.hpp>
 #include <FastCache/Cluster/ClusterState.hpp>
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/HostPort.hpp>
@@ -422,18 +423,19 @@ std::chrono::milliseconds SchedulerService::AgreedLeaseLifetime() const
 
     // Not fatal, and deliberately not a refusal to schedule. `Validate` runs on the
     // leader before the append, so no build in this tree can put an unreadable value
-    // here; what can is a NEWER build with wider bounds, mid rolling upgrade -- and a
-    // node that refused every lease on meeting one would take the fleet down for an
-    // upgrade rather than for a fault. Serving under the default is the outcome that
-    // degrades; saying so once is what keeps it from being silent.
+    // here; what can is a NEWER build with wider bounds, mid rolling upgrade, or an
+    // OLDER one's value committed before this setting took a unit (#1402: `1200000`
+    // names none) -- and a node that refused every lease on meeting one would take the
+    // fleet down for an upgrade rather than for a fault. Serving under the default is
+    // the outcome that degrades; saying so once is what keeps it from being silent.
     if (!_warnedLeaseLifetime.exchange(true, std::memory_order_relaxed))
         _logger.Logf(LogLevel::Warn,
-                     "this cluster's {} is {}, which this build cannot read ({}); granting leases of {} ms until it "
+                     "this cluster's {} is {}, which this build cannot read ({}); granting leases of {} until it "
                      "is set to something this build understands",
                      Cluster::LeaseLifetimeSetting,
                      *configured,
                      parsed.error(),
-                     _leases.Timeout().count());
+                     FormatDuration(_leases.Timeout()));
     return _leases.Timeout();
 }
 

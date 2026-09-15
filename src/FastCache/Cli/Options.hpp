@@ -215,7 +215,7 @@ struct OptionSpec
     /// Measured on the daemon when #1437 gave every setting row a key: 48 flag rows, 36
     /// of which carry one, diverging three ways -- `--storage` is `storage_path`,
     /// `--expiry-scan` is `active_expiry_scan`, and `--expiry-interval` is
-    /// `active_expiry_interval_ms` (renamed *and* carrying a unit the flag does not).
+    /// `active_expiry_interval` (renamed; until #1402 it also carried a unit the flag did not).
     /// There is no rule with exceptions there, only a mapping, and a convention derived
     /// from flag names would silently rename those three keys the day somebody
     /// generalised it.

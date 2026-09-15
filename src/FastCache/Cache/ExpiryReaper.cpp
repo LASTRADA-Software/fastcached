@@ -2,6 +2,7 @@
 #include <FastCache/Async/ResumeOn.hpp>
 #include <FastCache/Async/SleepUntil.hpp>
 #include <FastCache/Cache/ExpiryReaper.hpp>
+#include <FastCache/Cli/Duration.hpp>
 #include <FastCache/Core/BoundedDrain.hpp>
 #include <FastCache/Core/Profiling.hpp>
 
@@ -248,10 +249,10 @@ Task<void> ExpiryReaper::Run(IReactor* reactor, IExecutor* sweepOn, Cancellation
     }
 
     _logger.Logf(LogLevel::Debug,
-                 "expiry: active cycle every {} ms (idle backoff to {} ms), {} entries scanned and at most {} "
+                 "expiry: active cycle every {} (idle backoff to {}), {} entries scanned and at most {} "
                  "reclaimed per sweep",
-                 std::chrono::duration_cast<std::chrono::milliseconds>(_options.interval).count(),
-                 std::chrono::duration_cast<std::chrono::milliseconds>(_options.maxInterval).count(),
+                 FormatDuration(std::chrono::duration_cast<std::chrono::milliseconds>(_options.interval)),
+                 FormatDuration(std::chrono::duration_cast<std::chrono::milliseconds>(_options.maxInterval)),
                  _options.scanBudget,
                  _options.purgeBudget);
 

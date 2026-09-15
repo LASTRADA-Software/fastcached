@@ -294,7 +294,7 @@ WorkerTier::WorkerTier(WorkerTierParts const& parts,
     // Sized to the slot cap, which is what makes an admitted job always find a thread,
     // and declared before the capacity and the responder, so neither outlives it.
     _pool { slots },
-    _capacity { slots, WorkerMaxRequestBytes, std::chrono::seconds { parts.cfg.drainTimeoutSeconds }, parts.logger },
+    _capacity { slots, WorkerMaxRequestBytes, parts.cfg.drainTimeout, parts.logger },
     // The compile verbs on the node's own `0xFC` listener. A frame arrives on the reactor;
     // the compile leaves it for the pool and the reply comes BACK to it, which is why
     // `CompileResponder_test.cpp` asserts the thread identities (#213, #290).

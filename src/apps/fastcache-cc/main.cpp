@@ -24,16 +24,16 @@
 //   FASTCACHE_VERBOSE    if set, print fall-back diagnostics to stderr
 //   FASTCACHE_NO_STATS   if set, do not record invocations to the statistics log
 //   FASTCACHE_NO_DIRECT  if set, disable direct mode (always preprocess)
-//   FASTCACHE_TIMEOUT_MS deadline in ms for one WHOLE cache exchange, request to
-//                        last byte of the reply (default 10000; 0 = unbounded)
-//   FASTCACHE_DISPATCH_TIMEOUT_MS
-//                        deadline in ms for one whole COMPILE exchange with a
-//                        worker (default 600000; 0 = unbounded). Separate from the
+//   FASTCACHE_TIMEOUT    deadline for one WHOLE cache exchange, request to last
+//                        byte of the reply (default 10s; 0s = unbounded)
+//   FASTCACHE_DISPATCH_TIMEOUT
+//                        deadline for one whole COMPILE exchange with a worker
+//                        (default 10min; 0s = unbounded). Separate from the
 //                        one above because a compile is bounded by how long a
 //                        compiler runs, not by a round trip (#223).
-//   FASTCACHE_DISPATCH_IDLE_MS
-//                        deadline in ms on SILENCE during that exchange (default
-//                        30000; 0 = unbounded). A running compile pulses at its
+//   FASTCACHE_DISPATCH_IDLE
+//                        deadline on SILENCE during that exchange (default 30s;
+//                        0s = unbounded). All three are durations. A running compile pulses at its
 //                        client every few seconds, so this bounds how long the
 //                        worker may say NOTHING -- the one failure keepalive
 //                        cannot see (#245).
@@ -126,7 +126,7 @@ namespace Wire = FastCache::CompileCacheWire;
 // --- config ----------------------------------------------------------------
 
 /// Default deadline for one whole CACHE exchange, overridable with
-/// FASTCACHE_TIMEOUT_MS.
+/// FASTCACHE_TIMEOUT.
 ///
 /// Impatient on purpose: a daemon answers a FETCH or a STORE out of memory, so one
 /// that has not finished in ten seconds is one this build is better off without.
@@ -277,15 +277,13 @@ struct Config
     return static_cast<std::uint64_t>(value);
 }
 
-/// Read a non-negative millisecond count from the environment. `0` means "no
-/// timeout".
+/// Read a duration from the environment (`500ms`, `10min`). `0s` means "no timeout".
 /// @param name Variable to read.
-/// @param fallback Value to use when unset or malformed.
+/// @param fallback Value to use when unset or malformed -- see `Cc::EnvironmentDuration`.
 /// @return The parsed duration, or `fallback`.
-[[nodiscard]] std::chrono::milliseconds EnvMillis(std::string_view name, std::chrono::milliseconds fallback)
+[[nodiscard]] std::chrono::milliseconds EnvDuration(std::string_view name, std::chrono::milliseconds fallback)
 {
-    auto const count = static_cast<std::uint64_t>(fallback.count());
-    return std::chrono::milliseconds { static_cast<std::int64_t>(EnvUnsigned(name, count)) };
+    return Cc::EnvironmentDuration(EnvOr(name, ""), fallback);
 }
 
 /// The path-identity seam every root comparison in this file depends on.
@@ -330,10 +328,10 @@ struct Config
     c.stats = !EnvSet(Cc::EnvName::NoStats);
     c.direct = !EnvSet(Cc::EnvName::NoDirect);
     c.verifyRate = Cc::ParseVerificationRate(EnvOr(Cc::EnvName::Verify, ""));
-    c.ioTimeout = EnvMillis(Cc::EnvName::TimeoutMs, DefaultIoTimeout);
-    c.dispatchTimeout = EnvMillis(Cc::EnvName::DispatchTimeoutMs, Cc::DefaultDispatchTotal);
-    c.dispatchIdle = EnvMillis(Cc::EnvName::DispatchIdleMs, Cc::DefaultDispatchIdle);
-    c.connectTimeout = EnvMillis(Cc::EnvName::ConnectTimeoutMs, DefaultConnectTimeout);
+    c.ioTimeout = EnvDuration(Cc::EnvName::Timeout, DefaultIoTimeout);
+    c.dispatchTimeout = EnvDuration(Cc::EnvName::DispatchTimeout, Cc::DefaultDispatchTotal);
+    c.dispatchIdle = EnvDuration(Cc::EnvName::DispatchIdle, Cc::DefaultDispatchIdle);
+    c.connectTimeout = EnvDuration(Cc::EnvName::ConnectTimeout, DefaultConnectTimeout);
     // A username without a token is not a credential, and `Credential::Configured`
     // keys on the secret alone — so an operator who sets only FASTCACHE_USER gets
     // the same unauthenticated behaviour they had before, rather than an AUTH

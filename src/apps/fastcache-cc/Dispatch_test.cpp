@@ -1506,7 +1506,7 @@ TEST_CASE("The client waits for as long as the GRANT says, not for as long as it
     {
         // Not a fallback anybody should reach -- no version-6 peer sends a zero -- but
         // the alternative is a zero budget, which fails every compile instantly. The
-        // control also states what `FASTCACHE_DISPATCH_TIMEOUT_MS` still does: it bounds
+        // control also states what `FASTCACHE_DISPATCH_TIMEOUT` still does: it bounds
         // the legs that hold no grant, and nothing else.
         ScriptedFleet fleet;
         fleet.Serve(std::string { Scheduler }, GrantReply());

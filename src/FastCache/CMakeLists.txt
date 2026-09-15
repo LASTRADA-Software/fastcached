@@ -22,6 +22,7 @@ target_sources(FastCache
         Cache/ShardedStorage.cpp
         Cache/TracingStorage.cpp
         Cache/WriteErrorReportingStorage.cpp
+        Cli/Duration.cpp
         Cli/UsageDoc.cpp
         CompileCache/PrefetchGroupManifest.cpp
         CompileCache/CompileValue.cpp

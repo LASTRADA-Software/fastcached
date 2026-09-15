@@ -7,6 +7,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <format>
 #include <initializer_list>
@@ -375,32 +376,46 @@ TEST_CASE("CliParser: --listen-backlog rejects out-of-range values", "[config][c
     REQUIRE_FALSE(FastCache::ParseCli(std::span<char const* const> { tooBig }).has_value());
 }
 
-TEST_CASE("CliParser: --expiry-interval=0 disables the cycle and is not a degenerate count", "[config][cli][expiry]")
+TEST_CASE("CliParser: --expiry-interval=0s disables the cycle and is not a degenerate count", "[config][cli][expiry]")
 {
-    // Zero is the one spelling that MEANS something here -- it turns the active
+    // Zero is the one value that MEANS something here -- it turns the active
     // expiry cycle off and leaves expiry access-driven, which is what the
     // daemon did before it had one. Every other count flag in this table
     // rejects zero, so accepting it has to be asserted rather than assumed.
-    auto const args = std::array<char const*, 1> { "--expiry-interval=0" };
+    auto const args = std::array<char const*, 1> { "--expiry-interval=0s" };
     auto const result = FastCache::ParseCli(std::span<char const* const> { args });
     REQUIRE(result.has_value());
-    REQUIRE(result->config.activeExpiryIntervalMs == 0U);
-    REQUIRE(result->activeExpiryIntervalMsExplicit);
+    REQUIRE(result->config.activeExpiryInterval == std::chrono::milliseconds::zero());
+    REQUIRE(result->activeExpiryIntervalExplicit);
 }
 
-TEST_CASE("CliParser: --expiry-interval refuses a figure typed in the wrong unit", "[config][cli][expiry]")
+TEST_CASE("CliParser: --expiry-interval takes a duration, refuses a bare number, and stops at a day",
+          "[config][cli][expiry]")
 {
-    auto const ok = std::array<char const*, 1> { "--expiry-interval=250" };
+    auto const ok = std::array<char const*, 1> { "--expiry-interval=250ms" };
     auto const parsed = FastCache::ParseCli(std::span<char const* const> { ok });
     REQUIRE(parsed.has_value());
-    REQUIRE(parsed->config.activeExpiryIntervalMs == 250U);
+    REQUIRE(parsed->config.activeExpiryInterval == std::chrono::milliseconds { 250 });
 
-    // A day is the ceiling. Nobody reaches it on purpose; it is there so
-    // seconds typed where milliseconds were wanted -- or a stray digit -- is
-    // refused rather than silently turning the cycle off for the life of the
-    // process, which looks exactly like the bug this flag exists to fix.
-    auto const tooBig = std::array<char const*, 1> { "--expiry-interval=86400001" };
-    REQUIRE_FALSE(FastCache::ParseCli(std::span<char const* const> { tooBig }).has_value());
+    // A bare number was milliseconds here and seconds on the worker's drain timeout,
+    // which is the ambiguity the grammar exists to remove: it names no unit, so it
+    // is refused by name rather than read in one of them.
+    auto const bare = std::array<char const*, 1> { "--expiry-interval=250" };
+    auto const refusedBare = FastCache::ParseCli(std::span<char const* const> { bare });
+    REQUIRE_FALSE(refusedBare.has_value());
+    CHECK(refusedBare.error().context.contains("names no unit"));
+
+    // A day is the ceiling. Nobody reaches it on purpose; it is there so a figure
+    // typed wildly wrong is refused rather than silently turning the cycle off for
+    // the life of the process, which looks exactly like the bug this flag exists to
+    // fix. The bound is rendered in the grammar an operator would type it in.
+    auto const atCeiling = std::array<char const*, 1> { "--expiry-interval=1d" };
+    REQUIRE(FastCache::ParseCli(std::span<char const* const> { atCeiling }).has_value());
+    auto const tooBig = std::array<char const*, 1> { "--expiry-interval=86400001ms" };
+    auto const refusedBig = FastCache::ParseCli(std::span<char const* const> { tooBig });
+    REQUIRE_FALSE(refusedBig.has_value());
+    CHECK(refusedBig.error().code == FastCache::ConfigErrorCode::OutOfRange);
+    CHECK(refusedBig.error().context.contains("ceiling of 1d"));
 }
 
 TEST_CASE("CliParser: --expiry-scan rejects zero, which PurgeBudget reads as unbounded", "[config][cli][expiry]")

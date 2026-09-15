@@ -153,7 +153,7 @@ TEST_CASE("`node` reports what the endpoint is", "[cli][node][verbs]")
     // taken on the handler's word -- a handler sending the wrong opcode would otherwise
     // pass every case, the fake answering from a script regardless of what it was asked.
     REQUIRE(node.Sent().size() == 1);
-    CHECK(OpOf(node.Sent()[0]) == static_cast<std::uint8_t>(Cc::Op::NodeStatus));
+    CHECK(OpOf(SentFrame(node)) == static_cast<std::uint8_t>(Cc::Op::NodeStatus));
     CHECK(node.Unused() == 0);
 
     CHECK(RequiredCell(answer, "version").lexical == "0.2.0-124-gd911b33e");
@@ -455,7 +455,7 @@ TEST_CASE("`node-metrics` reports every figure the node's reading carries", "[cl
     auto const answer = RunNodeVerb("node-metrics", node);
     CHECK(answer.outcome == Outcome::Affirmative);
     REQUIRE(node.Sent().size() == 1);
-    CHECK(OpOf(node.Sent()[0]) == static_cast<std::uint8_t>(Cc::Op::NodeMetrics));
+    CHECK(OpOf(SentFrame(node)) == static_cast<std::uint8_t>(Cc::Op::NodeMetrics));
 
     CHECK(RequiredCell(answer, "fastcache_worker_jobs_completed_total").lexical == "12");
     CHECK(RequiredCell(answer, "fastcached_items").lexical == "3");
@@ -487,7 +487,7 @@ TEST_CASE("`node-metrics` against a node of the previous wire version is refused
 
     auto const answer = RunNodeVerb("node-metrics", node);
     REQUIRE(node.Sent().size() == 1);
-    CHECK(static_cast<std::uint8_t>(node.Sent()[0][1]) == Cc::CurrentVersion);
+    CHECK(static_cast<std::uint8_t>(SentFrame(node)[1]) == Cc::CurrentVersion);
     CHECK(answer.outcome == Outcome::Refused);
     REQUIRE(answer.advisories.size() == 1);
     CHECK(answer.advisories[0].contains("this server speaks 9..9"));
@@ -852,7 +852,7 @@ TEST_CASE("`del` on a node sends one cache-drop per key and counts what was remo
     REQUIRE(node.Sent().size() == Keys.size());
     for (auto const index: std::views::iota(std::size_t { 0 }, Keys.size()))
     {
-        auto const& sent = node.Sent()[index];
+        auto const& sent = SentFrame(node, index);
         auto const key = Keys[index];
         CHECK(OpOf(sent) == static_cast<std::uint8_t>(Cc::Op::CacheDrop));
         auto const payload = Cc::DecodeCacheDropPayload(std::span<std::byte const> { sent }.subspan(Cc::RequestHeaderSize));
@@ -1227,7 +1227,7 @@ TEST_CASE("the cluster verbs send the opcodes the wire table names", "[cli][node
         (void) RunNodeVerb(expectation.verb, node, expectation.operands);
 
         REQUIRE(node.Sent().size() == 1);
-        auto const header = Cc::DecodeRequestHeader(node.Sent()[0]);
+        auto const header = Cc::DecodeRequestHeader(SentFrame(node));
         REQUIRE(header.has_value());
         // `opRaw` and not an `Op`: the header decoder deliberately hands back the BYTE,
         // unvalidated against `OpTable`, so a verb this build does not carry is still
@@ -1363,7 +1363,7 @@ TEST_CASE("fleet asks the node for the section named and renders the leader's ow
     // The section travels as the word typed rather than being checked here: which sections exist is
     // the leader's table, and this binary deliberately holds no copy to disagree with it.
     REQUIRE(node.Sent().size() == 1);
-    auto const request = FleetRequestOf(node.Sent()[0]);
+    auto const request = FleetRequestOf(SentFrame(node));
     CHECK(request.section == "workers");
     CHECK(request.range.empty());
     CHECK(request.dashboardToken == "s3cret");
@@ -1391,7 +1391,7 @@ TEST_CASE("fleet series asks for the range given and draws a gap as an absent ce
 
     REQUIRE(answer.outcome == Outcome::Affirmative);
     REQUIRE(node.Sent().size() == 1);
-    auto const request = FleetRequestOf(node.Sent()[0]);
+    auto const request = FleetRequestOf(SentFrame(node));
     CHECK(request.section == "series");
     CHECK(request.range == "7d");
 
@@ -1405,7 +1405,7 @@ TEST_CASE("fleet series asks for the range given and draws a gap as an absent ce
         ScriptedNodeExchange defaulted { { FleetDocumentReply("start\tcoverage\tbackfilled\n") } };
         (void) RunFleet(defaulted, nullptr, { "series" });
         REQUIRE(defaulted.Sent().size() == 1);
-        CHECK(FleetRequestOf(defaulted.Sent()[0]).range.empty());
+        CHECK(FleetRequestOf(SentFrame(defaulted)).range.empty());
     }
 }
 
@@ -1457,7 +1457,7 @@ TEST_CASE("fleet follows a follower to the leader it names and says so on stderr
     CHECK(dial.Dialled() == std::vector<std::string> { "10.0.0.2:6674" });
     REQUIRE(leader.Sent().size() == 1);
     REQUIRE(follower.Sent().size() == 1);
-    CHECK(leader.Sent()[0] == follower.Sent()[0]);
+    CHECK(SentFrame(leader) == SentFrame(follower));
     CHECK(RenderValue(answer.value, RenderOptions { .format = OutputFormat::Json }).contains("w1"));
 
     // One remark naming both, so an operator who pointed at a follower learns where the leader is.
@@ -1948,8 +1948,8 @@ TEST_CASE("cordon and uncordon send the cordon verb carrying the action each nam
         (void) RunNodeVerb(verb, node);
 
         REQUIRE(node.Sent().size() == 1);
-        CHECK(OpOf(node.Sent()[0]) == 0x13);
-        CHECK(node.Sent()[0] == Cc::EncodeCordonRequest(action));
+        CHECK(OpOf(SentFrame(node)) == 0x13);
+        CHECK(SentFrame(node) == Cc::EncodeCordonRequest(action));
     }
 }
 

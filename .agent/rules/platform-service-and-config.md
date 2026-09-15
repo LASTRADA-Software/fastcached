@@ -699,8 +699,8 @@ readable and silently ignored. Every rule below has already been one of them.
 - **Which key a row answers to is a COLUMN, never a derivation.** Measured on the
   daemon when #1437 keyed every setting row: 48 flag rows, 36 of which carry a key,
   diverging three ways — `--storage` is `storage_path`, `--expiry-scan` is
-  `active_expiry_scan`, `--expiry-interval` is `active_expiry_interval_ms` (renamed
-  *and* carrying a unit the flag does not). There is no rule with exceptions there,
+  `active_expiry_scan`, `--expiry-interval` is `active_expiry_interval` (renamed, and
+  until #1402 also carrying a unit the flag did not). There is no rule with exceptions there,
   only a mapping, and a convention derived from flag names would silently rename
   those three keys the day somebody generalised it. A NESTED key cannot be a column
   at all: the daemon's `listeners:` block became `listen:` and `listen_tls:`, lists

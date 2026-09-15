@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
+#include "Dispatch.hpp"
 #include "LauncherCli.hpp"
+
+#include <FastCache/Cli/Duration.hpp>
 
 #include <algorithm>
 #include <array>
@@ -193,22 +196,24 @@ namespace
                                 "Direct mode is on by default: it reaches a cached object by\n"
                                 "re-hashing the project headers a previous compile recorded,\n"
                                 "which is far cheaper than preprocessing the translation unit." },
-        EnvVarSpec { .name = EnvName::ConnectTimeoutMs,
-                     .summary = "Deadline, in milliseconds, for OPENING a connection to the\n"
-                                "daemon -- name resolution included (default 1000; 0 leaves\n"
-                                "the platform's own, which runs to minutes).\n"
+        EnvVarSpec { .name = EnvName::ConnectTimeout,
+                     .summary = "Deadline for OPENING a connection to the daemon -- name\n"
+                                "resolution included (default {connect-timeout}; 0s leaves the\n"
+                                "platform's own, which runs to minutes). Each of these four\n"
+                                "deadlines is a duration: a whole number and one of\n"
+                                "{duration-units}. A bare number is not one, and is ignored.\n"
                                 "\n"
-                                "Separate from FASTCACHE_TIMEOUT_MS because they bound\n"
+                                "Separate from FASTCACHE_TIMEOUT because they bound\n"
                                 "different things and neither implies the other. This one is\n"
                                 "short on purpose: a cache that has not accepted within a\n"
                                 "second is one the build is better off without, and a name\n"
                                 "lookup that hangs would otherwise stall every translation\n"
                                 "unit with nothing to say why.\n" },
-        EnvVarSpec { .name = EnvName::TimeoutMs,
-                     .summary = "Deadline, in milliseconds, for one WHOLE exchange with the\n"
-                                "daemon -- or with a scheduler's lease and release verbs --\n"
-                                "measured from the request to the last byte of the reply\n"
-                                "(default 10000; 0 removes the bound). A daemon that accepts\n"
+        EnvVarSpec { .name = EnvName::Timeout,
+                     .summary = "Deadline for one WHOLE exchange with the daemon -- or with\n"
+                                "a scheduler's lease and release verbs -- measured from the\n"
+                                "request to the last byte of the reply (default {timeout};\n"
+                                "0s removes the bound). A daemon that accepts\n"
                                 "the connection and then stalls -- or dribbles one byte at a\n"
                                 "time, which no per-call ceiling catches -- would otherwise\n"
                                 "block the compile forever, which would make the cache\n"
@@ -219,13 +224,12 @@ namespace
                                 "mode makes a separate manifest round-trip, so one compile\n"
                                 "against a wedged daemon can wait up to twice this before\n"
                                 "falling back. It does NOT bound a remote compile -- see\n"
-                                "FASTCACHE_DISPATCH_TIMEOUT_MS." },
-        EnvVarSpec { .name = EnvName::DispatchTimeoutMs,
-                     .summary = "Deadline, in milliseconds, for one whole COMPILE exchange\n"
-                                "with a worker (default 600000 = 10 minutes; 0 removes the\n"
-                                "bound).\n"
+                                "FASTCACHE_DISPATCH_TIMEOUT." },
+        EnvVarSpec { .name = EnvName::DispatchTimeout,
+                     .summary = "Deadline for one whole COMPILE exchange with a worker\n"
+                                "(default {dispatch-timeout}; 0s removes the bound).\n"
                                 "\n"
-                                "Separate from FASTCACHE_TIMEOUT_MS, and far larger, because\n"
+                                "Separate from FASTCACHE_TIMEOUT, and far larger, because\n"
                                 "the two bound different shapes of conversation. A worker\n"
                                 "writes nothing until the compiler has finished, so the\n"
                                 "client waits out the entire remote compile in one read:\n"
@@ -252,15 +256,14 @@ namespace
                                 "variable is a RUNTIME setting: change it and the next\n"
                                 "compile picks it up. Nothing needs reloading or\n"
                                 "restarting." },
-        EnvVarSpec { .name = EnvName::DispatchIdleMs,
-                     .summary = "Deadline, in milliseconds, on SILENCE during a COMPILE\n"
-                                "exchange (default 30000 = 30 seconds; 0 removes the\n"
-                                "bound).\n"
+        EnvVarSpec { .name = EnvName::DispatchIdle,
+                     .summary = "Deadline on SILENCE during a COMPILE exchange\n"
+                                "(default {dispatch-idle}; 0s removes the bound).\n"
                                 "\n"
                                 "A worker writes a five-byte progress frame every few\n"
                                 "seconds while it is compiling, so what this bounds is not\n"
                                 "how long the compile takes -- that is\n"
-                                "FASTCACHE_DISPATCH_TIMEOUT_MS, and it stays minutes long --\n"
+                                "FASTCACHE_DISPATCH_TIMEOUT, and it stays minutes long --\n"
                                 "but how long the worker may say nothing at all. That is the\n"
                                 "one failure TCP keepalive cannot see: a machine whose\n"
                                 "kernel answers every probe while the worker process makes\n"
@@ -273,7 +276,7 @@ namespace
                                 "because 'that compile was slow' and 'that worker went quiet'\n"
                                 "are fixed in different places.\n"
                                 "\n"
-                                "Setting it to 0 restores the pre-progress-frame behaviour:\n"
+                                "Setting it to 0s restores the pre-progress-frame behaviour:\n"
                                 "one flat deadline, and a silent worker noticed only when it\n"
                                 "runs out." },
         EnvVarSpec { .name = EnvName::MaxStoreBytes,
@@ -479,6 +482,11 @@ Command ParseTopLevel(std::span<std::string const> args)
     return Selected(Action::Compile);
 }
 
+std::chrono::milliseconds EnvironmentDuration(std::string_view text, std::chrono::milliseconds fallback) noexcept
+{
+    return ParseDuration(text).value_or(fallback);
+}
+
 std::span<EnvVarSpec const> LauncherEnvironment() noexcept
 {
     return EnvironmentTable;
@@ -527,7 +535,16 @@ std::string HelpText(UsageColor color)
         { .blocks = allBlocks.subspan(6, 2) },
     });
 
-    return RenderUsage({ .sections = sections }, color);
+    // The defaults are formatted from the constants the launcher runs under, never written into
+    // the summaries: a number in prose is a second statement of it, and the one that drifts.
+    auto const substitutions = std::to_array<UsageSubstitution>({
+        { .token = "{duration-units}", .value = DurationUnitList() },
+        { .token = "{connect-timeout}", .value = FormatDuration(ExchangeBudget {}.connect) },
+        { .token = "{timeout}", .value = FormatDuration(ExchangeBudget {}.total) },
+        { .token = "{dispatch-timeout}", .value = FormatDuration(DefaultDispatchTotal) },
+        { .token = "{dispatch-idle}", .value = FormatDuration(DefaultDispatchIdle) },
+    });
+    return RenderUsage({ .sections = sections }, color, substitutions);
 }
 
 } // namespace FastCache::Cc

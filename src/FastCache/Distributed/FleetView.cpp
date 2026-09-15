@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#include <FastCache/Cli/Duration.hpp>
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/FigureText.hpp>
 #include <FastCache/Core/Ranges.hpp>
@@ -2632,7 +2633,8 @@ std::string RenderFleetHtml(FleetSnapshot const& snapshot, FleetHistoryView cons
 
     out += R"(<footer>/metrics remains the source of truth for anything alertable)";
     if (refreshSeconds != 0)
-        out += std::format(" &middot; this page refreshes every {} s", refreshSeconds);
+        out +=
+            std::format(" &middot; this page refreshes every {}", FormatDuration(std::chrono::seconds { refreshSeconds }));
     out += "</footer>";
 
     out += "</div></body></html>";

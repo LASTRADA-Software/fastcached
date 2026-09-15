@@ -283,7 +283,7 @@ fi
 # collapse in the one verb whose job is that distinction.
 # ---------------------------------------------------------------------------------
 echo "==> case 5: ttl reports three states"
-run_cli set withttl v --ttl=300
+run_cli set withttl v --ttl=300s
 expect_status 0 "set --ttl"
 
 run_cli ttl withttl --format=kv

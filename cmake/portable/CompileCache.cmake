@@ -985,7 +985,7 @@ function(_fc_daemon_answering addr outVar)
                 "FASTCACHE_BINARY_DIR=${CMAKE_BINARY_DIR}"
                 "FASTCACHE_VERBOSE=1"
                 "FASTCACHE_NO_STATS=1"
-                "FASTCACHE_TIMEOUT_MS=500"
+                "FASTCACHE_TIMEOUT=500ms"
                 "${FASTCACHE_CC}" "${CMAKE_CXX_COMPILER}" ${_args}
         WORKING_DIRECTORY "${_dir}"
         TIMEOUT 3
@@ -1215,7 +1215,7 @@ function(_fc_probe_fastcache_cc outVar reasonVar)
 
     # A probe that answers takes ~0.1s locally and little more over a LAN, so ten
     # seconds is generous for a working daemon and a bounded wait for a broken
-    # one. The cap has to live here: FASTCACHE_TIMEOUT_MS bounds the launcher's
+    # one. The cap has to live here: FASTCACHE_TIMEOUT bounds the launcher's
     # send/recv but not its connect(), so an address that drops packets rather
     # than refusing them — a firewall, a downed VPN, a host that is simply gone —
     # stalls on the TCP connect timeout instead (measured: 2m30s), and every
@@ -1223,14 +1223,14 @@ function(_fc_probe_fastcache_cc outVar reasonVar)
     set(_timeoutSeconds 10)
 
     # NO_STATS keeps the probe out of `fastcache-cc --show-stats`, where it would
-    # read as a build that never hits. TIMEOUT_MS bounds a daemon that accepts
+    # read as a build that never hits. FASTCACHE_TIMEOUT bounds a daemon that accepts
     # the connection and then stalls; builds keep the launcher's own default.
     execute_process(
         COMMAND "${CMAKE_COMMAND}" -E env
                 ${_fc_fastcache_env}
                 "FASTCACHE_VERBOSE=1"
                 "FASTCACHE_NO_STATS=1"
-                "FASTCACHE_TIMEOUT_MS=2000"
+                "FASTCACHE_TIMEOUT=2s"
                 "${FASTCACHE_CC}" "${CMAKE_CXX_COMPILER}" ${_args}
         WORKING_DIRECTORY "${_dir}"
         TIMEOUT ${_timeoutSeconds}
