@@ -12,6 +12,7 @@
     #include <chrono>
     #include <coroutine>
     #include <format>
+    #include <ranges>
     #include <string>
     #include <thread>
     #include <tuple>
@@ -42,7 +43,7 @@ struct YieldAwaitable
 // spells the same seam `ISocket*` / `IClock*` for the same reason.
 FastCache::DetachedTask Worker(FastCache::IReactor* reactor, std::atomic<int>* counter, int yields)
 {
-    for (auto i = 0; i < yields; ++i)
+    for ([[maybe_unused]] auto const i: std::views::iota(0, yields))
     {
         counter->fetch_add(1, std::memory_order_relaxed);
         co_await YieldAwaitable { *reactor };

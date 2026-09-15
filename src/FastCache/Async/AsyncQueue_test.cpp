@@ -9,6 +9,7 @@
 #include <coroutine>
 #include <cstddef>
 #include <optional>
+#include <ranges>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -236,7 +237,7 @@ TEST_CASE("A producer on another thread reaches a consumer on the reactor", "[as
     constexpr int Count = 256;
     {
         std::jthread const producer { [&] {
-            for (auto i = 0; i < Count; ++i)
+            for (auto const i: std::views::iota(0, Count))
                 queue.Push(i);
         } };
     }
@@ -245,7 +246,7 @@ TEST_CASE("A producer on another thread reaches a consumer on the reactor", "[as
     REQUIRE(seen.size() == Count);
     // FIFO across the hand-off: a queue that lost or reordered under contention
     // would show up here rather than as a count that happens to match.
-    for (auto i = 0; i < Count; ++i)
+    for (auto const i: std::views::iota(0, Count))
         REQUIRE(seen[static_cast<std::size_t>(i)] == i);
 
     queue.Close();

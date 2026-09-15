@@ -43,6 +43,7 @@
 #include <chrono>
 #include <coroutine>
 #include <cstdint>
+#include <ranges>
 #include <string>
 #include <thread>
 #include <tuple>
@@ -279,8 +280,10 @@ struct ManualDriver
     {
         // Stepped rather than jumped so a wait that polls in sub-steps still makes
         // progress, and bounded so a regression fails rather than hangs.
-        for (auto step = 0; step < 100 && !predicate(); ++step)
+        for ([[maybe_unused]] auto const step: std::views::iota(0, 100))
         {
+            if (predicate())
+                break;
             clock.Advance(window / 10 + 1ms);
             std::ignore = reactor.Drain();
         }
