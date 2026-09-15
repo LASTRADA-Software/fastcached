@@ -22,7 +22,11 @@
 
 #include <atomic>
 #include <coroutine>
+#include <string>
 #include <thread>
+#include <tuple>
+
+#include <tests/BoundedWait.hpp>
 
 using namespace FastCache;
 
@@ -84,6 +88,12 @@ class BareReactor: public IReactor
         return _entered.load(std::memory_order_acquire);
     }
 
+    /// @return The loop's wait for `Stop()`, asserted by the case once the loop's thread is joined.
+    [[nodiscard]] Testing::OffThreadWaits const& Waits() const noexcept
+    {
+        return _waits;
+    }
+
   protected:
     void RunLoop() override
     {
@@ -92,12 +102,21 @@ class BareReactor: public IReactor
         _sawOnWorker.store(IsOnWorkerThread(), std::memory_order_relaxed);
         _sawTeardownSafe.store(TeardownIsSerialisedWithDispatch(), std::memory_order_relaxed);
         _entered.store(true, std::memory_order_release);
-        while (!_stop.load(std::memory_order_acquire))
-            std::this_thread::yield();
+        // Bounded (#1446): a case that never stops the loop ends it red, not in a join that never returns.
+        // Twice the guard, because the case's own wait for this loop to be entered is one guard long:
+        // measured with both at one guard, a case whose wait ran out found the loop already given up
+        // and gone, and three more assertions went red for a reason that was not theirs.
+        std::ignore = _waits.WaitForFlag(
+            "the case to stop the loop",
+            _stop,
+            [] { return std::string { "still running" }; },
+            Testing::WaitOptions {
+                .step = {}, .context = {}, .bound = 2 * Testing::WaitHangGuard, .rest = Testing::WaitRest });
     }
 
   private:
     SteadyClock _clock;
+    Testing::OffThreadWaits _waits;
     std::atomic<bool> _stop { false };
     std::atomic<bool> _sawRunning { false };
     std::atomic<bool> _sawOnWorker { false };
@@ -117,8 +136,9 @@ TEST_CASE("A reactor that implements only the loop still claims its worker threa
     CHECK(reactor.TeardownIsSerialisedWithDispatch());
 
     std::thread worker { [&reactor] { reactor.Run(); } };
-    while (!reactor.Entered())
-        std::this_thread::yield();
+    // A CHECK, so a loop that never entered still reaches the Stop and the join below.
+    CHECK(Testing::WaitUntil(
+        "the loop to be entered on its thread", [&reactor] { return reactor.Entered(); }, [] { return std::string {}; }));
 
     // The claim happened without `BareReactor` writing a line of it. This is the
     // assertion the whole obligation exists for.
@@ -135,6 +155,7 @@ TEST_CASE("A reactor that implements only the loop still claims its worker threa
 
     reactor.Stop();
     worker.join();
+    CHECK(reactor.Waits().AllReached());
 
     // Claim released on the way out, or every later teardown would be refused
     // forever by a reactor that has finished.

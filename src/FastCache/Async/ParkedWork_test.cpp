@@ -43,9 +43,12 @@
 #include <chrono>
 #include <coroutine>
 #include <cstdint>
+#include <string>
 #include <thread>
 #include <tuple>
 #include <utility>
+
+#include <tests/BoundedWait.hpp>
 
 using namespace FastCache;
 using namespace std::chrono_literals;
@@ -325,12 +328,11 @@ struct PlatformDriver
 
         // Bounded, and generous rather than tuned: what is being waited for is one
         // timer on an idle reactor, so a slow runner is the only thing that can make
-        // this long.
-        auto const deadline = std::chrono::steady_clock::now() + 10s;
-        while (!predicate() && std::chrono::steady_clock::now() < deadline)
-            std::this_thread::sleep_for(1ms);
-
-        auto const settled = predicate();
+        // this long. Its account reaches the caller's assertion: `Quiesce` asserts nothing.
+        auto const settled =
+            FastCache::Testing::WaitUntil("the frame to complete on the platform reactor's own thread",
+                                          std::move(predicate),
+                                          [] { return std::string { "the reactor is running on its worker thread" }; });
         Quiesce();
         return settled;
     }
