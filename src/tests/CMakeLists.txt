@@ -1976,6 +1976,47 @@ set_tests_properties("test-name-hygiene" PROPERTIES
 )
 
 # ---------------------------------------------------------------------------
+# The tests' loops: no C-style `for`, and no `while` that polls an atomic (#1446).
+#
+# The first is a rule `AGENT.md` has always stated and 76 test files still broke. The
+# second is the ticket's subject: a test waiting on another thread through a polled atomic
+# either counts iterations, which a loaded host loses, or is unbounded, which turns a red
+# into a hang -- and the tree's one test wait is `src/tests/BoundedWait.hpp`. The scope is
+# a table row in the script, so #1452 widens it to non-test sources by adding one.
+#
+# In the default set, for the reason test-name-hygiene gives above. The timeout is wider:
+# the comment-stripping walk reads every test source, measured at 16 s on Windows.
+add_test(
+    NAME "test-loops"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-test-loops.cmake"
+)
+set_tests_properties("test-loops" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 180
+)
+
+# And that check must be SEEN to refuse each shape it names and to stay quiet over the ones
+# it does not: synthetic trees in both enumeration modes and nested inside another checkout
+# (how this registration stages them, under the build directory), exact `file:line`s,
+# exemptions in both directions, and the two fail-closed arms. It prints how many cases ran.
+# Each of seven neuters of the check was watched turning a named case red.
+add_test(
+    NAME "test-loops-selftest"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DFASTCACHED_SCRATCH_DIR=${CMAKE_CURRENT_BINARY_DIR}/test-loops-selftest"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-test-loops-selftest.cmake"
+)
+set_tests_properties("test-loops-selftest" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 120
+)
+
+# ---------------------------------------------------------------------------
 # A test may not decide anything from the architecture it was COMPILED for.
 #
 # `#if defined(_M_ARM64)` in a test picks an expected value from a fact about the

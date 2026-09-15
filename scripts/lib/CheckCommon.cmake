@@ -348,6 +348,109 @@ function(fastcached_decline_third_party sourceDir pathsVar declinedOut)
 endfunction()
 
 # ---------------------------------------------------------------------------
+# One line of C++ with its comments removed, carrying whether a block comment is still open.
+#
+# The ONE implementation of comment stripping for the line walks below. It was the body of
+# `fastcached_scan_code_lines` and moved out when `check-test-loops.cmake` needed the same
+# stripping over whole content rather than a per-line match: the comment-ordering defect
+# described inside has already had three copies, and a fourth would be the next.
+#
+# The blind spot, stated rather than papered over: CMake's regex engine is greedy and has no
+# lazy quantifier, so stripping inline `/* ... */` pairs takes everything between the FIRST `/*`
+# and the LAST `*/` on a line. Code sitting between two block comments on one line is invisible
+# here. Still blind to either introducer inside a STRING LITERAL, as every regex-shaped reader
+# here is.
+#
+# @param line The line, without its newline.
+# @param inBlockComment Whether a block comment was open when the line began.
+# @param strippedOut Set to what is left of the line: code only.
+# @param skipOut Set to TRUE when the whole line sits inside a block comment.
+# @param inBlockCommentOut Set to whether a block comment is still open when the line ends.
+function(fastcached_strip_comment_line line inBlockComment strippedOut skipOut inBlockCommentOut)
+    set(stripped "${line}")
+    set(skipLine FALSE)
+    if(inBlockComment)
+        if(NOT stripped MATCHES "\\*/")
+            set(skipLine TRUE)
+            set(stripped "")
+        else()
+            string(REGEX REPLACE "^.*\\*/" "" stripped "${stripped}")
+            set(inBlockComment FALSE)
+        endif()
+    endif()
+    if(NOT skipLine)
+        string(REGEX REPLACE "/\\*.*\\*/" " " stripped "${stripped}")
+
+        # Which introducer comes FIRST decides. The order is not a detail: the `/*` test used
+        # to run BEFORE `//` was stripped, so a line comment mentioning `/*` opened a block
+        # comment no `*/` ever closed, and every remaining line of that file was skipped while
+        # the caller still printed a clean count over lines it never read -- a false green, in
+        # the one direction a check exists to refuse.
+        #
+        # Positional rather than simply stripping `//` first, which MEASURED identical on every
+        # input tried: below the inline `/* ... */` strip above, removing `//...` removes any
+        # `/*` that followed it too, so the two orderings agree. What position buys is not a
+        # different verdict but independence -- it states the rule itself rather than being
+        # correct only while the strip above it keeps running first. A reordering is correct by
+        # PRECONDITION; this is correct by construction.
+        #
+        # Third copy of this defect: `check-cli-text-cell.cmake` and
+        # `check-markup-entities.cmake` carried it too, in walks of their own.
+        string(FIND "${stripped}" "/*" blockAt)
+        string(FIND "${stripped}" "//" lineAt)
+        if(NOT blockAt EQUAL -1 AND (lineAt EQUAL -1 OR blockAt LESS lineAt))
+            string(SUBSTRING "${stripped}" 0 ${blockAt} stripped)
+            set(inBlockComment TRUE)
+        elseif(NOT lineAt EQUAL -1)
+            string(SUBSTRING "${stripped}" 0 ${lineAt} stripped)
+        endif()
+    endif()
+    set(${strippedOut} "${stripped}" PARENT_SCOPE)
+    set(${skipOut} "${skipLine}" PARENT_SCOPE)
+    set(${inBlockCommentOut} "${inBlockComment}" PARENT_SCOPE)
+endfunction()
+
+# ---------------------------------------------------------------------------
+# C++ content with every comment removed and every NEWLINE kept, for a scan whose subject
+# can span lines -- a `for` header broken across two, say -- and so cannot be matched one
+# line at a time.
+#
+# Line numbers survive because only comment TEXT is removed: a line inside a block comment
+# becomes empty rather than disappearing. List-free, for the reasons given at
+# `fastcached_scan_code_lines` below, and O(n^2) in the same way, so a caller filters on a
+# whole-file `string(FIND)` first.
+#
+# @param content The file content.
+# @param outVar Set to the content with comments removed and newlines preserved.
+function(fastcached_strip_comments content outVar)
+    set(code "")
+    set(rest "${content}")
+    set(inBlockComment FALSE)
+    while(TRUE)
+        string(FIND "${rest}" "\n" newline)
+        if(newline EQUAL -1)
+            set(line "${rest}")
+        else()
+            string(SUBSTRING "${rest}" 0 ${newline} line)
+        endif()
+        string(REGEX REPLACE "\r$" "" line "${line}")
+        fastcached_strip_comment_line("${line}" "${inBlockComment}" stripped skipLine inBlockComment)
+        string(APPEND code "${stripped}")
+        if(newline EQUAL -1)
+            break()
+        endif()
+        string(APPEND code "\n")
+        math(EXPR skip "${newline} + 1")
+        string(LENGTH "${rest}" restLength)
+        if(skip GREATER_EQUAL restLength)
+            break()
+        endif()
+        string(SUBSTRING "${rest}" ${skip} -1 rest)
+    endwhile()
+    set(${outVar} "${code}" PARENT_SCOPE)
+endfunction()
+
+# ---------------------------------------------------------------------------
 # Scanning C++ for a USE of something, as opposed to a MENTION of it in a comment.
 #
 # Walk content line by line WITHOUT ever building a CMake list of lines, and report, per
@@ -407,52 +510,8 @@ function(fastcached_scan_code_lines content pattern outVar)
         endif()
 
         # Strip comments, so prose explaining the rule is not read as breaking it.
-        #
-        # The blind spot, stated rather than papered over: CMake's regex engine is
-        # greedy and has no lazy quantifier, so stripping inline `/* ... */` pairs
-        # takes everything between the FIRST `/*` and the LAST `*/` on a line. A use
-        # sitting between two block comments on one line is invisible here.
-        set(stripped "${line}")
-        set(skipLine FALSE)
-        if(inBlockComment)
-            if(NOT stripped MATCHES "\\*/")
-                set(skipLine TRUE)
-            else()
-                string(REGEX REPLACE "^.*\\*/" "" stripped "${stripped}")
-                set(inBlockComment FALSE)
-            endif()
-        endif()
+        fastcached_strip_comment_line("${line}" "${inBlockComment}" stripped skipLine inBlockComment)
         if(NOT skipLine)
-            string(REGEX REPLACE "/\\*.*\\*/" " " stripped "${stripped}")
-
-            # Which introducer comes FIRST decides. The order is not a detail: the
-            # `/*` test used to run BEFORE `//` was stripped, so a line comment
-            # mentioning `/*` opened a block comment no `*/` ever closed, and every
-            # remaining line of that file was skipped while this still printed a
-            # clean count over lines it never read -- a false green, in the one
-            # direction the check exists to refuse.
-            #
-            # Positional rather than simply stripping `//` first, which MEASURED
-            # identical on every input tried: below the inline `/* ... */` strip
-            # above, removing `//...` removes any `/*` that followed it too, so the
-            # two orderings agree. What position buys is not a different verdict but
-            # independence -- it states the rule itself rather than being correct
-            # only while the strip above it keeps running first. A reordering is
-            # correct by PRECONDITION; this is correct by construction.
-            #
-            # Third copy of this defect: `check-cli-text-cell.cmake` and
-            # `check-markup-entities.cmake` carried it too, in walks of their own.
-            #
-            # Still blind to either introducer inside a STRING LITERAL, as every
-            # regex-shaped reader here is. That is unchanged by this.
-            string(FIND "${stripped}" "/*" blockAt)
-            string(FIND "${stripped}" "//" lineAt)
-            if(NOT blockAt EQUAL -1 AND (lineAt EQUAL -1 OR blockAt LESS lineAt))
-                string(SUBSTRING "${stripped}" 0 ${blockAt} stripped)
-                set(inBlockComment TRUE)
-            elseif(NOT lineAt EQUAL -1)
-                string(SUBSTRING "${stripped}" 0 ${lineAt} stripped)
-            endif()
             if(stripped MATCHES "${pattern}")
                 list(APPEND hits "use:${lineNumber}")
             endif()

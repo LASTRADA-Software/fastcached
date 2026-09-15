@@ -978,6 +978,37 @@ subject and cannot come out of this build's encoder at all. The helper takes an 
 output; a frame this build could not have written is a different thing that happens to
 share a leading byte.
 
+### A C++ test waits through `BoundedWait.hpp`, on the thread the wait belongs to
+
+`src/tests/BoundedWait.hpp` is the tree's one test wait (#1446), over `DrainWithin`, so its
+bound is real time on a monotonic clock and never a count of sleeps. Before it, #1446's census
+found tests waiting on other threads by counting (`2000 x 1 ms`, `2000 x 5 ms`), by six
+hand-rolled deadline loops, and -- twice -- not bounding at all.
+
+- **`WaitUntil` on the case's own thread.** When it runs out it attaches an account to the
+  next assertion: what it waited for, the real time and polls spent, the state at the end, and
+  whether that state was MOVING, STALLED or cannot be told apart (`ReadWait`, a pure function
+  with a case per reading). Catch2 clears that message at the next assertion, pass or fail, so
+  **assert the wait that ran out first**.
+- **`OffThreadWaits` on a helper thread, never `WaitUntil`.** Catch2's assertions and messages
+  belong to the thread running the case; a message from another thread races its state, which
+  inside the TSan scope is a reported race. The helper keeps the account and the case asserts
+  `AllReached()` as its first assertion after the join.
+- **Two waits that give up together report the symptom, not the cause.** Measured on
+  `DashboardSampler_test`: the pool thread's one-guard wait for a release and the case's
+  one-guard wait for the frame ended within a millisecond, and the frame's won. The outer wait
+  is twice the guard, so the inner one gives up first and names the release.
+- **A wait that can now fail exposes the teardown behind it.** A neuter that failed one wait in
+  `ThreadedAddressResolver_test` hung the case until it was killed: the `REQUIRE` unwound into a
+  join on a worker the case held. `ShardedStorage_test`'s parked-thread cases unwound through a
+  joinable `std::thread` instead, which is `std::terminate` and takes the report with it. Both
+  are the RED-into-HANG rule above, and both were only visible once the wait could be made to
+  fail -- so neuter a new wait, and watch what the case does after it.
+
+`ctest -R test-loops` refuses a `while` that polls an atomic in a test, along with any C-style
+`for`; its header says what it does not cover. A coroutine waiting on its own reactor cannot
+block that thread and is bounded on the reactor's clock instead (#1453).
+
 ## The POSIX fixtures share one helper library, and a bound is read from a clock
 
 `scripts/lib/e2e-common.sh` holds `fail`, `free_port`, `port_answers`,
