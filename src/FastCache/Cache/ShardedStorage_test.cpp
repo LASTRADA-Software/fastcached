@@ -26,8 +26,11 @@
 #include <utility>
 #include <vector>
 
+#include <tests/BoundedWait.hpp>
+
 using FastCache::Testing::Decode;
 using FastCache::Testing::MakeBytes;
+using FastCache::Testing::WaitUntil;
 
 namespace
 {
@@ -193,20 +196,45 @@ class SharedReadParkableStorage final: public ParkableStorage
     }
 };
 
-/// Wait up to `timeoutMs` for `predicate` to become true; busy-spins
-/// on a 1ms interval. Returns true if the predicate became true.
-template <class Pred>
-bool WaitFor(Pred const& predicate, int timeoutMs = 2000)
+/// Releases every park it names when it goes, so a failed assertion cannot leave a thread parked
+/// under a join.
+///
+/// A `REQUIRE` that fires while a reader or writer is parked unwinds through the case's threads: a
+/// `std::thread` still joinable there is `std::terminate`, which takes the report with it, and a
+/// `std::jthread` joins a thread nobody will release. So the threads are `std::jthread`s declared
+/// first, and this is declared AFTER them: it is destroyed, and opens the parks, before they join.
+/// `Release` clears the park flags for good, so a thread that reaches its park afterwards passes
+/// straight through.
+class ReleaseParksOnUnwind
 {
-    using namespace std::chrono;
-    auto const deadline = steady_clock::now() + milliseconds { timeoutMs };
-    while (steady_clock::now() < deadline)
+  public:
+    /// @param parks The shards whose parks to open.
+    explicit ReleaseParksOnUnwind(std::vector<ParkableStorage*> parks) noexcept:
+        _parks { std::move(parks) }
     {
-        if (predicate())
-            return true;
-        std::this_thread::sleep_for(milliseconds { 1 });
     }
-    return predicate();
+
+    ReleaseParksOnUnwind(ReleaseParksOnUnwind const&) = delete;
+    ReleaseParksOnUnwind(ReleaseParksOnUnwind&&) = delete;
+    ReleaseParksOnUnwind& operator=(ReleaseParksOnUnwind const&) = delete;
+    ReleaseParksOnUnwind& operator=(ReleaseParksOnUnwind&&) = delete;
+
+    ~ReleaseParksOnUnwind()
+    {
+        for (auto* park: _parks)
+            park->Release();
+    }
+
+  private:
+    std::vector<ParkableStorage*> _parks;
+};
+
+/// What a parkable shard has let in, for a wait's account.
+/// @param park The shard.
+/// @return Its reads and writes in flight, in words.
+[[nodiscard]] std::string Describe(ParkableStorage const& park)
+{
+    return std::format("reads in flight {}, writes in flight {}", park.readInFlight.load(), park.writeInFlight.load());
 }
 
 } // namespace
@@ -422,14 +450,21 @@ TEST_CASE("Concurrent same-shard Gets serialise for a non-shared-read backend", 
     FastCache::ShardedStorage storage { std::move(shards) };
     FastCache::ManualClock clock;
 
+    std::jthread reader1;
+    std::jthread reader2;
+    ReleaseParksOnUnwind const release { { park } }; // after the threads, so it opens the park before they join
+
     // First reader: parks inside Get while holding the unique lock.
-    std::thread reader1 { [&] { (void) storage.Get("any-key", clock.Now()); } };
-    REQUIRE(WaitFor([&] { return park->readInFlight.load() == 1; }));
+    reader1 = std::jthread { [&] { (void) storage.Get("any-key", clock.Now()); } };
+    REQUIRE(WaitUntil(
+        "the first reader to park inside Get",
+        [&] { return park->readInFlight.load() == 1; },
+        [&] { return Describe(*park); }));
 
     // Second reader on the same shard: must block on the unique lock
     // and therefore not reach the stub while reader1 is still parked
     // inside Get. We confirm with a brief grace window.
-    std::thread reader2 { [&] { (void) storage.Get("another-key", clock.Now()); } };
+    reader2 = std::jthread { [&] { (void) storage.Get("another-key", clock.Now()); } };
     using namespace std::chrono_literals;
     std::this_thread::sleep_for(50ms);
     REQUIRE(park->readInFlight.load() == 1);
@@ -456,12 +491,18 @@ TEST_CASE("Concurrent same-shard Gets run in parallel for a shared-read backend"
     FastCache::ShardedStorage storage { std::move(shards) };
     FastCache::ManualClock clock;
 
-    std::thread reader1 { [&] { (void) storage.Get("key-a", clock.Now()); } };
-    std::thread reader2 { [&] { (void) storage.Get("key-b", clock.Now()); } };
+    std::jthread reader1;
+    std::jthread reader2;
+    ReleaseParksOnUnwind const release { { park } }; // after the threads, so it opens the park before they join
+    reader1 = std::jthread { [&] { (void) storage.Get("key-a", clock.Now()); } };
+    reader2 = std::jthread { [&] { (void) storage.Get("key-b", clock.Now()); } };
 
     // Both readers must reach the stub concurrently while parked — proving the
     // shared lock admits them simultaneously.
-    REQUIRE(WaitFor([&] { return park->readInFlight.load() == 2; }));
+    REQUIRE(WaitUntil(
+        "both readers to be inside Get at once",
+        [&] { return park->readInFlight.load() == 2; },
+        [&] { return Describe(*park); }));
 
     park->Release();
     reader1.join();
@@ -569,9 +610,15 @@ TEST_CASE("Cross-shard Gets run in parallel (sharding preserves read parallelism
 
     // Two readers on distinct shards must both reach the stub
     // simultaneously — sharding's whole point.
-    std::thread reader0 { [&] { (void) storage.Get(keyShard0, clock.Now()); } };
-    std::thread reader1 { [&] { (void) storage.Get(keyShard1, clock.Now()); } };
-    REQUIRE(WaitFor([&] { return park0->readInFlight.load() == 1 && park1->readInFlight.load() == 1; }));
+    std::jthread reader0;
+    std::jthread reader1;
+    ReleaseParksOnUnwind const release { { park0, park1 } }; // after the threads, so it opens the parks before they join
+    reader0 = std::jthread { [&] { (void) storage.Get(keyShard0, clock.Now()); } };
+    reader1 = std::jthread { [&] { (void) storage.Get(keyShard1, clock.Now()); } };
+    REQUIRE(WaitUntil(
+        "a reader inside Get on each shard",
+        [&] { return park0->readInFlight.load() == 1 && park1->readInFlight.load() == 1; },
+        [&] { return std::format("shard 0: {}; shard 1: {}", Describe(*park0), Describe(*park1)); }));
 
     park0->Release();
     park1->Release();
@@ -606,14 +653,22 @@ TEST_CASE("A writer excludes readers on the same shard but not across shards", "
             keyShard1 = k;
     }
 
+    std::atomic<bool> sameShardReadEntered { false }; // before the threads that write it
+    std::jthread writer;
+    std::jthread sameShardReader;
+    std::jthread otherShardReader;
+    ReleaseParksOnUnwind const release { { park0, park1 } }; // after the threads, so it opens the parks before they join
+
     // Writer parks inside Set on shard 0, holding the exclusive lock.
-    std::thread writer { [&] { (void) storage.Set(keyShard0, MakeBytes("v"), 0, FastCache::TimePoint::max()); } };
-    REQUIRE(WaitFor([&] { return park0->writeInFlight.load() == 1; }));
+    writer = std::jthread { [&] { (void) storage.Set(keyShard0, MakeBytes("v"), 0, FastCache::TimePoint::max()); } };
+    REQUIRE(WaitUntil(
+        "the writer to park inside Set on shard 0",
+        [&] { return park0->writeInFlight.load() == 1; },
+        [&] { return Describe(*park0); }));
 
     // A reader on the same shard MUST block — until the writer releases,
     // readInFlight on shard 0 stays at 0.
-    std::atomic<bool> sameShardReadEntered { false };
-    std::thread sameShardReader { [&] {
+    sameShardReader = std::jthread { [&] {
         (void) storage.Get(keyShard0, clock.Now());
         sameShardReadEntered = true;
     } };
@@ -626,12 +681,18 @@ TEST_CASE("A writer excludes readers on the same shard but not across shards", "
     // A reader on a DIFFERENT shard must proceed immediately — it should
     // reach the inner stub (where parkGet=true holds it) without being
     // blocked by the unrelated writer on shard 0.
-    std::thread otherShardReader { [&] { (void) storage.Get(keyShard1, clock.Now()); } };
-    REQUIRE(WaitFor([&] { return park1->readInFlight.load() == 1; }));
+    otherShardReader = std::jthread { [&] { (void) storage.Get(keyShard1, clock.Now()); } };
+    REQUIRE(WaitUntil(
+        "the other shard's reader to reach Get past the writer",
+        [&] { return park1->readInFlight.load() == 1; },
+        [&] { return Describe(*park1); }));
 
     // Release the writer; the same-shard reader can then proceed too.
     park0->Release();
-    REQUIRE(WaitFor([&] { return sameShardReadEntered.load(); }));
+    REQUIRE(WaitUntil(
+        "the same-shard reader to get in once the writer let go",
+        [&] { return sameShardReadEntered.load(); },
+        [&] { return std::format("shard 0: {}", Describe(*park0)); }));
 
     park1->Release();
     writer.join();
