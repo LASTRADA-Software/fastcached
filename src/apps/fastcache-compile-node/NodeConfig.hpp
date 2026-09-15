@@ -48,6 +48,19 @@ enum class ClusterAction : std::uint8_t
     Set,      ///< Change one replicated setting.
     Forget,   ///< Remove a member.
     Admit,    ///< Add a member, or record that one has moved.
+
+    /// Admit a client host to the fleet, and clear any tombstone for it (#1309).
+    ///
+    /// A CLIENT, never a member: it never joins consensus and is never counted towards
+    /// quorum, so this takes a bare host where `Admit` takes `<id>=<host>:<port>`.
+    AdmitClient,
+
+    /// Forget a client host, so every node refuses it from the next commit (#1309).
+    ///
+    /// The replicated alternative to editing `--fleet-member` on every other machine,
+    /// which is the direction that fails OPEN -- miss one and it serves the retired host
+    /// indefinitely, with admission succeeding being the ordinary case.
+    ForgetClient,
 };
 
 /// One cluster-administration request, as parsed from the command line.
@@ -55,7 +68,8 @@ struct ClusterRequest
 {
     ClusterAction action { ClusterAction::None };
 
-    /// The setting name for `Set`, the member id for `Forget` and `Admit`.
+    /// The setting name for `Set`, the member id for `Forget` and `Admit`, the client's
+    /// host for `AdmitClient` and `ForgetClient`.
     std::string key;
 
     /// The setting's new value for `Set`, the consensus endpoint for `Admit`,

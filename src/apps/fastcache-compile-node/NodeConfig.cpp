@@ -222,7 +222,8 @@ namespace
             auto& request = TargetOf<&NodeConfig::cluster>(result);
             request.action = Action;
 
-            if constexpr (Action == ClusterAction::Admit || Action == ClusterAction::Set)
+            if constexpr (Action == ClusterAction::Admit || Action == ClusterAction::Set
+                          || Action == ClusterAction::AdmitClient)
             {
                 // These two COMMIT their operand through consensus: an admitted
                 // member's id and endpoint land in every peer's `ClusterState` and
@@ -235,7 +236,9 @@ namespace
                 // issue #159 records: its operand IS the offending id, so a check
                 // covering it would make a bad member -- one admitted by an older
                 // peer -- impossible to remove, and it would count towards quorum
-                // forever.
+                // forever. `ForgetClient` is out for the same reason and the stake is
+                // the same shape: a client host recorded by a peer that did not check
+                // it must stay removable, or it goes on being served forever.
                 if (auto const text = ParseUtf8Text(value); !text.has_value())
                     return std::unexpected(text.error());
             }
@@ -253,6 +256,26 @@ namespace
             {
                 if (value.empty())
                     return std::unexpected(ArgvError(ConfigErrorCode::ParseError, "cluster-forget", "names no member"));
+                request.key = std::string { value };
+            }
+            else if constexpr (Action == ClusterAction::AdmitClient || Action == ClusterAction::ForgetClient)
+            {
+                // A bare HOST, which is what admission compares: a client dials from an
+                // ephemeral port, so there is nothing for a port to be matched against.
+                // An endpoint is accepted and reduced to its host by
+                // `Cluster::Validate`, so what commits is the machine either way -- the
+                // reply below says which host was sent, because dropping a port the
+                // operator typed is the kind of silent normalization nobody expects.
+                //
+                // Shape is NOT checked here beyond emptiness. Whether a host is
+                // loopback, or names no machine at all, is decided once in
+                // `Cluster::Validate` -- where the replicated entry is refused for every
+                // route into it, rather than at whichever flag happened to be typed.
+                if (value.empty())
+                    return std::unexpected(
+                        ArgvError(ConfigErrorCode::ParseError,
+                                  Action == ClusterAction::AdmitClient ? "cluster-admit-client" : "cluster-forget-client",
+                                  "names no host"));
                 request.key = std::string { value };
             }
             else if constexpr (Action == ClusterAction::Admit)
@@ -973,6 +996,31 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
                          "membership change nothing automatic makes:\n"
                          "discovery only ever adds, because a peer goes\n"
                          "quiet far more often than it leaves." },
+        { .primary = "--cluster-admit-client",
+          .arity = Arity::Value,
+          .operand = "=<host>",
+          .apply = SelectClusterAction<ClusterAction::AdmitClient>(),
+          .description = "admit a client machine to the fleet and exit, clearing\n"
+                         "any record of it having been forgotten. A CLIENT --\n"
+                         "a laptop, a CI runner, anything running fastcache-cc\n"
+                         "-- never joins consensus, so this takes a host where\n"
+                         "--cluster-admit takes an id and an endpoint. Every\n"
+                         "node then admits it, with --fleet-member edited on\n"
+                         "none of them. A port is ignored: admission compares a\n"
+                         "host, and a client dials from an ephemeral one." },
+        { .primary = "--cluster-forget-client",
+          .arity = Arity::Value,
+          .operand = "=<host>",
+          .apply = SelectClusterAction<ClusterAction::ForgetClient>(),
+          .description = "stop admitting a client machine, on every node, and\n"
+                         "exit. The direction editing --fleet-member gets\n"
+                         "wrong: adding a host there fails closed and heals,\n"
+                         "while REMOVING one fails open, so missing a single\n"
+                         "machine leaves it serving a host you retired. This\n"
+                         "records the removal instead, and a node whose own\n"
+                         "list still names the host refuses it anyway.\n"
+                         "--cluster-admit-client is how it comes back. A port is\n"
+                         "ignored here too, for the same reason." },
         {
             .primary = "--cluster-id",
             .arity = Arity::Value,
@@ -1637,6 +1685,10 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
         { "--cluster-set", "changes a running cluster's settings and exits" },
         { "--cluster-admit", "admits a member and exits" },
         { "--cluster-forget", "removes a member and exits" },
+        { "--cluster-admit-client", "admits a client host and exits" },
+        { "--cluster-forget-client",
+          "stops admitting a client host and exits; a key would re-forget it at every start, so a host "
+          "re-admitted from anywhere else would be removed again by the next restart of this node" },
         { "--enroll-from",
           "asks a seed to admit this machine and exits; a key would re-ask at every start, on a "
           "machine that is already a member" },

@@ -162,6 +162,8 @@ constexpr std::array NonStartVerbs {
     NonStartVerb { .flag = "--cluster-set", .why = "a cluster admin verb: changes one replicated setting and exits" },
     NonStartVerb { .flag = "--cluster-admit", .why = "a cluster admin verb: proposes a member and exits" },
     NonStartVerb { .flag = "--cluster-forget", .why = "a cluster admin verb: proposes a removal and exits" },
+    NonStartVerb { .flag = "--cluster-admit-client", .why = "a cluster admin verb: proposes a client host and exits" },
+    NonStartVerb { .flag = "--cluster-forget-client", .why = "a cluster admin verb: proposes a client removal and exits" },
     // The enrollment verbs. The five operator ones are the cluster-admin rows above in
     // every respect that matters here -- ask the window's holder one question, print
     // the answer, exit -- and they are listed rather than left out because leaving them

@@ -56,6 +56,15 @@ std::vector<std::byte> EncodeClusterRequest(ClusterRequest const& request)
         case ClusterAction::Admit:
             return Wire::EncodeClusterAdmit(
                 Wire::ClusterAdmitRequest { .memberId = request.key, .raftEndpoint = request.value });
+
+        // One encoder for the pair, and the verb is a TEMPLATE argument rather than a
+        // value: naming a third verb here does not compile. That is the obligation the
+        // type system can hold, and it is why `CompileCacheWire.hpp` needed no
+        // `<cassert>` to keep the pair honest.
+        case ClusterAction::AdmitClient:
+            return Wire::EncodeClusterClientVerb<Wire::Op::ClusterAdmitClient>(request.key);
+        case ClusterAction::ForgetClient:
+            return Wire::EncodeClusterClientVerb<Wire::Op::ClusterForgetClient>(request.key);
     }
 
     return {};
@@ -123,6 +132,21 @@ std::expected<std::string, std::string> InterpretClusterReply(ClusterAction acti
             // Appended, not committed, and the wording says so: the leader cannot know
             // the difference until a majority answers, and claiming otherwise would be
             // the one thing a report like this must not do.
+            return std::string { "accepted; the change is replicating\n" };
+
+        case ClusterAction::AdmitClient:
+        case ClusterAction::ForgetClient:
+            // The same claim as the two above, and nothing more. No echo of the host:
+            // these verbs answer a bare acknowledgement with no receipt to read a
+            // committed value back out of, so anything printed here would be what this
+            // process SENT wearing the authority of what the leader RECORDED -- which is
+            // #1296's defect exactly, and a confident wrong signal is worse than a vague
+            // right one.
+            //
+            // What an operator needs before typing -- that a port is ignored, because
+            // admission compares a host and a client dials from an ephemeral one -- is in
+            // the two flags' own descriptions, where it is read in time to matter rather
+            // than after the change has replicated.
             return std::string { "accepted; the change is replicating\n" };
 
         case ClusterAction::Admit: {

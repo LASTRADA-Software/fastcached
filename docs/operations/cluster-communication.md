@@ -585,11 +585,24 @@ Admission is fully dynamic and **removal is not**, and the asymmetry is worth st
 plainly because the machine an operator most wants to revoke is the one most likely to
 be in both lists.
 
-| Admitted via | Does `--cluster-forget` revoke it? |
-|---|---|
-| the cluster only | **yes**, on the committed membership change |
-| `--fleet-member` only | **no** — consensus does not speak for that list |
-| **both** | **no** — the static list keeps admitting it |
+**Two verbs, and they revoke different things.** `--cluster-forget` names a *member
+id* and removes a machine from consensus. `--cluster-forget-client` names a *host* and
+records that the fleet has forgotten it ([#1309](https://github.com/LASTRADA-Software/fastcached/issues/1309));
+a client never joins consensus, so it has no id for the first verb to name.
+
+| Admitted via | `--cluster-forget <id>` | `--cluster-forget-client <host>` |
+|---|---|---|
+| the cluster only | **yes**, on the committed membership change | **yes** |
+| `--fleet-member` only | **no** — consensus does not speak for that list | **yes** — the tombstone outranks the listing |
+| **both** | **no** — the static list keeps admitting it | **yes** |
+| under `--fleet-open` | **no** — there is no set to remove anybody from | **yes** — a blanket does not outrank a named host |
+
+The right-hand column is why the left-hand one is no longer the whole story. A forget of
+a *client* is recorded as a positive act rather than as an erasure, so a node whose own
+`--fleet-member` list still names the machine refuses it anyway, from the commit onward,
+with nobody editing a file on any other machine. The refusal is counted apart from a
+stranger's (`fastcache_node_requests_refused_host_forgotten_total`), because *a host an
+operator removed* and *a host nobody ever listed* are opposite diagnoses.
 
 `--fleet-member` is a **reloadable** setting, so removing a host from it takes a
 configuration change on every node that lists it and a `SIGHUP` — not a restart. Drop
@@ -604,12 +617,21 @@ configuration, and a `--cluster-forget` on the leader speaks for the cluster's s
 not for anybody's `--fleet-member`. That is what makes a listed client machine survive
 every membership commit in the first place.
 
-Under **`--fleet-open` a forget revokes nothing at all.** The flag says "admit
-everybody", so there is no set for a forget to remove anybody from and a committed
-membership change narrows nothing. That is the flag working rather than a limitation,
-and an operator who wants revocation has to turn it off — which is itself a reload:
-drop `fleet_open:` from the file and `SIGHUP`, and the node closes to everybody its
-`fleet_member:` list does not name.
+Under **`--fleet-open` a MEMBER forget revokes nothing at all.** The flag says "admit
+everybody", so there is no set for a membership change to remove anybody from. That is
+the flag working rather than a limitation, and an operator who wants that kind of
+revocation has to turn it off — which is itself a reload: drop `fleet_open:` from the
+file and `SIGHUP`, and the node closes to everybody its `fleet_member:` list does not
+name.
+
+**A client forget reaches an open node.** `--fleet-open` says *I have not enumerated who
+may use this fleet* — a blanket over hosts nobody named — and `--cluster-forget-client`
+names one. Letting the blanket win would make a local flag resurrect a machine the
+cluster positively removed, on exactly the node nobody has reconfigured yet. The two
+directions are not comparable: honouring the forget wrongly refuses a machine, which
+fails closed and is visible from the refused end, while ignoring it serves a
+decommissioned host indefinitely with admission succeeding as the ordinary case and
+nothing reporting it.
 
 **One thing a reload will not do is widen a node that has no `--cluster-key-file`.**
 Such a worker chose at startup to verify no lease signatures, which is only safe while
@@ -617,11 +639,13 @@ no machine but its own is admitted, so a reload that would newly admit a remote 
 refused by name and nothing is applied. Give the node a key and restart it, or leave the
 policy alone. Narrowing is always allowed — that is the direction that closes it.
 
-This is [#265](https://github.com/LASTRADA-Software/fastcached/issues/265), and it is
-not a regression: before #251 a forget *appeared* to revoke, as a side effect of the
-defect that also ejected every client laptop the moment the fleet agreed anything.
-What #251 exposed is that there has never been a revocation path for a statically
-listed host.
+This is [#265](https://github.com/LASTRADA-Software/fastcached/issues/265), and it was
+never a regression: before #251 a forget *appeared* to revoke, as a side effect of the
+defect that also ejected every client laptop the moment the fleet agreed anything. What
+#251 exposed is that there was no revocation path for a statically listed host —
+**which is what `--cluster-forget-client` now is.** The sentence that used to close this
+paragraph said there *never* had been one, and a rule stated as permanent is the
+expensive kind to leave standing: it instructs whoever reads it not to look.
 
 **It does not contradict the rule that absence from `ClusterState` is not removal.**
 That rule is about *absence* — a member the state has never named, which a node must

@@ -345,6 +345,13 @@ TEST_CASE("NodeConfig: every flag that is worker state reaches the supervisor", 
         "--cluster-set",
         "--cluster-forget",
         "--cluster-admit",
+        // The client pair (#1309), same rule and one sharper consequence: a registration
+        // carrying `--cluster-forget-client` would re-forget the host at every boot, so a
+        // host re-admitted from anywhere else would be removed again by this node's next
+        // restart -- a revocation that comes back from the dead, which is worse than one
+        // that never took.
+        "--cluster-admit-client",
+        "--cluster-forget-client",
         // The cordon, for the same rule with the consequence #1303 names: a registration
         // carrying one would re-cordon the worker at every boot -- a machine that silently
         // never comes back to the fleet.
