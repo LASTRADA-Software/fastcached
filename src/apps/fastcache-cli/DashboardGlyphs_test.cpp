@@ -2,6 +2,8 @@
 #include "DashboardGlyphs.hpp"
 #include "ScriptedCellWidth.hpp"
 
+#include <FastCache/Core/EnumTable.hpp>
+
 #include <catch2/catch_test_macros.hpp>
 
 #include <cmath>
@@ -14,6 +16,7 @@
 #include <vector>
 
 using namespace FastCache::Cli;
+using FastCache::Enumerators;
 using FastCache::Cli::Testing::FakeCellWidth;
 
 namespace
@@ -147,9 +150,8 @@ TEST_CASE("an absent figure is the marker in every format", "[cli][dashboard][gl
 {
     // The marker is the operator's `--absent`, so the one that is passed is the one that comes back
     // -- never a zero, never a format's own idea of blank.
-    for (auto const format: std::views::iota(0, static_cast<int>(FigureFormat::Last)))
+    for (auto const which: Enumerators<FigureFormat>())
     {
-        auto const which = static_cast<FigureFormat>(format);
         CHECK(FormatFigure(std::nullopt, which, "n/a").Text() == "n/a");
         CHECK(FormatFigure(std::numeric_limits<double>::quiet_NaN(), which, "?").Text() == "?");
         CHECK(FormatFigure(0.0, which, "n/a").Text() != "n/a");

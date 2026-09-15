@@ -2,6 +2,7 @@
 #include <FastCache/Async/Task.hpp>
 #include <FastCache/Core/BoundedDrain.hpp>
 #include <FastCache/Core/Bytes.hpp>
+#include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Metrics/PrometheusFormatter.hpp>
 #include <FastCache/Net/TlsWrap.hpp>
 #include <FastCache/Server/AdminHttpServer.hpp>
@@ -647,10 +648,10 @@ Task<void> ServeAdminHttp(ISocket* socket,
     // Kinds in enumerator order, so `Exact` is tried against every route before
     // `Prefix` is tried against any: which route answers a path is then a property
     // of the table rather than of the order a caller happened to build its vector in.
-    for (auto const kind: std::views::iota(std::size_t { 0 }, EnumeratorCount<AdminRouteMatch>))
+    for (auto const kind: Enumerators<AdminRouteMatch>())
         for (auto const& route: routes)
         {
-            if (static_cast<std::size_t>(route.match) != kind || !route.handler)
+            if (route.match != kind || !route.handler)
                 continue;
             auto const hit = route.match == AdminRouteMatch::Exact ? route.path == path : path.starts_with(route.path);
             if (!hit)

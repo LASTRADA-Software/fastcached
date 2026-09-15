@@ -37,6 +37,44 @@ inline constexpr std::size_t EnumeratorCount = static_cast<std::size_t>(Enum::La
 template <EnumWithLast Enum, typename Row>
 using EnumTable = std::array<Row, EnumeratorCount<Enum>>;
 
+/// The enumerators of @p Enum from @p from onwards, in declaration order.
+///
+/// @param from The first enumerator to yield.
+/// @return A view yielding @p from and every enumerator declared after it.
+template <EnumWithLast Enum>
+[[nodiscard]] constexpr auto Enumerators(Enum from) noexcept
+{
+    auto const first = std::min(static_cast<std::size_t>(from), EnumeratorCount<Enum>);
+    return std::views::iota(first, EnumeratorCount<Enum>)
+           | std::views::transform([](std::size_t index) { return static_cast<Enum>(index); });
+}
+
+/// Every enumerator of @p Enum, in declaration order, as a view.
+///
+/// The count lived here and the enumerators did not, so walking them was hand-spelled at
+/// every site as an `iota` over the count followed by a `static_cast<Enum>(index)` -- ten
+/// sites in three spellings, and three of those restated the count as
+/// `static_cast<...>(Enum::Last)`, so they did not go through `EnumeratorCount` at all
+/// (#1441). What the cast costs is not the line: a site that walks INDICES then compares
+/// one against an enumerator by casting the other way, as `AdminHttpServer` did, is a
+/// comparison with two spellings and no type to disagree with it. A site handed the
+/// enumerator has neither.
+///
+/// The sub-range overload above is a second function rather than a defaulted argument,
+/// because `Enumerators<Enum>()` deduces nothing from its arguments and
+/// `Enumerators(from)` deduces everything from one: no single spelling does both. It
+/// starts at enumerator ZERO, which is the same premise `EnumTable` and
+/// `RowsInEnumeratorOrder` are built on -- an index IS the enumerator -- rather than a
+/// new assumption of its own. A `from` at or past `Last` yields nothing, which is what an
+/// empty `iota` range already does, rather than walking backwards.
+///
+/// @return A view yielding each enumerator, `EnumeratorCount<Enum>` of them.
+template <EnumWithLast Enum>
+[[nodiscard]] constexpr auto Enumerators() noexcept
+{
+    return Enumerators(static_cast<Enum>(0));
+}
+
 /// Whether every row sits at the index of the enumerator it describes.
 ///
 /// This is the whole of the rule that makes indexing a table by its enumerator

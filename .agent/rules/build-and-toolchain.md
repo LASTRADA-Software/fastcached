@@ -5661,6 +5661,16 @@ is correct: an inclusion list naming this repository's own layout needs no roots
 
 ## Open work
 
+- **[#1476](https://github.com/LASTRADA-Software/fastcached/issues/1476)** — nothing refuses
+  a hand-spelled enumerator walk now that `Core/EnumTable.hpp` offers `Enumerators<E>()`
+  (#1441). The seam is the second kind of guard, the kind CALLED alongside an operation
+  rather than folded into it, so the entry above about scans applies to it: #1441 found ten
+  sites in three spellings, three of which restated the count as `static_cast<...>(E::Last)`
+  and bypassed `EnumeratorCount` too, so the tree has already demonstrated that a seam
+  nothing scans for gets walked around. Probably a ROW in the scan #1452 widens from tests
+  to all of `src/`, rather than a fourth copy of the file-set machinery; that sequencing is
+  the reason it is not in #1441.
+
 - **[#1432](https://github.com/LASTRADA-Software/fastcached/issues/1432)** — SHA-256 hardware
   detection and the ARM engine are compiled for arm64 macOS alone, so Linux aarch64 and Windows
   ARM64 run the scalar engine, which is correct and slower. That is the instruction-set extension

@@ -199,9 +199,8 @@ TEST_CASE("Every kind of decline is tallied under a reason of its own")
     // is the defect, one layer along, and is invisible to any assertion that only
     // looks at one cause.
     std::vector<std::string_view> reasons;
-    for (auto const idx: std::views::iota(std::size_t { 0 }, FastCache::EnumeratorCount<DeclineCause>))
+    for (auto const cause: FastCache::Enumerators<DeclineCause>())
     {
-        auto const cause = static_cast<DeclineCause>(idx);
         auto const recording = RecordingFor(DispatchStatus::Declined, cause);
 
         // Every cause stays a decline: the second field says WHICH, never whether.

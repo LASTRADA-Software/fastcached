@@ -385,8 +385,8 @@ struct ObjectField
 [[nodiscard]] std::vector<std::uint64_t> EnvelopeCounts(AtomicMetricsSink const& metrics)
 {
     std::vector<std::uint64_t> counts;
-    for (auto const index: std::views::iota(std::size_t { 0 }, EnumeratorCount<EnvelopeError>))
-        counts.push_back(metrics.Read(CounterFor(static_cast<EnvelopeError>(index))));
+    for (auto const reason: Enumerators<EnvelopeError>())
+        counts.push_back(metrics.Read(CounterFor(reason)));
     return counts;
 }
 
@@ -594,10 +594,8 @@ TEST_CASE("An envelope refusal's wire code and its message are one fact", "[work
     // the moment it exists.
     std::vector<std::string_view> texts;
     std::vector<IMetricsSink::Counter> counters;
-    for (auto const index: std::views::iota(std::size_t { 0 }, EnumeratorCount<EnvelopeError>))
+    for (auto const reason: Enumerators<EnvelopeError>())
     {
-        auto const reason = static_cast<EnvelopeError>(index);
-
         // Every reason says something, and no two say the same thing -- a description
         // shared between reasons is one an operator cannot act on.
         auto const text = DescribeEnvelopeError(reason);

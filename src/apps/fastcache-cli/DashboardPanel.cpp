@@ -690,10 +690,8 @@ namespace
 
         if (available.has_value())
         {
-            for (auto const level: std::views::iota(std::to_underlying(Priority::High), std::to_underlying(Priority::Last))
-                                       | std::views::reverse)
+            for (auto const priority: Enumerators(Priority::High) | std::views::reverse)
             {
-                auto const priority = static_cast<Priority>(level);
                 while (total > *available)
                 {
                     if (shrinkLast(priority))

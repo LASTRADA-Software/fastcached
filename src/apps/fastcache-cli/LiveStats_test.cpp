@@ -4,6 +4,7 @@
 #include "ScriptedExchange.hpp"
 
 #include <FastCache/Cli/Duration.hpp>
+#include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
 #include <catch2/catch_test_macros.hpp>
@@ -54,8 +55,7 @@ namespace
 /// @return The first kind, in enumerator order, in the row's `servedBy`.
 [[nodiscard]] RemoteKind AServerOf(LiveSubjectSpec const& row)
 {
-    auto const kinds = std::views::iota(std::size_t { 0 }, EnumeratorCount<RemoteKind>)
-                       | std::views::transform([](std::size_t index) { return static_cast<RemoteKind>(index); });
+    auto const kinds = Enumerators<RemoteKind>();
     auto const served = std::ranges::find_if(kinds, [&row](RemoteKind kind) { return row.servedBy.Contains(kind); });
     REQUIRE(served != kinds.end());
     return *served;

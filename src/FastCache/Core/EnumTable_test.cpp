@@ -3,11 +3,17 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
+#include <array>
+#include <cstddef>
 #include <cstdint>
+#include <ranges>
 #include <string_view>
 #include <type_traits>
+#include <utility>
 
 using FastCache::EnumeratorCount;
+using FastCache::Enumerators;
 using FastCache::EnumTable;
 using FastCache::EnumWithLast;
 using FastCache::RowsInEnumeratorOrder;
@@ -55,6 +61,57 @@ TEST_CASE("EnumWithLast: an enum qualifies only when it states its own count", "
     STATIC_REQUIRE(EnumWithLast<Colour>);
     STATIC_REQUIRE_FALSE(EnumWithLast<Unbounded>);
     STATIC_REQUIRE_FALSE(EnumWithLast<int>);
+}
+
+TEST_CASE("Enumerators: every enumerator, in declaration order, and no Last", "[core][enumtable]")
+{
+    // WHAT DISTINGUISHES: the ORDER and the EXTENT together. A view yielding the right
+    // COUNT of the wrong values passes any size assertion, and one yielding the right
+    // values in the wrong order passes any set assertion -- so the values are checked
+    // against their positions, which only one answer satisfies.
+    constexpr auto Walked = [] {
+        std::array<Colour, EnumeratorCount<Colour>> seen {};
+        std::size_t at = 0;
+        for (auto const colour: Enumerators<Colour>())
+        {
+            if (at >= seen.size())
+                return std::pair { seen, std::size_t { 0 } - 1 }; // more values than the count: fail loudly
+            seen[at++] = colour;
+        }
+        return std::pair { seen, at };
+    }();
+    STATIC_REQUIRE(Walked.second == EnumeratorCount<Colour>);
+    STATIC_REQUIRE(Walked.first[0] == Colour::Red);
+    STATIC_REQUIRE(Walked.first[1] == Colour::Green);
+    STATIC_REQUIRE(Walked.first[2] == Colour::Blue);
+
+    // And `Last` is not one of them. Asserted on the VALUE rather than on the count,
+    // because a walk that stopped one early would satisfy the count check above only by
+    // also dropping `Blue`, which the position checks catch -- these are the two halves of
+    // one claim and neither covers the other.
+    STATIC_REQUIRE(std::ranges::none_of(Enumerators<Colour>(), [](Colour c) { return c == Colour::Last; }));
+    STATIC_REQUIRE(std::ranges::size(Enumerators<Colour>()) == 3);
+}
+
+TEST_CASE("Enumerators: from an enumerator, and empty past the end", "[core][enumtable]")
+{
+    STATIC_REQUIRE(std::ranges::size(Enumerators(Colour::Green)) == 2);
+    // NAMED, because `ranges::begin` refuses an rvalue that is not a borrowed range and a
+    // `transform_view` is not one: the temporary spelling does not compile, which is the
+    // library saying the iterator would outlive its range.
+    STATIC_REQUIRE([] {
+        auto range = Enumerators(Colour::Green);
+        return *range.begin();
+    }() == Colour::Green);
+
+    // `Last` yields nothing, and so does anything past it: the sub-range clamps rather
+    // than walking backwards, which an unclamped `iota(first, count)` would do by
+    // producing a reversed empty range on one implementation and undefined behaviour on
+    // another. Both directions, because a clamp that only ever sees legal inputs is
+    // untested rather than proven.
+    STATIC_REQUIRE(std::ranges::empty(Enumerators(Colour::Last)));
+    STATIC_REQUIRE(std::ranges::empty(Enumerators(static_cast<Colour>(9))));
+    STATIC_REQUIRE(std::ranges::size(Enumerators(Colour::Red)) == EnumeratorCount<Colour>);
 }
 
 TEST_CASE("EnumeratorCount: counts the named enumerators, not Last", "[core][enumtable]")
