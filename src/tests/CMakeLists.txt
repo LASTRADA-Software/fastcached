@@ -7162,10 +7162,19 @@ add_test(
         "-DFASTCACHED_SCRATCH_DIR=${CMAKE_CURRENT_BINARY_DIR}/instruction-set-flags-selftest"
         -P "${CMAKE_SOURCE_DIR}/scripts/check-instruction-set-flags-selftest.cmake"
 )
+# TIMEOUT 300 against a ~9.5 s warm run, which is deliberate and is not slack. The
+# check spawns `cmake -P` per case and stages a compile database for each, so its cost
+# is processes rather than work, and it loses to contention rather than slowing down
+# gracefully: measured 9522 ms and 9994 ms warm on an idle host (its neighbours are
+# target-pragmas 5176 ms, target-pragmas-selftest 1174 ms, the wrapper self-test 632 ms
+# and the flags check itself 683 ms), and observed exceeding 60 s inside
+# `scripts/local-gate.sh`, whose `ctest --parallel 8` runs it beside the other
+# process-heavy hygiene checks while a build finishes. A budget is the wrong place to
+# notice that, so the figure is stated here rather than left to be re-derived.
 set_tests_properties("instruction-set-flags-selftest" PROPERTIES
     FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
     LABELS "hygiene"
-    TIMEOUT 60
+    TIMEOUT 300
 )
 
 # This build's own compile database, and a plant into its real Sha256.cpp entries that must be refused. Only the
