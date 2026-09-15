@@ -12,12 +12,14 @@
     #include <sys/socket.h>
     #include <sys/time.h>
 
+    #include <algorithm>
     #include <array>
     #include <atomic>
     #include <cerrno>
     #include <chrono>
     #include <cstddef>
     #include <cstdint>
+    #include <ranges>
     #include <span>
     #include <string>
     #include <string_view>
@@ -135,7 +137,7 @@ std::vector<std::byte> RecvExactly(int fd, std::size_t expected)
 std::vector<std::byte> CounterPattern(std::size_t count)
 {
     std::vector<std::byte> value(count);
-    for (std::size_t i = 0; i < count; ++i)
+    for (auto const i: std::views::iota(std::size_t { 0 }, count))
         value[i] = static_cast<std::byte>(i & 0xFF);
     return value;
 }
@@ -344,9 +346,8 @@ TEST_CASE("KqueueSocket::Write completes a payload larger than the send buffer",
 
     REQUIRE(reported.load() == ValueByteCount);
     REQUIRE(received.size() == ValueByteCount);
-    bool intact = true;
-    for (std::size_t i = 0; i < ValueByteCount && intact; ++i)
-        intact = received[i] == static_cast<std::byte>(i & 0xFF);
+    bool const intact = std::ranges::all_of(std::views::iota(std::size_t { 0 }, ValueByteCount),
+                                            [&](std::size_t i) { return received[i] == static_cast<std::byte>(i & 0xFF); });
     REQUIRE(intact);
 }
 
@@ -379,9 +380,9 @@ TEST_CASE("KqueueSocket::WriteVectored streams a large value across partial writ
     REQUIRE(reported.load() == total);
     REQUIRE(received.size() == total);
     REQUIRE(std::string_view { reinterpret_cast<char const*>(received.data()), header.size() } == header);
-    bool intact = true;
-    for (std::size_t i = 0; i < ValueByteCount && intact; ++i)
-        intact = received[header.size() + i] == static_cast<std::byte>(i & 0xFF);
+    bool const intact = std::ranges::all_of(std::views::iota(std::size_t { 0 }, ValueByteCount), [&](std::size_t i) {
+        return received[header.size() + i] == static_cast<std::byte>(i & 0xFF);
+    });
     REQUIRE(intact);
     REQUIRE(
         std::string_view { reinterpret_cast<char const*>(received.data()) + header.size() + ValueByteCount, trailer.size() }

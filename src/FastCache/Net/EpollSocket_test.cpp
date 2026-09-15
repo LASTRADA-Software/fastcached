@@ -12,12 +12,14 @@
     #include <sys/socket.h>
     #include <sys/time.h>
 
+    #include <algorithm>
     #include <array>
     #include <atomic>
     #include <cerrno>
     #include <chrono>
     #include <cstddef>
     #include <cstdint>
+    #include <ranges>
     #include <span>
     #include <string>
     #include <string_view>
@@ -282,7 +284,7 @@ TEST_CASE("EpollSocket::WriteVectored streams a large value across partial write
 
     constexpr std::size_t ValueByteCount = 4U * 1024U * 1024U; // 4 MiB
     std::vector<std::byte> value(ValueByteCount);
-    for (std::size_t i = 0; i < ValueByteCount; ++i)
+    for (auto const i: std::views::iota(std::size_t { 0 }, ValueByteCount))
         value[i] = static_cast<std::byte>(i & 0xFF);
     std::string_view const header = "HDR:";
     std::string_view const trailer = ":END";
@@ -308,9 +310,9 @@ TEST_CASE("EpollSocket::WriteVectored streams a large value across partial write
     std::string const tail { reinterpret_cast<char const*>(received.data()) + header.size() + ValueByteCount,
                              trailer.size() };
     REQUIRE(tail == ":END");
-    bool intact = true;
-    for (std::size_t i = 0; i < ValueByteCount && intact; ++i)
-        intact = received[header.size() + i] == static_cast<std::byte>(i & 0xFF);
+    bool const intact = std::ranges::all_of(std::views::iota(std::size_t { 0 }, ValueByteCount), [&](std::size_t i) {
+        return received[header.size() + i] == static_cast<std::byte>(i & 0xFF);
+    });
     REQUIRE(intact);
 }
 

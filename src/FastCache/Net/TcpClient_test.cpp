@@ -21,6 +21,7 @@
 #include <deque>
 #include <memory>
 #include <optional>
+#include <ranges>
 #include <span>
 #include <string>
 #include <vector>
@@ -122,7 +123,7 @@ class ScriptedSocket final: public ISocket
 [[nodiscard]] std::vector<std::byte> Payload(std::size_t count)
 {
     std::vector<std::byte> bytes(count);
-    for (std::size_t i = 0; i < count; ++i)
+    for (auto const i: std::views::iota(std::size_t { 0 }, count))
         bytes[i] = static_cast<std::byte>(i & 0xFFU);
     return bytes;
 }
