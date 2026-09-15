@@ -47,10 +47,22 @@
 # matters. The reader of the YAML is narrow the same way: a line it cannot place by indentation (a flow mapping, an
 # alias, a quoted key, a second document) is REFUSED, never skipped.
 #
+# ## What says the reader read every step
+#
+# Nothing in the reader, which is why the count is not in it: every `run:` key outside a scalar is counted by a second
+# walk that knows only which lines a scalar owns, both numbers are printed per file, and a key the reader did not place
+# as a step's script (or a `defaults.run`) is refused by line. A step whose keys sit where the reader does not look
+# would otherwise read as a step that reads nothing. The plant (`--plant`) answers the other half on the real files:
+# every step the reader DID place is read by a model that sees a read at its end.
+#
+# A tracked composite action (`action.yml`/`action.yaml` whose `runs.using` is `composite`) has `run:` steps under the
+# same rule and none of them is read here, so the unplanted run refuses one by name; git's listing is the file set.
+#
 # ## What it does NOT cover, so that nobody reads a pass as more than it is
 #
 # A name reached by `eval` or indirect expansion; one a sourced file defines; one supplied through a `${{ }}`
-# expression (substituted, so invisible here); `${#arr[@]}`; and composite actions' own steps.
+# expression (substituted, so invisible here); `${#arr[@]}`. And the `NAME: ${{ env.NAME }}` row itself: a typo'd
+# `${{ env.X }}` on the right of it is unchecked until #1460.
 #
 # bash 3.2 and a POSIX awk: this runs on macOS's `/bin/bash` and BSD awk.
 
@@ -91,7 +103,8 @@ unknown-shell|This check reads a script by the model of the shell that runs it, 
 unresolved-shell|The shell could not be derived: no \`shell:\` on the step, no \`defaults.run.shell\` above it, and a \`runs-on\` that is not a literal Windows, Ubuntu, macOS or Linux runner. Name the shell on the step.
 unreadable-run|The \`run:\` value is not a string this check can read (an alias, a tag, or a flow collection). Write the script as a block scalar (\`run: |\`) or an inline string.
 unreadable-env|The \`env:\` is not a block mapping this check can read. Write one \`NAME: value\` row per line.
-unreadable-yaml|This check places every line of a workflow by its indentation, and cannot place this one -- a flow mapping, an alias, a quoted key, or a second document -- so no step around it can be judged. Write it as a block mapping; if the construct is needed, teach the reader and add a case."
+unreadable-yaml|This check places every line of a workflow by its indentation, and cannot place this one -- a flow mapping, an alias, a quoted key, or a second document -- so no step around it can be judged. Write it as a block mapping; if the construct is needed, teach the reader and add a case.
+unplaced-run|Every \`run:\` key outside a scalar is counted without the reader and must be a script the reader placed in a step (or a \`defaults.run\`), so a step whose keys the reader stopped recognising is refused here rather than read as clean. If this is a step's script, the reader misplaced the step: teach it, with a case. If it is not one -- an action input or an \`env:\` row named \`run\` -- the reader has no place for it either: teach it where the key sits, with a case. Never rename a script key to get past this."
 
 # The tables as awk takes them: a -v value may not hold a newline on BSD awk.
 Flatten() { printf '%s' "$1" | tr '\n' "$2"; }
@@ -103,7 +116,7 @@ remedyRows="$(Flatten "$Remedies" $'\036')"
 problems=0
 
 # Scan one workflow file. Prints `REFUSE\t<line>\t<step>\t<kind>\t<detail>\t<remedy>` per refusal, in plant mode
-# `PLANTED\t<line>\t<step>\t<seen 0|1>` per step a model read, and last `STEPS\t<steps>\t<bash>\t<pwsh>`.
+# `PLANTED\t<line>\t<step>\t<seen 0|1>` per step a model read, and last `STEPS\t<steps>\t<bash>\t<pwsh>\t<run keys>\t<placed>`.
 # @param 1 The workflow file.
 # @param 2 1 to plant a read of an undefined name at the end of every step a model reads, else 0.
 Scan() {
@@ -354,13 +367,32 @@ Scan() {
         else stepEnv[name] = 1
     }
 
+    # ---- the count ---------------------------------------------------------------------------------------------------
+    # Every `run:` key outside a scalar, found WITHOUT the reader: no steps, no jobs, no key columns, only which lines a
+    # scalar owns. A line the reader places as a script and a line counted here are compared in END, so a step the
+    # reader stops recognising -- keys at a column it did not expect -- is refused by line rather than read as clean.
+    # A script body is a scalar, so a heredoc writing `run:` into a file is text here too, as in the reader.
+    function count(s,   lead, key, v) {
+        if (countOwner >= 0 && (s ~ /^[ \t]*$/ || indentOf(s) > countOwner)) return
+        countOwner = -1
+        if (match(s, /^[ ]*(-[ ]+)*/)) { lead = substr(s, 1, RLENGTH); gsub(/-/, " ", lead); s = lead substr(s, RLENGTH + 1) }
+        if (!match(s, /^[ ]*[A-Za-z_][A-Za-z0-9_.-]*[ \t]*:([ \t]|$)/)) return
+        key = substr(s, RSTART, RLENGTH)
+        sub(/^[ ]*/, "", key); sub(/[ \t]*:[ \t]*$/, "", key)
+        v = trim(substr(s, RSTART + RLENGTH))
+        if (substr(v, 1, 1) != "\"" && substr(v, 1, 1) != sq) sub(/(^|[ \t]+)#.*$/, "", v)
+        if (key == "run") { counted[FNR] = trim(s); runKeys++ }
+        if (v != "") countOwner = indentOf(s)
+    }
+    function place() { if (pass == 2) placed[FNR] = 1 }
+
     BEGIN {
         sq = sprintf("%c", 39)
         n = split(bashNames, p, " "); for (i = 1; i <= n; i++) if (p[i] != "") bashSet[p[i]] = 1
         n = split(windowsNames, p, " "); for (i = 1; i <= n; i++) if (p[i] != "") windowsSet[p[i]] = 1
         n = split(shells, p, " "); for (i = 1; i <= n; i++) if (split(p[i], q, "|") == 2) shellModel[q[1]] = q[2]
         n = split(remedies, p, "\036"); for (i = 1; i <= n; i++) if ((k = index(p[i], "|")) > 0) remedy[substr(p[i], 1, k - 1)] = substr(p[i], k + 1)
-        pass = 0; workflowShell = ""; resetAll()
+        pass = 0; workflowShell = ""; countOwner = -1; resetAll()
     }
 
     FNR == 1 { pass++; resetAll() }
@@ -370,6 +402,7 @@ Scan() {
         sub(/\r$/, "", line)
         ind = indentOf(line)
         blank = (line ~ /^[ \t]*$/)
+        if (pass == 2) count(line)
 
         # A block scalar, or a plain scalar continuing, owns every blank or more-indented line after its key.
         if (blockOwner >= 0) {
@@ -420,7 +453,8 @@ Scan() {
         sub(/^[ ]*/, "", key); sub(/[ \t]*:[ \t]*$/, "", key)
         value = trim(substr(line, RSTART + RLENGTH))
         c = substr(value, 1, 1)
-        if (c != "\"" && c != sq) sub(/[ \t]+#.*$/, "", value)
+        # A comment may be all there is after the colon, and the block below the key is then its value.
+        if (c != "\"" && c != sq) sub(/(^|[ \t]+)#.*$/, "", value)
 
         # A block scalar indicator hands the lines after it to the block; any other inline value may continue as a
         # plain scalar on more-indented lines, which are its text and never keys.
@@ -429,7 +463,7 @@ Scan() {
         if (value ~ /^[|>][-+0-9]*$/) {
             blockOwner = ind
             blockKind = (stepKey && key == "run") ? "run" : "skip"
-            if (blockKind == "run") hasRun = 1
+            if (blockKind == "run") { hasRun = 1; place() }
             if (!(inEnv && ind > envIndent)) next
         } else if (value != "") {
             blockOwner = ind; blockKind = "skip"
@@ -445,7 +479,7 @@ Scan() {
         }
 
         if (inDefaults) {
-            if (key == "run" && value == "") { defaultsRun = ind; next }
+            if (key == "run" && value == "") { defaultsRun = ind; place(); next }
             if (defaultsRun >= 0 && ind > defaultsRun && key == "shell") {
                 if (defaultsIndent == 0) workflowShell = unquote(value); else { jobShell = unquote(value); jobShellAt[jobStart] = jobShell }
             }
@@ -468,6 +502,7 @@ Scan() {
         else if (key == "shell") stepShell = trim(unquote(value))
         else if (key == "env") openEnv("step")
         else if (key == "run") {
+            place()
             if (c == "*" || c == "&" || c == "!" || c == "[" || c == "{") refuse(FNR, "unreadable-run", "`run: " value "`")
             else {
                 hasRun = 1
@@ -478,7 +513,16 @@ Scan() {
         }
     }
 
-    END { flush(); printf "STEPS\t%d\t%d\t%d\n", scanned, models["bash"], models["pwsh"] }
+    END {
+        flush()
+        stepName = "(none)"
+        for (i = 1; i <= FNR; i++) {
+            if (i in placed) placedKeys++
+            if ((i in counted) && !(i in placed)) refuse(i, "unplaced-run", "`" counted[i] "` is a `run:` key the reader placed in no step")
+            else if ((i in placed) && !(i in counted)) refuse(i, "unplaced-run", "the reader placed a `run:` script on a line the count found no `run:` key on")
+        }
+        printf "STEPS\t%d\t%d\t%d\t%d\t%d\n", scanned, models["bash"], models["pwsh"], runKeys, placedKeys
+    }
     ' "$1" "$1"
 }
 
@@ -488,6 +532,7 @@ Scan() {
 #          step a model read refuses it: proof, on the real files, that each is read by a model that sees a read.
 Judge() {
     local dir="$1" mode="${2:-plain}" plantFlag=0 file display status report files=0 steps=0 modelled=0 bashSteps=0 pwshSteps=0
+    local runKeys=0 placedKeys=0
     local tag line step kind detail remedy scanned planted=0 unplanted=0
     [ "$mode" = plant ] && plantFlag=1
     for file in "$dir"/*.yml "$dir"/*.yaml; do
@@ -500,10 +545,12 @@ Judge() {
         while IFS=$'\t' read -r tag line step kind detail remedy; do
             case "$tag" in
                 STEPS)
-                    # For a STEPS record the fields are the steps, those read as bash, and those read as PowerShell.
+                    # For a STEPS record the fields are the steps, those read as bash, those read as PowerShell, the
+                    # `run:` keys counted without the reader, and those the reader placed.
                     scanned="$line"
                     steps=$((steps + line)); bashSteps=$((bashSteps + step)); pwshSteps=$((pwshSteps + kind))
-                    echo "workflow-step-env: ${display}: ${line} run step(s), ${step} read as bash, ${kind} as PowerShell"
+                    runKeys=$((runKeys + detail)); placedKeys=$((placedKeys + remedy))
+                    echo "workflow-step-env: ${display}: ${detail} run: key(s) counted, ${remedy} placed; ${line} run step(s), ${step} read as bash, ${kind} as PowerShell"
                     ;;
                 PLANTED)
                     # For a PLANTED record the fourth field is whether the planted read was seen.
@@ -550,9 +597,59 @@ Judge() {
     if [ "$mode" = plant ]; then
         echo "workflow-step-env: plant: all ${modelled} run step(s) a model read in ${files} workflow file(s) refused the planted read (${bashSteps} bash, ${pwshSteps} PowerShell); ${unplanted} unplanted problem(s) left to the unplanted run"
     else
-        echo "workflow-step-env: ${files} workflow file(s), ${steps} run step(s) (${bashSteps} bash, ${pwshSteps} PowerShell), every environment name each reads is one it can see"
+        echo "workflow-step-env: ${files} workflow file(s), ${runKeys} run: key(s) counted and ${placedKeys} placed, ${steps} run step(s) (${bashSteps} bash, ${pwshSteps} PowerShell), every environment name each reads is one it can see"
     fi
     return 0
+}
+
+# A composite action's `runs.steps` are `run:` steps with the same environment rule, and this check reads none of
+# them. So one is REFUSED by name while none is tracked, rather than left outside a pass that reads as complete; the
+# file set is what git tracks, which is what a workflow can `uses: ./` -- a file on disk that is not tracked is not.
+# A JavaScript or Docker action runs no shell and is counted, and one whose `runs.using` cannot be read is refused.
+# @param 1 The repository root.
+# @return 0 when no composite action is tracked, 1 otherwise.
+CompositeActions() {
+    local root="$1" listed status file using tracked=0 actions=0 refused=0
+    # NUL-separated: a plain listing QUOTES a path holding a byte outside ASCII, and `*/action.yml` misses
+    # `".../action.yml"`. pipefail keeps git's status rather than tr's.
+    listed="$(git -C "$root" ls-files -z 2>&1 | tr '\0' '\n')"
+    status=$?
+    if [ "$status" -ne 0 ]; then
+        echo "  FAIL: git ls-files exited ${status} in ${root}, so no tracked composite action could be looked for: ${listed}"
+        return 1
+    fi
+    while IFS= read -r file; do
+        [ -n "$file" ] || continue
+        tracked=$((tracked + 1))
+        case "$file" in
+            action.yml | action.yaml | */action.yml | */action.yaml) ;;
+            *) continue ;;
+        esac
+        actions=$((actions + 1))
+        using="$(awk -v sq="'" '
+            { sub(/\r$/, "") }
+            /^runs:[ \t]*(#.*)?$/ { inRuns = 1; next }
+            /^[^ #]/ { inRuns = 0 }
+            inRuns && /^[ ]+using:/ { v = $0; sub(/^[ ]+using:[ \t]*/, "", v); sub(/[ \t]+#.*$/, "", v); gsub(/"/, "", v); gsub(sq, "", v); print v; exit }
+        ' "${root}/${file}" 2>/dev/null)"
+        case "$using" in
+            composite)
+                echo "  FAIL: ${file}: a composite action, whose steps this check does not read -- its \`run:\` steps are held to the same rule as a workflow's and nothing here judges them. Teach this check to read \`runs.steps\` as a job's steps, with cases, before adding one."
+                refused=$((refused + 1))
+                ;;
+            node[0-9]* | docker) ;;
+            *)
+                echo "  FAIL: ${file}: \`runs.using\` reads \`${using}\`, which is neither a composite action nor one that runs no shell, so whether its steps need judging cannot be told. Write \`using:\` under \`runs:\` on a line of its own, or teach this check the value."
+                refused=$((refused + 1))
+                ;;
+        esac
+    done <<< "$listed"
+    if [ "$tracked" -eq 0 ]; then
+        echo "  FAIL: git ls-files listed no tracked file in ${root} -- a listing of nothing is not a repository without actions"
+        return 1
+    fi
+    echo "workflow-step-env: actions: ${tracked} tracked file(s) listed by git ls-files, ${actions} action file(s), ${refused} refused"
+    [ "$refused" -eq 0 ]
 }
 
 # ---------------------------------------------------------------------------
@@ -854,6 +951,18 @@ jobs:
           echo "$CC"
 WF
 
+    # A `run:` key the reader places in no step is counted anyway, and refused by line.
+    Case unplacedRunKey 1 '`run: echo "$NOT_A_SCRIPT"` is a `run:` key the reader placed in no step' <<'WF'
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: some/action@v1
+        with:
+          run: echo "$NOT_A_SCRIPT"
+      - run: echo visible
+WF
+
     Case noRunStepAtAll 1 'not one `run:` step read' < /dev/null
     Case noWorkflowFile 1 'no workflow file under' plain nofile
 
@@ -894,6 +1003,33 @@ jobs:
     runs-on: ubuntu-latest
 env:
   WORKFLOW_AFTER: 1
+WF
+
+    # Each `run:` key is counted without the reader, so a step the reader stops placing is refused even when nothing
+    # it reads is wrong; and a line in a script that looks like a key is text, not a key.
+    Case runKeysCounted 0 '2 run: key(s) counted, 2 placed; 2 run step(s)' <<'WF'
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          cat > body.md <<BODY
+          - run: ${RUNNER_TEMP}
+          run: text
+          BODY
+      -   name: "wide"
+          run: echo clean
+WF
+
+    # A comment may be all that follows the colon; the block below is still the value.
+    Case commentAfterTheColon 0 '1 run step(s), 1 read as bash' <<'WF'
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    env: # the rows below
+      FROM_JOB: 1
+    steps: # one
+      - run: echo "$FROM_JOB"
 WF
 
     # A workflow's bash is the runner's, not macOS's 3.2, so the staged script names what a workflow may use.
@@ -968,7 +1104,8 @@ WF
 
     # ---- the plant ----------------------------------------------------------------------------------------------
 
-    Case plantSeenEverywhere 0 'all 3 run step(s) a model read in 1 workflow file(s) refused the planted read (2 bash, 1 PowerShell)' plant <<'WF'
+    # Two of the jobs name their runner and shell after their steps, which the plant must reach as well.
+    Case plantSeenEverywhere 0 'all 5 run step(s) a model read in 1 workflow file(s) refused the planted read (3 bash, 2 PowerShell)' plant <<'WF'
 jobs:
   a:
     runs-on: ubuntu-latest
@@ -982,6 +1119,21 @@ jobs:
     runs-on: windows-2025
     steps:
       - run: Write-Host hi
+  laterRunner:
+    steps:
+      - run: Write-Host $env:FROM_LATER
+    env:
+      FROM_LATER: 1
+    runs-on: windows-2025
+  laterShell:
+    steps:
+      - run: echo "$FROM_LATER"
+    runs-on: windows-2025
+    env:
+      FROM_LATER: 1
+    defaults:
+      run:
+        shell: bash
 WF
 
     # A body that never closes its quote hides everything after it: the plant must say so.
@@ -994,6 +1146,102 @@ jobs:
         run: |
           echo 'never closed
 WF
+
+    # ---- composite actions --------------------------------------------------------------------------------------
+    # Each case is a scratch repository, because the file set is what git TRACKS: an action on disk that is not
+    # tracked is not one a workflow can use, and a directory walk would read it.
+
+    # Write stdin to a path in a case's repository, and track it unless told not to.
+    # @param 1 Case name. @param 2 Path in the repository. @param 3 `untracked` to leave it out of the index.
+    Stage() {
+        if ! { mkdir -p "$(dirname "$tmp/$1/$2")" && cat > "$tmp/$1/$2" \
+            && { [ -d "$tmp/$1/.git" ] || git -C "$tmp/$1" init -q >/dev/null 2>&1; } \
+            && { [ "${3:-}" = untracked ] || git -C "$tmp/$1" add -- "$2" >/dev/null 2>&1; }; }; then
+            failures=$((failures + 1))
+            echo "  $1: could not stage $2 in a scratch repository"
+        fi
+    }
+    # Ask for the tracked composite actions of a case's directory. No repository above the scratch directory is
+    # consulted, so a case staging none is not one.
+    # @param 1 Case name. @param 2 Expected status (0 or 1). @param 3 Text the output must hold.
+    # @param 4 `script` to run the copy of this script staged in the case's repository, as ctest runs it, rather than
+    #          the function alone.
+    ActionCase() {
+        local name="$1" want="$2" expect="$3" how="${4:-function}" out got
+        mkdir -p "$tmp/$name"
+        if [ "$how" = script ]; then
+            out="$(GIT_CEILING_DIRECTORIES="$tmp" bash "$tmp/$name/scripts/check-workflow-step-env.sh" 2>&1)"
+        else
+            out="$(GIT_CEILING_DIRECTORIES="$tmp" CompositeActions "$tmp/$name" 2>&1)"
+        fi
+        got=$?
+        ran=$((ran + 1))
+        if [ "$got" != "$want" ]; then
+            failures=$((failures + 1))
+            printf '  %s: exited %s, wanted %s\n%s\n' "$name" "$got" "$want" "$out"
+        elif [[ "$out" != *"$expect"* ]]; then
+            failures=$((failures + 1))
+            printf '  %s: the right side for the wrong reason, no `%s` in:\n%s\n' "$name" "$expect" "$out"
+        fi
+    }
+
+    Stage compositeActionTracked README.md <<< "readme"
+    Stage compositeActionTracked .github/actions/build/action.yml <<'ACTION'
+name: build
+runs:
+  using: "composite"
+  steps:
+    - shell: bash
+      run: echo "$NOBODY_JUDGES_THIS"
+ACTION
+    ActionCase compositeActionTracked 1 '.github/actions/build/action.yml: a composite action'
+
+    # A path git would QUOTE in a plain listing.
+    local unquoted=".github/actions/b"$'\303\274'"hne/action.yml"
+    Stage quotedPath "$unquoted" <<'ACTION'
+runs:
+  using: composite
+ACTION
+    ActionCase quotedPath 1 "${unquoted}: a composite action"
+
+    Stage untrackedComposite README.md <<< "readme"
+    Stage untrackedComposite action.yaml <<'ACTION'
+runs:
+  using: node20 # a JavaScript action runs no shell
+  main: index.js
+ACTION
+    Stage untrackedComposite .github/actions/local/action.yml untracked <<'ACTION'
+runs:
+  using: composite
+  steps: []
+ACTION
+    ActionCase untrackedComposite 0 '2 tracked file(s) listed by git ls-files, 1 action file(s), 0 refused'
+
+    Stage unreadableUsing action.yml <<'ACTION'
+runs: { using: composite, steps: [] }
+ACTION
+    ActionCase unreadableUsing 1 '`runs.using` reads ``'
+
+    Stage nothingTracked notes.txt untracked <<< "not tracked"
+    ActionCase nothingTracked 1 'listed no tracked file'
+
+    ActionCase notARepository 1 'git ls-files exited'
+
+    # The unplanted run asks, not only the function: a clean workflow beside a tracked composite action is refused.
+    Stage askedByTheRun scripts/check-workflow-step-env.sh < "${BASH_SOURCE[0]}"
+    Stage askedByTheRun .github/workflows/wf.yml <<'WF'
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: ./.github/actions/setup
+      - run: echo clean
+WF
+    Stage askedByTheRun .github/actions/setup/action.yml <<'ACTION'
+runs:
+  using: composite
+ACTION
+    ActionCase askedByTheRun 1 '.github/actions/setup/action.yml: a composite action' script
 
     if [ "$failures" -ne 0 ]; then
         echo "check-workflow-step-env --self-test: ${ran} case(s) ran, ${failures} did not judge as they must"
@@ -1021,4 +1269,12 @@ if [ "$self_test" = "yes" ]; then
     SelfTest
 fi
 Judge "${dir:-$workflows_dir}" "$mode"
-exit $?
+status=$?
+if [ -n "$dir" ]; then
+    echo "workflow-step-env: actions: not asked -- --workflows names a directory, not a repository"
+elif [ "$mode" = plant ]; then
+    echo "workflow-step-env: actions: not asked by the plant run -- a tracked composite action is the unplanted run's to refuse"
+else
+    CompositeActions "$repo_root" || status=1
+fi
+exit "$status"

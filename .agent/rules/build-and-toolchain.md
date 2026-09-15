@@ -4503,8 +4503,9 @@ rule satisfied by a line that never executes is the same defect as a rule satisf
 prose, which that file's own header records making twice. **So the rule is per STEP and
 never whole-file; that is the whole of it.** `scripts/check-workflow-step-env.sh`
 (`ctest -R workflow-step-env`) refuses a `run:` step reading a name that neither its own
-`env:`, its job's or the workflow's `env:`, an export by an EARLIER step of the same job,
-the script's own assignments, nor a named allowlist of runner variables supplies.
+`env:`, its job's or the workflow's `env:`, the script's own assignments, nor a named
+allowlist of runner and shell variables supplies. A name an earlier step or an action
+exported is not on that list: the step names it in its own `env:` (below).
 
 It applies to **every** `run:`, not only the ones turning on `set -u`. Without `-u` an
 undefined name expands to EMPTY and the branch is silently taken the wrong way, which is
@@ -4557,6 +4558,16 @@ which reads identically to complete coverage. It walks every workflow file as a 
   second document — rather than skipping it, and a clean run is shown able to fail on the
   REAL files: `workflow-step-env-plant` appends a read of an undefined name to the end of
   every step, through the same lexer, and passes only when every step refuses it.
+- **The plant cannot see a step the reader never placed**, and nor can anything else the
+  reader computes: a step whose keys sit at a column it does not look at reads as a step
+  reading nothing, which is clean. So every `run:` key outside a scalar is COUNTED by a
+  second walk that knows no steps, both numbers are printed per file, and a key the reader
+  did not place is refused by line. Its positive control is on the real tree: the
+  `- run: ${RUN_URL}` lines inside `merge-group-report.yml`'s heredocs are text, not keys.
+- A tracked composite action has `run:` steps under the same rule and none is read, so one
+  is refused by NAME rather than left outside a pass that reads as complete. The file set
+  is `git ls-files -z`: a plain listing QUOTES a path holding a byte outside ASCII, and
+  `*/action.yml` then misses it.
 
 What it cannot see is stated in its own header.
 
@@ -5592,6 +5603,15 @@ is correct: an inclusion list naming this repository's own layout needs no roots
   entry under "Language and ABI pitfalls" being obeyed, not a gap in it: neither platform has a CI
   leg to compile a branch for it. It closes when each has one, and that change removes the `#1432`
   comments in `Core/CpuFeatures` and this entry.
+
+- **[#1460](https://github.com/LASTRADA-Software/fastcached/issues/1460)** — the
+  per-step env check accepts a `NAME: ${{ env.NAME }}` row as naming where an exported name
+  comes from, and reads nothing on its right: a `${{ env.X }}` naming no workflow, job or
+  step `env:`, no earlier `$GITHUB_ENV` write and no action export substitutes EMPTY with no
+  error, so a typo'd row passes. The same holds for a `${{ env.X }}` anywhere in a step's
+  `run:`, `with:`, `if:` or `env:` values. It closes when expressions are read against those
+  sources, with a writer table, an action-export table refused when stale in either direction,
+  and the plant added to every step's `env:` values.
 
 - **[#1410](https://github.com/LASTRADA-Software/fastcached/issues/1410)** — the
   declared clang-tidy build crashes in `modernize-min-max-use-initializer-list` on a call through a
