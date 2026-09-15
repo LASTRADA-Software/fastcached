@@ -4,6 +4,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <memory>
+#include <ranges>
 
 using FastCache::WatchHandle;
 using FastCache::WatchRegistry;
@@ -194,7 +195,7 @@ TEST_CASE("WatchRegistry: Touched on empty registry returns 0 without entering t
     // the outside beyond the absence of side effects, but the behavioural
     // contract (zero handles dirtied) holds.
     WatchRegistry registry;
-    for (auto i = 0; i < 1000; ++i)
+    for ([[maybe_unused]] auto const i: std::views::iota(0, 1000))
         REQUIRE(registry.Touched("nope") == 0);
 }
 

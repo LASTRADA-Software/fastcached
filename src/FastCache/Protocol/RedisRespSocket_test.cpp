@@ -38,6 +38,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <ranges>
 #include <span>
 #include <string>
 #include <string_view>
@@ -150,7 +151,7 @@ class RespClient
     [[nodiscard]] std::string ReadUntil(std::string_view marker)
     {
         std::string out;
-        for (int attempt = 0; attempt < 50; ++attempt)
+        for ([[maybe_unused]] auto const attempt: std::views::iota(0, 50))
         {
             auto const chunk = ReadSome();
             if (chunk.empty())

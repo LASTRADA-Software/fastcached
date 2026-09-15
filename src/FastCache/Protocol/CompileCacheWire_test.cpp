@@ -1167,7 +1167,7 @@ TEST_CASE("A byte that names no verb has no family")
     CHECK(FamilyOf(0x00) == VerbFamily::Unset);
     CHECK(FamilyOf(0xFF) == VerbFamily::Unset);
 
-    for (unsigned raw = 0; raw <= 0xFF; ++raw)
+    for (auto const raw: std::views::iota(unsigned { 0 }, unsigned { 0xFF } + 1))
     {
         INFO("op 0x" << raw);
         auto const known = FindOp(static_cast<std::uint8_t>(raw)) != nullptr;

@@ -17,6 +17,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <ranges>
 #include <span>
 #include <string>
 #include <string_view>
@@ -175,7 +176,8 @@ std::vector<BinaryRecord> ParseRecords(std::vector<std::byte> const& resp)
         rec.cas = FastCache::ReadBigEndian<std::uint64_t>(std::span<std::byte const> { resp.data() + off + 16, 8 });
         std::size_t const valueStart = off + 24 + extrasLen + keyLen;
         std::size_t const valueLen = bodyLen - extrasLen - keyLen;
-        for (std::size_t i = valueStart; i < valueStart + valueLen && i < resp.size(); ++i)
+        auto const valueEnd = std::min(valueStart + valueLen, resp.size());
+        for (auto const i: std::views::iota(std::min(valueStart, valueEnd), valueEnd))
             rec.value.push_back(static_cast<char>(resp[i]));
         out.push_back(std::move(rec));
         off += 24 + bodyLen;
@@ -213,8 +215,8 @@ TEST_CASE("memcached-binary: SET then GET round-trips", "[protocol][binary]")
         FastCache::ReadBigEndian<std::uint16_t>(std::span<std::byte const> { response.data() + 24 + 6, 2 });
     REQUIRE(getStatus == 0);
     std::string value;
-    for (std::size_t i = 24 + 24 + 4; i < response.size(); ++i)
-        value.push_back(static_cast<char>(response[i]));
+    for (auto const byte: response | std::views::drop(24 + 24 + 4))
+        value.push_back(static_cast<char>(byte));
     REQUIRE(value == "hello");
 }
 
@@ -438,8 +440,8 @@ TEST_CASE("memcached-binary: GAT (0x1d) returns value + flags + bumps CAS", "[pr
         FastCache::ReadBigEndian<std::uint32_t>(std::span<std::byte const> { response.data() + 24 + 24, 4 });
     REQUIRE(gatFlags == 0xCAFEU);
     std::string value;
-    for (std::size_t i = 24 + 24 + 4; i < response.size(); ++i)
-        value.push_back(static_cast<char>(response[i]));
+    for (auto const byte: response | std::views::drop(24 + 24 + 4))
+        value.push_back(static_cast<char>(byte));
     REQUIRE(value == "payload");
 }
 

@@ -21,6 +21,7 @@
 #include <array>
 #include <chrono>
 #include <cstddef>
+#include <ranges>
 #include <span>
 #include <string>
 #include <string_view>
@@ -70,7 +71,7 @@ FastCache::Task<std::string> DrainResponse(FastCache::ISocket* s)
         auto const r = co_await s->Read(std::span<std::byte> { chunk.data(), chunk.size() });
         if (!r.has_value() || *r == 0)
             break;
-        for (std::size_t i = 0; i < *r; ++i)
+        for (auto const i: std::views::iota(std::size_t { 0 }, *r))
             out.push_back(static_cast<char>(chunk[i]));
         if (*r < chunk.size())
             break;
@@ -609,7 +610,7 @@ TEST_CASE("RESP: TTL probe does NOT bump LRU recency", "[protocol][resp][ttl]")
     REQUIRE(engine.Set("b", blob, 0, 0).has_value());
     // Probe `a` repeatedly through TTL. If TTL were a regular Get, this
     // would promote `a` to MRU and the next insertion would evict `b`.
-    for (int i = 0; i < 5; ++i)
+    for ([[maybe_unused]] auto const i: std::views::iota(0, 5))
     {
         auto const t = engine.Ttl("a");
         REQUIRE(t.has_value());
@@ -1116,7 +1117,7 @@ TEST_CASE("RESP: MGET does NOT bump LRU recency", "[protocol][resp][mget]")
     REQUIRE(engine.Set("b", blob, 0, 0).has_value());
 
     // Probe `a` repeatedly through Peek (the MGET path).
-    for (int i = 0; i < 5; ++i)
+    for ([[maybe_unused]] auto const i: std::views::iota(0, 5))
     {
         auto const p = engine.Peek("a");
         REQUIRE(p.has_value());

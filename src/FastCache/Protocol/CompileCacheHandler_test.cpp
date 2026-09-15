@@ -384,7 +384,7 @@ TEST_CASE("STORE/FETCH round-trips an object blob larger than 1 MiB", "[compile-
     constexpr std::size_t BlobByteCount = (1024U * 1024U) + 4099U;
     CompileValue v;
     v.objectBlob.resize(BlobByteCount);
-    for (std::size_t i = 0; i < BlobByteCount; ++i)
+    for (auto const i: std::views::iota(std::size_t { 0 }, BlobByteCount))
         v.objectBlob[i] = static_cast<std::byte>((i * 31U) & 0xFF);
     v.textRegions.push_back({ .grammar = Grammar::ShowIncludes,
                               .bytes = "Note: including file: "
