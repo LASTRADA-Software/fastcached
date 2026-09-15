@@ -220,6 +220,67 @@ TEST_CASE("A composite with no participants refuses everybody", "[distributed][m
     CHECK(admitted.Classify("127.0.0.1") == Membership::Outsider);
 }
 
+namespace
+{
+
+/// An oracle that answers one fixed verdict, so a composite's FOLD can be driven.
+///
+/// A fake that could only answer `Member` or `Outsider` could not exercise the rule it is
+/// here for: every oracle in the tree derives its answer from a host list, and a list
+/// cannot spell `Forgotten`.
+class FixedMembership: public IMembershipOracle
+{
+  public:
+    /// @param verdict What every peer gets.
+    explicit FixedMembership(Membership verdict) noexcept: _verdict { verdict } {}
+
+    /// @param peerAddress Ignored.
+    /// @return The fixed verdict.
+    [[nodiscard]] Membership Classify(std::string_view /*peerAddress*/) const override { return _verdict; }
+
+  private:
+    Membership _verdict;
+};
+
+} // namespace
+
+TEST_CASE("A forget outranks a listing, whichever participant said it", "[distributed][membership][forget]")
+{
+    // #1309. The composite folds on `PrecedenceOf` rather than admitting on any_of: the host
+    // an operator has just forgotten in the cluster is exactly the one still named by
+    // `--fleet-member` on a node nobody has reconfigured, so a forget has to WIN. What this
+    // case distinguishes is the fold from the old `any_of(... == Member)`, which answered
+    // `Member` here and flattened the forget to `Outsider` when it stood alone.
+    FixedMembership const forgets { Membership::Forgotten };
+    ClusterMembership listed { { "10.0.0.1:7000" } };
+
+    SECTION("the forget is asked first")
+    {
+        AnyOfMembership const admitted { { &forgets, &listed } };
+        CHECK(admitted.Classify("10.0.0.1") == Membership::Forgotten);
+    }
+
+    SECTION("the listing is asked first")
+    {
+        AnyOfMembership const admitted { { &listed, &forgets } };
+        CHECK(admitted.Classify("10.0.0.1") == Membership::Forgotten);
+    }
+
+    SECTION("a forget alone reaches the surface as itself, not as an outsider")
+    {
+        AnyOfMembership const admitted { { &forgets } };
+        CHECK(admitted.Classify("10.0.0.9") == Membership::Forgotten);
+    }
+
+    SECTION("and nothing else is disturbed: a listed host with no forget is still a member")
+    {
+        FixedMembership const nobody { Membership::Outsider };
+        AnyOfMembership const admitted { { &nobody, &listed } };
+        CHECK(admitted.Classify("10.0.0.1") == Membership::Member);
+        CHECK(admitted.Classify("10.0.0.2") == Membership::Outsider);
+    }
+}
+
 TEST_CASE("A scheduler refuses a non-member through the oracle", "[distributed][membership][scheduler]")
 {
     // The two halves joined: the oracle answers who, `SchedulerService` decides

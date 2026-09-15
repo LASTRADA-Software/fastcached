@@ -93,13 +93,25 @@ class AnyOfMembership final: public IMembershipOracle
     }
 
     /// @param peerAddress The connecting peer's **host**, as the participants take it.
-    /// @return `Member` when any participant says so, `Outsider` when none does.
+    /// @return The participants' answers folded on `PrecedenceOf`: forgotten, else member,
+    ///         else outsider.
+    ///
+    /// **Not `any_of(... == Member)`**, which this was. That flattened every other answer to
+    /// `Outsider`, so a participant's `Forgotten` reached no surface as itself and no counted
+    /// refusal could fire (#1309) -- the safety survived and the distinction did not, with
+    /// nothing to warn anybody. A forget must also OUTRANK a listing, because the host an
+    /// operator has just forgotten in the cluster is exactly the one still named by
+    /// `--fleet-member` on a node nobody has reconfigured yet.
     [[nodiscard]] Membership Classify(std::string_view peerAddress) const override
     {
-        auto const admits = [peerAddress](IMembershipOracle const* oracle) {
-            return oracle->Classify(peerAddress) == Membership::Member;
-        };
-        return std::ranges::any_of(_participants, admits) ? Membership::Member : Membership::Outsider;
+        auto verdict = Membership::Outsider;
+        for (auto const* participant: _participants)
+        {
+            auto const answer = participant->Classify(peerAddress);
+            if (PrecedenceOf(answer) > PrecedenceOf(verdict))
+                verdict = answer;
+        }
+        return verdict;
     }
 
   private:

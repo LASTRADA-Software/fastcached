@@ -60,13 +60,49 @@ enum class SchedulerRole : std::uint8_t
 /// The anti-leeching decision, named for what it *is* rather than for the check
 /// that produces it. Zero is `Outsider` so a default-constructed request cannot
 /// accidentally be admitted: the direction a mistake has to fail in.
+/// A private, in-process enum: no wire and no file carries it, so the explicit `= 0` is
+/// the only value spelled and the rest may be reordered freely.
+///
+/// `Forgotten` is not a weaker `Outsider`: it says a host was a member and a POSITIVE act
+/// removed it (#1309). Every decision here tests for `Member`, so a third value fails
+/// closed at all of them; what it buys is the DISTINCTION, which is what a per-surface
+/// counted refusal and an operator's remedy need. `PrecedenceOf` is why it survives being
+/// composed -- see `AnyOfMembership`.
 enum class Membership : std::uint8_t
 {
     /// Not a cluster member. Still served the cache; never handed a worker.
     Outsider = 0,
     /// An authenticated member of this cluster.
     Member,
+    /// A host a `--cluster-forget-client` removed. Refused, and counted apart from an
+    /// ordinary outsider, because a decommissioned machine still dialling is an event.
+    Forgotten,
+    /// The count, for a table over this enum.
+    Last,
 };
+
+/// Which answer wins when several oracles disagree: **forgotten beats member beats
+/// outsider**.
+///
+/// A forget has to outrank a listing, or the decommissioning case this exists for cannot
+/// work: a host named by `--fleet-member` on a node that has not been reconfigured is
+/// exactly the host an operator has just forgotten in the cluster. The composer folds on
+/// this rather than `any_of`, which flattened every non-`Member` answer to `Outsider` and
+/// destroyed the distinction with no diagnostic.
+///
+/// @param membership An answer.
+/// @return Its rank, higher winning.
+[[nodiscard]] constexpr std::uint8_t PrecedenceOf(Membership membership) noexcept
+{
+    switch (membership)
+    {
+        case Membership::Forgotten: return 2;
+        case Membership::Member: return 1;
+        case Membership::Outsider: return 0;
+        case Membership::Last: break;
+    }
+    return 0;
+}
 
 /// Everything the scheduler needs to know about the caller, gathered by the
 /// transport before it asks.
