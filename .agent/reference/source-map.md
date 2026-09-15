@@ -252,6 +252,14 @@ src/apps/
                             framed surfaces are `FrameEndpoint`s over one shared
                             `NodeIoLoop`, and its HTTP surface is
                             `AdminHttpServer`.
+  fastcache-cli/            the operator's client (FASTCACHED_BUILD_CLI, default
+                            ON, INSTALLED). Reads, writes and measures a running
+                            cache from a terminal; `docs/tools/fastcache-cli.md`
+                            is its reference. It was absent from this tree and
+                            from `AGENT.md`'s app table until #1439 noticed,
+                            having shipped and been documented on the Tools page
+                            throughout — which is what a missing row of a table
+                            called the spec looks like
   compile-cache-testclient/ low-level `0xFC` protocol probe + cross-depth
                             validation (FASTCACHED_BUILD_TESTCLIENT, default
                             OFF — test infrastructure, never installed, but
@@ -274,6 +282,12 @@ src/apps/
                             suite run on the same machine. Default OFF but built
                             by the `linux` and `clang-tidy` CI jobs, because a
                             target nothing compiles is a target that rots.
+                            `BuildBanner` + `BuildBannerListener` are the one
+                            place any of that says which BUILD produced a figure:
+                            printed to stderr before any case runs, every verdict
+                            drawn from a macro the compiler defines rather than
+                            from `CMAKE_BUILD_TYPE`, and each figure marked with
+                            what that build makes of it (#1439)
 ```
 
 Platform service integration and OS packaging live under `packaging/`, which

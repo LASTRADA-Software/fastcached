@@ -106,12 +106,56 @@ def build_bench(preset: str) -> None:
     )
 
 
-def run_fastcached(binary: Path, samples: int) -> dict[str, float]:
-    """Run the Catch2 benchmarks and return {row name: nanoseconds per body}.
+#: One banner FACT, as ``RenderBuildBanner`` in ``src/apps/fastcache-bench/BuildBanner.cpp``
+#: writes it: two spaces, a label, ``: ``, the value.
+#:
+#: The indent is the contract, and it is the reason this pattern needs no list of labels to
+#: track: that renderer indents the lines that are properties of the binary and leaves its
+#: own advice to the reader flush-left, so a fact added there arrives here by existing and a
+#: sentence added there does not become a row of this report's environment block.
+BANNER_LINE = re.compile(r"^  ([^:]+): (.+)$", re.MULTILINE)
+
+#: The banner's verdict line, whose three leading characters are the emphasis run the C++
+#: side carries per standing. All three spellings match, because which one this build
+#: produces is the thing being recorded.
+BANNER_VERDICT = re.compile(r"^[-!?]{3} these figures are (.+?) -- (.+)$", re.MULTILINE)
+
+
+def parse_build_banner(stderr: str) -> dict[str, str]:
+    """Return what the binary said about its own build, from the banner on its stderr.
+
+    ``fastcache-bench`` prints this before any case runs (#1439). Reading it back is the
+    only way this report can state what the binary IS: ``--preset`` says what was asked
+    for, and a preset and a binary can disagree in every way that matters -- a stale build
+    directory, a hand-set flag, a cache entry that never reached a compile line.
+
+    :param stderr: everything the binary wrote to stderr
+    :return: the banner's labelled lines, plus ``figures`` from its verdict
+    :raises RuntimeError: when no banner was found, so that a silently empty block cannot
+        be mistaken for a build with nothing to say
+    """
+    facts = {label.strip(): value.strip() for label, value in BANNER_LINE.findall(stderr)}
+    verdict = BANNER_VERDICT.search(stderr)
+    if not facts or verdict is None:
+        raise RuntimeError(
+            "fastcache-bench printed no build banner on stderr; this report cannot state what build "
+            "produced its figures. Expected the block RenderBuildBanner writes in "
+            "src/apps/fastcache-bench/BuildBanner.cpp"
+        )
+    facts["figures"] = f"{verdict.group(1)} -- {verdict.group(2)}"
+    return facts
+
+
+def run_fastcached(binary: Path, samples: int) -> tuple[dict[str, float], str]:
+    """Run the Catch2 benchmarks and return ({row name: nanoseconds per body}, stderr).
 
     Catch2's XML reporter emits one ``<BenchmarkResults>`` per row with a
     ``<mean value=...>`` child in nanoseconds; parsing that is more robust than
     scraping the console table's aligned columns.
+
+    The stderr comes back with it because that is where the build banner is, and the
+    banner belongs to this run rather than to a second invocation that might be of a
+    different binary.
     """
     completed = subprocess.run(
         [str(binary), "[lookup]", "--reporter", "xml", "--benchmark-samples", str(samples)],
@@ -125,11 +169,11 @@ def run_fastcached(binary: Path, samples: int) -> dict[str, float]:
             results[node.get("name", "?")] = float(mean.get("value", "0"))
     if not results:
         raise RuntimeError("no benchmark results parsed from fastcache-bench XML output")
-    return results
+    return results, completed.stderr
 
 
-#: The line ``[scaling]`` prints per thread count. The C++ side emits these
-#: rather than asserting on them (a measurement is not a contract), so this
+#: The line ``[scaling]`` prints per thread count, on STDERR. The C++ side emits
+#: these rather than asserting on them (a measurement is not a contract), so this
 #: pattern is the whole contract between the two — keep it in step with the
 #: ``std::format`` call in ``StorageBench.cpp``.
 SCALING_LINE = re.compile(r"^SCALING threads=(\d+) ops_per_sec=(\d+)", re.MULTILINE)
@@ -139,7 +183,7 @@ def run_scaling(binary: Path) -> dict[int, float]:
     """Run the thread-scaling benchmark and return {thread count: ops/sec}.
 
     A separate invocation from :func:`run_fastcached` because this tier reports
-    through stdout rather than Catch2's timing harness: it measures aggregate
+    in its own lines rather than through Catch2's timing harness: it measures aggregate
     throughput over a fixed wall-clock window across N threads, which is not a
     per-iteration mean and so has no ``<BenchmarkResults>`` to parse. Single
     -threaded ns/op says nothing about how a sharded cache uses more cores, and
@@ -148,7 +192,10 @@ def run_scaling(binary: Path) -> dict[int, float]:
     completed = subprocess.run(
         [str(binary), "[scaling]"], capture_output=True, text=True, check=True,
     )
-    results = {int(threads): float(ops) for threads, ops in SCALING_LINE.findall(completed.stdout)}
+    # STDERR: stdout belongs to the Catch2 reporter and every line the bench writes of its
+    # own goes to stderr (#1439), which `ctest -R bench-build-banner-streams` enforces by
+    # refusing a document whose `<StdOut>` carries text.
+    results = {int(threads): float(ops) for threads, ops in SCALING_LINE.findall(completed.stderr)}
     if not results:
         raise RuntimeError("no SCALING lines found in fastcache-bench output")
     return results
@@ -215,17 +262,25 @@ def per_operation(name: str, body_nanoseconds: float) -> float:
     return body_nanoseconds / LOOKUPS_PER_ITERATION
 
 
-def collect_environment(preset: str) -> dict[str, str]:
-    """Describe the machine and build, so a report is reproducible in hindsight."""
+def collect_environment(preset: str, build: dict[str, str]) -> dict[str, str]:
+    """Describe the machine and build, so a report is reproducible in hindsight.
+
+    :param preset: the CMake preset this run was ASKED to use. Named as such, because it
+        is a request rather than an observation: until #1439 this row was the only thing
+        the report said about the build, and it was read as a statement about the binary.
+    :param build: what the binary said about itself, from :func:`parse_build_banner`
+    :return: the rows the report and the terminal block print
+    """
     return {
         "os": f"{platform.system()} {platform.release()} ({platform.version()})",
         "cpu": platform.processor() or "unknown",
         "python": platform.python_version(),
-        "preset": preset,
+        "preset (requested)": preset,
         "commit": subprocess.run(
             ["git", "-C", str(REPO_ROOT), "rev-parse", "--short", "HEAD"],
             capture_output=True, text=True, check=False,
         ).stdout.strip(),
+        **{f"binary: {label}": value for label, value in build.items()},
     }
 
 
@@ -332,7 +387,7 @@ def main() -> int:
         print(f"benchmark binary not found: {binary}", file=sys.stderr)
         return 1
 
-    ours = run_fastcached(binary, args.samples)
+    ours, bench_stderr = run_fastcached(binary, args.samples)
     scaling = {} if args.no_scaling else run_scaling(binary)
 
     theirs: dict[str, float] = {}
@@ -342,7 +397,7 @@ def main() -> int:
         except (RuntimeError, subprocess.CalledProcessError) as error:
             print(f"(jitbit baseline unavailable - skipping: {error})\n", file=sys.stderr)
 
-    environment = collect_environment(args.preset)
+    environment = collect_environment(args.preset, parse_build_banner(bench_stderr))
     termviz.print_environment(environment)
 
     reference = per_operation("FastCacheLookup", theirs["FastCacheLookup"]) if "FastCacheLookup" in theirs else None

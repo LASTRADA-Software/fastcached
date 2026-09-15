@@ -164,9 +164,9 @@ struct TickBytes
 
 TEST_CASE("bench: one live-stats tick, text against binary", "[!benchmark][livestats]")
 {
-    std::cout << std::format(
+    std::cerr << std::format(
         "live-stats bench: {} catalogue counters, layout {:#018x}\n", CounterTable.size(), StatsReadingLayout);
-    std::cout
+    std::cerr
         << "| subject | regime | /metrics text (bytes) | binary reading (bytes) | push frame (bytes) | text / frame |\n"
         << "|---|---|---:|---:|---:|---:|\n";
     for (auto const& subject: Subjects)
@@ -178,7 +178,7 @@ TEST_CASE("bench: one live-stats tick, text against binary", "[!benchmark][lives
             REQUIRE(decoded.has_value());
             REQUIRE(*decoded == reading);
             auto const bytes = Measure(reading);
-            std::cout << std::format("| {} | {} | {} | {} | {} | {:.1f}x |\n",
+            std::cerr << std::format("| {} | {} | {} | {} | {} | {:.1f}x |\n",
                                      subject.name,
                                      regime.name,
                                      bytes.text,
@@ -281,17 +281,17 @@ TEST_CASE("bench: the fleet document one interval costs a leader, polled against
     auto const rendersPerInterval = static_cast<double>(Interval / floor);
     constexpr auto Watchers = std::to_array<std::size_t>({ 1, 4, 16, 64 });
 
-    std::cout << std::format("fleet bench: interval {} ms, fleet floor {} ms ({} renders per interval subscribed)\n",
+    std::cerr << std::format("fleet bench: interval {} ms, fleet floor {} ms ({} renders per interval subscribed)\n",
                              Interval.count(),
                              floor.count(),
                              rendersPerInterval);
-    std::cout << "| machines N | document (bytes) | render (us) | push encode (us) |";
+    std::cerr << "| machines N | document (bytes) | render (us) | push encode (us) |";
     for (auto const watchers: Watchers)
-        std::cout << std::format(" M={} polled (us) | M={} subscribed (us) |", watchers, watchers);
-    std::cout << "\n|---:|---:|---:|---:|";
+        std::cerr << std::format(" M={} polled (us) | M={} subscribed (us) |", watchers, watchers);
+    std::cerr << "\n|---:|---:|---:|---:|";
     for ([[maybe_unused]] auto const watchers: Watchers)
-        std::cout << "---:|---:|";
-    std::cout << '\n';
+        std::cerr << "---:|---:|";
+    std::cerr << '\n';
 
     for (auto const machines: std::to_array<std::size_t>({ 1, 16, 64, 256 }))
     {
@@ -306,13 +306,13 @@ TEST_CASE("bench: the fleet document one interval costs a leader, polled against
         auto const push = MicrosPerRun([&] {
             return Wire::EncodeReply(Wire::Status::Push, Wire::EncodeLiveSnapshot(1, Wire::AsBytes(document))).size();
         });
-        std::cout << std::format("| {} | {} | {:.1f} | {:.2f} |", machines, document.size(), render, push);
+        std::cerr << std::format("| {} | {} | {:.1f} | {:.2f} |", machines, document.size(), render, push);
         for (auto const watchers: Watchers)
         {
             auto const polled = static_cast<double>(watchers) * render;
             auto const subscribed = (rendersPerInterval * render) + (static_cast<double>(watchers) * push);
-            std::cout << std::format(" {:.1f} | {:.1f} |", polled, subscribed);
+            std::cerr << std::format(" {:.1f} | {:.1f} |", polled, subscribed);
         }
-        std::cout << '\n';
+        std::cerr << '\n';
     }
 }

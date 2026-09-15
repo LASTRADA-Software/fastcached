@@ -7279,3 +7279,88 @@ set_tests_properties("target-pragmas-selftest" PROPERTIES
     LABELS "hygiene"
     TIMEOUT 60
 )
+
+# ---------------------------------------------------------------------------
+# `fastcache-bench` states the build its figures came from (#1439).
+#
+# A timing is a quantity UNDER CONDITIONS, and the condition that decides whether it is
+# a cost at all is the build. That binary used to print nothing about it, and a Debug
+# bench prints a plausible number -- so while reviewing #1420 an MSVC `cl-release` log
+# was read as "a Debug-build signature", and the only tell was the build directory's
+# name.
+#
+# TWO registrations, because they answer two different questions and only one of them
+# can be answered from inside the binary:
+#
+#   * `bench-build-banner` runs the DECISION -- `ReasonFor` and the renderers over
+#     staged readings, both ways, since this host can only ever produce one arm.
+#   * `bench-build-banner-streams` runs the BINARY and reads what came out of it: the
+#     listener is registered at all, the banner is on stderr and not on the stdout
+#     `bench/inproc_bench.py` parses, every figure is marked, and that document carries
+#     no mixed content.
+#
+# Both guarded on `TARGET fastcache-bench` as well as on the option, because the two are
+# independent and a `$<TARGET_FILE:>` naming a target this configure did not declare is
+# a hard error at GENERATE time rather than a skipped test (#390).
+if(TARGET fastcache-bench)
+    # A plain `add_test` and deliberately NOT `catch_discover_tests`:
+    # `scripts/check-tsan-binaries.cmake` derives "every Catch2 test binary this tree
+    # registers" from that call and requires each to be a row of the ThreadSanitizer
+    # gate or to carry an exemption whose claim is re-scanned -- and
+    # `src/apps/fastcache-bench/` names `std::thread`, so no exemption there could be
+    # honest. Registering this way would put a benchmark binary, scaling tier and all,
+    # under TSan in order to run a handful of text-rendering cases.
+    #
+    # `[buildbanner]` is the only non-hidden, non-benchmark tag in that binary, so the
+    # filter selects exactly those cases. The PASS pattern asserts a NON-ZERO number of
+    # cases RAN: a tag that has stopped matching prints `No tests ran` and exits
+    # non-zero, which reads as a failing subject rather than as an empty filter.
+    add_test(
+        NAME "bench-build-banner"
+        COMMAND $<TARGET_FILE:fastcache-bench> "[buildbanner]"
+    )
+    set_tests_properties("bench-build-banner" PROPERTIES
+        # `[(]` rather than `\(`: CMake reads `\(` in a quoted argument as an escape and
+        # stores a bare `(`, which its regex engine then takes as a capture group -- so the
+        # pattern stops requiring the literal parenthesis Catch2 prints. Measured, the
+        # first spelling of this line failed on a run whose output contained the sentence.
+        #
+        # `PASS_REGULAR_EXPRESSION` replaces the exit status as the verdict, which is why
+        # the pattern is anchored on `All tests passed`: Catch2 prints that only when every
+        # selected case passed, and a run that crashed before printing anything matches
+        # nothing.
+        PASS_REGULAR_EXPRESSION "All tests passed [(][0-9]+ assertions in [1-9][0-9]* test cases?[)]"
+        LABELS "hygiene"
+        TIMEOUT 120
+    )
+
+    # Python, reusing the `find_package(Python3)` above rather than asking again -- a
+    # third spelling of "find python" would disagree with the other two about which
+    # interpreter it means. The check needs an XML parser: "stdout parses" is a weaker
+    # property than it looks, since a stray write between two elements leaves a document
+    # that parses and carries text where only elements belong, and no `cmake -P` reader
+    # can tell those apart.
+    #
+    # 77 is this file's script-driven convention for a missing prerequisite, which here
+    # means the target is declared and was not built, so nothing ran.
+    if(NOT Python3_Interpreter_FOUND)
+        fastcached_register_skipped_test("bench-build-banner-streams"
+            "no Python 3 interpreter found, so what fastcache-bench writes to each stream is NOT guarded in this build tree")
+    else()
+        add_test(
+            NAME "bench-build-banner-streams"
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_SOURCE_DIR}/scripts/check-bench-build-banner.py"
+                --binary "$<TARGET_FILE:fastcache-bench>"
+        )
+        # TIMEOUT is the outer supervisor rather than the measurement. Measured on this
+        # tree's slowest configuration -- a clang-debug build with ASan and UBSan on, over
+        # a 9p mount -- the whole run at one sample per benchmark cost 11 s; the budget is
+        # for a cold two-core runner doing the same work.
+        set_tests_properties("bench-build-banner-streams" PROPERTIES
+            LABELS "hygiene"
+            SKIP_RETURN_CODE 77
+            TIMEOUT 300
+        )
+    endif()
+endif()

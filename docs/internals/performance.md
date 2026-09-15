@@ -20,6 +20,53 @@ L3 domains), Fedora Linux 44, clang 21 `-O3` (the `clang-release` preset),
 `powersave` governor. Absolute numbers move with the machine; the shape does
 not.
 
+## Reading a `fastcache-bench` run
+
+Two things have to be right before a number off that binary means anything, and
+both have been got wrong here.
+
+**Which column.** Catch2 prints two numbers per benchmark. `est run time`, beside
+the case name, is samples × iterations — the whole run — and it is the larger of
+the two, so it is the one a reader reaches for. The **`mean`, on the line below
+the case name, is the per-operation cost**, and it is the only figure on this page
+that is comparable with anything. One review of #1420 read `1.09 s` and `158 ms`
+off the `est run time` column as a per-hash cost; the means for the same run were
+`22.06 ms` and `77.2 ns`, and `1.09 s / 50 samples` is the same measurement.
+`bench/inproc_bench.py` reads `<mean value=...>` out of the XML reporter rather
+than scraping the console table, for exactly that reason.
+
+**Which build.** The binary prints its own build configuration to **stderr**
+before any case runs, and marks every figure with what that build makes of it:
+
+```
+fastcache-bench: the build these figures come from
+  build type (as configured -- a LABEL, never evidence): Debug
+  compiler (as it identifies itself): clang 22.1.2
+  asserts: LIVE -- NDEBUG is not defined, so assert() runs inside every measured body
+  optimiser: did NOT run -- this compiler defines __OPTIMIZE__ when it optimises and did not define it
+  ...
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+!!! these figures are NOT A COST -- asserts are LIVE (NDEBUG is not defined), ...
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+```
+
+Every verdict there is drawn from a macro the **compiler** defines — `NDEBUG`,
+`__OPTIMIZE__`, `_DEBUG`, `__MSVC_RUNTIME_CHECKS`, the sanitizer macros — never
+from `CMAKE_BUILD_TYPE`, which is printed as a label because it says what the
+build system was *asked* for. There are three verdicts rather than two: `cl`
+defines no optimiser macro at all, so a `cl` build with `NDEBUG` reports
+`UNCONFIRMED` rather than claiming the better answer. Quote a figure only from a
+run whose banner says **`a cost`**, and quote the banner with it.
+
+Everything the binary writes of its own -- the banner, the per-figure lines, each
+benchmark's own notes and the `[scaling]` tier's `SCALING` lines -- is on **stderr**;
+stdout carries the Catch2 reporter and nothing else, which is what keeps
+`--reporter xml` parseable. So capture the two streams separately, and keep the banner
+with any figure you quote.
+
+`src/apps/fastcache-bench/BuildBanner.hpp` carries the rest of the reasoning, and
+`ctest -R bench-build-banner` runs it.
+
 ## The storage stack, layer by layer
 
 `fastcache-bench` builds the same stack the daemon builds and adds one

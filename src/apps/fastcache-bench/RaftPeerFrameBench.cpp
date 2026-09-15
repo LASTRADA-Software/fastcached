@@ -10,10 +10,14 @@
 /// the tag is a cost anybody would see beside the replication it guards.
 ///
 /// **It measures the shipped seam, not a stand-in**: `FrameSealer` and `FrameOpener` over a
-/// `PskRaftPeerCredential`, the objects `RaftPeerTransport` and `RaftPeerServer` hold. The
-/// conditions -- build type, frame size -- are printed with the figures, because a digest's
-/// throughput at `-O0` and at `-O2` differ by an order of magnitude and a figure without them
-/// invites exactly the wrong comparison.
+/// `PskRaftPeerCredential`, the objects `RaftPeerTransport` and `RaftPeerServer` hold. The frame
+/// size is printed with the figures; the BUILD is printed once for the whole binary by
+/// `BuildBannerListener.cpp`, because a digest's throughput at `-O0` and at `-O2` differ by an
+/// order of magnitude and a figure without that condition invites exactly the wrong comparison.
+///
+/// This file used to carry its own `BuildKind` constant reading `NDEBUG`, and it called such a
+/// build *optimised* -- which `NDEBUG` does not say, since `-O0 -DNDEBUG` defines it and
+/// optimises nothing (#1439).
 
 #include <FastCache/Cluster/PskRaftPeerCredential.hpp>
 #include <FastCache/Consensus/RaftPeerServer.hpp>
@@ -33,7 +37,6 @@
 #include <format>
 #include <iostream>
 #include <span>
-#include <string_view>
 #include <vector>
 
 using namespace FastCache;
@@ -41,13 +44,6 @@ using namespace FastCache::Consensus;
 
 namespace
 {
-
-/// Whether this binary was built with optimisation, as the figures must say.
-#if defined(NDEBUG)
-constexpr std::string_view BuildKind = "optimised (NDEBUG)";
-#else
-constexpr std::string_view BuildKind = "unoptimised (no NDEBUG)";
-#endif
 
 /// A frame of @p payloadBytes: a real header, and a payload of arbitrary bytes, since the MAC
 /// does not read them as anything.
@@ -70,7 +66,7 @@ TEST_CASE("bench: sealing and opening a Raft peer frame", "[!benchmark][raftfram
     {
         auto const frame = FrameOf(payloadBytes);
         auto const bytes = std::span<std::byte const> { frame };
-        std::cout << "raft frame MAC: " << payloadBytes << "-byte payload, " << BuildKind << "\n";
+        std::cerr << "raft frame MAC: " << payloadBytes << "-byte payload\n";
 
         BENCHMARK(std::format("seal {} bytes", payloadBytes))
         {

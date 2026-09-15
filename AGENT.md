@@ -98,6 +98,10 @@ src/apps/
                             (FASTCACHED_BUILD_NODE, default ON). May also be the
                             scheduler, hold a cache tier, and run consensus — four
                             surfaces, each off unless asked for except the cache
+  fastcache-cli/            the operator's client (FASTCACHED_BUILD_CLI, default ON)
+                            — reads, writes and measures a running cache from a
+                            terminal. INSTALLED, and documented on the Tools page;
+                            this row was missing from the table until #1439
   compile-cache-testclient/ low-level 0xFC protocol probe + cross-depth validation
                             (FASTCACHED_BUILD_TESTCLIENT, default OFF, never
                             installed, but built by the linux and clang-tidy jobs)
@@ -1192,6 +1196,10 @@ what differs between compilers, standard libraries, hosts and tool versions.
   function, checked as a computation (`ctest -R debug-prefix-map-rules`).
 - A sanitizer that is on in the cache is not one that is on in the build — a tool that silently
   does nothing is worse than one that is visibly off.
+- **`NDEBUG` is not optimisation, and `CMAKE_BUILD_TYPE` is a LABEL that decides nothing.** A
+  benchmark states the build it came from, before any case runs, on **stderr**, and marks every
+  figure; each verdict comes from a macro the COMPILER defines in the asking TU. THREE answers,
+  because `cl` states no optimiser macro at all. `ctest -R bench-build-banner`.
 - A Windows **Debug** leg is run for `_ITERATOR_DEBUG_LEVEL=2`, not for the compiler, so it runs
   `ctest` rather than only building. Nothing states that level, so `iterator-debug-canary` is a
   program that must die and `scripts/iterator-debug-gate.ps1` refuses a build where it survives.

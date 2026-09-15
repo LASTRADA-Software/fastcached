@@ -1402,6 +1402,70 @@ determinism rests on.
     is why the gate sets `print_suppressions=1` on **every** run, canary included,
     and prints ThreadSanitizer's own `Matched N suppressions` line.
 
+## `NDEBUG` is not optimisation, and only the compiler can say which build this is
+
+The same "the cache and the log are the two places that lie" rule, arriving where a
+number gets quoted. `fastcache-bench` printed timings that said nothing about the build
+behind them, and a Debug bench prints a plausible number: reviewing #1420 the manager read
+an MSVC `cl-release` log as *"a Debug-build signature"*, and the only tell anywhere was the
+build directory's **name** ([#1439](https://github.com/LASTRADA-Software/fastcached/issues/1439)).
+
+Four things, and the first is the one that had already shipped as a defect.
+
+- **`NDEBUG` does not say the optimiser ran.** `RaftPeerFrameBench.cpp` spelled its own
+  `BuildKind` as `"optimised (NDEBUG)"`; `-O0 -DNDEBUG` defines it and optimises nothing.
+  A figure labelled *optimised* on that evidence is a **confident wrong signal**, which
+  this rulebook ranks below a vague right one everywhere else it appears.
+- **`CMAKE_BUILD_TYPE` is a LABEL and decides nothing.** It rides into the binary as a
+  compile definition and is printed, because an operator needs to know what was asked for
+  — and no verdict reads it. Every verdict comes from a macro the **compiler** defines in
+  the translation unit that asks, which is why `CurrentBuildConfiguration` is a non-inline
+  function in one `.cpp` of the target rather than an inline one in a header some other
+  target could instantiate with its own flags.
+- **Which drivers state the optimiser is a claim about tools, so it was measured against
+  the tools** (2026-09-15, on this machine, `-dM -E` over an empty TU):
+
+  <!-- table-total: none -->
+  | driver | `__OPTIMIZE__` at `-O1`/`/O1` and above | absent at `-O0`/`/Od` | `__MSVC_RUNTIME_CHECKS` under `/RTC1` |
+  |---|---|---|---|
+  | clang 22.1.2 (GNU driver) | yes | yes | n/a |
+  | gcc 14.3.0 | yes | yes | n/a |
+  | clang-cl 22.1.3 | yes | yes | **no** — it ignores `/RTC` |
+  | `cl` (VS 18) | **never defines it** | — | yes |
+
+  So an absent `__OPTIMIZE__` means *the optimiser did not run* on three of the four and
+  means **nothing** on `cl`. `__SANITIZE_ADDRESS__` is defined by all four under their
+  address-sanitizer flag, `__SANITIZE_THREAD__` by gcc and clang, and neither defines
+  anything for UBSan — `__has_feature(undefined_behavior_sanitizer)` answers on clang and
+  on gcc 14 and up, and MSVC has no `__has_feature` at all. clang-cl defines `__clang__`
+  and **not** `__GNUC__`, which is why a predicate for *does this compiler state the
+  optimiser* has to name both.
+- **So a figure's standing has THREE values, not two.** A cost, not a cost, or
+  **unconfirmed** — the last being a `cl` build with `NDEBUG` and no way to confirm the
+  optimiser from inside the binary. Folding it into *a cost* is the wrong answer arriving
+  as the plausible one, which is this file's recurring subject; folding it into *not a
+  cost* would mark every MSVC release figure unquotable. `src/apps/fastcache-bench/BuildBanner.hpp`
+  carries the fact table, and `ctest -R bench-build-banner` drives every arm over staged
+  readings, because this host can only ever produce one of them.
+
+The banner goes to **stderr**, and the reason is measured rather than assumed. Under
+`--reporter xml` Catch2 redirects the streams a test case writes, so `std::cout`/`std::cerr`
+from inside a case are captured into `<StdOut>`/`<StdErr>` and the document still parses —
+but C stdio and `std::println` are not redirected, and a write from inside a `BENCHMARK`
+body lands inside an open start tag and breaks the parse outright. stderr is safe for any
+API, so the rule needs no exception for how a line was written. `ctest -R
+bench-build-banner-streams` therefore asserts **no mixed content** rather than *stdout
+parses*: a stray write between two elements leaves a document that parses perfectly and
+carries text where only elements belong.
+
+**And the rule is the whole binary's, not the banner's: stdout belongs to the reporter.**
+Every line a bench file writes of its own goes to stderr -- the five files were moved onto
+it with #1439 and `bench/inproc_bench.py` reads the `SCALING` lines off stderr because of
+it. What makes that more than a sentence in the files that already obey it is that the same
+check refuses a document whose `<StdOut>` carries any text at all, so a `std::cout` added
+to a bench file tomorrow fails a check rather than being safe by luck about which reporter
+is running and which endpoint happens to end in a newline.
+
 ## A retry makes every one of these disappear without fixing it
 
 Eleven separate ways the gate reported something that was not about the tree under
