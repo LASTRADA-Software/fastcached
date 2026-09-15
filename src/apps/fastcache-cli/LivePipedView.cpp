@@ -2,7 +2,7 @@
 #include "DashboardPanels.hpp"
 #include "LivePipedView.hpp"
 
-#include <FastCache/Core/EnumTable.hpp>
+#include <FastCache/Core/FigureText.hpp>
 
 #include <algorithm>
 #include <cassert>
@@ -49,33 +49,13 @@ namespace
         out.append(count, ' ');
     }
 
-    /// How one figure format is written for a program rather than a person.
-    struct RawFigureRow
-    {
-        FigureFormat format;                ///< The enumerator this row describes.
-        std::string (*write)(double value); ///< The lexical form: no unit, no grouping.
-    };
-
-    /// One row per `FigureFormat`: whole numbers stay whole, and a fraction keeps the digits its
-    /// panel percentage is drawn from and one more.
-    constexpr auto RawFigureTable = EnumTable<FigureFormat, RawFigureRow> { {
-        { .format = FigureFormat::Count, .write = [](double value) { return std::format("{:.0f}", value); } },
-        { .format = FigureFormat::Rate, .write = [](double value) { return std::format("{:.3f}", value); } },
-        { .format = FigureFormat::Percent, .write = [](double value) { return std::format("{:.4f}", value); } },
-        { .format = FigureFormat::Bytes, .write = [](double value) { return std::format("{:.0f}", value); } },
-        { .format = FigureFormat::Seconds, .write = [](double value) { return std::format("{:.3f}", value); } },
-    } };
-
-    static_assert(RowsInEnumeratorOrder(RawFigureTable, &RawFigureRow::format),
-                  "RawFigureTable must hold one row per FigureFormat, in enumerator order");
-
-    /// @p value as a piped cell in @p format's raw form.
+    /// @p value as a piped cell, written for a program by the one writer the leader's documents use too.
     /// @param value The value.
     /// @param format How the panel writes it.
     /// @return The cell.
     [[nodiscard]] Cell RawFigureCell(double value, FigureFormat format)
     {
-        return Cell { .kind = CellKind::Number, .lexical = RawFigureTable[static_cast<std::size_t>(format)].write(value) };
+        return Cell { .kind = CellKind::Number, .lexical = WriteMachineFigure(value, format) };
     }
     /// The newest cell of @p figure's series: what the panel draws for it now.
     /// @param figure The figure.

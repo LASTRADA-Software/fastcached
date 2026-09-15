@@ -8,13 +8,13 @@ namespace FastCache
 {
 
 /// @file FigureText.hpp
-/// How a figure is written for a PERSON, in the one place every human surface asks.
+/// How a figure is written, for a PERSON and for a PROGRAM, in the one place every surface asks.
 ///
-/// **Human surfaces only.** `/fleet.txt`, `/fleet.json`, `/metrics` and a piped `live-stats`
-/// record carry the raw integer, because a humanised figure has to be parsed back by whoever reads
-/// it and `awk` cannot. What reads this is the browser page and the terminal panels, and they read
-/// it through here so an operator looking at both sees one vocabulary: `93.65 GiB` on the page is
-/// `93.65 GiB` in the panel, never `93.6 GiB` beside it.
+/// **Two writers, because the two readers want opposite things.** A person reads `93.65 GiB` and
+/// `85.3 %`; a program -- `/fleet.txt`, `/fleet.json`, a piped `live-stats` record -- reads
+/// `100000000000` and `0.8530`, because a humanised figure has to be parsed back and `awk` cannot.
+/// Both live here so an operator looking at the page and the panel sees one vocabulary, and a script
+/// reading the leader's document and the CLI's pipe reads one scale.
 
 /// How a figure is written.
 ///
@@ -55,5 +55,23 @@ struct WrittenFigure
 /// @param format How to write it.
 /// @return The number and its unit.
 [[nodiscard]] WrittenFigure WriteFigure(double value, FigureFormat format);
+
+/// @p value, present and finite, written as @p format says for a PROGRAM: no unit, no grouping.
+///
+/// A whole-number format (`Count`, `Bytes`) is written whole, `Rate` and `Seconds` to three decimals, and a
+/// `Percent` -- a share in [0, 1] -- to FOUR, which keeps the digits the page's `85.3 %` is drawn from and
+/// one more. Each format's count of decimals is one column of one row, never a caller's argument, so no
+/// two surfaces can write one share to different precision.
+///
+/// **Rounding** is `std::format`'s: the nearest number with that many decimals, and a value exactly halfway
+/// between two -- which only a binary fraction can be, such as 1/32 -- goes to the one whose last digit is
+/// even: 1/32 is `0.0312`, 3/32 is `0.0938`. The ends are written in full, `1.0000` and `0.0000`.
+///
+/// Absence is the caller's to spell, as for `WriteFigure`: a share nobody can compute is the surface's
+/// absent marker, never `0.0000`.
+/// @param value The value; finite.
+/// @param format How to write it.
+/// @return The lexical form.
+[[nodiscard]] std::string WriteMachineFigure(double value, FigureFormat format);
 
 } // namespace FastCache
