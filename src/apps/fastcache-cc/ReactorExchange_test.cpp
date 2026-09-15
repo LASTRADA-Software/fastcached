@@ -486,7 +486,7 @@ TEST_CASE("A peer that dribbles a byte at a time is bounded by the total budget"
     // the clock while an exchange is in flight.
     auto dribble =
         [](TestReactor* loop, ManualClock* c, PeerLog* log, std::chrono::milliseconds perByte, int turns) -> DetachedTask {
-        for (int turn = 0; turn < turns; ++turn)
+        for ([[maybe_unused]] auto const turn: std::views::iota(0, turns))
         {
             co_await ResumeOn { *loop };
             c->Advance(perByte);
@@ -623,7 +623,7 @@ TEST_CASE("A pulse pushes the idle bound out, so a worker that keeps reporting i
     constexpr int Turns = 32; // comfortably more than the stream is long
     auto dribble =
         [](TestReactor* loop, ManualClock* c, PeerLog* log, std::chrono::milliseconds perByte, int turns) -> DetachedTask {
-        for (int turn = 0; turn < turns; ++turn)
+        for ([[maybe_unused]] auto const turn: std::views::iota(0, turns))
         {
             co_await ResumeOn { *loop };
             c->Advance(perByte);
@@ -687,7 +687,7 @@ TEST_CASE("A budget of zero arms no deadline at all")
     // it read a whole reply and not because the driver ran out of turns.
     constexpr int Turns = 32;
     auto dribble = [](TestReactor* loop, ManualClock* c, PeerLog* log, int turns) -> DetachedTask {
-        for (int turn = 0; turn < turns; ++turn)
+        for ([[maybe_unused]] auto const turn: std::views::iota(0, turns))
         {
             co_await ResumeOn { *loop };
             c->Advance(1s);

@@ -6,6 +6,7 @@
 #include <atomic>
 #include <cstddef>
 #include <mutex>
+#include <ranges>
 #include <set>
 #include <stdexcept>
 #include <vector>
@@ -29,7 +30,7 @@ TEST_CASE("Every slice runs exactly once", "[parallelfor]")
         std::vector<std::atomic<int>> seen(Count);
         REQUIRE(parallel->Run(Count, [&](std::size_t index) { seen[index].fetch_add(1); }));
 
-        for (std::size_t index = 0; index < Count; ++index)
+        for (auto const index: std::views::iota(std::size_t { 0 }, Count))
             CHECK(seen[index].load() == 1);
     }
 }

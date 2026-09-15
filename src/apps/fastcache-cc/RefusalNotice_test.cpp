@@ -6,6 +6,7 @@
 
 #include <chrono>
 #include <filesystem>
+#include <ranges>
 #include <string>
 
 using namespace FastCache::Cc;
@@ -44,7 +45,7 @@ TEST_CASE("RefusalNotice: a thousand units produce one line, not a thousand", "[
     CHECK(ShouldAnnounceRefusal(dir, "127.0.0.1:6674", Wire::ErrorCode::UnsupportedVersion, Epoch));
 
     auto announced = 0;
-    for (auto i = 0; i < 1000; ++i)
+    for ([[maybe_unused]] auto const i: std::views::iota(0, 1000))
         if (ShouldAnnounceRefusal(dir, "127.0.0.1:6674", Wire::ErrorCode::UnsupportedVersion, Epoch + 1s))
             ++announced;
     CHECK(announced == 0);

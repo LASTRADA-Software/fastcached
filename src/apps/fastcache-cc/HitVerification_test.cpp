@@ -12,6 +12,7 @@
 #include <fstream>
 #include <iterator>
 #include <optional>
+#include <ranges>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -47,7 +48,7 @@ namespace
 [[nodiscard]] std::size_t SampledOut(std::size_t count, unsigned rate)
 {
     std::size_t sampled = 0;
-    for (std::size_t i = 0; i < count; ++i)
+    for (auto const i: std::views::iota(std::size_t { 0 }, count))
         if (ShouldVerifyHit(std::format("objkey-v3:{:016x}", i), rate))
             ++sampled;
     return sampled;

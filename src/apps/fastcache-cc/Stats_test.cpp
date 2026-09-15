@@ -137,7 +137,7 @@ void AppendDispatchRecords(int count,
                            std::string_view detail = {},
                            std::string_view source = "a.cpp")
 {
-    for (int i = 0; i < count; ++i)
+    for ([[maybe_unused]] auto const i: std::views::iota(0, count))
         AppendRecord(MakeDispatchRecord(dispatch, detail, source));
 }
 
@@ -524,7 +524,7 @@ TEST_CASE("FormatReport counts the hit rate over cacheable compiles only")
 TEST_CASE("FormatReport ranks the fall-back reasons")
 {
     ScopedStateDir const scoped;
-    for (int i = 0; i < 3; ++i)
+    for ([[maybe_unused]] auto const i: std::views::iota(0, 3))
     {
         auto record = MakeRecord(Outcome::Unavailable, "main", "a.cpp", 5);
         record.detail = "connect failed";
@@ -553,7 +553,7 @@ TEST_CASE("A miss that fell back from a worker is still ranked by its reason")
     // per translation unit with no metrics sink, this ranking is the only aggregate of
     // that event that exists anywhere.
     ScopedStateDir const scoped;
-    for (int i = 0; i < 2; ++i)
+    for ([[maybe_unused]] auto const i: std::views::iota(0, 2))
     {
         auto record = MakeRecord(Outcome::Miss, "main", "a.cpp", 5);
         record.detail = "a worker answered about a different compile";

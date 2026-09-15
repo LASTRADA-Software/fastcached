@@ -5,6 +5,7 @@
 
 #include <filesystem>
 #include <memory>
+#include <ranges>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -126,11 +127,11 @@ TEST_CASE("Resolution is memoized per directory, not per path")
     // directory must not be ten probes.
     FastCache::Testing::ScratchDirectory const scratch { "fc-resolve-memo" };
     auto const directory = scratch / "inc";
-    for (int index = 0; index < 10; ++index)
+    for (auto const index: std::views::iota(0, 10))
         (void) MakeFile(scratch, "inc/h" + std::to_string(index) + ".h");
 
     auto const resolver = MakePathResolver();
-    for (int index = 0; index < 10; ++index)
+    for (auto const index: std::views::iota(0, 10))
         (void) resolver->Resolve((directory / ("h" + std::to_string(index) + ".h")).string());
 
     auto const afterTen = resolver->FilesystemCalls();
