@@ -26,9 +26,11 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <concepts>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <format>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -41,11 +43,16 @@
 #include <utility>
 #include <vector>
 
+#include <tests/BoundedWait.hpp>
 #include <tests/Unwrap.hpp>
 
 using namespace FastCache;
 using namespace std::chrono_literals;
+using FastCache::Testing::Reached;
 using FastCache::Testing::Unwrap;
+using FastCache::Testing::WaitOptions;
+using FastCache::Testing::WaitOutcome;
+using FastCache::Testing::WaitUntilOutcome;
 
 namespace Wire = FastCache::CompileCacheWire;
 
@@ -387,15 +394,22 @@ struct Decoded
     }));
 }
 
-/// Wait on the real clock until @p predicate holds or @p bound passes.
-/// @return How long it waited, and whether it held.
-template <typename Predicate>
-[[nodiscard]] std::pair<std::chrono::milliseconds, bool> WaitFor(std::chrono::milliseconds bound, Predicate predicate)
+/// Wait on the real clock until @p predicate holds or @p bound passes, through the tree's one test wait.
+///
+/// Polled every 10 ms rather than at the helper's default rest: a busier poll takes CPU from the reactor
+/// threads whose lateness these cases measure.
+/// @param what      What the case waits for, in words.
+/// @param bound     How long to wait.
+/// @param predicate True once it has happened.
+/// @param state     What the reactors have done so far, in words.
+/// @return What the wait found, and how long it took.
+template <std::predicate Predicate, typename State>
+[[nodiscard]] WaitOutcome WaitFor(std::string_view what, std::chrono::milliseconds bound, Predicate predicate, State state)
 {
-    auto const start = std::chrono::steady_clock::now();
-    while (!predicate() && std::chrono::steady_clock::now() - start < bound)
-        std::this_thread::sleep_for(10ms);
-    return { std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start), predicate() };
+    return WaitUntilOutcome(what,
+                            std::move(predicate),
+                            std::move(state),
+                            WaitOptions { .step = {}, .context = {}, .bound = bound, .rest = 10ms });
 }
 
 /// Two subscribers of one stream, each on its own real reactor, and a heartbeat on each.
@@ -461,7 +475,9 @@ struct TwoReactorRig
                 return !started.at(index) || ended.at(index).returned.load();
             });
         };
-        return WaitFor(bound, all).second;
+        return Reached(WaitFor("every subscriber started to return", bound, all, [this] {
+            return std::format("returned: {}, {}", ended.at(0).returned.load(), ended.at(1).returned.load());
+        }));
     }
 
     AtomicMetricsSink metrics;
@@ -493,12 +509,20 @@ TEST_CASE("One live stream on two real reactors: a parked push stalls neither th
 
     // Long enough for the slow subscriber to miss ticks at least twice, and for the fast one's cadence to mean
     // something; bounded, and the reason for a timeout is in what the checks below then find.
-    auto const [waited, stalledTwice] = WaitFor(20s, [&rig] {
-        return CountOf(rig.sinks[0]->Frames(), Wire::PushKind::Gap) >= 2
-               && CountOf(rig.sinks[1]->Frames(), Wire::PushKind::Snapshot) >= 12;
-    });
-    INFO("waited " << waited.count() << " ms");
-    REQUIRE(stalledTwice);
+    auto const stalledTwice = WaitFor(
+        "the slow subscriber to miss two ticks while the fast one sees twelve",
+        20s,
+        [&rig] {
+            return CountOf(rig.sinks[0]->Frames(), Wire::PushKind::Gap) >= 2
+                   && CountOf(rig.sinks[1]->Frames(), Wire::PushKind::Snapshot) >= 12;
+        },
+        [&rig] {
+            return std::format("slow subscriber's gaps {}, fast subscriber's snapshots {}",
+                               CountOf(rig.sinks[0]->Frames(), Wire::PushKind::Gap),
+                               CountOf(rig.sinks[1]->Frames(), Wire::PushKind::Snapshot));
+        });
+    INFO("waited " << stalledTwice.elapsed.count() << " ms");
+    REQUIRE(Reached(stalledTwice));
 
     // Stop, and read what both saw only once every stream has returned, so nothing is still pushing.
     rig.stopping.store(true, std::memory_order_release);
@@ -567,24 +591,34 @@ TEST_CASE("One live stream on two real reactors: a capture running on one reacto
     constexpr auto CaptureTakes = Floor + (Floor / 2);
     TwoReactorRig rig { CaptureTakes, 0ms };
     rig.StartHeartbeats();
-    auto const [beating, bothBeat] =
-        WaitFor(10s, [&rig] { return rig.heartbeats[0].beats.load() > 0U && rig.heartbeats[1].beats.load() > 0U; });
-    INFO("heartbeats after " << beating.count() << " ms");
-    REQUIRE(bothBeat);
+    auto const bothBeat = WaitFor(
+        "both reactors' heartbeats to beat",
+        10s,
+        [&rig] { return rig.heartbeats[0].beats.load() > 0U && rig.heartbeats[1].beats.load() > 0U; },
+        [&rig] { return std::format("beats {}, {}", rig.heartbeats[0].beats.load(), rig.heartbeats[1].beats.load()); });
+    INFO("heartbeats after " << bothBeat.elapsed.count() << " ms");
+    REQUIRE(Reached(bothBeat));
     rig.sources.SlowOn(rig.heartbeats[0].thread.load());
 
     rig.StartSubscriber(0);
-    auto const [capturing, begun] = WaitFor(10s, [&rig] { return rig.sources.Captures() >= 1U; });
-    INFO("reactor 0's capture began after " << capturing.count() << " ms");
-    REQUIRE(begun);
+    auto const begun = WaitFor(
+        "reactor 0's capture to begin",
+        10s,
+        [&rig] { return rig.sources.Captures() >= 1U; },
+        [&rig] { return std::format("captures {}", rig.sources.Captures()); });
+    INFO("reactor 0's capture began after " << begun.elapsed.count() << " ms");
+    REQUIRE(Reached(begun));
 
     // Measured from here: what reactor 1's thread does from the moment its subscriber arrives mid-capture.
     rig.heartbeats[1].worstMicros.store(0, std::memory_order_release);
     rig.StartSubscriber(1);
-    auto const [waited, ran] =
-        WaitFor(20s, [&rig] { return CountOf(rig.sinks[1]->Frames(), Wire::PushKind::Snapshot) >= 4U; });
-    INFO("waited " << waited.count() << " ms");
-    REQUIRE(ran);
+    auto const ran = WaitFor(
+        "reactor 1's subscriber to see four snapshots",
+        20s,
+        [&rig] { return CountOf(rig.sinks[1]->Frames(), Wire::PushKind::Snapshot) >= 4U; },
+        [&rig] { return std::format("snapshots {}", CountOf(rig.sinks[1]->Frames(), Wire::PushKind::Snapshot)); });
+    INFO("waited " << ran.elapsed.count() << " ms");
+    REQUIRE(Reached(ran));
     rig.stopping.store(true, std::memory_order_release);
     REQUIRE(rig.StreamsReturned(10s));
 
