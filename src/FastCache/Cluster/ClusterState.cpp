@@ -624,8 +624,16 @@ std::expected<void, ConsensusError> Validate(Command const& command)
             if (host.empty())
                 return std::unexpected(InvalidConfiguration("a client command must name a host"));
             // A caller on a node's own machine is admitted to that node whatever any
-            // list says (`ClusterMembership::Classify`), so a record about loopback
+            // list says (`ClusterMembership::Classify`), so an ADMIT about loopback
             // would be accepted, replicated and snapshotted while deciding nothing.
+            //
+            // A FORGET about loopback is the opposite and is the reason this refusal
+            // must not be relaxed on the strength of the sentence above: since #1309 a
+            // tombstone OUTRANKS every admission route, so an entry naming loopback
+            // would refuse the local builds a node exists to serve, on every surface at
+            // once. `Distributed::ForgottenVerdicts` guards it a second time, because a
+            // rule enforced only here is one a later route can reach around -- and the
+            // consequence is invisible from this end.
             if (IsLoopbackHost(host))
                 return std::unexpected(InvalidConfiguration(
                     std::format("{} is loopback, which every node always admits from its own machine", host)));

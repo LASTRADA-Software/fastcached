@@ -683,6 +683,32 @@ class IMetricsSink
         NodeCacheRequestsRefusedNotLocal,
         NodeStatusRequestsRefusedNotAMember,
 
+        /// Requests refused because the cluster has FORGOTTEN the calling host
+        /// (#1309).
+        ///
+        /// **One counter for every surface, which is the one deviation from the
+        /// per-surface convention above, and it is deliberate.** Each
+        /// `...RefusedNotAMember` row answers a question about a DOOR -- how much
+        /// stranger traffic is arriving at the compile port, at live stats, at
+        /// `node-status` -- because a stranger at each is a different operational
+        /// story. A forgotten host is not a story about the door: it is one machine
+        /// somebody decommissioned that still has this fleet in its configuration,
+        /// and the remedy is the same wherever it knocked. Split six ways it would
+        /// have to be summed by hand to answer the only question anybody asks of it,
+        /// and five of the six would sit at zero looking like coverage.
+        ///
+        /// **Never sum it with a `...RefusedNotAMember` row either**, and it does not
+        /// double-count into one: a forgotten host is refused through THIS row
+        /// instead, so those keep meaning exactly what they always did -- a host
+        /// nobody ever listed. The two causes are opposite diagnoses. A stranger is
+        /// something to investigate; a forgotten host is something an operator
+        /// already decided, and a rise means the other end has not been told.
+        ///
+        /// Zero is the ordinary reading on a fleet nobody has shrunk, and it is an
+        /// honest zero rather than an absence: the row exists on every node, and a
+        /// node with no cluster simply never classifies anybody `Forgotten`.
+        NodeRequestsRefusedHostForgotten,
+
         /// An operator verb whose header declared more payload than it may carry.
         ///
         /// **Every one of these verbs is fieldless** -- `node-status` and

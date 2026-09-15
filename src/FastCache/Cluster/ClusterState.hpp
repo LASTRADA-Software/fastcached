@@ -495,8 +495,17 @@ struct ClusterState
 /// **Transmitted and persisted, and append only.** The numeric values are a wire contract
 /// twice over -- the byte a peer decodes and a log entry keeps, and the index of a table
 /// keyed by this enum -- so reordering these silently remaps every verb a running fleet
-/// has already replicated. Every value is written out, because on an enum like this one
-/// that is the enforcement; `Last` is the count and never travels.
+/// has already replicated. `Last` is the count and never travels.
+///
+/// **Only the first enumerator states its value, and the enforcement is the BYTE PINS in
+/// `ClusterState_test.cpp` rather than the declaration.** Writing `= N` on every verb is
+/// the tempting reading of the rule and was this branch's first version: it leaves `Last`
+/// inconsistent with the rest, which `readability-enum-initial-value` fails the build
+/// over, and the only ways out are worse. A literal `Last = N` is a hand-maintained count
+/// beside a hand-maintained list, which is the shape that drifts; anchoring the length on
+/// a verb by name is a guard that fires only when nothing is wrong. A test asserting each
+/// byte outranks both, because a red test cannot be failed to notice the way an absent
+/// `= N` can.
 ///
 /// **A verb is added without moving `CommandVersion`**, because the layout did not
 /// change, and that has a consequence a fleet mid-upgrade lives with: a member running a
@@ -513,22 +522,22 @@ enum class CommandKind : std::uint8_t
     /// same identity and a new address, and making the operator remove it first
     /// would leave a window in which the cluster has agreed it does not exist.
     AddMember = 0,
-    RemoveMember = 1,
-    SetSetting = 2,
+    RemoveMember,
+    SetSetting,
 
     /// Admit a client host to the fleet, clearing any tombstone for it (#1309).
     ///
     /// The replicated counterpart of a `--fleet-member` entry, for a machine that never
     /// joins consensus. Also the route BACK for a member that was forgotten and now
     /// serves as a plain worker or client: its forget tombstoned its host.
-    AdmitClient = 3,
+    AdmitClient,
 
     /// Forget a client host: stop admitting it and record that it was forgotten (#1309).
     ///
     /// A POSITIVE act, and recorded as one, because a node's own `--fleet-member` list
     /// may still name the host -- a tombstone is what lets every node refuse it with one
     /// committed entry rather than a reload on each machine.
-    ForgetClient = 4,
+    ForgetClient,
 
     Last, ///< Not a verb, and has no row: the length of a table keyed by one.
 };

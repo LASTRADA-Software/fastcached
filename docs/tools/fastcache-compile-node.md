@@ -777,6 +777,26 @@ unauthenticated.
 | `fastcache_node_status_requests_refused_payload_too_large_total` | A header declared more payload than these verbs may carry. Both are **fieldless**, so this came from no client of this tree at any version. Never sum it with the cache tier's row of the same name. |
 | `fastcache_node_status_requests_refused_endpoint_busy_total` | The surface had no bytes left in flight. These are the verbs somebody reaches for when a node is in trouble, so this is the node saying it is too busy to say what it is. Read it beside `fastcache_node_cache_requests_refused_endpoint_busy_total`, never summed: this says the diagnosis failed, that says why. |
 
+#### A host the cluster has forgotten
+
+One counter for the whole node rather than one per surface, because the answer does not
+depend on which door the caller knocked at:
+
+| Counter | What a rise means |
+|---|---|
+| `fastcache_node_requests_refused_host_forgotten_total` | A host the cluster agreed to **forget** asked this node for something -- a compile, the fleet tables, live stats, `node`, an enrollment verb. It means a machine somebody decommissioned is still configured to use this fleet, and the remedy is at that machine or at the cluster (admit it again), never on this node. |
+
+**Never sum it with a `..._refused_not_a_member_total` row**, and it does not double-count
+into one: a forgotten host is refused through this counter *instead*, so the
+`not_a_member` rows keep meaning what they always did -- a host nobody ever listed. The
+two are opposite diagnoses. A stranger is something to go and investigate; a forgotten
+host is something an operator already decided, and a rise means the other end has not
+been told.
+
+Zero is the ordinary reading, including on a node with no cluster at all, which never
+classifies anybody as forgotten. It is an honest zero rather than an absence: the series
+is rendered by every node.
+
 ### Live stats
 
 `fastcache-cli live-stats` subscribes over `0xFC` and this node pushes what the dashboard draws, instead of the dashboard polling `/metrics` and `/fleet.txt` ([#1399](https://github.com/LASTRADA-Software/fastcached/issues/1399)).

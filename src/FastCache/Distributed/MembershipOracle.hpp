@@ -118,14 +118,50 @@ class AnyOfMembership final: public IMembershipOracle
     std::vector<IMembershipOracle const*> _participants;
 };
 
-/// Only hosts on an explicit list are members.
+/// What one set of hosts answers, per question the set is asked.
 ///
-/// The list is the cluster's *authenticated* peers, refreshed by whatever
-/// established them -- `Cluster::DiscoveryService` in this tree, which admits a peer
-/// only after it proves the pre-shared key over a nonce this node chose. Holding a
-/// copy rather than a reference to that directory is what keeps this class free of
-/// the discovery module, and the copy is small: a fleet is tens of machines, and it
-/// changes when membership does rather than per request.
+/// Two columns rather than one, and `onLoopback` is the load-bearing half. A host
+/// set is asked one of two questions here -- *is this caller admitted* and *has this
+/// caller been forgotten* -- and the two disagree about THIS MACHINE in a way no
+/// derivation from `onMatch` can express: an admission list says its own machine is a
+/// member whatever it holds (`ClusterMembership`'s oldest rule), while a forgotten
+/// list must say *nothing at all* about its own machine. A forgotten set that
+/// answered `Forgotten` for loopback would refuse the local builds that are the
+/// entire reason the node is there, silently and on every surface at once.
+///
+/// `Cluster::Validate` already refuses a loopback host to `ForgetClient`, so today no
+/// such entry can be committed. That is a reason the guard is never REACHED, not a
+/// reason to leave it out: the consequence of it being wrong is invisible, and a rule
+/// enforced only by a validator two modules away is one a later route can bypass with
+/// nothing to warn anybody.
+struct HostSetVerdicts
+{
+    Membership onMatch;    ///< What a host IN the set is.
+    Membership onLoopback; ///< What this machine is, whatever the set holds.
+};
+
+/// The verdicts an admission list answers with: listed hosts and this machine.
+inline constexpr HostSetVerdicts AdmissionVerdicts { .onMatch = Membership::Member, .onLoopback = Membership::Member };
+
+/// The verdicts a forgotten list answers with: forgotten hosts, and silence about
+/// this machine. `Outsider` is that silence -- it is `PrecedenceOf` 0, so it loses to
+/// every other participant in `AnyOfMembership` rather than contributing an opinion.
+inline constexpr HostSetVerdicts ForgottenVerdicts { .onMatch = Membership::Forgotten, .onLoopback = Membership::Outsider };
+
+/// One verdict over one set of hosts, published wholesale and asked per connection.
+///
+/// Not a question in itself -- `ClusterMembership` and `ForgottenMembership` below are
+/// the questions, and this is what they share. Extracted when the second one arrived
+/// (#1309): a forgotten set is the same object in every respect that has ever cost a
+/// bug here -- the host-against-endpoint vocabulary, the two IPv6 spellings, the
+/// swap-under-a-shared-lock -- and differs only in what it ANSWERS. A second copy
+/// would have been a second place for each of those to be got wrong, in the one file
+/// whose comments exist because they already were.
+///
+/// Holding a copy of what established the set, rather than a reference to it, is what
+/// keeps this free of the modules that produce one -- discovery, consensus -- and the
+/// copy is small: a fleet is tens of machines, and it changes when membership does
+/// rather than per request.
 ///
 /// ## The identity is a HOST, and that is forced rather than chosen
 ///
@@ -148,12 +184,15 @@ class AnyOfMembership final: public IMembershipOracle
 /// trust boundary the pre-shared key establishes -- this refuses *strangers*, not
 /// co-located peers -- and separating them needs a credential in the frame, which is a
 /// different change with a different threat model.
-class ClusterMembership final: public IMembershipOracle
+class HostSetMembership: public IMembershipOracle
 {
   public:
     /// @param memberEndpoints `host:port` endpoints of the authenticated peers. Only
     ///        the host part is retained; see the class note.
-    explicit ClusterMembership(std::vector<std::string> const& memberEndpoints = {})
+    /// @param verdicts What this set answers on a match and for this machine.
+    /// @param memberEndpoints `host:port` endpoints. Only the host part is retained.
+    explicit HostSetMembership(HostSetVerdicts verdicts, std::vector<std::string> const& memberEndpoints = {}):
+        _verdicts { verdicts }
     {
         Publish(memberEndpoints);
     }
@@ -231,7 +270,7 @@ class ClusterMembership final: public IMembershipOracle
         // its own machine and nothing else, so it is useful immediately and closed to
         // the network until somebody says otherwise.
         if (IsLoopbackHost(peerAddress))
-            return Membership::Member;
+            return _verdicts.onLoopback;
 
         // A shared lock: this is asked once per connection on three surfaces and
         // written only when the cluster agrees a change, so readers must not
@@ -257,15 +296,61 @@ class ClusterMembership final: public IMembershipOracle
         auto const admits = [peerAddress](std::string_view host) {
             return SameHost(peerAddress, host);
         };
-        return std::ranges::any_of(_hosts, admits) ? Membership::Member : Membership::Outsider;
+        return std::ranges::any_of(_hosts, admits) ? _verdicts.onMatch : Membership::Outsider;
     }
 
   private:
+    /// What this set answers. Fixed at construction: the question a set answers is
+    /// what the set IS, where its contents are what changes while it lives.
+    HostSetVerdicts _verdicts;
+
     /// Guards `_hosts`. Mutable because `Classify` and `Size` are logically const
     /// and must still take it -- the alternative is a const method that reads a
     /// vector somebody else is replacing.
     mutable std::shared_mutex _mutex;
     std::vector<std::string> _hosts;
+};
+
+/// Only hosts on an explicit list are members.
+///
+/// The list is the cluster's *authenticated* peers, refreshed by whatever established
+/// them -- `Cluster::DiscoveryService` in this tree, which admits a peer only after it
+/// proves the pre-shared key over a nonce this node chose -- or, on the other route,
+/// what `--fleet-member` named. One list per question and composed, never one list
+/// answering both; see `AnyOfMembership` and #251.
+class ClusterMembership final: public HostSetMembership
+{
+  public:
+    /// @param memberEndpoints `host:port` endpoints of the admitted hosts. Only the
+    ///        host part is retained; see `HostSetMembership`.
+    explicit ClusterMembership(std::vector<std::string> const& memberEndpoints = {}):
+        HostSetMembership { AdmissionVerdicts, memberEndpoints }
+    {
+    }
+};
+
+/// Hosts the cluster has agreed to FORGET, and nothing else (#1309).
+///
+/// The participant that makes a forget reach a node whose own `--fleet-member` list
+/// still names the machine. Removing a client used to be an edit on every other
+/// machine in the fleet, which fails OPEN: miss one and it serves the retired host
+/// indefinitely, with admission succeeding being the ordinary case and nothing to
+/// report. A replicated tombstone plus `PrecedenceOf` closes that without asking
+/// anybody to reconfigure anything -- the forget outranks the listing.
+///
+/// It admits nobody. Composed into `AnyOfMembership` it can only ever RAISE a verdict
+/// from `Outsider` or `Member` to `Forgotten`, so adding it to a node's participants
+/// cannot widen admission -- which is the direction #282's guard is about, and the
+/// reason this needed no reload posture of its own.
+class ForgottenMembership final: public HostSetMembership
+{
+  public:
+    /// @param hosts The forgotten hosts, as `Cluster::ClusterState::forgotten` holds
+    ///        them: bare hosts, though an endpoint would be reduced to one anyway.
+    explicit ForgottenMembership(std::vector<std::string> const& hosts = {}):
+        HostSetMembership { ForgottenVerdicts, hosts }
+    {
+    }
 };
 
 } // namespace FastCache::Distributed

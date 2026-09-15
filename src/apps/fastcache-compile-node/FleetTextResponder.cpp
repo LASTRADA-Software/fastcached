@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "FleetReadGate.hpp"
 #include "FleetTextResponder.hpp"
+#include "MembershipGate.hpp"
 
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Protocol/SurfaceRefusal.hpp>
@@ -232,9 +233,8 @@ std::vector<std::byte> FleetTextResponder::Render(Wire::FleetTextRequest const& 
 
 std::optional<std::vector<std::byte>> FleetTextResponder::RefusePeer(std::string_view peer, std::uint8_t /*opRaw*/) const
 {
-    if (_membership.Classify(peer) == Distributed::Membership::Member)
-        return std::nullopt;
-    return Cc::Refuse(_metrics, RefusedNotAMember, "this node serves the fleet to fleet members only");
+    return RefuseUnlessMember(
+        _membership, _metrics, peer, RefusedNotAMember, "this node serves the fleet to fleet members only");
 }
 
 std::vector<std::byte> FleetTextResponder::RefusalReply(Wire::PrePayloadDecision decision,

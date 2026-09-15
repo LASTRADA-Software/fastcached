@@ -110,9 +110,23 @@ class NodeMembership final: public Distributed::IMembershipOracle
         _open {},
         _listed { cfg.fleetMembers },
         _cluster {},
+        _forgotten {},
         // Pointers into this object's own members, which is safe because the type is
-        // neither copyable nor movable and the composite is declared after both.
-        _admitted { { &_listed, &_cluster } },
+        // neither copyable nor movable and the composites are declared after all four.
+        _admitted { { &_forgotten, &_listed, &_cluster } },
+        // `--fleet-open` is folded with the forget rather than replacing it, and that
+        // is a decision about what the flag MEANS (#1309). It says "I have not
+        // enumerated who may use this fleet; serve whoever asks" -- a blanket over
+        // hosts nobody named. A forget names one. Letting the blanket win would make
+        // the local flag resurrect a machine the cluster positively removed, on
+        // exactly the node nobody has reconfigured yet, which is the failure this
+        // participant exists to close arriving through the one door left open.
+        //
+        // The directions are not comparable, which is what settles it: honouring the
+        // forget wrongly refuses a machine, fails CLOSED, and is visible from the
+        // refused end. Ignoring it serves a decommissioned host indefinitely, fails
+        // OPEN, and admission succeeding is the ordinary case -- nothing reports it.
+        _openly { { &_forgotten, &_open } },
         _logger { logger },
         _flagOpen { cfg.fleetOpen },
         _isOpen { cfg.fleetOpen }
@@ -164,7 +178,7 @@ class NodeMembership final: public Distributed::IMembershipOracle
     /// the other and never by half of each.
     [[nodiscard]] Distributed::Membership Classify(std::string_view peerAddress) const override
     {
-        return _isOpen.load(std::memory_order_relaxed) ? _open.Classify(peerAddress) : _admitted.Classify(peerAddress);
+        return _isOpen.load(std::memory_order_relaxed) ? _openly.Classify(peerAddress) : _admitted.Classify(peerAddress);
     }
 
     /// Record what the cluster agreed, alongside what the operator listed.
@@ -199,6 +213,16 @@ class NodeMembership final: public Distributed::IMembershipOracle
         _agreedOpen.store(AgreedOpenness(state), std::memory_order_relaxed);
         SettleOpenness();
         Publish(state.Endpoints());
+
+        // The tombstones, after the members, and the order is the same rule as the
+        // flag's: each publish is individually atomic, so a request landing between
+        // them reads one of them stale. Members first means the stale half a widening
+        // commit can be read with is the OLD forget list, which still refuses the host
+        // the new one does -- a re-admit is briefly not yet in force. The other order
+        // would leave a just-forgotten host admitted for that instant, which is the
+        // direction that cannot be recovered from: the compile has already been
+        // served.
+        _forgotten.Publish(state.forgotten);
     }
 
     /// Record the cluster's member set alone.
@@ -342,9 +366,20 @@ class NodeMembership final: public Distributed::IMembershipOracle
     /// What the cluster agreed, replaced on every committed membership change.
     Distributed::ClusterMembership _cluster;
 
-    /// The union the surfaces actually consult. Declared after both participants,
-    /// which it borrows.
+    /// What the cluster has agreed to forget. Written by `PublishCluster` and by
+    /// nothing else -- deliberately NOT by `Adopt`: a forget is the cluster's fact,
+    /// and a reload that rebuilt it from a config file would erase every tombstone
+    /// agreed since startup, which is #251's shape in the one direction where the
+    /// erasure fails open.
+    Distributed::ForgottenMembership _forgotten;
+
+    /// The fold the surfaces consult when this node has not been opened. Declared
+    /// after the three participants it borrows.
     Distributed::AnyOfMembership _admitted;
+
+    /// The fold they consult when it has. `_open` admits everybody and `_forgotten`
+    /// still outranks it; see the constructor for why the flag does not simply win.
+    Distributed::AnyOfMembership _openly;
 
     /// Where an unreadable `fleet-open` row is reported, once.
     ILogger& _logger;

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "DiscoveryTier.hpp"
 #include "EnrollmentResponder.hpp"
+#include "MembershipGate.hpp"
 
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/Utf8.hpp>
@@ -147,11 +148,10 @@ std::optional<std::vector<std::byte>> EnrollmentResponder::RefusePeer(std::strin
     if (static_cast<Wire::Op>(opRaw) == Wire::Op::Enroll)
         return std::nullopt;
 
-    if (_membership.Classify(peer) == Distributed::Membership::Member)
-        return std::nullopt;
-
-    return Cc::Refuse(
+    return RefuseUnlessMember(
+        _membership,
         _metrics,
+        peer,
         { .code = Wire::ErrorCode::NotAMember, .counter = IMetricsSink::Counter::EnrollmentControlRefusedNotAMember },
         "deciding who joins this cluster is a member's verb");
 }

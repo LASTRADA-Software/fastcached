@@ -232,11 +232,17 @@ class FixedMembership: public IMembershipOracle
 {
   public:
     /// @param verdict What every peer gets.
-    explicit FixedMembership(Membership verdict) noexcept: _verdict { verdict } {}
+    explicit FixedMembership(Membership verdict) noexcept:
+        _verdict { verdict }
+    {
+    }
 
     /// @param peerAddress Ignored.
     /// @return The fixed verdict.
-    [[nodiscard]] Membership Classify(std::string_view /*peerAddress*/) const override { return _verdict; }
+    [[nodiscard]] Membership Classify(std::string_view /*peerAddress*/) const override
+    {
+        return _verdict;
+    }
 
   private:
     Membership _verdict;
@@ -366,4 +372,63 @@ TEST_CASE("A peer this machine cannot name is refused", "[distributed][membershi
     ClusterMembership const membership { { "10.0.0.1:7000" } };
 
     CHECK(membership.Classify("") == Membership::Outsider);
+}
+
+TEST_CASE("A forgotten set answers about forgotten hosts and nothing else", "[distributed][membership][forget]")
+{
+    // The real oracle rather than the fake above, which could say `Forgotten` about
+    // anybody and therefore proved only the fold. What only this can show is that the
+    // set answers the RIGHT hosts -- and, twice as important, that it admits nobody: it
+    // is composed into every node's participants, so a `Member` escaping from here would
+    // widen admission on a node whose operator listed nothing at all.
+    ForgottenMembership const forgotten { { "10.0.0.7", "ci-runner-3.example" } };
+
+    CHECK(forgotten.Classify("10.0.0.7") == Membership::Forgotten);
+    CHECK(forgotten.Classify("ci-runner-3.example") == Membership::Forgotten);
+
+    // A host it has nothing to say about is `Outsider`, which is `PrecedenceOf` 0 and
+    // therefore silence in the fold -- not an opinion that this host is a stranger.
+    CHECK(forgotten.Classify("10.0.0.8") == Membership::Outsider);
+    CHECK(forgotten.Classify("") == Membership::Outsider);
+
+    // Whole-host, the same rule the member sets keep: `10.0.0.7` must not forget
+    // `10.0.0.70`, and the dual-stack spelling of a forgotten host is the same machine.
+    CHECK(forgotten.Classify("10.0.0.70") == Membership::Outsider);
+    CHECK(forgotten.Classify("::ffff:10.0.0.7") == Membership::Forgotten);
+}
+
+TEST_CASE("This machine is never forgotten, whatever the set holds", "[distributed][membership][forget]")
+{
+    // The guard `ForgottenVerdicts` exists for, asserted against a set that should be
+    // impossible: `Cluster::Validate` refuses a loopback host to `ForgetClient`, so no
+    // such entry can be committed today. That is a reason this is never REACHED, not a
+    // reason to leave it out -- the consequence is that a node stops serving the local
+    // builds that are the entire reason it is installed, on every surface at once, with
+    // admission having succeeded for years and nothing to report the change.
+    //
+    // It also distinguishes this class from a `ClusterMembership` with its verdict
+    // swapped, which is the cheap-looking implementation: that one answers `Member` for
+    // loopback, and remapping its match verdict would have remapped the loopback arm too.
+    ForgottenMembership const forgotten { { "127.0.0.1", "::1", "10.0.0.7" } };
+
+    CHECK(forgotten.Classify("127.0.0.1") == Membership::Outsider);
+    CHECK(forgotten.Classify("127.0.0.53") == Membership::Outsider);
+    CHECK(forgotten.Classify("::1") == Membership::Outsider);
+
+    // The control, and it is load-bearing: without it a class that answered `Outsider`
+    // for every caller would pass the three checks above.
+    CHECK(forgotten.Classify("10.0.0.7") == Membership::Forgotten);
+}
+
+TEST_CASE("A forget is published wholesale, and a re-admit is its removal", "[distributed][membership][forget]")
+{
+    ForgottenMembership forgotten { { "10.0.0.7" } };
+    REQUIRE(forgotten.Classify("10.0.0.7") == Membership::Forgotten);
+
+    // What a re-admit looks like from here: the tombstone leaves the replicated state,
+    // and the next publish carries a set without it. There is no "un-forget" call,
+    // because the cluster's committed set is the whole truth about this question.
+    forgotten.Publish({});
+    CHECK(forgotten.Classify("10.0.0.7") == Membership::Outsider);
+    CHECK(forgotten.Size() == 0);
 }
