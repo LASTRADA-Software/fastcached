@@ -20,6 +20,7 @@
 #include <mutex>
 #include <optional>
 #include <random>
+#include <ranges>
 #include <span>
 #include <string>
 #include <thread>
@@ -39,7 +40,7 @@ std::unique_ptr<FastCache::ShardedStorage> MakeSharded(std::size_t shardCount)
 {
     std::vector<std::unique_ptr<FastCache::IStorage>> shards;
     shards.reserve(shardCount);
-    for (std::size_t i = 0; i < shardCount; ++i)
+    for ([[maybe_unused]] auto const i: std::views::iota(std::size_t { 0 }, shardCount))
         shards.emplace_back(std::make_unique<FastCache::InMemoryLruStorage>());
     return std::make_unique<FastCache::ShardedStorage>(std::move(shards));
 }
@@ -249,7 +250,7 @@ TEST_CASE("ShardedStorage: a bounded sweep rotates across shards", "[sharded][pu
     std::vector<ParkableStorage*> raw;
     std::vector<std::unique_ptr<FastCache::IStorage>> shards;
     shards.reserve(ShardCount);
-    for (std::size_t i = 0; i < ShardCount; ++i)
+    for ([[maybe_unused]] auto const i: std::views::iota(std::size_t { 0 }, ShardCount))
     {
         auto shard = std::make_unique<ParkableStorage>();
         raw.push_back(shard.get());
@@ -259,7 +260,7 @@ TEST_CASE("ShardedStorage: a bounded sweep rotates across shards", "[sharded][pu
     FastCache::ManualClock clock;
 
     // A ceiling of one entry reaches exactly one shard per call.
-    for (std::size_t i = 0; i < ShardCount; ++i)
+    for ([[maybe_unused]] auto const i: std::views::iota(std::size_t { 0 }, ShardCount))
     {
         auto const outcome = storage.PurgeExpired(clock.Now(), FastCache::PurgeBudget { .maxScanned = 1 });
         CHECK_FALSE(outcome.completedPass); // Shards were left unvisited.
@@ -354,7 +355,7 @@ TEST_CASE("ShardedStorage spreads keys evenly over every shard, including non-po
     {
         auto const storage = MakeSharded(shardCount);
         std::vector<int> perShard(shardCount, 0);
-        for (int i = 0; i < KeyCount; ++i)
+        for (auto const i: std::views::iota(0, KeyCount))
         {
             auto const index = storage->ShardIndexFor(std::format("key-{}", i));
             REQUIRE(index < shardCount);
@@ -381,7 +382,7 @@ TEST_CASE("ShardedStorage Snapshot aggregates per-shard stats", "[sharded]")
     FastCache::ManualClock clock;
 
     // Insert across shards.
-    for (int i = 0; i < 16; ++i)
+    for (auto const i: std::views::iota(0, 16))
         REQUIRE(storage->Set(std::format("k-{}", i), MakeBytes("v"), 0, FastCache::TimePoint::max()).has_value());
 
     auto const stats = storage->Snapshot();
@@ -397,7 +398,7 @@ TEST_CASE("ShardedStorage Resize splits the total budget evenly across shards", 
     std::vector<FastCache::InMemoryLruStorage*> observers;
     shards.reserve(shardCount);
     observers.reserve(shardCount);
-    for (std::size_t i = 0; i < shardCount; ++i)
+    for ([[maybe_unused]] auto const i: std::views::iota(std::size_t { 0 }, shardCount))
     {
         auto shard = std::make_unique<FastCache::InMemoryLruStorage>(64);
         observers.push_back(shard.get());
@@ -421,12 +422,12 @@ TEST_CASE("ShardedStorage FlushWithGeneration invalidates entries in every shard
     auto storage = MakeSharded(4);
     FastCache::ManualClock clock;
 
-    for (int i = 0; i < 16; ++i)
+    for (auto const i: std::views::iota(0, 16))
         REQUIRE(storage->Set(std::format("k-{}", i), MakeBytes("v"), 0, FastCache::TimePoint::max()).has_value());
 
     storage->FlushWithGeneration(clock.Now());
 
-    for (int i = 0; i < 16; ++i)
+    for (auto const i: std::views::iota(0, 16))
     {
         auto const got = storage->Get(std::format("k-{}", i), clock.Now());
         REQUIRE(got.has_value());
@@ -532,19 +533,21 @@ TEST_CASE("ShardedStorage concurrent Get/Set over real storage is race-free", "[
         return "k" + std::to_string(k) + "-v" + std::to_string(v);
     };
     constexpr int ValuesPerKey = 4;
-    for (int k = 0; k < KeyCount; ++k)
+    for (auto const k: std::views::iota(0, KeyCount))
         REQUIRE(storage->Set(keyOf(k), MakeBytes(valueOf(k, 0)), 0, FastCache::TimePoint::max()).has_value());
 
     constexpr int ThreadCount = 8;
-    constexpr int OpsPerThread = 5000;
     std::atomic<bool> torn { false };
     std::vector<std::thread> threads;
     threads.reserve(ThreadCount);
-    for (int t = 0; t < ThreadCount; ++t)
+    for (auto const t: std::views::iota(0, ThreadCount))
     {
         threads.emplace_back([&, t] {
+            // Declared where it is read: declared outside this lambda, its only reader, GCC 14.2
+            // reported it as set but not used (-Werror=unused-but-set-variable).
+            constexpr int OpsPerThread = 5000;
             std::mt19937 rng { static_cast<std::uint32_t>(0x9E37 + t) };
-            for (int i = 0; i < OpsPerThread; ++i)
+            for ([[maybe_unused]] auto const i: std::views::iota(0, OpsPerThread))
             {
                 int const k = static_cast<int>(rng() % KeyCount);
                 if ((rng() & 1U) != 0U)
@@ -559,7 +562,7 @@ TEST_CASE("ShardedStorage concurrent Get/Set over real storage is race-free", "[
                     {
                         auto const text = Decode(got->entry.ValueBytes());
                         bool legal = false;
-                        for (int v = 0; v < ValuesPerKey; ++v)
+                        for (auto const v: std::views::iota(0, ValuesPerKey))
                             legal = legal || text == valueOf(k, v);
                         if (!legal)
                             torn.store(true);
@@ -573,7 +576,7 @@ TEST_CASE("ShardedStorage concurrent Get/Set over real storage is race-free", "[
 
     REQUIRE_FALSE(torn.load());
     // Every key still resolves to a legal value after the storm.
-    for (int k = 0; k < KeyCount; ++k)
+    for (auto const k: std::views::iota(0, KeyCount))
     {
         auto const got = storage->Get(keyOf(k), clock.Now());
         REQUIRE(got.has_value());
@@ -599,8 +602,10 @@ TEST_CASE("Cross-shard Gets run in parallel (sharding preserves read parallelism
     // Find two keys, one per shard.
     std::string keyShard0;
     std::string keyShard1;
-    for (int i = 0; keyShard0.empty() || keyShard1.empty(); ++i)
+    for (auto const i: std::views::iota(0))
     {
+        if (!keyShard0.empty() && !keyShard1.empty())
+            break;
         auto k = std::format("probe-{}", i);
         if (storage.ShardIndexFor(k) == 0 && keyShard0.empty())
             keyShard0 = k;
@@ -644,8 +649,10 @@ TEST_CASE("A writer excludes readers on the same shard but not across shards", "
     // Find a key that lives in shard 0 vs shard 1.
     std::string keyShard0;
     std::string keyShard1;
-    for (int i = 0; keyShard0.empty() || keyShard1.empty(); ++i)
+    for (auto const i: std::views::iota(0))
     {
+        if (!keyShard0.empty() && !keyShard1.empty())
+            break;
         auto k = std::format("probe-{}", i);
         if (storage.ShardIndexFor(k) == 0 && keyShard0.empty())
             keyShard0 = k;
@@ -719,7 +726,7 @@ TEST_CASE("Concurrent random workload matches std::map oracle", "[sharded][concu
         std::uniform_int_distribution<int> opDist { 0, 9 };
         std::uniform_int_distribution<int> keyDist { 0, 31 };
 
-        for (int i = 0; i < opsPerThread; ++i)
+        for (auto const i: std::views::iota(0, opsPerThread))
         {
             auto const op = opDist(rng);
             auto const key = std::format("k-{:02d}", keyDist(rng));
@@ -746,7 +753,7 @@ TEST_CASE("Concurrent random workload matches std::map oracle", "[sharded][concu
 
     std::vector<std::thread> threads;
     threads.reserve(threadCount);
-    for (int i = 0; i < threadCount; ++i)
+    for (auto const i: std::views::iota(0, threadCount))
         threads.emplace_back(worker, 0xC0DE0000U + static_cast<unsigned>(i));
     for (auto& t: threads)
         t.join();
@@ -767,13 +774,13 @@ TEST_CASE("Concurrent random workload matches std::map oracle", "[sharded][concu
     // Final pass: every key sees a deterministic last-write so we can
     // assert exact equality.
     FastCache::ManualClock clock;
-    for (int i = 0; i < 32; ++i)
+    for (auto const i: std::views::iota(0, 32))
     {
         auto const key = std::format("k-{:02d}", i);
         auto const val = std::format("final-{}", i);
         REQUIRE(storage->Set(key, MakeBytes(val), 0, FastCache::TimePoint::max()).has_value());
     }
-    for (int i = 0; i < 32; ++i)
+    for (auto const i: std::views::iota(0, 32))
     {
         auto const key = std::format("k-{:02d}", i);
         auto const got = storage->Get(key, clock.Now());

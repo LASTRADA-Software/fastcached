@@ -854,7 +854,7 @@ TEST_CASE("The scan budget is adapted from measured sweep cost, not trusted", "[
     {
         // `PurgeBudget` spells "no ceiling" as 0, so a budget that decayed to it would
         // become an unbounded scan -- the exact opposite of this mechanism's purpose.
-        for (int i = 0; i < 40; ++i)
+        for ([[maybe_unused]] auto const i: std::views::iota(0, 40))
             reaper.AdaptScanBudget(std::chrono::seconds { 5 });
         CHECK(reaper.CurrentScanBudget() >= 8);
         CHECK(reaper.CurrentScanBudget() > 0);
@@ -864,7 +864,7 @@ TEST_CASE("The scan budget is adapted from measured sweep cost, not trusted", "[
     {
         reaper.AdaptScanBudget(std::chrono::seconds { 5 }); // 256
         REQUIRE(reaper.CurrentScanBudget() == 256);
-        for (int i = 0; i < 50; ++i)
+        for ([[maybe_unused]] auto const i: std::views::iota(0, 50))
             reaper.AdaptScanBudget(std::chrono::milliseconds { 1 });
         // The configured value is the operator's ceiling: this only ever takes budget
         // AWAY from it, so no amount of headroom may exceed it.

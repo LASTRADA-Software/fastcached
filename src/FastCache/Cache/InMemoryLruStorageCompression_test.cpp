@@ -10,6 +10,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <cstddef>
+#include <ranges>
 #include <span>
 #include <string>
 #include <vector>
@@ -38,7 +39,7 @@ std::vector<std::byte> CompressiblePayload(std::size_t bytes)
         text += "void __cdecl FastCache::Repeated::Symbol(int, char const*, double); ";
     text.resize(bytes);
     std::vector<std::byte> out(bytes);
-    for (std::size_t i = 0; i < bytes; ++i)
+    for (auto const i: std::views::iota(std::size_t { 0 }, bytes))
         out[i] = static_cast<std::byte>(text[i]);
     return out;
 }
@@ -106,7 +107,7 @@ TEST_CASE("L1 compression makes the byte budget hold more entries", "[cache][lru
     InMemoryLruStorage packed { Budget, 0, LruMode::Strict };
     packed.SetCompression(ZstdOptions());
 
-    for (std::size_t i = 0; i < Values; ++i)
+    for (auto const i: std::views::iota(std::size_t { 0 }, Values))
     {
         auto const key = "key" + std::to_string(i);
         REQUIRE(plain.Set(key, payload, 0, Never()).has_value());
@@ -115,7 +116,7 @@ TEST_CASE("L1 compression makes the byte budget hold more entries", "[cache][lru
 
     auto survivors = [&](InMemoryLruStorage& s) {
         std::size_t alive = 0;
-        for (std::size_t i = 0; i < Values; ++i)
+        for (auto const i: std::views::iota(std::size_t { 0 }, Values))
         {
             auto const got = s.Get("key" + std::to_string(i), Now());
             if (got.has_value() && got->found)
@@ -280,7 +281,7 @@ TEST_CASE("L1 compression works in Approximate (shared-read) mode", "[cache][lru
     auto const payload = CompressiblePayload(32768);
     REQUIRE(storage.Set("k", payload, 0, Never()).has_value());
 
-    for (int i = 0; i < 3; ++i)
+    for ([[maybe_unused]] auto const i: std::views::iota(0, 3))
     {
         auto const got = storage.Get("k", Now());
         REQUIRE(got.has_value());

@@ -14,6 +14,7 @@
 #include <format>
 #include <memory>
 #include <random>
+#include <ranges>
 #include <span>
 #include <string>
 #include <string_view>
@@ -147,7 +148,7 @@ TEST_CASE("LayeredStorage CompareAndSwap survives L1 eviction (CAS coherency)", 
     REQUIRE(cas.has_value());
 
     // Insert other entries to evict "key" from L1.
-    for (int i = 0; i < 10; ++i)
+    for (auto const i: std::views::iota(0, 10))
         REQUIRE(
             storage->Set(std::format("filler-{}", i), MakeBytes("XXXXXXXX"), 0, FastCache::TimePoint::max()).has_value());
 
@@ -294,9 +295,9 @@ TEST_CASE("LayeredStorage PurgeExpired returns the L2 (canonical) count", "[laye
     FastCache::ManualClock clock;
     auto const shortExpiry = clock.Now() + 1ms;
 
-    for (int i = 0; i < 5; ++i)
+    for (auto const i: std::views::iota(0, 5))
         REQUIRE(storage->Set(std::format("expire-{}", i), MakeBytes("v"), 0, shortExpiry).has_value());
-    for (int i = 0; i < 3; ++i)
+    for (auto const i: std::views::iota(0, 3))
         REQUIRE(storage->Set(std::format("keep-{}", i), MakeBytes("v"), 0, FastCache::TimePoint::max()).has_value());
 
     clock.Advance(10ms);
@@ -304,7 +305,7 @@ TEST_CASE("LayeredStorage PurgeExpired returns the L2 (canonical) count", "[laye
     REQUIRE(purged == 5U);
 
     // Surviving entries still reachable.
-    for (int i = 0; i < 3; ++i)
+    for (auto const i: std::views::iota(0, 3))
     {
         auto got = storage->Get(std::format("keep-{}", i), clock.Now());
         REQUIRE(got.has_value());
@@ -318,7 +319,7 @@ TEST_CASE("L1 eviction never loses data; L2 still serves every key", "[layered][
     FastCache::ManualClock clock;
 
     constexpr int N = 50;
-    for (int i = 0; i < N; ++i)
+    for (auto const i: std::views::iota(0, N))
     {
         auto const key = std::format("k-{:02d}", i);
         REQUIRE(storage->Set(key, MakeBytes(std::format("payload-{:02d}", i)), 0, FastCache::TimePoint::max()).has_value());
@@ -326,7 +327,7 @@ TEST_CASE("L1 eviction never loses data; L2 still serves every key", "[layered][
 
     // Every key must still be retrievable (L1 evicted older entries
     // but L2 holds them all).
-    for (int i = 0; i < N; ++i)
+    for (auto const i: std::views::iota(0, N))
     {
         auto got = storage->Get(std::format("k-{:02d}", i), clock.Now());
         REQUIRE(got.has_value());
@@ -368,7 +369,7 @@ TEST_CASE("Sharded composition: ShardedStorage of LayeredStorage(InMem, CowTree)
 
     std::vector<std::filesystem::path> paths;
     paths.reserve(kShards);
-    for (std::size_t i = 0; i < kShards; ++i)
+    for (auto const i: std::views::iota(std::size_t { 0 }, kShards))
     {
         auto path = std::filesystem::temp_directory_path() / std::format("{}-shard-{:02d}.cow", stem, i);
         std::filesystem::remove(path);
@@ -378,7 +379,7 @@ TEST_CASE("Sharded composition: ShardedStorage of LayeredStorage(InMem, CowTree)
     auto build = [&] {
         std::vector<std::unique_ptr<FastCache::IStorage>> shards;
         shards.reserve(kShards);
-        for (std::size_t i = 0; i < kShards; ++i)
+        for (auto const i: std::views::iota(std::size_t { 0 }, kShards))
         {
             auto l1 = std::make_unique<FastCache::InMemoryLruStorage>(0);
             FastCache::CowTreeStorage::Options opts;
@@ -395,7 +396,7 @@ TEST_CASE("Sharded composition: ShardedStorage of LayeredStorage(InMem, CowTree)
     {
         auto storage = build();
         FastCache::ManualClock clock;
-        for (int i = 0; i < 100; ++i)
+        for (auto const i: std::views::iota(0, 100))
         {
             REQUIRE(
                 storage->Set(std::format("key-{}", i), MakeBytes(std::format("value-{}", i)), 0, FastCache::TimePoint::max())
@@ -407,7 +408,7 @@ TEST_CASE("Sharded composition: ShardedStorage of LayeredStorage(InMem, CowTree)
     {
         auto storage = build();
         FastCache::ManualClock clock;
-        for (int i = 0; i < 100; ++i)
+        for (auto const i: std::views::iota(0, 100))
         {
             auto got = storage->Get(std::format("key-{}", i), clock.Now());
             REQUIRE(got.has_value());
@@ -429,7 +430,7 @@ TEST_CASE("LayeredStorage::Resize tunes only the L1 budget", "[layered][resize]"
     auto storage = MakeLayered(1024);
 
     constexpr int N = 50;
-    for (int i = 0; i < N; ++i)
+    for (auto const i: std::views::iota(0, N))
     {
         REQUIRE(storage->Set(std::format("k-{:02d}", i), MakeBytes("XXXXXXXX"), 0, FastCache::TimePoint::max()).has_value());
     }
@@ -443,7 +444,7 @@ TEST_CASE("LayeredStorage::Resize tunes only the L1 budget", "[layered][resize]"
 
     // L2 still holds every entry — Resize only shrinks L1.
     FastCache::ManualClock clock;
-    for (int i = 0; i < N; ++i)
+    for (auto const i: std::views::iota(0, N))
     {
         auto got = storage->Get(std::format("k-{:02d}", i), clock.Now());
         REQUIRE(got.has_value());
@@ -459,7 +460,7 @@ TEST_CASE("LayeredStorage Add fails when present in L2 (canonical), even if L1 e
     REQUIRE(storage->Set("k", MakeBytes("first"), 0, FastCache::TimePoint::max()).has_value());
 
     // Push out L1 with other writes.
-    for (int i = 0; i < 5; ++i)
+    for (auto const i: std::views::iota(0, 5))
         REQUIRE(storage->Set(std::format("filler-{}", i), MakeBytes("XXXX"), 0, FastCache::TimePoint::max()).has_value());
 
     // L1 may have evicted "k", but L2 still has it — Add must fail.

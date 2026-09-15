@@ -5,6 +5,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <ranges>
 #include <span>
 #include <string>
 #include <vector>
@@ -177,7 +178,7 @@ TEST_CASE("StreamCodec: rejects a foreign / corrupt blob", "[cache][stream]")
         blob.push_back(StreamCodec::Magic);
         blob.push_back(StreamCodec::TypeStream);
         blob.insert(blob.end(), 40, std::byte { 0 }); // lastId + maxDeletedId + entriesAdded
-        for (int i = 0; i < 4; ++i)
+        for ([[maybe_unused]] auto const i: std::views::iota(0, 4))
             blob.push_back(std::byte { 0xFF }); // entryCount = 0xFFFFFFFF
         REQUIRE_FALSE(StreamCodec::Decode(std::span<std::byte const> { blob }, decoded));
     }
