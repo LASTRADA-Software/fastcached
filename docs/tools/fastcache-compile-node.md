@@ -1988,6 +1988,10 @@ wins" stays a question of which pass ran second. If the file will not parse, or
 changes a setting that cannot change at runtime, **nothing is applied** and the
 refusal names every offending setting. You saved once; you get one answer.
 
+A key written twice is refused the same way, at startup and at a reload, naming both
+lines. It used to keep the second silently — two `listen_node:` lines served the second
+address — so a list is written as one key with every value under it.
+
 <!-- reloadable-for: fastcache-compile-node -->
 
 | Reloadable | Requires a restart |
@@ -2233,7 +2237,9 @@ free the one with proportionally more of itself left takes the job.
 Two flags, one concern. `--log-level` decides *how much* — `trace`, `debug`,
 `info`, `warn`, `error`, `fatal`, default `info`. `--log-timestamps` decides
 whether each line carries *when*, as an ISO 8601 UTC instant, and is **off by
-default**. In YAML they are `log_level:` and `log_timestamps:`.
+default** except under macOS. In YAML they are `log_level:` and `log_timestamps:`,
+plus `no_log_timestamps:` for `--no-log-timestamps`, which is how to say off where the
+platform default is on: `log_timestamps: false` passes nothing and leaves that default.
 
 ```sh
 fastcache-compile-node --log-level=debug --log-timestamps

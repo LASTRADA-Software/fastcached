@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Cli/Options.hpp>
 #include <FastCache/Config/FileOptions.hpp>
+#include <FastCache/Platform/EnvironmentTestUtils.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -28,6 +29,7 @@ struct Sample
     bool loud { false };
     bool quiet { true };
     std::string tuned;
+    std::string place;
     bool nameExplicit { false };
     bool tunedExplicit { false };
 };
@@ -82,6 +84,13 @@ struct Sample
           .explicitBit = &Sample::tunedExplicit,
           .description = "a setting whose parser always refuses",
           .yamlKey = "tuned" },
+        { .primary = "--place",
+          .arity = Arity::Value,
+          .operand = "=<path>",
+          .apply = AssignFrom<&Sample::place, ParseAnything>(),
+          .description = "a path a file may write with environment references",
+          .yamlKey = "place",
+          .fileValue = FileValue::ExpandEnvironment },
         { .primary = "--now", .arity = Arity::None, .apply = SetTrue<&Sample::loud>(), .description = "no key" },
     });
     static_assert(TableIsWellFormed<Sample>(options));
@@ -196,6 +205,83 @@ TEST_CASE("FileOptions: a presence flag is a boolean, and only true applies it",
         }
         CHECK(!result.loud);
     }
+}
+
+TEST_CASE("FileOptions: a path row expands environment references from a file, and only from a file", "[config][file]")
+{
+    Testing::ScopedEnv const env { "FC_FILEOPTIONS_ROOT", "/srv/one" };
+
+    SECTION("the file's text is expanded before the applier sees it")
+    {
+        Sample result;
+        REQUIRE(
+            ApplyFileSettings(SampleOptions(),
+                              { Scalar("place", "${FC_FILEOPTIONS_ROOT}/cache"), Scalar("name", "$FC_FILEOPTIONS_ROOT") },
+                              std::filesystem::path { "c.yaml" },
+                              result)
+                .has_value());
+        CHECK(result.place == "/srv/one/cache");
+        // A `Literal` row beside it is left as written: the column decides, not the
+        // presence of a dollar.
+        CHECK(result.name == "$FC_FILEOPTIONS_ROOT");
+    }
+
+    SECTION("the command line is not expanded, because a shell already was")
+    {
+        Sample result;
+        auto const args = std::to_array<char const*>({ "--place=${FC_FILEOPTIONS_ROOT}/cache" });
+        REQUIRE(ParseOptionsInto(SampleOptions(), std::span<char const* const> { args }, result).has_value());
+        CHECK(result.place == "${FC_FILEOPTIONS_ROOT}/cache");
+    }
+
+    SECTION("an unset variable is refused, attributed to the file's key and line")
+    {
+        Sample result;
+        auto const applied = ApplyFileSettings(SampleOptions(),
+                                               { Scalar("place", "${FC_FILEOPTIONS_NEVER_SET}/cache", 4) },
+                                               std::filesystem::path { "c.yaml" },
+                                               result);
+        REQUIRE(!applied.has_value());
+        CHECK(applied.error().code == ConfigErrorCode::UndefinedVariable);
+        CHECK(applied.error().field == "place");
+        CHECK(applied.error().line == 4);
+        CHECK(applied.error().source == "c.yaml");
+        CHECK(result.place.empty());
+    }
+}
+
+TEST_CASE("FileOptions: a file spelling is refused on a row no file can reach, and on a presence flag", "[config][file]")
+{
+    // The column is read by the FILE layer alone, so a keyless row carrying it is a row
+    // somebody believes a file expands; and a presence flag's `true` has nothing in it
+    // to expand. Both are malformed tables rather than conditions to report at runtime.
+    static constexpr auto keyless = std::to_array<OptionSpec<Sample>>({
+        { .primary = "--place",
+          .arity = Arity::Value,
+          .operand = "=<path>",
+          .apply = AssignFrom<&Sample::place, ParseAnything>(),
+          .description = "no key, yet expanded",
+          .fileValue = FileValue::ExpandEnvironment },
+    });
+    static constexpr auto presence = std::to_array<OptionSpec<Sample>>({
+        { .primary = "--loud",
+          .apply = SetTrue<&Sample::loud>(),
+          .description = "a presence flag, expanded",
+          .yamlKey = "loud",
+          .fileValue = FileValue::ExpandEnvironment },
+    });
+    static constexpr auto control = std::to_array<OptionSpec<Sample>>({
+        { .primary = "--place",
+          .arity = Arity::Value,
+          .operand = "=<path>",
+          .apply = AssignFrom<&Sample::place, ParseAnything>(),
+          .description = "a keyed value row, expanded",
+          .yamlKey = "place",
+          .fileValue = FileValue::ExpandEnvironment },
+    });
+    STATIC_REQUIRE_FALSE(TableIsWellFormed<Sample>(keyless));
+    STATIC_REQUIRE_FALSE(TableIsWellFormed<Sample>(presence));
+    STATIC_REQUIRE(TableIsWellFormed<Sample>(control));
 }
 
 TEST_CASE("FileOptions: a key with no value empties a list and refuses a scalar", "[config][file]")

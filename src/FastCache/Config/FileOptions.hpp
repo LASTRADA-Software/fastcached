@@ -2,6 +2,7 @@
 #pragma once
 
 #include <FastCache/Cli/Options.hpp>
+#include <FastCache/Config/EnvExpand.hpp>
 #include <FastCache/Config/YamlReader.hpp>
 #include <FastCache/Core/Errors/ConfigError.hpp>
 
@@ -21,11 +22,12 @@ namespace FastCache
 ///
 /// ## Why this is not a merge
 ///
-/// The daemon reads YAML into a `Config`, parses argv into a `CliResult`, and then
-/// merges the two field by field -- which needs a per-field row list, a per-field
-/// explicit bit, and a per-field presence bit, none derived from the others. Four
-/// lists that must agree, and the file's own comments record that a flag which
-/// parses but never merges has been shipped four times.
+/// The daemon used to read YAML into a `Config` through a second parser, parse argv
+/// into a `CliResult`, and then merge the two field by field -- a per-field row list,
+/// a per-field explicit bit and a per-field presence bit, none derived from the
+/// others. Four lists that had to agree, and a flag which parsed but never merged
+/// shipped four times; the second parser accepted `port: 0x50` while argv refused
+/// `--port=0x50` (#1437).
 ///
 /// Here the file's values and the command line's reach the config through the SAME
 /// `apply`, in that order, so "CLI wins" is the order they are applied in and there
@@ -122,7 +124,15 @@ template <typename Result>
                     continue;
             }
 
-            if (auto applied = (*row->apply)(result, value); !applied.has_value())
+            // A file has no shell in front of it, so a path row's environment
+            // references are expanded HERE and never in the applier -- see `FileValue`
+            // for why the command line must not expand them too.
+            auto spelled = row->fileValue == FileValue::ExpandEnvironment
+                               ? ExpandEnvironmentVariables(value, setting.key)
+                               : std::expected<std::string, ConfigError> { value };
+            auto applied = std::move(spelled).and_then(
+                [&row, &result](std::string const& text) { return (*row->apply)(result, text); });
+            if (!applied.has_value())
             {
                 auto error = std::move(applied).error();
                 error.source = path.string();
@@ -143,7 +153,7 @@ template <typename Result>
 ///
 /// A repeatable row's applier APPENDS, so without this a `--toolchain` on the
 /// command line would extend the file's list rather than replace it. Replacement is
-/// the daemon's rule for `listeners:` and its reasoning is what settles it: mixing
+/// the daemon's rule for its listeners and its reasoning is what settles it: mixing
 /// partial file values with partial command-line values makes precedence depend on
 /// declaration order, which is not something an operator can reason about.
 ///

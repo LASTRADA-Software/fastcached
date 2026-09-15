@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#include <FastCache/Config/Config.hpp>
 #include <FastCache/Core/Errors/ConfigError.hpp>
 
 #include <expected>
@@ -12,62 +11,6 @@
 
 namespace FastCache
 {
-
-/// Parse a YAML file into a Config. Unknown keys yield ConfigError(UnknownKey);
-/// wrong types yield ConfigError(TypeMismatch); out-of-range numbers yield
-/// ConfigError(OutOfRange). Missing file is ConfigError(FileNotFound).
-///
-/// Recognised top-level keys (all optional):
-///
-///   bind:        string   interface to bind on (e.g. "127.0.0.1", "0.0.0.0").
-///
-///   port:        int      TCP listen port; 1..65535.
-///
-///   max_memory:  size     in-memory cache budget. Integer with optional unit
-///                         suffix: k/K = 1024, m/M = 1024², g/G = 1024³
-///                         (1024-based). Plain integer means bytes. A trailing
-///                         "%" sets the budget to that percentage of host total
-///                         RAM (e.g., 50%). 0 disables eviction.
-///                         Examples: 67108864, 64m, 1g, 50%.
-///
-///   log_level:   string   one of: trace | debug | info | warn | error | fatal.
-///
-/// CLI flags later override these values via the caller.
-/// @param path Filesystem path of the YAML file.
-/// @return Parsed Config or a ConfigError.
-[[nodiscard]] std::expected<Config, ConfigError> ReadYamlConfig(std::filesystem::path const& path);
-
-/// Parsed YAML, plus per-field "this key was present in the file" bits. The
-/// presence bits let the caller distinguish "the YAML explicitly set this to
-/// the default value" from "the YAML did not mention it" — important for the
-/// env-precedence guards in main.cpp, which would otherwise silently override
-/// an operator's explicit YAML value when it happens to equal the compiled
-/// default.
-struct YamlConfigWithPresence
-{
-    Config config {};
-    bool metricsPortExplicit { false };
-    bool metricsBindAddressExplicit { false };
-    bool metricsEnabledExplicit { false };
-    bool requirePassExplicit { false };
-    bool authUsernameExplicit { false };
-    bool tlsEnabledExplicit { false };
-    bool tlsCertPathExplicit { false };
-    bool tlsKeyPathExplicit { false };
-    /// Whether the YAML carried a `bind:` key. Together with
-    /// `portExplicit` this lets main.cpp reject a config that mixes the
-    /// legacy single-bind shape with `listeners:` — they would otherwise
-    /// silently pick `listeners:` and discard `bind:`/`port:`.
-    bool bindAddressExplicit { false };
-    bool portExplicit { false };
-};
-
-/// Variant of `ReadYamlConfig` that also reports which keys were explicitly
-/// present in the file. Used by main.cpp's env-precedence logic.
-/// @param path Filesystem path of the YAML file.
-/// @return Parsed config + presence bits, or a ConfigError.
-[[nodiscard]] std::expected<YamlConfigWithPresence, ConfigError> ReadYamlConfigWithPresence(
-    std::filesystem::path const& path);
 
 /// One top-level key from a YAML document, with the scalar values it carried.
 struct YamlSetting
@@ -90,21 +33,28 @@ struct YamlSetting
 /// Read a YAML file as top-level key/scalar settings, without knowing what any
 /// key MEANS.
 ///
-/// The generic door `ReadYamlConfig` never had: that function parses straight into
-/// the daemon's `Config` through a hand-written key ladder, so a second binary had
-/// no way in. This returns the file's shape and nothing else, which is what lets a
-/// caller drive its own option table from it.
+/// The ONE door both binaries read a configuration file through. It returns the
+/// file's shape and nothing else, and each binary drives its own option table from it
+/// (`ApplyFileSettings`), so a value reaches the same parser the command line does.
+/// The daemon had a second reader that parsed straight into `Config` through a
+/// hand-written key ladder, with yaml-cpp's own conversions: it accepted `port: 0x50`
+/// and `bind: ""` while argv refused both, and it is gone (#1437).
 ///
 /// **yaml-cpp stays out of the header** — values come back as `std::string`, so the
-/// dependency remains an implementation detail of this translation unit exactly as
-/// it is for `ReadYamlConfig`.
+/// dependency remains an implementation detail of this translation unit.
 ///
 /// Deliberately shallow. A value that is a map, or a sequence containing anything
 /// but scalars, is a `TypeMismatch` naming the key rather than something flattened:
 /// a caller that applies values through a table has no way to represent nesting,
 /// and silently ignoring a nested block would be a setting an operator wrote and
-/// nothing read. The daemon's own `listeners:` is nested, which is why that reader
-/// stays where it is rather than being rebuilt on this.
+/// nothing read. That is why the daemon's listeners are `listen:` and `listen_tls:`,
+/// sequences of `host:port` spelling the two flags, rather than one nested block.
+/// A key that is not a scalar is a `ParseError`.
+///
+/// A top-level key written twice is a `ParseError` naming the key and both lines.
+/// The parser hands over both entries, and without the refusal a scalar setting
+/// would keep the last one written while a list setting appended both -- a value
+/// the operator wrote either discarded or doubled, and nothing saying which.
 ///
 /// An empty document is success carrying nothing, because a fully-commented
 /// reference file is a legitimate and expected configuration.

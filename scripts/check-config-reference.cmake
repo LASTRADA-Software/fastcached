@@ -101,11 +101,12 @@ foreach(_match IN LISTS _matches)
     string(REGEX REPLACE "^\\.yamlKey = \"([a-z_]+)\"$" "\\1" _key "${_match}")
     list(APPEND _tableKeys "${_key}")
 endforeach()
-# Deduplicated because two rows may legitimately share one key -- the daemon's
-# `--listen`/`--listen-tls` both answer to `listeners:` -- so a raw count of
-# occurrences is not a count of settings. That is the other half of the census
-# rule: the same file gives two different figures under two patterns, and only one
-# of them is the population this check is about.
+# Deduplicated so a raw count of occurrences is never mistaken for a count of
+# settings. `TableIsWellFormed` refuses two rows answering to one key, so on today's
+# tables this removes nothing -- the daemon's `--listen`/`--listen-tls` are `listen:`
+# and `listen_tls:` since #1437 -- and it stays because the census rule is about the
+# pattern: the same file can give two different figures under two patterns, and only
+# one of them is the population this check is about.
 list(REMOVE_DUPLICATES _tableKeys)
 list(SORT _tableKeys)
 

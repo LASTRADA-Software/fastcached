@@ -319,8 +319,8 @@ struct Config
     /// a single synthesised `BindConfig` and proceeds. When non-empty,
     /// every entry defines one endpoint and the legacy single-bind fields
     /// are ignored. The CLI populates this vector from repeatable
-    /// `--listen address:port` / `--listen-tls address:port` flags; the
-    /// YAML reader populates it from the top-level `listeners:` list.
+    /// `--listen address:port` / `--listen-tls address:port` flags, and a
+    /// configuration file through the same appliers from `listen:` / `listen_tls:`.
     std::vector<BindConfig> binds {};
 
     /// ::listen() backlog — the depth of the kernel's queue of accepted-

@@ -122,12 +122,22 @@ max_memory: 4g
 storage_path: /var/lib/fastcached/cache
 ```
 
+Every key is a command-line flag spelled with underscores, and it takes exactly
+the value the flag does: `port: 0x50` is refused because `--port=0x50` is, and
+`listen:` takes `host:port` like `--listen`. A flag that takes no value is `true` or
+`false` in the file — `true` passes the flag, `false` passes nothing — and no other
+word; `yes` and `on` are refused rather than guessed at. A key the daemon does not
+know, or a key written twice, stops it at startup naming the key and the line, so
+a typo is never a setting that silently fails to apply.
+
 A release that changes the on-disk record layout refuses an older store at
 startup rather than mis-reading it. It is not damaged, and it does not have to be
 thrown away — see [Upgrading a store](../operations/upgrading-a-store.md).
 
 Path-valued settings (`storage_path`, `tls_cert`, `tls_key`) understand `$VAR`
-and `${VAR}` environment references; write `$$` for a literal dollar. A
+and `${VAR}` environment references in the file; write `$$` for a literal dollar.
+On the command line your shell has already expanded them, so fastcached does not
+expand them again. A
 reference to a variable that is not set is an error rather than an empty
 string, so a typo fails loudly instead of quietly relocating the cache. Windows
 `%VAR%` is *not* expanded — a bare `%` is valid in a path.

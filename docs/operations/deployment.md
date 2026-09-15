@@ -188,13 +188,14 @@ one time it is read.
 
 So `log_timestamps` **defaults to on when running on macOS**, in both binaries and
 in every deployment, not only under launchd: a terminal run stamps too. Turn it off
-with `log_timestamps: false` in the configuration file, or with the
+with `no_log_timestamps: true` in either binary's configuration file, or with the
 `--no-log-timestamps` flag, which exists for this — a bare `--log-timestamps` can
 only ask for the default that is already in force.
 
-A configuration file outranks the platform default in **both** directions, so
-`log_timestamps: false` on macOS is obeyed and `log_timestamps: true` on Linux is
-too. The command line outranks the file, as everywhere else.
+Each key is its flag, so `log_timestamps: false` means "do not pass
+`--log-timestamps`" and leaves the platform default — which on macOS is on. Say off
+with the negative key, and on (for Linux) with `log_timestamps: true`. The command
+line outranks the file, as everywhere else.
 
 There is no reload equivalent to `systemctl reload`: send `SIGHUP` to the
 pid `launchctl print` reports, or kickstart the job.

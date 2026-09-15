@@ -33,6 +33,10 @@
 # toolchain, raft_peer, fleet_member) naming any value on the command line
 # REPLACES this file's list rather than extending it.
 #
+# Write a list as ONE key with every value under it. A key written twice is
+# refused at startup and at a reload, naming both lines; it used to keep the
+# second silently, so a worker served an address its file also contradicted.
+#
 # A flag whose meaning is its presence -- one you would pass with no value --
 # is a boolean here, and only `true` and `false` are accepted. `raft_join: true`
 # is `--raft-join`; `raft_join: false` is not passing it. Read
@@ -390,9 +394,11 @@
 # Linux when the log is going somewhere journald is not: a foreground run, a
 # redirected file, a CI artefact.
 #
-# Setting it here WINS over the platform default in both directions, including
-# turning it off on macOS.
+# Each key spells its flag, so `true` passes it and `false` passes nothing, which
+# leaves the platform default. To turn timestamps ON set `log_timestamps: true`;
+# to turn them OFF -- including on macOS -- set `no_log_timestamps: true`.
 #log_timestamps: false
+#no_log_timestamps: false
 
 # write the pid here when daemonizing (POSIX)
 #pidfile:

@@ -76,6 +76,26 @@ using ConfigOf = ConfigOfImpl<Result>::type;
 template <typename Result>
 using SameFieldFn = bool (*)(ConfigOf<Result> const&, ConfigOf<Result> const&);
 
+/// How a configuration FILE spells a setting's value, before the row's applier
+/// reads it.
+///
+/// **A spelling, not a second setting.** The command line has a shell in front of it
+/// and a file has nothing, so `$HOME/cache` reaches `--storage` already expanded
+/// and reaches `storage_path:` as the eight characters an operator typed. Expanding
+/// in the file layer and nowhere else keeps the applier the one parser both sources
+/// reach -- the same arrangement as a presence flag's `true`/`false`, which is also
+/// a file-only spelling of something argv says another way.
+///
+/// **Never in the argv parser.** A service registration replays the command line
+/// the installer built from the parse, so an expansion there would register the
+/// expanded text: `$$` typed for a literal dollar would come back as `$` and the
+/// replayed service would refuse to start on a reference to a variable nobody set.
+enum class FileValue : std::uint8_t
+{
+    Literal,           ///< The file's text reaches the applier as written.
+    ExpandEnvironment, ///< `$NAME`, `${NAME}` and `$$` are expanded first; see `ExpandEnvironmentVariables`.
+};
+
 /// Whether a setting can take effect without restarting the process.
 ///
 /// **Opt-in, and that default is the guard.** The daemon's reloader used to decide
@@ -140,13 +160,13 @@ struct OptionSpec
     /// may not come from one.
     ///
     /// **A column rather than a derivation, because the mapping is not derivable.**
-    /// Measured on the daemon: 48 flag rows, 34 of which carry a key, diverging four
-    /// ways -- `--storage` is `storage_path`, `--expiry-scan` is `active_expiry_scan`,
-    /// `--expiry-interval` is `active_expiry_interval_ms` (renamed *and* carrying a
-    /// unit the flag does not), and `--listen`/`--listen-tls` collapse into a single
-    /// `listeners:` key. There is no rule with exceptions there, only a mapping, and
-    /// a convention derived from flag names would silently rename three existing
-    /// keys the day somebody generalised it.
+    /// Measured on the daemon when #1437 gave every setting row a key: 48 flag rows, 36
+    /// of which carry one, diverging three ways -- `--storage` is `storage_path`,
+    /// `--expiry-scan` is `active_expiry_scan`, and `--expiry-interval` is
+    /// `active_expiry_interval_ms` (renamed *and* carrying a unit the flag does not).
+    /// There is no rule with exceptions there, only a mapping, and a convention derived
+    /// from flag names would silently rename those three keys the day somebody
+    /// generalised it.
     ///
     /// Empty is a decision rather than an omission: a one-shot verb has no business
     /// in a file, because a file is read at every start and would replay one
@@ -168,6 +188,14 @@ struct OptionSpec
     /// worker no longer serves.
     Reloadable reloadable { Reloadable::No };
 
+    /// How a configuration file spells this setting's value. `Literal` unless the row
+    /// is a path a file may write with environment references.
+    ///
+    /// Declared beside `reloadable` rather than at the end of the row: every byte-wide
+    /// member of a struct lives in one run, or each one stranded between two 8-aligned
+    /// members costs seven bytes of padding and the analyser's budget fails the build.
+    FileValue fileValue { FileValue::Literal };
+
     /// Whether two configurations agree about this row's field.
     ///
     /// Paired with `reloadable` and derived from the SAME member pointer the applier
@@ -186,7 +214,7 @@ struct OptionSpec
     ///
     /// Only repeatable rows need it, and only because their applier APPENDS. A
     /// command line naming any value for a list setting **replaces** what the file
-    /// declared rather than extending it -- the daemon's rule for `listeners:`, and
+    /// declared rather than extending it -- the daemon's rule for its listeners, and
     /// its reasoning is what decides it: mixing partial file values with partial
     /// command-line values makes precedence depend on declaration order, which is
     /// not something an operator can reason about.
@@ -230,10 +258,15 @@ template <typename Result>
     // The alternative, a positively-named key with an applier no flag has, is a
     // setting reachable from a file and not from argv -- two mechanisms for one
     // setting, which is the shape this column exists to remove.
+    //
+    // A file spelling other than `Literal` is a column only a FILE reads, so a row no
+    // file can reach carrying one is a row somebody believes a file expands; and only a
+    // value can be expanded, a presence flag's `true` having nothing in it to expand.
     auto const fileRowsOk = std::ranges::all_of(table, [](OptionSpec<Result> const& spec) {
         if (spec.yamlKey.empty())
-            return spec.clear == nullptr;
-        return spec.apply != nullptr && spec.select == nullptr && spec.flow == ParseFlow::Continue;
+            return spec.clear == nullptr && spec.fileValue == FileValue::Literal;
+        return spec.apply != nullptr && spec.select == nullptr && spec.flow == ParseFlow::Continue
+               && (spec.fileValue == FileValue::Literal || spec.arity == Arity::Value);
     });
     if (!fileRowsOk)
         return false;

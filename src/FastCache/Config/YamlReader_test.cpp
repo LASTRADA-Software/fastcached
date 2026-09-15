@@ -29,362 +29,11 @@ std::filesystem::path WriteTempYaml(std::string_view stem, std::string_view cont
 
 } // namespace
 
-TEST_CASE("YamlReader: parses all recognised keys", "[config][yaml]")
-{
-    auto const path = WriteTempYaml("full",
-                                    "bind: 0.0.0.0\n"
-                                    "port: 22000\n"
-                                    "max_memory: 4096\n"
-                                    "log_level: debug\n");
-    auto const cfg = FastCache::ReadYamlConfig(path);
-    REQUIRE(cfg.has_value());
-    REQUIRE(cfg->bindAddress == "0.0.0.0");
-    REQUIRE(cfg->port == 22000);
-    REQUIRE(cfg->maxMemoryBytes == 4096);
-    REQUIRE(cfg->logLevel == FastCache::LogLevel::Debug);
-}
-
-TEST_CASE("YamlReader: storage_max_value and storage_max_disk parse byte-size suffixes", "[config][yaml][storage]")
-{
-    auto const path = WriteTempYaml("storagecaps",
-                                    "storage_path: /tmp/cache.cow\n"
-                                    "storage_max_value: 256m\n"
-                                    "storage_max_disk: 10g\n");
-    auto const cfg = FastCache::ReadYamlConfig(path);
-    REQUIRE(cfg.has_value());
-    REQUIRE(cfg->storageMaxValueBytes == 256ULL * 1024U * 1024U);
-    REQUIRE(cfg->storageMaxDiskBytes == 10ULL * 1024U * 1024U * 1024U);
-}
-
-TEST_CASE("YamlReader: storage_max_disk defaults to 0 (unbounded) when unset", "[config][yaml][storage]")
-{
-    auto const cfg = FastCache::ReadYamlConfig(WriteTempYaml("nodisk", "storage_path: /tmp/c.cow\n"));
-    REQUIRE(cfg.has_value());
-    REQUIRE(cfg->storageMaxDiskBytes == 0U);
-}
-
-TEST_CASE("YamlReader: malformed storage_max_disk is rejected", "[config][yaml][storage]")
-{
-    auto const cfg = FastCache::ReadYamlConfig(WriteTempYaml("baddisk", "storage_max_disk: lots\n"));
-    REQUIRE_FALSE(cfg.has_value());
-}
-
-TEST_CASE("YamlReader: the active expiry keys parse, zero included", "[config][yaml][expiry]")
-{
-    auto const path = WriteTempYaml("expiry",
-                                    "active_expiry_interval_ms: 250\n"
-                                    "active_expiry_scan: 64\n");
-    auto const cfg = FastCache::ReadYamlConfig(path);
-    REQUIRE(cfg.has_value());
-    REQUIRE(cfg->activeExpiryIntervalMs == 250U);
-    REQUIRE(cfg->activeExpiryScanBudget == 64U);
-
-    // Zero disables the cycle, so it has to survive the reader rather than be
-    // rejected as a degenerate count the way the scan budget is.
-    auto const off = FastCache::ReadYamlConfig(WriteTempYaml("expiry-off", "active_expiry_interval_ms: 0\n"));
-    REQUIRE(off.has_value());
-    REQUIRE(off->activeExpiryIntervalMs == 0U);
-}
-
-TEST_CASE("YamlReader: out-of-range active expiry values are rejected", "[config][yaml][expiry]")
-{
-    // Same two ceilings the CLI enforces, because the file is the other way an
-    // operator sets these and a key silently accepted here would be one the
-    // flag refuses.
-    REQUIRE_FALSE(
-        FastCache::ReadYamlConfig(WriteTempYaml("expiry-huge", "active_expiry_interval_ms: 86400001\n")).has_value());
-    REQUIRE_FALSE(
-        FastCache::ReadYamlConfig(WriteTempYaml("expiry-negative", "active_expiry_interval_ms: -1\n")).has_value());
-    // 0 means "no ceiling" to `PurgeBudget`, i.e. sweep everything under the
-    // shard lock -- the opposite of what a scan budget of zero asks for.
-    REQUIRE_FALSE(FastCache::ReadYamlConfig(WriteTempYaml("expiry-scan-zero", "active_expiry_scan: 0\n")).has_value());
-}
-
-TEST_CASE("YamlReader: log_source toggles the connection source prefix", "[config][yaml]")
-{
-    auto const on = FastCache::ReadYamlConfig(WriteTempYaml("logsrc-on", "log_source: true\n"));
-    REQUIRE(on.has_value());
-    REQUIRE(on->logSource);
-
-    // Absent key keeps the default (off).
-    auto const off = FastCache::ReadYamlConfig(WriteTempYaml("logsrc-off", "port: 11211\n"));
-    REQUIRE(off.has_value());
-    REQUIRE_FALSE(off->logSource);
-}
-
-TEST_CASE("YamlReader: log_everything toggles full command logging", "[config][yaml]")
-{
-    auto const on = FastCache::ReadYamlConfig(WriteTempYaml("logall-on", "log_everything: true\n"));
-    REQUIRE(on.has_value());
-    REQUIRE(on->logEverything);
-
-    auto const off = FastCache::ReadYamlConfig(WriteTempYaml("logall-off", "port: 11211\n"));
-    REQUIRE(off.has_value());
-    REQUIRE_FALSE(off->logEverything);
-}
-
-TEST_CASE("YamlReader: missing file is reported", "[config][yaml]")
-{
-    auto const cfg = FastCache::ReadYamlConfig("/no/such/path/qwerty.yaml");
-    REQUIRE_FALSE(cfg.has_value());
-    REQUIRE(cfg.error().code == FastCache::ConfigErrorCode::FileNotFound);
-}
-
-TEST_CASE("YamlReader: unknown keys are rejected", "[config][yaml]")
-{
-    auto const path = WriteTempYaml("unknown", "bogus_key: value\n");
-    auto const cfg = FastCache::ReadYamlConfig(path);
-    REQUIRE_FALSE(cfg.has_value());
-    REQUIRE(cfg.error().code == FastCache::ConfigErrorCode::UnknownKey);
-    REQUIRE(cfg.error().field == "bogus_key");
-}
-
-TEST_CASE("YamlReader: out-of-range port is rejected", "[config][yaml]")
-{
-    auto const path = WriteTempYaml("port", "port: 99999\n");
-    auto const cfg = FastCache::ReadYamlConfig(path);
-    REQUIRE_FALSE(cfg.has_value());
-    REQUIRE(cfg.error().code == FastCache::ConfigErrorCode::OutOfRange);
-}
-
-TEST_CASE("YamlReader: empty file produces defaults", "[config][yaml]")
-{
-    auto const path = WriteTempYaml("empty", "");
-    auto const cfg = FastCache::ReadYamlConfig(path);
-    REQUIRE(cfg.has_value());
-    REQUIRE(cfg->bindAddress == "127.0.0.1");
-    // Asserted against the constant, not a literal: a file with no `port:` key
-    // must fall through to the compiled default, whatever that default is.
-    REQUIRE(cfg->port == FastCache::DefaultPort);
-}
-
-TEST_CASE("YamlReader: max_memory accepts kibibyte suffix", "[config][yaml]")
-{
-    auto const path = WriteTempYaml("mem-k", "max_memory: 4k\n");
-    auto const cfg = FastCache::ReadYamlConfig(path);
-    REQUIRE(cfg.has_value());
-    REQUIRE(cfg->maxMemoryBytes == 4U * 1024U);
-}
-
-TEST_CASE("YamlReader: max_memory accepts mebibyte suffix", "[config][yaml]")
-{
-    auto const path = WriteTempYaml("mem-m", "max_memory: 256m\n");
-    auto const cfg = FastCache::ReadYamlConfig(path);
-    REQUIRE(cfg.has_value());
-    REQUIRE(cfg->maxMemoryBytes == 256U * 1024U * 1024U);
-}
-
-TEST_CASE("YamlReader: max_memory rejects unknown suffix", "[config][yaml]")
-{
-    auto const path = WriteTempYaml("mem-bad", "max_memory: 5x\n");
-    auto const cfg = FastCache::ReadYamlConfig(path);
-    REQUIRE_FALSE(cfg.has_value());
-    REQUIRE(cfg.error().code == FastCache::ConfigErrorCode::TypeMismatch);
-    REQUIRE(cfg.error().field == "max_memory");
-}
-
-TEST_CASE("YamlReader: execution_model is no longer accepted", "[config][yaml]")
-{
-    auto const path = WriteTempYaml("exec", "execution_model: reactor\n");
-    auto const cfg = FastCache::ReadYamlConfig(path);
-    REQUIRE_FALSE(cfg.has_value());
-    REQUIRE(cfg.error().code == FastCache::ConfigErrorCode::UnknownKey);
-}
-
-TEST_CASE("YamlReader: threading_model is no longer accepted", "[config][yaml]")
-{
-    auto const path = WriteTempYaml("legacy", "threading_model: threaded\n");
-    auto const cfg = FastCache::ReadYamlConfig(path);
-    REQUIRE_FALSE(cfg.has_value());
-    REQUIRE(cfg.error().code == FastCache::ConfigErrorCode::UnknownKey);
-}
-
-TEST_CASE("YamlReader: listeners sequence populates cfg.binds", "[config][yaml][listeners]")
-{
-    auto const path = WriteTempYaml("listeners-ok",
-                                    "listeners:\n"
-                                    "  - address: 0.0.0.0\n"
-                                    "    port: 11211\n"
-                                    "  - address: 0.0.0.0\n"
-                                    "    port: 6380\n"
-                                    "    tls: true\n");
-    auto const cfg = FastCache::ReadYamlConfig(path);
-    REQUIRE(cfg.has_value());
-    REQUIRE(cfg->binds.size() == 2);
-    REQUIRE(cfg->binds[0].address == "0.0.0.0");
-    REQUIRE(cfg->binds[0].port == 11211U);
-    REQUIRE_FALSE(cfg->binds[0].tls);
-    REQUIRE(cfg->binds[1].port == 6380U);
-    REQUIRE(cfg->binds[1].tls);
-}
-
-TEST_CASE("YamlReader: roles is gone, and is refused rather than ignored", "[config][yaml][listeners]")
-{
-    // `roles:` existed to compose `cache` with `dispatch`, and dispatch moved to
-    // `fastcache-compile-node --serve-scheduler`. With one role left the key could
-    // only ever say what the default already says, so it is deleted rather than kept
-    // as a spelling that does nothing.
-    //
-    // Refused rather than ignored, which is the half that matters: an operator
-    // upgrading from a config that carried `roles: [dispatch]` must be TOLD their
-    // scheduler configuration no longer means anything. Silently accepting it would
-    // leave them with a daemon that starts, looks configured, and schedules nothing.
-    auto const path = WriteTempYaml("listeners-roles-removed",
-                                    "listeners:\n"
-                                    "  - address: 0.0.0.0\n"
-                                    "    port: 6675\n"
-                                    "    roles: [dispatch]\n");
-    auto const cfg = FastCache::ReadYamlConfig(path);
-    REQUIRE_FALSE(cfg.has_value());
-    CHECK(cfg.error().field.contains("roles"));
-}
-
-TEST_CASE("YamlReader: an empty or non-sequence roles is rejected", "[config][yaml][listeners]")
-{
-    // An empty list would produce a listener that accepts connections and
-    // refuses every verb on them -- a port that looks open and answers nothing.
-    auto const empty = WriteTempYaml("listeners-empty-roles",
-                                     "listeners:\n"
-                                     "  - address: 0.0.0.0\n"
-                                     "    port: 6675\n"
-                                     "    roles: []\n");
-    auto const emptyCfg = FastCache::ReadYamlConfig(empty);
-    REQUIRE_FALSE(emptyCfg.has_value());
-    CHECK(emptyCfg.error().field == "listeners[0].roles");
-
-    auto const scalar = WriteTempYaml("listeners-scalar-roles",
-                                      "listeners:\n"
-                                      "  - address: 0.0.0.0\n"
-                                      "    port: 6675\n"
-                                      "    roles: dispatch\n");
-    auto const scalarCfg = FastCache::ReadYamlConfig(scalar);
-    REQUIRE_FALSE(scalarCfg.has_value());
-    CHECK(scalarCfg.error().field == "listeners[0].roles");
-}
-
-TEST_CASE("YamlReader: listeners with missing port is rejected", "[config][yaml][listeners]")
-{
-    auto const path = WriteTempYaml("listeners-noport",
-                                    "listeners:\n"
-                                    "  - address: 0.0.0.0\n");
-    auto const cfg = FastCache::ReadYamlConfig(path);
-    REQUIRE_FALSE(cfg.has_value());
-    REQUIRE(cfg.error().field == "listeners[0].port");
-}
-
-TEST_CASE("YamlReader: listeners with unknown field is rejected", "[config][yaml][listeners]")
-{
-    // A typo like `tsl` instead of `tls` must fail fast — otherwise the
-    // operator silently ships a daemon that comes up plaintext.
-    auto const path = WriteTempYaml("listeners-typo",
-                                    "listeners:\n"
-                                    "  - address: 0.0.0.0\n"
-                                    "    port: 6380\n"
-                                    "    tsl: true\n");
-    auto const cfg = FastCache::ReadYamlConfig(path);
-    REQUIRE_FALSE(cfg.has_value());
-    REQUIRE(cfg.error().field == "listeners[0].tsl");
-}
-
-TEST_CASE("YamlReader: listeners with non-sequence is rejected", "[config][yaml][listeners]")
-{
-    auto const path = WriteTempYaml("listeners-scalar", "listeners: 6379\n");
-    auto const cfg = FastCache::ReadYamlConfig(path);
-    REQUIRE_FALSE(cfg.has_value());
-    REQUIRE(cfg.error().code == FastCache::ConfigErrorCode::TypeMismatch);
-    REQUIRE(cfg.error().field == "listeners");
-}
-
-TEST_CASE("YamlReader: listeners empty sequence is rejected", "[config][yaml][listeners]")
-{
-    auto const path = WriteTempYaml("listeners-empty", "listeners: []\n");
-    auto const cfg = FastCache::ReadYamlConfig(path);
-    REQUIRE_FALSE(cfg.has_value());
-    REQUIRE(cfg.error().field == "listeners");
-}
-
-TEST_CASE("YamlReader: listeners out-of-range port is rejected", "[config][yaml][listeners]")
-{
-    auto const path = WriteTempYaml("listeners-bigport",
-                                    "listeners:\n"
-                                    "  - address: 0.0.0.0\n"
-                                    "    port: 99999\n");
-    auto const cfg = FastCache::ReadYamlConfig(path);
-    REQUIRE_FALSE(cfg.has_value());
-    REQUIRE(cfg.error().code == FastCache::ConfigErrorCode::OutOfRange);
-}
-
-TEST_CASE("YamlReader: ReadYamlConfigWithPresence reports bind:/port: presence", "[config][yaml][presence]")
-{
-    // These presence bits let main.cpp's ValidateBindFlagShape see the YAML
-    // legacy single-bind triplet — without them the YAML mix of `bind:` +
-    // `listeners:` silently dropped `bind:`.
-    auto const both = WriteTempYaml("with-bind-port",
-                                    "bind: 10.0.0.1\n"
-                                    "port: 6380\n");
-    auto const withBoth = FastCache::ReadYamlConfigWithPresence(both);
-    REQUIRE(withBoth.has_value());
-    REQUIRE(withBoth->bindAddressExplicit);
-    REQUIRE(withBoth->portExplicit);
-}
-
-TEST_CASE("YamlReader: ReadYamlConfigWithPresence leaves bind/port presence clear when absent", "[config][yaml][presence]")
-{
-    auto const path = WriteTempYaml("no-bind", "max_memory: 4096\n");
-    auto const cfg = FastCache::ReadYamlConfigWithPresence(path);
-    REQUIRE(cfg.has_value());
-    REQUIRE_FALSE(cfg->bindAddressExplicit);
-    REQUIRE_FALSE(cfg->portExplicit);
-}
-
-TEST_CASE("YamlReader: compression keys parse", "[config][yaml][compression]")
-{
-    // The codec key is only valid when the codec is compiled in; the level and
-    // min-bytes keys are build-independent, so a codec-less build still parses
-    // them from a `compression: none` document.
-    auto const* const codecLine = FastCache::Compression::IsAvailable(FastCache::CompressionCodec::Zstd)
-                                      ? "compression: zstd\n"
-                                      : "compression: none\n";
-    auto const doc = std::string { codecLine } + "compression_level: 7\n" + "compression_min_bytes: 1k\n";
-    auto const path = WriteTempYaml("compress", doc);
-    auto const cfg = FastCache::ReadYamlConfig(path);
-    REQUIRE(cfg.has_value());
-    if (FastCache::Compression::IsAvailable(FastCache::CompressionCodec::Zstd))
-        REQUIRE(cfg->compression == FastCache::CompressionCodec::Zstd);
-    else
-        REQUIRE(cfg->compression == FastCache::CompressionCodec::Identity);
-    REQUIRE(cfg->compressionLevel == 7);
-    REQUIRE(cfg->compressionMinBytes == 1024);
-}
-
-TEST_CASE("YamlReader: compression=none selects Identity", "[config][yaml][compression]")
-{
-    auto const path = WriteTempYaml("compress-none", "compression: none\n");
-    auto const cfg = FastCache::ReadYamlConfig(path);
-    REQUIRE(cfg.has_value());
-    REQUIRE(cfg->compression == FastCache::CompressionCodec::Identity);
-}
-
-TEST_CASE("YamlReader: unknown compression codec is rejected", "[config][yaml][compression]")
-{
-    auto const path = WriteTempYaml("compress-bad", "compression: brotli\n");
-    auto const cfg = FastCache::ReadYamlConfig(path);
-    REQUIRE_FALSE(cfg.has_value());
-    REQUIRE(cfg.error().code == FastCache::ConfigErrorCode::OutOfRange);
-}
-
-TEST_CASE("YamlReader: compression_level out of range is rejected", "[config][yaml][compression]")
-{
-    auto const path = WriteTempYaml("compress-lvl", "compression_level: 99\n");
-    auto const cfg = FastCache::ReadYamlConfig(path);
-    REQUIRE_FALSE(cfg.has_value());
-    REQUIRE(cfg.error().code == FastCache::ConfigErrorCode::OutOfRange);
-}
-
-// ---------------------------------------------------------------------------
-// ReadYamlSettings: the generic door. It answers "what did this file say",
-// with no idea what any of it means -- which is what lets one reader serve a
-// second binary whose settings are an entirely different table.
+// ReadYamlSettings: the one door. It answers "what did this file say", with no
+// idea what any of it means -- which is what lets one reader serve two binaries
+// whose settings are entirely different tables. What a KEY means, and which value
+// it accepts, is each binary's option table's question: the daemon's is asked in
+// `CliOptions_test.cpp` and `ConfigMerge_test.cpp`, through the assembly.
 
 TEST_CASE("YamlReader: settings arrive as keys, values and line numbers", "[config][yaml]")
 {
@@ -453,6 +102,35 @@ TEST_CASE("YamlReader: a nested sequence element is refused rather than flattene
     CHECK(settings.error().code == FastCache::ConfigErrorCode::TypeMismatch);
 }
 
+TEST_CASE("YamlReader: a key written twice is refused by name, not resolved", "[config][yaml]")
+{
+    // Neither answer a caller could give is one the operator can see: a scalar keeps
+    // the LAST value and a list appends BOTH. Whichever was meant, the file says two
+    // things, so the reader says which key and where.
+    auto const path = WriteTempYaml("settings-duplicate", "alpha: one\nbeta: 2\nalpha: three\n");
+    auto const settings = FastCache::ReadYamlSettings(path);
+
+    REQUIRE_FALSE(settings.has_value());
+    CHECK(settings.error().code == FastCache::ConfigErrorCode::ParseError);
+    CHECK(settings.error().field == "alpha");
+    CHECK(settings.error().line == 3);
+    CHECK(settings.error().context.contains("first at line 1"));
+}
+
+TEST_CASE("YamlReader: a key that is not a scalar is refused rather than thrown", "[config][yaml]")
+{
+    // Reading a sequence as text throws inside yaml-cpp, and nothing above the reader
+    // catches it: measured on a 0.2.0-568 worker, this document ended the process
+    // with an unhandled exception (0xC0000409) instead of naming the line.
+    auto const path = WriteTempYaml("settings-sequence-key", "? [a, b]\n: 1\n");
+    auto const settings = FastCache::ReadYamlSettings(path);
+
+    REQUIRE_FALSE(settings.has_value());
+    CHECK(settings.error().code == FastCache::ConfigErrorCode::ParseError);
+    CHECK(settings.error().context == "non-scalar key");
+    CHECK(settings.error().line == 1);
+}
+
 TEST_CASE("YamlReader: a document that is not a map is refused", "[config][yaml]")
 {
     auto const path = WriteTempYaml("settings-scalar-doc", "just a string\n");
@@ -476,12 +154,6 @@ TEST_CASE("YamlReader: a file that is not there is FileNotFound, not ParseError"
     auto const settings = FastCache::ReadYamlSettings(missing);
     REQUIRE_FALSE(settings.has_value());
     CHECK(settings.error().code == FastCache::ConfigErrorCode::FileNotFound);
-
-    // The same fix, through the daemon's own reader: `LoadRoot` is shared, so the
-    // code was wrong for both callers and is right for both.
-    auto const config = FastCache::ReadYamlConfig(missing);
-    REQUIRE_FALSE(config.has_value());
-    CHECK(config.error().code == FastCache::ConfigErrorCode::FileNotFound);
 }
 
 TEST_CASE("YamlReader: a malformed document reports the line it gave up on", "[config][yaml]")

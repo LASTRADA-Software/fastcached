@@ -3361,6 +3361,79 @@ namespace
 }
 } // namespace
 
+TEST_CASE("A setting a worker's file names reads as named exactly as one typed on its command line", "[node][config]")
+{
+    // A key in the FILE is the operator naming the setting, and the worker reads that
+    // provenance off the MERGED configuration: `CacheTier` asks `cacheMemoryExplicit`
+    // whether a tier was configured at all, and a `listen_node:` pinned at its default is
+    // a different instruction from one nobody wrote. Nothing held the worker to it:
+    // neutering the bit in `ApplyFileSettings` turned seven daemon cases red and no node
+    // case (#1437). The listener is given AT its default, so value equality cannot stand in
+    // for the bit.
+    auto const named =
+        FromFileAndArgv({ Setting("cache_memory", { "1g" }), Setting("listen_node", { "127.0.0.1:6674" }) }, {});
+    REQUIRE(named.has_value());
+    CHECK(named->cacheMemoryExplicit);
+    CHECK(named->nodeListen == NodeConfig {}.nodeListen);
+    CHECK(named->nodeListenExplicit);
+
+    // The control: a row the file did not name stays unnamed, or a bit set for every row
+    // would pass the half above.
+    auto const silent = FromFileAndArgv({ Setting("cache_memory", { "1g" }) }, {});
+    REQUIRE(silent.has_value());
+    CHECK_FALSE(silent->nodeListenExplicit);
+}
+
+TEST_CASE("A worker's file says timestamps off with the negative key, whichever default the platform has", "[node][config]")
+{
+    // The default is a compile-time constant that is ON only under macOS, so a case that
+    // started from it would discriminate on one platform and pass vacuously on the rest.
+    // Injected instead, both ways. Measured nowhere and derived from `ApplyFileSettings`:
+    // a presence key applies on `true` alone, so before this row had a key a worker's
+    // `log_timestamps: false` left macOS stamping while its own documentation said
+    // otherwise (#1437).
+    auto const path = std::filesystem::path { "/etc/n.yaml" };
+
+    SECTION("the negative key turns it off where the default is on")
+    {
+        NodeConfig cfg;
+        cfg.logTimestamps = true;
+        REQUIRE(ApplyNodeConfiguration({ Setting("no_log_timestamps", { "true" }) }, path, {}, cfg).has_value());
+        CHECK_FALSE(cfg.logTimestamps);
+    }
+
+    SECTION("false on either key passes nothing, so the default stands")
+    {
+        for (auto const injected: { true, false })
+        {
+            INFO("default: " << injected);
+            NodeConfig cfg;
+            cfg.logTimestamps = injected;
+            REQUIRE(ApplyNodeConfiguration(
+                        { Setting("log_timestamps", { "false" }), Setting("no_log_timestamps", { "false" }) }, path, {}, cfg)
+                        .has_value());
+            CHECK(cfg.logTimestamps == injected);
+        }
+    }
+
+    SECTION("the positive key turns it on where the default is off")
+    {
+        NodeConfig cfg;
+        cfg.logTimestamps = false;
+        REQUIRE(ApplyNodeConfiguration({ Setting("log_timestamps", { "true" }) }, path, {}, cfg).has_value());
+        CHECK(cfg.logTimestamps);
+    }
+
+    SECTION("a typed flag still outranks the file")
+    {
+        NodeConfig cfg;
+        cfg.logTimestamps = true;
+        auto const args = std::to_array<char const*>({ "--log-timestamps" });
+        REQUIRE(ApplyNodeConfiguration({ Setting("no_log_timestamps", { "true" }) }, path, args, cfg).has_value());
+        CHECK(cfg.logTimestamps);
+    }
+}
+
 TEST_CASE("NodeConfig: every row is reachable from a file or named as one that is not", "[node][config]")
 {
     // The compile-time guard beside the table proves this for the build; this is
@@ -3711,6 +3784,24 @@ TEST_CASE("One save touching both is refused whole, and names every unreloadable
     // The reloadable one is absent from the refusal, or the report would tell an
     // operator to restart for something that did not need it.
     CHECK_FALSE(std::ranges::contains(changed, std::string_view { "--log-level" }));
+}
+
+TEST_CASE("A worker's file naming a key twice is refused, where it used to keep the last", "[node][config][reload]")
+{
+    // Measured before the change on a 0.2.0-568 worker: `listen_node:` twice and
+    // `--print-surfaces` served the SECOND address, with nothing said about the first.
+    // A refusal is the intended change for this binary -- the shared reader answers
+    // for both, and under a list setting the same repetition would have APPENDED.
+    Testing::ScratchDirectory const scratch { "node-config-duplicate-key" };
+    auto const path =
+        WriteRunnableNodeConfigFile(scratch.Path(), "listen_node: 127.0.0.1:41001\nlisten_node: 127.0.0.1:41002\n");
+
+    auto const candidate = ReparseNodeConfig(path);
+    REQUIRE_FALSE(candidate.has_value());
+    CHECK(candidate.error().code == ConfigErrorCode::ParseError);
+    CHECK(candidate.error().field == "listen_node");
+    CHECK(candidate.error().line == 3);
+    CHECK(candidate.error().context.contains("first at line 2"));
 }
 
 TEST_CASE("A file that fails halfway is declined, never half-applied", "[node][config][reload]")
