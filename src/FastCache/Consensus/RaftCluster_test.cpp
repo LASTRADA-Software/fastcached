@@ -11,6 +11,7 @@
 #include <chrono>
 #include <cstdint>
 #include <memory>
+#include <ranges>
 #include <set>
 #include <span>
 #include <string>
@@ -107,7 +108,7 @@ constexpr std::array Everyone { "n1", "n2", "n3", "n4" };
 /// @return Whether one emerged.
 [[nodiscard]] bool SettleOnLeader(RaftClusterHarness& cluster, std::size_t steps = 200)
 {
-    for (auto step = std::size_t { 0 }; step < steps; ++step)
+    for ([[maybe_unused]] auto const step: std::views::iota(std::size_t { 0 }, steps))
     {
         cluster.Step();
         if (cluster.Leader().has_value())
@@ -172,7 +173,7 @@ TEST_CASE("Entries are applied in the same order on every node", "[consensus][ra
     RaftClusterHarness cluster { { "n1", "n2", "n3" }, ClusterKey };
     REQUIRE(SettleOnLeader(cluster));
 
-    for (auto index = 0; index < 8; ++index)
+    for (auto const index: std::views::iota(0, 8))
     {
         REQUIRE(cluster.ProposeOnLeader(FastCache::BytesFromString("v" + std::to_string(index))).has_value());
         cluster.Run(6);
@@ -186,7 +187,7 @@ TEST_CASE("Entries are applied in the same order on every node", "[consensus][ra
     {
         auto const& applied = cluster.At(id).applied;
         REQUIRE(applied.size() == reference.size());
-        for (auto index = std::size_t { 0 }; index < reference.size(); ++index)
+        for (auto const index: std::views::iota(std::size_t { 0 }, reference.size()))
         {
             CHECK(applied[index].index == reference[index].index);
             CHECK(applied[index].payload == reference[index].payload);
@@ -330,7 +331,7 @@ TEST_CASE("Restarting every node in turn preserves what was committed", "[consen
     {
         auto const& log = cluster.At(id).driver->Node().Log();
         auto found = false;
-        for (auto index = std::uint64_t { 1 }; index <= log.LastIndex().value; ++index)
+        for (auto const index: std::views::iota(std::uint64_t { 1 }, log.LastIndex().value + 1))
         {
             auto const* const entry = log.EntryAt(LogIndex { .value = index });
             if (entry != nullptr && entry->kind == EntryKind::Command
@@ -367,7 +368,7 @@ TEST_CASE("A long adversarial run violates nothing", "[consensus][raft][cluster]
     cluster.SetLossPercent(15);
 
     auto proposals = 0;
-    for (auto round = 0; round < 12; ++round)
+    for (auto const round: std::views::iota(0, 12))
     {
         if (round % 4 == 1)
             cluster.Partition({ "n1", "n2" });
@@ -594,7 +595,7 @@ TEST_CASE("A cluster that admitted a member re-elects after losing the leader", 
     cluster.Partition(survivors);
 
     auto elected = std::optional<NodeId> {};
-    for (auto step = std::size_t { 0 }; step < 600; ++step)
+    for ([[maybe_unused]] auto const step: std::views::iota(std::size_t { 0 }, std::size_t { 600 }))
     {
         cluster.Step();
         for (auto const& who: cluster.Leaders())
@@ -732,7 +733,7 @@ TEST_CASE("A leader that loses quorum contact stops being one", "[consensus][raf
     cluster.Partition({ isolated });
 
     auto stoodDown = false;
-    for (auto step = std::size_t { 0 }; step < 600; ++step)
+    for ([[maybe_unused]] auto const step: std::views::iota(std::size_t { 0 }, std::size_t { 600 }))
     {
         cluster.Step();
         if (cluster.At(isolated).driver->Node().CurrentRole() != Role::Leader)

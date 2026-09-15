@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cstdint>
 #include <optional>
+#include <ranges>
 #include <string>
 #include <variant>
 #include <vector>
@@ -1235,7 +1236,7 @@ TEST_CASE("A partitioned node cannot inflate the term it returns with", "[consen
     // back twenty terms ahead and deposed a leader that was working fine.
     Fixture fix;
 
-    for (auto round = 0; round < 20; ++round)
+    for (auto const round: std::views::iota(0, 20))
         (void) fix.node.Tick(At(ElectionMin.count() * (round + 1) * 4));
 
     // Twenty timeouts, no answers, and the term has not moved once.
@@ -1668,9 +1669,9 @@ TEST_CASE("A node with no cluster never stands for election", "[consensus][raft]
 
     REQUIRE_FALSE(node.HasCluster());
 
-    for (auto elapsed = ElectionMin.count(); elapsed <= ElectionMin.count() * 10; elapsed += ElectionMin.count())
+    for (auto const multiple: std::views::iota(1, 11))
     {
-        auto const output = node.Tick(At(elapsed));
+        auto const output = node.Tick(At(ElectionMin.count() * multiple));
         CHECK(output.messages.empty());
         CHECK_FALSE(output.persist.has_value());
     }

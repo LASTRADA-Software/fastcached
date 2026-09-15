@@ -234,8 +234,8 @@ TEST_CASE("Durable state is written before anything is sent", "[consensus][raft]
     REQUIRE(firstSend != journal.events.end());
 
     // Every persist precedes the first send.
-    for (auto event = journal.events.begin(); event != firstSend; ++event)
-        CHECK(*event != "send");
+    for (auto const& event: std::ranges::subrange { journal.events.begin(), firstSend })
+        CHECK(event != "send");
 
     CHECK(std::ranges::find(journal.events.begin(), firstSend, "persist-state") != firstSend);
 }

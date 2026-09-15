@@ -33,6 +33,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <ranges>
 #include <string>
 #include <thread>
 #include <tuple>
@@ -586,7 +587,7 @@ TEST_CASE("Send hands the message over without advancing the sender", "[consensu
     Harness harness;
     harness.Start();
 
-    for (auto term = 1; term <= 4; ++term)
+    for (auto const term: std::views::iota(1, 5))
         harness.transport->Send("n2", Vote(static_cast<std::uint64_t>(term)));
 
     CHECK(harness.Writes() == 0);
@@ -659,7 +660,7 @@ TEST_CASE("A queue for an unreachable peer is bounded", "[consensus][raft][trans
     harness.connector.Refuse(true);
     harness.Start(PeerTransportOptions { .dialTimeout = 10s, .reconnectBackoff = 10s, .maxQueuedPerPeer = Bound });
 
-    for (auto term = 1; term <= 10; ++term)
+    for (auto const term: std::views::iota(1, 11))
         harness.transport->Send("n2", Vote(static_cast<std::uint64_t>(term)));
 
     // Six displaced, and reported: a drop nobody counts is invisible, and Raft

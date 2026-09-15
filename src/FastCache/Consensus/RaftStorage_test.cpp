@@ -12,6 +12,7 @@
 #include <filesystem>
 #include <fstream>
 #include <optional>
+#include <ranges>
 #include <string>
 #include <system_error>
 #include <vector>
@@ -363,7 +364,7 @@ TEST_CASE("Appending one entry at a time builds the whole log", "[consensus][raf
     ScratchDirectory scratch { "fc-raft-store" };
     {
         auto store = OpenStore(scratch.Path());
-        for (auto index = std::uint64_t { 1 }; index <= 5; ++index)
+        for (auto const index: std::views::iota(std::uint64_t { 1 }, std::uint64_t { 6 }))
             REQUIRE(store
                         .SaveLog(LogAppend { .fromIndex = LogIndex { .value = index },
                                              .entries = { Entry(1, std::string { "e" } + std::to_string(index)) } })
