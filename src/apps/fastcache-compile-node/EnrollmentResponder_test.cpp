@@ -569,7 +569,7 @@ TEST_CASE("The pending list fills, refuses the next machine by name, and keeps t
     Seed seed;
     REQUIRE(Unwrap(Wire::DecodeReplyHeader(Control(seed, Wire::EnrollControlVerb::Open))).status == Wire::Status::Ok);
 
-    for (std::size_t index = 0; index < MaxPendingEnrollments; ++index)
+    for (auto const index: std::views::iota(std::size_t { 0 }, MaxPendingEnrollments))
     {
         auto const id = std::format("crowd-{}", index);
         REQUIRE(RefusalIn(AnswerNow(seed.responder,
@@ -893,7 +893,7 @@ TEST_CASE("A node that runs enrollment routes both verbs to it and nothing else"
     // this build knows lands somewhere else, which on this fixture is nowhere. Swept
     // over the whole byte range because a claim about routing stops being true without
     // anybody editing the sentence that states it.
-    for (std::uint32_t raw = 0; raw <= 0xFFU; ++raw)
+    for (auto const raw: std::views::iota(std::uint32_t { 0 }, 0xFFU + 1))
     {
         auto const byte = static_cast<std::uint8_t>(raw);
         auto const isEnrollment = Wire::FamilyOf(byte) == Wire::VerbFamily::Enrollment;

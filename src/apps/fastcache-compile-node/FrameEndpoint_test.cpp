@@ -3229,8 +3229,12 @@ namespace
 [[nodiscard]] std::size_t CountOf(std::string_view text, std::string_view needle)
 {
     std::size_t count = 0;
-    for (std::size_t at = text.find(needle); at != std::string_view::npos; at = text.find(needle, at + needle.size()))
+    auto at = text.find(needle);
+    while (at != std::string_view::npos)
+    {
         ++count;
+        at = text.find(needle, at + needle.size());
+    }
     return count;
 }
 

@@ -28,6 +28,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <ranges>
 #include <string>
 #include <vector>
 
@@ -47,7 +48,7 @@ namespace
 void PopulateRoot(std::filesystem::path const& root, std::size_t files)
 {
     std::filesystem::create_directories(root);
-    for (std::size_t index = 0; index < files; ++index)
+    for (auto const index: std::views::iota(std::size_t { 0 }, files))
     {
         // Nested a little, so the walk recurses rather than reading one flat
         // directory -- the relative spelling is part of the digest.
@@ -123,7 +124,7 @@ TEST_CASE("A slice that does not finish clears complete", "[toolchain][concurren
         [[nodiscard]] bool Run(std::size_t count, std::function<void(std::size_t)> const& slice) override
         {
             auto ok = true;
-            for (std::size_t index = 0; index < count; ++index)
+            for (auto const index: std::views::iota(std::size_t { 0 }, count))
             {
                 if (index == count / 2)
                 {
