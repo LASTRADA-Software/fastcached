@@ -33,8 +33,14 @@
 # `-m` reaches instruction sets (`-msha`, `-mavx2`) and much besides, and an allowlist that did not name
 # a flag would read identically to one that had judged it. So a flag that enables nothing gets a row
 # with its reason, and a row exists only for a spelling something produces -- the first real new one
-# arrives as a refusal. `-arch` names an Apple slice and is refused for any value: `x86_64h` implies AVX2,
-# and nothing here sets `CMAKE_OSX_ARCHITECTURES`. A target triple (`--target=`, `-target`, `-Xclang -triple`)
+# arrives as a refusal. `-arch` names an Apple slice, and the two BASELINE slices are rows of their own:
+# CMake passes `-arch arm64` on every Apple build -- the macOS leg's database carries it on all 709
+# first-party units, and this tree sets no `CMAKE_OSX_ARCHITECTURES`, so the flag comes from CMake's own
+# Apple handling rather than from anything here. `arm64` and `x86_64` imply no instruction set beyond
+# their architecture's own; every other value is refused, `x86_64h` because it implies AVX2 and an
+# unknown slice because a slice is exactly the thing that can imply instructions. The spelling ALONE is
+# refused too, since the value can arrive in a token of its own.
+# A target triple (`--target=`, `-target`, `-Xclang -triple`)
 # is refused for the same reason, and nothing here sets `CMAKE_<LANG>_COMPILER_TARGET`; so is clang's
 # `-Xclang -target-cpu`, which is `-march=` one layer down. Every other spelling of a refused flag is read as
 # the flag it spells: clang's `-Xclang=<flag>`, clang-cl's `-clang:` beside `/clang:`, GCC's `--machine-<ext>`.
@@ -108,6 +114,8 @@ set(DriverRows
 #            refuse whatever the value is.
 set(SpellingRows
     "Gnu|allow|prefix|it is the OS API floor CMakeLists.txt pins through CMAKE_OSX_DEPLOYMENT_TARGET, and enables no instruction|-mmacosx-version-min="
+    "Gnu|allow|exact|it is the baseline Apple silicon slice, implies no instruction set beyond the architecture's own, and CMake passes it on every Apple build|-arch arm64"
+    "Gnu|allow|exact|it is the baseline Intel slice, implying SSE2 and nothing above it -- x86_64h is the slice that implies more|-arch x86_64"
     "Gnu|refuse|flag-value|it names an Apple slice, and a slice can imply instructions (x86_64h implies AVX2)|-arch"
     "Gnu|refuse|prefix|it selects a CPU, and with it every instruction set that CPU has|-march="
     "Gnu|refuse|prefix|it selects a CPU, and with it every instruction set that CPU has|-mcpu="
@@ -146,7 +154,7 @@ set(rowIndex -1)
 foreach(row IN LISTS SpellingRows)
     math(EXPR rowIndex "${rowIndex} + 1")
     fastcached_row_fields("${row}" family verdict kind reason spelling)
-    if(NOT spelling MATCHES "^[-/:=_A-Za-z0-9]+$")
+    if(NOT spelling MATCHES "^[-/:=_A-Za-z0-9]+( [-_A-Za-z0-9]+)?$")
         message(FATAL_ERROR "instruction-set-flags: SpellingRows spelling `${spelling}` holds a character the derived pattern would read as regex syntax")
     endif()
     if(NOT verdict MATCHES "^(allow|refuse|unwrap)$")
