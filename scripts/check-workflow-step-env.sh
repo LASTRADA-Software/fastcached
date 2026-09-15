@@ -61,8 +61,11 @@
 # ## What it does NOT cover, so that nobody reads a pass as more than it is
 #
 # A name reached by `eval` or indirect expansion; one a sourced file defines; one supplied through a `${{ }}`
-# expression (substituted, so invisible here); `${#arr[@]}`. And the `NAME: ${{ env.NAME }}` row itself: a typo'd
-# `${{ env.X }}` on the right of it is unchecked until #1460.
+# expression (substituted, so invisible here); `${#arr[@]}`. Two known residuals, each its own issue:
+#
+#   * the `NAME: ${{ env.NAME }}` row itself -- a typo'd `${{ env.X }}` on the right of it is unchecked until #1460;
+#   * ORDER inside a script -- a name the script assigns counts as defined for the whole script, so `echo "$X"` above
+#     `X=1` passes until #1461. Loop bodies, functions and traps make order a question this reader cannot answer yet.
 #
 # bash 3.2 and a POSIX awk: this runs on macOS's `/bin/bash` and BSD awk.
 
@@ -101,7 +104,7 @@ pwsh|pwsh"
 Remedies="undefined|A step's environment is its own: a sibling step's or another job's \`env:\` does not lend it one, so under \`set -u\` the step dies on that line and without it the name expands to EMPTY and a branch is silently taken the wrong way (#1174). Add the row to THIS step's \`env:\` (or its job's), or assign it in the script. A name an earlier step or an action exported is named the same way, as \`NAME: \${{ env.NAME }}\`.
 unknown-shell|This check reads a script by the model of the shell that runs it, and has none for this one. Add a row to ShellModels only with a model of how that shell reads its environment, and cases for it.
 unresolved-shell|The shell could not be derived: no \`shell:\` on the step, no \`defaults.run.shell\` above it, and a \`runs-on\` that is not a literal Windows, Ubuntu, macOS or Linux runner. Name the shell on the step.
-unreadable-run|The \`run:\` value is not a string this check can read (an alias, a tag, or a flow collection). Write the script as a block scalar (\`run: |\`) or an inline string.
+unreadable-run|The \`run:\` value is not a string this check can read: an alias, a tag, a flow collection, or a quoted scalar that does not close on its own line, has text after its closing quote, or holds a YAML escape other than \`\\\\\"\`, \`\\\\\\\\\` or \`\\\\/\`. YAML quoting is not shell quoting, and a quote read as the shell would read it hides the reads inside it. Write the script as a block scalar (\`run: |\`), or as a plain or quoted string on one line.
 unreadable-env|The \`env:\` is not a block mapping this check can read. Write one \`NAME: value\` row per line.
 unreadable-yaml|This check places every line of a workflow by its indentation, and cannot place this one -- a flow mapping, an alias, a quoted key, or a second document -- so no step around it can be judged. Write it as a block mapping; if the construct is needed, teach the reader and add a case.
 unplaced-run|Every \`run:\` key outside a scalar is counted without the reader and must be a script the reader placed in a step (or a \`defaults.run\`), so a step whose keys the reader stopped recognising is refused here rather than read as clean. If this is a step's script, the reader misplaced the step: teach it, with a case. If it is not one -- an action input or an \`env:\` row named \`run\` -- the reader has no place for it either: teach it where the key sits, with a case. Never rename a script key to get past this."
@@ -139,20 +142,27 @@ Scan() {
     # every `$` becomes `_`, so nothing there reads a name while the words, the quotes and a heredoc delimiter stay
     # where they were -- `read -d '' name` still has a value before the name. @p esc is the escape character
     # (a backslash in bash, a backtick in PowerShell); @p heredocs says whether `<<` opens one.
-    function lex(s, esc, heredocs,   out, i, c, n, heredocAt, t, quoted) {
-        out = ""; n = length(s); heredocAt = 0
+    # Beside the text it returns, it leaves lexCode: the same line with every character inside a quote masked, which
+    # is what an assignment is looked for in -- `echo "please read NAME"` assigns nothing.
+    function lex(s, esc, heredocs,   out, i, c, n, heredocAt, t, quoted, wasQuoted) {
+        out = ""; lexCode = ""; n = length(s); heredocAt = 0
         for (i = 1; i <= n; i++) {
             c = substr(s, i, 1)
-            if (lexState == "single") { if (c == sq) lexState = ""; out = out (c == "$" ? "_" : c); continue }
+            if (lexState == "single") {
+                if (c == sq) { lexState = ""; lexCode = lexCode c } else lexCode = lexCode "_"
+                out = out (c == "$" ? "_" : c); continue
+            }
             if (c == esc) { i++; continue }
             # A `#` starting a word outside any quote begins a comment in both shells, so the rest of the line is
             # neither a read nor a quote -- an apostrophe in `# do not` must not open a string that hides the step.
             if (lexState == "" && c == "#" && (i == 1 || substr(s, i - 1, 1) ~ /[ \t;]/)) break
+            wasQuoted = (lexState == "double" && c != "\"")
             if (lexState == "" && c == sq) lexState = "single"
             else if (c == "\"") lexState = (lexState == "double") ? "" : "double"
             else if (heredocs && lexState == "" && substr(s, i, 2) == "<<" && substr(s, i + 2, 1) != "<" && (i == 1 || substr(s, i - 1, 1) != "<"))
                 if (!heredocAt) heredocAt = length(out) + 1
             out = out c
+            lexCode = lexCode (wasQuoted ? "_" : c)
         }
         # A heredoc started on this line, outside any quote. Quoted, its body is not expanded at all; either way it
         # ends at the delimiter alone on a line.
@@ -166,6 +176,7 @@ Scan() {
         return out
     }
     function bashVisible(s) {
+        lexCode = ""
         if (heredocEnd != "") {
             if (trim(s) == heredocEnd) { heredocEnd = ""; return "" }
             if (heredocQuoted) return ""
@@ -175,13 +186,18 @@ Scan() {
         }
         return lex(s, "\\", 1)
     }
-    function pwshVisible(s,   t) {
+    # A here-string opens where the CODE of a line ends in `@` and a quote, so the opener is looked for in what the
+    # lexer returns: a comment ending in one opens nothing, and the lines after it are still code.
+    function pwshVisible(s,   t, before, out) {
         t = trim(s)
         if (hereString == "single") { if (substr(t, 1, 2) == sq "@") hereString = ""; return "" }
         if (hereString == "double") { if (substr(t, 1, 2) == "\"@") { hereString = ""; return "" } return s }
-        if (lexState == "" && substr(t, length(t) - 1) == "@" sq) { hereString = "single"; return substr(s, 1, length(s) - 2) }
-        if (lexState == "" && substr(t, length(t) - 1) == "@\"") { hereString = "double"; return substr(s, 1, length(s) - 2) }
-        return lex(s, "`", 0)
+        before = lexState
+        out = lex(s, "`", 0)
+        t = out; sub(/[ \t]+$/, "", t)
+        if (before == "" && lexState == "single" && substr(t, length(t) - 1) == "@" sq) { hereString = "single"; lexState = ""; return substr(t, 1, length(t) - 2) }
+        if (before == "" && lexState == "double" && substr(t, length(t) - 1) == "@\"") { hereString = "double"; lexState = ""; return substr(t, 1, length(t) - 2) }
+        return out
     }
 
     # ---- bash ----------------------------------------------------------------------------------------------------
@@ -321,10 +337,12 @@ Scan() {
         # The plant is one more line, read LAST and by the same lexer, so a body that leaves a quote, a heredoc or a
         # here-string open hides it -- which is what the plant exists to catch.
         if (plant) body[nbody++] = fold ? "$null = $env:" PlantName : ": \"$" PlantName "\""
+        # No line is skipped for starting with `#`: the lexer ends a comment itself, and inside a heredoc or a
+        # here-string such a line is text that expands -- a Markdown heading in a report body. A heredoc line is
+        # text, too, so `NAME=$NAME` written into a file assigns nothing.
         for (i = 0; i < nbody; i++) {
-            if (body[i] ~ /^[ \t]*#/) continue
             if (fold) pwshScan(pwshVisible(body[i]))
-            else { t = bashVisible(body[i]); bashDefs(t); bashRefs(t) }
+            else { t = bashVisible(body[i]); if (lexCode != "") bashDefs(lexCode); bashRefs(t) }
         }
         if (plant) {
             printf "PLANTED\t%d\t%s\t%d\n", stepLine, stepName, (PlantName in refs)
@@ -385,6 +403,31 @@ Scan() {
         if (v != "") countOwner = indentOf(s)
     }
     function place() { if (pass == 2) placed[FNR] = 1 }
+
+    # The text of a YAML-quoted scalar @p v, which must close on its own line with at most a comment after it, and sets
+    # yamlOk to say whether it did. YAML quoting is not shell quoting, so the quotes must not reach a shell model, where
+    # they would hide every read between them: a doubled apostrophe in single quotes is one apostrophe, and in double
+    # quotes an escaped quote, backslash or slash is that character. Any other escape, a quote left open for the next
+    # line, or text after the closing quote, is not read at all -- yamlOk is 0 and the caller refuses the step.
+    function yamlQuoted(v,   q, i, n, ch, e, out) {
+        q = substr(v, 1, 1); n = length(v); out = ""; yamlOk = 0
+        for (i = 2; i <= n; i++) {
+            ch = substr(v, i, 1)
+            if (ch == q) {
+                if (q == sq && substr(v, i + 1, 1) == sq) { out = out sq; i++; continue }
+                yamlOk = (substr(v, i + 1) ~ /^([ \t]+#.*)?$/)
+                return yamlOk ? out : ""
+            }
+            if (q == "\"" && ch == "\\") {
+                e = substr(v, ++i, 1)
+                if (e != "\"" && e != "\\" && e != "/") return ""
+                out = out e
+                continue
+            }
+            out = out ch
+        }
+        return ""
+    }
 
     BEGIN {
         sq = sprintf("%c", 39)
@@ -505,8 +548,13 @@ Scan() {
             place()
             if (c == "*" || c == "&" || c == "!" || c == "[" || c == "{") refuse(FNR, "unreadable-run", "`run: " value "`")
             else {
+                if (c == sq || c == "\"") {
+                    t = yamlQuoted(value)
+                    if (!yamlOk) { refuse(FNR, "unreadable-run", "`run: " value "` is a quoted scalar this check cannot read on one line"); next }
+                    value = t
+                }
                 hasRun = 1
-                body[nbody++] = unquote(value)
+                body[nbody++] = value
                 # A plain scalar continues on more-indented lines, including one whose first line is empty.
                 blockOwner = ind; blockKind = "run"
             }
@@ -949,6 +997,116 @@ jobs:
       - run: |
           CC=clang make
           echo "$CC"
+WF
+
+    # A line starting with `#` inside an unquoted heredoc is text that expands, not a comment.
+    Case headingInHeredoc 1 'reads $UNDER_A_HEADING' <<'WF'
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          cat > body.md <<BODY
+          ## Failed on ${UNDER_A_HEADING}
+          BODY
+WF
+
+    # A heredoc line is text written into a file, so `NAME=$NAME` in it assigns nothing.
+    Case assignmentInHeredoc 1 'reads $WRITTEN_NOT_ASSIGNED' <<'WF'
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          cat >> "$GITHUB_ENV" <<EOF
+          WRITTEN_NOT_ASSIGNED=$WRITTEN_NOT_ASSIGNED
+          EOF
+WF
+
+    # A word inside quotes is not a command, so `read NAME` in a string assigns nothing.
+    Case readInsideQuotes 1 'reads $QUOTED_READ' <<'WF'
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          echo "please read QUOTED_READ first"
+          echo "$QUOTED_READ"
+WF
+
+    # A YAML-quoted script followed by a comment: the YAML quotes are not shell quotes.
+    Case yamlQuotedWithComment 1 'reads $YAML_QUOTED' <<'WF'
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    steps:
+      - run: 'echo $YAML_QUOTED' # a note
+WF
+
+    # A doubled apostrophe is one apostrophe, so the shell sees a single-quoted `$SINGLE` and a double-quoted read.
+    Case yamlDoubledApostrophe 1 'reads $DOUBLE -- ' <<'WF'
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    steps:
+      - run: 'echo ''$SINGLE'' "$DOUBLE"'
+WF
+
+    # An escaped quote is a quote, and the `#` after it is inside the shell string -- not a comment, and not the end.
+    Case yamlEscapedQuote 1 'reads $INSIDE_ESCAPED_QUOTES' <<'WF'
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    steps:
+      - run: "echo \"a # $INSIDE_ESCAPED_QUOTES\" # note"
+WF
+
+    # A quoted scalar this check cannot read on one line is refused, never read by a model that mistakes its quotes.
+    Case quotedRunAcrossLines 1 'is a quoted scalar this check cannot read on one line' <<'WF'
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    steps:
+      - run: 'echo one
+          $HIDDEN_BY_THE_YAML_QUOTE'
+WF
+
+    Case quotedRunOtherEscape 1 'is a quoted scalar this check cannot read on one line' <<'WF'
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    steps:
+      - run: "echo \t$AFTER_A_TAB"
+WF
+
+    Case quotedRunTextAfterQuote 1 'is a quoted scalar this check cannot read on one line' <<'WF'
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    steps:
+      - run: 'echo one' $AFTER_THE_QUOTE
+WF
+
+    # A comment ending the way a here-string opens opens nothing, so the next line is code.
+    Case pwshOpenerInAComment 1 'reads $env:AFTER_THE_OPENER' <<'WF'
+jobs:
+  w:
+    runs-on: windows-2025
+    steps:
+      - run: |
+          Write-Host hi # a here-string opens with @'
+          Write-Host $env:AFTER_THE_OPENER
+WF
+
+    # A single-quoted awk program is not the shell, so an assignment in it defines nothing.
+    Case assignmentInSingleQuotes 1 'reads $x' <<'WF'
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          awk '{ x=1 }' file
+          echo "$x"
 WF
 
     # A `run:` key the reader places in no step is counted anyway, and refused by line.
