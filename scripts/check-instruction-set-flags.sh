@@ -69,9 +69,12 @@ Classify() {
     local error="no" warning="no" verdict="no" summary="no"
     case "$flat" in *"CMake Error"*) error="yes" ;; esac
     case "$flat" in *"CMake Warning"*) warning="yes" ;; esac
-    # The check spells every verdict `instruction-set-flags: <text>` -- a colon and a space. Its own file name,
-    # `check-instruction-set-flags.cmake:<line>`, does not match that.
-    case "$flat" in *"instruction-set-flags: "*) verdict="yes" ;; esac
+    # The check spells every verdict as a `message(FATAL_ERROR)` whose text opens `instruction-set-flags: `, so it
+    # follows the `(message):` of its CMake Error header. A bare `instruction-set-flags: ` is NOT a verdict: every run
+    # that parsed its database printed `-- instruction-set-flags: parse: ...` first, so a foreign error raised after
+    # that line would otherwise read as the check refusing the tree. Its own file name,
+    # `check-instruction-set-flags.cmake:<line>`, does not match either.
+    case "$flat" in *"(message): instruction-set-flags: "*) verdict="yes" ;; esac
     case "$flat" in *"-- instruction-set-flags: $2"*"$3"*) summary="yes" ;; esac
     if [ "$error" = "no" ] && [ "$warning" = "no" ] && [ "$summary" = "yes" ]; then
         echo "clean"
@@ -163,6 +166,13 @@ EOF
 echo 'CMake Error: Error processing file: /nowhere/check-instruction-set-flags.cmake'
 exit 1
 EOF
+    cat > "$tmp/error-after-parse" <<'EOF'
+#!/bin/bash
+echo '-- instruction-set-flags: parse: batched (1 batch(es))'
+echo 'CMake Error at /r/scripts/check-instruction-set-flags.cmake:238 (string):'
+echo '  string sub-command JSON failed parsing json string: * Line 1, Column 1'
+exit 1
+EOF
     cat > "$tmp/plant-accepted" <<'EOF'
 #!/bin/bash
 case "$*" in
@@ -176,7 +186,7 @@ esac
 echo '-- instruction-set-flags: 1 first-party unit(s) judged, none carries a global instruction-set flag; 0 unit(s) outside src/ declined'
 exit 0
 EOF
-    chmod +x "$tmp/warns" "$tmp/foreign-error" "$tmp/plant-accepted"
+    chmod +x "$tmp/warns" "$tmp/foreign-error" "$tmp/error-after-parse" "$tmp/plant-accepted"
 
     local self="${repo_root}/scripts/check-instruction-set-flags.sh"
     Expect cleanDatabase 0 bash "$self" --cmake "$cmake_command" "$tmp/clean.json"
@@ -185,6 +195,7 @@ EOF
     Expect cmakeNeverStarted 2 bash "$self" --cmake "$tmp/no-such-cmake" "$tmp/clean.json"
     Expect warningBesideSummary 2 bash "$self" --cmake "$tmp/warns" "$tmp/clean.json"
     Expect errorNotTheChecks 2 bash "$self" --cmake "$tmp/foreign-error" "$tmp/clean.json"
+    Expect errorAfterParseLine 2 bash "$self" --cmake "$tmp/error-after-parse" "$tmp/clean.json"
     Expect plantAccepted 2 bash "$self" --cmake "$tmp/plant-accepted" "$tmp/clean.json"
     Expect noArguments 2 bash "$self"
 

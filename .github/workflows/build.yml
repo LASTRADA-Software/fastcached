@@ -2355,7 +2355,7 @@ jobs:
         # which is where the "only on a tag run" reasoning is written down.
         run: cmake --preset gcc-release -DFASTCACHED_BUILD_TESTS=OFF -DFASTCACHED_PACKAGE_ROOT_PREFIX=ON -DFASTCACHED_REQUIRE_EXACT_VERSION=${{ env.FASTCACHED_REQUIRE_EXACT_VERSION }}
 
-      # Why this step, why before Build, and why it reports without gating: the header of
+      # Why this step, why before Build, and why it gates the package but no merge: the header of
       # scripts/check-instruction-set-flags.sh (#1442).
       - name: "No global instruction-set flag in what ships"
         run: bash scripts/run-check.sh scripts/check-instruction-set-flags.sh out/build/gcc-release/compile_commands.json
@@ -2912,7 +2912,7 @@ jobs:
             -DFASTCACHED_MACOS_NOTARY_STALL_IS_FATAL="${{ steps.notary.outputs.stall_is_fatal }}" \
             -DFASTCACHED_REQUIRE_EXACT_VERSION=${{ env.FASTCACHED_REQUIRE_EXACT_VERSION }}
 
-      # Why this step, why before Build, and why it reports without gating: the header of
+      # Why this step, why before Build, and why it gates the package but no merge: the header of
       # scripts/check-instruction-set-flags.sh (#1442).
       - name: "No global instruction-set flag in what ships"
         run: bash scripts/run-check.sh scripts/check-instruction-set-flags.sh out/build/macos-package/compile_commands.json
@@ -3231,7 +3231,7 @@ jobs:
         # which is where the "only on a tag run" reasoning is written down.
         run: cmake --preset cl-release -DALLOW_SCCACHE_FALLBACK=ON -DFASTCACHED_BUILD_TESTS=OFF -DFASTCACHED_REQUIRE_EXACT_VERSION=${{ env.FASTCACHED_REQUIRE_EXACT_VERSION }}
 
-      # Why this step, why before Build, and why it reports without gating: the header of
+      # Why this step, why before Build, and why it gates the package but no merge: the header of
       # scripts/check-instruction-set-flags.sh (#1442). Git Bash, because the wrapper converts its own paths for the
       # native cmake.
       - name: "No global instruction-set flag in what ships"
