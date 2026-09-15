@@ -11,9 +11,12 @@
 # compiler (AppleClang) no test leg uses, so no ctest ever reads their database. A step after each Package job's
 # Configure asks both of those questions of the build that ships, before the long build.
 #
-# That step REPORTS and gates no merge: no Package job is a required context (.agent/rules/packaging-and-release.md),
-# so a red one shows on the pull request, in the merge-group report and at release, while the required test legs gate
-# through the ctests. The Docker job configures too and is not asked, because its image goes to no registry.
+# That step gates no MERGE: no Package job is a required context (.agent/rules/packaging-and-release.md), so on a pull
+# request a red one shows beside the required test legs, which gate through the ctests. It DOES gate the package: the
+# step has no continue-on-error, so a refused or inconclusive run stops that Package job before its build -- on a
+# release tag too, where the release then waits on that job. That is deliberate: nothing ships from a build whose
+# flags were found wrong or could not be judged, and whoever meets a red Package job reads this step's output first.
+# The Docker job configures too and is not asked, because its image goes to no registry.
 #
 # A step is judged by its exit status, and a `cmake -P` check must not be: `message(WARNING)` exits 0, and a script
 # that never ran is a `CMake Error` too. So this reads the output of two runs -- the database as it is, and the same
