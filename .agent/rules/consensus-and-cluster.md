@@ -1,11 +1,13 @@
 # Consensus and cluster membership
 
 Rules for `src/FastCache/Consensus/` and `src/FastCache/Cluster/`: Raft itself,
-the LAN discovery beacon and its pre-shared-key handshake, the replicated cluster
+the LAN discovery beacon and its pre-shared-key handshake, the Raft peer wire and the
+handshake every connection on it proves the key with, the replicated cluster
 configuration, and the admin verbs that change it.
 
 Read this before touching `RaftNode`, `RaftLog`, `RaftDriver`, `RaftWire`,
-`RaftPeerTransport`/`RaftPeerServer`, `DiscoveryService`, `PeerDirectory`,
+`RaftPeerSession`, `RaftPeerTransport`/`RaftPeerServer`, `PskRaftPeerCredential`,
+`RaftClusterHarness`, `DiscoveryService`, `PeerDirectory`,
 `ClusterState`/`ClusterStateMachine` or `MembershipPolicy` — and before adding a
 verb to the cluster-admin surface.
 
@@ -116,7 +118,9 @@ Every rule below has already been a bug.
     programmatically now.
 - **One key, one signing construction, and the domain label is a required
   parameter rather than a constant each signer remembers to fold in.** The
-  pre-shared key MACs a discovery proof and a lease token, and each used to build
+  pre-shared key MACs a discovery proof and a lease token -- and, since #1308, every
+  Raft peer connection, under rows of its own (see *The Raft peer wire* below) -- and
+  the first two each used to build
   its message inline out of `HmacSha256` and `WireFields::Encode` -- which are
   primitives, not a construction. So what a message is *made of* was written
   twice, and the requirement that every message carry a domain label was true of
@@ -145,7 +149,8 @@ Every rule below has already been a bug.
     the one part of the message a caller does not supply.
   - **`VerifyFields` is the only comparison the seam exposes, and every verifier
     goes through it** -- `AuthenticateLeaseToken` for the lease,
-    `DiscoveryWire::VerifyProofTag` for the proof. That second one is the whole
+    `DiscoveryWire::VerifyProofTag` for the proof, `PskRaftPeerCredential::Verify` for
+    the Raft peer wire, whose session code compares no tag itself. That second one is the whole
     reason this bullet is worth reading: the seam landed with `DiscoveryService`
     still taking an expected tag and comparing it by hand, so the property was
     true of one of the two wires it named. It was constant-time, so nothing was
@@ -196,6 +201,190 @@ Every rule below has already been a bug.
   a fake behind it is an interface nobody has checked -- `OpenUdpSocket` returned
   null on Windows until it called `Detail::EnsureNetworkInitialised`, and no fake
   would ever have shown that.
+
+## The Raft peer wire
+
+Until #1308 a Raft connection authenticated nothing. `RaftPeerServer` delivered whatever
+decoded, and every message names its own sender (`candidateId`, `voterId`, `leaderId`,
+`followerId`) in a field nothing tied to the connection it arrived on -- so anything that
+could reach a `--listen-raft` port could vote, depose a leader or replicate a log under
+any member's name, and discovery's proof bought admission to a cluster whose wire then
+trusted every address. Every connection now proves the pre-shared key before a message is
+read, and every frame after that stays bound to the proof. Each rule below is what some
+plausible simpler design gets wrong.
+
+- **The shape, because every other rule refers to it.** Connections are one-way: the
+  transport only writes, the server only reads, and a reply travels on the other node's
+  own outbound connection. So authentication is a short two-way prologue on an otherwise
+  one-way stream (`Consensus/RaftPeerSession.hpp`):
+  1. the ACCEPTOR sends a `Challenge` carrying its nonce, before it has read a byte;
+  2. the DIALLER answers a `Proof`: its id, the id it believes it dialled, its own nonce,
+     and a MAC over both nonces and both ids;
+  3. the acceptor checks the MAC, then the claims, and answers a signed `Verdict`;
+  4. the dialler checks the verdict's MAC before it sends a single Raft frame, and every
+     frame after that carries a 32-byte tag over both nonces, a sequence number and the
+     frame.
+
+- **The acceptor goes first because its port is the surface anybody can reach.** It
+  MACs nothing until the other end has proved the key, so a stranger who connects learns
+  a nonce and nothing else. The dialler hands a tag only to an address it CHOSE to dial.
+  Reversing the order makes every listener a signing oracle for whatever connects to it.
+
+- **The MAC is checked before any claim in the proof is read, and then `OwnId` before
+  `WrongTarget`.** Discovery's and the lease's rule, applied a third time: a named
+  refusal decided before the MAC is an oracle that tells a stranger which ids exist here.
+  `OwnId` first because a dialler proving the key under THIS node's id is a second machine
+  holding its identity -- a copied `--cluster-dir` or a duplicated `--node-id` -- and that
+  is the finding whatever it dialled; checked the other way round, a cloned identity whose
+  address book is also stale reports as a stale address book.
+
+- **The verdict is SIGNED, and so are the refusals** (A1). A dialler refused `WrongTarget`
+  or `OwnId` by a close would see exactly what a wrong key produces, and report "your key
+  is wrong" to an operator whose key is right: **a confident wrong signal is worse than a
+  vague right one.** A verdict exists only once the proof's MAC verified, so signing a
+  refusal tells a stranger nothing. Three consequences:
+  - `dials_refused_wrong_target` and `dials_refused_own_id` are the dialler's own rows,
+    and the log line names the member that actually answered at that address;
+  - an `Accepted` verdict naming an acceptor other than the one dialled is refused as
+    `WrongTarget`, because a signature proves a key holder and not the member meant;
+  - `dials_ended_by_acceptor` now means ONLY a close after the proof with no signed verdict
+    -- a wrong key, or a refusal the acceptor could not sign. Its description says so, and
+    a change that sends a refusal unsigned moves a count into the wrong row.
+
+- **Both nonces are in every MAC, and a nonce must never repeat -- it need not be
+  unpredictable.** The acceptor's makes a proof unreplayable; the dialler's makes a
+  verdict fresh, so a recorded `Accepted` cannot answer a dialler talking to something
+  without the key. A proof harvested in advance is useless, because step 4 needs a live
+  verdict and frames are only produced live, so a correct PREDICTION buys nothing a relay
+  does not. That is why `SystemRandomSource` is good enough here and why
+  `Core/IRandomSource.hpp` says so. **Size and source are one seam** (A2): `Core/Nonce.hpp`
+  holds `NonceBytes` (32, `static_assert`ed at least that and a multiple of a draw) and
+  `DrawNonce`, and discovery's challenge draws through the same helper -- a second loop over
+  `UniformInRange` would be a second answer to how big a nonce is.
+
+- **The ids are bound; the endpoint deliberately is NOT**, although discovery's proof binds
+  a `(node, endpoint)` pair. Discovery produces an ADDRESS somebody records, so the address
+  is what must be proved. This produces "the frames on this connection come from `d`, for
+  `a`", and neither end can state the endpoint identically -- an acceptor binds the
+  wildcard, a dialler reaches it through `--raft-self` or NAT. A relay at another address
+  can only forward frames whose MACs it cannot make, which a network path already can.
+  Binding it would refuse the NAT'd member and stop nothing.
+
+- **A pre-shared key proves "holds the cluster key", never WHICH holder.** Any key holder
+  can claim any member id; nothing in a PSK can separate them. That is a non-goal stated
+  rather than a gap left silent, and the credential seam takes the claimed ids as inputs so
+  a per-node credential can replace the shared one without a wire change -- an identity in
+  the frame rather than an address is where #178 points. Confidentiality is the other
+  non-goal: log entries stay in cleartext, as they were.
+
+- **Every session frame is tagged, the sequence number never travels, and a verified
+  message naming another sender closes the connection.**
+  - The tag is `Frame`-domain MAC over `[nonceA, nonceD, seq, header, payload]`. `seq`
+    counts the connection's frames from zero on both ends, so a frame replayed, reordered
+    or dropped fails the NEXT tag; the nonces make a frame spliced in from another
+    connection fail; an on-path injection fails outright.
+  - Header and payload are two FIELDS, because the server reads them apart and MACs what
+    it read without first copying them together. The opener advances only on success.
+  - The tag sits OUTSIDE `payloadLength`, so `WireFrame` keeps its meaning and
+    `CompileCacheWire` is untouched.
+  - The proven dialler id is what `RaftNode` reads: `SenderOf(message)` naming anybody
+    else is `frames_refused_sender`, and only a key holder can produce one, so a rise is a
+    defect in a member rather than an attacker.
+  - An unknown message type is still stepped over -- after its tag verifies, and it
+    consumes a `seq`. Stepping over an UNVERIFIED frame would be a free injection channel.
+
+- **The version is a property of the CONNECTION, and it moved to 2 because the GRAMMAR
+  changed.** A handshake before the first message and a trailer after every frame are a
+  different grammar, which is what a version is for -- the opposite of #402, where only
+  discovery's MAC input changed and `DiscoveryWire::CurrentVersion` rightly stayed. Read
+  the two together: the question is always WHICH changed. `MinSupportedVersion` is 2 as
+  well, because a version 1 peer authenticates nothing and accepting one is the
+  per-connection fallback this ticket refuses; so a fleet upgrades its consensus members
+  together. A session frame whose version byte differs from the handshake's closes the
+  connection, because stepping over it would mean guessing whether a trailer follows.
+  `RaftWire.hpp`'s old "Why there is no handshake" section argued against a VERSION
+  negotiation per reconnect, soundly; it is now "Why there is a handshake", because
+  freshness is the one thing a frame cannot prove about itself.
+
+- **Pre-authentication reachability is a COLUMN of `MessageTable`.** Each row's
+  `FramePhase` is `Handshake(ceiling)` or `Session()`, and `FramePhase` has a deleted default
+  constructor, so a new row cannot omit the answer. The acceptor reads the header, refuses
+  a type other than `Proof` or a length over that row's ceiling BEFORE buffering the
+  payload, and every handshake ceiling is `static_assert`ed within `MaxHandshakePayload`
+  (4096). The `0xFC` wire's rule, one protocol over: an unbounded pre-auth read is a
+  memory-exhaustion hole reachable without the key.
+
+- **One handshake bound, at both ends** (`RaftWire::HandshakeBound`, 5 s), armed through
+  `ArmSocketDeadline`. Before it, a connection that sent nothing held one of the
+  listener's 64 slots for as long as its socket lived, so a stranger could fill them all
+  with no timeout at all; now it is closed and counted. The dialler abandons an acceptor
+  that never challenges -- which is what a build from before the handshake looks like --
+  and the ordinary backoff applies. A non-positive bound arms nothing, which is the seam
+  tests over an unturned reactor use, not a production setting.
+
+- **Whether the wire authenticates is a STARTUP decision, never a per-connection
+  fallback.** `StartupPolicyRejection` refuses `RunsConsensus && clusterKeyFile.empty()`
+  by name (`ConsensusNeedsClusterKeyRefusal`, which names both remedies: generate a key, or
+  `--enroll-from` a member), after the two `--discovery` rows so their more specific
+  sentences still answer first. `ConsensusTier::Start` returns the same constant for a
+  `NodeConfig` no argv produced, and reads the key through `ReadClusterKey` BEFORE anything
+  is bound or dialled. The server and transport take the credential, their own id and an
+  `IRandomSource` as REQUIRED constructor arguments -- no default and no null -- so an
+  unauthenticated peer connection cannot be constructed. "No key, so skip the check" is
+  the shape the worker's lease rule (#282) refuses one surface over: the port open, every
+  refusal counter at zero, and the fleet healthy-looking from both ends.
+
+- **Layering decides where the seam sits.** `Cluster/` already includes `Consensus/`
+  headers, so `Consensus/` cannot include `ClusterSigning.hpp`. The seam is
+  `Consensus::IRaftPeerCredential` (`Sign`/`Verify` over a `RaftPeerMac` purpose), and
+  `Cluster::PskRaftPeerCredential` implements it over `SignFields`/`VerifyFields`, holding
+  the key in `SecureByteBuffer`. Its purpose-to-domain map is an `EnumTable` with
+  `RowsInEnumeratorOrder` and a `static_assert` that no two purposes share a domain -- a
+  proof reflected back as a verdict, or a discovery tag reused here, fails because each is
+  in a different domain (`fastcache-raft-dial-v1`, `-verdict-v1`, `-frame-v1`). The session
+  code never compares a tag itself.
+
+- **One refusal, one row -- at BOTH ends, because one misconfigured machine shows on two.**
+  Eight acceptor rows (`no_handshake`, `handshake_timeout`, `proof`, `wrong_target`,
+  `own_id`, `frames_refused_tag`, `frames_refused_sender`, `full`) and six dialler rows
+  (`timeout`, `no_challenge`, `acceptor_proof`, `wrong_target`, `own_id`,
+  `ended_by_acceptor`), each a row of `Consensus/RaftPeerRefusals.hpp` beside its log
+  sentence. `full` was an uncounted close before. A peer that sent NOTHING and closed asked
+  nothing, so it is closed and NOT counted. Refusals before authentication are logged at
+  most once per 60 s and name only the source address -- anything on the network can
+  provoke them, and an id nobody proved is not worth printing; refusals after
+  authentication name the proven ids, unthrottled; a dialler's refusals are throttled per
+  peer.
+
+- **What became false was removed, not kept** (the project's position on superseded
+  code). `EnrollmentConfigured`'s key clause could no longer decide anything, so the
+  predicate is gone and `ServesEnrollment` asks `RunsConsensus`; `EnrollmentResponder`
+  still reads the key before `ClusterAdmit`, because a key file readable at boot can break
+  later. `NodeMembership`'s refusal to let a replicated `fleet-open` WIDEN a keyless node is
+  gone too: cluster state reaches only a consensus node, and every consensus node now holds
+  the key its lease check verifies with. The RELOAD guard in `ValidateNodeReloadable`
+  stays, because a node that runs no consensus can still be keyless and be opened by its
+  operator. Enrollment itself reaches nothing new: `--enroll-from` writes the key before
+  the joiner ever starts consensus.
+
+- **`RaftClusterHarness` authenticates EVERY message**, through the same session objects
+  the server and transport drive, and delivers what the receiver DECODED rather than what
+  was sent. Four decisions, each with a way to get it wrong:
+  - **One session per message**, not per link: the harness has no connections, and a
+    session that outlived a partition or a restart would be a property of the harness, not
+    of the wire. The loss, reorder and duplication adversary stays intact; `seq` is the
+    unit cases' subject.
+  - **Nonces come from a source of their own**, never `_network`, so every existing seed
+    sees a byte-identical delay and loss schedule. Drawing from `_network` would silently
+    change what every adversarial run tests.
+  - **The credential factory is REQUIRED at construction.** A defaulted one would let a
+    case forget the key and still read as a cluster that forms.
+  - **An intruder case is read beside the formation case, under the same neuter.**
+    `Intrude` puts a campaigning non-member holding another key, or none, on the network,
+    and `Join(who, credential)` admits a joiner holding the wrong one. With
+    `PskRaftPeerCredential::Verify` answering true those are the cases that must go red,
+    and the formation case must stay green -- a harness where both go red is measuring the
+    neuter, not the wire.
 
 ## A refusal code carries its own permanence, and there are THREE answers
 

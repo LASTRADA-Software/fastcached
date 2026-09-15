@@ -73,9 +73,13 @@ src/FastCache/
                 IRaftStorage (state, log and snapshot, the last being what makes
                 RaftLog::Compact's precondition satisfiable at all) /
                 IRaftTransport / IRaftStateMachine / IRaftMessageSink seams, plus
-                RaftWire (the 0xFA peer frame), RaftPeerTransport (outbound,
-                one coroutine per peer on the reactor), RaftPeerServer (inbound,
-                also on the reactor)
+                RaftWire (the 0xFA peer frame), RaftPeerSession (the handshake
+                and the per-frame tag every peer connection proves the cluster key
+                with — pure, so the server, the transport and RaftClusterHarness
+                drive the same objects — reached through IRaftPeerCredential,
+                because Cluster/ includes Consensus/ and the key's signing seam
+                lives in Cluster/), RaftPeerTransport (outbound, one coroutine per
+                peer on the reactor), RaftPeerServer (inbound, also on the reactor)
                 and RaftMembership (the member set as a log entry) — Raft,
                 split into a pure state machine and a coroutine driver that
                 carries out what it asks for. RaftNode reads no clock, opens no
@@ -99,6 +103,8 @@ src/FastCache/
                 of the sockets sharing a port is handed a unicast and the
                 challenge and the proof are both unicast),
                 PeerDirectory (who proved the key, and where),
+                PskRaftPeerCredential (the pre-shared key as the Raft peer wire
+                proves it, one SigningDomain per MAC purpose),
                 ClusterState + ClusterStateMachine — the cluster's replicated
                 configuration: who is a member, WHERE they answer, and the settings
                 every member must agree on — and MembershipPolicy, the pure decision

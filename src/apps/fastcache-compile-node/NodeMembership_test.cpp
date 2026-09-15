@@ -8,7 +8,7 @@
 
 using namespace FastCache;
 
-/// `NodeMembership` reports the keyless-widening refusal here; no case asserts on it.
+/// `NodeMembership` reports an unreadable `fleet-open` row here; no case asserts on it.
 namespace
 {
 FastCache::NullLogger membershipLog;
@@ -211,8 +211,7 @@ TEST_CASE("A node with no cluster row keeps its own flag, and an unset row is no
 
 TEST_CASE("The cluster may CLOSE a node its flag opened", "[node][membership]")
 {
-    // Narrowing is always safe and always applies, which is what makes the widening
-    // guard below an asymmetry rather than a refusal to read the row at all.
+    // Narrowing is always safe and always applies.
     NodeConfig cfg;
     cfg.nodeId = "node-a";
     cfg.fleetOpen = true;
@@ -222,45 +221,6 @@ TEST_CASE("The cluster may CLOSE a node its flag opened", "[node][membership]")
 
     membership.PublishCluster(OpenSetTo("0"));
     CHECK(membership.Oracle().Classify("10.9.9.9") == Membership::Outsider);
-}
-
-TEST_CASE("A keyless node refuses to be WIDENED by the cluster, and still narrows", "[node][membership]")
-{
-    // #282 through a door the reload guard cannot watch. `ValidateNodeReloadable`
-    // refuses this transition when an OPERATOR acts on the machine; a replicated row
-    // does the same with no action on this node at all, so that guard's reasoning
-    // applies with more force while none of its code runs.
-    //
-    // The node stays CLOSED while the cluster says open. That divergence is the
-    // point: it fails closed, and it is reported.
-    NodeConfig cfg;
-    cfg.nodeId = "node-a";
-    cfg.fleetMembers = { "10.0.0.1:6676" };
-    REQUIRE(cfg.clusterKeyFile.empty());
-    REQUIRE_FALSE(cfg.fleetOpen);
-
-    NodeMembership membership { cfg, membershipLog };
-    membership.PublishCluster(OpenSetTo("1"));
-
-    CHECK(membership.Oracle().Classify("10.9.9.9") == Membership::Outsider);
-    CHECK(membership.Oracle().Classify("10.0.0.1") == Membership::Member);
-
-    // Asked as a TRANSITION, so a keyless node its operator already opened is
-    // running happily today and stays open -- refusing that would break the nodes
-    // this guard exists to protect.
-    NodeConfig opened;
-    opened.nodeId = "node-b";
-    opened.fleetOpen = true;
-    REQUIRE(opened.clusterKeyFile.empty());
-
-    NodeMembership already { opened, membershipLog };
-    already.PublishCluster(OpenSetTo("1"));
-    CHECK(already.Oracle().Classify("10.9.9.9") == Membership::Member);
-
-    // And narrowing still reaches a keyless node: only the widening is refused.
-    NodeMembership shut { opened, membershipLog };
-    shut.PublishCluster(OpenSetTo("0"));
-    CHECK(shut.Oracle().Classify("10.9.9.9") == Membership::Outsider);
 }
 
 TEST_CASE("A row value this build cannot read falls back to the flag", "[node][membership]")

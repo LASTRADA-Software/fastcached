@@ -2779,24 +2779,26 @@ never heard of can ask it for the pre-shared key that makes it a member. Everyth
 below is a property that shipped WRONG in the first draft of that feature and was
 found by review rather than by a test, so each one is a rule with a bug behind it.
 
-**A window is openable only where a key can actually be handed over.** That is
-consensus AND a named `--cluster-key-file`, and the second clause is the one with the
-history. A keyless consensus node is legal — the startup table refuses one only where
-the compile port faces the network and admits remote peers — and on such a node the
-window was openable, listable and APPROVABLE while it could never admit anybody,
-because the hand-over reads a key file that is not configured. The predicate is
-`EnrollmentConfigured` in `NodeConfig`, asked of the CONFIGURATION alone so that it is
-testable at all: whether a scheduler tier was built is a runtime fact `main.cpp` holds
-and ANDs at the call site, and `main.cpp` is the one translation unit no test links.
+**A window is openable only where a key can actually be handed over**, and since #1308
+that is every node that runs consensus. It took a second clause until then — consensus
+AND a named `--cluster-key-file`, the predicate `EnrollmentConfigured` — because a keyless
+consensus node was legal, and on one the window was openable, listable and APPROVABLE
+while it could never admit anybody: the hand-over reads a key file that was not
+configured. Every Raft peer connection now proves the key, so consensus without one is a
+startup refusal, the clause could only ever read true where it was asked, and the
+predicate was DELETED rather than kept answering a question nothing can reach.
+`ServesEnrollment` in `main.cpp` asks `RunsConsensus` and whether a scheduler tier was
+built — the second a runtime fact only that translation unit holds.
 
 **And the approval READS the key before it admits anybody**, because `ClusterAdmit` is
 the irreversible half. It used to consult `_key.ClusterKey()` only on the joiner's next
 poll, so a node whose key file was NAMED and unreadable answered the operator `Ok`,
 grew the replicated configuration — and therefore the QUORUM — by a machine that then
 received `StorageWriteFailed` forever. A phantom member counted towards every future
-election, from one command that reported success. The two guards answer different
-questions and both stay: a configuration cannot see a file it cannot read, and a
-startup predicate cannot see a file that breaks later. What a test must assert is that
+election, from one command that reported success. This guard OUTLIVED the configuration
+one, because it answers what no configuration can: the startup table sees that a key file
+is named and `ConsensusTier` that it read at boot, and neither sees a file that breaks
+later. What a test must assert is that
 consensus was offered NOTHING — a refusal alone is green under a build that refused the
 operator *after* telling the cluster, which is the whole defect.
 

@@ -551,41 +551,63 @@ TEST_CASE("NodeConfig: several --scheduler values are kept in order, and a regis
     CHECK_FALSE(NodeInstallRejection(cfg).has_value());
 }
 
-TEST_CASE("NodeConfig: a node with no cluster key file serves no enrollment window", "[node][config]")
+TEST_CASE("NodeConfig: a node running consensus without a cluster key file is refused at startup",
+          "[node][config][consensus][policy]")
 {
-    // **The keyless-node rule, and it is here because this is where it can be tested.**
-    // It used to live only as a conjunction inside `WorkerBody`, in the one translation
-    // unit no test links, so nothing could assert it at all.
-    //
-    // A keyless consensus node is LEGAL -- the startup table refuses one only where the
-    // compile port faces the network and admits remote peers -- and on such a node the
-    // enrollment window was openable, listable and APPROVABLE while it could never
-    // admit anybody, because the hand-over reads a key file that is not configured.
-    // Worse than a refusal: an approval commits `ClusterAdmit` before the key is
-    // consulted, so it grew the replicated configuration, and therefore the QUORUM, by
-    // a machine that then received `StorageWriteFailed` and never became anything.
-    auto const configured = ParseNodeArgv({ "--scheduler=s:1", "--listen-raft=7100", "--cluster-key-file=/etc/fc/key" });
-    REQUIRE(configured.has_value());
-    CHECK(EnrollmentConfigured(*configured));
+    // #1308. Every connection between members proves the cluster's key before a message
+    // is read, so a keyless consensus node is not a degraded member: it could neither be
+    // heard nor hear anybody. It used to be LEGAL, and the enrollment window on one was
+    // approvable while it had no key to hand over. Refused HERE, where an operator is
+    // watching and an install consults it, and never answered per connection.
+    auto clustered = Installable();
+    clustered.nodeId = "n1";
+    clustered.raftListen = "6680";
+    clustered.clusterDir = std::filesystem::path { "/var/lib/fastcache-node" };
+    clustered.raftPeers = { Peer("n1=10.0.0.1:6680"), Peer("n2=10.0.0.2:6680") };
+    REQUIRE(clustered.clusterKeyFile.empty());
 
-    // The clause with the history. Consensus is on, so `RunsConsensus` says yes and the
-    // OLD predicate said yes with it — which is the defect, not a near miss.
-    auto const keyless = ParseNodeArgv({ "--scheduler=s:1", "--listen-raft=7100" });
-    REQUIRE(keyless.has_value());
-    REQUIRE(RunsConsensus(*keyless));
-    CHECK_FALSE(EnrollmentConfigured(*keyless));
+    // By name, and the name matters: the other key rows say `--cluster-key-file` too, so
+    // "refused and mentions the flag" passes whichever row answers.
+    auto const refusal = StartupPolicyRejection(clustered);
+    REQUIRE(refusal.has_value());
+    CHECK(Unwrap(refusal) == ConsensusNeedsClusterKeyRefusal);
 
-    // And the other clause still bites, or "require a key file" would have been
-    // implemented as "require only a key file" and every keyed worker in the fleet
-    // would offer to admit machines to a cluster it does not belong to.
-    auto const clusterless = ParseNodeArgv({ "--scheduler=s:1", "--cluster-key-file=/etc/fc/key" });
-    REQUIRE(clusterless.has_value());
-    REQUIRE_FALSE(RunsConsensus(*clusterless));
-    CHECK_FALSE(EnrollmentConfigured(*clusterless));
+    auto const install = NodeInstallRejection(clustered);
+    REQUIRE(install.has_value());
+    CHECK(Unwrap(install) == ConsensusNeedsClusterKeyRefusal);
 
-    auto const neither = ParseNodeArgv({ "--scheduler=s:1" });
-    REQUIRE(neither.has_value());
-    CHECK_FALSE(EnrollmentConfigured(*neither));
+    // The remedy is in the refusal, because it is the only part most operators read: how
+    // to make a key, and how to be handed one.
+    CHECK(ConsensusNeedsClusterKeyRefusal.starts_with("--listen-raft"));
+    CHECK(ConsensusNeedsClusterKeyRefusal.contains("--cluster-key-file"));
+    CHECK(ConsensusNeedsClusterKeyRefusal.contains("head -c 32 /dev/urandom | base64"));
+    CHECK(ConsensusNeedsClusterKeyRefusal.contains("--enroll-from"));
+
+    // A joiner is asked the same: it proves the key to the members it dials, or it is
+    // refused by every one of them.
+    auto joiner = clustered;
+    joiner.nodeId = "n4";
+    joiner.raftJoin = true;
+    joiner.raftPeers = { Peer("n4=10.0.0.4:6680"), Peer("n1=10.0.0.1:6680") };
+    CHECK(Unwrap(StartupPolicyRejection(joiner)) == ConsensusNeedsClusterKeyRefusal);
+
+    // The control: the same node holding a key starts. A rule that refused consensus
+    // outright would pass every assertion above.
+    auto keyed = clustered;
+    keyed.clusterKeyFile = "cluster.key";
+    CHECK_FALSE(StartupPolicyRejection(keyed).has_value());
+
+    // And a node running no consensus is not asked for a key by THIS rule: a worker on
+    // loopback serving its own machine is still the ordinary keyless install.
+    CHECK_FALSE(StartupPolicyRejection(Installable()).has_value());
+
+    // `--discovery` without a key keeps its own, more specific sentence: first match
+    // wins, and this row sits after it.
+    auto discovering = clustered;
+    discovering.discoveryAddress = "255.255.255.255:6681";
+    auto const discoveryRefusal = StartupPolicyRejection(discovering);
+    REQUIRE(discoveryRefusal.has_value());
+    CHECK(Unwrap(discoveryRefusal).starts_with("--discovery needs --cluster-key-file"));
 }
 
 TEST_CASE("NodeConfig: a later enrollment verb drops the earlier one's subject", "[node][config]")
@@ -4148,19 +4170,25 @@ TEST_CASE("An operator who edits --listen-raft is answered by the right rule", "
     // Every section therefore asserts WHICH row answered and that the OTHER one did
     // not: the messages here share the words "peers dial", so a case matching on that
     // would pass for either and two refusals would be one passing test.
+    //
+    // A file that runs consensus names a key, because consensus needs one (#1308) and
+    // that row would otherwise answer every section. Named and never read: the rules ask
+    // about the path.
     Testing::ScratchDirectory const scratch { "node-listen-raft-reload" };
+    auto const keyLine = std::format("cluster_key_file: {}\n", (scratch.Path() / "cluster.key").string());
 
     SECTION("a port change on a node that already runs consensus is refused as immutable")
     {
         // `raft_self` is what names this node, so consensus is legitimately on at both
         // ends and the only difference between the two files is the port.
-        auto const path = WriteRunnableNodeConfigFile(scratch.Path(), "listen_raft: 0.0.0.0:7000\nraft_self: 10.0.0.7\n");
+        auto const path =
+            WriteRunnableNodeConfigFile(scratch.Path(), keyLine + "listen_raft: 0.0.0.0:7000\nraft_self: 10.0.0.7\n");
 
         auto const previous = ReparseNodeConfig(path);
         REQUIRE(previous.has_value());
 
         auto reloader = MakeNodeReloader(previous.value(), path);
-        (void) WriteRunnableNodeConfigFile(scratch.Path(), "listen_raft: 0.0.0.0:7001\nraft_self: 10.0.0.7\n");
+        (void) WriteRunnableNodeConfigFile(scratch.Path(), keyLine + "listen_raft: 0.0.0.0:7001\nraft_self: 10.0.0.7\n");
 
         auto const reloaded = reloader.Reload();
         REQUIRE_FALSE(reloaded.has_value());
@@ -4193,14 +4221,15 @@ TEST_CASE("An operator who edits --listen-raft is answered by the right rule", "
 
     SECTION("turning consensus OFF is refused for stranding --raft-self, not for being immutable")
     {
-        auto const path = WriteRunnableNodeConfigFile(scratch.Path(), "listen_raft: 0.0.0.0:7000\nraft_self: 10.0.0.7\n");
+        auto const path =
+            WriteRunnableNodeConfigFile(scratch.Path(), keyLine + "listen_raft: 0.0.0.0:7000\nraft_self: 10.0.0.7\n");
 
         auto const previous = ReparseNodeConfig(path);
         REQUIRE(previous.has_value());
         REQUIRE(RunsConsensus(previous.value()));
 
         auto reloader = MakeNodeReloader(previous.value(), path);
-        (void) WriteRunnableNodeConfigFile(scratch.Path(), "raft_self: 10.0.0.7\n");
+        (void) WriteRunnableNodeConfigFile(scratch.Path(), keyLine + "raft_self: 10.0.0.7\n");
 
         auto const reloaded = reloader.Reload();
         REQUIRE_FALSE(reloaded.has_value());
@@ -4391,6 +4420,9 @@ TEST_CASE("A clustered scheduler needs no --fleet-member", "[node-config]")
         // `--raft-peer`, because that is the spelling a node whose identity was
         // MINTED has (#1024).
         cfg.raftSelf = "scheduler-01.internal";
+        // And the key, for the same reason: consensus needs one (#1308), and that
+        // refusal would otherwise answer in the fleet-member rule's place.
+        cfg.clusterKeyFile = "cluster.key";
         auto const refusal = StartupPolicyRejection(cfg);
         INFO("refusal: " << refusal.value_or("<none>"));
         CHECK_FALSE(refusal.has_value());

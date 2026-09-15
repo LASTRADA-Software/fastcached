@@ -1256,6 +1256,35 @@ class IMetricsSink
         /// A FLEET-TEXT refused because the listener's in-flight byte budget was full. (#1391)
         FleetTextRequestsRefusedEndpointBusy,
 
+        /// A Raft peer connection whose first frame was not a proof this build can read. (#1308)
+        RaftPeerConnectionsRefusedNoHandshake,
+        /// A Raft peer connection that did not prove the key within the handshake bound. (#1308)
+        RaftPeerConnectionsRefusedHandshakeTimeout,
+        /// A Raft peer connection whose proof did not verify: no key, or a different one. (#1308)
+        RaftPeerConnectionsRefusedProof,
+        /// A Raft dialler that proved the key but dialled another member. (#1308)
+        RaftPeerConnectionsRefusedWrongTarget,
+        /// A Raft dialler that proved the key under this node's own id. (#1308)
+        RaftPeerConnectionsRefusedOwnId,
+        /// A Raft session frame whose tag did not verify, which ends the connection. (#1308)
+        RaftPeerFramesRefusedTag,
+        /// A verified Raft message naming a sender other than the connection's proven dialler. (#1308)
+        RaftPeerFramesRefusedSender,
+        /// A Raft peer connection closed because the listener already serves its maximum. (#1308)
+        RaftPeerConnectionsRefusedFull,
+        /// A Raft dial whose acceptor did not challenge or answer within the handshake bound. (#1308)
+        RaftPeerDialsRefusedTimeout,
+        /// A Raft dial whose acceptor opened with something other than a challenge this build reads. (#1308)
+        RaftPeerDialsRefusedNoChallenge,
+        /// A Raft dial whose acceptor's verdict did not verify: it does not hold this key. (#1308)
+        RaftPeerDialsRefusedAcceptorProof,
+        /// A Raft dial answered, signed, by a member other than the one dialled. (#1308)
+        RaftPeerDialsRefusedWrongTarget,
+        /// A Raft dial refused, signed, because the acceptor holds this node's own id. (#1308)
+        RaftPeerDialsRefusedOwnId,
+        /// A Raft dial the acceptor closed after this node's proof, with no signed verdict. (#1308)
+        RaftPeerDialsEndedByAcceptor,
+
         Last,
     };
 

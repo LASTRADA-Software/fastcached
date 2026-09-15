@@ -34,6 +34,9 @@ namespace
     cfg.raftListen = "6680";
     cfg.raftSelf = "10.0.0.7";
     cfg.clusterDir = dir;
+    // Named, never read: consensus needs the key (#1308), and the rules here are asked
+    // of the path.
+    cfg.clusterKeyFile = dir / "cluster.key";
     return cfg;
 }
 
@@ -297,6 +300,7 @@ TEST_CASE("A consensus node that names itself neither way is refused", "[node][i
     NodeConfig neither;
     neither.schedulers = { "127.0.0.1:6674" };
     neither.raftListen = "6680";
+    neither.clusterKeyFile = "cluster.key";
     auto const refusal = StartupPolicyRejection(neither);
     REQUIRE(refusal.has_value());
     CHECK(Unwrap(refusal) == ConsensusNamesNoSelfPeerRefusal);
@@ -394,6 +398,7 @@ TEST_CASE("A --raft-self that CONTRADICTS a --raft-peer for this node is refused
     both.nodeId = "n1";
     both.raftPeers = { Unwrap(Cluster::ParseMemberSpec("n1=10.0.0.4:6680")) };
     both.raftSelf = "10.0.0.7";
+    both.clusterKeyFile = "cluster.key";
 
     auto const refusal = StartupPolicyRejection(both);
     REQUIRE(refusal.has_value());

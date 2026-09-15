@@ -241,7 +241,9 @@ registers a toolchain no client can match. One machine leading a fleet of many i
 the only shape this is worth doing for.
 
 Once several nodes run, exactly one of them must schedule at a time, which is
-what consensus decides — `--node-id`, `--listen-raft` and `--raft-peer`. See
+what consensus decides — `--node-id`, `--listen-raft` and `--raft-peer`, with the
+same `--cluster-key-file` on every member, because each connection between them
+proves it. See
 [a cluster, and who leads it](../tools/fastcache-compile-node.md#a-cluster-and-who-leads-it).
 
 #### Who may use the fleet
@@ -870,10 +872,11 @@ against the rest of the fleet.
 
 !!! warning "Set `--cluster-key-file` on every node, and set it first"
 
-    A node that another machine could dial — anything with `--fleet-member`,
-    `--fleet-open` or consensus, on a bind that is not loopback — **will not start**
-    without it. That refusal is deliberate and it is a startup one, not a
-    per-request fallback: a worker that quietly skipped the check would serve
+    A node that another machine could dial — anything with `--fleet-member` or
+    `--fleet-open` on a bind that is not loopback — **will not start** without it,
+    and neither will any node running consensus, whatever it binds: every connection
+    between members proves the key before a message is read. Both refusals are
+    deliberate and both are startup ones, not per-request fallbacks: a worker that quietly skipped the check would serve
     whoever reached its port while every refusal counter read zero, which is a fleet
     that looks healthy from both ends.
 
@@ -883,12 +886,16 @@ against the rest of the fleet.
 
     **Provision the key everywhere before rolling the binary.** A worker that holds
     the key and a scheduler that does not is a worker refusing every grant that
-    scheduler hands out.
+    scheduler hands out. And upgrade a cluster's consensus members **together**: a
+    build with the authenticated consensus wire and one from before it cannot talk to
+    each other at all.
 
 --8<-- "node-credential-gap.md"
 
-Beyond the lease, the fleet's own traffic is unauthenticated, so treat its boundary
-as **network reachability plus membership** and size the network accordingly.
+Beyond the lease and consensus — whose every connection proves the cluster key, see
+[Raft peer authentication](../operations/cluster-communication.md#raft-peer-authentication)
+— the fleet's own traffic is unauthenticated, so treat its boundary as **network
+reachability plus membership** and size the network accordingly.
 
 So: keep `--serve-scheduler` off any network you would not run a compiler for,
 and put mTLS in front of every port for anything beyond a trusted build network.

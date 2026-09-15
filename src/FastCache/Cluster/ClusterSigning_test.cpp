@@ -45,6 +45,9 @@ TEST_CASE("Each domain's label is the byte string on the wire", "[cluster][signi
     // so it would read as a guarantee while asserting nothing.
     CHECK(DescribeSigningDomain(SigningDomain::DiscoveryProof).label == "fastcache-discovery-v1");
     CHECK(DescribeSigningDomain(SigningDomain::LeaseToken).label == "fastcache-lease-v1");
+    CHECK(DescribeSigningDomain(SigningDomain::RaftPeerDialler).label == "fastcache-raft-dial-v1");
+    CHECK(DescribeSigningDomain(SigningDomain::RaftPeerVerdict).label == "fastcache-raft-verdict-v1");
+    CHECK(DescribeSigningDomain(SigningDomain::RaftPeerFrame).label == "fastcache-raft-frame-v1");
 }
 
 TEST_CASE("One field list signs differently in each domain", "[cluster][signing]")
@@ -69,6 +72,17 @@ TEST_CASE("One field list signs differently in each domain", "[cluster][signing]
     // indistinguishable from nothing working at all.
     CHECK(VerifyFields(key, SigningDomain::DiscoveryProof, fields, asProof));
     CHECK(VerifyFields(key, SigningDomain::LeaseToken, fields, asLease));
+
+    // And every pair of domains, not only the first two: the Raft peer wire added three
+    // (#1308), two of which -- a dialler's proof and an acceptor's verdict -- are made
+    // by the two ends of ONE handshake, which is exactly where a reflected tag would be
+    // tried.
+    for (auto const& signer: SigningDomainTable)
+        for (auto const& verifier: SigningDomainTable)
+        {
+            auto const tag = SignFields(key, signer.domain, fields);
+            CHECK(VerifyFields(key, verifier.domain, fields, tag) == (signer.domain == verifier.domain));
+        }
 }
 
 TEST_CASE("An empty field list is still a signed statement of its domain", "[cluster][signing]")

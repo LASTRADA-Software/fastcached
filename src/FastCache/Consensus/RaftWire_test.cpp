@@ -16,6 +16,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -98,7 +99,10 @@ TEST_CASE("Every message type round-trips, field for field", "[consensus][raft][
 
     // A ninth row added without an exemplar fails here rather than going quietly
     // untested, which is how four of these came to be uncovered in the first place.
-    REQUIRE(exemplars.size() == RaftWire::MessageTable.size());
+    // The handshake rows are not messages and have their own round trip below.
+    auto const sessionRows = std::ranges::count_if(
+        RaftWire::MessageTable, [](RaftWire::MessageDescriptor const& row) { return !row.phase.IsHandshake(); });
+    REQUIRE(std::cmp_equal(exemplars.size(), sessionRows));
 
     auto covered = std::vector<std::uint8_t> {};
     for (auto const& sent: exemplars)
@@ -119,7 +123,8 @@ TEST_CASE("Every message type round-trips, field for field", "[consensus][raft][
     // duplicating a type -- the natural slip when one is copied from the next --
     // cannot stand in for the row it left out.
     for (auto const& row: RaftWire::MessageTable)
-        CHECK(std::ranges::count(covered, static_cast<std::uint8_t>(row.type)) == 1);
+        if (!row.phase.IsHandshake())
+            CHECK(std::ranges::count(covered, static_cast<std::uint8_t>(row.type)) == 1);
 }
 
 TEST_CASE("An AppendEntries carries its entries verbatim", "[consensus][raft][wire]")
@@ -488,4 +493,227 @@ TEST_CASE("A snapshot with no members and no state round-trips", "[consensus][ra
     auto const got = RoundTrip(sent);
     REQUIRE(got.has_value());
     CHECK(*got == sent);
+}
+
+namespace
+{
+
+/// A nonce whose every byte differs, so a mis-offset shows.
+/// @param base The first byte.
+/// @return The nonce.
+[[nodiscard]] Nonce DistinctNonce(unsigned base)
+{
+    Nonce nonce {};
+    for (std::size_t index = 0; auto& byte: nonce)
+        byte = static_cast<std::byte>(base + index++);
+    return nonce;
+}
+
+/// A tag whose every byte differs from any nonce `DistinctNonce` makes below 0x80.
+/// @return The tag.
+[[nodiscard]] Sha256::Digest DistinctTag()
+{
+    Sha256::Digest tag {};
+    for (std::size_t index = 0; auto& byte: tag)
+        byte = static_cast<std::byte>(0x80 + index++);
+    return tag;
+}
+
+/// Split a handshake frame into its header and payload.
+/// @param frame The frame.
+/// @return The header and a view of the payload.
+[[nodiscard]] std::pair<RaftWire::FrameHeader, std::span<std::byte const>> Split(std::vector<std::byte> const& frame)
+{
+    auto const header = RaftWire::DecodeHeader(frame);
+    REQUIRE(header.has_value());
+    auto const payload = std::span<std::byte const> { frame }.subspan(RaftWire::HeaderSize);
+    REQUIRE(payload.size() == Unwrap(header).payloadLength);
+    return { Unwrap(header), payload };
+}
+
+} // namespace
+
+TEST_CASE("Every handshake frame round-trips, field for field", "[consensus][raft][wire][handshake]")
+{
+    // Distinct values in every field, for the exemplar table's reason above: two fields
+    // sharing a value would let a transposition through, and a proof's two ids and its
+    // nonce and tag are exactly the fields a copied arm transposes.
+    RaftWire::ChallengeFrame const challenge { .nonce = DistinctNonce(0x10) };
+    RaftWire::ProofFrame const proof {
+        .dialler = "the-dialler", .target = "the-target", .nonce = DistinctNonce(0x40), .tag = DistinctTag()
+    };
+    RaftWire::VerdictFrame const verdict { .verdict = RaftWire::HandshakeVerdict::OwnId,
+                                           .acceptor = "the-acceptor",
+                                           .tag = DistinctTag() };
+
+    auto const challengeFrame = RaftWire::EncodeChallenge(challenge);
+    auto const proofFrame = RaftWire::EncodeProof(proof);
+    auto const verdictFrame = RaftWire::EncodeVerdict(verdict);
+
+    auto const [challengeHeader, challengePayload] = Split(challengeFrame);
+    auto const [proofHeader, proofPayload] = Split(proofFrame);
+    auto const [verdictHeader, verdictPayload] = Split(verdictFrame);
+
+    CHECK(challengeHeader.kindRaw == static_cast<std::uint8_t>(RaftWire::MessageType::Challenge));
+    CHECK(proofHeader.kindRaw == static_cast<std::uint8_t>(RaftWire::MessageType::Proof));
+    CHECK(verdictHeader.kindRaw == static_cast<std::uint8_t>(RaftWire::MessageType::Verdict));
+
+    CHECK(RaftWire::DecodeChallenge(challengeHeader, challengePayload) == challenge);
+    CHECK(RaftWire::DecodeProof(proofHeader, proofPayload) == proof);
+    CHECK(RaftWire::DecodeVerdict(verdictHeader, verdictPayload) == verdict);
+}
+
+TEST_CASE("Every verdict travels as its own byte", "[consensus][raft][wire][handshake]")
+{
+    for (auto const decided: { RaftWire::HandshakeVerdict::WrongTarget,
+                               RaftWire::HandshakeVerdict::OwnId,
+                               RaftWire::HandshakeVerdict::Accepted })
+    {
+        RaftWire::VerdictFrame const verdict { .verdict = decided, .acceptor = "a", .tag = DistinctTag() };
+        auto const frame = RaftWire::EncodeVerdict(verdict);
+        auto const [header, payload] = Split(frame);
+        CHECK(RaftWire::DecodeVerdict(header, payload) == verdict);
+    }
+}
+
+TEST_CASE("A handshake frame this reader did not ask for is refused", "[consensus][raft][wire][handshake]")
+{
+    auto const proofFrame =
+        RaftWire::EncodeProof({ .dialler = "d", .target = "a", .nonce = DistinctNonce(0x01), .tag = DistinctTag() });
+    auto const [proofHeader, proofPayload] = Split(proofFrame);
+
+    SECTION("another handshake type in its place")
+    {
+        auto const decoded = RaftWire::DecodeChallenge(proofHeader, proofPayload);
+        REQUIRE_FALSE(decoded.has_value());
+        CHECK(decoded.error().code == ConsensusErrorCode::MalformedFrame);
+    }
+
+    SECTION("a Raft message in its place, which is what a build from before the handshake sends first")
+    {
+        auto const message = RaftWire::Encode(RaftMessage {
+            RequestVoteResponse { .term = Term { .value = 1 }, .decision = VoteDecision::Granted, .voterId = "n1" } });
+        auto const header = RaftWire::DecodeHeader(message);
+        REQUIRE(header.has_value());
+        auto const decoded =
+            RaftWire::DecodeProof(Unwrap(header), std::span<std::byte const> { message }.subspan(RaftWire::HeaderSize));
+        REQUIRE_FALSE(decoded.has_value());
+        CHECK(decoded.error().code == ConsensusErrorCode::MalformedFrame);
+    }
+
+    SECTION("a handshake frame where a Raft message belongs")
+    {
+        auto const decoded = RaftWire::DecodeMessage(proofHeader, proofPayload);
+        REQUIRE_FALSE(decoded.has_value());
+        CHECK(decoded.error().code == ConsensusErrorCode::MalformedFrame);
+    }
+}
+
+TEST_CASE("A handshake at the version before the handshake existed is refused", "[consensus][raft][wire][handshake]")
+{
+    // Version 1 authenticated nothing. A build that still accepted it would be the
+    // per-connection fallback #1308 exists to refuse, so the floor moved with the grammar.
+    CHECK_FALSE(RaftWire::IsSupported(1));
+    CHECK(RaftWire::IsSupported(RaftWire::CurrentVersion));
+
+    auto const frame = RaftWire::EncodeProof(
+        { .dialler = "d", .target = "a", .nonce = DistinctNonce(0x01), .tag = DistinctTag() }, /*version=*/1);
+    auto const [header, payload] = Split(frame);
+    auto const decoded = RaftWire::DecodeProof(header, payload);
+    REQUIRE_FALSE(decoded.has_value());
+    CHECK(decoded.error().code == ConsensusErrorCode::UnsupportedVersion);
+}
+
+TEST_CASE("A handshake frame is refused before any field is trusted", "[consensus][raft][wire][handshake]")
+{
+    auto const refusedProof = [](RaftWire::ProofFrame const& proof) {
+        auto const frame = RaftWire::EncodeProof(proof);
+        auto const [header, payload] = Split(frame);
+        return !RaftWire::DecodeProof(header, payload).has_value();
+    };
+    auto const good =
+        RaftWire::ProofFrame { .dialler = "d", .target = "a", .nonce = DistinctNonce(0x01), .tag = DistinctTag() };
+    CHECK_FALSE(refusedProof(good));
+
+    SECTION("an empty id")
+    {
+        auto proof = good;
+        proof.dialler.clear();
+        CHECK(refusedProof(proof));
+    }
+
+    SECTION("an id that is not text")
+    {
+        auto proof = good;
+        proof.target = std::string { "\xC3\x28" };
+        CHECK(refusedProof(proof));
+    }
+
+    SECTION("an id at the bound is carried, and one past it is not")
+    {
+        auto proof = good;
+        proof.dialler = std::string(RaftWire::MaxHandshakeIdBytes, 'x');
+        CHECK_FALSE(refusedProof(proof));
+        proof.dialler.push_back('x');
+        CHECK(refusedProof(proof));
+    }
+
+    SECTION("a nonce or a tag of the wrong width")
+    {
+        auto const frame = RaftWire::Detail::Frame<RaftWire::MessageType::Proof>(
+            RaftWire::CurrentVersion,
+            std::array { WireFields::AsBytes(std::string_view { "d" }),
+                         WireFields::AsBytes(std::string_view { "a" }),
+                         WireFields::AsBytes(std::string_view { "short" }),
+                         std::span<std::byte const> { DistinctTag() } });
+        auto const [header, payload] = Split(frame);
+        CHECK_FALSE(RaftWire::DecodeProof(header, payload).has_value());
+    }
+
+    SECTION("a verdict byte naming no verdict")
+    {
+        auto frame = RaftWire::EncodeVerdict(
+            { .verdict = RaftWire::HandshakeVerdict::Accepted, .acceptor = "a", .tag = DistinctTag() });
+        // The verdict is the first field: header, then a four-byte length, then the byte.
+        frame[RaftWire::HeaderSize + WireFields::FieldPrefixSize] =
+            std::byte { static_cast<std::uint8_t>(RaftWire::HandshakeVerdict::Last) };
+        auto const [header, payload] = Split(frame);
+        CHECK_FALSE(RaftWire::DecodeVerdict(header, payload).has_value());
+    }
+}
+
+TEST_CASE("A handshake payload over its row's ceiling is refused", "[consensus][raft][wire][handshake]")
+{
+    // The reader refuses a declared length over the ceiling before it buffers anything;
+    // this is the decoder refusing one that somehow arrived anyway, so the bound does not
+    // depend on every reader remembering to ask first.
+    auto const* const row = RaftWire::FindMessage(static_cast<std::uint8_t>(RaftWire::MessageType::Challenge));
+    REQUIRE(row != nullptr);
+    REQUIRE(row->phase.IsHandshake());
+
+    std::vector<std::byte> const oversized(row->phase.Ceiling() + 1);
+    RaftWire::FrameHeader const header { .version = RaftWire::CurrentVersion,
+                                         .kindRaw = static_cast<std::uint8_t>(RaftWire::MessageType::Challenge),
+                                         .payloadLength = static_cast<std::uint32_t>(oversized.size()) };
+    auto const decoded = RaftWire::DecodeChallenge(header, oversized);
+    REQUIRE_FALSE(decoded.has_value());
+    CHECK(decoded.error().context.contains("ceiling"));
+}
+
+TEST_CASE("Every handshake row has a ceiling and every Raft message has none", "[consensus][raft][wire][handshake]")
+{
+    // The phase of each row, stated: the handshake is exactly these three, and each
+    // declares the payload a stranger may make this node buffer for it.
+    for (auto const& row: RaftWire::MessageTable)
+    {
+        CAPTURE(row.name);
+        auto const handshake = row.type == RaftWire::MessageType::Challenge || row.type == RaftWire::MessageType::Proof
+                               || row.type == RaftWire::MessageType::Verdict;
+        CHECK(row.phase.IsHandshake() == handshake);
+        if (handshake)
+        {
+            CHECK(row.phase.Ceiling() > 0);
+            CHECK(row.phase.Ceiling() <= RaftWire::MaxHandshakePayload);
+        }
+    }
 }

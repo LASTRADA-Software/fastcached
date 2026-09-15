@@ -32,7 +32,7 @@
 
 using namespace FastCache;
 
-/// `NodeMembership` reports the keyless-widening refusal here; no case asserts on it.
+/// `NodeMembership` reports an unreadable `fleet-open` row here; no case asserts on it.
 namespace
 {
 FastCache::NullLogger membershipLog;

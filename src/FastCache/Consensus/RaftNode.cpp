@@ -586,26 +586,6 @@ Term RaftNode::TermOf(RaftMessage const& message) noexcept
     return std::visit([](auto const& concrete) { return concrete.term; }, message);
 }
 
-NodeId RaftNode::SenderOf(RaftMessage const& message)
-{
-    // Four names for one fact, so the visitor asks which one this message has
-    // rather than being written out once per message type. The final `else` is
-    // not a default: a type carrying none of these four fails to compile, which
-    // is the whole reason to detect rather than enumerate.
-    return std::visit(
-        [](auto const& concrete) -> NodeId const& {
-            if constexpr (requires { concrete.candidateId; })
-                return concrete.candidateId;
-            else if constexpr (requires { concrete.voterId; })
-                return concrete.voterId;
-            else if constexpr (requires { concrete.leaderId; })
-                return concrete.leaderId;
-            else
-                return concrete.followerId;
-        },
-        message);
-}
-
 bool RaftNode::IsMember(NodeId const& id) const
 {
     return std::ranges::find(_members, id) != _members.end();

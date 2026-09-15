@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "ConsensusTier.hpp"
+#include "DiscoveryTier.hpp"
 #include "NodeIdentity.hpp"
 #include "NodeSurfaces.hpp"
 
 #include <FastCache/Async/PlatformReactor.hpp>
+#include <FastCache/Cluster/PskRaftPeerCredential.hpp>
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/HostPort.hpp>
@@ -187,12 +189,21 @@ std::string AdvertisedSchedulerEndpoint(std::string_view raftEndpoint, std::stri
 
 ConsensusTier::ConsensusTier(Cluster::ClusterMember self,
                              Consensus::FileRaftStorage storage,
+                             std::unique_ptr<Consensus::IRaftPeerCredential const> credential,
                              std::string boundEndpoint,
                              RoleObserver onRole,
                              MembersObserver onMembers,
+                             IMetricsSink& metrics,
                              ILogger& logger):
     _logger { logger },
     _storage { std::move(storage) },
+    // Unseeded, so two nodes started together do not draw the same election timeout and
+    // split the vote round after round -- nor the same handshake nonce. The seeded
+    // constructor exists so a failure can be replayed, and nothing replays a production
+    // node.
+    _random { std::make_unique<SystemRandomSource>() },
+    _metrics { metrics },
+    _credential { std::move(credential) },
     _connector { std::make_unique<PlatformConnector>(_reactor, _resolver, _clock) },
     _application { logger, [this](Cluster::ClusterState const& state) { OnStateChanged(state); } },
     _onRole { std::move(onRole) },
@@ -209,8 +220,12 @@ ConsensusTier::ConsensusTier(Cluster::ClusterMember self,
         .id = _self.id, .raftEndpoint = _self.raftEndpoint, .schedulerEndpoint = _self.schedulerEndpoint });
 }
 
-std::expected<std::unique_ptr<ConsensusTier>, std::string> ConsensusTier::Start(
-    NodeConfig const& cfg, std::string_view schedulerBound, RoleObserver onRole, MembersObserver onMembers, ILogger& logger)
+std::expected<std::unique_ptr<ConsensusTier>, std::string> ConsensusTier::Start(NodeConfig const& cfg,
+                                                                                std::string_view schedulerBound,
+                                                                                RoleObserver onRole,
+                                                                                MembersObserver onMembers,
+                                                                                IMetricsSink& metrics,
+                                                                                ILogger& logger)
 {
     // The bootstrap set, and this node must be in it. A node whose own id names no
     // member could never win a vote and could never be voted for -- it would stand
@@ -228,6 +243,18 @@ std::expected<std::unique_ptr<ConsensusTier>, std::string> ConsensusTier::Start(
     auto const* const self = ClusterSelfMember(cfg);
     if (self == nullptr)
         return std::unexpected { std::string { ConsensusNamesNoSelfPeerRefusal } };
+
+    // The key, before anything is bound or dialled (#1308). The startup table refuses a
+    // node that names no key file, and this is that answer arriving for a `NodeConfig` no
+    // argv produced; the READ is this tier's alone, because a registration is judged by
+    // the table long before the file need exist. A key that cannot be read is fatal here
+    // for the reason a missing one is: there is no unauthenticated consensus to fall back
+    // to.
+    if (cfg.clusterKeyFile.empty())
+        return std::unexpected { std::string { ConsensusNeedsClusterKeyRefusal } };
+    auto key = ReadClusterKey(cfg.clusterKeyFile);
+    if (!key.has_value())
+        return std::unexpected { std::format("--cluster-key-file: {}", key.error()) };
 
     // `--raft-join` takes the SAME tokens and means something else by them: these
     // are the nodes this one can REACH, not the cluster it is a member of. So the
@@ -284,12 +311,15 @@ std::expected<std::unique_ptr<ConsensusTier>, std::string> ConsensusTier::Start(
     auto announced = *self;
     announced.schedulerEndpoint = AdvertisedSchedulerEndpoint(self->raftEndpoint, schedulerBound);
 
-    auto tier = std::unique_ptr<ConsensusTier> { new ConsensusTier { std::move(announced),
-                                                                     *std::move(storage),
-                                                                     std::format("{}:{}", endpoint.host, endpoint.port),
-                                                                     std::move(onRole),
-                                                                     std::move(onMembers),
-                                                                     logger } };
+    auto tier = std::unique_ptr<ConsensusTier> { new ConsensusTier {
+        std::move(announced),
+        *std::move(storage),
+        std::make_unique<Cluster::PskRaftPeerCredential const>(*std::move(key)),
+        std::format("{}:{}", endpoint.host, endpoint.port),
+        std::move(onRole),
+        std::move(onMembers),
+        metrics,
+        logger } };
 
     if (auto started = tier->Launch(cfg, members, bootstrap, endpoint.host, endpoint.port); !started.has_value())
         return std::unexpected { started.error() };
@@ -377,18 +407,12 @@ std::expected<void, std::string> ConsensusTier::Launch(NodeConfig const& cfg,
     // `RaftConfig` owns its own list from here.
     auto ids = _bootstrapIds;
 
-    _transport =
-        std::make_unique<Consensus::RaftPeerTransport>(cfg.nodeId, std::move(peers), _reactor, *_connector, _logger);
+    _transport = std::make_unique<Consensus::RaftPeerTransport>(
+        cfg.nodeId, std::move(peers), _reactor, *_connector, _logger, _metrics, *_credential, *_random);
 
     auto recovered = _storage.Load();
     if (!recovered.has_value())
         return std::unexpected { std::format("cannot recover consensus state: {}", recovered.error().context) };
-
-    // `SystemRandomSource` unseeded, so two nodes started together do not draw the
-    // same election timeout and split the vote round after round. Owned here because
-    // the node holds it for its whole life; the seeded constructor exists so a
-    // failure can be replayed, and nothing replays a production node.
-    _random = std::make_unique<SystemRandomSource>();
 
     // `Create` rather than the constructor, which is private precisely so the
     // configuration validation cannot be bypassed by omission -- so there is no
@@ -426,7 +450,8 @@ std::expected<void, std::string> ConsensusTier::Launch(NodeConfig const& cfg,
     Republish();
 
     _sink = std::make_unique<DriverSink>(*_driver, _logger);
-    _peerServer = std::make_unique<Consensus::RaftPeerServer>(*_listener, _reactor, *_sink, _logger);
+    _peerServer = std::make_unique<Consensus::RaftPeerServer>(
+        *_listener, _reactor, *_sink, _logger, _metrics, *_credential, cfg.nodeId, *_random);
 
     // Both loops on ONE reactor, and neither through `SyncRun`: that function
     // resumes a coroutine exactly once and throws when it is still suspended, so a
@@ -940,6 +965,7 @@ std::expected<std::unique_ptr<ConsensusTier>, std::string> StartConsensusOrExpla
     std::unique_ptr<SchedulerTier> const& schedulerTier,
     std::string_view schedulerBound,
     NodeMembership& membership,
+    IMetricsSink& metrics,
     ILogger& logger)
 {
     // No cluster configured, which is the common deployment: one machine, leading
@@ -977,6 +1003,7 @@ std::expected<std::unique_ptr<ConsensusTier>, std::string> StartConsensusOrExpla
             // every surface bound at construction (#405).
             membership.PublishCluster(state);
         },
+        metrics,
         logger);
 
     // Wired here rather than at construction, and the order is forced: consensus

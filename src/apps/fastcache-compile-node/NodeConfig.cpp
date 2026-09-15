@@ -814,11 +814,13 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
             .apply = AssignFrom<&NodeConfig::raftListen, ParseText>(),
             .explicitBit = &NodeConfig::raftListenExplicit,
             .description = "where peers reach this node's consensus port. Giving\n"
-                           "it turns consensus ON; without it this node leads\n"
-                           "alone, which is right for one machine and is the\n"
-                           "default. A bare port binds the WILDCARD: peers are on\n"
-                           "other machines by definition, so loopback would\n"
-                           "silently not work.",
+                           "it turns consensus ON, and consensus needs\n"
+                           "--cluster-key-file: every peer connection proves the\n"
+                           "key before a message is read. Without this flag the\n"
+                           "node leads alone, which is right for one machine and\n"
+                           "is the default. A bare port binds the WILDCARD: peers\n"
+                           "are on other machines by definition, so loopback\n"
+                           "would silently not work.",
             .yamlKey = "listen_raft",
             .same = FieldEq<&NodeConfig::raftListen>(),
         },
@@ -968,10 +970,12 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
             .description = "the cluster's pre-shared key. A FILE and not a flag:\n"
                            "a command line is readable through ps, and a key that\n"
                            "leaks admits a node whose objects the whole fleet\n"
-                           "then caches. Discovery proves the cluster with it,\n"
-                           "and the scheduler SIGNS lease grants with it. Without\n"
-                           "one, a grant is unsigned and any client that can reach\n"
-                           "a worker's compile port can spend it.",
+                           "then caches. REQUIRED with --listen-raft: every\n"
+                           "consensus connection proves it before a message is\n"
+                           "read. Discovery proves the cluster with it, and the\n"
+                           "scheduler SIGNS lease grants with it. Without one, a\n"
+                           "grant is unsigned and any client that can reach a\n"
+                           "worker's compile port can spend it.",
             .yamlKey = "cluster_key_file",
             .same = FieldEq<&NodeConfig::clusterKeyFile>(),
         },
@@ -2268,14 +2272,6 @@ bool RunsConsensus(NodeConfig const& cfg) noexcept
     return !RowFor(NodeSurface::Raft).Resolve(cfg).empty();
 }
 
-bool EnrollmentConfigured(NodeConfig const& cfg) noexcept
-{
-    // `RunsConsensus` rather than `raftListen`, so this inherits the surface-row
-    // answer and cannot disagree with `--print-surfaces` about whether there is a
-    // cluster here at all.
-    return RunsConsensus(cfg) && !cfg.clusterKeyFile.empty();
-}
-
 std::string RaftSelfEndpoint(NodeConfig const& cfg)
 {
     if (cfg.raftSelf.empty())
@@ -3499,6 +3495,18 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
           .message = "--discovery needs --cluster-key-file: a beacon is unauthenticated by construction, so the "
                      "key is the only thing separating a peer from anything else on the segment. With none, no "
                      "peer can ever be admitted and this node would announce itself forever to no effect." },
+        // Consensus needs the key, full stop (#1308). After the `--discovery` row, which
+        // is the more specific sentence for a node that also asked for discovery: first
+        // match wins, and this row would otherwise answer in its place.
+        //
+        // A STARTUP refusal and never a per-connection fallback, which is the whole of
+        // the decision: a node that ran consensus unsigned when it had no key is the port
+        // open with every refusal counter reading zero. Asked of the PATH being named, as
+        // the discovery row asks it -- whether the file can be read is `ConsensusTier`'s
+        // question, answered at boot, because a registration is judged by this table
+        // long before the file need exist.
+        { .refuses = [](NodeConfig const& c) { return RunsConsensus(c) && c.clusterKeyFile.empty(); },
+          .message = ConsensusNeedsClusterKeyRefusal },
         { .refuses = [](NodeConfig const& c) { return c.discoveryReplyPort != 0 && c.discoveryAddress.empty(); },
           .message = "--discovery-reply-port is where discovery is ANSWERED, and --discovery is not set. A port "
                      "pinned for a service that is off is a port nothing will ever bind, so this is a typo or a "

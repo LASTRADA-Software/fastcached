@@ -1637,6 +1637,44 @@ counter_value() {
     metric_value "$body" "$name"
 }
 
+# The same counters through the OTHER door: a node's `0xFC` port, as
+# `fastcache-cli node-metrics --format=kv` prints them (#1308).
+#
+# A sibling of `metric_value` rather than a mode of it, because the grammars differ in
+# the one character that decides a match -- `name value` against `name=value` -- and a
+# reader that accepted both would read a Prometheus body's `name=...` that is not a
+# series. The rules are `metric_value`'s: the WHOLE name, a number and nothing else,
+# the last reading wins, and nothing on stdout means ABSENT, never zero.
+#
+# @param 1 a whole `node-metrics --format=kv` output
+# @param 2 the counter's name
+# @return echoes the reading, or nothing when the counter is absent
+node_metric_value() {
+    local body="$1" name="$2"
+    sed -n "s/^${name}=\([0-9][0-9]*\)\$/\1/p" <<< "$body" | tail -1
+}
+
+# How long one `node-metrics` exchange may take before it counts as unanswered.
+_e2e_node_metrics_seconds=5
+
+# Read one counter off a node's `0xFC` port with `fastcache-cli`.
+#
+# `counter_value`'s contract over the other door: a non-zero return is "the client got
+# no answer at all", an empty echo with status zero is "it answered and names no such
+# counter". Bounded, because a node that accepts and never answers would otherwise hang
+# the wait that polls this.
+#
+# @param 1 path to fastcache-cli
+# @param 2 the node's 0xFC endpoint, host:port
+# @param 3 the counter's name
+# @return echoes the reading; returns 1 if the client got no answer
+node_counter_value() {
+    local cli="$1" endpoint="$2" name="$3" body=""
+    body="$(run_bounded "$_e2e_node_metrics_seconds" "$cli" node-metrics --addr="$endpoint" --format=kv --quiet)" ||
+        return 1
+    node_metric_value "$body" "$name"
+}
+
 # Which of the three ways a counter wait can end badly this one was.
 #
 # PURE: it reads no clock, opens no socket and touches no process. Everything it
@@ -1664,18 +1702,19 @@ counter_value() {
 # @param 2 the last reading, or "" when the series was never present
 # @param 3 the floor the reading had to reach
 # @param 4 the series name
+# @param 5 optional: the door that was asked, `/metrics` (the default) or `node-metrics`
 _e2e_counter_finding() {
-    local answered="$1" value="$2" floor="$3" name="$4"
+    local answered="$1" value="$2" floor="$3" name="$4" door="${5:-/metrics}"
 
     if [ "$answered" != "yes" ]; then
-        echo "  COUNTER: nothing ever answered a /metrics request, so ${name} was never read."
-        echo "           Nothing above is a statement about the counter; the admin surface is"
-        echo "           the subject."
+        echo "  COUNTER: nothing ever answered a ${door} request, so ${name} was never read."
+        echo "           Nothing above is a statement about the counter; the surface that"
+        echo "           was asked is the subject."
         return 0
     fi
 
     if [ -z "$value" ]; then
-        echo "  COUNTER: /metrics answered and exports no ${name} series at all."
+        echo "  COUNTER: ${door} answered and exports no ${name} series at all."
         echo "           An absent series is not a reading of zero."
         return 0
     fi
@@ -1683,7 +1722,8 @@ _e2e_counter_finding() {
     echo "  COUNTER: ${name} was read and never reached ${floor}; the last reading was ${value}."
 }
 
-# What the last `wait_for_counter` read, and the only way it hands one back.
+# What the last `wait_for_counter` or `wait_for_node_counter` read, and the only way
+# either hands one back.
 #
 # A global rather than a value on stdout, and the reason is not style. `wait_until`
 # announces its own success on stdout -- `waited 0s (3 polls) for ...` -- so a wait
@@ -1698,9 +1738,12 @@ _e2e_counter_finding() {
 # Read it on the line after the call.
 E2eCounterReading=""
 
-# Whether any scrape during the last `wait_for_counter` was answered at all.
+# Whether any read during the last counter wait was answered at all.
 # Private; `_e2e_counter_finding` is what reads it.
 _e2e_counter_answered="no"
+
+# Which door the last counter wait asked, for its finding. Private.
+_e2e_counter_door="/metrics"
 
 # Wait until a counter on an admin endpoint reaches a floor, the way
 # `wait_for_port` waits for a listener.
@@ -1742,28 +1785,71 @@ wait_for_counter() {
     local host="$1" port="$2" name="$3" floor="$4" pid="$5" what="$6" logfile="$7"
     local seconds="${8:-$_e2e_wait_seconds}"
 
+    # `2>/dev/null` on the POLL and not inside `counter_value`, so a fixture that
+    # scrapes once still sees what bash says. A refused `/dev/tcp` writes a diagnostic
+    # carrying exactly the fact the status already carries, and a wait polling a dead
+    # admin surface for its whole budget would print it once per poll -- burying the
+    # verdict and the COUNTER finding that say the same thing once, at the end, in a
+    # sentence.
+    _e2e_counter_read() { counter_value "$host" "$port" "$name" 2>/dev/null; }
+    _e2e_counter_wait "/metrics" "$name" "$floor" "$pid" "$what" "$logfile" "$seconds"
+}
+
+# `wait_for_counter` through a node's `0xFC` port rather than an admin surface (#1308).
+#
+# The same wait with the same three terminal states and the same verdict, reading with
+# `node_counter_value`: a fixture whose nodes open no admin surface -- `cluster-e2e`'s
+# do not -- asks the port they already serve instead of opening one for the test.
+#
+# @param 1 path to fastcache-cli
+# @param 2 the node's 0xFC endpoint, host:port
+# @param 3 the counter's name
+# @param 4 the floor the reading must reach
+# @param 5 pid to watch, or "-"; the rules on `wait_until` apply unchanged
+# @param 6 what it is, for the messages
+# @param 7 the log to dump when it does not get there, or "-"
+# @param 8 optional bound in seconds; defaults to `e2e_wait_seconds`
+# @return sets `E2eCounterReading`; never returns on failure
+wait_for_node_counter() {
+    local cli="$1" endpoint="$2" name="$3" floor="$4" pid="$5" what="$6" logfile="$7"
+    local seconds="${8:-$_e2e_wait_seconds}"
+
+    _e2e_counter_read() { node_counter_value "$cli" "$endpoint" "$name" 2>/dev/null; }
+    _e2e_counter_wait "node-metrics" "$name" "$floor" "$pid" "$what" "$logfile" "$seconds"
+}
+
+# The counter wait both doors share. The caller defines `_e2e_counter_read`, which
+# echoes a reading and returns non-zero when nothing answered; this owns the rest --
+# the reading handed back, the three findings and the verdict -- so the two doors
+# cannot come to disagree about what absent MEANS.
+#
+# @param 1 the door, for the finding: `/metrics` or `node-metrics`
+# @param 2 the counter's name
+# @param 3 the floor
+# @param 4 pid to watch, or "-"
+# @param 5 what it is
+# @param 6 the log, or "-"
+# @param 7 bound in seconds
+_e2e_counter_wait() {
+    local door="$1" name="$2" floor="$3" pid="$4" what="$5" logfile="$6" seconds="$7"
+
     E2eCounterReading=""
     _e2e_counter_answered="no"
+    _e2e_counter_door="$door"
 
-    # A FAILED SCRAPE DOES NOT END THE WAIT, because not ending it is what a retry
+    # A FAILED READ DOES NOT END THE WAIT, because not ending it is what a retry
     # loop is for -- but it is remembered, so a bound that expires having never
     # had an answer says THAT rather than blaming the counter.
     _e2e_counter_ready() {
         local reading=""
-        # `2>/dev/null` on the POLL and not inside `counter_value`, so a fixture
-        # that scrapes once still sees what bash says. A refused `/dev/tcp` writes
-        # a diagnostic carrying exactly the fact the status already carries, and a
-        # wait polling a dead admin surface for its whole budget would print it
-        # once per poll -- burying the verdict and the COUNTER finding that say the
-        # same thing once, at the end, in a sentence.
-        reading="$(counter_value "$host" "$port" "$name" 2>/dev/null)" || return 1
+        reading="$(_e2e_counter_read)" || return 1
         _e2e_counter_answered="yes"
         E2eCounterReading="$reading"
         [ -n "$reading" ] || return 1
         [ "$reading" -ge "$floor" ]
     }
     _e2e_counter_findings() {
-        _e2e_counter_finding "$_e2e_counter_answered" "$E2eCounterReading" "$floor" "$name"
+        _e2e_counter_finding "$_e2e_counter_answered" "$E2eCounterReading" "$floor" "$name" "$_e2e_counter_door"
     }
 
     # The deadline is this wait's own, so the sixth argument is empty; the seventh

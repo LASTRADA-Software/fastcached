@@ -1276,6 +1276,25 @@ inline constexpr std::string_view ConsensusNamesNoSelfPeerRefusal =
     "--listen-raft turns consensus on and no --raft-peer names this node: it must name the endpoint its peers "
     "dial, whether it bootstraps a cluster or joins one, and consensus cannot start without one";
 
+/// Why a node running consensus with no `--cluster-key-file` cannot start (#1308).
+///
+/// A named constant for `ConsensusNamesNoSelfPeerRefusal`'s reason: the startup table
+/// refuses the configuration where an operator is watching, and `ConsensusTier::Start`
+/// answers with this same string for a `NodeConfig` no argv produced. It ends without a
+/// full stop for the same reason that one does.
+///
+/// **Decided once, before anything is served, and never per connection.** A node that
+/// ran consensus unsigned when it had no key would be the fallback where the port is open
+/// and every refusal counter reads zero -- which is the shape the worker's lease rule
+/// (#282) refuses, one surface over. It is also not a node that could work: every peer
+/// connection proves the key before a single message is read, so a keyless member could
+/// neither be heard nor hear anybody.
+inline constexpr std::string_view ConsensusNeedsClusterKeyRefusal =
+    "--listen-raft turns consensus on, and consensus needs --cluster-key-file: every connection between members "
+    "proves the cluster's pre-shared key before a message is read, so a node without the key could neither be heard "
+    "nor hear anybody. Give every member the same key file -- generate one with `head -c 32 /dev/urandom | base64`, "
+    "or run --enroll-from against a member to be handed it -- or drop --listen-raft to run one machine alone";
+
 /// The `--raft-peer` entry `--node-id` names, if the list names it at all.
 ///
 /// The predicate behind `ConsensusNamesNoSelfPeerRefusal`, shared for the reason that
@@ -1328,28 +1347,6 @@ inline constexpr std::string_view ConsensusNamesNoSelfPeerRefusal =
 /// @param cfg The parsed configuration.
 /// @return True when a consensus driver will run and report a role.
 [[nodiscard]] bool RunsConsensus(NodeConfig const& cfg) noexcept;
-
-/// Whether this node's CONFIGURATION could serve an enrollment window.
-///
-/// **Consensus AND a key file, and the second clause is the one with a history.** A
-/// keyless consensus node is legal -- the startup table refuses one only where the
-/// compile port faces the network and admits remote peers -- and on such a node the
-/// window was openable, listable and APPROVABLE while it could never admit anybody,
-/// because the hand-over reads a key file that is not configured. Worse than a
-/// refusal: an approval commits `ClusterAdmit` before the key is consulted, so it grew
-/// the replicated configuration -- and therefore the QUORUM -- by a machine that then
-/// received `StorageWriteFailed` and never became anything. A phantom member counted
-/// towards every future election, from one operator command that looked like it worked.
-///
-/// Asked of the configuration ALONE, which is what makes it testable: whether a
-/// scheduler TIER was actually built is a runtime fact the caller holds and ANDs at the
-/// call site, and `main.cpp` is the one translation unit no test links. The remaining
-/// window -- a key file that is NAMED and cannot be read -- is not a configuration
-/// question and is answered at the decision itself, where `EnrollmentResponder` reads
-/// the key before it admits anybody.
-/// @param cfg The parsed configuration.
-/// @return True when consensus will run and a cluster key file is named.
-[[nodiscard]] bool EnrollmentConfigured(NodeConfig const& cfg) noexcept;
 
 /// The member endpoint `--raft-self` and `--listen-raft` name between them.
 ///

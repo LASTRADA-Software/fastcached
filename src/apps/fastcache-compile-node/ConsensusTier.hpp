@@ -10,6 +10,7 @@
 #include <FastCache/Cluster/ClusterStateMachine.hpp>
 #include <FastCache/Cluster/MembershipPolicy.hpp>
 #include <FastCache/Consensus/FileRaftStorage.hpp>
+#include <FastCache/Consensus/IRaftPeerCredential.hpp>
 #include <FastCache/Consensus/RaftDriver.hpp>
 #include <FastCache/Consensus/RaftPeerServer.hpp>
 #include <FastCache/Consensus/RaftPeerTransport.hpp>
@@ -20,6 +21,7 @@
 // For `ConsensusStatus`, which is the shape a scrape reports this node's own quorum
 // in. Defined beside `MetricsSnapshot` rather than here because the renderer is what
 // has to know its shape, and `/metrics` is the one surface every node already serves.
+#include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Metrics/PrometheusFormatter.hpp>
 #include <FastCache/Net/PlatformListener.hpp>
 #include <FastCache/Net/ThreadedAddressResolver.hpp>
@@ -261,12 +263,14 @@ class ConsensusTier final: public Distributed::IClusterAdmin
     ///        `AdvertisedSchedulerEndpoint` for why the host cannot be.
     /// @param onRole Told this node's role; must outlive the tier.
     /// @param onMembers Told the member set; must outlive the tier.
+    /// @param metrics Where a refused peer connection is counted; must outlive the tier.
     /// @param logger Where progress and refusals are reported.
     /// @return The running tier, or the fatal reason.
     [[nodiscard]] static std::expected<std::unique_ptr<ConsensusTier>, std::string> Start(NodeConfig const& cfg,
                                                                                           std::string_view schedulerBound,
                                                                                           RoleObserver onRole,
                                                                                           MembersObserver onMembers,
+                                                                                          IMetricsSink& metrics,
                                                                                           ILogger& logger);
 
     ConsensusTier(ConsensusTier const&) = delete;
@@ -350,9 +354,11 @@ class ConsensusTier final: public Distributed::IClusterAdmin
   private:
     ConsensusTier(Cluster::ClusterMember self,
                   Consensus::FileRaftStorage storage,
+                  std::unique_ptr<Consensus::IRaftPeerCredential const> credential,
                   std::string boundEndpoint,
                   RoleObserver onRole,
                   MembersObserver onMembers,
+                  IMetricsSink& metrics,
                   ILogger& logger);
 
     /// Build the driver and start both loops.
@@ -473,7 +479,19 @@ class ConsensusTier final: public Distributed::IClusterAdmin
     PlatformReactor _reactor { _clock };
 
     Consensus::FileRaftStorage _storage;
+
+    /// Election timeouts and every peer connection's handshake nonce. One source for
+    /// both, because `SystemRandomSource` is safe from any thread and the two draw at
+    /// rates measured in seconds.
     std::unique_ptr<IRandomSource> _random;
+
+    /// Where a refused peer connection is counted.
+    IMetricsSink& _metrics;
+
+    /// The cluster key, as the peer wire proves it (#1308). Read once, before anything
+    /// is dialled or accepted, and declared before the transport and the server, which
+    /// both hold a reference to it.
+    std::unique_ptr<Consensus::IRaftPeerCredential const> _credential;
 
     /// Name resolution for the peer dials, off the reactor thread.
     ///
@@ -638,6 +656,7 @@ class ConsensusTier final: public Distributed::IClusterAdmin
 /// @param cfg The parsed configuration.
 /// @param schedulerTier Told this node's role; may be null when it serves none.
 /// @param membership Told the replicated member set; must outlive the tier.
+/// @param metrics Where a refused peer connection is counted; must outlive the tier.
 /// @param logger Where progress and refusals are reported.
 /// @return The tier, a null tier meaning "no cluster configured", or the fatal reason.
 /// @param schedulerBound What the node's `0xFC` listener bound, or empty when there
@@ -666,6 +685,7 @@ class ConsensusTier final: public Distributed::IClusterAdmin
     std::unique_ptr<SchedulerTier> const& schedulerTier,
     std::string_view schedulerBound,
     NodeMembership& membership,
+    IMetricsSink& metrics,
     ILogger& logger);
 
 } // namespace FastCache::Node

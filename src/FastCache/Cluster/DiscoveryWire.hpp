@@ -2,6 +2,7 @@
 #pragma once
 
 #include <FastCache/Cluster/ClusterSigning.hpp>
+#include <FastCache/Core/Nonce.hpp>
 #include <FastCache/Core/Sha256.hpp>
 #include <FastCache/Core/WireFields.hpp>
 #include <FastCache/Core/WireFrame.hpp>
@@ -79,8 +80,8 @@ struct Beacon
 /// A nonce the joiner must authenticate.
 struct Challenge
 {
-    std::string clusterId;              ///< Which cluster is asking.
-    std::array<std::byte, 32> nonce {}; ///< Fresh random bytes; never reused.
+    std::string clusterId; ///< Which cluster is asking.
+    Nonce nonce {};        ///< Fresh from `DrawNonce`; never reused.
 };
 
 /// The joiner's answer to a Challenge.

@@ -39,6 +39,38 @@ using RaftMessage = std::variant<PreVoteRequest,
                                  InstallSnapshotRequest,
                                  InstallSnapshotResponse>;
 
+/// Who sent a message.
+///
+/// Every message carries exactly one member id and it is always the sender -- but
+/// spelled four different ways, so this cannot be the one-line `std::visit` a term
+/// read is. Detected rather than enumerated: eight near-identical arms differing only
+/// in a field name is the copy-paste this codebase treats as a defect, and a ninth
+/// message type naming its sender something else fails to compile here rather than
+/// going quietly unattributed.
+///
+/// A free function rather than `RaftNode`'s, where it lived until #1308, because it now
+/// has two readers asking one question: the node, to say what disturbed it, and the
+/// peer server, to refuse a message that names a sender other than the one its
+/// connection proved. Two spellings of which field is the sender would be two answers
+/// that can drift, and the second one guards a trust boundary.
+/// @param message The message.
+/// @return The sender's id, borrowed from @p message.
+[[nodiscard]] inline NodeId const& SenderOf(RaftMessage const& message) noexcept
+{
+    return std::visit(
+        [](auto const& concrete) -> NodeId const& {
+            if constexpr (requires { concrete.candidateId; })
+                return concrete.candidateId;
+            else if constexpr (requires { concrete.voterId; })
+                return concrete.voterId;
+            else if constexpr (requires { concrete.leaderId; })
+                return concrete.leaderId;
+            else
+                return concrete.followerId;
+        },
+        message);
+}
+
 /// A change to the durable log: write `entries` at `fromIndex`, discarding
 /// anything already at or after it.
 ///

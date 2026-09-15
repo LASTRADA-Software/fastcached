@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Cluster/DiscoveryService.hpp>
-#include <FastCache/Core/Endian.hpp>
 #include <FastCache/Core/HostPort.hpp>
 #include <FastCache/Core/Utf8.hpp>
 
@@ -35,17 +34,13 @@ bool DiscoveryService::SendBeacon()
 
 void DiscoveryService::IssueChallenge(DiscoveryWire::Beacon const& peer, DatagramAddress const& replyTo)
 {
-    DiscoveryWire::Challenge challenge { .clusterId = _config.clusterId, .nonce = {} };
-
     // Drawn through the randomness seam rather than a local engine, for the
     // reason `RaftNode`'s election timeouts are: a nonce this node chose is the
     // only thing making a proof unreplayable, so a test has to be able to fix it
-    // and a production build has to be able to trust it.
-    for (auto offset = std::size_t { 0 }; offset < challenge.nonce.size(); offset += sizeof(std::uint64_t))
-    {
-        auto const draw = _random.UniformInRange(0, std::numeric_limits<std::uint64_t>::max());
-        WriteBigEndian<std::uint64_t>(std::span { challenge.nonce }.subspan(offset, sizeof(std::uint64_t)), draw);
-    }
+    // and a production build has to be able to trust it. `DrawNonce` rather than a
+    // loop here, because the Raft peer handshake draws its nonces the same way and
+    // the size and the source are one decision (#1308).
+    DiscoveryWire::Challenge const challenge { .clusterId = _config.clusterId, .nonce = DrawNonce(_random) };
 
     // Replaces any earlier challenge to this node rather than adding to a list:
     // a beacon is unauthenticated, so anything on the segment can send one, and a

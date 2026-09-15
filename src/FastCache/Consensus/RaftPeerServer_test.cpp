@@ -1,23 +1,33 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// The inbound peer listener. The case that matters most is the one about a
-// frame this build cannot interpret: it must be stepped over rather than end
-// the connection, because a node running a newer build would otherwise
-// partition itself from every older peer in a fleet nobody upgrades atomically.
+// The inbound peer listener. Two properties matter most. Nothing is read from a
+// connection that has not proved the cluster key, and every way one is refused moves
+// its own counter (#1308). And a frame this build cannot interpret must be stepped
+// over rather than end the connection, because a node running a newer build would
+// otherwise partition itself from every older peer in a fleet nobody upgrades
+// atomically.
 #include <FastCache/Async/PlatformReactor.hpp>
+#include <FastCache/Async/TestReactor.hpp>
+#include <FastCache/Cluster/PskRaftPeerCredential.hpp>
 #include <FastCache/Consensus/RaftPeerServer.hpp>
+#include <FastCache/Consensus/RaftPeerSession.hpp>
 #include <FastCache/Consensus/RaftWire.hpp>
 #include <FastCache/Core/BoundedDrain.hpp>
+#include <FastCache/Core/IRandomSource.hpp>
 #include <FastCache/Core/Logger.hpp>
+#include <FastCache/Core/SecureBytes.hpp>
+#include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Net/InMemoryTransport.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <thread>
@@ -25,8 +35,12 @@
 #include <variant>
 #include <vector>
 
+#include <tests/Unwrap.hpp>
+
 using namespace FastCache;
+using FastCache::Testing::Unwrap;
 using namespace FastCache::Consensus;
+using namespace std::chrono_literals;
 
 namespace
 {
@@ -44,13 +58,46 @@ class RecordingSink final: public IRaftMessageSink
     std::vector<RaftMessage> received; ///< In arrival order.
 };
 
+/// The cluster key every well-behaved end in this file holds.
+[[nodiscard]] SecureByteBuffer ClusterKey()
+{
+    return SecureByteBuffer(32, std::byte { 0x5A });
+}
+
+/// A key the server does not hold.
+[[nodiscard]] SecureByteBuffer StrangerKey()
+{
+    return SecureByteBuffer(32, std::byte { 0x33 });
+}
+
+/// The server's id in every case here. Dialled as, and never the sender of a message.
+constexpr std::string_view ServerId = "n1";
+
+/// The dialler's id: the voter in every vote these cases send.
+constexpr std::string_view DiallerId = "n2";
+
+/// The draws the server's nonce is made of, so a case can answer its challenge without
+/// reading it -- which is what lets a whole connection be written before the server runs.
+[[nodiscard]] std::vector<std::uint64_t> ServerNonceScript()
+{
+    return { 0x1111111111111111ULL, 0x2222222222222222ULL, 0x3333333333333333ULL, 0x4444444444444444ULL };
+}
+
+/// The challenge the server will send, from the same script it draws from.
+[[nodiscard]] RaftWire::ChallengeFrame ExpectedChallenge()
+{
+    ScriptedRandomSource random { ServerNonceScript() };
+    return RaftWire::ChallengeFrame { .nonce = DrawNonce(random) };
+}
+
 /// A vote response carrying `term`, the smallest message that round-trips.
 /// @param term Term to carry.
-/// @return The framed message.
-[[nodiscard]] std::vector<std::byte> VoteFrame(std::uint64_t term)
+/// @param voter Who it names as its sender.
+/// @return The framed message, untagged.
+[[nodiscard]] std::vector<std::byte> VoteFrame(std::uint64_t term, std::string_view voter = DiallerId)
 {
-    return RaftWire::Encode(RaftMessage {
-        RequestVoteResponse { .term = Term { .value = term }, .decision = VoteDecision::Granted, .voterId = "n2" } });
+    return RaftWire::Encode(RaftMessage { RequestVoteResponse {
+        .term = Term { .value = term }, .decision = VoteDecision::Granted, .voterId = NodeId { voter } } });
 }
 
 /// Write every byte of `bytes` to `socket`.
@@ -59,17 +106,21 @@ class RecordingSink final: public IRaftMessageSink
 /// the first suspension and outlives the frame that kept it alive.
 /// @param socket Destination; never null.
 /// @param bytes What to send.
-/// @return Task resolving when the bytes are queued for the peer.
-[[nodiscard]] Task<void> WriteAll(ISocket* socket, std::span<std::byte const> bytes)
+/// @return Whether all of it was accepted.
+[[nodiscard]] Task<bool> WriteAll(ISocket* socket, std::span<std::byte const> bytes)
 {
-    std::size_t sent = 0;
-    while (sent < bytes.size())
-    {
-        auto const written = co_await socket->Write(bytes.subspan(sent));
-        if (!written.has_value() || *written == 0)
-            co_return;
-        sent += *written;
-    }
+    auto const written = co_await socket->Write(bytes);
+    co_return written.has_value() && *written == bytes.size();
+}
+
+/// Read what is buffered for `socket`.
+/// @param socket Source; never null.
+/// @param buffer Where to put it.
+/// @return How many bytes arrived; zero at the end or on an error.
+[[nodiscard]] Task<std::size_t> ReadSome(ISocket* socket, std::span<std::byte> buffer)
+{
+    auto const read = co_await socket->Read(buffer);
+    co_return read.has_value() ? *read : std::size_t { 0 };
 }
 
 /// Append `bytes` to `out`.
@@ -80,53 +131,198 @@ void Append(std::vector<std::byte>& out, std::span<std::byte const> bytes)
     out.insert(out.end(), bytes.begin(), bytes.end());
 }
 
+/// The proof @p handshake sends in answer to `ExpectedChallenge()`.
+/// @param handshake The dialler's half.
+/// @return The proof; the case fails if the dialler refuses to send one.
+[[nodiscard]] RaftWire::ProofFrame AnswerExpectedChallenge(DiallerHandshake& handshake)
+{
+    auto proof = handshake.Answer(ExpectedChallenge());
+    REQUIRE(proof.has_value());
+    return *std::move(proof);
+}
+
+/// Everything one dialler sends on one connection, built before the server runs.
+///
+/// The proof answers `ExpectedChallenge()`, so it is the proof the server's real
+/// challenge will be answered by; every frame after it is sealed in that session, in
+/// order.
+class Dialler
+{
+  public:
+    /// @param id Who the dialler proves to be.
+    /// @param target Whom it dialled.
+    /// @param key What it proves the key with.
+    explicit Dialler(std::string_view id = DiallerId,
+                     std::string_view target = ServerId,
+                     SecureByteBuffer key = ClusterKey()):
+        _credential { std::move(key) },
+        _handshake { _credential, NodeId { id }, NodeId { target }, _random },
+        _proof { AnswerExpectedChallenge(_handshake) },
+        _sealer { _credential, SessionNonces { .acceptor = ExpectedChallenge().nonce, .dialler = _proof.nonce } },
+        _wire { RaftWire::EncodeProof(_proof) }
+    {
+    }
+
+    /// Seal @p frame in this session and append it.
+    /// @param frame A frame as `RaftWire::Encode` produced it.
+    /// @return The frame and its tag, as appended.
+    std::vector<std::byte> Send(std::vector<std::byte> const& frame)
+    {
+        auto sealed = frame;
+        auto const tag = _sealer.Seal(frame);
+        Append(sealed, tag);
+        Append(_wire, sealed);
+        return sealed;
+    }
+
+    /// Append bytes as they are, sealed by nothing.
+    /// @param bytes What to append.
+    void SendRaw(std::span<std::byte const> bytes)
+    {
+        Append(_wire, bytes);
+    }
+
+    /// @return Everything to send, proof first.
+    [[nodiscard]] std::vector<std::byte>& Wire() noexcept
+    {
+        return _wire;
+    }
+
+    /// @return The proof this dialler sent.
+    [[nodiscard]] RaftWire::ProofFrame const& Proof() const noexcept
+    {
+        return _proof;
+    }
+
+    /// @return This dialler's half of the handshake, to read a verdict with.
+    [[nodiscard]] DiallerHandshake const& Handshake() const noexcept
+    {
+        return _handshake;
+    }
+
+  private:
+    Cluster::PskRaftPeerCredential _credential;
+    SystemRandomSource _random { 0xD1A1 };
+    DiallerHandshake _handshake;
+    RaftWire::ProofFrame _proof;
+    FrameSealer _sealer;
+    std::vector<std::byte> _wire;
+};
+
+/// One run of the server over one connection, and what came of it.
+struct Served
+{
+    std::unique_ptr<AtomicMetricsSink> metrics { std::make_unique<AtomicMetricsSink>() };
+    std::unique_ptr<RaftPeerServer> server;
+
+    /// What the server wrote back: its challenge, then any verdict.
+    std::vector<std::byte> replied;
+
+    /// @param refusal A refusal.
+    /// @return How many times it was counted.
+    [[nodiscard]] std::uint64_t Refused(AcceptorRefusal refusal) const
+    {
+        return metrics->Read(RowFor(refusal).counter);
+    }
+
+    /// @return How many refusals of any kind were counted.
+    [[nodiscard]] std::uint64_t AnyRefusals() const
+    {
+        auto total = std::uint64_t { 0 };
+        for (auto const& row: AcceptorRefusals)
+            total += metrics->Read(row.counter);
+        return total;
+    }
+
+    /// The verdict the server wrote after its challenge, if it wrote one.
+    /// @return The decoded verdict.
+    [[nodiscard]] std::optional<RaftWire::VerdictFrame> Verdict() const
+    {
+        auto const bytes = std::span<std::byte const> { replied };
+        auto const challengeHeader = RaftWire::DecodeHeader(bytes);
+        if (!challengeHeader.has_value())
+            return std::nullopt;
+        auto const rest = bytes.subspan(RaftWire::HeaderSize + challengeHeader->payloadLength);
+        auto const header = RaftWire::DecodeHeader(rest);
+        if (!header.has_value())
+            return std::nullopt;
+        auto verdict = RaftWire::DecodeVerdict(*header, rest.subspan(RaftWire::HeaderSize, header->payloadLength));
+        return verdict.has_value() ? std::optional { *std::move(verdict) } : std::nullopt;
+    }
+};
+
 /// Drive a server over one in-memory connection carrying `wire`, to completion.
 ///
-/// The client half writes everything and then closes, so the server's reader
-/// sees a clean EOF and its connection coroutine finishes — which is what lets
-/// each case assert on a settled result rather than racing one.
+/// The client half writes everything and then shuts its write side, so the server's
+/// reader sees a clean EOF and its connection coroutine finishes -- which is what lets
+/// each case assert on a settled result rather than racing one. Its READ side stays
+/// open, so the case can see what the server wrote back.
+///
+/// The handshake bound is off: the reactor here is never turned, so a deadline could
+/// never fire and would only be a timer left parked on it. The bound has a case of its
+/// own over a `TestReactor`.
 /// @param wire The bytes a peer sends.
 /// @param sink Where decoded messages land.
 /// @param options Limits to run the server under.
-/// @return The server, after its accept loop has ended.
-[[nodiscard]] std::unique_ptr<RaftPeerServer> RunOnce(std::vector<std::byte> const& wire,
-                                                      RecordingSink& sink,
-                                                      PeerServerOptions options = {})
+/// @param key What the server holds.
+/// @return The server and what it counted and wrote, after its accept loop has ended.
+[[nodiscard]] Served RunOnce(std::vector<std::byte> const& wire,
+                             RecordingSink& sink,
+                             PeerServerOptions options = { .handshakeBound = 0ms },
+                             SecureByteBuffer key = ClusterKey())
 {
+    Served served;
     InMemoryListener listener;
     NullLogger logger;
-    // A reactor this case never turns: `RunOnce` drives the accept loop by hand and
-    // never calls `Shutdown()`, which is the only thing that posts anything.
     SteadyClock clock;
     PlatformReactor reactor { clock };
-    auto server = std::make_unique<RaftPeerServer>(listener, reactor, sink, logger, options);
+    Cluster::PskRaftPeerCredential const credential { std::move(key) };
+    ScriptedRandomSource random { ServerNonceScript() };
+    served.server = std::make_unique<RaftPeerServer>(
+        listener, reactor, sink, logger, *served.metrics, credential, NodeId { ServerId }, random, options);
 
     auto client = listener.ConnectClient();
-    SyncRun(WriteAll(client.get(), wire));
-
-    // Closed before the server runs, so its reader sees a clean EOF and its
-    // connection coroutine finishes rather than parking -- which is what lets
-    // each case assert on a settled result instead of racing one.
-    client->Close();
+    if (!wire.empty())
+        REQUIRE(SyncRun(WriteAll(client.get(), wire)));
+    client->ShutdownWrite();
 
     // The listener drains queued connections before reporting itself closed, so
     // closing here still delivers the one connection and then ends the loop.
     listener.Close();
-    SyncRun(server->Run());
-    return server;
+    SyncRun(served.server->Run());
+
+    auto buffer = std::array<std::byte, 4096> {};
+    while (true)
+    {
+        auto const got = SyncRun(ReadSome(client.get(), buffer));
+        if (got == 0)
+            break;
+        Append(served.replied, std::span<std::byte const> { buffer }.first(got));
+    }
+    return served;
 }
 
 } // namespace
 
-TEST_CASE("A framed message is decoded and delivered", "[consensus][raft][peerserver]")
+TEST_CASE("A framed message on a connection that proved the key is decoded and delivered", "[consensus][raft][peerserver]")
 {
+    Dialler dialler;
+    dialler.Send(VoteFrame(7));
+
     RecordingSink sink;
-    auto const server = RunOnce(VoteFrame(7), sink);
+    auto const served = RunOnce(dialler.Wire(), sink);
 
     REQUIRE(sink.received.size() == 1);
     REQUIRE(std::holds_alternative<RequestVoteResponse>(sink.received[0]));
     CHECK(std::get<RequestVoteResponse>(sink.received[0]).term == Term { .value = 7 });
-    CHECK(server->DeliveredMessages() == 1);
+    CHECK(served.server->DeliveredMessages() == 1);
+    CHECK(served.AnyRefusals() == 0);
+
+    // And the server said yes, signed: the verdict the dialler's own half accepts.
+    auto const verdict = served.Verdict();
+    REQUIRE(verdict.has_value());
+    CHECK(Unwrap(verdict).verdict == RaftWire::HandshakeVerdict::Accepted);
+    CHECK(dialler.Handshake().Conclude(Unwrap(verdict)).outcome == VerdictOutcome::Accepted);
 }
 
 TEST_CASE("Several messages on one connection all arrive", "[consensus][raft][peerserver]")
@@ -134,60 +330,61 @@ TEST_CASE("Several messages on one connection all arrive", "[consensus][raft][pe
     // A peer connection is long-lived and carries a stream, so reading exactly
     // one frame per connection would work in every single-message test and
     // deliver one heartbeat per reconnect in a real cluster.
-    std::vector<std::byte> wire;
+    Dialler dialler;
     for (auto term = std::uint64_t { 1 }; term <= 5; ++term)
-        Append(wire, VoteFrame(term));
+        dialler.Send(VoteFrame(term));
 
     RecordingSink sink;
-    auto const server = RunOnce(wire, sink);
+    auto const served = RunOnce(dialler.Wire(), sink);
 
     REQUIRE(sink.received.size() == 5);
     for (auto index = std::size_t { 0 }; index < 5; ++index)
         CHECK(std::get<RequestVoteResponse>(sink.received[index]).term == Term { .value = index + 1 });
-    CHECK(server->DeliveredMessages() == 5);
+    CHECK(served.server->DeliveredMessages() == 5);
 }
 
 TEST_CASE("An unknown message type is stepped over, not fatal", "[consensus][raft][peerserver]")
 {
     // The mixed-fleet property. The frame between the two known ones carries a
-    // type this build has never heard of; the one after it must still arrive.
+    // type this build has never heard of; the one after it must still arrive. It is
+    // sealed like any other, so it is stepped over only once its tag has verified.
     auto unknown = VoteFrame(2);
     unknown[2] = std::byte { 0x7F };
 
-    std::vector<std::byte> wire;
-    Append(wire, VoteFrame(1));
-    Append(wire, unknown);
-    Append(wire, VoteFrame(3));
+    Dialler dialler;
+    dialler.Send(VoteFrame(1));
+    dialler.Send(unknown);
+    dialler.Send(VoteFrame(3));
 
     RecordingSink sink;
-    auto const server = RunOnce(wire, sink);
+    auto const served = RunOnce(dialler.Wire(), sink);
 
     REQUIRE(sink.received.size() == 2);
     CHECK(std::get<RequestVoteResponse>(sink.received[0]).term == Term { .value = 1 });
     CHECK(std::get<RequestVoteResponse>(sink.received[1]).term == Term { .value = 3 });
-    CHECK(server->SkippedFrames() == 1);
+    CHECK(served.server->SkippedFrames() == 1);
 }
 
-TEST_CASE("A frame from a newer protocol version is stepped over too", "[consensus][raft][peerserver]")
+TEST_CASE("A frame at a version other than the handshake's ends the connection", "[consensus][raft][peerserver]")
 {
-    // Same property, reached the other way: the type is known and the version is
-    // not. Both are "a peer running another build", and both must leave the
-    // connection usable.
-    auto const newer =
-        RaftWire::Encode(RaftMessage { RequestVoteResponse {
-                             .term = Term { .value = 9 }, .decision = VoteDecision::Denied, .voterId = "n2" } },
-                         RaftWire::CurrentVersion + 1);
+    // This was stepped over before the handshake existed, and the case said so. The
+    // version is settled by the handshake now: a frame claiming another one cannot be
+    // stepped over without guessing whether a tag follows it, so it ends the connection
+    // -- even sealed correctly, which only a holder of the key could do.
+    auto const newer = RaftWire::Encode(RaftMessage { RequestVoteResponse { .term = Term { .value = 9 },
+                                                                            .decision = VoteDecision::Denied,
+                                                                            .voterId = NodeId { DiallerId } } },
+                                        RaftWire::CurrentVersion + 1);
 
-    std::vector<std::byte> wire;
-    Append(wire, newer);
-    Append(wire, VoteFrame(4));
+    Dialler dialler;
+    dialler.Send(newer);
+    dialler.Send(VoteFrame(4));
 
     RecordingSink sink;
-    auto const server = RunOnce(wire, sink);
+    auto const served = RunOnce(dialler.Wire(), sink);
 
-    REQUIRE(sink.received.size() == 1);
-    CHECK(std::get<RequestVoteResponse>(sink.received[0]).term == Term { .value = 4 });
-    CHECK(server->SkippedFrames() == 1);
+    CHECK(sink.received.empty());
+    CHECK(served.server->SkippedFrames() == 0);
 }
 
 TEST_CASE("A wrong magic ends the connection", "[consensus][raft][peerserver]")
@@ -198,15 +395,15 @@ TEST_CASE("A wrong magic ends the connection", "[consensus][raft][peerserver]")
     auto bad = VoteFrame(1);
     bad[0] = std::byte { 0xFC };
 
-    std::vector<std::byte> wire;
-    Append(wire, bad);
-    Append(wire, VoteFrame(2));
+    Dialler dialler;
+    dialler.Send(bad);
+    dialler.Send(VoteFrame(2));
 
     RecordingSink sink;
-    auto const server = RunOnce(wire, sink);
+    auto const served = RunOnce(dialler.Wire(), sink);
 
     CHECK(sink.received.empty());
-    CHECK(server->SkippedFrames() == 0);
+    CHECK(served.server->SkippedFrames() == 0);
 }
 
 TEST_CASE("A malformed payload ends the connection", "[consensus][raft][peerserver]")
@@ -221,15 +418,15 @@ TEST_CASE("A malformed payload ends the connection", "[consensus][raft][peerserv
     // prefix follows it and its single byte comes after that.
     bad[RaftWire::HeaderSize + 4 + 8 + 4] = std::byte { 0x7F };
 
-    std::vector<std::byte> wire;
-    Append(wire, bad);
-    Append(wire, VoteFrame(2));
+    Dialler dialler;
+    dialler.Send(bad);
+    dialler.Send(VoteFrame(2));
 
     RecordingSink sink;
-    auto const server = RunOnce(wire, sink);
+    auto const served = RunOnce(dialler.Wire(), sink);
 
     CHECK(sink.received.empty());
-    CHECK(server->SkippedFrames() == 0);
+    CHECK(served.server->SkippedFrames() == 0);
 }
 
 TEST_CASE("An over-large declared frame is refused before it is buffered", "[consensus][raft][peerserver]")
@@ -245,25 +442,328 @@ TEST_CASE("An over-large declared frame is refused before it is buffered", "[con
     oversized[5] = std::byte { 0x00 };
     oversized[6] = std::byte { 0x00 };
 
+    Dialler dialler;
+    dialler.SendRaw(oversized);
+
     RecordingSink sink;
-    auto const server = RunOnce(oversized, sink, PeerServerOptions { .maxFrameBytes = 1024 });
+    auto const served = RunOnce(dialler.Wire(), sink, PeerServerOptions { .maxFrameBytes = 1024, .handshakeBound = 0ms });
 
     CHECK(sink.received.empty());
-    CHECK(server->DeliveredMessages() == 0);
+    CHECK(served.server->DeliveredMessages() == 0);
 }
 
 TEST_CASE("A truncated frame ends the connection without delivering", "[consensus][raft][peerserver]")
 {
     // What a peer that died mid-write produces. Ordinary, and it must not be
     // half-decoded into a message.
-    auto whole = VoteFrame(1);
-    whole.resize(whole.size() - 3);
+    Dialler dialler;
+    dialler.Send(VoteFrame(1));
+    dialler.Wire().resize(dialler.Wire().size() - 3);
 
     RecordingSink sink;
-    auto const server = RunOnce(whole, sink);
+    auto const served = RunOnce(dialler.Wire(), sink);
 
     CHECK(sink.received.empty());
-    CHECK(server->DeliveredMessages() == 0);
+    CHECK(served.server->DeliveredMessages() == 0);
+}
+
+TEST_CASE("A connection that sends a Raft message first is refused, and nothing is delivered",
+          "[consensus][raft][peerserver][handshake]")
+{
+    // What a build from before the handshake sends: a message, with no proof in front of
+    // it. The counter is the refusal's own, and nothing reaches the node.
+    auto wire = std::vector<std::byte> {};
+    Append(wire, VoteFrame(1));
+    Append(wire, VoteFrame(2));
+
+    RecordingSink sink;
+    auto const served = RunOnce(wire, sink);
+
+    CHECK(sink.received.empty());
+    CHECK(served.Refused(AcceptorRefusal::NoHandshake) == 1);
+    CHECK(served.AnyRefusals() == 1);
+}
+
+TEST_CASE("A proof at the version before the handshake is refused", "[consensus][raft][peerserver][handshake]")
+{
+    auto const challenge = ExpectedChallenge();
+    Cluster::PskRaftPeerCredential const credential { ClusterKey() };
+    SystemRandomSource random { 3 };
+    DiallerHandshake handshake { credential, NodeId { DiallerId }, NodeId { ServerId }, random };
+    auto const proof = handshake.Answer(challenge);
+    REQUIRE(proof.has_value());
+
+    RecordingSink sink;
+    auto const served = RunOnce(RaftWire::EncodeProof(*proof, /*version=*/1), sink);
+
+    CHECK(served.Refused(AcceptorRefusal::NoHandshake) == 1);
+    CHECK_FALSE(served.Verdict().has_value());
+}
+
+TEST_CASE("A dialler with a different key is refused, counted, and told nothing", "[consensus][raft][peerserver][handshake]")
+{
+    Dialler dialler { DiallerId, ServerId, StrangerKey() };
+    dialler.Send(VoteFrame(1));
+
+    RecordingSink sink;
+    auto const served = RunOnce(dialler.Wire(), sink);
+
+    CHECK(sink.received.empty());
+    CHECK(served.Refused(AcceptorRefusal::Proof) == 1);
+    CHECK(served.AnyRefusals() == 1);
+
+    // A verdict exists only for a proof whose MAC verified; this one gets the challenge
+    // and a close.
+    CHECK_FALSE(served.Verdict().has_value());
+}
+
+TEST_CASE("A dialler with no key at all is refused and counted", "[consensus][raft][peerserver][handshake]")
+{
+    // The tag is whatever a peer holding nothing can put there.
+    auto const proof = RaftWire::ProofFrame {
+        .dialler = NodeId { DiallerId }, .target = NodeId { ServerId }, .nonce = ExpectedChallenge().nonce, .tag = {}
+    };
+
+    RecordingSink sink;
+    auto const served = RunOnce(RaftWire::EncodeProof(proof), sink);
+
+    CHECK(served.Refused(AcceptorRefusal::Proof) == 1);
+    CHECK_FALSE(served.Verdict().has_value());
+}
+
+TEST_CASE("A proof recorded against another challenge is refused", "[consensus][raft][peerserver][handshake]")
+{
+    // A genuine proof, harvested from a connection whose challenge was different. The
+    // server's challenge on THIS connection is what it answers, and it does not.
+    Cluster::PskRaftPeerCredential const credential { ClusterKey() };
+    SystemRandomSource random { 4 };
+    DiallerHandshake handshake { credential, NodeId { DiallerId }, NodeId { ServerId }, random };
+    auto elsewhere = ExpectedChallenge();
+    elsewhere.nonce[0] ^= std::byte { 0x01 };
+    auto const recorded = handshake.Answer(elsewhere);
+    REQUIRE(recorded.has_value());
+
+    RecordingSink sink;
+    auto const served = RunOnce(RaftWire::EncodeProof(*recorded), sink);
+
+    CHECK(served.Refused(AcceptorRefusal::Proof) == 1);
+    CHECK_FALSE(served.Verdict().has_value());
+}
+
+TEST_CASE("A proven dialler that dialled another member is refused with a signed verdict",
+          "[consensus][raft][peerserver][handshake]")
+{
+    Dialler dialler { DiallerId, "n9", ClusterKey() };
+    dialler.Send(VoteFrame(1));
+
+    RecordingSink sink;
+    auto const served = RunOnce(dialler.Wire(), sink);
+
+    CHECK(sink.received.empty());
+    CHECK(served.Refused(AcceptorRefusal::WrongTarget) == 1);
+    CHECK(served.AnyRefusals() == 1);
+
+    auto const verdict = served.Verdict();
+    REQUIRE(verdict.has_value());
+    CHECK(Unwrap(verdict).verdict == RaftWire::HandshakeVerdict::WrongTarget);
+    CHECK(dialler.Handshake().Conclude(Unwrap(verdict)).outcome == VerdictOutcome::WrongTarget);
+}
+
+TEST_CASE("A proven dialler under this node's own id is refused with a signed verdict",
+          "[consensus][raft][peerserver][handshake]")
+{
+    Dialler dialler { ServerId, ServerId, ClusterKey() };
+
+    RecordingSink sink;
+    auto const served = RunOnce(dialler.Wire(), sink);
+
+    CHECK(served.Refused(AcceptorRefusal::OwnId) == 1);
+    auto const verdict = served.Verdict();
+    REQUIRE(verdict.has_value());
+    CHECK(dialler.Handshake().Conclude(Unwrap(verdict)).outcome == VerdictOutcome::OwnId);
+}
+
+TEST_CASE("A proof declaring more than its ceiling is refused before it is read", "[consensus][raft][peerserver][handshake]")
+{
+    // Only the header is sent. A server that believed the declaration would sit waiting
+    // for a payload that is not coming, see the connection end, and count nothing -- so
+    // the counter moving is what shows the refusal came first.
+    auto header = std::vector<std::byte>(RaftWire::HeaderSize);
+    WireFrame::PutHeader(header,
+                         RaftWire::Magic,
+                         RaftWire::CurrentVersion,
+                         static_cast<std::uint8_t>(RaftWire::MessageType::Proof),
+                         static_cast<std::uint32_t>(RaftWire::MaxHandshakePayload + 1));
+
+    RecordingSink sink;
+    auto const served = RunOnce(header, sink);
+
+    CHECK(served.Refused(AcceptorRefusal::NoHandshake) == 1);
+}
+
+TEST_CASE("A peer that sends nothing is challenged, closed, and not counted", "[consensus][raft][peerserver][handshake]")
+{
+    // A peer that sent NOTHING asked nothing. It is still sent the challenge -- first, and
+    // before anything is read -- and a close with no counter is the ordinary answer to a
+    // connection that ends.
+    RecordingSink sink;
+    auto const served = RunOnce({}, sink);
+
+    CHECK(served.AnyRefusals() == 0);
+    auto const header = RaftWire::DecodeHeader(served.replied);
+    REQUIRE(header.has_value());
+    CHECK(Unwrap(header).kindRaw == static_cast<std::uint8_t>(RaftWire::MessageType::Challenge));
+}
+
+TEST_CASE("A frame whose tag does not verify ends the connection and is counted", "[consensus][raft][peerserver][handshake]")
+{
+    SECTION("its bytes changed on the way")
+    {
+        Dialler dialler;
+        dialler.Send(VoteFrame(1));
+        dialler.Wire()[dialler.Wire().size() - RaftWire::TagSize - 1] ^= std::byte { 0x01 };
+        dialler.Send(VoteFrame(2));
+
+        RecordingSink sink;
+        auto const served = RunOnce(dialler.Wire(), sink);
+        CHECK(sink.received.empty());
+        CHECK(served.Refused(AcceptorRefusal::FrameTag) == 1);
+    }
+
+    SECTION("the same frame, sent twice")
+    {
+        Dialler dialler;
+        auto const once = dialler.Send(VoteFrame(1));
+        dialler.SendRaw(once);
+
+        RecordingSink sink;
+        auto const served = RunOnce(dialler.Wire(), sink);
+        CHECK(sink.received.size() == 1);
+        CHECK(served.Refused(AcceptorRefusal::FrameTag) == 1);
+    }
+
+    SECTION("a frame from another connection's session")
+    {
+        // Another connection's session: same ids, same key, same dialler nonce even --
+        // and a different acceptor nonce, which is what makes it another connection.
+        Dialler dialler;
+        SystemRandomSource random { 0xBEEF };
+        Cluster::PskRaftPeerCredential const credential { ClusterKey() };
+        SessionNonces const foreign { .acceptor = DrawNonce(random), .dialler = dialler.Proof().nonce };
+        REQUIRE(foreign.acceptor != ExpectedChallenge().nonce);
+        FrameSealer sealer { credential, foreign };
+        auto const frame = VoteFrame(1);
+        dialler.SendRaw(frame);
+        dialler.SendRaw(sealer.Seal(frame));
+
+        RecordingSink sink;
+        auto const served = RunOnce(dialler.Wire(), sink);
+        CHECK(sink.received.empty());
+        CHECK(served.Refused(AcceptorRefusal::FrameTag) == 1);
+    }
+
+    SECTION("a frame sealed by something without the key")
+    {
+        Dialler dialler;
+        Cluster::PskRaftPeerCredential const stranger { StrangerKey() };
+        FrameSealer forging { stranger,
+                              SessionNonces { .acceptor = ExpectedChallenge().nonce, .dialler = dialler.Proof().nonce } };
+        auto const frame = VoteFrame(1);
+        dialler.SendRaw(frame);
+        dialler.SendRaw(forging.Seal(frame));
+
+        RecordingSink sink;
+        auto const served = RunOnce(dialler.Wire(), sink);
+        CHECK(sink.received.empty());
+        CHECK(served.Refused(AcceptorRefusal::FrameTag) == 1);
+    }
+}
+
+TEST_CASE("A verified message naming another sender ends the connection and is counted",
+          "[consensus][raft][peerserver][handshake]")
+{
+    // The member a connection proved is the one that speaks on it. A vote naming n3,
+    // on a connection n2 proved, is refused rather than delivered under n3's name.
+    Dialler dialler;
+    dialler.Send(VoteFrame(1));
+    dialler.Send(VoteFrame(2, "n3"));
+    dialler.Send(VoteFrame(3));
+
+    RecordingSink sink;
+    auto const served = RunOnce(dialler.Wire(), sink);
+
+    REQUIRE(sink.received.size() == 1);
+    CHECK(std::get<RequestVoteResponse>(sink.received[0]).voterId == DiallerId);
+    CHECK(served.Refused(AcceptorRefusal::FrameSender) == 1);
+}
+
+TEST_CASE("A connection over the listener's cap is closed and counted", "[consensus][raft][peerserver][handshake]")
+{
+    Dialler dialler;
+    dialler.Send(VoteFrame(1));
+
+    RecordingSink sink;
+    auto const served = RunOnce(dialler.Wire(), sink, PeerServerOptions { .maxConnections = 0, .handshakeBound = 0ms });
+
+    CHECK(sink.received.empty());
+    CHECK(served.Refused(AcceptorRefusal::Full) == 1);
+    CHECK(served.replied.empty());
+}
+
+TEST_CASE("A connection that does not prove the key within the bound is closed and counted",
+          "[consensus][raft][peerserver][handshake]")
+{
+    // Before the handshake existed, a connection that sent nothing held a slot for as long
+    // as its socket lived. Driven over a `TestReactor`, so the bound fires when the clock
+    // says and not when a host is slow enough.
+    constexpr auto Bound = 500ms;
+
+    InMemoryListener listener;
+    NullLogger logger;
+    ManualClock clock;
+    TestReactor reactor { clock };
+    RecordingSink sink;
+    AtomicMetricsSink metrics;
+    Cluster::PskRaftPeerCredential const credential { ClusterKey() };
+    ScriptedRandomSource random { ServerNonceScript() };
+    RaftPeerServer server { listener,
+                            reactor,
+                            sink,
+                            logger,
+                            metrics,
+                            credential,
+                            NodeId { ServerId },
+                            random,
+                            PeerServerOptions { .handshakeBound = Bound } };
+
+    auto accepting = [](RaftPeerServer* s) -> DetachedTask {
+        co_await s->Run();
+    };
+    accepting(&server);
+
+    auto const client = listener.ConnectClient();
+    reactor.Drain();
+
+    auto const timedOut = [&metrics] {
+        return metrics.Read(RowFor(AcceptorRefusal::HandshakeTimeout).counter);
+    };
+
+    clock.Advance(Bound / 2);
+    reactor.Drain();
+    CHECK(timedOut() == 0);
+
+    clock.Advance(Bound);
+    reactor.Drain();
+    CHECK(timedOut() == 1);
+
+    // The control the bound needs beside it: nothing else was counted, so the close was
+    // the bound's and not a refusal of something the peer sent.
+    CHECK(metrics.Read(RowFor(AcceptorRefusal::NoHandshake).counter) == 0);
+    CHECK(sink.received.empty());
+
+    listener.Close();
+    reactor.Drain();
+    CHECK(reactor.PendingTimers() == 0);
 }
 
 namespace
@@ -395,6 +895,9 @@ TEST_CASE("Shutdown closes the peer listener on the reactor, not on the calling 
     ClosingThreadListener listener;
     RecordingSink sink;
     NullLogger logger;
+    AtomicMetricsSink metrics;
+    Cluster::PskRaftPeerCredential const credential { ClusterKey() };
+    SystemRandomSource random { 5 };
     RunningReactor loop;
 
     // The arrangement, asserted rather than assumed: if the reactor were not running,
@@ -403,7 +906,7 @@ TEST_CASE("Shutdown closes the peer listener on the reactor, not on the calling 
     REQUIRE(WaitFor([&loop] { return loop.Get().Running(); }));
     REQUIRE_FALSE(loop.Get().IsOnWorkerThread());
 
-    RaftPeerServer server { listener, loop.Get(), sink, logger };
+    RaftPeerServer server { listener, loop.Get(), sink, logger, metrics, credential, NodeId { ServerId }, random };
 
     server.Shutdown();
 
