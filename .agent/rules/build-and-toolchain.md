@@ -2191,6 +2191,57 @@ rule, rest on that sentence, and it does not reproduce** (#565).
   buy an exit code and still leave nothing asserting that any given check can
   fail.
 
+## A guard's stated BLIND SPOT is nobody's to re-derive, so it must name its DIRECTION
+
+**Being blind to a MENTION is free. Being blind to a USE is the whole job.**
+
+`fastcached_strip_comment_line` in `scripts/lib/CheckCommon.cmake` is the one comment stripper
+for eight checks -- `check-test-loops`, `check-cli-text-cell`, `check-enumerator-walks`,
+`check-istreambuf-iterator`, `check-markup-entities`, `check-ranges-seam`,
+`check-selftest-registered`, `check-target-pragmas` -- so a defect in it is a defect in all of
+them at once. Its header declared one, for as long as it existed:
+
+> Still blind to either introducer inside a STRING LITERAL, as every regex-shaped reader here is.
+
+That sentence is accurate and points the wrong way. It reads as a false POSITIVE -- a comment
+inside a literal being stripped, which costs nothing and is what "as every regex-shaped reader
+here is" is true of. The consequence was a false GREEN.
+`src/apps/fastcache-cli/SocketExchange.cpp:410` holds a one-line `std::format` request
+literal whose header lines are separated by escaped CRLFs, one of them `Accept: */*`. The
+three
+characters `*`, `/`, `*` in `Accept: */*` contain a `/*`; no `*/` follows on that line; the
+stripper entered a block comment and blanked the remaining **51 lines of the file**, a `for (;;)`
+at line 420 among them. Every one of the eight checks then reported a clean count over lines it
+had never read. The sibling shape -- a `//` inside a literal -- truncated **21 lines across 16
+files**, losing text like `//") == 0)` and `"))`: in several cases the rest of a `REQUIRE`.
+Closed in #1494.
+
+**The ordering trap is that the paragraph eight lines below it in the same header describes this
+exact failure** -- "every remaining line of that file was skipped while the caller still printed
+a clean count over lines it never read -- a false green, in the one direction a check exists to
+refuse" -- about a defect that had already been fixed three times, one step further in. Whoever
+wrote the blind-spot note had the vocabulary and used it on the wrong half.
+
+Three things to carry out of it, none of which is "read guards more carefully":
+
+- **Ask a question the subject's own well-formedness answers, not a pattern census.** A C++ file
+  that COMPILES cannot end inside an unterminated block comment, so *does the stripper leave one
+  open at EOF* has no false positives at all. Exactly one file of 915 did, and it was the one.
+  A grep for `/*` inside quotes would have produced a list to argue about instead.
+- **A self-test written for what a stripper REMOVES passes under the entire defect.** Every
+  assertion about removal is satisfied by a stripper that removes too much. Assert what
+  SURVIVES, and prove the cases can fail by neutering the library: each case in
+  `check-comment-stripper-selftest.cmake` is green over a function that returns its input
+  unchanged, so six neuters are what make the table mean anything, and a neuter that provokes
+  nothing is reported as the self-test's own failure.
+- **A fix's own REACH is part of the fix.** `'` is deliberately not a literal opener here: 262
+  lines of this tree are digit separators (`1'000'000`), so treating a quote-shaped character as
+  a char literal would blank the tail of twelve times as many lines as the defect ever touched.
+  A `'"'` therefore opens a literal that usually does not close on its line, and an unterminated
+  literal KEEPS the rest of the line rather than dropping it -- the fail-CLOSED direction, since
+  a finding somebody can see and exempt beats a clean report over text that was dropped. Both
+  limits are pinned by cases so they stay decisions rather than becoming discoveries.
+
 ## A guard's REMEDY TEXT is part of the guard
 
 **Nothing tests it, and it is the only part of a check most people ever read.**

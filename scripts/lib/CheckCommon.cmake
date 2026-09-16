@@ -355,59 +355,202 @@ endfunction()
 # stripping over whole content rather than a per-line match: the comment-ordering defect
 # described inside has already had three copies, and a fourth would be the next.
 #
-# The blind spot, stated rather than papered over: CMake's regex engine is greedy and has no
-# lazy quantifier, so stripping inline `/* ... */` pairs takes everything between the FIRST `/*`
-# and the LAST `*/` on a line. Code sitting between two block comments on one line is invisible
-# here. Still blind to either introducer inside a STRING LITERAL, as every regex-shaped reader
-# here is.
+# A string literal's CONTENTS are code here, and that is the whole of why this is a scan rather
+# than a pair of regexes. Both of the blind spots this header used to declare were the same
+# false GREEN, which is the one direction a check exists to refuse:
 #
+#   * a `/*` inside a literal opened a block comment. `SocketExchange.cpp:410` carries
+#     `"...Accept: */*\r\n..."`, no `*/` follows on that line, and the remaining 51 lines of the
+#     file -- a `for (;;)` among them -- were blanked while the caller printed a clean count over
+#     lines it had never read. Proof that this was the only such file, and that there was one:
+#     a C++ file that COMPILES cannot end inside an unterminated block comment, and exactly one
+#     of 915 did.
+#   * a `//` inside a literal truncated the line there. 21 lines across 16 files, losing text
+#     like `//") == 0)` -- the rest of a `REQUIRE`.
+#
+# The old header called this "blind to either introducer inside a STRING LITERAL, as every
+# regex-shaped reader here is", which reads as a false-POSITIVE risk and is the reason it sat
+# for as long as it did. Being blind to a MENTION costs nothing; being blind to a USE is what
+# this function exists to prevent.
+#
+# Two limits remain, and both are stated because neither is a guess:
+#
+#   * A literal that does not END on its line -- a raw string's first line, 10 of them here --
+#     is kept as code from the quote onward, and the scan resumes on the next line outside any
+#     literal. So a `/*` inside a raw string's BODY still opens a comment. Keeping the text is
+#     the fail-CLOSED direction: a finding somebody can see and exempt, rather than a clean
+#     report over what was dropped.
+#   * `'` is NOT an opener. 262 lines here are digit separators (`1'000'000`), and treating a
+#     quote-shaped character as a char literal would blank the tail of every one of them -- a
+#     fix with twelve times the reach of the defect. A `'\"'` therefore opens a literal that
+#     usually does not close on its line, which lands on the keep-it-all path above.
+#
+# Where the string literal opening at @p quoteAt ends, or -1 when it does not end on this line.
+#
+# Needed because a comment introducer inside a string literal is not one, and the closing quote
+# is the only thing that says where the literal stops.
+#
+# A regex cannot answer it. CMake's engine has no lazy quantifier, so `^"([^"\\]|\\.)*"` runs
+# greedily to the LAST quote on the line and reports `"a" + "b"` as a single literal -- which
+# would hand back a literal spanning the code between them.
+#
+# An ODD run of backslashes immediately before a quote escapes it and an even one does not, so
+# `"a\\"` ends at its last character while `"a\""` does not. Counted backwards, and never past
+# the opening quote, whose own predecessors are outside the literal.
+#
+# @param text The line.
+# @param quoteAt Index of the opening quote.
+# @param endOut Set to the index of the closing quote, or -1 when there is none on this line.
+function(fastcached_literal_end text quoteAt endOut)
+    string(LENGTH "${text}" length)
+    math(EXPR from "${quoteAt} + 1")
+    while(from LESS length)
+        string(SUBSTRING "${text}" ${from} -1 tail)
+        string(FIND "${tail}" "\"" hit)
+        if(hit EQUAL -1)
+            break()
+        endif()
+        math(EXPR candidate "${from} + ${hit}")
+        set(slashes 0)
+        math(EXPR back "${candidate} - 1")
+        while(back GREATER ${quoteAt})
+            string(SUBSTRING "${text}" ${back} 1 character)
+            if(NOT character STREQUAL "\\")
+                break()
+            endif()
+            math(EXPR slashes "${slashes} + 1")
+            math(EXPR back "${back} - 1")
+        endwhile()
+        math(EXPR escaped "${slashes} % 2")
+        if(escaped EQUAL 0)
+            set(${endOut} ${candidate} PARENT_SCOPE)
+            return()
+        endif()
+        math(EXPR from "${candidate} + 1")
+    endwhile()
+    set(${endOut} -1 PARENT_SCOPE)
+endfunction()
+
+# ---------------------------------------------------------------------------
 # @param line The line, without its newline.
 # @param inBlockComment Whether a block comment was open when the line began.
 # @param strippedOut Set to what is left of the line: code only.
 # @param skipOut Set to TRUE when the whole line sits inside a block comment.
 # @param inBlockCommentOut Set to whether a block comment is still open when the line ends.
 function(fastcached_strip_comment_line line inBlockComment strippedOut skipOut inBlockCommentOut)
-    set(stripped "${line}")
-    set(skipLine FALSE)
-    if(inBlockComment)
-        if(NOT stripped MATCHES "\\*/")
-            set(skipLine TRUE)
-            set(stripped "")
-        else()
-            string(REGEX REPLACE "^.*\\*/" "" stripped "${stripped}")
-            set(inBlockComment FALSE)
-        endif()
+    # The fast path, and the reason the scan below is affordable: a line carrying neither `//`
+    # nor `/*`, outside a block comment, is already code. That is almost every line of the
+    # ~180k a full-tree walk reads, and it costs one regex.
+    if(NOT inBlockComment AND NOT line MATCHES "/[/*]")
+        set(${strippedOut} "${line}" PARENT_SCOPE)
+        set(${skipOut} FALSE PARENT_SCOPE)
+        set(${inBlockCommentOut} FALSE PARENT_SCOPE)
+        return()
     endif()
-    if(NOT skipLine)
-        string(REGEX REPLACE "/\\*.*\\*/" " " stripped "${stripped}")
 
-        # Which introducer comes FIRST decides. The order is not a detail: the `/*` test used
-        # to run BEFORE `//` was stripped, so a line comment mentioning `/*` opened a block
-        # comment no `*/` ever closed, and every remaining line of that file was skipped while
-        # the caller still printed a clean count over lines it never read -- a false green, in
-        # the one direction a check exists to refuse.
-        #
-        # Positional rather than simply stripping `//` first, which MEASURED identical on every
-        # input tried: below the inline `/* ... */` strip above, removing `//...` removes any
-        # `/*` that followed it too, so the two orderings agree. What position buys is not a
-        # different verdict but independence -- it states the rule itself rather than being
-        # correct only while the strip above it keeps running first. A reordering is correct by
-        # PRECONDITION; this is correct by construction.
-        #
-        # Third copy of this defect: `check-cli-text-cell.cmake` and
-        # `check-markup-entities.cmake` carried it too, in walks of their own.
-        string(FIND "${stripped}" "/*" blockAt)
-        string(FIND "${stripped}" "//" lineAt)
-        if(NOT blockAt EQUAL -1 AND (lineAt EQUAL -1 OR blockAt LESS lineAt))
-            string(SUBSTRING "${stripped}" 0 ${blockAt} stripped)
-            set(inBlockComment TRUE)
-        elseif(NOT lineAt EQUAL -1)
-            string(SUBSTRING "${stripped}" 0 ${lineAt} stripped)
+    set(code "")
+    set(rest "${line}")
+    set(open "${inBlockComment}")
+    # A line that BEGAN inside a block comment and never leaves it is the whole-line-comment
+    # case the callers skip. Cleared the moment a `*/` is consumed, which is what the old
+    # `MATCHES "\\*/"` test answered.
+    set(skipLine "${inBlockComment}")
+    while(TRUE)
+        string(LENGTH "${rest}" restLength)
+        if(open)
+            string(FIND "${rest}" "*/" closeAt)
+            if(closeAt EQUAL -1)
+                break()
+            endif()
+            # A space in place of the comment, so it cannot JOIN the tokens it sat between:
+            # `int/*x*/y` must not read as one identifier. A joined token is a match this
+            # reader invented, and the old greedy `REGEX REPLACE` substituted a space for
+            # exactly this reason.
+            string(APPEND code " ")
+            set(open FALSE)
+            set(skipLine FALSE)
+            math(EXPR after "${closeAt} + 2")
+            if(after GREATER_EQUAL restLength)
+                break()
+            endif()
+            string(SUBSTRING "${rest}" ${after} -1 rest)
+            continue()
         endif()
-    endif()
-    set(${strippedOut} "${stripped}" PARENT_SCOPE)
+
+        # Outside a comment, whichever of a QUOTE, a `//` and a `/*` comes FIRST decides.
+        #
+        # The quote is in that race because a comment introducer inside a string literal is
+        # not a comment introducer. Leaving it out is what let `"Accept: */*"` open a block
+        # comment nothing closed, hiding the rest of that file from a clean-reporting scan.
+        #
+        # That the other two are decided POSITIONALLY rather than by stripping `//` first is
+        # older and has its own history: the `/*` test used to run first, so a line comment
+        # MENTIONING `/*` opened a comment no `*/` ever closed -- the same false green, two
+        # steps in. Third copy of it: `check-cli-text-cell.cmake` and
+        # `check-markup-entities.cmake` carried it too, in walks of their own.
+        string(FIND "${rest}" "\"" quoteAt)
+        string(FIND "${rest}" "//" lineAt)
+        string(FIND "${rest}" "/*" blockAt)
+        set(first -1)
+        set(kind "none")
+        if(NOT quoteAt EQUAL -1)
+            set(first ${quoteAt})
+            set(kind "quote")
+        endif()
+        if(NOT lineAt EQUAL -1 AND (first EQUAL -1 OR lineAt LESS first))
+            set(first ${lineAt})
+            set(kind "line")
+        endif()
+        if(NOT blockAt EQUAL -1 AND (first EQUAL -1 OR blockAt LESS first))
+            set(first ${blockAt})
+            set(kind "block")
+        endif()
+
+        if(kind STREQUAL "none")
+            string(APPEND code "${rest}")
+            break()
+        endif()
+
+        string(SUBSTRING "${rest}" 0 ${first} head)
+        string(APPEND code "${head}")
+
+        if(kind STREQUAL "line")
+            break()
+        endif()
+
+        if(kind STREQUAL "block")
+            set(open TRUE)
+            math(EXPR after "${first} + 2")
+            if(after GREATER_EQUAL restLength)
+                break()
+            endif()
+            string(SUBSTRING "${rest}" ${after} -1 rest)
+            continue()
+        endif()
+
+        # A string literal. Copy it through, closing quote included, and resume after it.
+        fastcached_literal_end("${rest}" ${first} endAt)
+        if(endAt EQUAL -1)
+            # It does not end on this line: a raw string's first line, or a continuation. KEEP
+            # the rest as code. A reader that keeps text can only produce a finding somebody
+            # sees and exempts; one that drops it reports clean over what it never read, which
+            # is the failure this whole function was rewritten for.
+            string(SUBSTRING "${rest}" ${first} -1 tail)
+            string(APPEND code "${tail}")
+            break()
+        endif()
+        math(EXPR through "${endAt} + 1")
+        math(EXPR span "${through} - ${first}")
+        string(SUBSTRING "${rest}" ${first} ${span} literal)
+        string(APPEND code "${literal}")
+        if(through GREATER_EQUAL restLength)
+            break()
+        endif()
+        string(SUBSTRING "${rest}" ${through} -1 rest)
+    endwhile()
+    set(${strippedOut} "${code}" PARENT_SCOPE)
     set(${skipOut} "${skipLine}" PARENT_SCOPE)
-    set(${inBlockCommentOut} "${inBlockComment}" PARENT_SCOPE)
+    set(${inBlockCommentOut} "${open}" PARENT_SCOPE)
 endfunction()
 
 # ---------------------------------------------------------------------------

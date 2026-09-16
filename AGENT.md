@@ -1185,6 +1185,14 @@ what differs between compilers, standard libraries, hosts and tool versions.
     it therefore exits **0** and prints a real `CMake Error` from a nested `cmake -P`, which
     leaves the pattern as the only thing that can fail it. Fixing a wrong *reason* without
     re-deriving what it justified is how a guard survives as decoration.
+- **A guard's own stated BLIND SPOT is nobody's to re-derive, so it must name the DIRECTION it
+  fails in.** The shared C++ comment stripper declared itself "blind to either introducer inside
+  a STRING LITERAL, as every regex-shaped reader here is" — which reads as a false POSITIVE and
+  was a false GREEN: `"Accept: */*"` opened a block comment nothing closed, and 51 lines of that
+  file, a `for (;;)` among them, were invisible to eight checks at once while each printed a
+  clean count over lines it had never read (#1494). Being blind to a MENTION is free; being
+  blind to a USE is the whole job. A self-test written for what a stripper REMOVES passes under
+  all of it, so assert what SURVIVES.
 - **A guard's REMEDY TEXT is part of the guard. Nothing tests it, and it is the only part of a
   check most people ever read.** It survives every test a check normally gets, because a
   self-test asserts THAT the check objected and never what it advised. The window is a change of
@@ -1612,8 +1620,13 @@ and what they may assume.
 - A C++ test waits through `src/tests/BoundedWait.hpp`: `WaitUntil` on the case's thread,
   `OffThreadWaits` on a helper thread (Catch2's messages belong to the case's thread),
   `AwaitUntil` in a coroutine on a reactor — and a coroutine whose wait ran out STOPS there —
-  never a counted or unbounded poll. `ctest -R test-loops` refuses an atomic-polling `while`, a
-  coroutine `while` that opens by parking, and every C-style `for` in tests. **Neuter a new wait and watch the teardown**: two such failures in #1446
+  never a counted or unbounded poll. `ctest -R test-loops` refuses an atomic-polling `while` and
+  a coroutine `while` that opens by parking **in tests** — their remedy is a test header, so
+  widening them would refuse correct production code with advice nobody can follow — and a
+  C-style `for` **anywhere under `src/`**. The 148 production sites that already exist are a
+  RATCHET (`scripts/check-test-loops-backlog.txt`, keyed on a count per file, refusing a count
+  that has risen AND one that has fallen without being recorded); a new one is refused, never
+  added to it. **Neuter a new wait and watch the teardown**: two such failures in #1446
   were hangs and aborts, not reds.
 - A **cumulative** figure cannot answer a question about **now**, and a duty cycle over the same
   window is the same number divided by the same constant. Draw the verdict from a RECENT window

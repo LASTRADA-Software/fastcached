@@ -92,14 +92,36 @@ if(NOT DEFINED FASTCACHED_SOURCE_DIR)
 endif()
 
 # ---------------------------------------------------------------------------
-# What is scanned: one row per kind of file, as a git pathspec under the source root.
+# What is scanned, and by WHICH rule: one row per kind of file, as a git pathspec under the
+# source root. A file matching several rows is in scope for the UNION of their rules, which is
+# how a `*_test.cpp` is also a `*.cpp`.
 #
-# pathspec|what it is
+# The rules column is not a refinement of the scope, it is the scope. Widening all three rules
+# to `src/` fired `spin` 16 times and `poll` 5 times, every one in a PRODUCTION file: reactor
+# shutdown checks, `FrameEndpoint`'s drain, the bench's worker loops. Their remedy is
+# `src/tests/BoundedWait.hpp` -- a header a production source cannot include -- so a widened
+# `spin` refuses correct code and then tells the author to do something impossible. A guard's
+# REMEDY TEXT is part of the guard, and the two rules' rationale in `.agent/rules/testing.md`
+# is about waits in TESTS. So `loop` widens to all of `src/` (#1452) and they do not.
+#
+# pathspec|rules|what it is
 set(FastCachedTestLoopScope
-    "src/*_test.cpp|every Catch2 test source (#1446)"
-    "src/tests/*.cpp|the shared test programs and canaries (#1446)"
-    "src/tests/*.hpp|the shared test helpers (#1446)"
+    "src/*_test.cpp|loop spin poll|every Catch2 test source (#1446)"
+    "src/tests/*.cpp|loop spin poll|the shared test programs and canaries (#1446)"
+    "src/tests/*.hpp|loop spin poll|the shared test helpers (#1446)"
+    "src/*.cpp|loop|every other C++ source (#1452)"
+    "src/*.hpp|loop|every other C++ header (#1452)"
 )
+
+# ---------------------------------------------------------------------------
+# Sites nobody has decided about yet, and the issue that will decide them: the RATCHET, whose
+# rows live in `scripts/check-test-loops-backlog.txt` and whose reasoning lives there with them.
+#
+# What matters here: a backlog row is a different CLAIM from an exemption row below. An exemption
+# says *this site is right and must stay, here is why*. A backlog row says *nobody has decided
+# about this yet*, and it is safe only because this check tallies them and prints the total per
+# issue on every run -- the argument `RefuseUntriaged` rests on in
+# `.agent/rules/metrics-and-observability.md`.
 
 # ---------------------------------------------------------------------------
 # Sites that stay, and why.
@@ -127,8 +149,22 @@ set(whileCondition "([^;(){}]|\\(([^;(){}]|\\([^;(){}]*\\))*\\))*")
 set(spinPattern "(^|[^A-Za-z0-9_])while[ \t\r\n]*\\(${whileCondition}(\\.|->)load[ \t\r\n]*\\(")
 # The condition, its closing `)`, an optional `{`, then the park -- qualified or not -- and one
 # character that ends its name, so `ResumeOnce` is not `ResumeOn`.
+# The same three patterns ANCHORED at the start, used to decide WHERE a match is.
+# `string(REGEX MATCH)` does not report an offset, and locating the match by searching for
+# its own TEXT is wrong whenever that text occurs earlier in the file -- for a `for (;;)` the
+# extracted header is ` for (`, six characters, so the search lands on the file's first
+# `for (`, which in this tree is very often a RANGE-FOR. Measured: `SocketExchange.cpp`
+# reported its range-fors at lines 39 and 51 as C-style loops. The pattern itself never
+# matches a range-for, so this was attribution alone -- and a report naming a line that
+# holds a range-for is a confidently wrong signal, which is worse than a miscount.
+#
+# Anchored, without the leading boundary character, which the walk strips from the header.
+set(loopPatternAnchored "^for[ \t\r\n]*\\(${headerElement}*;${headerElement}*;")
+set(spinPatternAnchored "^while[ \t\r\n]*\\(${whileCondition}(\\.|->)load[ \t\r\n]*\\(")
 set(pollPattern
     "(^|[^A-Za-z0-9_])while[ \t\r\n]*\\(${whileCondition}\\)[ \t\r\n]*\\{?[ \t\r\n]*co_await[ \t\r\n]+([A-Za-z_][A-Za-z0-9_]*[ \t\r\n]*::[ \t\r\n]*)*(SleepFor|SleepUntil|ResumeOn)[^A-Za-z0-9_]")
+set(pollPatternAnchored
+    "^while[ \t\r\n]*\\(${whileCondition}\\)[ \t\r\n]*\\{?[ \t\r\n]*co_await[ \t\r\n]+([A-Za-z_][A-Za-z0-9_]*[ \t\r\n]*::[ \t\r\n]*)*(SleepFor|SleepUntil|ResumeOn)[^A-Za-z0-9_]")
 
 # ---------------------------------------------------------------------------
 # Exemption rows, checked for shape before anything is decided from them.
@@ -160,6 +196,7 @@ foreach(row IN LISTS FastCachedTestLoopExemptions)
     math(EXPR exemptionIndex "${exemptionIndex} + 1")
 endforeach()
 set(exemptionCount ${exemptionIndex})
+
 
 # ---------------------------------------------------------------------------
 # Which files, per scope row, asked of git -- a dependency cache and a build tree are
@@ -196,13 +233,128 @@ endif()
 # became an index read is the defect this line exists to make visible.
 message(STATUS "test-loops: mode: ${scanMode}")
 
-set(sourceFiles "")
-foreach(scopeRow IN LISTS FastCachedTestLoopScope)
-    string(FIND "${scopeRow}" "|" bar)
-    if(bar EQUAL -1)
-        message(FATAL_ERROR "test-loops: scope row carries no '|', so it says nothing about what it is:\n  ${scopeRow}")
+# ---------------------------------------------------------------------------
+# The path is overridable so `check-test-loops-selftest.cmake` can stage a backlog beside its
+# synthetic tree. That is a seam a self-test takes and CI does not, so the resolved path is part
+# of this check's OUTPUT on every run -- a guard whose self-test exercised one mode while CI
+# exercised another has already shipped in this tree and passed.
+if(NOT DEFINED FASTCACHED_TEST_LOOPS_BACKLOG)
+    set(FASTCACHED_TEST_LOOPS_BACKLOG "${CMAKE_CURRENT_LIST_DIR}/check-test-loops-backlog.txt")
+endif()
+if(NOT EXISTS "${FASTCACHED_TEST_LOOPS_BACKLOG}")
+    message("")
+    message("  The backlog file is not there: ${FASTCACHED_TEST_LOOPS_BACKLOG}")
+    message("")
+    message("Refused by name rather than read as an empty backlog. Empty would refuse every")
+    message("un-converted site in the tree -- loudly, and with a diagnosis that sends whoever")
+    message("meets it to the loops rather than to the missing file.")
+    message(FATAL_ERROR "test-loops: the backlog file cannot be read")
+endif()
+file(STRINGS "${FASTCACHED_TEST_LOOPS_BACKLOG}" backlogLines)
+set(FastCachedTestLoopBacklog "")
+foreach(backlogLine IN LISTS backlogLines)
+    string(STRIP "${backlogLine}" backlogLine)
+    if(backlogLine STREQUAL "" OR backlogLine MATCHES "^#")
+        continue()
     endif()
-    string(SUBSTRING "${scopeRow}" 0 ${bar} pathspec)
+    list(APPEND FastCachedTestLoopBacklog "${backlogLine}")
+endforeach()
+get_filename_component(backlogShown "${FASTCACHED_TEST_LOOPS_BACKLOG}" NAME)
+# WHICH backlog, on every run and before any row is judged: the path is overridable so
+# the self-test can stage one, and a run judged against the wrong table would otherwise
+# look exactly like a run judged against the right one.
+message(STATUS "test-loops: backlog file: ${backlogShown}")
+
+# ---------------------------------------------------------------------------
+# Backlog rows, checked for shape before anything is decided from them. A malformed row would
+# otherwise read as a count of zero, which is the direction that waves a new site through.
+set(backlogIndex 0)
+set(backlogIssues "")
+set(backlogSeen "")
+foreach(row IN LISTS FastCachedTestLoopBacklog)
+    string(REPLACE "|" ";" fields "${row}")
+    list(LENGTH fields fieldCount)
+    if(NOT fieldCount EQUAL 4)
+        message("")
+        message("  FastCachedTestLoopBacklog row has ${fieldCount} field(s), not 4:")
+        message("    ${row}")
+        message("")
+        message("The shape is rule|file|count|issue. A row this reader cannot split would be read")
+        message("as a count of zero, which waves through every site in that file.")
+        message(FATAL_ERROR "test-loops: a backlog row is malformed")
+    endif()
+    list(GET fields 0 backlogRule)
+    list(GET fields 1 backlogFile)
+    list(GET fields 2 backlogCount)
+    list(GET fields 3 backlogIssue)
+    if(NOT backlogRule MATCHES "^(loop|spin|poll)$")
+        message(FATAL_ERROR
+            "test-loops: backlog row names rule `${backlogRule}`, which is not loop, spin or poll:\n  ${row}")
+    endif()
+    if(NOT backlogCount MATCHES "^[1-9][0-9]*$")
+        message(FATAL_ERROR
+            "test-loops: backlog row for ${backlogFile} has count `${backlogCount}`. A row exists to "
+            "record sites that ARE there, so zero is spelled by deleting the row:\n  ${row}")
+    endif()
+    if(NOT backlogIssue MATCHES "^#[1-9][0-9]*$")
+        message(FATAL_ERROR
+            "test-loops: backlog row for ${backlogFile} names `${backlogIssue}` rather than an issue "
+            "like `#1452`. A row whose issue nobody can open is an exemption wearing the wrong "
+            "word:\n  ${row}")
+    endif()
+    # One row per (rule, file). Two would be refused anyway -- the scan matches the first and
+    # the stale sweep reports the second as a site that was converted or deleted, which is false
+    # in every clause and sends whoever reads it looking for a conversion that never happened.
+    if("${backlogRule}/${backlogFile}" IN_LIST backlogSeen)
+        message("")
+        message("  FastCachedTestLoopBacklog has two rows for ${backlogRule} in ${backlogFile}:")
+        message("    ${row}")
+        message("")
+        message("One row per rule per file. With two, the scan matches the first and the second")
+        message("reads as a site that was converted or deleted -- so the count that governs the")
+        message("file is whichever row comes first, which is not a thing anybody chose.")
+        message(FATAL_ERROR "test-loops: a backlog row is duplicated")
+    endif()
+    list(APPEND backlogSeen "${backlogRule}/${backlogFile}")
+    set(backlog_${backlogIndex}_rule "${backlogRule}")
+    set(backlog_${backlogIndex}_file "${backlogFile}")
+    set(backlog_${backlogIndex}_count "${backlogCount}")
+    set(backlog_${backlogIndex}_issue "${backlogIssue}")
+    set(backlog_${backlogIndex}_used 0)
+    list(APPEND backlogIssues "${backlogIssue}")
+    math(EXPR backlogIndex "${backlogIndex} + 1")
+endforeach()
+set(backlogCount ${backlogIndex})
+list(REMOVE_DUPLICATES backlogIssues)
+
+set(sourceFiles "")
+set(ruleFiles_loop "")
+set(ruleFiles_spin "")
+set(ruleFiles_poll "")
+foreach(scopeRow IN LISTS FastCachedTestLoopScope)
+    string(REPLACE "|" ";" scopeFields "${scopeRow}")
+    list(LENGTH scopeFields scopeFieldCount)
+    if(scopeFieldCount LESS 3)
+        message(FATAL_ERROR
+            "test-loops: scope row has ${scopeFieldCount} field(s), not 3. The shape is "
+            "pathspec|rules|what it is, and a row missing its rules column says nothing about "
+            "which rule it puts those files in scope for:\n  ${scopeRow}")
+    endif()
+    list(GET scopeFields 0 pathspec)
+    list(GET scopeFields 1 scopeRules)
+    string(REPLACE " " ";" scopeRules "${scopeRules}")
+    if(NOT scopeRules)
+        message(FATAL_ERROR
+            "test-loops: scope row names no rule, so its files are enumerated and then asked "
+            "nothing:\n  ${scopeRow}")
+    endif()
+    foreach(named IN LISTS scopeRules)
+        if(NOT named MATCHES "^(loop|spin|poll)$")
+            message(FATAL_ERROR
+                "test-loops: scope row names rule `${named}`, which is not loop, spin or "
+                "poll:\n  ${scopeRow}")
+        endif()
+    endforeach()
     set(rowFiles "")
     if(useGit)
         execute_process(
@@ -226,10 +378,28 @@ foreach(scopeRow IN LISTS FastCachedTestLoopScope)
         message(FATAL_ERROR "test-loops: a scope row matched nothing and cannot conclude")
     endif()
     list(APPEND sourceFiles ${rowFiles})
+    foreach(named IN LISTS scopeRules)
+        list(APPEND ruleFiles_${named} ${rowFiles})
+    endforeach()
 endforeach()
 list(REMOVE_DUPLICATES sourceFiles)
 list(SORT sourceFiles)
 list(LENGTH sourceFiles fileCount)
+
+# Every rule must be in scope somewhere. A rule no row names is enumerated by nothing and
+# refuses nothing, which reads exactly like a rule that found no violations.
+foreach(named loop spin poll)
+    if(ruleFiles_${named})
+        list(REMOVE_DUPLICATES ruleFiles_${named})
+    else()
+        message("")
+        message("  No scope row names the `${named}` rule, so it is asked about no file at all.")
+        message("")
+        message("A rule nothing enumerates refuses nothing, and a green run then says the tree is")
+        message("clean of something nobody looked for.")
+        message(FATAL_ERROR "test-loops: the ${named} rule is in scope nowhere")
+    endif()
+endforeach()
 
 # ---------------------------------------------------------------------------
 # The scan.
@@ -237,12 +407,13 @@ set(violations "")
 set(violationCount 0)
 set(loopsSeen 0)
 set(exemptedCount 0)
+set(staleBacklog "")
 
-foreach(relative IN LISTS sourceFiles)
-    if(NOT EXISTS "${FASTCACHED_SOURCE_DIR}/${relative}")
+foreach(sourceFile IN LISTS sourceFiles)
+    if(NOT EXISTS "${FASTCACHED_SOURCE_DIR}/${sourceFile}")
         continue()
     endif()
-    file(READ "${FASTCACHED_SOURCE_DIR}/${relative}" wholeFile)
+    file(READ "${FASTCACHED_SOURCE_DIR}/${sourceFile}" wholeFile)
     # Whole-file filters first: the walk below is O(n^2), and a file with no `for` and no
     # `while` has nothing to say.
     string(FIND "${wholeFile}" "for" forAt)
@@ -262,6 +433,12 @@ foreach(relative IN LISTS sourceFiles)
     # parking until an atomic flips matches both, and is one site to convert, not two.
     set(pollSites "")
     foreach(rule loop poll spin)
+        # This file may not be in scope for this rule -- `spin` and `poll` are test-only.
+        if(NOT sourceFile IN_LIST ruleFiles_${rule})
+            continue()
+        endif()
+        set(ruleSites 0)
+        set(ruleSiteText "")
         set(rest "${code}")
         set(consumed 0)
         while(TRUE)
@@ -269,12 +446,43 @@ foreach(relative IN LISTS sourceFiles)
             if(header STREQUAL "")
                 break()
             endif()
-            string(FIND "${rest}" "${header}" at)
             # The leading character the pattern needs to see a keyword boundary is not part
             # of the header, and a newline there would put the site one line early.
             if(header MATCHES "^[^fw]")
                 string(SUBSTRING "${header}" 1 -1 header)
-                math(EXPR at "${at} + 1")
+            endif()
+            # WHERE the match is. `string(REGEX MATCH)` reports no offset, and the first place
+            # the header's TEXT occurs is at or BEFORE the place the pattern matched -- equal
+            # only when that text is distinctive. It is not for a `for (;;)`, whose header is
+            # ` for (`: the search then lands on the file's first `for (`, very often a
+            # RANGE-FOR. So a candidate is accepted only when the pattern matches ANCHORED
+            # there, and otherwise the next occurrence is tried.
+            set(at -1)
+            set(searchFrom 0)
+            string(LENGTH "${rest}" restLength)
+            while(searchFrom LESS restLength)
+                string(SUBSTRING "${rest}" ${searchFrom} -1 tail)
+                string(FIND "${tail}" "${header}" offsetInTail)
+                if(offsetInTail EQUAL -1)
+                    break()
+                endif()
+                math(EXPR candidate "${searchFrom} + ${offsetInTail}")
+                string(SUBSTRING "${rest}" ${candidate} -1 fromCandidate)
+                if(fromCandidate MATCHES "${${rule}PatternAnchored}")
+                    set(at ${candidate})
+                    break()
+                endif()
+                math(EXPR searchFrom "${candidate} + 1")
+            endwhile()
+            if(at EQUAL -1)
+                message("")
+                message("  In ${sourceFile}, the ${rule} pattern matched a header this scan then could")
+                message("  not LOCATE: <${header}>")
+                message("")
+                message("That is the reader disagreeing with itself -- the unanchored pattern and its")
+                message("anchored twin must accept the same text, and a site nobody can place cannot")
+                message("be reported, exempted or converted. Refused rather than attributed to a guess.")
+                message(FATAL_ERROR "test-loops: a matched site could not be located")
             endif()
             math(EXPR absolute "${consumed} + ${at}")
             string(SUBSTRING "${code}" 0 ${absolute} before)
@@ -294,7 +502,7 @@ foreach(relative IN LISTS sourceFiles)
                 if(index EQUAL exemptionCount)
                     break()
                 endif()
-                if(exempt_${index}_rule STREQUAL rule AND exempt_${index}_file STREQUAL relative)
+                if(exempt_${index}_rule STREQUAL rule AND exempt_${index}_file STREQUAL sourceFile)
                     string(FIND "${header}" "${exempt_${index}_text}" textAt)
                     if(NOT textAt EQUAL -1)
                         math(EXPR exempt_${index}_used "${exempt_${index}_used} + 1")
@@ -307,17 +515,21 @@ foreach(relative IN LISTS sourceFiles)
             elseif(exempted)
                 math(EXPR exemptedCount "${exemptedCount} + 1")
             else()
-                # Text, not a list: a loop's header holds its own `;`, which a CMake list would
-                # split -- printing the header cut at its first `;` and counting it twice.
+                # Accumulated per (rule, file) rather than reported here, because whether these
+                # sites are a violation depends on the backlog row, which is one question about
+                # the whole file. Text, not a list: a loop's header holds its own `;`, which a
+                # CMake list would split -- printing the header cut at its first `;` and
+                # counting it twice.
                 string(REGEX REPLACE "[ \t\r\n]+" " " shown "${header}")
-                math(EXPR violationCount "${violationCount} + 1")
+                math(EXPR ruleSites "${ruleSites} + 1")
                 if(rule STREQUAL "loop")
-                    string(APPEND violations "\n  ${relative}:${lineNumber}: a C-style for loop: ${shown}")
+                    set(what "a C-style for loop")
                 elseif(rule STREQUAL "poll")
-                    string(APPEND violations "\n  ${relative}:${lineNumber}: a coroutine polling on its reactor: ${shown}")
+                    set(what "a coroutine polling on its reactor")
                 else()
-                    string(APPEND violations "\n  ${relative}:${lineNumber}: a while loop polling an atomic: ${shown}")
+                    set(what "a while loop polling an atomic")
                 endif()
+                string(APPEND ruleSiteText "\n  ${sourceFile}:${lineNumber}: ${what}: ${shown}")
             endif()
 
             string(LENGTH "${header}" headerLength)
@@ -325,6 +537,38 @@ foreach(relative IN LISTS sourceFiles)
             string(SUBSTRING "${rest}" ${advance} -1 rest)
             math(EXPR consumed "${consumed} + ${advance}")
         endwhile()
+
+        # The ratchet, asked once per (rule, file). A row is looked up only when there is
+        # something to compare it with; rows nothing matched are found by their `used` flag
+        # below, which is the same answer for a file with no sites and a file that is gone.
+        set(allowed 0)
+        set(allowedIssue "")
+        if(ruleSites GREATER 0)
+            foreach(index RANGE 0 ${backlogCount})
+                if(index EQUAL backlogCount)
+                    break()
+                endif()
+                if(backlog_${index}_rule STREQUAL rule AND backlog_${index}_file STREQUAL sourceFile)
+                    set(allowed "${backlog_${index}_count}")
+                    set(allowedIssue "${backlog_${index}_issue}")
+                    math(EXPR backlog_${index}_used "${backlog_${index}_used} + 1")
+                    break()
+                endif()
+            endforeach()
+        endif()
+        if(ruleSites GREATER allowed)
+            math(EXPR excess "${ruleSites} - ${allowed}")
+            math(EXPR violationCount "${violationCount} + ${excess}")
+            string(APPEND violations "${ruleSiteText}")
+            if(allowed GREATER 0)
+                string(APPEND violations
+                    "\n      ^ ${ruleSites} ${rule} site(s) here, and FastCachedTestLoopBacklog records ${allowed} for ${allowedIssue}")
+            endif()
+        elseif(ruleSites LESS allowed)
+            math(EXPR fixed "${allowed} - ${ruleSites}")
+            string(APPEND staleBacklog
+                "\n  ${rule}: ${sourceFile}: the row records ${allowed}, the scan finds ${ruleSites} -- ${fixed} converted, so the row must come down to ${ruleSites}")
+        endif()
     endforeach()
 endforeach()
 
@@ -332,10 +576,20 @@ if(loopsSeen EQUAL 0)
     message("")
     message("  No `for (` was found in ${fileCount} file(s) via ${scanSource}.")
     message("")
-    message("This tree's tests are full of range-for loops, so zero means the comment stripping")
+    message("This tree is full of range-for loops, so zero means the comment stripping")
     message("has begun eating code or the scope reads the wrong files -- not that no test loops.")
     message(FATAL_ERROR "test-loops: the scan matched nothing and cannot conclude")
 endif()
+
+foreach(index RANGE 0 ${backlogCount})
+    if(index EQUAL backlogCount)
+        break()
+    endif()
+    if(backlog_${index}_used EQUAL 0)
+        string(APPEND staleBacklog
+            "\n  ${backlog_${index}_rule}: ${backlog_${index}_file}: the row records ${backlog_${index}_count}, the scan finds none -- converted, exempted, renamed or deleted")
+    endif()
+endforeach()
 
 set(staleRows "")
 foreach(index RANGE 0 ${exemptionCount})
@@ -369,23 +623,82 @@ if(violationCount GREATER 0)
     message("run on as if what it waited for had happened.")
     message("")
     message("No rule reaches a `while` that does not wait, a coroutine `while` that works before")
-    message("it parks, `vendor/`, or non-test sources (#1452). A site that must stay takes a row in")
-    message("FastCachedTestLoopExemptions in ${CMAKE_CURRENT_LIST_FILE}, with its reason.")
+    message("it parks, or `vendor/`. The `loop` rule reaches every C++ source under src/ (#1452);")
+    message("`spin` and `poll` are test-only, because the wait they ask for is a test helper.")
+    message("")
+    message("A site that must STAY takes a row in FastCachedTestLoopExemptions, with its reason.")
+    message("A site nobody has decided about yet belongs in FastCachedTestLoopBacklog with the")
+    message("issue that will decide it -- and if the count for its file is already there, then")
+    message("this is a NEW site and the answer is to convert it, not to raise the number. Both")
+    message("tables are in ${CMAKE_CURRENT_LIST_FILE}.")
     message("")
     message("Enumerated ${fileCount} file(s) via ${scanSource}.")
-    message(FATAL_ERROR "test-loops: ${violationCount} site(s) break the loop rules")
+    set(refused TRUE)
+else()
+    set(refused FALSE)
+endif()
+
+if(NOT staleBacklog STREQUAL "")
+    message("")
+    message("FastCachedTestLoopBacklog no longer describes the tree:${staleBacklog}")
+    message("")
+    message("This is the ratchet, and it only turns one way. A converted site comes OFF the")
+    message("backlog in the same change that converts it, or the number it left behind is room")
+    message("for the next one to arrive unnoticed.")
+    set(refused TRUE)
 endif()
 
 if(NOT staleRows STREQUAL "")
     message("")
-    message("FastCachedTestLoopExemptions has row(s) matching no site:${staleRows}")
+    message("FastCachedTestLoopExemptions has STALE row(s) matching no site:${staleRows}")
     message("")
     message("The site was converted, moved or deleted. Remove the row -- a standing exemption")
     message("for a site that is gone would wave the next one of that text through silently.")
-    message(FATAL_ERROR "test-loops: ${exemptionCount} exemption row(s), some STALE")
+    set(refused TRUE)
+endif()
+
+# The tally, printed BEFORE any refusal and on every run. This is not decoration: 148 undecided
+# rows are allowed at all only because their total is in front of whoever reads this output,
+# which is the argument `RefuseUntriaged` rests on in
+# `.agent/rules/metrics-and-observability.md`. Below the refusal it printed on exactly the runs
+# nobody needed it on.
+#
+# Derived from the ROWS, which are the claim. What the scan observed is equal to it on any run
+# that passes, and on one that does not the refusal above names every file that disagrees and by
+# how much -- so a second accumulator for the same fact would be a second source of truth.
+foreach(issue IN LISTS backlogIssues)
+    set(issueSites 0)
+    set(issueFiles 0)
+    foreach(index RANGE 0 ${backlogCount})
+        if(index EQUAL backlogCount)
+            break()
+        endif()
+        if(backlog_${index}_issue STREQUAL issue)
+            math(EXPR issueSites "${issueSites} + ${backlog_${index}_count}")
+            math(EXPR issueFiles "${issueFiles} + 1")
+        endif()
+    endforeach()
+    message(STATUS
+        "test-loops: backlog: ${issueSites} site(s) across ${issueFiles} file(s) are waiting on "
+        "${issue}, and every one of them is a loop nobody has decided about yet")
+endforeach()
+
+# One refusal, after every finding has been printed. Failing at the first of three would report
+# a violation and stay silent about a stale row in the same tree, so the next run finds a
+# "new" failure that was there all along.
+if(refused)
+    # Each number DERIVED from what was observed. A refusal that names a cause it did not see
+    # sends whoever meets it to the wrong table, and this one can fire for three reasons at once.
+    string(REGEX MATCHALL "\n  " staleBacklogRows "${staleBacklog}")
+    list(LENGTH staleBacklogRows staleBacklogCount)
+    string(REGEX MATCHALL "\n  " staleExemptionRows "${staleRows}")
+    list(LENGTH staleExemptionRows staleExemptionCount)
+    message(FATAL_ERROR
+        "test-loops: ${violationCount} unbacklogged site(s), ${staleBacklogCount} stale backlog "
+        "row(s) and ${staleExemptionCount} stale exemption row(s)")
 endif()
 
 message(STATUS
-    "test-loops: ${loopsSeen} `for (` across ${fileCount} file(s) via ${scanSource}, no C-style loop, no "
+    "test-loops: ${loopsSeen} `for (` across ${fileCount} file(s) via ${scanSource}, no new C-style loop, no "
     "atomic-polling while and no coroutine polling on its reactor outside ${exemptedCount} exempted site(s) "
     "in ${exemptionCount} row(s)")

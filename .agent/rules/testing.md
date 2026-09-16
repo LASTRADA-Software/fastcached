@@ -1017,9 +1017,49 @@ hand-rolled deadline loops, and -- twice -- not bounding at all.
   still owes (`FrameEndpoint_test`'s held responder returns a counted `Miss`) and asserts its
   accounts where every case using it reaches -- its destructor, skipped while a failure unwinds.
 
-`ctest -R test-loops` refuses a `while` that polls an atomic in a test, a coroutine `while`
-whose body opens by parking on its reactor, and any C-style `for`; its header says what it
-does not cover, and the coroutine rule reads only the one shape #1453's census found.
+`ctest -R test-loops` refuses a `while` that polls an atomic, a coroutine `while` whose body
+opens by parking on its reactor, and a C-style `for`; its header says what it does not cover,
+and the coroutine rule reads only the one shape #1453's census found.
+
+**Its scope is per RULE, and that is the scope rather than a refinement of it.** `loop` reaches
+every C++ source under `src/` (#1452). `spin` and `poll` do not, and widening them was tried and
+reverted inside one change: they fired 16 and 5 times, every hit in a PRODUCTION file -- reactor
+shutdown checks, `FrameEndpoint`'s drain, the bench's workers -- and the wait they ask for is
+`src/tests/BoundedWait.hpp`, which a production source cannot include. **A guard's remedy text is
+part of the guard**, so a rule whose remedy does not exist for the files it refuses is not a
+stricter rule, it is a broken one. The `rules` column of `FastCachedTestLoopScope` says which,
+and a rule no scope row names is refused rather than left enumerated by nothing.
+
+**The 148 sites the widening found are a RATCHET, and a backlog row is a different CLAIM from an
+exemption row.** An exemption says *this site is right and must stay, here is why*. A row in
+`scripts/check-test-loops-backlog.txt` says *nobody has decided about this yet, and #1452 will* --
+the `RefuseUntriaged` distinction from
+[`.agent/rules/metrics-and-observability.md`](metrics-and-observability.md), and safe for the
+same single reason: the check TALLIES them and prints the total per issue on every run. Spelling
+them as exemptions would put 148 sites behind a word that means *decided*.
+
+It turns one way. A file with MORE sites than its row records is a new site and is refused, and
+the answer is to convert it rather than raise the number; FEWER is a row that has stopped
+describing the file and is refused as stale, so a conversion is recorded in the change that
+makes it and the number it left behind is not room for the next arrival. Keyed on a count per
+(rule, file) and deliberately not on a line, which churns on any edit above a site. **What that
+leaves open is stated rather than engineered away**: one site removed and another added in the
+same file under the same rule is a wash, and a key that could see it would have to be the header
+text, which contains a `;`.
+
+**The census in #1452's body is 45 and the tree holds 169.** Not a miscount -- the ticket's
+pattern `\bfor \([^:)]*;[^;]*;` rejects any init containing a `:` or a `)`, so it misses every
+`std::`-qualified declaration and every init that calls a function. Measured per line:
+`for (int i = 0; ...)` matches, `for (std::size_t i = 0; ...)` does not, `for (auto i = c.begin(); ...)`
+does not. **A census states its PATTERN, not only its number**, and this is the third instance of
+that rule in this repository's history.
+
+**clang-tidy cannot be the mechanism, and this was measured rather than assumed.**
+`modernize-loop-convert` is the only candidate, it is already enabled with
+`WarningsAsErrors: "*"`, and it fires only when the loop bound IS the container's own size:
+`index < batch.items.size()` over a `std::array` is flagged, `index < batch.count` over the same
+array with the same body and the same indexing is not. None of the 148 has that shape, which is
+why an analyser that has been on the whole time has said nothing about them.
 
 ## The POSIX fixtures share one helper library, and a bound is read from a clock
 
@@ -2429,6 +2469,15 @@ green Linux run is not evidence about it.
 
 ## Open work
 
+- **[#1452](https://github.com/LASTRADA-Software/fastcached/issues/1452)** — 148 C-style `for`
+  loops in production sources are recorded in `scripts/check-test-loops-backlog.txt` and not yet
+  converted. The scan that refuses NEW ones is in place and green, so what is open is the
+  conversion, one file at a time, each taking its row down in the same change. Read the ticket's
+  Direction before converting: some sites are not counting loops at all, a range adaptor on a
+  hot path in `Net/`, `Async/` or `Server/` is measured rather than assumed, and a site that must
+  stay moves from the backlog to `FastCachedTestLoopExemptions` with a reason — the two tables
+  make different claims. The ticket's own census says 45; the pattern behind that figure is
+  narrower than it reads, and the number is 169 across all three rules.
 - **[#1152](https://github.com/LASTRADA-Software/fastcached/issues/1152)** — ctest
   cannot be told about a Catch2 skip through any property `catch_discover_tests`
   offers, so `SKIP_RETURN_CODE 4` stays and a four-failure case is still scored
