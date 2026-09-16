@@ -89,40 +89,75 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 # plainly, because a check silent about a case reads exactly like one that
 # cleared it. No workflow here has one today.
 
+# ---------------------------------------------------------------------------
+# Every fact this check reads out of a workflow file, from ONE walk.
+#
+# Five awk programs used to live here, four of them structure readers spelling
+# `build.yml`'s two-space indentation as literal column counts -- so each was
+# right for the file as written today and answered nothing about a file whose
+# jobs sit at another depth, which is legal YAML. They are now key PATHS over
+# `scripts/lib/workflow-walk.awk` (#1456), which makes the depth the walk's
+# problem; `scripts/check-merge-queue-contexts.awk` holds this check's half and
+# documents the records.
+#
+# A missing awk program is refused BY NAME. A reader that ran over no program is
+# not a clean tree, and awk's own complaint names a file rather than the check
+# whose verdict just became meaningless.
+FastCachedTab="$(printf '\t')"
+FastCachedWalkAwk="$(dirname "${BASH_SOURCE[0]}")/lib/workflow-walk.awk"
+FastCachedFactsAwk="$(dirname "${BASH_SOURCE[0]}")/check-merge-queue-contexts.awk"
+for awkProgram in "$FastCachedWalkAwk" "$FastCachedFactsAwk"; do
+    if [ ! -f "$awkProgram" ]; then
+        echo "check-merge-queue-contexts: missing awk program ${awkProgram}; no workflow was read," >&2
+        echo "  so this is a refusal and not a clean run. It is expected beside this script, and a" >&2
+        echo "  staged copy of this check must stage it too." >&2
+        exit 2
+    fi
+done
+
+# Every record the walk yields for the workflow @p 1. The file is passed TWICE,
+# which is the walk's convention.
+WorkflowRecords() {
+    awk -f "$FastCachedWalkAwk" -f "$FastCachedFactsAwk" "$1" "$1"
+}
+
+# The rows of kind @p 2 for the workflow @p 1, with the kind column dropped.
+# `grep | cut` and never `grep -q` or `| head`: a pipe into a consumer that exits
+# early is a false negative under `pipefail` on its SUCCESS path, and `cut` exits
+# early for nothing.
+WorkflowFacts() {
+    local records
+    records="$(WorkflowRecords "$1")"
+    grep -F -- "$2${FastCachedTab}" <<< "$records" | cut -f2- || true
+}
+
+# Whether the workflow @p 1 carries the key at path @p 2. A HERESTRING, which is
+# not a pipe, so `grep -q` is safe here where `producer | grep -q` would not be.
+WorkflowHasKey() {
+    local records
+    records="$(WorkflowRecords "$1")"
+    grep -Fq -- "ON${FastCachedTab}$2${FastCachedTab}" <<< "$records"
+}
+
 # Which same-SHA re-trigger types this workflow's `on:` block names, if any.
 #
 # Comments are stripped before matching: a COMMENT is not a call site, and both
 # workflows this rule fires on discuss these very words in prose beside the
 # settings it reads.
 SameShaRetriggerTypes() {
-    awk '
-        { line = $0; sub(/[ \t]*#.*$/, "", line) }
-        line ~ /^on:[ \t]*$/         { inOn = 1; next }
-        inOn && line ~ /^[^ \t]/     { inOn = 0 }
-        !inOn                        { next }
-        line ~ /^    types:[ \t]*\[/ {
-            types = line
-            sub(/^[^[]*\[/, "", types)
-            sub(/\].*$/, "", types)
-            n = split(types, value, ",")
-            for (i = 1; i <= n; i++) {
-                gsub(/^[ \t]+|[ \t]+$/, "", value[i])
-                if (value[i] == "edited" || value[i] == "labeled" || value[i] == "unlabeled")
-                    hits = hits (hits == "" ? "" : ", ") value[i]
-            }
-        }
-        END { if (hits == "") exit 1; print hits }
-    ' "$1"
+    local hits
+    hits="$(WorkflowFacts "$1" RETRIGGER)"
+    [ -n "${hits}" ] || return 1
+    printf '%s\n' "${hits}"
 }
 
 # Does this workflow cancel a run that is already in progress?
 # @return 0 and the line number(s) when it does.
 CancelsRunsInProgress() {
-    awk '
-        { line = $0; sub(/[ \t]*#.*$/, "", line) }
-        line ~ /^[ \t]*cancel-in-progress:[ \t]*true[ \t]*$/ { hits = hits (hits == "" ? "" : ", ") NR }
-        END { if (hits == "") exit 1; print hits }
-    ' "$1"
+    local hits
+    hits="$(WorkflowFacts "$1" CANCEL)"
+    [ -n "${hits}" ] || return 1
+    printf '%s\n' "${hits}"
 }
 
 # ---------------------------------------------------------------------------
@@ -152,8 +187,12 @@ if [[ "${1:-}" == "--self-test" ]]; then
     # A pristine copy of the tree this check reads, remade for every case.
     Stage() {
         rm -rf "$scratch/tree"
-        mkdir -p "$scratch/tree/scripts" "$scratch/tree/.github/workflows"
+        mkdir -p "$scratch/tree/scripts/lib" "$scratch/tree/.github/workflows"
         cp "$me" "$scratch/tree/scripts/"
+        # The awk programs as well, or the copy refuses by name. That refusal is
+        # the point: without it the staged check would read no program at all.
+        cp "$FastCachedWalkAwk" "$scratch/tree/scripts/lib/"
+        cp "$FastCachedFactsAwk" "$scratch/tree/scripts/"
         cp .github/workflows/*.yml "$scratch/tree/.github/workflows/"
     }
 
@@ -326,6 +365,33 @@ PY
     Stage
     rm -f "$scratch/tree/.github/workflows/"*.yml
     SelfTestCase "an empty workflow glob is REFUSED, not read as 'every context is accounted for'" want-fail
+
+    # The verdict must come from the SHARED walk, and that is a different claim
+    # from "the check refuses". Every case above would still pass if this script
+    # had kept a private reader beside the shared one -- they assert the verdict,
+    # not its source. So the NEUTER goes at `scripts/lib/workflow-walk.awk`: with
+    # the job boundary disabled, no job record is ever completed, and a check
+    # whose whole subject is which job produces which context must go red.
+    #
+    # Asserted as an injection too, because a sed expression that matches nothing
+    # leaves a working library in place and the case then passes for the opposite
+    # reason.
+    Stage
+    cp "$scratch/tree/scripts/lib/workflow-walk.awk" "$scratch/before"
+    sed '/WorkflowFlushStep(); WorkflowFlushJob(); WorkflowResetJob(); WfJob = key/s/^/#/' \
+        "$scratch/before" > "$scratch/tree/scripts/lib/workflow-walk.awk"
+    Injected "a neutered job boundary in the shared walk" \
+        "$scratch/tree/scripts/lib/workflow-walk.awk" "$scratch/before" \
+        && SelfTestCase "neutering the shared walk's job boundary makes this check REFUSE, so its verdict comes from that walk" want-fail
+
+    # And a staged tree that forgot the walk is a REFUSAL, never a clean run. The
+    # window this closes is the one the previous increment met for real: a
+    # self-test that stages a copy of a check and not the programs it reads runs a
+    # reader over nothing, which produces no findings and reads exactly like a
+    # clean tree.
+    Stage
+    rm -f "$scratch/tree/scripts/lib/workflow-walk.awk"
+    SelfTestCase "a staged check with no shared walk beside it is REFUSED, not read as clean" want-fail
 
     if [[ "$selfTestStatus" -ne 0 ]]; then
         echo "check-merge-queue-contexts: self-test FAILED after $selfTestCases case(s)" >&2
@@ -520,13 +586,7 @@ Fail() { echo "  FAIL: $*" >&2; problems=$((problems + 1)); }
 # ---------------------------------------------------------------------------
 # Does this workflow's `on:` block name `merge_group`?
 TriggersOnMergeGroup() {
-    awk '
-        /^on:[ \t]*$/            { inOn = 1; next }
-        inOn && /^[^ \t]/        { inOn = 0 }
-        inOn && /^[ \t]*#/       { next }
-        inOn && /^  merge_group:/ { found = 1 }
-        END                      { exit(found ? 0 : 1) }
-    ' "$1"
+    WorkflowHasKey "$1" on/merge_group
 }
 
 # Every context this workflow can produce, one per line, as
@@ -541,45 +601,7 @@ TriggersOnMergeGroup() {
 # these are the repository's own files: a job key is two spaces, a job's `name:`
 # and `if:` are four, and a step's are six and eight.
 EmitJobContexts() {
-    awk '
-        function flush() {
-            if (jobKey == "") return
-            if (name == "") name = jobKey
-            if (presets != "") {
-                n = split(presets, values, ",")
-                for (i = 1; i <= n; i++) {
-                    value = values[i]
-                    gsub(/^[ \t]+|[ \t]+$/, "", value)
-                    expanded = name
-                    gsub(/\$\{\{ *matrix\.preset *\}\}/, value, expanded)
-                    print expanded "\t" jobKey "\t" ifExpr
-                }
-            } else {
-                print name "\t" jobKey "\t" ifExpr
-            }
-            jobKey = ""; name = ""; ifExpr = ""; presets = ""
-        }
-        /^jobs:[ \t]*$/                  { inJobs = 1; next }
-        inJobs && /^[^ \t]/              { flush(); inJobs = 0 }
-        !inJobs                          { next }
-        /^[ \t]*#/                       { next }
-        /^  [A-Za-z0-9_-]+:[ \t]*$/      { flush(); jobKey = $0
-                                           sub(/^  /, "", jobKey)
-                                           sub(/:[ \t]*$/, "", jobKey)
-                                           next }
-        /^    name:[ \t]*/               { name = $0
-                                           sub(/^    name:[ \t]*/, "", name)
-                                           gsub(/^"|"$/, "", name)
-                                           next }
-        /^    if:[ \t]*/                 { ifExpr = $0
-                                           sub(/^    if:[ \t]*/, "", ifExpr)
-                                           next }
-        /^[ \t]*preset:[ \t]*\[/         { presets = $0
-                                           sub(/^[ \t]*preset:[ \t]*\[/, "", presets)
-                                           sub(/\].*$/, "", presets)
-                                           next }
-        END                              { flush() }
-    ' "$1"
+    WorkflowFacts "$1" CONTEXT
 }
 
 # ---------------------------------------------------------------------------
@@ -593,14 +615,7 @@ EmitJobContexts() {
 # the workflow is valid, the jobs are correct, and the only observable is a pull
 # request waiting on CI nobody asked to run.
 FiltersPullRequestBranches() {
-    awk '
-        /^on:[ \t]*$/             { inOn = 1; next }
-        inOn && /^[^ \t]/         { inOn = 0 }
-        inOn && /^[ \t]*#/        { next }
-        inOn && /^  [a-z_]+:/     { inPr = ($0 ~ /^  pull_request:/) }
-        inOn && inPr && /^    branches:/ { found = 1 }
-        END                       { exit(found ? 0 : 1) }
-    ' "$1"
+    WorkflowHasKey "$1" on/pull_request/branches
 }
 
 
