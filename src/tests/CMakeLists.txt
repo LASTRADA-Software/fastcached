@@ -5029,10 +5029,37 @@ else()
     # missing", which here means git or cmake could not be run at all. TIMEOUT
     # is the outer supervisor rather than the measurement: the script bounds
     # every wait it makes, and this is what catches it failing to.
+    #
+    # Since #1469 it carries a SECOND meaning: a run that could not judge its own
+    # legs because the host was too slow for the phase deadline to mean anything.
+    # That collapse is ctest's vocabulary and not a choice -- a test is passed,
+    # failed or skipped, and `SKIP_RETURN_CODE` takes one value -- so the two are
+    # told apart by the OUTPUT, which names one `INCONCLUSIVE:` and the other a
+    # missing prerequisite. Same fully-occupied-channel problem as #1152.
     set_tests_properties("fetch-transfer-bound" PROPERTIES
         LABELS "hygiene"
         SKIP_RETURN_CODE 77
         TIMEOUT 300
+    )
+
+    # The verdict machinery, driven against synthesised readings rather than against
+    # a real stall: this needs no git, no cmake, no listener and no clock, so it runs
+    # in the DEFAULT set on every platform and in seconds.
+    #
+    # It is registered SEPARATELY and not folded into the check above for the reason
+    # #1469 exists: the check above cannot be made to say INCONCLUSIVE on a healthy
+    # developer machine, so the outcome that matters would be the one nobody ever
+    # watches fire. Here every verdict is reached by construction, including the
+    # measured `Windows-cl-debug` run the ticket was filed from, entered as data.
+    add_test(
+        NAME "fetch-transfer-bound-selftest"
+        COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_SOURCE_DIR}/scripts/check-fetch-transfer-bound.py"
+            --self-test
+    )
+    set_tests_properties("fetch-transfer-bound-selftest" PROPERTIES
+        LABELS "hygiene"
+        TIMEOUT 60
     )
 endif()
 
