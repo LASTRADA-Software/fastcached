@@ -356,8 +356,41 @@ traffic, while the tree holds everything.
 That is the fourth instance of one family, and the first three are closed: state that
 should describe the STORE was populated only by touch — the index cost capacity reserves
 (#175), the free list (#990), the byte total (#1006). Each of those was fixed by finding
-a durable SOURCE for a number. This one could not be: eviction needs a VICTIM to name,
-not a figure.
+a durable SOURCE for a number. **The EVICTION half of this one could not be: eviction
+needs a VICTIM to name, not a figure.**
+
+**And that sentence used to stand alone, which is how the fifth instance survived for
+months underneath it.** *Eviction* cannot use a durable source; the FIGURES sitting beside
+it in the same snapshot can, and `itemCount` was still `_index.size()` — so a node
+restarted onto a full cache reported zero items next to a `bytesUsed` describing the whole
+store (#1483). Two figures in one row, denominated over different populations, and an
+operator correctly reads `items 0` as an empty cache.
+
+Three things make it worth this much space:
+
+- **The durable source was already being called fourteen lines further down the same
+  function**, for `indexBytesAtCapacity`. Nothing was missing; the line simply had not
+  been revisited when #1006 fixed its neighbour — and #1006's fix comment sits three lines
+  below the defect, describing the same failure for the other field. *A fix that names its
+  own defect does not generalise itself to the field next to it.*
+- **The obvious repair over-counts.** `CowTree::ItemCount()` is documented *approximate*
+  and counts the store's own sentinel records, which is right for an upper bound a
+  reservation wants and wrong for a figure compared against `--cache-disk`. So the rule is
+  not *use the tree's count*: it is **a figure describing the store reads the store, at the
+  store's own denomination.** `build-and-toolchain.md` rates an over-report as the same
+  defect in the louder direction.
+- **A bare `- 1` would be right for a reason living in another function.** A store with a
+  conversion marker is REFUSED at `Open`, so a serving store carries exactly the format
+  marker — a fact `EnsureFormatVersion` owns and `Snapshot` would silently depend on. It
+  comes off a `ReservedKeys()` table with a column stating that dependency, and
+  `IsReservedKey` walks the same table, so a third sentinel is one edit rather than two
+  that can disagree.
+
+**What must not be "fixed" alongside it:** `indexBytes` still reports the PRESENT. That is
+#175's whole argument — a reservation may not be taken from a startup reading — so a change
+making every figure durable destroys the distinction rather than completing it. The pinning
+case now asserts the CONTRAST: a cold index beside a warm item count, and one read moving
+the index while the count does not.
 
 **So eviction reaches the cold set first, and that is LRU rather than a workaround.** An
 entry the mirror does not hold has not been read or written since startup, so it is
