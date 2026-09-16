@@ -592,6 +592,92 @@ TEST_CASE("RemoteCompileArgs keeps the flags that change generated code")
     }
 }
 
+TEST_CASE("A path-valued -D is dispatchable, and the macro leaves only the worker's line")
+{
+    // #1481. This project's own build passes `-DFASTCACHED_SOURCE_DIR="<abs>"`, and an
+    // argument the dispatch walk does not recognise refuses the WHOLE command line --
+    // correctly, since stripping an unknown one could change the generated code. The
+    // result was that every translation unit compiled locally, with one stderr line each,
+    // `dispatched 0` on the fleet page and no counter anywhere saying so. Any project
+    // passing a source root, a config directory or a version string containing a slash
+    // got the same silence.
+    std::vector<std::string> const argv { "g++", "-std=c++23", "-DFASTCACHED_SOURCE_DIR=\"/mnt/d/fastcached\"",
+                                          "-O2", "-c",         "a.cpp",
+                                          "-o",  "a.o" };
+    auto const cmd = ParseCommand(argv);
+    REQUIRE(cmd.parsedOk);
+
+    // **The regression**, and it is the `has_value` rather than anything below it: while
+    // this was `unexpected`, every other assertion in this case was unreachable.
+    auto const parsed = RemoteCompileArgs(cmd, argv, /*targetTriple=*/ {});
+    REQUIRE(parsed.has_value());
+    auto const remote = Unwrap(parsed);
+
+    // Gone from the worker's line: the text it is handed is already expanded.
+    CHECK(std::ranges::none_of(remote, [](std::string const& a) { return a.starts_with("-D"); }));
+
+    // And the flags that DO decide generated code survived -- a fix that dropped too much
+    // satisfies the assertion above and fails this one.
+    for (auto const* kept: { "-std=c++23", "-O2" })
+    {
+        INFO("flag " << kept);
+        CHECK(std::ranges::contains(remote, kept));
+    }
+
+    // **The other half, and not optional.** The definition must still reach the
+    // PREPROCESS line: dropping it there compiles a different program and stores the
+    // result under this program's key. A case asserting only the drop passes under
+    // exactly that bug.
+    auto const pp = PreprocessCommand(cmd, argv);
+    CHECK(std::ranges::contains(pp, "-DFASTCACHED_SOURCE_DIR=\"/mnt/d/fastcached\""));
+}
+
+TEST_CASE("Both macro spellings leave the dispatched line, and an undefine is the same object")
+{
+    // `-U` rides the same table as `-D`, so a fix that dropped one and not the other would
+    // pass every assertion written about `-D` alone.
+    //
+    // A bare `-D` owns the next argument, and the two ways of getting that wrong are
+    // opposite: leaving the value behind hands the worker a lone `FOO=1` to open as an
+    // input file, while eating a successor after a FUSED form drops a real flag. One
+    // `skipUntil` decides both, so both are asserted.
+    //
+    // `-o a.o` is not decoration. `ParseCommand` requires an object output -- measured on
+    // this branch, where an earlier version of this case omitted it and died on
+    // `REQUIRE(cmd.parsedOk)`. The cause looked like the separated `-D` spelling and was
+    // not: a plain `g++ -Wall -c a.cpp` fails the same way, and the separated form parses
+    // and dispatches perfectly well once the output is named.
+    std::vector<std::string> const fused { "g++", "-DFOO=1", "-UBAR", "-Wall", "-c", "a.cpp", "-o", "a.o" };
+    std::vector<std::string> const separated { "g++", "-D", "FOO=1", "-U", "BAR", "-Wall", "-c", "a.cpp", "-o", "a.o" };
+
+    for (auto const& argv: std::array { fused, separated })
+    {
+        INFO("argv[1] " << argv[1]);
+        auto const cmd = ParseCommand(argv);
+        REQUIRE(cmd.parsedOk);
+
+        auto const parsed = RemoteCompileArgs(cmd, argv, /*targetTriple=*/ {});
+        REQUIRE(parsed.has_value());
+        auto const remote = Unwrap(parsed);
+
+        // Nothing macro-shaped survives, in either spelling, and neither does a stranded
+        // value.
+        CHECK(std::ranges::none_of(remote, [](std::string const& a) {
+            return a.starts_with("-D") || a.starts_with("-U") || a == "FOO=1" || a == "BAR";
+        }));
+
+        // The flag AFTER the macros is the one a mis-counted skip would eat.
+        CHECK(std::ranges::contains(remote, "-Wall"));
+
+        // And they still reach the PREPROCESS line, where they decide the program. Asserted
+        // for both spellings, because the preprocess line forwards them untouched and a
+        // change that started dropping them there would compile a different program and
+        // store the result under this program's key.
+        auto const pp = PreprocessCommand(cmd, argv);
+        CHECK(std::ranges::contains(pp, argv[1]));
+    }
+}
+
 TEST_CASE("cc and c++ are classified by what the driver says, not by what it is called")
 {
     // `cc` and `c++` name a policy, not a product. On macOS `/usr/bin/c++` is Apple
@@ -803,14 +889,28 @@ TEST_CASE("RemoteCompileArgs refuses a command line it cannot fully account for"
     // A response file names a path with no separator at all when it sits in the
     // working directory, so it is called out on its own.
     CHECK(refuses({ "g++", "@args.rsp", "-c", "a.cpp", "-o", "a.o" }));
-    // A define whose value happens to hold a path is refused too. Over-strict, and
-    // deliberately: the cost is a local compile.
-    CHECK(refuses({ "g++", "-DCONFIG=\"/etc/app.conf\"", "-c", "a.cpp", "-o", "a.o" }));
+    // A DEFINE whose value holds a path is NOT refused, and these two assertions used to
+    // say the opposite. The comment above them read "over-strict, and deliberately: the
+    // cost is a local compile" -- and that trade was mis-stated, which is the whole of
+    // #1481. The cost is not one local compile: a project passing a path-valued `-D`
+    // anywhere gets NO dispatch for ANY translation unit, silently, one stderr line each,
+    // with no counter to read. This repository is such a project
+    // (`-DFASTCACHED_SOURCE_DIR`), so its own build reached its own fleet never.
+    //
+    // A macro is safe to drop where `-isystem` and `-fplugin=` above are not, and the
+    // difference is not strictness: dispatch sends PREPROCESSED text, so a definition has
+    // already been expanded on the client and the worker cannot open anything through it.
+    // The flags above point a compiler at a file or an executable it would still read.
+    CHECK_FALSE(refuses({ "g++", "-DCONFIG=\"/etc/app.conf\"", "-c", "a.cpp", "-o", "a.o" }));
+    CHECK_FALSE(refuses({ "cl", "/DCONFIG=C:\\app\\x.conf", "/c", "a.cpp", "/Foa.obj" }));
 
-    // The introducer is skipped before the separator is looked for, so an MSVC
-    // compile is not refused wholesale for spelling its options with `/` -- but a
-    // separator INSIDE one still refuses.
-    CHECK(refuses({ "cl", "/DCONFIG=C:\\app\\x.conf", "/c", "a.cpp", "/Foa.obj" }));
+    // The property the `/D` assertion used to carry is still worth holding, so it moves to
+    // a `/`-led option that is genuinely unaccounted for: the introducer is skipped before
+    // the separator is looked for, so an MSVC compile is not refused wholesale for spelling
+    // its options with `/` -- but a separator inside an option nothing recognises still
+    // refuses. `/FI` names a forced include, is in neither table, and the worker would have
+    // to open it.
+    CHECK(refuses({ "cl", "/FIC:\\force\\prefix.h", "/c", "a.cpp", "/Foa.obj" }));
     CHECK_FALSE(refuses({ "cl", "/std:c++20", "/O2", "/EHsc", "/c", "a.cpp", "/Foa.obj" }));
 }
 

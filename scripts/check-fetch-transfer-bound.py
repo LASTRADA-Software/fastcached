@@ -488,8 +488,14 @@ def run_phase(legs, workspace, pick_command, pick_environment, seconds, prefix):
 
 
 def run_transports(arguments, stall, workspace, window, floor):
-    """Both phases against the stall. Returns (failures, notes)."""
-    failures, notes = [], []
+    """Both phases against the stall. Returns (failures, notes, inconclusive).
+
+    THREE lists out, because there are three outcomes. The controls keep deciding as
+    they always did: `CONTROL: unbounded ... ended by itself` stays a hard failure
+    whatever the host's speed, since a stall that is not a stall makes everything
+    below vacuous and that verdict does not depend on how fast anything ran.
+    """
+    failures, notes, inconclusive = [], [], []
     legs = build_legs(arguments, stall_url(stall), workspace, window, floor)
 
     for leg, control in zip(
@@ -516,24 +522,34 @@ def run_transports(arguments, stall, workspace, window, floor):
             )
 
     # Generous on purpose: this deadline exists so a broken bound REPORTS
-    # rather than hangs, not to measure anything.
+    # rather than hangs, not to measure anything. Which is exactly why missing it
+    # cannot be read as a broken bound on its own -- see `classify_bounded`.
     patience = window + 30
-    for leg, bounded in zip(
+    results = run_phase(
         legs,
-        run_phase(
-            legs,
-            workspace,
-            lambda leg: leg.bounded_command,
-            lambda leg: leg.bound_environment,
-            patience,
-            "bounded-",
-        ),
-    ):
-        if not bounded.ended:
+        workspace,
+        lambda leg: leg.bounded_command,
+        lambda leg: leg.bound_environment,
+        patience,
+        "bounded-",
+    )
+    verdicts = classify_bounded(
+        [BoundedReading(leg.label, one.ended, one.seconds) for leg, one in zip(legs, results)],
+        window,
+        patience,
+    )
+    for leg, bounded, verdict in zip(legs, results, verdicts):
+        if verdict.outcome == OutcomeInconclusive:
+            inconclusive.append(
+                "bounded %s did not end within %ds of a %ds silence window, and this run "
+                "cannot say whether that is the bound or the machine: %s.\n%s"
+                % (leg.label, patience, window, verdict.detail, bounded.output)
+            )
+        elif verdict.outcome == OutcomeUnreachableBound:
             failures.append(
                 "bounded %s did NOT end within %ds of a %ds silence window; the "
-                "bound is not reaching it.\n%s"
-                % (leg.label, patience, window, bounded.output)
+                "bound is not reaching it -- %s.\n%s"
+                % (leg.label, patience, window, verdict.detail, bounded.output)
             )
         # The OUTPUT is the verdict, and the exit code is only evidence. A
         # `cmake -P` leg reports its refusal through message(FATAL_ERROR),
@@ -562,7 +578,187 @@ def run_transports(arguments, stall, workspace, window, floor):
                     bounded.output.splitlines()[-1][:160],
                 )
             )
-    return failures, notes
+    return failures, notes, inconclusive
+
+
+# One leg's reading, as the classifier sees it. A record rather than the live
+# `finish()` result, because the whole point is that this decision can be driven
+# against readings nobody had to produce with a real stall and a real clock.
+BoundedReading = namedtuple("BoundedReading", "label ended seconds")
+
+# What a bounded leg turned out to be. THREE, and the third is why this exists.
+BoundedVerdict = namedtuple("BoundedVerdict", "label outcome detail")
+
+# A leg that did not end, on a host fast enough that the deadline was fair.
+OutcomeUnreachableBound = "unreachable-bound"
+# A leg that did not end, on a host too slow for the deadline to have meant anything.
+OutcomeInconclusive = "inconclusive"
+# A leg that ended inside the deadline. Whether its MESSAGE is right is a separate
+# question, judged where it always was.
+OutcomeEnded = "ended"
+
+
+def classify_bounded(readings, window, patience):
+    """Which non-ending legs are broken bounds, and which cannot be judged at all.
+
+    A slow machine and a wedged bound are fixed in different places, so a wait that
+    ran out has to say which it met. Before #1469 this had two answers and gave the
+    confident one: `Windows-cl-debug` reported "the bound is not reaching it" about
+    git on an attempt where the SIBLING leg refused after 35.1s against a 5s window
+    -- a host running about 7x slow -- and passed on a re-run at the same commit.
+    That message sends whoever reads it to `cmake/FetchTransferBound.cmake` and to
+    git's `http.lowSpeedTime`, neither of which was involved.
+
+    **The evidence is already in hand: a sibling's own refusal time is a reading of
+    how slow the host is.** A leg refusing at `seconds` against `window` has
+    demonstrated that this host needs `seconds - window` of overhead to notice and
+    act. The phase hands every leg `patience - window` of slack for that. So:
+
+    - no leg ended at all -> there is no speed reading, and that is its own reason to
+      be inconclusive rather than a reason to believe the fastest explanation;
+    - a leg that DID end consumed the whole slack -> a leg exactly that slow could not
+      have ended inside `patience`, so a sibling that did not tells us nothing;
+    - otherwise the host was demonstrably fast enough, and a non-ending leg is a bound
+      that is not reaching its transport.
+
+    **This rule has no constant, deliberately.** The comparison is the phase's own
+    slack against a measurement the phase itself produced, so there is no number to
+    raise -- and raising one is what restores the original wrong answer by the front
+    door, since the next loaded runner is slower still.
+
+    What it does NOT cover, said here so the next reader does not over-apply it: a host
+    slow enough to eat only PART of the slack still yields `unreachable-bound`. Closing
+    that gap needs a fraction-of-slack constant, which is the thing this avoids.
+
+    @param readings A `BoundedReading` per leg of one phase.
+    @param window The silence window in force, in seconds.
+    @param patience The phase's deadline, in seconds.
+    @return A `BoundedVerdict` per leg, in the order given.
+    """
+    slack = patience - window
+    concluded = [one for one in readings if one.ended]
+    worst = max((one.seconds - window for one in concluded), default=None)
+    slowest = None
+    if concluded:
+        slowest = max(concluded, key=lambda one: one.seconds)
+
+    verdicts = []
+    for one in readings:
+        if one.ended:
+            verdicts.append(BoundedVerdict(one.label, OutcomeEnded, ""))
+        elif worst is None:
+            verdicts.append(
+                BoundedVerdict(
+                    one.label,
+                    OutcomeInconclusive,
+                    "no leg of this phase ended, so there is no reading of how fast this "
+                    "host was and nothing says whether %ds was a fair deadline" % patience,
+                )
+            )
+        elif worst >= slack:
+            verdicts.append(
+                BoundedVerdict(
+                    one.label,
+                    OutcomeInconclusive,
+                    "%s refused after %.1fs against a %ds window, spending %.1fs of the "
+                    "%ds this phase allows for overhead -- all of it, so a leg this slow "
+                    "could not have ended within %ds either"
+                    % (slowest.label, slowest.seconds, window, worst, slack, patience),
+                )
+            )
+        else:
+            verdicts.append(
+                BoundedVerdict(
+                    one.label,
+                    OutcomeUnreachableBound,
+                    "%s refused after %.1fs against the same %ds window, spending %.1fs of "
+                    "the %ds allowed, so this host was fast enough and the bound is not "
+                    "reaching this transport"
+                    % (slowest.label, slowest.seconds, window, worst, slack),
+                )
+            )
+    return verdicts
+
+
+SELF_TEST_CASES = (
+    # (name, readings, window, patience, expected outcomes in order)
+    (
+        "both legs refused promptly",
+        [BoundedReading("git", True, 6.1), BoundedReading("cmake", True, 6.4)],
+        5,
+        35,
+        [OutcomeEnded, OutcomeEnded],
+    ),
+    (
+        "the observed failure: a sibling ate the whole slack",
+        [BoundedReading("git", False, 35.0), BoundedReading("cmake file(DOWNLOAD)", True, 35.1)],
+        5,
+        35,
+        [OutcomeInconclusive, OutcomeEnded],
+    ),
+    (
+        "a healthy host, so a non-ending leg IS a broken bound",
+        [BoundedReading("git", False, 35.0), BoundedReading("cmake file(DOWNLOAD)", True, 6.2)],
+        5,
+        35,
+        [OutcomeUnreachableBound, OutcomeEnded],
+    ),
+    (
+        "nothing concluded, so there is no speed reading",
+        [BoundedReading("git", False, 35.0), BoundedReading("cmake", False, 35.0)],
+        5,
+        35,
+        [OutcomeInconclusive, OutcomeInconclusive],
+    ),
+    (
+        "exactly at the slack boundary is inconclusive, not failed",
+        [BoundedReading("git", False, 35.0), BoundedReading("cmake", True, 35.0)],
+        5,
+        35,
+        [OutcomeInconclusive, OutcomeEnded],
+    ),
+    (
+        "one tick inside the boundary is a broken bound",
+        [BoundedReading("git", False, 35.0), BoundedReading("cmake", True, 34.9)],
+        5,
+        35,
+        [OutcomeUnreachableBound, OutcomeEnded],
+    ),
+)
+
+
+def run_self_test():
+    """Drive every verdict against synthesised readings. Returns an exit code.
+
+    In the DEFAULT set, and driven against records rather than against a stall,
+    because a classifier that cannot be made to say INCONCLUSIVE cannot report a
+    starved runner -- and a fixture that can only answer the two outcomes its author
+    expected will answer one of them whatever it sees. The second case below is the
+    measured `Windows-cl-debug` run this ticket was filed from, entered as data.
+    """
+    failed = 0
+    for name, readings, window, patience, expected in SELF_TEST_CASES:
+        got = [one.outcome for one in classify_bounded(readings, window, patience)]
+        if got == list(expected):
+            print("  ok   %s" % name)
+        else:
+            failed += 1
+            print("  FAIL %s: expected %s, got %s" % (name, list(expected), got))
+
+    # A self-test that stopped early must not look like one that judged something.
+    print(
+        "fetch-transfer-bound --self-test: %d case(s) ran, %d failed"
+        % (len(SELF_TEST_CASES), failed)
+    )
+    # Every outcome must appear, or the table has quietly stopped exercising one.
+    seen = set()
+    for _, readings, window, patience, _expected in SELF_TEST_CASES:
+        seen.update(one.outcome for one in classify_bounded(readings, window, patience))
+    for outcome in (OutcomeEnded, OutcomeInconclusive, OutcomeUnreachableBound):
+        if outcome not in seen:
+            print("FAIL: no case produces %s, so that verdict is unwatched" % outcome)
+            failed += 1
+    return 1 if failed else 0
 
 
 def stall_url(stall):
@@ -625,6 +821,11 @@ def read_shipped_numbers(arguments, workspace):
 
 
 def main():
+    # Ahead of the parser, whose `--source-dir` is required: the self-test judges a pure
+    # function and wants no tree, no git and no stall.
+    if "--self-test" in sys.argv[1:]:
+        return run_self_test()
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source-dir", required=True)
     parser.add_argument("--git", default="git")
@@ -669,6 +870,7 @@ def main():
     # before anything can skip. Losing them behind a missing git would take the
     # "no download in this tree is left unbounded" assertion with it, silently,
     # behind a green Skipped -- skipped is not passed.
+    inconclusive = []
     failures = check_wiring(arguments.source_dir)
     failures += check_downloads_are_bounded(arguments.source_dir)
     notes = []
@@ -709,9 +911,10 @@ def main():
                     "leg" % (arguments.control, exercised)
                 )
             else:
-                ran, said = run_transports(arguments, stall, workspace, exercised, floor)
+                ran, said, undecided = run_transports(arguments, stall, workspace, exercised, floor)
                 failures += ran
                 notes += said
+                inconclusive += undecided
         # else: the runs are SKIPPED rather than run against a number the tree
         # disowns -- a green leg proving a number nobody ships is the worse
         # outcome, and `failures` already names why.
@@ -719,19 +922,34 @@ def main():
         stall.close()
         shutil.rmtree(workspace, ignore_errors=True)
 
-    return report(failures, notes, (exercised, shipped, source, arguments.full))
+    return report(failures, notes, inconclusive, (exercised, shipped, source, arguments.full))
 
 
-def report(failures, notes, verdict):
+def report(failures, notes, inconclusive, verdict):
     """Print the evidence, then the verdict. Returns the exit code.
 
     The verdict names the window that was actually exercised AND the window the
     bound is set to, because they differ by default: quoting one for the other
     is the failure this project has already paid for once, and a figure that
     states its own conditions is what prevents it.
+
+    A real FAILURE outranks an inconclusive leg: if any bound was shown broken on a
+    host demonstrably fast enough, that is the answer whatever else could not be
+    judged.
+
+    **The exit status collapses INCONCLUSIVE onto 77, and that is ctest's vocabulary
+    rather than a decision.** A registered test can be passed, failed or skipped, and
+    `SKIP_RETURN_CODE` takes exactly one value -- 77 here, already meaning *a
+    prerequisite is missing*. Green would be worse: it would read as *the bound is
+    proven* on precisely the loaded runs where nothing was proven. So the two share a
+    status and the OUTPUT is what tells them apart, which is the same
+    channel-is-fully-occupied problem as #1152 and wants the same kind of fix.
     """
     for note in notes:
         print("  " + note)
+    for undecided in inconclusive:
+        print("")
+        print("INCONCLUSIVE: " + undecided)
     if failures:
         print("")
         for failure in failures:
@@ -739,6 +957,15 @@ def report(failures, notes, verdict):
         print("")
         print("fetch-transfer-bound: %d of the guard's assertions failed" % len(failures))
         return 1
+
+    if inconclusive:
+        print("")
+        print(
+            "fetch-transfer-bound: %d leg(s) could not be judged on this host, so this run "
+            "proves nothing about the bound and is reported as SKIPPED rather than as a pass "
+            "or a failure. Nothing here says the bound is broken." % len(inconclusive)
+        )
+        return 77
 
     exercised, configured, source, full = verdict
     print(

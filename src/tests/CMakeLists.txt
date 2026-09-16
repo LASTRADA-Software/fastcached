@@ -5029,10 +5029,37 @@ else()
     # missing", which here means git or cmake could not be run at all. TIMEOUT
     # is the outer supervisor rather than the measurement: the script bounds
     # every wait it makes, and this is what catches it failing to.
+    #
+    # Since #1469 it carries a SECOND meaning: a run that could not judge its own
+    # legs because the host was too slow for the phase deadline to mean anything.
+    # That collapse is ctest's vocabulary and not a choice -- a test is passed,
+    # failed or skipped, and `SKIP_RETURN_CODE` takes one value -- so the two are
+    # told apart by the OUTPUT, which names one `INCONCLUSIVE:` and the other a
+    # missing prerequisite. Same fully-occupied-channel problem as #1152.
     set_tests_properties("fetch-transfer-bound" PROPERTIES
         LABELS "hygiene"
         SKIP_RETURN_CODE 77
         TIMEOUT 300
+    )
+
+    # The verdict machinery, driven against synthesised readings rather than against
+    # a real stall: this needs no git, no cmake, no listener and no clock, so it runs
+    # in the DEFAULT set on every platform and in seconds.
+    #
+    # It is registered SEPARATELY and not folded into the check above for the reason
+    # #1469 exists: the check above cannot be made to say INCONCLUSIVE on a healthy
+    # developer machine, so the outcome that matters would be the one nobody ever
+    # watches fire. Here every verdict is reached by construction, including the
+    # measured `Windows-cl-debug` run the ticket was filed from, entered as data.
+    add_test(
+        NAME "fetch-transfer-bound-selftest"
+        COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_SOURCE_DIR}/scripts/check-fetch-transfer-bound.py"
+            --self-test
+    )
+    set_tests_properties("fetch-transfer-bound-selftest" PROPERTIES
+        LABELS "hygiene"
+        TIMEOUT 60
     )
 endif()
 
@@ -5513,6 +5540,50 @@ add_test(
         -P "${CMAKE_SOURCE_DIR}/scripts/check-ranges-seam-selftest.cmake"
 )
 set_tests_properties("ranges-seam-selftest" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 180
+)
+
+# No first-party C++ walks an enum's enumerators by hand now that `Enumerators<Enum>()`
+# exists (#1476). Ten sites spelled the same walk before #1441 -- `views::iota` from zero to
+# `EnumeratorCount<Enum>` plus a `static_cast<Enum>(index)` in the body -- and NOTHING refused
+# it, which is why there were ten: the guidelines forbid C-style loops and ask for range
+# views, and every one of those ten obeyed both, because `views::iota` IS a range view. The
+# defect was walking indices to reach enumerators, and no existing check could see it.
+#
+# In the DEFAULT set, since the shape builds everywhere and fails no leg. The refused shapes
+# are line-local; a `static_cast` near an `EnumeratorCount` is deliberately NOT one of them,
+# measured -- six such sites in this tree are bounds checks on a value off a wire and every
+# one is correct. The seam's own existence is the ANCHOR: with `Enumerators` gone the check
+# refuses rather than reporting a clean tree.
+add_test(
+    NAME "enumerator-walks"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DGIT_EXECUTABLE=${GIT_EXECUTABLE}"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-enumerator-walks.cmake"
+)
+set_tests_properties("enumerator-walks" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 120
+)
+
+# And it must be seen to refuse AND to accept, in BOTH enumeration modes. The accepting
+# direction is the half usually skipped, and here it is load-bearing: the check must not
+# refuse the bounds-check shape. Every case asserts the mode it ran in, because this tree has
+# already shipped a guard whose self-test exercised a directory-walk fallback while CI
+# exercised git -- the mode under test not being the mode in use.
+add_test(
+    NAME "enumerator-walks-selftest"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DGIT_EXECUTABLE=${GIT_EXECUTABLE}"
+        "-DFASTCACHED_SCRATCH_DIR=${CMAKE_CURRENT_BINARY_DIR}/enumerator-walks-selftest"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-enumerator-walks-selftest.cmake"
+)
+set_tests_properties("enumerator-walks-selftest" PROPERTIES
     FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
     LABELS "hygiene"
     TIMEOUT 180

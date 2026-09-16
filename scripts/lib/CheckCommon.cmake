@@ -529,3 +529,93 @@ function(fastcached_scan_code_lines content pattern outVar)
     endwhile()
     set(${outVar} "${hits}" PARENT_SCOPE)
 endfunction()
+
+# Every first-party C++ source in the repository, and HOW they were found.
+#
+# Nine `check-*.cmake` readers had each copied this block before it was extracted, which is
+# nine chances for one of them to enumerate a different set than the rule it enforces claims
+# to cover. The copies are not migrated here -- each has a self-test that would have to be
+# re-run against it, so that is its own change rather than a rider on whichever check needed
+# the helper first.
+#
+# The MODE travels with the answer and is not an aside. There are two, they cover different
+# file sets, and CI takes the git one: a guard whose self-test exercised the walk while CI
+# exercised git has already shipped in this tree, and it passed because it was testing
+# something else. A caller states the mode in its verdict so a case can assert it.
+#
+# Third-party files are DECLINED rather than dropped, and named, because vendored code is not
+# ours to edit and a silent exclusion reads the same as complete coverage.
+#
+# @param sourceDir The repository root.
+# @param filesOut Set to the first-party C++ paths, relative to the root and sorted.
+# @param declinedOut Set to the third-party paths that were excluded.
+# @param modeOut Set to a human-readable name for how the files were found.
+function(fastcached_first_party_cxx sourceDir filesOut declinedOut modeOut)
+    # `\\.` and not `\.`: CMake unescapes a quoted argument BEFORE the regex engine sees it,
+    # so `"\.(...)"` arrives as `.(...)` -- a dot matching ANY character. That is not a
+    # near-miss: `check-apt-update.sh` then matches, because `.sh` is any-character followed
+    # by the `h` alternative, and this helper's first measured answer was 79 shell scripts too
+    # many. Measured against an independent `git ls-files | grep -cE`, which is the only
+    # reason it was seen at all.
+    set(cxxExtension "\\.(cpp|cc|cxx|hpp|hh|hxx|h|ixx|cppm)$")
+    set(found "")
+    set(mode "")
+
+    if(NOT GIT_EXECUTABLE)
+        find_package(Git QUIET)
+    endif()
+    if(GIT_EXECUTABLE)
+        execute_process(
+            COMMAND "${GIT_EXECUTABLE}" -C "${sourceDir}" rev-parse --is-inside-work-tree
+            OUTPUT_VARIABLE insideWorkTree
+            ERROR_VARIABLE gitError
+            RESULT_VARIABLE gitStatus
+            OUTPUT_STRIP_TRAILING_WHITESPACE)
+        if(gitStatus EQUAL 0 AND insideWorkTree STREQUAL "true")
+            execute_process(
+                COMMAND "${GIT_EXECUTABLE}" -C "${sourceDir}" ls-files
+                OUTPUT_VARIABLE tracked
+                RESULT_VARIABLE lsStatus
+                OUTPUT_STRIP_TRAILING_WHITESPACE)
+            if(lsStatus EQUAL 0 AND NOT tracked STREQUAL "")
+                string(REPLACE "\n" ";" trackedFiles "${tracked}")
+                foreach(candidate IN LISTS trackedFiles)
+                    if(candidate MATCHES "${cxxExtension}")
+                        list(APPEND found "${candidate}")
+                    endif()
+                endforeach()
+                set(mode "git ls-files")
+            endif()
+        endif()
+    endif()
+
+    if(NOT found)
+        # Build trees and caches, which are not source and are frequently enormous.
+        set(excludeNames "out" "build" "_deps" ".git" ".cache" ".claude")
+        file(GLOB_RECURSE walked RELATIVE "${sourceDir}" "${sourceDir}/*")
+        foreach(candidate IN LISTS walked)
+            if(NOT candidate MATCHES "${cxxExtension}")
+                continue()
+            endif()
+            set(excluded FALSE)
+            foreach(name IN LISTS excludeNames)
+                if(candidate MATCHES "(^|/)${name}/")
+                    set(excluded TRUE)
+                    break()
+                endif()
+            endforeach()
+            if(NOT excluded)
+                list(APPEND found "${candidate}")
+            endif()
+        endforeach()
+        set(mode "directory walk (no git index)")
+    endif()
+
+    list(REMOVE_DUPLICATES found)
+    list(SORT found)
+    fastcached_decline_third_party("${sourceDir}" found declined)
+
+    set(${filesOut} "${found}" PARENT_SCOPE)
+    set(${declinedOut} "${declined}" PARENT_SCOPE)
+    set(${modeOut} "${mode}" PARENT_SCOPE)
+endfunction()
