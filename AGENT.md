@@ -1443,6 +1443,12 @@ what differs between compilers, standard libraries, hosts and tool versions.
   members costs seven bytes, and clang-tidy's padding budget fails the build.
 - A table indexed by an enumerator is `EnumTable<Enum, Row>` + `RowsInEnumeratorOrder`. A length
   anchored on an enumerator by name is a guard that fires only when nothing is wrong.
+- An enum's ENUMERATORS are `Enumerators<Enum>()` / `Enumerators(from)`, never `views::iota` to
+  `EnumeratorCount<Enum>` with a `static_cast` in the body — walking indices to reach
+  enumerators. `ctest -R enumerator-walks` refuses it, and needed to exist because the
+  hand-spelled form obeys every OTHER rule: `views::iota` is a range view. It does NOT refuse a
+  `static_cast` beside an `EnumeratorCount` — measured, six such sites are bounds checks on a
+  value off a wire and correct — nor the C-style form, which is #1452's.
 - Coverage is Clang source-based, never gcov: ~2000 Catch2 cases are ~2000 processes, and gcov's
   shared `.gcda` races them. `%8m`, not `%p`. `*_test.cpp` sits next to the implementation, so a
   report that counts it measures the tests testing themselves. A compiler cache and coverage cannot

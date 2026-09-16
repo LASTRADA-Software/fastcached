@@ -201,6 +201,25 @@ determinism rests on.
   the idiom, it is the idiom applied to a variable whose assignment can vanish — and the
   check reported *"0 source(s) across 2 directory/directories reach only themselves"* and
   exited 0 over a tree with no sources in it at all. **Quote the variable.**
+- **CMake unescapes a quoted argument BEFORE the regex engine sees it, so a regex literal
+  needs `\\.` and not `\.`.** Written `"\.(cpp|cc|cxx|hpp|hh|hxx|h|ixx|cppm)$"`, the pattern
+  arrives as `.(cpp|...)$` — a dot matching ANY character. **It is not a near-miss that
+  merely widens the set slightly**: `check-apt-update.sh` matches it, because `.sh` is
+  any-character followed by the `h` alternative, and a file enumeration written that way
+  returned **79 shell scripts** as first-party C++. Every downstream verdict stayed green,
+  because a shell script contains no C++ for a C++ rule to object to — so the over-broad
+  half of this is invisible by construction and only a COUNT compared against an
+  independent one finds it (`git ls-files | grep -cE`, 1090 tracked C++ against the
+  helper's 1169). Same family as the `pkill -f` and `grep -Lq` entries: the shell or the
+  tool obliges, nothing errors, and the output looks right. Sibling trap, one level up: a
+  `macro()` re-parses its arguments textually, so there a backslash is eaten TWICE.
+  - **And the instrument used to find it can invent a second finding.** The first diff of
+    the two lists also reported `src/CowTree/*` as missing from the enumeration, which was
+    false: the CMake-written list had different line endings from the `git ls-files` one, so
+    `comm` matched nothing at all and `head` showed the front of each list as though it were
+    a difference. The real defect was the pattern alone. **A comparison of two file lists on
+    this host states its line endings**, or it reports a superset of what is wrong — and the
+    extra findings look exactly like the real one.
 - **A clean-tree injection understates a check that only reports violations.** #518
   classified `check-net-boundary` as PARTIAL — summary byte-identical, full output changes
   — from exactly that experiment, and the classification is too kind: everything a merged
@@ -5697,17 +5716,44 @@ variable with an unrecognised name) is not seen, and adding one is adding a row.
 its own directory -- and nothing checks an enumerator that is anchored under `src/`, which
 is correct: an inclusion list naming this repository's own layout needs no roots.
 
+## The enumerators of an enum are a view, and a hand-spelled walk is refused
+
+`Core/EnumTable.hpp` offers `Enumerators<Enum>()` and `Enumerators(Enum from)` (#1441), and
+`ctest -R enumerator-walks` refuses the hand-spelled form: `views::iota` to
+`EnumeratorCount<Enum>` on one line, or a `for`/`while` bounded by it.
+
+**The reason it needed a scan is that the hand-spelled form obeyed every existing rule.**
+The guidelines forbid C-style loops and ask for range views; all ten sites #1441 converted
+used `std::views::iota`, which IS a range view. The defect was walking INDICES to reach
+ENUMERATORS — one site even cast the enumerator back out again, comparing
+`static_cast<std::size_t>(route.match) != kind`, to meet the index it had been handed. No
+loop-shape check can see that, so this is the second kind of guard: the one CALLED alongside
+an operation rather than folded into it, which is the kind that needs a scan.
+
+**What it deliberately does not refuse, because that was measured.** A `static_cast` near an
+`EnumeratorCount` looks like the obvious third pattern and matches six sites in this tree —
+`static_cast<std::size_t>(raw) >= EnumeratorCount<E>` in `Consensus/RaftTypes.hpp` and
+`apps/fastcache-cc/Stats.cpp` — every one of which is a BOUNDS CHECK on a value off a wire
+and correct. A check on it would refuse working code, which is why the loop shape requires
+`for`/`while` on the line: `>=` is a range test and a `<` inside an `if` may be one too. Nor
+does it cover a walk split across lines, or the C-style three-clause form, which is #1452's
+scan — stated in the refusal itself so the next reader does not over-apply it.
+
+The seam's own existence is the ANCHOR: with `Enumerators` gone from the header the check
+REFUSES rather than reporting a clean tree, because *no violations* and *the rule no longer
+applies* are different answers and only one of them is good news.
+
 ## Open work
 
-- **[#1476](https://github.com/LASTRADA-Software/fastcached/issues/1476)** — nothing refuses
-  a hand-spelled enumerator walk now that `Core/EnumTable.hpp` offers `Enumerators<E>()`
-  (#1441). The seam is the second kind of guard, the kind CALLED alongside an operation
-  rather than folded into it, so the entry above about scans applies to it: #1441 found ten
-  sites in three spellings, three of which restated the count as `static_cast<...>(E::Last)`
-  and bypassed `EnumeratorCount` too, so the tree has already demonstrated that a seam
-  nothing scans for gets walked around. Probably a ROW in the scan #1452 widens from tests
-  to all of `src/`, rather than a fourth copy of the file-set machinery; that sequencing is
-  the reason it is not in #1441.
+- **[#1485](https://github.com/LASTRADA-Software/fastcached/issues/1485)** — nine
+  `check-*.cmake` readers each carry their own copy of the first-party-C++ enumeration.
+  `fastcached_first_party_cxx` in `scripts/lib/CheckCommon.cmake` is now the one answer and
+  #1476 is its first consumer; the nine are unchanged, so it is the source of truth for one
+  caller out of ten. Migrating them is one at a time with each check's own self-test re-run,
+  which is why it was not a rider on #1476. **The cost is not hypothetical**: extracting the
+  helper exposed a miscount in the freshly written copy within the hour — see the
+  single-backslash entry above — and nine copies is nine chances for that in nine files
+  nobody diffs against each other.
 
 - **[#1432](https://github.com/LASTRADA-Software/fastcached/issues/1432)** — SHA-256 hardware
   detection and the ARM engine are compiled for arm64 macOS alone, so Linux aarch64 and Windows

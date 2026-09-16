@@ -5545,6 +5545,50 @@ set_tests_properties("ranges-seam-selftest" PROPERTIES
     TIMEOUT 180
 )
 
+# No first-party C++ walks an enum's enumerators by hand now that `Enumerators<Enum>()`
+# exists (#1476). Ten sites spelled the same walk before #1441 -- `views::iota` from zero to
+# `EnumeratorCount<Enum>` plus a `static_cast<Enum>(index)` in the body -- and NOTHING refused
+# it, which is why there were ten: the guidelines forbid C-style loops and ask for range
+# views, and every one of those ten obeyed both, because `views::iota` IS a range view. The
+# defect was walking indices to reach enumerators, and no existing check could see it.
+#
+# In the DEFAULT set, since the shape builds everywhere and fails no leg. The refused shapes
+# are line-local; a `static_cast` near an `EnumeratorCount` is deliberately NOT one of them,
+# measured -- six such sites in this tree are bounds checks on a value off a wire and every
+# one is correct. The seam's own existence is the ANCHOR: with `Enumerators` gone the check
+# refuses rather than reporting a clean tree.
+add_test(
+    NAME "enumerator-walks"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DGIT_EXECUTABLE=${GIT_EXECUTABLE}"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-enumerator-walks.cmake"
+)
+set_tests_properties("enumerator-walks" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 120
+)
+
+# And it must be seen to refuse AND to accept, in BOTH enumeration modes. The accepting
+# direction is the half usually skipped, and here it is load-bearing: the check must not
+# refuse the bounds-check shape. Every case asserts the mode it ran in, because this tree has
+# already shipped a guard whose self-test exercised a directory-walk fallback while CI
+# exercised git -- the mode under test not being the mode in use.
+add_test(
+    NAME "enumerator-walks-selftest"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DGIT_EXECUTABLE=${GIT_EXECUTABLE}"
+        "-DFASTCACHED_SCRATCH_DIR=${CMAKE_CURRENT_BINARY_DIR}/enumerator-walks-selftest"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-enumerator-walks-selftest.cmake"
+)
+set_tests_properties("enumerator-walks-selftest" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 180
+)
+
 # A retained wall clock is a `WallClockRef`, never a raw `IWallClock` pointer or
 # reference member (#1032). The TYPE is the guard -- `WallClockRef` refuses to be built
 # from an rvalue, and the `static_assert` pairs in `Core/WallClockRef_test.cpp` and
