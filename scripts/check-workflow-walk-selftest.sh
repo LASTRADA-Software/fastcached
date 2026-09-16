@@ -78,7 +78,9 @@ cat > "${FastCachedWork}/drive.awk" <<'DRIVER'
 function WorkflowOn(kind) {
     tally[WfPass, kind]++
     if (WfPass != 2) return
-    if (kind == "key")
+    if (kind == "text")
+        blockKeys[WfBlockKey]++
+    else if (kind == "key")
         printf "key\t%s\tscope=%s\tind=%d\tvalue=<%s>\n", WfPath, WfScope, WfIndent, WfValue
     else if (kind == "step")
         printf "step\tjob=%s\tn=%d\tname=%s\tshell=%s\tuses=%s\trun=%d\tenv=%d\tenvnames=%s\n",
@@ -91,6 +93,7 @@ function WorkflowOn(kind) {
         printf "refusal\t%d\t%s\t%s\n", WfAt, WfRefuseKind, WfRefuseDetail
     else if (kind == "end") {
         printf "workflow\tshell=<%s>\tenvnames=%s\n", WfWorkflowShell, Names(WfWorkflowEnv)
+        printf "blockkeys\t%s\n", Counts(blockKeys)
         Tally(1); Tally(2)
         printf "count\trunKeys=%d\tplaced=%d\n", WfRunKeys, Cardinality(WfPlaced)
     }
@@ -109,6 +112,19 @@ function Names(a,   k, n, i, j, t, out, keys) {
     return n ? out : "-"
 }
 function Cardinality(a,   k, n) { for (k in a) n++; return n + 0 }
+# Owner=count pairs, sorted. A SET of owners cannot see a continuation attributed to the
+# WRONG key when that key owns other continuations too; a count can.
+function Counts(a,   k, n, i, j, t, out, keys) {
+    n = 0
+    for (k in a) keys[++n] = k
+    for (i = 2; i <= n; i++) {
+        t = keys[i]
+        for (j = i - 1; j >= 1 && keys[j] > t; j--) keys[j + 1] = keys[j]
+        keys[j + 1] = t
+    }
+    for (i = 1; i <= n; i++) out = out (i > 1 ? "," : "") keys[i] "=" a[keys[i]]
+    return n ? out : "-"
+}
 function Tally(p) {
     printf "tally\tpass=%d\traw=%d\ttext=%d\tstep-line=%d\tkey=%d\tstep=%d\tjob=%d\trefusal=%d\n",
            p, tally[p, "raw"], tally[p, "text"], tally[p, "step-line"], tally[p, "key"],
@@ -257,6 +273,38 @@ jobs:
 name: a second document
 YML
 
+Stage folded <<'YML'
+name: folded
+on: push
+jobs:
+  only:
+    runs-on: ubuntu-24.04
+    if: github.event_name == 'push'
+        && github.ref_type != 'branch'
+    steps:
+      - name: a folded condition and a folded env value
+        id: sweep
+        if: >-
+          github.ref == 'refs/heads/master'
+          && needs.changes.outputs.code != 'false'
+        env:
+          NOTE: >-
+            one
+            two
+        run: |
+          echo body
+      - name: a plain scalar that continues
+        working-directory: some/path
+          and/more
+        run: echo two
+      - name: a run whose plain scalar continues
+        run: echo three
+          echo four
+      - name: a run whose plain scalar starts on the NEXT line
+        run:
+          echo five
+YML
+
 # ---- the assertions, per case ----------------------------------------------
 # Kept in ONE place so a neuter re-runs exactly what the clean arm ran. A second
 # copy for the neuters would drift, and the neuter would then be holding up a
@@ -311,6 +359,40 @@ Judge() {
         Require "${t}" 'count	runKeys=6	placed=6' "every run: key the count found was placed"
     fi
 
+    if [ "${name}" = "folded" ]; then
+        # `WfBlockKey` is the only way to tell a folded `if:`'s second line from
+        # any other scalar's, and nothing in the tree consumed it when it shipped.
+        # Three owners here rather than one, so an implementation that hardcoded
+        # "run" cannot pass: `if`, a step `env:` VALUE, and the `run:` itself.
+        # Counted per owner, not merely listed. A SET cannot see a continuation
+        # attributed to the WRONG key when that key owns other continuations too,
+        # and that is the bug this field prevents: a consumer joining a folded
+        # `if:` must not swallow a `run:` body's lines. Neutering the `run:` site
+        # moves `run` from 3 to 2 and adds `name=1`, which a set would have hidden.
+        #
+        # Four owners over the four shapes that open a scalar: a block indicator
+        # (the step `if:` and the `env:` VALUE), a plain scalar with an inline
+        # value continuing below (`working-directory:` and the JOB-level `if:`),
+        # a `run:` whose value starts on its key line, and a `run:` whose value
+        # starts on the next one -- the last being the only path where the `run:`
+        # site's assignment is not already made by the plain-scalar branch above
+        # it, which is why a neuter of it provoked nothing until this shape was
+        # in the fixture.
+        Require "${t}" 'blockkeys	NOTE=2,if=3,run=3,working-directory=1' "a continuation names the key whose scalar it belongs to"
+
+        # The step record, and its own keys as key events -- what the next
+        # migration reads instead of `/^        id:/` and `/^        if:/`.
+        Require "${t}" 'key	jobs/only/steps/id	scope=step	ind=8	value=<sweep>' "a step id: is a key at step scope"
+        Require "${t}" 'key	jobs/only/steps/if	scope=step	ind=8	value=<>->' "a folded step if: is a key whose value is the indicator"
+        Require "${t}" 'key	jobs/only/steps/env/NOTE	scope=step	ind=10	value=<>->' "a folded env value is a key inside the step env block"
+        Require "${t}" 'step	job=only	n=1	name=a folded condition and a folded env value	shell=	uses=	run=1	env=1	envnames=NOTE' "the step record has one run line and one env row"
+        Require "${t}" 'tally	pass=2	raw=29	text=9	step-line=13	key=20	step=4	job=1	refusal=0' "the fixture drives nine continuations over four steps"
+        # The JOB-level folded condition, whose continuation is outside any step --
+        # a  event nothing would report while that kind was step-only, and the
+        # shape two of the readers still to migrate join on purpose.
+        Require "${t}" 'key	jobs/only/if	scope=job	ind=4	value=<github.event_name == '"'"'push'"'"'>' "a job-level condition is a key at job scope"
+    fi
+
     if [ "${name}" = "edges" ]; then
         Require "${t}" 'refusal	7	unreadable-yaml	a step written as `{ name: flow, run: echo flow }`' "a flow mapping step is refused, not misread"
         Require "${t}" 'refusal	9	unreadable-run	`run: *someAnchor`' "an alias as a run: value is refused"
@@ -335,6 +417,7 @@ Judge() {
 
 echo "check-workflow-walk-selftest: driving scripts/lib/workflow-walk.awk"
 Judge rich "${FastCachedWalkAwk}" clean
+Judge folded "${FastCachedWalkAwk}" clean
 Judge edges "${FastCachedWalkAwk}" clean
 CleanFailures=${Failures}
 
@@ -377,6 +460,15 @@ Neuter step-index 's/^    WfStepIndex++$/    #&/' rich \
     "a step knowing its position in its job"
 Neuter job-env '/WfJobEnv\[name\] = 1; WfJobEnvAt\[WfJobStart, name\] = 1/s/^/#/' rich \
     "a job-level env: name reaching the job record"
+# One per site where a scalar opens. Three of them, because a neuter of a site the
+# fixture never reaches provokes nothing -- which this self-test reports as ITS OWN
+# failure, and did, which is how the third shape came to be in the fixture at all.
+Neuter block-key-indicator 's/^        WfBlockOwner = ind; WfBlockKey = key$/        WfBlockOwner = ind/' folded \
+    "a block-indicator continuation knowing which key's scalar it is part of"
+Neuter block-key-plain 's/^        WfBlockOwner = ind; WfBlockKind = "skip"; WfBlockKey = key$/        WfBlockOwner = ind; WfBlockKind = "skip"/' folded \
+    "a plain-scalar continuation knowing which key's scalar it is part of"
+Neuter block-key-run 's/^            WfBlockOwner = ind; WfBlockKind = "run"; WfBlockKey = key$/            WfBlockOwner = ind; WfBlockKind = "run"/' folded \
+    "a run: body line knowing it belongs to a run:"
 Neuter path-mark '/if (kind == "unreadable-yaml" || kind == "unreadable-run") WorkflowPushPath/s/^/#/' edges \
     "a refused line marking the path so nothing below it claims a readable ancestor"
 Neuter second-document '/a document marker after the first document/s/^/#/' edges \

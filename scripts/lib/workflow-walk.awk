@@ -35,7 +35,12 @@
 #
 #   raw        every line as read, before any interpretation. `WfLine` and `WfAt` only.
 #   text       a continuation line owned by a scalar -- a `run:` body line, or any other block or
-#              plain scalar's text. Fires only inside a step.
+#              plain scalar's text. `WfBlockKey` is the key it belongs to and `WfScope` says
+#              where it sits. It fires OUTSIDE a step too, and deliberately: a folded job-level
+#              `if:` is a continuation nothing else would report, and two of the readers being
+#              migrated join one on purpose -- read a line at a time, a wrapped condition looks
+#              exactly like a deleted reader. A consumer that wants step bodies only says
+#              `WfScope == "step"`.
 #   step-line  a line inside a step, before it is read as a key, so a step's first line is this
 #              step's and not its predecessor's. `WfEnvRow` says it is a row of the step's own
 #              `env:`.
@@ -58,6 +63,9 @@
 #   WfScope        where the line sits: "" (document), "job", "steps" or "step"
 #   WfStepKey      1 when the line is one of the current step's own keys
 #   WfEnvRow       1 when the line is a row of the current step's own `env:`
+#   WfBlockKey     at a `text` event, the KEY whose scalar this continuation belongs to --
+#                  the only way to tell a folded `if:`'s second line from any other
+#                  scalar's, and a fact only the walk has
 #   WfJob          the current job's key, or "" outside `jobs:`
 #   WfJobStart     the `FNR` of that job's key -- the identity a pass-1 finding is filed under
 #   WfJobShell     `defaults.run.shell` for this job, or ""
@@ -173,7 +181,7 @@ function WorkflowWalkLine(   line, ind, blank, isItem, stepItem, t, key, value, 
             WfLine = line
             WfEnvRow = (WfInEnv && WfEnvScope == "step" && ind > WfEnvIndent)
             WfScope = WorkflowScope()
-            if (WfInStep && WfInSteps) WorkflowEmit("text")
+            WorkflowEmit("text")
             return
         }
         WfBlockOwner = -1
@@ -260,12 +268,12 @@ function WorkflowWalkLine(   line, ind, blank, isItem, stepItem, t, key, value, 
     WfStepKey = (WfInStep && WfInSteps && ind == WfStepKeyIndent)
     WorkflowEmit("key")
     if (value ~ /^[|>][-+0-9]*$/) {
-        WfBlockOwner = ind
+        WfBlockOwner = ind; WfBlockKey = key
         WfBlockKind = (WfStepKey && key == "run") ? "run" : "skip"
         if (WfBlockKind == "run") { WfHasRun = 1; WorkflowPlace() }
         if (!(WfInEnv && ind > WfEnvIndent)) return
     } else if (value != "") {
-        WfBlockOwner = ind; WfBlockKind = "skip"
+        WfBlockOwner = ind; WfBlockKind = "skip"; WfBlockKey = key
     }
 
     if (WfInEnv && ind > WfEnvIndent) { WorkflowAddEnv(key); return }
@@ -326,7 +334,7 @@ function WorkflowWalkLine(   line, ind, blank, isItem, stepItem, t, key, value, 
             WfHasRun = 1
             WfBodyAt[WfBodyCount] = FNR; WfBody[WfBodyCount++] = value
             # A plain scalar continues on more-indented lines, including one whose first line is empty.
-            WfBlockOwner = ind; WfBlockKind = "run"
+            WfBlockOwner = ind; WfBlockKind = "run"; WfBlockKey = key
         }
     }
 }

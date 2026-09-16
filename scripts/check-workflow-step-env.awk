@@ -365,6 +365,10 @@
     # uninteresting are otherwise the same silence.
     function WorkflowOn(kind) {
         if (kind == "raw") return              # the `run:` count is the walk`s own
+        # `text` fires for a continuation ANYWHERE since the walk stopped confining it to
+        # steps; this rule is about a step`s own values, so it says so rather than relying on
+        # the walk to have confined it.
+        if (kind == "text" && WfScope != "step") return
         if (kind == "text" || kind == "step-line") {
             # A `run:` body line and a step`s own key line both carry `${{ env.* }}`. The plant
             # goes in HERE, at the read site, on every env row of every step -- not synthesised in
