@@ -24,6 +24,14 @@
 # Runs as `cmake -P`. See `check-script-check-signals.cmake` for why such a check reports
 # failure through its OUTPUT rather than an exit code.
 #
+# A `directory walk` expectation below names the mode CLASS and not which of its two reasons
+# ran. Since #1485 a walk says whether there was no index at all or whether the index named no
+# matching file, and which one a staged tree gets depends on where the scratch directory sits --
+# a tree with no `.git` of its own is still inside a work tree whenever `CMAKE_CURRENT_BINARY_DIR`
+# is. The git-against-walk distinction these cases exist for is unaffected; the two reasons are
+# pinned in `check-tracked-files-selftest.cmake`, which controls the git probe instead of
+# inheriting it.
+#
 # Usage:
 #   cmake -DFASTCACHED_SOURCE_DIR=<dir> -DFASTCACHED_SCRATCH_DIR=<dir> \
 #         [-DGIT_EXECUTABLE=<git>] -P scripts/check-cli-ambient-reads-selftest.cmake
@@ -159,7 +167,7 @@ endfunction()
 # because a row that does not parse runs as a different case than it reads as.
 set(FastCachedAmbientReadCases
     # THE ACCEPTING ARM, in both modes, with the comment naming every token present.
-    "baseline via walk|none|-|-|-|no getenv, isatty, ioctl, GetConsoleMode across && directory walk (no git index) && 0 exemption row(s) && the control recognised 1 read(s)|CMake Error"
+    "baseline via walk|none|-|-|-|no getenv, isatty, ioctl, GetConsoleMode across && directory walk && 0 exemption row(s) && the control recognised 1 read(s)|CMake Error"
     "baseline via git|none-git|-|-|-|no getenv, isatty, ioctl, GetConsoleMode across && git ls-files|CMake Error"
 
     # THE RED ARM, one planted read per token, each named by file, line and token.

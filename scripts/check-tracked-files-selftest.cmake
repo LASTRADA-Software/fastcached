@@ -150,6 +150,35 @@ set(corpus
 
 set(cxxFilter "\\.(cpp|hpp)$")
 
+# ---------------------------------------------------------------------------
+# `fastcached_work_tree_state`: all THREE answers, each arranged deterministically.
+#
+# Every one of them has to be REACHABLE by a fixture or the third is a branch nobody has
+# watched, and two of the three are easy to arrange only by accident. `not-a-work-tree` is the
+# awkward one -- a directory outside every repository is not something this fixture can
+# guarantee, since the scratch directory may sit under `out/build/...` -- so it is arranged by
+# asking about a repository's own `.git` DIRECTORY, which git answers `false` for while
+# succeeding. That is the state's own meaning, not a trick: inside the repository, outside the
+# work tree.
+set(probeTree "${FASTCACHED_SCRATCH_DIR}/workTreeStateProbe")
+StageTree("${probeTree}" "src/Alpha.cpp|int alpha()")
+MakeRepository("${probeTree}" TRUE)
+
+fastcached_work_tree_state("${probeTree}" probeState)
+Expect("workTreeState" "a checkout" "${probeState}" "work-tree")
+
+fastcached_work_tree_state("${probeTree}/.git" probeState)
+Expect("workTreeState" "inside the repository, outside the work tree"
+    "${probeState}" "not-a-work-tree")
+
+set(realGit "${GIT_EXECUTABLE}")
+set(GIT_EXECUTABLE "${probeTree}/no-such-git-binary")
+fastcached_work_tree_state("${probeTree}" probeState)
+set(GIT_EXECUTABLE "${realGit}")
+# A git that cannot be RUN is `no-git` and not `not-a-work-tree`: a missing binary and a broken
+# one are one fact for every caller, and neither says anything about the directory.
+Expect("workTreeState" "git cannot answer" "${probeState}" "no-git")
+
 # --- 1. git, every tracked file, filtered ----------------------------------------------------
 set(tree "${FASTCACHED_SCRATCH_DIR}/gitAllTracked")
 StageTree("${tree}" ${corpus})

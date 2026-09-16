@@ -531,6 +531,51 @@ function(fastcached_scan_code_lines content pattern outVar)
 endfunction()
 
 # ---------------------------------------------------------------------------
+# Whether a directory is inside a git work tree, and when it is not, WHY.
+#
+# The last thing every enumerating check had its own copy of, and the one place the copies
+# already disagreed in SPELLING: they compared the exit status with `EQUAL 0` while
+# `check-repository-hygiene.cmake` used `STREQUAL "0"`. Both are right, and they are two
+# statements of one fact, which is the shape that drifts.
+#
+# THREE answers rather than a bool, because the two callers need different things from a
+# negative one and neither can recover the distinction from `FALSE`: an enumeration walks the
+# directory either way, while a check with nothing to fall back on SKIPS -- and it owes an
+# operator a different sentence for "git cannot answer here" than for "this is not a
+# checkout". A validator returns a reason.
+#
+# @param sourceDir The directory to ask about.
+# @param outVar Set to `work-tree`, `no-git` (no git executable, or it could not be run) or
+#        `not-a-work-tree` (git answered, and the answer is no).
+function(fastcached_work_tree_state sourceDir outVar)
+    if(NOT GIT_EXECUTABLE)
+        find_package(Git QUIET)
+    endif()
+    if(NOT GIT_EXECUTABLE)
+        set(${outVar} "no-git" PARENT_SCOPE)
+        return()
+    endif()
+
+    execute_process(
+        COMMAND "${GIT_EXECUTABLE}" -C "${sourceDir}" rev-parse --is-inside-work-tree
+        OUTPUT_VARIABLE insideWorkTree
+        ERROR_QUIET
+        RESULT_VARIABLE gitStatus
+        OUTPUT_STRIP_TRAILING_WHITESPACE)
+
+    # A git that could not be RUN is `no-git`, not `not-a-work-tree`: a missing binary and a
+    # broken one are the same fact for every caller, and neither is a statement about the
+    # directory. Only an answer counts as one.
+    if(NOT gitStatus EQUAL 0)
+        set(${outVar} "no-git" PARENT_SCOPE)
+    elseif(insideWorkTree STREQUAL "true")
+        set(${outVar} "work-tree" PARENT_SCOPE)
+    else()
+        set(${outVar} "not-a-work-tree" PARENT_SCOPE)
+    endif()
+endfunction()
+
+# ---------------------------------------------------------------------------
 # Every tracked file a check's rule is ABOUT, and HOW they were found.
 #
 # Eight `check-*.cmake` readers carried a byte-identical copy of this machinery, and each asks
@@ -606,38 +651,28 @@ function(fastcached_tracked_files sourceDir)
     set(found "")
     set(mode "")
 
-    if(NOT GIT_EXECUTABLE)
-        find_package(Git QUIET)
-    endif()
-    if(GIT_EXECUTABLE)
+    fastcached_work_tree_state("${sourceDir}" workTreeState)
+    if(workTreeState STREQUAL "work-tree")
+        set(pathspecArguments "")
+        if(arg_PATHSPECS)
+            set(pathspecArguments -- ${arg_PATHSPECS})
+        endif()
         execute_process(
-            COMMAND "${GIT_EXECUTABLE}" -C "${sourceDir}" rev-parse --is-inside-work-tree
-            OUTPUT_VARIABLE insideWorkTree
-            ERROR_VARIABLE gitError
-            RESULT_VARIABLE gitStatus
+            COMMAND "${GIT_EXECUTABLE}" -C "${sourceDir}" ls-files ${pathspecArguments}
+            OUTPUT_VARIABLE tracked
+            RESULT_VARIABLE lsStatus
             OUTPUT_STRIP_TRAILING_WHITESPACE)
-        if(gitStatus EQUAL 0 AND insideWorkTree STREQUAL "true")
-            set(pathspecArguments "")
-            if(arg_PATHSPECS)
-                set(pathspecArguments -- ${arg_PATHSPECS})
-            endif()
-            execute_process(
-                COMMAND "${GIT_EXECUTABLE}" -C "${sourceDir}" ls-files ${pathspecArguments}
-                OUTPUT_VARIABLE tracked
-                RESULT_VARIABLE lsStatus
-                OUTPUT_STRIP_TRAILING_WHITESPACE)
-            if(lsStatus EQUAL 0 AND tracked STREQUAL "")
-                set(mode "directory walk (git index names no matching file)")
-            elseif(lsStatus EQUAL 0)
-                string(REPLACE "\n" ";" trackedFiles "${tracked}")
-                foreach(candidate IN LISTS trackedFiles)
-                    if(hasFilter AND NOT candidate MATCHES "${arg_FILTER}")
-                        continue()
-                    endif()
-                    list(APPEND found "${candidate}")
-                endforeach()
-                set(mode "git ls-files")
-            endif()
+        if(lsStatus EQUAL 0 AND tracked STREQUAL "")
+            set(mode "directory walk (git index names no matching file)")
+        elseif(lsStatus EQUAL 0)
+            string(REPLACE "\n" ";" trackedFiles "${tracked}")
+            foreach(candidate IN LISTS trackedFiles)
+                if(hasFilter AND NOT candidate MATCHES "${arg_FILTER}")
+                    continue()
+                endif()
+                list(APPEND found "${candidate}")
+            endforeach()
+            set(mode "git ls-files")
         endif()
     endif()
 

@@ -71,15 +71,18 @@ if(NOT GIT_EXECUTABLE)
     return()
 endif()
 
-execute_process(
-    COMMAND "${GIT_EXECUTABLE}" rev-parse --is-inside-work-tree
-    WORKING_DIRECTORY "${FASTCACHED_SOURCE_DIR}"
-    OUTPUT_VARIABLE insideWorkTree
-    OUTPUT_STRIP_TRAILING_WHITESPACE
-    ERROR_QUIET
-    RESULT_VARIABLE revParseResult
-)
-if(NOT revParseResult STREQUAL "0" OR NOT insideWorkTree STREQUAL "true")
+# Asked through `fastcached_work_tree_state` (#1485), the one spelling of this question. It
+# answers in THREE values and the two negative ones get different sentences here: a check with
+# no index to inspect owes an operator "git cannot answer" or "this is not a checkout", never
+# one message covering both. This check has no directory-walk fallback and must not grow one --
+# its subject is what the INDEX holds, which a walk cannot see.
+include("${CMAKE_CURRENT_LIST_DIR}/lib/CheckCommon.cmake")
+fastcached_work_tree_state("${FASTCACHED_SOURCE_DIR}" workTreeState)
+if(workTreeState STREQUAL "no-git")
+    message("SKIP: git could not answer here, so nothing can be shown to be tracked by it")
+    return()
+endif()
+if(NOT workTreeState STREQUAL "work-tree")
     message("SKIP: ${FASTCACHED_SOURCE_DIR} is not a git work tree "
             "(an exported source tarball, for instance), so there is no index "
             "to inspect")
