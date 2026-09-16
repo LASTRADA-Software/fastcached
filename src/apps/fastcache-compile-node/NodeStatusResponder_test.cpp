@@ -266,6 +266,8 @@ struct DirectSources
 {
     CompileCapacity const* capacity { nullptr };                ///< Live slot accounting.
     Distributed::SchedulerService const* scheduler { nullptr }; ///< Role and known leader.
+    /// The admission oracle, for its applied-tombstone count; null is a node with no cluster.
+    NodeMembership const* membership { nullptr };
 };
 
 /// A `ConfiguredNodeStatus` beside the configuration it holds a reference to.
@@ -301,7 +303,8 @@ struct Fixture
                  components,
                  NodeRuntimeSources { .runtime = initial.has_value() ? &runtime : nullptr,
                                       .capacity = direct.capacity,
-                                      .scheduler = direct.scheduler } }
+                                      .scheduler = direct.scheduler,
+                                      .membership = direct.membership } }
     {
     }
 
@@ -851,6 +854,68 @@ TEST_CASE("NodeMetrics answers the reading /metrics renders, the cache tier's fi
         CHECK(std::ranges::all_of(CounterTable, [&metrics](auto const& row) {
             return row.counter == IMetricsSink::Counter::WorkerJobsCompleted || metrics.Read(row.counter) == 0;
         }));
+    }
+}
+
+TEST_CASE("the applied-tombstone count is absent with no cluster, zero with one, and a number after a forget",
+          "[node][node-status][forget]")
+{
+    // #1471's second acceptance clause. THREE readings, because two would not distinguish the
+    // field working from the field always saying nothing: an implementation that reports absent
+    // unconditionally passes any case that only checks the unwired arm.
+    ManualClock clock;
+
+    SECTION("a node with no cluster reports NOTHING, not zero")
+    {
+        // The source is null, which is how this node reports a fact it has no component for --
+        // `NodeRuntimeSources`' own rule. A `0` here would be a reassuring claim about a
+        // committed set that does not exist on this machine.
+        Fixture fix { ConfigShape {}, clock };
+        auto const fields = fix.status.Describe();
+
+        CHECK_FALSE(fields.runtime.forgottenClients.has_value());
+    }
+
+    SECTION("a node with a cluster that forgets nobody reports ZERO")
+    {
+        // The arm the ticket names, and the direction that gets skipped. Zero is the truth
+        // about a cluster that has agreed no forgets, and it is a different answer from the
+        // section above -- which is the whole distinction being tested.
+        NullLogger logger;
+        auto const cfg = NodeConfigOf(ConfigShape {});
+        NodeMembership membership { cfg, logger };
+
+        Fixture fix { ConfigShape {}, clock, {}, std::nullopt, DirectSources { .membership = &membership } };
+        auto const fields = fix.status.Describe();
+
+        REQUIRE(fields.runtime.forgottenClients.has_value());
+        CHECK(Unwrap(fields.runtime.forgottenClients) == 0);
+    }
+
+    SECTION("and the count is what a forget produces")
+    {
+        // Read per request, so an entry applied a moment ago is visible on the next
+        // `--node-status` rather than at the next restart -- asserted by publishing AFTER the
+        // status object was built and bound.
+        NullLogger logger;
+        auto const cfg = NodeConfigOf(ConfigShape {});
+        NodeMembership membership { cfg, logger };
+
+        Fixture fix { ConfigShape {}, clock, {}, std::nullopt, DirectSources { .membership = &membership } };
+        // Bound to a named local before unwrapping: `Unwrap` returns a REFERENCE, so reaching
+        // through a `Describe()` temporary would read a value whose owner has already died --
+        // the same hazard this file's own fixture exists to make unspellable.
+        auto const before = fix.status.Describe();
+        REQUIRE(before.runtime.forgottenClients.has_value());
+        REQUIRE(Unwrap(before.runtime.forgottenClients) == 0);
+
+        auto state = Cluster::ClusterState {};
+        state.forgotten = { "10.0.0.7", "10.0.0.8" };
+        membership.PublishCluster(state);
+
+        auto const fields = fix.status.Describe();
+        REQUIRE(fields.runtime.forgottenClients.has_value());
+        CHECK(Unwrap(fields.runtime.forgottenClients) == 2);
     }
 }
 

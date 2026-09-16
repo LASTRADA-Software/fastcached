@@ -1512,6 +1512,61 @@ TEST_CASE("A toolchain state this build cannot name is skipped rather than refus
     CHECK(Unwrap(back).toolchainsServed == 5);
 }
 
+TEST_CASE("An applied-tombstone count survives the wire, and its ABSENCE does too", "[wire][node-status][forget]")
+{
+    // #1471. The count answers "has my `--cluster-forget-client` reached this machine", so the
+    // two readings an operator must be able to tell apart are *this node has no committed
+    // tombstone set at all* and *the cluster forgets nobody*. Both are encodable; only one is a
+    // number.
+    SECTION("a count is carried")
+    {
+        auto fields = NodeRuntimeFields {};
+        fields.forgottenClients = 3;
+        fields.registrarsTotal = 7;
+
+        auto const back = DecodeNodeRuntime(EncodeNodeRuntime(fields));
+        REQUIRE(back.has_value());
+        auto const runtime = Unwrap(back);
+        REQUIRE(runtime.forgottenClients.has_value());
+        CHECK(Unwrap(runtime.forgottenClients) == 3);
+        // A neighbour, so a decoder reading the wrong POSITION cannot pass by returning the
+        // right number from the wrong field.
+        REQUIRE(runtime.registrarsTotal.has_value());
+        CHECK(Unwrap(runtime.registrarsTotal) == 7);
+    }
+
+    SECTION("a zero is carried as a zero, not as absence")
+    {
+        // The direction that gets skipped. `0` is a real reading -- the cluster has agreed no
+        // forgets -- and an encoder that treats it as "nothing to say" destroys the distinction
+        // the field was added for while every value-carrying case still passes.
+        auto fields = NodeRuntimeFields {};
+        fields.forgottenClients = 0;
+
+        auto const back = DecodeNodeRuntime(EncodeNodeRuntime(fields));
+        REQUIRE(back.has_value());
+        auto const runtime = Unwrap(back);
+        REQUIRE(runtime.forgottenClients.has_value());
+        CHECK(Unwrap(runtime.forgottenClients) == 0);
+    }
+
+    SECTION("absence survives, and the fields around it still decode")
+    {
+        // A node running no consensus says nothing here. The neighbour assertion is what
+        // distinguishes this from an implementation that blanked the tail of the record.
+        auto fields = NodeRuntimeFields {};
+        fields.registrarsTotal = 7;
+        REQUIRE_FALSE(fields.forgottenClients.has_value());
+
+        auto const back = DecodeNodeRuntime(EncodeNodeRuntime(fields));
+        REQUIRE(back.has_value());
+        auto const runtime = Unwrap(back);
+        CHECK_FALSE(runtime.forgottenClients.has_value());
+        REQUIRE(runtime.registrarsTotal.has_value());
+        CHECK(Unwrap(runtime.registrarsTotal) == 7);
+    }
+}
+
 TEST_CASE("A runtime record shorter than this build expects keeps its defaults", "[wire][node-status]")
 {
     // The variable-arity half of the contract: a sender that named only the state is a
@@ -2438,34 +2493,58 @@ TEST_CASE("The consensus address rides the runtime record's variable arity, in b
     sent.toolchainsServed = 4;
     sent.cordon = WireCordonState::Draining;
     sent.consensusEndpoint = "10.0.0.4:6680";
+    sent.forgottenClients = 2;
     // Kept in a local: `SplitAll` hands back spans INTO it.
     auto const emitted = EncodeNodeRuntime(sent);
     auto const parts = WireFields::SplitAll(emitted);
     REQUIRE(parts.has_value());
-    // Fourteen: thirteen that predate #1328 and the endpoint. Pinned, since every cut below
-    // is counted from it and a record that grew would move what "older" means.
-    REQUIRE(Unwrap(parts).size() == 14);
+    // Fifteen: thirteen that predate #1328, the endpoint it added, and #1471's applied-tombstone
+    // count. Pinned, since every cut below is counted from it and a record that grew would move
+    // what "older" means -- which is how this case caught #1471's append rather than letting it
+    // shift the cuts silently.
+    REQUIRE(Unwrap(parts).size() == 15);
 
-    SECTION("thirteen fields, as a build before #1328 emits: disengaged, and the cordon still read")
+    SECTION("thirteen fields, as a build before #1328 emits: both disengaged, and the cordon still read")
     {
         auto const older = std::vector<std::span<std::byte const>> { Unwrap(parts).begin(), Unwrap(parts).begin() + 13 };
         auto const back = DecodeNodeRuntime(WireFields::Encode(WireFields::FieldList { older }));
         REQUIRE(back.has_value());
         CHECK_FALSE(Unwrap(back).consensusEndpoint.has_value());
+        CHECK_FALSE(Unwrap(back).forgottenClients.has_value());
         // The field before it survives the cut, so the cut is where it was meant to be.
         CHECK(Unwrap(back).cordon == std::optional { WireCordonState::Draining });
         CHECK(Unwrap(back).toolchainsServed == 4);
     }
 
-    SECTION("fourteen fields: engaged")
+    SECTION("fourteen fields, as a build after #1328 and before #1471 emits: the count is absent")
+    {
+        // **The cut #1471 has to survive**, and the direction a version-bump argument gets
+        // tested in only by accident: a peer that knows the consensus endpoint and has never
+        // heard of the tombstone count. Its record is SHORTER, and the count must come back
+        // "did not say" rather than taking the reply with it -- which is the whole claim that
+        // appending to this record costs no wire version.
+        auto const older = std::vector<std::span<std::byte const>> { Unwrap(parts).begin(), Unwrap(parts).begin() + 14 };
+        auto const back = DecodeNodeRuntime(WireFields::Encode(WireFields::FieldList { older }));
+        REQUIRE(back.has_value());
+        CHECK_FALSE(Unwrap(back).forgottenClients.has_value());
+        // And everything that build DID send is still read, so the cut removed one fact rather
+        // than truncating the record.
+        CHECK(Unwrap(back).consensusEndpoint == std::optional<std::string> { "10.0.0.4:6680" });
+        CHECK(Unwrap(back).cordon == std::optional { WireCordonState::Draining });
+    }
+
+    SECTION("fifteen fields, this build: both engaged")
     {
         auto const current = std::vector<std::span<std::byte const>> { Unwrap(parts).begin(), Unwrap(parts).end() };
         auto const back = DecodeNodeRuntime(WireFields::Encode(WireFields::FieldList { current }));
         REQUIRE(back.has_value());
         CHECK(Unwrap(back).consensusEndpoint == std::optional<std::string> { "10.0.0.4:6680" });
+        auto const runtime = Unwrap(back);
+        REQUIRE(runtime.forgottenClients.has_value());
+        CHECK(Unwrap(runtime.forgottenClients) == 2);
     }
 
-    SECTION("fifteen fields, from a build ahead of this one: the surplus is skipped")
+    SECTION("sixteen fields, from a build ahead of this one: the surplus is skipped")
     {
         auto ahead = std::vector<std::span<std::byte const>> { Unwrap(parts).begin(), Unwrap(parts).end() };
         auto const extra = AsBytes(std::string_view { "a fact from the future" });
@@ -2473,5 +2552,8 @@ TEST_CASE("The consensus address rides the runtime record's variable arity, in b
         auto const back = DecodeNodeRuntime(WireFields::Encode(WireFields::FieldList { ahead }));
         REQUIRE(back.has_value());
         CHECK(Unwrap(back).consensusEndpoint == std::optional<std::string> { "10.0.0.4:6680" });
+        auto const runtime = Unwrap(back);
+        REQUIRE(runtime.forgottenClients.has_value());
+        CHECK(Unwrap(runtime.forgottenClients) == 2);
     }
 }

@@ -4651,6 +4651,27 @@ struct NodeRuntimeFields
     /// leaves this disengaged, and a node that runs consensus always states one (a node
     /// naming itself neither way is refused at startup).
     std::optional<std::string> consensusEndpoint {};
+
+    /// How many `--cluster-forget-client` tombstones this node has APPLIED, or disengaged on a
+    /// node that runs no consensus (#1471).
+    ///
+    /// **Absent and zero are different answers, and this is the field an operator checks after
+    /// forgetting a client.** Absent says *this node has no committed tombstone set at all* --
+    /// it runs no consensus, so there is nothing for a forget to have reached. Zero says *the
+    /// cluster has agreed no forgets*. A `0` standing in for absent is a reassuring claim about
+    /// a set that does not exist, which is the same reason `enrollment` above is absent rather
+    /// than `Closed` on a node with no window.
+    ///
+    /// It also answers the harder question, which is whether a forget has PROPAGATED: a node
+    /// that has not yet applied the entry reports a LOWER count than the leader, and both report
+    /// a count. So the three states an operator is trying to tell apart -- no cluster here, the
+    /// cluster forgets nobody, this node is behind -- are three readings rather than two.
+    ///
+    /// A COUNT rather than the set, deliberately. `NodeStatus` carries no request payload
+    /// ("there is nothing to ask a node about itself WITH"), so asking whether one specific host
+    /// is forgotten is a different verb; the seam's `Explain(host)` answers that where a caller
+    /// has the host, and the fleet page carries the leader's set.
+    std::optional<std::uint32_t> forgottenClients {};
 };
 
 /// What an operator reads `NodeRuntimeFields::consensusEndpoint` under, as prose: the
@@ -4765,6 +4786,7 @@ namespace Detail
     // why an engaged endpoint is never empty.
     auto const consensusEndpoint =
         runtime.consensusEndpoint.has_value() ? AsBytes(*runtime.consensusEndpoint) : std::span<std::byte const> {};
+    auto const forgottenClients = Detail::OptionalBigEndian(runtime.forgottenClients);
 
     // Positional, so the ORDER here is the wire contract for this record. Append only:
     // an insertion shifts every later field and every peer decodes one fact as the next.
@@ -4781,7 +4803,8 @@ namespace Detail
                                 enrollment,
                                 enrollmentPending,
                                 cordon,
-                                consensusEndpoint });
+                                consensusEndpoint,
+                                forgottenClients });
 }
 
 /// Read a runtime record back.
@@ -4851,7 +4874,8 @@ namespace Detail
         || !Detail::ReadOptionalBigEndian(at(7), out.registrarsRegistered)
         || !Detail::ReadOptionalBigEndian(at(8), out.registrarsTotal)
         || !Detail::ReadOptionalBigEndian(at(9), out.lastRegistrationSecondsAgo)
-        || !Detail::ReadOptionalBigEndian(at(11), out.enrollmentPending))
+        || !Detail::ReadOptionalBigEndian(at(11), out.enrollmentPending)
+        || !Detail::ReadOptionalBigEndian(at(14), out.forgottenClients))
         return std::nullopt;
 
     if (auto const role = at(5); !role.empty())

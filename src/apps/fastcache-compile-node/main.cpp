@@ -798,7 +798,20 @@ using Node::NodeReloader;
         Node::NodeRuntimeSources { .runtime = workerTier != nullptr ? &workerTier->Runtime() : nullptr,
                                    .capacity = workerTier != nullptr ? &workerTier->Capacity() : nullptr,
                                    .scheduler = ServiceOrNull(schedulerTier.get()),
-                                   .enrollment = AddressWhen(servesEnrollment, enrollmentWindow) },
+                                   .enrollment = AddressWhen(servesEnrollment, enrollmentWindow),
+                                   // `RunsConsensus`, not `servesEnrollment`: the committed
+                                   // tombstone set exists wherever this node participates in
+                                   // the cluster's state, which is a broader condition than
+                                   // serving an enrollment window (that also wants a scheduler
+                                   // tier). Asked of the ONE predicate rather than spelled as a
+                                   // conjunction here, which is the rule this file already
+                                   // carries for `servesEnrollment` two lines up.
+                                   //
+                                   // `NodeMembership` exists on every node; the committed SET
+                                   // only exists where consensus runs, so this pointer is what
+                                   // draws the distinction and a keyless node reports the field
+                                   // ABSENT rather than `0` (#1471).
+                                   .membership = AddressWhen(Node::RunsConsensus(cfg), membership) },
     };
 
     // The operator verbs. Declared BEFORE the surface that routes to it and therefore

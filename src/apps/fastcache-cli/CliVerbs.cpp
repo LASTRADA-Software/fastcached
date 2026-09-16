@@ -1141,6 +1141,18 @@ namespace
             record.push_back({ .name = std::string { CompileCacheWire::ConsensusEndpointField },
                                .value = TextCell(*fields.runtime.consensusEndpoint) });
 
+        // How many `--cluster-forget-client` tombstones this node is ENFORCING (#1471), which
+        // is the field an operator reads after issuing one. Through `AddOptionalNumber`, so
+        // absent renders no row at all rather than a `0`: a node running no consensus has no
+        // committed set for a forget to have reached, and a zero there answers a different
+        // question than "the cluster forgets nobody".
+        //
+        // It is also how a forget that has not PROPAGATED is visible. A node behind on the log
+        // reports a lower number than the leader, and both report one -- so an operator
+        // comparing two machines sees a difference rather than two plausible zeroes, which is
+        // the reading the counters cannot give them.
+        AddOptionalNumber(record, "forgotten-clients", fields.runtime.forgottenClients);
+
         // One field per surface the node actually opened. A surface it does not run gets
         // no field at all rather than a zero port -- the same rule the node applies when
         // encoding, held on both sides so neither can quietly invent a number.
