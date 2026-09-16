@@ -904,15 +904,20 @@ the whole diagnosis ([#1399](https://github.com/LASTRADA-Software/fastcached/iss
 
 ## Open work
 
-- **[#1484](https://github.com/LASTRADA-Software/fastcached/issues/1484)** — the writable-counter
-  attribution is deliberately THREE rows of 144, and the gap is the open half. 106 rows are
-  written through the table-driven `Refuse(row)` mechanism rather than an `Increment` call, so no
-  scan attributes them and none is in `CounterSoleWriterTable`; the remaining 35 have increment
-  sites but have not been read. Every unattributed row reports as this tree did before #1484 — a
-  plausible zero on a binary that cannot write it — so the gap is a known cost rather than a new
-  one, and `fastcached_metrics_surface_absent` is what makes the attributed count visible on every
-  scrape. Widening it means reading the refusal tables per surface, which is why it is not this
-  ticket's fix.
+- **[#1501](https://github.com/LASTRADA-Software/fastcached/issues/1501)** — the writable-counter
+  attribution #1484 landed covers THREE rows of 144, and the remaining 141 are the open half. 106
+  of them are written through the table-driven `Refuse(row)` mechanism rather than an `Increment`
+  call, so no scan attributes them and none is in `CounterSoleWriterTable`; the other 35 have
+  increment sites that have not been read. Every unattributed row reports as this tree did before
+  #1484 — a plausible zero on a binary that cannot write it — so the gap is a known cost rather
+  than a new one, and `fastcached_metrics_surface_absent` is what makes the attributed count
+  visible on every scrape. Widening it means reading the refusal TABLES per surface rather than
+  grepping for increment sites, which is why it was out of #1484's scope.
+
+  **Err unattributed.** The two directions are not symmetric: an unattributed row costs a
+  plausible zero, which is what the tree already has and what `surface_absent` counts, while a row
+  attributed too NARROWLY silently stops reporting a figure that is real — and that failure looks
+  exactly like the absence working.
 
 - **[#592](https://github.com/LASTRADA-Software/fastcached/issues/592)** — whether the
   fleet scheduler should count a non-member caller in a series of its own. #494 left it
