@@ -82,7 +82,7 @@ struct Fleet
     // Loopback, because that is the host a test connection arrives from. The
     // endpoint is given with a port so the constructor's host/endpoint collapse is
     // exercised rather than bypassed.
-    Distributed::ClusterMembership membership { { "127.0.0.1:7000" } };
+    Distributed::ClusterMembership membership { Distributed::MembershipParticipant::FleetMemberList, { "127.0.0.1:7000" } };
     SchedulerResponder responder { protocol, membership, metrics };
     NullLogger logger;
 

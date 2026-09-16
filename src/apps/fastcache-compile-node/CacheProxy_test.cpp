@@ -355,7 +355,8 @@ TEST_CASE("(#287) a fleet peer is refused this machine's cache tier, member or n
     // the fixture: a case whose caller was refused for some OTHER reason would pass
     // under the bug and prove nothing about locality.
     Fixture fixture;
-    Distributed::ClusterMembership const membership { { "10.0.0.1:7000" } };
+    Distributed::ClusterMembership const membership { Distributed::MembershipParticipant::FleetMemberList,
+                                                      { "10.0.0.1:7000" } };
     Testing::ScriptedHostAddresses const machine { { "10.0.0.7" } };
     CachedLocalityOracle const locality { machine, fixture.clock };
     CacheResponder responder { fixture.proxy, locality, fixture.metrics };

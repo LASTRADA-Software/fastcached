@@ -380,7 +380,7 @@ TEST_CASE("The merged surface applies the worker's own membership rule", "[node]
     ThreadPoolExecutor reactor { 1 };
     ThreadPoolExecutor jobs { 1 };
     CompileCapacity capacity { /*slots=*/2, /*byteBudget=*/1024ULL * 1024ULL, std::chrono::seconds { 5 }, fix.logger };
-    Distributed::ClusterMembership const listed { { "10.0.0.1:6676" } };
+    Distributed::ClusterMembership const listed { Distributed::MembershipParticipant::FleetMemberList, { "10.0.0.1:6676" } };
     CompileResponder responder { fix.protocol, capacity, listed, fix.locality, jobs, reactor, fix.metrics, fix.logger };
 
     auto const stranger = AnswerFrom(responder, reactor, CompileFrame(), "10.9.9.9");
