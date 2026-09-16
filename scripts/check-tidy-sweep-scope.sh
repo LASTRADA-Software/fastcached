@@ -126,35 +126,38 @@ FindQueueBaseEnvName() {
 # something they did not do.
 #
 # @param 1 The workflow file.
+# ---------------------------------------------------------------------------
+# Every fact this check reads out of a workflow, from the SHARED walk.
+#
+# Three awk programs used to live here, each spelling `build.yml`'s indentation
+# as literal columns -- `/^        id:/`, `/^        env:/`, `/^        if:/` at
+# eight spaces, `/^          /` at ten, `/^      - /` at six. Every one was right
+# for the file as written and said nothing about a file whose jobs sit at another
+# depth, which is legal YAML. `scripts/check-tidy-sweep-scope.awk` holds this
+# check's half over `scripts/lib/workflow-walk.awk` and documents the records
+# (#1456).
+#
+# A missing awk program is refused BY NAME: a reader that ran over no program is
+# not a clean tree, and awk's own complaint names a file rather than the check
+# whose verdict just became meaningless.
+FastCachedWalkAwk="$(dirname "${BASH_SOURCE[0]}")/lib/workflow-walk.awk"
+FastCachedScopeAwk="$(dirname "${BASH_SOURCE[0]}")/check-tidy-sweep-scope.awk"
+for awkProgram in "$FastCachedWalkAwk" "$FastCachedScopeAwk"; do
+    if [ ! -f "$awkProgram" ]; then
+        echo "check-tidy-sweep-scope: missing awk program ${awkProgram}; no workflow was read, so" >&2
+        echo "  this is a refusal and not a clean run. It is expected beside this script." >&2
+        exit 2
+    fi
+done
+
+# @param 1 the workflow  @param 2 which records  @param 3 a step id  @param 4 a job key
+WorkflowRead() {
+    awk -v want="$2" -v sweepId="${3:-}" -v sweepJob="${4:-}" \
+        -f "$FastCachedWalkAwk" -f "$FastCachedScopeAwk" "$1" "$1" | cut -f2-
+}
+
 FindSweep() {
-    awk '
-        function strip(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); return s }
-        # A step begins at `      - `; more deeply indented lines belong to it.
-        function flush() {
-            if (run ~ /tidy-sweep\.sh/ && run !~ /--self-test/)
-                print job "\t" id "\t" run "\t" env
-            id = ""; run = ""; env = ""; inRun = 0; inEnv = 0
-        }
-        /^[ \t]*#/                { next }
-        /^  [A-Za-z0-9_-]+:[ \t]*$/ { flush(); job = strip($0); sub(/:$/, "", job); next }
-        /^      - /               { flush(); inRun = 0; inEnv = 0 }
-        # Any step-level key closes a run: or env: block that was open.
-        /^        [A-Za-z_-]+:/   { inRun = 0; inEnv = 0 }
-        /^        id:/            { id = strip(substr($0, index($0, ":") + 1)) }
-        /^        env:/           { inEnv = 1; next }
-        /^        run:/           { inRun = 1
-                                    rest = strip(substr($0, index($0, ":") + 1))
-                                    # `run: >-` and `run: |` carry nothing here;
-                                    # anything else is the command itself.
-                                    if (rest != "" && rest !~ /^[>|]/) run = rest
-                                    next }
-        inEnv && /^          /    { line = strip($0)
-                                    if (line != "") env = (env == "" ? line : env " " line)
-                                    next }
-        inRun                     { line = strip($0)
-                                    if (line != "") run = (run == "" ? line : run " " line) }
-        END                       { flush() }
-    ' "$1"
+    WorkflowRead "$1" sweep
 }
 
 # The `if:` of every step that reads a named step's conclusion AND names master.
@@ -176,38 +179,14 @@ FindSweep() {
 # unreachable, and it would have shipped a leg whose failures reach nobody while
 # the guard said otherwise.
 FindReader() {
-    awk -v id="$2" -v want="$3" '
-        function strip(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); return s }
-        function flush() {
-            if (job == want && index(ifExpr, "steps." id ".conclusion") && index(ifExpr, "refs/heads/master"))
-                print ifExpr
-            ifExpr = ""; inIf = 0
-        }
-        /^[ \t]*#/               { next }
-        /^  [A-Za-z0-9_-]+:[ \t]*$/ { flush(); job = strip($0); sub(/:$/, "", job); next }
-        /^      - /              { flush(); inIf = 0 }
-        /^        [A-Za-z_-]+:/  { inIf = 0 }
-        /^        if:/           { inIf = 1
-                                   rest = strip(substr($0, index($0, ":") + 1))
-                                   if (rest != "" && rest !~ /^[>|]/) ifExpr = rest
-                                   next }
-        inIf                     { line = strip($0)
-                                   if (line != "") ifExpr = (ifExpr == "" ? line : ifExpr " " line) }
-        END                      { flush() }
-    ' "$1"
+    WorkflowRead "$1" reader "$2" "$3"
 }
 
 # The `permissions:` block of one job, comments dropped.
 # @param 1 The workflow file.
 # @param 2 The job key.
 FindJobPermissions() {
-    awk -v job="  $2:" '
-        index($0, job) == 1                  { inJob = 1; next }
-        inJob && /^  [A-Za-z0-9_-]+:[ \t]*$/ { inJob = 0 }
-        inJob && /^    permissions:/         { inPerms = 1; next }
-        inPerms && /^    [^ ]/               { inPerms = 0 }
-        inPerms && !/^[ \t]*#/               { print }
-    ' "$1"
+    WorkflowRead "$1" perms "" "$2"
 }
 
 # ---------------------------------------------------------------------------
@@ -526,22 +505,75 @@ SelfTest() {
         status=1
     fi
 
-    Reset
-    gReaderIf=""
-    { Fragment | awk '
+    # The reader's `if:` written as a FOLDED scalar. Its own case below asserts the
+    # check accepts one; the walk neuter reuses it, because `WfBlockKey` is reached
+    # only by a CONTINUATION line and the shipped fragment writes that `if:` on one
+    # line -- a neuter is evidence only over input that reaches the line it disabled.
+    FoldedReaderIf() {
+        gReaderIf=""
+        Fragment | awk '
         /^        if: $/ { print "        if: >-"
                            print "          ${{ failure() && steps.sweep.conclusion == '\''failure'\''"
                            print "          && github.event_name == '\''push'\''"
                            print "          && github.ref == '\''refs/heads/master'\'' }}"
                            next }
         { print }
-      '; } > "$file"
+      '
+    }
+
+    Reset
+    FoldedReaderIf > "$file"
     if CheckWorkflow "$file" >/dev/null 2>&1; then
         echo "  ok   a folded reader if: is not a deleted reader"
     else
         echo "  FAIL a folded reader if: is not a deleted reader: the check rejected a pure reflow"
         status=1
     fi
+    Reset
+
+    # The verdict must come from the SHARED walk, which is a different claim from
+    # "the check refuses". Every case above would pass just as well if this script
+    # had kept a private reader beside the shared one. So the library is copied,
+    # one line disabled, and `FastCachedWalkAwk` pointed at the copy for one case.
+    #
+    # @param 1 what the line holds up  @param 2 a sed expression disabling it
+    # @param 3 want-pass|want-fail  @param 4 which generator stages the workflow
+    WalkNeuter() {
+        local what="$1" expr="$2" want="$3" stage="${4:-Fragment}"
+        local file="${scratch}/wf.yml" neutered got realWalk
+        Reset
+        "$stage" > "$file"
+        neutered="${scratch}/neutered-walk.awk"
+        sed "$expr" "$FastCachedWalkAwk" > "$neutered"
+        if cmp -s "$neutered" "$FastCachedWalkAwk"; then
+            echo "  FAIL ${what}: the sed expression neutered no line, so the case stages nothing"
+            status=1
+            return
+        fi
+        realWalk="$FastCachedWalkAwk"
+        FastCachedWalkAwk="$neutered"
+        if CheckWorkflow "$file" >/dev/null 2>&1; then got=want-pass; else got=want-fail; fi
+        FastCachedWalkAwk="$realWalk"
+        if [[ "$got" == "$want" ]]; then
+            echo "  ok   ${what}"
+        else
+            echo "  FAIL ${what}: wanted ${want#want-}, got ${got#want-}"
+            status=1
+        fi
+    }
+
+    WalkNeuter "neutering the shared walk's step boundary makes this check REFUSE, so its verdict comes from that walk" \
+        '/WorkflowFlushStep(); WorkflowResetStep(); stepItem = 1/s/^/#/' want-fail
+    WalkNeuter "neutering the shared walk's WfBlockKey makes this check REFUSE over a FOLDED reader if:, so that if: is joined through that field" \
+        's/^        WfBlockOwner = ind; WfBlockKey = key$/        WfBlockOwner = ind/' want-fail FoldedReaderIf
+    # The same folded shape with the library untouched must PASS, or the case above
+    # says only that a folded `if:` is refused for some other reason entirely.
+    WalkNeuter "a FOLDED reader if: passes over an untouched copy of the shared walk, so the case above names its cause" \
+        '1s|^# SPDX|# neutered-nothing\n# SPDX|' want-pass FoldedReaderIf
+    # And the control, without which the two above prove only that a damaged
+    # library breaks something: an UNTOUCHED copy at a different path must pass.
+    WalkNeuter "a copy of the shared walk with only a comment changed still PASSES, so the two cases above name their cause" \
+        '1s|^# SPDX|# neutered-nothing\n# SPDX|' want-pass
     Reset
 
     [[ "$status" -eq 0 ]] && echo "TIDY SWEEP SCOPE SELF-TEST PASSED"

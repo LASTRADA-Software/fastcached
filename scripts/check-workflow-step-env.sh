@@ -114,8 +114,9 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # awk report a syntax error about a program it could not read -- a reader that ran over no
 # program is not a clean tree.
 FastCachedShellLexAwk="$(dirname "${BASH_SOURCE[0]}")/lib/shell-lex.awk"
+FastCachedWorkflowWalkAwk="$(dirname "${BASH_SOURCE[0]}")/lib/workflow-walk.awk"
 FastCachedStepEnvAwk="$(dirname "${BASH_SOURCE[0]}")/check-workflow-step-env.awk"
-for awkProgram in "$FastCachedShellLexAwk" "$FastCachedStepEnvAwk"; do
+for awkProgram in "$FastCachedShellLexAwk" "$FastCachedWorkflowWalkAwk" "$FastCachedStepEnvAwk"; do
     if [ ! -f "$awkProgram" ]; then
         echo "check-workflow-step-env: missing awk program ${awkProgram}; nothing was read, so this"
         echo "                         run judged no workflow -- refused rather than reported clean"
@@ -217,7 +218,8 @@ Scan() {
     awk -v bashNames="$bashNames" -v windowsNames="$windowsNames" -v shells="$shellRows" -v remedies="$remedyRows" \
         -v plant="$2" -v PlantName="FASTCACHED_PLANTED_READ" -v PlantExprName="FASTCACHED_PLANTED_EXPR" \
         -v exports="$exportRows" \
-        -f "${FastCachedShellLexAwk}" -f "${FastCachedStepEnvAwk}" "$1" "$1"
+        -f "${FastCachedShellLexAwk}" -f "${FastCachedWorkflowWalkAwk}" \
+        -f "${FastCachedStepEnvAwk}" "$1" "$1"
 }
 
 # Judge every workflow under @p dir; print one line per file and per refusal; return 0 clean, 1 refused.
@@ -1612,6 +1614,7 @@ ACTION
     # this case failed loudly on the extraction rather than passing over a scan of nothing --
     # which is the whole reason that refusal is there.
     Stage askedByTheRun scripts/lib/shell-lex.awk < "${FastCachedShellLexAwk}"
+    Stage askedByTheRun scripts/lib/workflow-walk.awk < "${FastCachedWorkflowWalkAwk}"
     Stage askedByTheRun scripts/check-workflow-step-env.awk < "${FastCachedStepEnvAwk}"
     Stage askedByTheRun .github/workflows/wf.yml <<'WF'
 jobs:

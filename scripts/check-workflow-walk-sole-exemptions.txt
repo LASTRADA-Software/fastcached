@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Sites that carry a fixed-indent awk literal and are NOT a private walk over a
+# workflow this project reads, one per line as `<path><TAB><reason>`.
+#
+# A row is an exemption from `scripts/check-workflow-walk-sole.sh`, whose header
+# carries the pattern and what it deliberately cannot see. A row that matches
+# nothing is REFUSED as stale: an exemption kept past its subject goes on
+# excusing whatever next takes that path, and reads as a considered decision.
+#
+# Adding a row for a real private walk is the one thing this file must not be
+# used for. The remedy is `scripts/lib/workflow-walk.awk`, which answers the
+# depth itself; a row here says the site WRITES a workflow rather than reading
+# one, and that claim is checkable by reading it.
+
+scripts/check-tidy-sweep-scope.sh	its self-test GENERATES workflow fragments and then reflows them -- `ReflowedRun` turns a `run: >-` plus continuation into the identical one-liner, and the folded-`if:` case wraps a condition. Both write the shape at the depth they write it AT; neither reads a workflow this project ships. The check they feed reads its workflow through the shared walk.

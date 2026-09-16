@@ -1328,6 +1328,13 @@ what differs between compilers, standard libraries, hosts and tool versions.
   too, since one naming nothing substitutes EMPTY with no error — and a step's own `env:` satisfies
   its `run:`, `with:`, `if:` and `name:` but NOT another row of that same `env:` block, which is
   what stops a typo satisfying itself. `ctest -R workflow-step-env`.
+- **There is ONE model of workflow YAML, `scripts/lib/workflow-walk.awk`, and it calls exactly one
+  hook.** Four of the five private readers spelled `build.yml`'s indentation as column counts; each
+  was right about the file and wrong about YAML. gawk makes a missing hook fatal only on the path
+  that REACHES it, so eight hooks would have been seven silences -- `raw` fires on every line. A
+  kind with no arm returns, so every consumer spells one for every kind. `ctest -R
+  workflow-walk-sole` refuses a new private walk; `ctest -R workflow-walk-selftest` drives every
+  kind, because its consumers reach three of them.
 - Every check whose SUBJECT is documentation was skipped on exactly the change it exists to catch,
   because `code=false` is right for a compiler and backwards for prose. Prose drifts by being
   EDITED. The set is the `docs-subject` ctest LABEL, read out of `src/tests/CMakeLists.txt` and

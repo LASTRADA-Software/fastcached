@@ -3079,6 +3079,41 @@ set_tests_properties("workflow-step-env-plant" PROPERTIES
     TIMEOUT 60
 )
 
+# The shared workflow walk (#1456), driven directly. Its consumers reach three of its eight event
+# kinds; the rest are driven here or they ship with nothing having watched them work -- and gawk
+# makes a missing hook fatal only on the path that REACHES it, so an unreached kind is silence in
+# both directions. Every assertion family carries a neuter, and the run states the counts.
+# No script under `scripts/` keeps a private awk walk over workflow YAML (#1456). Five checks each
+# carried one, and the migrations do not stop the sixth: `/^  [A-Za-z0-9_-]+:/` is four characters
+# and works on the file in front of you. Its `--self-test` drives the refusing arm, the exemption
+# mechanism, a stale row, four NEAR MISSES that must not be caught, and both enumeration refusals.
+add_test(
+    NAME "workflow-walk-sole"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-workflow-walk-sole.sh"
+)
+set_tests_properties("workflow-walk-sole" PROPERTIES
+    LABELS "hygiene"
+    TIMEOUT 60
+)
+
+add_test(
+    NAME "workflow-walk-sole-selftest"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-workflow-walk-sole.sh" --self-test
+)
+set_tests_properties("workflow-walk-sole-selftest" PROPERTIES
+    LABELS "hygiene"
+    TIMEOUT 120
+)
+
+add_test(
+    NAME "workflow-walk-selftest"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-workflow-walk-selftest.sh"
+)
+set_tests_properties("workflow-walk-selftest" PROPERTIES
+    LABELS "hygiene"
+    TIMEOUT 60
+)
+
 add_test(
     NAME "workflow-step-env-selftest"
     COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-workflow-step-env.sh" --self-test

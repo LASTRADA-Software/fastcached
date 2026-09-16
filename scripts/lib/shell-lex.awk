@@ -95,10 +95,15 @@
         }
         return out
     }
+    # This library defines every function it calls. It did NOT: as extracted it called a `trim`
+    # that lives in one consumer, so a second consumer would have died at its first heredoc --
+    # fatally, and only once a heredoc appeared, which is the per-reached-path silence measured on
+    # #1456 arriving in the same change that measured it.
+    function lexTrim(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); return s }
     function bashVisible(s) {
         lexCode = ""
         if (heredocEnd != "") {
-            if (trim(s) == heredocEnd) { heredocEnd = ""; return "" }
+            if (lexTrim(s) == heredocEnd) { heredocEnd = ""; return "" }
             if (heredocQuoted) return ""
             # An unquoted heredoc expands, but a quote in it is a character, not a string.
             gsub(/\\\$/, "", s)
@@ -109,7 +114,7 @@
     # A here-string opens where the CODE of a line ends in `@` and a quote, so the opener is looked for in what the
     # lexer returns: a comment ending in one opens nothing, and the lines after it are still code.
     function pwshVisible(s,   t, before, out) {
-        t = trim(s); lexCode = ""
+        t = lexTrim(s); lexCode = ""
         if (hereString == "single") { if (substr(t, 1, 2) == sq "@") hereString = ""; return "" }
         if (hereString == "double") { if (substr(t, 1, 2) == "\"@") { hereString = ""; return "" } return s }
         before = lexState
