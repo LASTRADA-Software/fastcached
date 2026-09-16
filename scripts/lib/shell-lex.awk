@@ -33,6 +33,30 @@
 # that owns that rule. The line between the two is whether a function answers *what text would a
 # shell see* (here) or *what does this repository require of it* (the check).
 
+# ## And `check-unguarded-prerequisites.sh`'s `Blank()` is NOT this, however much it looks like it
+#
+# #1456 describes the tree as having "two bash lexers" and asks for one. **Driven against each
+# other they disagree on nearly every line, and each is right for its own rule** -- so merging
+# them breaks one. Measured:
+#
+#   echo "$HOME is expanded"           lexCode: echo "________     Blank(): echo  $HOME
+#   echo "$(sed -e 's/x/y/' f)"        lexCode: echo "________     Blank(): echo  $(sed -e      f)
+#
+# `lexCode` masks everything inside ANY quote, double quotes included, because the rule here asks
+# *where is a name ASSIGNED* and an assignment cannot happen inside a string. `Blank()` keeps
+# double-quoted content as code and blanks only single-quoted content, because its rule asks
+# *which guards and invocations does this script RUN* -- and a command inside `"$( ... )"` is run,
+# so masking it would hide the invocations that check exists to find.
+#
+# What this file does NOT model, stated so nobody reads the absence as a defect: `$( )` is not a
+# quoting context here. `Blank()` models it and carries a fix (#1416) for getting it wrong. That
+# is not a gap here, because this lexer tracks no parentheses at all -- it tracks quote state, and
+# treating a `'` as literal inside a `"` reaches the same end-of-line state a shell does on every
+# balanced line, verified against `bash -n`. Where the two differ is the VISIBLE text, and there
+# this one is the more permissive, which for a guard is the fail-closed direction: it can see a
+# read a shell would not perform, which is a false refusal somebody meets rather than a silent
+# pass.
+
     # ---- the text a shell would expand ------------------------------------------------------------------------------
     # One lexer state per body, carried across lines, because a quoted string may span them. Inside single quotes
     # every `$` becomes `_`, so nothing there reads a name while the words, the quotes and a heredoc delimiter stay
