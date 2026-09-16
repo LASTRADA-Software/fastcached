@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Files that carry a SHIPPING configure and cannot run the instruction-set check,
+# one per line as `<path><TAB><reason>`.
+#
+# A row is an exemption from `scripts/check-shipping-configure-guard.sh`, whose
+# header carries the rule. A row that matches no shipping configure is REFUSED as
+# stale: an exemption kept past its subject goes on excusing whatever next takes
+# that path, and reads as a considered decision.
+#
+# The bar for a row is what that configure COMPILES reaching no customer CPU. A
+# packaging job never qualifies -- its whole purpose is that its objects reach
+# one.
+Dockerfile	the image is built and run inside one CI job and pushed to no registry (`build.yml`s own comment: "it pushes to no registry"), so nothing it compiles reaches a customer CPU. There is also no compile database to read: the configure runs inside `docker build`, whose filesystem the job cannot reach afterwards.

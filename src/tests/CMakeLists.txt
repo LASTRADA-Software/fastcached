@@ -3087,6 +3087,30 @@ set_tests_properties("workflow-step-env-plant" PROPERTIES
 # carried one, and the migrations do not stop the sixth: `/^  [A-Za-z0-9_-]+:/` is four characters
 # and works on the file in front of you. Its `--self-test` drives the refusing arm, the exemption
 # mechanism, a stale row, four NEAR MISSES that must not be caught, and both enumeration refusals.
+# Every SHIPPING configure in a workflow runs the instruction-set check, in its own job and before
+# that job's build (#1450). #1442 put the step into the three `Package` jobs and nothing made a
+# FOURTH get it -- and `Package` jobs are not required contexts, so its absence is green everywhere.
+# The selector is the `-DFASTCACHED_BUILD_TESTS=OFF` flag rather than three job names, and its
+# self-test's last case deletes one real guard step from a copy of `build.yml` and requires the
+# refusal to NAME that job.
+add_test(
+    NAME "shipping-configure-guard"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-shipping-configure-guard.sh"
+)
+set_tests_properties("shipping-configure-guard" PROPERTIES
+    LABELS "hygiene"
+    TIMEOUT 60
+)
+
+add_test(
+    NAME "shipping-configure-guard-selftest"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-shipping-configure-guard.sh" --self-test
+)
+set_tests_properties("shipping-configure-guard-selftest" PROPERTIES
+    LABELS "hygiene"
+    TIMEOUT 120
+)
+
 add_test(
     NAME "workflow-walk-sole"
     COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-workflow-walk-sole.sh"
