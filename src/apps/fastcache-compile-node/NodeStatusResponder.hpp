@@ -4,6 +4,7 @@
 #include "CompileCapacity.hpp"
 #include "EnrollmentWindow.hpp"
 #include "FrameEndpoint.hpp"
+#include "NodeMembership.hpp"
 
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Distributed/MembershipOracle.hpp>
@@ -494,6 +495,25 @@ struct NodeRuntimeSources
     /// to a stranger it approves -- and a false `Closed` is exactly the reading that
     /// stops them looking.
     EnrollmentWindow const* enrollment { nullptr };
+
+    /// This node's admission oracle, for the count of client tombstones it has applied;
+    /// null on a node that runs no consensus (#1471).
+    ///
+    /// Null is ABSENT and not `0`, for this record's stated reason and with the same force it
+    /// has for `enrollment` above: a node with no cluster has no committed tombstone set, so a
+    /// `0` there is a reassuring claim about a set that does not exist. The reading an operator
+    /// wants after `--cluster-forget-client` is whether the entry REACHED this machine, and a
+    /// zero meaning "no cluster here" answers a different question than a zero meaning "the
+    /// cluster forgets nobody".
+    ///
+    /// Null on a keyless node even though `NodeMembership` exists on EVERY node -- the object is
+    /// always there, the committed SET only exists where consensus runs, so the wiring draws the
+    /// distinction rather than the type.
+    ///
+    /// Appended rather than inserted, matching the wire half of this change: a designated
+    /// initializer must follow declaration order, so a member added in the middle silently
+    /// breaks every call site that named the ones after it.
+    NodeMembership const* membership { nullptr };
 };
 
 /// The production `INodeStatusSource`: config for the surfaces, a clock for the uptime.

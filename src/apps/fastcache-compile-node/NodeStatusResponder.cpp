@@ -421,6 +421,14 @@ CompileCacheWire::NodeStatusFields ConfiguredNodeStatus::Describe() const
         fields.runtime.enrollmentPending = pending;
     }
 
+    // How many client tombstones this node is ENFORCING (#1471). Absent on a node with no
+    // source, which is a node running no consensus: there is no committed set for a forget to
+    // have reached, and a `0` there would answer a different question than "the cluster forgets
+    // nobody". Read per request like the rest of this record, so a forget applied a moment ago
+    // is visible on the next `--node-status` rather than at the next restart.
+    if (_sources.membership != nullptr)
+        fields.runtime.forgottenClients = static_cast<std::uint32_t>(_sources.membership->ForgottenClientCount());
+
     // Where peers DIAL this node's consensus port, beside the surfaces it BOUND below
     // (#1328). The operator bringing a machine in compares this against the endpoint
     // `--cluster-admit` echoed, and the bound raft port is routinely the wildcard -- so

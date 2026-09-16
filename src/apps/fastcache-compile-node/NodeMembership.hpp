@@ -190,6 +190,21 @@ class NodeMembership final: public Distributed::IMembershipOracle
         return _isOpen.load(std::memory_order_relaxed) ? _openly.Explain(peerAddress) : _admitted.Explain(peerAddress);
     }
 
+    /// How many `--cluster-forget-client` tombstones this node has APPLIED (#1471).
+    ///
+    /// Asked of the oracle rather than read off its set, because the lock that makes the set
+    /// safe to read is the oracle's: `HostSetMembership::Size()` takes the shared lock, and a
+    /// caller holding the vector would be reading something `PublishCluster` may be replacing.
+    ///
+    /// A count on THIS node, which is the question -- not what the leader committed. A node
+    /// that has not yet applied an entry answers a lower number, and that difference is what
+    /// tells an operator a forget has not propagated yet (#1471's third clause).
+    /// @return The number of forgotten client hosts this node is enforcing.
+    [[nodiscard]] std::size_t ForgottenClientCount() const
+    {
+        return _forgotten.Size();
+    }
+
     /// Record what the cluster agreed, alongside what the operator listed.
     ///
     /// The seam consensus drives, and it does nothing under `--fleet-open` -- which
