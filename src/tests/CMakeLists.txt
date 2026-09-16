@@ -2013,7 +2013,28 @@ add_test(
 set_tests_properties("test-loops-selftest" PROPERTIES
     FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
     LABELS "hygiene"
-    TIMEOUT 120
+    # 600 rather than 120, and the number comes from a measurement rather than from a red run.
+    # Fifty cases, each staging a tree and spawning a `cmake -P`:
+    #
+    #     ext4 (/tmp, and every CI runner)                    1179 ms
+    #     DrvFs (a build tree on /mnt/d reached from WSL)     23667 ms
+    #
+    # Twenty times, and the scratch is `${CMAKE_CURRENT_BINARY_DIR}` -- the portable choice --
+    # so on a DrvFs build tree this starts from 23.7 s. Under `ctest --parallel 32` that crossed
+    # 120 s: `***Timeout 120.34 sec`, twice, the second time on an idle machine, so it was not
+    # contention. Measured NOT to be #1452's doing either: 23667 ms with that change and
+    # 23699 ms without it, same worktree, only the scripts stashed.
+    #
+    # A budget catches a HANG, and a hang is unbounded -- 600 s catches every one 120 s did.
+    # Policing COST is not its job, and relocating the scratch to a fast path is the wrong trade:
+    # the self-test `git init`s its own outer repository so it COULD live anywhere, but /tmp is
+    # not a path the native-Windows legs have, and the slowness belongs to one machine's layout
+    # rather than to the test.
+    #
+    # It grows: the cost is O(cases x exemption rows), because one file per exemption row is
+    # staged in EVERY tree so each case re-proves the rows still match. A sixth exemption row
+    # slows all fifty cases.
+    TIMEOUT 600
 )
 
 # ---------------------------------------------------------------------------
