@@ -1591,6 +1591,45 @@ namespace
         records, [](CapturingLogger::Record const& record) { return record.message.contains("cordoned and drained"); }));
 }
 
+/// How many drained reports @p logger holds, once it holds @p expected of them.
+///
+/// The sibling of `CounterReaching` above, one observation along, and it exists because
+/// that helper's rule reaches the LOGGER too: **the thread that did the work writes the
+/// report, and the thread that sees the result is not ordered against it.**
+/// `CompileCapacity::ReleaseSlot` decrements the in-flight count, notifies the drain, and
+/// only THEN writes the line -- so `DrainedWithin`, which polls that count and takes no
+/// lock, returns before the line exists. Reading the logger there saw nothing **15% of
+/// the time under load** (#1479, measured at 6 of 40 runs against 0 of 40 alone), on a
+/// tree where production is correct and can only be: the report claims *no compile is
+/// running*, so it cannot be written before the decrement.
+///
+/// **It returns the COUNT, not a bool**, for `CounterReaching`'s reason -- a genuine
+/// regression still prints the expansion that names it, `0 == 1`, rather than a bare
+/// `false` that says only that something timed out. And a wait that ran out says so,
+/// because a report that is never written and a machine slower than the ceiling both read
+/// zero here and this instrument cannot separate them.
+///
+/// **Only an assertion that a report HAS been written may use this.** The `== 0`
+/// assertions stay immediate: their claim is *no report YET*, a wait for zero is
+/// satisfied by construction, and one written that way would assert nothing at all.
+/// Nor does the case at the bottom of this file need it -- there the hold is released on
+/// the case's OWN thread, so `ReleaseSlot` runs inline and the line is already written.
+/// @param logger The capture.
+/// @param expected How many reports to wait for.
+/// @return How many it holds, once it holds @p expected or the ceiling elapsed.
+[[nodiscard]] std::size_t DrainedReportsReaching(CapturingLogger const& logger, std::size_t expected)
+{
+    constexpr auto Ceiling = std::chrono::seconds { 30 };
+    auto const drained = DrainWithin([&logger, expected] { return DrainedReports(logger) < expected; },
+                                     DrainBound { .ceiling = Ceiling, .poll = std::chrono::milliseconds { 5 } });
+    if (drained == DrainResult::Ceiling)
+        UNSCOPED_INFO("DrainedReportsReaching: waited " << Ceiling.count() << "s for " << expected
+                                                        << " drained report(s) and saw " << DrainedReports(logger)
+                                                        << "; a report never written and a machine slower than the "
+                                                           "ceiling are indistinguishable here");
+    return DrainedReports(logger);
+}
+
 /// Ask a worker behind @p port to cordon itself, or to lift it, and read back its state.
 /// @param port Where the endpoint listens.
 /// @param action Cordon, or lift it.
@@ -1654,7 +1693,10 @@ TEST_CASE("A cordoned worker refuses a new compile while the one it was running 
     CHECK(Unwrap(result).exitCode == 0);
 
     CHECK(DrainedWithin(worker.capacity, std::chrono::seconds { 5 }));
-    CHECK(DrainedReports(fix.logger) == 1);
+    // WAITED for, not sampled: the slot came back on the reactor's thread and the report is
+    // written after the count drops, so the two assertions above and below are two
+    // observations and only one of them is ordered against this case (#1479).
+    CHECK(DrainedReportsReaching(fix.logger, 1) == 1);
     CHECK(worker.capacity.CordonState() == Wire::WireCordonState::Drained);
 
     // Lifted over the same wire, and the worker takes compiles again.
