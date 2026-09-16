@@ -530,18 +530,161 @@ function(fastcached_scan_code_lines content pattern outVar)
     set(${outVar} "${hits}" PARENT_SCOPE)
 endfunction()
 
+# ---------------------------------------------------------------------------
+# Every tracked file a check's rule is ABOUT, and HOW they were found.
+#
+# Eight `check-*.cmake` readers carried a byte-identical copy of this machinery, and each asks
+# a DIFFERENT question with it: `*CMakeLists.txt`, `src/*.cpp` `src/*.hpp`, one subdirectory,
+# the test files by pathspec, every tracked C++ source. The census is on #1485. So the thing
+# to share is NOT the file set -- that is per check and has to stay so; migrating a check onto
+# somebody else's set would silently narrow or widen what its rule is enforced over, which is
+# the defect this consolidation exists to remove. What is shared is the MODE SELECTION: the
+# work-tree probe, the `ls-files` call, the walk fallback, the exclusion list and the ordering.
+#
+# `set(excludeNames "out" "build" "_deps" ".git" ".cache" ".claude")` was SEVEN byte-identical
+# copies. An exclusion list bets on the world's layout, so seven bets that have to move
+# together is the costliest part of the duplication rather than the most visible one.
+#
+# ## The FILTER applies in BOTH modes, and that is the point
+#
+# A check whose git path and walk path cover different sets is a guard that enforces one rule
+# on a developer's machine and another in CI, and this tree has shipped one (#1476). So a
+# filter is applied to every candidate whichever mode produced it, rather than living in the
+# pathspec on one side and in the glob on the other where nothing compares them.
+#
+# ## THREE modes, not two
+#
+# `git ls-files` succeeding and naming NOTHING is not the same event as there being no index,
+# and every copy collapsed them: it fell through to the walk and announced
+# `directory walk (no git index)` in a tree that has one. That is a true-sounding statement
+# about the environment which is false, and it is the string a self-test case asserts on --
+# which is how a guard whose self-test exercised the walk while CI exercised git passed for as
+# long as it did. A fresh `git init` with nothing staged produces it, and the self-tests drive
+# that shape deliberately, so the fallback stays; what changes is that it says WHY it ran.
+#
+# ## The fallback is gated on the MODE, never on the list being empty
+#
+# The copies asked `if(NOT sourceFiles)`, which conflates "no mode answered" with "a mode
+# answered and its filter kept nothing" -- so a real git answer whose filter emptied it would
+# be overwritten by a walk, and the verdict would name the wrong mode. The mode names what
+# ANSWERED, not what came back non-empty.
+
+## Every tracked file matching a question, and how they were found.
+## @param sourceDir The repository root.
+## @param PATHSPECS git pathspecs for `ls-files --`. Omit for every tracked file.
+## @param GLOBS The walk fallback's patterns, relative to sourceDir. Required.
+## @param FILTER A regex every candidate must match, in BOTH modes. Omit for no filter.
+## @param FILES_OUT Name of the variable to receive the paths, relative to the root and sorted.
+## @param MODE_OUT Name of the variable to receive the mode's name, for the caller's verdict.
+function(fastcached_tracked_files sourceDir)
+    cmake_parse_arguments(PARSE_ARGV 1 arg "" "FILTER;FILES_OUT;MODE_OUT" "PATHSPECS;GLOBS")
+
+    foreach(required FILES_OUT MODE_OUT GLOBS)
+        if(NOT arg_${required})
+            message(FATAL_ERROR
+                "fastcached_tracked_files: ${required} is required. Without FILES_OUT or "
+                "MODE_OUT the caller gets an answer it cannot read or cannot name; without "
+                "GLOBS it reports CLEAN over a source export that has no git index.")
+        endif()
+    endforeach()
+    if(arg_UNPARSED_ARGUMENTS)
+        # A misspelled keyword would otherwise be dropped in silence, and dropping GLOBS or
+        # FILTER WIDENS what a rule is enforced over -- the direction that reads as thorough.
+        message(FATAL_ERROR
+            "fastcached_tracked_files: unrecognised argument(s) '${arg_UNPARSED_ARGUMENTS}'")
+    endif()
+
+    # `if(arg_FILTER STREQUAL "")` does NOT fire when the keyword was omitted: CMake reads an
+    # unset left operand as the literal string `arg_FILTER`, which is not empty, so the test
+    # comes back the wrong way round. Quoting the variable is the fix, and omitted and empty
+    # then mean the same thing here, which is what a caller intends either way.
+    set(hasFilter FALSE)
+    if(NOT "${arg_FILTER}" STREQUAL "")
+        set(hasFilter TRUE)
+    endif()
+
+    set(found "")
+    set(mode "")
+
+    if(NOT GIT_EXECUTABLE)
+        find_package(Git QUIET)
+    endif()
+    if(GIT_EXECUTABLE)
+        execute_process(
+            COMMAND "${GIT_EXECUTABLE}" -C "${sourceDir}" rev-parse --is-inside-work-tree
+            OUTPUT_VARIABLE insideWorkTree
+            ERROR_VARIABLE gitError
+            RESULT_VARIABLE gitStatus
+            OUTPUT_STRIP_TRAILING_WHITESPACE)
+        if(gitStatus EQUAL 0 AND insideWorkTree STREQUAL "true")
+            set(pathspecArguments "")
+            if(arg_PATHSPECS)
+                set(pathspecArguments -- ${arg_PATHSPECS})
+            endif()
+            execute_process(
+                COMMAND "${GIT_EXECUTABLE}" -C "${sourceDir}" ls-files ${pathspecArguments}
+                OUTPUT_VARIABLE tracked
+                RESULT_VARIABLE lsStatus
+                OUTPUT_STRIP_TRAILING_WHITESPACE)
+            if(lsStatus EQUAL 0 AND tracked STREQUAL "")
+                set(mode "directory walk (git index names no matching file)")
+            elseif(lsStatus EQUAL 0)
+                string(REPLACE "\n" ";" trackedFiles "${tracked}")
+                foreach(candidate IN LISTS trackedFiles)
+                    if(hasFilter AND NOT candidate MATCHES "${arg_FILTER}")
+                        continue()
+                    endif()
+                    list(APPEND found "${candidate}")
+                endforeach()
+                set(mode "git ls-files")
+            endif()
+        endif()
+    endif()
+
+    if(NOT mode STREQUAL "git ls-files")
+        # Build trees and caches, which are not source and are frequently enormous. ONE copy
+        # of this list, and the walk is sound in an export precisely because an export
+        # contains neither by construction.
+        set(excludeNames "out" "build" "_deps" ".git" ".cache" ".claude")
+        set(globPatterns "")
+        foreach(pattern IN LISTS arg_GLOBS)
+            list(APPEND globPatterns "${sourceDir}/${pattern}")
+        endforeach()
+        file(GLOB_RECURSE walked RELATIVE "${sourceDir}" ${globPatterns})
+        foreach(candidate IN LISTS walked)
+            if(hasFilter AND NOT candidate MATCHES "${arg_FILTER}")
+                continue()
+            endif()
+            set(excluded FALSE)
+            foreach(name IN LISTS excludeNames)
+                if(candidate MATCHES "(^|/)${name}/")
+                    set(excluded TRUE)
+                    break()
+                endif()
+            endforeach()
+            if(NOT excluded)
+                list(APPEND found "${candidate}")
+            endif()
+        endforeach()
+        if(mode STREQUAL "")
+            set(mode "directory walk (no git index)")
+        endif()
+    endif()
+
+    list(REMOVE_DUPLICATES found)
+    list(SORT found)
+
+    set(${arg_FILES_OUT} "${found}" PARENT_SCOPE)
+    set(${arg_MODE_OUT} "${mode}" PARENT_SCOPE)
+endfunction()
+
+# ---------------------------------------------------------------------------
 # Every first-party C++ source in the repository, and HOW they were found.
 #
-# Nine `check-*.cmake` readers had each copied this block before it was extracted, which is
-# nine chances for one of them to enumerate a different set than the rule it enforces claims
-# to cover. The copies are not migrated here -- each has a self-test that would have to be
-# re-run against it, so that is its own change rather than a rider on whichever check needed
-# the helper first.
-#
-# The MODE travels with the answer and is not an aside. There are two, they cover different
-# file sets, and CI takes the git one: a guard whose self-test exercised the walk while CI
-# exercised git has already shipped in this tree, and it passed because it was testing
-# something else. A caller states the mode in its verdict so a case can assert it.
+# One of the questions `fastcached_tracked_files` can be asked, and the one two checks ask:
+# `check-enumerator-walks.cmake` and `check-ranges-seam.cmake`. It is NOT the question the
+# other six enumerating checks ask -- see the census on #1485 -- so it is a caller of the
+# shared machinery rather than the thing every check calls.
 #
 # Third-party files are DECLINED rather than dropped, and named, because vendored code is not
 # ours to edit and a silent exclusion reads the same as complete coverage.
@@ -557,62 +700,21 @@ function(fastcached_first_party_cxx sourceDir filesOut declinedOut modeOut)
     # by the `h` alternative, and this helper's first measured answer was 79 shell scripts too
     # many. Measured against an independent `git ls-files | grep -cE`, which is the only
     # reason it was seen at all.
-    set(cxxExtension "\\.(cpp|cc|cxx|hpp|hh|hxx|h|ixx|cppm)$")
-    set(found "")
-    set(mode "")
+    #
+    # `ipp` and `inl` are in the set although this tree tracks NONE of either (measured: 0,
+    # against 464 `.hpp` as a positive control on the same pattern). They are here because
+    # `check-ranges-seam.cmake` covered them before it migrated, and the day somebody adds the
+    # first `.ipp` is the day a narrower set silently stops enforcing the ranges seam there --
+    # no verdict changing, no self-test failing. A difference that is invisible today and
+    # silent on the day it matters is worse than one that shows up as a count.
+    set(cxxExtension "\\.(cpp|cc|cxx|hpp|hh|hxx|h|ipp|inl|ixx|cppm)$")
 
-    if(NOT GIT_EXECUTABLE)
-        find_package(Git QUIET)
-    endif()
-    if(GIT_EXECUTABLE)
-        execute_process(
-            COMMAND "${GIT_EXECUTABLE}" -C "${sourceDir}" rev-parse --is-inside-work-tree
-            OUTPUT_VARIABLE insideWorkTree
-            ERROR_VARIABLE gitError
-            RESULT_VARIABLE gitStatus
-            OUTPUT_STRIP_TRAILING_WHITESPACE)
-        if(gitStatus EQUAL 0 AND insideWorkTree STREQUAL "true")
-            execute_process(
-                COMMAND "${GIT_EXECUTABLE}" -C "${sourceDir}" ls-files
-                OUTPUT_VARIABLE tracked
-                RESULT_VARIABLE lsStatus
-                OUTPUT_STRIP_TRAILING_WHITESPACE)
-            if(lsStatus EQUAL 0 AND NOT tracked STREQUAL "")
-                string(REPLACE "\n" ";" trackedFiles "${tracked}")
-                foreach(candidate IN LISTS trackedFiles)
-                    if(candidate MATCHES "${cxxExtension}")
-                        list(APPEND found "${candidate}")
-                    endif()
-                endforeach()
-                set(mode "git ls-files")
-            endif()
-        endif()
-    endif()
+    fastcached_tracked_files("${sourceDir}"
+        GLOBS "*"
+        FILTER "${cxxExtension}"
+        FILES_OUT found
+        MODE_OUT mode)
 
-    if(NOT found)
-        # Build trees and caches, which are not source and are frequently enormous.
-        set(excludeNames "out" "build" "_deps" ".git" ".cache" ".claude")
-        file(GLOB_RECURSE walked RELATIVE "${sourceDir}" "${sourceDir}/*")
-        foreach(candidate IN LISTS walked)
-            if(NOT candidate MATCHES "${cxxExtension}")
-                continue()
-            endif()
-            set(excluded FALSE)
-            foreach(name IN LISTS excludeNames)
-                if(candidate MATCHES "(^|/)${name}/")
-                    set(excluded TRUE)
-                    break()
-                endif()
-            endforeach()
-            if(NOT excluded)
-                list(APPEND found "${candidate}")
-            endif()
-        endforeach()
-        set(mode "directory walk (no git index)")
-    endif()
-
-    list(REMOVE_DUPLICATES found)
-    list(SORT found)
     fastcached_decline_third_party("${sourceDir}" found declined)
 
     set(${filesOut} "${found}" PARENT_SCOPE)
