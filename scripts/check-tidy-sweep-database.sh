@@ -145,39 +145,32 @@ Abort() {
 #     a newline); it does not end it. Ending collection there dropped every
 #     option after the blank, and -- see the paragraph above -- a truncated
 #     command still compares as a command. The body ends at the dedent.
+# ---------------------------------------------------------------------------
+# The named step's `run:` body, folded to one line, from the SHARED walk.
+#
+# One awk program used to live here spelling `build.yml`'s indentation as literal
+# columns: the job key at two spaces, a step item at six, `run:` at eight, its
+# body at ten. `scripts/lib/workflow-walk.awk` answers all four, and the step's
+# NAME comes from the record rather than a re-derived `- name:` match -- which is
+# the site that needed a comment explaining why it must not `next`, a `- name:`
+# line being both a new step and possibly the wanted one (#1456).
+#
+# A missing awk program is refused BY NAME: a reader that ran over no program is
+# not a clean tree, and an empty extraction here compares as a difference, which
+# would send whoever met it to fix a workflow that is correct.
+FastCachedWalkAwk="$(dirname "${BASH_SOURCE[0]}")/lib/workflow-walk.awk"
+FastCachedDbAwk="$(dirname "${BASH_SOURCE[0]}")/check-tidy-sweep-database.awk"
+for awkProgram in "$FastCachedWalkAwk" "$FastCachedDbAwk"; do
+    if [ ! -f "$awkProgram" ]; then
+        echo "check-tidy-sweep-database: missing awk program ${awkProgram}; no workflow was read," >&2
+        echo "  so this is a refusal and not a clean run. It is expected beside this script." >&2
+        exit 2
+    fi
+done
+
+# @param 1 the workflow  @param 2 the job key  @param 3 the step name
 ExtractWorkflowConfigure() {
-    awk -v job="$2" -v step="$3" '
-        /^jobs:[ \t]*$/                  { inJobs = 1; next }
-        inJobs && /^[^ \t]/              { inJobs = 0 }
-        !inJobs                          { next }
-        /^  [A-Za-z0-9_-]+:[ \t]*$/      { key = $0
-                                           sub(/^  /, "", key)
-                                           sub(/:[ \t]*$/, "", key)
-                                           inJob = (key == job)
-                                           next }
-        !inJob                           { next }
-        # No `next`: a `- name:` line is also a new step and must fall through
-        # to the rule below, which decides whether THIS one is the wanted step.
-        /^      - /                      { pending = 0; collecting = 0 }
-        /^      - name:[ \t]*/           { name = $0
-                                           sub(/^      - name:[ \t]*/, "", name)
-                                           gsub(/^"|"$/, "", name)
-                                           pending = (name == step)
-                                           next }
-        pending && /^        run:[ \t]*/ { collecting = 1
-                                           rest = $0
-                                           sub(/^        run:[ \t]*/, "", rest)
-                                           # `>-` / `|` introduce a block scalar;
-                                           # anything else is the body itself.
-                                           if (rest !~ /^(>-?|\|-?)$/) printf "%s ", rest
-                                           next }
-        collecting && /^[ \t]*$/         { next }
-        collecting && /^          /      { line = $0
-                                           sub(/^[ \t]+/, "", line)
-                                           printf "%s ", line
-                                           next }
-        collecting                       { collecting = 0 }
-    ' "$1"
+    awk -v job="$2" -v step="$3"         -f "$FastCachedWalkAwk" -f "$FastCachedDbAwk" "$1" "$1"
 }
 
 # ---------------------------------------------------------------------------
@@ -620,6 +613,59 @@ and again, three hundred lines further down:
       - name: "Configure"
         run: >-
           cmake --preset clang-debug -DENABLE_TIDY=OFF'
+
+    # The extraction must come from the SHARED walk, which is a different claim
+    # from "the extraction is right". Every case above would pass just as well if
+    # this script had kept a private reader beside the shared one. So the library
+    # is copied, one line disabled, and `FastCachedWalkAwk` pointed at the copy.
+    #
+    # Two lines, and each produces a DIFFERENT wrong answer rather than the same
+    # empty one -- which matters, because a case that only ever sees "" cannot
+    # tell a neutered library from a missing one.
+    #
+    # @param 1 what the line holds up  @param 2 a sed expression  @param 3 want
+    WalkNeuter() {
+        local what="$1" expr="$2" want="$3" neutered realWalk got
+        printf '%s\n' "$FastCachedWorkflowFixture" > "$scratch/wf.yml"
+        neutered="$scratch/neutered-walk.awk"
+        sed "$expr" "$FastCachedWalkAwk" > "$neutered"
+        if cmp -s "$neutered" "$FastCachedWalkAwk"; then
+            echo "  FAIL: self-test walk neuter '$what' changed no line, so it stages nothing" >&2
+            failures=$((failures + 1))
+            return
+        fi
+        realWalk="$FastCachedWalkAwk"
+        FastCachedWalkAwk="$neutered"
+        got="$(ExtractWorkflowConfigure "$scratch/wf.yml" "clang-tidy" "Configure")"
+        FastCachedWalkAwk="$realWalk"
+        Report "walk neuter '$what'" "$want" "${got%"${got##*[![:space:]]}"}"
+    }
+
+    # A PLAIN multi-line `run:` -- its command starts on the key line and continues
+    # below -- so the three answers below are genuinely distinct rather than two
+    # spellings of empty: whole, nothing, and truncated-but-well-formed. That last
+    # one is the answer this check records having shipped once, because a truncated
+    # command still compares as a command.
+    FastCachedWorkflowFixture='jobs:
+  clang-tidy:
+    steps:
+      - name: "Configure"
+        run: cmake --preset clang-debug
+          -DENABLE_TIDY=OFF'
+
+    # The control FIRST, because the two neuters below are evidence only if the
+    # same fixture read through an untouched copy gives the right answer.
+    WalkNeuter "an untouched copy of the shared walk extracts the whole command" \
+        '1s|^# SPDX|# neutered-nothing\n# SPDX|' \
+        'cmake --preset clang-debug -DENABLE_TIDY=OFF'
+    WalkNeuter "without the walk's step boundary nothing is extracted at all" \
+        '/WorkflowFlushStep(); WorkflowResetStep(); stepItem = 1/s/^/#/' ''
+    # A body collection that stops at the key line yields a command missing its
+    # continuations -- and a TRUNCATED command still compares as a command, which
+    # is the silent pass this check records having shipped once.
+    WalkNeuter "without the walk's body collection the command comes back truncated" \
+        '/WfBody\[WfBodyCount++\] = blank ? line : substr(line, WfBlockOwner + 1)/s/^/#/' \
+        'cmake --preset clang-debug'
 
     if [[ $failures -gt 0 ]]; then
         echo "check-tidy-sweep-database --self-test: $failures case(s) wrong" >&2
