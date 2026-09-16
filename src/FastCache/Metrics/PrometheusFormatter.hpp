@@ -4,6 +4,7 @@
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Metrics/StatsReading.hpp>
 
+#include <span>
 #include <string>
 #include <string_view>
 
@@ -27,10 +28,20 @@ namespace FastCache
 [[nodiscard]] std::string RenderPrometheus(StatsReading const& reading);
 
 /// Capture and render in one call: what a scrape route does.
+///
+/// @p surfaces defaults to `EverySurface`, which is what this tree assumed for every binary
+/// before #1484, so a call site nobody has revisited renders exactly as it does today. A process
+/// that serves only some surfaces states so -- and states it here rather than being detected,
+/// because the two mistakes are not symmetric: too WIDE renders a plausible zero, the cost
+/// already being paid, while too NARROW invents a `-` that reads as *this process does not do
+/// that* and nobody re-checks.
 /// @param metrics Connection-level counter sink.
 /// @param snapshot Per-scrape storage stats and process uptime.
-/// @return `RenderPrometheus(CaptureStatsReading(metrics, snapshot))`.
-[[nodiscard]] std::string RenderPrometheus(IMetricsSink const& metrics, MetricsSnapshot const& snapshot);
+/// @param surfaces The surfaces this process serves.
+/// @return `RenderPrometheus(CaptureStatsReading(metrics, snapshot, surfaces))`.
+[[nodiscard]] std::string RenderPrometheus(IMetricsSink const& metrics,
+                                           MetricsSnapshot const& snapshot,
+                                           std::span<MetricsSurface const> surfaces = EverySurface);
 
 struct InfoDescriptor;
 

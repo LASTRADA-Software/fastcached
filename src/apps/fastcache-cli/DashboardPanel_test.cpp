@@ -72,12 +72,14 @@ constexpr std::string_view Absent = "n/a";
 /// @param counter The counter.
 /// @param value What it reads.
 /// @return The reading.
-[[nodiscard]] StatsReading CounterReading(IMetricsSink::Counter counter, std::uint64_t value)
+/// Named `CounterReading` until #1484 gave the library a cell type of that name. It never was
+/// one: it returns a whole `StatsReading`, so the old name read as the thing it is made of.
+[[nodiscard]] StatsReading ReadingStating(IMetricsSink::Counter counter, std::uint64_t value)
 {
     auto reading = StatsReading {};
     auto* const cell = reading.counters.Find(counter);
     REQUIRE(cell != nullptr);
-    *cell = value;
+    *cell = CounterReading::Of(value);
     return reading;
 }
 
@@ -94,7 +96,7 @@ constexpr std::string_view Absent = "n/a";
     auto const count = [&reading](IMetricsSink::Counter counter, std::uint64_t value) {
         auto* const cell = reading.counters.Find(counter);
         REQUIRE(cell != nullptr);
-        *cell = value;
+        *cell = CounterReading::Of(value);
     };
     count(IMetricsSink::Counter::ConnectionsTotal, 3 * step);
     // The cycle's share of expiry moves slower than expiry itself, so a panel reading the one for the other differs.
@@ -268,7 +270,7 @@ TEST_CASE("a gap and a real zero draw different middle cells in a panel's trend"
     // measure; the zero is a counter that did not move. WHAT DISTINGUISHES: the MIDDLE of the last
     // three cells differs, and is a space on one side and the lowest block on the other.
     auto const connections = [](std::uint64_t value) {
-        return CounterReading(IMetricsSink::Counter::ConnectionsTotal, value);
+        return ReadingStating(IMetricsSink::Counter::ConnectionsTotal, value);
     };
 
     auto const gapped = CacheFrames({ SampleOf(connections(0), 1),
@@ -328,7 +330,7 @@ TEST_CASE("a counter that went down draws a gap and the next interval draws a ra
 {
     // §9.3 on the panel: no negative rate, no clamp to zero, and the FOLLOWING interval is present.
     auto const connections = [](std::uint64_t value) {
-        return CounterReading(IMetricsSink::Counter::ConnectionsTotal, value);
+        return ReadingStating(IMetricsSink::Counter::ConnectionsTotal, value);
     };
     auto const frames = CacheFrames(
         { SampleOf(connections(100), 1), SampleOf(connections(50), 2), Tick, SampleOf(connections(60), 3), Tick },
@@ -637,7 +639,9 @@ TEST_CASE("an absent figure reads the same bytes on the Unicode and ASCII rungs"
     series.snapshot.storage.reset();
     auto* const cycle = series.counters.Find(IMetricsSink::Counter::ExpiryKeysReclaimed);
     REQUIRE(cycle != nullptr);
-    cycle->reset();
+    // Absent, which is what a default-constructed cell is. Either reason renders `-` at a
+    // panel; this case is about the panel, not about which absence it is.
+    *cycle = CounterReading {};
     auto const script = std::vector<DashboardEvent> { SampleOf(series, 1), Tick };
     auto const unicode = CacheFrames(script, RenderRung::Unicode);
     auto const ascii = CacheFrames(script, RenderRung::Ascii);
@@ -782,7 +786,8 @@ TEST_CASE("every figure a panel names reads the same number off the reading a su
                                                  .busySlots = 7 },
                           .hostLoad = HostLoadReading { .cpu = CpuTicks { .busy = 7'700'001, .total = 9'100'003 },
                                                         .availableMemoryBytes = 21'474'836'480 },
-                          .uptime = Uptime { 864'017s } });
+                          .uptime = Uptime { 864'017s } },
+        EverySurface);
     auto const decoded = DecodeStatsReading(EncodeStatsReading(original));
     REQUIRE(decoded.has_value());
     auto const& adapted = decoded.value();
@@ -888,10 +893,10 @@ TEST_CASE("the node panel's per-minute rate and mean compile come from the catal
     // Ten jobs over two seconds is 300 per minute, not 5; twenty thousand milliseconds over those
     // ten jobs is a 2 s mean, not 2000. Read from a reading stating those two counters alone.
     auto const node = [](std::uint64_t jobs, std::uint64_t millis) {
-        auto reading = CounterReading(IMetricsSink::Counter::WorkerJobsCompleted, jobs);
+        auto reading = ReadingStating(IMetricsSink::Counter::WorkerJobsCompleted, jobs);
         auto* const cell = reading.counters.Find(IMetricsSink::Counter::WorkerCompileMillisTotal);
         REQUIRE(cell != nullptr);
-        *cell = millis;
+        *cell = CounterReading::Of(millis);
         return reading;
     };
     auto view = PanelView {
@@ -2661,7 +2666,7 @@ struct NodeMachine
     auto const count = [&reading](NodeCounter counter, std::uint64_t value) {
         auto* const cell = reading.counters.Find(counter);
         REQUIRE(cell != nullptr);
-        *cell = value;
+        *cell = CounterReading::Of(value);
     };
     count(NodeCounter::WorkerJobsCompleted, 41 * step);
     count(NodeCounter::WorkerCompileMillisTotal, 75440 * step);

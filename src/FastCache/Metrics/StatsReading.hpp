@@ -6,10 +6,14 @@
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Platform/HostLoad.hpp>
 
+#include <algorithm>
+#include <array>
+#include <cassert>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -259,6 +263,194 @@ struct MetricsSnapshot
     [[nodiscard]] bool operator==(MetricsSnapshot const&) const = default;
 };
 
+/// Why a counter read back as nothing.
+///
+/// **Two absences with one spelling is how a healthy process comes to report a broken build.**
+/// Before [#1484](https://github.com/LASTRADA-Software/fastcached/issues/1484) a reading carried
+/// `std::optional<std::uint64_t>` per counter and every absence meant the first reason below.
+/// `RenderPrometheus` reads that absence, omits the series with a `# SKEW` marker and bumps
+/// `fastcached_metrics_catalogue_skew` -- so giving the one spelling a second reason made
+/// `fastcache-compile-node`, which simply has no writer for the daemon's accept counters, scrape
+/// as a build whose catalogue and sink disagree. That is a confident wrong signal replacing a
+/// vague one, and it costs the skew counter its meaning.
+///
+/// **The reason travels on the wire** rather than being re-derived by the renderer, because the
+/// renderer is not always in the process that captured the reading: `fastcache-cli`'s poll rung
+/// decodes a reading and renders Prometheus from it (`StatsSource.cpp`), so a local derivation
+/// would be a fact the CLI cannot reach.
+///
+/// Asked in the order declared: a build that cannot state the figure AT ALL outranks a process
+/// that merely never writes it.
+enum class CounterAbsence : std::uint8_t
+{
+    /// This build's sink has no slot for the row -- a catalogue compiled against a newer
+    /// `Counter` than the sink it is reading
+    /// ([#1353](https://github.com/LASTRADA-Software/fastcached/issues/1353)).
+    /// `IMetricsSink::Carries` is the question, and a skew is what this means.
+    NoSlotInThisBuild = 0,
+
+    /// This build can state the figure and this PROCESS has no writer for it: the row belongs to
+    /// a surface this binary does not serve (#1484). **Not a skew**, so it must never be counted
+    /// as one -- that is the whole reason this enumerator exists rather than a second `bool`.
+    NoWriterInThisProcess,
+
+    /// Enumerator count. Not a reason.
+    Last
+};
+
+/// One counter as a reading holds it: a value, or an absence that says why.
+///
+/// Not `std::expected<std::uint64_t, CounterAbsence>`, for one decisive reason:
+/// `std::expected` default-constructs to a VALUE, so a zero-initialised table of 144 of them
+/// reads as 144 present zeroes -- which is the exact defect this type exists to prevent, arriving
+/// by the front door. The default here is ABSENT, and absent for #1353's reason, which is what an
+/// untouched cell meant before this type existed.
+///
+/// `operator==` is defaulted and correct because the unused member of each state is left at its
+/// default by both factories: a present reading carries `NoSlotInThisBuild`, an absent one
+/// carries `0`. That is what keeps `StatsReading::operator==` defaulted too, and with it the
+/// codec's round-trip assertion.
+class CounterReading
+{
+  public:
+    /// An absent reading, for #1353's reason -- what an untouched cell means.
+    constexpr CounterReading() noexcept = default;
+
+    /// A reading that has a value.
+    /// @param value The counter's value.
+    /// @return The reading.
+    [[nodiscard]] static constexpr CounterReading Of(std::uint64_t value) noexcept
+    {
+        CounterReading reading;
+        reading._present = true;
+        reading._value = value;
+        return reading;
+    }
+
+    /// A reading that has no value, and says why.
+    /// @param why Which absence this is.
+    /// @return The reading.
+    [[nodiscard]] static constexpr CounterReading None(CounterAbsence why) noexcept
+    {
+        CounterReading reading;
+        reading._why = why;
+        return reading;
+    }
+
+    /// Whether this reading carries a value.
+    /// @return True when it does.
+    [[nodiscard]] constexpr bool Present() const noexcept
+    {
+        return _present;
+    }
+
+    /// The value. A programmer error to ask when `Present()` is false, so an assert rather than
+    /// a sentinel: a zero returned here would be the very figure this type refuses to invent.
+    /// @return The value.
+    [[nodiscard]] constexpr std::uint64_t Value() const noexcept
+    {
+        assert(_present);
+        return _value;
+    }
+
+    /// Why there is no value. A programmer error to ask when `Present()` is true.
+    /// @return The reason.
+    [[nodiscard]] constexpr CounterAbsence Why() const noexcept
+    {
+        assert(!_present);
+        return _why;
+    }
+
+    /// Both readings in the same state, carrying the same thing.
+    [[nodiscard]] constexpr bool operator==(CounterReading const&) const = default;
+
+  private:
+    bool _present { false };
+    CounterAbsence _why { CounterAbsence::NoSlotInThisBuild };
+    std::uint64_t _value { 0 };
+};
+
+/// A surface a process may serve, for deciding which counters it could ever write.
+///
+/// Deliberately small and deliberately not a list of PROCESS KINDS: "the daemon" and "a compile
+/// node" is a vocabulary that grows one enumerator per binary and answers nothing about a binary
+/// that serves half of one. A surface is what a counter belongs to, which is the question
+/// `CounterSoleWriterTable` below asks.
+enum class MetricsSurface : std::uint8_t
+{
+    /// The cache daemon's accept path: `Server/Server.cpp` and `Server/ReactorServerLoop.cpp`,
+    /// established by reading the tree as the only writers of `fastcached_connections_*`.
+    /// `fastcache-compile-node` serves none of it -- its own accept path has separate counters.
+    CacheAcceptPath = 0,
+
+    /// Enumerator count. Not a surface.
+    Last
+};
+
+/// Every surface this build knows: what a process that has not stated otherwise serves.
+///
+/// The DEFAULT for the convenience overloads, and the safe direction. A surface set left too
+/// wide reports a plausible zero -- the cost this tree already pays and that somebody has
+/// already been surprised by. One left too narrow invents a `-`, which reads as *this process
+/// does not do that* and nobody re-checks. So an unrevisited call site keeps today's behaviour,
+/// and narrowing is always a positive act.
+inline constexpr std::array EverySurface { MetricsSurface::CacheAcceptPath };
+
+static_assert(EverySurface.size() == static_cast<std::size_t>(MetricsSurface::Last),
+              "EverySurface must list every MetricsSurface: a surface missing from it silently "
+              "narrows every defaulted call site, which invents absences rather than zeroes");
+
+/// A counter whose only writer is one named surface.
+struct CounterSoleWriter
+{
+    IMetricsSink::Counter counter; ///< The row.
+    MetricsSurface surface;        ///< The only surface that writes it.
+};
+
+/// Counters whose ONLY writer is a named surface, so a process not serving that surface reports
+/// them absent rather than zero.
+///
+/// **A row absent from this table may be written anywhere**, which is what this tree assumed for
+/// every row before #1484 -- so an omission here reports exactly as the tree already does, while
+/// a row wrongly ADDED invents a silent absence for a figure that is real. Those two directions
+/// are not symmetric: a plausible zero is a known cost that somebody has already been surprised
+/// by, and a `-` reads as *this process does not do that* and nobody re-checks it. This table is
+/// therefore on the narrow side, and holds only rows whose writers have been positively
+/// established by reading the tree.
+///
+/// **It is not a complete attribution of the catalogue and must not be read as one.** Measured:
+/// 106 of 144 catalogue rows have no `Increment(Counter::X)` site anywhere in first-party
+/// non-test code, because they are refusal counters written through the table-driven
+/// `Refuse(row)` mechanism the rules file mandates. No scan for increment sites attributes them,
+/// and a writable set derived from such a scan would have rendered all 106 absent -- the same
+/// defect as the bug, three and a half times larger. Widening this table wants those refusal
+/// tables read properly and is its own piece of work.
+inline constexpr std::array CounterSoleWriterTable {
+    CounterSoleWriter { .counter = IMetricsSink::Counter::ConnectionsTotal, .surface = MetricsSurface::CacheAcceptPath },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::ConnectionsTotalTls, .surface = MetricsSurface::CacheAcceptPath },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::ConnectionsAdmissionRejected,
+                        .surface = MetricsSurface::CacheAcceptPath },
+};
+
+/// Whether a process serving @p surfaces could ever write @p counter.
+///
+/// True for every row this table says nothing about, which is the fail-as-today direction
+/// argued for at `CounterSoleWriterTable`.
+/// @param counter The row.
+/// @param surfaces The surfaces this process serves.
+/// @return True when some writer of the row could run in this process.
+[[nodiscard]] constexpr bool CounterHasAWriterIn(IMetricsSink::Counter counter,
+                                                 std::span<MetricsSurface const> surfaces) noexcept
+{
+    for (auto const& row: CounterSoleWriterTable)
+    {
+        if (row.counter != counter)
+            continue;
+        return std::ranges::find(surfaces, row.surface) != surfaces.end();
+    }
+    return true;
+}
+
 /// One reading of every figure a stats surface reports: the single source of truth `/metrics`
 /// and a live-stats snapshot are both encoded from.
 ///
@@ -277,10 +469,13 @@ struct StatsReading
 {
     /// Every catalogue counter as the sink stood when this was captured.
     ///
-    /// **Absent when this build's sink has no slot for the row**, never zero (#1353): a
-    /// catalogue compiled against a newer `Counter` than the sink is a build that cannot state
-    /// the figure, and a zero would be indistinguishable from an idle counter.
-    CounterCells<std::optional<std::uint64_t>> counters {};
+    /// **Absent rather than zero, and the absence says WHY** -- see `CounterAbsence`. A build
+    /// whose sink has no slot for the row cannot state the figure at all (#1353); a process
+    /// serving no surface that writes the row has nothing to state (#1484). Both render `-` at a
+    /// panel, and only the first is a SKEW -- which is the distinction the bare
+    /// `std::optional<std::uint64_t>` this field used to hold could not carry, and why a compile
+    /// node scraped as a build whose catalogue and sink disagree.
+    CounterCells<CounterReading> counters {};
 
     /// Everything else, as the snapshot provider stated it. Every absence it models stays one.
     MetricsSnapshot snapshot {};
@@ -301,11 +496,21 @@ struct StatsReading
 
 /// Read the sink and a per-call snapshot into one `StatsReading`, stamped with this build's version.
 ///
-/// The one place the counters are read, so the question #1353 asks -- does this sink carry
-/// the row at all? -- is asked once, here, rather than by every encoding.
+/// The one place the counters are read, so both questions about a row -- does this sink carry it
+/// (#1353), and could this process ever write it (#1484) -- are asked once, here, rather than by
+/// every encoding.
+///
+/// @p surfaces is REQUIRED rather than defaulted, unlike on the `RenderPrometheus` convenience
+/// overload: there are few callers, each is a real process, and each should state its claim
+/// where a reader can see it. An EMPTY span is a legitimate answer -- it is a compile node's,
+/// which serves none of the surfaces any row is attributed to.
 /// @param metrics The counter sink.
 /// @param snapshot What the provider stated for this call.
+/// @param surfaces The surfaces this process serves. `EverySurface` for a process that has not
+///                 been narrowed.
 /// @return The reading.
-[[nodiscard]] StatsReading CaptureStatsReading(IMetricsSink const& metrics, MetricsSnapshot const& snapshot);
+[[nodiscard]] StatsReading CaptureStatsReading(IMetricsSink const& metrics,
+                                               MetricsSnapshot const& snapshot,
+                                               std::span<MetricsSurface const> surfaces);
 
 } // namespace FastCache

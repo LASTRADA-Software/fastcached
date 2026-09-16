@@ -86,7 +86,7 @@ constexpr auto Elsewhere = std::string_view { "10.0.0.9:7071" };
 {
     AtomicMetricsSink sink;
     sink.Increment(CountedRow, static_cast<std::uint64_t>(value));
-    return CaptureStatsReading(sink, MetricsSnapshot {});
+    return CaptureStatsReading(sink, MetricsSnapshot {}, EverySurface);
 }
 
 /// A `Sample` carrying `Reading(value)`, as a stream pushes one.

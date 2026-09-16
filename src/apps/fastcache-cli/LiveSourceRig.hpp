@@ -73,7 +73,7 @@ inline constexpr auto SilentStream = std::string_view { "the stream went silent 
 {
     AtomicMetricsSink sink;
     sink.Increment(IMetricsSink::Counter::LiveSubscriptionsOpened, opened);
-    return CaptureStatsReading(sink, MetricsSnapshot {});
+    return CaptureStatsReading(sink, MetricsSnapshot {}, EverySurface);
 }
 
 /// A node status naming @p version, which is all these cases tell statuses apart by.

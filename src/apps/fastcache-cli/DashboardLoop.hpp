@@ -97,7 +97,10 @@ template <IMetricsSink::Counter Row>
 {
     return ReadingField { .read = [](StatsReading const& reading, std::optional<StorageTier> /*tier*/) noexcept {
         auto const* const value = reading.counters.Find(Row);
-        return value != nullptr && value->has_value() ? std::optional { static_cast<double>(**value) } : std::nullopt;
+        // Either absence renders `-`: a panel cell has nothing to say about WHY a figure is
+        // missing, and #1484's whole point is that the two absences differ for the SCRAPE rather
+        // than for the operator looking at a panel.
+        return value != nullptr && value->Present() ? std::optional { static_cast<double>(value->Value()) } : std::nullopt;
     } };
 }
 

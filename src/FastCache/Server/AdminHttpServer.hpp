@@ -266,13 +266,16 @@ class AdminHttpServer
     /// @param logger Shared logger.
     /// @param routes Routes beyond `/metrics` and `/healthz`; copied.
     /// @param tls Server TLS context, or nullptr to serve plaintext.
+    /// @param surfaces The metrics surfaces this process serves, for `/metrics`. Defaults to
+    ///                 `EverySurface`, so a process that has not been narrowed is unchanged.
     AdminHttpServer(IListener& listener,
                     IMetricsSink const& metrics,
                     SnapshotProvider snapshotProvider,
                     ILogger& logger,
                     IClock& clock,
                     std::vector<AdminRoute> routes = {},
-                    TlsContext* tls = nullptr) noexcept;
+                    TlsContext* tls = nullptr,
+                    std::span<MetricsSurface const> surfaces = EverySurface) noexcept;
 
     /// Accept loop; returns when the listener is closed via Shutdown().
     /// @return Task that resolves when the accept loop exits.
@@ -317,6 +320,9 @@ class AdminHttpServer
     std::vector<AdminRoute> _routes;
     /// Server TLS context, or null for plaintext. Not owned.
     TlsContext* _tls { nullptr };
+    /// Which metrics surfaces this process serves, for `/metrics`. A span over storage that
+    /// outlives this server -- `EverySurface` and a binary's own set are both constexpr.
+    std::span<MetricsSurface const> _surfaces { EverySurface };
     std::atomic<bool> _shuttingDown { false };
     /// Number of admin requests currently being served as detached tasks.
     /// Bumped in the accept loop, decremented at the end of each request.
@@ -341,10 +347,14 @@ class AdminHttpServer
 /// @param snapshotProvider Storage-stats + uptime provider for `/metrics`.
 /// @param routes Caller-registered routes, consulted before the 404.
 /// @return Task that resolves when the response has been written.
+/// @param surfaces The metrics surfaces this process serves, for `/metrics`. Defaults to
+///                 `EverySurface`, so the daemon is unchanged; a binary serving only some of
+///                 them renders those rows absent rather than as a plausible zero (#1484).
 [[nodiscard]] Task<void> ServeAdminHttp(ISocket* socket,
                                         IMetricsSink const* metrics,
                                         AdminHttpServer::SnapshotProvider snapshotProvider,
                                         IClock* clock,
-                                        std::span<AdminRoute const> routes = {});
+                                        std::span<AdminRoute const> routes = {},
+                                        std::span<MetricsSurface const> surfaces = EverySurface);
 
 } // namespace FastCache

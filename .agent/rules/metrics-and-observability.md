@@ -195,7 +195,42 @@ fault.
   is a number for an event that could not have been counted. A catalogue row the
   sink has no slot for is omitted and reported as its own series
   (`fastcached_metrics_catalogue_skew`), never rendered as a plausible zero (#1353).
-  That licenses nothing for the *does this apply* case below. The distinction:
+  **A SECOND carve-out, on the same side of the same line (#1484): *could a writer for this
+  counter run in this PROCESS at all*.** `fastcache-compile-node` constructs neither `Server`
+  nor `ReactorServerLoop`, the only writers of `fastcached_connections_*`, so that figure cannot
+  move there at any traffic level ever -- and it read `0`, which says the one thing an operator
+  most wants to know and gets wrong: *nothing has connected to this node*. Found by dogfooding,
+  on a node that two builds had just gone through.
+
+  This is the BUILD question one step out, not the world question: what a binary's code can
+  write is a static property of the program, so a zero there is a number for an event that could
+  not have been counted -- the same sentence that licenses the first carve-out. **What it must
+  not become is the seven-of-nine mechanism**, and the difference is four things, none of them
+  optional:
+  - The table is keyed the WIDE way. A counter absent from `CounterSoleWriterTable` may be
+    written anywhere, so an omission reports exactly as this tree already does, while a row
+    wrongly ADDED invents a `-`. Those directions are not symmetric: a plausible zero is a cost
+    somebody has already been surprised by, and a `-` reads as *this process does not do that*
+    and nobody re-checks it.
+  - Attribution is POSITIVELY established per row, never derived. Measured: 106 of 144 catalogue
+    rows have no `Increment(Counter::X)` site at all, because they are refusal counters written
+    through the table-driven `Refuse(row)` this file mandates. A writable set scanned from
+    increment sites would have rendered all 106 absent -- the same defect as the bug, three and a
+    half times larger. The table therefore holds three rows, and widening it wants the refusal
+    tables read properly.
+  - The absence carries its REASON, and only one reason is a fault.
+    `fastcached_metrics_catalogue_skew` counts a build whose sink has no slot; the new
+    `fastcached_metrics_surface_absent` counts rows this process cannot write, and a nonzero
+    value there is the HEALTHY state of any binary serving some surfaces. Collapsing the two --
+    which is what reusing `IMetricsSink::Carries` would have done -- makes every compile node
+    scrape as a broken build, and costs the skew series its meaning.
+  - The reason travels on the WIRE, because the renderer is not always in the process that
+    captured the reading: `fastcache-cli`'s poll rung decodes a reading and re-renders Prometheus
+    from it, so a locally-derived reason would answer for the wrong process. That is what moved
+    `StatsReadingWire::Grammar` to `-4`.
+
+  The first carve-out still licenses nothing for the *does this apply* case below. The
+  distinction:
   a *snapshot* value is a reading, so a zero is a claim about the world and absence
   must be spellable -- a *counter* is a tally of events, and zero is the truth about
   events that never happened. What the counters genuinely cannot answer, because
@@ -868,6 +903,16 @@ the whole diagnosis ([#1399](https://github.com/LASTRADA-Software/fastcached/iss
   refused by name at the grant, before any snapshot arrives, and refused again per reading.
 
 ## Open work
+
+- **[#1484](https://github.com/LASTRADA-Software/fastcached/issues/1484)** — the writable-counter
+  attribution is deliberately THREE rows of 144, and the gap is the open half. 106 rows are
+  written through the table-driven `Refuse(row)` mechanism rather than an `Increment` call, so no
+  scan attributes them and none is in `CounterSoleWriterTable`; the remaining 35 have increment
+  sites but have not been read. Every unattributed row reports as this tree did before #1484 — a
+  plausible zero on a binary that cannot write it — so the gap is a known cost rather than a new
+  one, and `fastcached_metrics_surface_absent` is what makes the attributed count visible on every
+  scrape. Widening it means reading the refusal tables per surface, which is why it is not this
+  ticket's fix.
 
 - **[#592](https://github.com/LASTRADA-Software/fastcached/issues/592)** — whether the
   fleet scheduler should count a non-member caller in a series of its own. #494 left it

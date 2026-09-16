@@ -5,6 +5,7 @@
 
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/Logger.hpp>
+#include <FastCache/Metrics/StatsReading.hpp>
 
 #include <array>
 #include <cstdint>
@@ -314,6 +315,27 @@ struct SurfaceRow
 ///
 /// @return The table; stable for the life of the process.
 [[nodiscard]] std::array<SurfaceRow, EnumeratorCount<NodeSurface>> const& NodeSurfaceTable() noexcept;
+
+/// Which METRICS surfaces this binary serves, for deciding which catalogue counters it could
+/// ever write (#1484).
+///
+/// Empty, and that is the whole statement: a compile node serves none of the surfaces any
+/// counter row is attributed to. Specifically it has no cache-daemon accept path -- it
+/// constructs neither `Server` nor `ReactorServerLoop`, the only writers of
+/// `fastcached_connections_*`, and its own accept path has separate counters of its own
+/// (`fastcache_node_frame_connections_refused_at_capacity_total`). So those rows read ABSENT
+/// here rather than as a plausible zero saying nothing has ever connected to this node.
+///
+/// It lives beside `NodeSurfaceTable()` because that table is already this binary's answer to
+/// *which surfaces do I serve*, and a second answer kept somewhere else is how the two come to
+/// disagree. It is deliberately not DERIVED from that table: these are metrics surfaces, a
+/// coarser vocabulary than listening ports, and a derivation would have to claim a mapping
+/// between them that nobody has established.
+///
+/// Empty is not "unknown". A process that has not been narrowed passes `EverySurface`, which is
+/// the default on every convenience overload -- so the direction of a mistake here is stated:
+/// too wide renders a zero, too narrow invents a `-`.
+inline constexpr std::array<MetricsSurface, 0> NodeServedSurfaces {};
 
 /// Apply @p row's bind-failure policy to a bind that failed.
 ///
