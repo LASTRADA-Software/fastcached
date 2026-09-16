@@ -91,7 +91,7 @@ set(liveFile "void Beat(std::atomic<bool>* stopping) { while (!stopping->load(st
 
 # ---------------------------------------------------------------------------
 # Stage a tree, apply one mutation, run the check, return its collapsed output.
-function(fastcached_stage_and_run name target from to outOutput outApplied)
+function(fastcached_stage_and_run name target from to backlog outOutput outApplied)
     set(tree "${FASTCACHED_SCRATCH_DIR}/${name}")
     file(REMOVE_RECURSE "${tree}")
     # `-nested`: the tree sits one level inside a git repository whose index knows none of
@@ -105,7 +105,7 @@ function(fastcached_stage_and_run name target from to outOutput outApplied)
 
     # `~n~`, `~lb~`, `~rb~`, `~sc~`, `~bar~` and `~bs~` are a newline, `[`, `]`, `;`, `|` and a backslash:
     # none of them can sit literally in a case row, which is a CMake list.
-    foreach(var from to)
+    foreach(var from to backlog)
         string(REPLACE "~n~" "\n" ${var} "${${var}}")
         string(REPLACE "~lb~" "[" ${var} "${${var}}")
         string(REPLACE "~rb~" "]" ${var} "${${var}}")
@@ -195,8 +195,24 @@ function(fastcached_stage_and_run name target from to outOutput outApplied)
         endif()
     endif()
 
+    # The backlog, beside the tree rather than the shipped one, which names 64 production
+    # files this tree does not have. `absent` writes nothing, for the missing-file case; `-` is
+    # an empty table, which is still a FILE -- the two are different refusals.
+    #
+    # A comment and a blank line ride along on every case, so the reader's skipping of them is
+    # exercised by every row rather than by one case that could rot.
+    set(backlogPath "${tree}/backlog.txt")
+    if(backlog STREQUAL "absent")
+        file(REMOVE "${backlogPath}")
+    elseif(backlog STREQUAL "-")
+        file(WRITE "${backlogPath}" "# rule|file|count|issue\n\n")
+    else()
+        file(WRITE "${backlogPath}" "# rule|file|count|issue\n\n${backlog}\n")
+    endif()
+
     execute_process(
-        COMMAND "${CMAKE_COMMAND}" "-DFASTCACHED_SOURCE_DIR=${tree}" -P "${check}"
+        COMMAND "${CMAKE_COMMAND}" "-DFASTCACHED_SOURCE_DIR=${tree}"
+                "-DFASTCACHED_TEST_LOOPS_BACKLOG=${backlogPath}" -P "${check}"
         OUTPUT_VARIABLE captured ERROR_VARIABLE capturedErrors)
     set(combined "${captured}${capturedErrors}")
     # `message(FATAL_ERROR)` word-wraps at a column that depends on the scratch path's
@@ -209,72 +225,116 @@ endfunction()
 # ---------------------------------------------------------------------------
 # The cases.
 #
-#   <name>|<target>|<from>|<to>|<must ALL appear>|<must NONE appear>
+#   <name>|<target>|<from>|<to>|<must ALL appear>|<must NONE appear>|<backlog>
 #
-# Needle fields are ' && '-separated; `-` means none. `CMake Error` in the last field means
+# Needle fields are ' && '-separated; `-` means none. `CMake Error` in the must-NONE field means
 # the case expects the check to PASS.
+#
+# The backlog field is the rows to stage, `~bar~`-separated and `~n~` between rows; `-` is an
+# empty table and `absent` is no file at all. It is the last field because almost every case
+# wants none, and a default that reads as `-` is one a row cannot forget to state.
 set(FastCachedTestLoopCases
     # The baseline, in both enumeration modes. Every refusal below is evidence only if
     # these pass -- and they pass only while every exemption row still matches its site.
-    "baseline via walk|none|-|-|no C-style loop && directory walk (no git index) && 4 exempted site(s) in 2 row(s)|CMake Error"
-    "baseline via git|none-git|-|-|no C-style loop && git ls-files|CMake Error"
+    "baseline via walk|none|-|-|no new C-style loop && directory walk (no git index) && 4 exempted site(s) in 2 row(s)|CMake Error|-"
+    "baseline via git|none-git|-|-|no new C-style loop && git ls-files|CMake Error|-"
     # A tree inside another checkout is walked, not read from that checkout's index, which
     # knows none of it. Asking "inside a work tree" instead of "at its top" refused every
     # case when ctest staged them under the gate's build directory.
-    "baseline nested in another checkout|none-nested|-|-|no C-style loop && directory walk (no git index) && 4 exempted site(s) in 2 row(s)|CMake Error"
-    "a counting loop nested in another checkout|newfile-nested|src/FastCache/Core/Fresh_test.cpp|int F()~n~{~n~    for (int i = 0~sc~ i < 3~sc~ ++i)~n~        Use(i)~sc~~n~}~n~|src/FastCache/Core/Fresh_test.cpp:3: a C-style for loop && directory walk (no git index)|-"
+    "baseline nested in another checkout|none-nested|-|-|no new C-style loop && directory walk (no git index) && 4 exempted site(s) in 2 row(s)|CMake Error|-"
+    "a counting loop nested in another checkout|newfile-nested|src/FastCache/Core/Fresh_test.cpp|int F()~n~{~n~    for (int i = 0~sc~ i < 3~sc~ ++i)~n~        Use(i)~sc~~n~}~n~|src/FastCache/Core/Fresh_test.cpp:3: a C-style for loop && directory walk (no git index)|-|-"
 
     # THE RED ARM.
-    "a counting loop|newfile|src/FastCache/Core/Fresh_test.cpp|int F()~n~{~n~    int n = 0~sc~~n~    for (int i = 0~sc~ i < 3~sc~ ++i)~n~        n += i~sc~~n~    return n~sc~~n~}~n~|src/FastCache/Core/Fresh_test.cpp:4: a C-style for loop: for (int i = 0~sc~ i < 3 && test-loops: 1 site(s) break the loop rules|-"
-    "a counting loop via git|newfile-git|src/FastCache/Core/Fresh_test.cpp|int F()~n~{~n~    for (std::size_t i = 0~sc~ i < 3~sc~ ++i)~n~        Use(i)~sc~~n~}~n~|src/FastCache/Core/Fresh_test.cpp:3: a C-style for loop && git ls-files|-"
-    "an empty header|newfile|src/FastCache/Core/Fresh_test.cpp|void F()~n~{~n~    for (~sc~~sc~)~n~        break~sc~~n~}~n~|src/FastCache/Core/Fresh_test.cpp:3: a C-style for loop|-"
-    "a header broken across lines|newfile|src/FastCache/Core/Fresh_test.cpp|void F()~n~{~n~    for (auto at = text.find(needle)~sc~~n~         at != npos~sc~~n~         at = text.find(needle, at + 1))~n~        Use(at)~sc~~n~}~n~|src/FastCache/Core/Fresh_test.cpp:3: a C-style for loop|-"
+    "a counting loop|newfile|src/FastCache/Core/Fresh_test.cpp|int F()~n~{~n~    int n = 0~sc~~n~    for (int i = 0~sc~ i < 3~sc~ ++i)~n~        n += i~sc~~n~    return n~sc~~n~}~n~|src/FastCache/Core/Fresh_test.cpp:4: a C-style for loop: for (int i = 0~sc~ i < 3 && test-loops: 1 unbacklogged site(s)|-|-"
+    "a counting loop via git|newfile-git|src/FastCache/Core/Fresh_test.cpp|int F()~n~{~n~    for (std::size_t i = 0~sc~ i < 3~sc~ ++i)~n~        Use(i)~sc~~n~}~n~|src/FastCache/Core/Fresh_test.cpp:3: a C-style for loop && git ls-files|-|-"
+    "an empty header|newfile|src/FastCache/Core/Fresh_test.cpp|void F()~n~{~n~    for (~sc~~sc~)~n~        break~sc~~n~}~n~|src/FastCache/Core/Fresh_test.cpp:3: a C-style for loop|-|-"
+    "a header broken across lines|newfile|src/FastCache/Core/Fresh_test.cpp|void F()~n~{~n~    for (auto at = text.find(needle)~sc~~n~         at != npos~sc~~n~         at = text.find(needle, at + 1))~n~        Use(at)~sc~~n~}~n~|src/FastCache/Core/Fresh_test.cpp:3: a C-style for loop|-|-"
     # ...and broken BEFORE its first `;`, inside a call: the shape a long init takes, and the only one
     # a reader matching line by line cannot see at all.
-    "a header broken before its first semicolon|newfile|src/FastCache/Core/Fresh_test.cpp|void F()~n~{~n~    for (auto at = text.find(~n~             needle)~sc~ at != npos~sc~ at = Next(at))~n~        Use(at)~sc~~n~}~n~|src/FastCache/Core/Fresh_test.cpp:3: a C-style for loop|-"
-    "a loop in a shared helper header|file1|inline int Helper() { return 0~sc~ }|inline int Helper() { int n = 0~sc~ for (int i = 0~sc~ i < 2~sc~ ++i) n += i~sc~ return n~sc~ }|src/tests/Helper.hpp:3: a C-style for loop|-"
-    "an atomic polled in a while|newfile|src/FastCache/Core/Spin_test.cpp|void F(std::atomic<bool> const& go)~n~{~n~    while (!go.load(std::memory_order_acquire))~n~        std::this_thread::yield()~sc~~n~}~n~|src/FastCache/Core/Spin_test.cpp:3: a while loop polling an atomic|-"
-    "an atomic polled through a pointer|newfile|src/FastCache/Core/Spin_test.cpp|void F(std::atomic<bool>* done)~n~{~n~    while (Count() < 3 && !done->load())~n~        Step()~sc~~n~}~n~|src/FastCache/Core/Spin_test.cpp:3: a while loop polling an atomic|-"
+    "a header broken before its first semicolon|newfile|src/FastCache/Core/Fresh_test.cpp|void F()~n~{~n~    for (auto at = text.find(~n~             needle)~sc~ at != npos~sc~ at = Next(at))~n~        Use(at)~sc~~n~}~n~|src/FastCache/Core/Fresh_test.cpp:3: a C-style for loop|-|-"
+    "a loop in a shared helper header|file1|inline int Helper() { return 0~sc~ }|inline int Helper() { int n = 0~sc~ for (int i = 0~sc~ i < 2~sc~ ++i) n += i~sc~ return n~sc~ }|src/tests/Helper.hpp:3: a C-style for loop|-|-"
+    "an atomic polled in a while|newfile|src/FastCache/Core/Spin_test.cpp|void F(std::atomic<bool> const& go)~n~{~n~    while (!go.load(std::memory_order_acquire))~n~        std::this_thread::yield()~sc~~n~}~n~|src/FastCache/Core/Spin_test.cpp:3: a while loop polling an atomic|-|-"
+    "an atomic polled through a pointer|newfile|src/FastCache/Core/Spin_test.cpp|void F(std::atomic<bool>* done)~n~{~n~    while (Count() < 3 && !done->load())~n~        Step()~sc~~n~}~n~|src/FastCache/Core/Spin_test.cpp:3: a while loop polling an atomic|-|-"
     # A coroutine parking until a plain flag holds: no atomic, so only this rule sees it (#1453's
     # EpollConnector and IocpConnector shape).
-    "a coroutine parking a turn at a time|newfile|src/FastCache/Net/Park_test.cpp|DetachedTask F(IReactor* loop, bool const* done)~n~{~n~    while (!*done)~n~        co_await FastCache::ResumeOn { *loop }~sc~~n~}~n~|src/FastCache/Net/Park_test.cpp:3: a coroutine polling on its reactor && test-loops: 1 site(s) break the loop rules|-"
-    "a coroutine sleeping in a braced body|newfile|src/FastCache/Net/Park_test.cpp|Task<int> F(IReactor* reactor, Held const* held)~n~{~n~    while (held->Is(Order::Acquire))~n~    {~n~        co_await SleepFor(*reactor, std::chrono::milliseconds { 1 })~sc~~n~        Note()~sc~~n~    }~n~    co_return 0~sc~~n~}~n~|src/FastCache/Net/Park_test.cpp:3: a coroutine polling on its reactor|-"
+    "a coroutine parking a turn at a time|newfile|src/FastCache/Net/Park_test.cpp|DetachedTask F(IReactor* loop, bool const* done)~n~{~n~    while (!*done)~n~        co_await FastCache::ResumeOn { *loop }~sc~~n~}~n~|src/FastCache/Net/Park_test.cpp:3: a coroutine polling on its reactor && test-loops: 1 unbacklogged site(s)|-|-"
+    "a coroutine sleeping in a braced body|newfile|src/FastCache/Net/Park_test.cpp|Task<int> F(IReactor* reactor, Held const* held)~n~{~n~    while (held->Is(Order::Acquire))~n~    {~n~        co_await SleepFor(*reactor, std::chrono::milliseconds { 1 })~sc~~n~        Note()~sc~~n~    }~n~    co_return 0~sc~~n~}~n~|src/FastCache/Net/Park_test.cpp:3: a coroutine polling on its reactor|-|-"
     # Both rules match a coroutine parking until an atomic flips (#1453's CancelRead and FrameEndpoint
     # shape), and it is ONE site: counted twice, the refusal would overstate what is wrong.
-    "a coroutine parking until an atomic flips is one site|newfile|src/FastCache/Net/Park_test.cpp|DetachedTask F(IReactor* reactor, std::atomic<bool> const* armed)~n~{~n~    while (!armed->load(std::memory_order_acquire))~n~        co_await SleepUntil { .reactor = reactor, .deadline = reactor->Clock().Now() + Step }~sc~~n~}~n~|src/FastCache/Net/Park_test.cpp:3: a coroutine polling on its reactor && test-loops: 1 site(s) break the loop rules|a while loop polling an atomic"
+    "a coroutine parking until an atomic flips is one site|newfile|src/FastCache/Net/Park_test.cpp|DetachedTask F(IReactor* reactor, std::atomic<bool> const* armed)~n~{~n~    while (!armed->load(std::memory_order_acquire))~n~        co_await SleepUntil { .reactor = reactor, .deadline = reactor->Clock().Now() + Step }~sc~~n~}~n~|src/FastCache/Net/Park_test.cpp:3: a coroutine polling on its reactor && test-loops: 1 unbacklogged site(s)|a while loop polling an atomic|-"
 
     # A violation BEHIND a comment: prose above it and a trailing comment on its own line
     # must not hide it, and the line number must survive list structure planted above it.
-    "a loop below prose and brackets|newfile|src/FastCache/Core/Drift_test.cpp|// for (int i = 0~sc~ i < n~sc~ ++i) is what this file must not do~n~int a~lb~4~rb~ = { 1, 2, 3, 4 }~sc~~n~// a trailing backslash ~bs~~n~void F() { for (int i = 0~sc~ i < 4~sc~ ++i) Use(a~lb~i~rb~)~sc~ } // and a trailing comment~n~|src/FastCache/Core/Drift_test.cpp:4: a C-style for loop|Drift_test.cpp:1"
+    "a loop below prose and brackets|newfile|src/FastCache/Core/Drift_test.cpp|// for (int i = 0~sc~ i < n~sc~ ++i) is what this file must not do~n~int a~lb~4~rb~ = { 1, 2, 3, 4 }~sc~~n~// a trailing backslash ~bs~~n~void F() { for (int i = 0~sc~ i < 4~sc~ ++i) Use(a~lb~i~rb~)~sc~ } // and a trailing comment~n~|src/FastCache/Core/Drift_test.cpp:4: a C-style for loop|Drift_test.cpp:1|-"
 
     # THE QUIET ARM.
-    "a commented-out loop|newfile|src/FastCache/Core/Note_test.cpp|// for (int i = 0~sc~ i < 3~sc~ ++i)~n~/* for (int j = 0~sc~ j < 3~sc~ ++j)~n~   while (!go.load()) */~n~int Note() { return 0~sc~ }~n~|no C-style loop|CMake Error"
-    "a range-for whose range holds a lambda with semicolons|newfile|src/FastCache/Core/Range_test.cpp|int F(std::vector<int> const& v)~n~{~n~    int n = 0~sc~~n~    for (auto const x: v ~bar~ std::views::transform(~lb~~rb~(int y) { int z = y~sc~ return z~sc~ }))~n~        n += x~sc~~n~    return n~sc~~n~}~n~|no C-style loop|CMake Error"
-    "a range-for followed by two statements|newfile|src/FastCache/Core/Range_test.cpp|void F(std::vector<int> const& v)~n~{~n~    for (auto const x: v)~n~        Use(x)~sc~~n~    Next()~sc~~n~}~n~|no C-style loop|CMake Error"
+    "a commented-out loop|newfile|src/FastCache/Core/Note_test.cpp|// for (int i = 0~sc~ i < 3~sc~ ++i)~n~/* for (int j = 0~sc~ j < 3~sc~ ++j)~n~   while (!go.load()) */~n~int Note() { return 0~sc~ }~n~|no new C-style loop|CMake Error|-"
+    "a range-for whose range holds a lambda with semicolons|newfile|src/FastCache/Core/Range_test.cpp|int F(std::vector<int> const& v)~n~{~n~    int n = 0~sc~~n~    for (auto const x: v ~bar~ std::views::transform(~lb~~rb~(int y) { int z = y~sc~ return z~sc~ }))~n~        n += x~sc~~n~    return n~sc~~n~}~n~|no new C-style loop|CMake Error|-"
+    "a range-for followed by two statements|newfile|src/FastCache/Core/Range_test.cpp|void F(std::vector<int> const& v)~n~{~n~    for (auto const x: v)~n~        Use(x)~sc~~n~    Next()~sc~~n~}~n~|no new C-style loop|CMake Error|-"
     # A C++20 range-for with an init-statement holds ONE `;`. master's RaftWire and Nonce tests
     # carry three, and the first version of this check -- one `;` was enough -- refused them.
-    "a range-for with an init-statement|newfile|src/FastCache/Core/Init_test.cpp|void F(std::span<std::byte> tag)~n~{~n~    for (std::size_t index = 0~sc~ auto& byte: tag)~n~        Use(byte, index++)~sc~~n~    Next()~sc~~n~}~n~|no C-style loop|CMake Error"
-    "a range-for whose init-statement breaks the line|newfile|src/FastCache/Core/Init_test.cpp|void F(std::span<std::byte const> nonce)~n~{~n~    for (std::size_t index = 0~sc~~n~         auto const byte: nonce)~n~        Use(byte, index++)~sc~~n~}~n~|no C-style loop|CMake Error"
+    "a range-for with an init-statement|newfile|src/FastCache/Core/Init_test.cpp|void F(std::span<std::byte> tag)~n~{~n~    for (std::size_t index = 0~sc~ auto& byte: tag)~n~        Use(byte, index++)~sc~~n~    Next()~sc~~n~}~n~|no new C-style loop|CMake Error|-"
+    "a range-for whose init-statement breaks the line|newfile|src/FastCache/Core/Init_test.cpp|void F(std::span<std::byte const> nonce)~n~{~n~    for (std::size_t index = 0~sc~~n~         auto const byte: nonce)~n~        Use(byte, index++)~sc~~n~}~n~|no new C-style loop|CMake Error|-"
     # A lambda's body is one element of the header, so its `;` are its own: the first version
     # stopped reading at a `{` and passed a counting loop that held a lambda.
-    "a range-for whose init-statement holds a lambda|newfile|src/FastCache/Core/Init_test.cpp|void F(std::vector<int> const& values)~n~{~n~    for (auto f = ~lb~~rb~(int x) { Note(x)~sc~ return x~sc~ }~sc~ auto v: values)~n~        Use(f(v))~sc~~n~}~n~|no C-style loop|CMake Error"
-    "a counting loop whose init holds a lambda|newfile|src/FastCache/Core/Fresh_test.cpp|void F()~n~{~n~    for (auto f = ~lb~~rb~ { return 0~sc~ }~sc~ f() < 3~sc~)~n~        Use()~sc~~n~}~n~|src/FastCache/Core/Fresh_test.cpp:3: a C-style for loop|-"
-    "a counting loop whose condition calls a lambda|newfile|src/FastCache/Core/Fresh_test.cpp|void F(int n)~n~{~n~    for (int i = 0~sc~ i < Pick(n, ~lb~~rb~ { return 1~sc~ })~sc~ ++i)~n~        Use(i)~sc~~n~}~n~|src/FastCache/Core/Fresh_test.cpp:3: a C-style for loop|-"
-    "a while that polls no atomic|newfile|src/FastCache/Core/While_test.cpp|void F(std::istream& in)~n~{~n~    std::string line~sc~~n~    while (std::getline(in, line))~n~        Use(line)~sc~~n~}~n~|no C-style loop|CMake Error"
-    "a coroutine that works before it parks|newfile|src/FastCache/Net/Beat_test.cpp|DetachedTask Beat(IReactor* reactor, Beats* beats)~n~{~n~    while (!beats->stopping)~n~    {~n~        auto const deadline = reactor->Clock().Now() + Step~sc~~n~        co_await SleepUntil { .reactor = reactor, .deadline = deadline }~sc~~n~    }~n~}~n~|no C-style loop|CMake Error"
-    "a coroutine reading until its peer is done|newfile|src/FastCache/Net/Read_test.cpp|Task<int> Drain(ISocket* socket, std::span<std::byte> buffer)~n~{~n~    auto eof = false~sc~~n~    while (!eof)~n~        eof = (co_await socket->Read(buffer)).value_or(0) == 0~sc~~n~    co_return 0~sc~~n~}~n~|no C-style loop|CMake Error"
-    "a coroutine parking a fixed number of turns|newfile|src/FastCache/Net/Turns_test.cpp|DetachedTask F(IReactor* loop, int turns)~n~{~n~    for (auto const turn: std::views::iota(0, turns))~n~        co_await ResumeOn { *loop }~sc~~n~}~n~|no C-style loop|CMake Error"
-    "a coroutine awaiting a name that only begins like a park|newfile|src/FastCache/Net/Name_test.cpp|DetachedTask F(IReactor* loop, bool const* done)~n~{~n~    while (!*done)~n~        co_await ResumeOnce(loop)~sc~~n~}~n~|no C-style loop|CMake Error"
-    "a function merely named for|newfile|src/FastCache/Core/Name_test.cpp|int transform_for(int a)~sc~~n~int platform(int b)~sc~~n~int x = transform_for(1)~sc~~n~|no C-style loop|CMake Error"
+    "a range-for whose init-statement holds a lambda|newfile|src/FastCache/Core/Init_test.cpp|void F(std::vector<int> const& values)~n~{~n~    for (auto f = ~lb~~rb~(int x) { Note(x)~sc~ return x~sc~ }~sc~ auto v: values)~n~        Use(f(v))~sc~~n~}~n~|no new C-style loop|CMake Error|-"
+    "a counting loop whose init holds a lambda|newfile|src/FastCache/Core/Fresh_test.cpp|void F()~n~{~n~    for (auto f = ~lb~~rb~ { return 0~sc~ }~sc~ f() < 3~sc~)~n~        Use()~sc~~n~}~n~|src/FastCache/Core/Fresh_test.cpp:3: a C-style for loop|-|-"
+    "a counting loop whose condition calls a lambda|newfile|src/FastCache/Core/Fresh_test.cpp|void F(int n)~n~{~n~    for (int i = 0~sc~ i < Pick(n, ~lb~~rb~ { return 1~sc~ })~sc~ ++i)~n~        Use(i)~sc~~n~}~n~|src/FastCache/Core/Fresh_test.cpp:3: a C-style for loop|-|-"
+    "a while that polls no atomic|newfile|src/FastCache/Core/While_test.cpp|void F(std::istream& in)~n~{~n~    std::string line~sc~~n~    while (std::getline(in, line))~n~        Use(line)~sc~~n~}~n~|no new C-style loop|CMake Error|-"
+    "a coroutine that works before it parks|newfile|src/FastCache/Net/Beat_test.cpp|DetachedTask Beat(IReactor* reactor, Beats* beats)~n~{~n~    while (!beats->stopping)~n~    {~n~        auto const deadline = reactor->Clock().Now() + Step~sc~~n~        co_await SleepUntil { .reactor = reactor, .deadline = deadline }~sc~~n~    }~n~}~n~|no new C-style loop|CMake Error|-"
+    "a coroutine reading until its peer is done|newfile|src/FastCache/Net/Read_test.cpp|Task<int> Drain(ISocket* socket, std::span<std::byte> buffer)~n~{~n~    auto eof = false~sc~~n~    while (!eof)~n~        eof = (co_await socket->Read(buffer)).value_or(0) == 0~sc~~n~    co_return 0~sc~~n~}~n~|no new C-style loop|CMake Error|-"
+    "a coroutine parking a fixed number of turns|newfile|src/FastCache/Net/Turns_test.cpp|DetachedTask F(IReactor* loop, int turns)~n~{~n~    for (auto const turn: std::views::iota(0, turns))~n~        co_await ResumeOn { *loop }~sc~~n~}~n~|no new C-style loop|CMake Error|-"
+    "a coroutine awaiting a name that only begins like a park|newfile|src/FastCache/Net/Name_test.cpp|DetachedTask F(IReactor* loop, bool const* done)~n~{~n~    while (!*done)~n~        co_await ResumeOnce(loop)~sc~~n~}~n~|no new C-style loop|CMake Error|-"
+    "a function merely named for|newfile|src/FastCache/Core/Name_test.cpp|int transform_for(int a)~sc~~n~int platform(int b)~sc~~n~int x = transform_for(1)~sc~~n~|no new C-style loop|CMake Error|-"
 
     # EXEMPTIONS, both directions.
-    "the exempted text in another file is not exempt|newfile|src/FastCache/Core/Copy_test.cpp|void Beat(std::atomic<bool>* stopping)~n~{~n~    while (!stopping->load(std::memory_order_acquire))~n~        Sleep()~sc~~n~}~n~|src/FastCache/Core/Copy_test.cpp:3: a while loop polling an atomic|-"
-    "a second site in an exempted file needs its own row|file3|Sleep()~sc~ }|Sleep()~sc~ }~n~void Other(std::atomic<bool>& ready) { while (!ready.load()) Sleep()~sc~ }|src/FastCache/Protocol/LiveStreamReactors_test.cpp:2: a while loop polling an atomic|-"
-    "an exemption whose site is gone is STALE|file3|while (!stopping->load(std::memory_order_acquire)) Sleep()~sc~|BeatUntilStopped()~sc~|matching no site && stopping->load( && STALE|-"
+    "the exempted text in another file is not exempt|newfile|src/FastCache/Core/Copy_test.cpp|void Beat(std::atomic<bool>* stopping)~n~{~n~    while (!stopping->load(std::memory_order_acquire))~n~        Sleep()~sc~~n~}~n~|src/FastCache/Core/Copy_test.cpp:3: a while loop polling an atomic|-|-"
+    "a second site in an exempted file needs its own row|file3|Sleep()~sc~ }|Sleep()~sc~ }~n~void Other(std::atomic<bool>& ready) { while (!ready.load()) Sleep()~sc~ }|src/FastCache/Protocol/LiveStreamReactors_test.cpp:2: a while loop polling an atomic|-|-"
+    "an exemption whose site is gone is STALE|file3|while (!stopping->load(std::memory_order_acquire)) Sleep()~sc~|BeatUntilStopped()~sc~|matching no site && stopping->load( && STALE|-|-"
 
     # --- fails CLOSED ---
-    "a scope row that matches nothing|noheader|-|-|matched no file && src/tests/*.hpp|-"
-    "no for anywhere|nofor|-|-|the scan matched nothing and cannot conclude|-"
+    "a scope row that matches nothing|noheader|-|-|matched no file && src/tests/*.hpp|-|-"
+    "no for anywhere|nofor|-|-|the scan matched nothing and cannot conclude|-|-"
+    # ---- #1452: the `loop` rule reaches production sources, and a ratchet is what lets it.
+    #
+    # The scope rows for `src/*.cpp` and `src/*.hpp` are what these exercise. Before #1452 a
+    # production source was in no scope row at all, so every one of these passed vacuously.
+    "a production loop with no backlog row|newfile|src/FastCache/Core/Prod.cpp|void F()~n~{~n~    for (int i = 0~sc~ i < 3~sc~ ++i)~n~        Use(i)~sc~~n~}~n~|src/FastCache/Core/Prod.cpp:3: a C-style for loop && A site nobody has decided about yet belongs in FastCachedTestLoopBacklog|-|-"
+    # The ACCEPTING direction. A ratchet that refused its own rows would look like a working
+    # one on any tree that still has sites, which is every tree until #1452 closes.
+    "a production loop its backlog row records|newfile|src/FastCache/Core/Prod.cpp|void F()~n~{~n~    for (int i = 0~sc~ i < 3~sc~ ++i)~n~        Use(i)~sc~~n~}~n~|no new C-style loop && backlog: 1 site(s) across 1 file(s) are waiting on #1452|CMake Error|loop~bar~src/FastCache/Core/Prod.cpp~bar~1~bar~#1452"
+    # One MORE than the row records: a new site arriving in a file that already has some, which
+    # is the likeliest way one arrives at all.
+    "one more loop than the backlog records|newfile|src/FastCache/Core/Prod.cpp|void F()~n~{~n~    for (int i = 0~sc~ i < 3~sc~ ++i)~n~        Use(i)~sc~~n~    for (int i = 0~sc~ i < 3~sc~ ++i)~n~        Use(i)~sc~~n~}~n~|2 loop site(s) here, and FastCachedTestLoopBacklog records 1 for #1452 && this is a NEW site|-|loop~bar~src/FastCache/Core/Prod.cpp~bar~1~bar~#1452"
+    # One FEWER: a conversion that did not come off the backlog. The non-obvious direction, and
+    # without it the number a fixed site left behind is room for the next arrival.
+    "one fewer loop than the backlog records|newfile|src/FastCache/Core/Prod.cpp|void F()~n~{~n~    for (int i = 0~sc~ i < 3~sc~ ++i)~n~        Use(i)~sc~~n~}~n~|the row records 2, the scan finds 1 && the ratchet, and it only turns one way|-|loop~bar~src/FastCache/Core/Prod.cpp~bar~2~bar~#1452"
+    "a backlog row whose file is not there|none|-|-|the row records 1, the scan finds none|-|loop~bar~src/FastCache/Core/Absent.cpp~bar~1~bar~#1452"
+
+    # ---- The per-rule scope: `spin` and `poll` are TEST-only, because the wait they ask for is
+    # `src/tests/BoundedWait.hpp` and a production source cannot include it. Both of these are
+    # refused when they sit in a test file (cases above), and must NOT be here.
+    "an atomic polled in a production source|newfile|src/FastCache/Core/Prod.cpp|void F(std::atomic<bool> const& go)~n~{~n~    while (!go.load(std::memory_order_acquire))~n~        std::this_thread::yield()~sc~~n~}~n~|no new C-style loop|CMake Error && a while loop polling an atomic|-"
+    "a coroutine parking in a production source|newfile|src/FastCache/Core/Prod.cpp|DetachedTask F(IReactor* loop, bool const* done)~n~{~n~    while (!*done)~n~        co_await FastCache::ResumeOn { *loop }~sc~~n~}~n~|no new C-style loop|CMake Error && a coroutine polling on its reactor|-"
+    # The must-NOT-catch half, now asked of a production source: the scope went from ~90 files
+    # to 915 and a rule that had only ever read tests now reads every header in the tree.
+    "a range-for in a production source|newfile|src/FastCache/Core/Prod.cpp|void F(std::span<int const> values)~n~{~n~    for (auto const value: values)~n~        Use(value)~sc~~n~}~n~|no new C-style loop|CMake Error && a C-style for loop|-"
+
+    # ---- The backlog FILE's own shape. Each refused by NAME: a row read as a count of zero
+    # waves through every site in its file, and that is the direction nobody notices.
+    "a backlog row with three fields|none|-|-|Backlog row has 3 field(s), not 4|-|loop~bar~src/FastCache/Core/Prod.cpp~bar~1"
+    "a backlog row with a count of zero|none|-|-|so zero is spelled by deleting the row|-|loop~bar~src/FastCache/Core/Prod.cpp~bar~0~bar~#1452"
+    "a backlog row naming no issue|none|-|-|rather than an issue like|-|loop~bar~src/FastCache/Core/Prod.cpp~bar~1~bar~1452"
+    "a backlog row naming an unknown rule|none|-|-|which is not loop, spin or poll|-|lint~bar~src/FastCache/Core/Prod.cpp~bar~1~bar~#1452"
+    # Two rows for one file: refused anyway, but the stale sweep would have blamed a conversion
+    # that never happened, and the count governing the file would be whichever row came first.
+    "two backlog rows for one file|none|-|-|has two rows for loop in src/FastCache/Core/Prod.cpp|-|loop~bar~src/FastCache/Core/Prod.cpp~bar~1~bar~#1452~n~loop~bar~src/FastCache/Core/Prod.cpp~bar~2~bar~#1452"
+    # The tally is the whole reason an undecided row is allowed, so it must print on a run that
+    # REFUSES too -- below the refusal it printed on exactly the runs nobody needs it on.
+    "the backlog tally prints on a refusing run|newfile|src/FastCache/Core/Prod.cpp|void F()~n~{~n~    for (int i = 0~sc~ i < 3~sc~ ++i)~n~        Use(i)~sc~~n~    for (int j = 0~sc~ j < 3~sc~ ++j)~n~        Use(j)~sc~~n~}~n~|2 loop site(s) here && backlog: 1 site(s) across 1 file(s) are waiting on #1452|-|loop~bar~src/FastCache/Core/Prod.cpp~bar~1~bar~#1452"
+    # Absent is not empty. Read as empty it refuses every un-converted site in the tree, loudly,
+    # and sends whoever meets it to the loops rather than to the missing file.
+    "a missing backlog file|none|-|-|the backlog file cannot be read|-|absent"
 )
 
 # ---------------------------------------------------------------------------
@@ -284,9 +344,9 @@ set(caseCount 0)
 foreach(row IN LISTS FastCachedTestLoopCases)
     string(REPLACE "|" ";" fields "${row}")
     list(LENGTH fields fieldCount)
-    if(NOT fieldCount EQUAL 6)
+    if(NOT fieldCount EQUAL 7)
         message(FATAL_ERROR
-            "case row has ${fieldCount} fields, expected 6 -- a row that does not parse would run as a "
+            "case row has ${fieldCount} fields, expected 7 -- a row that does not parse would run as a "
             "different case than it reads as: [${row}]")
     endif()
     list(GET fields 0 caseName)
@@ -295,9 +355,11 @@ foreach(row IN LISTS FastCachedTestLoopCases)
     list(GET fields 3 caseTo)
     list(GET fields 4 caseMustAppear)
     list(GET fields 5 caseMustNotAppear)
+    list(GET fields 6 caseBacklog)
 
     math(EXPR caseCount "${caseCount} + 1")
-    fastcached_stage_and_run("${caseCount}" "${caseTarget}" "${caseFrom}" "${caseTo}" output applied)
+    fastcached_stage_and_run("${caseCount}" "${caseTarget}" "${caseFrom}" "${caseTo}"
+                             "${caseBacklog}" output applied)
 
     if(NOT applied)
         list(APPEND failures
@@ -323,6 +385,18 @@ foreach(row IN LISTS FastCachedTestLoopCases)
     string(FIND "${output}" "${otherMode}" position)
     if(NOT position EQUAL -1)
         list(APPEND failures "${caseName}: ran as `${otherMode}`, which is not the path this case is about")
+    endif()
+
+    # WHICH backlog the check read, asserted on every case that got far enough to read one. The
+    # path is overridable so this file can stage one, and a case that silently read the SHIPPED
+    # 64-row table would refuse for a reason that is not what it is about -- while looking, in
+    # the rows that expect a refusal, exactly like a case that worked.
+    if(NOT caseBacklog STREQUAL "absent")
+        string(FIND "${output}" "test-loops: backlog file: backlog.txt" position)
+        if(position EQUAL -1)
+            list(APPEND failures
+                 "${caseName}: the check did not say it read the STAGED backlog, so this case may have been judged against the shipped one")
+        endif()
     endif()
 
     if(NOT caseMustAppear STREQUAL "-")

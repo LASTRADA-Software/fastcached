@@ -5674,6 +5674,30 @@ set_tests_properties("tracked-files-selftest" PROPERTIES
     TIMEOUT 180
 )
 
+# The OTHER single point of failure in `scripts/lib/CheckCommon.cmake`: eight checks read C++
+# through `fastcached_strip_comment_line`, so a defect there is a defect in all of them at once,
+# and it had one. A comment introducer inside a STRING LITERAL was read as a real introducer --
+# a request literal whose `Accept: */*` contains a `/*` opened a block comment nothing closed,
+# and the 51 lines after it, a `for (;;)` among them, were invisible to a scan that reported a
+# clean count over lines it had never read (#1452 found it; the shape is #1494).
+#
+# In the DEFAULT set: a pure function over one line, no daemon, no socket, no compiler, no git.
+#
+# It runs its case table against the shipped library AND against six copies with one decision
+# removed from each, because every case in it passes over a stripper that returns its input
+# unchanged. A neuter that provokes nothing is reported as this file's own failure.
+add_test(
+    NAME "comment-stripper-selftest"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SCRATCH_DIR=${CMAKE_CURRENT_BINARY_DIR}/comment-stripper-selftest"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-comment-stripper-selftest.cmake"
+)
+set_tests_properties("comment-stripper-selftest" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 180
+)
+
 # A retained wall clock is a `WallClockRef`, never a raw `IWallClock` pointer or
 # reference member (#1032). The TYPE is the guard -- `WallClockRef` refuses to be built
 # from an rvalue, and the `static_assert` pairs in `Core/WallClockRef_test.cpp` and

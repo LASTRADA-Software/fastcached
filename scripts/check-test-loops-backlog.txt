@@ -1,0 +1,105 @@
+# The C-style loops in production sources that nobody has decided about yet, and the issue that
+# will decide them. Read by `scripts/check-test-loops.cmake`.
+#
+# rule|file|count|issue
+#
+# A row here makes a DIFFERENT claim from a row in `FastCachedTestLoopExemptions`. An exemption
+# says *this site is right and must stay, here is why*. A row here says *nobody has decided about
+# these yet*. Spelling the second like the first would put 148 sites behind a word that means
+# "decided", and the only reason an undecided row is safe at all is that the check tallies these
+# and prints the total per issue on every run.
+#
+# It is a RATCHET and it turns one way. More sites in a file than its row records is a NEW site
+# and is refused -- the answer is to convert it, never to raise the number. FEWER is a row that
+# has stopped describing the file, refused as stale, so a conversion is recorded in the same
+# change that makes it and the number it left behind is not room for the next arrival.
+#
+# Keyed on a COUNT per (rule, file), deliberately not on a line number, which churns on any edit
+# above a site. What that leaves open, stated rather than engineered away: one site removed and
+# another added in the same file under the same rule is a wash this cannot see. A key that could
+# see it would have to be the header text, and a `for` header contains a `;`.
+#
+# ONE row per rule per file. Two are refused by name: the scan would match the first and read
+# the second as a site that had been converted, so the count governing the file would be
+# whichever row came first.
+#
+# Blank lines and `#` lines are ignored. Nothing else is: a line this reader cannot split is
+# refused, because a row read as a count of zero waves through every site in its file.
+#
+# The check refuses a row whose `issue` is not shaped like one, and deliberately does not ask
+# GitHub whether that issue is OPEN -- a hygiene check that needs the network is one that cannot
+# run. A row naming a CLOSED issue would be a row whose owner says the work is done, which is
+# the `RefuseUntriaged` hazard exactly. That liveness IS checked, one level up: every issue
+# named here also has an `## Open work` entry in `.agent/rules/testing.md`, and
+# `ctest -R rulebook-open-work` resolves those and refuses one that has been closed. Adding a
+# network probe here would be a second source of truth for the same fact.
+#
+# No total is written here. `check-table-totals.sh` reads only markdown under `.agent/`, so a
+# marker in this file would read as enforcement that nothing performs -- and the figures it
+# would state are DERIVED by the check on every run and printed there, which is the one place
+# they cannot drift from the rows.
+
+loop|src/CowTree/CowTree/CowTree.cpp|8|#1452
+loop|src/CowTree/CowTree/Crc32c.cpp|2|#1452
+loop|src/CowTree/CowTree/FilePageStore.cpp|5|#1452
+loop|src/CowTree/CowTree/PageLayout.cpp|2|#1452
+loop|src/FastCache/Async/EpollReactor.cpp|2|#1452
+loop|src/FastCache/Async/IocpReactor.cpp|1|#1452
+loop|src/FastCache/Async/KqueueReactor.cpp|2|#1452
+loop|src/FastCache/Cache/CacheEngine.cpp|3|#1452
+loop|src/FastCache/Cache/CowTreeStorage.cpp|2|#1452
+loop|src/FastCache/Cache/SetCodec.hpp|1|#1452
+loop|src/FastCache/Cache/StreamCodec.hpp|5|#1452
+loop|src/FastCache/Cli/Options.hpp|1|#1452
+loop|src/FastCache/Cli/UsageDoc.cpp|1|#1452
+loop|src/FastCache/Cli/UsageTestUtils.hpp|1|#1452
+loop|src/FastCache/Cluster/ClusterState.cpp|4|#1452
+loop|src/FastCache/CompileCache/PathCanon.cpp|2|#1452
+loop|src/FastCache/Config/DefaultConfigPath.cpp|1|#1452
+loop|src/FastCache/Config/EnvExpand.cpp|1|#1452
+loop|src/FastCache/Config/FileOptions.hpp|1|#1452
+loop|src/FastCache/Consensus/FileRaftStorage.cpp|1|#1452
+loop|src/FastCache/Consensus/RaftClusterHarness.hpp|5|#1452
+loop|src/FastCache/Core/Base64.cpp|7|#1452
+loop|src/FastCache/Distributed/FleetChart.cpp|1|#1452
+loop|src/FastCache/Distributed/FleetHistory.cpp|1|#1452
+loop|src/FastCache/Net/EpollSocket.cpp|1|#1452
+loop|src/FastCache/Net/HealthProbe.cpp|1|#1452
+loop|src/FastCache/Net/InMemoryTransport.cpp|1|#1452
+loop|src/FastCache/Net/IocpSocket.cpp|1|#1452
+loop|src/FastCache/Net/KqueueSocket.cpp|1|#1452
+loop|src/FastCache/Net/SocketAddress.cpp|1|#1452
+loop|src/FastCache/Net/ThreadedAddressResolver.cpp|1|#1452
+loop|src/FastCache/Net/TlsContext.cpp|1|#1452
+loop|src/FastCache/Net/UdpSocket.cpp|1|#1452
+loop|src/FastCache/Platform/InheritedListener.cpp|1|#1452
+loop|src/FastCache/Platform/LocalAddresses.cpp|4|#1452
+loop|src/FastCache/Protocol/CompileCacheWire.hpp|1|#1452
+loop|src/FastCache/Protocol/Framing/LineReader.cpp|1|#1452
+loop|src/FastCache/Protocol/MemcachedText.cpp|2|#1452
+loop|src/FastCache/Protocol/PubSubRegistry.cpp|2|#1452
+loop|src/FastCache/Protocol/RedisResp.cpp|16|#1452
+loop|src/FastCache/Protocol/RedisTransaction.cpp|1|#1452
+loop|src/FastCache/Protocol/StreamWaiterRegistry.cpp|2|#1452
+loop|src/FastCache/Server/AdminHttpServer.cpp|1|#1452
+loop|src/FastCache/Server/ReactorServerLoop.cpp|4|#1452
+loop|src/apps/fastcache-bench/StreamCodecBench.cpp|2|#1452
+loop|src/apps/fastcache-cc/DirectManifest.cpp|4|#1452
+loop|src/apps/fastcache-cc/ParallelFor.cpp|3|#1452
+loop|src/apps/fastcache-cc/ProcessRunner.cpp|4|#1452
+loop|src/apps/fastcache-cc/Stats.cpp|4|#1452
+loop|src/apps/fastcache-cc/ToolchainProbe.cpp|6|#1452
+loop|src/apps/fastcache-cc/main.cpp|2|#1452
+loop|src/apps/fastcache-cli/CliCommand.cpp|1|#1452
+loop|src/apps/fastcache-cli/DashboardPanel.cpp|1|#1452
+loop|src/apps/fastcache-cli/MemcachedClient.cpp|1|#1452
+loop|src/apps/fastcache-cli/RespClient.cpp|1|#1452
+loop|src/apps/fastcache-cli/SocketExchange.cpp|5|#1452
+loop|src/apps/fastcache-cli/main.cpp|1|#1452
+loop|src/apps/fastcache-compile-node/EnrollClient.cpp|1|#1452
+loop|src/apps/fastcache-compile-node/EnrollmentWindow.cpp|1|#1452
+loop|src/apps/fastcache-compile-node/FrameEndpoint.cpp|1|#1452
+loop|src/apps/fastcache-compile-node/NodeAnnounce.cpp|1|#1452
+loop|src/apps/fastcache-compile-node/NodeToolchains.cpp|1|#1452
+loop|src/apps/fastcache-compile-node/ScratchClaim.cpp|2|#1452
+loop|src/apps/fastcached/main.cpp|2|#1452
