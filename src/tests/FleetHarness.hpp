@@ -5,6 +5,7 @@
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Core/SecureBytes.hpp>
+#include <FastCache/Distributed/MembershipOracle.hpp>
 #include <FastCache/Distributed/SchedulerProtocol.hpp>
 #include <FastCache/Distributed/SchedulerService.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
@@ -35,7 +36,17 @@
 /// once and would let whichever case ran first silence the rest -- a coupling to
 /// Catch2's ordering that is invisible until it fails.
 /// @return A notice with no sink.
-[[nodiscard]] FastCache::Cc::CredentialNotice& Unwatched()
+///
+/// **`inline`, and it has to be.** This is a non-member function DEFINED in a header, so two
+/// translation units including `FleetHarness.hpp` are two definitions and the link fails --
+/// `multiple definition of Unwatched()`. It went unnoticed because the harness had exactly ONE
+/// includer until #1471 added a second, which is the shape of every latent ODR violation in a
+/// header: correct-looking, and only discoverable by using the header twice.
+///
+/// `inline` rather than `static`: the comment above says the notice is SHARED on purpose, and
+/// internal linkage would give each translation unit its own. Harmless for a sink-less notice
+/// today, and a silent divergence from the stated intent the moment one records anything.
+[[nodiscard]] inline FastCache::Cc::CredentialNotice& Unwatched()
 {
     static FastCache::Cc::CredentialNotice notice = FastCache::Cc::CredentialNotice::Silent();
     return notice;
@@ -148,6 +159,35 @@ class FleetHarness final: public Cc::IEndpointExchange
                 node->service.SetRole(Distributed::SchedulerRole::Follower, endpoint, Distributed::StandaloneSchedulerTerm);
     }
 
+    /// Where every subsequent request appears to come from.
+    ///
+    /// **A constant here cannot carry a membership property.** The default is `127.0.0.1`, and
+    /// loopback is never forgotten -- deliberately, so a node always admits its own machine --
+    /// so a forget published against the default caller applies to nobody and a case asserting
+    /// a refusal goes green having exercised nothing. Any case about admission sets this first.
+    /// @param host The caller's host, as `ISocket::PeerAddress()` would report it.
+    void SetCallerHost(std::string host)
+    {
+        _callerHost = std::move(host);
+    }
+
+    /// Let one node's admission oracle decide what its callers are.
+    ///
+    /// **Per NODE, and that is the point rather than generality.** The state #1471 is about is
+    /// two machines disagreeing about one host -- a forget committed on the leader and not yet
+    /// applied on the second -- and one oracle shared across the fleet cannot express it at all.
+    ///
+    /// A node given no oracle keeps answering `Member`, so every case written before this still
+    /// asserts what it always did. The oracle is borrowed, not owned: the production objects
+    /// belong to the case, because a `NodeMembership` needs a config and a logger this harness
+    /// has no business inventing.
+    /// @param endpoint Which node; must have been added.
+    /// @param oracle Who decides its callers, or nullptr to go back to admitting everybody.
+    void SetMembershipAt(std::string_view endpoint, Distributed::IMembershipOracle const* oracle)
+    {
+        NodeAt(endpoint).membership = oracle;
+    }
+
     /// Register a worker with one scheduler.
     /// @param scheduler Which scheduler's registry to put it in.
     /// @param workerEndpoint Where the worker answers compiles.
@@ -159,7 +199,13 @@ class FleetHarness final: public Cc::IEndpointExchange
                         std::uint32_t slots = 1)
     {
         auto const reply = NodeAt(scheduler).service.Register(
-            Caller(),
+            // `SetupCaller`, never the case's caller: this ARRANGES the fleet and throws when
+            // refused, so a case that set a forgotten caller host would fail here during setup
+            // rather than at the assertion it was written for -- which reads as the harness
+            // being broken. Registration IS membership-gated in production (`Gate` refuses
+            // `Register` too); what this says is that the worker doing the registering is not
+            // the client under test. Do not unify these two.
+            SetupCaller(),
             Distributed::WorkerRegistration {
                 .fingerprint = fingerprint, .endpoint = workerEndpoint, .slots = slots, .codecs = {} });
         if (reply.status != CompileCacheWire::Status::Ok)
@@ -282,6 +328,9 @@ class FleetHarness final: public Cc::IEndpointExchange
         std::string endpoint;
         Distributed::SchedulerService service;
         Distributed::SchedulerProtocol protocol;
+        /// Who decides this node's callers, or null to admit everybody (the default, and what
+        /// every case predating #1471 relies on). Borrowed -- see `SetMembershipAt`.
+        Distributed::IMembershipOracle const* membership { nullptr };
     };
 
     /// The scheduler at @p endpoint.
@@ -305,7 +354,10 @@ class FleetHarness final: public Cc::IEndpointExchange
     {
         auto const worker = std::ranges::find(_workerEndpoints, hostPort);
         if (worker == _workerEndpoints.end())
-            return NodeAt(hostPort).protocol.Answer(frame, Caller());
+        {
+            auto& node = NodeAt(hostPort);
+            return node.protocol.Answer(frame, Caller(node));
+        }
 
         // A worker endpoint. The hook fires here rather than around the whole
         // Dispatch call because this is the only instant that is *between* the
@@ -318,11 +370,33 @@ class FleetHarness final: public Cc::IEndpointExchange
         return _workerReply;
     }
 
-    /// A member calling from a loopback host, which is what every case here wants.
-    /// @return The context handed to the service.
-    [[nodiscard]] static Distributed::CallerContext Caller() noexcept
+    /// The context the harness ARRANGES the world with: a member on loopback, always.
+    ///
+    /// Separate from `Caller` deliberately. Setup helpers that throw on refusal -- registering a
+    /// worker, for one -- must not be subject to the membership a case is testing, or arranging
+    /// the fleet fails before the assertion runs.
+    /// @return A member calling from loopback.
+    [[nodiscard]] static Distributed::CallerContext SetupCaller() noexcept
     {
         return Distributed::CallerContext { .membership = Distributed::Membership::Member, .peerId = "127.0.0.1" };
+    }
+
+    /// The context handed to @p node's service for the current caller.
+    ///
+    /// **Decided by that node's oracle when it has one**, so a membership property is
+    /// falsifiable here at all: before #1471 this returned a hardcoded `Member`, which made any
+    /// case about who is admitted pass against an oracle that refused nobody.
+    ///
+    /// No oracle means `Member`, which is what every case about dispatch, leases and release
+    /// routing needs -- those are not about admission and would be testing nothing else if this
+    /// started refusing them.
+    /// @param node Whose oracle to ask.
+    /// @return The context, carrying that node's verdict about `_callerHost`.
+    [[nodiscard]] Distributed::CallerContext Caller(Node const& node) const
+    {
+        auto const verdict =
+            node.membership != nullptr ? node.membership->Classify(_callerHost) : Distributed::Membership::Member;
+        return Distributed::CallerContext { .membership = verdict, .peerId = _callerHost };
     }
 
     /// The verb byte a framed request carries, for the call log.
@@ -342,6 +416,9 @@ class FleetHarness final: public Cc::IEndpointExchange
     ManualWallClock _wallClock;
     AtomicMetricsSink _metrics;
     NullLogger _logger;
+    /// Where requests appear to come from. Loopback by default, which is what every case
+    /// predating #1471 assumed and what a node always admits.
+    std::string _callerHost { "127.0.0.1" };
     SecureByteBuffer _signingKey;
     std::vector<std::unique_ptr<Node>> _nodes;
     std::vector<std::string> _workerEndpoints;
