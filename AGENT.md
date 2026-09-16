@@ -267,6 +267,13 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
 - That language is stated by the flags dispatch APPENDS, so a build that named one itself
   (`/TP`) is folded into the language and dropped — never refused. A selector naming a FILE,
   or an `-x` value with no exact language, is still refused.
+- A MACRO SWITCH (`-D`, `-U`, `/D`, `/U`) leaves the DISPATCHED line only — the preprocess
+  line and the key keep it, since the key hashes the text those definitions produced. Its own
+  table, not a `PathValues` row. Unrecognised, a path-valued `-D` made `CouldNameAFile` refuse
+  the WHOLE line, so this project's own `-DFASTCACHED_SOURCE_DIR` build never dispatched
+  anything, with no counter anywhere (#1481). Prefix-matched, so the collision claim is
+  MEASURED against both drivers and is case-SENSITIVE — `cl`'s `/u` and `/utf-8` are one
+  fold away.
 - The arguments a worker will pass on are an **allowlist** keyed on the driver family, and
   the `-f` space is ENUMERATED rather than prefixed. **A refusal by ABSENCE and a refusal by
   ROW are the same answer only while nothing else is consulted**, and `--allow-compile-arg`

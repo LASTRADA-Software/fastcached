@@ -78,6 +78,34 @@ is the reproducible lesson, since no unit test can reach either:
     ordinary source promoted by a flag (`cl /interface`, `-fmodule-output`,
     `--precompile`, and `/Yc` for the precompiled-header case).
 
+- **A MACRO SWITCH leaves the dispatched line and nothing else.** `-D`, `-U` and their
+  MSVC spellings are dropped from what the worker is sent, and kept by the preprocess line
+  and by the key. The worker compiles PREPROCESSED text, so every macro a definition
+  introduced has already been expanded on the client -- including a
+  `#include CONFIG_HEADER` resolved through one, whose file the worker never opens. It is
+  the include directories' argument one step further along, and it is a NARROWING of what
+  reaches the worker rather than a permission.
+  - **Not a `PathValues` row**, although a path-valued `-D` is what exposed it: that table
+    has three consumers and a macro must reach two of them untouched. The key hashes the
+    text the definitions produced, so canonicalizing a macro's value would be a key change
+    with no cause. One table per question.
+  - **What this cost while it was missing is the point.** `CouldNameAFile` is the walk's
+    last word and refuses the WHOLE command line for one unrecognised argument -- which is
+    correct, since stripping an unknown one could change the generated code. An unrecognised
+    `-DFOO="/abs/path"` therefore made the translation unit undispatchable, and this
+    project's own build passes `-DFASTCACHED_SOURCE_DIR`. **Every** TU compiled locally, one
+    stderr line each, `dispatched 0` and `never-picked n of n` on the fleet page, and **no
+    counter anywhere** -- the fleet is not refusing jobs, it is never offered any. Any
+    project passing a source root, a config directory or a version string with a slash in it
+    gets the same silence, which is #226's shape reached through the launcher.
+  - **It is PREFIX-matched, so the collision question is asked of the DRIVERS.** Measured
+    rather than remembered: `g++ --help` over eight option groups (1401 options, with
+    `-D<macro>`/`-U<macro>` as the positive control) and `cl /?` both have no other option
+    beginning with an upper-case `D` or `U`. Case is load-bearing and the near-miss is one
+    character away -- `cl` has `/u` and `/utf-8`, which this repository passes to every MSVC
+    compile, so a matcher folding case would swallow them. The first census written for that
+    comment folded case by accident and reported all three as collisions.
+
 - **The worker's argument filter is an ALLOWLIST, not a shape-based denylist**
   (`IsAcceptableJobArgument`, `CompileJob.cpp`). The client's arguments are spliced
   into the compiler's command line verbatim, and the compile port carries no

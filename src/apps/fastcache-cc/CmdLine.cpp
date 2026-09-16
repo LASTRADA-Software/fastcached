@@ -435,6 +435,62 @@ namespace
         { .spelling = "-o", .role = PathValueRole::ObjectOutput, .families = DriverFamily::Any },
     } };
 
+    // --- macro switches -----------------------------------------------------
+    //
+    // Dropped from the DISPATCHED command line and from nowhere else, which is why they
+    // are a table of their own rather than rows of `PathValues`. That table has three
+    // consumers and a macro must reach two of them untouched: the PREPROCESS line needs
+    // every definition (it is still expanding them), and the KEY hashes the text they
+    // produced -- so rewriting a macro value to a canonical token would be a key change
+    // with no cause behind it.
+    //
+    // Dropping them from the WORKER line changes no generated code, by the include
+    // directories own argument one step further along: dispatch sends PREPROCESSED text,
+    // so every macro a definition introduced has already been expanded on the client --
+    // including a `#include CONFIG_HEADER` resolved through one, whose file the worker
+    // never opens. `-D` is a preprocessor switch and the preprocessing is over. This is a
+    // NARROWING of what reaches the worker, not a permission.
+    //
+    // Before #1481 these were unrecognised, so `CouldNameAFile` refused a path-valued
+    // `-DFOO="/abs/path"` -- and with it the WHOLE command line, which is the only safe
+    // answer for an argument the walk does not know. That is this project own build
+    // (`FASTCACHED_SOURCE_DIR`) and any project passing a source root, a config directory
+    // or a version string with a slash in it: no dispatch at all, one stderr line per
+    // translation unit, and no counter anywhere.
+    //
+    // These are PREFIX-matched, so the `-c`-swallows-`-coverage` hazard applies and was
+    // MEASURED against both drivers rather than remembered. Asked of `g++ --help` over
+    // eight option groups (1401 options, with `-D<macro>` and `-U<macro>` as the positive
+    // control) and of `cl /?`: neither family has any other option beginning with an
+    // upper-case `D` or `U`. `/DEBUG` and `/DLL` are LINKER options and reach `link`, not
+    // `cl`.
+    //
+    // **Upper case is load-bearing, and the near-miss is one character away**: `cl` has
+    // `/u` (remove ALL predefined macros) and `/utf-8`, both LOWER case, so a matcher that
+    // folded case would swallow `/utf-8` -- which this repository passes to every MSVC
+    // compile. `MatchesFlag` compares case-sensitively through `starts_with`, so they
+    // cannot collide. The first census written for this comment folded case by accident
+    // and reported all three as collisions, which is how they came to be named here.
+
+    /// A macro switch, and which families spell it that way.
+    struct MacroFlag
+    {
+        /// The flag, bare. Its value may be fused on or given as the next argument.
+        std::string_view spelling;
+
+        /// Which driver families accept this spelling.
+        DriverFamily families;
+    };
+
+    /// The macro switches. A `/`-led row is Msvc-only for the reason `PathValues` gives:
+    /// under a POSIX layout `/D` is the head of an absolute path rather than an option.
+    constexpr std::array<MacroFlag, 4> MacroFlags { {
+        { .spelling = "-D", .families = DriverFamily::Any },
+        { .spelling = "-U", .families = DriverFamily::Any },
+        { .spelling = "/D", .families = DriverFamily::Msvc },
+        { .spelling = "/U", .families = DriverFamily::Msvc },
+    } };
+
     /// One flag that makes a compile write a second artefact, and which families
     /// spell it that way.
     struct SideArtefactFlag
@@ -663,16 +719,21 @@ namespace
 
     /// True if `flag`, given bare, consumes the following argument as its value.
     ///
-    /// Every path-valued flag does, and nothing else the launcher knows about
-    /// does — which is why this is a lookup in the shared table rather than a
-    /// list of its own. It used to be one, and the object output ended up
-    /// relativized in the spelling that table happened to cover.
+    /// TWO tables, because there are two kinds. Every path-valued flag takes a value and
+    /// so does every macro switch; nothing else the launcher knows about does. This
+    /// consulted `PathValues` alone, above a comment stating that was the whole set --
+    /// true until #1481, whose rows are the first value-taking flags carrying no path.
+    ///
+    /// Still a LOOKUP rather than a list of its own, for the reason that comment gave: it
+    /// used to be a list, and the object output ended up relativized in the one spelling
+    /// that list happened to cover.
     ///
     /// @param flag The flag as it appeared on the command line.
     /// @return True when the next argument belongs to it.
     [[nodiscard]] bool TakesValue(std::string_view flag)
     {
-        return std::ranges::any_of(PathValues, [flag](PathValueFlag const& row) { return row.spelling == flag; });
+        return std::ranges::any_of(PathValues, [flag](PathValueFlag const& row) { return row.spelling == flag; })
+               || std::ranges::any_of(MacroFlags, [flag](MacroFlag const& row) { return row.spelling == flag; });
     }
 
     /// Characters that may separate a flag from a value fused onto it.
@@ -728,6 +789,30 @@ namespace
     [[nodiscard]] bool MatchesFlag(std::string_view arg, std::string_view flag)
     {
         return arg == flag || IsJoinedValue(arg, flag);
+    }
+
+    /// Is `arg` a macro switch this context spells, and where is its value?
+    ///
+    /// @param arg         The argument as it appeared on the command line.
+    /// @param introducers Which characters start an option here.
+    /// @param families    Which family spellings may match.
+    /// @return Nullopt when it is not a macro switch; true when its value is the NEXT
+    ///         argument, false when the value is fused on.
+    [[nodiscard]] std::optional<bool> MatchMacroFlag(std::string_view arg,
+                                                     std::string_view introducers,
+                                                     DriverFamily families)
+    {
+        if (arg.empty() || !introducers.contains(arg.front()))
+            return std::nullopt;
+        for (MacroFlag const& row: MacroFlags)
+        {
+            if (!introducers.contains(row.spelling.front()) || !Overlaps(row.families, families))
+                continue;
+            if (!MatchesFlag(arg, row.spelling))
+                continue;
+            return arg.size() == row.spelling.size();
+        }
+        return std::nullopt;
     }
 
     /// Whether `arg` states the input language explicitly.
@@ -1334,6 +1419,19 @@ std::expected<std::vector<std::string>, std::string> RemoteCompileArgs(ParsedCom
             // The separated `-x c++` form owns the next argument too, and leaving
             // its value behind would hand the worker a bare `c++` to open as a file.
             if (a == row->spelling && i + 1 < argv.size())
+                skipUntil = i + 2;
+            continue;
+        }
+
+        // Every macro definition, and only here -- the preprocess line and the key keep
+        // them (#1481). ABOVE the positive check below, which is what used to refuse a
+        // path-valued one and with it every other argument on the line.
+        if (auto const valueIsNext = MatchMacroFlag(a, IntroducersOf(driver.family), driver.family))
+        {
+            // Only a bare occurrence owns the successor. Eating it after a fused form
+            // would drop a real flag -- and leaving it after a bare one would strand the
+            // definition as a stray input file for the worker to open.
+            if (*valueIsNext && i + 1 < argv.size())
                 skipUntil = i + 2;
             continue;
         }
