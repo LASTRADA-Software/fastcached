@@ -3294,6 +3294,22 @@ makes it anyway and says so there.
   test leg's compile database and plants a flag it must refuse, each Package job asks the build that
   ships through `scripts/check-instruction-set-flags.sh`, and `ctest -R target-pragmas` refuses a
   target pragma under `src/` (#1442). What neither covers is listed in the checks' headers.
+  - **And nothing made a FUTURE shipping configure get that step** (#1450). #1442 put it into the
+    three `Package` jobs, and that step is the only thing reading what SHIPS -- the macOS package is
+    configured by a hand-written `cmake` line no `ctest` leg configures. A fourth packaging job, a
+    new configure line in an existing one, or the step reordered below the build would ship
+    unchecked, and **every required context would stay green, because `Package` jobs are not
+    required contexts.** `ctest -R shipping-configure-guard` selects on the
+    `-DFASTCACHED_BUILD_TESTS=OFF` FLAG rather than on three job names, so a fourth job is something
+    it FINDS; it matches the guard on that configure's own build directory, not merely on the job,
+    because a copied step naming another configure's database is the likeliest wrong shape and a
+    per-job existence test cannot see it. Four verdicts rather than one flag -- same job, before the
+    build, no `if:`, no `continue-on-error:` -- because a condition is how a step REPORTS without
+    gating and `continue-on-error` is how it GATES without failing, and a refusal naming the wrong
+    one sends somebody to delete the wrong line. `Dockerfile` carries a shipping configure and is
+    exempt BY ROW with its reason (the image reaches no registry, and `docker build`'s filesystem
+    holds no database the job can read); a row matching nothing is refused as stale. **Zero shipping
+    configures is a REFUSAL**, because every verdict here is about something missing.
   - **A global flag is wrong even when it is set on one file.** A translation unit built with
     `-msha -msse4.1` emits its own out-of-line copies of every inline function it uses:
     `std::span::subspan`, the `views::iota` iterator, and so on. The linker keeps one arbitrary
