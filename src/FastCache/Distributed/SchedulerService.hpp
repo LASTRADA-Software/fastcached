@@ -13,6 +13,7 @@
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -80,6 +81,130 @@ enum class Membership : std::uint8_t
     /// The count, for a table over this enum.
     Last,
 };
+
+/// Which participant in the admission fold produced an answer.
+///
+/// Admission is a fold over several routes and the question an operator asks after changing one
+/// of them is *which one decided* -- an operator who drops a host from `--fleet-member` and finds
+/// it still served needs to know the cluster admitted it (#1471).
+/// **There is no `None`.** An empty `MembershipParticipantSet` already says nobody decided, and
+/// an enumerator meaning *nothing* would be a contradiction the moment it can sit in a set beside
+/// a real route: a decision could then claim both that the cluster admitted a host and that no
+/// route did. One fact, one representation.
+///
+/// A private, in-process enum -- no wire and no file carries it -- so only the zero value is
+/// spelled and the rest may be reordered freely.
+enum class MembershipParticipant : std::uint8_t
+{
+    /// `--fleet-member`'s host list: a client admitted locally, which never joins consensus.
+    FleetMemberList = 0,
+    /// The cluster's committed member set.
+    ClusterMembers,
+    /// A `--cluster-forget-client` tombstone. Outranks every admission route, so when this is
+    /// the answer it is always the one that decided.
+    ClientTombstone,
+    /// A policy that admits everybody (`OpenMembership`): one machine, or a fleet whose
+    /// reachability is its boundary.
+    OpenPolicy,
+    /// The count, for a table over this enum.
+    Last,
+};
+
+/// Which routes produced an answer: a set, never one winner.
+///
+/// **A set because more than one route can be right at once, and reporting one of them is the
+/// defect this ticket is about.** Admission is a fold by `PrecedenceOf`, and two routes answering
+/// `Member` tie -- a host may sit in `--fleet-member` AND in the cluster's committed set. Keeping
+/// only the first is not a simplification, it is a wrong answer to the operator's actual question:
+/// told `FleetMemberList` decided, they remove the host from `--fleet-member` and find it still
+/// served by the cluster, which is the scenario #1471 opens with.
+///
+/// Empty means nobody decided -- the fold consulted no participant, or every one answered
+/// `Outsider`, which is a refusal by ABSENCE rather than by row. That is the same distinction this
+/// tree draws for `--allow-compile-arg`, and it is why there is no `None` enumerator to collide
+/// with it.
+struct MembershipParticipantSet
+{
+    /// One bit per enumerator, indexed by its value.
+    std::uint8_t bits { 0 };
+
+    static_assert(static_cast<std::size_t>(MembershipParticipant::Last) <= 8,
+                  "MembershipParticipantSet holds one bit per participant in a std::uint8_t; a "
+                  "sixth route needs a wider mask here, and the failure must be a BUILD error "
+                  "rather than a silently dropped attribution");
+
+    /// @param participant The route to include.
+    /// @return This set, with @p participant added.
+    constexpr MembershipParticipantSet& Add(MembershipParticipant participant) noexcept
+    {
+        bits |= static_cast<std::uint8_t>(1U << static_cast<unsigned>(participant));
+        return *this;
+    }
+
+    /// @param other Routes to include as well.
+    /// @return This set, unioned with @p other.
+    constexpr MembershipParticipantSet& Add(MembershipParticipantSet other) noexcept
+    {
+        bits |= other.bits;
+        return *this;
+    }
+
+    /// @param participant The route to ask about.
+    /// @return Whether @p participant is in this set.
+    [[nodiscard]] constexpr bool Has(MembershipParticipant participant) const noexcept
+    {
+        return (bits & static_cast<std::uint8_t>(1U << static_cast<unsigned>(participant))) != 0;
+    }
+
+    /// @return Whether no route decided.
+    [[nodiscard]] constexpr bool Empty() const noexcept
+    {
+        return bits == 0;
+    }
+
+    /// @return How many routes decided.
+    [[nodiscard]] constexpr std::size_t Count() const noexcept
+    {
+        return static_cast<std::size_t>(std::popcount(bits));
+    }
+
+    [[nodiscard]] constexpr bool operator==(MembershipParticipantSet const&) const = default;
+};
+
+/// One admission answer and every route that produced it.
+///
+/// Returned by the seam's ONE virtual, so the figure a status verb reports and the verdict a
+/// surface enforces are the same computation rather than two folds kept in step by discipline.
+struct MembershipDecision
+{
+    Membership verdict { Membership::Outsider }; ///< What the fold concluded.
+    MembershipParticipantSet decidedBy {};       ///< Every route that concluded it.
+
+    [[nodiscard]] bool operator==(MembershipDecision const&) const = default;
+};
+
+/// A verdict with @p participant named as its author -- EXCEPT `Outsider`.
+///
+/// **`Outsider` is never attributed.** It is `PrecedenceOf` 0 and loses to every other
+/// participant: an oracle answering it has no OPINION about the caller rather than an answer it
+/// produced. A forgotten-client list answers `Outsider` about loopback deliberately -- "the
+/// tombstone says nothing about this machine" -- and naming the author of a silence would report
+/// the tombstone as the reason a host was refused when the tombstone never mentioned it. That
+/// confident wrong signal is the thing #1471 exists to remove, so the rule is asked here and
+/// nowhere else.
+///
+/// A free function rather than a member, because the rule is a property of this VOCABULARY and is
+/// true of every `IMembershipOracle`: it began as a protected member of `HostSetMembership`, where
+/// five of the six implementations could not reach it and each would have restated it.
+/// @param verdict What the oracle answered.
+/// @param participant Which route it is, used only when the verdict is not `Outsider`.
+/// @return The verdict, attributed unless it is `Outsider`.
+[[nodiscard]] constexpr MembershipDecision DecidedBy(Membership verdict, MembershipParticipant participant) noexcept
+{
+    if (verdict == Membership::Outsider)
+        return {};
+    return { .verdict = verdict, .decidedBy = MembershipParticipantSet {}.Add(participant) };
+}
 
 /// Which answer wins when several oracles disagree: **forgotten beats member beats
 /// outsider**.

@@ -54,11 +54,17 @@ class ListedMembership final: public Distributed::IMembershipOracle
     {
     }
 
-    /// @copydoc Distributed::IMembershipOracle::Classify
-    [[nodiscard]] Distributed::Membership Classify(std::string_view peerAddress) const override
+    /// @copydoc Distributed::IMembershipOracle::Explain
+    ///
+    /// Names `FleetMemberList`, because that is the route this fake stands for: it models
+    /// `--fleet-member`'s host list. Through `DecidedBy`, so a miss stays unattributed
+    /// rather than claiming the list refused a host it never mentioned (#1471).
+    [[nodiscard]] Distributed::MembershipDecision Explain(std::string_view peerAddress) const override
     {
-        return std::ranges::find(_members, peerAddress) != _members.end() ? Distributed::Membership::Member
-                                                                          : Distributed::Membership::Outsider;
+        return Distributed::DecidedBy(std::ranges::find(_members, peerAddress) != _members.end()
+                                          ? Distributed::Membership::Member
+                                          : Distributed::Membership::Outsider,
+                                      Distributed::MembershipParticipant::FleetMemberList);
     }
 
   private:

@@ -479,7 +479,8 @@ TEST_CASE("(#290) one peer on one listener has a FETCH refused and a COMPILE adm
     // Admitted. Without this the FETCH would be refused for membership and the case
     // would pass having tested nothing about the merge -- and the compile would be
     // refused too, so there would be no contrast at all.
-    Distributed::ClusterMembership const membership { { "10.0.0.1:7000" } };
+    Distributed::ClusterMembership const membership { Distributed::MembershipParticipant::FleetMemberList,
+                                                      { "10.0.0.1:7000" } };
     REQUIRE(membership.Classify("10.0.0.1") == Distributed::Membership::Member);
     REQUIRE_FALSE(locality.IsThisMachine("10.0.0.1"));
 

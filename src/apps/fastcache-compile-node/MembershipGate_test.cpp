@@ -43,10 +43,14 @@ class FixedMembership: public Distributed::IMembershipOracle
     }
 
     /// @param peerAddress Ignored.
-    /// @return The fixed verdict.
-    [[nodiscard]] Distributed::Membership Classify(std::string_view /*peerAddress*/) const override
+    /// @return The fixed verdict, attributed to the cluster's set unless it is `Outsider`.
+    ///
+    /// The gate's subject is WHETHER a caller is refused, not by whom, so this names one
+    /// route and holds it fixed. `DecidedBy` keeps `Outsider` unattributed even here, so a
+    /// gate case can never be the thing that establishes the opposite convention.
+    [[nodiscard]] Distributed::MembershipDecision Explain(std::string_view /*peerAddress*/) const override
     {
-        return _verdict;
+        return Distributed::DecidedBy(_verdict, Distributed::MembershipParticipant::ClusterMembers);
     }
 
   private:

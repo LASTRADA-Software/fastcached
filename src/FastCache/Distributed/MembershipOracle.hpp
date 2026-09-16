@@ -35,10 +35,28 @@ class IMembershipOracle
     IMembershipOracle(IMembershipOracle&&) = default;
     IMembershipOracle& operator=(IMembershipOracle&&) = default;
 
-    /// Classify one caller.
+    /// Classify one caller, and say which participant decided.
+    ///
+    /// **The one door.** `Classify` below is derived from this rather than declared beside it,
+    /// so an implementation cannot answer the enforced question and the reported one
+    /// differently (#1471).
     /// @param peerAddress The address the connection came from, as text.
-    /// @return Whether that peer may be scheduled onto the fleet.
-    [[nodiscard]] virtual Membership Classify(std::string_view peerAddress) const = 0;
+    /// @return The verdict and the route that produced it.
+    [[nodiscard]] virtual MembershipDecision Explain(std::string_view peerAddress) const = 0;
+
+    /// Whether that peer may be scheduled onto the fleet.
+    ///
+    /// **Non-virtual, and that is load-bearing.** Left virtual this is a second door: an
+    /// implementation could override it inconsistently with `Explain`, and the answer a
+    /// `--node-status` reports would have a separate place to be right from the answer a surface
+    /// enforces. The reported and the enforced answer being one computation is the whole point
+    /// of #1471 -- two folds over the same data are kept in step by nothing.
+    /// @param peerAddress The address the connection came from, as text.
+    /// @return `Explain(peerAddress).verdict`.
+    [[nodiscard]] Membership Classify(std::string_view peerAddress) const
+    {
+        return Explain(peerAddress).verdict;
+    }
 };
 
 /// Everyone is a member.
@@ -52,9 +70,9 @@ class IMembershipOracle
 class OpenMembership final: public IMembershipOracle
 {
   public:
-    [[nodiscard]] Membership Classify(std::string_view /*peerAddress*/) const override
+    [[nodiscard]] MembershipDecision Explain(std::string_view /*peerAddress*/) const override
     {
-        return Membership::Member;
+        return DecidedBy(Membership::Member, MembershipParticipant::OpenPolicy);
     }
 };
 
@@ -102,16 +120,36 @@ class AnyOfMembership final: public IMembershipOracle
     /// nothing to warn anybody. A forget must also OUTRANK a listing, because the host an
     /// operator has just forgotten in the cluster is exactly the one still named by
     /// `--fleet-member` on a node nobody has reconfigured yet.
-    [[nodiscard]] Membership Classify(std::string_view peerAddress) const override
+    [[nodiscard]] MembershipDecision Explain(std::string_view peerAddress) const override
     {
-        auto verdict = Membership::Outsider;
+        // The same fold, carrying every route that produced the winning verdict rather than
+        // only the verdict. The reported set is then by definition the routes whose answer won,
+        // which is what makes the reported and the enforced answer one computation (#1471).
+        //
+        // **REPLACE on a higher precedence, UNION on a tie**, and the tie arm is the load-bearing
+        // one. Two routes answering `Member` are BOTH right -- a host can sit in `--fleet-member`
+        // and in the committed set at once -- so keeping the first would report one true route and
+        // hide another. An operator told only `FleetMemberList` removes the host from
+        // `--fleet-member` and finds it still served, which is the scenario this ticket opens
+        // with: the fix would have reproduced the defect it exists to remove.
+        //
+        // The initial value is `{Outsider, {}}` and stays so when every participant answers
+        // `Outsider`: nobody decided, and the refusal is by ABSENCE rather than by row. Those are
+        // different facts and an operator asking why a host is refused needs the difference. An
+        // `Outsider` answer carries an empty set (`DecidedBy` refuses to attribute one), so the
+        // tie arm unions nothing and the distinction survives the fold.
+        auto decision = MembershipDecision {};
         for (auto const* participant: _participants)
         {
-            auto const answer = participant->Classify(peerAddress);
-            if (PrecedenceOf(answer) > PrecedenceOf(verdict))
-                verdict = answer;
+            auto const answer = participant->Explain(peerAddress);
+            auto const rank = PrecedenceOf(answer.verdict);
+            auto const winning = PrecedenceOf(decision.verdict);
+            if (rank > winning)
+                decision = answer;
+            else if (rank == winning)
+                decision.decidedBy.Add(answer.decidedBy);
         }
-        return verdict;
+        return decision;
     }
 
   private:
@@ -191,8 +229,15 @@ class HostSetMembership: public IMembershipOracle
     ///        the host part is retained; see the class note.
     /// @param verdicts What this set answers on a match and for this machine.
     /// @param memberEndpoints `host:port` endpoints. Only the host part is retained.
-    explicit HostSetMembership(HostSetVerdicts verdicts, std::vector<std::string> const& memberEndpoints = {}):
-        _verdicts { verdicts }
+    /// @param participant Which route this list IS, for a report that must name the
+    ///        participant that DECIDED (#1471). Required rather than defaulted: a node owns
+    ///        one instance per question, so a default would make two lists
+    ///        indistinguishable in a report, which is the question this answers.
+    explicit HostSetMembership(HostSetVerdicts verdicts,
+                               MembershipParticipant participant,
+                               std::vector<std::string> const& memberEndpoints = {}):
+        _verdicts { verdicts },
+        _participant { participant }
     {
         Publish(memberEndpoints);
     }
@@ -254,8 +299,8 @@ class HostSetMembership: public IMembershipOracle
 
     /// @param peerAddress The connecting peer's **host**, as `ISocket::PeerAddress()`
     ///        reports it. Never an endpoint; see the class note.
-    /// @return Whether that peer may be scheduled onto the fleet.
-    [[nodiscard]] Membership Classify(std::string_view peerAddress) const override
+    /// @return The verdict and, unless it is `Outsider`, this list as its author.
+    [[nodiscard]] MembershipDecision Explain(std::string_view peerAddress) const override
     {
         // This machine is always a member of its own node's fleet, whatever the list
         // says, and that is a rule rather than a convenience. Anti-leeching exists to
@@ -270,7 +315,7 @@ class HostSetMembership: public IMembershipOracle
         // its own machine and nothing else, so it is useful immediately and closed to
         // the network until somebody says otherwise.
         if (IsLoopbackHost(peerAddress))
-            return _verdicts.onLoopback;
+            return Decided(_verdicts.onLoopback);
 
         // A shared lock: this is asked once per connection on three surfaces and
         // written only when the cluster agrees a change, so readers must not
@@ -296,13 +341,30 @@ class HostSetMembership: public IMembershipOracle
         auto const admits = [peerAddress](std::string_view host) {
             return SameHost(peerAddress, host);
         };
-        return std::ranges::any_of(_hosts, admits) ? _verdicts.onMatch : Membership::Outsider;
+        return Decided(std::ranges::any_of(_hosts, admits) ? _verdicts.onMatch : Membership::Outsider);
+    }
+
+  protected:
+    /// A verdict with this list named as its author -- EXCEPT `Outsider`.
+    ///
+    /// `Outsider` is `PrecedenceOf` 0 and loses to every other participant: it is this oracle
+    /// having no OPINION rather than an answer it produced. A forgotten list answers `Outsider`
+    /// about loopback deliberately -- "silence about this machine" -- and naming the author of a
+    /// silence would report a tombstone as the reason a host is refused when the tombstone said
+    /// nothing about it. That is the confident wrong signal #1471 exists to remove, so the
+    /// attribution is asked here once rather than at each return.
+    /// @param verdict What this list answered.
+    /// @return The verdict, attributed unless it is `Outsider`.
+    [[nodiscard]] MembershipDecision Decided(Membership verdict) const noexcept
+    {
+        return DecidedBy(verdict, _participant);
     }
 
   private:
     /// What this set answers. Fixed at construction: the question a set answers is
     /// what the set IS, where its contents are what changes while it lives.
     HostSetVerdicts _verdicts;
+    MembershipParticipant _participant;
 
     /// Guards `_hosts`. Mutable because `Classify` and `Size` are logically const
     /// and must still take it -- the alternative is a const method that reads a
@@ -321,10 +383,15 @@ class HostSetMembership: public IMembershipOracle
 class ClusterMembership final: public HostSetMembership
 {
   public:
+    /// @param participant Which route this list IS: `FleetMemberList` for what
+    ///        `--fleet-member` named, `ClusterMembers` for the committed set. A node owns one
+    ///        instance per question (`NodeMembership`'s `_listed` and `_cluster`), so this is a
+    ///        property of the INSTANCE and required rather than defaulted -- defaulted, the two
+    ///        would be indistinguishable in a report, which is the question #1471 answers.
     /// @param memberEndpoints `host:port` endpoints of the admitted hosts. Only the
     ///        host part is retained; see `HostSetMembership`.
-    explicit ClusterMembership(std::vector<std::string> const& memberEndpoints = {}):
-        HostSetMembership { AdmissionVerdicts, memberEndpoints }
+    explicit ClusterMembership(MembershipParticipant participant, std::vector<std::string> const& memberEndpoints = {}):
+        HostSetMembership { AdmissionVerdicts, participant, memberEndpoints }
     {
     }
 };
@@ -348,7 +415,8 @@ class ForgottenMembership final: public HostSetMembership
     /// @param hosts The forgotten hosts, as `Cluster::ClusterState::forgotten` holds
     ///        them: bare hosts, though an endpoint would be reduced to one anyway.
     explicit ForgottenMembership(std::vector<std::string> const& hosts = {}):
-        HostSetMembership { ForgottenVerdicts, hosts }
+        // One role, so unlike `ClusterMembership` this names it rather than taking it.
+        HostSetMembership { ForgottenVerdicts, MembershipParticipant::ClientTombstone, hosts }
     {
     }
 };

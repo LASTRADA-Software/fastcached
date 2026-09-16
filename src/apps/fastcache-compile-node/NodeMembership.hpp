@@ -108,8 +108,12 @@ class NodeMembership final: public Distributed::IMembershipOracle
     /// @param logger Where an unreadable `fleet-open` row is reported, once.
     NodeMembership(NodeConfig const& cfg, ILogger& logger):
         _open {},
-        _listed { cfg.fleetMembers },
-        _cluster {},
+        // The two lists differ in nothing but the QUESTION they answer, which is why each is
+        // told which route it is rather than deriving it from its type (#1471). An operator who
+        // removes a host from `--fleet-member` and finds it still served is asking exactly this,
+        // and before this both answered a bare `Member`.
+        _listed { Distributed::MembershipParticipant::FleetMemberList, cfg.fleetMembers },
+        _cluster { Distributed::MembershipParticipant::ClusterMembers },
         _forgotten {},
         // Pointers into this object's own members, which is safe because the type is
         // neither copyable nor movable and the composites are declared after all four.
@@ -172,13 +176,18 @@ class NodeMembership final: public Distributed::IMembershipOracle
         _listed.Publish(cfg.fleetMembers);
     }
 
-    /// @copydoc Distributed::IMembershipOracle::Classify
+    /// @copydoc Distributed::IMembershipOracle::Explain
     ///
     /// One atomic read of the flag per request, so a caller is judged by one policy or
     /// the other and never by half of each.
-    [[nodiscard]] Distributed::Membership Classify(std::string_view peerAddress) const override
+    ///
+    /// It attributes nothing of its own: whichever policy answered names ITSELF, so an
+    /// operator reading a refusal sees `OpenPolicy`, `FleetMemberList`, `ClusterMembers`
+    /// or `ClientTombstone` rather than "the node" -- which is the question #1471 asks
+    /// and the one this delegation is already the right shape for.
+    [[nodiscard]] Distributed::MembershipDecision Explain(std::string_view peerAddress) const override
     {
-        return _isOpen.load(std::memory_order_relaxed) ? _openly.Classify(peerAddress) : _admitted.Classify(peerAddress);
+        return _isOpen.load(std::memory_order_relaxed) ? _openly.Explain(peerAddress) : _admitted.Explain(peerAddress);
     }
 
     /// Record what the cluster agreed, alongside what the operator listed.
