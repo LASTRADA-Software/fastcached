@@ -63,7 +63,11 @@ std::vector<std::string> ParseGnuIncludeSearchPaths(std::string_view verboseOutp
     std::vector<std::string> paths;
     bool inList = false;
 
-    for (std::size_t pos = 0; pos <= verboseOutput.size();)
+    // A `while`, because the head never advanced anything: `pos` moves by what the find
+    // returned, which is only known inside. The `<=` is deliberate -- one pass past the last
+    // newline is what makes a trailing field visible -- so this is not `views::split`.
+    auto pos = std::size_t { 0 };
+    while (pos <= verboseOutput.size())
     {
         auto const newline = verboseOutput.find('\n', pos);
         auto line = verboseOutput.substr(pos, newline == std::string_view::npos ? std::string_view::npos : newline - pos);
@@ -109,7 +113,10 @@ std::vector<std::string> ParseGnuIncludeSearchPaths(std::string_view verboseOutp
 std::vector<std::string> ParseIncludeEnvironment(std::string_view value)
 {
     std::vector<std::string> paths;
-    for (std::size_t pos = 0; pos <= value.size();)
+    // See `ParseGnuIncludeSearchPaths`: the bound is `<=` on purpose and the advance depends
+    // on the separator found, so the head had nothing to say and this is a `while`.
+    auto pos = std::size_t { 0 };
+    while (pos <= value.size())
     {
         auto const sep = value.find(';', pos);
         auto const entry = Trim(value.substr(pos, sep == std::string_view::npos ? std::string_view::npos : sep - pos));
@@ -281,7 +288,9 @@ ToolchainFileScan ProbeToolchainFiles(std::span<std::string const> roots, IParal
         scan.complete = false;
 
     scan.files.reserve(pending.size());
-    for (std::size_t index = 0; index < pending.size(); ++index)
+    // `pending`, `unreadable` and `hashed` are parallel, so what is iterated is the INDEX
+    // rather than any one of them.
+    for (auto const index: std::views::iota(std::size_t { 0 }, pending.size()))
     {
         if (unreadable[index] != 0)
         {
@@ -441,7 +450,9 @@ namespace
     template <typename Extract>
     [[nodiscard]] std::string FirstLineAnswering(std::string_view text, Extract extract)
     {
-        for (std::size_t pos = 0; pos <= text.size();)
+        // As the two parsers above: an empty increment clause is a `while` in `for` syntax.
+        auto pos = std::size_t { 0 };
+        while (pos <= text.size())
         {
             auto const newline = text.find('\n', pos);
             auto line = text.substr(pos, newline == std::string_view::npos ? std::string_view::npos : newline - pos);
@@ -480,7 +491,10 @@ namespace
     [[nodiscard]] std::vector<std::string_view> SplitDriverLine(std::string_view line)
     {
         std::vector<std::string_view> tokens;
-        for (std::size_t pos = 0; pos < line.size();)
+        // A consumer rather than a splitter -- `<`, not `<=` -- and the amount consumed
+        // depends on whether a quote was found, so the advance cannot live in a head.
+        auto pos = std::size_t { 0 };
+        while (pos < line.size())
         {
             if (line[pos] == ' ' || line[pos] == '\t')
             {

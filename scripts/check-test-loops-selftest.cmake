@@ -89,6 +89,31 @@ set(canaryFile
 ")
 set(liveFile "void Beat(std::atomic<bool>* stopping) { while (!stopping->load(std::memory_order_acquire)) Sleep(); }\n")
 
+# `src/apps/fastcache-cc/ToolchainProbe.cpp`'s row: a recursive_directory_iterator advanced by
+# the error-code overload. ONLY the exempted loop, so this file contributes no unbacklogged site.
+set(probeFile
+"void Walk(std::filesystem::recursive_directory_iterator it, std::error_code& ec)
+{
+    std::filesystem::recursive_directory_iterator const end;
+    for (; it != end; it.increment(ec))
+        ;
+}
+")
+# `src/apps/fastcache-cc/ProcessRunner.cpp` carries TWO rows, so its file carries both sites:
+# the Windows double-NUL environment block and the POSIX NULL-terminated `char**` array.
+set(runnerFile
+"void Windows(char const* inherited)
+{
+    for (char const* cursor = inherited; *cursor != '\\0';)
+        cursor += 1;
+}
+void Posix(char** inherited)
+{
+    for (char** entry = inherited; entry != nullptr && *entry != nullptr; ++entry)
+        ;
+}
+")
+
 # ---------------------------------------------------------------------------
 # Stage a tree, apply one mutation, run the check, return its collapsed output.
 function(fastcached_stage_and_run name target from to backlog outOutput outApplied)
@@ -124,8 +149,10 @@ function(fastcached_stage_and_run name target from to backlog outOutput outAppli
         "src/FastCache/Core/Clean_test.cpp"
         "src/tests/Helper.hpp"
         "src/tests/TsanCanary.cpp"
-        "src/FastCache/Protocol/LiveStreamReactors_test.cpp")
-    set(texts cleanFile helperHeader canaryFile liveFile)
+        "src/FastCache/Protocol/LiveStreamReactors_test.cpp"
+        "src/apps/fastcache-cc/ToolchainProbe.cpp"
+        "src/apps/fastcache-cc/ProcessRunner.cpp")
+    set(texts cleanFile helperHeader canaryFile liveFile probeFile runnerFile)
     list(LENGTH files stagedCount)
     math(EXPR lastStaged "${stagedCount} - 1")
     foreach(index RANGE 0 ${lastStaged})
@@ -236,12 +263,12 @@ endfunction()
 set(FastCachedTestLoopCases
     # The baseline, in both enumeration modes. Every refusal below is evidence only if
     # these pass -- and they pass only while every exemption row still matches its site.
-    "baseline via walk|none|-|-|no new C-style loop && directory walk (no git index) && 4 exempted site(s) in 2 row(s)|CMake Error|-"
+    "baseline via walk|none|-|-|no new C-style loop && directory walk (no git index) && 7 exempted site(s) in 5 row(s)|CMake Error|-"
     "baseline via git|none-git|-|-|no new C-style loop && git ls-files|CMake Error|-"
     # A tree inside another checkout is walked, not read from that checkout's index, which
     # knows none of it. Asking "inside a work tree" instead of "at its top" refused every
     # case when ctest staged them under the gate's build directory.
-    "baseline nested in another checkout|none-nested|-|-|no new C-style loop && directory walk (no git index) && 4 exempted site(s) in 2 row(s)|CMake Error|-"
+    "baseline nested in another checkout|none-nested|-|-|no new C-style loop && directory walk (no git index) && 7 exempted site(s) in 5 row(s)|CMake Error|-"
     "a counting loop nested in another checkout|newfile-nested|src/FastCache/Core/Fresh_test.cpp|int F()~n~{~n~    for (int i = 0~sc~ i < 3~sc~ ++i)~n~        Use(i)~sc~~n~}~n~|src/FastCache/Core/Fresh_test.cpp:3: a C-style for loop && directory walk (no git index)|-|-"
 
     # THE RED ARM.

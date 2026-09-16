@@ -20,6 +20,7 @@
 #include <format>
 #include <fstream>
 #include <map>
+#include <ranges>
 #include <sstream>
 #include <string_view>
 #include <utility>
@@ -1116,7 +1117,7 @@ namespace
         constexpr double Gap = 2.0;
         auto const barWidth = (chartWidth - (Gap * static_cast<double>(binCount - 1))) / static_cast<double>(binCount);
         constexpr double MinBarHeight = 3.0; // a present-but-empty bucket still shows a sliver
-        for (std::size_t i = 0; i < binCount; ++i)
+        for (auto const i: std::views::iota(std::size_t { 0 }, binCount))
         {
             // Parenthesized to defeat windows.h's function-style max() macro:
             // this TU is not built with NOMINMAX (it deliberately avoids
@@ -1201,7 +1202,7 @@ namespace
         auto const maxVolume =
             std::ranges::max_element(days, {}, [](auto const& entry) { return entry.second.volume; })->second.volume;
         constexpr double BarBand = 30.0;
-        for (std::size_t i = 0; i < n; ++i)
+        for (auto const i: std::views::iota(std::size_t { 0 }, n))
         {
             auto const volume = days[i].second.volume;
             auto const barHeight =
@@ -1214,14 +1215,14 @@ namespace
         }
 
         svg << R"(<polyline class="trend-line" points=")";
-        for (std::size_t i = 0; i < n; ++i)
+        for (auto const i: std::views::iota(std::size_t { 0 }, n))
         {
             auto const [hits, servable, volume] = days[i].second;
             auto const rate = servable == 0 ? 0.0 : (100.0 * static_cast<double>(hits)) / static_cast<double>(servable);
             svg << FormatCoord(xAt(i)) << ',' << FormatCoord(yAt(rate)) << ' ';
         }
         svg << R"("/>)";
-        for (std::size_t i = 0; i < n; ++i)
+        for (auto const i: std::views::iota(std::size_t { 0 }, n))
         {
             auto const [hits, servable, volume] = days[i].second;
             auto const rate = servable == 0 ? 0.0 : (100.0 * static_cast<double>(hits)) / static_cast<double>(servable);
