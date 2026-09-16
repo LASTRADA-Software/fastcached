@@ -523,7 +523,12 @@ class StopReactorOnExit
         std::cout << RenderValue(answer.value,
                                  RenderOptions { .format = command.format,
                                                  .color = ResolveColor(command.color),
-                                                 .absentOverride = command.absentOverride });
+                                                 .absentOverride = command.absentOverride,
+                                                 // Carried from the verb, never derived here: only the verb
+                                                 // that fetched a table knows whose column tables scale it,
+                                                 // and deriving it from `command` would put fleet knowledge
+                                                 // in `main` (#1488).
+                                                 .columnScales = answer.columnScales });
 
     ReportAdvisories(answer, command.quiet);
     return ExitCodeOf(answer.outcome);

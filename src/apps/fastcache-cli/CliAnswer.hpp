@@ -4,6 +4,7 @@
 #include "CliValue.hpp"
 
 #include <FastCache/Core/EnumTable.hpp>
+#include <FastCache/Distributed/FleetView.hpp>
 
 #include <cstdint>
 #include <optional>
@@ -125,6 +126,20 @@ struct Answer
     /// Every other path classifies bytes as text or base64 rather than emitting them,
     /// so this is where "I know what I am doing" is spelled.
     std::optional<std::string> rawPayload {};
+
+    /// The fleet section `value`'s columns belong to, when they have scales to look up.
+    ///
+    /// **The PRODUCER states this; nothing infers it.** `CellFormat`'s own header says a
+    /// consumer reads a column's scale off the column NAME, which it already has -- so what
+    /// is missing at a render site is not the scale but which section's column tables to ask,
+    /// and only the verb that fetched the table knows that. Inferring it from the verb name
+    /// and its operand at the render site would put fleet knowledge in `main`, and it would
+    /// be one more place to forget (#1488).
+    ///
+    /// Engaged only for a table whose columns are the leader's. Disengaged means "these
+    /// columns have no scales", which is the truth for every other verb and is why the human
+    /// renderer must not go looking on its own.
+    std::optional<Distributed::FleetSection> columnScales {};
 };
 
 /// An answer carrying nothing but an outcome and one remark.

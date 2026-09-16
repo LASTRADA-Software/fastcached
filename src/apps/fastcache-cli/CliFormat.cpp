@@ -173,16 +173,83 @@ namespace
         auto const absent = AbsentTextFor(options, *DescriptorOf(options.format));
         auto const columnCount = value.columns.size();
 
+        // The scale of each column, asked of the leader's own column tables BY COLUMN NAME --
+        // which is how `CellFormat`'s header says a consumer reads it, and why no client here
+        // carries a list of which column is which. Every entry is disengaged unless the
+        // producer named a section, which is every verb but `fleet`.
+        std::vector<std::optional<Distributed::CellFormat>> scales;
+        scales.reserve(columnCount);
+        for (auto const index: std::views::iota(std::size_t { 0 }, columnCount))
+            scales.push_back(options.columnScales.has_value()
+                                 ? Distributed::FleetColumnFormat(*options.columnScales, value.columns[index])
+                                 : std::nullopt);
+
+        // A section whose scale is a property of the ROW instead: `kpi`, whose rows are one value
+        // per name, so `853` is a count in one row and 853 thousandths in the next. Which columns
+        // carry the figure and the unit is the LIBRARY's to say, so no client here holds a list of
+        // which column is which -- the same rule as the per-column lookup above.
+        auto const rowUnits =
+            options.columnScales.has_value() ? Distributed::FleetRowUnitColumnsFor(*options.columnScales) : std::nullopt;
+        auto const columnNamed = [&](std::string_view name) -> std::optional<std::size_t> {
+            for (auto const index: std::views::iota(std::size_t { 0 }, columnCount))
+                if (value.columns[index] == name)
+                    return index;
+            return std::nullopt;
+        };
+        // Both columns, or neither: a value column with no unit beside it is a figure whose scale
+        // nothing states, and guessing one is how `294` becomes a percentage of something else.
+        auto const valueColumn = rowUnits.has_value() ? columnNamed(rowUnits->value) : std::nullopt;
+        auto const unitColumn = rowUnits.has_value() ? columnNamed(rowUnits->unit) : std::nullopt;
+        auto const scaleFromRow = valueColumn.has_value() && unitColumn.has_value();
+
+        // Written ONCE, into the text the widths are measured from and the rows are built
+        // from. Formatting at both sites would be two passes that can disagree, and the
+        // disagreement would present as a misaligned table rather than as a wrong figure.
+        //
+        // A cell whose column has no scale, or whose text is not a figure of that scale, is
+        // shown as the leader sent it rather than guessed at: the leader may be newer than
+        // this client, and an unreadable figure is not a reason to refuse a table.
+        std::vector<std::vector<std::string>> written;
+        written.reserve(value.rows.size());
+        for (auto const& row: value.rows)
+        {
+            std::vector<std::string> line;
+            line.reserve(columnCount);
+            for (auto const index: std::views::iota(std::size_t { 0 }, columnCount))
+            {
+                // `PlainText` answers a VIEW, and `std::string`'s converting constructor from
+                // one is explicit, so the copy is spelled rather than implied.
+                auto const plain = PlainText(row[index], absent);
+
+                // The row's own unit, where the section scales that way. Resolved by NAME through
+                // `CellFormatFromName`, which is how a unit travels: the enumerator's value binds
+                // nothing on the wire.
+                auto scale = scales[index];
+                if (scaleFromRow && index == *valueColumn && row[*unitColumn].kind != CellKind::Absent)
+                    scale = Distributed::CellFormatFromName(row[*unitColumn].lexical);
+
+                if (row[index].kind == CellKind::Absent || !scale.has_value())
+                    line.emplace_back(plain);
+                else
+                    line.push_back(Distributed::HumanFigureFromMachineText(plain, *scale).value_or(std::string { plain }));
+            }
+            written.push_back(std::move(line));
+        }
+
         std::vector<std::size_t> widths;
         widths.reserve(columnCount);
         for (auto const index: std::views::iota(std::size_t { 0 }, columnCount))
         {
             auto width = value.columns[index].size();
-            for (auto const& row: value.rows)
-                width = std::max(width, PlainText(row[index], absent).size());
+            for (auto const& line: written)
+                width = std::max(width, line[index].size());
             widths.push_back(width);
         }
 
+        // Alignment is decided from the RAW cells, deliberately. `14223` is a number and
+        // `14 s` is not, so asking the written text would left-align exactly the columns a
+        // scale was applied to -- a numeric column that stops being right-aligned the moment
+        // it starts being readable.
         std::vector<bool> numeric;
         numeric.reserve(columnCount);
         for (auto const index: std::views::iota(std::size_t { 0 }, columnCount))
@@ -218,10 +285,10 @@ namespace
         }
         out += '\n';
 
-        for (auto const& row: value.rows)
+        for (auto const& line: written)
         {
             for (auto const index: std::views::iota(std::size_t { 0 }, columnCount))
-                appendPadded(PlainText(row[index], absent), index, out);
+                appendPadded(line[index], index, out);
             out += '\n';
         }
         return out;

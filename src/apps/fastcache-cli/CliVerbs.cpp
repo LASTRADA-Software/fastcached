@@ -1698,6 +1698,19 @@ namespace
             return Concluded(Outcome::Protocol, std::format("the fleet table could not be read: {}", table.error()));
 
         auto answer = Answered(*std::move(table));
+
+        // Which section's column tables scale these columns, said by the verb that fetched them
+        // (#1488). Before this the human table printed the leader's raw integers, so
+        // `heartbeat-age` read `14223` -- which under that column name says a worker was last
+        // heard from almost four hours ago when the truth was fourteen seconds, and `/fleet`
+        // rendered the same cell `14 s`. Wrong, and wrong toward a false alarm.
+        //
+        // From the OPERAND rather than from the document's marker: the operand is what this
+        // client asked for, while a marker is text a leader sent, and a leader naming a section
+        // this build does not know must still render its table -- raw, since an unknown scale is
+        // not a reason to refuse. `FleetSectionFromKey` answering nothing is exactly that case.
+        answer.columnScales = Distributed::FleetSectionFromKey(context.operands[0]);
+
         // On stderr: the table on stdout is the same whoever answered it, and a script reading it
         // must not have to skip a line -- while an operator who named a follower still learns
         // where the leader is.
