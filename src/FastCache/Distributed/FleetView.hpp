@@ -468,6 +468,27 @@ static_assert(RowsInEnumeratorOrder(CellFormatTable, &CellFormatRow::format));
 /// @return The scale, or absent for a name that section does not render.
 [[nodiscard]] std::optional<CellFormat> FleetColumnFormat(FleetSection section, std::string_view name);
 
+/// The two columns of a section whose scale is a property of the ROW rather than the column.
+struct FleetRowUnitColumns
+{
+    std::string_view value {}; ///< The column holding the figure.
+    std::string_view unit {};  ///< The column naming that row's scale, as `CellFormatTable::name`.
+};
+
+/// Which of @p section's columns carry a per-ROW scale, if any do.
+///
+/// `kpi` is the one such section and it is not an irregularity: its rows are one value per NAME
+/// rather than rows of one shape, so `853` is a count in one row and eight-hundred-and-fifty-three
+/// thousandths in the next, and no per-column answer exists. That is the case `CellFormat`'s header
+/// means by *NAMES it for a headline figure*.
+///
+/// Public for the same reason `FleetColumnFormat` is: a terminal renderer of these tables must not
+/// carry its own list of which column is which. Before this, `fastcache-cli fleet kpi` printed
+/// `cache-hit-rate 294 permille` where the page shows `29.4%` (#1488).
+/// @param section The section.
+/// @return The two column names, or nullopt where every column's scale is the column's own.
+[[nodiscard]] std::optional<FleetRowUnitColumns> FleetRowUnitColumnsFor(FleetSection section) noexcept;
+
 /// How long a column is kept by a human surface too narrow to draw every column.
 ///
 /// **The leader's decision, as a column of its tables**, because which columns matter is a property of

@@ -3,10 +3,13 @@
 
 #include <FastCache/Cli/UsageTestUtils.hpp>
 #include <FastCache/Distributed/FleetText.hpp>
+#include <FastCache/Distributed/FleetView.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <cstdint>
+#include <initializer_list>
 #include <string>
 #include <vector>
 
@@ -207,6 +210,171 @@ TEST_CASE("a numeric column right-aligns and a text column does not", "[cli][for
     // "   1" padded to the width of "1000".
     CHECK(human.contains("   1\n"));
     CHECK(human.contains("1000\n"));
+}
+
+TEST_CASE("a fleet column is written in the scale the leader's own tables give it", "[cli][format][fleet]")
+{
+    // #1488: the human table used to print the leader's raw integers, so `heartbeat-age` read
+    // `14223` -- which under that column name says a worker was last heard from almost four
+    // hours ago, when the truth was fourteen seconds, while `/fleet` rendered `14 s` from the
+    // same cell. Wrong rather than merely terser, and wrong toward a false alarm.
+    //
+    // 90000 ms, and the value is the point of the case. The defect was noticed on this machine
+    // only because the raw figure was IMPOSSIBLE -- 15965156 seconds is 185 days on a node up
+    // for four hours. A fixture using an impossible number passes under a build that merely
+    // mis-scales, because any reading of it looks wrong. 90000 is plausible BOTH ways: 90000 s
+    // is 25 hours and 90 s is a minute and a half, and both are things a heartbeat age could
+    // say. So only the scale distinguishes them.
+    auto const raw = std::uint64_t { 90000 };
+    auto const table = TableValue({ "id", "heartbeat-age", "last-picked-age" },
+                                  {
+                                      { TextCell("w1"), NumberCell(raw), AbsentCell() },
+                                  });
+
+    // The expected text comes from the leader's own writer rather than a literal. A literal
+    // here would be a second statement of a format this client does not own, and it would
+    // redden on any change to how a duration is written -- which is a change to the PAGE, not
+    // to this client.
+    auto const expected = Distributed::HumanFleetFigure(raw, Distributed::CellFormat::Millis);
+    REQUIRE(expected != "90000");
+
+    auto const human = RenderValue(
+        table, RenderOptions { .format = OutputFormat::Human, .columnScales = Distributed::FleetSection::Workers });
+
+    CHECK(human.contains(expected));
+    // And the raw figure is GONE, not merely accompanied. Asserting only that the written form
+    // is present passes on a build that prints both, which is the shape a careless fix takes.
+    CHECK_FALSE(human.contains("90000"));
+
+    // `last-picked-age` stays absent. The scale must not reach a cell carrying no value.
+    CHECK(human.contains("-"));
+}
+
+TEST_CASE("an absent fleet cell is not scaled, even when the absent marker parses", "[cli][format][fleet]")
+{
+    // **Written after neutering proved the obvious arrangement could not fail.** With the
+    // default marker the absent guard is unreachable: `PlainText` answers `-`,
+    // `HumanFigureFromMachineText` cannot read that as a figure, and `value_or` hands back the
+    // marker -- so deleting `kind == CellKind::Absent` from the condition changes no output and
+    // every case stays green. The assertion looked like it covered the guard and covered
+    // nothing.
+    //
+    // `--absent=0` is the arrangement that discriminates, and it is not contrived: the flag
+    // exists, and a zero is exactly what somebody piping a table into a spreadsheet asks for.
+    // Without the guard the marker then PARSES, and an absent `last-picked-age` renders as a
+    // written zero duration -- absent flattened into the healthiest reading on the row, which
+    // is the defect the column's own comment in `FleetView.cpp` exists to prevent.
+    auto const table = TableValue({ "id", "last-picked-age" },
+                                  {
+                                      { TextCell("w1"), AbsentCell() },
+                                  });
+
+    auto const human = RenderValue(table,
+                                   RenderOptions { .format = OutputFormat::Human,
+                                                   .absentOverride = std::string { "0" },
+                                                   .columnScales = Distributed::FleetSection::Workers });
+
+    // The marker, exactly as asked for, and not a duration built out of it. Derived from the
+    // writer rather than written as a literal, for the same reason as the case above.
+    auto const scaledZero = Distributed::HumanFleetFigure(std::uint64_t { 0 }, Distributed::CellFormat::Millis);
+    REQUIRE(scaledZero != "0");
+    CHECK(human.contains("0"));
+    CHECK_FALSE(human.contains(scaledZero));
+}
+
+TEST_CASE("a machine-readable fleet table keeps the leader's raw integer", "[cli][format][fleet]")
+{
+    // `CellFormat`'s header says a machine-readable surface ignores a column's scale, because a
+    // consumer has the column NAME and can scale it itself. So this is a contract rather than a
+    // preference, and it is the direction a fix applied to all five formats would break in
+    // SILENCE: a person reading the human table would see it corrected while every script
+    // parsing `--format=tsv` started receiving `1.5 min` where it had been reading `90000`.
+    auto const table = TableValue({ "id", "heartbeat-age" },
+                                  {
+                                      { TextCell("w1"), NumberCell(std::uint64_t { 90000 }) },
+                                  });
+
+    auto const written = Distributed::HumanFleetFigure(std::uint64_t { 90000 }, Distributed::CellFormat::Millis);
+
+    for (auto const format: { OutputFormat::Tsv, OutputFormat::Csv, OutputFormat::Kv, OutputFormat::Json })
+    {
+        auto const out =
+            RenderValue(table, RenderOptions { .format = format, .columnScales = Distributed::FleetSection::Workers });
+        CHECK(out.contains("90000"));
+        CHECK_FALSE(out.contains(written));
+    }
+}
+
+TEST_CASE("a column the section does not name is written as the leader sent it", "[cli][format][fleet]")
+{
+    // A leader may be newer than this client and send a column these tables do not know. An
+    // unknown scale is not a reason to refuse a table or to guess at one: the cell is shown as
+    // it arrived. This is also what every verb other than `fleet` relies on, since none of them
+    // names a section at all.
+    auto const table = TableValue({ "id", "not-a-fleet-column" },
+                                  {
+                                      { TextCell("w1"), NumberCell(std::uint64_t { 90000 }) },
+                                  });
+
+    auto const named = RenderValue(
+        table, RenderOptions { .format = OutputFormat::Human, .columnScales = Distributed::FleetSection::Workers });
+    auto const unnamed = RenderValue(table, RenderOptions { .format = OutputFormat::Human });
+
+    CHECK(named.contains("90000"));
+    // And naming a section changes nothing for a table whose columns none of its rows describe,
+    // which is what makes the field safe to set on an answer whose shape is not a fleet table.
+    CHECK(named == unnamed);
+}
+
+TEST_CASE("a kpi row is written in the unit its own row names", "[cli][format][fleet]")
+{
+    // `kpi` scales per ROW, not per column: its rows are one value per name, so `853` is a count
+    // in one row and 853 thousandths in the next and no per-column answer exists. Which columns
+    // carry the figure and the unit comes from `FleetRowUnitColumnsFor`, so this client holds no
+    // list of which column is which.
+    auto const table = TableValue(
+        { "kpi", "value", "unit", "of" },
+        {
+            { TextCell("oldest-heartbeat"), NumberCell(std::uint64_t { 90000 }), TextCell("milliseconds"), AbsentCell() },
+            { TextCell("dispatched"), NumberCell(std::uint64_t { 90000 }), TextCell("count"), AbsentCell() },
+        });
+
+    auto const human =
+        RenderValue(table, RenderOptions { .format = OutputFormat::Human, .columnScales = Distributed::FleetSection::Kpi });
+
+    // The SAME raw figure in both rows, deliberately: a per-column implementation would give the
+    // two rows one answer, and any assertion using different numbers would pass under it.
+    auto const asDuration = Distributed::HumanFleetFigure(std::uint64_t { 90000 }, Distributed::CellFormat::Millis);
+    auto const asCount = Distributed::HumanFleetFigure(std::uint64_t { 90000 }, Distributed::CellFormat::Count);
+    REQUIRE(asDuration != asCount);
+
+    CHECK(human.contains(asDuration));
+    CHECK(human.contains(asCount));
+}
+
+TEST_CASE("a kpi unit this build does not know is written as the leader sent it", "[cli][format][fleet]")
+{
+    // `permille` is not a made-up spelling: it is what a node from before #1445 writes for
+    // `cache-hit-rate`, and it was observed on this machine's own service, twenty commits behind
+    // the client reading it. So a client meeting a unit outside its vocabulary is the ORDINARY
+    // case during a rollout rather than an edge, and the answer is to show the figure as sent --
+    // not to refuse the table, and above all not to scale it by whatever the column happens to
+    // suggest.
+    auto const table =
+        TableValue({ "kpi", "value", "unit", "of" },
+                   {
+                       { TextCell("cache-hit-rate"), NumberCell(std::uint64_t { 294 }), TextCell("permille"), AbsentCell() },
+                   });
+
+    auto const human =
+        RenderValue(table, RenderOptions { .format = OutputFormat::Human, .columnScales = Distributed::FleetSection::Kpi });
+
+    CHECK(human.contains("294"));
+    CHECK(human.contains("permille"));
+    // And it is not silently read as a share, which is the nearest spelling in the vocabulary and
+    // the one a guess would land on -- 294 as a fraction is 29400%.
+    auto const asShare = Distributed::HumanFleetFigure(std::uint64_t { 294 }, Distributed::CellFormat::Share);
+    CHECK_FALSE(human.contains(asShare));
 }
 
 TEST_CASE("no human line ends in whitespace", "[cli][format]")

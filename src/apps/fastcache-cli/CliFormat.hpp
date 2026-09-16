@@ -5,6 +5,7 @@
 
 #include <FastCache/Cli/UsageDoc.hpp>
 #include <FastCache/Core/EnumTable.hpp>
+#include <FastCache/Distributed/FleetView.hpp>
 
 #include <cstdint>
 #include <optional>
@@ -90,6 +91,20 @@ struct RenderOptions
     OutputFormat format { OutputFormat::Human };  ///< Which format.
     UsageColor color { UsageColor::Plain };       ///< Colour, for Human only.
     std::optional<std::string> absentOverride {}; ///< From `--absent`; ignored by Json.
+
+    /// The fleet section whose column tables give this table's columns their scales.
+    ///
+    /// Copied from `Answer::columnScales`, which the verb that fetched the table sets: a
+    /// column's scale is a property of its NAME, and what a render site lacks is only which
+    /// section's tables to ask.
+    ///
+    /// **Human only, and that is the contract rather than an implementation detail.**
+    /// `CellFormat`'s header says a machine-readable surface ignores a column's scale, because
+    /// a consumer has the column name and can scale it itself. So `Tsv`, `Csv`, `Kv` and `Json`
+    /// keep the leader's raw integer whatever this field says -- a fix applied to all five
+    /// formats would silently start handing scripts `4.5 h` where they had been parsing
+    /// `15965156`, and a person reading the table would see it looking correct (#1488).
+    std::optional<Distributed::FleetSection> columnScales {};
 };
 
 /// Render an answer.

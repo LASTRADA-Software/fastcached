@@ -1504,6 +1504,16 @@ namespace
     }
 } // namespace
 
+std::optional<FleetRowUnitColumns> FleetRowUnitColumnsFor(FleetSection section) noexcept
+{
+    // Read out of `KpiTextColumns` rather than spelled again, so the names a renderer looks for
+    // and the names the document carries cannot part company -- which is the reason that array
+    // exists at all.
+    if (section != FleetSection::Kpi)
+        return std::nullopt;
+    return FleetRowUnitColumns { .value = KpiTextColumns[1], .unit = KpiTextColumns[2] };
+}
+
 std::optional<CellFormat> FleetColumnFormat(FleetSection section, std::string_view name)
 {
     return FactsOf(section, name).transform([](ColumnFacts const& facts) -> CellFormat { return facts.format; });
