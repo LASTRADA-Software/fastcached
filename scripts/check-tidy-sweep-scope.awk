@@ -39,6 +39,7 @@ function WorkflowOn(kind) {
     if (kind == "text") { OnText(); return }
     if (kind == "step-line") return         # the key events below are finer and are what is wanted
     if (kind == "key") { OnKey(); return }
+    if (kind == "item") return              # no rule here reads a sequence entry
     if (kind == "step") { FlushStep(); return }
     if (kind == "job") return               # every rule here is per STEP, inside a job the walk names
     if (kind == "refusal") return           # a workflow this walk cannot read is #1175's subject

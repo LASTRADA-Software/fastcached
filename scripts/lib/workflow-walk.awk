@@ -45,6 +45,10 @@
 #              step's and not its predecessor's. `WfEnvRow` says it is a row of the step's own
 #              `env:`.
 #   key        a mapping line. `WfKey`, `WfValue`, `WfPath`, `WfScope`, `WfIndent`.
+#   item       a bare scalar entry of a block sequence -- a `needs:`, `tags:` or `branches:`
+#              value. `WfItem` is its text, unquoted; `WfPath` is the OWNING key's path,
+#              since nothing is pushed for the entry itself. A `runs-on:` entry fires this
+#              too, and additionally accumulates into `WfRunsOn`.
 #   step       a step record is complete: every field below is final and the next line belongs to
 #              another step, another job, or nothing.
 #   job        a job record is complete. Fires after that job's last `step`.
@@ -70,6 +74,7 @@
 #   WfJobStart     the `FNR` of that job's key -- the identity a pass-1 finding is filed under
 #   WfJobShell     `defaults.run.shell` for this job, or ""
 #   WfRunsOn       this job's `runs-on`, list items joined by spaces
+#   WfItem         at an `item` event, that entry's text
 #   WfWorkflowShell  the workflow-level `defaults.run.shell`, or ""
 #   WfStepIndex    this step's position in its job, from 1
 #   WfStepLine     the `FNR` the step's item began on
@@ -208,7 +213,9 @@ function WorkflowWalkLine(   line, ind, blank, isItem, stepItem, t, key, value, 
     if (isItem) {
         if (WfInRunsOnList) {
             t = line; sub(/^[ ]*-[ \t]*/, "", t)
-            WfRunsOn = WfRunsOn " " WorkflowUnquote(WorkflowTrim(t)); WfRunsOnAt[WfJobStart] = WfRunsOn
+            WfItem = WorkflowUnquote(WorkflowTrim(t))
+            WfRunsOn = WfRunsOn " " WfItem; WfRunsOnAt[WfJobStart] = WfRunsOn
+            WorkflowEmit("item")
             return
         }
         if (WfInSteps && (WfItemIndent < 0 || ind == WfItemIndent)) {
@@ -235,9 +242,15 @@ function WorkflowWalkLine(   line, ind, blank, isItem, stepItem, t, key, value, 
     }
 
     if (!match(line, /^[ ]*[A-Za-z_][A-Za-z0-9_.-]*[ \t]*:([ \t]|$)/)) {
-        # A scalar list item (a `needs:` or `branches:` entry) is placed; a step that is not a
-        # mapping, and any other line, is not.
-        if (isItem && !stepItem) return
+        # A scalar list item -- a `needs:`, `tags:` or `branches:` entry written as a block
+        # sequence. It is PLACED and reported: for years it was placed and reported nothing,
+        # so a consumer wanting `release.needs` had to walk the file itself.
+        if (isItem && !stepItem) {
+            WfItem = WorkflowUnquote(WorkflowTrim(line))
+            WorkflowEmit("item")
+            return
+        }
+        # A step that is not a mapping, and any other line, is not placed.
         WorkflowRefuse(FNR, "unreadable-yaml", (stepItem ? "a step written as `" : "`") WorkflowTrim(line) "`")
         return
     }

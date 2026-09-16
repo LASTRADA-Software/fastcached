@@ -166,6 +166,42 @@ RunnerOs() {
     esac
 }
 
+# ---------------------------------------------------------------------------
+# Every fact these six rules read out of a workflow, from ONE walk.
+#
+# Six awk programs used to live here, every one spelling `build.yml`'s
+# indentation as literal column counts -- the job key at two spaces,
+# `name:`/`if:`/`runs-on:` at four, a step item at six, a step's own keys at
+# eight, a `with:` row and a matrix axis at ten. Each was right for the file as
+# written today and answered nothing about a file whose jobs sit at another
+# depth, which is legal YAML. `scripts/check-gated-jobs.awk` holds this check's
+# half over `scripts/lib/workflow-walk.awk` and documents the records (#1456).
+#
+# A missing awk program is refused BY NAME. Every rule here reports on what it
+# did NOT find -- an unguarded job, a missing reader, an empty gating set -- so a
+# reader that ran over no program produces no rows, and rules A, C and D each
+# have their own refusal for that. Naming the cause here is what stops three
+# correct refusals pointing at a workflow that is fine.
+FastCachedWalkAwk="$(dirname "${BASH_SOURCE[0]}")/lib/workflow-walk.awk"
+FastCachedGatedAwk="$(dirname "${BASH_SOURCE[0]}")/check-gated-jobs.awk"
+for awkProgram in "$FastCachedWalkAwk" "$FastCachedGatedAwk"; do
+    if [ ! -f "$awkProgram" ]; then
+        echo "check-gated-jobs: missing awk program ${awkProgram}; no workflow was read, so this" >&2
+        echo "  is a refusal and not a clean run. It is expected beside this script." >&2
+        exit 2
+    fi
+done
+
+# The rows of kind @p 2 for the workflow @p 1, with the kind column dropped.
+# `grep | cut` and never `grep -q` or `| head`: a pipe into a consumer that exits
+# early is a false negative under `pipefail` on its SUCCESS path.
+WorkflowRecords() {
+    local records
+    records="$(awk -v sep="$FieldSep" -v runner="$DocSubjectRunner" -v action="$CcacheAction" \
+        -f "$FastCachedWalkAwk" -f "$FastCachedGatedAwk" "$1" "$1")"
+    grep -F -- "$2	" <<< "$records" | cut -f2- || true
+}
+
 # The field separator every awk emitter below writes and every reader splits on.
 #
 # NOT a tab, and that is #791. Tab is IFS *whitespace*, so `IFS=$'\t' read` treats
@@ -226,28 +262,23 @@ fi
 # and rule A buys nothing. For a matrix job it is worse than a wrong-green: a
 # skipped matrix job never expands, so its per-leg contexts never exist at all
 # and the pull request cannot merge.
-guarded="$(awk -v sep="$FieldSep" '
-    function flush() {
-        if (jobKey != "" && usesCode && index(jobIf, "!cancelled()") == 0)
-            print "MISSING" sep jobKey sep (jobIf == "" ? "<no job-level if:>" : jobIf)
-        jobKey = ""; jobIf = ""; usesCode = 0
-    }
-    /^jobs:[ \t]*$/             { inJobs = 1; next }
-    inJobs && /^[^ \t]/         { flush(); inJobs = 0 }
-    !inJobs                     { next }
-    /^[ \t]*#/                  { next }
-    /^  [A-Za-z0-9_-]+:[ \t]*$/ { flush()
-                                  jobKey = $0
-                                  sub(/^  /, "", jobKey)
-                                  sub(/:[ \t]*$/, "", jobKey)
-                                  next }
-    /^    if:/                  { jobIf = $0; sub(/^    if:[ \t]*/, "", jobIf) }
-    /needs\.changes\.outputs\.code/ { usesCode = 1 }
-    END                         { flush() }
-' "$workflow")"
+# The POSITIVE CONTROL, asked before any rule below. Every one of them reports on
+# what it did not find, so over a file the reader could not place four of the six
+# answer "nothing to vouch for" and this check passes -- *absence of the negative is
+# not the positive*. Measured: with the shared walk's job boundary disabled the whole
+# check went GREEN, and rule C's own refusal stayed silent because its rows existed
+# with an empty job column and its loop skipped each one.
+placedJobs="$(WorkflowRecords "$workflow" JOBS)"
+if [[ -z "$placedJobs" || "$placedJobs" -eq 0 ]]; then
+    Fail "the reader placed 0 jobs in $workflow. Every rule below reports on what it does not find, so an unreadable file would answer \"nothing to vouch for\" six times and this check would pass. Nothing has been vouched for."
+else
+    echo "ok: the reader placed $placedJobs job(s), so the rules below have something to judge"
+fi
+
+guarded="$(WorkflowRecords "$workflow" GUARDED)"
 
 if [[ -n "$guarded" ]]; then
-    while IFS="$FieldSep" read -r _ jobKey jobIf; do
+    while IFS="$FieldSep" read -r jobKey jobIf; do
         Fail "job '$jobKey' consults the scope classifier but its job-level condition does not contain \`!cancelled()\`, so a FAILED \`changes\` skips it outright -- if: $jobIf"
     done <<< "$guarded"
 else
@@ -265,36 +296,7 @@ fi
 # The whole step block is read -- its own `if:`, and the job-level `if:` above it
 # -- because either can carry the condition and only one of the two is where a
 # reader would look.
-docSubject="$(awk -v runner="$DocSubjectRunner" -v sep="$FieldSep" '
-    function flushStep() {
-        if (inStep && stepUsesRunner)
-            print jobKey sep jobName sep jobIf sep stepIf
-        inStep = 0; stepIf = ""; stepUsesRunner = 0
-    }
-    function flushJob() { flushStep(); jobKey = ""; jobName = ""; jobIf = "" }
-    /^jobs:[ \t]*$/                { inJobs = 1; next }
-    inJobs && /^[^ \t]/            { flushJob(); inJobs = 0 }
-    !inJobs                        { next }
-    # A comment naming the runner is not a call site. Without this the job\047s
-    # own explanatory comment satisfied rule C, and the step it was attributed to
-    # was whichever block happened to be open -- the check reported the same step
-    # TWICE against the real workflow, which is the only reason it was noticed.
-    # A rule satisfied by prose is a rule that passes with the code deleted.
-    /^[ \t]*#/                     { next }
-    /^  [A-Za-z0-9_-]+:[ \t]*$/    { flushJob()
-                                     jobKey = $0
-                                     sub(/^  /, "", jobKey); sub(/:[ \t]*$/, "", jobKey)
-                                     next }
-    /^    name:[ \t]*/             { jobName = $0
-                                     sub(/^    name:[ \t]*/, "", jobName)
-                                     gsub(/^"|"$/, "", jobName)
-                                     next }
-    /^    if:[ \t]*/               { jobIf = $0; sub(/^    if:[ \t]*/, "", jobIf); next }
-    /^      - /                    { flushStep(); inStep = 1 }
-    inStep && /^        if:[ \t]*/ { stepIf = $0; sub(/^        if:[ \t]*/, "", stepIf) }
-    inStep && index($0, runner)    { stepUsesRunner = 1 }
-    END                            { flushJob() }
-' "$workflow")"
+docSubject="$(WorkflowRecords "$workflow" DOCSUBJ)"
 
 if [[ -z "$docSubject" ]]; then
     Fail "no step in $workflow runs \`$DocSubjectRunner\`. The checks whose SUBJECT is documentation would then run only when something OTHER than documentation changed, which is #687 -- and a doc-check step that is absent reports exactly as green as one that passed."
@@ -342,38 +344,13 @@ fi
 # ---------------------------------------------------------------------------
 # Rule D: an event-keyed condition on a job that gates the release names
 # `github.ref_type != 'branch'`, so a tag run is never the run it skips.
-releaseNeeds="$(awk '
-    /^jobs:[ \t]*$/             { inJobs = 1; next }
-    inJobs && /^[^ \t]/         { inJobs = 0 }
-    !inJobs                     { next }
-    /^[ \t]*#/                  { next }
-    /^  [A-Za-z0-9_-]+:[ \t]*$/ { jobKey = $0
-                                  sub(/^  /, "", jobKey); sub(/:[ \t]*$/, "", jobKey)
-                                  inNeeds = 0
-                                  next }
-    jobKey == "release" && /^    needs:[ \t]*$/ { inNeeds = 1; next }
-    inNeeds && /^      - [A-Za-z0-9_-]+[ \t]*$/ { need = $0
-                                  sub(/^      - /, "", need); sub(/[ \t]*$/, "", need)
-                                  print need
-                                  next }
-    inNeeds && /^    [A-Za-z]/  { inNeeds = 0 }
-' "$workflow")"
+releaseNeeds="$(WorkflowRecords "$workflow" NEEDS)"
 
 if [[ -z "$releaseNeeds" ]]; then
     Fail "read 0 jobs out of \`release.needs\` in $workflow; with an empty gating set every event-keyed condition looks unregulated and rule D would vouch for all of them."
 else
     # Every job's own `if:`, one `key<SEP>condition` row per job that has one.
-    jobConditions="$(awk -v sep="$FieldSep" '
-        /^jobs:[ \t]*$/             { inJobs = 1; next }
-        inJobs && /^[^ \t]/         { inJobs = 0 }
-        !inJobs                     { next }
-        /^[ \t]*#/                  { next }
-        /^  [A-Za-z0-9_-]+:[ \t]*$/ { jobKey = $0
-                                      sub(/^  /, "", jobKey); sub(/:[ \t]*$/, "", jobKey)
-                                      next }
-        /^    if:/                  { cond = $0; sub(/^    if:[ \t]*/, "", cond)
-                                      print jobKey sep cond }
-    ' "$workflow")"
+    jobConditions="$(WorkflowRecords "$workflow" JOBIF)"
 
     trimmed=0
     while IFS="$FieldSep" read -r jobKey cond; do
@@ -408,26 +385,7 @@ fi
 # canonical explanation of this very clause is a comment block naming the action,
 # and rule C already shipped the bug where a comment satisfied the rule the step
 # was supposed to.
-ccacheSteps="$(awk -v action="$CcacheAction" -v sep="$FieldSep" '
-    function flushStep() {
-        if (inStep && stepUsesAction) print jobKey sep saveExpr
-        inStep = 0; saveExpr = ""; stepUsesAction = 0
-    }
-    function flushJob() { flushStep(); jobKey = "" }
-    /^jobs:[ \t]*$/                  { inJobs = 1; next }
-    inJobs && /^[^ \t]/              { flushJob(); inJobs = 0 }
-    !inJobs                          { next }
-    /^[ \t]*#/                       { next }
-    /^  [A-Za-z0-9_-]+:[ \t]*$/      { flushJob()
-                                       jobKey = $0
-                                       sub(/^  /, "", jobKey); sub(/:[ \t]*$/, "", jobKey)
-                                       next }
-    /^      - /                      { flushStep(); inStep = 1 }
-    inStep && /^          save:[ \t]*/ { saveExpr = $0
-                                       sub(/^          save:[ \t]*/, "", saveExpr) }
-    inStep && index($0, action)      { stepUsesAction = 1 }
-    END                              { flushJob() }
-' "$workflow")"
+ccacheSteps="$(WorkflowRecords "$workflow" CCACHE)"
 
 ccacheTotal=0
 ccacheProblemsBefore=$problems
@@ -476,39 +434,7 @@ fi
 # refused rather than compared is a key still naming `runner.` or `matrix.`
 # after resolution -- a key this check cannot resolve is one it cannot vouch for
 # in either direction, and vouching for it is the silent half.
-cacheSteps="$(awk -v sep="$FieldSep" '
-    function flushStep() {
-        if (inStep && stepUses != "" && stepKey != "")
-            print jobKey sep stepUses sep runsOn sep matrixSpec sep stepKey
-        inStep = 0; stepUses = ""; stepKey = ""
-    }
-    function flushJob() { flushStep(); jobKey = ""; runsOn = ""; matrixSpec = ""; inMatrix = 0 }
-    /^jobs:[ \t]*$/                 { inJobs = 1; next }
-    inJobs && /^[^ \t]/             { flushJob(); inJobs = 0 }
-    !inJobs                         { next }
-    /^[ \t]*#/                      { next }
-    /^  [A-Za-z0-9_-]+:[ \t]*$/     { flushJob()
-                                      jobKey = $0
-                                      sub(/^  /, "", jobKey); sub(/:[ \t]*$/, "", jobKey)
-                                      next }
-    /^    runs-on:[ \t]*/           { runsOn = $0; sub(/^    runs-on:[ \t]*/, "", runsOn); next }
-    /^      matrix:[ \t]*$/         { inMatrix = 1; next }
-    /^    [A-Za-z0-9_-]+:/          { inMatrix = 0 }
-    inMatrix && /^        [A-Za-z0-9_-]+:[ \t]*\[/ {
-                                      axis = $0
-                                      sub(/^        /, "", axis)
-                                      sub(/:[ \t]*\[/, "=", axis)
-                                      sub(/\][ \t]*$/, "", axis)
-                                      gsub(/[ \t]/, "", axis)
-                                      matrixSpec = matrixSpec (matrixSpec == "" ? "" : ";") axis
-                                      next }
-    /^      - /                     { flushStep(); inStep = 1 }
-    inStep && /^[ \t]*(- )?uses:[ \t]*/ { stepUses = $0
-                                      sub(/^[ \t]*(- )?uses:[ \t]*/, "", stepUses) }
-    inStep && /^          key:[ \t]*/ { stepKey = $0
-                                      sub(/^          key:[ \t]*/, "", stepKey) }
-    END                             { flushJob() }
-' "$workflow")"
+cacheSteps="$(WorkflowRecords "$workflow" CACHE)"
 
 cacheTotal=0
 cacheProblemsBefore=$problems
@@ -909,6 +835,48 @@ REQ
 
     Generate "${scratch}/wf.yml" safe yes ungated required none all none unknownaxis
     Case "rule F: a key naming a \`matrix.\` axis the job does not declare is REFUSED, not read as 'resolves to something unique'" want-fail
+
+    # The verdicts must come from the SHARED walk, which is a different claim from
+    # "the check refuses". `Case` runs `bash "$0"`, which resolves its awk beside
+    # the real script, so a neuter has to stage a whole copy of the tooling.
+    #
+    # @param 1 what it holds up  @param 2 a sed expression, or `omit` to stage no
+    # walk at all  @param 3 want-pass|want-fail
+    StagedWalkCase() {
+        local what="$1" expr="$2" want="$3" tree="${scratch}/tree" out got=0
+        cases=$((cases + 1))
+        rm -rf "$tree"
+        mkdir -p "$tree/scripts/lib"
+        cp "$0" "$tree/scripts/"
+        cp "$FastCachedGatedAwk" "$tree/scripts/"
+        if [[ "$expr" != omit ]]; then
+            sed "$expr" "$FastCachedWalkAwk" > "$tree/scripts/lib/workflow-walk.awk"
+            if cmp -s "$tree/scripts/lib/workflow-walk.awk" "$FastCachedWalkAwk"; then
+                echo "  FAIL  '$what' neutered no line, so the case stages nothing" >&2
+                status=1
+                return
+            fi
+        fi
+        Generate "${scratch}/wf.yml" safe yes ungated required none all none
+        out="$(FASTCACHED_REQUIRED_CONTEXTS_FILE="$requiredFile" \
+            bash "$tree/scripts/$(basename "$0")" --workflow "${scratch}/wf.yml" 2>&1)" || got=$?
+        if [[ "$want" == "want-pass" && "$got" -eq 0 ]] || [[ "$want" == "want-fail" && "$got" -ne 0 ]]; then
+            echo "  ok    ($want) $what"
+        else
+            echo "  FAIL  ($want, exit $got) $what" >&2
+            printf '%s\n' "$out" | sed 's/^/        /' >&2
+            status=1
+        fi
+    }
+
+    # The CONTROL first: the same staged tooling with only a comment added must
+    # pass, or the two cases below say only that a copied tree behaves differently.
+    StagedWalkCase "a staged copy of the check over an untouched shared walk still PASSES" \
+        '1s|^# SPDX|# neutered-nothing\n# SPDX|' want-pass
+    StagedWalkCase "neutering the shared walk's job boundary makes this check REFUSE, so its verdicts come from that walk" \
+        '/WorkflowFlushStep(); WorkflowFlushJob(); WorkflowResetJob(); WfJob = key/s/^/#/' want-fail
+    StagedWalkCase "a staged check with no shared walk beside it is REFUSED, not read as clean" \
+        omit want-fail
 
     if [[ "$status" -ne 0 ]]; then
         echo "check-gated-jobs: self-test FAILED after $cases case(s)" >&2

@@ -4692,6 +4692,71 @@ which reads identically to complete coverage. It walks every workflow file as a 
 
 What it cannot see is stated in its own header.
 
+**And it is no longer the only reader: there is ONE model of workflow YAML, and it is
+`scripts/lib/workflow-walk.awk`** ([#1456](https://github.com/LASTRADA-Software/fastcached/issues/1456)).
+
+Five checks each carried their own awk walk over `.github/workflows`, and four of the five spelled
+`build.yml`'s two-space indentation as literal column counts -- `/^  [A-Za-z0-9_-]+:/`, `/^    if:/`,
+`/^      - /`, `/^        run:/`, `/^          key:/`. **Every one was right about the file and wrong
+about YAML**, written by somebody who had the file open. The reader above was the exception, the only
+depth-relative one, and the only one whose self-test drove folded scalars and heredocs -- so the walk
+was extracted from it, and its output over the real files is byte-for-byte unchanged.
+
+- **The library calls exactly ONE hook, `WorkflowOn(kind)`, and that is measured rather than
+  chosen.** gawk makes a call to an undefined function FATAL, so a consumer that forgets the hook
+  cannot report clean -- it cannot run at all. But the error names an `FNR`, and **the enforcement
+  is per reached PATH, not per program**: a hook called only on some lines exits 0 in silence until
+  such a line appears, and is then a fatal error in CI on somebody's unrelated pull request, naming
+  an awk function rather than the check that lacks it. Eight hooks would have been seven of those
+  waiting. The `raw` kind fires on every line of every input, so the one hook is reached before
+  anything else can be.
+- **A kind with no arm falls off the dispatcher and returns**, so every consumer spells a returning
+  arm for every kind including the ones it ignores: *a kind nobody decided about and a kind decided
+  to be uninteresting are otherwise the same silence.* Adding a kind to the library is therefore
+  adding an arm to all five consumers, and that is the price the one-hook design pays for being
+  able to add a kind at all.
+- **The same defect was already in the tree, in the library extracted one increment earlier.**
+  `scripts/lib/shell-lex.awk` called a `trim` it does not define, which lives in one consumer: a
+  second consumer would have died at its first heredoc, fatally, and only once a heredoc appeared.
+  A library defines every function it calls, and nothing but a second consumer would have said so.
+- **Three defects the walk shipped with were found by READING A TRANSCRIPT, not by review**, and
+  none was visible to the one consumer it had: a job flushed only after the NEXT job's key event,
+  so a consumer reading `WfJob` on the line `  second:` was told `first`; a pass whose LAST job was
+  never flushed, because `END` runs once and a new file only resets; and `WfPath` under a refused
+  line inheriting the ancestry of whatever key last sat at that indent. Dumping the records for a
+  rich fixture and reading them is a different activity from reviewing a diff, and it is the one
+  that finds this class.
+- **A neuter is evidence only over input that REACHES the line it disabled.** The walker's
+  self-test reports a neuter that provoked nothing as its own failure, and did so three times: a
+  fixture reaching two of four block-opening shapes, a `WfBlockKey` assignment already made by the
+  branch above it, and a folded `if:` the shipped fragment writes on one line. Each time the hole
+  was in the FIXTURE, and each time a green run would have read as coverage.
+- **A SET cannot see a value attributed to the wrong key when that key owns others too.** The
+  walker's driver counts continuations per owner for that reason: neutering the `run:` site moves
+  `run` from 3 to 2 and adds `name=1`, a body line attributed to the step's own `name:`. As a set
+  of owners, `run` was present either way and the neuter looked inert.
+- **Migrating a reader is not enough, and a green self-test afterwards says nothing about WHERE the
+  reading came from** -- every existing case passes just as well over a private reader kept beside
+  the shared one. So each migration neuters the LIBRARY and requires the check to refuse, with an
+  untouched copy at a different path as the control.
+- **That neuter found a hole in `check-gated-jobs.sh` that the migration did not introduce**: with
+  a reader placing no job, four of its six rules answer "nothing to vouch for" and it passes. Its
+  rule C even emitted rows with an empty job column while its own *no step runs the doc checks*
+  refusal stayed silent, because the string was not empty. *Absence of the negative is not the
+  positive*, so it asks for a POSITIVE CONTROL first -- how many jobs the walk placed -- and
+  refuses on zero.
+- **`ctest -R workflow-walk-sole` is what stops the sixth private walk**, because the migrations
+  cannot: `/^  [A-Za-z0-9_-]+:/` is four characters and works on the file in front of you. It
+  refuses an awk regex anchored on a FIXED indent in a first-party script that names a workflow,
+  passes a depth-relative one, and exempts a fixture GENERATOR by row with a reason -- a stale row
+  is refused, because an exemption kept past its subject excuses whatever next takes that path.
+  What it cannot see is in its header: an indent built at run time (`awk -v job="  $2:"` was one of
+  the spellings removed here), a `substr($0, 1, 4)`, an `index($0, "    if:")`.
+- **The two libraries are separate, and one consumer proves it**: `check-merge-queue-contexts.sh`
+  loads the walk and not the lexer, because it reads no shell. Merging them would have made every
+  YAML reader carry a bash model it has no use for.
+
+
 **A Windows leg that cannot start processes reports six red smoke tests, not a
 runner fault** ([#966](https://github.com/LASTRADA-Software/fastcached/issues/966)).
 Observed on `Windows-cl-debug`: six failures, all exit `0xc0000142`

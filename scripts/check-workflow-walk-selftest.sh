@@ -89,6 +89,8 @@ function WorkflowOn(kind) {
     else if (kind == "job")
         printf "job\t%s\tat=%d\trunsOn=<%s>\tshell=<%s>\tenvnames=%s\n",
                WfJob, WfJobStart, WfRunsOn, WfJobShell, Names(WfJobEnv)
+    else if (kind == "item")
+        printf "item\t%s\t%s\n", WfPath, WfItem
     else if (kind == "refusal")
         printf "refusal\t%d\t%s\t%s\n", WfAt, WfRefuseKind, WfRefuseDetail
     else if (kind == "end") {
@@ -126,9 +128,9 @@ function Counts(a,   k, n, i, j, t, out, keys) {
     return n ? out : "-"
 }
 function Tally(p) {
-    printf "tally\tpass=%d\traw=%d\ttext=%d\tstep-line=%d\tkey=%d\tstep=%d\tjob=%d\trefusal=%d\n",
+    printf "tally\tpass=%d\traw=%d\ttext=%d\tstep-line=%d\tkey=%d\tstep=%d\tjob=%d\trefusal=%d\titem=%d\n",
            p, tally[p, "raw"], tally[p, "text"], tally[p, "step-line"], tally[p, "key"],
-           tally[p, "step"], tally[p, "job"], tally[p, "refusal"]
+           tally[p, "step"], tally[p, "job"], tally[p, "refusal"], tally[p, "item"]
 }
 DRIVER
 
@@ -215,6 +217,9 @@ jobs:
   first:
     if: ${{ github.event_name == 'push' }}
     name: The First Job
+    needs:
+      - earlier
+      - "also-earlier"
     runs-on:
       - ubuntu-24.04
     defaults:
@@ -323,6 +328,15 @@ Judge() {
         Require "${t}" 'key	jobs/first/name	scope=job' "a job's own name: is reachable as a key event"
         Require "${t}" 'key	jobs/first/steps/with/fetch-depth	scope=step	ind=10' "a with: row is reachable, at step scope"
 
+        # A bare scalar sequence entry, which the walk PLACED and reported nothing
+        # about until `check-gated-jobs.sh` needed `release.needs`. Both of its two
+        # sites are driven -- `needs:`, and `runs-on:`, whose entries additionally
+        # accumulate into `WfRunsOn` -- because they are different code paths, and
+        # a quoted entry is asserted unquoted.
+        Require "${t}" 'item	jobs/first/needs	earlier' "a needs: entry carries its owning key's path"
+        Require "${t}" 'item	jobs/first/needs	also-earlier' "a quoted sequence entry arrives unquoted"
+        Require "${t}" 'item	jobs/first/runs-on	ubuntu-24.04' "a runs-on: entry fires the same kind as any other"
+
         # The step record. `>-`, `|+` and `|` are three chomping spellings and
         # each owns a different number of body lines.
         Require "${t}" 'step	job=first	n=1	name=folded chomped	shell=	uses=	run=2	env=0' "a folded chomped scalar owns both its lines"
@@ -339,7 +353,7 @@ Judge() {
 
         # The job record: its runs-on list joined, its own defaults shell, its env.
         Require "${t}" 'job	first	at=12	runsOn=< ubuntu-24.04>	shell=<sh>	envnames=JOBWIDE' "the job record carries its runs-on list, its own defaults shell and its env"
-        Require "${t}" 'job	second	at=41	runsOn=<windows-2022>	shell=<>	envnames=-' "a job with no defaults and no env of its own says so rather than inheriting"
+        Require "${t}" 'job	second	at=44	runsOn=<windows-2022>	shell=<>	envnames=-' "a job with no defaults and no env of its own says so rather than inheriting"
 
         # And the ORDER: a job is closed BEFORE the next job's key event fires.
         # Asserted as an order rather than as presence, because both orders
@@ -351,8 +365,8 @@ Judge() {
 
         # Every kind, in BOTH passes, and the job kind the same number of times in
         # each -- a pass whose last job is never flushed is what this refuses.
-        Require "${t}" 'tally	pass=1	raw=46	text=6	step-line=15	key=39	step=5	job=2	refusal=0' "pass 1 drove every structural kind"
-        Require "${t}" 'tally	pass=2	raw=46	text=6	step-line=15	key=39	step=5	job=2	refusal=0' "pass 2 drove the same kinds the same number of times as pass 1"
+        Require "${t}" 'tally	pass=1	raw=49	text=6	step-line=15	key=40	step=5	job=2	refusal=0	item=3' "pass 1 drove every structural kind"
+        Require "${t}" 'tally	pass=2	raw=49	text=6	step-line=15	key=40	step=5	job=2	refusal=0	item=3' "pass 2 drove the same kinds the same number of times as pass 1"
 
         # The completeness cross-check. Six run: keys -- four steps, and the
         # workflow and job defaults; the one in the heredoc is inside a scalar.
@@ -386,7 +400,7 @@ Judge() {
         Require "${t}" 'key	jobs/only/steps/if	scope=step	ind=8	value=<>->' "a folded step if: is a key whose value is the indicator"
         Require "${t}" 'key	jobs/only/steps/env/NOTE	scope=step	ind=10	value=<>->' "a folded env value is a key inside the step env block"
         Require "${t}" 'step	job=only	n=1	name=a folded condition and a folded env value	shell=	uses=	run=1	env=1	envnames=NOTE' "the step record has one run line and one env row"
-        Require "${t}" 'tally	pass=2	raw=29	text=9	step-line=13	key=20	step=4	job=1	refusal=0' "the fixture drives nine continuations over four steps"
+        Require "${t}" 'tally	pass=2	raw=29	text=9	step-line=13	key=20	step=4	job=1	refusal=0	item=0' "the fixture drives nine continuations over four steps"
         # The JOB-level folded condition, whose continuation is outside any step --
         # a  event nothing would report while that kind was step-only, and the
         # shape two of the readers still to migrate join on purpose.
@@ -410,8 +424,8 @@ Judge() {
         Require "${t}" 'step	job=one	n=4	name=quoted run	shell=	uses=	run=1' "a single-quoted run: with a doubled apostrophe is read"
         Require "${t}" 'job	one	at=4' "the first job is closed although its last step was refused"
         Require "${t}" 'job	two	at=16' "the last job of the file is closed in END"
-        Require "${t}" 'tally	pass=1	raw=21	text=0	step-line=10	key=18	step=6	job=2	refusal=5' "pass 1 drove five refusals and six steps"
-        Require "${t}" 'tally	pass=2	raw=21	text=0	step-line=10	key=18	step=6	job=2	refusal=5' "pass 2 drove the same"
+        Require "${t}" 'tally	pass=1	raw=21	text=0	step-line=10	key=18	step=6	job=2	refusal=5	item=0' "pass 1 drove five refusals and six steps"
+        Require "${t}" 'tally	pass=2	raw=21	text=0	step-line=10	key=18	step=6	job=2	refusal=5	item=0' "pass 2 drove the same"
     fi
 }
 
@@ -469,6 +483,10 @@ Neuter block-key-plain 's/^        WfBlockOwner = ind; WfBlockKind = "skip"; WfB
     "a plain-scalar continuation knowing which key's scalar it is part of"
 Neuter block-key-run 's/^            WfBlockOwner = ind; WfBlockKind = "run"; WfBlockKey = key$/            WfBlockOwner = ind; WfBlockKind = "run"/' folded \
     "a run: body line knowing it belongs to a run:"
+Neuter item-scalar '/WfItem = WorkflowUnquote(WorkflowTrim(line))/s/^/#/' rich \
+    "a bare sequence entry carrying its text"
+Neuter item-runs-on '/WfItem = WorkflowUnquote(WorkflowTrim(t))/s/^/#/' rich \
+    "a runs-on: entry carrying its text, which is a second site"
 Neuter path-mark '/if (kind == "unreadable-yaml" || kind == "unreadable-run") WorkflowPushPath/s/^/#/' edges \
     "a refused line marking the path so nothing below it claims a readable ancestor"
 Neuter second-document '/a document marker after the first document/s/^/#/' edges \

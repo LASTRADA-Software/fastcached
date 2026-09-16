@@ -382,6 +382,7 @@
             return
         }
         if (kind == "key") return              # the record the walk built is what this check reads
+        if (kind == "item") return             # a `needs:` entry carries no environment read
         if (kind == "step") { judgeStep(); resetCheckStep(); return }
         if (kind == "job") { resetCheckJob(); return }
         if (kind == "refusal") { refuse(WfAt, WfRefuseKind, WfRefuseDetail); return }

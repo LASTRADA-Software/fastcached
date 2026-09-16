@@ -44,6 +44,7 @@ function WorkflowOn(kind) {
     if (kind == "text") return              # a scalar's body is text; no fact of this check lives there
     if (kind == "step-line") return         # and no fact lives at a step's own lines either
     if (kind == "key") { OnKey(); return }
+    if (kind == "item") return              # every fact here is a key or a job, never a sequence entry
     if (kind == "step") return              # this check counts contexts, which are per JOB
     if (kind == "job") { FlushJob(); return }
     if (kind == "refusal") { Refused(); return }

@@ -37,6 +37,7 @@ function WorkflowOn(kind) {
     if (kind == "text") return              # a body line is already in the step record
     if (kind == "step-line") return
     if (kind == "key") return
+    if (kind == "item") return              # the body of one named step is all this reads
     if (kind == "step") { OnStep(); return }
     if (kind == "job") return
     if (kind == "refusal") return           # a workflow this walk cannot read is #1175's subject
