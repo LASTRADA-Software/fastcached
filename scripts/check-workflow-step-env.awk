@@ -1,32 +1,24 @@
 # SPDX-License-Identifier: Apache-2.0
 #
-# `check-workflow-step-env.sh`'s reader: every `run:` step of a workflow, the names it reads, and
+# `check-workflow-step-env.sh`'s rule: for every `run:` step of a workflow, the names it reads and
 # whether each is in scope at the line that reads it.
 #
-# In a file rather than inline in the script since #1456, because the shell lexer it shares with
-# other readers is loaded as an awk library and `-f` cannot be mixed with an inline program. Run
-# as:
+# The WALK is not here. `scripts/lib/workflow-walk.awk` reads the YAML and hands this program one
+# step record at a time through a single hook; this file is #1175's scope rule and #1461's ordering
+# rule over that record, plus the shell models both need. Run as:
 #
-#   awk -v ... -f scripts/lib/shell-lex.awk -f scripts/check-workflow-step-env.awk <file> <file>
+#   awk -v ... -f scripts/lib/shell-lex.awk -f scripts/lib/workflow-walk.awk \
+#       -f scripts/check-workflow-step-env.awk <file> <file>
 #
-# The file is passed TWICE on purpose -- `FNR == 1` counts the passes, and the second pass is
-# what judges, so the first can learn the workflow-level facts a step's verdict needs.
+# The file is passed TWICE on purpose -- the walk counts the passes from `FNR == 1`, and the second
+# pass is what judges, so the first can learn the workflow-level facts a step's verdict needs.
 #
-# The quoting constraint that shaped this program is still in force even though it is no longer
-# inside a single-quoted shell string: `sq = sprintf("%c", 39)` stays, because the SELF-TEST
-# stages fragments of this program's vocabulary and a literal quote here would be one more thing
-# that has to agree across two files.
-
-    function indentOf(s,   n) { n = match(s, /[^ ]/); return n ? n - 1 : length(s) }
-    function trim(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); return s }
-    function unquote(t,   first, last) {
-        first = substr(t, 1, 1); last = substr(t, length(t), 1)
-        if (length(t) >= 2 && first == last && (first == "\"" || first == sq)) return substr(t, 2, length(t) - 2)
-        return t
-    }
+# Every `Wf`-prefixed name below is the walk's, documented in its own header and read-only here.
+# The one exception the walk permits is appending the planted line to `WfBody[]` from the `step`
+# hook, which `judgeStep` does and which the neuter depends on.
     function refuse(at, kind, detail) {
-        if (pass < 2) return
-        printf "REFUSE\t%d\t%s\t%s\t%s\t%s\n", at, stepName, kind, detail, remedy[kind]
+        if (WfPass < 2) return
+        printf "REFUSE\t%d\t%s\t%s\t%s\t%s\n", at, (reportName != "" ? reportName : WfStepName), kind, detail, remedy[kind]
     }
 
     # ---- bash ----------------------------------------------------------------------------------------------------
@@ -158,7 +150,7 @@
             # Every read, wherever it sits, so the bash layer can refuse an `ActionExports` row
             # whose NAME nothing reads any more. Gated on the second pass like every other record:
             # the file is read TWICE, and an ungated printf reported every expression twice.
-            if (pass >= 2) printf "EXPRREAD\t%d\t%s\t%s\t%s\t%s\n", atLine, stepName, "-", name, ""
+            if (WfPass >= 2) printf "EXPRREAD\t%d\t%s\t%s\t%s\t%s\n", atLine, WfStepName, "-", name, ""
             rest = substr(rest, RSTART + RLENGTH)
         }
     }
@@ -247,12 +239,12 @@
     # PowerShell arm above folds only what a PowerShell script READS.
     function judgeExpressions(   name) {
         for (name in exprOther) {
-            if ((name in workflowEnv) || (name in jobEnv) || (name in stepEnv)) continue
+            if ((name in WfWorkflowEnv) || (name in WfJobEnv) || (name in WfStepEnv)) continue
             if ((name in jobWritten) || (name in jobExported)) continue
             refuse(exprOther[name], "undefined-expression", "reads ${{ env." name " }} and nothing in scope supplies it")
         }
         for (name in exprEnvValue) {
-            if ((name in workflowEnv) || (name in jobEnv)) continue
+            if ((name in WfWorkflowEnv) || (name in WfJobEnv)) continue
             if ((name in jobWritten) || (name in jobExported)) continue
             refuse(exprEnvValue[name], "undefined-expression",
                    "reads ${{ env." name " }} in this step`s own `env:` block, where its own `env:` is not yet in force")
@@ -262,22 +254,22 @@
     # action nor a write can satisfy a read in the very step that performs it -- an expression is
     # substituted before the step runs, and an action exports only once it has run.
     function adoptExports(   i, n, parts, row) {
-        if (stepUses == "") return
-        printf "USES\t%d\t%s\t%s\t%s\t%s\n", stepLine, stepName, "-", stepUses, ""
+        if (WfStepUses == "") return
+        printf "USES\t%d\t%s\t%s\t%s\t%s\n", WfStepLine, WfStepName, "-", WfStepUses, ""
         n = split(exports, parts, " ")
         for (i = 1; i <= n; i++) {
             if (split(parts[i], row, "|") != 2) continue
-            if (row[1] == stepUses) jobExported[row[2]] = 1
+            if (row[1] == WfStepUses) jobExported[row[2]] = 1
         }
     }
 
     # ---- one step --------------------------------------------------------------------------------------------------
     function resolveShell(   s) {
-        s = stepShell != "" ? stepShell : (jobShell != "" ? jobShell : workflowShell)
+        s = WfStepShell != "" ? WfStepShell : (WfJobShell != "" ? WfJobShell : WfWorkflowShell)
         if (s == "") {
-            if (runsOn ~ /\$\{\{/) return "?"
-            if (tolower(runsOn) ~ /windows/) s = "pwsh"
-            else if (tolower(runsOn) ~ /(ubuntu|macos|linux)/) s = "bash"
+            if (WfRunsOn ~ /\$\{\{/) return "?"
+            if (tolower(WfRunsOn) ~ /windows/) s = "pwsh"
+            else if (tolower(WfRunsOn) ~ /(ubuntu|macos|linux)/) s = "bash"
             else return "?"
         }
         sub(/[ \t].*$/, "", s)
@@ -286,50 +278,52 @@
     # The names a step of @p model can see: every scope, its own assignments, and its shell family allowlist.
     # PowerShell compares them upper-cased, as Windows does.
     function admit(src, fold,   k) { for (k in src) visible[fold ? toupper(k) : k] = 1 }
-    function flush(   model, i, name, missing, n, fold, t, at, code) {
-        if (!inStep) return
-        inStep = 0
-        if (pass < 2) return
+    # One step, judged. Reached from the `step` kind of `WorkflowOn` below, so the walk owns
+    # WHEN a step has ended and this owns what that means -- the `inStep` guard that used to
+    # open this function belongs to the library now, which fires the kind only for a step it
+    # had opened.
+    function judgeStep(   model, i, name, missing, n, fold, t, at, code) {
+        if (WfPass < 2) return
         # The expressions BEFORE the `hasRun` return, because a `uses:` step has no `run:` at all
         # and it is the step that EXPORTS -- returning first would leave every action export
         # unadopted and refuse the reads they supply.
         judgeExpressions()
-        if (plant) { printf "PLANTEDEXPR\t%d\t%s\t%d\t%d\t%s\n", stepLine, stepName, (PlantExprName in exprEnvValue), stepEnvRows, ""; delete exprEnvValue[PlantExprName] }
+        if (plant) { printf "PLANTEDEXPR\t%d\t%s\t%d\t%d\t%s\n", WfStepLine, WfStepName, (PlantExprName in exprEnvValue), WfStepEnvRows, ""; delete exprEnvValue[PlantExprName] }
         adoptExports()
-        if (!hasRun) return
+        if (!WfHasRun) return
         scanned++
         model = resolveShell()
-        if (model == "?") { refuse(stepLine, "unresolved-shell", "runs-on `" runsOn "`"); return }
-        if (substr(model, 1, 1) == "!") { refuse(stepLine, "unknown-shell", "shell `" substr(model, 2) "`"); return }
+        if (model == "?") { refuse(WfStepLine, "unresolved-shell", "runs-on `" WfRunsOn "`"); return }
+        if (substr(model, 1, 1) == "!") { refuse(WfStepLine, "unknown-shell", "shell `" substr(model, 2) "`"); return }
         split("", defs); split("", refs); split("", visible); lexState = ""; heredocEnd = ""; hereString = ""
         loopDepth = 0; inFn = 0; fnBrace = 0; fnStarted = 0; pwBrace = 0; constructBroken = ""
         models[model]++
         fold = (model == "pwsh")
         # The plant is one more line, read LAST and by the same lexer, so a body that leaves a quote, a heredoc or a
         # here-string open hides it -- which is what the plant exists to catch.
-        if (plant) { bodyAt[nbody] = stepLine; body[nbody++] = fold ? "$null = $env:" PlantName : ": \"$" PlantName "\"" }
+        if (plant) { WfBodyAt[WfBodyCount] = WfStepLine; WfBody[WfBodyCount++] = fold ? "$null = $env:" PlantName : ": \"$" PlantName "\"" }
         # No line is skipped for starting with `#`: the lexer ends a comment itself, and inside a heredoc or a
         # here-string such a line is text that expands -- a Markdown heading in a report body. A heredoc line is
         # text, too, so `NAME=$NAME` written into a file assigns nothing.
-        for (i = 0; i < nbody; i++) {
+        for (i = 0; i < WfBodyCount; i++) {
             curLine = i
             loose = looseHere(fold)
-            if (fold) { t = pwshVisible(body[i]); code = lexCode; pwshScan(t) }
-            else { t = bashVisible(body[i]); code = lexCode; if (code != "") bashDefs(code); bashRefs(t) }
+            if (fold) { t = pwshVisible(WfBody[i]); code = lexCode; pwshScan(t) }
+            else { t = bashVisible(WfBody[i]); code = lexCode; if (code != "") bashDefs(code); bashRefs(t) }
             # The RAW line, not the lexed code: the name in `echo "NAME=$v" >> "$GITHUB_ENV"` sits
             # inside quotes, which the lexer masks. Adopted after this step has been judged above.
-            noteWrites(body[i])
+            noteWrites(WfBody[i])
             advance(code, fold)
         }
         if (constructBroken == "" && (inFn || loopDepth != 0))
             constructBroken = inFn ? "a function whose braces never close" : "a `do` with no `done`"
         if (plant) {
-            printf "PLANTED\t%d\t%s\t%d\n", stepLine, stepName, (PlantName in refs)
+            printf "PLANTED\t%d\t%s\t%d\n", WfStepLine, WfStepName, (PlantName in refs)
             delete refs[PlantName]
         }
         # `defs` is deliberately NOT admitted into `visible`: a scope and the allowlist hold for a whole script
         # while an assignment holds from its own line down, and folding the two throws that line away.
-        admit(stepEnv, fold); admit(jobEnv, fold); admit(workflowEnv, fold)
+        admit(WfStepEnv, fold); admit(WfJobEnv, fold); admit(WfWorkflowEnv, fold)
         if (fold) admit(windowsSet, fold); else admit(bashSet, fold)
         missing = ""; n = 0
         for (name in refs) {
@@ -339,247 +333,66 @@
             if (at == -1 || defs[name] <= at) continue
             # Refused at the line of the READ rather than at the line of the step, because the remedy is a line to
             # move, and a step can be a hundred lines long.
-            refuse(bodyAt[at], "order", "reads " (fold ? "$env:" : "$") name " here, and this script assigns it further down, at line " bodyAt[defs[name]])
+            refuse(WfBodyAt[at], "order", "reads " (fold ? "$env:" : "$") name " here, and this script assigns it further down, at line " WfBodyAt[defs[name]])
         }
-        if (n) refuse(stepLine, "undefined", "reads " missing)
-        if (constructBroken != "") refuse(stepLine, "unreadable-construct", constructBroken)
+        if (n) refuse(WfStepLine, "undefined", "reads " missing)
+        if (constructBroken != "") refuse(WfStepLine, "unreadable-construct", constructBroken)
     }
-    function resetStep() {
-        split("", stepEnv); split("", body); split("", bodyAt)
-        split("", exprOther); split("", exprEnvValue); stepUses = ""; stepEnvRows = 0
-        nbody = 0; hasRun = 0; inStep = 1; stepName = "(unnamed)"; stepLine = FNR; stepShell = ""; stepKeyIndent = -1
-    }
-    # The `env:`, `defaults` and `runs-on` may follow its `steps:`, so the second pass starts each job from what the
-    # first pass found anywhere in that job.
-    function resetJob(   k, kp) {
-        split("", jobEnv); split("", jobWritten); split("", jobExported)
-        jobShell = ""; runsOn = ""; inSteps = 0; itemIndent = -1; jobKeyIndent = -1; stepName = "(job)"; jobStart = FNR
-        if (pass < 2) return
-        for (k in jobEnvAt) { split(k, kp, SUBSEP); if (kp[1] == jobStart) jobEnv[kp[2]] = 1 }
-        if (jobStart in jobShellAt) jobShell = jobShellAt[jobStart]
-        if (jobStart in runsOnAt) runsOn = runsOnAt[jobStart]
-    }
-    # Every state the reader carries, reset at the start of each pass. The workflow scope is not: `env:` and
-    # `defaults` may follow `jobs:`, and the first pass is what the second one reads them from.
-    function resetAll() {
-        inStep = 0; inJobs = 0; jobIndent = -1; blockOwner = -1; inEnv = 0; inDefaults = 0; defaultsRun = -1
-        inRunsOnList = 0; seenContent = 0; resetJob(); stepName = "(workflow)"
-    }
-    # An `env:` key opens a block mapping of @p scope, or is refused when it carries anything else.
-    function openEnv(scope) {
-        if (value != "" && value != "{}") { refuse(FNR, "unreadable-env", scope " `env: " value "`"); return }
-        inEnv = 1; envIndent = ind; envScope = scope
-    }
-    function addEnv(name) {
-        if (envScope == "workflow") workflowEnv[name] = 1
-        else if (envScope == "job") { jobEnv[name] = 1; jobEnvAt[jobStart, name] = 1 }
-        else stepEnv[name] = 1
-    }
+    # ---- this check`s own per-scope state ------------------------------------------------------
+    # The walk owns the workflow`s structure; these four arrays are this check`s records, cleared
+    # on the same boundaries. A step`s are cleared AFTER `judgeStep` has read them, which is why
+    # the hook does both in that order rather than resetting on the way in.
+    function resetCheckStep() { split("", exprOther); split("", exprEnvValue) }
+    function resetCheckJob() { split("", jobWritten); split("", jobExported); resetCheckStep() }
 
-    # ---- the count ---------------------------------------------------------------------------------------------------
-    # Every `run:` key outside a scalar, found WITHOUT the reader: no steps, no jobs, no key columns, only which lines a
-    # scalar owns. A line the reader places as a script and a line counted here are compared in END, so a step the
-    # reader stops recognising -- keys at a column it did not expect -- is refused by line rather than read as clean.
-    # A script body is a scalar, so a heredoc writing `run:` into a file is text here too, as in the reader.
-    function count(s,   lead, key, v) {
-        if (countOwner >= 0 && (s ~ /^[ \t]*$/ || indentOf(s) > countOwner)) return
-        countOwner = -1
-        if (match(s, /^[ ]*(-[ ]+)*/)) { lead = substr(s, 1, RLENGTH); gsub(/-/, " ", lead); s = lead substr(s, RLENGTH + 1) }
-        if (!match(s, /^[ ]*[A-Za-z_][A-Za-z0-9_.-]*[ \t]*:([ \t]|$)/)) return
-        key = substr(s, RSTART, RLENGTH)
-        sub(/^[ ]*/, "", key); sub(/[ \t]*:[ \t]*$/, "", key)
-        v = trim(substr(s, RSTART + RLENGTH))
-        if (substr(v, 1, 1) != "\"" && substr(v, 1, 1) != sq) sub(/(^|[ \t]+)#.*$/, "", v)
-        if (key == "run") { counted[FNR] = trim(s); runKeys++ }
-        if (v != "") countOwner = indentOf(s)
-    }
-    function place() { if (pass == 2) placed[FNR] = 1 }
-
-    # The text of a YAML-quoted scalar @p v, which must close on its own line with at most a comment after it, and sets
-    # yamlOk to say whether it did. YAML quoting is not shell quoting, so the quotes must not reach a shell model, where
-    # they would hide every read between them: a doubled apostrophe in single quotes is one apostrophe, and in double
-    # quotes an escaped quote, backslash or slash is that character. Any other escape, a quote left open for the next
-    # line, or text after the closing quote, is not read at all -- yamlOk is 0 and the caller refuses the step.
-    function yamlQuoted(v,   q, i, n, ch, e, out) {
-        q = substr(v, 1, 1); n = length(v); out = ""; yamlOk = 0
-        for (i = 2; i <= n; i++) {
-            ch = substr(v, i, 1)
-            if (ch == q) {
-                if (q == sq && substr(v, i + 1, 1) == sq) { out = out sq; i++; continue }
-                yamlOk = (substr(v, i + 1) ~ /^([ \t]+#.*)?$/)
-                return yamlOk ? out : ""
-            }
-            if (q == "\"" && ch == "\\") {
-                e = substr(v, ++i, 1)
-                if (e != "\"" && e != "\\" && e != "/") return ""
-                out = out e
-                continue
-            }
-            out = out ch
-        }
-        return ""
-    }
-
+    # The tables this check is given, and nothing the walk owns: `sq`, the pass counter and every
+    # scope flag are set by `scripts/lib/workflow-walk.awk`, whose `BEGIN` runs first because it is
+    # named first on the command line.
     BEGIN {
-        sq = sprintf("%c", 39)
         n = split(bashNames, p, " "); for (i = 1; i <= n; i++) if (p[i] != "") bashSet[p[i]] = 1
         n = split(windowsNames, p, " "); for (i = 1; i <= n; i++) if (p[i] != "") windowsSet[p[i]] = 1
         n = split(shells, p, " "); for (i = 1; i <= n; i++) if (split(p[i], q, "|") == 2) shellModel[q[1]] = q[2]
         n = split(remedies, p, "\036"); for (i = 1; i <= n; i++) if ((k = index(p[i], "|")) > 0) remedy[substr(p[i], 1, k - 1)] = substr(p[i], k + 1)
-        pass = 0; workflowShell = ""; countOwner = -1; resetAll()
+        reportName = ""
+        resetCheckJob()
     }
 
-    FNR == 1 { pass++; resetAll() }
+    FNR == 1 { resetCheckJob() }
 
-    {
-        line = $0
-        sub(/\r$/, "", line)
-        ind = indentOf(line)
-        blank = (line ~ /^[ \t]*$/)
-        if (pass == 2) count(line)
-
-        # A block scalar, or a plain scalar continuing, owns every blank or more-indented line after its key.
-        if (blockOwner >= 0) {
-            if (blank || ind > blockOwner) {
-                if (blockKind == "run") { bodyAt[nbody] = FNR; body[nbody++] = blank ? line : substr(line, blockOwner + 1) }
-                # A continuation line of one of this step`s values. A `#` line inside a `run:` body
-                # is SHELL text and its expressions are still substituted, so it is read here --
-                # unlike a YAML comment, which the site below never sees.
-                if (inStep && inSteps) noteExpr(line, FNR, inEnv && envScope == "step" && ind > envIndent)
-                next
-            }
-            blockOwner = -1
+    # The ONE function `scripts/lib/workflow-walk.awk` calls. Every kind it can emit has an arm
+    # here, the three this check makes no use of included -- spelled as a returning arm rather than
+    # left to fall off the end, because a kind nobody decided about and a kind decided to be
+    # uninteresting are otherwise the same silence.
+    function WorkflowOn(kind) {
+        if (kind == "raw") return              # the `run:` count is the walk`s own
+        if (kind == "text" || kind == "step-line") {
+            # A `run:` body line and a step`s own key line both carry `${{ env.* }}`. The plant
+            # goes in HERE, at the read site, on every env row of every step -- not synthesised in
+            # the judging. Synthesised, it would prove the judging works and say nothing about
+            # whether the reader ever VISITED the env block of a step, which is the half that can
+            # silently stop being true. A value written as a BLOCK SCALAR arrives as `text` and is
+            # not planted; stated rather than covered, because no step in this tree writes an
+            # `env:` value that way.
+            noteExpr((plant && WfEnvRow && kind == "step-line") ? WfLine " ${{ env." PlantExprName " }}" : WfLine,
+                     WfAt, WfEnvRow)
+            return
         }
-        if (blank || line ~ /^[ \t]*#/) next
-        if (line ~ /^(---|\.\.\.)([ \t]|$)/) {
-            if (seenContent) refuse(FNR, "unreadable-yaml", "a document marker after the first document")
-            next
-        }
-        seenContent = 1
-
-        isItem = (line ~ /^[ ]*-([ \t]|$)/)
-
-        # Leaving a context, by indentation.
-        if (inEnv && ind <= envIndent && !(isItem && ind == envIndent)) inEnv = 0
-        if (inDefaults && ind <= defaultsIndent) { inDefaults = 0; defaultsRun = -1 }
-        if (inRunsOnList && ind <= runsOnIndent && !(isItem && ind == runsOnIndent)) inRunsOnList = 0
-        if (inSteps && ind <= stepsIndent && !(isItem && (itemIndent < 0 || ind == itemIndent))) { flush(); inSteps = 0 }
-        if (inJobs && ind == 0) { flush(); inJobs = 0 }
-
-        stepItem = 0
-        if (isItem) {
-            if (inRunsOnList) { t = line; sub(/^[ ]*-[ \t]*/, "", t); runsOn = runsOn " " unquote(trim(t)); runsOnAt[jobStart] = runsOn; next }
-            if (inSteps && (itemIndent < 0 || ind == itemIndent)) {
-                if (itemIndent < 0) itemIndent = ind
-                flush(); resetStep(); stepItem = 1
-            }
-            sub(/-/, " ", line)
-            ind = indentOf(line)
-            if (line ~ /^[ \t]*$/) next
-            # The keys of a step sit where its first key does, however many spaces follow the dash.
-            if (stepItem) stepKeyIndent = ind
-        }
-
-        # Every other line of a step: its keys and their inline values, and the rows of its
-        # `with:` and `env:` blocks. AFTER the boundary handling above, so a step`s first line is
-        # read as that step`s and not as its predecessor`s, and after the comment skip, so a YAML
-        # comment explaining an expression is not read as carrying one.
-        if (inStep && inSteps) {
-            inOwnEnvRow = (inEnv && envScope == "step" && ind > envIndent)
-            if (inOwnEnvRow) stepEnvRows++
-            # The plant goes in HERE, at the read site, on every env row of every step -- not
-            # synthesised in the judging. Synthesised, it would prove the judging works and say
-            # nothing about whether the reader ever VISITED the env block of a step, which is the
-            # half that can silently stop being true. A value written as a BLOCK SCALAR is read at
-            # the continuation site above and is not planted; stated rather than covered, because
-            # no step in this tree writes an `env:` value that way.
-            noteExpr((plant && inOwnEnvRow) ? line " ${{ env." PlantExprName " }}" : line, FNR, inOwnEnvRow)
-        }
-
-        if (!match(line, /^[ ]*[A-Za-z_][A-Za-z0-9_.-]*[ \t]*:([ \t]|$)/)) {
-            # A scalar list item (a `needs:` or `branches:` entry) is placed; a step that is not a mapping, and any
-            # other line, is not.
-            if (isItem && !stepItem) next
-            refuse(FNR, "unreadable-yaml", (stepItem ? "a step written as `" : "`") trim(line) "`")
-            next
-        }
-        key = substr(line, RSTART, RLENGTH)
-        sub(/^[ ]*/, "", key); sub(/[ \t]*:[ \t]*$/, "", key)
-        value = trim(substr(line, RSTART + RLENGTH))
-        c = substr(value, 1, 1)
-        # A comment may be all there is after the colon, and the block below the key is then its value.
-        if (c != "\"" && c != sq) sub(/(^|[ \t]+)#.*$/, "", value)
-
-        # A block scalar indicator hands the lines after it to the block; any other inline value may continue as a
-        # plain scalar on more-indented lines, which are its text and never keys.
-        if (inStep && inSteps && stepKeyIndent < 0 && ind > itemIndent) stepKeyIndent = ind
-        stepKey = (inStep && inSteps && ind == stepKeyIndent)
-        if (value ~ /^[|>][-+0-9]*$/) {
-            blockOwner = ind
-            blockKind = (stepKey && key == "run") ? "run" : "skip"
-            if (blockKind == "run") { hasRun = 1; place() }
-            if (!(inEnv && ind > envIndent)) next
-        } else if (value != "") {
-            blockOwner = ind; blockKind = "skip"
-        }
-
-        if (inEnv && ind > envIndent) { addEnv(key); next }
-
-        if (ind == 0) {
-            if (key == "env") openEnv("workflow")
-            else if (key == "defaults") { inDefaults = 1; defaultsIndent = 0 }
-            else if (key == "jobs") { if (value != "") refuse(FNR, "unreadable-yaml", "`jobs: " value "`"); else { inJobs = 1; jobIndent = -1 } }
-            next
-        }
-
-        if (inDefaults) {
-            if (key == "run" && value == "") { defaultsRun = ind; place(); next }
-            if (defaultsRun >= 0 && ind > defaultsRun && key == "shell") {
-                if (defaultsIndent == 0) workflowShell = unquote(value); else { jobShell = unquote(value); jobShellAt[jobStart] = jobShell }
-            }
-            next
-        }
-
-        if (!inJobs) next
-        if (jobIndent < 0) jobIndent = ind
-        if (ind == jobIndent) { flush(); resetJob(); next }
-        if (jobKeyIndent < 0 && ind > jobIndent) jobKeyIndent = ind
-        if (ind == jobKeyIndent) {
-            if (key == "env") openEnv("job")
-            else if (key == "defaults") { inDefaults = 1; defaultsIndent = ind }
-            else if (key == "runs-on") { if (value == "") { inRunsOnList = 1; runsOnIndent = ind; runsOn = ""; blockOwner = -1 } else { runsOn = unquote(value); runsOnAt[jobStart] = runsOn } }
-            else if (key == "steps") { if (value != "") refuse(FNR, "unreadable-yaml", "`steps: " value "`"); else { inSteps = 1; stepsIndent = ind; itemIndent = -1 } }
-            next
-        }
-        if (!stepKey) next
-        if (key == "name") { t = unquote(value); if (t != "") stepName = t }
-        else if (key == "uses") { stepUses = trim(unquote(value)); sub(/@.*$/, "", stepUses) }
-        else if (key == "shell") stepShell = trim(unquote(value))
-        else if (key == "env") openEnv("step")
-        else if (key == "run") {
-            place()
-            if (c == "*" || c == "&" || c == "!" || c == "[" || c == "{") refuse(FNR, "unreadable-run", "`run: " value "`")
-            else {
-                if (c == sq || c == "\"") {
-                    t = yamlQuoted(value)
-                    if (!yamlOk) { refuse(FNR, "unreadable-run", "`run: " value "` is a quoted scalar this check cannot read on one line"); next }
-                    value = t
-                }
-                hasRun = 1
-                bodyAt[nbody] = FNR; body[nbody++] = value
-                # A plain scalar continues on more-indented lines, including one whose first line is empty.
-                blockOwner = ind; blockKind = "run"
-            }
-        }
+        if (kind == "key") return              # the record the walk built is what this check reads
+        if (kind == "step") { judgeStep(); resetCheckStep(); return }
+        if (kind == "job") { resetCheckJob(); return }
+        if (kind == "refusal") { refuse(WfAt, WfRefuseKind, WfRefuseDetail); return }
+        if (kind == "end") { report(); return }
     }
 
-    END {
-        flush()
-        stepName = "(none)"
+    # Every `run:` key the walk COUNTED without placing it in a step, and every script it placed on
+    # a line the count found no key on. Two directions, because either one alone is satisfied by a
+    # reader that sees nothing and a count that sees nothing.
+    function report(   i, placedKeys) {
+        reportName = "(none)"
         for (i = 1; i <= FNR; i++) {
-            if (i in placed) placedKeys++
-            if ((i in counted) && !(i in placed)) refuse(i, "unplaced-run", "`" counted[i] "` is a `run:` key the reader placed in no step")
-            else if ((i in placed) && !(i in counted)) refuse(i, "unplaced-run", "the reader placed a `run:` script on a line the count found no `run:` key on")
+            if (i in WfPlaced) placedKeys++
+            if ((i in WfCounted) && !(i in WfPlaced)) refuse(i, "unplaced-run", "`" WfCounted[i] "` is a `run:` key the reader placed in no step")
+            else if ((i in WfPlaced) && !(i in WfCounted)) refuse(i, "unplaced-run", "the reader placed a `run:` script on a line the count found no `run:` key on")
         }
-        printf "STEPS\t%d\t%d\t%d\t%d\t%d\n", scanned, models["bash"], models["pwsh"], runKeys, placedKeys
+        printf "STEPS\t%d\t%d\t%d\t%d\t%d\n", scanned, models["bash"], models["pwsh"], WfRunKeys, placedKeys
     }

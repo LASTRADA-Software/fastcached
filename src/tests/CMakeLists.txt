@@ -3079,6 +3079,19 @@ set_tests_properties("workflow-step-env-plant" PROPERTIES
     TIMEOUT 60
 )
 
+# The shared workflow walk (#1456), driven directly. Its consumers reach three of its eight event
+# kinds; the rest are driven here or they ship with nothing having watched them work -- and gawk
+# makes a missing hook fatal only on the path that REACHES it, so an unreached kind is silence in
+# both directions. Every assertion family carries a neuter, and the run states the counts.
+add_test(
+    NAME "workflow-walk-selftest"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-workflow-walk-selftest.sh"
+)
+set_tests_properties("workflow-walk-selftest" PROPERTIES
+    LABELS "hygiene"
+    TIMEOUT 60
+)
+
 add_test(
     NAME "workflow-step-env-selftest"
     COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-workflow-step-env.sh" --self-test
