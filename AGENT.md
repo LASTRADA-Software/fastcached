@@ -1314,7 +1314,10 @@ what differs between compilers, standard libraries, hosts and tool versions.
   GLOB, every `run:` key is COUNTED by a walk that knows no steps, and the refusal names the STEP.
   And a read is judged at its OWN line — loosened to the whole script only inside a LOOP body, which
   runs again, and a FUNCTION body, which runs where it is called. A `trap` handler needs no
-  loosening, which is a finding rather than an omission. `ctest -R workflow-step-env`.
+  loosening, which is a finding rather than an omission. The `${{ env.NAME }}` EXPRESSIONS are read
+  too, since one naming nothing substitutes EMPTY with no error — and a step's own `env:` satisfies
+  its `run:`, `with:`, `if:` and `name:` but NOT another row of that same `env:` block, which is
+  what stops a typo satisfying itself. `ctest -R workflow-step-env`.
 - Every check whose SUBJECT is documentation was skipped on exactly the change it exists to catch,
   because `code=false` is right for a compiler and backwards for prose. Prose drifts by being
   EDITED. The set is the `docs-subject` ctest LABEL, read out of `src/tests/CMakeLists.txt` and

@@ -4648,6 +4648,21 @@ which reads identically to complete coverage. It walks every workflow file as a 
   had stopped working. What the pair of cases pins instead is the DISCRIMINATION: single
   quotes accepted, double quotes refused. Neutering the mask reddens the single-quote case
   along with four pre-existing ones, which is what says the answer rests on the lexer.
+- **And the `${{ env.NAME }}` expressions are read too** (#1460). The convention this check
+  established -- bring an exported name into a step as `NAME: ${{ env.NAME }}` -- concentrates
+  the risk in one spelling: an expression naming nothing in scope is substituted with an EMPTY
+  string, with no error, so a typo defines the name the shell half then finds and nothing
+  objects. Read in a step's `run:`, `with:`, `if:`, `name:` and `env:` values; satisfied by the
+  workflow's or the job's `env:`, an EARLIER step's `$GITHUB_ENV` write, an `ActionExports`
+  row, and -- for every field except a step's own `env:` VALUES -- the step's own `env:`.
+- **That exception is the whole rule and not a detail**: GitHub substitutes an `env:` value
+  before the step's environment exists, so `SCCACHE_PAHT: ${{ env.SCCACHE_PAHT }}` would
+  otherwise satisfy ITSELF -- the one shape the ticket was opened for. A step cannot read what
+  it exports or writes either, for the same reason one step along, and the two cases that say
+  so exist because a NEUTER showed the obvious ones could not: they put the read in one step
+  and the source in another, so they discriminate WHICH STEP and never WHEN IN THE STEP.
+  Neutering the order reddened nothing. **A case that cannot fail for its stated reason is the
+  default outcome, not bad luck.**
 - Two limits are pinned as PASSING cases rather than left to be rediscovered: the grain is a
   LINE, so a read and an assignment on ONE line are not ordered against each other
   (`for x in a; do echo "$X"; X=1; done` is accepted), and for PowerShell the relaxation is
@@ -5700,15 +5715,6 @@ is correct: an inclusion list naming this repository's own layout needs no roots
   entry under "Language and ABI pitfalls" being obeyed, not a gap in it: neither platform has a CI
   leg to compile a branch for it. It closes when each has one, and that change removes the `#1432`
   comments in `Core/CpuFeatures` and this entry.
-
-- **[#1460](https://github.com/LASTRADA-Software/fastcached/issues/1460)** — the
-  per-step env check accepts a `NAME: ${{ env.NAME }}` row as naming where an exported name
-  comes from, and reads nothing on its right: a `${{ env.X }}` naming no workflow, job or
-  step `env:`, no earlier `$GITHUB_ENV` write and no action export substitutes EMPTY with no
-  error, so a typo'd row passes. The same holds for a `${{ env.X }}` anywhere in a step's
-  `run:`, `with:`, `if:` or `env:` values. It closes when expressions are read against those
-  sources, with a writer table, an action-export table refused when stale in either direction,
-  and the plant added to every step's `env:` values.
 
 - **[#1410](https://github.com/LASTRADA-Software/fastcached/issues/1410)** — the
   declared clang-tidy build crashes in `modernize-min-max-use-initializer-list` on a call through a

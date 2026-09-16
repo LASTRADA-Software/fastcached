@@ -30,8 +30,26 @@
 #
 # A name an EARLIER step or an action exported through `$GITHUB_ENV` does reach a later step at run time, and is
 # still refused unless the step names it in its own `env:` -- `NAME: ${{ env.NAME }}`, the spelling the tree already
-# uses for `CLANG_TIDY_BIN`. That row is the only spelling that says, in the step, where the name comes from, and it
-# asks for no model of every `$GITHUB_ENV` write and every action's exports, which would grow a row per action.
+# uses for `CLANG_TIDY_BIN`. That row is the only spelling that says, in the step, where the name comes from.
+#
+# ## The `${{ env.NAME }}` expressions themselves (#1460)
+#
+# That convention concentrates the risk in one spelling, so the RIGHT-HAND SIDE is read too. An expression naming
+# nothing in scope is substituted with an EMPTY STRING, with no error and no warning, so `SCCACHE_PAHT:
+# ${{ env.SCCACHE_PAHT }}` defines the name the shell half then finds and nothing anywhere objects -- #1174 through a
+# second door.
+#
+# Read in a step's `run:`, `with:`, `if:`, `name:` and `env:` values. Satisfied by the workflow's or the job's
+# `env:`, by a `$GITHUB_ENV` write in an EARLIER step of the same job, by an `ActionExports` row, and -- for every
+# field except a step's own `env:` values -- by the step's own `env:`. That exception is the whole point rather than
+# a detail: GitHub substitutes an `env:` value before the step's environment exists, so a typo that reads the name
+# it is defining would otherwise satisfy itself.
+#
+# `ActionExports` holds only names some step READS, and a row is refused STALE in both directions -- its action used
+# by nobody, or its name read by nobody. A `$GITHUB_ENV` write is any line NAMING `GITHUB_ENV`: every `NAME=` token
+# on it is taken as written, which covers the bash `echo`/`printf` redirect, PowerShell's `>> $env:GITHUB_ENV` and
+# `Add-Content`, each with a case. Job-level and workflow-level fields -- `runs-on`, a job's `env:` values, a job's
+# `if:` -- are out of scope and unread, as is every context other than `env.`.
 #
 # ## Which shell reads the script
 #
@@ -60,9 +78,16 @@
 #
 # ## What it does NOT cover, so that nobody reads a pass as more than it is
 #
-# A name reached by `eval` or indirect expansion; one a sourced file defines; one supplied through a `${{ }}`
-# expression (substituted, so invisible here); `${#arr[@]}`. One known residual, with an issue of its own: the
-# `NAME: ${{ env.NAME }}` row itself -- a typo'd `${{ env.X }}` on the right of it is unchecked until #1460.
+# A name reached by `eval` or indirect expansion; one a sourced file defines; `${#arr[@]}`. And four stated blind
+# spots in the expression half, each narrow and each the reason a wider reader was not written:
+#
+#   * a `$GITHUB_ENV` write whose names are on LATER lines (`cat >> "$GITHUB_ENV" <<EOF`) is not seen; the two
+#     writes in this tree are both the `echo` form;
+#   * a step `env:` VALUE written as a BLOCK SCALAR is read, but the `--plant` for expressions does not reach it;
+#   * an expression inside a YAML comment is correctly unread, and one inside a `#` line of a `run:` BODY is read,
+#     because GitHub substitutes that one before the shell ever sees it;
+#   * a name a `${{ }}` expression supplies to the SHELL is still invisible to the shell half, which is the original
+#     residual and is unchanged: the expression is substituted before the script exists.
 #
 # ## Where in a script a name has to be defined
 #
@@ -110,8 +135,43 @@ WindowsProvided="PROGRAMDATA"
 ShellModels="bash|bash
 pwsh|pwsh"
 
+# action|NAME -- a name an action EXPORTS, and only a name some step here reads through
+# `${{ env.NAME }}`. One row per (action, name); the action is matched on the part before its
+# `@`, so a version bump keeps the row.
+#
+# A row is refused STALE in BOTH directions, because the two go wrong separately: its action
+# is used by no step any more, or its name is read by no expression any more. An opt-in list
+# of exports would read identically to complete coverage, which is why this holds only what
+# is READ -- a name nothing reads needs no row and would have to be kept correct for nothing.
+# OVERRIDABLE by `FASTCACHED_STEPENV_ACTION_EXPORTS`, and the self-test sets it EMPTY: a
+# synthetic workflow uses none of these actions and reads none of these names, so every
+# case would trip the staleness check below on a tree the case says nothing about. A case
+# that is ABOUT an export stages its own row.
+ActionExports="${FASTCACHED_STEPENV_ACTION_EXPORTS-mozilla-actions/sccache-action|SCCACHE_PATH}"
+
+# Whether the two WHOLE-TREE claims below are being made: that at least one
+# `${{ env.NAME }}` expression was read, and that every `ActionExports` row still describes
+# something.
+#
+# Both are claims about THIS repository's workflows and about no directory the scan is pointed
+# at. A staged tree legitimately reads no expression and uses no action, so making either claim
+# there is the guard firing on a tree it says nothing about. ON for the default directory, OFF
+# for a `--workflows` one -- a SCOPE rather than an exemption.
+#
+# **Both, through one knob, because the second caller is what taught this.** The staleness half
+# was first scoped by emptying the table inside this file's own self-test, which fixed the
+# caller I could see: `check-merge-group-report.sh` also runs this check over a staged tree, and
+# CI refused the real `sccache-action` row on a tree that uses no action at all. A rule stated
+# in the files that obey it reaches no file that does not.
+#
+# A case sets it to 1 to drive either refusing direction, because a guard nobody has watched
+# refuse is not known to be a guard.
+JudgingTheRealTree=1
+
 # kind|remedy -- the text a refusal of that kind ends with.
-Remedies="undefined|A step's environment is its own: a sibling step's or another job's \`env:\` does not lend it one, so under \`set -u\` the step dies on that line and without it the name expands to EMPTY and a branch is silently taken the wrong way (#1174). Add the row to THIS step's \`env:\` (or its job's), or assign it in the script. A name an earlier step or an action exported is named the same way, as \`NAME: \${{ env.NAME }}\`.
+Remedies="undefined-expression|A \`\${{ env.NAME }}\` expression naming nothing in scope is replaced by an EMPTY string, with no error and no warning -- #1174 through a second door (#1460). Add the row to the workflow's or the job's \`env:\`, or write it to \`\$GITHUB_ENV\` from an EARLIER step of the same job, or give \`ActionExports\` a row for the action that exports it. A step's own \`env:\` satisfies that step's \`run:\`, \`with:\`, \`if:\` and \`name:\` -- but NOT another row of the same \`env:\` block, and not its own row: GitHub substitutes those values before the step's environment exists, so a typo'd \`NAME: \${{ env.NAME }}\` would otherwise satisfy itself, which is exactly the shape the convention concentrates.
+stale-action-export|An \`ActionExports\` row describes nothing in this tree. Either no step \`uses:\` that action any more, or no \`\${{ env.NAME }}\` expression reads that name any more. A row kept past its subject is the \"forgot\" state wearing the vocabulary of a decision: it goes on satisfying reads that no longer exist and would satisfy a new one by accident. Delete the row, or restore whichever half went away.
+undefined|A step's environment is its own: a sibling step's or another job's \`env:\` does not lend it one, so under \`set -u\` the step dies on that line and without it the name expands to EMPTY and a branch is silently taken the wrong way (#1174). Add the row to THIS step's \`env:\` (or its job's), or assign it in the script. A name an earlier step or an action exported is named the same way, as \`NAME: \${{ env.NAME }}\`.
 unknown-shell|This check reads a script by the model of the shell that runs it, and has none for this one. Add a row to ShellModels only with a model of how that shell reads its environment, and cases for it.
 unresolved-shell|The shell could not be derived: no \`shell:\` on the step, no \`defaults.run.shell\` above it, and a \`runs-on\` that is not a literal Windows, Ubuntu, macOS or Linux runner. Name the shell on the step.
 unreadable-run|The \`run:\` value is not a string this check can read: an alias, a tag, a flow collection, or a quoted scalar that does not close on its own line, has text after its closing quote, or holds a YAML escape other than \`\\\\\"\`, \`\\\\\\\\\` or \`\\\\/\`. YAML quoting is not shell quoting, and a quote read as the shell would read it hides the reads inside it. Write the script as a block scalar (\`run: |\`), or as a plain or quoted string on one line.
@@ -135,8 +195,13 @@ problems=0
 # @param 1 The workflow file.
 # @param 2 1 to plant a read of an undefined name at the end of every step a model reads, else 0.
 Scan() {
+    # Flattened HERE rather than once at the top, because a self-test case stages its own
+    # `ActionExports` and a value read before that would be the real row every time.
+    local exportRows
+    exportRows="$(Flatten "$ActionExports" ' ')"
     awk -v bashNames="$bashNames" -v windowsNames="$windowsNames" -v shells="$shellRows" -v remedies="$remedyRows" \
-        -v plant="$2" -v PlantName="FASTCACHED_PLANTED_READ" '
+        -v plant="$2" -v PlantName="FASTCACHED_PLANTED_READ" -v PlantExprName="FASTCACHED_PLANTED_EXPR" \
+        -v exports="$exportRows" '
     function indentOf(s,   n) { n = match(s, /[^ ]/); return n ? n - 1 : length(s) }
     function trim(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); return s }
     function unquote(t,   first, last) {
@@ -319,6 +384,62 @@ Scan() {
         }
     }
 
+    # ---- the `${{ }}` expressions a step carries -------------------------------------------------------------------
+    # A `${{ env.NAME }}` naming nothing in scope is substituted with an EMPTY STRING, with no
+    # error and no warning (#1460). That is #1174 through a second door, and the convention this
+    # check itself established -- bring an exported name into a step as `NAME: ${{ env.NAME }}` --
+    # concentrates the risk in exactly that spelling: the shell half then passes, because the row
+    # defines the name, while the row itself was never read.
+    #
+    # TWO BUCKETS, and the split is the whole point rather than a detail:
+    #
+    #   * a read in the step`s `run:`, `with:`, `if:` or `name:` IS satisfied by the step`s own
+    #     `env:`, which is in force by the time any of those is used;
+    #   * a read inside the step`s own `env:` VALUES is not. GitHub substitutes those before the
+    #     step`s environment exists, so a typo`d `NAME: ${{ env.NAME }}` row would otherwise
+    #     satisfy ITSELF -- the one case this exists to catch.
+    #
+    # `if:` is in the first bucket and no step in this tree reads an expression there, so that
+    # arm is carried by a case alone. It is the PERMISSIVE side of an uncertainty about when the
+    # runner applies a step`s env, and permissive is the right side to err on for a bucket whose
+    # only effect is to satisfy reads: the strict reading would refuse workflows that work.
+    #
+    # Job-level and workflow-level fields -- `runs-on`, a job`s `env:` values, a job`s `if:` --
+    # are OUT of scope and unread. So is every context other than `env.`: `github.`, `secrets.`,
+    # `matrix.` and `needs.` name things this check has no model of, and a model more permissive
+    # than the thing it stands for is what waves through the one read that matters.
+    function noteExpr(s, atLine, inOwnEnv,   name, rest) {
+        rest = s
+        while (match(rest, /\$\{\{[ \t]*env\.[A-Za-z_][A-Za-z0-9_]*/)) {
+            name = substr(rest, RSTART, RLENGTH)
+            sub(/^\$\{\{[ \t]*env\./, "", name)
+            if (inOwnEnv) { if (!(name in exprEnvValue)) exprEnvValue[name] = atLine }
+            else if (!(name in exprOther)) exprOther[name] = atLine
+            # Every read, wherever it sits, so the bash layer can refuse an `ActionExports` row
+            # whose NAME nothing reads any more. Gated on the second pass like every other record:
+            # the file is read TWICE, and an ungated printf reported every expression twice.
+            if (pass >= 2) printf "EXPRREAD\t%d\t%s\t%s\t%s\t%s\n", atLine, stepName, "-", name, ""
+            rest = substr(rest, RSTART + RLENGTH)
+        }
+    }
+    # A line that NAMES `GITHUB_ENV` writes every `NAME=` on it, and that one rule covers all
+    # four spellings this tree could use -- bash `echo`/`printf` redirected with `>>`, PowerShell
+    # `>> $env:GITHUB_ENV`, and `Add-Content` naming it -- because in every one of them the name
+    # being written is a `NAME=` token on the same line. Three rows behaving identically would be
+    # decoration; the spellings are named here and one case each pins them.
+    #
+    # STATED BLIND SPOT: a heredoc form (`cat >> "$GITHUB_ENV" <<EOF`) writes names on LATER
+    # lines and is not seen. The tree has two writes, both the `echo` form.
+    function noteWrites(s,   name, rest) {
+        if (index(s, "GITHUB_ENV") == 0) return
+        rest = s
+        while (match(rest, /[A-Za-z_][A-Za-z0-9_]*=/)) {
+            name = substr(rest, RSTART, RLENGTH - 1)
+            jobWritten[name] = 1
+            rest = substr(rest, RSTART + RLENGTH)
+        }
+    }
+
     # ---- where in a script a name is defined ---------------------------------------------------------------------
     # A definition is a LINE, and a read is judged against what is defined at or above its own line, because that is
     # what bash does: a script reading `$X` above `X=1` dies on that line under `set -u`, and without `-u` expands it
@@ -396,6 +517,36 @@ Scan() {
         }
     }
 
+    # Every expression this step carries, against every source that can supply one.
+    #
+    # Compared AS WRITTEN, with no case folding: the `env` context is not a shell, and the
+    # PowerShell arm above folds only what a PowerShell script READS.
+    function judgeExpressions(   name) {
+        for (name in exprOther) {
+            if ((name in workflowEnv) || (name in jobEnv) || (name in stepEnv)) continue
+            if ((name in jobWritten) || (name in jobExported)) continue
+            refuse(exprOther[name], "undefined-expression", "reads ${{ env." name " }} and nothing in scope supplies it")
+        }
+        for (name in exprEnvValue) {
+            if ((name in workflowEnv) || (name in jobEnv)) continue
+            if ((name in jobWritten) || (name in jobExported)) continue
+            refuse(exprEnvValue[name], "undefined-expression",
+                   "reads ${{ env." name " }} in this step`s own `env:` block, where its own `env:` is not yet in force")
+        }
+    }
+    # What this step hands to the steps AFTER it. Adopted after the judging above, so neither an
+    # action nor a write can satisfy a read in the very step that performs it -- an expression is
+    # substituted before the step runs, and an action exports only once it has run.
+    function adoptExports(   i, n, parts, row) {
+        if (stepUses == "") return
+        printf "USES\t%d\t%s\t%s\t%s\t%s\n", stepLine, stepName, "-", stepUses, ""
+        n = split(exports, parts, " ")
+        for (i = 1; i <= n; i++) {
+            if (split(parts[i], row, "|") != 2) continue
+            if (row[1] == stepUses) jobExported[row[2]] = 1
+        }
+    }
+
     # ---- one step --------------------------------------------------------------------------------------------------
     function resolveShell(   s) {
         s = stepShell != "" ? stepShell : (jobShell != "" ? jobShell : workflowShell)
@@ -415,6 +566,12 @@ Scan() {
         if (!inStep) return
         inStep = 0
         if (pass < 2) return
+        # The expressions BEFORE the `hasRun` return, because a `uses:` step has no `run:` at all
+        # and it is the step that EXPORTS -- returning first would leave every action export
+        # unadopted and refuse the reads they supply.
+        judgeExpressions()
+        if (plant) { printf "PLANTEDEXPR\t%d\t%s\t%d\t%d\t%s\n", stepLine, stepName, (PlantExprName in exprEnvValue), stepEnvRows, ""; delete exprEnvValue[PlantExprName] }
+        adoptExports()
         if (!hasRun) return
         scanned++
         model = resolveShell()
@@ -435,6 +592,9 @@ Scan() {
             loose = looseHere(fold)
             if (fold) { t = pwshVisible(body[i]); code = lexCode; pwshScan(t) }
             else { t = bashVisible(body[i]); code = lexCode; if (code != "") bashDefs(code); bashRefs(t) }
+            # The RAW line, not the lexed code: the name in `echo "NAME=$v" >> "$GITHUB_ENV"` sits
+            # inside quotes, which the lexer masks. Adopted after this step has been judged above.
+            noteWrites(body[i])
             advance(code, fold)
         }
         if (constructBroken == "" && (inFn || loopDepth != 0))
@@ -462,12 +622,13 @@ Scan() {
     }
     function resetStep() {
         split("", stepEnv); split("", body); split("", bodyAt)
+        split("", exprOther); split("", exprEnvValue); stepUses = ""; stepEnvRows = 0
         nbody = 0; hasRun = 0; inStep = 1; stepName = "(unnamed)"; stepLine = FNR; stepShell = ""; stepKeyIndent = -1
     }
     # The `env:`, `defaults` and `runs-on` may follow its `steps:`, so the second pass starts each job from what the
     # first pass found anywhere in that job.
     function resetJob(   k, kp) {
-        split("", jobEnv)
+        split("", jobEnv); split("", jobWritten); split("", jobExported)
         jobShell = ""; runsOn = ""; inSteps = 0; itemIndent = -1; jobKeyIndent = -1; stepName = "(job)"; jobStart = FNR
         if (pass < 2) return
         for (k in jobEnvAt) { split(k, kp, SUBSEP); if (kp[1] == jobStart) jobEnv[kp[2]] = 1 }
@@ -557,6 +718,10 @@ Scan() {
         if (blockOwner >= 0) {
             if (blank || ind > blockOwner) {
                 if (blockKind == "run") { bodyAt[nbody] = FNR; body[nbody++] = blank ? line : substr(line, blockOwner + 1) }
+                # A continuation line of one of this step`s values. A `#` line inside a `run:` body
+                # is SHELL text and its expressions are still substituted, so it is read here --
+                # unlike a YAML comment, which the site below never sees.
+                if (inStep && inSteps) noteExpr(line, FNR, inEnv && envScope == "step" && ind > envIndent)
                 next
             }
             blockOwner = -1
@@ -589,6 +754,22 @@ Scan() {
             if (line ~ /^[ \t]*$/) next
             # The keys of a step sit where its first key does, however many spaces follow the dash.
             if (stepItem) stepKeyIndent = ind
+        }
+
+        # Every other line of a step: its keys and their inline values, and the rows of its
+        # `with:` and `env:` blocks. AFTER the boundary handling above, so a step`s first line is
+        # read as that step`s and not as its predecessor`s, and after the comment skip, so a YAML
+        # comment explaining an expression is not read as carrying one.
+        if (inStep && inSteps) {
+            inOwnEnvRow = (inEnv && envScope == "step" && ind > envIndent)
+            if (inOwnEnvRow) stepEnvRows++
+            # The plant goes in HERE, at the read site, on every env row of every step -- not
+            # synthesised in the judging. Synthesised, it would prove the judging works and say
+            # nothing about whether the reader ever VISITED the env block of a step, which is the
+            # half that can silently stop being true. A value written as a BLOCK SCALAR is read at
+            # the continuation site above and is not planted; stated rather than covered, because
+            # no step in this tree writes an `env:` value that way.
+            noteExpr((plant && inOwnEnvRow) ? line " ${{ env." PlantExprName " }}" : line, FNR, inOwnEnvRow)
         }
 
         if (!match(line, /^[ ]*[A-Za-z_][A-Za-z0-9_.-]*[ \t]*:([ \t]|$)/)) {
@@ -648,6 +829,7 @@ Scan() {
         }
         if (!stepKey) next
         if (key == "name") { t = unquote(value); if (t != "") stepName = t }
+        else if (key == "uses") { stepUses = trim(unquote(value)); sub(/@.*$/, "", stepUses) }
         else if (key == "shell") stepShell = trim(unquote(value))
         else if (key == "env") openEnv("step")
         else if (key == "run") {
@@ -688,6 +870,7 @@ Judge() {
     local dir="$1" mode="${2:-plain}" plantFlag=0 file display status report files=0 steps=0 modelled=0 bashSteps=0 pwshSteps=0
     local runKeys=0 placedKeys=0
     local tag line step kind detail remedy scanned planted=0 unplanted=0
+    local exprReads=0 exprNames="" usedActions="" plantedExpr=0 envRows=0 action name
     [ "$mode" = plant ] && plantFlag=1
     for file in "$dir"/*.yml "$dir"/*.yaml; do
         [ -e "$file" ] || continue
@@ -712,6 +895,35 @@ Judge() {
                     if [ "$kind" != "1" ]; then
                         echo "  FAIL: ${display}:${line} step \"${step}\": a read planted at the end of its script was NOT seen, so its reading ends inside a quote, a heredoc or a here-string and a real read there would pass unseen. Either the script really leaves one open, or the check misreads a construct in it -- then the check is what needs fixing, with a case."
                         problems=$((problems + 1))
+                    fi
+                    ;;
+                EXPRREAD)
+                    # One per `${{ env.NAME }}` a step carries, wherever it sits. Counted so a run
+                    # that read NONE says so: this check went clean over the whole tree on the day
+                    # the expression half was still inert, which is the shape of every green
+                    # reading taken on the wrong object.
+                    exprReads=$((exprReads + 1))
+                    exprNames="${exprNames}${detail}
+"
+                    ;;
+                USES)
+                    # Every action a step names, version stripped. Only for the staleness check
+                    # below: an `ActionExports` row whose action nothing uses any more.
+                    usedActions="${usedActions}${detail}
+"
+                    ;;
+                PLANTEDEXPR)
+                    # Per step: whether the planted expression was seen, and how many `env:` rows
+                    # that step has. A step with NO env row cannot carry the plant, so the count
+                    # below is against the steps that have one rather than against every step.
+                    if [ "${detail:-0}" != "0" ]; then
+                        envRows=$((envRows + 1))
+                        if [ "$kind" = "1" ]; then
+                            plantedExpr=$((plantedExpr + 1))
+                        else
+                            echo "  FAIL: ${display}:${line} step \"${step}\": an expression planted into its \`env:\` rows was NOT seen, so the reader is not visiting that block and a typo of that kind \`\${{ env.X }}\` there would pass unread."
+                            problems=$((problems + 1))
+                        fi
                     fi
                     ;;
                 REFUSE)
@@ -740,6 +952,31 @@ Judge() {
         echo "  FAIL: ${files} workflow file(s) and not one \`run:\` step read -- the parser stopped understanding them"
         return 1
     fi
+    # AN EXPRESSION READER THAT READ NOTHING is not a clean tree. This check has already gone
+    # green over the whole tree with its expression half inert, on the day it was written, and
+    # nothing in the output said so -- a count is what makes that state loud.
+    if [ "$JudgingTheRealTree" -eq 1 ] && [ "$exprReads" -eq 0 ]; then
+        echo "  FAIL: not one \`\${{ env.NAME }}\` expression was read across ${files} workflow file(s). This tree has dozens; reading none means the expression reader stopped seeing them, which reads exactly like a clean tree."
+        problems=$((problems + 1))
+    fi
+
+    # `ActionExports` rows, STALE IN BOTH DIRECTIONS, and the two go wrong separately. Skipped
+    # under `--plant`, whose run answers one question; and skipped when the table is empty, which
+    # is how a self-test case stages a tree that must not be judged against the real row.
+    if [ "$JudgingTheRealTree" -eq 1 ] && [ "$mode" != plant ] && [ -n "${ActionExports//[[:space:]]/}" ]; then
+        while IFS='|' read -r action name; do
+            [ -n "${action:-}" ] || continue
+            if ! grep -Fxq "$action" <<< "$usedActions"; then
+                echo "  FAIL: ActionExports row \`${action}|${name}\`: no step \`uses:\` that action any more. A row kept past its subject goes on satisfying reads that no longer exist, and would satisfy a new one by accident. Delete the row, or restore the step that used it."
+                problems=$((problems + 1))
+            fi
+            if ! grep -Fxq "$name" <<< "$exprNames"; then
+                echo "  FAIL: ActionExports row \`${action}|${name}\`: no \`\${{ env.${name} }}\` expression reads that name any more. This table holds only what is READ; a row for a name nothing reads has to be kept correct for nothing. Delete the row, or restore the read."
+                problems=$((problems + 1))
+            fi
+        done <<< "$ActionExports"
+    fi
+
     if [ "$mode" = plant ] && [ "$planted" -ne "$modelled" ]; then
         echo "  FAIL: the plant went into ${planted} of the ${modelled} run step(s) a model read"
         problems=$((problems + 1))
@@ -749,9 +986,9 @@ Judge() {
         return 1
     fi
     if [ "$mode" = plant ]; then
-        echo "workflow-step-env: plant: all ${modelled} run step(s) a model read in ${files} workflow file(s) refused the planted read (${bashSteps} bash, ${pwshSteps} PowerShell); ${unplanted} unplanted problem(s) left to the unplanted run"
+        echo "workflow-step-env: plant: all ${modelled} run step(s) a model read in ${files} workflow file(s) refused the planted read (${bashSteps} bash, ${pwshSteps} PowerShell), and all ${plantedExpr} step(s) carrying an \`env:\` row saw a planted expression in it; ${unplanted} unplanted problem(s) left to the unplanted run"
     else
-        echo "workflow-step-env: ${files} workflow file(s), ${runKeys} run: key(s) counted and ${placedKeys} placed, ${steps} run step(s) (${bashSteps} bash, ${pwshSteps} PowerShell), every environment name each reads is one it can see"
+        echo "workflow-step-env: ${files} workflow file(s), ${runKeys} run: key(s) counted and ${placedKeys} placed, ${steps} run step(s) (${bashSteps} bash, ${pwshSteps} PowerShell), ${exprReads} \${{ env.* }} expression(s) read, every environment name each reads is one it can see"
     fi
     return 0
 }
@@ -818,14 +1055,25 @@ CompositeActions() {
 # ---------------------------------------------------------------------------
 SelfTest() {
     local tmp ran=0 failures=0
+    # A case that is ABOUT an export stages its own `ActionExports`; the rest are judged with
+    # the whole-tree claims OFF (`JudgingTheRealTree`), so the real row is simply not consulted.
+    # Emptying it here as well would work and is deliberately NOT done: it would hide the scope
+    # from the reader and leave the second caller -- `check-merge-group-report.sh` -- relying on
+    # a fix made in this file.
+    ActionExports=""
     tmp="$(mktemp -d "${TMPDIR:-/tmp}/workflow-step-env-selftest.XXXXXX")" || { echo "cannot create a scratch directory"; exit 2; }
     trap 'rm -rf -- "$tmp"' EXIT
 
     # Judge the workflow on stdin, alone in a directory of its own.
     # @param 1 Case name. @param 2 Expected status (0 or 1). @param 3 Text the output must hold.
     # @param 4 Mode (plain or plant). @param 5 `nofile` to stage an empty directory and read nothing from stdin.
+    # @param 6 1 to require that at least one `${{ env.NAME }}` expression was read, else 0.
     Case() {
         local name="$1" want="$2" expect="$3" mode="${4:-plain}" out got
+        # OFF by default here for the reason `JudgingTheRealTree` records: a staged tree reads no
+        # expression and uses no action, and the cases that drive either guard pass 1 as their
+        # sixth argument.
+        local JudgingTheRealTree="${6:-0}"
         mkdir -p "$tmp/$name"
         [ "${5:-}" = nofile ] || cat > "$tmp/$name/wf.yml"
         out="$(problems=0; Judge "$tmp/$name" "$mode" 2>&1)"
@@ -1301,6 +1549,100 @@ jobs:
             echo hello
 WF
 
+    # ---- EXPRESSIONS (#1460) -- a `${{ env.NAME }}` naming nothing is substituted EMPTY --------------------------
+    #
+    # One case per field that can carry one, because the fields do not share a code path and a
+    # reader that lost one of them would keep passing every case about the others.
+
+    Case exprInRun 1 ':9 step "reads an expression in its script": reads ${{ env.NOPE }} and nothing in scope supplies it' <<'WF'
+jobs:
+  j:
+    runs-on: ubuntu-latest
+    steps:
+      - name: "reads an expression in its script"
+        env:
+          KNOWN: 1
+        run: |
+          echo "${{ env.NOPE }} $KNOWN"
+WF
+
+    Case exprInWith 1 'step "reads an expression in a with: value": reads ${{ env.NOPE }}' <<'WF'
+jobs:
+  j:
+    runs-on: ubuntu-latest
+    steps:
+      - name: "reads an expression in a with: value"
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.NOPE }}
+          key: fixed
+      - run: echo ok
+WF
+
+    # `if:` is the field no step in this tree reads an expression in, so this case is the only
+    # thing that says the arm works at all.
+    Case exprInIf 1 'step "reads an expression in its if:": reads ${{ env.NOPE }}' <<'WF'
+jobs:
+  j:
+    runs-on: ubuntu-latest
+    steps:
+      - name: "reads an expression in its if:"
+        if: ${{ env.NOPE == '1' }}
+        run: echo ok
+WF
+
+    # A step `name:`, which #1460 did not list and which this tree reads six times -- a typo
+    # there is cosmetic rather than functional, and it is the same silent empty substitution.
+    Case exprInName 1 'reads ${{ env.NOPE }}' <<'WF'
+jobs:
+  j:
+    runs-on: ubuntu-latest
+    steps:
+      - name: "install ${{ env.NOPE }}"
+        run: echo ok
+WF
+
+    # THE motivating shape. `NAME: ${{ env.NAME }}` is the convention this check itself
+    # established for bringing an exported name into a step, so a typo in it defines the name
+    # the shell half then finds -- and the row that filled it was never read until now.
+    Case exprInOwnEnvValue 1 'own `env:` block, where its own `env:` is not yet in force' <<'WF'
+jobs:
+  j:
+    runs-on: ubuntu-latest
+    steps:
+      - name: "a typo in the convention"
+        env:
+          SCCACHE_PAHT: ${{ env.SCCACHE_PAHT }}
+        run: echo "$SCCACHE_PAHT"
+WF
+
+    # A `$GITHUB_ENV` write reaches only LATER steps of the same job, so a write BELOW the read
+    # supplies nothing -- and the expression is substituted before any script runs, so a write
+    # in the SAME step supplies nothing either.
+    Case exprWriteInLaterStep 1 'step "reads it first": reads ${{ env.LATER }}' <<'WF'
+jobs:
+  j:
+    runs-on: ubuntu-latest
+    steps:
+      - name: "reads it first"
+        run: echo "${{ env.LATER }}"
+      - name: "writes it after"
+        run: echo "LATER=1" >> "$GITHUB_ENV"
+WF
+
+    Case exprWriteInAnotherJob 1 'reads ${{ env.ELSEWHERE }}' <<'WF'
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "ELSEWHERE=1" >> "$GITHUB_ENV"
+  b:
+    runs-on: ubuntu-latest
+    steps:
+      - name: "another job cannot see it"
+        run: echo "${{ env.ELSEWHERE }}"
+WF
+
     Case noRunStepAtAll 1 'not one `run:` step read' < /dev/null
     Case noWorkflowFile 1 'no workflow file under' plain nofile
 
@@ -1401,6 +1743,15 @@ jobs:
 WF
     # bash32-scan: data-end
 
+    # This fixture already mirrored the real convention, `sccache-action` and all, so it stages
+    # the row that supplies the name: the fixture table #1460 asks for, so that a synthetic case
+    # is never judged against the real one. It therefore also covers an action export satisfying
+    # a read in a step`s own `env:` VALUES, which nothing else here drives.
+    #
+    # Set and reset explicitly rather than as an assignment prefix on the call: bash keeps a
+    # prefix assignment to a FUNCTION after the call outside POSIX mode, so the row would leak
+    # into every case below it and satisfy reads none of them stages.
+    ActionExports="mozilla-actions/sccache-action|SCCACHE_PATH"
     Case pwshModel 0 '0 read as bash, 2 as PowerShell' <<'WF'
 env:
   FROM_WORKFLOW: 1
@@ -1424,6 +1775,7 @@ jobs:
       - shell: pwsh
         run: echo "done"
 WF
+    ActionExports=""
 
     Case workflowDefaultsShell 0 '0 read as bash, 1 as PowerShell' <<'WF'
 defaults:
@@ -1540,6 +1892,209 @@ jobs:
             Write-Host $env:LATER
             $env:LATER = "x"
           }
+WF
+
+    # ---- EXPRESSIONS (#1460) -- what must NOT be refused ----------------------------------------------------------
+
+    # All four fields, from all three scopes at once. The twin of the four refusing cases above:
+    # a reader that refused everything would pass those and fail this.
+    Case exprFromScopes 0 '2 run step(s), 2 read as bash' <<'WF'
+env:
+  FROM_WORKFLOW: 1
+jobs:
+  j:
+    runs-on: ubuntu-latest
+    env:
+      FROM_JOB: 1
+    steps:
+      - name: "install ${{ env.FROM_WORKFLOW }}"
+        if: ${{ env.FROM_JOB == '1' }}
+        env:
+          OWN: 1
+        run: |
+          echo "${{ env.FROM_WORKFLOW }} ${{ env.FROM_JOB }} ${{ env.OWN }} $OWN"
+      - name: "a with: value from a scope"
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.FROM_WORKFLOW }}
+          key: fixed
+      - run: echo ok
+WF
+
+    # The legitimate form of the convention: a step `env:` VALUE may read a workflow or job name,
+    # just not one from its own block. Without this case the rule above could be implemented as
+    # "refuse every expression in a step env value" and every test would still pass.
+    Case exprOwnEnvFromScope 0 '1 run step(s), 1 read as bash' <<'WF'
+env:
+  FROM_WORKFLOW: 1
+jobs:
+  j:
+    runs-on: ubuntu-latest
+    steps:
+      - name: "the convention, spelled right"
+        env:
+          MINE: ${{ env.FROM_WORKFLOW }}
+        run: echo "$MINE"
+WF
+
+    # A write in an EARLIER step of the same job, in the one spelling this tree uses.
+    Case exprFromEarlierWrite 0 '2 run step(s), 2 read as bash' <<'WF'
+jobs:
+  j:
+    runs-on: ubuntu-latest
+    steps:
+      - name: "writes it"
+        run: echo "TIDY_BIN=/usr/bin/x" >> "$GITHUB_ENV"
+      - name: "reads it after"
+        env:
+          TIDY: ${{ env.TIDY_BIN }}
+        run: echo "$TIDY"
+WF
+
+    # The PowerShell spellings, one case each, because the one rule that covers them -- a line
+    # naming GITHUB_ENV writes every `NAME=` on it -- is worth nothing if a spelling never
+    # reaches it.
+    Case exprFromPwshRedirectWrite 0 '0 read as bash, 2 as PowerShell' <<'WF'
+jobs:
+  j:
+    runs-on: windows-2025
+    steps:
+      - name: "writes it, pwsh"
+        run: |
+          "MADE=1" >> $env:GITHUB_ENV
+      - name: "reads it after"
+        env:
+          MINE: ${{ env.MADE }}
+        run: Write-Host $env:MINE
+WF
+
+    Case exprFromAddContentWrite 0 '0 read as bash, 2 as PowerShell' <<'WF'
+jobs:
+  j:
+    runs-on: windows-2025
+    steps:
+      - name: "writes it with Add-Content"
+        run: Add-Content -Path $env:GITHUB_ENV -Value "ADDED=1"
+      - name: "reads it after"
+        env:
+          MINE: ${{ env.ADDED }}
+        run: Write-Host $env:MINE
+WF
+
+    # ---- EXPRESSIONS (#1460) -- the table, and the count that says the reader ran ---------------------------------
+    #
+    # An `ActionExports` row goes stale in TWO directions and they fail separately: its action
+    # stops being used, or its name stops being read. Each is its own case, and each has the
+    # coherent tree as its twin -- a check that refused every row would pass both refusals.
+
+    # Both pass 1 as their sixth argument: staleness is a whole-tree claim, so it is not made
+    # over a staged directory unless the case asks for it.
+    ActionExports="some/retired-action|EXPORTED_NAME"
+    Case exprStaleExportAction 1 'no step `uses:` that action any more' plain '' 1 <<'WF'
+jobs:
+  j:
+    runs-on: ubuntu-latest
+    steps:
+      - name: "reads the name, but nothing uses the action"
+        env:
+          MINE: ${{ env.EXPORTED_NAME }}
+        run: echo "$MINE"
+WF
+    ActionExports=""
+
+    # This fixture carries a SATISFIED read as well, so the zero-read guard -- which the same
+    # knob turns on -- cannot be what refuses it. Without that read the case would exit 1 for
+    # two reasons and the expected text would still match, which is the right side for the
+    # wrong reason.
+    ActionExports="some/live-action|UNREAD_NAME"
+    Case exprStaleExportName 1 'expression reads that name any more' plain '' 1 <<'WF'
+env:
+  SUPPLIED: 1
+jobs:
+  j:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: some/live-action@v1
+      - run: echo "${{ env.SUPPLIED }}"
+WF
+    ActionExports=""
+
+    # The twin of both: the action IS used and the name IS read, so the row describes something
+    # and the read it supplies is accepted. This is also the only case that drives an export
+    # satisfying a read in a step`s `run:` rather than in its `env:`.
+    ActionExports="some/live-action|EXPORTED_NAME"
+    Case exprFromActionExport 0 '2 run step(s), 2 read as bash' <<'WF'
+jobs:
+  j:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: some/live-action@v1
+      - name: "reads what the action exported"
+        run: echo "${{ env.EXPORTED_NAME }}"
+      - run: echo ok
+WF
+    ActionExports=""
+
+    # An action export reaches the steps AFTER it and no earlier: the same rule as a
+    # `$GITHUB_ENV` write, and for the same reason -- the action has not run yet.
+    ActionExports="some/live-action|EXPORTED_NAME"
+    Case exprExportReachesOnlyLaterSteps 1 'reads ${{ env.EXPORTED_NAME }}' <<'WF'
+jobs:
+  j:
+    runs-on: ubuntu-latest
+    steps:
+      - name: "reads it before the action runs"
+        run: echo "${{ env.EXPORTED_NAME }}"
+      - uses: some/live-action@v1
+WF
+    ActionExports=""
+
+    # A step cannot read what IT exports or writes, and these two cases are what says so. The
+    # ones above put the read in one step and the source in another, so they discriminate WHICH
+    # STEP and not WHEN IN THE STEP -- a neuter that adopted an export or a write before judging
+    # reddened neither of them, which is how these came to be written.
+    ActionExports="some/live-action|EXPORTED_NAME"
+    Case exprExportNotInItsOwnStep 1 'reads ${{ env.EXPORTED_NAME }}' <<'WF'
+jobs:
+  j:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: some/live-action@v1
+        with:
+          path: ${{ env.EXPORTED_NAME }}
+      - run: echo ok
+WF
+    ActionExports=""
+
+    Case exprWriteNotInItsOwnStep 1 'reads ${{ env.SELF }}' <<'WF'
+jobs:
+  j:
+    runs-on: ubuntu-latest
+    steps:
+      - name: "writes it and reads it in one step"
+        env:
+          MINE: ${{ env.SELF }}
+        run: echo "SELF=1" >> "$GITHUB_ENV"
+WF
+
+    # Reading NO expression at all is a refusal for the repository`s own workflows, which carry
+    # dozens, and ordinary for a staged tree -- so the guard is driven here explicitly, in both
+    # directions, over the same workflow. Without the refusing arm the guard is untested; without
+    # the accepting one, every other case here would have to carry an expression it is not about.
+    Case exprNoneReadRefused 1 'not one `${{ env.NAME }}` expression was read' plain '' 1 <<'WF'
+jobs:
+  j:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok
+WF
+
+    Case exprNoneReadAllowed 0 '1 run step(s), 1 read as bash' <<'WF'
+jobs:
+  j:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok
 WF
 
     # ---- the plant ----------------------------------------------------------------------------------------------
@@ -1725,7 +2280,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --self-test) self_test="yes"; shift ;;
         --plant) mode="plant"; shift ;;
-        --workflows) [ $# -ge 2 ] || { echo "--workflows needs a directory"; exit 2; }; dir="$2"; shift 2 ;;
+        --workflows) [ $# -ge 2 ] || { echo "--workflows needs a directory"; exit 2; }; dir="$2"; JudgingTheRealTree=0; shift 2 ;;
         *) echo "usage: bash scripts/check-workflow-step-env.sh [--plant] [--workflows <dir>] | --self-test"; exit 2 ;;
     esac
 done
