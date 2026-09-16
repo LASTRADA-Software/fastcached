@@ -150,68 +150,17 @@ string(REPLACE ";" ", " rowSummaryText "${rowSummaries}")
 
 # ---------------------------------------------------------------------------
 # Which C++ this repository holds, asked of git, then narrowed to what it OWNS by the
-# third-party roots. The fallback walk exists for a source export with no index, which holds
-# no build tree and no dependency cache by construction -- the same argument, and the same
-# excluded names, as `check-istreambuf-iterator.cmake`.
-set(cxxExtension "\\.(cpp|cc|cxx|cppm|hpp|hh|hxx|h|ipp|inl|ixx)$")
-
-if(NOT GIT_EXECUTABLE)
-    find_program(GIT_EXECUTABLE NAMES git)
-endif()
-
-set(sourceFiles "")
-set(scanSource "")
-
-if(GIT_EXECUTABLE)
-    execute_process(
-        COMMAND "${GIT_EXECUTABLE}" -C "${FASTCACHED_SOURCE_DIR}" rev-parse --is-inside-work-tree
-        OUTPUT_VARIABLE insideWorkTree
-        ERROR_VARIABLE gitError
-        RESULT_VARIABLE gitStatus
-        OUTPUT_STRIP_TRAILING_WHITESPACE)
-    if(gitStatus EQUAL 0 AND insideWorkTree STREQUAL "true")
-        execute_process(
-            COMMAND "${GIT_EXECUTABLE}" -C "${FASTCACHED_SOURCE_DIR}" ls-files
-            OUTPUT_VARIABLE tracked
-            RESULT_VARIABLE lsStatus
-            OUTPUT_STRIP_TRAILING_WHITESPACE)
-        if(lsStatus EQUAL 0 AND NOT tracked STREQUAL "")
-            string(REPLACE "\n" ";" trackedFiles "${tracked}")
-            foreach(candidate IN LISTS trackedFiles)
-                if(candidate MATCHES "${cxxExtension}")
-                    list(APPEND sourceFiles "${candidate}")
-                endif()
-            endforeach()
-            set(scanSource "git ls-files")
-        endif()
-    endif()
-endif()
-
-if(NOT sourceFiles)
-    set(excludeNames "out" "build" "_deps" ".git" ".cache" ".claude")
-    file(GLOB_RECURSE walked RELATIVE "${FASTCACHED_SOURCE_DIR}" "${FASTCACHED_SOURCE_DIR}/*")
-    foreach(candidate IN LISTS walked)
-        if(NOT candidate MATCHES "${cxxExtension}")
-            continue()
-        endif()
-        set(excluded FALSE)
-        foreach(name IN LISTS excludeNames)
-            if(candidate MATCHES "(^|/)${name}/")
-                set(excluded TRUE)
-                break()
-            endif()
-        endforeach()
-        if(NOT excluded)
-            list(APPEND sourceFiles "${candidate}")
-        endif()
-    endforeach()
-    set(scanSource "directory walk (no git index)")
-endif()
-
-list(REMOVE_DUPLICATES sourceFiles)
-list(SORT sourceFiles)
-
-fastcached_decline_third_party("${FASTCACHED_SOURCE_DIR}" sourceFiles declinedFiles)
+# third-party roots -- through `fastcached_first_party_cxx`, which is the ONE answer to that
+# question (#1485). The extension set that used to live here included `.ipp` and `.inl`, so
+# it moved INTO the helper rather than the helper's narrower set being adopted here: this
+# tree tracks none of either today, so a verbatim migration would have selected the identical
+# files and silently stopped covering them the day somebody adds the first one.
+#
+# The MODE travels with the answer and is stated in the status line and the refusal below. It
+# has three values, not two, and the walk's fallback exists for a source export with no index
+# -- which holds no build tree and no dependency cache by construction, and that is what makes
+# the walk sound there and unsound in a working checkout.
+fastcached_first_party_cxx("${FASTCACHED_SOURCE_DIR}" sourceFiles declinedFiles scanSource)
 list(LENGTH declinedFiles declinedCount)
 
 if(NOT sourceFiles)

@@ -170,15 +170,31 @@ fastcached_tracked_files("${tree}"
 Expect("gitPathspec" "mode" "${mode}" "git ls-files")
 Expect("gitPathspec" "files" "${files}" "src/Alpha.cpp;src/Alpha.hpp")
 
-# --- 3. no git at all -----------------------------------------------------------------------
-# The same corpus with no repository. The walk's exclusion list is what must remove the four
-# build-tree copies, and the `docs/notes.md` row is what the FILTER must remove.
-set(tree "${FASTCACHED_SCRATCH_DIR}/walkNoGit")
+# --- 3. git cannot answer at all ------------------------------------------------------------
+# The same corpus, with the git probe made unable to answer. The walk's exclusion list is what
+# must remove the four build-tree copies, and the `docs/notes.md` row is what the FILTER must
+# remove.
+#
+# **The probe is disabled rather than the repository merely being absent, because "absent" is
+# not something this fixture can arrange.** A staged tree with no `.git` of its own still sits
+# INSIDE a work tree whenever the scratch directory does -- and it does: every ctest
+# registration here puts it under `CMAKE_CURRENT_BINARY_DIR`, which is `out/build/...` in the
+# repository. `git -C <tree> rev-parse --is-inside-work-tree` then answers **true**, `ls-files`
+# names nothing under that directory, and the honest mode is the THIRD one. Measured: this
+# assertion passed with the scratch directory in `TEMP` and failed with it in `out/`, which is
+# a fixture whose verdict is about where somebody put their build tree. Pointing
+# `GIT_EXECUTABLE` at a path that cannot execute makes the branch deterministic and is the
+# branch a source tarball actually takes -- git absent and git unable to answer are one arm of
+# the function, by design.
+set(tree "${FASTCACHED_SCRATCH_DIR}/walkGitCannotAnswer")
 StageTree("${tree}" ${corpus})
+set(realGit "${GIT_EXECUTABLE}")
+set(GIT_EXECUTABLE "${tree}/no-such-git-binary")
 fastcached_tracked_files("${tree}"
     GLOBS "*" FILTER "${cxxFilter}" FILES_OUT walkFiles MODE_OUT mode)
-Expect("walkNoGit" "mode" "${mode}" "directory walk (no git index)")
-Expect("walkNoGit" "files" "${walkFiles}" "src/Alpha.cpp;src/Alpha.hpp;tools/Beta.cpp")
+set(GIT_EXECUTABLE "${realGit}")
+Expect("walkGitCannotAnswer" "mode" "${mode}" "directory walk (no git index)")
+Expect("walkGitCannotAnswer" "files" "${walkFiles}" "src/Alpha.cpp;src/Alpha.hpp;tools/Beta.cpp")
 
 # --- 4. a git index that names nothing -- the third mode -------------------------------------
 # `git init` with nothing staged. The copies this function replaced answered
