@@ -204,7 +204,17 @@ struct LiveCapture
 /// @param metrics The counters.
 /// @param snapshot The snapshot beside them.
 /// @return The capture; it carries no events.
-[[nodiscard]] LiveCapture CaptureCacheSubject(IMetricsSink const& metrics, MetricsSnapshot const& snapshot);
+/// @p surfaces defaults to `EverySurface`, so the DAEMON -- which serves every surface a row is
+/// attributed to -- is unchanged. A compile node passes its own, and passes it explicitly:
+/// this is the capture the `live-stats cache` panel reads, and the one that reported
+/// `connections_accepted 0` on a binary with no writer for that counter (#1484).
+/// @param metrics The counter sink.
+/// @param snapshot What the provider stated for this call.
+/// @param surfaces The surfaces this process serves.
+/// @return The capture.
+[[nodiscard]] LiveCapture CaptureCacheSubject(IMetricsSink const& metrics,
+                                              MetricsSnapshot const& snapshot,
+                                              std::span<MetricsSurface const> surfaces = EverySurface);
 
 /// Who leads, as a fleet gate needs it.
 struct LiveLeadership

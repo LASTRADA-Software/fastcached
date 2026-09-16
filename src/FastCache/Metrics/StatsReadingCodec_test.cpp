@@ -112,7 +112,7 @@ void GiveEveryCounterItsOwnValue(IMetricsSink& sink)
 {
     SkewedSink sink { IMetricsSink::Counter::ConnectionsAdmissionRejected };
     GiveEveryCounterItsOwnValue(sink);
-    return CaptureStatsReading(sink, EveryBlockPresent());
+    return CaptureStatsReading(sink, EveryBlockPresent(), EverySurface);
 }
 
 } // namespace
@@ -125,7 +125,7 @@ TEST_CASE("Capturing a reading asks the sink whether it carries each row", "[met
     SkewedSink sink { missing };
     GiveEveryCounterItsOwnValue(sink);
 
-    auto const reading = CaptureStatsReading(sink, EveryBlockPresent());
+    auto const reading = CaptureStatsReading(sink, EveryBlockPresent(), EverySurface);
 
     for (auto const& row: CounterTable)
     {
@@ -133,9 +133,15 @@ TEST_CASE("Capturing a reading asks the sink whether it carries each row", "[met
         auto const* const captured = reading.counters.Find(row.counter);
         REQUIRE(captured != nullptr);
         if (row.counter == missing)
-            CHECK_FALSE(captured->has_value());
+        {
+            CHECK_FALSE(captured->Present());
+            // WHICH absence, not merely that there is one: this case stages a sink with no slot
+            // for the row, so the reason must be the skew one. Asserting only the absence would
+            // pass just as well if capture had decided the process writes no such counter.
+            CHECK(captured->Why() == CounterAbsence::NoSlotInThisBuild);
+        }
         else
-            CHECK(*captured == std::optional { sink.Read(row.counter) });
+            CHECK(*captured == CounterReading::Of(sink.Read(row.counter)));
     }
     CHECK(reading.snapshot == EveryBlockPresent());
 }
@@ -157,7 +163,7 @@ TEST_CASE("An absent block survives the binary form as absent rather than as zer
     auto const decoded = DecodeStatsReading(EncodeStatsReading(nothing));
     REQUIRE(decoded.has_value());
     CHECK(*decoded == nothing);
-    CHECK(std::ranges::none_of(decoded->counters.Positional(), [](auto const& value) { return value.has_value(); }));
+    CHECK(std::ranges::none_of(decoded->counters.Positional(), [](auto const& cell) { return cell.Present(); }));
     CHECK_FALSE(decoded->snapshot.storage.has_value());
     CHECK_FALSE(decoded->snapshot.consensus.has_value());
     CHECK_FALSE(decoded->snapshot.hostLoad.has_value());
@@ -217,12 +223,16 @@ TEST_CASE("A host-load presence bit this build does not know is refused as malfo
     auto const bitmapBytes = [](std::size_t count) {
         return (count + 7) / 8;
     };
-    auto const at = sizeof(std::uint64_t) + bitmapBytes(reading.counters.Positional().size()) + 1
-                    + bitmapBytes(reading.snapshot.storageTiers.size());
+    // The counter block is TWO bitmaps since #1484 -- presence, then which absence each absent
+    // cell is -- and no values here, because this reading carries no present counter. Spelled once
+    // so the two offsets below cannot drift apart.
+    auto const counterBlock = 2 * bitmapBytes(reading.counters.Positional().size());
+    auto const snapshotPresenceAt = sizeof(std::uint64_t) + counterBlock;
+    auto const at = snapshotPresenceAt + 1 + bitmapBytes(reading.snapshot.storageTiers.size());
     // Positional controls: the snapshot presence byte names the host-load block alone, and the
     // byte at `at` is that block's own presence, with neither figure set.
     REQUIRE(bytes.size() > at);
-    REQUIRE(bytes[sizeof(std::uint64_t) + bitmapBytes(reading.counters.Positional().size())] == std::byte { 0x10 });
+    REQUIRE(bytes[snapshotPresenceAt] == std::byte { 0x10 });
     REQUIRE(bytes[at] == std::byte { 0x00 });
 
     // The control: the untouched bytes decode, with the block present and both figures absent.
@@ -314,7 +324,7 @@ TEST_CASE("An IMetricsSink counter travels at its ordinal and a reordered enum i
         auto reading = StatsReading {};
         auto* const cell = reading.counters.Find(counter);
         REQUIRE(cell != nullptr);
-        *cell = Value;
+        *cell = CounterReading::Of(Value);
         return EncodeStatsReading(reading);
     };
     auto const bigEndianAt = [](std::vector<std::byte> const& bytes, std::size_t at) {
@@ -369,7 +379,11 @@ TEST_CASE("This build's live-stats layout is the pinned one", "[metrics][livesta
     // client built before the change will refuse this node. Update the constant in the same
     // change, and say in its message that clients and nodes upgrade together.
     INFO(std::format("StatsReadingLayout is 0x{:016x}", StatsReadingLayout));
-    CHECK(StatsReadingLayout == 0x944ced6e24959f65ULL);
+    // Moved by #1484: the counter cells carry a second bitmap saying WHICH absence each absent
+    // cell is, so `StatsReadingWire::Grammar` went to `-4`. Clients and nodes upgrade together
+    // -- a `fastcache-cli` built before this refuses a node built after it, by name
+    // (`ForeignLayout`) rather than by decoding plausible numbers into the wrong fields.
+    CHECK(StatsReadingLayout == 0x70d8cbb1f96e9f1aULL);
 }
 
 TEST_CASE("A truncated or padded reading is refused and never half-read", "[metrics][livestats]")

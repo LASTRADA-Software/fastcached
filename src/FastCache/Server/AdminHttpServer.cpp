@@ -581,7 +581,8 @@ Task<void> ServeAdminHttp(ISocket* socket,
                           IMetricsSink const* metrics,
                           AdminHttpServer::SnapshotProvider snapshotProvider,
                           IClock* clock,
-                          std::span<AdminRoute const> routes)
+                          std::span<AdminRoute const> routes,
+                          std::span<MetricsSurface const> surfaces)
 {
     // TLS terminates here rather than in the accept loop, so a handshake failure
     // costs the same detached task a slow request does and never the loop. A
@@ -627,7 +628,7 @@ Task<void> ServeAdminHttp(ISocket* socket,
 
     if (path == "/metrics")
     {
-        auto const body = RenderPrometheus(*metrics, snapshotProvider());
+        auto const body = RenderPrometheus(*metrics, snapshotProvider(), surfaces);
         (void) co_await WriteResponse(
             socket, AdminResponse { .status = "200 OK", .contentType = "text/plain; version=0.0.4", .body = body });
         co_return;
@@ -670,14 +671,16 @@ AdminHttpServer::AdminHttpServer(IListener& listener,
                                  ILogger& logger,
                                  IClock& clock,
                                  std::vector<AdminRoute> routes,
-                                 TlsContext* tls) noexcept:
+                                 TlsContext* tls,
+                                 std::span<MetricsSurface const> surfaces) noexcept:
     _listener { listener },
     _metrics { metrics },
     _snapshotProvider { std::move(snapshotProvider) },
     _logger { logger },
     _clock { clock },
     _routes { std::move(routes) },
-    _tls { tls }
+    _tls { tls },
+    _surfaces { surfaces }
 {
 }
 
@@ -692,9 +695,10 @@ static DetachedTask ServeAdminConnection(std::unique_ptr<ISocket> socket,
                                          AdminHttpServer::SnapshotProvider snapshotProvider,
                                          IClock* clock,
                                          std::span<AdminRoute const> routes,
+                                         std::span<MetricsSurface const> surfaces,
                                          std::atomic<std::size_t>* inFlight)
 {
-    co_await ServeAdminHttp(socket.get(), metrics, std::move(snapshotProvider), clock, routes);
+    co_await ServeAdminHttp(socket.get(), metrics, std::move(snapshotProvider), clock, routes, surfaces);
     socket->Close();
     inFlight->fetch_sub(1, std::memory_order_acq_rel);
 }
@@ -740,7 +744,7 @@ Task<void> AdminHttpServer::Run()
             continue;
         }
         ServeAdminConnection(
-            WrapTls(std::move(*accepted), _tls), &_metrics, _snapshotProvider, &_clock, _routes, &_inFlight);
+            WrapTls(std::move(*accepted), _tls), &_metrics, _snapshotProvider, &_clock, _routes, _surfaces, &_inFlight);
     }
     co_return;
 }

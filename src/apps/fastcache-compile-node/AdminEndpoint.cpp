@@ -1043,7 +1043,17 @@ AdminEndpoint::AdminEndpoint(std::unique_ptr<BlockingListener> listener,
                              TlsContext* tls):
     _listener { std::move(listener) },
     _server { std::make_unique<AdminHttpServer>(
-        *_listener, metrics, std::move(snapshot), logger, _clock, std::move(routes), tls) },
+        // `NodeServedSurfaces`: this binary has no cache-daemon accept path, so the
+        // `fastcached_connections_*` rows read ABSENT on its `/metrics` rather than as a zero
+        // saying nothing has ever connected to it (#1484).
+        *_listener,
+        metrics,
+        std::move(snapshot),
+        logger,
+        _clock,
+        std::move(routes),
+        tls,
+        NodeServedSurfaces) },
     _boundEndpoint { std::move(boundEndpoint) },
     _thread { [server = _server.get()] { SyncRun(server->Run()); } }
 {

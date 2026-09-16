@@ -90,7 +90,7 @@ constexpr std::array Regimes {
     auto offset = std::uint64_t { 0 };
     for (auto const& row: CounterTable)
         sink.Increment(row.counter, regime.counter + (regime.counter == 0 ? 0 : offset++));
-    return CaptureStatsReading(sink, snapshot);
+    return CaptureStatsReading(sink, snapshot, EverySurface);
 }
 
 /// A cache daemon run with `--storage`: the merged cache and both tiers, no host, no consensus.

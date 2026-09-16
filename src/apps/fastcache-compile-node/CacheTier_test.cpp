@@ -233,7 +233,11 @@ class MetricsDoors
         REQUIRE(SyncRun(WriteWhole(pair.client.get(), Wire::AsBytes(request))));
         pair.client->ShutdownWrite();
         SteadyClock clock;
-        SyncRun(ServeAdminHttp(pair.server.get(), &_metrics, _provider, &clock));
+        // `NodeServedSurfaces`, because this door stands in for the NODE's `/metrics` and the
+        // node passes its own set (#1484). Left at the default this fixture answered for a
+        // process that serves every surface, and the case's two doors then disagreed about
+        // `fastcached_connections_total` -- which is the difference this case exists to find.
+        SyncRun(ServeAdminHttp(pair.server.get(), &_metrics, _provider, &clock, {}, NodeServedSurfaces));
         pair.server->Close();
 
         auto const response = SyncRun(ReadToEnd(pair.client.get()));

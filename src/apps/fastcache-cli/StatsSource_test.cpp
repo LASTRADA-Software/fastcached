@@ -305,7 +305,7 @@ TEST_CASE("a NodeMetrics body reads back as the record the /metrics rung parses,
     sink.Increment(IMetricsSink::Counter::WorkerJobsCompleted, 12);
     auto snapshot = MetricsSnapshot {};
     snapshot.storage = StorageStats { .itemCount = 3, .deleteHits = 2, .deleteMisses = 1 };
-    auto const reading = CaptureStatsReading(sink, snapshot);
+    auto const reading = CaptureStatsReading(sink, snapshot, EverySurface);
 
     auto const record = DecodeNodeMetrics(EncodeStatsReading(reading));
     REQUIRE(record.has_value());

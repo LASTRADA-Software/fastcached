@@ -38,9 +38,10 @@ std::optional<LiveCapture> NodeLiveStatsSources::Capture(Wire::LiveSubject subje
     switch (subject)
     {
         case Wire::LiveSubject::Cache:
-            return CaptureCacheSubject(*_parts.metrics, _parts.snapshot());
+            return CaptureCacheSubject(*_parts.metrics, _parts.snapshot(), NodeServedSurfaces);
         case Wire::LiveSubject::Node: {
-            auto const reading = EncodeStatsReading(CaptureStatsReading(*_parts.metrics, _parts.snapshot()));
+            auto const reading =
+                EncodeStatsReading(CaptureStatsReading(*_parts.metrics, _parts.snapshot(), NodeServedSurfaces));
             auto const status = _parts.identity->Describe();
             auto const described = Wire::EncodeNodeStatus(status);
             return LiveCapture { .body = WireFields::Encode(

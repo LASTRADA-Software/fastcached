@@ -43,7 +43,7 @@ namespace
 {
     AtomicMetricsSink sink;
     sink.Increment(IMetricsSink::Counter::LiveSubscriptionsOpened, 7);
-    return CaptureStatsReading(sink, MetricsSnapshot {});
+    return CaptureStatsReading(sink, MetricsSnapshot {}, EverySurface);
 }
 
 /// @param payload A push's payload.

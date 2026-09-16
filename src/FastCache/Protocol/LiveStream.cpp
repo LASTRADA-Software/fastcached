@@ -243,9 +243,11 @@ bool CarriesStatsReading(Wire::LiveSubject subject) noexcept
     return index < LiveSubjectBodies.size() && LiveSubjectBodies.at(index).statsReading;
 }
 
-LiveCapture CaptureCacheSubject(IMetricsSink const& metrics, MetricsSnapshot const& snapshot)
+LiveCapture CaptureCacheSubject(IMetricsSink const& metrics,
+                                MetricsSnapshot const& snapshot,
+                                std::span<MetricsSurface const> surfaces)
 {
-    return LiveCapture { .body = EncodeStatsReading(CaptureStatsReading(metrics, snapshot)), .probe = {} };
+    return LiveCapture { .body = EncodeStatsReading(CaptureStatsReading(metrics, snapshot, surfaces)), .probe = {} };
 }
 
 CacheLiveStatsSources::CacheLiveStatsSources(IMetricsSink const& metrics,

@@ -518,6 +518,7 @@ is where they are explained one by one.
 |---|---|
 | `fastcached_uptime_seconds` | Seconds since this process started. A gauge; a reset is a restart. |
 | `fastcached_build_info` | The build this process runs, as `fastcached_build_info{version="0.4.1"} 1`. The value is always 1 and the version is the label, so a query joins on it rather than reading a number. |
+| `fastcached_metrics_surface_absent` | How many counters this build's catalogue names that belong to surfaces **this process does not serve**, so nothing here can ever write them. A gauge, and **a nonzero reading is the healthy state** of any binary that serves only some surfaces -- `fastcache-compile-node` reports the daemon's `fastcached_connections_*` rows here, because it constructs neither of their writers. Those series are omitted from the scrape rather than rendered as a zero saying nothing has ever connected. **Do not alert on this**; it is the row above that is a fault. |
 | `fastcached_metrics_catalogue_skew` | How many counters this build's metrics catalogue names that its sink has no slot for. A gauge, and **zero on any correctly built process** -- a nonzero reading means the catalogue and the sink were compiled against different versions of the counter enum, so the binary is inconsistent and every counter at the affected ordinals is missing from this scrape rather than reading zero. Alert on `> 0`. |
 
 This table is checked against the exposition the daemon actually renders — see

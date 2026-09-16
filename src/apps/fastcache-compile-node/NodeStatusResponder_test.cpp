@@ -85,7 +85,12 @@ class CapturedReadings final: public ILiveStatsSources
     {
         if (!_attached || subject != Wire::LiveSubject::Cache)
             return std::nullopt;
-        return CaptureCacheSubject(_metrics, _snapshot);
+        // `NodeServedSurfaces`, because this stands in for the NODE's source and the shipped
+        // `NodeLiveStatsSources` passes its own set (#1484). Left at the default it answered for
+        // a process serving every surface, so the case compared the responder's reading against
+        // a capture the node would never produce -- a fake more permissive than the thing it
+        // stands for, which is the one kind of fixture defect reading the fake never finds.
+        return CaptureCacheSubject(_metrics, _snapshot, NodeServedSurfaces);
     }
 
     /// @copydoc ILiveStatsSources::Leadership
@@ -810,7 +815,7 @@ TEST_CASE("NodeMetrics answers the reading /metrics renders, the cache tier's fi
     // The whole reading, compared as one value: every counter, every block, the version. Derived
     // from a capture of the same sink and snapshot rather than from a list of expected figures,
     // which would go stale silently the day a figure is added.
-    CHECK(reading == CaptureStatsReading(metrics, snapshot));
+    CHECK(reading == CaptureStatsReading(metrics, snapshot, NodeServedSurfaces));
 
     REQUIRE(reading.snapshot.storage.has_value());
     CHECK(Unwrap(reading.snapshot.storage).itemCount == 3);
@@ -821,9 +826,15 @@ TEST_CASE("NodeMetrics answers the reading /metrics renders, the cache tier's fi
     // zero are PRESENT, not dropped.
     auto const* const completed = reading.counters.Find(IMetricsSink::Counter::WorkerJobsCompleted);
     REQUIRE(completed != nullptr);
-    CHECK(*completed == std::optional<std::uint64_t> { 7 });
-    auto const zeroes = std::ranges::count(reading.counters.Positional(), std::optional<std::uint64_t> { 0 });
-    CHECK(static_cast<std::size_t>(zeroes) == CounterTable.size() - 1);
+    CHECK(*completed == CounterReading::Of(7));
+    auto const zeroes = std::ranges::count(reading.counters.Positional(), CounterReading::Of(0));
+    // DERIVED, not `size() - 4`. Three rows read absent on a node rather than zero because it
+    // serves none of the surfaces they are attributed to (#1484), and a hardcoded number here
+    // would rot the moment a fourth row is attributed -- while still passing, which is the
+    // direction that matters.
+    auto const writable = std::ranges::count_if(
+        CounterTable, [](auto const& row) { return CounterHasAWriterIn(row.counter, NodeServedSurfaces); });
+    CHECK(static_cast<std::size_t>(zeroes) == static_cast<std::size_t>(writable) - 1);
 
     SECTION("and a node whose sources are detached is stopping, and says so uncounted")
     {

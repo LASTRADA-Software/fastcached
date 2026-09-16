@@ -208,10 +208,18 @@ std::vector<std::byte> EncodeStatsReading(StatsReading const& reading)
     // By position, which is this grammar's whole design: the digest above is what makes a position mean
     // the same row at both ends.
     auto const cells = counters.Positional();
-    out.Bitmap(cells.size(), [&](std::size_t i) { return cells[i].has_value(); });
-    for (auto const& value: cells)
-        if (value.has_value())
-            out.U64(*value);
+    out.Bitmap(cells.size(), [&](std::size_t i) { return cells[i].Present(); });
+    for (auto const& cell: cells)
+        if (cell.Present())
+            out.U64(cell.Value());
+    // A second bitmap over the same positions, saying WHICH absence each absent cell is: set
+    // means `NoWriterInThisProcess`, clear means `NoSlotInThisBuild` (#1484). Written for every
+    // position rather than only the absent ones, so the grammar has no conditional length --
+    // 144 bits is 18 bytes, and a length that depends on the first bitmap's contents is a
+    // reader that has to agree with the writer about two things instead of one.
+    out.Bitmap(cells.size(), [&](std::size_t i) {
+        return !cells[i].Present() && cells[i].Why() == CounterAbsence::NoWriterInThisProcess;
+    });
 
     // Structured bindings, so a field added to either struct stops this compiling until it is
     // given a place in the grammar and a name in `SnapshotFieldNames` / `ConsensusFieldNames`.
@@ -308,7 +316,26 @@ std::expected<StatsReading, StatsReadingFault> DecodeStatsReading(std::span<std:
         std::uint64_t value = 0;
         if (!in.ReadU64(value))
             return truncated;
-        cells[i] = value;
+        cells[i] = CounterReading::Of(value);
+    }
+
+    // Which absence each absent cell is. A set bit on a cell whose presence bit is ALSO set has
+    // no meaning in this grammar, so it is refused rather than ignored: the encoder never emits
+    // that combination, and a reader that tolerates one the writer cannot produce is a reader
+    // that will accept a corrupted frame and answer plausibly.
+    auto const absenceBits = ReadBitmap(in, cells.size());
+    if (!absenceBits.has_value())
+        return in.Ok() ? malformed : truncated;
+    for (auto const i: std::views::iota(std::size_t { 0 }, cells.size()))
+    {
+        if ((*counterBits)[i])
+        {
+            if ((*absenceBits)[i])
+                return malformed;
+            continue;
+        }
+        cells[i] = CounterReading::None((*absenceBits)[i] ? CounterAbsence::NoWriterInThisProcess
+                                                          : CounterAbsence::NoSlotInThisBuild);
     }
 
     auto& [storage, storageTiers, host, hostLoad, upstreamConfigured, consensus, uptime] = reading.snapshot;

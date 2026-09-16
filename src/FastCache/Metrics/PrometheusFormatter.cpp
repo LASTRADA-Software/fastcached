@@ -550,11 +550,29 @@ std::string RenderPrometheus(StatsReading const& reading)
     // skewed build degrades to "fewer series plus a visible reason" rather than to
     // a wrong number or a refused endpoint.
     std::uint64_t omittedBySkew = 0;
+    std::uint64_t omittedBySurface = 0;
     for (auto const& row: CounterTable)
     {
         auto const* const cell = reading.counters.Find(row.counter);
-        if (cell == nullptr || !cell->has_value())
+        if (cell == nullptr || !cell->Present())
         {
+            // WHICH absence this is decides whether it is a FAULT, and that is the whole of
+            // #1484. A row this build's sink has no slot for is a skew. A row this PROCESS has
+            // no writer for is an ordinary fact about which surfaces it serves -- counting it
+            // would report every healthy `fastcache-compile-node` as a build whose catalogue and
+            // sink disagree, which is a confident wrong signal replacing a vague one and costs
+            // the skew series its meaning.
+            //
+            // A null cell is this build having no slot at all, which is the skew reading.
+            auto const why = cell == nullptr ? CounterAbsence::NoSlotInThisBuild : cell->Why();
+            if (why == CounterAbsence::NoWriterInThisProcess)
+            {
+                ++omittedBySurface;
+                out += std::format("# ABSENT {} belongs to a surface this process does not serve, so it has "
+                                   "no writer here; omitted rather than rendered as zero, and NOT a skew.\n",
+                                   row.prometheusName);
+                continue;
+            }
             ++omittedBySkew;
             out += std::format("# SKEW {} is in the metrics catalogue and this build's sink has no "
                                "slot for it; omitted rather than rendered as zero. The catalogue "
@@ -563,7 +581,7 @@ std::string RenderPrometheus(StatsReading const& reading)
                                row.prometheusName);
             continue;
         }
-        Append(out, Metric { .name = row.prometheusName, .help = row.help, .type = row.type, .value = **cell });
+        Append(out, Metric { .name = row.prometheusName, .help = row.help, .type = row.type, .value = cell->Value() });
     }
 
     // How many catalogue rows this build's sink could not carry, as a SERIES.
@@ -579,6 +597,23 @@ std::string RenderPrometheus(StatsReading const& reading)
     //
     // Zero on a healthy build is a real reading rather than an absence, which is
     // what makes `> 0` alertable.
+    // The machine-readable half of the OTHER absence, and it earns a series by exactly the
+    // argument the skew series does: a scraper discards every comment, so the `# ABSENT` lines
+    // above reach monitoring as series that silently vanished, which is indistinguishable from a
+    // rename or a down target. A gauge rather than a catalogue row for the same reason as the
+    // skew gauge -- it describes THIS RENDER rather than an event the sink tallied.
+    //
+    // Zero on a process that serves everything, which is what makes a nonzero reading mean
+    // something. It is NOT an alert condition: unlike a skew, a nonzero value here is the
+    // healthy state of any binary that does not serve every surface.
+    Append(out,
+           Metric { .name = "fastcached_metrics_surface_absent",
+                    .help = "Catalogue rows belonging to surfaces this process does not serve, so they have "
+                            "no writer here and are omitted rather than rendered as zero. Not a fault: a "
+                            "nonzero value is the healthy state of a binary that serves only some surfaces.",
+                    .type = MetricType::Gauge,
+                    .value = omittedBySurface });
+
     Append(out,
            Metric { .name = "fastcached_metrics_catalogue_skew",
                     .help = "Catalogue rows this build's metrics sink has no slot for; nonzero means the "
@@ -604,9 +639,11 @@ std::string RenderPrometheus(StatsReading const& reading)
     return out;
 }
 
-std::string RenderPrometheus(IMetricsSink const& metrics, MetricsSnapshot const& snapshot)
+std::string RenderPrometheus(IMetricsSink const& metrics,
+                             MetricsSnapshot const& snapshot,
+                             std::span<MetricsSurface const> surfaces)
 {
-    return RenderPrometheus(CaptureStatsReading(metrics, snapshot));
+    return RenderPrometheus(CaptureStatsReading(metrics, snapshot, surfaces));
 }
 
 } // namespace FastCache

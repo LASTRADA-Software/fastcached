@@ -8,7 +8,9 @@
 namespace FastCache
 {
 
-StatsReading CaptureStatsReading(IMetricsSink const& metrics, MetricsSnapshot const& snapshot)
+StatsReading CaptureStatsReading(IMetricsSink const& metrics,
+                                 MetricsSnapshot const& snapshot,
+                                 std::span<MetricsSurface const> surfaces)
 {
     StatsReading reading { .counters = {}, .snapshot = snapshot, .version = std::string { VersionString } };
     // Driven by the catalogue, not by the enum's range: the catalogue is what every encoding
@@ -18,8 +20,18 @@ StatsReading CaptureStatsReading(IMetricsSink const& metrics, MetricsSnapshot co
     for (auto const& row: CounterTable)
     {
         auto* const cell = reading.counters.Find(row.counter);
-        if (cell != nullptr && metrics.Carries(row.counter))
-            *cell = metrics.Read(row.counter);
+        if (cell == nullptr)
+            continue;
+        // The ORDER is the one `CounterAbsence` declares, and it is not arbitrary: a build that
+        // cannot represent the row AT ALL outranks a process that merely never writes it. Asked
+        // the other way round, a skewed build serving no cache would report its skew as an
+        // ordinary component absence and nothing would count it.
+        if (!metrics.Carries(row.counter))
+            *cell = CounterReading::None(CounterAbsence::NoSlotInThisBuild);
+        else if (!CounterHasAWriterIn(row.counter, surfaces))
+            *cell = CounterReading::None(CounterAbsence::NoWriterInThisProcess);
+        else
+            *cell = CounterReading::Of(metrics.Read(row.counter));
     }
     return reading;
 }

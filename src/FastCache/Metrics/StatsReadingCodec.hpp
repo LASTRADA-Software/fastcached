@@ -184,7 +184,7 @@ namespace StatsReadingWire
     /// The grammar's own name, folded in first so a change to the grammar ABOVE with no table
     /// change still moves the digest. Bump the suffix whenever the encoder's statements change
     /// shape without a table changing.
-    inline constexpr std::string_view Grammar = "stats-reading-grammar-3";
+    inline constexpr std::string_view Grammar = "stats-reading-grammar-4";
 
     /// 64-bit FNV-1a over @p text, continuing from @p hash.
     /// @param hash The running digest.

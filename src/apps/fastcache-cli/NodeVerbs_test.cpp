@@ -130,7 +130,7 @@ namespace
     sink.Increment(IMetricsSink::Counter::WorkerJobsCompleted, jobsCompleted);
     auto snapshot = MetricsSnapshot {};
     snapshot.storage = storage;
-    return Cc::EncodeReply(Cc::Status::Ok, EncodeStatsReading(CaptureStatsReading(sink, snapshot)));
+    return Cc::EncodeReply(Cc::Status::Ok, EncodeStatsReading(CaptureStatsReading(sink, snapshot, EverySurface)));
 }
 
 } // namespace
