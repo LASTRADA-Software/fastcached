@@ -653,6 +653,80 @@ TEST_CASE("a piped cache row reports the panel's figures unformatted, absent unt
     CHECK(cell(second, "conns-per-sec").empty());
 }
 
+// Tagged `[absent]` so it can be SELECTED. The name carries a comma, and a Catch2 case name is
+// an argument a comma splits, so `-R` by name answers `No tests ran` and exits non-zero. The
+// sentence-shaped name is right; the tag is how a subset gets chosen.
+TEST_CASE("a node blanks only the counter it has no writer for, and the row keeps its real figures",
+          "[cli][live][piped][figures][absent]")
+{
+    // #1484's first acceptance clause, at the panel it was observed on. `CounterField` gates on
+    // `Present()`, so the mechanism is #1496's; what this adds is a case that can FAIL for the
+    // ticket's reason. The neighbouring figures case reads `conns-per-sec` as empty only because
+    // `CacheAt` leaves the whole counter block default-constructed -- absent by omission rather
+    // than absent because this process has no writer -- so it passes on a reading the ticket is
+    // not about.
+    auto const reading = [](std::optional<std::uint64_t> connections) {
+        auto r = CacheAt(90, 10, 1000, 4096);
+        auto* const cell = r.counters.Find(IMetricsSink::Counter::ConnectionsTotal);
+        REQUIRE(cell != nullptr);
+        // Stated, never defaulted: the fact is *this binary has no writer for the row*, which is
+        // what a compile node reports and what the panel must render as nothing.
+        *cell = connections.has_value() ? CounterReading::Of(*connections)
+                                        : CounterReading::None(CounterAbsence::NoWriterInThisProcess);
+        return r;
+    };
+
+    auto const row = [](StatsReading sample) {
+        std::vector<DashboardEvent> script;
+        AddSample(script, 1, std::move(sample));
+        auto const lines = Lines(Stream(std::move(script), OutputFormat::Tsv, {}, std::nullopt, &CacheFigures));
+        REQUIRE(lines.size() == 2);
+        return std::pair { Fields(lines[0]), Fields(lines[1]) };
+    };
+
+    // A column the header does not name fails here rather than reading past the end of a row.
+    auto const cell =
+        [](std::vector<std::string> const& header, std::vector<std::string> const& fields, std::string_view name) {
+            auto const found = std::ranges::find(header, name);
+            REQUIRE(found != header.end());
+            REQUIRE(fields.size() == header.size());
+            return fields[static_cast<std::size_t>(found - header.begin())];
+        };
+
+    SECTION("a compile node: the counter is blank and every other figure in the row is real")
+    {
+        auto const [header, fields] = row(reading(std::nullopt));
+
+        CHECK(cell(header, fields, "connections-accepted").empty());
+        // BOTH, or a fix that blanked the row -- or the counter block, or the whole reading --
+        // passes. The acceptance clause says so in as many words.
+        CHECK(cell(header, fields, "items") == "12");
+        CHECK(cell(header, fields, "hit-rate-since-start") == "0.9000");
+        CHECK(cell(header, fields, "bytes-used") == "4096");
+    }
+
+    SECTION("a daemon that has accepted nothing: an honest ZERO, never a blank")
+    {
+        // The direction #1484 says gets skipped, and skipping it is how the fix becomes "stop
+        // reporting a useful counter". A counter is a tally, so zero is the truth about events
+        // that never happened -- a different claim from *this process cannot answer*.
+        auto const [header, fields] = row(reading(0));
+
+        CHECK(cell(header, fields, "connections-accepted") == "0");
+        CHECK_FALSE(cell(header, fields, "connections-accepted").empty());
+        CHECK(cell(header, fields, "items") == "12");
+    }
+
+    SECTION("a daemon that has accepted some: the figure is the number")
+    {
+        // So the control above cannot pass by the figure being stuck at zero for some reason
+        // that has nothing to do with presence.
+        auto const [header, fields] = row(reading(7));
+
+        CHECK(cell(header, fields, "connections-accepted") == "7");
+    }
+}
+
 TEST_CASE("a piped cache header waits for a successful reading and names exactly the tiers it carried",
           "[cli][live][piped][figures]")
 {
