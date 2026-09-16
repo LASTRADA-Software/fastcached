@@ -169,67 +169,30 @@ endfunction()
 # check's own ticket exists to retire. So stop enumerating: `git ls-files` answers
 # "what does this repository contain" directly, and a dependency cache is untracked by
 # construction whatever it is called and wherever a package manager decides to put it.
-# It is also fast -- no stat of a build tree at all.
+# It is also fast -- no stat of a build tree at all. The walk fallback still carries
+# the excluded names, in the shared enumeration where there is one copy of them rather
+# than the seven this check's own history argues against.
+include("${CMAKE_CURRENT_LIST_DIR}/lib/CheckCommon.cmake")
+# The file set this rule is about, found through the ONE enumeration (#1485). The work-tree
+# probe, the git lookup, the `ls-files` call, the walk fallback and the build-tree exclusion
+# list were a byte-identical copy in eight checks, and a copy is what can drift from the rule
+# it enforces. The QUESTION stays here, where the rule is -- the pathspec and the glob are
+# this check's own, and they are the same question twice so the two modes cover one set.
 #
-# The same idiom, and the same fallback, as `check-repository-hygiene.cmake`.
-if(NOT GIT_EXECUTABLE)
-    find_program(GIT_EXECUTABLE NAMES git)
-endif()
+# The MODE travels with the answer and is stated in the status line and the refusal below. It
+# has THREE values since the consolidation: a walk now says whether there was no index at all
+# or whether the index named no file matching this question.
 
-set(listFiles "")
-set(scanSource "")
-
-if(GIT_EXECUTABLE)
-    execute_process(
-        COMMAND "${GIT_EXECUTABLE}" -C "${FASTCACHED_SOURCE_DIR}" rev-parse --is-inside-work-tree
-        OUTPUT_VARIABLE insideWorkTree
-        ERROR_VARIABLE gitError
-        RESULT_VARIABLE gitStatus
-        OUTPUT_STRIP_TRAILING_WHITESPACE)
-    if(gitStatus EQUAL 0 AND insideWorkTree STREQUAL "true")
-        execute_process(
-            COMMAND "${GIT_EXECUTABLE}" -C "${FASTCACHED_SOURCE_DIR}" ls-files -- "*CMakeLists.txt"
-            OUTPUT_VARIABLE tracked
-            RESULT_VARIABLE lsStatus
-            OUTPUT_STRIP_TRAILING_WHITESPACE)
-        if(lsStatus EQUAL 0 AND NOT tracked STREQUAL "")
-            string(REPLACE "\n" ";" listFiles "${tracked}")
-            set(scanSource "git ls-files")
-        endif()
-    endif()
-endif()
-
-# No git, or an export with no index. A source export contains no build tree and no
-# dependency cache BY CONSTRUCTION -- that is what makes the walk sound here and
-# unsound in a working checkout -- so the fallback is a plain recursive glob with the
-# build-tree names still excluded, and it says which mode produced the answer.
-if(NOT listFiles)
-    set(excludeNames "out" "build" "_deps" ".git" ".cache" ".claude")
-    file(GLOB_RECURSE walked RELATIVE "${FASTCACHED_SOURCE_DIR}"
-         "${FASTCACHED_SOURCE_DIR}/CMakeLists.txt")
-    foreach(candidate IN LISTS walked)
-        set(skip FALSE)
-        foreach(name IN LISTS excludeNames)
-            if(candidate MATCHES "(^|/)${name}/")
-                set(skip TRUE)
-                break()
-            endif()
-        endforeach()
-        if(NOT skip)
-            list(APPEND listFiles "${candidate}")
-        endif()
-    endforeach()
-    set(scanSource "directory walk (no git index)")
-endif()
-
-list(REMOVE_DUPLICATES listFiles)
-list(SORT listFiles)
+fastcached_tracked_files("${FASTCACHED_SOURCE_DIR}"
+    PATHSPECS "*CMakeLists.txt"
+    GLOBS "CMakeLists.txt"
+    FILES_OUT listFiles
+    MODE_OUT scanSource)
 
 # And TRACKED stopped meaning OWNED when `vendor/` arrived: upstream's own CMakeLists are
 # in the index, copied verbatim, and nobody here may add a property to them. So both modes
 # decline the third-party roots (#1370), and name what they declined on every run -- the
 # fourth fix to this scan's scope is the one that states the scope rather than guessing it.
-include("${CMAKE_CURRENT_LIST_DIR}/lib/CheckCommon.cmake")
 fastcached_decline_third_party("${FASTCACHED_SOURCE_DIR}" listFiles declinedFiles)
 if(declinedFiles)
     list(LENGTH declinedFiles declinedCount)
