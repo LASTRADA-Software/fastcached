@@ -5589,6 +5589,32 @@ set_tests_properties("enumerator-walks-selftest" PROPERTIES
     TIMEOUT 180
 )
 
+# `fastcached_tracked_files` is what every enumerating `check-*.cmake` now reads its file set
+# through (#1485), so a defect in it is a defect in all of them at once. Consolidating eight
+# byte-identical copies removed eight chances of a silent miscount and ADDED one, and a single
+# point of failure with no guard on it has moved the risk rather than removed it.
+#
+# In the DEFAULT set: it starts no daemon, opens no socket and needs no compiler, and the
+# defect class it guards -- an enumeration covering a different set than the rule it enforces
+# claims to -- is invisible in every downstream verdict, which all stay green.
+#
+# It needs git: two of the three modes are git's, and it REFUSES rather than reporting zero
+# failures when there is none, because a run that silently exercised only the directory walk is
+# the very shape (the mode under test not being the mode in use) this repository has paid for.
+add_test(
+    NAME "tracked-files-selftest"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DGIT_EXECUTABLE=${GIT_EXECUTABLE}"
+        "-DFASTCACHED_SCRATCH_DIR=${CMAKE_CURRENT_BINARY_DIR}/tracked-files-selftest"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-tracked-files-selftest.cmake"
+)
+set_tests_properties("tracked-files-selftest" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 180
+)
+
 # A retained wall clock is a `WallClockRef`, never a raw `IWallClock` pointer or
 # reference member (#1032). The TYPE is the guard -- `WallClockRef` refuses to be built
 # from an rvalue, and the `static_assert` pairs in `Core/WallClockRef_test.cpp` and

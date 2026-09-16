@@ -158,71 +158,25 @@ endfunction()
 # hazard: nobody here can edit them, so the first upstream sync that adds a
 # `SUCCEED` reddens a check about OUR code on a change that is not ours. Measured:
 # every one of this repository's 236 own `*_test.cpp` files is under `src/`, so the
-# anchor loses no coverage. Both enumeration paths carry it, or the two modes
-# disagree and the selftest's mode assertion stops meaning anything.
-if(NOT GIT_EXECUTABLE)
-    find_program(GIT_EXECUTABLE NAMES git)
-endif()
-
-set(testFiles "")
-set(scanSource "")
-
-if(GIT_EXECUTABLE)
-    execute_process(
-        COMMAND "${GIT_EXECUTABLE}" -C "${FASTCACHED_SOURCE_DIR}" rev-parse --is-inside-work-tree
-        OUTPUT_VARIABLE insideWorkTree
-        ERROR_VARIABLE gitError
-        RESULT_VARIABLE gitStatus
-        OUTPUT_STRIP_TRAILING_WHITESPACE)
-    if(gitStatus EQUAL 0 AND insideWorkTree STREQUAL "true")
-        execute_process(
-            COMMAND "${GIT_EXECUTABLE}" -C "${FASTCACHED_SOURCE_DIR}" ls-files
-                    -- "src/*_test.cpp" "src/tests/*.cpp" "src/tests/*.hpp"
-            OUTPUT_VARIABLE tracked
-            RESULT_VARIABLE lsStatus
-            OUTPUT_STRIP_TRAILING_WHITESPACE)
-        if(lsStatus EQUAL 0 AND NOT tracked STREQUAL "")
-            string(REPLACE "\n" ";" testFiles "${tracked}")
-            set(scanSource "git ls-files")
-        endif()
-    endif()
-endif()
-
-# No git, or an export with no index. A source export contains no build tree and no
-# dependency cache BY CONSTRUCTION -- that is what makes the walk sound here and unsound
-# in a working checkout -- so the fallback is a plain recursive glob with the build-tree
-# names still excluded, and it says which mode produced the answer.
+# anchor loses no coverage. The anchor is passed ONCE, as the pathspec and as the
+# glob below, because a question spelled differently per mode is two modes covering
+# two sets and the selftest's mode assertion then stops meaning anything.
+include("${CMAKE_CURRENT_LIST_DIR}/lib/CheckCommon.cmake")
+# The file set this rule is about, found through the ONE enumeration (#1485). The work-tree
+# probe, the git lookup, the `ls-files` call, the walk fallback and the build-tree exclusion
+# list were a byte-identical copy in eight checks, and a copy is what can drift from the rule
+# it enforces. The QUESTION stays here, where the rule is -- the pathspec and the glob are
+# this check's own, and they are the same question twice so the two modes cover one set.
 #
-# The fallback is NOT decorative, and it is worth saying where it gets exercised, because
-# a check with two enumeration paths of which only one is ever taken has an untested half
-# that will be reached exactly once, in anger. Two routes reach it: a release tarball, and
-# **inspecting a merge before it lands** -- `git merge-tree --write-tree` plus `git
-# archive` materialises a tree with no index, which is how #685 first ran this half. It
-# agreed with the git path, and the selftest asserts the MODE on both sides so that
-# agreement is not luck.
-if(NOT testFiles)
-    set(excludeNames "out" "build" "_deps" ".git" ".cache" ".claude")
-    file(GLOB_RECURSE walked RELATIVE "${FASTCACHED_SOURCE_DIR}"
-         "${FASTCACHED_SOURCE_DIR}/src/*_test.cpp"
-         "${FASTCACHED_SOURCE_DIR}/src/tests/*.cpp"
-         "${FASTCACHED_SOURCE_DIR}/src/tests/*.hpp")
-    foreach(candidate IN LISTS walked)
-        set(excluded FALSE)
-        foreach(name IN LISTS excludeNames)
-            if(candidate MATCHES "(^|/)${name}/")
-                set(excluded TRUE)
-                break()
-            endif()
-        endforeach()
-        if(NOT excluded)
-            list(APPEND testFiles "${candidate}")
-        endif()
-    endforeach()
-    set(scanSource "directory walk (no git index)")
-endif()
+# The MODE travels with the answer and is stated in the status line and the refusal below. It
+# has THREE values since the consolidation: a walk now says whether there was no index at all
+# or whether the index named no file matching this question.
 
-list(REMOVE_DUPLICATES testFiles)
-list(SORT testFiles)
+fastcached_tracked_files("${FASTCACHED_SOURCE_DIR}"
+    PATHSPECS "src/*_test.cpp" "src/tests/*.cpp" "src/tests/*.hpp"
+    GLOBS "src/*_test.cpp" "src/tests/*.cpp" "src/tests/*.hpp"
+    FILES_OUT testFiles
+    MODE_OUT scanSource)
 
 if(NOT testFiles)
     message("")

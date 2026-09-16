@@ -158,46 +158,24 @@ function(fastcached_mentions_any content outMentions)
     set(${outMentions} "${mentions}" PARENT_SCOPE)
 endfunction()
 
-# The C++ files under one root, asked of git rather than inferred from directory names,
-# with a directory walk when there is no index -- and the mode is part of the verdict,
-# because a fixture staging synthetic trees takes the walk while CI takes git.
+include("${CMAKE_CURRENT_LIST_DIR}/lib/CheckCommon.cmake")
+
+# The C++ files under one root, asked of git rather than inferred from directory names, with a
+# directory walk when there is no index -- and the mode is part of the verdict, because a
+# fixture staging synthetic trees takes the walk while CI takes git.
+#
+# The ROOT is this check's question and stays here; how a question is answered is
+# `fastcached_tracked_files` (#1485), which this wrapper keeps parameterising by root. The
+# pathspec and the glob are the same question twice, or the two modes cover two sets.
 function(fastcached_sources_under root outFiles outMode)
-    set(files "")
-    set(mode "")
-    if(GIT_EXECUTABLE)
-        execute_process(
-            COMMAND "${GIT_EXECUTABLE}" -C "${FASTCACHED_SOURCE_DIR}" rev-parse --is-inside-work-tree
-            OUTPUT_VARIABLE insideWorkTree
-            ERROR_QUIET
-            RESULT_VARIABLE gitStatus
-            OUTPUT_STRIP_TRAILING_WHITESPACE)
-        if(gitStatus EQUAL 0 AND insideWorkTree STREQUAL "true")
-            execute_process(
-                COMMAND "${GIT_EXECUTABLE}" -C "${FASTCACHED_SOURCE_DIR}" ls-files -- "${root}/*.cpp" "${root}/*.hpp"
-                OUTPUT_VARIABLE tracked
-                RESULT_VARIABLE lsStatus
-                OUTPUT_STRIP_TRAILING_WHITESPACE)
-            if(lsStatus EQUAL 0 AND NOT tracked STREQUAL "")
-                string(REPLACE "\n" ";" files "${tracked}")
-                set(mode "git ls-files")
-            endif()
-        endif()
-    endif()
-    if(NOT files)
-        file(GLOB_RECURSE files RELATIVE "${FASTCACHED_SOURCE_DIR}"
-             "${FASTCACHED_SOURCE_DIR}/${root}/*.cpp"
-             "${FASTCACHED_SOURCE_DIR}/${root}/*.hpp")
-        set(mode "directory walk (no git index)")
-    endif()
-    list(REMOVE_DUPLICATES files)
-    list(SORT files)
+    fastcached_tracked_files("${FASTCACHED_SOURCE_DIR}"
+        PATHSPECS "${root}/*.cpp" "${root}/*.hpp"
+        GLOBS "${root}/*.cpp" "${root}/*.hpp"
+        FILES_OUT files
+        MODE_OUT mode)
     set(${outFiles} "${files}" PARENT_SCOPE)
     set(${outMode} "${mode}" PARENT_SCOPE)
 endfunction()
-
-if(NOT GIT_EXECUTABLE)
-    find_program(GIT_EXECUTABLE NAMES git)
-endif()
 
 list(JOIN FastCachedAmbientTokens ", " tokenList)
 

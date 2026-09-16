@@ -216,63 +216,23 @@ endfunction()
 
 # Which C++ this REPOSITORY owns, asked of git rather than inferred from directory
 # names: a dependency cache is untracked by construction, whatever a package manager
-# calls it or wherever it puts it. The same idiom, and the same fallback, as
-# `check-istreambuf-iterator.cmake`.
-if(NOT GIT_EXECUTABLE)
-    find_program(GIT_EXECUTABLE NAMES git)
-endif()
+# calls it or wherever it puts it.
+include("${CMAKE_CURRENT_LIST_DIR}/lib/CheckCommon.cmake")
+# The file set this rule is about, found through the ONE enumeration (#1485). The work-tree
+# probe, the git lookup, the `ls-files` call, the walk fallback and the build-tree exclusion
+# list were a byte-identical copy in eight checks, and a copy is what can drift from the rule
+# it enforces. The QUESTION stays here, where the rule is -- the pathspec and the glob are
+# this check's own, and they are the same question twice so the two modes cover one set.
+#
+# The MODE travels with the answer and is stated in the status line and the refusal below. It
+# has THREE values since the consolidation: a walk now says whether there was no index at all
+# or whether the index named no file matching this question.
 
-set(sourceFiles "")
-set(scanSource "")
-
-if(GIT_EXECUTABLE)
-    execute_process(
-        COMMAND "${GIT_EXECUTABLE}" -C "${FASTCACHED_SOURCE_DIR}" rev-parse --is-inside-work-tree
-        OUTPUT_VARIABLE insideWorkTree
-        ERROR_VARIABLE gitError
-        RESULT_VARIABLE gitStatus
-        OUTPUT_STRIP_TRAILING_WHITESPACE)
-    if(gitStatus EQUAL 0 AND insideWorkTree STREQUAL "true")
-        execute_process(
-            COMMAND "${GIT_EXECUTABLE}" -C "${FASTCACHED_SOURCE_DIR}" ls-files
-                    -- "src/*.cpp" "src/*.hpp"
-            OUTPUT_VARIABLE tracked
-            RESULT_VARIABLE lsStatus
-            OUTPUT_STRIP_TRAILING_WHITESPACE)
-        if(lsStatus EQUAL 0 AND NOT tracked STREQUAL "")
-            string(REPLACE "\n" ";" sourceFiles "${tracked}")
-            set(scanSource "git ls-files")
-        endif()
-    endif()
-endif()
-
-# No git, or an export with no index. A source export contains no build tree and no
-# dependency cache BY CONSTRUCTION, so the fallback is a plain recursive glob with the
-# build-tree names still excluded -- and it says which mode produced the answer,
-# because a fixture staging synthetic trees takes this path while CI takes git, and a
-# check that cannot say which was used cannot be held to it.
-if(NOT sourceFiles)
-    set(excludeNames "out" "build" "_deps" ".git" ".cache" ".claude")
-    file(GLOB_RECURSE walked RELATIVE "${FASTCACHED_SOURCE_DIR}"
-         "${FASTCACHED_SOURCE_DIR}/src/*.cpp"
-         "${FASTCACHED_SOURCE_DIR}/src/*.hpp")
-    foreach(candidate IN LISTS walked)
-        set(excluded FALSE)
-        foreach(name IN LISTS excludeNames)
-            if(candidate MATCHES "(^|/)${name}/")
-                set(excluded TRUE)
-                break()
-            endif()
-        endforeach()
-        if(NOT excluded)
-            list(APPEND sourceFiles "${candidate}")
-        endif()
-    endforeach()
-    set(scanSource "directory walk (no git index)")
-endif()
-
-list(REMOVE_DUPLICATES sourceFiles)
-list(SORT sourceFiles)
+fastcached_tracked_files("${FASTCACHED_SOURCE_DIR}"
+    PATHSPECS "src/*.cpp" "src/*.hpp"
+    GLOBS "src/*.cpp" "src/*.hpp"
+    FILES_OUT sourceFiles
+    MODE_OUT scanSource)
 
 if(NOT sourceFiles)
     message("")

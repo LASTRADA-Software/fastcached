@@ -5716,6 +5716,71 @@ variable with an unrecognised name) is not seen, and adding one is adding a row.
 its own directory -- and nothing checks an enumerator that is anchored under `src/`, which
 is correct: an inclusion list naming this repository's own layout needs no roots.
 
+## And HOW a file set is found is ONE answer too (#1485)
+
+#1370 settled *which files are this project's own*. The sibling question — *how is a file
+set obtained at all* — had **eight** answers, one per `check-*.cmake`, each a byte-identical
+copy of a work-tree probe, an `ls-files` call, a `GLOB_RECURSE` fallback and
+`set(excludeNames "out" "build" "_deps" ".git" ".cache" ".claude")`. Seven copies of that last
+line, and an exclusion list is a bet on the world's layout: seven bets that have to move
+together.
+
+**What was shared is the MACHINERY; the file set is not shareable and must not be made so.**
+That is the finding, and it is the opposite of what the ticket was filed saying. The eight ask
+eight different questions — `*CMakeLists.txt`, `src/*.cpp src/*.hpp`, one subdirectory, the
+test files by pathspec, every tracked C++ source, and one that does not enumerate at all — so
+`fastcached_first_party_cxx` fit **none** of them verbatim and migrating any onto it would have
+narrowed or widened what its rule is enforced over. Three of them and the first-party set both
+answer **915** files today, which is a real coincidence rather than evidence they agree: every
+one of this repository's own C++ files is under `src/` spelled `.cpp` or `.hpp`, and every
+third-party file is under `vendor/`. It diverges the moment a `.h` or a `tools/*.cpp` appears,
+and nothing would say so.
+
+- **One function, parameterised by the question.** `fastcached_tracked_files(<dir>
+  [PATHSPECS ...] GLOBS ... [FILTER ...] FILES_OUT v MODE_OUT v)`. The pathspec and the glob
+  stay in the file where the rule is; `fastcached_first_party_cxx` is a CALLER of it, not the
+  thing every check calls.
+- **The pathspec and the glob are the same question twice, and the FILTER applies in both
+  modes.** A filter living in the pathspec on one side and in the glob on the other passes
+  every per-mode assertion while covering two different sets.
+- **The fallback is gated on the MODE, never on the list being empty.** `if(NOT sourceFiles)`
+  conflates *no mode answered* with *a mode answered and its filter kept nothing*, so a real
+  git answer can be overwritten by a walk under a verdict naming the wrong mode.
+- **`ls-files` succeeding and naming NOTHING is not the same event as there being no index**,
+  and every copy reported the latter for both — a true-sounding sentence about the
+  environment that is false. A walk therefore says WHICH of its two reasons it ran for.
+- **But a fixture must not pin WHICH walk reason**, because that is a fact about where the
+  scratch directory sits: a staged tree with no `.git` of its own is still inside a work tree
+  whenever `CMAKE_CURRENT_BINARY_DIR` is, and it is — `out/build/...`. Every `baseline via
+  walk` case asserts `directory walk` and the reasons are pinned where a fixture controls the
+  probe. Measured: six of these were green with the scratch directory in `TEMP` and red with it
+  in `out/`. In `check-catch-skip-selftest` that assertion is an ABSENCE, so the class-level
+  string is also **stricter** — the old spelling passed with the third mode's string present.
+- **The work-tree probe answers in THREE values**, `fastcached_work_tree_state` →
+  `work-tree` / `no-git` / `not-a-work-tree`, because an enumeration walks the directory on
+  either negative while a check with nothing to fall back on SKIPS, and owes an operator a
+  different sentence for each. It also settled a disagreement the copies carried in silence:
+  they compared the exit status `EQUAL 0`, `check-repository-hygiene.cmake` with
+  `STREQUAL "0"`.
+- **`check-repository-hygiene.cmake` has no file set and must never grow one.** Its subject is
+  what the INDEX holds (`ls-files --error-unmatch` on named forbidden paths), which a directory
+  walk cannot answer, so its probe ends in a SKIP where every other check's ends in a fallback.
+  It shares the probe, nothing else.
+- **A consolidation removes N chances of a silent miscount and ADDS one**, so the shared
+  function has a self-test of its own (`tracked-files-selftest`, default set). Without it the
+  risk has moved rather than gone: an over-broad enumeration reports on files a rule was never
+  written for, an under-broad one reports clean over files it never read, and every downstream
+  verdict stays green either way.
+- **All three probe answers are REACHABLE by a fixture, and one took arranging.** A directory
+  outside every repository is not something a staged tree can guarantee, so `not-a-work-tree`
+  is arranged by asking about a repository's own `.git` DIRECTORY — which git answers `false`
+  for while succeeding, and which is the state's own meaning rather than a trick.
+- **`.ipp` and `.inl` are in the C++ extension set although this tree tracks none.** Measured:
+  0, against 464 `.hpp` as a positive control on the same pattern. `check-ranges-seam` covered
+  them before it migrated, so the extensions moved INTO the helper rather than the check
+  adopting a narrower set: a difference that is invisible today and silent on the day it matters
+  is worse than one that shows up as a count.
+
 ## The enumerators of an enum are a view, and a hand-spelled walk is refused
 
 `Core/EnumTable.hpp` offers `Enumerators<Enum>()` and `Enumerators(Enum from)` (#1441), and
@@ -5744,16 +5809,6 @@ REFUSES rather than reporting a clean tree, because *no violations* and *the rul
 applies* are different answers and only one of them is good news.
 
 ## Open work
-
-- **[#1485](https://github.com/LASTRADA-Software/fastcached/issues/1485)** — nine
-  `check-*.cmake` readers each carry their own copy of the first-party-C++ enumeration.
-  `fastcached_first_party_cxx` in `scripts/lib/CheckCommon.cmake` is now the one answer and
-  #1476 is its first consumer; the nine are unchanged, so it is the source of truth for one
-  caller out of ten. Migrating them is one at a time with each check's own self-test re-run,
-  which is why it was not a rider on #1476. **The cost is not hypothetical**: extracting the
-  helper exposed a miscount in the freshly written copy within the hour — see the
-  single-backslash entry above — and nine copies is nine chances for that in nine files
-  nobody diffs against each other.
 
 - **[#1432](https://github.com/LASTRADA-Software/fastcached/issues/1432)** — SHA-256 hardware
   detection and the ARM engine are compiled for arm64 macOS alone, so Linux aarch64 and Windows

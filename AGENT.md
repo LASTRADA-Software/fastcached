@@ -1402,6 +1402,16 @@ what differs between compilers, standard libraries, hosts and tool versions.
   derives the enumerators from their spellings, so a new one that does not ask is refused. Importing
   `vendor/` needed five told separately and review found three. A root is the upstream COPY
   (`vendor/endo`), never the directory holding copies.
+- **And HOW a file set is found is one answer too: `fastcached_tracked_files`.** A
+  `check-*.cmake` keeps its QUESTION -- its pathspec and its glob, the same question twice -- and
+  never its own work-tree probe, `ls-files` call, walk fallback or copy of the excluded names;
+  eight carried all four, and `set(excludeNames ...)` was seven identical bets on the world's
+  layout. `fastcached_first_party_cxx` is a CALLER, not what everybody calls: it fitted NONE of the
+  eight, whose questions differ. A walk names WHICH of two reasons it ran for -- an index that
+  answered nothing is not an absent index -- but a FIXTURE must not pin which, since a staged tree
+  is inside a work tree whenever the build directory is. The probe is `fastcached_work_tree_state`,
+  THREE answers, because a check with no fallback SKIPS. Consolidating removes N chances of a silent
+  miscount and ADDS one, so `ctest -R tracked-files-selftest` guards it.
 - **A total stated beside a table is DERIVED from it, or it is a second claim** — a hand-maintained
   number describing a hand-maintained list is two sources of truth wearing one hat, and it drifted
   three commits running, in one file, in one day, each commit fixing the last count and introducing

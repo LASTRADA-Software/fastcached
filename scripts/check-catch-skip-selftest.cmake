@@ -32,6 +32,14 @@
 # Runs as `cmake -P`. See `check-script-check-signals.cmake` for why such a check
 # reports failure through its OUTPUT rather than an exit code.
 #
+# A `directory walk` expectation below names the mode CLASS and not which of its two reasons
+# ran. Since #1485 a walk says whether there was no index at all or whether the index named no
+# matching file, and which one a staged tree gets depends on where the scratch directory sits --
+# a tree with no `.git` of its own is still inside a work tree whenever `CMAKE_CURRENT_BINARY_DIR`
+# is. The git-against-walk distinction these cases exist for is unaffected; the two reasons are
+# pinned in `check-tracked-files-selftest.cmake`, which controls the git probe instead of
+# inheriting it.
+#
 # Usage:
 #   cmake -DFASTCACHED_SOURCE_DIR=<dir> -DFASTCACHED_SCRATCH_DIR=<dir> \
 #         -P scripts/check-catch-skip-selftest.cmake
@@ -127,7 +135,7 @@ endif()
 # The mode is asserted on both sides now, so neither half can quietly become the only
 # one exercised: this case fails if the git path somehow answered, and `git-untracked`
 # below fails if the walk did.
-string(FIND "${output}" "directory walk (no git index)" position)
+string(FIND "${output}" "directory walk" position)
 if(position EQUAL -1)
     list(APPEND failures
          "correct: the check did not report scanning via the directory walk, so the fallback -- the mode a release tarball with no git index takes -- was not the mode this case exercised")

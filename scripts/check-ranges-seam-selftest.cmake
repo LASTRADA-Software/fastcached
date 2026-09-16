@@ -24,6 +24,16 @@
 # staged for real (`git init` + `git add`), because a synthetic tree is not a git repository and
 # every case would otherwise exercise the directory walk while CI exercises git.
 #
+# What is asserted is `directory walk` and not which of its two REASONS ran, and that is
+# deliberate. Since #1485 a walk says whether there was no index or whether the index named no
+# matching file, and which one this fixture gets depends on where the scratch directory sits: a
+# staged tree with no `.git` of its own still sits inside a work tree whenever
+# `CMAKE_CURRENT_BINARY_DIR` does, which is `out/build/...` here. Pinning the reason would make
+# this case's verdict a fact about somebody's build-directory choice. The distinction the case
+# is FOR -- git against walk -- survives intact, and the reasons themselves are pinned in
+# `check-tracked-files-selftest.cmake`, whose fixture controls the git probe instead of
+# inheriting it.
+#
 # Mutations are applied to a SYNTHESISED tree, never to the tree under test, and each case
 # asserts its mutation LANDED before any verdict is drawn from it. The baselines are
 # load-bearing: every refusal below is evidence only if the unmutated tree passes.
@@ -270,7 +280,7 @@ endfunction()
 # case expects the check to PASS. The field count is asserted per row below.
 set(FastCachedRangesSeamCases
     # The baselines, in both enumeration modes. The vendored direct call is DECLINED here.
-    "baseline via walk|none|-|-|none called directly && directory walk (no git index) && 1 declined under third-party roots && std::ranges::iota -> Ranges::Iota && std::ranges::fold_left -> Ranges::FoldLeft|CMake Error"
+    "baseline via walk|none|-|-|none called directly && directory walk && 1 declined under third-party roots && std::ranges::iota -> Ranges::Iota && std::ranges::fold_left -> Ranges::FoldLeft|CMake Error"
     "baseline via git|none-git|-|-|none called directly && git ls-files && 1 declined under third-party roots|CMake Error"
 
     # --- THE RED ARM ---
