@@ -387,17 +387,63 @@ std::expected<void, StorageError> CowTreeStorage::Initialize()
 namespace
 {
 
+    /// A record the STORE keeps in the same tree as the cache's own entries.
+    struct ReservedKey
+    {
+        /// The sentinel's key.
+        std::string_view key;
+
+        /// Whether a store this build has successfully OPENED is holding this record.
+        ///
+        /// True for the format marker: `EnsureFormatVersion` stamps a brand-new store and
+        /// refuses every store carrying none, so an opened store always has exactly it.
+        ///
+        /// False for the migration marker -- and that is a CONSEQUENCE of the same
+        /// function rather than a fact about the marker itself: an interrupted conversion
+        /// is refused (`InterruptedConversion`) rather than served, so no serving store
+        /// holds one. **Relax that refusal and this column has to move with it**, or the
+        /// item count reads one high on exactly the stores a conversion touched.
+        bool onEveryOpenedStore;
+    };
+
+    /// The reserved sentinels, as data.
+    ///
+    /// A table rather than a spelling per site, because TWO questions read it -- is this
+    /// key reserved, and how many reserved records does an opened store hold -- and a third
+    /// sentinel answering one but not the other would be silent in both directions: a
+    /// mis-parsed record on one side, an item count off by one on the other.
+    /// @return The table.
+    [[nodiscard]] constexpr auto ReservedKeys() noexcept
+    {
+        return std::array {
+            ReservedKey { .key = CowTreeStorage::FormatMarkerKey, .onEveryOpenedStore = true },
+            ReservedKey { .key = CowTreeStorage::MigrationMarkerKey, .onEveryOpenedStore = false },
+        };
+    }
+
+    /// How many of an opened store's tree records belong to the STORE rather than to the
+    /// cache.
+    ///
+    /// Derived from the table rather than written as a constant: a bare `- 1` is correct
+    /// today for a reason that lives in another function entirely, and nothing would
+    /// connect the two.
+    /// @return The count.
+    [[nodiscard]] constexpr std::uint64_t ReservedRecordsOnAnOpenedStore() noexcept
+    {
+        return static_cast<std::uint64_t>(
+            std::ranges::count_if(ReservedKeys(), [](ReservedKey const& row) { return row.onEveryOpenedStore; }));
+    }
+
     /// Is `key` one of the reserved sentinels rather than a cache entry?
     ///
-    /// Both of them, in one predicate, because every caller wants the same
-    /// answer: a conversion that parsed either as a record would report the
-    /// store corrupt.
+    /// Every row, because every caller wants the same answer: a conversion that parsed
+    /// either as a record would report the store corrupt.
     /// @param key A tree key.
     /// @return True when it is reserved.
     [[nodiscard]] bool IsReservedKey(CowTree::BytesView key) noexcept
     {
-        return std::ranges::equal(key, KeyView(CowTreeStorage::FormatMarkerKey))
-               || std::ranges::equal(key, KeyView(CowTreeStorage::MigrationMarkerKey));
+        return std::ranges::any_of(ReservedKeys(),
+                                   [key](ReservedKey const& row) { return std::ranges::equal(key, KeyView(row.key)); });
     }
 
     /// How far an interrupted conversion had got.
@@ -2162,7 +2208,19 @@ void CowTreeStorage::SetReclaimLog(IReclaimLog* log)
 
 StorageStats CowTreeStorage::Snapshot() const noexcept
 {
-    _stats.itemCount = _index.size();
+    // What the CACHE holds, and a DURABLE answer -- which the mirror this line used to
+    // read is not. `_index` holds what this SESSION touched, so a node restarted onto a
+    // full store reported zero items beside a `bytesUsed` describing the whole store: two
+    // figures in one row denominated over different populations (#1483). #1006 fixed the
+    // byte half in this very function, which is why the comment immediately below
+    // describes this same defect for the neighbouring field.
+    //
+    // SATURATING. A count that OVERSTATES is the same defect as one that understates and
+    // the louder of the two, and `ReservedRecordsOnAnOpenedStore` is a claim about a store
+    // `Open` accepted -- so if that claim ever stops holding this must read zero rather
+    // than wrap to eighteen quintillion.
+    auto const treeRecords = _tree->ItemCount();
+    _stats.itemCount = static_cast<std::size_t>(treeRecords - std::min(treeRecords, ReservedRecordsOnAnOpenedStore()));
     // The STORE's total, not the mirror's -- which is the point of #1006: an
     // operator watching this against `--cache-disk` was told what this session had
     // touched, and after a restart that is zero while the store is full.

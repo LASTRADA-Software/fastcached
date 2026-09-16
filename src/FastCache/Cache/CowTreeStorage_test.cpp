@@ -3455,9 +3455,14 @@ TEST_CASE("A reopened store's index reports what has been TOUCHED, not what is o
     // **This pins a fact, not a policy.** It is equally true and equally load-bearing
     // whichever way #175 is settled -- a fix that reserves must reserve something other
     // than a startup reading, and a fix that bounds the index must bound something that
-    // starts empty and grows. Asserting it is what stops the next reader inferring the
-    // opposite from `itemCount`, which is `_index.size()` and therefore starts at zero
-    // too while the tree on disk is full.
+    // starts empty and grows.
+    //
+    // It used to assert `itemCount == 0` here as well, for a reason worth keeping: to stop
+    // the next reader inferring a durable INDEX from a non-zero item count, `itemCount`
+    // having been `_index.size()` too. #1483 made the item count the STORE's, so that job
+    // is now done better by the CONTRAST -- one figure in this one reading is durable and
+    // the other is the working set since the last restart, which is #175's whole
+    // distinction stated in two lines instead of inferred from one.
     TempFile tmp;
     FastCache::CowTreeStorage::Options opts;
     opts.path = tmp.path;
@@ -3480,7 +3485,12 @@ TEST_CASE("A reopened store's index reports what has been TOUCHED, not what is o
     // Nothing has been touched, so nothing is mirrored -- while every one of the
     // objects is still on disk, which the read below proves.
     CHECK((*second)->Snapshot().indexBytes == 0);
-    CHECK((*second)->Snapshot().itemCount == 0);
+
+    // The contrast, in the same reading: the store knows what it HOLDS across a restart.
+    // A cold index beside a cold item count was one fact; a cold index beside a warm item
+    // count is two, and the second one is what says the first is about the mirror rather
+    // than about an empty store.
+    CHECK((*second)->Snapshot().itemCount == Objects);
 
     FastCache::ManualClock clock;
     auto const got = (*second)->Get("key-0000", clock.Now());
@@ -3488,9 +3498,11 @@ TEST_CASE("A reopened store's index reports what has been TOUCHED, not what is o
     REQUIRE(got->found);
 
     // And one read is what puts one entry into the mirror. The index is a function of
-    // the WORKING SET since the last restart, not of the store.
+    // the WORKING SET since the last restart, not of the store -- so it MOVED while the
+    // item count did not, and asserting both is what distinguishes "the index tracks
+    // touches" from "both figures woke up together".
     CHECK((*second)->Snapshot().indexBytes > 0);
-    CHECK((*second)->Snapshot().itemCount == 1);
+    CHECK((*second)->Snapshot().itemCount == Objects);
 }
 
 TEST_CASE("A store reuses the pages a previous session freed", "[cowstorage][freelist][persist]")
@@ -3747,4 +3759,67 @@ TEST_CASE("A reopened store projects what its index WILL cost, not what it costs
     // recomputed constant, so the case cannot drift with `IndexBytesFor`'s internals
     // and cannot pass by agreeing with its own arithmetic.
     CHECK(cold.indexBytesAtCapacity == warmProjection);
+}
+
+TEST_CASE("A reopened store reports the items it HOLDS rather than the ones this session touched",
+          "[cowstorage][stats][items]")
+{
+    // #1483. `itemCount` was read from the session mirror while `bytesUsed` -- two lines
+    // below it in the same function -- was read from the store, so a node restarted onto
+    // a full cache reported zero items and read as a cache nothing was using. Found by
+    // dogfooding: `live-stats cache` said `items 0` beside `bytes_used 50873463991`.
+    //
+    // #1006 fixed the byte half of that function and left this one, which is why the fix
+    // sits directly above a comment describing the same defect for the other field.
+    TempFile tmp;
+    FastCache::CowTreeStorage::Options opts;
+    opts.path = tmp.path;
+
+    constexpr int Objects = 37;
+    FastCache::ManualClock clock;
+
+    {
+        auto first = FastCache::CowTreeStorage::Open(opts);
+        REQUIRE(first.has_value());
+        for (auto const i: std::views::iota(0, Objects))
+            REQUIRE(
+                (*first)->Set(std::format("key-{:04}", i), MakeBytes("value"), 0, FastCache::TimePoint::max()).has_value());
+
+        // Warm, this figure was ALREADY right, and it has to stay right: the mirror and
+        // the store agree here, so a fix that moved the warm reading moved the wrong
+        // thing. The control, not the subject.
+        CHECK((*first)->Snapshot().itemCount == Objects);
+    }
+
+    auto second = FastCache::CowTreeStorage::Open(opts);
+    REQUIRE(second.has_value());
+
+    // **The assertion**, and it is taken BEFORE anything is read back. The mirror fills
+    // itself from reads, so a case that fetched a key first would pass under the defect.
+    //
+    // `== Objects` rather than `> 0`, and that is the whole difference between this case
+    // and one that cannot fail: the tree keeps the store's format marker as a record too,
+    // so an unadjusted `ItemCount()` answers `Objects + 1`. That overstating fix satisfies
+    // every "the reading looks populated after a reopen" assertion.
+    auto const cold = (*second)->Snapshot();
+    CHECK(cold.itemCount == Objects);
+
+    // `bytesUsed` is the half #1006 already closed, so it is correct under the defect as
+    // well: a case asserting the pair agree, or merely that the row looks populated,
+    // passes with the item count still broken.
+    CHECK(cold.bytesUsed > 0);
+
+    // `indexBytes` deliberately still reports the PRESENT -- what the mirror costs now --
+    // with `indexBytesAtCapacity` as the durable projection beside it (#175). A fix that
+    // made every figure durable would destroy the reservation argument that field exists
+    // for, and these two are what say it did not.
+    CHECK(cold.indexBytes == 0);
+    CHECK(cold.indexBytesAtCapacity > 0);
+
+    // One read, and the mirror now costs something while the count does not move: the
+    // figure is the store's, not a mirror that happens to have been filled.
+    REQUIRE((*second)->Get("key-0000", clock.Now()).has_value());
+    auto const touched = (*second)->Snapshot();
+    CHECK(touched.itemCount == Objects);
+    CHECK(touched.indexBytes > 0);
 }

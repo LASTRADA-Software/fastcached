@@ -907,9 +907,12 @@ converting a store. Before `Cache/CowTreeStorage`, `CowTree/`.
 - The LRU mirror holds what this SESSION touched — `TouchOrInsert` is its only writer and no
   `Open` path calls it — so eviction reaches the COLD set first, and that is LRU rather than a
   workaround. A test asserting only the total sees neither the wrong victim nor the bound still
-  violated. Fourth of a family where state describing the STORE was populated only by touch;
-  this one could not be closed by finding a durable SOURCE for a number, because eviction needs
-  a VICTIM rather than a figure.
+  violated. Fourth of a family where state describing the STORE was populated only by touch,
+  and the one whose VICTIM cannot come from a durable source — **which was never true of the
+  FIGURES beside it, and `itemCount` read the mirror until #1483.** A figure describing the
+  store reads the store; only the victim reads the mirror. The tree's own count is an UPPER
+  bound carrying the store's sentinels, so taking it verbatim over-counts, and `indexBytes`
+  deliberately still reports the present.
 
 **[`.agent/rules/metrics-and-observability.md`](.agent/rules/metrics-and-observability.md)**
 — counters and scrape surfaces. Before `Metrics/`, `/metrics`, `/healthz`.
