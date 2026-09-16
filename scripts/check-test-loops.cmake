@@ -71,6 +71,24 @@
 #
 # ## Exemptions
 #
+# An exemption's `text` is matched as a SUBSTRING of the loop header **as this check extracts
+# it**, and that header STOPS AT THE SECOND `;` -- `loopPattern` is anchored to end there. So for
+#
+#     for (; it != end; it.increment(ec))
+#
+# the string being searched is `for (; it != end;` and the INCREMENT CLAUSE IS NOT IN IT. Naming
+# `it.increment(ec)` -- by far the most identifying fragment, and the obvious thing to write --
+# makes the row match nothing, and the row is then refused as stale with a message saying the
+# site was converted or deleted. It was not; it is exactly where it was. Name something from the
+# init or the condition instead.
+#
+# A text may also not contain `;`, for a different reason and with a different symptom: a
+# semicolon is what CMake splits a list on, so it breaks the row into pieces when this table is
+# DEFINED, and the arity check below reports a field count rather than a character.
+#
+# Both constraints have the same cause -- the header's two semicolons -- and a `loop` exemption is
+# the one kind of row where that is the natural thing to write.
+#
 # A row states its REASON, so an allowed site cannot be spelled the way a forgotten one
 # is, and a row that has stopped matching anything is refused as STALE: an exemption
 # nobody has to keep true outlives its argument and waves the next site through.
@@ -135,7 +153,9 @@ set(FastCachedTestLoopScope
 # CMake list. Checked below rather than left as a comment nothing reads.
 set(FastCachedTestLoopExemptions
     "loop|src/tests/TsanCanary.cpp|for (|The ThreadSanitizer canary's loops are its race: a change to this file is judged by a RATE over a few hundred runs (scripts/tsan-canary-rate.sh), never by a green run, and rewriting three loops would re-open that measurement for a spelling."
-    "spin|src/FastCache/Protocol/LiveStreamReactors_test.cpp|stopping->load(|Not a wait: a heartbeat coroutine that beats until the case says stop, and whose frame the rig's reactors free when a case ends early."
+    "spin|src/FastCache/Protocol/LiveStreamReactors_test.cpp|stopping->load(|Not a wait: a heartbeat coroutine that beats until the case says stop, and whose frame the rig's reactors free when a case ends early."    "loop|src/apps/fastcache-cc/ToolchainProbe.cpp|it != end|A recursive_directory_iterator advanced by the error-code overload. A range-based for calls ++it, which THROWS on an unreadable directory instead of setting ec -- and surviving that to report a PARTIAL walk is this loop's whole purpose, so converting it would be a behaviour regression rather than a modernisation."
+    "loop|src/apps/fastcache-cc/ProcessRunner.cpp|char const* cursor = inherited|GetEnvironmentStringsA returns a double-NUL-terminated block of NUL-separated strings with no size anywhere: the terminator IS the bound, so no range can be formed without first walking the block to find its end."
+    "loop|src/apps/fastcache-cc/ProcessRunner.cpp|char** entry = inherited|The POSIX environment array is a NULL-terminated char** with no size. Same reason as the Windows block above, and C++23 has no standard adaptor over a sentinel-terminated C array."
 )
 
 # One element of a loop header's clause: an ordinary character, a brace group (a lambda body,
@@ -175,7 +195,14 @@ foreach(row IN LISTS FastCachedTestLoopExemptions)
     if(NOT fieldCount EQUAL 4)
         message(FATAL_ERROR
             "test-loops: exemption row has ${fieldCount} field(s), expected 4 "
-            "(rule|file|text|reason), so it states no reason or cannot be read:\n  ${row}")
+            "(rule|file|text|reason), so it states no reason or cannot be read:\n  ${row}\n"
+            "  If the row above looks CUT OFF, it contained a `;`. That is the character "
+            "CMake splits a list on, so the row was broken into pieces when this table was "
+            "DEFINED -- before any check here could see it whole, which is why this "
+            "complains about a count rather than about the character. It is the likeliest "
+            "mistake in a `loop` row: the text names a loop HEADER, and a header's defining "
+            "feature is two semicolons. The text is matched as a SUBSTRING, so name a "
+            "fragment instead -- `it.increment(ec)`, never the whole header.")
     endif()
     list(GET fields 0 exemptRule)
     list(GET fields 1 exemptFile)
@@ -652,7 +679,7 @@ if(NOT staleRows STREQUAL "")
     message("")
     message("FastCachedTestLoopExemptions has STALE row(s) matching no site:${staleRows}")
     message("")
-    message("The site was converted, moved or deleted. Remove the row -- a standing exemption")
+    message("The site was converted, moved or deleted -- OR the text names something outside the header as extracted, which ends at the SECOND `;`, so an increment clause cannot be matched. Check that before concluding the site is gone. Remove the row -- a standing exemption")
     message("for a site that is gone would wave the next one of that text through silently.")
     set(refused TRUE)
 endif()

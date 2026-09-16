@@ -5,9 +5,13 @@
 #
 # A row here makes a DIFFERENT claim from a row in `FastCachedTestLoopExemptions`. An exemption
 # says *this site is right and must stay, here is why*. A row here says *nobody has decided about
-# these yet*. Spelling the second like the first would put 148 sites behind a word that means
-# "decided", and the only reason an undecided row is safe at all is that the check tallies these
-# and prints the total per issue on every run.
+# these yet*. Spelling the second like the first would put every site below behind a word that
+# means "decided", and the only reason an undecided row is safe at all is that the check tallies
+# these and prints the total per issue on every run.
+#
+# The count was spelled out here as `148 sites` and went stale the first time a batch landed,
+# which is the defect this file's own line about totals warns against: a figure in prose tracks
+# nothing and reads as authoritative. The check derives it.
 #
 # It is a RATCHET and it turns one way. More sites in a file than its row records is a NEW site
 # and is refused -- the answer is to convert it, never to raise the number. FEWER is a row that
@@ -86,9 +90,6 @@ loop|src/FastCache/Server/ReactorServerLoop.cpp|4|#1452
 loop|src/apps/fastcache-bench/StreamCodecBench.cpp|2|#1452
 loop|src/apps/fastcache-cc/DirectManifest.cpp|4|#1452
 loop|src/apps/fastcache-cc/ParallelFor.cpp|3|#1452
-loop|src/apps/fastcache-cc/ProcessRunner.cpp|4|#1452
-loop|src/apps/fastcache-cc/Stats.cpp|4|#1452
-loop|src/apps/fastcache-cc/ToolchainProbe.cpp|6|#1452
 loop|src/apps/fastcache-cc/main.cpp|2|#1452
 loop|src/apps/fastcache-cli/CliCommand.cpp|1|#1452
 loop|src/apps/fastcache-cli/DashboardPanel.cpp|1|#1452

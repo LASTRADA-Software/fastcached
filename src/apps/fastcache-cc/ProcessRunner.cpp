@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <ranges>
 #include <span>
 #include <string>
 #include <string_view>
@@ -759,7 +760,9 @@ namespace
                 std::array<::pollfd, 2> fds {};
                 std::array<std::size_t, 2> slot {};
                 ::nfds_t count = 0;
-                for (std::size_t i = 0; i < streams.size(); ++i)
+                // The index is written into `slot`, so it is the subject rather than a way
+                // of reaching `streams`.
+                for (auto const i: std::views::iota(std::size_t { 0 }, streams.size()))
                 {
                     if (!streams[i].open)
                         continue;
@@ -777,7 +780,10 @@ namespace
                     break; // Unrecoverable; treat what we have as the capture.
                 }
 
-                for (::nfds_t i = 0; i < count; ++i)
+                // `::nfds_t`, matching `count` and the `fds`/`slot` indices, rather than
+                // `std::size_t`: `poll` counts in its own type and a narrowing conversion here
+                // would be a warning on one platform and silent on another.
+                for (auto const i: std::views::iota(::nfds_t { 0 }, count))
                 {
                     if (fds[i].revents == 0)
                         continue;
