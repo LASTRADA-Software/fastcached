@@ -116,14 +116,15 @@ class NodeStatusResponder final: public IFrameResponder
     }
 
     /// @copydoc IFrameResponder::Answer
-    [[nodiscard]] Task<FrameReply> Answer(std::span<std::byte const> frame, std::string peer) override;
+    [[nodiscard]] Task<FrameReply> Answer(std::span<std::byte const> frame, PeerIdentity peer) override;
 
     /// @copydoc IFrameResponder::RefusePeer
     ///
     /// The one implementation of the rule, called by `Answer` as well as by the door, so
     /// the early refusal and the authoritative one cannot disagree and the counter moves
     /// exactly once per refused request whichever path reached it.
-    [[nodiscard]] std::optional<std::vector<std::byte>> RefusePeer(std::string_view peer, std::uint8_t opRaw) const override;
+    [[nodiscard]] std::optional<std::vector<std::byte>> RefusePeer(PeerIdentity const& peer,
+                                                                   std::uint8_t opRaw) const override;
 
     /// @copydoc IFrameResponder::AuthRequired
     ///
@@ -273,6 +274,15 @@ class NodeStatusResponder final: public IFrameResponder
     /// **Not a stream**: `NodeStatus` and `NodeMetrics` are the one-shot answers; the same figures as a series
     /// are `Op::Subscribe`, served by the live-stats component.
     [[nodiscard]] IFrameStream* StreamFor(std::uint8_t /*opRaw*/) noexcept override
+    {
+        return nullptr;
+    }
+
+    /// @copydoc IFrameResponder::NodeProver
+    ///
+    /// **None.** These verbs report what this node IS; nothing here verifies a secret. The proof
+    /// reaches this surface's membership gate through `RefusePeer`.
+    [[nodiscard]] INodeProver* NodeProver() noexcept override
     {
         return nullptr;
     }

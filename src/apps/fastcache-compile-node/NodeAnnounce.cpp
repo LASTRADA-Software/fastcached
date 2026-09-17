@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "NodeAnnounce.hpp"
+#include "NodeProofClient.hpp"
 #include "SchedulerLink.hpp"
 #include "WorkerLease.hpp"
 
@@ -115,6 +116,30 @@ AnnounceOutcome AnnounceOnce(HeartbeatRound const& round, ISocket& client, std::
     // scheduler, so they either all get redirected or none does, and following the
     // first is what lets the whole round move together.
     std::optional<std::string> leader;
+
+    // **The proof first, before anything else on this connection.** What it establishes is
+    // connection state, so one exchange covers every withdrawal, registration and heartbeat
+    // below it -- and it has to come first for the reason it exists: the scheduler's membership
+    // answer is what gates `Register`, and a proof sent after one had been refused would arrive
+    // too late to change the answer this round already got (#1428).
+    //
+    // **Every outcome but a refusal is silent, and a refusal does not stop the round.** A peer
+    // too old to know the verbs and a peer holding no cluster key are what a mixed fleet looks
+    // like mid-upgrade; a node that stopped registering over either would take itself out of a
+    // fleet that is admitting it by address perfectly well. So the round carries on in all four
+    // cases, and the one worth a person's attention says so -- a wrong `--cluster-key-file` on
+    // this machine is invisible from here in every other way, because the registration that
+    // follows then succeeds or fails for a reason that names the address instead.
+    if (round.proofKey != nullptr)
+    {
+        auto const attempt = ProveNodeOver(client, round.notice, *round.proofKey, round.nodeId, round.credential.Current());
+        if (attempt.result == NodeProofResult::Refused)
+            round.logger.Logf(LogLevel::Warn,
+                              "scheduler {} did not accept this node's cluster-key proof: {}. Registration continues "
+                              "by address; check --cluster-key-file on this machine if it is refused",
+                              endpoint,
+                              attempt.reason);
+    }
 
     // **Withdrawals first, and the ordering mirrors the adding direction's.** Adding
     // runs the compile port before the registration -- `ReplaceToolchains` then

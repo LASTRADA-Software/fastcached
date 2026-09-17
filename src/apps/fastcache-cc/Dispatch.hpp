@@ -501,6 +501,13 @@ inline constexpr std::array DeclineCauseTable {
     DeclineCauseRow { .code = CompileCacheWire::ErrorCode::EnrollmentAlreadyCollected, .cause = DeclineCause::NotPermitted },
     // A fleet read, which no compile reaches: the same reasoning as the enrollment rows above.
     DeclineCauseRow { .code = CompileCacheWire::ErrorCode::UnknownFleetSelector, .cause = DeclineCause::NotPermitted },
+    // The node proof (#1428). `NotPermitted` for the enrollment rows' reason and one more that
+    // is specific to these: the LAUNCHER holds no cluster key and never sends either verb, so a
+    // compile cannot reach them at all -- and if one somehow did, *not permitted* is the answer
+    // that makes the launcher compile locally and stop asking, which is right for a refusal no
+    // retry can clear.
+    DeclineCauseRow { .code = CompileCacheWire::ErrorCode::NodeProofUnchallenged, .cause = DeclineCause::NotPermitted },
+    DeclineCauseRow { .code = CompileCacheWire::ErrorCode::NodeProofRejected, .cause = DeclineCause::NotPermitted },
 };
 
 /// Whether every refusal this build's wire header knows carries a classification.

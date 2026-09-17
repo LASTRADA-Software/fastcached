@@ -3,6 +3,7 @@
 #include "FrameEndpoint.hpp"
 #include "LiveStatsResponder.hpp"
 #include "NodeIoLoop.hpp"
+#include "NodeProofResponder.hpp"
 #include "Responders.hpp"
 
 #include <FastCache/Auth/AuthPolicy.hpp>
@@ -11,6 +12,7 @@
 #include <FastCache/Core/HostPort.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Core/WireFrame.hpp>
+#include <FastCache/Distributed/NodeProof.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Net/BlockingConnector.hpp>
 #include <FastCache/Net/BlockingSocket.hpp>
@@ -42,6 +44,7 @@
 
 #include <tests/AbortiveClient.hpp>
 #include <tests/BoundedWait.hpp>
+#include <tests/NodeProofFakes.hpp>
 #include <tests/Unwrap.hpp>
 #include <tests/WireReply.hpp>
 
@@ -591,9 +594,11 @@ TEST_CASE("A stranger is refused the fleet", "[node][scheduler]")
 
     auto const frame = Wire::EncodeLease(Wire::LeaseRequest { .fingerprint = "gcc-14", .key = "k", .acceptedCodecs = {} });
 
-    CHECK(ErrorOf(SyncRun(fleet.responder.Answer(frame, "10.9.9.9")).bytes) == Wire::ErrorCode::NotAMember);
+    CHECK(ErrorOf(SyncRun(fleet.responder.Answer(frame, PeerIdentity { .host = "10.9.9.9" })).bytes)
+          == Wire::ErrorCode::NotAMember);
     // And a listed peer gets past the gate to the fleet's own answer.
-    CHECK(ErrorOf(SyncRun(fleet.responder.Answer(frame, "10.0.0.1")).bytes) == Wire::ErrorCode::NoWorker);
+    CHECK(ErrorOf(SyncRun(fleet.responder.Answer(frame, PeerIdentity { .host = "10.0.0.1" })).bytes)
+          == Wire::ErrorCode::NoWorker);
 }
 
 TEST_CASE("An oversize frame is refused with both numbers, and never buffered", "[node][scheduler]")
@@ -644,7 +649,7 @@ namespace
 class HoldableResponder final: public IFrameResponder
 {
   public:
-    [[nodiscard]] Task<FrameReply> Answer(std::span<std::byte const> /*frame*/, std::string /*peer*/) override
+    [[nodiscard]] Task<FrameReply> Answer(std::span<std::byte const> /*frame*/, PeerIdentity /*peer*/) override
     {
         // Read BEFORE anything else in this body, and before the first `co_await`:
         // this is the handoff instant, and a suspension here would let the very
@@ -689,7 +694,7 @@ class HoldableResponder final: public IFrameResponder
     /// refusal fired and that it fired exactly ONCE -- an uncounted refusal and a
     /// double-counted one are both worse than none, because the count is what an
     /// operator reads to know the gate works.
-    [[nodiscard]] std::optional<std::vector<std::byte>> RefusePeer(std::string_view /*peer*/,
+    [[nodiscard]] std::optional<std::vector<std::byte>> RefusePeer(PeerIdentity const& /*peer*/,
                                                                    std::uint8_t opRaw) const override
     {
         _peerChecks.fetch_add(1, std::memory_order_acq_rel);
@@ -869,6 +874,14 @@ class HoldableResponder final: public IFrameResponder
 
     /// @copydoc IFrameResponder::StreamFor
     [[nodiscard]] IFrameStream* StreamFor(std::uint8_t /*opRaw*/) noexcept override
+    {
+        return nullptr;
+    }
+    /// @copydoc IFrameResponder::NodeProver
+    ///
+    /// **None.** This fake stands in for a surface, not for the cluster-key prover; a case that
+    /// needs one builds a `NodeProofResponder`.
+    [[nodiscard]] INodeProver* NodeProver() noexcept override
     {
         return nullptr;
     }
@@ -3304,6 +3317,47 @@ namespace
     return code;
 }
 
+/// @p code with every blank removed.
+///
+/// **Because a sanctioned write is one clang-format decision away from being invisible.**
+/// The needles below read `WriteAll(EndpointWriter::` as ONE token, and the formatter breaks
+/// that call across lines as soon as its argument list grows -- which it did, at the
+/// node-proof interception (#1428). The scan then counted a correctly sanctioned write as a
+/// bare one and refused, reporting *a write that declares no writer* for a write declaring
+/// `Loop` on the following line.
+///
+/// That direction is the safe one and it is still worth removing, for two reasons that are
+/// not the same: a guard whose message misattributes the cause sends the next reader hunting
+/// for an unsanctioned write that does not exist, and the remedy which suggests itself --
+/// reshape the call until the pattern matches -- leaves the property resting on a formatting
+/// accident. The counting identity is the assertion that cannot survive a wrap, since a
+/// wrapped call increments the bare count and not the declared one.
+///
+/// Whitespace-FREE rather than whitespace-collapsed, so each needle stays a single literal
+/// with no space to get right; it can only ever match MORE, which is the direction a guard
+/// may err in. It does not close the residual the case states: which FUNCTION a call sits in
+/// is still unchecked.
+/// @param code The code to strip.
+/// @return The same code with no blanks at all.
+[[nodiscard]] std::string WithoutWhitespace(std::string_view code)
+{
+    // The four blanks BY CODE POINT rather than by escape: space, tab, line feed, carriage
+    // return. Numeric because a backslash escape inside a scanner that is itself scanned is
+    // one indirection too many, and CR is here so a CRLF checkout packs identically to an
+    // LF one.
+    static constexpr char space = 32;
+    static constexpr char tab = 9;
+    static constexpr char lineFeed = 10;
+    static constexpr char carriageReturn = 13;
+
+    std::string packed;
+    packed.reserve(code.size());
+    for (auto const character: code)
+        if (character != space && character != tab && character != lineFeed && character != carriageReturn)
+            packed.push_back(character);
+    return packed;
+}
+
 /// Every occurrence of @p needle in @p text.
 [[nodiscard]] std::size_t CountOf(std::string_view text, std::string_view needle)
 {
@@ -3333,7 +3387,10 @@ TEST_CASE("Every write on a framed endpoint names a sanctioned writer", "[node][
     // still name `Loop`. That is the residual, and it is stated in `EndpointWriters.hpp`
     // rather than papered over: this checks that there is ONE write primitive, that
     // every use of it declares a writer, and that no row is dead.
-    auto const code = EndpointCodeWithoutComments();
+    //
+    // Read whitespace-free, or the FORMATTER decides what this guard can see; the reason is
+    // on `WithoutWhitespace`.
+    auto const code = WithoutWhitespace(EndpointCodeWithoutComments());
     REQUIRE_FALSE(code.empty());
 
     // Positive control on the scan itself, before anything is concluded from what it did
@@ -3368,7 +3425,7 @@ TEST_CASE("Every sanctioned writer names a function that exists and says why it 
     // is to hand the bytes back to the loop instead. A placeholder would spell "forgot"
     // in the vocabulary of "decided", so the length floor is deliberate -- a one-word
     // reason is not one.
-    auto const code = EndpointCodeWithoutComments();
+    auto const code = WithoutWhitespace(EndpointCodeWithoutComments());
     REQUIRE_FALSE(code.empty());
 
     for (auto const& row: EndpointWriterTable)
@@ -3570,4 +3627,177 @@ TEST_CASE("A subscriber that stops reading is cut off past its hold and counted 
     CHECK(fleet.metrics.Read(IMetricsSink::Counter::LiveSubscriptionsEndedByClient) == 0);
     CHECK(fleet.metrics.Read(IMetricsSink::Counter::FrameAnswerDeadlineSweeps) == 0);
     CHECK(fleet.metrics.Read(IMetricsSink::Counter::FrameRequestDeadlineSweeps) == 0);
+}
+
+// ---- The node proof, on the connection it establishes (#1428) ---------------------------
+
+namespace
+{
+
+/// This cluster's key, for the proof cases below.
+constexpr std::string_view ProofKeyBytes = "the-cluster-key-0123456789abcdef";
+
+/// The label the proving side gives itself.
+constexpr std::string_view ProofNodeId = "node-7";
+
+/// A node that can be proved to: a scheduler, and the cluster-key prover beside it.
+///
+/// Its own fixture rather than a field on `Fleet`, because what these cases drive is the
+/// ENDPOINT's half of the exchange -- the challenge it holds per connection and spends per
+/// proof -- and that is only reachable through a listener with a routing responder on it.
+struct ProvingFleet
+{
+    Fleet fleet;
+    Testing::ScriptedClusterKey key { ProofKeyBytes };
+    Testing::FixedRandomSource random;
+    NodeProofResponder prover { key, random, fleet.metrics, fleet.logger };
+    MergedResponder merged { SurfaceComponents { .scheduler = &fleet.responder, .nodeProof = &prover } };
+};
+
+/// The challenge a reply carries, or empty when the reply is not one.
+/// @param reply The whole reply frame.
+/// @return The nonce.
+[[nodiscard]] std::vector<std::byte> ChallengeIn(std::span<std::byte const> reply)
+{
+    auto const payload = Testing::PayloadOf(reply);
+    auto const challenge = Wire::DecodeNodeChallengeReply(payload);
+    if (!challenge.has_value())
+        return {};
+    return std::vector<std::byte> { challenge->begin(), challenge->end() };
+}
+
+/// A framed `ProveNode` for @p challenge under this cluster's key.
+/// @param challenge The nonce the server stated.
+/// @return The framed request.
+[[nodiscard]] std::vector<std::byte> ProveFrame(std::span<std::byte const> challenge)
+{
+    auto const key = Testing::ProofBytesOf(ProofKeyBytes);
+    return Wire::EncodeProveNode(ProofNodeId, Distributed::MintNodeProof(key, challenge, ProofNodeId));
+}
+
+/// A lease request, which the scheduler gates on membership.
+/// @return The framed request.
+[[nodiscard]] std::vector<std::byte> LeaseRequestFrame()
+{
+    return Wire::EncodeLease(Wire::LeaseRequest { .fingerprint = "gcc-14", .key = "k", .acceptedCodecs = {} });
+}
+
+} // namespace
+
+TEST_CASE("A challenge and the proof it answers are exchanged on one connection", "[node][frame][proof]")
+{
+    // The ENDPOINT's half, end to end over a real socket: the challenge is drawn per connection
+    // and stated as exactly 32 bytes, and the tag minted over it is accepted. Nothing else
+    // reaches `AnswerNodeProof` -- these two verbs never arrive at `Answer`.
+    ProvingFleet rig;
+    auto const port = FreePort();
+    auto endpoint = FrameEndpoint::Start(rig.fleet.io,
+                                         NodeSurface::Node,
+                                         LoopbackFor(NodeSurface::Node, port),
+                                         rig.merged,
+                                         rig.fleet.metrics,
+                                         rig.fleet.logger);
+    REQUIRE(endpoint.has_value());
+    rig.fleet.Serve();
+
+    Conversation client { port };
+    auto const challenge = ChallengeIn(client.Send(Wire::EncodeNodeChallenge()));
+    REQUIRE(challenge.size() == Wire::NodeChallengeBytes);
+
+    CHECK(Testing::StatusOf(client.Send(ProveFrame(challenge))) == Wire::Status::Ok);
+    CHECK(rig.fleet.metrics.Read(IMetricsSink::Counter::NodeProofsAccepted) == 1);
+
+    // And the connection goes on serving, which is what makes the proof worth having: one
+    // exchange covers every verb sent after it. `NoWorker` is the fleet's own answer.
+    CHECK(ErrorOf(client.Send(LeaseRequestFrame())) == Wire::ErrorCode::NoWorker);
+}
+
+TEST_CASE("A challenge answers exactly one proof, whatever that proof's outcome", "[node][frame][proof]")
+{
+    // **Spent, and spent before anything is verified.** A nonce that can answer twice is a nonce
+    // a recorded exchange can be replayed over, so the second proof over one challenge is
+    // refused for having none rather than for being wrong -- which is what says the challenge
+    // was cleared rather than merely re-checked.
+    ProvingFleet rig;
+    auto const port = FreePort();
+    auto endpoint = FrameEndpoint::Start(rig.fleet.io,
+                                         NodeSurface::Node,
+                                         LoopbackFor(NodeSurface::Node, port),
+                                         rig.merged,
+                                         rig.fleet.metrics,
+                                         rig.fleet.logger);
+    REQUIRE(endpoint.has_value());
+    rig.fleet.Serve();
+
+    Conversation client { port };
+    auto const challenge = ChallengeIn(client.Send(Wire::EncodeNodeChallenge()));
+    REQUIRE(challenge.size() == Wire::NodeChallengeBytes);
+
+    auto const proof = ProveFrame(challenge);
+    CHECK(Testing::StatusOf(client.Send(proof)) == Wire::Status::Ok);
+
+    // The identical frame again: refused `NodeProofUnchallenged`, NOT `NodeProofRejected`. The
+    // distinction is the whole assertion -- a server that had kept the nonce would answer `Ok`,
+    // and one that re-verified against a stale copy would answer `Rejected`.
+    CHECK(ErrorOf(client.Send(proof)) == Wire::ErrorCode::NodeProofUnchallenged);
+    CHECK(rig.fleet.metrics.Read(IMetricsSink::Counter::NodeProofsUnchallenged) == 1);
+    CHECK(rig.fleet.metrics.Read(IMetricsSink::Counter::NodeProofsRejected) == 0);
+    CHECK(rig.fleet.metrics.Read(IMetricsSink::Counter::NodeProofsAccepted) == 1);
+}
+
+TEST_CASE("A proof nobody challenged is refused before a key is read", "[node][frame][proof]")
+{
+    // The endpoint's own refusal, and it is the endpoint's because the challenge is connection
+    // state. Asserted with the counter AND with the two that must not move: a server that
+    // verified anyway would answer `Rejected`, and one that read an absent challenge as an
+    // empty one would answer `Ok` to a tag minted over 32 zero bytes, which is what this sends.
+    ProvingFleet rig;
+    auto const port = FreePort();
+    auto endpoint = FrameEndpoint::Start(rig.fleet.io,
+                                         NodeSurface::Node,
+                                         LoopbackFor(NodeSurface::Node, port),
+                                         rig.merged,
+                                         rig.fleet.metrics,
+                                         rig.fleet.logger);
+    REQUIRE(endpoint.has_value());
+    rig.fleet.Serve();
+
+    Conversation client { port };
+    std::vector<std::byte> const zeroes(Wire::NodeChallengeBytes, std::byte { 0 });
+    CHECK(ErrorOf(client.Send(ProveFrame(zeroes))) == Wire::ErrorCode::NodeProofUnchallenged);
+    CHECK(rig.fleet.metrics.Read(IMetricsSink::Counter::NodeProofsUnchallenged) == 1);
+    CHECK(rig.fleet.metrics.Read(IMetricsSink::Counter::NodeProofsRejected) == 0);
+    CHECK(rig.fleet.metrics.Read(IMetricsSink::Counter::NodeProofsAccepted) == 0);
+}
+
+TEST_CASE("Asking for a second challenge abandons the first", "[node][frame][proof]")
+{
+    // One live nonce per connection, because a server holding two would accept a proof over
+    // either -- a replay window opened by nothing but politeness. The FIRST challenge is used
+    // after a second has been asked for, and it is refused for having been abandoned.
+    //
+    // `FixedRandomSource` draws the same bytes every time, so the two challenges are EQUAL and
+    // this case cannot tell them apart by their contents. That is the point: what it asserts is
+    // that the outstanding one was CLEARED by the second ask, which no byte comparison could see
+    // even with a real random source.
+    ProvingFleet rig;
+    auto const port = FreePort();
+    auto endpoint = FrameEndpoint::Start(rig.fleet.io,
+                                         NodeSurface::Node,
+                                         LoopbackFor(NodeSurface::Node, port),
+                                         rig.merged,
+                                         rig.fleet.metrics,
+                                         rig.fleet.logger);
+    REQUIRE(endpoint.has_value());
+    rig.fleet.Serve();
+
+    Conversation client { port };
+    auto const first = ChallengeIn(client.Send(Wire::EncodeNodeChallenge()));
+    REQUIRE(first.size() == Wire::NodeChallengeBytes);
+    auto const second = ChallengeIn(client.Send(Wire::EncodeNodeChallenge()));
+    REQUIRE(second.size() == Wire::NodeChallengeBytes);
+
+    // The second is the one outstanding, so the proof is accepted once and only once.
+    CHECK(Testing::StatusOf(client.Send(ProveFrame(second))) == Wire::Status::Ok);
+    CHECK(ErrorOf(client.Send(ProveFrame(first))) == Wire::ErrorCode::NodeProofUnchallenged);
 }

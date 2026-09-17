@@ -271,7 +271,7 @@ enum class ReplyHold : std::uint8_t
         // `request` is a local of THIS frame, which stays alive across the suspension
         // inside `Answer` -- the contract `IFrameResponder::Answer` states for the span
         // it borrows, and the same way the endpoint's own connection task holds it.
-        auto reply = co_await target->Answer(request, std::move(caller));
+        auto reply = co_await target->Answer(request, PeerIdentity { .host = std::move(caller) });
 
         // What the reply held is released BEFORE the answer is handed over, as the
         // endpoint releases it once the reply is written: released after, a case reading
@@ -390,7 +390,8 @@ TEST_CASE("The merged surface applies the worker's own membership rule", "[node]
 
     // Refused at the DOOR as well as in `Answer`, on the peer alone, so the endpoint
     // can ask it before it reads a payload byte (#285, #377).
-    auto const early = responder.RefusePeer("10.9.9.9", static_cast<std::uint8_t>(Wire::Op::Compile));
+    auto const early = responder.RefusePeer(PeerIdentity { .host = std::string { "10.9.9.9" } },
+                                            static_cast<std::uint8_t>(Wire::Op::Compile));
     CHECK(early.has_value());
 
     // And a member is served.
@@ -624,11 +625,12 @@ class ShortWindowResponder final: public IFrameResponder
     {
     }
 
-    [[nodiscard]] Task<FrameReply> Answer(std::span<std::byte const> frame, std::string peer) override
+    [[nodiscard]] Task<FrameReply> Answer(std::span<std::byte const> frame, PeerIdentity peer) override
     {
         co_return co_await _inner.Answer(frame, std::move(peer));
     }
-    [[nodiscard]] std::optional<std::vector<std::byte>> RefusePeer(std::string_view peer, std::uint8_t opRaw) const override
+    [[nodiscard]] std::optional<std::vector<std::byte>> RefusePeer(PeerIdentity const& peer,
+                                                                   std::uint8_t opRaw) const override
     {
         return _inner.RefusePeer(peer, opRaw);
     }
@@ -700,6 +702,14 @@ class ShortWindowResponder final: public IFrameResponder
     [[nodiscard]] IFrameStream* StreamFor(std::uint8_t opRaw) noexcept override
     {
         return _inner.StreamFor(opRaw);
+    }
+
+    /// @copydoc IFrameResponder::NodeProver
+    ///
+    /// Delegated, like every other question here: this decorates one surface and answers for it.
+    [[nodiscard]] INodeProver* NodeProver() noexcept override
+    {
+        return _inner.NodeProver();
     }
 
   private:
@@ -1769,12 +1779,12 @@ TEST_CASE("A cordon is answered for this machine only, whatever the peer's membe
     CHECK_FALSE(capacity.IsCordoned());
     // Refused at the door too, on the peer alone, before a payload byte is read -- and
     // counted there, since the door is where the endpoint asks it.
-    CHECK(responder.RefusePeer(Member, cordon).has_value());
+    CHECK(responder.RefusePeer(PeerIdentity { .host = std::string { Member } }, cordon).has_value());
     CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerCordonsRefusedNotLocal) == 2);
 
     // The same peer is still admitted to compile: the locality gate is the cordon's, not
     // the surface's.
-    CHECK_FALSE(responder.RefusePeer(Member, compile).has_value());
+    CHECK_FALSE(responder.RefusePeer(PeerIdentity { .host = std::string { Member } }, compile).has_value());
     auto const compiled = AnswerFrom(responder, reactor, CompileFrame(), std::string { Member });
     CHECK(StatusOf(compiled.reply) == Wire::Status::Ok);
     CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsRefusedNotAMember) == 0);

@@ -132,6 +132,8 @@ namespace Detail
           .policy = { .counter = std::nullopt, .rationale = CredentialIsTheSchedulersRationale } },
         { .refusal = EndpointRefusal::AnswerDeadline,
           .policy = { .counter = std::nullopt, .rationale = AnswerDeadlineIsTheEndpointsRationale } },
+        { .refusal = EndpointRefusal::NodeProofUnchallenged,
+          .policy = { .counter = std::nullopt, .rationale = NodeProofIsTheProversRationale } },
     } };
 
     // Positional rows alone would not catch an appended enumerator: it leaves a
@@ -272,6 +274,9 @@ namespace Detail
         { .refusal = EndpointRefusal::AnswerDeadline,
           .answer = std::nullopt,
           .rationale = AnswerDeadlineIsTheEndpointsRationale },
+        { .refusal = EndpointRefusal::NodeProofUnchallenged,
+          .answer = std::nullopt,
+          .rationale = NodeProofIsTheProversRationale },
     } };
 
     // Every uncounted row says why, and no counted row carries a reason it does not
@@ -337,25 +342,28 @@ class SchedulerResponder final: public IFrameResponder
     /// layer kept pure so every capacity and expiry rule is a `ManualClock` unit
     /// test -- so this is a one-line adapter, and a responder that costs a frame
     /// allocation and no round trip is a legitimate thing to be.
-    [[nodiscard]] Task<FrameReply> Answer(std::span<std::byte const> frame, std::string peer) override
+    [[nodiscard]] Task<FrameReply> Answer(std::span<std::byte const> frame, PeerIdentity peer) override
     {
         co_return _protocol.Answer(frame, Context(std::move(peer)));
     }
 
     /// @copydoc IFrameResponder::RefusePeer
     ///
-    /// Membership, which is decided from the peer's host alone -- so the transport
-    /// can ask it before it reads a payload, and a stranger cannot make the scheduler
-    /// allocate for a frame that was never going to be served (#285).
+    /// Membership, which is decided from what the CONNECTION is -- its address and what it has
+    /// proved -- so the transport can ask it before it reads a payload, and a stranger cannot
+    /// make the scheduler allocate for a frame that was never going to be served (#285).
+    ///
+    /// It said *from the peer's host alone* until #1428, and that clause was the whole of why
+    /// a worker on a VPN could not be admitted.
     ///
     /// Delegated rather than reimplemented: `SchedulerService::RefuseUnlessMember` is
     /// the same function `Gate()` calls, so the early check and the authoritative one
     /// cannot disagree, and the `NotAMember` counter is incremented inside it exactly
     /// once per refused request.
-    [[nodiscard]] std::optional<std::vector<std::byte>> RefusePeer(std::string_view peer,
+    [[nodiscard]] std::optional<std::vector<std::byte>> RefusePeer(PeerIdentity const& peer,
                                                                    std::uint8_t /*opRaw*/) const override
     {
-        return _protocol.RefusePeer(Context(std::string { peer }));
+        return _protocol.RefusePeer(Context(peer));
     }
 
     /// @copydoc IFrameResponder::AuthRequired
@@ -519,6 +527,16 @@ class SchedulerResponder final: public IFrameResponder
         return nullptr;
     }
 
+    /// @copydoc IFrameResponder::NodeProver
+    ///
+    /// **None.** The cluster key is not this surface's secret, and a proof could not widen this
+    /// gate even if one were verified here: a cache tier serves THIS MACHINE, which is a property
+    /// of the verb rather than of a member list (#287). See `RefusePeer` above.
+    [[nodiscard]] INodeProver* NodeProver() noexcept override
+    {
+        return nullptr;
+    }
+
   private:
     /// Who is asking, as both the gate and the early refusal need it.
     ///
@@ -545,11 +563,17 @@ class SchedulerResponder final: public IFrameResponder
     /// function ARGUMENTS, which are indeterminately sequenced, are the rule that
     /// gets misremembered into it.
     ///
-    /// @param peer The caller's peer host, taken over by the returned context.
-    [[nodiscard]] Distributed::CallerContext Context(std::string peer) const
+    /// **The proof is folded through `Distributed::ExplainConnection`, since #1428.** It has to
+    /// happen HERE rather than at the two call sites, because this is the one place the peer
+    /// becomes a `CallerContext` -- and a fold at one of them would make the door and the
+    /// authoritative gate answer differently about one connection, which is a caller admitted
+    /// and then refused a line later.
+    ///
+    /// @param peer The caller, whose host is taken over by the returned context.
+    [[nodiscard]] Distributed::CallerContext Context(PeerIdentity peer) const
     {
-        auto membership = _membership.Classify(peer);
-        return Distributed::CallerContext { .membership = membership, .peerId = std::move(peer) };
+        auto const decision = Distributed::ExplainConnection(_membership, peer.host, peer.provenNodeId.has_value());
+        return Distributed::CallerContext { .membership = decision.verdict, .peerId = std::move(peer.host) };
     }
 
     Distributed::SchedulerProtocol& _protocol;
@@ -600,7 +624,7 @@ class CacheResponder final: public IFrameResponder
     }
 
     /// @copydoc IFrameResponder::Answer
-    [[nodiscard]] Task<FrameReply> Answer(std::span<std::byte const> frame, std::string peer) override
+    [[nodiscard]] Task<FrameReply> Answer(std::span<std::byte const> frame, PeerIdentity peer) override
     {
         // Refused as a *reply*, never by closing: a client that cannot tell a policy
         // refusal from a dead host retries forever and reports a flaky network, which
@@ -637,10 +661,18 @@ class CacheResponder final: public IFrameResponder
     /// rather than repeating it, so the early refusal and the authoritative one are
     /// the same code and the counter moves exactly once per refused request whichever
     /// path reached it.
-    [[nodiscard]] std::optional<std::vector<std::byte>> RefusePeer(std::string_view peer,
+    ///
+    /// **A cluster-key proof widens nothing here, and that is the fix rather than an
+    /// oversight** (#287, #1428). This tier serves THIS MACHINE, always: locality is a
+    /// property of the verb, and a machine that holds the fleet's key is still not this one.
+    /// The proof establishes membership, and membership is the list this surface deliberately
+    /// does not consult -- a `--fleet-member` may spend this node's CPU, and it may not read
+    /// every object this machine has ever compiled. So the identity's `provenNodeId` is not
+    /// read, and a proven peer is refused exactly as it is today.
+    [[nodiscard]] std::optional<std::vector<std::byte>> RefusePeer(PeerIdentity const& peer,
                                                                    std::uint8_t /*opRaw*/) const override
     {
-        if (_locality.IsThisMachine(peer))
+        if (_locality.IsThisMachine(peer.host))
             return std::nullopt;
         return Cc::Refuse(_metrics,
                           { .code = CompileCacheWire::ErrorCode::NotAMember,
@@ -813,6 +845,20 @@ class CacheResponder final: public IFrameResponder
         return nullptr;
     }
 
+    /// @copydoc IFrameResponder::NodeProver
+    ///
+    /// **None, and that is the whole reason the proof verbs are a family of their own.** The
+    /// credential THIS surface owns is `--scheduler-token-file`, an operator's token; the cluster
+    /// key is a different secret, in a different file, that every member of the fleet holds. A
+    /// scheduler verifying it would also make a pure worker -- an ordinary deployment -- unprovable.
+    ///
+    /// What this surface does with a proof is READ it: `RefusePeer` folds it into the membership
+    /// answer, which is where a proven key holder is admitted.
+    [[nodiscard]] INodeProver* NodeProver() noexcept override
+    {
+        return nullptr;
+    }
+
   private:
     CacheProxy& _proxy;
     ILocalityOracle const& _locality;
@@ -902,6 +948,19 @@ struct SurfaceComponents
     /// saying so -- and where the fleet is served instead -- is this component's answer to give,
     /// not a family missing at the door.
     IFrameResponder* fleet { nullptr };
+
+    /// Verifies the cluster-key proof, or nullptr when this node holds no cluster key (#1428).
+    ///
+    /// Like `enrollment`, null is an ORDINARY state and the condition is a FILE rather than a
+    /// component: a node with no `--cluster-key-file` has nothing to verify a proof against, so
+    /// the family is refused at the door -- `NoCluster` rather than `UnimplementedVerb`, because
+    /// a caller told the latter goes off to upgrade a node that is already current.
+    ///
+    /// **Keyed on the KEY and not on consensus**, which is the distinction the enrollment
+    /// component does not have to draw: #1308 makes consensus imply a key, so every consensus
+    /// node has one, but a pure worker may hold one too -- it is what signs lease grants -- and
+    /// a proof presented to it must be verifiable there as well.
+    IFrameResponder* nodeProof { nullptr };
 };
 
 /// Whether a verb family's owner is there on a built node. In-process only, never
@@ -993,6 +1052,15 @@ inline constexpr EnumTable<CompileCacheWire::VerbFamily, FamilyRoute> FamilyRout
       .owner = &SurfaceComponents::fleet,
       .presence = FamilyPresence::OnEveryBuiltNode,
       .ceilings = SessionCeilings::Folded },
+    // Legitimately null: a node with no `--cluster-key-file` has nothing to verify a proof
+    // against. Its ceilings are NOT read, for `Enrollment`'s reason -- the fold is a MAXIMUM
+    // over connections and a SUM over every-node owners, so folding a small number in would
+    // change nothing today and would put a later raise of it in front of every surface on the
+    // port. `Node`, `Live` and `Fleet` are every-node owners, so the fold is never empty.
+    { .family = CompileCacheWire::VerbFamily::NodeProof,
+      .owner = &SurfaceComponents::nodeProof,
+      .presence = FamilyPresence::WhenItsComponentRuns,
+      .ceilings = SessionCeilings::NotRead },
 } };
 
 static_assert(RowsInEnumeratorOrder(FamilyRoutes, &FamilyRoute::family),
@@ -1093,7 +1161,7 @@ class MergedResponder final: public IFrameResponder
     /// Reachable directly as well as through the endpoint, so it decodes the header
     /// itself rather than taking anybody's word for the verb -- the same reason
     /// `CacheResponder::Answer` re-asks its own gate.
-    [[nodiscard]] Task<FrameReply> Answer(std::span<std::byte const> frame, std::string peer) override
+    [[nodiscard]] Task<FrameReply> Answer(std::span<std::byte const> frame, PeerIdentity peer) override
     {
         auto const header = CompileCacheWire::DecodeRequestHeader(frame);
         if (!header.has_value())
@@ -1112,7 +1180,8 @@ class MergedResponder final: public IFrameResponder
     ///
     /// A verb nobody serves is refused here, at the door, before a payload is read --
     /// which is what keeps an unserved verb from costing this surface a buffer.
-    [[nodiscard]] std::optional<std::vector<std::byte>> RefusePeer(std::string_view peer, std::uint8_t opRaw) const override
+    [[nodiscard]] std::optional<std::vector<std::byte>> RefusePeer(PeerIdentity const& peer,
+                                                                   std::uint8_t opRaw) const override
     {
         auto const* const owner = OwnerOf(opRaw);
         if (owner == nullptr)
@@ -1311,6 +1380,19 @@ class MergedResponder final: public IFrameResponder
         return owner != nullptr ? owner->StreamFor(opRaw) : nullptr;
     }
 
+    /// @copydoc IFrameResponder::NodeProver
+    ///
+    /// Routed by FAMILY rather than by verb, because the seam is not per verb -- and that is
+    /// what makes the endpoint's handling of the two proof verbs agree with the door by
+    /// CONSTRUCTION rather than by two computations kept in step: `RefusePeer` above refuses the
+    /// family when `FamilyOwner` is null, and this answers null under exactly the same
+    /// condition, from the same `FamilyRoutes` row.
+    [[nodiscard]] INodeProver* NodeProver() noexcept override
+    {
+        auto* const owner = FamilyOwner(_components, CompileCacheWire::VerbFamily::NodeProof);
+        return owner != nullptr ? owner->NodeProver() : nullptr;
+    }
+
   private:
     /// A verb family this node may run no component for, refused with its own code rather
     /// than `UnimplementedVerb`. See `UnservedReply` for why each row exists.
@@ -1338,6 +1420,15 @@ class MergedResponder final: public IFrameResponder
           .detail = "this endpoint runs no compile worker: it was started with --slots=0, so nothing here compiles "
                     "and there is nothing to cordon; ask a node that runs one -- --node-status names the components "
                     "a node serves" },
+        { .family = CompileCacheWire::VerbFamily::NodeProof,
+          .refusal = { .code = CompileCacheWire::ErrorCode::NoCluster,
+                       .rationale = "what a node holding no cluster key answers every proof aimed at it, and a node "
+                                    "that dials a whole fleet tries the proof on each peer once per round; counted, "
+                                    "one keyless machine in a fleet would dominate the series that says whether a "
+                                    "key is WRONG somewhere" },
+          .detail = "this node holds no cluster key (--cluster-key-file), so there is nothing here to prove against; "
+                    "admission at this endpoint is decided by your address -- --node-status names the components a "
+                    "node serves" },
     });
 
     // The compile row says `CompileCacheWire::NoCompileWorker`'s fact, which the daemon answers too, so

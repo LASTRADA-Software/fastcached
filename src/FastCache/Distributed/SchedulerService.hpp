@@ -106,6 +106,16 @@ enum class MembershipParticipant : std::uint8_t
     /// A policy that admits everybody (`OpenMembership`): one machine, or a fleet whose
     /// reachability is its boundary.
     OpenPolicy,
+    /// A caller that PROVED the cluster's pre-shared key on this connection
+    /// ([#1428](https://github.com/LASTRADA-Software/fastcached/issues/1428)).
+    ///
+    /// The one route here that is not a property of an ADDRESS, which is why it does not arrive
+    /// as an `IMembershipOracle` participant: that seam is asked `Explain(peerAddress)`, one
+    /// oracle serves every connection on a surface, and a participant answering from state some
+    /// other connection set would admit callers that proved nothing. It is folded per connection
+    /// instead, by `ExplainConnection`, on this same `PrecedenceOf` -- so a client tombstone
+    /// still outranks it and a proof cannot resurrect a forgotten host.
+    ProvenKeyHolder,
     /// The count, for a table over this enum.
     Last,
 };

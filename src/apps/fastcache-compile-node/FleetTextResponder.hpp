@@ -52,13 +52,14 @@ class FleetTextResponder final: public IFrameResponder
                        IMetricsSink& metrics) noexcept;
 
     /// @copydoc IFrameResponder::Answer
-    [[nodiscard]] Task<FrameReply> Answer(std::span<std::byte const> frame, std::string peer) override;
+    [[nodiscard]] Task<FrameReply> Answer(std::span<std::byte const> frame, PeerIdentity peer) override;
 
     /// @copydoc IFrameResponder::RefusePeer
     ///
     /// The one implementation of the membership rule, called by `Answer` as well as by the door,
     /// so the counter moves exactly once per refused request whichever path reached it.
-    [[nodiscard]] std::optional<std::vector<std::byte>> RefusePeer(std::string_view peer, std::uint8_t opRaw) const override;
+    [[nodiscard]] std::optional<std::vector<std::byte>> RefusePeer(PeerIdentity const& peer,
+                                                                   std::uint8_t opRaw) const override;
 
     /// @copydoc IFrameResponder::AuthRequired
     ///
@@ -146,6 +147,16 @@ class FleetTextResponder final: public IFrameResponder
     ///
     /// **Not a stream**: the same document as a series is the fleet subject of `Op::Subscribe`.
     [[nodiscard]] IFrameStream* StreamFor(std::uint8_t /*opRaw*/) noexcept override
+    {
+        return nullptr;
+    }
+
+    /// @copydoc IFrameResponder::NodeProver
+    ///
+    /// **None.** The credential this surface reads is the dashboard token, which is deliberately
+    /// not `--requirepass` and not the cluster key. The proof reaches its membership half through
+    /// `RefusePeer`.
+    [[nodiscard]] INodeProver* NodeProver() noexcept override
     {
         return nullptr;
     }

@@ -775,6 +775,79 @@ namespace
         return Wire::EncodeReply(Wire::Status::Ok, {});
     }
 
+    /// Whether @p opRaw is one of the two verbs the node-proof exchange is made of.
+    /// @param opRaw The third header byte, as received.
+    /// @return True for `NodeChallenge` and `ProveNode`.
+    [[nodiscard]] constexpr bool IsNodeProofVerb(std::uint8_t opRaw) noexcept
+    {
+        return opRaw == static_cast<std::uint8_t>(Wire::Op::NodeChallenge)
+               || opRaw == static_cast<std::uint8_t>(Wire::Op::ProveNode);
+    }
+
+    /// Answer a node-proof frame and record what it established on this connection.
+    ///
+    /// Separated from `ServeConnection` for `AnswerAuth`'s reason, and it is the same shape for
+    /// the same cause: what these two verbs change is CONNECTION state -- the challenge
+    /// outstanding, and the id this connection has proved -- and the responder is shared by every
+    /// connection on the surface, so neither can live there.
+    ///
+    /// Reached only when the surface OFFERS a prover. A surface that offers none never sees this:
+    /// the frame goes on to `Answer`, where `MergedResponder` refuses the whole family with the
+    /// sentence a node holding no cluster key owes -- and that fallthrough is deliberate, because
+    /// an endpoint answering it here would be encoding a refusal whose wording and counter belong
+    /// to a surface (#447).
+    ///
+    /// @param prover The surface's verifier.
+    /// @param responder The surface, for the one refusal the ENDPOINT decides.
+    /// @param payload The request body, already bounded by the verb's own cap.
+    /// @param opRaw The verb as received, so a refusal reaches the surface that owns the counter.
+    /// @param challenge This connection's outstanding nonce; drawn, spent and cleared here.
+    /// @param provenNodeId This connection's proof; ENGAGED only by one that authenticated, and
+    ///        holding the label the caller gave, which may legitimately be empty.
+    /// @return The reply frame to write.
+    [[nodiscard]] std::vector<std::byte> AnswerNodeProof(INodeProver& prover,
+                                                         IFrameResponder const& responder,
+                                                         std::span<std::byte const> payload,
+                                                         std::uint8_t opRaw,
+                                                         std::optional<Nonce>& challenge,
+                                                         std::optional<std::string>& provenNodeId)
+    {
+        if (opRaw == static_cast<std::uint8_t>(Wire::Op::NodeChallenge))
+        {
+            // **Re-drawn on a second ask, and the old one is gone.** A caller that asks again has
+            // abandoned the first, and a server holding two live nonces would accept a proof over
+            // either -- a replay window opened by nothing but politeness. It also keeps *a
+            // challenge is spent whatever the outcome* true with no second rule beside it.
+            challenge = prover.IssueChallenge();
+            return Wire::EncodeReply(Wire::Status::Ok, Wire::EncodeNodeChallengeReply(*challenge));
+        }
+
+        if (!challenge.has_value())
+            // The ENDPOINT's own refusal, because the challenge is the endpoint's own state. The
+            // surface encodes and counts it, as it does every other refusal this loop decides.
+            return responder.EndpointRefusalReply(
+                EndpointRefusal::NodeProofUnchallenged,
+                opRaw,
+                "ask for a challenge first: one challenge answers exactly one proof, whatever that proof's outcome");
+
+        // **Spent before anything is verified, whatever happens next**, which is discovery's rule
+        // and the Raft handshake's in the same words: a nonce that can answer twice is a nonce
+        // that can be replayed. A caller whose proof is refused may ask for another and try
+        // again, which costs it a round trip per attempt and gives it no nonce to grind against.
+        auto const spent = *challenge;
+        challenge.reset();
+
+        auto proved = prover.Verify(spent, payload);
+        if (!proved.has_value())
+            return std::move(proved).error();
+
+        // The one write, and the only thing on this connection that a later verb's membership
+        // answer reads. Disengaged until this line, which is what *nothing was proved* means --
+        // the label inside it may be empty, and `Verify` says why that is legal.
+        provenNodeId = *std::move(proved);
+        return Wire::EncodeReply(Wire::Status::Ok, {});
+    }
+
     /// Encode the refusal a connection owes its peer after a sweep deferred to it.
     ///
     /// Lifted out of `ServeConnection` for the reason `AnswerAuth` above was, and the
@@ -1633,14 +1706,15 @@ namespace
     ///  4. The in-flight byte budget, last, for the reason step 2 gives.
     ///
     /// @param state The server state: the responder, the budget and the surface's name.
-    /// @param peer The peer's HOST, as the kernel reports it; a source port is ephemeral
-    ///        and is not an identity, so this is the only thing an admission policy has.
+    /// @param peer Who is at the other end: the kernel's host, and what this connection has
+    ///        proved. A source port is ephemeral and is not an identity, so the address is all an
+    ///        admission policy had before #1428 -- and a proof is the second thing it now has.
     /// @param decoded The request header, as it decoded.
     /// @param cap The surface-wide request ceiling, read once by the caller.
     /// @param credentialAccepted Whether an AUTH frame on THIS connection was verified.
     /// @return The refusal, or nullopt when the request is to be served.
     [[nodiscard]] std::optional<HeaderRefusal> DecideHeaderRefusal(FrameServer::State* state,
-                                                                   std::string_view peer,
+                                                                   PeerIdentity const& peer,
                                                                    Wire::RequestHeader const& decoded,
                                                                    std::size_t cap,
                                                                    bool credentialAccepted)
@@ -1854,7 +1928,7 @@ namespace
     /// @param stream The surface's stream; outlives the endpoint.
     /// @param frame The whole request; owned here so it outlives the stream.
     /// @param opRaw The verb, as received.
-    /// @param peer The peer's host.
+    /// @param peer Who is at the other end, as `IFrameResponder::Answer` receives it.
     /// @param readerHoldsBytes Whether the connection's reader already holds a pipelined request.
     /// @return Whether this connection may serve another request: only when the peer is still
     ///         there with one of its own, which is `SettleWatch`'s answer after any reply.
@@ -1863,7 +1937,7 @@ namespace
                                  IFrameStream* stream,
                                  std::vector<std::byte> frame,
                                  std::uint8_t opRaw,
-                                 std::string peer,
+                                 PeerIdentity peer,
                                  bool readerHoldsBytes)
     {
         auto* const state = shared.get();
@@ -1874,14 +1948,19 @@ namespace
 
         StreamSink sink { shared, socket, watch };
         auto const startedAt = std::chrono::steady_clock::now();
-        auto const terminal = co_await stream->Serve(frame, peer, &sink);
+        // The host is kept for the exchange record below, which is about where a request came
+        // FROM: a proven id is an admission fact rather than an address, and a log line naming it
+        // would report two different things under one column. The identity itself goes to the
+        // stream, which needs both halves to gate on.
+        auto const peerHost = peer.host;
+        auto const terminal = co_await stream->Serve(frame, std::move(peer), &sink);
 
         // Once per subscription, at its end, at the level `ExchangeLogTable` gives the verb: a
         // subscription is an operator action, and nothing is logged per push.
         Node::LogExchange(
             state->logger,
             opRaw,
-            peer,
+            peerHost,
             frame,
             terminal,
             std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - startedAt),
@@ -1969,8 +2048,24 @@ namespace
         {
             // The peer's HOST. A connection's source port is ephemeral and is not the
             // peer's endpoint, so for a surface whose policy needs an identity -- the
-            // scheduler's -- there is nothing else here that could supply one.
+            // scheduler's -- this is all the kernel can supply.
             auto const peer = socket->PeerAddress();
+
+            // Who this connection IS, as an admission policy sees it: the address above, plus
+            // whatever it goes on to PROVE. Per CONNECTION, exactly as `credentialAccepted`
+            // below is and for the same reason -- the responder is shared by every connection on
+            // this surface, so an id proved here must not admit anybody else (#1428).
+            //
+            // `provenNodeId` starts DISENGAGED, which is what *nothing was proved* means
+            // everywhere that reads it, and is only ever engaged by a `ProveNode` frame this loop
+            // verified. The label inside it may be empty; see `NodeProofResponder::Verify`.
+            PeerIdentity identity { .host = peer, .provenNodeId = std::nullopt };
+
+            // The challenge outstanding on this connection, or none. Drawn by the surface's
+            // prover on request and SPENT by the next proof whatever its outcome, which is why
+            // it is an optional rather than a nonce plus a flag: two members that can disagree
+            // is a state nothing could describe.
+            std::optional<Nonce> challenge;
 
             auto const cap = state->responder.MaxRequestBytes();
 
@@ -2022,7 +2117,7 @@ namespace
                 // closes it, i.e. never usefully. Writing first costs nothing and the
                 // resynchronization is just as good: a peer that sends what it declared
                 // is still stepped over exactly.
-                if (auto const refusal = DecideHeaderRefusal(state, peer, *decoded, cap, credentialAccepted);
+                if (auto const refusal = DecideHeaderRefusal(state, identity, *decoded, cap, credentialAccepted);
                     refusal.has_value())
                 {
                     if (!co_await WriteAll(EndpointWriter::Loop, socket.get(), refusal->reply))
@@ -2079,6 +2174,20 @@ namespace
                     continue;
                 }
 
+                // And the node proof, for AUTH's reason one step further: what these two change
+                // is the connection's IDENTITY rather than its credential. Asked of the surface
+                // whether it offers a prover at all -- a surface that offers none lets the frame
+                // fall through to `Answer`, where the family is refused with the sentence a node
+                // holding no cluster key owes, rather than to a refusal encoded here (#447).
+                if (auto* const prover = state->responder.NodeProver(); prover != nullptr && IsNodeProofVerb(decoded->opRaw))
+                {
+                    auto const answer = AnswerNodeProof(
+                        *prover, state->responder, *payload, decoded->opRaw, challenge, identity.provenNodeId);
+                    if (!co_await WriteAll(EndpointWriter::Loop, socket.get(), answer))
+                        break;
+                    continue;
+                }
+
                 std::vector<std::byte> frame { header->begin(), header->end() };
                 frame.insert(frame.end(), payload->begin(), payload->end());
 
@@ -2107,7 +2216,7 @@ namespace
                 if (auto* const stream = state->responder.StreamFor(decoded->opRaw); stream != nullptr)
                 {
                     if (co_await ServeStream(
-                            shared, socket, stream, std::move(frame), decoded->opRaw, peer, !reader.Buffered().empty())
+                            shared, socket, stream, std::move(frame), decoded->opRaw, identity, !reader.Buffered().empty())
                         == AfterWatch::EndConnection)
                         break;
                     continue;
@@ -2159,7 +2268,7 @@ namespace
                 // written, and on every `break` in between by going out of scope -- see
                 // `IReplyHold`, which carries why a compile's slot cannot be released any
                 // earlier than that.
-                auto reply = co_await state->responder.Answer(frame, peer);
+                auto reply = co_await state->responder.Answer(frame, identity);
 
                 // **The one place this node says anything about a client**, and it is
                 // here because here is where every verb on every surface has already

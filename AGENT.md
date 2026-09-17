@@ -429,6 +429,12 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   a credential, as discovery's `(node, endpoint)` MAC is.
 - `CallerContext::peerId` is the kernel's peer host and IS trusted — membership is decided from it.
   It carries no port; a peer dials from an ephemeral one.
+- An address is a stand-in for *one of our nodes* and stops being one when it is not stable, so a
+  caller that PROVES the cluster key is a member wherever it dialled from. One fold
+  (`Distributed::ExplainConnection`, reached only through `Node::RefuseUnlessMember`), a
+  server-chosen challenge per connection spent whatever the outcome, and the id in the tag is a
+  LABEL — legitimately empty, since only a consensus node mints one. Neither verb is pre-auth:
+  the population already passes the credential gate, so requiring it refuses nobody.
 - A node's cache tier serves **this machine**, always: locality is a property of the VERB, never of
   the bind and never of a member list. `CacheResponder` therefore takes no membership oracle — its
   absence IS the fix. The question is ambient, so it arrives through `Platform/ILocalityOracle`:

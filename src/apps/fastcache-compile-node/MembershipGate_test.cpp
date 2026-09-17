@@ -64,7 +64,7 @@ TEST_CASE("A member is admitted and nothing is counted", "[node][membership][for
     FixedMembership const oracle { Distributed::Membership::Member, Distributed::MembershipParticipant::ClusterMembers };
     AtomicMetricsSink metrics;
 
-    CHECK_FALSE(RefuseUnlessMember(oracle, metrics, "10.0.0.7", Stranger, StrangerWhy).has_value());
+    CHECK_FALSE(RefuseUnlessMember(oracle, metrics, PeerIdentity { .host = "10.0.0.7" }, Stranger, StrangerWhy).has_value());
 
     // The control every counter assertion below needs: a gate that counted an ADMITTED
     // caller would make both of the cases that follow pass for the wrong reason.
@@ -81,7 +81,7 @@ TEST_CASE("A forgotten host is refused apart from a stranger", "[node][membershi
     FixedMembership const oracle { Distributed::Membership::Forgotten, Distributed::MembershipParticipant::ClusterMembers };
     AtomicMetricsSink metrics;
 
-    auto const refusal = RefuseUnlessMember(oracle, metrics, "10.0.0.7", Stranger, StrangerWhy);
+    auto const refusal = RefuseUnlessMember(oracle, metrics, PeerIdentity { .host = "10.0.0.7" }, Stranger, StrangerWhy);
     REQUIRE(refusal.has_value());
 
     CHECK(metrics.Read(HostForgotten.counter) == 1);
@@ -100,7 +100,7 @@ TEST_CASE("A host nobody listed is refused as the surface's own stranger", "[nod
     FixedMembership const oracle { Distributed::Membership::Outsider, Distributed::MembershipParticipant::ClusterMembers };
     AtomicMetricsSink metrics;
 
-    auto const refusal = RefuseUnlessMember(oracle, metrics, "10.0.0.7", Stranger, StrangerWhy);
+    auto const refusal = RefuseUnlessMember(oracle, metrics, PeerIdentity { .host = "10.0.0.7" }, Stranger, StrangerWhy);
     REQUIRE(refusal.has_value());
 
     CHECK(metrics.Read(Stranger.counter) == 1);
@@ -116,7 +116,7 @@ TEST_CASE("A forgotten host is told what happened and who can undo it", "[node][
     FixedMembership const oracle { Distributed::Membership::Forgotten, Distributed::MembershipParticipant::ClusterMembers };
     AtomicMetricsSink metrics;
 
-    auto const refusal = RefuseUnlessMember(oracle, metrics, "10.0.0.7", Stranger, StrangerWhy);
+    auto const refusal = RefuseUnlessMember(oracle, metrics, PeerIdentity { .host = "10.0.0.7" }, Stranger, StrangerWhy);
     REQUIRE(refusal.has_value());
 
     auto const [code, detail] = RefusalOf(Unwrap(refusal));

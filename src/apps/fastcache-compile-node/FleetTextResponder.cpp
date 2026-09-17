@@ -140,6 +140,8 @@ namespace
           .policy = { .counter = std::nullopt, .rationale = CredentialIsTheSchedulersRationale } },
         { .refusal = EndpointRefusal::AnswerDeadline,
           .policy = { .counter = std::nullopt, .rationale = AnswerDeadlineIsTheEndpointsRationale } },
+        { .refusal = EndpointRefusal::NodeProofUnchallenged,
+          .policy = { .counter = std::nullopt, .rationale = NodeProofIsTheProversRationale } },
     } };
 
     static_assert(RowsInEnumeratorOrder(EndpointRefusals, &EndpointRefusalRow::refusal),
@@ -165,7 +167,7 @@ FleetTextResponder::FleetTextResponder(ILiveStatsSources const& sources,
 {
 }
 
-Task<FrameReply> FleetTextResponder::Answer(std::span<std::byte const> frame, std::string peer)
+Task<FrameReply> FleetTextResponder::Answer(std::span<std::byte const> frame, PeerIdentity peer)
 {
     // The verb is read back out of the frame rather than taken on the endpoint's word, for
     // `NodeStatusResponder::Answer`'s reason: `Answer` is reachable directly.
@@ -187,7 +189,10 @@ Task<FrameReply> FleetTextResponder::Answer(std::span<std::byte const> frame, st
     if (!request.has_value())
         co_return Cc::Refuse(_metrics, RefusedMalformed, "a fleet-text request is a section, a range and a token");
 
-    co_return Read(*request, peer);
+    // The HOST: the dashboard credential and leadership are what `Read` decides from, and
+    // neither is a membership question -- the proof has already been folded into the one that
+    // is, at `RefusePeer` above.
+    co_return Read(*request, peer.host);
 }
 
 std::vector<std::byte> FleetTextResponder::Read(Wire::FleetTextRequest const& request, std::string_view peer) const
@@ -231,7 +236,7 @@ std::vector<std::byte> FleetTextResponder::Render(Wire::FleetTextRequest const& 
     return Wire::EncodeReply(Wire::Status::Ok, Wire::AsBytes(document->body));
 }
 
-std::optional<std::vector<std::byte>> FleetTextResponder::RefusePeer(std::string_view peer, std::uint8_t /*opRaw*/) const
+std::optional<std::vector<std::byte>> FleetTextResponder::RefusePeer(PeerIdentity const& peer, std::uint8_t /*opRaw*/) const
 {
     return RefuseUnlessMember(
         _membership, _metrics, peer, RefusedNotAMember, "this node serves the fleet to fleet members only");

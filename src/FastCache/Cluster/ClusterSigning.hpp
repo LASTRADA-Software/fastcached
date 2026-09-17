@@ -97,6 +97,23 @@ enum class SigningDomain : std::uint8_t
     /// `Consensus/RaftPeerSession`.
     RaftPeerFrame,
 
+    /// A caller's proof, on the `0xFC` surface, that it holds the cluster key. See
+    /// `Distributed/NodeProof`.
+    ///
+    /// Its own domain and NOT `RaftPeerDialler`'s, although both are "a dialler proves the
+    /// key over a challenge": a tag minted for one wire must not verify on the other. The
+    /// Raft wire admits a peer to CONSENSUS; this one admits a caller to the compile and
+    /// scheduler verbs of a node that may run no consensus at all, and the two populations
+    /// differ. Sharing a label would make a captured Raft proof spendable here.
+    ///
+    /// There is deliberately no verdict domain beside it, which is where this departs from
+    /// the Raft pair. There a verdict is SIGNED because both ends must agree about the
+    /// connection and an unsigned refusal of a key holder is a confident wrong signal. Here
+    /// the proof is an OPTIONAL upgrade: a caller that presents none is admitted or refused
+    /// by address exactly as before, so the only thing a refusal has to reach is this
+    /// server's own counters.
+    NodeProof,
+
     Last, ///< Not a domain, and has no row: the length of a table keyed by one.
 };
 
@@ -123,13 +140,15 @@ struct SigningDomainDescriptor
 ///
 /// The three `fastcache-raft-*` rows are the peer wire's (#1308): before them a Raft
 /// connection proved nothing, so there is no earlier tag for them to stay compatible
-/// with.
+/// with. `fastcache-node-proof-v1` is the `0xFC` surface's (#1428) and is new for the
+/// same reason.
 inline constexpr EnumTable<SigningDomain, SigningDomainDescriptor> SigningDomainTable { {
     { .domain = SigningDomain::DiscoveryProof, .label = "fastcache-discovery-v1" },
     { .domain = SigningDomain::LeaseToken, .label = "fastcache-lease-v1" },
     { .domain = SigningDomain::RaftPeerDialler, .label = "fastcache-raft-dial-v1" },
     { .domain = SigningDomain::RaftPeerVerdict, .label = "fastcache-raft-verdict-v1" },
     { .domain = SigningDomain::RaftPeerFrame, .label = "fastcache-raft-frame-v1" },
+    { .domain = SigningDomain::NodeProof, .label = "fastcache-node-proof-v1" },
 } };
 
 static_assert(RowsInEnumeratorOrder(SigningDomainTable, &SigningDomainDescriptor::domain),

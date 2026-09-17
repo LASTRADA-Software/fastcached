@@ -102,8 +102,11 @@ struct WorkerTierParts
     IHostFactsSource const& host;                     ///< The hostname a registration labels.
     CacheTier const* cacheTier;                       ///< Null on a node with no cache.
     ICredentialSource const& credential;              ///< What the heartbeat presents.
-    IMetricsSink& metrics;                            ///< Where the worker counts.
-    ILogger& logger;                                  ///< Where it reports.
+    /// Where the cluster key is read from to PROVE membership, or null when this node holds
+    /// none (#1428). One instance per process, shared with whatever else reads that file.
+    IClusterKeySource const* proofKey;
+    IMetricsSink& metrics; ///< Where the worker counts.
+    ILogger& logger;       ///< Where it reports.
 };
 
 class WorkerTier;
@@ -284,6 +287,11 @@ class WorkerTier
     NodeReloader const* _reloader;
     CacheTier const* _cacheTier;
     ICredentialSource const& _credential;
+
+    /// Where the cluster key is read from to prove membership, or null when this node holds
+    /// none. Borrowed, and it outlives this tier: `main` declares the one source above the
+    /// tier and destroys it after.
+    IClusterKeySource const* _proofKey;
     IMetricsSink& _metrics;
     ILogger& _logger;
     /// What this worker advertises, and the one thing the registration and the lease

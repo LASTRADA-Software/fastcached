@@ -211,7 +211,9 @@ struct Seed
                                                std::span<std::byte const> frame,
                                                std::string_view peer)
 {
-    return SyncRun(responder.Answer(frame, std::string { peer })).bytes;
+    // Nothing PROVED, which is what every case here is about: the enrollment pair is for a
+    // machine that holds no cluster key, so a proof is not a state a joiner can be in.
+    return SyncRun(responder.Answer(frame, PeerIdentity { .host = std::string { peer } })).bytes;
 }
 
 /// The payload of a reply.
@@ -579,18 +581,25 @@ TEST_CASE("Enrollment is reachable by a stranger and deciding it is not", "[enro
     // is on no member list -- it is a fresh install, which is the entire problem -- so
     // `Enroll` must be admitted at the door. Asserting only that would leave the pair
     // untested in the direction that matters.
-    CHECK(!seed.responder.RefusePeer(JoinerAddress, static_cast<std::uint8_t>(Wire::Op::Enroll)).has_value());
+    CHECK(
+        !seed.responder
+             .RefusePeer(PeerIdentity { .host = std::string { JoinerAddress } }, static_cast<std::uint8_t>(Wire::Op::Enroll))
+             .has_value());
 
     // And the decision verb is refused to the same peer, before a payload is read, with
     // the counter that says somebody tried to approve themselves.
-    auto const refused = seed.responder.RefusePeer(JoinerAddress, static_cast<std::uint8_t>(Wire::Op::EnrollControl));
+    auto const refused = seed.responder.RefusePeer(PeerIdentity { .host = std::string { JoinerAddress } },
+                                                   static_cast<std::uint8_t>(Wire::Op::EnrollControl));
     REQUIRE(refused.has_value());
     CHECK(RefusalIn(Unwrap(refused)) == Wire::ErrorCode::NotAMember);
     CHECK(seed.metrics.Read(IMetricsSink::Counter::EnrollmentControlRefusedNotAMember) == 1);
 
     // The operator's machine is admitted to both, so the refusal above is about the
     // peer rather than about the verb being closed to everybody.
-    CHECK(!seed.responder.RefusePeer(OperatorAddress, static_cast<std::uint8_t>(Wire::Op::EnrollControl)).has_value());
+    CHECK(!seed.responder
+               .RefusePeer(PeerIdentity { .host = std::string { OperatorAddress } },
+                           static_cast<std::uint8_t>(Wire::Op::EnrollControl))
+               .has_value());
 }
 
 TEST_CASE("A follower answers enrollment with the leader's endpoint rather than a window of its own",
@@ -721,7 +730,8 @@ TEST_CASE("A node with no enrollment component refuses the whole family at the d
     // past it -- and one route fixed alone reads exactly like both.
     for (auto const op: { Wire::Op::Enroll, Wire::Op::EnrollControl })
     {
-        auto const refused = merged.RefusePeer(JoinerAddress, static_cast<std::uint8_t>(op));
+        auto const refused =
+            merged.RefusePeer(PeerIdentity { .host = std::string { JoinerAddress } }, static_cast<std::uint8_t>(op));
         REQUIRE(refused.has_value());
         CHECK(RefusalIn(Unwrap(refused)) == Wire::ErrorCode::NoCluster);
         CHECK(RefusalIn(Unwrap(refused)) != Wire::UnimplementedVerb);
@@ -736,7 +746,8 @@ TEST_CASE("A node with no enrollment component refuses the whole family at the d
     // And the families this does NOT cover still answer the unserved sentence, or the
     // fix above would have been "call everything NoCluster", which tells a launcher
     // asking a worker for a cache verb that it is in the wrong cluster.
-    auto const cacheVerb = merged.RefusePeer(JoinerAddress, static_cast<std::uint8_t>(Wire::Op::Fetch));
+    auto const cacheVerb = merged.RefusePeer(PeerIdentity { .host = std::string { JoinerAddress } },
+                                             static_cast<std::uint8_t>(Wire::Op::Fetch));
     REQUIRE(cacheVerb.has_value());
     CHECK(RefusalIn(Unwrap(cacheVerb)) == Wire::UnimplementedVerb);
 }

@@ -285,7 +285,7 @@ TEST_CASE("The node's cache answers this machine and refuses every other one", "
 
     auto const fetch = Wire::EncodeFetch("some-key");
     auto const ask = [&](std::string peer) {
-        return Wire::DecodeReplyHeader(SyncRun(responder.Answer(fetch, std::move(peer))).bytes);
+        return Wire::DecodeReplyHeader(SyncRun(responder.Answer(fetch, PeerIdentity { .host = std::move(peer) })).bytes);
     };
 
     SECTION("over loopback, which is every ordinary fastcache-cc on this box")
@@ -371,7 +371,7 @@ TEST_CASE("(#287) a fleet peer is refused this machine's cache tier, member or n
     REQUIRE_FALSE(IsLoopbackHost("10.0.0.1"));
     REQUIRE_FALSE(locality.IsThisMachine("10.0.0.1"));
 
-    auto const refused = SyncRun(responder.Answer(Wire::EncodeFetch("some-key"), "10.0.0.1")).bytes;
+    auto const refused = SyncRun(responder.Answer(Wire::EncodeFetch("some-key"), PeerIdentity { .host = "10.0.0.1" })).bytes;
     auto const header = Wire::DecodeReplyHeader(refused);
     REQUIRE(header.has_value());
     CHECK(Unwrap(header).status == Wire::Status::Error);
@@ -404,7 +404,8 @@ TEST_CASE("(#377) the cache's locality gate is one predicate, asked before the p
     {
         // The early route, with no frame in hand at all: this is what the server can
         // ask before it has read a byte of payload.
-        auto const refusal = responder.RefusePeer("10.0.0.1", static_cast<std::uint8_t>(Wire::Op::Fetch));
+        auto const refusal = responder.RefusePeer(PeerIdentity { .host = std::string { "10.0.0.1" } },
+                                                  static_cast<std::uint8_t>(Wire::Op::Fetch));
         REQUIRE(refusal.has_value());
         CHECK(ErrorOf(Unwrap(refusal)) == Wire::ErrorCode::NotAMember);
 
@@ -420,8 +421,14 @@ TEST_CASE("(#377) the cache's locality gate is one predicate, asked before the p
         // The control: a predicate that refused everyone would satisfy the section
         // above while making the node's own cache unreachable, which is the failure
         // #229 already paid for.
-        CHECK_FALSE(responder.RefusePeer("10.0.0.7", static_cast<std::uint8_t>(Wire::Op::Fetch)).has_value());
-        CHECK_FALSE(responder.RefusePeer("127.0.0.1", static_cast<std::uint8_t>(Wire::Op::Fetch)).has_value());
+        CHECK_FALSE(
+            responder
+                .RefusePeer(PeerIdentity { .host = std::string { "10.0.0.7" } }, static_cast<std::uint8_t>(Wire::Op::Fetch))
+                .has_value());
+        CHECK_FALSE(
+            responder
+                .RefusePeer(PeerIdentity { .host = std::string { "127.0.0.1" } }, static_cast<std::uint8_t>(Wire::Op::Fetch))
+                .has_value());
         CHECK(fixture.metrics.Read(IMetricsSink::Counter::NodeCacheRequestsRefusedNotLocal) == 0);
     }
 }
@@ -681,19 +688,24 @@ TEST_CASE("(#1276) a drop from another machine is refused before it removes anyt
                                                                                         .srcRoot = "/src",
                                                                                         .buildTree = "/build",
                                                                                         .value = Bytes("object") }),
-                                                 "127.0.0.1"))
+                                                 PeerIdentity { .host = "127.0.0.1" }))
                             .bytes;
     REQUIRE(StatusOf(stored) == Wire::Status::Ok);
 
-    auto const refused = SyncRun(responder.Answer(Wire::EncodeCacheDrop("victim"), "10.9.9.9")).bytes;
+    auto const refused =
+        SyncRun(responder.Answer(Wire::EncodeCacheDrop("victim"), PeerIdentity { .host = "10.9.9.9" })).bytes;
     CHECK(ErrorOf(refused) == Wire::ErrorCode::NotAMember);
     CHECK(fixture.metrics.Read(IMetricsSink::Counter::NodeCacheRequestsRefusedNotLocal) == 1);
     CHECK(fixture.local.Snapshot().deleteHits == 0);
-    CHECK(StatusOf(SyncRun(responder.Answer(Wire::EncodeFetch("victim"), "127.0.0.1")).bytes) == Wire::Status::Ok);
+    CHECK(StatusOf(SyncRun(responder.Answer(Wire::EncodeFetch("victim"), PeerIdentity { .host = "127.0.0.1" })).bytes)
+          == Wire::Status::Ok);
 
     // And the same request from this machine is served, so the refusal above was about WHO
     // asked rather than about the request.
-    CHECK(StatusOf(SyncRun(responder.Answer(Wire::EncodeCacheDrop("victim"), "10.0.0.7")).bytes) == Wire::Status::Ok);
-    CHECK(StatusOf(SyncRun(responder.Answer(Wire::EncodeFetch("victim"), "127.0.0.1")).bytes) == Wire::Status::Miss);
-    CHECK(StatusOf(SyncRun(responder.Answer(Wire::EncodeCacheDrop("victim"), "10.0.0.7")).bytes) == Wire::Status::Miss);
+    CHECK(StatusOf(SyncRun(responder.Answer(Wire::EncodeCacheDrop("victim"), PeerIdentity { .host = "10.0.0.7" })).bytes)
+          == Wire::Status::Ok);
+    CHECK(StatusOf(SyncRun(responder.Answer(Wire::EncodeFetch("victim"), PeerIdentity { .host = "127.0.0.1" })).bytes)
+          == Wire::Status::Miss);
+    CHECK(StatusOf(SyncRun(responder.Answer(Wire::EncodeCacheDrop("victim"), PeerIdentity { .host = "10.0.0.7" })).bytes)
+          == Wire::Status::Miss);
 }

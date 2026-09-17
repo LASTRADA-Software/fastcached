@@ -3,6 +3,7 @@
 
 #include "AdminEndpoint.hpp"
 #include "CacheTier.hpp"
+#include "ClusterKeySource.hpp"
 #include "CompileCapacity.hpp"
 #include "EndpointDialer.hpp"
 #include "NodeConfig.hpp"
@@ -197,6 +198,27 @@ struct HeartbeatRound
     /// on presenting the old one -- until it was restarted, which is the thing the
     /// reload exists to avoid. There is no field here for a stale secret to sit in.
     ICredentialSource const& credential;
+
+    /// Where a credential the scheduler did not want is reported once, as every other exchange
+    /// on this wire reports it. The tier's own, shared with the registrars, so a node says it
+    /// once rather than once per verb.
+    Cc::CredentialNotice& notice;
+
+    /// Where this node's cluster key is read from to PROVE membership, or null when it holds
+    /// none (#1428).
+    ///
+    /// A pointer rather than a reference because *this node has no cluster key* has to be
+    /// representable and a null reference is not -- and that is the ordinary state on a
+    /// single-machine install, which is this binary's default configuration.
+    ///
+    /// The SOURCE and never the bytes, for `credential` above's reason: a key read once when
+    /// the round was built is a key an operator's rotation cannot reach until a restart.
+    IClusterKeySource const* proofKey;
+
+    /// The label to bind inside a proof's tag. **Legitimately empty**: an identity is minted
+    /// only by a node that runs consensus, and a keyed worker without one still has a key to
+    /// prove. `NodeProofClient.hpp` says what an empty one costs.
+    std::string_view nodeId;
     /// Where the fleet this node was admitted to is recorded, so the lease check can
     /// read it. Registration is the only place that fact arrives (#401).
     Distributed::WorkerLeaseState& lease;

@@ -197,7 +197,8 @@ struct Stream
 /// Run one subscription on the reactor, as the endpoint would.
 DetachedTask RunStream(LiveStatsResponder* responder, std::vector<std::byte> frame, std::string peer, Stream* stream)
 {
-    stream->reply = co_await responder->Serve(frame, std::move(peer), &stream->sink);
+    // Nothing proved: this surface ignores a proof by decision, and `RefuseWatcher` carries why.
+    stream->reply = co_await responder->Serve(frame, PeerIdentity { .host = std::move(peer) }, &stream->sink);
     stream->finished = true;
 }
 

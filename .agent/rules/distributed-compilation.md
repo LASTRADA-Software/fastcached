@@ -2998,7 +2998,110 @@ pointed at it three times — so the claim was circular. A case asserting only t
 reading leaves the field's whole purpose untested; absent-against-`closed` is what
 earns its place.
 
+## The node proof (#1428)
+
+Node-to-node admission on the `0xFC` surface was decided by the caller's SOURCE ADDRESS and
+nothing else — `ClusterMembership` against the committed endpoints, `--fleet-member` against a
+local list. An address is a stand-in for *this is one of our nodes*, and it stops being one the
+moment an address is not stable: a worker that joins over a VPN gets a different one each
+session and no literal host match can follow it (#178 item 1). Every caller that matters here
+already holds the cluster key — #282 refuses a network-facing keyless worker at startup and
+#1308 refuses keyless consensus — so it can PROVE membership rather than being inferred from
+where it dialled from.
+
+**The proof is an UPGRADE and never a replacement.** A connection that proves nothing is
+admitted or refused by its address exactly as it was before, which is what makes every existing
+deployment unaffected by construction: `Distributed::ExplainConnection` returns the oracle's own
+decision when nothing was proved, and unions `ProvenKeyHolder` onto it when something was. A tie
+unions rather than choosing, for `AnyOfMembership`'s reason — a host in `--fleet-member` that
+also holds the key is admitted by both, and an operator who drops it from the list has to be
+told the key still admits it.
+
+**A forget still outranks it**, on the same `PrecedenceOf` the address routes are composed with.
+That is not a softening of what a proof means: under a shared key a forget cannot revoke a key
+holder at all, which is why removal needs #178's credential in the frame, and the precedence is
+the direction the composition already fails in.
+
+**The fold lives in ONE function and every gate reaches it**, `Node::RefuseUnlessMember`. The
+alternative — folding at each surface — is the shape this file already records for the membership
+verdict itself: five copies of a one-armed decision were exactly as correct as one until a second
+arm arrived, and then five files each had to grow it. The one surface that must NOT widen says so
+by calling a differently-named spelling that takes a reason: `RefuseUnlessMemberAtAddress`, whose
+single caller is `LiveStatsResponder`, because a subscription is re-gated on every tick through
+`Protocol::ILiveGate` — a seam `fastcached` shares and which therefore carries no cluster key.
+A door that honoured a proof while the re-gate did not would admit a proven watcher and end its
+stream one tick later, which is worse than refusing it.
+
+**Neither verb is pre-auth, and the reasoning from `Enroll` does not transfer.** `Enroll` exists
+for a machine that holds NO secret of this cluster, so a credential gate there refuses the whole
+population. A node proving the cluster key is the opposite case: it came to send `Register`,
+which requires the credential when one is configured, so a caller that cannot pass that gate
+gains nothing from being proved and one that can passes it first. Nobody is refused by requiring
+it, and what pre-auth would cost is one-sided — an unauthenticated stranger able to make this
+node draw a nonce and run an HMAC per frame, and two more rows for `PreAuthVerbsAreBounded` to
+be right about. *The verb admits a non-member, therefore it is pre-auth* is the inference a
+reader makes from the table alone, so `VerbFamily::NodeProof` states the answer beside the rows.
+
+**The challenge is the SERVER's, per connection, and spent whatever the outcome.** Discovery's
+rule and the Raft handshake's, in the same words, and the endpoint holds it because it is
+connection state — the prover is shared by every connection on the surface. Asking twice
+re-draws it and the old one is gone: a server holding two live nonces would accept a proof over
+either, which is a replay window opened by nothing but politeness, and re-drawing keeps *spent
+whatever the outcome* true with no second rule beside it.
+
+**The id inside the tag is a LABEL and is legitimately EMPTY.** Binding it buys one thing — a
+captured tag cannot be relabelled, so the id this server records is the one the holder claimed —
+and it establishes nothing about WHICH holder is speaking, because under a shared key every
+holder can mint any id's tag. An identity is minted into `--cluster-dir` only by a node that
+runs consensus, so requiring a non-empty one would refuse exactly the population this exists for:
+an ordinary worker, which holds the key because that is what signs its lease grants. So *this
+connection proved the key* is carried by `PeerIdentity::provenNodeId` being ENGAGED, and
+`ExplainConnection` takes a `bool` rather than the label — a parameter carrying the label would
+make an empty one indistinguishable from no proof at all.
+
+**Three ways to fail, three diagnoses, and only one of them is about the caller's key.** A
+payload that will not decode is a client-library mismatch (`NodeProofsMalformed`); a tag that
+does not authenticate is a wrong `--cluster-key-file` or somebody guessing, which the RATE
+separates (`NodeProofsRejected`); a proof with no challenge outstanding is a client that has the
+exchange wrong (`NodeProofsUnchallenged`). A key file that has stopped being readable is a fact
+about THIS machine and answers `NoCluster` with a Warn naming the path — telling that caller its
+key did not match would send whoever reads it to check a key that is fine, and no counter can
+carry which machine is broken. `NodeProofsAccepted` is the positive half and is not decoration:
+every other row counts a refusal, so a fleet where the proof is configured but never taken reads
+identically on all of them to one where it works perfectly.
+
+**The presenting half runs once per CONNECTION, at the top of each heartbeat round, and carries
+on in every outcome.** A peer too old to know the verbs answers `UnknownOpcode` by the step-over
+rule and one holding no key answers `NoCluster` from its unserved-family row; both are what a
+mixed fleet looks like mid-upgrade, and a node that stopped registering over either would take
+itself out of a fleet that was admitting it by address perfectly well. Only a REFUSAL is logged,
+because that is the one an operator acts on and it is invisible from here in every other way —
+the registration that follows then succeeds or fails for a reason that names the address instead.
+
+**What it does not cover, stated rather than left to be found.** The cache tier is unaffected and
+that is the fix rather than an omission: locality is a property of the VERB, and a machine
+holding the fleet's key is still not this one (#287). `FleetText` and a live-stats subscription
+are BOTH behind the dashboard credential as well as membership, and that credential is untouched
+here -- it answers a different question and is its own file by rule. What differs between them is
+the membership half: `FleetTextResponder` folds a proof like every other gate, and
+`LiveStatsResponder` alone does not, for the re-gate reason above. **Five callers widen and
+exactly one does not**, which is the census rather than a description -- `CompileResponder`,
+`EnrollmentResponder`, `FleetTextResponder`, `NodeStatusResponder` and `SchedulerResponder`
+against `LiveStatsResponder`'s two sites -- so a sixth surface arriving is a decision somebody
+makes rather than a default it inherits.
+
 ## Open work
+- **[#1512](https://github.com/LASTRADA-Software/fastcached/issues/1512)** — `Protocol::ILiveGate`
+  carries no proof, so the one population #1428 exists for is the one machine in the fleet that
+  cannot watch its own live stats: a worker admitted by proving the cluster key at an unlisted
+  address registers, leases and compiles, and is refused `NotAMember` by `Subscribe`. The seam's
+  three methods all take the peer as a bare host, and `fastcached` implements them too, so there
+  is nowhere for a proof to travel — which is why #1428 refused to widen the DOOR alone rather
+  than leaving it. **A door that honoured a proof while the per-tick `Recheck` did not would be a
+  worse outcome than the refusal, not a partial fix**: the watcher is admitted and its stream ends
+  one tick later, so any shape where the two can disagree reintroduces this rather than narrowing
+  it. That is also what makes the failing test two ticks rather than one — one tick is what the
+  admitted-then-dropped bug produces as well.
 - **[#661](https://github.com/LASTRADA-Software/fastcached/issues/661)** — `IProcessRunner`
   has no cancellable seam, so a compile whose client has GONE runs to completion and this
   machine pays for an object nobody will read. The departure is already detected and

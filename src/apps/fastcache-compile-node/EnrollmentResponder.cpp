@@ -68,6 +68,9 @@ namespace
         { .refusal = EndpointRefusal::AnswerDeadline,
           .answer = std::nullopt,
           .rationale = AnswerDeadlineIsTheEndpointsRationale },
+        { .refusal = EndpointRefusal::NodeProofUnchallenged,
+          .answer = std::nullopt,
+          .rationale = NodeProofIsTheProversRationale },
     } };
 
     static_assert(Cc::RowsStateOneRefusalClaim(EnrollmentEndpointRefusals,
@@ -105,7 +108,7 @@ std::expected<SecureByteBuffer, std::string> FileClusterKeySource::ClusterKey() 
     return ReadClusterKey(_path);
 }
 
-Task<FrameReply> EnrollmentResponder::Answer(std::span<std::byte const> frame, std::string peer)
+Task<FrameReply> EnrollmentResponder::Answer(std::span<std::byte const> frame, PeerIdentity peer)
 {
     auto const header = Wire::DecodeRequestHeader(frame);
     if (!header.has_value())
@@ -124,8 +127,13 @@ Task<FrameReply> EnrollmentResponder::Answer(std::span<std::byte const> frame, s
     switch (static_cast<Wire::Op>(header->opRaw))
     {
         case Wire::Op::Enroll:
-            co_return AnswerEnroll(payload, peer);
+            // The HOST: what `Enroll` records is where a joiner dialled from, which is the fact
+            // an operator compares against the endpoint it CLAIMS. A joiner holds no cluster key
+            // by construction, so there is never a proof here to fold.
+            co_return AnswerEnroll(payload, peer.host);
         case Wire::Op::EnrollControl:
+            // The identity, whose proof `RefusePeer` has already folded into the membership
+            // answer; `ClusterAdmit` gates on the host, which `Context` takes from it.
             co_return AnswerControl(payload, peer);
         default:
             break;
@@ -141,7 +149,7 @@ Task<FrameReply> EnrollmentResponder::Answer(std::span<std::byte const> frame, s
                                        "this node serves no component for that verb");
 }
 
-std::optional<std::vector<std::byte>> EnrollmentResponder::RefusePeer(std::string_view peer, std::uint8_t opRaw) const
+std::optional<std::vector<std::byte>> EnrollmentResponder::RefusePeer(PeerIdentity const& peer, std::uint8_t opRaw) const
 {
     // `Enroll` admits everybody, which is this surface's one open door and is the whole
     // point of it. See the declaration.
@@ -313,7 +321,7 @@ std::vector<std::byte> EnrollmentResponder::AnswerEnroll(std::span<std::byte con
     return Wire::EncodeReply(Wire::Status::Ok, Wire::EncodeEnrollReply(Wire::EnrollOutcome::Approved, *key));
 }
 
-std::vector<std::byte> EnrollmentResponder::AnswerControl(std::span<std::byte const> payload, std::string_view peer)
+std::vector<std::byte> EnrollmentResponder::AnswerControl(std::span<std::byte const> payload, PeerIdentity const& peer)
 {
     auto const fields = Wire::DecodeEnrollControlPayload(payload);
     if (!fields.has_value())
@@ -369,7 +377,7 @@ std::vector<std::byte> EnrollmentResponder::AnswerControl(std::span<std::byte co
 
 std::vector<std::byte> EnrollmentResponder::AnswerDecision(Wire::EnrollControlVerb verb,
                                                            std::string_view subject,
-                                                           std::string_view peer)
+                                                           PeerIdentity const& peer)
 {
     auto const entry = _window.Find(subject);
     if (!entry.has_value())
@@ -451,7 +459,7 @@ std::vector<std::byte> EnrollmentResponder::AnswerDecision(Wire::EnrollControlVe
         // Through `SchedulerService::ClusterAdmit`, which is the same entry point
         // `--cluster-admit` reaches: one gate, one validation, one mapping from a
         // consensus refusal onto a wire code.
-        auto const reply = _scheduler.ClusterAdmit(Context(std::string { peer }), subject, entry->raftEndpoint);
+        auto const reply = _scheduler.ClusterAdmit(Context(peer), subject, entry->raftEndpoint);
 
         // **A RE-APPROVAL reaches a cluster that already holds this member, and that is
         // a `Satisfied` refusal rather than a failure.** The consensus rulebook draws

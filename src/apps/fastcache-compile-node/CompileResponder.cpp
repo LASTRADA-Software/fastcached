@@ -159,6 +159,9 @@ namespace
         { .refusal = EndpointRefusal::AnswerDeadline,
           .answer = std::nullopt,
           .rationale = AnswerDeadlineIsTheEndpointsRationale },
+        { .refusal = EndpointRefusal::NodeProofUnchallenged,
+          .answer = std::nullopt,
+          .rationale = NodeProofIsTheProversRationale },
     } };
 
     static_assert(RowsInEnumeratorOrder(EndpointRefusalTable, &EndpointRefusalRow::refusal),
@@ -187,14 +190,16 @@ namespace
                   "a converted row must answer the code `ErrorCodeFor` names for its refusal");
 } // namespace
 
-std::optional<std::vector<std::byte>> CompileResponder::RefusePeer(std::string_view peer, std::uint8_t opRaw) const
+std::optional<std::vector<std::byte>> CompileResponder::RefusePeer(PeerIdentity const& peer, std::uint8_t opRaw) const
 {
     // The verb decides WHICH question, which is what the column was carried for: a
     // compile spends this machine's CPU and asks membership, a cordon decides whether
     // this machine's CPU serves the fleet at all and asks locality.
     if (!IsCordon(opRaw))
         return RefuseUnlessMember(_membership, _metrics, peer, CompileRefusal::NotAMember, NotAMemberWhy);
-    if (_locality.IsThisMachine(peer))
+    // The ADDRESS, because locality is not a membership question: a machine holding the fleet's
+    // key is still not THIS machine, and a cordon is a decision about this one (#1428).
+    if (_locality.IsThisMachine(peer.host))
         return std::nullopt;
     return Cc::Refuse(_metrics, CompileRefusal::CordonNotLocal, "a machine is cordoned from itself");
 }
@@ -217,7 +222,7 @@ std::vector<std::byte> CompileResponder::EndpointRefusalReply(EndpointRefusal re
     return AnswerEndpointRefusal(_metrics, ErrorCodeFor(refusal), row.answer, row.rationale, detail);
 }
 
-Task<FrameReply> CompileResponder::Answer(std::span<std::byte const> frame, std::string peer)
+Task<FrameReply> CompileResponder::Answer(std::span<std::byte const> frame, PeerIdentity peer)
 {
     // The gate is re-asked here rather than taken on the endpoint's word. `Answer` is
     // reachable directly -- which is why `CacheResponder` re-asks its own -- and a

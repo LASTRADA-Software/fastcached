@@ -55,10 +55,11 @@ class LiveStatsResponder final: public IFrameResponder, public IFrameStream, pri
     ///
     /// Reached only by a caller that does not stream, since the endpoint asks `StreamFor` first:
     /// such a caller cannot carry a subscription, so it is told the verb is not served that way.
-    [[nodiscard]] Task<FrameReply> Answer(std::span<std::byte const> frame, std::string peer) override;
+    [[nodiscard]] Task<FrameReply> Answer(std::span<std::byte const> frame, PeerIdentity peer) override;
 
     /// @copydoc IFrameResponder::RefusePeer
-    [[nodiscard]] std::optional<std::vector<std::byte>> RefusePeer(std::string_view peer, std::uint8_t opRaw) const override;
+    [[nodiscard]] std::optional<std::vector<std::byte>> RefusePeer(PeerIdentity const& peer,
+                                                                   std::uint8_t opRaw) const override;
 
     /// @copydoc IFrameResponder::AuthRequired
     ///
@@ -150,9 +151,21 @@ class LiveStatsResponder final: public IFrameResponder, public IFrameStream, pri
     /// @copydoc IFrameResponder::StreamFor
     [[nodiscard]] IFrameStream* StreamFor(std::uint8_t opRaw) noexcept override;
 
+    /// @copydoc IFrameResponder::NodeProver
+    ///
+    /// **None.** The credential this surface reads is the dashboard token. And the proof does not
+    /// widen this gate at all -- `RefuseWatcher` carries the reason, which is that a subscription
+    /// is re-gated through a `Protocol/` seam `fastcached` shares.
+    [[nodiscard]] INodeProver* NodeProver() noexcept override
+    {
+        return nullptr;
+    }
+
     /// @copydoc IFrameStream::Serve
+    ///
+    /// The identity's HOST reaches `LiveStream` and its proof does not; see the definition.
     [[nodiscard]] Task<std::vector<std::byte>> Serve(std::span<std::byte const> frame,
-                                                     std::string peer,
+                                                     PeerIdentity peer,
                                                      IPushSink* sink) override;
 
     /// @return How many subscriptions are streaming right now. For tests.

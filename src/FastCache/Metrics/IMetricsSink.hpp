@@ -869,6 +869,51 @@ class IMetricsSink
         /// component can be asked for it.
         NodeFrameConnectionsRefusedAtCapacity,
 
+        /// Node proofs that authenticated, so a connection was admitted by what it PROVED
+        /// rather than by where it dialled from
+        /// ([#1428](https://github.com/LASTRADA-Software/fastcached/issues/1428)).
+        ///
+        /// **The positive half, and it is not decoration.** Every other row about this exchange
+        /// counts a refusal, and a fleet where the proof is configured but never taken reads
+        /// identically on all of them to a fleet where it works perfectly: zero refusals. So
+        /// this is what says the route is live, and the pair with `NodeProofsRejected` is what
+        /// says whether a wrong key is a rollout mistake on one machine or somebody guessing.
+        ///
+        /// Counted per EXCHANGE, never per verb: a connection that proves once and then sends
+        /// forty heartbeats moves this once. What it measures is how often a machine's identity
+        /// was established, which is per connection by construction.
+        NodeProofsAccepted,
+
+        /// Node proofs that decoded and did not authenticate under this node's cluster key.
+        ///
+        /// A node configured with the wrong `--cluster-key-file`, or somebody guessing at the
+        /// fleet's key. **The rate is what separates them**, exactly as the scheduler term's
+        /// does for a stale lease: one machine misconfigured moves this once per dial round
+        /// forever, at a cadence an operator can recognise, while a search moves it as fast as
+        /// the network allows.
+        ///
+        /// `SchedulerCredentialsRejected`'s sibling and never summed with it: that one is a
+        /// wrong `--requirepass` against this node's `--scheduler-token-file`, an operator's
+        /// token; this is a wrong cluster key, which every member holds. Two secrets, two
+        /// remedies.
+        NodeProofsRejected,
+
+        /// `ProveNode` frames that arrived with no challenge outstanding on their connection.
+        ///
+        /// Never asked for one, or already spent one. Not a security signal and it says so:
+        /// what moves it is a client that has the exchange wrong, which is a version or
+        /// client-library fault. Summed with the rejection above it would hide a key search
+        /// inside an old client's traffic, which is the shape `SchedulerCredentialsMalformed`
+        /// was split out for.
+        NodeProofsUnchallenged,
+
+        /// `ProveNode` payloads that would not decode into an id and a tag.
+        ///
+        /// `SchedulerCredentialsMalformed`'s counterpart, for its reason: a peer that cannot
+        /// form the frame is a mismatch, and one forming it correctly with the wrong key is the
+        /// security question.
+        NodeProofsMalformed,
+
         /// Reclaim reports the buffer between the storage tiers and the keyspace
         /// notifier could not hold, so the `expired` / `evicted` events for those
         /// keys were never published.

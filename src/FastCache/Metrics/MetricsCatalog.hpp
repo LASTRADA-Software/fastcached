@@ -592,6 +592,34 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
               "else -- that one says one request was too big right now, this says the "
               "surface has no room for another conversation.",
       .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::NodeProofsAccepted,
+      .prometheusName = "fastcache_node_proofs_accepted_total",
+      .help = "Connections admitted by PROVING the cluster key rather than by their source "
+              "address (#1428). The positive half: every other node_proofs row counts a "
+              "refusal, so a fleet where the proof is never taken reads the same on all of "
+              "them as one where it works. Per exchange, never per verb.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::NodeProofsRejected,
+      .prometheusName = "fastcache_node_proofs_rejected_total",
+      .help = "Node proofs that decoded and did not authenticate: a wrong "
+              "--cluster-key-file, or somebody guessing at the fleet's key. The RATE "
+              "separates them. Never sum with scheduler_credentials_rejected -- that is a "
+              "wrong --requirepass, an operator's token, and this is the cluster key every "
+              "member holds.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::NodeProofsUnchallenged,
+      .prometheusName = "fastcache_node_proofs_unchallenged_total",
+      .help = "prove-node frames sent with no challenge outstanding on their connection: "
+              "never asked for one, or already spent one. A client that has the exchange "
+              "wrong, not a security signal -- kept apart from node_proofs_rejected so an "
+              "old client cannot hide a key search.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::NodeProofsMalformed,
+      .prometheusName = "fastcache_node_proofs_malformed_total",
+      .help = "prove-node payloads that would not decode into an id and a tag: a version or "
+              "client-library mismatch, kept apart from node_proofs_rejected for "
+              "scheduler_credentials_malformed's reason.",
+      .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::KeyspaceReclaimEventsDropped,
       .prometheusName = "fastcached_keyspace_reclaim_events_dropped_total",
       .help = "Reclaimed keys whose expired/evicted keyspace event was never published, because "
