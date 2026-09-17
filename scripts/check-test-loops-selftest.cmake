@@ -135,6 +135,113 @@ set(cliCommandFile
 }
 ")
 
+# `src/apps/fastcache-cli/SocketExchange.cpp`'s row: FIVE deliberate infinite loops reading
+# framed replies. Five, because the tally counts SITES and that one file-wide row covers all
+# of them -- a synthetic file with one would leave the baseline four short and read as a
+# miscount in the check rather than in this fixture.
+set(socketExchangeFile
+"void ReadReply(Socket& socket)
+{
+    for (;;)
+    {
+        if (!socket.Read())
+            return;
+    }
+}
+void ReadStatus(Socket& socket)
+{
+    for (;;)
+    {
+        if (socket.Done())
+            break;
+    }
+}
+void ReadFrame(Socket& socket)
+{
+    for (;;)
+        if (socket.Done())
+            return;
+}
+void ReadPush(Socket& socket)
+{
+    for (;;)
+        if (socket.Done())
+            return;
+}
+void Drain(Socket& socket)
+{
+    for (;;)
+        if (socket.Done())
+            return;
+}
+")
+
+# `src/apps/fastcache-compile-node/NodeAnnounce.cpp`'s row: an init that resets the per-round
+# redirect budget and no condition at all, so what ends it is a break inside.
+set(nodeAnnounceFile
+"std::size_t DialAndAnnounce(SchedulerLink& link, IEndpointDialer& dialer)
+{
+    for (link.BeginRound();;)
+    {
+        if (!link.Next())
+            return 0;
+    }
+}
+")
+
+# `src/apps/fastcache-cc/ParallelFor.cpp`'s row: a work-stealing queue over a shared atomic.
+set(parallelForFile
+"void Worker(std::atomic<std::size_t>& next, std::size_t count, Slice slice)
+{
+    for (auto index = next.fetch_add(1, std::memory_order_relaxed); index < count;
+         index = next.fetch_add(1, std::memory_order_relaxed))
+    {
+        slice(index);
+    }
+}
+")
+
+# `src/apps/fastcache-compile-node/NodeToolchains.cpp`'s row: the same work-stealing shape over
+# the survey's entries.
+set(nodeToolchainsFile
+"void Survey(std::atomic<std::size_t>& next, Entries const& entries)
+{
+    for (auto index = next.fetch_add(1); index < entries.size(); index = next.fetch_add(1))
+    {
+        Fingerprint(entries, index);
+    }
+}
+")
+
+# `src/FastCache/Cli/UsageDoc.cpp`'s row: a find-and-REPLACE walk, so each search runs over a
+# string the previous iteration rewrote. Its text names the INIT, because the header this table
+# matches against stops at the second semicolon and the resume is in the increment.
+set(usageDocFile
+"std::string Expand(std::string out, std::string_view token, std::string_view value)
+{
+    for (auto at = out.find(token); at != std::string::npos; at = out.find(token, at + value.size()))
+        out.replace(at, token.size(), value);
+    return out;
+}
+")
+
+# `src/apps/fastcache-cli/DashboardPanel.cpp`'s row: the mutation is on the other side -- the
+# body shortens the view being searched, so the unqualified find always looks from the start of
+# what is left.
+set(dashboardPanelFile
+"std::string Glyphs(std::string_view note, Glyphs const& glyphs)
+{
+    auto text = std::string {};
+    for (auto at = note.find(DeltaMark); at != std::string_view::npos; at = note.find(DeltaMark))
+    {
+        text += note.substr(0, at);
+        text += glyphs.delta;
+        note.remove_prefix(at + DeltaMark.size());
+    }
+    return text;
+}
+")
+
 # ---------------------------------------------------------------------------
 # Stage a tree, apply one mutation, run the check, return its collapsed output.
 function(fastcached_stage_and_run name target from to backlog outOutput outApplied)
@@ -173,8 +280,18 @@ function(fastcached_stage_and_run name target from to backlog outOutput outAppli
         "src/FastCache/Protocol/LiveStreamReactors_test.cpp"
         "src/apps/fastcache-cc/ToolchainProbe.cpp"
         "src/apps/fastcache-cc/ProcessRunner.cpp"
-        "src/apps/fastcache-cli/CliCommand.cpp")
-    set(texts cleanFile helperHeader canaryFile liveFile probeFile runnerFile cliCommandFile)
+        "src/apps/fastcache-cli/CliCommand.cpp"
+        # APPENDED, never inserted: `file<N>` mutation targets are positional, so a new entry
+        # in the middle would silently re-point an existing case at a different file.
+        "src/apps/fastcache-cli/SocketExchange.cpp"
+        "src/apps/fastcache-compile-node/NodeAnnounce.cpp"
+        "src/apps/fastcache-cc/ParallelFor.cpp"
+        "src/apps/fastcache-compile-node/NodeToolchains.cpp"
+        "src/FastCache/Cli/UsageDoc.cpp"
+        "src/apps/fastcache-cli/DashboardPanel.cpp")
+    set(texts cleanFile helperHeader canaryFile liveFile probeFile runnerFile cliCommandFile
+              socketExchangeFile nodeAnnounceFile parallelForFile nodeToolchainsFile
+              usageDocFile dashboardPanelFile)
     list(LENGTH files stagedCount)
     math(EXPR lastStaged "${stagedCount} - 1")
     foreach(index RANGE 0 ${lastStaged})
@@ -285,12 +402,12 @@ endfunction()
 set(FastCachedTestLoopCases
     # The baseline, in both enumeration modes. Every refusal below is evidence only if
     # these pass -- and they pass only while every exemption row still matches its site.
-    "baseline via walk|none|-|-|no new C-style loop && directory walk (no git index) && 8 exempted site(s) in 6 row(s)|CMake Error|-"
+    "baseline via walk|none|-|-|no new C-style loop && directory walk (no git index) && 18 exempted site(s) in 12 row(s)|CMake Error|-"
     "baseline via git|none-git|-|-|no new C-style loop && git ls-files|CMake Error|-"
     # A tree inside another checkout is walked, not read from that checkout's index, which
     # knows none of it. Asking "inside a work tree" instead of "at its top" refused every
     # case when ctest staged them under the gate's build directory.
-    "baseline nested in another checkout|none-nested|-|-|no new C-style loop && directory walk (no git index) && 8 exempted site(s) in 6 row(s)|CMake Error|-"
+    "baseline nested in another checkout|none-nested|-|-|no new C-style loop && directory walk (no git index) && 18 exempted site(s) in 12 row(s)|CMake Error|-"
     "a counting loop nested in another checkout|newfile-nested|src/FastCache/Core/Fresh_test.cpp|int F()~n~{~n~    for (int i = 0~sc~ i < 3~sc~ ++i)~n~        Use(i)~sc~~n~}~n~|src/FastCache/Core/Fresh_test.cpp:3: a C-style for loop && directory walk (no git index)|-|-"
 
     # THE RED ARM.
