@@ -454,7 +454,7 @@ struct StorageBackendBundle
 
     if (!usingPersistent)
     {
-        for (std::size_t i = 0; i < physicalShards; ++i)
+        for ([[maybe_unused]] auto const i: std::views::iota(std::size_t { 0 }, physicalShards))
             inners.emplace_back(MakeL1(effective, perShardBytes));
         return inners;
     }

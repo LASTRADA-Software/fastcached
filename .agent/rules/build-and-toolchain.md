@@ -5940,6 +5940,48 @@ The seam's own existence is the ANCHOR: with `Enumerators` gone from the header 
 REFUSES rather than reporting a clean tree, because *no violations* and *the rule no longer
 applies* are different answers and only one of them is good news.
 
+## A C-style loop is classified by its BODY, and four shapes are not convertible
+
+#1452 converts the three-clause form across `src/`, and **the head is not a classifier.** Of
+the 134 backlogged sites, 78 are mechanical and 56 are not, and nothing about a head says which.
+The four that are not, in the order they cost the most:
+
+- **The body ADVANCES the loop variable**, to consume an escaped character, a continuation or a
+  length prefix — `CompileCache/PathCanon.cpp:558`, `Protocol/RedisResp.cpp:1487`,
+  `Cli/UsageTestUtils.hpp:27` and three in `apps/fastcache-cc/DirectManifest.cpp`. In a range-for
+  that `++i` advances the ITERATION'S COPY, so the second character is consumed as data. Not a
+  crash: in `DirectManifest` it mis-splits a dependency path on `\ `, which is **a wrong cache
+  key**. **And `auto i` compiles silently** — only `auto const i` is refused, by
+  `error: increment of read-only variable 'i'`, so the careful spelling is the one that fails
+  loudly and the careless one ships.
+- **A CALLEE advances it through `std::size_t&`**, which no body scan can see:
+  `Cli/Options.hpp:720` and `apps/fastcache-cli/CliCommand.cpp:690` pass their index to
+  `ApplyOneOption`, `Config/FileOptions.hpp:174` to `TakeValue`. Both consume an option's VALUE,
+  so a conversion makes every `--key value` flag re-read its value as the next token — across
+  argv, the launcher's flags and the config-FILE appliers at once, silent for boolean flags.
+  This is the shape that survives a careful reading of the loop.
+- **An INCLUSIVE bound.** `iota` is half-open, so `hop <= MaxRedirects` is `iota(0, N + 1)` and
+  the obvious conversion follows one redirect fewer (`apps/fastcache-compile-node/EnrollClient.cpp:317`,
+  `CowTree/FilePageStore.cpp:372`).
+- **A COMPOUND bound.** Two clauses are not one range: three sites want `iota(0, min(a, b))`, and
+  `Net/EpollSocket.cpp:127` / `Net/KqueueSocket.cpp:121` are `iovec` batch builders where the
+  second clause is a budget rather than a bound, so converting on the first alone overruns a write.
+
+**Every one of these was first classified as mechanical**, by three successive versions of the
+classifier — comments unstripped (a `;` inside `// … itself; drop it` truncated an unbraced
+body), no inclusive verdict, no escaping verdict. They failed the same way each time, and that
+direction is structural rather than unlucky: **a text scan fails toward "nothing unusual here",
+so every gap in one lands in the bucket whose sites get converted without being read.** A
+classifier for this therefore fails CLOSED and names the callee, and it refuses to print any
+count until it reproduces a hand-read site per verdict — the figures are otherwise
+unfalsifiable, and the first probe for inclusive bounds answered *0 sites* over an empty file
+list with no control.
+
+`std::views::iota` is the target, NOT the `Ranges::` seam — `check-ranges-seam.cmake` states it
+is deliberately outside it. For argv, the target is `std::span<char* const>{argv, argc}.subspan(1)`,
+because argv is the raw array `std::span` exists for and an `iota(1, argc)` still indexes a bare
+pointer.
+
 ## Open work
 
 - **[#1432](https://github.com/LASTRADA-Software/fastcached/issues/1432)** — SHA-256 hardware

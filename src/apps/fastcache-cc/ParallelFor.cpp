@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstddef>
+#include <ranges>
 #include <thread>
 #include <vector>
 
@@ -13,7 +14,7 @@ namespace FastCache::Cc
 bool SerialParallelFor::Run(std::size_t count, std::function<void(std::size_t)> const& slice)
 {
     auto ok = true;
-    for (std::size_t index = 0; index < count; ++index)
+    for (auto const index: std::views::iota(std::size_t { 0 }, count))
     {
         try
         {
@@ -82,7 +83,7 @@ bool ThreadedParallelFor::Run(std::size_t count, std::function<void(std::size_t)
         }
     };
 
-    for (std::size_t spawned = 0; spawned < width; ++spawned)
+    for ([[maybe_unused]] auto const spawned: std::views::iota(std::size_t { 0 }, width))
         workers.emplace_back(worker);
     for (auto& thread: workers)
         thread.join();

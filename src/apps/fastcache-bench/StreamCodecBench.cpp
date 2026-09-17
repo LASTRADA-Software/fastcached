@@ -28,6 +28,7 @@
 #include <cstdint>
 #include <format>
 #include <iostream>
+#include <ranges>
 #include <string>
 #include <vector>
 
@@ -57,11 +58,11 @@ constexpr std::uint32_t BenchFieldsPerEntry = 4;
     StreamCodec::Stream stream;
     stream.entriesAdded = BenchEntries;
     stream.lastId = StreamCodec::StreamId { .ms = BenchEntries, .seq = 0 };
-    for (auto i = std::uint32_t { 0 }; i < BenchEntries; ++i)
+    for (auto const i: std::views::iota(std::uint32_t { 0 }, BenchEntries))
     {
         StreamCodec::StreamEntry entry;
         entry.id = StreamCodec::StreamId { .ms = i, .seq = 0 };
-        for (auto f = std::uint32_t { 0 }; f < BenchFieldsPerEntry; ++f)
+        for ([[maybe_unused]] auto const f: std::views::iota(std::uint32_t { 0 }, BenchFieldsPerEntry))
             entry.fields.emplace_back(std::format("f{}", f), std::format("v{}", f));
         stream.entries.push_back(std::move(entry));
     }

@@ -196,7 +196,7 @@ std::expected<DirectManifest, DirectError> DecodeManifest(std::string_view bytes
     // translation unit, and are worth reserving for -- while a minimum-size hostile
     // blob is clamped to at most its own size rather than eight times it.
     manifest.entries.reserve(std::min<std::size_t>(count, cursor.CapacityFor(sizeof(DirectManifest::Entry))));
-    for (std::uint32_t index = 0; index < count; ++index)
+    for ([[maybe_unused]] auto const index: std::views::iota(std::uint32_t { 0 }, count))
     {
         DirectManifest::Entry entry;
         if (!cursor.ReadField(entry.canonicalPath) || !cursor.ReadField(entry.contentHash))
