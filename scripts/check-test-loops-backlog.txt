@@ -44,7 +44,7 @@
 # they cannot drift from the rows.
 
 loop|src/CowTree/CowTree/Crc32c.cpp|2|#1452
-loop|src/CowTree/CowTree/FilePageStore.cpp|2|#1452
+loop|src/CowTree/CowTree/FilePageStore.cpp|1|#1452
 loop|src/FastCache/Cache/CacheEngine.cpp|3|#1452
 loop|src/FastCache/Cli/UsageTestUtils.hpp|1|#1452
 loop|src/FastCache/Cluster/ClusterState.cpp|2|#1452
@@ -52,7 +52,6 @@ loop|src/FastCache/CompileCache/PathCanon.cpp|2|#1452
 loop|src/FastCache/Config/DefaultConfigPath.cpp|1|#1452
 loop|src/FastCache/Config/EnvExpand.cpp|1|#1452
 loop|src/FastCache/Consensus/FileRaftStorage.cpp|1|#1452
-loop|src/FastCache/Consensus/RaftClusterHarness.hpp|2|#1452
 loop|src/FastCache/Core/Base64.cpp|3|#1452
 loop|src/FastCache/Distributed/FleetChart.cpp|1|#1452
 loop|src/FastCache/Distributed/FleetHistory.cpp|1|#1452
@@ -71,7 +70,6 @@ loop|src/FastCache/Protocol/StreamWaiterRegistry.cpp|2|#1452
 loop|src/FastCache/Server/AdminHttpServer.cpp|1|#1452
 loop|src/apps/fastcache-cc/DirectManifest.cpp|3|#1452
 loop|src/apps/fastcache-cc/main.cpp|1|#1452
-loop|src/apps/fastcache-compile-node/EnrollClient.cpp|1|#1452
 loop|src/apps/fastcache-compile-node/FrameEndpoint.cpp|1|#1452
 loop|src/apps/fastcache-compile-node/ScratchClaim.cpp|1|#1452
 loop|src/apps/fastcached/main.cpp|1|#1452

@@ -1501,13 +1501,12 @@ what differs between compilers, standard libraries, hosts and tool versions.
   opening estimate was 78 of 134 mechanical; the outcome is **68**, and of the 66 that remain
   exactly NONE is. That ten-site gap is this rule charging its own price — ten heads that read
   mechanical over bodies that are not — so treat a head-shaped verdict as a CANDIDATE and never
-  as a clearance. **Six shapes are not convertible**, and the last two were found only by
+  as a clearance. **Five shapes are not convertible**, and the last two were found only by
   reading:
   - the body ADVANCES the variable (a range-for advances a COPY, and `auto i` compiles while
     only `auto const i` is refused — a wrong cache key in `DirectManifest`);
   - a CALLEE advances it through `std::size_t&` (`ApplyOneOption`, `TakeValue` — invisible to any
     body scan, and it breaks every `--key value` flag);
-  - an INCLUSIVE bound (`iota` is half-open, so `<= N` is `N + 1`);
   - a COMPOUND bound (two clauses are not one range; on the `iovec` builders the second is a
     budget);
   - the induction variable OUTLIVES the loop — `RedisResp.cpp` declares `i` above two sibling
@@ -1516,9 +1515,18 @@ what differs between compilers, standard libraries, hosts and tool versions.
   - a find-and-erase wearing a loop, which wants `ranges::find_if` and an erase rather than a
     range-for — an ALGORITHM substitution, so `Core/Ranges.hpp`'s `FindOrNull` / `FindIfOrNull`.
 
-  All of them were first classified mechanical, because **a text scan fails toward "nothing
-  unusual here"** — so such a classifier fails CLOSED and prints no count until it reproduces a
-  hand-read site per verdict. Target `std::views::iota`, never the `Ranges::` seam; for argv,
+  **An INCLUSIVE bound is not on that list, and it was until this was measured.** `i <= N` is
+  `iota(first, N + 1)` and a DESCENDING loop is that range through `views::reverse`, which
+  `DashboardPanel_test.cpp` already spells four times. What it needs is a stated premise rather
+  than an exemption: that `N + 1` cannot overflow, and that the range is EMPTY where the loop
+  ran zero times — which is the case an `iota` whose start is not zero gets wrong. Listing it as
+  non-convertible sent four sites toward a permanent exemption they did not need, and
+  **overstating what is wrong is the same defect as understating it, with the worse failure
+  mode: an under-report is silent, an over-report is loud and misattributed.**
+
+  All of the shapes above were first classified mechanical, because **a text scan fails toward
+  "nothing unusual here"** — so such a classifier fails CLOSED and prints no count until it
+  reproduces a hand-read site per verdict. Target `std::views::iota`, never the `Ranges::` seam; for argv,
   `std::span{argv, argc}.subspan(1)`. A loop the remedy does not FIT takes an exemption row with
   its reason, never a backlog row: a `for (;;)` on a list of loops to convert is a permanently
   false to-do, and the check prints the exempted total on every run so the decision stays
