@@ -44,8 +44,7 @@
 # they cannot drift from the rows.
 
 loop|src/CowTree/CowTree/Crc32c.cpp|2|#1452
-loop|src/CowTree/CowTree/FilePageStore.cpp|5|#1452
-loop|src/CowTree/CowTree/PageLayout.cpp|2|#1452
+loop|src/CowTree/CowTree/FilePageStore.cpp|2|#1452
 loop|src/FastCache/Cache/CacheEngine.cpp|3|#1452
 loop|src/FastCache/Cli/UsageDoc.cpp|1|#1452
 loop|src/FastCache/Cli/UsageTestUtils.hpp|1|#1452
@@ -54,7 +53,7 @@ loop|src/FastCache/CompileCache/PathCanon.cpp|2|#1452
 loop|src/FastCache/Config/DefaultConfigPath.cpp|1|#1452
 loop|src/FastCache/Config/EnvExpand.cpp|1|#1452
 loop|src/FastCache/Consensus/FileRaftStorage.cpp|1|#1452
-loop|src/FastCache/Consensus/RaftClusterHarness.hpp|5|#1452
+loop|src/FastCache/Consensus/RaftClusterHarness.hpp|2|#1452
 loop|src/FastCache/Core/Base64.cpp|3|#1452
 loop|src/FastCache/Distributed/FleetChart.cpp|1|#1452
 loop|src/FastCache/Distributed/FleetHistory.cpp|1|#1452
@@ -66,9 +65,8 @@ loop|src/FastCache/Net/SocketAddress.cpp|1|#1452
 loop|src/FastCache/Net/UdpSocket.cpp|1|#1452
 loop|src/FastCache/Platform/LocalAddresses.cpp|4|#1452
 loop|src/FastCache/Protocol/CompileCacheWire.hpp|1|#1452
-loop|src/FastCache/Protocol/Framing/LineReader.cpp|1|#1452
 loop|src/FastCache/Protocol/PubSubRegistry.cpp|2|#1452
-loop|src/FastCache/Protocol/RedisResp.cpp|13|#1452
+loop|src/FastCache/Protocol/RedisResp.cpp|9|#1452
 loop|src/FastCache/Protocol/RedisTransaction.cpp|1|#1452
 loop|src/FastCache/Protocol/StreamWaiterRegistry.cpp|2|#1452
 loop|src/FastCache/Server/AdminHttpServer.cpp|1|#1452

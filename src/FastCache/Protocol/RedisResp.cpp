@@ -3229,7 +3229,7 @@ namespace
     {
         cursors.clear();
         cursors.reserve(req.keys.size());
-        for (auto k = std::size_t { 0 }; k < req.keys.size(); ++k)
+        for (auto const k: std::views::iota(std::size_t { 0 }, req.keys.size()))
         {
             auto const& idArg = req.idArgs[k];
             if (idArg == "$")
@@ -3287,7 +3287,7 @@ namespace
         }
         else if (!co_await ReplyAggregateHeader(socket, Aggregate::Array, present, resp))
             co_return false;
-        for (auto k = std::size_t { 0 }; k < keys.size(); ++k)
+        for (auto const k: std::views::iota(std::size_t { 0 }, keys.size()))
         {
             if (!includeEmpty && perKey[k].empty())
                 continue;
@@ -3319,7 +3319,7 @@ namespace
         perKey.clear();
         perKey.reserve(req.keys.size());
         std::size_t total = 0;
-        for (auto k = std::size_t { 0 }; k < req.keys.size(); ++k)
+        for (auto const k: std::views::iota(std::size_t { 0 }, req.keys.size()))
         {
             auto entries = engine->StreamRead(req.keys[k], cursors[k], static_cast<std::size_t>(req.count));
             if (!entries.has_value())
@@ -3708,7 +3708,7 @@ namespace
             perKey.clear();
             perKey.reserve(req.keys.size());
             std::size_t total = 0;
-            for (auto k = std::size_t { 0 }; k < req.keys.size(); ++k)
+            for (auto const k: std::views::iota(std::size_t { 0 }, req.keys.size()))
             {
                 auto entries = engine->StreamReadGroup(
                     req.keys[k], group, consumer, afters[k], static_cast<std::size_t>(req.count), noAck);
