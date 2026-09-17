@@ -274,6 +274,31 @@ AnnounceOutcome AnnounceOnce(HeartbeatRound const& round, ISocket& client, std::
 
 std::size_t AnnounceRound(HeartbeatRound const& round, SchedulerLink& link, IEndpointDialer& dialer)
 {
+    /// The worker's announcement: registrations, withdrawals and the proof, as `AnnounceOnce`
+    /// has always done them. A thin adapter so the dial rules below are reached by one path.
+    class WorkerAnnouncement final: public IAnnouncement
+    {
+      public:
+        explicit WorkerAnnouncement(HeartbeatRound const& round) noexcept:
+            _round { round }
+        {
+        }
+
+        [[nodiscard]] AnnounceOutcome Attempt(ISocket& client, std::string_view endpoint) override
+        {
+            return AnnounceOnce(_round, client, endpoint);
+        }
+
+      private:
+        HeartbeatRound const& _round;
+    };
+
+    WorkerAnnouncement announcement { round };
+    return DialAndAnnounce(link, dialer, round.logger, announcement);
+}
+
+std::size_t DialAndAnnounce(SchedulerLink& link, IEndpointDialer& dialer, ILogger& logger, IAnnouncement& announcement)
+{
     for (link.BeginRound();;)
     {
         auto client = dialer.Dial(link.Target(), DialOptions { .connectTimeout = HeartbeatConnectTimeout });
@@ -284,10 +309,10 @@ std::size_t AnnounceRound(HeartbeatRound const& round, SchedulerLink& link, IEnd
             // went next, which "the configured endpoint" no longer identifies (#1310).
             auto const unreachable = link.Target();
             auto const next = link.Lost();
-            round.logger.Logf(LogLevel::Warn,
-                              "scheduler {} unreachable{}",
-                              unreachable,
-                              next.has_value() ? std::format("; trying {}", *next) : std::string {});
+            logger.Logf(LogLevel::Warn,
+                        "scheduler {} unreachable{}",
+                        unreachable,
+                        next.has_value() ? std::format("; trying {}", *next) : std::string {});
             // Another configured endpoint is tried now rather than a heartbeat interval
             // from now: this machine is out of the fleet for as long as it takes, and a
             // configured endpoint is the one still standing after an election the
@@ -298,7 +323,7 @@ std::size_t AnnounceRound(HeartbeatRound const& round, SchedulerLink& link, IEnd
             continue;
         }
 
-        auto const outcome = AnnounceOnce(round, *client, link.Target());
+        auto const outcome = announcement.Attempt(*client, link.Target());
         if (!outcome.leader.has_value())
         {
             // Committed only when this endpoint actually took an entry. It answered
@@ -316,15 +341,15 @@ std::size_t AnnounceRound(HeartbeatRound const& round, SchedulerLink& link, IEnd
             continue;
         }
 
-        round.logger.Logf(
+        logger.Logf(
             LogLevel::Info, "scheduler {} is not the leader; announcing to {} instead", link.Target(), *outcome.leader);
         if (!link.Redirect(*outcome.leader))
         {
             // Two schedulers naming each other, or a leader that moved again
             // mid-chain. Costs this round rather than the thread.
-            round.logger.Logf(LogLevel::Warn,
-                              "gave up following leader redirects after {} hop(s); retrying next heartbeat",
-                              MaxAnnounceRedirects);
+            logger.Logf(LogLevel::Warn,
+                        "gave up following leader redirects after {} hop(s); retrying next heartbeat",
+                        MaxAnnounceRedirects);
             return 0;
         }
     }
