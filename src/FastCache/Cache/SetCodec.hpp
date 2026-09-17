@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <ranges>
 #include <span>
 #include <string>
 #include <vector>
@@ -149,7 +150,7 @@ constexpr std::size_t MinMemberBytes = WireFields::FieldPrefixSize;
     // decode to `count` strings and reach the same 8x, with or without a reserve. The
     // ceiling there is the value size the storage tier accepted, not this loop, and
     // capping the member count is a separate decision from validating the claim.
-    for (auto i = std::uint32_t { 0 }; i < count; ++i)
+    for ([[maybe_unused]] auto const i: std::views::iota(std::uint32_t { 0 }, count))
     {
         std::string member;
         if (!cursor.ReadField(member))

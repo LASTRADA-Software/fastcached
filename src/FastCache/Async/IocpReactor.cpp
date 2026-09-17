@@ -280,7 +280,7 @@ void IocpReactor::RunLoop()
         }
 
         bool stopRequested = false;
-        for (ULONG i = 0; i < removed; ++i)
+        for (auto const i: std::views::iota(ULONG { 0 }, removed))
         {
             auto const& entry = entries[i];
             if (entry.lpCompletionKey == KeyStop)

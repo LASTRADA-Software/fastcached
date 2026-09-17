@@ -13,6 +13,7 @@
 #include <expected>
 #include <format>
 #include <optional>
+#include <ranges>
 #include <span>
 #include <string>
 #include <string_view>
@@ -348,7 +349,7 @@ namespace detail
     // cannot move it. All five counted runs below reserve the same way, and the
     // argument -- with the measurement that picked the cap -- is on `ReserveCapped`.
     detail::ReserveCapped(out.entries, entryCount);
-    for (auto i = std::uint32_t { 0 }; i < entryCount; ++i)
+    for ([[maybe_unused]] auto const i: std::views::iota(std::uint32_t { 0 }, entryCount))
     {
         StreamEntry entry;
         if (!detail::ReadId(r, entry.id))
@@ -357,7 +358,7 @@ namespace detail
         if (!r.ReadCount(fieldCount, detail::MinFieldBytes))
             return malformed("field count claims more fields than the remaining bytes could hold");
         detail::ReserveCapped(entry.fields, fieldCount);
-        for (auto f = std::uint32_t { 0 }; f < fieldCount; ++f)
+        for ([[maybe_unused]] auto const f: std::views::iota(std::uint32_t { 0 }, fieldCount))
         {
             std::string name;
             std::string value;
@@ -371,7 +372,7 @@ namespace detail
     if (!r.ReadCount(groupCount, detail::MinGroupBytes))
         return malformed("group count claims more groups than the remaining bytes could hold");
     detail::ReserveCapped(out.groups, groupCount);
-    for (auto g = std::uint32_t { 0 }; g < groupCount; ++g)
+    for ([[maybe_unused]] auto const g: std::views::iota(std::uint32_t { 0 }, groupCount))
     {
         ConsumerGroup group;
         if (!r.ReadField(group.name) || !detail::ReadId(r, group.lastDelivered) || !r.ReadU64(group.entriesRead))
@@ -380,7 +381,7 @@ namespace detail
         if (!r.ReadCount(consumerCount, detail::MinConsumerBytes))
             return malformed("consumer count claims more consumers than the remaining bytes could hold");
         detail::ReserveCapped(group.consumers, consumerCount);
-        for (auto c = std::uint32_t { 0 }; c < consumerCount; ++c)
+        for ([[maybe_unused]] auto const c: std::views::iota(std::uint32_t { 0 }, consumerCount))
         {
             std::string consumer;
             if (!r.ReadField(consumer))
@@ -391,7 +392,7 @@ namespace detail
         if (!r.ReadCount(pelCount, detail::MinPendingBytes))
             return malformed("pending count claims more entries than the remaining bytes could hold");
         detail::ReserveCapped(group.pel, pelCount);
-        for (auto p = std::uint32_t { 0 }; p < pelCount; ++p)
+        for ([[maybe_unused]] auto const p: std::views::iota(std::uint32_t { 0 }, pelCount))
         {
             PendingEntry pending;
             if (!detail::ReadId(r, pending.id) || !r.ReadU64(pending.deliveryTimeMs) || !r.ReadU64(pending.deliveryCount)

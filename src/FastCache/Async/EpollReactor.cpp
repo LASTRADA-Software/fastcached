@@ -240,7 +240,7 @@ void EpollReactor::Detach(EpollFdHandler* handler) const noexcept
     // The whole array is scanned, including entries already dispatched: nulling
     // one of those is a no-op, and it keeps this free of an off-by-one against
     // the loop's cursor.
-    for (int i = 0; i < _batch.count; ++i)
+    for (auto const i: std::views::iota(0, _batch.count))
     {
         if (_batch.events[i].data.ptr == handler)
             _batch.events[i].data.ptr = WithdrawnBatchEntry();
@@ -367,7 +367,7 @@ void EpollReactor::RunLoop()
         // Detach outside the loop scans nothing.
         _batch = DequeuedBatch { .events = events, .count = n };
 
-        for (int i = 0; i < n; ++i)
+        for (auto const i: std::views::iota(0, n))
         {
             auto const& ev = events[i];
             if (ev.data.ptr == WithdrawnBatchEntry())

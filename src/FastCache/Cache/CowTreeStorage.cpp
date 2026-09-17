@@ -18,6 +18,7 @@
 #include <format>
 #include <limits>
 #include <optional>
+#include <ranges>
 #include <span>
 #include <string_view>
 #include <tuple>
@@ -1084,7 +1085,7 @@ std::expected<CowTree::PageId, StorageError> CowTreeStorage::WriteOverflowChain(
         for (auto const id: ids)
             std::ignore = _store->Free(id);
     };
-    for (std::size_t i = 0; i < pageCount; ++i)
+    for ([[maybe_unused]] auto const i: std::views::iota(std::size_t { 0 }, pageCount))
     {
         auto allocated = _store->Allocate();
         if (!allocated.has_value())
@@ -1095,7 +1096,7 @@ std::expected<CowTree::PageId, StorageError> CowTreeStorage::WriteOverflowChain(
         ids.push_back(*allocated);
     }
 
-    for (std::size_t i = 0; i < pageCount; ++i)
+    for (auto const i: std::views::iota(std::size_t { 0 }, pageCount))
     {
         auto const offset = i * payloadPerPage;
         auto const chunkLen = std::min(payloadPerPage, value.size() - offset);

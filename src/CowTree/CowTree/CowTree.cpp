@@ -447,7 +447,7 @@ auto CowTree::WriteLeaf(WriteTxn& txn, std::span<std::pair<std::vector<std::byte
     // overflow. Guarantee both halves are non-empty.
     std::size_t splitIndex = 0;
     std::size_t leftBytes = 0;
-    for (std::size_t i = 0; i < entries.size(); ++i)
+    for (auto const i: std::views::iota(std::size_t { 0 }, entries.size()))
     {
         auto const need = LeafEntryBytes(entries[i].first.size(), entries[i].second.size());
         if (leftBytes + need > capacity && i > 0)
@@ -520,7 +520,7 @@ auto CowTree::WriteInternal(WriteTxn& txn,
     // Split: walk forward; one entry "moves up" as the separator.
     std::size_t splitIndex = 0;
     std::size_t leftBytes = 0;
-    for (std::size_t i = 0; i < entries.size(); ++i)
+    for (auto const i: std::views::iota(std::size_t { 0 }, entries.size()))
     {
         auto const need = InternalEntryBytes(entries[i].first.size());
         if (leftBytes + need > capacity && i > 0)
@@ -648,7 +648,7 @@ auto CowTree::PutRec(WriteTxn& txn, PageId node, BytesView key, BytesView value)
     //             existingOwned[i].second contains keys in [existingOwned[i].first, existingOwned[i+1].first)
     // childIndex == std::nullopt means "use firstChildSnapshot".
     std::optional<std::size_t> childIndex;
-    for (std::size_t i = 0; i < existingOwned.size(); ++i)
+    for (auto const i: std::views::iota(std::size_t { 0 }, existingOwned.size()))
     {
         if (CompareBytes(View(existingOwned[i].first), key) <= 0)
             childIndex = i;
@@ -671,7 +671,7 @@ auto CowTree::PutRec(WriteTxn& txn, PageId node, BytesView key, BytesView value)
     if (!childIndex.has_value())
         newFirstChild = sub->left;
 
-    for (std::size_t i = 0; i < existingOwned.size(); ++i)
+    for (auto const i: std::views::iota(std::size_t { 0 }, existingOwned.size()))
     {
         PageId childPtr = existingOwned[i].second;
         if (childIndex.has_value() && i == *childIndex)
@@ -765,7 +765,7 @@ auto CowTree::EraseRec(WriteTxn& txn, PageId node, BytesView key) -> std::expect
 
     // childIndex == std::nullopt means "use firstChildSnapshot".
     std::optional<std::size_t> childIndex;
-    for (std::size_t i = 0; i < existingOwned.size(); ++i)
+    for (auto const i: std::views::iota(std::size_t { 0 }, existingOwned.size()))
     {
         if (CompareBytes(View(existingOwned[i].first), key) <= 0)
             childIndex = i;
@@ -799,13 +799,13 @@ auto CowTree::EraseRec(WriteTxn& txn, PageId node, BytesView key) -> std::expect
             if (existingOwned.empty())
                 return EraseResult { .left = PageId::None(), .erased = true };
             newFirstChild = existingOwned[0].second;
-            for (std::size_t i = 1; i < existingOwned.size(); ++i)
+            for (auto const i: std::views::iota(std::size_t { 1 }, existingOwned.size()))
                 entries.emplace_back(std::move(existingOwned[i].first), existingOwned[i].second);
         }
         else
         {
             // Drop existingOwned[*childIndex].
-            for (std::size_t i = 0; i < existingOwned.size(); ++i)
+            for (auto const i: std::views::iota(std::size_t { 0 }, existingOwned.size()))
             {
                 if (i == *childIndex)
                     continue;
@@ -818,7 +818,7 @@ auto CowTree::EraseRec(WriteTxn& txn, PageId node, BytesView key) -> std::expect
         // Rebuild with updated child pointer.
         if (!childIndex.has_value())
             newFirstChild = sub->left;
-        for (std::size_t i = 0; i < existingOwned.size(); ++i)
+        for (auto const i: std::views::iota(std::size_t { 0 }, existingOwned.size()))
         {
             PageId childPtr = existingOwned[i].second;
             if (childIndex.has_value() && i == *childIndex)

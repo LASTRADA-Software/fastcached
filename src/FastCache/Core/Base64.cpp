@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <ranges>
 
 namespace FastCache
 {
@@ -54,16 +55,16 @@ std::string Base64Encode(std::span<std::byte const> bytes)
         auto const present = std::min<std::size_t>(3, bytes.size() - i);
 
         std::uint32_t group = 0;
-        for (std::size_t j = 0; j < 3; ++j)
+        for (auto const j: std::views::iota(std::size_t { 0 }, std::size_t { 3 }))
             group = (group << 8) | (j < present ? std::to_integer<std::uint32_t>(bytes[i + j]) : 0);
 
         // Three input bytes are four symbols; two are three; one is two. The spare
         // low bits of a short group are zero because they were shifted in as zero
         // above, which is exactly the property `Base64Decode` refuses an input for
         // getting wrong.
-        for (std::size_t j = 0; j < present + 1; ++j)
+        for (auto const j: std::views::iota(std::size_t { 0 }, present + 1))
             out.push_back(Alphabet[(group >> (18 - (6 * j))) & 0x3F]);
-        for (std::size_t j = present + 1; j < 4; ++j)
+        for ([[maybe_unused]] auto const j: std::views::iota(present + 1, std::size_t { 4 }))
             out.push_back('=');
     }
 
@@ -103,7 +104,7 @@ std::optional<std::string> Base64Decode(std::string_view text)
         auto const groupPadding = isLastGroup ? padding : 0;
 
         std::uint32_t group = 0;
-        for (std::size_t j = 0; j < 4; ++j)
+        for (auto const j: std::views::iota(std::size_t { 0 }, std::size_t { 4 }))
         {
             auto const ch = text[i + j];
             if (ch == '=' && isLastGroup && j >= 4 - groupPadding)
