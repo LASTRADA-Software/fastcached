@@ -1140,7 +1140,14 @@ using Node::NodeReloader;
                                                                                   .identity = &nodeStatus,
                                                                                   .fleet = fleetSources,
                                                                                   .history = &sampler,
-                                                                                  .endpoint = advertise } };
+                                                                                  .endpoint = advertise,
+                                                                                  // The same set the admin endpoint
+                                                                                  // renders from, derived from one
+                                                                                  // function so a subscriber and a
+                                                                                  // scrape cannot disagree about
+                                                                                  // which rows this node can write.
+                                                                                  .surfaces =
+                                                                                      Node::NodeServedSurfacesFor(cfg) } };
     auto const liveSourcesAttached = liveSources.Attach(nodeLiveSources);
 
     auto surfaceOrRefusal = Node::StartAdminSurfaceOrExplain(

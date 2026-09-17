@@ -606,4 +606,60 @@ SurfaceReport ReportSurfaces(NodeConfig const& cfg)
     return SurfaceReport { .text = RenderSurfaces(cfg), .refusal = StartupPolicyRejection(cfg) };
 }
 
+ServedSurfaces NodeServedSurfacesFor(NodeConfig const& cfg)
+{
+    // A TABLE rather than ten `push_back`s behind ten `if`s, so adding a surface is adding a
+    // row and the predicate sits beside the thing it decides. The three `false` rows are the
+    // point of the table rather than noise in it: they are the surfaces a compile node can
+    // never serve, and stating them is what makes this a complete answer instead of a list of
+    // the ones somebody remembered.
+    //
+    // Each predicate is the SAME one that decides whether the component is constructed, never
+    // a second reading of the flags -- a surface set that disagrees with what `main` built is
+    // exactly the silent absence this is meant to prevent.
+    struct Row
+    {
+        MetricsSurface surface;
+        bool served;
+    };
+
+    // `--serve-scheduler` is read directly because `main` has no predicate for it: it builds
+    // the tier under `if (cfg.serveScheduler)`. Enrollment repeats `ServesEnrollment`'s two
+    // clauses for the same reason -- that helper takes a started tier, which does not exist
+    // when a scrape asks this question.
+    auto const servesScheduler = cfg.serveScheduler;
+    std::array const rows {
+        // Never: this binary constructs no `Server`/`ReactorServerLoop`, so
+        // `fastcached_connections_*` read absent rather than as a node nobody has connected to.
+        Row { .surface = MetricsSurface::CacheAcceptPath, .served = false },
+        // Never: no `CacheEngine`, so nothing here expires or reclaims.
+        Row { .surface = MetricsSurface::CacheStorage, .served = false },
+        // Never: the DAEMON's `0xFC` executor. The node's own door is `NodeFrameEndpoint`.
+        Row { .surface = MetricsSurface::CacheCompileSurface, .served = false },
+        // Always: `main` constructs `LiveStatsResponder` unconditionally.
+        Row { .surface = MetricsSurface::LiveStats, .served = true },
+        // Always: the shared frame listener is what a compile node IS.
+        Row { .surface = MetricsSurface::NodeFrameEndpoint, .served = true },
+        Row { .surface = MetricsSurface::ConsensusPeerWire, .served = RunsConsensus(cfg) },
+        Row { .surface = MetricsSurface::CompileScheduler, .served = servesScheduler },
+        Row { .surface = MetricsSurface::CompileWorker, .served = RunsWorker(cfg) },
+        Row { .surface = MetricsSurface::NodeCacheTier, .served = ConfiguresCacheTier(cfg) },
+        Row { .surface = MetricsSurface::NodeEnrollment, .served = RunsConsensus(cfg) && servesScheduler },
+    };
+    static_assert(rows.size() == EnumeratorCount<MetricsSurface>,
+                  "every MetricsSurface needs a row here: a surface omitted is answered 'not "
+                  "served', which renders its counters absent on a node that does serve it");
+
+    // `.count = 0` EXPLICITLY. A default-constructed `ServedSurfaces` means *not narrowed* and
+    // therefore holds every surface, so a default-constructed accumulator starts at count 10
+    // and the first append runs off the end. It did: `array::at` threw on a node-status case,
+    // which is the one place a bounds-checked `at` earns its keep over `[]` -- the unchecked
+    // form would have written past the array and reported a wrong surface set instead.
+    ServedSurfaces out { .storage = {}, .count = 0 };
+    for (auto const& row: rows)
+        if (row.served)
+            out.storage.at(out.count++) = row.surface;
+    return out;
+}
+
 } // namespace FastCache::Node

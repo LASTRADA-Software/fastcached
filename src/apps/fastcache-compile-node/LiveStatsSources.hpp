@@ -42,6 +42,15 @@ struct NodeLiveStatsParts
 
     /// Where this node's `0xFC` surface answers.
     std::string endpoint {};
+
+    /// Which metrics surfaces this node serves, so a subscriber sees the same absences a
+    /// scrape does.
+    ///
+    /// Held BY VALUE, and `NodeLiveStatsSources` holds these parts by value in turn, so the
+    /// span handed to `CaptureStatsReading` borrows from storage that outlives the capture.
+    /// It was a `constexpr` global until #1501, which outlived everything for free; the
+    /// question only became askable when the set started depending on flags.
+    ServedSurfaces surfaces {};
 };
 
 /// The production `ILiveStatsSources`: each subject captured with the functions its one-shot

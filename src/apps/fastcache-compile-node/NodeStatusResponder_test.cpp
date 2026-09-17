@@ -62,12 +62,13 @@ class CapturedReadings final: public ILiveStatsSources
     {
         if (!_attached || subject != Wire::LiveSubject::Cache)
             return std::nullopt;
-        // `NodeServedSurfaces`, because this stands in for the NODE's source and the shipped
-        // `NodeLiveStatsSources` passes its own set (#1484). Left at the default it answered for
-        // a process serving every surface, so the case compared the responder's reading against
-        // a capture the node would never produce -- a fake more permissive than the thing it
-        // stands for, which is the one kind of fixture defect reading the fake never finds.
-        return CaptureCacheSubject(_metrics, _snapshot, NodeServedSurfaces);
+        // The node's own set, through the function production calls (#1484, #1501). Left at
+        // the default it answered for a process serving every surface, so the case compared the
+        // responder's reading against a capture the node would never produce -- a fake more
+        // permissive than the thing it stands for, which is the one kind of fixture defect
+        // reading the fake never finds.
+        auto const served = NodeServedSurfacesFor(NodeConfig {});
+        return CaptureCacheSubject(_metrics, _snapshot, served.Span());
     }
 
     /// @copydoc ILiveStatsSources::Leadership
@@ -801,7 +802,8 @@ TEST_CASE("NodeMetrics answers the reading /metrics renders, the cache tier's fi
     // The whole reading, compared as one value: every counter, every block, the version. Derived
     // from a capture of the same sink and snapshot rather than from a list of expected figures,
     // which would go stale silently the day a figure is added.
-    CHECK(reading == CaptureStatsReading(metrics, snapshot, NodeServedSurfaces));
+    auto const served = NodeServedSurfacesFor(NodeConfig {});
+    CHECK(reading == CaptureStatsReading(metrics, snapshot, served.Span()));
 
     REQUIRE(reading.snapshot.storage.has_value());
     CHECK(Unwrap(reading.snapshot.storage).itemCount == 3);
@@ -819,7 +821,7 @@ TEST_CASE("NodeMetrics answers the reading /metrics renders, the cache tier's fi
     // would rot the moment a fourth row is attributed -- while still passing, which is the
     // direction that matters.
     auto const writable = std::ranges::count_if(
-        CounterTable, [](auto const& row) { return CounterHasAWriterIn(row.counter, NodeServedSurfaces); });
+        CounterTable, [&served](auto const& row) { return CounterHasAWriterIn(row.counter, served.Span()); });
     CHECK(static_cast<std::size_t>(zeroes) == static_cast<std::size_t>(writable) - 1);
 
     SECTION("and a node whose sources are detached is stopping, and says so uncounted")

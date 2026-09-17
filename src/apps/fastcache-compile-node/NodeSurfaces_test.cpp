@@ -833,3 +833,82 @@ TEST_CASE("A consensus node that names itself neither way prints NOT STATED and 
     CHECK(Unwrap(line).contains("NOT STATED"));
     CHECK(Unwrap(line).contains("--raft-self"));
 }
+
+TEST_CASE("the metrics surfaces a node serves follow the components it was told to run", "[node][surfaces][metrics]")
+{
+    // #1501 attributed all 148 catalogue rows to a surface, which makes THIS the number that
+    // decides whether a figure is reported. It used to be an empty `constexpr` array -- right
+    // while `CacheAcceptPath` was the only surface and a node serves none of it, and the silent
+    // failure once every row was attributed, because empty renders all 148 absent.
+    auto const serves = [](NodeConfig const& cfg, MetricsSurface surface) {
+        auto const served = NodeServedSurfacesFor(cfg);
+        return std::ranges::find(served.Span(), surface) != served.Span().end();
+    };
+
+    SECTION("three are a property of the BINARY and no flag turns them on")
+    {
+        // A compile node constructs no `Server`, no `CacheEngine` and no daemon-side `0xFC`
+        // executor, so these cannot move at any traffic level ever -- which is #1484's finding.
+        // Asserted against a RICH configuration rather than a default one: a default `NodeConfig`
+        // serves little, so a case built on one passes for the wrong reason.
+        NodeConfig rich;
+        rich.slots = 4;
+        rich.serveScheduler = true;
+        rich.cacheMemoryBytes = 8 * 1024 * 1024;
+        rich.nodeListen = "127.0.0.1:1";
+
+        CHECK_FALSE(serves(rich, MetricsSurface::CacheAcceptPath));
+        CHECK_FALSE(serves(rich, MetricsSurface::CacheStorage));
+        CHECK_FALSE(serves(rich, MetricsSurface::CacheCompileSurface));
+
+        // And two it always serves, so the case above is not passing because the set is empty.
+        CHECK(serves(rich, MetricsSurface::NodeFrameEndpoint));
+        CHECK(serves(rich, MetricsSurface::LiveStats));
+    }
+
+    SECTION("the worker follows --slots, in both directions")
+    {
+        // BOTH directions, because a build that never served `CompileWorker` would pass the
+        // `--slots=0` half on its own -- and that is the direction this feature could plausibly
+        // break, since it renders a real figure as `-`.
+        NodeConfig withWorker;
+        withWorker.slots = 2;
+        REQUIRE(RunsWorker(withWorker));
+        CHECK(serves(withWorker, MetricsSurface::CompileWorker));
+
+        NodeConfig withoutWorker;
+        withoutWorker.slots = 0;
+        REQUIRE_FALSE(RunsWorker(withoutWorker));
+        CHECK_FALSE(serves(withoutWorker, MetricsSurface::CompileWorker));
+    }
+
+    SECTION("the scheduler follows --serve-scheduler, and enrollment needs consensus BESIDE it")
+    {
+        // `ServesEnrollment` is `RunsConsensus(cfg) && a started scheduler tier`, so a scheduler
+        // alone must NOT bring the enrollment surface with it. That conjunction is the one thing
+        // here a single predicate would have got wrong.
+        NodeConfig schedulerOnly;
+        schedulerOnly.serveScheduler = true;
+        REQUIRE_FALSE(RunsConsensus(schedulerOnly));
+        CHECK(serves(schedulerOnly, MetricsSurface::CompileScheduler));
+        CHECK_FALSE(serves(schedulerOnly, MetricsSurface::NodeEnrollment));
+        CHECK_FALSE(serves(schedulerOnly, MetricsSurface::ConsensusPeerWire));
+
+        NodeConfig neither;
+        CHECK_FALSE(serves(neither, MetricsSurface::CompileScheduler));
+        CHECK_FALSE(serves(neither, MetricsSurface::NodeEnrollment));
+    }
+
+    SECTION("a default-constructed ServedSurfaces means NOT NARROWED, so it holds every surface")
+    {
+        // The direction of a mistake is stated here rather than left to a reader: a set left too
+        // WIDE renders a plausible zero, which is what this tree did before any of this existed;
+        // one left too NARROW invents a `-`. So an unrevisited call site must keep the old
+        // behaviour, and an empty default did the opposite -- it rendered all 148 rows absent and
+        // one case out of ~4900 noticed.
+        ServedSurfaces const notNarrowed {};
+        CHECK(notNarrowed.count == EverySurface.size());
+        for (auto const surface: EverySurface)
+            CHECK(std::ranges::find(notNarrowed.Span(), surface) != notNarrowed.Span().end());
+    }
+}

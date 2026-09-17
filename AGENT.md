@@ -1005,6 +1005,13 @@ converting a store. Before `Cache/CowTreeStorage`, `CowTree/`.
   modelled in the **snapshot**, never by dropping a counter row. **One carve-out, and it is a
   different question rather than a softening**: a row this BUILD cannot represent is omitted
   and counted by `fastcached_metrics_catalogue_skew`, never rendered as a plausible zero.
+- A SECOND carve-out: a row no writer in this PROCESS could move is absent, never zero. Which
+  surface writes each of the 148 rows is `CounterSoleWriterTable`, complete and
+  `static_assert`ed — a scan for `Increment(Counter::X)` finds 39 of them, because the rest are
+  written through a table. Its `size()` counts (counter, surface) PAIRS and is not a count of
+  counters; `AttributedCounterCount()` is. **Err unattributed**, and narrow a BINARY's set only
+  from the flags that decide whether the component is CONSTRUCTED — `ServedSurfaces{}` means
+  *not narrowed* and therefore every surface. `ctest -R counter-attribution`.
 - A duration is a `_sum`/`_count` pair, never a gauge.
 - A merged snapshot is one tier's answer standing in for all of them: `SnapshotTiers()` reports
   the split, the `tier` label comes from a table, and a tier the cache does not have renders no
