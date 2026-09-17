@@ -81,6 +81,28 @@ namespace
         };
     }
 
+    /// Map an `OpenRefusal` into `FastCache::StorageError`, carrying the system error it saw.
+    ///
+    /// The whole point of #1507: a lock refusal reaching a log as `code=14 errno=0` says
+    /// *somebody holds this file* and nothing about which errno said so, so the one claim it
+    /// makes cannot be checked. With the code present, `InUse` is falsifiable from the log.
+    ///
+    /// **The disengaged/zero distinction ends here, deliberately.** `StorageError::systemCode`
+    /// is an `int` whose 0 has meant *no system error* across this tree and `NetError` since
+    /// long before this, so projecting onto it is the boundary's existing convention rather
+    /// than a loss this change introduces. Nothing #1507 asks for needs the distinction ABOVE
+    /// this line: a lock refusal always has a code now, and the paths that carry none are the
+    /// ones decided from arguments or from bytes already read.
+    /// @param refusal What `FilePageStore::Open` answered.
+    /// @param context Where it happened.
+    /// @return The translated error, with `systemCode` set where one was observed.
+    [[nodiscard]] StorageError TranslateError(CowTree::OpenRefusal const& refusal, std::string context = {})
+    {
+        auto translated = TranslateError(refusal.cause, std::move(context));
+        translated.systemCode = refusal.systemCode.value_or(0);
+        return translated;
+    }
+
     template <typename T>
     void AppendLe(std::vector<std::byte>& buf, T value)
     {
@@ -629,8 +651,8 @@ std::expected<CowTreeStorage::MigrationReport, StorageError> CowTreeStorage::Mig
 
     auto store = CowTree::FilePageStore::Open(pageOpts);
     if (!store.has_value())
-        return std::unexpected(
-            TranslateError(store.error(), std::format("cannot open the store: {}", CowTree::ToStringView(store.error()))));
+        return std::unexpected(TranslateError(
+            store.error(), std::format("cannot open the store: {}", CowTree::ToStringView(store.error().cause))));
 
     // Opening had to assume a page size in order to know where the second meta
     // slot even is, and the file gets to overrule that. When it does, the slot
@@ -646,7 +668,7 @@ std::expected<CowTreeStorage::MigrationReport, StorageError> CowTreeStorage::Mig
         store = CowTree::FilePageStore::Open(pageOpts);
         if (!store.has_value())
             return std::unexpected(TranslateError(
-                store.error(), std::format("cannot open the store: {}", CowTree::ToStringView(store.error()))));
+                store.error(), std::format("cannot open the store: {}", CowTree::ToStringView(store.error().cause))));
     }
     return MigrateStore(**store);
 }

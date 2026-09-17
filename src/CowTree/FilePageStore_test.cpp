@@ -20,6 +20,7 @@
 #include <CowTree/Meta.hpp>
 #include <CowTree/PageId.hpp>
 #include <tests/ScratchPath.hpp>
+#include <tests/Unwrap.hpp>
 
 // The lock-classifier case below asserts over the platform's own error
 // constants: `errno` values on POSIX, `GetLastError()` values on Windows.
@@ -694,7 +695,18 @@ TEST_CASE("A second store on one path is refused as InUse", "[filestore][lock]")
 
     auto second = CowTree::FilePageStore::Open(opts);
     REQUIRE_FALSE(second.has_value());
-    REQUIRE(second.error() == CowTree::CowTreeError::InUse);
+    REQUIRE(second.error().cause == CowTree::CowTreeError::InUse);
+
+    // #1507: the refusal carries the system error it was classified FROM. Asserted as a
+    // ROUND TRIP through the classifier rather than against a named errno, because the two
+    // platforms report this condition with different values -- EWOULDBLOCK/EAGAIN against
+    // ERROR_SHARING_VIOLATION -- and what the acceptance clause asks is that the code which
+    // PRODUCED this arm is the code reported. Naming one errno would make the case a
+    // statement about the host it was written on.
+    REQUIRE(second.error().systemCode.has_value());
+    auto const systemCode = FastCache::Testing::Unwrap(second.error().systemCode);
+    INFO("system code: " << systemCode);
+    CHECK(CowTree::FilePageStore::ClassifyLockFailure(systemCode) == CowTree::FilePageStore::LockFailure::Contended);
 }
 
 TEST_CASE("A store refused as InUse leaves the first one writable", "[filestore][lock]")
@@ -818,7 +830,15 @@ TEST_CASE("An empty file that already existed is not blanked into a fresh store"
     // just because it happens to be empty. It is refused, exactly as before.
     auto const store = CowTree::FilePageStore::Open(opts);
     REQUIRE_FALSE(store.has_value());
-    REQUIRE(store.error() == CowTree::CowTreeError::CorruptMetas);
+    REQUIRE(store.error().cause == CowTree::CowTreeError::CorruptMetas);
+
+    // The CONTROL for #1507's system code, and the reason it is an optional rather than an
+    // int. This refusal is decided from meta-page bytes already read, so there is no system
+    // call behind it and nothing to report -- and *absent* must not be spelled `0`, which is
+    // `errno`'s own value for success. Without this assertion a build that stamped the last
+    // errno it happened to see onto every refusal would satisfy the case that asserts the
+    // lock refusal carries one.
+    CHECK_FALSE(store.error().systemCode.has_value());
 }
 
 // ---------------------------------------------------------------------------
@@ -885,7 +905,7 @@ TEST_CASE("A free-list link pointing past the end of the file refuses the store 
     // slots read back fine, and it is the structure beneath them that did not
     // hold. Not `OutOfRange` or `IoError` either, both of which say the caller
     // asked for something silly rather than that the store is damaged.
-    REQUIRE(store.error() == CowTree::CowTreeError::Corrupt);
+    REQUIRE(store.error().cause == CowTree::CowTreeError::Corrupt);
 }
 
 TEST_CASE("A free-list chain that loops refuses the store at Open", "[filestore][open][freelist][corrupt]")
@@ -899,7 +919,7 @@ TEST_CASE("A free-list chain that loops refuses the store at Open", "[filestore]
 
     auto const store = OpenFreeListStore(tmp.path);
     REQUIRE_FALSE(store.has_value());
-    REQUIRE(store.error() == CowTree::CowTreeError::Corrupt);
+    REQUIRE(store.error().cause == CowTree::CowTreeError::Corrupt);
 }
 
 #if !defined(_WIN32)

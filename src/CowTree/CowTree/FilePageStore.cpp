@@ -138,10 +138,10 @@ FilePageStore::~FilePageStore()
 #endif
 }
 
-auto FilePageStore::Open(Options options) -> std::expected<std::unique_ptr<FilePageStore>, CowTreeError>
+auto FilePageStore::Open(Options options) -> std::expected<std::unique_ptr<FilePageStore>, OpenRefusal>
 {
     if (!IsValidPageSize(options.pageSize))
-        return std::unexpected(CowTreeError::InvalidArg);
+        return std::unexpected(OpenRefusal { CowTreeError::InvalidArg });
 
     auto store = std::unique_ptr<FilePageStore> { new FilePageStore { std::move(options) } };
 
@@ -156,8 +156,13 @@ auto FilePageStore::Open(Options options) -> std::expected<std::unique_ptr<FileP
         path.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (handle == INVALID_HANDLE_VALUE)
     {
-        auto const failure = ClassifyLockFailure(static_cast<int>(::GetLastError()));
-        return std::unexpected(failure == LockFailure::Contended ? CowTreeError::InUse : CowTreeError::IoError);
+        // The code is REPORTED as well as classified. `CreateFileW` is both the open and
+        // the claim on this platform, so a share-mode refusal and a genuine open failure
+        // arrive at the same statement and only the code tells them apart afterwards.
+        auto const systemCode = static_cast<int>(::GetLastError());
+        auto const failure = ClassifyLockFailure(systemCode);
+        return std::unexpected(
+            OpenRefusal { failure == LockFailure::Contended ? CowTreeError::InUse : CowTreeError::IoError, systemCode });
     }
     store->_handle = handle;
 
@@ -190,15 +195,17 @@ auto FilePageStore::Open(Options options) -> std::expected<std::unique_ptr<FileP
     auto const flags = O_RDWR | O_CREAT | O_CLOEXEC;
     auto const fd = ::open(store->_options.path.c_str(), flags, 0644);
     if (fd < 0)
-        return std::unexpected(CowTreeError::IoError);
+        return std::unexpected(OpenRefusal { CowTreeError::IoError, errno });
     store->_fd = fd;
 
     // Before bootstrap or recovery, either of which writes meta pages: a "new"
     // file is only new because nobody has claimed it yet, and blanking its two
     // meta pages is precisely the write that would destroy a store somebody
     // else is already using.
-    if (auto const claimed = store->TakeExclusiveLock(); !claimed.has_value())
-        return std::unexpected(claimed.error());
+    if (auto claimed = store->TakeExclusiveLock(); !claimed.has_value())
+        // Already an `OpenRefusal`, carrying the errno `ClassifyLockFailure` read -- so this
+        // is a pass-through rather than a re-wrap, and the code survives the hop.
+        return std::unexpected(std::move(claimed).error());
 #endif
 
     // Bootstrapping BLANKS both meta pages, so which branch runs is a
@@ -216,17 +223,17 @@ auto FilePageStore::Open(Options options) -> std::expected<std::unique_ptr<FileP
     // the racing one.
     auto const sizeUnderClaim = store->FileSizeBytes();
     if (!sizeUnderClaim.has_value())
-        return std::unexpected(sizeUnderClaim.error());
+        return std::unexpected(OpenRefusal { sizeUnderClaim.error() });
 
     if (!existedBeforeOpen && *sizeUnderClaim == 0)
     {
         if (auto const r = store->BootstrapNewFile(); !r.has_value())
-            return std::unexpected(r.error());
+            return std::unexpected(OpenRefusal { r.error() });
     }
     else
     {
         if (auto const r = store->RecoverExistingFile(); !r.has_value())
-            return std::unexpected(r.error());
+            return std::unexpected(OpenRefusal { r.error() });
     }
 
     store->_readBuffer.resize(store->_pageSize);
@@ -234,7 +241,7 @@ auto FilePageStore::Open(Options options) -> std::expected<std::unique_ptr<FileP
 }
 
 #if !defined(_WIN32)
-auto FilePageStore::TakeExclusiveLock() -> std::expected<void, CowTreeError>
+auto FilePageStore::TakeExclusiveLock() -> std::expected<void, OpenRefusal>
 {
     // flock rather than fcntl: an fcntl lock is per PROCESS, so a second store
     // in the same process would take it again and report success — which is
@@ -248,12 +255,15 @@ auto FilePageStore::TakeExclusiveLock() -> std::expected<void, CowTreeError>
     {
         if (errno == EINTR)
             continue;
-        switch (ClassifyLockFailure(errno))
+        // Read ONCE, because `errno` is a modifiable lvalue that any call after this may
+        // overwrite -- including, on some libcs, the ones a refusal is built with.
+        auto const systemCode = errno;
+        switch (ClassifyLockFailure(systemCode))
         {
             case LockFailure::Contended:
-                return std::unexpected(CowTreeError::InUse);
+                return std::unexpected(OpenRefusal { CowTreeError::InUse, systemCode });
             case LockFailure::Fatal:
-                return std::unexpected(CowTreeError::IoError);
+                return std::unexpected(OpenRefusal { CowTreeError::IoError, systemCode });
             case LockFailure::Unsupported:
                 // Not a failure to open. This filesystem cannot lock, so the
                 // store opens with no guard against a second one — refusing
