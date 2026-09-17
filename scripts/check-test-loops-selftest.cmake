@@ -9,6 +9,12 @@
 #
 # ## What the staged tree carries
 #
+# ADDING AN EXEMPTION ROW TO THE CHECK IS TWO EDITS, AND THIS FILE IS THE SECOND. A row with
+# no staged site here is reported STALE -- correctly -- which turns every baseline case red at
+# once, so the failure names this file rather than the row. Stage a file carrying that row's
+# site, add it to `files`/`texts` (positional, so both), and move the exempted-site tally in the
+# two baseline rows. Measured: missed twice in one session, both times by whoever added the row.
+#
 # One file per scope row, and one file per exemption row carrying the site that row exempts
 # -- so every case also proves the exemption rows still match what they claim to, and a case
 # that removes one of those sites proves STALE is refused. The mode (git or directory walk)
@@ -114,6 +120,21 @@ void Posix(char** inherited)
 }
 ")
 
+# `src/apps/fastcache-cli/CliCommand.cpp`'s row: the argv walk whose five `continue` paths all
+# depend on the head, so a `while` would need five duplicated increments. ONLY the exempted loop,
+# so this file contributes no unbacklogged site.
+set(cliCommandFile
+"void Parse(std::span<char const* const> args, Command& command)
+{
+    for (std::size_t index = 0; index < args.size(); ++index)
+    {
+        if (IsOption(args, index))
+            continue;
+        command.operands.emplace_back(args, index);
+    }
+}
+")
+
 # ---------------------------------------------------------------------------
 # Stage a tree, apply one mutation, run the check, return its collapsed output.
 function(fastcached_stage_and_run name target from to backlog outOutput outApplied)
@@ -151,8 +172,9 @@ function(fastcached_stage_and_run name target from to backlog outOutput outAppli
         "src/tests/TsanCanary.cpp"
         "src/FastCache/Protocol/LiveStreamReactors_test.cpp"
         "src/apps/fastcache-cc/ToolchainProbe.cpp"
-        "src/apps/fastcache-cc/ProcessRunner.cpp")
-    set(texts cleanFile helperHeader canaryFile liveFile probeFile runnerFile)
+        "src/apps/fastcache-cc/ProcessRunner.cpp"
+        "src/apps/fastcache-cli/CliCommand.cpp")
+    set(texts cleanFile helperHeader canaryFile liveFile probeFile runnerFile cliCommandFile)
     list(LENGTH files stagedCount)
     math(EXPR lastStaged "${stagedCount} - 1")
     foreach(index RANGE 0 ${lastStaged})
@@ -263,12 +285,12 @@ endfunction()
 set(FastCachedTestLoopCases
     # The baseline, in both enumeration modes. Every refusal below is evidence only if
     # these pass -- and they pass only while every exemption row still matches its site.
-    "baseline via walk|none|-|-|no new C-style loop && directory walk (no git index) && 7 exempted site(s) in 5 row(s)|CMake Error|-"
+    "baseline via walk|none|-|-|no new C-style loop && directory walk (no git index) && 8 exempted site(s) in 6 row(s)|CMake Error|-"
     "baseline via git|none-git|-|-|no new C-style loop && git ls-files|CMake Error|-"
     # A tree inside another checkout is walked, not read from that checkout's index, which
     # knows none of it. Asking "inside a work tree" instead of "at its top" refused every
     # case when ctest staged them under the gate's build directory.
-    "baseline nested in another checkout|none-nested|-|-|no new C-style loop && directory walk (no git index) && 7 exempted site(s) in 5 row(s)|CMake Error|-"
+    "baseline nested in another checkout|none-nested|-|-|no new C-style loop && directory walk (no git index) && 8 exempted site(s) in 6 row(s)|CMake Error|-"
     "a counting loop nested in another checkout|newfile-nested|src/FastCache/Core/Fresh_test.cpp|int F()~n~{~n~    for (int i = 0~sc~ i < 3~sc~ ++i)~n~        Use(i)~sc~~n~}~n~|src/FastCache/Core/Fresh_test.cpp:3: a C-style for loop && directory walk (no git index)|-|-"
 
     # THE RED ARM.

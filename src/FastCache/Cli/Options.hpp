@@ -717,13 +717,21 @@ template <typename Result>
                                                                      std::span<char const* const> args,
                                                                      Result& result)
 {
-    for (std::size_t i = 0; i < args.size(); ++i)
+    // A `while` rather than a counting `for`, because `ApplyOneOption` ADVANCES `i` to
+    // consume a separate-argument value: the head of a `for` would advertise a constant step
+    // this loop does not take, which is exactly what hid three such sites from #1452's body
+    // scan. The `++i` below is the step past the token just handled, and it is reached on the
+    // only path that falls out of the body -- the two early exits are `return`s, so there is
+    // no `continue` here to skip it.
+    auto i = std::size_t { 0 };
+    while (i < args.size())
     {
         auto const flow = ApplyOneOption(table, args, i, result);
         if (!flow.has_value())
             return std::unexpected(flow.error());
         if (*flow == ParseFlow::Stop)
             return ParseFlow::Stop;
+        ++i;
     }
     return ParseFlow::Continue;
 }
