@@ -22,6 +22,58 @@
 namespace CowTree
 {
 
+/// Why an `Open` refused, and the system error it was classified FROM.
+///
+/// **A refusal names what was OBSERVED, and an errno is the only observation behind a lock
+/// refusal.** `InUse` on its own says *somebody holds this file* -- which was the one claim
+/// that turned out to be false in
+/// [#1507](https://github.com/LASTRADA-Software/fastcached/issues/1507), where 31 of 32 test
+/// processes had drawn the same filename and `flock` was refusing correctly. Diagnosing that
+/// meant patching the test to print the errno, because nothing on the wire out of `Open`
+/// carried it; with the code present, `InUse` is falsifiable from a log.
+///
+/// `systemCode` is a **disengaged optional and never 0** where there was no system call.
+/// `InvalidArg` is decided from the arguments and a damaged meta page is decided from bytes
+/// already read, so neither has an errno to report -- and *absent* is a different fact from
+/// *the call returned 0*, which is `errno`'s spelling of success. That distinction is the
+/// whole defect this type exists to remove, so it cannot be represented by a sentinel.
+struct OpenRefusal
+{
+    /// What the caller is being refused with.
+    CowTreeError cause;
+
+    /// The `errno` (POSIX) or `GetLastError()` (Windows) value `cause` was classified from,
+    /// disengaged where no system call was involved.
+    std::optional<int> systemCode {};
+
+    /// A refusal with no system error behind it.
+    ///
+    /// **Explicit, and the verbosity at the call sites is the point.** An implicit conversion
+    /// would let every existing `return std::unexpected(CowTreeError::X)` inside `Open` keep
+    /// compiling untouched -- convenient, and it would also silently produce a
+    /// no-system-error refusal at the three sites that DO hold an errno, which is the defect
+    /// rather than a shortcut. Spelling it means each site states which of the two it is.
+    ///
+    /// There is deliberately **no `operator==(CowTreeError)`** either. Producing a refusal
+    /// from a bare cause loses nothing; COMPARING one to a bare cause would let a consumer
+    /// read the enumerator and silently discard the code, which is exactly the shape #1507
+    /// was filed about. A caller that wants the cause spells `.cause`.
+    /// @param from The cause, with no system error to report.
+    constexpr explicit OpenRefusal(CowTreeError from) noexcept:
+        cause { from }
+    {
+    }
+
+    /// A refusal carrying the system error it was classified from.
+    /// @param from The cause.
+    /// @param code The `errno` or `GetLastError()` value observed.
+    constexpr OpenRefusal(CowTreeError from, int code) noexcept:
+        cause { from },
+        systemCode { code }
+    {
+    }
+};
+
 /// File-backed `IPageStore`.
 ///
 /// Layout: `[meta_a][meta_b][data_pages...]` where each meta page is
@@ -107,10 +159,11 @@ class FilePageStore final: public IPageStore
     /// pages of a "new" file is itself the write that would destroy a store a
     /// second process is already using.
     /// @param options Open parameters.
-    /// @return Owning FilePageStore on success; CowTreeError::InUse when
-    ///         another open store holds the file, CowTreeError::IoError on any
-    ///         other failure to open it.
-    [[nodiscard]] static auto Open(Options options) -> std::expected<std::unique_ptr<FilePageStore>, CowTreeError>;
+    /// @return Owning FilePageStore on success; an `OpenRefusal` whose `cause` is
+    ///         CowTreeError::InUse when another open store holds the file and
+    ///         CowTreeError::IoError on any other failure to open it, carrying the
+    ///         `systemCode` it was classified from wherever a system call decided it.
+    [[nodiscard]] static auto Open(Options options) -> std::expected<std::unique_ptr<FilePageStore>, OpenRefusal>;
 
     FilePageStore(FilePageStore const&) = delete;
     FilePageStore(FilePageStore&&) = delete;
@@ -194,7 +247,7 @@ class FilePageStore final: public IPageStore
     /// @return Empty once the outcome is recorded — including the
     ///         `Unsupported` outcome, which opens unguarded rather than
     ///         failing; CowTreeError::InUse or ::IoError otherwise.
-    [[nodiscard]] auto TakeExclusiveLock() -> std::expected<void, CowTreeError>;
+    [[nodiscard]] auto TakeExclusiveLock() -> std::expected<void, OpenRefusal>;
 #endif
 
     /// Current length of the backing file, read from the open handle.

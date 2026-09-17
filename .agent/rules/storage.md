@@ -346,6 +346,52 @@ describes stops at the first commit that reclaims a page.
 Staging into an *uncommitted* write transaction from inside a walk is fine, and
 is what the conversion does.
 
+## What a refused `Open` can say
+
+**A lock refusal carries the errno it was classified from.** `FilePageStore::Open` classified a
+system error and then discarded it, so the refusal reached a log as
+`code=14 errno=0 ctx=FilePageStore::Open` — `InUse`, and nothing about which errno decided it.
+
+That one missing integer is the whole cost of
+[#1507](https://github.com/LASTRADA-Software/fastcached/issues/1507). `InUse` asserts *somebody
+holds this file*, and on the failure that opened the ticket **that claim was false**: 31 of 32
+test processes had drawn the same filename, because `std::random_device` answers zero for 57% of
+draws on that host, so `flock` was refusing exactly as designed. Diagnosing it meant patching
+the test to print the errno and rebuilding, because nothing on the way out of `Open` carried it.
+The refusal was right and unfalsifiable at the same time, which is the worst combination a
+diagnostic can have: it names a cause, the cause is wrong, and the only way to find out is to
+stop trusting the instrument and rebuild it.
+
+**Absent is a disengaged `std::optional<int>`, never `0`.** `InvalidArg` is decided from the
+arguments and a damaged meta page from bytes already read, so neither has a system error to
+report — and *there was no system call* is a different fact from *the call returned 0*, which is
+`errno`'s own value for success. Collapsing those two is the defect the type exists to remove,
+so it cannot be spelled with a sentinel. The projection onto `StorageError::systemCode`, an
+`int` whose `0` has meant *none* across this tree since long before, happens at
+`CowTreeStorage`'s `TranslateError` and is the boundary's existing convention rather than a loss
+this rule permits.
+
+**Two things the refusal type deliberately does not have**, and both are the same mistake from
+opposite sides:
+
+- **No implicit conversion from `CowTreeError`.** It would let all seven existing
+  `return std::unexpected(CowTreeError::X)` sites inside `Open` compile untouched — including
+  the three that DO hold an errno. Convenience that silently produces the no-code refusal at
+  exactly the sites the change exists for is the defect wearing a shortcut's clothes.
+- **No `operator==(CowTreeError)`.** Producing a refusal from a bare cause loses nothing;
+  COMPARING one to a bare cause lets every consumer read the enumerator and drop the code, which
+  is the shape that was filed. A caller that wants the cause spells `.cause`.
+
+**The control is the load-bearing half of the test.** Asserting that a contended refusal carries
+a code passes just as well on a build that stamps whatever errno it last saw onto *every*
+refusal — so the `CorruptMetas` case asserts it carries NONE. Measured by neutering: reporting no
+code reddens the contended case alone, stamping a code on every refusal reddens the control
+alone, and reporting `ENOLCK` in place of the real errno reddens the contended case again through
+a **round trip** — the code is fed back through `ClassifyLockFailure` and must arrive at
+`Contended`, rather than being compared to a named errno, because the two platforms spell this
+condition `EWOULDBLOCK`/`EAGAIN` and `ERROR_SHARING_VIOLATION` and a named one would make the
+case a statement about the host it was written on.
+
 ## What a reopened store can name
 
 **The LRU mirror holds what this SESSION touched, never what is on disk.** `_lru` and

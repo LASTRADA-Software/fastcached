@@ -932,6 +932,10 @@ converting a store. Before `Cache/CowTreeStorage`, `CowTree/`.
   store reads the store; only the victim reads the mirror. The tree's own count is an UPPER
   bound carrying the store's sentinels, so taking it verbatim over-counts, and `indexBytes`
   deliberately still reports the present.
+- A refused `Open` carries the **errno it classified** (`OpenRefusal`), because `InUse` alone
+  asserts *somebody holds this file* — a claim that has already been false, and cost a session
+  to disprove (#1507). Absent is a DISENGAGED optional, never `0`, which is `errno`'s own
+  spelling of success.
 
 **[`.agent/rules/metrics-and-observability.md`](.agent/rules/metrics-and-observability.md)**
 — counters and scrape surfaces. Before `Metrics/`, `/metrics`, `/healthz`.
