@@ -24,12 +24,28 @@ using namespace FastCache;
 namespace
 {
 
-/// A process serving none of the surfaces any catalogue row is attributed to: a compile node.
+/// A process serving none of the surfaces any catalogue row is attributed to.
 ///
-/// Spelled here rather than reaching for `Node::NodeServedSurfaces`, which lives in an app this
-/// translation unit does not link. That the two agree is what `NodeStatusResponder_test` asserts,
-/// against the node's own constant.
+/// **No longer "a compile node", which is what this said and what #1501 changed.** While
+/// `CacheAcceptPath` was the only surface, a node served none of it and the empty set described
+/// one exactly; now every row is attributed and a node serves several, so this is a synthetic
+/// process -- the strongest case for the renderer rather than a portrait of a binary. Which
+/// surfaces the node actually serves is `NodeServedSurfacesFor`, asserted in its own app.
 constexpr std::array<MetricsSurface, 0> ServesNothingAttributed {};
+
+/// A process that serves the compile worker and NOT the cache daemon's accept path.
+///
+/// **What the two-direction cases below need, and what `ServesNothingAttributed` stopped being
+/// able to give them.** Each asserts an absence AND a presence, because a fix that blanked every
+/// row would satisfy the absence alone — the acceptance for #1484 says so in as many words. Their
+/// control was `WorkerJobsCompleted`, which was PRESENT under an empty surface set only because
+/// it was unattributed; #1501 attributed all 148 rows, so an empty set now makes the control
+/// absent too and the case can no longer fail for its own reason.
+///
+/// A partial set restores the property and is the more realistic subject: a process serves some
+/// surfaces and not others, which is the whole situation being modelled. `ServesNothingAttributed`
+/// stays for the renderer case, whose subject IS the all-absent extreme.
+constexpr std::array ServesTheWorkerNotTheAcceptPath { MetricsSurface::CompileWorker };
 
 /// The row #1484 was found on, and the one whose sole writers were positively established.
 constexpr auto Connections = IMetricsSink::Counter::ConnectionsTotal;
@@ -56,7 +72,7 @@ TEST_CASE("A counter no surface of this process writes reads ABSENT, not zero", 
     AtomicMetricsSink sink;
     sink.Increment(IMetricsSink::Counter::WorkerJobsCompleted, 7);
 
-    auto const reading = CaptureStatsReading(sink, MetricsSnapshot {}, ServesNothingAttributed);
+    auto const reading = CaptureStatsReading(sink, MetricsSnapshot {}, ServesTheWorkerNotTheAcceptPath);
 
     auto const* const connections = reading.counters.Find(Connections);
     REQUIRE(connections != nullptr);
@@ -127,9 +143,11 @@ TEST_CASE("A scrape tells a skew from a surface this process does not serve", "[
     CHECK(node.contains("fastcached_metrics_catalogue_skew 0\n"));
     CHECK_FALSE(node.contains("# SKEW"));
 
-    // DERIVED from the table, so attributing a fourth row does not silently leave this passing
-    // against a stale number.
-    CHECK(node.contains(std::format("fastcached_metrics_surface_absent {}\n", CounterSoleWriterTable.size())));
+    // DERIVED, so a row arriving does not leave this passing against a stale number -- but from
+    // `AttributedCounterCount()` and NOT from `CounterSoleWriterTable.size()`, which it used to
+    // be. The table holds one row per (counter, surface) pair, so the two were equal only while
+    // no counter had two surfaces, and #1501 gave one of them two.
+    CHECK(node.contains(std::format("fastcached_metrics_surface_absent {}\n", AttributedCounterCount())));
 }
 
 TEST_CASE("The reason an absence has survives the wire", "[metrics][stats-reading]")
@@ -138,7 +156,7 @@ TEST_CASE("The reason an absence has survives the wire", "[metrics][stats-readin
     // poll rung decodes one and re-renders Prometheus from it -- so the reason has to travel.
     // This is the case that fails if it is ever made local again.
     AtomicMetricsSink sink;
-    auto const reading = CaptureStatsReading(sink, MetricsSnapshot {}, ServesNothingAttributed);
+    auto const reading = CaptureStatsReading(sink, MetricsSnapshot {}, ServesTheWorkerNotTheAcceptPath);
 
     auto const decoded = DecodeStatsReading(EncodeStatsReading(reading));
     REQUIRE(decoded.has_value());

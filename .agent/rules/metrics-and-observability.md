@@ -202,6 +202,40 @@ fault.
   most wants to know and gets wrong: *nothing has connected to this node*. Found by dogfooding,
   on a node that two builds had just gone through.
 
+  **All 148 rows are attributed now (#1501), and the guard is a `static_assert` rather than a
+  convention.** The state that made this dangerous was not the 145 unattributed rows, it was that
+  *absent from the table* and *nobody has considered this row* were spelled identically -- silence
+  reading as coverage, one level down from the refusal scan. `EveryCounterIsAttributed()` is a
+  `consteval` fold over `CounterSoleWriterTable`, so a new counter cannot be added without saying
+  which surface writes it.
+
+  **The attribution is one row per (counter, surface) PAIR, so its `size()` is not a count of
+  counters.** 149 rows for 148 rows-of-the-catalogue, and `fastcached_metrics_surface_absent` was
+  asserted against `CounterSoleWriterTable.size()` while the two happened to be equal.
+  `AttributedCounterCount()` is the derivation that stays right.
+
+  **And a scan for `Increment(Counter::X)` attributes 39 of the 148.** Four mechanisms write a
+  counter here -- a `SurfaceRefusal` row spent by `Refuse(row)` (102), a `LeaseToken` outcome row
+  (7), a classifier returning the row for its caller to spend (4), and a direct `Increment` (39) --
+  and reading only the `SurfaceRefusal` tables reaches 101 of the 109 that have no increment site.
+  `ctest -R counter-attribution` re-derives every one of those figures, because the previous
+  sentence here said "106 of 144" for a tree that had moved to 148 and nothing was watching it.
+
+  **What must NOT be narrowed casually is a BINARY's surface set, not this table.** The table says
+  where a counter is written, which is a fact about the source; what hides a figure is the set a
+  PROCESS claims. `fastcached` still passes `EverySurface` and renders every row. The node derives
+  its set from the flags that decide whether each component is CONSTRUCTED
+  (`NodeServedSurfacesFor`), never a second reading of them -- and `ServedSurfaces{}` defaults to
+  every surface, because a default-constructed value means *not narrowed* and an empty default
+  rendered all 148 rows absent on one fixture while 4900 cases went on passing.
+
+  **Err unattributed.** The two directions are not symmetric: an unattributed row costs a
+  plausible zero, which `surface_absent` counts, while a row attributed too NARROWLY silently
+  stops reporting a figure that is real -- and that failure looks exactly like the absence
+  working. So the check that matters asserts the NARROW direction: every file that writes a
+  counter must live on a surface the row is attributed to, and a production file naming a counter
+  and appearing on neither the writer nor the reads-only list fails the build.
+
   This is the BUILD question one step out, not the world question: what a binary's code can
   write is a static property of the program, so a zero there is a number for an event that could
   not have been counted -- the same sentence that licenses the first carve-out. **What it must
@@ -903,21 +937,6 @@ the whole diagnosis ([#1399](https://github.com/LASTRADA-Software/fastcached/iss
   refused by name at the grant, before any snapshot arrives, and refused again per reading.
 
 ## Open work
-
-- **[#1501](https://github.com/LASTRADA-Software/fastcached/issues/1501)** — the writable-counter
-  attribution #1484 landed covers THREE rows of 144, and the remaining 141 are the open half. 106
-  of them are written through the table-driven `Refuse(row)` mechanism rather than an `Increment`
-  call, so no scan attributes them and none is in `CounterSoleWriterTable`; the other 35 have
-  increment sites that have not been read. Every unattributed row reports as this tree did before
-  #1484 — a plausible zero on a binary that cannot write it — so the gap is a known cost rather
-  than a new one, and `fastcached_metrics_surface_absent` is what makes the attributed count
-  visible on every scrape. Widening it means reading the refusal TABLES per surface rather than
-  grepping for increment sites, which is why it was out of #1484's scope.
-
-  **Err unattributed.** The two directions are not symmetric: an unattributed row costs a
-  plausible zero, which is what the tree already has and what `surface_absent` counts, while a row
-  attributed too NARROWLY silently stops reporting a figure that is real — and that failure looks
-  exactly like the absence working.
 
 - **[#592](https://github.com/LASTRADA-Software/fastcached/issues/592)** — whether the
   fleet scheduler should count a non-member caller in a series of its own. #494 left it

@@ -8,9 +8,11 @@
 #include <FastCache/Metrics/StatsReading.hpp>
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <expected>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -335,7 +337,53 @@ struct SurfaceRow
 /// Empty is not "unknown". A process that has not been narrowed passes `EverySurface`, which is
 /// the default on every convenience overload -- so the direction of a mistake here is stated:
 /// too wide renders a zero, too narrow invents a `-`.
-inline constexpr std::array<MetricsSurface, 0> NodeServedSurfaces {};
+struct ServedSurfaces
+{
+    /// Room for every surface; `count` says how many are real.
+    ///
+    /// **Defaulted to `EverySurface`, and an empty default would have been a bug.** A
+    /// default-constructed value means *this call site has not been narrowed*, and the two
+    /// readings of that are not symmetric: every surface renders a plausible zero, which is
+    /// what the tree did before this existed, while no surface renders `-` for all 148 rows.
+    /// The empty version passed the build and was caught by one case out of 4900 --
+    /// `MetricsDoors` in `CacheTier_test.cpp` builds `NodeLiveStatsParts` without naming
+    /// surfaces, and its `node-metrics` body came back carrying the snapshot and not one
+    /// counter. Every other case that acquires parts this way asserts something narrower and
+    /// went on passing.
+    std::array<MetricsSurface, EnumeratorCount<MetricsSurface>> storage = EverySurface;
+    std::size_t count { EverySurface.size() };
+
+    /// The surfaces, as the metrics API takes them.
+    ///
+    /// **Borrowed from `storage`, so the owner must outlive the reader.** `AdminHttpServer`
+    /// keeps the span it is handed, which is why this type exists at all rather than a
+    /// function returning an array by value: `NodeServedSurfacesFor(cfg).Span()` on a
+    /// temporary dangles, and the two spellings look identical at a call site.
+    /// @return A view of the served surfaces.
+    [[nodiscard]] std::span<MetricsSurface const> Span() const noexcept
+    {
+        return std::span<MetricsSurface const> { storage }.first(count);
+    }
+};
+
+/// Which metrics surfaces a node started with @p cfg serves.
+///
+/// **Was an empty `constexpr` array, and the emptiness was load-bearing in a way that stopped
+/// being true.** It said *this binary serves none of the surfaces any counter is attributed
+/// to*, which was right while `CacheAcceptPath` was the only surface and the node genuinely
+/// serves none of it. #1501 attributed all 148 catalogue rows, so a constant empty set would
+/// now render every one of this node's OWN counters absent -- the silent direction, on the one
+/// binary the attribution exists to help.
+///
+/// Three of the ten are never served here and that is a property of the BINARY: a compile node
+/// constructs no `Server`, no `CacheEngine` and no daemon-side `0xFC` executor. The rest are
+/// decided by flags the operator already set, which is what makes the narrowing worth having --
+/// `--slots=0` means no worker, and a worker's refusal counters then read `-` rather than as a
+/// zero claiming nothing was ever refused.
+///
+/// @param cfg What the operator asked for.
+/// @return The surfaces this node serves.
+[[nodiscard]] ServedSurfaces NodeServedSurfacesFor(NodeConfig const& cfg);
 
 /// Apply @p row's bind-failure policy to a bind that failed.
 ///

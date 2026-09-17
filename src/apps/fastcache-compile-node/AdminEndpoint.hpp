@@ -590,13 +590,16 @@ class AdminEndpoint
     /// @param snapshot What to report per scrape.
     /// @param boundEndpoint What `BoundEndpoint()` reports.
     /// @param logger Where the server reports.
+    /// @param surfaces Which metrics surfaces this node serves; stored, because the server
+    ///        keeps a span of it.
     AdminEndpoint(std::unique_ptr<BlockingListener> listener,
                   IMetricsSink& metrics,
                   AdminHttpServer::SnapshotProvider snapshot,
                   std::string boundEndpoint,
                   ILogger& logger,
                   std::vector<AdminRoute> routes,
-                  TlsContext* tls);
+                  TlsContext* tls,
+                  ServedSurfaces surfaces);
 
     std::unique_ptr<BlockingListener> _listener;
     /// Owned rather than injected, declared before `_server` which references it.
@@ -604,6 +607,10 @@ class AdminEndpoint
     /// head deadlines is one level down on `ServeAdminHttp(..., IClock&, ...)`, which is
     /// where a test that needs to move time reaches.
     SteadyClock _clock;
+    /// What this node serves, owned here because `_server` holds a SPAN of it and this used
+    /// to be a `constexpr` global that outlived everything by construction. Declared before
+    /// `_server` for that reason, exactly as `_listener` and `_clock` are.
+    ServedSurfaces _surfaces;
     std::unique_ptr<AdminHttpServer> _server;
     std::string _boundEndpoint;
     std::jthread _thread;

@@ -213,7 +213,8 @@ class MetricsDoors
                                         .identity = &_identity,
                                         .fleet = {},
                                         .history = nullptr,
-                                        .endpoint = {} } },
+                                        .endpoint = {},
+                                        .surfaces = _served } },
         _responder { _identity, _sources, _membership, metrics }
     {
     }
@@ -233,11 +234,11 @@ class MetricsDoors
         REQUIRE(SyncRun(WriteWhole(pair.client.get(), Wire::AsBytes(request))));
         pair.client->ShutdownWrite();
         SteadyClock clock;
-        // `NodeServedSurfaces`, because this door stands in for the NODE's `/metrics` and the
-        // node passes its own set (#1484). Left at the default this fixture answered for a
-        // process that serves every surface, and the case's two doors then disagreed about
-        // `fastcached_connections_total` -- which is the difference this case exists to find.
-        SyncRun(ServeAdminHttp(pair.server.get(), &_metrics, _provider, &clock, {}, NodeServedSurfaces));
+        // `_served`, the SAME set the `node-metrics` door reads through `_sources` -- which is
+        // the whole point of this fixture. The two doors are meant to differ in nothing but how
+        // they are asked, so a surface set either one owns privately would make them disagree
+        // about which rows are absent and read as a figure one door drops (#1484, #1501).
+        SyncRun(ServeAdminHttp(pair.server.get(), &_metrics, _provider, &clock, {}, _served.Span()));
         pair.server->Close();
 
         auto const response = SyncRun(ReadToEnd(pair.client.get()));
@@ -265,6 +266,12 @@ class MetricsDoors
     Distributed::OpenMembership _membership;
     IMetricsSink& _metrics;
     AdminHttpServer::SnapshotProvider _provider;
+    /// One surface set for BOTH doors, declared before `_sources`, which copies it.
+    ///
+    /// Left at the default -- every surface -- because this fixture is about whether the two
+    /// doors agree, not about which rows a particular node can write. Narrowing it here would
+    /// make the case assert absences as well, which is `NodeStatusResponder_test`'s subject.
+    ServedSurfaces _served {};
     NodeLiveStatsSources _sources;
     NodeStatusResponder _responder;
 };

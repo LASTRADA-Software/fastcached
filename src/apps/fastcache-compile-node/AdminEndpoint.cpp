@@ -1040,12 +1040,16 @@ AdminEndpoint::AdminEndpoint(std::unique_ptr<BlockingListener> listener,
                              std::string boundEndpoint,
                              ILogger& logger,
                              std::vector<AdminRoute> routes,
-                             TlsContext* tls):
+                             TlsContext* tls,
+                             ServedSurfaces surfaces):
     _listener { std::move(listener) },
+    _surfaces { surfaces },
     _server { std::make_unique<AdminHttpServer>(
-        // `NodeServedSurfaces`: this binary has no cache-daemon accept path, so the
-        // `fastcached_connections_*` rows read ABSENT on its `/metrics` rather than as a zero
-        // saying nothing has ever connected to it (#1484).
+        // `_surfaces`: what this node's configuration makes it serve. It has no cache-daemon
+        // accept path whatever the flags say, so the `fastcached_connections_*` rows read
+        // ABSENT on its `/metrics` rather than as a zero saying nothing has ever connected to
+        // it (#1484) -- and since #1501 the same holds for every other surface it does not
+        // run, so `--slots=0` reads `-` on the worker rows rather than a quiet zero.
         *_listener,
         metrics,
         std::move(snapshot),
@@ -1053,7 +1057,7 @@ AdminEndpoint::AdminEndpoint(std::unique_ptr<BlockingListener> listener,
         _clock,
         std::move(routes),
         tls,
-        NodeServedSurfaces) },
+        _surfaces.Span()) },
     _boundEndpoint { std::move(boundEndpoint) },
     _thread { [server = _server.get()] { SyncRun(server->Run()); } }
 {
@@ -1131,7 +1135,8 @@ std::expected<std::unique_ptr<AdminEndpoint>, std::string> AdminEndpoint::Start(
                                                                 std::format("{}:{}", endpoint.host, endpoint.port),
                                                                 logger,
                                                                 std::move(routes),
-                                                                tls } };
+                                                                tls,
+                                                                NodeServedSurfacesFor(cfg) } };
 }
 
 } // namespace FastCache::Node
