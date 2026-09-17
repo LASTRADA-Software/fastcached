@@ -113,6 +113,7 @@ if(FASTCACHED_BUILD_TESTS)
         EndpointDialer.cpp
         EnrollClient.cpp
         EnrollClient_test.cpp
+        FleetForgetPropagation_test.cpp
         EnrollmentResponder.cpp
         EnrollmentResponder_test.cpp
         EnrollmentWindow.cpp
