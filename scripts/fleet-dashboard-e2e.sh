@@ -375,22 +375,48 @@ json="$(dash_get "$admin_port" /fleet.json "Bearer ${TOKEN}")"
 [[ "$json" == *Content-Type:\ application/json* ]] || fail "/fleet.json did not answer JSON"
 [[ "$json" == *'"role":"leader"'* ]] || fail "the node did not report itself as the fleet's leader"
 
-# The node registers with its own scheduler on its heartbeat, so the machine
-# appears once the first REGISTER lands. Bounded, and it says what it waited for.
-# A bespoke CONDITION through the shared loop, rather than a bespoke loop. The
-# hand-written one this replaces reported `timed out after $((WAIT_TICKS / 10))s`
-# -- a duration computed from the loop shape and never observed, which is the one
-# reading that would have said whether the runner was slow.
-worker_is_listed() {
+# **Two waits, because these are two facts, and #1440 is what separated them.** A node
+# announces the MACHINE as soon as it starts and registers a toolchain only once the
+# survey has fingerprinted a compiler -- so the endpoint appearing means *this machine
+# is in the fleet*, which is no longer the same claim as *its worker is registered*.
+#
+# This fixture waited on the endpoint and asserted the toolchain count on the NEXT
+# LINE, which was one fact until it was two: the wait now returns the moment the
+# presence row lands, and that row legitimately carries `"toolchains":0`. It was green
+# on a warm developer machine, where the survey is instant and the REGISTER wins, and
+# red on a contended runner, where the announce wins. A fixture waits on what a line
+# MEANS, and the meaning moved underneath this one.
+#
+# Bounded, and each says what it waited for. A bespoke CONDITION through the shared
+# loop, rather than a bespoke loop. The hand-written one this replaces reported
+# `timed out after $((WAIT_TICKS / 10))s` -- a duration computed from the loop shape
+# and never observed, which is the one reading that would have said whether the runner
+# was slow.
+machine_is_listed() {
     json="$(dash_get "$admin_port" /fleet.json "Bearer ${TOKEN}")"
     [[ "$json" == *"127.0.0.1:${sched_port}"* ]]
 }
-wait_until worker_is_listed "the worker to appear in /fleet.json" \
+wait_until machine_is_listed "this machine to appear in /fleet.json" \
+    "$node_pid" "${workdir}/node.log" 240
+
+worker_is_registered() {
+    json="$(dash_get "$admin_port" /fleet.json "Bearer ${TOKEN}")"
+    [[ "$json" == *'"toolchains":1'* ]]
+}
+wait_until worker_is_registered "the worker's toolchain to reach the registry" \
     "$node_pid" "${workdir}/node.log" 240
 
 # And it is one MACHINE, whatever it serves: the grain a fleet total is computed
 # over. A page listing registry entries would double-count a node's cores.
-[[ "$json" == *'"toolchains":1'* ]] || fail "/fleet.json did not report the machine's toolchain count"
+#
+# Asserted as the ABSENCE of a second row rather than as the presence of the first,
+# which is what the previous line already waited for -- and it is the half #1440 could
+# have got wrong: this machine now has BOTH a presence record and a worker
+# registration, and `NodeReports()` must fold them into the worker's row. A leftover
+# presence row for the same endpoint would render a second machine serving nothing,
+# and every total on the page would count this host twice.
+[[ "$json" != *'"toolchains":0'* ]] \
+    || fail "/fleet.json lists a machine serving no toolchains: the presence row was not folded into the worker's"
 
 # The version travelled from the node's own binary, through the REGISTER capacity
 # record, to the leader's report. Asserted end to end because every seam in that
