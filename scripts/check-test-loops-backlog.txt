@@ -61,15 +61,13 @@ loop|src/FastCache/Net/IocpSocket.cpp|1|#1452
 loop|src/FastCache/Net/KqueueSocket.cpp|1|#1452
 loop|src/FastCache/Net/SocketAddress.cpp|1|#1452
 loop|src/FastCache/Net/UdpSocket.cpp|1|#1452
-loop|src/FastCache/Platform/LocalAddresses.cpp|4|#1452
-loop|src/FastCache/Protocol/CompileCacheWire.hpp|1|#1452
+loop|src/FastCache/Platform/LocalAddresses.cpp|3|#1452
 loop|src/FastCache/Protocol/PubSubRegistry.cpp|2|#1452
 loop|src/FastCache/Protocol/RedisResp.cpp|9|#1452
 loop|src/FastCache/Protocol/RedisTransaction.cpp|1|#1452
 loop|src/FastCache/Protocol/StreamWaiterRegistry.cpp|2|#1452
 loop|src/FastCache/Server/AdminHttpServer.cpp|1|#1452
 loop|src/apps/fastcache-cc/DirectManifest.cpp|3|#1452
-loop|src/apps/fastcache-cc/main.cpp|1|#1452
 loop|src/apps/fastcache-compile-node/FrameEndpoint.cpp|1|#1452
 loop|src/apps/fastcache-compile-node/ScratchClaim.cpp|1|#1452
 loop|src/apps/fastcached/main.cpp|1|#1452
