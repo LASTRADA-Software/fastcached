@@ -565,4 +565,29 @@ class WorkerRegistrar
     std::uint64_t _epoch = 0;
 };
 
+/// Tell a scheduler this MACHINE exists, whatever components it runs.
+///
+/// **A free function rather than a `WorkerRegistrar` member, and that is the shape of the
+/// fact.** A registrar is per TOOLCHAIN and carries a scheduler-issued worker id; presence is
+/// per MACHINE, names no id and refreshes nothing. A node started with `--slots=0` has no
+/// registrar at all, and it is the reason this exists
+/// ([#1440](https://github.com/LASTRADA-Software/fastcached/issues/1440)).
+///
+/// It lives beside the registrar so that how a node talks to a scheduler stays ONE place: the
+/// framed exchange, the credential and the notice are all the registrar's, and this borrows
+/// them rather than growing a second answer.
+/// @param scheduler The dialled connection.
+/// @param notice Where a credential the scheduler did not want is reported, once.
+/// @param endpoint Where this machine answers; the key its row is filed under.
+/// @param capacity What the machine is, including its version and cache budget.
+/// @param load What it is doing, and the history buckets it is handing over.
+/// @param credential What to present.
+/// @return Nothing on acceptance, or why it was refused and where the leader is.
+[[nodiscard]] std::expected<void, AnnounceRefusal> AnnounceNodePresence(ISocket& scheduler,
+                                                                        CredentialNotice& notice,
+                                                                        std::string_view endpoint,
+                                                                        CompileCacheWire::CapacityFields const& capacity,
+                                                                        CompileCacheWire::LoadFields const& load = {},
+                                                                        Credential const& credential = {});
+
 } // namespace FastCache::Cc
