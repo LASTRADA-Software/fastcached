@@ -15,6 +15,7 @@
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Net/ISocket.hpp>
 #include <FastCache/Platform/HostLoad.hpp>
+#include <FastCache/Protocol/CompileCacheWire.hpp>
 
 #include <algorithm>
 #include <atomic>
@@ -340,6 +341,32 @@ inline constexpr std::chrono::milliseconds HeartbeatConnectTimeout { 1'000 };
 ///         round can achieve nothing -- nobody reachable, everybody refusing, a
 ///         redirect chain that ran out -- which are one answer to the only question
 ///         the caller asks of it: is this node getting through to a scheduler.
+/// The load record describing this MACHINE, sampled once.
+///
+/// Extracted rather than copied because both announcements describe ONE host: sampling twice in
+/// a process gives two readings a moment apart that disagree, and the CPU figure is a
+/// DIFFERENCE between successive readings, so a second sampler reports nothing meaningful at
+/// all rather than something slightly stale.
+///
+/// **It carries no history, and that absence is the design rather than an omission.** History
+/// is filed under the MACHINE, so it rides NODE-ANNOUNCE -- the one verb every node sends,
+/// including one that runs no worker and therefore never registers anything to hang it on
+/// ([#1440](https://github.com/LASTRADA-Software/fastcached/issues/1440)). Two callers of
+/// `FleetSampler::NextHistoryBatch` would each take a batch and each advance the cursor, so the
+/// buckets would be split between two verbs and a batch taken by one and acknowledged by the
+/// other would be lost. One carrier, and it is the one that always exists.
+/// @param loadSampler Where the host figures come from.
+/// @param cacheTier Null on a node with no cache.
+/// @param metrics Where the cache figures are read.
+/// @param inFlight Jobs this node is running for the fleet.
+/// @param cordoned Whether this node is refusing new work.
+/// @return The wire record, with an empty history.
+[[nodiscard]] CompileCacheWire::LoadFields SampleMachineLoad(IHostLoadSampler& loadSampler,
+                                                             CacheTier const* cacheTier,
+                                                             IMetricsSink const& metrics,
+                                                             std::uint32_t inFlight,
+                                                             bool cordoned);
+
 /// One announcement, on a connection somebody else dialled.
 ///
 /// **The seam that lets a node with NO WORKER reach the fleet.** Everything about *which*
