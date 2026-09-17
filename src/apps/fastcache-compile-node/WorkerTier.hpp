@@ -4,6 +4,7 @@
 #include "CompileCapacity.hpp"
 #include "CompileResponder.hpp"
 #include "EndpointDialer.hpp"
+#include "NodeAnnounce.hpp"
 #include "NodeConfig.hpp"
 #include "NodeCredential.hpp"
 #include "NodeReload.hpp"
@@ -83,10 +84,17 @@ using WorkerMachineFactory = std::function<WorkerMachine()>;
 /// What a worker tier borrows from the node that starts it, all of which outlive it.
 struct WorkerTierParts
 {
-    NodeConfig const& cfg;                            ///< The configuration the node started with.
-    NodeReloader const* reloader;                     ///< The live configuration; null with no file.
-    Distributed::NodeCapacity const& capacity;        ///< What `NodeCapacityOf` made of this machine.
-    std::string_view advertise;                       ///< `AdvertisedEndpoint`, which a grant's MAC covers.
+    NodeConfig const& cfg;                     ///< The configuration the node started with.
+    NodeReloader const* reloader;              ///< The live configuration; null with no file.
+    Distributed::NodeCapacity const& capacity; ///< What `NodeCapacityOf` made of this machine.
+    /// `AdvertisedEndpoint` of the configuration this process started with, which a
+    /// grant's MAC covers.
+    ///
+    /// The SEED for `AnnouncedEndpoint`, and not a value this tier keeps re-reading: a
+    /// worker that learns its address late republishes it on a heartbeat and tells the
+    /// scheduler, so what is advertised after the first reload is the tier's own state
+    /// rather than anything `main` computed (#1279).
+    std::string_view advertise;
     SocketActivation activation;                      ///< Whether a supervisor handed the port over.
     Distributed::IMembershipOracle const& membership; ///< Who may send a compile at all.
     ILocalityOracle const& locality;                  ///< Who may cordon this worker.
@@ -186,6 +194,17 @@ class WorkerTier
         return _runtime;
     }
 
+    /// Where this worker is telling clients to reach it, now.
+    ///
+    /// The seam itself rather than a string, so a caller cannot take a copy that then
+    /// goes stale -- which is the whole defect #1279 records, and the reason this
+    /// returns a reference to an interface holding no value of its own.
+    /// @return The source; it lives as long as this tier.
+    [[nodiscard]] Cc::IAdvertisedEndpointSource const& Advertised() const noexcept
+    {
+        return *_announced;
+    }
+
     /// @return The slots this worker offers and enforces.
     [[nodiscard]] std::uint32_t Slots() const noexcept
     {
@@ -229,6 +248,7 @@ class WorkerTier
                WorkerMachine machine,
                DiscoveredToolchains discovered,
                std::unique_ptr<IScratchClaim> scratchClaim,
+               std::unique_ptr<AnnouncedEndpoint> announced,
                std::unique_ptr<Distributed::WorkerLeaseState> leaseState,
                Cc::LeaseValidator validator,
                SchedulerLink link,
@@ -237,11 +257,28 @@ class WorkerTier
     /// The heartbeat thread's body: the first survey, then a round per interval.
     void Heartbeat(std::stop_token const& stop, FleetSampler& sampler, IClock const& statusClock);
 
-    /// One registrar per served toolchain, carrying this machine's capacity record.
+    /// One registrar per served toolchain, carrying this machine's capacity record and
+    /// the endpoint in force when it is called.
     [[nodiscard]] std::vector<Cc::WorkerRegistrar> RegistrarsFor(std::map<std::string, ServedToolchain> const& served);
 
     /// Make @p served what the compile port and the registrations answer, in that order.
     void Serve(std::map<std::string, ServedToolchain> served);
+
+    /// Advertise @p endpoint from now on, retiring the registrations under the old one.
+    ///
+    /// **The one caller of `AnnouncedEndpoint::Publish`, and the ordering is the whole
+    /// point.** Publishing before the registrars are rebuilt is what makes the new
+    /// address the one they carry; rebuilding through `AdoptRegistrars` is what queues
+    /// the old `(fingerprint, endpoint)` entries for withdrawal instead of destroying
+    /// the `WorkerId` they need to be retired with. Either half alone leaves the
+    /// scheduler leasing an address this worker does not answer on.
+    ///
+    /// The lease check moves with it, because the validator reads the same seam -- so
+    /// there is no moment at which this worker verifies against one address while the
+    /// fleet holds another. That is the property a second reader of the configuration
+    /// could not have.
+    /// @param endpoint The new endpoint; non-empty, per `AdvertisedEndpointChange`.
+    void AnnounceAs(std::string endpoint);
 
     NodeConfig const& _cfg;
     NodeReloader const* _reloader;
@@ -249,7 +286,10 @@ class WorkerTier
     ICredentialSource const& _credential;
     IMetricsSink& _metrics;
     ILogger& _logger;
-    std::string _advertise;
+    /// What this worker advertises, and the one thing the registration and the lease
+    /// check both read. A heap object so the validator's borrow survives this tier
+    /// being built around it -- `_leaseState`'s reason, for `_leaseState`'s consumer.
+    std::unique_ptr<AnnouncedEndpoint> _announced;
     WorkerMachine _machine;
     SteadyClock _toolchainClock;
     DiscoveredToolchains _discovered;

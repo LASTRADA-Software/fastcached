@@ -1165,9 +1165,24 @@ Consequences that are each load-bearing:
   collapses the one distinction an operator needs — somebody probing the port, a
   worker whose advertised endpoint is not the one clients dial, and a machine whose
   clock has drifted are three different things to go and do. The endpoint checked
-  against is the WORKER's own advertised address, captured at construction: a
-  parameter would invite a caller to pass something the *request* supplied, which is
-  the whole failure the endpoint is inside the MAC to prevent. And the refusal is
+  against is the WORKER's own advertised address, read through
+  `Cc::IAdvertisedEndpointSource` at every request: a parameter would invite a caller
+  to pass something the *request* supplied, which is the whole failure the endpoint is
+  inside the MAC to prevent. **That rule is about the DIRECTION the value comes from,
+  not about when it is read** — it said *captured at construction* until #1279, which
+  was a true statement of the code and never what made the rule sound. A node behind a
+  NAT learns its address after it starts, so a captured one is a worker verifying
+  against an address nobody dials.
+- **And the address it verifies against is the address it is REGISTERED under, at every
+  moment.** One seam, read by the lease check and by the registration, published at one
+  point — the heartbeat that re-announces. Two independent readers of the live
+  configuration is the shape that looks more correct and is the one that breaks: a
+  reload would move the check immediately while the scheduler still held the old entry,
+  so the worker would refuse grants it had authentically signed, for a whole heartbeat
+  interval, with nothing anywhere misconfigured. The registration's own key is
+  `(fingerprint, endpoint)`, so the old entry is WITHDRAWN rather than left to expire
+  (`AdoptRegistrars`) — without which the scheduler goes on minting grants for an
+  address this worker has left, and those grants are valid credentials for nothing. And the refusal is
   never `UnknownLease` — that is the SCHEDULER's code, meaning "a lease I issued and
   have since forgotten", and a worker answering with it sent an operator to the
   scheduler to look for a fault that is local.

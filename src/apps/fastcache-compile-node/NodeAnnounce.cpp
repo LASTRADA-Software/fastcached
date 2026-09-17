@@ -7,7 +7,10 @@
 #include <FastCache/Platform/DaemonControls.hpp>
 
 #include <format>
+#include <memory>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
 
 namespace FastCache::Node
@@ -17,6 +20,39 @@ namespace
 {
     namespace Wire = FastCache::CompileCacheWire;
 } // namespace
+
+std::optional<EndpointChange> AdvertisedEndpointChange(std::string_view inForce,
+                                                       std::shared_ptr<NodeConfig const> const& live)
+{
+    // No configuration file means no second moment at which anything could change,
+    // which is `ConfiguredCredential`'s null-reloader arm one layer up. Asked here
+    // rather than at the call site so the rule is in the tested function rather than in
+    // the heartbeat loop no test reaches.
+    if (live == nullptr)
+        return std::nullopt;
+
+    auto candidate = AdvertisedEndpoint(*live);
+
+    // An empty candidate is not a change, it is an answer nothing can be registered
+    // under -- so the previous value stays in force and the worker goes on being
+    // reachable. Unreachable today, since `--listen-node` is not reloadable and the
+    // fallback therefore cannot become empty on a node where it resolved at startup;
+    // stated because the alternative is a withdrawal followed by a registration under
+    // no address at all, which is a node that disappears from the fleet with every
+    // counter reading normal.
+    if (candidate.empty() || candidate == inForce)
+        return std::nullopt;
+
+    // Formatted before the move, because a designated initializer's arguments are
+    // evaluated in whatever order the compiler likes and `endpoint` is declared first.
+    auto said = std::format("now advertising {} instead of {}: clients will be told the new address, and this worker's "
+                            "registration under the old one is being retired rather than left to expire. A lease "
+                            "already granted for {} is refused, which costs that client a local compile",
+                            candidate,
+                            inForce,
+                            inForce);
+    return EndpointChange { .endpoint = std::move(candidate), .announcement = std::move(said) };
+}
 
 AnnounceOutcome AnnounceOnce(HeartbeatRound const& round, ISocket& client, std::string_view endpoint)
 {
@@ -89,6 +125,14 @@ AnnounceOutcome AnnounceOnce(HeartbeatRound const& round, ISocket& client, std::
     // certainly true. That the ordering was deliberate in one direction and merely
     // incidental in the other is how #573 came to exist at all.
     //
+    // **That reasoning covers a DROPPED TOOLCHAIN, which was the only way onto this
+    // list until #1279 added a second: an endpoint that moved.** There the fingerprint
+    // is still served and the compile port has stopped nothing -- what is being retired
+    // is the address half of the key. The ordering is still right, for a reason of its
+    // own rather than by inheritance: withdrawing first means the scheduler never holds
+    // two live entries for one machine naming different addresses, one of which is
+    // wrong. Registering first would make that window the normal case.
+    //
     // Cleared unconditionally afterwards: see `HeartbeatRound::withdrawals` for why a
     // failure is not retried.
     for (auto& retiring: round.withdrawals)
@@ -98,10 +142,14 @@ AnnounceOutcome AnnounceOnce(HeartbeatRound const& round, ISocket& client, std::
             // scheduler too old to know the verb, a `NotLeader`, an unreachable host --
             // leaves the pre-existing expiry closing the window exactly as before, so
             // this must never redirect the round, abort it, or count against it.
+            // Both halves of the registry's key, because since #1279 a withdrawal may
+            // name a fingerprint this worker still serves -- so the fingerprint alone
+            // reads as "it dropped a toolchain it is using" and names half an entry.
             round.logger.Logf(LogLevel::Info,
-                              "scheduler {} did not retire {}: {}; its registration will expire instead",
+                              "scheduler {} did not retire {} at {}: {}; that registration will expire instead",
                               endpoint,
                               retiring.Fingerprint(),
+                              retiring.Endpoint(),
                               retired.error().reason);
     }
     round.withdrawals.clear();

@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#include "NodeAnnounce.hpp"
 #include "WorkerLease.hpp"
 
 #include <FastCache/Core/Clock.hpp>
@@ -25,6 +26,12 @@ namespace
 
 /// The endpoint the worker under test advertises, and the one a grant must name.
 inline constexpr std::string_view ThisWorker = "worker-under-test:6675";
+
+/// Where it ends up once a NAT or a late interface tells it its real address.
+///
+/// Different in both host and port from `ThisWorker`, so a comparison matching on
+/// either half alone cannot pass.
+inline constexpr std::string_view MovedWorker = "worker-behind-nat:7700";
 
 /// The fleet it belongs to.
 inline constexpr std::string_view ThisCluster = "fleet-a";
@@ -75,13 +82,17 @@ void WriteClusterKey(std::filesystem::path const& keyFile)
 /// serial.
 /// @param epoch The scheduler term it is issued under.
 /// @param serial What distinguishes this issuance from the last.
+/// @param endpoint The worker it is issued FOR. A defaulted parameter rather than a
+///        third near-copy of this mint call, which is what the two below already are.
 /// @return The token, as a client would present it.
-[[nodiscard]] std::string GrantUnder(std::uint64_t epoch, std::string_view serial = "17")
+[[nodiscard]] std::string GrantUnder(std::uint64_t epoch,
+                                     std::string_view serial = "17",
+                                     std::string_view endpoint = ThisWorker)
 {
     return Distributed::MintLeaseToken(
         TestClusterKey(),
         Distributed::LeaseClaims { .serial = std::string { serial },
-                                   .endpoint = std::string { ThisWorker },
+                                   .endpoint = std::string { endpoint },
                                    .fingerprint = "gcc-13",
                                    .key = "obj-abc",
                                    .expiresAt = LeaseClock.Now() + std::chrono::minutes { 10 },
@@ -133,8 +144,65 @@ struct WorkerState
     Distributed::WorkerLeaseState lease; ///< Spent grants, learned term, reset notice.
     AtomicMetricsSink metrics;           ///< Where refusals are counted.
     NullLogger logger;                   ///< Where startup lines go.
+
+    /// What this worker advertises, which the validator reads per request rather than
+    /// copying (#1279). The production class, not a stand-in: it is in reach here, and a
+    /// fake would be a second answer to the one question this struct exists to settle --
+    /// what the validator borrows, and who keeps it alive.
+    AnnouncedEndpoint advertised { ThisWorker };
 };
 } // namespace
+
+TEST_CASE("A worker that republishes its advertised address verifies grants naming the new one", "[node][lease][advertise]")
+{
+    // **The WIRING half of #1279, which the validator's own cases cannot see.**
+    // `WorkerProtocol_test.cpp` proves `SignedLeaseValidator` follows an
+    // `IAdvertisedEndpointSource`; what it cannot prove is that the node's factory hands
+    // it the seam rather than a snapshot of the seam. A `MakeWorkerLeaseValidator` that
+    // copied the current value would satisfy every case in that file and leave this
+    // worker checking grants against the address it booted with -- which is the whole
+    // defect, one layer up from where it is testable.
+    //
+    // So this drives the production path end to end: the real factory, the real
+    // `AnnouncedEndpoint`, a real key file, and a `Publish` standing in for the
+    // heartbeat's re-announce.
+    Testing::ScratchDirectory const scratch { "fc-worker-lease-advertise" };
+    auto const keyFile = scratch.Path() / "cluster.key";
+    WriteClusterKey(keyFile);
+
+    auto const cfg = ConfigWithKey(keyFile);
+    WorkerState state;
+
+    auto validator = MakeWorkerLeaseValidator(
+        cfg, state.advertised, SocketActivation::No, LeaseClock, state.lease, state.metrics, state.logger);
+    REQUIRE(validator.has_value());
+    // Registered, as every case here but the unregistered one assumes (#401).
+    state.lease.fleet.Pin(std::string { ThisCluster });
+
+    // Minted before anything moves, so the only variable between the two halves is what
+    // this worker says it answers on. Distinct serials because a grant is spendable
+    // exactly once (#614).
+    auto const forTheNewAddress = GrantUnder(CurrentTerm, "l-moved", MovedWorker);
+    auto const forTheOldAddress = GrantUnder(CurrentTerm, "l-stayed");
+
+    // The control, and it has to come first: at startup the address the process was
+    // given is the one that verifies. Without it the case would pass against a factory
+    // that built a validator refusing everything.
+    CHECK_FALSE((*validator)(forTheOldAddress, "gcc-13").refusal.has_value());
+
+    auto const beforeTheMove = (*validator)(forTheNewAddress, "gcc-13").refusal;
+    REQUIRE(beforeTheMove.has_value());
+    CHECK(Testing::Unwrap(beforeTheMove).reason == Distributed::LeaseRefusalReason::EndpointMismatch);
+
+    // What the heartbeat does once the configuration's answer moves.
+    state.advertised.Publish(std::string { MovedWorker });
+
+    // The SAME token, refused a moment ago, now verifies -- it was never consumed,
+    // because a refusal is decided before the spend. A validator holding a copy of the
+    // old address answers this exactly as it did above, which is the failure this case
+    // exists for.
+    CHECK_FALSE((*validator)(forTheNewAddress, "gcc-13").refusal.has_value());
+}
 
 TEST_CASE("A worker that has verified no grant still refuses a foreign fleet", "[node][lease][epoch]")
 {
@@ -162,7 +230,7 @@ TEST_CASE("A worker that has verified no grant still refuses a foreign fleet", "
     WorkerState state;
 
     auto validator = MakeWorkerLeaseValidator(
-        cfg, ThisWorker, SocketActivation::No, LeaseClock, state.lease, state.metrics, state.logger);
+        cfg, state.advertised, SocketActivation::No, LeaseClock, state.lease, state.metrics, state.logger);
     REQUIRE(validator.has_value());
 
     // What a completed registration round does, and the only way this worker learns a
@@ -221,7 +289,7 @@ TEST_CASE("The production factory wires the spend and the term through", "[node]
         [&said](std::string_view line) { said.emplace_back(line); } } };
 
     auto validator = MakeWorkerLeaseValidator(
-        cfg, ThisWorker, SocketActivation::No, LeaseClock, state.lease, state.metrics, state.logger);
+        cfg, state.advertised, SocketActivation::No, LeaseClock, state.lease, state.metrics, state.logger);
     REQUIRE(validator.has_value());
     // Registered, as every case here but the unregistered one assumes (#401).
     state.lease.fleet.Pin(std::string { ThisCluster });
@@ -294,7 +362,7 @@ TEST_CASE("A node with no cluster key builds a validator that learns and spends 
     WorkerState state;
 
     auto validator = MakeWorkerLeaseValidator(
-        cfg, ThisWorker, SocketActivation::No, LeaseClock, state.lease, state.metrics, state.logger);
+        cfg, state.advertised, SocketActivation::No, LeaseClock, state.lease, state.metrics, state.logger);
     REQUIRE(validator.has_value());
     // Registered, as every case here but the unregistered one assumes (#401).
     state.lease.fleet.Pin(std::string { ThisCluster });

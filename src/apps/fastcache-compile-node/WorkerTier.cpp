@@ -240,12 +240,18 @@ std::expected<std::unique_ptr<WorkerTier>, std::string> WorkerTier::Start(Worker
     auto leaseState = std::make_unique<Distributed::WorkerLeaseState>(Distributed::SchedulerTermRegressionNotice {
         [&logger = parts.logger](std::string_view line) { logger.Logf(LogLevel::Warn, "{}", line); } });
 
+    // What this worker advertises, seeded with what the process was started with and
+    // republished by the heartbeat when the configuration's answer moves (#1279).
+    // Declared BEFORE the validator, which borrows it, for the reason `leaseState`
+    // above is: a heap object so the borrow survives the tier being built around it.
+    auto announced = std::make_unique<AnnouncedEndpoint>(parts.advertise);
+
     // The whole trust decision is one call, made and announced where a test can reach
     // it: a grant carries an HMAC over this worker's endpoint, the toolchain, the key
     // and an expiry, so the check is local and costs the job nothing. A WALL clock,
     // because the expiry was stamped on another machine.
     auto validator = MakeWorkerLeaseValidator(
-        parts.cfg, parts.advertise, parts.activation, DefaultSystemWallClock(), *leaseState, parts.metrics, parts.logger);
+        parts.cfg, *announced, parts.activation, DefaultSystemWallClock(), *leaseState, parts.metrics, parts.logger);
     if (!validator.has_value())
         return std::unexpected { std::move(validator).error() };
 
@@ -253,6 +259,7 @@ std::expected<std::unique_ptr<WorkerTier>, std::string> WorkerTier::Start(Worker
                                                         std::move(machine),
                                                         *std::move(discovered),
                                                         *std::move(claim),
+                                                        std::move(announced),
                                                         std::move(leaseState),
                                                         *std::move(validator),
                                                         *std::move(link),
@@ -263,6 +270,7 @@ WorkerTier::WorkerTier(WorkerTierParts const& parts,
                        WorkerMachine machine,
                        DiscoveredToolchains discovered,
                        std::unique_ptr<IScratchClaim> scratchClaim,
+                       std::unique_ptr<AnnouncedEndpoint> announced,
                        std::unique_ptr<Distributed::WorkerLeaseState> leaseState,
                        Cc::LeaseValidator validator,
                        SchedulerLink link,
@@ -273,7 +281,7 @@ WorkerTier::WorkerTier(WorkerTierParts const& parts,
     _credential { parts.credential },
     _metrics { parts.metrics },
     _logger { parts.logger },
-    _advertise { parts.advertise },
+    _announced { std::move(announced) },
     _machine { std::move(machine) },
     _discovered { std::move(discovered) },
     _scratchClaim { std::move(scratchClaim) },
@@ -337,6 +345,12 @@ std::vector<Cc::WorkerRegistrar> WorkerTier::RegistrarsFor(std::map<std::string,
     // One registrar per toolchain, because REGISTER carries ONE fingerprint and
     // `--toolchain` is repeatable. Every entry heartbeats the SAME machine-wide in-flight
     // count, so the scheduler stops picking all of them together once this worker is busy.
+    //
+    // The endpoint is asked ONCE for the whole set rather than per registrar: every entry here
+    // describes the same machine at the same moment, and a publish landing between two
+    // of them would register one toolchain at the new address and the rest at the old.
+    auto const advertised = _announced->Current();
+
     std::vector<Cc::WorkerRegistrar> built;
     built.reserve(served.size());
     for (auto const& [fingerprint, toolchain]: served)
@@ -345,7 +359,7 @@ std::vector<Cc::WorkerRegistrar> WorkerTier::RegistrarsFor(std::map<std::string,
         // node-wide (#194).
         auto perToolchain = _advertisedWire;
         perToolchain.toolchainLabel = toolchain.label;
-        built.emplace_back(_registrarNotice, fingerprint, _advertise, _slots, Cc::AvailableCodecs(), perToolchain);
+        built.emplace_back(_registrarNotice, fingerprint, advertised, _slots, Cc::AvailableCodecs(), perToolchain);
     }
     return built;
 }
@@ -357,9 +371,28 @@ void WorkerTier::Serve(std::map<std::string, ServedToolchain> served)
     // refuses a job naming a dropped fingerprint rather than serving it with the new
     // compiler, and it never announces a fingerprint it is not yet ready to serve.
     _jobs.ReplaceToolchains(CompilersOf(_toolchains));
-    AdoptRegistrars(RegistrarsFor(_toolchains), _toolchains, _registrars, _withdrawals);
+    AdoptRegistrars(RegistrarsFor(_toolchains), _registrars, _withdrawals);
     // AFTER the two calls above: this says the worker is serving, and it must not say so
     // while the compile port still holds the previous answer.
+    PublishToolchains(_runtime, _toolchains.size(), _discovered.entries.size());
+}
+
+void WorkerTier::AnnounceAs(std::string endpoint)
+{
+    // Published FIRST, so the registrars built below carry the new address and the lease
+    // check moves in the same step. The old registrars still hold the address they
+    // registered under -- `Cc::WorkerRegistrar` keeps its own endpoint precisely so a
+    // withdrawal names the entry that exists rather than the one about to.
+    _announced->Publish(std::move(endpoint));
+
+    // The compile port is untouched, and that is the difference from `Serve`: the
+    // toolchains and the compilers behind them are unchanged, so nothing about what this
+    // worker will RUN moves. Only the address it is filed under does.
+    AdoptRegistrars(RegistrarsFor(_toolchains), _registrars, _withdrawals);
+
+    // Republished for `node-status`, because the registered count drops to zero until the
+    // round that follows re-registers -- and a status still claiming those toolchains
+    // registered would be describing entries that were just withdrawn.
     PublishToolchains(_runtime, _toolchains.size(), _discovered.entries.size());
 }
 
@@ -444,6 +477,22 @@ void WorkerTier::Heartbeat(std::stop_token const& stop, FleetSampler& sampler, I
         // this worker advertises, so gating it on that answer would be a reload an
         // operator watched do nothing.
         AdoptAllowlist(_jobs, _logger, _appliedExtraArgs, liveCfg.extraAllowedArgs);
+
+        // Compared SEPARATELY from `reloaded` as well, and for the opposite half of that
+        // reason: this changes what the fleet must be TOLD while changing nothing about
+        // the toolchains, so it must not ride the re-survey `reloaded` triggers -- an
+        // include-tree walk to move a string would be minutes of work telling the fleet
+        // nothing it could not have had at once. The DERIVED endpoint is what is
+        // compared; `AdvertisedEndpointChange` owns why.
+        //
+        // At Warn, beside the allowlist's: an address change is a fleet-visible event an
+        // operator is watching for, and the one thing that explains a burst of
+        // `LeaseEndpointMismatch` in the minutes after it.
+        if (auto moved = AdvertisedEndpointChange(_announced->Current(), snapshot))
+        {
+            _logger.Log(LogLevel::Warn, moved->announcement);
+            AnnounceAs(std::move(moved->endpoint));
+        }
         auto const depth = RecheckDepthFor(reloaded, beat, SweepEveryBeats);
         auto const voice = SurveyVoiceFor(reloaded, depth);
 

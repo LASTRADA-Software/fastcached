@@ -25,6 +25,66 @@
 namespace FastCache::Cc
 {
 
+/// Where a worker's advertised endpoint is read, at the moment it is PRESENTED.
+///
+/// ## Why a seam rather than a string
+///
+/// The advertised endpoint is what clients are told to dial, what the scheduler files
+/// this worker's registration under, and what a grant's MAC is taken over -- three
+/// audiences for one fact. Captured at construction it is a fact as of startup, which
+/// is wrong for every node whose address is not known when it starts: one behind a NAT
+/// or a load balancer, one on an interface configured after the service, one whose
+/// address is meant to be derived
+/// ([#1279](https://github.com/LASTRADA-Software/fastcached/issues/1279)).
+///
+/// So it is asked where it is presented, exactly as `Node::ICredentialSource` is asked
+/// for the credential this worker presents, and for the same reason: **a change that
+/// reaches some presentation sites and not others is worse than one that reaches
+/// none.** Here the two sites are the registration and the lease check, and their
+/// disagreement is not a degraded service -- it is a worker refusing grants the
+/// scheduler authentically signed, at an address nobody typed wrong.
+///
+/// ## What this does NOT loosen
+///
+/// The endpoint is still **this worker's own**, never one the request states. That is
+/// the property the endpoint is inside the MAC to provide -- it stops a token captured
+/// on the way to one machine from being replayed against every other machine trusting
+/// the same key -- and it is a rule about WHERE the value comes from, not about WHEN it
+/// is read. A `LeaseValidator` therefore still takes no endpoint parameter: a caller
+/// with one in hand would be holding something the client supplied.
+///
+/// ## The implementation owes two things
+///
+/// **Thread safety**, because the heartbeat thread publishes while a compile thread and
+/// the node's reactor read.
+///
+/// **One moment of change.** A value that moved between the registration and the lease
+/// check would leave this worker verifying against an address the scheduler has not
+/// been told about -- so an implementation changes what it answers at ONE point, with
+/// the re-registration, rather than tracking a configuration snapshot independently at
+/// each call. `Node::AnnouncedEndpoint` owns that argument on the production side.
+class IAdvertisedEndpointSource
+{
+  public:
+    virtual ~IAdvertisedEndpointSource() = default;
+
+    IAdvertisedEndpointSource() = default;
+    IAdvertisedEndpointSource(IAdvertisedEndpointSource const&) = default;
+    IAdvertisedEndpointSource& operator=(IAdvertisedEndpointSource const&) = default;
+    IAdvertisedEndpointSource(IAdvertisedEndpointSource&&) = default;
+    IAdvertisedEndpointSource& operator=(IAdvertisedEndpointSource&&) = default;
+
+    /// The endpoint clients should be told to dial, right now.
+    ///
+    /// **Returned by value, and it OWNS**, for `ICredentialSource::Current`'s reason one
+    /// step further along: this string decides whether an authentic grant verifies, so a
+    /// view into a snapshot the call does not keep alive is a borrow deciding a trust
+    /// question. One small string against a compiler spawn.
+    /// @return The endpoint; empty means this worker has nothing to advertise, which is
+    ///         a node that registers nowhere rather than one advertising the wildcard.
+    [[nodiscard]] virtual std::string Current() const = 0;
+};
+
 /// What a validator answers: whether the job may run, and until when.
 ///
 /// **Two things, because the second one had nowhere to go and the caller needed it.**
@@ -102,13 +162,20 @@ struct LeaseDecision
 /// verified -- everything it names is already in the token the caller is holding, in
 /// the clear -- so a refusal an operator can act on costs nothing extra.
 ///
-/// **It does not take the endpoint.** The endpoint a grant is checked against is
-/// the WORKER's own advertised address, which is fixed for the life of the process
-/// and is not the client's to state -- so a production implementation captures it,
-/// along with the signing key and the clock, and this signature carries only what
-/// arrives in the request. A parameter here would invite a caller to pass something
-/// the request supplied, which is the whole failure the endpoint is inside the MAC
-/// to prevent.
+/// **It does not take the endpoint**, and the reason is the DIRECTION the value comes
+/// from rather than when it is read. The endpoint a grant is checked against is the
+/// WORKER's own advertised address and is not the client's to state, so this signature
+/// carries only what arrives in the request: a parameter here would invite a caller to
+/// pass something the request supplied, which is the whole failure the endpoint is
+/// inside the MAC to prevent.
+///
+/// This paragraph used to rest on the address being *fixed for the life of the
+/// process*, which was true and is no longer: a production implementation reaches
+/// `IAdvertisedEndpointSource` per request (#1279), so a node that learns its address
+/// late stops verifying against the one it booted with. The conclusion is unchanged
+/// because it never depended on that premise -- worth saying, since a premise that has
+/// gone false under a conclusion that survives is how a correct rule acquires a wrong
+/// reason.
 ///
 /// @param leaseToken The token the client presented.
 /// @param fingerprint The toolchain the client says it compiled against.
@@ -134,9 +201,11 @@ using LeaseValidator = std::function<LeaseDecision(std::string_view leaseToken, 
 ///
 /// @param signingKey The cluster's pre-shared key; copied, since it outlives no
 ///        particular call.
-/// @param advertisedEndpoint This worker's address as clients are told to dial it --
-///        exactly the string it registered with the scheduler under, because that is
-///        the string the scheduler signed.
+/// @param advertisedEndpoint Where this worker's address is read, asked once per
+///        request. It must answer exactly the string this worker is REGISTERED under,
+///        because that is the string the scheduler signed -- which is why it is the
+///        same seam the registration reads and not a second reader of the
+///        configuration. Borrowed, so it must outlive the validator.
 /// @param clusterId The fleet this worker belongs to, copied. Compared for EQUALITY
 ///        against what the grant names, so two clusters provisioned from one
 ///        `--cluster-key-file` -- the ordinary outcome of copying a configuration to
@@ -172,7 +241,7 @@ using LeaseValidator = std::function<LeaseDecision(std::string_view leaseToken, 
 ///        wire code and the counter together -- so this sink exists for the one event
 ///        that is not a refusal and would otherwise be visible only in a log.
 [[nodiscard]] LeaseValidator SignedLeaseValidator(SecureByteBuffer signingKey,
-                                                  std::string advertisedEndpoint,
+                                                  IAdvertisedEndpointSource const& advertisedEndpoint,
                                                   WallClockRef clock,
                                                   Distributed::WorkerLeaseState& lease,
                                                   IMetricsSink& metrics,
@@ -462,6 +531,21 @@ class WorkerRegistrar
     [[nodiscard]] std::string const& Fingerprint() const noexcept
     {
         return _fingerprint;
+    }
+
+    /// The address this registrar announced, and the other half of the key the
+    /// scheduler files it under.
+    ///
+    /// **`(fingerprint, endpoint)` is the registry's key, so a diagnostic or a
+    /// withdrawal decision that names only the fingerprint names half an entry.** A
+    /// registrar keeps its own endpoint rather than re-reading
+    /// `IAdvertisedEndpointSource` for it: this is the address it REGISTERED under, and
+    /// `Withdraw` has to retire that entry and not whatever the node advertises by the
+    /// time the withdrawal goes out -- which, when the endpoint is what changed, is a
+    /// different entry (#1279).
+    [[nodiscard]] std::string const& Endpoint() const noexcept
+    {
+        return _endpoint;
     }
 
   private:

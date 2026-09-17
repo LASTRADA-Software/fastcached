@@ -2047,11 +2047,13 @@ address — so a list is written as one key with every value under it.
 
 | Reloadable | Requires a restart |
 |---|---|
-| `log_level`, `allow_compile_arg`, `requirepass`, `fleet_member`, `fleet_open`, `toolchain`, `no_toolchain_discovery` | `advertise`, `slots`, `node_class`, `reserve_cores`, and every listen, cache, cluster and TLS setting |
+| `log_level`, `allow_compile_arg`, `requirepass`, `fleet_member`, `fleet_open`, `toolchain`, `no_toolchain_discovery`, `advertise` | `slots`, `node_class`, `reserve_cores`, and every listen, cache, cluster and TLS setting |
 
 `log_level`, `allow_compile_arg`, `requirepass`, `fleet_member` and `fleet_open` take
 effect immediately and tell the fleet nothing; `toolchain` and `no_toolchain_discovery`
-re-register this worker, which is the section after next.
+re-register this worker, which is the section after next; `advertise` re-registers it
+too, at a new address, and retires the entry under the old one -- with the cost that
+section states.
 
 ### Revoking a machine
 
@@ -2133,14 +2135,29 @@ Three consequences, in decreasing order of how likely they are to surprise you:
   builds a fresh configuration from the file, so a key that is gone from the file is a
   setting that is gone — not one that persists from the previous run.
 
-### Why `advertise` and the capacity flags need a restart
+### `advertise` takes effect on reload, and what that costs
 
-Not an oversight in either case.
+A node does not always know its own address when it starts: one behind a NAT or a load
+balancer learns its external address later, and one waiting on an interface may have
+none worth advertising yet. So `advertise` is reloadable, and a reload does two things
+rather than one — the worker starts telling clients the new address, **and** it retires
+its registration under the old one instead of leaving the scheduler to expire it.
 
-`advertise` is inside the signature of every lease the scheduler has handed out
-naming this worker. Changing it while those are outstanding would not merely leave
-the fleet with a stale address — it would invalidate grants already in clients'
-hands, which would then be refused by this worker as naming the wrong endpoint.
+The cost is stated because it is real and it is bounded. `advertise` is inside the
+signature of every lease the scheduler has handed out naming this worker, so grants
+already in clients' hands name the address you have just left. Those are refused, each
+costing that client one local compile, until they expire. In the deployment this exists
+for that loses nothing: the address changed because the old one stopped working, so
+those grants named something nobody could reach anyway. What it replaces is worse — a
+worker that can never advertise the reachable address without being restarted.
+
+Two things keep it honest. A reload is judged by the **startup** rules as well, so it
+cannot advertise something the process would have refused to start with — the wildcard,
+or a dialable address on a worker whose `listen_node` binds loopback. And the change is
+announced in the log, naming both addresses, which is what explains a burst of
+endpoint-mismatch refusals in the minutes after it.
+
+### Why the capacity flags still need a restart
 
 `slots`, `node_class` and `reserve_cores` are resolved against what the cache tier
 actually holds, which is decided when that tier starts. Re-deriving them safely means

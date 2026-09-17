@@ -152,6 +152,12 @@ TEST_CASE("A node running no worker builds no worker tier, and a worker builds o
     auto const& tier = *worker.value();
     CHECK(tier.Slots() == Distributed::OfferableSlots(fixture.capacity, std::nullopt));
     CHECK(tier.StartupToolchainCount() == 1);
+    // Seeded with what the process was started advertising, which is what the first
+    // registration and every lease check before any reload read (#1279). Asserted here
+    // because `Start` is where the seam is built and handed to the validator: a tier
+    // that came up answering something else would have the fleet dialling one address
+    // while this worker verified grants against another.
+    CHECK(tier.Advertised().Current() == "127.0.0.1:6674");
     CHECK_FALSE(std::filesystem::is_empty(fixture.scratch.Path()));
 }
 

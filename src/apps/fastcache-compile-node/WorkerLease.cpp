@@ -17,7 +17,7 @@ namespace FastCache::Node
 {
 
 std::expected<Cc::LeaseValidator, std::string> MakeWorkerLeaseValidator(NodeConfig const& cfg,
-                                                                        std::string_view advertise,
+                                                                        Cc::IAdvertisedEndpointSource const& advertise,
                                                                         SocketActivation activation,
                                                                         WallClockRef clock,
                                                                         Distributed::WorkerLeaseState& lease,
@@ -68,8 +68,13 @@ std::expected<Cc::LeaseValidator, std::string> MakeWorkerLeaseValidator(NodeConf
     logger.Logf(LogLevel::Info,
                 "verifying lease signatures against the cluster key, for grants naming {}; the fleet is adopted "
                 "from the scheduler's registration reply",
-                advertise);
-    return Cc::SignedLeaseValidator(*std::move(key), std::string { advertise }, clock, lease, metrics);
+                // What is advertised NOW, which at this moment is what the process
+                // started with -- the seam's value can move later, and this line is a
+                // statement about startup. The move itself is announced where it
+                // happens (`AdvertisedEndpointChange`), so no reader has to infer it
+                // from a startup line that was true when it was printed.
+                advertise.Current());
+    return Cc::SignedLeaseValidator(*std::move(key), advertise, clock, lease, metrics);
 }
 
 } // namespace FastCache::Node

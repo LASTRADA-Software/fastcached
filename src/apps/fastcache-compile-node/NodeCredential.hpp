@@ -34,10 +34,18 @@ namespace FastCache::Node
 /// site that presents one holds a reference to this interface instead of a value.
 /// That is the type system doing the work: a reference of this type cannot go stale,
 /// because it holds no secret to be stale about. A site that wanted a fixed one would
-/// have to construct a `Cc::Credential` of its own, which is what
-/// `node-credential-seam` refuses -- the guard is a scan rather than the type, because
+/// have to construct a `Cc::Credential` of its own, which is what the seam case in
+/// `NodeCredential_test.cpp` refuses -- `ctest -R node-credential-tests` or, directly,
+/// the `[node][credential][seam]` tag. The guard is a scan rather than the type, because
 /// nothing forces a site to reach for the seam at all, and forgetting to must not read
 /// the same as deciding not to.
+///
+/// **Named by its TAG and not by a phrase, because the phrase sent a reader looking for
+/// a check that does not exist.** This said `node-credential-seam`, which matches no
+/// ctest registration and no script in the tree -- so somebody grepping for it finds two
+/// comments, nine unrelated `*-seam` checks, and concludes the hazard is unguarded. It is
+/// guarded; a scan implemented as a Catch2 case walking the sources is simply invisible
+/// to a search shaped for `scripts/check-*`.
 ///
 /// Implementations must be safe to call from several threads at once: the heartbeat
 /// thread, the node's reactor and the process main thread each reach one.
