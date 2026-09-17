@@ -1497,16 +1497,32 @@ what differs between compilers, standard libraries, hosts and tool versions.
   hand-spelled form obeys every OTHER rule: `views::iota` is a range view. It does NOT refuse a
   `static_cast` beside an `EnumeratorCount` — measured, six such sites are bounds checks on a
   value off a wire and correct — nor the C-style form, which is #1452's.
-- **A C-style loop is classified by its BODY; the head is not a classifier** (#1452 — 78 of 134
-  mechanical). Four shapes are not convertible: the body ADVANCES the variable (a range-for
-  advances a COPY, and `auto i` compiles while only `auto const i` is refused — a wrong cache key
-  in `DirectManifest`), a CALLEE advances it through `std::size_t&` (`ApplyOneOption`,
-  `TakeValue` — invisible to any body scan, and it breaks every `--key value` flag), an INCLUSIVE
-  bound (`iota` is half-open, so `<= N` is `N + 1`), and a COMPOUND bound (two clauses are not one
-  range; on the `iovec` builders the second is a budget). All four were first classified
-  mechanical, because **a text scan fails toward "nothing unusual here"** — so such a classifier
-  fails CLOSED and prints no count until it reproduces a hand-read site per verdict. Target
-  `std::views::iota`, never the `Ranges::` seam; for argv, `std::span{argv, argc}.subspan(1)`.
+- **A C-style loop is classified by its BODY; the head is not a classifier** (#1452). The
+  opening estimate was 78 of 134 mechanical; the outcome is **68**, and of the 66 that remain
+  exactly NONE is. That ten-site gap is this rule charging its own price — ten heads that read
+  mechanical over bodies that are not — so treat a head-shaped verdict as a CANDIDATE and never
+  as a clearance. **Six shapes are not convertible**, and the last two were found only by
+  reading:
+  - the body ADVANCES the variable (a range-for advances a COPY, and `auto i` compiles while
+    only `auto const i` is refused — a wrong cache key in `DirectManifest`);
+  - a CALLEE advances it through `std::size_t&` (`ApplyOneOption`, `TakeValue` — invisible to any
+    body scan, and it breaks every `--key value` flag);
+  - an INCLUSIVE bound (`iota` is half-open, so `<= N` is `N + 1`);
+  - a COMPOUND bound (two clauses are not one range; on the `iovec` builders the second is a
+    budget);
+  - the induction variable OUTLIVES the loop — `RedisResp.cpp` declares `i` above two sibling
+    loops and the second RESUMES where the first `break`s, so neither converts in isolation and
+    nothing in either head says so;
+  - a find-and-erase wearing a loop, which wants `ranges::find_if` and an erase rather than a
+    range-for — an ALGORITHM substitution, so `Core/Ranges.hpp`'s `FindOrNull` / `FindIfOrNull`.
+
+  All of them were first classified mechanical, because **a text scan fails toward "nothing
+  unusual here"** — so such a classifier fails CLOSED and prints no count until it reproduces a
+  hand-read site per verdict. Target `std::views::iota`, never the `Ranges::` seam; for argv,
+  `std::span{argv, argc}.subspan(1)`. A loop the remedy does not FIT takes an exemption row with
+  its reason, never a backlog row: a `for (;;)` on a list of loops to convert is a permanently
+  false to-do, and the check prints the exempted total on every run so the decision stays
+  visible.
 - Coverage is Clang source-based, never gcov: ~2000 Catch2 cases are ~2000 processes, and gcov's
   shared `.gcda` races them. `%8m`, not `%p`. `*_test.cpp` sits next to the implementation, so a
   report that counts it measures the tests testing themselves. A compiler cache and coverage cannot
@@ -1652,10 +1668,12 @@ and what they may assume.
   never a counted or unbounded poll. `ctest -R test-loops` refuses an atomic-polling `while` and
   a coroutine `while` that opens by parking **in tests** — their remedy is a test header, so
   widening them would refuse correct production code with advice nobody can follow — and a
-  C-style `for` **anywhere under `src/`**. The 148 production sites that already exist are a
+  C-style `for` **anywhere under `src/`**. The production sites that already exist are a
   RATCHET (`scripts/check-test-loops-backlog.txt`, keyed on a count per file, refusing a count
   that has risen AND one that has fallen without being recorded); a new one is refused, never
-  added to it. **Neuter a new wait and watch the teardown**: two such failures in #1446
+  added to it. **The count is not repeated here on purpose** — that file owns it, it has been
+  148, 134, 119 and 56 while this sentence stood still, and a prose copy of a number a table
+  owns is the second source of truth `ctest -R table-totals` refuses everywhere else. **Neuter a new wait and watch the teardown**: two such failures in #1446
   were hangs and aborts, not reds.
 - A **cumulative** figure cannot answer a question about **now**, and a duty cycle over the same
   window is the same number divided by the same constant. Draw the verdict from a RECENT window
