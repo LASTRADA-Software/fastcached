@@ -24,48 +24,18 @@
 #include <utility>
 #include <vector>
 
+#include <tests/MembershipFakes.hpp>
 #include <tests/Unwrap.hpp>
 
 using namespace FastCache;
 using namespace FastCache::Node;
+using FastCache::Testing::ListedMembership;
 using FastCache::Testing::Unwrap;
 
 namespace Wire = FastCache::CompileCacheWire;
 
 namespace
 {
-
-/// Admits exactly the peers it was given, and nobody else.
-///
-/// Not `OpenMembership`: a fake that admits everyone cannot tell *the gate is wired*
-/// from *the gate admits everyone*, and on this surface exactly one verb is meant to
-/// admit everyone. A fixture that could not see the difference would report the hole
-/// as correct.
-class ListedMembership final: public Distributed::IMembershipOracle
-{
-  public:
-    /// @param members Who may ask.
-    explicit ListedMembership(std::vector<std::string> members) noexcept:
-        _members { std::move(members) }
-    {
-    }
-
-    /// @copydoc Distributed::IMembershipOracle::Explain
-    ///
-    /// Names `FleetMemberList`, because that is the route this fake stands for: it models
-    /// `--fleet-member`'s host list. Through `DecidedBy`, so a miss stays unattributed
-    /// rather than claiming the list refused a host it never mentioned (#1471).
-    [[nodiscard]] Distributed::MembershipDecision Explain(std::string_view peerAddress) const override
-    {
-        return Distributed::DecidedBy(std::ranges::find(_members, peerAddress) != _members.end()
-                                          ? Distributed::Membership::Member
-                                          : Distributed::Membership::Outsider,
-                                      Distributed::MembershipParticipant::FleetMemberList);
-    }
-
-  private:
-    std::vector<std::string> _members;
-};
 
 /// Records what the scheduler proposed, and answers what a state holding it would.
 ///
@@ -221,7 +191,12 @@ struct Seed
     NullLogger logger;
     Distributed::SchedulerService service { clock, wallClock, metrics, logger, {}, {} };
     RecordingCluster cluster;
-    ListedMembership membership { { std::string { OperatorAddress } } };
+    // A LIST, not `OpenMembership`: a fake that admits everyone cannot tell *the gate is
+    // wired* from *the gate admits everyone*, and on this surface exactly one verb is meant
+    // to admit everyone -- so a fixture that could not see the difference would report the
+    // hole as correct. The route is named HERE rather than defaulted in the shared fake,
+    // because which route admits is this case's fact to state (#1497).
+    ListedMembership membership { { std::string { OperatorAddress } }, Distributed::MembershipParticipant::FleetMemberList };
     FixedKey key { std::string { TheKey } };
     EnrollmentWindow window { clock };
     EnrollmentResponder responder { window, service, membership, key, metrics, logger };

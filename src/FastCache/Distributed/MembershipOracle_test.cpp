@@ -8,7 +8,10 @@
 #include <string>
 #include <vector>
 
+#include <tests/MembershipFakes.hpp>
+
 using namespace FastCache::Distributed;
+using FastCache::Testing::FixedMembership;
 
 TEST_CASE("An empty cluster admits nobody but this machine", "[distributed][membership]")
 {
@@ -219,44 +222,6 @@ TEST_CASE("A composite with no participants refuses everybody", "[distributed][m
     // here would make an unwired composite quietly useful instead of visibly wrong.
     CHECK(admitted.Classify("127.0.0.1") == Membership::Outsider);
 }
-
-namespace
-{
-
-/// An oracle that answers one fixed verdict, so a composite's FOLD can be driven.
-///
-/// A fake that could only answer `Member` or `Outsider` could not exercise the rule it is
-/// here for: every oracle in the tree derives its answer from a host list, and a list
-/// cannot spell `Forgotten`.
-class FixedMembership: public IMembershipOracle
-{
-  public:
-    /// @param verdict What every peer gets.
-    /// @param participant Which route this fake stands for. **Required**: left defaulted, a case
-    ///        asserting *which participant decided* compares `None` against `None` and passes
-    ///        while the fold attributes nothing -- the acceptance clause of #1471 rendered
-    ///        vacuous by the fake rather than by the assertion, which is where reading does not
-    ///        find it. Ask for `None` explicitly to get an oracle that admits and attributes
-    ///        nothing; that is a case, not a default.
-    FixedMembership(Membership verdict, MembershipParticipant participant) noexcept:
-        _verdict { verdict },
-        _participant { participant }
-    {
-    }
-
-    /// @param peerAddress Ignored.
-    /// @return The fixed verdict.
-    [[nodiscard]] MembershipDecision Explain(std::string_view /*peerAddress*/) const override
-    {
-        return DecidedBy(_verdict, _participant);
-    }
-
-  private:
-    Membership _verdict;
-    MembershipParticipant _participant;
-};
-
-} // namespace
 
 TEST_CASE("A forget outranks a listing, whichever participant said it", "[distributed][membership][forget]")
 {

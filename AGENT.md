@@ -1757,8 +1757,12 @@ and what they may assume.
   refused, not cleared.
 - A scratch directory comes from `src/tests/ScratchPath.hpp`. A per-process counter is not unique —
   `catch_discover_tests` gives every case its own process, and the suite runs in parallel.
-- A test FAKE is a shared helper too: `src/tests/ScriptedSocket.hpp`. A fake nothing exercises does
-  not report its own bugs.
+- A test FAKE is a shared helper too: `src/tests/ScriptedSocket.hpp`, and the membership oracles are
+  `src/tests/MembershipFakes.hpp` (`ctest -R membership-fakes`). A fake nothing exercises does not
+  report its own bugs, and a WRONG one makes its cases pass — so no failure ever finds it. A copy's
+  cost is the number of FACTS it must get right, which GROWS: six copies were free until #1471 gave
+  each one a route to name. So the shared fake takes the participant REQUIRED and undefaulted, and
+  the fixture's own reason for a host list rather than an open oracle stays at its call site.
 - And a fake that resolves SYNCHRONOUSLY what production SUSPENDS on cannot exercise a suspension
   protocol, however correct its assertions — nothing is wrong with the fake, which is what makes
   this the harder half of the rule above. Every property defined by parking is vacuous over

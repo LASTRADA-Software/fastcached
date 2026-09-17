@@ -887,6 +887,49 @@ sits where everything needing it can include from -- and a fake nobody exercises
 does not report its own bugs, so copies of one drift silently and the drift is
 found by whichever case walks into it.
 
+### A fourth time, and what it adds is that the COST OF A COPY GROWS
+
+`tests/MembershipFakes.hpp` -- `ListedMembership` (admits the hosts it lists, and
+`Remove` stops admitting one mid-case) and `FixedMembership` (one verdict whatever it
+is asked, which is the only way to spell `Forgotten`, since no host list can). It was
+**six** copies across six test files, four of them byte-identical (#1497).
+
+Everything above applies unchanged. Two things are new, and the second is the reason
+this one is worth its own entry.
+
+**The direction a fake's bugs point.** Duplicated production code is found when it
+breaks. A duplicated FAKE cannot break its cases -- a fake that is wrong makes them
+**pass**, because a case asserts what the fake was built to produce. So the green
+suite says nothing, an assertion review says nothing, and the copy is found only when
+somebody happens to read it. Three of the four instances in this file were found by
+reading, one by a second copy being written; none by a failure.
+
+**A copy's cost is the number of FACTS it must get right, and that number is not
+fixed.** These six copies were free for as long as the seam had nothing to decide:
+`Classify` returned a verdict, every copy returned it the same way, and a wrong copy
+was not expressible. #1471 made `Explain` the one virtual and gave every answer an
+attributed ROUTE -- so each copy acquired a fact, *which participant do I stand for*,
+and each became a separate chance to name the wrong one. Naming the wrong route makes
+a case assert attribution it never established, which is a green test over a defect.
+
+The consequence for the fix: **the shared fake takes the participant as a REQUIRED,
+undefaulted argument.** Consolidating a fake must not consolidate the fact each case
+states about it, and a default is the tempting shape precisely because eleven of the
+twelve call sites want the same value. That is the type system used for the half of
+the rule it is right for -- the obligation is *supply a value*, so make the right
+answer the only reachable one -- while the ONE reason a fixture had for using a host
+list rather than an open oracle stays at that fixture's construction site, in its own
+words. Those reasons differed across all four copies and were the only part that did.
+
+`ctest -R membership-fakes` enforces it, over every `*_test.cpp`, and the enforcement
+is a `class`/`struct` whose base clause names `IMembershipOracle` -- bounded by
+`[^;{]*`, so a declaration WRAPPED across lines is still one match. That bound is the
+point rather than an optimisation: a line-based reader fails **open** on exactly the
+shape a formatter produces once a class name grows, which is the residual that would
+have let copy seven through. Its self-test watches it accept a mention in prose and a
+parameter of the interface type, because a pattern that has gone greedy passes the
+refusing cases and only the accepting ones can see it.
+
 ### A fake that RESOLVES what production SUSPENDS on makes every test over it vacuous
 
 The entry above is about a fake carrying its own bugs into every consumer. This one is
