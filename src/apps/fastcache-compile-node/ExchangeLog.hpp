@@ -86,6 +86,13 @@ inline constexpr std::array ExchangeLogTable {
                  .level = LogLevel::Info,
                  .rationale = "a worker joining is rare and is what an operator checks first when the fleet "
                               "distributes nothing" },
+    VerbLogRow { .code = CompileCacheWire::Op::NodeAnnounce,
+                 .level = LogLevel::Trace,
+                 .rationale = "it arrives every round from every node whatever it runs, so it grows an IDLE "
+                              "journal exactly as the heartbeat does and belongs at the same level. A node "
+                              "APPEARING is worth a line and this is not where it is drawn: presence is read "
+                              "off the fleet page, and what an operator wants from a periodic announce is "
+                              "ABSENCE, which no line can carry" },
     VerbLogRow { .code = CompileCacheWire::Op::Heartbeat,
                  .level = LogLevel::Trace,
                  .rationale = "the only verb that arrives whether or not anybody is building, so at Debug it is the "
