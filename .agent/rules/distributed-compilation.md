@@ -1858,10 +1858,16 @@ Six more about what the tier IS and who gets to see it:
   pasted `RunsWorker(c) &&`. Six such conjuncts were written by hand in the branch that
   introduced them, and it dropped one (the reload widening rule). `--scheduler` is NOT
   worker-only: `RunClusterAdmin` and `RunEnrollAdmin` read it, so a no-worker node keeps
-  it and registers nothing. **Stated loss:** it is a cluster member and not a
-  fleet-page machine, since both the Machines rows and the history handover ride
-  worker registration, and its `/metrics` and history read 0 slots rather than absent
-  (#1440).
+  it and registers nothing -- but it is still a **fleet-page machine**, because the
+  Machines rows and the history handover ride `NodeAnnounce`, which every node sends
+  (#1440). Its slot count on a fleet report is **absent**, never zero: a registered
+  worker always offers at least one slot, so a zero there could only ever mean *a
+  machine with no worker* said in the vocabulary of *a worker offering nothing*, and
+  the fleet totals would put a machine that can take no work into the denominator of
+  *how busy is this fleet*. Its own `fastcache_node_slots_configured` **does** read 0,
+  and that is correct rather than the same defect: a node offering no slots has a
+  capacity of zero, which is a reading rather than an unmade measurement. The two
+  fields answer different questions and the same word would be wrong in one of them.
   **The worker is `WorkerTier`, null on such a node** (#1387): no idle pool thread, no
   capacity sized to zero, no validator. It owns the `SchedulerLink`, so a worker cannot
   exist without one and a start that reaches it with no `--scheduler` is refused by
@@ -2401,11 +2407,25 @@ filed under comes from the very entry that is missing.
 **The wire carries no acknowledgement, and needs none.** The leader keeps a
 high-water mark per endpoint, so a batch redelivered after a reply the node never saw
 is ignored there rather than counted twice. The node's own cursor is the other half:
-it advances **only when the verb that carried the batch succeeded**. `accepted` also
-counts a *registration*, which carries no history at all, so a round where every
-heartbeat failed and one re-register succeeded stepped the cursor over a batch that
-was never sent. The cursor lives on the sampler beside the series it indexes, not as
-a bare integer in `main()` that only running the program could exercise.
+it advances **only when the verb that carried the batch succeeded**. The cursor lives
+on the sampler beside the series it indexes, not as a bare integer in `main()` that
+only running the program could exercise.
+
+**And exactly one verb carries it: NODE-ANNOUNCE, which every node sends** (#1440).
+That is forced rather than chosen. A machine running no worker never sends `Register`
+at all, so a carrier riding registration cannot serve the machine the handover matters
+most for -- a scheduler-only leader, whose own series is the one an election is about
+to orphan. And it cannot ride both verbs, because `NextHistoryBatch` advances a
+cursor: two callers in one process would each take a batch and each step past it,
+splitting the buckets between two verbs and losing any batch one took and the other
+acknowledged.
+
+The defect this rule was first written for was `accepted` counting a *registration*,
+which carries no history, so a round where every heartbeat failed and one re-register
+succeeded stepped the cursor over a batch that was never sent. **That shape is now
+unreachable rather than merely fixed**: `HeartbeatRound` has no sampler, so the
+worker's round cannot obtain a batch to step over. Reach for the type system when the
+obligation is *do something*; the comment was doing a job a missing field does better.
 
 **A leader persists what it was handed, and that is not an optimisation.** A node
 advances its watermark once and never resends, so a leader that forgot what it had

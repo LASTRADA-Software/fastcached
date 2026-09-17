@@ -648,6 +648,26 @@ std::expected<void, AnnounceRefusal> WorkerRegistrar::Register(ISocket& schedule
     return {};
 }
 
+std::expected<void, AnnounceRefusal> AnnounceNodePresence(ISocket& scheduler,
+                                                          CredentialNotice& notice,
+                                                          std::string_view endpoint,
+                                                          Wire::CapacityFields const& capacity,
+                                                          Wire::LoadFields const& load,
+                                                          Credential const& credential)
+{
+    auto const frame =
+        Wire::EncodeNodeAnnounce(Wire::NodeAnnounceRequest { .endpoint = endpoint, .capacity = capacity, .load = load });
+    auto const outcome = SyncRun(ExchangeFramed(&scheduler, &notice, frame, credential));
+    if (outcome.IsHit())
+        return {};
+
+    // No `UnknownLease` arm, and its absence is the point rather than an omission: there is no
+    // id to forget. A registrar clears its worker id on that refusal so the caller's retry
+    // re-registers; presence has nothing corresponding, because the ENDPOINT is the key and it
+    // does not stop being the key when a scheduler restarts.
+    return std::unexpected { AnnounceRefusal { .reason = DescribeOutcome(outcome), .leader = RedirectTarget(outcome) } };
+}
+
 std::expected<void, AnnounceRefusal> WorkerRegistrar::Heartbeat(ISocket& scheduler,
                                                                 std::uint32_t inFlight,
                                                                 Wire::LoadFields const& load,

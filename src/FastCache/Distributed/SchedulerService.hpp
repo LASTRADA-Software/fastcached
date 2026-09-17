@@ -481,6 +481,31 @@ class SchedulerService
                                            NodeLoad const& load,
                                            std::span<FleetBucket const> history = {});
 
+    /// Record that a machine EXISTS, and take whatever history it is handing over.
+    ///
+    /// **What a node sends when it has nothing to register.** A node with `--slots=0` runs no
+    /// worker, so it never calls `Register` and never heartbeats -- and before
+    /// [#1440](https://github.com/LASTRADA-Software/fastcached/issues/1440) that left it absent
+    /// from the fleet page's Machines table AND silent, handing over no history at all. The
+    /// most likely such machine is the LEADER, whose page this is.
+    ///
+    /// Gated exactly as `Heartbeat` is, with no `GateScope` relaxation: this writes the
+    /// scheduler's own view of the fleet, and a demoted node's view is not the one anybody
+    /// reads. It names no worker id because there is no worker -- the ENDPOINT is the identity,
+    /// which is what `NodeReports()` already groups by and what an operator means by a node.
+    ///
+    /// It grants nothing and reserves nothing: a machine that announces itself may not be
+    /// leased against, and its worker cells render ABSENT rather than zero.
+    /// @param caller Who is asking.
+    /// @param presence What the machine says about itself.
+    /// @param history Closed buckets it is handing over, oldest first, filed under the same
+    ///        endpoint a worker's batch would be -- history belongs to the MACHINE, never to a
+    ///        worker id, and this is the verb that makes that true where there is no worker.
+    /// @return `Ok`, or a refusal.
+    [[nodiscard]] SchedulerReply AnnounceNode(CallerContext const& caller,
+                                              NodePresence const& presence,
+                                              std::span<FleetBucket const> history = {});
+
     /// Retire one registration at the worker's own request.
     ///
     /// `Register`'s missing counterpart. Without it a worker that re-surveyed and

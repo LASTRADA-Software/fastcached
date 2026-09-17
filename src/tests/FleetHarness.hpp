@@ -213,6 +213,57 @@ class FleetHarness final: public Cc::IEndpointExchange
         _workerEndpoints.emplace_back(workerEndpoint);
     }
 
+    /// Announce a MACHINE to one scheduler, as `NodeAnnounce` does.
+    ///
+    /// **The verb a node sends whatever components it runs**, which is why this is beside
+    /// `RegisterWorker` rather than folded into it: a machine with `--slots=0` sends this and
+    /// never registers anything, and a harness that could only express a registration could
+    /// not build the fleet
+    /// [#1440](https://github.com/LASTRADA-Software/fastcached/issues/1440) is about -- a
+    /// scheduler-only leader whose own row and own history the page has to carry.
+    /// @param scheduler Which scheduler to tell.
+    /// @param machineEndpoint The machine announcing itself.
+    /// @param history Closed buckets it is handing over; empty is the ordinary case.
+    void AnnounceMachine(std::string_view scheduler,
+                         std::string_view machineEndpoint,
+                         std::span<Distributed::FleetBucket const> history = {})
+    {
+        auto const reply = NodeAt(scheduler).service.AnnounceNode(
+            // `SetupCaller` for `RegisterWorker`'s reason: this ARRANGES the fleet, so a case
+            // that set a refused caller host must fail at its own assertion rather than here.
+            SetupCaller(),
+            Distributed::NodePresence { .endpoint = machineEndpoint,
+                                        .version = "harness",
+                                        .capacity = Distributed::NodeCapacity { .logicalCores = 8 },
+                                        .load = Distributed::NodeLoad {} },
+            history);
+        if (reply.status != CompileCacheWire::Status::Ok)
+            throw std::runtime_error { "FleetHarness: the scheduler refused a machine announcement" };
+    }
+
+    /// The Machines rows one scheduler would draw.
+    ///
+    /// `NodeReports()` and never the worker entries, because that is what the page walks: a
+    /// machine serving two toolchains is two registry entries and ONE row, and a machine
+    /// running no worker is no entry at all and still a row.
+    /// @param scheduler Which scheduler to ask.
+    /// @return One report per machine it knows about.
+    [[nodiscard]] std::vector<Distributed::NodeReport> MachinesAt(std::string_view scheduler)
+    {
+        return NodeAt(scheduler).service.Workers().NodeReports();
+    }
+
+    /// Where @p scheduler files what other machines hand it.
+    ///
+    /// Borrowed, and the case owns it: a history store needs paths and a logger this harness
+    /// has no business inventing -- `SetMembershipAt`'s arrangement, for its reason.
+    /// @param scheduler Which scheduler.
+    /// @param sink Where handed-over buckets go, or null to discard them.
+    void SetHistorySinkAt(std::string_view scheduler, Distributed::IFleetHistorySink* sink)
+    {
+        NodeAt(scheduler).service.SetHistorySink(sink);
+    }
+
     /// Advance every clock in the fleet.
     ///
     /// The only way time moves. A lease expiry, a heartbeat age and a grant's

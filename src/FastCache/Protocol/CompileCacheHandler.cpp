@@ -1197,6 +1197,7 @@ Task<void> CompileCacheHandler::Run(ISocket* socket,
             // on the socket: the refusal is a reply, so the connection has to stay
             // in sync for whatever the client pipelined behind it.
             case Wire::Op::Register:
+            case Wire::Op::NodeAnnounce:
             case Wire::Op::Heartbeat:
             case Wire::Op::Withdraw:
             case Wire::Op::Lease:

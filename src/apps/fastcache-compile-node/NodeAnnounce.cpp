@@ -55,6 +55,25 @@ std::optional<EndpointChange> AdvertisedEndpointChange(std::string_view inForce,
     return EndpointChange { .endpoint = std::move(candidate), .announcement = std::move(said) };
 }
 
+Wire::LoadFields SampleMachineLoad(IHostLoadSampler& loadSampler,
+                                   CacheTier const* cacheTier,
+                                   IMetricsSink const& metrics,
+                                   std::uint32_t inFlight,
+                                   bool cordoned)
+{
+    auto const sampled = loadSampler.Sample();
+    // The cache is sampled here too, and per MACHINE rather than per registrar: a node with
+    // two `--toolchain` flags is two registry entries against one machine and one cache, so
+    // both entries carry the same figures. Summing them across entries counts that cache
+    // twice, which is what `WorkerRegistry::NodeCaches()` exists to prevent on the other end.
+    return Distributed::LoadToWire(Distributed::NodeLoad { .inFlight = inFlight,
+                                                           .cpuBusyPermille = sampled.cpuBusyPermille,
+                                                           .availableMemoryBytes = sampled.availableMemoryBytes,
+                                                           .freeScratchBytes = sampled.freeScratchBytes,
+                                                           .cache = CacheLoadOf(cacheTier, metrics),
+                                                           .cordoned = cordoned });
+}
+
 AnnounceOutcome AnnounceOnce(HeartbeatRound const& round, ISocket& client, std::string_view endpoint)
 {
     // Counted rather than short-circuited: one toolchain the scheduler refuses must
@@ -81,35 +100,14 @@ AnnounceOutcome AnnounceOnce(HeartbeatRound const& round, ISocket& client, std::
     // the SAME machine, so sampling per toolchain would report several different
     // views of one host and, worse, would cut the CPU interval into pieces too short
     // to mean anything.
-    auto const sampled = round.loadSampler.Sample();
-    // The cache is sampled here too, and per ROUND rather than per registrar for the
-    // same reason: a node with two `--toolchain` flags is two registry entries
-    // against one machine and one cache, so both entries carry the same figures.
-    // Summing them across entries counts that cache twice, which is what
-    // `WorkerRegistry::NodeCaches()` exists to prevent on the other end.
-    auto load = Distributed::LoadToWire(Distributed::NodeLoad { .inFlight = inFlight,
-                                                                .cpuBusyPermille = sampled.cpuBusyPermille,
-                                                                .availableMemoryBytes = sampled.availableMemoryBytes,
-                                                                .freeScratchBytes = sampled.freeScratchBytes,
-                                                                .cache = CacheLoadOf(round.cacheTier, round.metrics),
-                                                                .cordoned = round.capacity.IsCordoned() });
-
-    // This machine's own closed buckets, so the fleet's record of it survives an
-    // election. Bounded per round: a node absent for a day has 1440 to hand over and
-    // a heartbeat has a payload ceiling, so a catch-up converges across rounds from
-    // the oldest end.
     //
-    // Attached to the shared load and therefore sent once per registrar, which is
-    // redundant for a machine serving several toolchains and deliberately left so:
-    // the leader's high-water mark already makes a repeat a no-op, and threading a
-    // per-registrar payload through would buy a few kilobytes at the cost of the one
-    // place this is assembled.
-    auto const outbox = round.sampler.NextHistoryBatch(Wire::MaxHistoryBucketsPerHeartbeat);
-    load.history = Distributed::HistoryToWire(outbox);
-    // Set by a HEARTBEAT and by nothing else. `accepted` also counts a registration,
-    // which carries no history at all -- so a round where every heartbeat failed and
-    // one re-register succeeded would step the cursor over a batch never sent.
-    auto handedOver = false;
+    // **No history rides this verb any more, and the plumbing that carried it is gone
+    // rather than left inert** (#1440): `handedOver`, the cursor acknowledgement and the
+    // conditional heartbeat that existed to step it. History is the MACHINE's and travels
+    // on NODE-ANNOUNCE, which a node running no worker also sends -- see
+    // `SampleMachineLoad`, which owns the argument for one carrier.
+    auto const load =
+        SampleMachineLoad(round.loadSampler, round.cacheTier, round.metrics, inFlight, round.capacity.IsCordoned());
 
     // The first leader any entry was pointed at. One per round rather than one per
     // registrar: every entry here describes the same machine talking to the same
@@ -188,7 +186,6 @@ AnnounceOutcome AnnounceOnce(HeartbeatRound const& round, ISocket& client, std::
             {
                 ++accepted;
                 ++beats;
-                handedOver = true;
                 continue;
             }
             if (!leader.has_value())
@@ -245,8 +242,8 @@ AnnounceOutcome AnnounceOnce(HeartbeatRound const& round, ISocket& client, std::
             //
             // Not counted as a beat: `DescribeAnnounceRound` reads beats and registrations
             // as a partition of the registrars, and this one already registered.
-            if (load.cordoned && registrar.Heartbeat(client, inFlight, load, round.credential.Current()).has_value())
-                handedOver = true;
+            if (load.cordoned)
+                (void) registrar.Heartbeat(client, inFlight, load, round.credential.Current());
         }
         else
         {
@@ -259,9 +256,6 @@ AnnounceOutcome AnnounceOnce(HeartbeatRound const& round, ISocket& client, std::
                               registered.error().reason);
         }
     }
-    if (handedOver && !outbox.empty())
-        round.sampler.HistoryHandedThrough(outbox.back().startMillis);
-
     // What this round DID, and how loudly to say it -- see `DescribeAnnounceRound`,
     // which owns both because the wording is the defect it was written for (#999) and
     // `main.cpp` is in no test target (#909). The shortfall-behind-a-leader rule it
@@ -274,6 +268,31 @@ AnnounceOutcome AnnounceOnce(HeartbeatRound const& round, ISocket& client, std::
 
 std::size_t AnnounceRound(HeartbeatRound const& round, SchedulerLink& link, IEndpointDialer& dialer)
 {
+    /// The worker's announcement: registrations, withdrawals and the proof, as `AnnounceOnce`
+    /// has always done them. A thin adapter so the dial rules below are reached by one path.
+    class WorkerAnnouncement final: public IAnnouncement
+    {
+      public:
+        explicit WorkerAnnouncement(HeartbeatRound const& round) noexcept:
+            _round { round }
+        {
+        }
+
+        [[nodiscard]] AnnounceOutcome Attempt(ISocket& client, std::string_view endpoint) override
+        {
+            return AnnounceOnce(_round, client, endpoint);
+        }
+
+      private:
+        HeartbeatRound const& _round;
+    };
+
+    WorkerAnnouncement announcement { round };
+    return DialAndAnnounce(link, dialer, round.logger, announcement);
+}
+
+std::size_t DialAndAnnounce(SchedulerLink& link, IEndpointDialer& dialer, ILogger& logger, IAnnouncement& announcement)
+{
     for (link.BeginRound();;)
     {
         auto client = dialer.Dial(link.Target(), DialOptions { .connectTimeout = HeartbeatConnectTimeout });
@@ -284,10 +303,10 @@ std::size_t AnnounceRound(HeartbeatRound const& round, SchedulerLink& link, IEnd
             // went next, which "the configured endpoint" no longer identifies (#1310).
             auto const unreachable = link.Target();
             auto const next = link.Lost();
-            round.logger.Logf(LogLevel::Warn,
-                              "scheduler {} unreachable{}",
-                              unreachable,
-                              next.has_value() ? std::format("; trying {}", *next) : std::string {});
+            logger.Logf(LogLevel::Warn,
+                        "scheduler {} unreachable{}",
+                        unreachable,
+                        next.has_value() ? std::format("; trying {}", *next) : std::string {});
             // Another configured endpoint is tried now rather than a heartbeat interval
             // from now: this machine is out of the fleet for as long as it takes, and a
             // configured endpoint is the one still standing after an election the
@@ -298,7 +317,7 @@ std::size_t AnnounceRound(HeartbeatRound const& round, SchedulerLink& link, IEnd
             continue;
         }
 
-        auto const outcome = AnnounceOnce(round, *client, link.Target());
+        auto const outcome = announcement.Attempt(*client, link.Target());
         if (!outcome.leader.has_value())
         {
             // Committed only when this endpoint actually took an entry. It answered
@@ -316,15 +335,15 @@ std::size_t AnnounceRound(HeartbeatRound const& round, SchedulerLink& link, IEnd
             continue;
         }
 
-        round.logger.Logf(
+        logger.Logf(
             LogLevel::Info, "scheduler {} is not the leader; announcing to {} instead", link.Target(), *outcome.leader);
         if (!link.Redirect(*outcome.leader))
         {
             // Two schedulers naming each other, or a leader that moved again
             // mid-chain. Costs this round rather than the thread.
-            round.logger.Logf(LogLevel::Warn,
-                              "gave up following leader redirects after {} hop(s); retrying next heartbeat",
-                              MaxAnnounceRedirects);
+            logger.Logf(LogLevel::Warn,
+                        "gave up following leader redirects after {} hop(s); retrying next heartbeat",
+                        MaxAnnounceRedirects);
             return 0;
         }
     }

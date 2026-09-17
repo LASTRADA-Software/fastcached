@@ -1018,8 +1018,11 @@ converting a store. Before `Cache/CowTreeStorage`, `CowTree/`.
 - Nothing a receiver can **recompute** travels: a handed-over bucket carries two instants and
   the readings, and the leader rebuilds the fold and the coverage by replaying them. History is
   filed under the **machine**, never the worker id.
-- A handover cursor advances only on the verb that carried the batch — `accepted` also counts a
-  registration, which carries no history at all.
+- A handover cursor advances only on the verb that carried the batch, and exactly ONE verb
+  carries it — NODE-ANNOUNCE, which every node sends. Forced, not chosen: a workerless machine
+  never registers, and two callers of `NextHistoryBatch` would split one cursor. The worker's
+  round now has no sampler, so the old `accepted`-counts-a-registration defect is unreachable
+  rather than fixed.
 - A node's version is compiled in, rides REGISTER's *nested* capacity record (whose arity is
   variable) rather than its top level (whose arity is exact), and is refreshed on
   re-registration — a restart is what an upgrade looks like.

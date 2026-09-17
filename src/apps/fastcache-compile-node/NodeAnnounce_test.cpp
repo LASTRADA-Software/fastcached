@@ -390,18 +390,6 @@ struct AnnounceFixture
     SilentLoadSampler loadSampler;
     // The process singleton wall clock, for the reason `NodeCredential_test` gives beside
     // the same construction: the sampler keeps the ADDRESS and reads it from its own thread.
-    FleetSampler sampler { std::nullopt,
-                           metrics,
-                           [] {
-                               return MetricsSnapshot { .storage = std::nullopt,
-                                                        .storageTiers = {},
-                                                        .host = HostCapacity { .configuredSlots = 1, .busySlots = 0 },
-                                                        .upstreamConfigured = std::nullopt,
-                                                        .uptime = {} };
-                           },
-                           DefaultSystemWallClock(),
-                           HistoryPaths {},
-                           logger };
     CompileCapacity capacity { /*slots=*/1, /*byteBudget=*/1024ULL, std::chrono::seconds { 1 }, logger };
     ConfiguredCredential credential { cfg, nullptr };
     Distributed::WorkerLeaseState lease { Distributed::SchedulerTermRegressionNotice::Silent() };
@@ -427,7 +415,6 @@ struct AnnounceFixture
                                 .loadSampler = loadSampler,
                                 .cacheTier = nullptr,
                                 .metrics = metrics,
-                                .sampler = sampler,
                                 .credential = credential,
                                 .notice = notice,
                                 // Nothing to prove and nothing to present: every case in this

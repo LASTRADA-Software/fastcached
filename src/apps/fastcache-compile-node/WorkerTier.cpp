@@ -29,7 +29,6 @@ namespace
     /// two errors are not symmetric: a heartbeat that arrives late costs this worker
     /// its place in the fleet until it re-registers, while one that arrives early costs
     /// a few bytes.
-    constexpr std::chrono::seconds HeartbeatInterval { 20 };
 
     /// How many heartbeats between unconditional toolchain sweeps.
     ///
@@ -240,18 +239,15 @@ std::expected<std::unique_ptr<WorkerTier>, std::string> WorkerTier::Start(Worker
     auto leaseState = std::make_unique<Distributed::WorkerLeaseState>(Distributed::SchedulerTermRegressionNotice {
         [&logger = parts.logger](std::string_view line) { logger.Logf(LogLevel::Warn, "{}", line); } });
 
-    // What this worker advertises, seeded with what the process was started with and
-    // republished by the heartbeat when the configuration's answer moves (#1279).
-    // Declared BEFORE the validator, which borrows it, for the reason `leaseState`
-    // above is: a heap object so the borrow survives the tier being built around it.
-    auto announced = std::make_unique<AnnouncedEndpoint>(parts.advertise);
-
     // The whole trust decision is one call, made and announced where a test can reach
     // it: a grant carries an HMAC over this worker's endpoint, the toolchain, the key
     // and an expiry, so the check is local and costs the job nothing. A WALL clock,
     // because the expiry was stamped on another machine.
+    //
+    // It borrows `main`'s one `AnnouncedEndpoint` -- see `WorkerTierParts::announced` for why
+    // there is exactly one per process rather than one per component that needs an address.
     auto validator = MakeWorkerLeaseValidator(
-        parts.cfg, *announced, parts.activation, DefaultSystemWallClock(), *leaseState, parts.metrics, parts.logger);
+        parts.cfg, parts.announced, parts.activation, DefaultSystemWallClock(), *leaseState, parts.metrics, parts.logger);
     if (!validator.has_value())
         return std::unexpected { std::move(validator).error() };
 
@@ -259,7 +255,6 @@ std::expected<std::unique_ptr<WorkerTier>, std::string> WorkerTier::Start(Worker
                                                         std::move(machine),
                                                         *std::move(discovered),
                                                         *std::move(claim),
-                                                        std::move(announced),
                                                         std::move(leaseState),
                                                         *std::move(validator),
                                                         *std::move(link),
@@ -270,7 +265,6 @@ WorkerTier::WorkerTier(WorkerTierParts const& parts,
                        WorkerMachine machine,
                        DiscoveredToolchains discovered,
                        std::unique_ptr<IScratchClaim> scratchClaim,
-                       std::unique_ptr<AnnouncedEndpoint> announced,
                        std::unique_ptr<Distributed::WorkerLeaseState> leaseState,
                        Cc::LeaseValidator validator,
                        SchedulerLink link,
@@ -282,7 +276,7 @@ WorkerTier::WorkerTier(WorkerTierParts const& parts,
     _proofKey { parts.proofKey },
     _metrics { parts.metrics },
     _logger { parts.logger },
-    _announced { std::move(announced) },
+    _announced { parts.announced },
     _machine { std::move(machine) },
     _discovered { std::move(discovered) },
     _scratchClaim { std::move(scratchClaim) },
@@ -350,7 +344,7 @@ std::vector<Cc::WorkerRegistrar> WorkerTier::RegistrarsFor(std::map<std::string,
     // The endpoint is asked ONCE for the whole set rather than per registrar: every entry here
     // describes the same machine at the same moment, and a publish landing between two
     // of them would register one toolchain at the new address and the rest at the old.
-    auto const advertised = _announced->Current();
+    auto const advertised = _announced.Current();
 
     std::vector<Cc::WorkerRegistrar> built;
     built.reserve(served.size());
@@ -384,7 +378,7 @@ void WorkerTier::AnnounceAs(std::string endpoint)
     // check moves in the same step. The old registrars still hold the address they
     // registered under -- `Cc::WorkerRegistrar` keeps its own endpoint precisely so a
     // withdrawal names the entry that exists rather than the one about to.
-    _announced->Publish(std::move(endpoint));
+    _announced.Publish(std::move(endpoint));
 
     // The compile port is untouched, and that is the difference from `Serve`: the
     // toolchains and the compilers behind them are unchanged, so nothing about what this
@@ -397,13 +391,13 @@ void WorkerTier::AnnounceAs(std::string endpoint)
     PublishToolchains(_runtime, _toolchains.size(), _discovered.entries.size());
 }
 
-WorkerHeartbeat WorkerTier::Launch(FleetSampler& sampler, IClock const& statusClock)
+WorkerHeartbeat WorkerTier::Launch(IClock const& statusClock)
 {
     return WorkerHeartbeat { std::jthread {
-        [this, &sampler, &statusClock](std::stop_token const& stop) { Heartbeat(stop, sampler, statusClock); } } };
+        [this, &statusClock](std::stop_token const& stop) { Heartbeat(stop, statusClock); } } };
 }
 
-void WorkerTier::Heartbeat(std::stop_token const& stop, FleetSampler& sampler, IClock const& statusClock)
+void WorkerTier::Heartbeat(std::stop_token const& stop, IClock const& statusClock)
 {
     // One sampler for the whole loop, not one per heartbeat: CPU utilization is a
     // difference between two readings, so a sampler per beat would report nothing,
@@ -417,7 +411,6 @@ void WorkerTier::Heartbeat(std::stop_token const& stop, FleetSampler& sampler, I
                                  .loadSampler = *loadSampler,
                                  .cacheTier = _cacheTier,
                                  .metrics = _metrics,
-                                 .sampler = sampler,
                                  .credential = _credential,
                                  .notice = _registrarNotice,
                                  .proofKey = _proofKey,
@@ -496,7 +489,7 @@ void WorkerTier::Heartbeat(std::stop_token const& stop, FleetSampler& sampler, I
         // At Warn, beside the allowlist's: an address change is a fleet-visible event an
         // operator is watching for, and the one thing that explains a burst of
         // `LeaseEndpointMismatch` in the minutes after it.
-        if (auto moved = AdvertisedEndpointChange(_announced->Current(), snapshot))
+        if (auto moved = AdvertisedEndpointChange(_announced.Current(), snapshot))
         {
             _logger.Log(LogLevel::Warn, moved->announcement);
             AnnounceAs(std::move(moved->endpoint));
@@ -525,7 +518,7 @@ void WorkerTier::Heartbeat(std::stop_token const& stop, FleetSampler& sampler, I
 
         // A cordon, or its lifting, reaches the scheduler at once rather than a whole
         // interval later (#1303); a stop ends the wait immediately.
-        if (_capacity.WaitForHeartbeat(stop, announcedCordon, HeartbeatInterval) == HeartbeatWake::Stopped)
+        if (_capacity.WaitForHeartbeat(stop, announcedCordon, NodeAnnounceInterval) == HeartbeatWake::Stopped)
             break;
     }
 }

@@ -337,22 +337,35 @@ class FleetSampler final: public IFleetHistoryView
 
     /// The next batch of this machine's closed buckets to hand over.
     ///
-    /// The cursor lives HERE rather than in the heartbeat loop, beside the series it
+    /// The cursor lives HERE rather than in the announce loop, beside the series it
     /// indexes: a bare `std::int64_t` in `main()` is owned by nothing, cannot be
     /// tested without running the program, and is the same shape as the expiry
     /// sweep's resume cursor, which sits on the thing being swept for the same
     /// reason.
-    /// @param limit The most buckets one heartbeat may carry.
+    ///
+    /// **There is exactly ONE caller, and that is a rule rather than a fact about
+    /// today's tree**: two callers would each take a batch and each advance the
+    /// cursor, splitting the buckets between two verbs and losing any batch one took
+    /// and the other acknowledged. Since
+    /// [#1440](https://github.com/LASTRADA-Software/fastcached/issues/1440) it is the
+    /// presence loop, because that is the verb EVERY node sends -- a machine running
+    /// no worker never registers, so a carrier riding `Register` could not serve it.
+    /// @param limit The most buckets one announcement may carry.
     /// @return The oldest unsent closed buckets, oldest first.
     [[nodiscard]] std::vector<Distributed::FleetBucket> NextHistoryBatch(std::size_t limit) const;
 
     /// Move the cursor past what a scheduler took.
     ///
-    /// Called ONLY when a heartbeat carrying the batch was accepted. A round where
-    /// every heartbeat failed leaves the mark where it was, so the next round offers
-    /// the same buckets rather than stepping over them -- and a registration that
-    /// succeeded in the same round is not an acceptance of anything, because a
-    /// REGISTER carries no history.
+    /// Called ONLY when a NODE-ANNOUNCE carrying the batch was accepted. A round where
+    /// every endpoint refused leaves the mark where it was, so the next round offers
+    /// the same buckets rather than stepping over them -- which matters precisely
+    /// because a fleet mid-election is when every endpoint refuses, and that is the
+    /// history the handover exists to carry across an election.
+    ///
+    /// The old hazard here was a REGISTER succeeding in the same round being read as
+    /// an acceptance of a batch it never carried. That cannot arise any more: the
+    /// worker's round has no sampler to take a batch from, so it cannot carry history
+    /// at all. The type system holds the rule now rather than a comment (#1440).
     /// @param startMillis The newest bucket start that was handed over.
     void HistoryHandedThrough(std::int64_t startMillis) noexcept;
 

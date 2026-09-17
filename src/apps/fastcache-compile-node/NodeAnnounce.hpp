@@ -15,6 +15,7 @@
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Net/ISocket.hpp>
 #include <FastCache/Platform/HostLoad.hpp>
+#include <FastCache/Protocol/CompileCacheWire.hpp>
 
 #include <algorithm>
 #include <atomic>
@@ -188,7 +189,6 @@ struct HeartbeatRound
     IHostLoadSampler& loadSampler;   ///< CPU, memory and scratch.
     CacheTier const* cacheTier;      ///< Null on a node with no cache.
     IMetricsSink const& metrics;     ///< Where the cache figures are read.
-    FleetSampler& sampler;           ///< This machine's own series.
     /// What this worker PRESENTS to the scheduler, asked at each exchange.
     ///
     /// The seam and never a value, which is the whole of #404 in one member
@@ -340,6 +340,83 @@ inline constexpr std::chrono::milliseconds HeartbeatConnectTimeout { 1'000 };
 ///         round can achieve nothing -- nobody reachable, everybody refusing, a
 ///         redirect chain that ran out -- which are one answer to the only question
 ///         the caller asks of it: is this node getting through to a scheduler.
+/// How often a node says anything to a scheduler -- a worker's heartbeat and a machine's
+/// presence announcement alike.
+///
+/// **ONE number rather than two that can disagree.** The scheduler's heartbeat timeout is what
+/// decides when either goes stale, so a presence loop on its own cadence would make a
+/// machine's fleet row expire on a schedule nothing else in this process knew about -- and the
+/// two loops run in the same process against the same timeout (#1440).
+constexpr std::chrono::seconds NodeAnnounceInterval { 20 };
+
+/// The load record describing this MACHINE, sampled once.
+///
+/// Extracted rather than copied because both announcements describe ONE host: sampling twice in
+/// a process gives two readings a moment apart that disagree, and the CPU figure is a
+/// DIFFERENCE between successive readings, so a second sampler reports nothing meaningful at
+/// all rather than something slightly stale.
+///
+/// **It carries no history, and that absence is the design rather than an omission.** History
+/// is filed under the MACHINE, so it rides NODE-ANNOUNCE -- the one verb every node sends,
+/// including one that runs no worker and therefore never registers anything to hang it on
+/// ([#1440](https://github.com/LASTRADA-Software/fastcached/issues/1440)). Two callers of
+/// `FleetSampler::NextHistoryBatch` would each take a batch and each advance the cursor, so the
+/// buckets would be split between two verbs and a batch taken by one and acknowledged by the
+/// other would be lost. One carrier, and it is the one that always exists.
+/// @param loadSampler Where the host figures come from.
+/// @param cacheTier Null on a node with no cache.
+/// @param metrics Where the cache figures are read.
+/// @param inFlight Jobs this node is running for the fleet.
+/// @param cordoned Whether this node is refusing new work.
+/// @return The wire record, with an empty history.
+[[nodiscard]] CompileCacheWire::LoadFields SampleMachineLoad(IHostLoadSampler& loadSampler,
+                                                             CacheTier const* cacheTier,
+                                                             IMetricsSink const& metrics,
+                                                             std::uint32_t inFlight,
+                                                             bool cordoned);
+
+/// One announcement, on a connection somebody else dialled.
+///
+/// **The seam that lets a node with NO WORKER reach the fleet.** Everything about *which*
+/// scheduler to talk to -- the `--scheduler` list walked at most once per round, a `NotLeader`
+/// followed to the endpoint it names, a remembered leader that stops answering falling back in
+/// the SAME round, the bound that stops two nodes naming each other forever -- lives in
+/// `DialAndAnnounce` below and must live in exactly one place. A second loop with its own copy
+/// of those rules is the shape this repository keeps paying for, and the rules would then have
+/// two answers depending on whether the node happened to run a worker
+/// ([#1440](https://github.com/LASTRADA-Software/fastcached/issues/1440)).
+///
+/// So what varies is only what is SAID once a connection exists, which is this.
+class IAnnouncement
+{
+  public:
+    IAnnouncement() = default;
+    IAnnouncement(IAnnouncement const&) = delete;
+    IAnnouncement(IAnnouncement&&) = delete;
+    IAnnouncement& operator=(IAnnouncement const&) = delete;
+    IAnnouncement& operator=(IAnnouncement&&) = delete;
+    virtual ~IAnnouncement() = default;
+
+    /// Say it, on this connection.
+    /// @param client The dialled connection.
+    /// @param endpoint Where it was dialled, for the messages that name it.
+    /// @return What was learned: how many entries landed, and any leader redirect.
+    [[nodiscard]] virtual AnnounceOutcome Attempt(ISocket& client, std::string_view endpoint) = 0;
+};
+
+/// Dial a scheduler and make @p announcement, following a redirect and falling back.
+///
+/// The rules named on `IAnnouncement`, applied once. Callers differ only in what they say.
+/// @param link Which endpoint to try, and what an answer teaches it.
+/// @param dialer How a connection is made.
+/// @param logger Where an unreachable endpoint and a redirect are named.
+/// @param announcement What to say.
+/// @return How many entries the endpoint that answered accepted.
+[[nodiscard]] std::size_t DialAndAnnounce(SchedulerLink& link,
+                                          IEndpointDialer& dialer,
+                                          ILogger& logger,
+                                          IAnnouncement& announcement);
+
 [[nodiscard]] std::size_t AnnounceRound(HeartbeatRound const& round, SchedulerLink& link, IEndpointDialer& dialer);
 
 } // namespace FastCache::Node

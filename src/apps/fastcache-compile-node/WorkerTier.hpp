@@ -87,14 +87,20 @@ struct WorkerTierParts
     NodeConfig const& cfg;                     ///< The configuration the node started with.
     NodeReloader const* reloader;              ///< The live configuration; null with no file.
     Distributed::NodeCapacity const& capacity; ///< What `NodeCapacityOf` made of this machine.
-    /// `AdvertisedEndpoint` of the configuration this process started with, which a
-    /// grant's MAC covers.
+    /// Where this node tells clients to reach it, right now.
     ///
-    /// The SEED for `AnnouncedEndpoint`, and not a value this tier keeps re-reading: a
-    /// worker that learns its address late republishes it on a heartbeat and tells the
-    /// scheduler, so what is advertised after the first reload is the tier's own state
-    /// rather than anything `main` computed (#1279).
-    std::string_view advertise;
+    /// **Owned by `main` rather than by this tier since
+    /// [#1440](https://github.com/LASTRADA-Software/fastcached/issues/1440), because a node
+    /// that runs no worker still has to announce an address** -- and there may be exactly ONE
+    /// of these per process. A second would be a second value changing at a second moment,
+    /// which is the defect #1279 closed *inside* the worker reopened one level up, between the
+    /// worker and the presence loop: the registration and the lease check would agree with
+    /// each other and disagree with what the fleet page was told.
+    ///
+    /// This tier remains its only PUBLISHER, which is what keeps that property cheap: an
+    /// address is learned by re-surveying, and only a worker re-surveys. The presence loop
+    /// reads it and never writes.
+    AnnouncedEndpoint& announced;
     SocketActivation activation;                      ///< Whether a supervisor handed the port over.
     Distributed::IMembershipOracle const& membership; ///< Who may send a compile at all.
     ILocalityOracle const& locality;                  ///< Who may cordon this worker.
@@ -174,10 +180,12 @@ class WorkerTier
     ///
     /// Separate from `Start` because the sampler the heartbeat hands history through is
     /// built after the admin surface, which reads this tier's capacity.
-    /// @param sampler This machine's own series; must outlive the returned handle.
+    /// It no longer takes the `FleetSampler`: history is the MACHINE's and rides
+    /// NODE-ANNOUNCE from the presence loop, which runs on every node (#1440). This tier
+    /// hands over none, so it reads none.
     /// @param statusClock The clock `node-status` differences a registration against.
     /// @return The running heartbeat.
-    [[nodiscard]] WorkerHeartbeat Launch(FleetSampler& sampler, IClock const& statusClock);
+    [[nodiscard]] WorkerHeartbeat Launch(IClock const& statusClock);
 
     /// @return What answers the compile family on this node's `0xFC` listener.
     [[nodiscard]] CompileResponder& Responder() noexcept
@@ -205,7 +213,7 @@ class WorkerTier
     /// @return The source; it lives as long as this tier.
     [[nodiscard]] Cc::IAdvertisedEndpointSource const& Advertised() const noexcept
     {
-        return *_announced;
+        return _announced;
     }
 
     /// @return The slots this worker offers and enforces.
@@ -251,14 +259,13 @@ class WorkerTier
                WorkerMachine machine,
                DiscoveredToolchains discovered,
                std::unique_ptr<IScratchClaim> scratchClaim,
-               std::unique_ptr<AnnouncedEndpoint> announced,
                std::unique_ptr<Distributed::WorkerLeaseState> leaseState,
                Cc::LeaseValidator validator,
                SchedulerLink link,
                std::uint32_t slots);
 
     /// The heartbeat thread's body: the first survey, then a round per interval.
-    void Heartbeat(std::stop_token const& stop, FleetSampler& sampler, IClock const& statusClock);
+    void Heartbeat(std::stop_token const& stop, IClock const& statusClock);
 
     /// One registrar per served toolchain, carrying this machine's capacity record and
     /// the endpoint in force when it is called.
@@ -295,9 +302,9 @@ class WorkerTier
     IMetricsSink& _metrics;
     ILogger& _logger;
     /// What this worker advertises, and the one thing the registration and the lease
-    /// check both read. A heap object so the validator's borrow survives this tier
-    /// being built around it -- `_leaseState`'s reason, for `_leaseState`'s consumer.
-    std::unique_ptr<AnnouncedEndpoint> _announced;
+    /// check both read. Borrowed from `main`, which declares it above this tier and destroys
+    /// it after -- `_proofKey`'s arrangement, for `_proofKey`'s reason.
+    AnnouncedEndpoint& _announced;
     WorkerMachine _machine;
     SteadyClock _toolchainClock;
     DiscoveredToolchains _discovered;

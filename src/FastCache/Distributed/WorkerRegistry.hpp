@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cstdint>
 #include <expected>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -211,8 +212,21 @@ struct NodeReport
     /// whatever the *contributing* entry last carried, and that one is folded
     /// across all of them.
     NodeLoad load {};
-    /// The largest slot count any of this machine's entries registered with.
-    std::uint32_t registeredSlots { 0 };
+    /// The largest slot count any of this machine's entries registered with, ABSENT on a
+    /// machine that runs no worker.
+    ///
+    /// **Absent rather than zero**, and the two are not interchangeable here even though no
+    /// live worker can carry a zero: `--slots=0` means there is NO worker, so a registered
+    /// entry always offers at least one slot. That is exactly what makes a zero in this field
+    /// ambiguous -- it could only ever mean *a machine with no worker*, said in the vocabulary
+    /// of *a worker offering nothing*, and the fleet page would render it as a real ceiling of
+    /// zero rather than as a cell with nothing in it
+    /// ([#1440](https://github.com/LASTRADA-Software/fastcached/issues/1440)).
+    ///
+    /// Not inferred from `fingerprints` being empty either. That would be the same fact read
+    /// off a different field, which is an inference a later change can falsify; a machine's
+    /// worker offer is its own question and says so.
+    std::optional<std::uint32_t> registeredSlots {};
     /// This fleet's jobs running on the machine.
     ///
     /// The maximum across its entries, not the sum: every writer of the underlying
@@ -255,6 +269,26 @@ struct NodeCacheReport
 ///
 /// A struct rather than four positional parameters: two of them are strings that
 /// would be transposable at a call site, and a fifth field is a foreseeable change.
+/// What a machine says about itself when it has nothing to register.
+///
+/// A record rather than loose parameters for `WorkerRegistration`'s reason: the UTF-8 gate is
+/// a TABLE over a record's fields, and text another machine will read is refused where it
+/// enters. Two fields here rather than five, which changes the table's length and not whether
+/// there is one ([#1440](https://github.com/LASTRADA-Software/fastcached/issues/1440)).
+struct NodePresence
+{
+    std::string_view endpoint;   ///< host:port the machine answers on; the key its row is filed under.
+    std::string_view version {}; ///< What software it runs; empty means it did not say.
+
+    /// What the machine is. Read for the page's columns, never for scheduling: nothing may be
+    /// leased against a machine that registered no worker.
+    NodeCapacity capacity {};
+
+    /// What it is doing, and what its cache holds. A machine with no worker still has a CPU, a
+    /// memory figure and a cache, so this is not an empty passenger.
+    NodeLoad load {};
+};
+
 struct WorkerRegistration
 {
     std::string_view fingerprint; ///< Toolchain identity.
@@ -428,6 +462,29 @@ class WorkerRegistry
     ///         ordinary case.
     [[nodiscard]] std::vector<std::string> ExpireStale();
 
+    /// Record that a machine EXISTS, whatever components it runs.
+    ///
+    /// **Presence is not a registration and adds no capacity.** It is keyed by the machine's
+    /// ENDPOINT, held apart from `_workers`, and nothing may lease against it: a node that runs
+    /// no worker is a row on the fleet page and a place for its history to be filed, never a
+    /// place to send work ([#1440](https://github.com/LASTRADA-Software/fastcached/issues/1440)).
+    ///
+    /// Held apart rather than as a `_workers` entry with an absent fingerprint, because this
+    /// registry keys on `(fingerprint, endpoint)` and every consumer of `LiveWorkers()` walks
+    /// that map. A fingerprint-less entry there would be a pseudo-worker with no toolchain and
+    /// no slots -- which is the workaround #206 deleted, where a FAKE toolchain made a machine
+    /// a registered worker so it would get a page row.
+    ///
+    /// **A node that runs a worker announces too**, and both records then describe it: the
+    /// worker entries carry what can be leased, this carries that it is there. `NodeReports()`
+    /// prefers the worker entries where both exist, so a machine with a worker renders exactly
+    /// as it did before.
+    /// @param endpoint Where the machine answers; the key.
+    /// @param capacity What the machine is.
+    /// @param load What it is doing, and what its cache holds.
+    /// @param version What software it runs; empty means it did not say.
+    void NoteNodePresent(std::string endpoint, NodeCapacity const& capacity, NodeLoad const& load, std::string version);
+
     /// Drop one registration because the worker says it no longer serves it.
     ///
     /// The same event as `ExpireStale` reached deliberately instead of by timeout,
@@ -550,7 +607,22 @@ class WorkerRegistry
     std::chrono::milliseconds _heartbeatTimeout;
     mutable std::mutex _mutex;
     std::unordered_map<std::string, Entry> _workers; ///< Guarded by _mutex.
-    std::uint64_t _nextId { 1 };                     ///< Guarded by _mutex.
+
+    /// What a machine last said about itself, whatever it runs. Guarded by _mutex.
+    ///
+    /// Aged out by the same heartbeat timeout the worker entries use, but FILTERED rather than
+    /// expired as an event: `ExpireStale` is an event because something is held against a
+    /// worker and has to be released, and nothing is held against presence. A row that stops
+    /// being refreshed stops being drawn, which is all its absence means.
+    struct Presence
+    {
+        NodeCapacity capacity {};
+        NodeLoad load {};
+        std::string version {};
+        TimePoint lastSeen {};
+    };
+    std::map<std::string, Presence> _present;
+    std::uint64_t _nextId { 1 }; ///< Guarded by _mutex.
 };
 
 } // namespace FastCache::Distributed

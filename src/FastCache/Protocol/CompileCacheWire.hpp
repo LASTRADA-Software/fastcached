@@ -638,6 +638,29 @@ enum class Op : std::uint8_t
     /// Two codes because the remedies are opposite: the first is a client that has the
     /// exchange wrong, the second is a key that does not match.
     ProveNode = 0x19,
+
+    /// A node tells the scheduler it EXISTS, whatever components it runs.
+    ///
+    /// Its own verb rather than a `Register` with no fingerprint, and that is the whole
+    /// decision of [#1440](https://github.com/LASTRADA-Software/fastcached/issues/1440).
+    /// The registry keys on `(fingerprint, endpoint)`, so a fingerprint-less registration
+    /// has no key -- and every consumer of `LiveWorkers()` would then walk an entry with no
+    /// toolchain and no slots. That pseudo-worker is exactly the workaround #206 deleted, in
+    /// which a FAKE toolchain made a machine a registered worker so it would get a Machine
+    /// row; spelling the fake as an absent field rather than a made-up string changes how it
+    /// reads and not what it is.
+    ///
+    /// So presence is keyed by the machine's ENDPOINT and held apart from worker entries. It
+    /// carries no slots and no fingerprint, nothing may lease against it, and it adds no
+    /// capacity: a machine announcing itself is a row on the page and a place for history to
+    /// be filed, never a place to send work.
+    ///
+    /// **Every node sends it, including one that runs a worker.** A node with `--slots=0`
+    /// is the reason it exists, but a verb only the workerless send would be a verb that is
+    /// exercised exactly where nobody is looking -- and the history cursor rule (*it advances
+    /// only on the verb that carried the batch*) then has two answers depending on a
+    /// configuration flag.
+    NodeAnnounce = 0x1A,
 };
 
 /// Reply status, the first byte of every reply.
@@ -1754,6 +1777,16 @@ inline constexpr std::array OpTable {
                    .name = "register",
                    .fieldCount = 5, // fingerprint, endpoint, u32 slots, accepted codecs, capacity
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
+                   .preAuth = RequiresAuth,
+                   .maxPayload = BoundedTo(MaxControlPayload),
+                   .family = VerbFamily::Scheduler },
+    OpDescriptor { .code = Op::NodeAnnounce,
+                   .name = "node-announce",
+                   .fieldCount = 3, // endpoint, capacity, load
+                   .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
+                   // Not pre-auth, for the same reason as every other verb in this block: a
+                   // node announcing itself is already a caller the scheduler's credential
+                   // gate admits, so requiring it refuses nobody.
                    .preAuth = RequiresAuth,
                    .maxPayload = BoundedTo(MaxControlPayload),
                    .family = VerbFamily::Scheduler },
@@ -3955,6 +3988,78 @@ struct LoadFields
         out.cordoned = true;
     }
     return out;
+}
+
+/// What a node says about itself, whatever it runs.
+///
+/// The ENDPOINT is the machine's identity here, as it is for a worker entry -- it is what an
+/// operator means by *a node*, and `NodeReports()` already groups by it. No fingerprint and no
+/// slots, for `Op::NodeAnnounce`'s reasons.
+struct NodeAnnounceRequest
+{
+    /// Where this machine answers, as it would register.
+    std::string_view endpoint;
+
+    /// The machine's registration facts: cores, memory, class, cache budget and version.
+    ///
+    /// The SAME nested record `Register` carries rather than a second spelling of the same
+    /// facts. Two records would be two places for *what is this machine* to be wrong, and the
+    /// fleet page renders them through one column table either way.
+    CapacityFields capacity {};
+
+    /// What it is doing now, and the history buckets it is handing over.
+    ///
+    /// A machine with no worker still has a CPU, a memory figure and a cache, so this is not
+    /// an empty passenger on such a node -- and `load.history` is how the batch travels, which
+    /// is the second half of #1440: a node whose history rode the worker heartbeat handed over
+    /// nothing at all when it had no worker.
+    LoadFields load {};
+};
+
+/// Frame a NODE-ANNOUNCE request.
+/// @param request What the node says about itself.
+/// @param version Version to advertise.
+/// @return The framed request.
+[[nodiscard]] inline std::vector<std::byte> EncodeNodeAnnounce(NodeAnnounceRequest const& request,
+                                                               WireVersion version = CurrentVersion)
+{
+    auto const capacity = EncodeCapacity(request.capacity);
+    auto const load = EncodeLoad(request.load);
+    return Detail::EncodeRequest(
+        version,
+        Op::NodeAnnounce,
+        { AsBytes(request.endpoint), std::span<std::byte const> { capacity }, std::span<std::byte const> { load } });
+}
+
+/// A node's announcement of itself, as received.
+///
+/// The endpoint BORROWS -- every consumer reads it inside the handler that decoded it -- while
+/// the two nested records are decoded into owned values, exactly as `RegisterView` and
+/// `HeartbeatView` do. Handing back raw spans instead would push the nested decoding into each
+/// caller, which is where two callers come to disagree about whether an ABSENT record is a
+/// malformed one. `DecodeCapacity` answers that question once, and its answer is *no*.
+struct NodeAnnounceView
+{
+    std::span<std::byte const> endpoint;
+    CapacityFields capacity {};
+    LoadFields load {};
+};
+
+/// Split a NODE-ANNOUNCE payload.
+/// @param payload The bytes following the request header.
+/// @return The fields, or nullopt when malformed.
+[[nodiscard]] inline std::optional<NodeAnnounceView> DecodeNodeAnnouncePayload(std::span<std::byte const> payload)
+{
+    auto const fields = SplitFields(payload, OpFieldCount(Op::NodeAnnounce));
+    if (!fields.has_value())
+        return std::nullopt;
+    auto capacity = DecodeCapacity((*fields)[1]);
+    if (!capacity.has_value())
+        return std::nullopt;
+    auto load = DecodeLoad((*fields)[2]);
+    if (!load.has_value())
+        return std::nullopt;
+    return NodeAnnounceView { .endpoint = (*fields)[0], .capacity = *std::move(capacity), .load = *std::move(load) };
 }
 
 /// Frame a HEARTBEAT request.
