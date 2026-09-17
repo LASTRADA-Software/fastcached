@@ -545,7 +545,7 @@ TEST_CASE("The strip's words are public, row for row with its keys", "[distribut
     CHECK(compiling->ofNoun == "slots");
     auto const snapshot = LeadingSnapshot();
     CHECK(RenderFleetHtml(snapshot, NoHistory(), 0)
-              .contains(std::format("/ {} {}", snapshot.nodes.front().registeredSlots, compiling->ofNoun)));
+              .contains(std::format("/ {} {}", Unwrap(snapshot.nodes.front().registeredSlots), compiling->ofNoun)));
 }
 
 TEST_CASE("A limit's tone and a refusal's alert are the leader's, beside the page's chip", "[distributed][fleetview][tone]")

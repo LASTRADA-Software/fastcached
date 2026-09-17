@@ -825,9 +825,20 @@ FleetTotals TotalsFor(FleetSnapshot const& snapshot) noexcept
         auto machineLoad = node.load;
         machineLoad.inFlight = node.fleetJobsInFlight;
 
-        auto const ceilings = SlotCeilingsFor(node.capacity, node.registeredSlots, machineLoad);
-        totals.registered += node.registeredSlots;
+        // A machine that runs no worker contributes to NEITHER total and gets no ceiling
+        // computed: it offers nothing, so counting it as zero registered and zero free is
+        // arithmetically identical and semantically a claim -- it would put a machine in the
+        // denominator of *how much of this fleet is busy* that was never able to take work
+        // (#1440). Its in-flight count is still read, because a machine with no worker of THIS
+        // fleet can still be running jobs nobody here granted, and that is what the external
+        // ceiling is about.
         totals.inFlight += node.fleetJobsInFlight;
+        if (!node.registeredSlots.has_value())
+            continue;
+        auto const registered = *node.registeredSlots;
+
+        auto const ceilings = SlotCeilingsFor(node.capacity, registered, machineLoad);
+        totals.registered += registered;
 
         // A ceiling is the total a machine supports with its RUNNING jobs
         // INCLUDED -- `Detail::CeilingFrom` says so in as many words -- so adding
@@ -839,7 +850,7 @@ FleetTotals TotalsFor(FleetSnapshot const& snapshot) noexcept
         // `WorkerRegistry::FreeSlots` is the definition this has to match, and it
         // subtracts before calling anything free. Two answers to "what is free"
         // is how a page comes to disagree with the scheduler it is describing.
-        auto const ceiling = std::min(ceilings.available, node.registeredSlots);
+        auto const ceiling = std::min(ceilings.available, registered);
         totals.free += node.fleetJobsInFlight >= ceiling ? 0U : ceiling - node.fleetJobsInFlight;
     }
 

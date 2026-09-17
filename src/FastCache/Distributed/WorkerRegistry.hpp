@@ -211,8 +211,21 @@ struct NodeReport
     /// whatever the *contributing* entry last carried, and that one is folded
     /// across all of them.
     NodeLoad load {};
-    /// The largest slot count any of this machine's entries registered with.
-    std::uint32_t registeredSlots { 0 };
+    /// The largest slot count any of this machine's entries registered with, ABSENT on a
+    /// machine that runs no worker.
+    ///
+    /// **Absent rather than zero**, and the two are not interchangeable here even though no
+    /// live worker can carry a zero: `--slots=0` means there is NO worker, so a registered
+    /// entry always offers at least one slot. That is exactly what makes a zero in this field
+    /// ambiguous -- it could only ever mean *a machine with no worker*, said in the vocabulary
+    /// of *a worker offering nothing*, and the fleet page would render it as a real ceiling of
+    /// zero rather than as a cell with nothing in it
+    /// ([#1440](https://github.com/LASTRADA-Software/fastcached/issues/1440)).
+    ///
+    /// Not inferred from `fingerprints` being empty either. That would be the same fact read
+    /// off a different field, which is an inference a later change can falsify; a machine's
+    /// worker offer is its own question and says so.
+    std::optional<std::uint32_t> registeredSlots {};
     /// This fleet's jobs running on the machine.
     ///
     /// The maximum across its entries, not the sum: every writer of the underlying

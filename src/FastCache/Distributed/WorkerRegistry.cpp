@@ -476,7 +476,13 @@ std::vector<NodeReport> WorkerRegistry::NodeReports() const
         // jobs as running eight -- and `TotalsFor` then had four slots of real work
         // it could not account for and rendered them as withheld by somebody else.
         held.report.fingerprints.push_back(entry.info.fingerprint);
-        held.report.registeredSlots = std::max(held.report.registeredSlots, entry.info.slots);
+        // Both sides are worker entries -- this is the fold over `_workers` -- so the held
+        // value is engaged and a `value_or(0)` here would be a default standing in for a state
+        // that cannot arise. A presence-only row never reaches this loop, which is what keeps
+        // its absent slot count absent (#1440).
+        held.report.registeredSlots = held.report.registeredSlots.has_value()
+                                          ? std::max(*held.report.registeredSlots, entry.info.slots)
+                                          : std::optional<std::uint32_t> { entry.info.slots };
         held.report.fleetJobsInFlight = std::max(held.report.fleetJobsInFlight, entry.info.inFlight);
 
         // And the machine-wide half, where only ONE entry contributes -- adding
