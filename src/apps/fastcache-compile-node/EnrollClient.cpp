@@ -314,7 +314,9 @@ std::expected<std::string, std::string> RunEnrollAdmin(NodeConfig const& cfg,
 
     auto const options = DialOptions { .connectTimeout = DialTimeout };
     std::optional<std::string> leader;
-    for (auto hop = 0; hop <= MaxRedirects; ++hop)
+    // `MaxRedirects + 1` because the bound was inclusive and `iota` is half-open: three
+    // redirects means four asks, which is what this loop has always done.
+    for (auto const hop: std::views::iota(0, MaxRedirects + 1))
     {
         // The first ask walks the configured list and takes whichever CONNECTS; a
         // redirect names one endpoint and is followed there, never back into the list

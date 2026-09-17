@@ -634,14 +634,17 @@ inline void RaftClusterHarness::CheckInvariants()
             auto const& right = _nodes[inner]->driver->Node().Log();
             auto const shared = std::min(left.LastIndex().value, right.LastIndex().value);
 
-            for (auto index = shared; index >= 1; --index)
+            // Descending to 1, so the range is built ascending and reversed -- the spelling
+            // `DashboardPanel_test.cpp` already uses. Empty when `shared` is 0, which is what
+            // `0 >= 1` gave.
+            for (auto const index: std::views::iota(std::uint64_t { 1 }, shared + 1) | std::views::reverse)
             {
                 auto const at = LogIndex { .value = index };
                 if (left.TermAt(at) != right.TermAt(at))
                     continue;
 
                 // Agreed here, so every entry below must be identical.
-                for (auto below = index; below >= 1; --below)
+                for (auto const below: std::views::iota(std::uint64_t { 1 }, index + 1) | std::views::reverse)
                 {
                     auto const* const a = left.EntryAt(LogIndex { .value = below });
                     auto const* const b = right.EntryAt(LogIndex { .value = below });

@@ -379,7 +379,10 @@ auto FilePageStore::RecoverExistingFile() -> std::expected<void, CowTreeError>
 
     // Mark every data page index live by default; consult the on-disk
     // free-list chain to subtract recycled pages.
-    for (std::uint64_t i = 1; i <= _totalDataPages; ++i)
+    // `+ 1` because `iota` is half-open where the loop it replaces was inclusive. Safe in
+    // both directions that matter: the sum overflows only at 2^64 - 1 data pages, and a store
+    // with NONE gives an empty range, which is what `1 <= 0` gave.
+    for (auto const i: std::views::iota(std::uint64_t { 1 }, _totalDataPages + 1))
         _live.insert(i);
 
     // `live.freeRoot` names a chain of DEDICATED free-list pages, each holding a

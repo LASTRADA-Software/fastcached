@@ -94,6 +94,7 @@
 #include <memory>
 #include <optional>
 #include <ostream>
+#include <ranges>
 #include <span>
 #include <string>
 #include <string_view>
@@ -1661,7 +1662,8 @@ struct MaterializedHit
     // different UI languages now exchange values whose notes each of them can match,
     // because neither ever sees the other's prefix.
     std::array<std::string, ReplayRegionCount> replayed;
-    for (std::size_t idx = 0; idx < localized.size() && idx < replayed.size(); ++idx)
+    // One bound written twice -- the shorter of the two parallel vectors.
+    for (auto const idx: std::views::iota(std::size_t { 0 }, std::min(localized.size(), replayed.size())))
         replayed[idx] = PathCanon::RestoreIncludeNoteMarker(localized[idx].bytes, showIncludesMarker);
     ReplayStreams(replayed[0], replayed[1]);
     return NotMaterialized(HitDisposition::Served);
