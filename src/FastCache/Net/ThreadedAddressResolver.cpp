@@ -8,6 +8,7 @@
 #include <coroutine>
 #include <deque>
 #include <format>
+#include <ranges>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -166,7 +167,7 @@ struct ThreadedAddressResolver::Impl
         if (!threads.empty() || stopping)
             return;
         threads.reserve(options.threads);
-        for (std::size_t i = 0; i < options.threads; ++i)
+        for ([[maybe_unused]] auto const i: std::views::iota(std::size_t { 0 }, options.threads))
             threads.emplace_back([this] { RunWorker(); });
     }
 };

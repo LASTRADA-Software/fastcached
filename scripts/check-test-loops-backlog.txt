@@ -60,14 +60,10 @@ loop|src/FastCache/Distributed/FleetChart.cpp|1|#1452
 loop|src/FastCache/Distributed/FleetHistory.cpp|1|#1452
 loop|src/FastCache/Net/EpollSocket.cpp|1|#1452
 loop|src/FastCache/Net/HealthProbe.cpp|1|#1452
-loop|src/FastCache/Net/InMemoryTransport.cpp|1|#1452
 loop|src/FastCache/Net/IocpSocket.cpp|1|#1452
 loop|src/FastCache/Net/KqueueSocket.cpp|1|#1452
 loop|src/FastCache/Net/SocketAddress.cpp|1|#1452
-loop|src/FastCache/Net/ThreadedAddressResolver.cpp|1|#1452
-loop|src/FastCache/Net/TlsContext.cpp|1|#1452
 loop|src/FastCache/Net/UdpSocket.cpp|1|#1452
-loop|src/FastCache/Platform/InheritedListener.cpp|1|#1452
 loop|src/FastCache/Platform/LocalAddresses.cpp|4|#1452
 loop|src/FastCache/Protocol/CompileCacheWire.hpp|1|#1452
 loop|src/FastCache/Protocol/Framing/LineReader.cpp|1|#1452
@@ -77,7 +73,6 @@ loop|src/FastCache/Protocol/RedisResp.cpp|16|#1452
 loop|src/FastCache/Protocol/RedisTransaction.cpp|1|#1452
 loop|src/FastCache/Protocol/StreamWaiterRegistry.cpp|2|#1452
 loop|src/FastCache/Server/AdminHttpServer.cpp|1|#1452
-loop|src/FastCache/Server/ReactorServerLoop.cpp|4|#1452
 loop|src/apps/fastcache-cc/DirectManifest.cpp|3|#1452
 loop|src/apps/fastcache-cc/ParallelFor.cpp|1|#1452
 loop|src/apps/fastcache-cc/main.cpp|1|#1452

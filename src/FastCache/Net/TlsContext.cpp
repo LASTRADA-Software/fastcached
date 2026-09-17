@@ -5,6 +5,7 @@
 #include <array>
 #include <cstdio>
 #include <format>
+#include <ranges>
 #include <memory>
 #include <string>
 
@@ -295,7 +296,7 @@ std::string TlsContext::CertificateFingerprint() const
 
     std::string out;
     out.reserve(std::size_t { length } * 2);
-    for (unsigned int i = 0; i < length; ++i)
+    for (auto const i: std::views::iota(0U, length))
     {
         std::array<char, 3> byte {};
         (void) std::snprintf(byte.data(), byte.size(), "%02x", digest[i]);
