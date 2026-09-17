@@ -700,8 +700,9 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
                            "Prefer a name that outlives any one machine (a DNS\n"
                            "name or a VIP) over a scheduler's literal address. On a\n"
                            "node running no worker (--slots=0) it registers nothing\n"
-                           "and only names where the --cluster-* and --enroll-*\n"
-                           "commands ask.",
+                           "but still announces the machine, so it appears on the\n"
+                           "fleet page and hands over its history; it also names\n"
+                           "where the --cluster-* and --enroll-* commands ask.",
             .yamlKey = "scheduler",
             .same = FieldEq<&NodeConfig::schedulers>(),
             .clear = ClearList<&NodeConfig::schedulers>(),

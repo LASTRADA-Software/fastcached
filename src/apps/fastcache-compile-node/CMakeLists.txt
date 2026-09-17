@@ -149,6 +149,7 @@ if(FASTCACHED_BUILD_TESTS)
         NodeFrameSurface.cpp
         NodeFrameSurface_test.cpp
         AuthRefusalContract_test.cpp
+        FleetMachinePresence_test.cpp
         FleetLeaseRouting_test.cpp
         NodeConfig_test.cpp
         NodeIdentity.cpp

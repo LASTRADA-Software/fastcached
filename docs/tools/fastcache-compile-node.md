@@ -2250,13 +2250,19 @@ as a node that runs no worker rather than as a verb its build does not know. It
 refuses to start with any setting only a worker reads — `--toolchain`,
 `--allow-compile-arg` or `--drain-timeout`, say — and names the setting, and it
 refuses when it would run nothing else either. `--scheduler` is not among them: on
-such a node it registers nothing and only tells the `--cluster-*` and `--enroll-*`
-commands run on the machine where to ask. Until #1440 lands, its `/metrics` and
-history still read 0 slots rather than no worker.
+such a node it registers nothing, tells the `--cluster-*` and `--enroll-*` commands
+run on the machine where to ask, and is where it announces its own presence.
 
-It is a cluster **member** when it runs consensus and not one of the fleet page's
-**machines**, which are built from worker registrations, and its own history is not
-handed to a leader, which rides the worker's heartbeat ([#1440](https://github.com/LASTRADA-Software/fastcached/issues/1440)).
+**It does appear on the fleet page.** A machine announces itself with
+`NodeAnnounce` whatever components it runs, so a scheduler-only node is one of the
+Machines rows and hands its own history to whoever leads -- which is what makes a
+leader's series survive the election that moves leadership away from it
+([#1440](https://github.com/LASTRADA-Software/fastcached/issues/1440)). Its worker
+cells on that row are **absent** rather than zero: it offers no slots because it has
+no worker, and a zero there would read as a worker that offers nothing and would enter
+the fleet's own busy/free arithmetic. Its `fastcache_node_slots_configured` gauge
+does read 0, which is a different question with a different right answer -- that one
+is this node's configured capacity, and zero is what it is.
 
 Slots bound CPU; they do not bound memory, and the two are separate questions now
 that compiles run side by side. A worker also caps the payload bytes all its jobs
