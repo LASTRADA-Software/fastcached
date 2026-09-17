@@ -716,8 +716,29 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
                            "Defaults to --listen-node, which binds loopback unless\n"
                            "widened: the scheduler hands this string to clients\n"
                            "verbatim, so a worker that advertises an address only it\n"
-                           "can reach is leased and then never answers.",
+                           "can reach is leased and then never answers. Reloadable:\n"
+                           "a node that learns its address late re-registers under\n"
+                           "the new one and retires the old entry.",
             .yamlKey = "advertise",
+            // Reloadable since #1279, and it is the flag the third classification list
+            // exists for. `AddressReloadableFlags`: the registration has to move, the
+            // toolchain survey must not.
+            //
+            // **The row alone changes nothing an operator can observe**, which is the
+            // half this ticket warns about in its own body. Two sites read this value --
+            // the REGISTER/heartbeat registrars and the lease validator, whose
+            // expectation a grant's MAC is taken over -- and both used to capture it at
+            // construction, so a reload published a snapshot neither read. They now read
+            // `Cc::IAdvertisedEndpointSource`, the heartbeat republishes it, and
+            // `AdoptRegistrars` withdraws the entry under the old address rather than
+            // leaving the scheduler to expire it. A reload that reached one of the two
+            // would be worse than one that reached neither: the worker would refuse
+            // grants the scheduler authentically signed.
+            //
+            // Safe to reload because the candidate is judged by the STARTUP rules too
+            // (`ValidateNodeReloadable` asks `StartupPolicyRejection` first), so a save
+            // naming the wildcard is refused by name rather than advertised to a fleet.
+            .reloadable = Reloadable::Yes,
             .same = FieldEq<&NodeConfig::advertise>(),
         },
         {
@@ -1419,8 +1440,10 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
             // a copy of this field at construction, and the reload publishing a
             // snapshot none of them read is the "green while doing nothing" failure
             // in its most expensive form. `Node::ICredentialSource` is what they read
-            // through now, and `node-credential-seam` is what stops a fourth site
-            // taking a copy instead.
+            // through now, and what stops a fourth site taking a copy instead is the
+            // `[node][credential][seam]` case, which walks this directory's sources.
+            // Named by its TAG: this said `node-credential-seam`, a phrase that matches
+            // nothing runnable, which reads as a guard that was never written.
             .reloadable = Reloadable::Yes,
             .same = FieldEq<&NodeConfig::token>(),
         },
@@ -1759,13 +1782,22 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
     // adding a hand-kept literal next to the very list it counted, which is the
     // "hand-checked list beside a table" shape the note above calls the joke telling
     // itself.
+    //
+    // **Walked over `ReloadableFlagLists`, for the reason its two converse guards below
+    // already carry.** This spelled its lists by hand -- the exact shape #1027 records
+    // one screen down -- so a THIRD kind of reloadable row silently satisfied nothing
+    // here until somebody remembered to add a clause. It did not stay hypothetical:
+    // `AddressReloadableFlags` is that third kind (#1279), and deriving the set is why
+    // adding it cost one edit rather than two.
     static_assert(std::ranges::all_of(options,
                                       [](OptionSpec<NodeConfig> const& spec) {
                                           return spec.reloadable != Reloadable::Yes
-                                                 || std::ranges::contains(AdvertisedReloadableFlags, spec.primary)
-                                                 || std::ranges::contains(LocalReloadableFlags, spec.primary);
+                                                 || std::ranges::any_of(ReloadableFlagLists,
+                                                                        [&spec](std::span<std::string_view const> list) {
+                                                                            return std::ranges::contains(list, spec.primary);
+                                                                        });
                                       }),
-                  "a new Reloadable::Yes row must be listed in AdvertisedReloadableFlags or LocalReloadableFlags");
+                  "a new Reloadable::Yes row must be classified by one of the ReloadableFlagLists");
 
     // And the converse, which is what makes `AdvertisedClaimsDiffer` safe to write as
     // a table walk: every name on either list is a real row AND carries a comparator.

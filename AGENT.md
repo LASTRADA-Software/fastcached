@@ -339,6 +339,12 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   on the worker be `Reloadable::Yes` at all. A rotation reaching two of three sites is WORSE than
   one reaching none. A site that never reaches for the seam is a SCAN, with a positive control on
   the pattern. The daemon's `SharedAuthSource` answers the opposite question and does not transfer.
+- So is the advertised ENDPOINT (`Cc::IAdvertisedEndpointSource`), which is what lets `--advertise`
+  be `Reloadable::Yes` — and it needs no scan, because there is no value for a site to capture. But
+  the registration and the lease check read ONE value changed at ONE moment, never a snapshot each:
+  two independent readers straddle a reload and the worker then refuses grants the scheduler
+  authentically signed. A move WITHDRAWS the old entry, `(fingerprint, endpoint)` being the
+  registry's whole key, or the fleet keeps minting valid credentials for an address nobody answers.
 - The worker's five key files are asked about at the START **and at every accepted reload**, from
   `main` and never from `WorkerBody`. A mode is in no configuration, so the re-ask is of the
   FILESYSTEM, not of the reloader's two snapshots; no configuration file means no second moment.

@@ -68,9 +68,11 @@ enum class SocketActivation : std::uint8_t
 ///        defect #282 exists to close, surviving inside the fix for it. The table
 ///        keeps its rule because an install must be refused before any tier exists;
 ///        this is the backstop for the one fact the table cannot see.
-/// @param advertise This worker's address as clients are told to dial it -- exactly
-///        the string it registers under, because that is the string the scheduler
-///        signs into the grant.
+/// @param advertise Where this worker's address is read, asked per request rather
+///        than copied here -- exactly the seam the registration reads, because the
+///        string the scheduler signs into a grant and the string this checks against
+///        have to be one fact at every moment, not two readers of one file (#1279).
+///        Borrowed by the validator, so it must outlive it.
 /// @param clock Where "now" comes from. A **wall** clock, not a steady one: the
 ///        expiry was stamped on another machine, and a steady instant means nothing
 ///        off the host that read it. Borrowed, so it must outlive the validator.
@@ -83,13 +85,14 @@ enum class SocketActivation : std::uint8_t
 /// @param metrics Where an adopted term reset is counted.
 /// @param logger Where the chosen mode is announced.
 /// @return The validator, or why the key file cannot serve as one.
-[[nodiscard]] std::expected<Cc::LeaseValidator, std::string> MakeWorkerLeaseValidator(NodeConfig const& cfg,
-                                                                                      std::string_view advertise,
-                                                                                      SocketActivation activation,
-                                                                                      WallClockRef clock,
-                                                                                      Distributed::WorkerLeaseState& lease,
-                                                                                      IMetricsSink& metrics,
-                                                                                      ILogger& logger);
+[[nodiscard]] std::expected<Cc::LeaseValidator, std::string> MakeWorkerLeaseValidator(
+    NodeConfig const& cfg,
+    Cc::IAdvertisedEndpointSource const& advertise,
+    SocketActivation activation,
+    WallClockRef clock,
+    Distributed::WorkerLeaseState& lease,
+    IMetricsSink& metrics,
+    ILogger& logger);
 
 /// Whether the fleet a scheduler admitted this node to is the one the operator asked
 /// for.

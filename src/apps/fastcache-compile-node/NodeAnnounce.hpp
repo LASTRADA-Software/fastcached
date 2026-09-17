@@ -15,18 +15,141 @@
 #include <FastCache/Net/ISocket.hpp>
 #include <FastCache/Platform/HostLoad.hpp>
 
+#include <algorithm>
 #include <atomic>
+#include <cassert>
 #include <chrono>
 #include <cstddef>
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include <WorkerProtocol.hpp>
 
 namespace FastCache::Node
 {
+
+/// The endpoint this worker is announcing, now.
+///
+/// The production `Cc::IAdvertisedEndpointSource`, and the one object the registration
+/// and the lease check both read -- which is what makes *the endpoint the scheduler
+/// signs and the endpoint this worker verifies are one fact* a property of the type
+/// system rather than a sentence in `main`.
+///
+/// ## Why this is not `ConfiguredCredential`'s shape
+///
+/// `Node::ConfiguredCredential` answers from the live configuration snapshot on every
+/// call, and that is right for a secret: a rotation should reach every presentation the
+/// instant the operator's file is accepted, and nothing downstream has to be told.
+///
+/// An endpoint is not like that, because a second party holds a copy. The scheduler
+/// files this worker under `(fingerprint, endpoint)` and signs that endpoint into every
+/// grant, so a value that changed the moment a snapshot was published would leave this
+/// worker refusing authentic grants for the address the fleet still has -- and it would
+/// do so for however long the heartbeat interval is, with `LeaseEndpointMismatch`
+/// rising and no configuration anywhere being wrong. Reading the snapshot per call is
+/// the shape that looks most correct and is the one that breaks.
+///
+/// So the value changes at ONE point: the heartbeat thread publishes it as part of
+/// re-announcing, after the old registration has been queued for withdrawal and the new
+/// registrars built. `WorkerTier::AnnounceAs` is that point, and it is the only caller
+/// of `Publish`.
+///
+/// ## The window this still has, stated rather than hidden
+///
+/// A grant signed for the old endpoint and presented after the change is refused, since
+/// one endpoint is expected at a time. That is bounded by the grant's own lifetime,
+/// counted (`LeaseEndpointMismatch`), and costs the client a local compile -- against
+/// which the alternative, accepting any recently advertised address, widens the window
+/// in which a captured token is replayable at this worker. Widening a replay window to
+/// save a handful of dispatches is a decision this ticket does not get to make quietly.
+class AnnouncedEndpoint final: public Cc::IAdvertisedEndpointSource
+{
+  public:
+    /// @param startup What this worker was started advertising -- `AdvertisedEndpoint`
+    ///        of the configuration it came up with, so the first registration and every
+    ///        lease check before any reload read exactly what `main` reported.
+    explicit AnnouncedEndpoint(std::string_view startup):
+        _endpoint { startup }
+    {
+    }
+
+    /// @copydoc Cc::IAdvertisedEndpointSource::Current
+    [[nodiscard]] std::string Current() const override
+    {
+        auto const lock = std::scoped_lock { _mutex };
+        return _endpoint;
+    }
+
+    /// Make @p endpoint what this worker advertises from now on.
+    ///
+    /// Called by the heartbeat thread alone, and only alongside the re-registration
+    /// that tells the scheduler -- see the class comment for why this is not a setter
+    /// anybody may reach for.
+    /// @param endpoint The new endpoint; must be non-empty, since nothing can be
+    ///        registered under an empty one.
+    void Publish(std::string endpoint)
+    {
+        // A precondition rather than a refusal, because an empty endpoint here is a
+        // programmer error and not a configuration: `AdvertisedEndpointChange` is what
+        // decides, and it answers nullopt for an empty candidate. Publishing one would
+        // withdraw every registration and re-register under no address at all -- a node
+        // that disappears from the fleet with every counter reading normal.
+        assert(!endpoint.empty());
+        auto const lock = std::scoped_lock { _mutex };
+        _endpoint = std::move(endpoint);
+    }
+
+  private:
+    /// A mutex rather than an atomic pointer, because the readers are a compile thread
+    /// per job and the writer is one thread per heartbeat interval: the contention is
+    /// nil and the cost is paid beside a process spawn.
+    mutable std::mutex _mutex;
+    std::string _endpoint;
+};
+
+/// A move of the endpoint this worker advertises: the new value, and what to say.
+///
+/// Two strings, named, rather than a pair: both halves are text and a `.first` deciding
+/// what gets REGISTERED while `.second` only gets logged is a positional contract with
+/// no compiler behind it.
+struct EndpointChange
+{
+    /// What to advertise from now on. Never empty.
+    std::string endpoint;
+
+    /// The line to log, naming both addresses -- an operator reading only the new one
+    /// cannot tell a change from a restart.
+    std::string announcement;
+};
+
+/// Whether the endpoint this worker advertises has moved, and what to say about it.
+///
+/// A pure function over the two facts for `RecheckDepthFor`'s reason: the heartbeat
+/// loop is reached by no test, so a rule left as an expression there can only be
+/// checked by reading it -- and this one is wrong silently in both directions. Missed,
+/// the fleet keeps leasing an address nobody answers; fired spuriously, every worker in
+/// a fleet re-registers because somebody saved a file.
+///
+/// **Compares the DERIVED endpoint, never the `--advertise` field.**
+/// `AdvertisedEndpoint` folds the flag with the `Node` surface's resolved address, and
+/// what the scheduler keys on is the result -- so a save that clears a flag whose value
+/// equalled the fallback has changed nothing to announce, and the row-level comparison
+/// the reload machinery uses (`AddressReloadableFlags`) would call it a change. The
+/// classification list is what forces the decision at the table; this is what decides
+/// whether anything happens.
+///
+/// @param inForce The endpoint being advertised now.
+/// @param live The configuration in force this beat, or null when this worker has no
+///        configuration file and therefore no second moment at which anything could
+///        change.
+/// @return The new endpoint and the line to log, or nullopt when nothing moved.
+[[nodiscard]] std::optional<EndpointChange> AdvertisedEndpointChange(std::string_view inForce,
+                                                                     std::shared_ptr<NodeConfig const> const& live);
 
 // Out of `main.cpp` since #404, and the credential is what forced it.
 //
@@ -115,19 +238,35 @@ struct AnnounceOutcome
 /// Only a registrar the scheduler ACCEPTED is retired: an empty `WorkerId()` means
 /// there is nothing on the other end to retire and no id to name it with.
 ///
-/// @tparam Served Anything answering `contains(std::string const&)` -- the served map.
+/// **A registration is retired unless the new set re-registers exactly it, and
+/// "exactly" is `(fingerprint, endpoint)` -- the registry's own key.** This asked
+/// whether the served map still contained the fingerprint, which is the right question
+/// for the case it was written for and half a key: a node that changes the address it
+/// advertises rebuilds every registrar with the SAME fingerprints, so nothing was ever
+/// retired and the scheduler kept an entry naming an address this worker no longer
+/// answers on -- handing out leases whose MAC covers it
+/// ([#1279](https://github.com/LASTRADA-Software/fastcached/issues/1279)).
+///
+/// Derived from @p rebuilt rather than from the served map, which is what deletes the
+/// `Served` parameter: @p rebuilt IS the new set, one registrar per served fingerprint
+/// carrying the endpoint now in force, so asking it about a pair answers both halves at
+/// once. Asking the map could only ever answer one.
+///
 /// @param rebuilt The registrars for the new set, already built.
-/// @param served The new set, asked whether it still carries a fingerprint.
 /// @param current Registrars in force; replaced by @p rebuilt.
 /// @param withdrawals Where the departing registrars are appended.
-template <typename Served>
-void AdoptRegistrars(std::vector<Cc::WorkerRegistrar> rebuilt,
-                     Served const& served,
-                     std::vector<Cc::WorkerRegistrar>& current,
-                     std::vector<Cc::WorkerRegistrar>& withdrawals)
+inline void AdoptRegistrars(std::vector<Cc::WorkerRegistrar> rebuilt,
+                            std::vector<Cc::WorkerRegistrar>& current,
+                            std::vector<Cc::WorkerRegistrar>& withdrawals)
 {
+    auto const reRegistered = [&rebuilt](Cc::WorkerRegistrar const& was) {
+        return std::ranges::any_of(rebuilt, [&was](Cc::WorkerRegistrar const& is) {
+            return is.Fingerprint() == was.Fingerprint() && is.Endpoint() == was.Endpoint();
+        });
+    };
+
     for (auto& registrar: current)
-        if (!registrar.WorkerId().empty() && !served.contains(registrar.Fingerprint()))
+        if (!registrar.WorkerId().empty() && !reRegistered(registrar))
             withdrawals.push_back(std::move(registrar));
     current = std::move(rebuilt);
 }

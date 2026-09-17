@@ -130,7 +130,7 @@ namespace
 } // namespace
 
 LeaseValidator SignedLeaseValidator(SecureByteBuffer signingKey,
-                                    std::string advertisedEndpoint,
+                                    IAdvertisedEndpointSource const& advertisedEndpoint,
                                     WallClockRef clock,
                                     Distributed::WorkerLeaseState& lease,
                                     IMetricsSink& metrics,
@@ -140,7 +140,11 @@ LeaseValidator SignedLeaseValidator(SecureByteBuffer signingKey,
     // carries the guard rather than re-binding a reference. This capture was `&clock`,
     // and it is the retention a member scan cannot see -- the validator outlives this
     // call and nothing anywhere declares a wall-clock member for it (#1032).
-    return [key = std::move(signingKey), endpoint = std::move(advertisedEndpoint), clock, &lease, &metrics, slack](
+    //
+    // The endpoint is the one capture that is a REFERENCE on purpose: it is read per
+    // request, so what is captured is where to ask rather than the answer (#1279). It
+    // outlives this validator by contract, exactly as `lease` does.
+    return [key = std::move(signingKey), endpoint = &advertisedEndpoint, clock, &lease, &metrics, slack](
                std::string_view token, std::string_view fingerprint) -> LeaseDecision {
         // The fingerprint is the one the REQUEST names, and this runs BEFORE anything
         // has checked that this worker serves it -- `CompileJobRunner::Run` answers
@@ -156,6 +160,12 @@ LeaseValidator SignedLeaseValidator(SecureByteBuffer signingKey,
         // deadline the check never saw. It is also one syscall rather than two on the
         // path of every dispatched compile.
         auto const now = clock.Now();
+
+        // Read ONCE per request, for `now`'s reason: the heartbeat thread republishes
+        // this when the node's advertised address moves, so two reads inside one
+        // verification could straddle that and check a MAC against one address while
+        // naming another in the refusal.
+        auto const advertised = endpoint->Current();
 
         // The fleet is READ per request rather than captured at construction, because
         // this validator is built at startup and the identity arrives later, in the
@@ -187,7 +197,7 @@ LeaseValidator SignedLeaseValidator(SecureByteBuffer signingKey,
         auto verified = Distributed::VerifyLeaseToken(
             key,
             token,
-            Distributed::LeaseExpectation { .endpoint = endpoint, .fingerprint = fingerprint, .clusterId = *cluster },
+            Distributed::LeaseExpectation { .endpoint = advertised, .fingerprint = fingerprint, .clusterId = *cluster },
             now,
             slack);
         if (verified.has_value())

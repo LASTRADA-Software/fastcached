@@ -4060,17 +4060,32 @@ TEST_CASE("A log-level reload does not re-derive what this worker serves", "[nod
     CHECK_FALSE(Node::AdvertisedClaimsDiffer(*before, *reloader.Current()));
 }
 
-TEST_CASE("The capacity trio and --advertise stay unreloadable, each for its own reason", "[node][config][reload]")
+TEST_CASE("The capacity trio stays unreloadable, each for its own reason", "[node][config][reload]")
 {
     // #403 moved the toolchain pair and deliberately left the rest of the band where
     // it was. Asserted rather than left to the table, because "we decided not to" and
     // "we forgot" are the same diff.
     //
-    // `--advertise` is the one that could not move even if the capacity trio did: it
-    // is baked into every outstanding lease's MAC as `expected.endpoint`, so changing
-    // it mid-life does not merely mislead the scheduler -- it invalidates every grant
-    // already in a client's hands, which then fail `EndpointMismatch`.
-    for (auto const* flag: { "--advertise", "--slots", "--node-class", "--reserve-cores" })
+    // **`--advertise` was on this list and has LEFT it (#1279), and the argument it was
+    // here on is worth answering rather than deleting.** That argument was: the value is
+    // baked into every outstanding lease's MAC as `expected.endpoint`, so changing it
+    // mid-life invalidates grants already in clients' hands, which then fail
+    // `EndpointMismatch`. Every word of that is still true. What it does not establish
+    // is the conclusion:
+    //
+    // - The grants it invalidates are the ones outstanding at that instant, bounded by
+    //   their own lifetime and counted. Each costs a client one local compile.
+    // - Those grants name the address this node has just LEFT -- and in the deployment
+    //   the flag was made reloadable for, that address is the one that stopped working.
+    //   Refusing them loses nothing a client could have used.
+    // - The unbounded version of the harm is the half the old reasoning could not see:
+    //   without a WITHDRAWAL the scheduler goes on minting grants for the old address
+    //   forever. That clause is what makes the reload safe, and it is why #1279 refused
+    //   to be closed by late-binding the read alone.
+    //
+    // The capacity trio is untouched by all of that: it is resolved against what the
+    // cache tier HOLDS, which is decided when the tier starts.
+    for (auto const* flag: { "--slots", "--node-class", "--reserve-cores" })
     {
         INFO("flag: " << flag);
         auto const rows = NodeOptions();
@@ -5088,6 +5103,97 @@ TEST_CASE("The allowlist row is reloadable, and LOCAL rather than advertised", "
 
     CHECK(ValidateNodeReloadable(previous, candidate).has_value());
     CHECK_FALSE(AdvertisedClaimsDiffer(previous, candidate));
+}
+
+TEST_CASE("The advertise row is reloadable, and is the ADDRESS kind rather than either other",
+          "[node][config][reload][advertise]")
+{
+    // #1279. Which list a `Reloadable::Yes` row is on decides what a change to it COSTS,
+    // and `--advertise` is the row that fitted neither of the two that existed: the
+    // registration has to move (so it is not local wiring) and the toolchain survey must
+    // not (so it is not an advertised CLAIM -- an include-tree walk measured over 300 s
+    // cold, to move a string this node already holds).
+    auto const rows = NodeOptions();
+    auto const row = std::ranges::find_if(rows, [](auto const& spec) { return spec.primary == "--advertise"; });
+    REQUIRE(row != rows.end());
+    CHECK(row->reloadable == Reloadable::Yes);
+    CHECK(std::ranges::contains(AddressReloadableFlags, std::string_view { "--advertise" }));
+
+    // Both exclusions asserted, not just the membership: an entry that ended up on two
+    // lists would be classified twice and re-surveyed for nothing, and the `static_assert`
+    // beside the table requires only that it be on ONE of them.
+    CHECK_FALSE(std::ranges::contains(AdvertisedReloadableFlags, std::string_view { "--advertise" }));
+    CHECK_FALSE(std::ranges::contains(LocalReloadableFlags, std::string_view { "--advertise" }));
+
+    // And what that MEANS, asked of the function that reads the advertised list rather
+    // than of the list again: a reload naming a new address is accepted, and it does not
+    // drag the toolchain re-survey with it.
+    NodeConfig previous;
+    previous.schedulers = { std::string { SchedulerEndpoint } };
+    auto candidate = previous;
+    candidate.advertise = "nat.example:7700";
+
+    CHECK(ValidateNodeReloadable(previous, candidate).has_value());
+    CHECK_FALSE(AdvertisedClaimsDiffer(previous, candidate));
+}
+
+TEST_CASE("A reload may not advertise what the startup rules refuse", "[node][config][reload][advertise]")
+{
+    // The half that makes the row above safe to mark reloadable at all. A candidate is
+    // judged by the STARTUP rules as well as the immutability ones, so a save cannot
+    // reach a state the process would have refused to start in -- and the wildcard is
+    // the shape that matters here: the scheduler hands this string to clients verbatim,
+    // so a client on another machine dialling it reaches ITSELF.
+    //
+    // Asserted through the reload path rather than through `StartupPolicyRejection`
+    // directly. The fact is the table's; what this case is about is whether the reload
+    // asks, which is a property of `ValidateNodeReloadable` and would be equally true of
+    // a build where it stopped asking.
+    NodeConfig previous;
+    previous.schedulers = { std::string { SchedulerEndpoint } };
+    // A member list is what makes the advertised endpoint TRAVEL, and therefore what
+    // scopes the wildcard rule: a node admitting nobody is reached at `--listen-node`
+    // and needs no advertise at all. The key file comes with it because admitting peers
+    // without one is refused by a DIFFERENT startup rule -- which is the refusal the
+    // control below would otherwise be reporting.
+    previous.fleetMembers = { "10.0.0.7" };
+    previous.clusterKeyFile = "/etc/fastcached/cluster.key";
+    // And a listener peers could actually reach, because the table ALSO refuses an
+    // advertise that names a dialable address while `--listen-node` binds loopback --
+    // a rule this change does not relax and deliberately re-asks: a reload cannot
+    // advertise an address this worker would never accept a connection on.
+    previous.nodeListen = "0.0.0.0:6674";
+    previous.nodeListenExplicit = true;
+
+    // The control, and it comes first: an ordinary address is accepted, so the refusal
+    // below is about the value rather than about this configuration being unreloadable
+    // for some other reason.
+    auto usable = previous;
+    usable.advertise = "nat.example:7700";
+    auto const accepted = ValidateNodeReloadable(previous, usable);
+    // The refusal's own words when this control fails, because a control that merely
+    // says `false` sends its reader to the value under test rather than to the fixture.
+    INFO("control refusal: " << (accepted.has_value() ? std::string { "(none)" } : accepted.error().context));
+    REQUIRE(accepted.has_value());
+
+    auto wildcard = previous;
+    wildcard.advertise = "0.0.0.0:6677";
+
+    auto const refused = ValidateNodeReloadable(previous, wildcard);
+    REQUIRE_FALSE(refused.has_value());
+    // A parse-time refusal rather than `ImmutableChanged`: the setting IS reloadable and
+    // the value is not usable, which are different sentences for an operator to read.
+    CHECK(refused.error().code == ConfigErrorCode::ParseError);
+    CHECK(refused.error().context.contains("not applied"));
+
+    // And the SHAPE, which this change is what made reachable at runtime. `--advertise`
+    // carries no grammar on its applier -- the dial check is a `StartupPolicyRejection`
+    // row over `ParseDialEndpoint` -- so a bare port is refused on a reload only because
+    // this path asks the table. The grammar itself is unchanged and out of the ticket's
+    // scope; WHEN it is asked is not.
+    auto barePort = previous;
+    barePort.advertise = "7700";
+    CHECK_FALSE(ValidateNodeReloadable(previous, barePort).has_value());
 }
 
 TEST_CASE("AllowlistAnnouncement says what changed, and stays quiet when nothing did", "[node][config][reload]")

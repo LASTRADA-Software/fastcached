@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // What a re-survey owes the scheduler when a toolchain goes away
-// ([#573](https://github.com/LASTRADA-Software/fastcached/issues/573)).
+// ([#573](https://github.com/LASTRADA-Software/fastcached/issues/573)) -- and what a
+// node owes it when the ADDRESS it is registered under moves
+// ([#1279](https://github.com/LASTRADA-Software/fastcached/issues/1279)). Two causes,
+// one rule: a registration is retired unless the new set re-registers exactly it, and
+// "exactly" is the registry's own key, `(fingerprint, endpoint)`.
 //
 // `AdoptRegistrars` exists as a free function because clang-tidy refused it as a
 // lambda inside `WorkerBody` -- cognitive complexity 66 against a threshold of 60 --
@@ -24,7 +28,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
-#include <map>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -43,16 +47,26 @@ namespace
 {
 namespace Wire = FastCache::CompileCacheWire;
 
+/// The address a node in these cases advertises.
+inline constexpr std::string_view ThisNode = "10.0.0.2:6677";
+
+/// Where it ends up once it learns its external address.
+inline constexpr std::string_view MovedNode = "nat.example:7700";
+
 /// A registrar for @p fingerprint, optionally already accepted by a scheduler.
 ///
 /// The id is what a withdrawal NAMES, so whether it is set is the whole of the
 /// second clause under test rather than incidental setup.
 /// @param notice Where an unchecked credential would be reported.
 /// @param fingerprint The toolchain it announces.
+/// @param endpoint The address it announces, defaulted because only the endpoint cases
+///        vary it -- and it is the other half of the key the adoption rule reads.
 /// @return The registrar, never registered.
-[[nodiscard]] Cc::WorkerRegistrar Registrar(Cc::CredentialNotice& notice, std::string fingerprint)
+[[nodiscard]] Cc::WorkerRegistrar Registrar(Cc::CredentialNotice& notice,
+                                            std::string fingerprint,
+                                            std::string_view endpoint = ThisNode)
 {
-    return Cc::WorkerRegistrar { notice, std::move(fingerprint), "10.0.0.2:6677",
+    return Cc::WorkerRegistrar { notice, std::move(fingerprint), std::string { endpoint },
                                  1U,     Wire::CodecList {},     Wire::CapacityFields {} };
 }
 
@@ -69,6 +83,20 @@ namespace Wire = FastCache::CompileCacheWire;
     return names;
 }
 
+/// The endpoints of a registrar list, in order, beside `NamesOf` -- because since
+/// #1279 a case that read only the fingerprints could not tell a list rebuilt at a new
+/// address from one that never moved.
+/// @param registrars The list to read.
+/// @return One address per entry.
+[[nodiscard]] std::vector<std::string> EndpointsOf(std::vector<Cc::WorkerRegistrar> const& registrars)
+{
+    std::vector<std::string> endpoints;
+    endpoints.reserve(registrars.size());
+    for (auto const& registrar: registrars)
+        endpoints.push_back(registrar.Endpoint());
+    return endpoints;
+}
+
 /// A framed REGISTER reply accepting a worker under @p workerId.
 /// @param workerId The id to assign.
 /// @return The reply bytes.
@@ -79,16 +107,6 @@ namespace Wire = FastCache::CompileCacheWire;
     return Wire::EncodeReply(Wire::Status::Ok, payload);
 }
 
-/// A served set with the given fingerprints, values unused by the rule under test.
-/// @param fingerprints What this node serves now.
-/// @return Something answering `contains`.
-[[nodiscard]] std::map<std::string, int> Served(std::vector<std::string> const& fingerprints)
-{
-    std::map<std::string, int> served;
-    for (auto const& fingerprint: fingerprints)
-        served.emplace(fingerprint, 0);
-    return served;
-}
 } // namespace
 
 TEST_CASE("Adopting a served set retires only the registrations that left it", "[node][announce]")
@@ -107,7 +125,7 @@ TEST_CASE("Adopting a served set retires only the registrations that left it", "
     rebuilt.push_back(Registrar(notice, "clang-20"));
 
     std::vector<Cc::WorkerRegistrar> withdrawals;
-    AdoptRegistrars(std::move(rebuilt), Served({ "gcc-14", "clang-20" }), current, withdrawals);
+    AdoptRegistrars(std::move(rebuilt), current, withdrawals);
 
     // Nothing is retired, because neither registrar was ever accepted -- an empty
     // `WorkerId()` means there is no id to name it with and nothing on the other end.
@@ -145,7 +163,7 @@ TEST_CASE("Adopting a served set retires a registration the scheduler accepted",
     rebuilt.push_back(Registrar(notice, "clang-20"));
 
     std::vector<Cc::WorkerRegistrar> withdrawals;
-    AdoptRegistrars(std::move(rebuilt), Served({ "clang-20" }), current, withdrawals);
+    AdoptRegistrars(std::move(rebuilt), current, withdrawals);
 
     // Exactly the one that left, carrying the id the scheduler issued -- which is the
     // only thing `Op::Withdraw` can name, and the thing rebuilding the list destroys.
@@ -172,7 +190,7 @@ TEST_CASE("Adopting a served set leaves the toolchains it still carries alone", 
     rebuilt.push_back(Registrar(notice, "clang-20"));
 
     std::vector<Cc::WorkerRegistrar> withdrawals;
-    AdoptRegistrars(std::move(rebuilt), Served({ "clang-20" }), current, withdrawals);
+    AdoptRegistrars(std::move(rebuilt), current, withdrawals);
 
     CHECK(withdrawals.empty());
     CHECK(NamesOf(current) == std::vector<std::string> { "clang-20" });
@@ -189,10 +207,141 @@ TEST_CASE("Adopting an empty served set retires nothing that was never registere
     current.push_back(Registrar(notice, "gcc-13"));
 
     std::vector<Cc::WorkerRegistrar> withdrawals;
-    AdoptRegistrars({}, Served({}), current, withdrawals);
+    AdoptRegistrars({}, current, withdrawals);
 
     CHECK(current.empty());
     CHECK(withdrawals.empty());
+}
+
+TEST_CASE("A node that moves the address it advertises retires every registration under the old one",
+          "[node][announce][advertise]")
+{
+    // **#1279's second clause, which is the one without which the ticket closes on a
+    // change that fixed nothing.** Late-binding the read gets the new address into the
+    // registrars; it is this that gets the OLD entry out of the scheduler. Left behind,
+    // that entry goes on being dispatched to and its grants go on verifying -- a lease
+    // token's MAC covers the endpoint, so what the fleet hands out is a valid credential
+    // for an address nobody answers, and every counter reads normal.
+    //
+    // Two toolchains, because a node serving several is the production shape and the
+    // rule is per ENTRY: a version that retired the first and kept the rest would leave
+    // the machine half-registered at an address it has left.
+    auto notice = Cc::CredentialNotice::Silent();
+
+    std::vector<Cc::WorkerRegistrar> current;
+    current.push_back(Registrar(notice, "gcc-13"));
+    current.push_back(Registrar(notice, "clang-20"));
+
+    Testing::ScriptedSocket scheduler { Testing::Replies({
+        RegisterOk("w-gcc"),
+        RegisterOk("w-clang"),
+    }) };
+    REQUIRE(current[0].Register(scheduler).has_value());
+    REQUIRE(current[1].Register(scheduler).has_value());
+
+    // The same fingerprints -- nothing about what this machine SERVES has changed, which
+    // is exactly why the fingerprint alone could not answer this.
+    std::vector<Cc::WorkerRegistrar> rebuilt;
+    rebuilt.push_back(Registrar(notice, "gcc-13", MovedNode));
+    rebuilt.push_back(Registrar(notice, "clang-20", MovedNode));
+
+    std::vector<Cc::WorkerRegistrar> withdrawals;
+    AdoptRegistrars(std::move(rebuilt), current, withdrawals);
+
+    // Both old entries, carrying the ids the scheduler issued -- the only thing
+    // `Op::Withdraw` can name, and what rebuilding the list would otherwise destroy.
+    REQUIRE(withdrawals.size() == 2);
+    CHECK(NamesOf(withdrawals) == std::vector<std::string> { "gcc-13", "clang-20" });
+    CHECK(EndpointsOf(withdrawals) == std::vector<std::string> { std::string { ThisNode }, std::string { ThisNode } });
+    CHECK(withdrawals[0].WorkerId() == "w-gcc");
+    CHECK(withdrawals[1].WorkerId() == "w-clang");
+
+    // And what is in force is the same toolchains at the new address, unregistered --
+    // so the round that follows registers them rather than heartbeating entries the
+    // scheduler has never been told about.
+    CHECK(NamesOf(current) == std::vector<std::string> { "gcc-13", "clang-20" });
+    CHECK(EndpointsOf(current) == std::vector<std::string> { std::string { MovedNode }, std::string { MovedNode } });
+    CHECK(current[0].WorkerId().empty());
+}
+
+TEST_CASE("A node re-adopting the same set at the same address retires nothing", "[node][announce][advertise]")
+{
+    // **The control for the case above, and it is not the one three cases up.** Those
+    // assert `withdrawals.empty()` over registrars no scheduler ever accepted, so they
+    // pass equally well against a version that retires everything it can. This one has
+    // an ACCEPTED registration and nothing moved, which is the state a node is in on
+    // every heartbeat of its life: re-adopting must be free.
+    //
+    // Without it, keying the rule on the pair reads as proven by a case that would also
+    // pass if the pair comparison were replaced by `false`.
+    auto notice = Cc::CredentialNotice::Silent();
+
+    std::vector<Cc::WorkerRegistrar> current;
+    current.push_back(Registrar(notice, "gcc-13"));
+
+    Testing::ScriptedSocket scheduler { Testing::Replies({ RegisterOk("w-gcc") }) };
+    REQUIRE(current[0].Register(scheduler).has_value());
+
+    std::vector<Cc::WorkerRegistrar> rebuilt;
+    rebuilt.push_back(Registrar(notice, "gcc-13"));
+
+    std::vector<Cc::WorkerRegistrar> withdrawals;
+    AdoptRegistrars(std::move(rebuilt), current, withdrawals);
+
+    CHECK(withdrawals.empty());
+    CHECK(NamesOf(current) == std::vector<std::string> { "gcc-13" });
+    CHECK(EndpointsOf(current) == std::vector<std::string> { std::string { ThisNode } });
+}
+
+TEST_CASE("The endpoint a heartbeat re-announces is the DERIVED one, not the flag", "[node][announce][advertise]")
+{
+    // `AdvertisedEndpointChange` is what decides whether a round re-announces at all,
+    // and it is wrong silently in both directions: missed, the fleet keeps leasing an
+    // address nobody answers; fired spuriously, every worker re-registers because
+    // somebody saved a file. Both directions are here.
+    SECTION("no configuration file means no second moment")
+    {
+        // The arm `ConfiguredCredential` has as a null reloader. A worker started with
+        // no file has nothing that could publish a new value, and a change function that
+        // answered anything here would be describing a configuration that cannot arrive.
+        CHECK_FALSE(AdvertisedEndpointChange(ThisNode, nullptr).has_value());
+    }
+
+    SECTION("a moved address is reported, and the line names both")
+    {
+        auto live = std::make_shared<NodeConfig>();
+        live->advertise = std::string { MovedNode };
+
+        auto const moved = AdvertisedEndpointChange(ThisNode, live);
+        REQUIRE(moved.has_value());
+        // `Unwrap` and not `moved->`, which is this repository's rule for an optional in
+        // a test and a build failure otherwise. A reference, safely, because `moved` is a
+        // named local rather than the temporary that form warns about.
+        auto const& change = Unwrap(moved);
+        CHECK(change.endpoint == MovedNode);
+        // Both addresses, because a line naming only the new one cannot be told from a
+        // startup line -- and the minutes after this is logged are when somebody is
+        // reading it to explain a burst of endpoint-mismatch refusals.
+        CHECK(change.announcement.contains(MovedNode));
+        CHECK(change.announcement.contains(ThisNode));
+    }
+
+    SECTION("the same address is not a change, however it is spelled")
+    {
+        // The direction that decides whether this is safe to run every beat. A file that
+        // spells out the value already in force moves the `--advertise` ROW -- which is
+        // what the reload machinery compares -- and moves nothing the scheduler keys on.
+        // Comparing the row here would re-register a fleet for a no-op edit.
+        auto live = std::make_shared<NodeConfig>();
+        auto const derived = AdvertisedEndpoint(*live);
+        REQUIRE_FALSE(derived.empty());
+
+        auto explicitlySpelled = std::make_shared<NodeConfig>();
+        explicitlySpelled->advertise = derived;
+
+        CHECK_FALSE(AdvertisedEndpointChange(derived, live).has_value());
+        CHECK_FALSE(AdvertisedEndpointChange(derived, explicitlySpelled).has_value());
+    }
 }
 
 // --- The cordon reaches the scheduler (#1303) -------------------------------

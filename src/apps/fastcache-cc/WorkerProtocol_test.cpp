@@ -123,6 +123,50 @@ enum class LeasePolicy : std::uint8_t
 /// The endpoint the worker under test advertises, and the one grants must name.
 inline constexpr std::string_view ThisWorker = "worker-under-test:6675";
 
+/// The address this worker has learned it is reachable at, which a case can MOVE.
+///
+/// A fake rather than the production `Node::AnnouncedEndpoint`, and only because of
+/// where this file lives: `fastcache-cc` does not link the node, so the real class is
+/// out of reach here. The node's own cases use the real one and should go on doing so --
+/// this is the exception, not the pattern.
+///
+/// One fact to get right (answer what was last set), which is what keeps it a local fake
+/// rather than a shared helper. It is deliberately NOT thread-safe: the interface
+/// requires that of a production implementation because a heartbeat thread publishes
+/// while compile threads read, and every case here drives one thread.
+class MovingEndpoint final: public IAdvertisedEndpointSource
+{
+  public:
+    /// @param startup What it answers until a case moves it.
+    explicit MovingEndpoint(std::string_view startup):
+        _endpoint { startup }
+    {
+    }
+
+    /// @copydoc IAdvertisedEndpointSource::Current
+    [[nodiscard]] std::string Current() const override
+    {
+        return _endpoint;
+    }
+
+    /// Learn a new address, as a reload does.
+    /// @param endpoint What to answer from now on.
+    void MoveTo(std::string_view endpoint)
+    {
+        _endpoint = std::string { endpoint };
+    }
+
+  private:
+    std::string _endpoint;
+};
+
+/// Where this worker ends up after a NAT or an interface tells it its real address.
+///
+/// Different in BOTH halves from `ThisWorker`, deliberately: an endpoint comparison that
+/// matched on the host alone, or on the port alone, would pass against a value differing
+/// only in the other.
+inline constexpr std::string_view MovedWorker = "worker-behind-nat:7700";
+
 /// The fleet this worker belongs to, and the one a grant has to name.
 ///
 /// Named rather than empty so the cases exercise a real comparison: an empty cluster
@@ -194,10 +238,14 @@ constexpr std::uint64_t GrantTerm = 4;
 /// @param lease What the verifying one borrows -- the spent grants, the learned term and
 ///        the reset notice. Borrowed, so it outlives the validator; the unchecked one
 ///        ignores it.
+/// @param endpoint Where the worker's advertised address is read. Borrowed for the life
+///        of the validator, exactly as @p lease is -- which is why the fixture holds one
+///        as a member rather than passing a temporary (#1279).
 /// @param metrics Where a term reset is counted; refusals are counted by the surface.
 /// @return The validator.
 [[nodiscard]] LeaseValidator MakeLeaseValidator(LeasePolicy policy,
                                                 Distributed::WorkerLeaseState& lease,
+                                                IAdvertisedEndpointSource const& endpoint,
                                                 IMetricsSink& metrics,
                                                 std::chrono::seconds slack = Distributed::LeaseTokenClockSkewSlack)
 {
@@ -207,7 +255,7 @@ constexpr std::uint64_t GrantTerm = 4;
     // REGISTER reply said, so a validator built for a test has to be told the same way
     // a production one is. A case that wants the UNREGISTERED worker leaves it unpinned.
     lease.fleet.Pin(std::string { ThisCluster });
-    return SignedLeaseValidator(TestClusterKey(), std::string { ThisWorker }, LeaseClock, lease, metrics, slack);
+    return SignedLeaseValidator(TestClusterKey(), endpoint, LeaseClock, lease, metrics, slack);
 }
 
 struct Fixture
@@ -226,6 +274,11 @@ struct Fixture
     /// `Silent()` rather than defaulted, which is that notice's own rule.
     Distributed::WorkerLeaseState lease { Distributed::SchedulerTermRegressionNotice::Silent() };
 
+    /// Where the validator reads this worker's advertised address, for `lease`'s reason
+    /// and by `lease`'s mechanism: declared BEFORE `worker`, so member order rather than
+    /// a rule somebody remembers is what keeps the borrow alive.
+    MovingEndpoint endpoint { ThisWorker };
+
     WorkerProtocol worker;
 
     /// @param codecs What this worker can produce and decode; the production node
@@ -240,7 +293,7 @@ struct Fixture
                      LeasePolicy policy = LeasePolicy::Unchecked,
                      std::chrono::seconds slack = Distributed::LeaseTokenClockSkewSlack):
         jobs { runner, scratch.Path(), { { "gcc-13", "g++" } }, ToolchainSurvey::Completed() },
-        worker { jobs, MakeLeaseValidator(policy, lease, metrics, slack), std::move(codecs), metrics }
+        worker { jobs, MakeLeaseValidator(policy, lease, endpoint, metrics, slack), std::move(codecs), metrics }
     {
     }
     Fixture(Fixture const&) = delete;
@@ -2169,8 +2222,8 @@ TEST_CASE("A worker that has not registered honours no grant, however authentic"
         Distributed::WorkerLeaseState lease { Distributed::SchedulerTermRegressionNotice::Silent() };
         // Deliberately NOT pinned: this is a worker whose first registration round has
         // not completed, which is every worker for the first moments of its life.
-        auto const validator =
-            SignedLeaseValidator(TestClusterKey(), std::string { ThisWorker }, LeaseClock, lease, metrics);
+        MovingEndpoint const endpoint { ThisWorker };
+        auto const validator = SignedLeaseValidator(TestClusterKey(), endpoint, LeaseClock, lease, metrics);
 
         auto const refusal = validator(GrantFor(ThisWorker), "gcc-13").refusal;
         REQUIRE(refusal.has_value());
@@ -2185,8 +2238,8 @@ TEST_CASE("A worker that has not registered honours no grant, however authentic"
     {
         Distributed::WorkerLeaseState lease { Distributed::SchedulerTermRegressionNotice::Silent() };
         lease.fleet.Pin(std::string { ThisCluster });
-        auto const validator =
-            SignedLeaseValidator(TestClusterKey(), std::string { ThisWorker }, LeaseClock, lease, metrics);
+        MovingEndpoint const endpoint { ThisWorker };
+        auto const validator = SignedLeaseValidator(TestClusterKey(), endpoint, LeaseClock, lease, metrics);
 
         CHECK_FALSE(validator(GrantFor(ThisWorker), "gcc-13").refusal.has_value());
     }
@@ -2199,8 +2252,8 @@ TEST_CASE("A worker that has not registered honours no grant, however authentic"
         // SECTIONs above and break every single-machine install.
         Distributed::WorkerLeaseState lease { Distributed::SchedulerTermRegressionNotice::Silent() };
         lease.fleet.Pin(std::string {});
-        auto const validator =
-            SignedLeaseValidator(TestClusterKey(), std::string { ThisWorker }, LeaseClock, lease, metrics);
+        MovingEndpoint const endpoint { ThisWorker };
+        auto const validator = SignedLeaseValidator(TestClusterKey(), endpoint, LeaseClock, lease, metrics);
 
         CHECK_FALSE(
             validator(GrantFor(ThisWorker, "gcc-13", std::chrono::minutes { 10 }, ""), "gcc-13").refusal.has_value());
@@ -2209,6 +2262,75 @@ TEST_CASE("A worker that has not registered honours no grant, however authentic"
             validator(GrantFor(ThisWorker, "gcc-13", std::chrono::minutes { 10 }, ThisCluster, 7, "18"), "gcc-13").refusal;
         REQUIRE(foreign.has_value());
         CHECK(Unwrap(foreign).reason == Distributed::LeaseRefusalReason::ClusterMismatch);
+    }
+}
+
+TEST_CASE("A worker that learns a new address verifies grants naming it, and stops honouring the old one",
+          "[worker-protocol][lease]")
+{
+    // The acceptance clause of #1279 at the validator, and what makes it a test rather
+    // than a restatement is that ONE token carries it: the same grant, unchanged, is
+    // refused before the address moves and accepted after. No implementation that
+    // captured the endpoint can produce that, and neither can one that refuses
+    // everything or accepts everything -- the two shapes a "follow the seam" change
+    // actually ships as.
+    //
+    // It works because a refusal happens BEFORE the spend (#614), so the grant refused
+    // in the first half is still unspent in the second. That ordering is load-bearing
+    // here: presenting an ACCEPTED token twice would be refused `Replayed`, and a case
+    // written that way would pass under the defect.
+    AtomicMetricsSink metrics;
+    Distributed::WorkerLeaseState lease { Distributed::SchedulerTermRegressionNotice::Silent() };
+    lease.fleet.Pin(std::string { ThisCluster });
+
+    MovingEndpoint endpoint { ThisWorker };
+    auto const validator = SignedLeaseValidator(TestClusterKey(), endpoint, LeaseClock, lease, metrics);
+
+    // Minted up front, both of them, so nothing about WHEN a token was signed can
+    // explain the difference in how it is answered -- the only thing that changes
+    // between the two halves below is what this worker says its address is.
+    auto const forTheNewAddress = GrantFor(MovedWorker, "gcc-13", std::chrono::minutes { 10 }, ThisCluster, GrantTerm, "40");
+    auto const forTheOldAddress = GrantFor(ThisWorker, "gcc-13", std::chrono::minutes { 10 }, ThisCluster, GrantTerm, "41");
+
+    SECTION("before the address moves, the new one is not this worker")
+    {
+        auto const refusal = validator(forTheNewAddress, "gcc-13").refusal;
+        REQUIRE(refusal.has_value());
+        CHECK(Unwrap(refusal).reason == Distributed::LeaseRefusalReason::EndpointMismatch);
+
+        // The control, and it is the half that fails against a validator refusing
+        // everything: the address this worker currently advertises still works.
+        CHECK_FALSE(validator(forTheOldAddress, "gcc-13").refusal.has_value());
+    }
+
+    SECTION("after the address moves, the same grant verifies")
+    {
+        endpoint.MoveTo(MovedWorker);
+
+        CHECK_FALSE(validator(forTheNewAddress, "gcc-13").refusal.has_value());
+
+        // And the mirror, which is what stops this reading as "it accepts more now".
+        // A grant for the address this worker has LEFT is refused -- as a mismatch
+        // rather than as anything else, because `EndpointMismatch` is what an operator
+        // reads as "the fleet is still handing out the old address" and a replay or an
+        // expiry would send them somewhere else entirely.
+        auto const refusal = validator(forTheOldAddress, "gcc-13").refusal;
+        REQUIRE(refusal.has_value());
+        CHECK(Unwrap(refusal).reason == Distributed::LeaseRefusalReason::EndpointMismatch);
+    }
+
+    SECTION("the refusal names the address this worker answers on, so an operator can compare two strings")
+    {
+        endpoint.MoveTo(MovedWorker);
+
+        auto const refusal = validator(forTheOldAddress, "gcc-13").refusal;
+        REQUIRE(refusal.has_value());
+        // Populated only after the MAC verified, so both addresses in it are facts the
+        // scheduler signed or this worker holds -- which is why it is safe to send and
+        // worth asserting: a mismatch whose text named neither address would leave the
+        // operator with a counter and nothing to compare.
+        CHECK(Unwrap(refusal).detail.contains(MovedWorker));
+        CHECK(Unwrap(refusal).detail.contains(ThisWorker));
     }
 }
 

@@ -12,7 +12,7 @@
 #
 # reloadable-for: fastcache-compile-node
 #
-# SEVEN settings are reloadable and the rest are read once at startup. A reload
+# EIGHT settings are reloadable and the rest are read once at startup. A reload
 # re-reads this file the way the start read it, so a change to anything else is
 # refused BY NAME rather than half-applied -- you are told which key needs the
 # restart instead of running a worker that disagrees with its own file.
@@ -26,6 +26,13 @@
 #   fleet_member, fleet_open            immediate, from the next connection; a
 #                                       host you REMOVE is refused straight away,
 #                                       which is what this one is for
+#   advertise                           re-registers at the new address and retires
+#                                       the entry under the old one, within a
+#                                       heartbeat. A lease already granted for the
+#                                       old address is refused, costing that client
+#                                       one local compile -- which is nothing when
+#                                       the old address is the one that stopped
+#                                       working, and is why this is reloadable
 #
 # Every key is one flag, spelled with underscores instead of dashes, and there
 # is no setting that a file can express and a command line cannot. A flag on the
@@ -95,7 +102,10 @@
 # scheduler hands this string to clients verbatim, so a worker that
 # advertises an address only it can reach is leased and then never answers.
 # It is also wrong when listen_node is the wildcard, which names no host any
-# client can dial -- the node refuses to start rather than advertise it.
+# client can dial -- the node refuses to start rather than advertise it, and
+# refuses a RELOAD naming one for the same reason.
+# Reloadable: a node that learns its address late -- behind a NAT, or on an
+# interface configured after the service -- re-registers under the new one.
 #advertise:
 
 # a toolchain this worker serves; repeatable. An OVERRIDE: naming any pins

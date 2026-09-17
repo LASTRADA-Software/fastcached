@@ -1015,7 +1015,37 @@ struct NodeConfig
 ///
 /// Changing one means re-deriving what this node serves and re-registering, so the
 /// scheduler stops dispatching against a set this worker no longer has.
+///
+/// **This is one of THREE kinds, not one of two**, and the third arrived because a flag
+/// existed that neither list described: `--advertise` changes the ADDRESS a registration
+/// is filed under while changing nothing about what is served, so it must re-register
+/// (this list's consequence) and must not re-survey (the local list's). Named
+/// `AddressReloadableFlags` below.
 inline constexpr std::array<std::string_view, 2> AdvertisedReloadableFlags { "--toolchain", "--no-toolchain-discovery" };
+
+/// The reloadable flags that change WHERE this worker is registered, not WHAT it
+/// registers.
+///
+/// The scheduler's registry is keyed per `(fingerprint, endpoint)`, so these move the
+/// second half of that key. The consequence is the expensive half of
+/// `AdvertisedReloadableFlags` -- withdraw the old entry, register the new one -- WITHOUT
+/// its cheap-looking half, the re-derivation: an endpoint is a string this node already
+/// holds, and spending a 300 s include-tree walk to move one would be minutes of work
+/// telling the fleet nothing the same beat could have told it at once.
+///
+/// **A list a `static_assert` reads rather than one any function walks, and that is the
+/// whole of its job today.** The DECISION to re-announce is made by comparing the
+/// DERIVED endpoint (`AdvertisedEndpointChange`), not by comparing this row: a save that
+/// clears `--advertise` where its value equalled the `Node` surface's resolved address
+/// moves this row and changes nothing the scheduler keys on, and re-registering a fleet
+/// for that is the spurious direction. So the list forces the classification at the
+/// table and the comparison happens where the fact lives
+/// ([#1279](https://github.com/LASTRADA-Software/fastcached/issues/1279)).
+///
+/// Stated because the alternative reads as an omission: an entry here is not a promise
+/// that something walks it, and the guard below is what keeps it honest by requiring the
+/// row it names to be real, comparable and `Reloadable::Yes`.
+inline constexpr std::array<std::string_view, 1> AddressReloadableFlags { "--advertise" };
 
 /// The reloadable flags that are local wiring and reach no other machine.
 ///
@@ -1061,8 +1091,9 @@ inline constexpr std::array<std::string_view, 5> LocalReloadableFlags {
 /// this. A third list is covered by being added to this array; naming the two lists in
 /// each assertion instead is the same duplication one level up, and is how the first
 /// guard came to stand alone.
-inline constexpr std::array<std::span<std::string_view const>, 2> ReloadableFlagLists {
+inline constexpr std::array<std::span<std::string_view const>, 3> ReloadableFlagLists {
     std::span<std::string_view const> { AdvertisedReloadableFlags },
+    std::span<std::string_view const> { AddressReloadableFlags },
     std::span<std::string_view const> { LocalReloadableFlags },
 };
 

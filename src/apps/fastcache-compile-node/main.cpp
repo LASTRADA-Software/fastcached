@@ -1070,6 +1070,13 @@ using Node::NodeReloader;
     // handed below, so a panel and `/metrics` cannot disagree about this machine. The attachment
     // is declared AFTER all of them and so detaches before the first of them is destroyed, on
     // every way out of this function -- including the surface outliving them, which it does.
+    //
+    // `endpoint` is the STARTUP value and deliberately not the seam (#1279). It is the
+    // dashboard's source line -- where this process ANSWERS -- and the bind behind that cannot
+    // move, `--listen-node` being unreloadable. So a node that re-advertises shows the address
+    // it booted with in one cosmetic line, and the alternative is a third spelling of
+    // `AdvertisedEndpoint` in the one translation unit no test can reach. The two sites that
+    // DECIDE anything, the registration and the lease check, both follow the seam.
     Node::NodeLiveStatsSources const nodeLiveSources { Node::NodeLiveStatsParts { .metrics = &metrics,
                                                                                   .snapshot = snapshotProvider,
                                                                                   .identity = &nodeStatus,
