@@ -7,7 +7,6 @@
 #include <expected>
 #include <filesystem>
 #include <fstream>
-#include <random>
 #include <ranges>
 #include <span>
 #include <string>
@@ -20,6 +19,7 @@
 #include <CowTree/FilePageStore.hpp>
 #include <CowTree/Meta.hpp>
 #include <CowTree/PageId.hpp>
+#include <tests/ScratchPath.hpp>
 
 // The lock-classifier case below asserts over the platform's own error
 // constants: `errno` values on POSIX, `GetLastError()` values on Windows.
@@ -53,8 +53,12 @@ struct TempFile
 
     TempFile()
     {
-        std::mt19937_64 rng { std::random_device {}() };
-        path = std::filesystem::temp_directory_path() / ("cowtree-test-" + std::to_string(rng()) + ".cow");
+        // `UniqueScratchPath`, never a random draw: `std::random_device` returns zero for
+        // most draws on the host #1507 was reproduced on, so every process here agreed on
+        // one filename and contended for its `flock`. See `StorageTestUtils.hpp`'s
+        // `TempFile`, which carries the measurement.
+        path = FastCache::Testing::UniqueScratchPath("cowtree-test");
+        path += ".cow";
         std::filesystem::remove(path);
     }
     ~TempFile()

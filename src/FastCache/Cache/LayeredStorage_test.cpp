@@ -13,12 +13,13 @@
 #include <filesystem>
 #include <format>
 #include <memory>
-#include <random>
 #include <ranges>
 #include <span>
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include <tests/ScratchPath.hpp>
 
 using namespace std::chrono_literals;
 using FastCache::Testing::Decode;
@@ -364,14 +365,16 @@ TEST_CASE("Sharded composition: ShardedStorage of LayeredStorage(InMem, CowTree)
     // against the same on-disk files, Gets through the rebuilt stack
     // must serve the canonical disk values (L1 is empty after rebuild).
     constexpr std::size_t kShards = 4;
-    std::mt19937_64 rng { std::random_device {}() };
-    auto const stem = std::format("layered-integration-{}", rng());
+    // `UniqueScratchPath` rather than a random stem: `std::random_device` answers zero
+    // for most draws on the host #1507 was reproduced on, which made every concurrent
+    // process pick the same four shard files. `StorageTestUtils.hpp` carries the numbers.
+    auto const stem = FastCache::Testing::UniqueScratchPath("layered-integration").string();
 
     std::vector<std::filesystem::path> paths;
     paths.reserve(kShards);
     for (auto const i: std::views::iota(std::size_t { 0 }, kShards))
     {
-        auto path = std::filesystem::temp_directory_path() / std::format("{}-shard-{:02d}.cow", stem, i);
+        std::filesystem::path path = std::format("{}-shard-{:02d}.cow", stem, i);
         std::filesystem::remove(path);
         paths.push_back(std::move(path));
     }

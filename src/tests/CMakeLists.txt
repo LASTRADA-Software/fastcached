@@ -2096,6 +2096,52 @@ set_tests_properties("membership-fakes-selftest" PROPERTIES
 )
 
 # ---------------------------------------------------------------------------
+# `std::random_device` is not a uniqueness source, and a temp path may not bet on it.
+#
+# #1507: `StorageTestUtils.hpp`'s `TempFile` named its file from
+# `std::mt19937_64 { std::random_device {}() }()`, and on the host it was reproduced on that
+# device answers ZERO for 57% of draws -- so 31 of 32 concurrent processes agreed on one
+# filename and the second opener was refused `InUse` by a `flock` doing its job. The symptom
+# named the STORAGE layer; the defect was four lines in a test helper, and four more copies of
+# the idiom had already spread.
+#
+# The unique-path helper has been written six times. Five used a counter, which the rulebook
+# already warns about; this one used something that merely LOOKS stronger, so none of that
+# reasoning applied to it. Nothing in the type system makes a test reach for the seam, so the
+# guard is a scan.
+add_test(
+    NAME "unique-temp-paths"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-unique-temp-paths.cmake"
+)
+set_tests_properties("unique-temp-paths" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 180
+)
+
+# And in BOTH directions, because the accepting half is the one this check is likely to lose:
+# the four files its rule was written for now DISCUSS `std::random_device` in prose, so a reader
+# that counted comments would refuse the tree it had just fixed. Seven staged trees: a clean
+# one, a real draw, the same words in a comment, an exemption row honoured and the same row
+# refused as stale, a missing seam, and a seam that has stopped reading the device -- the last
+# being the positive anchor, without which a clean report would mean only that nothing matched.
+# Each exemption case asserts it was judged by the STAGED check. It prints how many cases ran.
+add_test(
+    NAME "unique-temp-paths-selftest"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DFASTCACHED_SCRATCH_DIR=${CMAKE_CURRENT_BINARY_DIR}/unique-temp-paths-selftest"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-unique-temp-paths-selftest.cmake"
+)
+set_tests_properties("unique-temp-paths-selftest" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 180
+)
+
+# ---------------------------------------------------------------------------
 # A test may not decide anything from the architecture it was COMPILED for.
 #
 # `#if defined(_M_ARM64)` in a test picks an expected value from a fact about the
