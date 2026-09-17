@@ -6,6 +6,7 @@
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Metrics/StatsReading.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
+#include <FastCache/Protocol/LiveWatcher.hpp>
 
 #include <array>
 #include <atomic>
@@ -424,24 +425,31 @@ class ILiveGate
     ILiveGate& operator=(ILiveGate&&) = delete;
     virtual ~ILiveGate() = default;
 
-    /// May this peer subscribe at all, before its request is read for what it asks?
-    /// @param peer The peer's host.
+    /// May this watcher subscribe at all, before its request is read for what it asks?
+    ///
+    /// **All three of these take the same `LiveWatcher`, and that is the load-bearing part.**
+    /// The door and the per-tick re-gate must answer ONE question: a door that admitted on
+    /// something `Recheck` cannot see would admit a watcher and end its stream one tick later,
+    /// which is worse than refusing it outright
+    /// ([#1512](https://github.com/LASTRADA-Software/fastcached/issues/1512)). Widening one
+    /// without the other is not a partial fix, it is a regression.
+    /// @param watcher Who is asking.
     /// @return The encoded refusal, or nullopt to go on.
-    [[nodiscard]] virtual std::optional<std::vector<std::byte>> RefuseWatcher(std::string_view peer) const = 0;
+    [[nodiscard]] virtual std::optional<std::vector<std::byte>> RefuseWatcher(LiveWatcher const& watcher) const = 0;
 
-    /// May this peer have what it asked for?
+    /// May this watcher have what it asked for?
     /// @param request The decoded request.
-    /// @param peer The peer's host.
+    /// @param watcher Who is asking.
     /// @return The encoded refusal, or nullopt to stream.
     [[nodiscard]] virtual std::optional<std::vector<std::byte>> Admit(CompileCacheWire::SubscribeRequest const& request,
-                                                                      std::string_view peer) const = 0;
+                                                                      LiveWatcher const& watcher) const = 0;
 
     /// Is a running stream still admitted, on this tick?
     /// @param subject What it streams.
-    /// @param peer The peer's host.
+    /// @param watcher Who is streaming.
     /// @return The terminal reply that ends it, or nullopt to go on.
     [[nodiscard]] virtual std::optional<std::vector<std::byte>> Recheck(CompileCacheWire::LiveSubject subject,
-                                                                        std::string_view peer) const = 0;
+                                                                        LiveWatcher const& watcher) const = 0;
 };
 
 /// How many events one subject keeps for subscribers that have not read them yet.
@@ -492,13 +500,14 @@ class LiveStream
     /// Parameters are pointers because a coroutine parameter must not be a reference; each must
     /// outlive the returned task.
     /// @param frame The whole request, header included.
-    /// @param peer The peer's host.
+    /// @param watcher Who is subscribing. Taken BY VALUE and owning, because it is read again
+    ///        on every tick for the life of the stream.
     /// @param sink Where every push goes, and what the surface's read watch saw.
     /// @param gate Who is admitted, at subscribe and on every tick.
     /// @param reactor Where this stream sleeps between ticks: its connection's reactor.
     /// @return The terminal reply, or empty to close without one.
     [[nodiscard]] Task<std::vector<std::byte>> Serve(
-        std::span<std::byte const> frame, std::string peer, IPushSink* sink, ILiveGate const* gate, IReactor* reactor);
+        std::span<std::byte const> frame, LiveWatcher watcher, IPushSink* sink, ILiveGate const* gate, IReactor* reactor);
 
     /// @return How many subscriptions are streaming right now.
     [[nodiscard]] std::size_t ActiveSubscriptions() const noexcept

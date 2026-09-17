@@ -5,6 +5,7 @@
 
 #include <FastCache/Distributed/MembershipOracle.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
+#include <FastCache/Protocol/LiveWatcher.hpp>
 #include <FastCache/Protocol/SurfaceRefusal.hpp>
 
 #include <cstddef>
@@ -113,36 +114,46 @@ inline constexpr std::string_view HostForgottenWhy =
     return AnswerMembership(decision.verdict, metrics, stranger, strangerWhy);
 }
 
-/// Refuse @p peerAddress unless this node's oracle admits it, IGNORING any proof.
+/// Refuse @p watcher unless this node's oracle admits it, or unless its CONNECTION proved the
+/// cluster key.
 ///
-/// **Choosing this spelling is a claim, not a convenience**: it says the cluster-key proof
-/// must not widen this particular gate, and the caller has to say why. Same idea as
-/// `Cc::RefuseWithoutCounter` beside `Cc::Refuse` -- two spellings so that *decided* cannot
-/// be written the way *forgot* is.
+/// The same fold as the overload above, reached from the live-stream path, where what is
+/// available is a `LiveWatcher` rather than the connection's full identity -- narrower on
+/// purpose, and narrower in the one field a gate could not have checked anyway.
 ///
-/// One caller, and it is `LiveStatsResponder`. A subscription is re-gated on EVERY tick
-/// through `Protocol::ILiveGate::Recheck`, which takes an address because `fastcached` shares
-/// that seam and holds no cluster key; a door that honoured the proof while the re-gate did
-/// not would admit a proven watcher and drop it one tick later, which is worse than refusing
-/// it. So the two agree, and they agree in the closed direction.
+/// **It is an overload rather than a `(host, bool)` parameter pair deliberately.** A bare
+/// `bool` argument at a call site says nothing about which question it answers, and this
+/// header already carries the rule that a claim must not be spellable the way a default is.
+/// Two named types, one fold, and no call site that could pass the wrong one silently.
 ///
-/// @param membership The node's oracle.
+/// **Two gates reach this for ONE subscription** -- `RefuseWatcher` at the door and `Recheck`
+/// on every tick -- and that is the property #1512 turns on: they must answer alike, or a
+/// proven watcher is admitted and dropped a tick later.
+/// @param membership The node's oracle, bound once by the surface.
 /// @param metrics Where the refusal is counted.
-/// @param peerAddress The caller's host, as the kernel reported it.
+/// @param watcher Who is watching: the host, and whether the cluster key was proved.
 /// @param stranger What THIS surface answers a host nobody listed.
 /// @param strangerWhy The words that ride with it.
-/// @param proofExcluded Why a cluster-key proof may not widen this gate. Read by a person,
-///        never by the code -- it is here so the claim cannot be made silently.
-/// @return The refusal to answer, or nullopt when the caller is a member.
-[[nodiscard]] inline std::optional<std::vector<std::byte>> RefuseUnlessMemberAtAddress(
+/// @return The refusal to answer, or nullopt when the watcher is a member.
+[[nodiscard]] inline std::optional<std::vector<std::byte>> RefuseUnlessMember(
     Distributed::IMembershipOracle const& membership,
     IMetricsSink& metrics,
-    std::string_view peerAddress,
+    LiveWatcher const& watcher,
     Cc::SurfaceRefusal stranger,
-    std::string_view strangerWhy,
-    std::string_view /*proofExcluded*/)
+    std::string_view strangerWhy)
 {
-    return AnswerMembership(membership.Classify(peerAddress), metrics, stranger, strangerWhy);
+    auto const decision = Distributed::ExplainConnection(membership, watcher.host, watcher.provedClusterKey);
+    return AnswerMembership(decision.verdict, metrics, stranger, strangerWhy);
 }
+
+// `RefuseUnlessMemberAtAddress` stood here until #1512, and it is GONE rather than left
+// unused. It existed to say *the cluster-key proof must not widen this gate*, and its one
+// caller -- the live-stats door -- chose it for a reason about the SEAM rather than about the
+// subject: `Protocol::ILiveGate` took a bare host, so the per-tick `Recheck` could not have
+// seen a proof, and a door honouring one alone would admit a proven watcher and end its
+// stream a tick later. #1512 widened the seam, so both ends now fold through
+// `ExplainConnection` and the claim has no subject. Keeping the spelling would leave a
+// policy that reads as available and describes nothing, which is how a table stops
+// describing the file it is about.
 
 } // namespace FastCache::Node

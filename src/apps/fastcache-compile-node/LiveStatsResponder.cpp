@@ -203,22 +203,19 @@ Task<FrameReply> LiveStatsResponder::Answer(std::span<std::byte const> frame, Pe
 
 std::optional<std::vector<std::byte>> LiveStatsResponder::RefusePeer(PeerIdentity const& peer, std::uint8_t /*opRaw*/) const
 {
-    // The ADDRESS only, and `RefuseWatcher` is why: the door and the per-tick re-gate ask one
-    // question, and only one of them could ever see a proof.
-    return RefuseWatcher(peer.host);
+    // The whole identity, narrowed to what a gate may act on. Since #1512 the re-gate sees the
+    // same two facts this door does, so there is no longer a reason to ask a smaller question
+    // here -- and asking one anyway would refuse a watcher the re-gate would have kept.
+    return RefuseWatcher(LiveWatcher { .host = peer.host, .provedClusterKey = peer.provenNodeId.has_value() });
 }
 
-std::optional<std::vector<std::byte>> LiveStatsResponder::RefuseWatcher(std::string_view peer) const
+std::optional<std::vector<std::byte>> LiveStatsResponder::RefuseWatcher(LiveWatcher const& watcher) const
 {
-    return RefuseUnlessMemberAtAddress(
-        _membership,
-        _metrics,
-        peer,
-        RefusedNotAMember,
-        "this node streams its live stats to fleet members only",
-        "a subscription is re-gated on every tick through Protocol::ILiveGate::Recheck, which takes an "
-        "address because fastcached shares that seam and holds no cluster key; honouring a proof at this "
-        "door alone would admit a proven watcher and end its stream one tick later");
+    // The same fold every other membership gate on this surface reaches, and since #1512 the
+    // per-tick `Recheck` below reaches it too -- which is the condition under which honouring a
+    // proof here is a fix rather than a one-tick admission.
+    return RefuseUnlessMember(
+        _membership, _metrics, watcher, RefusedNotAMember, "this node streams its live stats to fleet members only");
 }
 
 std::vector<std::byte> LiveStatsResponder::RefusalReply(Wire::PrePayloadDecision decision,
@@ -242,14 +239,16 @@ IFrameStream* LiveStatsResponder::StreamFor(std::uint8_t opRaw) noexcept
 }
 
 std::optional<std::vector<std::byte>> LiveStatsResponder::Admit(Wire::SubscribeRequest const& request,
-                                                                std::string_view peer) const
+                                                                LiveWatcher const& watcher) const
 {
     if (!LiveSubjectGates.at(static_cast<std::size_t>(request.subject)).fleetGates)
         return std::nullopt;
 
     // The decision `FleetText` answers from too; what is this surface's is which counter each
-    // refusal moves.
-    auto const verdict = DecideFleetRead(_sources.Leadership(), _dashboard, request.dashboardToken, peer);
+    // refusal moves. The HOST alone, and that is unchanged by #1512: this is the dashboard
+    // credential and locality, which a cluster-key proof is not a substitute for -- two
+    // secrets answering two questions, and the token is its own file by rule.
+    auto const verdict = DecideFleetRead(_sources.Leadership(), _dashboard, request.dashboardToken, watcher.host);
     switch (verdict.decision)
     {
         case FleetReadDecision::Admitted:
@@ -266,23 +265,15 @@ std::optional<std::vector<std::byte>> LiveStatsResponder::Admit(Wire::SubscribeR
     return Cc::Refuse(_metrics, RefusedUnauthenticated, verdict.detail);
 }
 
-std::optional<std::vector<std::byte>> LiveStatsResponder::Recheck(Wire::LiveSubject subject, std::string_view peer) const
+std::optional<std::vector<std::byte>> LiveStatsResponder::Recheck(Wire::LiveSubject subject,
+                                                                  LiveWatcher const& watcher) const
 {
     // Re-asked every tick of the bound oracle, which is the whole defence against removal failing
     // open.
     // Through the same gate as the door, so a stream ENDS for the reason the door would
     // have refused it -- and a forget names itself rather than arriving as the generic
     // revocation, which is what an operator watching a subscriber drop needs to read.
-    if (auto refusal =
-            RefuseUnlessMemberAtAddress(_membership,
-                                        _metrics,
-                                        peer,
-                                        Revoked,
-                                        "this peer is no longer a fleet member",
-                                        "this is the re-gate `RefuseWatcher` agrees with: it is reached through "
-                                        "Protocol::ILiveGate, a seam fastcached shares and which carries no cluster-key "
-                                        "proof, so honouring one at the door alone would end a proven stream on its first "
-                                        "tick");
+    if (auto refusal = RefuseUnlessMember(_membership, _metrics, watcher, Revoked, "this peer is no longer a fleet member");
         refusal.has_value())
         return refusal;
 
@@ -296,11 +287,16 @@ std::optional<std::vector<std::byte>> LiveStatsResponder::Recheck(Wire::LiveSubj
 
 Task<std::vector<std::byte>> LiveStatsResponder::Serve(std::span<std::byte const> frame, PeerIdentity peer, IPushSink* sink)
 {
-    // The HOST goes down to the stream and the proof does not, which is `RefuseWatcher`'s
-    // decision arriving here: `LiveStream` re-gates through `Protocol::ILiveGate`, a seam
-    // `fastcached` shares and which therefore cannot carry a cluster-key proof. Dropping the
-    // field here rather than at the gate keeps the two from disagreeing about one connection.
-    co_return co_await _stream.Serve(frame, std::move(peer.host), sink, this, &_reactor);
+    // Narrowed, not dropped (#1512). `LiveWatcher` is what a gate may act on -- the host and
+    // whether the cluster key was proved -- and it OWNS its host because `Recheck` reads it
+    // again on every tick, long after this frame's storage is gone. The proven LABEL stays
+    // here: it is not something a gate can check, and it is legitimately empty.
+    co_return co_await _stream.Serve(
+        frame,
+        LiveWatcher { .host = std::move(peer.host), .provedClusterKey = peer.provenNodeId.has_value() },
+        sink,
+        this,
+        &_reactor);
 }
 
 } // namespace FastCache::Node
