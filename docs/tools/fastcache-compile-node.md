@@ -3279,6 +3279,74 @@ where addresses can be spoofed is not a boundary this can hold.
 
 For anything beyond a trusted build network, put mTLS in front of every port.
 
+### A node proves its membership instead of being recognised by its address
+
+**Every node-to-node connection now opens by proving the cluster key, and a node that
+proves it is admitted whatever address it dialled from.** There is no flag: a node that
+has `--cluster-key-file` presents a proof on every heartbeat round, and one that has the
+key verifies the proofs presented to it. Nothing else changes — a caller that proves
+nothing is admitted or refused by its address exactly as before.
+
+This is what makes a machine on a VPN, a NAT or DHCP usable at all. Before it, admission
+was the peer's source address against the cluster's committed endpoints or against
+`--fleet-member`, so a worker that gets a different address each session had to be
+re-listed each session, on every node.
+
+The exchange is two verbs on the port the node already serves: the node asks for a
+challenge, the server states one drawn for that connection, and the node answers with an
+HMAC over it under the cluster key. A challenge answers exactly one proof and is spent
+whatever the outcome, so a recorded exchange cannot be replayed onto a second connection.
+
+**What it does and does not establish.** It establishes *this caller holds the cluster
+key*. It does **not** say WHICH holder: one shared key cannot tell its holders apart, so
+the node id a proof carries is a label the MAC covers — it cannot be swapped by a relay —
+rather than an identity. Two consequences worth knowing before you rely on it:
+
+- **Removing one machine still means rotating the key on all the others.** A proof cannot
+  be revoked, and `--cluster-forget` removes an address from the committed set, not a key
+  from a machine. Per-node identity is
+  [#178](https://github.com/LASTRADA-Software/fastcached/issues/178).
+- **A node that runs no consensus has no id to name**, because an identity is minted into
+  `--cluster-dir` only where consensus runs. Such a node proves with an empty label, which
+  is accepted; what it costs is that the server's log and `--node-status` then name the
+  address it proved from and nothing else.
+
+**Where it does not reach.** A node's own cache tier still serves this machine only — that
+is a property of the verb and not of any list, so holding the fleet's key does not open
+it. The fleet page and a live-stats subscription both need `--dashboard-token-file` on top
+of membership, and that credential is unchanged: a proof is not a substitute for it. They
+differ in the membership half — a fleet read honours a proof, and a **subscription does
+not**, because it is re-checked on every tick through a seam `fastcached` shares and which
+therefore holds no cluster key. So a node admitted by its proof alone can read the fleet
+with the dashboard token and still cannot subscribe; that gap is
+[#1512](https://github.com/LASTRADA-Software/fastcached/issues/1512).
+
+**Reading the counters.** Four series, and they answer different questions:
+
+| Series | What a rise means |
+|---|---|
+| `fastcache_node_proofs_accepted_total` | The route is live. Every other row below counts a refusal, so this is the only one that distinguishes *working* from *never used*. |
+| `fastcache_node_proofs_rejected_total` | A tag that did not authenticate: a machine with the wrong `--cluster-key-file`, or somebody guessing at the key. The **rate** separates them — one misconfigured machine moves it once per dial round, forever, at a cadence you can recognise. |
+| `fastcache_node_proofs_unchallenged_total` | A client sent a proof with no challenge outstanding. A version or client-library mismatch, not a security signal. |
+| `fastcache_node_proofs_malformed_total` | A payload that would not decode. The same kind of mismatch, kept apart so an old client cannot hide a key search. |
+
+Never sum `node_proofs_rejected` with `scheduler_credentials_rejected`: that one is a
+wrong `--requirepass` against this node's `--scheduler-token-file`, which is an operator's
+token, and this is the cluster key every member holds. Two secrets, two remedies.
+
+A node whose proof is refused says so once per round and **carries on registering by
+address**, because a mixed fleet mid-upgrade is the ordinary reason a peer answers no proof
+at all:
+
+```
+WARN  scheduler 10.0.0.2:6676 did not accept this node's cluster-key proof: ...
+      Registration continues by address; check --cluster-key-file on this machine if it is refused
+```
+
+A node that holds no cluster key answers both verbs `no-cluster`, naming the flag, rather
+than *unimplemented verb* — which a caller would read as *this node's build is too old* and
+act on by upgrading a machine that is already current.
+
 ## Known limitations
 
 - **Preprocessing does not distribute.** The client must preprocess to compute

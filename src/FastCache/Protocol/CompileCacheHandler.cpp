@@ -1223,6 +1223,12 @@ Task<void> CompileCacheHandler::Run(ISocket* socket,
             case Wire::Op::EnrollControl:
             // The fleet document, answered by the fleet's scheduler; same arm, same reason.
             case Wire::Op::FleetText:
+            // The node proof (#1428), answered by a compile node that holds the cluster key.
+            // This daemon holds none -- the key is `fastcache-compile-node`'s flag -- so both
+            // verbs take the same arm for the same reason as the enrollment pair: `RefusalFor`
+            // is the one place the code and the sentence are decided.
+            case Wire::Op::NodeChallenge:
+            case Wire::Op::ProveNode:
                 next = co_await HandleDistributed(socket, descriptor->code);
                 break;
 

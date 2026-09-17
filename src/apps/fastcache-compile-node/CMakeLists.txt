@@ -50,6 +50,8 @@ add_executable(fastcache-compile-node
     EnrollClient.cpp
     EnrollmentResponder.cpp
     EnrollmentWindow.cpp
+    NodeProofClient.cpp
+    NodeProofResponder.cpp
     SchedulerLink.cpp
     SchedulerTier.cpp
     ScratchClaim.cpp
@@ -118,6 +120,9 @@ if(FASTCACHED_BUILD_TESTS)
         EnrollmentResponder_test.cpp
         EnrollmentWindow.cpp
         EnrollmentWindow_test.cpp
+        NodeProofClient.cpp
+    NodeProofResponder.cpp
+        NodeProofResponder_test.cpp
         EnrollTrap_test.cpp
         ExchangeLog_test.cpp
         NodeAnnounce_test.cpp

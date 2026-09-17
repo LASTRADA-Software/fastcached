@@ -134,7 +134,7 @@ constexpr std::uint32_t DiscoveryPort = 9103;
 /// @return The reply bytes.
 [[nodiscard]] std::vector<std::byte> AnswerNow(IFrameResponder& responder, std::span<std::byte const> frame)
 {
-    return SyncRun(responder.Answer(frame, std::string { CallerAddress })).bytes;
+    return SyncRun(responder.Answer(frame, PeerIdentity { .host = std::string { CallerAddress } })).bytes;
 }
 
 /// The bytes following a reply header.
@@ -926,7 +926,8 @@ TEST_CASE("The operator verbs are refused by name to a non-member, and counted o
         // `RefusePeer` is the ONE implementation and `Answer` calls it, so the early
         // refusal and the authoritative one cannot disagree -- and cannot double-count,
         // which a second gate written inline in `Answer` would.
-        auto const early = responder.RefusePeer(CallerAddress, static_cast<std::uint8_t>(Wire::Op::NodeStatus));
+        auto const early = responder.RefusePeer(PeerIdentity { .host = std::string { CallerAddress } },
+                                                static_cast<std::uint8_t>(Wire::Op::NodeStatus));
         CHECK(early.has_value());
         CHECK(metrics.Read(IMetricsSink::Counter::NodeStatusRequestsRefusedNotAMember) == 2);
     }

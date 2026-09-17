@@ -123,7 +123,7 @@ struct Rig
                                              std::vector<std::byte> const& frame,
                                              std::string_view peer)
     {
-        return SyncRun(on.Answer(frame, std::string { peer })).bytes;
+        return SyncRun(on.Answer(frame, PeerIdentity { .host = std::string { peer } })).bytes;
     }
 
     /// Ask the rig's responder from this machine, which a node with no token file admits.
@@ -159,9 +159,15 @@ TEST_CASE("A stranger is refused a fleet read by name and counted once whichever
     CHECK(rig.sources.reads == 0);
 
     // `RefusePeer` is the one implementation; the door asking it counts once more, not twice.
-    CHECK(rig.responder.RefusePeer("192.0.2.1", static_cast<std::uint8_t>(Wire::Op::FleetText)).has_value());
+    CHECK(
+        rig.responder
+            .RefusePeer(PeerIdentity { .host = std::string { "192.0.2.1" } }, static_cast<std::uint8_t>(Wire::Op::FleetText))
+            .has_value());
     CHECK(rig.metrics.Read(IMetricsSink::Counter::FleetTextRequestsRefusedNotAMember) == 2);
-    CHECK_FALSE(rig.responder.RefusePeer(Reader, static_cast<std::uint8_t>(Wire::Op::FleetText)).has_value());
+    CHECK_FALSE(
+        rig.responder
+            .RefusePeer(PeerIdentity { .host = std::string { Reader } }, static_cast<std::uint8_t>(Wire::Op::FleetText))
+            .has_value());
 }
 
 TEST_CASE("The dashboard credential decides a fleet read and is counted against the fleet-text series", "[node][fleettext]")
@@ -337,7 +343,8 @@ TEST_CASE("MergedResponder routes the Fleet family to the fleet-text component a
     MergedResponder merged { SurfaceComponents { .fleet = &rig.responder } };
 
     CHECK(merged.OwnerOf(static_cast<std::uint8_t>(Wire::Op::FleetText)) == &rig.responder);
-    CHECK(Testing::StatusOf(SyncRun(merged.Answer(FleetTextFrame(), "127.0.0.1")).bytes) == Wire::Status::Ok);
+    CHECK(Testing::StatusOf(SyncRun(merged.Answer(FleetTextFrame(), PeerIdentity { .host = "127.0.0.1" })).bytes)
+          == Wire::Status::Ok);
 
     // Routes rather than catching all: no other verb reaches it.
     for (auto const& row: Wire::OpTable)
@@ -350,7 +357,8 @@ TEST_CASE("MergedResponder routes the Fleet family to the fleet-text component a
     SECTION("and a node with no fleet-text component answers served-nowhere rather than crashing")
     {
         MergedResponder without { SurfaceComponents {} };
-        CHECK(Testing::ErrorOf(SyncRun(without.Answer(FleetTextFrame(), "127.0.0.1")).bytes) == Wire::UnimplementedVerb);
+        CHECK(Testing::ErrorOf(SyncRun(without.Answer(FleetTextFrame(), PeerIdentity { .host = "127.0.0.1" })).bytes)
+              == Wire::UnimplementedVerb);
     }
 
     SECTION("and a verb routed to it directly that it does not own is stepped over, uncounted")

@@ -112,6 +112,9 @@ struct TierFixture
                                                    .host = *host,
                                                    .cacheTier = nullptr,
                                                    .credential = credential,
+                                                   // No cluster key: every case here is about the worker tier itself, and a
+                                                   // worker with none is the ordinary single-machine shape.
+                                                   .proofKey = nullptr,
                                                    .metrics = metrics,
                                                    .logger = logger },
                                  makeMachine);

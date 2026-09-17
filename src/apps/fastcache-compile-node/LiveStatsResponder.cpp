@@ -161,6 +161,8 @@ namespace
           .policy = { .counter = std::nullopt, .rationale = CredentialIsTheSchedulersRationale } },
         { .refusal = EndpointRefusal::AnswerDeadline,
           .policy = { .counter = std::nullopt, .rationale = AnswerDeadlineIsTheEndpointsRationale } },
+        { .refusal = EndpointRefusal::NodeProofUnchallenged,
+          .policy = { .counter = std::nullopt, .rationale = NodeProofIsTheProversRationale } },
     } };
 
     static_assert(RowsInEnumeratorOrder(EndpointRefusals, &EndpointRefusalRow::refusal),
@@ -189,7 +191,7 @@ LiveStatsResponder::LiveStatsResponder(ILiveStatsSources const& sources,
 {
 }
 
-Task<FrameReply> LiveStatsResponder::Answer(std::span<std::byte const> frame, std::string peer)
+Task<FrameReply> LiveStatsResponder::Answer(std::span<std::byte const> frame, PeerIdentity peer)
 {
     auto const header = Wire::DecodeRequestHeader(frame);
     auto const opRaw = header.has_value() ? header->opRaw : std::uint8_t { 0xFF };
@@ -199,15 +201,24 @@ Task<FrameReply> LiveStatsResponder::Answer(std::span<std::byte const> frame, st
                                        "SUBSCRIBE is answered as a stream, which this caller cannot carry");
 }
 
-std::optional<std::vector<std::byte>> LiveStatsResponder::RefusePeer(std::string_view peer, std::uint8_t /*opRaw*/) const
+std::optional<std::vector<std::byte>> LiveStatsResponder::RefusePeer(PeerIdentity const& peer, std::uint8_t /*opRaw*/) const
 {
-    return RefuseWatcher(peer);
+    // The ADDRESS only, and `RefuseWatcher` is why: the door and the per-tick re-gate ask one
+    // question, and only one of them could ever see a proof.
+    return RefuseWatcher(peer.host);
 }
 
 std::optional<std::vector<std::byte>> LiveStatsResponder::RefuseWatcher(std::string_view peer) const
 {
-    return RefuseUnlessMember(
-        _membership, _metrics, peer, RefusedNotAMember, "this node streams its live stats to fleet members only");
+    return RefuseUnlessMemberAtAddress(
+        _membership,
+        _metrics,
+        peer,
+        RefusedNotAMember,
+        "this node streams its live stats to fleet members only",
+        "a subscription is re-gated on every tick through Protocol::ILiveGate::Recheck, which takes an "
+        "address because fastcached shares that seam and holds no cluster key; honouring a proof at this "
+        "door alone would admit a proven watcher and end its stream one tick later");
 }
 
 std::vector<std::byte> LiveStatsResponder::RefusalReply(Wire::PrePayloadDecision decision,
@@ -262,7 +273,16 @@ std::optional<std::vector<std::byte>> LiveStatsResponder::Recheck(Wire::LiveSubj
     // Through the same gate as the door, so a stream ENDS for the reason the door would
     // have refused it -- and a forget names itself rather than arriving as the generic
     // revocation, which is what an operator watching a subscriber drop needs to read.
-    if (auto refusal = RefuseUnlessMember(_membership, _metrics, peer, Revoked, "this peer is no longer a fleet member");
+    if (auto refusal =
+            RefuseUnlessMemberAtAddress(_membership,
+                                        _metrics,
+                                        peer,
+                                        Revoked,
+                                        "this peer is no longer a fleet member",
+                                        "this is the re-gate `RefuseWatcher` agrees with: it is reached through "
+                                        "Protocol::ILiveGate, a seam fastcached shares and which carries no cluster-key "
+                                        "proof, so honouring one at the door alone would end a proven stream on its first "
+                                        "tick");
         refusal.has_value())
         return refusal;
 
@@ -274,9 +294,13 @@ std::optional<std::vector<std::byte>> LiveStatsResponder::Recheck(Wire::LiveSubj
     return std::nullopt;
 }
 
-Task<std::vector<std::byte>> LiveStatsResponder::Serve(std::span<std::byte const> frame, std::string peer, IPushSink* sink)
+Task<std::vector<std::byte>> LiveStatsResponder::Serve(std::span<std::byte const> frame, PeerIdentity peer, IPushSink* sink)
 {
-    co_return co_await _stream.Serve(frame, std::move(peer), sink, this, &_reactor);
+    // The HOST goes down to the stream and the proof does not, which is `RefuseWatcher`'s
+    // decision arriving here: `LiveStream` re-gates through `Protocol::ILiveGate`, a seam
+    // `fastcached` shares and which therefore cannot carry a cluster-key proof. Dropping the
+    // field here rather than at the gate keeps the two from disagreeing about one connection.
+    co_return co_await _stream.Serve(frame, std::move(peer.host), sink, this, &_reactor);
 }
 
 } // namespace FastCache::Node

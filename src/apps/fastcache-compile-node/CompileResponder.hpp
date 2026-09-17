@@ -134,7 +134,7 @@ class CompileResponder final: public IFrameResponder
     ///
     /// Admits, hops to the pool, compiles, hops back, answers. The two hops are the
     /// point; see the class comment for why each one is invisible when it is missing.
-    [[nodiscard]] Task<FrameReply> Answer(std::span<std::byte const> frame, std::string peer) override;
+    [[nodiscard]] Task<FrameReply> Answer(std::span<std::byte const> frame, PeerIdentity peer) override;
 
     /// @copydoc IFrameResponder::RefusePeer
     ///
@@ -151,7 +151,8 @@ class CompileResponder final: public IFrameResponder
     /// A cordon is asked of LOCALITY instead, and membership is not consulted for it at
     /// all: a fleet member is exactly who must not be able to take this machine out of the
     /// fleet from somewhere else.
-    [[nodiscard]] std::optional<std::vector<std::byte>> RefusePeer(std::string_view peer, std::uint8_t opRaw) const override;
+    [[nodiscard]] std::optional<std::vector<std::byte>> RefusePeer(PeerIdentity const& peer,
+                                                                   std::uint8_t opRaw) const override;
 
     /// @copydoc IFrameResponder::AuthRequired
     ///
@@ -366,6 +367,16 @@ class CompileResponder final: public IFrameResponder
     /// **Not a stream**: a compile is long, and its liveness is `ProgressInterval`'s pulse ahead of ONE reply,
     /// never a series a client reads as it arrives.
     [[nodiscard]] IFrameStream* StreamFor(std::uint8_t /*opRaw*/) noexcept override
+    {
+        return nullptr;
+    }
+
+    /// @copydoc IFrameResponder::NodeProver
+    ///
+    /// **None.** This surface verifies a per-job LEASE, which is the scheduler's signature over a
+    /// grant, and that is a different question from *does this caller hold the cluster key*. The
+    /// proof still reaches the membership half of this gate through `RefusePeer`.
+    [[nodiscard]] INodeProver* NodeProver() noexcept override
     {
         return nullptr;
     }

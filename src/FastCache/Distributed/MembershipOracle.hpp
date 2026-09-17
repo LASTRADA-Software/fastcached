@@ -156,6 +156,66 @@ class AnyOfMembership final: public IMembershipOracle
     std::vector<IMembershipOracle const*> _participants;
 };
 
+/// The admission decision for one CONNECTION: the address routes, plus what this connection
+/// has PROVED.
+///
+/// ## Why this is not a participant
+///
+/// Every route in `AnyOfMembership` answers `Explain(peerAddress)`, and one oracle serves every
+/// connection a surface accepts. A cluster-key proof is a fact about ONE connection, so a
+/// participant carrying it would have to read state some other connection wrote -- which admits
+/// callers that proved nothing, on a seam whose whole contract is that the argument decides.
+/// There is nowhere in the participant list for a per-connection fact to live, so it is folded
+/// here, where the connection is.
+///
+/// ## Why it is the SAME fold
+///
+/// `PrecedenceOf`, unchanged, which settles the one question this route raises: a
+/// `--cluster-forget-client` tombstone still outranks a proof. That is not a softening of what
+/// a proof means -- under a shared key a forget cannot revoke a key holder at all, and
+/// `Distributed::NodeProof`'s header says so and says what closing that needs (#178). It is the
+/// direction the composition already fails in, and the alternative would be a second precedence
+/// rule reachable only from a connection.
+///
+/// **It takes a `bool` and not the proven id, deliberately.** What the fold needs is *did this
+/// connection prove the key*; the id a proof carries is a LABEL the MAC covers so it cannot be
+/// swapped, it is legitimately empty on any node that has minted no identity, and admission must
+/// not turn on it. A parameter that carried the label would make an empty one indistinguishable
+/// from no proof at all.
+///
+/// `false` is the ordinary case and the one every caller today is in: the fold then returns
+/// exactly what the oracle answered, so a surface that never establishes a proof is unaffected by
+/// construction.
+///
+/// @param oracle The address routes, composed.
+/// @param peerAddress The connecting peer's host, as the oracle takes it.
+/// @param provedClusterKey Whether this connection proved the cluster's pre-shared key.
+/// @return The folded decision, naming `ProvenKeyHolder` among the routes when the proof won or
+///         tied.
+[[nodiscard]] inline MembershipDecision ExplainConnection(IMembershipOracle const& oracle,
+                                                          std::string_view peerAddress,
+                                                          bool provedClusterKey)
+{
+    auto const byAddress = oracle.Explain(peerAddress);
+    if (!provedClusterKey)
+        return byAddress;
+
+    auto const proved = DecidedBy(Membership::Member, MembershipParticipant::ProvenKeyHolder);
+    auto const addressRank = PrecedenceOf(byAddress.verdict);
+    auto const provedRank = PrecedenceOf(proved.verdict);
+    if (provedRank > addressRank)
+        return proved;
+    if (provedRank < addressRank)
+        return byAddress;
+
+    // A tie UNIONS, for `AnyOfMembership`'s reason: a host in `--fleet-member` that also proved
+    // the key is admitted by both, and reporting one hides the other -- which is exactly the
+    // operator question #1471 opens with, asked of a route an operator cannot see in any file.
+    auto tied = byAddress;
+    tied.decidedBy.Add(proved.decidedBy);
+    return tied;
+}
+
 /// What one set of hosts answers, per question the set is asked.
 ///
 /// Two columns rather than one, and `onLoopback` is the load-bearing half. A host

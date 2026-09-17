@@ -87,13 +87,13 @@ class NamedResponder final: public IFrameResponder
     {
     }
 
-    [[nodiscard]] Task<FrameReply> Answer(std::span<std::byte const> /*frame*/, std::string /*peer*/) override
+    [[nodiscard]] Task<FrameReply> Answer(std::span<std::byte const> /*frame*/, PeerIdentity /*peer*/) override
     {
         _answered.push_back(_name);
         co_return Wire::EncodeErrorReply(Wire::ErrorCode::MalformedValue, _name);
     }
 
-    [[nodiscard]] std::optional<std::vector<std::byte>> RefusePeer(std::string_view /*peer*/,
+    [[nodiscard]] std::optional<std::vector<std::byte>> RefusePeer(PeerIdentity const& /*peer*/,
                                                                    std::uint8_t opRaw) const override
     {
         _admitted.push_back(opRaw);
@@ -197,6 +197,14 @@ class NamedResponder final: public IFrameResponder
     [[nodiscard]] IFrameStream* StreamFor(std::uint8_t /*opRaw*/) noexcept override
     {
         return _stream;
+    }
+    /// @copydoc IFrameResponder::NodeProver
+    ///
+    /// **None.** This fake stands in for a surface, not for the cluster-key prover; a case that
+    /// needs one builds a `NodeProofResponder`.
+    [[nodiscard]] INodeProver* NodeProver() noexcept override
+    {
+        return nullptr;
     }
 
     /// Say which stream this fake answers with, or that it answers none.
@@ -306,7 +314,7 @@ class NamedResponder final: public IFrameResponder
 /// @return The reply.
 [[nodiscard]] std::vector<std::byte> AnswerNow(MergedResponder& responder, std::span<std::byte const> frame)
 {
-    return SyncRun(responder.Answer(frame, std::string { "127.0.0.1" })).bytes;
+    return SyncRun(responder.Answer(frame, PeerIdentity { .host = "127.0.0.1" })).bytes;
 }
 
 /// A config naming a free loopback port, and that port.
@@ -513,7 +521,8 @@ TEST_CASE("(#290) one peer on one listener has a FETCH refused and a COMPILE adm
     // one socket, so the counter is the only thing here that says WHICH rule fired:
     // delete the increment in `CacheResponder::RefusePeer` and the code assertion below
     // still passes, with only the counter going red.
-    auto const fetchRefusal = responder.RefusePeer(peer, static_cast<std::uint8_t>(Wire::Op::Fetch));
+    auto const fetchRefusal =
+        responder.RefusePeer(PeerIdentity { .host = std::string { peer } }, static_cast<std::uint8_t>(Wire::Op::Fetch));
     REQUIRE(fetchRefusal.has_value());
     CHECK(ErrorOf(Unwrap(fetchRefusal)) == Wire::ErrorCode::NotAMember);
     CHECK(metrics.Read(IMetricsSink::Counter::NodeCacheRequestsRefusedNotLocal) == 1);
@@ -522,11 +531,16 @@ TEST_CASE("(#290) one peer on one listener has a FETCH refused and a COMPILE adm
     //
     // No refusal at the peer gate, which is as far as this layer decides: a lease and
     // a compiler are the next questions and belong to the fixture that has both.
-    CHECK_FALSE(responder.RefusePeer(peer, static_cast<std::uint8_t>(Wire::Op::Compile)).has_value());
+    CHECK_FALSE(
+        responder.RefusePeer(PeerIdentity { .host = std::string { peer } }, static_cast<std::uint8_t>(Wire::Op::Compile))
+            .has_value());
 
     // And the cache tier still answers THIS machine, which is the other direction of
     // the same rule and the one a widened bind is most likely to break in silence.
-    CHECK_FALSE(responder.RefusePeer("127.0.0.1", static_cast<std::uint8_t>(Wire::Op::Fetch)).has_value());
+    CHECK_FALSE(
+        responder
+            .RefusePeer(PeerIdentity { .host = std::string { "127.0.0.1" } }, static_cast<std::uint8_t>(Wire::Op::Fetch))
+            .has_value());
 }
 
 TEST_CASE("A verb no component serves is refused as unimplemented", "[node][merged-responder]")
@@ -618,12 +632,16 @@ TEST_CASE("An unowned verb is refused before its payload is read", "[node][merge
     NamedResponder scheduler { "scheduler" };
     MergedResponder schedulerOnly { SurfaceComponents { .scheduler = &scheduler } };
 
-    auto const refusal = schedulerOnly.RefusePeer("10.0.0.1", static_cast<std::uint8_t>(Wire::Op::Fetch));
+    auto const refusal = schedulerOnly.RefusePeer(PeerIdentity { .host = std::string { "10.0.0.1" } },
+                                                  static_cast<std::uint8_t>(Wire::Op::Fetch));
     REQUIRE(refusal.has_value());
     CHECK(ErrorOf(Unwrap(refusal)) == Wire::UnimplementedVerb);
 
     // And an owned verb is still the owner's question to answer, not this one's.
-    CHECK_FALSE(schedulerOnly.RefusePeer("10.0.0.1", static_cast<std::uint8_t>(Wire::Op::Lease)).has_value());
+    CHECK_FALSE(
+        schedulerOnly
+            .RefusePeer(PeerIdentity { .host = std::string { "10.0.0.1" } }, static_cast<std::uint8_t>(Wire::Op::Lease))
+            .has_value());
     REQUIRE(scheduler.Admitted().size() == 1);
     CHECK(scheduler.Admitted().front() == static_cast<std::uint8_t>(Wire::Op::Lease));
 

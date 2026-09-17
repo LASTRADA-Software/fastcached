@@ -429,6 +429,12 @@ struct AnnounceFixture
                                 .metrics = metrics,
                                 .sampler = sampler,
                                 .credential = credential,
+                                .notice = notice,
+                                // Nothing to prove and nothing to present: every case in this
+                                // file is about the announce round itself, and a round with no
+                                // cluster key is the ordinary single-machine shape.
+                                .proofKey = nullptr,
+                                .nodeId = {},
                                 .lease = lease,
                                 .fleetMismatch = fleetMismatch,
                                 .logger = logger };

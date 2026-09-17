@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include "ClusterKeySource.hpp"
 #include "EnrollmentWindow.hpp"
 #include "FrameEndpoint.hpp"
 
@@ -66,58 +67,6 @@ namespace FastCache::Node
 /// an enrollment surface that accepts requests and answers `NoCluster` to every
 /// decision: a window that can never admit anybody should not be openable.
 
-/// Where the cluster key is read from when a joiner is approved.
-///
-/// **Read where it is PRESENTED, never captured at construction**, which is this
-/// project's rule for an outbound credential and is the whole reason this is a seam
-/// rather than a `SecureByteBuffer` member. The key is handed over a handful of times
-/// in a fleet's life, so holding a second copy of the cluster's secret in this
-/// process's memory for its whole uptime buys nothing and costs exactly what the rule
-/// is about.
-class IClusterKeySource
-{
-  public:
-    IClusterKeySource() = default;
-    IClusterKeySource(IClusterKeySource const&) = delete;
-    IClusterKeySource(IClusterKeySource&&) = delete;
-    IClusterKeySource& operator=(IClusterKeySource const&) = delete;
-    IClusterKeySource& operator=(IClusterKeySource&&) = delete;
-    virtual ~IClusterKeySource() = default;
-
-    /// The key to hand an approved joiner.
-    ///
-    /// An `expected` rather than an empty buffer for a failure, because *this node
-    /// holds no key* and *the key file has gone* are different facts and only the
-    /// second is worth an operator's attention -- and a joiner handed zero bytes under
-    /// a successful outcome would write an empty key file and fail much later, on a
-    /// machine nobody is watching any more.
-    /// @return The key, or why it could not be read.
-    [[nodiscard]] virtual std::expected<SecureByteBuffer, std::string> ClusterKey() const = 0;
-};
-
-/// `IClusterKeySource` reading `--cluster-key-file` at each hand-over.
-class FileClusterKeySource final: public IClusterKeySource
-{
-  public:
-    /// @param path Where the key lives; empty means this node holds none.
-    explicit FileClusterKeySource(std::filesystem::path path) noexcept:
-        _path { std::move(path) }
-    {
-    }
-
-    /// @copydoc IClusterKeySource::ClusterKey
-    ///
-    /// Through `ReadClusterKey`, which is the one reader in this binary: it holds the
-    /// minimum-length rule and the trailing-newline trim, so a key handed to a joiner
-    /// is byte-for-byte the key every other tier on this node already uses. A second
-    /// reader would eventually differ by a newline, which is an HMAC that verifies
-    /// nowhere and no diagnostic anywhere.
-    [[nodiscard]] std::expected<SecureByteBuffer, std::string> ClusterKey() const override;
-
-  private:
-    std::filesystem::path _path;
-};
-
 /// Serves `Enroll` and `EnrollControl`.
 class EnrollmentResponder final: public IFrameResponder
 {
@@ -154,7 +103,7 @@ class EnrollmentResponder final: public IFrameResponder
     /// thing that touches the filesystem -- reading the cluster key -- is a file a few
     /// dozen bytes long, read on the rare path where a person has just approved
     /// somebody.
-    [[nodiscard]] Task<FrameReply> Answer(std::span<std::byte const> frame, std::string peer) override;
+    [[nodiscard]] Task<FrameReply> Answer(std::span<std::byte const> frame, PeerIdentity peer) override;
 
     /// @copydoc IFrameResponder::RefusePeer
     ///
@@ -168,7 +117,8 @@ class EnrollmentResponder final: public IFrameResponder
     /// `EnrollControl` is refused to a non-member, before a payload is read, and
     /// counted. That refusal is the one carrying the security argument for the pair: a
     /// peer reaching it has found an open window and gone on to ask for the decision.
-    [[nodiscard]] std::optional<std::vector<std::byte>> RefusePeer(std::string_view peer, std::uint8_t opRaw) const override;
+    [[nodiscard]] std::optional<std::vector<std::byte>> RefusePeer(PeerIdentity const& peer,
+                                                                   std::uint8_t opRaw) const override;
 
     /// @copydoc IFrameResponder::AuthRequired
     ///
@@ -309,6 +259,17 @@ class EnrollmentResponder final: public IFrameResponder
         return nullptr;
     }
 
+    /// @copydoc IFrameResponder::NodeProver
+    ///
+    /// **None, and the pairing is the opposite way round from what it looks like.** This surface
+    /// exists for a machine that holds NO cluster key, so it has nothing to verify a proof against
+    /// that the joiner could have produced; the prover exists for a machine that already holds one.
+    /// Two components, two populations, and the same file names both keys.
+    [[nodiscard]] INodeProver* NodeProver() noexcept override
+    {
+        return nullptr;
+    }
+
   private:
     /// Answer one `Enroll`.
     /// @param payload The request payload.
@@ -320,28 +281,32 @@ class EnrollmentResponder final: public IFrameResponder
     /// @param payload The request payload.
     /// @param peer The host the kernel reports.
     /// @return The encoded reply.
-    [[nodiscard]] std::vector<std::byte> AnswerControl(std::span<std::byte const> payload, std::string_view peer);
+    [[nodiscard]] std::vector<std::byte> AnswerControl(std::span<std::byte const> payload, PeerIdentity const& peer);
 
     /// Apply one operator decision to one waiting id.
     /// @param verb `Approve` or `Reject`.
     /// @param subject Who it is about.
-    /// @param peer The host the kernel reports; `ClusterAdmit` gates on it.
+    /// @param peer Who asked; `ClusterAdmit` gates on the membership `Context` folds from it.
     /// @return The encoded reply.
     [[nodiscard]] std::vector<std::byte> AnswerDecision(CompileCacheWire::EnrollControlVerb verb,
                                                         std::string_view subject,
-                                                        std::string_view peer);
+                                                        PeerIdentity const& peer);
 
     /// Who is asking, as both the door and `ClusterAdmit` need it.
     ///
     /// One place the peer becomes a `CallerContext`, so an early refusal's
     /// classification is by construction the one the verb would have got --
     /// `SchedulerResponder::Context`'s argument, and the same shape.
-    /// @param peer The caller's peer host, taken over by the returned context.
+    /// **The proof is folded through `Distributed::ExplainConnection`, since #1428**, here and
+    /// not at the call site: this is the one place the peer becomes a `CallerContext`, and a
+    /// fold at one call site would make the door and the authoritative gate answer differently
+    /// about one connection.
+    /// @param peer The caller, whose host is taken over by the returned context.
     /// @return The context.
-    [[nodiscard]] Distributed::CallerContext Context(std::string peer) const
+    [[nodiscard]] Distributed::CallerContext Context(PeerIdentity peer) const
     {
-        auto membership = _membership.Classify(peer);
-        return Distributed::CallerContext { .membership = membership, .peerId = std::move(peer) };
+        auto const decision = Distributed::ExplainConnection(_membership, peer.host, peer.provenNodeId.has_value());
+        return Distributed::CallerContext { .membership = decision.verdict, .peerId = std::move(peer.host) };
     }
 
     EnrollmentWindow& _window;

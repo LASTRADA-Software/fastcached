@@ -156,6 +156,17 @@ inline constexpr std::array ExchangeLogTable {
                  .level = LogLevel::Debug,
                  .rationale = "a read a script or a terminal may run in a loop, as node-status is; at Info a watch "
                               "over it would look like traffic" },
+    VerbLogRow { .code = CompileCacheWire::Op::NodeChallenge,
+                 .level = LogLevel::Debug,
+                 .rationale = "half of an exchange that decides nothing on its own: every node-to-node connection "
+                              "opens with one, so at Info a fleet's ordinary dial rounds would bury the line that "
+                              "matters -- which is prove-node's outcome, not the nonce that preceded it" },
+    VerbLogRow { .code = CompileCacheWire::Op::ProveNode,
+                 .level = LogLevel::Info,
+                 .rationale = "records that a machine was admitted by what it PROVED rather than by its address, "
+                              "which is the only place a VPN worker's changing address is reconciled with a "
+                              "stable identity; once per connection, and a refusal here is the line an operator "
+                              "reads when a node has the wrong --cluster-key-file" },
 };
 
 /// Whether every verb this build serves states a log level.

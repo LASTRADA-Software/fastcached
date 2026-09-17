@@ -3,10 +3,12 @@
 
 #include "ExchangeLog.hpp"
 #include "NodeSurfaces.hpp"
+#include "PeerIdentity.hpp"
 
 #include <FastCache/Async/Task.hpp>
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/Logger.hpp>
+#include <FastCache/Core/Nonce.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Net/IListener.hpp>
 #include <FastCache/Protocol/CompileCacheAuth.hpp>
@@ -94,6 +96,20 @@ enum class EndpointRefusal : std::uint8_t
     /// Three per-surface copies of one endpoint fact would be three things to drift.
     AnswerDeadline,
 
+    /// A `ProveNode` arrived with no challenge outstanding on this connection.
+    ///
+    /// **The endpoint's own fact, and the ONLY node-proof refusal here**: the challenge lives in
+    /// the serve loop, because it is connection state and the prover is shared by every
+    /// connection on the surface. Never asked for one, or already spent one -- a challenge
+    /// answers exactly one proof whatever that proof's outcome.
+    ///
+    /// Every other way a proof can fail -- a payload that will not decode, a tag that does not
+    /// authenticate, a key file that has stopped being readable -- is the PROVER's to decide,
+    /// and `INodeProver::Verify` hands those back already encoded and already counted. They are
+    /// not rows here, because a row here obliges all seven surfaces to say why they do not count
+    /// a refusal only one of them can ever produce.
+    NodeProofUnchallenged,
+
     /// The count. See `Core/EnumTable.hpp`.
     Last,
 };
@@ -122,6 +138,7 @@ inline constexpr EnumTable<EndpointRefusal, EndpointRefusalCode> EndpointRefusal
     { .refusal = EndpointRefusal::CredentialMalformed, .code = CompileCacheWire::ErrorCode::MalformedFrame },
     { .refusal = EndpointRefusal::CredentialRejected, .code = CompileCacheWire::ErrorCode::Unauthenticated },
     { .refusal = EndpointRefusal::AnswerDeadline, .code = CompileCacheWire::ErrorCode::RequestDeadlineExceeded },
+    { .refusal = EndpointRefusal::NodeProofUnchallenged, .code = CompileCacheWire::ErrorCode::NodeProofUnchallenged },
 } };
 
 static_assert(RowsInEnumeratorOrder(EndpointRefusalCodes, &EndpointRefusalCode::refusal),
@@ -141,6 +158,18 @@ static_assert(RowsInEnumeratorOrder(EndpointRefusalCodes, &EndpointRefusalCode::
 inline constexpr std::string_view AnswerDeadlineIsTheEndpointsRationale =
     "the answer deadline is the endpoint's decision and the endpoint counts it, in the sweep row and the "
     "refusal-sent row; a per-surface copy would be a third tally of one event";
+
+/// Why no surface but the cluster-key prover's counts a node-proof refusal, stated once for
+/// every surface that has to say it.
+///
+/// `CredentialIsTheSchedulersRationale`'s exact counterpart, and it is here rather than beside
+/// one responder for `EndpointRefusalCodes`' reason: this is a property of the ROUTING -- the
+/// two proof verbs are `VerbFamily::NodeProof`, which `MergedResponder` sends to the one
+/// component holding the cluster key -- so no other surface can ever be asked about them. Six
+/// surfaces stating that separately is six sentences that agree today.
+inline constexpr std::string_view NodeProofIsTheProversRationale =
+    "the node-proof verbs are the NodeProof family, which MergedResponder routes to the cluster-key prover; no "
+    "proof outcome is ever decided against this surface";
 
 /// Answer an endpoint-decided refusal the way its row decided, counted or not.
 ///
@@ -255,16 +284,78 @@ class IFrameStream
     /// Serve a subscription until it ends.
     /// @param frame The whole request, header included; outlives the returned task, as
     ///        `IFrameResponder::Answer`'s does.
-    /// @param peer The peer's host.
+    /// @param peer Who is at the other end, as `IFrameResponder::Answer` receives it -- the
+    ///        proof included, because a stream is re-gated on every tick and a gate that could
+    ///        not see the proof would revoke a proven subscriber at its first one.
     /// @param sink Where every push goes and what the peer has done; never null, and it outlives
     ///        the returned task. A pointer because a coroutine parameter must not be a reference.
     /// @return The terminal reply, or empty to close without one -- the answer for a peer that
     ///         has left, and for a push that will never leave.
     [[nodiscard]] virtual Task<std::vector<std::byte>> Serve(std::span<std::byte const> frame,
-                                                             std::string peer,
+                                                             PeerIdentity peer,
                                                              IPushSink* sink) = 0;
 };
 
+/// Verifies that a caller holds the cluster's pre-shared key, one connection at a time.
+///
+/// **A seam of its own rather than two more methods on `IFrameResponder`**, for
+/// `IFrameStream`'s reason: only the surface that owns `VerbFamily::NodeProof` has anything to
+/// say here, and every other one would write two bodies that refuse. One pure virtual returning
+/// a pointer says *this surface offers no prover* once, which is a decision rather than two
+/// omissions.
+///
+/// **The endpoint terminates both verbs rather than passing them to `Answer`**, exactly as it
+/// does `AUTH` and for the same reason: what they change is CONNECTION state, and the responder
+/// is shared by every connection on the surface. So the challenge lives in the serve loop and
+/// this object holds none.
+class INodeProver
+{
+  public:
+    INodeProver() = default;
+    INodeProver(INodeProver const&) = delete;
+    INodeProver(INodeProver&&) = delete;
+    INodeProver& operator=(INodeProver const&) = delete;
+    INodeProver& operator=(INodeProver&&) = delete;
+    virtual ~INodeProver() = default;
+
+    /// A fresh challenge for one connection.
+    ///
+    /// Drawn HERE rather than in the endpoint, because the randomness seam belongs with the
+    /// component that holds the key: `FrameServer` serves six surfaces that have no use for an
+    /// `IRandomSource&`, and threading one through every construction site would put the
+    /// dependency where nothing reads it.
+    /// @return The nonce to state on the wire and to verify the next proof against.
+    [[nodiscard]] virtual Nonce IssueChallenge() = 0;
+
+    /// Whether @p payload proves the cluster key against @p challenge.
+    ///
+    /// **The refusal comes back ENCODED and already counted**, which is this endpoint's
+    /// standing division of labour -- the endpoint owns WHEN the question is asked, the surface
+    /// owns the answer, its wording and its counter. It is not an `EndpointRefusal` row for the
+    /// three ways this can fail, because a row there obliges every surface on the port to state
+    /// why it does not count a refusal only this one can produce; and the three do not share a
+    /// diagnosis: a payload that will not decode is a client-library mismatch, a tag that does
+    /// not authenticate is a wrong key or a search, and a key file that has stopped being
+    /// readable is this node's own fault and nobody else's.
+    ///
+    /// @param challenge The nonce this connection was told, as it was sent.
+    /// @param payload The `ProveNode` request payload.
+    /// @return The id the caller claimed -- a label bound inside the MAC, never an authenticated
+    ///         identity, per `Distributed::NodeProof`'s header -- or the encoded refusal to send
+    ///         back. Never an empty id on success: a proof that authenticated for no id would
+    ///         read downstream as *nothing was proved*.
+    [[nodiscard]] virtual std::expected<std::string, std::vector<std::byte>> Verify(std::span<std::byte const> challenge,
+                                                                                    std::span<std::byte const> payload) = 0;
+};
+
+/// Who is at the other end of a connection, as an admission policy sees it.
+///
+/// Two facts rather than one string, and the second is why this type exists: admission used to
+/// be decided from the peer's ADDRESS alone, which is a stand-in for *this is one of our nodes*
+/// and stops being one the moment an address is not stable
+/// ([#1428](https://github.com/LASTRADA-Software/fastcached/issues/1428),
+/// [#178](https://github.com/LASTRADA-Software/fastcached/issues/178) item 1).
+///
 /// Answers one framed request.
 ///
 /// The seam that lets one accept loop serve every framed surface this node exposes.
@@ -301,14 +392,18 @@ class IFrameResponder
     ///        a parallel build. It must outlive the returned task -- the same
     ///        contract `SendAll` states, and true by construction at the one call
     ///        site, where the backing vector is a local of the calling coroutine.
-    /// @param peer The peer's host, for the surfaces whose policy needs one.
+    /// @param peer Who is at the other end, for the surfaces whose policy needs it.
     ///        Owned rather than a view: it is short, and every policy-bearing
     ///        responder holds it across a suspension, so a view would make its
     ///        lifetime a rule at each implementation instead of a fact.
+    ///        **It carries what the connection proved as well as its address, since
+    ///        #1428**, and it has to reach HERE rather than only the door: this is
+    ///        where the authoritative gate runs, so a proof the door honoured and
+    ///        `Answer` could not see would refuse the caller one line later.
     /// @return The encoded reply, or empty to close without answering -- which is
     ///         only ever right when the peer is not speaking this protocol at all --
     ///         and whatever must stay held until the endpoint has written it.
-    [[nodiscard]] virtual Task<FrameReply> Answer(std::span<std::byte const> frame, std::string peer) = 0;
+    [[nodiscard]] virtual Task<FrameReply> Answer(std::span<std::byte const> frame, PeerIdentity peer) = 0;
 
     /// May this peer send at all, before a byte of its payload is taken?
     ///
@@ -359,14 +454,22 @@ class IFrameResponder
     /// could only be asked about verbs this build knows would admit the ones it does
     /// not.
     ///
-    /// @param peer The peer's host, as `Answer` receives it.
+    /// **Takes what the connection PROVED as well as its address, since #1428.** That is a
+    /// `PeerIdentity` rather than a second parameter, and the widening is what makes a
+    /// key-holding node at an address on no list admissible at all: the address routes answer
+    /// the same as before, and the proof is unioned onto them per connection by
+    /// `Distributed::ExplainConnection`. A surface that ignores the new field answers exactly
+    /// what it answered, because *nothing was proved* is the empty id and the fold returns the
+    /// oracle's own decision for it.
+    ///
+    /// @param peer Who is at the other end: the kernel's host, and what this connection proved.
     /// @param opRaw The third header byte, as received; not necessarily a known verb.
     /// @return The encoded refusal to send back, or nullopt to go on and read the
     ///         payload. A refusal is answered as a **reply and a resynchronization**
     ///         by the caller -- never a close, because the frame declared its length
     ///         and a peer that cannot tell a policy refusal from a dead host retries
     ///         forever.
-    [[nodiscard]] virtual std::optional<std::vector<std::byte>> RefusePeer(std::string_view peer,
+    [[nodiscard]] virtual std::optional<std::vector<std::byte>> RefusePeer(PeerIdentity const& peer,
                                                                            std::uint8_t opRaw) const = 0;
 
     /// Does this surface require a credential before this verb?
@@ -763,6 +866,22 @@ class IFrameResponder
     /// @param opRaw The third header byte, as received; not necessarily a known verb.
     /// @return The stream, which must outlive the endpoint, or null.
     [[nodiscard]] virtual IFrameStream* StreamFor(std::uint8_t opRaw) noexcept = 0;
+
+    /// The cluster-key prover this surface offers a connection, or null when it offers none.
+    ///
+    /// **Not per verb**, unlike every question above it: the two verbs of
+    /// `VerbFamily::NodeProof` are one exchange and a surface that served half of it would be a
+    /// connection that can be challenged and never proved. So the answer is the surface's, asked
+    /// once, and the family's two rows are handled together or not at all.
+    ///
+    /// Pure virtual, and the reason is `StreamFor`'s rather than `RefusePeer`'s: null is the SAFE
+    /// answer here -- a surface offering no prover admits nobody it would not have admitted
+    /// before -- so what a default would cost is not an open door but a silence. It would let a
+    /// surface that ought to verify proofs inherit *I verify none*, which is a family refused at
+    /// the door with a sentence about this node running no component for it, on a node that holds
+    /// the key. A pure virtual makes the claim explicit at each surface.
+    /// @return The prover, which must outlive the endpoint, or null.
+    [[nodiscard]] virtual INodeProver* NodeProver() noexcept = 0;
 };
 
 /// Accepts connections and answers framed requests on each until the peer stops.

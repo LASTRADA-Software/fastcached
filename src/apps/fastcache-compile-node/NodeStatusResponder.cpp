@@ -179,6 +179,8 @@ namespace
           .policy = { .counter = std::nullopt, .rationale = CredentialIsTheSchedulersRationale } },
         { .refusal = EndpointRefusal::AnswerDeadline,
           .policy = { .counter = std::nullopt, .rationale = AnswerDeadlineIsTheEndpointsRationale } },
+        { .refusal = EndpointRefusal::NodeProofUnchallenged,
+          .policy = { .counter = std::nullopt, .rationale = NodeProofIsTheProversRationale } },
     } };
 
     // Positional rows alone would not catch an APPENDED enumerator: it leaves a
@@ -213,7 +215,7 @@ std::vector<std::byte> NodeStatusResponder::EndpointRefusalReply(EndpointRefusal
     return AnswerRefusal(_metrics, ErrorCodeFor(refusal), row.policy, detail);
 }
 
-std::optional<std::vector<std::byte>> NodeStatusResponder::RefusePeer(std::string_view peer, std::uint8_t /*opRaw*/) const
+std::optional<std::vector<std::byte>> NodeStatusResponder::RefusePeer(PeerIdentity const& peer, std::uint8_t /*opRaw*/) const
 {
     return RefuseUnlessMember(_membership,
                               _metrics,
@@ -223,7 +225,7 @@ std::optional<std::vector<std::byte>> NodeStatusResponder::RefusePeer(std::strin
                               "this node reports its identity and counters to fleet members only");
 }
 
-Task<FrameReply> NodeStatusResponder::Answer(std::span<std::byte const> frame, std::string peer)
+Task<FrameReply> NodeStatusResponder::Answer(std::span<std::byte const> frame, PeerIdentity peer)
 {
     // The verb is read back out of the frame this call was handed rather than taken on
     // the endpoint's word: `Answer` is reachable directly, which is why the gate exists

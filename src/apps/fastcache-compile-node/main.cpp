@@ -31,6 +31,7 @@
 #include "NodeIoLoop.hpp"
 #include "NodeLogging.hpp"
 #include "NodeMembership.hpp"
+#include "NodeProofResponder.hpp"
 #include "NodeReload.hpp"
 #include "NodeStatusResponder.hpp"
 #include "NodeSurfaces.hpp"
@@ -660,6 +661,27 @@ using Node::NodeReloader;
     auto const capacity =
         Node::NodeCapacityOf(cfg, *host, Node::CacheCapacityOf(cacheTier.get()), Node::IndexReserveBytesOf(cacheTier.get()));
 
+    // **The one reader of `--cluster-key-file` in this process**, declared here because three
+    // consumers now share it: an approved joiner's hand-over, the cluster-key PROOF this node
+    // VERIFIES, and the proof it PRESENTS on each heartbeat round (#1428).
+    //
+    // One instance rather than one per consumer. `ReadClusterKey` holds the minimum-length rule
+    // and the trailing-newline trim, so every tier here authenticates against byte-for-byte the
+    // same key -- and a second reader would eventually differ by a newline, which is an HMAC
+    // that verifies nowhere and no diagnostic anywhere.
+    //
+    // It takes the PATH and re-reads the file at each use rather than holding the bytes: an
+    // outbound credential is read where it is presented, which here also means this process
+    // does not carry a second copy of the cluster's secret for its whole uptime to serve a
+    // handful of exchanges in a fleet's life.
+    //
+    // Declared ABOVE the worker tier because the tier borrows it and is destroyed before it.
+    Node::FileClusterKeySource const clusterKeySource { cfg.clusterKeyFile };
+
+    // Whether this node has a key to prove at all. Null is the ordinary state on a
+    // single-machine install, which is this binary's default configuration.
+    Node::IClusterKeySource const* const proofKey = cfg.clusterKeyFile.empty() ? nullptr : &clusterKeySource;
+
     // The worker: survey, scratch root, lease check, slot cap, compile responder and
     // heartbeat, as one object (#1387). Built BELOW the cache tier, because the slots it
     // offers are what the tier built leaves (#167), and ABOVE the node surface, which
@@ -678,6 +700,7 @@ using Node::NodeReloader;
                                                         .host = *host,
                                                         .cacheTier = cacheTier.get(),
                                                         .credential = credential,
+                                                        .proofKey = proofKey,
                                                         .metrics = metrics,
                                                         .logger = logger },
                                 &Node::MakeSystemWorkerMachine);
@@ -731,12 +754,9 @@ using Node::NodeReloader;
     // whole family is refused at the door: a window that could never admit anybody
     // should not be openable, and one nothing serves should not be reported.
     //
-    // The key source takes the PATH and re-reads the file at each hand-over rather than
-    // holding the bytes: an outbound credential is read where it is presented, which
-    // here also means this process does not carry a second copy of the cluster's secret
-    // for its whole uptime to serve a handful of exchanges in a fleet's life.
+    // The key source that a hand-over reads is declared above the worker tier, because the
+    // cluster-key PROOF reads the same one (#1428) and the tier borrows it.
     Node::EnrollmentWindow enrollmentWindow { statusClock };
-    Node::FileClusterKeySource const enrollmentKey { cfg.clusterKeyFile };
 
     // **Whether this node serves enrollment at all, asked ONCE.**
     //
@@ -866,10 +886,34 @@ using Node::NodeReloader;
         enrollmentResponder.emplace(enrollmentWindow,
                                     schedulerTier->ServiceForSurfaces(),
                                     membership.Oracle(),
-                                    enrollmentKey,
+                                    clusterKeySource,
                                     metrics,
                                     logger,
                                     schedulerTier->Policy());
+
+    // Where a node-proof challenge's bytes come from. Its own source rather than a share of
+    // `identityRandom` above, which is a different lifetime and a different question -- an
+    // identity is minted once at startup and challenges are drawn for as long as the process
+    // serves.
+    SystemRandomSource proofRandom;
+
+    // The cluster-key prover (#1428), built wherever this node HOLDS a key -- which is a
+    // narrower condition than `servesEnrollment` and a wider one than a scheduler: #1308 makes
+    // consensus imply a key, and a pure worker may hold one too, because the key is what signs
+    // lease grants. A proof presented to either has to be verifiable there.
+    //
+    // It reads the same `enrollmentKey` source, which is the one reader of
+    // `--cluster-key-file` in this binary. A second reader would eventually differ by a
+    // trailing newline, which is an HMAC that verifies nowhere and no diagnostic anywhere.
+    //
+    // The credential is the SCHEDULER's, for the reason the enrollment surface holds the same
+    // object: `AUTH` is a `Session` verb and routes there, so a node with a token file must gate
+    // these two verbs with it as well -- and `schedulerTier` may legitimately be null on a node
+    // that holds a key and schedules nothing, which is what the conditional below reads.
+    std::optional<Node::NodeProofResponder> nodeProofResponder;
+    if (proofKey != nullptr)
+        nodeProofResponder.emplace(
+            *proofKey, proofRandom, metrics, logger, schedulerTier != nullptr ? schedulerTier->Policy() : nullptr);
 
     auto nodeSurfaceOrRefusal = Node::StartNodeSurfaceOrExplain(
         nodeIo,
@@ -886,7 +930,10 @@ using Node::NodeReloader;
                                   .node = &nodeStatusResponder,
                                   .enrollment = AddressOrNull(enrollmentResponder),
                                   .live = &liveStatsResponder,
-                                  .fleet = &fleetTextResponder },
+                                  .fleet = &fleetTextResponder,
+                                  // Absent on a node holding no cluster key: the router then
+                                  // answers the node-proof family `NoCluster`, naming the flag.
+                                  .nodeProof = AddressOrNull(nodeProofResponder) },
         activated,
         metrics,
         logger,
