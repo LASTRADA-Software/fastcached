@@ -8,6 +8,7 @@
 #include <format>
 #include <limits>
 #include <optional>
+#include <ranges>
 #include <utility>
 
 namespace FastCache::Cli
@@ -180,7 +181,7 @@ namespace
             aggregate.items.reserve(total);
 
             auto at = afterHeader;
-            for (std::size_t index = 0; index < total; ++index)
+            for ([[maybe_unused]] auto const index: std::views::iota(std::size_t { 0 }, total))
             {
                 auto element = ParseOne(bytes, at, limits, depth + 1);
                 if (element.state != ParseState::Complete)

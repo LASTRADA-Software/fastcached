@@ -4,6 +4,7 @@
 #include <array>
 #include <chrono>
 #include <format>
+#include <ranges>
 #include <string>
 #include <system_error>
 #include <utility>
@@ -271,7 +272,7 @@ namespace
             if (ec && !std::filesystem::is_directory(base))
                 return std::unexpected(ScratchClaimRefusal::Unavailable);
 
-            for (std::size_t index = 0; index < maxRoots; ++index)
+            for (auto const index: std::views::iota(std::size_t { 0 }, maxRoots))
             {
                 auto const root = base / std::format("node-{}", index);
                 auto held = TakeClaim(ClaimFileFor(root));

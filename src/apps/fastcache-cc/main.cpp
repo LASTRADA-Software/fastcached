@@ -3098,8 +3098,9 @@ int main(int argc, char** argv)
 
     std::vector<std::string> args;
     args.reserve(static_cast<std::size_t>(argc));
-    for (int i = 1; i < argc; ++i) // argv[0] is fastcache-cc itself; drop it
-        args.emplace_back(argv[i]);
+    // argv[0] is fastcache-cc itself; drop it
+    for (auto const* argument: std::span<char* const> { argv, static_cast<std::size_t>(argc) }.subspan(1))
+        args.emplace_back(argument);
 
     // Dispatch is driven by the flag table in LauncherCli.cpp, which also renders
     // the help text, so an accepted flag is necessarily a documented one.

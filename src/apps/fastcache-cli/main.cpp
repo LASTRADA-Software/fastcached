@@ -544,8 +544,9 @@ int main(int argc, char* argv[])
 {
     std::vector<std::string> args;
     args.reserve(argc > 0 ? static_cast<std::size_t>(argc - 1) : 0);
-    for (auto index = 1; index < argc; ++index)
-        args.emplace_back(argv[index]);
+    // argv[0] is fastcache-cli itself; drop it
+    for (auto const* argument: std::span<char* const> { argv, static_cast<std::size_t>(argc) }.subspan(1))
+        args.emplace_back(argument);
 
     // Defaults, then the environment, then argv -- in that order, each overriding the
     // last, and "the command line wins" is which step runs second rather than a

@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <format>
+#include <ranges>
 #include <utility>
 
 namespace FastCache::Node
@@ -189,7 +190,7 @@ Wire::EnrollmentReport EnrollmentWindow::Report() const
     Wire::EnrollmentReport report { .state = _open ? Wire::WireEnrollmentState::Open : Wire::WireEnrollmentState::Closed,
                                     .openForSeconds = _open ? SecondsSince(_openedAt) : 0,
                                     .pending = _pending };
-    for (std::size_t index = 0; index < report.pending.size(); ++index)
+    for (auto const index: std::views::iota(std::size_t { 0 }, report.pending.size()))
         report.pending[index].firstSeenSecondsAgo = SecondsSince(_firstSeen[index]);
     return report;
 }

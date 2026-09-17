@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <array>
 #include <charconv>
+#include <ranges>
 #include <utility>
 #include <vector>
 
@@ -258,7 +259,7 @@ McParseResult ParseMemcachedReply(std::string_view bytes, McParseLimits const& l
             auto const parts = Tokens(line);
             if (parts.size() >= 2)
                 reply.metaKey = std::string { parts[1] };
-            for (std::size_t index = 2; index < parts.size(); ++index)
+            for (auto const index: std::views::iota(std::size_t { 2 }, parts.size()))
             {
                 auto const equals = parts[index].find('=');
                 if (equals == std::string_view::npos)

@@ -1478,6 +1478,16 @@ what differs between compilers, standard libraries, hosts and tool versions.
   hand-spelled form obeys every OTHER rule: `views::iota` is a range view. It does NOT refuse a
   `static_cast` beside an `EnumeratorCount` — measured, six such sites are bounds checks on a
   value off a wire and correct — nor the C-style form, which is #1452's.
+- **A C-style loop is classified by its BODY; the head is not a classifier** (#1452 — 78 of 134
+  mechanical). Four shapes are not convertible: the body ADVANCES the variable (a range-for
+  advances a COPY, and `auto i` compiles while only `auto const i` is refused — a wrong cache key
+  in `DirectManifest`), a CALLEE advances it through `std::size_t&` (`ApplyOneOption`,
+  `TakeValue` — invisible to any body scan, and it breaks every `--key value` flag), an INCLUSIVE
+  bound (`iota` is half-open, so `<= N` is `N + 1`), and a COMPOUND bound (two clauses are not one
+  range; on the `iovec` builders the second is a budget). All four were first classified
+  mechanical, because **a text scan fails toward "nothing unusual here"** — so such a classifier
+  fails CLOSED and prints no count until it reproduces a hand-read site per verdict. Target
+  `std::views::iota`, never the `Ranges::` seam; for argv, `std::span{argv, argc}.subspan(1)`.
 - Coverage is Clang source-based, never gcov: ~2000 Catch2 cases are ~2000 processes, and gcov's
   shared `.gcda` races them. `%8m`, not `%p`. `*_test.cpp` sits next to the implementation, so a
   report that counts it measures the tests testing themselves. A compiler cache and coverage cannot
