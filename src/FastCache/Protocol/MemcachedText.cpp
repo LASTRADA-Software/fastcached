@@ -222,7 +222,7 @@ namespace
     {
         std::vector<std::span<std::byte const>> segments;
         segments.reserve((state->hits.size() * 3) + 1);
-        for (std::size_t i = 0; i < state->hits.size(); ++i)
+        for (auto const i: std::views::iota(std::size_t { 0 }, state->hits.size()))
         {
             segments.push_back(AsBytes(state->headers[i]));
             segments.push_back(state->hits[i].entry.ValueBytes());
@@ -614,7 +614,7 @@ namespace
         auto state = std::make_shared<GatherState>();
         state->hits.reserve(args.size());
         state->headers.reserve(args.size());
-        for (std::size_t i = 1; i < args.size(); ++i)
+        for (auto const i: std::views::iota(std::size_t { 1 }, args.size()))
         {
             auto const& key = args[i];
             // Refresh expiry and read the value back atomically. Composing

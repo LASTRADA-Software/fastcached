@@ -67,9 +67,8 @@ loop|src/FastCache/Net/UdpSocket.cpp|1|#1452
 loop|src/FastCache/Platform/LocalAddresses.cpp|4|#1452
 loop|src/FastCache/Protocol/CompileCacheWire.hpp|1|#1452
 loop|src/FastCache/Protocol/Framing/LineReader.cpp|1|#1452
-loop|src/FastCache/Protocol/MemcachedText.cpp|2|#1452
 loop|src/FastCache/Protocol/PubSubRegistry.cpp|2|#1452
-loop|src/FastCache/Protocol/RedisResp.cpp|16|#1452
+loop|src/FastCache/Protocol/RedisResp.cpp|13|#1452
 loop|src/FastCache/Protocol/RedisTransaction.cpp|1|#1452
 loop|src/FastCache/Protocol/StreamWaiterRegistry.cpp|2|#1452
 loop|src/FastCache/Server/AdminHttpServer.cpp|1|#1452

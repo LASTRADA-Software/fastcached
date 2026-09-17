@@ -1432,7 +1432,7 @@ namespace
 
         ParsedCommand cmd;
         cmd.args.reserve(static_cast<std::size_t>(count));
-        for (std::int64_t i = 0; i < count; ++i)
+        for ([[maybe_unused]] auto const i: std::views::iota(std::int64_t { 0 }, count))
         {
             auto arg = co_await ReadBulkArg(reader);
             if (!arg.has_value())
@@ -2140,7 +2140,7 @@ namespace
         // names: emit a flat array of per-command descriptors.
         if (!co_await ReplyAggregateHeader(socket, Aggregate::Array, total, resp))
             co_return false;
-        for (std::size_t i = 0; i < total; ++i)
+        for (auto const i: std::views::iota(std::size_t { 0 }, total))
             if (!co_await WriteCommandDescriptor(socket, i, resp))
                 co_return false;
         co_return true;
@@ -5148,7 +5148,7 @@ namespace
 
     std::optional<std::size_t> CommandTableFind(std::string_view upperName) noexcept
     {
-        for (std::size_t i = 0; i < CommandTable.size(); ++i)
+        for (auto const i: std::views::iota(std::size_t { 0 }, CommandTable.size()))
             if (CommandTable[i].name == upperName)
                 return i;
         return std::nullopt;
