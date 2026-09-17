@@ -79,7 +79,6 @@
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
 #include <algorithm>
-#include <ranges>
 #include <array>
 #include <charconv>
 #include <chrono>
@@ -95,6 +94,7 @@
 #include <memory>
 #include <optional>
 #include <ostream>
+#include <ranges>
 #include <span>
 #include <string>
 #include <string_view>
