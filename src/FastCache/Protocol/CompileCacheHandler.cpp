@@ -868,14 +868,14 @@ namespace
         }
 
         /// @copydoc ILiveGate::RefuseWatcher
-        [[nodiscard]] std::optional<std::vector<std::byte>> RefuseWatcher(std::string_view /*peer*/) const override
+        [[nodiscard]] std::optional<std::vector<std::byte>> RefuseWatcher(LiveWatcher const& /*watcher*/) const override
         {
             return std::nullopt;
         }
 
         /// @copydoc ILiveGate::Admit
         [[nodiscard]] std::optional<std::vector<std::byte>> Admit(Wire::SubscribeRequest const& request,
-                                                                  std::string_view /*peer*/) const override
+                                                                  LiveWatcher const& /*watcher*/) const override
         {
             if (request.subject == Wire::LiveSubject::Cache)
                 return std::nullopt;
@@ -885,8 +885,11 @@ namespace
         }
 
         /// @copydoc ILiveGate::Recheck
+        // The watcher is unnamed because this daemon decides on its own credential and never
+        // on who is asking: it holds no cluster key, so `provedClusterKey` is honestly false on
+        // every connection it will ever see, and reading it would be reading a constant.
         [[nodiscard]] std::optional<std::vector<std::byte>> Recheck(Wire::LiveSubject /*subject*/,
-                                                                    std::string_view /*peer*/) const override
+                                                                    LiveWatcher const& /*watcher*/) const override
         {
             auto const policy = _session->CurrentAuth();
             if (policy == nullptr || !policy->Enabled() || *_credentialAccepted)
@@ -945,8 +948,10 @@ namespace
 
         DaemonPushSink sink { socket, session->reactor, watch };
         DaemonLiveGate const gate { session, context.credentialAccepted };
-        auto const terminal =
-            co_await session->liveStats->Serve(frame, socket->PeerAddress(), &sink, &gate, session->reactor);
+        // `provedClusterKey` is left false and that is the truth rather than a default: this
+        // daemon holds no cluster key, so no connection it serves can ever have proved one.
+        auto const terminal = co_await session->liveStats->Serve(
+            frame, LiveWatcher { .host = socket->PeerAddress() }, &sink, &gate, session->reactor);
 
         if (!watch->finished)
         {

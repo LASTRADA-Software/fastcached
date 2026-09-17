@@ -129,19 +129,19 @@ class NumberedSources final: public ILiveStatsSources
 class OpenGate final: public ILiveGate
 {
   public:
-    [[nodiscard]] std::optional<std::vector<std::byte>> RefuseWatcher(std::string_view /*peer*/) const override
+    [[nodiscard]] std::optional<std::vector<std::byte>> RefuseWatcher(LiveWatcher const& /*watcher*/) const override
     {
         return std::nullopt;
     }
 
     [[nodiscard]] std::optional<std::vector<std::byte>> Admit(Wire::SubscribeRequest const& /*request*/,
-                                                              std::string_view /*peer*/) const override
+                                                              LiveWatcher const& /*watcher*/) const override
     {
         return std::nullopt;
     }
 
     [[nodiscard]] std::optional<std::vector<std::byte>> Recheck(Wire::LiveSubject /*subject*/,
-                                                                std::string_view /*peer*/) const override
+                                                                LiveWatcher const& /*watcher*/) const override
     {
         return std::nullopt;
     }
@@ -179,7 +179,7 @@ DetachedTask ServeCache(LiveStream* live, SnapshotSink* sink, ILiveGate const* g
 {
     auto const frame = Wire::EncodeSubscribeRequest(
         Wire::SubscribeRequest { .subject = Wire::LiveSubject::Cache, .cadenceMillis = 500, .dashboardToken = {} });
-    (void) co_await live->Serve(frame, "10.0.0.7", sink, gate, reactor);
+    (void) co_await live->Serve(frame, LiveWatcher { .host = "10.0.0.7" }, sink, gate, reactor);
     *returned = true;
 }
 

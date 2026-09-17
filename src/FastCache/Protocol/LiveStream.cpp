@@ -431,10 +431,10 @@ std::optional<std::vector<std::byte>> LiveStream::EndedBySink(IPushSink const& s
 }
 
 Task<std::vector<std::byte>> LiveStream::Serve(
-    std::span<std::byte const> frame, std::string peer, IPushSink* sink, ILiveGate const* gate, IReactor* reactor)
+    std::span<std::byte const> frame, LiveWatcher watcher, IPushSink* sink, ILiveGate const* gate, IReactor* reactor)
 {
     // The gate's authority, whatever a surface asked at its door: `Serve` is reachable directly.
-    if (auto refusal = gate->RefuseWatcher(peer); refusal.has_value())
+    if (auto refusal = gate->RefuseWatcher(watcher); refusal.has_value())
         co_return *std::move(refusal);
 
     auto const request = frame.size() >= Wire::RequestHeaderSize
@@ -443,7 +443,7 @@ Task<std::vector<std::byte>> LiveStream::Serve(
     if (!request.has_value())
         co_return Cc::Refuse(
             _metrics, RefusedMalformed, "a SUBSCRIBE carries a subject this build serves, a cadence and a dashboard token");
-    if (auto refusal = gate->Admit(*request, peer); refusal.has_value())
+    if (auto refusal = gate->Admit(*request, watcher); refusal.has_value())
         co_return *std::move(refusal);
 
     ActiveSubscription const place { _active };
@@ -512,7 +512,7 @@ Task<std::vector<std::byte>> LiveStream::Serve(
         if (auto end = EndedBySink(*sink); end.has_value())
             co_return *std::move(end);
         // Re-asked every tick, which is the whole defence against removal failing open.
-        if (auto end = gate->Recheck(subject, peer); end.has_value())
+        if (auto end = gate->Recheck(subject, watcher); end.has_value())
             co_return *std::move(end);
 
         auto const view =

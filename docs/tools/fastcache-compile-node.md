@@ -3314,12 +3314,12 @@ rather than an identity. Two consequences worth knowing before you rely on it:
 **Where it does not reach.** A node's own cache tier still serves this machine only — that
 is a property of the verb and not of any list, so holding the fleet's key does not open
 it. The fleet page and a live-stats subscription both need `--dashboard-token-file` on top
-of membership, and that credential is unchanged: a proof is not a substitute for it. They
-differ in the membership half — a fleet read honours a proof, and a **subscription does
-not**, because it is re-checked on every tick through a seam `fastcached` shares and which
-therefore holds no cluster key. So a node admitted by its proof alone can read the fleet
-with the dashboard token and still cannot subscribe; that gap is
-[#1512](https://github.com/LASTRADA-Software/fastcached/issues/1512).
+of membership, and that credential is unchanged: **a proof is not a substitute for the
+token.** What a proof does reach is the membership half of both, live stats included since
+[#1512](https://github.com/LASTRADA-Software/fastcached/issues/1512) — so a node admitted
+by its proof alone can read the fleet and subscribe to it with the dashboard token, and
+its subscription is re-checked against the same proof on every tick rather than being
+admitted once and dropped.
 
 **Reading the counters.** Four series, and they answer different questions:
 

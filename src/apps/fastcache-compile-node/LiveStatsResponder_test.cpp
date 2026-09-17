@@ -195,10 +195,19 @@ struct Stream
 };
 
 /// Run one subscription on the reactor, as the endpoint would.
-DetachedTask RunStream(LiveStatsResponder* responder, std::vector<std::byte> frame, std::string peer, Stream* stream)
+///
+/// @param proved Whether this CONNECTION proved the cluster key, which the endpoint records on
+///        the identity it hands down (#1428). Since #1512 this surface folds it, so a case can
+///        ask either question -- and the label is left EMPTY on purpose, because an ENGAGED
+///        optional is what *proved* means and an id is legitimately empty on a node that runs
+///        no consensus.
+DetachedTask RunStream(
+    LiveStatsResponder* responder, std::vector<std::byte> frame, std::string peer, bool proved, Stream* stream)
 {
-    // Nothing proved: this surface ignores a proof by decision, and `RefuseWatcher` carries why.
-    stream->reply = co_await responder->Serve(frame, PeerIdentity { .host = std::move(peer) }, &stream->sink);
+    auto identity = PeerIdentity { .host = std::move(peer) };
+    if (proved)
+        identity.provenNodeId = std::string {};
+    stream->reply = co_await responder->Serve(frame, std::move(identity), &stream->sink);
     stream->finished = true;
 }
 
@@ -249,14 +258,24 @@ struct Rig
     /// Open a subscription and let it run as far as it can now.
     [[nodiscard]] Stream& Open(std::vector<std::byte> frame, std::string peer = std::string { Watcher })
     {
-        return OpenOn(responder, std::move(frame), std::move(peer));
+        return OpenOn(responder, std::move(frame), std::move(peer), false);
+    }
+
+    /// Open a subscription whose connection PROVED the cluster key.
+    ///
+    /// Its own spelling rather than a defaulted flag on `Open`: every existing case here is
+    /// about a caller that proved nothing, and a default would let a new one be about a proof
+    /// without saying so.
+    [[nodiscard]] Stream& OpenProven(std::vector<std::byte> frame, std::string peer)
+    {
+        return OpenOn(responder, std::move(frame), std::move(peer), true);
     }
 
     /// Open a subscription on a responder of the case's own.
-    [[nodiscard]] Stream& OpenOn(LiveStatsResponder& on, std::vector<std::byte> frame, std::string peer)
+    [[nodiscard]] Stream& OpenOn(LiveStatsResponder& on, std::vector<std::byte> frame, std::string peer, bool proved = false)
     {
         streams.push_back(std::make_unique<Stream>(reactor));
-        RunStream(&on, std::move(frame), std::move(peer), streams.back().get());
+        RunStream(&on, std::move(frame), std::move(peer), proved, streams.back().get());
         reactor.Drain();
         return *streams.back();
     }
@@ -389,6 +408,69 @@ TEST_CASE("A watcher removed from the membership loses its stream on the next ti
         CHECK(rig.Read(IMetricsSink::Counter::LiveSubscriptionsRevoked) == 1);
         CHECK(rig.Read(IMetricsSink::Counter::LiveSubscriptionsRefusedNotAMember) == 0);
     }
+}
+
+TEST_CASE("A key holder streams from an address on no list, and keeps streaming past the first tick", "[node][livestats]")
+{
+    // #1512, and what distinguishes the FIX from the shape it was avoiding is that the stream is
+    // STILL RUNNING at the third sample. MEASURED against a door-only build (the proof folded at
+    // `RefuseWatcher` and not at `Recheck`): it produces ticks `{0, 1}` and then ends -- the
+    // opening snapshot plus one more. So "it streamed", "it got a snapshot" and even "it got two"
+    // are all true of the broken build, and only `{0, 1, 2}` with the stream unfinished is not.
+    constexpr std::string_view Roaming = "203.0.113.41";
+
+    Rig rig;
+    // The premise, asserted rather than assumed: this address is on no list, so anything that
+    // admits it below did so for the proof and not because the fixture was generous.
+    REQUIRE(rig.membership.Explain(Roaming).verdict == Distributed::Membership::Outsider);
+
+    SECTION("proved: it streams, and goes on streaming")
+    {
+        auto& stream = rig.OpenProven(SubscribeFrame(Wire::LiveSubject::Node, 500), std::string { Roaming });
+        REQUIRE_FALSE(stream.finished);
+
+        rig.RunTo(500ms);
+        rig.RunTo(1000ms);
+        CHECK_FALSE(stream.finished);
+        CHECK(stream.sink.SnapshotTicks() == std::vector<std::uint64_t> { 0, 1, 2 });
+        CHECK(rig.Read(IMetricsSink::Counter::LiveSubscriptionsRevoked) == 0);
+        CHECK(rig.Read(IMetricsSink::Counter::LiveSubscriptionsRefusedNotAMember) == 0);
+    }
+
+    SECTION("the same address proving nothing is still refused at the door")
+    {
+        // The control, and it is what says the section above is about the PROOF rather than
+        // about this address having become admissible to everybody.
+        auto& stream = rig.Open(SubscribeFrame(Wire::LiveSubject::Node, 500), std::string { Roaming });
+        REQUIRE(stream.finished);
+        CHECK(Testing::ErrorOf(stream.reply) == Wire::ErrorCode::NotAMember);
+        CHECK(rig.Read(IMetricsSink::Counter::LiveSubscriptionsRefusedNotAMember) == 1);
+    }
+}
+
+TEST_CASE("A proven watcher dropped from the member list keeps its stream, because the key still admits it",
+          "[node][livestats]")
+{
+    // The exact inverse of *A watcher removed from the membership loses its stream on the next
+    // tick* above, and both are correct: `--fleet-member` is ONE route to admission and what the
+    // cluster agrees is ADDED rather than substituted, so a host that holds the key is admitted
+    // by the key after the list stops naming it (#1471's union, folded by `ExplainConnection`).
+    //
+    // It is here because it is the operator-visible consequence, and the direction an operator
+    // gets wrong: editing the list is not how a key holder is removed, and the rulebook says the
+    // forget has to REPORT rather than be inferred from a stream that did not end. Removing a
+    // key holder is a key rotation; per-node revocation is #178.
+    Rig rig;
+    auto& stream = rig.OpenProven(SubscribeFrame(Wire::LiveSubject::Node, 500), std::string { Watcher });
+    REQUIRE_FALSE(stream.finished);
+    rig.RunTo(500ms);
+    REQUIRE_FALSE(stream.finished);
+
+    rig.membership.Remove(std::string { Watcher });
+    rig.RunTo(1000ms);
+    CHECK_FALSE(stream.finished);
+    CHECK(stream.sink.SnapshotTicks() == std::vector<std::uint64_t> { 0, 1, 2 });
+    CHECK(rig.Read(IMetricsSink::Counter::LiveSubscriptionsRevoked) == 0);
 }
 
 TEST_CASE("A fleet stream ends the tick its node stops leading, naming the new leader", "[node][livestats]")
@@ -582,7 +664,7 @@ TEST_CASE("Detaching the sources ends every stream in order at its next tick", "
     Stream stream { reactor };
     {
         auto const attached = slot.Attach(sources);
-        RunStream(&responder, SubscribeFrame(Wire::LiveSubject::Cache, 500), std::string { Watcher }, &stream);
+        RunStream(&responder, SubscribeFrame(Wire::LiveSubject::Cache, 500), std::string { Watcher }, false, &stream);
         reactor.Drain();
         REQUIRE(stream.sink.SnapshotTicks() == std::vector<std::uint64_t> { 0 });
     }

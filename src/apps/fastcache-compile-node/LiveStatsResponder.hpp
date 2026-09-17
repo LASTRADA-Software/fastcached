@@ -176,7 +176,7 @@ class LiveStatsResponder final: public IFrameResponder, public IFrameStream, pri
 
   private:
     /// @copydoc ILiveGate::RefuseWatcher
-    [[nodiscard]] std::optional<std::vector<std::byte>> RefuseWatcher(std::string_view peer) const override;
+    [[nodiscard]] std::optional<std::vector<std::byte>> RefuseWatcher(LiveWatcher const& watcher) const override;
 
     /// @copydoc ILiveGate::Admit
     ///
@@ -184,14 +184,18 @@ class LiveStatsResponder final: public IFrameResponder, public IFrameStream, pri
     /// token file, this machine only -- and leadership: a follower redirects, and a node running no
     /// scheduler says the fleet is served elsewhere.
     [[nodiscard]] std::optional<std::vector<std::byte>> Admit(CompileCacheWire::SubscribeRequest const& request,
-                                                              std::string_view peer) const override;
+                                                              LiveWatcher const& watcher) const override;
 
     /// @copydoc ILiveGate::Recheck
     ///
     /// Membership again, of the oracle bound once; and for the fleet, leadership, so a demoted
     /// node ends its fleet streams naming the new leader.
+    ///
+    /// **It folds the cluster-key proof exactly as the door does** (#1512). Both reach
+    /// `RefuseUnlessMember`, so one question is asked twice rather than two questions once
+    /// each -- which is the condition under which admitting a proven watcher is a fix.
     [[nodiscard]] std::optional<std::vector<std::byte>> Recheck(CompileCacheWire::LiveSubject subject,
-                                                                std::string_view peer) const override;
+                                                                LiveWatcher const& watcher) const override;
 
     ILiveStatsSources const& _sources;
     Distributed::IMembershipOracle const& _membership;

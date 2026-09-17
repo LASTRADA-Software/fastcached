@@ -3025,12 +3025,20 @@ the direction the composition already fails in.
 **The fold lives in ONE function and every gate reaches it**, `Node::RefuseUnlessMember`. The
 alternative — folding at each surface — is the shape this file already records for the membership
 verdict itself: five copies of a one-armed decision were exactly as correct as one until a second
-arm arrived, and then five files each had to grow it. The one surface that must NOT widen says so
-by calling a differently-named spelling that takes a reason: `RefuseUnlessMemberAtAddress`, whose
-single caller is `LiveStatsResponder`, because a subscription is re-gated on every tick through
-`Protocol::ILiveGate` — a seam `fastcached` shares and which therefore carries no cluster key.
-A door that honoured a proof while the re-gate did not would admit a proven watcher and end its
-stream one tick later, which is worse than refusing it.
+arm arrived, and then five files each had to grow it.
+
+**Every gate INCLUDES the live-stats one since #1512, and how that came about is the transferable
+part.** It was the one exception, and the reason was never about subscriptions: a subscription is
+re-gated on every tick through `Protocol::ILiveGate`, a seam `fastcached` shares, and that seam
+passed the peer as a bare host — so the re-gate *could not* see a proof, and a door honouring one
+alone would admit a proven watcher and end its stream one tick later, which is worse than
+refusing it. The exception was therefore a property of the SEAM, and it was recorded as a
+deliberate narrowing (`RefuseUnlessMemberAtAddress`, a differently-named spelling that took a
+written reason) rather than as an omission — which is what made it findable and fixable instead
+of looking like policy. #1512 widened the seam to a `LiveWatcher` carrying the host and a
+`provedClusterKey` bool, both ends now fold, and the narrow spelling was DELETED rather than left
+unused: a policy that reads as available and describes nothing is how a table stops describing
+the file it is about.
 
 **Neither verb is pre-auth, and the reasoning from `Enroll` does not transfer.** `Enroll` exists
 for a machine that holds NO secret of this cluster, so a credential gate there refuses the whole
@@ -3082,26 +3090,16 @@ the registration that follows then succeeds or fails for a reason that names the
 that is the fix rather than an omission: locality is a property of the VERB, and a machine
 holding the fleet's key is still not this one (#287). `FleetText` and a live-stats subscription
 are BOTH behind the dashboard credential as well as membership, and that credential is untouched
-here -- it answers a different question and is its own file by rule. What differs between them is
-the membership half: `FleetTextResponder` folds a proof like every other gate, and
-`LiveStatsResponder` alone does not, for the re-gate reason above. **Five callers widen and
-exactly one does not**, which is the census rather than a description -- `CompileResponder`,
-`EnrollmentResponder`, `FleetTextResponder`, `NodeStatusResponder` and `SchedulerResponder`
-against `LiveStatsResponder`'s two sites -- so a sixth surface arriving is a decision somebody
-makes rather than a default it inherits.
+-- it answers a different question and is its own file by rule, so a proof is not a substitute
+for the token.
+
+**Every membership gate on this surface folds the proof, and that is a census rather than a
+description**: `CompileResponder`, `EnrollmentResponder`, `FleetTextResponder`,
+`NodeStatusResponder`, `SchedulerResponder` and -- since #1512 -- `LiveStatsResponder` at BOTH
+its door and its per-tick re-gate. There is no longer a spelling that refuses to widen, so a
+seventh surface folds by reaching the one function rather than by remembering to.
 
 ## Open work
-- **[#1512](https://github.com/LASTRADA-Software/fastcached/issues/1512)** — `Protocol::ILiveGate`
-  carries no proof, so the one population #1428 exists for is the one machine in the fleet that
-  cannot watch its own live stats: a worker admitted by proving the cluster key at an unlisted
-  address registers, leases and compiles, and is refused `NotAMember` by `Subscribe`. The seam's
-  three methods all take the peer as a bare host, and `fastcached` implements them too, so there
-  is nowhere for a proof to travel — which is why #1428 refused to widen the DOOR alone rather
-  than leaving it. **A door that honoured a proof while the per-tick `Recheck` did not would be a
-  worse outcome than the refusal, not a partial fix**: the watcher is admitted and its stream ends
-  one tick later, so any shape where the two can disagree reintroduces this rather than narrowing
-  it. That is also what makes the failing test two ticks rather than one — one tick is what the
-  admitted-then-dropped bug produces as well.
 - **[#661](https://github.com/LASTRADA-Software/fastcached/issues/661)** — `IProcessRunner`
   has no cancellable seam, so a compile whose client has GONE runs to completion and this
   machine pays for an object nobody will read. The departure is already detected and
