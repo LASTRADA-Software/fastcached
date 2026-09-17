@@ -269,6 +269,26 @@ struct NodeCacheReport
 ///
 /// A struct rather than four positional parameters: two of them are strings that
 /// would be transposable at a call site, and a fifth field is a foreseeable change.
+/// What a machine says about itself when it has nothing to register.
+///
+/// A record rather than loose parameters for `WorkerRegistration`'s reason: the UTF-8 gate is
+/// a TABLE over a record's fields, and text another machine will read is refused where it
+/// enters. Two fields here rather than five, which changes the table's length and not whether
+/// there is one ([#1440](https://github.com/LASTRADA-Software/fastcached/issues/1440)).
+struct NodePresence
+{
+    std::string_view endpoint;   ///< host:port the machine answers on; the key its row is filed under.
+    std::string_view version {}; ///< What software it runs; empty means it did not say.
+
+    /// What the machine is. Read for the page's columns, never for scheduling: nothing may be
+    /// leased against a machine that registered no worker.
+    NodeCapacity capacity {};
+
+    /// What it is doing, and what its cache holds. A machine with no worker still has a CPU, a
+    /// memory figure and a cache, so this is not an empty passenger.
+    NodeLoad load {};
+};
+
 struct WorkerRegistration
 {
     std::string_view fingerprint; ///< Toolchain identity.

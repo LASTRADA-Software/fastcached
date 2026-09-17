@@ -301,6 +301,17 @@ namespace
                                         .project = [](WorkerRegistration const& r) { return r.displayName; } },
     };
 
+    /// The strings a presence announcement carries that another machine will read.
+    ///
+    /// Its own table rather than a reuse of `RegistrationTextFields`, which projects from
+    /// `WorkerRegistration`: two records, two projections, one validator. Shorter for the
+    /// honest reason -- a presence announcement carries no fingerprint, no toolchain label and
+    /// no display name, because it registers nothing.
+    constexpr std::array PresenceTextFields {
+        TextField<NodePresence> { .name = "endpoint", .project = [](NodePresence const& p) { return p.endpoint; } },
+        TextField<NodePresence> { .name = "version", .project = [](NodePresence const& p) { return p.version; } },
+    };
+
     /// Whether a registration's endpoint names the host it arrived from.
     ///
     /// **Hosts only, never ports**, which is forced rather than chosen: a peer dials
@@ -766,6 +777,35 @@ SchedulerReply SchedulerService::Register(CallerContext const& caller, WorkerReg
 void SchedulerService::SetHistorySink(IFleetHistorySink* sink) noexcept
 {
     _history = sink;
+}
+
+SchedulerReply SchedulerService::AnnounceNode(CallerContext const& caller,
+                                              NodePresence const& presence,
+                                              std::span<FleetBucket const> history)
+{
+    if (auto refusal = Gate(caller); refusal.has_value())
+        return std::move(*refusal);
+
+    // Refused where it ENTERS, through the same validator the registration goes through: one
+    // byte that is not UTF-8 makes the fleet document unparseable for the whole fleet, and a
+    // renderer that repaired it would be a second author of the value.
+    if (auto const field = FirstFieldNotText(presence, PresenceTextFields); field.has_value())
+        return Refuse(Wire::ErrorCode::MalformedRegistration, NotTextRefusal(*field));
+
+    // The endpoint is the KEY, so an empty one is not a machine that declined to say where it
+    // answers -- it is a row that would collide with every other machine that did the same.
+    if (presence.endpoint.empty())
+        return Refuse(Wire::ErrorCode::MalformedRegistration, "a machine announces the endpoint it answers on");
+
+    _workers.NoteNodePresent(
+        std::string { presence.endpoint }, presence.capacity, presence.load, std::string { presence.version });
+
+    // Filed under the ENDPOINT, exactly as a worker's batch is. The node's cursor advances only
+    // because this verb was accepted, which is the rule `Heartbeat` already follows.
+    if (_history != nullptr && !history.empty())
+        _history->AcceptHistory(std::string { presence.endpoint }, history);
+
+    return SchedulerReply::Success();
 }
 
 SchedulerReply SchedulerService::Heartbeat(CallerContext const& caller,
