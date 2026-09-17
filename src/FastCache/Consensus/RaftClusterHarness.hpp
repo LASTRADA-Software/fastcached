@@ -18,6 +18,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <ranges>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -625,9 +626,9 @@ inline void RaftClusterHarness::CheckInvariants()
 
     // Log Matching: two logs sharing an (index, term) must agree on every entry
     // up through that index.
-    for (auto outer = std::size_t { 0 }; outer < _nodes.size(); ++outer)
+    for (auto const outer: std::views::iota(std::size_t { 0 }, _nodes.size()))
     {
-        for (auto inner = outer + 1; inner < _nodes.size(); ++inner)
+        for (auto const inner: std::views::iota(outer + 1, _nodes.size()))
         {
             auto const& left = _nodes[outer]->driver->Node().Log();
             auto const& right = _nodes[inner]->driver->Node().Log();
@@ -702,7 +703,7 @@ inline void RaftClusterHarness::Step(std::chrono::milliseconds by)
 
 inline void RaftClusterHarness::Run(std::size_t steps, std::chrono::milliseconds by)
 {
-    for (auto step = std::size_t { 0 }; step < steps; ++step)
+    for ([[maybe_unused]] auto const step: std::views::iota(std::size_t { 0 }, steps))
         Step(by);
 }
 

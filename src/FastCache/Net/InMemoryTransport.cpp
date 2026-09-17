@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <memory>
+#include <ranges>
 #include <span>
 #include <string>
 #include <utility>
@@ -49,7 +50,7 @@ void InMemoryPipe::CloseWrite() noexcept
 std::size_t InMemoryPipe::TryPull(std::span<std::byte> into) noexcept
 {
     auto const take = std::min(into.size(), _buffer.size());
-    for (std::size_t i = 0; i < take; ++i)
+    for (auto const i: std::views::iota(std::size_t { 0 }, take))
     {
         into[i] = _buffer.front();
         _buffer.pop_front();

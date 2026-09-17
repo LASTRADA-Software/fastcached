@@ -98,7 +98,7 @@ std::expected<std::vector<LeafEntry>, CowTreeError> DecodeLeafEntries(BytesView 
     std::vector<LeafEntry> entries;
     entries.reserve(header.entryCount);
 
-    for (std::uint16_t i = 0; i < header.entryCount; ++i)
+    for ([[maybe_unused]] auto const i: std::views::iota(std::size_t { 0 }, std::size_t { header.entryCount }))
     {
         if (cursor.size() < sizeof(std::uint16_t) + sizeof(std::uint32_t))
             return std::unexpected(CowTreeError::Corrupt);
@@ -125,7 +125,7 @@ std::expected<std::vector<InternalEntry>, CowTreeError> DecodeInternalEntries(By
     std::vector<InternalEntry> entries;
     entries.reserve(header.entryCount);
 
-    for (std::uint16_t i = 0; i < header.entryCount; ++i)
+    for ([[maybe_unused]] auto const i: std::views::iota(std::size_t { 0 }, std::size_t { header.entryCount }))
     {
         if (cursor.size() < sizeof(std::uint64_t) + sizeof(std::uint16_t))
             return std::unexpected(CowTreeError::Corrupt);

@@ -416,7 +416,7 @@ auto FilePageStore::RecoverExistingFile() -> std::expected<void, CowTreeError>
         if (count > perPage)
             return std::unexpected(CowTreeError::Corrupt);
 
-        for (std::uint64_t k = 0; k < count; ++k)
+        for (auto const k: std::views::iota(std::uint64_t { 0 }, count))
         {
             std::uint64_t id = 0;
             std::memcpy(&id, page.data() + 16 + (k * sizeof(id)), sizeof(id));
@@ -575,7 +575,7 @@ auto FilePageStore::WriteFreeListLocked() -> std::expected<PageId, CowTreeError>
     // also why the snapshot is taken first: extending does not change it.
     std::vector<PageId> listPages;
     listPages.reserve(pagesNeeded);
-    for (std::size_t i = 0; i < pagesNeeded; ++i)
+    for ([[maybe_unused]] auto const i: std::views::iota(std::size_t { 0 }, pagesNeeded))
     {
         auto const page = ExtendLocked();
         if (!page.has_value())
@@ -594,7 +594,7 @@ auto FilePageStore::WriteFreeListLocked() -> std::expected<PageId, CowTreeError>
         std::memcpy(buffer.data(), &next, sizeof(next));
         auto const countRaw = static_cast<std::uint64_t>(count);
         std::memcpy(buffer.data() + sizeof(next), &countRaw, sizeof(countRaw));
-        for (std::size_t k = 0; k < count; ++k)
+        for (auto const k: std::views::iota(std::size_t { 0 }, count))
         {
             auto const id = snapshot[first + k];
             std::memcpy(buffer.data() + FreeListHeaderBytes + (k * sizeof(id)), &id, sizeof(id));

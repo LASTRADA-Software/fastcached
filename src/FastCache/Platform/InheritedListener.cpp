@@ -4,6 +4,7 @@
 
 #include <charconv>
 #include <cstdlib>
+#include <ranges>
 #include <string>
 
 #if !defined(_WIN32)
@@ -114,7 +115,7 @@ std::vector<int> AdoptInheritedDescriptors()
                                                fds.has_value() ? std::optional { std::string_view { *fds } } : std::nullopt,
                                                static_cast<std::uint64_t>(::getpid()));
 
-    for (int offset = 0; offset < handoff.count; ++offset)
+    for (auto const offset: std::views::iota(0, handoff.count))
     {
         int const descriptor = handoff.firstDescriptor + offset;
         // Applied HERE rather than left to whoever adopts the descriptor, because

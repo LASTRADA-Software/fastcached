@@ -340,9 +340,9 @@ std::expected<ClusterState, ConsensusError> DecodeState(std::span<std::byte cons
     for (std::size_t index = memberSpan; index < settingsEnd; index += SettingFields)
         state.settings.push_back(Setting { .name = at(index), .value = at(index + 1) });
     auto const clientsEnd = settingsEnd + *clientCount;
-    for (std::size_t index = settingsEnd; index < clientsEnd; ++index)
+    for (auto const index: std::views::iota(settingsEnd, clientsEnd))
         state.clients.push_back(at(index));
-    for (std::size_t index = clientsEnd; index < clientsEnd + *forgottenCount; ++index)
+    for (auto const index: std::views::iota(clientsEnd, clientsEnd + *forgottenCount))
         state.forgotten.push_back(at(index));
     return state;
 }

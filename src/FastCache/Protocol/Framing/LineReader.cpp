@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstring>
 #include <format>
+#include <ranges>
 #include <string>
 #include <utility>
 
@@ -65,7 +66,7 @@ std::expected<std::string, ProtocolError> ByteReader::TryExtractLine()
     if (avail < 2)
         return std::unexpected(ProtocolError { .code = ProtocolErrorCode::MalformedFrame, .context = "no CRLF yet" });
 
-    for (std::size_t i = 0; i + 1 < avail; ++i)
+    for (auto const i: std::views::iota(std::size_t { 0 }, avail - 1))
     {
         if (base[i] == CarriageReturn && base[i + 1] == LineFeed)
         {

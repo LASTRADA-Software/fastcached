@@ -286,7 +286,7 @@ void KqueueReactor::Detach(KqueueFdHandler* handler) const noexcept
     //
     // The whole array is scanned, already-dispatched entries included: nulling
     // one of those is a no-op and it avoids an off-by-one against the cursor.
-    for (int i = 0; i < _batch.count; ++i)
+    for (auto const i: std::views::iota(0, _batch.count))
     {
         if (_batch.events[i].udata == handler)
             _batch.events[i].udata = WithdrawnBatchEntry();
@@ -447,7 +447,7 @@ void KqueueReactor::RunLoop()
         std::array<void*, Batch> serviced {};
         std::size_t servicedCount = 0;
 
-        for (int i = 0; i < n; ++i)
+        for (auto const i: std::views::iota(0, n))
         {
             auto const& ev = events[i];
             if (ev.udata == WithdrawnBatchEntry())

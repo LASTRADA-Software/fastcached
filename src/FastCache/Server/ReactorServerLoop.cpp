@@ -302,7 +302,7 @@ namespace
 
         std::vector<std::unique_ptr<IocpReactor>> reactors;
         reactors.reserve(reactorCount);
-        for (auto i = 0U; i < reactorCount; ++i)
+        for ([[maybe_unused]] auto const i: std::views::iota(0U, reactorCount))
         {
             reactors.push_back(std::make_unique<IocpReactor>(clock));
             announcer.ExpectAcceptor();
@@ -467,7 +467,7 @@ namespace
 
         std::vector<std::jthread> threads;
         threads.reserve(reactorCount - 1);
-        for (auto i = 1U; i < reactorCount; ++i)
+        for (auto const i: std::views::iota(1U, reactorCount))
             threads.emplace_back([&reactors, &announcer, i] {
                 [[maybe_unused]] auto const threadName = std::format("fc-reactor-{}", i);
                 FC_THREAD_NAME(threadName.c_str());
@@ -529,7 +529,7 @@ namespace
         // outlives every caller of `AcceptorArmed`.
         ReadinessAnnouncer announcer { logger, std::format("{} bind(s) x {} reactors", bindCount, reactorCount) };
 
-        for (auto i = 0U; i < reactorCount; ++i)
+        for (auto const i: std::views::iota(0U, reactorCount))
         {
             reactors.push_back(std::make_unique<PlatformReactor>(clock));
             for (auto const& bind: options.binds)
@@ -618,7 +618,7 @@ namespace
 
         std::vector<std::jthread> threads;
         threads.reserve(reactorCount - 1);
-        for (auto i = 1U; i < reactorCount; ++i)
+        for (auto const i: std::views::iota(1U, reactorCount))
             threads.emplace_back([&runReactor, i] {
                 // Hoist into a stack local; Tracy's SetThreadName does not
                 // copy and would dangle on a `std::format(...).c_str()`.
