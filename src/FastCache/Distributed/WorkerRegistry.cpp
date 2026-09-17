@@ -425,6 +425,19 @@ std::chrono::milliseconds WorkerRegistry::AgeOf(TimePoint lastSeen, TimePoint no
     return std::chrono::duration_cast<std::chrono::milliseconds>(now - lastSeen);
 }
 
+void WorkerRegistry::NoteNodePresent(std::string endpoint,
+                                     NodeCapacity const& capacity,
+                                     NodeLoad const& load,
+                                     std::string version)
+{
+    std::scoped_lock const guard { _mutex };
+    auto& slot = _present[std::move(endpoint)];
+    slot.capacity = capacity;
+    slot.load = load;
+    slot.version = std::move(version);
+    slot.lastSeen = _clock.Now();
+}
+
 std::vector<NodeReport> WorkerRegistry::NodeReports() const
 {
     std::scoped_lock const guard { _mutex };
@@ -506,6 +519,37 @@ std::vector<NodeReport> WorkerRegistry::NodeReports() const
             held.lastSeen = entry.lastSeen;
             held.contributorSaysCache = saysCache;
         }
+    }
+
+    // Every machine that announced itself, for the endpoints no live worker covers. The
+    // worker entries WIN where both exist: they carry what can be leased, and a machine that
+    // runs a worker must render exactly as it did before #1440 -- so this loop adds rows and
+    // never edits one.
+    //
+    // Filtered on the same heartbeat timeout rather than expired as an event, which is the
+    // distinction `ExpireStale` draws: something is held against a worker and has to be
+    // released, and nothing at all is held against presence.
+    for (auto const& [endpoint, presence]: _present)
+    {
+        if (now - presence.lastSeen > _heartbeatTimeout)
+            continue;
+        if (byEndpoint.contains(endpoint))
+            continue;
+
+        // `registeredSlots` stays ABSENT and `fingerprints` stays empty, which is what makes
+        // this a machine rather than a worker offering nothing: the page renders both at the
+        // CELL, and the slot totals skip it rather than adding a zero.
+        byEndpoint.emplace(endpoint,
+                           Candidate { .report = NodeReport { .endpoint = endpoint,
+                                                              .fingerprints = {},
+                                                              .capacity = presence.capacity,
+                                                              .load = presence.load,
+                                                              .registeredSlots = std::nullopt,
+                                                              .fleetJobsInFlight = 0,
+                                                              .heartbeatAge = AgeOf(presence.lastSeen, now),
+                                                              .version = presence.version },
+                                       .lastSeen = presence.lastSeen,
+                                       .contributorSaysCache = SaysAnything(presence.load.cache) });
     }
 
     std::vector<NodeReport> out;

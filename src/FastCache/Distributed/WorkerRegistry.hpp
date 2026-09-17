@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cstdint>
 #include <expected>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -441,6 +442,29 @@ class WorkerRegistry
     ///         ordinary case.
     [[nodiscard]] std::vector<std::string> ExpireStale();
 
+    /// Record that a machine EXISTS, whatever components it runs.
+    ///
+    /// **Presence is not a registration and adds no capacity.** It is keyed by the machine's
+    /// ENDPOINT, held apart from `_workers`, and nothing may lease against it: a node that runs
+    /// no worker is a row on the fleet page and a place for its history to be filed, never a
+    /// place to send work ([#1440](https://github.com/LASTRADA-Software/fastcached/issues/1440)).
+    ///
+    /// Held apart rather than as a `_workers` entry with an absent fingerprint, because this
+    /// registry keys on `(fingerprint, endpoint)` and every consumer of `LiveWorkers()` walks
+    /// that map. A fingerprint-less entry there would be a pseudo-worker with no toolchain and
+    /// no slots -- which is the workaround #206 deleted, where a FAKE toolchain made a machine
+    /// a registered worker so it would get a page row.
+    ///
+    /// **A node that runs a worker announces too**, and both records then describe it: the
+    /// worker entries carry what can be leased, this carries that it is there. `NodeReports()`
+    /// prefers the worker entries where both exist, so a machine with a worker renders exactly
+    /// as it did before.
+    /// @param endpoint Where the machine answers; the key.
+    /// @param capacity What the machine is.
+    /// @param load What it is doing, and what its cache holds.
+    /// @param version What software it runs; empty means it did not say.
+    void NoteNodePresent(std::string endpoint, NodeCapacity const& capacity, NodeLoad const& load, std::string version);
+
     /// Drop one registration because the worker says it no longer serves it.
     ///
     /// The same event as `ExpireStale` reached deliberately instead of by timeout,
@@ -563,7 +587,22 @@ class WorkerRegistry
     std::chrono::milliseconds _heartbeatTimeout;
     mutable std::mutex _mutex;
     std::unordered_map<std::string, Entry> _workers; ///< Guarded by _mutex.
-    std::uint64_t _nextId { 1 };                     ///< Guarded by _mutex.
+
+    /// What a machine last said about itself, whatever it runs. Guarded by _mutex.
+    ///
+    /// Aged out by the same heartbeat timeout the worker entries use, but FILTERED rather than
+    /// expired as an event: `ExpireStale` is an event because something is held against a
+    /// worker and has to be released, and nothing is held against presence. A row that stops
+    /// being refreshed stops being drawn, which is all its absence means.
+    struct Presence
+    {
+        NodeCapacity capacity {};
+        NodeLoad load {};
+        std::string version {};
+        TimePoint lastSeen {};
+    };
+    std::map<std::string, Presence> _present;
+    std::uint64_t _nextId { 1 }; ///< Guarded by _mutex.
 };
 
 } // namespace FastCache::Distributed
