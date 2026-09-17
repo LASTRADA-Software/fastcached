@@ -1173,8 +1173,9 @@ TEST_CASE("Mixed Set/Update/Delete script replays identically across a mid-scrip
 
 TEST_CASE("Open with a non-existent path under an existing directory creates the file", "[cowstorage][open]")
 {
-    auto const dir = std::filesystem::temp_directory_path();
-    auto const path = dir / std::format("cowstorage-mktest-{}.cow", std::mt19937_64 { std::random_device {}() }());
+    // Through the seam, for the reason `StorageTestUtils.hpp`'s `TempFile` records: a
+    // `std::random_device` draw is not unique on the host #1507 was reproduced on.
+    std::filesystem::path const path = FastCache::Testing::UniqueScratchPath("cowstorage-mktest").string() + ".cow";
     std::error_code ec;
     std::filesystem::remove(path, ec);
 

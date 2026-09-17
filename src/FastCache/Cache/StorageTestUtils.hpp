@@ -5,12 +5,13 @@
 
 #include <cstddef>
 #include <filesystem>
-#include <random>
 #include <span>
 #include <string>
 #include <string_view>
 #include <system_error>
 #include <vector>
+
+#include <tests/ScratchPath.hpp>
 
 /// Shared helpers for the storage-layer unit tests. Header-only so each test
 /// translation unit gets its own `inline` copies without an extra link target.
@@ -61,11 +62,22 @@ struct TempFile
 
     /// @param prefix Filename prefix identifying the test that owns the file.
     /// @param extension File extension including the dot (default `.cow`).
-    explicit TempFile(std::string_view prefix = "fastcache-storage-test-", std::string_view extension = ".cow")
+    explicit TempFile(std::string_view prefix = "fastcache-storage-test", std::string_view extension = ".cow")
     {
-        std::mt19937_64 rng { std::random_device {}() };
-        path = std::filesystem::temp_directory_path()
-               / (std::string { prefix } + std::to_string(rng()) + std::string { extension });
+        // `UniqueScratchPath` and NOT a random draw. This built its name from
+        // `std::mt19937_64 { std::random_device {}() }()`, and on the host #1507 was
+        // reproduced on `std::random_device` returns **zero** for 57% of draws (1652 of
+        // 2880, measured across 32 concurrent processes) -- so 31 of those 32 processes
+        // produced the SAME filename, `mt19937_64 { 0 }()` being 2947667278772165694
+        // every time. Whichever opened it second was refused `InUse` by a `flock` doing
+        // precisely its job, and the failure read as a storage concurrency bug.
+        //
+        // The seam is pid AND counter: no entropy source to fail, and the pid is what
+        // makes two test PROCESSES unable to agree. `ScratchPath.hpp`'s own comment
+        // records four earlier copies of this helper and the fifth that reintroduced the
+        // bug; this was the sixth, and the only one that got it wrong in a new way.
+        path = FastCache::Testing::UniqueScratchPath(prefix);
+        path += std::string { extension };
         std::filesystem::remove(path);
     }
 

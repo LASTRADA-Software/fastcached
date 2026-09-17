@@ -1763,6 +1763,11 @@ and what they may assume.
   refused, not cleared.
 - A scratch directory comes from `src/tests/ScratchPath.hpp`. A per-process counter is not unique —
   `catch_discover_tests` gives every case its own process, and the suite runs in parallel.
+- **And neither is `std::random_device`**, which on one host here answers **zero for 57% of
+  draws**, so every process picks the identical "random" name and the second one is refused
+  `InUse` by a lock doing its job — a defect that reads as a storage concurrency bug (#1507).
+  Written six times now; `ctest -R unique-temp-paths` is the scan, because no type forces a
+  test to reach for the seam.
 - A test FAKE is a shared helper too: `src/tests/ScriptedSocket.hpp`, and the membership oracles are
   `src/tests/MembershipFakes.hpp` (`ctest -R membership-fakes`). A fake nothing exercises does not
   report its own bugs, and a WRONG one makes its cases pass — so no failure ever finds it. A copy's

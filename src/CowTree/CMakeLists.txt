@@ -66,6 +66,15 @@ if(FASTCACHED_BUILD_TESTS)
             Catch2::Catch2
     )
 
+    # `src` on the TEST executable alone, never on the CowTree library: the library stays
+    # standalone and this buys its tests the shared helpers under `src/tests/`.
+    #
+    # It is the remedy `ScratchPath.hpp` prescribes in its own words -- *a helper is only
+    # shared if it is somewhere everything that needs it can include from* -- and this
+    # target is the one that could not. So `FilePageStore_test` re-derived the unique-path
+    # helper, got it wrong in a way no other copy had, and #1507's flake came out of it.
+    target_include_directories(CowTreeTests PRIVATE "${CMAKE_SOURCE_DIR}/src")
+
     # Catch.cmake (catch_discover_tests) is placed on CMAKE_MODULE_PATH by the
     # top-level CMakeLists, regardless of whether Catch2 came from CPM source
     # or a system find_package.

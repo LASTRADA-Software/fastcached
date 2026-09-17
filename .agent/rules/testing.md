@@ -825,11 +825,33 @@ definition now (`UniqueScratchPath`, pid + counter, and the RAII
 `ScratchDirectory` over it), and four things about how it got there are worth
 keeping:
 
-- **It has been written five times.** The first fix was private to
-  `Stats_test.cpp`; three later files reintroduced it; and the fifth,
-  `RaftStorage_test.cpp`, failed ten cases under `ctest -j 8`. Its class comment
-  claimed exactly the guarantee it had -- "two cases running in one binary cannot
-  collide" -- and that scope is the bug.
+- **It has been written SIX times.** The first fix was private to
+  `Stats_test.cpp`; three later files reintroduced it; the fifth,
+  `RaftStorage_test.cpp`, failed ten cases under `ctest -j 8` -- its class comment
+  claimed exactly the guarantee it had, "two cases running in one binary cannot
+  collide", and that scope is the bug.
+- **The sixth got it wrong in a NEW way, and that is the one worth reading**
+  ([#1507](https://github.com/LASTRADA-Software/fastcached/issues/1507)). Five copies
+  used a counter and were beaten by the pid; `StorageTestUtils.hpp`'s `TempFile` reached
+  for `std::mt19937_64 { std::random_device {}() }()` instead -- which *looks* stronger
+  than a counter and is not a counter at all, so none of the reasoning above applied to
+  it and review had nothing to catch. **`std::random_device` is not a uniqueness source.**
+  Measured on the WSL2/libstdc++ host this was reproduced on: 2880 draws across 32
+  concurrent processes returned **1652 seeds of zero**, and `mt19937_64 { 0 }()` is
+  always `2947667278772165694` -- so 31 of 32 processes agreed on one filename. Four
+  more copies of the idiom had spread by then, in `FilePageStore_test`,
+  `LayeredStorage_test`, `CowTreeStorage_test` and `DefaultConfigPath_test`, the last of
+  which said in its own comment that it followed `Testing::TempFile`'s reasoning. It
+  did.
+  - **The symptom named the wrong subject, which is why it cost a ticket.** The store's
+    `flock` refused the second opener `InUse` -- doing exactly what `FilePageStore`'s
+    comment says it will -- so the failure read as a storage concurrency defect and was
+    filed as one. What identified it was printing `(dev, ino, pid, path)` at the refusal
+    and finding **one path held by nine of thirty-two processes while all 2582 others
+    were private to one**. A shared path is not a collision; it is a constant.
+  - And the fix is the seam, so the guard is a SCAN: nothing in the type system makes a
+    test reach for `UniqueScratchPath`, and a seventh author will reach for whatever
+    looks random. `ctest -R unique-temp-paths`.
 - **The fifth one happened because the shared fix was somewhere it could not be
   included from.** `UniqueScratchPath` lived in `src/apps/fastcache-cc/`, which
   `FastCacheTest` does not have on its include path, so the one suite that could

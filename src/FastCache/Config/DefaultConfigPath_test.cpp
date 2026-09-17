@@ -13,13 +13,14 @@
 #include <functional>
 #include <map>
 #include <optional>
-#include <random>
 #include <ranges>
 #include <set>
 #include <sstream>
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include <tests/ScratchPath.hpp>
 
 #if !defined(_WIN32)
     #include <sys/stat.h>
@@ -176,11 +177,17 @@ class TempDir
     ///        temp directory does not have.
     explicit TempDir(std::string_view name, std::filesystem::path const& root = std::filesystem::temp_directory_path())
     {
-        // A random suffix, not just the case name: two test binaries running
+        // A unique suffix, not just the case name: two test binaries running
         // concurrently (the ordinary CI shape) would otherwise share a path and
-        // delete each other's scratch tree. Same reasoning as Testing::TempFile.
-        std::mt19937_64 rng { std::random_device {}() };
-        _path = root / "fastcached-test" / std::format("{}-{}", name, rng());
+        // delete each other's scratch tree. Same reasoning as Testing::TempFile -- and
+        // the same seam, for the reason that helper now records: this was a
+        // `std::random_device` draw, which answers ZERO for most draws on the host #1507
+        // was reproduced on, so the "random" suffix was one shared constant.
+        //
+        // The pid is what separates two processes; `UniqueScratchPath`'s counter is what
+        // separates two directories inside one case. The name stays in the path so a
+        // leaked tree can still be traced to its case.
+        _path = root / "fastcached-test" / FastCache::Testing::UniqueScratchPath(name).filename();
         std::filesystem::create_directories(_path);
     }
 
