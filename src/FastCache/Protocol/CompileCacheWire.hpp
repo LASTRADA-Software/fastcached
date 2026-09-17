@@ -3174,7 +3174,10 @@ struct CacheLoadFields
                                            &CacheTierUsage::bytesUsed,
                                            &CacheTierUsage::evictions,
                                            &CacheTierUsage::indexBytes };
-            for (std::size_t index = 0; index < Members.size() && index < values->size(); ++index)
+            // Two clauses that are ONE bound: the shorter of the table and what the wire
+            // carried. A field this build does not know about is not read, and a field the
+            // peer did not send is left at its default.
+            for (auto const index: std::views::iota(std::size_t { 0 }, std::min(Members.size(), values->size())))
             {
                 auto const& raw = (*values)[index];
                 if (raw.empty())

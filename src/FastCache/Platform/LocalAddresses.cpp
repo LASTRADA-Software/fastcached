@@ -4,6 +4,7 @@
 #include <FastCache/Platform/LocalAddresses.hpp>
 
 #include <algorithm>
+#include <ranges>
 #include <array>
 #include <chrono>
 #include <cstddef>
@@ -122,11 +123,18 @@ std::vector<std::string> QueryLocalAddresses()
     std::vector<std::uintptr_t> buffer;
     auto sizeBytes = InitialBufferBytes;
     auto status = ULONG { ERROR_BUFFER_OVERFLOW };
-    for (auto attempt = 0; attempt < MaxAttempts && status == ERROR_BUFFER_OVERFLOW; ++attempt)
+    // The retry CONDITION becomes a `break` and the retry CAP stays the range, which is what
+    // the two clauses always meant apart. Equivalent rather than nearly so: `status` is
+    // ERROR_BUFFER_OVERFLOW on the line above, so the old entry test was always true and the
+    // first ask always happened -- a bottom `break` that changed whether the body runs once
+    // would be the zero-trip hazard, and it cannot arise here.
+    for ([[maybe_unused]] auto const attempt: std::views::iota(0, MaxAttempts))
     {
         buffer.assign(wordsFor(sizeBytes), 0);
         status = ::GetAdaptersAddresses(
             AF_UNSPEC, Flags, nullptr, reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buffer.data()), &sizeBytes);
+        if (status != ERROR_BUFFER_OVERFLOW)
+            break;
     }
     if (status != ERROR_SUCCESS)
         return {};
