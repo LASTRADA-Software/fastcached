@@ -28,10 +28,12 @@
 #include <utility>
 #include <vector>
 
+#include <tests/MembershipFakes.hpp>
 #include <tests/Unwrap.hpp>
 
 using namespace FastCache;
 using namespace FastCache::Node;
+using FastCache::Testing::ListedMembership;
 using FastCache::Testing::Unwrap;
 using namespace std::chrono_literals;
 
@@ -39,37 +41,6 @@ namespace Wire = FastCache::CompileCacheWire;
 
 namespace
 {
-
-/// Admits exactly the peers it was given, and nobody else.
-///
-/// Not `OpenMembership`, and that is the whole point of the fixture: a fake that admits
-/// everyone cannot tell *the gate is wired* from *the gate admits everyone*, which is
-/// the shape a loopback-only fixture already cost this tree once (#235).
-class ListedMembership final: public Distributed::IMembershipOracle
-{
-  public:
-    /// @param members Who may ask.
-    explicit ListedMembership(std::vector<std::string> members) noexcept:
-        _members { std::move(members) }
-    {
-    }
-
-    /// @copydoc Distributed::IMembershipOracle::Explain
-    ///
-    /// Names `FleetMemberList`, because that is the route this fake stands for: it models
-    /// `--fleet-member`'s host list. Through `DecidedBy`, so a miss stays unattributed
-    /// rather than claiming the list refused a host it never mentioned (#1471).
-    [[nodiscard]] Distributed::MembershipDecision Explain(std::string_view peerAddress) const override
-    {
-        return Distributed::DecidedBy(std::ranges::find(_members, peerAddress) != _members.end()
-                                          ? Distributed::Membership::Member
-                                          : Distributed::Membership::Outsider,
-                                      Distributed::MembershipParticipant::FleetMemberList);
-    }
-
-  private:
-    std::vector<std::string> _members;
-};
 
 /// The live-stats sources `NodeMetrics` reads, over a snapshot a case scripts.
 ///
@@ -768,7 +739,12 @@ TEST_CASE("NodeStatus answers a member with what the node is", "[node][node-stat
 {
     ManualClock clock;
     AtomicMetricsSink metrics;
-    ListedMembership const membership { { std::string { CallerAddress } } };
+    // A LIST, not `OpenMembership`, and that is the whole point of the fixture: a fake that
+    // admits everyone cannot tell *the gate is wired* from *the gate admits everyone*, which
+    // is the shape a loopback-only fixture already cost this tree once (#235). The route is
+    // named at the site because which route admits is this case's fact (#1497).
+    ListedMembership const membership { { std::string { CallerAddress } },
+                                        Distributed::MembershipParticipant::FleetMemberList };
     Fixture const fixture { { .admin = true, .raft = true }, clock, { .cacheTier = true, .worker = true } };
     CapturedReadings const readings { metrics, {} };
     NodeStatusResponder responder { fixture.status, readings, membership, metrics };
@@ -802,7 +778,8 @@ TEST_CASE("NodeMetrics answers the reading /metrics renders, the cache tier's fi
     // could not see.
     ManualClock clock;
     AtomicMetricsSink metrics;
-    ListedMembership const membership { { std::string { CallerAddress } } };
+    ListedMembership const membership { { std::string { CallerAddress } },
+                                        Distributed::MembershipParticipant::FleetMemberList };
     Fixture const fixture { {}, clock };
 
     auto snapshot = MetricsSnapshot {};
@@ -923,7 +900,7 @@ TEST_CASE("The operator verbs are refused by name to a non-member, and counted o
 {
     ManualClock clock;
     AtomicMetricsSink metrics;
-    ListedMembership const membership { { "10.0.0.9" } };
+    ListedMembership const membership { { "10.0.0.9" }, Distributed::MembershipParticipant::FleetMemberList };
     Fixture const fixture { { .admin = true }, clock };
     CapturedReadings const readings { metrics, {} };
     NodeStatusResponder responder { fixture.status, readings, membership, metrics };
@@ -956,7 +933,8 @@ TEST_CASE("The operator verbs are refused by name to a non-member, and counted o
 
     SECTION("and a listed member is served, so the gate is not simply refusing everyone")
     {
-        ListedMembership const listed { { std::string { CallerAddress } } };
+        ListedMembership const listed { { std::string { CallerAddress } },
+                                        Distributed::MembershipParticipant::FleetMemberList };
         NodeStatusResponder served { fixture.status, readings, listed, metrics };
         CHECK(ShapeOf(AnswerNow(served, HeaderFor(Wire::Op::NodeStatus))).status == Wire::Status::Ok);
         CHECK(metrics.Read(IMetricsSink::Counter::NodeStatusRequestsRefusedNotAMember) == 1);
@@ -976,7 +954,8 @@ TEST_CASE("A verb this component does not own is UnimplementedVerb and is not co
     // is one a later caller walks around.
     ManualClock clock;
     AtomicMetricsSink metrics;
-    ListedMembership const membership { { std::string { CallerAddress } } };
+    ListedMembership const membership { { std::string { CallerAddress } },
+                                        Distributed::MembershipParticipant::FleetMemberList };
     Fixture const fixture { {}, clock };
     CapturedReadings const readings { metrics, {} };
     NodeStatusResponder responder { fixture.status, readings, membership, metrics };
@@ -1006,7 +985,8 @@ TEST_CASE("The operator surface requires no credential, so a plain worker can an
     // implementation.
     ManualClock clock;
     AtomicMetricsSink metrics;
-    ListedMembership const membership { { std::string { CallerAddress } } };
+    ListedMembership const membership { { std::string { CallerAddress } },
+                                        Distributed::MembershipParticipant::FleetMemberList };
     Fixture const fixture { {}, clock };
     CapturedReadings const readings { metrics, {} };
     NodeStatusResponder const responder { fixture.status, readings, membership, metrics };
@@ -1041,7 +1021,8 @@ TEST_CASE("A frame-ceiling probe against the operator verbs is counted; an unkno
     // `MergedResponder` and counting it would put a port scan and a probe in one series.
     ManualClock clock;
     AtomicMetricsSink metrics;
-    ListedMembership const membership { { std::string { CallerAddress } } };
+    ListedMembership const membership { { std::string { CallerAddress } },
+                                        Distributed::MembershipParticipant::FleetMemberList };
     Fixture const fixture { {}, clock };
     CapturedReadings const readings { metrics, {} };
     NodeStatusResponder const responder { fixture.status, readings, membership, metrics };
@@ -1075,7 +1056,8 @@ TEST_CASE("MergedResponder routes the Node family to the node responder and nowh
     // verb answered *served nowhere* on the one platform this was developed on.
     ManualClock clock;
     AtomicMetricsSink metrics;
-    ListedMembership const membership { { std::string { CallerAddress } } };
+    ListedMembership const membership { { std::string { CallerAddress } },
+                                        Distributed::MembershipParticipant::FleetMemberList };
     Fixture const fixture { {}, clock };
     CapturedReadings const readings { metrics, {} };
     NodeStatusResponder node { fixture.status, readings, membership, metrics };

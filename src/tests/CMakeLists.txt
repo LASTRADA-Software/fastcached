@@ -2038,6 +2038,64 @@ set_tests_properties("test-loops-selftest" PROPERTIES
 )
 
 # ---------------------------------------------------------------------------
+# A test file does not define its own `IMembershipOracle` -- the fakes are shared (#1497).
+#
+# Six test files carried their own copy of one of two membership fakes, four byte-identical.
+# A duplicated FAKE is worse than duplicated production code because its bugs point the wrong
+# way: a fake that is wrong makes its cases PASS, so an assertion review finds nothing and a
+# green suite says nothing. And the cost is the number of facts each copy must get right, which
+# #1471 moved from zero to one -- each copy now names which admission route it stands for.
+#
+# In the default set for the reason test-name-hygiene gives above: it needs no daemon, no
+# socket and no compiler. The timeout is test-loops' 180 for the same reason -- it reads the
+# same file set. Measured at 7346 ms over 284 test files (WSL, DrvFs worktree on /mnt/d), where
+# the cost is the reads rather than the pattern: a whole-file filter means only the files that
+# mention the interface are comment-stripped.
+add_test(
+    NAME "membership-fakes"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-membership-fakes.cmake"
+)
+set_tests_properties("membership-fakes" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 180
+)
+
+# And that check must be SEEN to refuse and to ACCEPT, because a guard nobody has watched
+# accept is not known to work either. Ten staged trees: a duplicated fake plain and WRAPPED
+# across lines (the shape a line-based reader fails open on), a mention in a comment and a
+# parameter of the interface type both staying quiet, the check refusing when its own pattern
+# finds no shared fake in the header it points everybody at, refusing an enumeration that
+# selected nothing, and an exemption row honoured in one tree and refused as stale in another.
+# Both enumeration modes are exercised and asserted per case. It prints how many cases ran.
+add_test(
+    NAME "membership-fakes-selftest"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DFASTCACHED_SCRATCH_DIR=${CMAKE_CURRENT_BINARY_DIR}/membership-fakes-selftest"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-membership-fakes-selftest.cmake"
+)
+set_tests_properties("membership-fakes-selftest" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    # The default 120 s, and the number comes from a measurement rather than from a red run.
+    # Ten cases, each staging a tree, a `git init` and a `cmake -P`:
+    #
+    #     ext4 (/tmp, and every CI runner)                     412 ms
+    #     DrvFs (a build tree on /mnt/d reached from WSL)      2995 ms
+    #
+    # Seven times apart, and the scratch is `${CMAKE_CURRENT_BINARY_DIR}`, so a DrvFs build tree
+    # starts from 3.0 s -- two orders inside the budget even under `ctest --parallel 32`. These
+    # conditions are PINNED rather than pointed at a source: they are the world at one instant,
+    # and a figure that tracked its subject would silently re-attribute a real measurement to
+    # conditions it was never taken under. Unlike test-loops-selftest this does not grow with the
+    # exemption table -- the rows are staged into a COPY of the check, one tree per case.
+    TIMEOUT 120
+)
+
+# ---------------------------------------------------------------------------
 # A test may not decide anything from the architecture it was COMPILED for.
 #
 # `#if defined(_M_ARM64)` in a test picks an expected value from a fact about the

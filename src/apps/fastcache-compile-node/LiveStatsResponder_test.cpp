@@ -28,11 +28,13 @@
 #include <utility>
 #include <vector>
 
+#include <tests/MembershipFakes.hpp>
 #include <tests/Unwrap.hpp>
 #include <tests/WireReply.hpp>
 
 using namespace FastCache;
 using namespace FastCache::Node;
+using FastCache::Testing::ListedMembership;
 using FastCache::Testing::Unwrap;
 using namespace std::chrono_literals;
 
@@ -43,44 +45,6 @@ namespace
 
 /// The peer every subscription below arrives from, unless a case says otherwise.
 constexpr std::string_view Watcher = "10.0.0.7";
-
-/// Admits exactly the peers it currently lists.
-///
-/// MUTABLE, and bound once by reference like the production oracle: a removal case edits THIS
-/// object after the stream began, and a fixture that handed the responder a fresh oracle would
-/// pass under the very defect re-gating exists for.
-class ListedMembership final: public Distributed::IMembershipOracle
-{
-  public:
-    /// @param members Who may watch.
-    explicit ListedMembership(std::vector<std::string> members) noexcept:
-        _members { std::move(members) }
-    {
-    }
-
-    /// @copydoc Distributed::IMembershipOracle::Explain
-    ///
-    /// Names `FleetMemberList`, because that is the route this fake stands for: it models
-    /// `--fleet-member`'s host list. Through `DecidedBy`, so a miss stays unattributed
-    /// rather than claiming the list refused a host it never mentioned (#1471).
-    [[nodiscard]] Distributed::MembershipDecision Explain(std::string_view peerAddress) const override
-    {
-        return Distributed::DecidedBy(std::ranges::find(_members, peerAddress) != _members.end()
-                                          ? Distributed::Membership::Member
-                                          : Distributed::Membership::Outsider,
-                                      Distributed::MembershipParticipant::FleetMemberList);
-    }
-
-    /// Stop admitting @p peer.
-    /// @param peer Who to remove.
-    void Remove(std::string_view peer)
-    {
-        std::erase(_members, peer);
-    }
-
-  private:
-    std::vector<std::string> _members;
-};
 
 /// Captures what a case scripts, and counts how often it was asked.
 class ScriptedSources final: public ILiveStatsSources
@@ -264,7 +228,11 @@ struct Rig
     TestReactor reactor { clock };
     AtomicMetricsSink metrics;
     ScriptedSources sources;
-    ListedMembership membership { { std::string { Watcher }, "127.0.0.1", "10.0.0.8" } };
+    // MUTABLE, and bound once by reference like the production oracle: the removal case
+    // below edits THIS object after the stream began, and a fixture that handed the
+    // responder a fresh oracle would pass under the very defect re-gating exists for.
+    ListedMembership membership { { std::string { Watcher }, "127.0.0.1", "10.0.0.8" },
+                                  Distributed::MembershipParticipant::FleetMemberList };
     LiveStatsResponder responder { sources, membership, AdminCredential {}, reactor, metrics };
     std::deque<std::unique_ptr<LiveStatsResponder>> responders;
     std::deque<std::unique_ptr<Stream>> streams;
@@ -607,7 +575,7 @@ TEST_CASE("Detaching the sources ends every stream in order at its next tick", "
     AtomicMetricsSink metrics;
     ScriptedSources sources;
     LiveStatsSourceSlot slot;
-    ListedMembership membership { { std::string { Watcher } } };
+    ListedMembership membership { { std::string { Watcher } }, Distributed::MembershipParticipant::FleetMemberList };
     LiveStatsResponder responder { slot, membership, AdminCredential {}, reactor, metrics };
 
     Stream stream { reactor };

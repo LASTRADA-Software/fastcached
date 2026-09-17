@@ -12,10 +12,12 @@
 #include <string_view>
 #include <utility>
 
+#include <tests/MembershipFakes.hpp>
 #include <tests/Unwrap.hpp>
 
 using namespace FastCache;
 using namespace FastCache::Node;
+using FastCache::Testing::FixedMembership;
 using FastCache::Testing::Unwrap;
 
 namespace
@@ -30,32 +32,13 @@ constexpr Cc::SurfaceRefusal Stranger {
     .counter = IMetricsSink::Counter::NodeStatusRequestsRefusedNotAMember,
 };
 
+// Every case here names `ClusterMembers` and holds it fixed. The gate's subject is WHETHER a
+// caller is refused, not by whom -- the real host sets are asserted where they live -- so the
+// route is a constant of the arrangement rather than a variable of it. It is still spelled at
+// each site: a shared fake defaulting it would make the statement disappear, and `DecidedBy`
+// keeps `Outsider` unattributed even here, so no gate case can be the thing that establishes
+// the opposite convention (#1497).
 constexpr std::string_view StrangerWhy = "this node reports its identity and counters to fleet members only";
-
-/// An oracle that answers one verdict, so the gate is asked about a verdict rather than
-/// about a host set. The real sets are asserted where they live.
-class FixedMembership: public Distributed::IMembershipOracle
-{
-  public:
-    explicit FixedMembership(Distributed::Membership verdict) noexcept:
-        _verdict { verdict }
-    {
-    }
-
-    /// @param peerAddress Ignored.
-    /// @return The fixed verdict, attributed to the cluster's set unless it is `Outsider`.
-    ///
-    /// The gate's subject is WHETHER a caller is refused, not by whom, so this names one
-    /// route and holds it fixed. `DecidedBy` keeps `Outsider` unattributed even here, so a
-    /// gate case can never be the thing that establishes the opposite convention.
-    [[nodiscard]] Distributed::MembershipDecision Explain(std::string_view /*peerAddress*/) const override
-    {
-        return Distributed::DecidedBy(_verdict, Distributed::MembershipParticipant::ClusterMembers);
-    }
-
-  private:
-    Distributed::Membership _verdict;
-};
 
 /// The code and the sentence a refusal carries.
 ///
@@ -78,7 +61,7 @@ class FixedMembership: public Distributed::IMembershipOracle
 
 TEST_CASE("A member is admitted and nothing is counted", "[node][membership][forget]")
 {
-    FixedMembership const oracle { Distributed::Membership::Member };
+    FixedMembership const oracle { Distributed::Membership::Member, Distributed::MembershipParticipant::ClusterMembers };
     AtomicMetricsSink metrics;
 
     CHECK_FALSE(RefuseUnlessMember(oracle, metrics, "10.0.0.7", Stranger, StrangerWhy).has_value());
@@ -95,7 +78,7 @@ TEST_CASE("A forgotten host is refused apart from a stranger", "[node][membershi
     // forgotten arm still refuses this caller, still answers `NotAMember` on the wire,
     // and still reads as correct from the client's end -- what it loses is the
     // diagnosis, and the only thing that can see the difference is which series rose.
-    FixedMembership const oracle { Distributed::Membership::Forgotten };
+    FixedMembership const oracle { Distributed::Membership::Forgotten, Distributed::MembershipParticipant::ClusterMembers };
     AtomicMetricsSink metrics;
 
     auto const refusal = RefuseUnlessMember(oracle, metrics, "10.0.0.7", Stranger, StrangerWhy);
@@ -114,7 +97,7 @@ TEST_CASE("A host nobody listed is refused as the surface's own stranger", "[nod
 {
     // The mirror, and the reason the case above cannot stand alone: a gate that counted
     // EVERY refusal as a forget would pass it and lose the distinction the other way.
-    FixedMembership const oracle { Distributed::Membership::Outsider };
+    FixedMembership const oracle { Distributed::Membership::Outsider, Distributed::MembershipParticipant::ClusterMembers };
     AtomicMetricsSink metrics;
 
     auto const refusal = RefuseUnlessMember(oracle, metrics, "10.0.0.7", Stranger, StrangerWhy);
@@ -130,7 +113,7 @@ TEST_CASE("A forgotten host is told what happened and who can undo it", "[node][
     // people read. It must say that a decision was made -- not that the caller is
     // unknown, which is what the stranger sentence says and what the old one-armed gate
     // told a decommissioned machine.
-    FixedMembership const oracle { Distributed::Membership::Forgotten };
+    FixedMembership const oracle { Distributed::Membership::Forgotten, Distributed::MembershipParticipant::ClusterMembers };
     AtomicMetricsSink metrics;
 
     auto const refusal = RefuseUnlessMember(oracle, metrics, "10.0.0.7", Stranger, StrangerWhy);

@@ -24,11 +24,13 @@
 #include <utility>
 #include <vector>
 
+#include <tests/MembershipFakes.hpp>
 #include <tests/Unwrap.hpp>
 #include <tests/WireReply.hpp>
 
 using namespace FastCache;
 using namespace FastCache::Node;
+using FastCache::Testing::ListedMembership;
 using FastCache::Testing::Unwrap;
 
 namespace Wire = FastCache::CompileCacheWire;
@@ -41,33 +43,6 @@ constexpr std::string_view Reader = "10.0.0.7";
 
 /// Where the leader a follower names answers.
 constexpr std::string_view LeaderEndpoint = "10.0.0.2:6674";
-
-/// Admits exactly the peers it was given.
-class ListedMembership final: public Distributed::IMembershipOracle
-{
-  public:
-    /// @param members Who may ask.
-    explicit ListedMembership(std::vector<std::string> members) noexcept:
-        _members { std::move(members) }
-    {
-    }
-
-    /// @copydoc Distributed::IMembershipOracle::Explain
-    ///
-    /// Names `FleetMemberList`, because that is the route this fake stands for: it models
-    /// `--fleet-member`'s host list. Through `DecidedBy`, so a miss stays unattributed
-    /// rather than claiming the list refused a host it never mentioned (#1471).
-    [[nodiscard]] Distributed::MembershipDecision Explain(std::string_view peerAddress) const override
-    {
-        return Distributed::DecidedBy(std::ranges::find(_members, peerAddress) != _members.end()
-                                          ? Distributed::Membership::Member
-                                          : Distributed::Membership::Outsider,
-                                      Distributed::MembershipParticipant::FleetMemberList);
-    }
-
-  private:
-    std::vector<std::string> _members;
-};
 
 /// Sources whose leadership and document a case scripts, and which record what was asked.
 class ScriptedFleet final: public ILiveStatsSources
@@ -139,7 +114,8 @@ struct Rig
 {
     AtomicMetricsSink metrics;
     ScriptedFleet sources;
-    ListedMembership membership { { std::string { Reader }, "127.0.0.1" } };
+    ListedMembership membership { { std::string { Reader }, "127.0.0.1" },
+                                  Distributed::MembershipParticipant::FleetMemberList };
     FleetTextResponder responder { sources, membership, AdminCredential {}, metrics };
 
     /// Ask @p on, from @p peer.
