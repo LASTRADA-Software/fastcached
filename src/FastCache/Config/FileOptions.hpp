@@ -171,7 +171,13 @@ template <typename Result>
 template <typename Result>
 void ClearListsNamedOn(std::span<OptionSpec<Result> const> table, std::span<char const* const> args, Result& result)
 {
-    for (std::size_t i = 0; i < args.size(); ++i)
+    // A `while`, and the `continue` below is inverted into an `if`, so this loop has exactly
+    // ONE advance point. `TakeValue` advances `i` past a separate-argument value, so a `for`
+    // head here would claim a constant step the loop does not take -- and the old `continue`
+    // advanced nothing at all, relying entirely on that head, which is the shape that turns
+    // into an infinite loop the moment somebody converts it without reading it.
+    auto i = std::size_t { 0 };
+    while (i < args.size())
     {
         std::string_view const arg { args[i] };
         auto const row = std::ranges::find_if(table, [arg](OptionSpec<Result> const& spec) { return Matches(arg, spec); });
@@ -179,23 +185,26 @@ void ClearListsNamedOn(std::span<OptionSpec<Result> const> table, std::span<char
         // A token naming no row is left alone rather than reported: the caller has
         // already parsed this argv once and refused it there, with the message an
         // operator wants. A second refusal here would only change which sentence
-        // they see.
-        if (row == std::ranges::end(table))
-            continue;
+        // they see. Written as the POSITIVE condition rather than an early
+        // `continue`, so the advance below is the loop's only one.
+        if (row != std::ranges::end(table))
+        {
+            // A VALUE is not a flag, and only the parser's own rule can tell them
+            // apart. `--advertise --toolchain` gives `--advertise` the value
+            // "--toolchain"; a scan of every token for a spelling would read that
+            // value as naming the list and silently empty what the file declared. So
+            // the value is consumed here exactly as `ApplyOneOption` consumes it --
+            // through `TakeValue`, which advances past a separate-argument value and
+            // leaves an attached one alone. Its outcome is discarded because a missing
+            // value was already refused by that same earlier parse.
+            if (row->arity == Arity::Value)
+                (void) TakeValue(args, i, row->primary);
 
-        // A VALUE is not a flag, and only the parser's own rule can tell them
-        // apart. `--advertise --toolchain` gives `--advertise` the value
-        // "--toolchain"; a scan of every token for a spelling would read that value
-        // as naming the list and silently empty what the file declared. So the value
-        // is consumed here exactly as `ApplyOneOption` consumes it -- through
-        // `TakeValue`, which advances past a separate-argument value and leaves an
-        // attached one alone. Its outcome is discarded because a missing value was
-        // already refused by that same earlier parse.
-        if (row->arity == Arity::Value)
-            (void) TakeValue(args, i, row->primary);
+            if (row->clear != nullptr)
+                (void) (*row->clear)(result, {});
+        }
 
-        if (row->clear != nullptr)
-            (void) (*row->clear)(result, {});
+        ++i;
     }
 }
 
