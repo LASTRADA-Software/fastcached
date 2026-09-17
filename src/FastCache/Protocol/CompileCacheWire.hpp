@@ -4033,13 +4033,16 @@ struct NodeAnnounceRequest
 
 /// A node's announcement of itself, as received.
 ///
-/// A `*View` because it borrows: every consumer reads it inside the handler that decoded it,
-/// and the two nested records are decoded into owned values by their own decoders.
+/// The endpoint BORROWS -- every consumer reads it inside the handler that decoded it -- while
+/// the two nested records are decoded into owned values, exactly as `RegisterView` and
+/// `HeartbeatView` do. Handing back raw spans instead would push the nested decoding into each
+/// caller, which is where two callers come to disagree about whether an ABSENT record is a
+/// malformed one. `DecodeCapacity` answers that question once, and its answer is *no*.
 struct NodeAnnounceView
 {
     std::span<std::byte const> endpoint;
-    std::span<std::byte const> capacity;
-    std::span<std::byte const> load;
+    CapacityFields capacity {};
+    LoadFields load {};
 };
 
 /// Split a NODE-ANNOUNCE payload.
@@ -4047,10 +4050,16 @@ struct NodeAnnounceView
 /// @return The fields, or nullopt when malformed.
 [[nodiscard]] inline std::optional<NodeAnnounceView> DecodeNodeAnnouncePayload(std::span<std::byte const> payload)
 {
-    auto const fields = SplitFields(payload, 3);
+    auto const fields = SplitFields(payload, OpFieldCount(Op::NodeAnnounce));
     if (!fields.has_value())
         return std::nullopt;
-    return NodeAnnounceView { .endpoint = (*fields)[0], .capacity = (*fields)[1], .load = (*fields)[2] };
+    auto capacity = DecodeCapacity((*fields)[1]);
+    if (!capacity.has_value())
+        return std::nullopt;
+    auto load = DecodeLoad((*fields)[2]);
+    if (!load.has_value())
+        return std::nullopt;
+    return NodeAnnounceView { .endpoint = (*fields)[0], .capacity = *std::move(capacity), .load = *std::move(load) };
 }
 
 /// Frame a HEARTBEAT request.

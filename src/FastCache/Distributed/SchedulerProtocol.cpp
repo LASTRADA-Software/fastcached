@@ -30,9 +30,9 @@ namespace
     /// derived from it: a verb that reaches this class without a row is refused
     /// rather than served, which is the direction a mistake has to fail in.
     constexpr std::array SchedulerOps {
-        Wire::Op::Register,     Wire::Op::Heartbeat,          Wire::Op::Withdraw,           Wire::Op::Lease,
-        Wire::Op::Release,      Wire::Op::ClusterStatus,      Wire::Op::ClusterSet,         Wire::Op::ClusterForget,
-        Wire::Op::ClusterAdmit, Wire::Op::ClusterAdmitClient, Wire::Op::ClusterForgetClient
+        Wire::Op::Register,      Wire::Op::NodeAnnounce, Wire::Op::Heartbeat,          Wire::Op::Withdraw,
+        Wire::Op::Lease,         Wire::Op::Release,      Wire::Op::ClusterStatus,      Wire::Op::ClusterSet,
+        Wire::Op::ClusterForget, Wire::Op::ClusterAdmit, Wire::Op::ClusterAdmitClient, Wire::Op::ClusterForgetClient
     };
 
     /// Whether this scheduler serves @p op at all.
@@ -370,6 +370,33 @@ SchedulerReply SchedulerProtocol::Route(Wire::Op op, std::span<std::byte const> 
                                                           .slots = fields->slots,
                                                           .codecs = fields->acceptedCodecs,
                                                           .capacity = *capacity });
+        }
+        case Wire::Op::NodeAnnounce: {
+            auto const fields = Wire::DecodeNodeAnnouncePayload(payload);
+            if (!fields.has_value())
+                return SchedulerReply::Malformed();
+            // Refused for the same reason REGISTER refuses it: a class byte this build does not
+            // know means a peer built with a class this one lacks, and guessing either way is a
+            // fleet decision made silently.
+            auto const capacity = CapacityFromWire(fields->capacity);
+            if (!capacity.has_value())
+                return SchedulerReply::Malformed("this scheduler does not know that node class");
+
+            // **Zero in-flight, and it is a fact rather than a default.** This verb carries no
+            // job count because a machine announcing itself has no worker of THIS fleet for one
+            // to describe; where it does run a worker, that worker's own heartbeat reports the
+            // number and `NodeReports()` prefers those entries anyway. The wire has no field
+            // here to get wrong.
+            return _service.AnnounceNode(caller,
+                                         NodePresence { .endpoint = Wire::AsStringView(fields->endpoint),
+                                                        // Off the nested capacity record for
+                                                        // REGISTER's reason: it is the extensible
+                                                        // carrier, and `NodeCapacity` stays a
+                                                        // literal type.
+                                                        .version = fields->capacity.version,
+                                                        .capacity = *capacity,
+                                                        .load = LoadFromWire(fields->load, 0) },
+                                         HistoryFromWire(fields->load.history));
         }
         case Wire::Op::Heartbeat: {
             auto const fields = Wire::DecodeHeartbeatPayload(payload);
