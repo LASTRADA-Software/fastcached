@@ -5,8 +5,8 @@
 #include <array>
 #include <cstdio>
 #include <format>
-#include <ranges>
 #include <memory>
+#include <ranges>
 #include <string>
 
 #include <openssl/err.h>
