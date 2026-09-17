@@ -140,34 +140,26 @@ struct PresenceFixture
                                .logger = logger };
     }
 
-    /// Announce once against schedulers answering @p replies, one per dial.
+    /// Announce once through @p dialer.
     ///
-    /// A SCRIPT rather than a single reply, because a `NotLeader` is an instruction and the
-    /// round FOLLOWS it -- so the realistic refusal costs two dials, and a fixture scripting
-    /// one reply does not measure a refusal at all, it runs out. That is how the first version
-    /// of the refusal case below failed, and the dialler said so in as many words rather than
-    /// letting it read as a dial failure.
-    /// @param replies The framed replies, in dial order.
+    /// The dialler is the CASE's, passed in rather than made here, so a case can read the walk
+    /// afterwards -- which endpoints were reached, in what order -- against an object whose
+    /// existence is in its type. A fixture that owned one in a `std::optional` made every such
+    /// read an unchecked optional access, and Catch2's `REQUIRE` is a macro no analyser can see
+    /// through, so the guard that looked sufficient established nothing.
+    ///
+    /// Its script carries one reply PER DIAL, because a `NotLeader` is an instruction and the
+    /// round FOLLOWS it -- so the realistic refusal costs two dials, and a script of one reply
+    /// does not measure a refusal at all, it runs out. That is how the first version of the
+    /// refusal case below failed, and the scripted dialler said so in as many words rather
+    /// than letting it read as a dial failure.
+    /// @param dialer How the round reaches a scheduler, and what records the walk.
     /// @return Whether the round reported acceptance.
-    [[nodiscard]] bool AnnounceGetting(std::vector<std::vector<std::byte>> replies)
+    [[nodiscard]] bool AnnounceThrough(Testing::ScriptedDialer& dialer)
     {
-        dialer.emplace(std::move(replies));
         auto link = Unwrap(SchedulerLink::For(cfg.schedulers));
-        return AnnounceMachineOnce(Round(), link, *dialer);
+        return AnnounceMachineOnce(Round(), link, dialer);
     }
-
-    /// The frames dial @p index carried.
-    /// @param index Which dial.
-    /// @return One entry per whole frame.
-    [[nodiscard]] std::vector<std::pair<std::uint8_t, std::vector<std::byte>>> FramesOn(std::size_t index) const
-    {
-        REQUIRE(dialer.has_value());
-        return FramesIn(dialer->SentOn(index));
-    }
-
-    /// Held so a case can read the walk after the round: which endpoints were reached, and in
-    /// what order. Optional because the script is a case's to choose.
-    std::optional<Testing::ScriptedDialer> dialer;
 };
 
 } // namespace
@@ -175,9 +167,10 @@ struct PresenceFixture
 TEST_CASE("A machine announces itself under its own address and hands over its history", "[node][presence][fleethistory]")
 {
     PresenceFixture fixture;
-    REQUIRE(fixture.AnnounceGetting({ Wire::EncodeReply(Wire::Status::Ok, std::vector<std::byte> {}) }));
+    Testing::ScriptedDialer dialer { { Wire::EncodeReply(Wire::Status::Ok, std::vector<std::byte> {}) } };
+    REQUIRE(fixture.AnnounceThrough(dialer));
 
-    auto const frames = fixture.FramesOn(0);
+    auto const frames = FramesIn(dialer.SentOn(0));
     REQUIRE(frames.size() == 1);
 
     // The VERB, pinned by its byte as well as by its name: a symbol both ends spell can only
@@ -208,23 +201,23 @@ TEST_CASE("A refused announcement leaves the history to be offered again", "[nod
     // re-elects -- the moment the handover exists for -- and then a refusal at the endpoint it
     // named, since the round FOLLOWS a redirect. Two dials is the production walk, not a
     // contrivance: `NotAMember` is what a leader answers a machine it does not admit.
-    CHECK_FALSE(fixture.AnnounceGetting({ Wire::EncodeErrorReply(Wire::ErrorCode::NotLeader, "10.0.0.7:6676"),
-                                          Wire::EncodeErrorReply(Wire::ErrorCode::NotAMember, "") }));
+    Testing::ScriptedDialer dialer { { Wire::EncodeErrorReply(Wire::ErrorCode::NotLeader, "10.0.0.7:6676"),
+                                       Wire::EncodeErrorReply(Wire::ErrorCode::NotAMember, "") } };
+    CHECK_FALSE(fixture.AnnounceThrough(dialer));
 
     // The redirect WAS followed, so this case covers the whole walk rather than a round that
     // gave up at the first answer.
-    REQUIRE(fixture.dialer.has_value());
-    REQUIRE(fixture.dialer->Dialed().size() == 2);
-    CHECK(fixture.dialer->Dialed().at(1) == "10.0.0.7:6676");
+    REQUIRE(dialer.Dialed().size() == 2);
+    CHECK(dialer.Dialed().at(1) == "10.0.0.7:6676");
 
     // It was SENT -- on BOTH dials -- which is what makes the next assertion about the cursor
     // rather than about whether anything happened at all: a round that skipped the
     // announcement would also leave the batch in place, and would pass a test that only
     // looked at the sampler.
-    auto const first = fixture.FramesOn(0);
+    auto const first = FramesIn(dialer.SentOn(0));
     REQUIRE(first.size() == 1);
     CHECK(first.front().first == static_cast<std::uint8_t>(Wire::Op::NodeAnnounce));
-    REQUIRE(fixture.FramesOn(1).size() == 1);
+    REQUIRE(FramesIn(dialer.SentOn(1)).size() == 1);
 
     // Unmoved. This is the direction that gets skipped, and the one a fleet depends on.
     CHECK(fixture.sampler.NextHistoryBatch(8).size() == 1);

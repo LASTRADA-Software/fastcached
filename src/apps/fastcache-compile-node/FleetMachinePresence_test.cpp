@@ -25,6 +25,7 @@
 
 #include <tests/FleetHarness.hpp>
 #include <tests/FleetHistoryFakes.hpp>
+#include <tests/Unwrap.hpp>
 
 using namespace FastCache;
 using namespace FastCache::Testing;
@@ -93,7 +94,7 @@ TEST_CASE("A scheduler-only machine and a worker machine are both Machines rows"
     // The worker machine is untouched by any of this: a presence row is added beside worker
     // rows and never edits one, so a fleet that runs workers renders exactly as it did.
     REQUIRE(workerRow->registeredSlots.has_value());
-    CHECK(*workerRow->registeredSlots == 4);
+    CHECK(Unwrap(workerRow->registeredSlots) == 4);
     CHECK(workerRow->fingerprints.size() == 1);
 }
 
@@ -192,6 +193,6 @@ TEST_CASE("A worker-only fleet is unchanged by any of this", "[node][fleet][pres
     auto const* const row = RowFor(reports, WorkerMachine);
     REQUIRE(row != nullptr);
     REQUIRE(row->registeredSlots.has_value());
-    CHECK(*row->registeredSlots == 4);
+    CHECK(Unwrap(row->registeredSlots) == 4);
     CHECK(row->fingerprints.size() == 1);
 }
