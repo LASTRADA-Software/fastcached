@@ -189,7 +189,6 @@ struct HeartbeatRound
     IHostLoadSampler& loadSampler;   ///< CPU, memory and scratch.
     CacheTier const* cacheTier;      ///< Null on a node with no cache.
     IMetricsSink const& metrics;     ///< Where the cache figures are read.
-    FleetSampler& sampler;           ///< This machine's own series.
     /// What this worker PRESENTS to the scheduler, asked at each exchange.
     ///
     /// The seam and never a value, which is the whole of #404 in one member
@@ -341,6 +340,15 @@ inline constexpr std::chrono::milliseconds HeartbeatConnectTimeout { 1'000 };
 ///         round can achieve nothing -- nobody reachable, everybody refusing, a
 ///         redirect chain that ran out -- which are one answer to the only question
 ///         the caller asks of it: is this node getting through to a scheduler.
+/// How often a node says anything to a scheduler -- a worker's heartbeat and a machine's
+/// presence announcement alike.
+///
+/// **ONE number rather than two that can disagree.** The scheduler's heartbeat timeout is what
+/// decides when either goes stale, so a presence loop on its own cadence would make a
+/// machine's fleet row expire on a schedule nothing else in this process knew about -- and the
+/// two loops run in the same process against the same timeout (#1440).
+constexpr std::chrono::seconds NodeAnnounceInterval { 20 };
+
 /// The load record describing this MACHINE, sampled once.
 ///
 /// Extracted rather than copied because both announcements describe ONE host: sampling twice in

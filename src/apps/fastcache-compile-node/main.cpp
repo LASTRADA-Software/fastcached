@@ -31,6 +31,7 @@
 #include "NodeIoLoop.hpp"
 #include "NodeLogging.hpp"
 #include "NodeMembership.hpp"
+#include "NodePresenceTier.hpp"
 #include "NodeProofResponder.hpp"
 #include "NodeReload.hpp"
 #include "NodeStatusResponder.hpp"
@@ -494,6 +495,16 @@ using Node::NodeReloader;
     // fact with one author. See `AdvertisedEndpoint`.
     auto const advertise = Node::AdvertisedEndpoint(cfg);
 
+    // **One per process, and that is the whole reason it is here rather than inside the worker
+    // tier** (#1440). Both the worker's registrations and the presence loop's announcements
+    // name this machine's address, and two sources would be two values changing at two
+    // moments -- the defect #1279 closed inside the worker, reopened between two components.
+    // Seeded with what the process started with; the worker tier republishes it when a
+    // re-survey finds the configuration's answer has moved, and is its only writer.
+    //
+    // Declared up here, above every component that reads it, so it outlives all of them.
+    Node::AnnouncedEndpoint announced { advertise };
+
     // The descriptor travels to `StartNodeSurfaceOrExplain` below and is served
     // there. It used to be refused here, for the two months between the surfaces
     // merging and the reactor listeners learning to adopt: `AdoptInheritedListeners`
@@ -691,7 +702,7 @@ using Node::NodeReloader;
         Node::WorkerTier::Start(Node::WorkerTierParts { .cfg = cfg,
                                                         .reloader = reloader,
                                                         .capacity = capacity,
-                                                        .advertise = advertise,
+                                                        .announced = announced,
                                                         .activation = activated.has_value() ? Node::SocketActivation::Yes
                                                                                             : Node::SocketActivation::No,
                                                         .membership = membership.Oracle(),
@@ -1157,7 +1168,25 @@ using Node::NodeReloader;
     // through is destroyed: the handle is declared after it.
     std::optional<Node::WorkerHeartbeat> heartbeat;
     if (workerTier != nullptr)
-        heartbeat.emplace(workerTier->Launch(sampler, statusClock));
+        heartbeat.emplace(workerTier->Launch(statusClock));
+
+    // **Started unconditionally, and that one word is the whole of #1440.** A node with
+    // `--slots=0` has no `workerTier`, so before this existed such a machine reached the fleet
+    // through nothing at all -- absent from the Machines table it was itself serving, and
+    // handing over no history across an election.
+    //
+    // Declared AFTER the sampler it hands history through and therefore destroyed before it.
+    // That is the ordering rationale `WorkerHeartbeat` used to carry, and it moved here with
+    // the history: this loop is now the only thing in the process that reads the sampler's
+    // handover cursor.
+    auto const presence = Node::NodePresence::Start(Node::NodePresenceParts { .cfg = cfg,
+                                                                              .capacity = capacity,
+                                                                              .announced = announced,
+                                                                              .cacheTier = cacheTier.get(),
+                                                                              .metrics = metrics,
+                                                                              .sampler = sampler,
+                                                                              .credential = credential,
+                                                                              .logger = logger });
 
     // Installed only once the listener is up and the heartbeat is running, so a
     // stop arriving during startup cannot close a listener that does not exist yet.

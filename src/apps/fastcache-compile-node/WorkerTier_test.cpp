@@ -77,6 +77,10 @@ struct TierFixture
     NodeIoLoop io;
     std::unique_ptr<IHostFactsSource> host = MakeSystemHostFacts();
     Distributed::NodeCapacity capacity { .logicalCores = 16 };
+    /// The one advertised endpoint, owned HERE because `main` owns it: since #1440 the tier
+    /// borrows it rather than building one, so the presence loop and the worker read the same
+    /// value changing at the same moment.
+    AnnouncedEndpoint announced { "127.0.0.1:6674" };
     /// What the next `Start` builds from; a case edits it first.
     NodeConfig cfg = Worker();
     ConfiguredCredential credential { cfg, nullptr };
@@ -104,7 +108,7 @@ struct TierFixture
         return WorkerTier::Start(WorkerTierParts { .cfg = cfg,
                                                    .reloader = nullptr,
                                                    .capacity = capacity,
-                                                   .advertise = "127.0.0.1:6674",
+                                                   .announced = announced,
                                                    .activation = SocketActivation::No,
                                                    .membership = membership,
                                                    .locality = locality,

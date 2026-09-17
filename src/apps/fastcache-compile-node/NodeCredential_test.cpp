@@ -368,29 +368,6 @@ TEST_CASE("Site 3: a registration presents the secret in force NOW", "[node][cre
     AtomicMetricsSink metrics;
     NullLogger logger;
     SilentLoadSampler loadSampler;
-    FleetSampler sampler { std::nullopt,
-                           metrics,
-                           [] {
-                               return MetricsSnapshot { .storage = std::nullopt,
-                                                        .storageTiers = {},
-                                                        .host = HostCapacity { .configuredSlots = 1, .busySlots = 0 },
-                                                        .upstreamConfigured = std::nullopt,
-                                                        .uptime = {} };
-                           },
-                           // The process singleton, NOT a `SystemWallClock {}` temporary and not a
-                           // local either. `FleetSampler` stores no clock; it hands the reference to
-                           // `_fleet`, `_node` and `_received`, and `FleetHistory` keeps the ADDRESS
-                           // (`IWallClock const* _wall`) and dereferences it from a thread the
-                           // constructor itself starts -- so a temporary is read after it has died.
-                           // At `-O0` the dead frame slot still holds a usable vptr and this passes;
-                           // at `-O2` and above the locals declared after it reuse the slot and it is
-                           // a SIGSEGV. Static storage leaves no lifetime to reason about, which is
-                           // the argument `main.cpp` already makes beside its own use of it. Nothing
-                           // here asserts on wall-clock VALUES, so the determinism a `ManualWallClock`
-                           // would buy is not being given up. Compile-time guard: #1032.
-                           DefaultSystemWallClock(),
-                           HistoryPaths {},
-                           logger };
     CompileCapacity capacity { /*slots=*/1, /*byteBudget=*/1024ULL, std::chrono::seconds { 1 }, logger };
     Distributed::WorkerLeaseState lease { Distributed::SchedulerTermRegressionNotice::Silent() };
     std::atomic<bool> fleetMismatch { false };
@@ -411,7 +388,6 @@ TEST_CASE("Site 3: a registration presents the secret in force NOW", "[node][cre
                                  .loadSampler = loadSampler,
                                  .cacheTier = nullptr,
                                  .metrics = metrics,
-                                 .sampler = sampler,
                                  .credential = credential,
                                  .notice = notice,
                                  // Nothing to prove and nothing to present: every case in this

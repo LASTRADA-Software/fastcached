@@ -57,6 +57,7 @@ add_executable(fastcache-compile-node
     ScratchClaim.cpp
     LocalCache.cpp
     NodeAnnounce.cpp
+    NodePresenceTier.cpp
     NodeConfig.cpp
     NodeReload.cpp
     NodeFrameSurface.cpp
@@ -126,6 +127,7 @@ if(FASTCACHED_BUILD_TESTS)
         EnrollTrap_test.cpp
         ExchangeLog_test.cpp
         NodeAnnounce_test.cpp
+        NodePresenceTier_test.cpp
         SchedulerLink.cpp
         SchedulerLink_test.cpp
         SchedulerTier.cpp
@@ -137,6 +139,7 @@ if(FASTCACHED_BUILD_TESTS)
         RemoteUpstream.cpp
         RemoteUpstream_test.cpp
         NodeAnnounce.cpp
+        NodePresenceTier.cpp
         NodeConfig.cpp
         NodeCredential_test.cpp
         NodeReload.cpp
