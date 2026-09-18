@@ -606,6 +606,11 @@ target_compile_features(FastCache PUBLIC cxx_std_23)
 target_link_libraries(FastCache PUBLIC yaml-cpp::yaml-cpp)
 target_link_libraries(FastCache PUBLIC CowTree)
 
+# PRIVATE: no FastCache header includes a Monocypher header, so nothing that links FastCache
+# compiles against it -- `Core/Ed25519.hpp` and its siblings are the seam, and `ctest -R
+# crypto-seam` refuses any other first-party file reaching past them.
+target_link_libraries(FastCache PRIVATE fastcache-monocypher)
+
 # Tracy is linked PUBLIC so FC_TRACY_ENABLED and the Tracy include dirs
 # propagate transitively to the fastcached executable (thread naming in
 # main.cpp) and to the FastCacheTest binary (so Profiling_test sees the same

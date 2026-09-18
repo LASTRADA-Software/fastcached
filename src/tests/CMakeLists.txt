@@ -5273,7 +5273,8 @@ endif()
 
 # ---------------------------------------------------------------------------
 # The cluster pre-shared key's signing seam. Fails when anything in `src/` other
-# than `Core/Sha256.{hpp,cpp}` and `Cluster/ClusterSigning.hpp` calls the MAC
+# than `Core/Sha256.{hpp,cpp}`, `Cluster/ClusterSigning.hpp` and HKDF's `Core/Hkdf.cpp`
+# (#178, a derivation under keys that are never the cluster key) calls the MAC
 # primitive directly. scripts/check-psk-signing-seam.cmake carries the signer
 # table and the reason each row is in it, and prints the whole table on failure.
 #
