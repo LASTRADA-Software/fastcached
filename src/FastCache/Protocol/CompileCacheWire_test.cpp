@@ -76,11 +76,11 @@ TEST_CASE("The wire constants have their specified byte values")
     // the screen. A missing string does not announce itself as missing, so leaving the
     // floor at 7 would manufacture a quiet failure inside the fix for one.
     //
-    // Version 12 (#178) gives NODE-ANNOUNCE a fourth field -- a voter's roster endorsement --
+    // Version 13 (#178) gives NODE-ANNOUNCE a fourth field -- a voter's roster endorsement --
     // and its `Ok` a body, the certified roster. The arity is exact, so an older peer cannot
     // read the request at all, and both move for that reason.
-    CHECK(CurrentVersion == 12);
-    CHECK(MinSupportedVersion == 12);
+    CHECK(CurrentVersion == 13);
+    CHECK(MinSupportedVersion == 13);
     CHECK(RequestHeaderSize == 7);
     CHECK(ReplyHeaderSize == 5);
 
@@ -126,7 +126,7 @@ TEST_CASE("EncodeFetch emits the specified bytes exactly")
     // clang-format off: the grid IS the specification -- one wire field per row.
     auto const expected = Bytes({
         0xFC,                   // magic
-        0x0C,                   // version
+        0x0D,                   // version
         0x02,                   // op = Fetch
         0x00, 0x00, 0x00, 0x06, // payloadLength = 6
         0x00, 0x00, 0x00, 0x02, // field[0] length = 2
@@ -145,7 +145,7 @@ TEST_CASE("EncodeStore emits the specified bytes exactly")
 
     auto const expected = Bytes({
         0xFC,                               // magic
-        0x0C,                               // version
+        0x0D,                               // version
         0x01,                               // op = Store
         0x00, 0x00, 0x00, 0x19,             // payloadLength = 25 = (4+1) + (4+0) + (4+1) + (4+1) + (4+2)
         0x00, 0x00, 0x00, 0x01, 0x6B,       // key           = "k"
@@ -344,7 +344,7 @@ TEST_CASE("EncodeCacheDrop emits the specified bytes exactly", "[wire][cache-dro
     // clang-format off: the grid IS the specification -- one wire field per row.
     auto const expected = Bytes({
         0xFC,                   // magic
-        0x0C,                   // version
+        0x0D,                   // version
         0x15,                   // op = CacheDrop
         0x00, 0x00, 0x00, 0x06, // payloadLength = 6
         0x00, 0x00, 0x00, 0x02, // field[0] length = 2
@@ -537,7 +537,7 @@ TEST_CASE("EncodeAuth emits the specified bytes exactly")
     auto const frame = EncodeAuth(AuthRequest { .username = "bob", .secret = "hunter2" });
 
     auto const expected = Bytes({
-        0xFC, 0x0C, 0x03,       // magic, version, op=Auth
+        0xFC, 0x0D, 0x03,       // magic, version, op=Auth
         0x00, 0x00, 0x00, 0x12, // payload length: (4+3) + (4+7) = 18
         0x00, 0x00, 0x00, 0x03, 'b', 'o', 'b', 0x00, 0x00, 0x00, 0x07, 'h', 'u', 'n', 't', 'e', 'r', '2',
     });
@@ -2996,7 +2996,7 @@ TEST_CASE("A member admission carries three fields and a version no version-10 p
     {
         REQUIRE(frame.size() > RequestHeaderSize);
         CHECK(std::to_integer<unsigned>(frame[0]) == 0xFC);
-        CHECK(std::to_integer<unsigned>(frame[1]) == 12);
+        CHECK(std::to_integer<unsigned>(frame[1]) == 13);
 
         // No key is a zero-length THIRD field, never a two-field payload: the arity is exact.
         auto const payload = std::span<std::byte const> { frame }.subspan(RequestHeaderSize);
@@ -3201,7 +3201,7 @@ TEST_CASE("NODE-ANNOUNCE carries a voter's endorsement as its fourth field, empt
         auto const frame = EncodeNodeAnnounce(
             NodeAnnounceRequest { .endpoint = "10.0.0.2:6674", .capacity = {}, .load = {}, .endorsement = carried });
         REQUIRE(frame.size() > RequestHeaderSize);
-        CHECK(std::to_integer<unsigned>(frame[1]) == 12);
+        CHECK(std::to_integer<unsigned>(frame[1]) == 13);
         auto const payload = std::span<std::byte const> { frame }.subspan(RequestHeaderSize);
         REQUIRE(WireFields::SplitExactly(payload, 4).has_value());
 
