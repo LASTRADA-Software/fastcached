@@ -2073,9 +2073,12 @@ jobs:
           }
           Write-Host "::notice::spawn works before ctest"
 
+      # `--output-log` because it is the only place ctest writes WHICH failures were
+      # timeouts: `LastTest.log` records a timeout and a failed assertion alike, as
+      # `Test Failed.`. The reading after a red needs that distinction (#1515).
       - name: "Test"
         if: ${{ needs.changes.outputs.code != 'false' }}
-        run: ctest --preset ${{ matrix.preset }}
+        run: ctest --preset ${{ matrix.preset }} --output-log out/build/${{ matrix.preset }}/ctest-output.log
 
       # The other half of the bracket, and it only runs on a red.
       #
@@ -2084,18 +2087,24 @@ jobs:
       #
       #   * spawning is broken NOW -- the run degraded while ctest was running, and
       #     the failures above say nothing about the tree;
-      #   * spawning works now -- so either the tree is genuinely broken, or the
-      #     runner recovered, and this reading cannot tell which;
+      #   * spawning works now -- which clears the runner of #966's shape and of
+      #     NOTHING else, so this step no longer says what to read the failures as;
       #   * the probe itself could not conclude -- said out loud rather than folded
       #     into either of the above.
       #
-      # It is a reading taken AFTER the fact and says so. Paired with the one before
-      # ctest it still narrows things: both green is a tree finding, before-green
-      # and after-red is the runner, and before-red never reaches here at all.
+      # It used to end the third arm with "read the failures as being about the
+      # tree", and said so over a 170 ms check that had timed out at 60 s on a
+      # runner that could still spawn (#1515): a probe of one capability cannot
+      # clear a runner that degraded in another. The verdict is now the next step's,
+      # which reads the ctest log as well; this one hands it the READING.
+      #
+      # The broken arm keeps its own annotation: on a runner that cannot start a
+      # process, the next step -- which starts bash -- cannot say anything at all.
       #
       # `continue-on-error` because this is a classifier on an already-failing job:
       # it must not be able to change the verdict, only to explain it.
       - name: "Can this runner start a process at all? (after a red)"
+        id: spawn-after-red
         if: ${{ failure() && needs.changes.outputs.code != 'false' }}
         continue-on-error: true
         shell: pwsh
@@ -2104,13 +2113,37 @@ jobs:
           $rc = $null
           try { & cmd /c exit 0; $rc = $LASTEXITCODE } catch { $rc = $null }
           if ($null -eq $rc) {
+            $reading = 'unconcluded'
             Write-Host "::warning::the spawn probe did not conclude; this run is unclassified (#966)"
           } elseif ($rc -ne 0) {
+            $reading = 'broken'
             Write-Host "::error::spawning worked BEFORE ctest and does not now (cmd exited $rc)."
             Write-Host "::error::This runner degraded during the run, so the failures above are about the runner and not the tree (#966)."
           } else {
-            Write-Host "::notice::spawning still works, so this red is not #966's runner-state shape; read the failures as being about the tree."
+            $reading = 'ok'
+            Write-Host "spawning still works after ctest, so this red is not #966's shape; that is all this probe can say"
           }
+          "reading=$reading" >> $env:GITHUB_OUTPUT
+
+      # The verdict, from the spawn reading AND the ctest log (#1515). A timeout
+      # never reaches "read the failures as being about the tree", because a hang in
+      # the tree and a runner that stopped making progress both end in one; and each
+      # way of not being able to read the log is its own unclassified warning, never
+      # a fall-through. `scripts/ci-ctest-red-reading.sh --self-test` drives every
+      # verdict, and both wiring mistakes -- a log path that disagrees with the Test
+      # step's, or a misspelt step id, which substitutes EMPTY -- land on an
+      # unclassified warning rather than on the tree. And a classifier that never
+      # reached a verdict says so here, because `continue-on-error` is exactly what
+      # would otherwise hide it.
+      - name: "Which failures were timeouts? (after a red)"
+        if: ${{ failure() && needs.changes.outputs.code != 'false' }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          bash scripts/ci-ctest-red-reading.sh \
+            --log "out/build/${{ matrix.preset }}/ctest-output.log" \
+            --spawn "${{ steps.spawn-after-red.outputs.reading }}" \
+            || echo "::warning::the timeout classifier did not reach a verdict (exit $?); this red is unclassified (#1515)"
 
       - name: "Upload fastcached.exe"
         if: ${{ needs.changes.outputs.code != 'false' }}
