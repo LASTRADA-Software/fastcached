@@ -15,6 +15,14 @@
 #   upstreamStale      a new tui test counted as upstream's                   refuses
 #   phraseReworded     a figure sentence rephrased so nothing matches         refuses: nothing compared
 #   emptyTree          no vendored files at all                              refuses
+#   secondRootCounted  a second root, with a true row in The copies          accepts, counting both
+#   secondRootMissing  a second root with no row                            refuses: nothing compared
+#   secondRootStale    a second root whose row states the wrong lines       refuses, naming the lines
+#   rowNamesNoRoot     a row for a directory the roots file does not name    refuses
+#
+# The last four are the per-root table (#178), and each was run against a mutant of the check:
+# walking the first root only fails secondRootCounted, secondRootMissing and secondRootStale, and
+# dropping the refusal of a row naming no root fails rowNamesNoRoot.
 #
 # Usage:
 #   cmake -DFASTCACHED_SOURCE_DIR=<dir> -DFASTCACHED_SCRATCH_DIR=<dir> \
@@ -41,9 +49,11 @@ set(mismatches "")
 # The tree every case starts from: 2 upstream tui files (3 lines), 1 new tui test (2 lines),
 # 2 supporting headers (1 line each) and 1 supporting implementation (4 lines).
 # Copy: 6 files, 11 lines. Supporting: 3 files, 6 lines, 2 headers, 1 implementation.
+# The roots file names `vendor/endo` alone.
 function(fastcached_tree name out)
     set(root "${FASTCACHED_SCRATCH_DIR}/${name}")
     file(REMOVE_RECURSE "${root}")
+    file(WRITE "${root}/scripts/lib/third-party-roots.txt" "vendor/endo\n")
     file(WRITE "${root}/vendor/endo/tui/A.cpp" "a\nb\n")
     file(WRITE "${root}/vendor/endo/tui/A.hpp" "a\n")
     file(WRITE "${root}/vendor/endo/tui/A_test.cpp" "t\nu\n")
@@ -64,7 +74,9 @@ function(fastcached_document root copyFiles copyLines supporting supportingLines
         "1 local changes' new test files (\"Local changes\") the copy is **${copyFiles} files, ${copyLines} lines**.\n\n"
         "It is ${supporting} files and ${supportingLines} lines: ${headers} headers, plus **${implementations}\n"
         "implementation files** -- and so on.\n\n"
-        "**${headerOnly} of the ${supporting} are header-only, and that is all.**\n")
+        "**${headerOnly} of the ${supporting} are header-only, and that is all.**\n\n"
+        "## The copies\n\n| root | upstream | files | lines |\n|---|---|---|---|\n"
+        "| `vendor/endo` | endo | ${copyFiles} | ${copyLines} |\n")
 endfunction()
 
 function(fastcached_judge name root refuses expected)
@@ -100,7 +112,7 @@ endfunction()
 
 fastcached_tree(clean root)
 fastcached_document("${root}" 6 11 3 6 2 1 2 2)
-fastcached_judge(clean "${root}" OFF "12 figure(s) in vendor/VENDOR.md match the tree")
+fastcached_judge(clean "${root}" OFF "14 figure(s) in vendor/VENDOR.md match the tree")
 
 fastcached_tree(wrappedAndGrouped root)
 # Built in memory and written once: an append per line is an open per line, and on DrvFs under a
@@ -112,7 +124,8 @@ file(WRITE "${root}/vendor/VENDOR.md"
     "`src/tui` upstream is 3 files and ~1k lines; with the 3\nsupporting files below and\n"
     "1 local changes' new test files (\"Local changes\") the copy is **7 files,\n1,211 lines**.\n"
     "It is 3 files and 6 lines: 2 headers, plus **1 implementation files**.\n"
-    "**2 of the 3 are header-only**\n")
+    "**2 of the 3 are header-only**\n"
+    "| root | upstream | files | lines |\n|---|---|---|---|\n| `vendor/endo` | endo | 7 | 1,211 |\n")
 fastcached_judge(wrappedAndGrouped "${root}" OFF "match the tree")
 
 fastcached_tree(copyTestUncounted root)
@@ -130,7 +143,8 @@ file(WRITE "${root}/vendor/VENDOR.md"
     "`src/tui` upstream is 2 files and ~0k lines; with the 3 supporting files below and "
     "1 local changes' new test files (\"Local changes\") the copy is **6 files, 11 lines**.\n"
     "It is 3 files and 6 lines: 2 headers, plus **1 implementation files**.\n"
-    "**3 of the 3 are header-only**\n")
+    "**3 of the 3 are header-only**\n"
+    "| `vendor/endo` | endo | 6 | 11 |\n")
 fastcached_judge(headerCountStale "${root}" ON "supporting headers = 3, the tree holds 2")
 
 fastcached_tree(upstreamStale root)
@@ -142,14 +156,47 @@ file(WRITE "${root}/vendor/VENDOR.md"
     "`src/tui` upstream is 2 files and ~0k lines; with the 3 supporting files below and "
     "1 local changes' new test files (\"Local changes\") the copy is **6 files, 11 lines**.\n"
     "The supporting set is 3 files and 6 lines: 2 headers, plus **1 implementation files**.\n"
-    "**2 of the 3 are header-only**\n")
+    "**2 of the 3 are header-only**\n"
+    "| `vendor/endo` | endo | 6 | 11 |\n")
 fastcached_judge(phraseReworded "${root}" ON "could not find the supporting files phrase")
 
 set(root "${FASTCACHED_SCRATCH_DIR}/emptyTree")
 file(REMOVE_RECURSE "${root}")
+file(WRITE "${root}/scripts/lib/third-party-roots.txt" "vendor/endo\n")
 file(WRITE "${root}/vendor/MANIFEST" "# header\n")
 fastcached_document("${root}" 0 0 0 0 0 0 0 0)
 fastcached_judge(emptyTree "${root}" ON "found no files under")
+
+# A second root (#178): `vendor/second` holds 2 files, 3 lines, and is named by the roots file.
+#
+# @param root A tree from fastcached_tree.
+function(fastcached_second_root root)
+    file(WRITE "${root}/scripts/lib/third-party-roots.txt" "vendor/endo\nvendor/second\n")
+    file(WRITE "${root}/vendor/second/s.c" "s\nt\n")
+    file(WRITE "${root}/vendor/second/LICENCE" "l\n")
+endfunction()
+
+fastcached_tree(secondRootCounted root)
+fastcached_second_root("${root}")
+fastcached_document("${root}" 6 11 3 6 2 1 2 2)
+file(APPEND "${root}/vendor/VENDOR.md" "| `vendor/second` | second | 2 | 3 |\n")
+fastcached_judge(secondRootCounted "${root}" OFF "16 figure(s) in vendor/VENDOR.md match the tree")
+
+fastcached_tree(secondRootMissing root)
+fastcached_second_root("${root}")
+fastcached_document("${root}" 6 11 3 6 2 1 2 2)
+fastcached_judge(secondRootMissing "${root}" ON "could not find the `vendor/second` row of The copies phrase")
+
+fastcached_tree(secondRootStale root)
+fastcached_second_root("${root}")
+fastcached_document("${root}" 6 11 3 6 2 1 2 2)
+file(APPEND "${root}/vendor/VENDOR.md" "| `vendor/second` | second | 2 | 2 |\n")
+fastcached_judge(secondRootStale "${root}" ON "vendor/second lines = 2, the tree holds 3")
+
+fastcached_tree(rowNamesNoRoot root)
+fastcached_document("${root}" 6 11 3 6 2 1 2 2)
+file(APPEND "${root}/vendor/VENDOR.md" "| `vendor/gone` | gone | 2 | 3 |\n")
+fastcached_judge(rowNamesNoRoot "${root}" ON "The copies names `vendor/gone`, which scripts/lib/third-party-roots.txt does not")
 
 if(NOT mismatches STREQUAL "")
     message(FATAL_ERROR "vendor-figures-selftest: ${ran} case(s) ran, and these did not judge as they must:${mismatches}")
