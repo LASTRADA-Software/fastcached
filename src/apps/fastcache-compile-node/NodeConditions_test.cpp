@@ -319,8 +319,6 @@ TEST_CASE("Every condition row is evaluated on a fully configured node", "[node]
     clusteredNode.nodeId = "n1";
     clusteredNode.raftListen = std::format("127.0.0.1:{}", raftPort);
     clusteredNode.raftPeers = { Unwrap(Cluster::ParseMemberSpec(std::format("n1=127.0.0.1:{}", raftPort))) };
-    clusteredNode.clusterKeyFile = consensusState / "cluster.key";
-    WriteClusterKey(clusteredNode.clusterKeyFile);
     clusteredNode.clusterDir = consensusState / "state";
     auto const consensus = ConsensusTier::Start(
         clusteredNode,
@@ -328,6 +326,8 @@ TEST_CASE("Every condition row is evaluated on a fully configured node", "[node]
         FastCache::Testing::TestKeyPair("n1"),
         [](Distributed::SchedulerRole, std::string_view, std::uint64_t) {},
         [](Cluster::ClusterState const&) {},
+        DefaultSystemWallClock(),
+        {},
         metrics,
         logger,
         &conditions);
