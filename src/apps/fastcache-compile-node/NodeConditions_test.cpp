@@ -31,6 +31,7 @@
 #include <string_view>
 #include <vector>
 
+#include <tests/RaftPeerKeyFakes.hpp>
 #include <tests/ScratchPath.hpp>
 #include <tests/SkewedMetricsSink.hpp>
 #include <tests/Unwrap.hpp>
@@ -332,6 +333,7 @@ TEST_CASE("Every condition row is evaluated on a fully configured node", "[node]
     auto const consensus = ConsensusTier::Start(
         clusteredNode,
         {},
+        FastCache::Testing::TestKeyPair("n1"),
         [](Distributed::SchedulerRole, std::string_view, std::uint64_t) {},
         [](Cluster::ClusterState const&) {},
         metrics,
