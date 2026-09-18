@@ -1190,24 +1190,38 @@ TEST_CASE("cluster-admit sends the key it was given and reports the key the lead
     // #178. Both halves: what went out, read back off the frame, and what came back. A
     // handler that always sent a key, or never did, passes one of the two sections -- and
     // so does a renderer that always printed one.
-    constexpr std::string_view KeyText = "KKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKK";
+    auto key = Ed25519PublicKey {};
+    key.fill(std::byte { 0x6E });
+    auto const keyText = FormatEd25519PublicKey(key);
 
     SECTION("a key operand travels, and the recorded key is printed")
     {
-        auto const receipt = Cc::EncodeClusterAdmitReceipt(Cc::ClusterAdmitReceipt {
-            .memberId = "node-c", .raftEndpoint = "10.0.0.9:6675", .publicKey = std::string { KeyText } });
+        auto const receipt = Cc::EncodeClusterAdmitReceipt(
+            Cc::ClusterAdmitReceipt { .memberId = "node-c", .raftEndpoint = "10.0.0.9:6675", .publicKey = keyText });
         ScriptedNodeExchange node { { Cc::EncodeReply(Cc::Status::Ok, receipt) } };
 
-        auto const answer = RunNodeVerb("cluster-admit", node, { "node-c", "10.0.0.9:6675", std::string { KeyText } });
+        auto const answer = RunNodeVerb("cluster-admit", node, { "node-c", "10.0.0.9:6675", keyText });
         REQUIRE(answer.outcome == Outcome::Affirmative);
-        CHECK(RequiredCell(answer, "public-key-as-recorded").lexical == KeyText);
+        CHECK(RequiredCell(answer, "public-key-as-recorded").lexical == keyText);
 
         REQUIRE(node.Sent().size() == 1);
         auto const sent = std::span<std::byte const> { node.Sent().front() }.subspan(Cc::RequestHeaderSize);
         auto const view = Cc::DecodeClusterAdmitPayload<Cc::Op::ClusterAdmit>(sent);
         REQUIRE(view.has_value());
         REQUIRE(Unwrap(view).publicKey.has_value());
-        CHECK(Cc::AsStringView(Unwrap(Unwrap(view).publicKey)) == KeyText);
+        CHECK(Cc::AsStringView(Unwrap(Unwrap(view).publicKey)) == keyText);
+    }
+
+    SECTION("a key operand that is not a key is refused here, and nothing is sent")
+    {
+        // Read through the one parser before anything is sent, so the operator who mistyped
+        // it is told in front of the command -- the leader's counted refusal is for a client
+        // that does not check, and this one does.
+        ScriptedNodeExchange node { {} };
+        auto const answer = RunNodeVerb("cluster-admit", node, { "node-c", "10.0.0.9:6675", keyText.substr(1) });
+        CHECK(answer.outcome == Outcome::Usage);
+        CHECK(AdvisoryText(answer).contains("is not a public key"));
+        CHECK(node.Sent().empty());
     }
 
     SECTION("no key operand sends none, and the receipt's none is said as what it means")
