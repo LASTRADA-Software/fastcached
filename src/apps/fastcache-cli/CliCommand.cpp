@@ -381,7 +381,8 @@ namespace
         "machine that is joining, since it writes that machine's identity and the key\n"
         "it is handed. --print-surfaces lists the ports a node's configuration would\n"
         "open, and dials nothing. The cluster-* commands above send the requests its\n"
-        "--cluster-status, --cluster-set, --cluster-admit and --cluster-forget send.",
+        "--cluster-status, --cluster-set, --cluster-admit, --cluster-admit-learner and\n"
+        "--cluster-forget send.",
     });
 
     /// The verb's invocation form, for the left column of the COMMANDS block.

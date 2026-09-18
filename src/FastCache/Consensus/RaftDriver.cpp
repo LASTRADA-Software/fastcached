@@ -197,25 +197,25 @@ std::expected<LogIndex, ConsensusError> RaftDriver::Propose(std::vector<std::byt
     return Land(_node.Propose(std::move(payload), now));
 }
 
-std::expected<LogIndex, ConsensusError> RaftDriver::ProposeMembership(std::vector<NodeId> members, TimePoint now)
+std::expected<LogIndex, ConsensusError> RaftDriver::ProposeMembership(Configuration configuration, TimePoint now)
 {
     auto const guard = std::scoped_lock { _mutex };
     if (_failure.has_value())
         return std::unexpected { *_failure };
 
-    return Land(_node.ProposeMembership(std::move(members), now));
+    return Land(_node.ProposeMembership(std::move(configuration), now));
 }
 
 RaftDriver::Progress RaftDriver::CurrentProgress() const
 {
     auto const guard = std::scoped_lock { _mutex };
-    return Progress { .members = _node.ActiveMembers(),
+    return Progress { .configuration = _node.ActiveConfiguration(),
                       .commitIndex = _node.CommitIndex(),
                       .term = _node.CurrentTerm(),
                       .role = _node.CurrentRole(),
-                      // Copied out rather than referenced, like `members`: the timer
-                      // loop and every peer reader move this, and the lock ends with
-                      // this statement.
+                      // Copied out rather than referenced, like `configuration`: the
+                      // timer loop and every peer reader move this, and the lock ends
+                      // with this statement.
                       .knownLeader = _node.KnownLeader() };
 }
 

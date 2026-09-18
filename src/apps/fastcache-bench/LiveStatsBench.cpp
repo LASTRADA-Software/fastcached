@@ -122,11 +122,12 @@ constexpr std::array Regimes {
                                    .diskFreeBytes = 442'381'631'488,
                                    .busySlots = 7 };
     snapshot.upstreamConfigured = true;
-    snapshot.consensus = ConsensusStatus { .members = { "build-01", "build-02", "build-03" },
-                                           .knownLeader = Consensus::NodeId { "build-01" },
-                                           .term = Consensus::Term { .value = 41 },
-                                           .commitIndex = Consensus::LogIndex { .value = 918'273 },
-                                           .role = Consensus::Role::Follower };
+    snapshot.consensus =
+        ConsensusStatus { .configuration = { .voters = { "build-01", "build-02", "build-03" }, .learners = { "laptop-01" } },
+                          .knownLeader = Consensus::NodeId { "build-01" },
+                          .term = Consensus::Term { .value = 41 },
+                          .commitIndex = Consensus::LogIndex { .value = 918'273 },
+                          .role = Consensus::Role::Follower };
     return snapshot;
 }
 

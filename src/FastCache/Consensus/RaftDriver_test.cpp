@@ -174,7 +174,8 @@ class FailingStorage final: public IRaftStorage
 [[nodiscard]] RaftConfig SoloConfig()
 {
     return RaftConfig { .self = "solo",
-                        .members = { "solo" },
+                        .voters = { "solo" },
+                        .learners = {},
                         .electionTimeoutMin = 150ms,
                         .electionTimeoutMax = 300ms,
                         .heartbeatInterval = 50ms };
@@ -183,7 +184,8 @@ class FailingStorage final: public IRaftStorage
 [[nodiscard]] RaftConfig TrioConfig()
 {
     return RaftConfig { .self = "n1",
-                        .members = { "n1", "n2", "n3" },
+                        .voters = { "n1", "n2", "n3" },
+                        .learners = {},
                         .electionTimeoutMin = 150ms,
                         .electionTimeoutMax = 300ms,
                         .heartbeatInterval = 50ms };
@@ -767,7 +769,7 @@ TEST_CASE("CurrentProgress reports the role and the leader, under the same lock"
     // a commit index say nothing about whether this node is campaigning or who it
     // follows.
     //
-    // The alternative is `Node().CurrentRole()` beside `Node().ActiveMembers()`, and
+    // The alternative is `Node().CurrentRole()` beside `Node().ActiveConfiguration()`, and
     // `Node()` says in as many words that it is not synchronized. That is four reads
     // of a state machine the timer loop and every peer reader are free to move, and
     // the moment they disagree is an election -- which is exactly when somebody is
@@ -789,7 +791,7 @@ TEST_CASE("CurrentProgress reports the role and the leader, under the same lock"
     CHECK(quiet.role == Role::Follower);
     CHECK_FALSE(quiet.knownLeader.has_value());
     CHECK(quiet.term == Term { .value = 0 });
-    CHECK(quiet.members == std::vector<NodeId> { "n1", "n2", "n3" });
+    CHECK(quiet.configuration == Configuration { .voters = { "n1", "n2", "n3" }, .learners = {} });
 
     // Campaigning: a role that moved without a leader appearing, which is the
     // reading that separates a node standing for election from one quietly

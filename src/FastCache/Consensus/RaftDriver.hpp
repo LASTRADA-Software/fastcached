@@ -188,17 +188,17 @@ class RaftDriver
     /// @return Where it landed, or why it was refused.
     [[nodiscard]] std::expected<LogIndex, ConsensusError> Propose(std::vector<std::byte> payload, TimePoint now);
 
-    /// Offer the cluster a new member set, one member added or removed.
+    /// Offer the cluster a new configuration, one member moved.
     ///
     /// `RaftNode::ProposeMembership` reached through the same lock and the same
     /// output ordering as `Propose`, and it needs its own entry point rather than
     /// a caller doing it: a configuration change is a durability write followed by
     /// a broadcast, so its output has to be delivered in order by whoever owns
     /// that order.
-    /// @param members The proposed member set.
+    /// @param configuration The proposed configuration, voters and learners.
     /// @param now The current instant.
     /// @return Where the entry landed, or why it was refused.
-    [[nodiscard]] std::expected<LogIndex, ConsensusError> ProposeMembership(std::vector<NodeId> members, TimePoint now);
+    [[nodiscard]] std::expected<LogIndex, ConsensusError> ProposeMembership(Configuration configuration, TimePoint now);
 
     /// What consensus counts, how far it has agreed, and what this node is playing.
     ///
@@ -215,12 +215,12 @@ class RaftDriver
     /// ([#435](https://github.com/LASTRADA-Software/fastcached/issues/435)).
     /// `RaftDriver::Node()` says in as many words that it is not synchronized, so a
     /// caller assembling this picture from `Node().CurrentRole()` and
-    /// `Node().ActiveMembers()` would be reading two moments and reporting them as
+    /// `Node().ActiveConfiguration()` would be reading two moments and reporting them as
     /// one — and the moment that matters is an election, which is exactly when the
     /// two disagree.
     struct Progress
     {
-        std::vector<NodeId> members; ///< The member set this node operates under.
+        Configuration configuration; ///< The voters and learners this node operates under.
         LogIndex commitIndex;        ///< How far its log is committed.
 
         /// The term it is operating in.

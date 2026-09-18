@@ -55,6 +55,18 @@ namespace FastCache::Consensus
 /// above would recover entry 8 as entry 1 — every index in the store off by the
 /// length of the discarded prefix, silently.
 ///
+/// ## Which build wrote it
+///
+/// Every file says which FORMAT it is in: the state and snapshot headers carry a
+/// version, and since format 2 (#1449, a configuration of voters and learners) so
+/// does every log record. A store another build wrote is refused as
+/// `UnsupportedFormatVersion`, judged from the header before the CRC -- never as
+/// `StorageFailure`, which is the damage code, and damage is what gets a healthy store
+/// deleted. The log is judged by its FIRST record: format 1's records carried no
+/// version, so a later record that reads as foreign is a torn tail, and only a log
+/// that STARTS foreign was written by another build. There is no conversion; the
+/// refusal names what to do (`docs/operations/upgrading-a-fleet.md`).
+///
 /// The residual, recorded deliberately: `fsync` on the file does not make the
 /// *directory entry* durable on POSIX, so a crash immediately after the rename
 /// can in principle leave the old name pointing at the old inode. Closing that

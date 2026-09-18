@@ -162,7 +162,7 @@ namespace StatsReadingWire
     /// Not member pointers, because the members are not all one width. Their COUNT is held to
     /// the struct by structured bindings in the encoder, which stop compiling the moment a field
     /// is added; their ORDER is the encoder's statement order, which sits beside this list.
-    inline constexpr std::array ConsensusFieldNames { std::string_view { "members" },
+    inline constexpr std::array ConsensusFieldNames { std::string_view { "configuration" },
                                                       std::string_view { "knownLeader" },
                                                       std::string_view { "term" },
                                                       std::string_view { "commitIndex" },
@@ -184,7 +184,9 @@ namespace StatsReadingWire
     /// The grammar's own name, folded in first so a change to the grammar ABOVE with no table
     /// change still moves the digest. Bump the suffix whenever the encoder's statements change
     /// shape without a table changing.
-    inline constexpr std::string_view Grammar = "stats-reading-grammar-4";
+    ///
+    /// 5: the consensus block's one member list became two, voters then learners (#1449).
+    inline constexpr std::string_view Grammar = "stats-reading-grammar-5";
 
     /// 64-bit FNV-1a over @p text, continuing from @p hash.
     /// @param hash The running digest.
