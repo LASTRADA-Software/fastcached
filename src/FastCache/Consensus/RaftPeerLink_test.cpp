@@ -277,11 +277,9 @@ TEST_CASE("A key revoked mid-session closes that session, and the redial is refu
         CHECK(link.sink.received.size() == 1);
         CHECK(link.Refused(AcceptorRefusal::KeyWithdrawn) == 1);
 
-        // Over TCP the dialler learns that from its next write, which the peer's reset fails;
-        // the in-memory socket accepts writes nobody reads, so the fixture makes the redial
-        // happen the way a moved address would rather than waiting for a reset that never comes.
-        REQUIRE(link.transport->Learn(PeerEndpoint { .id = "n1", .host = "in-memory", .port = 2 })
-                == PeerChange::Readdressed);
+        // The acceptor closed having read everything, so the first write after it is accepted
+        // and lost -- it draws the reset -- and the one after it fails and ends the session.
+        link.SendVote(3);
         link.SendVote(3);
         link.clock.Advance(ReconnectBackoff);
         link.reactor.Drain();
