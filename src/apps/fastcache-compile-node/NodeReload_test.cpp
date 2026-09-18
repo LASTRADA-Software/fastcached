@@ -161,7 +161,7 @@ TEST_CASE("A member added to the file is admitted after the reload", "[node][mem
     // and fails the case above. Neither case alone says the list was replaced.
     //
     // It starts from a node that ALREADY admits a remote peer, and that is not
-    // incidental: a keyless node going from admitting nobody to admitting somebody is
+    // incidental: a rosterless node going from admitting nobody to admitting somebody is
     // refused by the guard two cases down, so a fixture that widened from nothing
     // would fail here for a reason this case is not about. Adding a SECOND host to a
     // policy that already reaches the network changes nothing about what this node can
@@ -215,7 +215,7 @@ TEST_CASE("Dropping fleet_open closes the node again", "[node][membership][reloa
 TEST_CASE("A reload may not widen admission on a node that cannot check a lease", "[node][membership][reload][revocation]")
 {
     // **The hole this ticket would otherwise open, which is #282 arriving through a
-    // new door.** A keyless worker is legitimate for one shape of node: one no other
+    // new door.** A worker with no roster is legitimate for one shape of node: one no other
     // machine can dial. `StartupPolicyRejection` decides that from the listen flags,
     // which describe nothing under socket activation, and `MakeWorkerLeaseValidator`
     // is the backstop for that -- and it runs once, at startup, against the
@@ -228,7 +228,7 @@ TEST_CASE("A reload may not widen admission on a node that cannot check a lease"
     auto const path = WriteConfig(scratch.Path(), std::format("fleet_member: {}\n", Revoked));
 
     auto const initial = RunningNode();
-    REQUIRE(initial.clusterKeyFile.empty());
+    REQUIRE(initial.voterKeys.empty()); // no roster root (#178)
     NodeMembership membership { initial, membershipLog };
     // Bound ONCE, as a surface does at startup.
     auto const& oracle = membership.Oracle();
@@ -240,8 +240,8 @@ TEST_CASE("A reload may not widen admission on a node that cannot check a lease"
     ApplyReloadRequest(&reloader, membership, logger);
 
     CHECK_FALSE(Admits(oracle, Revoked));
-    // **WHICH refusal, not that one happened.** The startup table's cluster-key row and
-    // this guard both name `--cluster-key-file`, so matching that string alone passes
+    // **WHICH refusal, not that one happened.** The startup table's lease row and this
+    // guard both name `--voter-key` (#178), so matching that string alone passes
     // for either -- and on a loopback-bound node the startup row does not fire, which is
     // exactly the gap this rule exists to cover. `may not widen` is this rule's own
     // words; the case below asserts the other side of the same distinction.
@@ -262,7 +262,7 @@ TEST_CASE("A node running no worker may widen admission without a key", "[node][
 
     NodeConfig initial;
     initial.slots = 0;
-    REQUIRE(initial.clusterKeyFile.empty());
+    REQUIRE(initial.voterKeys.empty()); // no roster root (#178)
     REQUIRE_FALSE(RunsWorker(initial));
 
     auto const candidate = Reparse(path);
@@ -315,7 +315,7 @@ TEST_CASE("Narrowing is allowed on a keyless node, which is the direction that c
           "[node][membership][reload][revocation]")
 {
     // The control for the case above, and the reason it asks about a WIDENING rather
-    // than about a state. A keyless worker that already admits remote peers passed its
+    // than about a state. A rosterless worker that already admits remote peers passed its
     // own startup rules and is running today; refusing its reloads would refuse the
     // one edit that makes it safer, which is a guard that punishes the remedy.
     Testing::ScratchDirectory const scratch { "node-reload-keyless-narrow" };
@@ -425,12 +425,12 @@ TEST_CASE("A node that binds its own network-facing port is closed by the STARTU
     // `--listen-node` keeps whatever was typed. The obvious worry is that a node which
     // binds its own network-facing port is exposed too, and it is NOT: `StartupPolicyRejection`
     // is re-run on the candidate by `ValidateNodeReloadable`, `CompilePortFacesTheNetwork`
-    // tells the truth for a self-binding node, and the pre-existing cluster-key row
-    // refuses the widening before the backstop is ever consulted.
+    // tells the truth for a self-binding node, and the pre-existing lease row refuses
+    // the widening before the backstop is ever consulted.
     //
     // So this case is what makes "socket activation is a necessary condition" a measured
     // claim instead of a reading, and it is asserted on WHICH rule answered -- both
-    // messages name `--cluster-key-file`, so matching that alone cannot tell them apart.
+    // messages name `--voter-key` (#178), so matching that alone cannot tell them apart.
     // It also guards a dependency across lanes: the severity stated in #405's commit
     // body is only true while that startup row keeps catching this, so a change to it
     // fails here rather than silently widening what this ticket left open.
@@ -448,7 +448,7 @@ TEST_CASE("A node that binds its own network-facing port is closed by the STARTU
     auto initial = RunningNode();
     initial.nodeListen = "0.0.0.0:6674";
     initial.advertise = "worker-01.internal:6674";
-    REQUIRE(initial.clusterKeyFile.empty());
+    REQUIRE(initial.voterKeys.empty()); // no roster root (#178)
 
     auto const candidate = Reparse(path);
     REQUIRE(candidate.has_value());
@@ -466,6 +466,6 @@ TEST_CASE("A node that binds its own network-facing port is closed by the STARTU
     REQUIRE_FALSE(outcome.has_value());
     // The STARTUP row's own words, and NOT the reload guard's, which says "may not
     // widen". Which one answers is the whole finding.
-    CHECK(outcome.error().context.contains("needs --cluster-key-file"));
+    CHECK(outcome.error().context.contains(RosterlessWorkerRefusal));
     CHECK_FALSE(outcome.error().context.contains("may not widen"));
 }

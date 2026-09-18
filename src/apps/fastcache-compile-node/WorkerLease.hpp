@@ -5,6 +5,7 @@
 
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Logger.hpp>
+#include <FastCache/Distributed/LeaseToken.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 
 #include <cstdint>
@@ -29,9 +30,9 @@ enum class SocketActivation : std::uint8_t
 
 /// Build the lease check this node's compile port applies, from its configuration.
 ///
-/// **The node's trust decision, in one function.** It reads the cluster key, chooses
-/// between the two validators `Cc::WorkerProtocol` accepts, and says which one it
-/// chose.
+/// **The node's trust decision, in one function.** It chooses between the two validators
+/// `Cc::WorkerProtocol` accepts, from whether this node holds a roster to verify a grant
+/// against (#178), and says which one it chose.
 ///
 /// A file of its own rather than a corner of `WorkerServer`, which is the idiom this
 /// directory already follows -- `ScratchClaim`, `NodeToolchains` and `NodeMembership`
@@ -45,16 +46,19 @@ enum class SocketActivation : std::uint8_t
 /// translation unit no test can reach. That is exactly where an accept-all lambda
 /// survived a fully passing suite (#282).
 ///
-/// An absent `--cluster-key-file` yields `Cc::UncheckedLeaseValidator()` and a
-/// warning, and is legitimate for exactly one shape of node: one no other machine
-/// can dial. `StartupPolicyRejection` refuses every other shape before this runs, so
-/// the choice is made once, in front of the operator, rather than per request where
-/// an open port and a zeroed counter look like a healthy fleet.
+/// No roster yields `Cc::UncheckedLeaseValidator()` and a warning, and is legitimate for
+/// exactly one shape of node: one no other machine can dial. `StartupPolicyRejection` and
+/// `NodeRoster::Build` refuse every other shape before this runs, so the choice is made once,
+/// in front of the operator, rather than per request where an open port and a zeroed counter
+/// look like a healthy fleet.
 ///
-/// A key file that cannot be READ is an error, never a quiet fall back to checking
-/// nothing -- a node told to verify and unable to must not serve.
+/// Since #178 a grant is signed by the voter that issued it, with its own identity key, and
+/// verified against the roster: the state a consensus member applies, or the roster a strict
+/// majority of the voters certified on any other node. The cluster key signs no lease.
 ///
-/// @param cfg What this node was told to be; `clusterKeyFile` is the field read.
+/// @param cfg What this node was told to be.
+/// @param roster What a grant is verified against, or null when this node holds none. Borrowed
+///        by the validator, so it must outlive it.
 /// @param activation Whether the listener was inherited. **Load-bearing, and the
 ///        reason this refuses rather than only warning.** `StartupPolicyRejection`
 ///        decides reachability from `--bind`, which is the right answer for a node
@@ -84,9 +88,10 @@ enum class SocketActivation : std::uint8_t
 ///        for its caller to hold a different set of objects.
 /// @param metrics Where an adopted term reset is counted.
 /// @param logger Where the chosen mode is announced.
-/// @return The validator, or why the key file cannot serve as one.
+/// @return The validator, or why this node must not serve.
 [[nodiscard]] std::expected<Cc::LeaseValidator, std::string> MakeWorkerLeaseValidator(
     NodeConfig const& cfg,
+    Distributed::ILeaseRoster const* roster,
     Cc::IAdvertisedEndpointSource const& advertise,
     SocketActivation activation,
     WallClockRef clock,

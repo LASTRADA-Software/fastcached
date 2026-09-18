@@ -80,9 +80,6 @@ enum class SigningDomain : std::uint8_t
     /// The LAN handshake's proof of key possession. See `Cluster/DiscoveryWire`.
     DiscoveryProof = 0,
 
-    /// The scheduler's signed grant. See `Distributed/LeaseToken`.
-    LeaseToken,
-
     /// A caller's proof, on the `0xFC` surface, that it holds the cluster key. See
     /// `Distributed/NodeProof`.
     ///
@@ -98,6 +95,10 @@ enum class SigningDomain : std::uint8_t
     /// retired, never reused: a new row spelled `fastcache-raft-dial-v1`,
     /// `fastcache-raft-verdict-v1` or `fastcache-raft-frame-v1` would accept every tag an older
     /// build ever minted under it.
+    ///
+    /// The lease had a row here too, until #178 signed a grant with the issuing voter's OWN
+    /// key (`Distributed/LeaseToken`), so a worker can tell which member issued it and refuse
+    /// one whose key the cluster revoked. `fastcache-lease-v1` is retired on the same terms.
     NodeProof,
 
     Last, ///< Not a domain, and has no row: the length of a table keyed by one.
@@ -119,16 +120,13 @@ struct SigningDomainDescriptor
 /// retires every outstanding tag in that domain -- which is a deliberate, stated
 /// act rather than something to discover.
 ///
-/// `fastcache-lease-v1` is the label the lease token already carried, spelled
-/// identically, so moving that call site onto this seam changes no byte a lease
-/// authenticates. `fastcache-discovery-v1` is new: the discovery proof had no
-/// label at all, so its message -- and therefore every proof tag -- changes.
+/// `fastcache-discovery-v1` is new: the discovery proof had no label at all, so its
+/// message -- and therefore every proof tag -- changes.
 ///
 /// `fastcache-node-proof-v1` is the `0xFC` surface's (#1428): before it a caller there
 /// proved nothing, so there is no earlier tag for it to stay compatible with.
 inline constexpr EnumTable<SigningDomain, SigningDomainDescriptor> SigningDomainTable { {
     { .domain = SigningDomain::DiscoveryProof, .label = "fastcache-discovery-v1" },
-    { .domain = SigningDomain::LeaseToken, .label = "fastcache-lease-v1" },
     { .domain = SigningDomain::NodeProof, .label = "fastcache-node-proof-v1" },
 } };
 

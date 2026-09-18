@@ -36,6 +36,7 @@
 #include "NodePresenceTier.hpp"
 #include "NodeProofResponder.hpp"
 #include "NodeReload.hpp"
+#include "NodeRoster.hpp"
 #include "NodeStatusResponder.hpp"
 #include "NodeSurfaces.hpp"
 #include "NodeToolchains.hpp"
@@ -615,6 +616,24 @@ using Node::NodeReloader;
     // `RunsConsensus`, the one predicate every consensus-dependent site asks.
     Node::NodeMembership membership { cfg, logger, AddressWhen(Node::RunsConsensus(cfg), conditions) };
 
+    // **The roster every lease grant is verified against** (#178), built before anything that
+    // reads it: the worker's validator borrows it, consensus feeds it every applied state and
+    // every endorsement this node signs, and the presence loop carries the endorsement out and
+    // the certified roster back. A WALL clock, because a certificate's lapse was stamped on
+    // another machine.
+    //
+    // Refusing here is the half of `RosterlessWorkerRefusal` only the state directory can
+    // answer, and a kept roster this build cannot use -- never a quiet fall back to the
+    // `--voter-key` anchors, which may name a voter revoked since.
+    SystemWallClock const rosterWallClock;
+    auto rosterOrRefusal = Node::NodeRoster::Build(cfg, rosterWallClock, metrics, logger);
+    if (!rosterOrRefusal.has_value())
+    {
+        logger.Logf(LogLevel::Error, "{}; refusing to start", rosterOrRefusal.error());
+        return ExitUsage;
+    }
+    auto const nodeRoster = std::move(*rosterOrRefusal);
+
     // The worker server and the admin endpoint are both built BELOW the cache tier,
     // and in both cases moving them down was the fix rather than tidying: one takes
     // a slot count that is not knowable until the tier has been built or not been
@@ -663,7 +682,7 @@ using Node::NodeReloader;
     if (cfg.serveScheduler)
     {
         auto started = Node::SchedulerTier::Start(
-            cfg, membership.Oracle(), schedulerClock, schedulerWallClock, metrics, logger, conditions);
+            cfg, membership.Oracle(), schedulerClock, schedulerWallClock, metrics, logger, identityKey);
         if (!started.has_value())
         {
             // Fatal for the same reason the admin endpoint's is: an operator who asked
@@ -785,6 +804,7 @@ using Node::NodeReloader;
                                                         .cacheTier = cacheTier.get(),
                                                         .credential = credential,
                                                         .proofKey = proofKey,
+                                                        .leaseRoster = nodeRoster->Lease(),
                                                         .metrics = metrics,
                                                         .logger = logger,
                                                         .conditions = conditions },
@@ -934,7 +954,10 @@ using Node::NodeReloader;
                                    // Every node has conditions, so this is never null here: a node
                                    // with nothing raised reports every row `clear` or
                                    // `not-evaluated`, never an empty list (#1364).
-                                   .conditions = &conditions },
+                                   .conditions = &conditions,
+                                   // Every node has one; one that holds no roster reports the
+                                   // field ABSENT through it (#178).
+                                   .roster = nodeRoster.get() },
     };
 
     // The operator verbs. Declared BEFORE the surface that routes to it and therefore
@@ -1091,10 +1114,10 @@ using Node::NodeReloader;
     if (servesEnrollment)
         enrollmentWatch.emplace([&](std::stop_token const& stop) { WarnWhileWindowIsOpen(enrollmentWindow, logger, stop); });
 
-    // Consensus, when the operator configured a cluster. It is what turns the
-    // scheduler tier's standalone leadership into a real one: without it, every node
-    // in a fleet believes it schedules, and two nodes handing out the same machine's
-    // slots is the one thing the architecture says only one may do.
+    // Consensus, when the operator configured a cluster -- which every scheduler has, even a
+    // lone one (#178). It is what gives the scheduler tier a role at all: without it every
+    // node in a fleet would believe it schedules, and two nodes handing out the same
+    // machine's slots is the one thing the architecture says only one may do.
     //
     // Started AFTER the scheduler tier, because its observers push into it, and
     // declared after too, so it is destroyed first and cannot call into a tier that
@@ -1105,6 +1128,8 @@ using Node::NodeReloader;
                                       nodeSurface != nullptr ? nodeSurface->BoundEndpoint() : std::string {},
                                       identityKey,
                                       membership,
+                                      *nodeRoster,
+                                      rosterWallClock,
                                       metrics,
                                       logger);
     if (!consensusOrRefusal.has_value())
@@ -1118,7 +1143,8 @@ using Node::NodeReloader;
         logger.Logf(LogLevel::Error, "{}; refusing to start", consensusOrRefusal.error());
         return ExitUsage;
     }
-    // May legitimately be null: no `--node-id` means this node leads alone.
+    // Null on a node with no `--listen-raft`: a pure worker, since #178 makes every scheduler a
+    // consensus member.
     auto const consensusTier = std::move(*consensusOrRefusal);
 
     // Attached as soon as the tier exists and before anything serves, and detached before the
@@ -1191,16 +1217,19 @@ using Node::NodeReloader;
             // scrape say NO cluster rather than a cluster of nobody. The tier is
             // declared above, so it outlives the provider: locals are destroyed in
             // reverse.
-            .consensus = Node::ConsensusScrapeSource(consensusTier.get()) },
+            .consensus = Node::ConsensusScrapeSource(consensusTier.get()),
+            // The roster's lapse (#178), declared above the provider for the tier's reason.
+            .roster = nodeRoster.get() },
         startedAt);
 
     // Absent when this node runs no scheduler: there is then no registry to report,
     // so no fleet route is registered and `/fleet` is a plain 404.
     auto const fleetSources = schedulerTier
                                   ? std::optional { Distributed::FleetSources { .scheduler = &schedulerTier->Service(),
-                                                                                // Legitimately null: a node with no
-                                                                                // `--node-id` leads itself and has no
-                                                                                // replicated state for anybody to read.
+                                                                                // Null only while consensus is being
+                                                                                // built: every scheduler runs it since
+                                                                                // #178, so a node with a scheduler tier
+                                                                                // has replicated state to read.
                                                                                 .cluster = consensusTier.get(),
                                                                                 .metrics = &metrics } }
                                   : std::nullopt;
@@ -1306,7 +1335,8 @@ using Node::NodeReloader;
                                                                               .sampler = sampler,
                                                                               .credential = credential,
                                                                               .logger = logger,
-                                                                              .conditions = conditions });
+                                                                              .conditions = conditions,
+                                                                              .roster = nodeRoster.get() });
 
     // Installed only once the listener is up and the heartbeat is running, so a
     // stop arriving during startup cannot close a listener that does not exist yet.

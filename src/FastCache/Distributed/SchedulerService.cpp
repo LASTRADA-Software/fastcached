@@ -414,18 +414,41 @@ namespace
                 return row.counter;
         return std::nullopt;
     }
+
+    /// The keys a RELEASE is verified under: this scheduler's own, for its own id, and nothing
+    /// else. A grant handed back here was signed here, or it names a serial this table never
+    /// issued.
+    class OwnSignature final: public ILeaseSignerKeys
+    {
+      public:
+        /// @param signer This scheduler's identity.
+        explicit OwnSignature(ILeaseSigner const& signer) noexcept:
+            _signer { signer }
+        {
+        }
+
+        [[nodiscard]] LeaseSignerKeys KeysOf(std::string_view signer) const override
+        {
+            if (signer != _signer.SignerId())
+                return {};
+            return LeaseSignerKeys { .live = _signer.PublicKey(), .revoked = {} };
+        }
+
+      private:
+        ILeaseSigner const& _signer;
+    };
 } // namespace
 
 SchedulerService::SchedulerService(IClock& clock,
                                    WallClockRef wallClock,
                                    IMetricsSink& metrics,
                                    ILogger& logger,
-                                   std::span<std::byte const> signingKey,
+                                   ILeaseSigner const& signer,
                                    std::string_view clusterId):
     _wallClock { wallClock },
     _metrics { metrics },
     _logger { logger },
-    _signingKey { signingKey.begin(), signingKey.end() },
+    _signer { signer },
     _clusterId { clusterId },
     _workers { clock },
     _leases { clock }
@@ -436,21 +459,6 @@ std::string SchedulerService::MintGrantToken(Distributed::Lease const& lease,
                                              std::string_view endpoint,
                                              std::string_view fingerprint)
 {
-    if (_signingKey.empty())
-    {
-        // Stated once, loudly, rather than left to look like it worked. Every other
-        // way of getting here is worse: refusing to schedule would break every
-        // single-machine install that has no `--cluster-key-file`, and saying nothing
-        // is the failure mode this repository keeps rediscovering -- a fleet that is
-        // green and is not doing the thing it claims.
-        if (!_warnedUnsigned.exchange(true, std::memory_order_relaxed))
-            _logger.Logf(LogLevel::Warn,
-                         "handing out UNSIGNED lease grants: no cluster key is configured, so any client that can "
-                         "reach a worker's compile port can spend it. Set --cluster-key-file on every node to close "
-                         "this");
-        return lease.token;
-    }
-
     // The expiry comes from the LEASE, not from the table. A token that outlived its
     // lease would be a capability with no record anywhere; one that died first would
     // have a worker refusing work whose key this scheduler is still suppressing.
@@ -460,14 +468,15 @@ std::string SchedulerService::MintGrantToken(Distributed::Lease const& lease,
     // was a constant. It is a replicated setting since #522, so the two could be
     // separated by an operator changing it between the two statements. The lease
     // carries what it was granted under and every end reads that.
-    return MintLeaseToken(_signingKey,
+    return MintLeaseToken(_signer,
                           LeaseClaims { .serial = lease.token,
                                         .endpoint = std::string { endpoint },
                                         .fingerprint = std::string { fingerprint },
                                         .key = lease.key,
                                         .expiresAt = _wallClock.Now() + lease.lifetime,
                                         .clusterId = _clusterId,
-                                        .epoch = _epoch.load(std::memory_order_acquire) });
+                                        .epoch = _epoch.load(std::memory_order_acquire),
+                                        .signer = {} });
 }
 
 std::chrono::milliseconds SchedulerService::AgreedLeaseLifetime() const
@@ -930,7 +939,82 @@ SchedulerReply SchedulerService::AnnounceNode(CallerContext const& caller,
     if (_history != nullptr && !history.empty())
         _history->AcceptHistory(std::string { presence.endpoint }, history);
 
-    return SchedulerReply::Success();
+    // A voter's endorsement rides beside the rest and is judged APART from it: an endorsement
+    // this node refuses is counted, and the machine's load and history still land -- they are
+    // true whoever it is, and refusing them would hide the machine that is misbehaving.
+    if (!presence.endorsement.empty())
+    {
+        auto const endorsement = Cluster::DecodeEndorsement(presence.endorsement);
+        if (!endorsement.has_value())
+            _metrics.Increment(IMetricsSink::Counter::SchedulerRosterEndorsementsRefused);
+        else
+            std::ignore = AcceptEndorsement(*endorsement);
+    }
+
+    auto const certified = CertifiedRosterNow(_wallClock.Now());
+    return SchedulerReply::Success(certified.has_value() ? Cluster::EncodeCertifiedRoster(*certified)
+                                                         : std::vector<std::byte> {});
+}
+
+SchedulerService::EndorsementOutcome SchedulerService::AcceptEndorsement(Cluster::RosterEndorsement const& endorsement)
+{
+    if (_admin == nullptr)
+        return EndorsementOutcome::NoState;
+
+    // The signature first, against the key THIS node's state records for the claimed voter: the
+    // claimed endorser only selects the key, and nothing else about an endorsement that does
+    // not verify is looked at.
+    auto const state = _admin->ClusterState();
+    auto const voter = std::ranges::find(state.members, endorsement.endorser, &Cluster::ClusterMember::id);
+    if (voter == state.members.end() || voter->seat != Cluster::MemberSeat::Voter || !voter->publicKey.has_value()
+        || !Cluster::VerifyEndorsement(endorsement, *voter->publicKey))
+    {
+        _metrics.Increment(IMetricsSink::Counter::SchedulerRosterEndorsementsRefused);
+        return EndorsementOutcome::Refused;
+    }
+
+    // A voter a change ahead of this node, or one behind it, endorsed a roster this state does
+    // not hold. Ordinary for the seconds a change takes, and it will send the next one.
+    if (endorsement.clusterId != _clusterId || endorsement.version != state.rosterVersion
+        || endorsement.rosterDigest != Cluster::DigestOfRoster(Cluster::ProjectRoster(state)))
+        return EndorsementOutcome::Stale;
+
+    std::scoped_lock const lock { _endorsementsMutex };
+    auto const [held, inserted] = _endorsements.try_emplace(endorsement.endorser, endorsement);
+    if (!inserted && (held->second.version != endorsement.version || held->second.notAfter < endorsement.notAfter))
+        held->second = endorsement;
+    return EndorsementOutcome::Accepted;
+}
+
+std::optional<Cluster::CertifiedRoster> SchedulerService::CertifiedRosterNow(std::chrono::system_clock::time_point now) const
+{
+    if (_admin == nullptr)
+        return std::nullopt;
+
+    auto const state = _admin->ClusterState();
+    auto roster = Cluster::EncodeRoster(Cluster::ProjectRoster(state));
+    auto const digest = Cluster::DigestOfRoster(roster);
+    auto const voters = static_cast<std::size_t>(
+        std::ranges::count(state.members, Cluster::MemberSeat::Voter, &Cluster::ClusterMember::seat));
+
+    // Only endorsements of THIS roster that have not lapsed -- a worker counts nothing else, so
+    // anything more is bytes on every announcement for nobody. And only once they are a strict
+    // majority of the current voters, which is the least a worker holding the current roster
+    // could adopt; a worker holding an older one counts its own voters, which is its business.
+    std::vector<Cluster::RosterEndorsement> current;
+    {
+        std::scoped_lock const lock { _endorsementsMutex };
+        for (auto const& [endorser, endorsement]: _endorsements)
+            if (endorsement.clusterId == _clusterId && endorsement.version == state.rosterVersion
+                && endorsement.rosterDigest == digest && now <= endorsement.notAfter)
+                current.push_back(endorsement);
+    }
+    if (voters == 0 || current.size() * 2 <= voters)
+        return std::nullopt;
+    return Cluster::CertifiedRoster { .clusterId = _clusterId,
+                                      .version = state.rosterVersion,
+                                      .roster = std::move(roster),
+                                      .endorsements = std::move(current) };
 }
 
 SchedulerReply SchedulerService::Heartbeat(CallerContext const& caller,
@@ -1125,16 +1209,16 @@ SchedulerReply SchedulerService::Release(CallerContext const& caller, std::strin
     // The token the client hands back is the SIGNED grant, so the serial the lease
     // table knows has to be unwrapped out of it -- which is also the point at which a
     // release that was never granted stops being able to resolve anything. Verified
-    // rather than merely parsed: it costs one HMAC on a verb that already crossed the
-    // network, and a forged release frees a key somebody else is building.
+    // rather than merely parsed: it costs one signature check on a verb that already
+    // crossed the network, and a forged release frees a key somebody else is building.
     //
-    // Only when this scheduler signs. Without a key it never wrapped anything, so the
-    // token is the serial, and demanding otherwise would refuse every lease it had
-    // itself just issued.
+    // Against THIS scheduler's own key and nothing else (#178). A release goes to whoever
+    // issued the grant -- the rulebook's rule, and `Dispatch`'s behaviour -- so "a grant I
+    // signed" is the whole question, and it needs no roster: a grant another member signed
+    // names a serial this table never issued.
     std::string serial { leaseToken };
-    if (!_signingKey.empty())
     {
-        auto authentic = AuthenticateLeaseToken(_signingKey, leaseToken);
+        auto authentic = AuthenticateLeaseToken(OwnSignature { _signer }, leaseToken);
         if (!authentic.has_value())
             return Refuse(Wire::ErrorCode::LeaseUnauthorized);
 

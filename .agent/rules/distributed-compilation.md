@@ -945,21 +945,24 @@ Consequences that are each load-bearing:
   the scheduler minted for its own bookkeeping, and the worker's validator was
   literally `[](...){ return true; }` — so a worker compiled for anyone who could
   reach its port and present any string, and membership (which matches on a source
-  address) was the entire boundary. A grant now carries an HMAC-SHA256 tag over the
-  worker's **endpoint**, the fingerprint, the object key and an absolute expiry,
-  under the same pre-shared key discovery uses. The endpoint is the load-bearing
-  field: a MAC over "somebody may compile" is a token captured on the way to one
-  machine and replayed against every machine that trusts the key, which is the
-  identical failure `Cluster::DiscoveryWire` closes by covering the
+  address) was the entire boundary. A grant now carries an **Ed25519 signature**, made
+  with the ISSUING scheduler's own identity key and naming that scheduler, over the
+  worker's **endpoint**, the fingerprint, the object key and an absolute expiry (#178;
+  an HMAC under the pre-shared key until then, which could not say WHICH member minted
+  a grant and so could not refuse one the cluster had removed). The endpoint is the
+  load-bearing field: a signature over "somebody may compile" is a token captured on
+  the way to one machine and replayed against every machine that trusts the signer,
+  which is the identical failure `Cluster::DiscoveryWire` closes by covering the
   `(node, endpoint)` pair. The claim fields are **length-prefixed, never joined**,
   and here the separator argument is not hypothetical — an endpoint is `host:port`,
   so `{endpoint="a", key="b:1"}` and `{endpoint="a:b", key="1"}` would authenticate
-  identically. Every message is prefixed with a **domain label**, because the same
-  key already MACs discovery proofs and one key serving two constructions is how a
-  tag made for one comes to pass for the other. The token wraps the `LeaseTable`
-  serial rather than replacing it, which is what keeps that component pure — no key,
-  no wall clock, no crypto in the thing whose whole job is a deterministic unit
-  test. See `src/FastCache/Distributed/LeaseToken.hpp` (#281, #282).
+  identically. The message is prefixed with its own **domain label**
+  (`fastcache-lease-v3`), because the same key signs Raft handshakes and roster
+  endorsements and one key serving two constructions is how a signature made for one
+  comes to pass for the other. The token wraps the `LeaseTable` serial rather than
+  replacing it, which is what keeps that component pure — no key, no wall clock, no
+  crypto in the thing whose whole job is a deterministic unit test. See
+  `src/FastCache/Distributed/LeaseToken.hpp` (#281, #282, #178).
 - **A credential lives in `SecureByteBuffer`, and the wipe is an ALLOCATOR rather than a
   destructor.** The cluster key was a plain `std::vector<std::byte>` in every one of its
   holders, freed without being touched — the key that MACs both discovery proofs and every
@@ -1194,13 +1197,52 @@ Consequences that are each load-bearing:
   case — and the way down is not a permission, it is a different mechanism answering the
   question the ratchet was standing in for.
 
-- **A scheduler with no `--cluster-key-file` signs nothing, and says so.** Refusing
-  to schedule without a key would break every single-machine install, which is what
-  most people run; doing it quietly is the failure class this repository keeps
-  rediscovering — a fleet that is green and is not doing the thing it claims. So the
-  fallback is the bare serial exactly as before, plus one bounded warning line at the
-  first grant. #303 is the open question of whether that should become a refusal;
-  the worker's answer below is the shape it should take.
+- **A scheduler IS a consensus member, alone or not, so no grant is unsigned.** It signs
+  with its own identity key, which a consensus node always holds, and hands its workers a
+  roster its voters certify, which is replicated state (#178, owner decision 3). One
+  without `--listen-raft` is refused by name (`SchedulerNeedsConsensusRefusal`), and
+  that is a refusal of the SCHEDULER, not of a single-machine install: a pure worker
+  runs no consensus. It closed #303, whose objection -- a refusal would break every
+  single-node install -- was about refusing on a MISSING KEY; this refuses on a missing
+  port, which `--print-surfaces` shows and every install can state. And it asks a flag,
+  never a bind, so the socket-activation hole the worker's rule below has to backstop
+  does not exist here. The row it replaced -- a non-clustered scheduler with no member
+  set -- describes a node that can no longer be configured.
+- **A signature is only as good as the answer to "is this signer an unrevoked voter", and a
+  worker that runs no consensus cannot read the state that answers it -- so it holds a
+  CERTIFIED ROSTER** (#178). A consensus member asks the state it applies
+  (`StateLeaseRoster`); every other worker asks `RosterTrust`. Both are `ILeaseRoster`, and
+  `SignedLeaseValidator` takes one and never a key.
+  - **A worker adopts v' >= v only if a STRICT MAJORITY of the voters in the roster it HOLDS
+    endorse it, unexpired** (`CertifyRoster`: `needed = voters / 2 + 1`, keyless voters in
+    the denominator). `--voter-key` roots only the FIRST roster, and is never read again once
+    one is held -- as the replicated state wins over the keys `--raft-peer` typed. So a
+    revoked ex-leader that withholds the roster revoking it and serves one of its own, with
+    itself as the only voter, is ONE endorsement of three and is refused. **A majority of
+    the voters the worker already trusts, never of the voters the offered roster names**:
+    counting the offer's own voters is a roster certifying itself.
+  - **A voter endorses `[clusterId, version, SHA-256(roster), notAfter]`, every 15 minutes
+    for an hour** (owner decision 4), and the endorsement rides NODE-ANNOUNCE, whose reply
+    carries the newest roster a majority endorsed. The version is DERIVED in `Apply` from the
+    projection, never bumped per verb: a verb that changes the roster only sometimes must not
+    move it on a no-op, and every voter applying one log must reach one number.
+  - **Past `notAfter` plus the skew slack, every grant is refused `RosterExpired`** -- the
+    bound on a worker cut off with a withholding ex-leader, which otherwise goes on honouring
+    the revoked machine's grants forever. `NoRoster` shares the wire code and not the counter:
+    one never reached a leader its anchors endorse, the other did and was cut off. Both are
+    facts about THIS worker, so answering them before the signature is no oracle.
+    `SignerRevoked` shares `LeaseUnauthorized`'s code and keeps a counter, for
+    `ClusterMismatch`'s reason. The gauge is `fastcache_node_roster_expires_in_seconds`,
+    ABSENT on a consensus member, whose roster never expires.
+  - **The presence round follows a redirect before it reads the reply**
+    (`AnnouncePresence`, reached by the node's loop and by `FleetHarness` alike), so a worker
+    whose remembered leader was deposed adopts the new leader's roster in the SAME round. A
+    worker holding no current roster asks every `RosterWantingInterval`, not every
+    `NodeAnnounceInterval`: it is compiling nothing until one arrives.
+  - **A roster is kept only with `--cluster-dir`, and a kept one that cannot be used REFUSES
+    the start** (`NodeRoster::Build`) -- it may be all that stands between this worker and a
+    voter revoked since. A widening reload asks `--voter-key` and fails CLOSED on a kept
+    roster the configuration cannot see.
 - **Whether a worker CHECKS a lease is a startup decision, never a per-request
   fallback.** The two are not the same rule written twice. "No key, so skip the
   check" taken per request is silent degradation of exactly the kind this file
@@ -1308,11 +1350,10 @@ Consequences that are each load-bearing:
     in a guard. Two instances make it a family rather than a coincidence: when a
     premise is doing load-bearing work, check it still holds on every path that reads
     it, not only on the path it was written for.
-  - **And the sibling is already known.** `--listen-node` describes nothing under
-    activation for exactly the same reason, so the scheduler-side refusal (#303) will
-    have this hole the day it is written -- and since #290 that one flag carries the
-    scheduler's address as well as the cache's, so the hole is one flag wider than it
-    was. Recorded on that issue from the other direction.
+  - **And the sibling was known, and did not arrive.** `--listen-node` describes nothing
+    under activation for exactly the same reason, so a scheduler-side refusal asking the
+    bind would have had this hole. The one #178 landed asks `RunsConsensus` -- a port
+    this process binds itself -- so it has none.
 - **The trust decision does not live in `main()`.** It lived there, as
   `[](...){ return true; }`, through a fully passing suite — the shape this file
   already names as *a reclaimer nothing constructs is the bug it was written to
@@ -3213,17 +3254,6 @@ seventh surface folds by reaching the one function rather than by remembering to
   snapshots by `ConfigReloader` — so a rotated secret survives in the previous snapshot
   for as long as anything holds it. That reach is why it is a separate ticket rather than
   the second half of #324.
-- **[#303](https://github.com/LASTRADA-Software/fastcached/issues/303)** — a scheduler
-  with no `--cluster-key-file` signs nothing and only warns, while the WORKER half of
-  the same question is now a startup refusal (#282). The objection this issue was
-  filed on — refusing would break every single-machine install, which is what most
-  people run — is answered by the shape #282 landed on: ask whether a machine that is
-  not this one can reach the surface, not whether a key is configured, and a
-  single-machine install is out of scope by construction. What is left is applying
-  that predicate to `--listen-node` rather than to `--bind` -- which since #290 is the
-  address the scheduler verbs are answered on, and which takes the wildcard by default
-  the moment `--serve-scheduler` is passed. That default is exactly the configuration
-  the predicate has to catch.
 - **[#201](https://github.com/LASTRADA-Software/fastcached/issues/201)** — a node
   offers only the NATIVE MSVC target variant, on a reason that no longer holds: the
   variants shared a banner and so a fingerprint, and

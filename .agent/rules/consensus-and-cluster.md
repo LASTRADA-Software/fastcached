@@ -417,9 +417,9 @@ simpler design gets wrong.
   `ISecureRandom` as REQUIRED constructor arguments -- no default and no null -- and their own
   id IS the identity's, never a parameter beside it that could name somebody the proofs do
   not. `ConsensusNeedsClusterKeyRefusal` stays in the startup table for reasons that MOVED:
-  the tier no longer reads the cluster key, but a consensus node still signs leases, proves
-  itself on the node port and hands the key over at enrollment with it, and #178 retires it
-  surface by surface. "No key, so skip the check" is the shape the worker's lease rule (#282)
+  the tier no longer reads the cluster key, and a lease is signed by the issuing voter's own
+  key since #178, but a consensus node still proves itself on the node port and hands the key
+  over at enrollment with it, and #178 retires it surface by surface. "No key, so skip the check" is the shape the worker's lease rule (#282)
   refuses one surface over: the port open, every refusal counter at zero, and the fleet
   healthy-looking from both ends.
 
@@ -545,8 +545,9 @@ and it is recorded here because the question will be asked again.
     stranger and the rows that remain.
   - **`NoCluster` is distinct from `NotLeader`, because the operator does something
     different.** `NotLeader` names somewhere else to ask; `NoCluster` says the
-    question does not apply here at all — a single node started without `--node-id`
-    leads itself and has no replicated state. Answering the second with the first
+    question does not apply here at all — a node started without `--listen-raft` runs
+    no scheduler (a scheduler is a cluster of one since #178) and has no replicated
+    state. Answering the second with the first
     sends somebody looking for a node that does not exist.
   - **The consensus-to-wire refusal mapping is a table with one row per
     `ConsensusErrorCode`, `static_assert`ed on its length.** A `switch` here and a

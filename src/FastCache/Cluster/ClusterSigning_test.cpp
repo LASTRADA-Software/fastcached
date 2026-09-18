@@ -36,15 +36,12 @@ TEST_CASE("Each domain's label is the byte string on the wire", "[cluster][signi
     // The labels themselves, spelled out, because they are covered by the MAC:
     // changing one retires every outstanding tag in that domain, and that should
     // be a deliberate act with a test to update rather than a silent edit.
-    // `fastcache-lease-v1` in particular is what the lease carried BEFORE the seam
-    // existed, which is what made moving it a no-op on the wire.
     //
     // That the two are non-empty and distinct is `SigningLabelsSeparateDomains`,
     // `static_assert`ed three lines below its own definition -- a runtime `CHECK`
     // of a `consteval` predicate cannot fail in a translation unit that compiled,
     // so it would read as a guarantee while asserting nothing.
     CHECK(DescribeSigningDomain(SigningDomain::DiscoveryProof).label == "fastcache-discovery-v1");
-    CHECK(DescribeSigningDomain(SigningDomain::LeaseToken).label == "fastcache-lease-v1");
     CHECK(DescribeSigningDomain(SigningDomain::NodeProof).label == "fastcache-node-proof-v1");
 }
 
@@ -55,21 +52,21 @@ TEST_CASE("One field list signs differently in each domain", "[cluster][signing]
     // fields beginning with a cluster id, a lease tag two beginning with a literal,
     // so no byte string was a valid message under both. That is a coincidence, and
     // it survives exactly as long as nobody adds a field to discovery. Here the
-    // SAME fields are signed in both domains and must not produce the same tag.
+    // SAME fields are signed in two domains and must not produce the same tag.
     auto const key = Key();
     auto const fields = std::array<std::span<std::byte const>, 2> { Bytes("node-a"), Bytes("10.0.0.7:6675") };
 
     auto const asProof = SignFields(key, SigningDomain::DiscoveryProof, fields);
-    auto const asLease = SignFields(key, SigningDomain::LeaseToken, fields);
+    auto const asNodeProof = SignFields(key, SigningDomain::NodeProof, fields);
 
-    CHECK_FALSE(ConstantTimeEquals(asProof, asLease));
-    CHECK_FALSE(VerifyFields(key, SigningDomain::LeaseToken, fields, asProof));
-    CHECK_FALSE(VerifyFields(key, SigningDomain::DiscoveryProof, fields, asLease));
+    CHECK_FALSE(ConstantTimeEquals(asProof, asNodeProof));
+    CHECK_FALSE(VerifyFields(key, SigningDomain::NodeProof, fields, asProof));
+    CHECK_FALSE(VerifyFields(key, SigningDomain::DiscoveryProof, fields, asNodeProof));
 
     // And each still authenticates in its own domain, or the separation would be
     // indistinguishable from nothing working at all.
     CHECK(VerifyFields(key, SigningDomain::DiscoveryProof, fields, asProof));
-    CHECK(VerifyFields(key, SigningDomain::LeaseToken, fields, asLease));
+    CHECK(VerifyFields(key, SigningDomain::NodeProof, fields, asNodeProof));
 
     // And every pair of domains, not only the first two: the Raft peer wire added three
     // (#1308), two of which -- a dialler's proof and an acceptor's verdict -- are made
@@ -93,7 +90,7 @@ TEST_CASE("An empty field list is still a signed statement of its domain", "[clu
     auto const none = WireFields::FieldList {};
 
     CHECK_FALSE(ConstantTimeEquals(SignFields(key, SigningDomain::DiscoveryProof, none),
-                                   SignFields(key, SigningDomain::LeaseToken, none)));
+                                   SignFields(key, SigningDomain::NodeProof, none)));
 }
 
 TEST_CASE("The signed message is the label, then the fields, all length-prefixed", "[cluster][signing]")
@@ -118,9 +115,9 @@ TEST_CASE("A tampered tag is refused", "[cluster][signing]")
 {
     auto const key = Key();
     auto const fields = std::array<std::span<std::byte const>, 1> { Bytes("payload") };
-    auto const honest = SignFields(key, SigningDomain::LeaseToken, fields);
+    auto const honest = SignFields(key, SigningDomain::NodeProof, fields);
 
-    REQUIRE(VerifyFields(key, SigningDomain::LeaseToken, fields, honest));
+    REQUIRE(VerifyFields(key, SigningDomain::NodeProof, fields, honest));
 
     // Every byte, not just the first. A comparison that stopped early would accept
     // a suffix edit, and stopping early is precisely what `ConstantTimeEquals` --
@@ -130,7 +127,7 @@ TEST_CASE("A tampered tag is refused", "[cluster][signing]")
     {
         auto tampered = honest;
         tampered[index] ^= std::byte { 0x01 };
-        CHECK_FALSE(VerifyFields(key, SigningDomain::LeaseToken, fields, tampered));
+        CHECK_FALSE(VerifyFields(key, SigningDomain::NodeProof, fields, tampered));
     }
 }
 
@@ -167,12 +164,12 @@ TEST_CASE("The label boundary cannot be shifted into", "[cluster][signing]")
     // another domain's label into it and produce that domain's message.
     auto const key = Key();
 
-    auto const label = std::string { DescribeSigningDomain(SigningDomain::LeaseToken).label };
+    auto const label = std::string { DescribeSigningDomain(SigningDomain::NodeProof).label };
     REQUIRE_FALSE(label.empty());
 
     auto const truncated = label.substr(0, label.size() - 1);
     auto const restored = label.substr(label.size() - 1) + "payload";
-    CHECK_FALSE(ConstantTimeEquals(SignFields(key, SigningDomain::LeaseToken, { Bytes("payload") }),
+    CHECK_FALSE(ConstantTimeEquals(SignFields(key, SigningDomain::NodeProof, { Bytes("payload") }),
                                    HmacSha256(key, WireFields::Encode({ Bytes(truncated), Bytes(restored) }))));
 }
 
@@ -185,6 +182,6 @@ TEST_CASE("Both spellings of a field list sign the same", "[cluster][signing]")
     auto const key = Key();
     auto const fields = std::array<std::span<std::byte const>, 2> { Bytes("node-a"), Bytes("10.0.0.7:6675") };
 
-    CHECK(ConstantTimeEquals(SignFields(key, SigningDomain::LeaseToken, fields),
-                             SignFields(key, SigningDomain::LeaseToken, { Bytes("node-a"), Bytes("10.0.0.7:6675") })));
+    CHECK(ConstantTimeEquals(SignFields(key, SigningDomain::NodeProof, fields),
+                             SignFields(key, SigningDomain::NodeProof, { Bytes("node-a"), Bytes("10.0.0.7:6675") })));
 }

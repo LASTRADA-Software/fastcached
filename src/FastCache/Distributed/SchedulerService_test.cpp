@@ -1,4 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
+#include <FastCache/Cluster/ClusterState.hpp>
+#include <FastCache/Cluster/Roster.hpp>
+#include <FastCache/Cluster/RosterCertificate.hpp>
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Ed25519.hpp>
 #include <FastCache/Distributed/FleetHistory.hpp>
@@ -21,6 +24,7 @@
 #include <vector>
 
 #include <tests/FleetHistoryFakes.hpp>
+#include <tests/LeaseRosterFakes.hpp>
 #include <tests/Unwrap.hpp>
 
 using namespace FastCache;
@@ -73,6 +77,20 @@ CallerContext const Outsider { .membership = Membership::Outsider, .peerId = "st
     return std::string { Wire::AsStringView(Unwrap(grant).leaseToken) };
 }
 
+/// The serial a granted lease resolves by, out of its signed token.
+///
+/// Two tokens can no longer be compared to show two grants collide (#178): each is signed
+/// over everything it names, the key included, so a reissued SERIAL -- the collision a
+/// restart produces -- travels in two different tokens.
+/// @param reply What `Lease` answered; signed by `Testing::TestLeaseSigner()`.
+/// @return The serial inside.
+[[nodiscard]] std::string SerialOf(SchedulerReply const& reply)
+{
+    auto const claims = AuthenticateLeaseToken(Testing::FixedLeaseRoster {}, TokenOf(reply));
+    REQUIRE(claims.has_value());
+    return Unwrap(claims).serial;
+}
+
 /// A service that already leads, which is the precondition of every verb.
 struct Leading
 {
@@ -88,18 +106,18 @@ struct Leading
     /// from any case that cares and costs the rest nothing.
     CapturingLogger logger;
     ManualWallClock wallClock;
-    SchedulerService service { clock, wallClock, metrics, logger, {}, {} };
+    KeyPairLeaseSigner const signer = Testing::TestLeaseSigner();
+    SchedulerService service { clock, wallClock, metrics, logger, signer, {} };
 };
 
 /// A fixed wall-clock instant, so a grant's expiry is a value a test can name.
 constexpr std::chrono::system_clock::time_point Noon { 1'767'225'600s };
 
-/// The same, with a cluster key, so its grants are signed.
+/// The same, naming its fleet, with the roster a worker would verify its grants against.
 ///
-/// A separate fixture rather than a parameter on `Leading`, because unsigned is not
-/// a variation of signed: it is the boundary this surface had before, kept working
-/// for the single machine that runs no cluster, and the cases about it assert a
-/// warning that a signing fleet must never write.
+/// Every grant is signed since #178 -- by the issuing voter's own identity key -- so this
+/// differs from `Leading` only in carrying what a VERIFIER holds: a roster naming this
+/// scheduler as a voter.
 struct Signing
 {
     Signing()
@@ -113,14 +131,15 @@ struct Signing
     /// on both sides of the comparison passes whether the check runs or not (#322).
     static constexpr std::string_view TestCluster = "fleet-under-test";
 
-    /// Thirty-two bytes, as `--cluster-key-file` would supply them.
-    std::vector<std::byte> key = std::vector<std::byte>(32, std::byte { 0x5A });
+    /// What a worker verifies this scheduler's grants against: it, as a voter.
+    Testing::FixedLeaseRoster roster { { "scheduler" } };
 
     ManualClock clock;
     AtomicMetricsSink metrics;
     CapturingLogger logger;
     ManualWallClock wallClock;
-    SchedulerService service { clock, wallClock, metrics, logger, key, TestCluster };
+    KeyPairLeaseSigner const signer = Testing::TestLeaseSigner("scheduler");
+    SchedulerService service { clock, wallClock, metrics, logger, signer, TestCluster };
 };
 } // namespace
 
@@ -192,7 +211,8 @@ TEST_CASE("Only the leader hands out capacity", "[distributed][scheduler]")
     AtomicMetricsSink metrics;
     NullLogger schedulerLogger;
     ManualWallClock wallClock;
-    SchedulerService service { clock, wallClock, metrics, schedulerLogger, {}, {} };
+    auto const signer = Testing::TestLeaseSigner();
+    SchedulerService service { clock, wallClock, metrics, schedulerLogger, signer, {} };
 
     SECTION("an undecided node refuses, and names nobody")
     {
@@ -243,15 +263,16 @@ TEST_CASE("Only the leader hands out capacity", "[distributed][scheduler]")
         // is never replicated, and it is the only node that can free them. Refusing
         // here pinned the key until it expired.
         //
-        // `NotLeader` is what must not come back. `UnknownLease` is the right answer
-        // for this particular token, because this service never granted `l1` -- and
-        // that is asserted rather than skipped past, since "the release got through"
-        // and "the release resolved something" are the two halves that must not be
-        // confused.
+        // `NotLeader` is what must not come back. `LeaseUnauthorized` is the right answer
+        // for this particular token, because this service never signed `l1` -- every
+        // grant is signed since #178, so a bare serial fails authentication before the
+        // table is read -- and that is asserted rather than skipped past, since "the
+        // release got through" and "the release resolved something" are the two halves
+        // that must not be confused.
         service.SetRole(SchedulerRole::Follower, "10.0.0.1:7000", StandaloneSchedulerTerm);
         auto const reply = service.Release(Insider, "l1", "abc");
         CHECK(reply.error != Wire::ErrorCode::NotLeader);
-        CHECK(reply.error == Wire::ErrorCode::UnknownLease);
+        CHECK(reply.error == Wire::ErrorCode::LeaseUnauthorized);
     }
 }
 
@@ -284,7 +305,8 @@ TEST_CASE("Membership is checked after leadership", "[distributed][scheduler]")
     AtomicMetricsSink metrics;
     NullLogger schedulerLogger;
     ManualWallClock wallClock;
-    SchedulerService service { clock, wallClock, metrics, schedulerLogger, {}, {} };
+    auto const signer = Testing::TestLeaseSigner();
+    SchedulerService service { clock, wallClock, metrics, schedulerLogger, signer, {} };
     service.SetRole(SchedulerRole::Follower, "10.0.0.1:7000", StandaloneSchedulerTerm);
 
     CHECK(service.Lease(Outsider, Ask("gcc-14", "abc")).error == Wire::ErrorCode::NotLeader);
@@ -841,7 +863,9 @@ TEST_CASE("A lease that is already gone is refused, not waved through", "[distri
     auto const again = fleet.service.Release(Insider, TokenOf(granted), "key-1");
     CHECK(again.status == Wire::Status::Error);
     CHECK(again.error == Wire::ErrorCode::UnknownLease);
-    CHECK(fleet.service.Release(Insider, "no-such-token", "key-1").error == Wire::ErrorCode::UnknownLease);
+    // A token this scheduler never signed is refused before the table is read (#178): it is
+    // not a lease that is gone, it was never one.
+    CHECK(fleet.service.Release(Insider, "no-such-token", "key-1").error == Wire::ErrorCode::LeaseUnauthorized);
 
     CHECK(fleet.metrics.Read(IMetricsSink::Counter::DispatchLeasesReleased) == 1);
 
@@ -916,15 +940,20 @@ TEST_CASE("A release names its key, so a reissued token resolves nothing", "[dis
     // one has since issued under that number, freeing a key somebody is building and
     // decrementing a worker that is busy. Two schedulers here is exactly that: the
     // second is the restarted process, and `before` is a token minted by the first.
+    //
+    // The restarted process holds the same identity key, as a real one does -- it is kept in
+    // the state directory -- so the stale grant still AUTHENTICATES there, and the key it
+    // names is what stops it (#178).
     Leading first;
     REQUIRE(first.service.Register(Insider, OneSlot("gcc-14", "10.0.0.2:7100")).status == Wire::Status::Ok);
-    auto const before = TokenOf(first.service.Lease(Insider, Ask("gcc-14", "old-key")));
+    auto const beforeGrant = first.service.Lease(Insider, Ask("gcc-14", "old-key"));
+    auto const before = TokenOf(beforeGrant);
 
     Leading restarted;
     REQUIRE(restarted.service.Register(Insider, OneSlot("gcc-14", "10.0.0.2:7100")).status == Wire::Status::Ok);
     auto const after = restarted.service.Lease(Insider, Ask("gcc-14", "new-key"));
     REQUIRE(after.status == Wire::Status::Ok);
-    REQUIRE(TokenOf(after) == before); // the collision this guards, spelled out
+    REQUIRE(SerialOf(after) == SerialOf(beforeGrant)); // the collision this guards, spelled out
 
     CHECK(restarted.service.Release(Insider, before, "old-key").error == Wire::ErrorCode::UnknownLease);
     // And the live lease it collided with is untouched -- neither resolved nor
@@ -997,12 +1026,13 @@ TEST_CASE("Only a job that outlived its lease moves the late-release counter", "
     // starts again at one in every freshly constructed table.
     Leading before;
     REQUIRE(before.service.Register(Insider, OneSlot("gcc-14", "10.0.0.2:7100")).status == Wire::Status::Ok);
-    auto const stale = TokenOf(before.service.Lease(Insider, Ask("gcc-14", "old-key")));
+    auto const staleGrant = before.service.Lease(Insider, Ask("gcc-14", "old-key"));
+    auto const stale = TokenOf(staleGrant);
     Leading restarted;
     REQUIRE(restarted.service.Register(Insider, OneSlot("gcc-14", "10.0.0.2:7100")).status == Wire::Status::Ok);
     auto const reissuedGrant = restarted.service.Lease(Insider, Ask("gcc-14", "new-key"));
     REQUIRE(reissuedGrant.status == Wire::Status::Ok);
-    REQUIRE(TokenOf(reissuedGrant) == stale); // the collision this depends on, spelled out
+    REQUIRE(SerialOf(reissuedGrant) == SerialOf(staleGrant)); // the collision this depends on, spelled out
     auto const reissued = restarted.service.Release(Insider, stale, "old-key");
 
     // No client learns more than it does today: one code, all three.
@@ -1405,14 +1435,17 @@ TEST_CASE("A grant is signed for exactly one worker, and only that worker's is v
     // The grant is no longer the lease table's handle -- it WRAPS one. Asserted
     // directly, because everything below would also pass for a token that merely
     // happened to verify while carrying no binding at all.
-    auto const wrapped = AuthenticateLeaseToken(fleet.key, token);
+    auto const wrapped = AuthenticateLeaseToken(fleet.roster, token);
     REQUIRE(wrapped.has_value());
     CHECK(wrapped->serial != token);
+
+    // And it names who signed it: this scheduler, as the member it runs as (#178).
+    CHECK(wrapped->signer == "scheduler");
 
     SECTION("the worker it names accepts it")
     {
         auto const verified = VerifyLeaseToken(
-            fleet.key,
+            fleet.roster,
             token,
             LeaseExpectation { .endpoint = "peer-1:7100", .fingerprint = "gcc-14", .clusterId = Signing::TestCluster },
             Noon);
@@ -1427,11 +1460,11 @@ TEST_CASE("A grant is signed for exactly one worker, and only that worker's is v
 
     SECTION("a second worker does not")
     {
-        // The replay the endpoint is inside the MAC for. Without it, one grant is a
-        // grant on every machine that trusts the key -- which is every machine in
+        // The replay the endpoint is inside the signature for. Without it, one grant is a
+        // grant on every machine that trusts the roster -- which is every machine in
         // the fleet.
         auto const refusal = VerifyLeaseToken(
-            fleet.key,
+            fleet.roster,
             token,
             LeaseExpectation { .endpoint = "peer-2:7100", .fingerprint = "gcc-14", .clusterId = Signing::TestCluster },
             Noon);
@@ -1442,7 +1475,7 @@ TEST_CASE("A grant is signed for exactly one worker, and only that worker's is v
     SECTION("and it stops being good once it has expired")
     {
         auto const refusal = VerifyLeaseToken(
-            fleet.key,
+            fleet.roster,
             token,
             LeaseExpectation { .endpoint = "peer-1:7100", .fingerprint = "gcc-14", .clusterId = Signing::TestCluster },
             Noon + LeaseTable::DefaultLeaseTimeout + LeaseTokenClockSkewSlack + 1s);
@@ -1482,12 +1515,13 @@ TEST_CASE("A release names a lease this scheduler actually signed", "[distribute
         CHECK(fleet.metrics.Read(IMetricsSink::Counter::DispatchLeasesReleased) == 0);
     }
 
-    SECTION("nor does one signed with another cluster's key")
+    SECTION("nor does one signed with another machine's key under this scheduler's name")
     {
-        // The claims name THIS cluster and this term. Only the signing key differs, so
-        // what the case pins is the MAC and nothing else -- a foreign `clusterId` here
-        // would leave it passing whichever of the two checks happened to run first.
-        auto const foreign = MintLeaseToken(std::vector<std::byte>(32, std::byte { 0x11 }),
+        // The claims name THIS cluster, this term and this scheduler. Only the signing key
+        // differs, so what the case pins is the signature and nothing else -- a foreign
+        // `clusterId` or signer id here would leave it passing whichever check ran first.
+        auto const impostor = KeyPairLeaseSigner { "scheduler", Testing::TestKeyPair("intruder") };
+        auto const foreign = MintLeaseToken(impostor,
                                             LeaseClaims { .serial = "1",
                                                           .endpoint = "peer-1:7100",
                                                           .fingerprint = "gcc-14",
@@ -1501,7 +1535,8 @@ TEST_CASE("A release names a lease this scheduler actually signed", "[distribute
                                                           // borrow the bytes they were
                                                           // decoded from.
                                                           .clusterId = std::string { Signing::TestCluster },
-                                                          .epoch = 0 });
+                                                          .epoch = 0,
+                                                          .signer = {} });
         CHECK(fleet.service.Release(Insider, foreign, "obj-1").error == Wire::ErrorCode::LeaseUnauthorized);
         CHECK(fleet.service.Leases().IsInFlight("obj-1"));
     }
@@ -1553,41 +1588,22 @@ TEST_CASE("A release names a lease this scheduler actually signed", "[distribute
     }
 }
 
-TEST_CASE("A scheduler with no cluster key says so, once", "[distributed][scheduler][lease]")
+TEST_CASE("Every grant is signed by the scheduler that issued it, and says nothing about it",
+          "[distributed][scheduler][lease]")
 {
-    // Unsigned grants stay a working configuration -- a single machine with no
-    // `--cluster-key-file` is what most people run, and refusing to schedule would
-    // break every one of those installs. What is not acceptable is doing it quietly:
-    // a fleet that is green and is not doing the thing it claims is the failure this
-    // repository keeps rediscovering.
-    Leading fleet;
+    // Unsigned grants are gone (#178): a scheduler is a consensus member and holds an identity
+    // key, so there is no configuration left in which a grant goes out unsigned -- and none in
+    // which this service has a warning to write about it. The token is not the lease table's
+    // bare handle, and the one line the old unsigned path wrote is never written.
+    Signing fleet;
+    fleet.wallClock.SetNow(Noon);
     REQUIRE(fleet.service.Register(Insider, OneSlot("gcc-14", "peer-1:7100")).status == Wire::Status::Ok);
     fleet.logger.Clear();
 
     auto const granted = fleet.service.Lease(Insider, Ask("gcc-14", "obj-1"));
     REQUIRE(granted.status == Wire::Status::Ok);
-
-    // Unsigned means the lease table's own handle, unchanged -- so an old launcher
-    // and an old worker go on working exactly as they did. Spelled as the literal
-    // `LeaseTable` mints, on purpose: if that format moves, the thing this case is
-    // about has moved with it.
-    CHECK(TokenOf(granted) == "l1");
-
-    auto const records = fleet.logger.Snapshot();
-    REQUIRE(records.size() == 1);
-    CHECK(records.front().level == LogLevel::Warn);
-    CHECK(records.front().message.contains("UNSIGNED"));
-    CHECK(records.front().message.contains("--cluster-key-file"));
-
-    // Once for the life of the process, not once per grant: the fact is about the
-    // configuration and does not change, and a line per lease would bury it under
-    // itself on the first parallel build.
-    fleet.logger.Clear();
-    // Released first: the worker offers one slot, so a second lease taken while the
-    // first is outstanding would be refused for capacity and never reach the mint.
-    REQUIRE(fleet.service.Release(Insider, TokenOf(granted), "obj-1").status == Wire::Status::Ok);
-    auto const second = fleet.service.Lease(Insider, Ask("gcc-14", "obj-2"));
-    REQUIRE(second.status == Wire::Status::Ok);
+    CHECK(TokenOf(granted) != "l1");
+    CHECK(AuthenticateLeaseToken(fleet.roster, TokenOf(granted)).has_value());
     CHECK(fleet.logger.Snapshot().empty());
 }
 
@@ -1793,7 +1809,7 @@ TEST_CASE("A lease is granted for as long as the CLUSTER agreed, not for as long
             said, [](auto const& record) { return record.message.contains(Cluster::LeaseLifetimeSetting); });
         CHECK(mentions == 1);
         // ONCE, not once per compile: a line per dispatched job buries itself on the
-        // first parallel build, which is the same fact `_warnedUnsigned` records.
+        // first parallel build.
         (void) fleet.service.Lease(Insider, Ask("gcc-14", "key-2"));
         CHECK(
             std::ranges::count_if(fleet.logger.Snapshot(),
@@ -2284,4 +2300,119 @@ TEST_CASE("An admission proposes the verb its seat names, and no opinion keeps t
 
     CHECK(proposedFor("laptop", std::nullopt) == Cluster::CommandKind::AddLearner);
     CHECK(proposedFor("node-c", std::nullopt) == Cluster::CommandKind::AddMember);
+}
+
+namespace
+{
+/// A state with @p voters as keyed voters, at roster version @p version.
+[[nodiscard]] Cluster::ClusterState VotersState(std::vector<std::string> const& voters, std::uint64_t version)
+{
+    Cluster::ClusterState state;
+    for (auto const& id: voters)
+        state.members.push_back(
+            Cluster::ClusterMember { .id = id,
+                                     .raftEndpoint = id + ":6680",
+                                     .schedulerEndpoint = {},
+                                     .schedulerEndpointHistory = Cluster::SchedulerEndpointHistory::NeverAnnounced,
+                                     .seat = Cluster::MemberSeat::Voter,
+                                     .publicKey = Testing::TestKeyPair(id).PublicKey() });
+    state.rosterVersion = version;
+    return state;
+}
+
+/// @p voter's endorsement of @p state's roster, lapsing at @p notAfter, signed with @p signerKey.
+[[nodiscard]] Cluster::RosterEndorsement EndorsementOf(std::string const& voter,
+                                                       Cluster::ClusterState const& state,
+                                                       std::chrono::system_clock::time_point notAfter,
+                                                       std::string const& signerKey = {})
+{
+    auto const key = Testing::TestKeyPair(signerKey.empty() ? voter : signerKey);
+    return Cluster::SignEndorsement(
+        Cluster::RosterEndorsement { .clusterId = std::string { Signing::TestCluster },
+                                     .version = state.rosterVersion,
+                                     .rosterDigest = Cluster::DigestOfRoster(Cluster::ProjectRoster(state)),
+                                     .notAfter = notAfter,
+                                     .endorser = voter,
+                                     .signature = {} },
+        [&key](std::span<std::byte const> message) { return key.Sign(message); });
+}
+} // namespace
+
+TEST_CASE("A scheduler takes only a current voter's endorsement of the roster it holds", "[distributed][scheduler][roster]")
+{
+    // #178. The endorser selects the key and nothing else is read before the signature
+    // verifies under it; a verified endorsement of another roster is ordinary during a change
+    // and kept out, never counted; a node with no cluster certifies nothing.
+    Signing fleet;
+    fleet.wallClock.SetNow(Noon);
+    auto const state = VotersState({ "n1", "n2", "n3" }, 4);
+
+    CHECK(fleet.service.AcceptEndorsement(EndorsementOf("n1", state, Noon + 1h))
+          == SchedulerService::EndorsementOutcome::NoState);
+
+    StubCluster cluster;
+    cluster.state = state;
+    fleet.service.AdministerWith(cluster);
+
+    CHECK(fleet.service.AcceptEndorsement(EndorsementOf("n1", state, Noon + 1h))
+          == SchedulerService::EndorsementOutcome::Accepted);
+    // Another machine's key under n2's name, and a stranger: refused and counted.
+    CHECK(fleet.service.AcceptEndorsement(EndorsementOf("n2", state, Noon + 1h, "n1"))
+          == SchedulerService::EndorsementOutcome::Refused);
+    CHECK(fleet.service.AcceptEndorsement(EndorsementOf("n9", state, Noon + 1h))
+          == SchedulerService::EndorsementOutcome::Refused);
+    CHECK(fleet.metrics.Read(IMetricsSink::Counter::SchedulerRosterEndorsementsRefused) == 2);
+    // A voter one change behind: stale, not counted.
+    CHECK(fleet.service.AcceptEndorsement(EndorsementOf("n3", VotersState({ "n1", "n2", "n3" }, 3), Noon + 1h))
+          == SchedulerService::EndorsementOutcome::Stale);
+    CHECK(fleet.metrics.Read(IMetricsSink::Counter::SchedulerRosterEndorsementsRefused) == 2);
+}
+
+TEST_CASE("A scheduler hands out a roster only once a strict majority of its voters endorse it",
+          "[distributed][scheduler][roster]")
+{
+    // What NODE-ANNOUNCE's reply carries (#178): nothing until a majority of the current voters
+    // have endorsed the roster this state holds, unexpired -- a worker refuses anything less,
+    // so anything less is bytes on every announcement for nobody.
+    Signing fleet;
+    fleet.wallClock.SetNow(Noon);
+    StubCluster cluster;
+    cluster.state = VotersState({ "n1", "n2", "n3" }, 4);
+    fleet.service.AdministerWith(cluster);
+    fleet.service.SetRole(SchedulerRole::Leader, {}, 7);
+
+    REQUIRE(fleet.service.AcceptEndorsement(EndorsementOf("n1", cluster.state, Noon + 1h))
+            == SchedulerService::EndorsementOutcome::Accepted);
+    CHECK_FALSE(fleet.service.CertifiedRosterNow(Noon).has_value());
+
+    // The second endorsement arrives the way every voter's does: on NODE-ANNOUNCE.
+    auto const second = Cluster::EncodeEndorsement(EndorsementOf("n2", cluster.state, Noon + 50min));
+    auto const reply = fleet.service.AnnounceNode(Insider,
+                                                  NodePresence { .endpoint = "n2:6674",
+                                                                 .version = "test",
+                                                                 .capacity = {},
+                                                                 .load = {},
+                                                                 .conditions = std::nullopt,
+                                                                 .endorsement = second });
+    REQUIRE(reply.status == Wire::Status::Ok);
+    auto const certified = Cluster::DecodeCertifiedRoster(reply.payload);
+    REQUIRE(certified.has_value());
+    CHECK(Unwrap(certified).version == 4);
+    CHECK(Unwrap(certified).endorsements.size() == 2);
+    CHECK(Unwrap(certified).roster == Cluster::EncodeRoster(Cluster::ProjectRoster(cluster.state)));
+
+    // An endorsement that has lapsed is not served: past n2's, one voter remains.
+    CHECK_FALSE(fleet.service.CertifiedRosterNow(Noon + 55min).has_value());
+
+    // And a machine whose endorsement is not one still lands: its presence is true whoever it is.
+    auto const garbage = std::vector<std::byte>(5, std::byte { 0x5A });
+    auto const landed = fleet.service.AnnounceNode(Insider,
+                                                   NodePresence { .endpoint = "n3:6674",
+                                                                  .version = "test",
+                                                                  .capacity = {},
+                                                                  .load = {},
+                                                                  .conditions = std::nullopt,
+                                                                  .endorsement = garbage });
+    CHECK(landed.status == Wire::Status::Ok);
+    CHECK(fleet.metrics.Read(IMetricsSink::Counter::SchedulerRosterEndorsementsRefused) == 1);
 }

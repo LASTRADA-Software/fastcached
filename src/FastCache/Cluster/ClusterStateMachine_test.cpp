@@ -282,7 +282,7 @@ TEST_CASE("A snapshot the previous build wrote, in its own layout, is refused by
     CHECK(std::ranges::any_of(records, [](auto const& record) {
         return record.message.contains("cannot decode")
                && record.message.contains(std::format("version {}", Testing::PreviousClusterStateVersion))
-               && record.message.contains("reads 6");
+               && record.message.contains("reads 7");
     }));
 }
 

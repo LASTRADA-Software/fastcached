@@ -7,6 +7,7 @@
 #include "FrameEndpoint.hpp"
 #include "NodeConditions.hpp"
 #include "NodeMembership.hpp"
+#include "NodeRoster.hpp"
 
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Distributed/MembershipOracle.hpp>
@@ -543,6 +544,11 @@ struct NodeRuntimeSources
     /// sends every row as `clear` or `not-evaluated`, which is how *nothing raised* is told apart
     /// from *does not carry conditions* at the far end.
     NodeConditions const* conditions { nullptr };
+
+    /// The roster this node verifies lease grants against (#178); null only where nothing was
+    /// wired. A node that holds no roster reports the field ABSENT through it, which is a
+    /// different answer from a roster of nobody.
+    NodeRoster const* roster { nullptr };
 };
 
 /// The production `INodeStatusSource`: config for the surfaces, a clock for the uptime.

@@ -182,12 +182,13 @@ struct LeaseDecision
 /// @return Whether the job may run, and the bound it runs under.
 using LeaseValidator = std::function<LeaseDecision(std::string_view leaseToken, std::string_view fingerprint)>;
 
-/// The validator a worker holding the cluster's key builds.
+/// The validator a worker holding a roster builds.
 ///
-/// The whole check, and it costs no round trip: a grant carries an HMAC over the
-/// worker's endpoint, the toolchain, the object key and an expiry, signed with the
-/// key both ends already have for discovery. So this is a local
-/// `Distributed::VerifyLeaseToken` and nothing else.
+/// The whole check, and it costs no round trip: a grant carries an Ed25519 signature
+/// over the worker's endpoint, the toolchain, the object key and an expiry, made with
+/// the issuing scheduler's own identity key, and @p roster says whether that key is an
+/// unrevoked voter's (#178). So this is a local `Distributed::VerifyLeaseToken` and
+/// nothing else.
 ///
 /// It lives HERE rather than beside the node's `main`, next to the only class that
 /// consults it, because that is the one place both binaries compile: `main.cpp` is
@@ -196,22 +197,14 @@ using LeaseValidator = std::function<LeaseDecision(std::string_view leaseToken, 
 ///
 /// The endpoint is captured, never taken per request. A grant is signed FOR one
 /// worker, and that is what stops a token captured on the way to one machine from
-/// being replayed against every other machine trusting the same key -- so the
+/// being replayed against every other machine trusting the same signer -- so the
 /// address checked against has to be this worker's own, established once at startup.
 ///
-/// @param signingKey The cluster's pre-shared key; copied, since it outlives no
-///        particular call.
 /// @param advertisedEndpoint Where this worker's address is read, asked once per
 ///        request. It must answer exactly the string this worker is REGISTERED under,
 ///        because that is the string the scheduler signed -- which is why it is the
 ///        same seam the registration reads and not a second reader of the
 ///        configuration. Borrowed, so it must outlive the validator.
-/// @param clusterId The fleet this worker belongs to, copied. Compared for EQUALITY
-///        against what the grant names, so two clusters provisioned from one
-///        `--cluster-key-file` -- the ordinary outcome of copying a configuration to
-///        a second site -- stop authenticating each other's grants (#322). Empty is
-///        legal and means a node that named no cluster: it then expects grants that
-///        name none, which is the one-machine deployment and must keep working.
 /// @param clock Where "now" comes from. A **wall** clock, not a steady one: the
 ///        expiry was stamped on another machine, and a steady instant means nothing
 ///        off the host that read it. Borrowed, so it must outlive the validator.
@@ -240,14 +233,16 @@ using LeaseValidator = std::function<LeaseDecision(std::string_view leaseToken, 
 ///        counted here -- the surface converts one `LeaseRefusalTable` row into the
 ///        wire code and the counter together -- so this sink exists for the one event
 ///        that is not a refusal and would otherwise be visible only in a log.
-[[nodiscard]] LeaseValidator SignedLeaseValidator(SecureByteBuffer signingKey,
+/// @param roster Who may sign a grant, and whether that may be trusted now (#178). Read per
+///        request, borrowed, and must outlive the validator -- as @p advertisedEndpoint must.
+[[nodiscard]] LeaseValidator SignedLeaseValidator(Distributed::ILeaseRoster const& roster,
                                                   IAdvertisedEndpointSource const& advertisedEndpoint,
                                                   WallClockRef clock,
                                                   Distributed::WorkerLeaseState& lease,
                                                   IMetricsSink& metrics,
                                                   std::chrono::seconds slack = Distributed::LeaseTokenClockSkewSlack);
 
-/// The validator a worker with no cluster key builds: it refuses nothing.
+/// The validator a worker with no roster builds: it refuses nothing.
 ///
 /// A named function rather than a lambda written out at each call site, because it
 /// is a **policy** and deserves to be greppable -- and because a bare
@@ -581,13 +576,18 @@ class WorkerRegistrar
 /// @param endpoint Where this machine answers; the key its row is filed under.
 /// @param capacity What the machine is, including its version and cache budget.
 /// @param load What it is doing, and the history buckets it is handing over.
+/// @param endorsement This machine's encoded endorsement of the roster it applied, when it is a
+///        voter; empty otherwise (#178).
 /// @param credential What to present.
-/// @return Nothing on acceptance, or why it was refused and where the leader is.
-[[nodiscard]] std::expected<void, AnnounceRefusal> AnnounceNodePresence(ISocket& scheduler,
-                                                                        CredentialNotice& notice,
-                                                                        std::string_view endpoint,
-                                                                        CompileCacheWire::CapacityFields const& capacity,
-                                                                        CompileCacheWire::LoadFields const& load = {},
-                                                                        Credential const& credential = {});
+/// @return The reply's payload on acceptance -- an encoded certified roster, or empty when the
+///         scheduler has none to hand out -- or why it was refused and where the leader is.
+[[nodiscard]] std::expected<std::vector<std::byte>, AnnounceRefusal> AnnounceNodePresence(
+    ISocket& scheduler,
+    CredentialNotice& notice,
+    std::string_view endpoint,
+    CompileCacheWire::CapacityFields const& capacity,
+    CompileCacheWire::LoadFields const& load = {},
+    std::span<std::byte const> endorsement = {},
+    Credential const& credential = {});
 
 } // namespace FastCache::Cc

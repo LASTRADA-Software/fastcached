@@ -4707,23 +4707,23 @@ TEST_CASE("a node panel names each raised condition with its persistence, says n
     // row that must not be named at all; then nothing raised, SAID; then a node that carried no rows, which must read
     // the marker and never the reassuring words.
     auto raised = MockupNodeStatus();
-    raised.runtime.conditions = std::vector { NodeConditionRow("unsigned-lease-grants", "latched", "warning", "raised"),
+    raised.runtime.conditions = std::vector { NodeConditionRow("scratch-root-unmappable", "latched", "warning", "raised"),
                                               NodeConditionRow("enrollment-window-open", "live", "alert", "raised"),
                                               NodeConditionRow("counter-table-skew", "latched", "warning", "clear") };
     auto const line = ContentStarting(NodeFrameAt(80, 24, raised), "conditions");
-    CHECK(line.starts_with("conditions  unsigned-lease-grants latched"));
+    CHECK(line.starts_with("conditions  scratch-root-unmappable latched"));
     CHECK(line.contains("enrollment-window-open live"));
     CHECK_FALSE(line.contains("counter-table-skew"));
     CHECK_FALSE(line.contains("none raised"));
     // Toned by severity, the persistence a label beside it.
     auto const sink = NodeSinkOf(raised);
-    CHECK(ToneOver(sink, "unsigned-lease-grants") == FrameTone::Stale);
+    CHECK(ToneOver(sink, "scratch-root-unmappable") == FrameTone::Stale);
     CHECK(ToneOver(sink, "enrollment-window-open") == FrameTone::Alert);
     CHECK(ToneOver(sink, "latched") == FrameTone::Label);
     CHECK(ToneOver(sink, "live") == FrameTone::Label);
 
     auto quiet = MockupNodeStatus();
-    quiet.runtime.conditions = std::vector { NodeConditionRow("unsigned-lease-grants", "latched", "warning", "clear"),
+    quiet.runtime.conditions = std::vector { NodeConditionRow("scratch-root-unmappable", "latched", "warning", "clear"),
                                              NodeConditionRow("enrollment-window-open", "live", "alert", "not-evaluated") };
     CHECK(ContentStarting(NodeFrameAt(80, 24, quiet), "conditions") == "conditions  none raised");
     CHECK(ToneOver(NodeSinkOf(quiet), "none raised") == FrameTone::Fresh);

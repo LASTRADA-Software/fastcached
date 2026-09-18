@@ -392,7 +392,7 @@ wrong or unreachable `FASTCACHE_ADDR`, and a `DISPATCHED` line follows it — se
 
 ## Who leads, and what happens when that changes
 
-Run **one** node and it leads itself. It schedules for its own machine and nobody
+Run **one** scheduler and it leads a cluster of one. It schedules for its own machine and nobody
 else's, needs no configuration, and this is the common deployment.
 
 Run several and exactly one must schedule at a time — two nodes handing out the

@@ -7,7 +7,9 @@
 #include <cstddef>
 #include <format>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -19,11 +21,12 @@ SchedulerTier::SchedulerTier(Distributed::IMembershipOracle const& membership,
                              WallClockRef wallClock,
                              IMetricsSink& metrics,
                              ILogger& logger,
-                             std::span<std::byte const> signingKey,
+                             std::string signerId,
+                             Ed25519KeyPair identityKey,
                              std::string_view clusterId,
-                             std::shared_ptr<AuthPolicy const> policy,
-                             LeadsAlone leadsAlone):
-    _service { clock, wallClock, metrics, logger, signingKey, clusterId },
+                             std::shared_ptr<AuthPolicy const> policy):
+    _signer { std::move(signerId), std::move(identityKey) },
+    _service { clock, wallClock, metrics, logger, _signer, clusterId },
     _protocol { _service, metrics },
     // The oracle is the NODE's, not this tier's: the cache surface consults the same
     // object, and a node that answered "is this peer one of ours" differently at its
@@ -38,39 +41,11 @@ SchedulerTier::SchedulerTier(Distributed::IMembershipOracle const& membership,
     _policy { policy },
     _responder { _protocol, membership, metrics, std::move(policy) }
 {
-    // **Standalone leadership, and ONLY for a node that leads alone** (#613).
-    //
-    // A node with no `--node-id` runs no consensus and is the only scheduler there is:
-    // it hands out its own machine's slots and nobody else's, which is exactly right
-    // for the one-machine deployment and is what most people run. Nothing will ever
-    // call `SetRole` on it, so leaving it `Undecided` would refuse every verb forever
-    // -- and the argument that a node refusing until an election completes is "worse
-    // than what it replaces at exactly the moment somebody is watching it start" is
-    // right for THIS node, where no election is coming.
-    //
-    // Term ZERO is an answer rather than a placeholder here: there is no term to be
-    // in. Every grant it mints names 0, and the only verifier that could compare terms
-    // is one told what is current -- which nothing tells a lone node, because nothing
-    // elects it (#322).
-    //
-    // **It used to be published unconditionally, and that is the defect.** With
-    // consensus configured the comment claimed this value "is superseded before the
-    // first lease", and it is not: `ConsensusTier` publishes a role from the driver's
-    // callback, which cannot run until the reactor starts and then only once an
-    // election completes. Until then the surface answered `Lease` as a leader nobody
-    // had elected, minting grants at term 0 that any worker which has learned a higher
-    // term refuses. "Leader at term 0" is not a weaker answer than "leader at term N";
-    // it is a different and wrong one, and a surface must not answer a question whose
-    // input it does not have -- the same rule the node already follows between bound
-    // and surveyed (#365).
-    //
-    // A clustered node therefore keeps the service's own `Undecided` default, which
-    // `Gate()` already answers with `NotLeader` and the leader's endpoint. That is not
-    // a new refusal path: it is the one an election in progress has always produced,
-    // and a client answers it by compiling locally. One local compile during a startup
-    // election is the cost; the alternative is a grant the fleet will refuse.
-    if (leadsAlone == LeadsAlone::Yes)
-        _service.SetRole(Distributed::SchedulerRole::Leader, {}, Distributed::StandaloneSchedulerTerm);
+    // No standalone leadership any more (#178). Every scheduler runs consensus -- a lone one
+    // is a cluster of one -- so the service keeps its own `Undecided` default until the
+    // consensus tier publishes a role and a term, which `Gate()` answers with `NotLeader`
+    // meanwhile. "Leader at term 0" is not a weaker answer than "leader at term N"; it is a
+    // different and wrong one (#613), and there is no longer a node for whom it is right.
 }
 
 std::expected<std::unique_ptr<SchedulerTier>, std::string> SchedulerTier::Start(
@@ -80,34 +55,14 @@ std::expected<std::unique_ptr<SchedulerTier>, std::string> SchedulerTier::Start(
     WallClockRef wallClock,
     IMetricsSink& metrics,
     ILogger& logger,
-    NodeConditions& conditions)
+    std::optional<Ed25519KeyPair> const& identityKey)
 {
-    // The key a lease grant is signed with, and the same file discovery proves the
-    // cluster's identity from -- read again here rather than passed down, because the
-    // scheduler is built before discovery is and may be the only one of the two an
-    // operator asked for. Reading a small file twice at startup is not a cost worth a
-    // dependency between two tiers that otherwise have none.
-    //
-    // Absent is legal and means unsigned grants; unreadable is not, and is fatal for
-    // the reason the header states.
-    SecureByteBuffer signingKey;
-    if (!cfg.clusterKeyFile.empty())
-    {
-        auto key = ReadClusterKey(cfg.clusterKeyFile);
-        if (!key.has_value())
-            return std::unexpected { key.error() };
-        signingKey = std::move(*key);
-    }
-
-    // Whether the grants this tier mints will be signed, decided by the one fact that decides it
-    // -- the key read just above -- and so fixed for the life of the process (#1364). The Warn the
-    // service writes at the first unsigned grant stays; this is what somebody who was not watching
-    // then can still ask for.
-    if (signingKey.empty())
-        conditions.Raise(NodeCondition::UnsignedLeaseGrants,
-                         "no --cluster-key-file is configured, so every lease grant this scheduler hands out is unsigned");
-    else
-        conditions.Clear(NodeCondition::UnsignedLeaseGrants);
+    // The key every grant is signed with is this node's OWN (#178), resolved out of its state
+    // directory before any tier exists. A scheduler runs consensus and a consensus node always
+    // holds one, so this is the answer to a caller that did not -- never a fallback to
+    // unsigned grants, which no longer exist.
+    if (!identityKey.has_value())
+        return std::unexpected { std::string { SchedulerNeedsIdentityKeyRefusal } };
 
     // The credential this surface REQUIRES, which is the inbound half of
     // `--requirepass` (#289). Absent is legal and means membership is the only gate;
@@ -124,12 +79,8 @@ std::expected<std::unique_ptr<SchedulerTier>, std::string> SchedulerTier::Start(
         policy = std::make_shared<AuthPolicy const>(std::string {}, std::move(*secret));
     }
 
-    // Asked of the SHARED predicate, so this tier and `StartConsensusOrExplain` cannot
-    // disagree about whether a role is coming (#613).
-    auto const leadsAlone = RunsConsensus(cfg) ? LeadsAlone::No : LeadsAlone::Yes;
-
     auto tier = std::unique_ptr<SchedulerTier> { new SchedulerTier {
-        membership, clock, wallClock, metrics, logger, signingKey, cfg.clusterId, std::move(policy), leadsAlone } };
+        membership, clock, wallClock, metrics, logger, cfg.nodeId, *identityKey, cfg.clusterId, std::move(policy) } };
 
     // No address in this line since #290: the scheduler verbs are answered on the
     // node's one 0xFC listener, and that listener names itself when it binds.
@@ -140,6 +91,21 @@ std::expected<std::unique_ptr<SchedulerTier>, std::string> SchedulerTier::Start(
     // their compile port is configured because their scheduler said so (#235).
     logger.Logf(LogLevel::Info, "scheduling for the fleet ({})", AdmissionSummary(cfg));
     return tier;
+}
+
+void SchedulerTier::Endorse(Cluster::RosterEndorsement const& endorsement)
+{
+    std::scoped_lock const lock { _ownEndorsementMutex };
+    _ownEndorsement = endorsement;
+    std::ignore = _service.AcceptEndorsement(endorsement);
+}
+
+void SchedulerTier::Administer(Distributed::IClusterAdmin& admin)
+{
+    std::scoped_lock const lock { _ownEndorsementMutex };
+    _service.AdministerWith(admin);
+    if (_ownEndorsement.has_value())
+        std::ignore = _service.AcceptEndorsement(*_ownEndorsement);
 }
 
 } // namespace FastCache::Node

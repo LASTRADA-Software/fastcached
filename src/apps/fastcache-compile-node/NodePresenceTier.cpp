@@ -3,7 +3,11 @@
 
 #include <FastCache/Distributed/SchedulerProtocol.hpp>
 
+#include <chrono>
+#include <cstddef>
+#include <span>
 #include <utility>
+#include <vector>
 
 namespace FastCache::Node
 {
@@ -25,12 +29,14 @@ namespace
         PresenceAnnouncement(std::string_view endpoint,
                              Wire::CapacityFields const& capacity,
                              Wire::LoadFields const& load,
+                             std::span<std::byte const> endorsement,
                              ICredentialSource const& credential,
                              Cc::CredentialNotice& notice,
                              ILogger& logger) noexcept:
             _endpoint { endpoint },
             _capacity { capacity },
             _load { load },
+            _endorsement { endorsement },
             _credential { credential },
             _notice { notice },
             _logger { logger }
@@ -39,10 +45,12 @@ namespace
 
         [[nodiscard]] AnnounceOutcome Attempt(ISocket& client, std::string_view endpoint) override
         {
-            auto const sent = Cc::AnnounceNodePresence(client, _notice, _endpoint, _capacity, _load, _credential.Current());
+            auto sent =
+                Cc::AnnounceNodePresence(client, _notice, _endpoint, _capacity, _load, _endorsement, _credential.Current());
             if (sent.has_value())
             {
                 _accepted = true;
+                _reply = *std::move(sent);
                 return AnnounceOutcome { .accepted = 1, .leader = std::nullopt };
             }
 
@@ -66,14 +74,23 @@ namespace
             return _accepted;
         }
 
+        /// @return What the scheduler that recorded this machine answered with: an encoded
+        ///         certified roster, or empty.
+        [[nodiscard]] std::span<std::byte const> Reply() const noexcept
+        {
+            return _reply;
+        }
+
       private:
         std::string_view _endpoint;
         Wire::CapacityFields const& _capacity;
         Wire::LoadFields const& _load;
+        std::span<std::byte const> _endorsement;
         ICredentialSource const& _credential;
         Cc::CredentialNotice& _notice;
         ILogger& _logger;
         bool _accepted = false;
+        std::vector<std::byte> _reply;
     };
 } // namespace
 
@@ -99,11 +116,36 @@ bool AnnounceMachineOnce(PresenceRound const& round, SchedulerLink& link, IEndpo
     // live row that cleared is clear at the leader one interval later.
     load.conditions = round.conditions.Snapshot();
 
-    PresenceAnnouncement announcement { round.endpoint, round.capacity, load, round.credential, round.notice, round.logger };
-    (void) DialAndAnnounce(link, dialer, round.logger, announcement);
+    auto const accepted = AnnouncePresence(
+        PresenceMessage {
+            .endpoint = round.endpoint,
+            .capacity = round.capacity,
+            .load = load,
+            .credential = round.credential,
+            .notice = round.notice,
+            .logger = round.logger,
+        },
+        round.roster,
+        link,
+        dialer);
 
-    if (announcement.Accepted() && !outbox.empty())
+    if (accepted && !outbox.empty())
         round.sampler.HistoryHandedThrough(outbox.back().startMillis);
+    return accepted;
+}
+
+bool AnnouncePresence(PresenceMessage const& message, IPresenceRoster* roster, SchedulerLink& link, IEndpointDialer& dialer)
+{
+    // The roster rides the same verb (#178): a voter's endorsement out, and back whatever roster
+    // the leader can certify -- which a node that holds none adopts in this same round, from
+    // whichever scheduler the round's redirects and fallbacks reached.
+    auto const endorsement = roster != nullptr ? roster->Endorsement() : std::vector<std::byte> {};
+    PresenceAnnouncement announcement { message.endpoint,   message.capacity, message.load,  endorsement,
+                                        message.credential, message.notice,   message.logger };
+    (void) DialAndAnnounce(link, dialer, message.logger, announcement);
+
+    if (announcement.Accepted() && roster != nullptr)
+        roster->Offered(announcement.Reply());
     return announcement.Accepted();
 }
 
@@ -126,6 +168,7 @@ NodePresence::NodePresence(NodePresenceParts const& parts, SchedulerLink link):
     _credential { parts.credential },
     _logger { parts.logger },
     _conditions { parts.conditions },
+    _roster { parts.roster },
     // Reported at Warn and once, exactly as the registrars' notice is: a credential the
     // scheduler did not want is a configuration fact, not a per-round event.
     _notice { [&logger = parts.logger](std::string_view text) { logger.Logf(LogLevel::Warn, "scheduler: {}", text); } },
@@ -164,7 +207,8 @@ void NodePresence::Loop(std::stop_token const& stop)
                                                        .capacity = _capacityWire,
                                                        .endpoint = endpoint,
                                                        .logger = _logger,
-                                                       .conditions = _conditions },
+                                                       .conditions = _conditions,
+                                                       .roster = _roster },
                                        _link,
                                        _dialer);
 
@@ -178,8 +222,11 @@ bool NodePresence::WaitOutInterval(std::stop_token const& stop)
     // A named lock, because the stop-token `wait_for` takes it by non-const reference -- a
     // temporary does not bind, which is the compiler catching the lifetime question rather
     // than a style preference.
+    auto const interval = _roster != nullptr && _roster->Wanting()
+                              ? std::chrono::duration_cast<std::chrono::seconds>(RosterWantingInterval)
+                              : NodeAnnounceInterval;
     std::unique_lock lock { _wakeMutex };
-    return _wake.wait_for(lock, stop, NodeAnnounceInterval, [&stop] { return stop.stop_requested(); });
+    return _wake.wait_for(lock, stop, interval, [&stop] { return stop.stop_requested(); });
 }
 
 } // namespace FastCache::Node

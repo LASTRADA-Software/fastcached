@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
@@ -1054,6 +1055,24 @@ namespace
             record.push_back({ .name = std::string { name }, .value = NumberCell(static_cast<std::uint64_t>(*value)) });
     }
 
+    /// An instant a node sent as milliseconds since the Unix epoch, as a UTC timestamp.
+    ///
+    /// A value this host's clock cannot represent is rendered as the number it was, never
+    /// converted: the conversion to the clock's own period overflows, and a node is a peer.
+    /// @param millis What the node sent.
+    /// @return `YYYY-MM-DDTHH:MM:SSZ`, or the raw count.
+    [[nodiscard]] std::string RenderEpochMillis(std::uint64_t millis)
+    {
+        constexpr auto MaxMillis =
+            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::duration::max()).count();
+        if (millis > static_cast<std::uint64_t>(MaxMillis))
+            return std::format("{} ms since the epoch", millis);
+        auto const instant =
+            std::chrono::system_clock::time_point { std::chrono::duration_cast<std::chrono::system_clock::duration>(
+                std::chrono::milliseconds { static_cast<std::int64_t>(millis) }) };
+        return std::format("{:%FT%TZ}", std::chrono::floor<std::chrono::seconds>(instant));
+    }
+
     /// Turn a decoded node status into the reported record.
     ///
     /// Pure, and separate from the handler, so the reported SHAPE is testable without a
@@ -1207,6 +1226,26 @@ namespace
         // comparing two machines sees a difference rather than two plausible zeroes, which is
         // the reading the counters cannot give them.
         AddOptionalNumber(record, "forgotten-clients", fields.runtime.forgottenClients);
+
+        // **The roster this node verifies lease grants against** (#178): which one, how many
+        // vote, how many machines are admitted by key, how many keys the cluster revoked, and
+        // until when a majority of its voters vouch for it. ABSENT on a node that holds none --
+        // it checks no grant, and four zeroes would read as a roster of nobody. The lapse is
+        // absent on a consensus member, whose roster is the state it applied and never lapses;
+        // rendered as a UTC instant, whole seconds, because it is compared against a clock.
+        if (fields.runtime.roster.has_value())
+        {
+            auto const& roster = *fields.runtime.roster;
+            record.push_back({ .name = "roster-version", .value = NumberCell(roster.version) });
+            record.push_back({ .name = "roster-voters", .value = NumberCell(static_cast<std::uint64_t>(roster.voters)) });
+            record.push_back(
+                { .name = "roster-principals", .value = NumberCell(static_cast<std::uint64_t>(roster.principals)) });
+            record.push_back({ .name = "roster-revoked", .value = NumberCell(static_cast<std::uint64_t>(roster.revoked)) });
+            record.push_back({ .name = "roster-certified-until",
+                               .value = roster.certifiedUntilMillis.has_value()
+                                            ? TextCell(RenderEpochMillis(*roster.certifiedUntilMillis))
+                                            : AbsentCell() });
+        }
 
         // One field per surface the node actually opened. A surface it does not run gets
         // no field at all rather than a zero port -- the same rule the node applies when

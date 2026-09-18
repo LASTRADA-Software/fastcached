@@ -2,9 +2,15 @@
 #pragma once
 
 #include <FastCache/Async/Task.hpp>
+#include <FastCache/Cluster/ClusterState.hpp>
+#include <FastCache/Cluster/Roster.hpp>
+#include <FastCache/Cluster/RosterCertificate.hpp>
 #include <FastCache/Core/Clock.hpp>
+#include <FastCache/Core/Ed25519.hpp>
 #include <FastCache/Core/Logger.hpp>
-#include <FastCache/Core/SecureBytes.hpp>
+#include <FastCache/Distributed/IClusterAdmin.hpp>
+#include <FastCache/Distributed/LeaseSigner.hpp>
+#include <FastCache/Distributed/LeaseToken.hpp>
 #include <FastCache/Distributed/MembershipOracle.hpp>
 #include <FastCache/Distributed/SchedulerProtocol.hpp>
 #include <FastCache/Distributed/SchedulerService.hpp>
@@ -27,7 +33,16 @@
 
 #include <CacheProtocol.hpp>
 #include <Dispatch.hpp>
+#include <WorkerProtocol.hpp>
+#include <apps/fastcache-compile-node/EndpointDialer.hpp>
+#include <apps/fastcache-compile-node/NodeConfig.hpp>
+#include <apps/fastcache-compile-node/NodeCredential.hpp>
+#include <apps/fastcache-compile-node/NodePresenceTier.hpp>
+#include <apps/fastcache-compile-node/NodeRoster.hpp>
+#include <apps/fastcache-compile-node/SchedulerLink.hpp>
+#include <tests/RaftPeerKeyFakes.hpp>
 #include <tests/ScriptedSocket.hpp>
+#include <tests/Unwrap.hpp>
 
 /// A notice these cases do not inspect.
 ///
@@ -97,7 +112,19 @@ namespace FastCache::Testing
 /// `SetWorkerReply` was given.
 ///
 /// Time moves only in `Step`.
-class FleetHarness final: public Cc::IEndpointExchange
+///
+/// ## Rosters (#178)
+///
+/// Every scheduler signs its grants with its own identity key -- `TestKeyPair` of its
+/// endpoint, which is also its member id -- and holds a cluster state of its own, set by
+/// `SetClusterStateAt`: an ex-leader that has not heard a change is a node holding an older
+/// one. A voter's endorsement reaches a scheduler on NODE-ANNOUNCE (`EndorseAt`). A
+/// `RosterWorker` is a machine with no consensus: a production `FastCache::Node::NodeRoster` rooted in
+/// `--voter-key` anchors, the production lease validator over it, and a presence round that is
+/// production's `FastCache::Node::AnnouncePresence` -- `SchedulerLink`'s redirects and fallbacks, dialled
+/// through this harness (`SetUnreachable`), the certified roster adopted from whichever
+/// scheduler answered.
+class FleetHarness final: public Cc::IEndpointExchange, public FastCache::Node::IEndpointDialer
 {
   public:
     /// What one exchange did, in the order it happened.
@@ -120,11 +147,7 @@ class FleetHarness final: public Cc::IEndpointExchange
     /// drive. Named rather than empty so the comparison is a real one (#322).
     static constexpr std::string_view ClusterId = "fleet-harness";
 
-    /// @param signingKey The cluster key every scheduler here signs with. Empty —
-    ///        the default — means unsigned grants, which is what a fleet with no
-    ///        `--cluster-key-file` runs and is the simpler thing to assert against.
-    explicit FleetHarness(SecureByteBuffer signingKey = {}):
-        _signingKey { std::move(signingKey) }
+    FleetHarness()
     {
         // A worker that refuses is the default because the release is the subject
         // here, and the rule under test is that it happens on EVERY path out of the
@@ -337,6 +360,228 @@ class FleetHarness final: public Cc::IEndpointExchange
         return _metrics;
     }
 
+    /// The cluster's state as @p scheduler has applied it.
+    ///
+    /// Per node, because the case #178 is about is two nodes disagreeing: an ex-leader that
+    /// never heard the change revoking it holds the state from before.
+    /// @param scheduler Which scheduler; must have been added.
+    /// @param state What it applied.
+    void SetClusterStateAt(std::string_view scheduler, Cluster::ClusterState state)
+    {
+        NodeAt(scheduler).cluster.state = std::move(state);
+    }
+
+    /// A state whose voters are @p voters, each keyed with its test key, with @p revoked's
+    /// keys revoked -- and its roster version, as `Apply` would have derived it.
+    /// @param voters The voters, by member id.
+    /// @param revoked Machines whose test keys the cluster revoked.
+    /// @param version The roster version the state carries.
+    /// @return The state.
+    [[nodiscard]] static Cluster::ClusterState StateOf(std::vector<std::string> const& voters,
+                                                       std::vector<std::string> const& revoked,
+                                                       std::uint64_t version)
+    {
+        Cluster::ClusterState state;
+        for (auto const& id: voters)
+            state.members.push_back(
+                Cluster::ClusterMember { .id = id,
+                                         .raftEndpoint = id,
+                                         .schedulerEndpoint = id,
+                                         .schedulerEndpointHistory = Cluster::SchedulerEndpointHistory::Announced,
+                                         .seat = Cluster::MemberSeat::Voter,
+                                         .publicKey = TestKeyPair(id).PublicKey() });
+        // As `Apply` revokes: the key leaves the member's record and joins the revoked list, so
+        // the member stays a voter nobody can verify.
+        for (auto const& id: revoked)
+        {
+            for (auto& member: state.members)
+                if (member.id == id)
+                    member.publicKey.reset();
+            state.revokedKeys.push_back(Cluster::RevokedKey { .id = id, .publicKey = TestKeyPair(id).PublicKey() });
+        }
+        state.rosterVersion = version;
+        return state;
+    }
+
+    /// @p voter endorses the roster @p state holds, now, and says so to @p scheduler on
+    /// NODE-ANNOUNCE -- the wire field and the scheduler's decode, not a direct call.
+    /// @param scheduler Who hears it.
+    /// @param voter Who endorses; signs with its own test key.
+    /// @param state The state @p voter applied.
+    void EndorseAt(std::string_view scheduler, std::string const& voter, Cluster::ClusterState const& state)
+    {
+        auto const key = TestKeyPair(voter);
+        auto const endorsement = Cluster::SignEndorsement(
+            Cluster::RosterEndorsement { .clusterId = std::string { ClusterId },
+                                         .version = state.rosterVersion,
+                                         .rosterDigest = Cluster::DigestOfRoster(Cluster::ProjectRoster(state)),
+                                         .notAfter = _wallClock.Now() + Cluster::RosterEndorsementLifetime,
+                                         .endorser = voter,
+                                         .signature = {} },
+            [&key](std::span<std::byte const> message) { return key.Sign(message); });
+        auto const encoded = Cluster::EncodeEndorsement(endorsement);
+        auto const reply = NodeAt(scheduler).service.AnnounceNode(
+            SetupCaller(),
+            Distributed::NodePresence { .endpoint = voter,
+                                        .version = "harness",
+                                        .capacity = Distributed::NodeCapacity { .logicalCores = 8 },
+                                        .load = Distributed::NodeLoad {},
+                                        .conditions = std::nullopt,
+                                        .endorsement = encoded });
+        if (reply.status != CompileCacheWire::Status::Ok)
+            throw std::runtime_error { "FleetHarness: the scheduler refused a voter's announcement" };
+    }
+
+    /// Take @p scheduler off the network, or put it back: a dial to it fails, as a machine
+    /// that is down or partitioned from the caller answers.
+    /// @param scheduler Which scheduler.
+    /// @param unreachable Whether it answers.
+    void SetUnreachable(std::string_view scheduler, bool unreachable)
+    {
+        (void) NodeAt(scheduler);
+        std::erase(_unreachable, std::string { scheduler });
+        if (unreachable)
+            _unreachable.emplace_back(scheduler);
+    }
+
+    /// A grant @p scheduler mints for @p key, for a worker registered there serving
+    /// @p fingerprint: its own `Lease` verb, signed with its own key.
+    /// @param scheduler Who grants.
+    /// @param fingerprint The toolchain.
+    /// @param key The object key.
+    /// @return The token a client would present.
+    [[nodiscard]] std::string GrantAt(std::string_view scheduler, std::string_view fingerprint, std::string_view key)
+    {
+        auto const reply = NodeAt(scheduler).service.Lease(
+            SetupCaller(), CompileCacheWire::LeaseRequest { .fingerprint = fingerprint, .key = key, .acceptedCodecs = {} });
+        if (reply.status != CompileCacheWire::Status::Ok)
+            throw std::runtime_error { "FleetHarness: the scheduler refused a lease" };
+        auto const grant = CompileCacheWire::DecodeLeaseGrant(reply.payload);
+        if (!grant.has_value())
+            throw std::runtime_error { "FleetHarness: the scheduler answered a lease with no grant" };
+        return std::string { CompileCacheWire::AsStringView(grant->leaseToken) };
+    }
+
+    /// A machine that runs no consensus and verifies every grant against the roster its
+    /// voters certify (#178). Production parts throughout; see the class comment.
+    class RosterWorker final
+    {
+      public:
+        /// @param fleet The harness it lives in, for the clocks, the sink and the dialer.
+        /// @param endpoint Where it answers compiles, and the key its presence is filed under.
+        /// @param anchors The voters whose keys it is started with (`--voter-key`).
+        /// @param schedulers Its `--scheduler` list, in order.
+        RosterWorker(FleetHarness& fleet,
+                     std::string endpoint,
+                     std::vector<std::string> const& anchors,
+                     std::vector<std::string> schedulers):
+            _fleet { fleet },
+            _advertised { std::move(endpoint) },
+            _roster { BuildRoster(fleet, anchors) },
+            _link { Unwrap(FastCache::Node::SchedulerLink::For(std::move(schedulers))) },
+            _lease { Distributed::SchedulerTermRegressionNotice::Silent() },
+            _validator { Cc::SignedLeaseValidator(*_roster->Lease(), _advertised, fleet._wallClock, _lease, fleet._metrics) }
+        {
+            // Registered into the harness's fleet, as a completed REGISTER round pins it (#401).
+            _lease.fleet.Pin(std::string { ClusterId });
+        }
+
+        /// One presence round: production's announcement, through this harness's dialer.
+        /// @return Whether a scheduler recorded this machine.
+        bool Announce()
+        {
+            auto const capacity = CompileCacheWire::CapacityFields {};
+            auto const load = CompileCacheWire::LoadFields {};
+            auto const endpoint = _advertised.Current();
+            return FastCache::Node::AnnouncePresence(FastCache::Node::PresenceMessage { .endpoint = endpoint,
+                                                                                        .capacity = capacity,
+                                                                                        .load = load,
+                                                                                        .credential = _credential,
+                                                                                        .notice = Unwatched(),
+                                                                                        .logger = _fleet._logger },
+                                                     _roster.get(),
+                                                     _link,
+                                                     _fleet);
+        }
+
+        /// What this worker's compile port answers @p token with.
+        /// @param token The grant a client presents.
+        /// @param fingerprint The toolchain the client asks for.
+        /// @return The refusal, or nothing when the grant is honoured.
+        [[nodiscard]] std::optional<Distributed::LeaseRefusal> Check(std::string_view token, std::string_view fingerprint)
+        {
+            return _validator(token, fingerprint).refusal;
+        }
+
+        /// @return The roster this worker holds, summarised; nothing before the first.
+        [[nodiscard]] std::optional<Distributed::RosterSummary> Roster() const
+        {
+            return _roster->Summary();
+        }
+
+      private:
+        /// Where this worker answers: fixed, since nothing here moves an address.
+        struct Advertised final: Cc::IAdvertisedEndpointSource
+        {
+            explicit Advertised(std::string at):
+                endpoint { std::move(at) }
+            {
+            }
+
+            [[nodiscard]] std::string Current() const override
+            {
+                return endpoint;
+            }
+
+            std::string endpoint;
+        };
+
+        /// No `--requirepass`: the harness's schedulers ask for none.
+        struct NoCredential final: FastCache::Node::ICredentialSource
+        {
+            [[nodiscard]] Cc::Credential Current() const override
+            {
+                return {};
+            }
+        };
+
+        /// The production roster for a worker trusting @p anchors, with no state directory.
+        [[nodiscard]] static std::unique_ptr<FastCache::Node::NodeRoster> BuildRoster(
+            FleetHarness& fleet, std::vector<std::string> const& anchors)
+        {
+            FastCache::Node::NodeConfig cfg;
+            cfg.clusterId = std::string { ClusterId };
+            for (auto const& voter: anchors)
+                cfg.voterKeys.push_back(TestKeyPair(voter).PublicKey());
+            auto built = FastCache::Node::NodeRoster::Build(cfg, fleet._wallClock, fleet._metrics, fleet._logger);
+            if (!built.has_value())
+                throw std::runtime_error { "FleetHarness: a worker's roster could not be built: " + built.error() };
+            return *std::move(built);
+        }
+
+        FleetHarness& _fleet;
+        Advertised _advertised;
+        NoCredential _credential;
+        std::unique_ptr<FastCache::Node::NodeRoster> _roster;
+        FastCache::Node::SchedulerLink _link;
+        Distributed::WorkerLeaseState _lease;
+        Cc::LeaseValidator _validator;
+    };
+
+    /// Dial a scheduler in this fleet, as a node's presence round would.
+    /// @param endpoint Which scheduler.
+    /// @param options Ignored; nothing here blocks.
+    /// @return A connection answering from that scheduler, or null when it is unreachable or
+    ///         nobody was added there.
+    [[nodiscard]] std::unique_ptr<ISocket> Dial(std::string_view endpoint, DialOptions options) override
+    {
+        (void) options;
+        if (std::ranges::contains(_unreachable, endpoint)
+            || std::ranges::none_of(_nodes, [endpoint](auto const& node) { return node->endpoint == endpoint; }))
+            return nullptr;
+        return std::make_unique<AnsweringSocket>(*this, std::string { endpoint });
+    }
+
     /// Answer one exchange, from whichever endpoint it was addressed to.
     /// @param hostPort The endpoint the client chose. **This is the fact most of
     ///        these tests are about**: which machine the client decided to ask.
@@ -381,20 +626,42 @@ class FleetHarness final: public Cc::IEndpointExchange
         /// @param at How clients address it.
         Node(FleetHarness& harness, std::string at):
             endpoint { std::move(at) },
+            // Its endpoint is its member id, and its test key the one it signs every grant
+            // with (#178).
+            signer { endpoint, TestKeyPair(endpoint) },
             service { harness._clock,
                       harness._wallClock,
                       harness._metrics,
                       harness._logger,
-                      harness._signingKey,
+                      signer,
                       // One fleet, so one cluster id across every node the harness
                       // builds: a grant minted by any of them must verify on any
                       // other, which is what the harness exists to exercise (#322).
                       FleetHarness::ClusterId },
             protocol { service, harness._metrics }
         {
+            service.AdministerWith(cluster);
         }
 
         std::string endpoint;
+        Distributed::KeyPairLeaseSigner signer;
+        /// The state this node applied; declared before `service`, which borrows it.
+        struct AppliedState final: Distributed::IClusterAdmin
+        {
+            Cluster::ClusterState state;
+
+            [[nodiscard]] Cluster::ClusterState ClusterState() const override
+            {
+                return state;
+            }
+
+            [[nodiscard]] std::expected<void, ConsensusError> ProposeToCluster(Cluster::Command const& /*command*/) override
+            {
+                return std::unexpected { ConsensusError { .code = ConsensusErrorCode::NotLeader,
+                                                          .context = "the harness proposes nothing",
+                                                          .knownLeader = std::nullopt } };
+            }
+        } cluster;
         Distributed::SchedulerService service;
         Distributed::SchedulerProtocol protocol;
         /// Who decides this node's callers, or null to admit everybody (the default, and what
@@ -481,14 +748,81 @@ class FleetHarness final: public Cc::IEndpointExchange
         return header.has_value() ? header->opRaw : std::uint8_t { 0xFF };
     }
 
+    /// A connection whose answer is computed from what was written to it, by the scheduler it
+    /// was dialled at -- `ScriptedSocket`'s replay, with the reply decided when it is first read.
+    class AnsweringSocket final: public ISocket
+    {
+      public:
+        AnsweringSocket(FleetHarness& fleet, std::string endpoint):
+            _fleet { fleet },
+            _endpoint { std::move(endpoint) }
+        {
+        }
+
+        [[nodiscard]] IoAwaitable Write(std::span<std::byte const> bytes) override
+        {
+            _sent.insert(_sent.end(), bytes.begin(), bytes.end());
+            return IoAwaitable { IoResult { bytes.size() } };
+        }
+
+        [[nodiscard]] IoAwaitable WriteVectored(std::span<std::span<std::byte const> const> segments,
+                                                std::shared_ptr<void const> /*keepAlive*/ = {}) override
+        {
+            std::size_t total = 0;
+            for (auto const& segment: segments)
+            {
+                _sent.insert(_sent.end(), segment.begin(), segment.end());
+                total += segment.size();
+            }
+            return IoAwaitable { IoResult { total } };
+        }
+
+        [[nodiscard]] IoAwaitable Read(std::span<std::byte> buffer) override
+        {
+            if (!_answered)
+            {
+                _answered = true;
+                _fleet._calls.push_back(Call { .endpoint = _endpoint,
+                                               .opRaw = OpOf(_sent),
+                                               .kind = Cc::CacheOutcomeKind::Hit,
+                                               .code = CompileCacheWire::ErrorCode::MalformedFrame });
+                _reply = _fleet.Answer(_endpoint, _sent);
+            }
+            auto const take = std::min(_reply.size() - _cursor, buffer.size());
+            std::copy_n(_reply.begin() + static_cast<std::ptrdiff_t>(_cursor), take, buffer.begin());
+            _cursor += take;
+            return IoAwaitable { IoResult { take } };
+        }
+
+        void Close() noexcept override
+        {
+            _closed = true;
+        }
+
+        [[nodiscard]] bool IsClosed() const noexcept override
+        {
+            return _closed;
+        }
+
+      private:
+        FleetHarness& _fleet;
+        std::string _endpoint;
+        std::vector<std::byte> _sent;
+        std::vector<std::byte> _reply;
+        std::size_t _cursor { 0 };
+        bool _answered { false };
+        bool _closed { false };
+    };
+
     ManualClock _clock;
     ManualWallClock _wallClock;
     AtomicMetricsSink _metrics;
     NullLogger _logger;
+    /// Schedulers a dial does not reach; see `SetUnreachable`.
+    std::vector<std::string> _unreachable;
     /// Where requests appear to come from. Loopback by default, which is what every case
     /// predating #1471 assumed and what a node always admits.
     std::string _callerHost { "127.0.0.1" };
-    SecureByteBuffer _signingKey;
     std::vector<std::unique_ptr<Node>> _nodes;
     std::vector<std::string> _workerEndpoints;
     std::vector<std::byte> _workerReply;

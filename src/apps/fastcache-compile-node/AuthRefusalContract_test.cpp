@@ -23,6 +23,7 @@
 #include <vector>
 
 #include <CacheProtocol.hpp>
+#include <tests/LeaseRosterFakes.hpp>
 #include <tests/ScriptedSocket.hpp>
 #include <tests/Unwrap.hpp>
 
@@ -86,7 +87,8 @@ namespace Wire = CompileCacheWire;
     // No `SetRole`: the refusal is answered before `Route`, so before any `Gate()`.
     // Leadership is not part of this contract, and a line setting it would tell a
     // reader it is.
-    Distributed::SchedulerService service { clock, wallClock, metrics, logger, {}, {} };
+    auto const signer = Testing::TestLeaseSigner();
+    Distributed::SchedulerService service { clock, wallClock, metrics, logger, signer, {} };
     Distributed::SchedulerProtocol protocol { service, metrics };
 
     auto const auth = Wire::EncodeAuth(Wire::AuthRequest { .username = {}, .secret = "s3cret" });

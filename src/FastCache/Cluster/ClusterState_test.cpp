@@ -382,17 +382,17 @@ TEST_CASE("A state another build encoded is refused by its version while a comma
     Apply(state, Cmd(CommandKind::AddMember, "n1", "10.0.0.1:6675", "10.0.0.1:7000"));
     auto bytes = Encode(state);
     REQUIRE(bytes.size() > 4);
-    CHECK(bytes[4] == std::byte { 6 });
+    CHECK(bytes[4] == std::byte { 7 });
 
     // A version the next build might write. Refused BY NAME, both versions stated, and
     // never as `MalformedFrame`: those bytes are intact, and *damaged* is what gets a
     // healthy snapshot deleted. The previous build's LAYOUT is the case below this one.
-    bytes[4] = std::byte { 7 };
+    bytes[4] = std::byte { 8 };
     auto const newerState = DecodeState(bytes);
     REQUIRE_FALSE(newerState.has_value());
     CHECK(newerState.error().code == ConsensusErrorCode::UnsupportedVersion);
-    CHECK(newerState.error().context.contains("version 7"));
-    CHECK(newerState.error().context.contains("reads 6"));
+    CHECK(newerState.error().context.contains("version 8"));
+    CHECK(newerState.error().context.contains("reads 7"));
 
     // #178 moved the COMMAND layout as well -- two fields, a key and a role -- so its version
     // moved with it, and for that reason only: a committed entry this build cannot decode is
@@ -422,8 +422,8 @@ TEST_CASE("A state the previous build wrote is refused as another build's, never
     // At the decoder, and through `ClusterStateMachine::RestoreSnapshot` in its own file. A
     // node RESTARTING on a snapshot of its own at this version takes a different path, and
     // that path is #1542's -- this case says nothing about it.
-    auto const v5 = Testing::EncodePreviousClusterState();
-    auto const refused = DecodeState(v5);
+    auto const previous = Testing::EncodePreviousClusterState();
+    auto const refused = DecodeState(previous);
     REQUIRE_FALSE(refused.has_value());
     // The version mismatch, by NAME -- the storage rule: an old store is a version answer,
     // never the one that makes somebody delete a healthy snapshot.
@@ -432,7 +432,7 @@ TEST_CASE("A state the previous build wrote is refused as another build's, never
     CHECK(refused.error().context.contains(std::format("version {}", Testing::PreviousClusterStateVersion)));
     // The current version as a literal: it is private to the codec, and pinned by the
     // version case above.
-    CHECK(refused.error().context.contains("reads 6"));
+    CHECK(refused.error().context.contains("reads 7"));
 }
 
 TEST_CASE("A command the previous build wrote is refused by its version before its arity is judged",
@@ -1295,4 +1295,47 @@ TEST_CASE("A peer's key rides the same token after an @, and a key that is not o
     CHECK_FALSE(ParseMemberSpec(std::format("n1=h@st:6680@{}", keyText)).has_value());
     // And a key with no endpoint is not a member.
     CHECK_FALSE(ParseMemberSpec(std::format("n1=@{}", keyText)).has_value());
+}
+
+TEST_CASE("The roster version moves with who may vouch for whom, and with nothing else", "[cluster][state][roster]")
+{
+    // #178. `rosterVersion` is what a voter endorses beside the roster's digest and what a worker
+    // orders rosters by, so it must move exactly when the ROSTER does -- a member, a seat, a key,
+    // a principal, a revocation -- and never for a setting, a forgotten client or a scheduler
+    // endpoint an election moves. WHAT DISTINGUISHES: each non-roster change is asserted NOT to
+    // move it, so a version bumped on every applied command fails half of this.
+    ClusterState state;
+    CHECK(state.rosterVersion == 0);
+
+    Apply(state, Cmd(CommandKind::AddMember, "n1", "10.0.0.1:6675"));
+    CHECK(state.rosterVersion == 1);
+
+    // Not the roster: a setting, a client admission and forget, and the scheduler endpoint the
+    // member announces when it leads.
+    Apply(state, Cmd(CommandKind::SetSetting, "lease-lifetime", "20min"));
+    Apply(state, Cmd(CommandKind::AdmitClient, "10.0.0.9"));
+    Apply(state, Cmd(CommandKind::ForgetClient, "10.0.0.9"));
+    Apply(state, Cmd(CommandKind::AddMember, "n1", "10.0.0.1:6675", "10.0.0.1:7000"));
+    CHECK(state.rosterVersion == 1);
+
+    // The roster: a second voter, a seat change, a principal, a revocation, a removal.
+    Apply(state, Keyed(CommandKind::AddMember, "n2", KeyOf(0x22), "10.0.0.2:6675"));
+    CHECK(state.rosterVersion == 2);
+    Apply(state, Cmd(CommandKind::AddLearner, "n2", "10.0.0.2:6675"));
+    CHECK(state.rosterVersion == 3);
+    Apply(state, Keyed(CommandKind::AdmitPrincipal, "w1", KeyOf(0x31)));
+    CHECK(state.rosterVersion == 4);
+    Apply(state, Keyed(CommandKind::RevokeKey, "w1", KeyOf(0x31)));
+    CHECK(state.rosterVersion == 5);
+    Apply(state, Cmd(CommandKind::RemoveMember, "n2"));
+    CHECK(state.rosterVersion == 6);
+
+    // A command dropped at apply -- removing a member that is not there -- changes nothing.
+    Apply(state, Cmd(CommandKind::RemoveMember, "n9"));
+    CHECK(state.rosterVersion == 6);
+
+    // And it survives the state's own encoding: a restarted node endorses the version it had.
+    auto const decoded = DecodeState(Encode(state));
+    REQUIRE(decoded.has_value());
+    CHECK(Unwrap(decoded).rosterVersion == 6);
 }

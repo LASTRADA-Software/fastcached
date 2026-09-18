@@ -31,7 +31,7 @@ owns. No decision below is shared, and none is made twice.
 | May this compile run on another machine, and which one? | The **leader** node's scheduler | What the fleet's heartbeats have told it: toolchains, free slots, keys already in flight |
 | Which compiler actually runs? | The **worker**, from its own `--toolchain` configuration | The fingerprint the client named — which selects a compiler the worker already trusts, never one the client supplies |
 | What gets stored in the cache? | `fastcache-cc`, the client | The compile it just watched succeed. A worker is given no cache credential and never stores |
-| Who leads? | Consensus, across the nodes | A Raft election. With one node, it leads itself and needs no configuration |
+| Who leads? | Consensus, across the schedulers | A Raft election. A lone scheduler is a cluster of one and elects itself |
 
 The last column is where the safety comes from. A client cannot name a program
 for a worker to run, and a worker cannot put anything into a cache other machines
@@ -145,15 +145,17 @@ compressing it.
 
 !!! info "The lease token is signed, and what it covers is the point"
 
-    When `--cluster-key-file` is set, the token is not a serial number. It is
-    base64 text carrying the granted worker's endpoint, the toolchain fingerprint,
-    the object key and an absolute expiry, plus an HMAC-SHA256 tag over all of them
-    under the cluster's pre-shared key — the same key discovery proves membership
-    with, under a domain label of its own so one construction's tag can never pass
-    for the other's.
+    The token is not a serial number. It is base64 text carrying the granted
+    worker's endpoint, the toolchain fingerprint, the object key, an absolute
+    expiry and the id of the scheduler that issued it, plus an **Ed25519 signature**
+    over all of them made with that scheduler's own identity key
+    ([#178](https://github.com/LASTRADA-Software/fastcached/issues/178)). A worker
+    checks it against the cluster's *roster* — its voters and their keys, as a
+    strict majority of them certify it — so a grant is good only while the machine
+    that signed it is an unrevoked voter.
 
-    **The endpoint is inside the MAC, and that is the whole reason the token has a
-    shape at all.** A signature over "somebody may compile" is a signature that lets
+    **The endpoint is inside the signature, and that is the whole reason the token
+    has a shape at all.** A signature over "somebody may compile" is a signature that lets
     a token captured on the way to one machine be replayed against every other
     machine in the fleet. This is the same rule LAN discovery follows, where the
     proof covers the `(node, endpoint)` pair.
@@ -165,8 +167,8 @@ compressing it.
     so an unexpired lease is not a promise that the scheduler still holds capacity
     for it.
 
-    A node started with no `--cluster-key-file` cannot sign, and hands out the bare
-    serial it always did. It says so in its log, once, at the first grant.
+    Every scheduler signs: a scheduler runs consensus, so it always holds an
+    identity key, and there is no unsigned grant any more.
 
     The worker **verifies** it — see
     [The lease token, and what it buys](#the-lease-token-and-what-it-buys).
@@ -451,7 +453,7 @@ A version is refreshed on re-registration, so **an upgrade looks like a restart*
 
 !!! note "A single node dials itself"
 
-    Run one node and it leads itself, so `--scheduler` points at its own
+    Run one scheduler and it leads a cluster of one, so `--scheduler` points at its own
     `127.0.0.1:6675`. Nothing is special-cased: the same register and heartbeat
     go over loopback, and everything on this page still applies with the
     round trips costing nothing.
@@ -742,7 +744,7 @@ notes:
     `--print-surfaces` runs the **startup policy rules** before it prints, so the
     command has to be one the node would actually accept. Six rules apply to the
     flags above and each refuses a configuration that would start and silently not
-    work: `--serve-scheduler` needs a member set, `--listen-raft` needs a `--raft-peer`
+    work: `--serve-scheduler` needs `--listen-raft`, `--listen-raft` needs a `--raft-peer`
     **and** a `--cluster-key-file`, `--discovery` needs a `--cluster-key-file`,
     membership needs an `--advertise` peers can dial, and a worker needs a
     `--scheduler`. An earlier version of this transcript omitted the five that applied
@@ -770,12 +772,18 @@ serves.
 
     ```sh
     fastcache-compile-node --serve-scheduler --listen-node 127.0.0.1:6675 \
+        --listen-raft 127.0.0.1:6680 --raft-self 127.0.0.1 \
+        --cluster-key-file /etc/fastcached/cluster.key \
         --scheduler 127.0.0.1:6675 --fleet-open
     ```
 
+    A scheduler is a cluster of one even here, so its consensus port is bound to
+    loopback, where nothing else can reach it.
+
 === "One scheduler, N workers"
 
-    No consensus, so no Raft or discovery ports.
+    The scheduler is a cluster of one, so its Raft port is open only to itself —
+    bind it to loopback or leave it unopened. No discovery port.
 
     | Machine | Inbound | From |
     |---|---|---|
@@ -839,11 +847,11 @@ is not a boundary it can hold. For anything beyond a trusted build network, put 
 in front of every port.
 
 The credentials that are real and unaffected: `--dashboard-token-file` for the fleet
-page, and `fastcached`'s own `--requirepass` for the shared cache. **The cluster key
-is real too**: the scheduler signs every lease grant with it
-([below](#the-lease-token-and-what-it-buys)). And every consensus connection proves each
-member's own identity key (next), which is stronger than any shared key: it proves WHICH
-machine, and removing one is a single revocation rather than a new key everywhere.
+page, and `fastcached`'s own `--requirepass` for the shared cache. **Each member's own
+identity key is real too**: every consensus connection proves it (next), and the scheduler
+signs every lease grant with it ([below](#the-lease-token-and-what-it-buys)) — which is
+stronger than any shared key: it proves WHICH machine, and removing one is a single
+revocation rather than a new key everywhere.
 
 ### Raft peer authentication
 
@@ -965,45 +973,76 @@ after it name both member ids. The full list, with a description of each series,
 
 ### The lease token, and what it buys
 
-A lease grant is a **signed capability** rather than a serial number: with
-`--cluster-key-file` set, the scheduler MACs the granted endpoint, the toolchain,
-the object key and an expiry under the cluster's pre-shared key
-([#281](https://github.com/LASTRADA-Software/fastcached/issues/281)), and the
-worker checks that MAC before it decompresses anything, let alone compiles
+A lease grant is a **signed capability** rather than a serial number: the scheduler
+signs the granted endpoint, the toolchain, the object key, an expiry and its own id
+with its own Ed25519 identity key
+([#281](https://github.com/LASTRADA-Software/fastcached/issues/281),
+[#178](https://github.com/LASTRADA-Software/fastcached/issues/178)), and the worker
+checks that signature before it decompresses anything, let alone compiles
 ([#282](https://github.com/LASTRADA-Software/fastcached/issues/282)). A token is
 unforgeable, and one minted for one worker does not authenticate against another.
 
-The check costs a job nothing: it is a local HMAC over a few hundred bytes, with no
+The check costs a job one signature verification over a few hundred bytes, with no
 round trip back to the scheduler. It happens **before** the payload is decompressed,
 so an unauthorized peer cannot make a worker do the expensive part.
 
-Three refusals are now reachable at the compile port, each with its own counter,
-because they are three different things for an operator to do:
+#### The roster a worker checks against
+
+A signature is only as good as the answer to *is this key one of the cluster's
+voters, and not revoked* — and a worker that runs no consensus cannot read the
+cluster's state. So it holds a **roster**: the cluster's voters, its principals and
+its revoked keys, at a version, with an **endorsement** from each voter who signed
+`[cluster, version, SHA-256 of the roster, not-after]`.
+
+- **A worker adopts a roster only if a strict majority of the voters in the one it
+  already holds endorse it**, unexpired. Before it holds any, the voters it trusts are
+  the keys `--voter-key` names. So a revoked leader that withholds the roster revoking
+  it and serves one of its own instead is refused: it is one voter, not a majority.
+- **Endorsements ride NODE-ANNOUNCE.** Each voter endorses what it has applied every
+  15 minutes, for an hour; the leader hands every announcing machine the newest roster
+  a majority has endorsed, and a machine that holds none asks every 2 seconds until
+  it does. A redirect to the real leader is followed in the same round, so a worker
+  whose remembered leader was deposed adopts the new roster at once.
+- **Past the roster's not-after plus five minutes of slack, every grant is refused
+  `roster-expired`.** That is the bound on how long a worker cut off from the leader —
+  or talking only to an ex-leader that withholds newer rosters — goes on trusting the
+  voters it last heard of. `fastcache_node_roster_expires_in_seconds` says how long is
+  left.
+- **A consensus member needs none of this**: it checks against the state it applies,
+  which is the roster by definition and never expires.
+
+With `--cluster-dir`, a worker keeps its roster across restarts, and from then on
+that roster — not `--voter-key` — is its trust root.
+
+The refusals reachable at the compile port, each with its own counter, because they
+are different things for an operator to do:
 
 | Refusal | What it means | What to do |
 |---|---|---|
-| `lease-unauthorized` | The token is junk, or signed with a key this worker does not hold | Somebody is probing the port — or a key rollout is half-finished |
+| `lease-unauthorized` | The token is junk, signed by a key that is no voter the roster names — or signed by one the cluster has **revoked**, which has a counter of its own | Somebody is probing the port — or a machine was removed and is still leasing out work |
 | `lease-endpoint-mismatch` | An authentic grant, issued for a different address | This worker's `--advertise` is not what the scheduler registered it under |
 | `lease-expired` | An authentic grant, older than its expiry plus five minutes of slack | A clock on one of the two machines is wrong |
+| `roster-expired` | This worker holds no current roster, so it can check nobody's grant | It has never reached a leader its `--voter-key` voters endorse, or it has been cut off from one for longer than a roster lives |
 
 #### Whether a worker checks at all is a startup decision
 
-**Not a per-request fallback.** A worker with no key cannot verify, and "no key, so
-skip the check" decided per request is the worst of both: the port is open, every
+**Not a per-request fallback.** A worker with no roster cannot verify, and "no roster,
+so skip the check" decided per request is the worst of both: the port is open, every
 refusal counter reads zero, and the fleet looks healthy from both ends. So the
 decision is made once, before anything is served:
 
-- A node that **another machine could dial** and has no `--cluster-key-file` is
-  refused at startup, by name. Both halves have to be true — a node bound to
+- A node that **another machine could dial** and has no way to check a lease — it
+  runs no consensus, names no `--voter-key` and keeps no roster in its `--cluster-dir`
+  — is refused at startup, by name. Both halves have to be true — a node bound to
   loopback answers nobody else whatever `--fleet-member` or `--fleet-open` say, and
   a node admitting only its own machine escalates nobody however it is bound.
 - A node that **nothing else can dial** runs without the check and logs a warning
   saying so, once, at startup. This is the ordinary single-machine install: a
   process on that host already has that host's compiler.
 
-So the upgrade order for a fleet is: provision the key on every node first, then
-roll the binary. A worker that has the key and a scheduler that does not will refuse
-every grant that scheduler hands out.
+The lease format and the roster arrived in one release, and a worker and a scheduler
+from either side of it do not understand each other's grants — so a fleet upgrades its
+schedulers and workers together.
 
 Fuller treatment in
 [Distributed compilation § Security](../getting-started/distributed-compilation.md#security)

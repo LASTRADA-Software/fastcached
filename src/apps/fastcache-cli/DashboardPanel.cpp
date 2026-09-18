@@ -1472,7 +1472,7 @@ namespace
 
     /// The node's conditions as a fact line (#1364): the marker when it carried none, `none raised` when nothing
     /// asks for attention, and otherwise each condition that does, toned by its severity and followed by its
-    /// persistence -- `unsigned-lease-grants latched  enrollment-window-open live` -- so a latched row, which no
+    /// persistence -- `scratch-root-unmappable latched  enrollment-window-open live` -- so a latched row, which no
     /// fix short of a restart clears, cannot be read as a live one an operator can watch clear.
     ///
     /// The words are the node's, as they travelled: this panel restates no list of conditions, and a row a newer

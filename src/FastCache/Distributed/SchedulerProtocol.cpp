@@ -407,7 +407,10 @@ SchedulerReply SchedulerProtocol::Route(Wire::Op op, std::span<std::byte const> 
                                                         // What the machine says is wrong with it
                                                         // (#1364). Off the load record, the one
                                                         // variable-arity carrier this verb has.
-                                                        .conditions = fields->load.conditions },
+                                                        .conditions = fields->load.conditions,
+                                                        // A voter's roster endorsement (#178),
+                                                        // opaque until the service verifies it.
+                                                        .endorsement = fields->endorsement },
                                          HistoryFromWire(fields->load.history));
         }
         case Wire::Op::Heartbeat: {

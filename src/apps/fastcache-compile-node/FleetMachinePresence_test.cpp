@@ -232,9 +232,9 @@ TEST_CASE("A machine's condition rows reach its Machines row, with or without a 
     fleet.AddScheduler(std::string { SchedulerA });
     fleet.ElectLeader(SchedulerA);
 
-    std::vector const raised { ConditionRow("unsigned-lease-grants", "latched", "raised"),
+    std::vector const raised { ConditionRow("scratch-root-unmappable", "latched", "raised"),
                                ConditionRow("enrollment-window-open", "live", "raised") };
-    std::vector const quiet { ConditionRow("unsigned-lease-grants", "latched", "clear"),
+    std::vector const quiet { ConditionRow("scratch-root-unmappable", "latched", "clear"),
                               ConditionRow("enrollment-window-open", "live", "not-evaluated") };
     constexpr std::string_view OldMachine = "builder-2:6674";
     constexpr std::string_view SilentWorker = "builder-3:6674";
@@ -281,7 +281,7 @@ TEST_CASE("A condition row that is not text is refused where it enters, naming t
     for (auto const& field: CompileCacheWire::ConditionFieldTable)
     {
         CAPTURE(field.name);
-        auto bad = ConditionRow("unsigned-lease-grants", "latched", "raised");
+        auto bad = ConditionRow("scratch-root-unmappable", "latched", "raised");
         (bad.*field.member).append("\xff");
         auto const refused = fleet.AnnounceMachineAnswer(SchedulerA, MachineA, std::vector { bad });
         CHECK(refused.status == CompileCacheWire::Status::Error);
@@ -290,7 +290,7 @@ TEST_CASE("A condition row that is not text is refused where it enters, naming t
     }
     CHECK(fleet.MachinesAt(SchedulerA).empty());
 
-    auto const good = ConditionRow("unsigned-lease-grants", "latched", "raised");
+    auto const good = ConditionRow("scratch-root-unmappable", "latched", "raised");
     CHECK(fleet.AnnounceMachineAnswer(SchedulerA, MachineA, std::vector { good }).status == CompileCacheWire::Status::Ok);
     CHECK(fleet.MachinesAt(SchedulerA).size() == 1);
 }

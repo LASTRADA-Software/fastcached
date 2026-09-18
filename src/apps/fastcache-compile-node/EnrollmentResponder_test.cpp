@@ -24,6 +24,7 @@
 #include <utility>
 #include <vector>
 
+#include <tests/LeaseRosterFakes.hpp>
 #include <tests/MembershipFakes.hpp>
 #include <tests/Unwrap.hpp>
 
@@ -189,7 +190,8 @@ struct Seed
     ManualWallClock wallClock;
     AtomicMetricsSink metrics;
     NullLogger logger;
-    Distributed::SchedulerService service { clock, wallClock, metrics, logger, {}, {} };
+    Distributed::KeyPairLeaseSigner const signer = Testing::TestLeaseSigner();
+    Distributed::SchedulerService service { clock, wallClock, metrics, logger, signer, {} };
     RecordingCluster cluster;
     // A LIST, not `OpenMembership`: a fake that admits everyone cannot tell *the gate is
     // wired* from *the gate admits everyone*, and on this surface exactly one verb is meant

@@ -54,8 +54,6 @@ Refuse() {
 # inherit it.
 # ---------------------------------------------------------------------------
 CredentialIdentifiers='
-signingKey|what a lease grant is MACed with; SchedulerService and SignedLeaseValidator hold it
-_signingKey|the SchedulerService member holding the same
 presharedKey|the cluster PSK, which MACs discovery proofs
 clusterKey|the cluster key an enrolling node is handed and writes to disk; EnrollReading holds it
 secretKey|an Ed25519 or X25519 secret key: what signs as a node, and what a key agreement is computed from (Core/Ed25519, Core/X25519, #178)
@@ -304,8 +302,6 @@ RunSelfTest() {
     # (#1031 stood for two days as a guard that refused every tree).
     mkdir -p "$tmp/clean"
     cat > "$tmp/clean/a.hpp" <<'EOF'
-SecureByteBuffer signingKey;
-SecureByteBuffer _signingKey;
 SecureByteBuffer presharedKey;
 SecureByteBuffer clusterKey;
 SecureByteBuffer secretKey;
@@ -331,9 +327,9 @@ EOF
     # watched refusing something.
     mkdir -p "$tmp/dirty"
     cp "$tmp/clean/a.hpp" "$tmp/dirty/a.hpp"
-    printf 'std::vector<std::byte> signingKey;\n' >> "$tmp/dirty/a.hpp"
+    printf 'std::vector<std::byte> clusterKey;\n' >> "$tmp/dirty/a.hpp"
     verdict=$(bash "$0" --root "$tmp/dirty" 2>&1)
-    if grep -q 'signingKey declared as std::vector<std::byte>' <<< "$verdict"; then
+    if grep -q 'clusterKey declared as std::vector<std::byte>' <<< "$verdict"; then
         printf 'ok   case 2: a plain vector holding a credential is reported\n'
     else
         printf 'FAIL case 2: violation not reported. Got: %s\n' "$verdict"; return 1
@@ -344,8 +340,6 @@ EOF
     # check exists to have -- it is what a rename leaves behind, and it is silent.
     mkdir -p "$tmp/blind"
     cat > "$tmp/blind/a.hpp" <<'EOF'
-SecureByteBuffer signingKey;
-SecureByteBuffer _signingKey;
 SecureByteBuffer clusterKey;
 SecureByteBuffer secretKey;
 SecureByteBuffer _secretKey;
@@ -377,7 +371,7 @@ EOF
     # Case 5: a comment naming the pattern is not a call site.
     mkdir -p "$tmp/comment"
     cp "$tmp/clean/a.hpp" "$tmp/comment/a.hpp"
-    printf '// std::vector<std::byte> signingKey; -- the shape this check refuses\n' >> "$tmp/comment/a.hpp"
+    printf '// std::vector<std::byte> clusterKey; -- the shape this check refuses\n' >> "$tmp/comment/a.hpp"
     verdict=$(bash "$0" --root "$tmp/comment" 2>&1)
     if grep -q '^ok: every credential identifier' <<< "$verdict"; then
         printf 'ok   case 5: a commented-out declaration is not a finding\n'
@@ -391,8 +385,6 @@ EOF
     # POSITIVES -- the direction that gets acted on, because a finding looks like work.
     mkdir -p "$tmp/precise"
     cat > "$tmp/precise/a.hpp" <<'EOF'
-SecureByteBuffer signingKey;
-SecureByteBuffer _signingKey;
 SecureByteBuffer presharedKey;
 SecureByteBuffer clusterKey;
 SecureByteBuffer secretKey;
@@ -403,8 +395,8 @@ SecureByteBuffer pseudoRandomKey;
 SecureByteBuffer outputKeyMaterial;
 SecureByteBuffer identitySeed;
 SecureByteBuffer keyFileBytes;
-inline std::string MintLeaseToken(std::span<std::byte const> signingKey, int claims);
-bool Authenticate(std::span<std::byte const> signingKey, std::string_view token);
+inline std::string SealWith(std::span<std::byte const> clusterKey, int claims);
+bool Authenticate(std::span<std::byte const> clusterKey, std::string_view token);
 EOF
     verdict=$(bash "$0" --root "$tmp/precise" 2>&1)
     if grep -q '^ok: every credential identifier' <<< "$verdict"; then

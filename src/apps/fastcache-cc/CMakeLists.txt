@@ -42,6 +42,7 @@ set(_fc_cc_core
     "${CMAKE_SOURCE_DIR}/src/FastCache/Core/Base64.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/Core/Compression.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/Core/CpuFeatures.cpp"
+    "${CMAKE_SOURCE_DIR}/src/FastCache/Core/Ed25519.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/Core/SecureBytes.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/Core/Sha256.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/Metrics/IMetricsSink.cpp"
@@ -86,14 +87,19 @@ set(_fc_cc_core
 # is why the platform selection is in a .cpp at all and not in the header every
 # credential holder includes.
 
-# Core/Sha256.cpp and Core/Base64.cpp are what a signed lease token is made of:
-# HMAC-SHA256 over the granted endpoint, fingerprint, key and expiry, rendered as
-# base64 text (src/FastCache/Distributed/LeaseToken.hpp). Nothing here reaches that
-# header YET -- the scheduler signs a grant and no worker checks one until #282 --
-# and the two rows are here ahead of it on purpose: the worker's protocol is
-# WorkerProtocol.cpp, which lives in THIS directory and is compiled into both
-# binaries, so the verification half lands in a launcher build that already links
-# what it needs rather than in one that discovers it cannot.
+# Core/Sha256.cpp and Core/Base64.cpp are what a signed lease token was made of when
+# it was an HMAC under the cluster key, and Base64 still renders it as text; Sha256
+# keys the spent-grant set (src/FastCache/Distributed/LeaseToken.hpp). The worker's
+# protocol is WorkerProtocol.cpp, which lives in THIS directory and is compiled into
+# both binaries, so the verification half is linked into a launcher build too.
+#
+# Core/Ed25519.cpp is what a grant is signed with since #178: the issuing voter's
+# own identity key, verified against the roster. It is the second deliberate
+# exception to the no-third-party rule, after Compression below, and it costs one
+# static library: fastcache-monocypher, a verbatim vendored copy built as C++ with no
+# dependency of its own (cmake/Monocypher.cmake). Linked below for both targets that
+# compile these rows. The alternative -- a launcher build that cannot verify what
+# the worker it shares a file with must -- is not one.
 #
 # They cost nothing the rule above protects. Sha256.hpp reaches only the standard
 # library; Sha256.cpp adds Core/Endian.hpp (already here through
@@ -105,8 +111,9 @@ set(_fc_cc_core
 # -- which is the point of having SHA-256 in this tree at all, since
 # FASTCACHED_ENABLE_TLS is off by default and peer authentication is not optional.
 #
-# Core/Compression.cpp is the one row here that is NOT dependency-free, and it is a
-# deliberate exception to the rule the comment above states.
+# Core/Compression.cpp is the first of the two rows here that are NOT dependency-free
+# (Core/Ed25519.cpp, above, is the second), and it is a deliberate exception to the
+# rule the comment above states.
 #
 # Distributed compilation sends a preprocessed translation unit over the network --
 # several megabytes for an ordinary C++ TU, on the hot path of a parallel build --
@@ -201,6 +208,9 @@ if(FASTCACHED_ENABLE_COMPRESSION AND _fc_cc_zstd AND _fc_cc_lz4)
     target_link_libraries(fastcache-cc PRIVATE ${_fc_cc_zstd} ${_fc_cc_lz4})
     target_compile_definitions(fastcache-cc PRIVATE FC_COMPRESSION_ENABLED=1)
 endif()
+
+# Core/Ed25519.cpp's primitive; see the comment on `_fc_cc_core`.
+target_link_libraries(fastcache-cc PRIVATE fastcache-monocypher)
 
 if(WIN32)
     target_link_libraries(fastcache-cc PRIVATE ws2_32)
@@ -322,7 +332,7 @@ if(FASTCACHED_BUILD_TESTS)
         # ${_fc_cc_core} rows and links FastCache no more than the launcher does.
         target_compile_definitions(fastcache-cc-tests PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX _WIN32_WINNT=0x0A00)
     endif()
-    target_link_libraries(fastcache-cc-tests PRIVATE Catch2::Catch2 Threads::Threads)
+    target_link_libraries(fastcache-cc-tests PRIVATE Catch2::Catch2 Threads::Threads fastcache-monocypher)
     if(FASTCACHED_ENABLE_COMPRESSION AND _fc_cc_zstd AND _fc_cc_lz4)
         target_link_libraries(fastcache-cc-tests PRIVATE ${_fc_cc_zstd} ${_fc_cc_lz4})
         target_compile_definitions(fastcache-cc-tests PRIVATE FC_COMPRESSION_ENABLED=1)

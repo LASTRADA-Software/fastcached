@@ -199,9 +199,9 @@ TEST_CASE("A proof is signed in its own domain, which the unlabelled message was
     CHECK_FALSE(
         ConstantTimeEquals(tag, HmacSha256(key, WireFields::Encode({ fields[0], fields[1], fields[2], fields[3] }))));
 
-    // And the same four fields signed as a LEASE are a different tag, which is the
+    // And the same four fields signed as a NODE PROOF are a different tag, which is the
     // separation the label buys and which arity alone was standing in for.
-    CHECK_FALSE(ConstantTimeEquals(tag, SignFields(key, SigningDomain::LeaseToken, fields)));
+    CHECK_FALSE(ConstantTimeEquals(tag, SignFields(key, SigningDomain::NodeProof, fields)));
 }
 
 TEST_CASE("A proof's fields are framed, not concatenated", "[cluster][discovery][wire]")

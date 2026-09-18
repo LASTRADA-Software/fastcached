@@ -24,13 +24,12 @@
 #include <cstddef>
 #include <cstdint>
 #include <format>
-#include <fstream>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
 
-#include <tests/ScratchPath.hpp>
+#include <tests/RaftPeerKeyFakes.hpp>
 #include <tests/SkewedMetricsSink.hpp>
 #include <tests/Unwrap.hpp>
 
@@ -93,13 +92,6 @@ constexpr PresentComponents NoComponent {
     };
 }
 
-/// A cluster key file of a length `ReadClusterKey` accepts.
-/// @param path Where to write it.
-void WriteClusterKey(std::filesystem::path const& path)
-{
-    std::ofstream out { path, std::ios::binary };
-    out << std::string(32, 'k');
-}
 } // namespace
 
 TEST_CASE("Every condition row travels, in table order, whatever its state", "[node][conditions]")
@@ -140,10 +132,10 @@ TEST_CASE("A live condition clears and raises again; a latched one stays raised"
 
     // A latched row may be raised again -- a second observation of a fixed fact -- and says the
     // newer thing; it is never cleared by it.
-    conditions.Raise(NodeCondition::UnsignedLeaseGrants, "first");
-    conditions.Raise(NodeCondition::UnsignedLeaseGrants, "second");
+    conditions.Raise(NodeCondition::ScratchRootUnmappable, "first");
+    conditions.Raise(NodeCondition::ScratchRootUnmappable, "second");
     auto const rows = conditions.Snapshot();
-    auto const* const latched = RowNamed(rows, RowFor(NodeCondition::UnsignedLeaseGrants).id);
+    auto const* const latched = RowNamed(rows, RowFor(NodeCondition::ScratchRootUnmappable).id);
     REQUIRE(latched != nullptr);
     CHECK(latched->state == "raised");
     CHECK(latched->detail == "second");
@@ -295,16 +287,16 @@ TEST_CASE("Every condition row is evaluated on a fully configured node", "[node]
     clustered.fleetMembers = { "10.0.0.7:6674" };
     NodeMembership membership { clustered, membershipLog, &conditions };
 
-    // The scheduler scope: a scheduler with a cluster key.
-    FastCache::Testing::ScratchDirectory keys { "conditions-wiring" };
+    // The scheduler scope: a scheduler, signing with its identity key (#178). It answers no row
+    // of its own since unsigned grants went; it is started so a row joining its scope later is
+    // asked here.
     NodeConfig scheduling;
     scheduling.serveScheduler = true;
-    scheduling.clusterKeyFile = keys / "cluster.key";
-    WriteClusterKey(scheduling.clusterKeyFile);
+    scheduling.nodeId = "n1";
     ManualClock schedulerClock;
     ManualWallClock wallClock;
-    auto scheduler =
-        SchedulerTier::Start(scheduling, membership.Oracle(), schedulerClock, wallClock, metrics, logger, conditions);
+    auto scheduler = SchedulerTier::Start(
+        scheduling, membership.Oracle(), schedulerClock, wallClock, metrics, logger, FastCache::Testing::TestKeyPair("n1"));
     REQUIRE(scheduler.has_value());
 
     // The worker scope.

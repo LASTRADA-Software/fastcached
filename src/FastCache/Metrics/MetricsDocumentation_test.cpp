@@ -136,6 +136,9 @@ constexpr std::string_view NodePrefix = "fastcache_";
                                            .term = Consensus::Term { .value = 1 },
                                            .commitIndex = Consensus::LogIndex { .value = 1 },
                                            .role = Consensus::Role::Leader };
+    // And the roster's remaining lifetime, rendered only by a node whose roster has a
+    // certificate to lapse (#178) -- absent here, its row could go missing unnoticed.
+    snapshot.rosterExpiresInSeconds = 3600;
     return snapshot;
 }
 

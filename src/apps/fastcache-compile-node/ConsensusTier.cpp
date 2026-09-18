@@ -5,6 +5,7 @@
 #include "NodeSurfaces.hpp"
 
 #include <FastCache/Async/PlatformReactor.hpp>
+#include <FastCache/Cluster/Roster.hpp>
 #include <FastCache/Consensus/RaftMembership.hpp>
 #include <FastCache/Consensus/RaftNode.hpp>
 #include <FastCache/Core/Clock.hpp>
@@ -15,8 +16,11 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <cstddef>
 #include <format>
 #include <mutex>
+#include <span>
 #include <utility>
 
 namespace FastCache::Node
@@ -210,6 +214,9 @@ ConsensusTier::ConsensusTier(Cluster::ClusterMember self,
                              std::string boundEndpoint,
                              RoleObserver onRole,
                              MembersObserver onMembers,
+                             WallClockRef wallClock,
+                             std::string clusterId,
+                             EndorsementObserver onEndorsement,
                              IMetricsSink& metrics,
                              ILogger& logger):
     _logger { logger },
@@ -226,7 +233,10 @@ ConsensusTier::ConsensusTier(Cluster::ClusterMember self,
     _onRole { std::move(onRole) },
     _boundEndpoint { std::move(boundEndpoint) },
     _self { std::move(self) },
-    _onMembers { std::move(onMembers) }
+    _onMembers { std::move(onMembers) },
+    _wallClock { wallClock },
+    _clusterId { std::move(clusterId) },
+    _onEndorsement { std::move(onEndorsement) }
 {
     // Seeded with this node's own record, and its scheduler endpoint travels as a
     // value that is PRESENT even when it is empty. That is an assertion -- "I know
@@ -255,6 +265,8 @@ std::expected<std::unique_ptr<ConsensusTier>, std::string> ConsensusTier::Start(
     std::optional<Ed25519KeyPair> const& identityKey,
     RoleObserver onRole,
     MembersObserver onMembers,
+    WallClockRef wallClock,
+    EndorsementObserver onEndorsement,
     IMetricsSink& metrics,
     ILogger& logger)
 {
@@ -349,6 +361,9 @@ std::expected<std::unique_ptr<ConsensusTier>, std::string> ConsensusTier::Start(
                                                                      std::format("{}:{}", endpoint.host, endpoint.port),
                                                                      std::move(onRole),
                                                                      std::move(onMembers),
+                                                                     wallClock,
+                                                                     cfg.clusterId,
+                                                                     std::move(onEndorsement),
                                                                      metrics,
                                                                      logger } };
 
@@ -501,8 +516,9 @@ std::expected<void, std::string> ConsensusTier::Launch(NodeConfig const& cfg,
 
     // Announced BEFORE anything starts, and unconditionally. Until consensus says
     // otherwise this node is `Undecided`, which is what a node in a cluster that
-    // has not elected anybody is -- and the scheduler surface would otherwise go
-    // on believing the standalone leadership it was constructed with. A node that
+    // has not elected anybody is -- and what the scheduler surface already believes,
+    // since no scheduler leads before an election (#178), so saying it is a formality
+    // that keeps the first publication from depending on that default. A node that
     // recovered a snapshot has already announced exactly this, from the restore's
     // publication above; `Republish` then finds nothing moved and says nothing.
     Republish();
@@ -713,6 +729,10 @@ void ConsensusTier::Reconcile()
     // Every node, because the question "what does THIS node count" has no other
     // answer anywhere. See `ReportQuorum`.
     ReportQuorum();
+
+    // Every node, and before the leadership test below, for the reason `LearnMembers` is: a
+    // roster is certified by a majority of the VOTERS, and a leader cannot endorse for them.
+    Endorse(state);
 
     // Only a leader may propose, and asking here rather than letting `Propose`
     // refuse is what keeps a follower from logging a `NotLeader` every interval for
@@ -1081,6 +1101,42 @@ void ConsensusTier::PublishRole(Consensus::RaftDriver::RoleChange const& change)
     Republish();
 }
 
+void ConsensusTier::Endorse(Cluster::ClusterState const& state)
+{
+    // A voter the state records under the key this node HOLDS. A learner does not vote, a
+    // node the state does not record yet is not a voter of it, and one recorded under another
+    // key would sign an endorsement that verifies nowhere -- the state's key is what every
+    // verifier asks.
+    auto const self = std::ranges::find(state.members, _self.id, &Cluster::ClusterMember::id);
+    if (self == state.members.end() || self->seat != Cluster::MemberSeat::Voter || self->publicKey != _roster.OwnPublicKey())
+        return;
+
+    auto const digest = Cluster::DigestOfRoster(Cluster::ProjectRoster(state));
+    auto const now = _wallClock.Now();
+
+    // Re-signed when the roster moved, and when a refresh is due. "Due" is measured from when
+    // the last one was SIGNED, which its lapse states; a clock stepped backwards past that
+    // instant re-signs too, rather than holding an endorsement stamped in the future.
+    if (_endorsement.has_value() && _endorsement->clusterId == _clusterId && _endorsement->version == state.rosterVersion
+        && _endorsement->rosterDigest == digest)
+    {
+        auto const signedAt = _endorsement->notAfter - Cluster::RosterEndorsementLifetime;
+        if (signedAt <= now && now - signedAt < Cluster::RosterEndorsementRefresh)
+            return;
+    }
+
+    _endorsement =
+        Cluster::SignEndorsement(Cluster::RosterEndorsement { .clusterId = _clusterId,
+                                                              .version = state.rosterVersion,
+                                                              .rosterDigest = digest,
+                                                              .notAfter = now + Cluster::RosterEndorsementLifetime,
+                                                              .endorser = _self.id,
+                                                              .signature = {} },
+                                 [this](std::span<std::byte const> message) { return _roster.SignAsSelf(message); });
+    if (_onEndorsement)
+        _onEndorsement(*_endorsement);
+}
+
 void ConsensusTier::OnStateChanged(Cluster::ClusterState const& state)
 {
     // The roster FIRST, so the keys every peer connection is judged by are the committed
@@ -1161,16 +1217,17 @@ std::expected<std::unique_ptr<ConsensusTier>, std::string> StartConsensusOrExpla
     std::string_view schedulerBound,
     std::optional<Ed25519KeyPair> const& identityKey,
     NodeMembership& membership,
+    NodeRoster& roster,
+    WallClockRef wallClock,
     IMetricsSink& metrics,
     ILogger& logger)
 {
-    // No cluster configured, which is the common deployment: one machine, leading
-    // itself. Requiring an operator to configure a one-member cluster to get that
-    // would be ceremony for the ordinary case.
+    // No cluster configured: a pure worker, which since #178 is the only node that runs
+    // none -- a scheduler is a consensus member even alone.
     //
-    // Asked through `RunsConsensus` rather than spelled here, because `SchedulerTier`
-    // asks the same question to decide whether a role is COMING -- and while both
-    // spelled it for themselves they were two authors of one rule (#613).
+    // Asked through `RunsConsensus` rather than spelled here, because the startup table
+    // asks the same question of a scheduler, and while two tiers spelled it for
+    // themselves they were two authors of one rule (#613).
     if (!RunsConsensus(cfg))
         return std::unique_ptr<ConsensusTier> {};
 
@@ -1186,7 +1243,7 @@ std::expected<std::unique_ptr<ConsensusTier>, std::string> StartConsensusOrExpla
             if (schedulerTier != nullptr)
                 schedulerTier->SetRole(role, leaderEndpoint, term);
         },
-        [&membership](Cluster::ClusterState const& state) {
+        [&membership, &roster](Cluster::ClusterState const& state) {
             // The replicated member set joins the fleet's admission policy, so a node
             // the cluster agreed to admit is served by every surface at once. It does
             // not *become* that policy: `--fleet-member` answers a different question
@@ -1199,6 +1256,20 @@ std::expected<std::unique_ptr<ConsensusTier>, std::string> StartConsensusOrExpla
             // the widening guard needs to be inside the oracle, which is the object
             // every surface bound at construction (#405).
             membership.PublishCluster(state);
+
+            // And the roster every grant this node's worker checks is verified against (#178):
+            // the committed voters and revocations, the moment they are committed.
+            roster.Applied(state);
+        },
+        wallClock,
+        [&schedulerTier, &roster](Cluster::RosterEndorsement const& endorsement) {
+            // Both readers, and neither waits for the other. The presence loop carries the
+            // latest one to whoever leads; this node's own scheduler takes it directly, so a
+            // lone scheduler certifies its roster without dialling itself, and a follower
+            // already holds its own endorsement on the day it is elected.
+            roster.Endorsed(endorsement);
+            if (schedulerTier != nullptr)
+                schedulerTier->Endorse(endorsement);
         },
         metrics,
         logger);

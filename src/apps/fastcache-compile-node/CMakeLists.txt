@@ -58,6 +58,7 @@ add_executable(fastcache-compile-node
     LocalCache.cpp
     NodeAnnounce.cpp
     NodePresenceTier.cpp
+    NodeRoster.cpp
     NodeConditions.cpp
     NodeConfig.cpp
     NodeReload.cpp
@@ -142,6 +143,8 @@ if(FASTCACHED_BUILD_TESTS)
         RemoteUpstream_test.cpp
         NodeAnnounce.cpp
         NodePresenceTier.cpp
+        NodeRoster.cpp
+        NodeRoster_test.cpp
         NodeConditions.cpp
         NodeConditions_test.cpp
         NodeConfig.cpp
@@ -154,6 +157,7 @@ if(FASTCACHED_BUILD_TESTS)
         NodeFrameSurface_test.cpp
         AuthRefusalContract_test.cpp
         FleetMachinePresence_test.cpp
+        FleetRoster_test.cpp
         FleetLeaseRouting_test.cpp
         NodeConfig_test.cpp
         NodeIdentity.cpp

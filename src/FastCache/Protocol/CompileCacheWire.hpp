@@ -172,7 +172,14 @@ using WireVersion = std::uint8_t;
 /// client reading a version-10 receipt would report a key nobody recorded as absent. A key
 /// that reaches the leader and is dropped on the way is the worst of the three: a member
 /// admitted with no key while its operator believes it has one.
-inline constexpr WireVersion CurrentVersion = 11;
+///
+/// **12 made NODE-ANNOUNCE carry a voter's roster endorsement and answer with the certified
+/// roster** (#178). The request gained a fourth top-level field, which the exact-arity decoder
+/// cannot step over, and the reply gained a body where it had none: a version-11 node would
+/// refuse every announcement a version-12 voter sends, and a version-11 worker would never
+/// adopt a roster and refuse every grant once its old one lapsed -- both silently, in the
+/// words of the refusal that ends it.
+inline constexpr WireVersion CurrentVersion = 12;
 
 /// The oldest version this build still accepts. Equal to `CurrentVersion` while
 /// only one version exists; widen the range when a second one ships and this
@@ -314,7 +321,11 @@ inline constexpr WireVersion CurrentVersion = 11;
 /// fields, and a version-10 request answered with it would be answered in a grammar that
 /// version has no reading for -- and a version-10 request is two fields, which the exact-arity
 /// decoder refuses anyway.
-inline constexpr WireVersion MinSupportedVersion = 11;
+///
+/// Version 12 moves it for version 11's: a version-11 announcement is three fields, which the
+/// exact-arity decoder refuses, and a version-11 client has no reading for the roster the reply
+/// now carries.
+inline constexpr WireVersion MinSupportedVersion = 12;
 
 /// Size of the fixed request header: magic, version, op, payload length.
 inline constexpr std::size_t RequestHeaderSize = WireFrame::HeaderSize;
@@ -675,6 +686,12 @@ enum class Op : std::uint8_t
     /// exercised exactly where nobody is looking -- and the history cursor rule (*it advances
     /// only on the verb that carried the batch*) then has two answers depending on a
     /// configuration flag.
+    ///
+    /// **And it is how the certified roster travels (#178).** A voter's announcement carries
+    /// its signed endorsement of the roster it applied; the leader's `Ok` carries the roster a
+    /// majority of the current voters endorse, or nothing until they have. Riding the verb
+    /// every node already sends costs no log entry and no second loop -- and a worker that
+    /// follows `NotLeader` to the real leader adopts that leader's roster in the same round.
     NodeAnnounce = 0x1A,
 
     /// Ask a node which route admits or refuses a NAMED host (#1471).
@@ -1165,6 +1182,19 @@ enum class ErrorCode : std::uint8_t
     /// admitted or refused by its ADDRESS exactly as it would have been without ever proving
     /// anything. The proof is an upgrade, so failing it takes nothing away.
     NodeProofRejected = 0x27,
+
+    /// This worker cannot verify ANY grant right now: it holds no roster its trust anchors
+    /// certify, or the one it holds has not been re-certified by a majority of its voters for
+    /// longer than its lifetime and the skew slack (#178).
+    ///
+    /// A statement about the WORKER, never about the grant, which is why it is not
+    /// `LeaseUnauthorized` or `LeaseExpired`: a client told its lease was bad would ask the same
+    /// scheduler for another and be refused again, while this says the machine it was sent to
+    /// is cut off from the cluster that vouches for its schedulers. A fleet whose every worker
+    /// answers this is a fleet whose leader has stopped certifying rosters -- or whose workers
+    /// only reach an ex-leader that withholds them -- and the worker's
+    /// `fastcache_roster_expires_in_seconds` gauge is where it showed first.
+    RosterExpired = 0x28,
 };
 
 /// Bit for `status` within an `OpDescriptor::legalStatuses` mask.
@@ -1820,7 +1850,7 @@ inline constexpr std::array OpTable {
                    .family = VerbFamily::Scheduler },
     OpDescriptor { .code = Op::NodeAnnounce,
                    .name = "node-announce",
-                   .fieldCount = 3, // endpoint, capacity, load
+                   .fieldCount = 4, // endpoint, capacity, load, endorsement
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
                    // Not pre-auth, for the same reason as every other verb in this block: a
                    // node announcing itself is already a caller the scheduler's credential
@@ -2209,6 +2239,10 @@ inline constexpr std::array ErrorTable {
     ErrorDescriptor { .code = ErrorCode::NodeProofRejected,
                       .name = "node-proof-rejected",
                       .defaultMessage = "the node proof did not authenticate under this cluster's key" },
+    ErrorDescriptor { .code = ErrorCode::RosterExpired,
+                      .name = "roster-expired",
+                      .defaultMessage = "this worker holds no roster its voters currently certify, so it can verify no "
+                                        "grant" },
 };
 
 /// Wire bytes that once meant something and must never mean anything again.
@@ -4103,6 +4137,16 @@ struct NodeAnnounceRequest
     /// is the second half of #1440: a node whose history rode the worker heartbeat handed over
     /// nothing at all when it had no worker.
     LoadFields load {};
+
+    /// This node's signed endorsement of the roster it has applied, when it is a voter
+    /// holding one; empty otherwise (#178).
+    ///
+    /// OPAQUE here, encoded by `Cluster/RosterCertificate` -- this header stays
+    /// dependency-free, and the leader verifies the signature before it reads a single claim
+    /// in it. A top-level field of its own rather than a member of `load`: it is not a
+    /// reading of the machine, and the leader must be able to refuse it without refusing the
+    /// load and the history that ride beside it.
+    std::span<std::byte const> endorsement {};
 };
 
 /// Frame a NODE-ANNOUNCE request.
@@ -4114,10 +4158,12 @@ struct NodeAnnounceRequest
 {
     auto const capacity = EncodeCapacity(request.capacity);
     auto const load = EncodeLoad(request.load);
-    return Detail::EncodeRequest(
-        version,
-        Op::NodeAnnounce,
-        { AsBytes(request.endpoint), std::span<std::byte const> { capacity }, std::span<std::byte const> { load } });
+    return Detail::EncodeRequest(version,
+                                 Op::NodeAnnounce,
+                                 { AsBytes(request.endpoint),
+                                   std::span<std::byte const> { capacity },
+                                   std::span<std::byte const> { load },
+                                   request.endorsement });
 }
 
 /// A node's announcement of itself, as received.
@@ -4132,6 +4178,7 @@ struct NodeAnnounceView
     std::span<std::byte const> endpoint;
     CapacityFields capacity {};
     LoadFields load {};
+    std::span<std::byte const> endorsement; ///< Borrowed, and empty when none travelled.
 };
 
 /// Split a NODE-ANNOUNCE payload.
@@ -4148,7 +4195,9 @@ struct NodeAnnounceView
     auto load = DecodeLoad((*fields)[2]);
     if (!load.has_value())
         return std::nullopt;
-    return NodeAnnounceView { .endpoint = (*fields)[0], .capacity = *std::move(capacity), .load = *std::move(load) };
+    return NodeAnnounceView {
+        .endpoint = (*fields)[0], .capacity = *std::move(capacity), .load = *std::move(load), .endorsement = (*fields)[3]
+    };
 }
 
 /// Frame a HEARTBEAT request.
@@ -5013,6 +5062,26 @@ struct AdmissionExplanationFields
 /// `static_assert`s the two equal where it fills the field, so they cannot drift apart silently.
 inline constexpr std::size_t IdentityPublicKeyBytes = 32;
 
+/// What `--node-status` says about the roster a node verifies lease grants against (#178).
+///
+/// Carried as its own nested record inside `NodeRuntimeFields`, because it is one fact with
+/// five parts and an operator reads it as one: which roster, how many vote, how many machines
+/// are admitted by key, how many keys are revoked, and until when it is certified.
+struct NodeRosterFields
+{
+    std::uint64_t version { 0 };    ///< `ClusterState::rosterVersion` of the roster held.
+    std::uint32_t voters { 0 };     ///< Members that vote.
+    std::uint32_t principals { 0 }; ///< Machines admitted by key rather than as members.
+    std::uint32_t revoked { 0 };    ///< Keys the cluster will never admit again.
+
+    /// When its certification lapses, in milliseconds since the Unix epoch -- ABSENT on a
+    /// consensus member, whose roster is the state it applied and needs no certificate. A
+    /// worker past this instant (and the clock-skew slack) refuses every grant `roster-expired`.
+    std::optional<std::uint64_t> certifiedUntilMillis {};
+
+    [[nodiscard]] friend bool operator==(NodeRosterFields const&, NodeRosterFields const&) = default;
+};
+
 /// What a node's live components report about themselves, as opposed to what its
 /// configuration asked for.
 ///
@@ -5195,6 +5264,11 @@ struct NodeRuntimeFields
     /// predates the field sends fewer fields, and both read as absent, which is the most a
     /// reader can honestly say about either.
     std::optional<std::array<std::byte, IdentityPublicKeyBytes>> identityPublicKey {};
+
+    /// The roster this node verifies lease grants against (#178), or disengaged on a node that
+    /// holds none -- one no other machine can reach, which checks no grant -- or on one too old
+    /// to say.
+    std::optional<NodeRosterFields> roster {};
 };
 
 /// What an operator reads `NodeRuntimeFields::consensusEndpoint` under, as prose: the
@@ -5279,6 +5353,53 @@ namespace Detail
     }
 } // namespace Detail
 
+/// Fields a `NodeRosterFields` record carries. A reader accepts more, and ignores the surplus.
+inline constexpr std::size_t NodeRosterFieldCount = 5;
+
+/// Encode a roster summary as one nested record.
+/// @param roster The summary.
+/// @return Its bytes; never empty, so an engaged roster never reads back as absent.
+[[nodiscard]] inline std::vector<std::byte> EncodeNodeRoster(NodeRosterFields const& roster)
+{
+    auto const version = WireFields::ToBigEndian<std::uint64_t>(roster.version);
+    auto const voters = WireFields::ToBigEndian<std::uint32_t>(roster.voters);
+    auto const principals = WireFields::ToBigEndian<std::uint32_t>(roster.principals);
+    auto const revoked = WireFields::ToBigEndian<std::uint32_t>(roster.revoked);
+    auto const certifiedUntil = Detail::OptionalBigEndian(roster.certifiedUntilMillis);
+    return WireFields::Encode({ std::span<std::byte const> { version },
+                                std::span<std::byte const> { voters },
+                                std::span<std::byte const> { principals },
+                                std::span<std::byte const> { revoked },
+                                certifiedUntil });
+}
+
+/// Read a roster summary.
+/// @param field The nested record's bytes; empty is ABSENT.
+/// @param out Set only when the field carried a roster.
+/// @return False when the field was present and not a roster this build reads.
+[[nodiscard]] inline bool ReadNodeRoster(std::span<std::byte const> field, std::optional<NodeRosterFields>& out)
+{
+    if (field.empty())
+        return true;
+    auto const parts = WireFields::SplitAll(field);
+    if (!parts.has_value() || parts->size() < NodeRosterFieldCount)
+        return false;
+    auto const version = WireFields::FromBigEndian<std::uint64_t>((*parts)[0]);
+    auto const voters = WireFields::FromBigEndian<std::uint32_t>((*parts)[1]);
+    auto const principals = WireFields::FromBigEndian<std::uint32_t>((*parts)[2]);
+    auto const revoked = WireFields::FromBigEndian<std::uint32_t>((*parts)[3]);
+    auto roster = NodeRosterFields {};
+    if (!version.has_value() || !voters.has_value() || !principals.has_value() || !revoked.has_value()
+        || !Detail::ReadOptionalBigEndian((*parts)[4], roster.certifiedUntilMillis))
+        return false;
+    roster.version = *version;
+    roster.voters = *voters;
+    roster.principals = *principals;
+    roster.revoked = *revoked;
+    out = roster;
+    return true;
+}
+
 /// Frame a runtime record as one nested field list.
 ///
 /// Absent facts travel as ZERO-LENGTH fields rather than as zero values, exactly as
@@ -5317,6 +5438,8 @@ namespace Detail
     auto const identityPublicKey = runtime.identityPublicKey.has_value()
                                        ? std::span<std::byte const> { *runtime.identityPublicKey }
                                        : std::span<std::byte const> {};
+    // Absent as zero length; an engaged roster is never empty -- see `EncodeNodeRoster`.
+    auto const roster = runtime.roster.has_value() ? EncodeNodeRoster(*runtime.roster) : std::vector<std::byte> {};
 
     // Positional, so the ORDER here is the wire contract for this record. Append only:
     // an insertion shifts every later field and every peer decodes one fact as the next.
@@ -5337,7 +5460,8 @@ namespace Detail
                                 forgottenClients,
                                 consensusStanding,
                                 conditions,
-                                identityPublicKey });
+                                identityPublicKey,
+                                roster });
 }
 
 /// Read a runtime record back.
@@ -5514,6 +5638,10 @@ namespace Detail
         out.identityPublicKey.emplace();
         std::ranges::copy(key, out.identityPublicKey->begin());
     }
+
+    // Field 18 (#178 PR 5). Empty is ABSENT, and so is a record from a build before it.
+    if (!ReadNodeRoster(at(18), out.roster))
+        return std::nullopt;
 
     return out;
 }

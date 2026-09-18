@@ -83,6 +83,7 @@ constexpr std::array WriterFiles {
     SurfaceWriterFile { .surface = MetricsSurface::CompileScheduler,
                         .path = "src/FastCache/Distributed/SchedulerService.cpp" },
     SurfaceWriterFile { .surface = MetricsSurface::CompileWorker, .path = "src/FastCache/Distributed/LeaseToken.hpp" },
+    SurfaceWriterFile { .surface = MetricsSurface::CompileWorker, .path = "src/FastCache/Distributed/RosterTrust.cpp" },
     SurfaceWriterFile { .surface = MetricsSurface::CompileWorker, .path = "src/apps/fastcache-cc/CodecEnvelope.cpp" },
     SurfaceWriterFile { .surface = MetricsSurface::CompileWorker, .path = "src/apps/fastcache-cc/WorkerProtocol.cpp" },
     SurfaceWriterFile { .surface = MetricsSurface::CompileWorker,
@@ -91,6 +92,7 @@ constexpr std::array WriterFiles {
                         .path = "src/apps/fastcache-compile-node/CompileResponder.cpp" },
     SurfaceWriterFile { .surface = MetricsSurface::CompileWorker,
                         .path = "src/apps/fastcache-compile-node/CompileResponder.hpp" },
+    SurfaceWriterFile { .surface = MetricsSurface::CompileWorker, .path = "src/apps/fastcache-compile-node/NodeRoster.cpp" },
     SurfaceWriterFile { .surface = MetricsSurface::CompileWorker, .path = "src/apps/fastcache-compile-node/WorkerTier.cpp" },
     SurfaceWriterFile { .surface = MetricsSurface::ConsensusPeerWire,
                         .path = "src/FastCache/Consensus/RaftPeerRefusals.hpp" },
@@ -544,9 +546,9 @@ TEST_CASE("counter-attribution: the mechanism figures quoted beside the table st
     // tracked its own subject would silently re-attribute a real measurement to conditions it
     // was never taken under. Drift is a red build, which is what the previous "106 of 144" --
     // a sentence with nothing watching it -- did not get.
-    CHECK(incremented.size() == 39);
+    CHECK(incremented.size() == 42);
     CHECK(refusalRow.size() == 111);
-    CHECK(outcomeRow.size() == 7);
+    CHECK(outcomeRow.size() == 10);
     CHECK(returned.size() == 4);
 
     std::set<std::string> anyWriter;
@@ -556,7 +558,7 @@ TEST_CASE("counter-attribution: the mechanism figures quoted beside the table st
     // No catalogue row is written by none of the four. The check for that is the whole
     // catalogue, not a count: a row nobody writes is a row whose surface was guessed.
     CHECK(anyWriter.size() == spellings.size());
-    CHECK(spellings.size() - incremented.size() == 118);
+    CHECK(spellings.size() - incremented.size() == 121);
 
     // 111 rows have a refusal row; 110 of them have no increment site. Two figures one apart
     // measuring different things is how a census gets quoted wrong -- the first draft of the
@@ -568,7 +570,7 @@ TEST_CASE("counter-attribution: the mechanism figures quoted beside the table st
             reachedByRefusalRowsAlone.insert(name);
     CHECK(reachedByRefusalRowsAlone.size() == 110);
 
-    // And four rows are written two ways, which is why the column sums to 161 over 157 rows.
+    // And four rows are written two ways, which is why the column sums to 167 over 163 rows.
     CHECK(incremented.size() + refusalRow.size() + outcomeRow.size() + returned.size() == spellings.size() + 4);
 }
 

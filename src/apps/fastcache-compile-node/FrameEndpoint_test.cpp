@@ -44,6 +44,7 @@
 
 #include <tests/AbortiveClient.hpp>
 #include <tests/BoundedWait.hpp>
+#include <tests/LeaseRosterFakes.hpp>
 #include <tests/NodeProofFakes.hpp>
 #include <tests/Unwrap.hpp>
 #include <tests/WireReply.hpp>
@@ -80,7 +81,8 @@ struct Fleet
     AtomicMetricsSink metrics;
     NullLogger schedulerLogger;
     ManualWallClock wallClock;
-    Distributed::SchedulerService service { clock, wallClock, metrics, schedulerLogger, {}, {} };
+    Distributed::KeyPairLeaseSigner const signer = Testing::TestLeaseSigner();
+    Distributed::SchedulerService service { clock, wallClock, metrics, schedulerLogger, signer, {} };
     Distributed::SchedulerProtocol protocol { service, metrics };
     // Loopback, because that is the host a test connection arrives from. The
     // endpoint is given with a port so the constructor's host/endpoint collapse is

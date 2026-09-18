@@ -577,6 +577,21 @@ struct ClusterState
     /// property is that it cannot.
     std::vector<RevokedKey> revokedKeys;
 
+    /// How many times the ROSTER has changed: the members' ids, endpoints, seats and keys,
+    /// the principals and the revoked keys (#178).
+    ///
+    /// **Derived by `Apply`, never carried by a command**, and bumped only when the roster's
+    /// projection actually differs afterwards -- so every voter applying the same log reaches
+    /// the same number for the same roster, which is what lets their endorsements of it add
+    /// up to a majority. The applied log INDEX is the rejected alternative: two voters a
+    /// moment apart would endorse one roster under two versions, and neither would ever
+    /// reach a majority.
+    ///
+    /// A worker adopts only a version at least as new as the one it holds, so this is also
+    /// what stops a replayed old roster -- endorsed when it was current -- from winding a
+    /// worker back.
+    std::uint64_t rosterVersion {};
+
     [[nodiscard]] friend bool operator==(ClusterState const&, ClusterState const&) = default;
 
     /// The consensus endpoint recorded for `id`, if any.

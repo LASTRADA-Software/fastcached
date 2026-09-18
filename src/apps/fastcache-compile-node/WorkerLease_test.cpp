@@ -4,18 +4,18 @@
 
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Logger.hpp>
+#include <FastCache/Distributed/LeaseSigner.hpp>
 #include <FastCache/Distributed/LeaseToken.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <chrono>
 #include <cstddef>
-#include <fstream>
 #include <optional>
 #include <string>
 #include <vector>
 
-#include <tests/ScratchPath.hpp>
+#include <tests/LeaseRosterFakes.hpp>
 #include <tests/Unwrap.hpp>
 
 using namespace FastCache;
@@ -46,31 +46,31 @@ inline constexpr std::uint64_t DeposedTerm = 4;
 /// expiry that moved per run would make a failure look like a flake.
 ManualWallClock const LeaseClock { std::chrono::system_clock::time_point { std::chrono::seconds { 1704067200 } } };
 
-/// The key both actors share. Constant for the reason the clock is.
-/// @return Thirty-two arbitrary bytes.
-[[nodiscard]] std::vector<std::byte> TestClusterKey()
+/// The scheduler that signs every grant here. Its key is derived from its name, constant
+/// for the reason the clock is.
+/// @return The signer.
+[[nodiscard]] Distributed::KeyPairLeaseSigner const& TestSigner()
 {
-    return std::vector<std::byte>(32, std::byte { 0x5A });
+    static auto const signer = Testing::TestLeaseSigner("scheduler");
+    return signer;
 }
 
-/// A node configured the way `main.cpp` configures one that checks grants.
-/// @param keyFile Where the cluster key was written.
+/// The roster a checking worker holds: the scheduler above, as a voter (#178).
+/// @return The roster; one for the file, since a validator borrows it and nothing here changes it.
+[[nodiscard]] Testing::FixedLeaseRoster const& TestRoster()
+{
+    static Testing::FixedLeaseRoster const roster { { "scheduler" } };
+    return roster;
+}
+
+/// A node configured the way `main.cpp` configures one that checks grants: its fleet named.
+/// What it checks AGAINST is the roster handed to the factory beside it.
 /// @return The configuration.
-[[nodiscard]] NodeConfig ConfigWithKey(std::filesystem::path const& keyFile)
+[[nodiscard]] NodeConfig CheckingConfig()
 {
     NodeConfig cfg;
-    cfg.clusterKeyFile = keyFile.string();
     cfg.clusterId = std::string { ThisCluster };
     return cfg;
-}
-
-/// Write the cluster key where `ReadClusterKey` will find it.
-/// @param keyFile Where to write it.
-void WriteClusterKey(std::filesystem::path const& keyFile)
-{
-    auto const key = TestClusterKey();
-    std::ofstream out { keyFile, std::ios::binary };
-    out.write(reinterpret_cast<char const*>(key.data()), static_cast<std::streamsize>(key.size()));
 }
 
 /// A grant, signed the way a scheduler signs one.
@@ -90,35 +90,37 @@ void WriteClusterKey(std::filesystem::path const& keyFile)
                                      std::string_view endpoint = ThisWorker)
 {
     return Distributed::MintLeaseToken(
-        TestClusterKey(),
+        TestSigner(),
         Distributed::LeaseClaims { .serial = std::string { serial },
                                    .endpoint = std::string { endpoint },
                                    .fingerprint = "gcc-13",
                                    .key = "obj-abc",
                                    .expiresAt = LeaseClock.Now() + std::chrono::minutes { 10 },
                                    .clusterId = std::string { ThisCluster },
-                                   .epoch = epoch });
+                                   .epoch = epoch,
+                                   .signer = {} });
 }
 
-/// A grant from ANOTHER fleet, signed with the same key.
+/// A grant from ANOTHER fleet, signed by the same voter.
 ///
-/// The shape two sites provisioned from one `--cluster-key-file` produce, which is
-/// what copying a working configuration or cloning staging from production gives you.
-/// The MAC verifies; only the fleet differs.
+/// The shape two sites whose rosters name one machine produce, which is what copying a
+/// working state directory or cloning staging from production gives you. The signature
+/// verifies; only the fleet differs.
 /// @param epoch The scheduler term it is issued under.
 /// @param serial What distinguishes this issuance from the last; see `GrantUnder`.
 /// @return The token, as a client would present it.
 [[nodiscard]] std::string ForeignGrantUnder(std::uint64_t epoch, std::string_view serial = "17")
 {
     return Distributed::MintLeaseToken(
-        TestClusterKey(),
+        TestSigner(),
         Distributed::LeaseClaims { .serial = std::string { serial },
                                    .endpoint = std::string { ThisWorker },
                                    .fingerprint = "gcc-13",
                                    .key = "obj-abc",
                                    .expiresAt = LeaseClock.Now() + std::chrono::minutes { 10 },
                                    .clusterId = "fleet-b",
-                                   .epoch = epoch });
+                                   .epoch = epoch,
+                                   .signer = {} });
 }
 
 } // namespace
@@ -164,17 +166,13 @@ TEST_CASE("A worker that republishes its advertised address verifies grants nami
     // defect, one layer up from where it is testable.
     //
     // So this drives the production path end to end: the real factory, the real
-    // `AnnouncedEndpoint`, a real key file, and a `Publish` standing in for the
-    // heartbeat's re-announce.
-    Testing::ScratchDirectory const scratch { "fc-worker-lease-advertise" };
-    auto const keyFile = scratch.Path() / "cluster.key";
-    WriteClusterKey(keyFile);
-
-    auto const cfg = ConfigWithKey(keyFile);
+    // `AnnouncedEndpoint`, a roster, and a `Publish` standing in for the heartbeat's
+    // re-announce.
+    auto const cfg = CheckingConfig();
     WorkerState state;
 
     auto validator = MakeWorkerLeaseValidator(
-        cfg, state.advertised, SocketActivation::No, LeaseClock, state.lease, state.metrics, state.logger);
+        cfg, &TestRoster(), state.advertised, SocketActivation::No, LeaseClock, state.lease, state.metrics, state.logger);
     REQUIRE(validator.has_value());
     // Registered, as every case here but the unregistered one assumes (#401).
     state.lease.fleet.Pin(std::string { ThisCluster });
@@ -222,15 +220,11 @@ TEST_CASE("A worker that has verified no grant still refuses a foreign fleet", "
     // window would be. What #401 describes could only exist in the PATH -- a worker
     // whose expectation came from somewhere other than its configuration -- so that is
     // where it has to be looked for.
-    Testing::ScratchDirectory const scratch { "fc-worker-lease-fleet" };
-    auto const keyFile = scratch.Path() / "cluster.key";
-    WriteClusterKey(keyFile);
-
-    auto const cfg = ConfigWithKey(keyFile);
+    auto const cfg = CheckingConfig();
     WorkerState state;
 
     auto validator = MakeWorkerLeaseValidator(
-        cfg, state.advertised, SocketActivation::No, LeaseClock, state.lease, state.metrics, state.logger);
+        cfg, &TestRoster(), state.advertised, SocketActivation::No, LeaseClock, state.lease, state.metrics, state.logger);
     REQUIRE(validator.has_value());
 
     // What a completed registration round does, and the only way this worker learns a
@@ -273,13 +267,9 @@ TEST_CASE("The production factory wires the spend and the term through", "[node]
     // stays green while the production worker enforces nothing -- `PurgeExpired`
     // exactly: correct, tested, and reachable from nothing.
     //
-    // So this drives the factory `main.cpp` actually calls, with a real key file, and
-    // asserts the whole chain in one case.
-    Testing::ScratchDirectory const scratch { "fc-worker-lease" };
-    auto const keyFile = scratch.Path() / "cluster.key";
-    WriteClusterKey(keyFile);
-
-    auto const cfg = ConfigWithKey(keyFile);
+    // So this drives the factory `main.cpp` actually calls, with a roster, and asserts the
+    // whole chain in one case.
+    auto const cfg = CheckingConfig();
 
     // Recording rather than silent, because the notice's WIRING is the half no unit test
     // of the notice itself can see: a `SchedulerTermRegressionNotice` that works perfectly and
@@ -289,7 +279,7 @@ TEST_CASE("The production factory wires the spend and the term through", "[node]
         [&said](std::string_view line) { said.emplace_back(line); } } };
 
     auto validator = MakeWorkerLeaseValidator(
-        cfg, state.advertised, SocketActivation::No, LeaseClock, state.lease, state.metrics, state.logger);
+        cfg, &TestRoster(), state.advertised, SocketActivation::No, LeaseClock, state.lease, state.metrics, state.logger);
     REQUIRE(validator.has_value());
     // Registered, as every case here but the unregistered one assumes (#401).
     state.lease.fleet.Pin(std::string { ThisCluster });
@@ -347,22 +337,21 @@ TEST_CASE("The production factory wires the spend and the term through", "[node]
     CHECK(state.metrics.Read(IMetricsSink::Counter::WorkerSchedulerTermRegressions) == 1);
 }
 
-TEST_CASE("A node with no cluster key builds a validator that learns and spends nothing", "[node][lease][epoch]")
+TEST_CASE("A node with no roster builds a validator that learns and spends nothing", "[node][lease][epoch]")
 {
     // The other production path through the same factory, asserted because the term and
     // the spent set are taken on BOTH and a reader should not have to guess whether the
     // unchecked one quietly uses them. It refuses nothing and remembers nothing: a node
-    // admitting only its own machine has no signature to check, so it has no authentic
-    // term to believe and no authentic grant to spend.
+    // admitting only its own machine has no roster to check a signature against, so it has
+    // no authentic term to believe and no authentic grant to spend.
     //
-    // The second half matters on its own: a spend here would make a keyless node refuse
-    // the second compile of any TU whose token bytes repeated, which for an unsigned
-    // grant is a bare `LeaseTable` serial that restarts at 1 with the scheduler.
+    // The second half matters on its own: a spend here would make such a node refuse the
+    // second compile of any TU whose token bytes repeated.
     NodeConfig cfg;
     WorkerState state;
 
     auto validator = MakeWorkerLeaseValidator(
-        cfg, state.advertised, SocketActivation::No, LeaseClock, state.lease, state.metrics, state.logger);
+        cfg, nullptr, state.advertised, SocketActivation::No, LeaseClock, state.lease, state.metrics, state.logger);
     REQUIRE(validator.has_value());
     // Registered, as every case here but the unregistered one assumes (#401).
     state.lease.fleet.Pin(std::string { ThisCluster });
@@ -371,6 +360,32 @@ TEST_CASE("A node with no cluster key builds a validator that learns and spends 
     CHECK_FALSE((*validator)(GrantUnder(CurrentTerm), "gcc-13").refusal.has_value());
     CHECK_FALSE(state.lease.term.Known().has_value());
     CHECK(state.lease.spent.Size() == 0);
+}
+
+TEST_CASE("A socket-activated worker that admits remote peers and holds no roster is refused", "[node][lease][roster]")
+{
+    // The backstop the startup table cannot be (#282, #178): under socket activation the
+    // unit chose the address, so `--bind` describes nothing, and a node with no roster must
+    // not build a validator that refuses nothing. The refusal names the remedy.
+    NodeConfig cfg;
+    cfg.fleetOpen = true;
+    WorkerState state;
+
+    auto const refused = MakeWorkerLeaseValidator(
+        cfg, nullptr, state.advertised, SocketActivation::Yes, LeaseClock, state.lease, state.metrics, state.logger);
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error().contains("--voter-key"));
+
+    // The control: the same node HOLDING a roster builds its checking validator.
+    CHECK(MakeWorkerLeaseValidator(cfg,
+                                   &TestRoster(),
+                                   state.advertised,
+                                   SocketActivation::Yes,
+                                   LeaseClock,
+                                   state.lease,
+                                   state.metrics,
+                                   state.logger)
+              .has_value());
 }
 
 TEST_CASE("The --cluster-id flag asserts the fleet rather than choosing it", "[node][lease][fleet]")

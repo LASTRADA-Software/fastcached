@@ -375,9 +375,9 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
       .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::WorkerJobsRefusedLeaseUnauthorized,
       .prometheusName = "fastcache_worker_jobs_refused_lease_unauthorized_total",
-      .help = "Jobs refused because the lease was not signed by this cluster. A "
-              "security signal, not a capacity one -- or a launcher predating "
-              "signed leases, which presents a token that cannot authenticate.",
+      .help = "Jobs refused because the lease was not signed by any voter this worker's "
+              "roster names. A security signal, not a capacity one -- or a launcher "
+              "predating this lease format, which presents a token that cannot authenticate.",
       .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::WorkerJobsRefusedLeaseUnregistered,
       .prometheusName = "fastcache_worker_jobs_refused_lease_unregistered_total",
@@ -388,8 +388,9 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
     { .counter = IMetricsSink::Counter::WorkerJobsRefusedLeaseWrongCluster,
       .prometheusName = "fastcache_worker_jobs_refused_lease_wrong_cluster_total",
       .help = "Jobs refused because an authentic lease was issued by a different fleet. "
-              "A rise means two clusters are running from the same --cluster-key-file, "
-              "which is what copying a working configuration to a second site produces.",
+              "Every grant is signed by a voter's own identity key, so a rise means one "
+              "key votes in two clusters -- a --cluster-dir copied to a second site, which "
+              "copies the node and its key with it.",
       .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::WorkerJobsRefusedLeaseReplayed,
       .prometheusName = "fastcache_worker_jobs_refused_lease_replayed_total",
@@ -1077,6 +1078,45 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
       .help = "Proven Raft sessions this node ended before sending a frame, because the key the acceptor proved "
               "the session with stopped being that member's in the cluster's roster: revoked, or replaced. The "
               "redial that follows is judged against the roster as it is now.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::WorkerJobsRefusedLeaseNoRoster,
+      .prometheusName = "fastcache_worker_jobs_refused_lease_no_roster_total",
+      .help = "Grants refused because this worker holds no roster to verify them against: it has not yet been "
+              "handed one its --voter-key anchors certify, and kept none from an earlier run. A few at startup are "
+              "ordinary; a rise that does not stop means no leader it can reach is endorsed by the keys it was "
+              "given.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::WorkerJobsRefusedLeaseRosterExpired,
+      .prometheusName = "fastcache_worker_jobs_refused_lease_roster_expired_total",
+      .help = "Grants refused because this worker's roster has not been re-certified by a majority of its voters "
+              "within its lifetime and the clock-skew slack, so it cannot tell a live voter from a revoked one. The "
+              "worker is cut off from the leader, or reaches only an ex-leader that withholds newer rosters; "
+              "fastcache_node_roster_expires_in_seconds reached 0 first.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::WorkerJobsRefusedLeaseSignerRevoked,
+      .prometheusName = "fastcache_worker_jobs_refused_lease_signer_revoked_total",
+      .help = "Grants refused because their signature verifies under a key the cluster has revoked: the removed "
+              "machine itself, still leasing out work. Should read zero; a rise names a machine somebody removed and "
+              "nobody stopped.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::WorkerRostersRefusedUncertified,
+      .prometheusName = "fastcache_worker_rosters_refused_uncertified_total",
+      .help = "Rosters a scheduler handed this worker that a strict majority of the voters it trusts did not "
+              "endorse, so it kept the one it holds. Expected zero: a rise is a scheduler serving a roster the "
+              "cluster did not agree -- a revoked ex-leader keeping itself on it -- or a worker so far behind that "
+              "none of its voters remain.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::WorkerRostersRefusedExpired,
+      .prometheusName = "fastcache_worker_rosters_refused_expired_total",
+      .help = "Rosters a scheduler handed this worker whose endorsements had lapsed before they arrived, so it kept "
+              "the one it holds. The scheduler that answered is serving a roster its voters stopped re-endorsing: an "
+              "ex-leader, or voters whose clocks are far behind this one.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::SchedulerRosterEndorsementsRefused,
+      .prometheusName = "fastcache_scheduler_roster_endorsements_refused_total",
+      .help = "Roster endorsements this scheduler refused because they were not signed by a voter it holds a key "
+              "for. Endorsements of an older roster are dropped without counting: they are what a change looks like "
+              "for a few seconds. A rise names a machine claiming to vote that does not.",
       .type = MetricType::Counter },
 } };
 
