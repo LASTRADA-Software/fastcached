@@ -2899,8 +2899,9 @@ TEST_CASE("A condition row from a newer node keeps what this build can read", "[
 {
     // A seventh field is a fact appended by a build ahead of this one: skipped, and the six this
     // build knows are still read. A state word it has never seen is KEPT, and asks for attention.
-    std::vector<std::span<std::byte const>> fields;
     auto const texts = std::array<std::string_view, 7> { "id", "latched", "warning", "suppressed", "d", "r", "since" };
+    std::vector<std::span<std::byte const>> fields;
+    fields.reserve(texts.size());
     for (auto const text: texts)
         fields.push_back(AsBytes(text));
     auto const row = WireFields::Encode(WireFields::FieldList { fields });
