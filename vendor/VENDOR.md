@@ -51,7 +51,7 @@ Both repositories are Apache-2.0, and so is this copy. `endo/tui` was last touch
 upstream at `37d875f8` (2026-08-15).
 
 `src/tui` upstream is 154 files and ~46k lines; with the 19 supporting files below and
-3 local changes' new test files ("Local changes") the copy is **176 files, 49,467 lines**.
+3 local changes' new test files ("Local changes") the copy is **176 files, 49,485 lines**.
 Those figures, and the ones in the next section, are recomputed from the tree and `MANIFEST`
 by `ctest -R vendor-figures`, which refuses a sentence that no longer describes the copy.
 
@@ -230,7 +230,7 @@ none.
 
 ## Local changes
 
-Four local changes, 23 files between them; the other 153 files of `vendor/endo`, and all six of
+Five local changes, 25 files between them; the other 151 files of `vendor/endo`, and all six of
 `vendor/monocypher`, are byte-identical to their upstream blobs. A later change can touch a file an earlier one did, so a file can be named by more than one row.
 Both halves are checked rather than asserted: `vendor/MANIFEST` records each changed file's
 UPSTREAM hash beside its current one, and `ctest -R vendor-verbatim` refuses a file that differs
@@ -242,11 +242,11 @@ counts as declared only when a row names it in backticks, so prose here explains
 nothing.
 
 **One branch per upstream carries every local change**, so the fixes go back as one pull request
-per upstream: endo's on `fastcached/upstream`, published as
-[contour-terminal/endo#184](https://github.com/contour-terminal/endo/pull/184), and contour's on a `fastcached/upstream`
-in a contour checkout. Each row names its commit on that branch, one commit per change. **A later endo change is a new
-commit on that same branch, pushed to update #184** -- never a second pull request, which would split one review of a
-single set of fixes across two threads nobody reads together. No row today
+per upstream: endo's on `fastcached/upstream`, and contour's on a `fastcached/upstream` in a contour checkout. Each row
+names its commit on that branch, one commit per change. The first four endo rows were published as
+[contour-terminal/endo#184](https://github.com/contour-terminal/endo/pull/184), merged at `f774a210`; **a later endo
+change is a new commit on that same branch, and every change not yet merged goes back in ONE pull request** -- never
+one per fix, which would split one review of a single set of fixes across threads nobody reads together. No row today
 changes a contour-origin file (`coro/*`, `crispy/FNV.hpp`), or a Monocypher file.
 
 | files | what | why | upstream | prepared as |
@@ -255,6 +255,7 @@ changes a contour-origin file (`coro/*`, `crispy/FNV.hpp`), or a Monocypher file
 | `vendor/endo/tui/CMakeLists.txt`<br>`vendor/endo/tui/Terminal.hpp`<br>`vendor/endo/tui/TerminalInputWin32_test.cpp`<br>`vendor/endo/tui/TerminalQuery_test.cpp`<br>`vendor/endo/tui/platform/Terminal.cpp`<br>`vendor/endo/tui/platform/TerminalInputWin32.cpp`<br>`vendor/endo/tui/platform/TerminalShared.cpp`<br>`vendor/endo/tui/platform/TerminalWin32.cpp` | `queryDecMode` moves into `TerminalShared.cpp`, so the Windows arm sends DECRQM and reads the reply through the shared loop; the Windows stub and `DecModeStatus::NotImplemented` go. Raw mode on Windows also asks for `ENABLE_WINDOW_INPUT`. New `TerminalInputWin32_test.cpp` runs against the real console, serialised by a named mutex, and SKIPs by name where there is none: the console mode carries both flags, a size record arrives as a resize with the window's geometry, a buffer resize the console makes is reported, the console's own DECRQM answer for DECTCEM reads Set then Reset, and an unanswered DECRQM is NoReply at the deadline | #134: the Windows arm answered every DEC mode query NotImplemented, so synchronized output could never be detected on Windows. Measured on Windows 11 (26200): conhost answered DECRQM 2026 not-recognized and Windows Terminal answered it reset, both through the shared loop. The flag is the documented condition for size records and is not what made resizing work on the hosts measured: both delivered a window resize with it cleared | endo (contour-terminal/endo) | `contour-terminal/endo` branch `fastcached/upstream`, commit `ee25be66e1ece8f2637c3a0aade3ad85153e0eff`, on `9ae3c66b`; published in [contour-terminal/endo#184](https://github.com/contour-terminal/endo/pull/184) |
 | `vendor/endo/tui/CMakeLists.txt`<br>`vendor/endo/tui/Sixel.cpp`<br>`vendor/endo/tui/Sixel_test.cpp` | `medianCut` sorts a bucket by a total order on the whole pixel, the widest channel first, instead of by the widest channel alone. New `Sixel_test.cpp`: a fixture with the tie shape, the same pixels reversed quantizing to the same palette, and the encoding's FNV-1a digest equal to a recorded constant | #134: `std::ranges::sort` left pixels equal in the sort channel in the library's tie order and the median split followed it, so the Sixel rung's bytes differed per standard library. Measured with the test: the previous sort gave three digests on libstdc++, libc++ and MSVC, a stable sort one digest on all three but still failed the reversal case, this change `0xbace46a6344de1d9` on all three | endo (contour-terminal/endo) | `contour-terminal/endo` branch `fastcached/upstream`, commit `c85ba078c18d0f5ea24376f317961485af327f40`, on `ee25be66`; published in [contour-terminal/endo#184](https://github.com/contour-terminal/endo/pull/184) |
 | `vendor/endo/tui/TerminalQuery_test.cpp` | New case: the reply bytes `CSI 6;20;10t` go through `VtParser` into one protocol report, and `queryCellSize()` answers 10 wide and 20 high from it in one read. Test only | #134: the Sixel rung is chosen only with a measured cell size, and the reply is height first while the query answers width first. Every earlier case scripted an already-decoded `CellSizeReport`, so a swap on either side passed all of them | endo (contour-terminal/endo) | `contour-terminal/endo` branch `fastcached/upstream`, commit `f774a210ce989e5947b8f61d715068b1dc96088c`, on `4f8f4630`; published in [contour-terminal/endo#184](https://github.com/contour-terminal/endo/pull/184) |
+| `vendor/endo/tui/runtime/TuiRuntime.hpp`<br>`vendor/endo/tui/runtime/TuiRuntime_test.cpp` | `DelayAwaiter::await_ready` is a constant `false` and `await_suspend` declines to park when the deadline has already passed, so no call is made in `await_ready`. A `static_assert` in `TuiRuntime_test.cpp` holds it constant | #1546: on Windows ARM64, MSVC 19.44 let the `OperationCancelled` thrown by `await_resume` escape the try block around `co_await runtime->delay(...)`, a typed catch and `catch (...)` alike, and "A pending delay bounds the wait timeout" and "An injected ManualClock makes a delay's computed timeout exact" failed with "Unknown exception". Measured on the `windows-11-arm` runner: it escapes when the awaiter is a temporary whose `await_ready` reads the clock through the virtual `IClock::now()`, and is caught when `await_ready` makes no call or the awaiter is a named local | endo (contour-terminal/endo) | `contour-terminal/endo` branch `fastcached/upstream`, commit `c09959fc80f424b5a43adeff20d7193c9721c23e`, on `f774a210`; not yet published: #184 merged at `f774a210`, and the next pull request is the owner's to open |
 
 ## How to send a change back to endo or contour
 

@@ -82,7 +82,13 @@ Task<int> awaitKeyOrCancel(TuiRuntime* runtime, int cancelSentinel)
     }
 }
 
-/// Resumes immediately when the delay has already elapsed (the ready path).
+// A delay's readiness is a constant, so no call is made in await_ready: MSVC 19.44's
+// ARM64 code generator let OperationCancelled escape the try block around a co_await on a
+// DelayAwaiter whose await_ready read the clock, and both cancellation cases below failed
+// there. Reading the clock in await_ready again cannot compile.
+static_assert(!tui::runtime::DelayAwaiter::await_ready());
+
+/// Resumes immediately when the delay has already elapsed (it declines to park).
 Task<int> awaitZeroDelay(TuiRuntime* runtime)
 {
     co_await runtime->delay(std::chrono::milliseconds { 0 });

@@ -430,6 +430,13 @@ class NextActivityAwaiter
 /// parked coroutine is re-queued promptly and unwinds via @c OperationCancelled,
 /// rather than lingering until the deadline elapses. The stale timer entry is
 /// skipped when it later fires (the handle is already done).
+///
+/// An elapsed deadline is decided in @c await_suspend, which declines to park, and
+/// never in @c await_ready, which is a constant: MSVC 19.44's ARM64 code generator
+/// loses the enclosing @c try block of a @c co_await on a temporary awaiter whose
+/// @c await_ready reads the clock through its virtual @c now(). There the
+/// @c OperationCancelled thrown by @c await_resume passed every handler in the
+/// awaiting coroutine, @c catch(...) included, and reached the task's result.
 class DelayAwaiter
 {
   public:
@@ -438,11 +445,16 @@ class DelayAwaiter
     {
     }
 
-    [[nodiscard]] bool await_ready() const noexcept { return _deadline <= _runtime.clock().now(); }
+    /// @return false: an elapsed deadline is answered by @c await_suspend instead.
+    [[nodiscard]] static constexpr bool await_ready() noexcept { return false; }
 
+    /// @return false, resuming at once, when the deadline has elapsed or the flow is
+    ///         already cancelled; true once the timer and the cancellation are armed.
     template <typename Promise>
     [[nodiscard]] bool await_suspend(std::coroutine_handle<Promise> awaiting)
     {
+        if (_deadline <= _runtime.clock().now())
+            return false;
         if constexpr (requires { awaiting.promise().stopToken(); })
             _token = awaiting.promise().stopToken();
         if (_token.stop_requested())
