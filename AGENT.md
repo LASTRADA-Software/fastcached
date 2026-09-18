@@ -1250,6 +1250,12 @@ what differs between compilers, standard libraries, hosts and tool versions.
   or scan for a VALUE and name no iterator.
 - A return type is not part of a function's mangled name on Linux, so two functions differing
   only in return type silently collide.
+- **MSVC 19.44 targeting ARM64 miscompiled two coroutine shapes** -- measured there and claimed
+  nowhere wider: a call's result held across a `co_await` was left on the resume function's STACK
+  (#1545), and a `co_await` on a temporary awaiter whose `await_ready` made a virtual call lost its
+  `try` block (#1546). Compute such a value after the `co_await`; keep `await_ready` trivial. Only the
+  `NotBinding` `Windows-cl-release-arm64` ctest would see the next one, and the stack-slot audit is a
+  probe, never a check.
 - An instruction-set extension is used only inside a function that asks for it
   (`__attribute__((target(...)))`), never through a global `-m` flag: a flagged TU's inline copies
   can reach a fallback path on a CPU without the instructions. And that function runs only once
