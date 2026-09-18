@@ -53,7 +53,9 @@
 # combination's label when the job has a matrix. Every leg is a writer, because legs of one job run
 # concurrently exactly as two jobs do: a key the legs do NOT vary is one key written several times,
 # which is #318 arriving through a matrix -- unless the step's own `if:` DECIDEDLY rules a leg out,
-# which gets that leg no row (#1540). `unresolved` is empty, or says why this row's key cannot be
+# which gets that leg no row (#1540). An `actions/cache/restore` step gets the same rows, and the
+# shell reads them as the READERS whose keys must each have a writer, so a restore leg its `if:`
+# rules out reads nothing. `unresolved` is empty, or says why this row's key cannot be
 # compared at all -- a matrix the walk cannot read, a matrix reference it left unexpanded, a step
 # output -- and the shell refuses such a row rather than comparing its text.
 #

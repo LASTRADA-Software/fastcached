@@ -149,7 +149,7 @@ DocSubjectRunner="scripts/doc-subject-checks.sh"
 # self-test cannot drift from the rule by restating either.
 CcacheAction="hendrikmuhs/ccache-action"
 
-# Rule F's subjects. The restore spelling is a PREFIX of the writer's, so every
+# Rule F's subjects. The writer's spelling is a PREFIX of the restore one's, so every
 # test below asks about it FIRST; reversed, every reader reads as a writer.
 CacheAction="actions/cache"
 CacheRestoreAction="actions/cache/restore"
@@ -170,6 +170,13 @@ RunnerOs() {
         *windows*)        echo "Windows" ;;
         *)                echo "" ;;
     esac
+}
+
+# The legs in the `key<SEP>leg` rows @p 1 whose key is EXACTLY @p 2, sorted and
+# unique. A field comparison, never `grep -F "<key><SEP>"`: that is a substring
+# test, and a key ending another key's text would be lent that key's legs.
+LegsOfKey() {
+    FastCachedRuleFKey="$2" awk -F"$FieldSep" '$1 == ENVIRON["FastCachedRuleFKey"] { print $2 }' <<< "$1" | sort -u
 }
 
 # ---------------------------------------------------------------------------
@@ -448,6 +455,29 @@ fi
 # writer, which is the direction that keeps the refusal. A key taken from a step
 # output is refused as unresolvable: each leg computes its own.
 #
+# Ruling legs out opened the OTHER direction, so it is refused too: a key some leg
+# RESTORES that no step any leg can run WRITES. Two writers cost an upload; none
+# costs the cache, silently -- every run misses the exact key, a `restore-keys`
+# prefix at best hands back an entry saved for a different key, and the job reads
+# as cached. The shape that arrives there is a save guarded PER JOB, by a matrix
+# value only one key's legs carry, in a job whose legs use several keys. Only the
+# restore action is asked about. The combined action restores as well, but only
+# the key it writes itself, in the same row, so its key cannot be unwritten; the
+# same holds for `ccache-action`. Only `key:` is compared: a `restore-keys`
+# prefix is not a key, so it neither needs a writer nor supplies one -- a prefix
+# matching some other key's entry is exactly the silent miss above. And the writer
+# must be in this workflow; a key saved only by another file is refused here,
+# since nothing in this one would notice that file stop.
+#
+# What is compared is key TEXT, and GitHub finds an entry by key AND a version
+# hashed from `path:` as the runner expanded it plus the compression it chose. So
+# two legs on runners that disagree on either -- `windows-2025` and `windows-11-arm`
+# disagree on both -- share no entry under one key text. So this check PASSES a
+# restore whose only writer is such a leg, a false GREEN; and it REFUSES two such
+# legs as writers of one key although they write two entries, a false red whose
+# remedy (vary the key) is what those legs need anyway. Neither half can be read
+# from the workflow, so `build.yml` says at each shared key what is known of it.
+#
 # Every other `${{ ... }}` is left as text deliberately: `hashFiles('CMakeLists.txt')`
 # resolves to the same digest in every job of one run, so two steps spelling it
 # identically DO collide and must be compared rather than excused. What is
@@ -458,45 +488,60 @@ fi
 cacheSteps="$(WorkflowRecords "$workflow" CACHE)"
 
 cacheTotal=0
+resolvedWriters=0
+restoreTotal=0
 cacheProblemsBefore=$problems
 resolvedRows=""
+restoredRows=""
 osPattern='${{ runner.os }}'
-while IFS="$FieldSep" read -r writer stepUses runsOn cacheKey unresolved; do
-    [[ -n "$writer" ]] || continue
-    # The reader spelling is tested FIRST because it is a prefix of the writer's.
+while IFS="$FieldSep" read -r leg stepUses runsOn cacheKey unresolved; do
+    [[ -n "$leg" ]] || continue
+    # The reader spelling is tested FIRST because the writer's pattern matches it too.
     # Reversed, every restore step reads as a writer and the check refuses a
     # correct workflow -- loudly, but for a reason nobody could act on.
+    restores=no
+    writes=yes
     case "$stepUses" in
-        "$CacheRestoreAction"*)             continue ;;
+        "$CacheRestoreAction"*)             restores=yes; writes=no ;;
         "$CacheAction"*|*"$CcacheAction"*)  ;;
         *)                                  continue ;;
     esac
-    cacheTotal=$((cacheTotal + 1))
+    question="whether it collides with another writer's key"
+    if [[ "$writes" == yes ]]; then
+        cacheTotal=$((cacheTotal + 1))
+    else
+        question="whether any step writes it"
+    fi
+    [[ "$restores" == no ]] || restoreTotal=$((restoreTotal + 1))
 
     if [[ -n "$unresolved" ]]; then
-        Fail "the cache step in job '$writer' has a key this check cannot resolve: $unresolved -- key: $cacheKey, runs-on: $runsOn. Whether it collides with another writer's key cannot be decided in either direction, so it is refused rather than compared as text."
+        Fail "the cache step in job '$leg' has a key this check cannot resolve: $unresolved -- key: $cacheKey, runs-on: $runsOn. It is refused rather than compared as text: $question cannot be decided in either direction."
         continue
     fi
 
     runnerOs="$(RunnerOs "$runsOn")"
     if [[ -z "$runnerOs" ]]; then
-        Fail "the cache step in job '$writer' runs on '$runsOn', which this check cannot map to a \`runner.os\`, so it cannot say whether that job's key collides with another job's. Teach \`RunnerOs\` the new label rather than leaving the key uncompared."
+        Fail "the cache step in job '$leg' runs on '$runsOn', which this check cannot map to a \`runner.os\`, so it cannot say $question. Teach \`RunnerOs\` the new label rather than leaving the key uncompared."
         continue
     fi
 
     resolvedKey="${cacheKey//"$osPattern"/$runnerOs}"
     if [[ "$resolvedKey" == *'${{ runner.'* ]]; then
-        Fail "job '$writer' has a cache key this check cannot resolve -- key: $resolvedKey. It names a \`runner.\` field other than \`os\`, so whether it collides with another job's key cannot be decided in either direction."
+        Fail "job '$leg' has a cache key this check cannot resolve -- key: $resolvedKey. It names a \`runner.\` field other than \`os\`, so $question cannot be decided in either direction."
         continue
     fi
-    resolvedRows="${resolvedRows}${resolvedKey}${FieldSep}${writer}"$'\n'
+    if [[ "$writes" == yes ]]; then
+        resolvedWriters=$((resolvedWriters + 1))
+        resolvedRows="${resolvedRows}${resolvedKey}${FieldSep}${leg}"$'\n'
+    fi
+    [[ "$restores" == no ]] || restoredRows="${restoredRows}${resolvedKey}${FieldSep}${leg}"$'\n'
 done <<< "$cacheSteps"
 
 if [[ -n "$resolvedRows" ]]; then
     duplicateKeys="$(printf '%s' "$resolvedRows" | grep -v '^$' | cut -d"$FieldSep" -f1 | sort | uniq -d || true)"
     while IFS= read -r duplicateKey; do
         [[ -n "$duplicateKey" ]] || continue
-        writers="$(printf '%s' "$resolvedRows" | grep -F "${duplicateKey}${FieldSep}" | cut -d"$FieldSep" -f2 | sort -u || true)"
+        writers="$(LegsOfKey "$resolvedRows" "$duplicateKey")"
         # Joined with `; ` because a matrix leg's label carries commas of its own.
         writingJobs="$(awk 'NR > 1 { printf "; " } { printf "%s", $0 }' <<< "$writers")"
         # Whether every writer is a LEG of one matrix job. The remedy differs, because one step
@@ -504,17 +549,35 @@ if [[ -n "$resolvedRows" ]]; then
         writerJobs="$(sed 's/ (.*$//' <<< "$writers" | sort -u)"
         cause="On a run where that key misses, every one of them fetches the content and every one of them tries to save it; whichever finishes second finds the key taken and discards an archive it has already paid to build and upload (#318)."
         if [[ "$writerJobs" != *$'\n'* && "$writers" == *" ("* ]]; then
-            Fail "the cache key '$duplicateKey' is WRITTEN by more than one leg of the matrix job '$writerJobs' (${writingJobs}). Legs of one job run concurrently, exactly as two jobs do, so a key the legs do not vary is one key saved by each of them. $cause Where the legs' content DIFFERS, vary the key with them -- a \`\${{ matrix.* }}\` value they differ in, in \`key:\` and \`restore-keys:\` alike. Where it is IDENTICAL, restore on every leg and give each KEY one writer -- one per key, never one per job, since a job whose legs use several keys needs a saver for each (#1540): \`${CacheRestoreAction}@v4\` for every leg, plus an \`${CacheAction}/save@v4\` step whose \`if:\` selects, by matrix value, exactly one leg per key it saves -- e.g. \`matrix.suffix == ''\` where each preset's x86 leg saves and its arm64 twin only restores -- and whose \`key:\` is spelled as the restore step spells it. This check rules a leg out only where the save condition DECIDES it from the leg's matrix values -- a term it cannot decide (\`steps.*\`, a function) leaves the leg a writer -- and it cannot compare a key taken from \`cache-primary-key\`, which each leg computes for itself."
+            Fail "the cache key '$duplicateKey' is WRITTEN by more than one leg of the matrix job '$writerJobs' (${writingJobs}). Legs of one job run concurrently, exactly as two jobs do, so a key the legs do not vary is one key saved by each of them. $cause Where the legs' content DIFFERS, vary the key with them -- a \`\${{ matrix.* }}\` value they differ in, in \`key:\` and \`restore-keys:\` alike -- and vary it too where their RUNNERS disagree on the cache version, which hashes \`path:\` as the runner expanded it plus the compression it chose: \`windows-2025\` and \`windows-11-arm\` disagree on both, so no key makes them share an entry. Where the content is IDENTICAL and the runners agree, restore on every leg and give each KEY one writer -- one per key, never one per job, since a job whose legs use several keys needs a saver for each (#1540): \`${CacheRestoreAction}@v4\` for every leg, plus an \`${CacheAction}/save@v4\` step whose \`if:\` selects, by matrix value, exactly one leg per key it saves -- e.g. \`matrix.suffix == ''\` where each preset's x86 leg saves and its arm64 twin only restores -- and whose \`key:\` is spelled as the restore step spells it. This check rules a leg out only where the save condition DECIDES it from the leg's matrix values -- a term it cannot decide (\`steps.*\`, a function) leaves the leg a writer -- and it cannot compare a key taken from \`cache-primary-key\`, which each leg computes for itself."
         else
             Fail "the cache key '$duplicateKey' is WRITTEN by more than one job (${writingJobs}). $cause Keep exactly one writer and change the others to \`${CacheRestoreAction}@v4\` -- never to a second key, which spends the repository's 10 GB cache budget on a duplicate."
         fi
     done <<< "$duplicateKeys"
 fi
 
-if [[ "$cacheTotal" -eq 0 ]]; then
+# Every restored key has a writer. Keys, not rows: a key restored by three legs
+# is one key, refused once and naming all three. A writer refused above as
+# unresolvable may be the one that saves it, so while there is one the answer is
+# UNDECIDED and says so -- "nothing writes it" would be a confident wrong signal.
+unresolvedWriters=$((cacheTotal - resolvedWriters))
+restoredKeys="$(cut -d"$FieldSep" -f1 <<< "$restoredRows" | sort -u)"
+while IFS= read -r restoredKey; do
+    [[ -n "$restoredKey" ]] || continue
+    writersOfKey="$(LegsOfKey "$resolvedRows" "$restoredKey")"
+    if [[ -n "$writersOfKey" ]]; then continue; fi
+    restoringLegs="$(LegsOfKey "$restoredRows" "$restoredKey" | awk 'NR > 1 { printf "; " } { printf "%s", $0 }')"
+    if [[ "$unresolvedWriters" -gt 0 ]]; then
+        Fail "whether the cache key '$restoredKey', RESTORED (${restoringLegs}), has a writer is UNDECIDED: $unresolvedWriters writer(s) above carry a key this check could not resolve, and any of them may be the one that saves it. Resolve those first -- this is not a finding that nothing writes it."
+        continue
+    fi
+    Fail "the cache key '$restoredKey' is RESTORED (${restoringLegs}) and WRITTEN by no step any leg can run, so no run ever saves it: every one misses the exact key, a \`restore-keys\` prefix at best hands back an entry saved for a DIFFERENT key, and the job reads as cached. Give the key one writer -- one per key, never one per job. A save step's \`if:\` that selects a leg by matrix value must select one leg OF EACH KEY the step saves: a guard only one key's legs satisfy leaves every other key with none, which is the per-job shape. Only a condition this check DECIDES from the leg's matrix values rules a leg out -- a term it cannot decide leaves the leg a writer -- so this refusal never rests on a term it could not read. Only \`key:\` is compared: a \`restore-keys\` prefix is not a key, so it neither needs a writer nor supplies one."
+done <<< "$restoredKeys"
+
+if [[ "$cacheTotal" -eq 0 && "$restoreTotal" -eq 0 ]]; then
     echo "ok: no keyed cache step in $workflow (nothing for rule F to vouch for)"
 elif [[ "$problems" -eq "$cacheProblemsBefore" ]]; then
-    echo "ok: all $cacheTotal keyed cache writer(s) -- one per step per leg that can run it -- resolve to a key with exactly one writer"
+    echo "ok: all $cacheTotal keyed cache writer(s) -- one per step per leg that can run it -- resolve to a key with exactly one writer, and each of the $restoreTotal restore(s) reads a key one of them writes"
 fi
 
 if [[ $problems -gt 0 ]]; then
@@ -569,7 +632,8 @@ REQ
     #        crossarch | foldedref | unreadablematrix -- the last six are #1432's
     #        matrix shapes, read through the shared walk's model of a matrix --
     #        and #1540's restore-everywhere/save-once split: splitsave |
-    #        splittwolegs | splitundecided | splitstepkey
+    #        splittwolegs | splitundecided | splitstepkey | splitwrongkey |
+    #        splitundecidedwriter
     Generate() {
         local out="$1" comparison="$2" cancelled="$3" docStep="$4" docJob="$5"
         local trim="${6:-none}" gate="${7:-all}" ccache="${8:-none}"
@@ -690,12 +754,21 @@ REQ
                         [[ "$cacheKnob" == "splittwolegs" ]] && saveIf="\${{ matrix.preset == 'two' }}"
                         [[ "$cacheKnob" == "splitundecided" ]] && saveIf="\${{ matrix.suffix == '' || steps.cpm.outputs.cache-hit != 'true' }}"
                         [[ "$cacheKnob" == "splitstepkey" ]] && saveKey="\${{ steps.cpm.outputs.cache-primary-key }}"
+                        # The per-JOB guard: one saver, selected by a value only the
+                        # `one` key's leg carries, so `two`'s key has none.
+                        [[ "$cacheKnob" == "splitwrongkey" ]] && saveIf="\${{ matrix.preset == 'one' && steps.cpm.outputs.cache-hit != 'true' }}"
+                        # Decided TRUE on `one`, FALSE on `two`'s x86 leg and UNKNOWN on
+                        # its arm64 leg -- so `two`'s one writer is the leg it cannot decide.
+                        [[ "$cacheKnob" == "splitundecidedwriter" ]] && saveIf="\${{ matrix.preset == 'one' || (matrix.suffix != '' && steps.cpm.outputs.cache-hit != 'true') }}"
                         echo "      - name: \"Restore CPM packages\""
                         echo "        id: cpm"
                         echo "        uses: ${CacheRestoreAction}@v4"
                         echo "        with:"
                         echo "          path: .cpm"
                         echo "          key: cpm-\${{ runner.os }}-\${{ matrix.preset }}-x"
+                        # A prefix of EVERY key the job saves, so a check reading it
+                        # as a key -- or as a writer -- is seen doing so.
+                        echo "          restore-keys: cpm-\${{ runner.os }}-"
                         echo "      - name: \"Save CPM packages\""
                         echo "        if: ${saveIf}"
                         echo "        uses: ${CacheAction}/save@v4"
@@ -967,6 +1040,23 @@ REQ
     Generate "${scratch}/wf.yml" safe yes ungated required none all none splitstepkey
     CaseSaying "rule F: a save key taken from a step output is a value each leg computes, so it is REFUSED as unresolvable rather than compared as text" \
         "it names a step output" "WRITTEN by more than"
+    # The same workflow through the zero-writer half: the unresolvable save may be
+    # the writer of the restored keys, so their verdict is UNDECIDED, never "none".
+    CaseSaying "rule F: a restored key whose only candidate writer could not be resolved is UNDECIDED, not reported as written by nobody" \
+        "has a writer is UNDECIDED" "WRITTEN by no step"
+
+    # The direction reading `if:` OPENED: a key restored and written by nobody. The
+    # restore step carries a `restore-keys` prefix of every key the job saves, so
+    # the `two` legs' prefix matches the entry `one`'s leg DOES write -- and that
+    # must not stand in for a writer of `two`'s key.
+    Generate "${scratch}/wf.yml" safe yes ungated required none all none splitwrongkey
+    CaseSaying "rule F: a save guarded PER JOB -- to the leg of one key, in a job whose legs use two -- leaves the other key restored and written by nobody, and is REFUSED as zero writers; the \`restore-keys\` prefix matching the written key is not its writer" \
+        "'cpm-Linux-two-x' is RESTORED" "'cpm-Linux-one-x' is RESTORED"
+
+    # Unknown means RUNS in this direction too: here the one leg that can save
+    # `two`'s key is the one leg whose condition the check cannot decide.
+    Generate "${scratch}/wf.yml" safe yes ungated required none all none splitundecidedwriter
+    Case "rule F: a save condition UNDECIDED on the only leg that can save a key leaves that leg its writer, so every key has one writer and it PASSES" want-pass
 
     # The verdicts must come from the SHARED walk, which is a different claim from
     # "the check refuses". `Case` runs `bash "$0"`, which resolves its awk beside
@@ -975,21 +1065,28 @@ REQ
     # @param 1 what it holds up  @param 2 a sed expression, or `omit` to stage no
     # walk at all  @param 3 want-pass|want-fail  @param 4 rule F's cache knob,
     # `none` by default  @param 5 which program the expression neuters: `walk`,
-    # the default, or `gated` for this check's own half
+    # the default, `gated` for this check's own awk half, or `self` for this
+    # script  @param 6 a phrase the output must contain, or empty
     StagedWalkCase() {
-        local what="$1" expr="$2" want="$3" knob="${4:-none}" target="${5:-walk}"
+        local what="$1" expr="$2" want="$3" knob="${4:-none}" target="${5:-walk}" mustSay="${6:-}"
         local tree="${scratch}/tree" out got=0 source staged
         cases=$((cases + 1))
         rm -rf "$tree"
         mkdir -p "$tree/scripts/lib"
         cp "$0" "$tree/scripts/"
         cp "$FastCachedGatedAwk" "$tree/scripts/"
-        [[ "$target" == gated ]] && cp "$FastCachedWalkAwk" "$tree/scripts/lib/"
+        if [[ "$target" != walk ]]; then
+            cp "$FastCachedWalkAwk" "$tree/scripts/lib/"
+        fi
         if [[ "$expr" != omit ]]; then
-            source="$FastCachedWalkAwk"; staged="$tree/scripts/lib/workflow-walk.awk"
-            if [[ "$target" == gated ]]; then
-                source="$FastCachedGatedAwk"; staged="$tree/scripts/$(basename "$FastCachedGatedAwk")"
-            fi
+            case "$target" in
+                walk)  source="$FastCachedWalkAwk"; staged="$tree/scripts/lib/workflow-walk.awk" ;;
+                gated) source="$FastCachedGatedAwk"; staged="$tree/scripts/$(basename "$FastCachedGatedAwk")" ;;
+                self)  source="$0"; staged="$tree/scripts/$(basename "$0")" ;;
+                *)     echo "  FAIL  '$what' names no program this self-test can neuter: '$target'" >&2
+                       status=1
+                       return ;;
+            esac
             sed "$expr" "$source" > "$staged"
             if cmp -s "$staged" "$source"; then
                 echo "  FAIL  '$what' neutered no line, so the case stages nothing" >&2
@@ -1001,7 +1098,13 @@ REQ
         out="$(FASTCACHED_REQUIRED_CONTEXTS_FILE="$requiredFile" \
             bash "$tree/scripts/$(basename "$0")" --workflow "${scratch}/wf.yml" 2>&1)" || got=$?
         if [[ "$want" == "want-pass" && "$got" -eq 0 ]] || [[ "$want" == "want-fail" && "$got" -ne 0 ]]; then
-            echo "  ok    ($want) $what"
+            if [[ -n "$mustSay" && "$out" != *"$mustSay"* ]]; then
+                echo "  FAIL  ($want, exit $got as wanted) $what -- but the output never says '$mustSay'" >&2
+                printf '%s\n' "$out" | sed 's/^/        /' >&2
+                status=1
+            else
+                echo "  ok    ($want) $what"
+            fi
         else
             echo "  FAIL  ($want, exit $got) $what" >&2
             printf '%s\n' "$out" | sed 's/^/        /' >&2
@@ -1025,6 +1128,32 @@ REQ
     StagedWalkCase "with an UNDECIDED save condition read as 'does not run', the undecidable split is ACCEPTED -- the neuter the refusal above depends on" \
         's/if (WorkflowMatrixDecide(stepIf, c) == "F") continue/if (WorkflowMatrixDecide(stepIf, c) != "T") continue/' \
         want-pass splitundecided gated
+
+    # The same neuter from the other side: the one writer of `two`'s key is the leg
+    # its condition leaves UNDECIDED, so reading that as "does not run" refuses the
+    # key as unwritten -- and the refusal must be that one.
+    StagedWalkCase "with an UNDECIDED save condition read as 'does not run', the key whose only saver is undecided is REFUSED as unwritten" \
+        's/if (WorkflowMatrixDecide(stepIf, c) == "F") continue/if (WorkflowMatrixDecide(stepIf, c) != "T") continue/' \
+        want-fail splitundecidedwriter gated "'cpm-Linux-two-x' is RESTORED"
+
+    # The zero-writer rule NEUTERED -- a restored key taken as written without
+    # looking -- lets the per-job guard through, so its refusal is that rule's.
+    StagedWalkCase "with a restored key never looked up among the written ones, the per-JOB save guard is ACCEPTED -- the neuter the zero-writer refusal depends on" \
+        's/if \[\[ -n "\$writersOfKey" \]\]; then continue; fi/continue/' \
+        want-pass splitwrongkey self
+
+    # And the passing split holds up the WRITER half: a save-only step not counted
+    # as a writer -- its rows dropped, and nothing else -- makes every key it saves
+    # read as unwritten.
+    StagedWalkCase "with \`${CacheAction}/save\` not counted as a writer, the split that must PASS is refused as zero writers -- so its pass says a save-only step IS one" \
+        's/^    \[\[ -n "\$leg" \]\] || continue$/&; [[ "$stepUses" != *\/save ]] || continue/' \
+        want-fail splitsave self "'cpm-Linux-one-x' is RESTORED"
+
+    # And the UNDECIDED arm: without it an unresolvable writer is reported as no
+    # writer at all, which is the confident wrong sentence that arm exists to stop.
+    StagedWalkCase "with the UNDECIDED arm removed, a restore beside an unresolvable save is reported as written by nobody -- the sentence the case above refuses" \
+        's/if \[\[ "\$unresolvedWriters" -gt 0 \]\]; then/if false; then/' \
+        want-fail splitstepkey self "WRITTEN by no step"
 
     if [[ "$status" -ne 0 ]]; then
         echo "check-gated-jobs: self-test FAILED after $cases case(s)" >&2

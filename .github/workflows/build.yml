@@ -550,6 +550,14 @@ jobs:
       # `scripts/check-gated-jobs.sh` rule F is what says each key has one writer --
       # a combined `actions/cache` step here would be every leg saving one key at
       # once, which is #318.
+      #
+      # Sharing needs one VERSION as well as one key: actions/cache hashes it from
+      # `path:` as the runner expanded it plus the compression it chose, and the
+      # `windows` job is where that fails. Here both runners expand the path to
+      # `/home/runner/work/fastcached/fastcached/.cache/CPM` (run 35340951724), the
+      # x86 leg is seen restoring zstd, and the arm64 image LISTS zstd -- nobody has
+      # yet seen that leg restore this entry. If it always misses, the second
+      # premise has failed and this job takes the `windows` job's shape.
       - name: "Restore CPM packages"
         id: cpm-cache
         if: ${{ needs.changes.outputs.code != 'false' }}
@@ -651,8 +659,10 @@ jobs:
       # The x86 leg of each preset saves; the arm64 leg, the one row naming a
       # `suffix`, only restores. Everything the combined step's post-job save
       # checked is still here: it ran only where the restore ran, only on a miss
-      # of the exact key -- `cache-hit` is 'true' for that and nothing else -- and
-      # only on success, which an `if:` naming no status function still means.
+      # of the exact key -- `cache-hit` is 'true' for an exact hit and nothing
+      # else, and is left EMPTY rather than 'false' on a total miss, so the test
+      # is `!= 'true'` -- and only on success, which an `if:` naming no status
+      # function still means.
       # The one difference is WHEN: right after `Configure`, where CPM's sources
       # are complete, so a red test no longer costs the next run its sources.
       #
@@ -2007,16 +2017,22 @@ jobs:
         with:
           fetch-depth: 0
 
-      # Restored by every leg, saved by one per key: the reason is on the `linux`
-      # job's `Restore CPM packages` step, and `Save CPM packages` is below.
-      - name: "Restore CPM packages"
-        id: cpm-cache
+      # NOT the `linux` job's split, and the key names the leg: here the arm64 leg
+      # could never read what its x86 sibling wrote, whatever the key said. An
+      # entry is found by key AND version, and actions/cache hashes the version
+      # from `path:` as the runner expanded it plus the compression it chose
+      # (`getCacheVersion`, @actions/cache). Both differ between these images:
+      # `github.workspace` is `D:\a\...` on windows-2025 and `C:\a\...` on
+      # windows-11-arm (run 35340951724), and zstd is on windows-2025 and in the
+      # arm image's list of OMITTED software, which makes the tool fall back to
+      # gzip. So each leg saves its own entry, one writer per key.
+      - name: "Cache CPM packages"
         if: ${{ needs.changes.outputs.code != 'false' }}
-        uses: actions/cache/restore@v4
+        uses: actions/cache@v4
         with:
           path: ${{ env.CPM_SOURCE_CACHE }}
-          key: cpm-${{ runner.os }}-${{ matrix.preset }}-${{ hashFiles('CMakeLists.txt') }}
-          restore-keys: cpm-${{ runner.os }}-${{ matrix.preset }}-
+          key: cpm-${{ runner.os }}-${{ matrix.preset }}${{ matrix.suffix }}-${{ hashFiles('CMakeLists.txt') }}
+          restore-keys: cpm-${{ runner.os }}-${{ matrix.preset }}${{ matrix.suffix }}-
 
       # v0.0.11 rather than v0.0.6: GitHub's cache service v1 is gone, and only
       # the newer action exports the ACTIONS_RESULTS_URL / ACTIONS_RUNTIME_TOKEN
@@ -2051,15 +2067,6 @@ jobs:
           -DFASTCACHED_ENABLE_TLS=ON
           -DALLOW_SCCACHE_FALLBACK=ON
           "-DOPENSSL_ROOT_DIR=C:/Program Files/OpenSSL"
-
-      # The x86 leg of each preset saves and the arm64 leg only restores; the
-      # conditions and the placement are the `linux` job's, with their reasons.
-      - name: "Save CPM packages"
-        if: ${{ needs.changes.outputs.code != 'false' && matrix.suffix == '' && steps.cpm-cache.outputs.cache-hit != 'true' }}
-        uses: actions/cache/save@v4
-        with:
-          path: ${{ env.CPM_SOURCE_CACHE }}
-          key: cpm-${{ runner.os }}-${{ matrix.preset }}-${{ hashFiles('CMakeLists.txt') }}
 
       - name: "Build"
         if: ${{ needs.changes.outputs.code != 'false' }}
