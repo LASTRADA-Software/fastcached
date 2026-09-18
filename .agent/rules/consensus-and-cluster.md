@@ -878,9 +878,31 @@ and it is recorded here because the question will be asked again.
     `node-id` and `node-key` -- moving the whole directory mints a new identity the
     cluster must admit while it still counts the old one -- and rejoins with
     `--raft-join`, because an empty node under a bootstrap set naming only itself
-    elects itself and becomes a second cluster. A LEADER's snapshot the application
-    cannot read is the install path's own question, deliberately left as it was; its
-    log line now says *installed* and a recovered one says *recovered*.
+    elects itself and becomes a second cluster. A recovered snapshot's log line says
+    *recovered*, an installed one's *installed*.
+  - **And a LEADER's snapshot the application cannot read is refused before the node
+    takes it on** ([#1552](https://github.com/LASTRADA-Software/fastcached/issues/1552)).
+    Taken on, a snapshot resets the log, moves both indices past it, and is persisted
+    and ACKNOWLEDGED inside one step; the application saw it only at the end, logged
+    *keeping current state*, and every later entry was then applied on the state the
+    snapshot was meant to replace while Raft reported the replica current. So the driver
+    asks `IRaftStateMachine::CanRestore` -- const, and in agreement with `RestoreSnapshot`
+    -- BEFORE the node sees the offer, and hands the node a `SnapshotReadability`. An
+    unreadable one is answered `Rejected` after the covered check (a snapshot this node
+    already holds needs no reading) and after the leader was HEARD (a refused offer still
+    arms the election timer, so the node does not campaign against the leader offering it),
+    and nothing moves. **The decision, recorded: refuse and stay behind, never stop the
+    tier.** Both need the question asked first -- stopping after the node took the snapshot
+    on leaves an acknowledgement nothing can retract -- and staying behind is what Raft
+    already knows how to be: the leader counts the answer as contact and advances nothing,
+    the node keeps its vote, its application stays a committed prefix rather than a mix,
+    and it catches up BY ITSELF the moment it can read an offer, with nothing moved aside.
+    Stopping would buy none of that and cost the vote. The refusal is held by the driver
+    (`Progress::installRefusal`, reported once through `ObserveInstallRefusal` however often
+    the leader offers again, ended when the node has applied past it) and raised as the
+    `unreadable-leader-snapshot` condition, Live and Alert, with an Error line. A machine
+    whose `CanRestore` accepted bytes its `RestoreSnapshot` then refuses stops the driver:
+    by then the node has persisted and acknowledged the snapshot.
   - **The harness's state machine holds real state, and a restart empties it.** Its
     `RestoreSnapshot` was a no-op ("this machine records what it was told") and its
     `TakeSnapshot` returned nothing, so every restart case passed whether or not a

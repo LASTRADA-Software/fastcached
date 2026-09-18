@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "AdminEndpoint.hpp"
+#include "ConsensusTier.hpp"
 #include "EnrollmentWindow.hpp"
 #include "NodeConditions.hpp"
 #include "NodeMembership.hpp"
@@ -315,6 +316,28 @@ TEST_CASE("Every condition row is evaluated on a fully configured node", "[node]
     // The enrollment scope.
     ManualClock windowClock;
     EnrollmentWindow window { windowClock, &conditions };
+
+    // The consensus scope's own tier (#1552): one voter over a state directory of its own,
+    // started the way `main` starts it and with the registry, because it answers
+    // `unreadable-leader-snapshot` as its driver starts.
+    FastCache::Testing::ScratchDirectory consensusState { "conditions-consensus" };
+    auto const raftPort = FreePort();
+    NodeConfig clusteredNode;
+    clusteredNode.nodeId = "n1";
+    clusteredNode.raftListen = std::format("127.0.0.1:{}", raftPort);
+    clusteredNode.raftPeers = { Unwrap(Cluster::ParseMemberSpec(std::format("n1=127.0.0.1:{}", raftPort))) };
+    clusteredNode.clusterKeyFile = consensusState / "cluster.key";
+    WriteClusterKey(clusteredNode.clusterKeyFile);
+    clusteredNode.clusterDir = consensusState / "state";
+    auto const consensus = ConsensusTier::Start(
+        clusteredNode,
+        {},
+        [](Distributed::SchedulerRole, std::string_view, std::uint64_t) {},
+        [](Cluster::ClusterState const&) {},
+        metrics,
+        logger,
+        &conditions);
+    REQUIRE(consensus.has_value());
 
     // The admin surface.
     NodeConfig admin;

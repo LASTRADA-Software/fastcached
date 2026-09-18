@@ -360,3 +360,41 @@ TEST_CASE("Whether a command can be applied is asked without applying it, in the
         CHECK(refused.error().code == ConsensusErrorCode::StorageFailure);
     }
 }
+
+TEST_CASE("Whether a snapshot can be restored is asked without restoring it, in the two codes held state is refused with",
+          "[cluster][statemachine]")
+{
+    // What the driver asks of every snapshot a leader offers, before the node takes it on
+    // (#1552): a question with no effects, answered exactly as `RestoreSnapshot` would be.
+    Watched watched;
+    watched.machine.Apply(Entry(1, Cmd(CommandKind::AddMember, "n1", "10.0.0.1:6675")));
+    auto const before = watched.machine.State();
+    auto const published = watched.published.size();
+
+    ClusterState other;
+    Apply(other, Cmd(CommandKind::AddMember, "n3", "10.0.0.3:6675"));
+
+    SECTION("this build's state is restorable, and asking changes nothing")
+    {
+        CHECK(watched.machine.CanRestore(Encode(other)).has_value());
+    }
+
+    SECTION("the previous build's state is another build's format, both versions named")
+    {
+        auto const refused = watched.machine.CanRestore(Testing::EncodePreviousClusterState());
+        REQUIRE_FALSE(refused.has_value());
+        CHECK(refused.error().code == ConsensusErrorCode::UnsupportedFormatVersion);
+        CHECK(refused.error().context.contains(std::format("version {}", Testing::PreviousClusterStateVersion)));
+        CHECK(refused.error().context.contains("reads 6"));
+    }
+
+    SECTION("bytes that are no state at all are damage")
+    {
+        auto const refused = watched.machine.CanRestore(std::vector<std::byte>(5, std::byte { 0x01 }));
+        REQUIRE_FALSE(refused.has_value());
+        CHECK(refused.error().code == ConsensusErrorCode::StorageFailure);
+    }
+
+    CHECK(watched.machine.State() == before);
+    CHECK(watched.published.size() == published);
+}

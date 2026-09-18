@@ -37,13 +37,14 @@ namespace FastCache::Node
 /// lists the rows in.
 enum class NodeCondition : std::uint8_t
 {
-    CounterTableSkew = 0,    ///< The metrics catalogue names counters this build's sink has no slot for (#1362).
-    ScratchRootUnmappable,   ///< The worker's scratch root cannot be written into a debug-prefix-map rule (#810).
-    UnsignedLeaseGrants,     ///< This scheduler signs nothing, because no cluster key is configured (#303).
-    GeneratedTlsCertificate, ///< The admin surface serves a certificate generated at startup.
-    EnrollmentWindowOpen,    ///< A stranger that asks can be handed the cluster key (#1298).
-    ForgottenFleetMember,    ///< `--fleet-member` names a host the cluster has forgotten (#1309).
-    Last,                    ///< Not a condition.
+    CounterTableSkew = 0,     ///< The metrics catalogue names counters this build's sink has no slot for (#1362).
+    ScratchRootUnmappable,    ///< The worker's scratch root cannot be written into a debug-prefix-map rule (#810).
+    UnsignedLeaseGrants,      ///< This scheduler signs nothing, because no cluster key is configured (#303).
+    GeneratedTlsCertificate,  ///< The admin surface serves a certificate generated at startup.
+    EnrollmentWindowOpen,     ///< A stranger that asks can be handed the cluster key (#1298).
+    ForgottenFleetMember,     ///< `--fleet-member` names a host the cluster has forgotten (#1309).
+    UnreadableLeaderSnapshot, ///< This build cannot read the snapshot its leader sends, so it stays behind (#1552).
+    Last,                     ///< Not a condition.
 };
 
 /// Which of this node's components evaluates a row.
@@ -102,7 +103,7 @@ inline constexpr EnumTable<ConditionScope, ConditionScopeRow> ConditionScopeTabl
                       "(--serve-scheduler)" },
     { .scope = ConditionScope::Consensus,
       .present = &PresentComponents::consensus,
-      .notEvaluated = "this node runs no consensus (no --listen-raft), so no cluster can forget a host here" },
+      .notEvaluated = "this node runs no consensus (no --listen-raft), so no cluster state reaches it" },
 } };
 static_assert(RowsInEnumeratorOrder(ConditionScopeTable, &ConditionScopeRow::scope),
               "ConditionScopeTable must hold one row per ConditionScope, in enumerator order");
@@ -177,6 +178,16 @@ inline constexpr EnumTable<NodeCondition, NodeConditionRow> NodeConditionTable {
       .remedy = "Remove these hosts from this node's --fleet-member list (fleet_member in its configuration file) and "
                 "reload it. They are refused either way, because the cluster's forget outranks the listing; if the "
                 "forget was a mistake, --cluster-admit-client undoes it for every node instead." },
+    { .condition = NodeCondition::UnreadableLeaderSnapshot,
+      .id = "unreadable-leader-snapshot",
+      .persistence = CompileCacheWire::ConditionPersistence::Live,
+      .severity = CompileCacheWire::ConditionSeverity::Alert,
+      .scope = ConditionScope::Consensus,
+      .remedy = "Run the build this node's leader runs: it cannot read the cluster state the leader sends, so it stays "
+                "where it was rather than take on a state it cannot hold, and follows no change the cluster makes -- "
+                "members, settings, forgets -- until it can. It catches up by itself once it reads the leader's "
+                "snapshot; nothing needs moving aside. A fleet upgrades as one: see "
+                "docs/operations/upgrading-a-fleet.md." },
 } };
 static_assert(RowsInEnumeratorOrder(NodeConditionTable, &NodeConditionRow::condition),
               "NodeConditionTable must hold one row per NodeCondition, in enumerator order");

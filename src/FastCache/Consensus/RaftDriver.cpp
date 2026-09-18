@@ -6,10 +6,11 @@
 #include <format>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <ranges>
 #include <string_view>
-#include <tuple>
 #include <utility>
+#include <variant>
 
 namespace FastCache::Consensus
 {
@@ -100,6 +101,22 @@ void RaftDriver::ObserveRole(RoleObserver observer)
     _onRole = std::move(observer);
 }
 
+void RaftDriver::ObserveInstallRefusal(InstallRefusalObserver observer)
+{
+    auto const guard = std::scoped_lock { _mutex };
+    _onInstallRefusal = std::move(observer);
+}
+
+void RaftDriver::PublishInstallRefusal(std::optional<InstallRefusal> refusal)
+{
+    if (refusal == _installRefusal)
+        return;
+
+    _installRefusal = std::move(refusal);
+    if (_onInstallRefusal)
+        _onInstallRefusal(_installRefusal);
+}
+
 void RaftDriver::PublishRoleIfChanged(std::optional<TermAdoption> const& cause)
 {
     auto const role = _node.CurrentRole();
@@ -181,16 +198,30 @@ std::expected<void, ConsensusError> RaftDriver::Deliver(RaftOutput output)
     // everything up to its index, and replaying entries over it would re-apply
     // what it contains.
     //
-    // A leader's snapshot the application cannot read is refused there, and the
-    // application keeps what it holds and says which snapshot it was -- the contract
-    // `RestoreSnapshot` states. What the NODE should do then is the install path's own
-    // question, and this does not answer it: the result is dropped here deliberately,
-    // where a recovered snapshot's refusal stops the node starting (`Recover`).
+    // A leader's snapshot reaches here only once `CanRestore` accepted it (`Receive`), so
+    // a refusal now is the application contradicting its own answer -- after the node has
+    // persisted the snapshot and acknowledged it. Nothing sound follows from that: every
+    // later entry would be applied on the state the snapshot was meant to replace, which
+    // is #1552's defect by another road. So it stops the driver, as a storage failure does,
+    // and says why.
     if (output.restoreSnapshot.has_value())
-        std::ignore = _application.RestoreSnapshot(output.restoreSnapshot->state, SnapshotOrigin::Installed);
+    {
+        if (auto restored = _application.RestoreSnapshot(output.restoreSnapshot->state, SnapshotOrigin::Installed);
+            !restored.has_value())
+        {
+            _failure = restored.error();
+            return std::unexpected { std::move(restored).error() };
+        }
+    }
     else
         for (auto const& entry: output.applied)
             _application.Apply(entry);
+
+    // A refusal ends when this node has applied past the snapshot it refused -- by one it
+    // could read, or by entries a later leader still held. Asked here, where every path
+    // that applies anything comes out.
+    if (_installRefusal.has_value() && _node.LastApplied() >= _installRefusal->index)
+        PublishInstallRefusal(std::nullopt);
 
     // Reported here and only here, which is the point of putting it at the end of
     // `Deliver` rather than in `Tick`, `Receive` and `Propose`: those are three ways
@@ -261,7 +292,28 @@ std::expected<void, ConsensusError> RaftDriver::Receive(RaftMessage const& messa
     if (_failure.has_value())
         return std::unexpected { *_failure };
 
-    return Deliver(_node.Receive(message, now));
+    // A leader's snapshot is asked about BEFORE the node sees it (#1552), because the node
+    // is where the answer has to take effect: taken on, a snapshot resets the log, moves
+    // both indices and is persisted and acknowledged within this one step, and the
+    // application is handed it only at the end. An application refusing it THEN would
+    // hold its old state under an applied index that said otherwise.
+    auto const* const install = std::get_if<InstallSnapshotRequest>(&message);
+    auto unreadable = std::optional<ConsensusError> {};
+    if (install != nullptr)
+        if (auto readable = _application.CanRestore(install->state); !readable.has_value())
+            unreadable = std::move(readable).error();
+
+    auto output = _node.Receive(
+        message, now, unreadable.has_value() ? SnapshotReadability::Unreadable : SnapshotReadability::Readable);
+    auto const refused = output.refusedSnapshot;
+    auto delivered = Deliver(std::move(output));
+
+    // Only a refusal the node actually made is reported: a snapshot it already covered
+    // needed no reading, and is answered as it always was.
+    if (refused.has_value() && install != nullptr && unreadable.has_value())
+        PublishInstallRefusal(
+            InstallRefusal { .index = *refused, .leader = install->leaderId, .reason = *std::move(unreadable) });
+    return delivered;
 }
 
 std::expected<LogIndex, ConsensusError> RaftDriver::Propose(std::vector<std::byte> payload, TimePoint now)
@@ -293,7 +345,8 @@ RaftDriver::Progress RaftDriver::CurrentProgress() const
                       // timer loop and every peer reader move this, and the lock ends
                       // with this statement.
                       .knownLeader = _node.KnownLeader(),
-                      .matchIndex = _node.MatchIndices() };
+                      .matchIndex = _node.MatchIndices(),
+                      .installRefusal = _installRefusal };
 }
 
 std::expected<LogIndex, ConsensusError> RaftDriver::Land(std::expected<RaftNode::Proposal, ConsensusError> proposed)

@@ -2,6 +2,7 @@
 #pragma once
 
 #include "ConsensusStanding.hpp"
+#include "NodeConditions.hpp"
 #include "NodeConfig.hpp"
 #include "NodeMembership.hpp"
 #include "SchedulerTier.hpp"
@@ -144,6 +145,30 @@ inline constexpr std::string_view ConsensusNeedsIdentityKeyRefusal =
 /// @return The refusal, as `ConsensusTier::Start` reports it.
 [[nodiscard]] std::string UnreadableConsensusStateRefusal(std::filesystem::path const& directory,
                                                           ConsensusError const& refusal);
+
+/// What this node says while it refuses its leader's snapshot (#1552).
+///
+/// The detail of the `unreadable-leader-snapshot` condition and the body of its log line:
+/// who offered what, why this build cannot read it, and what that leaves this node doing.
+/// A free function for the reason `DescribeRole` is.
+/// @param refusal What the driver refused.
+/// @return The sentence, without a level or a prefix.
+[[nodiscard]] std::string DescribeInstallRefusal(Consensus::RaftDriver::InstallRefusal const& refusal);
+
+/// Say, on every surface, that this node refuses its leader's snapshot -- or no longer does.
+///
+/// What the tier does whenever its driver's refusal starts, changes or ends (#1552). A node
+/// refusing is a follower that is BEHIND and stays so until it can read what its leader
+/// sends; from the outside that looks exactly like a slow node, so it is an Alert condition
+/// and an Error line. Its end is said as well, because watching it clear is watching the
+/// upgrade land. A free function so a case can drive both directions without a leader
+/// running another build, which is the only thing that produces one.
+/// @param refusal The refusal now in force, or nullopt once it has ended.
+/// @param logger Where the line goes.
+/// @param conditions Where `unreadable-leader-snapshot` is answered; null when nobody reads it.
+void ReportInstallRefusal(std::optional<Consensus::RaftDriver::InstallRefusal> const& refusal,
+                          ILogger& logger,
+                          NodeConditions* conditions);
 
 /// Whether a configuration change this node proposed is still in flight.
 ///
@@ -307,6 +332,8 @@ class ConsensusTier final: public Distributed::IClusterAdmin, public IConsensusS
     /// @param onMembers Told the member set; must outlive the tier.
     /// @param metrics Where a refused peer connection is counted; must outlive the tier.
     /// @param logger Where progress and refusals are reported.
+    /// @param conditions Where this tier answers its node conditions; null when nobody
+    ///        reads them. Must outlive the tier.
     /// @return The running tier, or the fatal reason.
     [[nodiscard]] static std::expected<std::unique_ptr<ConsensusTier>, std::string> Start(
         NodeConfig const& cfg,
@@ -315,7 +342,8 @@ class ConsensusTier final: public Distributed::IClusterAdmin, public IConsensusS
         RoleObserver onRole,
         MembersObserver onMembers,
         IMetricsSink& metrics,
-        ILogger& logger);
+        ILogger& logger,
+        NodeConditions* conditions = nullptr);
 
     ConsensusTier(ConsensusTier const&) = delete;
     ConsensusTier& operator=(ConsensusTier const&) = delete;
@@ -411,7 +439,8 @@ class ConsensusTier final: public Distributed::IClusterAdmin, public IConsensusS
                   RoleObserver onRole,
                   MembersObserver onMembers,
                   IMetricsSink& metrics,
-                  ILogger& logger);
+                  ILogger& logger,
+                  NodeConditions* conditions);
 
     /// Build the driver and start both loops.
     ///
@@ -605,6 +634,9 @@ class ConsensusTier final: public Distributed::IClusterAdmin, public IConsensusS
     /// Told the member set whenever it changes; may be empty.
     MembersObserver _onMembers;
 
+    /// Where this tier answers `unreadable-leader-snapshot`; null when nobody reads it.
+    NodeConditions* _conditions;
+
     /// What consensus last said, so a state change can be re-read against it.
     ///
     /// The term is carried for the log line rather than for any decision: a role
@@ -777,6 +809,7 @@ class ConsensusTier final: public Distributed::IClusterAdmin, public IConsensusS
     std::optional<Ed25519KeyPair> const& identityKey,
     NodeMembership& membership,
     IMetricsSink& metrics,
-    ILogger& logger);
+    ILogger& logger,
+    NodeConditions* conditions = nullptr);
 
 } // namespace FastCache::Node

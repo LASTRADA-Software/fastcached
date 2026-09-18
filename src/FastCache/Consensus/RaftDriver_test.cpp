@@ -131,6 +131,17 @@ class RecordingMachine final: public IRaftStateMachine
         return {};
     }
 
+    /// Journalled as "can-restore", so a case can see that the question came before
+    /// anything was persisted. Refuses while a case has said so.
+    [[nodiscard]] std::expected<void, ConsensusError> CanRestore(std::span<std::byte const> state) const override
+    {
+        std::ignore = state;
+        _journal.events.emplace_back("can-restore");
+        if (_unreadableSnapshots)
+            return std::unexpected { FastCache::UnsupportedFormatVersion("a snapshot this fake was told it cannot read") };
+        return {};
+    }
+
     [[nodiscard]] std::vector<std::byte> TakeSnapshot() override
     {
         _journal.events.emplace_back("snapshot");
@@ -164,10 +175,17 @@ class RecordingMachine final: public IRaftStateMachine
         _unreadableCommand = std::move(command);
     }
 
-    /// Refuse every snapshot from now on.
+    /// Refuse every snapshot from now on, when handed one to restore.
     void RefuseRestore() noexcept
     {
         _refuseRestore = true;
+    }
+
+    /// Answer `CanRestore` with a refusal from now on, or accept again.
+    /// @param unreadable Whether snapshots are beyond this fake.
+    void SetSnapshotsUnreadable(bool unreadable) noexcept
+    {
+        _unreadableSnapshots = unreadable;
     }
 
     /// @return Which caller each restore came from, in order.
@@ -195,6 +213,7 @@ class RecordingMachine final: public IRaftStateMachine
     std::vector<SnapshotOrigin> _origins;
     std::optional<std::vector<std::byte>> _unreadableCommand;
     bool _refuseRestore = false;
+    bool _unreadableSnapshots = false;
 };
 
 /// Storage whose every write fails, for the stop-on-failure case.
@@ -1215,4 +1234,118 @@ TEST_CASE("A driver over recovered state its application cannot read is refused,
         CHECK(machine.State().empty());
         CHECK(machine.Origins() == std::vector { SnapshotOrigin::Recovered });
     }
+}
+
+TEST_CASE("A follower's driver refuses a leader's snapshot its application cannot read, and applies nothing after it",
+          "[consensus][raft][driver][snapshot]")
+{
+    // #1552 at the driver: the application is asked BEFORE the node sees the offer, so a
+    // refusal reaches the node as a verdict and nothing is persisted, acknowledged or
+    // restored. The leader is answered `Rejected`; the refusal is held and reported ONCE,
+    // however often the leader offers again; the entry after the snapshot is not applied
+    // on the stale base -- this node does not even hold the entry it would follow; and the
+    // refusal ends by itself once the node can read what it is offered.
+    Journal journal;
+    RecordingStorage storage { journal };
+    RecordingTransport transport { journal };
+    ScriptedRandomSource random { { 0 } };
+    RecordingMachine machine { journal };
+    machine.SetSnapshotsUnreadable(true);
+
+    auto const owned =
+        MakeDriver(std::move(RaftNode::Create(TrioConfig(), random, TimePoint {})).value(), storage, transport, machine);
+    auto& driver = *owned;
+
+    auto reported = std::vector<std::optional<RaftDriver::InstallRefusal>> {};
+    driver.ObserveInstallRefusal(
+        [&reported](std::optional<RaftDriver::InstallRefusal> const& refusal) { reported.push_back(refusal); });
+
+    auto const offer = InstallSnapshotRequest { .term = Term { .value = 1 },
+                                                .leaderId = "n2",
+                                                .lastIncludedIndex = LogIndex { .value = 5 },
+                                                .lastIncludedTerm = Term { .value = 1 },
+                                                .configuration = TrioConfig().Bootstrap(),
+                                                .state = FastCache::BytesFromString("the state as of index 5") };
+
+    REQUIRE(driver.Receive(offer, TimePoint {} + 10ms).has_value());
+
+    // Asked first, and nothing taken on: no snapshot persisted, none restored.
+    REQUIRE(std::ranges::find(journal.events, std::string { "can-restore" }) != journal.events.end());
+    CHECK(std::ranges::find(journal.events, std::string { "persist-snapshot" }) == journal.events.end());
+    CHECK(std::ranges::find(journal.events, std::string { "restore" }) == journal.events.end());
+    CHECK(driver.Node().LastApplied() == LogIndex::BeforeFirst());
+
+    // The leader was told no.
+    REQUIRE_FALSE(transport.Sent().empty());
+    auto const* const answer = std::get_if<InstallSnapshotResponse>(&transport.Sent().back().second);
+    REQUIRE(answer != nullptr);
+    CHECK(answer->result == AppendResult::Rejected);
+
+    // Held, and reported once however often the leader offers again.
+    auto const held = driver.CurrentProgress().installRefusal;
+    REQUIRE(held.has_value());
+    auto const refusal = Unwrap(held);
+    CHECK(refusal.index == LogIndex { .value = 5 });
+    CHECK(refusal.leader == "n2");
+    CHECK(refusal.reason.code == ConsensusErrorCode::UnsupportedFormatVersion);
+    REQUIRE(driver.Receive(offer, TimePoint {} + 60ms).has_value());
+    REQUIRE(driver.Receive(offer, TimePoint {} + 110ms).has_value());
+    CHECK(reported.size() == 1);
+
+    // The entry after the snapshot is not applied on the stale base: the node does not hold
+    // the entry it would follow, so the append is refused and nothing reaches the machine.
+    REQUIRE(driver
+                .Receive(AppendEntriesRequest { .term = Term { .value = 1 },
+                                                .leaderId = "n2",
+                                                .prevLogIndex = LogIndex { .value = 5 },
+                                                .prevLogTerm = Term { .value = 1 },
+                                                .entries = { LogEntry { .term = Term { .value = 1 },
+                                                                        .kind = EntryKind::Command,
+                                                                        .payload = FastCache::BytesFromString("six") } },
+                                                .leaderCommit = LogIndex { .value = 6 } },
+                         TimePoint {} + 120ms)
+                .has_value());
+    CHECK(machine.Applied().empty());
+    CHECK(driver.Node().LastApplied() == LogIndex::BeforeFirst());
+
+    SECTION("and once it can read the snapshot, it takes it on and the refusal ends")
+    {
+        machine.SetSnapshotsUnreadable(false);
+        REQUIRE(driver.Receive(offer, TimePoint {} + 160ms).has_value());
+        CHECK(driver.Node().LastApplied() == LogIndex { .value = 5 });
+        CHECK_FALSE(driver.CurrentProgress().installRefusal.has_value());
+        REQUIRE(reported.size() == 2);
+        CHECK_FALSE(reported.back().has_value());
+    }
+}
+
+TEST_CASE("A machine that accepts a snapshot and then refuses to restore it stops the driver", "[consensus][raft][driver]")
+{
+    // The one ordering the question-first design cannot rule out by itself: `CanRestore`
+    // said yes, the node took the snapshot on -- persisted it, acknowledged it -- and then
+    // `RestoreSnapshot` said no. Continuing would apply every later entry on the state the
+    // snapshot was meant to replace, which is #1552 by another road, so the driver stops as
+    // it does for a failed durability write, and says why.
+    Journal journal;
+    RecordingStorage storage { journal };
+    RecordingTransport transport { journal };
+    ScriptedRandomSource random { { 0 } };
+    RecordingMachine machine { journal };
+    machine.RefuseRestore();
+
+    auto const owned =
+        MakeDriver(std::move(RaftNode::Create(TrioConfig(), random, TimePoint {})).value(), storage, transport, machine);
+    auto& driver = *owned;
+
+    auto const received = driver.Receive(InstallSnapshotRequest { .term = Term { .value = 1 },
+                                                                  .leaderId = "n2",
+                                                                  .lastIncludedIndex = LogIndex { .value = 5 },
+                                                                  .lastIncludedTerm = Term { .value = 1 },
+                                                                  .configuration = TrioConfig().Bootstrap(),
+                                                                  .state = FastCache::BytesFromString("state") },
+                                         TimePoint {} + 10ms);
+    REQUIRE_FALSE(received.has_value());
+    CHECK(received.error().code == ConsensusErrorCode::UnsupportedFormatVersion);
+    CHECK(driver.Failure().has_value());
+    CHECK_FALSE(driver.Tick(TimePoint {} + 500ms).has_value());
 }

@@ -1106,7 +1106,8 @@ using Node::NodeReloader;
                                       identityKey,
                                       membership,
                                       metrics,
-                                      logger);
+                                      logger,
+                                      &conditions);
     if (!consensusOrRefusal.has_value())
     {
         // No flag prefix here, for the reason the cache tier's line below has none:
