@@ -4,6 +4,7 @@
 #include <FastCache/Core/IRandomSource.hpp>
 #include <FastCache/Core/Ranges.hpp>
 #include <FastCache/Core/Sha256.hpp>
+#include <FastCache/Platform/Environment.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
@@ -299,6 +300,35 @@ TEST_CASE("The default Sha256 engine is the one selected for this CPU", "[core][
 {
     CHECK(ActiveSha256Engine() == SelectSha256Engine(DetectCpuFeatures()));
     CHECK(Sha256 {}.Engine() == ActiveSha256Engine());
+}
+
+TEST_CASE("A run that states its SHA-256 engine runs that engine", "[core][sha256][engine]")
+{
+    // Every other hardware case here decides from `DetectCpuFeatures`, so a detection that
+    // wrongly answered NOTHING would SKIP them all, and a leg that exists to test a hardware
+    // engine would go green having tested only Scalar (#1432). So such a leg STATES which
+    // engine its runner's CPU offers, from the workflow -- never from the architecture this
+    // test was compiled for, which agrees with the implementation on every machine CI owns
+    // (scripts/check-architecture-conditioned-tests.cmake).
+    //
+    // Only legs whose runner CPU is known state one. GitHub's x86 runners are a mix of CPUs
+    // with and without SHA-NI, so an x86 leg cannot.
+    // Unset and set-but-empty are one answer here -- no engine stated -- so they fold into
+    // one string before anything reads it.
+    auto const expected = ReadEnvironmentVariable("FASTCACHED_EXPECT_SHA256_ENGINE").value_or(std::string {});
+    if (expected.empty())
+        SKIP("this run states no expected SHA-256 engine in FASTCACHED_EXPECT_SHA256_ENGINE");
+
+    // The stated name must be one an engine answers to, or a typo in a workflow would fail
+    // here as a WRONG engine and send somebody to debug the detection.
+    auto const engines = AllEngines();
+    auto const* const named =
+        FindIfOrNull(engines, [&expected](Sha256Engine engine) { return Sha256EngineName(engine) == expected; });
+    INFO("stated engine " << expected);
+    REQUIRE(named != nullptr);
+
+    CHECK(ActiveSha256Engine() == *named);
+    CHECK(Sha256EngineRunsOn(*named, DetectCpuFeatures()));
 }
 
 TEST_CASE("HmacSha256 matches the RFC 4231 vectors", "[core][sha256][hmac]")

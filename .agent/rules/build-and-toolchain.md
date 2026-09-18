@@ -6295,13 +6295,6 @@ pointer.
 
 ## Open work
 
-- **[#1432](https://github.com/LASTRADA-Software/fastcached/issues/1432)** — SHA-256 hardware
-  detection and the ARM engine are compiled for arm64 macOS alone, so Linux aarch64 and Windows
-  ARM64 run the scalar engine, which is correct and slower. That is the instruction-set extension
-  entry under "Language and ABI pitfalls" being obeyed, not a gap in it: neither platform has a CI
-  leg to compile a branch for it. It closes when each has one, and that change removes the `#1432`
-  comments in `Core/CpuFeatures` and this entry.
-
 - **[#829](https://github.com/LASTRADA-Software/fastcached/issues/829)** — six
   contexts are still `Undecided` in `check-merge-queue-contexts.sh`'s binding table
   (`Windows-cl-debug`, `Code coverage`, both `compile-cache E2E` legs, the
