@@ -1025,6 +1025,36 @@ Consequences that are each load-bearing:
   and lease tokens, so a construction that omits its domain is a credential valid on the
   other surface — which is the failure the label existed to prevent and which two
   hand-rolled constructions could only prevent by both remembering to (#402).
+- **Asymmetric cryptography has ONE seam too: `Core/Ed25519`, `Core/X25519` and `Core/Hkdf`,
+  over the vendored Monocypher (#178).** Only `Ed25519.cpp` and `X25519.cpp` include a Monocypher
+  header, and `ctest -R crypto-seam` refuses any other first-party file that does -- the include
+  directories are PUBLIC on the vendored library, so the build alone cannot say it. A primitive
+  the seam lacks is added THERE, beside the RFC vectors that check it, never by reaching past it.
+  - **Why asymmetric at all.** The per-node identity #178 builds has to let ONE machine be revoked
+    without rotating anything on the others, and with symmetric keys a verifier holds the key
+    that mints: Raft is all-to-all, so every key reaches every member, and every member can then
+    sign as every other. Verifying without being able to mint is what a signature is.
+  - **Why Monocypher.** OpenSSL is optional here (`FASTCACHED_ENABLE_TLS`, off by default) and
+    the launcher, which will verify signed leases, must stay free of it; hand-written curve
+    arithmetic is refused when an audited, constant-time, public-domain implementation exists.
+    Monocypher is two C files with no dependency and no random generator of its own -- every
+    seed and ephemeral secret is the CALLER's, which is what #1527's `ISecureRandom` supplies. It
+    is built as C++ (`cmake/Monocypher.cmake`), and 4.0.3 is the floor: its changelog opens with
+    a fixed timing leak in EdDSA signatures.
+  - **What the seam decides once, so no caller can get it wrong.** Ed25519 is RFC 8032's, over
+    SHA-512 (`crypto_ed25519_*`), NEVER Monocypher's default `crypto_eddsa_*`, which is EdDSA
+    over BLAKE2b: a different scheme no other Ed25519 verifies and the RFC vectors cannot test.
+    `crypto_ed25519_key_pair` WIPES the seed it is handed, so it is handed a copy. A signature
+    whose S is not below L is refused -- that range check is all that stops a valid signature
+    being turned into a second one. An all-zero X25519 result is refused, since a low-order peer
+    key fixes it for everybody. And a raw X25519 secret is not a key: it goes through HKDF.
+  - **One leniency, stated rather than found later:** Monocypher accepts a non-canonical
+    encoding of R or A (y at or above p), where RFC 8032 has decoding fail. Only a point whose y
+    is below 19 has such a spelling, so an honest signature or key has none in practice.
+  - Secrets at the seam live in `SecureByteBuffer`, temporaries are wiped with `SecureZero` --
+    the tree's one zeroing primitive, rather than Monocypher's `crypto_wipe` beside it -- and the
+    names they are held under are rows of `scripts/check-credential-containers.sh`, which since
+    #178 also refuses a secret held in a `std::array`, the spelling of this tree's PUBLIC keys.
 - **That consolidation changed the discovery proof wire, and
   `DiscoveryWire::CurrentVersion` deliberately did NOT move.** The proof message gains
   `fastcache-discovery-v1` as a leading length-prefixed field, so every proof tag differs

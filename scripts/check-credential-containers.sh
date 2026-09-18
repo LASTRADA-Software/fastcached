@@ -58,7 +58,18 @@ signingKey|what a lease grant is MACed with; SchedulerService and SignedLeaseVal
 _signingKey|the SchedulerService member holding the same
 presharedKey|the cluster PSK, which MACs discovery proofs
 clusterKey|the cluster key an enrolling node is handed and writes to disk; EnrollReading holds it
+secretKey|an Ed25519 or X25519 secret key: what signs as a node, and what a key agreement is computed from (Core/Ed25519, Core/X25519, #178)
+_secretKey|the Ed25519KeyPair member holding the same, in the Monocypher layout: seed, then public key
+sharedSecret|a raw X25519 shared secret, the input keying material every session key is derived from (Core/X25519)
+inputKeyMaterial|what HKDF extracts from -- a shared secret under another name (Core/Hkdf)
+pseudoRandomKey|the HKDF PRK, from which every output key is expanded (Core/Hkdf)
+outputKeyMaterial|the HKDF output: the derived key itself (Core/Hkdf)
 '
+# The six rows below `clusterKey` are the per-node identity's (#178), and they are here although
+# none of that material is the CLUSTER key: the table's claim is "these names hold key material",
+# and a node's signing key and a session's derived keys are exactly that. Each name is held by the
+# Core crypto seam today and matched there, so a rename in `Core/Ed25519`, `Core/X25519` or
+# `Core/Hkdf` is a refusal here.
 # `clusterKey` WAS excluded, and the note said "nothing here is called that" -- true when
 # it was written and false now. It was excluded because a term matching nothing is a
 # REFUSAL here (that is case 3, and deliberately so), not because the name is dangerous:
@@ -77,11 +88,17 @@ clusterKey|the cluster key an enrolling node is handed and writes to disk; Enrol
 # Types that OWN bytes. A borrowing view (`std::span`, `BytesView`, `std::string_view`)
 # is deliberately absent: it owns no storage, so there is nothing for it to zero, and
 # demanding a secure type of a view would refuse every correct boundary in the tree.
+#
+# Each row is an extended regular expression, matched immediately before the identifier. The
+# `std::array` row is the one that needs to be: a fixed-size array is the obvious spelling of a
+# 32-byte key -- this tree's PUBLIC keys are exactly that -- and it is never zeroed when it dies,
+# so a secret spelled like its public half is the declaration most likely to be written next (#178).
 OwningTypes='
 std::vector<std::byte>
 std::vector<uint8_t>
 std::vector<std::uint8_t>
 std::string
+std::array<std::(byte|uint8_t|byte const|uint8_t const),[^>]*>
 '
 
 # ---------------------------------------------------------------------------
@@ -289,6 +306,13 @@ SecureByteBuffer signingKey;
 SecureByteBuffer _signingKey;
 SecureByteBuffer presharedKey;
 SecureByteBuffer clusterKey;
+SecureByteBuffer secretKey;
+SecureByteBuffer _secretKey;
+SecureByteBuffer sharedSecret;
+SecureByteBuffer inputKeyMaterial;
+SecureByteBuffer pseudoRandomKey;
+SecureByteBuffer outputKeyMaterial;
+std::array<std::byte, 32> publicKey;
 
 EOF
     verdict=$(bash "$0" --root "$tmp/clean" 2>&1)
@@ -319,6 +343,12 @@ EOF
 SecureByteBuffer signingKey;
 SecureByteBuffer _signingKey;
 SecureByteBuffer clusterKey;
+SecureByteBuffer secretKey;
+SecureByteBuffer _secretKey;
+SecureByteBuffer sharedSecret;
+SecureByteBuffer inputKeyMaterial;
+SecureByteBuffer pseudoRandomKey;
+SecureByteBuffer outputKeyMaterial;
 EOF
     verdict=$(bash "$0" --root "$tmp/blind" 2>&1)
     if grep -q "identifier 'presharedKey' matches nothing" <<< "$verdict"; then
@@ -359,6 +389,12 @@ SecureByteBuffer signingKey;
 SecureByteBuffer _signingKey;
 SecureByteBuffer presharedKey;
 SecureByteBuffer clusterKey;
+SecureByteBuffer secretKey;
+SecureByteBuffer _secretKey;
+SecureByteBuffer sharedSecret;
+SecureByteBuffer inputKeyMaterial;
+SecureByteBuffer pseudoRandomKey;
+SecureByteBuffer outputKeyMaterial;
 inline std::string MintLeaseToken(std::span<std::byte const> signingKey, int claims);
 bool Authenticate(std::span<std::byte const> signingKey, std::string_view token);
 EOF
@@ -367,6 +403,21 @@ EOF
         printf 'ok   case 6: a return type and a string_view are not declarations\n'
     else
         printf 'FAIL case 6: false positive returned: %s\n' "$verdict"; return 1
+    fi
+    cases=$((cases + 1))
+
+    # Case 7: a secret spelled like its public half. A fixed-size array is how this tree writes a
+    # PUBLIC key, which makes it the likeliest wrong spelling of a SECRET one, and it is never
+    # zeroed. The public key in the clean tree (case 1) is the control that the row is about the
+    # identifier and not about arrays.
+    mkdir -p "$tmp/array"
+    cp "$tmp/clean/a.hpp" "$tmp/array/a.hpp"
+    printf 'std::array<std::byte, Ed25519SeedBytes> secretKey {};\n' >> "$tmp/array/a.hpp"
+    verdict=$(bash "$0" --root "$tmp/array" 2>&1)
+    if grep -q 'secretKey declared as std::array' <<< "$verdict"; then
+        printf 'ok   case 7: a secret held in a std::array is reported\n'
+    else
+        printf 'FAIL case 7: array-held secret not reported. Got: %s\n' "$verdict"; return 1
     fi
     cases=$((cases + 1))
 

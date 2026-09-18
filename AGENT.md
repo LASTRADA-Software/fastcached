@@ -16,7 +16,8 @@ src/FastCache/
                 Utf8 (the one strict decoder), Markup (the one markup escaper, over
                 Utf8 and reached by all three targets that emit XML-family documents),
                 Compression, WireFrame + WireFields
-                (the shared framing), Profiling
+                (the shared framing), Profiling, and the crypto seam -- Ed25519,
+                X25519 and Hkdf, the ONLY way into the vendored Monocypher
   Async/        Task<T>, Cancellation, ResumeOn, SleepUntil,
                 InterruptibleSleepUntil, DeadlineTimer, AsyncQueue (MPSC,
                 bounded, closable), IExecutor (the one thing ResumeOn needs)
@@ -309,6 +310,10 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
 - And it says WHICH nothing it resolved: one wire code, three rows, keyed on the OUTCOME. Only
   `Expired` is counted, and the enumerators name what was OBSERVED. Acceptance is a
   discrimination case; per-arm sections all pass when all three answer alike.
+- Asymmetric crypto has ONE seam: `Core/Ed25519`, `Core/X25519`, `Core/Hkdf` over the vendored
+  Monocypher, and only `Ed25519.cpp` and `X25519.cpp` include its headers (`ctest -R crypto-seam`).
+  RFC 8032 Ed25519, never Monocypher's default EdDSA over BLAKE2b. A missing primitive is added THERE,
+  beside its RFC vectors.
 - A credential lives in `SecureByteBuffer`, and the wipe is an **allocator**, not a destructor.
   Container-agnostic is not SUFFICIENT — SSO keeps a short secret where no allocator is called,
   which makes **macOS the platform to write the failing test against**. Secret STRINGS need an
