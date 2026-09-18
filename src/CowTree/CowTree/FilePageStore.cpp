@@ -586,9 +586,10 @@ auto FilePageStore::WriteFreeListLocked() -> std::expected<PageId, CowTreeError>
         listPages.push_back(*page);
     }
 
-    // Written back to front so each page can name its successor.
+    // Written back to front so each page can name its successor: `pagesNeeded - 1` down to 0,
+    // and no page at all when there are none, which is what the descending counter gave.
     std::vector<std::byte> buffer(_pageSize);
-    for (std::size_t i = pagesNeeded; i-- > 0;)
+    for (auto const i: std::views::iota(std::size_t { 0 }, pagesNeeded) | std::views::reverse)
     {
         std::ranges::fill(buffer, std::byte { 0 });
         std::uint64_t const next = (i + 1 < pagesNeeded) ? listPages[i + 1].value : 0;

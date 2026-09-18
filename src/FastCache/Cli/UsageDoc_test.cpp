@@ -165,6 +165,19 @@ TEST_CASE("color adds escapes without changing a single character", "[cli][usage
     CHECK(StripAnsi(colored) == plain);
 }
 
+TEST_CASE("StripAnsi removes each escape through its m and keeps every character around it", "[cli][usage][color]")
+{
+    // The helper the invariant above is judged by, pinned on its own: a strip that ate one
+    // character too many or too few would make that comparison agree or disagree for the
+    // wrong reason. Adjacent escapes, one at either end, and a letter `m` OUTSIDE an escape.
+    CHECK(StripAnsi("plain m text") == "plain m text");
+    CHECK(StripAnsi("\x1b[1mbold\x1b[0m") == "bold");
+    CHECK(StripAnsi("a\x1b[1m\x1b[32mb\x1b[0mc") == "abc");
+    CHECK(StripAnsi("\x1b[0m").empty());
+    // An escape nothing terminates runs to the end, and takes the rest with it.
+    CHECK(StripAnsi("kept\x1b[1") == "kept");
+}
+
 TEST_CASE("rendered text ends in exactly one newline", "[cli][usage]")
 {
     static constexpr auto entries = std::to_array<UsageEntry>({ { .term = "--f", .description = "d" } });

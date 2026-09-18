@@ -504,8 +504,12 @@ namespace
         // which point whichever header the client happened to send first is the only
         // one that arrives, so a chart's `If-None-Match` would vanish whenever the
         // browser put `Authorization` above it.
+        //
+        // A `find` walk, one field line per pass, whose only advance is the `cursor` assignment
+        // at the foot -- there is no `continue` to skip it, and each way out is a `break`.
         EnumTable<AdminHeader, std::string> headers {};
-        for (auto cursor = eol + 2; cursor < buffer.size();)
+        auto cursor = eol + 2;
+        while (cursor < buffer.size())
         {
             auto const lineEnd = buffer.find("\r\n", cursor);
             if (lineEnd == std::string::npos || lineEnd == cursor)

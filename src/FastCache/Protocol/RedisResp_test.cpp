@@ -3959,3 +3959,107 @@ TEST_CASE("A RESP session some Task owns is left alone by the reactor", "[protoc
     // Freed exactly once, by the Task that owns it.
     CHECK(counters.destroyed == 1);
 }
+
+// -- option walks: each consumes a value inside its own arm ---------------------------
+
+TEST_CASE("RESP: XSETID reads ENTRIESADDED and MAXDELETEDID in either order", "[protocol][resp][stream]")
+{
+    // Each option consumes itself AND its value, so the walk must land on the next option
+    // after either one -- in both orders -- and a value must never be read as an option.
+    RespFixture fix;
+    auto const out = Exchange(fix,
+                              "XADD s 1-0 f v\r\n"
+                              "XSETID s 5-0 ENTRIESADDED 7 MAXDELETEDID 3-0\r\n"
+                              "XSETID s 6-0 MAXDELETEDID 4-0 ENTRIESADDED 8\r\n"
+                              "XINFO STREAM s\r\n");
+    INFO(out);
+    CHECK(out.starts_with("$3\r\n1-0\r\n+OK\r\n+OK\r\n"));
+    CHECK(out.contains("$17\r\nlast-generated-id\r\n$3\r\n6-0\r\n"));
+    CHECK(out.contains("$20\r\nmax-deleted-entry-id\r\n$3\r\n4-0\r\n"));
+    CHECK(out.contains("$13\r\nentries-added\r\n:8\r\n"));
+}
+
+TEST_CASE("RESP: XSETID refuses an option whose value is missing or unknown", "[protocol][resp][stream]")
+{
+    RespFixture fix;
+    auto const out = Exchange(fix,
+                              "XADD s 1-0 f v\r\n"
+                              "XSETID s 5-0 ENTRIESADDED\r\n"
+                              "XSETID s 5-0 BOGUS 1\r\n"
+                              "XINFO STREAM s\r\n");
+    INFO(out);
+    CHECK(out.starts_with("$3\r\n1-0\r\n-ERR syntax error\r\n-ERR syntax error\r\n"));
+    // Neither refused call moved the stream.
+    CHECK(out.contains("$17\r\nlast-generated-id\r\n$3\r\n1-0\r\n"));
+}
+
+TEST_CASE("RESP: XCLAIM reads every ID and then value-bearing options from where the IDs stop", "[protocol][resp][stream]")
+{
+    // Two phases over one cursor: the IDs run until the first argument that is not one, and the
+    // options start exactly there. `IDLE`, `RETRYCOUNT` and `LASTID` each consume a value, which
+    // must not be read as the next option.
+    RespFixture fix;
+    auto const out = Exchange(fix,
+                              "XADD s 1-0 f v\r\n"
+                              "XADD s 2-0 f v\r\n"
+                              "XGROUP CREATE s g1 0\r\n"
+                              "XREADGROUP GROUP g1 c1 STREAMS s >\r\n"
+                              "XCLAIM s g1 c2 0 1-0 2-0 IDLE 5 RETRYCOUNT 2 FORCE LASTID 2-0 JUSTID\r\n");
+    INFO(out);
+    CHECK(out.ends_with("*2\r\n$3\r\n1-0\r\n$3\r\n2-0\r\n"));
+}
+
+TEST_CASE("RESP: XCLAIM refuses an option missing its value and a claim naming no ID", "[protocol][resp][stream]")
+{
+    RespFixture fix;
+    auto const out = Exchange(fix,
+                              "XADD s 1-0 f v\r\n"
+                              "XGROUP CREATE s g1 0\r\n"
+                              "XCLAIM s g1 c2 0 1-0 IDLE\r\n"
+                              "XCLAIM s g1 c2 0 1-0 BOGUS\r\n"
+                              "XCLAIM s g1 c2 0 JUSTID\r\n");
+    INFO(out);
+    CHECK(out.ends_with("-ERR syntax error\r\n-ERR syntax error\r\n-ERR wrong number of arguments for 'xclaim'\r\n"));
+}
+
+TEST_CASE("RESP: XAUTOCLAIM reads COUNT and JUSTID in either order", "[protocol][resp][stream]")
+{
+    // COUNT consumes its value and JUSTID does not, so the walk advances by two and by one; a
+    // COUNT of one over two pending entries claims the first and resumes the cursor at the second.
+    RespFixture fix;
+    auto const out = Exchange(fix,
+                              "XADD s 1-0 f v\r\n"
+                              "XADD s 2-0 f v\r\n"
+                              "XGROUP CREATE s g1 0\r\n"
+                              "XREADGROUP GROUP g1 c1 STREAMS s >\r\n"
+                              "XAUTOCLAIM s g1 c2 0 0-0 COUNT 1 JUSTID\r\n"
+                              "XAUTOCLAIM s g1 c3 0 0-0 JUSTID COUNT 1\r\n");
+    INFO(out);
+    auto const firstOnly = std::string { "*3\r\n$3\r\n2-0\r\n*1\r\n$3\r\n1-0\r\n*0\r\n" };
+    CHECK(out.ends_with(firstOnly + firstOnly));
+}
+
+TEST_CASE("RESP: XAUTOCLAIM refuses COUNT 0 and a COUNT missing its value", "[protocol][resp][stream]")
+{
+    RespFixture fix;
+    auto const out = Exchange(fix,
+                              "XADD s 1-0 f v\r\n"
+                              "XGROUP CREATE s g1 0\r\n"
+                              "XAUTOCLAIM s g1 c2 0 0-0 COUNT 0\r\n"
+                              "XAUTOCLAIM s g1 c2 0 0-0 COUNT\r\n");
+    INFO(out);
+    CHECK(out.ends_with("-ERR COUNT must be > 0\r\n-ERR syntax error\r\n"));
+}
+
+TEST_CASE("RESP: XADD stores every field pair in the order given", "[protocol][resp][stream]")
+{
+    RespFixture fix;
+    auto const out = Exchange(fix,
+                              "XADD s 1-0 a 1 b 2 c 3\r\n"
+                              "XRANGE s - +\r\n");
+    INFO(out);
+    CHECK(out
+          == "$3\r\n1-0\r\n"
+             "*1\r\n"
+             "*2\r\n$3\r\n1-0\r\n*6\r\n$1\r\na\r\n$1\r\n1\r\n$1\r\nb\r\n$1\r\n2\r\n$1\r\nc\r\n$1\r\n3\r\n");
+}

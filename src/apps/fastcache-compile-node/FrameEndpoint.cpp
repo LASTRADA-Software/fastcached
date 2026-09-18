@@ -80,8 +80,11 @@ namespace
     /// @param limit How many bytes may be discarded before giving up on politeness.
     Task<void> DrainUntilPeerCloses(ISocket* socket, std::size_t limit)
     {
+        // A `while`: each read advances the tally by however much arrived, which no `for`
+        // head can state, and that addition at the foot is the loop's only advance.
         std::array<std::byte, 4096> scratch {};
-        for (std::size_t discarded = 0; discarded < limit;)
+        auto discarded = std::size_t { 0 };
+        while (discarded < limit)
         {
             auto const read = co_await socket->Read(std::span<std::byte> { scratch });
             if (!read.has_value() || *read == 0)

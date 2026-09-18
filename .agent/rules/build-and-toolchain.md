@@ -6089,42 +6089,86 @@ The seam's own existence is the ANCHOR: with `Enumerators` gone from the header 
 REFUSES rather than reporting a clean tree, because *no violations* and *the rule no longer
 applies* are different answers and only one of them is good news.
 
-## A C-style loop is classified by its BODY, and four shapes are not convertible
+## A C-style loop is classified by its BODY, and "not a range-for" is not "stays a `for`"
 
-#1452 converts the three-clause form across `src/`, and **the head is not a classifier.** Of
-the 134 backlogged sites, 78 are mechanical and 56 are not, and nothing about a head says which.
-The four that are not, in the order they cost the most:
+#1452 converted the three-clause form across `src/`, and **the head is not a classifier.** Of
+the 134 backlogged sites the opening estimate called 78 mechanical; 68 were, and nothing about a
+head says which. It closed with `scripts/check-test-loops-backlog.txt` EMPTY: every site either
+converted or moved to `FastCachedTestLoopExemptions` with the reason it stays.
+
+Five shapes are not a RANGE-FOR, in the order they cost the most, each with the target it
+actually took:
 
 - **The body ADVANCES the loop variable**, to consume an escaped character, a continuation or a
-  length prefix — `CompileCache/PathCanon.cpp:558`, `Protocol/RedisResp.cpp:1487`,
-  `Cli/UsageTestUtils.hpp:27` and three in `apps/fastcache-cc/DirectManifest.cpp`. In a range-for
-  that `++i` advances the ITERATION'S COPY, so the second character is consumed as data. Not a
-  crash: in `DirectManifest` it mis-splits a dependency path on `\ `, which is **a wrong cache
-  key**. **And `auto i` compiles silently** — only `auto const i` is refused, by
+  length prefix — `CompileCache/PathCanon.cpp`'s depfile tokenizer, `Protocol/RedisResp.cpp`'s
+  `SET` options, `Cli/UsageTestUtils.hpp` and three walks in `apps/fastcache-cc/DirectManifest.cpp`.
+  In a range-for that `++i` advances the ITERATION'S COPY, so the second character is consumed as
+  data. Not a crash: in `DirectManifest` it mis-splits a dependency path on `\ `, which is **a
+  wrong cache key**. **And `auto i` compiles silently** — only `auto const i` is refused, by
   `error: increment of read-only variable 'i'`, so the careful spelling is the one that fails
-  loudly and the careless one ships.
+  loudly and the careless one ships. The target is a `while` with ONE advance at its foot and
+  every `continue` inverted into an `else` of the arm before it — the shape `Cli/Options.hpp`'s
+  `ParseOptionsInto` took first — so no path can skip the step and the head no longer advertises
+  a constant one the loop does not take.
 - **A CALLEE advances it through `std::size_t&`**, which no body scan can see:
-  `Cli/Options.hpp:720` and `apps/fastcache-cli/CliCommand.cpp:690` pass their index to
-  `ApplyOneOption`, `Config/FileOptions.hpp:174` to `TakeValue`. Both consume an option's VALUE,
-  so a conversion makes every `--key value` flag re-read its value as the next token — across
-  argv, the launcher's flags and the config-FILE appliers at once, silent for boolean flags.
-  This is the shape that survives a careful reading of the loop.
-- **An INCLUSIVE bound.** `iota` is half-open, so `hop <= MaxRedirects` is `iota(0, N + 1)` and
-  the obvious conversion follows one redirect fewer (`apps/fastcache-compile-node/EnrollClient.cpp:317`,
-  `CowTree/FilePageStore.cpp:372`).
-- **A COMPOUND bound.** Two clauses are not one range: three sites want `iota(0, min(a, b))`, and
-  `Net/EpollSocket.cpp:127` / `Net/KqueueSocket.cpp:121` are `iovec` batch builders where the
-  second clause is a budget rather than a bound, so converting on the first alone overruns a write.
+  `Cli/Options.hpp` and `apps/fastcache-cli/CliCommand.cpp` pass their index to `ApplyOneOption`,
+  `Config/FileOptions.hpp` to `TakeValue`. Both consume an option's VALUE, so a conversion to a
+  range-for makes every `--key value` flag re-read its value as the next token — across argv, the
+  launcher's flags and the config-FILE appliers at once, silent for boolean flags. This is the
+  shape that survives a careful reading of the loop. Two became `while`s; `CliCommand.cpp` stays,
+  because its five `continue`s would each need the step.
+- **A COMPOUND bound.** Two clauses are not one range — but they are often one range AND A BREAK.
+  `std::min` where both clauses bound the index, and a `break` asked where the head asked it where
+  the second clause is something else: on `Net/EpollSocket.cpp` / `Net/KqueueSocket.cpp`'s `iovec`
+  batch builders it is a slot BUDGET that an empty segment does not spend, so it is checked BEFORE
+  each segment, at the top of the body. Converting on the first clause alone overruns a write.
+  *Measured* on those builders with g++ 14.3 and clang 22.1 at `-O2`: the code generated differs,
+  and the range form is the shorter of the two in both (69 against 73 lines of assembly once
+  directives are dropped under g++, 40 against 55 under clang). *Inferred*: neither difference
+  can be seen beside the `sendmsg` that follows every batch.
+  `Cache/CacheEngine.cpp`'s stream walks bounded on `out.size() < count` with `count == 0` meaning
+  unbounded — which is a `take` after all, because `out` starts empty and gains one entry per step.
+  One helper, `FirstCount`, CLAMPS the count to the match first: a client may send `COUNT` up to
+  `UINT64_MAX`, and past `PTRDIFF_MAX` that is a negative `take`, which the view does not allow.
+- **The induction variable OUTLIVES the loop** — `RedisResp.cpp`'s XCLAIM declares `i` above two
+  sibling loops and the second RESUMES where the first `break`s, so neither converts in isolation
+  and nothing in either head says so. Two phases over one cursor are two `while`s over a shared
+  `i`.
+- **Erase-while-walking**, which wants an ALGORITHM rather than a range-for. `std::erase_if` on a
+  container is SPECIFIED as exactly the loop it replaces — each element visited once, in order,
+  erased when the predicate answers true — so a predicate may do the per-bucket removal itself
+  and answer whether that left the bucket empty (`PubSubRegistry`, `RedisTransaction`,
+  `StreamWaiterRegistry`). A find-and-erase of one element is `ranges::find` and one `erase`
+  (`Net/IocpSocket.cpp`, which cannot reach `Core/Ranges.hpp`'s `FindOrNull` across the
+  `net-boundary`).
 
-**Every one of these was first classified as mechanical**, by three successive versions of the
-classifier — comments unstripped (a `;` inside `// … itself; drop it` truncated an unbraced
+**An INCLUSIVE bound is on none of those lists.** `i <= N` is `iota(first, N + 1)` and a
+DESCENDING loop is that range through `views::reverse`; what it needs is a stated premise — `N + 1`
+cannot overflow, and the range is EMPTY where the loop ran zero times — rather than an exemption.
+A STRIDE is a range over the group ORDINAL with the index derived from it (`Core/Base64.cpp`,
+`Cluster/ClusterState.cpp`, `Distributed/FleetChart.cpp`, `Distributed/FleetHistory.cpp`), with the
+count rounded up where the original stepped past a partial last group. Not `views::stride` or
+`views::chunk`: they are C++23 adaptors of the family this tree already avoids for AppleClang's
+libc++ (`enumerate`, `zip`), and nobody has measured them there.
+
+**What stays a `for` is a sequence the standard library has no range for**, and it stays with an
+exemption row naming why: a C linked list (`getaddrinfo`, `getifaddrs`, `GetAdaptersAddresses`), a
+`directory_iterator` advanced by the error-code overload, a sentinel-terminated block, a
+work-stealing index, a find-walk over text it rewrites, and a loop with no condition. Moving such
+a loop's constant step from the head to the foot of a `while` buys nothing and costs a trap: the
+next `continue` anybody writes skips it and never ends.
+
+**Every one of these shapes was first classified mechanical**, by three successive versions of
+the classifier — comments unstripped (a `;` inside `// … itself; drop it` truncated an unbraced
 body), no inclusive verdict, no escaping verdict. They failed the same way each time, and that
 direction is structural rather than unlucky: **a text scan fails toward "nothing unusual here",
 so every gap in one lands in the bucket whose sites get converted without being read.** A
 classifier for this therefore fails CLOSED and names the callee, and it refuses to print any
 count until it reproduces a hand-read site per verdict — the figures are otherwise
 unfalsifiable, and the first probe for inclusive bounds answered *0 sites* over an empty file
-list with no control.
+list with no control. **And the opposite error was made twice, too**: the inclusive bound, and
+then four of these five, were first listed as NOT CONVERTIBLE when only the range-for had been
+ruled out — an over-report that points sites at exemptions they do not need.
 
 `std::views::iota` is the target, NOT the `Ranges::` seam — `check-ranges-seam.cmake` states it
 is deliberately outside it. For argv, the target is `std::span<char* const>{argv, argc}.subspan(1)`,

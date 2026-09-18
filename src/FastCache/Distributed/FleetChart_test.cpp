@@ -3,6 +3,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <format>
@@ -739,4 +740,55 @@ TEST_CASE("A chart whose ticks are a day apart labels them with dates", "[distri
                              { { FleetMetric::DispatchGranted, static_cast<std::uint64_t>(index) } }));
     auto const short_ = RenderChartSvg(ChartByKey("dispatched"), minutes, FleetRange::OneHour, FleetTheme::Light);
     CHECK(short_.contains(">00:00<"));
+}
+
+TEST_CASE("The axis labels every step-th bucket from the first and rounds the last one in", "[distributed][fleetchart]")
+{
+    // `step` is the bucket count over six, at least one, and the ticks are as many as fit
+    // from index zero. Minute buckets make each label its own index: bucket N reads `HH:MM`
+    // of N minutes past midnight, so WHICH ticks were drawn can be read off the text.
+    auto const occurrences = [](std::string_view haystack, std::string_view needle) {
+        auto count = std::size_t { 0 };
+        auto at = haystack.find(needle);
+        while (at != std::string_view::npos)
+        {
+            ++count;
+            at = haystack.find(needle, at + 1);
+        }
+        return count;
+    };
+    auto const render = [](int bucketCount) {
+        std::vector<FleetBucket> minutes;
+        for (auto const index: std::views::iota(0, bucketCount))
+            minutes.push_back(At(static_cast<std::int64_t>(index) * 60'000,
+                                 { { FleetMetric::DispatchGranted, static_cast<std::uint64_t>(index) } }));
+        return RenderChartSvg(ChartByKey("dispatched"), minutes, FleetRange::OneHour, FleetTheme::Light);
+    };
+
+    struct Row
+    {
+        int buckets;               ///< How many buckets the chart draws.
+        std::size_t labels;        ///< How many ticks that gives.
+        std::string_view last;     ///< The last tick's label.
+        std::string_view notDrawn; ///< The label one step past it, which must be absent.
+    };
+    constexpr auto Rows = std::to_array<Row>({
+        { .buckets = 60, .labels = 6, .last = ">00:50<", .notDrawn = ">01:00<" },
+        { .buckets = 61, .labels = 7, .last = ">01:00<", .notDrawn = ">01:10<" },
+        { .buckets = 5, .labels = 5, .last = ">00:04<", .notDrawn = ">00:05<" },
+        { .buckets = 2, .labels = 2, .last = ">00:01<", .notDrawn = ">00:02<" },
+    });
+    for (auto const& row: Rows)
+    {
+        INFO(row.buckets << " buckets");
+        auto const svg = render(row.buckets);
+        CHECK(occurrences(svg, R"(text-anchor="start")") == 1);
+        CHECK(occurrences(svg, R"(text-anchor="middle")") == row.labels - 1);
+        CHECK(svg.contains(">00:00<"));
+        CHECK(svg.contains(row.last));
+        CHECK_FALSE(svg.contains(row.notDrawn));
+    }
+
+    // One bucket has no span to label at all.
+    CHECK_FALSE(render(1).contains("text-anchor="));
 }

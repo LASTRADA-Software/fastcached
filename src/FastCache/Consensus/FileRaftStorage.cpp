@@ -67,8 +67,8 @@ namespace
     {
 #if defined(_WIN32)
         auto wide = std::wstring {};
-        for (auto const* cursor = mode; *cursor != '\0'; ++cursor)
-            wide.push_back(static_cast<wchar_t>(*cursor));
+        for (char const symbol: std::string_view { mode })
+            wide.push_back(static_cast<wchar_t>(symbol));
 
         return ::_wfopen(path.wstring().c_str(), wide.c_str());
 #else

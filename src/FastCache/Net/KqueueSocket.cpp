@@ -21,6 +21,7 @@
     #include <cstring>
     #include <expected>
     #include <memory>
+    #include <ranges>
     #include <span>
     #include <string>
     #include <string_view>
@@ -118,8 +119,12 @@ namespace
         {
             std::array<iovec, MaxIovBatch> iov {};
             std::size_t count = 0;
-            for (auto i = segIndex; i < segments.size() && count < MaxIovBatch; ++i)
+            // The range and the batch budget apart, as in EpollSocket.cpp's twin of this loop:
+            // a full batch is a `break` asked before each segment, where the head asked it.
+            for (auto const i: std::views::iota(segIndex, segments.size()))
             {
+                if (count == MaxIovBatch)
+                    break;
                 auto const seg = segments[i];
                 auto const skip = (i == segIndex) ? segOffset : std::size_t { 0 };
                 if (seg.size() <= skip)

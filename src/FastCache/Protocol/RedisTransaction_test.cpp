@@ -464,3 +464,27 @@ TEST_CASE("WatchRegistry::TouchedAll skips expired weak_ptrs without crashing", 
     }
     REQUIRE(registry.TouchedAll() == 0);
 }
+
+TEST_CASE("WatchRegistry: UnregisterAll keeps a key another handle still watches", "[protocol][redis][transaction]")
+{
+    // The walk drops a key only once NOBODY watches it: `a` leaving must take `bar` with it,
+    // must leave `foo` to `b`, and must take exactly its own two entries off the counter --
+    // so `b` leaving afterwards brings it to zero rather than below or above.
+    WatchRegistry registry;
+    auto a = std::make_shared<WatchHandle>();
+    auto b = std::make_shared<WatchHandle>();
+    REQUIRE(registry.Register(a, "foo"));
+    REQUIRE(registry.Register(a, "bar"));
+    REQUIRE(registry.Register(b, "foo"));
+
+    registry.UnregisterAll(a.get());
+    CHECK(registry.Touched("bar") == 0);
+    CHECK(registry.Touched("foo") == 1);
+    CHECK(b->IsDirty());
+    CHECK_FALSE(a->IsDirty());
+    CHECK(registry.HasAnyWatchers());
+
+    registry.UnregisterAll(b.get());
+    CHECK(registry.Touched("foo") == 0);
+    CHECK_FALSE(registry.HasAnyWatchers());
+}

@@ -33,7 +33,7 @@ namespace
         std::array<std::uint8_t, 256> table {};
         for (auto& entry: table)
             entry = Invalid;
-        for (std::size_t i = 0; i < Alphabet.size(); ++i)
+        for (auto const i: std::views::iota(std::size_t { 0 }, Alphabet.size()))
             table[static_cast<unsigned char>(Alphabet[i])] = static_cast<std::uint8_t>(i);
         return table;
     }
@@ -43,11 +43,17 @@ namespace
 
 std::string Base64Encode(std::span<std::byte const> bytes)
 {
+    // Walked by group rather than by byte: three input bytes per group, the last one short
+    // when the length is not a multiple of three. `+ 2` cannot overflow, since a span holds
+    // no more bytes than half the address space.
+    auto const groups = (bytes.size() + 2) / 3;
     std::string out;
-    out.reserve((bytes.size() + 2) / 3 * 4);
+    out.reserve(groups * 4);
 
-    for (std::size_t i = 0; i < bytes.size(); i += 3)
+    for (auto const ordinal: std::views::iota(std::size_t { 0 }, groups))
     {
+        auto const i = ordinal * 3;
+
         // How many of this group's three input bytes actually exist. The final
         // group is the only short one, and the count drives both how many symbols
         // are emitted and how many `=` follow -- computed once rather than
@@ -92,10 +98,15 @@ std::optional<std::string> Base64Decode(std::string_view text)
             ++padding;
     }
 
+    // Walked by group, four symbols each -- exactly, because a length that is not a multiple of
+    // four was refused above.
+    auto const groups = text.size() / 4;
     std::string out;
-    out.reserve(text.size() / 4 * 3);
-    for (std::size_t i = 0; i < text.size(); i += 4)
+    out.reserve(groups * 3);
+    for (auto const ordinal: std::views::iota(std::size_t { 0 }, groups))
     {
+        auto const i = ordinal * 4;
+
         // Padding belongs to the LAST group only. Applying the count to every
         // group would drop a byte from each, which decodes short inputs correctly
         // and silently truncates every longer one -- the shape of bug that passes

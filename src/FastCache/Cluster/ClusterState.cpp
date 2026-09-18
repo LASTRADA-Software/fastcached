@@ -314,8 +314,12 @@ std::expected<ClusterState, ConsensusError> DecodeState(std::span<std::byte cons
     state.settings.reserve(*settingCount);
     state.clients.reserve(*clientCount);
     state.forgotten.reserve(*forgottenCount);
-    for (std::size_t index = 0; index < memberSpan; index += MemberFields)
+    // Walked by member rather than by field: `memberSpan` is exactly `*memberCount` quadruples,
+    // so each member's first field is its ordinal times `MemberFields` -- the same indices the
+    // stepped counter visited, with the stride stated once instead of in the head.
+    for (auto const ordinal: std::views::iota(std::size_t { 0 }, std::size_t { *memberCount }))
     {
+        auto const index = ordinal * MemberFields;
         auto const historyField = (*fields)[StateHeaderFields + index + 3];
         auto const history =
             historyField.size() == 1
@@ -337,8 +341,11 @@ std::expected<ClusterState, ConsensusError> DecodeState(std::span<std::byte cons
         state.members.push_back(std::move(member));
     }
     auto const settingsEnd = memberSpan + settingSpan;
-    for (std::size_t index = memberSpan; index < settingsEnd; index += SettingFields)
+    for (auto const ordinal: std::views::iota(std::size_t { 0 }, std::size_t { *settingCount }))
+    {
+        auto const index = memberSpan + (ordinal * SettingFields);
         state.settings.push_back(Setting { .name = at(index), .value = at(index + 1) });
+    }
     auto const clientsEnd = settingsEnd + *clientCount;
     for (auto const index: std::views::iota(settingsEnd, clientsEnd))
         state.clients.push_back(at(index));

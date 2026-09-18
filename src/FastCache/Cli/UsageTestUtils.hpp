@@ -23,16 +23,22 @@ namespace FastCache::Testing
 /// @return `text` with all escape sequences removed.
 [[nodiscard]] inline std::string StripAnsi(std::string_view text)
 {
+    // A `while`, because an escape is consumed up to its `m` INSIDE the body: a counting `for`
+    // head would advertise a step of one that this loop does not take. The `++i` at the foot
+    // steps past the character just handled -- the `m`, after an escape -- and it is the one
+    // advance every path reaches, since there is no `continue` to skip it.
     std::string out;
-    for (std::size_t i = 0; i < text.size(); ++i)
+    auto i = std::size_t { 0 };
+    while (i < text.size())
     {
-        if (text[i] != '\x1b')
+        if (text[i] == '\x1b')
         {
-            out += text[i];
-            continue;
+            while (i < text.size() && text[i] != 'm')
+                ++i;
         }
-        while (i < text.size() && text[i] != 'm')
-            ++i;
+        else
+            out += text[i];
+        ++i;
     }
     return out;
 }

@@ -124,14 +124,12 @@ void WatchRegistry::UnregisterAll(WatchHandle* handle)
     {
         std::scoped_lock const lock { _mu };
         std::size_t removed = 0;
-        for (auto it = _index.begin(); it != _index.end();)
-        {
-            removed += it->second.erase(handle);
-            if (it->second.empty())
-                it = _index.erase(it);
-            else
-                ++it;
-        }
+        // `std::erase_if` is specified as the erase-while-walking loop this replaced, so the
+        // predicate removes the handle and answers whether its key is now watched by nobody.
+        std::erase_if(_index, [&removed, handle](auto& watchers) {
+            removed += watchers.second.erase(handle);
+            return watchers.second.empty();
+        });
         if (removed > 0)
             _entryCount.fetch_sub(removed, std::memory_order_release);
     }

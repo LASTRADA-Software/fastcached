@@ -1521,32 +1521,34 @@ what differs between compilers, standard libraries, hosts and tool versions.
   hand-spelled form obeys every OTHER rule: `views::iota` is a range view. It does NOT refuse a
   `static_cast` beside an `EnumeratorCount` — measured, six such sites are bounds checks on a
   value off a wire and correct — nor the C-style form, which is #1452's.
-- **A C-style loop is classified by its BODY; the head is not a classifier** (#1452). The
-  opening estimate was 78 of 134 mechanical; the outcome is **68**, and of the 66 that remain
-  exactly NONE is. That ten-site gap is this rule charging its own price — ten heads that read
-  mechanical over bodies that are not — so treat a head-shaped verdict as a CANDIDATE and never
-  as a clearance. **Five shapes are not convertible**, and the last two were found only by
-  reading:
+- **A C-style loop is classified by its BODY; the head is not a classifier** (#1452, closed with
+  its backlog EMPTY). The opening estimate was 78 of 134 mechanical and the outcome 68, so treat a
+  head-shaped verdict as a CANDIDATE and never as a clearance. **Five shapes are not a RANGE-FOR,
+  and "not a range-for" is not "stays a `for`"** — each has its own target:
   - the body ADVANCES the variable (a range-for advances a COPY, and `auto i` compiles while
-    only `auto const i` is refused — a wrong cache key in `DirectManifest`);
+    only `auto const i` is refused — a wrong cache key in `DirectManifest`) → a `while` with ONE
+    advance at its foot, `continue`s inverted into `else`s;
   - a CALLEE advances it through `std::size_t&` (`ApplyOneOption`, `TakeValue` — invisible to any
-    body scan, and it breaks every `--key value` flag);
-  - a COMPOUND bound (two clauses are not one range; on the `iovec` builders the second is a
-    budget);
-  - the induction variable OUTLIVES the loop — `RedisResp.cpp` declares `i` above two sibling
-    loops and the second RESUMES where the first `break`s, so neither converts in isolation and
-    nothing in either head says so;
-  - a find-and-erase wearing a loop, which wants `ranges::find_if` and an erase rather than a
-    range-for — an ALGORITHM substitution, so `Core/Ranges.hpp`'s `FindOrNull` / `FindIfOrNull`.
+    body scan, and it breaks every `--key value` flag) → the same `while`, or an exemption where
+    five `continue`s would each need the step (`CliCommand.cpp`);
+  - a COMPOUND bound (two clauses are not one range) → the range, plus a `break` asked where the
+    head asked it — on the `iovec` builders the second clause is a slot BUDGET, checked before
+    each segment;
+  - the induction variable OUTLIVES the loop (`RedisResp.cpp`'s XCLAIM resumes one loop where the
+    other `break`s) → `while`s over one shared cursor;
+  - erase-while-walking → an ALGORITHM: `std::erase_if`, which is SPECIFIED as that loop, or
+    `ranges::find` and one `erase`.
 
-  **An INCLUSIVE bound is not on that list, and it was until this was measured.** `i <= N` is
-  `iota(first, N + 1)` and a DESCENDING loop is that range through `views::reverse`, which
-  `DashboardPanel_test.cpp` already spells four times. What it needs is a stated premise rather
-  than an exemption: that `N + 1` cannot overflow, and that the range is EMPTY where the loop
-  ran zero times — which is the case an `iota` whose start is not zero gets wrong. Listing it as
-  non-convertible sent four sites toward a permanent exemption they did not need, and
-  **overstating what is wrong is the same defect as understating it, with the worse failure
-  mode: an under-report is silent, an over-report is loud and misattributed.**
+  An INCLUSIVE bound is `iota(first, N + 1)` and a DESCENDING one is that range through
+  `views::reverse`, each with its premise stated: `N + 1` cannot overflow, and the range is EMPTY
+  where the loop ran zero times — the case an `iota` whose start is not zero gets wrong. **What
+  stays a `for` is a sequence the standard library has no range for** — a C linked list, an
+  error-code `directory_iterator`, a sentinel-terminated block, a work-stealing index, a find-walk
+  over the text it rewrites, a loop with no condition — and it stays with an exemption row
+  stating why. Listing a shape as non-convertible when only the range-for was ruled out sent
+  sites toward exemptions they did not need, twice: **overstating what is wrong is the same
+  defect as understating it, with the worse failure mode — an under-report is silent, an
+  over-report is loud and misattributed.**
 
   All of the shapes above were first classified mechanical, because **a text scan fails toward
   "nothing unusual here"** — so such a classifier fails CLOSED and prints no count until it
@@ -1705,11 +1707,11 @@ and what they may assume.
   never a counted or unbounded poll. `ctest -R test-loops` refuses an atomic-polling `while` and
   a coroutine `while` that opens by parking **in tests** — their remedy is a test header, so
   widening them would refuse correct production code with advice nobody can follow — and a
-  C-style `for` **anywhere under `src/`**. The production sites that already exist are a
-  RATCHET (`scripts/check-test-loops-backlog.txt`, keyed on a count per file, refusing a count
-  that has risen AND one that has fallen without being recorded); a new one is refused, never
-  added to it. **The count is not repeated here on purpose** — that file owns it, it has been
-  148, 134, 119 and 56 while this sentence stood still, and a prose copy of a number a table
+  C-style `for` **anywhere under `src/`**. The production sites it found were a RATCHET
+  (`scripts/check-test-loops-backlog.txt`, keyed on a count per file, refusing a count that has
+  risen AND one that has fallen without being recorded), EMPTIED by #1452; a new one is refused,
+  never added to it. **The count is not repeated here on purpose** — that file owns it, it went
+  148, 134, 119, 56 and 0 while this sentence stood still, and a prose copy of a number a table
   owns is the second source of truth `ctest -R table-totals` refuses everywhere else. **Neuter a new wait and watch the teardown**: two such failures in #1446
   were hangs and aborts, not reds.
 - A **cumulative** figure cannot answer a question about **now**, and a duty cycle over the same

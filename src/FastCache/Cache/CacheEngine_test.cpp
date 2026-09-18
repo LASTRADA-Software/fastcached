@@ -138,6 +138,53 @@ TEST_CASE("CacheEngine stream: XRANGE / XREVRANGE honour bounds and count", "[ca
     REQUIRE(rev->front().id == StreamId { .ms = 40, .seq = 0 });
 }
 
+TEST_CASE("CacheEngine stream: a COUNT past the match takes every entry in order in both directions and a group read",
+          "[cache][stream]")
+{
+    // COUNT is a client's number, so it reaches `UINT64_MAX` -- which, taken as a view length
+    // without clamping it to the match first, is a negative one. Asserted with the ORDER of
+    // every entry rather than the size alone, so a direction that lost or repeated one is seen.
+    StreamEngineFixture fix;
+    for (auto const ms: { 10U, 20U, 30U })
+        REQUIRE(fix.engine.StreamAdd("s", StreamId { .ms = ms, .seq = 0 }, false, Fields("f", "v"), std::nullopt, false)
+                    .has_value());
+    auto const idsOf = [](std::vector<StreamCodec::StreamEntry> const& entries) {
+        std::vector<std::uint64_t> ms;
+        ms.reserve(entries.size());
+        for (auto const& entry: entries)
+            ms.push_back(entry.id.ms);
+        return ms;
+    };
+    auto const ascending = std::vector<std::uint64_t> { 10, 20, 30 };
+    auto const descending = std::vector<std::uint64_t> { 30, 20, 10 };
+
+    for (auto const count: { std::size_t { 3 }, std::size_t { 4 }, std::numeric_limits<std::size_t>::max() })
+    {
+        auto const forward = fix.engine.StreamRange("s", StreamId::Min(), StreamId::Max(), count, false);
+        REQUIRE(forward.has_value());
+        CHECK(idsOf(*forward) == ascending);
+
+        auto const backward = fix.engine.StreamRange("s", StreamId::Min(), StreamId::Max(), count, true);
+        REQUIRE(backward.has_value());
+        CHECK(idsOf(*backward) == descending);
+    }
+
+    // The reverse walk takes from the NEWEST end, so a COUNT below the match keeps the newest.
+    auto const newestTwo = fix.engine.StreamRange("s", StreamId::Min(), StreamId::Max(), 2, true);
+    REQUIRE(newestTwo.has_value());
+    CHECK(idsOf(*newestTwo) == std::vector<std::uint64_t> { 30, 20 });
+
+    REQUIRE(fix.engine.StreamGroupCreate("s", "g1", CacheEngine::GroupStart::Beginning, {}, false).has_value());
+    auto const first = fix.engine.StreamReadGroup("s", "g1", "c1", std::nullopt, 1, false);
+    REQUIRE(first.has_value());
+    CHECK(idsOf(*first) == std::vector<std::uint64_t> { 10 });
+    auto const rest =
+        fix.engine.StreamReadGroup("s", "g1", "c1", std::nullopt, std::numeric_limits<std::size_t>::max(), false);
+    REQUIRE(rest.has_value());
+    CHECK(idsOf(*rest) == std::vector<std::uint64_t> { 20, 30 });
+    CHECK(fix.engine.StreamPendingSummary("s", "g1").value().count == 3);
+}
+
 TEST_CASE("CacheEngine stream: XREAD returns entries strictly after the cursor", "[cache][stream]")
 {
     StreamEngineFixture fix;

@@ -1119,6 +1119,21 @@ namespace
         return out;
     }
 
+    /// The `name value` pairs of an argument tail: `MSET`'s keys and values, `XADD`'s fields.
+    ///
+    /// One place for the stride, so no verb spells `i += 2` and `args[i + 1]` again. The
+    /// caller has refused an ODD tail before it gets here -- every verb that takes pairs
+    /// answers that with its own arity error -- so a trailing unpaired argument is not
+    /// dropped, it cannot arrive.
+    /// @param tail The arguments, starting at the first name. Its length must be even.
+    /// @return A view of `(name, value)` references into @p tail.
+    [[nodiscard]] auto ArgPairs(std::span<std::string const> tail)
+    {
+        return std::views::iota(std::size_t { 0 }, tail.size() / 2) | std::views::transform([tail](std::size_t pair) {
+                   return std::pair<std::string const&, std::string const&> { tail[2 * pair], tail[(2 * pair) + 1] };
+               });
+    }
+
     template <typename T>
     [[nodiscard]] bool ParseUnsigned(std::string_view sv, T& out) noexcept
     {
@@ -1484,7 +1499,12 @@ namespace
     [[nodiscard]] std::expected<SetOptions, std::string> ParseSetOptions(std::span<std::string const> tail, IClock& clock)
     {
         SetOptions opts;
-        for (std::size_t i = 0; i < tail.size(); ++i)
+        // A `while` rather than a counting `for`, because `EX`/`PX` consume their value with a
+        // `++i` of their own: a `for` head would advertise a step of one this loop does not
+        // take. The `++i` at the foot steps past the token just handled, and every arm that
+        // does not `return` reaches it -- there is no `continue` here to skip it.
+        auto i = std::size_t { 0 };
+        while (i < tail.size())
         {
             auto const tok = Upper(tail[i]);
             if (tok == "NX")
@@ -1514,10 +1534,11 @@ namespace
                     return std::unexpected(std::string { "invalid expire time in 'set'" });
                 opts.deadline =
                     millis ? clock.Now() + std::chrono::milliseconds { raw } : clock.Now() + std::chrono::seconds { raw };
-                ++i;
+                ++i; // the value, consumed
             }
             else
                 return std::unexpected("syntax error");
+            ++i;
         }
         return opts;
     }
@@ -2985,8 +3006,8 @@ namespace
             co_return co_await ReplyError(socket, "wrong number of arguments for 'xadd'");
         std::vector<std::pair<std::string, std::string>> fields;
         fields.reserve((args.size() - idx) / 2);
-        for (auto i = idx; i + 1 < args.size(); i += 2)
-            fields.emplace_back(args[i], args[i + 1]);
+        for (auto const [field, value]: ArgPairs(args.subspan(idx)))
+            fields.emplace_back(field, value);
 
         auto const added = engine->StreamAdd(key, autoFull ? std::nullopt : requestedId, seqAuto, fields, trim, noMkStream);
         if (!added.has_value())
@@ -3111,7 +3132,10 @@ namespace
             co_return co_await ReplyError(socket, "Invalid stream ID specified as stream command argument");
         std::optional<std::uint64_t> entriesAdded;
         std::optional<StreamCodec::StreamId> maxDeletedId;
-        for (auto i = std::size_t { 2 }; i < args.size();)
+        // A `while`, as `ParseXRead`'s is: each option consumes itself AND its value, so every
+        // arm advances `i` by what it read and a `for` head would claim a step it does not take.
+        auto i = std::size_t { 2 };
+        while (i < args.size())
         {
             auto const opt = Upper(args[i]);
             if (opt == "ENTRIESADDED" && i + 1 < args.size())
@@ -3900,15 +3924,21 @@ namespace
         // IDs run until the first option keyword; trailing options we accept and
         // (for the value-bearing ones) skip without acting on, except JUSTID and
         // FORCE which change the claim behaviour.
+        //
+        // Two phases over ONE cursor, so two `while`s over a shared `i` rather than two loops
+        // that each own one: the options start exactly where the IDs stopped, and the option
+        // arms consume a value with a `++i` of their own. Each loop's other advance is the `++i`
+        // at its foot, which no `continue` skips.
         std::size_t i = 4;
-        for (; i < args.size(); ++i)
+        while (i < args.size())
         {
             auto const parsed = StreamCodec::ParseId(args[i]);
             if (!parsed.has_value())
                 break;
             ids.push_back(*parsed);
+            ++i;
         }
-        for (; i < args.size(); ++i)
+        while (i < args.size())
         {
             auto const opt = Upper(args[i]);
             if (opt == "JUSTID")
@@ -3921,6 +3951,7 @@ namespace
                 ++i; // value consumed, not modelled.
             else
                 co_return co_await ReplyError(socket, "syntax error");
+            ++i;
         }
         if (ids.empty())
             co_return co_await ReplyError(socket, "wrong number of arguments for 'xclaim'");
@@ -3951,7 +3982,10 @@ namespace
             co_return co_await ReplyError(socket, "Invalid stream ID specified as stream command argument");
         std::uint64_t count = 0;
         bool justId = false;
-        for (auto j = std::size_t { 5 }; j < args.size();)
+        // A `while`: each arm advances `j` by what it consumed -- an option and its value, or
+        // the option alone -- so a `for` head would claim a step it does not take.
+        auto j = std::size_t { 5 };
+        while (j < args.size())
         {
             auto const opt = Upper(args[j]);
             if (opt == "COUNT" && j + 1 < args.size())
@@ -4352,13 +4386,13 @@ namespace
         // The previous hoist allowed a concurrent WATCH on another reactor
         // mid-loop to be silently skipped for later keys, breaking the
         // WATCH guarantee for that racing transaction.
-        for (std::size_t i = 0; i < args.size(); i += 2)
+        for (auto const [key, value]: ArgPairs(args))
         {
-            auto const r = engine->Set(args[i], BytesFromString(args[i + 1]), 0, 0);
+            auto const r = engine->Set(key, BytesFromString(value), 0, 0);
             if (!r.has_value())
                 co_return co_await ReplyError(socket, "storage failure");
-            NotifyWatchers(state, args[i]);
-            NotifyKeyspace(state, KeyspaceEvents::String, "set", args[i]);
+            NotifyWatchers(state, key);
+            NotifyKeyspace(state, KeyspaceEvents::String, "set", key);
         }
         co_return co_await ReplyOk(socket);
     }
@@ -4381,9 +4415,9 @@ namespace
         if (args.empty() || (args.size() % 2) != 0)
             co_return co_await ReplyError(socket, "wrong number of arguments for 'msetnx'");
         // First pass: any key already present aborts the whole batch.
-        for (std::size_t i = 0; i < args.size(); i += 2)
+        for (auto const pair: ArgPairs(args))
         {
-            auto const peek = engine->Peek(args[i]);
+            auto const peek = engine->Peek(pair.first);
             if (peek.has_value() && peek->found)
                 co_return co_await ReplyInteger(socket, 0);
         }
@@ -4395,10 +4429,8 @@ namespace
         // committed keys so we can roll back if a later Add fails.
         std::vector<std::string_view> committed;
         committed.reserve(args.size() / 2);
-        for (std::size_t i = 0; i < args.size(); i += 2)
+        for (auto const [key, value]: ArgPairs(args))
         {
-            auto const& key = args[i];
-            auto const& value = args[i + 1];
             auto const r = engine->Add(key, BytesFromString(value), 0, 0);
             if (!r.has_value())
             {

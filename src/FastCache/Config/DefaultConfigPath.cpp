@@ -154,7 +154,11 @@ std::string ExpandApplicationName(std::string_view pattern, std::string_view app
     std::string out;
     out.reserve(pattern.size() + appName.size());
 
-    for (std::size_t at = 0; at < pattern.size();)
+    // A `find` walk over a pattern that never changes, advanced only past each token it
+    // replaced -- so the name substituted in is never searched, and a name containing the
+    // token cannot expand again.
+    auto at = std::size_t { 0 };
+    while (at < pattern.size())
     {
         auto const found = pattern.find(ApplicationNameToken, at);
         if (found == std::string_view::npos)
