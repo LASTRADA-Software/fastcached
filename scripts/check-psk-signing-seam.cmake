@@ -15,8 +15,10 @@
 # function in `Core/`, a new caller is an ordinary call, and nothing in the build
 # would say a word. So the guard is a scan: the primitive may be NAMED in the
 # file that declares it, the file that implements it, and the one seam that wraps
-# it. Anywhere else in `src/` is a second construction, and the fix is to add a
-# row to `SigningDomainTable` and go through `SignFields`.
+# it -- plus HKDF (#178), which uses HMAC as a derivation function under keys that are
+# never the cluster key, and says so in its row. Anywhere else in `src/` is a second
+# construction, and the fix is to add a row to `SigningDomainTable` and go through
+# `SignFields`.
 #
 # Runs as `cmake -P`, for the reason check-net-boundary.cmake states: this
 # compares strings and reports, so a .sh + .ps1 pair would be two implementations
@@ -67,6 +69,7 @@ set(FastCachedPskSigners
     "FastCache/Core/Sha256.hpp|Declares it. The primitive has to live somewhere, and Core/ is where the algorithm is -- implemented in-tree because FASTCACHED_ENABLE_TLS is off by default and a cluster that could only authenticate its members when OpenSSL happened to be compiled in would accept anybody in the common configuration."
     "FastCache/Core/Sha256.cpp|Implements it, against FIPS 180-4 and RFC 4231 vectors."
     "FastCache/Cluster/ClusterSigning.hpp|The one construction. SignFields folds the domain label in ahead of every field and VerifyFields is the only comparison exposed, so a caller can neither omit a label nor reach for a non-constant-time ==."
+    "FastCache/Core/Hkdf.cpp|HKDF-SHA256 (RFC 5869), which is a key DERIVATION and not a signer: HMAC is its PRF, keyed by a salt and then by the PRK it extracts, and what it extracts from is a per-session X25519 secret, never the cluster key. It is part of the crypto seam that retires the pre-shared key (#178), and it is checked against RFC 5869's own vectors rather than through SignFields, whose domain-labelled message is not HKDF's."
 )
 
 # ---------------------------------------------------------------------------
