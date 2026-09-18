@@ -27,6 +27,12 @@
 # reading a transcript of a rich case found -- a job flushed only after the NEXT
 # job's key event, and a pass whose last job was never flushed at all.
 #
+# And a job MATRIX (#1432), whose fixture opens with GitHub's own documented
+# include example -- the one expected answer here not written by whoever wrote
+# the model -- then #1432's arm64 row, an include-only matrix, exclude followed by
+# an include adding back, a matrix written below its steps, and one job per way
+# the walk must REFUSE a matrix rather than guess its legs.
+#
 # ## Proving it can fail
 #
 # Every assertion family has a NEUTER: the library is copied with one line
@@ -75,20 +81,38 @@ Counted() {
 # printed: a transcript carrying one line per input line would be unreadable, and
 # the tally is what says a kind fired at all.
 cat > "${FastCachedWork}/drive.awk" <<'DRIVER'
-function WorkflowOn(kind) {
+function WorkflowOn(kind,   c) {
     tally[WfPass, kind]++
     if (WfPass != 2) return
     if (kind == "text")
         blockKeys[WfBlockKey]++
     else if (kind == "key")
         printf "key\t%s\tscope=%s\tind=%d\tvalue=<%s>\n", WfPath, WfScope, WfIndent, WfValue
-    else if (kind == "step")
+    else if (kind == "step") {
         printf "step\tjob=%s\tn=%d\tname=%s\tshell=%s\tuses=%s\trun=%d\tenv=%d\tenvnames=%s\n",
                WfJob, WfStepIndex, WfStepName, WfStepShell, WfStepUses, WfBodyCount,
                WfStepEnvRows, Names(WfStepEnv)
-    else if (kind == "job")
+        # What a STEP sees of its job's matrix, which is the previous pass's answer: a job
+        # can write its matrix below its steps.
+        if (WfHasMatrix)
+            for (c = 1; c <= WfComboCount; c++)
+                printf "step-expand\t%s\t%d\trunsOn=<%s>\n", WfJob, c, WorkflowMatrixExpand(WfRunsOn, c)
+    }
+    else if (kind == "job") {
         printf "job\t%s\tat=%d\trunsOn=<%s>\tshell=<%s>\tenvnames=%s\n",
                WfJob, WfJobStart, WfRunsOn, WfJobShell, Names(WfJobEnv)
+        if (WfHasMatrix) {
+            printf "matrix\t%s\tcount=%d\tunread=<%s>\n", WfJob, WfComboCount, WfMatrixUnread
+            for (c = 1; c <= WfComboCount; c++) {
+                printf "combo\t%s\t%d\t%s\n", WfJob, c, WorkflowComboLabel(c)
+                # Two spellings of a reference, one with no blanks, and a key only some
+                # combinations carry -- the rest expand it to NOTHING.
+                printf "expand\t%s\t%d\trunsOn=<%s>\tprobe=<%s>\n", WfJob, c,
+                       WorkflowMatrixExpand(WfRunsOn, c),
+                       WorkflowMatrixExpand("${{ matrix.preset }}${{matrix.suffix}}", c)
+            }
+        }
+    }
     else if (kind == "item")
         printf "item\t%s\t%s\n", WfPath, WfItem
     else if (kind == "refusal")
@@ -310,6 +334,215 @@ jobs:
           echo five
 YML
 
+# A job MATRIX (#1432), one job per shape. `docs` is GitHub's own documented
+# example, verbatim, whose six combinations the documentation lists -- the one
+# fixture here whose expected answer was not written by whoever wrote the model.
+# Every job after `quoting` is a matrix the walk must REFUSE, one reason each.
+Stage matrix <<'YML'
+name: matrix
+on: push
+jobs:
+  docs:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        fruit: [apple, pear]
+        animal: [cat, dog]
+        include:
+          - color: green
+          - color: pink
+            animal: cat
+          - fruit: apple
+            shape: circle
+          - fruit: banana
+          - fruit: banana
+            animal: cat
+    steps:
+      - run: echo docs
+  arm:
+    name: "Linux-${{ matrix.preset }}${{ matrix.suffix }}"
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        preset: [clang-release, gcc-release]
+        runner: [ubuntu-24.04]
+        include:
+          - preset: gcc-release
+            runner: ubuntu-24.04-arm
+            suffix: "-arm64"
+    steps:
+      - run: echo arm
+  only:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - site: production
+            os: ubuntu-24.04
+          - site: staging
+    steps:
+      - run: echo only
+  excluded:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        os:
+          - a
+          - "b, c"
+        version: [10, '12', "14"]
+        exclude:
+          - os: a
+            version: 10
+          - version: "14"
+        include:
+        - os: a
+          version: 10
+          extra: back
+    steps:
+      - run: echo excluded
+  late:
+    steps:
+      - name: late step
+        run: echo late
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [windows-2025, windows-11-arm]
+  folded:
+    runs-on: ${{ matrix.Os }}
+    strategy:
+      matrix:
+        os: [ubuntu-24.04]
+    steps:
+      - run: echo folded
+  quoting:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        name: [plain, "x, y", 'it''s'] # a comment
+    steps:
+      - run: echo quoting
+  fromjson:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - run: echo fromjson
+  nested:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        preset: [a]
+        include:
+          - preset: a
+            os:
+              name: x
+    steps:
+      - run: echo nested
+  rowlist:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        include:
+          - os: [a, b]
+    steps:
+      - run: echo rowlist
+  wrapped:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        preset: [a,
+          b]
+    steps:
+      - run: echo wrapped
+  continued:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        include:
+          - suffix: one
+              two
+    steps:
+      - run: echo continued
+  badexclude:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        preset: [a]
+        exclude:
+          - os: z
+    steps:
+      - run: echo badexclude
+  flowrow:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        include:
+          - {preset: a}
+    steps:
+      - run: echo flowrow
+  expr:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        preset: [a]
+        include:
+          - suffix: ${{ github.sha }}
+    steps:
+      - run: echo expr
+  flownested:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        os: [[a, b]]
+    steps:
+      - run: echo flownested
+  empty:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        preset: []
+    steps:
+      - run: echo empty
+  typed:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        python: [3.9, 3.10]
+    steps:
+      - run: echo typed
+  kinds:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        version: [10, 12]
+        exclude:
+          - version: "10"
+    steps:
+      - run: echo kinds
+  casekeys:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        os: [a]
+        include:
+          - OS: b
+    steps:
+      - run: echo casekeys
+  baredash:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        preset: [a]
+        include:
+          - note: one
+          -
+            note: two
+    steps:
+      - run: echo baredash
+YML
+
 # ---- the assertions, per case ----------------------------------------------
 # Kept in ONE place so a neuter re-runs exactly what the clean arm ran. A second
 # copy for the neuters would drift, and the neuter would then be holding up a
@@ -407,6 +640,71 @@ Judge() {
         Require "${t}" 'key	jobs/only/if	scope=job	ind=4	value=<github.event_name == '"'"'push'"'"'>' "a job-level condition is a key at job scope"
     fi
 
+    if [ "${name}" = "matrix" ]; then
+        # GitHub's documented example: six combinations, as the documentation lists
+        # them. `{fruit: banana}` fits no base combination and is its own, and the
+        # row after it is a SECOND one -- only base combinations take a row in.
+        Require "${t}" 'matrix	docs	count=6	unread=<>' "the documented example has six combinations"
+        Require "${t}" 'combo	docs	1	(fruit=apple, animal=cat, color=pink, shape=circle)' "a row naming no axis merges into every combination, and a later row overwrites what it added"
+        Require "${t}" 'combo	docs	2	(fruit=apple, animal=dog, color=green, shape=circle)' "a row matching an ORIGINAL value merges only where it matches"
+        Require "${t}" 'combo	docs	4	(fruit=pear, animal=dog, color=green)' "a combination no later row fits keeps the first row's value"
+        Require "${t}" 'combo	docs	5	(fruit=banana)' "a row overwriting an original value is a new combination of its own keys"
+        Require "${t}" 'combo	docs	6	(fruit=banana, animal=cat)' "a second such row is a second combination, not merged into the first"
+
+        # #1432's shape. The row would overwrite the ORIGINAL `runner`, so it is a
+        # third combination -- and `suffix`, which only it carries, expands to
+        # NOTHING on the others, which is what keeps their names where they were.
+        Require "${t}" 'matrix	arm	count=3	unread=<>' "an include row that fits no base combination adds one"
+        Require "${t}" 'combo	arm	3	(preset=gcc-release, runner=ubuntu-24.04-arm, suffix=-arm64)' "the new combination carries the row's own keys"
+        Require "${t}" 'expand	arm	1	runsOn=<ubuntu-24.04>	probe=<clang-release>' "a key a combination lacks expands EMPTY, in either spelling of the reference"
+        Require "${t}" 'expand	arm	3	runsOn=<ubuntu-24.04-arm>	probe=<gcc-release-arm64>' "runs-on and a name expand for the combination that carries the key"
+
+        # No axes: no base combination, so every row is its own -- and a key the
+        # second row lacks expands EMPTY in `runs-on`.
+        Require "${t}" 'matrix	only	count=2	unread=<>' "a matrix of include rows alone runs one combination per row"
+        Require "${t}" 'expand	only	2	runsOn=<>	probe=<>' "a runs-on naming a key the combination lacks expands EMPTY"
+
+        # Exclude runs BEFORE include, so a row can add back what an exclude took;
+        # a block-sequence axis and every quoting of a value read the same.
+        Require "${t}" 'matrix	excluded	count=4	unread=<>' "exclude removes, and include adds back"
+        Require "${t}" 'combo	excluded	1	(os=a, version=12)' "a partial exclude row removes every combination it matches"
+        Require "${t}" 'combo	excluded	2	(os=b, c, version=10)' "a quoted block-sequence value keeps its comma"
+        Require "${t}" 'combo	excluded	4	(os=a, version=10, extra=back)' "an include row adds back an excluded combination"
+        Require "${t}" 'combo	quoting	2	(name=x, y)' "a quoted flow-sequence item keeps its comma"
+        Require "${t}" 'combo	quoting	3	(name=it'"'"'s)' "a doubled apostrophe in a single-quoted item is one"
+
+        # A matrix written below the steps still reaches them.
+        Require "${t}" 'step-expand	late	2	runsOn=<windows-11-arm>' "a step sees the combinations of a matrix written after it"
+
+        # A reference differing from a key only in CASE is left for the consumer.
+        Require "${t}" 'expand	folded	1	runsOn=<${{ matrix.Os }}>' "a reference that matches a key only case-folded is left unexpanded, not expanded EMPTY"
+
+        # Every matrix the walk cannot read is refused ONCE, and leaves no
+        # combinations -- never one plausible leg.
+        Require "${t}" 'unreadable-matrix	job `fromjson`: `matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}` is not a block mapping of axes' "an expression in place of the matrix is refused"
+        Require "${t}" 'unreadable-matrix	job `nested`: `os:` in an `include` row has no inline value' "a row value that is a nested mapping is refused"
+        Require "${t}" 'unreadable-matrix	job `rowlist`: `os: [a, b]` in an `include` row opens with the YAML indicator `[`' "a row value that is a flow list is refused"
+        Require "${t}" 'unreadable-matrix	job `wrapped`: the axis `preset: [a,` does not close its list on its own line' "a flow list wrapped over two lines is refused"
+        Require "${t}" 'unreadable-matrix	job `continued`: `two` continues a matrix value onto another line' "a plain value continued onto a second line is refused"
+        Require "${t}" 'unreadable-matrix	job `badexclude`: an `exclude` row names `os`, which is not an axis' "an exclude naming no axis is refused"
+        Require "${t}" 'unreadable-matrix	job `flowrow`: `- {preset: a}` under `include` is not a row written as a block mapping' "a flow-mapping row is refused"
+        Require "${t}" 'unreadable-matrix	job `expr`: `suffix: ${{ github.sha }}` in an `include` row carries an expression' "a value carrying an expression is refused"
+        Require "${t}" 'unreadable-matrix	job `flownested`: the axis `os: [[a, b]]` nests a collection' "a nested flow list is refused"
+        Require "${t}" 'unreadable-matrix	job `empty`: the axis `preset` has no values' "an axis with no values is refused"
+        # A plain scalar is TYPED: `3.10` is the number 3.1, which is what GitHub
+        # renders, and whether `10` matches `"10"` is a question about types. Both are
+        # refused -- a guess is a wrong name or a missing leg, and both read as clean.
+        Require "${t}" 'unreadable-matrix	job `typed`: the axis `python: [3.9, 3.10]` holds `3.9`, which is a plain scalar YAML types as a number' "a value YAML types as a float is refused, not rendered as its text"
+        Require "${t}" 'unreadable-matrix	job `kinds`: it compares `10`, written as an integer, with `10`, written as a string' "an integer and a string with one text are not taken to match"
+        # Two keys one case fold apart, and a row opened by a bare dash, whose keys would
+        # otherwise be read as the previous row's -- both a leg merged away in silence.
+        Require "${t}" 'unreadable-matrix	job `casekeys`: the keys `os` and `OS` differ only in case' "keys differing only in case are refused, not read as two keys"
+        Require "${t}" 'unreadable-matrix	job `baredash`: a bare `-`, with its keys on the lines below, under `include`' "a bare dash is refused, not read as the previous row continuing"
+        RequireCount "${t}" 14 'count=0	unread=<' "every refused matrix leaves its job NO combinations"
+        Require "${t}" 'tally	pass=1	raw=202	text=2	step-line=22	key=196	step=21	job=21	refusal=14	item=3' "pass 1 refused each unreadable matrix once"
+        Require "${t}" 'tally	pass=2	raw=202	text=2	step-line=22	key=196	step=21	job=21	refusal=14	item=3' "pass 2 refused each unreadable matrix once, as pass 1 did"
+    fi
+
     if [ "${name}" = "edges" ]; then
         Require "${t}" 'refusal	7	unreadable-yaml	a step written as `{ name: flow, run: echo flow }`' "a flow mapping step is refused, not misread"
         Require "${t}" 'refusal	9	unreadable-run	`run: *someAnchor`' "an alias as a run: value is refused"
@@ -433,6 +731,7 @@ echo "check-workflow-walk-selftest: driving scripts/lib/workflow-walk.awk"
 Judge rich "${FastCachedWalkAwk}" clean
 Judge folded "${FastCachedWalkAwk}" clean
 Judge edges "${FastCachedWalkAwk}" clean
+Judge matrix "${FastCachedWalkAwk}" clean
 CleanFailures=${Failures}
 
 # ---- the neuters ------------------------------------------------------------
@@ -493,6 +792,41 @@ Neuter second-document '/a document marker after the first document/s/^/#/' edge
     "a second document being refused"
 Neuter yaml-quoted 's/^        if (ch == q) {$/        if (0) {/' edges \
     "a YAML-quoted run: scalar being read rather than refused"
+
+# The matrix (#1432), one neuter per rule of GitHub's that the model implements
+# and per refusal that is not a side effect of another.
+Neuter matrix-original-guard '/ fits = 0$/s/^/#/' matrix \
+    "an include row never overwriting an ORIGINAL axis value"
+Neuter matrix-new-combination 's/^        if (matched) continue$/        continue/' matrix \
+    "a row that fits no base combination becoming one of its own"
+Neuter matrix-no-axes 's/^    if (WfMxAxisN > 0) {$/    if (1) {/' matrix \
+    "a matrix with no axes having no base combination to absorb its rows"
+Neuter matrix-exclude '/excluded = WorkflowMatrixExcluded(e, pick)/s/^/#/' matrix \
+    "an exclude row removing the combinations it matches"
+Neuter matrix-missing-empty 's/^        else value = ""$/        else value = token/' matrix \
+    "a key a combination lacks expanding to NOTHING, as GitHub expands it"
+Neuter matrix-folded-case '/else if (WorkflowMatrixFoldedKey(key)) value = token/s/^/#/' matrix \
+    "a reference differing from a key only in case being left for the consumer"
+Neuter matrix-restore 's/^    WorkflowMatrixRestore()$/    #&/' matrix \
+    "a step seeing the combinations of a matrix written below it"
+Neuter matrix-refusal '/WorkflowRefuse(at, "unreadable-matrix"/s/^/#/' matrix \
+    "a matrix the model cannot read being REFUSED"
+Neuter matrix-indicator '/%@/s/^/#/' matrix \
+    "a value opening with a YAML indicator not being read as a scalar"
+Neuter matrix-expression '/index(v, "\${{") > 0/s/^/#/' matrix \
+    "a value carrying an expression not being read as a scalar"
+Neuter matrix-continuation '/continues a matrix value onto another line/s/^/#/' matrix \
+    "a value continued onto a second line being refused"
+Neuter matrix-typed '/&& WorkflowYamlTyped(v)) return ""/s/^/#/' matrix \
+    "a value YAML types other than as a string, an integer or a boolean being refused"
+Neuter matrix-kinds '/if (k1 != k2) WorkflowMatrixUnread/s/^/#/' matrix \
+    "values of one text and two YAML types never being taken to match"
+Neuter matrix-key-case '/differ only in case, and whether GitHub reads them/s/^/#/' matrix \
+    "keys that differ only in case being refused"
+Neuter matrix-bare-dash 's/{ WorkflowMatrixItem(itemInd, ""); return }$/return/' matrix \
+    "a bare dash in the matrix being refused"
+Neuter matrix-flow-quotes 's/^        if (ch == "\\"" || ch == sq) { q = ch; item = item ch; continue }$/        #&/' matrix \
+    "a comma inside a quoted flow item separating nothing"
 
 echo "check-workflow-walk-selftest: ${Cases} fixture(s), ${Assertions} assertion(s), ${Neuters} neuter(s)"
 if [ "${Failures}" -ne 0 ]; then

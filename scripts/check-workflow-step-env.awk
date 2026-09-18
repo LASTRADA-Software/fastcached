@@ -264,13 +264,43 @@
     }
 
     # ---- one step --------------------------------------------------------------------------------------------------
-    function resolveShell(   s) {
+    # The default shell of the runner @p r names, or "?" when it names none this check knows -- including a runner
+    # still carrying an expression, which is one this file does not decide.
+    function runnerShell(r) {
+        if (r ~ /\$\{\{/) return "?"
+        r = tolower(r)
+        if (r ~ /windows/) return "pwsh"
+        if (r ~ /(ubuntu|macos|linux)/) return "bash"
+        return "?"
+    }
+    # The step's shell model: "?" when it cannot be derived and "~" when the job's matrix puts the step on runners
+    # whose defaults DIFFER, each with `shellWhy` saying what was found. A step naming no shell is read by its runner's
+    # default, and `runs-on` may vary by matrix combination (#1432), so the default is derived for EVERY combination
+    # the shared walk computed -- one answer when they agree, a refusal when they do not, because one script read by two
+    # shells cannot be held to either model.
+    function resolveShell(   s, c, r, one, firstRunner) {
         s = WfStepShell != "" ? WfStepShell : (WfJobShell != "" ? WfJobShell : WfWorkflowShell)
+        shellWhy = "runs-on `" WfRunsOn "`"
         if (s == "") {
-            if (WfRunsOn ~ /\$\{\{/) return "?"
-            if (tolower(WfRunsOn) ~ /windows/) s = "pwsh"
-            else if (tolower(WfRunsOn) ~ /(ubuntu|macos|linux)/) s = "bash"
-            else return "?"
+            # A matrix that cannot be read leaves no legs -- which matters only when `runs-on` names them. The matrix
+            # itself is refused on its own line, so a literal runner still answers for every step of the job.
+            if (WfComboCount == 0) {
+                s = runnerShell(WorkflowTrim(WfRunsOn))
+                if (s == "?") { if (WfRunsOn ~ /\$\{\{/) shellWhy = shellWhy ", in a job whose matrix cannot be read"; return "?" }
+            }
+            for (c = 1; c <= WfComboCount; c++) {
+                r = WorkflowTrim(WorkflowMatrixExpand(WfRunsOn, c))
+                one = runnerShell(r)
+                if (one == "?") {
+                    if (WfHasMatrix) shellWhy = shellWhy ", which is `" r "` for " WorkflowComboLabel(c)
+                    return "?"
+                }
+                if (c == 1) { s = one; firstRunner = r; continue }
+                if (one == s) continue
+                shellWhy = shellWhy " is `" firstRunner "` for " WorkflowComboLabel(1) ", whose default shell is " s \
+                           ", and `" r "` for " WorkflowComboLabel(c) ", whose default shell is " one
+                return "~"
+            }
         }
         sub(/[ \t].*$/, "", s)
         return (s in shellModel) ? shellModel[s] : "!" s
@@ -293,7 +323,8 @@
         if (!WfHasRun) return
         scanned++
         model = resolveShell()
-        if (model == "?") { refuse(WfStepLine, "unresolved-shell", "runs-on `" WfRunsOn "`"); return }
+        if (model == "?") { refuse(WfStepLine, "unresolved-shell", shellWhy); return }
+        if (model == "~") { refuse(WfStepLine, "varying-shell", shellWhy); return }
         if (substr(model, 1, 1) == "!") { refuse(WfStepLine, "unknown-shell", "shell `" substr(model, 2) "`"); return }
         split("", defs); split("", refs); split("", visible); lexState = ""; heredocEnd = ""; hereString = ""
         loopDepth = 0; inFn = 0; fnBrace = 0; fnStarted = 0; pwBrace = 0; constructBroken = ""

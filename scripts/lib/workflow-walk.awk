@@ -51,8 +51,10 @@
 #              too, and additionally accumulates into `WfRunsOn`.
 #   step       a step record is complete: every field below is final and the next line belongs to
 #              another step, another job, or nothing.
-#   job        a job record is complete. Fires after that job's last `step`.
-#   refusal    a line the walk cannot place. `WfRefuseKind`, `WfRefuseDetail`, `WfAt`.
+#   job        a job record is complete. Fires after that job's last `step`, with its matrix
+#              already turned into combinations.
+#   refusal    a line the walk cannot place, or a job matrix it cannot read (`unreadable-matrix`).
+#              `WfRefuseKind`, `WfRefuseDetail`, `WfAt`.
 #   end        after the last line of the last file.
 #
 # ## The state this library owns
@@ -85,10 +87,21 @@
 #   WfWorkflowEnv[] WfJobEnv[] WfStepEnv[]   the names each `env:` scope defines
 #   WfCounted[] WfPlaced[] WfRunKeys    the completeness cross-check, below
 #   WfYamlOk       whether `WorkflowYamlQuoted` closed the scalar it was given
+#   WfHasMatrix    whether this job declares a `strategy.matrix`
+#   WfMatrixUnread why that matrix cannot be read, or "" -- and then `WfComboCount` is 0
+#   WfComboCount   how many combinations the job runs as: 1 for a job with no matrix, whose one
+#                  combination has no keys, so a consumer iterates every job the same way
+#   WfCombo[c, key]  combination @p c's value for @p key; absent when that combination has none
+#   WfComboKeyCount[c] WfComboKey[c, k]   its keys, in the order GitHub adds them
 #
 # The exception: a consumer may append to `WfBody[]`/`WfBodyCount` from its `step` hook, which is
 # how `check-workflow-step-env.sh` adds the planted line its neuter depends on. Nothing in this
 # file reads them after `step` has fired.
+#
+# Two functions answer questions about a combination rather than about a line:
+#
+#   WorkflowMatrixExpand(s, c)  @p s with every `${{ matrix.KEY }}` substituted for combination @p c
+#   WorkflowComboLabel(c)       `(key=value, ...)`, for naming a combination in a message
 #
 # ## The completeness cross-check, and why it is here
 #
@@ -97,6 +110,48 @@
 # the two in its `END`, so a file whose keys sit at a column the walk did not expect is refused by
 # line rather than read as clean. It belongs here rather than in one check because it is a property
 # of the WALK: the question it answers is whether this file's steps were seen at all.
+#
+# ## The job matrix, and why it is the walk's (#1432)
+#
+# A job's NAME, RUNNER and cache KEYS may each vary by matrix combination, and three checks read
+# them. Each had its own partial answer: one expanded `${{ matrix.preset }}` over a `preset:` flow
+# sequence and nothing else, one expanded the axes a cache key named when they were inline lists
+# and mapped `runs-on` to an OS only when it was literal, and one refused any expression in
+# `runs-on` outright. So the first matrix to grow a second axis -- a `runner:` row, so one leg could
+# run on arm64 -- read to the first as a context named `Linux-clang-release${{ matrix.suffix }}`,
+# to the second as a runner it could not map, and to the third as a step with no shell. Three
+# private models of one YAML construct is the defect #1456 removed for the walk itself, so the
+# matrix is read HERE, once, with GitHub's semantics, and every consumer asks for combinations:
+#
+#   * the base AXES are every key under `strategy.matrix` but `include` and `exclude`, each a list
+#     -- a one-line flow sequence or a block sequence of plain scalars -- and the base combinations
+#     are their cartesian product, the first axis varying slowest;
+#   * each `exclude` row removes every base combination it matches on all of its keys, and it runs
+#     BEFORE `include`, so an include can add back what an exclude took away;
+#   * each `include` row is added to every base combination whose ORIGINAL axis values it would
+#     overwrite none of. Keys that are not original axes are added, and one an earlier row added
+#     may be overwritten. A row that fits no base combination becomes a NEW combination of its own
+#     keys -- and only base combinations are candidates, so two such rows are two combinations. A
+#     matrix with no axes has no base combination, so every row is its own;
+#   * `${{ matrix.KEY }}` expands per combination, and a key the combination lacks expands to the
+#     EMPTY string, which is what GitHub substitutes.
+#
+# **A matrix this walk cannot read is REFUSED, never guessed**: an expression in place of the
+# matrix (`${{ fromJSON(...) }}`), a flow mapping, a row that is not a block mapping of plain
+# scalars, a value carrying an expression, a list that does not close on its line, an axis with no
+# values, an exclude naming no axis, a matrix producing no combination -- and a plain value YAML
+# TYPES as anything but a string, an integer or `true`/`false` (`3.10` is the number 3.1, which is
+# what GitHub renders), or a comparison of `10` with `"10"`, since which types match is not
+# modelled either; so are two keys that differ only in CASE. The text is kept only where it IS the
+# value. It fires `refusal` with
+# `unreadable-matrix` and leaves the job with NO combinations, so a consumer iterating them reads
+# nothing rather than one plausible leg. A reference differing from a key of the matrix only in
+# CASE is left unexpanded, for a consumer to refuse: whether GitHub folds it is not something this
+# walk will guess in the direction that reads as clean.
+#
+# The combinations are final at the `job` event. A step fires before its job ends -- and a matrix
+# may be written after the steps -- so the second pass starts each job from what the first pass
+# computed for it, exactly as `runs-on` and the job's `env:` already are.
 #
 # ## What is NOT here
 #
@@ -163,7 +218,7 @@ function WorkflowUnquote(t,   first, last) {
 
 # One line of the walk. Its scratch is in the parameter list, which is awk's only way to declare a
 # local -- a global here would be a name five consumers could collide with.
-function WorkflowWalkLine(   line, ind, blank, isItem, stepItem, t, key, value, c) {
+function WorkflowWalkLine(   line, ind, blank, isItem, itemInd, stepItem, t, key, value, c) {
     line = $0
     sub(/\r$/, "", line)
     WfLine = line; WfAt = FNR
@@ -183,6 +238,10 @@ function WorkflowWalkLine(   line, ind, blank, isItem, stepItem, t, key, value, 
             # A continuation line of one of this step's values. A `#` line inside a `run:` body is
             # SHELL text and its expressions are still substituted, so it is reported here --
             # unlike a YAML comment, which the site below never sees.
+            #
+            # Inside a matrix it is a value continuing onto a second line -- a flow list wrapped
+            # over two, or a plain scalar that goes on -- which the matrix model does not read.
+            if (WfMxOpen && !blank && ind > WfMxIndent) WorkflowMatrixUnread("`" WorkflowTrim(line) "` continues a matrix value onto another line", FNR)
             WfLine = line
             WfEnvRow = (WfInEnv && WfEnvScope == "step" && ind > WfEnvIndent)
             WfScope = WorkflowScope()
@@ -204,6 +263,13 @@ function WorkflowWalkLine(   line, ind, blank, isItem, stepItem, t, key, value, 
     if (WfInEnv && ind <= WfEnvIndent && !(isItem && ind == WfEnvIndent)) WfInEnv = 0
     if (WfInDefaults && ind <= WfDefaultsIndent) { WfInDefaults = 0; WfDefaultsRun = -1 }
     if (WfInRunsOnList && ind <= WfRunsOnIndent && !(isItem && ind == WfRunsOnIndent)) WfInRunsOnList = 0
+    if (WfMxOpen && ind <= WfMxIndent) {
+        # A sequence at the matrix's own column is the matrix written as a list, which GitHub
+        # does not accept either -- and read as ending the block, its rows would vanish unread.
+        if (isItem && ind == WfMxIndent && WfMxKeyIndent < 0)
+            WorkflowMatrixUnread("the matrix is written as a sequence rather than a mapping of axes", FNR)
+        WfMxOpen = 0
+    }
     if (WfInSteps && ind <= WfStepsIndent && !(isItem && (WfItemIndent < 0 || ind == WfItemIndent))) {
         WorkflowFlushStep(); WfInSteps = 0
     }
@@ -211,6 +277,9 @@ function WorkflowWalkLine(   line, ind, blank, isItem, stepItem, t, key, value, 
 
     stepItem = 0
     if (isItem) {
+        # The dash's own column, before the dash is blanked below: a matrix row's key sits at the
+        # column after it, and only the dash says the row is NEW.
+        itemInd = ind
         if (WfInRunsOnList) {
             t = line; sub(/^[ ]*-[ \t]*/, "", t)
             WfItem = WorkflowUnquote(WorkflowTrim(t))
@@ -225,7 +294,9 @@ function WorkflowWalkLine(   line, ind, blank, isItem, stepItem, t, key, value, 
         sub(/-/, " ", line)
         ind = WorkflowIndentOf(line)
         WfLine = line; WfIndent = ind
-        if (line ~ /^[ \t]*$/) return
+        # A bare dash: its row's keys follow on the lines below, which the matrix reader would
+        # otherwise take as keys of the row BEFORE it.
+        if (line ~ /^[ \t]*$/) { WorkflowMatrixItem(itemInd, ""); return }
         # The keys of a step sit where its first key does, however many spaces follow the dash.
         if (stepItem) WfStepKeyIndent = ind
     }
@@ -248,6 +319,9 @@ function WorkflowWalkLine(   line, ind, blank, isItem, stepItem, t, key, value, 
         if (isItem && !stepItem) {
             WfItem = WorkflowUnquote(WorkflowTrim(line))
             WorkflowEmit("item")
+            # The RAW text rather than `WfItem`: a matrix value is read by YAML's quoting rules,
+            # which `WorkflowUnquote` does not implement.
+            WorkflowMatrixItem(itemInd, WorkflowTrim(line))
             return
         }
         # A step that is not a mapping, and any other line, is not placed.
@@ -280,6 +354,7 @@ function WorkflowWalkLine(   line, ind, blank, isItem, stepItem, t, key, value, 
     if (WfInStep && WfInSteps && WfStepKeyIndent < 0 && ind > WfItemIndent) WfStepKeyIndent = ind
     WfStepKey = (WfInStep && WfInSteps && ind == WfStepKeyIndent)
     WorkflowEmit("key")
+    WorkflowMatrixKey(ind, key, value, isItem, itemInd)
     if (value ~ /^[|>][-+0-9]*$/) {
         WfBlockOwner = ind; WfBlockKey = key
         WfBlockKind = (WfStepKey && key == "run") ? "run" : "skip"
@@ -374,6 +449,7 @@ function WorkflowFlushStep() {
 
 function WorkflowFlushJob() {
     if (WfJob == "") return
+    WorkflowMatrixFinalize()
     WorkflowEmit("job")
     WfJob = ""
 }
@@ -391,10 +467,12 @@ function WorkflowResetJob(   k, kp) {
     split("", WfJobEnv)
     WfJobShell = ""; WfRunsOn = ""; WfInSteps = 0; WfItemIndent = -1; WfJobKeyIndent = -1
     WfStepName = "(job)"; WfJobStart = FNR; WfStepIndex = 0; WfJob = ""
+    WorkflowMatrixReset(); WorkflowComboReset()
     if (WfPass < 2) return
     for (k in WfJobEnvAt) { split(k, kp, SUBSEP); if (kp[1] == WfJobStart) WfJobEnv[kp[2]] = 1 }
     if (WfJobStart in WfJobShellAt) WfJobShell = WfJobShellAt[WfJobStart]
     if (WfJobStart in WfRunsOnAt) WfRunsOn = WfRunsOnAt[WfJobStart]
+    WorkflowMatrixRestore()
 }
 
 # Every state the walk carries, reset at the start of each pass. The workflow scope is not: `env:`
@@ -418,6 +496,433 @@ function WorkflowAddEnv(name) {
     if (WfEnvScope == "workflow") WfWorkflowEnv[name] = 1
     else if (WfEnvScope == "job") { WfJobEnv[name] = 1; WfJobEnvAt[WfJobStart, name] = 1 }
     else WfStepEnv[name] = 1
+}
+
+# ---- the job matrix -------------------------------------------------------------------------------
+# The header's `## The job matrix` states the semantics; this is the reader and the arithmetic.
+#
+# The PARSE state, reset per job and prefixed `WfMx` because no consumer reads it: `WfMxSeen` (a
+# `matrix:` key was met), `WfMxOpen` (its block is being read), `WfMxIndent` (that key's column),
+# `WfMxKeyIndent` (its axes' column), `WfMxAt` (its line), `WfMxSection` and `WfMxSectionName` (what
+# the last axis-column key opened), `WfMxAxis` (the axis a block list feeds), `WfMxEntry` and
+# `WfMxEntryIndent` (the include or exclude row being read), `WfMxUnread` (the first reason it
+# cannot be read). The axes are `WfMxAxisN`, `WfMxAxisName[a]`, `WfMxAxisIdx[name]`,
+# `WfMxAxisVals[a]`, `WfMxAxisVal[a, i]` and `WfMxAxisKind[a, i]`; the rows are `WfMxRowN[section]`,
+# `WfMxRowKeyN[section, e]`, `WfMxRowKey[section, e, k]`, `WfMxRowVal[section, e, key]` and
+# `WfMxRowKind[section, e, key]`, with `WfMxRowSeen[section]` refusing a second `include:`. A base
+# combination's original kinds are `WfMxBaseKind[c, key]`; `WfMxFolded` is `WorkflowMatrixKeyCase`'s.
+
+function WorkflowMatrixReset() {
+    WfMxSeen = 0; WfMxOpen = 0; WfMxIndent = -1; WfMxKeyIndent = -1; WfMxAt = 0
+    WfMxSection = ""; WfMxSectionName = ""; WfMxAxis = 0; WfMxEntry = 0; WfMxEntryIndent = -1
+    WfMxUnread = ""; WfMxAxisN = 0
+    split("", WfMxAxisName); split("", WfMxAxisIdx); split("", WfMxAxisVals); split("", WfMxAxisVal)
+    split("", WfMxAxisKind); split("", WfMxRowKind); split("", WfMxBaseKind)
+    split("", WfMxRowN); split("", WfMxRowKeyN); split("", WfMxRowKey); split("", WfMxRowVal)
+    split("", WfMxRowSeen); split("", WfMxFolded)
+    WfMxRowN["include"] = 0; WfMxRowN["exclude"] = 0
+}
+
+# The RESULT: one empty combination, which is what a job with no matrix runs as.
+function WorkflowComboReset() {
+    split("", WfCombo); split("", WfComboKey); split("", WfComboKeyCount)
+    WfHasMatrix = 0; WfMatrixUnread = ""; WfComboCount = 1; WfComboKeyCount[1] = 0
+}
+
+# The first reason this job's matrix cannot be read, reported once as a refusal at line @p at. The
+# walk's own `WfAt` and step name are put back afterwards, because a reason found while FINISHING a
+# job is reported from inside the next job's key line.
+function WorkflowMatrixUnread(reason, at,   savedAt, savedName) {
+    if (WfMxUnread != "") return
+    WfMxUnread = reason
+    savedAt = WfAt; savedName = WfStepName; WfStepName = "(job)"
+    WorkflowRefuse(at, "unreadable-matrix", "job `" WfJob "`: " reason)
+    WfAt = savedAt; WfStepName = savedName
+}
+
+# A key line, after its `key` event. Opens the matrix at `jobs/<job>/strategy/matrix`, and inside it
+# reads an axis, an include or exclude row's key, or refuses what fits neither.
+# @param ind the key's column  @param isItem whether the line opened with a dash
+# @param itemInd that dash's column
+function WorkflowMatrixKey(ind, key, value, isItem, itemInd,   lead) {
+    if (WfJob == "") return
+    if (!WfMxOpen) {
+        if (WfPath == "jobs/" WfJob "/strategy" && value != "") {
+            WfMxSeen = 1; WfMxAt = FNR
+            WorkflowMatrixUnread("`strategy: " value "` is not a mapping, so no matrix can be read from it", FNR)
+            return
+        }
+        if (WfPath != "jobs/" WfJob "/strategy/matrix") return
+        if (WfMxSeen) { WorkflowMatrixUnread("`matrix:` is written twice", FNR); return }
+        WfMxSeen = 1; WfMxAt = FNR
+        if (value != "") {
+            WorkflowMatrixUnread("`matrix: " value "` is not a block mapping of axes", FNR)
+            return
+        }
+        WfMxOpen = 1; WfMxIndent = ind
+        return
+    }
+    if (WfMxUnread != "") return
+    lead = isItem ? itemInd : ind
+    if (WfMxKeyIndent < 0) {
+        if (isItem) { WorkflowMatrixUnread("the matrix is written as a sequence rather than a mapping of axes", FNR); return }
+        WfMxKeyIndent = ind
+    }
+    if (!isItem && ind == WfMxKeyIndent) { WorkflowMatrixSection(key, value); return }
+    if (lead < WfMxKeyIndent) {
+        WorkflowMatrixUnread("`" key ":` sits shallower than the matrix's own keys", FNR)
+        return
+    }
+    if (WfMxSection != "include" && WfMxSection != "exclude") {
+        WorkflowMatrixUnread("`" key ": " value "` under `" WfMxSectionName "` is a mapping where a plain scalar belongs", FNR)
+        return
+    }
+    if (isItem) {
+        WfMxEntry = ++WfMxRowN[WfMxSection]
+        WfMxRowKeyN[WfMxSection, WfMxEntry] = 0
+        WfMxEntryIndent = ind
+    } else if (WfMxEntry == 0 || ind != WfMxEntryIndent) {
+        WorkflowMatrixUnread("`" key ": " value "` under `" WfMxSectionName "` is nested inside a row rather than one of its keys", FNR)
+        return
+    }
+    WorkflowMatrixRowValue(key, value)
+}
+
+# A key at the axes' column: `include`, `exclude`, or an axis.
+function WorkflowMatrixSection(key, value) {
+    WfMxSectionName = key; WfMxEntry = 0; WfMxEntryIndent = -1; WfMxAxis = 0
+    if (key == "include" || key == "exclude") {
+        if (key in WfMxRowSeen) { WorkflowMatrixUnread("`" key ":` is written twice", FNR); return }
+        WfMxRowSeen[key] = 1
+        WfMxSection = key
+        if (value == "") return
+        WfMxSection = "closed"
+        if (value == "[]") return
+        WorkflowMatrixUnread("`" key ": " value "` is not a block sequence of rows", FNR)
+        return
+    }
+    if (key in WfMxAxisIdx) { WorkflowMatrixUnread("the axis `" key "` is written twice", FNR); return }
+    WfMxAxis = ++WfMxAxisN
+    WfMxAxisName[WfMxAxis] = key; WfMxAxisIdx[key] = WfMxAxis; WfMxAxisVals[WfMxAxis] = 0
+    if (value == "") { WfMxSection = "axis"; return }
+    WfMxSection = "closed"
+    if (substr(value, 1, 1) != "[") {
+        WorkflowMatrixUnread("the axis `" key ": " value "` is not a list", FNR)
+        return
+    }
+    WorkflowMatrixFlow(value)
+}
+
+# A bare entry of a block sequence inside the matrix, which is an axis value or nothing readable.
+# @param itemInd the dash's column  @param text the entry, raw
+function WorkflowMatrixItem(itemInd, text,   v) {
+    if (!WfMxOpen || WfMxUnread != "") return
+    if (WfMxKeyIndent < 0) {
+        WorkflowMatrixUnread("the matrix is written as a sequence rather than a mapping of axes", FNR)
+        return
+    }
+    if (WfMxSection != "axis" || itemInd < WfMxKeyIndent) {
+        WorkflowMatrixUnread((text == "" ? "a bare `-`, with its keys on the lines below," : "`- " text "`") \
+            " under `" WfMxSectionName "` is not " \
+            ((WfMxSection == "include" || WfMxSection == "exclude") ? "a row written as a block mapping" : "a value of a block-sequence axis"), FNR)
+        return
+    }
+    v = WorkflowMatrixScalar(text)
+    if (!WfMxScalarOk) {
+        WorkflowMatrixUnread("`- " text "` in the axis `" WfMxSectionName "` " WfMxScalarWhy, FNR)
+        return
+    }
+    WfMxAxisVal[WfMxAxis, ++WfMxAxisVals[WfMxAxis]] = v
+    WfMxAxisKind[WfMxAxis, WfMxAxisVals[WfMxAxis]] = WfMxScalarKind
+}
+
+# One key of the include or exclude row being read.
+function WorkflowMatrixRowValue(key, value,   s, e, v) {
+    s = WfMxSection; e = WfMxEntry
+    if ((s, e, key) in WfMxRowVal) {
+        WorkflowMatrixUnread("`" key "` is written twice in one `" s "` row", FNR)
+        return
+    }
+    v = WorkflowMatrixScalar(value)
+    if (!WfMxScalarOk) {
+        WorkflowMatrixUnread("`" key ":" (value == "" ? "" : " " value) "` in an `" s "` row " WfMxScalarWhy, FNR)
+        return
+    }
+    WfMxRowKey[s, e, ++WfMxRowKeyN[s, e]] = key
+    WfMxRowVal[s, e, key] = v
+    WfMxRowKind[s, e, key] = WfMxScalarKind
+}
+
+# The items of the one-line flow sequence @p v, into the axis being read. Quotes are honoured, so a
+# comma inside one separates nothing; a nested collection, an item that is not a plain scalar, and a
+# list that does not close on its own line are refused.
+function WorkflowMatrixFlow(v,   body, n, i, ch, q, item) {
+    if (substr(v, length(v), 1) != "]") {
+        WorkflowMatrixUnread("the axis `" WfMxSectionName ": " v "` does not close its list on its own line", FNR)
+        return
+    }
+    body = substr(v, 2, length(v) - 2)
+    if (WorkflowTrim(body) == "") return
+    n = length(body); q = ""; item = ""
+    for (i = 1; i <= n; i++) {
+        ch = substr(body, i, 1)
+        if (q != "") {
+            item = item ch
+            if (q == "\"" && ch == "\\") { i++; item = item substr(body, i, 1); continue }
+            if (ch != q) continue
+            if (q == sq && substr(body, i + 1, 1) == sq) { i++; item = item sq; continue }
+            q = ""
+            continue
+        }
+        if (ch == "\"" || ch == sq) { q = ch; item = item ch; continue }
+        if (ch == "[" || ch == "]" || ch == "{" || ch == "}") {
+            WorkflowMatrixUnread("the axis `" WfMxSectionName ": " v "` nests a collection", FNR)
+            return
+        }
+        if (ch != ",") { item = item ch; continue }
+        if (!WorkflowMatrixFlowItem(item, v)) return
+        item = ""
+    }
+    if (q != "") {
+        WorkflowMatrixUnread("the axis `" WfMxSectionName ": " v "` leaves a quote open", FNR)
+        return
+    }
+    WorkflowMatrixFlowItem(item, v)
+}
+
+function WorkflowMatrixFlowItem(item, v,   s) {
+    s = WorkflowMatrixScalar(WorkflowTrim(item))
+    if (!WfMxScalarOk) {
+        WorkflowMatrixUnread("the axis `" WfMxSectionName ": " v "` holds `" WorkflowTrim(item) "`, which " WfMxScalarWhy, FNR)
+        return 0
+    }
+    WfMxAxisVal[WfMxAxis, ++WfMxAxisVals[WfMxAxis]] = s
+    WfMxAxisKind[WfMxAxis, WfMxAxisVals[WfMxAxis]] = WfMxScalarKind
+    return 1
+}
+
+# The text of the matrix value @p v, setting `WfMxScalarOk` to say whether it is one: a plain or
+# YAML-quoted scalar carrying no expression -- `WfMxScalarWhy` to say why not, and `WfMxScalarKind`
+# to say which YAML type it is. Empty -- YAML's null, or a key whose collection follows on the next
+# lines -- is not one, and neither is anything opening with an indicator: a collection, an alias, a
+# tag, a block scalar. An expression is refused because GitHub evaluates it, and what it evaluates
+# to is not in this file.
+#
+# **A plain scalar is TYPED, and the text is not the value.** `3.10` is the number 3.1, so GitHub
+# renders `${{ matrix.v }}` as `3.1` -- and whether `10` matches `"10"` in an exclude is a question
+# about types. A string, a canonical integer and `true`/`false` render as written and are kept with
+# their kind (`s`, `i`, `b`); every other spelling YAML may type -- a float, an exponent, a radix,
+# null, and YAML 1.1's other booleans -- is refused, since a guess there is a wrong NAME or a
+# missing LEG, and both read as clean. Quoting one makes it the string it looks like.
+function WorkflowMatrixScalar(v,   c) {
+    WfMxScalarOk = 0; WfMxScalarKind = "s"
+    c = substr(v, 1, 1)
+    if (c == "\"" || c == sq) {
+        v = WorkflowYamlQuoted(v)
+        WfMxScalarWhy = "is a quoted scalar that does not close on its line, or holds an escape this walk does not read"
+        if (!WfYamlOk) return ""
+    } else {
+        sub(/(^|[ \t]+)#.*$/, "", v)
+        v = WorkflowTrim(v)
+        WfMxScalarWhy = "has no inline value, so it is null or a collection on the lines below"
+        if (v == "") return ""
+        WfMxScalarWhy = "opens with the YAML indicator `" c "`, so it is a collection, an alias, a tag or a block scalar"
+        if (index("[]{}&*!|>%@`?", c) > 0) return ""
+        WfMxScalarWhy = "is a plain scalar YAML types as a number, a boolean or null, which GitHub renders and compares its own way -- `3.10` is the number 3.1 -- so quote it to make it the string it looks like"
+        if (v !~ /^(true|false|-?(0|[1-9][0-9]*))$/ && WorkflowYamlTyped(v)) return ""
+        WfMxScalarKind = (v ~ /^(true|false)$/) ? "b" : ((v ~ /^-?(0|[1-9][0-9]*)$/) ? "i" : "s")
+    }
+    WfMxScalarWhy = "carries an expression, whose value GitHub computes and this file does not hold"
+    if (index(v, "${{") > 0) return ""
+    WfMxScalarWhy = ""
+    WfMxScalarOk = 1
+    return v
+}
+
+# Whether YAML -- 1.2's core schema, or 1.1's, since which one GitHub reads is not something this
+# file says -- could type the plain scalar @p v as anything but a string.
+function WorkflowYamlTyped(v,   l) {
+    l = tolower(v)
+    if (l ~ /^(null|~|true|false|yes|no|on|off|y|n)$/) return 1
+    if (l ~ /^[-+]?\.(inf|nan)$/) return 1
+    if (l ~ /^[-+]?[0-9][0-9_]*(\.[0-9_]*)?(e[-+]?[0-9]+)?$/) return 1
+    if (l ~ /^[-+]?\.[0-9][0-9_]*(e[-+]?[0-9]+)?$/) return 1
+    if (l ~ /^[-+]?0(x[0-9a-f_]+|o[0-7_]+|b[01_]+)$/) return 1
+    if (l ~ /^[-+]?[0-9][0-9_]*(:[0-5]?[0-9])+(\.[0-9_]*)?$/) return 1
+    return 0
+}
+
+function WorkflowMatrixKindName(k) { return (k == "i") ? "an integer" : ((k == "b") ? "a boolean" : "a string") }
+
+# Whether two matrix values are the same: 0 when their texts differ, 1 when they agree -- and a
+# REFUSAL when the texts agree and the kinds do not, because whether GitHub matches `10` with `"10"`
+# is not modelled, and matching them wrongly removes a leg in silence.
+function WorkflowMatrixSame(v1, k1, v2, k2) {
+    if (v1 != v2) return 0
+    if (k1 != k2) WorkflowMatrixUnread("it compares `" v1 "`, written as " WorkflowMatrixKindName(k1) ", with `" v2 "`, written as " WorkflowMatrixKindName(k2) ", and whether GitHub matches the two is not modelled", WfMxAt)
+    return 1
+}
+
+# Refuses @p key when another key of this matrix differs from it only in CASE: whether GitHub reads
+# `os` and `OS` as one key is not modelled, and read as two, a row GitHub would find overwriting an
+# original value merges instead -- a leg missing in silence.
+function WorkflowMatrixKeyCase(key,   l) {
+    l = tolower(key)
+    if ((l in WfMxFolded) && WfMxFolded[l] != key) WorkflowMatrixUnread("the keys `" WfMxFolded[l] "` and `" key "` differ only in case, and whether GitHub reads them as one key is not modelled", WfMxAt)
+    WfMxFolded[l] = key
+}
+
+# Set @p key in combination @p c, recording the key's position the first time it is set.
+function WorkflowComboSet(c, key, value) {
+    if (!((c, key) in WfCombo)) WfComboKey[c, ++WfComboKeyCount[c]] = key
+    WfCombo[c, key] = value
+}
+
+# Whether the exclude row @p e matches the base choice @p pick (one value index per axis).
+function WorkflowMatrixExcluded(e, pick,   k, key, a) {
+    for (k = 1; k <= WfMxRowKeyN["exclude", e]; k++) {
+        key = WfMxRowKey["exclude", e, k]; a = WfMxAxisIdx[key]
+        if (!WorkflowMatrixSame(WfMxAxisVal[a, pick[a]], WfMxAxisKind[a, pick[a]],
+                                WfMxRowVal["exclude", e, key], WfMxRowKind["exclude", e, key])) return 0
+    }
+    return 1
+}
+
+# The job's combinations, from what its matrix block said. Called as the job ends, in every pass.
+function WorkflowMatrixFinalize(   a, e, k, key, total, i, r, pick, excluded, base, c, fits, matched) {
+    WorkflowComboReset()
+    if (!WfMxSeen) { WorkflowMatrixSave(); return }
+    WfHasMatrix = 1
+    for (a = 1; a <= WfMxAxisN; a++)
+        if (WfMxAxisVals[a] == 0) WorkflowMatrixUnread("the axis `" WfMxAxisName[a] "` has no values", WfMxAt)
+    for (e = 1; e <= WfMxRowN["exclude"]; e++)
+        for (k = 1; k <= WfMxRowKeyN["exclude", e]; k++)
+            if (!(WfMxRowKey["exclude", e, k] in WfMxAxisIdx))
+                WorkflowMatrixUnread("an `exclude` row names `" WfMxRowKey["exclude", e, k] "`, which is not an axis", WfMxAt)
+    for (a = 1; a <= WfMxAxisN; a++) WorkflowMatrixKeyCase(WfMxAxisName[a])
+    for (e = 1; e <= WfMxRowN["include"]; e++)
+        for (k = 1; k <= WfMxRowKeyN["include", e]; k++) WorkflowMatrixKeyCase(WfMxRowKey["include", e, k])
+    if (WfMxUnread != "") { WfMatrixUnread = WfMxUnread; WfComboCount = 0; WorkflowMatrixSave(); return }
+
+    # The base: the cartesian product of the axes, the first varying slowest, less every exclude.
+    # With NO axes there is no base combination at all, rather than one empty one: every include
+    # row is then its own combination, and one empty base would absorb them all into one.
+    WfComboCount = 0
+    if (WfMxAxisN > 0) {
+        total = 1
+        for (a = 1; a <= WfMxAxisN; a++) total *= WfMxAxisVals[a]
+        for (i = 0; i < total; i++) {
+            split("", pick)
+            r = i
+            for (a = WfMxAxisN; a >= 1; a--) { pick[a] = r % WfMxAxisVals[a] + 1; r = int(r / WfMxAxisVals[a]) }
+            excluded = 0
+            for (e = 1; e <= WfMxRowN["exclude"] && !excluded; e++) excluded = WorkflowMatrixExcluded(e, pick)
+            if (excluded) continue
+            c = ++WfComboCount
+            WfComboKeyCount[c] = 0
+            for (a = 1; a <= WfMxAxisN; a++) {
+                WorkflowComboSet(c, WfMxAxisName[a], WfMxAxisVal[a, pick[a]])
+                WfMxBaseKind[c, WfMxAxisName[a]] = WfMxAxisKind[a, pick[a]]
+            }
+        }
+    }
+    base = WfComboCount
+
+    # Each include row, in order, into every base combination whose ORIGINAL values it overwrites
+    # none of -- and a row that fits none is a combination of its own.
+    for (e = 1; e <= WfMxRowN["include"]; e++) {
+        matched = 0
+        for (c = 1; c <= base; c++) {
+            fits = 1
+            for (k = 1; k <= WfMxRowKeyN["include", e]; k++) {
+                key = WfMxRowKey["include", e, k]
+                if ((key in WfMxAxisIdx) && !WorkflowMatrixSame(WfCombo[c, key], WfMxBaseKind[c, key], WfMxRowVal["include", e, key], WfMxRowKind["include", e, key])) fits = 0
+            }
+            if (!fits) continue
+            matched = 1
+            for (k = 1; k <= WfMxRowKeyN["include", e]; k++) {
+                key = WfMxRowKey["include", e, k]
+                if (!(key in WfMxAxisIdx)) WorkflowComboSet(c, key, WfMxRowVal["include", e, key])
+            }
+        }
+        if (matched) continue
+        c = ++WfComboCount
+        WfComboKeyCount[c] = 0
+        for (k = 1; k <= WfMxRowKeyN["include", e]; k++)
+            WorkflowComboSet(c, WfMxRowKey["include", e, k], WfMxRowVal["include", e, WfMxRowKey["include", e, k]])
+    }
+    if (WfComboCount == 0) WorkflowMatrixUnread("the matrix produces no combination", WfMxAt)
+    # A comparison refused while combining leaves NO combinations, never the ones computed so far.
+    if (WfMxUnread != "") { WfMatrixUnread = WfMxUnread; WfComboCount = 0 }
+    WorkflowMatrixSave()
+}
+
+# The combinations as one string per job, for the next pass to start that job from: combinations
+# split by \036, keys by \037, a key from its value by \035 -- none of which a YAML scalar here holds.
+function WorkflowMatrixSave(   c, k, s) {
+    s = ""
+    for (c = 1; c <= WfComboCount; c++) {
+        if (c > 1) s = s "\036"
+        for (k = 1; k <= WfComboKeyCount[c]; k++)
+            s = s (k > 1 ? "\037" : "") WfComboKey[c, k] "\035" WfCombo[c, WfComboKey[c, k]]
+    }
+    WfMatrixAt[WfJobStart] = s
+    WfMatrixCountAt[WfJobStart] = WfComboCount
+    WfMatrixHasAt[WfJobStart] = WfHasMatrix
+    WfMatrixUnreadAt[WfJobStart] = WfMatrixUnread
+}
+
+function WorkflowMatrixRestore(   c, k, n, rows, pairs, p) {
+    if (!(WfJobStart in WfMatrixHasAt) || !WfMatrixHasAt[WfJobStart]) return
+    WfHasMatrix = 1
+    WfMatrixUnread = WfMatrixUnreadAt[WfJobStart]
+    WfComboCount = WfMatrixCountAt[WfJobStart]
+    split(WfMatrixAt[WfJobStart], rows, "\036")
+    for (c = 1; c <= WfComboCount; c++) {
+        WfComboKeyCount[c] = 0
+        n = split(rows[c], pairs, "\037")
+        for (k = 1; k <= n; k++) {
+            p = index(pairs[k], "\035")
+            WorkflowComboSet(c, substr(pairs[k], 1, p - 1), substr(pairs[k], p + 1))
+        }
+    }
+}
+
+# @p s with every `${{ matrix.KEY }}` replaced by combination @p c's value for KEY, and by NOTHING
+# where that combination has no such key -- which is what GitHub substitutes. A reference that names
+# a key of this matrix only when case is folded is LEFT in place for the consumer to refuse, and so
+# is any other shape of reference (`matrix.os.name`, `toJSON(matrix)`): whether and how GitHub
+# resolves those is not modelled, and a guess would be the answer that reads as clean.
+function WorkflowMatrixExpand(s, c,   out, token, key, value) {
+    out = ""
+    while (match(s, /\$\{\{[ \t]*matrix\.[A-Za-z_][A-Za-z0-9_-]*[ \t]*\}\}/)) {
+        token = substr(s, RSTART, RLENGTH)
+        key = token
+        sub(/^\$\{\{[ \t]*matrix\./, "", key); sub(/[ \t]*\}\}$/, "", key)
+        if ((c, key) in WfCombo) value = WfCombo[c, key]
+        else if (WorkflowMatrixFoldedKey(key)) value = token
+        else value = ""
+        out = out substr(s, 1, RSTART - 1) value
+        s = substr(s, RSTART + RLENGTH)
+    }
+    return out s
+}
+
+# Whether @p key names a key of some combination only when case is folded.
+function WorkflowMatrixFoldedKey(key,   c, k, other) {
+    for (c = 1; c <= WfComboCount; c++)
+        for (k = 1; k <= WfComboKeyCount[c]; k++) {
+            other = WfComboKey[c, k]
+            if (other != key && tolower(other) == tolower(key)) return 1
+        }
+    return 0
+}
+
+function WorkflowComboLabel(c,   k, out) {
+    out = ""
+    for (k = 1; k <= WfComboKeyCount[c]; k++)
+        out = out (k > 1 ? ", " : "") WfComboKey[c, k] "=" WfCombo[c, WfComboKey[c, k]]
+    return "(" out ")"
 }
 
 # ---- the completeness cross-check -----------------------------------------------------------------
