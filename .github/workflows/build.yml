@@ -1448,7 +1448,7 @@ jobs:
       # two other places that also enumerated them, having dropped the two
       # refusals that are hardest to reason about.
       - name: "ThreadSanitizer gate"
-        run: scripts/tsan-gate.sh out/build/clang-tsan
+        run: bash scripts/tsan-gate.sh out/build/clang-tsan
 
   # Coverage, measured once, on Linux, with Clang. One configuration and not a
   # matrix, because coverage answers "which lines did the tests reach", and that

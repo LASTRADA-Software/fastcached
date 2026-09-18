@@ -2189,8 +2189,11 @@ cmake --preset clang-tsan
 # ThreadSanitizer, the way CI runs it: the concurrency-bearing tests only
 # (Async / Consensus / Distributed / the node), behind a gate that refuses to
 # report clean unless the sanitizer is proven live. See scripts/tsan-gate.sh.
-cmake --build --preset clang-tsan --target FastCacheTest fastcache-compile-node-tests tsan-canary
-scripts/tsan-gate.sh out/build/clang-tsan
+# The targets are the gate's TARGETS rows plus the canary. Nothing checks this list --
+# it had lost two rows -- but the gate refuses to run over a row whose binary was never
+# built, so a short list fails loudly rather than sanitizing less.
+cmake --build --preset clang-tsan --target FastCacheTest fastcache-compile-node-tests fastcache-cc-tests fastcache-cli-tests tsan-canary
+bash scripts/tsan-gate.sh out/build/clang-tsan
 
 # Linux/macOS — RelWithDebInfo + Tracy profiler (.agent/guides/profiling-tracy.md)
 cmake --preset clang-tracy
