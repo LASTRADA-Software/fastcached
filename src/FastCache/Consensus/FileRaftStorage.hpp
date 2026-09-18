@@ -9,10 +9,40 @@
 #include <cstdio>
 #include <filesystem>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace FastCache::Consensus
 {
+
+/// What an operator does about consensus state in a directory this build cannot recover.
+///
+/// Two refusals send an operator here, and they are one remedy because they are one
+/// state: the store's own files in another build's format (#1449), and state INSIDE
+/// them -- a snapshot, or a command the log still holds -- that the application cannot
+/// read (#1542). Either way the node refuses to start and the directory is intact.
+///
+/// It names all three files, because they are ONE store and go aside together: a remedy
+/// naming only the file that happened to be read first leaves the other two to refuse
+/// the next start, one at a time. It names the identity as STAYING, because it lives in
+/// the same directory and a wiped identity is a different node -- both halves of it, the
+/// id and the key that proves it (#178) -- which the cluster would then have to admit
+/// while it went on counting the old id towards quorum. And it says how the node gets
+/// back in, since "move it aside" alone reads as harmless: restarted under a bootstrap
+/// set that names only itself, an empty node elects itself and becomes a second cluster,
+/// which `--raft-join` is the flag against.
+///
+/// Text, not a path to open: every flag it names is a row of `fastcache-compile-node`'s
+/// option table.
+inline constexpr std::string_view UnreadableStateRemedy =
+    "stop the node and move raft-state, raft-log and raft-snapshot out of its state directory together, leaving "
+    "node-id and node-key where they are: they are this node's identity, and without them it starts as a different "
+    "node. If its cluster is already running on this build, start it again with --raft-join added and its "
+    "--raft-peer list unchanged, so it waits to be admitted rather than bootstrapping a cluster of itself: a cluster "
+    "that still counts it catches it up from the leader, and one that has forgotten it admits it again with "
+    "--cluster-admit (or --cluster-admit-learner). It keeps its --cluster-key-file, so it needs no --enroll-from. If "
+    "every member was moved aside together, start them under their --raft-peer bootstrap set instead and make again "
+    "every --cluster-* change made since the cluster formed; see docs/operations/upgrading-a-fleet.md";
 
 /// `IRaftStorage` backed by three files in a directory.
 ///

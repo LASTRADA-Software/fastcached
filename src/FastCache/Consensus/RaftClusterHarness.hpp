@@ -17,6 +17,8 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <expected>
+#include <format>
 #include <functional>
 #include <map>
 #include <memory>
@@ -26,6 +28,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -135,8 +138,15 @@ class RaftClusterHarness
     /// because a process that restarts remembers nothing it applied, so whatever
     /// the node holds afterwards is what recovery gave back -- the snapshot's
     /// state, restored, and the entries above it, re-applied.
+    ///
+    /// **A restart can be REFUSED**, through the one seam production's is:
+    /// `RaftDriver::Create`, when the application cannot read what the node recovered.
+    /// The node is then DOWN -- no driver, reached by no message and ticked by no step
+    /// -- which is what a process that refused to start is, and its application holds
+    /// nothing, because the refusal handed it nothing.
     /// @param who Which node.
-    void Restart(NodeId const& who);
+    /// @return Nothing once it runs again; otherwise why it does not, and it is down.
+    [[nodiscard]] std::expected<void, ConsensusError> Restart(NodeId const& who);
 
     /// Bring up a machine that has no cluster, on the same network.
     ///
@@ -232,6 +242,8 @@ class RaftClusterHarness
         std::unique_ptr<InMemoryRaftStorage> storage;
         std::unique_ptr<IRaftTransport> transport;
         std::unique_ptr<IRaftStateMachine> machine;
+
+        /// The running node; null while it is down, which only a refused `Restart` does.
         std::unique_ptr<RaftDriver> driver;
 
         /// The configuration this node was started with, empty for a joiner.
@@ -312,14 +324,24 @@ class RaftClusterHarness
             _harness.RecordApplied(_who, entry);
         }
 
+        /// Every command: this harness's commands are a case's opaque bytes, in no
+        /// format a build could fail to read. What an unreadable command does to a
+        /// recovering node is asked over the production machine, in `RaftDriver_test`.
+        [[nodiscard]] std::expected<void, ConsensusError> CanRead(std::span<std::byte const> command) const override
+        {
+            std::ignore = command;
+            return {};
+        }
+
         [[nodiscard]] std::vector<std::byte> TakeSnapshot() override
         {
             return EncodeApplication(_harness.Find(_who).application);
         }
 
-        void RestoreSnapshot(std::span<std::byte const> state) override
+        [[nodiscard]] std::expected<void, ConsensusError> RestoreSnapshot(std::span<std::byte const> state,
+                                                                          SnapshotOrigin origin) override
         {
-            _harness.RestoreApplication(_who, state);
+            return _harness.RestoreApplication(_who, state, origin);
         }
 
       private:
@@ -337,23 +359,32 @@ class RaftClusterHarness
     /// @return The entries, or nullopt for bytes it cannot have written.
     [[nodiscard]] static std::optional<std::vector<AppliedEntry>> DecodeApplication(std::span<std::byte const> state);
 
-    /// Replace `who`'s application state with the one `state` encodes.
+    /// Replace `who`'s application state with the one `state` encodes, or refuse it.
     ///
-    /// Wholesale, as `IRaftStateMachine::RestoreSnapshot` requires. Bytes this
-    /// harness's own encoder could not have produced are a VIOLATION rather than an
-    /// empty state, because an empty state is exactly what a missed restore looks
-    /// like and the two must not read alike.
+    /// Wholesale, as `IRaftStateMachine::RestoreSnapshot` requires, and a refusal
+    /// changes nothing. Bytes this harness's own encoder could not have produced are
+    /// refused, never read as an empty state, because an empty state is exactly what a
+    /// missed restore looks like and the two must not read alike. A LEADER's snapshot
+    /// that will not decode is also a VIOLATION, since every leader here encodes with
+    /// that encoder; a node's own recovered one is a case's doing, and its refusal is
+    /// what that case asserts (#1542).
     /// @param who The node.
     /// @param state A snapshot `EncodeApplication` produced, on some node.
-    void RestoreApplication(NodeId const& who, std::span<std::byte const> state);
+    /// @param origin Which of `RestoreSnapshot`'s two callers this is.
+    /// @return Nothing once replaced; otherwise the refusal, as `StorageFailure`.
+    [[nodiscard]] std::expected<void, ConsensusError> RestoreApplication(NodeId const& who,
+                                                                         std::span<std::byte const> state,
+                                                                         SnapshotOrigin origin);
 
     /// Build a driver for `member` over `node`, the one way this harness makes one.
     ///
     /// Shared by `AddNode` and `Restart`, so the compaction policy -- and whatever the
-    /// next collaborator is -- cannot reach a first start and miss a restart.
-    /// @param member The node's world.
+    /// next collaborator is -- cannot reach a first start and miss a restart. Through
+    /// `RaftDriver::Create`, production's one seam, so a refusal there is one here.
+    /// @param member The node's world; its driver is set only on success.
     /// @param node The Raft node the driver takes over.
-    void BuildDriver(Member& member, RaftNode node);
+    /// @return Nothing once built; otherwise `Create`'s refusal.
+    [[nodiscard]] std::expected<void, ConsensusError> BuildDriver(Member& member, RaftNode node);
 
     /// The configuration every node in this cluster runs with.
     ///
@@ -397,6 +428,16 @@ class RaftClusterHarness
     void CheckInvariants();
 
     [[nodiscard]] Member& Find(NodeId const& who);
+
+    /// Whether @p member is running. The one statement of the rule a refused `Restart`
+    /// introduced -- a node that is down has no driver -- so the loops that must skip
+    /// such a node filter on this rather than each testing the pointer.
+    /// @param member The node.
+    /// @return True unless it is down.
+    [[nodiscard]] static bool IsUp(std::unique_ptr<Member> const& member) noexcept
+    {
+        return member->driver != nullptr;
+    }
 
     ManualClock _clock;
 
@@ -517,15 +558,22 @@ inline void RaftClusterHarness::AddNode(NodeId const& who,
     member->bootstrap = std::move(bootstrap);
 
     auto node = RaftNode::Create(ConfigFor(member->id, member->bootstrap), *member->random, _clock.Now());
-    BuildDriver(*member, std::move(node).value());
+
+    // A node that has never run recovered nothing, so nothing can be refused; one that
+    // was is this harness broken, not an outcome for a case to assert.
+    if (auto built = BuildDriver(*member, std::move(node).value()); !built.has_value())
+        throw std::logic_error { "a fresh node's driver was refused: " + built.error().context };
 
     _nodes.push_back(std::move(member));
 }
 
-inline void RaftClusterHarness::BuildDriver(Member& member, RaftNode node)
+inline std::expected<void, ConsensusError> RaftClusterHarness::BuildDriver(Member& member, RaftNode node)
 {
-    member.driver =
-        std::make_unique<RaftDriver>(std::move(node), *member.storage, *member.transport, *member.machine, _compaction);
+    auto driver = RaftDriver::Create(std::move(node), *member.storage, *member.transport, *member.machine, _compaction);
+    if (!driver.has_value())
+        return std::unexpected { std::move(driver).error() };
+    member.driver = *std::move(driver);
+    return {};
 }
 
 inline std::vector<std::byte> RaftClusterHarness::EncodeApplication(std::vector<AppliedEntry> const& application)
@@ -570,17 +618,23 @@ inline std::optional<std::vector<AppliedEntry>> RaftClusterHarness::DecodeApplic
     return entries;
 }
 
-inline void RaftClusterHarness::RestoreApplication(NodeId const& who, std::span<std::byte const> state)
+inline std::expected<void, ConsensusError> RaftClusterHarness::RestoreApplication(NodeId const& who,
+                                                                                  std::span<std::byte const> state,
+                                                                                  SnapshotOrigin origin)
 {
     auto restored = DecodeApplication(state);
     if (!restored.has_value())
     {
-        _violations.push_back("Snapshot: " + who + " was handed application state its own encoder cannot have written");
-        return;
+        auto const refused = std::format(
+            "{} holds application state the encoder {} uses cannot have written", TraitsOf(origin).described, who);
+        if (origin == SnapshotOrigin::Installed)
+            _violations.push_back("Snapshot: " + refused);
+        return std::unexpected { StorageFailure(refused) };
     }
 
     // Replace, never merge -- the contract this harness exists to hold production to.
     Find(who).application = *std::move(restored);
+    return {};
 }
 
 inline RaftConfig RaftClusterHarness::ConfigFor(NodeId const& who, Configuration bootstrap)
@@ -752,7 +806,8 @@ inline void RaftClusterHarness::RecordApplied(NodeId const& who, AppliedEntry co
 
 inline void RaftClusterHarness::CheckInvariants()
 {
-    for (auto const& node: _nodes)
+    // A node that is down holds no role and no log anybody can read.
+    for (auto const& node: _nodes | std::views::filter(IsUp))
     {
         auto const& raft = node->driver->Node();
 
@@ -821,12 +876,16 @@ inline void RaftClusterHarness::CheckInvariants()
 
     // Log Matching: two logs sharing an (index, term) must agree on every entry
     // up through that index.
-    for (auto const outer: std::views::iota(std::size_t { 0 }, _nodes.size()))
+    auto up = std::vector<Member const*> {};
+    for (auto const& node: _nodes | std::views::filter(IsUp))
+        up.push_back(node.get());
+
+    for (auto const outer: std::views::iota(std::size_t { 0 }, up.size()))
     {
-        for (auto const inner: std::views::iota(outer + 1, _nodes.size()))
+        for (auto const inner: std::views::iota(outer + 1, up.size()))
         {
-            auto const& left = _nodes[outer]->driver->Node().Log();
-            auto const& right = _nodes[inner]->driver->Node().Log();
+            auto const& left = up[outer]->driver->Node().Log();
+            auto const& right = up[inner]->driver->Node().Log();
             auto const shared = std::min(left.LastIndex().value, right.LastIndex().value);
 
             // Descending to 1, so the range is built ascending and reversed -- the spelling
@@ -845,9 +904,8 @@ inline void RaftClusterHarness::CheckInvariants()
                     auto const* const b = right.EntryAt(LogIndex { .value = below });
                     if (a != nullptr && b != nullptr && (a->term != b->term || a->payload != b->payload))
                     {
-                        _violations.push_back("Log Matching: " + _nodes[outer]->id + " and " + _nodes[inner]->id
-                                              + " agree at index " + std::to_string(index) + " but differ at "
-                                              + std::to_string(below));
+                        _violations.push_back("Log Matching: " + up[outer]->id + " and " + up[inner]->id + " agree at index "
+                                              + std::to_string(index) + " but differ at " + std::to_string(below));
                         break;
                     }
                 }
@@ -889,11 +947,16 @@ inline void RaftClusterHarness::Step(std::chrono::milliseconds by)
             continue;
         }
 
+        // A node that is down hears nothing, as a process that is not running does not.
+        auto& receiver = Find(message.to);
+        if (receiver.driver == nullptr)
+            continue; // Down: see `IsUp`.
+
         ++_deliveredFrom[message.from];
-        (void) Find(message.to).driver->Receive(*std::move(authenticated), now);
+        (void) receiver.driver->Receive(*std::move(authenticated), now);
     }
 
-    for (auto& node: _nodes)
+    for (auto& node: _nodes | std::views::filter(IsUp))
         (void) node->driver->Tick(now);
 
     CheckInvariants();
@@ -908,7 +971,7 @@ inline void RaftClusterHarness::Run(std::size_t steps, std::chrono::milliseconds
 inline std::vector<NodeId> RaftClusterHarness::Leaders() const
 {
     auto found = std::vector<NodeId> {};
-    for (auto const& node: _nodes)
+    for (auto const& node: _nodes | std::views::filter(IsUp))
         if (node->driver->Node().CurrentRole() == Role::Leader)
             found.push_back(node->id);
 
@@ -935,7 +998,7 @@ inline std::optional<NodeId> RaftClusterHarness::Leader() const
     auto best = std::optional<NodeId> {};
     auto bestTerm = Term::None();
 
-    for (auto const& node: _nodes)
+    for (auto const& node: _nodes | std::views::filter(IsUp))
     {
         auto const& raft = node->driver->Node();
         if (raft.CurrentRole() != Role::Leader)
@@ -986,21 +1049,29 @@ inline std::optional<LogIndex> RaftClusterHarness::ProposeMembershipOnLeader(Con
     return *proposed;
 }
 
-inline void RaftClusterHarness::Restart(NodeId const& who)
+inline std::expected<void, ConsensusError> RaftClusterHarness::Restart(NodeId const& who)
 {
     auto& member = Find(who);
 
-    auto recovered = member.storage->Load();
-    if (!recovered.has_value())
-        return;
+    // The old process is gone before the new one starts, whether or not it does: a node
+    // whose restart is refused is DOWN, never still running the driver it had.
+    member.driver.reset();
 
     // Forgotten before the new driver exists, as a process's memory is: whatever the
     // application holds from here on, recovery put there.
     member.application.clear();
 
+    // A store that cannot be read is a refused start as well, and says so; it used to
+    // return here silently, leaving the old driver running as if it had restarted.
+    auto recovered = member.storage->Load();
+    if (!recovered.has_value())
+        return std::unexpected { std::move(recovered).error() };
+
     auto node =
         RaftNode::Create(ConfigFor(member.id, member.bootstrap), *member.random, _clock.Now(), std::move(recovered).value());
-    BuildDriver(member, std::move(node).value());
+    if (!node.has_value())
+        return std::unexpected { std::move(node).error() };
+    return BuildDriver(member, std::move(node).value());
 }
 
 inline void RaftClusterHarness::RequireNew(NodeId const& who) const

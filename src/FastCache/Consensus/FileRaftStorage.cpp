@@ -69,24 +69,6 @@ namespace
     /// The format a log whose records carry no version was written in.
     constexpr std::uint16_t UnversionedLogFormat = 1;
 
-    /// What an operator does about a store another build wrote.
-    ///
-    /// One sentence for every such refusal, because the three files are ONE store and
-    /// go aside together: a remedy naming only the file that happened to be read
-    /// first leaves the other two to refuse the next start, one at a time. And it
-    /// says where that leaves the node, since "move it aside" alone reads as
-    /// harmless -- it is a node with an empty log, and whatever the cluster agreed
-    /// at runtime has to be agreed again. The identity is named as staying, because
-    /// it lives in the same directory and a wiped identity is a different node -- both
-    /// halves of it, the id and the key that proves it (#178).
-    constexpr std::string_view ForeignStoreRemedy =
-        "it is intact, and there is no conversion: stop the node, move raft-state, raft-log and raft-snapshot out of "
-        "its state directory -- leaving node-id and node-key where they are -- and start it again. It comes back with "
-        "an empty log "
-        "under its bootstrap configuration, so anything the cluster agreed at runtime (members admitted with "
-        "--cluster-admit or --cluster-admit-learner, cluster settings) has to be agreed again: re-run those "
-        "commands once a leader is elected; see docs/operations/upgrading-a-fleet.md";
-
     constexpr std::string_view StateFileName = "raft-state";
     constexpr std::string_view LogFileName = "raft-log";
     constexpr std::string_view SnapshotFileName = "raft-snapshot";
@@ -150,11 +132,12 @@ namespace
         auto const version = ReadBigEndian<std::uint16_t>(raw.subspan(sizeof(std::uint32_t)));
         if (version != FormatVersion)
             return std::unexpected { FastCache::UnsupportedFormatVersion(
-                std::format("the {} file is in Raft store format {} and this build reads format {}; {}",
+                std::format("the {} file is in Raft store format {} and this build reads format {}; it is intact, and "
+                            "there is no conversion: {}",
                             what,
                             version,
                             FormatVersion,
-                            ForeignStoreRemedy)) };
+                            UnreadableStateRemedy)) };
 
         return {};
     }
@@ -660,11 +643,12 @@ std::expected<void, ConsensusError> FileRaftStorage::ScanLog(std::vector<LogEntr
                 auto const stated = *foreign;
                 auto const written = stated == UnversionedLogReadsAs ? UnversionedLogFormat : stated;
                 return std::unexpected { FastCache::UnsupportedFormatVersion(
-                    std::format("{} is in Raft store format {} and this build reads format {}; {}",
+                    std::format("{} is in Raft store format {} and this build reads format {}; it is intact, and "
+                                "there is no conversion: {}",
                                 _logPath.string(),
                                 written,
                                 FormatVersion,
-                                ForeignStoreRemedy)) };
+                                UnreadableStateRemedy)) };
             }
 
             break; // A torn tail: it was never acknowledged, so nobody committed on it.

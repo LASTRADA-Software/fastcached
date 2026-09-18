@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "ConsensusTier.hpp"
+#include "NodeIdentity.hpp"
 #include "NodeMembership.hpp"
 #include "SchedulerTier.hpp"
 
 #include <FastCache/Cluster/ClusterState.hpp>
+#include <FastCache/Consensus/FileRaftStorage.hpp>
 #include <FastCache/Core/HostPort.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
@@ -12,16 +14,22 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <format>
 #include <fstream>
 #include <memory>
+#include <optional>
+#include <ranges>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include <tests/BoundedWait.hpp>
+#include <tests/PreviousClusterState.hpp>
 #include <tests/ScratchPath.hpp>
 #include <tests/Unwrap.hpp>
 
@@ -426,4 +434,197 @@ TEST_CASE("A running one-voter tier refuses to forget its only voter, and nothin
         [&tier] { return std::format("commit index {}", tier->Status().commitIndex.value); }));
     CHECK(tier->Status().commitIndex.value == before.value + 1);
     CHECK(records(tier->ClusterState(), self));
+}
+
+namespace
+{
+/// A command with no endpoint, key or role: a client admission or a forget.
+/// @param kind What it does.
+/// @param host The host it names.
+/// @return The command.
+[[nodiscard]] Cluster::Command HostCommand(Cluster::CommandKind kind, std::string host)
+{
+    return Cluster::Command { .kind = kind,
+                              .key = std::move(host),
+                              .value = {},
+                              .schedulerEndpoint = {},
+                              .publicKey = std::nullopt,
+                              .role = std::nullopt };
+}
+
+/// Write a node's own consensus state into @p directory, as a node that ran would have left it.
+///
+/// A one-voter cluster of `n1` that compacted through index 3 into a snapshot holding
+/// @p snapshotState, and still holds @p retained at index 4 -- written through the
+/// store the tier opens, in the order a driver writes it: the log, then the snapshot,
+/// which trims what it covers.
+/// @param directory The node's state directory.
+/// @param snapshotState The application's bytes as of index 3.
+/// @param retained The command at index 4, above the snapshot.
+void PlantConsensusState(std::filesystem::path const& directory,
+                         std::vector<std::byte> snapshotState,
+                         std::vector<std::byte> retained)
+{
+    auto store = Consensus::FileRaftStorage::Open(directory);
+    REQUIRE(store.has_value());
+    auto const term = Consensus::Term { .value = 1 };
+    REQUIRE(store->SaveState(Consensus::PersistentState { .currentTerm = term, .votedFor = std::nullopt }).has_value());
+
+    auto const covered = Cluster::Encode(HostCommand(Cluster::CommandKind::AdmitClient, "10.0.0.1"));
+    auto entries = std::vector<Consensus::LogEntry> {};
+    for ([[maybe_unused]] auto const index: std::views::iota(1, 4))
+        entries.push_back(Consensus::LogEntry { .term = term, .kind = Consensus::EntryKind::Command, .payload = covered });
+    entries.push_back(
+        Consensus::LogEntry { .term = term, .kind = Consensus::EntryKind::Command, .payload = std::move(retained) });
+    // Each written outside the assertion: a `REQUIRE` expands its expression more than
+    // once, so a move inside one reads to the analyser as a use after the move.
+    auto const logged = store->SaveLog(
+        Consensus::LogAppend { .fromIndex = Consensus::LogIndex { .value = 1 }, .entries = std::move(entries) });
+    REQUIRE(logged.has_value());
+
+    auto const snapshotted = store->SaveSnapshot(
+        Consensus::RaftSnapshot { .lastIncludedIndex = Consensus::LogIndex { .value = 3 },
+                                  .lastIncludedTerm = term,
+                                  .configuration = Consensus::Configuration { .voters = { "n1" }, .learners = {} },
+                                  .state = std::move(snapshotState) });
+    REQUIRE(snapshotted.has_value());
+}
+} // namespace
+
+TEST_CASE("A node whose own consensus state this build cannot read refuses to start, and nothing is applied",
+          "[node][consensus][snapshot]")
+{
+    // The follow-up to #1542, at the door an operator meets it: `ConsensusTier::Start` over
+    // a real state directory. A node that upgraded across a change of the cluster state's
+    // or the command's encoding restarts over its OWN snapshot and log, written by the
+    // build before. Recovery used to hand the snapshot to a machine that could not decode
+    // it and ran on with an EMPTY state -- no members, no settings, no forget tombstones --
+    // and skipped the commands it could not read: removal failing open, loudly but open.
+    // It now refuses to start, by name, before anything is applied.
+    NullLogger logger;
+    AtomicMetricsSink metrics;
+
+    auto probe = BlockingListener::Bind("127.0.0.1", 0);
+    REQUIRE(probe);
+    REQUIRE(probe->IsBound());
+    auto const port = probe->BoundPort();
+    probe.reset();
+
+    auto const scratch = Testing::UniqueScratchPath("consensus-unreadable-state");
+    std::filesystem::create_directories(scratch);
+    {
+        auto key = std::ofstream { scratch / "cluster.key", std::ios::binary };
+        key << std::string(32, 'k');
+    }
+
+    NodeConfig cfg;
+    cfg.nodeId = "n1";
+    cfg.raftListen = std::format("127.0.0.1:{}", port);
+    cfg.raftPeers = { Unwrap(Cluster::ParseMemberSpec(std::format("n1=127.0.0.1:{}", port))) };
+    cfg.clusterKeyFile = scratch / "cluster.key";
+    cfg.clusterDir = scratch / "state";
+    auto const directory = NodeStateDirectory(cfg);
+
+    // A tombstone in the snapshot and an admission above it: what a node that ran on an
+    // unread snapshot loses, and what one that skipped an unread command loses.
+    auto current = Cluster::ClusterState {};
+    Cluster::Apply(current, HostCommand(Cluster::CommandKind::ForgetClient, "10.0.0.7"));
+    auto const currentSnapshot = Cluster::Encode(current);
+    auto const currentCommand = Cluster::Encode(HostCommand(Cluster::CommandKind::AdmitClient, "10.0.0.9"));
+
+    // Anything published at all is something applied: the observer is how the member set
+    // reaches the fleet's oracle.
+    auto published = std::make_shared<std::atomic<int>>(0);
+    auto const start = [&] {
+        return ConsensusTier::Start(
+            cfg,
+            {},
+            [](Distributed::SchedulerRole, std::string_view, std::uint64_t) {},
+            [published](Cluster::ClusterState const&) { published->fetch_add(1); },
+            metrics,
+            logger);
+    };
+
+    SECTION("control: state this build wrote starts, with the snapshot restored and the entry above it applied")
+    {
+        PlantConsensusState(directory, currentSnapshot, currentCommand);
+        auto started = start();
+        REQUIRE(started.has_value());
+        auto const& tier = *started;
+
+        // Restored when the driver was built, before either loop ran.
+        CHECK(tier->ClusterState().HasForgotten("10.0.0.7"));
+        CHECK(published->load() > 0);
+
+        // And the entry above it, once the node leads again and commits it.
+        CHECK(Testing::WaitUntil(
+            "the retained admission to commit",
+            [&tier] { return tier->ClusterState().AdmitsClient("10.0.0.9"); },
+            [&tier] { return std::format("commit index {}", tier->Status().commitIndex.value); }));
+    }
+
+    SECTION("a snapshot the build before wrote refuses the start, naming the directory, both versions and the remedy")
+    {
+        PlantConsensusState(directory, Testing::EncodePreviousClusterState(), currentCommand);
+        auto const started = start();
+        REQUIRE_FALSE(started.has_value());
+        auto const& refusal = started.error();
+        CAPTURE(refusal);
+        CHECK(refusal.contains(directory.string()));
+        CHECK(refusal.contains("the snapshot as of log entry 3"));
+        CHECK(refusal.contains(std::format("cluster state encoding version {}", Testing::PreviousClusterStateVersion)));
+        CHECK(refusal.contains("reads 6"));
+        CHECK(refusal.contains("it is intact, and there is no conversion"));
+        CHECK(refusal.contains(Consensus::UnreadableStateRemedy));
+        CHECK(published->load() == 0);
+    }
+
+    SECTION("a retained command the build before wrote refuses the start, before the snapshot is restored")
+    {
+        // The snapshot is THIS build's, so it would restore -- and must not have been: the
+        // commands are asked about first, so a refusal hands the application nothing.
+        PlantConsensusState(directory, currentSnapshot, Testing::EncodePreviousClusterCommand());
+        auto const started = start();
+        REQUIRE_FALSE(started.has_value());
+        auto const& refusal = started.error();
+        CAPTURE(refusal);
+        CHECK(refusal.contains(directory.string()));
+        CHECK(refusal.contains("log entry 4"));
+        CHECK(refusal.contains(std::format("cluster command encoding version {}", Testing::PreviousClusterCommandVersion)));
+        CHECK(refusal.contains("reads 3"));
+        CHECK(refusal.contains(Consensus::UnreadableStateRemedy));
+        CHECK(published->load() == 0);
+    }
+}
+
+TEST_CASE("The remedy for unreadable consensus state names only flags this node has", "[node][consensus][snapshot]")
+{
+    // The remedy is prose an operator follows at the worst moment, so a flag it names that
+    // this binary does not have sends them to `--help` in the middle of a recovery. Asked
+    // of the option table, never remembered. A spelling ending in `-` is a family
+    // (`--cluster-*`), and at least one row must belong to it.
+    auto const remedy = std::string_view { Consensus::UnreadableStateRemedy };
+    auto const options = NodeOptions();
+    auto named = std::vector<std::string_view> {};
+    for (auto const word: std::views::split(remedy, ' '))
+    {
+        auto const text = std::string_view { word.begin(), word.end() };
+        auto const at = text.find("--");
+        if (at == std::string_view::npos)
+            continue;
+        auto const flag = text.substr(at);
+        named.push_back(flag.substr(0, flag.find_first_not_of("abcdefghijklmnopqrstuvwxyz-", 2)));
+    }
+
+    // A positive control on the scan itself, so an empty list cannot pass as a clean one.
+    REQUIRE(std::ranges::find(named, std::string_view { "--raft-join" }) != named.end());
+
+    for (auto const flag: named)
+    {
+        CAPTURE(flag);
+        if (flag.ends_with('-'))
+            CHECK(std::ranges::any_of(options, [flag](auto const& row) { return row.primary.starts_with(flag); }));
+        else
+            CHECK(std::ranges::any_of(options, [flag](auto const& row) { return row.primary == flag; }));
+    }
 }

@@ -9,6 +9,7 @@
 #include <format>
 #include <ranges>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -178,7 +179,8 @@ TEST_CASE("A snapshot round-trips through the machine", "[cluster][statemachine]
     source.machine.Apply(Entry(2, Cmd(CommandKind::SetSetting, "fleet-open", "1")));
 
     Watched restored;
-    restored.machine.RestoreSnapshot(source.machine.TakeSnapshot());
+    REQUIRE(
+        restored.machine.RestoreSnapshot(source.machine.TakeSnapshot(), Consensus::SnapshotOrigin::Installed).has_value());
 
     CHECK(restored.machine.State() == source.machine.State());
 
@@ -204,7 +206,7 @@ TEST_CASE("A snapshot replaces, and an unreadable one changes nothing", "[cluste
         ClusterState smaller;
         Apply(smaller, Cmd(CommandKind::AddMember, "n3", "10.0.0.3:6675"));
 
-        watched.machine.RestoreSnapshot(Encode(smaller));
+        REQUIRE(watched.machine.RestoreSnapshot(Encode(smaller), Consensus::SnapshotOrigin::Installed).has_value());
         REQUIRE(watched.machine.State().members.size() == 1);
         CHECK(watched.machine.State().members.front().id == "n3");
     }
@@ -215,9 +217,15 @@ TEST_CASE("A snapshot replaces, and an unreadable one changes nothing", "[cluste
         // cannot read your state" into "the cluster has no members", after which this
         // node would refuse every peer it had been serving a moment earlier.
         auto const before = watched.machine.State();
-        watched.machine.RestoreSnapshot(std::vector<std::byte>(5, std::byte { 0x01 }));
+        auto const published = watched.published.size();
+        auto const refused = watched.machine.RestoreSnapshot(std::vector<std::byte>(5, std::byte { 0x01 }),
+                                                             Consensus::SnapshotOrigin::Installed);
 
+        // Refused as DAMAGE: bytes no build wrote as a state -- the one refusal that is.
+        REQUIRE_FALSE(refused.has_value());
+        CHECK(refused.error().code == ConsensusErrorCode::StorageFailure);
         CHECK(watched.machine.State() == before);
+        CHECK(watched.published.size() == published);
     }
 }
 
@@ -237,8 +245,11 @@ TEST_CASE("A snapshot another build encoded is refused by its version and change
     // The state's version is the first field's only byte, after its u32 length prefix.
     REQUIRE(snapshot.size() > 4);
     snapshot[4] = std::byte { 2 };
-    machine.RestoreSnapshot(snapshot);
+    auto const refused = machine.RestoreSnapshot(snapshot, Consensus::SnapshotOrigin::Installed);
 
+    // Another build's, so the storage rule's code and never the damage one (#1542).
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error().code == ConsensusErrorCode::UnsupportedFormatVersion);
     CHECK(machine.State() == before);
     auto const records = logger.Snapshot();
     CHECK(std::ranges::any_of(records, [](auto const& record) {
@@ -255,14 +266,17 @@ TEST_CASE("A snapshot the previous build wrote, in its own layout, is refused by
     // names both versions -- an upgrade in progress, never a snapshot to delete.
     //
     // A follower handed the snapshot by a leader, and ONLY that. A node restarting on a
-    // snapshot of its own at the previous version takes a different path, which is #1542's.
+    // snapshot of its own at the previous version refuses to start; that is the case below.
     CapturingLogger logger;
     ClusterStateMachine machine { logger, {} };
     machine.Apply(Entry(1, Cmd(CommandKind::AddMember, "n9", "10.0.0.9:6675")));
     auto const before = machine.State();
 
-    machine.RestoreSnapshot(Testing::EncodePreviousClusterState());
+    auto const refused =
+        machine.RestoreSnapshot(Testing::EncodePreviousClusterState(), Consensus::SnapshotOrigin::Installed);
 
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error().code == ConsensusErrorCode::UnsupportedFormatVersion);
     CHECK(machine.State() == before);
     auto const records = logger.Snapshot();
     CHECK(std::ranges::any_of(records, [](auto const& record) {
@@ -270,4 +284,79 @@ TEST_CASE("A snapshot the previous build wrote, in its own layout, is refused by
                && record.message.contains(std::format("version {}", Testing::PreviousClusterStateVersion))
                && record.message.contains("reads 6");
     }));
+}
+
+TEST_CASE("A snapshot that cannot be decoded is named for where it came from, and so is what happens next",
+          "[cluster][statemachine]")
+{
+    // #1542. The line used to say a snapshot "arrived", which reads right for a leader's
+    // and wrong for a node's own: that one did not arrive, it was recovered, and the node
+    // does not keep its current state -- it has none, and it will not start. Each origin
+    // is asserted to name ITSELF and not the other, so a line that said both passes neither.
+    //
+    // Each section's first phrase is a REQUIRE. A line naming the wrong origin fails the
+    // four checks below it together, and a Catch2 binary's exit status is its failed
+    // assertion count -- four is `SKIP_RETURN_CODE`, so that defect was scored SKIPPED,
+    // not failed (#1152). Measured, on this case, by neutering the origin out of the line.
+    CapturingLogger logger;
+    ClusterStateMachine machine { logger, {} };
+
+    auto const said = [&logger](std::string_view phrase) {
+        auto const records = logger.Snapshot();
+        return std::ranges::any_of(records, [phrase](auto const& record) { return record.message.contains(phrase); });
+    };
+
+    SECTION("recovered")
+    {
+        auto const refused =
+            machine.RestoreSnapshot(Testing::EncodePreviousClusterState(), Consensus::SnapshotOrigin::Recovered);
+        REQUIRE_FALSE(refused.has_value());
+        CHECK(refused.error().code == ConsensusErrorCode::UnsupportedFormatVersion);
+        REQUIRE(said("the snapshot this node recovered from its own storage"));
+        CHECK(said("this node will not start on it"));
+        CHECK_FALSE(said("installed"));
+        CHECK_FALSE(said("keeping current state"));
+    }
+
+    SECTION("installed")
+    {
+        auto const refused =
+            machine.RestoreSnapshot(Testing::EncodePreviousClusterState(), Consensus::SnapshotOrigin::Installed);
+        REQUIRE_FALSE(refused.has_value());
+        REQUIRE(said("a snapshot the leader installed"));
+        CHECK(said("keeping current state"));
+        CHECK_FALSE(said("recovered"));
+        CHECK_FALSE(said("will not start"));
+    }
+}
+
+TEST_CASE("Whether a command can be applied is asked without applying it, in the two codes held state is refused with",
+          "[cluster][statemachine]")
+{
+    // What recovery asks of every command a node's own log holds (#1542): a question with
+    // no effects, answered in the storage rule's codes rather than the peer wire's.
+    Watched watched;
+
+    SECTION("this build's command is readable, and asking changes nothing")
+    {
+        CHECK(watched.machine.CanRead(Encode(Cmd(CommandKind::AddMember, "n1", "10.0.0.1:6675"))).has_value());
+        CHECK(watched.machine.State().members.empty());
+        CHECK(watched.published.empty());
+    }
+
+    SECTION("the previous build's command is another build's format, both versions named")
+    {
+        auto const refused = watched.machine.CanRead(Testing::EncodePreviousClusterCommand());
+        REQUIRE_FALSE(refused.has_value());
+        CHECK(refused.error().code == ConsensusErrorCode::UnsupportedFormatVersion);
+        CHECK(refused.error().context.contains(std::format("version {}", Testing::PreviousClusterCommandVersion)));
+        CHECK(refused.error().context.contains("reads 3"));
+    }
+
+    SECTION("bytes that are no command at all are damage")
+    {
+        auto const refused = watched.machine.CanRead(std::vector<std::byte>(3, std::byte { 0x01 }));
+        REQUIRE_FALSE(refused.has_value());
+        CHECK(refused.error().code == ConsensusErrorCode::StorageFailure);
+    }
 }

@@ -442,16 +442,14 @@ TEST_CASE("A command the previous build wrote is refused by its version before i
     // the fields first would call an intact entry from before the upgrade malformed, and a
     // node replaying its own log would report damage in every entry. The version is read
     // first, and the answer is *another build*.
-    auto const header = std::array { std::byte { 2 }, static_cast<std::byte>(CommandKind::AddMember) };
-    auto const v2 = WireFields::Encode({ std::span<std::byte const> { header },
-                                         WireFields::AsBytes(std::string_view { "n1" }),
-                                         WireFields::AsBytes(std::string_view { "10.0.0.1:6675" }),
-                                         WireFields::AsBytes(std::string_view {}) });
-
-    auto const refused = DecodeCommand(v2);
+    //
+    // The builder is shared (`tests/PreviousClusterState.hpp`), and its verb byte is pinned
+    // here against the enumerator it stands for.
+    REQUIRE(static_cast<std::uint8_t>(CommandKind::AddMember) == 0);
+    auto const refused = DecodeCommand(Testing::EncodePreviousClusterCommand());
     REQUIRE_FALSE(refused.has_value());
     CHECK(refused.error().code == ConsensusErrorCode::UnsupportedVersion);
-    CHECK(refused.error().context.contains("version 2"));
+    CHECK(refused.error().context.contains(std::format("version {}", Testing::PreviousClusterCommandVersion)));
     CHECK(refused.error().context.contains("reads 3"));
 }
 

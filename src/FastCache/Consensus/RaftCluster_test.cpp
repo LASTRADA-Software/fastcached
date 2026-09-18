@@ -3,6 +3,7 @@
 #include <FastCache/Consensus/RaftClusterHarness.hpp>
 #include <FastCache/Core/Bytes.hpp>
 #include <FastCache/Core/SecureBytes.hpp>
+#include <FastCache/Core/WireFields.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -16,6 +17,7 @@
 #include <set>
 #include <span>
 #include <string>
+#include <string_view>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -308,7 +310,7 @@ TEST_CASE("A restarted node rejoins without violating anything", "[consensus][ra
 
     auto const leader = cluster.Leader();
     REQUIRE(leader.has_value());
-    cluster.Restart(leader.value_or(NodeId {}));
+    REQUIRE(cluster.Restart(leader.value_or(NodeId {})).has_value());
     cluster.Run(300);
 
     REQUIRE(SettleOnLeader(cluster, 200));
@@ -329,7 +331,7 @@ TEST_CASE("Restarting every node in turn preserves what was committed", "[consen
 
     for (auto const& id: { "n1", "n2", "n3" })
     {
-        cluster.Restart(id);
+        REQUIRE(cluster.Restart(id).has_value());
         cluster.Run(200);
     }
 
@@ -390,7 +392,7 @@ TEST_CASE("A long adversarial run violates nothing", "[consensus][raft][cluster]
             ++proposals;
 
         if (round % 5 == 2)
-            cluster.Restart("n3");
+            REQUIRE(cluster.Restart("n3").has_value());
 
         cluster.Run(60);
     }
@@ -644,7 +646,7 @@ TEST_CASE("An admitted member survives its own restart", "[consensus][raft][clus
     cluster.Run(120);
     REQUIRE(cluster.At("n4").driver->Node().HasCluster());
 
-    cluster.Restart("n4");
+    REQUIRE(cluster.Restart("n4").has_value());
     CHECK(cluster.At("n4").driver->Node().HasCluster());
     CHECK(cluster.At("n4").driver->Node().ActiveConfiguration().voters.size() == 4);
 
@@ -947,7 +949,7 @@ TEST_CASE("A voter whose only peer is a learner leads through that learner's abs
 
     // And it restarts alone, the learner still absent, recovering the pair's
     // configuration from its own log rather than from a list it was started with.
-    cluster->Restart("n1");
+    REQUIRE(cluster->Restart("n1").has_value());
     REQUIRE(cluster->At("n1").driver->Node().CurrentRole() == Role::Follower);
     CHECK(cluster->At("n1").driver->Node().ActiveConfiguration()
           == Configuration { .voters = { "n1" }, .learners = { "n2" } });
@@ -1098,7 +1100,7 @@ TEST_CASE("A node restarted after compacting holds in its application what its s
     auto const before = cluster.At("n2").application;
     REQUIRE(SameApplication(before, cluster.At("n1").application));
 
-    cluster.Restart("n2");
+    REQUIRE(cluster.Restart("n2").has_value());
 
     // Before a single step: exactly what the snapshot covers, restored -- not empty, and
     // not the entries above it, which only a commit can bring back.
@@ -1149,6 +1151,62 @@ TEST_CASE("A follower caught up by an installed snapshot holds in its applicatio
     CHECK(cluster.At(lagging).driver->Node().SnapshotIndex() != LogIndex::BeforeFirst());
     CHECK(SameApplication(cluster.At(lagging).application, cluster.At(leader).application));
     CHECK(cluster.At(lagging).applied.size() < cluster.At(leader).application.size());
+
+    RequireNoViolations(cluster);
+}
+
+TEST_CASE("A node whose own recovered snapshot its application cannot read stays down, and holds nothing",
+          "[consensus][raft][cluster][snapshot]")
+{
+    // The harness half of #1542's follow-up. A restart here goes through
+    // `RaftDriver::Create`, production's one seam, so a node whose OWN snapshot is one its
+    // application cannot read is refused there -- and here that leaves it DOWN, which is
+    // what a process that refused to start is: no driver, and an application holding
+    // nothing, because the refusal handed it nothing. The rest of the cluster carries on.
+    RaftClusterHarness cluster { { "n1", "n2", "n3" }, ClusterKey, 1, CompactOften };
+    REQUIRE(SettleOnLeader(cluster));
+    ProposeSeveral(cluster, 10);
+    cluster.Run(60);
+
+    auto const leader = Unwrap(cluster.Leader());
+    auto const follower = NodeId { leader == "n2" ? "n3" : "n2" };
+    REQUIRE(cluster.At(follower).driver->Node().SnapshotIndex() != LogIndex::BeforeFirst());
+
+    SECTION("control: its own snapshot, as written, restarts it")
+    {
+        REQUIRE(cluster.Restart(follower).has_value());
+        CHECK(cluster.At(follower).driver != nullptr);
+        CHECK_FALSE(cluster.At(follower).application.empty());
+    }
+
+    SECTION("its own snapshot, rewritten to bytes the encoder never writes, keeps it down")
+    {
+        // One field where every entry is two: nothing `EncodeApplication` produced.
+        auto& storage = *cluster.At(follower).storage;
+        auto recovered = storage.Load();
+        REQUIRE(recovered.has_value());
+        REQUIRE(recovered->snapshot.has_value());
+        auto snapshot = Unwrap(recovered->snapshot);
+        snapshot.state = WireFields::Encode({ WireFields::AsBytes(std::string_view { "one field" }) });
+        REQUIRE(storage.SaveSnapshot(snapshot).has_value());
+
+        auto const restarted = cluster.Restart(follower);
+        REQUIRE_FALSE(restarted.has_value());
+        CHECK(restarted.error().code == ConsensusErrorCode::StorageFailure);
+        CHECK(restarted.error().context.starts_with("the snapshot as of log entry "));
+        CHECK(restarted.error().context.contains("the snapshot this node recovered"));
+
+        // Down, and handed nothing.
+        CHECK(cluster.At(follower).driver == nullptr);
+        CHECK(cluster.At(follower).application.empty());
+
+        // And the two it left behind still make a majority, and commit without it.
+        auto const without = cluster.ProposeOnLeader(FastCache::BytesFromString("without the node that is down"));
+        REQUIRE(without.has_value());
+        cluster.Run(60);
+        CHECK(cluster.At(leader).driver->Node().CommitIndex() >= Unwrap(without));
+        CHECK(cluster.At(follower).driver == nullptr);
+    }
 
     RequireNoViolations(cluster);
 }

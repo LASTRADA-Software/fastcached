@@ -121,20 +121,59 @@ class RecordingMachine final: public IRaftStateMachine
         _applied.push_back(entry);
     }
 
+    /// Journalled as "read", so a case can see WHEN recovery asked -- before the
+    /// snapshot, or after it. Refuses only the one command a case named.
+    [[nodiscard]] std::expected<void, ConsensusError> CanRead(std::span<std::byte const> command) const override
+    {
+        _journal.events.emplace_back("read");
+        if (_unreadableCommand.has_value() && std::ranges::equal(command, *_unreadableCommand))
+            return std::unexpected { FastCache::UnsupportedFormatVersion("a command this fake was told it cannot read") };
+        return {};
+    }
+
     [[nodiscard]] std::vector<std::byte> TakeSnapshot() override
     {
         _journal.events.emplace_back("snapshot");
         return _state;
     }
 
-    void RestoreSnapshot(std::span<std::byte const> state) override
+    [[nodiscard]] std::expected<void, ConsensusError> RestoreSnapshot(std::span<std::byte const> state,
+                                                                      SnapshotOrigin origin) override
     {
+        _origins.push_back(origin);
+        if (_refuseRestore)
+        {
+            // Refused, and NOTHING changes: the contract, held by the fake too.
+            _journal.events.emplace_back("restore-refused");
+            return std::unexpected { FastCache::UnsupportedFormatVersion("a snapshot this fake was told it cannot read") };
+        }
+
         _journal.events.emplace_back("restore");
         _state.assign(state.begin(), state.end());
 
         // A restore REPLACES: anything applied before it is described by the
         // snapshot, so keeping it would double-count.
         _applied.clear();
+        return {};
+    }
+
+    /// Refuse `command` from now on, as a build that cannot read it would.
+    /// @param command The payload to refuse.
+    void RefuseCommand(std::vector<std::byte> command)
+    {
+        _unreadableCommand = std::move(command);
+    }
+
+    /// Refuse every snapshot from now on.
+    void RefuseRestore() noexcept
+    {
+        _refuseRestore = true;
+    }
+
+    /// @return Which caller each restore came from, in order.
+    [[nodiscard]] std::vector<SnapshotOrigin> const& Origins() const noexcept
+    {
+        return _origins;
     }
 
     /// @return The state a restore installed, for assertions.
@@ -153,6 +192,9 @@ class RecordingMachine final: public IRaftStateMachine
     Journal& _journal;
     std::vector<AppliedEntry> _applied;
     std::vector<std::byte> _state;
+    std::vector<SnapshotOrigin> _origins;
+    std::optional<std::vector<std::byte>> _unreadableCommand;
+    bool _refuseRestore = false;
 };
 
 /// Storage whose every write fails, for the stop-on-failure case.
@@ -200,6 +242,27 @@ class FailingStorage final: public IRaftStorage
                         .heartbeatInterval = 50ms };
 }
 
+/// Build a driver the one way there is, requiring that recovery accepted the node.
+///
+/// Every case below that is not ABOUT a refusal builds through this, so the one that
+/// is about one is the only place `Create`'s error is read.
+/// @param node The node, as recovered or fresh.
+/// @param storage Its durable state.
+/// @param transport Its peers.
+/// @param machine Its application.
+/// @param compaction When it trims its log.
+/// @return The driver.
+[[nodiscard]] std::unique_ptr<RaftDriver> MakeDriver(RaftNode node,
+                                                     IRaftStorage& storage,
+                                                     IRaftTransport& transport,
+                                                     IRaftStateMachine& machine,
+                                                     CompactionPolicy compaction = {})
+{
+    auto driver = RaftDriver::Create(std::move(node), storage, transport, machine, compaction);
+    REQUIRE(driver.has_value());
+    return *std::move(driver);
+}
+
 /// Carry a driver's pre-vote round so its node becomes a candidate.
 ///
 /// An election timeout starts a pre-vote round rather than an election, so a
@@ -227,9 +290,9 @@ TEST_CASE("Durable state is written before anything is sent", "[consensus][raft]
     RecordingMachine machine { journal };
     ScriptedRandomSource random { { 0 } };
 
-    RaftDriver driver {
-        std::move(RaftNode::Create(TrioConfig(), random, TimePoint {})).value(), storage, transport, machine
-    };
+    auto const owned =
+        MakeDriver(std::move(RaftNode::Create(TrioConfig(), random, TimePoint {})).value(), storage, transport, machine);
+    auto& driver = *owned;
 
     REQUIRE(driver.Tick(TimePoint {} + 150ms).has_value());
 
@@ -263,9 +326,9 @@ TEST_CASE("Term and vote are written before the log", "[consensus][raft][driver]
     RecordingMachine machine { journal };
     ScriptedRandomSource random { { 0 } };
 
-    RaftDriver driver {
-        std::move(RaftNode::Create(TrioConfig(), random, TimePoint {})).value(), storage, transport, machine
-    };
+    auto const owned =
+        MakeDriver(std::move(RaftNode::Create(TrioConfig(), random, TimePoint {})).value(), storage, transport, machine);
+    auto& driver = *owned;
 
     // Becoming leader writes both: the term/vote from standing for election, and
     // the no-op entry.
@@ -295,9 +358,9 @@ TEST_CASE("Committed entries are applied after the messages go out", "[consensus
     RecordingMachine machine { journal };
     ScriptedRandomSource random { { 0 } };
 
-    RaftDriver driver {
-        std::move(RaftNode::Create(TrioConfig(), random, TimePoint {})).value(), storage, transport, machine
-    };
+    auto const owned =
+        MakeDriver(std::move(RaftNode::Create(TrioConfig(), random, TimePoint {})).value(), storage, transport, machine);
+    auto& driver = *owned;
 
     REQUIRE(driver.Tick(TimePoint {} + 150ms).has_value());
     REQUIRE(CarryPreVote(driver, TimePoint {} + 150ms));
@@ -329,9 +392,9 @@ TEST_CASE("A proposal reaches storage, the wire and the application", "[consensu
     RecordingMachine machine { journal };
     ScriptedRandomSource random { { 0 } };
 
-    RaftDriver driver {
-        std::move(RaftNode::Create(SoloConfig(), random, TimePoint {})).value(), storage, transport, machine
-    };
+    auto const owned =
+        MakeDriver(std::move(RaftNode::Create(SoloConfig(), random, TimePoint {})).value(), storage, transport, machine);
+    auto& driver = *owned;
 
     REQUIRE(driver.Tick(TimePoint {} + 150ms).has_value());
     REQUIRE(CarryPreVote(driver, TimePoint {} + 150ms));
@@ -358,9 +421,9 @@ TEST_CASE("A storage failure stops the driver and latches", "[consensus][raft][d
     RecordingMachine machine { journal };
     ScriptedRandomSource random { { 0 } };
 
-    RaftDriver driver {
-        std::move(RaftNode::Create(TrioConfig(), random, TimePoint {})).value(), storage, transport, machine
-    };
+    auto const owned =
+        MakeDriver(std::move(RaftNode::Create(TrioConfig(), random, TimePoint {})).value(), storage, transport, machine);
+    auto& driver = *owned;
 
     // The pre-vote round writes nothing, so it cannot fail; the election it
     // leads to is the first thing that touches the store.
@@ -408,9 +471,9 @@ TEST_CASE("Run ticks the node on the reactor's timer", "[consensus][raft][driver
     ManualClock clock;
     TestReactor reactor { clock };
 
-    RaftDriver driver {
-        std::move(RaftNode::Create(TrioConfig(), random, clock.Now())).value(), storage, transport, machine
-    };
+    auto const owned =
+        MakeDriver(std::move(RaftNode::Create(TrioConfig(), random, clock.Now())).value(), storage, transport, machine);
+    auto& driver = *owned;
 
     // Started the way SleepUntil_test starts a root task: hand the handle to the
     // reactor rather than awaiting it, since there is no coroutine here to await
@@ -459,9 +522,9 @@ TEST_CASE("A node elected between ticks still heartbeats on time", "[consensus][
     ManualClock clock;
     TestReactor reactor { clock };
 
-    RaftDriver driver {
-        std::move(RaftNode::Create(TrioConfig(), random, clock.Now())).value(), storage, transport, machine
-    };
+    auto const owned =
+        MakeDriver(std::move(RaftNode::Create(TrioConfig(), random, clock.Now())).value(), storage, transport, machine);
+    auto& driver = *owned;
 
     auto loop = driver.Run(&reactor);
     reactor.Submit(loop.Native());
@@ -505,9 +568,9 @@ TEST_CASE("Stop ends the run loop", "[consensus][raft][driver]")
     ManualClock clock;
     TestReactor reactor { clock };
 
-    RaftDriver driver {
-        std::move(RaftNode::Create(TrioConfig(), random, clock.Now())).value(), storage, transport, machine
-    };
+    auto const owned =
+        MakeDriver(std::move(RaftNode::Create(TrioConfig(), random, clock.Now())).value(), storage, transport, machine);
+    auto& driver = *owned;
 
     auto loop = driver.Run(&reactor);
     reactor.Submit(loop.Native());
@@ -536,11 +599,12 @@ TEST_CASE("An applied log is traded for a snapshot once enough has piled up", "[
 
     constexpr auto Threshold = std::uint64_t { 4 };
 
-    RaftDriver driver { std::move(RaftNode::Create(SoloConfig(), random, TimePoint {})).value(),
-                        storage,
-                        transport,
-                        machine,
-                        CompactionPolicy { .appliedEntriesBeforeCompaction = Threshold } };
+    auto const owned = MakeDriver(std::move(RaftNode::Create(SoloConfig(), random, TimePoint {})).value(),
+                                  storage,
+                                  transport,
+                                  machine,
+                                  CompactionPolicy { .appliedEntriesBeforeCompaction = Threshold });
+    auto& driver = *owned;
 
     REQUIRE(driver.Tick(TimePoint {} + 150ms).has_value());
     REQUIRE(CarryPreVote(driver, TimePoint {} + 150ms));
@@ -594,9 +658,9 @@ TEST_CASE("A driver told nothing about compaction never discards anything", "[co
     RecordingMachine machine { journal };
     ScriptedRandomSource random { { 0 } };
 
-    RaftDriver driver {
-        std::move(RaftNode::Create(SoloConfig(), random, TimePoint {})).value(), storage, transport, machine
-    };
+    auto const owned =
+        MakeDriver(std::move(RaftNode::Create(SoloConfig(), random, TimePoint {})).value(), storage, transport, machine);
+    auto& driver = *owned;
 
     REQUIRE(driver.Tick(TimePoint {} + 150ms).has_value());
     REQUIRE(CarryPreVote(driver, TimePoint {} + 150ms));
@@ -624,11 +688,12 @@ TEST_CASE("A snapshot that cannot be written stops the driver", "[consensus][raf
     // Two, not one: the no-op a new leader appends is applied during the election
     // itself, so a threshold of one would fall due before there is a proposal to
     // attribute the refusal to.
-    RaftDriver driver { std::move(RaftNode::Create(SoloConfig(), random, TimePoint {})).value(),
-                        storage,
-                        transport,
-                        machine,
-                        CompactionPolicy { .appliedEntriesBeforeCompaction = 2 } };
+    auto const owned = MakeDriver(std::move(RaftNode::Create(SoloConfig(), random, TimePoint {})).value(),
+                                  storage,
+                                  transport,
+                                  machine,
+                                  CompactionPolicy { .appliedEntriesBeforeCompaction = 2 });
+    auto& driver = *owned;
 
     REQUIRE(driver.Tick(TimePoint {} + 150ms).has_value());
     REQUIRE(CarryPreVote(driver, TimePoint {} + 150ms));
@@ -653,9 +718,9 @@ TEST_CASE("A role change is reported with the term it happened in", "[consensus]
     RecordingMachine machine { journal };
     ScriptedRandomSource random { { 0 } };
 
-    RaftDriver driver {
-        std::move(RaftNode::Create(TrioConfig(), random, TimePoint {})).value(), storage, transport, machine
-    };
+    auto const owned =
+        MakeDriver(std::move(RaftNode::Create(TrioConfig(), random, TimePoint {})).value(), storage, transport, machine);
+    auto& driver = *owned;
 
     auto reported = std::vector<RaftDriver::RoleChange> {};
     driver.ObserveRole([&reported](RaftDriver::RoleChange const& change) { reported.push_back(change); });
@@ -683,9 +748,9 @@ TEST_CASE("A deposition is reported with the peer that caused it", "[consensus][
     RecordingMachine machine { journal };
     ScriptedRandomSource random { { 0 } };
 
-    RaftDriver driver {
-        std::move(RaftNode::Create(TrioConfig(), random, TimePoint {})).value(), storage, transport, machine
-    };
+    auto const owned =
+        MakeDriver(std::move(RaftNode::Create(TrioConfig(), random, TimePoint {})).value(), storage, transport, machine);
+    auto& driver = *owned;
 
     auto reported = std::vector<RaftDriver::RoleChange> {};
     driver.ObserveRole([&reported](RaftDriver::RoleChange const& change) { reported.push_back(change); });
@@ -732,9 +797,9 @@ TEST_CASE("A term that moves without the role moving is still reported", "[conse
     RecordingMachine machine { journal };
     ScriptedRandomSource random { { 0 } };
 
-    RaftDriver driver {
-        std::move(RaftNode::Create(TrioConfig(), random, TimePoint {})).value(), storage, transport, machine
-    };
+    auto const owned =
+        MakeDriver(std::move(RaftNode::Create(TrioConfig(), random, TimePoint {})).value(), storage, transport, machine);
+    auto& driver = *owned;
 
     auto reported = std::vector<RaftDriver::RoleChange> {};
     driver.ObserveRole([&reported](RaftDriver::RoleChange const& change) { reported.push_back(change); });
@@ -789,9 +854,9 @@ TEST_CASE("CurrentProgress reports the role and the leader, under the same lock"
     RecordingMachine machine { journal };
     ScriptedRandomSource random { { 0 } };
 
-    RaftDriver driver {
-        std::move(RaftNode::Create(TrioConfig(), random, TimePoint {})).value(), storage, transport, machine
-    };
+    auto const owned =
+        MakeDriver(std::move(RaftNode::Create(TrioConfig(), random, TimePoint {})).value(), storage, transport, machine);
+    auto& driver = *owned;
 
     // A quiet follower knows its members and no leader. Asserted BEFORE anything
     // moves, because "names no leader" is the state an election is in and a case
@@ -873,14 +938,15 @@ TEST_CASE("Constructing a driver over a recovered snapshot restores it before an
                                                         .state = state } };
 
         RecordingMachine machine { journal };
-        RaftDriver const driver {
-            std::move(RaftNode::Create(SoloConfig(), random, TimePoint {}, std::move(recovered))).value(),
-            storage,
-            transport,
-            machine
-        };
+        auto const owned =
+            MakeDriver(std::move(RaftNode::Create(SoloConfig(), random, TimePoint {}, std::move(recovered))).value(),
+                       storage,
+                       transport,
+                       machine);
+        auto const& driver = *owned;
 
         REQUIRE(journal.events == std::vector<std::string> { "restore" });
+        CHECK(machine.Origins() == std::vector { SnapshotOrigin::Recovered });
         CHECK(machine.State() == state);
         CHECK(machine.Applied().empty());
         CHECK(driver.Node().LastApplied() == LogIndex { .value = 5 });
@@ -889,9 +955,9 @@ TEST_CASE("Constructing a driver over a recovered snapshot restores it before an
     SECTION("a node with no snapshot restores nothing")
     {
         RecordingMachine machine { journal };
-        RaftDriver const driver {
-            std::move(RaftNode::Create(SoloConfig(), random, TimePoint {})).value(), storage, transport, machine
-        };
+        auto const owned =
+            MakeDriver(std::move(RaftNode::Create(SoloConfig(), random, TimePoint {})).value(), storage, transport, machine);
+        auto const& driver = *owned;
 
         CHECK(journal.events.empty());
         CHECK(driver.Node().SnapshotIndex() == LogIndex::BeforeFirst());
@@ -938,9 +1004,7 @@ class NoPeers final: public IRaftTransport
     REQUIRE(recovered.has_value());
     auto node = RaftNode::Create(SoloConfig(), random, start, *std::move(recovered));
     REQUIRE(node.has_value());
-    auto driver = std::make_unique<RaftDriver>(
-        *std::move(node), store, transport, machine, CompactionPolicy { .appliedEntriesBeforeCompaction = 4 });
-    return driver;
+    return MakeDriver(*std::move(node), store, transport, machine, CompactionPolicy { .appliedEntriesBeforeCompaction = 4 });
 }
 
 /// Carry a solo driver to leadership.
@@ -1071,4 +1135,84 @@ TEST_CASE("A node restarted after compacting comes back holding every cluster fa
     Elect(*driver, TimePoint {} + 1s + 150ms);
     CHECK(driver->Node().LastApplied() >= aboveAt);
     CHECK(machine.State() == before);
+}
+
+TEST_CASE("A driver over recovered state its application cannot read is refused, and the application is handed nothing",
+          "[consensus][raft][driver][snapshot]")
+{
+    // The follow-up to #1542: recovery restores a node's snapshot, and a node whose own
+    // snapshot -- or a command its own log holds above it -- is something the application
+    // cannot read does not get a driver at all. Asked in ONE order, which is what makes a
+    // refusal hand the application nothing: every command first, read-only, then the
+    // snapshot, which replaces or changes nothing. The journal is the evidence -- a
+    // refused command must leave no "restore" in it -- so it is each section's REQUIRE:
+    // a wrong order fails every check after it together, and four failures in one run are
+    // scored SKIPPED rather than failed (#1152).
+    Journal journal;
+    RecordingStorage storage { journal };
+    RecordingTransport transport { journal };
+    ScriptedRandomSource random { { 0 } };
+    RecordingMachine machine { journal };
+
+    auto const state = FastCache::BytesFromString("the state as of index 5");
+    auto const readable = FastCache::BytesFromString("a command at index 7");
+    auto const unreadable = FastCache::BytesFromString("a command at index 8");
+
+    // A no-op at 6, which is Raft's own and never the application's: it is not asked
+    // about, so a case counting reads sees two, not three.
+    auto const recovered = [&] {
+        return RecoveredState {
+            .state = PersistentState { .currentTerm = Term { .value = 2 }, .votedFor = std::nullopt },
+            .entries = { LogEntry { .term = Term { .value = 2 }, .kind = EntryKind::NoOp, .payload = {} },
+                         LogEntry { .term = Term { .value = 2 }, .kind = EntryKind::Command, .payload = readable },
+                         LogEntry { .term = Term { .value = 2 }, .kind = EntryKind::Command, .payload = unreadable } },
+            .firstIndex = LogIndex { .value = 6 },
+            .snapshot = RaftSnapshot { .lastIncludedIndex = LogIndex { .value = 5 },
+                                       .lastIncludedTerm = Term { .value = 2 },
+                                       .configuration = SoloConfig().Bootstrap(),
+                                       .state = state }
+        };
+    };
+    auto const create = [&] {
+        return RaftDriver::Create(std::move(RaftNode::Create(SoloConfig(), random, TimePoint {}, recovered())).value(),
+                                  storage,
+                                  transport,
+                                  machine);
+    };
+
+    SECTION("control: every command is asked about, and only then is the snapshot restored")
+    {
+        auto const driver = create();
+        REQUIRE(driver.has_value());
+        REQUIRE(journal.events == std::vector<std::string> { "read", "read", "restore" });
+        CHECK(machine.State() == state);
+        CHECK(machine.Origins() == std::vector { SnapshotOrigin::Recovered });
+    }
+
+    SECTION("a command the application cannot read refuses the driver before the snapshot is touched")
+    {
+        machine.RefuseCommand(unreadable);
+        auto const driver = create();
+        REQUIRE_FALSE(driver.has_value());
+        CHECK(driver.error().code == ConsensusErrorCode::UnsupportedFormatVersion);
+        CHECK(driver.error().context.starts_with("log entry 8: "));
+
+        // Nothing handed over: no restore was even attempted, so the snapshot's state is
+        // not sitting in an application whose node will never run.
+        REQUIRE(journal.events == std::vector<std::string> { "read", "read" });
+        CHECK(machine.State().empty());
+        CHECK(machine.Origins().empty());
+    }
+
+    SECTION("a snapshot the application cannot read refuses the driver and changes nothing")
+    {
+        machine.RefuseRestore();
+        auto const driver = create();
+        REQUIRE_FALSE(driver.has_value());
+        CHECK(driver.error().code == ConsensusErrorCode::UnsupportedFormatVersion);
+        CHECK(driver.error().context.starts_with("the snapshot as of log entry 5: "));
+        REQUIRE(journal.events == std::vector<std::string> { "read", "read", "restore-refused" });
+        CHECK(machine.State().empty());
+        CHECK(machine.Origins() == std::vector { SnapshotOrigin::Recovered });
+    }
 }

@@ -779,14 +779,37 @@ and it is recorded here because the question will be asked again.
     fact its snapshot held: members, settings, and the forget tombstones, which made
     REMOVAL fail OPEN -- a forgotten host admitted again after a restart, reported by
     nothing. It recovered only if a leader later sent it an `InstallSnapshot`, which a
-    follower whose log is current never gets. `RaftDriver`'s constructor now restores
-    a node's snapshot into the application before any step can apply an entry above
-    it: every driver is built there, so no caller has to remember, and
-    `IRaftStateMachine::RestoreSnapshot` states both of its callers -- recovery and
-    install. Asked of the boundary (`SnapshotIndex() != BeforeFirst()`), never of the
-    bytes, because an empty state is a legitimate snapshot. `ConsensusTier` reads the
-    recovered term BEFORE constructing the driver, since the restore's publication
-    announces the role.
+    follower whose log is current never gets. `RaftDriver::Create` -- a factory over
+    a private constructor, the one way a driver is built -- now restores a node's
+    snapshot into the application before any step can apply an entry above it, so no
+    caller has to remember, and `IRaftStateMachine::RestoreSnapshot` states both of its
+    callers -- recovery and install -- and is told which (`SnapshotOrigin`). Asked of
+    the boundary (`SnapshotIndex() != BeforeFirst()`), never of the bytes, because an
+    empty state is a legitimate snapshot. `ConsensusTier` reads the recovered term
+    BEFORE building the driver, since the restore's publication announces the role.
+  - **And a node whose own state the application cannot read does not start.** The
+    restore above met a change of the cluster state's encoding (#178's `StateVersion`
+    5 -> 6, `CommandVersion` 2 -> 3): a node restarting over its OWN snapshot from the
+    build before reached `RestoreSnapshot`, which logged *cannot decode ... keeping
+    current state* -- and the node then RAN with an empty `ClusterState`, tombstones
+    included, while `Apply` skipped every retained command it could not decode.
+    Removal failed open on the upgrade path, loudly but open. So `Create` is FALLIBLE:
+    it asks `CanRead` -- const, no effects -- of every command the log holds above the
+    snapshot, and only then restores, and `RestoreSnapshot` replaces wholesale or
+    refuses changing NOTHING. The ORDER is the property: a refusal means the
+    application was handed nothing, never a snapshot with no future or the entries
+    without the snapshot under them. The refusal code is the storage rule's --
+    `UnsupportedFormatVersion` for intact bytes another build laid out, `StorageFailure`
+    only for bytes that are no state at all -- and `ConsensusTier::Start` names the
+    directory, where in the state, both versions and `UnreadableStateRemedy`, which is
+    ONE remedy with the store's own format refusal because the three files go aside
+    together. That remedy moves `raft-state`, `raft-log` and `raft-snapshot` and KEEPS
+    `node-id` and `node-key` -- moving the whole directory mints a new identity the
+    cluster must admit while it still counts the old one -- and rejoins with
+    `--raft-join`, because an empty node under a bootstrap set naming only itself
+    elects itself and becomes a second cluster. A LEADER's snapshot the application
+    cannot read is the install path's own question, deliberately left as it was; its
+    log line now says *installed* and a recovered one says *recovered*.
   - **The harness's state machine holds real state, and a restart empties it.** Its
     `RestoreSnapshot` was a no-op ("this machine records what it was told") and its
     `TakeSnapshot` returned nothing, so every restart case passed whether or not a
@@ -796,7 +819,9 @@ and it is recorded here because the question will be asked again.
     `Restart` as a process's memory is) and `Member::applied` stays the HISTORY State
     Machine Safety is checked against. A restart case asserts the application, not
     only the log; the harness takes a `CompactionPolicy`, so a case can make every
-    node compact at all.
+    node compact at all. Its `Restart` goes through `RaftDriver::Create` too and
+    returns the refusal: a node whose restart is refused is DOWN -- no driver, reached
+    by no message, ticked by no step -- never still running the driver it had.
 - **A seeded draw must be the same on every platform, or a seeded harness is not
   reproducible.** `std::mt19937_64` is specified bit-for-bit by the standard;
   `std::uniform_int_distribution` is **not** — how it reduces the engine's output
