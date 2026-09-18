@@ -669,7 +669,10 @@ void ConsensusTier::Reconcile()
     // Outside the lock, both the decision and the proposals: a proposal is a
     // durability write and a broadcast, and holding a lock across one would stall
     // whoever is discovering peers behind whoever is writing to a disk.
-    for (auto const& command: Cluster::MembershipProposals(state, desired))
+    auto const plan = Cluster::MembershipProposals(state, desired);
+    ReportForgottenDesires(plan.forgotten);
+
+    for (auto const& command: plan.proposals)
     {
         auto const proposed = Propose(command);
         if (!proposed.has_value())
@@ -736,6 +739,33 @@ void ConsensusTier::Reconcile()
     // agreed before the id is counted. That ordering is what lets every other node
     // learn where the new member answers before it is asked to vote for anybody.
     ReconcileQuorum(state);
+}
+
+void ConsensusTier::ReportForgottenDesires(std::span<Cluster::DesiredMember const> refused)
+{
+    // Once per member rather than once per pass (#1528). A forgotten machine that still
+    // holds the key is proved again at every beacon, so it is refused on every pass for
+    // as long as it runs -- a line per interval is a line an operator filters out, and
+    // the one fact worth saying is that the forget is being honoured while something
+    // still asks for the member back.
+    for (auto const& member: refused)
+    {
+        if (std::ranges::find(_reportedForgotten, member.id) != _reportedForgotten.end())
+            continue;
+        _reportedForgotten.push_back(member.id);
+        _logger.Logf(LogLevel::Info,
+                     "cluster: not recording {} at {}: the cluster forgot host {}, and only --cluster-admit undoes a "
+                     "forget",
+                     member.id,
+                     member.raftEndpoint,
+                     HostOfEndpoint(member.raftEndpoint));
+    }
+
+    // A member no longer refused is forgotten here too, so forgetting it a SECOND time --
+    // after an operator re-admitted it -- is said again rather than swallowed.
+    std::erase_if(_reportedForgotten, [refused](Consensus::NodeId const& id) {
+        return std::ranges::find(refused, id, &Cluster::DesiredMember::id) == refused.end();
+    });
 }
 
 void ConsensusTier::LearnMembers(Cluster::ClusterState const& state, std::span<Cluster::DesiredMember const> desired)

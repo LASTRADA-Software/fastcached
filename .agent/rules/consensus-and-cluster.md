@@ -1117,6 +1117,25 @@ and it is recorded here because the question will be asked again.
     thing to get wrong — and no scheduler endpoint, because a member announces its own
     once elected and a value typed about somebody else would outrank what they say
     about themselves.
+  - **A forget outranks an observation**
+    ([#1528](https://github.com/LASTRADA-Software/fastcached/issues/1528)). Everything
+    the reconciler is handed is an OBSERVATION -- a peer proved the key, this node knows
+    its own record -- and `--cluster-forget` leaves the machine running with the key, so
+    discovery proves it again at its next beacon. `ConsensusTier::Desire` never prunes,
+    `MembershipProposals` proposed every desired id the state lacked, and `AddMember`
+    lifts the tombstone for the host it admits at: the leader re-recorded the forgotten
+    member on the very next pass, tombstone gone, and the quorum flapped -- removed on
+    one pass, re-added on the next. Inferred from reading, then REPRODUCED at the policy
+    before the fix. So `MembershipProposals` refuses a desire at a forgotten host --
+    by NAME, into `MembershipPlan::forgotten`, which the tier logs once per member,
+    because a refused desire and one the state already matches both propose nothing.
+    **Refused at the decision, not by pruning the desire**: discovery hands it back at
+    the next proof for as long as the machine holds the key. The predicate is `Apply`'s
+    own (`HasForgotten` over `HostOfEndpoint`, through `SameHost`), asked only of a desire
+    that would propose something, and it covers this node's OWN record. Lifting a
+    tombstone is the operator's: `--cluster-admit` commits `AddMember` directly. The
+    tombstone is a HOST, so a loopback cluster -- which records none -- is not covered,
+    and #178's per-node keys are what replace it with an identity.
   - **The quorum follows the state, never the other way round, and one step at a
     time.** Additions come first: growing before shrinking keeps the quorum reachable
     through a replacement, where the other order passes through a configuration

@@ -42,6 +42,21 @@ struct DesiredMember
     std::optional<MemberSeat> seat;
 };
 
+/// What `MembershipProposals` decided: what to propose, and what it refused to.
+struct MembershipPlan
+{
+    /// The commands to propose, in `desired` order; empty when nothing differs.
+    std::vector<Command> proposals;
+
+    /// Desires refused because the cluster FORGOT the host they name (#1528).
+    ///
+    /// Named rather than dropped, because a refusal nothing can see reads exactly like a
+    /// desire that already matches: both propose nothing. The caller reports them, once
+    /// per member -- a forgotten machine that still holds the key is desired again at
+    /// every proof, so it stays on this list for as long as it runs.
+    std::vector<DesiredMember> forgotten;
+};
+
 /// What a leader should propose to make the cluster's state say what it knows.
 ///
 /// The whole decision, as a pure function over two values: what the replicated state
@@ -68,10 +83,40 @@ struct DesiredMember
 /// comparison is on the *whole* record rather than on the id -- a member whose
 /// scheduler endpoint has just been announced differs from the one recorded, and must
 /// be re-proposed, while one that agrees in every field must not.
+///
+/// ## What it refuses to propose
+///
+/// **A record at a host the cluster has FORGOTTEN (#1528).** Everything this function
+/// is handed is an OBSERVATION -- a peer proved the key, this node knows its own record
+/// -- and a forget is an operator's positive act, so an observation must not undo one.
+/// It would, and silently: `--cluster-forget` leaves the machine running with the key,
+/// so discovery proves it again and this node goes on desiring it, and `AddMember`
+/// lifts the tombstone for the host it admits at. The next pass would put the member
+/// back, the quorum would flap -- removed on one pass, re-added on the next -- and the
+/// tombstone every surface refuses the host by would be gone.
+///
+/// Decided HERE, against the state, and not by forgetting the desire: discovery hands
+/// the desire back at the machine's next proof, for as long as it holds the key. The
+/// predicate is exactly the one `Apply` lifts a tombstone by, so a refusal here is
+/// precisely a proposal that would have cleared one. Asked only of a desire that would
+/// propose something -- one the state already matches changes nothing and lifts
+/// nothing. It covers this node's OWN record too: a leader whose host was forgotten
+/// stops re-proposing itself, and goes on counting itself only because it never
+/// proposes its own removal (`NextQuorumChange`).
+///
+/// **Undoing a forget is the operator's, and it is deliberate**: `--cluster-admit`
+/// commits `AddMember` directly -- never through this function -- and that lifts the
+/// tombstone, after which the desire matches and nothing here moves.
+///
+/// **A loopback host is never tombstoned**, so a cluster whose members share one
+/// machine over loopback -- a test rig, not a deployment -- has nothing to refuse by: a
+/// member forgotten there is re-admitted at its next proof. A host names no machine
+/// among members that all have the same one.
 /// @param state The cluster's state as this node last applied it.
 /// @param desired Records this node believes should be present.
-/// @return The commands to propose, in `desired` order; empty when nothing differs.
-[[nodiscard]] std::vector<Command> MembershipProposals(ClusterState const& state, std::span<DesiredMember const> desired);
+/// @return What to propose, in `desired` order, and what was refused because its host
+///         was forgotten.
+[[nodiscard]] MembershipPlan MembershipProposals(ClusterState const& state, std::span<DesiredMember const> desired);
 
 /// The one consensus membership change that moves the quorum towards the state.
 ///
@@ -117,10 +162,13 @@ struct DesiredMember
 /// over one would turn a typo into a cluster that cannot elect.
 ///
 /// **This node's own removal.** A leader taking itself out of the quorum it leads
-/// is an operator's decision and stays one — and it would not stick anyway, since
-/// a node always desires its own record and the next pass would propose putting it
-/// back. A configuration flapping on a timer is worse than one that is merely
-/// wrong.
+/// is an operator's decision and stays one — and short of a forget it would not
+/// stick anyway, since a node always desires its own record and the next pass would
+/// propose putting it back. A configuration flapping on a timer is worse than one
+/// that is merely wrong. A leader whose own host WAS forgotten stops re-proposing
+/// its record (`MembershipProposals`, #1528) and is still counted here, so the
+/// quorum drops it only under another leader: the record is honoured, the quorum
+/// fails closed.
 ///
 /// **The removal of a bootstrap member.** This is the one that is not obvious, and
 /// getting it wrong shrinks a healthy cluster to one node: `--raft-peer` puts a

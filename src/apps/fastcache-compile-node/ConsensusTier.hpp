@@ -443,6 +443,14 @@ class ConsensusTier final: public Distributed::IClusterAdmin, public IConsensusS
     ///        between, so a leader would dial one set and propose from another.
     void LearnMembers(Cluster::ClusterState const& state, std::span<Cluster::DesiredMember const> desired);
 
+    /// Say, once per member, that a desire was refused because its host was forgotten.
+    ///
+    /// The refusal itself is `Cluster::MembershipProposals`'s (#1528); this is only
+    /// what makes it visible, since a refused desire and one the state already matches
+    /// both propose nothing. Reconciler thread only.
+    /// @param refused The desires this pass's plan refused.
+    void ReportForgottenDesires(std::span<Cluster::DesiredMember const> refused);
+
     /// Move the quorum one step towards the cluster's member set.
     ///
     /// Leader only, and one member at a time -- see `Cluster::NextQuorumChange` for
@@ -595,6 +603,12 @@ class ConsensusTier final: public Distributed::IClusterAdmin, public IConsensusS
     /// is a member -- so every member of the cluster it joins is one it may later be
     /// told to forget.
     std::vector<Consensus::NodeId> _bootstrapIds;
+
+    /// The desires already reported as refused for a forgotten host (#1528).
+    ///
+    /// So each is said once while it stays refused, rather than once per pass for as
+    /// long as the forgotten machine goes on proving the key. Reconciler thread only.
+    std::vector<Consensus::NodeId> _reportedForgotten;
 
     /// Where the last configuration change this node proposed landed.
     ///

@@ -1,11 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Cluster/MembershipPolicy.hpp>
+#include <FastCache/Consensus/RaftMembership.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <optional>
+#include <ranges>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <tests/Unwrap.hpp>
@@ -72,10 +76,19 @@ namespace
 /// `MembershipProposals`, spelled without the span conversion at every call.
 /// @param state What the cluster holds.
 /// @param desired What this node believes.
+/// @return The whole plan: what to propose, and what was refused.
+[[nodiscard]] MembershipPlan Plan(ClusterState const& state, std::vector<DesiredMember> const& desired)
+{
+    return MembershipProposals(state, std::span<DesiredMember const> { desired });
+}
+
+/// The proposals alone, which is all most cases are about.
+/// @param state What the cluster holds.
+/// @param desired What this node believes.
 /// @return The proposals.
 [[nodiscard]] std::vector<Command> Proposals(ClusterState const& state, std::vector<DesiredMember> const& desired)
 {
-    return MembershipProposals(state, std::span<DesiredMember const> { desired });
+    return Plan(state, desired).proposals;
 }
 
 /// A configuration of voters alone: every configuration before #1449.
@@ -527,4 +540,171 @@ TEST_CASE("A node's own record keeps the seat the operator recorded", "[cluster]
     auto const learner = Proposals(ClusterState {}, { Desire("n3", "10.0.0.3:6675", std::nullopt, MemberSeat::Learner) });
     REQUIRE(learner.size() == 1);
     CHECK(learner[0].kind == CommandKind::AddLearner);
+}
+
+// --------------------------------------------------------------------------
+// Forgetting (#1528): a forget is a positive act, and what a leader merely OBSERVES --
+// a peer proving the key, its own record -- must not undo it.
+
+namespace
+{
+/// A leader's reconcile passes, as `ConsensusTier::Reconcile` runs them.
+///
+/// Both halves decide from the state read at the TOP of a pass, as the tier does -- the
+/// proposals and `ReconcileQuorum` see one snapshot -- and everything a pass proposes
+/// has committed by the next one, which is the tier's pending-change wait letting one
+/// configuration change through per commit. Composed from the two functions the tier
+/// calls rather than restated, so a case here exercises the decisions production makes.
+struct Leader
+{
+    ClusterState state;                  ///< What the cluster has applied.
+    Consensus::Configuration active;     ///< What consensus counts.
+    Consensus::NodeId self;              ///< This node.
+    std::vector<Consensus::NodeId> boot; ///< What it was started with.
+    std::vector<DesiredMember> desired;  ///< Itself, and whatever discovery has proved.
+
+    /// One pass: propose what the state does not yet say, and move the quorum one step.
+    void Pass()
+    {
+        auto const top = state;
+        for (auto const& command: Proposals(top, desired))
+            Apply(state, command);
+        if (auto const change = NextQuorumChange(top, active, self, boot); change.has_value())
+            active = Unwrap(change);
+    }
+
+    /// Whether the state records `id`.
+    /// @param id The member.
+    /// @return True when a member record names it.
+    [[nodiscard]] bool Records(std::string_view id) const
+    {
+        return std::ranges::find(state.members, id, &ClusterMember::id) != state.members.end();
+    }
+};
+
+/// A leader that bootstrapped alone and admitted `n2` and `n3` because discovery proved them.
+///
+/// The shape `--discovery` builds: one machine names only itself in `--raft-peer`, so
+/// every other member was admitted at runtime -- which is what makes it removable.
+/// @return The leader, settled: a pass proposes nothing.
+[[nodiscard]] Leader DiscoveredCluster()
+{
+    return Leader { .state = StateOf(
+                        { Member("n1", "10.0.0.1:6680"), Member("n2", "10.0.0.2:6680"), Member("n3", "10.0.0.3:6680") }),
+                    .active = Voters({ "n1", "n2", "n3" }),
+                    .self = "n1",
+                    .boot = { "n1" },
+                    .desired = { Desire("n1", "10.0.0.1:6680", std::string {}),
+                                 Desire("n2", "10.0.0.2:6680"),
+                                 Desire("n3", "10.0.0.3:6680") } };
+}
+
+/// What `--cluster-forget=<id>` commits.
+/// @param id The member.
+/// @return The command.
+[[nodiscard]] Command Forget(std::string id)
+{
+    return Command { .kind = CommandKind::RemoveMember, .key = std::move(id), .value = {}, .schedulerEndpoint = {} };
+}
+} // namespace
+
+TEST_CASE("A member the operator forgot stays forgotten while discovery still proves it", "[cluster][membership][forget]")
+{
+    // #1528. `n3` still holds the key, so discovery goes on proving it and this node goes
+    // on desiring it; the forget is the operator saying that no longer admits it. Several
+    // passes, each asserted, because the failure is a re-admission on the NEXT pass and a
+    // configuration that then flaps -- removed from the quorum on one pass and added back
+    // on the one after.
+    auto leader = DiscoveredCluster();
+    leader.Pass();
+    REQUIRE(leader.active == Voters({ "n1", "n2", "n3" }));
+
+    Apply(leader.state, Forget("n3"));
+    REQUIRE(leader.state.HasForgotten("10.0.0.3"));
+
+    for (auto const pass: std::views::iota(0, 4))
+    {
+        leader.Pass();
+        INFO("reconcile pass " << pass);
+        CHECK_FALSE(leader.Records("n3"));
+        CHECK(leader.state.HasForgotten("10.0.0.3"));
+    }
+
+    // And the forget reached the quorum: `n3` was admitted at runtime, so it is removed.
+    CHECK(leader.active == Voters({ "n1", "n2" }));
+}
+
+TEST_CASE("A desire at a forgotten host is refused by name, and only when it would propose", "[cluster][membership][forget]")
+{
+    // Refused rather than dropped: a desire nothing proposes for and nothing reports reads
+    // exactly like one the state already matches, and the tier logs this list.
+    auto state = StateOf({ Member("n1", "10.0.0.1:6680") });
+    state.forgotten = { "10.0.0.3" };
+
+    auto const plan = Plan(state, { Desire("n3", "10.0.0.3:6680"), Desire("n4", "10.0.0.4:6680") });
+    REQUIRE(plan.proposals.size() == 1);
+    CHECK(plan.proposals[0].key == "n4");
+    REQUIRE(plan.forgotten.size() == 1);
+    CHECK(plan.forgotten[0].id == "n3");
+
+    // The SAME machine however it is spelled, through the comparison `Apply` lifts a
+    // tombstone by -- a dual-stack listener reports an IPv4 host in its mapped form.
+    CHECK(Plan(state, { Desire("n3", "[::ffff:10.0.0.3]:6680") }).proposals.empty());
+
+    // A record the state already matches proposes nothing and lifts nothing, so it is no
+    // refusal: a member whose host a CLIENT forget named is still recorded and counted,
+    // and a line saying it is "not re-admitted" would be false.
+    auto recorded = StateOf({ Member("n1", "10.0.0.1:6680"), Member("n3", "10.0.0.3:6680") });
+    recorded.forgotten = { "10.0.0.3" };
+    CHECK(Plan(recorded, { Desire("n3", "10.0.0.3:6680") }).forgotten.empty());
+
+    // And this node's own record is an observation like any other: a leader whose host
+    // was forgotten does not put itself back.
+    auto self = StateOf({});
+    self.forgotten = { "10.0.0.1" };
+    auto const own = Plan(self, { Desire("n1", "10.0.0.1:6680", std::string {}) });
+    CHECK(own.proposals.empty());
+    CHECK(own.forgotten.size() == 1);
+}
+
+TEST_CASE("A member nobody forgot is still admitted when discovery proves it", "[cluster][membership][forget]")
+{
+    // The control the case above needs: a reconciler that stopped admitting whatever
+    // discovery proved, or stopped re-proposing a record that changed, would pass it.
+    // Beside a forgotten member, so the refusal is seen to be about THAT member.
+    auto leader = DiscoveredCluster();
+    Apply(leader.state, Forget("n3"));
+    leader.desired.push_back(Desire("n4", "10.0.0.4:6680"));
+    leader.desired[1] = Desire("n2", "10.0.0.12:6680");
+
+    for ([[maybe_unused]] auto const pass: std::views::iota(0, 4))
+        leader.Pass();
+
+    CHECK(leader.Records("n4"));
+    CHECK(Consensus::Membership::IsMember(leader.active, "n4"));
+    CHECK(leader.state.RaftEndpointOf("n2") == "10.0.0.12:6680");
+    CHECK_FALSE(leader.Records("n3"));
+}
+
+TEST_CASE("Only an operator's admit brings a forgotten member back", "[cluster][membership][forget]")
+{
+    // Re-admission is a positive act too, and it is the operator's: `--cluster-admit`
+    // commits the record, which lifts the tombstone -- deliberately, since `Apply` clears
+    // a forgotten host whenever a member is admitted at it. After that the machine is
+    // desired and recorded again, and discovery's desire has nothing left to change.
+    auto leader = DiscoveredCluster();
+    Apply(leader.state, Forget("n3"));
+    leader.Pass();
+    leader.Pass();
+    REQUIRE_FALSE(leader.Records("n3"));
+
+    Apply(leader.state,
+          Command { .kind = CommandKind::AddMember, .key = "n3", .value = "10.0.0.3:6680", .schedulerEndpoint = {} });
+    CHECK_FALSE(leader.state.HasForgotten("10.0.0.3"));
+
+    for ([[maybe_unused]] auto const pass: std::views::iota(0, 4))
+        leader.Pass();
+
+    CHECK(leader.Records("n3"));
+    CHECK(Consensus::Membership::IsMember(leader.active, "n3"));
 }
