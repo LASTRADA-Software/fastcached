@@ -69,37 +69,42 @@ BeaconOutcome PeerDirectory::NoteBeacon(std::string_view clusterId, std::string_
         // A peer that now advertises a different endpoint loses its
         // authenticated bit: the proof covered the OLD endpoint, so carrying the
         // bit across would admit an address nobody ever proved. Re-proving is
-        // one handshake, and the alternative is the hole the MAC's endpoint
+        // one handshake, and the alternative is the hole the signed endpoint
         // field exists to close.
         if (found->second.raftEndpoint != raftEndpoint)
         {
             found->second.raftEndpoint = std::string { raftEndpoint };
             found->second.authenticated = false;
+            found->second.provenKey.reset();
         }
         found->second.lastSeen = now;
         return BeaconOutcome::Recorded;
     }
 
-    _peers.emplace(
-        key,
-        KnownPeer { .nodeId = key, .raftEndpoint = std::string { raftEndpoint }, .authenticated = false, .lastSeen = now });
+    _peers.emplace(key,
+                   KnownPeer { .nodeId = key,
+                               .raftEndpoint = std::string { raftEndpoint },
+                               .authenticated = false,
+                               .provenKey = std::nullopt,
+                               .lastSeen = now });
     return BeaconOutcome::Recorded;
 }
 
-bool PeerDirectory::MarkAuthenticated(std::string_view nodeId, std::string_view raftEndpoint)
+bool PeerDirectory::MarkAuthenticated(std::string_view nodeId, std::string_view raftEndpoint, Ed25519PublicKey const& key)
 {
     auto found = _peers.find(std::string { nodeId });
     if (found == _peers.end())
         return false;
 
     // The endpoint must be the one currently advertised. A proof authenticates a
-    // (node, endpoint) pair -- both are inside the MAC -- so accepting it against
+    // (node, endpoint) pair -- both are inside the signature -- so accepting it against
     // whatever the directory happens to hold now would let a beacon sent between
     // the challenge and the proof redirect an authenticated peer.
     if (found->second.raftEndpoint != raftEndpoint)
         return false;
 
     found->second.authenticated = true;
+    found->second.provenKey = key;
     return true;
 }
 

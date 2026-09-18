@@ -919,12 +919,12 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
             .explicitBit = &NodeConfig::raftListenExplicit,
             .description = "where peers reach this node's consensus port. Giving\n"
                            "it turns consensus ON, and consensus needs\n"
-                           "--cluster-key-file: every peer connection proves the\n"
-                           "key before a message is read. Without this flag the\n"
-                           "node leads alone, which is right for one machine and\n"
-                           "is the default. A bare port binds the WILDCARD: peers\n"
-                           "are on other machines by definition, so loopback\n"
-                           "would silently not work.",
+                           "--cluster-key-file: it signs the scheduler's leases\n"
+                           "and proves this node on the node port. Without this\n"
+                           "flag the node leads alone, which is right for one\n"
+                           "machine and is the default. A bare port binds the\n"
+                           "WILDCARD: peers are on other machines by definition,\n"
+                           "so loopback would silently not work.",
             .yamlKey = "listen_raft",
             .same = FieldEq<&NodeConfig::raftListen>(),
         },
@@ -1092,10 +1092,11 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
             .apply = AssignFrom<&NodeConfig::discoveryAddress, ParseText>(),
             .explicitBit = &NodeConfig::discoveryAddressExplicit,
             .description = "announce this node on the segment and listen for peers\n"
-                           "here; off unless given. Needs --listen-raft and\n"
-                           "--cluster-key-file. A peer that proves the key joins as\n"
-                           "a learner, counted by no quorum; --cluster-admit\n"
-                           "promotes it to a voter.",
+                           "here; off unless given. Needs --listen-raft. A peer\n"
+                           "counts only when it proves the key the cluster holds\n"
+                           "for it, and joins as a learner, counted by no quorum;\n"
+                           "--cluster-admit promotes it. Any other key is\n"
+                           "reported, never admitted.",
             .yamlKey = "discovery",
             .same = FieldEq<&NodeConfig::discoveryAddress>(),
         },
@@ -1120,14 +1121,14 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
             .operand = "=<path>",
             .apply = AssignFrom<&NodeConfig::clusterKeyFile, ParsePathValue>(),
             .description = "the cluster's pre-shared key. A FILE and not a flag:\n"
-                           "a command line is readable through ps, and a key that\n"
-                           "leaks admits a node whose objects the whole fleet\n"
-                           "then caches. REQUIRED with --listen-raft: every\n"
-                           "consensus connection proves it before a message is\n"
-                           "read. Discovery proves the cluster with it, and the\n"
-                           "scheduler SIGNS lease grants with it. Without one, a\n"
-                           "grant is unsigned and any client that can reach a\n"
-                           "worker's compile port can spend it.",
+                           "a command line is readable through ps. REQUIRED with\n"
+                           "--listen-raft: the scheduler SIGNS lease grants with\n"
+                           "it, and a node proves itself on the node port with\n"
+                           "it. Consensus, discovery and enrollment prove each\n"
+                           "node's OWN identity key instead, and nothing hands\n"
+                           "this file over: place it on every member. Without\n"
+                           "one, a grant is unsigned and any client that can\n"
+                           "reach a worker's compile port can spend it.",
             .yamlKey = "cluster_key_file",
             .same = FieldEq<&NodeConfig::clusterKeyFile>(),
         },
@@ -1651,21 +1652,22 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
             .apply = AssignFrom<&NodeConfig::enrollFrom, ParseText>(),
             .description = "ask the node at this address to admit this machine to\n"
                            "its cluster, then exit. Opens no port. Mints this\n"
-                           "node's identity into --cluster-dir, asks, waits for an\n"
-                           "operator there to approve it, and writes the cluster\n"
-                           "key it is handed to --cluster-key-file. The key\n"
-                           "crosses in CLEARTEXT: this wire has no TLS, and what\n"
-                           "that key buys is admission to the fleet. Run it on a\n"
-                           "trusted segment, at a moment somebody is watching.",
+                           "node's identity and identity key into its state\n"
+                           "directory, PRINTS the key, asks, and waits for an\n"
+                           "operator there to approve it -- as a member when it\n"
+                           "runs consensus, a worker principal when it does not.\n"
+                           "No secret crosses: once admitted it prints the\n"
+                           "roster's fingerprint to compare with --enroll-list,\n"
+                           "and the --raft-peer list its next start needs.",
         },
         { .primary = "--enroll-open",
           .arity = Arity::None,
           .apply = SelectEnrollAction<EnrollAction::Open>(),
           .description = "open an enrollment window on the cluster at\n"
                          "--scheduler, then exit. While it is open ANY machine\n"
-                         "that can reach that node may ask to join, and\n"
-                         "approving one hands it this cluster's key in\n"
-                         "cleartext. The window is held in memory: a restart\n"
+                         "that can reach that node may ask to join under the\n"
+                         "key it minted; approving one admits exactly that\n"
+                         "key. The window is held in memory: a restart\n"
                          "closes it, and so does --enroll-close." },
         { .primary = "--enroll-close",
           .arity = Arity::None,
@@ -1678,19 +1680,20 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
           .arity = Arity::None,
           .apply = SelectEnrollAction<EnrollAction::List>(),
           .description = "print what is waiting at the enrollment window and\n"
-                         "exit. Shows each machine's claimed address AND the\n"
-                         "host it actually came from, and marks a\n"
-                         "disagreement -- it does not refuse one, because DNS,\n"
-                         "NAT and multi-homing all produce it legitimately." },
+                         "exit. Shows each machine's identity key WHOLE -- the\n"
+                         "string to compare with what that machine printed --\n"
+                         "the fingerprint of the roster it was handed, and its\n"
+                         "claimed address beside the host it actually came\n"
+                         "from. A disagreement there is marked, not refused:\n"
+                         "DNS, NAT and multi-homing all produce it." },
         { .primary = "--enroll-approve",
           .arity = Arity::Value,
           .operand = "=<node-id>",
           .apply = SelectEnrollAction<EnrollAction::Approve>(),
-          .description = "admit the named machine to the cluster and let it\n"
-                         "collect the cluster key, then exit. Take the id from\n"
-                         "--enroll-list and check the two addresses beside it\n"
-                         "first: this is the moment the fleet's key leaves\n"
-                         "this cluster." },
+          .description = "admit the named machine to the cluster under the key\n"
+                         "--enroll-list shows for it, then exit. Compare that\n"
+                         "key with the one the machine printed first: the\n"
+                         "comparison is the whole of what makes this safe." },
         { .primary = "--enroll-reject",
           .arity = Arity::Value,
           .operand = "=<node-id>",
@@ -1700,7 +1703,7 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
                          "committed to the cluster and needs no\n"
                          "--cluster-forget. One already approved is a\n"
                          "different matter: the approval committed it, so this\n"
-                         "stops it being handed the key but does NOT remove\n"
+                         "stops it being handed the roster but does NOT remove\n"
                          "it, and --cluster-forget is what does." },
         { .primary = "--version",
           .arity = Arity::None,
@@ -1762,8 +1765,8 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
           "asks a seed to admit this machine and exits; a key would re-ask at every start, on a "
           "machine that is already a member" },
         { "--enroll-open",
-          "opens a window a stranger can be handed the cluster key through, and exits; a key would "
-          "re-open it at every start, which is a window nobody ever closes" },
+          "opens a window any machine can ask to join through, and exits; a key would re-open it at every "
+          "start, which is a window nobody ever closes" },
         { "--enroll-close", "closes the window and exits" },
         { "--enroll-list", "prints what is waiting and exits" },
         { "--enroll-approve", "admits one machine and exits; a key would re-admit it at every start" },
@@ -3135,8 +3138,8 @@ std::optional<std::string> NodeServiceRejection(NodeConfig const& cfg)
 std::span<NodeSecretFile const> NodeSecretFileTable() noexcept
 {
     static constexpr auto table = std::to_array<NodeSecretFile>({
-        // The PSK, and the worst of the four: it MACs discovery proofs AND lease
-        // grants, so a leak admits a node whose objects the whole fleet then caches.
+        // The PSK, and the worst of the four: it MACs lease grants AND a node's proof on
+        // the node port, so a leak spends the fleet's capacity and passes that proof.
         { .flag = "--cluster-key-file", .path = [](NodeConfig const& cfg) { return cfg.clusterKeyFile; } },
         // What this node REQUIRES of its own callers. A leak makes membership -- a
         // host list, not a credential -- the only gate left on the scheduler verbs.
@@ -3752,16 +3755,11 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
           .message = "--discovery needs --listen-raft: discovery finds peers for a CLUSTER, and without a "
                      "consensus port this node is not in one. It would broadcast, be answered, prove the key and "
                      "have nowhere to put the answer." },
-        { .refuses = [](NodeConfig const& c) { return !c.discoveryAddress.empty() && c.clusterKeyFile.empty(); },
-          .message = "--discovery needs --cluster-key-file: a beacon is unauthenticated by construction, so the "
-                     "key is the only thing separating a peer from anything else on the segment. With none, no "
-                     "peer can ever be admitted and this node would announce itself forever to no effect." },
         // Consensus needs the key (#1308), for reasons that moved at #178: the Raft peer
-        // wire proves each node's own identity key now, and what still reads the cluster
-        // key on a consensus node is the rest of the fleet's surfaces -- see the refusal's
-        // own comment. After the `--discovery` row, which is the more specific sentence for
-        // a node that also asked for discovery: first match wins, and this row would
-        // otherwise answer in its place.
+        // wire and discovery prove each node's own identity key now, and what still reads the
+        // cluster key on a consensus node is the rest of the fleet's surfaces -- see the
+        // refusal's own comment. `--discovery` needs no key of its own any more, so it has no
+        // row here (#178 PR 4).
         //
         // A STARTUP refusal and never a per-connection fallback. Asked of the PATH being
         // named, as the discovery row asks it, because a registration is judged by this

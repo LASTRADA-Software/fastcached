@@ -2,6 +2,7 @@
 #include "EnrollClient.hpp"
 #include "NodeConfig.hpp"
 #include "NodeCredential.hpp"
+#include "NodeKey.hpp"
 
 #include <FastCache/Consensus/FileRaftStorage.hpp>
 #include <FastCache/Consensus/RaftTypes.hpp>
@@ -96,7 +97,6 @@ TEST_CASE("A node whose state directory has run consensus is refused at enrol ti
 
     NodeConfig cfg;
     cfg.enrollFrom = "10.0.0.1:7000";
-    cfg.clusterKeyFile = scratch / "cluster.key";
     cfg.clusterDir = scratch.Path();
     cfg.raftListen = "7100";
     cfg.raftSelf = "198.51.100.4";
@@ -107,7 +107,7 @@ TEST_CASE("A node whose state directory has run consensus is refused at enrol ti
 
     // **Assert what DISTINGUISHES.** Every refusal this mode can produce is a
     // `std::unexpected<std::string>`, so *it was refused* is true under half a dozen
-    // unrelated faults -- a missing key file, an unreachable seed, no consensus
+    // unrelated faults -- no state directory, an unreachable seed, no consensus
     // identity. What only THIS refusal says is the remedy and the reason the cheaper
     // remedy is wrong.
     CHECK(refused.error().contains("already holds consensus state"));
@@ -128,8 +128,10 @@ TEST_CASE("A node whose state directory has run consensus is refused at enrol ti
     CHECK(refused.error().contains("identity"));
 
     // Nothing was written. The refusal must not leave a half-enrolled machine behind,
-    // and the key file is the observable half of that.
-    CHECK(!std::filesystem::exists(cfg.clusterKeyFile));
+    // and the identity key -- minted only after this check -- is the observable half of
+    // that: a key minted into a directory that is then wiped is a key an operator may
+    // already have compared.
+    CHECK(!std::filesystem::exists(scratch / std::string { NodeKeyFileName }));
 }
 
 TEST_CASE("The same state directory is fine at ordinary startup, which is why this is not a startup rule",
@@ -162,7 +164,6 @@ TEST_CASE("The same state directory is fine at ordinary startup, which is why th
     // the same directory, refused on one path and accepted on the other. Either half
     // alone reads as a predicate that happens to answer correctly once.
     cfg.enrollFrom = "10.0.0.1:7000";
-    cfg.clusterKeyFile = scratch / "cluster.key";
     SystemSecureRandom random;
     CHECK(!RunEnrollClient(cfg, ConfiguredCredential { cfg, nullptr }, random).has_value());
 }

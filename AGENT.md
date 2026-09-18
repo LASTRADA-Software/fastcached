@@ -325,14 +325,14 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
 - A lease token is a credential, and its MAC covers the granted **endpoint**. Fields
   length-prefixed, never joined.
 - The PSK signs through ONE seam and the domain is a required PARAMETER, never a string a caller
-  remembers: `Cluster/ClusterSigning.hpp`'s `SigningDomain` and its `SigningDomainTable`. Discovery,
-  the lease and the node proof each own rows, and every verifier goes through `VerifyFields`. The
-  Raft peer wire's rows LEFT at #178 and their labels are retired, never reused.
-- That change moved the proof's MAC *input* and **`DiscoveryWire::CurrentVersion` deliberately
-  did not move** — the datagram grammar is unchanged. "We changed the MAC, so bump the version"
-  is the tempting correction, and it is wrong. `RaftWire`'s did move for #1308 and for #178,
-  because a handshake, a tag trailer and signatures are GRAMMAR: the question is always which of
-  the two changed.
+  remembers: `Cluster/ClusterSigning.hpp`'s `SigningDomain` and its `SigningDomainTable`. The lease
+  and the node proof each own rows, and every verifier goes through `VerifyFields`. The Raft peer
+  wire's rows and discovery's LEFT at #178 and their labels are retired, never reused.
+- #402 moved the discovery proof's MAC *input* and **`DiscoveryWire::CurrentVersion` deliberately
+  did not move** — the datagram grammar was unchanged. "We changed the MAC, so bump the version"
+  is the tempting correction, and it is wrong. It DID move at #178 (1→2), and `RaftWire`'s for #1308
+  and #178, because a key and a signature where a MAC was, a handshake and a tag trailer are
+  GRAMMAR: the question is always which of the two changed.
 - The MAC is checked before any other claim is reported on, or a named refusal is an oracle. The
   expiry bounds how long a *captured* token is useful and is **not** a capacity bound.
 - A grant is spendable **once**, at the worker it names. The spend runs LAST, so a grant refused
@@ -482,20 +482,22 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   exactly that defect. And a reload may not WIDEN admission on a node with no `--cluster-key-file`,
   which built an unchecked lease validator at startup. Asked as a TRANSITION, or it refuses the
   keyless nodes running happily today.
-- An enrollment window is served by a node that runs consensus (`ServesEnrollment`), and since
-  #1308 consensus IMPLIES a named `--cluster-key-file` — so the key clause that predicate used to
-  carry was DELETED rather than kept. The APPROVAL still reads the key before `ClusterAdmit`, which
-  is the irreversible half: a key file readable at boot can break later, and no configuration
-  predicate sees that.
+- An enrollment window is served by a node that runs consensus (`ServesEnrollment`). **No secret
+  crosses it** (#178): the joiner sends its role and PUBLIC key, and the approved reply is the
+  roster, answered only once the leader's own roster records that key — so nothing is spendable,
+  nothing is re-armed, and no key file is read at approval or written by the joiner.
 - A node that runs no consensus refuses the enrollment family `NoCluster`, never
   `UnimplementedVerb`: a client reads the latter as *this seed's build is too old* and is sent to
   upgrade a node that is already current. Asserted as NOT `UnimplementedVerb`, since both refuse.
-- Rejecting an already-APPROVED joiner does NOT un-admit it. The reject still stops the key
-  hand-over, and `--cluster-forget` is what removes the member — said in the flag's own description
-  and in a Warn, with the silence on a PENDING reject as the control.
-- The grant is spendable once, so `--enroll-from` refuses its own preconditions BEFORE the exchange.
-  `StoreClusterKey`'s exclusive create stays as well (`"wbx"`, with no `exists()` in front of it):
-  `"wb"` TRUNCATES, and a stat that is stale or cannot answer destroys the key this machine holds.
+- Rejecting an already-APPROVED joiner does NOT un-admit it. The reject still stops the roster
+  hand-over; the remedy is the ROLE's column (`EnrollRoleRow::removalFlag`) — `--cluster-forget` for
+  a member, and for a worker principal NOTHING yet (#1555), which the Warn says rather than naming
+  a flag that removes nothing. The silence on a PENDING reject is the control.
+- **The key an operator compared is the key an approval admits.** A pending row keeps the FIRST key
+  its id asked with; a later poll under that id with another key is another machine — counted in
+  `claimsChanged`, answered `Pending`, never recorded — or a key is swapped between `--enroll-list`
+  and `--enroll-approve`. A test that the approve reply carries no private key scans the WHOLE
+  frame in every spelling, beside a POSITIVE control: a planted key found by the same scan.
 - `--node-status`'s `enrollment` field is ABSENT on a node with no window and `closed` on one whose
   window is shut — the distinction the two enrollment counters' zero cannot carry.
 - A compile is awaited onto a `ThreadPoolExecutor` sized to the slot cap, never served inline and
@@ -536,14 +538,18 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
 
 **[`.agent/rules/consensus-and-cluster.md`](.agent/rules/consensus-and-cluster.md)**
 — Raft, discovery, membership. Before `Consensus/`, `Cluster/`.
-- The pre-shared key never travels in a beacon. It appears only inside an HMAC over a nonce
-  *this* node chose, and the MAC covers the `(node, endpoint)` pair.
+- A discovery proof is a signature by the node's OWN identity key over a nonce *this* node chose,
+  and it covers the `(node, endpoint)` pair AND the key (#178). The signature is verified BEFORE
+  the roster is asked, and a forgery is reported by the address it came from, never by its claims.
 - A proof only ever answers a challenge this node issued, and the nonce is spent whatever
   the outcome.
 - **Nonces and minted node ids come from `ISecureRandom`, never a seeded engine**, and a failed
   draw is a REFUSAL, never a fallback (#1527). Its test is CROSS-PROCESS, because an engine
   seeded once per process repeats only across processes.
-- Discovery never changes membership: it reports who proved the key and where.
+- Discovery never changes membership, and since #178 it admits NOBODY: a proven key the roster does
+  not hold for that id is REPORTED (counted, named whole) and never desired; a revoked one is
+  reported as revoked. A KNOWN key may be desired — with no KEY opinion, since a desire outlives an
+  operator's re-key — and the authenticated set is re-asked of the roster at every publish.
 - **Every Raft peer connection proves each end's OWN identity key before a message is read**
   (#178) — Ed25519 signatures through `Consensus::IRaftPeerIdentity` over `IRaftPeerKeys`, never the
   pre-shared key, which proved "holds the key" and never WHICH holder. **Each signature covers the

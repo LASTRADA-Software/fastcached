@@ -56,8 +56,7 @@ Refuse() {
 CredentialIdentifiers='
 signingKey|what a lease grant is MACed with; SchedulerService and SignedLeaseValidator hold it
 _signingKey|the SchedulerService member holding the same
-presharedKey|the cluster PSK, which MACs discovery proofs
-clusterKey|the cluster key an enrolling node is handed and writes to disk; EnrollReading holds it
+clusterKey|the cluster key as a node reads it to prove itself on the node port; NodeProofClient holds it
 secretKey|an Ed25519 or X25519 secret key: what signs as a node, and what a key agreement is computed from (Core/Ed25519, Core/X25519, #178)
 _secretKey|the Ed25519KeyPair member holding the same, in the Monocypher layout: seed, then public key
 sharedSecret|a raw X25519 shared secret, the input keying material every session key is derived from (Core/X25519)
@@ -72,6 +71,12 @@ keyFileBytes|the contents of a node-key file, which carry that seed (NodeKey, #1
 # and a node's signing key and a session's derived keys are exactly that. Each name is held by the
 # Core crypto seam today and matched there, so a rename in `Core/Ed25519`, `Core/X25519` or
 # `Core/Hkdf` is a refusal here.
+# `presharedKey` was a row until #178 PR 4, when discovery stopped reading the cluster key and
+# `DiscoveryConfig` stopped holding it: a row that matches nothing is a refusal here (case 3),
+# so it went with its last holder rather than being kept as a comment. `clusterKey` lost its
+# enrolment holder in the same change -- enrollment no longer hands the key over -- and is kept
+# for the node-proof client, which still holds the key under that name.
+#
 # `clusterKey` WAS excluded, and the note said "nothing here is called that" -- true when
 # it was written and false now. It was excluded because a term matching nothing is a
 # REFUSAL here (that is case 3, and deliberately so), not because the name is dangerous:
@@ -306,7 +311,6 @@ RunSelfTest() {
     cat > "$tmp/clean/a.hpp" <<'EOF'
 SecureByteBuffer signingKey;
 SecureByteBuffer _signingKey;
-SecureByteBuffer presharedKey;
 SecureByteBuffer clusterKey;
 SecureByteBuffer secretKey;
 SecureByteBuffer _secretKey;
@@ -346,7 +350,6 @@ EOF
     cat > "$tmp/blind/a.hpp" <<'EOF'
 SecureByteBuffer signingKey;
 SecureByteBuffer _signingKey;
-SecureByteBuffer clusterKey;
 SecureByteBuffer secretKey;
 SecureByteBuffer _secretKey;
 SecureByteBuffer sharedSecret;
@@ -357,7 +360,7 @@ SecureByteBuffer identitySeed;
 SecureByteBuffer keyFileBytes;
 EOF
     verdict=$(bash "$0" --root "$tmp/blind" 2>&1)
-    if grep -q "identifier 'presharedKey' matches nothing" <<< "$verdict"; then
+    if grep -q "identifier 'clusterKey' matches nothing" <<< "$verdict"; then
         printf 'ok   case 3: a term that has stopped matching is a refusal, not a pass\n'
     else
         printf 'FAIL case 3: blind term not refused. Got: %s\n' "$verdict"; return 1
@@ -393,7 +396,6 @@ EOF
     cat > "$tmp/precise/a.hpp" <<'EOF'
 SecureByteBuffer signingKey;
 SecureByteBuffer _signingKey;
-SecureByteBuffer presharedKey;
 SecureByteBuffer clusterKey;
 SecureByteBuffer secretKey;
 SecureByteBuffer _secretKey;

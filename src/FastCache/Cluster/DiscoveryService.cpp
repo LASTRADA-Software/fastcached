@@ -4,6 +4,7 @@
 #include <FastCache/Core/Utf8.hpp>
 
 #include <algorithm>
+#include <format>
 #include <ranges>
 #include <utility>
 
@@ -15,12 +16,16 @@ DiscoveryService::DiscoveryService(IDatagramSocket& socket,
                                    ISecureRandom& random,
                                    PeerDirectory& directory,
                                    DiscoveryConfig config,
+                                   Consensus::IRaftPeerKeys const& keys,
+                                   IMetricsSink& metrics,
                                    ILogger& logger):
     _socket { socket },
     _clock { clock },
     _random { random },
     _directory { directory },
     _config { std::move(config) },
+    _keys { keys },
+    _metrics { metrics },
     _logger { logger }
 {
 }
@@ -137,16 +142,21 @@ DiscoveryEvent DiscoveryService::PumpOnce(std::chrono::milliseconds timeout)
             if (!challenge.has_value())
                 return DiscoveryEvent::Ignored;
 
-            // Answering a challenge for another cluster would prove possession
-            // of this key to a fleet that is not ours.
+            // Answering a challenge for another cluster would announce this node, signed, to a
+            // fleet that is not ours.
             if (challenge->clusterId != _config.clusterId)
                 return DiscoveryEvent::Ignored;
 
-            auto const tag =
-                DiscoveryWire::ExpectedProofTag(_config.presharedKey, *challenge, _config.nodeId, _config.raftEndpoint);
-            (void) _socket.Send(
-                DiscoveryWire::EncodeProof({ .nodeId = _config.nodeId, .raftEndpoint = _config.raftEndpoint, .tag = tag }),
-                received->from);
+            // Signed with this node's OWN key (#178), over a nonce somebody else chose -- so the
+            // signature is fresh, names this node's endpoint, and proves nothing to anybody but
+            // the node that asked.
+            auto proof = DiscoveryWire::Proof { .nodeId = _config.nodeId,
+                                                .raftEndpoint = _config.raftEndpoint,
+                                                .publicKey = _keys.OwnPublicKey(),
+                                                .signature = {} };
+            proof.signature =
+                _keys.SignAsSelf(DiscoveryWire::ProofMessage(*challenge, proof.nodeId, proof.raftEndpoint, proof.publicKey));
+            (void) _socket.Send(DiscoveryWire::EncodeProof(proof), received->from);
             return DiscoveryEvent::ChallengeAnswered;
         }
 
@@ -157,9 +167,9 @@ DiscoveryEvent DiscoveryService::PumpOnce(std::chrono::milliseconds timeout)
 
             // Refused before it is COMPARED, and the ordering is the whole of it:
             // the mismatch below names what the proof claimed, and a proof is
-            // unauthenticated until its tag checks out -- so anything on the
+            // unauthenticated until its signature checks out -- so anything on the
             // segment could otherwise put arbitrary bytes into this node's log
-            // without ever holding the key.
+            // without ever holding a key.
             //
             // It could never have matched anyway. The endpoint it would have to
             // equal is one `PeerDirectory::NoteBeacon` recorded, and that refuses
@@ -177,8 +187,8 @@ DiscoveryEvent DiscoveryService::PumpOnce(std::chrono::milliseconds timeout)
                 return DiscoveryEvent::ProofRejected;
 
             // The endpoint must be the one that was challenged. Both are inside
-            // the MAC, so a mismatch cannot produce a valid tag anyway -- this
-            // rejects it before doing the work, and says so.
+            // the signature, so a mismatch cannot verify anyway -- this rejects it
+            // before doing the work, and says so.
             if (pending->second.endpoint != proof->raftEndpoint)
             {
                 _logger.Logf(LogLevel::Warn,
@@ -189,39 +199,11 @@ DiscoveryEvent DiscoveryService::PumpOnce(std::chrono::milliseconds timeout)
                 return DiscoveryEvent::ProofRejected;
             }
 
-            // Through `VerifyProofTag` rather than by taking the expected tag and
-            // comparing it here. The comparison has to be constant-time -- anything
-            // on the segment can provoke another challenge and retry, so a compare
-            // that stops at the first difference leaks the tag a byte at a time --
-            // and that is a property of the seam, not something each verifier
-            // should be trusted to remember.
-            if (!DiscoveryWire::VerifyProofTag(
-                    _config.presharedKey, pending->second.challenge, proof->nodeId, proof->raftEndpoint, proof->tag))
-            {
-                // Warn rather than debug: on a healthy segment this does not
-                // happen, and when it does it means either a misconfigured key or
-                // somebody trying to join a fleet they do not belong to. Both are
-                // things an operator wants to see.
-                _logger.Logf(LogLevel::Warn,
-                             "discovery: {} at {} failed to prove the cluster key",
-                             proof->nodeId,
-                             proof->raftEndpoint);
-                _pending.erase(pending);
-                return DiscoveryEvent::ProofRejected;
-            }
-
-            // Spent, whatever happens next: a nonce that could answer twice is a
-            // nonce that can be replayed.
+            // Spent, whatever the verdict: a nonce that could answer twice is a nonce that can
+            // be replayed, and a proof that failed must not get a second try at it.
+            auto const challenge = pending->second.challenge;
             _pending.erase(pending);
-
-            if (!_directory.MarkAuthenticated(proof->nodeId, proof->raftEndpoint))
-                return DiscoveryEvent::ProofRejected;
-
-            _logger.Logf(LogLevel::Info,
-                         "discovery: {} at {} proved the cluster key and may be admitted",
-                         proof->nodeId,
-                         proof->raftEndpoint);
-            return DiscoveryEvent::PeerAuthenticated;
+            return JudgeProof(*proof, challenge, received->from);
         }
 
         case DiscoveryWire::Kind::Invalid:
@@ -229,6 +211,78 @@ DiscoveryEvent DiscoveryService::PumpOnce(std::chrono::milliseconds timeout)
     }
 
     return DiscoveryEvent::Ignored;
+}
+
+DiscoveryEvent DiscoveryService::JudgeProof(DiscoveryWire::Proof const& proof,
+                                            DiscoveryWire::Challenge const& challenge,
+                                            DatagramAddress const& from)
+{
+    // The SIGNATURE first, under the key the proof carries, before anything the proof claims
+    // is looked up or reported: until it verifies, the key is a claim too, and naming it would
+    // be naming bytes anybody could have sent.
+    if (!DiscoveryWire::VerifyProofSignature(challenge, proof))
+    {
+        _metrics.Increment(IMetricsSink::Counter::DiscoveryProofsRefusedForged);
+        _logger.Logf(LogLevel::Warn,
+                     "discovery: the proof from {} is not signed by the key it carries; ignoring it",
+                     FormatHostPort(from.host, from.port));
+        return DiscoveryEvent::ProofRejected;
+    }
+
+    // Then the roster: whose key is this? Only the key the roster holds for this id proves the
+    // id. A revoked key is recognised whatever id it claims, because the list is not narrowed to
+    // the claim -- the question is who SIGNED, which only the signature answers (`PeerKeys`).
+    auto const keys = _keys.KeysOf(proof.nodeId);
+    if (keys.live != std::optional { proof.publicKey })
+    {
+        // Two increments rather than one over a conditional, so each counter is written by a
+        // statement that names it -- which is what `counter-attribution` reads to find a writer.
+        auto const revoked = std::ranges::contains(keys.revoked, proof.publicKey);
+        if (revoked)
+            _metrics.Increment(IMetricsSink::Counter::DiscoveryProofsRefusedRevokedKey);
+        else
+            _metrics.Increment(IMetricsSink::Counter::DiscoveryProofsRefusedUnknownKey);
+        ReportUnacceptedKey(revoked, proof, from);
+        return revoked ? DiscoveryEvent::PeerRevokedKey : DiscoveryEvent::PeerUnknownKey;
+    }
+
+    if (!_directory.MarkAuthenticated(proof.nodeId, proof.raftEndpoint, proof.publicKey))
+        return DiscoveryEvent::ProofRejected;
+
+    _logger.Logf(
+        LogLevel::Info, "discovery: {} at {} proved the key the cluster holds for it", proof.nodeId, proof.raftEndpoint);
+    return DiscoveryEvent::PeerAuthenticated;
+}
+
+void DiscoveryService::ReportUnacceptedKey(bool revoked, DiscoveryWire::Proof const& proof, DatagramAddress const& from)
+{
+    ++_unacceptedSinceReport;
+    auto const now = _clock.Now();
+    if (now < _nextUnacceptedKeyReport)
+        return;
+    _nextUnacceptedKeyReport = now + UnacceptedKeyReportInterval;
+
+    // The key WHOLE, because it verified: only its holder could have signed this, so naming it
+    // is no oracle, and it is exactly what an operator types after `@` to admit the machine --
+    // or recognises as the one they removed. The two remedies are opposite, so each is said.
+    auto const key = FormatEd25519PublicKey(proof.publicKey);
+    auto const remedy = revoked ? std::string { "that machine was removed, and this key is never admitted again" }
+                                : std::format("enroll it, or admit it with --cluster-admit={}={}@{}, if it belongs",
+                                              proof.nodeId,
+                                              proof.raftEndpoint,
+                                              key);
+    _logger.Logf(LogLevel::Warn,
+                 "discovery: {} at {} (from {}) proved the key {}, which the cluster {}. Not desiring it: {}.{}",
+                 proof.nodeId,
+                 proof.raftEndpoint,
+                 FormatHostPort(from.host, from.port),
+                 key,
+                 revoked ? "has REVOKED" : "does not hold for that id",
+                 remedy,
+                 _unacceptedSinceReport > 1
+                     ? std::format(" ({} such proof(s) since the last report)", _unacceptedSinceReport)
+                     : std::string {});
+    _unacceptedSinceReport = 0;
 }
 
 void DiscoveryService::Maintain()

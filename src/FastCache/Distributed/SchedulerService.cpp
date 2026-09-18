@@ -758,6 +758,33 @@ SchedulerReply SchedulerService::ClusterAdmit(CallerContext const& caller,
     return reply;
 }
 
+SchedulerReply SchedulerService::AdmitPrincipal(CallerContext const& caller,
+                                                std::string_view principalId,
+                                                Ed25519PublicKey const& publicKey,
+                                                Cluster::PrincipalRole role)
+{
+    if (auto refusal = Gate(caller); refusal.has_value())
+        return std::move(*refusal);
+    if (_admin == nullptr)
+        return Refuse(Wire::ErrorCode::NoCluster);
+
+    // No value and no scheduler endpoint: a principal has no address anybody dials, which is
+    // the difference between it and a member (`ClusterPrincipal`).
+    return Offer(Cluster::Command { .kind = Cluster::CommandKind::AdmitPrincipal,
+                                    .key = std::string { principalId },
+                                    .value = {},
+                                    .schedulerEndpoint = {},
+                                    .publicKey = publicKey,
+                                    .role = role });
+}
+
+std::optional<Cluster::ClusterState> SchedulerService::AdministeredState() const
+{
+    if (_admin == nullptr)
+        return std::nullopt;
+    return _admin->ClusterState();
+}
+
 SchedulerReply SchedulerService::Refuse(Wire::ErrorCode code, std::string message) const
 {
     if (auto const counter = CounterFor(code); counter.has_value())

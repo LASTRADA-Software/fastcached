@@ -301,12 +301,9 @@ constexpr int ExitOk = 0;
 /// what was actually built, which only this translation unit knows and which no test
 /// links.
 ///
-/// **There was a third clause, a named `--cluster-key-file`, and #1308 folded it into
-/// the first.** A keyless consensus node used to be legal, and on one the window was
-/// openable and APPROVABLE while the hand-over had no key to hand over -- an approval
-/// that grew the quorum by a machine that never became anything. A consensus node
-/// without the key is now refused at startup, because no peer connection can form
-/// without it, so the clause could only ever read true where it was asked.
+/// **There was a third clause, a named `--cluster-key-file`, and it is gone for good**: an
+/// approval no longer hands over any key (#178), so a window has nothing a key file could be
+/// missing for.
 ///
 /// Named rather than spelled inline because `WorkerBody` is at the
 /// cognitive-complexity ceiling the build enforces, and because the two sites that
@@ -745,9 +742,9 @@ using Node::NodeReloader;
     auto const capacity =
         Node::NodeCapacityOf(cfg, *host, Node::CacheCapacityOf(cacheTier.get()), Node::IndexReserveBytesOf(cacheTier.get()));
 
-    // **The one reader of `--cluster-key-file` in this process**, declared here because three
-    // consumers now share it: an approved joiner's hand-over, the cluster-key PROOF this node
-    // VERIFIES, and the proof it PRESENTS on each heartbeat round (#1428).
+    // **The one reader of `--cluster-key-file` in this process**, declared here because two
+    // consumers share it: the cluster-key PROOF this node VERIFIES, and the proof it PRESENTS on
+    // each heartbeat round (#1428). An approved joiner is no longer handed it (#178).
     //
     // One instance rather than one per consumer. `ReadClusterKey` holds the minimum-length rule
     // and the trailing-newline trim, so every tier here authenticates against byte-for-byte the
@@ -847,17 +844,6 @@ using Node::NodeReloader;
     // No test reaches this: `main.cpp` is the translation unit none of them links, so
     // the guard here is CONSTRUCTION rather than a case -- a test built around a second
     // copy of this expression would assert something other than what ships.
-    //
-    // **A consensus node HOLDS the key, so there is no keyless window to refuse**
-    // (#1308). That used to be a third clause here, because a keyless consensus node was
-    // legal and its window was approvable while it had nothing to hand over. The startup
-    // table now refuses consensus without `--cluster-key-file`, and `ConsensusTier`
-    // refuses a key it cannot read, before this line runs.
-    //
-    // What remains is a key file that was readable at boot and is not at the
-    // hand-over -- the file can break long after startup -- and that is closed where it
-    // has to be, at the decision itself: the responder reads the key BEFORE it admits
-    // anybody.
     auto const servesEnrollment = ServesEnrollment(cfg, schedulerTier.get());
 
     // Where this node sits in its consensus configuration (#1449), for `NodeStatus`. A SLOT,
@@ -876,9 +862,6 @@ using Node::NodeReloader;
     // has no references to hold. A node missing either leaves the component null and the
     // whole family is refused at the door: a window that could never admit anybody
     // should not be openable, and one nothing serves should not be reported.
-    //
-    // The key source that a hand-over reads is declared above the worker tier, because the
-    // cluster-key PROOF reads the same one (#1428) and the tier borrows it.
     //
     // It reports itself as a condition only where it can be opened at all: `servesEnrollment`
     // above, so a node with no window reports that row NOT EVALUATED rather than a reassuring
@@ -989,7 +972,6 @@ using Node::NodeReloader;
         enrollmentResponder.emplace(enrollmentWindow,
                                     schedulerTier->ServiceForSurfaces(),
                                     membership.Oracle(),
-                                    clusterKeySource,
                                     metrics,
                                     logger,
                                     schedulerTier->Policy());
@@ -1005,7 +987,7 @@ using Node::NodeReloader;
     // consensus imply a key, and a pure worker may hold one too, because the key is what signs
     // lease grants. A proof presented to either has to be verifiable there.
     //
-    // It reads the same `enrollmentKey` source, which is the one reader of
+    // It reads the same `clusterKeySource`, which is the one reader of
     // `--cluster-key-file` in this binary. A second reader would eventually differ by a
     // trailing newline, which is an HMAC that verifies nowhere and no diagnostic anywhere.
     //
@@ -1130,7 +1112,7 @@ using Node::NodeReloader;
     // destroyed before it, because its observer pushes into the tier above: a
     // discovery loop outliving the thing it hands peers to is a dangling reference
     // that only fires while a node is shutting down.
-    auto discoveryOrRefusal = Node::StartDiscoveryOrExplain(cfg, consensusTier, logger);
+    auto discoveryOrRefusal = Node::StartDiscoveryOrExplain(cfg, consensusTier, metrics, logger);
     if (!discoveryOrRefusal.has_value())
     {
         // Fatal; why is `RowFor(NodeSurface::Discovery).bindFailureReason` (#352).

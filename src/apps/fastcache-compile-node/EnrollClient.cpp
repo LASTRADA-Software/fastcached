@@ -1,20 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "EnrollClient.hpp"
+#include "EnrollmentWindow.hpp"
 #include "NodeIdentity.hpp"
+#include "NodeKey.hpp"
 #include "NodeSurfaces.hpp"
 
 #include <FastCache/Async/Task.hpp>
+#include <FastCache/Cluster/Roster.hpp>
 #include <FastCache/Consensus/FileRaftStorage.hpp>
+#include <FastCache/Core/Base64.hpp>
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/HostPort.hpp>
-#include <FastCache/Platform/FileTrust.hpp>
 #include <FastCache/Protocol/LeaderRedirect.hpp>
 
 #include <algorithm>
 #include <array>
-#include <cerrno>
 #include <cstddef>
-#include <cstdio>
 #include <format>
 #include <iostream>
 #include <memory>
@@ -104,10 +105,9 @@ namespace
     /// person comparing two addresses on forty rows, and a ragged left edge makes the
     /// one comparison they are here to make harder.
     constexpr std::array DecisionLabels {
-        DecisionLabelRow { .decision = Wire::EnrollmentDecision::Pending, .label = "pending  " },
-        DecisionLabelRow { .decision = Wire::EnrollmentDecision::Approved, .label = "approved " },
-        DecisionLabelRow { .decision = Wire::EnrollmentDecision::Collected, .label = "collected" },
-        DecisionLabelRow { .decision = Wire::EnrollmentDecision::Rejected, .label = "rejected " },
+        DecisionLabelRow { .decision = Wire::EnrollmentDecision::Pending, .label = "pending " },
+        DecisionLabelRow { .decision = Wire::EnrollmentDecision::Approved, .label = "approved" },
+        DecisionLabelRow { .decision = Wire::EnrollmentDecision::Rejected, .label = "rejected" },
     };
 
     /// Whether every decision this build knows carries exactly one label.
@@ -115,7 +115,7 @@ namespace
     /// Derived from `KnownEnrollmentDecisions` rather than restated, so an enumerator
     /// ARRIVING is caught as well as one going away -- a restated list only ever notices
     /// the second, and the first is what leaves a row rendering as a fallback in the
-    /// listing somebody reads before handing over the fleet's key.
+    /// listing somebody reads before admitting a machine to the fleet.
     /// @return True when every known decision has one row.
     [[nodiscard]] consteval bool EveryDecisionIsLabelled() noexcept
     {
@@ -153,7 +153,7 @@ EnrollReading ReadEnrollReply(Cc::CacheOutcome const& outcome)
     if (outcome.kind == Cc::CacheOutcomeKind::Transport)
         return EnrollReading { .progress = EnrollProgress::Fatal,
                                .detail = std::string { Cc::DescribeTransportFailure(outcome.transportFailure) },
-                               .clusterKey = {} };
+                               .roster = {} };
 
     if (outcome.kind == Cc::CacheOutcomeKind::Rejected)
     {
@@ -162,7 +162,7 @@ EnrollReading ReadEnrollReply(Cc::CacheOutcome const& outcome)
         // empty one is replaced by the error table's default sentence, so "no leader
         // known" and "the leader is at h:p" arrive the same shape.
         if (auto const leader = Cc::RedirectTarget(outcome); leader.has_value())
-            return EnrollReading { .progress = EnrollProgress::Redirect, .detail = *leader, .clusterKey = {} };
+            return EnrollReading { .progress = EnrollProgress::Redirect, .detail = *leader, .roster = {} };
 
         switch (outcome.code)
         {
@@ -172,17 +172,17 @@ EnrollReading ReadEnrollReply(Cc::CacheOutcome const& outcome)
                 // is, so the joiner keeps polling and the operator is told why.
                 return EnrollReading { .progress = EnrollProgress::Closed,
                                        .detail = "the cluster has no leader right now",
-                                       .clusterKey = {} };
+                                       .roster = {} };
             case Wire::ErrorCode::EnrollmentClosed:
                 return EnrollReading { .progress = EnrollProgress::Closed,
                                        .detail = "the seed is not accepting enrollments; ask an operator to open a "
                                                  "window with --enroll-open",
-                                       .clusterKey = {} };
+                                       .roster = {} };
             case Wire::ErrorCode::EnrollmentFull:
                 return EnrollReading { .progress = EnrollProgress::Closed,
                                        .detail = "the seed's enrollment window is full; it holds as many requests as "
                                                  "it will record at once",
-                                       .clusterKey = {} };
+                                       .roster = {} };
             case Wire::ErrorCode::NoCluster:
                 // **The one an operator actually gets, and it is NOT a version
                 // problem.** The documented flow points `--enroll-from` at any member,
@@ -196,7 +196,7 @@ EnrollReading ReadEnrollReply(Cc::CacheOutcome const& outcome)
                                        .detail = "that node runs no consensus, so it belongs to no cluster and there "
                                                  "is nothing there to join. Point --enroll-from at a node that runs "
                                                  "consensus; --node-status names the components a node serves",
-                                       .clusterKey = {} };
+                                       .roster = {} };
             case Wire::ErrorCode::UnknownOpcode:
                 // The one refusal that says the SEED is the problem rather than this
                 // machine or this moment, and the one worth stopping on: a seed that
@@ -211,46 +211,45 @@ EnrollReading ReadEnrollReply(Cc::CacheOutcome const& outcome)
                 return EnrollReading { .progress = EnrollProgress::Fatal,
                                        .detail = "the seed does not implement enrollment; it is running a build older "
                                                  "than this one",
-                                       .clusterKey = {} };
+                                       .roster = {} };
             default:
                 break;
         }
-        return EnrollReading { .progress = EnrollProgress::Fatal, .detail = Cc::DescribeOutcome(outcome), .clusterKey = {} };
+        return EnrollReading { .progress = EnrollProgress::Fatal, .detail = Cc::DescribeOutcome(outcome), .roster = {} };
     }
 
     auto const reply = Wire::DecodeEnrollReply(outcome.value);
     if (!reply.has_value())
         return EnrollReading { .progress = EnrollProgress::Fatal,
                                .detail = "the seed answered enroll with a body this build cannot read",
-                               .clusterKey = {} };
+                               .roster = {} };
 
     switch (reply->outcome)
     {
         case Wire::EnrollOutcome::Pending:
+            // Two readings, one answer: nobody has decided yet, or an approval has not reached
+            // the leader's own roster -- which takes a moment and needs nothing from anybody.
             return EnrollReading { .progress = EnrollProgress::Waiting,
-                                   .detail = "recorded; waiting for an operator to approve it",
-                                   .clusterKey = {} };
+                                   .detail = "recorded; waiting to be admitted",
+                                   .roster = {} };
         case Wire::EnrollOutcome::Rejected:
             return EnrollReading { .progress = EnrollProgress::Refused,
                                    .detail = "an operator refused this machine",
-                                   .clusterKey = {} };
+                                   .roster = {} };
         case Wire::EnrollOutcome::Approved:
             break;
     }
 
-    // Asserted rather than assumed, and this is the assertion that matters: a server
-    // bug that leaked the key on `Pending` would be invisible from here, because an
-    // outcome byte is equally correct in the healthy and the broken build. The empty
-    // case is the mirror -- an `Approved` carrying nothing would have this node write
-    // a zero-length key file and fail much later, on a machine nobody is watching.
-    if (reply->clusterKey.empty())
+    // Asserted rather than assumed: an `Approved` carrying nothing would have this node
+    // report an admission it can check nothing about, and a roster is what it checks.
+    if (reply->roster.empty())
         return EnrollReading { .progress = EnrollProgress::Fatal,
-                               .detail = "the seed approved this machine and sent no key",
-                               .clusterKey = {} };
+                               .detail = "the seed approved this machine and sent no roster",
+                               .roster = {} };
 
     return EnrollReading { .progress = EnrollProgress::Admitted,
                            .detail = "approved",
-                           .clusterKey = SecureByteBuffer { reply->clusterKey.begin(), reply->clusterKey.end() } };
+                           .roster = std::vector<std::byte> { reply->roster.begin(), reply->roster.end() } };
 }
 
 std::string RenderEnrollmentReport(Wire::EnrollmentReport const& report)
@@ -272,32 +271,100 @@ std::string RenderEnrollmentReport(Wire::EnrollmentReport const& report)
         // **The mark, which is the whole reason both hosts are shown.** They disagree
         // for entirely ordinary reasons -- a DNS name, a NAT, a node dialling itself --
         // so this is never a refusal; it is the one line an operator's eye stops on
-        // before handing over a key, and at forty rows an unmarked mismatch is one
-        // nobody sees.
+        // before admitting a machine, and at forty rows an unmarked mismatch is one
+        // nobody sees. A worker states no endpoint, so there is nothing to compare.
         auto const claimedHost = HostOfEndpoint(entry.raftEndpoint);
-        auto const* const mismatch =
-            claimedHost != entry.peerId ? "  <-- claimed address does not match the host it came from" : "";
+        auto const* const mismatch = !entry.raftEndpoint.empty() && claimedHost != entry.peerId
+                                         ? "  <-- claimed address does not match the host it came from"
+                                         : "";
 
         // The SECOND mark, and it answers a question the first cannot: this row stopped
-        // tracking the machine when somebody decided about it, and something has polled
-        // since claiming otherwise. Ordinary when a machine moved after being decided
-        // about -- enrol it again -- and the signature of somebody else answering to a
-        // decided id, which is the reading that wants an eye on it. Shown, never acted
-        // on, for #242's reason.
+        // tracking the machine when somebody decided about it, or another KEY asked under
+        // its id, and something has polled since claiming otherwise. Ordinary when a machine
+        // moved after being decided about -- enrol it again -- and the signature of somebody
+        // else answering to this id, which is the reading that wants an eye on it. Shown,
+        // never acted on, for #242's reason.
         auto const drifted =
             entry.claimsChanged != 0
                 ? std::format("  <-- {} later poll(s) claimed something other than this", entry.claimsChanged)
                 : std::string {};
-        out += std::format("  {}  {}  claims {}  from {}  {}s ago  {} attempt(s){}{}\n",
+
+        // The KEY, whole, and on a line of its own: it is 43 characters an operator compares
+        // one by one against what the joiner printed, and an approval admits exactly this one.
+        auto const where =
+            entry.raftEndpoint.empty() ? std::string { "no endpoint" } : std::format("claims {}", entry.raftEndpoint);
+        out += std::format("  {}  {}  {}  {}  from {}  {}s ago  {} attempt(s){}{}\n",
                            DescribeEnrollmentDecision(entry.decision),
                            entry.nodeId,
-                           entry.raftEndpoint,
+                           EnrollRoleRowFor(entry.role).name,
+                           where,
                            entry.peerId,
                            entry.firstSeenSecondsAgo,
                            entry.attempts,
                            mismatch,
                            drifted);
+        out += std::format("      key     {}\n", FormatEd25519PublicKey(entry.publicKey));
+        if (entry.rosterFingerprint.has_value())
+            out += std::format("      roster  {}  (handed to it; compare with what it printed)\n",
+                               Cluster::RenderRosterFingerprint(*entry.rosterFingerprint));
     }
+    return out;
+}
+
+std::expected<std::string, std::string> DescribeAdmission(JoinerIdentity const& self,
+                                                          std::span<std::byte const> roster,
+                                                          bool keyFileNamed)
+{
+    auto const decoded = Cluster::DecodeRoster(roster);
+    if (!decoded.has_value())
+        return std::unexpected { std::format("the seed answered with a roster this build cannot read: {}",
+                                             decoded.error().context) };
+
+    auto const& row = EnrollRoleRowFor(self.role);
+    if (!RosterRecordsJoiner(*decoded, self.nodeId, self.publicKey, self.role))
+        return std::unexpected { std::format(
+            "the seed said {} was admitted, and the roster it sent does not record {} as a {} under this machine's key "
+            "{}. Either an operator approved a different key for this id, or something between this machine and the "
+            "seed rewrote the reply; nothing it names can be trusted. Compare --enroll-list on the seed with this "
+            "key, and ask again",
+            self.nodeId,
+            self.nodeId,
+            row.name,
+            FormatEd25519PublicKey(self.publicKey)) };
+
+    auto out = std::format("admitted to the cluster as {}, a {}.\n"
+                           "Roster fingerprint: {}\n"
+                           "Compare it with the fingerprint --enroll-list shows for {} on the seed; if they differ, "
+                           "something between the two rewrote the roster and this machine must not be started.\n",
+                           self.nodeId,
+                           row.name,
+                           Cluster::RenderRosterFingerprint(Cluster::DigestOfRoster(roster)),
+                           self.nodeId);
+
+    if (row.statesEndpoint)
+    {
+        // Every member's token, this node's own included: a joiner verifies each peer's proof
+        // against the key its command line typed until the replicated state says otherwise, so
+        // a member left off this list is one whose connection it would refuse.
+        out += "Start this node with --raft-join and the same state directory, and with these peers:\n";
+        for (auto const& member: decoded->members)
+            out += std::format("  --raft-peer={}\n",
+                               Cluster::FormatMemberSpec(Cluster::ClusterMember {
+                                   .id = member.id,
+                                   .raftEndpoint = member.raftEndpoint,
+                                   .schedulerEndpoint = {},
+                                   .schedulerEndpointHistory = Cluster::SchedulerEndpointHistory::NeverAnnounced,
+                                   .seat = member.seat,
+                                   .publicKey = member.publicKey }));
+    }
+    else
+        out += "Start this node with the same state directory; a worker principal joins no consensus.\n";
+
+    // Said now rather than met at the next start: the pre-shared key still signs leases and
+    // proves a caller on the node port, and enrollment no longer hands it over (#178).
+    if (!keyFileNamed)
+        out += "It also needs this cluster's --cluster-key-file, which enrollment no longer hands over: place it the "
+               "way it is placed on every other member.\n";
     return out;
 }
 
@@ -401,98 +468,6 @@ std::expected<std::pair<std::string, std::string>, std::string> EnrollClaim(Node
     return std::pair { self->id, self->raftEndpoint };
 }
 
-std::expected<void, std::string> StoreClusterKey(std::filesystem::path const& path, SecureByteBuffer const& key)
-{
-    if (auto const parent = path.parent_path(); !parent.empty())
-    {
-        auto error = std::error_code {};
-        std::filesystem::create_directories(parent, error);
-        if (error)
-            return std::unexpected { std::format("cannot create {}: {}", parent.string(), error.message()) };
-    }
-
-    {
-        // **The refusal to overwrite IS this open, and there is no pre-flight
-        // `exists()` above it.** `"wbx"` is C11 exclusive create -- `O_EXCL` -- so the
-        // file is created or the open FAILS, in one step that no second process can
-        // interleave with. Asking `exists()` first and then opening `"wb"` is the
-        // available spelling and is wrong twice over: `"wb"` TRUNCATES, so both ways
-        // of the pre-check being wrong destroy the key this machine already holds.
-        // It is wrong when the answer is stale -- anything creating the file between
-        // the two calls is overwritten -- and, the half that needs no race at all,
-        // when `exists()` cannot answer: its `error_code` overload reports a failed
-        // stat by returning FALSE and setting the code, so a file that is there but
-        // could not be stat'd (a directory this process may not traverse, a
-        // filesystem error) read as absent and was truncated. That code was
-        // discarded, so the guard failed OPEN silently.
-        //
-        // A guard folded into the operation is self-enforcing; one called alongside
-        // it needs somebody to remember the call and to read its error.
-        //
-        // If a platform's libc ignored `x`, this would silently go back to
-        // truncating -- so the property is TESTED rather than assumed, and the test
-        // is the only thing that can catch it: `A key file that already exists is
-        // never written over` in `EnrollClient_test.cpp` reaches this open with
-        // nothing in front of it, so a libc that ignores `x` turns that case RED on
-        // the platform that ignores it. That is what answers macOS, rather than a
-        // claim about its `fopen`. Measured here on the MSVC CRT: a fresh path opens,
-        // an existing one returns `EEXIST` and is NOT truncated, and plain `"wb"` on
-        // the same path truncates it.
-        //
-        // A `unique_ptr` over the handle for the reason `ReadClusterKey`'s has one:
-        // there are failure paths below and a bare `fclose` at each is the one that
-        // eventually gets forgotten.
-        errno = 0;
-        auto* const opened = std::fopen(path.string().c_str(), "wbx");
-        auto const openErrno = errno;
-        auto file = std::unique_ptr<std::FILE, int (*)(std::FILE*)> { opened, &std::fclose };
-        if (file == nullptr)
-        {
-            // `EEXIST` is the ordinary answer and the one an operator acts on, so it
-            // keeps its own sentence; everything else names what the C library said,
-            // because "cannot create" alone sends somebody looking for a key file
-            // that is not the problem.
-            if (openErrno == EEXIST)
-                return std::unexpected { std::format(
-                    "{} already exists; this machine already holds a cluster key. Remove it "
-                    "deliberately if it is to join a different cluster",
-                    path.string()) };
-            return std::unexpected { std::format(
-                "cannot create {}: {}", path.string(), std::error_code { openErrno, std::generic_category() }.message()) };
-        }
-        if (!key.empty() && std::fwrite(key.data(), 1, key.size(), file.get()) != key.size())
-            return std::unexpected { std::format("cannot write {} in full", path.string()) };
-    }
-
-    // The FILE's own list, protected against the directory's. On Windows a
-    // machine-wide directory grants read to `BUILTIN\Users` inheritably, so a key
-    // written without this is one every standard account can read -- which is #741
-    // arriving through a new door, on the one file whose exposure admits a machine to
-    // the fleet.
-    //
-    // Refused rather than warned about: a key this process just placed and cannot
-    // protect is a key an operator would have to notice a log line to learn about.
-    // The property is asked BACK rather than the call's own success being trusted,
-    // which is what `SecureSecretFileForServices` returns.
-    //
-    // **The remedy names a RE-APPROVAL and not "enrol again", because the key is
-    // spendable once.** This runs after the server has already marked the id collected,
-    // so running `--enroll-from` a second time is refused
-    // (`enrollment-already-collected`) and the operator would be following this
-    // sentence into a dead end. A guard's remedy text is part of the guard and is the
-    // only part most people read; a confident wrong one is worse than none.
-    if (!SecureSecretFileForServices(path))
-        return std::unexpected { std::format("{} was written and could not be made unreadable to other accounts on "
-                                             "this machine. It holds this cluster's key: remove it and check who may "
-                                             "write to {}. This node has already collected its key, so enrolling "
-                                             "again is refused -- ask an operator to run --enroll-approve for this "
-                                             "id again, which re-arms exactly one more collection",
-                                             path.string(),
-                                             path.parent_path().string()) };
-
-    return {};
-}
-
 std::expected<std::string, std::string> RunEnrollClient(NodeConfig const& cfg,
                                                         ICredentialSource const& credential,
                                                         ISecureRandom& random,
@@ -531,39 +506,13 @@ std::expected<std::string, std::string> RunEnrollClient(NodeConfig const& cfg,
             "machine. Nothing has been changed on this machine",
             cfg.enrollFrom) };
 
-    if (cfg.clusterKeyFile.empty())
+    // A worker enrolls under a key too, and a key lives in a state directory: one that runs
+    // consensus always has one, and any other node has one only when it names `--cluster-dir`.
+    // Refused before anything is written, so the fix is a flag and nothing needs undoing.
+    if (!HoldsNodeKey(cfg))
         return std::unexpected { std::string {
-            "--enroll-from needs --cluster-key-file: it names where the key this node is given gets written, and "
-            "nothing else can be inferred from" } };
-
-    // **A key already sitting there is refused BEFORE the exchange, because the grant is
-    // spendable once.**
-    //
-    // `StoreClusterKey` refuses this too, and that refusal is the authoritative one --
-    // but it runs after the seed has already taken `Approved -> Collected`, so a machine
-    // with a pre-placed key file would dial, be approved, BURN the one collection its id
-    // has, and only then be told locally that it had nowhere to put the key. Recovering
-    // from that needs an operator to run `--enroll-approve` again for an id that looks
-    // already handled. Asking here costs a `stat` and saves a machine the round trip and
-    // the operator the re-approval.
-    //
-    // **Both checks stay, and each closes a window the other cannot.** This one is
-    // ADVISORY: it fails fast on the ordinary case and is allowed to be wrong, because
-    // anything can create that file during the ten minutes this mode then spends waiting
-    // for a person. The one in `StoreClusterKey` is the exclusive CREATE itself, which is
-    // what makes the guarantee atomic. Deleting this one costs a burned grant; deleting
-    // that one costs the key the machine is holding, so they are not alternatives and the
-    // redundancy is the point rather than an oversight.
-    //
-    // A failed `stat` deliberately PROCEEDS rather than refusing. "Cannot tell" is not
-    // "already there", refusing on it would block a legitimate enrolment on a transient
-    // filesystem error, and it is safe to be wrong in this direction precisely because
-    // the create below cannot truncate.
-    if (auto error = std::error_code {}; std::filesystem::exists(cfg.clusterKeyFile, error) && !error)
-        return std::unexpected { std::format(
-            "{} already exists; this machine already holds a cluster key. Remove it deliberately if it is to join a "
-            "different cluster. Nothing has been asked of the seed, so no enrollment request was spent",
-            cfg.clusterKeyFile.string()) };
+            "--enroll-from admits this machine under its identity key, and a node that runs no consensus keeps that "
+            "key only in --cluster-dir. Name one. Nothing has been changed on this machine" } };
 
     // **The one-way mistake, caught before anything is asked of anybody (#1299).**
     //
@@ -602,10 +551,44 @@ std::expected<std::string, std::string> RunEnrollClient(NodeConfig const& cfg,
     auto resolved = cfg;
     ApplyNodeIdentity(resolved, *identity);
 
-    auto claim = EnrollClaim(resolved);
-    if (!claim.has_value())
-        return std::unexpected { std::move(claim).error() };
-    auto const& [nodeId, raftEndpoint] = *claim;
+    // The KEY is minted beside the id, into the same directory, before anything is asked: it
+    // is what the seed records and what every later proof is checked against, so a machine that
+    // asked under one key and started with another would be a stranger to its own cluster.
+    auto key = ResolveNodeKeyFor(resolved, random);
+    if (!key.has_value())
+        return std::unexpected { std::move(key).error().message };
+    if (!key->has_value())
+        // Unreachable: `HoldsNodeKey` was asked above of the same configuration, and applying
+        // the identity changes no field it reads. Answered rather than asserted.
+        return std::unexpected { std::string { "this node holds no identity key to enrol under" } };
+
+    // A member when it runs consensus, a worker principal when it runs none (#178): the role
+    // follows from what the node IS, so an operator cannot ask for one this machine will not be.
+    auto const role = RunsConsensus(resolved) ? Wire::EnrollRole::Member : Wire::EnrollRole::Worker;
+    auto self = JoinerIdentity {
+        .nodeId = resolved.nodeId, .raftEndpoint = {}, .role = role, .publicKey = (*key)->pair.PublicKey()
+    };
+    if (role == Wire::EnrollRole::Member)
+    {
+        auto claim = EnrollClaim(resolved);
+        if (!claim.has_value())
+            return std::unexpected { std::move(claim).error() };
+        self.nodeId = claim->first;
+        self.raftEndpoint = claim->second;
+    }
+    auto const& nodeId = self.nodeId;
+
+    // The key, whole, BEFORE the first ask: it is what the operator compares against the row
+    // `--enroll-list` shows, and the comparison is the whole strength of an approval now that
+    // no secret is exchanged (#178).
+    std::cerr << std::format("fastcache-compile-node: asking {} to admit {} as a {} under the key\n"
+                             "    {}\n"
+                             "  Compare it with the key --enroll-list shows for {} before approving it.\n",
+                             cfg.enrollFrom,
+                             nodeId,
+                             EnrollRoleRowFor(role).name,
+                             FormatEd25519PublicKey(self.publicKey),
+                             nodeId);
 
     auto notice =
         Cc::CredentialNotice { [](std::string_view text) { std::cerr << "fastcache-compile-node: " << text << '\n'; } };
@@ -628,24 +611,17 @@ std::expected<std::string, std::string> RunEnrollClient(NodeConfig const& cfg,
         if (client == nullptr)
             return std::unexpected { std::format("cannot reach the seed at {}", seed) };
 
-        auto reading = ReadEnrollReply(SyncRun(
-            Cc::ExchangeFramed(client.get(),
-                               &notice,
-                               Wire::EncodeEnroll(Wire::EnrollRequest { .nodeId = nodeId, .raftEndpoint = raftEndpoint }),
-                               credential.Current())));
+        auto reading = ReadEnrollReply(SyncRun(Cc::ExchangeFramed(
+            client.get(),
+            &notice,
+            Wire::EncodeEnroll(Wire::EnrollRequest {
+                .nodeId = self.nodeId, .raftEndpoint = self.raftEndpoint, .role = self.role, .publicKey = self.publicKey }),
+            credential.Current())));
 
         switch (reading.progress)
         {
-            case EnrollProgress::Admitted: {
-                if (auto stored = StoreClusterKey(cfg.clusterKeyFile, reading.clusterKey); !stored.has_value())
-                    return std::unexpected { std::move(stored).error() };
-                return std::format("admitted to the cluster as {}.\n"
-                                   "The cluster key is now at {}.\n"
-                                   "Start this node with --raft-join, and with the same --cluster-dir and "
-                                   "--cluster-key-file it was enrolled with.\n",
-                                   nodeId,
-                                   cfg.clusterKeyFile.string());
-            }
+            case EnrollProgress::Admitted:
+                return DescribeAdmission(self, reading.roster, !cfg.clusterKeyFile.empty());
             case EnrollProgress::Refused:
                 return std::unexpected { std::format("{} refused this machine ({})", seed, reading.detail) };
             case EnrollProgress::Fatal:

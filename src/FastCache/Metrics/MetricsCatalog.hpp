@@ -814,30 +814,34 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
       .help = "Enrollment windows opened on this node. The only durable audit trail there is: the "
               "window lives in memory, a restart closes it, its repeating warning reaches only "
               "whoever reads this node's log, and the open state is a snapshot field that says "
-              "nothing about how often it has been open. Any rise is a minute in which this "
-              "machine would have handed the cluster key to a stranger it approved. A tally and "
-              "not a gauge, which is what keeps it from being a second spelling of the snapshot.",
+              "nothing about how often it has been open. Any rise is a minute in which anybody who "
+              "could reach this machine could ask to be admitted to the fleet. A tally and not a "
+              "gauge, which is what keeps it from being a second spelling of the snapshot.",
       .type = MetricType::Counter },
-    { .counter = IMetricsSink::Counter::EnrollmentKeysHandedOver,
-      .prometheusName = "fastcache_enrollment_keys_handed_over_total",
-      .help = "Cluster keys handed to an approved joiner -- the event the feature exists to "
-              "perform and the one worth alerting on. Each rise is the fleet's pre-shared key "
-              "crossing the network in cleartext to one machine a person approved by name. During "
-              "a rollout it rises once per machine and stops; on a settled fleet it should never "
-              "rise again. Read beside fastcache_enrollment_windows_opened_total: hand-overs "
-              "without an open is impossible and is a bug report, while opens without hand-overs "
-              "is the ordinary shape of a window somebody opened and closed again.",
+    { .counter = IMetricsSink::Counter::EnrollmentRostersServed,
+      .prometheusName = "fastcache_enrollment_rosters_served_total",
+      .help = "Rosters handed to an admitted joiner: a machine an operator approved by name, whose "
+              "admission the leader's roster now records, told who else is in the cluster. No secret "
+              "crosses with it -- the roster is every member's public key. During a rollout it rises "
+              "about once per machine and stops. Read beside "
+              "fastcache_enrollment_windows_opened_total: rosters served without an open is impossible "
+              "and is a bug report.",
       .type = MetricType::Counter },
-    { .counter = IMetricsSink::Counter::EnrollmentRequestsRefusedAlreadyCollected,
-      .prometheusName = "fastcache_enrollment_requests_refused_already_collected_total",
-      .help = "Enroll requests naming an id whose cluster key had already been collected. Refused "
-              "with no key bytes served: the grant is spendable once. A healthy enrolment produces "
-              "none of these, because a joiner that collects the key writes it and exits -- so this "
-              "is not a second spelling of "
-              "fastcache_enrollment_keys_handed_over_total, which says the key left, where this says "
-              "somebody asked for it after it had left. Two causes and the rate separates them: one "
-              "is a joiner whose reply was lost, a run of them is somebody answering to an id an "
-              "operator approved. Both are fixed by approving that machine again.",
+    { .counter = IMetricsSink::Counter::DiscoveryProofsRefusedUnknownKey,
+      .prometheusName = "fastcache_discovery_proofs_refused_unknown_key_total",
+      .help = "Discovery proofs that verified under a key this node's roster does not record for "
+              "the id they claimed. Reported by name, key and address in the log, and never desired "
+              "onto the cluster: a machine to enroll, or one that was wiped and minted a new key.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::DiscoveryProofsRefusedRevokedKey,
+      .prometheusName = "fastcache_discovery_proofs_refused_revoked_key_total",
+      .help = "Discovery proofs that verified under a key the roster has revoked: a machine that "
+              "was removed from the cluster and is still announcing itself on the segment.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::DiscoveryProofsRefusedForged,
+      .prometheusName = "fastcache_discovery_proofs_refused_forged_total",
+      .help = "Discovery proofs whose signature did not verify under the key they carried: whoever "
+              "sent them does not hold that key. A healthy segment produces none.",
       .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::LiveSubscriptionsOpened,
       .prometheusName = "fastcache_live_subscriptions_opened_total",

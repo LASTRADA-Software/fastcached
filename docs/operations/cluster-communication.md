@@ -148,15 +148,15 @@ compressing it.
     When `--cluster-key-file` is set, the token is not a serial number. It is
     base64 text carrying the granted worker's endpoint, the toolchain fingerprint,
     the object key and an absolute expiry, plus an HMAC-SHA256 tag over all of them
-    under the cluster's pre-shared key — the same key discovery proves membership
-    with, under a domain label of its own so one construction's tag can never pass
-    for the other's.
+    under the cluster's pre-shared key — the same key a caller proves on the node
+    port with, under a domain label of its own so one construction's tag can never
+    pass for the other's.
 
     **The endpoint is inside the MAC, and that is the whole reason the token has a
     shape at all.** A signature over "somebody may compile" is a signature that lets
     a token captured on the way to one machine be replayed against every other
     machine in the fleet. This is the same rule LAN discovery follows, where the
-    proof covers the `(node, endpoint)` pair.
+    signature covers the `(node, endpoint)` pair.
 
     The expiry carries **five minutes of slack**, because not every machine in a
     fleet is NTP-managed and an unsynchronised clock is minutes out, not seconds.
@@ -517,8 +517,8 @@ message is read**, each with its own identity key, so every member's `--raft-pee
 names every other member's key. That is the one leg of this page whose every byte is
 authenticated; what it checks and how a failure shows is under
 [Raft peer authentication](#raft-peer-authentication). Every member still needs
-`--cluster-key-file` too, for the leases and enrollment, and a node given `--listen-raft`
-without one refuses to start, naming the flag.
+`--cluster-key-file` too, for the leases and the node port, and a node given
+`--listen-raft` without one refuses to start, naming the flag.
 
 That cadence is the reason the consensus port wants a network that is not
 congested. Nothing breaks if it is — an election settles again — but leadership
@@ -533,10 +533,13 @@ the segment, and only one socket sharing a port receives a unicast. That port is
 kernel-chosen unless `--discovery-reply-port` pins it, which is what a site with a
 host firewall scoped to the beacon port alone has to open.
 
-Discovery only ever **reports** who proved the shared key. It changes no
-membership: the leader still proposes, and admission is still a consensus
-decision. See [Cluster discovery](../getting-started/cluster-discovery.md) for the
-exchange and the key.
+Discovery only ever **reports** which members proved the key the cluster holds for
+them, each with its own identity key
+([#178](https://github.com/LASTRADA-Software/fastcached/issues/178)). It admits
+nobody: a machine whose key the cluster does not hold is counted and logged, never
+desired, and admission is an operator's act — an enrollment or `--cluster-admit
+...@<key>`. See [Cluster discovery](../getting-started/cluster-discovery.md) for the
+exchange.
 
 ## Who a node admits
 
@@ -743,9 +746,10 @@ notes:
     command has to be one the node would actually accept. Six rules apply to the
     flags above and each refuses a configuration that would start and silently not
     work: `--serve-scheduler` needs a member set, `--listen-raft` needs a `--raft-peer`
-    **and** a `--cluster-key-file`, `--discovery` needs a `--cluster-key-file`,
-    membership needs an `--advertise` peers can dial, and a worker needs a
-    `--scheduler`. An earlier version of this transcript omitted the five that applied
+    **and** a `--cluster-key-file`, membership needs an `--advertise` peers can dial,
+    and a worker needs a `--scheduler`. (`--discovery` had a key rule of its own until
+    [#178](https://github.com/LASTRADA-Software/fastcached/issues/178) moved its proof
+    to each node's identity key.) An earlier version of this transcript omitted the five that applied
     then, and the binary refused it with exit 2 — the printed table was right, the
     invocation was not
     ([#807](https://github.com/LASTRADA-Software/fastcached/issues/807)).
@@ -820,9 +824,9 @@ open.
 | A lease is granted, then the compile runs locally anyway | client → node | The worker refused the client `not-a-member`. Give that worker `--fleet-member` or `--fleet-open`: membership gates its compile port, not only a scheduler's. The scheduler's counters stay correct and flat — the lease *was* granted — so look at the **worker**: its ready line names who it admits, and `fastcache_worker_jobs_refused_not_a_member_total` counts each turned-away client ([#235](https://github.com/LASTRADA-Software/fastcached/issues/235)) |
 | `no-worker`, though the toolchain looks identical | client → scheduler | Fingerprints must match byte for byte. Compare the node's `serving …` startup lines against the client's |
 | `/fleet` answers `503` | operator → dashboard | You are asking a follower. The reply names the leader |
-| Peers are seen but never admitted | node → segment | The reply port is being dropped while the beacon port passes. Pin `--discovery-reply-port` and open it |
+| Peers are seen but never authenticated | node → segment | The reply port is being dropped while the beacon port passes. Pin `--discovery-reply-port` and open it. If `fastcache_discovery_proofs_refused_unknown_key_total` climbs instead, the handshake completes and the key is one the cluster does not hold: discovery admits nobody, so enrol the machine or `--cluster-admit` it under the key the warning names |
 | The cluster elects, then re-elects, repeatedly | node → node | Consensus traffic is not getting through promptly, or a member is unreachable. The role-change log lines carry the term |
-| A consensus member never joins, and the others' `fastcache_raft_peer_connections_refused_proof_total` climbs | node → node | Its `--cluster-key-file` is not the cluster's. Its own `fastcache_raft_peer_dials_ended_by_acceptor_total` climbs for the same connections. Copy the key file, or enrol the machine with `--enroll-from` |
+| A consensus member never joins, and the others' `fastcache_raft_peer_connections_refused_proof_total` climbs | node → node | The key it proves is not the one the cluster records for it. Its own `fastcache_raft_peer_dials_ended_by_acceptor_total` climbs for the same connections. Compare its `--print-identity` with the cluster's record, and admit it under the key it holds -- `--enroll-from`, or `--cluster-admit ...@<key>` |
 | `fastcache_raft_peer_dials_refused_wrong_target_total` climbs | node → node | An address this node has for one member now answers as another: a node moved, or two swapped addresses. The log line names both ids; the other end counts `..._connections_refused_wrong_target_total` |
 | `..._refused_own_id_total` climbs on either end | node → node | Two machines answer to one id — a copied `--cluster-dir` or a duplicated `--node-id`. The address in the accepting node's log is the second machine |
 | `fastcache_raft_peer_dials_refused_timeout_total` climbs after an upgrade | node → node | The peer runs a build from before the handshake, which never sends a challenge. Consensus members upgrade together; see [Raft peer authentication](#raft-peer-authentication) |
@@ -917,8 +921,9 @@ raft-peer n1=10.0.0.1:6680@11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo
 leads there: a node that runs consensus always has a state directory, and mints its key into
 it on its first start. It is decided once, at startup, and never per connection: a node that
 quietly ran consensus unsigned would look healthy from both ends while trusting anybody.
-`--cluster-key-file` is still required on a consensus node, for the leases, the node port
-and enrollment, which still use it — but it no longer proves anything on this port.
+`--cluster-key-file` is still required on a consensus node, for the leases and the node
+port, which still use it — but it no longer proves anything on this port, on the LAN or at
+enrollment.
 
 **Upgrading.** The consensus wire moved to version 4 with identity keys (it was 2 with the
 first handshake, which proved the cluster key, and 3 with learners). A version 4 node and an
@@ -1018,6 +1023,6 @@ and
 - [fastcache-compile-node](../tools/fastcache-compile-node.md) — every flag, the
   cache tier, the cluster, and the fleet dashboard.
 - [Cluster discovery](../getting-started/cluster-discovery.md) — the beacon
-  exchange and the pre-shared key.
+  exchange and the identity key it proves.
 - [Compile cache protocol](../protocols/compile-cache.md) — the wire format and
   every verb.

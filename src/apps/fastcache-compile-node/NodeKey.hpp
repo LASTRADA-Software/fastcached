@@ -149,8 +149,8 @@ struct NodeKey
 ///
 /// **Absent is asked of the OPEN, never of `exists()`**: a stat that cannot answer read as
 /// "absent" would mint over a key this machine holds. And the mint is an EXCLUSIVE create
-/// with nothing in front of it, `StoreClusterKey`'s idiom for the same reason: a file that
-/// appeared a moment ago is refused, never truncated.
+/// with nothing in front of it, for the same reason: a file that appeared a moment ago is
+/// refused, never truncated.
 ///
 /// The secret is drawn from @p random before anything is created, so a draw this host cannot
 /// make leaves no directory and no file behind. On POSIX the file is created mode 0600 in the

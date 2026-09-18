@@ -691,6 +691,33 @@ class SchedulerService
                                               std::optional<std::string_view> publicKey,
                                               std::optional<Cluster::MemberSeat> seat);
 
+    /// Admit a PRINCIPAL: a machine the cluster knows by its key and never counts (#178).
+    ///
+    /// The verb an approved `Worker` enrollment reaches, beside `ClusterAdmit` for a
+    /// `Member` one, and gated exactly as it is -- leadership, membership and the credential
+    /// -- because what it changes is replicated state. It takes the key as a KEY rather than
+    /// as text: its one caller read it off the wire as 32 bytes, and a round trip through a
+    /// spelling would be a second parser to be wrong in. A key the cluster has revoked, or
+    /// holds under another id, is `Cluster::ValidateAgainst`'s refusal, in `Offer`.
+    /// @param caller Who is asking.
+    /// @param principalId The principal's identity.
+    /// @param publicKey The key it proves that identity with.
+    /// @param role What it is admitted to do.
+    /// @return `Ok` once the entry is appended, or a refusal.
+    [[nodiscard]] SchedulerReply AdmitPrincipal(CallerContext const& caller,
+                                                std::string_view principalId,
+                                                Ed25519PublicKey const& publicKey,
+                                                Cluster::PrincipalRole role);
+
+    /// The replicated state this node administers, or nothing on a node with no cluster.
+    ///
+    /// UNGATED, and that is the caller's to answer for: its one caller is the enrollment
+    /// surface, which hands the ROSTER part of it to a joiner an operator approved, and has
+    /// already asked the leadership question itself. Every operator verb goes through
+    /// `ClusterStatus`, which is gated.
+    /// @return The state as this node has applied it, or nullopt.
+    [[nodiscard]] std::optional<Cluster::ClusterState> AdministeredState() const;
+
     /// Where the leader answers, when one is known.
     ///
     /// The scheduler endpoint rather than the consensus one, and that distinction

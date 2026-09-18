@@ -5,7 +5,7 @@
 // sort inside a group cannot demote it. A translation unit that includes something
 // else before its own header stops proving that header is self-contained -- which
 // this project requires of every public header -- and the proof is lost silently.
-#include "DiscoveryTier.hpp"
+#include "ClusterKeySource.hpp"
 #include "NodeMembership.hpp"
 
 #include <FastCache/Core/HostPort.hpp>

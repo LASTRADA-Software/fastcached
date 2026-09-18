@@ -1,10 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "EnrollmentWindow.hpp"
 
+#include <FastCache/Cluster/ClusterState.hpp>
+#include <FastCache/Cluster/Roster.hpp>
+
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <array>
+#include <cstdint>
 #include <format>
+#include <optional>
 #include <ranges>
 #include <string>
 
@@ -18,13 +24,42 @@ namespace Wire = FastCache::CompileCacheWire;
 
 namespace
 {
+/// An identity key whose every byte is @p fill, so two cases' keys differ visibly.
+/// @param fill The byte.
+/// @return The key.
+[[nodiscard]] std::array<std::byte, Wire::IdentityPublicKeyBytes> KeyOf(std::uint8_t fill)
+{
+    std::array<std::byte, Wire::IdentityPublicKeyBytes> key {};
+    key.fill(static_cast<std::byte>(fill));
+    return key;
+}
+
+/// The key most cases ask under.
+/// @return The key.
+[[nodiscard]] std::array<std::byte, Wire::IdentityPublicKeyBytes> TheKey()
+{
+    return KeyOf(0x11);
+}
+
+/// A member's claim under @p key.
+/// @param id The identity it claims.
+/// @param endpoint The consensus address it claims.
+/// @param key The key it asks under.
+/// @return The claim.
+[[nodiscard]] JoinerClaim Claim(std::string_view id,
+                                std::string_view endpoint,
+                                std::array<std::byte, Wire::IdentityPublicKeyBytes> const& key)
+{
+    return JoinerClaim { .nodeId = id, .raftEndpoint = endpoint, .role = Wire::EnrollRole::Member, .publicKey = key };
+}
+
 /// One offer from a machine that is not already on the list.
 /// @param window The window to ask.
 /// @param id The identity the joiner claims.
 /// @return What the window decided.
 [[nodiscard]] EnrollDecision Offer(EnrollmentWindow& window, std::string_view id)
 {
-    return window.Offer(id, "10.0.0.9:7100", "10.0.0.9");
+    return window.Offer(Claim(id, "10.0.0.9:7100", TheKey()), "10.0.0.9");
 }
 } // namespace
 
@@ -134,12 +169,13 @@ TEST_CASE("A flooder fills the list and the genuine joiner is refused and RECORD
     REQUIRE(window.Open() == EnrollControlOutcome::Done);
 
     for (auto const index: std::views::iota(std::size_t { 0 }, MaxPendingEnrollments))
-        REQUIRE(window.Offer(std::format("junk-{}", index), "10.0.0.9:7100", "203.0.113.7") == EnrollDecision::Pending);
+        REQUIRE(window.Offer(Claim(std::format("junk-{}", index), "10.0.0.9:7100", KeyOf(0x66)), "203.0.113.7")
+                == EnrollDecision::Pending);
 
     // The real machine arrives second and is not merely refused -- it leaves NO ROW, so
     // it cannot be approved, and an operator reading `--enroll-list` sees sixty-four
     // strangers and no sign of the joiner they are waiting for.
-    CHECK(window.Offer("joiner-real", "10.0.0.4:6680", "10.0.0.4") == EnrollDecision::Full);
+    CHECK(window.Offer(Claim("joiner-real", "10.0.0.4:6680", TheKey()), "10.0.0.4") == EnrollDecision::Full);
     CHECK_FALSE(window.Find("joiner-real").has_value());
 
     // The flood IS visible, which is what makes the trade defensible: every row carries
@@ -153,7 +189,7 @@ TEST_CASE("A flooder fills the list and the genuine joiner is refused and RECORD
     // it again and the genuine joiner's next poll is recorded.
     REQUIRE(window.Close() == EnrollControlOutcome::Done);
     REQUIRE(window.Open() == EnrollControlOutcome::Done);
-    CHECK(window.Offer("joiner-real", "10.0.0.4:6680", "10.0.0.4") == EnrollDecision::Pending);
+    CHECK(window.Offer(Claim("joiner-real", "10.0.0.4:6680", TheKey()), "10.0.0.4") == EnrollDecision::Pending);
 }
 
 TEST_CASE("A joiner polls, so repeat offers count attempts and refresh what it claims", "[enrollment][window]")
@@ -162,9 +198,9 @@ TEST_CASE("A joiner polls, so repeat offers count attempts and refresh what it c
     EnrollmentWindow window { clock };
     REQUIRE(window.Open() == EnrollControlOutcome::Done);
 
-    REQUIRE(window.Offer("joiner-a", "10.0.0.9:7100", "10.0.0.9") == EnrollDecision::Pending);
-    REQUIRE(window.Offer("joiner-a", "10.0.0.9:7100", "10.0.0.9") == EnrollDecision::Pending);
-    REQUIRE(window.Offer("joiner-a", "node-a.example:7100", "198.51.100.4") == EnrollDecision::Pending);
+    REQUIRE(window.Offer(Claim("joiner-a", "10.0.0.9:7100", TheKey()), "10.0.0.9") == EnrollDecision::Pending);
+    REQUIRE(window.Offer(Claim("joiner-a", "10.0.0.9:7100", TheKey()), "10.0.0.9") == EnrollDecision::Pending);
+    REQUIRE(window.Offer(Claim("joiner-a", "node-a.example:7100", TheKey()), "198.51.100.4") == EnrollDecision::Pending);
 
     // One row for one id, however many times it asked.
     REQUIRE(window.Summary().second == 1);
@@ -185,7 +221,7 @@ TEST_CASE("A decided row stops tracking the machine, so what was approved is wha
     ManualClock clock;
     EnrollmentWindow window { clock };
     REQUIRE(window.Open() == EnrollControlOutcome::Done);
-    REQUIRE(window.Offer("joiner-a", "10.0.0.9:7100", "10.0.0.9") == EnrollDecision::Pending);
+    REQUIRE(window.Offer(Claim("joiner-a", "10.0.0.9:7100", TheKey()), "10.0.0.9") == EnrollDecision::Pending);
     REQUIRE(window.Decide("joiner-a", Wire::EnrollmentDecision::Approved) == EnrollControlOutcome::Done);
 
     // **The assertion that discriminates.** `--enroll-list` and `--enroll-approve` are
@@ -194,7 +230,7 @@ TEST_CASE("A decided row stops tracking the machine, so what was approved is wha
     // `ClusterAdmit` was not necessarily the endpoint the eye that approved it had read.
     // A test asserting only that the row still exists passes under that; this one
     // asserts the VALUE, which is the thing that travels.
-    REQUIRE(window.Offer("joiner-a", "evil.example:7100", "198.51.100.4") == EnrollDecision::Approved);
+    REQUIRE(window.Offer(Claim("joiner-a", "evil.example:7100", TheKey()), "198.51.100.4") == EnrollDecision::Approved);
 
     auto const entry = window.Find("joiner-a");
     REQUIRE(entry.has_value());
@@ -207,7 +243,7 @@ TEST_CASE("A decided row stops tracking the machine, so what was approved is wha
     CHECK(Unwrap(entry).claimsChanged == 1);
 }
 
-TEST_CASE("The cluster key is spendable once, and a second collect is refused", "[enrollment][window]")
+TEST_CASE("An approval is answered on every poll, because what it leads to is no secret", "[enrollment][window]")
 {
     ManualClock clock;
     EnrollmentWindow window { clock };
@@ -215,59 +251,124 @@ TEST_CASE("The cluster key is spendable once, and a second collect is refused", 
     REQUIRE(Offer(window, "joiner-a") == EnrollDecision::Pending);
     REQUIRE(window.Decide("joiner-a", Wire::EnrollmentDecision::Approved) == EnrollControlOutcome::Done);
 
-    // The hand-over, and it is reachable exactly once per approval.
+    // **Every poll, and the row does not move** (#178). While an approval led to the cluster
+    // key it was spendable once, and a joiner whose one reply was lost was stranded until an
+    // operator re-approved it. What an approval leads to now is the ROSTER, which is no secret,
+    // so answering it again costs nothing and a lost reply is recovered by the joiner simply
+    // asking again. Asserting "the first poll is answered" passes under the old spend; the
+    // SECOND and THIRD answers are the ones that tell the two apart.
     CHECK(Offer(window, "joiner-a") == EnrollDecision::Approved);
-    REQUIRE(Unwrap(window.Find("joiner-a")).decision == Wire::EnrollmentDecision::Collected);
-
-    // **`Collected`, not `Approved`.** The two shared an enumerator until this case
-    // existed, and the caller then served the key on every poll with only a counter
-    // gated -- so a second hand-over was invisible: the tally stayed at one and the real
-    // joiner still got its key on its next poll. Asserting "the window still answers
-    // about this id" passes under that; asserting WHICH answer is what does not.
-    CHECK(Offer(window, "joiner-a") == EnrollDecision::Collected);
-    CHECK(Offer(window, "joiner-a") == EnrollDecision::Collected);
+    CHECK(Offer(window, "joiner-a") == EnrollDecision::Approved);
+    CHECK(Offer(window, "joiner-a") == EnrollDecision::Approved);
+    CHECK(Unwrap(window.Find("joiner-a")).decision == Wire::EnrollmentDecision::Approved);
 }
 
-TEST_CASE("A claim the caller could not serve is given back rather than spent", "[enrollment][window]")
+TEST_CASE("A poll under another KEY is another machine: counted, held, and never recorded", "[enrollment][window][security]")
+{
+    ManualClock clock;
+    EnrollmentWindow window { clock };
+    REQUIRE(window.Open() == EnrollControlOutcome::Done);
+    REQUIRE(window.Offer(Claim("joiner-a", "10.0.0.9:7100", TheKey()), "10.0.0.9") == EnrollDecision::Pending);
+
+    // **While the row is still PENDING**, which is the arrangement that matters: an operator
+    // reads the key on `--enroll-list`, compares it with what the machine printed, and
+    // approves minutes later. A row that took whichever key polled LAST would let a second
+    // machine swap in a key nobody compared, between the reading and the approval.
+    auto const impostor = KeyOf(0x99);
+    CHECK(window.Offer(Claim("joiner-a", "10.0.0.9:7100", impostor), "10.0.0.9") == EnrollDecision::Pending);
+    CHECK(Unwrap(window.Find("joiner-a")).publicKey == TheKey());
+    CHECK(Unwrap(window.Find("joiner-a")).claimsChanged == 1);
+
+    // And after the approval the impostor is STILL answered `Pending` -- never `Approved`,
+    // which is what would send it to fetch a roster it is not on and tell it it was admitted.
+    REQUIRE(window.Decide("joiner-a", Wire::EnrollmentDecision::Approved) == EnrollControlOutcome::Done);
+    CHECK(window.Offer(Claim("joiner-a", "10.0.0.9:7100", impostor), "10.0.0.9") == EnrollDecision::Pending);
+    CHECK(Unwrap(window.Find("joiner-a")).publicKey == TheKey());
+    CHECK(Unwrap(window.Find("joiner-a")).claimsChanged == 2);
+
+    // The control: the machine that asked first, under the key that was compared, is the one
+    // the approval answers. Without it the two checks above pass under a window that answers
+    // `Pending` to everybody.
+    CHECK(window.Offer(Claim("joiner-a", "10.0.0.9:7100", TheKey()), "10.0.0.9") == EnrollDecision::Approved);
+
+    // A ROLE is held the same way: a worker's request under a member's id is another claim.
+    auto worker = Claim("joiner-a", "", TheKey());
+    worker.role = Wire::EnrollRole::Worker;
+    CHECK(window.Offer(worker, "10.0.0.9") == EnrollDecision::Pending);
+    CHECK(Unwrap(window.Find("joiner-a")).role == Wire::EnrollRole::Member);
+}
+
+TEST_CASE("The roster fingerprint a joiner was handed is recorded on its row", "[enrollment][window]")
 {
     ManualClock clock;
     EnrollmentWindow window { clock };
     REQUIRE(window.Open() == EnrollControlOutcome::Done);
     REQUIRE(Offer(window, "joiner-a") == EnrollDecision::Pending);
-    REQUIRE(window.Decide("joiner-a", Wire::EnrollmentDecision::Approved) == EnrollControlOutcome::Done);
 
-    // The spend is taken BEFORE the caller has the key in hand -- it has to be, or two
-    // polls arriving together are both served -- so a caller that then cannot read its
-    // key file must put it back. Without this, one transient permission error costs a
-    // machine the only collection it has.
-    REQUIRE(Offer(window, "joiner-a") == EnrollDecision::Approved);
-    CHECK(window.ReturnClaim("joiner-a") == ClaimReturn::Returned);
-    CHECK(Unwrap(window.Find("joiner-a")).decision == Wire::EnrollmentDecision::Approved);
-    CHECK(Offer(window, "joiner-a") == EnrollDecision::Approved);
+    // Absent until something was served -- a disengaged optional, never a zero digest, which
+    // would render as a fingerprint the joiner could never have printed.
+    CHECK_FALSE(Unwrap(window.Find("joiner-a")).rosterFingerprint.has_value());
 
-    // And it returns only what it took: a row that never collected, and an id nobody has
-    // heard of, are both declined rather than moved. A `ReturnClaim` that walked a
-    // `Pending` row back to `Approved` would be an approval this node invented.
-    //
-    // **The two nothings are told APART**, and that is the assertion rather than
-    // thoroughness: they are different events with different remedies -- a window
-    // somebody closed, against a row somebody decided about while this claim was out --
-    // and only the second says a machine was stranded by a race. A predicate answering
-    // one `false` for both is what made the caller discard it.
-    CHECK(window.ReturnClaim("nobody") == ClaimReturn::NoSuchRow);
-    REQUIRE(Offer(window, "joiner-b") == EnrollDecision::Pending);
-    CHECK(window.ReturnClaim("joiner-b") == ClaimReturn::AlreadyMoved);
-    CHECK(Unwrap(window.Find("joiner-b")).decision == Wire::EnrollmentDecision::Pending);
+    std::array<std::byte, Wire::RosterFingerprintBytes> first {};
+    first.fill(std::byte { 0x01 });
+    std::array<std::byte, Wire::RosterFingerprintBytes> second {};
+    second.fill(std::byte { 0x02 });
 
-    // The race this names, arranged rather than raced for: `joiner-a`'s claim is out
-    // (its row is `Collected` from the offer above), an operator REJECTS it, and the
-    // return then finds it moved. The claim is not silently restored over that
-    // decision -- which is the half that keeps this from being a way to undo a
-    // rejection, and the reason the guard is `!= Collected` rather than `== Approved`.
-    REQUIRE(Unwrap(window.Find("joiner-a")).decision == Wire::EnrollmentDecision::Collected);
-    REQUIRE(window.Decide("joiner-a", Wire::EnrollmentDecision::Rejected) == EnrollControlOutcome::Done);
-    CHECK(window.ReturnClaim("joiner-a") == ClaimReturn::AlreadyMoved);
-    CHECK(Unwrap(window.Find("joiner-a")).decision == Wire::EnrollmentDecision::Rejected);
+    // The LATEST wins, because the latest is the one the joiner holds: it stops polling once
+    // it has been told `Approved`, and a roster that moved between two answers is the one it
+    // printed last.
+    window.NoteServed("joiner-a", first);
+    window.NoteServed("joiner-a", second);
+    CHECK(Unwrap(window.Find("joiner-a")).rosterFingerprint == second);
+    auto const report = window.Report();
+    REQUIRE(report.pending.size() == 1);
+    CHECK(report.pending.front().rosterFingerprint == second);
+
+    // An id with no row records nothing and creates nothing.
+    window.NoteServed("nobody", first);
+    CHECK(window.Summary().second == 1);
+}
+
+TEST_CASE("A roster records a joiner only under the key and the role it asked for", "[enrollment][window]")
+{
+    // The one question both ends ask -- the leader before it answers `Approved`, the joiner before
+    // it believes it -- so it is pinned once, here, in every direction it can be wrong.
+    auto roster = Cluster::Roster {};
+    roster.members.push_back(Cluster::RosterMember {
+        .id = "n1", .raftEndpoint = "10.0.0.1:6680", .seat = Cluster::MemberSeat::Voter, .publicKey = KeyOf(0x01) });
+    roster.members.push_back(Cluster::RosterMember {
+        .id = "n2", .raftEndpoint = "10.0.0.2:6680", .seat = Cluster::MemberSeat::Voter, .publicKey = std::nullopt });
+    roster.principals.push_back(
+        Cluster::ClusterPrincipal { .id = "w1", .publicKey = KeyOf(0x11), .role = Cluster::PrincipalRole::Worker });
+
+    CHECK(RosterRecordsJoiner(roster, "n1", KeyOf(0x01), Wire::EnrollRole::Member));
+    CHECK(RosterRecordsJoiner(roster, "w1", KeyOf(0x11), Wire::EnrollRole::Worker));
+
+    // Another key under the same id is not this machine.
+    CHECK_FALSE(RosterRecordsJoiner(roster, "n1", KeyOf(0x99), Wire::EnrollRole::Member));
+
+    // A principal is not a member and a member is not a principal: a worker counted towards
+    // quorum is a vote nobody can collect.
+    CHECK_FALSE(RosterRecordsJoiner(roster, "w1", KeyOf(0x11), Wire::EnrollRole::Member));
+    CHECK_FALSE(RosterRecordsJoiner(roster, "n1", KeyOf(0x01), Wire::EnrollRole::Worker));
+
+    // A member with no key recorded records no key, whatever the joiner holds.
+    CHECK_FALSE(RosterRecordsJoiner(roster, "n2", KeyOf(0x02), Wire::EnrollRole::Member));
+}
+
+TEST_CASE("Each enrollment role says whether it states an endpoint and what an approval records", "[enrollment][window]")
+{
+    // The two roles' difference is what the responder refuses and what the approval commits,
+    // so it is pinned per row rather than inferred from a name.
+    auto const& member = EnrollRoleRowFor(Wire::EnrollRole::Member);
+    CHECK(member.name == "member");
+    CHECK(member.statesEndpoint);
+    CHECK_FALSE(member.principal.has_value());
+
+    auto const& worker = EnrollRoleRowFor(Wire::EnrollRole::Worker);
+    CHECK(worker.name == "worker");
+    CHECK_FALSE(worker.statesEndpoint);
+    CHECK(worker.principal == Cluster::PrincipalRole::Worker);
 }
 
 TEST_CASE("A second decision about a settled id is refused rather than repeated", "[enrollment][window]")
@@ -280,24 +381,10 @@ TEST_CASE("A second decision about a settled id is refused rather than repeated"
     REQUIRE(window.Decide("joiner-a", Wire::EnrollmentDecision::Approved) == EnrollControlOutcome::Done);
     CHECK(window.Decide("joiner-a", Wire::EnrollmentDecision::Approved) == EnrollControlOutcome::AlreadyInForce);
 
-    // **But once the key has gone out, an approval is ACCEPTED and re-arms exactly one
-    // more collection.** That is the whole recovery path for a joiner whose reply was
-    // lost: one operator command, on the id they already approved.
-    //
-    // While `Collected` was folded into `Approved` for this question, this answered
-    // `AlreadyInForce` and the only remedy its refusal offered was `--cluster-forget` --
-    // a quorum change to recover from a dropped packet, followed by a re-approve that
-    // consensus refuses because the member is already there. Four commands, two of them
-    // counter-intuitive, none documented.
+    // Still `AlreadyInForce` after the joiner has been answered: nothing an answer does
+    // moves the row any more (#178), so there is nothing a second approval could re-arm.
     REQUIRE(Offer(window, "joiner-a") == EnrollDecision::Approved);
-    REQUIRE(Unwrap(window.Find("joiner-a")).decision == Wire::EnrollmentDecision::Collected);
-    CHECK(window.Decide("joiner-a", Wire::EnrollmentDecision::Approved) == EnrollControlOutcome::Done);
-    CHECK(Unwrap(window.Find("joiner-a")).decision == Wire::EnrollmentDecision::Approved);
-
-    // Re-armed for exactly ONE: the second collection is served and the third is not,
-    // so the recovery does not quietly become the idempotent behaviour it replaced.
-    CHECK(Offer(window, "joiner-a") == EnrollDecision::Approved);
-    CHECK(Offer(window, "joiner-a") == EnrollDecision::Collected);
+    CHECK(window.Decide("joiner-a", Wire::EnrollmentDecision::Approved) == EnrollControlOutcome::AlreadyInForce);
 
     // A REJECTED row may still be approved, because an operator who refused the wrong
     // row must not have to close the window -- which would lose every other row with it.
@@ -378,7 +465,8 @@ TEST_CASE("The warning states the age and how many are waiting, so a log line ca
     CHECK(Unwrap(line).contains("120s"));
     CHECK(Unwrap(line).contains("1 request(s) waiting"));
     CHECK(Unwrap(line).contains("2 listed"));
-    CHECK(Unwrap(line).contains("CLEARTEXT"));
+    // And what to compare before approving, which is the whole of what makes approving safe.
+    CHECK(Unwrap(line).contains("compare that key"));
 }
 
 TEST_CASE("A report carries ages as durations and the state the wire spells", "[enrollment][window]")

@@ -2,54 +2,45 @@
 #include "DiscoveryTier.hpp"
 
 #include <FastCache/Cluster/MembershipPolicy.hpp>
-#include <FastCache/Core/SecureBytes.hpp>
+#include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Net/InMemoryDatagram.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
-#include <filesystem>
-#include <fstream>
+#include <memory>
+#include <optional>
 #include <ranges>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <tests/CoHostedDatagram.hpp>
-#include <tests/ScratchPath.hpp>
+#include <tests/RaftPeerKeyFakes.hpp>
 
 using namespace FastCache;
 using namespace FastCache::Node;
 using namespace std::chrono_literals;
 using FastCache::Testing::CoHostedDatagramSocket;
+using FastCache::Testing::RosterPeerKeys;
+using FastCache::Testing::SharedRoster;
 using FastCache::Testing::TestBeaconPort;
+using FastCache::Testing::TestKeyPair;
 
 namespace
 {
-/// A key every node in a test cluster shares.
-[[nodiscard]] SecureByteBuffer TestKey()
-{
-    // Constructed rather than typed as a hex run, for the reason the RFC 4231
-    // vectors next door are: a hand-written literal of this length is one nobody
-    // recounts, and a miscounted key accuses the code that reads it.
-    auto bytes = std::views::iota(0, 32) | std::views::transform([](int value) { return static_cast<std::byte>(value); });
-    return SecureByteBuffer { bytes.begin(), bytes.end() };
-}
-
 /// What one node announces about itself.
 /// @param nodeId Its identity.
-/// @param key The cluster key it holds.
 /// @param beaconAddress Where this node announces itself.
 /// @return The configuration.
-[[nodiscard]] Cluster::DiscoveryConfig ConfigFor(std::string const& nodeId,
-                                                 SecureByteBuffer key,
-                                                 DatagramAddress beaconAddress)
+[[nodiscard]] Cluster::DiscoveryConfig ConfigFor(std::string const& nodeId, DatagramAddress beaconAddress)
 {
     return Cluster::DiscoveryConfig { .clusterId = "fleet",
                                       .nodeId = nodeId,
                                       .raftEndpoint = nodeId + ".local:6675",
                                       .beaconAddress = std::move(beaconAddress),
-                                      .presharedKey = std::move(key),
                                       .beaconInterval = 15s,
                                       .challengeLifetime = 30s };
 }
@@ -62,37 +53,48 @@ struct Peer
 {
     NullLogger logger;
     std::vector<Cluster::DesiredMember> seen;
+    AtomicMetricsSink metrics;
+    RosterPeerKeys keys;
     std::unique_ptr<DiscoveryTier> tier;
 
     /// One node per machine, which is the ordinary deployment.
     /// @param bus The segment.
-    /// @param nodeId This node's identity.
-    /// @param key The cluster key it holds.
-    Peer(DatagramBus& bus, std::string const& nodeId, SecureByteBuffer key):
+    /// @param nodeId This node's identity; its key is `TestKeyPair(nodeId)`.
+    /// @param roster Whose key every id is, as this node's replicated state says.
+    Peer(DatagramBus& bus, std::string const& nodeId, std::shared_ptr<SharedRoster const> roster):
         Peer(bus.Open(DatagramAddress { .host = nodeId, .port = TestBeaconPort }),
              DatagramBus::BroadcastAddress(),
              nodeId,
-             std::move(key))
+             std::move(roster))
     {
     }
 
     /// Over a socket and a beacon address somebody else chose.
     /// @param socket Where this node's datagrams come from and go.
     /// @param beaconAddress Where it announces itself.
-    /// @param nodeId This node's identity.
-    /// @param key The cluster key it holds.
+    /// @param nodeId This node's identity; its key is `TestKeyPair(nodeId)`.
+    /// @param roster Whose key every id is, as this node's replicated state says.
     Peer(std::unique_ptr<IDatagramSocket> socket,
          DatagramAddress beaconAddress,
          std::string const& nodeId,
-         SecureByteBuffer key):
+         std::shared_ptr<SharedRoster const> roster):
+        keys { TestKeyPair(nodeId), std::move(roster) },
         tier { DiscoveryTier::Over(
             std::move(socket),
-            ConfigFor(nodeId, std::move(key), std::move(beaconAddress)),
+            ConfigFor(nodeId, std::move(beaconAddress)),
+            keys,
             [this](std::span<Cluster::DesiredMember const> peers) { seen.assign(peers.begin(), peers.end()); },
+            metrics,
             logger) }
     {
     }
 };
+
+/// Step both sides @p rounds times.
+/// @param a One side.
+/// @param b The other.
+/// @param rounds How many turns each gets.
+void Settle(Peer& a, Peer& b, int rounds);
 
 /// A step short enough that a whole handshake costs milliseconds.
 ///
@@ -101,15 +103,25 @@ struct Peer
 /// any of them waits. What the timeout bounds is only the last step of each side,
 /// where there is nothing left to read.
 constexpr auto Step = 5ms;
+
+void Settle(Peer& a, Peer& b, int rounds)
+{
+    for ([[maybe_unused]] auto const round: std::views::iota(0, rounds))
+    {
+        CHECK(a.tier->Step(Step));
+        CHECK(b.tier->Step(Step));
+    }
+}
 } // namespace
 
-TEST_CASE("Two nodes holding one key find and prove each other", "[node][discovery]")
+TEST_CASE("Two nodes the roster knows find and prove each other", "[node][discovery]")
 {
     // The whole handshake, driven by hand: no threads, no sleeps, and a failure
     // names the step it happened at rather than timing out.
     DatagramBus bus;
-    Peer first { bus, "n1", TestKey() };
-    Peer second { bus, "n2", TestKey() };
+    auto const roster = SharedRoster::Of({ "n1", "n2" });
+    Peer first { bus, "n1", roster };
+    Peer second { bus, "n2", roster };
 
     // Each announces itself; the bus doubles a broadcast back to its sender, exactly
     // as a real one does, which is the case `PeerDirectory` must ignore.
@@ -132,13 +144,18 @@ TEST_CASE("Two nodes holding one key find and prove each other", "[node][discove
     REQUIRE(second.tier->AuthenticatedCount() == 1);
 
     // What reaches the observer is a DESIRE with no opinion about the scheduler
-    // endpoint. Discovery proved where `n2` answers CONSENSUS -- that is what the MAC
-    // covered -- and knows nothing about the port clients speak to, so saying `""`
-    // would clear whatever `n2` had announced about itself.
+    // endpoint. Discovery proved where `n2` answers CONSENSUS -- that is what the
+    // signature covered -- and knows nothing about the port clients speak to, so saying
+    // `""` would clear whatever `n2` had announced about itself.
     REQUIRE(first.seen.size() == 1);
     CHECK(first.seen.front().id == "n2");
     CHECK(first.seen.front().raftEndpoint == "n2.local:6675");
     CHECK_FALSE(first.seen.front().schedulerEndpoint.has_value());
+
+    // And no opinion about the KEY either, although one was just proved (#178): it is the
+    // key the roster already holds, and a desire outlives the moment it was stated, so a
+    // key named here would be proposed straight back over an operator who re-keyed `n2`.
+    CHECK_FALSE(first.seen.front().publicKey.has_value());
 }
 
 TEST_CASE("A node that cannot name itself is never desired", "[node][discovery]")
@@ -152,13 +169,14 @@ TEST_CASE("A node that cannot name itself is never desired", "[node][discovery]"
     // that stalls a cluster: `Reconcile` abandons the pass at the first refusal and
     // never reaches `ReconcileQuorum`.
     DatagramBus bus;
-    Peer good { bus, "n1", TestKey() };
-
     // A truncated three-byte sequence -- the shape is right and the bytes stop
     // early -- which reaches the endpoint too, since a node's endpoint is derived
     // from its id here exactly as an operator's `--raft-peer` derives from what
     // they typed.
-    Peer nameless { bus, "n2-\xE2\x82", TestKey() };
+    auto const namelessId = std::string { "n2-\xE2\x82" };
+    auto const roster = SharedRoster::Of({ "n1", namelessId });
+    Peer good { bus, "n1", roster };
+    Peer nameless { bus, namelessId, roster };
 
     // Four rounds is well over the three legs a handshake takes, so this fails as
     // "it was admitted" rather than as "it had not finished yet".
@@ -168,8 +186,8 @@ TEST_CASE("A node that cannot name itself is never desired", "[node][discovery]"
         CHECK(nameless.tier->Step(Step));
     }
 
-    // Never seen, so never proved, so never desired. The key was right and made no
-    // difference: this is a refusal about what the peer CLAIMS rather than about
+    // Never seen, so never proved, so never desired. The key was one the roster holds and
+    // made no difference: this is a refusal about what the peer CLAIMS rather than about
     // what it holds.
     CHECK(good.tier->AuthenticatedCount() == 0);
     CHECK(good.seen.empty());
@@ -182,28 +200,68 @@ TEST_CASE("A node that cannot name itself is never desired", "[node][discovery]"
     CHECK(nameless.seen.front().id == "n1");
 }
 
-TEST_CASE("A node holding the wrong key is never admitted", "[node][discovery]")
+TEST_CASE("A beacon from an UNKNOWN key is reported and never desired", "[node][discovery][security]")
 {
-    // The refusal that matters, because an admitted node is assigned compile jobs and
-    // returns objects cached fleet-wide. It still SEES the beacon -- a beacon is
-    // unauthenticated by construction -- and is simply never marked as having proved
-    // anything.
+    // **The acceptance case for #178's discovery half.** Under the shared key a proof WAS
+    // membership, so any machine holding the file was desired -- and a desired machine the
+    // reconciler would admit. Now a machine proves possession of a key of its own, and
+    // proving it perfectly is not enough: the roster does not hold that key for `n2`, so
+    // `n2` is seen, counted, reported, and never handed to `Desire`.
     DatagramBus bus;
-    Peer honest { bus, "n1", TestKey() };
+    auto const roster = SharedRoster::Of({ "n1" });
+    Peer honest { bus, "n1", roster };
+    Peer stranger { bus, "n2", roster };
 
-    auto wrong = TestKey();
-    wrong.front() = std::byte { 0xFF };
-    Peer stranger { bus, "n2", std::move(wrong) };
-
-    for ([[maybe_unused]] auto const round: std::views::iota(0, 6))
-    {
-        CHECK(honest.tier->Step(Step));
-        CHECK(stranger.tier->Step(Step));
-    }
+    Settle(honest, stranger, 6);
 
     CHECK(honest.tier->AuthenticatedCount() == 0);
-    CHECK(stranger.tier->AuthenticatedCount() == 0);
     CHECK(honest.seen.empty());
+    CHECK(honest.metrics.Read(IMetricsSink::Counter::DiscoveryProofsRefusedUnknownKey) >= 1);
+}
+
+TEST_CASE("The same stranger IS desired once the roster holds its key", "[node][discovery][security]")
+{
+    // The control for the case above, through the same arrangement with ONE fact changed:
+    // the roster now holds `n2`'s key. Without it the refusal above passes under a tier
+    // that desires nobody at all -- which would also end auto-admission, and would also
+    // break every discovered address change.
+    DatagramBus bus;
+    auto const roster = SharedRoster::Of({ "n1" });
+    roster->Admit("n2", TestKeyPair("n2").PublicKey());
+    Peer honest { bus, "n1", roster };
+    Peer stranger { bus, "n2", roster };
+
+    Settle(honest, stranger, 6);
+
+    CHECK(honest.tier->AuthenticatedCount() == 1);
+    REQUIRE(honest.seen.size() == 1);
+    CHECK(honest.seen.front().id == "n2");
+    CHECK(honest.metrics.Read(IMetricsSink::Counter::DiscoveryProofsRefusedUnknownKey) == 0);
+}
+
+TEST_CASE("A peer whose proven key the roster has since revoked is not desired again", "[node][discovery][security]")
+{
+    // The authenticated set is re-published whenever ANY peer proves itself, and the
+    // directory remembers a proof from whenever it was taken. So what is published is
+    // re-asked of the roster at the moment it is published: `n2` proved its key, the key
+    // was then revoked, and `n3` proving ITS key must not carry `n2` along with it.
+    DatagramBus bus;
+    auto roster = SharedRoster::Of({ "n1", "n2", "n3" });
+    Peer first { bus, "n1", roster };
+    Peer second { bus, "n2", roster };
+
+    Settle(first, second, 4);
+    REQUIRE(first.seen.size() == 1);
+    REQUIRE(first.seen.front().id == "n2");
+
+    roster->Revoke("n2");
+
+    Peer third { bus, "n3", roster };
+    Settle(first, third, 4);
+
+    REQUIRE_FALSE(first.seen.empty());
+    CHECK(std::ranges::any_of(first.seen, [](Cluster::DesiredMember const& m) { return m.id == "n3"; }));
+    CHECK(std::ranges::none_of(first.seen, [](Cluster::DesiredMember const& m) { return m.id == "n2"; }));
 }
 
 TEST_CASE("Two nodes on one host find and prove each other", "[node][discovery]")
@@ -221,8 +279,9 @@ TEST_CASE("Two nodes on one host find and prove each other", "[node][discovery]"
     DatagramBus bus;
     auto const beacon = DatagramBus::BroadcastAddressOn(TestBeaconPort);
 
-    Peer first { CoHostedDatagramSocket(bus, "host", 40001), beacon, "n1", TestKey() };
-    Peer second { CoHostedDatagramSocket(bus, "host", 40002), beacon, "n2", TestKey() };
+    auto const roster = SharedRoster::Of({ "n1", "n2" });
+    Peer first { CoHostedDatagramSocket(bus, "host", 40001), beacon, "n1", roster };
+    Peer second { CoHostedDatagramSocket(bus, "host", 40002), beacon, "n2", roster };
 
     // Each announces itself, then reads the other's beacon and challenges it, then
     // answers the challenge it was given, then checks the proof it was sent. The
@@ -255,9 +314,15 @@ TEST_CASE("A peer discovery proves is recorded as a learner", "[node][discovery]
     // from. `n1` bootstrapped alone and `n2` has never been recorded or counted, so the
     // proof buys `n2` a learner's record -- replicated to, counted by nothing -- and a
     // vote stays the operator's to give.
+    //
+    // Since #178 the proof counts only because `n2`'s KEY is one `n1` already holds -- here
+    // the roster knows it, as a `--raft-peer n2=...@<key>` typed on `n1` makes it known
+    // before the state records any `n2`. A key nobody holds is reported and never desired
+    // (the UNKNOWN-key case above), so this path records a learner and admits nobody new.
     DatagramBus bus;
-    Peer first { bus, "n1", TestKey() };
-    Peer second { bus, "n2", TestKey() };
+    auto const roster = SharedRoster::Of({ "n1", "n2" });
+    Peer first { bus, "n1", roster };
+    Peer second { bus, "n2", roster };
 
     for ([[maybe_unused]] auto const round: std::views::iota(0, 4))
     {
@@ -283,16 +348,23 @@ TEST_CASE("A peer discovery proves is recorded as a learner", "[node][discovery]
 TEST_CASE("Two fleets on one segment ignore each other at the node's discovery tier", "[node][discovery]")
 {
     // A cluster id is routing rather than authentication, and this is what it buys:
-    // the challenge is never even issued, so a shared key would not help. Checked
-    // before a challenge goes out AND before one is answered.
+    // the challenge is never even issued, so a roster that knew both would not help.
+    // Checked before a challenge goes out AND before one is answered.
     DatagramBus bus;
-    Peer ours { bus, "n1", TestKey() };
+    auto const roster = SharedRoster::Of({ "n1", "n2" });
+    Peer ours { bus, "n1", roster };
 
     NullLogger otherLogger;
-    auto otherConfig = ConfigFor("n2", TestKey(), DatagramBus::BroadcastAddress());
+    AtomicMetricsSink otherMetrics;
+    RosterPeerKeys otherKeys { TestKeyPair("n2"), roster };
+    auto otherConfig = ConfigFor("n2", DatagramBus::BroadcastAddress());
     otherConfig.clusterId = "somebody-elses";
-    auto const theirs = DiscoveryTier::Over(
-        bus.Open(DatagramAddress { .host = "n2", .port = TestBeaconPort }), std::move(otherConfig), {}, otherLogger);
+    auto const theirs = DiscoveryTier::Over(bus.Open(DatagramAddress { .host = "n2", .port = TestBeaconPort }),
+                                            std::move(otherConfig),
+                                            otherKeys,
+                                            {},
+                                            otherMetrics,
+                                            otherLogger);
 
     for ([[maybe_unused]] auto const round: std::views::iota(0, 6))
     {
@@ -302,48 +374,4 @@ TEST_CASE("Two fleets on one segment ignore each other at the node's discovery t
 
     CHECK(ours.tier->AuthenticatedCount() == 0);
     CHECK(theirs->AuthenticatedCount() == 0);
-}
-
-TEST_CASE("A key file is read, trimmed, and refused when it is too short", "[node][discovery]")
-{
-    FastCache::Testing::ScratchDirectory const scratch { "fastcache-discovery-key-test" };
-    auto const& dir = scratch.Path();
-
-    SECTION("a generated key, with the newline an editor left on it")
-    {
-        // The overwhelmingly common way to produce one of these ends the file with a
-        // newline, and a key one byte different from its peers' fails to authenticate
-        // with a message about a bad proof rather than about a newline.
-        auto const path = dir / "good";
-        {
-            std::ofstream out { path, std::ios::binary };
-            out << "0123456789abcdefghij\n";
-        }
-
-        auto const key = ReadClusterKey(path);
-        REQUIRE(key.has_value());
-        CHECK(key->size() == 20);
-    }
-
-    SECTION("a key short enough to guess is refused, and the message says how to make one")
-    {
-        auto const path = dir / "short";
-        {
-            std::ofstream out { path, std::ios::binary };
-            out << "hunter2\n";
-        }
-
-        auto const key = ReadClusterKey(path);
-        REQUIRE_FALSE(key.has_value());
-        CHECK(key.error().contains("urandom"));
-    }
-
-    SECTION("a file that is not there is a refusal rather than an empty key")
-    {
-        // An empty key would authenticate every node on the segment against every
-        // other, which is the one failure this whole layer exists to prevent.
-        CHECK_FALSE(ReadClusterKey(dir / "absent").has_value());
-    }
-
-    std::filesystem::remove_all(dir);
 }

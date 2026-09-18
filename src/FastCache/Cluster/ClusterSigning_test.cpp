@@ -5,6 +5,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <ranges>
@@ -43,9 +44,18 @@ TEST_CASE("Each domain's label is the byte string on the wire", "[cluster][signi
     // `static_assert`ed three lines below its own definition -- a runtime `CHECK`
     // of a `consteval` predicate cannot fail in a translation unit that compiled,
     // so it would read as a guarantee while asserting nothing.
-    CHECK(DescribeSigningDomain(SigningDomain::DiscoveryProof).label == "fastcache-discovery-v1");
     CHECK(DescribeSigningDomain(SigningDomain::LeaseToken).label == "fastcache-lease-v1");
     CHECK(DescribeSigningDomain(SigningDomain::NodeProof).label == "fastcache-node-proof-v1");
+
+    // And a RETIRED label stays retired (#178): the discovery proof moved to each node's own key,
+    // and a row spelled `fastcache-discovery-v1` again would accept every tag an older build
+    // minted under it. Asserted by label, so a row re-added under any enumerator name is caught.
+    for (auto const retired: { std::string_view { "fastcache-discovery-v1" },
+                               std::string_view { "fastcache-raft-dial-v1" },
+                               std::string_view { "fastcache-raft-verdict-v1" },
+                               std::string_view { "fastcache-raft-frame-v1" } })
+        CHECK(std::ranges::none_of(SigningDomainTable,
+                                   [retired](SigningDomainDescriptor const& row) { return row.label == retired; }));
 }
 
 TEST_CASE("One field list signs differently in each domain", "[cluster][signing]")
@@ -59,16 +69,16 @@ TEST_CASE("One field list signs differently in each domain", "[cluster][signing]
     auto const key = Key();
     auto const fields = std::array<std::span<std::byte const>, 2> { Bytes("node-a"), Bytes("10.0.0.7:6675") };
 
-    auto const asProof = SignFields(key, SigningDomain::DiscoveryProof, fields);
+    auto const asProof = SignFields(key, SigningDomain::NodeProof, fields);
     auto const asLease = SignFields(key, SigningDomain::LeaseToken, fields);
 
     CHECK_FALSE(ConstantTimeEquals(asProof, asLease));
     CHECK_FALSE(VerifyFields(key, SigningDomain::LeaseToken, fields, asProof));
-    CHECK_FALSE(VerifyFields(key, SigningDomain::DiscoveryProof, fields, asLease));
+    CHECK_FALSE(VerifyFields(key, SigningDomain::NodeProof, fields, asLease));
 
     // And each still authenticates in its own domain, or the separation would be
     // indistinguishable from nothing working at all.
-    CHECK(VerifyFields(key, SigningDomain::DiscoveryProof, fields, asProof));
+    CHECK(VerifyFields(key, SigningDomain::NodeProof, fields, asProof));
     CHECK(VerifyFields(key, SigningDomain::LeaseToken, fields, asLease));
 
     // And every pair of domains, not only the first two: the Raft peer wire added three
@@ -92,7 +102,7 @@ TEST_CASE("An empty field list is still a signed statement of its domain", "[clu
     auto const key = Key();
     auto const none = WireFields::FieldList {};
 
-    CHECK_FALSE(ConstantTimeEquals(SignFields(key, SigningDomain::DiscoveryProof, none),
+    CHECK_FALSE(ConstantTimeEquals(SignFields(key, SigningDomain::NodeProof, none),
                                    SignFields(key, SigningDomain::LeaseToken, none)));
 }
 
@@ -138,22 +148,22 @@ TEST_CASE("A tag covers these fields, this key, and this arity", "[cluster][sign
 {
     auto const key = Key();
     auto const granted = std::array<std::span<std::byte const>, 2> { Bytes("node-a"), Bytes("10.0.0.7:6675") };
-    auto const honest = SignFields(key, SigningDomain::DiscoveryProof, granted);
+    auto const honest = SignFields(key, SigningDomain::NodeProof, granted);
 
     // A different endpoint. This is the load-bearing field on both wires: a MAC
     // over "somebody may join" or "somebody may compile" is a tag captured on the
     // way to one machine and replayed against every machine that trusts the key.
     auto const elsewhere = std::array<std::span<std::byte const>, 2> { Bytes("node-a"), Bytes("10.0.0.9:6675") };
-    CHECK_FALSE(VerifyFields(key, SigningDomain::DiscoveryProof, elsewhere, honest));
+    CHECK_FALSE(VerifyFields(key, SigningDomain::NodeProof, elsewhere, honest));
 
     // A different key, which is what it all rests on.
-    CHECK_FALSE(VerifyFields(Key(0x5B), SigningDomain::DiscoveryProof, granted, honest));
+    CHECK_FALSE(VerifyFields(Key(0x5B), SigningDomain::NodeProof, granted, honest));
 
     // A different arity. An appended EMPTY field is the cheapest way to ask whether
     // the encoding says how many fields there were: it adds no content, only a
     // length prefix, so a construction that merely concatenated would not notice.
     auto const padded = std::array<std::span<std::byte const>, 3> { Bytes("node-a"), Bytes("10.0.0.7:6675"), Bytes("") };
-    CHECK_FALSE(VerifyFields(key, SigningDomain::DiscoveryProof, padded, honest));
+    CHECK_FALSE(VerifyFields(key, SigningDomain::NodeProof, padded, honest));
 }
 
 TEST_CASE("The label boundary cannot be shifted into", "[cluster][signing]")

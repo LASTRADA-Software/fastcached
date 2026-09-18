@@ -6,8 +6,8 @@
 #include "NodeCredential.hpp"
 
 #include <FastCache/Core/BoundedDrain.hpp>
+#include <FastCache/Core/Ed25519.hpp>
 #include <FastCache/Core/ISecureRandom.hpp>
-#include <FastCache/Core/SecureBytes.hpp>
 #include <FastCache/Net/IConnector.hpp>
 #include <FastCache/Net/ISocket.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
@@ -17,37 +17,35 @@
 #include <expected>
 #include <filesystem>
 #include <memory>
+#include <span>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace FastCache::Node
 {
 
 /// @file EnrollClient.hpp
-/// `--enroll-from`: a keyless fresh install asking a seed to let it in.
+/// `--enroll-from`: a fresh install asking a seed to admit it under the key it minted.
 ///
-/// **A one-shot mode that opens NO surfaces at all.** It mints this node's identity
-/// into `--cluster-dir`, dials the seed, polls until a person decides, writes the
-/// cluster key with a protected access list, says what to do next, and exits -- the
-/// same idiom `RunClusterAdmin` uses, and for the same reason: no reactor exists on
-/// this path, so a blocking dial spends a thread this process owns outright.
+/// **A one-shot mode that opens NO surfaces at all.** It mints this node's identity and its
+/// identity key into its state directory, dials the seed, polls until a person decides,
+/// checks the roster it is handed, says what to do next, and exits -- the same idiom
+/// `RunClusterAdmin` uses, and for the same reason: no reactor exists on this path, so a
+/// blocking dial spends a thread this process owns outright.
 ///
-/// Because it opens nothing there is no widening question and no reload to refuse,
-/// and by the time the node starts normally its `clusterKeyFile` is non-empty, so
-/// both startup guards that refuse a keyless node -- one that faces the network and
-/// admits remote peers (#282), and one that runs consensus at all (#1308) -- are
-/// satisfied forever after. Those guards must keep refusing; this mode is what makes
-/// satisfying them possible without placing the key by hand on every machine first.
+/// **Nothing secret crosses** (#178). The request carries this node's PUBLIC key and the
+/// approved reply carries the cluster's roster, which is every member's public key -- so a
+/// captured exchange admits nobody, and there is nothing to spend. What the exchange cannot
+/// defend against on its own is somebody between the two ends swapping one public key for
+/// another, which is why this mode PRINTS both things an operator compares: this node's key
+/// before it asks, against the key `--enroll-list` shows, and the roster's fingerprint once it
+/// is admitted, against the fingerprint `--enroll-list` shows beside this node's row.
 ///
-/// **The key crosses in cleartext.** The `0xFC` wire has no TLS -- `--tls-*` cover
-/// the admin surface only -- and what a captured cluster key buys is admission to the
-/// fleet, which is object injection into everybody's build. That is accepted
-/// deliberately: one round trip, at a moment an operator chose, to a machine they
-/// approved by name, in place of thirty-nine manual secret placements that each have
-/// an exposure of their own. Sealing the reply to an ephemeral joiner key is the
-/// upgrade and needs a curve this tree does not carry, so it is a follow-up rather
-/// than a blocker. An out-of-band passphrase is NOT the answer: it reintroduces the
-/// distribution problem being solved.
+/// The cluster's pre-shared key is NOT handed over any more. Until #178 retires it, a node
+/// that serves leases or proves itself on the node port still needs `--cluster-key-file`,
+/// placed the way it was before enrollment existed; that is said in the next steps this mode
+/// prints, rather than discovered at the next start.
 
 /// How long between two polls of a pending enrollment.
 ///
@@ -72,8 +70,8 @@ inline constexpr std::chrono::milliseconds EnrollTotalBound { std::chrono::minut
 /// live leader, and the decision needs neither.
 enum class EnrollProgress : std::uint8_t
 {
-    Waiting,  ///< Recorded and undecided. Poll again.
-    Admitted, ///< Approved, and the key is in hand.
+    Waiting,  ///< Not admitted yet. Poll again.
+    Admitted, ///< Admitted, and the roster is in hand.
     Refused,  ///< A person said no. Stop; asking again will not help.
     Redirect, ///< This node does not lead. `detail` names where to ask instead.
     Closed,   ///< No window is open, or it is full. Poll again and say why.
@@ -92,32 +90,12 @@ struct EnrollReading
     /// about the same reply.
     std::string detail;
 
-    /// The cluster key, non-empty exactly for `Admitted`.
+    /// The roster's bytes, exactly as the seed sent them, non-empty exactly for `Admitted`.
     ///
-    /// `SecureByteBuffer`, so **this holder's** storage is wiped by the allocator on
-    /// release rather than by somebody remembering to -- including the copies THIS value
-    /// makes, since the allocator travels with the type.
-    ///
-    /// It used to claim "every copy this value makes on its way to disk", and that
-    /// reached further than the type can. Two plain `std::vector<std::byte>` copies sit
-    /// on the journey and are not covered: `EncodeEnrollReply`'s return
-    /// (`CompileCacheWire.hpp`, server side) and `CacheOutcome::value`
-    /// (`CacheProtocol.hpp:119`, client side). Others are plausible and were NOT read --
-    /// the frame copy, the socket buffers, stdio's buffer behind `fwrite` -- and are
-    /// named as unverified rather than folded into the count.
-    ///
-    /// That residue is an ACCEPTED cost, not an open defect: this exchange carries the
-    /// key in cleartext by design, which is why the window is closed by default and why
-    /// opening it is an operator's deliberate act. A sentence promising more than the
-    /// mechanism delivers is what stops the next reader asking.
-    ///
-    /// **Named `clusterKey` and not `key` so the guard can find it.**
-    /// `scripts/check-credential-containers.sh` locates credential holders BY NAME, and
-    /// a bare `key` cannot be one of its terms -- this is a cache, where `key` is the
-    /// thing being cached in most of the tree. An unfindable holder is the mirror of the
-    /// defect that scan exists to prevent: not a term that stopped matching, but a path
-    /// that was never added.
-    SecureByteBuffer clusterKey;
+    /// Kept as BYTES rather than decoded here, because the fingerprint an operator compares is
+    /// taken over the bytes: a re-encoding of a decoded value would be a second input the two
+    /// ends could disagree about. No secret, so a plain vector (#178).
+    std::vector<std::byte> roster;
 };
 
 /// Read one `Enroll` reply.
@@ -191,29 +169,33 @@ enum class ConsensusHistory : std::uint8_t
 /// @return The id and the consensus endpoint, or why neither could be derived.
 [[nodiscard]] std::expected<std::pair<std::string, std::string>, std::string> EnrollClaim(NodeConfig const& cfg);
 
-/// Write an approved joiner's key where this node will read it from.
+/// Who this node is asking to be admitted as: everything the request states about it.
+struct JoinerIdentity
+{
+    std::string nodeId;       ///< The id it minted.
+    std::string raftEndpoint; ///< Where its consensus port answers; empty for a worker.
+    CompileCacheWire::EnrollRole role { CompileCacheWire::EnrollRole::Member }; ///< What it asks to be.
+    Ed25519PublicKey publicKey {};                                              ///< The key it asks under.
+};
+
+/// What to tell the operator once a roster has been handed over, or why it cannot be believed.
 ///
-/// Creates the parent directory, writes the bytes, and then narrows the FILE's own
-/// access list -- `SecureSecretFileForServices`, the same call `--seed-config` makes
-/// and for the same reason: on Windows a machine-wide directory grants read broadly
-/// and everything created inside inherits it, so a key written without this step is
-/// one every standard account can read.
+/// **The roster must record THIS node under THIS key**, and that is asserted rather than
+/// assumed: the leader answers `Approved` only once its own roster does, so a roster that
+/// lacks this node was not produced by the cluster this node asked -- or an operator approved
+/// another machine's key for this id. Either way nothing it names can be trusted, and saying
+/// "admitted" over it would be a confident wrong signal.
 ///
-/// Refuses to overwrite an existing file. A machine that already holds a cluster key
-/// is either already a member or is being pointed at a second cluster, and both are
-/// decisions an operator makes by removing the file deliberately.
-///
-/// That refusal is the CREATE itself (`fopen` with `"wbx"`, i.e. `O_EXCL`) and not a
-/// check in front of it, so there is no window in which a file that appeared a moment
-/// ago is truncated, and no way for a stat this process cannot perform to be read as
-/// "absent". The distinction is load-bearing rather than stylistic: the mode that a
-/// pre-check would guard is `"wb"`, which TRUNCATES, so a guard that fails open
-/// destroys the key the machine is holding.
-/// @param path Where `--cluster-key-file` says the key lives.
-/// @param key The bytes the leader handed over.
-/// @return Nothing, or why the key could not be stored.
-[[nodiscard]] std::expected<void, std::string> StoreClusterKey(std::filesystem::path const& path,
-                                                               SecureByteBuffer const& key);
+/// Pure, so what an admitted machine is told -- the fingerprint to compare, and the
+/// `--raft-peer` tokens its next start needs -- is pinned by a test rather than reachable only
+/// through a dial loop.
+/// @param self Who this node asked to be admitted as.
+/// @param roster The roster's bytes, as received.
+/// @param keyFileNamed Whether this node already names a `--cluster-key-file`.
+/// @return The text to print, or why the roster is refused.
+[[nodiscard]] std::expected<std::string, std::string> DescribeAdmission(JoinerIdentity const& self,
+                                                                        std::span<std::byte const> roster,
+                                                                        bool keyFileNamed);
 
 /// Render an enrollment report the way an operator reads it before deciding.
 ///
@@ -224,8 +206,12 @@ enum class ConsensusHistory : std::uint8_t
 /// at forty rows nobody notices an unmarked mismatch, so the mark is the whole of what
 /// this rendering adds over a list of ids.
 ///
+/// **Each row shows the joiner's key WHOLE**, which is what an operator compares against the
+/// key the joiner printed before approving it (#178), and the fingerprint of the roster the
+/// leader last handed it, which is what the joiner's own print is compared against afterwards.
+///
 /// A free function so it is testable without a socket: what an operator is shown before
-/// they hand over the fleet's key is worth pinning, and a renderer inside the dial loop
+/// they admit a machine to the fleet is worth pinning, and a renderer inside the dial loop
 /// would only be reachable through one.
 /// @param report What the leader answered.
 /// @return The text to print, ending in a newline.
@@ -250,10 +236,10 @@ enum class ConsensusHistory : std::uint8_t
 
 /// Run `--enroll-from` to completion.
 ///
-/// @param cfg The resolved configuration; `enrollFrom`, `clusterDir` and
-///        `clusterKeyFile` are the fields read.
+/// @param cfg The resolved configuration; `enrollFrom` and the state directory are the fields
+///        read, and `clusterKeyFile` only to say whether the next steps need one.
 /// @param credential What to present to the seed, read where it is presented.
-/// @param random Where a minted identity's bits come from.
+/// @param random Where a minted identity's bits come from, the id's and the key's alike.
 /// @param wait How the poll loop spends the gap between two asks, and how it measures
 ///        the bound it is spending -- the seam `DrainWithin` takes, for the reason it
 ///        takes one: a loop that counts its requested sleeps states a bound and

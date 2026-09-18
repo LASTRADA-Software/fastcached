@@ -424,6 +424,18 @@ class ConsensusTier final: public Distributed::IClusterAdmin, public IConsensusS
         return _self;
     }
 
+    /// This node's key material and the roster's keys, as the Raft peer wire proves them.
+    ///
+    /// Exposed because discovery proves the SAME key on the segment (#178): a beacon signed with
+    /// one reading of the key file and a handshake signed with another could disagree about who
+    /// this node is, and a proof classified against a second copy of the roster could disagree
+    /// about who everybody else is. One object answers both.
+    /// @return The keys; valid for as long as this tier.
+    [[nodiscard]] Consensus::IRaftPeerKeys const& Keys() const noexcept
+    {
+        return _roster;
+    }
+
     /// The address this node's peer port bound.
     [[nodiscard]] std::string const& BoundEndpoint() const noexcept
     {

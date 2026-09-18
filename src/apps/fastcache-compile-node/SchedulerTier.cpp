@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "AdminEndpoint.hpp"
-#include "DiscoveryTier.hpp"
+#include "ClusterKeySource.hpp"
 #include "NodeIoLoop.hpp"
 #include "SchedulerTier.hpp"
 
@@ -82,11 +82,10 @@ std::expected<std::unique_ptr<SchedulerTier>, std::string> SchedulerTier::Start(
     ILogger& logger,
     NodeConditions& conditions)
 {
-    // The key a lease grant is signed with, and the same file discovery proves the
-    // cluster's identity from -- read again here rather than passed down, because the
-    // scheduler is built before discovery is and may be the only one of the two an
-    // operator asked for. Reading a small file twice at startup is not a cost worth a
-    // dependency between two tiers that otherwise have none.
+    // The key a lease grant is signed with, and the same file the node proof reads -- read
+    // again here rather than passed down, because the scheduler may be the only one of the
+    // surfaces an operator asked for. Reading a small file twice at startup is not a cost
+    // worth a dependency between two tiers that otherwise have none.
     //
     // Absent is legal and means unsigned grants; unreadable is not, and is fatal for
     // the reason the header states.

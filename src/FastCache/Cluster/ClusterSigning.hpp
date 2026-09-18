@@ -19,9 +19,9 @@
 ///
 /// ## Why this exists
 ///
-/// One key MACs several different things -- a discovery proof, a lease token, a node's
-/// proof on the `0xFC` surface -- and the first two used to build their own messages
-/// inline, from `HmacSha256` and
+/// One key MACs several different things -- a lease token and a node's proof on the `0xFC`
+/// surface today, and a discovery proof until #178 moved it to each node's own key -- and the
+/// first two ever written built their own messages inline, from `HmacSha256` and
 /// `WireFields::Encode`. Those are primitives, not a construction: what a message
 /// is made of was written twice, and the rulebook's requirement that *every*
 /// message carry a domain label was true of exactly one of them. The lease
@@ -52,7 +52,7 @@
 ///   would happily authenticate each other's tags -- two machines agreeing on "no
 ///   secret" and calling it authentication. Both wires already refuse that, at
 ///   different layers and for different reasons: `ReadClusterKey` refuses a file
-///   holding fewer than `MinimumKeyBytes` before a `DiscoveryConfig` is built, and
+///   holding fewer than `MinimumKeyBytes` before any tier is handed it, and
 ///   `AuthenticateLeaseToken` refuses an empty key at verify because a verifier
 ///   that legitimately runs without one must decide so in the open rather than by
 ///   omission. Neither belongs here: it is a policy about what a *deployment*
@@ -77,11 +77,14 @@ namespace FastCache::Cluster
 /// nowhere.
 enum class SigningDomain : std::uint8_t
 {
-    /// The LAN handshake's proof of key possession. See `Cluster/DiscoveryWire`.
-    DiscoveryProof = 0,
-
     /// The scheduler's signed grant. See `Distributed/LeaseToken`.
-    LeaseToken,
+    ///
+    /// The LAN discovery proof was a row here until #178, when it moved to a signature by each
+    /// node's OWN key (`DiscoveryWire::ProofSignatureLabel`) and this key stopped proving
+    /// anything on the segment. Its label, `fastcache-discovery-v1`, is retired and never
+    /// reused: a new row spelled that way would accept every tag an older build ever minted
+    /// under it.
+    LeaseToken = 0,
 
     /// A caller's proof, on the `0xFC` surface, that it holds the cluster key. See
     /// `Distributed/NodeProof`.
@@ -120,14 +123,12 @@ struct SigningDomainDescriptor
 /// act rather than something to discover.
 ///
 /// `fastcache-lease-v1` is the label the lease token already carried, spelled
-/// identically, so moving that call site onto this seam changes no byte a lease
-/// authenticates. `fastcache-discovery-v1` is new: the discovery proof had no
-/// label at all, so its message -- and therefore every proof tag -- changes.
+/// identically, so moving that call site onto this seam changed no byte a lease
+/// authenticates. `fastcache-discovery-v1` was the discovery proof's, retired with it (#178).
 ///
 /// `fastcache-node-proof-v1` is the `0xFC` surface's (#1428): before it a caller there
 /// proved nothing, so there is no earlier tag for it to stay compatible with.
 inline constexpr EnumTable<SigningDomain, SigningDomainDescriptor> SigningDomainTable { {
-    { .domain = SigningDomain::DiscoveryProof, .label = "fastcache-discovery-v1" },
     { .domain = SigningDomain::LeaseToken, .label = "fastcache-lease-v1" },
     { .domain = SigningDomain::NodeProof, .label = "fastcache-node-proof-v1" },
 } };
@@ -216,8 +217,7 @@ static_assert(SigningLabelsSeparateDomains(),
 ///
 /// **What that does and does not guarantee.** This module exposes no other
 /// comparison, and each wire's verifier goes through it -- `VerifyLeaseToken` via
-/// `AuthenticateLeaseToken`, `DiscoveryService` via `DiscoveryWire::VerifyProofTag`,
-/// and the `0xFC` surface via `VerifyNodeProof`. It does NOT make a hand-rolled comparison
+/// `AuthenticateLeaseToken`, and the `0xFC` surface via `VerifyNodeProof`. It does NOT make a hand-rolled comparison
 /// impossible: signing entry points are public because minting is a separate act,
 /// so a future caller could take a tag from one and compare it itself. That is
 /// the residual, and it is smaller than it was rather than gone. `ctest -R
