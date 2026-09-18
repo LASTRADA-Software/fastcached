@@ -101,6 +101,20 @@
 # against each other, and for PowerShell the relaxation is every brace-enclosed block. Both limits are stated there.
 #
 # bash 3.2 and a POSIX awk: this runs on macOS's `/bin/bash` and BSD awk.
+#
+# ## What the self-test costs, and why its TIMEOUT did not move (#1550)
+#
+# Its cost is PROCESS CREATIONS, which Windows charges for heavily and an x64-emulated
+# `windows-11-arm` more heavily still: `workflow-step-env-selftest` took 77.97 s of its `TIMEOUT 120`
+# on `Windows-cl-release-arm64` and 24-35 s on the x64 Windows legs (run 35340951724). These figures
+# are pinned to the conditions they were taken under, not live values. Counted with strace over the
+# process tree at a0a4d09d, bash 5.3 on Linux: 932 forks and 533 execs. A `mkdir` and a `cat` per
+# case staged each workflow, and `Flatten` ran a `printf | tr` pipeline in a subshell on every scan.
+# All three are now the shell's own work: 414 forks and 209 execs (bash 3.2.57: 1021 and 533 became
+# 503 and 209). Git Bash on a Windows 11 x64 host went from 12.5-14.8 s to 6.7-7.3 s. What remains
+# is what the cases exist to drive -- one `awk` per scan and the `git` a composite case stages
+# through -- plus a subshell per case, kept because it is what stops one case's state reaching the
+# next. `TIMEOUT 120` stays: a timeout is not a verdict about the tree (#1515).
 
 set -uo pipefail
 
@@ -201,12 +215,15 @@ unplaced-run|Every \`run:\` key outside a scalar is counted without the reader a
 order|A step's script is read in ORDER, because bash is: the name is expanded where the line stands, so a read above the line that assigns it dies there under \`set -u\` and expands EMPTY without it, taking a branch the wrong way (#1174, #1461). Move the assignment above the read, or give the step's \`env:\` a row for it. A read inside a LOOP body or a FUNCTION body is judged against the whole script instead -- a loop body runs again and a function body runs where it is called -- so this is a read at the script's top level.
 unreadable-construct|This check follows a step's loops and functions to know where ordering applies, and lost the one it was inside: the \`do\`/\`done\` pairs, or a function's braces, do not balance in the CODE the lexer left. A \`do\`, a \`done\` or a brace inside a string or a heredoc is masked and cannot cause this. Write the construct so it balances, or teach the reader the shape, with a case."
 
-# The tables as awk takes them: a -v value may not hold a newline on BSD awk.
-Flatten() { printf '%s' "$1" | tr '\n' "$2"; }
-bashNames="$(Flatten "$RunnerProvided $BashProvided" ' ')"
-windowsNames="$(Flatten "$RunnerProvided $WindowsProvided" ' ')"
-shellRows="$(Flatten "$ShellModels" ' ')"
-remedyRows="$(Flatten "$Remedies" $'\036')"
+# The tables as awk takes them: a -v value may not hold a newline on BSD awk. Done by the shell
+# into a named variable, because `Scan` flattens once per workflow and the self-test scans one per
+# case: as `$(printf | tr)` that was a subshell, a pipeline and a `tr` each time (#1550).
+# @param 1 The variable to assign. @param 2 The text. @param 3 What each newline becomes.
+Flatten() { printf -v "$1" '%s' "${2//$'\n'/$3}"; }
+Flatten bashNames "$RunnerProvided $BashProvided" ' '
+Flatten windowsNames "$RunnerProvided $WindowsProvided" ' '
+Flatten shellRows "$ShellModels" ' '
+Flatten remedyRows "$Remedies" $'\036'
 
 problems=0
 
@@ -218,7 +235,7 @@ Scan() {
     # Flattened HERE rather than once at the top, because a self-test case stages its own
     # `ActionExports` and a value read before that would be the real row every time.
     local exportRows
-    exportRows="$(Flatten "$ActionExports" ' ')"
+    Flatten exportRows "$ActionExports" ' '
     awk -v bashNames="$bashNames" -v windowsNames="$windowsNames" -v shells="$shellRows" -v remedies="$remedyRows" \
         -v plant="$2" -v PlantName="FASTCACHED_PLANTED_READ" -v PlantExprName="FASTCACHED_PLANTED_EXPR" \
         -v exports="$exportRows" \
@@ -427,20 +444,37 @@ SelfTest() {
     ActionExports=""
     tmp="$(mktemp -d "${TMPDIR:-/tmp}/workflow-step-env-selftest.XXXXXX")" || { echo "cannot create a scratch directory"; exit 2; }
     trap 'rm -rf -- "$tmp"' EXIT
+    # Every case stages its workflow into ONE directory, overwriting the last, and `nofile` judges
+    # one that stays empty. A directory per case cost a `mkdir` each, and the staging a `cat`: a
+    # process creation apiece, which Windows charges tens of milliseconds for and an x64-emulated
+    # windows-11-arm more (#1550).
+    mkdir -p "$tmp/case" "$tmp/empty" || { echo "cannot create the case directories"; exit 2; }
 
-    # Judge the workflow on stdin, alone in a directory of its own.
+    # Write stdin to a file, byte for byte, without a `cat`. Nothing staged here holds a NUL byte,
+    # which is the one thing `read -d ''` cannot carry.
+    # @param 1 The file to write.
+    WriteStdinTo() {
+        local body=""
+        IFS= read -r -d '' body || true
+        printf '%s' "$body" > "$1"
+    }
+
+    # Judge the workflow on stdin, alone in a directory.
     # @param 1 Case name. @param 2 Expected status (0 or 1). @param 3 Text the output must hold.
-    # @param 4 Mode (plain or plant). @param 5 `nofile` to stage an empty directory and read nothing from stdin.
+    # @param 4 Mode (plain or plant). @param 5 `nofile` to judge an empty directory and read nothing from stdin.
     # @param 6 1 to require that at least one `${{ env.NAME }}` expression was read, else 0.
     Case() {
-        local name="$1" want="$2" expect="$3" mode="${4:-plain}" out got
+        local name="$1" want="$2" expect="$3" mode="${4:-plain}" out got dir="$tmp/case"
         # OFF by default here for the reason `JudgingTheRealTree` records: a staged tree reads no
         # expression and uses no action, and the cases that drive either guard pass 1 as their
         # sixth argument.
         local JudgingTheRealTree="${6:-0}"
-        mkdir -p "$tmp/$name"
-        [ "${5:-}" = nofile ] || cat > "$tmp/$name/wf.yml"
-        out="$(problems=0; Judge "$tmp/$name" "$mode" 2>&1)"
+        if [ "${5:-}" = nofile ]; then
+            dir="$tmp/empty"
+        else
+            WriteStdinTo "$dir/wf.yml"
+        fi
+        out="$(problems=0; Judge "$dir" "$mode" 2>&1)"
         got=$?
         ran=$((ran + 1))
         if [ "$got" != "$want" ]; then
@@ -1656,7 +1690,8 @@ WF
     # Write stdin to a path in a case's repository, and track it unless told not to.
     # @param 1 Case name. @param 2 Path in the repository. @param 3 `untracked` to leave it out of the index.
     Stage() {
-        if ! { mkdir -p "$(dirname "$tmp/$1/$2")" && cat > "$tmp/$1/$2" \
+        local path="$tmp/$1/$2"
+        if ! { { [ -d "${path%/*}" ] || mkdir -p "${path%/*}"; } && WriteStdinTo "$path" \
             && { [ -d "$tmp/$1/.git" ] || git -C "$tmp/$1" init -q >/dev/null 2>&1; } \
             && { [ "${3:-}" = untracked ] || git -C "$tmp/$1" add -- "$2" >/dev/null 2>&1; }; }; then
             failures=$((failures + 1))
@@ -1670,12 +1705,12 @@ WF
     #          the function alone.
     ActionCase() {
         local name="$1" want="$2" expect="$3" how="${4:-function}" out got
-        mkdir -p "$tmp/$name"
+        [ -d "$tmp/$name" ] || mkdir -p "$tmp/$name"
         # A case tree is a repository, so it owns the one answer to what is third-party. Staged here rather than per
         # case, because a case that forgot it would refuse for the wrong reason; `rootsUnreadable` is the case that
         # deliberately has none.
         if [ ! -e "$tmp/$name/scripts/lib/third-party-roots.txt" ] && [ "$name" != rootsUnreadable ]; then
-            mkdir -p "$tmp/$name/scripts/lib" && printf 'vendor/endo
+            { [ -d "$tmp/$name/scripts/lib" ] || mkdir -p "$tmp/$name/scripts/lib"; } && printf 'vendor/endo
 ' > "$tmp/$name/scripts/lib/third-party-roots.txt"
         fi
         if [ "$how" = script ]; then
