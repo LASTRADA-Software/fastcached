@@ -7520,7 +7520,20 @@ set_tests_properties("cli-exit-code-docs-selftest" PROPERTIES
 # in the same configuration with `-fno-sanitize=all`, which must come back without it -- so the
 # reader is watched saying "absent" as well as "present". ASan and TSan only: UBSan leaves no
 # per-object init to read, and MSVC has no `nm`.
-if(TARGET fastcache-tui-objects AND (ENABLE_SANITIZER_ADDRESS OR ENABLE_SANITIZER_THREAD) AND NOT MSVC AND CMAKE_NM)
+#
+# Monocypher (#178) is read here too, from the targets cmake/Monocypher.cmake names, and it is
+# unconditional where the TUI is not -- so the check now runs in a sanitizer build with
+# `FASTCACHED_BUILD_TUI=OFF` as well, reading the one vendored copy that build compiles.
+if((ENABLE_SANITIZER_ADDRESS OR ENABLE_SANITIZER_THREAD) AND NOT MSVC AND CMAKE_NM)
+    set(_fcVendoredObjectTargets ${FASTCACHED_MONOCYPHER_TARGETS})
+    if(TARGET fastcache-tui-objects)
+        list(APPEND _fcVendoredObjectTargets fastcache-tui-objects)
+    endif()
+    set(_fcVendoredObjects "")
+    foreach(_fcVendoredObjectTarget IN LISTS _fcVendoredObjectTargets)
+        list(APPEND _fcVendoredObjects "$<JOIN:$<TARGET_OBJECTS:${_fcVendoredObjectTarget}>,|>")
+    endforeach()
+    list(JOIN _fcVendoredObjects "|" _fcVendoredObjects)
     add_library(sanitizer-absent-probe OBJECT SanitizerAbsentProbe.cpp)
     target_compile_options(sanitizer-absent-probe PRIVATE -fno-sanitize=all)
     set(_fcSanitizerInitSymbols "")
@@ -7536,7 +7549,7 @@ if(TARGET fastcache-tui-objects AND (ENABLE_SANITIZER_ADDRESS OR ENABLE_SANITIZE
         COMMAND ${CMAKE_COMMAND}
             "-DFASTCACHED_NM=${CMAKE_NM}"
             "-DFASTCACHED_SYMBOLS=${_fcSanitizerInitSymbols}"
-            "-DFASTCACHED_INSTRUMENTED=$<JOIN:$<TARGET_OBJECTS:fastcache-tui-objects>,|>"
+            "-DFASTCACHED_INSTRUMENTED=${_fcVendoredObjects}"
             "-DFASTCACHED_UNINSTRUMENTED=$<JOIN:$<TARGET_OBJECTS:sanitizer-absent-probe>,|>"
             -P "${CMAKE_SOURCE_DIR}/scripts/check-sanitized-objects.cmake"
     )
