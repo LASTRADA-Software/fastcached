@@ -736,11 +736,16 @@ determinism rests on.
       the wheel segfaulted on a unit #1392 added, where apt, built from the same commit, exited 0.
   - **A crash the declared build is KNOWN to have is a row of
     `scripts/check-clang-tidy-known-defects.sh`, never a disabled check.** The tree names the
-    offending value first at every site, with a ONE-line comment naming the check and the tracking
-    issue, and each row plants the crashing shape, a named control and a unit the check reports.
+    offending value first at every site, with a ONE-line comment naming the check and the issue
+    that documents the defect, and each row plants the crashing shape, a named control and a unit the check reports.
     Both CI jobs and the gate run `--installed` against the identified build, so the release that
     fixes the defect goes red there and says what the change must remove. apt's silence on the same
     shape is a null pointer read by luck, and it is not a reason to prefer apt: a crash fails CLOSED.
+    **A row is its own record, so it needs no open issue:** it fires on the one event the defect
+    waits for, going red on the change that moves the pin and LISTING the site comments to delete,
+    so an issue held open for that event is a second, unwired copy of the tripwire. The issue a row
+    names DOCUMENTS the defect, open or closed (#1410), and an EMPTY table passes every mode, so
+    retiring the last row leaves a working guard.
   - **One question, three askers.** `--resolve` hands a local run the binary `FASTCACHED_CLANG_TIDY`
     names, or the one installed at `${XDG_DATA_HOME:-~/.local/share}/fastcached/clang-tidy/<version>`,
     only after identifying it, and names the exact `pip install --target` command when it cannot.
@@ -6239,15 +6244,6 @@ pointer.
   entry under "Language and ABI pitfalls" being obeyed, not a gap in it: neither platform has a CI
   leg to compile a branch for it. It closes when each has one, and that change removes the `#1432`
   comments in `Core/CpuFeatures` and this entry.
-
-- **[#1410](https://github.com/LASTRADA-Software/fastcached/issues/1410)** — the
-  declared clang-tidy build crashes in `modernize-min-max-use-initializer-list` on a call through a
-  function pointer inside a `std::max({...})` or `std::min({...})` list. The upstream check dereferences
-  every inner call's direct callee without a null test, and that line is unchanged on llvm `main`.
-  `DashboardPanel.cpp` names the value first at its one site (a census of all 684 gate units found
-  no other), and `check-clang-tidy-known-defects.sh` asserts the crash against the declared build.
-  It closes when the pin moves to a release carrying the fix: the guard's row flips red, and that
-  change removes the row, the site comments naming this issue, and this entry.
 
 - **[#829](https://github.com/LASTRADA-Software/fastcached/issues/829)** — six
   contexts are still `Undecided` in `check-merge-queue-contexts.sh`'s binding table

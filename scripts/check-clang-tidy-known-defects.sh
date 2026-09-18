@@ -8,8 +8,8 @@
 # The analyser `.clang-tidy-version` declares crashes on some source shapes. The tree rewrites every site of such a
 # shape rather than disable the check (#1404): a crash fails the build closed, and a disabled check is NOLINT by other
 # means. But a rewrite with no reason beside it reads as an accident to the next cleanup, and nothing would say when it
-# may come out. So each defect is a ROW below, carrying the check it lives in, the issue tracking it, and three units
-# planted and run through the declared build:
+# may come out. So each defect is a ROW below, carrying the check it lives in, the issue that documents it, and three
+# units planted and run through the declared build:
 #
 #   crashes   the shape itself, which the build must STILL crash on: exit 139 and a stack dump. Measured on the Linux
 #             wheel and on the Windows wheels under Git Bash, which reports the access violation as 139 too.
@@ -18,22 +18,31 @@
 #   live      a shape the check reports, which it must report -- so the check is enabled and running in this build,
 #             and `crashes` not crashing can mean only that the defect is gone.
 #
-# When the pin moves to an LLVM carrying the upstream fix, `crashes` stops crashing and `--installed` goes red, naming
-# what the change that makes it green removes: the row, the site comments naming its issue, and the rulebook entry.
+# When the pin moves to an LLVM carrying the upstream fix, `crashes` stops crashing and `--installed` goes red ON THE
+# CHANGE THAT MOVED THE PIN, naming what that change removes: the row, and the comment naming its issue at each site,
+# which it lists. The rewrites themselves may stay.
+#
+# **So a row is its own record, and needs no open issue.** The event a known defect waits for is the pin moving, and
+# the row is what fires on it; an issue held open for the same event would be a second copy of the tripwire, and the
+# one nothing wires. The issue a row names is where the defect is DOCUMENTED, open or closed (#1410). For the same
+# reason a table with NO rows is legal in every mode: the change that retires the last defect deletes the last row,
+# and the guard it leaves behind must still pass.
 #
 # ## Modes
 #
-#   (default)           Every row is well formed; its issue leads an entry in the `## Open work` section of
-#                       `.agent/rules/build-and-toolchain.md`; and every source line under `src/` that names a row's
-#                       check also names that row's issue. A site comment is one line for exactly that reason. Needs
-#                       no analyser, runs in the default ctest set.
+#   (default)           Every row is well formed, and every source line under `src/` that names a row's check also
+#                       names that row's issue -- a site comment is one line for exactly that reason. Needs no
+#                       analyser, runs in the default ctest set.
 #   --installed <exe>   Run every row's three units through <exe> and require the outcomes above. Run by both
 #                       clang-tidy jobs after they identify the install, and by local-gate.sh after it resolves the
 #                       analyser. Not a ctest: no build leg has the analyser, so it would skip everywhere (#1135).
-#   --self-test         Drive the decision over every outcome, `--installed` end to end over stub analysers, and the
-#                       default mode over synthetic trees.
+#   --self-test         Drive the decision over every outcome, and both other modes end to end over COPIES of this
+#                       script carrying a sample table -- one row, a malformed row, and none -- so no case depends on
+#                       what the shipped table holds. The shipped tree is checked last, against the shipped table.
 #
-# bash 3.2: the default and self-test modes run in ctest on macOS.
+# bash 3.2: the default and self-test modes run in ctest on macOS. There, `"${Rows[@]}"` on an EMPTY array is an
+# unbound variable under `set -u` -- measured on 3.2.57, and fixed only in bash 4.4 -- so every walk of the table is
+# `${Rows[@]+"${Rows[@]}"}`. `${#Rows[@]}` is safe on 3.2 and is used as it is.
 #
 # Usage:
 #   bash scripts/check-clang-tidy-known-defects.sh [<source-dir>]
@@ -143,33 +152,25 @@ SitesOf() {
     done <<< "$found"
 }
 
+# An empty table is legal (see the header), and says so rather than passing in silence: a run that printed nothing
+# reads the same whether it found no rows or never got as far as looking.
+# $1 = what there is nothing to do, for the sentence.
+NoRows() {
+    echo "no known defect: the table in $(basename "$0") has no rows, so there is nothing $1"
+}
+
 CheckStatic() {
-    local dir="$1" rulebook="$1/.agent/rules/build-and-toolchain.md" row openWork site bad=0 count unnamed
-    if [ ! -f "$rulebook" ]; then
-        echo "FAIL: $rulebook does not exist, so no row's issue can be found in its Open work"
-        return 1
+    local dir="$1" row site bad=0 count unnamed
+    if [ "${#Rows[@]}" -eq 0 ]; then
+        NoRows "to ask of the sources under $dir/src"
+        return 0
     fi
-    # The section from its heading to the next `## ` heading.
-    openWork="$(sed -n '/^## Open work$/,/^## /p' "$rulebook")"
-    if [ -z "$openWork" ]; then
-        echo "FAIL: $rulebook has no '## Open work' section, so no row's issue can be found in it"
-        return 1
-    fi
-    [ "${#Rows[@]}" -gt 0 ] || { echo "FAIL: the defect table is empty, which this check cannot tell from a table it failed to read"; return 1; }
-    for row in "${Rows[@]}"; do
+    for row in ${Rows[@]+"${Rows[@]}"}; do
         if ! SplitRow "$row"; then
             echo "FAIL: malformed row '${row%%|*}': want name|check|issue|crashes|named|live, a check name, a numeric issue"
             bad=1
             continue
         fi
-        case $'\n'"$openWork" in
-            *$'\n'"- **[#$RowIssue]("*) ;;
-            *)
-                echo "FAIL: row '$RowName' is tracked by #$RowIssue, which leads no entry in the '## Open work' section of"
-                echo "      $rulebook. A known defect the tree works around is open work until the pinned build carries the fix."
-                bad=1
-                ;;
-        esac
         if ! SitesOf "$dir"; then
             echo "FAIL: grep could not read the sources under $dir/src (exit $SitesStatus), so which lines name '$RowCheck' is"
             echo "      unknown -- which is not the same as none"
@@ -202,6 +203,21 @@ CheckStatic() {
     [ "$bad" -eq 0 ]
 }
 
+# $1 = the row's sites, as SitesOf found them; printed under the `fixed` remedy, which is the moment they are needed and
+# the last moment this script can list them: once the row is deleted, the default mode asks nothing about its check.
+ListSitesForRemedy() {
+    local dir="$1"
+    if ! SitesOf "$dir"; then
+        echo "             (grep could not read $dir/src, exit $SitesStatus -- so list them with the default mode BEFORE step 1)"
+        return
+    fi
+    if [ -z "$Sites" ]; then
+        echo "             (none: no source line under $dir/src names $RowCheck)"
+        return
+    fi
+    printf '%s' "$Sites" | sed 's/^/             /'
+}
+
 # $1 = the analyser. Every row's three units through it.
 CheckInstalled() {
     local exe="$1" dir="$2" row work unit rc out verdict bad=0 config
@@ -209,8 +225,12 @@ CheckInstalled() {
         echo "FAIL: '$exe' is not an executable here, so no known defect can be asked about"
         return 1
     fi
+    if [ "${#Rows[@]}" -eq 0 ]; then
+        NoRows "to ask $exe"
+        return 0
+    fi
     work="$(mktemp -d "${TMPDIR:-/tmp}/clang-tidy-known-defects.XXXXXX")" || { echo "FAIL: mktemp failed"; return 1; }
-    for row in "${Rows[@]}"; do
+    for row in ${Rows[@]+"${Rows[@]}"}; do
         SplitRow "$row" || { echo "FAIL: malformed row '${row%%|*}'; run the default mode"; bad=1; continue; }
         # A config of its own, so neither `.clang-tidy` nor WarningsAsErrors decides an outcome here.
         config="{Checks: '-*,$RowCheck', WarningsAsErrors: ''}"
@@ -233,11 +253,16 @@ CheckInstalled() {
                 echo "    $RowCheck reports the live unit -- so the rewritten sites stay as they are"
                 ;;
             fixed)
-                echo "FAIL: '$RowName' (#$RowIssue) no longer crashes $exe: the declared build carries the upstream fix."
-                echo "      This is the change that retires #$RowIssue. In it: delete this row, remove the comment naming #$RowIssue at"
-                echo "      each site the default mode lists, remove its '## Open work' entry in .agent/rules/build-and-toolchain.md,"
-                echo "      and close the issue. The rewrites may stay, they are ordinary code; and there is nothing to re-enable,"
-                echo "      because the check was never disabled."
+                echo "FAIL: '$RowName' (#$RowIssue) no longer crashes $exe: the declared build carries the upstream fix, so this"
+                echo "      row has done its job, and THIS change -- the one that moved the pin -- is where it retires:"
+                echo "        1. delete the row '$RowName' from Rows in scripts/check-clang-tidy-known-defects.sh. The table may be"
+                echo "           left empty: every mode of this script passes on an empty table."
+                echo "        2. delete the comment naming #$RowIssue on each line below that carries one. They are listed here"
+                echo "           because the default mode stops listing them the moment the row is gone:"
+                ListSitesForRemedy "$dir"
+                echo "        3. keep the rewrites at those sites: they are ordinary code. There is no check to re-enable,"
+                echo "           because it was never disabled."
+                echo "      Nothing here needs #$RowIssue open: it documents the defect, open or closed, and the row was the record."
                 echo "      All of that holds only for the DECLARED build: first see 'check-clang-tidy-version.sh --installed' accept"
                 echo "      $exe. Another build proves nothing -- apt's 22.1.8 snapshot, from the same commit, reads the same null"
                 echo "      pointer and survives, and this mode reports exactly this for it."
@@ -279,7 +304,12 @@ if [ "$Mode" = "self-test" ]; then
     Cases=0
     Failed=0
     Self="$0"
-    SplitRow "${Rows[0]}" || { echo "FAIL: the first row is malformed, so no case can be built from it"; exit 1; }
+
+    # A SAMPLE row, never the shipped table's first: the shipped table may hold no rows at all -- the change that
+    # retires the last defect leaves it that way -- and a self-test built on it would then have nothing to build from.
+    # Its units carry markers the stub analysers below recognise, and nothing a real analyser would parse.
+    SampleRow="sample-defect|sample-known-defect-check|4242|int Crashes() { return CRASH_MARKER; }|int Named() { return 0; }|int Live() { return LIVE_MARKER; }"
+    SplitRow "$SampleRow" || { echo "FAIL: the sample row is malformed, so no case can be built from it"; exit 1; }
     Dump=$'PLEASE submit a bug report\nStack dump:\n0.\tProgram arguments: clang-tidy'
     Warning="x.cpp:3:70: warning: do not use nested 'std::max' calls, use an initializer list instead [$RowCheck]"
 
@@ -326,15 +356,43 @@ if [ "$Mode" = "self-test" ]; then
     Splits "a row whose issue is not a number" 1 "name|some-check|#12|a|b|c"
     Splits "a row whose check is not a check name" 1 "name|Some Check|12|a|b|c"
     Splits "a row with an empty unit" 1 "name|some-check|12|a||c"
-    # The shipped rows are split again last, so the cases above cannot leave another row's fields behind.
-    SplitRow "${Rows[0]}"
+    # The sample is split again last, so the cases above cannot leave another row's fields behind.
+    SplitRow "$SampleRow"
 
-    # $1 = label, $2 = want (pass|refuse), $3 = required output fragment, rest = arguments to this script.
+    # A COPY of this script whose table holds exactly the rows given -- none for an empty table, which is the table
+    # the change retiring the last defect leaves. The whole `Rows=(` ... `)` block is replaced, and a copy in which it
+    # was not replaced exactly once is refused: one that kept the shipped rows would be testing those instead.
+    # $1 = the copy's path, rest = its rows (no `"` in any).
+    WithRows() {
+        local copy="$1" block="Rows=("$'\n'
+        shift
+        while [ $# -gt 0 ]; do
+            block="$block    \"$1\""$'\n'
+            shift
+        done
+        block="$block)"
+        if ! RowsBlock="$block" awk '
+            /^Rows=\($/ { print ENVIRON["RowsBlock"]; inBlock = 1; replaced++; next }
+            inBlock && /^\)$/ { inBlock = 0; next }
+            inBlock { next }
+            { print }
+            END { if (replaced != 1 || inBlock) exit 1 }
+        ' "$Self" > "$copy"; then
+            echo "FAIL: the Rows=( ... ) block of $Self was not replaced exactly once in $copy, so no case can use it"
+            exit 1
+        fi
+    }
+    WithRows "$Work/sample.sh" "$SampleRow"
+    WithRows "$Work/malformed.sh" "malformed|Not A Check|12|a|b|c"
+    WithRows "$Work/empty.sh"
+
+    # $1 = label, $2 = the script to run, $3 = want (pass|refuse), $4 = fragments the output must hold, one per line,
+    # $5 = a fragment it must NOT hold ("-" for none), rest = arguments to that script.
     Expect() {
-        local label="$1" want="$2" fragment="$3" output status got
-        shift 3
+        local label="$1" script="$2" want="$3" fragments="$4" absent="$5" output status got fragment missing=""
+        shift 5
         Cases=$((Cases + 1))
-        output="$("${BASH:-bash}" "$Self" "$@" 2>&1)"
+        output="$("${BASH:-bash}" "$script" "$@" 2>&1)"
         status=$?
         got="pass"
         [ "$status" -eq 0 ] || got="refuse"
@@ -344,15 +402,52 @@ if [ "$Mode" = "self-test" ]; then
             Failed=$((Failed + 1))
             return
         fi
-        case "$output" in
-            *"$fragment"*) echo "ok: self-test '$label' ($want)" ;;
-            *)
-                echo "FAIL: self-test '$label': $want as wanted, but the output lacks '$fragment'"
-                printf '%s\n' "$output" | sed 's/^/      | /'
-                Failed=$((Failed + 1))
-                ;;
-        esac
+        while IFS= read -r fragment; do
+            [ -n "$fragment" ] || continue
+            case "$output" in
+                *"$fragment"*) ;;
+                *) missing="$missing '$fragment'" ;;
+            esac
+        done <<< "$fragments"
+        if [ -n "$missing" ]; then
+            echo "FAIL: self-test '$label': $want as wanted, but the output lacks$missing"
+            printf '%s\n' "$output" | sed 's/^/      | /'
+            Failed=$((Failed + 1))
+            return
+        fi
+        if [ "$absent" != "-" ]; then
+            case "$output" in
+                *"$absent"*)
+                    echo "FAIL: self-test '$label': $want as wanted, but the output holds '$absent', which it must not"
+                    printf '%s\n' "$output" | sed 's/^/      | /'
+                    Failed=$((Failed + 1))
+                    return
+                    ;;
+            esac
+        fi
+        echo "ok: self-test '$label' ($want)"
     }
+
+    # Synthetic trees for the default mode. $1 = dir, $2 = the issue an `## Open work` entry leads (empty: an entry
+    # for another issue only), rest = src/x.cpp lines (none: no source at all). The rulebook is written only so that
+    # the "no Open work entry" case below can differ from its neighbour in that one fact.
+    Tree() {
+        local dir="$1" issue="$2"
+        shift 2
+        mkdir -p "$dir/.agent/rules" "$dir/src"
+        {
+            printf '# Build\n\n## Open work\n\n'
+            if [ -n "$issue" ]; then
+                printf -- '- **[#%s](https://example.invalid/%s)** -- a known defect.\n' "$issue" "$issue"
+            fi
+            printf -- '- **[#1](https://example.invalid/1)** -- something else.\n'
+        } > "$dir/.agent/rules/build-and-toolchain.md"
+        if [ $# -gt 0 ]; then
+            printf '%s\n' "$@" > "$dir/src/x.cpp"
+        fi
+    }
+    SiteComment="// Named first: $RowCheck crashes on a pointer call inside the list (#$RowIssue)."
+    Tree "$Work/good" "$RowIssue" "int a;" "$SiteComment"
 
     # Stub analysers: they read the unit they are handed and answer the way a build with or without the defect does.
     # Each also refuses a config that does not name the row's check, so a run that passed none cannot look like one.
@@ -367,9 +462,9 @@ if [ "$Mode" = "self-test" ]; then
             echo 'text="$(cat "$unit")"'
             echo 'case "$text" in'
             if [ "$2" = yes ]; then
-                echo '    *"width(1) })"*) echo "PLEASE submit a bug report"; echo "Stack dump:"; exit 139 ;;'
+                echo '    *CRASH_MARKER*) echo "PLEASE submit a bug report"; echo "Stack dump:"; exit 139 ;;'
             fi
-            echo "    *\"std::max(a, std::max\"*) echo \"\$unit:3:70: warning: do not use nested 'std::max' calls [$RowCheck]\"; exit 0 ;;"
+            echo "    *LIVE_MARKER*) echo \"\$unit:1:25: warning: do not use nested calls [$RowCheck]\"; exit 0 ;;"
             echo 'esac'
             echo 'exit 0'
         } > "$1"
@@ -379,57 +474,66 @@ if [ "$Mode" = "self-test" ]; then
     Stub "$Work/fixed" no
     printf '#!/usr/bin/env bash\necho "error: no such file" >&2\nexit 1\n' > "$Work/broken"
     chmod +x "$Work/broken"
-    Expect "--installed: a build with the defect" pass "still crashes on it" --installed "$Work/defective" "$SourceDir"
-    Expect "--installed: a build carrying the fix names what the retiring change removes" refuse \
-        "remove the comment naming #$RowIssue at" --installed "$Work/fixed" "$SourceDir"
-    Expect "--installed: an analyser that cannot parse anything" refuse "did not report the live unit" \
-        --installed "$Work/broken" "$SourceDir"
-    Expect "--installed: no such analyser" refuse "is not an executable here" --installed "$Work/absent" "$SourceDir"
 
-    # Synthetic trees for the default mode. $1 = dir, $2 = Open work lead issue (empty: none), rest = src/x.cpp lines.
-    Tree() {
-        local dir="$1" issue="$2"
-        shift 2
-        mkdir -p "$dir/.agent/rules" "$dir/src"
-        {
-            echo "# Build"
-            echo
-            echo "## Open work"
-            echo
-            if [ -n "$issue" ]; then
-                echo "- **[#$issue](https://example.invalid/$issue)** -- a known defect."
-            fi
-            echo "- **[#1](https://example.invalid/1)** -- something else."
-            echo
-            echo "## Appendix"
-        } > "$dir/.agent/rules/build-and-toolchain.md"
-        if [ $# -gt 0 ]; then
-            printf '%s\n' "$@" > "$dir/src/x.cpp"
-        fi
-    }
-    Tree "$Work/good" "$RowIssue" "int a;" "// Named first: $RowCheck crashes on a pointer call inside the list (#$RowIssue)."
-    Expect "a tracked defect with one commented site" pass "1 site line(s) naming" "$Work/good"
+    # --installed, over the sample table.
+    Expect "--installed: a build with the defect" "$Work/sample.sh" pass "still crashes on it" - \
+        --installed "$Work/defective" "$Work/good"
+    # The remedy is read as its reader will act on it: it names the ROW to delete, LISTS the site lines -- the default
+    # mode cannot, once the row is gone -- says the rewrites stay, and no longer sends anybody to a rulebook entry.
+    Expect "--installed: a build carrying the fix names the row and the sites the retiring change edits" \
+        "$Work/sample.sh" refuse "delete the row 'sample-defect' from Rows
+delete the comment naming #$RowIssue
+src/x.cpp:2:$SiteComment
+keep the rewrites at those sites
+Nothing here needs #$RowIssue open" "Open work" --installed "$Work/fixed" "$Work/good"
+    Expect "--installed: an analyser that cannot parse anything" "$Work/sample.sh" refuse "did not report the live unit" - \
+        --installed "$Work/broken" "$Work/good"
+    Expect "--installed: no such analyser" "$Work/sample.sh" refuse "is not an executable here" - \
+        --installed "$Work/absent" "$Work/good"
+
+    # The default mode, over the sample table.
+    Expect "a documented defect with one commented site" "$Work/sample.sh" pass "1 site line(s) naming" - "$Work/good"
     Tree "$Work/nosites" "$RowIssue" "int a;"
-    Expect "a tracked defect with no site left" pass "0 site line(s) naming" "$Work/nosites"
-    Tree "$Work/untracked" "" "int a;"
-    Expect "a row whose issue leads no Open work entry" refuse "leads no entry" "$Work/untracked"
-    Tree "$Work/inprose" "" "int a;"
-    printf '%s\n' "- **[#1](x)** -- mentions #$RowIssue only in passing." >> "$Work/inprose/.agent/rules/build-and-toolchain.md"
-    Expect "an issue cited in prose, not leading an entry" refuse "leads no entry" "$Work/inprose"
-    Tree "$Work/elsewhere" "" "int a;"
-    printf '\n## Other\n\n- **[#%s](x)** -- in the wrong section.\n' "$RowIssue" >> "$Work/elsewhere/.agent/rules/build-and-toolchain.md"
-    Expect "an issue leading an entry outside Open work" refuse "leads no entry" "$Work/elsewhere"
-    Tree "$Work/bare" "$RowIssue" "// $RowCheck crashes here, so the width is named first."
-    Expect "a site naming the check without the issue" refuse "names $RowCheck but not #$RowIssue" "$Work/bare"
-    Tree "$Work/other" "$RowIssue" "// $RowCheck crashes here (#1)."
-    Expect "a site naming another issue" refuse "names $RowCheck but not #$RowIssue" "$Work/other"
-    Tree "$Work/empty" "$RowIssue"
-    Expect "no source at all" refuse "no C++ source under" "$Work/empty"
+    Expect "a documented defect with no site left" "$Work/sample.sh" pass "0 site line(s) naming" - "$Work/nosites"
+    # The PASSING direction of the rule this change removed: a row is its own record, so its issue need not lead an
+    # Open work entry -- nor be open, which only `rulebook-open-work` could have asked. These two differ from the
+    # tree above in that fact alone; with the old rule back, they are the cases that go red.
+    Tree "$Work/untracked" "" "int a;" "$SiteComment"
+    Expect "a row whose issue leads no Open work entry passes" "$Work/sample.sh" pass "1 site line(s) naming" - \
+        "$Work/untracked"
     mkdir -p "$Work/norulebook/src"
-    printf 'int a;\n' > "$Work/norulebook/src/x.cpp"
-    Expect "no rulebook" refuse "does not exist" "$Work/norulebook"
+    printf '%s\n' "$SiteComment" > "$Work/norulebook/src/x.cpp"
+    Expect "a tree with no rulebook at all passes" "$Work/sample.sh" pass "0 not naming #$RowIssue" - "$Work/norulebook"
+    Tree "$Work/bare" "$RowIssue" "// $RowCheck crashes here, so the width is named first."
+    Expect "a site naming the check without the issue" "$Work/sample.sh" refuse "names $RowCheck but not #$RowIssue" - "$Work/bare"
+    Tree "$Work/other" "$RowIssue" "// $RowCheck crashes here (#1)."
+    Expect "a site naming another issue" "$Work/sample.sh" refuse "names $RowCheck but not #$RowIssue" - "$Work/other"
+    Tree "$Work/empty" "$RowIssue"
+    Expect "no source at all" "$Work/sample.sh" refuse "no C++ source under" - "$Work/empty"
+    Expect "a malformed row" "$Work/malformed.sh" refuse "malformed row 'malformed'" - "$Work/good"
 
-    Expect "the shipped tree" pass "0 not naming #$RowIssue" "$SourceDir"
+    # An EMPTY table, which is what deleting the last row leaves: every mode passes, and says why.
+    Expect "an empty table: the default mode" "$Work/empty.sh" pass "has no rows, so there is nothing" - "$Work/good"
+    Expect "an empty table: the default mode over this tree" "$Work/empty.sh" pass "has no rows" - "$SourceDir"
+    Expect "an empty table: --installed" "$Work/empty.sh" pass "nothing to ask $Work/defective" - \
+        --installed "$Work/defective" "$Work/good"
+    Expect "an empty table: --installed still refuses an analyser that is not there" "$Work/empty.sh" refuse \
+        "is not an executable here" - --installed "$Work/absent" "$Work/good"
+    # The empty copy's own self-test, once: nested, it skips this case, or each copy would run the next forever.
+    if [ -z "${FASTCACHED_KNOWN_DEFECTS_NESTED:-}" ]; then
+        FASTCACHED_KNOWN_DEFECTS_NESTED=1
+        export FASTCACHED_KNOWN_DEFECTS_NESTED
+        Expect "an empty table: --self-test" "$Work/empty.sh" pass "self-test: " - --self-test "$SourceDir"
+    else
+        echo "self-test: nested inside another self-test, so the empty table's own self-test is not run again from here"
+    fi
+
+    # The shipped table over the shipped tree, last. When it is empty, the line to expect is the empty table's.
+    if [ "${#Rows[@]}" -eq 0 ]; then
+        Expect "the shipped tree" "$Self" pass "has no rows" - "$SourceDir"
+    else
+        Expect "the shipped tree" "$Self" pass ", 0 not naming #" - "$SourceDir"
+    fi
 
     echo "self-test: $Cases case(s) ran, $Failed failed"
     [ "$Cases" -gt 0 ] || { echo "FAIL: no self-test case ran"; exit 1; }
