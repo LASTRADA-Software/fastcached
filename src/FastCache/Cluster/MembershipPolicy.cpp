@@ -45,9 +45,9 @@ namespace
     }
 } // namespace
 
-std::vector<Command> MembershipProposals(ClusterState const& state, std::span<DesiredMember const> desired)
+MembershipPlan MembershipProposals(ClusterState const& state, std::span<DesiredMember const> desired)
 {
-    std::vector<Command> proposals;
+    MembershipPlan plan;
     for (auto const& member: desired)
     {
         // A record with no id or no consensus endpoint is not a member. `Validate`
@@ -76,12 +76,23 @@ std::vector<Command> MembershipProposals(ClusterState const& state, std::span<De
         if (known && it->raftEndpoint == member.raftEndpoint && it->schedulerEndpoint == scheduler && it->seat == seat)
             continue;
 
-        proposals.push_back(Command { .kind = MemberSeatTable[static_cast<std::size_t>(seat)].admittedBy,
-                                      .key = member.id,
-                                      .value = member.raftEndpoint,
-                                      .schedulerEndpoint = scheduler });
+        // A forget outranks an observation (#1528). Asked with the host `Apply` would
+        // lift the tombstone for and through the same comparison, so what is refused
+        // here is exactly a proposal that would have undone the forget -- and only
+        // once something would be proposed, since a record that already matches lifts
+        // nothing and is no refusal.
+        if (state.HasForgotten(HostOfEndpoint(member.raftEndpoint)))
+        {
+            plan.forgotten.push_back(member);
+            continue;
+        }
+
+        plan.proposals.push_back(Command { .kind = MemberSeatTable[static_cast<std::size_t>(seat)].admittedBy,
+                                           .key = member.id,
+                                           .value = member.raftEndpoint,
+                                           .schedulerEndpoint = scheduler });
     }
-    return proposals;
+    return plan;
 }
 
 std::optional<Consensus::Configuration> NextQuorumChange(ClusterState const& state,

@@ -104,7 +104,9 @@ saying so. The store is intact; what an operator does is:
 Whatever the cluster agreed at **runtime** has to be agreed again once a leader is
 elected: members admitted with `--cluster-admit` or `--cluster-admit-learner`, and
 cluster settings (`--cluster-set`). Members found by `--discovery` are re-admitted by
-discovery itself. Nothing a build writes into `--cache-dir` is involved.
+discovery itself — including a machine the cluster had forgotten, because its tombstone
+was part of the state that was moved aside; forget it again. Nothing a build writes
+into `--cache-dir` is involved.
 
 This is backwards compatibility not being owed yet, and it is stated rather than
 discovered: the version on each format is what turns *an older store* into a refusal
