@@ -2494,15 +2494,16 @@ TEST_CASE("The consensus address rides the runtime record's variable arity, in b
     sent.cordon = WireCordonState::Draining;
     sent.consensusEndpoint = "10.0.0.4:6680";
     sent.forgottenClients = 2;
+    sent.consensusStanding = WireConsensusStanding::Learner;
     // Kept in a local: `SplitAll` hands back spans INTO it.
     auto const emitted = EncodeNodeRuntime(sent);
     auto const parts = WireFields::SplitAll(emitted);
     REQUIRE(parts.has_value());
-    // Fifteen: thirteen that predate #1328, the endpoint it added, and #1471's applied-tombstone
-    // count. Pinned, since every cut below is counted from it and a record that grew would move
-    // what "older" means -- which is how this case caught #1471's append rather than letting it
-    // shift the cuts silently.
-    REQUIRE(Unwrap(parts).size() == 15);
+    // Sixteen: thirteen that predate #1328, the endpoint it added, #1471's applied-tombstone
+    // count and #1449's consensus standing. Pinned, since every cut below is counted from it and
+    // a record that grew would move what "older" means -- which is how this case caught #1471's
+    // append, and then #1449's, rather than letting either shift the cuts silently.
+    REQUIRE(Unwrap(parts).size() == 16);
 
     SECTION("thirteen fields, as a build before #1328 emits: both disengaged, and the cordon still read")
     {
@@ -2533,7 +2534,21 @@ TEST_CASE("The consensus address rides the runtime record's variable arity, in b
         CHECK(Unwrap(back).cordon == std::optional { WireCordonState::Draining });
     }
 
-    SECTION("fifteen fields, this build: both engaged")
+    SECTION("fifteen fields, as a build after #1471 and before #1449 emits: the standing is absent")
+    {
+        // The cut #1449 has to survive, for #1471's reason: a peer that has never heard of a
+        // learner answers with a shorter record, and the standing comes back "did not say"
+        // rather than taking the reply -- or the tombstone count before it -- with it.
+        auto const older = std::vector<std::span<std::byte const>> { Unwrap(parts).begin(), Unwrap(parts).begin() + 15 };
+        auto const back = DecodeNodeRuntime(WireFields::Encode(WireFields::FieldList { older }));
+        REQUIRE(back.has_value());
+        CHECK_FALSE(Unwrap(back).consensusStanding.has_value());
+        auto const runtime = Unwrap(back);
+        REQUIRE(runtime.forgottenClients.has_value());
+        CHECK(Unwrap(runtime.forgottenClients) == 2);
+    }
+
+    SECTION("sixteen fields, this build: all three engaged")
     {
         auto const current = std::vector<std::span<std::byte const>> { Unwrap(parts).begin(), Unwrap(parts).end() };
         auto const back = DecodeNodeRuntime(WireFields::Encode(WireFields::FieldList { current }));
@@ -2542,9 +2557,10 @@ TEST_CASE("The consensus address rides the runtime record's variable arity, in b
         auto const runtime = Unwrap(back);
         REQUIRE(runtime.forgottenClients.has_value());
         CHECK(Unwrap(runtime.forgottenClients) == 2);
+        CHECK(runtime.consensusStanding == std::optional { WireConsensusStanding::Learner });
     }
 
-    SECTION("sixteen fields, from a build ahead of this one: the surplus is skipped")
+    SECTION("seventeen fields, from a build ahead of this one: the surplus is skipped")
     {
         auto ahead = std::vector<std::span<std::byte const>> { Unwrap(parts).begin(), Unwrap(parts).end() };
         auto const extra = AsBytes(std::string_view { "a fact from the future" });
@@ -2555,7 +2571,45 @@ TEST_CASE("The consensus address rides the runtime record's variable arity, in b
         auto const runtime = Unwrap(back);
         REQUIRE(runtime.forgottenClients.has_value());
         CHECK(Unwrap(runtime.forgottenClients) == 2);
+        CHECK(runtime.consensusStanding == std::optional { WireConsensusStanding::Learner });
     }
+}
+
+TEST_CASE("A consensus standing travels as its pinned byte, and one this build cannot name is skipped",
+          "[wire][consensus][nodestatus][learner]")
+{
+    // The BYTES, not only the names (#1449): a consistent renumbering keeps every in-tree
+    // test agreeing while a deployed CLI reads a learner as a voter.
+    CHECK(static_cast<std::uint8_t>(WireConsensusStanding::NoCluster) == 0x01);
+    CHECK(static_cast<std::uint8_t>(WireConsensusStanding::Voter) == 0x02);
+    CHECK(static_cast<std::uint8_t>(WireConsensusStanding::Learner) == 0x03);
+    CHECK(static_cast<std::uint8_t>(WireConsensusStanding::Outsider) == 0x04);
+
+    for (auto const standing: { WireConsensusStanding::NoCluster,
+                                WireConsensusStanding::Voter,
+                                WireConsensusStanding::Learner,
+                                WireConsensusStanding::Outsider })
+    {
+        NodeRuntimeFields sent {};
+        sent.consensusStanding = standing;
+        auto const back = DecodeNodeRuntime(EncodeNodeRuntime(sent));
+        REQUIRE(back.has_value());
+        CHECK(Unwrap(back).consensusStanding == std::optional { standing });
+    }
+
+    // A byte from a build ahead of this one is left DISENGAGED, never refused -- the rule
+    // every enum in this record keeps, so an older client still reads the rest of the reply.
+    NodeRuntimeFields sent {};
+    sent.forgottenClients = 3;
+    auto emitted = EncodeNodeRuntime(sent);
+    auto parts = Unwrap(WireFields::SplitAll(emitted));
+    REQUIRE(parts.size() == 16);
+    auto const unknown = std::array { std::byte { 0x7F } };
+    parts[15] = unknown;
+    auto const back = DecodeNodeRuntime(WireFields::Encode(WireFields::FieldList { parts }));
+    REQUIRE(back.has_value());
+    CHECK_FALSE(Unwrap(back).consensusStanding.has_value());
+    CHECK(Unwrap(back).forgottenClients == std::optional<std::uint32_t> { 3 });
 }
 
 // --- Explaining an admission (#1471) ----------------------------------------
@@ -2665,4 +2719,51 @@ TEST_CASE("An unknown VERDICT is refused and an unknown ROUTE is kept, which is 
                         WireFields::Encode({ std::span<std::byte const> { wide }, std::span<std::byte const> { routes } }))
                         .has_value());
     }
+}
+
+// --- Admitting a learner (#1449) ----------------------------------------------
+
+TEST_CASE("The learner admission occupies the byte it was assigned, beside the voter admission", "[wire][cluster][learner]")
+{
+    // The value as well as the name, for the explain-admission byte's reason.
+    CHECK(static_cast<std::uint8_t>(Op::ClusterAdmitLearner) == 0x1C);
+    CHECK(static_cast<std::uint8_t>(Op::ClusterAdmit) == 0x0B);
+    CHECK(std::ranges::count(OpTable, Op::ClusterAdmitLearner, &OpDescriptor::code) == 1);
+
+    // The scheduler family and never pre-auth, exactly as the voter admission: the two
+    // change the same replicated state and must not be gated two ways.
+    CHECK(FamilyOf(static_cast<std::uint8_t>(Op::ClusterAdmitLearner)) == VerbFamily::Scheduler);
+    CHECK(FamilyOf(static_cast<std::uint8_t>(Op::ClusterAdmitLearner))
+          == FamilyOf(static_cast<std::uint8_t>(Op::ClusterAdmit)));
+    CHECK_FALSE(IsPreAuthAllowed(static_cast<std::uint8_t>(Op::ClusterAdmitLearner)));
+    CHECK(OpFieldCount(Op::ClusterAdmitLearner) == OpFieldCount(Op::ClusterAdmit));
+
+    CHECK(IsMemberAdmission(Op::ClusterAdmit));
+    CHECK(IsMemberAdmission(Op::ClusterAdmitLearner));
+    CHECK_FALSE(IsMemberAdmission(Op::ClusterAdmitClient));
+}
+
+TEST_CASE("Both member admissions frame one payload under their own byte", "[wire][cluster][learner]")
+{
+    auto const request = ClusterAdmitRequest { .memberId = "laptop", .raftEndpoint = "10.0.0.9:6675" };
+    auto const learner = EncodeClusterAdmit<Op::ClusterAdmitLearner>(request);
+    auto const voter = EncodeClusterAdmit<Op::ClusterAdmit>(request);
+
+    auto const learnerHeader = DecodeRequestHeader(learner);
+    REQUIRE(learnerHeader.has_value());
+    CHECK(Unwrap(learnerHeader).opRaw == 0x1C);
+    auto const voterHeader = DecodeRequestHeader(voter);
+    REQUIRE(voterHeader.has_value());
+    CHECK(Unwrap(voterHeader).opRaw == 0x0B);
+
+    // The payloads are byte-identical: which set the member lands in is the op, never a
+    // field -- so neither decoder can disagree with the other about the member.
+    auto const learnerPayload = std::span<std::byte const> { learner }.subspan(RequestHeaderSize);
+    auto const voterPayload = std::span<std::byte const> { voter }.subspan(RequestHeaderSize);
+    CHECK(std::ranges::equal(learnerPayload, voterPayload));
+
+    auto const decoded = DecodeClusterAdmitPayload<Op::ClusterAdmitLearner>(learnerPayload);
+    REQUIRE(decoded.has_value());
+    CHECK(AsStringView(Unwrap(decoded).memberId) == "laptop");
+    CHECK(AsStringView(Unwrap(decoded).raftEndpoint) == "10.0.0.9:6675");
 }

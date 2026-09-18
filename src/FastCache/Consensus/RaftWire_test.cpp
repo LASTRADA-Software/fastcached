@@ -90,7 +90,7 @@ TEST_CASE("Every message type round-trips, field for field", "[consensus][raft][
                                  .leaderId = "is-leader",
                                  .lastIncludedIndex = LogIndex { .value = 72 },
                                  .lastIncludedTerm = Term { .value = 73 },
-                                 .members = { "is-m1", "is-m2" },
+                                 .configuration = { .voters = { "is-m1", "is-m2" }, .learners = { "is-l1" } },
                                  .state = BytesFromString("is-state") },
         InstallSnapshotResponse { .term = Term { .value = 81 },
                                   .result = AppendResult::Accepted,
@@ -489,7 +489,7 @@ TEST_CASE("A snapshot with no members and no state round-trips", "[consensus][ra
                                                       .leaderId = "n1",
                                                       .lastIncludedIndex = LogIndex { .value = 9 },
                                                       .lastIncludedTerm = Term { .value = 1 },
-                                                      .members = {},
+                                                      .configuration = {},
                                                       .state = {} } };
     auto const got = RoundTrip(sent);
     REQUIRE(got.has_value());
@@ -619,6 +619,28 @@ TEST_CASE("A handshake at the version before the handshake existed is refused", 
 
     auto const frame = RaftWire::EncodeProof(
         { .dialler = "d", .target = "a", .nonce = DistinctNonce(0x01), .tag = DistinctTag() }, /*version=*/1);
+    auto const [header, payload] = Split(frame);
+    auto const decoded = RaftWire::DecodeProof(header, payload);
+    REQUIRE_FALSE(decoded.has_value());
+    CHECK(decoded.error().code == ConsensusErrorCode::UnsupportedVersion);
+}
+
+TEST_CASE("A peer that spells a configuration without learners is refused at its handshake",
+          "[consensus][raft][wire][handshake][learner]")
+{
+    // Version 3 is #1449's: a configuration is two nested lists, voters and learners,
+    // where version 2 had one flat one. The frame's arity did not move, so nothing but
+    // the version tells a version 2 peer's configuration from this build's -- and the
+    // version is refused at the handshake, before a configuration can be misread.
+    //
+    // The VALUE is pinned beside the name: every other case here spells
+    // `CurrentVersion`, which would go on passing if the constant moved back.
+    CHECK(RaftWire::CurrentVersion == 3);
+    CHECK(RaftWire::MinSupportedVersion == 3);
+    CHECK_FALSE(RaftWire::IsSupported(2));
+
+    auto const frame = RaftWire::EncodeProof(
+        { .dialler = "d", .target = "a", .nonce = DistinctNonce(0x01), .tag = DistinctTag() }, /*version=*/2);
     auto const [header, payload] = Split(frame);
     auto const decoded = RaftWire::DecodeProof(header, payload);
     REQUIRE_FALSE(decoded.has_value());

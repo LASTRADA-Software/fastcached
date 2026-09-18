@@ -10,6 +10,7 @@
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/IRandomSource.hpp>
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstddef>
@@ -24,11 +25,14 @@
 namespace FastCache::Consensus
 {
 
-/// Which timer governs a node in a given role.
+/// Which timer governs a node.
+///
+/// **Private: never transmitted or persisted**, so the enumerators carry no values.
 enum class TimerKind : std::uint8_t
 {
-    Election = 0, ///< Time until this node stands for election.
-    Heartbeat,    ///< Time until this node next sends heartbeats.
+    Election,  ///< Time until this node stands for election.
+    Heartbeat, ///< Time until this node next sends heartbeats.
+    None,      ///< Nothing falls due: this node never stands (#1449).
 };
 
 /// The per-role facts the state machine reads rather than branches on.
@@ -41,12 +45,17 @@ struct RoleTraits
 
 /// Behaviour that varies by role, as data.
 ///
-/// Three rows today. The reason this is a table and not a `switch` is the fourth
-/// row that is already foreseeable: a non-voting **Learner**, which is how a node
-/// is brought up to date without being counted in a quorum — exactly what
-/// discovery needs when a machine joins a running cluster. Adding it should be a
-/// row plus whatever columns it forces, not an edit to every function that asks
+/// Four rows, one per `Role`. It is a table and not a `switch` so that a new role is
+/// a row plus whatever columns it forces, not an edit to every function that asks
 /// what role this node is playing.
+///
+/// **A learner is NOT a row here**, although this comment once foresaw it as the
+/// fifth (#1449). Voting is a property of the CONFIGURATION, not of a role: a learner
+/// still follows -- it takes entries, arms nothing, redirects clients to the leader --
+/// so it is a `Follower` in every sense this table describes, and a fifth role `Tick`
+/// moved a node between would have to be left again the instant a promotion committed.
+/// What a learner lacks is decided by where its latest configuration seats it, which
+/// is `StandingTable`'s question.
 inline constexpr EnumTable<Role, RoleTraits> RoleTable { {
     { .role = Role::Follower, .name = "follower", .timer = TimerKind::Election },
     { .role = Role::PreCandidate, .name = "pre-candidate", .timer = TimerKind::Election },
@@ -68,6 +77,61 @@ static_assert(RowsInEnumeratorOrder(RoleTable, &RoleTraits::role),
 [[nodiscard]] constexpr RoleTraits const& TraitsOf(Role role) noexcept
 {
     return RoleTable[static_cast<std::size_t>(role)];
+}
+
+/// The per-standing facts the state machine reads rather than branches on.
+struct StandingTraits
+{
+    Standing standing {};  ///< The standing this row describes.
+    std::string_view name; ///< For log lines, test failure messages and a status report.
+
+    /// What a follower or candidate in this standing waits on.
+    ///
+    /// `Election` for a node that stands, `None` for one that never does. It governs
+    /// only the roles whose own timer is `Election`: a LEADER that has been demoted or
+    /// removed is still owed its heartbeats until the change that did it commits, and
+    /// only it can commit that change.
+    TimerKind timer {};
+
+    /// Whether it grants a vote or a pre-vote when asked.
+    ///
+    /// A refusal decided HERE is `VoteRefusal::CastsNoVote`, which is what "a learner
+    /// refuses by row" means: the node answers, and the row is the reason.
+    bool votes {};
+};
+
+/// Behaviour that varies by standing, as data.
+///
+/// The learner row is the point (#1449), and `NoCluster` is its oldest instance: a node
+/// waiting to be admitted was already a node that neither stands nor votes, spelled as
+/// a special case in `NextDeadline` and as an accident of `IsMember` finding nobody. It
+/// is the same two columns, so it is the same kind of row.
+///
+/// `Outsider` keeps what such a node always did -- it stands and it votes -- because
+/// nothing here asked for that to change. It cannot win for itself (a node counts its
+/// own vote only while it is a VOTER), and a voter it asks refuses it by the candidate's
+/// own row, so its campaigning costs a message per timeout and decides nothing.
+inline constexpr EnumTable<Standing, StandingTraits> StandingTable { {
+    { .standing = Standing::NoCluster, .name = "no cluster", .timer = TimerKind::None, .votes = false },
+    { .standing = Standing::Voter, .name = "voter", .timer = TimerKind::Election, .votes = true },
+    { .standing = Standing::Learner, .name = "learner", .timer = TimerKind::None, .votes = false },
+    { .standing = Standing::Outsider, .name = "outsider", .timer = TimerKind::Election, .votes = true },
+} };
+
+static_assert(RowsInEnumeratorOrder(StandingTable, &StandingTraits::standing),
+              "StandingTable must hold one row per Standing, in enumerator order");
+
+static_assert(std::ranges::none_of(StandingTable,
+                                   [](StandingTraits const& row) { return row.timer == TimerKind::Heartbeat; }),
+              "a standing decides whether a node STANDS; heartbeats are a role's, and a standing that asked for "
+              "them would have a follower broadcasting as though it led");
+
+/// The row describing `standing`.
+/// @param standing The standing to look up.
+/// @return Its traits.
+[[nodiscard]] constexpr StandingTraits const& TraitsOf(Standing standing) noexcept
+{
+    return StandingTable[static_cast<std::size_t>(standing)];
 }
 
 /// One Raft node, as a deterministic state machine.
@@ -101,12 +165,11 @@ class RaftNode
     /// with a message naming the offending field. It is also the only way to make
     /// `RaftConfig::Validate` unbypassable: a constructor that merely *documents*
     /// the precondition is one an omission can skip, and the resulting failures
-    /// are silent rather than loud — a `self` outside `members` makes `Peers()`
-    /// return every member while `Quorum()` still assumes this node is one of
-    /// them, so the node counts a self-vote it is not entitled to.
+    /// are silent rather than loud — a `self` outside the configuration is a node
+    /// replicating to every member while believing it is one of them.
     ///
-    /// An empty `members` is the one shape that is legal rather than refused: it
-    /// says this node has no cluster and is waiting to be admitted to one. It
+    /// An empty configuration is the one shape that is legal rather than refused:
+    /// it says this node has no cluster and is waiting to be admitted to one. It
     /// would elect itself instantly on a quorum of one if it stood at all, which
     /// is exactly why it does not — see `HasCluster`.
     ///
@@ -178,15 +241,18 @@ class RaftNode
     /// @return Where it landed and what to do, or why it was refused.
     [[nodiscard]] std::expected<Proposal, ConsensusError> Propose(std::vector<std::byte> payload, TimePoint now);
 
-    /// Propose a new member set, one member added or removed (§4.3).
+    /// Propose a new configuration, one member moved (§4.3).
     ///
-    /// Restricted to a single-member delta, and that restriction is the whole
-    /// safety argument: any majority of the old configuration and any majority
-    /// of the new one then share at least one member, so the two cannot elect
-    /// different leaders in the same term. Going from three members to five in
-    /// one step makes `{n1,n2}` a majority of the old and `{n3,n4,n5}` a
-    /// majority of the new, with nobody in common — which is what joint
-    /// consensus exists to handle and why this refuses instead.
+    /// Restricted to a single-member delta -- added, removed, promoted from
+    /// learner to voter, or demoted from voter to learner -- and that restriction
+    /// is the whole safety argument: any majority of the old configuration's
+    /// voters and any majority of the new one's then share at least one voter, so
+    /// the two cannot elect different leaders in the same term. Going from three
+    /// voters to five in one step makes `{n1,n2}` a majority of the old and
+    /// `{n3,n4,n5}` a majority of the new, with nobody in common — which is what
+    /// joint consensus exists to handle and why this refuses instead. Promoting
+    /// one member and removing another is two voter changes, and is refused the
+    /// same way (`Membership::ChangeShape::Unsafe`).
     ///
     /// Only one change may be in flight. A second proposed before the first
     /// commits would be built on a configuration that can still be rolled back
@@ -196,10 +262,10 @@ class RaftNode
     /// The new configuration takes effect on **this node** immediately, before
     /// it is committed, because a configuration that waited for commitment could
     /// not be used to reach it.
-    /// @param members The proposed member set.
+    /// @param configuration The proposed configuration.
     /// @param now The current instant.
     /// @return Where the entry landed and what to do, or why it was refused.
-    [[nodiscard]] std::expected<Proposal, ConsensusError> ProposeMembership(std::vector<NodeId> members, TimePoint now);
+    [[nodiscard]] std::expected<Proposal, ConsensusError> ProposeMembership(Configuration configuration, TimePoint now);
 
     /// Compact the log, keeping `state` as the snapshot that replaces it.
     ///
@@ -245,19 +311,27 @@ class RaftNode
         return _lastApplied;
     }
 
-    /// The member set this node is currently operating under.
+    /// The configuration this node is currently operating under.
     ///
     /// The latest configuration in its log, which is not necessarily a committed
     /// one; see `ProposeMembership`.
-    /// @return The active members.
-    [[nodiscard]] std::vector<NodeId> const& ActiveMembers() const noexcept
+    /// @return The active voters and learners.
+    [[nodiscard]] Configuration const& ActiveConfiguration() const noexcept
     {
-        return _members;
+        return _configuration;
     }
+
+    /// Where this node sits in its own latest configuration.
+    ///
+    /// Derived from `ActiveConfiguration()` every time rather than stored, so it
+    /// cannot lag the configuration it describes. `StandingTable` says what each
+    /// answer permits.
+    /// @return This node's standing.
+    [[nodiscard]] Standing CurrentStanding() const;
 
     /// Whether this node belongs to a cluster at all.
     ///
-    /// False for a node started with an empty `RaftConfig::members` and never yet
+    /// False for a node started with an empty configuration and never yet
     /// admitted to one — a machine brought up to be added to a running fleet. It
     /// is a *waiting* state rather than a broken one, and three rules follow from
     /// it, each of which is the difference between joining and never joining:
@@ -265,9 +339,10 @@ class RaftNode
     ///   - **It never stands for election.** With no members the quorum arithmetic
     ///     answers one, so a node that campaigned would elect itself, hold a term
     ///     and a log of its own, and stop being admissible at all — see
-    ///     `RaftConfig::members`. `NextDeadline` reports that nothing falls due,
+    ///     `RaftConfig::voters`. `NextDeadline` reports that nothing falls due,
     ///     rather than naming a deadline `Tick` would have to decline to act on;
-    ///     the timer is re-armed by the leader contact that admits it.
+    ///     the timer is re-armed by the leader contact that admits it. That is
+    ///     `StandingTable`'s `NoCluster` row, which a learner's row matches.
     ///   - **It accepts `AppendEntries` and `InstallSnapshot` from any leader**,
     ///     because the membership test that guards those has nothing to test
     ///     against: the only way to learn a configuration is to be sent one. The
@@ -275,15 +350,14 @@ class RaftNode
     ///     — and there is nothing here to protect, since such a node holds no
     ///     committed state, has never voted and is counted by nobody. The moment
     ///     it adopts a configuration the guard applies again, permanently.
-    ///   - **It grants no votes**, for the same arithmetic reason read the other
-    ///     way: `IsMember` is false for every candidate, so a node with no cluster
-    ///     refuses every request. Nobody counts its answer anyway.
+    ///   - **It grants no votes**: its row says so, and nobody counts its answer
+    ///     anyway, since it is in no member set.
     ///
     /// @return True once a configuration — bootstrapped or replicated — is in
     ///         force.
     [[nodiscard]] bool HasCluster() const noexcept
     {
-        return !_members.empty();
+        return !_configuration.voters.empty() || !_configuration.learners.empty();
     }
 
     /// How often a leader speaks when it has nothing to say.
@@ -303,9 +377,11 @@ class RaftNode
 
     /// When the driver must next call `Tick`.
     ///
-    /// Which deadline this is depends on the role and comes from `RoleTable`.
+    /// Which deadline this is depends on the role and comes from `RoleTable`,
+    /// and -- for a role that would wait on an election -- on the standing, from
+    /// `StandingTable`: a learner and a node with no cluster wait on nothing.
     /// @return The next instant at which something is due.
-    [[nodiscard]] TimePoint NextDeadline() const noexcept;
+    [[nodiscard]] TimePoint NextDeadline() const;
 
     /// Advance time.
     ///
@@ -331,32 +407,60 @@ class RaftNode
     /// @param recovered What durable storage held.
     RaftNode(RaftConfig config, IRandomSource& random, TimePoint now, RecoveredState recovered);
 
-    /// Whether `id` is a configured member of this cluster.
+    /// Whether `id` is a configured member of this cluster, voter or learner.
     ///
-    /// Every identity in an incoming message is self-declared, and two of them
-    /// decide something: a granted vote counts toward leadership, and an accepted
-    /// AppendEntries publishes its sender as the leader clients are redirected to.
+    /// The question REPLICATION asks: a learner is sent the log and its answers
+    /// are read. Every identity in an incoming message is self-declared, so
+    /// whichever of this and `IsVoter` a handler asks decides what that identity
+    /// can do.
     /// @param id The claimed identity.
     /// @return True when the configuration contains it.
     [[nodiscard]] bool IsMember(NodeId const& id) const;
+
+    /// Whether `id` is a VOTER of this cluster.
+    ///
+    /// The question every decision that COUNTS asks: a granted vote counts toward
+    /// leadership, and an accepted AppendEntries publishes its sender as the
+    /// leader clients are redirected to -- and a learner may be neither counted
+    /// nor leader (#1449).
+    /// @param id The claimed identity.
+    /// @return True when the configuration counts it.
+    [[nodiscard]] bool IsVoter(NodeId const& id) const;
+
     [[nodiscard]] std::size_t Quorum() const noexcept;
-    void AdoptMembers(std::vector<NodeId> members);
+    void AdoptConfiguration(Configuration configuration);
     void RefreshConfiguration();
     [[nodiscard]] bool HasUncommittedConfiguration() const;
     [[nodiscard]] LogIndex LatestConfigurationIndex() const;
 
-    /// The member set CheckQuorum measures contact against.
+    /// Which timer governs this node right now: its role's, unless that is the
+    /// election timer and its standing never stands.
+    /// @return The timer `NextDeadline` and `Tick` read.
+    [[nodiscard]] TimerKind CurrentTimer() const;
+
+    /// Count this node's own vote into `tally`, but only while it is a voter.
     ///
-    /// `_members` while nothing is in flight, and the COMMITTED configuration
-    /// while a change is — see `HasQuorumContact`, which is the only caller and
-    /// carries the argument.
+    /// The carve-out `AdvanceCommitIndex` and `HasQuorumContact` already made for a
+    /// leader, made for a candidate too: a node its own configuration does not count
+    /// must not count itself. Without it a node REMOVED from a one-voter
+    /// configuration reached a quorum of one alone -- its own pre-vote and its own
+    /// vote -- and led a cluster that does not contain it, deposing the real leader
+    /// with every term it raised.
+    /// @param tally The pre-vote or vote tally being started.
+    void CountOwnVote(std::unordered_set<NodeId>& tally) const;
+
+    /// The configuration CheckQuorum measures contact against.
+    ///
+    /// `_configuration` while nothing is in flight, and the COMMITTED
+    /// configuration while a change is — see `HasQuorumContact`, which is the only
+    /// caller and carries the argument.
     ///
     /// By value rather than by reference because the two answers have different
-    /// lifetimes: one is a member, the other is decoded from a log entry. A member
-    /// set is a handful of ids, and returning a reference to a local is the bug
-    /// that shape invites.
-    /// @return The member set to measure a quorum of contact against.
-    [[nodiscard]] std::vector<NodeId> QuorumContactMembers() const;
+    /// lifetimes: one is a member, the other is decoded from a log entry. A
+    /// configuration is a handful of ids, and returning a reference to a local is
+    /// the bug that shape invites.
+    /// @return The configuration to measure a quorum of contact against.
+    [[nodiscard]] Configuration QuorumContactConfiguration() const;
 
     /// Begin an election for the next term (§5.2).
     void StartPreVote(TimePoint now, RaftOutput& output);
@@ -464,8 +568,12 @@ class RaftNode
     /// candidacies disrupt the cluster on a fixed schedule.
     void ArmElectionTimer(TimePoint now);
 
-    /// Queue a message to every peer.
-    void BroadcastToPeers(RaftOutput& output, RaftMessage const& message) const;
+    /// Queue a vote or pre-vote request to every VOTER other than this node.
+    ///
+    /// Voters only: a learner casts no vote, so asking one costs a message and a
+    /// refusal and can change no tally. Replication goes to learners too, and that
+    /// is `ReplicateToPeers`.
+    void BroadcastToVoters(RaftOutput& output, RaftMessage const& message) const;
 
     /// The AppendEntries this leader owes `peer`, given how far it has caught up.
     ///
@@ -515,8 +623,25 @@ class RaftNode
     /// @return True for a pre-vote request, and for a granted pre-vote response.
     [[nodiscard]] static bool IsPreVoteExempt(RaftMessage const& message) noexcept;
     void OnPreVote(PreVoteRequest const& request, TimePoint now, RaftOutput& output);
+
+    /// Which rule, if any, denies `request`.
+    ///
+    /// The whole decision, separated from the reply so the answer is written once
+    /// and the reason travels beside it in `RaftOutput::voteRefusal`. The order is
+    /// the order the rules are asked in, and the first is this node's own row.
+    /// @param request The pre-vote.
+    /// @param now Current time.
+    /// @return The refusal, or nullopt when the pre-vote would be granted.
+    [[nodiscard]] std::optional<VoteRefusal> PreVoteRefusal(PreVoteRequest const& request, TimePoint now) const;
+
     void OnPreVoteResponse(PreVoteResponse const& response, TimePoint now, RaftOutput& output);
     void OnRequestVote(RequestVoteRequest const& request, TimePoint now, RaftOutput& output);
+
+    /// Which rule, if any, denies `request`; `PreVoteRefusal`'s counterpart.
+    /// @param request The vote request.
+    /// @return The refusal, or nullopt when the vote would be granted.
+    [[nodiscard]] std::optional<VoteRefusal> VoteRefusalFor(RequestVoteRequest const& request) const;
+
     void OnRequestVoteResponse(RequestVoteResponse const& response, TimePoint now, RaftOutput& output);
     void OnAppendEntries(AppendEntriesRequest const& request, TimePoint now, RaftOutput& output);
     void OnAppendEntriesResponse(AppendEntriesResponse const& response, TimePoint now, RaftOutput& output);
@@ -530,14 +655,18 @@ class RaftNode
 
     RaftConfig _config;
 
-    /// `_config.Peers()`, computed once.
+    /// Every member other than this node, voters AND learners: who is replicated to.
     ///
-    /// Derived rather than re-derived: the member set is fixed at construction,
-    /// while broadcasting happens on every heartbeat — that is, on the interval
-    /// that decides how fast a dead leader is noticed, so it is the one path here
-    /// that runs at a rate worth caring about. Rebuilding the vector each time
-    /// allocated once per heartbeat per node for a value that cannot change.
+    /// Derived once per configuration rather than on every use: the configuration
+    /// moves only when a configuration entry does, while replicating happens on
+    /// every heartbeat — that is, on the interval that decides how fast a dead
+    /// leader is noticed, so it is the one path here that runs at a rate worth
+    /// caring about. `AdoptConfiguration` is the one writer of this and of
+    /// `_voterPeers`, which is what keeps the two in step with `_configuration`.
     std::vector<NodeId> _peers;
+
+    /// Every VOTER other than this node: who is asked for a vote or a pre-vote.
+    std::vector<NodeId> _voterPeers;
 
     IRandomSource& _random;
 
@@ -590,9 +719,9 @@ class RaftNode
     std::unordered_map<NodeId, TimePoint> _followerContact;
 
     /// Voters that granted this node their vote in the current term, itself
-    /// included. A set rather than a counter because a retransmitted response
-    /// would otherwise be counted twice, and two counted votes from one node is a
-    /// quorum that does not exist.
+    /// included while it is a voter. A set rather than a counter because a
+    /// retransmitted response would otherwise be counted twice, and two counted
+    /// votes from one node is a quorum that does not exist.
     std::unordered_set<NodeId> _votesGranted;
 
     /// The configuration as of the snapshot.
@@ -602,7 +731,7 @@ class RaftNode
     /// it the fall-back is the *bootstrap* set, so a node that took part in a
     /// membership change and then compacted would forget it, silently and only
     /// after a restart.
-    std::vector<NodeId> _snapshotMembers;
+    Configuration _snapshotConfiguration;
 
     /// The application state the log's discarded prefix produced.
     ///
@@ -612,16 +741,17 @@ class RaftNode
     /// would produce one as of a different index than the log was compacted to.
     std::vector<std::byte> _snapshotState;
 
-    /// The member set this node is operating under: the latest configuration in
-    /// its log, or `_config.members` when the log holds none.
+    /// The configuration this node is operating under: the latest one in its log,
+    /// or the snapshot's, or `_config`'s bootstrap when neither holds one.
     ///
-    /// Separate from `_config.members`, which stays the set this node was
-    /// *bootstrapped* with. Keeping both is what lets a restart re-derive the
-    /// active set from the log rather than silently reverting a change the
-    /// cluster already made.
-    std::vector<NodeId> _members;
+    /// Separate from `_config`, which stays what this node was *bootstrapped*
+    /// with. Keeping both is what lets a restart re-derive the active configuration
+    /// from the log rather than silently reverting a change the cluster already
+    /// made.
+    Configuration _configuration;
 
-    /// Peers that said an election would be winnable, itself included.
+    /// Voters that said an election would be winnable, itself included while it is
+    /// a voter.
     ///
     /// Separate from `_votesGranted` rather than reusing it, because the two
     /// count answers to different questions in different terms: a pre-vote is

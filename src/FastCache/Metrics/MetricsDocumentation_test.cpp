@@ -131,7 +131,7 @@ constexpr std::string_view NodePrefix = "fastcache_";
     // rendered only when there is something to name, so a default-constructed status
     // would let the page lose exactly those two rows unnoticed -- which is this
     // check's whole direction.
-    snapshot.consensus = ConsensusStatus { .members = { "n1" },
+    snapshot.consensus = ConsensusStatus { .configuration = { .voters = { "n1" }, .learners = { "n2" } },
                                            .knownLeader = Consensus::NodeId { "n1" },
                                            .term = Consensus::Term { .value = 1 },
                                            .commitIndex = Consensus::LogIndex { .value = 1 },

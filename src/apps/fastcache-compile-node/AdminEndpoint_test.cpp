@@ -478,28 +478,29 @@ TEST_CASE("A node that runs consensus reports what IT counts, per scrape", "[nod
     ScriptedHostFacts host;
     AtomicMetricsSink metrics;
     auto reads = std::size_t { 0 };
-    auto const provider =
-        MakeNodeSnapshotProvider(NodeScrapeSources { .host = &host,
-                                                     .busySlots = [] { return std::size_t { 0 }; },
-                                                     .cache = nullptr,
-                                                     .slots = 4,
-                                                     .scratchRoot = std::filesystem::path { "." },
-                                                     .consensus =
-                                                         [&reads] {
-                                                             ++reads;
-                                                             return ConsensusStatus {
-                                                                 .members = { "n1", "n2" },
-                                                                 .knownLeader = Consensus::NodeId { "n1" },
-                                                                 .term = Consensus::Term { .value = reads },
-                                                                 .commitIndex = Consensus::LogIndex { .value = 7 },
-                                                                 .role = Consensus::Role::Follower,
-                                                             };
-                                                         } },
-                                 std::chrono::steady_clock::now());
+    auto const provider = MakeNodeSnapshotProvider(
+        NodeScrapeSources { .host = &host,
+                            .busySlots = [] { return std::size_t { 0 }; },
+                            .cache = nullptr,
+                            .slots = 4,
+                            .scratchRoot = std::filesystem::path { "." },
+                            .consensus =
+                                [&reads] {
+                                    ++reads;
+                                    return ConsensusStatus {
+                                        .configuration = { .voters = { "n1", "n2" }, .learners = { "n3" } },
+                                        .knownLeader = Consensus::NodeId { "n1" },
+                                        .term = Consensus::Term { .value = reads },
+                                        .commitIndex = Consensus::LogIndex { .value = 7 },
+                                        .role = Consensus::Role::Follower,
+                                    };
+                                } },
+        std::chrono::steady_clock::now());
 
     auto const first = provider();
     REQUIRE(first.consensus.has_value());
-    CHECK(Unwrap(first.consensus).members == std::vector<Consensus::NodeId> { "n1", "n2" });
+    CHECK(Unwrap(first.consensus).configuration.voters == std::vector<Consensus::NodeId> { "n1", "n2" });
+    CHECK(Unwrap(first.consensus).configuration.learners == std::vector<Consensus::NodeId> { "n3" });
     CHECK(Unwrap(first.consensus).knownLeader == Consensus::NodeId { "n1" });
     CHECK(Unwrap(first.consensus).commitIndex.value == 7);
     CHECK(Unwrap(first.consensus).term.value == 1);

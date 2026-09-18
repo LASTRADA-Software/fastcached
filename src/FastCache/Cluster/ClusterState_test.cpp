@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cstddef>
 #include <format>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -326,28 +327,28 @@ TEST_CASE("A truncated snapshot is refused rather than half-read", "[cluster][st
 
 TEST_CASE("A state another build encoded is refused by its version while a command keeps its own", "[cluster][state][wire]")
 {
-    // #1309 added the admitted clients and the forgotten hosts, so the state's version
-    // moved -- and the byte is pinned as well as the refusal, because a symbol both ends
-    // spell can only test the NAME of a wire constant. The version is the first field's
-    // only byte, after that field's u32 length prefix.
+    // #1449 added each member's seat, so the state's version moved again -- and the byte
+    // is pinned as well as the refusal, because a symbol both ends spell can only test the
+    // NAME of a wire constant. The version is the first field's only byte, after that
+    // field's u32 length prefix.
     ClusterState state;
     Apply(state, Cmd(CommandKind::AddMember, "n1", "10.0.0.1:6675", "10.0.0.1:7000"));
     auto bytes = Encode(state);
     REQUIRE(bytes.size() > 4);
-    CHECK(bytes[4] == std::byte { 4 });
+    CHECK(bytes[4] == std::byte { 5 });
 
     // What the previous build wrote. Refused BY NAME, both versions stated, and never
     // as `MalformedFrame`: those bytes are intact, and *damaged* is what gets a healthy
     // snapshot deleted.
-    bytes[4] = std::byte { 3 };
+    bytes[4] = std::byte { 4 };
     auto const older = DecodeState(bytes);
     REQUIRE_FALSE(older.has_value());
     CHECK(older.error().code == ConsensusErrorCode::UnsupportedVersion);
-    CHECK(older.error().context.contains("version 3"));
-    CHECK(older.error().context.contains("reads 4"));
+    CHECK(older.error().context.contains("version 4"));
+    CHECK(older.error().context.contains("reads 5"));
 
-    // The COMMAND layout did not change -- #1309 added verbs, not fields -- so its version
-    // must not have either. A committed entry this build cannot decode is skipped, so
+    // The COMMAND layout did not change -- #1309 and #1449 added verbs, not fields -- so
+    // its version must not have either. A committed entry this build cannot decode is skipped, so
     // moving this byte with the state's would make a node restarting onto its own log skip
     // every entry in it.
     auto command = Encode(Cmd(CommandKind::AddMember, "n1", "10.0.0.1:6675", "10.0.0.1:7000"));
@@ -788,6 +789,7 @@ TEST_CASE("Each cluster verb keeps the byte a log entry already carries", "[clus
     CHECK(byteOf(CommandKind::SetSetting) == 2U);
     CHECK(byteOf(CommandKind::AdmitClient) == 3U);
     CHECK(byteOf(CommandKind::ForgetClient) == 4U);
+    CHECK(byteOf(CommandKind::AddLearner) == 5U);
 }
 
 TEST_CASE("A client command names a machine that is not this one, and nothing else", "[cluster][state][forget]")
@@ -830,4 +832,93 @@ TEST_CASE("Clients and forgotten hosts survive a snapshot apart from each other"
     auto const truncated = DecodeState(shortened);
     REQUIRE_FALSE(truncated.has_value());
     CHECK(truncated.error().code == ConsensusErrorCode::MalformedFrame);
+}
+
+// --------------------------------------------------------------------------
+// Seats (#1449): which set of the consensus configuration the operator admitted a
+// member into, recorded by the verb and carried by every snapshot.
+
+TEST_CASE("The verb that admits a member decides its seat, and re-admitting moves it", "[cluster][state][learner]")
+{
+    // `AddLearner` is `AddMember` recording the other seat, so promoting and demoting
+    // are both a re-admit -- and the record is otherwise replaced exactly as a move
+    // replaces it, since the two verbs share one arm of `Apply`.
+    ClusterState state;
+    Apply(state, Cmd(CommandKind::AddLearner, "laptop", "10.0.0.9:6675"));
+    REQUIRE(state.members.size() == 1);
+    CHECK(state.members[0].seat == MemberSeat::Learner);
+    CHECK(state.members[0].raftEndpoint == "10.0.0.9:6675");
+
+    Apply(state, Cmd(CommandKind::AddMember, "laptop", "10.0.0.9:6675"));
+    REQUIRE(state.members.size() == 1);
+    CHECK(state.members[0].seat == MemberSeat::Voter);
+
+    Apply(state, Cmd(CommandKind::AddLearner, "laptop", "10.0.0.10:6675"));
+    REQUIRE(state.members.size() == 1);
+    CHECK(state.members[0].seat == MemberSeat::Learner);
+    CHECK(state.members[0].raftEndpoint == "10.0.0.10:6675");
+
+    // And the rules both verbs share: no endpoint, no member; and what it records is text.
+    CHECK(Refused(Cmd(CommandKind::AddLearner, "laptop")).contains("endpoint"));
+    CHECK(Refused(Cmd(CommandKind::AddLearner, "laptop\x80", "10.0.0.9:6675")).contains("member id"));
+}
+
+TEST_CASE("Every seat names the verb that records it and the set it means", "[cluster][state][learner]")
+{
+    // One statement of three facts, read by `Apply`, the scheduler that builds the
+    // command, the reconciler that moves consensus and every renderer. Asserted as
+    // FACTS rather than as `MemberSeatTable` agreeing with itself.
+    CHECK(SeatAdmittedBy(CommandKind::AddMember) == std::optional { MemberSeat::Voter });
+    CHECK(SeatAdmittedBy(CommandKind::AddLearner) == std::optional { MemberSeat::Learner });
+    CHECK_FALSE(SeatAdmittedBy(CommandKind::RemoveMember).has_value());
+    CHECK_FALSE(SeatAdmittedBy(CommandKind::AdmitClient).has_value());
+
+    CHECK(MemberSeatName(MemberSeat::Voter) == "voter");
+    CHECK(MemberSeatName(MemberSeat::Learner) == "learner");
+
+    auto configuration = Consensus::Configuration {};
+    (configuration.*MemberSeatTable[static_cast<std::size_t>(MemberSeat::Learner)].set).emplace_back("laptop");
+    CHECK(configuration.learners == std::vector<Consensus::NodeId> { "laptop" });
+    CHECK(configuration.voters.empty());
+    CHECK(MemberSeatTable[static_cast<std::size_t>(MemberSeat::Voter)].counted);
+    CHECK_FALSE(MemberSeatTable[static_cast<std::size_t>(MemberSeat::Learner)].counted);
+
+    // No opinion reads the record, and a voter where there is none.
+    ClusterState state;
+    Apply(state, Cmd(CommandKind::AddLearner, "laptop", "10.0.0.9:6675"));
+    CHECK(RecordedSeatOf(state, "laptop") == MemberSeat::Learner);
+    CHECK(RecordedSeatOf(state, "stranger") == MemberSeat::Voter);
+}
+
+TEST_CASE("A member's seat survives a snapshot, and one this build cannot name is refused",
+          "[cluster][state][wire][learner]")
+{
+    ClusterState state;
+    Apply(state, Cmd(CommandKind::AddMember, "n1", "10.0.0.1:6675"));
+    Apply(state, Cmd(CommandKind::AddLearner, "n2", "10.0.0.2:6675"));
+
+    auto bytes = Encode(state);
+    auto const restored = DecodeState(bytes);
+    REQUIRE(restored.has_value());
+    CHECK(*restored == state);
+    REQUIRE(restored->members.size() == 2);
+    CHECK(restored->members[0].seat == MemberSeat::Voter);
+    CHECK(restored->members[1].seat == MemberSeat::Learner);
+
+    // The seat BYTE is pinned, not only the symbol: it is persisted, so a renumbering
+    // that stayed consistent across this build would read every snapshot a fleet
+    // already wrote as the other set. The last member's seat is the state's last byte
+    // here, since there are no settings, clients or forgotten hosts after it.
+    CHECK(bytes.back() == std::byte { 1 });
+    CHECK(static_cast<unsigned>(MemberSeat::Voter) == 0U);
+    CHECK(static_cast<unsigned>(MemberSeat::Learner) == 1U);
+
+    // A seat this build has no name for is refused as malformed rather than read as a
+    // voter -- which would count, in every quorum, a member the operator admitted to be
+    // counted by none.
+    bytes.back() = std::byte { 2 };
+    auto const unknown = DecodeState(bytes);
+    REQUIRE_FALSE(unknown.has_value());
+    CHECK(unknown.error().code == ConsensusErrorCode::MalformedFrame);
+    CHECK(unknown.error().context.contains("seat"));
 }

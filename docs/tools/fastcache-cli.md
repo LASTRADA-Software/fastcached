@@ -141,7 +141,7 @@ the help renders `Verbs()` grouped by `WireSpec::heading`, and
 | Read (memcached) | `gat`, `gats`, `inspect`, `mc-stats` |
 | Write (memcached) | `touch`, `add`, `replace`, `append`, `prepend`, `cas`, `cache-memlimit` |
 | Node (`0xFC`) | `node`, `node-metrics`, `fleet`, `cordon`, `uncordon`, `explain-admission` |
-| Cluster (`0xFC`) | `cluster-members`, `cluster-settings`, `cluster-set`, `cluster-forget`, `cluster-admit` |
+| Cluster (`0xFC`) | `cluster-members`, `cluster-settings`, `cluster-set`, `cluster-forget`, `cluster-admit`, `cluster-admit-learner` |
 
 ### The fleet verb
 
@@ -261,6 +261,13 @@ says which: `announced`, `never-announced` (a member that has not led, which is
 ordinary), or `cleared` (a re-admit wiped the endpoint it had; it returns when that
 member next leads).
 
+`seat` is `voter` or `learner`: the set the member was **admitted into**, which is
+the record the leader moves consensus towards one change at a time. A learner is
+replicated to and counted by no quorum, and never stands for election, so a machine
+that comes and goes costs the cluster nothing while it is away. What a node is
+counted as *right now* is its own `consensus-standing` under `node` -- the two differ
+for as long as an admit is replicating.
+
 `cluster-settings` lists **every setting this build knows**, whether or not the
 cluster has agreed one — the question is usually *what can I set*, and a report
 showing only what somebody already set answers it wrongly by omission. A setting
@@ -282,8 +289,16 @@ majority involved, so that much comes back:
 - `member-id-as-received` — the id, byte for byte as it arrived
 - `consensus-endpoint-as-recorded` — the address that goes into the replicated
   configuration
+- `seat-as-requested` — `voter` or `learner`, which is the VERB this client sent
+  rather than an echo: the receipt does not carry it, because the leader can only have
+  answered the verb it was asked
 - `state` — **appended, not committed**, which is as strong a claim as a leader can
   truthfully make here
+
+`cluster-admit-learner` is `cluster-admit` recording a **learner**. On a voter it
+demotes that voter, and `cluster-admit` on a learner promotes it; either way the
+cluster moves one member at a time, and a demotion that would leave no voter is never
+proposed.
 
 Hold both values against the machine being brought in: the id it minted into its own
 `--cluster-dir`, and the address it answers consensus on (`--raft-self` together with
@@ -295,8 +310,8 @@ nobody, which at three members or more presents as an election storm that then
 settles — so the symptom points at consensus rather than at the character that was
 mistyped, and one address costs an afternoon.
 
-The same four verbs are also spelled `fastcache-compile-node --cluster-status`,
-`--cluster-set`, `--cluster-forget` and `--cluster-admit`. Prefer these: that path
+The same verbs are also spelled `fastcache-compile-node --cluster-status`,
+`--cluster-set`, `--cluster-forget`, `--cluster-admit` and `--cluster-admit-learner`. Prefer these: that path
 needs `--scheduler`, which is also a **startup** flag, so putting it in a unit file
 to run one admin command points that node at one scheduler forever — a registration
 replays its command line. A `--fleet-member` client has no node binary at all.
@@ -400,6 +415,11 @@ Beside them, what that worker is offering and whether anyone knows about it:
   which is the half of `--cluster-admit`'s receipt to compare against. Not `raft-port`,
   which is the port the node BOUND, on an address that is routinely the wildcard. A node
   running no consensus reports no such field rather than an empty one.
+- **`consensus-standing`** — which set consensus counts this node in right now:
+  `voter`, `learner`, `no-cluster` (waiting to be admitted) or `outsider` (its
+  configuration names others and not it). A learner and a following voter report the
+  same `scheduler-role`, and only one of them stands for election when the leader
+  goes. A node running no consensus reports no such field.
 
 There is deliberately no *limited-by* field beside the slot count. Which ceiling bound a
 worker's slots is the **scheduler's** conclusion — derived on the leader from what the

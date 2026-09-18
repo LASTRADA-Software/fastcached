@@ -6,6 +6,8 @@
 
 #include <FastCache/Async/PlatformReactor.hpp>
 #include <FastCache/Cluster/PskRaftPeerCredential.hpp>
+#include <FastCache/Consensus/RaftMembership.hpp>
+#include <FastCache/Consensus/RaftNode.hpp>
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/HostPort.hpp>
@@ -142,7 +144,7 @@ namespace
 
 ConsensusStatus ConsensusStatusFrom(Consensus::RaftDriver::Progress const& progress)
 {
-    return ConsensusStatus { .members = progress.members,
+    return ConsensusStatus { .configuration = progress.configuration,
                              .knownLeader = progress.knownLeader,
                              .term = progress.term,
                              .commitIndex = progress.commitIndex,
@@ -216,8 +218,15 @@ ConsensusTier::ConsensusTier(Cluster::ClusterMember self,
     // what mine is" -- where a peer discovered on the segment has no opinion at
     // all, and `DesiredMember` keeps the two apart precisely so one cannot clear
     // what the other announced.
-    _desired.push_back(Cluster::DesiredMember {
-        .id = _self.id, .raftEndpoint = _self.raftEndpoint, .schedulerEndpoint = _self.schedulerEndpoint });
+    //
+    // The SEAT is the opposite way round (#1449): no opinion, even about itself. Which
+    // set a node is in is the operator's decision, recorded by `--cluster-admit` and
+    // `--cluster-admit-learner`; a node that asserted its own seat on every pass would
+    // undo a demotion one interval after it committed.
+    _desired.push_back(Cluster::DesiredMember { .id = _self.id,
+                                                .raftEndpoint = _self.raftEndpoint,
+                                                .schedulerEndpoint = _self.schedulerEndpoint,
+                                                .seat = std::nullopt });
 }
 
 std::expected<std::unique_ptr<ConsensusTier>, std::string> ConsensusTier::Start(NodeConfig const& cfg,
@@ -405,6 +414,11 @@ std::expected<void, std::string> ConsensusTier::Launch(NodeConfig const& cfg,
     // A copy rather than moving `_bootstrapIds` into the configuration: the member
     // is what the reconciler compares against for the whole life of this node, and
     // `RaftConfig` owns its own list from here.
+    //
+    // Every one of them a VOTER (#1449). A learner is admitted at runtime -- by
+    // `--cluster-admit-learner`, into the replicated record -- and never typed into a
+    // bootstrap set, which every member must agree on and a flag cannot say which
+    // seat of.
     auto ids = _bootstrapIds;
 
     _transport = std::make_unique<Consensus::RaftPeerTransport>(
@@ -417,10 +431,11 @@ std::expected<void, std::string> ConsensusTier::Launch(NodeConfig const& cfg,
     // `Create` rather than the constructor, which is private precisely so the
     // configuration validation cannot be bypassed by omission -- so there is no
     // separate `Validate()` call here to forget.
-    auto node = Consensus::RaftNode::Create(Consensus::RaftConfig { .self = cfg.nodeId, .members = std::move(ids) },
-                                            *_random,
-                                            std::chrono::steady_clock::now(),
-                                            *std::move(recovered));
+    auto node =
+        Consensus::RaftNode::Create(Consensus::RaftConfig { .self = cfg.nodeId, .voters = std::move(ids), .learners = {} },
+                                    *_random,
+                                    std::chrono::steady_clock::now(),
+                                    *std::move(recovered));
     if (!node.has_value())
         return std::unexpected { node.error().context };
 
@@ -577,6 +592,14 @@ ConsensusStatus ConsensusTier::Status() const
     // that accessor says so in as many words -- and the moment they disagree is an
     // election, which is exactly when somebody is looking.
     return ConsensusStatusFrom(_driver->CurrentProgress());
+}
+
+std::optional<Consensus::Standing> ConsensusTier::CurrentStanding() const
+{
+    // From the configuration consensus HOLDS and this node's own id, through the one
+    // author of the answer -- the question `--node-status` asks, and a different one from
+    // the seat the replicated record names (#1449).
+    return Consensus::Membership::StandingOf(_driver->CurrentProgress().configuration, _self.id);
 }
 
 std::expected<void, ConsensusError> ConsensusTier::ProposeToCluster(Cluster::Command const& command)
@@ -768,21 +791,22 @@ void ConsensusTier::ReportQuorum()
     //
     // #435 is the surface this should eventually be; a line an operator can already
     // read is what can be had without one.
-    auto members = _driver->CurrentProgress().members;
-    std::ranges::sort(members);
+    auto configuration = _driver->CurrentProgress().configuration;
+    std::ranges::sort(configuration.voters);
+    std::ranges::sort(configuration.learners);
 
     // The FIRST pass reports whatever it finds, changed or not, and that is the
     // point rather than an initialisation detail. A joiner starts with no members,
     // so a report that only fired on a CHANGE would say nothing at all about the
     // state that matters -- and silence would then mean both "this node counts no
     // cluster" and "this loop never ran". Those are different failures.
-    if (_quorumReported && members == _reportedMembers)
+    if (_quorumReported && configuration == _reportedConfiguration)
         return;
 
     _quorumReported = true;
-    _reportedMembers = std::move(members);
+    _reportedConfiguration = std::move(configuration);
 
-    if (_reportedMembers.empty())
+    if (Consensus::Membership::IsEmpty(_reportedConfiguration))
     {
         // Said out loud, because it is a legitimate state for a `--raft-join` node
         // and a fatal one for any other -- and the two are told apart by which node
@@ -791,11 +815,29 @@ void ConsensusTier::ReportQuorum()
         return;
     }
 
-    auto names = std::string {};
-    for (auto const& id: _reportedMembers)
-        names += (names.empty() ? "" : ", ") + id;
+    auto const join = [](std::vector<Consensus::NodeId> const& ids) {
+        auto names = std::string {};
+        for (auto const& id: ids)
+            names += (names.empty() ? "" : ", ") + id;
+        return names;
+    };
 
-    _logger.Logf(LogLevel::Info, "consensus: this node counts {} member(s): {}", _reportedMembers.size(), names);
+    // The COUNT is the voters, since a quorum counts nobody else, and the line keeps the
+    // prefix it has always had so a watcher of it keeps working. Then the learners, only
+    // when there are any, and last this node's own standing (#1449): the half an operator
+    // cannot read off the lists without knowing which id this node is, and the one that
+    // says whether it will ever stand -- a learner counting itself among nobody is not
+    // the #388 fault, and a watcher that must tell the two apart reads this word.
+    auto const standing = Consensus::TraitsOf(Consensus::Membership::StandingOf(_reportedConfiguration, _self.id)).name;
+    auto const learners = _reportedConfiguration.learners.empty()
+                              ? std::string {}
+                              : std::format("; learners, counted by no quorum: {}", join(_reportedConfiguration.learners));
+    _logger.Logf(LogLevel::Info,
+                 "consensus: this node counts {} member(s): {}{}; it is a {}",
+                 _reportedConfiguration.voters.size(),
+                 join(_reportedConfiguration.voters),
+                 learners,
+                 standing);
 }
 
 void ConsensusTier::ReconcileQuorum(Cluster::ClusterState const& state)
@@ -826,7 +868,7 @@ void ConsensusTier::ReconcileQuorum(Cluster::ClusterState const& state)
 
     _quorumWaited = 0;
 
-    auto change = Cluster::NextQuorumChange(state, progress.members, _self.id, _bootstrapIds);
+    auto change = Cluster::NextQuorumChange(state, progress.configuration, _self.id, _bootstrapIds);
     if (!change.has_value())
         return;
 
@@ -872,8 +914,11 @@ void ConsensusTier::ReconcileQuorum(Cluster::ClusterState const& state)
     // index without its term cannot say whether the proposal it names can still be
     // the one that lands.
     _quorumProposedIn = progress.term;
-    _logger.Logf(
-        LogLevel::Info, "cluster: proposing a quorum of {} member(s) at index {}", change->size(), _quorumProposedAt.value);
+    _logger.Logf(LogLevel::Info,
+                 "cluster: proposing a quorum of {} voter(s) and {} learner(s) at index {}",
+                 change->voters.size(),
+                 change->learners.size(),
+                 _quorumProposedAt.value);
 }
 
 void ConsensusTier::PublishRole(Consensus::RaftDriver::RoleChange const& change)
