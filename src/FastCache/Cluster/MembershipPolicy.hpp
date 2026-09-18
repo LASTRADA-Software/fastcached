@@ -17,6 +17,15 @@ namespace FastCache::Cluster
 /// what somebody *knows*, assembled from a source that may not know all of it:
 /// discovery proves a peer's consensus endpoint and learns nothing about the port
 /// clients speak to, because nobody dials that port to find out.
+///
+/// **It carries no seat (#1535).** Which set a member is recorded in is decided against
+/// the state on every pass (`MembershipProposals`), never by whoever made the desire. A
+/// desire is made once and replayed on every pass for the life of the process, so a seat
+/// written into it would undo the operator's next promotion or demotion one interval
+/// after it committed -- the defect #1449 closed for this node's own record, reached
+/// from discovery's. And the fact a source cannot know is the one that decides: a
+/// `--raft-peer` member is counted by the configuration and recorded nowhere in the
+/// state, so a source that called every unrecorded peer a newcomer would demote it.
 struct DesiredMember
 {
     Consensus::NodeId id;     ///< Stable identity; what consensus counts.
@@ -31,16 +40,27 @@ struct DesiredMember
     /// simply never knew. A node says `""` about itself and `nullopt` about a peer,
     /// and only the first of those is an assertion.
     std::optional<std::string> schedulerEndpoint;
-
-    /// Which set it should be in; absent when this node has no opinion (#1449).
-    ///
-    /// Absent is not `Voter`, for `schedulerEndpoint`'s reason one field along: a node
-    /// desires ITSELF on every pass, so a record that always said voter would promote an
-    /// operator's demotion straight back. With no opinion the recorded seat stands, and a
-    /// member not yet recorded is admitted as a voter -- which is what discovery has
-    /// always admitted.
-    std::optional<MemberSeat> seat;
 };
+
+/// The seat a member is recorded in when nothing has placed it yet: a LEARNER (#1535).
+///
+/// Everything the reconciler is handed is an OBSERVATION -- a peer proved the cluster
+/// key, this node knows its own record -- and an observation does not grant a vote. A
+/// proof says a machine holds the key NOW; a vote is a claim that it will go on
+/// answering, and a two-voter cluster needs both machines for every commit from the
+/// moment the second is counted. Admitted straight as a voter, a discovered laptop on a
+/// VPN made the always-on machine beside it unable to commit or re-elect alone, which is
+/// #178's failure and the one learners exist to avoid. And the key is SHARED, so a proof
+/// names no machine: votes handed out per proof are votes any key holder can multiply.
+///
+/// **Promotion is the operator's act, never automatic** -- `--cluster-admit` on the
+/// learner. Catching up to the leader's commit index was the alternative, and it
+/// answers the wrong question: it says the machine can answer now, which is what
+/// discovery already knew, and nothing about whether it will stay. That is known only to
+/// whoever knows the machine. The record is the operator's as well (`ClusterMember::seat`,
+/// written only by the verb), so an automatic promotion would have to tell a learner the
+/// operator chose -- the laptop -- from one discovery admitted, and nothing records which.
+inline constexpr MemberSeat NewcomerSeat = MemberSeat::Learner;
 
 /// What `MembershipProposals` decided: what to propose, and what it refused to.
 struct MembershipPlan
@@ -59,11 +79,11 @@ struct MembershipPlan
 
 /// What a leader should propose to make the cluster's state say what it knows.
 ///
-/// The whole decision, as a pure function over two values: what the replicated state
-/// currently holds, and what this node believes the membership ought to include. It
-/// is a function rather than a method for the reason `WorkerRegistry` and
-/// `LeaseTable` are pure -- every rule below is a table-driven unit test rather than
-/// a cluster and a sleep -- and it is *one* function rather than one per source
+/// The whole decision, as a pure function over three values: what the replicated state
+/// currently holds, what consensus counts, and what this node believes the membership
+/// ought to include. It is a function rather than a method for the reason
+/// `WorkerRegistry` and `LeaseTable` are pure -- every rule below is a table-driven unit
+/// test rather than a cluster and a sleep -- and it is *one* function rather than one per source
 /// because this node has more than one: its own record, which only it can supply,
 /// and the peers discovery has proved. Two callers each deciding "is this already
 /// there?" would be two places for the answer to drift.
@@ -83,6 +103,14 @@ struct MembershipPlan
 /// comparison is on the *whole* record rather than on the id -- a member whose
 /// scheduler endpoint has just been announced differs from the one recorded, and must
 /// be re-proposed, while one that agrees in every field must not.
+///
+/// **A seat something else placed.** A recorded member keeps the seat the operator's
+/// verb wrote, so neither this node's own record nor a rediscovered peer promotes a
+/// demotion back or demotes a promotion. One recorded nowhere but counted by @p active
+/// -- a `--raft-peer` member, which nothing puts in the state -- is recorded in the set
+/// consensus already counts it in, so recording a typed voter never demotes it. Only a
+/// member neither places is a newcomer, and it joins as `NewcomerSeat`: a learner, which
+/// an operator promotes (#1535).
 ///
 /// ## What it refuses to propose
 ///
@@ -113,10 +141,14 @@ struct MembershipPlan
 /// member forgotten there is re-admitted at its next proof. A host names no machine
 /// among members that all have the same one.
 /// @param state The cluster's state as this node last applied it.
+/// @param active The configuration consensus currently holds, both sets: where a member
+///        the state does not record is already counted.
 /// @param desired Records this node believes should be present.
 /// @return What to propose, in `desired` order, and what was refused because its host
 ///         was forgotten.
-[[nodiscard]] MembershipPlan MembershipProposals(ClusterState const& state, std::span<DesiredMember const> desired);
+[[nodiscard]] MembershipPlan MembershipProposals(ClusterState const& state,
+                                                 Consensus::Configuration const& active,
+                                                 std::span<DesiredMember const> desired);
 
 /// The one consensus membership change that moves the quorum towards the state.
 ///

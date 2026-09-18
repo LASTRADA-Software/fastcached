@@ -104,7 +104,8 @@ saying so. The store is intact; what an operator does is:
 Whatever the cluster agreed at **runtime** has to be agreed again once a leader is
 elected: members admitted with `--cluster-admit` or `--cluster-admit-learner`, and
 cluster settings (`--cluster-set`). Members found by `--discovery` are re-admitted by
-discovery itself — including a machine the cluster had forgotten, because its tombstone
+discovery itself, as **learners** — promote the ones that voted again with
+`--cluster-admit` — and so is a machine the cluster had forgotten, because its tombstone
 was part of the state that was moved aside; forget it again. Nothing a build writes
 into `--cache-dir` is involved.
 

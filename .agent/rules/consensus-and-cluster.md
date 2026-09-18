@@ -1243,10 +1243,28 @@ tick -- the scheduler answers `NotLeader` and the fleet page goes dark until it 
 - **The SEAT is the operator's record, written only by the verb.** `ClusterMember::seat` is set
   by `AddMember` (voter) or `AddLearner` (learner), so promotion and demotion are re-admissions
   and `MemberSeatTable` is the one statement of which verb writes which seat and which
-  configuration set it means. **No opinion is not `Voter`**: `DesiredMember::seat` is optional
-  and a node desires ITSELF on every pass, so a self-record that said voter would undo an
-  operator's demotion one interval after it committed. An enrollment approval, which recovery
-  repeats, states no seat either (`RecordedSeatOf`).
+  configuration set it means. **A desire carries no seat at all** (#1535; #1449 had an optional
+  one): a node desires ITSELF on every pass and discovery re-desires every peer at every proof,
+  so a seat fixed when the desire was made would undo an operator's promotion or demotion one
+  interval after it committed. `MembershipProposals` decides it against the state at every pass
+  (`SeatFor`): the recorded seat, else the set the CONFIGURATION counts it in -- a `--raft-peer`
+  member is counted and recorded nowhere, and read from the state alone it looks exactly like a
+  newcomer, so recording it as one DEMOTES it -- else `NewcomerSeat`. The record outranks the
+  configuration because a demotion in flight is the record running ahead. An enrollment
+  approval, which recovery repeats, states no seat either (`RecordedSeatOf`).
+- **A machine discovery proves joins as a LEARNER, and an operator promotes it** (#1535). A
+  proof says a machine holds the key now; a vote says it will go on answering, and admitted
+  straight as a voter a laptop made the always-on machine beside it unable to commit or re-elect
+  alone -- #178's failure, reached through discovery. The shared key also names no holder, so a
+  vote per proof is a vote any key holder can multiply. **Promotion is deliberately NOT
+  automatic once caught up**: that was the alternative, and it answers the wrong question --
+  caught up is *can answer now*, which the proof already said, and nothing records whether a
+  learner is the operator's (the laptop, meant to stay one) or discovery's. #178's approved
+  design ends discovery admission altogether, so votes as an operator act is where this is
+  heading anyway. The cost, stated in the docs: a fleet formed by discovery alone has ONE voter
+  until somebody promotes more. Pinned with the neuter *newcomers are voters* reddening the
+  per-pass quorum assertion, and a typed-peer control the neuter *ignore the configuration*
+  reddens.
 - **A learner is never removed for being absent.** Nothing in `NextQuorumChange` asks whether a
   member answers, so this is the bootstrap rule applied to a second population: only a member
   the operator FORGOT, and admitted at runtime, is proposed for removal, whichever set it is in.
@@ -1276,6 +1294,13 @@ tick -- the scheduler answers `NotLeader` and the fleet page goes dark until it 
   window leaves the cluster waiting for it to return rather than electing around it.
 
 ## Open work
+
+- **[#1537](https://github.com/LASTRADA-Software/fastcached/issues/1537)** — a promotion,
+  or a voter admission, is counted as soon as the member's address is dialable, never once
+  it has CAUGHT UP. #1535 left promotion to the operator on purpose -- caught up is the wrong
+  criterion for WHETHER to promote -- and this is the guard on that act: the right criterion
+  for WHEN a promotion may take effect. Promoting an absent learner in a one-voter cluster
+  stalls every commit until it returns (inferred).
 
 - **[#144](https://github.com/LASTRADA-Software/fastcached/issues/144)** — a
   follower answering `/fleet` names the leader but cannot link to it, because

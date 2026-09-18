@@ -213,8 +213,9 @@
 #cluster_id:
 
 # announce this node on the segment and listen for peers here; off unless
-# given. Needs --listen-raft and --cluster-key-file. Without it a cluster is
-# exactly the --raft-peer list an operator typed.
+# given. Needs --listen-raft and --cluster-key-file. A peer that proves the key
+# joins as a learner, counted by no quorum; --cluster-admit promotes it to a
+# voter.
 #discovery:
 
 # port peers unicast their discovery challenges and proofs to; kernel-chosen

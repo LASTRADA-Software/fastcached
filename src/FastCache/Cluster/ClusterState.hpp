@@ -627,10 +627,13 @@ static_assert(RowsInEnumeratorOrder(MemberSeatTable, &MemberSeatRow::seat),
 
 /// The seat `id` is recorded in, or a voter when `state` has no record of it.
 ///
-/// The one reading of *no opinion about the seat*, shared by every caller that re-admits a
-/// member without deciding its seat -- the membership reconciler and an enrollment
-/// approval -- so neither can promote a demoted member by re-proposing it as a voter.
-/// Declared here and defined in the translation unit, beside `ClusterState`'s lookups.
+/// The reading of *no opinion about the seat* for an operator's re-admission -- an
+/// enrollment approval, which recovery repeats -- so it cannot promote a demoted member by
+/// re-proposing it as a voter. A voter for a member with no record, because an approval is
+/// an operator's act. The membership RECONCILER does not use it (#1535): what it records
+/// is an observation, and a member nothing has placed joins there as a learner
+/// (`Cluster::NewcomerSeat`). Declared here and defined in the translation unit, beside
+/// `ClusterState`'s lookups.
 /// @param state The replicated state.
 /// @param id The member.
 /// @return Its recorded seat, or `MemberSeat::Voter`.
