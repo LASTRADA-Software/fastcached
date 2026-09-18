@@ -116,6 +116,8 @@ here.
 | `FASTCACHE_AUTO_INSTALL_API` | `https://api.github.com` | API used to resolve the latest release. |
 | `FASTCACHE_AUTO_INSTALL_DOWNLOAD_BASE` | `https://github.com` | Where release archives are downloaded from. |
 | `FASTCACHE_AUTO_INSTALL_TTL_HOURS` | `24` | How long a resolved "latest" is reused before asking again. |
+| `FASTCACHE_AUTO_INSTALL_HOST_SYSTEM` | *(empty: `CMAKE_HOST_SYSTEM_NAME`)* | Fetch the binary published for this system instead of the host's. One that does not run here is removed again and declined, never used. |
+| `FASTCACHE_AUTO_INSTALL_HOST_PROCESSOR` | *(empty: `CMAKE_HOST_SYSTEM_PROCESSOR`)* | The same, for the processor. |
 
 #### What it will not do
 
