@@ -1188,7 +1188,8 @@ what differs between compilers, standard libraries, hosts and tool versions.
   `bash scripts/check-clang-tidy-version.sh --resolve`, which names the install command when it
   cannot answer. A shape that build is KNOWN to crash on is a row of
   `check-clang-tidy-known-defects.sh`: its sites name the value first under a one-line comment
-  naming the issue, and the check stays on.
+  naming the issue, and the check stays on. The row is its own record -- it goes red on the pin
+  move that fixes the defect -- so its issue need not stay open.
 - **The formatter is a BUILD too: `.clang-format-version` declares ONE PyPI clang-format release by
   its banner, and a clang-format that is not that build does not WRITE** — not the format-on-edit
   hook, not `local-gate.sh`'s `-i`. The banner is compared WHOLE, so the apt snapshot of the same
