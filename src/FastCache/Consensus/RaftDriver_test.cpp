@@ -980,21 +980,29 @@ TEST_CASE("A node restarted after compacting comes back holding every cluster fa
         Elect(*driver, TimePoint {} + 150ms);
 
         auto const at = TimePoint {} + 200ms;
-        (void) ProposeCommand(
-            *driver,
-            Cluster::Command {
-                .kind = Cluster::CommandKind::AddMember, .key = "n2", .value = "10.0.0.2:6675", .schedulerEndpoint = {} },
-            at);
-        forgottenAt = ProposeCommand(
-            *driver,
-            Cluster::Command {
-                .kind = Cluster::CommandKind::ForgetClient, .key = "10.0.0.7", .value = {}, .schedulerEndpoint = {} },
-            at);
+        (void) ProposeCommand(*driver,
+                              Cluster::Command { .kind = Cluster::CommandKind::AddMember,
+                                                 .key = "n2",
+                                                 .value = "10.0.0.2:6675",
+                                                 .schedulerEndpoint = {},
+                                                 .publicKey = std::nullopt,
+                                                 .role = std::nullopt },
+                              at);
+        forgottenAt = ProposeCommand(*driver,
+                                     Cluster::Command { .kind = Cluster::CommandKind::ForgetClient,
+                                                        .key = "10.0.0.7",
+                                                        .value = {},
+                                                        .schedulerEndpoint = {},
+                                                        .publicKey = std::nullopt,
+                                                        .role = std::nullopt },
+                                     at);
         (void) ProposeCommand(*driver,
                               Cluster::Command { .kind = Cluster::CommandKind::SetSetting,
                                                  .key = std::string { Cluster::LeaseLifetimeSetting },
                                                  .value = "40min",
-                                                 .schedulerEndpoint = {} },
+                                                 .schedulerEndpoint = {},
+                                                 .publicKey = std::nullopt,
+                                                 .role = std::nullopt },
                               at);
 
         // Padded until the snapshot covers the tombstone -- counted by the boundary
@@ -1009,18 +1017,23 @@ TEST_CASE("A node restarted after compacting comes back holding every cluster fa
                                   Cluster::Command { .kind = Cluster::CommandKind::SetSetting,
                                                      .key = std::string { Cluster::FleetOpenSetting },
                                                      .value = step % 2 == 0 ? "1" : "0",
-                                                     .schedulerEndpoint = {} },
+                                                     .schedulerEndpoint = {},
+                                                     .publicKey = std::nullopt,
+                                                     .role = std::nullopt },
                                   at);
         }
         REQUIRE(driver->Node().SnapshotIndex() >= forgottenAt);
 
         // And one fact ABOVE the snapshot, which a restart re-applies rather than
         // restores -- so the case sees both halves of recovery, in their order.
-        aboveAt = ProposeCommand(
-            *driver,
-            Cluster::Command {
-                .kind = Cluster::CommandKind::AdmitClient, .key = "10.0.0.9", .value = {}, .schedulerEndpoint = {} },
-            at);
+        aboveAt = ProposeCommand(*driver,
+                                 Cluster::Command { .kind = Cluster::CommandKind::AdmitClient,
+                                                    .key = "10.0.0.9",
+                                                    .value = {},
+                                                    .schedulerEndpoint = {},
+                                                    .publicKey = std::nullopt,
+                                                    .role = std::nullopt },
+                                 at);
         REQUIRE(driver->Node().SnapshotIndex() < aboveAt);
 
         before = machine.State();
