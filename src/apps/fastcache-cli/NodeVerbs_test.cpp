@@ -2090,9 +2090,9 @@ TEST_CASE("explain-admission names EVERY route that decided, never only the winn
 
     SECTION("a host admitted by two routes has both named")
     {
-        auto const answer = explain({ .verdict = Cc::WireMembership::Member,
-                                      .decidedBy = static_cast<std::uint32_t>(Cc::WireMembershipRoute::FleetMemberList)
-                                                   | static_cast<std::uint32_t>(Cc::WireMembershipRoute::ClusterMembers) });
+        auto const answer =
+            explain({ .verdict = Cc::WireMembership::Member,
+                      .decidedBy = Cc::WireMembershipRoute::FleetMemberList | Cc::WireMembershipRoute::ClusterMembers });
 
         CHECK(answer.outcome == Outcome::Affirmative);
         CHECK(RequiredCell(answer, "host").lexical == "10.0.0.9");
@@ -2103,8 +2103,8 @@ TEST_CASE("explain-admission names EVERY route that decided, never only the winn
 
     SECTION("a forgotten host names the tombstone and says re-listing it will not help")
     {
-        auto const answer = explain({ .verdict = Cc::WireMembership::Forgotten,
-                                      .decidedBy = static_cast<std::uint32_t>(Cc::WireMembershipRoute::ClientTombstone) });
+        auto const answer =
+            explain({ .verdict = Cc::WireMembership::Forgotten, .decidedBy = Cc::WireMembershipRoute::ClientTombstone });
 
         CHECK(RequiredCell(answer, "verdict").lexical == "forgotten");
         CHECK(RequiredCell(answer, "decided-by").lexical == "--cluster-forget-client");
@@ -2131,9 +2131,8 @@ TEST_CASE("explain-admission names EVERY route that decided, never only the winn
         // FEWER things decided this than did, which is the reading that sends somebody to
         // change a route that was never consulted.
         constexpr auto unknownBit = std::uint32_t { 0x8000'0000 };
-        auto const answer =
-            explain({ .verdict = Cc::WireMembership::Member,
-                      .decidedBy = static_cast<std::uint32_t>(Cc::WireMembershipRoute::FleetMemberList) | unknownBit });
+        auto const answer = explain(
+            { .verdict = Cc::WireMembership::Member, .decidedBy = Cc::WireMembershipRoute::FleetMemberList | unknownBit });
 
         CHECK(RequiredCell(answer, "decided-by").lexical.contains("--fleet-member"));
         CHECK(RequiredCell(answer, "decided-by").lexical.contains("1 route(s) this client is too old to name"));

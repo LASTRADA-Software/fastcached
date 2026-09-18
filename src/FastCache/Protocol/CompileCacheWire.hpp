@@ -4845,14 +4845,22 @@ enum class WireMembership : std::uint8_t
 /// for a silence is the confident wrong signal this verb exists to remove.
 ///
 /// Explicit values because these bytes are transmitted, and powers of two because they combine.
-enum class WireMembershipRoute : std::uint32_t
+/// A NAMESPACE of constants rather than an `enum class`, following `NodeComponentBit` above --
+/// which is the same question on the same wire, and the precedent this originally missed.
+///
+/// A bitmask is not an enumeration: its values combine, so no variable of the type holds one
+/// of them and a `switch` over it means nothing. `performance-enum-size` says the quiet part --
+/// an `enum class : std::uint32_t` whose named values reach 0x10 is four bytes carrying one --
+/// and the tempting fix, narrowing the base type, is wrong twice: it caps a set the WIRE has
+/// room to grow at eight, and it makes the type's width disagree with the field's.
+namespace WireMembershipRoute
 {
-    FleetMemberList = 0x01, ///< `--fleet-member`'s list on this node.
-    ClusterMembers = 0x02,  ///< The member set the cluster has agreed.
-    ClientTombstone = 0x04, ///< A replicated `--cluster-forget-client` entry.
-    OpenPolicy = 0x08,      ///< `--fleet-open`, which admits every caller.
-    ProvenKeyHolder = 0x10, ///< The caller proved the cluster key on this connection.
-};
+    constexpr std::uint32_t FleetMemberList = 0x01; ///< `--fleet-member`'s list on this node.
+    constexpr std::uint32_t ClusterMembers = 0x02;  ///< The member set the cluster has agreed.
+    constexpr std::uint32_t ClientTombstone = 0x04; ///< A replicated `--cluster-forget-client` entry.
+    constexpr std::uint32_t OpenPolicy = 0x08;      ///< `--fleet-open`, which admits every caller.
+    constexpr std::uint32_t ProvenKeyHolder = 0x10; ///< The caller proved the cluster key on this connection.
+} // namespace WireMembershipRoute
 
 /// One node's answer about one host.
 struct AdmissionExplanationFields

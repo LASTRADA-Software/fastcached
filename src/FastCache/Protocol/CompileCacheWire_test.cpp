@@ -2578,11 +2578,11 @@ TEST_CASE("The explain-admission verb occupies the byte it was assigned, in the 
     CHECK(static_cast<std::uint8_t>(WireMembership::Outsider) == 0x01);
     CHECK(static_cast<std::uint8_t>(WireMembership::Member) == 0x02);
     CHECK(static_cast<std::uint8_t>(WireMembership::Forgotten) == 0x03);
-    CHECK(static_cast<std::uint32_t>(WireMembershipRoute::FleetMemberList) == 0x01);
-    CHECK(static_cast<std::uint32_t>(WireMembershipRoute::ClusterMembers) == 0x02);
-    CHECK(static_cast<std::uint32_t>(WireMembershipRoute::ClientTombstone) == 0x04);
-    CHECK(static_cast<std::uint32_t>(WireMembershipRoute::OpenPolicy) == 0x08);
-    CHECK(static_cast<std::uint32_t>(WireMembershipRoute::ProvenKeyHolder) == 0x10);
+    CHECK(WireMembershipRoute::FleetMemberList == 0x01);
+    CHECK(WireMembershipRoute::ClusterMembers == 0x02);
+    CHECK(WireMembershipRoute::ClientTombstone == 0x04);
+    CHECK(WireMembershipRoute::OpenPolicy == 0x08);
+    CHECK(WireMembershipRoute::ProvenKeyHolder == 0x10);
 }
 
 TEST_CASE("An explain-admission request carries exactly one host, and anything else is refused", "[wire][admission]")
@@ -2613,15 +2613,14 @@ TEST_CASE("An admission explanation round-trips every verdict and the whole rout
 {
     // A different route set per verdict, so an encoder that dropped either half cannot
     // agree with all three.
-    for (auto const& sent:
-         { AdmissionExplanationFields { .verdict = WireMembership::Member,
-                                        .decidedBy = static_cast<std::uint32_t>(WireMembershipRoute::FleetMemberList)
-                                                     | static_cast<std::uint32_t>(WireMembershipRoute::ClusterMembers) },
-           AdmissionExplanationFields { .verdict = WireMembership::Forgotten,
-                                        .decidedBy = static_cast<std::uint32_t>(WireMembershipRoute::ClientTombstone) },
-           // The silence: refused, and no route claims authorship. Zero is the READING
-           // here rather than a missing field.
-           AdmissionExplanationFields { .verdict = WireMembership::Outsider, .decidedBy = 0 } })
+    for (auto const& sent: { AdmissionExplanationFields { .verdict = WireMembership::Member,
+                                                          .decidedBy = WireMembershipRoute::FleetMemberList
+                                                                       | WireMembershipRoute::ClusterMembers },
+                             AdmissionExplanationFields { .verdict = WireMembership::Forgotten,
+                                                          .decidedBy = WireMembershipRoute::ClientTombstone },
+                             // The silence: refused, and no route claims authorship. Zero is the READING
+                             // here rather than a missing field.
+                             AdmissionExplanationFields { .verdict = WireMembership::Outsider, .decidedBy = 0 } })
     {
         auto const back = DecodeAdmissionExplanation(EncodeAdmissionExplanation(sent));
         REQUIRE(back.has_value());
@@ -2631,8 +2630,7 @@ TEST_CASE("An admission explanation round-trips every verdict and the whole rout
 
 TEST_CASE("An unknown VERDICT is refused and an unknown ROUTE is kept, which is not one rule twice", "[wire][admission]")
 {
-    auto const routes =
-        WireFields::ToBigEndian<std::uint32_t>(static_cast<std::uint32_t>(WireMembershipRoute::FleetMemberList));
+    auto const routes = WireFields::ToBigEndian<std::uint32_t>(WireMembershipRoute::FleetMemberList);
 
     SECTION("a verdict byte this build cannot name is refused, never read as a refusal nobody authored")
     {
@@ -2652,10 +2650,8 @@ TEST_CASE("An unknown VERDICT is refused and an unknown ROUTE is kept, which is 
         // decided this than did, on a fleet mid-upgrade -- and the reader can tell,
         // because the bit it does not know is still there to count.
         constexpr auto ahead = std::uint32_t { 0x8000'0000 };
-        auto const sent =
-            AdmissionExplanationFields { .verdict = WireMembership::Member,
-                                         .decidedBy =
-                                             static_cast<std::uint32_t>(WireMembershipRoute::FleetMemberList) | ahead };
+        auto const sent = AdmissionExplanationFields { .verdict = WireMembership::Member,
+                                                       .decidedBy = WireMembershipRoute::FleetMemberList | ahead };
         auto const back = DecodeAdmissionExplanation(EncodeAdmissionExplanation(sent));
         REQUIRE(back.has_value());
         CHECK(Unwrap(back).decidedBy == sent.decidedBy);

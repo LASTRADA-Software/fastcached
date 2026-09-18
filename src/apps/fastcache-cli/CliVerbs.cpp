@@ -1279,7 +1279,7 @@ namespace
         auto named = std::uint32_t { 0 };
         for (auto const& row: Distributed::MembershipWireRoutes)
         {
-            auto const bit = static_cast<std::uint32_t>(row.bit);
+            auto const bit = row.bit;
             if ((decidedBy & bit) == 0)
                 continue;
             named |= bit;

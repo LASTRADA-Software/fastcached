@@ -1113,7 +1113,7 @@ TEST_CASE("explain-admission names every route that decided, and attributes a si
         REQUIRE(header.has_value());
         auto const decoded = Wire::DecodeAdmissionExplanation(PayloadOf(reply, Unwrap(header)));
         REQUIRE(decoded.has_value());
-        return *decoded;
+        return Unwrap(decoded);
     };
 
     // The caller must itself be admitted, or the membership gate refuses before the verb runs --
@@ -1127,7 +1127,7 @@ TEST_CASE("explain-admission names every route that decided, and attributes a si
     {
         auto const answer = ask(fleetList, Subject);
         CHECK(answer.verdict == Wire::WireMembership::Member);
-        CHECK(answer.decidedBy == static_cast<std::uint32_t>(Wire::WireMembershipRoute::FleetMemberList));
+        CHECK(answer.decidedBy == Wire::WireMembershipRoute::FleetMemberList);
     }
 
     SECTION("a host the CLUSTER admits is attributed to the cluster, which the section above cannot show")
@@ -1136,7 +1136,7 @@ TEST_CASE("explain-admission names every route that decided, and attributes a si
         // bit, and the two together cannot.
         auto const answer = ask(clusterSet, Subject);
         CHECK(answer.verdict == Wire::WireMembership::Member);
-        CHECK(answer.decidedBy == static_cast<std::uint32_t>(Wire::WireMembershipRoute::ClusterMembers));
+        CHECK(answer.decidedBy == Wire::WireMembershipRoute::ClusterMembers);
     }
 
     SECTION("a host on BOTH reports BOTH, which is the question an operator actually has")
@@ -1148,8 +1148,8 @@ TEST_CASE("explain-admission names every route that decided, and attributes a si
         auto const answer = ask(both, Subject);
 
         CHECK(answer.verdict == Wire::WireMembership::Member);
-        CHECK((answer.decidedBy & static_cast<std::uint32_t>(Wire::WireMembershipRoute::FleetMemberList)) != 0);
-        CHECK((answer.decidedBy & static_cast<std::uint32_t>(Wire::WireMembershipRoute::ClusterMembers)) != 0);
+        CHECK((answer.decidedBy & Wire::WireMembershipRoute::FleetMemberList) != 0);
+        CHECK((answer.decidedBy & Wire::WireMembershipRoute::ClusterMembers) != 0);
     }
 
     SECTION("a forgotten host is Forgotten and attributed to the TOMBSTONE, outranking the listing")
@@ -1176,7 +1176,7 @@ TEST_CASE("explain-admission names every route that decided, and attributes a si
 
         auto const answer = ask(both, Subject);
         CHECK(answer.verdict == Wire::WireMembership::Forgotten);
-        CHECK((answer.decidedBy & static_cast<std::uint32_t>(Wire::WireMembershipRoute::ClientTombstone)) != 0);
+        CHECK((answer.decidedBy & Wire::WireMembershipRoute::ClientTombstone) != 0);
     }
 
     SECTION("a host nobody has an opinion about is Outsider, attributed to NOBODY")
@@ -1207,15 +1207,14 @@ TEST_CASE("an admission explanation survives the wire, and an unknown verdict is
     // the route set to its winner would round-trip a value that compares equal to itself.
     auto const original = Wire::AdmissionExplanationFields {
         .verdict = Wire::WireMembership::Member,
-        .decidedBy = static_cast<std::uint32_t>(Wire::WireMembershipRoute::FleetMemberList)
-                     | static_cast<std::uint32_t>(Wire::WireMembershipRoute::ClusterMembers),
+        .decidedBy = Wire::WireMembershipRoute::FleetMemberList | Wire::WireMembershipRoute::ClusterMembers,
     };
 
     auto const decoded = Wire::DecodeAdmissionExplanation(Wire::EncodeAdmissionExplanation(original));
     REQUIRE(decoded.has_value());
-    CHECK(*decoded == original);
-    CHECK(decoded->verdict == Wire::WireMembership::Member);
-    CHECK((decoded->decidedBy & static_cast<std::uint32_t>(Wire::WireMembershipRoute::ClusterMembers)) != 0);
+    CHECK(Unwrap(decoded) == original);
+    CHECK(Unwrap(decoded).verdict == Wire::WireMembership::Member);
+    CHECK((Unwrap(decoded).decidedBy & Wire::WireMembershipRoute::ClusterMembers) != 0);
 
     SECTION("a verdict byte this build cannot name is REFUSED, never defaulted to Outsider")
     {
@@ -1227,7 +1226,7 @@ TEST_CASE("an admission explanation survives the wire, and an unknown verdict is
         REQUIRE(fields.has_value());
 
         // The verdict is the first field's single byte; 0x7F names no `WireMembership`.
-        auto const at = static_cast<std::size_t>((*fields)[0].data() - damaged.data());
+        auto const at = static_cast<std::size_t>(Unwrap(fields)[0].data() - damaged.data());
         damaged[at] = std::byte { 0x7F };
 
         CHECK_FALSE(Wire::DecodeAdmissionExplanation(damaged).has_value());
@@ -1240,10 +1239,10 @@ TEST_CASE("an admission explanation survives the wire, and an unknown verdict is
         // mid-upgrade -- reporting fewer deciders than there were.
         auto const withUnknown = Wire::AdmissionExplanationFields {
             .verdict = Wire::WireMembership::Member,
-            .decidedBy = static_cast<std::uint32_t>(Wire::WireMembershipRoute::FleetMemberList) | 0x8000U,
+            .decidedBy = Wire::WireMembershipRoute::FleetMemberList | 0x8000U,
         };
         auto const back = Wire::DecodeAdmissionExplanation(Wire::EncodeAdmissionExplanation(withUnknown));
         REQUIRE(back.has_value());
-        CHECK((back->decidedBy & 0x8000U) != 0);
+        CHECK((Unwrap(back).decidedBy & 0x8000U) != 0);
     }
 }

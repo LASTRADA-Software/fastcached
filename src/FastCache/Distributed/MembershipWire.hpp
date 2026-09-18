@@ -42,8 +42,8 @@ static_assert(RowsInEnumeratorOrder(MembershipWireVerdicts, &MembershipVerdictRo
 /// One row of `MembershipWireRoutes`.
 struct MembershipRouteRow
 {
-    MembershipParticipant route;               ///< What the fold calls it.
-    CompileCacheWire::WireMembershipRoute bit; ///< The bit it travels as.
+    MembershipParticipant route; ///< What the fold calls it.
+    std::uint32_t bit;           ///< The bit it travels as, a `CompileCacheWire::WireMembershipRoute` value.
 };
 
 /// Which bit each admission route travels as.
@@ -71,7 +71,7 @@ static_assert(RowsInEnumeratorOrder(MembershipWireRoutes, &MembershipRouteRow::r
     auto bits = std::uint32_t { 0 };
     for (auto const& row: MembershipWireRoutes)
         if (decision.decidedBy.Has(row.route))
-            bits |= static_cast<std::uint32_t>(row.bit);
+            bits |= row.bit;
 
     return { .verdict = MembershipWireVerdicts[static_cast<std::size_t>(decision.verdict)].tag, .decidedBy = bits };
 }

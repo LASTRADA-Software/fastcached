@@ -655,6 +655,10 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
 - A wire constant has TWO facts, its name and its value, and a symbol both ends spell can only
   test the first. Pin the **byte** as well, and keep one test on the raw enumerator — it is
   the anchor, not the code smell it looks like.
+- **A new verb is not one dispatch, and none of the other places fails the BUILD**: the daemon
+  needs a `switch` arm — a missing one DROPS the frame rather than refusing, so the client
+  reports a dead endpoint — and a `RelocatedVerbs` row; a counter it adds needs a row on the
+  node's documentation page; and the live-stats layout pin moves.
 - `Net/` must not depend on `Core/`. `Async/` travels with it, plus three named
   dependency-free leaf headers; `ctest -R net-boundary` enforces the table.
 - `CompileCacheWire.hpp` must stay header-only and dependency-free — the launcher does not
