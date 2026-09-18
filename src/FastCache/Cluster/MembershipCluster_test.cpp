@@ -84,6 +84,13 @@ class Fleet
     {
     }
 
+    /// @param configuration The voters and the learners, every one bootstrapped with both.
+    explicit Fleet(Consensus::Configuration const& configuration):
+        _ids { MembersOf(configuration) },
+        _cluster { configuration, ClusterKey }
+    {
+    }
+
     /// @return The cluster underneath.
     [[nodiscard]] Consensus::RaftClusterHarness& Cluster() noexcept
     {
@@ -112,8 +119,11 @@ class Fleet
         if (!leader.has_value())
             return {};
 
+        // One read of the driver, as the tier makes it: the configuration, the commit
+        // index and every member's match index describe one moment.
         auto const state = StateAt(*leader);
-        auto const configuration = _cluster.At(*leader).driver->CurrentProgress().configuration;
+        auto const progress = _cluster.At(*leader).driver->CurrentProgress();
+        auto const& configuration = progress.configuration;
         auto const plan = MembershipProposals(state, configuration, DesiredBy(*leader));
         for (auto const& command: plan.proposals)
             std::ignore = _cluster.ProposeOnLeader(Encode(command));
@@ -123,8 +133,15 @@ class Fleet
                                           .schedulerEndpoint = {},
                                           .schedulerEndpointHistory = SchedulerEndpointHistory::NeverAnnounced,
                                           .seat = MemberSeat::Voter };
-        if (auto const change = NextQuorumChange(state, configuration, self, _ids); change.has_value())
-            std::ignore = _cluster.ProposeMembershipOnLeader(*change);
+        auto const quorum =
+            NextQuorumChange(state,
+                             configuration,
+                             self,
+                             _ids,
+                             Replication { .commitIndex = progress.commitIndex, .matchIndex = progress.matchIndex });
+        _catchingUp = quorum.catchingUp;
+        if (quorum.change.has_value())
+            std::ignore = _cluster.ProposeMembershipOnLeader(*quorum.change);
         return plan.forgotten;
     }
 
@@ -147,7 +164,39 @@ class Fleet
         return {};
     }
 
+    /// `--cluster-admit=<id>=<endpoint>`: an operator's voter record, committed directly.
+    /// @param id The member.
+    /// @return Whether a leader took it.
+    bool Admit(Consensus::NodeId const& id)
+    {
+        return _cluster
+            .ProposeOnLeader(Encode(
+                Command { .kind = CommandKind::AddMember, .key = id, .value = EndpointOf(id), .schedulerEndpoint = {} }))
+            .has_value();
+    }
+
+    /// Who the last pass said a promotion is waiting for (#1537).
+    /// @return Their ids.
+    [[nodiscard]] std::vector<Consensus::NodeId> const& CatchingUp() const noexcept
+    {
+        return _catchingUp;
+    }
+
+    /// Run reconcile passes, `StepsPerPass` apart.
+    /// @param passes How many.
+    void Reconcile(std::size_t passes);
+
   private:
+    /// Every member a configuration names, voters first.
+    /// @param configuration The configuration.
+    /// @return Its ids.
+    [[nodiscard]] static std::vector<Consensus::NodeId> MembersOf(Consensus::Configuration const& configuration)
+    {
+        auto ids = configuration.voters;
+        ids.insert(ids.end(), configuration.learners.begin(), configuration.learners.end());
+        return ids;
+    }
+
     /// What `who` desires: itself, asserting its (empty) scheduler endpoint, and every
     /// other member with no opinion about one, as discovery hands proven peers over.
     /// @param who The member.
@@ -165,6 +214,7 @@ class Fleet
 
     std::vector<Consensus::NodeId> _ids;
     Consensus::RaftClusterHarness _cluster;
+    std::vector<Consensus::NodeId> _catchingUp;
 };
 
 /// Step until one leader exists, or give up.
@@ -192,6 +242,24 @@ void RequireNoViolations(Consensus::RaftClusterHarness const& cluster)
 
 /// Harness steps between two reconcile passes: 100 ms, against the tier's second.
 constexpr std::size_t StepsPerPass = 10;
+
+void Fleet::Reconcile(std::size_t passes)
+{
+    for ([[maybe_unused]] auto const pass: std::views::iota(std::size_t { 0 }, passes))
+    {
+        _cluster.Run(StepsPerPass);
+        std::ignore = Pass();
+    }
+}
+
+/// A setting write: the ordinary entry a cluster that commits nothing cannot take.
+/// @param value The value `lease-lifetime` is set to.
+/// @return The command's bytes.
+[[nodiscard]] std::vector<std::byte> SettingWrite(std::string value)
+{
+    return Encode(Command {
+        .kind = CommandKind::SetSetting, .key = "lease-lifetime", .value = std::move(value), .schedulerEndpoint = {} });
+}
 } // namespace
 
 TEST_CASE("A cluster that forgets its leader commits a configuration without it, and elects another",
@@ -325,5 +393,77 @@ TEST_CASE("Forgetting the only voter is refused by name, and the cluster keeps i
     CHECK(Records(fleet.StateAt("n1"), "n1"));
     CHECK_FALSE(fleet.StateAt("n1").HasForgotten(HostOf("n1")));
     CHECK(fleet.Cluster().Leader() == Consensus::NodeId { "n1" });
+    RequireNoViolations(fleet.Cluster());
+}
+
+// --------------------------------------------------------------------------
+// A voter is counted only once it has caught up (#1537).
+
+TEST_CASE("Promoting a learner that is away does not stall the cluster's commits",
+          "[consensus][cluster][membership][learner]")
+{
+    // #1537. `n1` is the only voter and `n2` a learner that has gone away. An operator
+    // promotes it. Counted at once, `n2` would make every commit need both machines --
+    // the promotion entry first of all -- so nothing commits until it returns.
+    Fleet fleet { Consensus::Configuration { .voters = { "n1" }, .learners = { "n2" } } };
+    REQUIRE(SettleOnLeader(fleet.Cluster()));
+    fleet.Reconcile(10);
+    REQUIRE(RecordedSeatOf(fleet.StateAt("n1"), "n2") == MemberSeat::Learner);
+
+    fleet.Cluster().Partition({ "n2" });
+    REQUIRE(fleet.Admit("n2"));
+    fleet.Reconcile(10);
+    REQUIRE(RecordedSeatOf(fleet.StateAt("n1"), "n2") == MemberSeat::Voter);
+
+    REQUIRE(fleet.Cluster().ProposeOnLeader(SettingWrite("20min")).has_value());
+    fleet.Reconcile(30);
+
+    // Committed with `n2` away, by the leader that led before: its promotion is
+    // waiting, not counted -- and the wait is named.
+    CHECK(fleet.Cluster().Leader() == Consensus::NodeId { "n1" });
+    CHECK(fleet.StateAt("n1").SettingOf("lease-lifetime") == "20min");
+    CHECK(fleet.Cluster().At("n1").driver->Node().ActiveConfiguration()
+          == Consensus::Configuration { .voters = { "n1" }, .learners = { "n2" } });
+    CHECK(fleet.CatchingUp() == std::vector<Consensus::NodeId> { "n2" });
+
+    // Back, it catches up and is promoted -- one change, and still committing.
+    fleet.Cluster().Heal();
+    fleet.Reconcile(30);
+    CHECK(fleet.Cluster().At("n1").driver->Node().ActiveConfiguration()
+          == Consensus::Configuration { .voters = { "n1", "n2" }, .learners = {} });
+    CHECK(fleet.CatchingUp().empty());
+    REQUIRE(fleet.Cluster().ProposeOnLeader(SettingWrite("30min")).has_value());
+    fleet.Reconcile(10);
+    CHECK(fleet.StateAt("n2").SettingOf("lease-lifetime") == "30min");
+    RequireNoViolations(fleet.Cluster());
+}
+
+TEST_CASE("Admitting a voter that is not up does not stall the cluster's commits",
+          "[consensus][cluster][membership][learner]")
+{
+    // The same fault reached through an admission: `--cluster-admit` of a machine that is
+    // not running yet. Added straight to the voters, `n2` is counted before it has
+    // answered once.
+    Fleet fleet { std::vector<Consensus::NodeId> { "n1" } };
+    REQUIRE(SettleOnLeader(fleet.Cluster()));
+    fleet.Reconcile(5);
+
+    fleet.Cluster().Join("n2");
+    fleet.Cluster().Partition({ "n2" });
+    REQUIRE(fleet.Admit("n2"));
+    fleet.Reconcile(10);
+
+    REQUIRE(fleet.Cluster().ProposeOnLeader(SettingWrite("20min")).has_value());
+    fleet.Reconcile(30);
+    CHECK(fleet.Cluster().Leader() == Consensus::NodeId { "n1" });
+    CHECK(fleet.StateAt("n1").SettingOf("lease-lifetime") == "20min");
+    CHECK(fleet.Cluster().At("n1").driver->Node().ActiveConfiguration()
+          == Consensus::Configuration { .voters = { "n1" }, .learners = { "n2" } });
+    CHECK(fleet.CatchingUp() == std::vector<Consensus::NodeId> { "n2" });
+
+    fleet.Cluster().Heal();
+    fleet.Reconcile(40);
+    CHECK(fleet.Cluster().At("n1").driver->Node().ActiveConfiguration()
+          == Consensus::Configuration { .voters = { "n1", "n2" }, .learners = {} });
     RequireNoViolations(fleet.Cluster());
 }

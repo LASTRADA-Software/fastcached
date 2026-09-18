@@ -277,7 +277,8 @@ TEST_CASE("What a node reports about its own quorum is one read of the driver", 
                                           .commitIndex = Consensus::LogIndex { .value = 12 },
                                           .term = Consensus::Term { .value = 4 },
                                           .role = Consensus::Role::Leader,
-                                          .knownLeader = Consensus::NodeId { "n1" } };
+                                          .knownLeader = Consensus::NodeId { "n1" },
+                                          .matchIndex = {} };
 
     auto const status = ConsensusStatusFrom(progress);
 
@@ -307,7 +308,8 @@ TEST_CASE("A node that has adopted no configuration reports an empty set, not a 
                                                                               .commitIndex = Consensus::LogIndex {},
                                                                               .term = Consensus::Term {},
                                                                               .role = Consensus::Role::Follower,
-                                                                              .knownLeader = Consensus::NodeId { "n1" } });
+                                                                              .knownLeader = Consensus::NodeId { "n1" },
+                                                                              .matchIndex = {} });
 
     CHECK(status.configuration.voters.empty());
     CHECK(status.configuration.learners.empty());

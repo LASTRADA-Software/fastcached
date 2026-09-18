@@ -1282,10 +1282,22 @@ tick -- the scheduler answers `NotLeader` and the fleet page goes dark until it 
   argument (CheckQuorum on the committed configuration while a change is in flight) needs the
   shared voter and is unaffected by learners.
 - **The reconciler's order is additions, promotions, demotions, removals**
-  (`Cluster::NextQuorumChange`): growing the voter set before shrinking it. A promotion waits
-  for a dialable address, as any voter addition does; a demotion or removal that would leave no
-  voter is never proposed -- the record then runs ahead of consensus, which is the fail-closed
-  direction.
+  (`Cluster::NextQuorumChange`): growing the voter set before shrinking it. A demotion or
+  removal that would leave no voter is never proposed -- the record then runs ahead of
+  consensus, which is the fail-closed direction.
+- **A voter is COUNTED only once it has caught up** (#1537). Every member enters the
+  configuration as a LEARNER, whatever its record names, and one recorded as a voter is
+  promoted once it is dialable AND its match index has reached the commit index
+  (`Replication::CaughtUp`, from `RaftDriver::Progress::matchIndex` read under the same lock as
+  the commit index). REPRODUCED before the fix, over `RaftClusterHarness`: promote an absent
+  learner in a one-voter cluster -- or admit a voter that is not up -- and a write proposed
+  afterwards never commits while the leader goes on leading; the promotion entry itself needs
+  both machines. It governs WHEN a promotion takes effect and never WHETHER to promote, which
+  stays the operator's (#1535). The wait is NAMED (`QuorumPlan::catchingUp`), because from the
+  outside it is `seat=voter` against a `learner` standing, which reads as a bug: the leader
+  logs it once and again at Warn after `QuorumProposalPatience`. Neutering the gate reddens both
+  harness cases; neutering the staging reddens the admission case and the four
+  additions-enter-as-learners units, and the promotion case stays green.
 - **The SEAT is the operator's record, written only by the verb.** `ClusterMember::seat` is set
   by `AddMember` (voter) or `AddLearner` (learner), so promotion and demotion are re-admissions
   and `MemberSeatTable` is the one statement of which verb writes which seat and which
@@ -1340,13 +1352,6 @@ tick -- the scheduler answers `NotLeader` and the fleet page goes dark until it 
   window leaves the cluster waiting for it to return rather than electing around it.
 
 ## Open work
-
-- **[#1537](https://github.com/LASTRADA-Software/fastcached/issues/1537)** — a promotion,
-  or a voter admission, is counted as soon as the member's address is dialable, never once
-  it has CAUGHT UP. #1535 left promotion to the operator on purpose -- caught up is the wrong
-  criterion for WHETHER to promote -- and this is the guard on that act: the right criterion
-  for WHEN a promotion may take effect. Promoting an absent learner in a one-voter cluster
-  stalls every commit until it returns (inferred).
 
 - **[#144](https://github.com/LASTRADA-Software/fastcached/issues/144)** — a
   follower answering `/fleet` names the leader but cannot link to it, because

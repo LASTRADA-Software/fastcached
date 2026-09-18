@@ -40,6 +40,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace FastCache::Node
@@ -471,6 +472,15 @@ class ConsensusTier final: public Distributed::IClusterAdmin, public IConsensusS
 
     void ReconcileQuorum(Cluster::ClusterState const& state);
 
+    /// Say which recorded voters consensus is holding as learners until they catch up.
+    ///
+    /// The wait is `Cluster::NextQuorumChange`'s (#1537); this names it where an
+    /// operator reads, once when it starts and at Warn once it has lasted
+    /// `QuorumProposalPatience` passes. Reconciler thread only.
+    /// @param waiting The members this pass's plan named.
+    /// @param progress The read the plan was made from, for the indices it quotes.
+    void ReportCatchingUp(std::span<Consensus::NodeId const> waiting, Consensus::RaftDriver::Progress const& progress);
+
     /// Record that one of the two reactor loops has ended.
     ///
     /// The second one to call this stops the reactor. Public to the class only --
@@ -612,6 +622,11 @@ class ConsensusTier final: public Distributed::IClusterAdmin, public IConsensusS
     /// So each is said once while it stays refused, rather than once per pass for as
     /// long as the forgotten machine goes on proving the key. Reconciler thread only.
     std::vector<Consensus::NodeId> _reportedForgotten;
+
+    /// Recorded voters held as learners until they catch up, and for how many passes
+    /// (#1537). What `ReportCatchingUp` says once and escalates once. Reconciler thread
+    /// only.
+    std::unordered_map<Consensus::NodeId, std::uint32_t> _catchingUp;
 
     /// Where the last configuration change this node proposed landed.
     ///

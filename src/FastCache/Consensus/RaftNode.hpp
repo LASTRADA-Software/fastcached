@@ -217,6 +217,15 @@ class RaftNode
     /// @return The commit index.
     [[nodiscard]] LogIndex CommitIndex() const noexcept;
 
+    /// How far each member's log is known to match this leader's (#1537).
+    ///
+    /// A fact only a LEADER holds, and empty on any other node: a follower tracks nobody's
+    /// log but its own. Learners are in it as well as voters -- replication reaches both --
+    /// which is what lets a caller ask whether a learner has caught up before it is counted.
+    /// A member absent from it has acknowledged nothing to this leader yet.
+    /// @return The match index per member this leader replicates to.
+    [[nodiscard]] std::unordered_map<NodeId, LogIndex> const& MatchIndices() const noexcept;
+
     /// What a successful proposal yields.
     struct Proposal
     {
