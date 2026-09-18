@@ -4864,19 +4864,33 @@ was extracted from it, and its output over the real files is byte-for-byte uncha
 - **So a leg is a writer of a step UNLESS the step's `if:` decidedly rules it out**
   ([#1540](https://github.com/LASTRADA-Software/fastcached/issues/1540)), which is what makes the
   shape IDENTICAL content wants expressible: `actions/cache/restore` on every leg and
-  `actions/cache/save` guarded by `matrix.suffix == ''`, as `build.yml`'s CPM steps are. **The rule
-  is one writer per KEY, never one per job**: each preset has its own key, so a guard picking one
-  leg of the job would leave every other preset's key with no writer at all -- `matrix.suffix == ''`
-  gives each key its x86 leg and leaves the arm64 legs only restoring. Rule F refuses TWO writers
-  and says nothing about NONE, so a per-job guard would pass it in silence while every other key is
-  restored forever and saved by nothing -- that direction is not covered. The walk
-  decides a condition from the leg's matrix values alone (`WorkflowMatrixDecide`: `==`, `!=`, `!`,
-  `&&`, `||`, parentheses, string literals, GitHub's case-folding and null coercion), in
-  THREE-valued logic, and **UNDECIDED is never read as false**: a `steps.*`, `needs.*` or function
-  term leaves the leg a writer, so an `if:` it cannot read keeps the refusal it had -- a staged
-  neuter reading undecided as "does not run" is what shows the refusal rests on that. A save key
-  taken from `cache-primary-key` is refused as unresolvable, since each leg computes it; spell the
-  key as the restore step does.
+  `actions/cache/save` guarded by `matrix.suffix == ''`, as the `linux` job's CPM steps are. **The
+  rule is one writer per KEY, never one per job**: each preset has its own key, so a guard picking
+  one leg of the job would leave every other preset's key with no writer at all -- `matrix.suffix ==
+  ''` gives each key its x86 leg and leaves the arm64 legs only restoring. The walk decides a
+  condition from the leg's matrix values alone (`WorkflowMatrixDecide`: `==`, `!=`, `!`, `&&`,
+  `||`, parentheses, string literals, GitHub's case-folding and null coercion), in THREE-valued
+  logic, and **UNDECIDED is never read as false**: a `steps.*`, `needs.*` or function term leaves
+  the leg a writer, so an `if:` it cannot read keeps the refusal it had -- a staged neuter reading
+  undecided as "does not run" is what shows the refusal rests on that. A save key taken from
+  `cache-primary-key` is refused as unresolvable, since each leg computes it; spell the key as the
+  restore step does.
+- **Ruling legs out opened the other direction, so rule F refuses NONE as well as TWO**: a key an
+  `actions/cache/restore` step reads that no step any leg can run writes. Two writers cost an
+  upload; none costs the cache in silence -- every run misses, a `restore-keys` prefix at best hands
+  back an entry saved for a different key, and the job reads as cached. The refusal names the key
+  and the restoring legs. Only `key:` is compared: a `restore-keys` prefix is not a key, so it
+  neither needs a writer nor supplies one -- the self-test gives the restore step a prefix of the
+  key that IS written, and the unwritten one is still refused. While any writer's key could not be
+  resolved the answer is UNDECIDED and says so, never "nothing writes it".
+- **One key is not one entry**: GitHub finds an entry by key AND a version hashed from `path:` as
+  the runner EXPANDED it plus the compression the tool chose (`getCacheVersion`, reproduced
+  exactly against this repository's Linux, Windows and macOS CPM entries). `windows-2025` and
+  `windows-11-arm` disagree on both -- `D:\a\...` against `C:\a\...`, and zstd is on the first and
+  in the second image's list of OMITTED software -- so the `windows` job's legs keep a key each.
+  Rule F compares key TEXT, so over such legs it passes a restore whose only writer is the other
+  runner (a false GREEN) and refuses two such writers that write two entries (a false red, whose
+  remedy is what they need anyway); `build.yml` says at each shared key what is known of it.
 
 
 **A Windows leg that cannot start processes reports six red smoke tests, not a
