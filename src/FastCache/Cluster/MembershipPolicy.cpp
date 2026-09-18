@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <format>
 
 namespace FastCache::Cluster
 {
@@ -42,6 +43,42 @@ namespace
     [[nodiscard]] bool KeepsAVoter(Consensus::Configuration const& configuration) noexcept
     {
         return !configuration.voters.empty();
+    }
+
+    /// This node's own removal, once the operator has forgotten it (#1539).
+    ///
+    /// FORGOTTEN is both facts `RemoveMember` writes: its record gone, and its host
+    /// tombstoned. Either alone is not a forget -- a fresh leader's first pass has
+    /// recorded nothing yet, and a client forget may name a member's host -- so
+    /// removing on the first would take every new cluster's only voter out of it.
+    /// @param state The replicated state.
+    /// @param active The configuration consensus holds.
+    /// @param self This node's own record, as it announces it.
+    /// @return The configuration without this node, or nullopt when it is not
+    ///         forgotten, is counted nowhere, or is the last voter.
+    [[nodiscard]] std::optional<Consensus::Configuration> OwnRemoval(ClusterState const& state,
+                                                                     Consensus::Configuration const& active,
+                                                                     ClusterMember const& self)
+    {
+        auto const recorded = std::ranges::find(state.members, self.id, &ClusterMember::id) != state.members.end();
+        if (recorded || !state.HasForgotten(HostOfEndpoint(self.raftEndpoint)))
+            return std::nullopt;
+
+        for (auto const& row: MemberSeatTable)
+        {
+            if (!Consensus::Membership::Contains(active.*row.set, self.id))
+                continue;
+
+            // Never the last voter. `ValidateForget` refuses that forget by name before
+            // it is proposed, so arriving here means the voters changed after it
+            // committed -- and the fail-closed answer is still to stay counted.
+            auto proposed = active;
+            std::erase(proposed.*row.set, self.id);
+            if (!KeepsAVoter(proposed))
+                return std::nullopt;
+            return proposed;
+        }
+        return std::nullopt;
     }
 
     /// The seat `id` is recorded in: wherever something already placed it, else a newcomer's.
@@ -122,7 +159,7 @@ MembershipPlan MembershipProposals(ClusterState const& state,
 
 std::optional<Consensus::Configuration> NextQuorumChange(ClusterState const& state,
                                                          Consensus::Configuration const& active,
-                                                         Consensus::NodeId const& self,
+                                                         ClusterMember const& self,
                                                          std::span<Consensus::NodeId const> bootstrap)
 {
     // A node with no cluster counts nobody and proposes nothing. It is never a
@@ -192,8 +229,10 @@ std::optional<Consensus::Configuration> NextQuorumChange(ClusterState const& sta
     // every member is equally unexplained to it -- and a `--raft-join` node elected
     // leader would remove all of them, one per commit, which is the failure the
     // parameter exists to prevent reached through the one path with no baseline.
+    // It still removes ITSELF once forgotten, below: that question is answered by the
+    // tombstone, not by the bootstrap set.
     if (bootstrap.empty())
-        return std::nullopt;
+        return OwnRemoval(state, active, self);
 
     // Removals, from either set. A learner is removed on exactly the terms a voter is
     // -- forgotten by the operator, and never for being ABSENT: nothing here reads
@@ -203,10 +242,10 @@ std::optional<Consensus::Configuration> NextQuorumChange(ClusterState const& sta
     {
         for (auto const& id: active.*row.set)
         {
-            // Never itself: a leader taking itself out of the quorum it leads is an
-            // operator's decision, and the next pass would propose putting it back
-            // anyway, because a node always desires its own record.
-            if (id == self)
+            // Not itself here: this node's own removal is decided LAST, below, and
+            // only once it is forgotten -- absent a forget the next pass would propose
+            // putting it back, because a node always desires its own record.
+            if (id == self.id)
                 continue;
 
             // Membership only, and deliberately not dialability. A member already
@@ -233,7 +272,25 @@ std::optional<Consensus::Configuration> NextQuorumChange(ClusterState const& sta
         }
     }
 
-    return std::nullopt;
+    // Last, this node itself (#1539): after every change it can still make as the
+    // leader, since once its own removal commits it leads nothing.
+    return OwnRemoval(state, active, self);
+}
+
+std::expected<void, ConsensusError> ValidateForget(Consensus::Configuration const& active, Consensus::NodeId const& id)
+{
+    // The one forget no quorum can follow: removing the only voter. Any other member --
+    // a learner, one of several voters, one consensus does not count at all -- leaves a
+    // configuration somebody is counted in.
+    if (active.voters.size() != 1 || active.voters.front() != id)
+        return {};
+
+    return std::unexpected { ConsensusError {
+        .code = ConsensusErrorCode::InvalidConfiguration,
+        .context = std::format("cannot forget {}: it is the cluster's only voter, and a configuration with no voter "
+                               "can commit nothing -- admit or promote another voter first",
+                               id),
+        .knownLeader = std::nullopt } };
 }
 
 } // namespace FastCache::Cluster

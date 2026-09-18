@@ -561,6 +561,14 @@ std::expected<Consensus::LogIndex, ConsensusError> ConsensusTier::Propose(Cluste
     if (auto const allowed = Cluster::Validate(command); !allowed.has_value())
         return std::unexpected { allowed.error() };
 
+    // And a forget against the configuration consensus holds (#1539): forgetting the
+    // only voter is a record no quorum could ever follow, so it is refused by name
+    // here, while the operator who typed it is reading the answer.
+    if (command.kind == Cluster::CommandKind::RemoveMember)
+        if (auto const allowed = Cluster::ValidateForget(_driver->CurrentProgress().configuration, command.key);
+            !allowed.has_value())
+            return std::unexpected { allowed.error() };
+
     return _driver->Propose(Cluster::Encode(command), std::chrono::steady_clock::now());
 }
 
@@ -900,7 +908,7 @@ void ConsensusTier::ReconcileQuorum(Cluster::ClusterState const& state)
 
     _quorumWaited = 0;
 
-    auto change = Cluster::NextQuorumChange(state, progress.configuration, _self.id, _bootstrapIds);
+    auto change = Cluster::NextQuorumChange(state, progress.configuration, _self, _bootstrapIds);
     if (!change.has_value())
         return;
 
@@ -951,6 +959,15 @@ void ConsensusTier::ReconcileQuorum(Cluster::ClusterState const& state)
                  change->voters.size(),
                  change->learners.size(),
                  _quorumProposedAt.value);
+
+    // Said on its own line, because it is the one change after which this node stops
+    // leading (#1539), and an operator watching a leader go quiet should not have to
+    // infer why from a count.
+    if (!Consensus::Membership::IsMember(*change, _self.id))
+        _logger.Logf(LogLevel::Info,
+                     "cluster: the cluster forgot this node ({}), so it proposes its own removal and steps down once "
+                     "that commits",
+                     _self.id);
 }
 
 void ConsensusTier::PublishRole(Consensus::RaftDriver::RoleChange const& change)

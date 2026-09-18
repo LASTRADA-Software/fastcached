@@ -1692,7 +1692,9 @@ wrote it down". A member a machine names in its own `--raft-peer` list is a memb
 by that operator's assertion: forgetting it removes the record every surface reads,
 and the quorum goes on counting it. Taking a *typed* member out of the quorum means
 dropping it from `--raft-peer` on the machines that name it and restarting them —
-a leader never proposes removing a member its own bootstrap list asserts.
+a leader never proposes removing a member its own bootstrap list asserts. **The one
+exception is the leader itself**, below: every node names itself in its own list
+because it cannot start otherwise, so that entry asserts nothing.
 
 **It sticks while the machine is still running**
 ([#1528](https://github.com/LASTRADA-Software/fastcached/issues/1528)). A forgotten
@@ -1708,10 +1710,24 @@ Bringing it back is `--cluster-admit=n3=10.0.0.3:6680`, which lifts the tombston
 Two limits follow from the tombstone naming a **host**: another node at that address is
 not recorded either, and members that share one machine over loopback — a test rig —
 leave no tombstone at all, so a member forgotten there comes back at its next proof.
-Forgetting the **leader** stops it recording itself, but it goes on leading and being
-counted, because a leader never proposes its own removal: the quorum drops it only once
-another member leads — and, as for every removal, only one that bootstrapped from a
-`--raft-peer` list not naming it.
+**Forgetting the leader removes it too**
+([#1539](https://github.com/LASTRADA-Software/fastcached/issues/1539)). A forget means
+the same thing whoever currently leads, so the forgotten leader stops recording itself
+and proposes its own removal — last, after any other change it still has to make — and
+steps down once that commits. The other voters elect a leader, and it never admits the
+forgotten machine again. It says so:
+
+```
+cluster: the cluster forgot this node (n1), so it proposes its own removal and steps down once that commits
+```
+
+**Forgetting the cluster's only voter is refused**, by name, before anything is
+recorded: a configuration with nobody counted in it can commit nothing, including the
+change that would undo it. Admit or promote another voter first.
+
+```
+cannot forget n1: it is the cluster's only voter, and a configuration with no voter can commit nothing -- admit or promote another voter first
+```
 
 **It withdraws the admission consensus granted, and only that.** A host that a node
 also lists in its own `--fleet-member` stays admitted to that node's three surfaces

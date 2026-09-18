@@ -580,7 +580,10 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   rule nothing would warn you about.
 - Absence from `ClusterState` is not removal: a member named in the bootstrap set is never
   proposed for removal, and a node given no bootstrap set proposes none at all. **A learner is
-  never removed for being absent** — nothing in the policy asks whether a member answers.
+  never removed for being absent** — nothing in the policy asks whether a member answers. The
+  one exception is THIS node once FORGOTTEN — record gone AND host tombstoned, never either
+  alone: it proposes its own removal last and steps down (#1539). Forgetting the only voter
+  is refused by name (`ValidateForget`).
 - **A forget outranks an observation (#1528).** A forgotten machine keeps the key and discovery
   proves it again, so `MembershipProposals` refuses a desire at a forgotten host BY NAME
   (`MembershipPlan::forgotten`) — at the decision, never by pruning a desire the next proof
