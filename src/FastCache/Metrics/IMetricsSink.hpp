@@ -1263,43 +1263,54 @@ class IMetricsSink
         /// restart closes it, the warning it emits reaches only whoever reads this node's
         /// log, and the open STATE is a snapshot field that says nothing about how often
         /// it has been open. This is what a scrape can alert on: any rise is a minute in
-        /// which this machine would have handed the cluster key to a stranger that asked
-        /// and was approved.
+        /// which anybody who could reach this machine could ask to be admitted to the fleet.
         ///
         /// A tally rather than a gauge, which is what keeps it and the snapshot from
         /// being two spellings of one fact: this counts events and zero is the truth
         /// about a node whose window has never been opened.
         EnrollmentWindowsOpened,
 
-        /// Cluster keys handed to an approved joiner.
+        /// Rosters handed to an admitted joiner (#178).
         ///
-        /// **The event the whole feature exists to perform, and the one worth alerting
-        /// on.** Each rise is the fleet's pre-shared key crossing the network in
-        /// cleartext to one machine a person approved by name. During a rollout it rises
-        /// once per machine and stops; afterwards it should never rise again, so a single
-        /// increment on a settled fleet is either an operator adding a machine or the
-        /// event this counter exists for.
+        /// **The event the feature exists to perform**: a machine an operator approved by
+        /// name, whose admission the leader's own roster now records, being told who else is
+        /// in the cluster. It rises once per poll that is answered `Approved`, and a joiner
+        /// stops polling at the first -- so during a rollout it rises about once per machine
+        /// and stops, and a rise on a settled fleet is an operator adding a machine.
         ///
-        /// Read beside `EnrollmentWindowsOpened`: hand-overs without an open is
-        /// impossible and would be a bug report, and opens without hand-overs is the
-        /// ordinary shape of a window somebody opened and closed again.
-        EnrollmentKeysHandedOver,
+        /// No secret crosses with it, which is why it replaced a counter of cluster keys handed
+        /// over rather than keeping that name: the roster is every member's PUBLIC key.
+        ///
+        /// Read beside `EnrollmentWindowsOpened`: rosters served without an open is impossible
+        /// and would be a bug report, and opens without any is the ordinary shape of a window
+        /// somebody opened and closed again.
+        EnrollmentRostersServed,
 
-        /// An `ENROLL` naming an id whose key has already been collected. Refused, and
-        /// no key bytes were served.
+        /// Discovery proofs that verified under a key this node's roster does not record for
+        /// the id they claimed (#178). Reported, and never desired.
         ///
-        /// **This is the counter for the spend, and a healthy enrolment produces
-        /// exactly none of them** -- a joiner that collects successfully writes the key
-        /// and exits, so there is no honest second poll. It is not the same fact as
-        /// `EnrollmentKeysHandedOver`, and the difference is the whole point: that one
-        /// says the key left, this one says somebody asked for it after it had already
-        /// left, and only one of the two can be read as an attempt.
+        /// **The counter for LAN auto-admission ending.** Before #178 a proof of the shared key
+        /// was a proof of membership, so anything that held it was desired onto the cluster;
+        /// now a proof names a KEY, and a key the cluster never admitted is a machine to tell
+        /// an operator about -- by name, key and address, in the log -- rather than one to add.
+        /// A rise is a machine on the segment that wants to join and has not been enrolled, or
+        /// one that was wiped and minted a new key under an old id.
+        DiscoveryProofsRefusedUnknownKey,
+
+        /// Discovery proofs that verified under a key the roster has REVOKED (#178).
         ///
-        /// Two causes, named rather than guessed between, with the RATE separating
-        /// them: one is a joiner whose reply was lost, retrying; a run of them is
-        /// somebody answering to an id an operator approved. Both are refused and both
-        /// are fixed by one operator approving the machine again.
-        EnrollmentRequestsRefusedAlreadyCollected,
+        /// Its own row rather than one with the unknown key above, because the two send an
+        /// operator opposite ways: that one is a machine to consider admitting, this one is a
+        /// machine that was removed and is still announcing itself. Only the holder of the key
+        /// could have signed the proof, so naming it is no oracle.
+        DiscoveryProofsRefusedRevokedKey,
+
+        /// Discovery proofs whose signature did not verify under the key they carried (#178).
+        ///
+        /// Not a machine to admit and not a removed one: whoever sent it does not hold the key
+        /// it presented. A healthy segment produces none, so a rise is somebody forging, or a
+        /// build that signs a different message -- which the version byte should have refused.
+        DiscoveryProofsRefusedForged,
 
         /// A live-stats stream this node granted and began pushing to. (#1399)
         LiveSubscriptionsOpened,

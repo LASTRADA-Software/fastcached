@@ -11,6 +11,21 @@ namespace FastCache::Node
 
 namespace Wire = CompileCacheWire;
 
+bool RosterRecordsJoiner(Cluster::Roster const& roster,
+                         std::string_view nodeId,
+                         Ed25519PublicKey const& key,
+                         Wire::EnrollRole role)
+{
+    auto const& row = EnrollRoleRowFor(role);
+    if (row.principal.has_value())
+        return std::ranges::any_of(roster.principals, [&](Cluster::ClusterPrincipal const& principal) {
+            return principal.id == nodeId && principal.publicKey == key && principal.role == *row.principal;
+        });
+    return std::ranges::any_of(roster.members, [&](Cluster::RosterMember const& member) {
+        return member.id == nodeId && member.publicKey == std::optional { key };
+    });
+}
+
 EnrollControlOutcome EnrollmentWindow::Open()
 {
     std::scoped_lock const guard { _mutex };
@@ -46,15 +61,27 @@ EnrollControlOutcome EnrollmentWindow::Close()
     return EnrollControlOutcome::Done;
 }
 
-EnrollDecision EnrollmentWindow::Offer(std::string_view nodeId, std::string_view raftEndpoint, std::string_view peerId)
+EnrollDecision EnrollmentWindow::Offer(JoinerClaim const& claim, std::string_view peerId)
 {
     std::scoped_lock const guard { _mutex };
     if (!_open)
         return EnrollDecision::Closed;
 
-    if (auto* const existing = FindLocked(nodeId); existing != nullptr)
+    if (auto* const existing = FindLocked(claim.nodeId); existing != nullptr)
     {
         ++existing->attempts;
+
+        // **The key and the role are the row's, whatever is asked later** (#178). A poll under
+        // this id with another key is ANOTHER MACHINE: counted, answered `Pending`, never
+        // recorded, and never handed what an approval of the first one leads to. Refreshing
+        // them would let whoever polled last swap the key an operator compared on the list for
+        // one they never saw, in the minutes between `--enroll-list` and `--enroll-approve`.
+        auto const sameMachine = existing->publicKey == claim.publicKey && existing->role == claim.role;
+        if (!sameMachine)
+        {
+            ++existing->claimsChanged;
+            return EnrollDecision::Pending;
+        }
 
         // **A row a person has decided about is a RECORD of what they decided about,
         // and stops tracking the machine.** The claim refreshes only while the row is
@@ -74,10 +101,10 @@ EnrollDecision EnrollmentWindow::Offer(std::string_view nodeId, std::string_view
         // recording a move.
         if (existing->decision == Wire::EnrollmentDecision::Pending)
         {
-            existing->raftEndpoint = std::string { raftEndpoint };
+            existing->raftEndpoint = std::string { claim.raftEndpoint };
             existing->peerId = std::string { peerId };
         }
-        else if (existing->raftEndpoint != raftEndpoint || existing->peerId != peerId)
+        else if (existing->raftEndpoint != claim.raftEndpoint || existing->peerId != peerId)
         {
             // Marked and counted, never gated. #242 settled that comparing hosts refuses
             // the documented setup -- DNS names, a node dialling itself, NAT, VPN,
@@ -92,21 +119,10 @@ EnrollDecision EnrollmentWindow::Offer(std::string_view nodeId, std::string_view
             case Wire::EnrollmentDecision::Pending:
                 return EnrollDecision::Pending;
             case Wire::EnrollmentDecision::Approved:
-                // **The SPEND, taken here and not after the key is read.** It is the only
-                // transition that answers `Approved`, and it happens under this lock, so
-                // two polls arriving together cannot both take it -- which is the
-                // property, and it cannot be had by reading the key first and marking
-                // afterwards.
-                //
-                // A caller that then fails to produce the key calls `ReturnClaim`, so a
-                // transient fault does not burn the one collection this id has. Taking
-                // and returning rather than deferring the take is what keeps the race
-                // closed: between the two, a concurrent poll is refused and retries,
-                // where a deferred take would serve the key twice.
-                existing->decision = Wire::EnrollmentDecision::Collected;
+                // Every poll, and nothing is spent: what an approval leads to is the roster,
+                // which is no secret (#178). A joiner whose reply was lost simply asks again,
+                // which is the whole recovery path and needs no operator.
                 return EnrollDecision::Approved;
-            case Wire::EnrollmentDecision::Collected:
-                return EnrollDecision::Collected;
             case Wire::EnrollmentDecision::Rejected:
                 return EnrollDecision::Rejected;
         }
@@ -119,31 +135,28 @@ EnrollDecision EnrollmentWindow::Offer(std::string_view nodeId, std::string_view
     if (_pending.size() >= MaxPendingEnrollments)
         return EnrollDecision::Full;
 
-    _pending.push_back(Wire::EnrollmentPendingEntry { .nodeId = std::string { nodeId },
-                                                      .raftEndpoint = std::string { raftEndpoint },
+    _pending.push_back(Wire::EnrollmentPendingEntry { .nodeId = std::string { claim.nodeId },
+                                                      .raftEndpoint = std::string { claim.raftEndpoint },
                                                       .peerId = std::string { peerId },
                                                       .firstSeenSecondsAgo = 0,
                                                       .attempts = 1,
                                                       .claimsChanged = 0,
-                                                      .decision = Wire::EnrollmentDecision::Pending });
+                                                      .decision = Wire::EnrollmentDecision::Pending,
+                                                      .role = claim.role,
+                                                      .publicKey = claim.publicKey,
+                                                      .rosterFingerprint = std::nullopt });
     _firstSeen.push_back(_clock.Now());
     return EnrollDecision::Pending;
 }
 
-ClaimReturn EnrollmentWindow::ReturnClaim(std::string_view nodeId)
+void EnrollmentWindow::NoteServed(std::string_view nodeId,
+                                  std::array<std::byte, Wire::RosterFingerprintBytes> const& fingerprint)
 {
     std::scoped_lock const guard { _mutex };
-    auto* const entry = FindLocked(nodeId);
-    if (entry == nullptr)
-        return ClaimReturn::NoSuchRow;
-    // Two nothings, told apart, because they are different events: a window somebody
-    // closed, and a row somebody decided about while this claim was out. Only the
-    // second says a machine was stranded by a race.
-    if (entry->decision != Wire::EnrollmentDecision::Collected)
-        return ClaimReturn::AlreadyMoved;
-
-    entry->decision = Wire::EnrollmentDecision::Approved;
-    return ClaimReturn::Returned;
+    // A row that went -- the window closed between the answer and this -- has nobody to show
+    // it to, so there is nothing to record and nothing to report.
+    if (auto* const entry = FindLocked(nodeId); entry != nullptr)
+        entry->rosterFingerprint = fingerprint;
 }
 
 std::optional<Wire::EnrollmentPendingEntry> EnrollmentWindow::Find(std::string_view nodeId) const
@@ -168,21 +181,6 @@ EnrollControlOutcome EnrollmentWindow::Decide(std::string_view nodeId, Wire::Enr
     if (entry == nullptr)
         return EnrollControlOutcome::UnknownSubject;
 
-    // **Approving a `Collected` row RE-ARMS exactly one more collection, and that is the
-    // whole recovery path for a joiner whose reply was lost.**
-    //
-    // The key is spendable once, so a lost TCP reply strands a machine an operator has
-    // already admitted. This is what un-strands it: one deliberate operator act, on the
-    // id they already approved, auditable in the log and in both counters -- the
-    // hand-over tally rises again because the key genuinely goes out again, and that is
-    // the honest reading rather than a second event hidden inside the first.
-    //
-    // Folding `Collected` into `Approved` here -- which this did -- made that command
-    // answer *already in force*, and the only instruction the refusal then offered was
-    // `--cluster-forget`: a QUORUM CHANGE to recover from a dropped packet, with a
-    // re-approve afterwards that consensus refuses because the member is already in
-    // `ClusterState`, so the real recovery was four commands and two of them
-    // counter-intuitive. A remedy that expensive is one an operator works around.
     if (entry->decision == decision)
         return EnrollControlOutcome::AlreadyInForce;
 
@@ -230,9 +228,10 @@ std::optional<std::string> EnrollmentWindow::TakeDueWarning()
     auto const waiting =
         std::ranges::count(_pending, Wire::EnrollmentDecision::Pending, &Wire::EnrollmentPendingEntry::decision);
     return std::format("the enrollment window is OPEN and has been for {}s: any machine that can reach this node's "
-                       "0xFC port may ask to join, and approving one hands it this cluster's key IN CLEARTEXT. "
-                       "{} request(s) waiting, {} listed in total. Close it with --enroll-close; a restart closes "
-                       "it too, because the window is held in memory and nowhere else.",
+                       "0xFC port may ask to join, and approving one admits it under the key it asked with -- compare "
+                       "that key with the one the machine printed before approving. {} request(s) waiting, {} listed "
+                       "in total. Close it with --enroll-close; a restart closes it too, because the window is held "
+                       "in memory and nowhere else.",
                        SecondsSince(_openedAt),
                        waiting,
                        _pending.size());

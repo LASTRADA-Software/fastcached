@@ -5,7 +5,7 @@
 #include <FastCache/Core/ISecureRandom.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Core/Nonce.hpp>
-#include <FastCache/Core/SecureBytes.hpp>
+#include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Net/InMemoryDatagram.hpp>
 #include <FastCache/Net/SharedPortDatagram.hpp>
 
@@ -15,35 +15,34 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <format>
 #include <initializer_list>
 #include <memory>
+#include <optional>
 #include <ranges>
 #include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 
 #include <tests/CoHostedDatagram.hpp>
+#include <tests/RaftPeerKeyFakes.hpp>
 #include <tests/SecureRandomFakes.hpp>
 #include <tests/Unwrap.hpp>
 
 using namespace FastCache;
 using namespace FastCache::Cluster;
 using FastCache::Testing::CoHostedDatagramSocket;
+using FastCache::Testing::RosterPeerKeys;
 using FastCache::Testing::ScriptedSecureRandom;
+using FastCache::Testing::SharedRoster;
 using FastCache::Testing::TestBeaconPort;
+using FastCache::Testing::TestKeyPair;
 using FastCache::Testing::Unwrap;
 using namespace std::chrono_literals;
 
 namespace
 {
-/// A key, as the config wants it.
-[[nodiscard]] SecureByteBuffer Key(std::string_view text)
-{
-    SecureByteBuffer out;
-    out.reserve(text.size());
-    for (auto const ch: text)
-        out.push_back(static_cast<std::byte>(ch));
-    return out;
-}
 
 /// The bus address a `host:port` endpoint names -- see `DatagramAddress` for why
 /// the two halves travel apart below this layer.
@@ -87,7 +86,8 @@ struct Node
     /// @param id This node's identity.
     /// @param endpoint Where it answers Raft peer traffic.
     /// @param cluster Which fleet it belongs to.
-    /// @param key The cluster key it holds.
+    /// @param roster Whose key every id is, as this node's replicated state says.
+    /// @param own The key this node signs its proofs with.
     Node(std::unique_ptr<IDatagramSocket> ownSocket,
          DatagramAddress beaconAddress,
          IClock& clock,
@@ -96,9 +96,11 @@ struct Node
          std::string id,
          std::string endpoint,
          std::string cluster,
-         std::string const& key):
+         std::shared_ptr<SharedRoster const> roster,
+         Ed25519KeyPair own):
         socket { std::move(ownSocket) },
         directory { clock, cluster, id },
+        keys { std::move(own), std::move(roster) },
         service { *socket,
                   clock,
                   random,
@@ -106,8 +108,9 @@ struct Node
                   DiscoveryConfig { .clusterId = std::move(cluster),
                                     .nodeId = std::move(id),
                                     .raftEndpoint = std::move(endpoint),
-                                    .beaconAddress = std::move(beaconAddress),
-                                    .presharedKey = Key(key) },
+                                    .beaconAddress = std::move(beaconAddress) },
+                  keys,
+                  metrics,
                   logger }
     {
     }
@@ -120,7 +123,9 @@ struct Node
     /// @param id This node's identity.
     /// @param endpoint Where it answers Raft peer traffic, and where it listens.
     /// @param cluster Which fleet it belongs to.
-    /// @param key The cluster key it holds.
+    /// @param roster Whose key every id is, as this node's replicated state says.
+    /// @param own The key this node signs its proofs with; by default the one `roster`'s
+    ///        `SharedRoster::Of` records for @p id.
     Node(DatagramBus& bus,
          IClock& clock,
          ISecureRandom& random,
@@ -128,7 +133,8 @@ struct Node
          std::string const& id,
          std::string const& endpoint,
          std::string const& cluster,
-         std::string const& key):
+         std::shared_ptr<SharedRoster const> roster,
+         std::optional<Ed25519KeyPair> own = std::nullopt):
         // By reference here and by value one frame down, deliberately.
         // `AtEndpoint(endpoint)` is evaluated in the same argument list as the
         // forwarded `endpoint` and the order of the two is unspecified, so there
@@ -142,14 +148,44 @@ struct Node
              id,
              endpoint,
              cluster,
-             key)
+             std::move(roster),
+             own.has_value() ? *std::move(own) : TestKeyPair(id))
     {
     }
 
     std::unique_ptr<IDatagramSocket> socket;
     PeerDirectory directory;
+    AtomicMetricsSink metrics;
+    RosterPeerKeys keys;
     DiscoveryService service;
 };
+
+/// Beacon, challenge, proof, and what @p listener made of the proof.
+///
+/// The three legs in the order they happen, each asserted, so a case that fails names the
+/// leg that went wrong rather than the verdict at the end.
+/// @param listener Who challenges.
+/// @param peer Who announces and answers.
+/// @return The listener's event for the proof.
+DiscoveryEvent Handshake(Node& listener, Node& peer)
+{
+    REQUIRE(peer.service.SendBeacon());
+    REQUIRE(listener.service.PumpOnce(1ms) == DiscoveryEvent::PeerSeen);
+    REQUIRE(peer.service.PumpOnce(1ms) == DiscoveryEvent::Ignored); // its own beacon
+    REQUIRE(peer.service.PumpOnce(1ms) == DiscoveryEvent::ChallengeAnswered);
+    return listener.service.PumpOnce(1ms);
+}
+
+/// How many Warn lines @p logger holds that contain @p needle.
+/// @param logger What captured them.
+/// @param needle What to look for.
+/// @return The count.
+[[nodiscard]] std::ptrdiff_t Warned(CapturingLogger const& logger, std::string_view needle)
+{
+    return std::ranges::count_if(logger.Snapshot(), [needle](CapturingLogger::Record const& record) {
+        return record.level == LogLevel::Warn && record.message.contains(needle);
+    });
+}
 
 /// Nonces for a scripted generator: one per value in @p fills, each `NonceBytes` of that
 /// value, served in turn and cycling. So `{ 1, 2 }` is two distinct nonces and then the first
@@ -176,7 +212,7 @@ std::size_t Drain(Node& node)
 }
 } // namespace
 
-TEST_CASE("Two nodes on one host share a beacon port and still prove the key", "[cluster][discovery][service]")
+TEST_CASE("Two nodes on one host share a beacon port and still prove their keys", "[cluster][discovery][service]")
 {
     // The configuration the whole shared-port shape exists for, and the one that
     // used to fail in silence. A beacon is a broadcast, so every node on a
@@ -196,6 +232,7 @@ TEST_CASE("Two nodes on one host share a beacon port and still prove the key", "
     NullLogger logger;
 
     auto const beacon = DatagramBus::BroadcastAddressOn(TestBeaconPort);
+    auto const roster = SharedRoster::Of({ "first", "second" });
 
     Node first { CoHostedDatagramSocket(bus, "10.0.0.1", 40001),
                  beacon,
@@ -205,7 +242,8 @@ TEST_CASE("Two nodes on one host share a beacon port and still prove the key", "
                  "first",
                  "10.0.0.1:7000",
                  "prod",
-                 "secret" };
+                 roster,
+                 TestKeyPair("first") };
     Node second { CoHostedDatagramSocket(bus, "10.0.0.1", 40002),
                   beacon,
                   clock,
@@ -214,7 +252,8 @@ TEST_CASE("Two nodes on one host share a beacon port and still prove the key", "
                   "second",
                   "10.0.0.1:7001",
                   "prod",
-                  "secret" };
+                  roster,
+                  TestKeyPair("second") };
 
     REQUIRE(first.service.SendBeacon());
     REQUIRE(second.service.SendBeacon());
@@ -244,7 +283,7 @@ TEST_CASE("A peer that cannot name itself is never challenged", "[cluster][disco
 {
     // #159, one layer up from `PeerDirectory`. The refusal is worth asserting from
     // here as well as there, because two things follow from it that the directory
-    // alone cannot show: no challenge is spent on such a peer -- the HMAC and the
+    // alone cannot show: no challenge is spent on such a peer -- the nonce and the
     // `_pending` entry are both work an unauthenticated broadcast should not be
     // able to provoke -- and the datagram is REPORTED, which its two siblings
     // (another fleet's beacon, and this node's own) deliberately are not.
@@ -253,11 +292,12 @@ TEST_CASE("A peer that cannot name itself is never challenged", "[cluster][disco
     ScriptedSecureRandom random { NonceScript({ 1, 2 }) };
     CapturingLogger logger;
 
-    Node listener { bus, clock, random, logger, "listener", "10.0.0.1:7000", "prod", "secret" };
+    auto const roster = SharedRoster::Of({ "listener" });
+    Node listener { bus, clock, random, logger, "listener", "10.0.0.1:7000", "prod", roster };
 
     // A lone surrogate: valid in shape, refused by every strict decoder, and the
     // sequence a lenient encoder is most likely to emit by accident.
-    Node rogue { bus, clock, random, logger, "rogue-\xED\xA0\x80", "10.0.0.2:7000", "prod", "secret" };
+    Node rogue { bus, clock, random, logger, "rogue-\xED\xA0\x80", "10.0.0.2:7000", "prod", roster };
 
     REQUIRE(rogue.service.SendBeacon());
     CHECK(listener.service.PumpOnce(1ms) == DiscoveryEvent::Ignored);
@@ -266,7 +306,7 @@ TEST_CASE("A peer that cannot name itself is never challenged", "[cluster][disco
 
     // Exactly one datagram is waiting for the rogue -- its own beacon, which a
     // broadcast doubles back to its sender -- and a challenge would make it two.
-    // That is the half the directory cannot show: a challenge is an HMAC and a
+    // That is the half the directory cannot show: a challenge is a nonce and a
     // `_pending` entry, and an unauthenticated broadcast must not provoke either.
     CHECK(Drain(rogue) == 1);
 
@@ -283,8 +323,8 @@ TEST_CASE("A peer that cannot name itself is never challenged", "[cluster][disco
 
     // And once, however many arrive. This is the half a per-datagram log line gets
     // wrong: one unauthenticated datagram provokes it, so anything on the segment
-    // can drive it at line rate without ever holding the cluster key, which is a
-    // disk-exhaustion hole reached from outside the fleet.
+    // can drive it at line rate without ever holding a key the cluster knows, which is
+    // a disk-exhaustion hole reached from outside the fleet.
     for ([[maybe_unused]] auto const round: std::views::iota(0, 5))
     {
         REQUIRE(rogue.service.SendBeacon());
@@ -304,7 +344,7 @@ TEST_CASE("A peer that cannot name itself is never challenged", "[cluster][disco
 TEST_CASE("A proof is refused before this node logs what it claimed", "[cluster][discovery][service]")
 {
     // The mismatch line names the endpoint a PROOF claimed, and a proof is
-    // unauthenticated until its tag checks out -- so without this, anything on the
+    // unauthenticated until its signature checks out -- so without this, anything on the
     // segment could write arbitrary bytes into a node's log by sending one beacon
     // and then one lie, holding no key at all.
     DatagramBus bus;
@@ -312,19 +352,20 @@ TEST_CASE("A proof is refused before this node logs what it claimed", "[cluster]
     ScriptedSecureRandom random { NonceScript({ 1, 2 }) };
     CapturingLogger logger;
 
-    Node listener { bus, clock, random, logger, "listener", "10.0.0.1:7000", "prod", "secret" };
-    Node peer { bus, clock, random, logger, "peer", "10.0.0.2:7000", "prod", "secret" };
+    auto const roster = SharedRoster::Of({ "listener", "peer" });
+    Node listener { bus, clock, random, logger, "listener", "10.0.0.1:7000", "prod", roster };
+    Node peer { bus, clock, random, logger, "peer", "10.0.0.2:7000", "prod", roster };
 
     // Announced properly, so it is recorded and challenged -- which is what makes a
     // proof carrying its id something this node looks at rather than discards.
     REQUIRE(peer.service.SendBeacon());
     REQUIRE(listener.service.PumpOnce(1ms) == DiscoveryEvent::PeerSeen);
 
-    // And then answers for an endpoint that is not text. The tag is not even filled
+    // And then answers for an endpoint that is not text. The signature is not even filled
     // in: this is refused long before anything is verified.
     REQUIRE(peer.socket
-                ->Send(DiscoveryWire::EncodeProof(
-                           DiscoveryWire::Proof { .nodeId = "peer", .raftEndpoint = "10.0.0.2:7000\xFF", .tag = {} }),
+                ->Send(DiscoveryWire::EncodeProof(DiscoveryWire::Proof {
+                           .nodeId = "peer", .raftEndpoint = "10.0.0.2:7000\xFF", .publicKey = {}, .signature = {} }),
                        AtEndpoint("10.0.0.1:7000"))
                 .has_value());
     CHECK(listener.service.PumpOnce(1ms) == DiscoveryEvent::ProofRejected);
@@ -347,8 +388,9 @@ TEST_CASE("A beacon this node cannot draw a challenge for is recorded, not chall
     ScriptedSecureRandom random { NonceScript({ 1, 2 }) };
     CapturingLogger logger;
 
-    Node listener { bus, clock, denied, logger, "listener", "10.0.0.1:7000", "prod", "secret" };
-    Node peer { bus, clock, random, logger, "peer", "10.0.0.2:7000", "prod", "secret" };
+    auto const roster = SharedRoster::Of({ "listener", "peer" });
+    Node listener { bus, clock, denied, logger, "listener", "10.0.0.1:7000", "prod", roster };
+    Node peer { bus, clock, random, logger, "peer", "10.0.0.2:7000", "prod", roster };
 
     REQUIRE(peer.service.SendBeacon());
     CHECK(listener.service.PumpOnce(1ms) == DiscoveryEvent::ChallengeWithheld);
@@ -371,18 +413,19 @@ TEST_CASE("A beacon this node cannot draw a challenge for is recorded, not chall
     CHECK(listener.directory.AuthenticatedPeers().empty());
 }
 
-TEST_CASE("Two nodes discover each other and prove the key", "[cluster][discovery][service]")
+TEST_CASE("Two nodes discover each other and prove the keys the roster holds for them", "[cluster][discovery][service]")
 {
     // The whole feature, end to end, in one process: beacon, challenge, proof,
-    // admitted. What makes this a unit test rather than a fixture is that the
+    // authenticated. What makes this a unit test rather than a fixture is that the
     // segment, the clock and the nonces are all injected.
     DatagramBus bus;
     ManualClock clock;
     ScriptedSecureRandom random { NonceScript({ 1, 2 }) };
     NullLogger logger;
 
-    Node alice { bus, clock, random, logger, "alice", "10.0.0.1:7000", "prod", "secret" };
-    Node bob { bus, clock, random, logger, "bob", "10.0.0.2:7000", "prod", "secret" };
+    auto const roster = SharedRoster::Of({ "alice", "bob" });
+    Node alice { bus, clock, random, logger, "alice", "10.0.0.1:7000", "prod", roster };
+    Node bob { bus, clock, random, logger, "bob", "10.0.0.2:7000", "prod", roster };
 
     REQUIRE(alice.service.SendBeacon());
 
@@ -403,31 +446,158 @@ TEST_CASE("Two nodes discover each other and prove the key", "[cluster][discover
     // RaftMembership names a member by id and carries no address, so a node the
     // cluster agrees to admit is unreachable until discovery supplies one.
     CHECK_FALSE(admitted.front().raftEndpoint.empty());
+
+    // And the key it PROVED, which is what a desire built from this entry carries.
+    CHECK(admitted.front().provenKey == TestKeyPair("alice").PublicKey());
 }
 
-TEST_CASE("A node with the wrong key is never admitted", "[cluster][discovery][service]")
+TEST_CASE("A proof under a key the roster does not hold is reported and never authenticated",
+          "[cluster][discovery][service][security]")
 {
-    // The reason the handshake exists. An admitted node is assigned compile jobs
-    // and returns objects cached fleet-wide, so this is the boundary between a
-    // shared cache and object injection into everybody's build.
+    // **The acceptance case for #178's discovery half: LAN auto-admission ends.** Under the
+    // shared key a proof WAS membership. Now a proof names a key, and an outsider signs
+    // perfectly well with one of its own -- so this is a machine that proves POSSESSION and
+    // is still not authenticated, because the roster does not hold that key for its id.
+    DatagramBus bus;
+    ManualClock clock;
+    ScriptedSecureRandom random { NonceScript({ 11 }) };
+    CapturingLogger logger;
+
+    auto const roster = SharedRoster::Of({ "insider" });
+    Node insider { bus, clock, random, logger, "insider", "10.0.0.1:7000", "prod", roster };
+    Node outsider { bus, clock, random, logger, "outsider", "10.0.0.2:7000", "prod", roster };
+
+    CHECK(Handshake(insider, outsider) == DiscoveryEvent::PeerUnknownKey);
+
+    // Seen, but never authenticated -- the two facts the directory keeps apart, and the
+    // second is what `DiscoveryTier` builds a desire from.
+    CHECK(insider.directory.Size() == 1);
+    CHECK(insider.directory.AuthenticatedPeers().empty());
+
+    // Counted by name, and apart from a forgery and from a revoked key: three diagnoses.
+    CHECK(insider.metrics.Read(IMetricsSink::Counter::DiscoveryProofsRefusedUnknownKey) == 1);
+    CHECK(insider.metrics.Read(IMetricsSink::Counter::DiscoveryProofsRefusedRevokedKey) == 0);
+    CHECK(insider.metrics.Read(IMetricsSink::Counter::DiscoveryProofsRefusedForged) == 0);
+
+    // Reported with the key WHOLE and the command that would admit it: the key verified, so
+    // only its holder could have signed this, and naming it is no oracle.
+    auto const key = FormatEd25519PublicKey(TestKeyPair("outsider").PublicKey());
+    CHECK(Warned(logger, std::format("--cluster-admit=outsider=10.0.0.2:7000@{}", key)) == 1);
+}
+
+TEST_CASE("A KNOWN id proving another key is reported, not authenticated", "[cluster][discovery][service][security]")
+{
+    // The impostor's shape, which the case above cannot show: the id is one the roster
+    // knows, the endpoint is plausible, and the key is the impostor's own. An id is a label;
+    // the key the roster holds for it is the credential.
     DatagramBus bus;
     ManualClock clock;
     ScriptedSecureRandom random { NonceScript({ 11 }) };
     NullLogger logger;
 
-    Node insider { bus, clock, random, logger, "insider", "10.0.0.1:7000", "prod", "secret" };
-    Node outsider { bus, clock, random, logger, "outsider", "10.0.0.2:7000", "prod", "not-the-secret" };
+    auto const roster = SharedRoster::Of({ "insider", "worker-a" });
+    Node insider { bus, clock, random, logger, "insider", "10.0.0.1:7000", "prod", roster };
+    Node impostor { bus, clock, random, logger, "worker-a", "10.0.0.2:7000", "prod", roster, TestKeyPair("impostor") };
 
-    REQUIRE(outsider.service.SendBeacon());
-
-    CHECK(insider.service.PumpOnce(1ms) == DiscoveryEvent::PeerSeen);
-    CHECK(outsider.service.PumpOnce(1ms) == DiscoveryEvent::Ignored); // its own beacon
-    CHECK(outsider.service.PumpOnce(1ms) == DiscoveryEvent::ChallengeAnswered);
-    CHECK(insider.service.PumpOnce(1ms) == DiscoveryEvent::ProofRejected);
-
-    // Seen, but never admitted -- the two facts the directory keeps apart.
-    CHECK(insider.directory.Size() == 1);
+    CHECK(Handshake(insider, impostor) == DiscoveryEvent::PeerUnknownKey);
     CHECK(insider.directory.AuthenticatedPeers().empty());
+
+    // The control, through the same fixture: the genuine holder of that id's key IS
+    // authenticated. Without it the refusal above passes under a service refusing everybody.
+    Node genuine { bus, clock, random, logger, "worker-a", "10.0.0.3:7000", "prod", roster };
+    CHECK(Handshake(insider, genuine) == DiscoveryEvent::PeerAuthenticated);
+}
+
+TEST_CASE("A proof under a REVOKED key is recognised as one", "[cluster][discovery][service][security]")
+{
+    // Revoked is not unknown: the remedies are opposite -- admit it if it belongs, against
+    // never admit it again -- so the event, the counter and the log each say which.
+    DatagramBus bus;
+    ManualClock clock;
+    ScriptedSecureRandom random { NonceScript({ 11 }) };
+    CapturingLogger logger;
+
+    auto roster = SharedRoster::Of({ "insider", "gone" });
+    Node insider { bus, clock, random, logger, "insider", "10.0.0.1:7000", "prod", roster };
+    Node gone { bus, clock, random, logger, "gone", "10.0.0.2:7000", "prod", roster };
+    REQUIRE(Handshake(insider, gone) == DiscoveryEvent::PeerAuthenticated);
+
+    roster->Revoke("gone");
+    CHECK(Handshake(insider, gone) == DiscoveryEvent::PeerRevokedKey);
+    CHECK(insider.metrics.Read(IMetricsSink::Counter::DiscoveryProofsRefusedRevokedKey) == 1);
+    CHECK(insider.metrics.Read(IMetricsSink::Counter::DiscoveryProofsRefusedUnknownKey) == 0);
+    CHECK(Warned(logger, "REVOKED") == 1);
+    CHECK(Warned(logger, "--cluster-admit") == 0);
+}
+
+TEST_CASE("A proof whose signature does not verify is counted as forged and names nothing it claimed",
+          "[cluster][discovery][service][security]")
+{
+    // A signature that fails under the key the proof CARRIES is the one case where the key
+    // is as much a claim as the id: anybody could have typed it. So it is counted, and
+    // logged by the address it came from and nothing else.
+    DatagramBus bus;
+    ManualClock clock;
+    ScriptedSecureRandom random { NonceScript({ 7 }) };
+    CapturingLogger logger;
+
+    auto const roster = SharedRoster::Of({ "alice", "bob" });
+    Node alice { bus, clock, random, logger, "alice", "10.0.0.1:7000", "prod", roster };
+    Node bob { bus, clock, random, logger, "bob", "10.0.0.2:7000", "prod", roster };
+
+    REQUIRE(alice.service.SendBeacon());
+    REQUIRE(bob.service.PumpOnce(1ms) == DiscoveryEvent::PeerSeen);
+    REQUIRE(alice.service.PumpOnce(1ms) == DiscoveryEvent::Ignored);
+    auto const captured = alice.socket->Receive(1ms);
+    REQUIRE(captured.has_value());
+    auto const challenge = DiscoveryWire::DecodeChallenge(captured->payload);
+    REQUIRE(challenge.has_value());
+
+    // Alice's KEY, and a signature made by somebody else.
+    auto const pair = TestKeyPair("alice");
+    auto proof = DiscoveryWire::Proof {
+        .nodeId = "alice", .raftEndpoint = "10.0.0.1:7000", .publicKey = pair.PublicKey(), .signature = {}
+    };
+    proof.signature = TestKeyPair("mallory").Sign(
+        DiscoveryWire::ProofMessage(Unwrap(challenge), proof.nodeId, proof.raftEndpoint, proof.publicKey));
+    REQUIRE(alice.socket->Send(DiscoveryWire::EncodeProof(proof), AtEndpoint("10.0.0.2:7000")).has_value());
+
+    CHECK(bob.service.PumpOnce(1ms) == DiscoveryEvent::ProofRejected);
+    CHECK(bob.metrics.Read(IMetricsSink::Counter::DiscoveryProofsRefusedForged) == 1);
+    CHECK(bob.directory.AuthenticatedPeers().empty());
+    CHECK(Warned(logger, "not signed by the key it carries") == 1);
+    CHECK(Warned(logger, FormatEd25519PublicKey(pair.PublicKey())) == 0);
+
+    // The nonce was spent by the forgery: the real proof arriving after it finds nothing
+    // outstanding, which is what keeps a forger from racing the honest answer for free.
+    CHECK(bob.service.PendingChallenges() == 0);
+}
+
+TEST_CASE("Proofs under keys the roster does not accept are all counted and reported at most once a minute",
+          "[cluster][discovery][service]")
+{
+    // A fresh key costs nothing to make, so anything on the segment can send one proof per
+    // beacon. The counter takes every one; the log takes the latest per interval and says how
+    // many it stands for, or the line is a disk-exhaustion hole reached from outside the fleet.
+    DatagramBus bus;
+    ManualClock clock;
+    ScriptedSecureRandom random { NonceScript({ 1, 2, 3 }) };
+    CapturingLogger logger;
+
+    auto const roster = SharedRoster::Of({ "insider" });
+    Node insider { bus, clock, random, logger, "insider", "10.0.0.1:7000", "prod", roster };
+    Node outsider { bus, clock, random, logger, "outsider", "10.0.0.2:7000", "prod", roster };
+
+    CHECK(Handshake(insider, outsider) == DiscoveryEvent::PeerUnknownKey);
+    CHECK(Handshake(insider, outsider) == DiscoveryEvent::PeerUnknownKey);
+    CHECK(Handshake(insider, outsider) == DiscoveryEvent::PeerUnknownKey);
+    CHECK(insider.metrics.Read(IMetricsSink::Counter::DiscoveryProofsRefusedUnknownKey) == 3);
+    CHECK(Warned(logger, "outsider at 10.0.0.2:7000") == 1);
+
+    clock.Advance(DiscoveryService::UnacceptedKeyReportInterval);
+    CHECK(Handshake(insider, outsider) == DiscoveryEvent::PeerUnknownKey);
+    CHECK(Warned(logger, "outsider at 10.0.0.2:7000") == 2);
+    CHECK(Warned(logger, "3 such proof(s) since the last report") == 1);
 }
 
 TEST_CASE("A proof nobody asked for is refused", "[cluster][discovery][service]")
@@ -440,17 +610,22 @@ TEST_CASE("A proof nobody asked for is refused", "[cluster][discovery][service]"
     ScriptedSecureRandom random { NonceScript({ 5 }) };
     NullLogger logger;
 
-    Node alice { bus, clock, random, logger, "alice", "10.0.0.1:7000", "prod", "secret" };
+    auto const roster = SharedRoster::Of({ "alice", "ghost" });
+    Node alice { bus, clock, random, logger, "alice", "10.0.0.1:7000", "prod", roster };
     auto intruder = bus.Open(AtEndpoint("10.0.0.9:7000"));
 
     DiscoveryWire::Challenge const invented { .clusterId = "prod", .nonce = {} };
-    auto const tag = DiscoveryWire::ExpectedProofTag(Key("secret"), invented, "ghost", "10.0.0.9:7000");
+    auto const ghost = TestKeyPair("ghost");
+    auto const signature = ghost.Sign(DiscoveryWire::ProofMessage(invented, "ghost", "10.0.0.9:7000", ghost.PublicKey()));
     REQUIRE(intruder
-                ->Send(DiscoveryWire::EncodeProof({ .nodeId = "ghost", .raftEndpoint = "10.0.0.9:7000", .tag = tag }),
+                ->Send(DiscoveryWire::EncodeProof({ .nodeId = "ghost",
+                                                    .raftEndpoint = "10.0.0.9:7000",
+                                                    .publicKey = ghost.PublicKey(),
+                                                    .signature = signature }),
                        AtEndpoint("10.0.0.1:7000"))
                 .has_value());
 
-    // Even holding the real key, a proof against a self-chosen nonce is refused:
+    // Even holding a key the roster knows, a proof against a self-chosen nonce is refused:
     // alice never challenged "ghost".
     CHECK(alice.service.PumpOnce(1ms) == DiscoveryEvent::ProofRejected);
     CHECK(alice.directory.AuthenticatedPeers().empty());
@@ -460,14 +635,15 @@ TEST_CASE("A challenge is spent once", "[cluster][discovery][service]")
 {
     // A nonce that could answer twice is a nonce that can be replayed: an
     // observer who captured one valid proof could re-send it later and be
-    // re-admitted without ever holding the key.
+    // re-authenticated without ever holding the key.
     DatagramBus bus;
     ManualClock clock;
     ScriptedSecureRandom random { NonceScript({ 7 }) };
     NullLogger logger;
 
-    Node alice { bus, clock, random, logger, "alice", "10.0.0.1:7000", "prod", "secret" };
-    Node bob { bus, clock, random, logger, "bob", "10.0.0.2:7000", "prod", "secret" };
+    auto const roster = SharedRoster::Of({ "alice", "bob" });
+    Node alice { bus, clock, random, logger, "alice", "10.0.0.1:7000", "prod", roster };
+    Node bob { bus, clock, random, logger, "bob", "10.0.0.2:7000", "prod", roster };
 
     REQUIRE(alice.service.SendBeacon());
     REQUIRE(bob.service.PumpOnce(1ms) == DiscoveryEvent::PeerSeen);
@@ -479,8 +655,11 @@ TEST_CASE("A challenge is spent once", "[cluster][discovery][service]")
     auto const proofDatagram = DiscoveryWire::DecodeChallenge(captured->payload);
     REQUIRE(proofDatagram.has_value());
 
-    auto const tag = DiscoveryWire::ExpectedProofTag(Key("secret"), Unwrap(proofDatagram), "alice", "10.0.0.1:7000");
-    auto const proof = DiscoveryWire::EncodeProof({ .nodeId = "alice", .raftEndpoint = "10.0.0.1:7000", .tag = tag });
+    auto const pair = TestKeyPair("alice");
+    auto const signature =
+        pair.Sign(DiscoveryWire::ProofMessage(Unwrap(proofDatagram), "alice", "10.0.0.1:7000", pair.PublicKey()));
+    auto const proof = DiscoveryWire::EncodeProof(
+        { .nodeId = "alice", .raftEndpoint = "10.0.0.1:7000", .publicKey = pair.PublicKey(), .signature = signature });
 
     REQUIRE(alice.socket->Send(proof, AtEndpoint("10.0.0.2:7000")).has_value());
     CHECK(bob.service.PumpOnce(1ms) == DiscoveryEvent::PeerAuthenticated);
@@ -498,17 +677,17 @@ TEST_CASE("Two fleets on one segment ignore each other", "[cluster][discovery][s
     ScriptedSecureRandom random { NonceScript({ 1 }) };
     NullLogger logger;
 
-    Node prod { bus, clock, random, logger, "prod-a", "10.0.0.1:7000", "prod", "secret" };
-    Node staging { bus, clock, random, logger, "staging-a", "10.0.0.2:7000", "staging", "secret" };
+    auto const roster = SharedRoster::Of({ "prod-a", "staging-a" });
+    Node prod { bus, clock, random, logger, "prod-a", "10.0.0.1:7000", "prod", roster };
+    Node staging { bus, clock, random, logger, "staging-a", "10.0.0.2:7000", "staging", roster };
 
     REQUIRE(prod.service.SendBeacon());
 
     CHECK(staging.service.PumpOnce(1ms) == DiscoveryEvent::Ignored);
     CHECK(staging.directory.Size() == 0);
 
-    // Same key, different cluster: routing, not authentication. Sharing a key
-    // across fleets is a bad idea, but the cluster id is what keeps them apart
-    // even when somebody does it.
+    // Same roster, different cluster: routing, not authentication. The cluster id is what
+    // keeps two fleets apart even when one roster knows both.
     CHECK(staging.service.PendingChallenges() == 0);
 }
 
@@ -522,8 +701,9 @@ TEST_CASE("Discovery survives a lost beacon", "[cluster][discovery][service]")
     ScriptedSecureRandom random { NonceScript({ 3 }) };
     NullLogger logger;
 
-    Node alice { bus, clock, random, logger, "alice", "10.0.0.1:7000", "prod", "secret" };
-    Node bob { bus, clock, random, logger, "bob", "10.0.0.2:7000", "prod", "secret" };
+    auto const roster = SharedRoster::Of({ "alice", "bob" });
+    Node alice { bus, clock, random, logger, "alice", "10.0.0.1:7000", "prod", roster };
+    Node bob { bus, clock, random, logger, "bob", "10.0.0.2:7000", "prod", roster };
 
     REQUIRE(bus.DropNext(AtEndpoint("10.0.0.2:7000"), 1) == 1);
 
@@ -543,13 +723,13 @@ TEST_CASE("A challenge expires rather than accumulating", "[cluster][discovery][
 {
     // A beacon is unauthenticated, so anything on the segment can provoke a
     // challenge. One entry per node and a lifetime is what keeps that from being
-    // a memory-exhaustion hole reachable without holding the key.
+    // a memory-exhaustion hole reachable without holding any key.
     DatagramBus bus;
     ManualClock clock;
     ScriptedSecureRandom random { NonceScript({ 1, 2, 3 }) };
     NullLogger logger;
 
-    Node watcher { bus, clock, random, logger, "watcher", "10.0.0.1:7000", "prod", "secret" };
+    Node watcher { bus, clock, random, logger, "watcher", "10.0.0.1:7000", "prod", SharedRoster::Of({ "watcher" }) };
     auto noisy = bus.Open(AtEndpoint("10.0.0.9:7000"));
 
     auto const beacon =

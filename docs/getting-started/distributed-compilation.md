@@ -966,6 +966,6 @@ so a build LAN where addresses can be spoofed is not a boundary this can hold.
   node's cache tier, the cluster, and the fleet dashboard.
 - [Cluster communication](../operations/cluster-communication.md) — one compile
   as the fleet sees it, every connection in one table, and firewall rules.
-- [Cluster discovery](cluster-discovery.md) — how nodes find each other, and the
-  pre-shared key that admits them.
+- [Cluster discovery](cluster-discovery.md) — how nodes find each other, and why
+  finding one no longer admits it.
 - [Compile cache protocol](../protocols/compile-cache.md) — the wire format.

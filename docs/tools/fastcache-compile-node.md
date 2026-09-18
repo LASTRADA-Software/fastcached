@@ -1242,7 +1242,8 @@ list names every other member's key** when a cluster is first formed; a member n
 without one cannot be verified, and a cluster none of whose members was given keys does
 not form. What that refuses, and how a refusal reads, is under
 [Raft peer authentication](../operations/cluster-communication.md#raft-peer-authentication).
-The cluster key is still what the leases, the node port and enrollment use
+Discovery and enrollment prove these keys too, and hand no secret to anybody. The cluster
+key is still what the leases and the node port use
 ([#178](https://github.com/LASTRADA-Software/fastcached/issues/178) moves them next).
 
 `--print-identity` is how you learn a node's key before any member starts. Run it with the
@@ -1281,7 +1282,7 @@ nobody reads:
 | this node is named, by a `--raft-peer` of its own or by `--raft-self` | The address its peers dial is the half only it knows — whether it bootstraps a cluster or joins one with `--raft-join`. |
 | not both, naming different addresses | Two answers to one question, with nothing to rank them by. |
 | `--listen-raft` names a usable port | That is where every peer dials it, and giving it is what turns consensus on. A value that is not an address is refused with the text you typed. |
-| `--cluster-key-file` names the cluster's key | A consensus node signs the scheduler's leases with it, proves itself on the node port with it, and hands it over at enrollment. It no longer proves anything between members -- each member's own identity key does, see [Raft peer authentication](../operations/cluster-communication.md#raft-peer-authentication) -- but it is still required until those move too. The refusal says how to make a key and how to be handed one. |
+| `--cluster-key-file` names the cluster's key | A consensus node signs the scheduler's leases with it and proves itself on the node port with it. It no longer proves anything between members, on the LAN or at enrollment -- each member's own identity key does, see [Raft peer authentication](../operations/cluster-communication.md#raft-peer-authentication) -- but it is still required until those two move too. Enrollment no longer hands it over, so it is placed on every member by hand. The refusal says how to make one. |
 
 The reverse holds too: `--node-id` or `--raft-peer` **without** `--listen-raft` is
 refused rather than ignored. This node would run no consensus at all, so neither
@@ -1469,7 +1470,8 @@ reaches it. A joiner that cannot send one is admitted, dialled, and permanently
 silent.
 
 With `--discovery` the same node names only itself, because discovery supplies the
-addresses — see below.
+addresses of members whose keys the cluster already holds — see below. It does not
+supply the admission: that is still the `--cluster-admit` above, or an enrollment.
 
 **Nothing about the existing members changes.** They are not restarted, their
 command lines are not edited, and the new member survives *their* restarts as well
@@ -1554,34 +1556,51 @@ majority that decides. Promote it while a voter is still there to commit the cha
 
 ### Enrolling a machine instead of typing it
 
-The two commands above need the operator to know the joiner's id and its consensus
-address, and to type both correctly on a machine that is not the one being added.
-The enrollment window is the same expansion asked for from the other end: the
-joiner states who it is, an operator looks at the request and approves it, and the
-cluster key travels back over the wire instead of being copied out of band.
+The two commands above need the operator to know the joiner's id, its consensus
+address and its identity key, and to type all three correctly on a machine that is
+not the one being added. The enrollment window is the same expansion asked for from
+the other end: the joiner states who it is and which key it holds, an operator
+compares that key and approves it, and the cluster's **roster** travels back —
+every member's public key, and **no secret at all**
+([#178](https://github.com/LASTRADA-Software/fastcached/issues/178)).
 
-**It is shut unless somebody opens it, and that is the whole security model.** An
-open window is the one interval in which a machine this cluster has never heard of
-can ask it for the key that makes it a member, so the window is a *moment an
-operator chooses* rather than a setting. There is no flag that starts a node with it
-open, deliberately: a service registration replays its command line at every boot
-forever, and a window re-opening on every reboot is a door nobody decided to leave
-unlocked. It is opened, used, and closed:
+**It is shut unless somebody opens it.** An open window is the one interval in which
+a machine this cluster has never heard of can put itself on the list an operator
+approves from, so the window is a *moment an operator chooses* rather than a
+setting. There is no flag that starts a node with it open, deliberately: a service
+registration replays its command line at every boot forever, and a window re-opening
+on every reboot is a door nobody decided to leave unlocked. It is opened, used, and
+closed:
 
 ```sh
 fastcache-compile-node --scheduler=10.0.0.1:6675 --enroll-open
 ```
 
-The joiner is then started with `--enroll-from` naming any member. It states its own
-id and the address its consensus port will answer on, polls until somebody decides,
-writes the key to `--cluster-key-file`, and **exits** — it is a one-shot join and not
-a way to run a node:
+The joiner is then started with `--enroll-from` naming any member that runs
+consensus. It mints its id and its identity key into its state directory, **prints
+the key**, asks, polls until somebody decides, checks the roster it is handed, prints
+what to start it with, and **exits** — it is a one-shot join and not a way to run a
+node:
 
 ```sh
-fastcache-compile-node --enroll-from=10.0.0.1:6675 --raft-self=10.0.0.4 --listen-raft=6680 --cluster-key-file=/etc/fastcached/cluster.key
+fastcache-compile-node --enroll-from=10.0.0.1:6675 --raft-self=10.0.0.4 --listen-raft=6680
 ```
 
-**No `--node-id`**, deliberately. The mode mints one into `--cluster-dir` — a node *is* its state directory — and the minted form is 128 bits of randomness rendered as 32 hex characters. **Naming a short id here is the one way to make this genuinely unsafe**: an open window will hand the key to whoever names an id an operator approved, and while the id is unguessable that is a gate, where `n4` is the first guess anybody would make. If you must pin an id, pin a minted-shaped one.
+A node that runs consensus asks **as a member**, and one that does not asks **as a
+worker**: a worker is admitted as a *principal* — an id and a key the roster records —
+and never counts towards a quorum. The role follows from what the node is, so nobody
+can ask for one the machine will not be. A worker names `--cluster-dir`, because that
+is the only place a node running no consensus keeps its key:
+
+```sh
+fastcache-compile-node --enroll-from=10.0.0.1:6675 --cluster-dir=/var/lib/fastcache-node
+```
+
+**No `--node-id`**, and it matters less than it did. The mode mints one into the state
+directory — a node *is* its state directory — as 128 bits of randomness in 32 hex
+characters. The id is a label; the key is the credential, so a short guessable id can
+no longer be answered to. It can still be *squatted*: whoever asks first under an id
+holds that row, and the key comparison below is what catches it.
 
 While it polls, the window's holder reports what is waiting:
 
@@ -1589,23 +1608,34 @@ While it polls, the window's holder reports what is waiting:
 fastcache-compile-node --scheduler=10.0.0.1:6675 --enroll-list
 ```
 
-Each row names the id the machine claims, the consensus address it claims, and **the
-host the kernel says the request came from**. Those last two are shown side by side
-and never checked against each other — [#242](https://github.com/LASTRADA-Software/fastcached/issues/242)
-settled that enforcing agreement refuses the documented setup and stops only a third
-host — so a disagreement is *marked* for a person to read rather than refused. That
-is the gate: at forty rows nobody notices an unmarked one.
+Each row names the id and the role the machine claims, the consensus address it
+claims, the host the kernel says the request came from, and **its key, whole**.
+**Compare that key with the one the joiner printed before you approve: the comparison
+is the whole of what makes an approval safe.** Nothing secret changes hands, so what
+somebody between the two ends can do is substitute a key of their own — and the key on
+the row is exactly the key an approval admits.
 
-Approving does the `--cluster-admit` above, from inside the cluster, and lets the
-machine collect the key **exactly once** — the grant is spendable once, the same rule
-a compile lease follows, on a credential worth rather more:
+The row keeps the **first** key its id asked with. A later poll under that id with
+another key is another machine: it is counted on the row's "later poll" mark,
+answered as still pending, and never recorded — so a key cannot be swapped between
+`--enroll-list` and `--enroll-approve`. A joiner that genuinely minted a new key (a
+wiped state directory is a new machine) is enrolled again after `--enroll-close` and
+`--enroll-open`.
+
+The claimed address and the observed host are shown side by side and never checked
+against each other — [#242](https://github.com/LASTRADA-Software/fastcached/issues/242)
+settled that enforcing agreement refuses the documented setup and stops only a third
+host — so a disagreement is *marked* for a person to read rather than refused.
+
+Approving admits the machine under the key its row holds — the `--cluster-admit
+...@<key>` above for a member, a worker principal otherwise — from inside the cluster:
 
 ```sh
-fastcache-compile-node --scheduler=10.0.0.1:6675 --enroll-approve=n4
+fastcache-compile-node --scheduler=10.0.0.1:6675 --enroll-approve=<id>
 ```
 
 ```sh
-fastcache-compile-node --scheduler=10.0.0.1:6675 --enroll-reject=n7
+fastcache-compile-node --scheduler=10.0.0.1:6675 --enroll-reject=<id>
 ```
 
 and when the expansion is done:
@@ -1618,22 +1648,27 @@ Closing **forgets everything pending**. A request that was waiting is not held o
 to the next time somebody opens the window, because a list that survives its window
 is a machine approved weeks after anybody remembers asking for it.
 
-**If a joiner never got its key, approve it again.** The key is handed over once per
-approval, so a reply lost on the wire leaves the machine with nothing and the node
-answering `enrollment-already-collected` to every retry. Running `--enroll-approve`
-on that same id re-arms exactly one more collection — one command, on the id you
-already approved, and both counters go on telling the truth: the hand-over tally
-rises a second time because the key genuinely leaves a second time.
+**The joiner prints a roster fingerprint, and `--enroll-list` shows the one it was
+sent.** The approved reply is answered only once the leader's own roster records the
+joiner, and the joiner refuses a roster that does not record it under its own key —
+either somebody approved a different key for this id, or something rewrote the reply.
+Otherwise it prints `SHA256:` and 43 characters; the joiner's row on the list shows
+the fingerprint of the roster the leader SENT it. The two agreeing is what says
+nothing between them rewrote the roster. The fingerprint is per row, because the
+roster moves with every admission and a batch of approvals would otherwise make every
+joiner disagree with the list for a reason that is no attack at all.
 
-That is the cost of the key being spendable once, and it was chosen over the
-alternative. Serving it on every poll would spare the lost-reply case and would hand
-the fleet's key to anybody who can reach this port while a window is open and name an
-id that was approved — invisibly, because the tally would not move and the real
-joiner would still get its key on its next poll. The observed peer host cannot close
-that instead: [#242](https://github.com/LASTRADA-Software/fastcached/issues/242)
-settled that gating on it refuses the documented setup and stops only a third host.
-So the row shows both addresses, marks a decided row that polls with a different
-claim, and the *spend* is what carries the security property.
+**A lost reply costs nothing.** An approval is answered on every poll — a roster is no
+secret — so a joiner whose reply went missing simply asks again. There is no spend,
+no re-approval and nothing to re-arm; that whole mechanism existed because a key
+handed over could not be handed over twice, and it went with the key.
+
+**Enrollment no longer hands over `--cluster-key-file`.** A consensus node still
+reads that file — it signs leases and proves a member on the node port — until those
+wires move to identity keys as well, so place it on a joining member the way it is
+placed on every other; a member that finishes enrolling without one says so. What
+the key no longer does is admit anybody: it travels nowhere, and a machine holding it
+is not thereby a member.
 
 **An open window says so, repeatedly.** The node logs a warning when the window
 opens and goes on logging it at an interval for as long as it is open, so a window
@@ -1848,7 +1883,8 @@ and reloading is what closes such a node.
 ### Finding peers instead of typing them
 
 `--raft-peer` works and needs no network magic, but it means editing a file on every
-machine each time one joins. `--discovery` replaces the editing with a broadcast:
+machine each time a member moves. `--discovery` replaces that editing with a
+broadcast:
 
 ```sh
 head -c 32 /dev/urandom | base64 > /etc/fastcached/cluster.key   # once, per fleet
@@ -1866,54 +1902,62 @@ fastcache-compile-node \
 Every node still names **itself** in `--raft-peer`, because that is the address its
 peers dial and only it knows it. What it no longer has to name is anybody else.
 
-**The key authenticates a handshake; it never travels in a beacon.** A beacon says
-what a node *is* — cluster, id, consensus endpoint — and nothing derived from the
-key, because a broadcast reaches every listener on the segment and anything
-key-derived in one hands them what they need to join. The key appears only inside an
-HMAC over a nonce the challenger chose, and that MAC covers the `(node, endpoint)`
-**pair**: signing the nonce alone would let anyone who observed one valid proof
-replay its tag with a different endpoint substituted, admitting a legitimate node id
-at an attacker's address.
+**Discovery finds members; it no longer admits anybody**
+([#178](https://github.com/LASTRADA-Software/fastcached/issues/178)). A beacon says
+what a node *is* — cluster, id, consensus endpoint — and the challenge that follows it
+is answered with a **signature by that node's own identity key**, over a nonce the
+challenger chose, its id, its endpoint and the key itself. A peer is then desired only
+when the key it proved is **the key the cluster's roster holds for that id**. A key
+the roster does not hold is *reported* — counted, and logged with the id, the address
+it came from, the key whole and the `--cluster-admit` that would admit it — and never
+desired; a key the roster has revoked is reported as revoked. So discovery can tell
+the cluster that a known member now answers at a new address, and cannot add a member:
+that is an operator's act, through `--enroll-approve` or `--cluster-admit ...@<key>`.
+
+Under the shared key it could. A proof then showed possession of the fleet's key, and
+possession *was* membership, so any machine holding the file was desired and the
+leader admitted it. That is what ended: a copied key file no longer turns into a
+member by being on the right segment.
+
+What the signature covers matters as much as who signs. It covers the `(node,
+endpoint)` **pair** and the key: signing the nonce alone would let anyone who observed
+one valid proof replay it with a different endpoint substituted, pointing a known id
+at an attacker's address. The datagram grammar changed with it — a key and a 64-byte
+signature where a 32-byte MAC was — so the discovery wire moved to version 2, and a
+node on an older build is refused rather than misread; upgrade a segment's consensus
+members together.
 
 **`--cluster-key-file` is a file and not a flag**, and that is the whole reason it
 exists in that shape. A command line is readable through `ps` on every POSIX system,
 and a service's arguments end up in a unit file or a registry key that more accounts
-can read than can read a mode-0600 file. A leaked key admits a node, an admitted node
-is assigned compile jobs, and the objects it returns are cached fleet-wide — so it is
-object injection into everybody's build.
+can read than can read a mode-0600 file.
 
-**Three surfaces read it, not one — and the consensus wire as well.** Every
-**consensus connection** proves it before a message is read
-([#1308](https://github.com/LASTRADA-Software/fastcached/issues/1308)); discovery
-proves the cluster's identity with it; the scheduler **signs lease grants** with it — a
-MAC over the granted worker's endpoint, the toolchain, the object key and an expiry
-([#281](https://github.com/LASTRADA-Software/fastcached/issues/281)); and the worker
+**Three readers are left.** The scheduler **signs lease grants** with it — a MAC
+over the granted worker's endpoint, the toolchain, the object key and an expiry
+([#281](https://github.com/LASTRADA-Software/fastcached/issues/281)) — the worker
 **verifies** that MAC before it compiles anything
-([#282](https://github.com/LASTRADA-Software/fastcached/issues/282)). So every node
-wants the key, not only the one running `--serve-scheduler`.
+([#282](https://github.com/LASTRADA-Software/fastcached/issues/282)), and a caller
+proves it on the node port. Discovery and the consensus wire no longer read it at all:
+each proves a node's own key instead. So every node that runs consensus or a reachable
+worker still wants the file, and a node running consensus without it **will not
+start**; `--discovery` has no key requirement of its own any more.
 
-A node running consensus without the key **will not start**, whatever it binds, and
-neither will a worker that another machine could dial — each refusal names the flag.
-A worker nothing else can dial runs without the lease check and warns once, loudly. A scheduler with no key hands out unsigned grants and says so at the
-first one. Provision the key everywhere *before* rolling the binary: a worker that
-has it and a scheduler that does not is a worker refusing every grant that scheduler
-issues.
-
-There is no longer a refusal for a key nothing reads. That rule was wrong twice —
-each new reader made it reject the configuration that reader needed — and whether a
-worker tier exists is not something the flag table can see.
+A worker nothing else can dial runs without the lease check and warns once, loudly. A
+scheduler with no key hands out unsigned grants and says so at the first one.
+Provision the key everywhere *before* rolling the binary: a worker that has it and a
+scheduler that does not is a worker refusing every grant that scheduler issues.
 
 **`--cluster-id` is routing, not authentication.** It is plain text in every beacon,
 so treating it as a credential would be the mistake. What it buys is that two
-unrelated fleets on one segment ignore each other, which holds even when somebody
-shares a key across fleets — which they should not.
+unrelated fleets on one segment ignore each other, even where one roster knows
+machines in both.
 
 **A node listens on the `--discovery` port and answers somewhere else.** Every node
 on the segment binds that port — a beacon is a broadcast, so they have to — and only
 one of the sockets sharing a port is handed a *unicast*. Since the challenge and the
 proof are both unicast, a node answering there would be answering for its whole
 machine, which is why two nodes on one host used to see each other and never finish
-proving the key. Each one therefore also holds a port of its own, and that is where
+the handshake. Each one therefore also holds a port of its own, and that is where
 its peers reach it.
 
 Two consequences worth knowing before you deploy it:
@@ -1934,14 +1978,14 @@ Running several nodes on one machine works, and each needs its own `--cluster-di
 `--listen-raft` and — if you pin them — `--discovery-reply-port`. The identity comes
 with the directory: two Raft logs cannot share one, so there is no name to invent.
 
-**Discovery never changes membership by itself.** It answers who proved the key and
-where they answer; the *leader* proposes, and only the leader, because admitting a
-node is a Raft decision. Every node on the segment sees the same peers and all but
+**Discovery never changes membership by itself.** It answers which known members
+proved their keys and where they answer; the *leader* proposes, and only the leader,
+because a membership change is a Raft decision. Every node on the segment sees the same peers and all but
 one of them do nothing about it.
 
-**A node joining a discovered fleet still needs `--raft-join`**, and nothing else
-about the *cluster*: discovery supplies the addresses a typed join has to list by
-hand. It still names itself — `--listen-raft` and either `--raft-self` or its own
+**A node joining a discovered fleet still needs `--raft-join`, and an operator to
+admit its key** — `--enroll-approve`, or `--cluster-admit ...@<key>`: discovery supplies
+the addresses a typed join has to list by hand, and never the admission. It still names itself — `--listen-raft` and either `--raft-self` or its own
 `--raft-peer` entry — as every node in a cluster must. One
 node bootstraps the cluster and the rest join it — and exactly one, because two
 nodes that each bootstrapped a cluster of themselves cannot be merged. A membership
@@ -2872,8 +2916,8 @@ repeating warning, because that is a state and a counter cannot carry one.
 
 | Series | Says |
 |---|---|
-| `fastcache_enrollment_windows_opened_total` | An operator opened the window. **This is the series to alert on**, and the alert is that it moved at all outside a planned expansion: an open window is the one interval in which an unknown machine can ask this cluster for its key. A rise with no change window is somebody opening a door, and the rate matters less than the fact. |
-| `fastcache_enrollment_keys_handed_over_total` | An approved joiner collected the cluster key. Bounded by the number of machines an operator approved, so it should equal the size of the expansion and stop. It rising while `fastcache_enrollment_windows_opened_total` is flat is an approval collected late, which is ordinary; it rising past the number of machines anybody approved is not, and the pending list names who. |
+| `fastcache_enrollment_windows_opened_total` | An operator opened the window. **This is the series to alert on**, and the alert is that it moved at all outside a planned expansion: an open window is the one interval in which an unknown machine can put itself on the list an operator approves from. A rise with no change window is somebody opening a door, and the rate matters less than the fact. |
+| `fastcache_enrollment_rosters_served_total` | An approved joiner was handed the roster. Per roster SENT, not per machine: an approval is answered on every poll, so a joiner whose reply was lost and asked again counts twice. It carries no secret, so a rise past the machines anybody approved is a retry rather than a leak -- and the pending list names who asked. |
 
 Both are rendered by **every** node, consensus or not, and read zero on a machine
 that has no window at all. That is deliberate and is this project's rule rather than
@@ -2882,6 +2926,20 @@ happened, and absence is modelled in the *snapshot* rather than by dropping a ro
 Which of the two a zero means is answered by `--node-status`, whose enrollment field
 is **absent** on a node that runs no consensus and `closed` on one that does — the
 distinction a counter cannot carry, kept where it can be.
+
+### Discovery
+
+Three counters, each a discovery proof that answered a challenge this node issued and was
+**not** accepted ([#178](https://github.com/LASTRADA-Software/fastcached/issues/178)). None
+of them is a membership change: discovery reports, and only an operator admits. They are
+rendered only by a node that runs discovery; anywhere else no writer exists, so the rows
+are absent rather than a zero that claims nobody tried.
+
+| Series | Says |
+|---|---|
+| `fastcache_discovery_proofs_refused_unknown_key_total` | A peer proved possession of a key the roster does not hold for the id it claimed. **The ordinary cause is a new machine nobody has admitted yet**: enrol it, or `--cluster-admit` it under the key the warning names. The other cause is a machine claiming a known member's id under its own key, and the log line -- id, the address it came from, the key whole -- is what tells them apart. Logged at most once a minute with how many it stands for; every one is counted. |
+| `fastcache_discovery_proofs_refused_revoked_key_total` | A peer proved possession of a key the roster has REVOKED. The remedy is the opposite of the row above: that machine was removed and is never admitted again under that key, so a rise is a decommissioned machine still running, or one somebody restored from a backup of its state directory. |
+| `fastcache_discovery_proofs_refused_forged_total` | A proof whose signature does not verify under the key it carries. An honest node cannot produce one, so it is somebody sending datagrams by hand, or a build that disagrees about the signed message -- which moves the discovery wire's version when it changes, so it should not happen between two builds of this project. Logged by the address it came from and nothing it claimed. |
 
 ### What a refused connection looks like
 
@@ -2926,8 +2984,7 @@ byte-budget refusal that fires in practice is a cache `STORE`.
 | `fastcache_enrollment_requests_refused_closed_total` | An `ENROLL` arrived while the window was shut. **This is the only series that sees a stranger asking**, and it is the one refusal here that is reachable pre-auth, so it doubles as the probe counter for that verb. A slow trickle is a joiner that was started before anybody opened the window and is polling; a burst from addresses nobody recognises is a scan, and the peer host is in the node's log beside it. | `ENROLL` |
 | `fastcache_enrollment_requests_refused_full_total` | The pending list already held every entry it will. Separate from the row above because the operator actions are opposite: *closed* means open the window, *full* means go and decide about the machines already in it. A fleet expansion larger than the list is the honest cause; anything else is a list nobody is draining. | `ENROLL` |
 | `fastcache_enrollment_requests_refused_malformed_total` | An `ENROLL` payload that would not decode, or one naming no id or no address. Flat at zero against this project's own client, so a rise is another implementation or a probe shaped like one. | `ENROLL` |
-| `fastcache_enrollment_control_refused_not_a_member_total` | An `ENROLL-CONTROL` from a host this node does not admit. The decision half of the family is the one that hands over the key, so it is gated twice — membership here, and `AUTH` in the row below — and this counter is the outer gate reporting. | `ENROLL-CONTROL` |
-| `fastcache_enrollment_requests_refused_already_collected_total` | An `ENROLL` naming an id whose key has already been collected. Refused with **no key bytes served** — the grant is spendable once. A healthy enrolment produces none of these, because a joiner that collects the key writes it and exits, so this is not a second spelling of the hand-over tally: that one says the key left, this one says somebody asked after it had left. Two causes and the rate separates them — one is a joiner whose reply was lost, a run of them is somebody answering to an id an operator approved. Both are fixed by `--enroll-approve` on that id, which re-arms exactly one more collection. | `ENROLL` |
+| `fastcache_enrollment_control_refused_not_a_member_total` | An `ENROLL-CONTROL` from a host this node does not admit. The decision half of the family is the one that admits a key to the cluster, so it is gated twice — membership here, and `AUTH` in the row below — and this counter is the outer gate reporting. | `ENROLL-CONTROL` |
 | `fastcache_enrollment_control_refused_unauthenticated_total` | An `ENROLL-CONTROL` from an admitted host that never presented a credential. Counted apart from the row above — and answered `unauthenticated` where that one answers `not-a-member` — because those are different machines with opposite remedies: one is a host to add to the membership policy, the other a host that is already trusted and whose operator tool is missing its token. A single "refused" tally would make the two indistinguishable at exactly the moment somebody is trying to work out why an approval will not go through. | `ENROLL-CONTROL` |
 
 **A Raft peer that could not prove which member it is, or proved it and still could not be served.** Every connection between consensus members opens with a handshake: the accepting node challenges, the dialling node signs that challenge with its own identity key and names the member it meant to dial, and the acceptor answers with a verdict signed with its own. Each end checks the other's signature against the key the cluster records for the id it claims. The `connections` and `frames` rows are counted by the node that ACCEPTED the connection, the `dials` rows by the node that DIALLED it — so one misconfigured machine shows on both, from opposite ends. See [cluster communication](../operations/cluster-communication.md#raft-peer-authentication).

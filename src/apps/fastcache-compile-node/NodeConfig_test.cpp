@@ -593,10 +593,9 @@ TEST_CASE("NodeConfig: a node running consensus without a cluster key file is re
           "[node][config][consensus][policy]")
 {
     // #1308, and a reason that moved at #178. The Raft peer wire proves each member's own
-    // identity key now, but a consensus node still signs leases, proves itself on the node
-    // port and hands the key over at enrollment with it -- and the enrollment window on a
-    // keyless one was approvable while it had no key to hand over. Refused HERE, where an
-    // operator is watching and an install consults it, and never answered per connection.
+    // identity key now, but a consensus node still signs leases and proves itself on the
+    // node port with it. Refused HERE, where an operator is watching and an install consults
+    // it, and never answered per connection.
     auto clustered = Installable();
     clustered.nodeId = "n1";
     clustered.raftListen = "6680";
@@ -615,11 +614,16 @@ TEST_CASE("NodeConfig: a node running consensus without a cluster key file is re
     CHECK(Unwrap(install) == ConsensusNeedsClusterKeyRefusal);
 
     // The remedy is in the refusal, because it is the only part most operators read: how
-    // to make a key, and how to be handed one.
+    // to make a key.
     CHECK(ConsensusNeedsClusterKeyRefusal.starts_with("--listen-raft"));
     CHECK(ConsensusNeedsClusterKeyRefusal.contains("--cluster-key-file"));
     CHECK(ConsensusNeedsClusterKeyRefusal.contains("head -c 32 /dev/urandom | base64"));
-    CHECK(ConsensusNeedsClusterKeyRefusal.contains("--enroll-from"));
+
+    // And NOT how to be handed one: enrollment stopped handing the key over at #178 PR 4, so
+    // a refusal still naming `--enroll-from` as a source of the key would send an operator
+    // to wait ten minutes for a file that never arrives. A guard a remedy text needs, since
+    // nothing else reads it.
+    CHECK_FALSE(ConsensusNeedsClusterKeyRefusal.contains("--enroll-from"));
 
     // A joiner is asked the same: it is a consensus node like any other.
     auto joiner = clustered;
@@ -638,13 +642,18 @@ TEST_CASE("NodeConfig: a node running consensus without a cluster key file is re
     // loopback serving its own machine is still the ordinary keyless install.
     CHECK_FALSE(StartupPolicyRejection(Installable()).has_value());
 
-    // `--discovery` without a key keeps its own, more specific sentence: first match
-    // wins, and this row sits after it.
+    // `--discovery` has no key row of its own any more (#178 PR 4): a beacon is proved by
+    // each node's own identity key, so the key a discovering node lacks is the one CONSENSUS
+    // still needs, and that is the sentence it is answered. Asserted as the consensus row
+    // rather than as "refused", because the removed row also refused.
     auto discovering = clustered;
     discovering.discoveryAddress = "255.255.255.255:6681";
-    auto const discoveryRefusal = StartupPolicyRejection(discovering);
-    REQUIRE(discoveryRefusal.has_value());
-    CHECK(Unwrap(discoveryRefusal).starts_with("--discovery needs --cluster-key-file"));
+    CHECK(Unwrap(StartupPolicyRejection(discovering)) == ConsensusNeedsClusterKeyRefusal);
+
+    // And with the key, discovery starts: nothing about announcing reads it.
+    auto keyedDiscovering = keyed;
+    keyedDiscovering.discoveryAddress = "255.255.255.255:6681";
+    CHECK_FALSE(StartupPolicyRejection(keyedDiscovering).has_value());
 }
 
 TEST_CASE("NodeConfig: a later enrollment verb drops the earlier one's subject", "[node][config]")

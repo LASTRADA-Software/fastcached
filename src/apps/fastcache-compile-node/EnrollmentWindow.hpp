@@ -3,9 +3,13 @@
 
 #include "NodeConditions.hpp"
 
+#include <FastCache/Cluster/ClusterState.hpp>
+#include <FastCache/Cluster/Roster.hpp>
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
+#include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -36,8 +40,8 @@ inline constexpr std::size_t MaxPendingEnrollments = 64;
 /// How often an open window says so again.
 ///
 /// **Repeating rather than one line at open**, because a one-shot line scrolls away
-/// and this is the one state in which this machine hands its cluster's key to a
-/// stranger that asked. Sixty seconds is short enough that a window left open over a
+/// and this is the one state in which anybody who can reach this machine may put a row
+/// on the list an operator approves from. Sixty seconds is short enough that a window left open over a
 /// lunch break is unmissable in the log and long enough that it is not itself noise.
 inline constexpr std::chrono::seconds EnrollmentWarningInterval { 60 };
 
@@ -50,57 +54,103 @@ enum class EnrollDecision : std::uint8_t
 {
     Closed,   ///< No window is open. Refused.
     Full,     ///< The list is full and this id is not already on it. Refused, nothing recorded.
-    Pending,  ///< Recorded and waiting for a person.
-    Approved, ///< A person approved it; the caller hands the key over. **Reachable once per id.**
-
-    /// This id already collected the key. Refused, and **no key bytes are returned**.
-    ///
-    /// Distinct from `Approved` rather than folded into it, and that distinction is the
-    /// whole of what makes a grant spendable ONCE: while the two shared an enumerator
-    /// the responder served the key on every poll and only the counter was gated, so a
-    /// second hand-over was invisible -- the tally stayed at one and the real joiner
-    /// still got its key on its next poll, which is what an ordinary enrolment looks
-    /// like to an operator.
-    ///
-    /// **The cost of this is real and was accepted rather than argued away.** A joiner
-    /// whose reply was lost is on a machine an operator has already admitted, and it is
-    /// now stranded until somebody approves it again. The idempotent reading that would
-    /// have spared it is honest, and it loses on the trade: one operator action against
-    /// handing the fleet's pre-shared key to anybody who can route to this port and name
-    /// an id that was approved. `peerId` cannot close the gap instead -- #242 settled
-    /// that comparing hosts refuses the documented setup (DNS names, a node dialling
-    /// itself, NAT, VPN, multi-homing) and stops only a third host -- so the spend is
-    /// what carries it, exactly as a lease grant's is (#614). Refused-until-somebody-
-    /// acts is also the direction this codebase fails in by preference: self-healing,
-    /// and visible from the machine being refused.
-    Collected,
-
+    Pending,  ///< Recorded and waiting for a person -- or asked under a key nobody decided about.
+    Approved, ///< A person approved exactly this claim; the caller hands over the roster.
     Rejected, ///< A person refused it.
 };
 
-/// What giving an unserved claim back did.
-///
-/// Its own enum rather than `EnrollControlOutcome`, because the question is not an
-/// operator's: those enumerators answer *what did your command do*, and none of them
-/// can honestly carry *the row moved underneath me*. Reusing `AlreadyInForce` for that
-/// would be a name that reads as reassurance for the one outcome an operator must act
-/// on.
-///
-/// A private enum: nothing transmits or persists these ordinals.
-enum class ClaimReturn : std::uint8_t
+/// What an enrollment ROLE means on this node (#178).
+struct EnrollRoleRow
 {
-    /// The row was still `Collected` and is `Approved` again. The joiner's next poll
-    /// collects, and nothing was lost.
-    Returned,
+    CompileCacheWire::EnrollRole role; ///< The wire role.
+    std::string_view name;             ///< Its one spelling in a list and in a sentence.
 
-    /// No row of that id is on the list any more -- the window was closed, most
-    /// plausibly, which also forgets every pending row.
-    NoSuchRow,
+    /// Whether a request in this role states a consensus endpoint: a member must, because an
+    /// id with no address is a member the cluster counts and cannot reach, and a worker must
+    /// NOT, because a principal has no address anybody dials.
+    bool statesEndpoint;
 
-    /// The row is on the list and is not `Collected`: somebody decided about it between
-    /// the claim being taken and the key read failing. Rare, and the case worth saying
-    /// out loud, since the machine is left holding a consumed collection.
-    AlreadyMoved,
+    /// The principal role an approval records, or absent for a member, which `ClusterAdmit`
+    /// records instead.
+    std::optional<Cluster::PrincipalRole> principal;
+
+    /// The flag that removes a machine an approval admitted in this role, or absent when no
+    /// operator verb does yet.
+    ///
+    /// **Absent for a worker, and that is a gap rather than a design**: `--cluster-forget` is
+    /// `RemoveMember`, which touches members only, and nothing an operator can type proposes
+    /// the `RevokeKey` that would take a principal's key away (#1555). A warning naming
+    /// `--cluster-forget` for a worker would send an operator to a command that removes
+    /// nothing and reports success.
+    std::optional<std::string_view> removalFlag;
+};
+
+/// One row per role this build implements.
+///
+/// A plain array rather than an `EnumTable`, for `KnownEnrollmentDecisions`' reason: a WIRE enum
+/// carries no `Last`. Completeness is asserted against `KnownEnrollRoles` instead.
+inline constexpr std::array EnrollRoleTable {
+    EnrollRoleRow { .role = CompileCacheWire::EnrollRole::Member,
+                    .name = "member",
+                    .statesEndpoint = true,
+                    .principal = std::nullopt,
+                    .removalFlag = "--cluster-forget" },
+    EnrollRoleRow { .role = CompileCacheWire::EnrollRole::Worker,
+                    .name = "worker",
+                    .statesEndpoint = false,
+                    .principal = Cluster::PrincipalRole::Worker,
+                    .removalFlag = std::nullopt },
+};
+
+/// Whether every role this build knows has exactly one row.
+/// @return True when `EnrollRoleTable` is complete and has no duplicate.
+[[nodiscard]] consteval bool EveryEnrollRoleHasARow() noexcept
+{
+    return std::ranges::all_of(CompileCacheWire::KnownEnrollRoles, [](CompileCacheWire::EnrollRole role) {
+        return std::ranges::count(EnrollRoleTable, role, &EnrollRoleRow::role) == 1;
+    });
+}
+
+static_assert(EveryEnrollRoleHasARow(), "every enrollment role needs one EnrollRoleTable row");
+
+/// The row for @p role.
+/// @param role A role the decoder accepted.
+/// @return Its row; the first row for a value no row names, which the assertion above makes unreachable.
+[[nodiscard]] constexpr EnrollRoleRow const& EnrollRoleRowFor(CompileCacheWire::EnrollRole role) noexcept
+{
+    for (auto const& row: EnrollRoleTable)
+        if (row.role == role)
+            return row;
+    return EnrollRoleTable.front();
+}
+
+/// Whether @p roster records @p nodeId holding @p key in @p role -- as a member for a member, and
+/// as a principal in the role's principal role for anything else.
+///
+/// What the leader asks of its own roster before it answers `Approved`, and what the joiner asks
+/// of the roster it is handed before it believes it was admitted: one question, so the two ends
+/// cannot come to mean different things by "admitted". A member row with no key recorded records
+/// no key, and a principal is not a member.
+/// @param roster The roster.
+/// @param nodeId The joiner's id.
+/// @param key The key it asked under.
+/// @param role What it asked to be.
+/// @return True when the roster says exactly that.
+[[nodiscard]] bool RosterRecordsJoiner(Cluster::Roster const& roster,
+                                       std::string_view nodeId,
+                                       Ed25519PublicKey const& key,
+                                       CompileCacheWire::EnrollRole role);
+
+/// What one joiner claims about itself, as a single request carried it.
+///
+/// One value rather than four parameters, because two of them are strings and two adjacent
+/// strings at a call site are two a caller can silently transpose.
+struct JoinerClaim
+{
+    std::string_view nodeId;       ///< The identity it claims.
+    std::string_view raftEndpoint; ///< The consensus address it claims; empty for a worker.
+    CompileCacheWire::EnrollRole role { CompileCacheWire::EnrollRole::Member };   ///< What it asks to be.
+    std::array<std::byte, CompileCacheWire::IdentityPublicKeyBytes> publicKey {}; ///< The key it asks under.
 };
 
 /// What an operator's decision did.
@@ -183,34 +233,30 @@ class EnrollmentWindow
     /// that. A repeat from a different peer host updates the recorded `peerId` rather
     /// than being refused -- see `EnrollmentPendingEntry::peerId` for why the two hosts
     /// are shown and never enforced against each other.
-    /// @param nodeId The identity the joiner claims.
-    /// @param raftEndpoint The consensus address it claims.
+    ///
+    /// **The KEY is the exception, and it is never refreshed** (#178). The first key an id
+    /// asks under is the one the row holds and the one an approval admits; a later poll under
+    /// the same id with another key is another machine, so it is counted in `claimsChanged`,
+    /// answered `Pending`, and never recorded. Refreshing it would let whoever polled last
+    /// replace the key an operator had just compared, between the list and the approval.
+    /// The role is held the same way, for the same reason.
+    ///
+    /// No answer here is spent: an approved claim is answered `Approved` on every poll,
+    /// because what it leads to is a roster, which is no secret (#178).
+    /// @param claim What the joiner claims about itself.
     /// @param peerId The host the kernel says the request came from.
-    /// @return What to answer. `Approved` is returned at most once per approval, and the
-    ///         caller either serves the key or calls `ReturnClaim`.
-    [[nodiscard]] EnrollDecision Offer(std::string_view nodeId, std::string_view raftEndpoint, std::string_view peerId);
+    /// @return What to answer.
+    [[nodiscard]] EnrollDecision Offer(JoinerClaim const& claim, std::string_view peerId);
 
-    /// Give back the one collection an `Approved` answer took, because it was not served.
+    /// Record the fingerprint of the roster just handed to @p nodeId.
     ///
-    /// **The other half of the spend, and it exists so a transient fault does not cost a
-    /// machine its only collection.** `Offer` takes the transition before the caller has
-    /// the key in hand -- it has to, or two polls arriving together both get served --
-    /// so a caller that cannot then read the key file must put it back. Without this, a
-    /// filesystem permission error lasting one second leaves a joiner that can never
-    /// collect and an operator with no signal saying why.
-    ///
-    /// Only a row still `Collected` is returned, so a decision an operator took in
-    /// between is never overwritten by a late failure path.
-    ///
-    /// **It says WHICH nothing it did, and the caller reads it.** A `bool` here was
-    /// discarded at its one call site, which made it a claim with no reader -- and the
-    /// unread value is the one that matters: anything but `Returned` means the repair
-    /// ITSELF failed, leaving a machine holding a consumed collection with nothing
-    /// saying so. That is the state this function exists to prevent, arriving through
-    /// its own fix.
-    /// @param nodeId The id whose claim is being returned.
-    /// @return What happened, so a caller can report the case where nothing did.
-    [[nodiscard]] ClaimReturn ReturnClaim(std::string_view nodeId);
+    /// What `--enroll-list` shows beside the row, so the operator compares the fingerprint the
+    /// leader SENT with the one the joiner printed. The latest one wins, because the latest is
+    /// the one the joiner holds: it stops polling once it is told `Approved`.
+    /// @param nodeId Who was handed it.
+    /// @param fingerprint Its `Cluster::DigestOfRoster`.
+    void NoteServed(std::string_view nodeId,
+                    std::array<std::byte, CompileCacheWire::RosterFingerprintBytes> const& fingerprint);
 
     /// The entry carrying @p nodeId, as a copy.
     ///

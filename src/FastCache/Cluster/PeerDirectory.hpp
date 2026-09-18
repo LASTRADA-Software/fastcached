@@ -2,10 +2,12 @@
 #pragma once
 
 #include <FastCache/Core/Clock.hpp>
+#include <FastCache/Core/Ed25519.hpp>
 
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -42,13 +44,17 @@ struct KnownPeer
     std::string nodeId;       ///< How membership names it.
     std::string raftEndpoint; ///< Where its Raft peer server answers.
 
-    /// Whether this peer has proved it holds the cluster key.
+    /// Whether this peer has proved the key the cluster holds for its id.
     ///
     /// Seen and admitted are different facts and are kept apart on purpose. A
     /// beacon is unauthenticated by construction -- anybody on the segment can
     /// send one -- so a directory that recorded "seen" as "trusted" would let a
     /// broadcast alone drive a membership change.
     bool authenticated { false };
+
+    /// The key it proved, exactly when `authenticated` (#178): what a desire built from this peer
+    /// carries, so the cluster records the key discovery saw rather than no opinion about one.
+    std::optional<Ed25519PublicKey> provenKey;
 
     /// When its most recent beacon arrived.
     std::chrono::steady_clock::time_point lastSeen {};
@@ -112,17 +118,18 @@ class PeerDirectory
     /// @return What was done with it, so a caller can report the one that is a fault.
     BeaconOutcome NoteBeacon(std::string_view clusterId, std::string_view nodeId, std::string_view raftEndpoint);
 
-    /// Record that a peer proved it holds the cluster key.
+    /// Record that a peer proved the key the cluster holds for its id.
     ///
     /// Separate from `NoteBeacon` so that the authenticated bit can only ever be
     /// set by a completed handshake. A peer that changes the endpoint it
-    /// advertises **loses** it: the endpoint is inside the MAC, so a proof
+    /// advertises **loses** it: the endpoint is inside the signature, so a proof
     /// authenticates one endpoint and not the node in general, and carrying the
     /// bit across a change would admit an address nobody proved.
     /// @param nodeId Who proved it.
     /// @param raftEndpoint The endpoint they proved for.
+    /// @param key The key they proved it with.
     /// @return True when a peer was marked, false when none is known by that id.
-    bool MarkAuthenticated(std::string_view nodeId, std::string_view raftEndpoint);
+    bool MarkAuthenticated(std::string_view nodeId, std::string_view raftEndpoint, Ed25519PublicKey const& key);
 
     /// Forget peers whose last beacon is older than the expiry.
     /// @return How many were forgotten.

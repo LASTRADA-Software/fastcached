@@ -216,9 +216,9 @@
 #cluster_id:
 
 # announce this node on the segment and listen for peers here; off unless
-# given. Needs --listen-raft and --cluster-key-file. A peer that proves the key
-# joins as a learner, counted by no quorum; --cluster-admit promotes it to a
-# voter.
+# given. Needs --listen-raft. A peer counts only when it proves the key the
+# cluster holds for it, and joins as a learner, counted by no quorum;
+# --cluster-admit promotes it. Any other key is reported, never admitted.
 #discovery:
 
 # port peers unicast their discovery challenges and proofs to; kernel-chosen
@@ -229,12 +229,12 @@
 #discovery_reply_port:
 
 # the cluster's pre-shared key. A FILE and not a flag: a command line is
-# readable through ps, and a key that leaks admits a node whose objects the
-# whole fleet then caches. REQUIRED with listen_raft: every consensus
-# connection proves it before a message is read. Discovery proves the cluster
-# with it, and the scheduler SIGNS lease grants with it. Without one, a grant
-# is unsigned and any client that can reach a worker's compile port can spend
-# it.
+# readable through ps. REQUIRED with listen_raft: the scheduler SIGNS lease
+# grants with it, and a node proves itself on the node port with it.
+# Consensus, discovery and enrollment prove each node's OWN identity key
+# instead, and nothing hands this file over: place it on every member.
+# Without one, a grant is unsigned and any client that can reach a worker's
+# compile port can spend it.
 #cluster_key_file:
 
 # credential this node REQUIRES on its scheduler verbs. The inbound half of

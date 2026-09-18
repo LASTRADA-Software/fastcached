@@ -3,10 +3,11 @@
 
 #include <FastCache/Cluster/DiscoveryWire.hpp>
 #include <FastCache/Cluster/PeerDirectory.hpp>
+#include <FastCache/Consensus/IRaftPeerKeys.hpp>
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/ISecureRandom.hpp>
 #include <FastCache/Core/Logger.hpp>
-#include <FastCache/Core/SecureBytes.hpp>
+#include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Net/IDatagramSocket.hpp>
 
 #include <chrono>
@@ -38,12 +39,6 @@ struct DiscoveryConfig
     /// and where the two error messages it can produce are worth telling apart.
     DatagramAddress beaconAddress;
 
-    /// The cluster's pre-shared key.
-    ///
-    /// Never sent, and nothing derived from it is either. It only ever appears
-    /// inside an HMAC over a nonce this node chose or was given.
-    SecureByteBuffer presharedKey;
-
     /// How often this node announces itself.
     std::chrono::seconds beaconInterval { 15 };
 
@@ -64,12 +59,14 @@ enum class DiscoveryEvent : std::uint8_t
     PeerSeen,          ///< A beacon was recorded; a challenge went out.
     ChallengeWithheld, ///< A beacon was recorded, but no nonce could be drawn, so no challenge went out.
     ChallengeAnswered, ///< A challenge arrived and was answered with a proof.
-    PeerAuthenticated, ///< A proof checked out; the peer may now be proposed.
-    ProofRejected,     ///< A proof did not check out, and was discarded.
+    PeerAuthenticated, ///< A proof verified under the key the roster holds for its id; the peer may be desired.
+    PeerUnknownKey,    ///< A proof verified under a key the roster does not hold for its id: reported, not desired.
+    PeerRevokedKey,    ///< A proof verified under a key the roster has revoked: reported, not desired.
+    ProofRejected,     ///< A proof did not verify, answered nothing this node asked, or claimed another endpoint.
 };
 
-/// LAN discovery: find peers, prove who holds the cluster key, and say who may
-/// be admitted.
+/// LAN discovery: find peers, learn which identity key each one holds, and say which of
+/// them the cluster already knows (#178).
 ///
 /// The one piece of this feature that speaks to the network, and it is kept as
 /// thin as that allows: what a datagram means lives in `DiscoveryWire`, who is
@@ -78,11 +75,18 @@ enum class DiscoveryEvent : std::uint8_t
 /// so an entire segment forming a cluster is a loop in a unit test rather than
 /// several processes and a sleep.
 ///
-/// **It never changes membership itself.** It answers "who has proved they hold
-/// the key, and where do they answer", and a caller decides what to propose. That
-/// separation is deliberate: admitting a node is a Raft decision that only a
-/// leader may make, and a discovery layer that proposed directly would have every
-/// node in the segment proposing the same change at once.
+/// **It never changes membership itself.** It answers "who has proved a key the roster
+/// knows, and where do they answer", and a caller decides what to propose. That separation
+/// is deliberate: admitting a node is a Raft decision that only a leader may make, and a
+/// discovery layer that proposed directly would have every node in the segment proposing
+/// the same change at once.
+///
+/// **And it admits nobody new** (#178). Under the shared key a proof WAS membership, so any
+/// holder was authenticated; now a proof names a KEY, and only a key the roster already holds
+/// for that id authenticates. A key the roster does not know, or has revoked, is reported --
+/// counted, and named in the log with the id and the address it came from -- and never
+/// handed on: LAN auto-admission ends, and admitting a machine is an operator's act
+/// (`--enroll-approve`, or `--cluster-admit ...@<key>`).
 class DiscoveryService
 {
   public:
@@ -113,11 +117,24 @@ class DiscoveryService
     /// every beacon from every peer provokes it until that is fixed (#1527).
     static constexpr std::chrono::seconds NoNonceReportInterval { 60 };
 
+    /// How often a proof under a key the roster does not accept is reported, at most.
+    ///
+    /// Throttled for `UnnameableReportInterval`'s reason, and more pointedly: a proof under a
+    /// FRESH key costs its sender nothing to make, so anything on the segment can provoke one
+    /// per beacon. Every one is COUNTED; the log carries the latest, by id, key and address,
+    /// plus how many it stands for.
+    static constexpr std::chrono::seconds UnacceptedKeyReportInterval { 60 };
+
+    /// @param keys This node's own key, which signs its proofs, and the roster that says
+    ///        whose key every other id is; must outlive this.
+    /// @param metrics Where proofs under keys the roster does not accept are counted.
     DiscoveryService(IDatagramSocket& socket,
                      IClock& clock,
                      ISecureRandom& random,
                      PeerDirectory& directory,
                      DiscoveryConfig config,
+                     Consensus::IRaftPeerKeys const& keys,
+                     IMetricsSink& metrics,
                      ILogger& logger);
 
     /// Announce this node on the segment.
@@ -155,11 +172,28 @@ class DiscoveryService
     ///         reported here and leaves any earlier challenge to that peer as it was.
     [[nodiscard]] bool IssueChallenge(DiscoveryWire::Beacon const& peer, DatagramAddress const& replyTo);
 
+    /// Judge a proof that answered a challenge this node issued.
+    /// @param proof What arrived.
+    /// @param challenge What this node asked.
+    /// @param from Where it came from, for a report.
+    /// @return What it proved.
+    [[nodiscard]] DiscoveryEvent JudgeProof(DiscoveryWire::Proof const& proof,
+                                            DiscoveryWire::Challenge const& challenge,
+                                            DatagramAddress const& from);
+
+    /// Report a proof under a key the roster does not accept, throttled.
+    /// @param revoked Whether the key is one the roster revoked, rather than one it never held.
+    /// @param proof What arrived.
+    /// @param from Where it came from.
+    void ReportUnacceptedKey(bool revoked, DiscoveryWire::Proof const& proof, DatagramAddress const& from);
+
     IDatagramSocket& _socket;
     IClock& _clock;
     ISecureRandom& _random;
     PeerDirectory& _directory;
     DiscoveryConfig _config;
+    Consensus::IRaftPeerKeys const& _keys;
+    IMetricsSink& _metrics;
     ILogger& _logger;
 
     /// Outstanding challenges, keyed by the node they were sent to.
@@ -181,6 +215,12 @@ class DiscoveryService
     /// When a challenge withheld for want of a nonce may next be reported; value-initialized
     /// for the reason `_nextUnnameableReport` is.
     TimePoint _nextNoNonceReport {};
+
+    /// When a proof under a key the roster does not accept may next be reported, and how many
+    /// have arrived since the last one was; value-initialized for `_nextUnnameableReport`'s
+    /// reason.
+    TimePoint _nextUnacceptedKeyReport {};
+    std::size_t _unacceptedSinceReport { 0 };
 };
 
 } // namespace FastCache::Cluster

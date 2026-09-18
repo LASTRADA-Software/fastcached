@@ -573,11 +573,11 @@ struct NodeConfig
     /// can read a mode-0600 file. A leaked key admits a node, and an admitted node
     /// returns objects the whole fleet then caches.
     ///
-    /// Read by **two** surfaces, which is worth stating because it used to be one:
-    /// discovery proves the cluster's identity with it, and the scheduler signs
-    /// lease grants with it (`Distributed/LeaseToken.hpp`). Without one a grant is a
-    /// bare serial and a worker has nothing to check, so anybody who can reach a
-    /// compile port can spend it.
+    /// Read by **two** surfaces: the scheduler signs lease grants with it
+    /// (`Distributed/LeaseToken.hpp`), and a node proves itself on the node port with it.
+    /// Discovery and enrollment read it until #178 moved both to each node's own identity key.
+    /// Without one a grant is a bare serial and a worker has nothing to check, so anybody who
+    /// can reach a compile port can spend it.
     std::filesystem::path clusterKeyFile;
 
     /// The name the platform's supervisor keys this worker's registration on.
@@ -1401,9 +1401,8 @@ inline constexpr std::string_view ConsensusNamesNoSelfPeerRefusal =
 inline constexpr std::string_view ConsensusNeedsClusterKeyRefusal =
     "--listen-raft turns consensus on, and consensus needs --cluster-key-file: the cluster's pre-shared key no "
     "longer proves anything between members, which each member's own identity key does, but it still signs the "
-    "scheduler's leases, proves a member on the node port and is what an enrollment window hands a joiner. Give "
-    "every member the same key file -- generate one with `head -c 32 /dev/urandom | base64`, or run --enroll-from "
-    "against a member to be handed it -- or drop --listen-raft to run one machine alone";
+    "scheduler's leases and proves a member on the node port. Give every member the same key file -- generate one "
+    "with `head -c 32 /dev/urandom | base64` -- or drop --listen-raft to run one machine alone";
 
 /// Why a node with no worker, no scheduler, no consensus and no cache tier is refused.
 inline constexpr std::string_view NodeRunsNothingRefusal =

@@ -292,7 +292,7 @@ if(violationCount GREATER 0)
     message(FATAL_ERROR
         "A second MAC construction has appeared under the cluster's pre-shared key:\n"
         "${violationReport}\n\n"
-        "That key already signs a discovery proof and a lease token, and one key serving two "
+        "That key already signs a node proof and a lease token, and one key serving two "
         "hand-rolled constructions is how a tag produced for one purpose comes to be accepted "
         "for the other (#402). Only these may name it:\n\n"
         "${rulebook}\n"

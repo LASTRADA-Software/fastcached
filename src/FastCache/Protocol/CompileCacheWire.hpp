@@ -172,7 +172,17 @@ using WireVersion = std::uint8_t;
 /// client reading a version-10 receipt would report a key nobody recorded as absent. A key
 /// that reaches the leader and is dropped on the way is the worst of the three: a member
 /// admitted with no key while its operator believes it has one.
-inline constexpr WireVersion CurrentVersion = 11;
+///
+/// **12 took the secret out of ENROLL and put identity in** (#178). The request carries the
+/// joiner's ROLE and its identity KEY beside its id and endpoint, so its arity went from two to
+/// four; the approved reply carries the cluster's ROSTER where it carried the cluster key; and
+/// a pending row reports the joiner's role, its key and the fingerprint of the roster it was
+/// last handed. A version-11 joiner would send two fields a version-12 leader refuses, and a
+/// version-11 leader would hand a version-12 joiner a secret where it expects a roster -- which
+/// a version-12 decoder reads as a malformed roster, but only after the secret crossed the
+/// wire. Refused by version, before a byte of the request is read, is the one outcome that
+/// hands nothing to anybody.
+inline constexpr WireVersion CurrentVersion = 12;
 
 /// The oldest version this build still accepts. Equal to `CurrentVersion` while
 /// only one version exists; widen the range when a second one ships and this
@@ -314,7 +324,11 @@ inline constexpr WireVersion CurrentVersion = 11;
 /// fields, and a version-10 request answered with it would be answered in a grammar that
 /// version has no reading for -- and a version-10 request is two fields, which the exact-arity
 /// decoder refuses anyway.
-inline constexpr WireVersion MinSupportedVersion = 11;
+///
+/// Version 12 moves it for version 3's reason, and for a sharper one of its own: a version-11
+/// ENROLL is answered, when approved, with the cluster KEY, and a leader that still accepted one
+/// would have to either refuse it anyway or keep a secret-handing path alive for it.
+inline constexpr WireVersion MinSupportedVersion = 12;
 
 /// Size of the fixed request header: magic, version, op, payload length.
 inline constexpr std::size_t RequestHeaderSize = WireFrame::HeaderSize;
@@ -481,10 +495,12 @@ enum class Op : std::uint8_t
     /// refused by the digest the encoding starts with rather than misreading it.
     NodeMetrics = 0x0F,
 
-    // Runtime enrollment. A window an operator opens on the seed so a fresh keyless
-    // install can ask to join and be handed the cluster key, instead of that key being
-    // placed on all forty machines by hand before any of them can start
-    // ([#1298](https://github.com/LASTRADA-Software/fastcached/issues/1298)).
+    // Runtime enrollment. A window an operator opens on the seed so a fresh install can ask
+    // to join under the identity key it minted, and be told who else is in the cluster,
+    // instead of every member's key being typed onto forty machines by hand
+    // ([#1298](https://github.com/LASTRADA-Software/fastcached/issues/1298), #178). **No
+    // secret crosses this exchange in either direction**: the request carries a public key
+    // and the approved reply carries the roster, which is public too.
     //
     // Its own family and its own block, deliberately away from the distributed-execution
     // rows: that block's section comment states that none of it is `preAuth`, and `Enroll`
@@ -498,8 +514,8 @@ enum class Op : std::uint8_t
     /// `PreAuthVerbsAreBounded` had never discriminated anything: it was satisfied by a
     /// table that was going to satisfy it anyway. This row is the first that makes it
     /// load-bearing, which is why it declares `BoundedTo(MaxEnrollPayload)` -- a ceiling
-    /// far under the control cap, because the whole request is an identity and an
-    /// endpoint and the peer sending it has presented nothing.
+    /// far under the control cap, because the whole request is an identity, an endpoint, a
+    /// role and a public key, and the peer sending it has presented nothing.
     ///
     /// It has to be pre-auth. The machine asking is by construction the one that holds
     /// no secret of this cluster -- that is the entire problem being solved -- so a
@@ -1110,25 +1126,10 @@ enum class ErrorCode : std::uint8_t
     /// will go on being answered until a person decides something.
     EnrollmentFull = 0x23,
 
-    /// This id was approved, and the key it was approved for has already been collected.
-    ///
-    /// **The spend, and it is what makes the grant worth one hand-over rather than one
-    /// per poll.** The window moves the entry to `Collected` on the transition that
-    /// hands the key out, under its own lock, and every later request naming that id is
-    /// answered with this and no payload -- so there are no key bytes to serve rather
-    /// than a decision not to serve them.
-    ///
-    /// Its own code rather than `EnrollmentClosed` or a `Rejected` outcome, because the
-    /// three send an operator to three different places: re-open a window, argue with
-    /// whoever refused this machine, or find out where the key went. A joiner meeting
-    /// this and holding no key was beaten to it -- either by its own earlier attempt
-    /// whose reply was lost, or by somebody else answering to its id -- and in both
-    /// cases the way forward is one operator approving it again.
-    ///
-    /// Counted, because a healthy enrolment produces exactly none of these: a joiner
-    /// that collects successfully writes the key and exits. A rise names both causes and
-    /// the RATE separates them -- one is a lost reply, a run of them is not.
-    EnrollmentAlreadyCollected = 0x24,
+    // 0x24 was `EnrollmentAlreadyCollected`, the refusal that made a key hand-over spendable
+    // once. An approved enrollment no longer carries a secret (#178), so there is nothing to
+    // spend; the byte is RETIRED and never reused, because a reader that still names it would
+    // read a new code under it as a spent grant.
 
     /// A fleet read named a section or a range this build does not serve.
     ///
@@ -1333,7 +1334,7 @@ enum class VerbFamily : std::uint8_t
     /// reason that generalises past the fact it was drawn from.
     Node,
 
-    /// Lets a machine that holds no cluster secret ask to be given one.
+    /// Lets a machine the cluster has never heard of ask to be admitted under the key it minted.
     ///
     /// **Its own family because one of its two verbs is `OpenBeforeAuth`, and no other
     /// family could hold that without changing what it means.** The distributed-execution
@@ -1960,7 +1961,7 @@ inline constexpr std::array OpTable {
     // comment a reviewer reads to understand this table's security posture.
     OpDescriptor { .code = Op::Enroll,
                    .name = "enroll",
-                   .fieldCount = 2, // nodeId, raftEndpoint
+                   .fieldCount = 4, // nodeId, raftEndpoint, role, publicKey
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
                    // The second such row this table has ever held, and the first that is
                    // not AUTH. `PreAuthVerbsAreBounded` is what keeps the ceiling below
@@ -2197,9 +2198,6 @@ inline constexpr std::array ErrorTable {
     ErrorDescriptor { .code = ErrorCode::EnrollmentFull,
                       .name = "enrollment-full",
                       .defaultMessage = "the enrollment window is full; nothing was recorded" },
-    ErrorDescriptor { .code = ErrorCode::EnrollmentAlreadyCollected,
-                      .name = "enrollment-already-collected",
-                      .defaultMessage = "the cluster key for this id has already been collected" },
     ErrorDescriptor { .code = ErrorCode::UnknownFleetSelector,
                       .name = "unknown-fleet-selector",
                       .defaultMessage = "this build serves no fleet section or range by that name" },
@@ -5106,13 +5104,14 @@ struct NodeRuntimeFields
     /// Whether this node's enrollment window is open, or disengaged on a node that runs
     /// no enrollment surface.
     ///
-    /// **The one state in this record where a stranger can be handed the cluster key**,
-    /// so it is reported here rather than left to the logs: an operator who opened a
+    /// **The one state in this record where a stranger can put itself on the list an
+    /// operator approves from**, so it is reported here rather than left to the logs: an
+    /// operator who opened a
     /// window and walked away has no other way to find out, and the repeating warning
     /// that exists for the same reason only reaches whoever is reading that node's log.
     ///
     /// A STATE, and therefore in the snapshot rather than exported as a gauge: the
-    /// metrics tally the events -- windows opened, keys handed over -- because a counter
+    /// metrics tally the events -- windows opened, rosters served -- because a counter
     /// is a tally and a synthetic gauge built out of one would be a second spelling of
     /// this field that can disagree with it.
     std::optional<WireEnrollmentState> enrollment {};
@@ -5820,27 +5819,60 @@ struct CordonFields
 /// Explicit values because these bytes are transmitted.
 enum class EnrollOutcome : std::uint8_t
 {
-    /// Recorded, and nobody has decided. **Carries no key bytes**, and a client must
-    /// assert that rather than assume it: a bug that handed the cluster key out here
-    /// would give it to every machine that ever asked, and would look exactly like
-    /// working software from both ends.
+    /// Not admitted yet: nobody has decided, or an approval has not reached the leader's own
+    /// roster. **Carries no roster**, and a client asserts that rather than assumes it -- the
+    /// roster names every member and where it answers, which goes to a machine an operator
+    /// approved and to nobody else.
     Pending = 0x01,
 
-    /// An operator approved this id, and the payload's second field IS the cluster key.
+    /// The cluster records this joiner, and the payload's second field IS the roster
+    /// (`Cluster::EncodeRoster`): every member's id, consensus endpoint, seat and key, every
+    /// principal, every revoked key. **No secret, so no spend** (#178): the answer is the same
+    /// on every poll, and a joiner whose reply was lost simply asks again.
     ///
-    /// **Spendable once.** The entry moves to `Collected` under the window's lock on the
-    /// transition that produces this outcome, so a replay of the exchange is REFUSED --
-    /// `ErrorCode::EnrollmentAlreadyCollected`, carrying no payload and therefore no key
-    /// bytes by construction. It is a refusal rather than a `Rejected` reply because the
-    /// joiner needs a sentence: *the key already went to this id* and *ask an operator to
-    /// approve you again* are what it must be told, and a bare outcome byte can carry
-    /// neither.
+    /// Answered only once the LEADER's applied roster records the joiner under the key it
+    /// asked with, so a joiner that is told `Approved` can check its own entry in the roster
+    /// it was handed -- and a roster that lacks it was not produced by this cluster.
     Approved = 0x02,
 
-    /// An operator refused this id. No key, and asking again will not change it until
+    /// An operator refused this id. No roster, and asking again will not change it until
     /// that operator decides otherwise.
     Rejected = 0x03,
 };
+
+/// What a joiner asks to be admitted as (#178).
+///
+/// Explicit values because these bytes are transmitted.
+enum class EnrollRole : std::uint8_t
+{
+    /// A consensus member: it states the endpoint its consensus port answers on, and an
+    /// approval records it as a member holding the key it asked with.
+    Member = 0x01,
+
+    /// A worker principal: a machine that never joins consensus -- a roaming worker whose
+    /// address a VPN reassigns -- admitted by its key alone. It states NO endpoint, because it
+    /// has none anybody dials.
+    Worker = 0x02,
+};
+
+/// Every role this build implements, as ONE list, for `KnownEnrollmentDecisions`' reason: the
+/// decoder refuses a byte outside it and the renderer asserts a label for every member.
+inline constexpr std::array KnownEnrollRoles { EnrollRole::Member, EnrollRole::Worker };
+
+/// Whether @p raw names a role this build understands.
+/// @param raw The role byte, as received.
+/// @return True when it names one.
+[[nodiscard]] constexpr bool IsKnownEnrollRole(std::uint8_t raw) noexcept
+{
+    return std::ranges::any_of(KnownEnrollRoles, [raw](EnrollRole role) { return static_cast<std::uint8_t>(role) == raw; });
+}
+
+/// How many bytes a roster fingerprint carries on the wire: one SHA-256 digest.
+///
+/// Spelled HERE rather than taken from `Core/Sha256.hpp`, for `NodeChallengeBytes`' reason:
+/// this header is what the launcher compiles in. `EnrollmentResponder.cpp` pins the two to each
+/// other, where both are visible.
+inline constexpr std::size_t RosterFingerprintBytes = 32;
 
 /// What an operator is asking of the window.
 ///
@@ -5850,7 +5882,7 @@ enum class EnrollControlVerb : std::uint8_t
     Open = 0x01,    ///< Start accepting requests. Names no subject.
     Close = 0x02,   ///< Stop accepting them, and forget what was pending. Names no subject.
     List = 0x03,    ///< Report the window and everything waiting. Names no subject.
-    Approve = 0x04, ///< Admit the named id to the cluster and let it collect the key.
+    Approve = 0x04, ///< Admit the named id, under the key it asked with, and hand it the roster.
     Reject = 0x05,  ///< Refuse the named id.
 };
 
@@ -5883,34 +5915,53 @@ enum class EnrollControlVerb : std::uint8_t
     return verb == EnrollControlVerb::Approve || verb == EnrollControlVerb::Reject;
 }
 
-/// A keyless machine asking to be let in.
+/// A machine asking to be let in, under the identity it minted.
+///
+/// **The key is PUBLIC and the request carries nothing secret** (#178): what the joiner proves
+/// later, on every wire, is that it holds the private half -- and what an operator checks now
+/// is that the key the leader lists is the one the joiner printed.
 struct EnrollRequest
 {
-    std::string_view nodeId;       ///< The identity it minted into its own `--cluster-dir`.
-    std::string_view raftEndpoint; ///< host:port its consensus port will answer on.
+    std::string_view nodeId;                ///< The identity it minted into its own `--cluster-dir`.
+    std::string_view raftEndpoint;          ///< host:port its consensus port will answer on; empty for a `Worker`.
+    EnrollRole role { EnrollRole::Member }; ///< What it asks to be admitted as.
+    std::span<std::byte const> publicKey;   ///< Its identity key: `IdentityPublicKeyBytes` of it.
 };
 
-/// The same, as views into a received payload.
+/// The same, decoded from a received payload. The id and the endpoint are views; the role and
+/// the key are values, because the decoder has already checked what they are.
 struct EnrollView
 {
-    std::span<std::byte const> nodeId;
-    std::span<std::byte const> raftEndpoint;
+    std::span<std::byte const> nodeId;                          ///< The id, as sent.
+    std::span<std::byte const> raftEndpoint;                    ///< The endpoint, as sent; empty for a `Worker`.
+    EnrollRole role { EnrollRole::Member };                     ///< What it asks to be admitted as.
+    std::array<std::byte, IdentityPublicKeyBytes> publicKey {}; ///< Its identity key.
 };
 
 /// Frame an ENROLL request.
 ///
-/// Two fields for `ClusterAdmit`'s reason: an id with no address is a member the
-/// cluster counts towards quorum and cannot reach. The joiner states both because it
-/// is the only party that knows either -- the leader has never heard of this machine.
-/// @param request Who is asking, and where it will answer.
+/// Four fields. The id and the endpoint for `ClusterAdmit`'s reason -- an id with no address is
+/// a member the cluster counts towards quorum and cannot reach -- the role because a member and
+/// a worker are admitted by different commands, and the key because it is what the cluster
+/// records instead of handing a secret back. The joiner states all four because it is the only
+/// party that knows any of them.
+/// @param request Who is asking, as what, under which key, and where it will answer.
 /// @param version Version to advertise.
 /// @return The framed request.
 [[nodiscard]] inline std::vector<std::byte> EncodeEnroll(EnrollRequest const& request, WireVersion version = CurrentVersion)
 {
-    return Detail::EncodeRequest(version, Op::Enroll, { AsBytes(request.nodeId), AsBytes(request.raftEndpoint) });
+    std::array<std::byte, 1> const role { static_cast<std::byte>(request.role) };
+    return Detail::EncodeRequest(
+        version,
+        Op::Enroll,
+        { AsBytes(request.nodeId), AsBytes(request.raftEndpoint), std::span<std::byte const> { role }, request.publicKey });
 }
 
 /// Split an ENROLL payload.
+///
+/// Refuses a role this build does not implement and a key that is not exactly one key wide: a
+/// prefix of a key is a different key, and an operator would be shown a string no machine holds.
+/// Whether the endpoint suits the role is the RESPONDER's to refuse, with a sentence of its own.
 /// @param payload The bytes following the request header.
 /// @return The fields, or nullopt when malformed.
 [[nodiscard]] inline std::optional<EnrollView> DecodeEnrollPayload(std::span<std::byte const> payload)
@@ -5918,15 +5969,18 @@ struct EnrollView
     auto const fields = SplitFields(payload, OpFieldCount(Op::Enroll));
     if (!fields.has_value())
         return std::nullopt;
-    return EnrollView { .nodeId = (*fields)[0], .raftEndpoint = (*fields)[1] };
+    auto const role = (*fields)[2];
+    auto const key = (*fields)[3];
+    if (role.size() != 1 || !IsKnownEnrollRole(static_cast<std::uint8_t>(role[0])) || key.size() != IdentityPublicKeyBytes)
+        return std::nullopt;
+    auto view = EnrollView {
+        .nodeId = (*fields)[0], .raftEndpoint = (*fields)[1], .role = static_cast<EnrollRole>(role[0]), .publicKey = {}
+    };
+    std::ranges::copy(key, view.publicKey.begin());
+    return view;
 }
 
 /// What an ENROLL was answered with, as views into the reply payload.
-///
-/// A `*View` and named as one, because `clusterKey` is the whole point of the reply
-/// and copying it would put a second copy of the cluster's secret on the heap under no
-/// wiping allocator. The one consumer reads it in scope, into a `SecureByteBuffer`, and
-/// writes it to disk.
 struct EnrollReplyView
 {
     /// What the leader decided, so far.
@@ -5934,26 +5988,26 @@ struct EnrollReplyView
     /// Defaulted to `Pending` EXPLICITLY, and not with `{}`: this enum starts at `0x01`,
     /// so a value-initialized member would hold 0, which names no enumerator
     /// (`bugprone-invalid-enum-default-initialization`). `Pending` rather than any other
-    /// is the harmless one -- it is the outcome documented to carry no key bytes, so a
-    /// view nobody filled in reads as *no key here* rather than as an approval.
+    /// is the harmless one -- it is the outcome documented to carry no roster, so a view
+    /// nobody filled in reads as *not admitted* rather than as an approval.
     EnrollOutcome outcome { EnrollOutcome::Pending };
 
-    std::span<std::byte const> clusterKey {}; ///< The key, and EMPTY for every outcome but `Approved`.
+    std::span<std::byte const> roster {}; ///< The roster, and EMPTY for every outcome but `Approved`.
 };
 
 /// Frame the payload of an ENROLL reply.
 ///
-/// **The key travels as a field of its own so that "there is no key here" is a length
-/// of zero rather than a convention.** A client asserts that length, which is the only
-/// assertion that can catch a server handing the key out on `Pending` -- an outcome
-/// byte is equally correct in both the healthy and the broken build.
+/// **The roster travels as a field of its own so that "there is no roster here" is a length of
+/// zero rather than a convention.** A client asserts that length, which is the only assertion
+/// that can catch a server handing the roster to a machine nobody approved -- an outcome byte is
+/// equally correct in both the healthy and the broken build.
 /// @param outcome What was decided.
-/// @param clusterKey The key for `Approved`, empty otherwise.
+/// @param roster `Cluster::EncodeRoster(Cluster::ProjectRoster(state))`'s bytes for `Approved`, empty otherwise.
 /// @return The reply payload, to be carried by `EncodeReply(Status::Ok, ...)`.
-[[nodiscard]] inline std::vector<std::byte> EncodeEnrollReply(EnrollOutcome outcome, std::span<std::byte const> clusterKey)
+[[nodiscard]] inline std::vector<std::byte> EncodeEnrollReply(EnrollOutcome outcome, std::span<std::byte const> roster)
 {
     std::array<std::byte, 1> const tag { static_cast<std::byte>(outcome) };
-    return WireFields::Encode({ std::span<std::byte const> { tag }, clusterKey });
+    return WireFields::Encode({ std::span<std::byte const> { tag }, roster });
 }
 
 /// Read an ENROLL reply payload back.
@@ -5962,7 +6016,7 @@ struct EnrollReplyView
 /// the opposite of `DecodeNodeStatus`' rule for an unknown surface tag and is the right
 /// answer here: a status report may be partially understood and still useful, while a
 /// joiner that cannot tell *approved* from *rejected* has no safe default -- treating
-/// an unknown outcome as pending polls forever, and treating it as approved reads a key
+/// an unknown outcome as pending polls forever, and treating it as approved reads a roster
 /// out of a field that may hold anything.
 /// @param payload The reply payload.
 /// @return The fields, or nullopt when malformed.
@@ -5983,7 +6037,7 @@ struct EnrollReplyView
         default:
             return std::nullopt;
     }
-    return EnrollReplyView { .outcome = static_cast<EnrollOutcome>(tag[0]), .clusterKey = (*fields)[1] };
+    return EnrollReplyView { .outcome = static_cast<EnrollOutcome>(tag[0]), .roster = (*fields)[1] };
 }
 
 /// Frame an ENROLL-CONTROL request.
@@ -6007,8 +6061,8 @@ struct EnrollControlView
     /// Defaulted to `List` EXPLICITLY, for `EnrollReplyView::outcome`'s reason: this
     /// enum starts at `0x01`, so `{}` would hold a 0 that names no enumerator. `List` is
     /// the choice among the five because it is the only one that CHANGES nothing -- a
-    /// view nobody filled in must not read as `Open`, which is the verb that makes this
-    /// node's cluster key askable for by anyone who can reach the port.
+    /// view nobody filled in must not read as `Open`, which is the verb that lets anyone
+    /// who can reach the port put a row on the list an operator reads.
     EnrollControlVerb verb { EnrollControlVerb::List };
 
     std::span<std::byte const> subject {}; ///< The id, empty for the verbs that name none.
@@ -6042,10 +6096,14 @@ struct EnrollControlView
 /// Explicit values because these bytes are transmitted.
 enum class EnrollmentDecision : std::uint8_t
 {
-    Pending = 0x01,   ///< Waiting for a person.
-    Approved = 0x02,  ///< Approved, and the key has not been collected yet.
-    Collected = 0x03, ///< The key was handed over. Approving again is refused, not repeated.
-    Rejected = 0x04,  ///< Refused by a person.
+    Pending = 0x01,  ///< Waiting for a person.
+    Approved = 0x02, ///< Admitted; every poll from now on is handed the roster.
+
+    // 0x03 was `Collected`, the state a spendable-once key hand-over moved a row into (#178
+    // retired it with the secret). RETIRED and never reused: a reader that still names it would
+    // show an operator a row that collected something.
+
+    Rejected = 0x04, ///< Refused by a person.
 };
 
 /// Every decision this build implements, as ONE list.
@@ -6055,14 +6113,14 @@ enum class EnrollmentDecision : std::uint8_t
 /// asserts at compile time that it has a label for every member. A second list would
 /// catch an enumerator going away and be blind to one ARRIVING -- which on the renderer
 /// means a row rendering as whatever a fallback said, in the list somebody reads before
-/// handing over the fleet's key.
+/// admitting a machine to the fleet.
 ///
 /// `EnrollmentDecision` cannot be an `EnumTable`: it is a WIRE enum, so a trailing
 /// `Last` would permanently claim a byte, which is the reason `ErrorCode` has none
 /// either.
-inline constexpr std::array KnownEnrollmentDecisions {
-    EnrollmentDecision::Pending, EnrollmentDecision::Approved, EnrollmentDecision::Collected, EnrollmentDecision::Rejected
-};
+inline constexpr std::array KnownEnrollmentDecisions { EnrollmentDecision::Pending,
+                                                       EnrollmentDecision::Approved,
+                                                       EnrollmentDecision::Rejected };
 
 /// Whether @p raw names a decision this build understands.
 /// @param raw The decision byte, as received.
@@ -6113,6 +6171,27 @@ struct EnrollmentPendingEntry
     std::uint32_t claimsChanged { 0 };
 
     EnrollmentDecision decision { EnrollmentDecision::Pending }; ///< What has been decided about it.
+
+    EnrollRole role { EnrollRole::Member }; ///< What it asked to be admitted as.
+
+    /// The identity key it asked with, WHOLE (#178).
+    ///
+    /// **This is what an operator approves**, and the comparison is the whole strength of an
+    /// enrollment now that no secret is handed out: the joiner prints its key, the list shows
+    /// the key the leader recorded, and an approval admits exactly the key shown. The first key
+    /// an id asks with is the one kept; a later poll under the same id with another key is a
+    /// DIFFERENT machine, so it is counted in `claimsChanged` and never recorded.
+    std::array<std::byte, IdentityPublicKeyBytes> publicKey {};
+
+    /// The fingerprint of the roster this joiner was last handed, or absent until it was
+    /// handed one.
+    ///
+    /// The joiner prints the fingerprint of the roster it RECEIVED; this is the one the leader
+    /// SENT. The two agreeing is what says nothing between them rewrote the roster, and it is
+    /// per row rather than the cluster's current one because the roster moves with every
+    /// admission -- a batch of approvals would otherwise make every joiner's print disagree with
+    /// the list for a reason that is no attack at all.
+    std::optional<std::array<std::byte, RosterFingerprintBytes>> rosterFingerprint {};
 };
 
 /// What an ENROLL-CONTROL was answered with.
@@ -6145,13 +6224,20 @@ struct EnrollmentReport
         // claim above ("a fact added to one of these rows must not move the reply's own
         // arity") true of the ROW as well as of the reply. It was not, until
         // `claimsChanged` was the first fact added and the row's reader was exact.
+        std::array<std::byte, 1> const role { static_cast<std::byte>(entry.role) };
+        auto const fingerprint = entry.rosterFingerprint.has_value()
+                                     ? std::span<std::byte const> { *entry.rosterFingerprint }
+                                     : std::span<std::byte const> {};
         rows.push_back(WireFields::Encode({ AsBytes(entry.nodeId),
                                             AsBytes(entry.raftEndpoint),
                                             AsBytes(entry.peerId),
                                             std::span<std::byte const> { EncodeU64Field(entry.firstSeenSecondsAgo) },
                                             std::span<std::byte const> { EncodeU32Field(entry.attempts) },
                                             std::span<std::byte const> { decision },
-                                            std::span<std::byte const> { EncodeU32Field(entry.claimsChanged) } }));
+                                            std::span<std::byte const> { EncodeU32Field(entry.claimsChanged) },
+                                            std::span<std::byte const> { role },
+                                            std::span<std::byte const> { entry.publicKey },
+                                            fingerprint }));
     }
     std::vector<std::span<std::byte const>> views;
     views.reserve(rows.size());
@@ -6171,10 +6257,10 @@ struct EnrollmentReport
 
 /// Read an ENROLL-CONTROL reply payload back.
 ///
-/// A `decision` byte this build has no name for is refused rather than defaulted: the
-/// reader is a person deciding whether to hand somebody the fleet's key, and a row
-/// whose state renders as `pending` when it is really something else is the one wrong
-/// answer this report must not give.
+/// A `decision` or `role` byte this build has no name for is refused rather than defaulted:
+/// the reader is a person deciding whether to admit somebody to the fleet, and a row whose
+/// state renders as `pending` when it is really something else is the one wrong answer this
+/// report must not give.
 /// @param payload The reply payload.
 /// @return The report, or nullopt when malformed.
 [[nodiscard]] inline std::optional<EnrollmentReport> DecodeEnrollmentReport(std::span<std::byte const> payload)
@@ -6207,39 +6293,46 @@ struct EnrollmentReport
     report.pending.reserve(rows->size());
     for (auto const& row: *rows)
     {
-        // At LEAST the six a row has always carried, and any surplus is skipped: a row
-        // from a build that records one more fact than this one knows about is read for
-        // what it does know, exactly as `DecodeNodeRuntime` reads its own record. A row
-        // SHORTER than six is refused, because those six are not optional and reading a
-        // missing one would invent a value rather than omit a fact.
+        // At LEAST the ten a version-12 row carries, and any surplus is skipped: a row from a
+        // build that records one more fact than this one knows about is read for what it does
+        // know, exactly as `DecodeNodeRuntime` reads its own record. A row SHORTER than ten is
+        // refused, because those ten are not optional -- the key above all, which is the thing
+        // the operator is reading this list to compare -- and reading a missing one would
+        // invent a value rather than omit a fact. An older sender is refused by VERSION first.
         auto const parts = WireFields::SplitAll(row);
-        if (!parts.has_value() || parts->size() < 6)
+        if (!parts.has_value() || parts->size() < 10)
             return std::nullopt;
         auto const firstSeen = DecodeU64Field((*parts)[3]);
         auto const attempts = DecodeU32Field((*parts)[4]);
         auto const decision = (*parts)[5];
-        if (!firstSeen.has_value() || !attempts.has_value() || decision.size() != 1)
+        auto const changed = DecodeU32Field((*parts)[6]);
+        auto const role = (*parts)[7];
+        auto const key = (*parts)[8];
+        auto const fingerprint = (*parts)[9];
+        if (!firstSeen.has_value() || !attempts.has_value() || decision.size() != 1 || !changed.has_value()
+            || role.size() != 1 || key.size() != IdentityPublicKeyBytes
+            || (!fingerprint.empty() && fingerprint.size() != RosterFingerprintBytes))
             return std::nullopt;
-        if (!IsKnownEnrollmentDecision(static_cast<std::uint8_t>(decision[0])))
+        if (!IsKnownEnrollmentDecision(static_cast<std::uint8_t>(decision[0]))
+            || !IsKnownEnrollRole(static_cast<std::uint8_t>(role[0])))
             return std::nullopt;
-        // Absent is ZERO here and that is honest rather than a shortcut: this field is a
-        // tally, and a sender too old to keep it has observed no changed claim that it
-        // could have reported.
-        std::uint32_t changed = 0;
-        if (parts->size() > 6)
+        auto entry = EnrollmentPendingEntry { .nodeId = std::string { AsStringView((*parts)[0]) },
+                                              .raftEndpoint = std::string { AsStringView((*parts)[1]) },
+                                              .peerId = std::string { AsStringView((*parts)[2]) },
+                                              .firstSeenSecondsAgo = *firstSeen,
+                                              .attempts = *attempts,
+                                              .claimsChanged = *changed,
+                                              .decision = static_cast<EnrollmentDecision>(decision[0]),
+                                              .role = static_cast<EnrollRole>(role[0]),
+                                              .publicKey = {},
+                                              .rosterFingerprint = std::nullopt };
+        std::ranges::copy(key, entry.publicKey.begin());
+        if (!fingerprint.empty())
         {
-            auto const read = DecodeU32Field((*parts)[6]);
-            if (!read.has_value())
-                return std::nullopt;
-            changed = *read;
+            entry.rosterFingerprint.emplace();
+            std::ranges::copy(fingerprint, entry.rosterFingerprint->begin());
         }
-        report.pending.push_back(EnrollmentPendingEntry { .nodeId = std::string { AsStringView((*parts)[0]) },
-                                                          .raftEndpoint = std::string { AsStringView((*parts)[1]) },
-                                                          .peerId = std::string { AsStringView((*parts)[2]) },
-                                                          .firstSeenSecondsAgo = *firstSeen,
-                                                          .attempts = *attempts,
-                                                          .claimsChanged = changed,
-                                                          .decision = static_cast<EnrollmentDecision>(decision[0]) });
+        report.pending.push_back(std::move(entry));
     }
     return report;
 }
