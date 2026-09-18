@@ -145,7 +145,8 @@ the help renders `Verbs()` grouped by `WireSpec::heading`, and
 
 ### The fleet verb
 
-Every fleet table — machines, workers, outstanding leases, members, cache tiers — used
+Every fleet table — machines, workers, outstanding leases, members, forgotten clients,
+cache tiers — used
 to be reachable from a browser and from nowhere else. `/fleet.json` is the only other
 door and it needs a JSON parser the operator supplies; `jq` is not on a Windows build
 box, and this tool has no JSON *parser* of its own — it only emits one.
@@ -225,6 +226,15 @@ statement about its own fleet, and re-deriving it here would be the same convent
 spelled twice, in two binaries, free to drift. Unescaping would also put a real tab back
 into a cell that `--format=csv` carries through raw and that the human format prints
 into its own aligned columns.
+
+`forgotten` is the replicated tombstones — the client hosts `--cluster-forget-client`
+removed, which stay refused however many admission routes name them. `node` already
+reports how MANY a node is enforcing (`forgotten-clients`); this is WHICH, and the
+difference matters once more than one forget has been issued: two nodes reporting
+different counts says only that they disagree, while two lists say which host has not
+propagated. An empty set renders as an empty table and says so in words, and a node
+running no cluster reports the section absent rather than empty — `null` in the JSON,
+because no replicated state at all is not a cluster that has forgotten nobody.
 
 ### The cluster verbs
 
@@ -690,7 +700,7 @@ $ fastcache-cli live-stats node --format=tsv --samples=30 > node.tsv
 |---|---|---|
 | `cache` | a `fastcached`, or a `fastcache-compile-node` for its own cache tier | the hit rate, and operations, connections, evictions and expiries per second, each with its trend; connections, items and bytes in use against their limits, per storage tier |
 | `node` | a `fastcache-compile-node` | compiles and refusals per minute, the mean compile and its trend; the slots in use against the slots available and the limit that bounds them; the cache tier's fill; the host's CPU and free memory; the node's identity, toolchains, registrars and the leader; on a consensus node, `dialled at` — the address its peers dial, the string `--cluster-admit`'s receipt asks you to compare |
-| `fleet` | the node that leads the fleet | the headline figures as tiles; one table per section (machines, workers, leases, members, tiers); each machine's CPU over time |
+| `fleet` | the node that leads the fleet | the headline figures as tiles; one table per section (machines, workers, leases, members, forgotten, tiers); each machine's CPU over time |
 
 The subject may be left out, and then it is what `--addr` is: a `fastcached` is
 watched as `cache`, and a compile node as `node`. **`fleet` is never inferred.** The
@@ -719,7 +729,7 @@ A terminal smaller than a panel's minimum gets one line, `needs <columns>x<rows>
 | `q`, `Q`, `Esc`, `Ctrl-C` | quit, restoring the terminal |
 | `Tab`, `→` / `←` | the fleet's next / previous section |
 | `1` … `9` | the fleet's sections by position |
-| `m` `w` `l` `c` `t` | the fleet's sections by name: machines, workers, leases, members (`c`, for cluster: `m` is taken) and tiers |
+| `m` `w` `l` `c` `f` `t` | the fleet's sections by name: machines, workers, leases, members (`c`, for cluster: `m` is taken), forgotten clients and tiers |
 | `PgDn` / `PgUp`, `Home` | scroll the fleet's table a page, or back to its top |
 | `/` | filter the fleet's table: type, `Enter` keeps the filter, `Esc` clears it, `Backspace` edits it |
 

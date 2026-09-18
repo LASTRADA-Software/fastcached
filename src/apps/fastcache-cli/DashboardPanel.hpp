@@ -615,7 +615,7 @@ struct PanelContext
 /// **The sections a key walks are the ones the strip names**: the tabular rows of
 /// `Distributed::FleetSectionTable`, in its order. `Tab` and `Right` step to the next, `Left` to the
 /// previous, both wrapping; a digit `1`-`9` names the strip's tab in that position, and each tab's
-/// letter -- the strip's `keys  m w l c t` -- names that tab. From a section the strip does not name,
+/// letter -- the strip's `keys  m w l c f t` -- names that tab. From a section the strip does not name,
 /// the first step lands on its first or last tab. A key naming no section, or a digit past the last
 /// tab, switches nothing.
 /// @param active The section drawn now.
