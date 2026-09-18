@@ -37,6 +37,7 @@ target_sources(FastCache
         Config/SecretExposureWatcher.cpp
         Config/SecretProvenance.cpp
         Config/YamlReader.cpp
+        Consensus/DurableFile.cpp
         Consensus/FileRaftStorage.cpp
         Consensus/InMemoryRaftStorage.cpp
         Consensus/RaftConfig.cpp
@@ -63,6 +64,8 @@ target_sources(FastCache
         Cluster/DiscoveryService.cpp
         Cluster/MembershipPolicy.cpp
         Cluster/PeerDirectory.cpp
+        Cluster/Roster.cpp
+        Cluster/RosterCertificate.cpp
         Cluster/RosterKeys.cpp
         Net/InMemoryDatagram.cpp
         Net/SharedPortDatagram.cpp
@@ -70,6 +73,7 @@ target_sources(FastCache
         Core/Logger.cpp
         Distributed/LeaseTable.cpp
         Distributed/WorkerRegistry.cpp
+        Distributed/RosterStore.cpp
         Distributed/SchedulerService.cpp
         Distributed/SchedulerProtocol.cpp
         Distributed/FleetHistory.cpp

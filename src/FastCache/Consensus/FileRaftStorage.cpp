@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#include <FastCache/Consensus/DurableFile.hpp>
 #include <FastCache/Consensus/FileRaftStorage.hpp>
 #include <FastCache/Consensus/RaftMembership.hpp>
 #include <FastCache/Core/Crc32c.hpp>
@@ -80,28 +81,6 @@ namespace
         auto scratch = std::array<std::byte, sizeof(T)> {};
         WriteBigEndian<T>(scratch, value);
         out.insert(out.end(), scratch.begin(), scratch.end());
-    }
-
-    /// Open a file in binary mode, spelling the path the way the platform wants.
-    ///
-    /// `std::fopen` takes a narrow path, which on Windows is converted through
-    /// the active code page — so a directory containing a character that page
-    /// cannot represent would fail to open for a reason having nothing to do with
-    /// the storage. `_wfopen` takes the `wstring` the path already holds there.
-    /// @param path File to open.
-    /// @param mode An `fopen` mode string.
-    /// @return The stream, or nullptr.
-    [[nodiscard]] gsl::owner<std::FILE*> OpenBinary(std::filesystem::path const& path, char const* mode)
-    {
-#if defined(_WIN32)
-        auto wide = std::wstring {};
-        for (char const symbol: std::string_view { mode })
-            wide.push_back(static_cast<wchar_t>(symbol));
-
-        return ::_wfopen(path.wstring().c_str(), wide.c_str());
-#else
-        return std::fopen(path.c_str(), mode);
-#endif
     }
 
     /// Bytes every file here opens with, in every format: the magic, then the version.
@@ -342,6 +321,21 @@ namespace
         return snapshot;
     }
 
+    /// Read a whole file into memory; a missing one reads as EMPTY, which is what a store
+    /// starting for the first time has -- neither a log nor a snapshot, and no error.
+    /// @param path What to read.
+    /// @param into Destination, replaced.
+    /// @return Nothing, or why it could not be read.
+    [[nodiscard]] std::expected<void, ConsensusError> ReadWholeFile(std::filesystem::path const& path,
+                                                                    std::vector<std::byte>& into)
+    {
+        auto read = ReadFileIfPresent(path);
+        if (!read.has_value())
+            return std::unexpected { std::move(read).error() };
+        into = std::move(*read).value_or(std::vector<std::byte> {});
+        return {};
+    }
+
     /// Seek to an absolute offset that may exceed 2 GiB.
     ///
     /// `std::fseek` takes a `long`, which is 32-bit under LLP64 -- every Windows
@@ -360,129 +354,6 @@ namespace
 #endif
     }
 
-    /// Flush a stream all the way to the platter.
-    ///
-    /// `fflush` alone only pushes the C library's buffer into the kernel, which a
-    /// power loss still discards -- so it is the pair that makes a write durable,
-    /// and the reason this is one helper rather than two calls at each site.
-    /// @param file The open stream.
-    /// @return True when both stages succeeded.
-    [[nodiscard]] bool FlushToDisk(std::FILE* file) noexcept
-    {
-        if (std::fflush(file) != 0)
-            return false;
-
-#if defined(_WIN32)
-        return ::_commit(::_fileno(file)) == 0;
-#else
-        return ::fsync(::fileno(file)) == 0;
-#endif
-    }
-
-    /// Read a whole file into memory.
-    ///
-    /// Returns the reason rather than a bare failure flag. Every step here can
-    /// fail for a different and actionable cause -- the path is a directory, the
-    /// permissions are wrong, the disk gave up mid-read -- and a caller handed
-    /// only "false" can say no more than "cannot read <path>", which is the one
-    /// thing the operator already knew. `std::filesystem` reports through
-    /// `error_code` and `fopen` through `errno`, so both are translated here where
-    /// they are still in scope; a caller cannot recover them afterwards.
-    /// @param path What to read.
-    /// @param into Destination, cleared first.
-    /// @return Nothing, or why it could not be read; a missing file reads as empty.
-    [[nodiscard]] std::expected<void, ConsensusError> ReadWholeFile(std::filesystem::path const& path,
-                                                                    std::vector<std::byte>& into)
-    {
-        into.clear();
-
-        auto error = std::error_code {};
-        auto const present = std::filesystem::exists(path, error);
-        if (error)
-            return std::unexpected { FastCache::StorageFailure(
-                std::format("cannot stat {}: {}", path.string(), error.message())) };
-
-        // A file that is not there is not a failure: a store starting for the
-        // first time has neither a log nor a snapshot, and that is the ordinary
-        // case rather than an error.
-        if (!present)
-            return {};
-
-        auto const size = std::filesystem::file_size(path, error);
-        if (error)
-            return std::unexpected { FastCache::StorageFailure(
-                std::format("cannot size {}: {}", path.string(), error.message())) };
-
-        errno = 0;
-        gsl::owner<std::FILE*> const file = OpenBinary(path, "rb");
-        if (file == nullptr)
-            return std::unexpected { FastCache::StorageFailure(
-                std::format("cannot open {}: {}", path.string(), std::generic_category().message(errno))) };
-
-        into.resize(static_cast<std::size_t>(size));
-
-        errno = 0;
-        auto const read = into.empty() ? std::size_t { 0 } : std::fread(into.data(), 1, into.size(), file);
-        auto const failure = errno;
-        auto const truncated = std::ferror(file) != 0 || read != into.size();
-        (void) std::fclose(file);
-
-        if (truncated)
-        {
-            into.clear();
-
-            // A short read with no errno is a file that shrank between the size
-            // call and the read, which is a different fault from an I/O error and
-            // is worth saying so rather than reporting errno 0 as a cause.
-            return std::unexpected { FastCache::StorageFailure(
-                failure != 0 ? std::format("cannot read {}: {}", path.string(), std::generic_category().message(failure))
-                             : std::format("{} is shorter than its reported size of {} bytes", path.string(), size)) };
-        }
-
-        return {};
-    }
-
-    /// Replace `path` with `body`, indivisibly.
-    ///
-    /// Written beside the target and renamed over it: rename is the only single
-    /// filesystem operation that replaces a file's contents in one step, so a
-    /// crash leaves either the whole previous file or the whole new one.
-    /// @param path What to replace.
-    /// @param body The new contents.
-    /// @return Nothing, or why it could not be replaced.
-    [[nodiscard]] std::expected<void, ConsensusError> ReplaceFileAtomically(std::filesystem::path const& path,
-                                                                            std::span<std::byte const> body)
-    {
-        auto const temporary = std::filesystem::path { path }.concat(".tmp");
-
-        errno = 0;
-        gsl::owner<std::FILE*> const file = OpenBinary(temporary, "wb");
-        if (file == nullptr)
-            return std::unexpected { FastCache::StorageFailure(
-                std::format("cannot open {}: {}", temporary.string(), std::generic_category().message(errno))) };
-
-        errno = 0;
-        auto const wrote = body.empty() || std::fwrite(body.data(), 1, body.size(), file) == body.size();
-        auto const flushed = wrote && FlushToDisk(file);
-        auto const failure = errno;
-        (void) std::fclose(file);
-
-        if (!flushed)
-        {
-            auto discard = std::error_code {};
-            std::filesystem::remove(temporary, discard);
-            return std::unexpected { FastCache::StorageFailure(
-                std::format("cannot write {}: {}", temporary.string(), std::generic_category().message(failure))) };
-        }
-
-        auto error = std::error_code {};
-        std::filesystem::rename(temporary, path, error);
-        if (error)
-            return std::unexpected { FastCache::StorageFailure(
-                std::format("cannot replace {}: {}", path.string(), error.message())) };
-
-        return {};
-    }
 } // namespace
 
 std::expected<FileRaftStorage, ConsensusError> FileRaftStorage::Open(std::filesystem::path const& directory)
