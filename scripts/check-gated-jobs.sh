@@ -76,8 +76,9 @@
 # comment -- *"on a tag nothing below is ever skipped"* -- and nothing asserted
 # it.
 #
-# A shell check cannot evaluate a GitHub expression, so this asserts the SPELLING
-# instead: an event-keyed condition on a job that gates the release must contain
+# This check evaluates a GitHub expression only where a job's MATRIX decides it
+# (rule F, #1540), and an event-keyed condition is decided by no matrix, so this
+# asserts the SPELLING instead: an event-keyed condition on a job that gates the release must contain
 # the exact clause `github.ref_type != 'branch'`, which is the one clause that
 # lets a tag through. Any other spelling is refused by name rather than analysed
 # -- the same answer rule A gives a classifier read in a shape it does not
@@ -441,6 +442,12 @@ fi
 # leg at once -- legs of one job run concurrently exactly as two jobs do, so that
 # is #318 arriving through a matrix, and it is compared like any other pair.
 #
+# Unless the step's own `if:` rules the leg OUT (#1540), which is how a cache is
+# restored everywhere and saved once. Only a condition the shared walk can DECIDE
+# from the leg's matrix values rules one out; an undecidable term leaves the leg a
+# writer, which is the direction that keeps the refusal. A key taken from a step
+# output is refused as unresolvable: each leg computes its own.
+#
 # Every other `${{ ... }}` is left as text deliberately: `hashFiles('CMakeLists.txt')`
 # resolves to the same digest in every job of one run, so two steps spelling it
 # identically DO collide and must be compared rather than excused. What is
@@ -497,7 +504,7 @@ if [[ -n "$resolvedRows" ]]; then
         writerJobs="$(sed 's/ (.*$//' <<< "$writers" | sort -u)"
         cause="On a run where that key misses, every one of them fetches the content and every one of them tries to save it; whichever finishes second finds the key taken and discards an archive it has already paid to build and upload (#318)."
         if [[ "$writerJobs" != *$'\n'* && "$writers" == *" ("* ]]; then
-            Fail "the cache key '$duplicateKey' is WRITTEN by more than one leg of the matrix job '$writerJobs' (${writingJobs}). Legs of one job run concurrently, exactly as two jobs do, so a key the legs do not vary is one key saved by each of them. $cause Vary the key with the legs -- add a \`\${{ matrix.* }}\` value they differ in, to \`key:\` and \`restore-keys:\` alike. Where the legs' content is IDENTICAL, a restore step every leg runs plus a save step gated on one leg is the shape that avoids a duplicate entry, and this check does NOT accept it: it does not evaluate a step's \`if:\`, so it counts that save in every leg."
+            Fail "the cache key '$duplicateKey' is WRITTEN by more than one leg of the matrix job '$writerJobs' (${writingJobs}). Legs of one job run concurrently, exactly as two jobs do, so a key the legs do not vary is one key saved by each of them. $cause Where the legs' content DIFFERS, vary the key with them -- a \`\${{ matrix.* }}\` value they differ in, in \`key:\` and \`restore-keys:\` alike. Where it is IDENTICAL, restore on every leg and give each KEY one writer -- one per key, never one per job, since a job whose legs use several keys needs a saver for each (#1540): \`${CacheRestoreAction}@v4\` for every leg, plus an \`${CacheAction}/save@v4\` step whose \`if:\` selects, by matrix value, exactly one leg per key it saves -- e.g. \`matrix.suffix == ''\` where each preset's x86 leg saves and its arm64 twin only restores -- and whose \`key:\` is spelled as the restore step spells it. This check rules a leg out only where the save condition DECIDES it from the leg's matrix values -- a term it cannot decide (\`steps.*\`, a function) leaves the leg a writer -- and it cannot compare a key taken from \`cache-primary-key\`, which each leg computes for itself."
         else
             Fail "the cache key '$duplicateKey' is WRITTEN by more than one job (${writingJobs}). $cause Keep exactly one writer and change the others to \`${CacheRestoreAction}@v4\` -- never to a second key, which spends the repository's 10 GB cache budget on a duplicate."
         fi
@@ -507,7 +514,7 @@ fi
 if [[ "$cacheTotal" -eq 0 ]]; then
     echo "ok: no keyed cache step in $workflow (nothing for rule F to vouch for)"
 elif [[ "$problems" -eq "$cacheProblemsBefore" ]]; then
-    echo "ok: all $cacheTotal keyed cache step(s) resolve to a key with exactly one writer"
+    echo "ok: all $cacheTotal keyed cache writer(s) -- one per step per leg that can run it -- resolve to a key with exactly one writer"
 fi
 
 if [[ $problems -gt 0 ]]; then
@@ -560,7 +567,9 @@ REQ
     #   $9 = rule F's cache jobs: none | single | twowriters | writerreader |
     #        crossos | matrixleg | unknownaxis | matrixinclude | matrixlegcollide |
     #        crossarch | foldedref | unreadablematrix -- the last six are #1432's
-    #        matrix shapes, read through the shared walk's model of a matrix
+    #        matrix shapes, read through the shared walk's model of a matrix --
+    #        and #1540's restore-everywhere/save-once split: splitsave |
+    #        splittwolegs | splitundecided | splitstepkey
     Generate() {
         local out="$1" comparison="$2" cancelled="$3" docStep="$4" docJob="$5"
         local trim="${6:-none}" gate="${7:-all}" ccache="${8:-none}"
@@ -640,7 +649,7 @@ REQ
             if [[ "$cacheKnob" != "none" ]]; then
                 echo "  pkg-a:"
                 case "$cacheKnob" in
-                    matrixinclude|matrixlegcollide|crossarch)
+                    matrixinclude|matrixlegcollide|crossarch|split*)
                         echo "    runs-on: \${{ matrix.runner }}" ;;
                     *)  echo "    runs-on: ubuntu-24.04" ;;
                 esac
@@ -651,7 +660,7 @@ REQ
                         echo "        preset: [one, two]" ;;
                     # #1432's shape: the include row would overwrite the ORIGINAL
                     # `runner`, so it fits no base combination and is a third leg.
-                    matrixinclude|matrixlegcollide)
+                    matrixinclude|matrixlegcollide|split*)
                         echo "    strategy:"
                         echo "      matrix:"
                         echo "        preset: [one, two]"
@@ -671,22 +680,48 @@ REQ
                         echo "      matrix: \${{ fromJSON(needs.plan.outputs.matrix) }}" ;;
                 esac
                 echo "    steps:"
-                echo "      - name: \"Cache CPM packages\""
-                echo "        uses: ${CacheAction}@v4"
-                echo "        with:"
-                echo "          path: .cpm"
                 case "$cacheKnob" in
-                    matrixleg|matrixlegcollide)
-                        echo "          key: cpm-\${{ runner.os }}-\${{ matrix.preset }}-x" ;;
-                    matrixinclude)
-                        echo "          key: cpm-\${{ runner.os }}-\${{ matrix.preset }}\${{ matrix.suffix }}-x" ;;
-                    # A key no combination defines. GitHub expands it EMPTY, so both
-                    # legs resolve to one key -- the typo is a collision, not a mystery.
-                    unknownaxis)
-                        echo "          key: cpm-\${{ runner.os }}-\${{ matrix.flavour }}-x" ;;
-                    foldedref)
-                        echo "          key: cpm-\${{ runner.os }}-\${{ matrix.Preset }}-x" ;;
-                    *)  echo "          key: cpm-\${{ runner.os }}-x" ;;
+                    # #1540: restored on every leg, saved by the ONE leg per key the
+                    # save step's `if:` selects. Each knob varies only that `if:` or
+                    # the key it saves under, so each case says what rule F decided.
+                    split*)
+                        local saveIf="\${{ matrix.suffix == '' && steps.cpm.outputs.cache-hit != 'true' }}"
+                        local saveKey="cpm-\${{ runner.os }}-\${{ matrix.preset }}-x"
+                        [[ "$cacheKnob" == "splittwolegs" ]] && saveIf="\${{ matrix.preset == 'two' }}"
+                        [[ "$cacheKnob" == "splitundecided" ]] && saveIf="\${{ matrix.suffix == '' || steps.cpm.outputs.cache-hit != 'true' }}"
+                        [[ "$cacheKnob" == "splitstepkey" ]] && saveKey="\${{ steps.cpm.outputs.cache-primary-key }}"
+                        echo "      - name: \"Restore CPM packages\""
+                        echo "        id: cpm"
+                        echo "        uses: ${CacheRestoreAction}@v4"
+                        echo "        with:"
+                        echo "          path: .cpm"
+                        echo "          key: cpm-\${{ runner.os }}-\${{ matrix.preset }}-x"
+                        echo "      - name: \"Save CPM packages\""
+                        echo "        if: ${saveIf}"
+                        echo "        uses: ${CacheAction}/save@v4"
+                        echo "        with:"
+                        echo "          path: .cpm"
+                        echo "          key: ${saveKey}"
+                        ;;
+                    *)
+                        echo "      - name: \"Cache CPM packages\""
+                        echo "        uses: ${CacheAction}@v4"
+                        echo "        with:"
+                        echo "          path: .cpm"
+                        case "$cacheKnob" in
+                            matrixleg|matrixlegcollide)
+                                echo "          key: cpm-\${{ runner.os }}-\${{ matrix.preset }}-x" ;;
+                            matrixinclude)
+                                echo "          key: cpm-\${{ runner.os }}-\${{ matrix.preset }}\${{ matrix.suffix }}-x" ;;
+                            # A key no combination defines. GitHub expands it EMPTY, so both
+                            # legs resolve to one key -- the typo is a collision, not a mystery.
+                            unknownaxis)
+                                echo "          key: cpm-\${{ runner.os }}-\${{ matrix.flavour }}-x" ;;
+                            foldedref)
+                                echo "          key: cpm-\${{ runner.os }}-\${{ matrix.Preset }}-x" ;;
+                            *)  echo "          key: cpm-\${{ runner.os }}-x" ;;
+                        esac
+                        ;;
                 esac
                 echo "      - run: ctest"
             fi
@@ -913,28 +948,56 @@ REQ
     CaseSaying "rule F: a cache step in a job whose matrix the walk cannot read is REFUSED, not compared as text" \
         "its job's matrix cannot be read" ""
 
+    # #1540. A cache restored by every leg and saved by ONE: the save step's `if:`
+    # rules the arm64 leg out on its matrix values alone, so that leg is no writer,
+    # while the undecidable half of the condition keeps the x86 legs writers.
+    Generate "${scratch}/wf.yml" safe yes ungated required none all none splitsave
+    Case "rule F: restore on every leg and save on the one leg per key the save step's \`if:\` selects -- the shape identical content wants, which must PASS (#1540)" want-pass
+
+    Generate "${scratch}/wf.yml" safe yes ungated required none all none splittwolegs
+    CaseSaying "rule F: a DECIDABLE save condition that selects two legs of one key still leaves two writers, and is REFUSED" \
+        "more than one leg of the matrix job 'pkg-a'" ""
+
+    # The OR's other side is a step output, so on the arm64 leg the condition reads
+    # `false || unknown`, which is unknown -- and unknown must stay a writer.
+    Generate "${scratch}/wf.yml" safe yes ungated required none all none splitundecided
+    CaseSaying "rule F: a save condition that CANNOT be decided for a leg leaves that leg a writer, so the collision it may hide is REFUSED rather than excused" \
+        "more than one leg of the matrix job 'pkg-a'" ""
+
+    Generate "${scratch}/wf.yml" safe yes ungated required none all none splitstepkey
+    CaseSaying "rule F: a save key taken from a step output is a value each leg computes, so it is REFUSED as unresolvable rather than compared as text" \
+        "it names a step output" "WRITTEN by more than"
+
     # The verdicts must come from the SHARED walk, which is a different claim from
     # "the check refuses". `Case` runs `bash "$0"`, which resolves its awk beside
     # the real script, so a neuter has to stage a whole copy of the tooling.
     #
     # @param 1 what it holds up  @param 2 a sed expression, or `omit` to stage no
-    # walk at all  @param 3 want-pass|want-fail
+    # walk at all  @param 3 want-pass|want-fail  @param 4 rule F's cache knob,
+    # `none` by default  @param 5 which program the expression neuters: `walk`,
+    # the default, or `gated` for this check's own half
     StagedWalkCase() {
-        local what="$1" expr="$2" want="$3" tree="${scratch}/tree" out got=0
+        local what="$1" expr="$2" want="$3" knob="${4:-none}" target="${5:-walk}"
+        local tree="${scratch}/tree" out got=0 source staged
         cases=$((cases + 1))
         rm -rf "$tree"
         mkdir -p "$tree/scripts/lib"
         cp "$0" "$tree/scripts/"
         cp "$FastCachedGatedAwk" "$tree/scripts/"
+        [[ "$target" == gated ]] && cp "$FastCachedWalkAwk" "$tree/scripts/lib/"
         if [[ "$expr" != omit ]]; then
-            sed "$expr" "$FastCachedWalkAwk" > "$tree/scripts/lib/workflow-walk.awk"
-            if cmp -s "$tree/scripts/lib/workflow-walk.awk" "$FastCachedWalkAwk"; then
+            source="$FastCachedWalkAwk"; staged="$tree/scripts/lib/workflow-walk.awk"
+            if [[ "$target" == gated ]]; then
+                source="$FastCachedGatedAwk"; staged="$tree/scripts/$(basename "$FastCachedGatedAwk")"
+            fi
+            sed "$expr" "$source" > "$staged"
+            if cmp -s "$staged" "$source"; then
                 echo "  FAIL  '$what' neutered no line, so the case stages nothing" >&2
                 status=1
                 return
             fi
         fi
-        Generate "${scratch}/wf.yml" safe yes ungated required none all none
+        Generate "${scratch}/wf.yml" safe yes ungated required none all none "$knob"
         out="$(FASTCACHED_REQUIRED_CONTEXTS_FILE="$requiredFile" \
             bash "$tree/scripts/$(basename "$0")" --workflow "${scratch}/wf.yml" 2>&1)" || got=$?
         if [[ "$want" == "want-pass" && "$got" -eq 0 ]] || [[ "$want" == "want-fail" && "$got" -ne 0 ]]; then
@@ -954,6 +1017,14 @@ REQ
         '/WorkflowFlushStep(); WorkflowFlushJob(); WorkflowResetJob(); WfJob = key/s/^/#/' want-fail
     StagedWalkCase "a staged check with no shared walk beside it is REFUSED, not read as clean" \
         omit want-fail
+
+    # #1540's load-bearing line, NEUTERED: rule F reading an UNDECIDED save
+    # condition as "does not run" lets the undecidable case above PASS. That this
+    # case passes under the neuter while the unneutered one is refused is what
+    # says the refusal comes from undecided meaning "runs", and from nothing else.
+    StagedWalkCase "with an UNDECIDED save condition read as 'does not run', the undecidable split is ACCEPTED -- the neuter the refusal above depends on" \
+        's/if (WorkflowMatrixDecide(stepIf, c) == "F") continue/if (WorkflowMatrixDecide(stepIf, c) != "T") continue/' \
+        want-pass splitundecided gated
 
     if [[ "$status" -ne 0 ]]; then
         echo "check-gated-jobs: self-test FAILED after $cases case(s)" >&2

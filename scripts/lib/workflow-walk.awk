@@ -918,6 +918,166 @@ function WorkflowMatrixFoldedKey(key,   c, k, other) {
     return 0
 }
 
+# ---- a condition over a combination (#1540) -------------------------------------------------------
+# Whether the `if:` expression @p cond is TRUE, FALSE or UNDECIDED for combination @p c: "T", "F"
+# or "U". Decided only from the combination's matrix values and literals, with GitHub's operators
+# `==`, `!=`, `!`, `&&`, `||` and parentheses; an empty condition is "T", because a step with no
+# `if:` runs. Every other context (`steps.*`, `needs.*`, `github.*`), every function call and every
+# operator this does not model (`<`, `[`) is UNDECIDED, and so is anything it cannot parse.
+#
+# **UNDECIDED is never read as false.** The logic is three-valued, so `U && F` is F and `U || T` is
+# T -- a leg an `if:` rules out on its matrix terms alone is ruled out whatever else it says -- but
+# `U && T` stays U. A consumer asking "can this step run on this leg" answers yes for U, which is
+# the direction that keeps a refusal rather than dropping one.
+#
+# Comparison is GitHub's: strings case-insensitively, and a missing matrix key is null, which GitHub
+# coerces to 0 against a string -- so it equals `''`, differs from `'x'`, and is undecided against
+# a numeric string. A matrix value that could be a number or a boolean (`10`, `true`) is undecided
+# too: the walk keeps its text, not its YAML type, and GitHub coerces by type. A key matching only
+# case-folded is undecided, for the reason `WorkflowMatrixExpand` leaves one.
+function WorkflowMatrixDecide(cond, c,   e, r) {
+    e = WorkflowTrim(cond)
+    if (e == "") return "T"
+    if (index(e, "${{") > 0) {
+        if (e !~ /^\$\{\{.*\}\}$/) return "U"
+        e = substr(e, 4, length(e) - 5)
+        if (index(e, "${{") > 0 || index(e, "}}") > 0) return "U"
+    }
+    if (!WorkflowExprTokens(e)) return "U"
+    WfExPos = 1; WfExErr = 0; WfExCombo = c
+    r = WorkflowExprTruth(WorkflowExprOr())
+    if (WfExErr || WfExPos <= WfExN) return "U"
+    return r
+}
+
+# Split @p e into `WfExKind[i]`/`WfExText[i]`, `WfExN` of them: `s` a string literal (its text, the
+# doubled apostrophe undone), `i` a name or property path, `#` a number, `o` an operator. Returns 0
+# on any character this does not model, which the caller reads as undecided.
+function WorkflowExprTokens(e,   two, ch, v, i) {
+    WfExN = 0
+    while (e != "") {
+        ch = substr(e, 1, 1); two = substr(e, 1, 2)
+        if (ch == " " || ch == "\t") { e = substr(e, 2); continue }
+        if (two == "&&" || two == "||" || two == "==" || two == "!=") { WorkflowExprAdd("o", two); e = substr(e, 3); continue }
+        if (ch == "!" || ch == "(" || ch == ")" || ch == ",") { WorkflowExprAdd("o", ch); e = substr(e, 2); continue }
+        if (ch == sq) {
+            v = ""
+            for (i = 2; i <= length(e); i++) {
+                if (substr(e, i, 1) != sq) { v = v substr(e, i, 1); continue }
+                if (substr(e, i + 1, 1) == sq) { v = v sq; i++; continue }
+                break
+            }
+            if (i > length(e)) return 0
+            WorkflowExprAdd("s", v); e = substr(e, i + 1); continue
+        }
+        if (match(e, /^[A-Za-z_][A-Za-z0-9_.-]*/)) { WorkflowExprAdd("i", substr(e, 1, RLENGTH)); e = substr(e, RLENGTH + 1); continue }
+        if (match(e, /^[0-9][0-9A-Za-z.]*/)) { WorkflowExprAdd("#", substr(e, 1, RLENGTH)); e = substr(e, RLENGTH + 1); continue }
+        return 0
+    }
+    return 1
+}
+function WorkflowExprAdd(k, t) { WfExKind[++WfExN] = k; WfExText[WfExN] = t }
+function WorkflowExprAt(t) { return WfExPos <= WfExN && WfExKind[WfExPos] == "o" && WfExText[WfExPos] == t }
+
+# The parser, one precedence level per function, GitHub's order: `||` below `&&` below `==`/`!=`
+# below `!`. A value travels as `<kind>\034<text>`: `B` a truth value (T, F or U), `s` a string
+# literal, `m` a matrix value, `n` null, `u` unknown.
+function WorkflowExprOr(   a) {
+    a = WorkflowExprAnd()
+    while (!WfExErr && WorkflowExprAt("||")) { WfExPos++; a = "B\034" WorkflowKleeneOr(WorkflowExprTruth(a), WorkflowExprTruth(WorkflowExprAnd())) }
+    return a
+}
+function WorkflowExprAnd(   a) {
+    a = WorkflowExprCompare()
+    while (!WfExErr && WorkflowExprAt("&&")) { WfExPos++; a = "B\034" WorkflowKleeneAnd(WorkflowExprTruth(a), WorkflowExprTruth(WorkflowExprCompare())) }
+    return a
+}
+function WorkflowExprCompare(   a, op) {
+    a = WorkflowExprUnary()
+    if (WfExErr || !(WorkflowExprAt("==") || WorkflowExprAt("!="))) return a
+    op = WfExText[WfExPos++]
+    return "B\034" WorkflowExprEqual(a, WorkflowExprUnary(), op)
+}
+function WorkflowExprUnary(   t) {
+    if (!WorkflowExprAt("!")) return WorkflowExprPrimary()
+    WfExPos++
+    t = WorkflowExprTruth(WorkflowExprUnary())
+    return "B\034" ((t == "T") ? "F" : ((t == "F") ? "T" : "U"))
+}
+function WorkflowExprPrimary(   k, t, depth, key, r) {
+    if (WfExPos > WfExN) { WfExErr = 1; return "u\034" }
+    k = WfExKind[WfExPos]; t = WfExText[WfExPos]; WfExPos++
+    if (k == "o" && t == "(") {
+        r = WorkflowExprOr()
+        if (!WorkflowExprAt(")")) { WfExErr = 1; return "u\034" }
+        WfExPos++
+        return r
+    }
+    if (k == "s") return "s\034" t
+    if (k == "#") return "u\034"
+    if (k != "i") { WfExErr = 1; return "u\034" }
+    # A function call is undecided, its arguments skipped by their parentheses.
+    if (WorkflowExprAt("(")) {
+        for (depth = 0; WfExPos <= WfExN; WfExPos++) {
+            if (WorkflowExprAt("(")) depth++
+            else if (WorkflowExprAt(")") && --depth == 0) { WfExPos++; return "u\034" }
+        }
+        WfExErr = 1; return "u\034"
+    }
+    if (t == "true") return "B\034T"
+    if (t == "false") return "B\034F"
+    if (t == "null") return "n\034"
+    if (t !~ /^matrix\.[A-Za-z_][A-Za-z0-9_-]*$/) return "u\034"
+    key = substr(t, 8)
+    if ((WfExCombo, key) in WfCombo) return "m\034" WfCombo[WfExCombo, key]
+    if (WorkflowMatrixFoldedKey(key)) return "u\034"
+    return "n\034"
+}
+
+# The truth of a value, as GitHub reads one in `if:`: an empty string and null are false, any
+# other string true. A matrix value that could be a number or a boolean is undecided -- `0` and
+# `false` are falsy as YAML types and truthy as strings.
+function WorkflowExprTruth(v,   k, t) {
+    k = substr(v, 1, 1); t = substr(v, 3)
+    if (k == "B") return t
+    if (k == "n") return "F"
+    if (k == "m" && WorkflowExprTyped(t)) return "U"
+    if (k == "s" || k == "m") return (t == "") ? "F" : "T"
+    return "U"
+}
+function WorkflowExprTyped(t) { return t ~ /^(true|false|-?(0|[1-9][0-9]*))$/ }
+
+# `==` or `!=` between two values, as a truth value.
+function WorkflowExprEqual(a, b, op,   ka, kb, ta, tb, eq) {
+    ka = substr(a, 1, 1); ta = substr(a, 3); kb = substr(b, 1, 1); tb = substr(b, 3)
+    if (ka == "u" || kb == "u") return "U"
+    if (ka == "B" || kb == "B") {
+        if (ka != kb || ta == "U" || tb == "U") return "U"
+        eq = (ta == tb)
+    } else {
+        if ((ka == "m" && WorkflowExprTyped(ta)) || (kb == "m" && WorkflowExprTyped(tb))) return "U"
+        if (ka == "n" && kb == "n") eq = 1
+        else if (ka == "n" || kb == "n") {
+            # null against a string: both coerce to numbers, null to 0 and `''` to 0.
+            if (ka == "n") ta = tb
+            if (ta == "") eq = 1
+            else if (ta ~ /^[ \t]*$/ || ta ~ /^[ \t]*[-+]?(\.?[0-9]|[Ii]nfinity|0[xXoObB])/) return "U"
+            else eq = 0
+        } else eq = (tolower(ta) == tolower(tb))
+    }
+    if (op == "!=") eq = !eq
+    return eq ? "T" : "F"
+}
+
+function WorkflowKleeneAnd(a, b) {
+    if (a == "F" || b == "F") return "F"
+    return (a == "T" && b == "T") ? "T" : "U"
+}
+function WorkflowKleeneOr(a, b) {
+    if (a == "T" || b == "T") return "T"
+    return (a == "F" && b == "F") ? "F" : "U"
+}
+
 function WorkflowComboLabel(c,   k, out) {
     out = ""
     for (k = 1; k <= WfComboKeyCount[c]; k++)
