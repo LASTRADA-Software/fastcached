@@ -263,8 +263,10 @@ void DiscoveryTier::PublishAuthenticated()
         // nowhere is recorded as a LEARNER and an operator promotes it, while one it
         // already records or counts keeps that seat. Decided by the leader against the
         // state it holds at every pass, which this tier cannot see.
-        members.push_back(Cluster::DesiredMember {
-            .id = peer.nodeId, .raftEndpoint = peer.raftEndpoint, .schedulerEndpoint = std::nullopt });
+        members.push_back(Cluster::DesiredMember { .id = peer.nodeId,
+                                                   .raftEndpoint = peer.raftEndpoint,
+                                                   .schedulerEndpoint = std::nullopt,
+                                                   .publicKey = std::nullopt });
 
     if (_onPeers && !members.empty())
         _onPeers(members);

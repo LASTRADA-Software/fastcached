@@ -4,6 +4,7 @@
 
 #include <FastCache/Cli/Options.hpp>
 #include <FastCache/Core/Clock.hpp>
+#include <FastCache/Core/Ed25519.hpp>
 #include <FastCache/Distributed/SchedulerProtocol.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 
@@ -11,6 +12,7 @@
 
 #include <array>
 #include <cstddef>
+#include <format>
 #include <optional>
 #include <span>
 #include <string>
@@ -114,9 +116,12 @@ struct Fixture
                                    std::string value = {},
                                    std::string scheduler = {})
 {
-    return Cluster::Command {
-        .kind = kind, .key = std::move(key), .value = std::move(value), .schedulerEndpoint = std::move(scheduler)
-    };
+    return Cluster::Command { .kind = kind,
+                              .key = std::move(key),
+                              .value = std::move(value),
+                              .schedulerEndpoint = std::move(scheduler),
+                              .publicKey = std::nullopt,
+                              .role = std::nullopt };
 }
 
 /// A cluster-administration request, spelled once so a field added to
@@ -124,10 +129,14 @@ struct Fixture
 /// @param action What to do.
 /// @param key The setting name or member id.
 /// @param value The setting's new value.
+/// @param publicKey The member's identity key, for an admission that states one.
 /// @return The request.
-[[nodiscard]] ClusterRequest Ask(ClusterAction action, std::string key = {}, std::string value = {})
+[[nodiscard]] ClusterRequest Ask(ClusterAction action,
+                                 std::string key = {},
+                                 std::string value = {},
+                                 std::optional<Ed25519PublicKey> publicKey = std::nullopt)
 {
-    return ClusterRequest { .action = action, .key = std::move(key), .value = std::move(value) };
+    return ClusterRequest { .action = action, .key = std::move(key), .value = std::move(value), .publicKey = publicKey };
 }
 
 /// A cluster that has agreed something, for the rendering cases.
@@ -510,6 +519,56 @@ TEST_CASE("An admission prints back the id and the endpoint the leader recorded"
     CHECK(rendered->contains("10.0.0.4:6680"));
 }
 
+TEST_CASE("An admission carries the member's key from the command line and prints back the key the leader recorded",
+          "[node][clusteradmin][identity]")
+{
+    // #178, from argv to the rendered receipt through the real service and protocol, for
+    // #1296's reason: the halves must AGREE, and a hand-built payload passes with any two of
+    // them wired to each other. Both directions, because a renderer that always prints a key,
+    // or never does, passes one of them.
+    auto key = Ed25519PublicKey {};
+    key.fill(std::byte { 0x6E });
+    auto const keyText = FormatEd25519PublicKey(key);
+
+    SECTION("a key typed after @ is recorded and read back")
+    {
+        FakeCluster cluster;
+        Fixture fixture;
+        fixture.service.AdministerWith(cluster);
+
+        auto const flag = std::format("--cluster-admit=n4=10.0.0.4:6680@{}", keyText);
+        auto const cfg = ParsedFrom({ flag.c_str() });
+        auto const reply = fixture.Ask(cfg.cluster);
+        REQUIRE(StatusOf(reply) == Wire::Status::Ok);
+        REQUIRE(cluster.proposed.size() == 1);
+        CHECK(cluster.proposed.front().publicKey == std::optional { key });
+
+        auto const rendered = InterpretClusterReply(ClusterAction::Admit, PayloadOf(reply));
+        REQUIRE(rendered.has_value());
+        CHECK(rendered->contains("identity key"));
+        CHECK(rendered->contains(keyText));
+        CHECK_FALSE(rendered->contains("none stated"));
+    }
+
+    SECTION("no key is recorded as none, and says what none means")
+    {
+        FakeCluster cluster;
+        Fixture fixture;
+        fixture.service.AdministerWith(cluster);
+
+        auto const reply = fixture.Ask(Ask(ClusterAction::Admit, "n4", "10.0.0.4:6680"));
+        REQUIRE(StatusOf(reply) == Wire::Status::Ok);
+        REQUIRE(cluster.proposed.size() == 1);
+        CHECK_FALSE(cluster.proposed.front().publicKey.has_value());
+
+        auto const rendered = InterpretClusterReply(ClusterAction::Admit, PayloadOf(reply));
+        REQUIRE(rendered.has_value());
+        CHECK(rendered->contains("identity key"));
+        CHECK(rendered->contains("none stated"));
+        CHECK_FALSE(rendered->contains(keyText));
+    }
+}
+
 TEST_CASE("An admission is reported as recorded and appended, never as in force", "[node][clusteradmin]")
 {
     // **The wording half of #1296's acceptance, and it is a CEILING rather than a
@@ -798,4 +857,48 @@ TEST_CASE("A status report names the seat each member was admitted into", "[node
     CHECK(rendered.contains("seat=learner raft=10.0.0.9:6680"));
     CHECK(rendered.contains("seat=voter raft=10.0.0.1:6680"));
     CHECK(rendered.contains("seat=voter raft=10.0.0.2:6680"));
+}
+
+TEST_CASE("A status report shows each member's key, the principals and the revoked keys", "[node][clusteradmin][identity]")
+{
+    // #178. Whole keys, in the one spelling `--node-status` prints on the machine itself, and
+    // ABSENT as the dash every other absent field here is -- never an empty `key=` somebody
+    // could read as a key. The two new sections say "(none)" when empty, for the members'
+    // reason: after a revocation an operator needs "none" to be an answer.
+    auto keyed = Cmd(Cluster::CommandKind::AddMember, "keyed", "10.0.0.1:6680");
+    keyed.publicKey = Ed25519PublicKey {};
+    keyed.publicKey->fill(std::byte { 0x2B });
+    auto principal = Cmd(Cluster::CommandKind::AdmitPrincipal, "worker-1");
+    principal.publicKey = Ed25519PublicKey {};
+    principal.publicKey->fill(std::byte { 0x2C });
+    principal.role = Cluster::PrincipalRole::Worker;
+    auto revoked = Cmd(Cluster::CommandKind::RevokeKey, "gone");
+    revoked.publicKey = Ed25519PublicKey {};
+    revoked.publicKey->fill(std::byte { 0x2D });
+
+    SECTION("an empty roster says so")
+    {
+        Cluster::ClusterState state;
+        Apply(state, Cmd(Cluster::CommandKind::AddMember, "plain", "10.0.0.2:6680"));
+        auto const rendered = RenderClusterState(state);
+        CHECK(rendered.contains("key=-"));
+        CHECK(rendered.contains("principals (0):\n  (none)"));
+        CHECK(rendered.contains("revoked keys (0):\n  (none)"));
+    }
+
+    SECTION("a full one names every key whole")
+    {
+        Cluster::ClusterState state;
+        Apply(state, keyed);
+        Apply(state, principal);
+        Apply(state, revoked);
+        auto const rendered = InterpretClusterReply(ClusterAction::Status, Cluster::Encode(state));
+        REQUIRE(rendered.has_value());
+        INFO(*rendered);
+        CHECK(rendered->contains(std::format("key={}", FormatEd25519PublicKey(*keyed.publicKey))));
+        CHECK(rendered->contains("principals (1):"));
+        CHECK(rendered->contains(std::format("role=worker key={}", FormatEd25519PublicKey(*principal.publicKey))));
+        CHECK(rendered->contains("revoked keys (1):"));
+        CHECK(rendered->contains(std::format("key={}", FormatEd25519PublicKey(*revoked.publicKey))));
+    }
 }

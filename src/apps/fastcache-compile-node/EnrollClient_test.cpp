@@ -192,7 +192,8 @@ TEST_CASE("What a joiner claims is derived from the configuration it will actual
 
     cfg.raftListen = "7100";
     cfg.raftSelf = "198.51.100.4";
-    ApplyNodeIdentity(cfg, NodeIdentity { .id = "joiner-a", .origin = NodeIdentityOrigin::Minted });
+    ApplyNodeIdentity(cfg,
+                      NodeIdentity { .id = "joiner-a", .origin = NodeIdentityOrigin::Minted, .publicKey = std::nullopt });
 
     auto const claim = EnrollClaim(cfg);
     REQUIRE(claim.has_value());

@@ -365,7 +365,7 @@ TEST_CASE("SecretExposureWatcher: a reload reports a transition into exposure, o
 TEST_CASE("ReportSecretExposure: the arm for a process with no file to reload", "[config][secret]")
 {
     // **The other half of #868's wiring, and the half only a source scan asserted.**
-    // `fastcache-compile-node` started entirely from argv still names four key files
+    // `fastcache-compile-node` started entirely from argv still names its key files
     // and takes this arm; a `main` reaching it against a function that reported
     // nothing would pass every text scan there is. So the arm is driven here rather
     // than left to the two call sites.

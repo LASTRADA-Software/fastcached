@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "LauncherCli.hpp"
 #include "NodeConfig.hpp"
+#include "NodeKey.hpp"
 #include "NodeSurfaces.hpp"
 #include "NodeToolchains.hpp"
 
@@ -15,6 +16,8 @@
 #include <FastCache/Config/SecretExposureWatcher.hpp>
 #include <FastCache/Config/YamlReader.hpp>
 #include <FastCache/Core/Compression.hpp>
+#include <FastCache/Core/Ed25519.hpp>
+#include <FastCache/Core/ISecureRandom.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Core/Ranges.hpp>
 #include <FastCache/Platform/ServiceControl.hpp>
@@ -41,6 +44,7 @@
 
 #include <tests/PathFlagCoverage.hpp>
 #include <tests/ScratchPath.hpp>
+#include <tests/SecureRandomFakes.hpp>
 #include <tests/Unwrap.hpp>
 
 #if !defined(_WIN32)
@@ -1015,6 +1019,65 @@ TEST_CASE("NodeConfig: a --raft-peer that names no member is refused where it wa
     CHECK(parsed->raftPeers[0].raftEndpoint == "10.0.0.1:6680");
     CHECK(parsed->raftPeers[1].id == "n2");
     CHECK(parsed->raftPeers[1].raftEndpoint == "[2001:db8::1]:6680");
+}
+
+TEST_CASE("NodeConfig: --raft-peer takes a member's key after @, and a key that is not one is refused as a key",
+          "[node][consensus][policy][identity]")
+{
+    // #178. One grammar, `Cluster::ParseMemberSpec`, so the refusal is the grammar's own
+    // sentence -- what a key looks like -- stamped with the row's own spelling.
+    auto key = Ed25519PublicKey {};
+    key.fill(std::byte { 0x3C });
+    auto const keyText = FormatEd25519PublicKey(key);
+
+    auto const flag = std::format("--raft-peer=n1=10.0.0.1:6680@{}", keyText);
+    auto const parsed = ParseNodeArgv({ "--scheduler=s:1", "--toolchain=/usr/bin/cc", flag.c_str() });
+    REQUIRE(parsed.has_value());
+    REQUIRE(parsed->raftPeers.size() == 1);
+    CHECK(parsed->raftPeers[0].raftEndpoint == "10.0.0.1:6680");
+    CHECK(parsed->raftPeers[0].publicKey == std::optional { key });
+
+    auto const cut = std::format("--raft-peer=n1=10.0.0.1:6680@{}", keyText.substr(1));
+    auto const refused = ParseNodeArgv({ "--scheduler=s:1", "--toolchain=/usr/bin/cc", cut.c_str() });
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error().field == "raft-peer");
+    CHECK(refused.error().context.contains("names a key that is not one"));
+    CHECK(refused.error().context.contains("43 base64url characters"));
+}
+
+TEST_CASE("NodeConfig: --cluster-admit carries a key after @, and one that is not a key is refused as a key",
+          "[node][consensus][policy][identity]")
+{
+    // #178. The grammar is one grammar, so `@<key>` on --cluster-admit reads as it does on
+    // --raft-peer -- and it is CARRIED, as the request's third field, rather than parsed and
+    // dropped. Absent stays disengaged, which the leader reads as *no opinion*: the control
+    // that separates carrying the key from inventing one.
+    auto key = Ed25519PublicKey {};
+    key.fill(std::byte { 0x3D });
+    auto const keyText = FormatEd25519PublicKey(key);
+    for (auto const* const verb: { "--cluster-admit", "--cluster-admit-learner" })
+    {
+        INFO("verb: " << verb);
+        auto const flag = std::format("{}=n2=10.0.0.2:6680@{}", verb, keyText);
+        auto const keyed = ParseNodeArgv({ "--scheduler=s:1", flag.c_str() });
+        REQUIRE(keyed.has_value());
+        CHECK(keyed->cluster.key == "n2");
+        CHECK(keyed->cluster.value == "10.0.0.2:6680");
+        CHECK(keyed->cluster.publicKey == std::optional { key });
+
+        auto const plain = std::format("{}=n2=10.0.0.2:6680", verb);
+        auto const unkeyed = ParseNodeArgv({ "--scheduler=s:1", plain.c_str() });
+        REQUIRE(unkeyed.has_value());
+        CHECK(unkeyed->cluster.value == "10.0.0.2:6680");
+        CHECK_FALSE(unkeyed->cluster.publicKey.has_value());
+
+        // Refused by the grammar's own sentence, stamped with the row's own spelling.
+        auto const cut = std::format("{}=n2=10.0.0.2:6680@{}", verb, keyText.substr(1));
+        auto const refused = ParseNodeArgv({ "--scheduler=s:1", cut.c_str() });
+        REQUIRE_FALSE(refused.has_value());
+        CHECK(refused.error().field == std::string_view { verb }.substr(2));
+        CHECK(refused.error().context.contains("names a key that is not one"));
+    }
 }
 
 TEST_CASE("NodeConfig: a registered peer list comes back the way it went in", "[node][consensus][service]")
@@ -4199,7 +4262,7 @@ TEST_CASE("NodeSecretFiles: every path-valued flag is classified, secret or not"
     // identically to complete coverage (#492) -- and #752 is written about exactly
     // that failure: answering the narrow half while looking complete. So a further
     // `=<path>` row cannot be added without its author saying which kind it is --
-    // `NodeOptions()` has nine of them today, four secret and five public.
+    // `NodeOptions()` has nine of them today, five secret and four public.
     //
     // The join itself is `Testing::ClassifyPathFlags`, shared with the daemon's twin
     // since [#864](https://github.com/LASTRADA-Software/fastcached/issues/864) gave
@@ -4243,6 +4306,15 @@ TEST_CASE("NodeSecretFiles: every path-valued flag is classified, secret or not"
             // spell "forgot" in the vocabulary of "decided".
             CHECK_FALSE(row.why.empty());
         }
+    }
+
+    SECTION("--cluster-dir is a SECRET row, because the directory holds the identity key")
+    {
+        // #178 moved it: the directory stopped being "Raft state, no credential" the moment it
+        // held the key a machine proves itself with. Classified on the secret side, where the
+        // row's path is the key file the node minted inside it -- never the directory itself.
+        CHECK(FastCache::Testing::Names(secret, "--cluster-dir"));
+        CHECK_FALSE(FastCache::Testing::Names(publicPaths, "--cluster-dir"));
     }
 
     SECTION("--tls-cert is classified as public, deliberately")
@@ -4293,6 +4365,21 @@ TEST_CASE("NodeSecretFiles: a path-reached secret is not provenance-gated", "[no
         NodeConfig bare;
         bare.clusterKeyFile = "/etc/fastcached/cluster.key";
         CHECK(NodeSecretFiles(bare, {}, false) == std::vector<std::filesystem::path> { bare.clusterKeyFile });
+    }
+
+    SECTION("the identity key is asked about wherever the node holds one, and nowhere else")
+    {
+        // The row's path is DERIVED -- `NodeKeyPath`, the one author of where the key is --
+        // so the file asked about is the file the start read, never a re-spelling of it.
+        NodeConfig worker;
+        worker.clusterDir = "/var/lib/fastcache-node";
+        auto const files = NodeSecretFiles(worker, {}, false);
+        CHECK(std::ranges::find(files, NodeKeyPath(worker)) != files.end());
+        CHECK(NodeKeyPath(worker) == std::filesystem::path { "/var/lib/fastcache-node" } / NodeKeyFileName);
+
+        // A node with no state directory holds no key, so there is no file to ask about.
+        NodeConfig bare;
+        CHECK(NodeSecretFiles(bare, {}, false).empty());
     }
 }
 
@@ -4559,6 +4646,69 @@ TEST_CASE("A reload re-asks the filesystem about the worker's key files", "[node
         REQUIRE(reloader.Reload().has_value());
         REQUIRE(reloader.Reload().has_value());
         CHECK(said.empty());
+    }
+}
+
+TEST_CASE("The identity key is watched at the start and at every reload, and only an exposed one is reported",
+          "[node][config][secret][reload][identity]")
+{
+    // #178's acceptance: the key file is a MANDATORY row of the secret-by-path table, asked at
+    // the start AND at every accepted reload -- and the row fires on a world-readable key file
+    // while a protected one stays quiet. Driven against a key the node actually MINTED, in the
+    // state directory the configuration names, through the real reloader `main` wires.
+    Testing::ScratchDirectory const scratch { "node-key-exposure" };
+    auto const stateDir = scratch.Path() / "state";
+
+    Testing::ScriptedSecureRandom random { Testing::ScriptedSecureRandom::Ascending(Ed25519SeedBytes) };
+    auto const minted = ResolveNodeKey(stateDir, random);
+    REQUIRE(minted.has_value());
+    auto const key = stateDir / NodeKeyFileName;
+
+    auto const path = WriteRunnableNodeConfigFile(scratch.Path(), std::format("cluster_dir: {}\n", stateDir.string()));
+    REQUIRE(::chmod(path.c_str(), S_IRUSR | S_IWUSR) == 0);
+
+    std::vector<std::string> said;
+    NodeConfig initial = RunningNode();
+    // Matching the file, because `cluster_dir` is not reloadable -- a seed that disagreed would
+    // make the first reload refuse by name, which looks nothing like the case under test.
+    initial.clusterDir = stateDir;
+    auto reloader = MakeNodeReloader(initial, path);
+    WatchSecretExposure<NodeConfig>(
+        reloader,
+        [](NodeConfig const& live) { return NodeSecretFiles(live, {}, false); },
+        [&said](std::string_view warning) { said.emplace_back(warning); });
+
+    SECTION("minted 0600, it is quiet at the start and at every reload")
+    {
+        // The control. Without it, "reports an exposed key" and "reports every key" are told
+        // apart by nothing, and a row that warned about the ordinary minted file would fire on
+        // every node there is.
+        CHECK(said.empty());
+        REQUIRE(reloader.Reload().has_value());
+        CHECK(said.empty());
+    }
+
+    SECTION("loosened while the node runs, it is reported at the next reload, naming the key file")
+    {
+        REQUIRE(said.empty());
+        REQUIRE(::chmod(key.c_str(), S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH) == 0);
+        REQUIRE(reloader.Reload().has_value());
+
+        REQUIRE(said.size() == 1);
+        CHECK(said.front().contains(key.string()));
+        CHECK(said.front().contains("chmod o-r"));
+    }
+
+    SECTION("already exposed at the start, it is reported at the start")
+    {
+        REQUIRE(::chmod(key.c_str(), S_IRUSR | S_IWUSR | S_IROTH) == 0);
+        std::vector<std::string> atStart;
+        ReportSecretExposure<NodeConfig>(
+            initial,
+            [](NodeConfig const& live) { return NodeSecretFiles(live, {}, false); },
+            [&atStart](std::string_view warning) { atStart.emplace_back(warning); });
+        REQUIRE(atStart.size() == 1);
+        CHECK(atStart.front().contains(key.string()));
     }
 }
 

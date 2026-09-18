@@ -2,14 +2,19 @@
 #include "NodeIdentity.hpp"
 #include "NodeSurfaces.hpp"
 
+#include <FastCache/Core/Ed25519.hpp>
 #include <FastCache/Core/ISecureRandom.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <format>
 #include <fstream>
+#include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -587,4 +592,135 @@ TEST_CASE("A service registration bakes in the resolved identity", "[node][ident
     // whole reason these rules are pure functions of the command line.
     replayed.clusterDir = cfg.clusterDir;
     CHECK_FALSE(StartupPolicyRejection(replayed).has_value());
+}
+
+namespace
+{
+/// A public key whose every byte is @p fill. The roster never asks whether it is a curve point.
+/// @param fill The byte.
+/// @return The key.
+[[nodiscard]] Ed25519PublicKey KeyOf(std::uint8_t fill)
+{
+    auto key = Ed25519PublicKey {};
+    key.fill(static_cast<std::byte>(fill));
+    return key;
+}
+
+/// This node's own `--raft-peer` entry, as an operator would type it.
+/// @param id The node's id.
+/// @param suffix What follows the endpoint: empty, or `@<key>`.
+/// @return The parsed member.
+[[nodiscard]] Cluster::ClusterMember TypedSelf(std::string_view id, std::string_view suffix = {})
+{
+    auto member = Cluster::ParseMemberSpec(std::format("{}=10.0.0.7:6680{}", id, suffix));
+    REQUIRE(member.has_value());
+    return *std::move(member);
+}
+} // namespace
+
+TEST_CASE("The key a node holds reaches its own member entry and the configuration", "[node][identity][key]")
+{
+    // #178. The record a leader announces is this node's own entry, so the key has to be ON
+    // it -- and applied through the one function a reload runs too, or a candidate would hold
+    // a self member whose key has changed and every reload would be refused by name.
+    ScratchDirectory const scratch { "node-identity-key" };
+    SystemSecureRandom random;
+
+    auto cfg = ClusteredNode(scratch.Path());
+    auto identity = Resolved(NodeStateDirectory(cfg), cfg.nodeId, random);
+    identity.publicKey = KeyOf(0x5A);
+
+    SECTION("the entry --raft-self synthesises carries it")
+    {
+        ApplyNodeIdentity(cfg, identity);
+        CHECK(cfg.identityPublicKey == std::optional { KeyOf(0x5A) });
+        auto const* const self = ClusterSelfMember(cfg);
+        REQUIRE(self != nullptr);
+        CHECK(self->publicKey == std::optional { KeyOf(0x5A) });
+
+        // And applying twice -- what a reload does to a candidate -- changes nothing.
+        auto const once = cfg.raftPeers;
+        ApplyNodeIdentity(cfg, identity);
+        CHECK(cfg.raftPeers == once);
+    }
+
+    SECTION("a typed entry naming no key is given the one the node holds")
+    {
+        cfg.raftSelf.clear();
+        cfg.raftPeers.push_back(TypedSelf(identity.id));
+        ApplyNodeIdentity(cfg, identity);
+        auto const* const self = ClusterSelfMember(cfg);
+        REQUIRE(self != nullptr);
+        CHECK(self->publicKey == std::optional { KeyOf(0x5A) });
+        CHECK_FALSE(SelfKeyContradiction(cfg, KeyOf(0x5A)).has_value());
+    }
+
+    SECTION("a typed entry naming ANOTHER key is left as typed, and refused")
+    {
+        // Overwriting it would hide the mistake: either the token was copied from another
+        // node, or this is not the state directory it was written for. Both are the
+        // operator's to resolve, so the refusal names both keys, whole.
+        cfg.raftSelf.clear();
+        cfg.raftPeers.push_back(TypedSelf(identity.id, std::format("@{}", FormatEd25519PublicKey(KeyOf(0x11)))));
+        ApplyNodeIdentity(cfg, identity);
+        auto const* const self = ClusterSelfMember(cfg);
+        REQUIRE(self != nullptr);
+        CHECK(self->publicKey == std::optional { KeyOf(0x11) });
+
+        auto const refusal = SelfKeyContradiction(cfg, KeyOf(0x5A));
+        REQUIRE(refusal.has_value());
+        CHECK(Unwrap(refusal).contains(FormatEd25519PublicKey(KeyOf(0x11))));
+        CHECK(Unwrap(refusal).contains(FormatEd25519PublicKey(KeyOf(0x5A))));
+
+        // The control: the same entry naming the key the node DOES hold is no contradiction.
+        CHECK_FALSE(SelfKeyContradiction(cfg, KeyOf(0x11)).has_value());
+    }
+}
+
+TEST_CASE("A node that runs no consensus still carries the key it holds", "[node][identity][key]")
+{
+    // A worker naming --cluster-dir holds a key and has no id. The key-only identity is what
+    // reaches it -- and every reload candidate -- without inventing an id or a member entry.
+    NodeConfig worker;
+    worker.clusterDir = std::filesystem::path { "/var/lib/fastcache-node" };
+
+    auto const keyOnly = NodeIdentity { .id = {}, .origin = NodeIdentityOrigin::Recorded, .publicKey = KeyOf(0x77) };
+    ApplyNodeIdentity(worker, keyOnly);
+    CHECK(worker.identityPublicKey == std::optional { KeyOf(0x77) });
+    CHECK(worker.nodeId.empty());
+    CHECK(worker.raftPeers.empty());
+}
+
+TEST_CASE("A service registration keeps the key its --raft-peer entries name", "[node][identity][service][key]")
+{
+    // A registration RE-RENDERS every `--raft-peer` from its parsed form, so a rendering that
+    // dropped `@<key>` would install a node whose next start no longer knows what its own
+    // operator typed. Read back by PARSING the registration, never by grepping it.
+    ScratchDirectory const scratch { "node-identity-install-key" };
+    SystemSecureRandom random;
+
+    auto cfg = ClusteredNode(scratch.Path());
+    cfg.advertise = "10.0.0.7:6674";
+    cfg.advertiseExplicit = true;
+    cfg.raftListenExplicit = true;
+    cfg.raftSelfExplicit = true;
+    auto peer = Cluster::ParseMemberSpec(std::format("n2=10.0.0.8:6680@{}", FormatEd25519PublicKey(KeyOf(0x42))));
+    REQUIRE(peer.has_value());
+    cfg.raftPeers.push_back(*peer);
+
+    auto const identity = Resolved(NodeStateDirectory(cfg), cfg.nodeId, random);
+    ApplyNodeIdentity(cfg, identity);
+
+    auto const spec = MakeNodeServiceSpec(std::filesystem::path { "fastcache-compile-node" }, cfg);
+    std::vector<char const*> argv;
+    argv.reserve(spec.arguments.size());
+    for (auto const& argument: spec.arguments)
+        argv.push_back(argument.c_str());
+
+    NodeConfig replayed;
+    auto const flow = ParseOptionsInto(NodeOptions(), std::span<char const* const> { argv }, replayed);
+    REQUIRE(flow.has_value());
+    auto const replayedPeer = std::ranges::find(replayed.raftPeers, std::string { "n2" }, &Cluster::ClusterMember::id);
+    REQUIRE(replayedPeer != replayed.raftPeers.end());
+    CHECK(replayedPeer->publicKey == std::optional { KeyOf(0x42) });
 }

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Cli/Duration.hpp>
 #include <FastCache/Cluster/ClusterState.hpp>
+#include <FastCache/Core/Ed25519.hpp>
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/HostPort.hpp>
 #include <FastCache/Core/Utf8.hpp>
@@ -193,6 +194,49 @@ namespace
     static_assert(ReleaseRefusalsCountOnce(),
                   "a release refusal carries its own counter, so its code must not also carry a code-keyed one");
 
+    /// A refusal decided by one verb before anything is proposed, which moves a counter of
+    /// its own while its wire code moves none.
+    ///
+    /// The shape `ReleaseRefusalRow` has and for its reason: the row is the REFUSAL, not the
+    /// code, so two refusals may share a code and must not share a counter.
+    struct VerbRefusalRow
+    {
+        Wire::ErrorCode code;          ///< What the client is told.
+        IMetricsSink::Counter counter; ///< What the operator sees rise.
+    };
+
+    /// A CLUSTER-ADMIT naming a key that is not one (#178).
+    ///
+    /// `InvalidClusterChange`, which `UncountedRefusals` lists as moving nothing because an
+    /// operator's typo read back to them is not a fact about the fleet. **This one is
+    /// counted anyway, because the typo is not the likely cause.** Both of this project's
+    /// clients parse the key where it is typed, through the one parser, so what arrives
+    /// here malformed was sent by a client that does not -- and every member it admits
+    /// joins with no identity while its operator was shown a key. The wire door is the
+    /// last place that can be told, which is why the refusal exists at all; the counter is
+    /// what makes a client doing it on every admission visible to somebody other than the
+    /// person reading its output.
+    ///
+    /// Never `MalformedFrame` either: the frame decoded, and what it carried is the thing
+    /// refused. A client told *malformed frame* goes looking for a version mismatch.
+    constexpr VerbRefusalRow MalformedAdmissionKey {
+        .code = Wire::ErrorCode::InvalidClusterChange,
+        .counter = IMetricsSink::Counter::ClusterAdmissionsRefusedMalformedKey,
+    };
+
+    /// Whether a verb's own refusal is counted once: its code must carry no code-keyed
+    /// counter, or `Refuse` would move a second one beside the row's.
+    /// @param row The verb's refusal.
+    /// @return True when `RefusalTable` holds no row for its code.
+    [[nodiscard]] consteval bool CountsOnce(VerbRefusalRow const& row) noexcept
+    {
+        return std::ranges::none_of(RefusalTable,
+                                    [&row](RefusalDescriptor const& counted) { return counted.code == row.code; });
+    }
+
+    static_assert(CountsOnce(MalformedAdmissionKey),
+                  "a verb's own refusal carries its own counter, so its code must not also carry a code-keyed one");
+
     /// What a consensus refusal becomes on the wire.
     struct ProposalRefusalRow
     {
@@ -218,6 +262,12 @@ namespace
         // sends somebody to correct a record that is already correct.
         { .code = ConsensusErrorCode::ConfigurationChangeInFlight, .reported = Wire::ErrorCode::ClusterChangeInFlight },
         { .code = ConsensusErrorCode::MembershipUnchanged, .reported = Wire::ErrorCode::ClusterChangeNotNeeded },
+        // The generic PERMANENT refusal, and deliberately not a wire code of its own (#178).
+        // A code of its own would claim a client acts differently on it, and none does: both
+        // this and `InvalidClusterChange` mean *this request will never be accepted as it
+        // stands*, and the sentence carries which key and whose it was. The permanence is
+        // stated where it is decided -- `RefusalSubjects` -- which is what a reconciler reads.
+        { .code = ConsensusErrorCode::KeyRevoked, .reported = Wire::ErrorCode::InvalidClusterChange },
         { .code = ConsensusErrorCode::NotLeader, .reported = Wire::ErrorCode::NotLeader },
         { .code = ConsensusErrorCode::StorageFailure, .reported = Wire::ErrorCode::StorageWriteFailed },
         // A store another build wrote is judged when the node STARTS, which it then
@@ -487,7 +537,11 @@ SchedulerReply SchedulerService::Offer(Cluster::Command const& command)
     // `--cluster-admit`, `--cluster-set` or `--cluster-forget` and is reading the
     // answer. The reconciler is where the identical refusal is a trap, because it
     // would re-offer the same command every interval forever.
-    if (auto const allowed = Cluster::Validate(command); !allowed.has_value())
+    //
+    // Against the state as this node holds it (#178), so a revoked key or one somebody
+    // else holds is refused HERE, where the operator reads the answer; the proposer below
+    // asks the same question again, and `Apply` enforces it on commit whatever either said.
+    if (auto const allowed = Cluster::ValidateAgainst(_admin->ClusterState(), command); !allowed.has_value())
         return Refuse(WireCodeFor(allowed.error().code), allowed.error().context);
 
     auto const proposed = _admin->ProposeToCluster(command);
@@ -530,7 +584,9 @@ SchedulerReply SchedulerService::ClusterSet(CallerContext const& caller, std::st
     return Offer(Cluster::Command { .kind = Cluster::CommandKind::SetSetting,
                                     .key = std::string { name },
                                     .value = std::string { value },
-                                    .schedulerEndpoint = {} });
+                                    .schedulerEndpoint = {},
+                                    .publicKey = std::nullopt,
+                                    .role = std::nullopt });
 }
 
 SchedulerReply SchedulerService::ClusterForget(CallerContext const& caller, std::string_view memberId)
@@ -540,8 +596,12 @@ SchedulerReply SchedulerService::ClusterForget(CallerContext const& caller, std:
     if (_admin == nullptr)
         return Refuse(Wire::ErrorCode::NoCluster);
 
-    return Offer(Cluster::Command {
-        .kind = Cluster::CommandKind::RemoveMember, .key = std::string { memberId }, .value = {}, .schedulerEndpoint = {} });
+    return Offer(Cluster::Command { .kind = Cluster::CommandKind::RemoveMember,
+                                    .key = std::string { memberId },
+                                    .value = {},
+                                    .schedulerEndpoint = {},
+                                    .publicKey = std::nullopt,
+                                    .role = std::nullopt });
 }
 
 SchedulerReply SchedulerService::ClusterAdmitClient(CallerContext const& caller, std::string_view host)
@@ -563,7 +623,12 @@ SchedulerReply SchedulerService::OfferClientVerb(CallerContext const& caller,
     if (_admin == nullptr)
         return Refuse(Wire::ErrorCode::NoCluster);
 
-    auto reply = Offer(Cluster::Command { .kind = kind, .key = std::string { host }, .value = {}, .schedulerEndpoint = {} });
+    auto reply = Offer(Cluster::Command { .kind = kind,
+                                          .key = std::string { host },
+                                          .value = {},
+                                          .schedulerEndpoint = {},
+                                          .publicKey = std::nullopt,
+                                          .role = std::nullopt });
 
     // Said on the FORGET and deliberately not on the admit, and the asymmetry is the
     // whole reason this line exists. A member whose build predates these verbs skips
@@ -598,12 +663,34 @@ SchedulerReply SchedulerService::OfferClientVerb(CallerContext const& caller,
 SchedulerReply SchedulerService::ClusterAdmit(CallerContext const& caller,
                                               std::string_view memberId,
                                               std::string_view raftEndpoint,
+                                              std::optional<std::string_view> publicKey,
                                               std::optional<Cluster::MemberSeat> seat)
 {
     if (auto refusal = Gate(caller); refusal.has_value())
         return std::move(*refusal);
     if (_admin == nullptr)
         return Refuse(Wire::ErrorCode::NoCluster);
+
+    // The key is read HERE, through the one parser, before anything is proposed (#178):
+    // whatever client sent it, the leader is the last place anybody can be told, and a
+    // command carrying bytes it guessed at would be applied after it is committed with
+    // nobody left to refuse it. A key that is REVOKED is `ValidateAgainst`'s refusal, in
+    // `Offer`, because that one is a fact about the replicated state and this one is not.
+    auto key = std::optional<Ed25519PublicKey> {};
+    if (publicKey.has_value())
+    {
+        auto parsed = ParseEd25519PublicKey(*publicKey);
+        if (!parsed.has_value())
+        {
+            _metrics.Increment(MalformedAdmissionKey.counter);
+            return Refuse(MalformedAdmissionKey.code,
+                          std::format("{} was sent with a key that is not one ({}): {}",
+                                      memberId,
+                                      *publicKey,
+                                      DescribePublicKeyTextFault(parsed.error())));
+        }
+        key = *parsed;
+    }
 
     // `schedulerEndpoint` left empty, which `AddMember` applies wholesale -- so
     // re-admitting a member that has moved clears whatever it had announced, and it
@@ -623,7 +710,9 @@ SchedulerReply SchedulerService::ClusterAdmit(CallerContext const& caller,
     auto const command = Cluster::Command { .kind = Cluster::MemberSeatTable[static_cast<std::size_t>(resolved)].admittedBy,
                                             .key = std::string { memberId },
                                             .value = std::string { raftEndpoint },
-                                            .schedulerEndpoint = {} };
+                                            .schedulerEndpoint = {},
+                                            .publicKey = key,
+                                            .role = std::nullopt };
 
     auto reply = Offer(command);
     if (reply.status != Wire::Status::Ok)
@@ -656,8 +745,16 @@ SchedulerReply SchedulerService::ClusterAdmit(CallerContext const& caller,
     // one claim is *these are the bytes I wrote down*, so it is taken from the thing
     // that was written down. Spelling the parameters again here would make the two
     // able to disagree, which is the whole defect one level in.
+    //
+    // The key by the same rule, and it is where the rule earns its keep (#178): the text a
+    // client sent and the key the command carries can differ, since the one is PARSED into
+    // the other, so the receipt spells the command's key back through the one encoder.
     reply.payload = Wire::EncodeClusterAdmitReceipt(
-        Wire::ClusterAdmitReceipt { .memberId = command.key, .raftEndpoint = command.value });
+        Wire::ClusterAdmitReceipt { .memberId = command.key,
+                                    .raftEndpoint = command.value,
+                                    .publicKey = command.publicKey.transform([](Ed25519PublicKey const& recorded) {
+                                        return FormatEd25519PublicKey(recorded);
+                                    }) });
     return reply;
 }
 

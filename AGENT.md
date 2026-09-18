@@ -355,7 +355,8 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   two independent readers straddle a reload and the worker then refuses grants the scheduler
   authentically signed. A move WITHDRAWS the old entry, `(fingerprint, endpoint)` being the
   registry's whole key, or the fleet keeps minting valid credentials for an address nobody answers.
-- The worker's five key files are asked about at the START **and at every accepted reload**, from
+- The worker's key files -- every row of `NodeSecretFileTable()`, the identity key among them -- are asked
+  about at the START **and at every accepted reload**, from
   `main` and never from `WorkerBody`. A mode is in no configuration, so the re-ask is of the
   FILESYSTEM, not of the reloader's two snapshots; no configuration file means no second moment.
 - A worker being dropped is an **event** (`ExpireStale`), or nothing releases what was held against
@@ -642,6 +643,17 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   cannot disagree. A flag whose ABSENCE carries a mode can never be given a default. A boolean
   beside the port is the tempting alternative and is worse: two things that can disagree, and
   both disagreements are states nothing could describe. One predicate, `RunsConsensus`.
+- **Only an ABSENT `node-key` mints** (#178): a key file that is there and cannot be used is
+  refused by name and left untouched, never re-minted. A node with no state directory holds
+  NO key rather than one minted per boot. The key file is a secret-by-path row whose path is
+  DERIVED (`NodeKeyPath`), and a public key has one spelling, 43 characters of base64url.
+- **`ValidateAgainst` is the courtesy, `Apply` the guarantee**: the key rules need the state,
+  so every proposer asks the former and `Apply` enforces the same rules on commit. A revoked
+  key is never admitted again (`KeyRevoked`, permanent), and `RevokeKey` is the one verb
+  `Apply` never drops -- a dropped revocation is removal failing OPEN.
+- **A flag that parses a key CARRIES it, never parses and drops it**: `--cluster-admit@<key>`
+  rides CLUSTER-ADMIT's third field (0xFC 11), the leader parses it again before proposing, and
+  the receipt echoes the key the COMMAND carries. An absent key keeps the recorded one.
 
 **Backwards compatibility is not owed yet, and designing around it has already cost
 work.** Until this software is declared production ready, a wire format, an on-disk format,

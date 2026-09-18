@@ -484,6 +484,7 @@ SchedulerReply SchedulerProtocol::Route(Wire::Op op, std::span<std::byte const> 
             return _service.ClusterAdmit(caller,
                                          Wire::AsStringView(fields->memberId),
                                          Wire::AsStringView(fields->raftEndpoint),
+                                         fields->publicKey.transform(Wire::AsStringView),
                                          Cluster::MemberSeat::Voter);
         }
 
@@ -494,6 +495,7 @@ SchedulerReply SchedulerProtocol::Route(Wire::Op op, std::span<std::byte const> 
             return _service.ClusterAdmit(caller,
                                          Wire::AsStringView(fields->memberId),
                                          Wire::AsStringView(fields->raftEndpoint),
+                                         fields->publicKey.transform(Wire::AsStringView),
                                          Cluster::MemberSeat::Learner);
         }
         default:

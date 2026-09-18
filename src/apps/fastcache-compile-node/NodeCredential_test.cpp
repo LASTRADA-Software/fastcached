@@ -336,7 +336,7 @@ TEST_CASE("Site 2: a cluster verb presents the secret in force NOW", "[node][cre
     // so it cannot become the stale one when somebody calls it from a running worker.
     RotatingCredential credential { FirstSecret };
     auto notice = Cc::CredentialNotice::Silent();
-    ClusterRequest const request { .action = ClusterAction::Status, .key = {}, .value = {} };
+    ClusterRequest const request { .action = ClusterAction::Status, .key = {}, .value = {}, .publicKey = std::nullopt };
 
     Testing::ScriptedSocket first { AcceptedThen(Wire::EncodeReply(Wire::Status::Ok, {})) };
     (void) PutClusterRequest(first, notice, request, credential, "scheduler.example:6676");

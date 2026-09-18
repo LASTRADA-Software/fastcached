@@ -623,7 +623,10 @@ readable and silently ignored. Every rule below has already been one of them.
     handshake, and warning about a file that is *meant* to be readable is the alarm
     that teaches operators to ignore the one that matters. Measured by
     `grep -c 'operand = "=<path>"'`: **6** such rows in `CliOptions()`, one of them
-    secret, and **9** in `NodeOptions()`, four of them secret.
+    secret, and **9** in `NodeOptions()`, five of them secret. `--cluster-dir` is the fifth
+    since #178, and its row is why a row's path is a PROJECTION of the configuration
+    rather than a member pointer: the flag names a directory, and the secret is the
+    identity key the node minted inside it (`NodeKeyPath`).
   - **One join, asked of two option tables.** `Testing::ClassifyPathFlags` is the
     guard, and it reports three lists rather than a verdict — unclassified, claimed by
     both, and naming no row at all — because those are three different repairs. It

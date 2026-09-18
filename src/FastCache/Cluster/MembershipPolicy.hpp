@@ -42,6 +42,14 @@ struct DesiredMember
     /// simply never knew. A node says `""` about itself and `nullopt` about a peer,
     /// and only the first of those is an assertion.
     std::optional<std::string> schedulerEndpoint;
+
+    /// Its identity key; absent when this node has no opinion (#178).
+    ///
+    /// A node asserts ITS OWN, which it read out of its state directory, and has no opinion
+    /// about a peer's: discovery proves where a peer answers, not which key it holds. Absent
+    /// keeps whatever is recorded, which is `AddMember`'s own reading of a command with no
+    /// key -- so discovery can never clear what a member announced.
+    std::optional<Ed25519PublicKey> publicKey;
 };
 
 /// The seat a member is recorded in when nothing has placed it yet: a LEARNER (#1535).

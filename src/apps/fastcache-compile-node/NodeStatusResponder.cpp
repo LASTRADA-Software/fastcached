@@ -3,6 +3,7 @@
 #include "NodeStatusResponder.hpp"
 #include "NodeSurfaces.hpp"
 
+#include <FastCache/Core/Ed25519.hpp>
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Distributed/MembershipWire.hpp>
 #include <FastCache/Protocol/SurfaceRefusal.hpp>
@@ -369,6 +370,13 @@ CompileCacheWire::NodeStatusFields ConfiguredNodeStatus::Describe() const
     CompileCacheWire::NodeStatusFields fields;
     fields.version = _version;
     fields.nodeId = _nodeId;
+
+    // The key this node holds (#178), or nothing on a node that holds none: read from the
+    // configuration the start applied it to, so it is the key the startup log named. The
+    // wire spells the width itself, because its header may not include the crypto seam.
+    static_assert(CompileCacheWire::IdentityPublicKeyBytes == Ed25519PublicKeyBytes,
+                  "NodeStatus carries an Ed25519 public key, so the two widths are one fact");
+    fields.runtime.identityPublicKey = _cfg.identityPublicKey;
     fields.uptimeSeconds =
         static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::seconds>(_clock.Now() - _startedAt).count());
 

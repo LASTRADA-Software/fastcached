@@ -9,6 +9,7 @@
 #include <iterator>
 #include <ranges>
 #include <span>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -284,4 +285,60 @@ TEST_CASE("Ed25519Verify refuses a non-canonical S at or above the group order",
         REQUIRE(malleated != signature);
         CHECK_FALSE(Ed25519Verify(publicKey, message, malleated));
     }
+}
+
+TEST_CASE("An Ed25519 public key is spelled as 43 characters of unpadded base64url", "[core][crypto][ed25519]")
+{
+    // The expected strings were computed by a DIFFERENT implementation -- Python's
+    // `base64.urlsafe_b64encode` with the padding stripped -- so the encoder is pinned to an
+    // answer it did not produce. TEST 2's key opens with 0xFC, which reaches `_`, one of the two
+    // symbols the URL-safe alphabet exists for.
+    auto const test1 =
+        ArrayFromHex<Ed25519PublicKeyBytes>("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a");
+    auto const test2 =
+        ArrayFromHex<Ed25519PublicKeyBytes>("fc51cd8e6218a1a38da47ed00230f0580816ed13ba3303ac5deb911548908025");
+    constexpr std::string_view Test1Text = "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo";
+    constexpr std::string_view Test2Text = "_FHNjmIYoaONpH7QAjDwWAgW7RO6MwOsXeuRFUiQgCU";
+
+    CHECK(FormatEd25519PublicKey(test1) == Test1Text);
+    CHECK(FormatEd25519PublicKey(test2) == Test2Text);
+    CHECK(FormatEd25519PublicKey(test1).size() == Ed25519PublicKeyTextLength);
+
+    auto const parsed1 = ParseEd25519PublicKey(Test1Text);
+    auto const parsed2 = ParseEd25519PublicKey(Test2Text);
+    REQUIRE(parsed1.has_value());
+    REQUIRE(parsed2.has_value());
+    CHECK(*parsed1 == test1);
+    CHECK(*parsed2 == test2);
+}
+
+TEST_CASE("A public key's text is refused by what is wrong with it", "[core][crypto][ed25519][negative]")
+{
+    constexpr std::string_view Whole = "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo";
+    auto const faultOf = [](std::string_view text) {
+        auto const parsed = ParseEd25519PublicKey(text);
+        REQUIRE_FALSE(parsed.has_value());
+        return parsed.error();
+    };
+
+    // Cut short and run long -- the second is also what padding looks like, which a key's
+    // spelling never carries.
+    CHECK(faultOf(Whole.substr(0, 42)) == PublicKeyTextFault::WrongLength);
+    CHECK(faultOf(std::string { Whole } + "=") == PublicKeyTextFault::WrongLength);
+    CHECK(faultOf("") == PublicKeyTextFault::WrongLength);
+
+    // The standard alphabet's spelling of the same key: `_` becomes `/`.
+    auto standard = std::string { Whole };
+    std::ranges::replace(standard, '_', '/');
+    CHECK(faultOf(standard) == PublicKeyTextFault::NotBase64Url);
+
+    // A last character carrying a bit no 32-byte key has: `o` is 101000 and `p` is 101001, and
+    // a decoder that dropped the two spare bits would read both as one key.
+    auto nonCanonical = std::string { Whole };
+    nonCanonical.back() = 'p';
+    CHECK(faultOf(nonCanonical) == PublicKeyTextFault::NotBase64Url);
+
+    // Every fault has a sentence, and the sentence says what a key looks like.
+    CHECK(DescribePublicKeyTextFault(PublicKeyTextFault::WrongLength).contains("43"));
+    CHECK(DescribePublicKeyTextFault(PublicKeyTextFault::NotBase64Url).contains("base64url"));
 }

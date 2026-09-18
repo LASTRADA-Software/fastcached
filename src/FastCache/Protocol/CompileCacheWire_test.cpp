@@ -47,6 +47,10 @@ namespace
 TEST_CASE("The wire constants have their specified byte values")
 {
     CHECK(static_cast<std::uint8_t>(Magic) == 0xFC);
+    // Version 11 gives CLUSTER-ADMIT and CLUSTER-ADMIT-LEARNER a member's identity key, as a
+    // third field of the request and a third field of the receipt (#178): two exact arities
+    // moved, which no reader can step over.
+    //
     // Version 10 makes the NODE-METRICS reply a `StatsReading` (#1406): the body of an existing
     // verb changed shape, which no reader can step over.
     //
@@ -65,8 +69,8 @@ TEST_CASE("The wire constants have their specified byte values")
     // no reply body for this verb, and drops the one string the change exists to put on
     // the screen. A missing string does not announce itself as missing, so leaving the
     // floor at 7 would manufacture a quiet failure inside the fix for one.
-    CHECK(CurrentVersion == 10);
-    CHECK(MinSupportedVersion == 10);
+    CHECK(CurrentVersion == 11);
+    CHECK(MinSupportedVersion == 11);
     CHECK(RequestHeaderSize == 7);
     CHECK(ReplyHeaderSize == 5);
 
@@ -112,7 +116,7 @@ TEST_CASE("EncodeFetch emits the specified bytes exactly")
     // clang-format off: the grid IS the specification -- one wire field per row.
     auto const expected = Bytes({
         0xFC,                   // magic
-        0x0A,                   // version
+        0x0B,                   // version
         0x02,                   // op = Fetch
         0x00, 0x00, 0x00, 0x06, // payloadLength = 6
         0x00, 0x00, 0x00, 0x02, // field[0] length = 2
@@ -131,7 +135,7 @@ TEST_CASE("EncodeStore emits the specified bytes exactly")
 
     auto const expected = Bytes({
         0xFC,                               // magic
-        0x0A,                               // version
+        0x0B,                               // version
         0x01,                               // op = Store
         0x00, 0x00, 0x00, 0x19,             // payloadLength = 25 = (4+1) + (4+0) + (4+1) + (4+1) + (4+2)
         0x00, 0x00, 0x00, 0x01, 0x6B,       // key           = "k"
@@ -330,7 +334,7 @@ TEST_CASE("EncodeCacheDrop emits the specified bytes exactly", "[wire][cache-dro
     // clang-format off: the grid IS the specification -- one wire field per row.
     auto const expected = Bytes({
         0xFC,                   // magic
-        0x0A,                   // version
+        0x0B,                   // version
         0x15,                   // op = CacheDrop
         0x00, 0x00, 0x00, 0x06, // payloadLength = 6
         0x00, 0x00, 0x00, 0x02, // field[0] length = 2
@@ -523,7 +527,7 @@ TEST_CASE("EncodeAuth emits the specified bytes exactly")
     auto const frame = EncodeAuth(AuthRequest { .username = "bob", .secret = "hunter2" });
 
     auto const expected = Bytes({
-        0xFC, 0x0A, 0x03,       // magic, version, op=Auth
+        0xFC, 0x0B, 0x03,       // magic, version, op=Auth
         0x00, 0x00, 0x00, 0x12, // payload length: (4+3) + (4+7) = 18
         0x00, 0x00, 0x00, 0x03, 'b', 'o', 'b', 0x00, 0x00, 0x00, 0x07, 'h', 'u', 'n', 't', 'e', 'r', '2',
     });
@@ -1741,7 +1745,11 @@ TEST_CASE("A CLUSTER-ADMIT receipt round-trips what the leader wrote down", "[wi
     // two fields sharing one value let a transposed index through, which is the
     // mistake a two-field encoder invites and the one `RaftWire`'s exemplars were
     // rewritten to catch.
-    auto const sent = ClusterAdmitReceipt { .memberId = "node-c", .raftEndpoint = "10.0.0.9:6675" };
+    //
+    // Three fields since #178, and the key is a third distinct value for the same reason.
+    auto const sent = ClusterAdmitReceipt { .memberId = "node-c",
+                                            .raftEndpoint = "10.0.0.9:6675",
+                                            .publicKey = "PKeyPKeyPKeyPKeyPKeyPKeyPKeyPKeyPKeyPKeyPKe" };
 
     auto const back = DecodeClusterAdmitReceipt(EncodeClusterAdmitReceipt(sent));
     REQUIRE(back.has_value());
@@ -1776,8 +1784,8 @@ TEST_CASE("A receipt survives its own buffer, because an operator reads it", "[w
         // named for -- that the DECODED record outlives the payload -- would be
         // demonstrated by nothing.
         auto const endpoint = std::string { Endpoint };
-        auto const payload = EncodeClusterAdmitReceipt(
-            ClusterAdmitReceipt { .memberId = "a-node-id-of-a-realistic-length", .raftEndpoint = endpoint });
+        auto const payload = EncodeClusterAdmitReceipt(ClusterAdmitReceipt {
+            .memberId = "a-node-id-of-a-realistic-length", .raftEndpoint = endpoint, .publicKey = std::nullopt });
         receipt = DecodeClusterAdmitReceipt(payload);
     }
 
@@ -1801,18 +1809,57 @@ TEST_CASE("A CLUSTER-ADMIT reply with no receipt in it is refused, not read as n
     CHECK_FALSE(DecodeClusterAdmitReceipt({}).has_value());
 }
 
-TEST_CASE("A receipt at any arity but two is refused", "[wire][cluster-admit]")
+TEST_CASE("A receipt at any arity but three is refused", "[wire][cluster-admit]")
 {
     // Exact, like every other reply body here, and BOTH directions: a decoder that
-    // only refuses short bodies reads a longer one's first two fields and silently
-    // drops whatever a newer leader added beside them.
-    auto const tooFew = WireFields::Encode({ AsBytes(std::string_view { "node-c" }) });
-    CHECK_FALSE(DecodeClusterAdmitReceipt(tooFew).has_value());
+    // only refuses short bodies reads a longer one's first fields and silently drops
+    // whatever a newer leader added beside them. The TWO-field body is a version-10
+    // receipt, and refusing it is what keeps a key the leader did record from reading
+    // as none (#178).
+    auto const one = WireFields::Encode({ AsBytes(std::string_view { "node-c" }) });
+    CHECK_FALSE(DecodeClusterAdmitReceipt(one).has_value());
 
-    auto const tooMany = WireFields::Encode({ AsBytes(std::string_view { "node-c" }),
-                                              AsBytes(std::string_view { "10.0.0.9:6675" }),
-                                              AsBytes(std::string_view { "something-newer" }) });
-    CHECK_FALSE(DecodeClusterAdmitReceipt(tooMany).has_value());
+    auto const two =
+        WireFields::Encode({ AsBytes(std::string_view { "node-c" }), AsBytes(std::string_view { "10.0.0.9:6675" }) });
+    CHECK_FALSE(DecodeClusterAdmitReceipt(two).has_value());
+
+    auto const four = WireFields::Encode({ AsBytes(std::string_view { "node-c" }),
+                                           AsBytes(std::string_view { "10.0.0.9:6675" }),
+                                           AsBytes(std::string_view {}),
+                                           AsBytes(std::string_view { "something-newer" }) });
+    CHECK_FALSE(DecodeClusterAdmitReceipt(four).has_value());
+
+    // The control: the same bytes at three fields read.
+    auto const three = WireFields::Encode({ AsBytes(std::string_view { "node-c" }),
+                                            AsBytes(std::string_view { "10.0.0.9:6675" }),
+                                            AsBytes(std::string_view {}) });
+    CHECK(DecodeClusterAdmitReceipt(three).has_value());
+}
+
+TEST_CASE("A receipt names the key the leader recorded, or none, and none is not an empty key",
+          "[wire][cluster-admit][identity]")
+{
+    // #178. Both cases, because a decoder that always produced a key -- or never did --
+    // passes one of them. None travels as a ZERO-LENGTH third field and comes back
+    // DISENGAGED: the decoder is the one place the encoding of absence is read.
+    auto const keyed = ClusterAdmitReceipt { .memberId = "node-c",
+                                             .raftEndpoint = "10.0.0.9:6675",
+                                             .publicKey = "KKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKK" };
+    auto const keyedBack = DecodeClusterAdmitReceipt(EncodeClusterAdmitReceipt(keyed));
+    REQUIRE(keyedBack.has_value());
+    CHECK(Unwrap(keyedBack).publicKey == keyed.publicKey);
+
+    auto const bare =
+        ClusterAdmitReceipt { .memberId = "node-c", .raftEndpoint = "10.0.0.9:6675", .publicKey = std::nullopt };
+    auto const bareBytes = EncodeClusterAdmitReceipt(bare);
+    auto const fields = WireFields::SplitExactly(bareBytes, 3);
+    REQUIRE(fields.has_value());
+    CHECK(Unwrap(fields)[2].empty());
+
+    auto const bareBack = DecodeClusterAdmitReceipt(bareBytes);
+    REQUIRE(bareBack.has_value());
+    CHECK_FALSE(Unwrap(bareBack).publicKey.has_value());
+    CHECK(Unwrap(bareBack) == bare);
 }
 
 TEST_CASE("A receipt carries the bytes it was given, not a tidied version of them", "[wire][cluster-admit]")
@@ -1823,7 +1870,8 @@ TEST_CASE("A receipt carries the bytes it was given, not a tidied version of the
     // normaliser removes. Surrounding space and an unexpected case are both things an
     // operator's shell and keyboard produce; what this case pins is that they come
     // back unchanged, so they can be SEEN.
-    auto const odd = ClusterAdmitReceipt { .memberId = " Node-C ", .raftEndpoint = "[2001:DB8::1]:6675" };
+    auto const odd =
+        ClusterAdmitReceipt { .memberId = " Node-C ", .raftEndpoint = "[2001:DB8::1]:6675", .publicKey = std::nullopt };
 
     auto const back = DecodeClusterAdmitReceipt(EncodeClusterAdmitReceipt(odd));
     REQUIRE(back.has_value());
@@ -2502,17 +2550,19 @@ TEST_CASE("The consensus address rides the runtime record's variable arity, in b
                                                           .state = "raised",
                                                           .detail = "no key",
                                                           .remedy = "name one" } };
+    sent.identityPublicKey.emplace();
+    sent.identityPublicKey->fill(std::byte { 0xA5 });
     // Kept in a local: `SplitAll` hands back spans INTO it.
     auto const emitted = EncodeNodeRuntime(sent);
     auto const parts = WireFields::SplitAll(emitted);
     REQUIRE(parts.has_value());
-    // Seventeen: thirteen that predate #1328, the endpoint it added, #1471's applied-tombstone
-    // count, #1449's consensus standing and #1364's condition list. Pinned, since every cut below
-    // is counted from it and a record that grew would move what "older" means -- which is how this
-    // case caught #1471's append, then #1449's and #1364's, rather than letting any of them shift
-    // the cuts silently. #1449 and #1364 each appended at sixteen on their own; the integration
-    // orders them, the standing first.
-    REQUIRE(Unwrap(parts).size() == 17);
+    // Eighteen: thirteen that predate #1328, the endpoint it added, #1471's applied-tombstone
+    // count, #1449's consensus standing, #1364's condition list and #178's identity key. Pinned,
+    // since every cut below is counted from it and a record that grew would move what "older"
+    // means -- which is how this case caught #1471's append, then #1449's, #1364's and #178's,
+    // rather than letting any of them shift the cuts silently. #1364 and #178 each appended
+    // behind the standing on their own; the integration orders them, the conditions first.
+    REQUIRE(Unwrap(parts).size() == 18);
 
     SECTION("thirteen fields, as a build before #1328 emits: both disengaged, and the cordon still read")
     {
@@ -2568,13 +2618,27 @@ TEST_CASE("The consensus address rides the runtime record's variable arity, in b
         auto const back = DecodeNodeRuntime(WireFields::Encode(WireFields::FieldList { older }));
         REQUIRE(back.has_value());
         CHECK_FALSE(Unwrap(back).conditions.has_value());
+        CHECK_FALSE(Unwrap(back).identityPublicKey.has_value());
         auto const runtime = Unwrap(back);
         REQUIRE(runtime.forgottenClients.has_value());
         CHECK(Unwrap(runtime.forgottenClients) == 2);
         CHECK(runtime.consensusStanding == std::optional { WireConsensusStanding::Learner });
     }
 
-    SECTION("seventeen fields, this build: every fact engaged")
+    SECTION("seventeen fields, as a build after #1364 and before #178 emits: the key is absent")
+    {
+        // The cut #178 has to survive, for #1449's reason: a node that has never held a key
+        // answers with a shorter record, and the key comes back "did not say" rather than taking
+        // the conditions before it -- or the reply -- with it.
+        auto const older = std::vector<std::span<std::byte const>> { Unwrap(parts).begin(), Unwrap(parts).begin() + 17 };
+        auto const back = DecodeNodeRuntime(WireFields::Encode(WireFields::FieldList { older }));
+        REQUIRE(back.has_value());
+        CHECK_FALSE(Unwrap(back).identityPublicKey.has_value());
+        CHECK(Unwrap(back).consensusStanding == std::optional { WireConsensusStanding::Learner });
+        CHECK(Unwrap(back).conditions == sent.conditions);
+    }
+
+    SECTION("eighteen fields, this build: every fact engaged")
     {
         auto const current = std::vector<std::span<std::byte const>> { Unwrap(parts).begin(), Unwrap(parts).end() };
         auto const back = DecodeNodeRuntime(WireFields::Encode(WireFields::FieldList { current }));
@@ -2585,9 +2649,10 @@ TEST_CASE("The consensus address rides the runtime record's variable arity, in b
         CHECK(Unwrap(runtime.forgottenClients) == 2);
         CHECK(runtime.consensusStanding == std::optional { WireConsensusStanding::Learner });
         CHECK(runtime.conditions == sent.conditions);
+        CHECK(runtime.identityPublicKey == sent.identityPublicKey);
     }
 
-    SECTION("eighteen fields, from a build ahead of this one: the surplus is skipped")
+    SECTION("nineteen fields, from a build ahead of this one: the surplus is skipped")
     {
         auto ahead = std::vector<std::span<std::byte const>> { Unwrap(parts).begin(), Unwrap(parts).end() };
         auto const extra = AsBytes(std::string_view { "a fact from the future" });
@@ -2600,6 +2665,40 @@ TEST_CASE("The consensus address rides the runtime record's variable arity, in b
         CHECK(Unwrap(runtime.forgottenClients) == 2);
         CHECK(runtime.consensusStanding == std::optional { WireConsensusStanding::Learner });
         CHECK(runtime.conditions == sent.conditions);
+        CHECK(runtime.identityPublicKey == sent.identityPublicKey);
+    }
+}
+
+TEST_CASE("An identity key travels as its 32 bytes, absent as nothing, and any other width refuses the record",
+          "[wire][nodestatus][identity]")
+{
+    // Absent is a zero-length field, as every optional here is -- a node that holds no key.
+    auto const absent = DecodeNodeRuntime(EncodeNodeRuntime(NodeRuntimeFields {}));
+    REQUIRE(absent.has_value());
+    CHECK_FALSE(Unwrap(absent).identityPublicKey.has_value());
+
+    // A key, every byte distinct, so a decoder that read it from the wrong offset or in the
+    // wrong order cannot come back equal.
+    NodeRuntimeFields sent {};
+    sent.identityPublicKey.emplace();
+    for (auto const index: std::views::iota(std::size_t { 0 }, IdentityPublicKeyBytes))
+        (*sent.identityPublicKey)[index] = static_cast<std::byte>(index + 1);
+    auto const back = DecodeNodeRuntime(EncodeNodeRuntime(sent));
+    REQUIRE(back.has_value());
+    CHECK(Unwrap(back).identityPublicKey == sent.identityPublicKey);
+
+    // A PREFIX of a key is another key, so a short field is refused rather than padded, and a
+    // long one rather than truncated: either would print a string an operator compares against
+    // a machine that holds no such key. The key is the eighteenth field, behind #1364's
+    // conditions.
+    for (auto const width: { std::size_t { 31 }, std::size_t { 33 } })
+    {
+        auto emitted = EncodeNodeRuntime(NodeRuntimeFields {});
+        auto parts = Unwrap(WireFields::SplitAll(emitted));
+        REQUIRE(parts.size() == 18);
+        auto const wrong = std::vector<std::byte>(width, std::byte { 0x11 });
+        parts[17] = wrong;
+        CHECK_FALSE(DecodeNodeRuntime(WireFields::Encode(WireFields::FieldList { parts })).has_value());
     }
 }
 
@@ -2631,9 +2730,10 @@ TEST_CASE("A consensus standing travels as its pinned byte, and one this build c
     sent.forgottenClients = 3;
     auto emitted = EncodeNodeRuntime(sent);
     auto parts = Unwrap(WireFields::SplitAll(emitted));
-    // Seventeen since #1364 appended its condition list behind the standing; the standing is
-    // still the sixteenth field, so the byte replaced below is still the one under test.
-    REQUIRE(parts.size() == 17);
+    // Eighteen since #1364 and #178 appended the condition list and the identity key behind the
+    // standing; the standing is still the sixteenth field, so the byte replaced below is still
+    // the one under test.
+    REQUIRE(parts.size() == 18);
     auto const unknown = std::array { std::byte { 0x7F } };
     parts[15] = unknown;
     auto const back = DecodeNodeRuntime(WireFields::Encode(WireFields::FieldList { parts }));
@@ -2775,7 +2875,9 @@ TEST_CASE("The learner admission occupies the byte it was assigned, beside the v
 
 TEST_CASE("Both member admissions frame one payload under their own byte", "[wire][cluster][learner]")
 {
-    auto const request = ClusterAdmitRequest { .memberId = "laptop", .raftEndpoint = "10.0.0.9:6675" };
+    auto const request = ClusterAdmitRequest { .memberId = "laptop",
+                                               .raftEndpoint = "10.0.0.9:6675",
+                                               .publicKey = "LLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLL" };
     auto const learner = EncodeClusterAdmit<Op::ClusterAdmitLearner>(request);
     auto const voter = EncodeClusterAdmit<Op::ClusterAdmit>(request);
 
@@ -2796,6 +2898,59 @@ TEST_CASE("Both member admissions frame one payload under their own byte", "[wir
     REQUIRE(decoded.has_value());
     CHECK(AsStringView(Unwrap(decoded).memberId) == "laptop");
     CHECK(AsStringView(Unwrap(decoded).raftEndpoint) == "10.0.0.9:6675");
+    REQUIRE(Unwrap(decoded).publicKey.has_value());
+    CHECK(AsStringView(Unwrap(Unwrap(decoded).publicKey)) == "LLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLL");
+}
+
+TEST_CASE("A member admission carries three fields and version 11, as bytes", "[wire][cluster][identity]")
+{
+    // #178. The COUNT and the VERSION, as values and as the bytes a frame carries -- a symbol
+    // both ends spell can only test that they agree with each other, and a version-10 peer
+    // reads the byte, not the name.
+    CHECK(OpFieldCount(Op::ClusterAdmit) == 3);
+    CHECK(OpFieldCount(Op::ClusterAdmitLearner) == 3);
+
+    auto const request =
+        ClusterAdmitRequest { .memberId = "n4", .raftEndpoint = "10.0.0.4:6680", .publicKey = std::nullopt };
+    for (auto const& frame:
+         { EncodeClusterAdmit<Op::ClusterAdmit>(request), EncodeClusterAdmit<Op::ClusterAdmitLearner>(request) })
+    {
+        REQUIRE(frame.size() > RequestHeaderSize);
+        CHECK(std::to_integer<unsigned>(frame[0]) == 0xFC);
+        CHECK(std::to_integer<unsigned>(frame[1]) == 11);
+
+        // No key is a zero-length THIRD field, never a two-field payload: the arity is exact.
+        auto const payload = std::span<std::byte const> { frame }.subspan(RequestHeaderSize);
+        auto const fields = WireFields::SplitExactly(payload, 3);
+        REQUIRE(fields.has_value());
+        CHECK(Unwrap(fields)[2].empty());
+    }
+}
+
+TEST_CASE("A member admission's key is carried, and absence decodes as absence", "[wire][cluster][identity]")
+{
+    // #178. Both directions, because a decoder that invented a key -- or dropped one --
+    // passes the other. And the version-10 shape, two fields, is refused: read leniently it
+    // would admit a member with no key while its operator believed it had one.
+    auto const keyed = EncodeClusterAdmit<Op::ClusterAdmit>(ClusterAdmitRequest {
+        .memberId = "n4", .raftEndpoint = "10.0.0.4:6680", .publicKey = "KKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKK" });
+    auto const keyedView =
+        DecodeClusterAdmitPayload<Op::ClusterAdmit>(std::span<std::byte const> { keyed }.subspan(RequestHeaderSize));
+    REQUIRE(keyedView.has_value());
+    REQUIRE(Unwrap(keyedView).publicKey.has_value());
+    CHECK(AsStringView(Unwrap(Unwrap(keyedView).publicKey)) == "KKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKK");
+
+    auto const bare = EncodeClusterAdmit<Op::ClusterAdmit>(
+        ClusterAdmitRequest { .memberId = "n4", .raftEndpoint = "10.0.0.4:6680", .publicKey = std::nullopt });
+    auto const bareView =
+        DecodeClusterAdmitPayload<Op::ClusterAdmit>(std::span<std::byte const> { bare }.subspan(RequestHeaderSize));
+    REQUIRE(bareView.has_value());
+    CHECK_FALSE(Unwrap(bareView).publicKey.has_value());
+    CHECK(AsStringView(Unwrap(bareView).raftEndpoint) == "10.0.0.4:6680");
+
+    auto const versionTen =
+        WireFields::Encode({ AsBytes(std::string_view { "n4" }), AsBytes(std::string_view { "10.0.0.4:6680" }) });
+    CHECK_FALSE(DecodeClusterAdmitPayload<Op::ClusterAdmit>(versionTen).has_value());
 }
 
 namespace

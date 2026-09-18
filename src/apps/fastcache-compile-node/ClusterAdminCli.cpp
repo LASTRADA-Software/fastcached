@@ -2,6 +2,7 @@
 #include "CacheProtocol.hpp"
 #include "ClusterAdminCli.hpp"
 
+#include <FastCache/Core/Ed25519.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
 #include <chrono>
@@ -39,6 +40,31 @@ namespace
     /// "this member has not said" -- which for a scheduler endpoint is the ordinary
     /// state of every node that has never led, and not a fault.
     constexpr std::string_view Absent = "-";
+
+    /// What a receipt says for an admission that stated no key (#178). Not `Absent`: the
+    /// leader recorded no key BY THIS COMMAND, which keeps one already recorded, and a dash
+    /// in a column of values reads as *this member holds none*.
+    constexpr std::string_view NoKeyStated = "none stated (a key already recorded stays)";
+
+    /// An admission request, with the key spelled back out as the text the wire carries.
+    ///
+    /// Through the one encoder, `FormatEd25519PublicKey`, rather than the text the operator
+    /// typed: the leader parses whatever arrives, and what reached this process is the key
+    /// `ParseMemberSpec` already read, so re-spelling it is the canonical form of the same
+    /// 32 bytes. Absent stays disengaged all the way to the wire's zero-length field.
+    /// @tparam op `Op::ClusterAdmit` or `Op::ClusterAdmitLearner`.
+    /// @param request What the operator asked for.
+    /// @return The framed request.
+    template <Wire::Op op>
+        requires(Wire::IsMemberAdmission(op))
+    [[nodiscard]] std::vector<std::byte> EncodeAdmission(ClusterRequest const& request)
+    {
+        auto const keyText = request.publicKey.transform(FormatEd25519PublicKey);
+        return Wire::EncodeClusterAdmit<op>(Wire::ClusterAdmitRequest {
+            .memberId = request.key,
+            .raftEndpoint = request.value,
+            .publicKey = keyText.transform([](std::string const& text) { return std::string_view { text }; }) });
+    }
 } // namespace
 
 std::vector<std::byte> EncodeClusterRequest(ClusterRequest const& request)
@@ -54,11 +80,9 @@ std::vector<std::byte> EncodeClusterRequest(ClusterRequest const& request)
         case ClusterAction::Forget:
             return Wire::EncodeClusterForget(request.key);
         case ClusterAction::Admit:
-            return Wire::EncodeClusterAdmit<Wire::Op::ClusterAdmit>(
-                Wire::ClusterAdmitRequest { .memberId = request.key, .raftEndpoint = request.value });
+            return EncodeAdmission<Wire::Op::ClusterAdmit>(request);
         case ClusterAction::AdmitLearner:
-            return Wire::EncodeClusterAdmit<Wire::Op::ClusterAdmitLearner>(
-                Wire::ClusterAdmitRequest { .memberId = request.key, .raftEndpoint = request.value });
+            return EncodeAdmission<Wire::Op::ClusterAdmitLearner>(request);
 
         // One encoder for the pair, and the verb is a TEMPLATE argument rather than a
         // value: naming a third verb here does not compile. That is the obligation the
@@ -96,13 +120,37 @@ std::string RenderClusterState(Cluster::ClusterState const& state)
         // and consensus moves towards it one change at a time, so for a moment after an
         // admit it can lead what is counted. `--node-status` on the member says which
         // set it is counted in now.
-        out += std::format("  {:<{}} seat={} raft={} scheduler={}\n",
-                           member.id,
-                           IdColumn,
-                           Cluster::MemberSeatName(member.seat),
-                           member.raftEndpoint,
-                           scheduler);
+        //
+        // The key WHOLE (#178), in the one spelling `--node-status` prints on the member, so
+        // an operator compares two identical strings from two machines. Absent is a member
+        // that has not stated one, which is not a key anybody could type.
+        out +=
+            std::format("  {:<{}} seat={} raft={} scheduler={} key={}\n",
+                        member.id,
+                        IdColumn,
+                        Cluster::MemberSeatName(member.seat),
+                        member.raftEndpoint,
+                        scheduler,
+                        member.publicKey.has_value() ? FormatEd25519PublicKey(*member.publicKey) : std::string { Absent });
     }
+
+    // Said out loud when empty, for the members' reason: an operator reading this after a
+    // revocation needs "none" to be an answer rather than a section that failed to render.
+    out += std::format("principals ({}):\n", state.principals.size());
+    if (state.principals.empty())
+        out += "  (none)\n";
+    for (auto const& principal: state.principals)
+        out += std::format("  {:<{}} role={} key={}\n",
+                           principal.id,
+                           IdColumn,
+                           Cluster::PrincipalRoleName(principal.role),
+                           FormatEd25519PublicKey(principal.publicKey));
+
+    out += std::format("revoked keys ({}):\n", state.revokedKeys.size());
+    if (state.revokedKeys.empty())
+        out += "  (none)\n";
+    for (auto const& revoked: state.revokedKeys)
+        out += std::format("  {:<{}} key={}\n", revoked.id, IdColumn, FormatEd25519PublicKey(revoked.publicKey));
 
     out += std::format("settings ({}):\n", state.settings.size());
     if (state.settings.empty())
@@ -195,9 +243,15 @@ std::expected<std::string, std::string> InterpretClusterReply(ClusterAction acti
             // The seat is NOT in the receipt and is printed anyway, labelled as what it
             // is: the verb this request was sent as, which is the only one the leader
             // can have answered (#1449). It is not an echo, so it is not dressed as one.
+            //
+            // The key IS in it (#178), and an absent one is spelled as what it means rather
+            // than as a dash: this admission stated no key, which KEEPS any key already
+            // recorded -- a dash would read as *this member has no key*, which the leader
+            // did not say.
             auto const seat =
                 action == ClusterAction::AdmitLearner ? Cluster::MemberSeat::Learner : Cluster::MemberSeat::Voter;
             return std::format("recorded, as received:\n"
+                               "  {:<{}}{}\n"
                                "  {:<{}}{}\n"
                                "  {:<{}}{}\n"
                                "  {:<{}}{} (the verb this request was sent as)\n"
@@ -205,16 +259,20 @@ std::expected<std::string, std::string> InterpretClusterReply(ClusterAction acti
                                "Appended, not committed: a majority has to take it, and this leader cannot\n"
                                "see that yet. Ask for the cluster state again to see the result.\n"
                                "\n"
-                               "Compare the first two lines against the machine itself -- the id it minted\n"
-                               "into --cluster-dir, and the consensus endpoint its own --print-surfaces\n"
-                               "prints (or `fastcache-cli node` against it). They are two spellings of one\n"
-                               "thing, and nothing else compares them.\n",
+                               "Compare the first three lines against the machine itself -- the id it minted\n"
+                               "into --cluster-dir, the consensus endpoint its own --print-surfaces prints,\n"
+                               "and the identity key its --node-status prints (or `fastcache-cli node`\n"
+                               "against it). Each is one thing spelled on two machines, and nothing else\n"
+                               "compares them.\n",
                                "member id",
                                ReceiptLabelColumn,
                                receipt->memberId,
                                Wire::ConsensusEndpointLabel,
                                ReceiptLabelColumn,
                                receipt->raftEndpoint,
+                               "identity key",
+                               ReceiptLabelColumn,
+                               receipt->publicKey.value_or(std::string { NoKeyStated }),
                                "seat",
                                ReceiptLabelColumn,
                                Cluster::MemberSeatName(seat));
