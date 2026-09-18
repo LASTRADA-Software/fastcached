@@ -3278,6 +3278,10 @@ set_tests_properties("workflow-walk-sole-selftest" PROPERTIES
     TIMEOUT 120
 )
 
+# TIMEOUT 60 is not raised, and the script header says why with the per-leg figures:
+# its cost is process spawns, multiplied by every neuter, and #1541 took the x64
+# Windows legs to 30-47 s of it and an emulated windows-11-arm past it. The fix was
+# to stop spawning a process per assertion (#1432), not to buy more time.
 add_test(
     NAME "workflow-walk-selftest"
     COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-workflow-walk-selftest.sh"

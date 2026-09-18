@@ -40,6 +40,37 @@
 # nothing is reported as its own failure, because that means either the line is
 # not load-bearing or no assertion reaches it. A green self-test over an
 # unneutered library says only that today's fixtures and today's code agree.
+#
+# ## What it costs, and why the TIMEOUT did not move
+#
+# Neuters multiply the assertions: each one re-runs its case's whole list. While
+# every assertion was a `grep`, the cost was PROCESS SPAWNS, which Windows charges
+# for heavily and an x64-emulated `windows-11-arm` more heavily still. Measured,
+# with the pins these figures describe (they are conditions, not live values):
+#
+#   ctest seconds, per leg       master ee71f868    #1541, 336dffcd    #1543
+#                                run 35338027883    run 35338751765    run 35340951724
+#   assertions / neuters            41 / 13            78 / 29            78 / 29
+#   Windows-cl-release                  11.35            39.65            30.23
+#   Windows-clangcl-release             16.60            34.17            35.82
+#   Windows-cl-debug                     7.73            46.91              --
+#   Windows-cl-release-arm64              --               --          Timeout 60.03
+#   Linux-gcc-release                    0.68             2.35             2.23
+#   macOS-clang-release                  1.62             5.86             5.22
+#
+# So #1541 took the x64 Windows legs to 30-47 s of a 60 s budget -- `cl-debug` at
+# 78% -- and arm64 over it. The spawns were counted with PATH shims on a Windows
+# 11 x64 host under Git Bash: 986 per run, 889 of them `grep`. Assertions now
+# match the transcript in the shell, read once per drive, which left 97 spawns
+# (33 `awk` drives, 29 `sed` + 29 `cmp` for the neuters, 5 `cat`, 1 `mktemp`), and
+# took the same host from 16.99 s to 4.97 s, idle, with every neuter provoking the
+# same number of failures as before.
+#
+# `TIMEOUT 60` stays. A timeout on a degraded runner is not a verdict about the
+# tree (#1515), and raising it would have hidden a cost that grows with every
+# neuter added here; the fix was the cost. A neuter is still one `sed`, one
+# `cmp` and one `awk`, so a large new batch of them is the thing to measure on a
+# Windows leg before it lands.
 set -uo pipefail
 
 FastCachedScriptDir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -165,52 +196,84 @@ Drive() {
 }
 
 # ---- assertions -------------------------------------------------------------
-# Each takes the transcript FILE rather than a pipe: `producer | grep -q` is a
-# false negative under `pipefail` on its SUCCESS path, and reading a file is not
-# a pipe at all.
+# Each takes the transcript TEXT, read once per drive, and matches it in the shell
+# -- no process per assertion. The assertions run once on the clean library and
+# again under every neuter of the same case, so their count multiplies: 78
+# assertions and 29 neuters were 889 `grep` processes, 986 spawns in all
+# (counted, #1432), and a spawn is what a Windows runner charges most for -- the
+# self-test went from 11 s to 40 s on `Windows-cl-release` when #1541 grew it, and
+# timed out at 60 s on an emulated `windows-11-arm`. What it costs now is in
+# the header.
+#
+# A fixed pattern holds no newline, so matching it anywhere in the text is
+# matching it within one line, which is what `grep -F` answered. And nothing here
+# is a pipe, so `producer | grep -q` -- a false negative under `pipefail` on its
+# SUCCESS path -- cannot come back.
 
-# @param 1 transcript file  @param 2 fixed pattern  @param 3 what it proves
+# @param 1 transcript text  @param 2 fixed pattern  @param 3 what it proves
 Require() {
     Counted
-    if grep -Fq -- "$2" "$1"; then return 0; fi
+    case "$1" in
+        *"$2"*) return 0 ;;
+    esac
     Fail "$3 -- no line matching <$2>"
     return 1
 }
 
-# @param 1 transcript file  @param 2 fixed pattern  @param 3 what it proves
+# @param 1 transcript text  @param 2 fixed pattern  @param 3 what it proves
 Refute() {
     Counted
-    if grep -Fq -- "$2" "$1"; then
-        Fail "$3 -- a line matching <$2> is present and must not be"
-        return 1
-    fi
+    case "$1" in
+        *"$2"*)
+            Fail "$3 -- a line matching <$2> is present and must not be"
+            return 1
+            ;;
+    esac
     return 0
 }
 
-# @param 1 transcript file  @param 2 how many  @param 3 fixed pattern  @param 4 what it proves
+# LINES matching, as `grep -c` counted them: a line holding the pattern twice is one.
+# @param 1 transcript text  @param 2 how many  @param 3 fixed pattern  @param 4 what it proves
 RequireCount() {
-    local seen
+    local line seen=0
     Counted
-    seen="$(grep -Fc -- "$3" "$1" || true)"
-    if [ "${seen:-0}" = "$2" ]; then return 0; fi
-    Fail "$4 -- expected $2 line(s) matching <$3>, saw ${seen:-0}"
+    while IFS= read -r line; do
+        case "${line}" in
+            *"$3"*) seen=$((seen + 1)) ;;
+        esac
+    done <<< "$1"
+    if [ "${seen}" = "$2" ]; then return 0; fi
+    Fail "$4 -- expected $2 line(s) matching <$3>, saw ${seen}"
     return 1
+}
+
+# Sets FirstLineAt to the number of the first line of @p 1 holding @p 2, or empty.
+# A variable rather than stdout, because a `$( )` is a fork, which is the cost this
+# file stopped paying per assertion.
+FirstLine() {
+    local line at=0
+    FirstLineAt=""
+    while IFS= read -r line; do
+        at=$((at + 1))
+        case "${line}" in
+            *"$2"*)
+                FirstLineAt=${at}
+                return 0
+                ;;
+        esac
+    done <<< "$1"
+    return 0
 }
 
 # The FIRST line matching @p 2 must come before the first matching @p 3. Both are
 # asserted to match at all, because two absent patterns compare equal and an
 # ordering assertion over nothing passes.
-# @param 1 transcript file  @param 2 earlier  @param 3 later  @param 4 what it proves
+# @param 1 transcript text  @param 2 earlier  @param 3 later  @param 4 what it proves
 RequireOrder() {
     local first later
     Counted
-    # `grep -n` prints `<lineno>:<text>`, so cutting the longest suffix from the
-    # first colon leaves the FIRST match's line number however many matched --
-    # never `| head -1`, which is a false NEGATIVE under `pipefail` on its SUCCESS
-    # path and is what `check-e2e-helpers.sh` refuses. This function was caught by
-    # that scan on its first run, which is the scan doing exactly its job.
-    first="$(grep -nF -- "$2" "$1" || true)"; first="${first%%:*}"
-    later="$(grep -nF -- "$3" "$1" || true)"; later="${later%%:*}"
+    FirstLine "$1" "$2"; first="${FirstLineAt}"
+    FirstLine "$1" "$3"; later="${FirstLineAt}"
     if [ -z "${first}" ] || [ -z "${later}" ]; then
         Fail "$4 -- one of the two patterns matched nothing (<$2>: ${first:-none}, <$3>: ${later:-none})"
         return 1
@@ -548,62 +611,65 @@ YML
 # copy for the neuters would drift, and the neuter would then be holding up a
 # stale list while reporting on the current library.
 Judge() {
-    local name="$1" lib="$2" t
+    local name="$1" lib="$2" t text=""
     t="${FastCachedWork}/$1-$3.out"
     Drive "${FastCachedWork}/${name}.yml" "${lib}" > "${t}"
+    # Read ONCE, by the shell itself: `read -d ''` runs to end of file, which is its
+    # non-zero status, and forks nothing. The file stays for whoever reads a failure.
+    IFS= read -r -d '' text < "${t}" || true
 
     if [ "${name}" = "rich" ]; then
         # The key PATH. Nothing consumes it in this tree yet; it is what will let
         # the four absolute-indentation readers state a path instead of a column.
-        Require "${t}" 'key	on/pull_request/branches	scope=	ind=4' "a nested non-job key carries its ancestry"
-        Require "${t}" 'key	defaults/run/shell	scope=	ind=4' "a workflow default's path is three deep"
-        Require "${t}" 'key	jobs/first/if	scope=job' "a job's own if: is reachable as a key event"
-        Require "${t}" 'key	jobs/first/name	scope=job' "a job's own name: is reachable as a key event"
-        Require "${t}" 'key	jobs/first/steps/with/fetch-depth	scope=step	ind=10' "a with: row is reachable, at step scope"
+        Require "${text}" 'key	on/pull_request/branches	scope=	ind=4' "a nested non-job key carries its ancestry"
+        Require "${text}" 'key	defaults/run/shell	scope=	ind=4' "a workflow default's path is three deep"
+        Require "${text}" 'key	jobs/first/if	scope=job' "a job's own if: is reachable as a key event"
+        Require "${text}" 'key	jobs/first/name	scope=job' "a job's own name: is reachable as a key event"
+        Require "${text}" 'key	jobs/first/steps/with/fetch-depth	scope=step	ind=10' "a with: row is reachable, at step scope"
 
         # A bare scalar sequence entry, which the walk PLACED and reported nothing
         # about until `check-gated-jobs.sh` needed `release.needs`. Both of its two
         # sites are driven -- `needs:`, and `runs-on:`, whose entries additionally
         # accumulate into `WfRunsOn` -- because they are different code paths, and
         # a quoted entry is asserted unquoted.
-        Require "${t}" 'item	jobs/first/needs	earlier' "a needs: entry carries its owning key's path"
-        Require "${t}" 'item	jobs/first/needs	also-earlier' "a quoted sequence entry arrives unquoted"
-        Require "${t}" 'item	jobs/first/runs-on	ubuntu-24.04' "a runs-on: entry fires the same kind as any other"
+        Require "${text}" 'item	jobs/first/needs	earlier' "a needs: entry carries its owning key's path"
+        Require "${text}" 'item	jobs/first/needs	also-earlier' "a quoted sequence entry arrives unquoted"
+        Require "${text}" 'item	jobs/first/runs-on	ubuntu-24.04' "a runs-on: entry fires the same kind as any other"
 
         # The step record. `>-`, `|+` and `|` are three chomping spellings and
         # each owns a different number of body lines.
-        Require "${t}" 'step	job=first	n=1	name=folded chomped	shell=	uses=	run=2	env=0' "a folded chomped scalar owns both its lines"
-        Require "${t}" 'step	job=first	n=2	name=literal kept	shell=	uses=	run=1	env=0' "a literal kept scalar owns its one line"
-        Require "${t}" 'step	job=first	n=3	name=(unnamed)	shell=	uses=actions/checkout	run=0' "a uses: step has no run body and its tag is stripped"
-        Require "${t}" 'run=3	env=2	envnames=ALSO,MINE' "the heredoc body is three lines and the step env: block has two rows"
+        Require "${text}" 'step	job=first	n=1	name=folded chomped	shell=	uses=	run=2	env=0' "a folded chomped scalar owns both its lines"
+        Require "${text}" 'step	job=first	n=2	name=literal kept	shell=	uses=	run=1	env=0' "a literal kept scalar owns its one line"
+        Require "${text}" 'step	job=first	n=3	name=(unnamed)	shell=	uses=actions/checkout	run=0' "a uses: step has no run body and its tag is stripped"
+        Require "${text}" 'run=3	env=2	envnames=ALSO,MINE' "the heredoc body is three lines and the step env: block has two rows"
 
         # A heredoc that WRITES a step is text. Placing it would be a fifth step.
-        RequireCount "${t}" 4 'job=first	n=' "the job has four steps and the heredoc body holds no fifth"
-        Refute "${t}" 'name=not a step' "a heredoc body never becomes a step"
+        RequireCount "${text}" 4 'job=first	n=' "the job has four steps and the heredoc body holds no fifth"
+        Refute "${text}" 'name=not a step' "a heredoc body never becomes a step"
 
         # The step index restarts per job, and the second job's shell is its own.
-        Require "${t}" 'step	job=second	n=1	name=pwsh	shell=pwsh' "the step index restarts in the next job"
+        Require "${text}" 'step	job=second	n=1	name=pwsh	shell=pwsh' "the step index restarts in the next job"
 
         # The job record: its runs-on list joined, its own defaults shell, its env.
-        Require "${t}" 'job	first	at=12	runsOn=< ubuntu-24.04>	shell=<sh>	envnames=JOBWIDE' "the job record carries its runs-on list, its own defaults shell and its env"
-        Require "${t}" 'job	second	at=44	runsOn=<windows-2022>	shell=<>	envnames=-' "a job with no defaults and no env of its own says so rather than inheriting"
+        Require "${text}" 'job	first	at=12	runsOn=< ubuntu-24.04>	shell=<sh>	envnames=JOBWIDE' "the job record carries its runs-on list, its own defaults shell and its env"
+        Require "${text}" 'job	second	at=44	runsOn=<windows-2022>	shell=<>	envnames=-' "a job with no defaults and no env of its own says so rather than inheriting"
 
         # And the ORDER: a job is closed BEFORE the next job's key event fires.
         # Asserted as an order rather than as presence, because both orders
         # produce the same two lines.
-        RequireOrder "${t}" 'job	first	at=12' 'key	jobs/second	scope=job' "a job is closed before the next job's key event"
+        RequireOrder "${text}" 'job	first	at=12' 'key	jobs/second	scope=job' "a job is closed before the next job's key event"
 
         # The workflow scope, which the second pass reads from the first.
-        Require "${t}" 'workflow	shell=<bash>	envnames=TOP' "the workflow-level defaults shell and env are kept"
+        Require "${text}" 'workflow	shell=<bash>	envnames=TOP' "the workflow-level defaults shell and env are kept"
 
         # Every kind, in BOTH passes, and the job kind the same number of times in
         # each -- a pass whose last job is never flushed is what this refuses.
-        Require "${t}" 'tally	pass=1	raw=49	text=6	step-line=15	key=40	step=5	job=2	refusal=0	item=3' "pass 1 drove every structural kind"
-        Require "${t}" 'tally	pass=2	raw=49	text=6	step-line=15	key=40	step=5	job=2	refusal=0	item=3' "pass 2 drove the same kinds the same number of times as pass 1"
+        Require "${text}" 'tally	pass=1	raw=49	text=6	step-line=15	key=40	step=5	job=2	refusal=0	item=3' "pass 1 drove every structural kind"
+        Require "${text}" 'tally	pass=2	raw=49	text=6	step-line=15	key=40	step=5	job=2	refusal=0	item=3' "pass 2 drove the same kinds the same number of times as pass 1"
 
         # The completeness cross-check. Six run: keys -- four steps, and the
         # workflow and job defaults; the one in the heredoc is inside a scalar.
-        Require "${t}" 'count	runKeys=6	placed=6' "every run: key the count found was placed"
+        Require "${text}" 'count	runKeys=6	placed=6' "every run: key the count found was placed"
     fi
 
     if [ "${name}" = "folded" ]; then
@@ -625,105 +691,105 @@ Judge() {
         # site's assignment is not already made by the plain-scalar branch above
         # it, which is why a neuter of it provoked nothing until this shape was
         # in the fixture.
-        Require "${t}" 'blockkeys	NOTE=2,if=3,run=3,working-directory=1' "a continuation names the key whose scalar it belongs to"
+        Require "${text}" 'blockkeys	NOTE=2,if=3,run=3,working-directory=1' "a continuation names the key whose scalar it belongs to"
 
         # The step record, and its own keys as key events -- what the next
         # migration reads instead of `/^        id:/` and `/^        if:/`.
-        Require "${t}" 'key	jobs/only/steps/id	scope=step	ind=8	value=<sweep>' "a step id: is a key at step scope"
-        Require "${t}" 'key	jobs/only/steps/if	scope=step	ind=8	value=<>->' "a folded step if: is a key whose value is the indicator"
-        Require "${t}" 'key	jobs/only/steps/env/NOTE	scope=step	ind=10	value=<>->' "a folded env value is a key inside the step env block"
-        Require "${t}" 'step	job=only	n=1	name=a folded condition and a folded env value	shell=	uses=	run=1	env=1	envnames=NOTE' "the step record has one run line and one env row"
-        Require "${t}" 'tally	pass=2	raw=29	text=9	step-line=13	key=20	step=4	job=1	refusal=0	item=0' "the fixture drives nine continuations over four steps"
+        Require "${text}" 'key	jobs/only/steps/id	scope=step	ind=8	value=<sweep>' "a step id: is a key at step scope"
+        Require "${text}" 'key	jobs/only/steps/if	scope=step	ind=8	value=<>->' "a folded step if: is a key whose value is the indicator"
+        Require "${text}" 'key	jobs/only/steps/env/NOTE	scope=step	ind=10	value=<>->' "a folded env value is a key inside the step env block"
+        Require "${text}" 'step	job=only	n=1	name=a folded condition and a folded env value	shell=	uses=	run=1	env=1	envnames=NOTE' "the step record has one run line and one env row"
+        Require "${text}" 'tally	pass=2	raw=29	text=9	step-line=13	key=20	step=4	job=1	refusal=0	item=0' "the fixture drives nine continuations over four steps"
         # The JOB-level folded condition, whose continuation is outside any step --
         # a  event nothing would report while that kind was step-only, and the
         # shape two of the readers still to migrate join on purpose.
-        Require "${t}" 'key	jobs/only/if	scope=job	ind=4	value=<github.event_name == '"'"'push'"'"'>' "a job-level condition is a key at job scope"
+        Require "${text}" 'key	jobs/only/if	scope=job	ind=4	value=<github.event_name == '"'"'push'"'"'>' "a job-level condition is a key at job scope"
     fi
 
     if [ "${name}" = "matrix" ]; then
         # GitHub's documented example: six combinations, as the documentation lists
         # them. `{fruit: banana}` fits no base combination and is its own, and the
         # row after it is a SECOND one -- only base combinations take a row in.
-        Require "${t}" 'matrix	docs	count=6	unread=<>' "the documented example has six combinations"
-        Require "${t}" 'combo	docs	1	(fruit=apple, animal=cat, color=pink, shape=circle)' "a row naming no axis merges into every combination, and a later row overwrites what it added"
-        Require "${t}" 'combo	docs	2	(fruit=apple, animal=dog, color=green, shape=circle)' "a row matching an ORIGINAL value merges only where it matches"
-        Require "${t}" 'combo	docs	4	(fruit=pear, animal=dog, color=green)' "a combination no later row fits keeps the first row's value"
-        Require "${t}" 'combo	docs	5	(fruit=banana)' "a row overwriting an original value is a new combination of its own keys"
-        Require "${t}" 'combo	docs	6	(fruit=banana, animal=cat)' "a second such row is a second combination, not merged into the first"
+        Require "${text}" 'matrix	docs	count=6	unread=<>' "the documented example has six combinations"
+        Require "${text}" 'combo	docs	1	(fruit=apple, animal=cat, color=pink, shape=circle)' "a row naming no axis merges into every combination, and a later row overwrites what it added"
+        Require "${text}" 'combo	docs	2	(fruit=apple, animal=dog, color=green, shape=circle)' "a row matching an ORIGINAL value merges only where it matches"
+        Require "${text}" 'combo	docs	4	(fruit=pear, animal=dog, color=green)' "a combination no later row fits keeps the first row's value"
+        Require "${text}" 'combo	docs	5	(fruit=banana)' "a row overwriting an original value is a new combination of its own keys"
+        Require "${text}" 'combo	docs	6	(fruit=banana, animal=cat)' "a second such row is a second combination, not merged into the first"
 
         # #1432's shape. The row would overwrite the ORIGINAL `runner`, so it is a
         # third combination -- and `suffix`, which only it carries, expands to
         # NOTHING on the others, which is what keeps their names where they were.
-        Require "${t}" 'matrix	arm	count=3	unread=<>' "an include row that fits no base combination adds one"
-        Require "${t}" 'combo	arm	3	(preset=gcc-release, runner=ubuntu-24.04-arm, suffix=-arm64)' "the new combination carries the row's own keys"
-        Require "${t}" 'expand	arm	1	runsOn=<ubuntu-24.04>	probe=<clang-release>' "a key a combination lacks expands EMPTY, in either spelling of the reference"
-        Require "${t}" 'expand	arm	3	runsOn=<ubuntu-24.04-arm>	probe=<gcc-release-arm64>' "runs-on and a name expand for the combination that carries the key"
+        Require "${text}" 'matrix	arm	count=3	unread=<>' "an include row that fits no base combination adds one"
+        Require "${text}" 'combo	arm	3	(preset=gcc-release, runner=ubuntu-24.04-arm, suffix=-arm64)' "the new combination carries the row's own keys"
+        Require "${text}" 'expand	arm	1	runsOn=<ubuntu-24.04>	probe=<clang-release>' "a key a combination lacks expands EMPTY, in either spelling of the reference"
+        Require "${text}" 'expand	arm	3	runsOn=<ubuntu-24.04-arm>	probe=<gcc-release-arm64>' "runs-on and a name expand for the combination that carries the key"
 
         # No axes: no base combination, so every row is its own -- and a key the
         # second row lacks expands EMPTY in `runs-on`.
-        Require "${t}" 'matrix	only	count=2	unread=<>' "a matrix of include rows alone runs one combination per row"
-        Require "${t}" 'expand	only	2	runsOn=<>	probe=<>' "a runs-on naming a key the combination lacks expands EMPTY"
+        Require "${text}" 'matrix	only	count=2	unread=<>' "a matrix of include rows alone runs one combination per row"
+        Require "${text}" 'expand	only	2	runsOn=<>	probe=<>' "a runs-on naming a key the combination lacks expands EMPTY"
 
         # Exclude runs BEFORE include, so a row can add back what an exclude took;
         # a block-sequence axis and every quoting of a value read the same.
-        Require "${t}" 'matrix	excluded	count=4	unread=<>' "exclude removes, and include adds back"
-        Require "${t}" 'combo	excluded	1	(os=a, version=12)' "a partial exclude row removes every combination it matches"
-        Require "${t}" 'combo	excluded	2	(os=b, c, version=10)' "a quoted block-sequence value keeps its comma"
-        Require "${t}" 'combo	excluded	4	(os=a, version=10, extra=back)' "an include row adds back an excluded combination"
-        Require "${t}" 'combo	quoting	2	(name=x, y)' "a quoted flow-sequence item keeps its comma"
-        Require "${t}" 'combo	quoting	3	(name=it'"'"'s)' "a doubled apostrophe in a single-quoted item is one"
+        Require "${text}" 'matrix	excluded	count=4	unread=<>' "exclude removes, and include adds back"
+        Require "${text}" 'combo	excluded	1	(os=a, version=12)' "a partial exclude row removes every combination it matches"
+        Require "${text}" 'combo	excluded	2	(os=b, c, version=10)' "a quoted block-sequence value keeps its comma"
+        Require "${text}" 'combo	excluded	4	(os=a, version=10, extra=back)' "an include row adds back an excluded combination"
+        Require "${text}" 'combo	quoting	2	(name=x, y)' "a quoted flow-sequence item keeps its comma"
+        Require "${text}" 'combo	quoting	3	(name=it'"'"'s)' "a doubled apostrophe in a single-quoted item is one"
 
         # A matrix written below the steps still reaches them.
-        Require "${t}" 'step-expand	late	2	runsOn=<windows-11-arm>' "a step sees the combinations of a matrix written after it"
+        Require "${text}" 'step-expand	late	2	runsOn=<windows-11-arm>' "a step sees the combinations of a matrix written after it"
 
         # A reference differing from a key only in CASE is left for the consumer.
-        Require "${t}" 'expand	folded	1	runsOn=<${{ matrix.Os }}>' "a reference that matches a key only case-folded is left unexpanded, not expanded EMPTY"
+        Require "${text}" 'expand	folded	1	runsOn=<${{ matrix.Os }}>' "a reference that matches a key only case-folded is left unexpanded, not expanded EMPTY"
 
         # Every matrix the walk cannot read is refused ONCE, and leaves no
         # combinations -- never one plausible leg.
-        Require "${t}" 'unreadable-matrix	job `fromjson`: `matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}` is not a block mapping of axes' "an expression in place of the matrix is refused"
-        Require "${t}" 'unreadable-matrix	job `nested`: `os:` in an `include` row has no inline value' "a row value that is a nested mapping is refused"
-        Require "${t}" 'unreadable-matrix	job `rowlist`: `os: [a, b]` in an `include` row opens with the YAML indicator `[`' "a row value that is a flow list is refused"
-        Require "${t}" 'unreadable-matrix	job `wrapped`: the axis `preset: [a,` does not close its list on its own line' "a flow list wrapped over two lines is refused"
-        Require "${t}" 'unreadable-matrix	job `continued`: `two` continues a matrix value onto another line' "a plain value continued onto a second line is refused"
-        Require "${t}" 'unreadable-matrix	job `badexclude`: an `exclude` row names `os`, which is not an axis' "an exclude naming no axis is refused"
-        Require "${t}" 'unreadable-matrix	job `flowrow`: `- {preset: a}` under `include` is not a row written as a block mapping' "a flow-mapping row is refused"
-        Require "${t}" 'unreadable-matrix	job `expr`: `suffix: ${{ github.sha }}` in an `include` row carries an expression' "a value carrying an expression is refused"
-        Require "${t}" 'unreadable-matrix	job `flownested`: the axis `os: [[a, b]]` nests a collection' "a nested flow list is refused"
-        Require "${t}" 'unreadable-matrix	job `empty`: the axis `preset` has no values' "an axis with no values is refused"
+        Require "${text}" 'unreadable-matrix	job `fromjson`: `matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}` is not a block mapping of axes' "an expression in place of the matrix is refused"
+        Require "${text}" 'unreadable-matrix	job `nested`: `os:` in an `include` row has no inline value' "a row value that is a nested mapping is refused"
+        Require "${text}" 'unreadable-matrix	job `rowlist`: `os: [a, b]` in an `include` row opens with the YAML indicator `[`' "a row value that is a flow list is refused"
+        Require "${text}" 'unreadable-matrix	job `wrapped`: the axis `preset: [a,` does not close its list on its own line' "a flow list wrapped over two lines is refused"
+        Require "${text}" 'unreadable-matrix	job `continued`: `two` continues a matrix value onto another line' "a plain value continued onto a second line is refused"
+        Require "${text}" 'unreadable-matrix	job `badexclude`: an `exclude` row names `os`, which is not an axis' "an exclude naming no axis is refused"
+        Require "${text}" 'unreadable-matrix	job `flowrow`: `- {preset: a}` under `include` is not a row written as a block mapping' "a flow-mapping row is refused"
+        Require "${text}" 'unreadable-matrix	job `expr`: `suffix: ${{ github.sha }}` in an `include` row carries an expression' "a value carrying an expression is refused"
+        Require "${text}" 'unreadable-matrix	job `flownested`: the axis `os: [[a, b]]` nests a collection' "a nested flow list is refused"
+        Require "${text}" 'unreadable-matrix	job `empty`: the axis `preset` has no values' "an axis with no values is refused"
         # A plain scalar is TYPED: `3.10` is the number 3.1, which is what GitHub
         # renders, and whether `10` matches `"10"` is a question about types. Both are
         # refused -- a guess is a wrong name or a missing leg, and both read as clean.
-        Require "${t}" 'unreadable-matrix	job `typed`: the axis `python: [3.9, 3.10]` holds `3.9`, which is a plain scalar YAML types as a number' "a value YAML types as a float is refused, not rendered as its text"
-        Require "${t}" 'unreadable-matrix	job `kinds`: it compares `10`, written as an integer, with `10`, written as a string' "an integer and a string with one text are not taken to match"
+        Require "${text}" 'unreadable-matrix	job `typed`: the axis `python: [3.9, 3.10]` holds `3.9`, which is a plain scalar YAML types as a number' "a value YAML types as a float is refused, not rendered as its text"
+        Require "${text}" 'unreadable-matrix	job `kinds`: it compares `10`, written as an integer, with `10`, written as a string' "an integer and a string with one text are not taken to match"
         # Two keys one case fold apart, and a row opened by a bare dash, whose keys would
         # otherwise be read as the previous row's -- both a leg merged away in silence.
-        Require "${t}" 'unreadable-matrix	job `casekeys`: the keys `os` and `OS` differ only in case' "keys differing only in case are refused, not read as two keys"
-        Require "${t}" 'unreadable-matrix	job `baredash`: a bare `-`, with its keys on the lines below, under `include`' "a bare dash is refused, not read as the previous row continuing"
-        RequireCount "${t}" 14 'count=0	unread=<' "every refused matrix leaves its job NO combinations"
-        Require "${t}" 'tally	pass=1	raw=202	text=2	step-line=22	key=196	step=21	job=21	refusal=14	item=3' "pass 1 refused each unreadable matrix once"
-        Require "${t}" 'tally	pass=2	raw=202	text=2	step-line=22	key=196	step=21	job=21	refusal=14	item=3' "pass 2 refused each unreadable matrix once, as pass 1 did"
+        Require "${text}" 'unreadable-matrix	job `casekeys`: the keys `os` and `OS` differ only in case' "keys differing only in case are refused, not read as two keys"
+        Require "${text}" 'unreadable-matrix	job `baredash`: a bare `-`, with its keys on the lines below, under `include`' "a bare dash is refused, not read as the previous row continuing"
+        RequireCount "${text}" 14 'count=0	unread=<' "every refused matrix leaves its job NO combinations"
+        Require "${text}" 'tally	pass=1	raw=202	text=2	step-line=22	key=196	step=21	job=21	refusal=14	item=3' "pass 1 refused each unreadable matrix once"
+        Require "${text}" 'tally	pass=2	raw=202	text=2	step-line=22	key=196	step=21	job=21	refusal=14	item=3' "pass 2 refused each unreadable matrix once, as pass 1 did"
     fi
 
     if [ "${name}" = "edges" ]; then
-        Require "${t}" 'refusal	7	unreadable-yaml	a step written as `{ name: flow, run: echo flow }`' "a flow mapping step is refused, not misread"
-        Require "${t}" 'refusal	9	unreadable-run	`run: *someAnchor`' "an alias as a run: value is refused"
-        Require "${t}" 'refusal	10	unreadable-yaml	a step written as `"quoted key step":`' "a quoted step key is refused"
-        Require "${t}" 'refusal	15	unreadable-run	`run: "echo unterminated`' "a quoted scalar left open is refused"
-        Require "${t}" 'refusal	20	unreadable-yaml	a document marker after the first document' "a second document is refused"
+        Require "${text}" 'refusal	7	unreadable-yaml	a step written as `{ name: flow, run: echo flow }`' "a flow mapping step is refused, not misread"
+        Require "${text}" 'refusal	9	unreadable-run	`run: *someAnchor`' "an alias as a run: value is refused"
+        Require "${text}" 'refusal	10	unreadable-yaml	a step written as `"quoted key step":`' "a quoted step key is refused"
+        Require "${text}" 'refusal	15	unreadable-run	`run: "echo unterminated`' "a quoted scalar left open is refused"
+        Require "${text}" 'refusal	20	unreadable-yaml	a document marker after the first document' "a second document is refused"
 
         # A key under a REFUSED line must not inherit the ancestry of whatever
         # key last sat at that indent -- which here belonged to another step.
-        Require "${t}" 'key	jobs/one/steps/?/nothing' "an unreadable ancestor is marked in the path"
-        Refute "${t}" 'key	jobs/one/steps/run/nothing' "the path must not claim a readable ancestor it does not have"
+        Require "${text}" 'key	jobs/one/steps/?/nothing' "an unreadable ancestor is marked in the path"
+        Refute "${text}" 'key	jobs/one/steps/run/nothing' "the path must not claim a readable ancestor it does not have"
 
         # A doubled apostrophe in a YAML single-quoted scalar is ONE apostrophe,
         # and the step is read rather than refused.
-        Require "${t}" 'step	job=one	n=4	name=quoted run	shell=	uses=	run=1' "a single-quoted run: with a doubled apostrophe is read"
-        Require "${t}" 'job	one	at=4' "the first job is closed although its last step was refused"
-        Require "${t}" 'job	two	at=16' "the last job of the file is closed in END"
-        Require "${t}" 'tally	pass=1	raw=21	text=0	step-line=10	key=18	step=6	job=2	refusal=5	item=0' "pass 1 drove five refusals and six steps"
-        Require "${t}" 'tally	pass=2	raw=21	text=0	step-line=10	key=18	step=6	job=2	refusal=5	item=0' "pass 2 drove the same"
+        Require "${text}" 'step	job=one	n=4	name=quoted run	shell=	uses=	run=1' "a single-quoted run: with a doubled apostrophe is read"
+        Require "${text}" 'job	one	at=4' "the first job is closed although its last step was refused"
+        Require "${text}" 'job	two	at=16' "the last job of the file is closed in END"
+        Require "${text}" 'tally	pass=1	raw=21	text=0	step-line=10	key=18	step=6	job=2	refusal=5	item=0' "pass 1 drove five refusals and six steps"
+        Require "${text}" 'tally	pass=2	raw=21	text=0	step-line=10	key=18	step=6	job=2	refusal=5	item=0' "pass 2 drove the same"
     fi
 }
 
