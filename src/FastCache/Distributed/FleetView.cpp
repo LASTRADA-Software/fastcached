@@ -2855,6 +2855,19 @@ namespace
         out += std::format(R"(<p class="condition-remedy">{}</p></div>)", EscapeHtml(row.remedy));
     }
 
+    /// The panel's modifier class: none while some machine asks for attention, and otherwise which of the two
+    /// quiet readings the fleet is in -- every machine said nothing is raised, or some machine said nothing at all.
+    /// The second is dressed apart because it is the one nothing here can vouch for.
+    /// @param anyAsking Whether some machine has a condition asking for attention.
+    /// @param anyAbsent Whether some machine sent no conditions at all.
+    /// @return The class suffix, with its leading space, or empty.
+    [[nodiscard]] std::string_view ConditionsPanelModifier(bool anyAsking, bool anyAbsent) noexcept
+    {
+        if (anyAsking)
+            return {};
+        return anyAbsent ? " conditions--absent" : " conditions--quiet";
+    }
+
     /// What is wrong across the fleet, before anything else on the page (#1364).
     ///
     /// **A panel, not a column**: forty machines each with a cell of ids would put the one thing an
@@ -2869,32 +2882,43 @@ namespace
     /// @param snapshot What to render.
     void AppendConditionsPanel(std::string& out, FleetSnapshot const& snapshot)
     {
-        std::vector<NodeReport const*> asking;
+        // A machine that asks is held with the rows it sent, taken where the list was found present, so
+        // nothing below reads an optional it has not just checked.
+        struct Asking
+        {
+            NodeReport const* node;                                         ///< The machine.
+            std::vector<CompileCacheWire::NodeConditionFields> const* rows; ///< What it sent.
+        };
+        std::vector<Asking> asking;
         std::size_t quiet = 0;
         std::vector<std::string> absent;
         for (auto const& node: snapshot.nodes)
         {
             if (!node.conditions.has_value())
+            {
                 absent.push_back(node.endpoint);
-            else if (std::ranges::any_of(*node.conditions, &CompileCacheWire::AsksForAttention))
-                asking.push_back(&node);
+                continue;
+            }
+            auto const& rows = *node.conditions;
+            if (std::ranges::any_of(rows, &CompileCacheWire::AsksForAttention))
+                asking.push_back(Asking { .node = &node, .rows = &rows });
             else
                 ++quiet;
         }
 
-        auto const* const modifier = !asking.empty() ? "" : absent.empty() ? " conditions--quiet" : " conditions--absent";
+        auto const modifier = ConditionsPanelModifier(!asking.empty(), !absent.empty());
         out += std::format(R"(<section><div class="sec-head"><h2>Conditions</h2><span class="rule"></span>)"
                            R"(<span class="meta">what each machine says is wrong with it</span></div>)"
                            R"(<div class="panel conditions{}">)",
                            modifier);
 
-        for (auto const* const node: asking)
+        for (auto const& [node, rows]: asking)
         {
             out += std::format(R"(<div class="machine-conditions"><h3>{}{}</h3>)",
                                EscapeHtml(node->endpoint),
                                node->displayName.empty() ? std::string {}
                                                          : std::format(" &middot; {}", EscapeHtml(node->displayName)));
-            for (auto const& row: *node->conditions)
+            for (auto const& row: *rows)
                 if (CompileCacheWire::AsksForAttention(row))
                     AppendRaisedCondition(out, row);
             out += "</div>";

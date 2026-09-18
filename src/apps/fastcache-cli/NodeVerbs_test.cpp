@@ -2370,6 +2370,7 @@ TEST_CASE("`node-conditions` lists every row, exits by whether any asks, and ref
         CHECK(answer.outcome == Outcome::Affirmative);
 
         std::vector<std::string> expected;
+        expected.reserve(Cc::ConditionFieldTable.size());
         for (auto const& field: Cc::ConditionFieldTable)
             expected.emplace_back(field.name);
         CHECK(answer.value.columns == expected);
