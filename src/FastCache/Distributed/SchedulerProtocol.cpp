@@ -29,11 +29,19 @@ namespace
     /// A table rather than three `case` labels so the membership test below is
     /// derived from it: a verb that reaches this class without a row is refused
     /// rather than served, which is the direction a mistake has to fail in.
-    constexpr std::array SchedulerOps {
-        Wire::Op::Register,      Wire::Op::NodeAnnounce, Wire::Op::Heartbeat,          Wire::Op::Withdraw,
-        Wire::Op::Lease,         Wire::Op::Release,      Wire::Op::ClusterStatus,      Wire::Op::ClusterSet,
-        Wire::Op::ClusterForget, Wire::Op::ClusterAdmit, Wire::Op::ClusterAdmitClient, Wire::Op::ClusterForgetClient
-    };
+    constexpr std::array SchedulerOps { Wire::Op::Register,
+                                        Wire::Op::NodeAnnounce,
+                                        Wire::Op::Heartbeat,
+                                        Wire::Op::Withdraw,
+                                        Wire::Op::Lease,
+                                        Wire::Op::Release,
+                                        Wire::Op::ClusterStatus,
+                                        Wire::Op::ClusterSet,
+                                        Wire::Op::ClusterForget,
+                                        Wire::Op::ClusterAdmit,
+                                        Wire::Op::ClusterAdmitLearner,
+                                        Wire::Op::ClusterAdmitClient,
+                                        Wire::Op::ClusterForgetClient };
 
     /// Whether this scheduler serves @p op at all.
     /// @param op The verb, already resolved against `OpTable`.
@@ -466,11 +474,23 @@ SchedulerReply SchedulerProtocol::Route(Wire::Op op, std::span<std::byte const> 
         }
 
         case Wire::Op::ClusterAdmit: {
-            auto const fields = Wire::DecodeClusterAdmitPayload(payload);
+            auto const fields = Wire::DecodeClusterAdmitPayload<Wire::Op::ClusterAdmit>(payload);
             if (!fields.has_value())
                 return SchedulerReply::Malformed();
-            return _service.ClusterAdmit(
-                caller, Wire::AsStringView(fields->memberId), Wire::AsStringView(fields->raftEndpoint));
+            return _service.ClusterAdmit(caller,
+                                         Wire::AsStringView(fields->memberId),
+                                         Wire::AsStringView(fields->raftEndpoint),
+                                         Cluster::MemberSeat::Voter);
+        }
+
+        case Wire::Op::ClusterAdmitLearner: {
+            auto const fields = Wire::DecodeClusterAdmitPayload<Wire::Op::ClusterAdmitLearner>(payload);
+            if (!fields.has_value())
+                return SchedulerReply::Malformed();
+            return _service.ClusterAdmit(caller,
+                                         Wire::AsStringView(fields->memberId),
+                                         Wire::AsStringView(fields->raftEndpoint),
+                                         Cluster::MemberSeat::Learner);
         }
         default:
             // Unreachable: `IsSchedulerVerb` has already refused everything else.

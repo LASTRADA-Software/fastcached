@@ -4,6 +4,7 @@
 // `Role` itself is in `RaftTypes.hpp` and reaches the header. Same rule the tier
 // samples follow against `StorageTierTable`: a fifth role reaches the scrape by
 // being a row rather than by somebody remembering a second place.
+#include <FastCache/Consensus/RaftMembership.hpp>
 #include <FastCache/Consensus/RaftNode.hpp>
 #include <FastCache/Metrics/MetricsCatalog.hpp>
 #include <FastCache/Metrics/PrometheusFormatter.hpp>
@@ -364,14 +365,20 @@ static void AppendConsensusMetrics(std::string& out, ConsensusStatus const& stat
     // that are perfectly ordinary. Without an unconditional row a node holding no
     // configuration during an election would render nothing at all, which reads as a
     // process with no consensus rather than as the one thing #435 exists to show.
+    //
+    // Voters AND learners (#1449): the members this node replicates to or is replicated
+    // from. How many of them a quorum counts is the `seat` label on the member series
+    // below, which a scraper sums by -- a second gauge would be a second spelling of it.
+    auto const& configuration = status.configuration;
     Append(out,
            Metric { .name = "fastcache_node_consensus_members",
-                    .help = "Members in the configuration this node's consensus operates under. 0 is a reading, not "
-                            "an absence: the node holds no configuration, so it campaigns in no election and grants "
-                            "no vote. That is the ordinary waiting state of a --raft-join node and a fault for any "
-                            "other. A process running no consensus renders none of these series at all.",
+                    .help = "Members in the configuration this node's consensus operates under, voters and learners "
+                            "alike. 0 is a reading, not an absence: the node holds no configuration, so it campaigns "
+                            "in no election and grants no vote. That is the ordinary waiting state of a --raft-join "
+                            "node and a fault for any other. A process running no consensus renders none of these "
+                            "series at all.",
                     .type = Gauge,
-                    .value = static_cast<std::uint64_t>(status.members.size()) });
+                    .value = static_cast<std::uint64_t>(configuration.voters.size() + configuration.learners.size()) });
 
     Append(out,
            Metric { .name = "fastcache_node_consensus_term",
@@ -401,22 +408,29 @@ static void AppendConsensusMetrics(std::string& out, ConsensusStatus const& stat
     for (auto const& row: Consensus::RoleTable)
         out += std::format("fastcache_node_consensus_role{{role=\"{}\"}} {}\n", row.name, row.role == status.role ? 1 : 0);
 
-    // One sample per member, carrying its id. The SET rather than only its size,
-    // because "which members does this node count" is the question an operator asks
-    // when a cluster will not re-elect, and the count alone cannot answer it.
+    // One sample per member, carrying its id and its seat. The SET rather than only its
+    // size, because "which members does this node count" is the question an operator
+    // asks when a cluster will not re-elect, and the count alone cannot answer it -- and
+    // since #1449 the seat is half that answer: a learner is a member no quorum counts.
+    // Its spelling is `StandingTable`'s, through `StandingOf`, so the label and every
+    // other place a standing is named cannot disagree.
     //
     // No line at all for a node holding no configuration -- the rule a tier the cache
     // does not have already follows, and readable here for the same reason: the three
     // series above are unconditional, so their presence is what says consensus is
     // running and this one's absence says the configuration is empty.
-    if (!status.members.empty())
+    if (!Consensus::Membership::IsEmpty(configuration))
     {
         out += std::format("# HELP {0} {1}\n# TYPE {0} {2}\n",
                            "fastcache_node_consensus_member",
-                           "One sample per member of the configuration this node operates under.",
+                           "One sample per member of the configuration this node operates under. seat is voter or "
+                           "learner; only a voter is counted by a quorum.",
                            TypeName(Gauge));
-        for (auto const& member: status.members)
-            out += std::format("fastcache_node_consensus_member{{member=\"{}\"}} 1\n", member);
+        for (auto const* const set: { &configuration.voters, &configuration.learners })
+            for (auto const& member: *set)
+                out += std::format("fastcache_node_consensus_member{{member=\"{}\",seat=\"{}\"}} 1\n",
+                                   member,
+                                   Consensus::TraitsOf(Consensus::Membership::StandingOf(configuration, member)).name);
     }
 
     // And who it believes leads, absent during an election.

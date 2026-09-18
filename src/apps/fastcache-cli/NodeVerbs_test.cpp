@@ -1223,7 +1223,10 @@ TEST_CASE("the cluster verbs send the opcodes the wire table names", "[cli][node
            Expectation { .verb = "cluster-settings", .operands = {}, .op = Cc::Op::ClusterStatus },
            Expectation { .verb = "cluster-set", .operands = { "fleet-open", "1" }, .op = Cc::Op::ClusterSet },
            Expectation { .verb = "cluster-forget", .operands = { "node-b" }, .op = Cc::Op::ClusterForget },
-           Expectation { .verb = "cluster-admit", .operands = { "node-c", "10.0.0.9:6675" }, .op = Cc::Op::ClusterAdmit } })
+           Expectation { .verb = "cluster-admit", .operands = { "node-c", "10.0.0.9:6675" }, .op = Cc::Op::ClusterAdmit },
+           Expectation { .verb = "cluster-admit-learner",
+                         .operands = { "node-c", "10.0.0.9:6675" },
+                         .op = Cc::Op::ClusterAdmitLearner } })
     {
         INFO("verb: " << expectation.verb);
         ScriptedNodeExchange node { { ClusterStatusReply(
@@ -2171,4 +2174,94 @@ TEST_CASE("every admission route the node can send has a spelling an operator ca
         // is what a missing row would produce and what every other assertion here allows.
         CHECK_FALSE(described.lexical.contains("too old to name"));
     }
+}
+
+// --------------------------------------------------------------------------
+// Learners (#1449).
+
+TEST_CASE("cluster-members says which seat each member was admitted into", "[cli][node][cluster][learner]")
+{
+    // The RECORD, built through `Apply` as a leader acquires it: a voter, a learner, and
+    // a learner promoted by a re-admit -- so a renderer spelling every seat the same way
+    // is red on at least one row.
+    Cluster::ClusterState state;
+    auto const admit = [&state](Cluster::CommandKind kind, std::string id, std::string raft) {
+        Apply(state,
+              Cluster::Command { .kind = kind, .key = std::move(id), .value = std::move(raft), .schedulerEndpoint = {} });
+    };
+    admit(Cluster::CommandKind::AddMember, "node-a", "10.0.0.7:6675");
+    admit(Cluster::CommandKind::AddLearner, "node-b", "10.0.0.8:6675");
+    admit(Cluster::CommandKind::AddLearner, "node-c", "10.0.0.9:6675");
+    admit(Cluster::CommandKind::AddMember, "node-c", "10.0.0.9:6675");
+
+    ScriptedNodeExchange node { { ClusterStatusReply(state) } };
+    auto const answer = RunNodeVerb("cluster-members", node);
+    REQUIRE(answer.outcome == Outcome::Affirmative);
+
+    auto const& rows = RowsOf(answer);
+    REQUIRE(rows.size() == 3);
+    auto const id = ColumnOf(answer, "id");
+    auto const seat = ColumnOf(answer, "seat");
+    CHECK(rows[0][id].lexical == "node-a");
+    CHECK(rows[0][seat].lexical == "voter");
+    CHECK(rows[1][id].lexical == "node-b");
+    CHECK(rows[1][seat].lexical == "learner");
+    CHECK(rows[2][id].lexical == "node-c");
+    CHECK(rows[2][seat].lexical == "voter");
+}
+
+TEST_CASE("cluster-admit-learner reports the seat it asked for, as asked rather than as recorded",
+          "[cli][node][cluster][learner]")
+{
+    // The receipt carries no seat -- it is the verb's byte, and a field echoing the request
+    // is the constant the receipt refuses to carry -- so the field NAME says where the value
+    // came from. Both verbs, so a handler that spelled one seat for both is red.
+    auto const receipt =
+        Cc::EncodeClusterAdmitReceipt(Cc::ClusterAdmitReceipt { .memberId = "node-c", .raftEndpoint = "10.0.0.9:6675" });
+
+    ScriptedNodeExchange learner { { Cc::EncodeReply(Cc::Status::Ok, receipt) } };
+    auto const asLearner = RunNodeVerb("cluster-admit-learner", learner, { "node-c", "10.0.0.9:6675" });
+    REQUIRE(asLearner.outcome == Outcome::Affirmative);
+    CHECK(RequiredCell(asLearner, "seat-as-requested").lexical == "learner");
+    CHECK(RequiredCell(asLearner, "member-id-as-received").lexical == "node-c");
+    CHECK(RequiredCell(asLearner, "state").lexical == "appended, not committed");
+
+    ScriptedNodeExchange voter { { Cc::EncodeReply(Cc::Status::Ok, receipt) } };
+    auto const asVoter = RunNodeVerb("cluster-admit", voter, { "node-c", "10.0.0.9:6675" });
+    REQUIRE(asVoter.outcome == Outcome::Affirmative);
+    CHECK(RequiredCell(asVoter, "seat-as-requested").lexical == "voter");
+}
+
+TEST_CASE("`node` reports which set consensus counts it in", "[cli][node][verbs][consensus][learner]")
+{
+    // A learner and a following voter report the same `scheduler-role`; this is the field
+    // that tells an operator which of them will stand when the leader goes. Every standing,
+    // so a renderer that named one of them wrongly is red.
+    for (auto const& [standing, name]:
+         { std::pair { Cc::WireConsensusStanding::Voter, std::string_view { "voter" } },
+           std::pair { Cc::WireConsensusStanding::Learner, std::string_view { "learner" } },
+           std::pair { Cc::WireConsensusStanding::NoCluster, std::string_view { "no-cluster" } },
+           std::pair { Cc::WireConsensusStanding::Outsider, std::string_view { "outsider" } } })
+    {
+        INFO("standing: " << name);
+        ScriptedNodeExchange node { { StatusReply({ .version = "1.2.3",
+                                                    .nodeId = "node-a",
+                                                    .uptimeSeconds = 5,
+                                                    .surfaces = {},
+                                                    .components = Cc::NodeComponentBit::Consensus,
+                                                    .runtime = { .consensusStanding = standing } }) } };
+        auto const answer = RunNodeVerb("node", node);
+        CHECK(RequiredCell(answer, "consensus-standing").lexical == name);
+    }
+
+    // Absent on a node running no consensus, rather than a standing it does not have.
+    ScriptedNodeExchange none { { StatusReply({ .version = "1.2.3",
+                                                .nodeId = "node-a",
+                                                .uptimeSeconds = 5,
+                                                .surfaces = {},
+                                                .components = Cc::NodeComponentBit::Worker,
+                                                .runtime = {} }) } };
+    auto const answer = RunNodeVerb("node", none);
+    CHECK(answer.outcome == Outcome::Affirmative);
+    CHECK(CellOf(answer, "consensus-standing") == nullptr);
 }

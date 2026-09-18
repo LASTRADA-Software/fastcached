@@ -664,13 +664,22 @@ class SchedulerService
     ///
     /// It is attached at this call site rather than inside `Offer`, so the other two
     /// verbs' reply shape is unchanged; the argument is at the attachment.
+    ///
+    /// **The seat is a parameter and the receipt does not echo it** (#1449). It is
+    /// chosen by the VERB the operator sent -- `ClusterAdmit` or `ClusterAdmitLearner`
+    /// -- so the client already knows it, and a receipt field nobody can vary against
+    /// the request is the constant `ClusterAdmitReceipt` refuses to carry. Re-admitting
+    /// a member in the other seat is how it is promoted or demoted.
     /// @param caller Who is asking.
     /// @param memberId The member's identity.
     /// @param raftEndpoint host:port its consensus port answers on.
+    /// @param seat Which set of the configuration to record it in; nullopt for a caller
+    ///        with no opinion, which keeps the recorded seat (`Cluster::RecordedSeatOf`).
     /// @return The receipt for what was recorded, or why it was refused.
     [[nodiscard]] SchedulerReply ClusterAdmit(CallerContext const& caller,
                                               std::string_view memberId,
-                                              std::string_view raftEndpoint);
+                                              std::string_view raftEndpoint,
+                                              std::optional<Cluster::MemberSeat> seat);
 
     /// Where the leader answers, when one is known.
     ///

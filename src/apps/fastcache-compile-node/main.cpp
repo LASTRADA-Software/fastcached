@@ -801,6 +801,11 @@ using Node::NodeReloader;
     // anybody.
     auto const servesEnrollment = ServesEnrollment(cfg, schedulerTier.get());
 
+    // Where this node sits in its consensus configuration (#1449), for `NodeStatus`. A SLOT,
+    // because the tier that answers is built below and this surface is built now -- see
+    // `ConsensusStandingSlot`. Declared before the status that reads it, so destroyed after.
+    Node::ConsensusStandingSlot consensusStanding;
+
     Node::ConfiguredNodeStatus const nodeStatus {
         cfg,
         statusClock,
@@ -842,7 +847,11 @@ using Node::NodeReloader;
                                    // only exists where consensus runs, so this pointer is what
                                    // draws the distinction and a keyless node reports the field
                                    // ABSENT rather than `0` (#1471).
-                                   .membership = AddressWhen(Node::RunsConsensus(cfg), membership) },
+                                   .membership = AddressWhen(Node::RunsConsensus(cfg), membership),
+                                   // The same predicate, for the same reason: a standing is a
+                                   // claim about a configuration only a consensus node holds, so
+                                   // a node running none reports the field ABSENT (#1449).
+                                   .consensus = AddressWhen(Node::RunsConsensus(cfg), consensusStanding) },
     };
 
     // The operator verbs. Declared BEFORE the surface that routes to it and therefore
@@ -1027,6 +1036,10 @@ using Node::NodeReloader;
     }
     // May legitimately be null: no `--node-id` means this node leads alone.
     auto const consensusTier = std::move(*consensusOrRefusal);
+
+    // Attached as soon as the tier exists and before anything serves, and detached before the
+    // tier is destroyed: the attachment is declared after it. A null tier attaches nothing.
+    auto const consensusStandingAttached = consensusStanding.Attach(consensusTier.get());
 
     // Discovery, when the operator configured it. Declared AFTER consensus and so
     // destroyed before it, because its observer pushes into the tier above: a

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Consensus/RaftConfig.hpp>
+#include <FastCache/Consensus/RaftMembership.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -19,7 +20,8 @@ namespace
 [[nodiscard]] RaftConfig Sound()
 {
     return RaftConfig { .self = "n1",
-                        .members = { "n1", "n2", "n3" },
+                        .voters = { "n1", "n2", "n3" },
+                        .learners = {},
                         .electionTimeoutMin = 150ms,
                         .electionTimeoutMax = 300ms,
                         .heartbeatInterval = 50ms };
@@ -60,7 +62,7 @@ TEST_CASE("An empty member set is a node with no cluster, not a broken one", "[c
     // startable alternative bootstraps a one-member cluster of its own, and a node
     // that has elected itself can never be admitted to somebody else's.
     auto config = Sound();
-    config.members.clear();
+    config.voters.clear();
     CHECK(config.Validate().has_value());
 }
 
@@ -71,7 +73,7 @@ TEST_CASE("A node with no cluster is still held to its timings", "[consensus][ra
     // -- it declines to act on it, but the moment it is admitted it will -- so an
     // inverted range accepted here would be one nobody discovers until then.
     auto config = Sound();
-    config.members.clear();
+    config.voters.clear();
     config.electionTimeoutMin = 300ms;
     config.electionTimeoutMax = 150ms;
 
@@ -85,7 +87,7 @@ TEST_CASE("A duplicated member is refused", "[consensus][raft][config]")
     // A duplicate is counted twice toward a quorum, so a "majority" could be one
     // physical node agreeing with itself -- Election Safety lost to a typo.
     auto config = Sound();
-    config.members = { "n1", "n2", "n2" };
+    config.voters = { "n1", "n2", "n2" };
 
     auto const result = config.Validate();
     REQUIRE_FALSE(result.has_value());
@@ -138,15 +140,12 @@ TEST_CASE("Non-positive timeouts are refused", "[consensus][raft][config]")
     }
 }
 
-TEST_CASE("Quorum is a strict majority", "[consensus][raft][config]")
+TEST_CASE("Quorum is a strict majority of the voters", "[consensus][raft][config]")
 {
-    // Two overlapping majorities always share a member, which is the whole
-    // mechanism behind Election Safety -- so this is floor(n/2)+1, never n/2.
-    auto config = Sound();
-
-    auto const quorumOf = [&config](std::vector<NodeId> members) {
-        config.members = std::move(members);
-        return config.Quorum();
+    // Two overlapping majorities always share a voter, which is the whole
+    // mechanism behind Election Safety -- so this is floor(v/2)+1, never v/2.
+    auto const quorumOf = [](std::vector<NodeId> voters) {
+        return Membership::QuorumOf(Configuration { .voters = std::move(voters), .learners = {} });
     };
 
     CHECK(quorumOf({ "a" }) == 1);
@@ -156,22 +155,54 @@ TEST_CASE("Quorum is a strict majority", "[consensus][raft][config]")
     CHECK(quorumOf({ "a", "b", "c", "d", "e" }) == 3);
 }
 
-TEST_CASE("Peers are the members other than this node", "[consensus][raft][config]")
+TEST_CASE("Learners do not move the quorum", "[consensus][raft][config][learner]")
 {
-    auto const config = Sound();
-    auto const peers = config.Peers();
+    // The whole of what a learner is (#1449): one voter and any number of learners
+    // is a quorum of one, which is what lets the always-on machine of a pair lead
+    // while the other is off its VPN. The voter-only arithmetic above is the
+    // control -- one voter is a quorum of one there too.
+    auto const one = Configuration { .voters = { "a" }, .learners = { "b", "c", "d" } };
+    CHECK(Membership::QuorumOf(one) == 1);
 
-    REQUIRE(peers.size() == 2);
-    CHECK(peers[0] == "n2");
-    CHECK(peers[1] == "n3");
+    auto const three = Configuration { .voters = { "a", "b", "c" }, .learners = { "d" } };
+    CHECK(Membership::QuorumOf(three) == 2);
 }
 
-TEST_CASE("A single-node cluster has no peers", "[consensus][raft][config]")
+TEST_CASE("A node may be bootstrapped as a learner", "[consensus][raft][config][learner]")
 {
+    // A usually-absent machine is a learner on its own command line as much as in
+    // the leader's log: `self` is found in either set.
     auto config = Sound();
-    config.members = { "n1" };
+    config.self = "laptop";
+    config.learners = { "laptop" };
+    CHECK(config.Validate().has_value());
+}
 
-    CHECK(config.Peers().empty());
-    CHECK(config.Quorum() == 1);
+TEST_CASE("A member that is both a voter and a learner is refused", "[consensus][raft][config][learner]")
+{
+    // Counted by one rule and excused by the other -- one member meaning two things.
+    // The sets are disjoint because the duplicate check runs over both at once.
+    auto config = Sound();
+    config.learners = { "n3" };
+
+    auto const result = config.Validate();
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().code == ConsensusErrorCode::InvalidConfiguration);
+    CHECK(result.error().context.contains("n3"));
+}
+
+TEST_CASE("A configuration of learners alone is refused", "[consensus][raft][config][learner]")
+{
+    // Nobody may lead a cluster of learners. Not the empty configuration either --
+    // that one is legal and means no cluster yet -- so this is asserted beside it.
+    auto config = Sound();
+    config.voters.clear();
+    config.learners = { "n1", "n2" };
+
+    auto const result = config.Validate();
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().context.contains("voter"));
+
+    config.learners.clear();
     CHECK(config.Validate().has_value());
 }

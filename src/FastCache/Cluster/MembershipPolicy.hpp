@@ -31,6 +31,15 @@ struct DesiredMember
     /// simply never knew. A node says `""` about itself and `nullopt` about a peer,
     /// and only the first of those is an assertion.
     std::optional<std::string> schedulerEndpoint;
+
+    /// Which set it should be in; absent when this node has no opinion (#1449).
+    ///
+    /// Absent is not `Voter`, for `schedulerEndpoint`'s reason one field along: a node
+    /// desires ITSELF on every pass, so a record that always said voter would promote an
+    /// operator's demotion straight back. With no opinion the recorded seat stands, and a
+    /// member not yet recorded is admitted as a voter -- which is what discovery has
+    /// always admitted.
+    std::optional<MemberSeat> seat;
 };
 
 /// What a leader should propose to make the cluster's state say what it knows.
@@ -75,11 +84,28 @@ struct DesiredMember
 ///
 /// ## One change, and which one
 ///
-/// A configuration change may add **or** remove exactly one member (§4.3), so this
-/// returns one step and is called again when it commits. Additions come first:
-/// growing before shrinking keeps the quorum reachable while a replacement is in
-/// progress, where the other order passes through a configuration that is smaller
+/// A configuration change may add, remove, promote **or** demote exactly one member
+/// (§4.3, and `Consensus::Membership::Classify`), so this returns one step and is
+/// called again when it commits. Additions come first -- into whichever set the
+/// member's record names -- then promotions, then demotions, then removals: growing
+/// the voter set before shrinking it keeps the quorum reachable while a replacement is
+/// in progress, where the other order passes through a configuration that is smaller
 /// than either endpoint.
+///
+/// ## Learners (#1449)
+///
+/// A learner is proposed, moved and removed on the same terms as a voter, with one
+/// difference that follows from what it is: adding one changes no quorum, so it is
+/// always safe -- and it still waits for a dialable address, since a member nothing
+/// can replicate to never catches up. A promotion is a voter ADDITION and waits for
+/// one for the voter reason. A demotion or removal that would leave no voter is never
+/// proposed: a configuration nobody is counted in can commit nothing, including the
+/// change that would undo it.
+///
+/// **A learner is never removed for being absent**, which is the property `--raft-peer`
+/// members already have below, and for the same reason: nothing here asks whether a
+/// member ANSWERS. Only a member the operator forgot -- gone from the state, admitted
+/// at runtime -- is removed, whichever set it is in.
 ///
 /// ## What it refuses to propose
 ///
@@ -128,13 +154,13 @@ struct DesiredMember
 /// quorum until one leads again; it fails closed, counting a member too many rather
 /// than too few.
 /// @param state The cluster's state as this node last applied it.
-/// @param active The member set consensus currently counts.
+/// @param active The configuration consensus currently holds, both sets.
 /// @param self This node's id.
-/// @param bootstrap The member set this node was started with; never removed.
-/// @return The member set to propose, or nullopt when nothing should change.
-[[nodiscard]] std::optional<std::vector<Consensus::NodeId>> NextQuorumChange(ClusterState const& state,
-                                                                             std::span<Consensus::NodeId const> active,
-                                                                             Consensus::NodeId const& self,
-                                                                             std::span<Consensus::NodeId const> bootstrap);
+/// @param bootstrap The ids this node was started with, in either set; never removed.
+/// @return The configuration to propose, or nullopt when nothing should change.
+[[nodiscard]] std::optional<Consensus::Configuration> NextQuorumChange(ClusterState const& state,
+                                                                       Consensus::Configuration const& active,
+                                                                       Consensus::NodeId const& self,
+                                                                       std::span<Consensus::NodeId const> bootstrap);
 
 } // namespace FastCache::Cluster

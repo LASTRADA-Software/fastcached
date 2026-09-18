@@ -1222,13 +1222,17 @@ echo "cluster E2E: an admitted node is replicated to, which is being counted, an
 # not the quorum, and only a leader answers it at all, so the one node whose view is
 # needed is the one that redirects. #435 is that surface; until it exists this line
 # is what an operator has too.
+#
+# And counted as a VOTER, which the line has said since #1449: a node counted as a
+# learner is replicated to and counted by nothing, so it would satisfy "counts N
+# member(s)" while voting in no election -- the very property this wait exists for.
 adopted=0
 _e2e_deadline_arm "$JoinSeconds"
 adopted_armed="$_e2e_deadline_armed"
 adopted_dpid="${adopted_armed%% *}"
 adopted_dmark="${adopted_armed#* }"
 while ! _e2e_deadline_passed "$adopted_dmark"; do
-    if grep -q "consensus: this node counts [0-9]* member(s)" "${workdir}/n4.log" 2>/dev/null; then
+    if grep -q "consensus: this node counts [0-9]* member(s): .*; it is a voter" "${workdir}/n4.log" 2>/dev/null; then
         adopted=1
         break
     fi
@@ -1238,7 +1242,7 @@ _e2e_deadline_disarm "$adopted_dpid" "$adopted_dmark"
 if [[ "$adopted" -ne 1 ]]; then
     echo "n4 never adopted a configuration. What it last said about its own quorum:"
     grep -E "consensus: this node counts" "${workdir}/n4.log" 2>/dev/null || echo "  (nothing -- it never reported one at all)"
-    fail "the admitted node never counted itself a member within ${JoinSeconds}s, so it can vote in no election"
+    fail "the admitted node never counted itself a voting member within ${JoinSeconds}s, so it can vote in no election"
 fi
 echo "cluster E2E: the admitted node counts itself a member: $(grep -o "counts [0-9]* member(s)" "${workdir}/n4.log" | tail -1)"
 

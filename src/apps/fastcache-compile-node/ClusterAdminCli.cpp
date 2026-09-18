@@ -54,7 +54,10 @@ std::vector<std::byte> EncodeClusterRequest(ClusterRequest const& request)
         case ClusterAction::Forget:
             return Wire::EncodeClusterForget(request.key);
         case ClusterAction::Admit:
-            return Wire::EncodeClusterAdmit(
+            return Wire::EncodeClusterAdmit<Wire::Op::ClusterAdmit>(
+                Wire::ClusterAdmitRequest { .memberId = request.key, .raftEndpoint = request.value });
+        case ClusterAction::AdmitLearner:
+            return Wire::EncodeClusterAdmit<Wire::Op::ClusterAdmitLearner>(
                 Wire::ClusterAdmitRequest { .memberId = request.key, .raftEndpoint = request.value });
 
         // One encoder for the pair, and the verb is a TEMPLATE argument rather than a
@@ -88,7 +91,17 @@ std::string RenderClusterState(Cluster::ClusterState const& state)
         auto const scheduler = member.schedulerEndpoint.empty()
                                    ? std::format("{} ({})", Absent, Cluster::SchedulerEndpointStateName(member))
                                    : member.schedulerEndpoint;
-        out += std::format("  {:<{}} raft={} scheduler={}\n", member.id, IdColumn, member.raftEndpoint, scheduler);
+        //
+        // The seat is the RECORD (#1449) -- what the operator admitted the member as --
+        // and consensus moves towards it one change at a time, so for a moment after an
+        // admit it can lead what is counted. `--node-status` on the member says which
+        // set it is counted in now.
+        out += std::format("  {:<{}} seat={} raft={} scheduler={}\n",
+                           member.id,
+                           IdColumn,
+                           Cluster::MemberSeatName(member.seat),
+                           member.raftEndpoint,
+                           scheduler);
     }
 
     out += std::format("settings ({}):\n", state.settings.size());
@@ -149,7 +162,8 @@ std::expected<std::string, std::string> InterpretClusterReply(ClusterAction acti
             // than after the change has replicated.
             return std::string { "accepted; the change is replicating\n" };
 
-        case ClusterAction::Admit: {
+        case ClusterAction::Admit:
+        case ClusterAction::AdmitLearner: {
             auto const receipt = Wire::DecodeClusterAdmitReceipt(reply);
             if (!receipt.has_value())
                 // NOT *an older leader*, which is the tempting sentence and is wrong
@@ -177,23 +191,33 @@ std::expected<std::string, std::string> InterpretClusterReply(ClusterAction acti
             // second screen to hold them against, and an operator who does not know
             // that compares them with their own memory, which is what nothing was
             // comparing in the first place.
+            //
+            // The seat is NOT in the receipt and is printed anyway, labelled as what it
+            // is: the verb this request was sent as, which is the only one the leader
+            // can have answered (#1449). It is not an echo, so it is not dressed as one.
+            auto const seat =
+                action == ClusterAction::AdmitLearner ? Cluster::MemberSeat::Learner : Cluster::MemberSeat::Voter;
             return std::format("recorded, as received:\n"
                                "  {:<{}}{}\n"
                                "  {:<{}}{}\n"
+                               "  {:<{}}{} (the verb this request was sent as)\n"
                                "\n"
                                "Appended, not committed: a majority has to take it, and this leader cannot\n"
                                "see that yet. Ask for the cluster state again to see the result.\n"
                                "\n"
-                               "Compare both lines above against the machine itself -- the id it minted into\n"
-                               "--cluster-dir, and the consensus endpoint its own --print-surfaces prints\n"
-                               "(or `fastcache-cli node` against it). They are two spellings of one thing,\n"
-                               "and nothing else compares them.\n",
+                               "Compare the first two lines against the machine itself -- the id it minted\n"
+                               "into --cluster-dir, and the consensus endpoint its own --print-surfaces\n"
+                               "prints (or `fastcache-cli node` against it). They are two spellings of one\n"
+                               "thing, and nothing else compares them.\n",
                                "member id",
                                ReceiptLabelColumn,
                                receipt->memberId,
                                Wire::ConsensusEndpointLabel,
                                ReceiptLabelColumn,
-                               receipt->raftEndpoint);
+                               receipt->raftEndpoint,
+                               "seat",
+                               ReceiptLabelColumn,
+                               Cluster::MemberSeatName(seat));
         }
     }
 

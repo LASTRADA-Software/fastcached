@@ -288,7 +288,8 @@ void ApplyNodeIdentity(NodeConfig& cfg, NodeIdentity const& identity)
         Cluster::ClusterMember { .id = identity.id,
                                  .raftEndpoint = std::move(*endpoint),
                                  .schedulerEndpoint = {},
-                                 .schedulerEndpointHistory = Cluster::SchedulerEndpointHistory::NeverAnnounced });
+                                 .schedulerEndpointHistory = Cluster::SchedulerEndpointHistory::NeverAnnounced,
+                                 .seat = Cluster::MemberSeat::Voter });
 }
 
 } // namespace FastCache::Node

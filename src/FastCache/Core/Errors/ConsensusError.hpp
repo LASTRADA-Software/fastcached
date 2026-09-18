@@ -17,6 +17,11 @@ namespace FastCache
 /// Deliberately small, and grown one enumerator at a time as a phase of the
 /// consensus library actually produces one — the taxonomy is not invented up
 /// front.
+///
+/// **Private: never transmitted or persisted.** What a client is told is
+/// `SchedulerService`'s `WireCodeFor`, a table over this enum, so an insertion
+/// here moves nothing any other process reads -- which is also why no enumerator
+/// but the first states a value. `ToString` prints the ordinal for a log line only.
 enum class ConsensusErrorCode : std::uint8_t
 {
     InvalidConfiguration = 0, ///< The cluster configuration is not self-consistent.
@@ -32,6 +37,13 @@ enum class ConsensusErrorCode : std::uint8_t
 
     NotLeader,      ///< Only a leader may accept a proposal; see `knownLeader`.
     StorageFailure, ///< Durable state could not be written or read back.
+
+    /// Durable state is intact and was written by a build that laid it out
+    /// differently (#1449). The storage rule, arriving in the Raft store: an old
+    /// store is `UnsupportedFormatVersion`, never the `StorageFailure` a DAMAGED one
+    /// is -- because the code is what an operator acts on, and "the store is
+    /// corrupt" is what makes somebody delete a healthy one.
+    UnsupportedFormatVersion,
 
     // Peer-wire decode failures. Three rather than one because a reader's
     // correct response differs: an unknown message type or an unsupported
@@ -114,6 +126,9 @@ inline constexpr EnumTable<ConsensusErrorCode, RefusalSubjectRow> RefusalSubject
     { .code = ConsensusErrorCode::MembershipUnchanged, .subject = RefusalSubject::Satisfied },
     { .code = ConsensusErrorCode::NotLeader, .subject = RefusalSubject::Moment },
     { .code = ConsensusErrorCode::StorageFailure, .subject = RefusalSubject::Moment },
+    // About this NODE, like `StorageFailure`: it refuses the node's start, so no
+    // proposal is ever refused with it, and were one, the next would be too.
+    { .code = ConsensusErrorCode::UnsupportedFormatVersion, .subject = RefusalSubject::Moment },
     { .code = ConsensusErrorCode::MalformedFrame, .subject = RefusalSubject::Moment },
     { .code = ConsensusErrorCode::UnknownMessageType, .subject = RefusalSubject::Moment },
     { .code = ConsensusErrorCode::UnsupportedVersion, .subject = RefusalSubject::Moment },
@@ -227,6 +242,21 @@ struct ConsensusError
 [[nodiscard]] inline ConsensusError StorageFailure(std::string_view context)
 {
     return ConsensusError { .code = ConsensusErrorCode::StorageFailure,
+                            .context = std::string { context },
+                            .knownLeader = std::nullopt };
+}
+
+/// Build an `UnsupportedFormatVersion` error.
+///
+/// Separate from `StorageFailure` because the remedy is: an intact store another
+/// build wrote is moved aside -- there is no conversion before production-ready --
+/// while a damaged one is a disk or a crash to investigate. Refused by NAME, with
+/// both versions in the context, so nobody reads a layout change as damage.
+/// @param context Which file, the version it carries and the one this build reads.
+/// @return The error.
+[[nodiscard]] inline ConsensusError UnsupportedFormatVersion(std::string_view context)
+{
+    return ConsensusError { .code = ConsensusErrorCode::UnsupportedFormatVersion,
                             .context = std::string { context },
                             .knownLeader = std::nullopt };
 }

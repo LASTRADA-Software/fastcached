@@ -494,21 +494,27 @@ TEST_CASE("A node's consensus block names every member and who leads", "[metrics
         RenderPrometheus(metrics,
                          MetricsSnapshot { .storage = std::nullopt,
                                            .host = std::nullopt,
-                                           .consensus = ConsensusStatus { .members = { "n1", "n2", "n3" },
-                                                                          .knownLeader = Consensus::NodeId { "n2" },
-                                                                          .term = Consensus::Term { .value = 4 },
-                                                                          .commitIndex = Consensus::LogIndex { .value = 11 },
-                                                                          .role = Consensus::Role::Follower } });
+                                           .consensus = ConsensusStatus {
+                                               .configuration = { .voters = { "n1", "n2", "n3" }, .learners = { "laptop" } },
+                                               .knownLeader = Consensus::NodeId { "n2" },
+                                               .term = Consensus::Term { .value = 4 },
+                                               .commitIndex = Consensus::LogIndex { .value = 11 },
+                                               .role = Consensus::Role::Follower } });
 
-    CHECK(body.contains("fastcache_node_consensus_members 3\n"));
+    // Voters AND learners: the members this node replicates with (#1449). Which of them
+    // a quorum counts is the `seat` label below, not a second gauge.
+    CHECK(body.contains("fastcache_node_consensus_members 4\n"));
     CHECK(body.contains("fastcache_node_consensus_term 4\n"));
     CHECK(body.contains("fastcache_node_consensus_commit_index 11\n"));
 
     // The set, not only its size: "which members does this node count" is the
     // question asked when a cluster will not re-elect, and a count cannot answer it.
-    CHECK(body.contains("fastcache_node_consensus_member{member=\"n1\"} 1\n"));
-    CHECK(body.contains("fastcache_node_consensus_member{member=\"n2\"} 1\n"));
-    CHECK(body.contains("fastcache_node_consensus_member{member=\"n3\"} 1\n"));
+    // And since #1449 the SEAT is half that answer, since a learner is a member no
+    // quorum counts -- spelled as `StandingTable` spells it.
+    CHECK(body.contains("fastcache_node_consensus_member{member=\"n1\",seat=\"voter\"} 1\n"));
+    CHECK(body.contains("fastcache_node_consensus_member{member=\"n2\",seat=\"voter\"} 1\n"));
+    CHECK(body.contains("fastcache_node_consensus_member{member=\"n3\",seat=\"voter\"} 1\n"));
+    CHECK(body.contains("fastcache_node_consensus_member{member=\"laptop\",seat=\"learner\"} 1\n"));
     // One HELP/TYPE pair for the series, with the three samples under it: repeating
     // the header per label value is what a scraper rejects, and it is the mistake a
     // per-sample `Append` loop makes silently -- every value is present and the
@@ -533,11 +539,12 @@ TEST_CASE("The consensus role is a state set driven by RoleTable", "[metrics][pr
 
     for (auto const& subject: Consensus::RoleTable)
     {
-        auto const body =
-            RenderPrometheus(metrics,
-                             MetricsSnapshot { .storage = std::nullopt,
-                                               .host = std::nullopt,
-                                               .consensus = ConsensusStatus { .members = { "n1" }, .role = subject.role } });
+        auto const body = RenderPrometheus(
+            metrics,
+            MetricsSnapshot { .storage = std::nullopt,
+                              .host = std::nullopt,
+                              .consensus = ConsensusStatus { .configuration = { .voters = { "n1" }, .learners = {} },
+                                                             .role = subject.role } });
 
         for (auto const& row: Consensus::RoleTable)
             CHECK(body.contains(std::format(
@@ -554,13 +561,13 @@ TEST_CASE("A node in an election names no leader rather than an empty one", "[me
     // Absence is the spelling, and it is readable because the three unconditional
     // series are still there saying consensus is running.
     AtomicMetricsSink metrics;
-    auto const body =
-        RenderPrometheus(metrics,
-                         MetricsSnapshot { .storage = std::nullopt,
-                                           .host = std::nullopt,
-                                           .consensus = ConsensusStatus { .members = { "n1", "n2" },
-                                                                          .term = Consensus::Term { .value = 9 },
-                                                                          .role = Consensus::Role::Candidate } });
+    auto const body = RenderPrometheus(
+        metrics,
+        MetricsSnapshot { .storage = std::nullopt,
+                          .host = std::nullopt,
+                          .consensus = ConsensusStatus { .configuration = { .voters = { "n1", "n2" }, .learners = {} },
+                                                         .term = Consensus::Term { .value = 9 },
+                                                         .role = Consensus::Role::Candidate } });
 
     CHECK_FALSE(body.contains("fastcache_node_consensus_leader"));
     CHECK(body.contains("fastcache_node_consensus_members 2\n"));

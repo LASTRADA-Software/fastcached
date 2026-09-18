@@ -79,6 +79,37 @@ to do step 5 rather than a reason to skip it.
 The asymmetry is worth stating plainly: **the server can see this and the client
 cannot.** Check the servers.
 
+## The consensus state directory
+
+**#1449 (learners) changed what a consensus member writes to disk and says to its
+peers, so a fleet running consensus crosses it as one step as well.** Three formats
+moved, each refused by name rather than misread:
+
+| What | Now | Refused as |
+|---|---|---|
+| The Raft store in `--cluster-dir` (`raft-state`, `raft-log`, `raft-snapshot`) | format 2: a configuration carries voters and learners, and every log record carries the format it was written in | `UnsupportedFormatVersion` — never the damage code — naming the format it found and the one it reads |
+| The consensus peer wire | version 3 | refused at the handshake by its version, never read as this layout -- a fleet's consensus members upgrade together |
+| The replicated cluster state (a snapshot, and the `--cluster-status` reply) | version 5: each member records its seat | `UnsupportedVersion`, naming both versions |
+
+The store has **no conversion**, and a node started on an older one refuses to start,
+saying so. The store is intact; what an operator does is:
+
+1. Stop the node.
+2. Move `raft-state`, `raft-log` and `raft-snapshot` out of its `--cluster-dir`,
+   **leaving `node-id` where it is** — the identity lives in the same directory, and a
+   wiped identity is a different node.
+3. Start it again. It comes back with an empty log under its bootstrap configuration
+   (`--raft-peer`), or waiting to be admitted if it was started with `--raft-join`.
+
+Whatever the cluster agreed at **runtime** has to be agreed again once a leader is
+elected: members admitted with `--cluster-admit` or `--cluster-admit-learner`, and
+cluster settings (`--cluster-set`). Members found by `--discovery` are re-admitted by
+discovery itself. Nothing a build writes into `--cache-dir` is involved.
+
+This is backwards compatibility not being owed yet, and it is stated rather than
+discovered: the version on each format is what turns *an older store* into a refusal
+that names itself instead of a store read as damage.
+
 ## Downgrading
 
 The same procedure, in the same order. Nothing in the on-disk cache format is tied to

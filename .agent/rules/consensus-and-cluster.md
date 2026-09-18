@@ -316,13 +316,15 @@ plausible simpler design gets wrong.
     consumes a `seq`. Stepping over an UNVERIFIED frame would be a free injection channel.
 
 - **The version is a property of the CONNECTION, and it moved to 2 because the GRAMMAR
-  changed.** A handshake before the first message and a trailer after every frame are a
-  different grammar, which is what a version is for -- the opposite of #402, where only
-  discovery's MAC input changed and `DiscoveryWire::CurrentVersion` rightly stayed. Read
-  the two together: the question is always WHICH changed. `MinSupportedVersion` is 2 as
-  well, because a version 1 peer authenticates nothing and accepting one is the
-  per-connection fallback this ticket refuses; so a fleet upgrades its consensus members
-  together. A session frame whose version byte differs from the handshake's closes the
+  changed** -- and to 3 for #1449, whose `InstallSnapshot` carries a configuration of two
+  sets where it carried one list (see *Learners* below). A handshake before the first
+  message and a trailer after every frame are a different grammar, which is what a version
+  is for -- the opposite of #402, where only discovery's MAC input changed and
+  `DiscoveryWire::CurrentVersion` rightly stayed. Read the two together: the question is
+  always WHICH changed. `MinSupportedVersion` moved with it both times: a version 1 peer
+  authenticates nothing and accepting one is the per-connection fallback this ticket
+  refuses, and a version 2 peer cannot read a configuration of two sets; so a fleet upgrades its
+  consensus members together. A session frame whose version byte differs from the handshake's closes the
   connection, because stepping over it would mean guessing whether a trailer follows.
   `RaftWire.hpp`'s old "Why there is no handshake" section argued against a VERSION
   negotiation per reconnect, soundly; it is now "Why there is a handshake", because
@@ -1195,6 +1197,90 @@ and it is recorded here because the question will be asked again.
   `RaftPeerServer::Shutdown` in a comment while reimplementing it. The ceiling and the
   cadence are `DrainBound`'s defaults, so neither site states one; the reasoning is in
   [`.agent/rules/distributed-compilation.md`](distributed-compilation.md).
+
+## Learners: a member no quorum counts
+
+[#1449](https://github.com/LASTRADA-Software/fastcached/issues/1449), for the machine
+[#178](https://github.com/LASTRADA-Software/fastcached/issues/178) describes: an always-on
+node and a laptop. With the laptop a voter, two voters are a quorum of two, so the laptop
+leaving the VPN costs the always-on node its majority and CheckQuorum deposes it at the next
+tick -- the scheduler answers `NotLeader` and the fleet page goes dark until it comes back.
+
+- **Voting is a property of the CONFIGURATION, not of a role.** A learner still follows, so it
+  cannot be a fifth state `Tick` moves between: it is a `Follower` whose STANDING forbids the
+  two things a follower may otherwise do. `Consensus::Configuration` is two disjoint sets with
+  at least one voter, and `Membership::StandingOf(configuration, id)` is the ONE author of
+  *where does this node sit* -- `RaftNode::CurrentStanding`, `--node-status`'s
+  `consensus-standing`, the member series' `seat` label and the node's own log line all ask it.
+  What a standing permits is `StandingTable`'s `timer` and `votes` columns, never a switch: a
+  learner's row is `TimerKind::None`, so it has no election deadline at all rather than one it
+  ignores. A LEADER keeps its heartbeat whatever its standing -- one demoted by a change it has
+  not committed is the only node that can commit it -- and steps down once that change commits.
+- **A learner refuses a vote by ROW, never by silence.** `VoteRefusal` names why a pre-vote or
+  a vote was denied and the row comes FIRST (`CastsNoVote`), before the term, the log or a live
+  leader: a learner behind on its log would otherwise refuse "for being behind" and a test
+  asserting *denied* would pass under a learner that votes whenever it is caught up. The enum
+  is private and in `RaftOutput` only, so it is observable without being a wire contract; the
+  wire answer is still `Denied`.
+- **Every quorum read counts voters through `Membership::QuorumOf`, and replication reaches
+  both sets.** Commitment (`AdvanceCommitIndex` walks the voters' match indices, self only when
+  a voter), pre-vote and vote tallies (a grant from a non-voter is dropped on arrival, and a
+  candidate counts its own vote only when it is a voter -- which also closed a pre-existing
+  defect: a node removed from a one-voter configuration elected ITSELF), and CheckQuorum
+  (`HasQuorumContact` walks the committed configuration's voters). `_peers` is everybody
+  replicated to, `_voterPeers` everybody asked for a vote; a learner's answers land in
+  `_followerContact` like anybody's and are simply not counted.
+- **A leader named only as a LEARNER is still a leader to follow.** `OnAppendEntries` and
+  `OnInstallSnapshot` test `IsMember`, not `IsVoter`, and deliberately: a follower that has not
+  yet applied the entry promoting its new leader holds a configuration naming that leader as a
+  learner, and refusing it would wedge exactly the node that needs catching up. Both handlers,
+  for the "a leader spoke arrives at two handlers" rule.
+- **One change at a time is restated for VOTERS.** `ChangeShape` is `AddedOne`, `RemovedOne`,
+  `PromotedOne`, `DemotedOne` -- exactly one member moves, and a promotion counts as the voter
+  addition it is. Two moves in one proposal (promote one and remove another, add two) is
+  `Unsafe`, because a majority of the old voters and a majority of the new could then share no
+  voter. A learner addition or removal changes no voter set, so it is always safe; the READ
+  argument (CheckQuorum on the committed configuration while a change is in flight) needs the
+  shared voter and is unaffected by learners.
+- **The reconciler's order is additions, promotions, demotions, removals**
+  (`Cluster::NextQuorumChange`): growing the voter set before shrinking it. A promotion waits
+  for a dialable address, as any voter addition does; a demotion or removal that would leave no
+  voter is never proposed -- the record then runs ahead of consensus, which is the fail-closed
+  direction.
+- **The SEAT is the operator's record, written only by the verb.** `ClusterMember::seat` is set
+  by `AddMember` (voter) or `AddLearner` (learner), so promotion and demotion are re-admissions
+  and `MemberSeatTable` is the one statement of which verb writes which seat and which
+  configuration set it means. **No opinion is not `Voter`**: `DesiredMember::seat` is optional
+  and a node desires ITSELF on every pass, so a self-record that said voter would undo an
+  operator's demotion one interval after it committed. An enrollment approval, which recovery
+  repeats, states no seat either (`RecordedSeatOf`).
+- **A learner is never removed for being absent.** Nothing in `NextQuorumChange` asks whether a
+  member answers, so this is the bootstrap rule applied to a second population: only a member
+  the operator FORGOT, and admitted at runtime, is proposed for removal, whichever set it is in.
+- **The formats moved, each refused by name.** The configuration payload is two id lists and
+  carries no version of its own -- its containers do: the Raft store is format 2
+  (`FileRaftStorage`, every log record now carrying its format so an old log can be told from a
+  torn one), `RaftWire` is version 3, `ClusterState`'s encoding is 5, and the live-stats
+  grammar is `-5`. An old store is `UnsupportedFormatVersion` -- a new `ConsensusErrorCode`,
+  `Moment`, mapped to `InvalidClusterChange` on the wire -- judged from the header before the
+  CRC, so an intact store of another vintage never reads as damage. `CommandVersion` did NOT
+  move: `AddLearner` is a verb, not a field, which is also why #144's trigger has not fired.
+- **What the neuters showed.** Counting learners in `QuorumOf` reddens five cases, not one,
+  because `QuorumOf` is the single author of commitment, elections and CheckQuorum alike -- the
+  absent-learner cluster case (at committing alone and re-leading alone: the learner
+  configuration itself never commits under that neuter, so CheckQuorum keeps reading the
+  voter-only one), its node-level twin, and the three cases asserting commitment, election and
+  the quorum function with learners present. Treating a learner as a voter in CheckQuorum ALONE
+  reddens exactly the two absent-learner leadership cases, the cluster one at the per-step
+  leadership assertion. Letting a learner stand reddens the vote-refusal case and the four other
+  cases asserting *a learner never stands* by another route (the table, a snapshot, a demotion,
+  a promotion's before-state). An "only this case" prediction is a claim about how many tests
+  assert one property, and here several do.
+- **What a learner cannot do, stated so nobody expects it.** It cannot rescue a cluster whose
+  voters are gone -- it was never part of the majority that decides -- so promote it while a
+  voter can still commit the change. INFERRED, not tested: a node whose promotion has committed
+  on the leader but not yet reached it still refuses votes by its row, so a leader lost in that
+  window leaves the cluster waiting for it to return rather than electing around it.
 
 ## Open work
 
