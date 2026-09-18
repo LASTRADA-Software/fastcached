@@ -20,13 +20,15 @@
 # on Windows. To reach the code under test the three launchers must be
 # unfindable, and CMAKE_FIND_ROOT_PATH_MODE_PROGRAM is the only knob that makes
 # find_program come up empty without also hiding the toolchain. It redirects
-# CMake's own `uname` lookup too, and a host whose architecture is unknown takes
-# the "no binary published for this platform" path before reaching the one under
-# test — so the sandbox is seeded with a uname of its own. Windows resolves the
-# host architecture from the environment instead and needs no such seed, but its
-# generators find more of their toolchain through find_program than a sandbox
-# can safely stand in for. The rules being checked are plain CMake and identical
-# on every platform, so covering them on Linux and macOS covers them.
+# CMake's own `uname` lookup too, which leaves CMAKE_HOST_SYSTEM_PROCESSOR empty
+# (measured, Linux, CMake 4.2) — so the sandbox is seeded with a uname of its own,
+# and a configure inside it differs from an ordinary one only in the launchers it
+# cannot find. Which platform the module asks about is not left to that seed: the
+# rows pin it (below). Windows resolves the host architecture from the
+# environment instead and needs no such seed, but its generators find more of
+# their toolchain through find_program than a sandbox can safely stand in for.
+# The rules being checked are plain CMake and identical on every platform, so
+# covering them on Linux and macOS covers them.
 #
 # Usage:
 #   cmake -DFASTCACHED_SOURCE_DIR=<repo> -DFASTCACHED_SCRATCH_DIR=<scratch>
@@ -48,15 +50,30 @@ cmake_minimum_required(VERSION 3.28)
 #
 # No row may contain a ';' — these are CMake lists, and a semicolon inside a row
 # would split it in two. Arguments are separated by single spaces, so no
-# argument may contain one either. A fifth way to decline is a fifth row and
+# argument may contain one either. Another way to decline is another row and
 # nothing below changes.
+#
+# Every row asks about the SAME platform, whatever this host is: the module's
+# first question is whether a binary is published for the host, and on a host
+# that has none (#1432's aarch64 leg) every row stopped there and never reached
+# the question it names. So the platform is pinned below to one the module
+# publishes for, and the unpublished case is a row of its own that states a
+# platform nothing is published for. no-such-release names the asset it tried,
+# which is how it shows the pin reached the download and not only the lookup.
 set(FastCachedAutoInstallRows
     "api-unreachable|Not auto-installing fastcache-cc: cannot reach the GitHub API||-DFASTCACHE_AUTO_INSTALL=ON -DFASTCACHE_AUTO_INSTALL_API=http://127.0.0.1:1"
     "off-by-default||Not auto-installing fastcache-cc|"
     "opted-out-empty-addr|Not auto-installing fastcache-cc: FASTCACHE_ADDR is empty||-DFASTCACHE_AUTO_INSTALL=ON -DFASTCACHE_ADDR="
     "not-a-version|is not a numeric X.Y.Z version||-DFASTCACHE_AUTO_INSTALL=ON -DFASTCACHE_AUTO_INSTALL_VERSION=not-a-version"
-    "no-such-release|Not auto-installing fastcache-cc:||-DFASTCACHE_AUTO_INSTALL=ON -DFASTCACHE_AUTO_INSTALL_VERSION=9.9.9"
+    "no-such-release|Not auto-installing fastcache-cc: downloading fastcached-9.9.9-Linux-x86_64.tar.gz failed||-DFASTCACHE_AUTO_INSTALL=ON -DFASTCACHE_AUTO_INSTALL_VERSION=9.9.9"
+    "unpublished-platform|Not auto-installing fastcache-cc: no prebuilt binary is published for Linux-no-such-arch||-DFASTCACHE_AUTO_INSTALL=ON -DFASTCACHE_AUTO_INSTALL_HOST_SYSTEM=Linux -DFASTCACHE_AUTO_INSTALL_HOST_PROCESSOR=no-such-arch"
 )
+
+# The platform every row asks about unless it states its own. It must be a row of
+# the module's published-asset table, and the one no-such-release's asset name
+# spells; a row's own -D comes later on the command line, and the later one wins.
+set(FastCachedPinnedHostSystem "Linux")
+set(FastCachedPinnedHostProcessor "x86_64")
 
 foreach(required FASTCACHED_SOURCE_DIR FASTCACHED_SCRATCH_DIR FASTCACHED_CXX_COMPILER)
     if(NOT DEFINED ${required})
@@ -75,8 +92,8 @@ if(CMAKE_HOST_WIN32)
     return()
 endif()
 
-# Seed the sandbox with a uname, so host detection inside it still answers and
-# the rows exercise the decline paths rather than the unknown-platform one.
+# Seed the sandbox with a uname, so CMake's own host detection inside it answers
+# as it would outside. The module's platform question is pinned, not seeded.
 find_program(hostUname NAMES uname)
 if(NOT hostUname)
     message("SKIP: no uname found, so a sandboxed configure cannot detect its own host")
@@ -98,7 +115,9 @@ set(commonArguments
     "-DFASTCACHED_MODULE_DIR=${moduleDir}"
     "-DCMAKE_CXX_COMPILER=${FASTCACHED_CXX_COMPILER}"
     "-DCMAKE_FIND_ROOT_PATH=${sandbox}"
-    "-DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=ONLY")
+    "-DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=ONLY"
+    "-DFASTCACHE_AUTO_INSTALL_HOST_SYSTEM=${FastCachedPinnedHostSystem}"
+    "-DFASTCACHE_AUTO_INSTALL_HOST_PROCESSOR=${FastCachedPinnedHostProcessor}")
 if(FASTCACHED_MAKE_PROGRAM)
     list(APPEND commonArguments "-DCMAKE_MAKE_PROGRAM=${FASTCACHED_MAKE_PROGRAM}")
 endif()
