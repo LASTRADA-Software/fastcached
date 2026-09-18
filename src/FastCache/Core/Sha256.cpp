@@ -3,6 +3,7 @@
 #include <FastCache/Core/Endian.hpp>
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/Ranges.hpp>
+#include <FastCache/Core/SecureBytes.hpp>
 #include <FastCache/Core/Sha256.hpp>
 
 #if defined(_M_X64) || defined(__x86_64__)
@@ -437,8 +438,9 @@ Sha256::Digest HmacSha256(std::span<std::byte const> key, std::span<std::byte co
     std::array<std::byte, Sha256::BlockSize> paddedKey {};
     if (key.size() > Sha256::BlockSize)
     {
-        auto const hashed = Sha256::Hash(key);
+        auto hashed = Sha256::Hash(key);
         std::ranges::copy(hashed, paddedKey.begin());
+        SecureZero(hashed.data(), hashed.size());
     }
     else
         std::ranges::copy(key, paddedKey.begin());
@@ -459,7 +461,21 @@ Sha256::Digest HmacSha256(std::span<std::byte const> key, std::span<std::byte co
     Sha256 outer;
     outer.Update(outerPad);
     outer.Update(innerDigest);
-    return outer.Finish();
+    auto const tag = outer.Finish();
+
+    // The three pads ARE the key, XORed with a public constant, so they are wiped with it in
+    // mind: HKDF (`Core/Hkdf`) runs a derived secret through here as the key, and a copy left on
+    // the stack is that secret, recoverable from the constant. `SecureZero` rather than a plain
+    // store, which a compiler is entitled to delete from storage about to die.
+    //
+    // Not wiped, and why: the hashers need nothing. A whole-block pad is compressed straight from
+    // this frame's array without being copied into a hasher's pending block, and the key-equivalent
+    // state after that first block is overwritten by every block that follows it. What remains is
+    // the compression function's own stack frame, its message schedule, which no caller reaches.
+    SecureZero(paddedKey.data(), paddedKey.size());
+    SecureZero(innerPad.data(), innerPad.size());
+    SecureZero(outerPad.data(), outerPad.size());
+    return tag;
 }
 
 bool ConstantTimeEquals(Sha256::Digest const& lhs, Sha256::Digest const& rhs) noexcept
