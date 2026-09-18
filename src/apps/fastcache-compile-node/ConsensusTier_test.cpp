@@ -1,19 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "ConsensusTier.hpp"
-#include "DiscoveryTier.hpp"
 #include "NodeIdentity.hpp"
 #include "NodeMembership.hpp"
 #include "SchedulerTier.hpp"
 
 #include <FastCache/Async/Task.hpp>
 #include <FastCache/Cluster/ClusterState.hpp>
-#include <FastCache/Cluster/PskRaftPeerCredential.hpp>
 #include <FastCache/Consensus/FileRaftStorage.hpp>
 #include <FastCache/Consensus/RaftPeerSession.hpp>
 #include <FastCache/Consensus/RaftWire.hpp>
+#include <FastCache/Core/Ed25519.hpp>
 #include <FastCache/Core/HostPort.hpp>
 #include <FastCache/Core/ISecureRandom.hpp>
 #include <FastCache/Core/Logger.hpp>
+#include <FastCache/Core/SessionSeal.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Net/BlockingConnector.hpp>
 #include <FastCache/Net/BlockingSocket.hpp>
@@ -731,24 +731,21 @@ struct PeerFrame
 /// Stand in for leader `n1` on @p port's peer wire and make it @p offer.
 ///
 /// Every step is production's own, in production's order: the dialler's handshake answers
-/// the acceptor's challenge, the frame is sealed in the session that proof opened, and the
-/// SIGNED verdict is read back and required to be an acceptance -- so a case built on this
-/// asserts about a message the tier actually read, never about one a failed handshake
-/// dropped on the floor.
+/// the acceptor's challenge with n1's own key, the SIGNED verdict is read back and required
+/// to be an acceptance, and only then is the frame sealed, in the session that verdict
+/// concluded -- so a case built on this asserts about a message the tier actually read,
+/// never about one a failed handshake dropped on the floor. The frame cannot ride behind
+/// the proof: the session key exists only once the verdict is concluded.
 /// @param port The tier's peer port.
-/// @param keyFile The cluster key the tier holds.
 /// @param offer What the leader says.
 /// @return The connection, open: the case holds it until it has seen what it waits for,
-///         because a close with the verdict unread can reach the tier as a reset.
-[[nodiscard]] std::unique_ptr<ISocket> OfferAsLeader(std::uint16_t port,
-                                                     std::filesystem::path const& keyFile,
-                                                     Consensus::RaftMessage const& offer)
+///         because a close with the tier's reply unread is a reset, which can reach the
+///         tier before it has read the offer.
+[[nodiscard]] std::unique_ptr<ISocket> OfferAsLeader(std::uint16_t port, Consensus::RaftMessage const& offer)
 {
-    auto key = ReadClusterKey(keyFile);
-    REQUIRE(key.has_value());
-    Cluster::PskRaftPeerCredential const credential { *std::move(key) };
+    Testing::TestPeerIdentity const identity { "n1", Testing::TestKeyPair("n1"), Testing::SharedRoster::Of({ "n1", "n2" }) };
     SystemSecureRandom random;
-    auto handshake = Consensus::DiallerHandshake::Create(credential, "n1", "n2", random);
+    auto handshake = Consensus::DiallerHandshake::Create(identity, "n2", random);
     REQUIRE(handshake.has_value());
 
     BlockingConnector connector { DefaultAddressResolver(),
@@ -766,21 +763,24 @@ struct PeerFrame
     auto const proof = handshake->Answer(*challenge);
     REQUIRE(proof.has_value());
 
-    auto wire = Consensus::RaftWire::EncodeProof(*proof);
-    auto const frame = Consensus::RaftWire::Encode(offer);
-    auto sealer =
-        Consensus::FrameSealer { credential,
-                                 Consensus::SessionNonces { .acceptor = challenge->nonce, .dialler = proof->nonce } };
-    auto const tag = sealer.Seal(frame);
-    wire.insert(wire.end(), frame.begin(), frame.end());
-    wire.insert(wire.end(), tag.begin(), tag.end());
-    REQUIRE(SyncRun(WriteOnce(socket.get(), wire)) == wire.size());
+    auto const proofWire = Consensus::RaftWire::EncodeProof(*proof);
+    REQUIRE(SyncRun(WriteOnce(socket.get(), proofWire)) == proofWire.size());
 
     auto const verdictFrame = ReadPeerFrame(*socket);
     REQUIRE(verdictFrame.has_value());
     auto const verdict = Consensus::RaftWire::DecodeVerdict(Unwrap(verdictFrame).header, Unwrap(verdictFrame).payload);
     REQUIRE(verdict.has_value());
-    REQUIRE(handshake->Conclude(*verdict).outcome == Consensus::VerdictOutcome::Accepted);
+    auto const conclusion = handshake->Conclude(*verdict);
+    REQUIRE(conclusion.outcome == Consensus::VerdictOutcome::Accepted);
+    REQUIRE(conclusion.session.has_value());
+
+    auto wire = Consensus::RaftWire::Encode(offer);
+    auto sealer = FrameSealer { Unwrap(conclusion.session) };
+    auto const frame = std::span<std::byte const> { wire };
+    auto const tag =
+        sealer.Seal(frame.first(Consensus::RaftWire::HeaderSize), frame.subspan(Consensus::RaftWire::HeaderSize));
+    wire.insert(wire.end(), tag.begin(), tag.end());
+    REQUIRE(SyncRun(WriteOnce(socket.get(), wire)) == wire.size());
     return socket;
 }
 } // namespace
@@ -790,8 +790,9 @@ TEST_CASE("A running tier offered a snapshot it cannot read raises unreadable-le
 {
     // #1552's wiring, end to end, at the door a leader reaches: the real peer wire, the
     // tier's own driver and its own `ClusterStateMachine`, and the registry `main` hands
-    // it. No second build is needed, because this case IS the leader: it proves the key
-    // as `n1` and offers the previous build's cluster state, from the shared builder.
+    // it. No second build is needed, because this case IS the leader: it proves `n1`'s own
+    // identity key, which the tier's `--raft-peer` names, and offers the previous build's
+    // cluster state, from the shared builder.
     // Anything between the wire and the condition that stopped carrying the refusal --
     // the driver never asking, the node taking it on, the observer not installed, the
     // report not raising -- leaves the row clear, and this case red.
@@ -822,14 +823,18 @@ TEST_CASE("A running tier offered a snapshot it cannot read raises unreadable-le
     NodeConfig cfg;
     cfg.nodeId = "n2";
     cfg.raftListen = std::format("127.0.0.1:{}", self);
-    cfg.raftPeers = { Unwrap(Cluster::ParseMemberSpec(std::format("n1=127.0.0.1:{}", leaderPort))),
-                      Unwrap(Cluster::ParseMemberSpec(std::format("n2=127.0.0.1:{}", self))) };
+    cfg.raftPeers = {
+        Unwrap(Cluster::ParseMemberSpec(
+            std::format("n1=127.0.0.1:{}@{}", leaderPort, FormatEd25519PublicKey(Testing::TestKeyPair("n1").PublicKey())))),
+        Unwrap(Cluster::ParseMemberSpec(std::format("n2=127.0.0.1:{}", self)))
+    };
     cfg.clusterKeyFile = scratch / "cluster.key";
     cfg.clusterDir = scratch / "state";
 
     auto started = ConsensusTier::Start(
         cfg,
         {},
+        Testing::TestKeyPair("n2"),
         [](Distributed::SchedulerRole, std::string_view, std::uint64_t) {},
         [](Cluster::ClusterState const&) {},
         metrics,
@@ -856,7 +861,7 @@ TEST_CASE("A running tier offered a snapshot it cannot read raises unreadable-le
     {
         auto current = Cluster::ClusterState {};
         Cluster::Apply(current, HostCommand(Cluster::CommandKind::ForgetClient, "10.0.0.7"));
-        auto const connection = OfferAsLeader(self, cfg.clusterKeyFile, offer(Cluster::Encode(current)));
+        auto const connection = OfferAsLeader(self, offer(Cluster::Encode(current)));
 
         REQUIRE(Testing::WaitUntil(
             "the offered snapshot to be taken on",
@@ -868,7 +873,7 @@ TEST_CASE("A running tier offered a snapshot it cannot read raises unreadable-le
 
     SECTION("the previous build's state is refused, raised by name, and nothing is taken on")
     {
-        auto const connection = OfferAsLeader(self, cfg.clusterKeyFile, offer(Testing::EncodePreviousClusterState()));
+        auto const connection = OfferAsLeader(self, offer(Testing::EncodePreviousClusterState()));
 
         REQUIRE(Testing::WaitUntil(
             "the refusal to be raised",
