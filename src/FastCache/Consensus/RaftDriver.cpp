@@ -3,17 +3,87 @@
 #include <FastCache/Consensus/RaftDriver.hpp>
 
 #include <algorithm>
+#include <format>
+#include <memory>
 #include <mutex>
+#include <ranges>
+#include <string_view>
+#include <tuple>
 #include <utility>
 
 namespace FastCache::Consensus
 {
 
+namespace
+{
+    /// @p refusal, saying WHERE in the recovered state it was found.
+    /// @param where The snapshot, or a log entry by index.
+    /// @param refusal What the application said; its code is kept.
+    /// @return The located refusal.
+    [[nodiscard]] ConsensusError Located(std::string_view where, ConsensusError refusal)
+    {
+        refusal.context = std::format("{}: {}", where, refusal.context);
+        return refusal;
+    }
+} // namespace
+
+std::expected<std::unique_ptr<RaftDriver>, ConsensusError> RaftDriver::Create(RaftNode node,
+                                                                              IRaftStorage& storage,
+                                                                              IRaftTransport& transport,
+                                                                              IRaftStateMachine& application,
+                                                                              CompactionPolicy compaction)
+{
+    if (auto recovered = Recover(node, application); !recovered.has_value())
+        return std::unexpected { std::move(recovered).error() };
+
+    // `new` rather than `make_unique`, which cannot reach a private constructor -- and
+    // the constructor is private so this function's recovery cannot be skipped.
+    return std::unique_ptr<RaftDriver> { new RaftDriver { std::move(node), storage, transport, application, compaction } };
+}
+
+std::expected<void, ConsensusError> RaftDriver::Recover(RaftNode const& node, IRaftStateMachine& application)
+{
+    // Recovery's half of `IRaftStateMachine::RestoreSnapshot` (#1542): the other half is
+    // an installed snapshot, which `Deliver` hands over. A node holding a snapshot before
+    // any driver exists recovered it -- nothing has run yet to compact or install one --
+    // and its applied index sits at the snapshot's boundary, so the state the snapshot
+    // describes reaches the application HERE or never.
+    //
+    // The commands above the snapshot FIRST, and read-only: every one of them will be
+    // applied once a leader commits it, so one this application cannot read is state this
+    // node cannot run on. Asked before the snapshot is restored so that a refusal leaves
+    // the application untouched rather than holding a snapshot with no future.
+    auto const& log = node.Log();
+    auto const first = node.SnapshotIndex().value + 1;
+    auto const last = std::max(log.LastIndex().value, node.SnapshotIndex().value);
+    for (auto const index: std::views::iota(first, last + 1))
+    {
+        auto const* const entry = log.EntryAt(LogIndex { .value = index });
+        if (entry == nullptr || entry->kind != EntryKind::Command)
+            continue;
+        if (auto readable = application.CanRead(entry->payload); !readable.has_value())
+            return std::unexpected { Located(std::format("log entry {}", index), std::move(readable).error()) };
+    }
+
+    // Asked of the boundary rather than of the bytes: an application's empty state is a
+    // legitimate snapshot, and "no snapshot" is `BeforeFirst`, never an empty buffer.
+    if (node.SnapshotIndex() == LogIndex::BeforeFirst())
+        return {};
+
+    // Last, and wholesale or not at all -- the contract `RestoreSnapshot` states -- so a
+    // refusal here too means the application was handed nothing.
+    if (auto restored = application.RestoreSnapshot(node.CurrentSnapshot().state, SnapshotOrigin::Recovered);
+        !restored.has_value())
+        return std::unexpected { Located(std::format("the snapshot as of log entry {}", node.SnapshotIndex().value),
+                                         std::move(restored).error()) };
+    return {};
+}
+
 RaftDriver::RaftDriver(RaftNode node,
                        IRaftStorage& storage,
                        IRaftTransport& transport,
                        IRaftStateMachine& application,
-                       CompactionPolicy compaction):
+                       CompactionPolicy compaction) noexcept:
     _node { std::move(node) },
     _storage { storage },
     _transport { transport },
@@ -23,18 +93,6 @@ RaftDriver::RaftDriver(RaftNode node,
     _reportedTerm { _node.CurrentTerm() },
     _reportedLeader { _node.KnownLeader() }
 {
-    // Recovery's half of `IRaftStateMachine::RestoreSnapshot` (#1542): the other half
-    // is an installed snapshot, which `Deliver` hands over. A node holding a snapshot
-    // at construction recovered it -- nothing has run yet to compact or install one --
-    // and its applied index sits at the snapshot's boundary, so the state the snapshot
-    // describes reaches the application HERE or never. Before any entry above it can
-    // be applied, because no step has been taken; and without a caller having to know,
-    // because the one that did not know is the defect.
-    //
-    // Asked of the boundary rather than of the bytes: an application's empty state is
-    // a legitimate snapshot, and "no snapshot" is `BeforeFirst`, never an empty buffer.
-    if (_node.SnapshotIndex() != LogIndex::BeforeFirst())
-        _application.RestoreSnapshot(_node.CurrentSnapshot().state);
 }
 
 void RaftDriver::ObserveRole(RoleObserver observer)
@@ -122,8 +180,14 @@ std::expected<void, ConsensusError> RaftDriver::Deliver(RaftOutput output)
     // applied entries and not alongside them -- the snapshot already includes
     // everything up to its index, and replaying entries over it would re-apply
     // what it contains.
+    //
+    // A leader's snapshot the application cannot read is refused there, and the
+    // application keeps what it holds and says which snapshot it was -- the contract
+    // `RestoreSnapshot` states. What the NODE should do then is the install path's own
+    // question, and this does not answer it: the result is dropped here deliberately,
+    // where a recovered snapshot's refusal stops the node starting (`Recover`).
     if (output.restoreSnapshot.has_value())
-        _application.RestoreSnapshot(output.restoreSnapshot->state);
+        std::ignore = _application.RestoreSnapshot(output.restoreSnapshot->state, SnapshotOrigin::Installed);
     else
         for (auto const& entry: output.applied)
             _application.Apply(entry);

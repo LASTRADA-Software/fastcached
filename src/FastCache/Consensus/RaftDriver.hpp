@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <expected>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <unordered_map>
@@ -147,6 +148,24 @@ class RaftDriver
     /// -- it is on the path that also has to send the next heartbeat.
     using RoleObserver = std::function<void(RoleChange const& change)>;
 
+    /// Build a driver over @p node, handing @p application what the node recovered.
+    ///
+    /// **The one way a driver is built**, and a factory rather than a constructor
+    /// because building one can now be REFUSED (#1542). A node recovered from storage
+    /// comes back with its applied index AT the snapshot's boundary, so nothing the
+    /// snapshot covers will ever be applied again: the snapshot's state reaches the
+    /// application here or never, and a node that ran without it would lose every
+    /// fact it held -- for a membership state the forget tombstones too, so removal
+    /// fails OPEN. Folded into building rather than left to the caller, because the
+    /// defect was precisely a caller that did not know to do it.
+    ///
+    /// **And a node whose own state this application cannot read does not start.**
+    /// Asked in an order that leaves nothing half-done: every command the log holds
+    /// above the snapshot first, through `CanRead`, which has no effects -- then the
+    /// snapshot, through `RestoreSnapshot`, which replaces wholesale or changes
+    /// nothing. So a refusal means the application was handed NOTHING. A node running
+    /// on the entries it could read, or on the entries without the snapshot under
+    /// them, is running on a state no member of its cluster ever held.
     /// @param node The state machine to drive; taken by value and owned.
     /// @param storage Where durable state goes; must outlive this driver.
     /// @param transport How peers are reached; must outlive this driver.
@@ -157,21 +176,14 @@ class RaftDriver
     /// compaction gets the behaviour that cannot lose anything -- a log that grows
     /// is wasteful, and a snapshot taken by a machine whose `TakeSnapshot` is not
     /// yet meaningful is wrong.
-    ///
-    /// **Constructing a driver restores the node's snapshot into `application`**
-    /// (#1542), before anything else can reach it. A node recovered from storage
-    /// comes back with its applied index AT the snapshot's boundary, so nothing the
-    /// snapshot covers will ever be applied again: were its state not handed over
-    /// here, a restarted node would run without every fact the snapshot held -- and
-    /// for a membership state that includes the forget tombstones, so removal would
-    /// fail OPEN. Folded into construction rather than left to the caller, because
-    /// the defect was precisely a caller that did not know to do it, and every
-    /// driver ever built goes through here.
-    RaftDriver(RaftNode node,
-               IRaftStorage& storage,
-               IRaftTransport& transport,
-               IRaftStateMachine& application,
-               CompactionPolicy compaction = {});
+    /// @return The driver; or, when the application cannot read what the node
+    ///         recovered, the application's refusal -- its code kept, and its context
+    ///         prefixed with WHERE: the snapshot, or the log entry by index.
+    [[nodiscard]] static std::expected<std::unique_ptr<RaftDriver>, ConsensusError> Create(RaftNode node,
+                                                                                           IRaftStorage& storage,
+                                                                                           IRaftTransport& transport,
+                                                                                           IRaftStateMachine& application,
+                                                                                           CompactionPolicy compaction = {});
 
     /// Install the role observer.
     ///
@@ -317,6 +329,27 @@ class RaftDriver
     void Stop() noexcept;
 
   private:
+    /// Private, so `Create`'s recovery cannot be skipped by building one directly.
+    /// @param node As for `Create`.
+    /// @param storage As for `Create`.
+    /// @param transport As for `Create`.
+    /// @param application As for `Create`, already handed what the node recovered.
+    /// @param compaction As for `Create`.
+    RaftDriver(RaftNode node,
+               IRaftStorage& storage,
+               IRaftTransport& transport,
+               IRaftStateMachine& application,
+               CompactionPolicy compaction) noexcept;
+
+    /// Hand @p application what @p node recovered, or refuse it whole.
+    ///
+    /// `Create`'s first half, before any driver exists: see there for the order.
+    /// @param node The node, as recovered.
+    /// @param application What it will drive.
+    /// @return Nothing once the snapshot is restored (or there was none); otherwise
+    ///         the application's refusal, located.
+    [[nodiscard]] static std::expected<void, ConsensusError> Recover(RaftNode const& node, IRaftStateMachine& application);
+
     /// Perform one output in the required order; `_mutex` must be held.
     [[nodiscard]] std::expected<void, ConsensusError> Deliver(RaftOutput output);
 

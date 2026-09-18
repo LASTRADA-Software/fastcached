@@ -168,6 +168,21 @@ std::string DescribeTermAdoption(Consensus::Term adopted, Consensus::TermAdoptio
                        cause.previousTerm.value);
 }
 
+std::string UnreadableConsensusStateRefusal(std::filesystem::path const& directory, ConsensusError const& refusal)
+{
+    // Which of the two the application found decides the middle clause: another build's
+    // layout is intact and has no conversion, while bytes no build wrote are damage -- a
+    // disk or a crash to look at before anything is moved. The remedy after it is the
+    // same either way, because either way this directory cannot be run on.
+    auto const intact = refusal.code == ConsensusErrorCode::UnsupportedFormatVersion;
+    return std::format("cannot start consensus on the state in {}: {}; {}: {}",
+                       directory.string(),
+                       refusal.context,
+                       intact ? "it is intact, and there is no conversion"
+                              : "it is damaged, which is a disk or a crash to investigate first",
+                       Consensus::UnreadableStateRemedy);
+}
+
 std::string AdvertisedSchedulerEndpoint(std::string_view raftEndpoint, std::string_view schedulerBound)
 {
     // Nothing to advertise when this node serves no scheduler surface, which is a
@@ -448,21 +463,32 @@ std::expected<void, std::string> ConsensusTier::Launch(NodeConfig const& cfg,
     // differ -- a recovered node is always a follower knowing no leader -- so this
     // changes what the first line SAYS and not what it announces.
     //
-    // Read BEFORE the driver exists, and that order is #1542's: constructing the driver
+    // Read BEFORE the driver exists, and that order is #1542's: building the driver
     // restores a recovered snapshot into `_application`, whose observer publishes the
     // state -- the member set, the tombstones, and a role announcement through
     // `Republish`. Read after, that first announcement would name term 0.
     _lastTerm = node->CurrentTerm();
 
-    // The constructor hands a recovered snapshot to `_application` before anything
-    // can apply an entry above it, so the replicated member set, settings and
-    // tombstones are back -- and published -- before either loop below starts.
-    _driver = std::make_unique<Consensus::RaftDriver>(
-        *std::move(node),
-        _storage,
-        *_transport,
-        _application,
-        Consensus::CompactionPolicy { .appliedEntriesBeforeCompaction = CompactAfterEntries });
+    // `Create` hands a recovered snapshot to `_application` before anything can apply an
+    // entry above it, so the replicated member set, settings and tombstones are back --
+    // and published -- before either loop below starts.
+    //
+    // Or it REFUSES, and then this node does not start (#1542): its own snapshot, or a
+    // command its own log holds, is one this build cannot read, and the application was
+    // handed nothing. Running on what it could read would be running without the
+    // members, the settings and the forget tombstones -- removal failing OPEN, loudly or
+    // not. Named here, where the directory is known: the refusal says where in the state
+    // and which versions, and the remedy is the store's own, since the three files go
+    // aside together whichever of them could not be read.
+    auto driver =
+        Consensus::RaftDriver::Create(*std::move(node),
+                                      _storage,
+                                      *_transport,
+                                      _application,
+                                      Consensus::CompactionPolicy { .appliedEntriesBeforeCompaction = CompactAfterEntries });
+    if (!driver.has_value())
+        return std::unexpected { UnreadableConsensusStateRefusal(NodeStateDirectory(cfg), driver.error()) };
+    _driver = *std::move(driver);
 
     // Pushed, not polled. A poll interval is a window in which this node has stopped
     // leading and is still handing out other machines' capacity, and the driver knows

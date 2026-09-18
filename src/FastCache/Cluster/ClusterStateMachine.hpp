@@ -6,6 +6,7 @@
 #include <FastCache/Core/Logger.hpp>
 
 #include <cstddef>
+#include <expected>
 #include <functional>
 #include <shared_mutex>
 #include <span>
@@ -49,9 +50,29 @@ class ClusterStateMachine final: public Consensus::IRaftStateMachine
 
     void Apply(Consensus::AppliedEntry const& entry) override;
 
+    /// Whether @p command decodes as a command this build applies.
+    ///
+    /// `DecodeCommand`'s refusal, restated for bytes this node HOLDS (#1542): another
+    /// build's encoding -- an older command version, or a verb this build lacks -- is
+    /// `UnsupportedFormatVersion` with both versions stated, and only bytes that are not
+    /// a command at all are `StorageFailure`.
+    /// @param command An entry's payload.
+    /// @return Nothing when `Apply` would act on it; otherwise why not.
+    [[nodiscard]] std::expected<void, ConsensusError> CanRead(std::span<std::byte const> command) const override;
+
     [[nodiscard]] std::vector<std::byte> TakeSnapshot() override;
 
-    void RestoreSnapshot(std::span<std::byte const> state) override;
+    /// Replace the state with the one @p state encodes, or refuse and keep it.
+    ///
+    /// A refusal is logged, naming which snapshot it was and what happens next from
+    /// `Consensus::SnapshotOriginTable` -- a node's own recovered snapshot and a
+    /// leader's installed one lead to different places, and "arrived" read wrong for
+    /// the first. It is refused in `CanRead`'s two codes, for `CanRead`'s reason.
+    /// @param state A snapshot `TakeSnapshot` produced, on some node.
+    /// @param origin Which of the two callers this is.
+    /// @return Nothing once replaced; otherwise why not, with nothing changed.
+    [[nodiscard]] std::expected<void, ConsensusError> RestoreSnapshot(std::span<std::byte const> state,
+                                                                      Consensus::SnapshotOrigin origin) override;
 
     /// The state as of the last applied entry.
     ///

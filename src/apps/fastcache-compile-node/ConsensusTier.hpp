@@ -32,6 +32,7 @@
 #include <chrono>
 #include <cstdint>
 #include <expected>
+#include <filesystem>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -109,6 +110,24 @@ namespace FastCache::Node
 /// @param cause What it was, and who carried the term.
 /// @return The line, without a level or a newline.
 [[nodiscard]] std::string DescribeTermAdoption(Consensus::Term adopted, Consensus::TermAdoption const& cause);
+
+/// Why this node will not start consensus on the state its directory holds (#1542).
+///
+/// `RaftDriver::Create` refused because the application cannot read what the node
+/// recovered -- its own snapshot, or a command its own log holds -- and running on the
+/// rest would mean running without the members, the settings and the forget tombstones
+/// that state carried. What an operator needs is WHERE (the directory), WHAT (which
+/// part, the version found and the version this build reads, all of it in the
+/// refusal's context) and what to DO, which is the store's own remedy: the three files
+/// go aside together whichever of them could not be read.
+///
+/// A free function for the reason `DescribeRole` is: the wording is the diagnostic, and
+/// a rendering reachable only from a tier that failed to start is one no case can read.
+/// @param directory The node's state directory, as `NodeStateDirectory` names it.
+/// @param refusal What `RaftDriver::Create` refused with.
+/// @return The refusal, as `ConsensusTier::Start` reports it.
+[[nodiscard]] std::string UnreadableConsensusStateRefusal(std::filesystem::path const& directory,
+                                                          ConsensusError const& refusal);
 
 /// Whether a configuration change this node proposed is still in flight.
 ///

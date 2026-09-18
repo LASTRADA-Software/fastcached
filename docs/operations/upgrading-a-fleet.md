@@ -92,14 +92,27 @@ moved, each refused by name rather than misread:
 | The replicated cluster state (a snapshot, and the `--cluster-status` reply) | version 5: each member records its seat | `UnsupportedVersion`, naming both versions |
 
 The store has **no conversion**, and a node started on an older one refuses to start,
-saying so. The store is intact; what an operator does is:
+saying so. **So does a node whose store is this build's but whose snapshot or retained
+log entries hold the cluster state or a command in an older encoding** — it names the
+directory, which part it could not read and both versions, rather than running on the
+part it could (which, for a snapshot, is a cluster with no members and no forget
+tombstones). Either way the directory is intact; what an operator does is:
 
 1. Stop the node.
 2. Move `raft-state`, `raft-log` and `raft-snapshot` out of its `--cluster-dir`,
-   **leaving `node-id` where it is** — the identity lives in the same directory, and a
-   wiped identity is a different node.
-3. Start it again. It comes back with an empty log under its bootstrap configuration
-   (`--raft-peer`), or waiting to be admitted if it was started with `--raft-join`.
+   **leaving `node-id` and `node-key` where they are** — the identity lives in the same
+   directory, and a wiped identity is a different node, which the cluster would have to
+   admit while it went on counting the old one.
+3. If its cluster is **already running on this build**, start it again with
+   `--raft-join` added and its `--raft-peer` list unchanged. It waits to be admitted
+   instead of bootstrapping a cluster of itself — which a node whose bootstrap set names
+   only itself would otherwise do — and a cluster that still counts it catches it up from
+   the leader; one that has forgotten it admits it again with `--cluster-admit` (or
+   `--cluster-admit-learner`). It keeps its `--cluster-key-file`, so it needs no
+   `--enroll-from`.
+4. If **every** member was moved aside together, start them as they were. They come back
+   with empty logs under their bootstrap configuration (`--raft-peer`), or waiting to be
+   admitted if they were started with `--raft-join`.
 
 Whatever the cluster agreed at **runtime** has to be agreed again once a leader is
 elected: members admitted with `--cluster-admit` or `--cluster-admit-learner`, and

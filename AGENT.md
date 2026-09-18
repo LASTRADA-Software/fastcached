@@ -560,10 +560,15 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   nothing without the formation case beside it staying green under the same neuter.
 - `RaftNode` reads no clock, opens no socket and draws no randomness of its own.
 - A snapshot is durable before it is acknowledged, and the configuration travels inside it.
-- A snapshot reaches the APPLICATION on recovery AND on install: `RaftDriver`'s constructor restores a
+- A snapshot reaches the APPLICATION on recovery AND on install: `RaftDriver::Create` restores a
   recovered snapshot before any entry above it is applied (#1542), or a restart after compaction loses
   every tombstone and removal fails OPEN. The harness's state machine holds real state and a restart
   empties it, so a restart case asserts `Member::application`, never only the log.
+- **A node whose OWN snapshot, or a command its own log holds, is one this build cannot read REFUSES TO
+  START** -- by name, naming the directory, both versions and the remedy -- and never runs on part of its
+  state. `Create` asks `CanRead` of every command FIRST, then restores, so a refusal hands the application
+  NOTHING. The remedy keeps `node-id` and `node-key` and rejoins with `--raft-join`; a leader's INSTALLED
+  snapshot is a different question and keeps its behaviour.
 - A seeded draw must be identical on every standard library — `UniformInRange`, never
   `std::uniform_int_distribution`.
 - A node being admitted must never have bootstrapped a cluster of itself, so
