@@ -2242,7 +2242,9 @@ TEST_CASE("at 80x24 the fleet panel reads as the mockup draws it", "[cli][dashbo
     //   - the qualifiers `of 192 slots` and `not yet resolved`, where it wrote a bare `of 30` and nothing;
     //   - `heartbeat-age` and `cpu-busy` in the heading at 80, `memory`, `class` and `version` gone, where
     //     it dropped from the right and kept `version`;
-    //   - the strip's `keys  m w l c f t`, right-aligned against the frame's blank column.
+    //   - every section's tab on the strip. Since #1364 there are seven tabbed sections and at 80 they fill the
+    //     line, so the `keys  m w l c f ! t` hint is what yields -- `StripItems`' stated order, never a tab -- and
+    //     a wider terminal draws it again, right-aligned against the frame's blank column.
     auto const run = RunFleet({ FleetSampleOf(1, LeaderFleetText(FleetMachines)), Tick }, 80, 24, UnicodeContext());
     REQUIRE(run.frames.size() == 1);
     auto const& frame = run.frames.front();
@@ -2273,7 +2275,18 @@ TEST_CASE("at 80x24 the fleet panel reads as the mockup draws it", "[cli][dashbo
 
     auto const strip = LineIndexHolding(frame, "[machines]");
     REQUIRE(strip < Lines(frame).size());
-    CHECK(Lines(frame)[strip].ends_with("keys  m w l c f t \xe2\x94\x82"));
+    for (auto const& row: Distributed::FleetSectionTable)
+    {
+        INFO("tab " << row.key);
+        CHECK(Lines(frame)[strip].contains(row.key) == row.tabular);
+    }
+    CHECK_FALSE(Lines(frame)[strip].contains("keys"));
+    auto const wide = RunFleet({ FleetSampleOf(1, LeaderFleetText(FleetMachines)), Tick }, 100, 24, UnicodeContext());
+    REQUIRE(wide.frames.size() == 1);
+    auto const& wideFrame = wide.frames.front();
+    auto const wideStrip = LineIndexHolding(wideFrame, "[machines]");
+    REQUIRE(wideStrip < Lines(wideFrame).size());
+    CHECK(Lines(wideFrame)[wideStrip].ends_with("keys  m w l c f ! t \xe2\x94\x82"));
 
     CHECK(Lines(frame).size() == 24);
     CHECK(WidestLine(frame) <= 80);
@@ -4325,7 +4338,7 @@ TEST_CASE("a worker's limit is toned by the leader, and a table's heading, key h
 {
     // #134 G1. WHAT DISTINGUISHES: `registered` is Fresh and `scratch` an Alert, by the leader's one table --
     // a panel tinting every limit alike fails the pair -- the heading's `limited-by` is a Label run over the
-    // word alone, and so are `keys  m w l c f t` and the overflow line, while no machine name is toned.
+    // word alone, and so are `keys  m w l c f ! t` and the overflow line, while no machine name is toned.
     auto document = FleetText(3);
     document += "\n# workers\nendpoint\tlimited-by\n";
     for (auto const index: std::views::iota(1, 31))
@@ -4338,7 +4351,7 @@ TEST_CASE("a worker's limit is toned by the leader, and a table's heading, key h
     CHECK(TonesOver(run, 1, "build-02:7070", "scratch") == std::vector<FrameTone> { FrameTone::Alert });
     CHECK(TonesOver(run, 1, "build-02:7070", "build-02:7070").empty());
     CHECK(TonesOver(run, 1, "limited-by", "limited-by") == std::vector<FrameTone> { FrameTone::Label });
-    CHECK(TonesOver(run, 1, "keys  m w l c f t", "keys  m w l c f t") == std::vector<FrameTone> { FrameTone::Label });
+    CHECK(TonesOver(run, 1, "keys  m w l c f ! t", "keys  m w l c f ! t") == std::vector<FrameTone> { FrameTone::Label });
 
     auto const overflow = LineStarting(frame, "... ");
     REQUIRE(overflow.has_value());
@@ -4659,4 +4672,63 @@ TEST_CASE("at every height the fleet chart takes only rows nothing else wanted",
         CHECK(kept(ascii.frames.front()) == kept(plain.frames.front()));
     }
     CHECK(charted > 0);
+}
+
+namespace
+{
+
+/// One condition row as a node sends it.
+/// @param id The row's id.
+/// @param persistence Its persistence word.
+/// @param severity Its severity word.
+/// @param state Its state word.
+/// @return The row.
+[[nodiscard]] CompileCacheWire::NodeConditionFields NodeConditionRow(std::string id,
+                                                                     std::string persistence,
+                                                                     std::string severity,
+                                                                     std::string state)
+{
+    return CompileCacheWire::NodeConditionFields { .id = std::move(id),
+                                                   .persistence = std::move(persistence),
+                                                   .severity = std::move(severity),
+                                                   .state = std::move(state),
+                                                   .detail = "what the node saw",
+                                                   .remedy = "what to do about it" };
+}
+
+} // namespace
+
+TEST_CASE("a node panel names each raised condition with its persistence, says none, and draws the marker when it "
+          "cannot know",
+          "[cli][dashboard][panel][node][conditions]")
+{
+    // #1364, the live panel's half. WHAT DISTINGUISHES: a latched row and a live one raised side by side, each followed
+    // by its own word -- so a line that dropped the persistence reads the same for both and fails -- beside a clear
+    // row that must not be named at all; then nothing raised, SAID; then a node that carried no rows, which must read
+    // the marker and never the reassuring words.
+    auto raised = MockupNodeStatus();
+    raised.runtime.conditions = std::vector { NodeConditionRow("unsigned-lease-grants", "latched", "warning", "raised"),
+                                              NodeConditionRow("enrollment-window-open", "live", "alert", "raised"),
+                                              NodeConditionRow("counter-table-skew", "latched", "warning", "clear") };
+    auto const line = ContentStarting(NodeFrameAt(80, 24, raised), "conditions");
+    CHECK(line.starts_with("conditions  unsigned-lease-grants latched"));
+    CHECK(line.contains("enrollment-window-open live"));
+    CHECK_FALSE(line.contains("counter-table-skew"));
+    CHECK_FALSE(line.contains("none raised"));
+    // Toned by severity, the persistence a label beside it.
+    auto const sink = NodeSinkOf(raised);
+    CHECK(ToneOver(sink, "unsigned-lease-grants") == FrameTone::Stale);
+    CHECK(ToneOver(sink, "enrollment-window-open") == FrameTone::Alert);
+    CHECK(ToneOver(sink, "latched") == FrameTone::Label);
+    CHECK(ToneOver(sink, "live") == FrameTone::Label);
+
+    auto quiet = MockupNodeStatus();
+    quiet.runtime.conditions = std::vector { NodeConditionRow("unsigned-lease-grants", "latched", "warning", "clear"),
+                                             NodeConditionRow("enrollment-window-open", "live", "alert", "not-evaluated") };
+    CHECK(ContentStarting(NodeFrameAt(80, 24, quiet), "conditions") == "conditions  none raised");
+    CHECK(ToneOver(NodeSinkOf(quiet), "none raised") == FrameTone::Fresh);
+
+    // `MockupNodeStatus` carries no rows: a node older than conditions.
+    auto const absent = ContentStarting(NodeFrameAt(80, 24, MockupNodeStatus()), "conditions");
+    CHECK(absent == std::format("conditions  {}", Absent));
 }

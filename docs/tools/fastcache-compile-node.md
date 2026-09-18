@@ -2381,6 +2381,64 @@ diagnosis.
 with timestamps on comes back with them on — they are most wanted exactly when
 something is being diagnosed, which is the worst time to lose them to a restart.
 
+## Conditions
+
+A node detects things an operator has to act on — at startup and while it runs — and a
+log line is the weakest carrier there is for any of them: it scrolls away, and across forty
+machines nobody reads forty logs. So each of them is also a **condition**: a row the node
+keeps and every surface can ask for
+([#1364](https://github.com/LASTRADA-Software/fastcached/issues/1364)). The log lines are
+still written; the row is what is still there an hour later.
+
+Every row says two things before anything else:
+
+- **latched** or **live**. A latched condition was decided once, for the life of the
+  process, and nothing short of a restart on a different build or configuration clears it —
+  so an operator waiting for it to clear is waiting for nothing. A live one can clear while
+  the process runs, and watching it clear is watching the fix land. The two are drawn
+  differently everywhere, because *still broken* and *was broken and is fixed* must not look
+  alike.
+- its **state**: `raised` (it holds now), `clear` (checked and benign), `not-evaluated`
+  (this node runs nothing that could raise it, and the detail says what), or `undecided` —
+  nothing evaluated it at all, which is a node wired wrongly and is itself worth reporting.
+  *Checked and benign* and *nobody decided* are different claims, so they are different words.
+
+| Condition | Persistence | Severity | Raised when | What to do |
+|---|---|---|---|---|
+| `counter-table-skew` | latched | warning | this binary's metrics catalogue carries counters its sink has no slot for — a build mixed from two versions of the counter list (#1362) | rebuild from one clean build tree and redeploy; restarting the same binary will not clear it |
+| `scratch-root-unmappable` | latched | warning | the worker's scratch root cannot be spelled inside a `-fdebug-prefix-map` rule, so debug names in objects it builds for other machines record its own path | point `TMPDIR` (`TEMP` on Windows) at a path with no whitespace, no `=` and no control character, and restart |
+| `unsigned-lease-grants` | latched | warning | a scheduler runs with no `--cluster-key-file`, so every lease grant it hands out is unsigned (#303) | give every node the same `--cluster-key-file` and restart this one |
+| `generated-tls-certificate` | latched | notice | the admin surface serves a certificate made at startup by `--tls-self-signed`; the detail carries its SHA-256 fingerprint | compare the fingerprint with your browser's, or name a trusted certificate with `--tls-cert` and `--tls-key` |
+| `enrollment-window-open` | live | alert | the enrollment window is open, so any machine that can reach the `0xFC` port may ask to join | `--enroll-close` once the machines you meant to admit have joined; `--enroll-list` before approving anyone |
+| `forgotten-fleet-member` | live | warning | a `--fleet-member` entry names a host the cluster has been told to forget (#1309), so the list says one thing and the fleet does another | drop the entry and reload; `--cluster-admit-client` if the forget was the mistake |
+
+The remedy each row carries is longer than this column, and it is the node's text: an older
+client or leader prints a newer node's row exactly as that node wrote it, rather than looking
+it up in a table of its own.
+
+A node with nothing raised **says** so — `none raised` — and a node too old to carry
+conditions says **nothing**, which every surface draws as absent. The two are opposite
+readings: the first has been checked, the second cannot vouch for anything.
+
+Three places answer:
+
+- **`fastcache-cli node`** carries a `conditions` field naming each raised condition with its
+  persistence, and **`fastcache-cli node-conditions`** lists every row with its detail and
+  remedy, exiting `no` when none is raised so a loop over machines can test it.
+- **The fleet page** (below) opens with a Conditions panel, filed per machine: what each
+  machine that has something raised reports, with its severity, persistence and remedy; how
+  many report nothing raised; and, apart, which machines report no conditions at all. Every
+  row every machine sent follows behind a disclosure, and `/fleet.json`, `/fleet.txt` and
+  `fastcache-cli fleet conditions` carry the same rows. Every machine sends its rows with
+  the announcement it makes whatever it runs, so a machine with no worker is on it too.
+- **`fastcache-cli live-stats node`** carries a `conditions` line under the node's identity.
+
+**One candidate is not a condition yet.** `--scheduler` naming a literal seed address rather
+than a stable name (#1310) is invisible until the day that host is retired, but no part of
+this node detects it: #1310 was closed by making `--scheduler` a list the node falls back
+along, and a row with no detection behind it would be a condition that can only ever read
+`undecided`.
+
 ## Watching one
 
 `--admin-listen` serves `/metrics` and `/healthz`, and is **off unless you ask

@@ -27,6 +27,7 @@
 #include <utility>
 #include <vector>
 
+#include <tests/SkewedMetricsSink.hpp>
 #include <tests/Unwrap.hpp>
 
 using namespace FastCache;
@@ -37,33 +38,7 @@ namespace
 {
 
 /// A sink that cannot carry one catalogue row, the in-process shape of #1353's build skew.
-class SkewedSink final: public IMetricsSink
-{
-  public:
-    explicit SkewedSink(Counter missing) noexcept:
-        _missing { missing }
-    {
-    }
-
-    void Increment(Counter counter, std::uint64_t by = 1) noexcept override
-    {
-        _inner.Increment(counter, by);
-    }
-
-    [[nodiscard]] std::uint64_t Read(Counter counter) const noexcept override
-    {
-        return _inner.Read(counter);
-    }
-
-    [[nodiscard]] bool Carries(Counter counter) const noexcept override
-    {
-        return counter != _missing;
-    }
-
-  private:
-    AtomicMetricsSink _inner;
-    Counter _missing;
-};
+using SkewedSink = FastCache::Testing::SkewedMetricsSink;
 
 /// Every counter a distinct, wide value, so a figure decoded into its neighbour's slot differs.
 void GiveEveryCounterItsOwnValue(IMetricsSink& sink)

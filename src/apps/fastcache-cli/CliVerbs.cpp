@@ -1049,6 +1049,14 @@ namespace
         record.push_back({ .name = "uptime-seconds", .value = NumberCell(fields.uptimeSeconds) });
         record.push_back({ .name = "components", .value = TextCell(DescribeComponents(fields.components)) });
 
+        // **What is wrong with this node, in one field** (#1364): `none raised`, or each condition
+        // that asks for attention with its persistence, so a latched row that will outlast every fix
+        // short of a restart cannot read like a live one an operator can watch clear. ABSENT -- not
+        // `none raised` -- from a node too old to carry conditions: it has not said there is nothing,
+        // it has said nothing. `node-conditions` is every row in full.
+        auto const conditions = DescribeConditions(fields.runtime.conditions);
+        record.push_back({ .name = "conditions", .value = conditions.has_value() ? TextCell(*conditions) : AbsentCell() });
+
         // **What the worker is DOING, which `components` cannot say.** That mask carries
         // a `worker` bit which is a constant on this binary -- it compiles, that is what
         // it is for -- so it reports a node that is still walking its include trees and
@@ -1211,6 +1219,72 @@ namespace
                 std::format("{} answered node-status with a body this client cannot read", context.node->Address()));
 
         return Answered(NodeStatusRecord(*fields));
+    }
+
+    /// The `node-conditions` answer for one node's status: every row it reported, as a table.
+    ///
+    /// The COLUMNS are `ConditionFieldTable`'s names in its order -- the table the wire itself is
+    /// walked by -- so this renderer restates no list of fields, and a field appended to a row is a
+    /// column here without anybody remembering to add one.
+    ///
+    /// **Three outcomes, and they are the three answers** (#1364). Something asks for attention:
+    /// `ok`, every row, and a count on stderr. Nothing does: `no`, every row still printed -- each
+    /// says `clear` or `not-evaluated`, which is how *none raised* is SHOWN rather than asserted --
+    /// and the words on stderr. And a node that carried no conditions at all: refused as a reply this
+    /// client cannot read the answer out of, never an empty table, which would print exactly like
+    /// a node with nothing to report.
+    /// @param fields What the node said.
+    /// @param address Where it answered, for the refusal's wording.
+    /// @return The answer.
+    [[nodiscard]] Answer NodeConditionsAnswer(CompileCacheWire::NodeStatusFields const& fields, std::string_view address)
+    {
+        if (!fields.runtime.conditions.has_value())
+            return Concluded(Outcome::Protocol,
+                             std::format("{} reports no conditions: it is a build older than them, which is not the same "
+                                         "answer as none raised",
+                                         address));
+
+        std::vector<std::string> columns;
+        columns.reserve(CompileCacheWire::ConditionFieldTable.size());
+        for (auto const& field: CompileCacheWire::ConditionFieldTable)
+            columns.emplace_back(field.name);
+
+        std::vector<std::vector<Cell>> rows;
+        rows.reserve(fields.runtime.conditions->size());
+        for (auto const& condition: *fields.runtime.conditions)
+        {
+            std::vector<Cell> row;
+            row.reserve(CompileCacheWire::ConditionFieldTable.size());
+            for (auto const& field: CompileCacheWire::ConditionFieldTable)
+                row.push_back(TextCell(condition.*field.member));
+            rows.push_back(std::move(row));
+        }
+
+        auto const asking = std::ranges::count_if(*fields.runtime.conditions, &CompileCacheWire::AsksForAttention);
+        auto answer = Answered(TableValue(std::move(columns), std::move(rows)),
+                               asking == 0 ? Outcome::Negative : Outcome::Affirmative);
+        answer.advisories.push_back(
+            asking == 0 ? std::string { NoConditionsRaised }
+                        : std::format("{} of {} condition(s) raised", asking, fields.runtime.conditions->size()));
+        return answer;
+    }
+
+    /// `node-conditions` -- every condition this endpoint reports, raised or not.
+    /// @param context What to run against.
+    /// @return The answer.
+    [[nodiscard]] Answer NodeConditions(VerbContext const& context)
+    {
+        auto const reply = AskNode(context, CompileCacheWire::EncodeNodeStatusRequest());
+        if (!reply.has_value())
+            return reply.error();
+
+        auto const fields = CompileCacheWire::DecodeNodeStatus(reply->payload);
+        if (!fields.has_value())
+            return Concluded(
+                Outcome::Protocol,
+                std::format("{} answered node-status with a body this client cannot read", context.node->Address()));
+
+        return NodeConditionsAnswer(*fields, context.node->Address());
     }
 
     /// What to call one admission verdict.
@@ -2115,6 +2189,21 @@ namespace
           .handler = &NodeStatus,
           .nodeFallback = nullptr,
           .session = nullptr },
+        // A second row over the same wire verb, for `cluster-members`' reason: `node` is a record
+        // and this is a table, and one verb returning both would have to nest a table in a field.
+        { .name = "node-conditions",
+          .wire = Wire::Node,
+          .minOperands = 0,
+          .maxOperands = 0,
+          .operands = "",
+          .summary = "what this node has detected that an operator must act on:\n"
+                     "every condition, raised or not, with its remedy; exits 1\n"
+                     "when none is raised, so a loop over machines can test it",
+          .protocolCommand = "node-status",
+          .modifiers = Modifier::None,
+          .handler = &NodeConditions,
+          .nodeFallback = nullptr,
+          .session = nullptr },
         // Asked of the node on THIS machine: the node refuses a cordon from anywhere else,
         // because whether a machine serves the fleet is decided on that machine (#1303).
         { .name = "cordon",
@@ -2150,7 +2239,7 @@ namespace
           // `the fleet verb offers every section the server serves` in
           // `CliVerbs_test.cpp`, which walks that table: a section added and not
           // spelled here reddens rather than going quietly missing from the help.
-          .operands = " <kpi|machines|workers|leases|members|forgotten|tiers|series>",
+          .operands = " <kpi|machines|workers|leases|members|forgotten|conditions|tiers|series>",
           .summary = "one of the leader's fleet tables, read over 0xFC from\n"
                      "the node that leads -- no admin surface, browser or JSON parser",
           .protocolCommand = "fleet-text",

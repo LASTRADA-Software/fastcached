@@ -24,6 +24,7 @@
 #include "LiveStatsResponder.hpp"
 #include "LiveStatsSources.hpp"
 #include "NodeAnnounce.hpp"
+#include "NodeConditions.hpp"
 #include "NodeConfig.hpp"
 #include "NodeCredential.hpp"
 #include "NodeFrameSurface.hpp"
@@ -533,6 +534,17 @@ using Node::NodeReloader;
         logger.Log(LogLevel::Info, *said);
 
     AtomicMetricsSink metrics;
+
+    // **What this node has detected that an operator must act on, as one table** (#1364). Every
+    // row was log-only before, and a log line scrolls away. Declared above every component that
+    // raises or clears a row, so it outlives all of them; each component that runs answers its own
+    // rows as it starts, and `Settle` below answers the rest before any surface serves.
+    //
+    // The process scope first, because it needs nothing but the sink: whether this build's
+    // catalogue and sink agree is fixed before the process serves anything.
+    Node::NodeConditions conditions;
+    Node::EvaluateProcessConditions(conditions, metrics);
+
     // One policy for all THREE surfaces -- the compile port here, the scheduler and
     // the cache below -- and it outlives every one of them. A node that answered "is
     // this peer one of ours" differently at two of its surfaces would admit a peer to
@@ -540,7 +552,10 @@ using Node::NodeReloader;
     // Not `const`: consensus republishes the member set into it while the node runs,
     // which is the whole point of membership being a replicated log entry rather than
     // a command-line list.
-    Node::NodeMembership membership { cfg, logger };
+    //
+    // It reports a `--fleet-member` entry the cluster has forgotten only where there IS a cluster:
+    // `RunsConsensus`, the one predicate every consensus-dependent site asks.
+    Node::NodeMembership membership { cfg, logger, AddressWhen(Node::RunsConsensus(cfg), conditions) };
 
     // The worker server and the admin endpoint are both built BELOW the cache tier,
     // and in both cases moving them down was the fix rather than tidying: one takes
@@ -589,8 +604,8 @@ using Node::NodeReloader;
     std::unique_ptr<Node::SchedulerTier> schedulerTier;
     if (cfg.serveScheduler)
     {
-        auto started =
-            Node::SchedulerTier::Start(cfg, membership.Oracle(), schedulerClock, schedulerWallClock, metrics, logger);
+        auto started = Node::SchedulerTier::Start(
+            cfg, membership.Oracle(), schedulerClock, schedulerWallClock, metrics, logger, conditions);
         if (!started.has_value())
         {
             // Fatal for the same reason the admin endpoint's is: an operator who asked
@@ -713,7 +728,8 @@ using Node::NodeReloader;
                                                         .credential = credential,
                                                         .proofKey = proofKey,
                                                         .metrics = metrics,
-                                                        .logger = logger },
+                                                        .logger = logger,
+                                                        .conditions = conditions },
                                 &Node::MakeSystemWorkerMachine);
     if (!workerOrRefusal.has_value())
     {
@@ -753,21 +769,6 @@ using Node::NodeReloader;
     // `RunsConsensus` is the one predicate `StartConsensusOrExplain` itself asks (#1022,
     // #613). Reporting it cannot disagree with whether a tier gets built, which a second
     // spelling of the same question could.
-    // The runtime enrollment window, and the key source it hands over from.
-    //
-    // Held whatever this node runs, because it is two words of state and a mutex, and
-    // declared here so it outlives both the surface that mutates it and the status
-    // source that reads it. **What decides whether it is REACHABLE is
-    // `servesEnrollment` below** -- `RunsConsensus`, which is the one predicate the
-    // consensus tier itself asks so the surface and the tier cannot disagree about
-    // whether this node has a cluster, AND a scheduler tier, without which the responder
-    // has no references to hold. A node missing either leaves the component null and the
-    // whole family is refused at the door: a window that could never admit anybody
-    // should not be openable, and one nothing serves should not be reported.
-    //
-    // The key source that a hand-over reads is declared above the worker tier, because the
-    // cluster-key PROOF reads the same one (#1428) and the tier borrows it.
-    Node::EnrollmentWindow enrollmentWindow { statusClock };
 
     // **Whether this node serves enrollment at all, asked ONCE.**
     //
@@ -800,6 +801,26 @@ using Node::NodeReloader;
     // has to be, at the decision itself: the responder reads the key BEFORE it admits
     // anybody.
     auto const servesEnrollment = ServesEnrollment(cfg, schedulerTier.get());
+
+    // The runtime enrollment window, and the key source it hands over from.
+    //
+    // Held whatever this node runs, because it is two words of state and a mutex, and
+    // declared here so it outlives both the surface that mutates it and the status
+    // source that reads it. **What decides whether it is REACHABLE is
+    // `servesEnrollment` above** -- `RunsConsensus`, which is the one predicate the
+    // consensus tier itself asks so the surface and the tier cannot disagree about
+    // whether this node has a cluster, AND a scheduler tier, without which the responder
+    // has no references to hold. A node missing either leaves the component null and the
+    // whole family is refused at the door: a window that could never admit anybody
+    // should not be openable, and one nothing serves should not be reported.
+    //
+    // The key source that a hand-over reads is declared above the worker tier, because the
+    // cluster-key PROOF reads the same one (#1428) and the tier borrows it.
+    //
+    // It reports itself as a condition only where it can be opened at all: `servesEnrollment`
+    // above, so a node with no window reports that row NOT EVALUATED rather than a reassuring
+    // `clear` for a window nothing can open (#1364).
+    Node::EnrollmentWindow enrollmentWindow { statusClock, AddressWhen(servesEnrollment, conditions) };
 
     Node::ConfiguredNodeStatus const nodeStatus {
         cfg,
@@ -842,7 +863,11 @@ using Node::NodeReloader;
                                    // only exists where consensus runs, so this pointer is what
                                    // draws the distinction and a keyless node reports the field
                                    // ABSENT rather than `0` (#1471).
-                                   .membership = AddressWhen(Node::RunsConsensus(cfg), membership) },
+                                   .membership = AddressWhen(Node::RunsConsensus(cfg), membership),
+                                   // Every node has conditions, so this is never null here: a node
+                                   // with nothing raised reports every row `clear` or
+                                   // `not-evaluated`, never an empty list (#1364).
+                                   .conditions = &conditions },
     };
 
     // The operator verbs. Declared BEFORE the surface that routes to it and therefore
@@ -1151,7 +1176,7 @@ using Node::NodeReloader;
     auto const liveSourcesAttached = liveSources.Attach(nodeLiveSources);
 
     auto surfaceOrRefusal = Node::StartAdminSurfaceOrExplain(
-        cfg, *host, metrics, std::move(snapshotProvider), fleetSources, &sampler, dashboardCredential, logger);
+        cfg, *host, metrics, std::move(snapshotProvider), fleetSources, &sampler, dashboardCredential, logger, conditions);
 
     // Fatal here and not in the daemon, which is a real difference between the two
     // binaries rather than a defect in either; the row says why
@@ -1168,6 +1193,21 @@ using Node::NodeReloader;
     // already uses, and for the same reason: a client that dials the instant a port
     // is bound must not find a listener nobody is accepting on.
     //
+    // Every component that will ever exist in this process has now been built, so every condition
+    // row is answered -- by the component that runs it, or here, from its scope, for a component
+    // this node does not run. BEFORE any surface serves, so no reader ever sees the `undecided` a
+    // correct node never shows. A row still undecided is a component that runs and never said
+    // anything: named at Error, and reported as `undecided` rather than dressed as a neighbour.
+    for (auto const undecided: conditions.Settle(Node::PresentComponents { .worker = workerTier != nullptr,
+                                                                           .scheduler = schedulerTier != nullptr,
+                                                                           .adminSurface = adminSurface.endpoint != nullptr,
+                                                                           .enrollment = servesEnrollment,
+                                                                           .consensus = Node::RunsConsensus(cfg) }))
+        logger.Logf(LogLevel::Error,
+                    "condition {} was never evaluated although this node runs what evaluates it; every surface "
+                    "reports it undecided",
+                    Node::RowFor(undecided).id);
+
     // A node with neither surface enabled adopts nothing and starts no thread.
     nodeIo.Start();
 
@@ -1193,7 +1233,8 @@ using Node::NodeReloader;
                                                                               .metrics = metrics,
                                                                               .sampler = sampler,
                                                                               .credential = credential,
-                                                                              .logger = logger });
+                                                                              .logger = logger,
+                                                                              .conditions = conditions });
 
     // Installed only once the listener is up and the heartbeat is running, so a
     // stop arriving during startup cannot close a listener that does not exist yet.

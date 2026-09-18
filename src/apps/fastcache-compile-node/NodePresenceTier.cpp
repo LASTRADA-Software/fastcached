@@ -93,6 +93,12 @@ bool AnnounceMachineOnce(PresenceRound const& round, SchedulerLink& link, IEndpo
     auto const outbox = round.sampler.NextHistoryBatch(Wire::MaxHistoryBucketsPerHeartbeat);
     load.history = Distributed::HistoryToWire(outbox);
 
+    // What is wrong with this machine, every row whatever its state (#1364). Nothing a receiver
+    // could recompute travels with it: the leader files what arrived under the machine and renders
+    // it, so a leader older than a row still shows it as this node wrote it. Taken per round, so a
+    // live row that cleared is clear at the leader one interval later.
+    load.conditions = round.conditions.Snapshot();
+
     PresenceAnnouncement announcement { round.endpoint, round.capacity, load, round.credential, round.notice, round.logger };
     (void) DialAndAnnounce(link, dialer, round.logger, announcement);
 
@@ -119,6 +125,7 @@ NodePresence::NodePresence(NodePresenceParts const& parts, SchedulerLink link):
     _sampler { parts.sampler },
     _credential { parts.credential },
     _logger { parts.logger },
+    _conditions { parts.conditions },
     // Reported at Warn and once, exactly as the registrars' notice is: a credential the
     // scheduler did not want is a configuration fact, not a per-round event.
     _notice { [&logger = parts.logger](std::string_view text) { logger.Logf(LogLevel::Warn, "scheduler: {}", text); } },
@@ -156,7 +163,8 @@ void NodePresence::Loop(std::stop_token const& stop)
                                                        .notice = _notice,
                                                        .capacity = _capacityWire,
                                                        .endpoint = endpoint,
-                                                       .logger = _logger },
+                                                       .logger = _logger,
+                                                       .conditions = _conditions },
                                        _link,
                                        _dialer);
 

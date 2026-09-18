@@ -14,13 +14,17 @@
 // itself is the evidence that the old shape could not express the fact.
 #include <FastCache/Distributed/FleetHistory.hpp>
 #include <FastCache/Distributed/FleetView.hpp>
+#include <FastCache/Protocol/NodeConditionWire.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
 #include <cstdint>
+#include <format>
+#include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include <tests/FleetHarness.hpp>
@@ -195,4 +199,98 @@ TEST_CASE("A worker-only fleet is unchanged by any of this", "[node][fleet][pres
     REQUIRE(row->registeredSlots.has_value());
     CHECK(Unwrap(row->registeredSlots) == 4);
     CHECK(row->fingerprints.size() == 1);
+}
+
+namespace
+{
+
+/// One condition row as a node would send it: six strings, no enumerator anywhere.
+/// @param id The row's stable id.
+/// @param persistence `latched` or `live`.
+/// @param state `raised`, `clear` and so on.
+/// @return The row.
+[[nodiscard]] CompileCacheWire::NodeConditionFields ConditionRow(std::string id, std::string persistence, std::string state)
+{
+    return CompileCacheWire::NodeConditionFields { .id = std::move(id),
+                                                   .persistence = std::move(persistence),
+                                                   .severity = "warning",
+                                                   .state = std::move(state),
+                                                   .detail = "what the node saw",
+                                                   .remedy = "what to do about it" };
+}
+
+} // namespace
+
+TEST_CASE("A machine's condition rows reach its Machines row, with or without a worker",
+          "[node][fleet][presence][conditions]")
+{
+    // #1364. The leader stores what each MACHINE said, under the machine, and recomputes nothing:
+    // the rows come back byte for byte. Four machines, because four answers must stay apart -- a
+    // scheduler-only machine with a latched and a live row raised, a worker machine with none
+    // raised, a machine too old to say anything, and a worker that registered and never announced.
+    FleetHarness fleet;
+    fleet.AddScheduler(std::string { SchedulerA });
+    fleet.ElectLeader(SchedulerA);
+
+    std::vector const raised { ConditionRow("unsigned-lease-grants", "latched", "raised"),
+                               ConditionRow("enrollment-window-open", "live", "raised") };
+    std::vector const quiet { ConditionRow("unsigned-lease-grants", "latched", "clear"),
+                              ConditionRow("enrollment-window-open", "live", "not-evaluated") };
+    constexpr std::string_view OldMachine = "builder-2:6674";
+    constexpr std::string_view SilentWorker = "builder-3:6674";
+
+    REQUIRE(fleet.AnnounceMachineAnswer(SchedulerA, MachineA, raised).status == CompileCacheWire::Status::Ok);
+    REQUIRE(fleet.AnnounceMachineAnswer(SchedulerA, WorkerMachine, quiet).status == CompileCacheWire::Status::Ok);
+    fleet.RegisterWorker(SchedulerA, WorkerMachine, Toolchain, 4);
+    REQUIRE(fleet.AnnounceMachineAnswer(SchedulerA, OldMachine, std::nullopt).status == CompileCacheWire::Status::Ok);
+    fleet.RegisterWorker(SchedulerA, SilentWorker, Toolchain, 2);
+
+    auto const reports = fleet.MachinesAt(SchedulerA);
+    REQUIRE(reports.size() == 4);
+
+    auto const* const leaderRow = RowFor(reports, MachineA);
+    auto const* const workerRow = RowFor(reports, WorkerMachine);
+    auto const* const oldRow = RowFor(reports, OldMachine);
+    auto const* const silentRow = RowFor(reports, SilentWorker);
+    REQUIRE(leaderRow != nullptr);
+    REQUIRE(workerRow != nullptr);
+    REQUIRE(oldRow != nullptr);
+    REQUIRE(silentRow != nullptr);
+
+    CHECK(Unwrap(leaderRow->conditions) == raised);
+    // A worker machine's rows survive the fold that merges its registration into its presence --
+    // the fold whose first version kept the worker entry's fields and dropped everything else.
+    CHECK(Unwrap(workerRow->conditions) == quiet);
+    CHECK(workerRow->registeredSlots.has_value());
+    // ABSENT, twice, and neither is an empty list: "said nothing" is not "said none".
+    CHECK_FALSE(oldRow->conditions.has_value());
+    CHECK_FALSE(silentRow->conditions.has_value());
+}
+
+TEST_CASE("A condition row that is not text is refused where it enters, naming the field",
+          "[node][fleet][presence][conditions]")
+{
+    // One byte that is not UTF-8 makes `/fleet.json` unparseable for the WHOLE fleet, so the
+    // leader refuses the announcement rather than storing it -- every field of the row, from the
+    // table that lists them. The control is the same row as text, accepted, so the refusal is
+    // about the byte and not about the row.
+    FleetHarness fleet;
+    fleet.AddScheduler(std::string { SchedulerA });
+    fleet.ElectLeader(SchedulerA);
+
+    for (auto const& field: CompileCacheWire::ConditionFieldTable)
+    {
+        CAPTURE(field.name);
+        auto bad = ConditionRow("unsigned-lease-grants", "latched", "raised");
+        (bad.*field.member).append("\xff");
+        auto const refused = fleet.AnnounceMachineAnswer(SchedulerA, MachineA, std::vector { bad });
+        CHECK(refused.status == CompileCacheWire::Status::Error);
+        CHECK(refused.error == CompileCacheWire::ErrorCode::MalformedRegistration);
+        CHECK(refused.message.contains(std::format("condition {}", field.name)));
+    }
+    CHECK(fleet.MachinesAt(SchedulerA).empty());
+
+    auto const good = ConditionRow("unsigned-lease-grants", "latched", "raised");
+    CHECK(fleet.AnnounceMachineAnswer(SchedulerA, MachineA, std::vector { good }).status == CompileCacheWire::Status::Ok);
+    CHECK(fleet.MachinesAt(SchedulerA).size() == 1);
 }

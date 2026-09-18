@@ -4,6 +4,7 @@
 #include "NodeIoLoop.hpp"
 #include "ScratchClaim.hpp"
 #include "WorkerTier.hpp"
+#include "WorkerTierTestFixture.hpp"
 
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Logger.hpp>
@@ -31,101 +32,8 @@
 using namespace FastCache;
 using namespace FastCache::Node;
 
-namespace
-{
-
-/// A discovery that finds nothing and counts how often it was asked.
-class CountingDiscovery final: public Cc::IToolchainDiscovery
-{
-  public:
-    /// @param calls Incremented per `Discover`; outlives this.
-    explicit CountingDiscovery(int& calls) noexcept:
-        _calls { calls }
-    {
-    }
-
-    std::vector<Cc::ToolchainCandidate> Discover() override
-    {
-        ++_calls;
-        return {};
-    }
-
-  private:
-    int& _calls;
-};
-
-/// A worker naming one compiler and its own scheduler, so nothing is spawned to start it.
-[[nodiscard]] NodeConfig Worker()
-{
-    NodeConfig cfg;
-    cfg.schedulers = { "127.0.0.1:6675" };
-    cfg.toolchains = { "/usr/bin/g++" };
-    return cfg;
-}
-
-/// Everything a worker tier borrows, over fakes where the machine would be asked, and
-/// all of it outliving any tier a case starts.
-struct TierFixture
-{
-    Testing::ScratchDirectory scratch { "fc-worker-tier" };
-    NullLogger logger;
-    AtomicMetricsSink metrics;
-    Distributed::OpenMembership membership;
-    Testing::ScriptedHostAddresses addresses;
-    ManualClock clock;
-    CachedLocalityOracle locality { addresses, clock };
-    NodeIoLoop io;
-    std::unique_ptr<IHostFactsSource> host = MakeSystemHostFacts();
-    Distributed::NodeCapacity capacity { .logicalCores = 16 };
-    /// The one advertised endpoint, owned HERE because `main` owns it: since #1440 the tier
-    /// borrows it rather than building one, so the presence loop and the worker read the same
-    /// value changing at the same moment.
-    AnnouncedEndpoint announced { "127.0.0.1:6674" };
-    /// What the next `Start` builds from; a case edits it first.
-    NodeConfig cfg = Worker();
-    ConfiguredCredential credential { cfg, nullptr };
-    int discoveryCalls = 0;
-    /// How often the machine was asked for; a no-worker start must never ask.
-    int machineBuilds = 0;
-    /// Whether building the machine fails the way `temp_directory_path()` does for a
-    /// `TMP` that names no directory.
-    bool machineThrows = false;
-
-    /// Start a tier for `cfg` on a machine of sixteen cores.
-    [[nodiscard]] std::expected<std::unique_ptr<WorkerTier>, std::string> Start()
-    {
-        auto const makeMachine = [this] {
-            ++machineBuilds;
-            if (machineThrows)
-                throw std::filesystem::filesystem_error("temp_directory_path",
-                                                        std::make_error_code(std::errc::no_such_file_or_directory));
-            return WorkerMachine { .runner = Cc::MakeProcessRunner(),
-                                   .host = Cc::MakeToolchainHost(),
-                                   .discovery = std::make_unique<CountingDiscovery>(discoveryCalls),
-                                   .claimant = MakeLockFileScratchClaimant(),
-                                   .scratchBase = scratch.Path() };
-        };
-        return WorkerTier::Start(WorkerTierParts { .cfg = cfg,
-                                                   .reloader = nullptr,
-                                                   .capacity = capacity,
-                                                   .announced = announced,
-                                                   .activation = SocketActivation::No,
-                                                   .membership = membership,
-                                                   .locality = locality,
-                                                   .io = io,
-                                                   .host = *host,
-                                                   .cacheTier = nullptr,
-                                                   .credential = credential,
-                                                   // No cluster key: every case here is about the worker tier itself, and a
-                                                   // worker with none is the ordinary single-machine shape.
-                                                   .proofKey = nullptr,
-                                                   .metrics = metrics,
-                                                   .logger = logger },
-                                 makeMachine);
-    }
-};
-
-} // namespace
+using WorkerTierFixture = WorkerTierTesting::WorkerTierFixture;
+using WorkerTierTesting::Worker;
 
 TEST_CASE("A node running no worker builds no worker tier, and a worker builds one", "[node][worker-tier]")
 {
@@ -134,7 +42,7 @@ TEST_CASE("A node running no worker builds no worker tier, and a worker builds o
     // capacity sized to zero, no validator, no survey and no heartbeat to register with.
     // A `--scheduler` is named on it deliberately -- the cluster and enrollment commands
     // read it -- and it still builds nothing that could register.
-    TierFixture fixture;
+    WorkerTierFixture fixture;
 
     fixture.cfg.slots = 0;
     fixture.cfg.toolchains.clear();
@@ -173,10 +81,54 @@ TEST_CASE("A worker with no scheduler to register with is refused rather than st
     // The startup table refuses this configuration, and the tier refuses it again by
     // name: a worker that started without a link would never register, which is the
     // invisible-node failure. One fact, so the link and the worker cannot disagree.
-    TierFixture fixture;
+    WorkerTierFixture fixture;
     fixture.cfg.schedulers.clear();
 
     auto const refused = fixture.Start();
     REQUIRE_FALSE(refused.has_value());
     CHECK(refused.error().contains("no --scheduler"));
+}
+
+TEST_CASE("A worker answers whether its scratch root can be written into a mapping rule", "[node][worker-tier][conditions]")
+{
+    // #1364. The worker's half of a debug-prefix-map rule it cannot spell was a startup Warn and
+    // nothing else; it is now a LATCHED condition row too, answered where the root is claimed. WHAT
+    // DISTINGUISHES: three roots give three different answers -- benign, raised, and not evaluated
+    // because there is no root -- and a tier answering any one of them for all three fails two.
+    namespace Wire = CompileCacheWire;
+    WorkerTierFixture fixture;
+
+    SECTION("an ordinary root is checked and benign")
+    {
+        auto const tier = fixture.Start();
+        REQUIRE(tier.has_value());
+        REQUIRE(tier.value() != nullptr);
+        CHECK(fixture.conditions.StateOf(NodeCondition::ScratchRootUnmappable) == Wire::ConditionState::Clear);
+    }
+
+    SECTION("a root with a space in it is raised, naming the rule and the root")
+    {
+        fixture.scratchBase = fixture.scratch.Path() / "with space";
+        std::filesystem::create_directories(fixture.scratchBase);
+        auto const tier = fixture.Start();
+        REQUIRE(tier.has_value());
+        REQUIRE(tier.value() != nullptr);
+        CHECK(fixture.conditions.StateOf(NodeCondition::ScratchRootUnmappable) == Wire::ConditionState::Raised);
+        auto const rows = fixture.conditions.Snapshot();
+        auto const row =
+            std::ranges::find(rows, RowFor(NodeCondition::ScratchRootUnmappable).id, &Wire::NodeConditionFields::id);
+        REQUIRE(row != rows.end());
+        CHECK(row->detail.contains("-fdebug-prefix-map"));
+        CHECK(row->detail.contains("with space"));
+        CHECK(row->persistence == "latched");
+    }
+
+    SECTION("a worker with nothing to compile claims no root, and says it could not check one")
+    {
+        fixture.cfg.toolchains.clear();
+        auto const tier = fixture.Start();
+        REQUIRE(tier.has_value());
+        REQUIRE(tier.value() != nullptr);
+        CHECK(fixture.conditions.StateOf(NodeCondition::ScratchRootUnmappable) == Wire::ConditionState::NotEvaluated);
+    }
 }

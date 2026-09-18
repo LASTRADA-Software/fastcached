@@ -140,13 +140,13 @@ the help renders `Verbs()` grouped by `WireSpec::heading`, and
 | Write | `set`, `del`, `incr`, `decr`, `incrby`, `decrby`, `expire`, `persist`, `flush` |
 | Read (memcached) | `gat`, `gats`, `inspect`, `mc-stats` |
 | Write (memcached) | `touch`, `add`, `replace`, `append`, `prepend`, `cas`, `cache-memlimit` |
-| Node (`0xFC`) | `node`, `node-metrics`, `fleet`, `cordon`, `uncordon`, `explain-admission` |
+| Node (`0xFC`) | `node`, `node-conditions`, `node-metrics`, `fleet`, `cordon`, `uncordon`, `explain-admission` |
 | Cluster (`0xFC`) | `cluster-members`, `cluster-settings`, `cluster-set`, `cluster-forget`, `cluster-admit` |
 
 ### The fleet verb
 
 Every fleet table — machines, workers, outstanding leases, members, forgotten clients,
-cache tiers — used
+conditions, cache tiers — used
 to be reachable from a browser and from nowhere else. `/fleet.json` is the only other
 door and it needs a JSON parser the operator supplies; `jq` is not on a Windows build
 box, and this tool has no JSON *parser* of its own — it only emits one.
@@ -331,6 +331,7 @@ version                        0.2.0-125-g6ba32b30
 node-id                        -
 uptime-seconds                 15
 components                     cache-tier, worker
+conditions                     raised: unsigned-lease-grants (latched), enrollment-window-open (live)
 toolchains                     surveying
 toolchains-served              0
 toolchains-discovered          3
@@ -400,6 +401,44 @@ Beside them, what that worker is offering and whether anyone knows about it:
   which is the half of `--cluster-admit`'s receipt to compare against. Not `raft-port`,
   which is the port the node BOUND, on an address that is routinely the wildcard. A node
   running no consensus reports no such field rather than an empty one.
+
+**`conditions`** is what this node has detected that an operator must act on — each
+condition it raised, by its stable id, with **`latched`** or **`live`** beside it:
+
+- **`latched`** — decided once, for the life of the process: an unsigned grant, an
+  unmappable scratch root, a counter table this build cannot carry. Only a restart on a
+  different build or configuration clears it, so waiting for it to clear is waiting for
+  nothing.
+- **`live`** — it can clear while the process runs: an open enrollment window, a
+  `--fleet-member` entry the cluster has forgotten. Watching it clear is watching the
+  fix land.
+
+A node with nothing raised **says** `none raised`, which is a reading. A node too old to
+carry conditions reports the field **absent**, which is not the same answer: it has not
+said there is nothing, it has said nothing. A row whose state is not plainly `raised` —
+`undecided`, which is a node wired wrongly, or a word from a newer node — carries that
+state beside its persistence rather than passing for an ordinary raise.
+
+`node-conditions` is the same question as a table: every condition the node reports,
+raised or not, one row each, with the columns `id`, `persistence`, `severity`, `state`,
+`detail` and `remedy`. The words are the **node's** — sent, never looked up — so an older
+client prints a newer node's condition as that node wrote it. It exits `ok` when any row
+asks for attention and `no` when none does, with `none raised` on stderr and every row
+still printed, so a loop over machines can test it:
+
+```console
+$ fastcache-cli node-conditions --addr=10.0.0.7:6674 --format=csv
+id,persistence,severity,state,detail,remedy
+counter-table-skew,latched,warning,clear,,...
+unsigned-lease-grants,latched,warning,raised,"no --cluster-key-file is configured, ...",...
+...
+fastcache-cli: 1 of 6 condition(s) raised
+```
+
+A node too old to carry conditions exits `protocol`, naming itself, rather than printing
+an empty table that would read exactly like a node with nothing to report. What each
+condition means and what to do about it is on the
+[compile node's page](fastcache-compile-node.md#conditions).
 
 There is deliberately no *limited-by* field beside the slot count. Which ceiling bound a
 worker's slots is the **scheduler's** conclusion — derived on the leader from what the
@@ -699,8 +738,8 @@ $ fastcache-cli live-stats node --format=tsv --samples=30 > node.tsv
 | Subject | Served by | The panel |
 |---|---|---|
 | `cache` | a `fastcached`, or a `fastcache-compile-node` for its own cache tier | the hit rate, and operations, connections, evictions and expiries per second, each with its trend; connections, items and bytes in use against their limits, per storage tier |
-| `node` | a `fastcache-compile-node` | compiles and refusals per minute, the mean compile and its trend; the slots in use against the slots available and the limit that bounds them; the cache tier's fill; the host's CPU and free memory; the node's identity, toolchains, registrars and the leader; on a consensus node, `dialled at` — the address its peers dial, the string `--cluster-admit`'s receipt asks you to compare |
-| `fleet` | the node that leads the fleet | the headline figures as tiles; one table per section (machines, workers, leases, members, forgotten, tiers); each machine's CPU over time |
+| `node` | a `fastcache-compile-node` | compiles and refusals per minute, the mean compile and its trend; the slots in use against the slots available and the limit that bounds them; the cache tier's fill; the host's CPU and free memory; the node's identity, the conditions it has raised (each marked `latched` or `live`, `none raised` when there are none, the absent marker from a node too old to say), toolchains, registrars and the leader; on a consensus node, `dialled at` — the address its peers dial, the string `--cluster-admit`'s receipt asks you to compare |
+| `fleet` | the node that leads the fleet | the headline figures as tiles; one table per section (machines, workers, leases, members, forgotten, conditions, tiers); each machine's CPU over time |
 
 The subject may be left out, and then it is what `--addr` is: a `fastcached` is
 watched as `cache`, and a compile node as `node`. **`fleet` is never inferred.** The
@@ -729,7 +768,7 @@ A terminal smaller than a panel's minimum gets one line, `needs <columns>x<rows>
 | `q`, `Q`, `Esc`, `Ctrl-C` | quit, restoring the terminal |
 | `Tab`, `→` / `←` | the fleet's next / previous section |
 | `1` … `9` | the fleet's sections by position |
-| `m` `w` `l` `c` `f` `t` | the fleet's sections by name: machines, workers, leases, members (`c`, for cluster: `m` is taken), forgotten clients and tiers |
+| `m` `w` `l` `c` `f` `!` `t` | the fleet's sections by name: machines, workers, leases, members (`c`, for cluster: `m` is taken), forgotten clients, conditions (`!`: `c` is taken) and tiers |
 | `PgDn` / `PgUp`, `Home` | scroll the fleet's table a page, or back to its top |
 | `/` | filter the fleet's table: type, `Enter` keeps the filter, `Esc` clears it, `Backspace` edits it |
 

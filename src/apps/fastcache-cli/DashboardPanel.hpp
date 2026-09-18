@@ -294,6 +294,7 @@ enum class StatusFact : std::uint8_t
 {
     NodeId,     ///< Its minted identity.
     Components, ///< What it runs.
+    Conditions, ///< What it says is wrong with it: each raised condition and its persistence (#1364).
     Toolchains, ///< `serving 3 of 3`: the survey's state and its counts.
     Registrars, ///< `1 of 1, last 4s ago`: its registrations, and when one was last accepted.
     Consensus,  ///< Its scheduler role; only on a node running consensus.
@@ -615,7 +616,7 @@ struct PanelContext
 /// **The sections a key walks are the ones the strip names**: the tabular rows of
 /// `Distributed::FleetSectionTable`, in its order. `Tab` and `Right` step to the next, `Left` to the
 /// previous, both wrapping; a digit `1`-`9` names the strip's tab in that position, and each tab's
-/// letter -- the strip's `keys  m w l c f t` -- names that tab. From a section the strip does not name,
+/// letter -- the strip's `keys  m w l c f ! t` -- names that tab. From a section the strip does not name,
 /// the first step lands on its first or last tab. A key naming no section, or a digit past the last
 /// tab, switches nothing.
 /// @param active The section drawn now.

@@ -16,6 +16,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace FastCache
@@ -933,5 +934,16 @@ struct StatsReading
 [[nodiscard]] StatsReading CaptureStatsReading(IMetricsSink const& metrics,
                                                MetricsSnapshot const& snapshot,
                                                std::span<MetricsSurface const> surfaces);
+
+/// Every catalogue row this build's sink has no slot for, by the series name it would render as.
+///
+/// **The scrape's own question, asked through the scrape's own capture** (#1364), so the startup
+/// report of a counter-table skew and the `# SKEW` lines `RenderPrometheus` writes cannot disagree
+/// about what a skew is. That is #1362's constraint: derived from the COUNTED set, never from the
+/// exported one. Every surface is claimed, because a row this process has no writer for is an
+/// ordinary absence and never a skew -- the distinction `CounterAbsence` exists to keep.
+/// @param metrics The counter sink.
+/// @return The rows' series names, in catalogue order; empty on a consistent build.
+[[nodiscard]] std::vector<std::string_view> CatalogueRowsWithoutASlot(IMetricsSink const& metrics);
 
 } // namespace FastCache

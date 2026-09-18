@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "NodeMembership.hpp"
 
+#include <FastCache/Cluster/ClusterState.hpp>
+
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <string>
 #include <vector>
 
@@ -331,4 +334,53 @@ TEST_CASE("A forget reaches an open node too", "[node][membership][forget]")
     // And the blanket still covers everybody else, so the forget narrowed exactly one
     // host rather than closing the node.
     CHECK(membership.Oracle().Classify("10.9.9.9") == Membership::Member);
+}
+
+TEST_CASE("A --fleet-member entry the cluster forgot is a LIVE condition, cleared by the reload that drops it",
+          "[node][membership][forget][conditions]")
+{
+    // #1364. The forget outranks the listing, so the host is refused either way -- what is left is a
+    // list that says one thing and a fleet that does another, which nothing reported. WHAT
+    // DISTINGUISHES: each of the three moves that can change the answer is driven, in both
+    // directions, and a host listed and never forgotten is the control that must stay out of it.
+    namespace Wire = FastCache::CompileCacheWire;
+    NodeConfig cfg;
+    cfg.nodeId = "node-a";
+    cfg.fleetMembers = { "10.0.0.1:6676", "10.0.0.2:6676" };
+    NodeConditions conditions;
+    NodeMembership membership { cfg, membershipLog, &conditions };
+    auto const detail = [&conditions] {
+        auto const rows = conditions.Snapshot();
+        auto const row =
+            std::ranges::find(rows, RowFor(NodeCondition::ForgottenFleetMember).id, &Wire::NodeConditionFields::id);
+        REQUIRE(row != rows.end());
+        return row->detail;
+    };
+
+    // Nothing forgotten yet: checked and benign.
+    CHECK(conditions.StateOf(NodeCondition::ForgottenFleetMember) == Wire::ConditionState::Clear);
+
+    // The cluster forgets one listed host: raised, naming the entry as the operator spelled it.
+    FastCache::Cluster::ClusterState state;
+    state.forgotten = { "10.0.0.1" };
+    membership.PublishCluster(state);
+    CHECK(conditions.StateOf(NodeCondition::ForgottenFleetMember) == Wire::ConditionState::Raised);
+    CHECK(detail().contains("10.0.0.1:6676"));
+    CHECK_FALSE(detail().contains("10.0.0.2"));
+
+    // The reload that drops the entry clears it, while the forget stands.
+    auto dropped = cfg;
+    dropped.fleetMembers = { "10.0.0.2:6676" };
+    membership.Adopt(dropped);
+    CHECK(conditions.StateOf(NodeCondition::ForgottenFleetMember) == Wire::ConditionState::Clear);
+    REQUIRE(membership.Oracle().Classify("10.0.0.1") == Membership::Forgotten);
+
+    // A reload that puts it back raises it again: LIVE, round and round.
+    membership.Adopt(cfg);
+    CHECK(conditions.StateOf(NodeCondition::ForgottenFleetMember) == Wire::ConditionState::Raised);
+
+    // And the cluster re-admitting the host clears it with the entry still listed.
+    state.forgotten = {};
+    membership.PublishCluster(state);
+    CHECK(conditions.StateOf(NodeCondition::ForgottenFleetMember) == Wire::ConditionState::Clear);
 }

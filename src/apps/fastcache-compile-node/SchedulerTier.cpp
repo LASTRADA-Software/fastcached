@@ -79,7 +79,8 @@ std::expected<std::unique_ptr<SchedulerTier>, std::string> SchedulerTier::Start(
     IClock& clock,
     WallClockRef wallClock,
     IMetricsSink& metrics,
-    ILogger& logger)
+    ILogger& logger,
+    NodeConditions& conditions)
 {
     // The key a lease grant is signed with, and the same file discovery proves the
     // cluster's identity from -- read again here rather than passed down, because the
@@ -97,6 +98,16 @@ std::expected<std::unique_ptr<SchedulerTier>, std::string> SchedulerTier::Start(
             return std::unexpected { key.error() };
         signingKey = std::move(*key);
     }
+
+    // Whether the grants this tier mints will be signed, decided by the one fact that decides it
+    // -- the key read just above -- and so fixed for the life of the process (#1364). The Warn the
+    // service writes at the first unsigned grant stays; this is what somebody who was not watching
+    // then can still ask for.
+    if (signingKey.empty())
+        conditions.Raise(NodeCondition::UnsignedLeaseGrants,
+                         "no --cluster-key-file is configured, so every lease grant this scheduler hands out is unsigned");
+    else
+        conditions.Clear(NodeCondition::UnsignedLeaseGrants);
 
     // The credential this surface REQUIRES, which is the inbound half of
     // `--requirepass` (#289). Absent is legal and means membership is the only gate;

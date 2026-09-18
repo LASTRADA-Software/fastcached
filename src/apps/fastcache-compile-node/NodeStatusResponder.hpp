@@ -4,6 +4,7 @@
 #include "CompileCapacity.hpp"
 #include "EnrollmentWindow.hpp"
 #include "FrameEndpoint.hpp"
+#include "NodeConditions.hpp"
 #include "NodeMembership.hpp"
 
 #include <FastCache/Core/Clock.hpp>
@@ -524,6 +525,14 @@ struct NodeRuntimeSources
     /// initializer must follow declaration order, so a member added in the middle silently
     /// breaks every call site that named the ones after it.
     NodeMembership const* membership { nullptr };
+
+    /// This node's conditions (#1364); null only where nothing was wired, which reports the
+    /// field ABSENT -- the reading an older node gives -- rather than an empty list.
+    ///
+    /// Every node has one, so on a running node this is never null: a node with nothing raised
+    /// sends every row as `clear` or `not-evaluated`, which is how *nothing raised* is told apart
+    /// from *does not carry conditions* at the far end.
+    NodeConditions const* conditions { nullptr };
 };
 
 /// The production `INodeStatusSource`: config for the surfaces, a clock for the uptime.

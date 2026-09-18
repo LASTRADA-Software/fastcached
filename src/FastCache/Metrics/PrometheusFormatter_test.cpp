@@ -19,6 +19,8 @@
 #include <string>
 #include <string_view>
 
+#include <tests/SkewedMetricsSink.hpp>
+
 using namespace FastCache;
 using namespace std::chrono_literals;
 
@@ -585,33 +587,7 @@ namespace
 /// Deliberately NOT a sink that merely reads zero: a zero is what the defect
 /// produces and what an honest idle counter produces, so a case asserting on the
 /// VALUE could not tell them apart. The case asserts on the LINE.
-class SkewedSink final: public IMetricsSink
-{
-  public:
-    explicit SkewedSink(IMetricsSink::Counter missing) noexcept:
-        _missing { missing }
-    {
-    }
-
-    void Increment(Counter counter, std::uint64_t by = 1) noexcept override
-    {
-        _inner.Increment(counter, by);
-    }
-
-    [[nodiscard]] std::uint64_t Read(Counter counter) const noexcept override
-    {
-        return _inner.Read(counter);
-    }
-
-    [[nodiscard]] bool Carries(Counter counter) const noexcept override
-    {
-        return counter != _missing;
-    }
-
-  private:
-    AtomicMetricsSink _inner;
-    IMetricsSink::Counter _missing;
-};
+using SkewedSink = FastCache::Testing::SkewedMetricsSink;
 
 /// The catalogue row's series name for @p counter, so the case names the series the
 /// way the exporter does rather than writing the string out twice.

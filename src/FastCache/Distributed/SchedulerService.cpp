@@ -797,8 +797,22 @@ SchedulerReply SchedulerService::AnnounceNode(CallerContext const& caller,
     if (presence.endpoint.empty())
         return Refuse(Wire::ErrorCode::MalformedRegistration, "a machine announces the endpoint it answers on");
 
-    _workers.NoteNodePresent(
-        std::string { presence.endpoint }, presence.capacity, presence.load, std::string { presence.version });
+    // Every string of every condition row, from the table that says which fields a row HAS -- so a
+    // field appended to it is checked without anybody remembering to (#1364). Refused like the
+    // fields above rather than dropped, for their reason: a renderer that repaired it would be a
+    // second author of what the machine said.
+    if (presence.conditions.has_value())
+        for (auto const& row: *presence.conditions)
+            for (auto const& field: Wire::ConditionFieldTable)
+                if (!IsValidUtf8(row.*field.member))
+                    return Refuse(Wire::ErrorCode::MalformedRegistration,
+                                  NotTextRefusal(std::format("condition {}", field.name)));
+
+    _workers.NoteNodePresent(std::string { presence.endpoint },
+                             presence.capacity,
+                             presence.load,
+                             std::string { presence.version },
+                             presence.conditions);
 
     // Filed under the ENDPOINT, exactly as a worker's batch is. The node's cursor advances only
     // because this verb was accepted, which is the rule `Heartbeat` already follows.

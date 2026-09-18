@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -228,17 +229,34 @@ class FleetHarness final: public Cc::IEndpointExchange
                          std::string_view machineEndpoint,
                          std::span<Distributed::FleetBucket const> history = {})
     {
-        auto const reply = NodeAt(scheduler).service.AnnounceNode(
+        if (AnnounceMachineAnswer(scheduler, machineEndpoint, std::nullopt, history).status != CompileCacheWire::Status::Ok)
+            throw std::runtime_error { "FleetHarness: the scheduler refused a machine announcement" };
+    }
+
+    /// Announce a machine carrying its condition rows (#1364), and hand back what the scheduler
+    /// ANSWERED rather than throwing on a refusal -- a case about refusing a row that is not text has
+    /// to be able to see the refusal, which `AnnounceMachine`'s arranging contract hides.
+    /// @param scheduler Which scheduler to tell.
+    /// @param machineEndpoint The machine announcing itself.
+    /// @param conditions What it says is wrong with it; `std::nullopt` is a build that says nothing.
+    /// @param history Closed buckets it is handing over.
+    /// @return The scheduler's reply.
+    [[nodiscard]] Distributed::SchedulerReply AnnounceMachineAnswer(
+        std::string_view scheduler,
+        std::string_view machineEndpoint,
+        std::optional<std::vector<CompileCacheWire::NodeConditionFields>> conditions,
+        std::span<Distributed::FleetBucket const> history = {})
+    {
+        return NodeAt(scheduler).service.AnnounceNode(
             // `SetupCaller` for `RegisterWorker`'s reason: this ARRANGES the fleet, so a case
             // that set a refused caller host must fail at its own assertion rather than here.
             SetupCaller(),
             Distributed::NodePresence { .endpoint = machineEndpoint,
                                         .version = "harness",
                                         .capacity = Distributed::NodeCapacity { .logicalCores = 8 },
-                                        .load = Distributed::NodeLoad {} },
+                                        .load = Distributed::NodeLoad {},
+                                        .conditions = std::move(conditions) },
             history);
-        if (reply.status != CompileCacheWire::Status::Ok)
-            throw std::runtime_error { "FleetHarness: the scheduler refused a machine announcement" };
     }
 
     /// The Machines rows one scheduler would draw.

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include "NodeConditions.hpp"
 #include "NodeConfig.hpp"
 #include "NodeSurfaces.hpp"
 
@@ -664,6 +665,9 @@ struct AdminSurface
 ///         it could not be served.
 /// @param credential The dashboard credential, from `LoadDashboardCredentialOrExplain`; a default
 ///        one when no token file is named.
+/// @param conditions Where whether this surface serves a GENERATED certificate is answered, with
+///        its fingerprint (#1364) -- once it serves, since a surface that did not start has nothing
+///        to report. A node asking for no surface answers nothing here; the row's scope does.
 [[nodiscard]] std::expected<AdminSurface, std::string> StartAdminSurfaceOrExplain(
     NodeConfig const& cfg,
     IHostFactsSource const& host,
@@ -672,7 +676,8 @@ struct AdminSurface
     std::optional<Distributed::FleetSources> fleet,
     FleetSampler const* sampler,
     AdminCredential const& credential,
-    ILogger& logger);
+    ILogger& logger,
+    NodeConditions& conditions);
 
 /// Read the dashboard credential `--dashboard-token-file` names, once, for every surface that
 /// guards the fleet with it.

@@ -4,6 +4,7 @@
 #include <FastCache/Core/Endian.hpp>
 #include <FastCache/Core/WireFields.hpp>
 #include <FastCache/Core/WireFrame.hpp>
+#include <FastCache/Protocol/NodeConditionWire.hpp>
 
 #include <algorithm>
 #include <array>
@@ -3927,7 +3928,30 @@ struct LoadFields
     /// that believed it was. Absent travels as a zero-length field and reads as serving,
     /// which is what a peer older than this field is.
     bool cordoned { false };
+
+    /// What this machine's conditions are (#1364), or ABSENT from a sender that says nothing
+    /// about them.
+    ///
+    /// **Carried by `NodeAnnounce` and by nothing else.** The history rule applies here for the
+    /// same reason: a heartbeat is a WORKER's and a workerless machine sends none, while every
+    /// node announces itself -- so the one verb that reaches the leader from every machine is the
+    /// one that carries what is wrong with it. A heartbeat leaves this disengaged, and the leader
+    /// does not read it there.
+    ///
+    /// Here rather than as a fourth `NodeAnnounce` field for the reason `history` is: that verb's
+    /// top-level arity is exact, and this record is the variable-arity one. Absent travels as a
+    /// zero-length field, which is also what every peer older than the field sends, so the leader
+    /// renders such a machine ABSENT rather than as one with nothing raised.
+    std::optional<std::vector<NodeConditionFields>> conditions {};
 };
+
+/// A list of conditions fits in a `NodeAnnounce` beside everything else it carries.
+///
+/// A quarter of the payload, with the history batch holding its half: the two are the only
+/// variable-length passengers the verb has, and a ceiling nobody checked is a frame a leader
+/// refuses -- a machine the fleet stops seeing, over the report of what is wrong with it.
+static_assert(MaxNodeConditionListBytes <= MaxControlPayload / 4,
+              "a node's conditions must leave room for the history and the load beside them");
 
 /// Frame a live-load record as one nested field list.
 ///
@@ -3946,13 +3970,16 @@ struct LoadFields
     auto const cache = EncodeCacheLoad(load.cache);
     auto const history = EncodeHistoryBuckets(load.history);
     auto constexpr Cordoned = std::array { std::byte { 1 } };
+    // Absent as zero length; an engaged list is never empty -- see `EncodeNodeConditions`.
+    auto const conditions = load.conditions.has_value() ? EncodeNodeConditions(*load.conditions) : std::vector<std::byte> {};
     return WireFields::Encode(
         { load.cpuBusyPermille.has_value() ? std::span<std::byte const> { cpu } : std::span<std::byte const> {},
           load.availableMemoryBytes.has_value() ? std::span<std::byte const> { memory } : std::span<std::byte const> {},
           load.freeScratchBytes.has_value() ? std::span<std::byte const> { scratch } : std::span<std::byte const> {},
           std::span<std::byte const> { cache },
           std::span<std::byte const> { history },
-          load.cordoned ? std::span<std::byte const> { Cordoned } : std::span<std::byte const> {} });
+          load.cordoned ? std::span<std::byte const> { Cordoned } : std::span<std::byte const> {},
+          std::span<std::byte const> { conditions } });
 }
 
 /// Read a live-load record back.
@@ -4014,6 +4041,10 @@ struct LoadFields
             return std::nullopt;
         out.cordoned = true;
     }
+    // Absent from every heartbeat and from any peer older than the field, which `at()` answers
+    // as an empty span; a malformed list is refused with the record, as a malformed field is.
+    if (!ReadNodeConditions(at(6), out.conditions))
+        return std::nullopt;
     return out;
 }
 
@@ -5025,6 +5056,16 @@ struct NodeRuntimeFields
     /// is forgotten is a different verb; the seam's `Explain(host)` answers that where a caller
     /// has the host, and the fleet page carries the leader's set.
     std::optional<std::uint32_t> forgottenClients {};
+
+    /// Every condition this node's table holds and what this process found for each (#1364), or
+    /// disengaged from a node too old to carry them.
+    ///
+    /// **Every row, whatever its state**, rather than only the raised ones: a list of raised rows
+    /// cannot say *checked and benign* apart from *not evaluated here*, and an empty one cannot say
+    /// *nothing raised* apart from *this build has no conditions* -- which is the absent-is-not-zero
+    /// rule one level down. A node whose table has rows always sends them, so an engaged list is
+    /// never empty and a zero-length field reads back as ABSENT.
+    std::optional<std::vector<NodeConditionFields>> conditions {};
 };
 
 /// What an operator reads `NodeRuntimeFields::consensusEndpoint` under, as prose: the
@@ -5140,6 +5181,9 @@ namespace Detail
     auto const consensusEndpoint =
         runtime.consensusEndpoint.has_value() ? AsBytes(*runtime.consensusEndpoint) : std::span<std::byte const> {};
     auto const forgottenClients = Detail::OptionalBigEndian(runtime.forgottenClients);
+    // Absent as zero length, and an engaged list is never empty; see the member.
+    auto const conditions =
+        runtime.conditions.has_value() ? EncodeNodeConditions(*runtime.conditions) : std::vector<std::byte> {};
 
     // Positional, so the ORDER here is the wire contract for this record. Append only:
     // an insertion shifts every later field and every peer decodes one fact as the next.
@@ -5157,7 +5201,8 @@ namespace Detail
                                 enrollmentPending,
                                 cordon,
                                 consensusEndpoint,
-                                forgottenClients });
+                                forgottenClients,
+                                conditions });
 }
 
 /// Read a runtime record back.
@@ -5296,6 +5341,12 @@ namespace Detail
     // and a sender that predates the field sends fewer fields, which `at` answers empty.
     if (auto const consensusEndpoint = at(13); !consensusEndpoint.empty())
         out.consensusEndpoint = std::string { AsStringView(consensusEndpoint) };
+
+    // Empty is ABSENT, and so is a record from a build before #1364, which `at` answers empty. A
+    // list this build cannot read refuses the record, for the rule every field above follows: a
+    // shape this build does not know is not read as a partial answer.
+    if (!ReadNodeConditions(at(15), out.conditions))
+        return std::nullopt;
 
     return out;
 }
