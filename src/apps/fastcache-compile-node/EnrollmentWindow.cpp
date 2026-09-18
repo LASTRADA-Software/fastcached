@@ -22,6 +22,13 @@ EnrollControlOutcome EnrollmentWindow::Open()
     // Due NOW rather than one interval from now: the open is itself the thing worth
     // saying, and a driver that asks a moment later gets the first line immediately.
     _warnDueAt = _openedAt;
+    // Live: it clears on `--enroll-close`, which is what an operator watching this row is waiting
+    // to see (#1364). The repeating Warn stays; this is what somebody not reading the log can ask
+    // for. Under the lock, so a racing open and close cannot report in the other order.
+    if (_conditions != nullptr)
+        _conditions->Raise(NodeCondition::EnrollmentWindowOpen,
+                           "the enrollment window is open: any machine that can reach this node's 0xFC port may ask to "
+                           "join, and approving one hands it this cluster's key in cleartext");
     return EnrollControlOutcome::Done;
 }
 
@@ -34,6 +41,8 @@ EnrollControlOutcome EnrollmentWindow::Close()
     _open = false;
     _pending.clear();
     _firstSeen.clear();
+    if (_conditions != nullptr)
+        _conditions->Clear(NodeCondition::EnrollmentWindowOpen);
     return EnrollControlOutcome::Done;
 }
 

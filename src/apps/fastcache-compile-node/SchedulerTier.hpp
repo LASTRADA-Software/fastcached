@@ -2,6 +2,7 @@
 #pragma once
 
 #include "FrameEndpoint.hpp"
+#include "NodeConditions.hpp"
 #include "NodeConfig.hpp"
 #include "Responders.hpp"
 
@@ -66,6 +67,8 @@ class SchedulerTier
     /// @param wallClock Where a grant's absolute expiry comes from.
     /// @param metrics Where dispatch outcomes are counted.
     /// @param logger Where the tier reports what it is doing.
+    /// @param conditions Where whether this scheduler signs its grants is answered (#1364): a
+    ///        property of the key it read here, fixed for the life of the process.
     /// @return The tier, or why it could not be built.
     [[nodiscard]] static std::expected<std::unique_ptr<SchedulerTier>, std::string> Start(
         NodeConfig const& cfg,
@@ -73,7 +76,8 @@ class SchedulerTier
         IClock& clock,
         WallClockRef wallClock,
         IMetricsSink& metrics,
-        ILogger& logger);
+        ILogger& logger,
+        NodeConditions& conditions);
 
     ~SchedulerTier() = default;
 

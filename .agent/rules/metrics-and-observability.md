@@ -941,6 +941,54 @@ the whole diagnosis ([#1399](https://github.com/LASTRADA-Software/fastcached/iss
   stream and the scrape cannot disagree about the cache. A reading in another build's layout is
   refused by name at the grant, before any snapshot arrives, and refused again per reading.
 
+## A condition an operator must act on is a row, never a log line alone
+
+A node detects things an operator has to act on, and until
+[#1364](https://github.com/LASTRADA-Software/fastcached/issues/1364) each one reached only the
+log -- which scrolls, and which nobody reads across forty machines. A condition is now a row of
+`NodeConditionTable` (`apps/fastcache-compile-node/NodeConditions.hpp`), kept in the one
+`NodeConditions` registry `main` declares and every component borrows, and carried to three
+surfaces: `node-status` (so `fastcache-cli node` and `node-conditions`), NODE-ANNOUNCE (so the
+leader's page, `/fleet.json`, `/fleet.txt` and `fleet conditions`) and the live-stats node panel.
+The log lines stay.
+
+- **Latched and live are two promises, and every surface draws them apart.** A latched row was
+  decided once and only a restart on a different build or configuration clears it; a live one
+  can clear while the process runs. Drawn alike, *still broken* and *was broken and is fixed*
+  are the same pixels -- so every test of a surface drives one of each and asserts they differ,
+  and a neuter that renders every row as latched fails exactly those cases.
+- **Four states, and two of them are claims nobody else can make.** `raised`, `clear` (checked
+  and benign), `not-evaluated` (this node runs nothing that could raise it, with the reason), and
+  `undecided` (nothing evaluated it). The last is *forgot* and must not be spelled like the
+  second, which is *decided*: `NodeConditions::Settle` answers an absent component's rows
+  `not-evaluated` and hands back every row still `undecided`, which `main` logs as an error. A
+  row whose component is PRESENT is left undecided on purpose -- filling it in would hide the
+  wiring defect it reports. The `[conditions]` Catch2 tag holds a fully configured node to no
+  undecided row, through the one registry the components share.
+- **"None raised" is SAID, and absent is ABSENT.** A node with nothing raised sends every row,
+  each `clear` or `not-evaluated`, and every surface renders that as `none raised`; a node too
+  old to carry conditions sends no list, which every surface renders at the cell as absent. An
+  engaged list is never empty -- every table row travels -- so "an empty list" is not a state the
+  wire can express, and the two readings cannot collapse into it. `node-conditions` against an
+  old node exits `protocol` rather than printing an empty table shaped exactly like *nothing to
+  report*.
+- **A row travels as WORDS, never as an enumerator.** Six strings, the last of them the remedy,
+  so a leader or a client older than a condition prints it as the node wrote it. The vocabulary
+  enums (`ConditionPersistence`, `ConditionSeverity`, `ConditionState`) are transmitted by NAME,
+  so their ordinals are free and the word is the contract -- which is why the words are pinned by
+  their bytes. A word this build cannot name is kept and shown undressed, and an unknown STATE
+  asks for attention: a word nobody here understands is not `clear`.
+- **Refused where it enters, like every other string a peer states.** `AnnounceNode` checks every
+  field of every row against `ConditionFieldTable` -- the table the wire is walked by -- so a field
+  appended to a row is checked without anybody remembering to. The node escapes a non-text
+  detail itself, so its own announcement is never the one refused.
+- **Nothing a surface can recompute is looked up instead of sent, and nothing sent is
+  recomputed.** The leader stores each machine's rows under the MACHINE, as sent, and derives no
+  count from them it could not re-derive from the rows at render time.
+- **A condition with no detection behind it is not a row.** `--scheduler` naming a literal seed
+  address (#1310) was a candidate and is not wired: nothing detects it, and a row nothing can
+  raise would read `undecided` forever -- the defect above, shipped on purpose.
+
 ## Open work
 
 - **[#592](https://github.com/LASTRADA-Software/fastcached/issues/592)** — whether the

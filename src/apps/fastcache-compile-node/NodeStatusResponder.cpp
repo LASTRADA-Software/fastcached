@@ -493,6 +493,12 @@ CompileCacheWire::NodeStatusFields ConfiguredNodeStatus::Describe() const
         if (auto const standing = _sources.consensus->CurrentStanding(); standing.has_value())
             fields.runtime.consensusStanding = WireStandings[static_cast<std::size_t>(*standing)].tag;
 
+    // Every row of the node's condition table, whatever its state (#1364), read per request like
+    // the rest of this record: a window closed a moment ago is `clear` on the next answer, which
+    // is what an operator watching a live row is waiting to see.
+    if (_sources.conditions != nullptr)
+        fields.runtime.conditions = _sources.conditions->Snapshot();
+
     for (auto const& mapping: mappings)
     {
         // **A surface the configuration does not resolve is ABSENT, never a zero port.**

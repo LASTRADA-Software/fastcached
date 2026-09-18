@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "AdminEndpoint.hpp"
+#include "NodeConditions.hpp"
 
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Logger.hpp>
@@ -689,12 +690,17 @@ TEST_CASE("An admin surface nobody asked for starts nothing at all", "[node][adm
     AtomicMetricsSink metrics;
     NullLogger logger;
     ScriptedHostFacts const scrapeHost;
+    Node::NodeConditions conditions;
     NodeConfig cfg;
 
     auto surface = Node::StartAdminSurfaceOrExplain(
-        cfg, scrapeHost, metrics, WorkerShapedSnapshot(), std::nullopt, nullptr, AdminCredential {}, logger);
+        cfg, scrapeHost, metrics, WorkerShapedSnapshot(), std::nullopt, nullptr, AdminCredential {}, logger, conditions);
     REQUIRE(surface.has_value());
     CHECK(surface->endpoint == nullptr);
+    // A surface that never started answers nothing about its certificate: the row is left for
+    // `Settle` to answer from its scope, which is what makes *not evaluated here* a statement about
+    // this node rather than a guess by a component that does not exist.
+    CHECK(conditions.StateOf(Node::NodeCondition::GeneratedTlsCertificate) == CompileCacheWire::ConditionState::Undecided);
 }
 
 TEST_CASE("An admin surface reports which flag refused it", "[node][admin][dashboard]")
@@ -705,6 +711,7 @@ TEST_CASE("An admin surface reports which flag refused it", "[node][admin][dashb
     AtomicMetricsSink metrics;
     NullLogger logger;
     ScriptedHostFacts const scrapeHost;
+    Node::NodeConditions conditions;
 
     SECTION("a listen spelling that is not an endpoint")
     {
@@ -712,7 +719,7 @@ TEST_CASE("An admin surface reports which flag refused it", "[node][admin][dashb
         cfg.adminListen = "not-a-port";
 
         auto const surface = Node::StartAdminSurfaceOrExplain(
-            cfg, scrapeHost, metrics, WorkerShapedSnapshot(), std::nullopt, nullptr, AdminCredential {}, logger);
+            cfg, scrapeHost, metrics, WorkerShapedSnapshot(), std::nullopt, nullptr, AdminCredential {}, logger, conditions);
         REQUIRE_FALSE(surface.has_value());
         CHECK(surface.error().contains("--admin-listen"));
 
@@ -759,6 +766,7 @@ TEST_CASE("An admin surface serves the fleet only when there is a fleet to read"
     AtomicMetricsSink metrics;
     NullLogger logger;
     ScriptedHostFacts const scrapeHost;
+    Node::NodeConditions conditions;
     ManualClock clock;
     ManualWallClock wallClock;
     Distributed::SchedulerService scheduler { clock, wallClock, metrics, logger, {}, {} };
@@ -779,7 +787,7 @@ TEST_CASE("An admin surface serves the fleet only when there is a fleet to read"
     SECTION("with no scheduler, /fleet is not a route")
     {
         auto surface = Node::StartAdminSurfaceOrExplain(
-            cfg, scrapeHost, metrics, WorkerShapedSnapshot(), std::nullopt, nullptr, AdminCredential {}, logger);
+            cfg, scrapeHost, metrics, WorkerShapedSnapshot(), std::nullopt, nullptr, AdminCredential {}, logger, conditions);
         REQUIRE(surface.has_value());
         REQUIRE(surface->endpoint != nullptr);
         CHECK(surface->endpoint->BoundEndpoint() == std::format("127.0.0.1:{}", port));
@@ -795,7 +803,8 @@ TEST_CASE("An admin surface serves the fleet only when there is a fleet to read"
             Distributed::FleetSources { .scheduler = &scheduler, .cluster = nullptr, .metrics = &metrics },
             nullptr,
             AdminCredential {},
-            logger);
+            logger,
+            conditions);
         REQUIRE(surface.has_value());
         REQUIRE(surface->endpoint != nullptr);
     }
@@ -810,6 +819,7 @@ TEST_CASE("Asking for a generated certificate gives the surface one to serve", "
     AtomicMetricsSink metrics;
     NullLogger logger;
     ScriptedHostFacts const scrapeHost;
+    Node::NodeConditions conditions;
 
     auto probe = BlockingListener::Bind("127.0.0.1", 0);
     REQUIRE(probe);
@@ -822,7 +832,7 @@ TEST_CASE("Asking for a generated certificate gives the surface one to serve", "
     cfg.tlsSelfSigned = true;
 
     auto surface = Node::StartAdminSurfaceOrExplain(
-        cfg, scrapeHost, metrics, WorkerShapedSnapshot(), std::nullopt, nullptr, AdminCredential {}, logger);
+        cfg, scrapeHost, metrics, WorkerShapedSnapshot(), std::nullopt, nullptr, AdminCredential {}, logger, conditions);
     REQUIRE(surface.has_value());
     REQUIRE(surface->endpoint != nullptr);
     REQUIRE(surface->tls != nullptr);
@@ -831,6 +841,15 @@ TEST_CASE("Asking for a generated certificate gives the surface one to serve", "
     // signed, so it has to be reportable -- an operator compares it with what
     // their browser shows.
     CHECK(surface->tls->CertificateFingerprint().size() == 64);
+
+    // And it is kept where somebody who missed the startup line can still read it (#1364): the
+    // condition is raised carrying THIS certificate's fingerprint, not a generic sentence.
+    CHECK(conditions.StateOf(Node::NodeCondition::GeneratedTlsCertificate) == CompileCacheWire::ConditionState::Raised);
+    auto const rows = conditions.Snapshot();
+    auto const row =
+        std::ranges::find(rows, std::string { "generated-tls-certificate" }, &CompileCacheWire::NodeConditionFields::id);
+    REQUIRE(row != rows.end());
+    CHECK(row->detail.contains(surface->tls->CertificateFingerprint()));
 }
 #endif
 
@@ -841,6 +860,7 @@ TEST_CASE("A surface with no TLS asked for holds no context at all", "[node][adm
     AtomicMetricsSink metrics;
     NullLogger logger;
     ScriptedHostFacts const scrapeHost;
+    Node::NodeConditions conditions;
 
     auto probe = BlockingListener::Bind("127.0.0.1", 0);
     REQUIRE(probe);
@@ -852,12 +872,15 @@ TEST_CASE("A surface with no TLS asked for holds no context at all", "[node][adm
     cfg.adminListen = std::format("127.0.0.1:{}", port);
 
     auto surface = Node::StartAdminSurfaceOrExplain(
-        cfg, scrapeHost, metrics, WorkerShapedSnapshot(), std::nullopt, nullptr, AdminCredential {}, logger);
+        cfg, scrapeHost, metrics, WorkerShapedSnapshot(), std::nullopt, nullptr, AdminCredential {}, logger, conditions);
     REQUIRE(surface.has_value());
     REQUIRE(surface->endpoint != nullptr);
 #if defined(FC_TLS_ENABLED)
     CHECK(surface->tls == nullptr);
 #endif
+    // Checked and benign, which is not the same answer as the no-surface case's: this surface
+    // exists and serves no generated certificate.
+    CHECK(conditions.StateOf(Node::NodeCondition::GeneratedTlsCertificate) == CompileCacheWire::ConditionState::Clear);
 }
 
 TEST_CASE("A sample records what the fleet is, in the slots the table names", "[node][admin][fleethistory]")

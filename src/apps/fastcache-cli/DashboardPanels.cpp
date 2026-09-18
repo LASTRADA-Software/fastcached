@@ -312,6 +312,10 @@ namespace
         FactCell { .label = "node-id", .fact = StatusFact::NodeId },
         FactCell { .label = "components", .fact = StatusFact::Components },
     };
+    // What the node says is wrong with it (#1364): a first cell, so its label is no wider than `toolchains`.
+    constexpr auto ConditionsCells = std::array {
+        FactCell { .label = "conditions", .fact = StatusFact::Conditions },
+    };
     constexpr auto WorkingCells = std::array {
         FactCell { .label = "toolchains", .fact = StatusFact::Toolchains },
         FactCell { .label = "registrars", .fact = StatusFact::Registrars },
@@ -388,7 +392,10 @@ namespace
 
     // §4's order: who the node is; whether it is WORKING rather than merely up; its slots and what limits
     // them; then the rates; then its cache tier and the machine.
-    constexpr auto IdentityLines = std::array { FactLine { .cells = IdentityCells, .priority = Priority::Normal } };
+    // The conditions line under who the node is, and High: it is the line an operator opened the panel to find
+    // when something is wrong, so it outlasts the rest of the identity block under height.
+    constexpr auto IdentityLines = std::array { FactLine { .cells = IdentityCells, .priority = Priority::Normal },
+                                                FactLine { .cells = ConditionsCells, .priority = Priority::High } };
     constexpr auto WorkingLines = std::array {
         FactLine { .cells = WorkingCells, .priority = Priority::High },
         FactLine { .cells = ConsensusCells, .priority = Priority::Normal },

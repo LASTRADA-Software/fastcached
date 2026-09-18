@@ -23,6 +23,7 @@
 #include <ranges>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include <tests/Unwrap.hpp>
@@ -2235,4 +2236,201 @@ TEST_CASE("The forgotten clients reach every surface, and absent is not the same
         CHECK(RenderFleetJson(snapshot, NoHistory()).contains(R"("forgotten":[])"));
         CHECK(LineCount(RenderFleetText(snapshot, NoHistory(), FleetSection::Forgotten)) == 1);
     }
+}
+
+namespace
+{
+
+/// One condition row as a machine sends it: words, never an enumerator.
+/// @param id The row's id.
+/// @param persistence Its persistence word.
+/// @param severity Its severity word.
+/// @param state Its state word.
+/// @return The row.
+[[nodiscard]] CompileCacheWire::NodeConditionFields Condition(std::string id,
+                                                              std::string persistence,
+                                                              std::string severity,
+                                                              std::string state)
+{
+    return CompileCacheWire::NodeConditionFields { .id = std::move(id),
+                                                   .persistence = std::move(persistence),
+                                                   .severity = std::move(severity),
+                                                   .state = std::move(state),
+                                                   .detail = "what the machine saw",
+                                                   .remedy = "what to do about it" };
+}
+
+constexpr std::string_view LatchedMachine = "10.0.0.2:7100";
+constexpr std::string_view LiveMachine = "10.0.0.3:7100";
+constexpr std::string_view QuietMachine = "10.0.0.4:7100";
+constexpr std::string_view SilentMachine = "10.0.0.5:7100";
+
+/// A machine of @p endpoint carrying @p conditions.
+/// @param endpoint Which machine.
+/// @param conditions What it said, or `std::nullopt` for a machine that said nothing.
+/// @return The report.
+[[nodiscard]] NodeReport Saying(std::string_view endpoint,
+                                std::optional<std::vector<CompileCacheWire::NodeConditionFields>> conditions)
+{
+    auto machine = Machine(std::string { endpoint }, 8);
+    machine.conditions = std::move(conditions);
+    return machine;
+}
+
+/// @return A machine raising one latched row, with a live row clear beside it.
+[[nodiscard]] NodeReport LatchedRaised()
+{
+    return Saying(LatchedMachine,
+                  std::vector { Condition("unsigned-lease-grants", "latched", "warning", "raised"),
+                                Condition("enrollment-window-open", "live", "alert", "clear") });
+}
+
+/// @return A machine raising one live row, with a latched row clear beside it.
+[[nodiscard]] NodeReport LiveRaised()
+{
+    return Saying(LiveMachine,
+                  std::vector { Condition("unsigned-lease-grants", "latched", "warning", "clear"),
+                                Condition("enrollment-window-open", "live", "alert", "raised") });
+}
+
+/// @return A machine that sent every row and raised none of them.
+[[nodiscard]] NodeReport NoneRaised()
+{
+    return Saying(QuietMachine,
+                  std::vector { Condition("unsigned-lease-grants", "latched", "warning", "clear"),
+                                Condition("enrollment-window-open", "live", "alert", "not-evaluated") });
+}
+
+/// @return A machine that sent no rows at all: a build older than conditions.
+[[nodiscard]] NodeReport SaidNothing()
+{
+    return Saying(SilentMachine, std::nullopt);
+}
+
+/// The panel block one machine's raised rows are listed in, or empty when it has none.
+/// @param html The page.
+/// @param endpoint Which machine.
+/// @return The block's markup.
+[[nodiscard]] std::string_view MachineBlock(std::string_view html, std::string_view endpoint)
+{
+    auto const start = html.find(std::format(R"(<div class="machine-conditions"><h3>{})", endpoint));
+    if (start == std::string_view::npos)
+        return {};
+    auto const end = html.find(R"(</div></div>)", start);
+    return html.substr(start, end - start);
+}
+
+/// Refused for `HeaderLine`'s reason: the view would outlive the page it points into.
+std::string_view MachineBlock(std::string&&, std::string_view) = delete;
+
+} // namespace
+
+TEST_CASE("A latched condition and a live one render differently on the page, in the JSON and in the text",
+          "[distributed][fleetview][conditions]")
+{
+    // #1364, the leader's three renderings of one snapshot. WHAT DISTINGUISHES: two machines each
+    // raising one row, identical but for persistence -- so a renderer that dressed every raise the
+    // same, or dropped the persistence word, fails here and nowhere else. The quiet machine and the
+    // silent one ride along so the counts in words can be asserted beside them.
+    auto snapshot = LeadingSnapshot();
+    snapshot.nodes = { LatchedRaised(), LiveRaised(), NoneRaised(), SaidNothing() };
+
+    auto const html = RenderFleetHtml(snapshot, NoHistory(), 10);
+    auto const latched = MachineBlock(html, LatchedMachine);
+    auto const live = MachineBlock(html, LiveMachine);
+    REQUIRE_FALSE(latched.empty());
+    REQUIRE_FALSE(live.empty());
+    CHECK(latched.contains("pill--latched"));
+    CHECK(latched.contains(">latched</span>"));
+    CHECK_FALSE(latched.contains("pill--live"));
+    CHECK(latched.contains("unsigned-lease-grants"));
+    CHECK_FALSE(latched.contains("enrollment-window-open")); // a clear row is not listed as raised
+    CHECK(latched.contains("chip--warning"));
+    CHECK(live.contains("pill--live"));
+    CHECK(live.contains(">live</span>"));
+    CHECK_FALSE(live.contains("pill--latched"));
+    CHECK(live.contains("chip--alert"));
+    // Neither machine that raises nothing gets a block -- and they are counted APART.
+    CHECK(MachineBlock(html, QuietMachine).empty());
+    CHECK(MachineBlock(html, SilentMachine).empty());
+    CHECK(html.contains("1 other machine(s) report no conditions raised."));
+    CHECK(html.contains("1 machine(s) report no conditions at all"));
+    CHECK_FALSE(html.contains("No conditions raised"));
+
+    auto const json = RenderFleetJson(snapshot, NoHistory());
+    CHECK(json.contains(R"({"endpoint":"10.0.0.2:7100","condition":"unsigned-lease-grants","state":"raised",)"
+                        R"("persistence":"latched","severity":"warning")"));
+    CHECK(json.contains(R"({"endpoint":"10.0.0.3:7100","condition":"enrollment-window-open","state":"raised",)"
+                        R"("persistence":"live","severity":"alert")"));
+
+    auto const text = RenderFleetText(snapshot, NoHistory(), FleetSection::Conditions);
+    CHECK(HeaderLine(text) == "endpoint\tcondition\tstate\tpersistence\tseverity\tdetail\tremedy");
+    CHECK(text.contains("10.0.0.2:7100\tunsigned-lease-grants\traised\tlatched\twarning\t"));
+    CHECK(text.contains("10.0.0.3:7100\tenrollment-window-open\traised\tlive\talert\t"));
+}
+
+TEST_CASE("A fleet with nothing raised SAYS so, and a machine that said nothing is not counted in it",
+          "[distributed][fleetview][conditions]")
+{
+    // The control and the absent case, each ALONE, because each is the other's false positive: a
+    // page that printed "no conditions raised" whenever it listed nothing would pass the first and
+    // lie in the second, and one that treated a missing list as an empty one would do the same.
+    SECTION("none raised")
+    {
+        auto snapshot = LeadingSnapshot();
+        snapshot.nodes = { NoneRaised() };
+        auto const html = RenderFleetHtml(snapshot, NoHistory(), 10);
+        CHECK(html.contains("<strong>No conditions raised</strong> on any of the 1 machine(s)."));
+        CHECK(html.contains("conditions--quiet"));
+        CHECK_FALSE(html.contains("report no conditions at all"));
+        CHECK_FALSE(html.contains(R"(<div class="machine-conditions">)"));
+        // Every row still travels: "none raised" is a reading of rows, never their absence.
+        auto const json = RenderFleetJson(snapshot, NoHistory());
+        CHECK(json.contains(R"("condition":"unsigned-lease-grants","state":"clear")"));
+        CHECK(json.contains(R"("condition":"enrollment-window-open","state":"not-evaluated")"));
+        CHECK(RenderFleetText(snapshot, NoHistory(), FleetSection::Conditions)
+                  .contains("10.0.0.4:7100\tunsigned-lease-grants\tclear\tlatched\t"));
+    }
+    SECTION("absent")
+    {
+        auto snapshot = LeadingSnapshot();
+        snapshot.nodes = { SaidNothing() };
+        auto const html = RenderFleetHtml(snapshot, NoHistory(), 10);
+        CHECK_FALSE(html.contains("No conditions raised"));
+        CHECK_FALSE(html.contains("report no conditions raised"));
+        CHECK(html.contains("conditions--absent"));
+        CHECK(html.contains("1 machine(s) report no conditions at all"));
+        CHECK(html.contains("nothing here can vouch for them. 10.0.0.5:7100"));
+        // One row per silent machine, every cell but the machine's own absent -- never a word.
+        auto const json = RenderFleetJson(snapshot, NoHistory());
+        CHECK(json.contains(R"({"endpoint":"10.0.0.5:7100","condition":null,"state":null,"persistence":null,)"
+                            R"("severity":null,"detail":null,"remedy":null})"));
+        CHECK(
+            RenderFleetText(snapshot, NoHistory(), FleetSection::Conditions).contains("10.0.0.5:7100\t-\t-\t-\t-\t-\t-\n"));
+    }
+}
+
+TEST_CASE("A row this leader has no word for is shown as the machine sent it, never filtered",
+          "[distributed][fleetview][conditions]")
+{
+    // The reason a row travels as TEXT: a newer node's condition, or its newer state, reaches an
+    // older leader's page intact. An unknown state asks for attention -- a reader must not take a
+    // word nobody here understands for "clear" -- and it is shown beside the id rather than assumed
+    // to be a raise.
+    auto snapshot = LeadingSnapshot();
+    snapshot.nodes = { Saying(LatchedMachine,
+                              std::vector { Condition("future-condition", "sticky", "dire", "smouldering") }) };
+
+    auto const html = RenderFleetHtml(snapshot, NoHistory(), 10);
+    auto const block = MachineBlock(html, LatchedMachine);
+    REQUIRE_FALSE(block.empty());
+    CHECK(block.contains("future-condition"));
+    CHECK(block.contains(">sticky</span>"));
+    CHECK(block.contains(">dire</span>"));
+    CHECK(block.contains(">smouldering</span>"));
+    // Undressed: a colour for a word this build cannot name would be this leader's guess.
+    CHECK_FALSE(block.contains("pill--latched"));
+    CHECK_FALSE(block.contains("pill--live"));
+    CHECK(RenderFleetJson(snapshot, NoHistory())
+              .contains(R"("condition":"future-condition","state":"smouldering","persistence":"sticky","severity":"dire")"));
 }

@@ -4,6 +4,7 @@
 #include "CacheTier.hpp"
 #include "EndpointDialer.hpp"
 #include "NodeAnnounce.hpp"
+#include "NodeConditions.hpp"
 #include "NodeConfig.hpp"
 #include "NodeCredential.hpp"
 #include "SchedulerLink.hpp"
@@ -36,6 +37,9 @@ struct NodePresenceParts
     FleetSampler& sampler;                          ///< This machine's own series, and its history.
     ICredentialSource const& credential;            ///< What the announcement presents.
     ILogger& logger;                                ///< Where a refusal is named.
+    /// What is wrong with this machine (#1364), read per round and handed to the leader's fleet
+    /// page. The one verb every node sends is the one that carries it.
+    NodeConditions const& conditions;
 };
 
 /// What one presence announcement is made of.
@@ -56,6 +60,7 @@ struct PresenceRound
     CompileCacheWire::CapacityFields const& capacity; ///< What this machine is.
     std::string_view endpoint;                        ///< Where it answers; the key its row is filed under.
     ILogger& logger;                                  ///< Where a refusal is named.
+    NodeConditions const& conditions;                 ///< What is wrong with this machine, as of this round.
 };
 
 /// Announce this machine once, and hand over the history it owes.
@@ -136,6 +141,7 @@ class NodePresence
     FleetSampler& _sampler;
     ICredentialSource const& _credential;
     ILogger& _logger;
+    NodeConditions const& _conditions;
 
     /// Where a credential the scheduler did not want is reported, once for this loop.
     Cc::CredentialNotice _notice;

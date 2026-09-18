@@ -103,13 +103,26 @@ namespace
     /// @param claimant Takes the claim.
     /// @param base Where the candidate roots live.
     /// @param logger Where the outcome is announced.
+    /// @param conditions Where whether the root can be mapped is answered, every way out that
+    ///        does not refuse to start.
     /// @return The held claim; a NULL claim when there is nothing to compile with; or why
     ///         the node must refuse to start.
     [[nodiscard]] std::expected<std::unique_ptr<IScratchClaim>, std::string> ClaimScratchRoot(
-        bool servesCompiles, IScratchClaimant& claimant, std::filesystem::path const& base, ILogger& logger)
+        bool servesCompiles,
+        IScratchClaimant& claimant,
+        std::filesystem::path const& base,
+        ILogger& logger,
+        NodeConditions& conditions)
     {
         if (!servesCompiles)
+        {
+            // Not `Clear`: nothing was checked, because there is no root. A worker that later finds
+            // a toolchain still runs on the root it would have claimed here -- none -- so this stays
+            // what it is for the life of the process.
+            conditions.NotEvaluated(NodeCondition::ScratchRootUnmappable,
+                                    "this worker found nothing to compile with, so it claimed no scratch root");
             return std::unique_ptr<IScratchClaim> {};
+        }
 
         auto claimed = claimant.Claim(base, DefaultMaxScratchRoots);
         if (!claimed.has_value())
@@ -140,6 +153,18 @@ namespace
         // degrade.
         for (auto const& warning: Cc::ScratchRootMappingWarnings(claim->Root().string()))
             logger.Logf(LogLevel::Warn, "{}", warning);
+
+        // And said again where somebody arriving later can ask for it (#1364), from the same
+        // derivation as the lines above, so the two cannot name different flags. Latched: the root
+        // is claimed once and held for the life of the process.
+        auto const unmappable = Cc::ScratchRootUnmappableFlags(claim->Root().string());
+        if (unmappable.empty())
+            conditions.Clear(NodeCondition::ScratchRootUnmappable);
+        else
+            conditions.Raise(NodeCondition::ScratchRootUnmappable,
+                             ListDetail(std::format("this worker's scratch root {} cannot be spelled inside a rule of:",
+                                                    claim->Root().string()),
+                                        std::vector<std::string> { unmappable.begin(), unmappable.end() }));
         return claim;
     }
 
@@ -227,7 +252,8 @@ std::expected<std::unique_ptr<WorkerTier>, std::string> WorkerTier::Start(Worker
         // The entry was named above, at Error, by the survey that could not read it.
         return std::unexpected { std::string { "a malformed --toolchain was named" } };
 
-    auto claim = ClaimScratchRoot(!discovered->entries.empty(), *machine.claimant, machine.scratchBase, parts.logger);
+    auto claim = ClaimScratchRoot(
+        !discovered->entries.empty(), *machine.claimant, machine.scratchBase, parts.logger, parts.conditions);
     if (!claim.has_value())
         return std::unexpected { std::move(claim).error() };
 

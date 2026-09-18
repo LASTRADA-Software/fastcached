@@ -89,4 +89,47 @@ std::string_view NameOfSchedulerRole(CompileCacheWire::WireSchedulerRole role) n
     return "unknown";
 }
 
+std::optional<std::vector<ConditionMention>> ConditionsAskingForAttention(
+    std::optional<std::vector<CompileCacheWire::NodeConditionFields>> const& conditions)
+{
+    if (!conditions.has_value())
+        return std::nullopt;
+
+    std::vector<ConditionMention> mentions;
+    for (auto const& row: *conditions)
+    {
+        if (!CompileCacheWire::AsksForAttention(row))
+            continue;
+        // The state rides along only where it is not the plain `raised`, so the ordinary line stays
+        // short and the unusual one cannot be mistaken for it.
+        auto const plain = CompileCacheWire::ConditionStateNamed(row.state) == CompileCacheWire::ConditionState::Raised;
+        mentions.push_back(
+            ConditionMention { .id = row.id,
+                               .persistence = row.persistence,
+                               .unusualState = plain ? std::nullopt : std::optional<std::string> { row.state },
+                               .severity = CompileCacheWire::ConditionSeverityNamed(row.severity) });
+    }
+    return mentions;
+}
+
+std::optional<std::string> DescribeConditions(
+    std::optional<std::vector<CompileCacheWire::NodeConditionFields>> const& conditions)
+{
+    auto const mentions = ConditionsAskingForAttention(conditions);
+    if (!mentions.has_value())
+        return std::nullopt;
+    if (mentions->empty())
+        return std::string { NoConditionsRaised };
+
+    std::string raised;
+    for (auto const& mention: *mentions)
+        raised += std::format("{}{} ({}{}{})",
+                              raised.empty() ? "" : ", ",
+                              mention.id,
+                              mention.persistence,
+                              mention.unusualState.has_value() ? ", " : "",
+                              mention.unusualState.value_or(std::string {}));
+    return std::format("raised: {}", raised);
+}
+
 } // namespace FastCache::Cli

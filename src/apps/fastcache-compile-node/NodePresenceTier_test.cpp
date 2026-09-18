@@ -24,6 +24,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -112,6 +113,7 @@ struct PresenceFixture
     Wire::CapacityFields capacity {};
     FleetSampler sampler { std::nullopt, metrics, NodeFacts(), wall, HistoryPaths {}, logger };
     ConfiguredCredential credential { cfg, nullptr };
+    NodeConditions conditions;
 
     PresenceFixture()
     {
@@ -137,7 +139,8 @@ struct PresenceFixture
                                .notice = notice,
                                .capacity = capacity,
                                .endpoint = ThisMachine,
-                               .logger = logger };
+                               .logger = logger,
+                               .conditions = conditions };
     }
 
     /// Announce once through @p dialer.
@@ -239,6 +242,7 @@ TEST_CASE("A machine with no closed window announces itself anyway", "[node][pre
     Wire::CapacityFields const capacity {};
     FleetSampler sampler { std::nullopt, metrics, NodeFacts(), wall, HistoryPaths {}, logger };
     ConfiguredCredential credential { cfg, nullptr };
+    NodeConditions const conditions;
 
     REQUIRE(sampler.NextHistoryBatch(8).empty());
 
@@ -252,7 +256,8 @@ TEST_CASE("A machine with no closed window announces itself anyway", "[node][pre
                                                               .notice = notice,
                                                               .capacity = capacity,
                                                               .endpoint = ThisMachine,
-                                                              .logger = logger },
+                                                              .logger = logger,
+                                                              .conditions = conditions },
                                               link,
                                               dialer);
 
@@ -264,4 +269,33 @@ TEST_CASE("A machine with no closed window announces itself anyway", "[node][pre
     auto const announced = Unwrap(Wire::DecodeNodeAnnouncePayload(frames.front().second));
     CHECK(Wire::AsStringView(announced.endpoint) == ThisMachine);
     CHECK(announced.load.history.empty());
+}
+
+TEST_CASE("A machine announces its condition rows, as they stand when the round runs", "[node][presence][conditions]")
+{
+    // #1364. NODE-ANNOUNCE is the one verb every machine sends, workerless ones included, so it is
+    // what carries the rows to the leader's page. Read when the ROUND runs rather than when the
+    // presence tier was built: a live row that cleared between two rounds must arrive cleared.
+    PresenceFixture fixture;
+    fixture.conditions.Raise(NodeCondition::UnsignedLeaseGrants, "no key");
+    fixture.conditions.Raise(NodeCondition::EnrollmentWindowOpen, "the window is open");
+
+    Testing::ScriptedDialer first { { Wire::EncodeReply(Wire::Status::Ok, std::vector<std::byte> {}) } };
+    REQUIRE(fixture.AnnounceThrough(first));
+    auto const opened = Unwrap(Wire::DecodeNodeAnnouncePayload(FramesIn(first.SentOn(0)).front().second));
+    CHECK(Unwrap(opened.load.conditions) == fixture.conditions.Snapshot());
+
+    fixture.conditions.Clear(NodeCondition::EnrollmentWindowOpen);
+    Testing::ScriptedDialer second { { Wire::EncodeReply(Wire::Status::Ok, std::vector<std::byte> {}) } };
+    REQUIRE(fixture.AnnounceThrough(second));
+    auto const closed = Unwrap(Wire::DecodeNodeAnnouncePayload(FramesIn(second.SentOn(0)).front().second));
+    auto const rows = Unwrap(closed.load.conditions);
+    CHECK(rows == fixture.conditions.Snapshot());
+    auto const stateOf = [&rows](NodeCondition condition) {
+        auto const row = std::ranges::find(rows, RowFor(condition).id, &Wire::NodeConditionFields::id);
+        REQUIRE(row != rows.end());
+        return row->state;
+    };
+    CHECK(stateOf(NodeCondition::EnrollmentWindowOpen) == "clear");
+    CHECK(stateOf(NodeCondition::UnsignedLeaseGrants) == "raised");
 }

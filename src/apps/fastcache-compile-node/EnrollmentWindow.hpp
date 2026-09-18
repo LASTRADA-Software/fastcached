@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include "NodeConditions.hpp"
+
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
@@ -138,9 +140,17 @@ class EnrollmentWindow
 {
   public:
     /// @param clock Where "now" comes from; must outlive this.
-    explicit EnrollmentWindow(IClock const& clock) noexcept:
-        _clock { clock }
+    /// @param conditions Where an open window is RAISED and a closed one cleared (#1364), or null on
+    ///        a node that serves no window -- whose row its scope then answers, rather than this
+    ///        object reporting a reassuring `clear` for a window nothing can open. Must outlive this.
+    explicit EnrollmentWindow(IClock const& clock, NodeConditions* conditions = nullptr):
+        _clock { clock },
+        _conditions { conditions }
     {
+        // Closed at construction, and checked rather than assumed: a window is held in memory
+        // and nowhere else, so a process starts with none open.
+        if (_conditions != nullptr)
+            _conditions->Clear(NodeCondition::EnrollmentWindowOpen);
     }
 
     EnrollmentWindow(EnrollmentWindow const&) = delete;
@@ -256,6 +266,10 @@ class EnrollmentWindow
     [[nodiscard]] std::uint64_t SecondsSince(TimePoint since) const noexcept;
 
     IClock const& _clock;
+
+    /// Where the window's state is reported as a condition; null on a node that serves none.
+    /// Written under `_mutex`, so a racing open and close cannot report in the other order.
+    NodeConditions* _conditions;
 
     mutable std::mutex _mutex;
 

@@ -36,4 +36,19 @@ StatsReading CaptureStatsReading(IMetricsSink const& metrics,
     return reading;
 }
 
+std::vector<std::string_view> CatalogueRowsWithoutASlot(IMetricsSink const& metrics)
+{
+    auto const reading = CaptureStatsReading(metrics, MetricsSnapshot {}, EverySurface);
+    std::vector<std::string_view> rows;
+    for (auto const& row: CounterTable)
+    {
+        // A null cell is a row the reading itself cannot hold, which `RenderPrometheus` counts as a
+        // skew too; asking only `Why()` would miss the half of the skew that direction produces.
+        auto const* const cell = reading.counters.Find(row.counter);
+        if (cell == nullptr || (!cell->Present() && cell->Why() == CounterAbsence::NoSlotInThisBuild))
+            rows.push_back(row.prometheusName);
+    }
+    return rows;
+}
+
 } // namespace FastCache

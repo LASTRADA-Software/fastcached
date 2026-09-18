@@ -58,6 +58,7 @@ add_executable(fastcache-compile-node
     LocalCache.cpp
     NodeAnnounce.cpp
     NodePresenceTier.cpp
+    NodeConditions.cpp
     NodeConfig.cpp
     NodeReload.cpp
     NodeFrameSurface.cpp
@@ -140,6 +141,8 @@ if(FASTCACHED_BUILD_TESTS)
         RemoteUpstream_test.cpp
         NodeAnnounce.cpp
         NodePresenceTier.cpp
+        NodeConditions.cpp
+        NodeConditions_test.cpp
         NodeConfig.cpp
         NodeCredential_test.cpp
         NodeReload.cpp
@@ -190,6 +193,10 @@ if(FASTCACHED_BUILD_TESTS)
         "${CMAKE_SOURCE_DIR}/src/apps/fastcache-cli/CliAnswer.cpp"
         "${CMAKE_SOURCE_DIR}/src/apps/fastcache-cli/CliValue.cpp"
         "${CMAKE_SOURCE_DIR}/src/apps/fastcache-cli/StatsSource.cpp"
+        # The CLI's one reading of a node's conditions, compiled in for the same reason: the case
+        # that proves every surface walks the node's real table renders through the code the CLI
+        # draws its `node` line and panel with (#1364).
+        "${CMAKE_SOURCE_DIR}/src/apps/fastcache-cli/NodeStatusText.cpp"
     )
     target_include_directories(fastcache-compile-node-tests PRIVATE
         "${CMAKE_SOURCE_DIR}/src"
