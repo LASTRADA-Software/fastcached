@@ -2195,8 +2195,12 @@ TEST_CASE("The forgotten clients reach every surface, and absent is not the same
         // Built through `Apply`, which is how a leader acquires this state; a literal
         // would assert the representation rather than what the cluster records.
         Cluster::ClusterState state;
-        Apply(state, Cluster::Command { .kind = Cluster::CommandKind::ForgetClient, .key = "10.0.0.7", .value = {} });
-        Apply(state, Cluster::Command { .kind = Cluster::CommandKind::ForgetClient, .key = "10.0.0.8", .value = {} });
+        Apply(state,
+              Cluster::Command {
+                  .kind = Cluster::CommandKind::ForgetClient, .key = "10.0.0.7", .value = {}, .schedulerEndpoint = {} });
+        Apply(state,
+              Cluster::Command {
+                  .kind = Cluster::CommandKind::ForgetClient, .key = "10.0.0.8", .value = {}, .schedulerEndpoint = {} });
         snapshot.cluster = state;
 
         auto const json = RenderFleetJson(snapshot, NoHistory());
@@ -2220,8 +2224,12 @@ TEST_CASE("The forgotten clients reach every surface, and absent is not the same
         // surface still naming the host would send an operator to undo a forget that is
         // already undone.
         Cluster::ClusterState state;
-        Apply(state, Cluster::Command { .kind = Cluster::CommandKind::ForgetClient, .key = "10.0.0.7", .value = {} });
-        Apply(state, Cluster::Command { .kind = Cluster::CommandKind::AdmitClient, .key = "10.0.0.7", .value = {} });
+        Apply(state,
+              Cluster::Command {
+                  .kind = Cluster::CommandKind::ForgetClient, .key = "10.0.0.7", .value = {}, .schedulerEndpoint = {} });
+        Apply(state,
+              Cluster::Command {
+                  .kind = Cluster::CommandKind::AdmitClient, .key = "10.0.0.7", .value = {}, .schedulerEndpoint = {} });
         snapshot.cluster = state;
 
         CHECK(RenderFleetJson(snapshot, NoHistory()).contains(R"("forgotten":[])"));
