@@ -9,6 +9,18 @@
     #endif
 #elif defined(__APPLE__) && defined(__aarch64__)
     #include <sys/sysctl.h>
+#elif defined(__linux__) && defined(__aarch64__)
+    #include <sys/auxv.h>
+
+    #include <asm/hwcap.h>
+#elif defined(_WIN32) && defined(_M_ARM64)
+    #if !defined(WIN32_LEAN_AND_MEAN)
+        #define WIN32_LEAN_AND_MEAN
+    #endif
+    #if !defined(NOMINMAX)
+        #define NOMINMAX
+    #endif
+    #include <windows.h>
 #endif
 
 #include <algorithm>
@@ -93,8 +105,16 @@ CpuFeatures DetectCpuFeatures() noexcept
     int present = 0;
     std::size_t size = sizeof(present);
     features.armSha2 = ::sysctlbyname("hw.optional.arm.FEAT_SHA256", &present, &size, nullptr, 0) == 0 && present != 0;
+#elif defined(__linux__) && defined(__aarch64__)
+    // The kernel's statement of what userspace may execute -- the same bits `/proc/cpuinfo`
+    // renders as its `Features` line, which the test compares this with.
+    features.armSha2 = (::getauxval(AT_HWCAP) & HWCAP_SHA2) != 0;
+#elif defined(_WIN32) && defined(_M_ARM64)
+    // Windows states the ARMv8 cryptographic extension -- AES, SHA-1 and SHA-256 -- as ONE
+    // feature, so a CPU with SHA-256 and without AES would read as having neither. That errs
+    // toward Scalar, which is correct, only slower.
+    features.armSha2 = ::IsProcessorFeaturePresent(PF_ARM_V8_CRYPTO_INSTRUCTIONS_AVAILABLE) != 0;
 #endif
-    // Linux aarch64 and Windows ARM64 detect nothing until a CI leg compiles a branch for them (#1432).
 
     return features;
 }

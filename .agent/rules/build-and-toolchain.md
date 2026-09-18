@@ -6233,13 +6233,6 @@ pointer.
 
 ## Open work
 
-- **[#1432](https://github.com/LASTRADA-Software/fastcached/issues/1432)** — SHA-256 hardware
-  detection and the ARM engine are compiled for arm64 macOS alone, so Linux aarch64 and Windows
-  ARM64 run the scalar engine, which is correct and slower. That is the instruction-set extension
-  entry under "Language and ABI pitfalls" being obeyed, not a gap in it: neither platform has a CI
-  leg to compile a branch for it. It closes when each has one, and that change removes the `#1432`
-  comments in `Core/CpuFeatures` and this entry.
-
 - **[#1410](https://github.com/LASTRADA-Software/fastcached/issues/1410)** — the
   declared clang-tidy build crashes in `modernize-min-max-use-initializer-list` on a call through a
   function pointer inside a `std::max({...})` or `std::min({...})` list. The upstream check dereferences
