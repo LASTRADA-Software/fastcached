@@ -1129,7 +1129,7 @@ enum class ErrorCode : std::uint8_t
     // 0x24 was `EnrollmentAlreadyCollected`, the refusal that made a key hand-over spendable
     // once. An approved enrollment no longer carries a secret (#178), so there is nothing to
     // spend; the byte is RETIRED and never reused, because a reader that still names it would
-    // read a new code under it as a spent grant.
+    // read a new code under it as a spent grant -- see `RetiredErrorCodes`.
 
     /// A fleet read named a section or a range this build does not serve.
     ///
@@ -2222,7 +2222,7 @@ inline constexpr std::array ErrorTable {
 /// A row here rather than a comment for the reason `PreAuthVerbsAreBounded` is a
 /// `static_assert`: getting it wrong is silent everywhere it matters and visible
 /// nowhere, so the build is the only place it can be caught.
-inline constexpr std::array<std::uint8_t, 1> RetiredErrorCodes { 0x06 };
+inline constexpr std::array<std::uint8_t, 2> RetiredErrorCodes { 0x06, 0x24 };
 
 /// Whether the error table has kept clear of every retired byte.
 ///
@@ -2241,7 +2241,8 @@ inline constexpr std::array<std::uint8_t, 1> RetiredErrorCodes { 0x06 };
 
 static_assert(NoRetiredErrorCodeIsReused(),
               "a retired wire code must never be reassigned -- a peer built against an older header still reports it "
-              "under its old name (0x06 was canonicalization-failed; see issues #59, #69)");
+              "under its old name (0x06 was canonicalization-failed, see issues #59 and #69; 0x24 was "
+              "enrollment-already-collected, see #178)");
 
 /// What a compile-family verb is told at an endpoint that runs no compile worker.
 ///
@@ -6101,7 +6102,7 @@ enum class EnrollmentDecision : std::uint8_t
 
     // 0x03 was `Collected`, the state a spendable-once key hand-over moved a row into (#178
     // retired it with the secret). RETIRED and never reused: a reader that still names it would
-    // show an operator a row that collected something.
+    // show an operator a row that collected something -- see `RetiredEnrollmentDecisions`.
 
     Rejected = 0x04, ///< Refused by a person.
 };
@@ -6121,6 +6122,27 @@ enum class EnrollmentDecision : std::uint8_t
 inline constexpr std::array KnownEnrollmentDecisions { EnrollmentDecision::Pending,
                                                        EnrollmentDecision::Approved,
                                                        EnrollmentDecision::Rejected };
+
+/// Decision bytes that once meant something and must never mean anything again, for
+/// `RetiredErrorCodes`' reason: a peer built before the retirement still names the byte, and
+/// would render a new decision under it as the old one.
+inline constexpr std::array<std::uint8_t, 1> RetiredEnrollmentDecisions { 0x03 };
+
+/// Whether the decision list has kept clear of every retired byte.
+///
+/// Checks `KnownEnrollmentDecisions` rather than the enum, for `NoRetiredErrorCodeIsReused`'s
+/// reason: the list is what a decision must join to be decoded at all.
+/// @return True when no known decision claims a retired byte.
+[[nodiscard]] consteval bool NoRetiredEnrollmentDecisionIsReused() noexcept
+{
+    return std::ranges::none_of(KnownEnrollmentDecisions, [](EnrollmentDecision decision) {
+        return std::ranges::contains(RetiredEnrollmentDecisions, static_cast<std::uint8_t>(decision));
+    });
+}
+
+static_assert(NoRetiredEnrollmentDecisionIsReused(),
+              "a retired enrollment decision must never be reassigned -- a peer built against an older header "
+              "still reports it under its old name (0x03 was collected, see #178)");
 
 /// Whether @p raw names a decision this build understands.
 /// @param raw The decision byte, as received.
