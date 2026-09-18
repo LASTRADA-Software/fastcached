@@ -5,7 +5,7 @@
 #include "FrameEndpoint.hpp"
 
 #include <FastCache/Auth/AuthPolicy.hpp>
-#include <FastCache/Core/IRandomSource.hpp>
+#include <FastCache/Core/ISecureRandom.hpp>
 #include <FastCache/Core/Nonce.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
@@ -72,14 +72,15 @@ class NodeProofResponder final: public IFrameResponder, public INodeProver
   public:
     /// @param key Where the cluster key is read from at each verification; must outlive this.
     /// @param random Where a challenge's bytes come from; must outlive this. A test scripts it
-    ///        to fix the nonce, which is the only way a proof is reproducible at all.
+    ///        to fix the nonce, which is the only way a proof is reproducible at all -- or to
+    ///        fail, which is how a challenge this node cannot draw is shown to be refused.
     /// @param metrics Where every outcome of the exchange is recorded; must outlive this.
     /// @param logger Where a key file that has stopped being readable is reported; must outlive
     ///        this. That one condition is an operator's to fix and no counter can carry WHY.
     /// @param policy The credential this surface requires, or nullptr for none. Shared rather
     ///        than referenced because "there is no credential" has to be representable.
     NodeProofResponder(IClusterKeySource const& key,
-                       IRandomSource& random,
+                       ISecureRandom& random,
                        IMetricsSink& metrics,
                        ILogger& logger,
                        std::shared_ptr<AuthPolicy const> policy = nullptr) noexcept:
@@ -233,10 +234,7 @@ class NodeProofResponder final: public IFrameResponder, public INodeProver
     }
 
     /// @copydoc INodeProver::IssueChallenge
-    [[nodiscard]] Nonce IssueChallenge() override
-    {
-        return DrawNonce(_random);
-    }
+    [[nodiscard]] std::expected<Nonce, std::vector<std::byte>> IssueChallenge() override;
 
     /// @copydoc INodeProver::Verify
     [[nodiscard]] std::expected<std::string, std::vector<std::byte>> Verify(std::span<std::byte const> challenge,
@@ -244,12 +242,13 @@ class NodeProofResponder final: public IFrameResponder, public INodeProver
 
   private:
     IClusterKeySource const& _key;
-    IRandomSource& _random;
+    ISecureRandom& _random;
     IMetricsSink& _metrics;
 
-    /// Where the one condition no counter can explain is said out loud: this node's own key file
-    /// has stopped being readable. A counter would tell an operator that proofs are failing and
-    /// not that the failure is on THIS machine, which is the whole of the diagnosis.
+    /// Where the two conditions no counter can explain are said out loud: this node's own key
+    /// file has stopped being readable, or its generator cannot draw a challenge. A counter would
+    /// tell an operator that proofs are failing and not that the failure is on THIS machine, which
+    /// is the whole of the diagnosis.
     ILogger& _logger;
 
     std::shared_ptr<AuthPolicy const> _policy;

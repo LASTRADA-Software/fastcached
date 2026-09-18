@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#include <FastCache/Core/Endian.hpp>
-#include <FastCache/Core/IRandomSource.hpp>
+#include <FastCache/Core/ISecureRandom.hpp>
 
 #include <array>
 #include <cstddef>
-#include <cstdint>
-#include <limits>
-#include <ranges>
-#include <span>
+#include <expected>
 
 namespace FastCache
 {
@@ -25,39 +21,42 @@ namespace FastCache
 inline constexpr std::size_t NonceBytes = 32;
 
 static_assert(NonceBytes >= 32, "a nonce below 256 bits weakens the repeat bound every handshake relies on");
-static_assert(NonceBytes % sizeof(std::uint64_t) == 0, "DrawNonce fills a nonce one 64-bit draw at a time");
 
 /// A handshake nonce.
 using Nonce = std::array<std::byte, NonceBytes>;
 
-/// A fresh nonce, drawn through the randomness seam.
+/// A fresh nonce, drawn from the operating system's generator.
 ///
-/// **What a nonce here needs is that it never REPEATS, not that nobody can predict
-/// it**, and the difference is why this reaches `IRandomSource` rather than a
-/// cryptographic generator. Every handshake that uses one is a MAC under the cluster
-/// key over BOTH ends' nonces, answered live: a peer that guessed the next nonce could
-/// ask a key holder for a tag over it ahead of time, and would then hold a tag that is
-/// only ever accepted by a connection whose other half is that same key holder speaking
-/// live -- a relay, which the network already is. A repeat is different: it lets a
-/// recorded exchange be replayed whole. So the bound that matters is the collision one
-/// `NonceBytes` states, and a 64-bit-seeded engine meets it.
+/// **What a nonce here needs is that it never REPEATS, not that nobody can predict it.**
+/// Every handshake that uses one is a MAC under the cluster key over BOTH ends' nonces,
+/// answered live: a peer that guessed the next nonce could ask a key holder for a tag over
+/// it ahead of time, and would then hold a tag that is only ever accepted by a connection
+/// whose other half is that same key holder speaking live -- a relay, which the network
+/// already is. A repeat is different: it lets a recorded exchange be replayed whole. So the
+/// bound that matters is the collision one `NonceBytes` states.
 ///
-/// Drawn here, once, rather than at each handshake, because the draw loop was written
-/// inline in `DiscoveryService::IssueChallenge` and the Raft handshake needs the same
-/// bytes the same way (#1308): a second loop over `UniformInRange` is a second place for
-/// the size and the source to disagree.
-/// @param random Where the bytes come from; a test scripts it to fix the nonce.
-/// @return The nonce, each 64-bit draw written big-endian in turn.
-[[nodiscard]] inline Nonce DrawNonce(IRandomSource& random)
+/// **And that bound needs an ENTROPY SOURCE, not a seeded engine** (#1527). This drew from
+/// `IRandomSource` until then, on the argument that "a 64-bit-seeded engine meets it" -- which
+/// holds only while the seed is random, and nothing checked that it was. The engine was seeded
+/// from `std::random_device`, which on the host #1507 was measured on answers zero for 57% of
+/// draws (measured). Both seed halves zero is then about a third of processes (0.57 squared,
+/// inferred rather than reproduced), each drawing the SAME nonce stream -- so an acceptor that
+/// restarts there can re-issue its previous run's challenges. Hence `ISecureRandom`, whose
+/// production implementation reads the operating system's generator directly.
+///
+/// **A draw that fails is a refusal**, and the result says so rather than handing back a
+/// nonce: a handshake that cannot draw one is closed rather than run with a weak one, and
+/// there is no fallback to anything else.
+///
+/// Drawn here, once, rather than at each handshake, because the draw was written inline in
+/// `DiscoveryService::IssueChallenge` and the Raft handshake needs the same bytes the same way
+/// (#1308): a second draw site is a second place for the size and the source to disagree.
+/// @param random Where the bytes come from; a test scripts it to fix the nonce, or to fail.
+/// @return The nonce, or why no nonce could be drawn.
+[[nodiscard]] inline std::expected<Nonce, SecureRandomError> DrawNonce(ISecureRandom& random)
 {
     Nonce nonce {};
-    for (auto const index: std::views::iota(std::size_t { 0 }, NonceBytes / sizeof(std::uint64_t)))
-    {
-        auto const draw = random.UniformInRange(0, std::numeric_limits<std::uint64_t>::max());
-        WriteBigEndian<std::uint64_t>(std::span { nonce }.subspan(index * sizeof(std::uint64_t), sizeof(std::uint64_t)),
-                                      draw);
-    }
-    return nonce;
+    return random.Fill(nonce).transform([&nonce] { return nonce; });
 }
 
 } // namespace FastCache

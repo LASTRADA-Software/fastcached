@@ -4,7 +4,7 @@
 #include "NodeConfig.hpp"
 
 #include <FastCache/Core/EnumTable.hpp>
-#include <FastCache/Core/IRandomSource.hpp>
+#include <FastCache/Core/ISecureRandom.hpp>
 
 #include <cstdint>
 #include <expected>
@@ -116,22 +116,35 @@ enum class IdentityNeed : std::uint8_t
 /// identity this cluster has already admitted must not be replaced because a file
 /// was hard to read. Whoever meets that message can delete the file deliberately and
 /// take the consequences knowingly.
+///
+/// And so is a mint whose bits cannot be drawn (#1527): nothing is written, and the
+/// caller refuses to start rather than running under an identity drawn from anywhere
+/// weaker.
 /// @param stateDirectory Where consensus keeps its durable state.
 /// @param configured What `--node-id` said, or empty.
 /// @param random Where a minted identity's bits come from.
 /// @return The identity and how it was arrived at, or why it could not be.
 [[nodiscard]] std::expected<NodeIdentity, std::string> ResolveNodeIdentity(std::filesystem::path const& stateDirectory,
                                                                            std::string_view configured,
-                                                                           IRandomSource& random);
+                                                                           ISecureRandom& random);
 
 /// Draw a fresh identity.
 ///
 /// Exposed so a test can drive it against a scripted source rather than observing it
 /// through a file, and because "two draws differ" is a property of this function
 /// rather than of the resolver around it.
+///
+/// **From the operating system's generator, never a seeded engine** (#1527). "Two
+/// machines cloned from one image mint the SAME id" is the collision this whole file
+/// exists to prevent, and an engine seeded from `std::random_device` reproduces it on
+/// any host where that device answers a constant -- measured at zero for 57% of draws
+/// on the one #1507 was found on. It also has to be UNGUESSABLE, which an engine never
+/// was: an open enrollment window hands the key to whoever names an approved id, and
+/// the operator documentation calls a minted id a gate for exactly that reason. A draw
+/// that fails is a refusal, not a fallback.
 /// @param random Where the bits come from.
-/// @return `MintedNodeIdLength` lowercase hex characters.
-[[nodiscard]] std::string MintNodeId(IRandomSource& random);
+/// @return `MintedNodeIdLength` lowercase hex characters, or why none could be drawn.
+[[nodiscard]] std::expected<std::string, SecureRandomError> MintNodeId(ISecureRandom& random);
 
 /// Put a resolved identity into a configuration, including this node's own peer entry.
 ///

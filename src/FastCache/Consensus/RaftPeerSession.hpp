@@ -4,7 +4,7 @@
 #include <FastCache/Consensus/IRaftPeerCredential.hpp>
 #include <FastCache/Consensus/RaftTypes.hpp>
 #include <FastCache/Consensus/RaftWire.hpp>
-#include <FastCache/Core/IRandomSource.hpp>
+#include <FastCache/Core/ISecureRandom.hpp>
 #include <FastCache/Core/Nonce.hpp>
 #include <FastCache/Core/Sha256.hpp>
 
@@ -118,11 +118,19 @@ class AcceptorHandshake
         NodeId dialler;
     };
 
-    /// Draws the challenge nonce.
-    /// @param credential What MACs are made and checked with; must outlive this.
+    /// Begin a handshake by drawing its challenge nonce.
+    ///
+    /// A factory rather than a constructor because the draw can FAIL, and a handshake that
+    /// cannot draw a nonce must not exist at all: run with a weak one, a restarted acceptor
+    /// re-issues challenges an earlier run already issued, and a recorded proof answers them
+    /// (#1527). So the caller is handed the refusal and closes the connection.
+    /// @param credential What MACs are made and checked with; must outlive the handshake.
     /// @param self This node's id.
     /// @param random Where the nonce comes from.
-    AcceptorHandshake(IRaftPeerCredential const& credential, NodeId self, IRandomSource& random);
+    /// @return The handshake, or why no nonce could be drawn.
+    [[nodiscard]] static std::expected<AcceptorHandshake, SecureRandomError> Create(IRaftPeerCredential const& credential,
+                                                                                    NodeId self,
+                                                                                    ISecureRandom& random);
 
     /// @return The challenge to send, before reading anything.
     [[nodiscard]] RaftWire::ChallengeFrame const& Challenge() const noexcept;
@@ -133,6 +141,11 @@ class AcceptorHandshake
     [[nodiscard]] Judgement Judge(RaftWire::ProofFrame const& proof);
 
   private:
+    /// @param credential What MACs are made and checked with.
+    /// @param self This node's id.
+    /// @param nonce The challenge nonce, freshly drawn by `Create`.
+    AcceptorHandshake(IRaftPeerCredential const& credential, NodeId self, Nonce const& nonce);
+
     IRaftPeerCredential const& _credential;
     NodeId _self;
     RaftWire::ChallengeFrame _challenge;
@@ -166,12 +179,19 @@ class DiallerHandshake
         SessionNonces nonces;
     };
 
-    /// Draws this end's nonce.
-    /// @param credential What MACs are made and checked with; must outlive this.
+    /// Begin a handshake by drawing this end's nonce.
+    ///
+    /// A factory for `AcceptorHandshake::Create`'s reason: a dialler whose nonce is weak makes
+    /// a recorded `Accepted` verdict answer it, so a draw that fails is a connection abandoned.
+    /// @param credential What MACs are made and checked with; must outlive the handshake.
     /// @param self This node's id.
     /// @param target The member this node believes it dialled.
     /// @param random Where the nonce comes from.
-    DiallerHandshake(IRaftPeerCredential const& credential, NodeId self, NodeId target, IRandomSource& random);
+    /// @return The handshake, or why no nonce could be drawn.
+    [[nodiscard]] static std::expected<DiallerHandshake, SecureRandomError> Create(IRaftPeerCredential const& credential,
+                                                                                   NodeId self,
+                                                                                   NodeId target,
+                                                                                   ISecureRandom& random);
 
     /// Answer the acceptor's challenge.
     /// @param challenge The decoded challenge.
@@ -185,6 +205,12 @@ class DiallerHandshake
     [[nodiscard]] Conclusion Conclude(RaftWire::VerdictFrame const& verdict) const;
 
   private:
+    /// @param credential What MACs are made and checked with.
+    /// @param self This node's id.
+    /// @param target The member this node believes it dialled.
+    /// @param nonce This end's nonce, freshly drawn by `Create`.
+    DiallerHandshake(IRaftPeerCredential const& credential, NodeId self, NodeId target, Nonce const& nonce);
+
     IRaftPeerCredential const& _credential;
     NodeId _self;
     NodeId _target;

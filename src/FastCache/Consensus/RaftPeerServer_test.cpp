@@ -13,14 +13,16 @@
 #include <FastCache/Consensus/RaftPeerSession.hpp>
 #include <FastCache/Consensus/RaftWire.hpp>
 #include <FastCache/Core/BoundedDrain.hpp>
-#include <FastCache/Core/IRandomSource.hpp>
+#include <FastCache/Core/ISecureRandom.hpp>
 #include <FastCache/Core/Logger.hpp>
+#include <FastCache/Core/Nonce.hpp>
 #include <FastCache/Core/SecureBytes.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Net/InMemoryTransport.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -36,6 +38,7 @@
 #include <variant>
 #include <vector>
 
+#include <tests/SecureRandomFakes.hpp>
 #include <tests/Unwrap.hpp>
 
 using namespace FastCache;
@@ -77,18 +80,21 @@ constexpr std::string_view ServerId = "n1";
 /// The dialler's id: the voter in every vote these cases send.
 constexpr std::string_view DiallerId = "n2";
 
-/// The draws the server's nonce is made of, so a case can answer its challenge without
+/// The bytes the server's nonce is made of, so a case can answer its challenge without
 /// reading it -- which is what lets a whole connection be written before the server runs.
-[[nodiscard]] std::vector<std::uint64_t> ServerNonceScript()
+[[nodiscard]] std::vector<std::byte> ServerNonceScript()
 {
-    return { 0x1111111111111111ULL, 0x2222222222222222ULL, 0x3333333333333333ULL, 0x4444444444444444ULL };
+    std::vector<std::byte> script;
+    for (auto const fill: { 0x11U, 0x22U, 0x33U, 0x44U })
+        script.insert(script.end(), NonceBytes / 4, static_cast<std::byte>(fill));
+    return script;
 }
 
 /// The challenge the server will send, from the same script it draws from.
 [[nodiscard]] RaftWire::ChallengeFrame ExpectedChallenge()
 {
-    ScriptedRandomSource random { ServerNonceScript() };
-    return RaftWire::ChallengeFrame { .nonce = DrawNonce(random) };
+    Testing::ScriptedSecureRandom random { ServerNonceScript() };
+    return RaftWire::ChallengeFrame { .nonce = DrawNonce(random).value() };
 }
 
 /// A vote response carrying `term`, the smallest message that round-trips.
@@ -157,7 +163,7 @@ class Dialler
                      std::string_view target = ServerId,
                      SecureByteBuffer key = ClusterKey()):
         _credential { std::move(key) },
-        _handshake { _credential, NodeId { id }, NodeId { target }, _random },
+        _handshake { DiallerHandshake::Create(_credential, NodeId { id }, NodeId { target }, _random).value() },
         _proof { AnswerExpectedChallenge(_handshake) },
         _sealer { _credential, SessionNonces { .acceptor = ExpectedChallenge().nonce, .dialler = _proof.nonce } },
         _wire { RaftWire::EncodeProof(_proof) }
@@ -203,7 +209,7 @@ class Dialler
 
   private:
     Cluster::PskRaftPeerCredential _credential;
-    SystemRandomSource _random { 0xD1A1 };
+    SystemSecureRandom _random;
     DiallerHandshake _handshake;
     RaftWire::ProofFrame _proof;
     FrameSealer _sealer;
@@ -264,21 +270,23 @@ struct Served
 /// own over a `TestReactor`.
 /// @param wire The bytes a peer sends.
 /// @param sink Where decoded messages land.
+/// @param random Where the server draws its challenge from.
+/// @param logger Where the server reports.
 /// @param options Limits to run the server under.
 /// @param key What the server holds.
 /// @return The server and what it counted and wrote, after its accept loop has ended.
-[[nodiscard]] Served RunOnce(std::vector<std::byte> const& wire,
-                             RecordingSink& sink,
-                             PeerServerOptions options = { .handshakeBound = 0ms },
-                             SecureByteBuffer key = ClusterKey())
+[[nodiscard]] Served RunOnceWith(std::vector<std::byte> const& wire,
+                                 RecordingSink& sink,
+                                 ISecureRandom& random,
+                                 ILogger& logger,
+                                 PeerServerOptions options = { .handshakeBound = 0ms },
+                                 SecureByteBuffer key = ClusterKey())
 {
     Served served;
     InMemoryListener listener;
-    NullLogger logger;
     SteadyClock clock;
     PlatformReactor reactor { clock };
     Cluster::PskRaftPeerCredential const credential { std::move(key) };
-    ScriptedRandomSource random { ServerNonceScript() };
     served.server = std::make_unique<RaftPeerServer>(
         listener, reactor, sink, logger, *served.metrics, credential, NodeId { ServerId }, random, options);
 
@@ -301,6 +309,22 @@ struct Served
         Append(served.replied, std::span<std::byte const> { buffer }.first(got));
     }
     return served;
+}
+
+/// `RunOnceWith` over the scripted challenge every case here answers, reporting nowhere.
+/// @param wire The bytes a peer sends.
+/// @param sink Where decoded messages land.
+/// @param options Limits to run the server under.
+/// @param key What the server holds.
+/// @return The server and what it counted and wrote, after its accept loop has ended.
+[[nodiscard]] Served RunOnce(std::vector<std::byte> const& wire,
+                             RecordingSink& sink,
+                             PeerServerOptions options = { .handshakeBound = 0ms },
+                             SecureByteBuffer key = ClusterKey())
+{
+    Testing::ScriptedSecureRandom random { ServerNonceScript() };
+    NullLogger logger;
+    return RunOnceWith(wire, sink, random, logger, options, std::move(key));
 }
 
 } // namespace
@@ -485,12 +509,40 @@ TEST_CASE("A connection that sends a Raft message first is refused, and nothing 
     CHECK(served.AnyRefusals() == 1);
 }
 
+TEST_CASE("An acceptor that cannot draw a nonce closes the connection unchallenged and blames itself",
+          "[consensus][raft][peerserver][handshake]")
+{
+    // A connection this node cannot challenge with a FRESH nonce is one it must not challenge
+    // at all (#1527): nothing is written, nothing is read, nothing is delivered. And it is not
+    // an `AcceptorRefusal` -- every one of those names something about the peer -- so no peer
+    // counter moves, and the Error names this host's generator instead.
+    Dialler dialler;
+    dialler.Send(VoteFrame(1));
+
+    RecordingSink sink;
+    Testing::ScriptedSecureRandom denied { Testing::ScriptedSecureRandom::DeniedFailure() };
+    CapturingLogger logger;
+    auto const served = RunOnceWith(dialler.Wire(), sink, denied, logger);
+
+    CHECK(denied.FillCount() == 1);
+    CHECK(served.replied.empty());
+    CHECK(sink.received.empty());
+    CHECK(served.server->DeliveredMessages() == 0);
+    CHECK(served.AnyRefusals() == 0);
+
+    auto const lines = logger.Snapshot();
+    CHECK(std::ranges::any_of(lines, [](CapturingLogger::Record const& record) {
+        return record.level == LogLevel::Error && record.message.contains("cannot draw a handshake nonce")
+               && record.message.contains(Testing::ScriptedSecureRandom::DeniedFailure().primitive);
+    }));
+}
+
 TEST_CASE("A proof at the version before the handshake is refused", "[consensus][raft][peerserver][handshake]")
 {
     auto const challenge = ExpectedChallenge();
     Cluster::PskRaftPeerCredential const credential { ClusterKey() };
-    SystemRandomSource random { 3 };
-    DiallerHandshake handshake { credential, NodeId { DiallerId }, NodeId { ServerId }, random };
+    SystemSecureRandom random;
+    auto handshake = DiallerHandshake::Create(credential, NodeId { DiallerId }, NodeId { ServerId }, random).value();
     auto const proof = handshake.Answer(challenge);
     REQUIRE(proof.has_value());
 
@@ -537,8 +589,8 @@ TEST_CASE("A proof recorded against another challenge is refused", "[consensus][
     // A genuine proof, harvested from a connection whose challenge was different. The
     // server's challenge on THIS connection is what it answers, and it does not.
     Cluster::PskRaftPeerCredential const credential { ClusterKey() };
-    SystemRandomSource random { 4 };
-    DiallerHandshake handshake { credential, NodeId { DiallerId }, NodeId { ServerId }, random };
+    SystemSecureRandom random;
+    auto handshake = DiallerHandshake::Create(credential, NodeId { DiallerId }, NodeId { ServerId }, random).value();
     auto elsewhere = ExpectedChallenge();
     elsewhere.nonce[0] ^= std::byte { 0x01 };
     auto const recorded = handshake.Answer(elsewhere);
@@ -648,9 +700,9 @@ TEST_CASE("A frame whose tag does not verify ends the connection and is counted"
         // Another connection's session: same ids, same key, same dialler nonce even --
         // and a different acceptor nonce, which is what makes it another connection.
         Dialler dialler;
-        SystemRandomSource random { 0xBEEF };
+        SystemSecureRandom random;
         Cluster::PskRaftPeerCredential const credential { ClusterKey() };
-        SessionNonces const foreign { .acceptor = DrawNonce(random), .dialler = dialler.Proof().nonce };
+        SessionNonces const foreign { .acceptor = DrawNonce(random).value(), .dialler = dialler.Proof().nonce };
         REQUIRE(foreign.acceptor != ExpectedChallenge().nonce);
         FrameSealer sealer { credential, foreign };
         auto const frame = VoteFrame(1);
@@ -726,7 +778,7 @@ TEST_CASE("A connection that does not prove the key within the bound is closed a
     RecordingSink sink;
     AtomicMetricsSink metrics;
     Cluster::PskRaftPeerCredential const credential { ClusterKey() };
-    ScriptedRandomSource random { ServerNonceScript() };
+    Testing::ScriptedSecureRandom random { ServerNonceScript() };
     RaftPeerServer server { listener,
                             reactor,
                             sink,
@@ -898,7 +950,7 @@ TEST_CASE("Shutdown closes the peer listener on the reactor, not on the calling 
     NullLogger logger;
     AtomicMetricsSink metrics;
     Cluster::PskRaftPeerCredential const credential { ClusterKey() };
-    SystemRandomSource random { 5 };
+    SystemSecureRandom random;
     RunningReactor loop;
 
     // The arrangement, asserted rather than assumed: if the reactor were not running,
