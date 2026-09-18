@@ -586,9 +586,11 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   (`MembershipPlan::forgotten`) — at the decision, never by pruning a desire the next proof
   restores. Only `--cluster-admit` lifts a tombstone.
 - The SEAT an operator chose is the record (`ClusterMember::seat`, written only by the verb:
-  `AddMember` a voter, `AddLearner` a learner, `MemberSeatTable`). A caller with NO opinion —
-  a node desiring itself, an enrollment re-approval — keeps the recorded seat
-  (`RecordedSeatOf`), or a node's own record undoes its demotion one interval later.
+  `AddMember` a voter, `AddLearner` a learner, `MemberSeatTable`). A desire carries NO seat
+  (#1535): the reconciler keeps the recorded one, else the set the CONFIGURATION counts —
+  a `--raft-peer` member is recorded nowhere, and read as a newcomer it is demoted — else a
+  newcomer joins as a LEARNER. A discovered machine is a learner until an OPERATOR promotes
+  it; never automatically, since *caught up* is not *will stay*.
 - The Raft store is FORMAT 2 and every log record carries its format: a store another build
   wrote is `UnsupportedFormatVersion`, judged from the header before the CRC, never the damage
   code. A log's FIRST record decides; a foreign LATER record is a torn tail.

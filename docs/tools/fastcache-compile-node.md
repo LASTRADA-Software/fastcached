@@ -1391,7 +1391,8 @@ as its own, because it is a log entry rather than a flag.
 
 A member admitted with `--cluster-admit` is a **voter**: every quorum counts it — the
 one that commits an entry, the one that elects a leader, and the one a leader checks it
-still has contact with. That is right for a machine that is always on, and wrong for
+still has contact with. (A machine that joins by `--discovery` is a learner until you
+promote it — [see below](#finding-peers-instead-of-typing-them).) That is right for a machine that is always on, and wrong for
 one that is not. In a cluster of an always-on node and a laptop, the laptop leaving the
 VPN costs the always-on node its majority, so it stops leading at its next check: the
 scheduler answers `NotLeader`, and the fleet page and history go dark until the laptop
@@ -1827,6 +1828,31 @@ node bootstraps the cluster and the rest join it — and exactly one, because tw
 nodes that each bootstrapped a cluster of themselves cannot be merged. A membership
 change proposed against such a node never commits, and the leader says so once the
 wait becomes unreasonable rather than leaving it to be inferred.
+
+**A discovered machine joins as a [learner](#a-machine-that-is-usually-away-admitting-a-learner),
+and you decide which ones vote**
+([#1535](https://github.com/LASTRADA-Software/fastcached/issues/1535)). It is replicated
+to from the moment it is recorded, holds the cluster state and serves whatever its other
+tiers serve, and it is counted by no quorum. Proving the key says a machine holds it
+*now*; a vote says it will go on answering, and every voter is one more machine the
+cluster needs a majority of — a laptop on a VPN admitted as a voter beside one always-on
+machine makes that machine unable to commit or re-elect alone. Only you know which
+machines stay, so promotion is yours, and it is not automatic when the learner has caught
+up: catching up says it can answer now, which the proof already said. Promote with the id
+and address `--cluster-status` shows:
+
+```sh
+fastcache-compile-node --scheduler=10.0.0.1:6675 --cluster-admit=n2=10.0.0.2:6680
+```
+
+So a fleet formed by discovery alone has **one** voter — the machine that bootstrapped —
+until you promote more, and a voter lost is a cluster that can neither commit nor elect.
+Promote two for three voters, which survive losing one. Promote a machine that is up: a
+promotion waits for its address to be dialable, not for it to have caught up
+([#1537](https://github.com/LASTRADA-Software/fastcached/issues/1537)), so a learner
+promoted while it is away is a voter the cluster must wait for. A machine already recorded or
+counted keeps its seat when it is discovered again: a promoted learner stays a voter, a
+`--raft-peer` member stays whatever that list made it, and a demoted voter stays demoted.
 
 **It never proposes a removal either.** A peer vanishes from a broadcast for reasons
 that are almost never "it left" — a lost datagram, a switch rebooting, a laptop

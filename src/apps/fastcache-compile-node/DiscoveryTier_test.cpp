@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "DiscoveryTier.hpp"
 
+#include <FastCache/Cluster/MembershipPolicy.hpp>
 #include <FastCache/Core/SecureBytes.hpp>
 #include <FastCache/Net/InMemoryDatagram.hpp>
 
@@ -245,6 +246,34 @@ TEST_CASE("Two nodes on one host find and prove each other", "[node][discovery]"
     REQUIRE(second.seen.size() == 1);
     CHECK(second.seen.front().id == "n1");
     CHECK(second.seen.front().raftEndpoint == "n1.local:6675");
+}
+
+TEST_CASE("A peer discovery proves is recorded as a learner", "[node][discovery][learner]")
+{
+    // #1535, from the proof to the command a leader proposes: what this tier hands its
+    // observer is what `ConsensusTier::Desire` stores and `MembershipProposals` decides
+    // from. `n1` bootstrapped alone and `n2` has never been recorded or counted, so the
+    // proof buys `n2` a learner's record -- replicated to, counted by nothing -- and a
+    // vote stays the operator's to give.
+    DatagramBus bus;
+    Peer first { bus, "n1", TestKey() };
+    Peer second { bus, "n2", TestKey() };
+
+    for ([[maybe_unused]] auto const round: std::views::iota(0, 4))
+    {
+        CHECK(first.tier->Step(Step));
+        CHECK(second.tier->Step(Step));
+    }
+    REQUIRE(first.seen.size() == 1);
+
+    auto const plan = Cluster::MembershipProposals(
+        Cluster::ClusterState {}, Consensus::Configuration { .voters = { "n1" }, .learners = {} }, first.seen);
+
+    REQUIRE(plan.proposals.size() == 1);
+    CHECK(plan.proposals.front()
+          == Cluster::Command {
+              .kind = Cluster::CommandKind::AddLearner, .key = "n2", .value = "n2.local:6675", .schedulerEndpoint = {} });
+    CHECK(plan.forgotten.empty());
 }
 
 TEST_CASE("Two fleets on one segment ignore each other at the node's discovery tier", "[node][discovery]")

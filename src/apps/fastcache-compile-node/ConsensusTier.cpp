@@ -218,14 +218,13 @@ ConsensusTier::ConsensusTier(Cluster::ClusterMember self,
     // all, and `DesiredMember` keeps the two apart precisely so one cannot clear
     // what the other announced.
     //
-    // The SEAT is the opposite way round (#1449): no opinion, even about itself. Which
-    // set a node is in is the operator's decision, recorded by `--cluster-admit` and
-    // `--cluster-admit-learner`; a node that asserted its own seat on every pass would
-    // undo a demotion one interval after it committed.
-    _desired.push_back(Cluster::DesiredMember { .id = _self.id,
-                                                .raftEndpoint = _self.raftEndpoint,
-                                                .schedulerEndpoint = _self.schedulerEndpoint,
-                                                .seat = std::nullopt });
+    // No SEAT, and no desire carries one (#1449, #1535): which set a node is in is the
+    // operator's decision, recorded by `--cluster-admit` and `--cluster-admit-learner`,
+    // and a node that asserted its own on every pass would undo a demotion one interval
+    // after it committed. Before its first pass it is recorded where the configuration
+    // already counts it.
+    _desired.push_back(Cluster::DesiredMember {
+        .id = _self.id, .raftEndpoint = _self.raftEndpoint, .schedulerEndpoint = _self.schedulerEndpoint });
 }
 
 std::expected<std::unique_ptr<ConsensusTier>, std::string> ConsensusTier::Start(NodeConfig const& cfg,
@@ -668,7 +667,11 @@ void ConsensusTier::Reconcile()
     // Outside the lock, both the decision and the proposals: a proposal is a
     // durability write and a broadcast, and holding a lock across one would stall
     // whoever is discovering peers behind whoever is writing to a disk.
-    auto const plan = Cluster::MembershipProposals(state, desired);
+    //
+    // With the configuration consensus holds, because a member the state does not
+    // record may still be counted there -- every `--raft-peer` member is -- and
+    // recording one as the newcomer it is not would demote it (#1535).
+    auto const plan = Cluster::MembershipProposals(state, _driver->CurrentProgress().configuration, desired);
     ReportForgottenDesires(plan.forgotten);
 
     for (auto const& command: plan.proposals)
