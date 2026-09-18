@@ -264,6 +264,12 @@ SUPPRESSIONS="${REPO_ROOT}/.tsan-suppressions"
 # scope did (#1207, #1208). It did not, and that is worth stating as a measurement
 # rather than as a conclusion about the code.
 #
+# **It declares first-party since #178**, which gave the launcher's shared sources an
+# Ed25519 verifier -- the worker half checks a lease's signature -- and with it ONE
+# first-party archive, `fastcache-monocypher`. It still links no FastCache library; what
+# the row now asks is that the archive it does link was instrumented, which a "none" row
+# would have waved through unasked.
+#
 # The instrumentation figure is the one that cannot be read off the binary: the
 # link pulls in the sanitizer runtime whole, so `__tsan_init` is present in an
 # executable whose translation units carried no `-fsanitize=` at all (#472). It is
@@ -272,7 +278,7 @@ SUPPRESSIONS="${REPO_ROOT}/.tsan-suppressions"
 TARGETS=(
     "FastCacheTest|[async],[consensus],[distributed],[reactor],[task],[net],[tls],[sharded],[expiry],[clock],[wait],[pubsub],[server]|first-party"
     "fastcache-compile-node-tests||first-party"
-    "fastcache-cc-tests||none: the launcher does not link the FastCache library, it compiles its few shared sources in"
+    "fastcache-cc-tests||first-party"
     "fastcache-cli-tests||first-party"
 )
 
@@ -734,9 +740,9 @@ ${offenders}    The BINARY may still carry a defined __tsan_init -- the link pul
 # archive nobody recorded as a dependency is treated as ours and checked, which
 # fails CLOSED.
 #
-# A row linking no first-party archive is ordinary -- `fastcache-cc-tests` compiles
-# its few shared sources in rather than linking the library -- so it is REPORTED by
-# name rather than refused. What is refused is the derivation coming back empty for
+# A row linking no first-party archive is ordinary -- `fastcache-cc-tests` was one,
+# compiling its few shared sources in, until #178 linked it the Ed25519 archive -- so it
+# is REPORTED by name rather than refused. What is refused is the derivation coming back empty for
 # EVERY row (`AssertSomeRowLinksALibrary`), and a link edge ninja cannot describe.
 # ---------------------------------------------------------------------------
 
