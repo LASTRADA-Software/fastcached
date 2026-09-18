@@ -48,20 +48,36 @@
 # regeneration can no longer silence an edit. It turns an undeclared edit into a refusal
 # that names the file.
 #
-# `RESYNC` is the one spelling that marks every file upstream's, because after a re-sync
-# every file IS: the import reads upstream blobs at a pinned SHA and compares each one
+# `RESYNC` is the one spelling that marks files upstream's, because after a re-sync every
+# file of that copy IS: the import reads upstream at a pinned version and compares each one
 # (VENDOR.md, "How to re-sync"). It is a claim this script cannot verify, which is why it
 # is a separate word rather than the default.
+#
+# ## Every third-party root, and a re-sync names ONE of them
+#
+# The roots are `scripts/lib/third-party-roots.txt`, read here rather than restated, so a new
+# upstream copy is hashed, compared and declared by the same rules the day its row is added
+# (#178 added the second, `vendor/monocypher`). Each root must hold files: a root that walks to
+# nothing is refused by name, since the whole tree being non-empty says nothing about one copy.
+#
+# A re-sync is of ONE upstream, so `RESYNC` takes the root it is about in
+# `FASTCACHED_VENDOR_RESYNC_ROOT` and marks only that root's files upstream's; every other root
+# is carried forward exactly as `ON` carries it. A bare RESYNC that blessed every root would
+# silence each OTHER copy's local changes -- the regeneration defect above, reached through the
+# one word that is allowed to bless. The first import of a root is a re-sync of it.
 #
 # Not covered: a vendored file DELETED locally. The manifest describes the tree, so a
 # deletion regenerates away with no declaration. The vendor build's partition assertion
 # refuses a missing source, so this is covered for translation units and not for headers.
 #
-# Regenerate with -DFASTCACHED_VENDOR_WRITE_MANIFEST=ON (or =RESYNC after a re-sync).
+# Regenerate with -DFASTCACHED_VENDOR_WRITE_MANIFEST=ON, or with =RESYNC plus
+# -DFASTCACHED_VENDOR_RESYNC_ROOT=<root> after a re-sync or the first import of that root.
 #
 # @param FASTCACHED_SOURCE_DIR Repository root.
 
 cmake_minimum_required(VERSION 3.28)
+
+include("${CMAKE_CURRENT_LIST_DIR}/lib/CheckCommon.cmake")
 
 if(NOT DEFINED FASTCACHED_SOURCE_DIR)
     message(FATAL_ERROR "FASTCACHED_SOURCE_DIR must be set")
@@ -71,24 +87,52 @@ set(vendorDir "${FASTCACHED_SOURCE_DIR}/vendor")
 set(manifestPath "${vendorDir}/MANIFEST")
 set(vendorDocPath "${vendorDir}/VENDOR.md")
 
-# The tree, walked rather than read from git: a source export has no index, and the
-# question -- do these bytes match what was imported -- is the same either way.
-# `endo` rather than `vendor` so MANIFEST and VENDOR.md, which are OURS, are not
-# asked to describe themselves.
-file(GLOB_RECURSE vendorFiles RELATIVE "${FASTCACHED_SOURCE_DIR}" "${vendorDir}/endo/*")
-list(SORT vendorFiles)
+# The roots, from the one answer to "which directories are third-party" rather than a path
+# written here: every root is a verbatim copy, and a copy this check was never told about is a
+# copy an in-place edit reaches silently.
+fastcached_third_party_roots("${FASTCACHED_SOURCE_DIR}" thirdPartyRoots)
 
-# A walk that matched nothing is a refusal, never a clean tree. It is also the state
-# the whole check is easiest to leave silently broken in: an empty tree and an empty
-# manifest agree perfectly, and the run reports success.
+# The tree, walked rather than read from git: a source export has no index, and the
+# question -- do these bytes match what was imported -- is the same either way. Each ROOT
+# rather than `vendor/`, so MANIFEST and VENDOR.md, which are OURS, are not asked to describe
+# themselves.
+#
+# A walk that matched nothing is a refusal, never a clean tree, and it is asked PER ROOT: an
+# empty copy and a manifest without its lines agree perfectly, and the other roots' files would
+# make the total look healthy.
+set(vendorFiles "")
+foreach(root IN LISTS thirdPartyRoots)
+    file(GLOB_RECURSE rootFiles RELATIVE "${FASTCACHED_SOURCE_DIR}" "${FASTCACHED_SOURCE_DIR}/${root}/*")
+    list(LENGTH rootFiles rootFileCount)
+    if(rootFileCount EQUAL 0)
+        message(FATAL_ERROR
+            "check-vendor-verbatim: no files were found under ${FASTCACHED_SOURCE_DIR}/${root}, a root "
+            "scripts/lib/third-party-roots.txt names, so nothing of it was compared and this run says "
+            "nothing about that copy. That is the CHECK failing, not a clean result -- restore the "
+            "copy, or remove its row if the import is gone.")
+    endif()
+    list(APPEND vendorFiles ${rootFiles})
+endforeach()
+list(SORT vendorFiles)
 list(LENGTH vendorFiles fileCount)
-if(fileCount EQUAL 0)
-    message(FATAL_ERROR
-        "check-vendor-verbatim: no files were found under ${vendorDir}/endo, so nothing was "
-        "compared and this run says nothing about the vendored tree. That is the CHECK "
-        "failing, not a clean result -- a checkout of this repository cannot have an empty "
-        "vendor/endo.")
-endif()
+list(LENGTH thirdPartyRoots rootCount)
+
+# The root a path lies under, or empty. A prefix test on `<path>/`, never a regex: a root is a
+# path name, and a `.` or `+` in one is a character, not a pattern.
+#
+# @param path A repository-relative path.
+# @param outVar Set to the root, or to empty.
+function(fastcached_root_of path outVar)
+    set(found "")
+    foreach(candidate IN LISTS thirdPartyRoots)
+        string(FIND "${path}/" "${candidate}/" position)
+        if(position EQUAL 0)
+            set(found "${candidate}")
+            break()
+        endif()
+    endforeach()
+    set(${outVar} "${found}" PARENT_SCOPE)
+endfunction()
 
 # Build the current state as text, in one spelling used for BOTH writing and
 # checking, so the two can never disagree about what a line looks like.
@@ -152,15 +196,32 @@ function(fastcached_read_manifest raw)
 endfunction()
 
 if(FASTCACHED_VENDOR_WRITE_MANIFEST)
-    set(resync FALSE)
+    set(resyncRoot "")
     if("${FASTCACHED_VENDOR_WRITE_MANIFEST}" STREQUAL "RESYNC")
-        set(resync TRUE)
+        string(REPLACE ";" ", " rootsText "${thirdPartyRoots}")
+        if("${FASTCACHED_VENDOR_RESYNC_ROOT}" STREQUAL "")
+            message(FATAL_ERROR
+                "check-vendor-verbatim: RESYNC names no root. A re-sync is of ONE upstream copy, so say "
+                "which with -DFASTCACHED_VENDOR_RESYNC_ROOT=<root>, one of: ${rootsText}. Blessing every "
+                "root at once would mark each OTHER copy's local changes upstream's, silently.")
+        endif()
+        if(NOT "${FASTCACHED_VENDOR_RESYNC_ROOT}" IN_LIST thirdPartyRoots)
+            message(FATAL_ERROR
+                "check-vendor-verbatim: FASTCACHED_VENDOR_RESYNC_ROOT is `${FASTCACHED_VENDOR_RESYNC_ROOT}`, "
+                "which scripts/lib/third-party-roots.txt does not name. The roots are: ${rootsText}. A new "
+                "copy is a row there first, then a RESYNC of it.")
+        endif()
+        set(resyncRoot "${FASTCACHED_VENDOR_RESYNC_ROOT}")
     elseif(NOT EXISTS "${manifestPath}")
         message(FATAL_ERROR
             "check-vendor-verbatim: there is no ${manifestPath} to carry upstream hashes forward "
             "from, so a regeneration cannot tell a local change from an upstream file. A first "
-            "import, whose files are all upstream's, is -DFASTCACHED_VENDOR_WRITE_MANIFEST=RESYNC.")
-    else()
+            "import, whose files are all upstream's, is -DFASTCACHED_VENDOR_WRITE_MANIFEST=RESYNC "
+            "with -DFASTCACHED_VENDOR_RESYNC_ROOT=<root>.")
+    endif()
+    # Carried forward in BOTH modes: a RESYNC of one root still carries every other root's
+    # upstream hashes, which is the point of naming the root.
+    if(EXISTS "${manifestPath}")
         file(READ "${manifestPath}" previousRaw)
         fastcached_read_manifest("${previousRaw}")
         if(NOT "${malformedLines}" STREQUAL "")
@@ -175,7 +236,8 @@ if(FASTCACHED_VENDOR_WRITE_MANIFEST)
     foreach(rel IN LISTS vendorFiles)
         string(MD5 key "${rel}")
         set(hash "${currentHash_${key}}")
-        if(resync)
+        fastcached_root_of("${rel}" relRoot)
+        if(NOT "${resyncRoot}" STREQUAL "" AND "${relRoot}" STREQUAL "${resyncRoot}")
             set(upstream "${hash}")
         elseif(NOT DEFINED "upstream_${key}")
             set(upstream "new")
@@ -201,9 +263,10 @@ if(FASTCACHED_VENDOR_WRITE_MANIFEST)
     file(WRITE "${manifestPath}"
 "# Vendored file manifest -- see vendor/VENDOR.md.
 #
-# SHA-256 of every file under vendor/endo. scripts/check-vendor-verbatim.cmake compares the
-# tree against this list, so a vendored file edited in place is refused rather than
-# discovered months later by somebody trying to send the change upstream.
+# SHA-256 of every file under every third-party root in scripts/lib/third-party-roots.txt.
+# scripts/check-vendor-verbatim.cmake compares the tree against this list, so a vendored file
+# edited in place is refused rather than discovered months later by somebody trying to send the
+# change upstream.
 #
 # A line ending `local-change-of <sha256>` differs from upstream, whose hash it records, and one
 # ending `local-change-new` is not in upstream. Every such path must be named by a row of
@@ -213,11 +276,16 @@ if(FASTCACHED_VENDOR_WRITE_MANIFEST)
 #     cmake -DFASTCACHED_SOURCE_DIR=<root> -DFASTCACHED_VENDOR_WRITE_MANIFEST=ON \\
 #           -P scripts/check-vendor-verbatim.cmake
 #
-# After a re-sync from upstream blobs, and only then, =RESYNC marks every file upstream's.
+# After a re-sync of ONE root from upstream, and only then, =RESYNC with
+# -DFASTCACHED_VENDOR_RESYNC_ROOT=<root> marks that root's files upstream's.
 #
 ${lines}")
-    message(STATUS "check-vendor-verbatim: wrote ${fileCount} entries to vendor/MANIFEST, "
-                   "${localCount} of them local change(s)")
+    set(resyncText "")
+    if(NOT "${resyncRoot}" STREQUAL "")
+        set(resyncText ", ${resyncRoot} re-synced")
+    endif()
+    message(STATUS "check-vendor-verbatim: wrote ${fileCount} entries across ${rootCount} root(s) to "
+                   "vendor/MANIFEST, ${localCount} of them local change(s)${resyncText}")
     return()
 endif()
 
@@ -264,6 +332,7 @@ if(NOT current STREQUAL expected)
     set(changed "")
     set(missing "")
     set(added "")
+    set(outside "")
     string(REPLACE "\n" ";" expectedLines "${expected}")
     string(REPLACE "\n" ";" currentLines "${current}")
     foreach(line IN LISTS expectedLines)
@@ -272,7 +341,10 @@ if(NOT current STREQUAL expected)
         endif()
         if(NOT current MATCHES "(^|\n)${line}\n")
             string(REGEX REPLACE "^[0-9a-fA-F]+  " "" path "${line}")
-            if(EXISTS "${FASTCACHED_SOURCE_DIR}/${path}")
+            fastcached_root_of("${path}" pathRoot)
+            if("${pathRoot}" STREQUAL "")
+                list(APPEND outside "${path}")
+            elseif(EXISTS "${FASTCACHED_SOURCE_DIR}/${path}")
                 list(APPEND changed "${path}")
             else()
                 list(APPEND missing "${path}")
@@ -303,12 +375,19 @@ if(NOT current STREQUAL expected)
         list(JOIN added "\n    " addedText)
         string(APPEND report "\n  UNRECORDED (in the tree, not in the manifest):\n    ${addedText}")
     endif()
+    if(outside)
+        list(JOIN outside "\n    " outsideText)
+        string(APPEND report
+            "\n  OUTSIDE EVERY ROOT (in the manifest, under no root of scripts/lib/third-party-roots.txt, "
+            "so nothing compared them -- a root was dropped from that file, or the manifest names a path "
+            "that was never vendored):\n    ${outsideText}")
+    endif()
 endif()
 
 # ---------------------------------------------------------------------------
 # Half two: every file that is not upstream's is declared, and every declaration describes one.
 #
-# A declaration is a backticked `vendor/endo/...` path on a TABLE ROW (a line starting `|`) of
+# A declaration is a backticked path under a third-party root on a TABLE ROW (a line starting `|`) of
 # VENDOR.md's "## Local changes" section. Rows only: prose in that section explains, and a path
 # mentioned while explaining must not declare anything. Brackets and semicolons are blanked
 # before the section is split into lines, since VENDOR.md is markdown and a declared path holds
@@ -337,10 +416,13 @@ if(EXISTS "${vendorDocPath}")
         if(NOT line MATCHES "^\\|")
             continue()
         endif()
-        string(REGEX MATCHALL "`vendor/endo/[^`]+`" rowPaths "${line}")
+        string(REGEX MATCHALL "`[^`]+`" rowPaths "${line}")
         foreach(rowPath IN LISTS rowPaths)
             string(REPLACE "`" "" rowPath "${rowPath}")
-            list(APPEND declaredPaths "${rowPath}")
+            fastcached_root_of("${rowPath}" rowRoot)
+            if(NOT "${rowRoot}" STREQUAL "")
+                list(APPEND declaredPaths "${rowPath}")
+            endif()
         endforeach()
     endforeach()
 else()
@@ -383,9 +465,10 @@ endif()
 
 if("${report}" STREQUAL "")
     list(LENGTH localPaths localCount)
+    string(REPLACE ";" ", " rootsText "${thirdPartyRoots}")
     message(STATUS
-        "vendor verbatim: ${fileCount} vendored file(s) match vendor/MANIFEST, "
-        "${localCount} of them declared local change(s)")
+        "vendor verbatim: ${fileCount} vendored file(s) under ${rootCount} root(s) (${rootsText}) "
+        "match vendor/MANIFEST, ${localCount} of them declared local change(s)")
     return()
 endif()
 
@@ -409,4 +492,4 @@ message(FATAL_ERROR
     "the row, or the path from it.\n\n"
     "This check says nothing about whether the tree still matches UPSTREAM beyond the "
     "hashes the manifest carries -- `=RESYNC` is trusted, not verified. Re-syncing is "
-    "vendor/VENDOR.md's \"How to re-sync\".")
+    "vendor/VENDOR.md's \"How to re-sync\", one root at a time.")

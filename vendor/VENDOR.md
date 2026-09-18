@@ -2,19 +2,33 @@
 
 Everything under `vendor/` is third-party code copied **verbatim** from upstream.
 It is not this project's code, it is not formatted, analysed or styled by this
-project's rules, and it is kept byte-identical to a named upstream commit so that
-improvements made here can be sent back.
+project's rules, and it is kept byte-identical to a named upstream commit or release so
+that improvements made here can be sent back.
 
 That last clause is the reason for all the rest. `fastcached` is downstream of two
 repositories the same author maintains, so a fix made here is worth more upstream
 than it is here — but only while the copy is still diffable against upstream. A
 copy that has been reformatted, renamed, re-namespaced or "just slightly adapted"
 cannot be contributed back, and the ability is lost silently: nothing fails, the
-build stays green, and the discovery comes months later when somebody tries.
+build stays green, and the discovery comes months later when somebody tries. The
+third upstream, Monocypher, is somebody else's, and the same holds for it with more
+force: a cryptographic library edited locally is one whose audit no longer describes it.
 
-## What is here, and where it came from
+## The copies
 
-**Two upstreams.** This is the single most important fact in this file, because
+Each row is one third-party root of `scripts/lib/third-party-roots.txt`: a directory holding
+one verbatim copy, hashed file by file into `MANIFEST` and checked by `ctest -R vendor-verbatim`.
+The two counts are recomputed from the tree by `ctest -R vendor-figures`, for every root the roots
+file names, so a new copy needs a row here the day it arrives.
+
+| root | upstream | files | lines |
+|---|---|---|---|
+| `vendor/endo` | endo and contour, "`vendor/endo`" below | 176 | 49,467 |
+| `vendor/monocypher` | Monocypher 4.0.3, "`vendor/monocypher`" below | 6 | 4,182 |
+
+## `vendor/endo`: what is here, and where it came from
+
+**Two upstreams.** This is the single most important fact about this copy, because
 the directory is called `endo` and four fifths of it is endo's — so a reader will
 assume one fork point, and be wrong about five files in a way that is invisible
 from the contents.
@@ -165,10 +179,59 @@ Two facts that make this much less alarming than it sounds, both measured:
   somewhere else, that is the signal to widen the adapter, not to add a second
   crossing.
 
+## `vendor/monocypher`: Monocypher 4.0.3
+
+The Ed25519 and X25519 implementation behind `src/FastCache/Core/{Ed25519,X25519}` (#178), which
+give every node an identity of its own in place of the cluster's shared key.
+
+| | |
+|---|---|
+| upstream | [Monocypher](https://monocypher.org), source at [LoupVaillant/Monocypher](https://github.com/LoupVaillant/Monocypher) |
+| version | **4.0.3**, released 2026-06-15. Its changelog's first line is "Fixed timing leak vulnerability in EdDSA/Ed25519 signatures", which is the reason for no earlier version |
+| taken from | the release tarball `monocypher-4.0.3.tar.gz`, from `https://monocypher.org/download/` |
+| tarball sha256 | `8cc9bc341a66249016db9bd70e9142d8d0aef9945973744b1ac05dbc55d8ee66` |
+| tarball sha512 | `40904ada5c7ee4f7741733e38b69a30a4b0561cbffba5ffe7c2dce16136d540251ec0d9056ff606510d3b5b708fb8a40db7e0870d4a0b2dc17ba2bfb880f8965` |
+| tag | `4.0.3`, commit `ab2b16dd619ad5f6979a4fbe69cfa324a6fcc35f` |
+| licence | dual, BSD-2-Clause OR CC0-1.0 at the user's choice (`LICENCE.md`, kept verbatim) |
+
+**How that provenance was established, so the next re-sync can repeat it rather than trust it.**
+The GitHub release asset and the monocypher.org download are byte-identical (the sha256 above),
+and the tarball matches the sha512 monocypher.org publishes beside it. Its sources match the git
+tag apart from the release's version stamp -- the tag's sources say `__git__` where the tarball's
+say `4.0.3` -- and a `LICENCE.md` note about test files the tarball does not ship. So the copy is
+taken from the TARBALL: it is what upstream released, and the tag is not byte-for-byte that.
+
+**Six files, and why only these.** `src/monocypher.c`, `src/monocypher.h`,
+`src/optional/monocypher-ed25519.c` and `src/optional/monocypher-ed25519.h` are what the build
+compiles -- the RFC 8032 Ed25519 this tree uses is the `optional/` half, over SHA-512, not the
+library's default EdDSA over BLAKE2b. `LICENCE.md` and `AUTHORS.md` are the licence and the
+attribution. The tests, the manual, the makefile, the README and the changelog build nothing and
+attribute nothing, so they are left upstream; each file's hash is its `MANIFEST` line.
+
+**What the build does with it.** `cmake/Monocypher.cmake`, which is ours, declares one static
+library, `fastcache-monocypher`, from the two `.c` files compiled as C++ with upstream's
+`MONOCYPHER_CPP_NAMESPACE` -- that file says why C++, why the namespace, and why it is built
+unconditionally and outside `vendor/CMakeLists.txt`. It has no dependency, so `fastcache-cc` can
+link it without FastCache.
+
+**Who may use it.** Only `src/FastCache/Core/Ed25519.cpp` and `src/FastCache/Core/X25519.cpp`
+include a Monocypher header; `ctest -R crypto-seam` refuses any other first-party file that does.
+Everything else goes through those two headers and `Core/Hkdf.hpp`, which is where a new primitive
+is added and checked against its RFC's vectors.
+
+**How to re-sync, and how to send a change back.** Download the new release tarball, check it
+against the sha512 monocypher.org publishes, and extract the six files from the ARCHIVE (for
+instance `tar -xzOf monocypher-X.Y.Z.tar.gz monocypher-X.Y.Z/<path> > vendor/monocypher/<path>`),
+never from a checkout, whose sources carry `__git__`. Then
+`cmake -DFASTCACHED_SOURCE_DIR=<root> -DFASTCACHED_VENDOR_WRITE_MANIFEST=RESYNC -DFASTCACHED_VENDOR_RESYNC_ROOT=vendor/monocypher -P scripts/check-vendor-verbatim.cmake`,
+update the table above and the row in "The copies", and run the vectors. A change goes to
+LoupVaillant/Monocypher as a pull request first; a local change would be a row below, and there is
+none.
+
 ## Local changes
 
-Four local changes, 23 files between them; the other 153 files are byte-identical to their upstream
-blobs. A later change can touch a file an earlier one did, so a file can be named by more than one row.
+Four local changes, 23 files between them; the other 153 files of `vendor/endo`, and all six of
+`vendor/monocypher`, are byte-identical to their upstream blobs. A later change can touch a file an earlier one did, so a file can be named by more than one row.
 Both halves are checked rather than asserted: `vendor/MANIFEST` records each changed file's
 UPSTREAM hash beside its current one, and `ctest -R vendor-verbatim` refuses a file that differs
 from upstream unless a row below names it, and refuses a row naming a file that does not.
@@ -184,7 +247,7 @@ per upstream: endo's on `fastcached/upstream`, published as
 in a contour checkout. Each row names its commit on that branch, one commit per change. **A later endo change is a new
 commit on that same branch, pushed to update #184** -- never a second pull request, which would split one review of a
 single set of fixes across two threads nobody reads together. No row today
-changes a contour-origin file (`coro/*`, `crispy/FNV.hpp`).
+changes a contour-origin file (`coro/*`, `crispy/FNV.hpp`), or a Monocypher file.
 
 | files | what | why | upstream | prepared as |
 |---|---|---|---|---|
@@ -193,7 +256,9 @@ changes a contour-origin file (`coro/*`, `crispy/FNV.hpp`).
 | `vendor/endo/tui/CMakeLists.txt`<br>`vendor/endo/tui/Sixel.cpp`<br>`vendor/endo/tui/Sixel_test.cpp` | `medianCut` sorts a bucket by a total order on the whole pixel, the widest channel first, instead of by the widest channel alone. New `Sixel_test.cpp`: a fixture with the tie shape, the same pixels reversed quantizing to the same palette, and the encoding's FNV-1a digest equal to a recorded constant | #134: `std::ranges::sort` left pixels equal in the sort channel in the library's tie order and the median split followed it, so the Sixel rung's bytes differed per standard library. Measured with the test: the previous sort gave three digests on libstdc++, libc++ and MSVC, a stable sort one digest on all three but still failed the reversal case, this change `0xbace46a6344de1d9` on all three | endo (contour-terminal/endo) | `contour-terminal/endo` branch `fastcached/upstream`, commit `c85ba078c18d0f5ea24376f317961485af327f40`, on `ee25be66`; published in [contour-terminal/endo#184](https://github.com/contour-terminal/endo/pull/184) |
 | `vendor/endo/tui/TerminalQuery_test.cpp` | New case: the reply bytes `CSI 6;20;10t` go through `VtParser` into one protocol report, and `queryCellSize()` answers 10 wide and 20 high from it in one read. Test only | #134: the Sixel rung is chosen only with a measured cell size, and the reply is height first while the query answers width first. Every earlier case scripted an already-decoded `CellSizeReport`, so a swap on either side passed all of them | endo (contour-terminal/endo) | `contour-terminal/endo` branch `fastcached/upstream`, commit `f774a210ce989e5947b8f61d715068b1dc96088c`, on `4f8f4630`; published in [contour-terminal/endo#184](https://github.com/contour-terminal/endo/pull/184) |
 
-## How to send a change back
+## How to send a change back to endo or contour
+
+Monocypher's is in its own section above.
 
 **Diff against UPSTREAM, not against a local commit.** The import commit is the
 obvious anchor and it is the wrong one: this project rebases every branch before it
@@ -215,7 +280,9 @@ immutable and are already the thing being diffed *from*.
 3. Open the pull request against that repository.
 4. When it merges, re-sync (below) and delete the row from "Local changes".
 
-## How to re-sync
+## How to re-sync `vendor/endo`
+
+Monocypher's is in its own section above: it is taken from a release tarball rather than from git.
 
 **Read upstream BLOBS, never a working tree.** This is the one sentence that will
 save the next person re-syncing, and it is not obvious until it has cost you an hour.
@@ -249,9 +316,11 @@ git -C <repo> -c core.autocrlf=false -c core.eol=lf show <sha>:src/<path> > vend
 ```
 
 Then compare every file against its upstream blob and **assert the count**, because
-a loop over an empty set also reports no differences. Update the fork points above.
+a loop over an empty set also reports no differences. Update the fork points above, and record
+the re-sync with `-DFASTCACHED_VENDOR_WRITE_MANIFEST=RESYNC -DFASTCACHED_VENDOR_RESYNC_ROOT=vendor/endo`:
+a re-sync names ONE root, so it cannot mark another copy's local changes upstream's.
 
-## What the build does with it
+## What the build does with `vendor/endo`
 
 `vendor/CMakeLists.txt` — which is **ours**, not upstream's — declares one static
 library, `fastcache-tui`, from 21 translation units per platform.
@@ -295,10 +364,11 @@ each spelling names this directory:
 | where | what it does | what happens without it |
 |---|---|---|
 | `.clang-format-ignore` | the formatter declines the path, for every caller | `clang-format -i` rewrites **146 of 165** vendored files on the first gate run, and verbatim is gone on day one |
-| `.clang-tidy` `HeaderFilterRegex` | already an inclusion list naming `src/` only, so `vendor/` is outside it | `WarningsAsErrors: "*"` fails the build on naming rules upstream has no reason to satisfy |
+| `.clang-tidy` `HeaderFilterRegex` | already an inclusion list naming `src/` only, so `vendor/` is outside it -- and it names this project's own directories UNDER `src/`, which is what keeps `vendor/monocypher/src/` outside it too | `WarningsAsErrors: "*"` fails the build on naming rules upstream has no reason to satisfy |
 | `scripts/local-gate.sh` | splits tracked headers into first-party and vendored, and asks each half its own question | the gate refuses every tree carrying a vendored header, advising a fix that is itself the `deps-leak` defect |
 | `scripts/check-succeed-not-skip.cmake` | `src/`-anchored, so it scans this repository's own tests | the first upstream sync adding a `SUCCEED` reddens a check about *our* code |
 | `vendor/CMakeLists.txt` | added before the pedantic/clang-tidy includes, and clears `CXX_CLANG_TIDY` on the target as well | see the two rows above |
+| `cmake/Monocypher.cmake` | included before the pedantic/clang-tidy includes, clears `CXX_CLANG_TIDY`, and makes the include directories `SYSTEM` | the same, for Monocypher |
 
 
 `local-gate.sh` also refuses when `vendor/` exists but git tracks nothing inside it:
