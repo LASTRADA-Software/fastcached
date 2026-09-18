@@ -355,7 +355,14 @@ TEST_CASE("This build's live-stats layout is the pinned one", "[metrics][livesta
     // client built before the change will refuse this node. Update the constant in the same
     // change, and say in its message that clients and nodes upgrade together.
     INFO(std::format("StatsReadingLayout is 0x{:016x}", StatsReadingLayout));
-    // Moved by #178's Raft peer wire: seven counters joined the catalogue for the refusals an
+    // Moved by #178's enrollment and discovery on keys: three counters joined the catalogue for
+    // the discovery proofs a key makes possible to refuse (`unknown_key`, `revoked_key`,
+    // `forged`), `enrollment_keys_handed_over` became `enrollment_rosters_served`, and
+    // `enrollment_requests_refused_already_collected` left with the spend it counted -- which
+    // changes which cells every live-stats reading carries. Clients and nodes upgrade together,
+    // as below.
+    //
+    // Moved by #178's Raft peer wire before that: seven counters joined the catalogue for the refusals an
     // identity key makes possible (`unknown_key`, `revoked_key` and `ended_key_withdrawn` at the
     // acceptor; `acceptor_key_unknown`, `acceptor_key_revoked`, `own_key_revoked` and
     // `ended_key_withdrawn` at the dialler), which changes which cells every live-stats reading
@@ -383,7 +390,7 @@ TEST_CASE("This build's live-stats layout is the pinned one", "[metrics][livesta
     //
     // Moved by #1484 before that: the counter cells carry a second bitmap saying WHICH absence
     // each absent cell is, so `StatsReadingWire::Grammar` went to `-4`.
-    CHECK(StatsReadingLayout == 0x1b33c41ea88a8e8dULL);
+    CHECK(StatsReadingLayout == 0x01e9671035b15a67ULL);
 }
 
 TEST_CASE("A truncated or padded reading is refused and never half-read", "[metrics][livestats]")

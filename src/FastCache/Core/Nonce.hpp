@@ -12,8 +12,8 @@ namespace FastCache
 
 /// How many bytes a handshake nonce carries.
 ///
-/// One constant for every handshake the cluster key takes part in -- the discovery
-/// challenge and both halves of the Raft peer handshake -- because a nonce's size is a
+/// One constant for every handshake a node proves itself in -- the discovery challenge,
+/// the node proof and both halves of the Raft peer handshake -- because a nonce's size is a
 /// claim about how unlikely a repeat is, and two protocols sized apart are two such
 /// claims that can drift (#1308). 256 bits puts the chance of any two nonces in a
 /// fleet's lifetime colliding below anything worth naming, which is the property a
@@ -28,11 +28,11 @@ using Nonce = std::array<std::byte, NonceBytes>;
 /// A fresh nonce, drawn from the operating system's generator.
 ///
 /// **What a nonce here needs is that it never REPEATS, not that nobody can predict it.**
-/// Every handshake that uses one is a MAC under the cluster key over BOTH ends' nonces,
-/// answered live: a peer that guessed the next nonce could ask a key holder for a tag over
-/// it ahead of time, and would then hold a tag that is only ever accepted by a connection
-/// whose other half is that same key holder speaking live -- a relay, which the network
-/// already is. A repeat is different: it lets a recorded exchange be replayed whole. So the
+/// Every handshake that uses one is answered live, with a signature or a MAC by a key holder
+/// over the nonces it was given: a peer that guessed the next nonce could ask a key holder for
+/// a proof over it ahead of time, and would then hold a proof that is only ever accepted by a
+/// connection whose other half is that same key holder speaking live -- a relay, which the
+/// network already is. A repeat is different: it lets a recorded exchange be replayed whole. So the
 /// bound that matters is the collision one `NonceBytes` states.
 ///
 /// **And that bound needs an ENTROPY SOURCE, not a seeded engine** (#1527). This drew from

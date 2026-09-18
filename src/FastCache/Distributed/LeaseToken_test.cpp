@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Cluster/ClusterSigning.hpp>
-#include <FastCache/Cluster/DiscoveryWire.hpp>
 #include <FastCache/Core/Base64.hpp>
 #include <FastCache/Core/Sha256.hpp>
 #include <FastCache/Core/WireFields.hpp>
 #include <FastCache/Distributed/LeaseToken.hpp>
+#include <FastCache/Distributed/NodeProof.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -752,14 +752,16 @@ TEST_CASE("The claim fields are framed, not joined", "[distributed][lease][token
     CHECK_FALSE(VerifyLeaseToken(key, right, Worker("a", "f"), Noon()).has_value());
 }
 
-TEST_CASE("A discovery proof is not a lease, under the same key", "[distributed][lease][token]")
+TEST_CASE("A node proof is not a lease, under the same key", "[distributed][lease][token]")
 {
-    // The cluster's pre-shared key already MACs discovery proofs. One key serving
-    // two constructions is how a tag produced for one purpose comes to be accepted
-    // for the other, so every lease message is prefixed with its own domain label.
+    // The cluster's pre-shared key also MACs a node's proof on the `0xFC` surface (#1428).
+    // One key serving two constructions is how a tag produced for one purpose comes to be
+    // accepted for the other, so every lease message is prefixed with its own domain label.
+    // (This case paired the lease with the DISCOVERY proof until #178 moved that proof to each
+    // node's own key; the node proof is the construction still sharing the lease's key.)
     auto const key = Key();
-    Cluster::DiscoveryWire::Challenge const challenge { .clusterId = "fleet", .nonce = {} };
-    auto const proof = Cluster::DiscoveryWire::ExpectedProofTag(key, challenge, "n1", "10.0.0.7:6675");
+    auto const challenge = std::array<std::byte, 16> {};
+    auto const proof = MintNodeProof(key, challenge, "n1");
 
     // The tag alone, and the tag inside something shaped like an envelope, are both
     // refused -- the first as malformed, the second because the label is not in it.

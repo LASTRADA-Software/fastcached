@@ -405,8 +405,8 @@ which both ends sign with theirs and check the other's against the key the clust
 records for it; every message after it carries a tag, so nothing that merely reaches the
 port can vote or lead, and no member can speak as another
 ([Raft peer authentication](operations/cluster-communication.md#raft-peer-authentication)).
-Every member also holds the cluster's `--cluster-key-file`, which the leases and
-enrollment use, and a node without one refuses to start.
+Every member also holds the cluster's `--cluster-key-file`, which the leases and the node
+port use, and a node without one refuses to start.
 
 ### What a node does when it starts, in order
 

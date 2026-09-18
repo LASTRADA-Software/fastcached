@@ -437,6 +437,11 @@ enum class MetricsSurface : std::uint8_t
     /// never by the daemon.
     NodeFrameEndpoint,
 
+    /// LAN discovery, `Cluster/DiscoveryService.cpp` (#178). Served only where `--discovery` is
+    /// configured, which also needs consensus -- so a consensus node without it moves none of
+    /// these, and reporting them as zeroes there would be a plausible wrong answer.
+    NodeDiscovery,
+
     /// Enumerator count. Not a surface.
     Last
 };
@@ -452,7 +457,7 @@ inline constexpr std::array EverySurface {
     MetricsSurface::CacheAcceptPath,   MetricsSurface::CacheStorage,      MetricsSurface::CacheCompileSurface,
     MetricsSurface::LiveStats,         MetricsSurface::ConsensusPeerWire, MetricsSurface::CompileScheduler,
     MetricsSurface::CompileWorker,     MetricsSurface::NodeEnrollment,    MetricsSurface::NodeCacheTier,
-    MetricsSurface::NodeFrameEndpoint,
+    MetricsSurface::NodeFrameEndpoint, MetricsSurface::NodeDiscovery,
 };
 
 static_assert(EverySurface.size() == static_cast<std::size_t>(MetricsSurface::Last),
@@ -729,10 +734,14 @@ inline constexpr std::array CounterSoleWriterTable {
                         .surface = MetricsSurface::NodeEnrollment },
     CounterSoleWriter { .counter = IMetricsSink::Counter::EnrollmentWindowsOpened,
                         .surface = MetricsSurface::NodeEnrollment },
-    CounterSoleWriter { .counter = IMetricsSink::Counter::EnrollmentKeysHandedOver,
+    CounterSoleWriter { .counter = IMetricsSink::Counter::EnrollmentRostersServed,
                         .surface = MetricsSurface::NodeEnrollment },
-    CounterSoleWriter { .counter = IMetricsSink::Counter::EnrollmentRequestsRefusedAlreadyCollected,
-                        .surface = MetricsSurface::NodeEnrollment },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::DiscoveryProofsRefusedUnknownKey,
+                        .surface = MetricsSurface::NodeDiscovery },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::DiscoveryProofsRefusedRevokedKey,
+                        .surface = MetricsSurface::NodeDiscovery },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::DiscoveryProofsRefusedForged,
+                        .surface = MetricsSurface::NodeDiscovery },
     CounterSoleWriter { .counter = IMetricsSink::Counter::LiveSubscriptionsOpened, .surface = MetricsSurface::LiveStats },
     CounterSoleWriter { .counter = IMetricsSink::Counter::LiveSnapshotsRendered, .surface = MetricsSurface::LiveStats },
     CounterSoleWriter { .counter = IMetricsSink::Counter::LiveSnapshotsSkipped, .surface = MetricsSurface::LiveStats },

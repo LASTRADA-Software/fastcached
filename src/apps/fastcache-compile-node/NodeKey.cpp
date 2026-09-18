@@ -86,8 +86,8 @@ namespace
 
     /// Create @p path for writing, refusing when it exists.
     ///
-    /// The EXCLUSIVE create is the whole guard, with nothing in front of it
-    /// (`StoreClusterKey`'s idiom): a file that appeared a moment ago is refused, never
+    /// The EXCLUSIVE create is the whole guard, with nothing in front of it (`O_EXCL`, `"wbx"`
+    /// on Windows, and no `exists()`): a file that appeared a moment ago is refused, never
     /// truncated. On POSIX the file is created mode 0600 by the same call, so there is no
     /// moment in which the secret is readable by another account and no `chmod` whose
     /// failure would leave it so.

@@ -498,7 +498,6 @@ inline constexpr std::array DeclineCauseTable {
     // asking.
     DeclineCauseRow { .code = CompileCacheWire::ErrorCode::EnrollmentClosed, .cause = DeclineCause::NotPermitted },
     DeclineCauseRow { .code = CompileCacheWire::ErrorCode::EnrollmentFull, .cause = DeclineCause::NotPermitted },
-    DeclineCauseRow { .code = CompileCacheWire::ErrorCode::EnrollmentAlreadyCollected, .cause = DeclineCause::NotPermitted },
     // A fleet read, which no compile reaches: the same reasoning as the enrollment rows above.
     DeclineCauseRow { .code = CompileCacheWire::ErrorCode::UnknownFleetSelector, .cause = DeclineCause::NotPermitted },
     // The node proof (#1428). `NotPermitted` for the enrollment rows' reason and one more that

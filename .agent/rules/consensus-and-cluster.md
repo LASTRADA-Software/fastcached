@@ -13,37 +13,59 @@ verb to the cluster-admin surface.
 
 Every rule below has already been a bug.
 
-## Discovery and the pre-shared key
+## Discovery and the identity key
 
-- **A pre-shared key authenticates a handshake; it never travels in a beacon.**
-  Discovery broadcasts what a node *is* -- cluster, id, Raft endpoint -- and nothing
-  derived from the key, because a broadcast reaches every listener on the segment
-  and anything key-derived in one hands them what they need to join. The key only
-  ever appears inside an HMAC over a nonce the challenger chose. Five consequences,
-  each of which some plausible simpler design gets wrong:
-  - **The proof authenticates a `(node, endpoint)` PAIR, not the nonce alone.**
-    Both are inside the MAC. Signing the nonce only would let anyone who observed
-    one valid proof replay its tag with a *different* endpoint substituted --
-    admitting a legitimate node id at an attacker's address. An admitted node is
-    assigned compile jobs and returns objects cached fleet-wide, so that is object
-    injection into everybody's build. Verified by removing the endpoint from the
-    MAC and watching exactly the one case that asserts it fail.
+- **A discovery proof is a SIGNATURE by the node's OWN identity key, and discovery admits
+  nobody (#178).** It was an HMAC under the pre-shared key until then, and a proof of
+  possession of the fleet's key WAS membership, so any machine holding the file on the
+  segment was desired and admitted. Now discovery broadcasts what a node *is* -- cluster,
+  id, Raft endpoint -- and the challenge that follows is answered with an Ed25519
+  signature over `(fastcache-discovery-proof-v2, cluster, nonce, id, endpoint, key)`, the
+  key carried beside it. The consequences, each of which some plausible simpler design
+  gets wrong:
+  - **The signature is checked BEFORE the roster is asked.** Until it verifies, the
+    carried key is as much a claim as the id, and naming it would be naming bytes
+    anybody could have sent -- so a forgery is counted (`DiscoveryProofsRefusedForged`)
+    and logged by the address it came from, never by what it claimed.
+  - **Only the key the roster holds FOR THAT ID authenticates.** A verified key the
+    roster does not hold is `PeerUnknownKey`: counted, and logged -- at most once per
+    `UnacceptedKeyReportInterval`, with how many it stands for, because a fresh key
+    costs its sender nothing -- with the id, the source, the key WHOLE (it verified, so
+    naming it is no oracle) and the `--cluster-admit` that would admit it. A revoked one
+    is `PeerRevokedKey`, whose remedy is the opposite, so it is counted and worded apart.
+    The acceptance pair is a stranger that proves its own key and is NOT desired, beside
+    the same stranger desired once the roster holds its key; a service accepting any
+    verified key fails the first, one refusing everybody fails the second.
+  - **Discovery states no KEY in what it desires.** It authenticates only the key the
+    roster already holds, so it has nothing to add, and a desire outlives its moment
+    (`ConsensusTier::Desire` replaces per id and never prunes) -- a key named there would
+    be proposed straight back over an operator who re-keyed that member. And the
+    authenticated set is re-asked of the roster at every publish
+    (`DiscoveryTier::PublishAuthenticated`), because it is re-published whenever ANY peer
+    proves itself and a proof taken before a revocation must not ride along after it.
+  - **The proof signs a `(node, endpoint)` PAIR and the key, not the nonce alone.**
+    Signing the nonce only would let anyone who observed one valid proof replay it
+    with a *different* endpoint substituted -- pointing a known node id at an
+    attacker's address. A member is assigned compile jobs and returns objects cached
+    fleet-wide, so that is object injection into everybody's build. The key is inside
+    the message so a signature cannot be re-attributed to another key.
   - **A proof is only ever an answer to a challenge THIS node issued**, and the
-    nonce is spent whatever the outcome. An unsolicited proof is refused *even when
-    it carries the real key*: it answers a nonce nobody here chose, and accepting
-    one would make the nonce -- and therefore the replay protection -- pointless.
+    nonce is spent whatever the outcome -- a forgery included, so a forger cannot race
+    the honest answer for free. An unsolicited proof is refused *even when it is signed
+    by a key the roster holds*: it answers a nonce nobody here chose, and accepting one
+    would make the nonce -- and therefore the replay protection -- pointless.
   - **A peer that moves loses its authenticated bit.** The bit is a property of the
     node *at an endpoint*, not of the node, because that is what the proof covered.
     Carrying it across a change would admit an address nobody proved.
   - **The pending-challenge table is one entry per node, with a lifetime.** A
     beacon is unauthenticated by construction, so anything on the segment can
     provoke a challenge -- a table that grew per datagram would be a
-    memory-exhaustion hole reachable without holding the key, which is the same
+    memory-exhaustion hole reachable without holding any key, which is the same
     shape as the pre-auth payload cap on the `0xFC` port.
-  - **Discovery never changes membership.** It answers who proved the key and where
-    they answer; a caller proposes. Admitting a node is a Raft decision only a
-    leader may make, and a layer that proposed directly would have every node on
-    the segment proposing the same change at once.
+  - **Discovery never changes membership.** It answers which known members proved
+    their keys and where they answer; a caller proposes. A membership change is a
+    Raft decision only a leader may make, and a layer that proposed directly would
+    have every node on the segment proposing the same change at once.
   - **A peer this node cannot NAME is a peer it does not remember.** `NoteBeacon`
     refuses an id or endpoint that is empty or is not valid UTF-8, alongside the
     wrong-cluster and own-beacon filters, because what the directory holds is what
@@ -51,7 +73,7 @@ Every rule below has already been a bug.
     out as text (#159). Filtered here rather than at any later layer, which is what
     keeps a permanently-refusable proposal from ever being generated; it also keeps
     such a peer out of the challenge table, out of `Peers()`, and out of the line
-    logged when a peer proves the key. The beacon's *cluster id* is deliberately
+    logged when a peer proves its key. The beacon's *cluster id* is deliberately
     exempt: it is compared and never recorded, and filtering it would take every
     peer away from a fleet named in some other encoding, silently.
   - **A claim a peer has not proved is printed only once it is TEXT, and never
@@ -71,7 +93,7 @@ Every rule below has already been a bug.
   the last -- and the challenge and the proof are both unicast to `received->from`.
   A node that answered out of the shared socket would be answering for its
   *machine*, so two nodes on one host saw each other's beacons and silently never
-  finished proving the key (#126). It holds two sockets now: the shared listener,
+  finished the handshake (#126). It holds two sockets now: the shared listener,
   which never sends, and a private one, which sends everything and receives the
   answers. `Net/SharedPortDatagram` pairs them, so `DiscoveryService` still holds
   one socket -- which datagram left from where is a question about sockets, not
@@ -118,9 +140,9 @@ Every rule below has already been a bug.
     programmatically now.
 - **One key, one signing construction, and the domain label is a required
   parameter rather than a constant each signer remembers to fold in.** The
-  pre-shared key MACs a discovery proof, a lease token and a member's proof on the `0xFC`
-  surface -- and, from #1308 until #178 moved it to identity keys, every Raft peer
-  connection -- and the first two each used to build
+  pre-shared key MACs a lease token and a member's proof on the `0xFC` surface -- and
+  MACed a discovery proof until #178, and every Raft peer connection from #1308 until #178,
+  both moved to identity keys -- and the lease and the discovery proof each used to build
   its message inline out of `HmacSha256` and `WireFields::Encode` -- which are
   primitives, not a construction. So what a message is *made of* was written
   twice, and the requirement that every message carry a domain label was true of
@@ -148,9 +170,9 @@ Every rule below has already been a bug.
     domain's label. It is the object key's rule and the proof's own, applied to
     the one part of the message a caller does not supply.
   - **`VerifyFields` is the only comparison the seam exposes, and every verifier
-    goes through it** -- `AuthenticateLeaseToken` for the lease,
-    `DiscoveryWire::VerifyProofTag` for the proof, `VerifyNodeProof` for the `0xFC`
-    surface's. That second one is the whole
+    goes through it** -- `AuthenticateLeaseToken` for the lease and `VerifyNodeProof` for
+    the `0xFC` surface's, and `DiscoveryWire::VerifyProofTag` for the discovery proof
+    until #178 retired it. That discovery one is the whole
     reason this bullet is worth reading: the seam landed with `DiscoveryService`
     still taking an expected tag and comparing it by hand, so the property was
     true of one of the two wires it named. It was constant-time, so nothing was
@@ -178,9 +200,12 @@ Every rule below has already been a bug.
     vacuously forever. `psk-signing-seam-selftest` drives all seven verdicts,
     including the two that must PASS.
 - **Giving the proof a label changed the proof wire, and the datagram version did
-  not move.** Every tag differs from a pre-#402 build's; `CurrentVersion` stays at
-  1 because what changed is the MAC *input* and not the grammar, and bumping it
-  would misdescribe the format. It is also the better failure of the two: an older
+  not move.** Every tag differed from a pre-#402 build's; `CurrentVersion` stayed at
+  1 because what changed was the MAC *input* and not the grammar, and bumping it
+  would have misdescribed the format. **#178 then moved it to 2**, and for the opposite
+  reason: a key and a 64-byte signature where a 32-byte MAC was change the proof's
+  arity and widths, which is grammar, and `MinimumVersion` moved with it because a
+  version-1 proof is a MAC nothing here can verify. It is also the better failure of the two: an older
   node reaches the proof step and is logged failing to prove the key, where an
   unsupported version is dropped by `ClassifyDatagram` and presents as peers seen
   and never admitted -- the same silence this file already records
@@ -382,7 +407,8 @@ simpler design gets wrong.
   configuration of two sets where it carried one list (see *Learners* below), and to 4 for
   #178, whose challenge, proof and verdict carry ephemeral keys and signatures. The opposite of
   #402, where only discovery's MAC input changed and `DiscoveryWire::CurrentVersion` rightly
-  stayed: the question is always WHICH changed. `MinSupportedVersion` moved with it every
+  stayed -- and the same as #178's discovery change, where a key and a signature replaced the
+  MAC and that version moved to 2: the question is always WHICH changed. `MinSupportedVersion` moved with it every
   time: a version 1 peer authenticates nothing, a version 3 peer proves the pre-shared key,
   and accepting either is the per-connection fallback these tickets refuse -- so a fleet
   upgrades its consensus members together. A session frame whose version byte differs from
@@ -417,9 +443,9 @@ simpler design gets wrong.
   `ISecureRandom` as REQUIRED constructor arguments -- no default and no null -- and their own
   id IS the identity's, never a parameter beside it that could name somebody the proofs do
   not. `ConsensusNeedsClusterKeyRefusal` stays in the startup table for reasons that MOVED:
-  the tier no longer reads the cluster key, but a consensus node still signs leases, proves
-  itself on the node port and hands the key over at enrollment with it, and #178 retires it
-  surface by surface. "No key, so skip the check" is the shape the worker's lease rule (#282)
+  the tier no longer reads the cluster key, and neither do discovery nor enrollment since #178
+  PR 4, but a consensus node still signs leases and proves itself on the node port with it,
+  and #178 retires it surface by surface. "No key, so skip the check" is the shape the worker's lease rule (#282)
   refuses one surface over: the port open, every refusal counter at zero, and the fleet
   healthy-looking from both ends.
 
@@ -1480,8 +1506,10 @@ tick -- the scheduler answers `NotLeader` and the fleet page goes dark until it 
 [#178](https://github.com/LASTRADA-Software/fastcached/issues/178) PR 2: every node with a
 state directory holds an Ed25519 identity key, and `ClusterState` records members' keys,
 principals admitted by key, and keys revoked for good. PR 3 made the Raft peer wire VERIFY
-against them (see *The Raft peer wire*); the `0xFC` surface, discovery and leases still use
-the cluster key until later PRs move them. Every rule below is about getting the record
+against them (see *The Raft peer wire*), and PR 4 moved discovery and enrollment onto them
+(see *Discovery and the identity key*, and the enrollment window in
+`distributed-compilation.md`); the `0xFC` surface and leases still use the cluster key until
+later PRs move them. Every rule below is about getting the record
 right, because the wire now trusts it.
 
 - **Only an ABSENT key file mints.** `node-key` is read back on every start; a file that is
@@ -1489,7 +1517,7 @@ right, because the wire now trusts it.
   or a seed and a public key that disagree -- is REFUSED by name and left untouched, the
   `node-id` rule arriving at the file that proves the id. Absent is what the OPEN says
   (`ENOENT`), never `exists()`, and the mint is an exclusive create with nothing in front of
-  it (`StoreClusterKey`'s idiom). The file stores the public key beside the seed on purpose: a
+  it -- the idiom `StoreClusterKey` had until enrollment stopped writing a key file (#178). The file stores the public key beside the seed on purpose: a
   flipped bit in a bare seed is another VALID key, adopted silently. `ctest -R` the
   `[identity][key]` cases; the truncation case is the one a "re-mint on unreadable" neuter
   turns red.

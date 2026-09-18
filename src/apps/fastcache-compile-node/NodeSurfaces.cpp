@@ -645,6 +645,9 @@ ServedSurfaces NodeServedSurfacesFor(NodeConfig const& cfg)
         Row { .surface = MetricsSurface::CompileWorker, .served = RunsWorker(cfg) },
         Row { .surface = MetricsSurface::NodeCacheTier, .served = ConfiguresCacheTier(cfg) },
         Row { .surface = MetricsSurface::NodeEnrollment, .served = RunsConsensus(cfg) && servesScheduler },
+        // `StartDiscoveryOrExplain`'s two conditions: an announce address, and a consensus tier
+        // to desire peers onto.
+        Row { .surface = MetricsSurface::NodeDiscovery, .served = RunsConsensus(cfg) && !cfg.discoveryAddress.empty() },
     };
     static_assert(rows.size() == EnumeratorCount<MetricsSurface>,
                   "every MetricsSurface needs a row here: a surface omitted is answered 'not "

@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#include "ClusterKeySource.hpp"
 #include "EnrollmentWindow.hpp"
 #include "FrameEndpoint.hpp"
 
@@ -34,7 +33,7 @@ namespace FastCache::Node
 /// ## Why this is a component of its own
 ///
 /// `Op::Enroll` is `OpenBeforeAuth` and must admit a machine that is not a member --
-/// that machine holding no secret of this cluster is the entire problem being solved.
+/// a machine this cluster has never heard of is the entire population it serves.
 /// Every other verb on this wire but `AUTH` requires a credential, and the two
 /// surfaces that could have hosted this pair both answer *may this peer be here* once
 /// for every verb they own: `SchedulerResponder::AuthRequired` ignores the opcode and
@@ -75,22 +74,20 @@ class EnrollmentResponder final: public IFrameResponder
     /// @param scheduler Whose leadership decides whether this node may answer, and
     ///        whose `ClusterAdmit` records an approval; must outlive this.
     /// @param membership Who may reach `EnrollControl`; must outlive this.
-    /// @param key Where an approved joiner's key comes from; must outlive this.
-    /// @param metrics Where refusals and hand-overs are recorded; must outlive this.
+    /// @param metrics Where refusals and admissions served are recorded; must outlive this.
+    /// @param logger Where a reject of an already-admitted machine is said out loud.
     /// @param policy The credential this surface requires, or nullptr for none. Shared
     ///        rather than referenced because "there is no credential" has to be
     ///        representable, and a null reference is not.
     EnrollmentResponder(EnrollmentWindow& window,
                         Distributed::SchedulerService& scheduler,
                         Distributed::IMembershipOracle const& membership,
-                        IClusterKeySource const& key,
                         IMetricsSink& metrics,
                         ILogger& logger,
                         std::shared_ptr<AuthPolicy const> policy = nullptr) noexcept:
         _window { window },
         _scheduler { scheduler },
         _membership { membership },
-        _key { key },
         _metrics { metrics },
         _logger { logger },
         _policy { std::move(policy) }
@@ -99,16 +96,14 @@ class EnrollmentResponder final: public IFrameResponder
 
     /// @copydoc IFrameResponder::Answer
     ///
-    /// Never suspends: every decision is taken from this node's own memory, and the one
-    /// thing that touches the filesystem -- reading the cluster key -- is a file a few
-    /// dozen bytes long, read on the rare path where a person has just approved
-    /// somebody.
+    /// Never suspends: every decision is taken from this node's own memory -- the window, and
+    /// the replicated state it hands the roster from.
     [[nodiscard]] Task<FrameReply> Answer(std::span<std::byte const> frame, PeerIdentity peer) override;
 
     /// @copydoc IFrameResponder::RefusePeer
     ///
     /// **`Enroll` is admitted whoever asks, and that is the one hole this surface
-    /// opens.** The machine asking holds no secret of this cluster and is on no list --
+    /// opens.** The machine asking is on no list and holds no key this cluster knows --
     /// it is a fresh install -- so a membership test here would refuse exactly the
     /// population the verb exists for. What stands in place of the credential is a
     /// person: the window is closed by default, closes again on restart, and admits
@@ -262,9 +257,9 @@ class EnrollmentResponder final: public IFrameResponder
     /// @copydoc IFrameResponder::NodeProver
     ///
     /// **None, and the pairing is the opposite way round from what it looks like.** This surface
-    /// exists for a machine that holds NO cluster key, so it has nothing to verify a proof against
-    /// that the joiner could have produced; the prover exists for a machine that already holds one.
-    /// Two components, two populations, and the same file names both keys.
+    /// exists for a machine the cluster has never admitted, so there is nothing it could prove;
+    /// the prover exists for a machine that already holds the cluster key. Two components, two
+    /// populations.
     [[nodiscard]] INodeProver* NodeProver() noexcept override
     {
         return nullptr;
@@ -312,13 +307,12 @@ class EnrollmentResponder final: public IFrameResponder
     EnrollmentWindow& _window;
     Distributed::SchedulerService& _scheduler;
     Distributed::IMembershipOracle const& _membership;
-    IClusterKeySource const& _key;
     IMetricsSink& _metrics;
 
-    /// Where the one condition no counter can carry is said out loud: a claim this
-    /// surface took and could not give back. It is per node and per machine, and an
-    /// operator meets it in the log at the moment they go looking for why a joiner is
-    /// stuck -- a counter would be a second tally with no second audience.
+    /// Where the one condition no counter can carry is said out loud: a machine rejected
+    /// after its approval had already admitted it. It is per node and per machine, and an
+    /// operator meets it in the log at the moment they go looking -- a counter would be a
+    /// second tally with no second audience.
     ILogger& _logger;
 
     std::shared_ptr<AuthPolicy const> _policy;

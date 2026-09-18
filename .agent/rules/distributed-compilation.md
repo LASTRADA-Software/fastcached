@@ -450,7 +450,7 @@ Consequences that are each load-bearing:
       this machine receive work", so the check narrows the primitive without removing
       it — which is the same shape as the security theater it was meant to replace.
     - **The real mechanism is a credential, and this tree already has it one layer
-      over.** Discovery proves a `(node, endpoint)` pair with a MAC over a nonce the
+      over.** Discovery proves a `(node, endpoint)` pair with a signature over a nonce the
       challenger chose, *precisely* so a claimed endpoint cannot be substituted. A
       registration wants that, and it is the same mechanism as the planned signed
       lease tokens.
@@ -947,7 +947,7 @@ Consequences that are each load-bearing:
   reach its port and present any string, and membership (which matches on a source
   address) was the entire boundary. A grant now carries an HMAC-SHA256 tag over the
   worker's **endpoint**, the fingerprint, the object key and an absolute expiry,
-  under the same pre-shared key discovery uses. The endpoint is the load-bearing
+  under the cluster's pre-shared key. The endpoint is the load-bearing
   field: a MAC over "somebody may compile" is a token captured on the way to one
   machine and replayed against every machine that trusts the key, which is the
   identical failure `Cluster::DiscoveryWire` closes by covering the
@@ -955,15 +955,15 @@ Consequences that are each load-bearing:
   and here the separator argument is not hypothetical — an endpoint is `host:port`,
   so `{endpoint="a", key="b:1"}` and `{endpoint="a:b", key="1"}` would authenticate
   identically. Every message is prefixed with a **domain label**, because the same
-  key already MACs discovery proofs and one key serving two constructions is how a
-  tag made for one comes to pass for the other. The token wraps the `LeaseTable`
+  key MACs the node proof (and MACed discovery proofs until #178) and one key serving
+  two constructions is how a tag made for one comes to pass for the other. The token wraps the `LeaseTable`
   serial rather than replacing it, which is what keeps that component pure — no key,
   no wall clock, no crypto in the thing whose whole job is a deterministic unit
   test. See `src/FastCache/Distributed/LeaseToken.hpp` (#281, #282).
 - **A credential lives in `SecureByteBuffer`, and the wipe is an ALLOCATOR rather than a
   destructor.** The cluster key was a plain `std::vector<std::byte>` in every one of its
-  holders, freed without being touched — the key that MACs both discovery proofs and every
-  lease grant, left in freed memory for whatever allocated next (#324). The wipe rides on
+  holders, freed without being touched — the key that MACed discovery proofs then and still
+  MACs every lease grant, left in freed memory for whatever allocated next (#324). The wipe rides on
   `deallocate` so that every release goes through one door and no holder has a line it can
   forget — the `Refuse`/`ClaimReadSlot` argument again, a guard folded INTO the operation
   being self-enforcing where one called alongside it needs a scan. It is what makes the
@@ -1021,9 +1021,9 @@ Consequences that are each load-bearing:
   parameter rather than a string each caller remembers.**
   `Cluster/ClusterSigning.hpp` carries `SigningDomain` and a `SigningDomainTable` row
   per construction, so there is no argument to pass a bare label to and a fourth signer
-  cannot be written against `HmacSha256` directly. The same key MACs discovery proofs
-  and lease tokens, so a construction that omits its domain is a credential valid on the
-  other surface — which is the failure the label existed to prevent and which two
+  cannot be written against `HmacSha256` directly. The same key MACs node proofs and
+  lease tokens (and MACed discovery proofs until #178), so a construction that omits its
+  domain is a credential valid on the other surface — which is the failure the label existed to prevent and which two
   hand-rolled constructions could only prevent by both remembering to (#402).
 - **Asymmetric cryptography has ONE seam too: `Core/Ed25519`, `Core/X25519` and `Core/Hkdf`,
   over the vendored Monocypher (#178).** Only `Ed25519.cpp` and `X25519.cpp` include a Monocypher
@@ -1056,7 +1056,9 @@ Consequences that are each load-bearing:
     names they are held under are rows of `scripts/check-credential-containers.sh`, which since
     #178 also refuses a secret held in a `std::array`, the spelling of this tree's PUBLIC keys.
 - **That consolidation changed the discovery proof wire, and
-  `DiscoveryWire::CurrentVersion` deliberately did NOT move.** The proof message gains
+  `DiscoveryWire::CurrentVersion` deliberately did NOT move.** (#178 later moved discovery off
+  the shared key altogether and DID move it, 1 to 2: a key and a signature where a MAC was is
+  a change of GRAMMAR. The paragraph below stands as the other half of the same question.) The proof message gains
   `fastcache-discovery-v1` as a leading length-prefixed field, so every proof tag differs
   from a pre-#402 build's and a node on an older build cannot prove the key. Lease token
   messages are byte-for-byte unchanged: `fastcache-lease-v1` was already the leading
@@ -1530,7 +1532,7 @@ Consequences that are each load-bearing:
   answer: an operator edits `log_level:`, sends SIGHUP, the reload is accepted, and
   nothing re-asks the filesystem, so a `--cluster-key-file` that went to 0644 an hour
   after the node started is silent for the rest of the process's life. That key MACs
-  discovery proofs AND lease grants. `SecretExposureWatcher` re-asks and remembers
+  node proofs AND lease grants. `SecretExposureWatcher` re-asks and remembers
   `(path, exposure)`, so a standing exposure is said once; an implementation reasoning
   from the reloader's previous-and-current pair concludes nothing changed and never
   looks, which is what makes the snapshot-diffing version look correct while covering
@@ -2981,39 +2983,74 @@ cordoned machine whose disk also filled sends an operator to the wrong fix. The 
 cordoned worker answers is `NoCapacity` on the wire -- the client compiles locally either
 way -- and its own counter, because a stop ends by itself and a cordon does not.
 
-## The enrollment window (#1298, #1299)
+## The enrollment window (#1298, #1299; on keys since #178)
 
 `--enroll-open` puts a node into the one interval in which a machine this cluster has
-never heard of can ask it for the pre-shared key that makes it a member. Everything
-below is a property that shipped WRONG in the first draft of that feature and was
-found by review rather than by a test, so each one is a rule with a bug behind it.
+never heard of can put itself on the list an operator approves from. Until #178 what an
+approval handed back was the pre-shared key; it now hands back the ROSTER -- every
+member's PUBLIC key -- and nothing secret crosses in either direction. Everything below
+is a property that shipped WRONG in a draft of this feature and was found by review
+rather than by a test, so each one is a rule with a bug behind it.
 
-**A window is openable only where a key can actually be handed over**, and since #1308
-that is every node that runs consensus. It took a second clause until then — consensus
-AND a named `--cluster-key-file`, the predicate `EnrollmentConfigured` — because a keyless
-consensus node was legal, and on one the window was openable, listable and APPROVABLE
-while it could never admit anybody: the hand-over reads a key file that was not
-configured. Consensus without the key is a startup refusal (`ConsensusNeedsClusterKeyRefusal`),
-so the clause could only ever read true where it was asked, and the predicate was DELETED
-rather than kept answering a question nothing can reach. **That refusal outlived its first
-reason**: since #178 the Raft peer wire proves each node's own identity key rather than this
-one, and the rule stays because this window -- with the lease and the node proof -- still
-hands over and reads the pre-shared key. Relax it only together with the last of them, or
-this window becomes openable on a node with nothing to hand over again.
-`ServesEnrollment` in `main.cpp` asks `RunsConsensus` and whether a scheduler tier was
-built — the second a runtime fact only that translation unit holds.
+**No secret crosses, and a test proves it against the whole frame.** The joiner sends
+its role and its public key; `Approved` carries `Cluster::EncodeRoster(ProjectRoster(state))`
+-- members with seat and key, principals and revoked keys, in a versioned encoding shared
+with #178 PR 5's certified roster -- which carries nothing an election moves, so its
+fingerprint does not move when somebody leads. The acceptance case scans the WHOLE approve frame for
+the leader's seed, its 64-byte signing layout and a cluster key -- raw, and as base64,
+base64url and hex in both cases, because a hand-over that forwarded a key FILE carries no
+raw run of the key's bytes -- beside POSITIVE controls: a seed planted where a roster
+travels IS found by the same scan through the same responder, and a secret in a setting
+IS found in the whole state's encoding. Without them the scan passes over a reply it
+cannot see into.
 
-**And the approval READS the key before it admits anybody**, because `ClusterAdmit` is
-the irreversible half. It used to consult `_key.ClusterKey()` only on the joiner's next
-poll, so a node whose key file was NAMED and unreadable answered the operator `Ok`,
-grew the replicated configuration — and therefore the QUORUM — by a machine that then
-received `StorageWriteFailed` forever. A phantom member counted towards every future
-election, from one command that reported success. This guard OUTLIVED the configuration
-one, because it answers what no configuration can: the startup table sees that a key file
-is named and `ConsensusTier` that it read at boot, and neither sees a file that breaks
-later. What a test must assert is that
-consensus was offered NOTHING — a refusal alone is green under a build that refused the
-operator *after* telling the cluster, which is the whole defect.
+**Nothing is spendable, so nothing is re-armed.** `Collected`, `EnrollmentAlreadyCollected`,
+`ReturnClaim`, `StoreClusterKey`'s exclusive create and the re-approve that re-armed one
+collection existed only because a key handed over could not be handed over twice -- and
+they cost a lost reply a stranded joiner. All of it went with the key; the error code
+`0x24` and the decision byte `0x03` are retired and never reused. A lost reply is
+recovered by the joiner asking again.
+
+**The key an operator compared is the key an approval admits.** A row keeps the FIRST key
+and role its id asked with. A later poll under that id with another key is ANOTHER
+MACHINE: counted in `claimsChanged`, answered `Pending`, never recorded. Refreshing it --
+which the ADDRESS fields still do while a row is pending, because those are display --
+would let whoever polled last swap a key in the minutes between `--enroll-list` and
+`--enroll-approve`, which are the minutes an operator's comparison is supposed to cover.
+A joiner that genuinely re-minted (a wiped state directory) enrolls again after a close.
+
+**`Approved` means the leader's roster RECORDS the joiner, not that a person typed
+approve.** `ClusterAdmit` returns at the APPEND, and a joiner polling in between would be
+handed a roster lacking its own entry -- exactly what it is told to refuse -- so an
+approved row answers `Pending` until `RosterRecordsJoiner(ProjectRoster(state), id, key, role)`
+holds -- the same predicate the joiner asks of what it receives.
+The responder test holds the fake's applies and commits them, asserting both sides.
+
+**The joiner checks the roster against ITSELF, and prints a fingerprint an operator
+compares.** `DescribeAdmission` refuses a roster that does not record this id under this
+machine's key and role -- an operator approved a different key, or something rewrote the
+reply -- and prints nothing from it. The leader records the fingerprint of what it SENT on
+the row (`NoteServed`), per row, because the roster moves with every admission and one
+cluster-wide fingerprint would make a batch of approvals disagree for no attack at all.
+
+**A role is a table (`EnrollRoleTable`), and each column is a decision.** A member states
+an endpoint and is admitted by `ClusterAdmit`, with no seat opinion so an approval cannot
+promote a demoted learner; a worker states none and is admitted by `AdmitPrincipal`. The
+role follows from `RunsConsensus`, so nobody asks for one the machine will not be.
+`removalFlag` is what the reject-after-approve warning names: `--cluster-forget` for a
+member, and NOTHING for a principal
+([#1555](https://github.com/LASTRADA-Software/fastcached/issues/1555)) -- naming
+`--cluster-forget` there would send an operator to a command that reports success and
+removes nothing.
+
+**A window is openable wherever consensus runs.** `ServesEnrollment` in `main.cpp` asks
+`RunsConsensus` and whether a scheduler tier was built -- the second a runtime fact only
+that translation unit holds. It took a key clause until #1308, and the APPROVAL read the
+key before `ClusterAdmit` until #178, because a key file that broke after boot let an
+approval commit a member that could never collect -- a phantom counted towards every
+election. Nothing is collected any more, so that read had nothing left to protect and
+went; consensus still refuses to start without `--cluster-key-file`, for the lease and the
+node proof, and that rule no longer mentions enrollment.
 
 **A node that runs no consensus refuses the family `NoCluster`, never
 `UnimplementedVerb`.** This is *unimplemented is not served elsewhere* on a new
@@ -3033,32 +3070,10 @@ refuse, so a case asserting only that the peer was refused passes under either.
 `ClusterAdmit`, which is right for a PENDING row — nothing was committed — but
 `EnrollmentWindow::Decide` permits `Approved -> Rejected`, which is the path an
 operator correcting a mis-approval takes, and there the approval has already committed
-the member. It is not refused outright, because the reject still stops the key
+the member. It is not refused outright, because the reject still stops the roster
 hand-over and that is worth having; what changed is that the flag's own description and
-a Warn both name `--cluster-forget` as the thing that removes it. The control that a
-PENDING reject stays SILENT is what keeps that warning worth reading.
-
-**The grant is spendable once, so this mode's preconditions are refused before the
-exchange.** A machine that already holds a key file used to dial, be approved, burn the
-one collection its id has, and only then discover locally that it had nowhere to put
-what it was given — recovering needs an operator to re-approve an id that looks already
-handled. Both that check and `StoreClusterKey`'s stay, and each closes a window the
-other cannot: the early one is ADVISORY and allowed to be wrong, since anything may
-create that file during the ten minutes this mode spends waiting for a person, while
-the one in `StoreClusterKey` is the exclusive CREATE itself.
-
-**That create is `"wbx"` and there is no `exists()` in front of it.** The available
-spelling — ask, then open `"wb"` — is wrong twice over, because `"wb"` TRUNCATES: wrong
-when the answer goes stale, and wrong with no race at all when `exists()` cannot
-answer, its `error_code` overload reporting a failed stat by returning FALSE, which
-that code then discarded. A guard folded into the operation is self-enforcing. No
-platform claim is made for `x` beyond the MSVC CRT, where it was measured; the refusal
-reaches that open with nothing in front of it, so a libc ignoring `x` reddens `A key
-file that already exists is never written over` on the platform that ignores it. Its
-survival assertion is a file SIZE rather than a read-back, because
-`SecureSecretFileForServices` narrows the key past what a non-elevated test process can
-open — so a `static_assert` pins the two test keys to different LENGTHS, which is what
-a size comparison silently needs.
+a Warn both name what removes it -- the ROLE's remedy, above. The control that a PENDING
+reject stays SILENT is what keeps that warning worth reading.
 
 **A one-shot verb's shape is refused on the path that uses it.** `--enroll-from` has a
 `StartupPolicyRejection` row and `main` dispatches the flag and RETURNS before that
@@ -3186,6 +3201,13 @@ its door and its per-tick re-gate. There is no longer a spelling that refuses to
 seventh surface folds by reaching the one function rather than by remembering to.
 
 ## Open work
+- **[#1555](https://github.com/LASTRADA-Software/fastcached/issues/1555)** — nothing an
+  operator can type proposes `RevokeKey`, so a worker principal an enrollment admitted
+  cannot be removed: `--cluster-forget` is `RemoveMember` and touches members only. The
+  reject-after-approve warning says so by name (`EnrollRoleRow::removalFlag` is absent for
+  a worker) rather than naming a flag that would report success and remove nothing. In
+  #178 PR 4 a principal's key admits nothing on any wire, so the exposure is a roster row;
+  it becomes an access path when node verbs require identity.
 - **[#661](https://github.com/LASTRADA-Software/fastcached/issues/661)** — `IProcessRunner`
   has no cancellable seam, so a compile whose client has GONE runs to completion and this
   machine pays for an object nobody will read. The departure is already detected and

@@ -13,66 +13,15 @@
 namespace FastCache::Node
 {
 
-namespace
-{
-    /// The shortest key this node will accept.
-    ///
-    /// An HMAC key shorter than its own block is not wrong, but a key an operator
-    /// can type in a hurry is one an attacker can guess -- and what a guessed key
-    /// buys is admission to the fleet, which is object injection into everybody's
-    /// build. Sixteen bytes is a low bar that any generated key clears without
-    /// anybody thinking about it, and the refusal says how to produce one.
-    constexpr std::size_t MinimumKeyBytes = 16;
-
-    /// Whether a byte is trailing noise a key file did not mean to carry.
-    /// @param byte The candidate.
-    /// @return True when it may be trimmed.
-    [[nodiscard]] constexpr bool IsTrailingNoise(std::byte byte) noexcept
-    {
-        auto const raw = static_cast<unsigned char>(byte);
-        return raw == '\n' || raw == '\r' || raw == ' ' || raw == '\t';
-    }
-} // namespace
-
-std::expected<SecureByteBuffer, std::string> ReadClusterKey(std::filesystem::path const& path)
-{
-    auto error = std::error_code {};
-    auto const size = std::filesystem::file_size(path, error);
-    if (error)
-        return std::unexpected { std::format("cannot read {}: {}", path.string(), error.message()) };
-
-    // A `unique_ptr` over the handle for the reason every other `fopen` in this tree
-    // has one: there are failure paths below, and a bare `fclose` at each is the one
-    // that eventually gets forgotten.
-    auto file = std::unique_ptr<std::FILE, int (*)(std::FILE*)> { std::fopen(path.string().c_str(), "rb"), &std::fclose };
-    if (file == nullptr)
-        return std::unexpected { std::format("cannot open {}", path.string()) };
-
-    auto key = SecureByteBuffer(static_cast<std::size_t>(size));
-    if (!key.empty() && std::fread(key.data(), 1, key.size(), file.get()) != key.size())
-        return std::unexpected { std::format("cannot read {} in full", path.string()) };
-
-    while (!key.empty() && IsTrailingNoise(key.back()))
-        key.pop_back();
-
-    if (key.size() < MinimumKeyBytes)
-        return std::unexpected { std::format("{} holds {} byte(s) of key and at least {} are required. Generate one "
-                                             "with `head -c 32 /dev/urandom | base64 > {}` and give every node in the "
-                                             "cluster that same file",
-                                             path.string(),
-                                             key.size(),
-                                             MinimumKeyBytes,
-                                             path.string()) };
-
-    return key;
-}
-
 DiscoveryTier::DiscoveryTier(std::unique_ptr<IDatagramSocket> socket,
                              Cluster::DiscoveryConfig config,
+                             Consensus::IRaftPeerKeys const& keys,
                              PeerObserver onPeers,
+                             IMetricsSink& metrics,
                              ILogger& logger):
     _logger { logger },
     _onPeers { std::move(onPeers) },
+    _keys { keys },
     _socket { std::move(socket) },
     _random { std::make_unique<SystemSecureRandom>() },
     _directory { _clock, config.clusterId, config.nodeId },
@@ -81,22 +30,26 @@ DiscoveryTier::DiscoveryTier(std::unique_ptr<IDatagramSocket> socket,
     // invisible to a segment that is already up for as long as its own interval, and
     // the first beacon is the cheapest thing it will ever send.
     _nextBeacon { _clock.Now() },
-    _service { *_socket, _clock, *_random, _directory, std::move(config), logger }
+    _service { *_socket, _clock, *_random, _directory, std::move(config), keys, metrics, logger }
 {
 }
 
 std::unique_ptr<DiscoveryTier> DiscoveryTier::Over(std::unique_ptr<IDatagramSocket> socket,
                                                    Cluster::DiscoveryConfig config,
+                                                   Consensus::IRaftPeerKeys const& keys,
                                                    PeerObserver onPeers,
+                                                   IMetricsSink& metrics,
                                                    ILogger& logger)
 {
     return std::unique_ptr<DiscoveryTier> { new DiscoveryTier {
-        std::move(socket), std::move(config), std::move(onPeers), logger } };
+        std::move(socket), std::move(config), keys, std::move(onPeers), metrics, logger } };
 }
 
 std::expected<std::unique_ptr<DiscoveryTier>, std::string> DiscoveryTier::Start(NodeConfig const& cfg,
                                                                                 std::string_view raftEndpoint,
+                                                                                Consensus::IRaftPeerKeys const& keys,
                                                                                 PeerObserver onPeers,
+                                                                                IMetricsSink& metrics,
                                                                                 ILogger& logger)
 {
     // The ANNOUNCE address -- where beacons are sent. Only its host is read here; the
@@ -106,10 +59,6 @@ std::expected<std::unique_ptr<DiscoveryTier>, std::string> DiscoveryTier::Start(
     auto const announce = ParseDialEndpoint(cfg.discoveryAddress);
     if (!announce.has_value())
         return std::unexpected { std::format("--discovery={} is not <address>:<port>", cfg.discoveryAddress) };
-
-    auto key = ReadClusterKey(cfg.clusterKeyFile);
-    if (!key.has_value())
-        return std::unexpected { key.error() };
 
     // Two sockets, and which does what is the whole of issue #126.
     //
@@ -177,11 +126,10 @@ std::expected<std::unique_ptr<DiscoveryTier>, std::string> DiscoveryTier::Start(
                                    .nodeId = cfg.nodeId,
                                    .raftEndpoint = std::string { raftEndpoint },
                                    .beaconAddress = DatagramAddress { .host = announce->first, .port = beaconSocket.port },
-                                   .presharedKey = *std::move(key),
                                    .beaconInterval = Cluster::DiscoveryConfig {}.beaconInterval,
                                    .challengeLifetime = Cluster::DiscoveryConfig {}.challengeLifetime };
 
-    auto tier = Over(std::move(socket), std::move(config), std::move(onPeers), logger);
+    auto tier = Over(std::move(socket), std::move(config), keys, std::move(onPeers), metrics, logger);
 
     tier->_thread = std::jthread { [tier = tier.get()](std::stop_token const& stop) {
         while (!stop.stop_requested() && tier->Step(PollTimeout))
@@ -252,6 +200,16 @@ void DiscoveryTier::PublishAuthenticated()
 {
     auto members = std::vector<Cluster::DesiredMember> {};
     for (auto const& peer: _directory.AuthenticatedPeers())
+    {
+        // **Re-asked of the roster NOW, not taken from the moment of the proof** (#178). The
+        // directory records that a key was proved; the roster may since have revoked it or
+        // re-admitted the id under another, and this set is re-published whenever ANY peer
+        // proves itself -- so a proof taken an hour ago would otherwise go on being handed to
+        // `Desire` as if it were current. A peer whose proven key is no longer the one the
+        // roster holds is left out until it proves the one it does.
+        if (peer.provenKey != _keys.KeysOf(peer.nodeId).live)
+            continue;
+
         // No scheduler endpoint, and `nullopt` rather than an empty string is what
         // says so. Discovery learns where a peer answers CONSENSUS, because that is
         // what the proof covered; the port clients speak to is one nobody dials, so
@@ -263,17 +221,26 @@ void DiscoveryTier::PublishAuthenticated()
         // nowhere is recorded as a LEARNER and an operator promotes it, while one it
         // already records or counts keeps that seat. Decided by the leader against the
         // state it holds at every pass, which this tier cannot see.
+        //
+        // And no KEY, although the peer just proved one (#178). Discovery authenticates only the
+        // key the roster already holds, so it has nothing to add -- and a desire OUTLIVES the
+        // moment it was stated (`ConsensusTier::Desire` replaces per id and never prunes), so a
+        // key stated here would still be desired after an operator re-admitted that id under
+        // another key, and the reconciler would propose the old one straight back over the
+        // operator's decision. No opinion keeps whatever is recorded, which is the reading that
+        // cannot outlive its facts.
         members.push_back(Cluster::DesiredMember { .id = peer.nodeId,
                                                    .raftEndpoint = peer.raftEndpoint,
                                                    .schedulerEndpoint = std::nullopt,
                                                    .publicKey = std::nullopt });
+    }
 
     if (_onPeers && !members.empty())
         _onPeers(members);
 }
 
 std::expected<std::unique_ptr<DiscoveryTier>, std::string> StartDiscoveryOrExplain(
-    NodeConfig const& cfg, std::unique_ptr<ConsensusTier> const& consensus, ILogger& logger)
+    NodeConfig const& cfg, std::unique_ptr<ConsensusTier> const& consensus, IMetricsSink& metrics, ILogger& logger)
 {
     if (cfg.discoveryAddress.empty())
         return std::unique_ptr<DiscoveryTier> {};
@@ -285,15 +252,19 @@ std::expected<std::unique_ptr<DiscoveryTier>, std::string> StartDiscoveryOrExpla
     if (consensus == nullptr)
         return std::unexpected { std::string { "--discovery needs --node-id: there is no cluster to admit anybody to" } };
 
+    // The consensus tier's own keys (#178): discovery proves this node with the key the Raft
+    // peer wire proves it with, and classifies a peer's key against the roster that wire reads.
     return DiscoveryTier::Start(
         cfg,
         consensus->Self().raftEndpoint,
+        consensus->Keys(),
         [&consensus](std::span<Cluster::DesiredMember const> peers) {
             // Desired, not proposed. Whether this node is the one that may act on it
             // is the reconciler's question, and asking it here would have every node
             // on the segment proposing the same change at once.
             consensus->Desire(peers);
         },
+        metrics,
         logger);
 }
 

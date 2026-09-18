@@ -5,11 +5,24 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <chrono>
+#include <cstddef>
 #include <string>
 
 using namespace FastCache;
 using namespace FastCache::Cluster;
 using namespace std::chrono_literals;
+
+namespace
+{
+/// The key a proof verified under. Any 32 bytes: the directory records it and verifies nothing.
+/// @return The key.
+[[nodiscard]] Ed25519PublicKey ProvenKey()
+{
+    auto key = Ed25519PublicKey {};
+    key.fill(std::byte { 0x42 });
+    return key;
+}
+} // namespace
 
 TEST_CASE("PeerDirectory records a peer and forgets it when its beacons stop", "[cluster][discovery]")
 {
@@ -111,7 +124,7 @@ TEST_CASE("PeerDirectory keeps a peer it can name when the next beacon is one it
     PeerDirectory directory { clock, "prod", "self" };
 
     REQUIRE(directory.NoteBeacon("prod", "worker-a", "10.0.0.5:6677") == BeaconOutcome::Recorded);
-    REQUIRE(directory.MarkAuthenticated("worker-a", "10.0.0.5:6677"));
+    REQUIRE(directory.MarkAuthenticated("worker-a", "10.0.0.5:6677", ProvenKey()));
     REQUIRE(directory.AuthenticatedPeers().size() == 1);
 
     CHECK(directory.NoteBeacon("prod", "worker-a", "10.0.0.9:6677\xFF") == BeaconOutcome::Unnameable);
@@ -133,10 +146,15 @@ TEST_CASE("PeerDirectory keeps 'seen' and 'proved' apart", "[cluster][discovery]
     REQUIRE(directory.NoteBeacon("prod", "worker-a", "10.0.0.5:6677") == BeaconOutcome::Recorded);
     REQUIRE(directory.Peers().size() == 1);
     CHECK_FALSE(directory.Peers().front().authenticated);
+    CHECK_FALSE(directory.Peers().front().provenKey.has_value());
     CHECK(directory.AuthenticatedPeers().empty());
 
-    REQUIRE(directory.MarkAuthenticated("worker-a", "10.0.0.5:6677"));
-    CHECK(directory.AuthenticatedPeers().size() == 1);
+    REQUIRE(directory.MarkAuthenticated("worker-a", "10.0.0.5:6677", ProvenKey()));
+    REQUIRE(directory.AuthenticatedPeers().size() == 1);
+
+    // And WHICH key it proved, which is what lets a reader re-ask the roster later rather
+    // than trusting a proof from whenever it was taken (#178). Absent until proved.
+    CHECK(directory.AuthenticatedPeers().front().provenKey == ProvenKey());
 }
 
 TEST_CASE("PeerDirectory will not authenticate an endpoint nobody proved", "[cluster][discovery]")
@@ -145,15 +163,15 @@ TEST_CASE("PeerDirectory will not authenticate an endpoint nobody proved", "[clu
     PeerDirectory directory { clock, "prod", "self" };
     REQUIRE(directory.NoteBeacon("prod", "worker-a", "10.0.0.5:6677") == BeaconOutcome::Recorded);
 
-    // A proof covers a (node, endpoint) PAIR, because both are inside the MAC.
+    // A proof covers a (node, endpoint) PAIR, because both are inside the signature.
     // Accepting one against a different endpoint would let a beacon sent between
     // the challenge and the proof redirect an authenticated peer to an address
     // its holder never proved.
-    CHECK_FALSE(directory.MarkAuthenticated("worker-a", "10.0.0.9:6677"));
+    CHECK_FALSE(directory.MarkAuthenticated("worker-a", "10.0.0.9:6677", ProvenKey()));
     CHECK(directory.AuthenticatedPeers().empty());
 
     // And an id nobody has beaconed for is not a peer at all.
-    CHECK_FALSE(directory.MarkAuthenticated("worker-z", "10.0.0.5:6677"));
+    CHECK_FALSE(directory.MarkAuthenticated("worker-z", "10.0.0.5:6677", ProvenKey()));
 }
 
 TEST_CASE("PeerDirectory drops authentication when a peer moves", "[cluster][discovery]")
@@ -162,12 +180,12 @@ TEST_CASE("PeerDirectory drops authentication when a peer moves", "[cluster][dis
     // wrong by treating the authenticated bit as a property of the NODE. It is a
     // property of the node at an endpoint: carrying it across a move would admit
     // an address nobody proved, which is exactly what putting the endpoint inside
-    // the MAC exists to prevent.
+    // the signature exists to prevent.
     ManualClock clock;
     PeerDirectory directory { clock, "prod", "self" };
 
     REQUIRE(directory.NoteBeacon("prod", "worker-a", "10.0.0.5:6677") == BeaconOutcome::Recorded);
-    REQUIRE(directory.MarkAuthenticated("worker-a", "10.0.0.5:6677"));
+    REQUIRE(directory.MarkAuthenticated("worker-a", "10.0.0.5:6677", ProvenKey()));
     REQUIRE(directory.AuthenticatedPeers().size() == 1);
 
     REQUIRE(directory.NoteBeacon("prod", "worker-a", "10.0.0.9:6677") == BeaconOutcome::Recorded);
@@ -175,9 +193,13 @@ TEST_CASE("PeerDirectory drops authentication when a peer moves", "[cluster][dis
     REQUIRE(directory.Peers().size() == 1);
     CHECK(directory.Peers().front().raftEndpoint == "10.0.0.9:6677");
 
+    // The proven key goes with the bit: a key proved at one address says nothing about who
+    // answers at the next.
+    CHECK_FALSE(directory.Peers().front().provenKey.has_value());
+
     // A repeated beacon for the SAME endpoint must not drop it, or a peer would
     // lose its place every beacon interval and the cluster would never settle.
-    REQUIRE(directory.MarkAuthenticated("worker-a", "10.0.0.9:6677"));
+    REQUIRE(directory.MarkAuthenticated("worker-a", "10.0.0.9:6677", ProvenKey()));
     REQUIRE(directory.NoteBeacon("prod", "worker-a", "10.0.0.9:6677") == BeaconOutcome::Recorded);
     CHECK(directory.AuthenticatedPeers().size() == 1);
 }
