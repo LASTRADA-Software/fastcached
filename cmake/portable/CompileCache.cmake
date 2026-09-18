@@ -416,6 +416,10 @@ set(FASTCACHE_AUTO_INSTALL_VERSION "" CACHE STRING
     "exact fastcache-cc version to install (empty resolves the latest stable release)")
 set(FASTCACHE_AUTO_INSTALL_TTL_HOURS "24" CACHE STRING
     "how long a resolved latest release is reused before the GitHub API is asked again")
+set(FASTCACHE_AUTO_INSTALL_HOST_SYSTEM "" CACHE STRING
+    "system to fetch fastcache-cc for (empty asks CMAKE_HOST_SYSTEM_NAME)")
+set(FASTCACHE_AUTO_INSTALL_HOST_PROCESSOR "" CACHE STRING
+    "processor to fetch fastcache-cc for (empty asks CMAKE_HOST_SYSTEM_PROCESSOR)")
 
 # Auto-installing the launcher alone leaves a genuinely clean machine exactly
 # where it started: fastcache-cc caches nothing unless a fastcached daemon
@@ -531,18 +535,46 @@ set(_fc_asset_windows_amd64_exe "fastcache-cc.exe")
 set(_fc_asset_windows_amd64_daemon_member "bin/fastcached.exe")
 set(_fc_asset_windows_amd64_daemon_exe "fastcached.exe")
 
+# The host the table above is asked about: this machine, unless
+# FASTCACHE_AUTO_INSTALL_HOST_SYSTEM / _HOST_PROCESSOR state another.
+#
+# `scripts/check-compile-cache-autoinstall.cmake` states one, because each of
+# its rows exercises a different way to decline and on a host no binary is
+# published for every one of them stops at THIS question first and never reaches
+# its own (#1432's aarch64 leg). So it pins a published platform for all of them
+# and asks this question deliberately, in a row of its own.
+#
+# Stating a platform this host cannot run fetches a binary the smoke run after
+# staging then refuses, which is one more decline and never a failed configure.
+#
+# @param systemVar Receives the host system name.
+# @param processorVar Receives the host processor.
+function(_fc_auto_install_host systemVar processorVar)
+    set(_system "${CMAKE_HOST_SYSTEM_NAME}")
+    set(_processor "${CMAKE_HOST_SYSTEM_PROCESSOR}")
+    if(NOT "${FASTCACHE_AUTO_INSTALL_HOST_SYSTEM}" STREQUAL "")
+        set(_system "${FASTCACHE_AUTO_INSTALL_HOST_SYSTEM}")
+    endif()
+    if(NOT "${FASTCACHE_AUTO_INSTALL_HOST_PROCESSOR}" STREQUAL "")
+        set(_processor "${FASTCACHE_AUTO_INSTALL_HOST_PROCESSOR}")
+    endif()
+    set(${systemVar} "${_system}" PARENT_SCOPE)
+    set(${processorVar} "${_processor}" PARENT_SCOPE)
+endfunction()
+
 # Pick the row serving this host.
 # @param outVar Receives the row id, or empty when no binary is published for it.
 function(_fc_auto_install_select_row outVar)
     set(${outVar} "" PARENT_SCOPE)
+    _fc_auto_install_host(_system _processor)
     foreach(_id IN LISTS _fc_asset_rows)
-        if(NOT CMAKE_HOST_SYSTEM_NAME STREQUAL "${_fc_asset_${_id}_system}")
+        if(NOT _system STREQUAL "${_fc_asset_${_id}_system}")
             continue()
         endif()
         # Architecture spellings vary by OS and by how CMake was told about the
         # host, so a row lists every name that means it rather than one.
         foreach(_arch IN LISTS _fc_asset_${_id}_arch)
-            if(CMAKE_HOST_SYSTEM_PROCESSOR STREQUAL "${_arch}")
+            if(_processor STREQUAL "${_arch}")
                 set(${outVar} "${_id}" PARENT_SCOPE)
                 return()
             endif()
@@ -643,9 +675,8 @@ function(_fc_auto_install_resolve_release rowVar versionVar jsonVar reasonVar)
 
     _fc_auto_install_select_row(_row)
     if(NOT _row)
-        set(${reasonVar}
-            "no prebuilt binary is published for ${CMAKE_HOST_SYSTEM_NAME}-${CMAKE_HOST_SYSTEM_PROCESSOR}"
-            PARENT_SCOPE)
+        _fc_auto_install_host(_system _processor)
+        set(${reasonVar} "no prebuilt binary is published for ${_system}-${_processor}" PARENT_SCOPE)
         return()
     endif()
 
