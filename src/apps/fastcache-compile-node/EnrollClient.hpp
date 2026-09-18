@@ -6,7 +6,7 @@
 #include "NodeCredential.hpp"
 
 #include <FastCache/Core/BoundedDrain.hpp>
-#include <FastCache/Core/IRandomSource.hpp>
+#include <FastCache/Core/ISecureRandom.hpp>
 #include <FastCache/Core/SecureBytes.hpp>
 #include <FastCache/Net/IConnector.hpp>
 #include <FastCache/Net/ISocket.hpp>
@@ -263,7 +263,7 @@ enum class ConsensusHistory : std::uint8_t
 /// @return What to print on success, or what to print on failure.
 [[nodiscard]] std::expected<std::string, std::string> RunEnrollClient(NodeConfig const& cfg,
                                                                       ICredentialSource const& credential,
-                                                                      IRandomSource& random,
+                                                                      ISecureRandom& random,
                                                                       IDrainWait& wait = DefaultDrainWait(),
                                                                       IEndpointDialer& dialer = DefaultOneShotDialer());
 

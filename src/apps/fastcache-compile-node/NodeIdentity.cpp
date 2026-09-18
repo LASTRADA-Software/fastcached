@@ -172,27 +172,30 @@ IdentityNeed NodeIdentityNeed(NodeConfig const& cfg) noexcept
     return IdentityNeed::Mint;
 }
 
-std::string MintNodeId(IRandomSource& random)
+std::expected<std::string, SecureRandomError> MintNodeId(ISecureRandom& random)
 {
-    // Two draws rather than one, because a `std::uint64_t` is 64 bits and this is 128.
-    // Written as hex rather than as a UUID: nothing here parses it, it appears in Raft
-    // messages, in discovery beacons and on a dashboard, and a shape that looks like a
-    // UUID invites somebody to read structure into bits that have none.
-    auto const draw = [&random] {
-        return random.UniformInRange(0, std::numeric_limits<std::uint64_t>::max());
-    };
+    // Two hex characters per byte, high nibble first. Written as hex rather than as a
+    // UUID: nothing here parses it, it appears in Raft messages, in discovery beacons and
+    // on a dashboard, and a shape that looks like a UUID invites somebody to read
+    // structure into bits that have none.
+    std::array<std::byte, MintedNodeIdLength / 2> bits {};
+    if (auto const drawn = random.Fill(bits); !drawn.has_value())
+        return std::unexpected { drawn.error() };
 
     std::string id;
     id.reserve(MintedNodeIdLength);
-    for (auto const half: std::array { draw(), draw() })
-        for (auto const shift: std::views::iota(std::size_t { 0 }, std::size_t { 16 }))
-            id.push_back(HexDigits[(half >> (60U - (4U * shift))) & 0xFU]);
+    for (auto const byte: bits)
+    {
+        auto const value = std::to_integer<unsigned>(byte);
+        id.push_back(HexDigits[value >> 4U]);
+        id.push_back(HexDigits[value & 0xFU]);
+    }
     return id;
 }
 
 std::expected<NodeIdentity, std::string> ResolveNodeIdentity(std::filesystem::path const& stateDirectory,
                                                              std::string_view configured,
-                                                             IRandomSource& random)
+                                                             ISecureRandom& random)
 {
     auto const path = stateDirectory / NodeIdentityFileName;
 
@@ -227,17 +230,26 @@ std::expected<NodeIdentity, std::string> ResolveNodeIdentity(std::filesystem::pa
                                       configured.empty() ? NodeIdentityOrigin::Recorded : NodeIdentityOrigin::Configured };
     }
 
-    auto const minted = configured.empty() ? MintNodeId(random) : std::string { configured };
+    // Drawn BEFORE anything is created, so a mint this host cannot draw leaves no directory
+    // behind -- and refused by name rather than filled from a weaker source (#1527).
+    auto const minted =
+        configured.empty() ? MintNodeId(random) : std::expected<std::string, SecureRandomError> { configured };
+    if (!minted.has_value())
+        return std::unexpected { std::format("cannot mint an identity into {}: {}. Nothing was written, and no weaker "
+                                             "source is used in its place, because two machines drawing the same id "
+                                             "are two members the cluster cannot tell apart",
+                                             path.string(),
+                                             minted.error().ToString()) };
 
     auto failure = std::error_code {};
     std::filesystem::create_directories(stateDirectory, failure);
     if (failure)
         return std::unexpected { std::format("cannot create {}: {}", stateDirectory.string(), failure.message()) };
 
-    if (auto const written = WriteIdentityFile(path, minted); !written.has_value())
+    if (auto const written = WriteIdentityFile(path, *minted); !written.has_value())
         return std::unexpected { written.error() };
 
-    return NodeIdentity { .id = minted,
+    return NodeIdentity { .id = *minted,
                           .origin = configured.empty() ? NodeIdentityOrigin::Minted : NodeIdentityOrigin::Configured };
 }
 

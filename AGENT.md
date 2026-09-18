@@ -10,7 +10,8 @@ transport, a manual clock and a scripted reactor.
 
 ```
 src/FastCache/
-  Core/         Error taxonomy, Clock, HostPort, IRandomSource, Logger, BufferPool,
+  Core/         Error taxonomy, Clock, HostPort, IRandomSource, ISecureRandom (the OS
+                CSPRNG every nonce and minted id is drawn from), Logger, BufferPool,
                 Base64, Bytes, Endian, Crc32c, MurmurHash3, Sha256/HMAC, StringHash, Owner,
                 SecureBytes (the one zeroing primitive, and the allocator credentials live in),
                 Utf8 (the one strict decoder), Markup (the one markup escaper, over
@@ -528,6 +529,9 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   *this* node chose, and the MAC covers the `(node, endpoint)` pair.
 - A proof only ever answers a challenge this node issued, and the nonce is spent whatever
   the outcome.
+- **Nonces and minted node ids come from `ISecureRandom`, never a seeded engine**, and a failed
+  draw is a REFUSAL, never a fallback (#1527). Its test is CROSS-PROCESS, because an engine
+  seeded once per process repeats only across processes.
 - Discovery never changes membership: it reports who proved the key and where.
 - **Every Raft peer connection proves the cluster key before a message is read** — through
   `Consensus::IRaftPeerCredential` over `Cluster::SignFields`, under `SigningDomain` rows of its

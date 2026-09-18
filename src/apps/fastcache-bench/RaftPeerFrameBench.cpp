@@ -23,7 +23,7 @@
 #include <FastCache/Consensus/RaftPeerServer.hpp>
 #include <FastCache/Consensus/RaftPeerSession.hpp>
 #include <FastCache/Consensus/RaftWire.hpp>
-#include <FastCache/Core/IRandomSource.hpp>
+#include <FastCache/Core/ISecureRandom.hpp>
 #include <FastCache/Core/Nonce.hpp>
 #include <FastCache/Core/SecureBytes.hpp>
 #include <FastCache/Core/Sha256.hpp>
@@ -59,8 +59,10 @@ namespace
 TEST_CASE("bench: sealing and opening a Raft peer frame", "[!benchmark][raftframe]")
 {
     Cluster::PskRaftPeerCredential const credential { SecureByteBuffer(32, std::byte { 0x5A }) };
-    SystemRandomSource random { 1308 };
-    SessionNonces const nonces { .acceptor = DrawNonce(random), .dialler = DrawNonce(random) };
+    // The nonces' VALUES cost nothing a MAC can see, so they come from where production draws
+    // them rather than from a seed (#1527).
+    SystemSecureRandom random;
+    SessionNonces const nonces { .acceptor = DrawNonce(random).value(), .dialler = DrawNonce(random).value() };
 
     for (auto const payloadBytes: { std::size_t { 64 }, PeerServerOptions {}.maxFrameBytes })
     {

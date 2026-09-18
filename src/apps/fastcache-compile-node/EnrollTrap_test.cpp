@@ -5,7 +5,7 @@
 
 #include <FastCache/Consensus/FileRaftStorage.hpp>
 #include <FastCache/Consensus/RaftTypes.hpp>
-#include <FastCache/Core/IRandomSource.hpp>
+#include <FastCache/Core/ISecureRandom.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -101,7 +101,7 @@ TEST_CASE("A node whose state directory has run consensus is refused at enrol ti
     cfg.raftListen = "7100";
     cfg.raftSelf = "198.51.100.4";
 
-    SystemRandomSource random;
+    SystemSecureRandom random;
     auto const refused = RunEnrollClient(cfg, ConfiguredCredential { cfg, nullptr }, random);
     REQUIRE(!refused.has_value());
 
@@ -163,6 +163,6 @@ TEST_CASE("The same state directory is fine at ordinary startup, which is why th
     // alone reads as a predicate that happens to answer correctly once.
     cfg.enrollFrom = "10.0.0.1:7000";
     cfg.clusterKeyFile = scratch / "cluster.key";
-    SystemRandomSource random;
+    SystemSecureRandom random;
     CHECK(!RunEnrollClient(cfg, ConfiguredCredential { cfg, nullptr }, random).has_value());
 }

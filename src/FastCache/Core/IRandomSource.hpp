@@ -99,11 +99,18 @@ class IRandomSource
 ///
 /// Not cryptographic, and deliberately so — the callers are timeout jitter and
 /// tie-breaking, where predictability costs nothing an attacker on the build
-/// network could not already do more cheaply. A caller that needs unguessable
-/// bytes (a bearer token) needs a different seam, not a stronger engine behind
-/// this one, because the two have different failure modes and this one's contract
-/// promises nothing about them. A handshake nonce is NOT that caller: it needs
-/// never to repeat rather than never to be guessed, and `Core/Nonce.hpp` says why.
+/// network could not already do more cheaply, and where a REPEATED stream costs a
+/// slower election and nothing else. A caller whose bytes must never repeat, or
+/// never be guessed, needs a different seam rather than a stronger engine behind
+/// this one: that is `ISecureRandom` (`Core/ISecureRandom.hpp`), and a handshake
+/// nonce and a minted node id both draw from it.
+///
+/// They drew from HERE until #1527, on the argument that a 64-bit-seeded engine never
+/// repeats. It does not repeat only while its SEED does not, and the seed below comes
+/// from `std::random_device` — which on the host #1507 was measured on answers zero
+/// for 57% of draws, so a large share of processes there seed this engine with the
+/// same value and draw the same stream. Harmless for jitter; a replay window for a
+/// nonce, and two machines under one identity for a minted id.
 class SystemRandomSource final: public IRandomSource
 {
   public:

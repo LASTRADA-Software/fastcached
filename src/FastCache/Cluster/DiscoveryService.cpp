@@ -12,7 +12,7 @@ namespace FastCache::Cluster
 
 DiscoveryService::DiscoveryService(IDatagramSocket& socket,
                                    IClock& clock,
-                                   IRandomSource& random,
+                                   ISecureRandom& random,
                                    PeerDirectory& directory,
                                    DiscoveryConfig config,
                                    ILogger& logger):
@@ -32,15 +32,30 @@ bool DiscoveryService::SendBeacon()
     return _socket.Send(datagram, _config.beaconAddress).has_value();
 }
 
-void DiscoveryService::IssueChallenge(DiscoveryWire::Beacon const& peer, DatagramAddress const& replyTo)
+bool DiscoveryService::IssueChallenge(DiscoveryWire::Beacon const& peer, DatagramAddress const& replyTo)
 {
-    // Drawn through the randomness seam rather than a local engine, for the
-    // reason `RaftNode`'s election timeouts are: a nonce this node chose is the
-    // only thing making a proof unreplayable, so a test has to be able to fix it
-    // and a production build has to be able to trust it. `DrawNonce` rather than a
-    // loop here, because the Raft peer handshake draws its nonces the same way and
-    // the size and the source are one decision (#1308).
-    DiscoveryWire::Challenge const challenge { .clusterId = _config.clusterId, .nonce = DrawNonce(_random) };
+    // Drawn through the randomness seam rather than a local engine: a nonce this
+    // node chose is the only thing making a proof unreplayable, so a test has to be
+    // able to fix it and a production build has to be able to trust it. `DrawNonce`
+    // rather than a draw here, because the Raft peer handshake draws its nonces the
+    // same way and the size and the source are one decision (#1308).
+    auto const nonce = DrawNonce(_random);
+    if (!nonce.has_value())
+    {
+        // Withheld rather than issued with a weak nonce (#1527), and said. The line names
+        // no peer: nothing about the peer is wrong, and what it claimed is unproved.
+        if (auto const now = _clock.Now(); now >= _nextNoNonceReport)
+        {
+            _nextNoNonceReport = now + NoNonceReportInterval;
+            _logger.Logf(LogLevel::Error,
+                         "discovery: withheld a challenge, because this node cannot draw a nonce: {}. No peer can "
+                         "prove the key to this node until it can",
+                         nonce.error().ToString());
+        }
+        return false;
+    }
+
+    DiscoveryWire::Challenge const challenge { .clusterId = _config.clusterId, .nonce = *nonce };
 
     // Replaces any earlier challenge to this node rather than adding to a list:
     // a beacon is unauthenticated, so anything on the segment can send one, and a
@@ -52,6 +67,7 @@ void DiscoveryService::IssueChallenge(DiscoveryWire::Beacon const& peer, Datagra
     // A beacon that lies about its endpoint should not be able to aim this
     // node's challenges at a third party.
     (void) _socket.Send(DiscoveryWire::EncodeChallenge(challenge), replyTo);
+    return true;
 }
 
 DiscoveryEvent DiscoveryService::PumpOnce(std::chrono::milliseconds timeout)
@@ -113,8 +129,7 @@ DiscoveryEvent DiscoveryService::PumpOnce(std::chrono::milliseconds timeout)
                     return DiscoveryEvent::Ignored;
             }
 
-            IssueChallenge(*beacon, received->from);
-            return DiscoveryEvent::PeerSeen;
+            return IssueChallenge(*beacon, received->from) ? DiscoveryEvent::PeerSeen : DiscoveryEvent::ChallengeWithheld;
         }
 
         case DiscoveryWire::Kind::Challenge: {
