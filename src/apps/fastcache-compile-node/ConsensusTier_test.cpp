@@ -983,6 +983,8 @@ TEST_CASE("A running tier offered a snapshot it cannot read raises unreadable-le
         Testing::TestKeyPair("n2"),
         [](Distributed::SchedulerRole, std::string_view, std::uint64_t) {},
         [](Cluster::ClusterState const&) {},
+        DefaultSystemWallClock(),
+        {},
         metrics,
         logger,
         &conditions);
