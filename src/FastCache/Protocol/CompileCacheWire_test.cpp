@@ -2631,7 +2631,9 @@ TEST_CASE("A consensus standing travels as its pinned byte, and one this build c
     sent.forgottenClients = 3;
     auto emitted = EncodeNodeRuntime(sent);
     auto parts = Unwrap(WireFields::SplitAll(emitted));
-    REQUIRE(parts.size() == 16);
+    // Seventeen since #1364 appended its condition list behind the standing; the standing is
+    // still the sixteenth field, so the byte replaced below is still the one under test.
+    REQUIRE(parts.size() == 17);
     auto const unknown = std::array { std::byte { 0x7F } };
     parts[15] = unknown;
     auto const back = DecodeNodeRuntime(WireFields::Encode(WireFields::FieldList { parts }));
