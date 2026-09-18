@@ -240,6 +240,8 @@ struct DirectSources
     Distributed::SchedulerService const* scheduler { nullptr }; ///< Role and known leader.
     /// The admission oracle, for its applied-tombstone count; null is a node with no cluster.
     NodeMembership const* membership { nullptr };
+    /// Where consensus counts this node; null is a node running no consensus (#1449).
+    IConsensusStandingSource const* consensus { nullptr };
 };
 
 /// A `ConfiguredNodeStatus` beside the configuration it holds a reference to.
@@ -276,7 +278,8 @@ struct Fixture
                  NodeRuntimeSources { .runtime = initial.has_value() ? &runtime : nullptr,
                                       .capacity = direct.capacity,
                                       .scheduler = direct.scheduler,
-                                      .membership = direct.membership } }
+                                      .membership = direct.membership,
+                                      .consensus = direct.consensus } }
     {
     }
 
@@ -1244,5 +1247,73 @@ TEST_CASE("an admission explanation survives the wire, and an unknown verdict is
         auto const back = Wire::DecodeAdmissionExplanation(Wire::EncodeAdmissionExplanation(withUnknown));
         REQUIRE(back.has_value());
         CHECK((Unwrap(back).decidedBy & 0x8000U) != 0);
+    }
+}
+
+namespace
+{
+/// A consensus tier that answers whatever standing a case sets.
+struct ScriptedStanding final: IConsensusStandingSource
+{
+    std::optional<Consensus::Standing> standing; ///< What the next question is answered with.
+
+    [[nodiscard]] std::optional<Consensus::Standing> CurrentStanding() const override
+    {
+        return standing;
+    }
+};
+} // namespace
+
+TEST_CASE("The consensus standing is absent with no consensus, and read per request through the slot",
+          "[node][node-status][consensus][learner]")
+{
+    // #1449. A learner and a following voter report one role and one component mask, and
+    // this is the field that tells them apart. Read through the SLOT the way production
+    // binds it -- the status is built before the tier exists -- so a case that handed the
+    // fake straight to the status would pass under a slot that never forwarded anything.
+    ManualClock clock;
+
+    SECTION("a node running no consensus reports NOTHING")
+    {
+        Fixture fix { ConfigShape {}, clock };
+        CHECK_FALSE(fix.status.Describe().runtime.consensusStanding.has_value());
+    }
+
+    SECTION("a slot answers what is attached, per request, and nothing once it is detached")
+    {
+        ConsensusStandingSlot slot;
+        Fixture fix { ConfigShape {}, clock, {}, std::nullopt, DirectSources { .consensus = &slot } };
+
+        // Before the tier exists: nothing to ask, so nothing is claimed.
+        CHECK_FALSE(fix.status.Describe().runtime.consensusStanding.has_value());
+
+        ScriptedStanding tier;
+        tier.standing = Consensus::Standing::Learner;
+        {
+            auto const attached = slot.Attach(&tier);
+            CHECK(fix.status.Describe().runtime.consensusStanding == std::optional { Wire::WireConsensusStanding::Learner });
+
+            // A promotion committed a moment ago is visible on the next request.
+            tier.standing = Consensus::Standing::Voter;
+            CHECK(fix.status.Describe().runtime.consensusStanding == std::optional { Wire::WireConsensusStanding::Voter });
+        }
+
+        // Detached, as the tier is on the way out: absent rather than a read of freed memory.
+        CHECK_FALSE(fix.status.Describe().runtime.consensusStanding.has_value());
+    }
+
+    SECTION("every standing travels as its own tag")
+    {
+        ScriptedStanding tier;
+        Fixture fix { ConfigShape {}, clock, {}, std::nullopt, DirectSources { .consensus = &tier } };
+        for (auto const& [standing, tag]:
+             { std::pair { Consensus::Standing::NoCluster, Wire::WireConsensusStanding::NoCluster },
+               std::pair { Consensus::Standing::Voter, Wire::WireConsensusStanding::Voter },
+               std::pair { Consensus::Standing::Learner, Wire::WireConsensusStanding::Learner },
+               std::pair { Consensus::Standing::Outsider, Wire::WireConsensusStanding::Outsider } })
+        {
+            tier.standing = standing;
+            CHECK(fix.status.Describe().runtime.consensusStanding == std::optional { tag });
+        }
     }
 }

@@ -21,26 +21,34 @@ namespace FastCache::Consensus
 /// it goes through the log as a configuration entry rather than by mutating this.
 struct RaftConfig
 {
-    /// This node's own identity; must appear in `members` unless that is empty.
+    /// This node's own identity; must appear in `voters` or `learners` unless both
+    /// are empty.
     NodeId self;
 
-    /// Every voting member of the cluster, **including this node**.
+    /// Every voting member of the cluster, **including this node** when it is one.
     ///
     /// Including self rather than listing "peers" because the member set is what
     /// Raft's configuration actually is, and quorum is a property of the whole
     /// set. A peers-only list makes the reader do the +1 at every use, which is
     /// the arithmetic an off-by-one in a quorum calculation hides in.
     ///
-    /// **Empty is a legal and meaningful value: this node has no cluster yet.**
-    /// It is what a machine being added to a running fleet starts with, and it is
-    /// the only shape that can be added at all. A node that bootstrapped itself as
-    /// the sole member of its own cluster is not a candidate for admission: it has
-    /// elected itself, holds a term and a log of its own, and refuses
-    /// `AppendEntries` from a leader its configuration has never heard of -- so a
-    /// cluster that admitted it would count towards quorum a node that answers
-    /// nobody. Two clusters cannot be merged by any local rule, which is why the
-    /// joining node must never have formed one. See `RaftNode::HasCluster`.
-    std::vector<NodeId> members;
+    /// **Empty, with `learners` empty too, is a legal and meaningful value: this
+    /// node has no cluster yet.** It is what a machine being added to a running
+    /// fleet starts with, and it is the only shape that can be added at all. A node
+    /// that bootstrapped itself as the sole member of its own cluster is not a
+    /// candidate for admission: it has elected itself, holds a term and a log of its
+    /// own, and refuses `AppendEntries` from a leader its configuration has never
+    /// heard of -- so a cluster that admitted it would count towards quorum a node
+    /// that answers nobody. Two clusters cannot be merged by any local rule, which is
+    /// why the joining node must never have formed one. See `RaftNode::HasCluster`.
+    std::vector<NodeId> voters;
+
+    /// Members that are replicated to and counted by nothing (#1449).
+    ///
+    /// Disjoint from `voters`. A node bootstrapped as one of these never stands and
+    /// never votes, which is what lets a usually-absent machine be part of the
+    /// cluster without its absence costing a quorum. See `Configuration`.
+    std::vector<NodeId> learners {};
 
     /// Lower bound of the randomized election timeout.
     std::chrono::milliseconds electionTimeoutMin { 150 };
@@ -73,22 +81,9 @@ struct RaftConfig
     /// @return Nothing on success, or what is wrong with it.
     [[nodiscard]] std::expected<void, ConsensusError> Validate() const;
 
-    /// How many members must agree for a decision to be committed.
-    ///
-    /// Strict majority: `floor(n/2) + 1`. Two overlapping majorities always share
-    /// a member, which is the whole mechanism behind Election Safety and Leader
-    /// Completeness — so this is `+ 1` and never `>= n/2`.
-    ///
-    /// Meaningless for an empty member set, where it answers 1 arithmetically and
-    /// nothing at all in fact — a node with no cluster has nobody to agree with
-    /// it. `RaftNode` never asks: it refuses to stand for election at all while
-    /// it has no cluster, which is what keeps that 1 from being a quorum of one.
-    /// @return The quorum size.
-    [[nodiscard]] std::size_t Quorum() const noexcept;
-
-    /// Every member other than this node.
-    /// @return The peers, in `members` order.
-    [[nodiscard]] std::vector<NodeId> Peers() const;
+    /// The bootstrap configuration these two lists describe.
+    /// @return `voters` and `learners`, as one value.
+    [[nodiscard]] Configuration Bootstrap() const;
 };
 
 } // namespace FastCache::Consensus

@@ -257,8 +257,13 @@ void DiscoveryTier::PublishAuthenticated()
         // what the proof covered; the port clients speak to is one nobody dials, so
         // only that node can announce it. An empty string here would read as "I know
         // it has none" and clear whatever the peer had announced about itself.
+        //
+        // No seat either, for the same reason and with the same consequence (#1449):
+        // no opinion keeps whatever the cluster recorded, and a peer it has no record of
+        // is admitted as a VOTER, as discovery always has. Desiring a proven peer as a
+        // LEARNER first is the step this leaves for later.
         members.push_back(Cluster::DesiredMember {
-            .id = peer.nodeId, .raftEndpoint = peer.raftEndpoint, .schedulerEndpoint = std::nullopt });
+            .id = peer.nodeId, .raftEndpoint = peer.raftEndpoint, .schedulerEndpoint = std::nullopt, .seat = std::nullopt });
 
     if (_onPeers && !members.empty())
         _onPeers(members);

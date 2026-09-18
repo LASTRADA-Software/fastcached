@@ -84,6 +84,14 @@ void RequireNoViolations(RaftClusterHarness const& cluster)
 /// The four nodes a membership case ends up with.
 constexpr std::array Everyone { "n1", "n2", "n3", "n4" };
 
+/// A configuration of voters and no learners.
+/// @param voters The voters.
+/// @return The configuration.
+[[nodiscard]] Configuration Voters(std::vector<NodeId> voters)
+{
+    return Configuration { .voters = std::move(voters), .learners = {} };
+}
+
 /// The furthest any of `who` has committed.
 ///
 /// The commit index rather than what a node calls itself, for the reason "A
@@ -419,11 +427,11 @@ TEST_CASE("A machine with no cluster is admitted into a running one", "[consensu
     CHECK(cluster.At("n4").driver->Node().CurrentRole() == Role::Follower);
     CHECK(cluster.Leaders().size() == 1);
 
-    REQUIRE(cluster.ProposeMembershipOnLeader({ "n1", "n2", "n3", "n4" }).has_value());
+    REQUIRE(cluster.ProposeMembershipOnLeader(Voters({ "n1", "n2", "n3", "n4" })).has_value());
     cluster.Run(120);
 
     CHECK(cluster.At("n4").driver->Node().HasCluster());
-    CHECK(cluster.At("n4").driver->Node().ActiveMembers().size() == 4);
+    CHECK(cluster.At("n4").driver->Node().ActiveConfiguration().voters.size() == 4);
 
     // Caught up rather than merely counted. A member the cluster admits and never
     // fills in is one that would win an election holding nothing, which is
@@ -540,7 +548,7 @@ TEST_CASE("A joiner admitted with the wrong key receives nothing, and the cluste
     REQUIRE(SettleOnLeader(cluster));
 
     cluster.Join("n4", StrangerKey());
-    REQUIRE(cluster.ProposeMembershipOnLeader({ "n1", "n2", "n3", "n4" }).has_value());
+    REQUIRE(cluster.ProposeMembershipOnLeader(Voters({ "n1", "n2", "n3", "n4" })).has_value());
     cluster.Run(120);
 
     CHECK(cluster.RefusedAt("n4") > 0);
@@ -579,7 +587,7 @@ TEST_CASE("A cluster that admitted a member re-elects after losing the leader", 
 
     cluster.Join("n4");
     cluster.Run(30);
-    REQUIRE(cluster.ProposeMembershipOnLeader({ "n1", "n2", "n3", "n4" }).has_value());
+    REQUIRE(cluster.ProposeMembershipOnLeader(Voters({ "n1", "n2", "n3", "n4" })).has_value());
     cluster.Run(120);
     REQUIRE(cluster.At("n4").driver->Node().HasCluster());
 
@@ -615,7 +623,7 @@ TEST_CASE("A cluster that admitted a member re-elects after losing the leader", 
     // joiner that dropped its configuration reports no cluster, and a node with no
     // cluster is excused from every deadline -- silent, and uncountable.
     CHECK(cluster.At("n4").driver->Node().HasCluster());
-    CHECK(cluster.At("n4").driver->Node().ActiveMembers().size() == 4);
+    CHECK(cluster.At("n4").driver->Node().ActiveConfiguration().voters.size() == 4);
 
     RequireNoViolations(cluster);
 }
@@ -631,13 +639,13 @@ TEST_CASE("An admitted member survives its own restart", "[consensus][raft][clus
 
     cluster.Join("n4");
     cluster.Run(30);
-    REQUIRE(cluster.ProposeMembershipOnLeader({ "n1", "n2", "n3", "n4" }).has_value());
+    REQUIRE(cluster.ProposeMembershipOnLeader(Voters({ "n1", "n2", "n3", "n4" })).has_value());
     cluster.Run(120);
     REQUIRE(cluster.At("n4").driver->Node().HasCluster());
 
     cluster.Restart("n4");
     CHECK(cluster.At("n4").driver->Node().HasCluster());
-    CHECK(cluster.At("n4").driver->Node().ActiveMembers().size() == 4);
+    CHECK(cluster.At("n4").driver->Node().ActiveConfiguration().voters.size() == 4);
 
     cluster.Run(200);
     RequireNoViolations(cluster);
@@ -826,7 +834,7 @@ TEST_CASE("A cluster of one that admits a second member keeps leading", "[consen
     REQUIRE_FALSE(cluster.At("n2").driver->Node().HasCluster());
 
     auto const term = Unwrap(cluster.TermOfLeader());
-    REQUIRE(cluster.ProposeMembershipOnLeader({ "n1", "n2" }).has_value());
+    REQUIRE(cluster.ProposeMembershipOnLeader(Voters({ "n1", "n2" })).has_value());
 
     // The admitted member's first answer does not arrive inside one heartbeat, and
     // the case says nothing without that. The harness delivers in one to three
@@ -856,8 +864,183 @@ TEST_CASE("A cluster of one that admits a second member keeps leading", "[consen
     // the assertion above a property of the cluster rather than of one node's
     // opinion of itself.
     CHECK(cluster.At("n2").driver->Node().HasCluster());
-    CHECK(cluster.At("n2").driver->Node().ActiveMembers().size() == 2);
+    CHECK(cluster.At("n2").driver->Node().ActiveConfiguration().voters.size() == 2);
     CHECK(cluster.At("n2").driver->Node().KnownLeader() == std::optional<NodeId> { "n1" });
+
+    RequireNoViolations(cluster);
+}
+
+// --------------------------------------------------------------------------
+// Learners (#1449): a machine that is usually absent, as a member of the cluster.
+
+namespace
+{
+
+/// A two-machine cluster in which `n1` leads and `n2` has been admitted, as `seat`
+/// says -- with the change committed and `n2` caught up.
+///
+/// Built the way a real pair is: `n1` leads a cluster of itself, `n2` joins with no
+/// configuration, and the leader proposes the pair. The learner case and its voter
+/// control differ in that ONE argument and in nothing else, so whatever separates
+/// their outcomes is the seat.
+/// @param seat The configuration the leader proposes for the pair.
+/// @return The cluster, `n1` leading.
+[[nodiscard]] std::unique_ptr<RaftClusterHarness> PairWith(Configuration const& seat)
+{
+    auto cluster = std::make_unique<RaftClusterHarness>(std::vector<NodeId> { "n1" }, ClusterKey);
+    REQUIRE(SettleOnLeader(*cluster));
+    REQUIRE(Unwrap(cluster->Leader()) == "n1");
+
+    cluster->Join("n2");
+    cluster->Run(30);
+    REQUIRE(cluster->ProposeMembershipOnLeader(seat).has_value());
+    cluster->Run(120);
+
+    // Formed, not merely elected: n2 holds the configuration, follows n1, and has
+    // been caught up to everything n1 committed.
+    auto const& second = cluster->At("n2").driver->Node();
+    REQUIRE(second.HasCluster());
+    REQUIRE(second.KnownLeader() == std::optional<NodeId> { "n1" });
+    REQUIRE(second.CommitIndex() == cluster->At("n1").driver->Node().CommitIndex());
+    REQUIRE(cluster->At("n1").driver->Node().CurrentRole() == Role::Leader);
+    return cluster;
+}
+
+} // namespace
+
+TEST_CASE("A voter whose only peer is a learner leads through that learner's absence, and restarts alone to lead",
+          "[consensus][raft][cluster][learner]")
+{
+    // #178's clause, which is #1449's reason to exist: an always-on node and a laptop
+    // that drops off the VPN. With the laptop a voter, the always-on node loses its
+    // quorum the moment the laptop leaves and stops leading -- the control below.
+    // With the laptop a LEARNER it is replicated to and counted by nothing, so its
+    // absence costs the leader nothing, and the leader restarting alone still leads.
+    auto cluster = PairWith(Configuration { .voters = { "n1" }, .learners = { "n2" } });
+    REQUIRE(cluster->At("n2").driver->Node().CurrentStanding() == Standing::Learner);
+
+    auto const term = cluster->At("n1").driver->Node().CurrentTerm();
+    CAPTURE(term.value);
+
+    // The learner goes absent.
+    cluster->Partition({ "n1" });
+
+    // Checked at EVERY step, never only at the end: a lapse that recovered before the
+    // last step is the defect too, and a single poll passes against leadership that
+    // comes and goes. Six simulated seconds is forty `electionTimeoutMin` windows --
+    // CheckQuorum would have deposed a leader counting n2 inside the first.
+    for (auto const step: std::views::iota(std::size_t { 0 }, std::size_t { 600 }))
+    {
+        cluster->Step();
+        CAPTURE(step);
+        auto const& leader = cluster->At("n1").driver->Node();
+        REQUIRE(leader.CurrentRole() == Role::Leader);
+        REQUIRE(leader.CurrentTerm() == term);
+    }
+
+    // It commits alone, too: the learner is no part of the quorum that decides that.
+    auto const alone = cluster->ProposeOnLeader(FastCache::BytesFromString("while n2 is away"));
+    REQUIRE(alone.has_value());
+    cluster->Run(10);
+    CHECK(cluster->At("n1").driver->Node().CommitIndex() >= Unwrap(alone));
+
+    // And it restarts alone, the learner still absent, recovering the pair's
+    // configuration from its own log rather than from a list it was started with.
+    cluster->Restart("n1");
+    REQUIRE(cluster->At("n1").driver->Node().CurrentRole() == Role::Follower);
+    CHECK(cluster->At("n1").driver->Node().ActiveConfiguration()
+          == Configuration { .voters = { "n1" }, .learners = { "n2" } });
+
+    auto relead = false;
+    for ([[maybe_unused]] auto const step: std::views::iota(std::size_t { 0 }, std::size_t { 600 }))
+    {
+        cluster->Step();
+        if (cluster->At("n1").driver->Node().CurrentRole() == Role::Leader)
+        {
+            relead = true;
+            break;
+        }
+    }
+    auto const termAfterRestart = cluster->At("n1").driver->Node().CurrentTerm();
+    CAPTURE(termAfterRestart.value);
+    CHECK(relead);
+    CHECK(termAfterRestart > term);
+
+    RequireNoViolations(*cluster);
+}
+
+TEST_CASE("The same two machines as two voters lose their leader when one is absent", "[consensus][raft][cluster][learner]")
+{
+    // The CONTROL for the case above: every step the same, and n2 admitted as a VOTER.
+    // Two voters are a quorum of two, so the leader stops leading once n2 has been
+    // silent for a CheckQuorum window -- which is the behaviour #437 wants for a real
+    // quorum, and the one a learner exists to be exempt from. Without this beside it,
+    // a harness that simply never deposed anybody would pass the case above.
+    auto cluster = PairWith(Configuration { .voters = { "n1", "n2" }, .learners = {} });
+    REQUIRE(cluster->At("n2").driver->Node().CurrentStanding() == Standing::Voter);
+
+    auto const term = cluster->At("n1").driver->Node().CurrentTerm();
+    CAPTURE(term.value);
+    cluster->Partition({ "n1" });
+
+    auto stoodDown = false;
+    for ([[maybe_unused]] auto const step: std::views::iota(std::size_t { 0 }, std::size_t { 600 }))
+    {
+        cluster->Step();
+        if (cluster->At("n1").driver->Node().CurrentRole() != Role::Leader)
+        {
+            stoodDown = true;
+            break;
+        }
+    }
+    CHECK(stoodDown);
+    CHECK(cluster->At("n1").driver->Node().CurrentTerm() == term);
+
+    RequireNoViolations(*cluster);
+}
+
+TEST_CASE("A learner is promoted and demoted one change at a time, across the whole cluster",
+          "[consensus][raft][cluster][learner]")
+{
+    // The node-level cases pin each step's rule; this is every message authenticated,
+    // every member applying the same configurations in the same order, and the
+    // invariants checked at every step while a member moves between the two sets.
+    RaftClusterHarness cluster { { "n1", "n2", "n3" }, ClusterKey };
+    REQUIRE(SettleOnLeader(cluster));
+
+    cluster.Join("n4");
+    cluster.Run(30);
+
+    auto const agreed = [&cluster](Configuration const& expected) {
+        for (auto const* const id: Everyone)
+        {
+            CAPTURE(id);
+            CHECK(cluster.At(id).driver->Node().ActiveConfiguration() == expected);
+        }
+    };
+
+    auto const learner = Configuration { .voters = { "n1", "n2", "n3" }, .learners = { "n4" } };
+    REQUIRE(cluster.ProposeMembershipOnLeader(learner).has_value());
+    cluster.Run(120);
+    agreed(learner);
+    CHECK(cluster.At("n4").driver->Node().CurrentStanding() == Standing::Learner);
+
+    auto const promoted = Voters({ "n1", "n2", "n3", "n4" });
+    REQUIRE(cluster.ProposeMembershipOnLeader(promoted).has_value());
+    cluster.Run(120);
+    agreed(promoted);
+    CHECK(cluster.At("n4").driver->Node().CurrentStanding() == Standing::Voter);
+
+    REQUIRE(cluster.ProposeMembershipOnLeader(learner).has_value());
+    cluster.Run(120);
+    agreed(learner);
+    CHECK(cluster.At("n4").driver->Node().CurrentStanding() == Standing::Learner);
+
+    // Still one leader, still committing.
+    REQUIRE(SettleOnLeader(cluster));
+    REQUIRE(cluster.ProposeOnLeader(FastCache::BytesFromString("after")).has_value());
+    cluster.Run(60);
+    CHECK_FALSE(cluster.At("n4").applied.empty());
 
     RequireNoViolations(cluster);
 }

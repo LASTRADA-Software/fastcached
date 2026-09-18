@@ -123,29 +123,30 @@ struct HostLoadReading
 /// a tally where zero is the truth about events that never happened, while a
 /// *reading* of zero is a claim about the world.
 ///
-/// **`members` being empty is a reading and not an absence**, which is the one
+/// **`configuration` being empty is a reading and not an absence**, which is the one
 /// distinction worth getting right here. A process that runs no consensus leaves
 /// `MetricsSnapshot::consensus` disengaged and renders no consensus line at all; a
-/// node that RUNS consensus and holds no configuration renders an empty member set,
+/// node that RUNS consensus and holds no configuration renders an empty configuration,
 /// because that is precisely the #388 state and hiding it would defeat the ticket.
 /// The two are told apart by whether the block is there, never by a zero inside it.
 struct ConsensusStatus
 {
-    /// The member set the local Raft node operates under, in whatever order
-    /// consensus holds it.
+    /// The configuration the local Raft node operates under -- its voters and its
+    /// learners, each in whatever order consensus holds them (#1449).
     ///
-    /// Empty means this node holds no configuration — the legitimate waiting state
-    /// of a `--raft-join` node, and a fatal one for any other. Its SIZE is
-    /// `HasCluster()`, which is why no separate boolean is carried: `HasCluster()`
-    /// is defined as `!members.empty()`, and a second field saying the same thing is
-    /// a second thing to be wrong.
-    std::vector<Consensus::NodeId> members {};
+    /// Both sets empty means this node holds no configuration — the legitimate
+    /// waiting state of a `--raft-join` node, and a fatal one for any other. That is
+    /// `HasCluster()`, which is why no separate boolean is carried: a second field
+    /// saying the same thing is a second thing to be wrong. Where THIS node sits in
+    /// it is `Consensus::Membership::StandingOf`, asked with the node's own id, which
+    /// this record does not carry and so does not restate.
+    Consensus::Configuration configuration {};
 
     /// Who this node believes leads, if anybody.
     ///
     /// Disengaged during an election, which is a different fact from "somebody else
     /// leads" and the one a client cannot act on. It is NOT constrained to
-    /// @ref members: a node with no configuration accepts entries from any leader,
+    /// @ref configuration: a node with no configuration accepts entries from any leader,
     /// so it can name one while counting nobody — which is the #388 shape exactly.
     std::optional<Consensus::NodeId> knownLeader {};
 

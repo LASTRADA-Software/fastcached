@@ -44,10 +44,15 @@ std::optional<ClusterMember> ParseMemberSpec(std::string_view spec)
     // types about a PEER could supply it -- the node announces its own. Saying so
     // with `{}` rather than leaving it out is what keeps a field added to the
     // middle of the struct from becoming a silent zero here.
+    //
+    // A voter, because that is what `--raft-peer` bootstraps and what `--cluster-admit`
+    // records; the learner spelling is a different flag rather than a different token,
+    // so the one grammar an operator copies between them stays one grammar.
     return ClusterMember { .id = std::string { id },
                            .raftEndpoint = std::string { endpoint },
                            .schedulerEndpoint = {},
-                           .schedulerEndpointHistory = SchedulerEndpointHistory::NeverAnnounced };
+                           .schedulerEndpointHistory = SchedulerEndpointHistory::NeverAnnounced,
+                           .seat = MemberSeat::Voter };
 }
 
 namespace
@@ -75,17 +80,18 @@ namespace
     /// A snapshot is the one thing here that outlives a process, so a format that could
     /// not say which build wrote it would make an upgrade a silent corruption. 3 added
     /// each member's `SchedulerEndpointHistory` (#1340). 4 added the admitted clients and
-    /// the forgotten hosts, and states every group's count up front (#1309).
-    constexpr std::uint8_t StateVersion = 4;
+    /// the forgotten hosts, and states every group's count up front (#1309). 5 added each
+    /// member's `MemberSeat` (#1449).
+    constexpr std::uint8_t StateVersion = 5;
 
-    /// Fields one member occupies in an encoded state: id, Raft, scheduler, and the
-    /// scheduler endpoint's history.
+    /// Fields one member occupies in an encoded state: id, Raft, scheduler, the
+    /// scheduler endpoint's history, and the seat.
     ///
-    /// Named because the decoder's arithmetic is otherwise four unexplained fours,
+    /// Named because the decoder's arithmetic is otherwise five unexplained fives,
     /// and getting one of them wrong reads every member's scheduler endpoint as the
     /// next member's id -- which decodes, and produces a state nothing would report as
     /// wrong.
-    constexpr std::size_t MemberFields = 4;
+    constexpr std::size_t MemberFields = 5;
 
     /// Fields one setting occupies: name, value.
     constexpr std::size_t SettingFields = 2;
@@ -151,6 +157,12 @@ std::optional<std::string> ClusterState::SchedulerEndpointOf(std::string_view id
     if (it == members.end() || it->schedulerEndpoint.empty())
         return std::nullopt;
     return it->schedulerEndpoint;
+}
+
+MemberSeat RecordedSeatOf(ClusterState const& state, std::string_view id)
+{
+    auto const it = std::ranges::find(state.members, id, &ClusterMember::id);
+    return it != state.members.end() ? it->seat : MemberSeat::Voter;
 }
 
 std::optional<std::string> ClusterState::SettingOf(std::string_view name) const
@@ -237,27 +249,32 @@ std::vector<std::byte> Encode(ClusterState const& state)
     auto const clientCount = countOf(state.clients.size());
     auto const forgottenCount = countOf(state.forgotten.size());
 
-    // Every history byte is written before any span into them is taken, because the
-    // list below holds spans and a vector that grew under them would leave each
-    // pointing at freed storage.
-    std::vector<std::byte> histories;
-    histories.reserve(state.members.size());
+    // Every history and seat byte is written before any span into them is taken,
+    // because the list below holds spans and a vector that grew under them would leave
+    // each pointing at freed storage. Two bytes per member, interleaved, so one cursor
+    // walks both.
+    std::vector<std::byte> memberBytes;
+    memberBytes.reserve(state.members.size() * 2);
     for (auto const& member: state.members)
-        histories.push_back(static_cast<std::byte>(member.schedulerEndpointHistory));
+    {
+        memberBytes.push_back(static_cast<std::byte>(member.schedulerEndpointHistory));
+        memberBytes.push_back(static_cast<std::byte>(member.seat));
+    }
 
     fields.emplace_back(header);
     fields.emplace_back(memberCount);
     fields.emplace_back(settingCount);
     fields.emplace_back(clientCount);
     fields.emplace_back(forgottenCount);
-    auto history = std::span<std::byte const> { histories };
+    auto cursor = std::span<std::byte const> { memberBytes };
     for (auto const& member: state.members)
     {
         fields.push_back(WireFields::AsBytes(member.id));
         fields.push_back(WireFields::AsBytes(member.raftEndpoint));
         fields.push_back(WireFields::AsBytes(member.schedulerEndpoint));
-        fields.push_back(history.first(1));
-        history = history.subspan(1);
+        fields.push_back(cursor.first(1));
+        fields.push_back(cursor.subspan(1, 1));
+        cursor = cursor.subspan(2);
     }
     for (auto const& setting: state.settings)
     {
@@ -293,7 +310,7 @@ std::expected<ClusterState, ConsensusError> DecodeState(std::span<std::byte cons
     if (!memberCount.has_value() || !settingCount.has_value() || !clientCount.has_value() || !forgottenCount.has_value())
         return std::unexpected(MalformedWireFrame("a cluster state's counts are not four bytes each"));
 
-    // Members as quadruples, settings as pairs, then clients and forgotten hosts one field
+    // Members as quintuples, settings as pairs, then clients and forgotten hosts one field
     // each -- and the TOTAL is checked against what actually arrived. A truncated snapshot
     // must be refused rather than read as a member with an empty endpoint -- that member
     // would be replicated onward as an address nobody can dial -- and a declared count
@@ -328,10 +345,18 @@ std::expected<ClusterState, ConsensusError> DecodeState(std::span<std::byte cons
         if (!history.has_value())
             return std::unexpected(MalformedWireFrame("a member's scheduler endpoint history names none this build knows"));
 
+        auto const seatField = (*fields)[StateHeaderFields + index + 4];
+        auto const seat = seatField.size() == 1
+                              ? Consensus::DecodeWireEnum<MemberSeat>(static_cast<std::uint8_t>(seatField[0]))
+                              : std::nullopt;
+        if (!seat.has_value())
+            return std::unexpected(MalformedWireFrame("a member's seat names none this build knows"));
+
         auto member = ClusterMember { .id = at(index),
                                       .raftEndpoint = at(index + 1),
                                       .schedulerEndpoint = at(index + 2),
-                                      .schedulerEndpointHistory = *history };
+                                      .schedulerEndpointHistory = *history,
+                                      .seat = *seat };
 
         // The one combination `Apply` never produces. Read as it stands it would be a
         // member holding an endpoint it reports never having announced, and every
@@ -358,7 +383,12 @@ void Apply(ClusterState& state, Command const& command)
 {
     switch (command.kind)
     {
-        case CommandKind::AddMember: {
+        // One arm for both, because they are one verb recording two seats: the seat is
+        // the only thing that differs, and `MemberSeatTable` is where it is read from.
+        // A member re-admitted through the other verb changes seat and nothing else it
+        // did not also restate -- which is how an operator promotes and demotes.
+        case CommandKind::AddMember:
+        case CommandKind::AddLearner: {
             // Update in place when the id is already known. One verb for "join" and
             // "moved" because they are one intention, and removing first would leave a
             // window in which the cluster has agreed the node does not exist.
@@ -377,7 +407,8 @@ void Apply(ClusterState& state, Command const& command)
                                 .schedulerEndpoint = command.schedulerEndpoint,
                                 .schedulerEndpointHistory = announcedBefore || !command.schedulerEndpoint.empty()
                                                                 ? SchedulerEndpointHistory::Announced
-                                                                : SchedulerEndpointHistory::NeverAnnounced };
+                                                                : SchedulerEndpointHistory::NeverAnnounced,
+                                .seat = SeatAdmittedBy(command.kind).value_or(MemberSeat::Voter) };
             // Admitting a member at a host re-admits that host: a forget it carries is
             // over (#1309).
             EraseHost(state.forgotten, HostOfEndpoint(command.value));
@@ -500,7 +531,7 @@ std::optional<std::string> RefuseLeaseLifetime(std::string_view value)
 
 namespace
 {
-    /// What `AddMember` records; all three become a `ClusterMember`.
+    /// What `AddMember` and `AddLearner` record; all three become a `ClusterMember`.
     ///
     /// The rows restate the strings `Apply` copies, which is a residual worth naming:
     /// the completeness check below proves one row per VERB, not one entry per field,
@@ -548,6 +579,7 @@ namespace
         { .kind = CommandKind::SetSetting, .fields = SetSettingText },
         { .kind = CommandKind::AdmitClient, .fields = ClientHostText },
         { .kind = CommandKind::ForgetClient, .fields = ClientHostText },
+        { .kind = CommandKind::AddLearner, .fields = AddMemberText },
     } };
 
     static_assert(RowsInEnumeratorOrder(CommandTextFields, &CommandTextRow::kind),
@@ -576,6 +608,7 @@ std::expected<void, ConsensusError> Validate(Command const& command)
     switch (command.kind)
     {
         case CommandKind::AddMember:
+        case CommandKind::AddLearner:
             // An endpoint is required, and this is the check that closes the recorded
             // residual: a member the cluster agreed to admit but cannot reach is worse
             // than one it refused, because the fleet counts it towards quorum and

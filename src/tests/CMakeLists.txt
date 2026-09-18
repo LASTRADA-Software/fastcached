@@ -5278,7 +5278,8 @@ endif()
 
 # ---------------------------------------------------------------------------
 # The cluster pre-shared key's signing seam. Fails when anything in `src/` other
-# than `Core/Sha256.{hpp,cpp}` and `Cluster/ClusterSigning.hpp` calls the MAC
+# than `Core/Sha256.{hpp,cpp}`, `Cluster/ClusterSigning.hpp` and HKDF's `Core/Hkdf.cpp`
+# (#178, a derivation under keys that are never the cluster key) calls the MAC
 # primitive directly. scripts/check-psk-signing-seam.cmake carries the signer
 # table and the reason each row is in it, and prints the whole table on failure.
 #
@@ -5753,6 +5754,42 @@ add_test(
         -P "${CMAKE_SOURCE_DIR}/scripts/check-ranges-seam-selftest.cmake"
 )
 set_tests_properties("ranges-seam-selftest" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 180
+)
+
+# No first-party file includes a Monocypher header except `Core/Ed25519.cpp` and
+# `Core/X25519.cpp`, the crypto seam (#178). The include directories are PUBLIC on the
+# vendored library and FastCache links it PRIVATE, which keeps them from FastCache's consumers
+# and not from FastCache itself -- so the build cannot say this and a scan does. The permitted
+# rows are the positive control: each must be seen INCLUDING Monocypher, or it is refused as
+# stale, which is what a broken pattern or an enumeration that missed `src/` looks like.
+add_test(
+    NAME "crypto-seam"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DGIT_EXECUTABLE=${GIT_EXECUTABLE}"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-crypto-seam.cmake"
+)
+set_tests_properties("crypto-seam" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 120
+)
+
+# And that check must be SEEN to refuse each spelling of the crossing, seen to stay quiet over
+# a comment and over the seam's own pointer bridge, and seen to refuse a stale row and an empty
+# tree -- by directory walk and by a staged git index. It prints how many cases ran.
+add_test(
+    NAME "crypto-seam-selftest"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DGIT_EXECUTABLE=${GIT_EXECUTABLE}"
+        "-DFASTCACHED_SCRATCH_DIR=${CMAKE_CURRENT_BINARY_DIR}/crypto-seam-selftest"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-crypto-seam-selftest.cmake"
+)
+set_tests_properties("crypto-seam-selftest" PROPERTIES
     FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
     LABELS "hygiene"
     TIMEOUT 180
@@ -7490,7 +7527,20 @@ set_tests_properties("cli-exit-code-docs-selftest" PROPERTIES
 # in the same configuration with `-fno-sanitize=all`, which must come back without it -- so the
 # reader is watched saying "absent" as well as "present". ASan and TSan only: UBSan leaves no
 # per-object init to read, and MSVC has no `nm`.
-if(TARGET fastcache-tui-objects AND (ENABLE_SANITIZER_ADDRESS OR ENABLE_SANITIZER_THREAD) AND NOT MSVC AND CMAKE_NM)
+#
+# Monocypher (#178) is read here too, from the targets cmake/Monocypher.cmake names, and it is
+# unconditional where the TUI is not -- so the check now runs in a sanitizer build with
+# `FASTCACHED_BUILD_TUI=OFF` as well, reading the one vendored copy that build compiles.
+if((ENABLE_SANITIZER_ADDRESS OR ENABLE_SANITIZER_THREAD) AND NOT MSVC AND CMAKE_NM)
+    set(_fcVendoredObjectTargets ${FASTCACHED_MONOCYPHER_TARGETS})
+    if(TARGET fastcache-tui-objects)
+        list(APPEND _fcVendoredObjectTargets fastcache-tui-objects)
+    endif()
+    set(_fcVendoredObjects "")
+    foreach(_fcVendoredObjectTarget IN LISTS _fcVendoredObjectTargets)
+        list(APPEND _fcVendoredObjects "$<JOIN:$<TARGET_OBJECTS:${_fcVendoredObjectTarget}>,|>")
+    endforeach()
+    list(JOIN _fcVendoredObjects "|" _fcVendoredObjects)
     add_library(sanitizer-absent-probe OBJECT SanitizerAbsentProbe.cpp)
     target_compile_options(sanitizer-absent-probe PRIVATE -fno-sanitize=all)
     set(_fcSanitizerInitSymbols "")
@@ -7506,7 +7556,7 @@ if(TARGET fastcache-tui-objects AND (ENABLE_SANITIZER_ADDRESS OR ENABLE_SANITIZE
         COMMAND ${CMAKE_COMMAND}
             "-DFASTCACHED_NM=${CMAKE_NM}"
             "-DFASTCACHED_SYMBOLS=${_fcSanitizerInitSymbols}"
-            "-DFASTCACHED_INSTRUMENTED=$<JOIN:$<TARGET_OBJECTS:fastcache-tui-objects>,|>"
+            "-DFASTCACHED_INSTRUMENTED=${_fcVendoredObjects}"
             "-DFASTCACHED_UNINSTRUMENTED=$<JOIN:$<TARGET_OBJECTS:sanitizer-absent-probe>,|>"
             -P "${CMAKE_SOURCE_DIR}/scripts/check-sanitized-objects.cmake"
     )

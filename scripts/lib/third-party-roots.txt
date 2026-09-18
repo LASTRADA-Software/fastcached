@@ -27,5 +27,10 @@
 # "is `vendor/CMakeLists.txt` first-party?" is yes -- and a root of `vendor` answers no,
 # which drops this project's own build glue from every scan that reads this file. The
 # next import is its own row.
+#
+# Every root is also a verbatim copy: `scripts/check-vendor-verbatim.cmake` hashes each one
+# into `vendor/MANIFEST`, and `scripts/check-vendor-figures.cmake` requires `vendor/VENDOR.md`
+# to describe each one. So a row here is the whole of adding a root to those checks too.
 
 vendor/endo
+vendor/monocypher

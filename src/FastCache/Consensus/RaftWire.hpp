@@ -121,13 +121,26 @@ using WireVersion = WireFrame::Version;
 /// 2 since #1308, which changed the GRAMMAR -- a handshake before the first message
 /// and a tag after every frame -- rather than only a MAC input, which is why this
 /// moved where `DiscoveryWire::CurrentVersion` deliberately did not for #402.
-inline constexpr WireVersion CurrentVersion = 2;
+///
+/// 3 since #1449, and it is the grammar again, one level down. A configuration
+/// carries voters AND learners, as two nested id lists where version 2 had one flat
+/// list, and it travels in two places: `InstallSnapshotRequest::configuration`, and
+/// the payload of every `EntryKind::Configuration` entry an AppendEntries carries. The
+/// frame's arity did not move, so the frame itself would still decode -- which is
+/// exactly why the version must: a version 2 peer's flat list read by this build's
+/// decoder is refused as malformed at best, and a version 3 configuration entry
+/// replicated to a version 2 follower is one it cannot read and silently ignores,
+/// counting a quorum of the configuration before it. The question the #402/#1308 pair
+/// asks is always WHICH changed, and here a field's grammar did.
+inline constexpr WireVersion CurrentVersion = 3;
 
 /// The oldest version this build still accepts.
 ///
 /// Equal to `CurrentVersion`: a version 1 peer authenticates nothing, and accepting
-/// one would be the per-connection fallback #1308 exists to refuse.
-inline constexpr WireVersion MinSupportedVersion = 2;
+/// one would be the per-connection fallback #1308 exists to refuse; a version 2 peer
+/// spells a configuration this build cannot read (#1449). So the consensus members of
+/// a fleet upgrade together.
+inline constexpr WireVersion MinSupportedVersion = 3;
 
 /// Size of the fixed frame header: magic, version, type, payload length.
 inline constexpr std::size_t HeaderSize = WireFrame::HeaderSize;
@@ -637,10 +650,12 @@ namespace Detail
                 auto const term = Detail::CounterField(m.term);
                 auto const lastIndex = Detail::CounterField(m.lastIncludedIndex);
                 auto const lastTerm = Detail::CounterField(m.lastIncludedTerm);
-                auto const members = Membership::Encode(m.members);
-                std::array const fields { std::span<std::byte const> { term },      WireFields::AsBytes(m.leaderId),
-                                          std::span<std::byte const> { lastIndex }, std::span<std::byte const> { lastTerm },
-                                          std::span<std::byte const> { members },   std::span<std::byte const> { m.state } };
+                auto const configuration = Membership::Encode(m.configuration);
+                std::array const fields {
+                    std::span<std::byte const> { term },          WireFields::AsBytes(m.leaderId),
+                    std::span<std::byte const> { lastIndex },     std::span<std::byte const> { lastTerm },
+                    std::span<std::byte const> { configuration }, std::span<std::byte const> { m.state }
+                };
                 return Detail::Frame<MessageType::InstallSnapshot>(version, fields);
             }
             else if constexpr (std::is_same_v<T, InstallSnapshotResponse>)
@@ -789,16 +804,16 @@ namespace Detail
             if (!term.has_value() || !lastIndex.has_value() || !lastTerm.has_value())
                 return malformed("a counter field is not eight bytes");
 
-            auto members = Membership::Decode((*fields)[4]);
-            if (!members.has_value())
-                return malformed("the member list is malformed");
+            auto configuration = Membership::Decode((*fields)[4]);
+            if (!configuration.has_value())
+                return malformed("the configuration is malformed");
 
             return RaftMessage { InstallSnapshotRequest {
                 .term = Term { .value = *term },
                 .leaderId = NodeId { WireFields::AsStringView((*fields)[1]) },
                 .lastIncludedIndex = LogIndex { .value = *lastIndex },
                 .lastIncludedTerm = Term { .value = *lastTerm },
-                .members = *std::move(members),
+                .configuration = *std::move(configuration),
                 .state = std::vector<std::byte> { (*fields)[5].begin(), (*fields)[5].end() } } };
         }
         case MessageType::InstallSnapshotResponse: {

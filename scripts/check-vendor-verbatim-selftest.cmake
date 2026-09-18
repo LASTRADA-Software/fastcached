@@ -19,6 +19,19 @@
 #   staleDeclaration, revertedChange                  a row naming a file that is upstream's is refused
 #   editedTwice                                       the upstream hash survives a second regeneration
 #   noManifestToCarry, malformed, noHeading, vacuous  every way of having nothing to compare refuses
+#   secondRoot{Seen,Edited,Regenerated,Declared}      a SECOND root is hashed and declared like the first
+#   resyncOneRoot                                     a re-sync of one root leaves another's local change
+#   resyncNamesNoRoot, resyncNamesUnknownRoot         a re-sync that does not say which root refuses
+#   emptySecondRoot, rootDropped                      a root with nothing in it, a manifest line under none
+#
+# The second-root cases are what make the check's generalisation to every root in
+# scripts/lib/third-party-roots.txt (#178) something watched rather than claimed. Each was run
+# against a mutant of the check, and reddened exactly where it should: walking the first root only
+# fails secondRoot{Seen,Edited,Regenerated,Declared}, emptySecondRoot and rootDropped; a RESYNC that
+# blesses every root fails resyncOneRoot; dropping the per-root emptiness refusal fails
+# emptySecondRoot (and vacuous, which then refuses for another reason); dropping the
+# outside-every-root report fails rootDropped; reading declarations under `vendor/endo/` only fails
+# secondRootDeclared.
 #
 # Usage:
 #   cmake -DFASTCACHED_SOURCE_DIR=<dir> -DFASTCACHED_SCRATCH_DIR=<dir> \
@@ -50,12 +63,15 @@ set(alpha "alpha\n")
 # Runs the check over @p tree, optionally in a write mode.
 #
 # @param tree The synthetic source root.
-# @param writeMode Empty to verify, or the value of FASTCACHED_VENDOR_WRITE_MANIFEST.
+# @param writeMode Empty to verify; `ON`; or `RESYNC:<root>`, which is RESYNC of that root, and
+#        `RESYNC:` alone names none.
 # @param outObjected Set to TRUE when the output carries a CMake diagnostic.
 # @param outOutput Set to the output, whitespace flattened so a wrapped phrase still matches.
 function(fastcached_run_check tree writeMode outObjected outOutput)
     set(extra "")
-    if(NOT "${writeMode}" STREQUAL "")
+    if(writeMode MATCHES "^RESYNC:(.*)$")
+        set(extra "-DFASTCACHED_VENDOR_WRITE_MANIFEST=RESYNC" "-DFASTCACHED_VENDOR_RESYNC_ROOT=${CMAKE_MATCH_1}")
+    elseif(NOT "${writeMode}" STREQUAL "")
         set(extra "-DFASTCACHED_VENDOR_WRITE_MANIFEST=${writeMode}")
     endif()
     execute_process(
@@ -79,10 +95,10 @@ function(fastcached_run_check tree writeMode outObjected outOutput)
     set(${outOutput} "${flattened}" PARENT_SCOPE)
 endfunction()
 
-# A vendored tree of two files, a VENDOR.md whose "Local changes" section holds @p localChanges
-# followed by another heading, and a manifest written by RESYNC -- so both files start as
-# upstream's. The RESYNC is asserted to have succeeded, or every case below tests a tree that
-# was never set up.
+# A vendored tree of two files under one root, a roots file naming it, a VENDOR.md whose "Local
+# changes" section holds @p localChanges followed by another heading, and a manifest written by a
+# RESYNC of that root -- so both files start as upstream's. The RESYNC is asserted to have
+# succeeded, or every case below tests a tree that was never set up.
 #
 # @param name The case name and directory.
 # @param localChanges The body of the "Local changes" section.
@@ -90,11 +106,12 @@ endfunction()
 function(fastcached_make_tree name localChanges outVar)
     set(tree "${root}/${name}")
     file(REMOVE_RECURSE "${tree}")
+    file(WRITE "${tree}/scripts/lib/third-party-roots.txt" "# roots\nvendor/endo\n")
     file(WRITE "${tree}/vendor/endo/a.hpp" "${alpha}")
     file(WRITE "${tree}/vendor/endo/sub/b.hpp" "beta\n")
     file(WRITE "${tree}/vendor/VENDOR.md"
         "# Vendored\n\n## Local changes\n\n${localChanges}\n\n## How to send a change back\n\nProse.\n")
-    fastcached_run_check("${tree}" RESYNC objected output)
+    fastcached_run_check("${tree}" "RESYNC:vendor/endo" objected output)
     if(objected OR NOT EXISTS "${tree}/vendor/MANIFEST")
         message(FATAL_ERROR
             "check-vendor-verbatim-selftest: INCONCLUSIVE -- the setup RESYNC for `${name}` failed, "
@@ -139,7 +156,7 @@ set(rowA "| `vendor/endo/a.hpp` | what | why | endo | prepared as a branch |")
 
 # ---------------------------------------------------------------------------
 fastcached_make_tree("clean" "None." tree)
-fastcached_judge("clean" "${tree}" accept "2 vendored file(s) match vendor/MANIFEST, 0 of them declared"
+fastcached_judge("clean" "${tree}" accept "2 vendored file(s) under 1 root(s) (vendor/endo) match vendor/MANIFEST, 0 of them declared"
     "an upstream tree with a fresh manifest -- a check refusing this refuses everything")
 
 fastcached_make_tree("editedNotRegenerated" "None." tree)
@@ -216,7 +233,7 @@ fastcached_judge("editedTwice" "${tree}" accept "1 of them declared local change
 
 fastcached_make_tree("resyncClears" "None." tree)
 file(WRITE "${tree}/vendor/endo/a.hpp" "alpha from a newer upstream\n")
-fastcached_run_check("${tree}" RESYNC objected output)
+fastcached_run_check("${tree}" "RESYNC:vendor/endo" objected output)
 fastcached_judge("resyncClears" "${tree}" accept "0 of them declared local change(s)"
     "after a re-sync every file is upstream's, which is what RESYNC says")
 
@@ -242,11 +259,89 @@ fastcached_judge("noHeading" "${tree}" refuse "no `## Local changes` section"
 
 set(tree "${root}/vacuous")
 file(REMOVE_RECURSE "${tree}")
+file(WRITE "${tree}/scripts/lib/third-party-roots.txt" "vendor/endo\n")
 file(MAKE_DIRECTORY "${tree}/vendor/endo")
 file(WRITE "${tree}/vendor/VENDOR.md" "## Local changes\n\nNone.\n")
 file(WRITE "${tree}/vendor/MANIFEST" "# empty\n")
 fastcached_judge("vacuous" "${tree}" refuse "no files were found"
     "an empty tree and an empty manifest agree perfectly")
+
+# ---------------------------------------------------------------------------
+# A second root (#178). Each tree adds `vendor/second` to the roots file and imports it with a
+# RESYNC of THAT root, so the first root's state is whatever the case set up before.
+
+# Adds a second root holding one file to @p tree and re-syncs only it.
+#
+# @param tree A tree from fastcached_make_tree.
+function(fastcached_add_second_root tree)
+    file(WRITE "${tree}/scripts/lib/third-party-roots.txt" "# roots\nvendor/endo\nvendor/second\n")
+    file(WRITE "${tree}/vendor/second/x.hpp" "chi\n")
+    fastcached_run_check("${tree}" "RESYNC:vendor/second" objected output)
+    if(objected)
+        message(FATAL_ERROR
+            "check-vendor-verbatim-selftest: INCONCLUSIVE -- importing a second root into ${tree} failed: ${output}")
+    endif()
+endfunction()
+
+set(rowX "| `vendor/second/x.hpp` | what | why | second | prepared as a branch |")
+
+fastcached_make_tree("secondRootSeen" "None." tree)
+fastcached_add_second_root("${tree}")
+fastcached_judge("secondRootSeen" "${tree}" accept "3 vendored file(s) under 2 root(s)"
+    "a second root imported by its own RESYNC is upstream's and is counted")
+file(WRITE "${tree}/vendor/second/x.hpp" "chi edited\n")
+fastcached_judge("secondRootEdited" "${tree}" refuse "EDITED"
+    "an edit under the SECOND root must be seen, or the check still walks one root")
+fastcached_regenerate("${tree}")
+fastcached_judge("secondRootRegenerated" "${tree}" refuse "vendor/second/x.hpp (upstream sha256"
+    "a regenerated edit under the second root is a local change like one under the first")
+
+fastcached_make_tree("secondRootDeclared" "${rowX}" tree)
+fastcached_add_second_root("${tree}")
+file(WRITE "${tree}/vendor/second/x.hpp" "chi edited\n")
+fastcached_regenerate("${tree}")
+fastcached_judge("secondRootDeclared" "${tree}" accept "1 of them declared local change(s)"
+    "a row naming a path under the second root declares it, or no second copy could carry a change")
+
+fastcached_make_tree("resyncOneRoot" "${rowA}" tree)
+file(WRITE "${tree}/vendor/endo/a.hpp" "alpha edited\n")
+fastcached_regenerate("${tree}")
+fastcached_add_second_root("${tree}")
+fastcached_judge("resyncOneRoot" "${tree}" accept "1 of them declared local change(s)"
+    "a re-sync of the second root must leave the FIRST root's local change a local change")
+file(READ "${tree}/vendor/MANIFEST" manifest)
+string(FIND "${manifest}" "vendor/endo/a.hpp  local-change-of" kept)
+if(kept EQUAL -1)
+    list(APPEND failures "resyncOneRoot: the RESYNC of vendor/second marked vendor/endo/a.hpp upstream's")
+endif()
+
+fastcached_make_tree("resyncNamesNoRoot" "None." tree)
+math(EXPR caseCount "${caseCount} + 1")
+fastcached_run_check("${tree}" "RESYNC:" objected output)
+string(FIND "${output}" "RESYNC names no root" said)
+if(NOT objected OR said EQUAL -1)
+    list(APPEND failures "resyncNamesNoRoot: a RESYNC naming no root did not refuse by saying so. Output: ${output}")
+endif()
+
+fastcached_make_tree("resyncNamesUnknownRoot" "None." tree)
+math(EXPR caseCount "${caseCount} + 1")
+fastcached_run_check("${tree}" "RESYNC:vendor/elsewhere" objected output)
+string(FIND "${output}" "does not name" said)
+if(NOT objected OR said EQUAL -1)
+    list(APPEND failures "resyncNamesUnknownRoot: a RESYNC of a root the roots file does not name did not refuse. Output: ${output}")
+endif()
+
+fastcached_make_tree("emptySecondRoot" "None." tree)
+file(WRITE "${tree}/scripts/lib/third-party-roots.txt" "vendor/endo\nvendor/second\n")
+file(MAKE_DIRECTORY "${tree}/vendor/second")
+fastcached_judge("emptySecondRoot" "${tree}" refuse "no files were found under ${tree}/vendor/second"
+    "an empty root must be refused by name even while another root is full")
+
+fastcached_make_tree("rootDropped" "None." tree)
+fastcached_add_second_root("${tree}")
+file(WRITE "${tree}/scripts/lib/third-party-roots.txt" "vendor/endo\n")
+fastcached_judge("rootDropped" "${tree}" refuse "OUTSIDE EVERY ROOT"
+    "a manifest line under a root the roots file no longer names describes a copy nothing compares")
 
 # ---------------------------------------------------------------------------
 list(LENGTH failures failureCount)

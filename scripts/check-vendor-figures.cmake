@@ -22,6 +22,16 @@
 # prose is read with its line breaks folded to spaces, because markdown wraps a sentence wherever the
 # editor did.
 #
+# ## Every root, not only `vendor/endo`
+#
+# The figures above are endo's, because the prose they are read from is about endo's structure. What
+# every copy has in common is a size, so VENDOR.md's "The copies" table carries one row per root of
+# `scripts/lib/third-party-roots.txt` -- the root in backticks, its upstream, its files, its lines -- and each
+# row is recomputed here from that root's files, the same way `the copy` is. The roots are READ, never
+# restated (#178 added the second, `vendor/monocypher`): a root with no row is refused, since a copy
+# VENDOR.md does not describe is one nobody checks the size of, and so is a row naming a directory the
+# roots file does not.
+#
 # NOT covered, stated so it is not over-read: figures VENDOR.md quotes as MEASUREMENTS at a moment
 # (the formatter's "146 of 165" on its first run, upstream's `coro`/`endo-platform` size) describe
 # the world when they were taken and are deliberately left pinned rather than recomputed.
@@ -32,6 +42,8 @@
 # The verdict is `CMake Error` in the output, never the exit code.
 
 cmake_minimum_required(VERSION 3.28)
+
+include("${CMAKE_CURRENT_LIST_DIR}/lib/CheckCommon.cmake")
 
 if(NOT DEFINED FASTCACHED_SOURCE_DIR)
     message(FATAL_ERROR "vendor-figures: FASTCACHED_SOURCE_DIR must be set")
@@ -151,6 +163,45 @@ fastcached_figures("header-only"
     "\\*\\*([0-9,]+) of the ([0-9,]+) are header-only"
     "supporting headers:supportingHeaders" "supporting files:supportingFiles")
 
+# ---- every root, as "The copies" table states it --------------------------------------------------
+
+fastcached_third_party_roots("${FASTCACHED_SOURCE_DIR}" thirdPartyRoots)
+set(rootsCompared 0)
+foreach(root IN LISTS thirdPartyRoots)
+    file(GLOB_RECURSE rootFiles LIST_DIRECTORIES false "${FASTCACHED_SOURCE_DIR}/${root}/*")
+    set(rootFileCount 0)
+    set(rootLineCount 0)
+    foreach(file IN LISTS rootFiles)
+        fastcached_count_lines("${file}" lines)
+        math(EXPR rootFileCount "${rootFileCount} + 1")
+        math(EXPR rootLineCount "${rootLineCount} + ${lines}")
+    endforeach()
+    if(rootFileCount EQUAL 0)
+        string(APPEND problems "\n  the root `${root}` holds no files, so its row would be compared against zero")
+        continue()
+    endif()
+    # The root is a path, not a pattern: every regex metacharacter in it is escaped.
+    string(REGEX REPLACE "([][.*+?^$(){}|\\\\])" "\\\\\\1" rootPattern "${root}")
+    set(copyRootFiles ${rootFileCount})
+    set(copyRootLines ${rootLineCount})
+    fastcached_figures("`${root}` row of The copies"
+        "\\| `${rootPattern}` \\| [^|]* \\| ([0-9,]+) \\| ([0-9,]+) \\|"
+        "${root} files:copyRootFiles" "${root} lines:copyRootLines")
+    math(EXPR rootsCompared "${rootsCompared} + 1")
+endforeach()
+
+# A row naming a directory the roots file does not is a copy that was removed, or never a root: either
+# way the table claims a size for something no check will ever count again.
+string(REGEX MATCHALL "\\| `[^`|]+` \\| [^|]* \\| [0-9,]+ \\| [0-9,]+ \\|" copyRows "${prose}")
+foreach(row IN LISTS copyRows)
+    string(REGEX MATCH "^\\| `([^`|]+)`" ignored "${row}")
+    if(NOT "${CMAKE_MATCH_1}" IN_LIST thirdPartyRoots)
+        string(APPEND problems
+            "\n  The copies names `${CMAKE_MATCH_1}`, which scripts/lib/third-party-roots.txt does not; remove the "
+            "row, or add the root")
+    endif()
+endforeach()
+
 if(NOT problems STREQUAL "")
     message(FATAL_ERROR
         "vendor-figures: vendor/VENDOR.md does not describe the vendored tree:${problems}\n"
@@ -158,4 +209,5 @@ if(NOT problems STREQUAL "")
         "unless the file set itself is what went wrong -- in which case fix the tree, not the prose.")
 endif()
 message(STATUS "vendor-figures: ${compared} figure(s) in vendor/VENDOR.md match the tree "
-               "(${copyFiles} files, ${copyLines} lines; ${supportingFiles} supporting)")
+               "(${copyFiles} files, ${copyLines} lines; ${supportingFiles} supporting; "
+               "${rootsCompared} root(s) in The copies)")

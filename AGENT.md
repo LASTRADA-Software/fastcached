@@ -17,7 +17,8 @@ src/FastCache/
                 Utf8 (the one strict decoder), Markup (the one markup escaper, over
                 Utf8 and reached by all three targets that emit XML-family documents),
                 Compression, WireFrame + WireFields
-                (the shared framing), Profiling
+                (the shared framing), Profiling, and the crypto seam -- Ed25519,
+                X25519 and Hkdf, the ONLY way into the vendored Monocypher
   Async/        Task<T>, Cancellation, ResumeOn, SleepUntil,
                 InterruptibleSleepUntil, DeadlineTimer, AsyncQueue (MPSC,
                 bounded, closable), IExecutor (the one thing ResumeOn needs)
@@ -310,6 +311,10 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
 - And it says WHICH nothing it resolved: one wire code, three rows, keyed on the OUTCOME. Only
   `Expired` is counted, and the enumerators name what was OBSERVED. Acceptance is a
   discrimination case; per-arm sections all pass when all three answer alike.
+- Asymmetric crypto has ONE seam: `Core/Ed25519`, `Core/X25519`, `Core/Hkdf` over the vendored
+  Monocypher, and only `Ed25519.cpp` and `X25519.cpp` include its headers (`ctest -R crypto-seam`).
+  RFC 8032 Ed25519, never Monocypher's default EdDSA over BLAKE2b. A missing primitive is added THERE,
+  beside its RFC vectors.
 - A credential lives in `SecureByteBuffer`, and the wipe is an **allocator**, not a destructor.
   Container-agnostic is not SUFFICIENT — SSO keeps a short secret where no allocator is called,
   which makes **macOS the platform to write the failing test against**. Secret STRINGS need an
@@ -545,10 +550,10 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   verified message naming a sender other than the proven dialler closes the connection. The ids
   are bound and the ENDPOINT deliberately is not: a shared key cannot tell holders apart, and an
   identity in the frame is #178's question.
-- `RaftWire::CurrentVersion` and `MinSupportedVersion` are both 2: the handshake changed the
-  GRAMMAR, so the version moved — the opposite of discovery's #402, where only the MAC input did.
-  Accepting a v1 peer would be the per-connection fallback, so a fleet upgrades its consensus
-  members together.
+- `RaftWire::CurrentVersion` and `MinSupportedVersion` are both 3: the handshake changed the
+  GRAMMAR (2), and so did a configuration of two sets inside `InstallSnapshot` (3, #1449) — the
+  opposite of discovery's #402, where only the MAC input did. Accepting an older peer would be
+  the per-connection fallback, so a fleet upgrades its consensus members together.
 - `RaftClusterHarness` authenticates EVERY message through the real session objects, with a
   REQUIRED credential factory and a nonce source apart from `_network`. An intruder case says
   nothing without the formation case beside it staying green under the same neuter.
@@ -557,16 +562,32 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
 - A seeded draw must be identical on every standard library — `UniformInRange`, never
   `std::uniform_int_distribution`.
 - A node being admitted must never have bootstrapped a cluster of itself, so
-  `RaftConfig::members` may legally be **empty** and `--raft-join` is what starts a machine
-  that way. Who a node dials is not who it counts.
-- The quorum follows the replicated state, one change at a time, additions before removals —
-  and a member is never counted before every node can dial it. **One at a time is
-  load-bearing for READS as well as for commitment**: CheckQuorum consults the committed
-  configuration while a change is in flight, and that is only safe because any majority of
-  the old and any majority of the new share a member. Relaxing the restriction on the
-  commitment argument alone breaks a rule nothing would warn you about.
+  `RaftConfig::voters` and `learners` may legally both be **empty** and `--raft-join` is what
+  starts a machine that way. Who a node dials is not who it counts.
+- **Voting is a property of the CONFIGURATION, never of a role (#1449).** A configuration is two
+  disjoint sets, voters and learners, with at least one voter. A learner is a `Follower` whose
+  STANDING never stands and never votes — a `StandingTable` row with `TimerKind::None`, answered
+  through `Membership::StandingOf`, never a switch and never a fifth `Role`. Every quorum read —
+  commitment, pre-vote, votes, CheckQuorum — counts VOTERS through `Membership::QuorumOf`;
+  replication and `_followerContact` reach both sets. A learner asked for a vote refuses by ROW
+  (`VoteRefusal::CastsNoVote`), never by silence.
+- The quorum follows the replicated state, one change at a time — additions, then promotions,
+  then demotions, then removals — and a member is never COUNTED before every node can dial it.
+  **One at a time is load-bearing for READS as well as for commitment**: CheckQuorum consults the
+  committed configuration while a change is in flight, and that is only safe because any
+  majority of the old VOTERS and any majority of the new share a voter; a learner change touches
+  no voter majority at all. Relaxing the restriction on the commitment argument alone breaks a
+  rule nothing would warn you about.
 - Absence from `ClusterState` is not removal: a member named in the bootstrap set is never
-  proposed for removal, and a node given no bootstrap set proposes none at all.
+  proposed for removal, and a node given no bootstrap set proposes none at all. **A learner is
+  never removed for being absent** — nothing in the policy asks whether a member answers.
+- The SEAT an operator chose is the record (`ClusterMember::seat`, written only by the verb:
+  `AddMember` a voter, `AddLearner` a learner, `MemberSeatTable`). A caller with NO opinion —
+  a node desiring itself, an enrollment re-approval — keeps the recorded seat
+  (`RecordedSeatOf`), or a node's own record undoes its demotion one interval later.
+- The Raft store is FORMAT 2 and every log record carries its format: a store another build
+  wrote is `UnsupportedFormatVersion`, judged from the header before the CRC, never the damage
+  code. A log's FIRST record decides; a foreign LATER record is a torn tail.
 - A cluster that has elected is not one that has formed. Until every member attaches,
   pre-vote refuses nothing and any stall re-elects — assert leadership stability only after
   formation, and log the term or nothing explains it.
