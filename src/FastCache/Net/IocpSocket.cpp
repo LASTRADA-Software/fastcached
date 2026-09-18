@@ -14,6 +14,7 @@
 
     #include <winsock2.h>
 
+    #include <algorithm>
     #include <array>
     #include <cstddef>
     #include <cstdint>
@@ -270,14 +271,9 @@ struct IocpSocket::Impl
         {
             op->settling = false;
             auto& nodes = keepAlive->settlingNodes;
-            for (auto it = nodes.begin(); it != nodes.end(); ++it)
-            {
-                if (it->get() == op)
-                {
-                    nodes.erase(it);
-                    break;
-                }
-            }
+            auto const settled = std::ranges::find(nodes, op, [](std::shared_ptr<Op> const& node) { return node.get(); });
+            if (settled != nodes.end())
+                nodes.erase(settled);
         }
 
         auto* awaitable = op->awaitable;

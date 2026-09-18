@@ -841,3 +841,19 @@ TEST_CASE("SystemConfigPathProbe: a file only administrators can replace is trus
 
     REQUIRE(probe.IsTrustedSystemLocation(wellKnown));
 }
+
+TEST_CASE("ExpandApplicationName: every token is replaced and nothing it substitutes is searched again",
+          "[config][defaultpath]")
+{
+    // The walk resumes PAST each token it replaced, over the pattern rather than over the
+    // output -- so a name that itself spells the token is written once and not expanded again.
+    CHECK(ExpandApplicationName("", "app").empty());
+    CHECK(ExpandApplicationName("no token here", "app") == "no token here");
+    CHECK(ExpandApplicationName("{app}", "app") == "app");
+    CHECK(ExpandApplicationName("{app}/{app}.yaml", "app") == "app/app.yaml");
+    CHECK(ExpandApplicationName("{app}{app}", "x") == "xx");
+    CHECK(ExpandApplicationName("etc/{app}", "") == "etc/");
+    CHECK(ExpandApplicationName("{app}.d", "{app}") == "{app}.d");
+    // A token cut short at the end is text, not a token.
+    CHECK(ExpandApplicationName("dir/{ap", "app") == "dir/{ap");
+}

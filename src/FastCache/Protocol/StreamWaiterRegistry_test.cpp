@@ -114,3 +114,39 @@ TEST_CASE("StreamWaiterRegistry: re-registering the same waiter does not double-
     reg.NotifyAppended("s1");
     REQUIRE(w->wakes == 1);
 }
+
+TEST_CASE("StreamWaiterRegistry: an expired waiter is pruned beside a live one that keeps waking", "[protocol][stream]")
+{
+    // The upgrade walk erases exactly the entries whose owner is gone. A walk that erased the
+    // live one too -- or dropped the whole key -- would wake it once and never again.
+    StreamWaiterRegistry reg;
+    auto live = std::make_shared<CountingWaiter>();
+    auto const keys = Keys({ "s1" });
+    reg.Register(live, keys);
+    {
+        auto dead = std::make_shared<CountingWaiter>();
+        reg.Register(dead, keys);
+    }
+
+    reg.NotifyAppended("s1");
+    reg.NotifyAppended("s1");
+    CHECK(live->wakes == 2);
+}
+
+TEST_CASE("StreamWaiterRegistry: Unregister leaves another waiter on the same key", "[protocol][stream]")
+{
+    StreamWaiterRegistry reg;
+    auto leaving = std::make_shared<CountingWaiter>();
+    auto staying = std::make_shared<CountingWaiter>();
+    auto const shared = Keys({ "s1" });
+    auto const solo = Keys({ "s2" });
+    reg.Register(leaving, shared);
+    reg.Register(leaving, solo);
+    reg.Register(staying, shared);
+
+    reg.Unregister(leaving.get());
+    reg.NotifyAppended("s1");
+    reg.NotifyAppended("s2");
+    CHECK(leaving->wakes == 0);
+    CHECK(staying->wakes == 1);
+}

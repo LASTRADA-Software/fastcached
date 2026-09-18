@@ -395,9 +395,14 @@ namespace
         auto const step = std::max<std::size_t>(1, buckets.size() / Wanted);
         auto const dated = TicksNeedADate(buckets, step);
 
+        // Walked by tick, `step` buckets apart and starting at the first: as many as fit, which
+        // is the size rounded up by `step`. `step` is at least one, so the division is defined,
+        // and `+ step - 1` cannot overflow a count of buckets held in memory.
+        auto const ticks = (buckets.size() + step - 1) / step;
         std::string out;
-        for (std::size_t index = 0; index < buckets.size(); index += step)
+        for (auto const tick: std::views::iota(std::size_t { 0 }, ticks))
         {
+            auto const index = tick * step;
             auto const civil = CivilFromMillis(buckets[index].startMillis);
             auto const label = dated ? std::format("{:02}-{:02}", civil.month, civil.day)
                                      : std::format("{:02}:{:02}", civil.hour, civil.minute);

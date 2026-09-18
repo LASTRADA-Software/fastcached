@@ -242,6 +242,66 @@ set(dashboardPanelFile
 }
 ")
 
+# #1452's rows over C linked lists: `getaddrinfo`'s result in three files, and the two lists
+# `LocalAddresses.cpp` walks -- `GetAdaptersAddresses`' adapters and their unicast addresses,
+# and `getifaddrs`' interfaces. Each file carries only its exempted sites, as many as the real one.
+set(healthProbeFile
+"bool Probe(addrinfo* results)
+{
+    for (addrinfo const* it = results; it != nullptr; it = it->ai_next)
+        if (Connect(it))
+            return true;
+    return false;
+}
+")
+set(socketAddressFile
+"void Resolve(addrinfo* head)
+{
+    for (addrinfo const* ai = head; ai != nullptr; ai = ai->ai_next)
+        Keep(ai);
+}
+")
+set(udpSocketFile
+"void Bind(addrinfo* resolved)
+{
+    for (auto const* candidate = resolved; candidate != nullptr; candidate = candidate->ai_next)
+        Try(candidate);
+}
+")
+set(localAddressesFile
+"void Windows(IP_ADAPTER_ADDRESSES const* head)
+{
+    for (auto const* adapter = head; adapter != nullptr; adapter = adapter->Next)
+        for (auto const* unicast = adapter->FirstUnicastAddress; unicast != nullptr; unicast = unicast->Next)
+            Append(unicast);
+}
+void Posix(ifaddrs const* head)
+{
+    for (auto const* entry = head; entry != nullptr; entry = entry->ifa_next)
+        Append(entry);
+}
+")
+
+# #1452's two error-code directory walks, the shape `ToolchainProbe.cpp`'s row already carries.
+set(scratchClaimFile
+"bool EmptyDirectory(std::filesystem::path const& root, std::error_code& ec)
+{
+    for (auto iterator = std::filesystem::directory_iterator { root, ec };
+         !ec && iterator != std::filesystem::directory_iterator {};
+         iterator.increment(ec))
+        Remove(*iterator);
+    return true;
+}
+")
+set(daemonMainFile
+"void Shards(std::filesystem::directory_iterator entry, std::error_code& ec)
+{
+    auto const end = std::filesystem::directory_iterator {};
+    for (; !ec && entry != end; entry.increment(ec))
+        Keep(*entry);
+}
+")
+
 # ---------------------------------------------------------------------------
 # Stage a tree, apply one mutation, run the check, return its collapsed output.
 function(fastcached_stage_and_run name target from to backlog outOutput outApplied)
@@ -288,10 +348,17 @@ function(fastcached_stage_and_run name target from to backlog outOutput outAppli
         "src/apps/fastcache-cc/ParallelFor.cpp"
         "src/apps/fastcache-compile-node/NodeToolchains.cpp"
         "src/FastCache/Cli/UsageDoc.cpp"
-        "src/apps/fastcache-cli/DashboardPanel.cpp")
+        "src/apps/fastcache-cli/DashboardPanel.cpp"
+        "src/FastCache/Net/HealthProbe.cpp"
+        "src/FastCache/Net/SocketAddress.cpp"
+        "src/FastCache/Net/UdpSocket.cpp"
+        "src/FastCache/Platform/LocalAddresses.cpp"
+        "src/apps/fastcache-compile-node/ScratchClaim.cpp"
+        "src/apps/fastcached/main.cpp")
     set(texts cleanFile helperHeader canaryFile liveFile probeFile runnerFile cliCommandFile
               socketExchangeFile nodeAnnounceFile parallelForFile nodeToolchainsFile
-              usageDocFile dashboardPanelFile)
+              usageDocFile dashboardPanelFile healthProbeFile socketAddressFile udpSocketFile
+              localAddressesFile scratchClaimFile daemonMainFile)
     list(LENGTH files stagedCount)
     math(EXPR lastStaged "${stagedCount} - 1")
     foreach(index RANGE 0 ${lastStaged})
@@ -402,12 +469,12 @@ endfunction()
 set(FastCachedTestLoopCases
     # The baseline, in both enumeration modes. Every refusal below is evidence only if
     # these pass -- and they pass only while every exemption row still matches its site.
-    "baseline via walk|none|-|-|no new C-style loop && directory walk (no git index) && 18 exempted site(s) in 12 row(s)|CMake Error|-"
+    "baseline via walk|none|-|-|no new C-style loop && directory walk (no git index) && 26 exempted site(s) in 20 row(s) && backlog: empty|CMake Error|-"
     "baseline via git|none-git|-|-|no new C-style loop && git ls-files|CMake Error|-"
     # A tree inside another checkout is walked, not read from that checkout's index, which
     # knows none of it. Asking "inside a work tree" instead of "at its top" refused every
     # case when ctest staged them under the gate's build directory.
-    "baseline nested in another checkout|none-nested|-|-|no new C-style loop && directory walk (no git index) && 18 exempted site(s) in 12 row(s)|CMake Error|-"
+    "baseline nested in another checkout|none-nested|-|-|no new C-style loop && directory walk (no git index) && 26 exempted site(s) in 20 row(s) && backlog: empty|CMake Error|-"
     "a counting loop nested in another checkout|newfile-nested|src/FastCache/Core/Fresh_test.cpp|int F()~n~{~n~    for (int i = 0~sc~ i < 3~sc~ ++i)~n~        Use(i)~sc~~n~}~n~|src/FastCache/Core/Fresh_test.cpp:3: a C-style for loop && directory walk (no git index)|-|-"
 
     # THE RED ARM.
@@ -457,6 +524,9 @@ set(FastCachedTestLoopCases
     "the exempted text in another file is not exempt|newfile|src/FastCache/Core/Copy_test.cpp|void Beat(std::atomic<bool>* stopping)~n~{~n~    while (!stopping->load(std::memory_order_acquire))~n~        Sleep()~sc~~n~}~n~|src/FastCache/Core/Copy_test.cpp:3: a while loop polling an atomic|-|-"
     "a second site in an exempted file needs its own row|file3|Sleep()~sc~ }|Sleep()~sc~ }~n~void Other(std::atomic<bool>& ready) { while (!ready.load()) Sleep()~sc~ }|src/FastCache/Protocol/LiveStreamReactors_test.cpp:2: a while loop polling an atomic|-|-"
     "an exemption whose site is gone is STALE|file3|while (!stopping->load(std::memory_order_acquire)) Sleep()~sc~|BeatUntilStopped()~sc~|matching no site && stopping->load( && STALE|-|-"
+    # The same refusal for a PRODUCTION row under the `loop` rule -- the kind #1452 added eight
+    # of. A converted site whose row stays behind would exempt the next loop of that text.
+    "a production exemption whose site is gone is STALE|file4|for (~sc~ it != end~sc~ it.increment(ec))|while (it != end)|matching no site && loop: src/apps/fastcache-cc/ToolchainProbe.cpp: it != end && STALE|-|-"
 
     # --- fails CLOSED ---
     "a scope row that matches nothing|noheader|-|-|matched no file && src/tests/*.hpp|-|-"
@@ -467,7 +537,8 @@ set(FastCachedTestLoopCases
     # production source was in no scope row at all, so every one of these passed vacuously.
     "a production loop with no backlog row|newfile|src/FastCache/Core/Prod.cpp|void F()~n~{~n~    for (int i = 0~sc~ i < 3~sc~ ++i)~n~        Use(i)~sc~~n~}~n~|src/FastCache/Core/Prod.cpp:3: a C-style for loop && A site nobody has decided about yet belongs in FastCachedTestLoopBacklog|-|-"
     # The ACCEPTING direction. A ratchet that refused its own rows would look like a working
-    # one on any tree that still has sites, which is every tree until #1452 closes.
+    # one on any tree that still has sites -- and the shipped backlog is EMPTY since #1452, so
+    # this case is now the only thing that exercises a row being honoured at all.
     "a production loop its backlog row records|newfile|src/FastCache/Core/Prod.cpp|void F()~n~{~n~    for (int i = 0~sc~ i < 3~sc~ ++i)~n~        Use(i)~sc~~n~}~n~|no new C-style loop && backlog: 1 site(s) across 1 file(s) are waiting on #1452|CMake Error|loop~bar~src/FastCache/Core/Prod.cpp~bar~1~bar~#1452"
     # One MORE than the row records: a new site arriving in a file that already has some, which
     # is the likeliest way one arrives at all.

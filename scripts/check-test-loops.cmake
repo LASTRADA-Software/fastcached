@@ -50,7 +50,8 @@
 #     WORKS before it parks, as a heartbeat beats and then sleeps, and a `for` that parks a
 #     fixed number of turns: neither is waiting for something to hold.
 #   * `vendor/` is not scanned: it is another project's code, changed upstream.
-#   * Non-test sources are #1452, whose change adds its row to the scope table below.
+#   * `spin` and `poll` do not reach non-test sources; only `loop` does (#1452), per the scope
+#     table below.
 #   * A token inside a STRING LITERAL reads as code, as in every regex-shaped reader here.
 #
 # ## Its residual, in both directions, so the next surprise is diagnosed rather than exempted
@@ -160,7 +161,8 @@ set(FastCachedTestLoopScope
 # CMake list. Checked below rather than left as a comment nothing reads.
 set(FastCachedTestLoopExemptions
     "loop|src/tests/TsanCanary.cpp|for (|The ThreadSanitizer canary's loops are its race: a change to this file is judged by a RATE over a few hundred runs (scripts/tsan-canary-rate.sh), never by a green run, and rewriting three loops would re-open that measurement for a spelling."
-    "spin|src/FastCache/Protocol/LiveStreamReactors_test.cpp|stopping->load(|Not a wait: a heartbeat coroutine that beats until the case says stop, and whose frame the rig's reactors free when a case ends early."    "loop|src/apps/fastcache-cc/ToolchainProbe.cpp|it != end|A recursive_directory_iterator advanced by the error-code overload. A range-based for calls ++it, which THROWS on an unreadable directory instead of setting ec -- and surviving that to report a PARTIAL walk is this loop's whole purpose, so converting it would be a behaviour regression rather than a modernisation."
+    "spin|src/FastCache/Protocol/LiveStreamReactors_test.cpp|stopping->load(|Not a wait: a heartbeat coroutine that beats until the case says stop, and whose frame the rig's reactors free when a case ends early."
+    "loop|src/apps/fastcache-cc/ToolchainProbe.cpp|it != end|A recursive_directory_iterator advanced by the error-code overload. A range-based for calls ++it, which THROWS on an unreadable directory instead of setting ec -- and surviving that to report a PARTIAL walk is this loop's whole purpose, so converting it would be a behaviour regression rather than a modernisation."
     "loop|src/apps/fastcache-cc/ProcessRunner.cpp|char const* cursor = inherited|GetEnvironmentStringsA returns a double-NUL-terminated block of NUL-separated strings with no size anywhere: the terminator IS the bound, so no range can be formed without first walking the block to find its end."
     "loop|src/apps/fastcache-cc/ProcessRunner.cpp|char** entry = inherited|The POSIX environment array is a NULL-terminated char** with no size. Same reason as the Windows block above, and C++23 has no standard adaptor over a sentinel-terminated C array."
     "loop|src/apps/fastcache-cli/CliCommand.cpp|index < args.size()|The argv walk, and the one option-parser loop of the three #1452 found that does NOT convert. `ApplyOneOption` advances `index` to consume a value, and FIVE `continue` paths -- end-of-options, a refused option while settled, a Stop flow, an operand after the action settled, and a word alias -- advance nothing in the body, so every one of them depends on the head. A `while` therefore needs five duplicated `++index` statements, which is the copy-pasted increment this project forbids elsewhere, or an RAII scope-exit whose only purpose is to satisfy a loop-shape rule. Both are worse than the `for`. Its two clean siblings DID convert in the same change: Cli/Options.hpp ParseOptionsInto has no `continue` at all, and Config/FileOptions.hpp ClearListsNamedOn had one that inverted into an `if`."
@@ -170,6 +172,14 @@ set(FastCachedTestLoopExemptions
     "loop|src/apps/fastcache-compile-node/NodeToolchains.cpp|index = next.fetch_add(1)|The toolchain survey's work-stealing walk, and the same fact as ParallelFor.cpp above: the indices this thread sees are the ones no sibling claimed first. A fingerprint probe spawns a compiler, so the durations are wildly uneven and a fixed slice per thread is measurably worse -- which is why the shape is what it is rather than an oversight."
     "loop|src/FastCache/Cli/UsageDoc.cpp|auto at = out.find(token)|A find-and-replace walk, and it is not merely a scan: the body calls out.replace, so each search runs over a string the previous iteration rewrote. The resume offset is at + value.size() rather than at + token.size() for exactly that reason -- it steps past the REPLACEMENT, so a token whose value contains it does not expand forever. No range over the original text can express a walk whose subject changes underneath it."
     "loop|src/apps/fastcache-cli/DashboardPanel.cpp|at = note.find(DeltaMark)|The same shape as UsageDoc.cpp above, with the mutation on the other side: the body calls note.remove_prefix, so the view being searched shrinks each iteration and the unqualified find always looks from the start of what is left. A range over the original note would walk bytes this loop has already consumed."
+    "loop|src/FastCache/Net/HealthProbe.cpp|addrinfo const* it = results|getaddrinfo answers with a C singly-linked list: no size and no iterator, so the ai_next step in the head IS the sequence and nullptr is its end. C++23 has no standard view over a nullptr-terminated list -- the gap the ProcessRunner.cpp rows above record for the environment -- and the head's step is a constant one, so a `for` states it honestly. A `while` would move it to the foot of a body whose `continue`, taken for a candidate that yields no socket, would then skip it and never end."
+    "loop|src/FastCache/Net/SocketAddress.cpp|addrinfo const* ai = head|The getaddrinfo result list again, walked as HealthProbe.cpp's is and for the same reason: the ai_next step in the head is the only way to the next entry, no standard view walks a nullptr-terminated C list, and the body's `continue` for an address too long for the endpoint storage would skip that step in a `while`."
+    "loop|src/FastCache/Net/UdpSocket.cpp|auto const* candidate = resolved|The getaddrinfo result list, as in HealthProbe.cpp: the ai_next step is the sequence, no standard view walks it, and the body continues past a candidate that yields no socket, which a `while` would turn into a loop that never ends."
+    "loop|src/FastCache/Platform/LocalAddresses.cpp|auto const* adapter = head|GetAdaptersAddresses answers with a C linked list of adapters, each holding a C linked list of unicast addresses: no size and no iterator at either level, so each head's Next step IS the sequence and nullptr its end. No standard view walks a nullptr-terminated list -- the gap the ProcessRunner.cpp rows record -- and a `while` would move a constant step from the head to a foot that the next `continue` anybody writes skips."
+    "loop|src/FastCache/Platform/LocalAddresses.cpp|auto const* unicast = adapter->FirstUnicastAddress|The inner half of the adapter walk the row above describes: one adapter's unicast addresses, the same nullptr-terminated Next list, exempt for the same reason."
+    "loop|src/FastCache/Platform/LocalAddresses.cpp|auto const* entry = head|getifaddrs answers with a C linked list threaded through ifa_next -- the POSIX twin of the adapter walk above, and exempt for the same reason: the head's step is the sequence, and no standard view walks a nullptr-terminated list."
+    "loop|src/apps/fastcache-compile-node/ScratchClaim.cpp|auto iterator = std::filesystem::directory_iterator|A directory_iterator advanced by the error-code overload, as ToolchainProbe.cpp's is and for the same reason: a range-based for calls operator++, which THROWS where increment(ec) sets ec, and emptying a claimed scratch root is exactly where an entry vanishing under the walk must stop it quietly rather than end the node."
+    "loop|src/apps/fastcached/main.cpp|!ec && entry != end|The same error-code directory_iterator walk, over the shard files a migration converts, and the comment above it says why: a range-based for advances through the throwing operator++, so an entry vanishing mid-scan or an unreadable subdirectory would terminate the process instead of reporting that the directory cannot be listed."
 )
 
 # One element of a loop header's clause: an ordinary character, a brace group (a lambda body,
@@ -698,15 +708,25 @@ if(NOT staleRows STREQUAL "")
     set(refused TRUE)
 endif()
 
-# The tally, printed BEFORE any refusal and on every run. This is not decoration: 148 undecided
-# rows are allowed at all only because their total is in front of whoever reads this output,
-# which is the argument `RefuseUntriaged` rests on in
-# `.agent/rules/metrics-and-observability.md`. Below the refusal it printed on exactly the runs
-# nobody needed it on.
+# The tally, printed BEFORE any refusal and on every run. This is not decoration: undecided rows
+# are allowed at all only because their total is in front of whoever reads this output, which is
+# the argument `RefuseUntriaged` rests on in `.agent/rules/metrics-and-observability.md`. Below
+# the refusal it printed on exactly the runs nobody needed it on.
 #
 # Derived from the ROWS, which are the claim. What the scan observed is equal to it on any run
 # that passes, and on one that does not the refusal above names every file that disagrees and by
 # how much -- so a second accumulator for the same fact would be a second source of truth.
+#
+# An EMPTY backlog says so rather than printing no tally at all: a line that simply stops
+# appearing reads the same as a tally that stopped being computed, and only one of those is
+# news. #1452 emptied it, so this is the line the shipped tree prints.
+#
+# Quoted, because an unquoted operand naming an UNSET variable is read as its own name, which
+# is never empty -- and whether `list(REMOVE_DUPLICATES)` leaves an empty list set or unset is
+# not something this line should depend on.
+if("${backlogIssues}" STREQUAL "")
+    message(STATUS "test-loops: backlog: empty -- no loop is waiting on any issue")
+endif()
 foreach(issue IN LISTS backlogIssues)
     set(issueSites 0)
     set(issueFiles 0)

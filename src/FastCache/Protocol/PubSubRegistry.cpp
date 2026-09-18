@@ -216,17 +216,16 @@ void PubSubRegistry::UnsubscribeAll(ISubscriber* sub)
 {
     std::scoped_lock const lock { _mu };
     std::size_t removed = 0;
-    // Erase the subscriber from every channel/pattern; drop now-empty buckets.
-    for (auto it = _channels.begin(); it != _channels.end();)
-    {
-        removed += it->second.erase(sub);
-        it = it->second.empty() ? _channels.erase(it) : std::next(it);
-    }
-    for (auto it = _patterns.begin(); it != _patterns.end();)
-    {
-        removed += it->second.erase(sub);
-        it = it->second.empty() ? _patterns.erase(it) : std::next(it);
-    }
+    // Erase the subscriber from every channel/pattern; drop now-empty buckets. `std::erase_if`
+    // is SPECIFIED as the erase-while-walking loop this replaced -- each bucket visited once, in
+    // order, erased when the predicate answers true -- so the predicate may do the removal
+    // itself and answer whether that left the bucket empty. One removal serves both maps.
+    auto const dropSubscriber = [&removed, sub](auto& bucket) {
+        removed += bucket.second.erase(sub);
+        return bucket.second.empty();
+    };
+    std::erase_if(_channels, dropSubscriber);
+    std::erase_if(_patterns, dropSubscriber);
     if (removed > 0)
         _entryCount.fetch_sub(removed, std::memory_order_release);
 }

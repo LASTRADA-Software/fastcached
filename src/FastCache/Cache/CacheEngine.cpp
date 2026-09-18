@@ -7,8 +7,10 @@
 #include <chrono>
 #include <cstdint>
 #include <functional>
+#include <iterator>
 #include <limits>
 #include <optional>
+#include <ranges>
 #include <span>
 #include <string>
 #include <unordered_set>
@@ -603,6 +605,25 @@ namespace
         return static_cast<std::int64_t>(before - stream.entries.size());
     }
 
+    /// The first @p count of @p entries, or every one of them when @p count is zero: a stream
+    /// verb's COUNT, read in one place so XRANGE, XREVRANGE and XREADGROUP agree about it.
+    ///
+    /// Each verb used to bound its walk on `out.size() < count`, which is this exactly because
+    /// its `out` starts empty and gains one entry per step. Clamped to what is there before it
+    /// becomes a `take`, because a client may send any COUNT up to `UINT64_MAX` and a length
+    /// past `PTRDIFF_MAX` would be a negative one, which the view does not allow.
+    /// @param entries The candidates, in the order they are delivered.
+    /// @param count   The verb's COUNT, zero meaning no limit.
+    /// @return A view of at most @p count of them, from the front.
+    template <std::ranges::sized_range Entries>
+    [[nodiscard]] auto FirstCount(Entries&& entries, std::size_t count)
+    {
+        auto const available = static_cast<std::size_t>(std::ranges::size(entries));
+        auto const taken = count == 0 ? available : std::min(count, available);
+        return std::forward<Entries>(entries)
+               | std::views::take(static_cast<std::ranges::range_difference_t<Entries>>(taken));
+    }
+
 } // namespace
 
 std::uint64_t CacheEngine::WallNowMs() const noexcept
@@ -706,12 +727,11 @@ std::expected<std::vector<StreamEntry>, StorageError> CacheEngine::StreamRange(
             return out;
         auto const lo = std::ranges::lower_bound(stream->entries, start, {}, &StreamEntry::id);
         auto const hi = std::ranges::upper_bound(stream->entries, end, {}, &StreamEntry::id);
+        auto const matched = std::ranges::subrange { lo, hi };
         if (!reverse)
-            for (auto it = lo; it != hi && (count == 0 || out.size() < count); ++it)
-                out.push_back(*it);
+            std::ranges::copy(FirstCount(matched, count), std::back_inserter(out));
         else
-            for (auto it = hi; it != lo && (count == 0 || out.size() < count);)
-                out.push_back(*--it);
+            std::ranges::copy(FirstCount(matched | std::views::reverse, count), std::back_inserter(out));
         return out;
     });
 }
@@ -990,14 +1010,14 @@ std::expected<std::vector<StreamEntry>, StorageError> CacheEngine::StreamReadGro
             // `>`: deliver new entries after the group cursor, recording them in
             // the PEL (unless NOACK) and advancing the cursor.
             auto const lo = std::ranges::upper_bound(stream.entries, g->lastDelivered, {}, &StreamEntry::id);
-            for (auto it = lo; it != stream.entries.end() && (count == 0 || out.size() < count); ++it)
+            for (auto const& entry: FirstCount(std::ranges::subrange { lo, stream.entries.end() }, count))
             {
-                out.push_back(*it);
-                g->lastDelivered = it->id;
+                out.push_back(entry);
+                g->lastDelivered = entry.id;
                 ++g->entriesRead;
                 if (!noAck)
                     g->pel.push_back(PendingEntry {
-                        .id = it->id, .consumer = std::string { consumer }, .deliveryTimeMs = nowMs, .deliveryCount = 1 });
+                        .id = entry.id, .consumer = std::string { consumer }, .deliveryTimeMs = nowMs, .deliveryCount = 1 });
             }
             if (out.empty())
                 return consumerCreated ? PersistStream(stream)

@@ -42,32 +42,10 @@
 # marker in this file would read as enforcement that nothing performs -- and the figures it
 # would state are DERIVED by the check on every run and printed there, which is the one place
 # they cannot drift from the rows.
-
-loop|src/CowTree/CowTree/Crc32c.cpp|2|#1452
-loop|src/CowTree/CowTree/FilePageStore.cpp|1|#1452
-loop|src/FastCache/Cache/CacheEngine.cpp|3|#1452
-loop|src/FastCache/Cli/UsageTestUtils.hpp|1|#1452
-loop|src/FastCache/Cluster/ClusterState.cpp|2|#1452
-loop|src/FastCache/CompileCache/PathCanon.cpp|2|#1452
-loop|src/FastCache/Config/DefaultConfigPath.cpp|1|#1452
-loop|src/FastCache/Config/EnvExpand.cpp|1|#1452
-loop|src/FastCache/Consensus/FileRaftStorage.cpp|1|#1452
-loop|src/FastCache/Core/Base64.cpp|3|#1452
-loop|src/FastCache/Distributed/FleetChart.cpp|1|#1452
-loop|src/FastCache/Distributed/FleetHistory.cpp|1|#1452
-loop|src/FastCache/Net/EpollSocket.cpp|1|#1452
-loop|src/FastCache/Net/HealthProbe.cpp|1|#1452
-loop|src/FastCache/Net/IocpSocket.cpp|1|#1452
-loop|src/FastCache/Net/KqueueSocket.cpp|1|#1452
-loop|src/FastCache/Net/SocketAddress.cpp|1|#1452
-loop|src/FastCache/Net/UdpSocket.cpp|1|#1452
-loop|src/FastCache/Platform/LocalAddresses.cpp|3|#1452
-loop|src/FastCache/Protocol/PubSubRegistry.cpp|2|#1452
-loop|src/FastCache/Protocol/RedisResp.cpp|9|#1452
-loop|src/FastCache/Protocol/RedisTransaction.cpp|1|#1452
-loop|src/FastCache/Protocol/StreamWaiterRegistry.cpp|2|#1452
-loop|src/FastCache/Server/AdminHttpServer.cpp|1|#1452
-loop|src/apps/fastcache-cc/DirectManifest.cpp|3|#1452
-loop|src/apps/fastcache-compile-node/FrameEndpoint.cpp|1|#1452
-loop|src/apps/fastcache-compile-node/ScratchClaim.cpp|1|#1452
-loop|src/apps/fastcached/main.cpp|1|#1452
+#
+# EMPTY, and deliberately so: #1452 decided every production site this file held -- each one
+# converted, or moved to `FastCachedTestLoopExemptions` with the reason it stays. The check says
+# so on every run (`backlog: empty`) rather than printing nothing, because a tally that simply
+# stops appearing reads the same as one that stopped being computed. A NEW site is converted or
+# exempted, never added here: a row comes back only when the scan's SCOPE widens over sites
+# nobody has decided about, naming the issue that will -- and the ratchet above applies unchanged.

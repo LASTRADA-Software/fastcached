@@ -555,7 +555,13 @@ namespace
             raw.clear();
         };
 
-        for (std::size_t i = 0; i < text.size(); ++i)
+        // A `while` with ONE step at its foot, each arm an `else` of the one before rather than
+        // a `continue`: an escape pair consumes its second character with a `++i` of its own,
+        // so a counting `for` head would advertise a step this walk does not take -- and in a
+        // range-for that `++i` would advance a COPY and read the escaped character as data,
+        // which on this path is a wrong cache key rather than a crash.
+        auto i = std::size_t { 0 };
+        while (i < text.size())
         {
             char const c = text[i];
 
@@ -566,14 +572,12 @@ namespace
                 token.push_back(text[i + 1]);
                 raw.push_back(c);
                 raw.push_back(text[i + 1]);
-                ++i;
-                continue;
+                ++i; // the escaped character, consumed
             }
-
             // A backslash immediately before a newline is a line continuation and
             // ends the token; anywhere else it is a Windows path separator and
             // belongs to the path ("D:\src\a.cpp" is ONE token, not three).
-            if (c == '\\')
+            else if (c == '\\')
             {
                 bool const continuation =
                     i + 1 < text.size()
@@ -582,21 +586,19 @@ namespace
                 {
                     flush();
                     out.push_back(c);
-                    continue;
                 }
-                token.push_back(c);
-                raw.push_back(c);
-                continue;
+                else
+                {
+                    token.push_back(c);
+                    raw.push_back(c);
+                }
             }
-
             // Any separator ends the current token and is copied verbatim.
-            if (c == ' ' || c == '\t' || c == '\n' || c == '\r')
+            else if (c == ' ' || c == '\t' || c == '\n' || c == '\r')
             {
                 flush();
                 out.push_back(c);
-                continue;
             }
-
             // A ':' separates target from dependencies — unless it is a Windows
             // drive letter, which is part of the path itself ("C:\src\a.cpp").
             //
@@ -605,15 +607,17 @@ namespace
             // is where a rule ends, and a drive-relative "C:foo" is still one
             // token — splitting it would hand the transform two fragments, neither
             // of which is a path.
-            if (c == ':' && !(token.size() == 1 && IsDriveLetter(token.front())))
+            else if (c == ':' && !(token.size() == 1 && IsDriveLetter(token.front())))
             {
                 flush();
                 out.push_back(c);
-                continue;
             }
-
-            token.push_back(c);
-            raw.push_back(c);
+            else
+            {
+                token.push_back(c);
+                raw.push_back(c);
+            }
+            ++i;
         }
         flush();
         return out;
@@ -788,9 +792,12 @@ std::string RewriteIncludeNoteMarker(std::string_view text, std::string_view fro
     if (from.empty() || from == to)
         return std::string { text };
 
+    // A `find` walk, one line per pass: the only advance is `offset = past` at the top of the
+    // body, so every `continue` below has already taken it.
     std::string out;
     out.reserve(text.size());
-    for (std::size_t offset = 0; offset < text.size();)
+    auto offset = std::size_t { 0 };
+    while (offset < text.size())
     {
         auto const newline = text.find('\n', offset);
         auto const past = newline == std::string_view::npos ? text.size() : newline + 1;

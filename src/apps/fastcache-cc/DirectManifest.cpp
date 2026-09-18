@@ -485,24 +485,31 @@ namespace
         // several lines reads as one rule. Real depfiles wrap aggressively — gcc
         // breaks at ~76 columns — so a parser that ignored this would see only the
         // first handful of headers.
+        //
+        // The three walks below are `while`s, each with ONE step at its foot and its arms
+        // `else`s of each other rather than `continue`s: a continuation or an escape consumes
+        // what follows it with an advance of its own, so a counting `for` head would advertise
+        // a step these walks do not take -- and in a range-for that advance would move a COPY,
+        // which here mis-splits a dependency path on `\ ` and is a wrong cache key.
         std::string spliced;
         spliced.reserve(depFileText.size());
-        for (std::size_t i = 0; i < depFileText.size(); ++i)
+        auto at = std::size_t { 0 };
+        while (at < depFileText.size())
         {
-            if (depFileText[i] == '\\' && i + 1 < depFileText.size() && depFileText[i + 1] == '\n')
+            if (depFileText[at] == '\\' && at + 1 < depFileText.size() && depFileText[at + 1] == '\n')
             {
                 spliced.push_back(' ');
-                ++i;
-                continue;
+                ++at; // the newline, consumed
             }
-            if (depFileText[i] == '\\' && i + 2 < depFileText.size() && depFileText[i + 1] == '\r'
-                && depFileText[i + 2] == '\n')
+            else if (depFileText[at] == '\\' && at + 2 < depFileText.size() && depFileText[at + 1] == '\r'
+                     && depFileText[at + 2] == '\n')
             {
                 spliced.push_back(' ');
-                i += 2;
-                continue;
+                at += 2; // the CRLF, consumed
             }
-            spliced.push_back(depFileText[i]);
+            else
+                spliced.push_back(depFileText[at]);
+            ++at;
         }
 
         // Walk each rule: everything before the unescaped ':' is a target (an output,
@@ -516,25 +523,25 @@ namespace
             // Find the rule separator, skipping ':' that is escaped or part of a
             // Windows drive letter ("C:\..." must not read as a target boundary).
             std::size_t colon = std::string_view::npos;
-            for (std::size_t i = 0; i < line.size(); ++i)
+            auto scan = std::size_t { 0 };
+            while (scan < line.size())
             {
-                if (line[i] == '\\')
+                if (line[scan] == '\\')
+                    ++scan; // skip the escaped character
+                else if (line[scan] == ':')
                 {
-                    ++i; // skip the escaped character
-                    continue;
+                    // The letter rule is PathCanon's, so all four drive tests share one
+                    // definition; what follows the colon is deliberately not asked, because
+                    // the question here is where a rule ends and a drive-relative "C:foo"
+                    // is still one token.
+                    bool const driveLetter = scan == 1 && PathCanon::IsDriveLetter(line[0]);
+                    if (!driveLetter)
+                    {
+                        colon = scan;
+                        break;
+                    }
                 }
-                if (line[i] != ':')
-                    continue;
-                // The letter rule is PathCanon's, so all four drive tests share one
-                // definition; what follows the colon is deliberately not asked, because
-                // the question here is where a rule ends and a drive-relative "C:foo"
-                // is still one token.
-                bool const driveLetter = i == 1 && PathCanon::IsDriveLetter(line[0]);
-                if (!driveLetter)
-                {
-                    colon = i;
-                    break;
-                }
+                ++scan;
             }
             if (colon == std::string_view::npos)
                 continue; // not a rule line (blank, or a stray continuation remnant)
@@ -559,21 +566,21 @@ namespace
                     paths.push_back(current);
                 current.clear();
             };
-            for (std::size_t i = 0; i < span.size(); ++i)
+            auto pos = std::size_t { 0 };
+            while (pos < span.size())
             {
-                char const c = span[i];
-                if (c == '\\' && i + 1 < span.size() && (span[i + 1] == ' ' || span[i + 1] == '\\' || span[i + 1] == ':'))
+                char const c = span[pos];
+                if (c == '\\' && pos + 1 < span.size()
+                    && (span[pos + 1] == ' ' || span[pos + 1] == '\\' || span[pos + 1] == ':'))
                 {
-                    current.push_back(span[i + 1]);
-                    ++i;
-                    continue;
+                    current.push_back(span[pos + 1]);
+                    ++pos; // the escaped character, consumed
                 }
-                if (c == ' ' || c == '\t')
-                {
+                else if (c == ' ' || c == '\t')
                     flush();
-                    continue;
-                }
-                current.push_back(c);
+                else
+                    current.push_back(c);
+                ++pos;
             }
             flush();
         }

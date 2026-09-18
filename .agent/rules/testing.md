@@ -1095,13 +1095,16 @@ part of the guard**, so a rule whose remedy does not exist for the files it refu
 stricter rule, it is a broken one. The `rules` column of `FastCachedTestLoopScope` says which,
 and a rule no scope row names is refused rather than left enumerated by nothing.
 
-**The 148 sites the widening found are a RATCHET, and a backlog row is a different CLAIM from an
+**The 148 sites the widening found were a RATCHET, and a backlog row is a different CLAIM from an
 exemption row.** An exemption says *this site is right and must stay, here is why*. A row in
-`scripts/check-test-loops-backlog.txt` says *nobody has decided about this yet, and #1452 will* --
-the `RefuseUntriaged` distinction from
+`scripts/check-test-loops-backlog.txt` says *nobody has decided about this yet, and the issue it
+names will* -- the `RefuseUntriaged` distinction from
 [`.agent/rules/metrics-and-observability.md`](metrics-and-observability.md), and safe for the
 same single reason: the check TALLIES them and prints the total per issue on every run. Spelling
-them as exemptions would put 148 sites behind a word that means *decided*.
+them as exemptions would have put 148 sites behind a word that means *decided*. #1452 decided all
+of them and left the backlog EMPTY, which the check says in so many words (`backlog: empty`)
+rather than by printing no tally -- a line that stops appearing reads the same as one that
+stopped being computed.
 
 It turns one way. A file with MORE sites than its row records is a new site and is refused, and
 the answer is to convert it rather than raise the number; FEWER is a row that has stopped
@@ -2534,25 +2537,6 @@ green Linux run is not evidence about it.
 
 ## Open work
 
-- **[#1452](https://github.com/LASTRADA-Software/fastcached/issues/1452)** — the C-style `for`
-  loops in production sources are recorded in `scripts/check-test-loops-backlog.txt` and not yet
-  converted. **The count lives in that file and is deliberately not restated here**: this entry
-  carried `148` while the backlog said `134`, and a batch has moved it since — a number beside a
-  table it does not derive from is a second source of truth, and this one had already drifted
-  before anybody used it. `ctest -R test-loops` prints the live figure on every run.
-
-  The scan that refuses NEW ones is in place and green, so what is open is the conversion, one
-  file at a time, each taking its row down in the same change. A site that must stay moves from
-  the backlog to `FastCachedTestLoopExemptions` with a reason — the two tables make different
-  claims. A range adaptor on a hot path in `Net/`, `Async/` or `Server/` is measured rather than
-  assumed.
-
-  **Classify by the BODY.** Roughly four in ten sites are not convertible on head shape, and the
-  four shapes that are not — a body that advances the variable, a callee that advances it through
-  `std::size_t&`, an inclusive bound, a compound bound — are enumerated with their file:line in
-  [`.agent/rules/build-and-toolchain.md`](build-and-toolchain.md). Read that before a batch: the
-  three worst are value-consuming option parsers where a conversion breaks every `--key value`
-  flag, and two more sit on the cache-key path where it produces a wrong key rather than a crash.
 - **[#1152](https://github.com/LASTRADA-Software/fastcached/issues/1152)** — ctest
   cannot be told about a Catch2 skip through any property `catch_discover_tests`
   offers, so `SKIP_RETURN_CODE 4` stays and a four-failure case is still scored

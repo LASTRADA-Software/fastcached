@@ -176,9 +176,17 @@ namespace
                                                         std::int64_t windowStart,
                                                         std::int64_t windowEnd)
     {
+        // Walked by sub-bucket: `windowStart`, then every `subWidthMillis` after it while still
+        // inside the window -- the window's span rounded up by the sub-width, and none at all
+        // for an empty or inverted window. The sub-width is a ring's bucket from
+        // `FleetRingTable`, a positive duration, and the span is one view bucket, so the
+        // rounding can neither divide by zero nor overflow.
+        auto const span = windowEnd - windowStart;
+        auto const steps = span <= 0 ? std::int64_t { 0 } : (span + subWidthMillis - 1) / subWidthMillis;
         std::optional<FleetBucket> out;
-        for (auto start = windowStart; start < windowEnd; start += subWidthMillis)
+        for (auto const step: std::views::iota(std::int64_t { 0 }, steps))
         {
+            auto const start = windowStart + (step * subWidthMillis);
             auto const number = start / subWidthMillis;
             auto const& slot = ring[static_cast<std::size_t>(number) % ring.size()];
             if (!slot.present || slot.startMillis != start)

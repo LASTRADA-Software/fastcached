@@ -179,3 +179,30 @@ TEST_CASE("PubSubRegistry: HasAnySubscribers reflects live entry count lock-free
     registry.UnsubscribeAll(sub.get());
     REQUIRE_FALSE(registry.HasAnySubscribers());
 }
+
+TEST_CASE("PubSubRegistry: UnsubscribeAll keeps a channel or pattern another subscriber still holds", "[pubsub]")
+{
+    // A bucket goes only once it is EMPTY: `leaving` must take `solo` with it and leave `a`
+    // and `p.*` to `staying` -- and must take exactly its own three entries off the count, so
+    // the lock-free check reads true until `staying` leaves too, and false after.
+    PubSubRegistry registry;
+    auto leaving = std::make_shared<RecordingSubscriber>();
+    auto staying = std::make_shared<RecordingSubscriber>();
+    CHECK(registry.Subscribe(leaving, "a") == 1);
+    CHECK(registry.Subscribe(leaving, "solo") == 2);
+    CHECK(registry.PSubscribe(leaving, "p.*") == 3);
+    CHECK(registry.Subscribe(staying, "a") == 1);
+    CHECK(registry.PSubscribe(staying, "p.*") == 2);
+
+    registry.UnsubscribeAll(leaving.get());
+    CHECK(registry.Publish("a", "x") == 1);
+    CHECK(registry.Publish("p.q", "y") == 1);
+    CHECK(registry.Publish("solo", "z") == 0);
+    CHECK(registry.SnapshotChannels(leaving.get()).empty());
+    CHECK(registry.SnapshotPatterns(leaving.get()).empty());
+    CHECK(registry.HasAnySubscribers());
+
+    registry.UnsubscribeAll(staying.get());
+    CHECK(registry.Publish("a", "x") == 0);
+    CHECK_FALSE(registry.HasAnySubscribers());
+}

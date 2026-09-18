@@ -21,6 +21,7 @@
     #include <cstring>
     #include <expected>
     #include <memory>
+    #include <ranges>
     #include <span>
     #include <string>
     #include <string_view>
@@ -124,8 +125,15 @@ namespace
         {
             std::array<iovec, MaxIovBatch> iov {};
             std::size_t count = 0;
-            for (auto i = segIndex; i < segments.size() && count < MaxIovBatch; ++i)
+            // The segments from the cursor on are the range; a FULL BATCH is a `break`, asked
+            // where the head used to ask it -- before each segment -- because it is a budget on
+            // iovec slots rather than a bound on the index: an empty segment takes none.
+            // `segIndex < segments.size()` is the enclosing loop's condition, so the range is
+            // never inverted.
+            for (auto const i: std::views::iota(segIndex, segments.size()))
             {
+                if (count == MaxIovBatch)
+                    break;
                 auto const seg = segments[i];
                 auto const skip = (i == segIndex) ? segOffset : std::size_t { 0 };
                 // A zero-length segment carries no bytes; skip it so it never

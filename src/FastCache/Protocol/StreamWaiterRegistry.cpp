@@ -26,15 +26,13 @@ void StreamWaiterRegistry::Unregister(IStreamWaiter const* waiter)
 {
     std::scoped_lock const lock { _mu };
     // Drop the waiter from every key set, pruning any set it empties so the map
-    // does not accumulate dead keys under churn.
-    for (auto it = _keys.begin(); it != _keys.end();)
-    {
-        it->second.erase(waiter);
-        if (it->second.empty())
-            it = _keys.erase(it);
-        else
-            ++it;
-    }
+    // does not accumulate dead keys under churn. `std::erase_if` is specified as
+    // the erase-while-walking loop this replaced, so the predicate may do the
+    // removal and answer whether it left the set empty.
+    std::erase_if(_keys, [waiter](auto& waiters) {
+        waiters.second.erase(waiter);
+        return waiters.second.empty();
+    });
 }
 
 void StreamWaiterRegistry::NotifyAppended(std::string_view key)
@@ -46,17 +44,16 @@ void StreamWaiterRegistry::NotifyAppended(std::string_view key)
         if (it == _keys.end())
             return;
         // Snapshot-and-upgrade: pin each waiter for the Wake() below, which runs
-        // outside the lock. Drop entries whose owner has already disconnected.
-        for (auto entry = it->second.begin(); entry != it->second.end();)
-        {
-            if (auto strong = entry->second.lock())
-            {
-                wake.push_back(std::move(strong));
-                ++entry;
-            }
-            else
-                entry = it->second.erase(entry);
-        }
+        // outside the lock. Drop entries whose owner has already disconnected:
+        // `std::erase_if` visits each entry once, in order, and erases exactly
+        // the ones whose upgrade failed.
+        std::erase_if(it->second, [&wake](auto& entry) {
+            auto strong = entry.second.lock();
+            if (strong == nullptr)
+                return true;
+            wake.push_back(std::move(strong));
+            return false;
+        });
         if (it->second.empty())
             _keys.erase(it);
     }

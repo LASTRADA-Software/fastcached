@@ -1457,6 +1457,24 @@ TEST_CASE("ParseDepFileTargets reaches a target on a continued line")
     CHECK(ParseDepFilePaths(depFile).size() == 2);
 }
 
+TEST_CASE("ParseDepFile consumes each escape and continuation exactly once on both sides")
+{
+    // Every walk here consumes what follows a backslash with an advance of its own, and the
+    // character consumed must be neither dropped nor read a second time as data. One rule
+    // exercises each: an escaped space and an escaped COLON in the target (the second must not
+    // end the rule), a Windows separator that is NOT an escape, an escaped backslash, a CRLF
+    // continuation, an escaped colon in a dependency and a drive-relative path.
+    constexpr std::string_view depFile = "a\\ b\\:c.o: C:\\s\\x.cpp d\\\\e.h \\\r\n"
+                                         "  f\\:g.h C:h.h\n";
+
+    auto const targets = ParseDepFileTargets(depFile);
+    REQUIRE(targets.size() == 1);
+    CHECK(targets[0] == "a b:c.o");
+
+    auto const deps = ParseDepFilePaths(depFile);
+    CHECK(deps == std::vector<std::string> { R"(C:\s\x.cpp)", R"(d\e.h)", "f:g.h", "C:h.h" });
+}
+
 TEST_CASE("ParseDepFilePaths reads the dependencies of a simple rule")
 {
     // The target (before the colon) is an OUTPUT, not a dependency: listing it

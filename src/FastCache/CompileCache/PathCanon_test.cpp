@@ -730,6 +730,25 @@ TEST_CASE("RewritePaths reaches every token of a depfile, target included")
              "  C:\\Users\\runneradmin\\src\\inc\\h1.h\n");
 }
 
+TEST_CASE("RewritePaths hands a depfile's transform each token with every escape consumed exactly once")
+{
+    // The walker consumes the character after an escaping backslash with an advance of its
+    // own. Dropped, a path loses a character; read twice, an escaped space splits one path
+    // into two and an escaped colon ends a rule early -- each a wrong cache key. So the spans
+    // are asserted, and the identity transform must give back every byte, escapes included.
+    constexpr std::string_view depFile = "a\\ b\\:c.o: C:\\s\\x.cpp d\\\\e.h \\\r\n"
+                                         "  f\\:g.h C:h.h\n";
+    std::vector<std::string> spans;
+    auto const record = [&spans](std::string_view span) {
+        spans.emplace_back(span);
+        return std::string { span };
+    };
+
+    auto const rewritten = PathCanon::RewritePaths(depFile, Grammar::GccDepfile, record);
+    CHECK(rewritten == depFile);
+    CHECK(spans == std::vector<std::string> { "a b:c.o", R"(C:\s\x.cpp)", R"(d\e.h)", "f:g.h", "C:h.h" });
+}
+
 TEST_CASE("RewritePaths lets a transform preserve one span and rewrite its neighbours")
 {
     // The per-span decision is the mechanism the launcher builds its depfile rule

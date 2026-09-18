@@ -41,7 +41,10 @@ std::expected<std::string, ConfigError> ExpandEnvironmentVariables(std::string_v
     std::string out;
     out.reserve(input.size());
 
-    for (std::size_t i = 0; i < input.size();)
+    // A `while`, because every arm below decides how far it consumed -- one character, `$$`,
+    // a braced name or a bare one -- and advances `i` itself. A `for` head would claim a step.
+    auto i = std::size_t { 0 };
+    while (i < input.size())
     {
         if (input[i] != '$')
         {
