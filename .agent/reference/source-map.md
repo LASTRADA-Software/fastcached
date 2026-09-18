@@ -28,7 +28,12 @@ src/FastCache/
                 what that production excludes includes perfectly good UTF-8 -- and it
                 is here rather than beside its first consumer because three targets
                 spell the convention, two of which have no business reaching into
-                Distributed/), Profiling (Tracy wrappers)
+                Distributed/), Profiling (Tracy wrappers), and the crypto seam
+                -- Ed25519 (RFC 8032 signatures), X25519 (RFC 7748 key agreement,
+                refusing the all-zero secret) and Hkdf (RFC 5869, over Sha256's
+                HMAC) -- which is the ONLY first-party code that reaches the
+                vendored Monocypher, so each primitive's traps are decided once,
+                beside its RFC vectors (#178)
   Async/        Task<T>, Cancellation, ResumeOn, SleepUntil,
                 InterruptibleSleepUntil (a bounded wait a stop can interrupt),
                 DeadlineTimer (the same shape with a callback, for a timeout that
