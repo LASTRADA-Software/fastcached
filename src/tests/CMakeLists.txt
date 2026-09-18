@@ -1635,8 +1635,9 @@ set_tests_properties("clang-tidy-version-selftest" PROPERTIES
 
 # A crash the declared clang-tidy build is KNOWN to have is a row of `check-clang-tidy-known-defects.sh` (#1410):
 # the tree names the value first at every site of the crashing shape rather than disable the check. This
-# default mode needs no analyser: each row's issue leads a rulebook `## Open work` entry, and every source
-# line naming a row's check names that issue too, so the change that retires a row finds every site.
+# default mode needs no analyser: every source line naming a row's check names that row's issue too, so the
+# change that retires a row finds every site. A row is its own record, so its issue need not be open, and a
+# table with no rows passes.
 #
 # Whether the build still crashes is `--installed`, run by both clang-tidy jobs and the gate -- not a
 # ctest, for the reason `clang-tidy-version` gives (#1135).
@@ -1651,7 +1652,8 @@ set_tests_properties("clang-tidy-known-defects" PROPERTIES
 
 # Every verdict of the decision (still crashing, fixed, check not live, control not parsing, a different
 # failure), `--installed` end to end over stub analysers with and without the defect, and the default mode
-# over synthetic trees in both directions.
+# over synthetic trees in both directions -- each over a copy of the script carrying a sample table, so an
+# empty shipped table is exercised as well as a full one.
 add_test(
     NAME "clang-tidy-known-defects-selftest"
     COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-clang-tidy-known-defects.sh" --self-test "${CMAKE_SOURCE_DIR}"
