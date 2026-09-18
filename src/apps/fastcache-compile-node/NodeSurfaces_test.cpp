@@ -796,8 +796,12 @@ TEST_CASE("The dial address is the node's own member entry, which a typed --raft
     NodeConfig cfg;
     cfg.raftListen = "6680";
     cfg.nodeId = "n1";
-    cfg.raftPeers = { Cluster::ClusterMember { .id = "n1", .raftEndpoint = "10.0.0.7:6680", .schedulerEndpoint = {} },
-                      Cluster::ClusterMember { .id = "n2", .raftEndpoint = "10.0.0.8:6680", .schedulerEndpoint = {} } };
+    cfg.raftPeers = { Cluster::ClusterMember {
+                          .id = "n1", .raftEndpoint = "10.0.0.7:6680", .schedulerEndpoint = {}, .publicKey = std::nullopt },
+                      Cluster::ClusterMember { .id = "n2",
+                                               .raftEndpoint = "10.0.0.8:6680",
+                                               .schedulerEndpoint = {},
+                                               .publicKey = std::nullopt } };
 
     auto const dial = ConsensusDialAddressOf(cfg);
     REQUIRE(dial.has_value());

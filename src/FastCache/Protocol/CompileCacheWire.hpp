@@ -162,7 +162,16 @@ using WireVersion = std::uint8_t;
 /// version-10 client would read a version-9 node's rows as a reading laid out by another build.
 /// Both are wrong sentences about the right machine; `UnsupportedVersion` naming the range is
 /// the right one.
-inline constexpr WireVersion CurrentVersion = 10;
+///
+/// **11 gave CLUSTER-ADMIT and CLUSTER-ADMIT-LEARNER a member's identity key** (#178): the
+/// request carries the `@<key>` an operator typed, as a third field, and the receipt echoes
+/// the key the leader RECORDED, as a third field of its own. Both arities moved, which a
+/// reader cannot step over -- the request's is exact, and a version-10 client reading a
+/// version-11 receipt would refuse a body with a field it never heard of, while a version-11
+/// client reading a version-10 receipt would report a key nobody recorded as absent. A key
+/// that reaches the leader and is dropped on the way is the worst of the three: a member
+/// admitted with no key while its operator believes it has one.
+inline constexpr WireVersion CurrentVersion = 11;
 
 /// The oldest version this build still accepts. Equal to `CurrentVersion` while
 /// only one version exists; widen the range when a second one ships and this
@@ -299,7 +308,12 @@ inline constexpr WireVersion CurrentVersion = 10;
 /// Version 10 moves it for version 7's: `NodeMetrics` answers one shape and takes no version,
 /// so a floor of 9 would accept a version-9 request and answer it with a body that version has
 /// no reading for.
-inline constexpr WireVersion MinSupportedVersion = 10;
+///
+/// Version 11 moves it for the same reason: `EncodeClusterAdmitReceipt` emits one shape, three
+/// fields, and a version-10 request answered with it would be answered in a grammar that
+/// version has no reading for -- and a version-10 request is two fields, which the exact-arity
+/// decoder refuses anyway.
+inline constexpr WireVersion MinSupportedVersion = 11;
 
 /// Size of the fixed request header: magic, version, op, payload length.
 inline constexpr std::size_t RequestHeaderSize = WireFrame::HeaderSize;
@@ -1872,14 +1886,14 @@ inline constexpr std::array OpTable {
                    .family = VerbFamily::Scheduler },
     OpDescriptor { .code = Op::ClusterAdmit,
                    .name = "cluster-admit",
-                   .fieldCount = 2, // member id, consensus endpoint
+                   .fieldCount = 3, // member id, consensus endpoint, identity key (#178)
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
                    .preAuth = RequiresAuth,
                    .maxPayload = BoundedTo(MaxControlPayload),
                    .family = VerbFamily::Scheduler },
     OpDescriptor { .code = Op::ClusterAdmitLearner,
                    .name = "cluster-admit-learner",
-                   .fieldCount = 2, // member id, consensus endpoint -- ClusterAdmit's
+                   .fieldCount = 3, // member id, consensus endpoint, identity key -- ClusterAdmit's
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
                    .preAuth = RequiresAuth,
                    .maxPayload = BoundedTo(MaxControlPayload),
@@ -4361,6 +4375,14 @@ struct ClusterAdmitRequest
 {
     std::string_view memberId;     ///< Stable identity; what consensus counts.
     std::string_view raftEndpoint; ///< host:port its consensus port answers on.
+
+    /// The member's identity key as the operator typed it after `@` (#178), or nothing.
+    ///
+    /// Its TEXT, the 43-character spelling, rather than its bytes: the request carries what
+    /// the operator stated, as it carries the endpoint, and the LEADER reads it through the one
+    /// parser whatever client sent it. Absent is disengaged here; the zero-length field is only
+    /// how the wire spells it.
+    std::optional<std::string_view> publicKey;
 };
 
 /// The same, as views into a received payload.
@@ -4368,6 +4390,11 @@ struct ClusterAdmitView
 {
     std::span<std::byte const> memberId;
     std::span<std::byte const> raftEndpoint;
+
+    /// The key field, or disengaged when the request stated none (#178). Read out of the
+    /// zero-length encoding HERE and nowhere else, so every reader past the decoder sees an
+    /// absent key as absent rather than as an empty string.
+    std::optional<std::span<std::byte const>> publicKey;
 };
 
 /// Whether `op` admits a MEMBER: `ClusterAdmit` (a voter) or `ClusterAdmitLearner` (#1449).
@@ -4397,7 +4424,11 @@ template <Op op>
 [[nodiscard]] inline std::vector<std::byte> EncodeClusterAdmit(ClusterAdmitRequest const& request,
                                                                WireVersion version = CurrentVersion)
 {
-    return Detail::EncodeRequest(version, op, { AsBytes(request.memberId), AsBytes(request.raftEndpoint) });
+    return Detail::EncodeRequest(version,
+                                 op,
+                                 { AsBytes(request.memberId),
+                                   AsBytes(request.raftEndpoint),
+                                   AsBytes(request.publicKey.value_or(std::string_view {})) });
 }
 
 /// Split a CLUSTER-ADMIT or CLUSTER-ADMIT-LEARNER payload.
@@ -4411,7 +4442,10 @@ template <Op op>
     auto const fields = SplitFields(payload, OpFieldCount(op));
     if (!fields.has_value())
         return std::nullopt;
-    return ClusterAdmitView { .memberId = (*fields)[0], .raftEndpoint = (*fields)[1] };
+    auto const key = (*fields)[2];
+    return ClusterAdmitView { .memberId = (*fields)[0],
+                              .raftEndpoint = (*fields)[1],
+                              .publicKey = key.empty() ? std::nullopt : std::optional { key } };
 }
 
 /// What a CLUSTER-ADMIT reply carries back: what the leader RECORDED, never what is in
@@ -4472,6 +4506,17 @@ struct ClusterAdmitReceipt
     std::string memberId;     ///< The id as received, byte for byte.
     std::string raftEndpoint; ///< The consensus endpoint as parsed, byte for byte.
 
+    /// The identity key the leader RECORDED (#178), in its one text spelling, or disengaged
+    /// when the command carries none.
+    ///
+    /// **A third field, and not the constant the paragraph above refuses**: it varies with
+    /// the request, and it is exactly the other half of what an operator compares -- the key
+    /// the joiner's own `node` report prints against the one the seed wrote down. Read off
+    /// the COMMAND, like the other two, so a leader that dropped the key it was sent answers
+    /// *none recorded* rather than echoing the request back. Absent travels as a zero-length
+    /// field and comes back disengaged; it is never an empty string standing in for none.
+    std::optional<std::string> publicKey;
+
     [[nodiscard]] friend bool operator==(ClusterAdmitReceipt const&, ClusterAdmitReceipt const&) = default;
 };
 
@@ -4486,25 +4531,29 @@ struct ClusterAdmitReceipt
 /// @return The reply payload (not a whole frame).
 [[nodiscard]] inline std::vector<std::byte> EncodeClusterAdmitReceipt(ClusterAdmitReceipt const& receipt)
 {
-    return WireFields::Encode({ AsBytes(receipt.memberId), AsBytes(receipt.raftEndpoint) });
+    return WireFields::Encode(
+        { AsBytes(receipt.memberId), AsBytes(receipt.raftEndpoint), AsBytes(receipt.publicKey.value_or(std::string {})) });
 }
 
 /// Read a CLUSTER-ADMIT reply body.
 ///
-/// Exact arity, like every other reply body here: two fields or nothing. An EMPTY
+/// Exact arity, like every other reply body here: three fields or nothing. An EMPTY
 /// payload is refused rather than read as *this leader recorded nothing*, which is not
 /// a state that exists -- a reply carrying no receipt came from a build older than this
 /// one, and that is `MinSupportedVersion`'s question rather than a shape to tolerate
-/// here.
+/// here. The key's zero-length field comes back DISENGAGED here and nowhere else.
 /// @param payload The reply body.
 /// @return The receipt, or nullopt when malformed.
 [[nodiscard]] inline std::optional<ClusterAdmitReceipt> DecodeClusterAdmitReceipt(std::span<std::byte const> payload)
 {
-    auto const fields = SplitFields(payload, 2);
+    auto const fields = SplitFields(payload, 3);
     if (!fields.has_value())
         return std::nullopt;
+    auto const key = (*fields)[2];
     return ClusterAdmitReceipt { .memberId = std::string { AsStringView((*fields)[0]) },
-                                 .raftEndpoint = std::string { AsStringView((*fields)[1]) } };
+                                 .raftEndpoint = std::string { AsStringView((*fields)[1]) },
+                                 .publicKey =
+                                     key.empty() ? std::nullopt : std::optional { std::string { AsStringView(key) } } };
 }
 
 /// Frame a COMPILE request.
@@ -4926,6 +4975,13 @@ struct AdmissionExplanationFields
     [[nodiscard]] bool operator==(AdmissionExplanationFields const&) const = default;
 };
 
+/// Bytes in a node's identity key as `NodeStatus` carries it: an Ed25519 public key (#178).
+///
+/// Spelled here rather than taken from `Core/Ed25519.hpp`, which this header may not include --
+/// it is dependency-free by rule, and the launcher compiles it without the library. The node
+/// `static_assert`s the two equal where it fills the field, so they cannot drift apart silently.
+inline constexpr std::size_t IdentityPublicKeyBytes = 32;
+
 /// What a node's live components report about themselves, as opposed to what its
 /// configuration asked for.
 ///
@@ -5088,6 +5144,16 @@ struct NodeRuntimeFields
     /// a learner and a voter that follows both report `consensus` and `follower`, and only
     /// one of them will ever stand when the leader goes.
     std::optional<WireConsensusStanding> consensusStanding {};
+
+    /// This node's identity key (#178), or disengaged on a node that holds none.
+    ///
+    /// **Its 32 bytes, never its text**: the text is a presentation, and one client
+    /// rendering it through the one encoder is what keeps the spelling an operator compares
+    /// the same on every tool. Absent is a node with no state directory to keep a key in,
+    /// which is a different answer from a key the reader failed to receive -- a sender that
+    /// predates the field sends fewer fields, and both read as absent, which is the most a
+    /// reader can honestly say about either.
+    std::optional<std::array<std::byte, IdentityPublicKeyBytes>> identityPublicKey {};
 };
 
 /// What an operator reads `NodeRuntimeFields::consensusEndpoint` under, as prose: the
@@ -5204,6 +5270,9 @@ namespace Detail
         runtime.consensusEndpoint.has_value() ? AsBytes(*runtime.consensusEndpoint) : std::span<std::byte const> {};
     auto const forgottenClients = Detail::OptionalBigEndian(runtime.forgottenClients);
     auto const consensusStanding = Detail::OptionalEnumByte(runtime.consensusStanding);
+    auto const identityPublicKey = runtime.identityPublicKey.has_value()
+                                       ? std::span<std::byte const> { *runtime.identityPublicKey }
+                                       : std::span<std::byte const> {};
 
     // Positional, so the ORDER here is the wire contract for this record. Append only:
     // an insertion shifts every later field and every peer decodes one fact as the next.
@@ -5222,7 +5291,8 @@ namespace Detail
                                 cordon,
                                 consensusEndpoint,
                                 forgottenClients,
-                                consensusStanding });
+                                consensusStanding,
+                                identityPublicKey });
 }
 
 /// Read a runtime record back.
@@ -5378,6 +5448,17 @@ namespace Detail
             default:
                 break;
         }
+    }
+
+    // Exactly the width of a key, or absent. A field of any other width is refused rather
+    // than read, for the record's own reason: a prefix of a key is a different key, and
+    // printing one would hand an operator a string to compare that no machine holds.
+    if (auto const key = at(16); !key.empty())
+    {
+        if (key.size() != IdentityPublicKeyBytes)
+            return std::nullopt;
+        out.identityPublicKey.emplace();
+        std::ranges::copy(key, out.identityPublicKey->begin());
     }
 
     return out;

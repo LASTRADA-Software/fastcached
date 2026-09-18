@@ -74,8 +74,8 @@ class RecordingCluster final: public Distributed::IClusterAdmin
         if (_refuse.has_value())
             return std::unexpected { *_refuse };
         if (command.kind == Cluster::CommandKind::AddMember)
-            _state.members.push_back(
-                Cluster::ClusterMember { .id = command.key, .raftEndpoint = command.value, .schedulerEndpoint = {} });
+            _state.members.push_back(Cluster::ClusterMember {
+                .id = command.key, .raftEndpoint = command.value, .schedulerEndpoint = {}, .publicKey = std::nullopt });
         return {};
     }
 

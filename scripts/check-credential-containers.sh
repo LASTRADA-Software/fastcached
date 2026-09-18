@@ -64,6 +64,8 @@ sharedSecret|a raw X25519 shared secret, the input keying material every session
 inputKeyMaterial|what HKDF extracts from -- a shared secret under another name (Core/Hkdf)
 pseudoRandomKey|the HKDF PRK, from which every output key is expanded (Core/Hkdf)
 outputKeyMaterial|the HKDF output: the derived key itself (Core/Hkdf)
+identitySeed|the seed a node identity key is derived from, drawn when it is minted (NodeKey, #178)
+keyFileBytes|the contents of a node-key file, which carry that seed (NodeKey, #178)
 '
 # The six rows below `clusterKey` are the per-node identity's (#178), and they are here although
 # none of that material is the CLUSTER key: the table's claim is "these names hold key material",
@@ -312,6 +314,8 @@ SecureByteBuffer sharedSecret;
 SecureByteBuffer inputKeyMaterial;
 SecureByteBuffer pseudoRandomKey;
 SecureByteBuffer outputKeyMaterial;
+SecureByteBuffer identitySeed;
+SecureByteBuffer keyFileBytes;
 std::array<std::byte, 32> publicKey;
 
 EOF
@@ -349,6 +353,8 @@ SecureByteBuffer sharedSecret;
 SecureByteBuffer inputKeyMaterial;
 SecureByteBuffer pseudoRandomKey;
 SecureByteBuffer outputKeyMaterial;
+SecureByteBuffer identitySeed;
+SecureByteBuffer keyFileBytes;
 EOF
     verdict=$(bash "$0" --root "$tmp/blind" 2>&1)
     if grep -q "identifier 'presharedKey' matches nothing" <<< "$verdict"; then
@@ -395,6 +401,8 @@ SecureByteBuffer sharedSecret;
 SecureByteBuffer inputKeyMaterial;
 SecureByteBuffer pseudoRandomKey;
 SecureByteBuffer outputKeyMaterial;
+SecureByteBuffer identitySeed;
+SecureByteBuffer keyFileBytes;
 inline std::string MintLeaseToken(std::span<std::byte const> signingKey, int claims);
 bool Authenticate(std::span<std::byte const> signingKey, std::string_view token);
 EOF

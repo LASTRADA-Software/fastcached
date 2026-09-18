@@ -1183,6 +1183,62 @@ it. That is the safe direction rather than an inconvenience: the vote record wen
 with the file, and a node that came back under its old name having forgotten which
 term it voted in is how one term gets two leaders.
 
+### Its identity key
+
+A node with a state directory — one that runs consensus, or names `--cluster-dir` —
+also holds an **Ed25519 identity key**, in a file called `node-key` beside `node-id`.
+It is minted on the first start from the operating system's random source and read
+back on every start after, and it says which, once:
+
+```
+identity key 11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo (newly minted; no cluster has admitted this key yet)
+identity key 11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo (recorded)
+no identity key: this node runs no consensus and names no --cluster-dir, so it has no state directory a key would survive a restart in; name --cluster-dir to give it one
+```
+
+The **public** half is always shown whole — 43 characters of unpadded base64url, never
+abbreviated — and it is the string to compare between machines: `fastcache-cli node`
+reports it as `public-key`, and `--cluster-status` and `fastcache-cli cluster-members`
+show the key the cluster has recorded for each member. The secret half never leaves
+the machine and is never logged.
+
+**A key file that is there and cannot be used is refused, never replaced.** Unreadable,
+cut short by a crash, not a key file at all, written by a build that lays keys out
+differently, or damaged so its two halves disagree: each stops the node with a sentence
+naming the file and what is wrong with it. Replacing it would make this machine a
+stranger to a cluster that may already have admitted its key, with nothing anywhere
+saying why. Removing the file deliberately mints a new identity, which the cluster must
+then admit. Only a file that is **absent** is minted.
+
+A node with no state directory holds no key rather than one minted afresh at every
+boot, which would be a new machine at every boot. Its working directory is no place to
+keep one: under the packaged unit it is a runtime directory emptied at every boot, and
+under the Windows SCM it is `System32`.
+
+On POSIX the file is created readable by its owner alone, in the same call that creates
+it. On Windows it takes the state directory's access list. On both, the file is one of
+the secrets this node re-checks at startup and at every reload, and one that other
+accounts on the machine can read is reported with the command that fixes it.
+`--install-service` mints no key: the service mints its own at its first start, as the
+account it runs as.
+
+`@<key>` states a member's key on `--raft-peer`, after the address:
+`--raft-peer=n2=10.0.0.2:6680@<key>`. On this node's own entry it must be the key this
+node holds, and one that is not is refused at startup — the token was copied from
+another node, or this is not the state directory it was written for. A key the grammar
+cannot read is refused with the sentence that says what a key looks like.
+`--cluster-admit` and `--cluster-admit-learner` read the same token and carry the key to
+the leader, which reads it once more and refuses one that is not a key, or one the
+cluster has revoked, before anything is proposed. The receipt prints the key the leader
+recorded. Without `@<key>` an admission keeps whatever key is already recorded, and a
+member's key also reaches the cluster from the member itself, which announces the key it
+holds when it leads.
+
+**Nothing verifies against these keys yet.** They are recorded, reported and carried;
+what proves a node is a member of the cluster is still the cluster key. Proving
+identity with them is the next step of
+[#178](https://github.com/LASTRADA-Software/fastcached/issues/178).
+
 A node must name itself among its own peers, and it is refused if it does not —
 such a node could never win a vote and could never be voted for, so it would stand
 for election forever against a cluster that has never heard of it.
@@ -1194,7 +1250,7 @@ nobody reads:
 
 | What has to hold | Why |
 |---|---|
-| every `--raft-peer` is `<id>=<host>:<port>` | A token that names no member is refused by the parser, which is the only place that can tell you *which* token. `--cluster-admit` takes the same one. |
+| every `--raft-peer` is `<id>=<host>:<port>`, optionally `@<key>` | A token that names no member is refused by the parser, which is the only place that can tell you *which* token. `--cluster-admit` takes the same one. |
 | this node is named, by a `--raft-peer` of its own or by `--raft-self` | The address its peers dial is the half only it knows — whether it bootstraps a cluster or joins one with `--raft-join`. |
 | not both, naming different addresses | Two answers to one question, with nothing to rank them by. |
 | `--listen-raft` names a usable port | That is where every peer dials it, and giving it is what turns consensus on. A value that is not an address is refused with the text you typed. |
@@ -1203,8 +1259,8 @@ nobody reads:
 The reverse holds too: `--node-id` or `--raft-peer` **without** `--listen-raft` is
 refused rather than ignored. This node would run no consensus at all, so neither
 flag is read by anybody and nothing would say so. (`--cluster-dir` is not one of
-them — the dashboard keeps its history file there, so a node with no consensus
-still has a use for it.)
+them — the dashboard keeps its history file there and the node keeps its identity
+key there, so a node with no consensus still has a use for it.)
 
 ### Two ports, and why a member records both
 
@@ -1311,22 +1367,27 @@ and any member of the cluster is then told to admit it:
 fastcache-compile-node --scheduler=10.0.0.1:6675 --cluster-admit=n4=10.0.0.4:6680
 ```
 
-It prints back the two things the leader wrote down:
+It prints back the three things the leader wrote down:
 
 ```
 recorded, as received:
   member id           n4
   consensus endpoint  10.0.0.4:6680
+  identity key        none stated (a key already recorded stays)
   seat                voter (the verb this request was sent as)
 
 Appended, not committed: a majority has to take it, and this leader cannot
 see that yet. Ask for the cluster state again to see the result.
 
-Compare the first two lines against the machine itself -- the id it minted
-into --cluster-dir, and the consensus endpoint its own --print-surfaces
-prints (or `fastcache-cli node` against it). They are two spellings of one
-thing, and nothing else compares them.
+Compare the first three lines against the machine itself -- the id it minted
+into --cluster-dir, the consensus endpoint its own --print-surfaces prints,
+and the identity key its --node-status prints (or `fastcache-cli node`
+against it). Each is one thing spelled on two machines, and nothing else
+compares them.
 ```
+
+`--cluster-admit=n4=10.0.0.4:6680@<key>` states the member's identity key as well, and
+the receipt then prints the key the leader recorded in place of *none stated*.
 
 The seat is not an echo: the leader's receipt does not carry it, because it can only
 have answered the verb it was sent, so it is printed as what it is.
@@ -1823,9 +1884,9 @@ after a restart, which is two leaders in one term.
 
 It holds this node's **identity** as well, in a file called `node-id`, which is why
 the default no longer ends in the id — a name read out of a directory cannot name the
-directory. Losing this directory loses both, and losing them together is the safe
-pairing: a node that kept its identity across a lost vote record is the two-leaders
-case above, arriving automatically.
+directory — and the key that proves it, in `node-key`. Losing this directory loses all
+of them, and losing them together is the safe pairing: a node that kept its identity
+across a lost vote record is the two-leaders case above, arriving automatically.
 
 **A state directory copied to a second machine copies the node**, identity and all,
 and nothing refuses that. It cannot be refused where it would be noticed:
@@ -2725,6 +2786,18 @@ byte-budget refusal that fires in practice is a cache `STORE`.
 | `fastcache_raft_peer_dials_refused_wrong_target_total` | Raft dials refused, by a verified verdict, because the member answering at the address is not the one this node dialled: this node's record of that member's address is stale. The log names both. It clears when the replicated state or discovery re-addresses the member. |
 | `fastcache_raft_peer_dials_refused_own_id_total` | Raft dials refused, by a verified verdict, because the acceptor answers to this node's own id: two machines share an identity, a copied --cluster-dir or a duplicated --node-id. |
 | `fastcache_raft_peer_dials_ended_by_acceptor_total` | Raft dials the acceptor closed after this node sent its proof, without a signed verdict. The causes are the ones an acceptor cannot sign: this node's key is not the acceptor's, or the acceptor refused the proof's shape or ran out of handshake time. Never a stale address or a shared identity, which arrive signed and have series of their own. |
+
+**A member admitted with a key the leader could not read.** `--cluster-admit` and
+`fastcache-cli cluster-admit` may name the member's identity key. The leader reads it
+before it proposes anything, and refuses one that is not a key with
+`invalid-cluster-change` and the reason. This project's clients check the key where it is
+typed, so the leader's refusal is the last line of defence against a client that does not
+— which is why it is counted, while every other `invalid-cluster-change` is an operator's
+own typo read back to them and moves nothing.
+
+| Series | Says |
+|---|---|
+| `fastcache_cluster_admissions_refused_malformed_key_total` | cluster-admit requests the leader refused because the member's identity key was not one: not 43 base64url characters naming 32 bytes. Nothing was proposed. This project's clients check the key where it is typed, so a rise names a client that does not. |
 
 ### Deciding whether a new refusal gets a counter
 

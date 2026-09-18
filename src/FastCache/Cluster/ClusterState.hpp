@@ -2,6 +2,7 @@
 #pragma once
 
 #include <FastCache/Consensus/RaftTypes.hpp>
+#include <FastCache/Core/Ed25519.hpp>
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/Errors/ConsensusError.hpp>
 
@@ -113,7 +114,87 @@ struct ClusterMember
     /// is promoted or demoted, and nothing else writes it.
     MemberSeat seat { MemberSeat::Voter };
 
+    /// This member's identity key, or absent when nothing has stated one (#178).
+    ///
+    /// **Absent is not a key of zeroes, and it is not "revoked".** A member admitted before
+    /// keys existed, or admitted by a verb that named none, simply has not said; what asserts
+    /// one is the member itself, announcing its own record, or an operator's `@<key>`. A
+    /// re-admit that names no key KEEPS what is recorded -- unlike the scheduler endpoint, a
+    /// machine that moves keeps its identity -- and only a revocation clears it
+    /// (`CommandKind::RevokeKey`).
+    std::optional<Ed25519PublicKey> publicKey;
+
     [[nodiscard]] friend bool operator==(ClusterMember const&, ClusterMember const&) = default;
+};
+
+/// What a principal is admitted to do (#178).
+///
+/// **Persisted and transmitted**: one byte per principal in a snapshot and in every
+/// `ClusterStatus` reply, and one byte in an `AdmitPrincipal` command. The ordinals are
+/// explicit and append only, and `Last` never travels.
+enum class PrincipalRole : std::uint8_t
+{
+    Worker = 0, ///< Registers with the scheduler and runs compiles; never joins consensus.
+    Last = 1,   ///< Not a role, and never travels. See `DecodeWireEnum`.
+};
+
+/// How one `PrincipalRole` is spelled.
+struct PrincipalRoleRow
+{
+    PrincipalRole role;    ///< The role this row describes.
+    std::string_view name; ///< Its one spelling: a table cell, a JSON value and a report word alike.
+};
+
+/// One row per `PrincipalRole`, in enumerator order.
+inline constexpr EnumTable<PrincipalRole, PrincipalRoleRow> PrincipalRoleTable { {
+    { .role = PrincipalRole::Worker, .name = "worker" },
+} };
+
+static_assert(RowsInEnumeratorOrder(PrincipalRoleTable, &PrincipalRoleRow::role),
+              "PrincipalRoleTable must hold one row per PrincipalRole, in enumerator order");
+
+/// The spelling of `role`, from `PrincipalRoleTable`.
+/// @param role A role.
+/// @return Its row's name.
+[[nodiscard]] constexpr std::string_view PrincipalRoleName(PrincipalRole role) noexcept
+{
+    return PrincipalRoleTable[static_cast<std::size_t>(role)].name;
+}
+
+/// A machine the cluster admits by its KEY without counting it (#178).
+///
+/// **Not a member**, and the difference is the whole reason this is a second list rather
+/// than a third `MemberSeat`. A member is somewhere consensus replicates to -- it has a Raft
+/// endpoint every other member dials -- while a principal is a machine that never joins
+/// consensus at all: a roaming worker whose address the VPN reassigns. What the cluster
+/// records about it is the one thing that does not move, its key, and what it may do.
+///
+/// An id is a member or a principal, never both; `Apply` holds that, and `DecodeState`
+/// refuses a state that breaks it.
+struct ClusterPrincipal
+{
+    Consensus::NodeId id;                         ///< Its identity, as it names itself.
+    Ed25519PublicKey publicKey {};                ///< The key it proves that identity with.
+    PrincipalRole role { PrincipalRole::Worker }; ///< What it is admitted to do.
+
+    [[nodiscard]] friend bool operator==(ClusterPrincipal const&, ClusterPrincipal const&) = default;
+};
+
+/// A key the cluster will never admit again, and whose it was (#178).
+///
+/// **The whole key, never a digest or a prefix**: a revoked machine still holds every byte
+/// it ever held, and whatever it presents next is checked against this -- so the record has
+/// to be something a signature can be verified under, which a digest is not. That is what
+/// lets a later verifier check the proof BEFORE it reports `revoked`, so the refusal is
+/// never an oracle for a caller who holds no key at all.
+struct RevokedKey
+{
+    /// Whose it was, as the revocation named them. A LABEL for an operator reading the
+    /// state: nothing is keyed on it, because the key is what is refused.
+    Consensus::NodeId id;
+    Ed25519PublicKey publicKey {}; ///< The key.
+
+    [[nodiscard]] friend bool operator==(RevokedKey const&, RevokedKey const&) = default;
 };
 
 /// What a member's scheduler endpoint is, as a reader asks it.
@@ -156,7 +237,7 @@ static_assert(RowsInEnumeratorOrder(SchedulerEndpointStateTable, &SchedulerEndpo
 /// @return The row's name.
 [[nodiscard]] std::string_view SchedulerEndpointStateName(ClusterMember const& member) noexcept;
 
-/// Parse one `<id>=<host>:<port>` member specification.
+/// Parse one `<id>=<host>:<port>[@<key>]` member specification.
 ///
 /// The grammar an operator types, in the one place the type it produces lives. It
 /// has two callers that must not disagree — `--raft-peer` names a member at
@@ -173,9 +254,26 @@ static_assert(RowsInEnumeratorOrder(SchedulerEndpointStateTable, &SchedulerEndpo
 /// dialer asks: a bare port names no machine, and `host:0` names no port, and a
 /// member recorded either way is one the cluster counts towards quorum and cannot
 /// reach.
+///
+/// **`@<key>` states the member's identity key** (#178), in the one spelling
+/// `FormatEd25519PublicKey` prints. Split at the FIRST `@` after the `=`: no host
+/// contains one and no key does, so a token with two is refused rather than read as a
+/// host nobody can resolve. A key that does not parse is refused with the sentence
+/// that says what a key looks like, never read as part of the endpoint.
 /// @param spec The token as an operator wrote it.
-/// @return The member, or nullopt when the token is not one.
-[[nodiscard]] std::optional<ClusterMember> ParseMemberSpec(std::string_view spec);
+/// @return The member, or why the token is not one -- a sentence naming the token.
+[[nodiscard]] std::expected<ClusterMember, std::string> ParseMemberSpec(std::string_view spec);
+
+/// Render @p member the way `ParseMemberSpec` reads it: `<id>=<host>:<port>`, and `@<key>`
+/// when a key is recorded.
+///
+/// The inverse, beside the parser, for the reason the key's own two functions are a pair:
+/// a service registration re-renders every `--raft-peer` from its parsed form, and a
+/// rendering that dropped the key would install a node whose next start no longer knows
+/// what its own operator typed.
+/// @param member The member.
+/// @return The token.
+[[nodiscard]] std::string FormatMemberSpec(ClusterMember const& member);
 
 /// A setting every member of the cluster must agree on.
 ///
@@ -463,6 +561,22 @@ struct ClusterState
     /// traffic: nothing but a committed command adds one, and a re-admit removes one.
     std::vector<std::string> forgotten;
 
+    /// Machines admitted by key rather than as members, sorted by id (#178).
+    ///
+    /// Written by `AdmitPrincipal` and cleared, per key, by `RevokeKey`. Nothing in this
+    /// build proposes one yet: enrollment (#178 PR 4) is its producer, and this is the
+    /// record it will write into.
+    std::vector<ClusterPrincipal> principals;
+
+    /// Keys the cluster will never admit again, sorted by id and then key, one entry per
+    /// key (#178).
+    ///
+    /// **Bounded by the keys ever revoked**, never by traffic, for `forgotten`'s reason:
+    /// nothing but a committed `RevokeKey` adds one. Nothing ever shortens it -- a
+    /// revocation that could be undone would be a key that could come back, and the
+    /// property is that it cannot.
+    std::vector<RevokedKey> revokedKeys;
+
     [[nodiscard]] friend bool operator==(ClusterState const&, ClusterState const&) = default;
 
     /// The consensus endpoint recorded for `id`, if any.
@@ -508,6 +622,16 @@ struct ClusterState
     /// @param host A caller's host, without a port.
     /// @return True when a `forgotten` entry names the same machine.
     [[nodiscard]] bool HasForgotten(std::string_view host) const;
+
+    /// Whether `key` has been revoked.
+    /// @param key A public key.
+    /// @return True when a `revokedKeys` entry holds it.
+    [[nodiscard]] bool IsRevoked(Ed25519PublicKey const& key) const;
+
+    /// Who holds `key` LIVE, as a member or as a principal.
+    /// @param key A public key.
+    /// @return The holder's id, or nullopt when no member and no principal holds it.
+    [[nodiscard]] std::optional<std::string> HolderOf(Ed25519PublicKey const& key) const;
 };
 
 /// What a command does to the state.
@@ -531,13 +655,14 @@ struct ClusterState
 /// byte outranks both, because a red test cannot be failed to notice the way an absent
 /// `= N` can.
 ///
-/// **A verb is added without moving `CommandVersion`**, because the layout did not
-/// change, and that has a consequence a fleet mid-upgrade lives with: a member running a
-/// build that predates a verb meets its committed entries and SKIPS them by name
+/// **A verb is added without moving `CommandVersion`** when the layout does not change,
+/// and that has a consequence a fleet mid-upgrade lives with: a member running a build
+/// that predates a verb meets its committed entries and SKIPS them by name
 /// (`ClusterStateMachine::Apply`), applying the rest of the log around them. So it holds
 /// the state as if that command had never been proposed -- which for #1309's two verbs
 /// means such a member admits no replicated client (closed, and healed by the upgrade)
-/// and ignores a client forget (OPEN for that host, until it is upgraded).
+/// and ignores a client forget (OPEN for that host, until it is upgraded). #178's two
+/// verbs DID move it, because they brought two fields the layout had no room for.
 enum class CommandKind : std::uint8_t
 {
     /// Add a member, or update the endpoint of one already present.
@@ -571,6 +696,23 @@ enum class CommandKind : std::uint8_t
     /// admitting a voter through this verb DEMOTES it, and admitting a learner through
     /// `AddMember` promotes it. `MemberSeatTable` says which verb writes which seat.
     AddLearner,
+
+    /// Admit a machine by its key, as a principal rather than a member (#178).
+    ///
+    /// Refused for a key that is revoked, for a key another id holds, and for an id that
+    /// is a member. Re-admitting a principal's id replaces its record, which is how a
+    /// principal's key is rotated -- the old key is then simply nobody's, and an operator
+    /// who wants it refused for good revokes it.
+    AdmitPrincipal,
+
+    /// Revoke a key, for good (#178).
+    ///
+    /// Clears the key from whatever holds it -- a principal is removed, a member keeps its
+    /// record and loses the key -- and records it in `revokedKeys`, which nothing shortens.
+    /// **Never dropped on commit**: every other verb is dropped at `Apply` when its
+    /// preconditions no longer hold, and this one is applied whatever the state says,
+    /// because a revocation that could be lost is removal failing OPEN.
+    RevokeKey,
 
     Last, ///< Not a verb, and has no row: the length of a table keyed by one.
 };
@@ -650,7 +792,8 @@ struct Command
     CommandKind kind { CommandKind::AddMember };
     /// The member id for `AddMember`/`AddLearner`/`RemoveMember`, the setting name for
     /// `SetSetting`, the client's host (a port, if given, is ignored) for
-    /// `AdmitClient`/`ForgetClient`.
+    /// `AdmitClient`/`ForgetClient`, the principal's id for `AdmitPrincipal`, and whose the
+    /// key was -- a label -- for `RevokeKey`.
     std::string key;
     /// The consensus endpoint for `AddMember`/`AddLearner`, the value for `SetSetting`,
     /// empty otherwise.
@@ -667,6 +810,16 @@ struct Command
     /// rather than this command carrying it. Refused for the other two verbs, because a
     /// field a verb ignores is a field somebody misunderstood.
     std::string schedulerEndpoint;
+
+    /// The key the verb acts on (#178): the member's for `AddMember`/`AddLearner`, where
+    /// absent is NO OPINION and keeps what is recorded; the principal's for
+    /// `AdmitPrincipal` and the revoked one for `RevokeKey`, where it is required. Refused
+    /// for every other verb.
+    std::optional<Ed25519PublicKey> publicKey;
+
+    /// `AdmitPrincipal` only, and required there: what the principal may do. Refused for
+    /// every other verb.
+    std::optional<PrincipalRole> role;
 
     [[nodiscard]] friend bool operator==(Command const&, Command const&) = default;
 };
@@ -739,8 +892,30 @@ void Apply(ClusterState& state, Command const& command);
 /// name a machine, and it must not be this one's loopback -- a caller on the node's own
 /// machine is always admitted to it, so a record about loopback would be accepted,
 /// replicated and snapshotted while deciding nothing.
+///
+/// **A function of the command alone**, so it cannot know what the state holds: a key
+/// that is revoked, or held by somebody else, is `ValidateAgainst`'s question.
 /// @param command The change.
 /// @return Nothing when it may be proposed, or why it may not.
 [[nodiscard]] std::expected<void, ConsensusError> Validate(Command const& command);
+
+/// Whether `command` may be proposed against the state as it stands (#178).
+///
+/// `Validate`, and then the rules only the state can answer, which are all about KEYS: a
+/// revoked key is never admitted again (`KeyRevoked`, a refusal of the command -- nothing
+/// the state can later do un-revokes it); a key is held by one id at a time; and an id is a
+/// member or a principal, never both. Every proposer asks this -- the leader before it
+/// appends, and the scheduler surface an operator types at -- so the refusal reaches whoever
+/// asked, with its reason.
+///
+/// **It is a courtesy, and `Apply` is the guarantee.** Two proposals judged against one state
+/// can both be appended before either commits -- a revocation and an admission of the same
+/// key -- so `Apply` enforces the same rules on commit and drops a command that has stopped
+/// satisfying them. What that costs is a silent drop; what this buys is that the ordinary case
+/// is refused where somebody reads the answer.
+/// @param state The state the command would apply to.
+/// @param command The change.
+/// @return Nothing when it may be proposed, or why it may not.
+[[nodiscard]] std::expected<void, ConsensusError> ValidateAgainst(ClusterState const& state, Command const& command);
 
 } // namespace FastCache::Cluster

@@ -289,6 +289,12 @@ majority involved, so that much comes back:
 - `member-id-as-received` — the id, byte for byte as it arrived
 - `consensus-endpoint-as-recorded` — the address that goes into the replicated
   configuration
+- `public-key-as-recorded` — the member's identity key, when a third operand named one:
+  `cluster-admit <member-id> <raft-endpoint> <public-key>`, the 43 characters the member's
+  own `node` report prints as `public-key`. The leader reads the key and refuses one that
+  is not a key, or one the cluster has revoked, before anything is proposed. With no third
+  operand it reads **none stated**, which keeps a key already recorded rather than
+  clearing it
 - `seat-as-requested` — `voter` or `learner`, which is the VERB this client sent
   rather than an echo: the receipt does not carry it, because the leader can only have
   answered the verb it was asked
@@ -300,11 +306,12 @@ demotes that voter, and `cluster-admit` on a learner promotes it; either way the
 cluster moves one member at a time, and a demotion that would leave no voter is never
 proposed.
 
-Hold both values against the machine being brought in: the id it minted into its own
-`--cluster-dir`, and the address it answers consensus on (`--raft-self` together with
+Hold the values against the machine being brought in: the id it minted into its own
+`--cluster-dir`, the address it answers consensus on (`--raft-self` together with
 `--listen-raft`), which `node` against that machine reports as `consensus-endpoint` --
-never its `raft-port`, which is the port it BOUND. They are two spellings of one thing
-and nothing else compares them.
+never its `raft-port`, which is the port it BOUND -- and the identity key, which `node`
+reports as `public-key`. Each is one thing spelled on two machines, and nothing else
+compares them.
 When they disagree the member sits in the cluster's configuration and contacts
 nobody, which at three members or more presents as an election storm that then
 settles — so the symptom points at consensus rather than at the character that was

@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
+#include <FastCache/Core/Base64.hpp>
 #include <FastCache/Core/Ed25519.hpp>
 #include <FastCache/Core/MonocypherBytes.hpp>
 
+#include <algorithm>
 #include <cassert>
 #include <utility>
 
@@ -59,6 +61,30 @@ bool Ed25519Verify(Ed25519PublicKey const& publicKey,
                                             Detail::MonocypherIn(message),
                                             message.size())
            == 0;
+}
+
+std::string FormatEd25519PublicKey(Ed25519PublicKey const& key)
+{
+    return Base64UrlEncode(key);
+}
+
+std::expected<Ed25519PublicKey, PublicKeyTextFault> ParseEd25519PublicKey(std::string_view text)
+{
+    // The length first, because it is the fault an operator is likeliest to have made -- a key
+    // cut short by a terminal or a paste -- and the sentence for it says what whole looks like.
+    if (text.size() != Ed25519PublicKeyTextLength)
+        return std::unexpected(PublicKeyTextFault::WrongLength);
+
+    auto const decoded = Base64UrlDecode(text);
+    if (!decoded.has_value())
+        return std::unexpected(PublicKeyTextFault::NotBase64Url);
+
+    // 43 canonical symbols are 32 bytes exactly, so this cannot be short; asserted rather than
+    // branched on, because a branch here would be an arm nothing can reach.
+    assert(decoded->size() == Ed25519PublicKeyBytes);
+    Ed25519PublicKey key {};
+    std::ranges::transform(*decoded, key.begin(), [](char c) { return static_cast<std::byte>(c); });
+    return key;
 }
 
 } // namespace FastCache

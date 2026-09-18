@@ -1028,6 +1028,12 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
               "the proof's shape or ran out of handshake time. Never a stale address or a shared identity, which "
               "arrive signed and have series of their own.",
       .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::ClusterAdmissionsRefusedMalformedKey,
+      .prometheusName = "fastcache_cluster_admissions_refused_malformed_key_total",
+      .help = "cluster-admit requests the leader refused because the member's identity key was not one: not 43 "
+              "base64url characters naming 32 bytes. Nothing was proposed. This project's clients check the key "
+              "where it is typed, so a rise names a client that does not.",
+      .type = MetricType::Counter },
 } };
 
 // Checked at compile time rather than by a test, because the failure this prevents

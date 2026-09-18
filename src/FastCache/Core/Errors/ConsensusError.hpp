@@ -35,6 +35,15 @@ enum class ConsensusErrorCode : std::uint8_t
     ConfigurationChangeInFlight, ///< One membership change is already uncommitted; wait for it.
     MembershipUnchanged,         ///< The proposed member set is the one already in force.
 
+    /// The command would admit a key the cluster has revoked (#178).
+    ///
+    /// Its own code rather than `InvalidConfiguration`, because the permanence is the
+    /// POINT and deserves to be stated where it is decided: nothing any later command can
+    /// do makes a revoked key admissible again, so this is `Command` in the table below
+    /// for a stronger reason than a malformed field is. What the wire says is
+    /// `SchedulerService`'s `WireCodeFor`, which fails the build until it has a row.
+    KeyRevoked,
+
     NotLeader,      ///< Only a leader may accept a proposal; see `knownLeader`.
     StorageFailure, ///< Durable state could not be written or read back.
 
@@ -124,6 +133,10 @@ inline constexpr EnumTable<ConsensusErrorCode, RefusalSubjectRow> RefusalSubject
     { .code = ConsensusErrorCode::InvalidConfiguration, .subject = RefusalSubject::Command },
     { .code = ConsensusErrorCode::ConfigurationChangeInFlight, .subject = RefusalSubject::Moment },
     { .code = ConsensusErrorCode::MembershipUnchanged, .subject = RefusalSubject::Satisfied },
+    // PERMANENT, and by construction rather than by today's verbs: `revokedKeys` is never
+    // shortened, so the command is refused identically at every future instant. A caller
+    // re-offering it next interval would be the #159 trap; skipping it is right.
+    { .code = ConsensusErrorCode::KeyRevoked, .subject = RefusalSubject::Command },
     { .code = ConsensusErrorCode::NotLeader, .subject = RefusalSubject::Moment },
     { .code = ConsensusErrorCode::StorageFailure, .subject = RefusalSubject::Moment },
     // About this NODE, like `StorageFailure`: it refuses the node's start, so no
@@ -221,6 +234,20 @@ struct ConsensusError
 [[nodiscard]] inline ConsensusError MembershipUnchanged(std::string_view context)
 {
     return ConsensusError { .code = ConsensusErrorCode::MembershipUnchanged,
+                            .context = std::string { context },
+                            .knownLeader = std::nullopt };
+}
+
+/// Build a `KeyRevoked` error.
+///
+/// A COMMAND, permanently: a revoked key is never admitted again, so the remedy is never
+/// to wait or to ask elsewhere -- it is a new identity, minted on the machine the key
+/// belonged to.
+/// @param context Which key, whose it was, and what to do instead.
+/// @return The error.
+[[nodiscard]] inline ConsensusError KeyRevoked(std::string_view context)
+{
+    return ConsensusError { .code = ConsensusErrorCode::KeyRevoked,
                             .context = std::string { context },
                             .knownLeader = std::nullopt };
 }

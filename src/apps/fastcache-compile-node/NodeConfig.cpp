@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "NodeConfig.hpp"
+#include "NodeKey.hpp"
 #include "NodeMembership.hpp"
 #include "NodeSurfaces.hpp"
 #include "NodeToolchains.hpp"
@@ -287,15 +288,18 @@ namespace
                 // for one concept -- with only one of them being what the transport
                 // actually dials. The learner flag takes it too (#1449): which set a
                 // member is admitted into is the flag, never a second grammar.
+                auto const* const flag = Action == ClusterAction::Admit ? "cluster-admit" : "cluster-admit-learner";
                 auto member = Cluster::ParseMemberSpec(value);
                 if (!member.has_value())
-                    return std::unexpected(
-                        ArgvError(ConfigErrorCode::ParseError,
-                                  Action == ClusterAction::Admit ? "cluster-admit" : "cluster-admit-learner",
-                                  std::format("not <id>=<host>:<port>: {}", value)));
+                    return std::unexpected(ArgvError(ConfigErrorCode::ParseError, flag, member.error()));
 
+                // `@<key>` rides the request as its third field (#178), already PARSED --
+                // so a key that is not one is refused here, in `ParseMemberSpec`'s own
+                // sentence, in front of whoever typed it. The leader parses the text it is
+                // sent once more, because the wire door is not the flag door.
                 request.key = std::move(member->id);
                 request.value = std::move(member->raftEndpoint);
+                request.publicKey = member->publicKey;
             }
 
             return {};
@@ -495,10 +499,11 @@ namespace
         if (auto const text = ParseUtf8Text(sv); !text.has_value())
             return std::unexpected(text.error());
 
+        // The key an `@<key>` suffix names is refused in the grammar's own sentence (#178),
+        // which says what a key looks like -- never read as part of the endpoint.
         auto member = Cluster::ParseMemberSpec(sv);
         if (!member.has_value())
-            return std::unexpected(
-                ArgvError(ConfigErrorCode::ParseError, "raft-peer", std::format("not <id>=<host>:<port>: {}", sv)));
+            return std::unexpected(ArgvError(ConfigErrorCode::ParseError, "raft-peer", member.error()));
         return *std::move(member);
     }
 
@@ -941,13 +946,16 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
         {
             .primary = "--raft-peer",
             .arity = Arity::Value,
-            .operand = "=<id>=<host>:<port>",
+            .operand = "=<id>=<host>:<port>[@<key>]",
             .apply = AppendFrom<&NodeConfig::raftPeers, ParseRaftPeer>(),
             .description = "a cluster member and where it answers; repeatable.\n"
                            "Both halves in one token because a member id with\n"
                            "no address is a node counted towards quorum and\n"
                            "unreachable. This is the BOOTSTRAP set only:\n"
-                           "membership is replicated once the cluster runs.",
+                           "membership is replicated once the cluster runs.\n"
+                           "@<key> states the member's identity key, as its\n"
+                           "--node-status prints it; on this node's own entry\n"
+                           "it must be the key this node holds.",
             .yamlKey = "raft_peer",
             .same = FieldEq<&NodeConfig::raftPeers>(),
             .clear = ClearList<&NodeConfig::raftPeers>(),
@@ -972,9 +980,11 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
             .arity = Arity::Value,
             .operand = "=<path>",
             .apply = AssignFrom<&NodeConfig::clusterDir, ParsePathValue>(),
-            .description = "where consensus keeps its durable state. A node\n"
-                           "that answered a vote and forgot it votes twice in\n"
-                           "one term after a restart, which is two leaders.",
+            .description = "this node's state directory: its identity key,\n"
+                           "its id, and where consensus keeps its durable state.\n"
+                           "A node that answered a vote and forgot it votes\n"
+                           "twice in one term after a restart, which is two\n"
+                           "leaders; a node that lost it is a new identity.",
             .yamlKey = "cluster_dir",
             .same = FieldEq<&NodeConfig::clusterDir>(),
         },
@@ -1005,7 +1015,7 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
                          "their restarts. --cluster-status lists the keys." },
         { .primary = "--cluster-admit",
           .arity = Arity::Value,
-          .operand = "=<id>=<host>:<port>",
+          .operand = "=<id>=<host>:<port>[@<key>]",
           .apply = SelectClusterAction<ClusterAction::Admit>(),
           .description = "add a member to the cluster and exit, or record that\n"
                          "one has moved. Both halves in one token for the\n"
@@ -1013,10 +1023,12 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
                          "is counted towards quorum and never reached. The\n"
                          "member itself must have been started with\n"
                          "--raft-join. A VOTER: counted by every quorum. On a\n"
-                         "learner this promotes it." },
+                         "learner this promotes it. @<key> records the\n"
+                         "member's identity key, as its --node-status prints\n"
+                         "it; without one, a key already recorded stays." },
         { .primary = "--cluster-admit-learner",
           .arity = Arity::Value,
-          .operand = "=<id>=<host>:<port>",
+          .operand = "=<id>=<host>:<port>[@<key>]",
           .apply = SelectClusterAction<ClusterAction::AdmitLearner>(),
           .description = "add a member as a LEARNER and exit, or move a voter\n"
                          "into that set. A learner is replicated to and\n"
@@ -2295,9 +2307,11 @@ ServiceSpec MakeNodeServiceSpec(std::filesystem::path const& exePath, NodeConfig
     // it was installed with would present as a cluster that stopped forming quorum,
     // not as a packaging bug. Re-rendered rather than echoed, because the list is
     // stored parsed; it is the same token either way, since `ParseMemberSpec` splits
-    // at the FIRST `=` and keeps the endpoint verbatim.
+    // at the FIRST `=` and keeps the endpoint verbatim -- and `FormatMemberSpec` is its
+    // inverse, `@<key>` included, so a key the operator typed is not dropped from the
+    // command line a supervisor replays (#178).
     for (auto const& peer: cfg.raftPeers)
-        argv.push_back(std::format("--raft-peer={}={}", peer.id, peer.raftEndpoint));
+        argv.push_back(std::format("--raft-peer={}", Cluster::FormatMemberSpec(peer)));
     emitIfExplicit("upstream", cfg.upstream, cfg.upstreamExplicit);
     emitPathIfSet("cache-dir", cfg.cacheDir.string());
     if (cfg.raftJoin)
@@ -3111,19 +3125,27 @@ std::span<NodeSecretFile const> NodeSecretFileTable() noexcept
     static constexpr auto table = std::to_array<NodeSecretFile>({
         // The PSK, and the worst of the four: it MACs discovery proofs AND lease
         // grants, so a leak admits a node whose objects the whole fleet then caches.
-        { .flag = "--cluster-key-file", .path = &NodeConfig::clusterKeyFile },
+        { .flag = "--cluster-key-file", .path = [](NodeConfig const& cfg) { return cfg.clusterKeyFile; } },
         // What this node REQUIRES of its own callers. A leak makes membership -- a
         // host list, not a credential -- the only gate left on the scheduler verbs.
-        { .flag = "--scheduler-token-file", .path = &NodeConfig::schedulerTokenFile },
+        { .flag = "--scheduler-token-file", .path = [](NodeConfig const& cfg) { return cfg.schedulerTokenFile; } },
         // The admin credential. The dashboard's own rules are REFUSALS about a
         // MISSING one; this is a warning about an EXPOSED one, and the two
         // deliberately differ in kind about one file for #384's stated reason:
         // refusing a missing credential fails closed and breaks nothing that worked,
         // while refusing an exposed one breaks a deployment that is running today.
-        { .flag = "--dashboard-token-file", .path = &NodeConfig::dashboardTokenFile },
+        { .flag = "--dashboard-token-file", .path = [](NodeConfig const& cfg) { return cfg.dashboardTokenFile; } },
         // A TLS private key, which #752's own list does not name. At least as severe
         // as the PSK: anything holding it can terminate this node's admin surface.
-        { .flag = "--tls-key", .path = &NodeConfig::tlsKeyFile },
+        { .flag = "--tls-key", .path = [](NodeConfig const& cfg) { return cfg.tlsKeyFile; } },
+        // The node's IDENTITY key (#178), which the flag does not name: it names the
+        // state directory, and the key is the file inside it this node minted. A row of
+        // this table rather than a public one, because the directory stopped being "Raft
+        // state, no credential" the moment it held the key a machine proves itself with --
+        // and a row whose path is DERIVED, because the file is found where the start put
+        // it (`NodeKeyPath`), never re-spelled here. Empty on a node that holds no key,
+        // which the loop below skips like any unnamed file.
+        { .flag = "--cluster-dir", .path = &NodeKeyPath },
     });
     return table;
 }
@@ -3134,7 +3156,6 @@ std::span<NodePublicPathFlag const> NodePublicPathFlags() noexcept
         { .flag = "--config",
           .why = "the file itself holds no secret by construction; whether the secret IN it is exposed is the "
                  "provenance-gated question NodeSecretFiles asks separately" },
-        { .flag = "--cluster-dir", .why = "a directory of Raft state: log entries and snapshots, no credential" },
         { .flag = "--cache-dir", .why = "compiled objects, which the fleet already shares" },
         { .flag = "--pidfile", .why = "a process id, which every process list already publishes" },
         // The shipped TEMPLATE, which is payload: it is the annotated reference every
@@ -3169,8 +3190,8 @@ std::vector<std::filesystem::path> NodeSecretFiles(NodeConfig const& cfg,
         files.push_back(configFile);
 
     for (auto const& row: NodeSecretFileTable())
-        if (auto const& path = cfg.*row.path; !path.empty())
-            files.push_back(path);
+        if (auto path = row.path(cfg); !path.empty())
+            files.push_back(std::move(path));
 
     return files;
 }

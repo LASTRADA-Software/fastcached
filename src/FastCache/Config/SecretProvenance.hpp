@@ -131,13 +131,19 @@ struct SecretFileFinding
 /// be written against both
 /// ([#864](https://github.com/LASTRADA-Software/fastcached/issues/864)).
 ///
+/// **A projection rather than a member pointer** (#178), because a flag does not always
+/// NAME the file its secret lives in: `--cluster-dir` names a directory, and the secret is
+/// the identity key the node minted inside it. A member pointer can only say *the value
+/// typed is the file*; a projection says *this configuration's secret is in this file*,
+/// which is the question the loop asks. Empty is "no such file here", and is skipped.
+///
 /// @tparam ConfigT The configuration a flag's value lands in.
 /// @tparam PathT How that configuration spells a filesystem path.
 template <typename ConfigT, typename PathT = std::filesystem::path>
 struct SecretFileRow
 {
-    std::string_view flag; ///< The `--flag` spelling, and the key the coverage guard joins on.
-    PathT ConfigT::* path; ///< Where the operator's answer lands.
+    std::string_view flag;                ///< The `--flag` spelling, and the key the coverage guard joins on.
+    PathT (*path)(ConfigT const& config); ///< The file this configuration's secret lives in, or empty.
 };
 
 /// One path-valued flag whose file is deliberately NOT a secret.

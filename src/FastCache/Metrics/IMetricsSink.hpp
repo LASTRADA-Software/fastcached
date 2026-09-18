@@ -1370,6 +1370,12 @@ class IMetricsSink
         /// A Raft dial the acceptor closed after this node's proof, with no signed verdict. (#1308)
         RaftPeerDialsEndedByAcceptor,
 
+        /// A CLUSTER-ADMIT naming an identity key that does not parse, refused before anything
+        /// was proposed. Both of this project's clients parse the key where it is typed, so a
+        /// rise names a client that does not -- one whose members would otherwise join with no
+        /// identity while their operator was shown a key. (#178)
+        ClusterAdmissionsRefusedMalformedKey,
+
         Last,
     };
 

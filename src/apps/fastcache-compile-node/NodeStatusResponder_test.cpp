@@ -5,6 +5,7 @@
 
 #include <FastCache/Async/Task.hpp>
 #include <FastCache/Core/Clock.hpp>
+#include <FastCache/Core/Ed25519.hpp>
 #include <FastCache/Core/WireFrame.hpp>
 #include <FastCache/Distributed/MembershipOracle.hpp>
 #include <FastCache/Metrics/MetricsCatalog.hpp>
@@ -1316,4 +1317,29 @@ TEST_CASE("The consensus standing is absent with no consensus, and read per requ
             CHECK(fix.status.Describe().runtime.consensusStanding == std::optional { tag });
         }
     }
+}
+
+TEST_CASE("A node reports the identity key it holds, and nothing on a node that holds none", "[node][node-status][identity]")
+{
+    // #178. Read from the configuration the start applied the key to -- through the SAME
+    // reference production binds, so the case cannot pass on a copy the status never reads.
+    ManualClock clock;
+    Fixture fix { ConfigShape {}, clock };
+
+    // Absent, not a key of zeroes: a node with no state directory holds no key.
+    CHECK_FALSE(fix.status.Describe().runtime.identityPublicKey.has_value());
+
+    auto key = Ed25519PublicKey {};
+    for (auto const index: std::views::iota(std::size_t { 0 }, key.size()))
+        key[index] = static_cast<std::byte>(0xC0 + index);
+    fix.cfg.identityPublicKey = key;
+
+    auto const fields = fix.status.Describe();
+    REQUIRE(fields.runtime.identityPublicKey.has_value());
+    CHECK(Unwrap(fields.runtime.identityPublicKey) == key);
+
+    // And the bytes survive the reply a client decodes, byte for byte.
+    auto const decoded = Wire::DecodeNodeStatus(Wire::EncodeNodeStatus(fields));
+    REQUIRE(decoded.has_value());
+    CHECK(Unwrap(decoded).runtime.identityPublicKey == fields.runtime.identityPublicKey);
 }

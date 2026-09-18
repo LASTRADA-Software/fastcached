@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Cluster/MembershipPolicy.hpp>
+#include <FastCache/Core/Ed25519.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <cstddef>
 #include <optional>
 #include <span>
 #include <string>
@@ -31,7 +33,8 @@ namespace
                            .raftEndpoint = std::move(raft),
                            .schedulerEndpoint = std::move(scheduler),
                            .schedulerEndpointHistory = SchedulerEndpointHistory::NeverAnnounced,
-                           .seat = seat };
+                           .seat = seat,
+                           .publicKey = std::nullopt };
 }
 
 /// A learner the cluster has agreed on (#1449).
@@ -56,9 +59,11 @@ namespace
                                    std::optional<std::string> scheduler = std::nullopt,
                                    std::optional<MemberSeat> seat = std::nullopt)
 {
-    return DesiredMember {
-        .id = std::move(id), .raftEndpoint = std::move(raft), .schedulerEndpoint = std::move(scheduler), .seat = seat
-    };
+    return DesiredMember { .id = std::move(id),
+                           .raftEndpoint = std::move(raft),
+                           .schedulerEndpoint = std::move(scheduler),
+                           .seat = seat,
+                           .publicKey = std::nullopt };
 }
 
 /// The state a cluster reaches after admitting each of `members`.
@@ -66,7 +71,9 @@ namespace
 /// @return The state.
 [[nodiscard]] ClusterState StateOf(std::vector<ClusterMember> members)
 {
-    return ClusterState { .members = std::move(members), .settings = {}, .clients = {}, .forgotten = {} };
+    return ClusterState {
+        .members = std::move(members), .settings = {}, .clients = {}, .forgotten = {}, .principals = {}, .revokedKeys = {}
+    };
 }
 
 /// `MembershipProposals`, spelled without the span conversion at every call.
@@ -139,8 +146,12 @@ TEST_CASE("A member the state has never heard of is proposed", "[cluster][member
 
     REQUIRE(proposals.size() == 2);
     CHECK(proposals[0]
-          == Command {
-              .kind = CommandKind::AddMember, .key = "n1", .value = "10.0.0.1:6675", .schedulerEndpoint = "10.0.0.1:7000" });
+          == Command { .kind = CommandKind::AddMember,
+                       .key = "n1",
+                       .value = "10.0.0.1:6675",
+                       .schedulerEndpoint = "10.0.0.1:7000",
+                       .publicKey = std::nullopt,
+                       .role = std::nullopt });
     CHECK(proposals[1].key == "n2");
     CHECK(proposals[1].schedulerEndpoint.empty());
 }
@@ -527,4 +538,51 @@ TEST_CASE("A node's own record keeps the seat the operator recorded", "[cluster]
     auto const learner = Proposals(ClusterState {}, { Desire("n3", "10.0.0.3:6675", std::nullopt, MemberSeat::Learner) });
     REQUIRE(learner.size() == 1);
     CHECK(learner[0].kind == CommandKind::AddLearner);
+}
+
+TEST_CASE("A node's own key reaches the roster, and no opinion about a peer's leaves it alone",
+          "[cluster][membership][identity]")
+{
+    // #178. A node is the authority on the key it holds, as it is on its scheduler endpoint:
+    // its own record carries the key, and a record that differs from the state in that one
+    // field is re-proposed. Discovery has no opinion about a peer's key, and no opinion must
+    // never clear what the member announced.
+    auto key = Ed25519PublicKey {};
+    key.fill(std::byte { 0x4E });
+    auto withKey = Desire("n1", "10.0.0.1:6675", std::string {});
+    withKey.publicKey = key;
+
+    SECTION("the key is proposed where the state records none")
+    {
+        auto const state = StateOf({ Member("n1", "10.0.0.1:6675") });
+        auto const proposals = Proposals(state, { withKey });
+        REQUIRE(proposals.size() == 1);
+        CHECK(proposals[0].publicKey == std::optional { key });
+    }
+
+    SECTION("and not again once it is recorded")
+    {
+        auto recorded = Member("n1", "10.0.0.1:6675");
+        recorded.publicKey = key;
+        CHECK(Proposals(StateOf({ recorded }), { withKey }).empty());
+    }
+
+    SECTION("a peer about whose key this node knows nothing keeps the one recorded")
+    {
+        auto recorded = Member("n2", "10.0.0.2:6675");
+        recorded.publicKey = key;
+        auto const state = StateOf({ recorded });
+
+        // Nothing differs but the opinion nobody has: nothing is proposed.
+        CHECK(Proposals(state, { Desire("n2", "10.0.0.2:6675") }).empty());
+
+        // It moved: proposed, carrying NO key, which `AddMember` reads as *keep* -- so the
+        // recorded key survives the move rather than being dropped by omission.
+        auto const moved = Proposals(state, { Desire("n2", "10.0.0.9:6675") });
+        REQUIRE(moved.size() == 1);
+        CHECK_FALSE(moved[0].publicKey.has_value());
+        auto applied = state;
+        Apply(applied, moved[0]);
+        CHECK(applied.members[0].publicKey == std::optional { key });
+    }
 }

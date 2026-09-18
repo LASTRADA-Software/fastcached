@@ -29,6 +29,7 @@
 #include "NodeFrameSurface.hpp"
 #include "NodeIdentity.hpp"
 #include "NodeIoLoop.hpp"
+#include "NodeKey.hpp"
 #include "NodeLogging.hpp"
 #include "NodeMembership.hpp"
 #include "NodePresenceTier.hpp"
@@ -436,21 +437,34 @@ using Node::NodeReloader;
 /// @param cliOnly The command-line-only parse a registration is built from.
 /// @param random Where a minted identity's bits come from.
 /// @param logger Where the identity, or the refusal, is reported.
+/// @param publicKey The key this node holds, already resolved (#178); nothing on the install
+///        path, which mints no key, and on a node that holds none.
 /// @return The identity, DISENGAGED when this invocation needs none, or why it could
 ///         not be resolved. `std::expected` over a nested optional, because "no
 ///         identity is wanted here" and "one was wanted and could not be had" are the
-///         two states a caller acts on differently and two optionals render alike.
-[[nodiscard]] std::expected<std::optional<Node::NodeIdentity>, std::string> AdoptNodeIdentity(NodeConfig& cfg,
-                                                                                              NodeConfig& cliOnly,
-                                                                                              ISecureRandom& random,
-                                                                                              ILogger& logger)
+///         two states a caller acts on differently and two optionals render alike. A node
+///         that needs no id but holds a key gets an identity carrying only the key, so the
+///         one `ApplyNodeIdentity` a reload runs applies it too.
+[[nodiscard]] std::expected<std::optional<Node::NodeIdentity>, std::string> AdoptNodeIdentity(
+    NodeConfig& cfg,
+    NodeConfig& cliOnly,
+    ISecureRandom& random,
+    ILogger& logger,
+    std::optional<Ed25519PublicKey> const& publicKey)
 {
     if (Node::NodeIdentityNeed(cfg) != Node::IdentityNeed::Mint)
-        return std::optional<Node::NodeIdentity> {};
+    {
+        if (!publicKey.has_value())
+            return std::optional<Node::NodeIdentity> {};
+        auto keyOnly = Node::NodeIdentity { .id = {}, .origin = Node::NodeIdentityOrigin::Recorded, .publicKey = publicKey };
+        Node::ApplyNodeIdentity(cfg, keyOnly);
+        return std::optional { std::move(keyOnly) };
+    }
 
     auto resolved = Node::ResolveNodeIdentity(Node::NodeStateDirectory(cfg), cfg.nodeId, random);
     if (!resolved.has_value())
         return std::unexpected { std::move(resolved).error() };
+    resolved->publicKey = publicKey;
 
     Node::ApplyNodeIdentity(cfg, *resolved);
     Node::ApplyNodeIdentity(cliOnly, *resolved);
@@ -461,6 +475,38 @@ using Node::NodeReloader;
     // admitted, and an operator who sees it after a restart has lost a state directory.
     logger.Logf(LogLevel::Info, "node identity {} ({})", resolved->id, Node::DescribeNodeIdentityOrigin(resolved->origin));
     return std::optional<Node::NodeIdentity> { *std::move(resolved) };
+}
+
+/// Resolve the identity key this node holds, and say so once.
+///
+/// A function rather than a block in `main` for `AdoptNodeIdentity`'s reason, and what it
+/// decides is `NodeKey`'s: this only reports it. The PUBLIC half is logged whole, in the one
+/// spelling `--node-status` and `@<key>` share; the secret half is never logged, and is
+/// released when this returns -- nothing in this build signs with it yet (#178 PR 3), so it is
+/// not held a moment longer than reading it back needed.
+/// @param cfg The resolved configuration.
+/// @param random Where a minted key's seed comes from.
+/// @param logger Where the key, or its absence, is reported.
+/// @return The public key, DISENGAGED on a node that holds none, or why there is none.
+[[nodiscard]] std::expected<std::optional<Ed25519PublicKey>, std::string> AdoptNodeKey(NodeConfig const& cfg,
+                                                                                       ISecureRandom& random,
+                                                                                       ILogger& logger)
+{
+    auto nodeKey = Node::ResolveNodeKeyFor(cfg, random);
+    if (!nodeKey.has_value())
+        return std::unexpected { std::move(nodeKey).error().message };
+    if (!nodeKey->has_value())
+    {
+        logger.Logf(LogLevel::Info, "{}", Node::NoNodeKeySentence);
+        return std::optional<Ed25519PublicKey> {};
+    }
+
+    auto const& held = **nodeKey;
+    logger.Logf(LogLevel::Info,
+                "identity key {} ({})",
+                FormatEd25519PublicKey(held.pair.PublicKey()),
+                Node::DescribeNodeKeyOrigin(held.origin));
+    return std::optional { held.pair.PublicKey() };
 }
 
 [[nodiscard]] int WorkerBody(NodeConfig const& cfg, ILogger& logger, NodeReloader* reloader)
@@ -1432,8 +1478,13 @@ struct EarlyVerbRow
     // An uninstall reaches neither -- `NodeIdentityNeed` declines it -- because removing
     // a registration is the recovery an operator reaches for when the configuration is
     // already wrong.
+    //
+    // No KEY is minted here (#178), and deliberately: a registration carries no key, the
+    // service mints its own at its first start -- as the account it RUNS as, which is not
+    // necessarily the one installing it, and a key file this installer owned would be one
+    // that account might never be able to read.
     SystemSecureRandom identityRandom;
-    if (auto const adopted = AdoptNodeIdentity(context.cfg, context.cliOnly, identityRandom, context.logger);
+    if (auto const adopted = AdoptNodeIdentity(context.cfg, context.cliOnly, identityRandom, context.logger, std::nullopt);
         !adopted.has_value())
     {
         context.logger.Logf(LogLevel::Error, "{}; refusing to install", adopted.error());
@@ -1857,11 +1908,32 @@ int main(int argc, char** argv)
     // The install path resolves at its OWN site, after its own table, for the same
     // reason and it cannot share this one: `--install-service` returns long before
     // here, and its refusals are `NodeInstallRejection`'s rather than these.
+    //
+    // **The identity KEY first** (#178), so the one `ApplyNodeIdentity` puts the id, this
+    // node's own member entry and its key into the configuration together -- and every
+    // reload candidate after it. Read, or minted into the state directory when there is
+    // none there; a key file that is there and cannot be used is a refusal, never a re-mint.
+    // A node with no state directory holds none, and says so.
     SystemSecureRandom identityRandom;
-    auto const identity = AdoptNodeIdentity(cfg, cliOnly, identityRandom, logger);
+    auto const publicKey = AdoptNodeKey(cfg, identityRandom, logger);
+    if (!publicKey.has_value())
+    {
+        logger.Logf(LogLevel::Error, "{}; refusing to start", publicKey.error());
+        return ExitUsage;
+    }
+
+    auto const identity = AdoptNodeIdentity(cfg, cliOnly, identityRandom, logger, *publicKey);
     if (!identity.has_value())
     {
         logger.Logf(LogLevel::Error, "{}; refusing to start", identity.error());
+        return ExitUsage;
+    }
+
+    // An `@<key>` this node's own `--raft-peer` states is a claim about the machine it is
+    // typed on, so one that is not the key it holds is refused rather than announced.
+    if (auto const contradiction = Node::SelfKeyContradiction(cfg, *publicKey); contradiction.has_value())
+    {
+        logger.Logf(LogLevel::Error, "{}; refusing to start", *contradiction);
         return ExitUsage;
     }
 
@@ -1905,12 +1977,12 @@ int main(int argc, char** argv)
             },
             &ValidateNodeReloadable);
 
-    // A secret is only as private as the file holding it, and this worker has FIVE
-    // such files where the daemon has one. #384 landed that rule and wired only the
-    // daemon; the exposure here is identical for `--requirepass` out of a
-    // configuration file, and WIDER for the four secrets reached by path -- a
-    // world-readable `--cluster-key-file` is the PSK that MACs both discovery proofs
-    // and lease tokens, handed to every account on the machine
+    // A secret is only as private as the file holding it, and this worker has one per
+    // row of `NodeSecretFileTable()` beside its configuration file, where the daemon has
+    // one. #384 landed that rule and wired only the daemon; the exposure here is
+    // identical for `--requirepass` out of a configuration file, and WIDER for the
+    // secrets reached by path -- a world-readable `--cluster-key-file` is the PSK that
+    // MACs both discovery proofs and lease tokens, handed to every account on the machine
     // ([#752](https://github.com/LASTRADA-Software/fastcached/issues/752)).
     //
     // **And re-asked at every accepted reload**, which is the half a snapshot cannot
@@ -1975,7 +2047,7 @@ int main(int argc, char** argv)
     };
 
     // Two arms, and the difference is whether there is a SECOND moment at all. A
-    // worker configured entirely from argv still names four key files and still has to
+    // worker configured entirely from argv still names its key files and still has to
     // be told about them; what it has no use for is the memory that keeps a standing
     // exposure from being repeated, because nothing will re-ask.
     if (reloader.has_value())

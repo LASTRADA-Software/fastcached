@@ -1282,6 +1282,81 @@ tick -- the scheduler answers `NotLeader` and the fleet page goes dark until it 
   on the leader but not yet reached it still refuses votes by its row, so a leader lost in that
   window leaves the cluster waiting for it to return rather than electing around it.
 
+## Identity keys and the roster
+
+[#178](https://github.com/LASTRADA-Software/fastcached/issues/178) PR 2: every node with a
+state directory holds an Ed25519 identity key, and `ClusterState` records members' keys,
+principals admitted by key, and keys revoked for good. Nothing VERIFIES against them yet --
+the cluster key still proves membership -- so every rule below is about getting the record
+right before anything trusts it.
+
+- **Only an ABSENT key file mints.** `node-key` is read back on every start; a file that is
+  there and cannot be used -- unreadable, truncated, not a key file, another build's format,
+  or a seed and a public key that disagree -- is REFUSED by name and left untouched, the
+  `node-id` rule arriving at the file that proves the id. Absent is what the OPEN says
+  (`ENOENT`), never `exists()`, and the mint is an exclusive create with nothing in front of
+  it (`StoreClusterKey`'s idiom). The file stores the public key beside the seed on purpose: a
+  flipped bit in a bare seed is another VALID key, adopted silently. `ctest -R` the
+  `[identity][key]` cases; the truncation case is the one a "re-mint on unreadable" neuter
+  turns red.
+- **A node holds a key when it has a state directory to hold it in** -- consensus, or a named
+  `--cluster-dir` -- and holds NONE otherwise, said at startup. A key minted into a working
+  directory is minted afresh at every boot under the packaged unit (a runtime directory) and
+  lands in `System32` under the SCM: a new machine at every boot is worse than no key.
+  `--install-service` mints no key; the service mints its own, as the account it runs as.
+- **The key file is a secret-by-path row, and the row's path is DERIVED.** `--cluster-dir`
+  moved from the public table to `NodeSecretFileTable()`, whose rows are now PROJECTIONS
+  (`SecretFileRow::path` is a function of the configuration) because the flag names a
+  directory and the secret is the file the node minted inside it. `NodeKeyPath` is the one
+  author of that path, asked by the start and by the row.
+- **A public key has ONE spelling**: 43 characters of unpadded base64url
+  (`FormatEd25519PublicKey` / `ParseEd25519PublicKey`, canonical last character), shown whole
+  everywhere. It travels as its 32 bytes -- in `ClusterState`, in a command, in
+  `NodeRuntimeFields::identityPublicKey` -- and is rendered only at the edge.
+- **`ValidateAgainst` is the courtesy and `Apply` is the guarantee.** The key rules are about
+  what the state already holds, so `Validate(Command)` cannot ask them; every proposer asks
+  `ValidateAgainst(state, command)` so the operator is told, and `Apply` enforces the same
+  rules on commit because two proposals judged against one state can both be appended. The
+  rules share one author (`StandingOf` in `ClusterState.cpp`) so the two cannot drift.
+- **A revoked key is never admitted again, and the refusal says PERMANENT.** `KeyRevoked` is
+  its own `ConsensusErrorCode`, `RefusalSubject::Command` in `RefusalSubjects`, and maps to the
+  generic permanent wire code (`InvalidClusterChange`) -- a code of its own would claim a
+  client acts differently, and none does. `revokedKeys` keeps the WHOLE key and is never
+  shortened.
+- **`RevokeKey` is never dropped at `Apply`.** Every other verb is dropped when its
+  preconditions no longer hold; a revocation is applied whatever its label says, because a
+  dropped revocation is removal failing OPEN. It removes a principal outright and clears a
+  member's key while keeping the member -- removing a member is a quorum change, one at a
+  time, and that is `RemoveMember`'s decision.
+- **Absent is no opinion, again.** A member admission with no key KEEPS the recorded one --
+  unlike the scheduler endpoint, a machine that moves keeps its identity -- and discovery,
+  which has no opinion about a peer's key, can therefore never clear one. A node asserts its
+  OWN key on its self record, as it asserts its own scheduler endpoint.
+- **One key, one identity; one id, one list.** A key held by another id is refused, and an id
+  is a member or a principal, never both. `DecodeState` refuses a snapshot breaking either rule
+  or holding a revoked key live -- the combinations `Apply` never produces.
+- **`@<key>` rides the member token** (`<id>=<host>:<port>@<key>`, split at the first `@`), so
+  `--raft-peer` states a member's key and a service registration re-renders it through
+  `FormatMemberSpec`. On this node's OWN entry a key other than the one it holds is a startup
+  refusal (`SelfKeyContradiction`), never quietly overwritten.
+- **An admission CARRIES the key it parsed, or it must refuse it -- never parse and drop.**
+  A key accepted at the flag and lost on the wire is a member admitted keyless while its
+  operator believes otherwise. So CLUSTER-ADMIT and CLUSTER-ADMIT-LEARNER carry it as a THIRD
+  field (0xFC version 11, `MinSupportedVersion` too), in its TEXT form; absent is a zero-length
+  field read back DISENGAGED by the decoder and nowhere else. The LEADER parses it again, before
+  it proposes: a malformed key is its own counted refusal
+  (`ClusterAdmissionsRefusedMalformedKey`, a row sharing `InvalidClusterChange` with refusals
+  that count nothing -- never `MalformedFrame`, since the frame decoded), and a revoked one is
+  `ValidateAgainst`'s. The receipt echoes the key the COMMAND carries, re-spelled through the
+  one encoder, and an absent one is printed as *none stated*, which KEEPS a recorded key --
+  never a dash, which reads as *holds none*.
+- **The formats moved, both, each refused by name.** `CommandVersion` 2→3 because the layout
+  gained two fields (a key and a role), and a v2 command is judged by its VERSION before its
+  arity, or an intact entry from before the upgrade reads as damage. `StateVersion` 5→6. A
+  state at the previous version is `UnsupportedVersion`, never `MalformedFrame`, and the test
+  builds it in the previous LAYOUT rather than flipping a byte of the current one -- a decoder
+  that judged the arity first passes the flipped-byte test and fails this one.
+
 ## Open work
 
 - **[#144](https://github.com/LASTRADA-Software/fastcached/issues/144)** — a

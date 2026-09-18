@@ -8,6 +8,7 @@
 
 #include <FastCache/Cli/Duration.hpp>
 #include <FastCache/Cluster/ClusterState.hpp>
+#include <FastCache/Core/Ed25519.hpp>
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Distributed/MembershipWire.hpp>
 
@@ -1069,6 +1070,16 @@ namespace
         // **Absent, not empty.** A node running no consensus has no minted identity, and
         // an empty string renders as a value somebody could paste into `--raft-peer`.
         record.push_back({ .name = "node-id", .value = fields.nodeId.empty() ? AbsentCell() : TextCell(fields.nodeId) });
+
+        // **The key this node proves who it is with** (#178), WHOLE, through the one encoder:
+        // it is the string an operator holds against a roster or types after `@` in a
+        // `--raft-peer` token, and an abbreviation would be a display form somebody compares.
+        // Absent for node-id's reason one field along: a node with no state directory holds no
+        // key, and an empty cell would read as a key nobody could type.
+        record.push_back({ .name = "public-key",
+                           .value = fields.runtime.identityPublicKey.has_value()
+                                        ? TextCell(FormatEd25519PublicKey(*fields.runtime.identityPublicKey))
+                                        : AbsentCell() });
         record.push_back({ .name = "uptime-seconds", .value = NumberCell(fields.uptimeSeconds) });
         record.push_back({ .name = "components", .value = TextCell(DescribeComponents(fields.components)) });
 
@@ -1589,13 +1600,19 @@ namespace
             // `seat` is the set the operator admitted the member into (#1449) -- the
             // RECORD, which consensus moves towards one change at a time. What a node is
             // counted as right now is its own `consensus-standing` under `node`.
-            rows.push_back({ TextCell(member.id),
-                             TextCell(std::string { Cluster::MemberSeatName(member.seat) }),
-                             TextCell(member.raftEndpoint),
-                             member.schedulerEndpoint.empty() ? AbsentCell() : TextCell(member.schedulerEndpoint),
-                             TextCell(std::string { Cluster::SchedulerEndpointStateName(member) }) });
+            //
+            // `key` is the member's identity key WHOLE (#178), through the one encoder, and
+            // ABSENT for a member that has not stated one -- which is not a key anybody could
+            // type after `@`.
+            rows.push_back(
+                { TextCell(member.id),
+                  TextCell(std::string { Cluster::MemberSeatName(member.seat) }),
+                  TextCell(member.raftEndpoint),
+                  member.schedulerEndpoint.empty() ? AbsentCell() : TextCell(member.schedulerEndpoint),
+                  TextCell(std::string { Cluster::SchedulerEndpointStateName(member) }),
+                  member.publicKey.has_value() ? TextCell(FormatEd25519PublicKey(*member.publicKey)) : AbsentCell() });
 
-        return TableValue({ "id", "seat", "raft", "scheduler", "scheduler-state" }, std::move(rows));
+        return TableValue({ "id", "seat", "raft", "scheduler", "scheduler-state", "key" }, std::move(rows));
     }
 
     /// Every setting this build knows, with what the cluster has agreed for it.
@@ -1751,6 +1768,12 @@ namespace
     /// One handler for both admission verbs (#1449), the verb a template argument as it is
     /// for the encoder. The seat is reported as REQUESTED, never as recorded: the receipt
     /// does not echo it, because it is the verb's byte and the client already knows it.
+    ///
+    /// The optional third operand is the member's identity key (#178), sent as the TEXT the
+    /// operator typed: the leader reads it through the one parser and refuses, by name, a key
+    /// that is not one. The receipt's key is what the leader RECORDED, and an absent one is
+    /// spelled as what it means -- this admission stated none, which keeps any key already
+    /// recorded -- rather than as a null cell, which would read as *this member holds none*.
     /// @tparam op `Op::ClusterAdmit` (a voter) or `Op::ClusterAdmitLearner`.
     /// @param context What to run against.
     /// @return The answer.
@@ -1760,9 +1783,12 @@ namespace
     {
         constexpr auto seat =
             op == CompileCacheWire::Op::ClusterAdmitLearner ? Cluster::MemberSeat::Learner : Cluster::MemberSeat::Voter;
-        auto const reply = AskNode(context,
-                                   CompileCacheWire::EncodeClusterAdmit<op>(CompileCacheWire::ClusterAdmitRequest {
-                                       .memberId = context.operands[0], .raftEndpoint = context.operands[1] }));
+        auto const publicKey =
+            context.operands.size() > 2 ? std::optional { std::string_view { context.operands[2] } } : std::nullopt;
+        auto const reply =
+            AskNode(context,
+                    CompileCacheWire::EncodeClusterAdmit<op>(CompileCacheWire::ClusterAdmitRequest {
+                        .memberId = context.operands[0], .raftEndpoint = context.operands[1], .publicKey = publicKey }));
         if (!reply.has_value())
             return reply.error();
 
@@ -1783,6 +1809,8 @@ namespace
               Field { .name = "member-id-as-received", .value = TextCell(receipt->memberId) },
               Field { .name = std::format("{}-as-recorded", CompileCacheWire::ConsensusEndpointField),
                       .value = TextCell(receipt->raftEndpoint) },
+              Field { .name = "public-key-as-recorded",
+                      .value = TextCell(receipt->publicKey.value_or("none stated (a key already recorded stays)")) },
               Field { .name = "seat-as-requested", .value = TextCell(std::string { Cluster::MemberSeatName(seat) }) },
               Field { .name = "state", .value = TextCell("appended, not committed") } }));
     }
@@ -2292,8 +2320,8 @@ namespace
         { .name = "cluster-admit",
           .wire = Wire::Node,
           .minOperands = 2,
-          .maxOperands = 2,
-          .operands = " <member-id> <raft-endpoint>",
+          .maxOperands = 3,
+          .operands = " <member-id> <raft-endpoint> [<public-key>]",
           .summary = "add a member as a voter, or record that one has moved",
           .protocolCommand = "cluster-admit",
           .modifiers = Modifier::None,
@@ -2303,8 +2331,8 @@ namespace
         { .name = "cluster-admit-learner",
           .wire = Wire::Node,
           .minOperands = 2,
-          .maxOperands = 2,
-          .operands = " <member-id> <raft-endpoint>",
+          .maxOperands = 3,
+          .operands = " <member-id> <raft-endpoint> [<public-key>]",
           .summary = "add a member as a learner (counted by no quorum), or demote a voter",
           .protocolCommand = "cluster-admit-learner",
           .modifiers = Modifier::None,

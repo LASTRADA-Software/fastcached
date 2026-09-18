@@ -262,8 +262,11 @@ void DiscoveryTier::PublishAuthenticated()
         // no opinion keeps whatever the cluster recorded, and a peer it has no record of
         // is admitted as a VOTER, as discovery always has. Desiring a proven peer as a
         // LEARNER first is the step this leaves for later.
-        members.push_back(Cluster::DesiredMember {
-            .id = peer.nodeId, .raftEndpoint = peer.raftEndpoint, .schedulerEndpoint = std::nullopt, .seat = std::nullopt });
+        members.push_back(Cluster::DesiredMember { .id = peer.nodeId,
+                                                   .raftEndpoint = peer.raftEndpoint,
+                                                   .schedulerEndpoint = std::nullopt,
+                                                   .seat = std::nullopt,
+                                                   .publicKey = std::nullopt });
 
     if (_onPeers && !members.empty())
         _onPeers(members);

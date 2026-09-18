@@ -6,6 +6,7 @@
 #include "StatsGatherer.hpp"
 
 #include <FastCache/Cluster/ClusterState.hpp>
+#include <FastCache/Core/Ed25519.hpp>
 #include <FastCache/Core/Ranges.hpp>
 #include <FastCache/Distributed/MembershipWire.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
@@ -32,6 +33,7 @@
 #include <utility>
 #include <vector>
 
+#include <tests/HexBytes.hpp>
 #include <tests/Unwrap.hpp>
 
 using namespace FastCache;
@@ -962,10 +964,16 @@ TEST_CASE("cluster-members reports who the cluster agreed on, and an unled membe
           Cluster::Command { .kind = Cluster::CommandKind::AddMember,
                              .key = "node-a",
                              .value = "10.0.0.7:6675",
-                             .schedulerEndpoint = "10.0.0.7:6674" });
+                             .schedulerEndpoint = "10.0.0.7:6674",
+                             .publicKey = std::nullopt,
+                             .role = std::nullopt });
     Apply(state,
-          Cluster::Command {
-              .kind = Cluster::CommandKind::AddMember, .key = "node-b", .value = "10.0.0.8:6675", .schedulerEndpoint = {} });
+          Cluster::Command { .kind = Cluster::CommandKind::AddMember,
+                             .key = "node-b",
+                             .value = "10.0.0.8:6675",
+                             .schedulerEndpoint = {},
+                             .publicKey = std::nullopt,
+                             .role = std::nullopt });
     ScriptedNodeExchange node { { ClusterStatusReply(state) } };
 
     auto const answer = RunNodeVerb("cluster-members", node);
@@ -1003,7 +1011,9 @@ TEST_CASE("cluster-members says which absence a scheduler endpoint is: never ann
               Cluster::Command { .kind = Cluster::CommandKind::AddMember,
                                  .key = std::move(id),
                                  .value = std::move(raft),
-                                 .schedulerEndpoint = std::move(scheduler) });
+                                 .schedulerEndpoint = std::move(scheduler),
+                                 .publicKey = std::nullopt,
+                                 .role = std::nullopt });
     };
     admit("node-b", "10.0.0.8:6675", {});
     admit("node-c", "10.0.0.9:6675", "10.0.0.9:6674");
@@ -1027,6 +1037,44 @@ TEST_CASE("cluster-members says which absence a scheduler endpoint is: never ann
     CHECK(rows[1][schedulerState].lexical == "cleared");
 }
 
+TEST_CASE("cluster-members shows each member's key whole, and absent for one that stated none",
+          "[cli][node][cluster][identity]")
+{
+    // #178. The key is the string an operator holds against a member's own `node` output, so
+    // it is rendered WHOLE through the one encoder -- and ABSENT, never empty, for a member
+    // that has not stated one: an empty cell reads as a key nobody could type. Both rows are
+    // asserted, so a column rendering every row alike cannot pass.
+    auto key = Ed25519PublicKey {};
+    key.fill(std::byte { 0x6B });
+
+    Cluster::ClusterState state;
+    Apply(state,
+          Cluster::Command { .kind = Cluster::CommandKind::AddMember,
+                             .key = "node-b",
+                             .value = "10.0.0.8:6675",
+                             .schedulerEndpoint = {},
+                             .publicKey = key,
+                             .role = std::nullopt });
+    Apply(state,
+          Cluster::Command { .kind = Cluster::CommandKind::AddMember,
+                             .key = "node-c",
+                             .value = "10.0.0.9:6675",
+                             .schedulerEndpoint = {},
+                             .publicKey = std::nullopt,
+                             .role = std::nullopt });
+
+    ScriptedNodeExchange node { { ClusterStatusReply(state) } };
+    auto const answer = RunNodeVerb("cluster-members", node);
+    CHECK(answer.outcome == Outcome::Affirmative);
+
+    auto const& rows = RowsOf(answer);
+    REQUIRE(rows.size() == 2);
+    auto const column = ColumnOf(answer, "key");
+    CHECK(rows[0][column].lexical == FormatEd25519PublicKey(key));
+    CHECK(rows[0][column].lexical.size() == Ed25519PublicKeyTextLength);
+    CHECK(rows[1][column].kind == CellKind::Absent);
+}
+
 TEST_CASE("cluster-settings names every key this build knows, set or not", "[cli][node][cluster]")
 {
     // An operator's real question is usually *what CAN I set*, and a report listing only
@@ -1034,7 +1082,8 @@ TEST_CASE("cluster-settings names every key this build knows, set or not", "[cli
     REQUIRE_FALSE(Cluster::SettingTable.empty());
     auto const known = std::string { Cluster::SettingTable[0].name };
 
-    ScriptedNodeExchange node { { ClusterStatusReply({ .members = {}, .settings = {}, .clients = {}, .forgotten = {} }) } };
+    ScriptedNodeExchange node { { ClusterStatusReply(
+        { .members = {}, .settings = {}, .clients = {}, .forgotten = {}, .principals = {}, .revokedKeys = {} }) } };
 
     auto const answer = RunNodeVerb("cluster-settings", node);
     CHECK(answer.outcome == Outcome::Affirmative);
@@ -1062,7 +1111,9 @@ TEST_CASE("cluster-settings keeps a setting this build does not know", "[cli][no
     ScriptedNodeExchange node { { ClusterStatusReply({ .members = {},
                                                        .settings = { { .name = "a-key-from-a-newer-build", .value = "7" } },
                                                        .clients = {},
-                                                       .forgotten = {} }) } };
+                                                       .forgotten = {},
+                                                       .principals = {},
+                                                       .revokedKeys = {} }) } };
 
     auto const answer = RunNodeVerb("cluster-settings", node);
     CHECK(answer.outcome == Outcome::Affirmative);
@@ -1113,8 +1164,8 @@ TEST_CASE("cluster-admit reports what the leader RECORDED, never what is in forc
     //
     // What it RECORDED it knows instantly and alone; whether a majority has taken it, it
     // cannot know. The field names carry that distinction, so they are what this asserts.
-    auto const receipt =
-        Cc::EncodeClusterAdmitReceipt(Cc::ClusterAdmitReceipt { .memberId = "node-c", .raftEndpoint = "10.0.0.9:6675" });
+    auto const receipt = Cc::EncodeClusterAdmitReceipt(
+        Cc::ClusterAdmitReceipt { .memberId = "node-c", .raftEndpoint = "10.0.0.9:6675", .publicKey = std::nullopt });
     ScriptedNodeExchange node { { Cc::EncodeReply(Cc::Status::Ok, receipt) } };
 
     auto const answer = RunNodeVerb("cluster-admit", node, { "node-c", "10.0.0.9:6675" });
@@ -1130,6 +1181,50 @@ TEST_CASE("cluster-admit reports what the leader RECORDED, never what is in forc
     // signal the whole change exists to avoid.
     CHECK(RequiredCell(answer, "state").lexical == "appended, not committed");
     CHECK(RequiredCell(answer, "state").lexical != "replicating");
+}
+
+TEST_CASE("cluster-admit sends the key it was given and reports the key the leader recorded, or none",
+          "[cli][node][cluster][identity]")
+{
+    // #178. Both halves: what went out, read back off the frame, and what came back. A
+    // handler that always sent a key, or never did, passes one of the two sections -- and
+    // so does a renderer that always printed one.
+    constexpr std::string_view KeyText = "KKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKK";
+
+    SECTION("a key operand travels, and the recorded key is printed")
+    {
+        auto const receipt = Cc::EncodeClusterAdmitReceipt(Cc::ClusterAdmitReceipt {
+            .memberId = "node-c", .raftEndpoint = "10.0.0.9:6675", .publicKey = std::string { KeyText } });
+        ScriptedNodeExchange node { { Cc::EncodeReply(Cc::Status::Ok, receipt) } };
+
+        auto const answer = RunNodeVerb("cluster-admit", node, { "node-c", "10.0.0.9:6675", std::string { KeyText } });
+        REQUIRE(answer.outcome == Outcome::Affirmative);
+        CHECK(RequiredCell(answer, "public-key-as-recorded").lexical == KeyText);
+
+        REQUIRE(node.Sent().size() == 1);
+        auto const sent = std::span<std::byte const> { node.Sent().front() }.subspan(Cc::RequestHeaderSize);
+        auto const view = Cc::DecodeClusterAdmitPayload<Cc::Op::ClusterAdmit>(sent);
+        REQUIRE(view.has_value());
+        REQUIRE(Unwrap(view).publicKey.has_value());
+        CHECK(Cc::AsStringView(Unwrap(Unwrap(view).publicKey)) == KeyText);
+    }
+
+    SECTION("no key operand sends none, and the receipt's none is said as what it means")
+    {
+        auto const receipt = Cc::EncodeClusterAdmitReceipt(
+            Cc::ClusterAdmitReceipt { .memberId = "node-c", .raftEndpoint = "10.0.0.9:6675", .publicKey = std::nullopt });
+        ScriptedNodeExchange node { { Cc::EncodeReply(Cc::Status::Ok, receipt) } };
+
+        auto const answer = RunNodeVerb("cluster-admit", node, { "node-c", "10.0.0.9:6675" });
+        REQUIRE(answer.outcome == Outcome::Affirmative);
+        CHECK(RequiredCell(answer, "public-key-as-recorded").lexical.contains("none stated"));
+
+        REQUIRE(node.Sent().size() == 1);
+        auto const sent = std::span<std::byte const> { node.Sent().front() }.subspan(Cc::RequestHeaderSize);
+        auto const view = Cc::DecodeClusterAdmitPayload<Cc::Op::ClusterAdmit>(sent);
+        REQUIRE(view.has_value());
+        CHECK_FALSE(Unwrap(view).publicKey.has_value());
+    }
 }
 
 TEST_CASE("cluster-admit refuses a reply whose receipt it cannot read", "[cli][node][cluster]")
@@ -1194,7 +1289,8 @@ TEST_CASE("a cluster reply another build encoded is refused by its version", "[c
     // The same refusal as above, for the cause an upgrade produces -- and it says so,
     // because *cannot read* alone fits a damaged body too and the two send an operator
     // to different machines.
-    auto body = Cluster::Encode(Cluster::ClusterState { .members = {}, .settings = {}, .clients = {}, .forgotten = {} });
+    auto body = Cluster::Encode(Cluster::ClusterState {
+        .members = {}, .settings = {}, .clients = {}, .forgotten = {}, .principals = {}, .revokedKeys = {} });
     // The state's version is the first field's only byte, after its u32 length prefix.
     REQUIRE(body.size() > 4);
     body[4] = std::byte { 2 };
@@ -1230,7 +1326,7 @@ TEST_CASE("the cluster verbs send the opcodes the wire table names", "[cli][node
     {
         INFO("verb: " << expectation.verb);
         ScriptedNodeExchange node { { ClusterStatusReply(
-            { .members = {}, .settings = {}, .clients = {}, .forgotten = {} }) } };
+            { .members = {}, .settings = {}, .clients = {}, .forgotten = {}, .principals = {}, .revokedKeys = {} }) } };
         (void) RunNodeVerb(expectation.verb, node, expectation.operands);
 
         REQUIRE(node.Sent().size() == 1);
@@ -2187,7 +2283,12 @@ TEST_CASE("cluster-members says which seat each member was admitted into", "[cli
     Cluster::ClusterState state;
     auto const admit = [&state](Cluster::CommandKind kind, std::string id, std::string raft) {
         Apply(state,
-              Cluster::Command { .kind = kind, .key = std::move(id), .value = std::move(raft), .schedulerEndpoint = {} });
+              Cluster::Command { .kind = kind,
+                                 .key = std::move(id),
+                                 .value = std::move(raft),
+                                 .schedulerEndpoint = {},
+                                 .publicKey = std::nullopt,
+                                 .role = std::nullopt });
     };
     admit(Cluster::CommandKind::AddMember, "node-a", "10.0.0.7:6675");
     admit(Cluster::CommandKind::AddLearner, "node-b", "10.0.0.8:6675");
@@ -2216,8 +2317,8 @@ TEST_CASE("cluster-admit-learner reports the seat it asked for, as asked rather 
     // The receipt carries no seat -- it is the verb's byte, and a field echoing the request
     // is the constant the receipt refuses to carry -- so the field NAME says where the value
     // came from. Both verbs, so a handler that spelled one seat for both is red.
-    auto const receipt =
-        Cc::EncodeClusterAdmitReceipt(Cc::ClusterAdmitReceipt { .memberId = "node-c", .raftEndpoint = "10.0.0.9:6675" });
+    auto const receipt = Cc::EncodeClusterAdmitReceipt(
+        Cc::ClusterAdmitReceipt { .memberId = "node-c", .raftEndpoint = "10.0.0.9:6675", .publicKey = std::nullopt });
 
     ScriptedNodeExchange learner { { Cc::EncodeReply(Cc::Status::Ok, receipt) } };
     auto const asLearner = RunNodeVerb("cluster-admit-learner", learner, { "node-c", "10.0.0.9:6675" });
@@ -2264,4 +2365,29 @@ TEST_CASE("`node` reports which set consensus counts it in", "[cli][node][verbs]
     auto const answer = RunNodeVerb("node", none);
     CHECK(answer.outcome == Outcome::Affirmative);
     CHECK(CellOf(answer, "consensus-standing") == nullptr);
+}
+
+TEST_CASE("`node` reports the identity key whole, and absent on a node that holds none", "[cli][node][verbs][identity]")
+{
+    // RFC 8032 TEST 1's public key, and its text as a DIFFERENT implementation spells it
+    // (Python's `base64.urlsafe_b64encode`, padding stripped) -- so the cell is pinned to an
+    // answer the one encoder did not produce.
+    auto key = Cc::NodeRuntimeFields {};
+    key.identityPublicKey = FastCache::Testing::ArrayFromHex<Cc::IdentityPublicKeyBytes>(
+        "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a");
+
+    ScriptedNodeExchange keyed { { StatusReply(
+        { .version = "1.2.3", .nodeId = "node-a", .uptimeSeconds = 5, .surfaces = {}, .components = 0, .runtime = key }) } };
+    auto const answer = RunNodeVerb("node", keyed);
+    CHECK(answer.outcome == Outcome::Affirmative);
+    CHECK(RequiredCell(answer, "public-key").kind == CellKind::Text);
+    CHECK(RequiredCell(answer, "public-key").lexical == "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo");
+
+    // A node with no state directory holds no key: the field is there and says ABSENT, the
+    // way `node-id` does, rather than an empty string somebody could type after `@`.
+    ScriptedNodeExchange keyless { { StatusReply(
+        { .version = "1.2.3", .nodeId = {}, .uptimeSeconds = 5, .surfaces = {}, .components = 0, .runtime = {} }) } };
+    auto const none = RunNodeVerb("node", keyless);
+    CHECK(none.outcome == Outcome::Affirmative);
+    CHECK(RequiredCell(none, "public-key").kind == CellKind::Absent);
 }

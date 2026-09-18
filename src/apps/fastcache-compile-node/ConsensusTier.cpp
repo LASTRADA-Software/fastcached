@@ -222,10 +222,15 @@ ConsensusTier::ConsensusTier(Cluster::ClusterMember self,
     // set a node is in is the operator's decision, recorded by `--cluster-admit` and
     // `--cluster-admit-learner`; a node that asserted its own seat on every pass would
     // undo a demotion one interval after it committed.
+    //
+    // The KEY is the scheduler endpoint's way round again (#178): a node is the authority
+    // on the key it holds, read out of its own state directory, and nobody else can say
+    // it. Absent on a node that holds none, which is no opinion rather than a claim.
     _desired.push_back(Cluster::DesiredMember { .id = _self.id,
                                                 .raftEndpoint = _self.raftEndpoint,
                                                 .schedulerEndpoint = _self.schedulerEndpoint,
-                                                .seat = std::nullopt });
+                                                .seat = std::nullopt,
+                                                .publicKey = _self.publicKey });
 }
 
 std::expected<std::unique_ptr<ConsensusTier>, std::string> ConsensusTier::Start(NodeConfig const& cfg,
@@ -559,7 +564,10 @@ std::expected<Consensus::LogIndex, ConsensusError> ConsensusTier::Propose(Cluste
     // Validated BEFORE it is proposed, which is the only place a change can be
     // refused: an entry is applied after it is committed, when there is nobody left
     // to report a failure to and no way to un-commit it.
-    if (auto const allowed = Cluster::Validate(command); !allowed.has_value())
+    //
+    // Against the state this node has applied (#178), because the rules about keys are
+    // rules about what the roster already holds: a revoked key, one held under another id.
+    if (auto const allowed = Cluster::ValidateAgainst(_application.State(), command); !allowed.has_value())
         return std::unexpected { allowed.error() };
 
     return _driver->Propose(Cluster::Encode(command), std::chrono::steady_clock::now());

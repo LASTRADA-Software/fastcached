@@ -795,6 +795,8 @@ inline constexpr std::array CounterSoleWriterTable {
                         .surface = MetricsSurface::ConsensusPeerWire },
     CounterSoleWriter { .counter = IMetricsSink::Counter::RaftPeerDialsEndedByAcceptor,
                         .surface = MetricsSurface::ConsensusPeerWire },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::ClusterAdmissionsRefusedMalformedKey,
+                        .surface = MetricsSurface::CompileScheduler },
 };
 
 /// Whether every catalogue row has at least one surface attributed to it.

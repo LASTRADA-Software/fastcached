@@ -670,15 +670,25 @@ class SchedulerService
     /// -- so the client already knows it, and a receipt field nobody can vary against
     /// the request is the constant `ClusterAdmitReceipt` refuses to carry. Re-admitting
     /// a member in the other seat is how it is promoted or demoted.
+    ///
+    /// **The key IS echoed, and it is the one field the receipt can disagree with the
+    /// request about** (#178): what arrives is TEXT, parsed here, so the receipt spells back
+    /// the key the command carries rather than the text it was sent. A key that does not
+    /// parse is refused before anything is proposed, and counted
+    /// (`ClusterAdmissionsRefusedMalformedKey`); a key the cluster has revoked is refused by
+    /// `Cluster::ValidateAgainst`, which says whose it was.
     /// @param caller Who is asking.
     /// @param memberId The member's identity.
     /// @param raftEndpoint host:port its consensus port answers on.
+    /// @param publicKey The member's identity key as its 43-character text, or nullopt for a
+    ///        caller with no opinion, which keeps whatever key is recorded.
     /// @param seat Which set of the configuration to record it in; nullopt for a caller
     ///        with no opinion, which keeps the recorded seat (`Cluster::RecordedSeatOf`).
     /// @return The receipt for what was recorded, or why it was refused.
     [[nodiscard]] SchedulerReply ClusterAdmit(CallerContext const& caller,
                                               std::string_view memberId,
                                               std::string_view raftEndpoint,
+                                              std::optional<std::string_view> publicKey,
                                               std::optional<Cluster::MemberSeat> seat);
 
     /// Where the leader answers, when one is known.

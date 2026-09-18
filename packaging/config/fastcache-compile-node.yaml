@@ -203,8 +203,11 @@
 # afterwards be admitted to anybody else's.
 #raft_join: false
 
-# where consensus keeps its durable state. A node that answered a vote and
-# forgot it votes twice in one term after a restart, which is two leaders.
+# this node's state directory: its identity key, its id, and where consensus
+# keeps its durable state. A node that answered a vote and forgot it votes
+# twice in one term after a restart, which is two leaders; a node that lost it
+# is a new identity. Name it on a worker too, or the worker holds no identity
+# key -- its working directory is no place a key would survive a restart.
 #cluster_dir:
 
 # which fleet this node belongs to. Plain text in every beacon and NOT a

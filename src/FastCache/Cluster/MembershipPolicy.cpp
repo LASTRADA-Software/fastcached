@@ -73,13 +73,22 @@ std::vector<Command> MembershipProposals(ClusterState const& state, std::span<De
         // admitted -- `RecordedSeatOf`, the one reading of *no opinion*.
         auto const seat = member.seat.value_or(RecordedSeatOf(state, member.id));
 
-        if (known && it->raftEndpoint == member.raftEndpoint && it->schedulerEndpoint == scheduler && it->seat == seat)
+        // The key by the same rule once more (#178): no opinion is whatever is recorded. The
+        // command carries the opinion itself rather than the resolved value, because
+        // `AddMember` reads an absent key as *keep*, which is this rule stated once more at
+        // the layer that applies it.
+        auto const publicKey = member.publicKey.or_else([&] { return known ? it->publicKey : std::nullopt; });
+
+        if (known && it->raftEndpoint == member.raftEndpoint && it->schedulerEndpoint == scheduler && it->seat == seat
+            && it->publicKey == publicKey)
             continue;
 
         proposals.push_back(Command { .kind = MemberSeatTable[static_cast<std::size_t>(seat)].admittedBy,
                                       .key = member.id,
                                       .value = member.raftEndpoint,
-                                      .schedulerEndpoint = scheduler });
+                                      .schedulerEndpoint = scheduler,
+                                      .publicKey = member.publicKey,
+                                      .role = std::nullopt });
     }
     return proposals;
 }

@@ -12,6 +12,7 @@
 #include <utility>
 #include <vector>
 
+#include <tests/PreviousClusterState.hpp>
 #include <tests/Unwrap.hpp>
 
 using namespace FastCache;
@@ -34,9 +35,12 @@ namespace
 /// @return The command.
 [[nodiscard]] Command Cmd(CommandKind kind, std::string key, std::string value = {}, std::string scheduler = {})
 {
-    return Command {
-        .kind = kind, .key = std::move(key), .value = std::move(value), .schedulerEndpoint = std::move(scheduler)
-    };
+    return Command { .kind = kind,
+                     .key = std::move(key),
+                     .value = std::move(value),
+                     .schedulerEndpoint = std::move(scheduler),
+                     .publicKey = std::nullopt,
+                     .role = std::nullopt };
 }
 
 /// One applied entry carrying a command.
@@ -239,5 +243,31 @@ TEST_CASE("A snapshot another build encoded is refused by its version and change
     auto const records = logger.Snapshot();
     CHECK(std::ranges::any_of(records, [](auto const& record) {
         return record.message.contains("cannot decode") && record.message.contains("version 2");
+    }));
+}
+
+TEST_CASE("A snapshot the previous build wrote, in its own layout, is refused by its version and changes nothing",
+          "[cluster][statemachine][identity]")
+{
+    // #178. The case above flips one byte of a CURRENT encoding, which a decoder judging the
+    // arity first would still call another build's; this one is the previous build's LAYOUT,
+    // which such a decoder calls damage. What a follower does with it: keeps its state, and
+    // names both versions -- an upgrade in progress, never a snapshot to delete.
+    //
+    // A follower handed the snapshot by a leader, and ONLY that. A node restarting on a
+    // snapshot of its own at the previous version takes a different path, which is #1542's.
+    CapturingLogger logger;
+    ClusterStateMachine machine { logger, {} };
+    machine.Apply(Entry(1, Cmd(CommandKind::AddMember, "n9", "10.0.0.9:6675")));
+    auto const before = machine.State();
+
+    machine.RestoreSnapshot(Testing::EncodePreviousClusterState());
+
+    CHECK(machine.State() == before);
+    auto const records = logger.Snapshot();
+    CHECK(std::ranges::any_of(records, [](auto const& record) {
+        return record.message.contains("cannot decode")
+               && record.message.contains(std::format("version {}", Testing::PreviousClusterStateVersion))
+               && record.message.contains("reads 6");
     }));
 }
