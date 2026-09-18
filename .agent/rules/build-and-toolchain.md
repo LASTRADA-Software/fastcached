@@ -5716,13 +5716,38 @@ ext4 tree -- 4902 tests, 0 failures, 153.5s at `CTEST_PARALLEL_LEVEL=16`. A rule
 a layout nobody had run the suite in would be this file's own *a fixture that has never
 completed has told you nothing*, one level up.
 
-### What this does NOT change
+### The gate does this itself (#1227)
 
 `scripts/local-gate.sh` owns `out/build/gate-clang-debug` and `out/build/gate-gcc-release`
-**under the source directory**, so a gate run stays on the Windows mount and stays slow.
-That is stated rather than fixed here: those paths are the gate's, moving them is its own
-change, and a reader who speeds up their dev builds and then finds the gate unchanged should
-meet this sentence rather than a puzzle.
+**under the source directory**, and it keeps owning those paths. What changes is where they
+POINT: when the root is on a filesystem in `protocol_filesystems` and the build home is not,
+each becomes a symlink into `${FASTCACHED_GATE_BUILD_HOME:-$XDG_CACHE_HOME/fastcached/gate}`,
+and every run says which it decided.
+
+- **A symlink, not a path threaded through the script.** The build directory is spelled once,
+  and CMake records the SPELLED path in its cache rather than the resolved one, so
+  `cmake --build --preset` and a re-configure agree with it -- probed through a 9p-to-ext4 link
+  before anything depended on it. `cmake -B` beside `--preset` is the tempting alternative and
+  moves only the configure; the build step reads the preset's own `binaryDir`.
+- **Keyed per worktree, and the key is CHECKED.** Two worktrees sharing one build tree would
+  give one of them a verdict built from the other's sources -- the failure this file exists to
+  refuse. The home is a digest of the root, it records its owner in `ROOT`, and a home naming
+  any other root is REFUSED rather than reused, compared WHOLE so a prefix is another tree.
+- **It sidesteps the hazard the ticket feared rather than managing it.** #1227 assumed a
+  WSL-native gate meant building a COPY of the tree, with every hazard a copy carries: a stale
+  mirror, a dirty tree sampled at a third moment, a `.git` pointing back at a Windows path.
+  Moving only the OUTPUT keeps the gate building the real tree; there is no copy to go stale.
+- **An `unknown` is its own answer.** A root whose filesystem could not be asked -- no
+  `findmnt`, as on macOS -- stays in the tree AND says why, rather than being read as local.
+- **The table is the measured one.** `9p` and `v9fs` (one WSL2 mount, two spellings) and WSL1's
+  `drvfs`. NFS, CIFS and sshfs are protocol filesystems too and are left out on purpose: nobody
+  has measured a build on them here, and the next row comes with its measurement.
+- **Nothing is deleted.** An in-tree build left by an earlier gate is moved aside and named.
+
+What it does NOT reach: the hygiene checks that walk the SOURCE tree still read it over 9p,
+because the sources stay where git and the Windows toolchain can reach them. Those are the
+ticket's own measured rows (11x to 104x). Moving the sources is the copy this section
+declines, so that half is a known residual rather than a forgotten one.
 
 ## What the TSan scope covers, and the three ways it has been wrong
 
