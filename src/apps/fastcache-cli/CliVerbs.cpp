@@ -1769,11 +1769,12 @@ namespace
     /// for the encoder. The seat is reported as REQUESTED, never as recorded: the receipt
     /// does not echo it, because it is the verb's byte and the client already knows it.
     ///
-    /// The optional third operand is the member's identity key (#178), sent as the TEXT the
-    /// operator typed: the leader reads it through the one parser and refuses, by name, a key
-    /// that is not one. The receipt's key is what the leader RECORDED, and an absent one is
-    /// spelled as what it means -- this admission stated none, which keeps any key already
-    /// recorded -- rather than as a null cell, which would read as *this member holds none*.
+    /// The optional third operand is the member's identity key (#178), read here through the
+    /// one parser -- a key that is not one is a usage error and nothing is sent -- and sent as
+    /// its canonical text, which the leader parses once more. The receipt's key is what the
+    /// leader RECORDED, and an absent one is spelled as what it means -- this admission stated
+    /// none, which keeps any key already recorded -- rather than as a null cell, which would
+    /// read as *this member holds none*.
     /// @tparam op `Op::ClusterAdmit` (a voter) or `Op::ClusterAdmitLearner`.
     /// @param context What to run against.
     /// @return The answer.
@@ -1783,12 +1784,27 @@ namespace
     {
         constexpr auto seat =
             op == CompileCacheWire::Op::ClusterAdmitLearner ? Cluster::MemberSeat::Learner : Cluster::MemberSeat::Voter;
-        auto const publicKey =
-            context.operands.size() > 2 ? std::optional { std::string_view { context.operands[2] } } : std::nullopt;
-        auto const reply =
-            AskNode(context,
-                    CompileCacheWire::EncodeClusterAdmit<op>(CompileCacheWire::ClusterAdmitRequest {
-                        .memberId = context.operands[0], .raftEndpoint = context.operands[1], .publicKey = publicKey }));
+        // The key is read HERE, through the one parser, before anything is sent: an operator
+        // who mistyped it is told in front of the command they typed, and nothing reaches a
+        // leader that would only refuse it. What travels is the canonical spelling of what
+        // was read, so the leader's own parse of it cannot disagree.
+        auto keyText = std::optional<std::string> {};
+        if (context.operands.size() > 2)
+        {
+            auto const parsed = ParseEd25519PublicKey(context.operands[2]);
+            if (!parsed.has_value())
+                return Concluded(Outcome::Usage,
+                                 std::format("`{}` is not a public key: {}",
+                                             context.operands[2],
+                                             DescribePublicKeyTextFault(parsed.error())));
+            keyText = FormatEd25519PublicKey(*parsed);
+        }
+        auto const reply = AskNode(
+            context,
+            CompileCacheWire::EncodeClusterAdmit<op>(CompileCacheWire::ClusterAdmitRequest {
+                .memberId = context.operands[0],
+                .raftEndpoint = context.operands[1],
+                .publicKey = keyText.transform([](std::string const& text) { return std::string_view { text }; }) }));
         if (!reply.has_value())
             return reply.error();
 

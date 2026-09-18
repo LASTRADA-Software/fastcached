@@ -291,10 +291,10 @@ majority involved, so that much comes back:
   configuration
 - `public-key-as-recorded` — the member's identity key, when a third operand named one:
   `cluster-admit <member-id> <raft-endpoint> <public-key>`, the 43 characters the member's
-  own `node` report prints as `public-key`. The leader reads the key and refuses one that
-  is not a key, or one the cluster has revoked, before anything is proposed. With no third
-  operand it reads **none stated**, which keeps a key already recorded rather than
-  clearing it
+  own `node` report prints as `public-key`. A third operand that is not a key is a usage
+  error and nothing is sent; the leader reads the key again, and refuses one the cluster
+  has revoked, before anything is proposed. With no third operand it reads **none
+  stated**, which keeps a key already recorded rather than clearing it
 - `seat-as-requested` — `voter` or `learner`, which is the VERB this client sent
   rather than an echo: the receipt does not carry it, because the leader can only have
   answered the verb it was asked
