@@ -306,11 +306,10 @@ TEST_CASE("After --cluster-forget=n3, n3's session closes and its redial is refu
     CHECK(network.sink.received.size() == 1);
     CHECK(network.Refused(Consensus::AcceptorRefusal::KeyWithdrawn) == 1);
 
-    // And its redial is refused, signed, so n3 reports its own removal. Over TCP n3 learns of the
-    // close from its next write, which the reset fails; the in-memory socket accepts writes
-    // nobody reads, so the case makes the redial happen the way a moved address would.
-    REQUIRE(fromN3.transport.Learn(Consensus::PeerEndpoint { .id = "n1", .host = "in-memory", .port = 2 })
-            == Consensus::PeerChange::Readdressed);
+    // And its redial is refused, signed, so n3 reports its own removal. The acceptor closed having
+    // read everything, so n3's first write after it is accepted and lost -- it draws the reset --
+    // and the one after it fails and ends the session.
+    fromN3.Vote(3, "n3");
     fromN3.Vote(3, "n3");
     network.clock.Advance(ReconnectBackoff);
     network.reactor.Drain();
