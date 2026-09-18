@@ -6,6 +6,8 @@
 // fleet that is mid-upgrade from partitioning itself.
 #include <FastCache/Consensus/RaftWire.hpp>
 #include <FastCache/Core/Bytes.hpp>
+#include <FastCache/Core/Ed25519.hpp>
+#include <FastCache/Core/X25519.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -510,14 +512,36 @@ namespace
     return nonce;
 }
 
-/// A tag whose every byte differs from any nonce `DistinctNonce` makes below 0x80.
-/// @return The tag.
-[[nodiscard]] Sha256::Digest DistinctTag()
+/// An ephemeral key whose every byte differs from any nonce `DistinctNonce` makes below 0x40.
+/// @param base The first byte.
+/// @return The key.
+[[nodiscard]] X25519PublicKey DistinctEphemeral(unsigned base)
 {
-    Sha256::Digest tag {};
-    for (std::size_t index = 0; auto& byte: tag)
+    X25519PublicKey key {};
+    for (std::size_t index = 0; auto& byte: key)
+        byte = static_cast<std::byte>(base + index++);
+    return key;
+}
+
+/// A signature whose every byte differs from any nonce or key made above below 0x80.
+/// @return The signature.
+[[nodiscard]] Ed25519Signature DistinctSignature()
+{
+    Ed25519Signature signature {};
+    for (std::size_t index = 0; auto& byte: signature)
         byte = static_cast<std::byte>(0x80 + index++);
-    return tag;
+    return signature;
+}
+
+/// A well-formed proof, for the cases that change one thing about it.
+/// @return The proof.
+[[nodiscard]] RaftWire::ProofFrame SomeProof()
+{
+    return RaftWire::ProofFrame { .dialler = "d",
+                                  .target = "a",
+                                  .nonce = DistinctNonce(0x01),
+                                  .ephemeral = DistinctEphemeral(0x21),
+                                  .signature = DistinctSignature() };
 }
 
 /// Split a handshake frame into its header and payload.
@@ -537,15 +561,17 @@ namespace
 TEST_CASE("Every handshake frame round-trips, field for field", "[consensus][raft][wire][handshake]")
 {
     // Distinct values in every field, for the exemplar table's reason above: two fields
-    // sharing a value would let a transposition through, and a proof's two ids and its
-    // nonce and tag are exactly the fields a copied arm transposes.
-    RaftWire::ChallengeFrame const challenge { .nonce = DistinctNonce(0x10) };
-    RaftWire::ProofFrame const proof {
-        .dialler = "the-dialler", .target = "the-target", .nonce = DistinctNonce(0x40), .tag = DistinctTag()
-    };
+    // sharing a value would let a transposition through, and a proof's two ids, its nonce,
+    // its ephemeral key and its signature are exactly the fields a copied arm transposes.
+    RaftWire::ChallengeFrame const challenge { .nonce = DistinctNonce(0x10), .ephemeral = DistinctEphemeral(0x30) };
+    RaftWire::ProofFrame const proof { .dialler = "the-dialler",
+                                       .target = "the-target",
+                                       .nonce = DistinctNonce(0x40),
+                                       .ephemeral = DistinctEphemeral(0x60),
+                                       .signature = DistinctSignature() };
     RaftWire::VerdictFrame const verdict { .verdict = RaftWire::HandshakeVerdict::OwnId,
                                            .acceptor = "the-acceptor",
-                                           .tag = DistinctTag() };
+                                           .signature = DistinctSignature() };
 
     auto const challengeFrame = RaftWire::EncodeChallenge(challenge);
     auto const proofFrame = RaftWire::EncodeProof(proof);
@@ -568,9 +594,10 @@ TEST_CASE("Every verdict travels as its own byte", "[consensus][raft][wire][hand
 {
     for (auto const decided: { RaftWire::HandshakeVerdict::WrongTarget,
                                RaftWire::HandshakeVerdict::OwnId,
-                               RaftWire::HandshakeVerdict::Accepted })
+                               RaftWire::HandshakeVerdict::Accepted,
+                               RaftWire::HandshakeVerdict::KeyRevoked })
     {
-        RaftWire::VerdictFrame const verdict { .verdict = decided, .acceptor = "a", .tag = DistinctTag() };
+        RaftWire::VerdictFrame const verdict { .verdict = decided, .acceptor = "a", .signature = DistinctSignature() };
         auto const frame = RaftWire::EncodeVerdict(verdict);
         auto const [header, payload] = Split(frame);
         CHECK(RaftWire::DecodeVerdict(header, payload) == verdict);
@@ -579,8 +606,7 @@ TEST_CASE("Every verdict travels as its own byte", "[consensus][raft][wire][hand
 
 TEST_CASE("A handshake frame this reader did not ask for is refused", "[consensus][raft][wire][handshake]")
 {
-    auto const proofFrame =
-        RaftWire::EncodeProof({ .dialler = "d", .target = "a", .nonce = DistinctNonce(0x01), .tag = DistinctTag() });
+    auto const proofFrame = RaftWire::EncodeProof(SomeProof());
     auto const [proofHeader, proofPayload] = Split(proofFrame);
 
     SECTION("another handshake type in its place")
@@ -617,34 +643,63 @@ TEST_CASE("A handshake at the version before the handshake existed is refused", 
     CHECK_FALSE(RaftWire::IsSupported(1));
     CHECK(RaftWire::IsSupported(RaftWire::CurrentVersion));
 
-    auto const frame = RaftWire::EncodeProof(
-        { .dialler = "d", .target = "a", .nonce = DistinctNonce(0x01), .tag = DistinctTag() }, /*version=*/1);
+    auto const frame = RaftWire::EncodeProof(SomeProof(), /*version=*/1);
     auto const [header, payload] = Split(frame);
     auto const decoded = RaftWire::DecodeProof(header, payload);
     REQUIRE_FALSE(decoded.has_value());
     CHECK(decoded.error().code == ConsensusErrorCode::UnsupportedVersion);
 }
 
-TEST_CASE("A peer that spells a configuration without learners is refused at its handshake",
-          "[consensus][raft][wire][handshake][learner]")
+TEST_CASE("A peer at an earlier grammar is refused at its handshake", "[consensus][raft][wire][handshake][learner]")
 {
-    // Version 3 is #1449's: a configuration is two nested lists, voters and learners,
-    // where version 2 had one flat one. The frame's arity did not move, so nothing but
-    // the version tells a version 2 peer's configuration from this build's -- and the
-    // version is refused at the handshake, before a configuration can be misread.
+    // Version 3 was #1449's: a configuration became two nested lists, voters and learners,
+    // where version 2 had one flat one. Version 4 is #178's: the handshake proves each
+    // node's OWN key, so a challenge carries an ephemeral key, a proof an ephemeral key and a
+    // 64-byte signature, and a verdict a signature, where version 3 carried 32-byte MACs under
+    // the cluster's pre-shared key. Accepting a version 3 peer would be the per-connection
+    // fallback to that key, so both are refused at the handshake, before anything is misread.
     //
     // The VALUE is pinned beside the name: every other case here spells
     // `CurrentVersion`, which would go on passing if the constant moved back.
-    CHECK(RaftWire::CurrentVersion == 3);
-    CHECK(RaftWire::MinSupportedVersion == 3);
-    CHECK_FALSE(RaftWire::IsSupported(2));
+    CHECK(RaftWire::CurrentVersion == 4);
+    CHECK(RaftWire::MinSupportedVersion == 4);
 
-    auto const frame = RaftWire::EncodeProof(
-        { .dialler = "d", .target = "a", .nonce = DistinctNonce(0x01), .tag = DistinctTag() }, /*version=*/2);
-    auto const [header, payload] = Split(frame);
-    auto const decoded = RaftWire::DecodeProof(header, payload);
-    REQUIRE_FALSE(decoded.has_value());
-    CHECK(decoded.error().code == ConsensusErrorCode::UnsupportedVersion);
+    for (auto const earlier: { std::uint8_t { 2 }, std::uint8_t { 3 } })
+    {
+        CAPTURE(earlier);
+        CHECK_FALSE(RaftWire::IsSupported(earlier));
+
+        auto const frame = RaftWire::EncodeProof(SomeProof(), earlier);
+        auto const [header, payload] = Split(frame);
+        auto const decoded = RaftWire::DecodeProof(header, payload);
+        REQUIRE_FALSE(decoded.has_value());
+        CHECK(decoded.error().code == ConsensusErrorCode::UnsupportedVersion);
+    }
+}
+
+TEST_CASE("Each handshake frame carries the fields of its version, at their widths", "[consensus][raft][wire][handshake]")
+{
+    // The arity and the widths, pinned as numbers: a signature is Ed25519's 64 bytes and an
+    // ephemeral key X25519's 32, and a row that lost a field would still round-trip against
+    // an encoder that lost it too.
+    auto const fieldsOf = [](RaftWire::MessageType type) {
+        auto const* const row = RaftWire::FindMessage(static_cast<std::uint8_t>(type));
+        REQUIRE(row != nullptr);
+        return row->fieldCount;
+    };
+    CHECK(fieldsOf(RaftWire::MessageType::Challenge) == 2);
+    CHECK(fieldsOf(RaftWire::MessageType::Proof) == 5);
+    CHECK(fieldsOf(RaftWire::MessageType::Verdict) == 3);
+    CHECK(RaftWire::SignatureSize == 64);
+    CHECK(RaftWire::EphemeralKeySize == 32);
+    CHECK(RaftWire::TagSize == 32);
+
+    // And the verdict that reports a revoked key is its own byte, appended rather than
+    // inserted, so no earlier verdict moved.
+    CHECK(static_cast<std::uint8_t>(RaftWire::HandshakeVerdict::WrongTarget) == 0);
+    CHECK(static_cast<std::uint8_t>(RaftWire::HandshakeVerdict::OwnId) == 1);
+    CHECK(static_cast<std::uint8_t>(RaftWire::HandshakeVerdict::Accepted) == 2);
+    CHECK(static_cast<std::uint8_t>(RaftWire::HandshakeVerdict::KeyRevoked) == 3);
 }
 
 TEST_CASE("A handshake frame is refused before any field is trusted", "[consensus][raft][wire][handshake]")
@@ -654,8 +709,7 @@ TEST_CASE("A handshake frame is refused before any field is trusted", "[consensu
         auto const [header, payload] = Split(frame);
         return !RaftWire::DecodeProof(header, payload).has_value();
     };
-    auto const good =
-        RaftWire::ProofFrame { .dialler = "d", .target = "a", .nonce = DistinctNonce(0x01), .tag = DistinctTag() };
+    auto const good = SomeProof();
     CHECK_FALSE(refusedProof(good));
 
     SECTION("an empty id")
@@ -681,22 +735,40 @@ TEST_CASE("A handshake frame is refused before any field is trusted", "[consensu
         CHECK(refusedProof(proof));
     }
 
-    SECTION("a nonce or a tag of the wrong width")
+    SECTION("a nonce, an ephemeral key or a signature of the wrong width")
     {
-        auto const frame = RaftWire::Detail::Frame<RaftWire::MessageType::Proof>(
-            RaftWire::CurrentVersion,
-            std::array { WireFields::AsBytes(std::string_view { "d" }),
-                         WireFields::AsBytes(std::string_view { "a" }),
-                         WireFields::AsBytes(std::string_view { "short" }),
-                         std::span<std::byte const> { DistinctTag() } });
-        auto const [header, payload] = Split(frame);
-        CHECK_FALSE(RaftWire::DecodeProof(header, payload).has_value());
+        // One field short at a time, each against a frame otherwise well-formed, so the
+        // refusal is that field's and not a neighbour's.
+        auto const nonce = DistinctNonce(0x01);
+        auto const ephemeral = DistinctEphemeral(0x21);
+        auto const signature = DistinctSignature();
+        auto const shortField = WireFields::AsBytes(std::string_view { "short" });
+        auto const proofWith = [&](std::span<std::byte const> nonceField,
+                                   std::span<std::byte const> ephemeralField,
+                                   std::span<std::byte const> signatureField) {
+            return RaftWire::Detail::Frame<RaftWire::MessageType::Proof>(
+                RaftWire::CurrentVersion,
+                std::array { WireFields::AsBytes(std::string_view { "d" }),
+                             WireFields::AsBytes(std::string_view { "a" }),
+                             nonceField,
+                             ephemeralField,
+                             signatureField });
+        };
+        auto const decodes = [](std::vector<std::byte> const& frame) {
+            auto const [header, payload] = Split(frame);
+            return RaftWire::DecodeProof(header, payload).has_value();
+        };
+
+        CHECK(decodes(proofWith(nonce, ephemeral, signature)));
+        CHECK_FALSE(decodes(proofWith(shortField, ephemeral, signature)));
+        CHECK_FALSE(decodes(proofWith(nonce, shortField, signature)));
+        CHECK_FALSE(decodes(proofWith(nonce, ephemeral, shortField)));
     }
 
     SECTION("a verdict byte naming no verdict")
     {
         auto frame = RaftWire::EncodeVerdict(
-            { .verdict = RaftWire::HandshakeVerdict::Accepted, .acceptor = "a", .tag = DistinctTag() });
+            { .verdict = RaftWire::HandshakeVerdict::Accepted, .acceptor = "a", .signature = DistinctSignature() });
         // The verdict is the first field: header, then a four-byte length, then the byte.
         frame[RaftWire::HeaderSize + WireFields::FieldPrefixSize] =
             std::byte { static_cast<std::uint8_t>(RaftWire::HandshakeVerdict::Last) };

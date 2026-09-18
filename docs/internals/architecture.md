@@ -50,7 +50,9 @@ src/FastCache/
                 settings every member must agree on
   Consensus/    Raft, split into a pure state machine (RaftNode) and a coroutine
                 driver, behind IRaftStorage / IRaftTransport / IRaftStateMachine;
-                plus RaftLog, RaftWire, RaftPeerTransport/RaftPeerServer,
+                plus RaftLog, RaftWire, RaftPeerSession (the handshake each peer
+                connection proves both ends' identity keys with, behind
+                IRaftPeerIdentity), RaftPeerTransport/RaftPeerServer,
                 RaftMembership, and RaftClusterHarness (a whole cluster in one
                 process, against scripted partitions, loss and restarts)
   Cli/          UsageDoc (usage text as data) and Options (the one parse loop),

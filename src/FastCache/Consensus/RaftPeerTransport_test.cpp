@@ -4,13 +4,13 @@
 // than a socket: the properties worth pinning are about queueing, dropping and
 // shutdown, and a real network would make each of them a race.
 //
-// The scripted socket is an ACCEPTOR as well as a sink (#1308): it challenges, judges
-// the transport's proof with the real `AcceptorHandshake`, answers with a verdict, and
-// then checks every frame's tag before recording it -- so "a frame reached the peer"
-// still means what it meant, on a connection that proved the key.
+// The scripted socket is an ACCEPTOR as well as a sink (#1308, #178): it challenges, judges
+// the transport's proof with the real `AcceptorHandshake` under an identity of the case's
+// choosing, answers with a verdict, and then checks every frame's tag under the session it
+// agreed before recording it -- so "a frame reached the peer" still means what it meant, on a
+// connection whose two ends proved their ids.
 #include <FastCache/Async/SleepUntil.hpp>
 #include <FastCache/Async/TestReactor.hpp>
-#include <FastCache/Cluster/PskRaftPeerCredential.hpp>
 #include <FastCache/Consensus/RaftPeerSession.hpp>
 #include <FastCache/Consensus/RaftPeerTransport.hpp>
 #include <FastCache/Consensus/RaftWire.hpp>
@@ -18,7 +18,7 @@
 #include <FastCache/Core/ISecureRandom.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Core/Nonce.hpp>
-#include <FastCache/Core/SecureBytes.hpp>
+#include <FastCache/Core/SessionSeal.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Net/InMemoryTransport.hpp>
 
@@ -42,6 +42,7 @@
 #include <utility>
 #include <vector>
 
+#include <tests/RaftPeerKeyFakes.hpp>
 #include <tests/SecureRandomFakes.hpp>
 
 using namespace FastCache;
@@ -51,44 +52,19 @@ using namespace std::chrono_literals;
 namespace
 {
 
-/// The cluster key every well-behaved end in this file holds.
-[[nodiscard]] SecureByteBuffer ClusterKey()
+/// A roster naming every member any case here dials or is, each under its own key.
+/// @return A fresh one, so a case that revokes changes nobody else's.
+[[nodiscard]] std::shared_ptr<Testing::SharedRoster> Roster()
 {
-    return SecureByteBuffer(32, std::byte { 0x5A });
+    return Testing::SharedRoster::Of({ "n1", "n2", "n3" });
 }
 
-/// A key the transport under test does not hold.
-[[nodiscard]] SecureByteBuffer StrangerKey()
-{
-    return SecureByteBuffer(32, std::byte { 0x33 });
-}
-
-/// An acceptor's credential that verifies every proof and signs with a key the cluster
-/// does not hold: an impostor that says yes to everybody.
-class AcceptsEverything final: public IRaftPeerCredential
-{
-  public:
-    [[nodiscard]] Sha256::Digest Sign(RaftPeerMac purpose, WireFields::FieldList fields) const override
-    {
-        return _stranger.Sign(purpose, fields);
-    }
-
-    [[nodiscard]] bool Verify(RaftPeerMac /*purpose*/,
-                              WireFields::FieldList /*fields*/,
-                              Sha256::Digest const& /*presented*/) const override
-    {
-        return true;
-    }
-
-  private:
-    Cluster::PskRaftPeerCredential _stranger { StrangerKey() };
-};
-
-/// The bytes the scripted acceptor draws its nonce from on the connection with @p seed.
+/// The bytes the scripted acceptor draws on the connection with @p seed: its nonce, and --
+/// the script cycling -- the same bytes again as its ephemeral secret.
 ///
 /// Scripted rather than drawn, so the acceptor can be REBUILT from the seed when the proof
-/// arrives and hold the nonce its challenge carried. Distinct for every seed below 256, which
-/// is more connections than any case here opens.
+/// arrives and hold the nonce and the ephemeral secret its challenge carried. Distinct for
+/// every seed below 256, which is more connections than any case here opens.
 /// @param seed The connection's seed.
 /// @return The bytes.
 [[nodiscard]] std::vector<std::byte> ConnectionNonceScript(std::uint64_t seed)
@@ -142,21 +118,25 @@ class RecordingSocket final: public ISocket
         /// What one connection is given, taken in one step under the lock.
         struct Connection
         {
-            std::shared_ptr<IRaftPeerCredential const> acceptorKey; ///< What its acceptor holds.
-            AcceptorScript script { AcceptorScript::Answers };      ///< How its acceptor opens.
-            std::uint64_t seed { 0 };                               ///< Its nonce seed.
+            std::string machine;                                 ///< Whose key its acceptor signs with.
+            std::shared_ptr<Testing::SharedRoster const> roster; ///< What its acceptor believes.
+            AcceptorScript script { AcceptorScript::Answers };   ///< How its acceptor opens.
+            std::uint64_t seed { 0 };                            ///< Its nonce seed.
         };
 
         /// @return The next connection's acceptor, and a seed no other connection has.
         [[nodiscard]] Connection NextConnection()
         {
             std::scoped_lock const guard { mutex };
-            return Connection { .acceptorKey = acceptorKey, .script = script, .seed = nextSeed++ };
+            return Connection { .machine = acceptorMachine, .roster = acceptorRoster, .script = script, .seed = nextSeed++ };
         }
 
-        /// What the acceptor holds. The cluster's key unless a case says otherwise.
-        std::shared_ptr<IRaftPeerCredential const> acceptorKey { std::make_shared<Cluster::PskRaftPeerCredential>(
-            ClusterKey()) };
+        /// Whose private key the acceptor signs with. Empty means "the id it answers as",
+        /// which is what every honest address does.
+        std::string acceptorMachine;
+
+        /// What the acceptor believes about everybody's keys.
+        std::shared_ptr<Testing::SharedRoster> acceptorRoster { Roster() };
 
         /// Who the acceptor is. Unset means "whichever member was dialled", which is
         /// what every honest address answers as.
@@ -179,16 +159,20 @@ class RecordingSocket final: public ISocket
     /// @param connection What this connection's acceptor is.
     RecordingSocket(std::shared_ptr<Record> record, Record::Connection connection):
         _record { std::move(record) },
-        _acceptorKey { std::move(connection.acceptorKey) },
+        _machine { std::move(connection.machine) },
+        _roster { std::move(connection.roster) },
         _script { connection.script },
         _seed { connection.seed }
     {
         switch (_script)
         {
             case AcceptorScript::Answers: {
+                // The challenge draws nothing from who the acceptor is, so any identity makes it;
+                // the one that JUDGES is built when the proof names whom it dialled.
                 Testing::ScriptedSecureRandom random { ConnectionNonceScript(_seed) };
-                auto const challenge = RaftWire::EncodeChallenge(
-                    AcceptorHandshake::Create(*_acceptorKey, "unused", random).value().Challenge());
+                Testing::TestPeerIdentity const anyone { "unused", Testing::TestKeyPair("unused"), _roster };
+                auto const challenge =
+                    RaftWire::EncodeChallenge(AcceptorHandshake::Create(anyone, random).value().Challenge());
                 _inbound.insert(_inbound.end(), challenge.begin(), challenge.end());
                 break;
             }
@@ -277,7 +261,7 @@ class RecordingSocket final: public ISocket
         else
         {
             auto const frame = buffer.first(buffer.size() - RaftWire::TagSize);
-            Sha256::Digest tag {};
+            SessionTag tag {};
             std::ranges::copy(buffer.last(RaftWire::TagSize), tag.begin());
             if (_opener->Open(frame.first(RaftWire::HeaderSize), frame.subspan(RaftWire::HeaderSize), tag))
                 _record->writes.emplace_back(frame.begin(), frame.end());
@@ -332,9 +316,10 @@ class RecordingSocket final: public ISocket
   private:
     /// Judge the proof the transport wrote, and queue the verdict for its next read.
     ///
-    /// The real `AcceptorHandshake`, rebuilt from this connection's script so its nonce is
-    /// the one the challenge carried. Rebuilt rather than kept because who this acceptor
-    /// IS may be "whoever was dialled", which is known only once the proof names it.
+    /// The real `AcceptorHandshake`, rebuilt from this connection's script so its nonce and
+    /// its ephemeral secret are the ones the challenge carried. Rebuilt rather than kept
+    /// because who this acceptor IS may be "whoever was dialled", which is known only once
+    /// the proof names it.
     /// @param buffer The proof frame.
     /// @return The write's result.
     [[nodiscard]] IoAwaitable AnswerProof(std::span<std::byte const> buffer)
@@ -354,20 +339,22 @@ class RecordingSocket final: public ISocket
         }
 
         Testing::ScriptedSecureRandom random { ConnectionNonceScript(_seed) };
-        auto handshake = AcceptorHandshake::Create(*_acceptorKey, self, random).value();
-        auto const judgement = handshake.Judge(*proof);
+        Testing::TestPeerIdentity const identity { self, Testing::TestKeyPair(_machine.empty() ? self : _machine), _roster };
+        auto handshake = AcceptorHandshake::Create(identity, random).value();
+        auto judgement = handshake.Judge(*proof);
         if (judgement.verdict.has_value())
         {
             auto const verdict = RaftWire::EncodeVerdict(*judgement.verdict);
             _inbound.insert(_inbound.end(), verdict.begin(), verdict.end());
         }
-        if (judgement.outcome == ProofOutcome::Accepted)
-            _opener.emplace(*_acceptorKey, judgement.nonces);
+        if (judgement.outcome == ProofOutcome::Accepted && judgement.session.has_value())
+            _opener.emplace(*std::move(judgement.session));
         return IoAwaitable { IoResult { buffer.size() } };
     }
 
     std::shared_ptr<Record> _record;
-    std::shared_ptr<IRaftPeerCredential const> _acceptorKey;
+    std::string _machine;
+    std::shared_ptr<Testing::SharedRoster const> _roster;
     AcceptorScript _script { AcceptorScript::Answers };
     std::uint64_t _seed { 0 };
     std::deque<std::byte> _inbound;
@@ -491,12 +478,18 @@ struct Harness
     ScriptedConnector connector { record, reactor };
     CapturingLogger logger;
     AtomicMetricsSink metrics;
-    Cluster::PskRaftPeerCredential credential { ClusterKey() };
     SystemSecureRandom random;
+
+    /// What the transport believes about everybody's keys. A case may replace it, or revoke
+    /// from it, before `Build`; revoking after is a key withdrawn from an open session.
+    std::shared_ptr<Testing::SharedRoster> roster { Roster() };
 
     /// Where the transport draws its nonces: `random`, unless a case points it elsewhere
     /// before `Build`.
     ISecureRandom* nonces { &random };
+
+    /// Who the transport is: n1, under its own key, over `roster`. Built by `Build`.
+    std::unique_ptr<Testing::TestPeerIdentity const> identity;
 
     std::unique_ptr<RaftPeerTransport> transport;
 
@@ -517,8 +510,9 @@ struct Harness
     /// @param options Timeouts and queue bound.
     void Build(PeerTransportOptions options = {})
     {
-        transport = std::make_unique<RaftPeerTransport>(
-            NodeId { "n1" }, OnePeer(), reactor, connector, logger, metrics, credential, *nonces, options);
+        identity = Testing::TestPeerIdentity::Honest("n1", roster);
+        transport =
+            std::make_unique<RaftPeerTransport>(OnePeer(), reactor, connector, logger, metrics, *identity, *nonces, options);
     }
 
     /// Build the transport over one peer and start its sender.
@@ -658,12 +652,12 @@ TEST_CASE("A message for this node itself is not sent anywhere", "[consensus][ra
     ScriptedConnector connector { record, reactor };
     NullLogger logger;
     AtomicMetricsSink metrics;
-    Cluster::PskRaftPeerCredential const credential { ClusterKey() };
+    auto const identity = Testing::TestPeerIdentity::Honest("n1", Roster());
     SystemSecureRandom random;
 
     std::vector<PeerEndpoint> peers { PeerEndpoint { .id = "n1", .host = "self", .port = 1 },
                                       PeerEndpoint { .id = "n2", .host = "unused", .port = 2 } };
-    RaftPeerTransport transport { "n1", std::move(peers), reactor, connector, logger, metrics, credential, random };
+    RaftPeerTransport transport { std::move(peers), reactor, connector, logger, metrics, *identity, random };
     transport.Start();
     reactor.Drain();
 
@@ -892,10 +886,10 @@ TEST_CASE("Stop is idempotent and safe before Start", "[consensus][raft][transpo
     ScriptedConnector connector { record, reactor };
     NullLogger logger;
     AtomicMetricsSink metrics;
-    Cluster::PskRaftPeerCredential const credential { ClusterKey() };
+    auto const identity = Testing::TestPeerIdentity::Honest("n1", Roster());
     SystemSecureRandom random;
 
-    RaftPeerTransport transport { "n1", OnePeer(), reactor, connector, logger, metrics, credential, random };
+    RaftPeerTransport transport { OnePeer(), reactor, connector, logger, metrics, *identity, random };
     transport.Stop();
     transport.Stop();
     CHECK(transport.SendersRunning() == 0);
@@ -1108,7 +1102,7 @@ TEST_CASE("A peer learned after a stop is refused", "[consensus][raft][transport
     CHECK(harness.transport->SendersRunning() == 0);
 }
 
-TEST_CASE("An acceptor that proves the key is sent the messages, and nothing is counted",
+TEST_CASE("An acceptor that proves its id is sent the messages, and nothing is counted",
           "[consensus][raft][transport][handshake]")
 {
     Harness harness;
@@ -1128,12 +1122,13 @@ TEST_CASE("An acceptor that proves the key is sent the messages, and nothing is 
     harness.RequestStopAndDrain();
 }
 
-TEST_CASE("An acceptor without the key is never sent a Raft message", "[consensus][raft][transport][handshake]")
+TEST_CASE("An acceptor that holds no key for this node closes, and is never sent a Raft message",
+          "[consensus][raft][transport][handshake]")
 {
-    // An impostor at the member's address: it answers every step of the handshake, and
-    // its verdict is signed with a key that is not the cluster's.
+    // A member that was never given n1's key: it cannot verify the proof, so it has no verdict
+    // it may sign, and what this end sees is the connection ending after its proof.
     Harness harness;
-    harness.record->acceptorKey = std::make_shared<Cluster::PskRaftPeerCredential>(StrangerKey());
+    harness.record->acceptorRoster = Testing::SharedRoster::Of({ "n2", "n3" });
     harness.Start();
 
     harness.transport->Send("n2", Vote(1));
@@ -1141,20 +1136,19 @@ TEST_CASE("An acceptor without the key is never sent a Raft message", "[consensu
 
     CHECK(harness.Writes() == 0);
     CHECK(harness.transport->ConnectedPeers() == 0);
-    // It cannot sign a verdict for a proof it could not verify, so what this end sees is
-    // the connection ending after its proof -- the row that names a key mismatch.
     CHECK(harness.Refused(DiallerRefusal::EndedByAcceptor) == 1);
 
     harness.RequestStopAndDrain();
 }
 
-TEST_CASE("A verdict signed with another key is refused as the acceptor's proof", "[consensus][raft][transport][handshake]")
+TEST_CASE("A verdict signed with another machine's key is refused as the acceptor's proof",
+          "[consensus][raft][transport][handshake]")
 {
-    // The impostor that goes further than closing: it accepts every proof it is shown --
-    // which is what an impostor wants -- and signs its acceptance with the key it has,
-    // which is not this cluster's.
+    // The impostor that goes further than closing: it answers at n2's address AS n2, judges
+    // this node's proof honestly -- it holds the roster, every public key -- and signs its
+    // acceptance with the only private key it has, which is not n2's.
     Harness harness;
-    harness.record->acceptorKey = std::make_shared<AcceptsEverything>();
+    harness.record->acceptorMachine = "impostor";
     harness.Start();
 
     harness.transport->Send("n2", Vote(1));
@@ -1169,11 +1163,11 @@ TEST_CASE("A verdict signed with another key is refused as the acceptor's proof"
 
 TEST_CASE("A signed wrong-target verdict is counted as such, and nothing is sent", "[consensus][raft][transport][handshake]")
 {
-    // #178's shape from the dialling end: the address this node has for n2 now answers as
-    // n9. Both hold the key, so the refusal is SIGNED and reported by name -- never as
-    // the key mismatch an unsigned close would read as (#1308, A1).
+    // The address this node has for n2 now answers as n3. Both prove their ids, so the
+    // refusal is SIGNED and reported by name -- never as the key problem an unsigned close
+    // would read as (#1308, A1).
     Harness harness;
-    harness.record->acceptorId = "n9";
+    harness.record->acceptorId = "n3";
     harness.Start();
 
     harness.transport->Send("n2", Vote(1));
@@ -1189,7 +1183,8 @@ TEST_CASE("A signed wrong-target verdict is counted as such, and nothing is sent
 
 TEST_CASE("A signed own-id verdict is counted as such, and nothing is sent", "[consensus][raft][transport][handshake]")
 {
-    // A second machine answering to this node's own id: a copied --cluster-dir.
+    // A second machine answering to this node's own id, holding this node's private key: a
+    // copied --cluster-dir. Only that key proves n1, so only such a copy can send this.
     Harness harness;
     harness.record->acceptorId = "n1";
     harness.Start();
@@ -1199,6 +1194,96 @@ TEST_CASE("A signed own-id verdict is counted as such, and nothing is sent", "[c
     CHECK(harness.Refused(DiallerRefusal::EndedByAcceptor) == 0);
 
     harness.RequestStopAndDrain();
+}
+
+TEST_CASE("An acceptor this node holds no key for is sent nothing, counted by name",
+          "[consensus][raft][transport][handshake]")
+{
+    // The member answered and signed; this node cannot tell whether it is n2, because it was
+    // never given n2's key. Its own row, apart from a forgery: the remedy is to give the key.
+    Harness harness;
+    harness.roster = Testing::SharedRoster::Of({ "n1", "n3" });
+    harness.Start();
+
+    harness.transport->Send("n2", Vote(1));
+    harness.reactor.Drain();
+
+    CHECK(harness.Writes() == 0);
+    CHECK(harness.transport->ConnectedPeers() == 0);
+    CHECK(harness.Refused(DiallerRefusal::AcceptorKeyUnknown) == 1);
+    CHECK(harness.Refused(DiallerRefusal::AcceptorProof) == 0);
+
+    harness.RequestStopAndDrain();
+}
+
+TEST_CASE("An acceptor whose key the cluster revoked is sent nothing, counted by name",
+          "[consensus][raft][transport][handshake]")
+{
+    // A removed machine still answering at an address this node dials, with the key it
+    // always had: it verifies, under a key this node's roster has revoked.
+    Harness harness;
+    harness.roster->Revoke("n2");
+    harness.Start();
+
+    harness.transport->Send("n2", Vote(1));
+    harness.reactor.Drain();
+
+    CHECK(harness.Writes() == 0);
+    CHECK(harness.transport->ConnectedPeers() == 0);
+    CHECK(harness.Refused(DiallerRefusal::AcceptorKeyRevoked) == 1);
+    CHECK(harness.Refused(DiallerRefusal::AcceptorProof) == 0);
+
+    harness.RequestStopAndDrain();
+}
+
+TEST_CASE("A signed verdict that this node's key was revoked is counted by name, and nothing is sent",
+          "[consensus][raft][transport][handshake]")
+{
+    // This machine was removed from the cluster. The acceptor could verify its proof -- under
+    // a revoked key -- so it says so, signed, and this node reports its own removal rather than
+    // a key problem at n2.
+    Harness harness;
+    harness.record->acceptorRoster->Revoke("n1");
+    harness.Start();
+
+    CHECK(harness.Writes() == 0);
+    CHECK(harness.transport->ConnectedPeers() == 0);
+    CHECK(harness.Refused(DiallerRefusal::OwnKeyRevoked) == 1);
+    CHECK(harness.Refused(DiallerRefusal::EndedByAcceptor) == 0);
+
+    harness.RequestStopAndDrain();
+}
+
+TEST_CASE("A key revoked while its session is open ends the session before the next frame, counted",
+          "[consensus][raft][transport][handshake][revocation]")
+{
+    // #178: an applied `RevokeKey` closes the sessions that key proved. The roster is asked
+    // before each frame is sealed, so the frame after the revocation is never written, and
+    // the redial is judged against the roster as it is then.
+    constexpr auto Backoff = 10ms;
+    Harness harness;
+    harness.Start(PeerTransportOptions { .dialTimeout = 50ms, .reconnectBackoff = Backoff, .stopWakeBound = 5ms });
+
+    harness.transport->Send("n2", Vote(1));
+    harness.reactor.Drain();
+    REQUIRE(harness.Writes() == 1);
+    REQUIRE(harness.transport->ConnectedPeers() == 1);
+
+    harness.roster->Revoke("n2");
+    harness.transport->Send("n2", Vote(2));
+    harness.reactor.Drain();
+
+    CHECK(harness.Writes() == 1);
+    CHECK(harness.Refused(DiallerRefusal::KeyWithdrawn) == 1);
+    CHECK(harness.transport->ConnectedPeers() == 0);
+
+    harness.clock.Advance(Backoff);
+    harness.reactor.Drain();
+    CHECK(harness.Refused(DiallerRefusal::AcceptorKeyRevoked) == 1);
+    CHECK(harness.transport->ConnectedPeers() == 0);
+    CHECK(harness.Writes() == 1);
+
+    harness.RequestStopAndDrain(5ms);
 }
 
 TEST_CASE("An acceptor that never challenges is abandoned at the handshake bound", "[consensus][raft][transport][handshake]")

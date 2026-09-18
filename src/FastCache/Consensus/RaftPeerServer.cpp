@@ -60,12 +60,13 @@ namespace
         ISocket* _socket;
     };
 
-    /// A connection that has proved the key: who it proved, and the session its frames
-    /// are bound to.
+    /// A connection that has proved its id: who it proved, with which key, and the session
+    /// its frames are bound to.
     struct ProvenPeer
     {
-        NodeId dialler;       ///< The member the connection proved.
-        SessionNonces nonces; ///< What its frames are MACed under.
+        NodeId dialler;             ///< The member the connection proved.
+        Ed25519PublicKey provenKey; ///< The key it proved that with; re-checked on every frame.
+        SessionKey session;         ///< What its frames are sealed under.
     };
 
     /// The tag after a session frame, copied out of what the reader returned.
@@ -104,7 +105,7 @@ struct PeerServerAccess
                                                      ByteReader* reader,
                                                      std::string peer);
 
-    /// Read, check and deliver the frames of a connection that proved the key.
+    /// Read, check and deliver the frames of a connection that proved its id.
     /// @param self The server.
     /// @param reader The connection's reader.
     /// @param peer The address the connection came from.
@@ -154,7 +155,7 @@ Task<std::optional<ProvenPeer>> PeerServerAccess::Handshake(RaftPeerServer* self
 
     // Drawn before anything is written: a connection this node cannot challenge with a fresh
     // nonce is one it must not challenge at all (#1527), so it is closed unchallenged.
-    auto begun = AcceptorHandshake::Create(self->_credential, self->_self, self->_random);
+    auto begun = AcceptorHandshake::Create(self->_identity, self->_random);
     if (!begun.has_value())
     {
         self->NoteNoNonce(peer, begun.error());
@@ -218,18 +219,19 @@ Task<std::optional<ProvenPeer>> PeerServerAccess::Handshake(RaftPeerServer* self
     }
 
     auto judgement = handshake.Judge(*proof);
-    // Refused, or no verdict to send, which `Judge` produces together: the second clause
-    // is the first said about the value this function goes on to read.
-    if (judgement.outcome == ProofOutcome::Refused || !judgement.verdict.has_value())
+
+    // Answered with nothing: a verdict exists only for a proof whose signature verified. The
+    // claimed id is not printed for either -- it is exactly what nobody proved.
+    if (!judgement.verdict.has_value())
     {
-        // Answered with nothing: a verdict exists only for a proof whose MAC verified.
-        self->NotePreAuthRefusal(AcceptorRefusal::Proof, peer, "");
+        self->NotePreAuthRefusal(
+            judgement.outcome == ProofOutcome::UnknownKey ? AcceptorRefusal::UnknownKey : AcceptorRefusal::Proof, peer, "");
         co_return std::nullopt;
     }
 
-    // Every outcome from here is about a peer that holds the key, so each is answered
-    // SIGNED -- including the two refusals, which a bare close would leave the dialler to
-    // report as a wrong key (#1308, A1).
+    // Every outcome from here is about a peer whose signature verified, so each is answered
+    // SIGNED -- including the refusals, which a bare close would leave the dialler to report as
+    // its key being unknown here (#1308, A1).
     auto const verdict = RaftWire::EncodeVerdict(*judgement.verdict);
     auto const written = co_await socket->Write(verdict);
     auto const sent = written.has_value() && *written == verdict.size();
@@ -240,12 +242,20 @@ Task<std::optional<ProvenPeer>> PeerServerAccess::Handshake(RaftPeerServer* self
             self->NoteProvenRefusal(AcceptorRefusal::WrongTarget,
                                     peer,
                                     judgement.dialler,
-                                    std::format("it dialled {} and this node is {}", proof->target, self->_self));
+                                    std::format("it dialled {} and this node is {}", proof->target, self->_identity.Self()));
             co_return std::nullopt;
         case ProofOutcome::OwnId:
             self->NoteProvenRefusal(AcceptorRefusal::OwnId, peer, judgement.dialler, "");
             co_return std::nullopt;
-        case ProofOutcome::Refused:
+        case ProofOutcome::RevokedKey:
+            // The key is named, whole: it is what the signature proved, and it is what an
+            // operator matches against the revocation they made.
+            self->NotePreAuthRefusal(AcceptorRefusal::RevokedKey,
+                                     peer,
+                                     std::format("the key is {}", FormatEd25519PublicKey(judgement.provenKey)));
+            co_return std::nullopt;
+        case ProofOutcome::Forged:
+        case ProofOutcome::UnknownKey:
             // Handled above; named so a new outcome is a compile error rather than a
             // connection served by accident.
             co_return std::nullopt;
@@ -253,18 +263,20 @@ Task<std::optional<ProvenPeer>> PeerServerAccess::Handshake(RaftPeerServer* self
             break;
     }
 
-    if (!sent)
+    if (!sent || !judgement.session.has_value())
         co_return ended();
 
-    // Disarmed only now: the bound is on proving the key, and a member that has proved
-    // it is held to the same no-deadline stream every peer connection always was.
+    // Disarmed only now: the bound is on proving an id, and a member that has proved one is
+    // held to the same no-deadline stream every peer connection always was.
     deadline.reset();
-    co_return ProvenPeer { .dialler = std::move(judgement.dialler), .nonces = judgement.nonces };
+    co_return ProvenPeer { .dialler = std::move(judgement.dialler),
+                           .provenKey = judgement.provenKey,
+                           .session = *std::move(judgement.session) };
 }
 
 Task<void> PeerServerAccess::Serve(RaftPeerServer* self, ByteReader* reader, std::string peer, ProvenPeer proven)
 {
-    FrameOpener opener { self->_credential, proven.nonces };
+    FrameOpener opener { std::move(proven.session) };
 
     while (true)
     {
@@ -313,13 +325,23 @@ Task<void> PeerServerAccess::Serve(RaftPeerServer* self, ByteReader* reader, std
             break;
         }
 
+        // The roster, asked again for every frame: a key revoked since the handshake ends the
+        // connection here, at the first frame after the decision, rather than whenever the
+        // connection happens to break. Asked after the tag, so a frame nobody sealed is counted
+        // as what it is.
+        if (!self->_identity.StillProves(proven.dialler, proven.provenKey))
+        {
+            self->NoteProvenRefusal(AcceptorRefusal::KeyWithdrawn, peer, proven.dialler, "");
+            break;
+        }
+
         auto decoded = RaftWire::DecodeMessage(*header, payload);
         if (decoded.has_value())
         {
             // The member the connection proved is the one that speaks on it. A message
             // naming another sender is refused rather than delivered under that name:
             // everything the node decides about a sender -- whom it votes for, whose
-            // entries it takes -- is then a fact about the credential, not about a field.
+            // entries it takes -- is then a fact about the key, not about a field.
             if (auto const& sender = SenderOf(*decoded); sender != proven.dialler)
             {
                 self->NoteProvenRefusal(
@@ -364,8 +386,7 @@ RaftPeerServer::RaftPeerServer(IListener& listener,
                                IRaftMessageSink& sink,
                                ILogger& logger,
                                IMetricsSink& metrics,
-                               IRaftPeerCredential const& credential,
-                               NodeId self,
+                               IRaftPeerIdentity const& identity,
                                ISecureRandom& random,
                                PeerServerOptions options):
     _listener { listener },
@@ -373,8 +394,7 @@ RaftPeerServer::RaftPeerServer(IListener& listener,
     _sink { sink },
     _logger { logger },
     _metrics { metrics },
-    _credential { credential },
-    _self { std::move(self) },
+    _identity { identity },
     _random { random },
     _options { options }
 {
@@ -425,8 +445,8 @@ void RaftPeerServer::NoteProvenRefusal(AcceptorRefusal refusal,
                                        std::string_view dialler,
                                        std::string_view detail)
 {
-    // Not throttled: only a holder of the key can provoke one, so the log cannot be
-    // filled from outside, and each is a member worth naming every time.
+    // Not throttled: only the member that proved its id can provoke one, so the log cannot
+    // be filled from outside, and each is a member worth naming every time.
     auto const& row = RowFor(refusal);
     _metrics.Increment(row.counter);
     _logger.Log(

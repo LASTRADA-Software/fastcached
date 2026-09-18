@@ -2,11 +2,11 @@
 
 Rules for `src/FastCache/Consensus/` and `src/FastCache/Cluster/`: Raft itself,
 the LAN discovery beacon and its pre-shared-key handshake, the Raft peer wire and the
-handshake every connection on it proves the key with, the replicated cluster
-configuration, and the admin verbs that change it.
+handshake every connection on it proves each end's identity key with, the replicated
+cluster configuration, and the admin verbs that change it.
 
 Read this before touching `RaftNode`, `RaftLog`, `RaftDriver`, `RaftWire`,
-`RaftPeerSession`, `RaftPeerTransport`/`RaftPeerServer`, `PskRaftPeerCredential`,
+`RaftPeerSession`, `RaftPeerTransport`/`RaftPeerServer`, `RaftPeerIdentity`, `RosterKeys`,
 `RaftClusterHarness`, `DiscoveryService`, `PeerDirectory`,
 `ClusterState`/`ClusterStateMachine` or `MembershipPolicy` — and before adding a
 verb to the cluster-admin surface.
@@ -118,9 +118,9 @@ Every rule below has already been a bug.
     programmatically now.
 - **One key, one signing construction, and the domain label is a required
   parameter rather than a constant each signer remembers to fold in.** The
-  pre-shared key MACs a discovery proof and a lease token -- and, since #1308, every
-  Raft peer connection, under rows of its own (see *The Raft peer wire* below) -- and
-  the first two each used to build
+  pre-shared key MACs a discovery proof, a lease token and a member's proof on the `0xFC`
+  surface -- and, from #1308 until #178 moved it to identity keys, every Raft peer
+  connection -- and the first two each used to build
   its message inline out of `HmacSha256` and `WireFields::Encode` -- which are
   primitives, not a construction. So what a message is *made of* was written
   twice, and the requirement that every message carry a domain label was true of
@@ -149,8 +149,8 @@ Every rule below has already been a bug.
     the one part of the message a caller does not supply.
   - **`VerifyFields` is the only comparison the seam exposes, and every verifier
     goes through it** -- `AuthenticateLeaseToken` for the lease,
-    `DiscoveryWire::VerifyProofTag` for the proof, `PskRaftPeerCredential::Verify` for
-    the Raft peer wire, whose session code compares no tag itself. That second one is the whole
+    `DiscoveryWire::VerifyProofTag` for the proof, `VerifyNodeProof` for the `0xFC`
+    surface's. That second one is the whole
     reason this bullet is worth reading: the seam landed with `DiscoveryService`
     still taking an expected tag and comparing it by hand, so the property was
     true of one of the two wires it named. It was constant-time, so nothing was
@@ -209,75 +209,109 @@ decoded, and every message names its own sender (`candidateId`, `voterId`, `lead
 `followerId`) in a field nothing tied to the connection it arrived on -- so anything that
 could reach a `--listen-raft` port could vote, depose a leader or replicate a log under
 any member's name, and discovery's proof bought admission to a cluster whose wire then
-trusted every address. Every connection now proves the pre-shared key before a message is
-read, and every frame after that stays bound to the proof. Each rule below is what some
-plausible simpler design gets wrong.
+trusted every address. #1308 made every connection prove the pre-shared key before a
+message is read. #178 (`RaftWire` 4) made it prove each end's OWN identity key instead,
+because a pre-shared key proves "holds the key" and never WHICH holder: any holder could
+claim any member's id, and removing one machine meant rotating the key on every other.
+Every frame after the handshake stays bound to it. Each rule below is what some plausible
+simpler design gets wrong.
 
 - **The shape, because every other rule refers to it.** Connections are one-way: the
   transport only writes, the server only reads, and a reply travels on the other node's
   own outbound connection. So authentication is a short two-way prologue on an otherwise
   one-way stream (`Consensus/RaftPeerSession.hpp`):
-  1. the ACCEPTOR sends a `Challenge` carrying its nonce, before it has read a byte;
-  2. the DIALLER answers a `Proof`: its id, the id it believes it dialled, its own nonce,
-     and a MAC over both nonces and both ids;
-  3. the acceptor checks the MAC, then the claims, and answers a signed `Verdict`;
-  4. the dialler checks the verdict's MAC before it sends a single Raft frame, and every
-     frame after that carries a 32-byte tag over both nonces, a sequence number and the
-     frame.
+  1. the ACCEPTOR sends a `Challenge` carrying its nonce and an ephemeral X25519 key,
+     before it has read a byte;
+  2. the DIALLER answers a `Proof`: its id, the id it believes it dialled, its own nonce and
+     ephemeral key, and an Ed25519 signature under its OWN identity key over all of that and
+     the challenge;
+  3. the acceptor verifies the signature under the key its ROSTER holds for the claimed id,
+     then the claims, and answers a `Verdict` signed with its own key over the whole
+     transcript, the proof's signature, the verdict and its own id;
+  4. the dialler verifies the verdict under the key its roster holds for the id that
+     answered before it sends a single Raft frame. Both ends derive the session key --
+     HKDF-SHA256 over the X25519 output, salted with both nonces and bound to both ephemeral
+     keys and both ids -- and every frame after that carries a 32-byte HMAC tag under it,
+     over an implicit sequence number and the frame (`Core/SessionSeal.hpp`).
 
-- **The acceptor goes first because its port is the surface anybody can reach.** It
-  MACs nothing until the other end has proved the key, so a stranger who connects learns
-  a nonce and nothing else. The dialler hands a tag only to an address it CHOSE to dial.
-  Reversing the order makes every listener a signing oracle for whatever connects to it.
+- **Each signature covers the WHOLE transcript so far.** A field left out is a field whatever
+  sits on the path can change while the signature still verifies -- and the ephemeral keys
+  are the ones that matter most: swapped for its own, a man in the middle agrees a session key
+  with each end. `RaftPeerSession_test` changes each of the proof's six transcript fields in
+  transit and requires each change to be refused, so dropping any one of them from what is
+  signed turns that field's section red. The verdict carries the proof's signature, so the
+  dialler's fresh values reach it three ways at once; the field a single-field test can see
+  there is the verdict byte, and a signed refusal flipped to `Accepted` is its case.
 
-- **The MAC is checked before any claim in the proof is read, and then `OwnId` before
-  `WrongTarget`.** Discovery's and the lease's rule, applied a third time: a named
-  refusal decided before the MAC is an oracle that tells a stranger which ids exist here.
-  `OwnId` first because a dialler proving the key under THIS node's id is a second machine
-  holding its identity -- a copied `--cluster-dir` or a duplicated `--node-id` -- and that
-  is the finding whatever it dialled; checked the other way round, a cloned identity whose
-  address book is also stale reports as a stale address book.
+- **The acceptor goes first because its port is the surface anybody can reach.** It signs
+  nothing until the other end has proved an id, so a stranger who connects learns a nonce
+  and an ephemeral public key and nothing else. The dialler signs only for an address it
+  CHOSE to dial. Reversing the order makes every listener a signing oracle for whatever
+  connects to it.
+
+- **The signature is checked before any claim in the proof is reported on, and then `OwnId`
+  before `WrongTarget`.** Discovery's and the lease's rule, applied a third time: a named
+  refusal decided before the signature is an oracle that tells a stranger which ids exist
+  here. **One claim is read first, and has to be**: the claimed id SELECTS the key to verify
+  under. So an id the roster holds no key for is `UnknownKey` and a signature that does not
+  verify under the id's key is `Proof`, and BOTH are answered with nothing and logged with the
+  address alone -- an id nobody proved is not one worth printing. `OwnId` first because a
+  dialler proving THIS node's id holds this node's private key, which is a copied
+  `--cluster-dir`, and that is the finding whatever it dialled.
 
 - **The verdict is SIGNED, and so are the refusals** (A1). A dialler refused `WrongTarget`
-  or `OwnId` by a close would see exactly what a wrong key produces, and report "your key
-  is wrong" to an operator whose key is right: **a confident wrong signal is worse than a
-  vague right one.** A verdict exists only once the proof's MAC verified, so signing a
-  refusal tells a stranger nothing. Three consequences:
+  or `OwnId` by a close would see exactly what an unknown key produces, and report a key
+  problem to an operator whose keys are right: **a confident wrong signal is worse than a
+  vague right one.** A verdict exists only once the proof's signature verified, so signing a
+  refusal tells a stranger nothing. Four consequences:
   - `dials_refused_wrong_target` and `dials_refused_own_id` are the dialler's own rows,
     and the log line names the member that actually answered at that address;
   - an `Accepted` verdict naming an acceptor other than the one dialled is refused as
-    `WrongTarget`, because a signature proves a key holder and not the member meant;
+    `WrongTarget`, because a signature proves a key and not the member meant;
+  - **a signature that verifies under a key the roster has REVOKED is answered with a signed
+    `KeyRevoked`**, so the removed machine reports its OWN removal
+    (`dials_refused_own_key_revoked`) rather than a key problem at the acceptor. No oracle:
+    only the holder of that key can produce the signature, and all it learns is that its own
+    key is revoked. The check runs against EVERY revoked key, never only the ones revoked under
+    the claimed id (`RosterKeys::KeysOf`). A revocation's id is a LABEL (`RevokedKey`), so
+    narrowing to it reports the removed machine as a key nobody gave, or as a forgery, whenever
+    the label and the claim differ. The list decides a diagnosis and never an acceptance, and a
+    stranger's proof costs one check per key an operator ever revoked;
   - `dials_ended_by_acceptor` now means ONLY a close after the proof with no signed verdict
-    -- a wrong key, or a refusal the acceptor could not sign. Its description says so, and
-    a change that sends a refusal unsigned moves a count into the wrong row.
+    -- the acceptor holds no key for this node's id, or another one, or refused the proof's
+    shape. Its description says so, and a change that sends a refusal unsigned moves a count
+    into the wrong row.
 
-- **Both nonces are in every MAC, and a nonce must never repeat -- it need not be
-  unpredictable.** The acceptor's makes a proof unreplayable; the dialler's makes a
-  verdict fresh, so a recorded `Accepted` cannot answer a dialler talking to something
-  without the key. A proof harvested in advance is useless, because step 4 needs a live
-  verdict and frames are only produced live, so a correct PREDICTION buys nothing a relay
-  does not. **Size and source are one seam** (A2): `Core/Nonce.hpp` holds `NonceBytes` (32,
-  `static_assert`ed at least that) and `DrawNonce`, and discovery's challenge and the node
-  proof's draw through the same helper -- a second draw site would be a second answer to how
-  big a nonce is.
+- **Fresh values from BOTH ends in every signature, and a nonce must never repeat -- it need
+  not be unpredictable.** The acceptor's makes a proof unreplayable; the dialler's makes a
+  verdict fresh, so a recorded `Accepted` cannot answer a dialler talking to something else.
+  The EPHEMERAL SECRETS must be unpredictable, and are: they are what makes the session key
+  one only the two ends hold. **Size and source are one seam** (A2): `Core/Nonce.hpp` holds
+  `NonceBytes` (32, `static_assert`ed at least that) and `DrawNonce`, and discovery's
+  challenge and the node proof's draw through the same helper -- a second draw site would be a
+  second answer to how big a nonce is.
 
 - **Never-repeat needs an ENTROPY SOURCE, not a seeded engine** (#1527). This bullet used to
   conclude that `SystemRandomSource` was good enough, and the conclusion rested on a premise
   nobody wrote down: that its seed was random. It is seeded from `std::random_device`, which on
   the host #1507 was measured on answers zero for 57% of draws, so about a third of processes
   there (0.57 squared -- inferred, not reproduced) seed zero and draw ONE nonce stream: a
-  restarted acceptor re-issues its previous run's challenges. So nonces and minted node ids
-  come from `Core/ISecureRandom.hpp` -- `getrandom` on Linux, `getentropy` on macOS,
-  `BCryptGenRandom` on Windows -- and `SystemRandomSource` keeps jitter and tie-breaking.
+  restarted acceptor re-issues its previous run's challenges. So nonces, ephemeral secrets and
+  minted node ids come from `Core/ISecureRandom.hpp` -- `getrandom` on Linux, `getentropy` on
+  macOS, `BCryptGenRandom` on Windows -- and `SystemRandomSource` keeps jitter and
+  tie-breaking.
   - **A draw that fails is a REFUSAL, never a fallback** to the device, a clock or an engine.
-    The handshakes are FACTORIES (`AcceptorHandshake::Create`, `DiallerHandshake::Create`), so
-    a handshake with a weak nonce cannot be constructed: the acceptor closes unchallenged, the
-    dialler abandons before proving, discovery withholds its challenge (`ChallengeWithheld`),
-    the node-proof surface refuses `NoCluster`, and a mint refuses to start the node by name.
+    The handshakes are FACTORIES (`AcceptorHandshake::Create`, `DiallerHandshake::Create`), and
+    each draws TWICE -- the nonce, then the ephemeral secret -- so a handshake with either
+    weak cannot be constructed: the acceptor closes unchallenged, the dialler abandons before
+    proving, discovery withholds its challenge (`ChallengeWithheld`), the node-proof surface
+    refuses `NoCluster`, and a mint refuses to start the node by name. The second draw has a
+    case of its own (`ScriptedSecureRandom::DenyAfter`), because a factory that checked only
+    the first would pass every nonce case.
   - **Each of those is uncounted, and says so in an Error naming the primitive**: every refusal
     row on these surfaces describes a PEER, and this describes THIS host. The transport's
-    precedent is its "cannot prove the key" line; the acceptor and discovery throttle theirs,
-    because anything on the network can provoke them.
+    precedent is its "cannot prove this node's id" line; the acceptor and discovery throttle
+    theirs, because anything on the network can provoke them.
   - **Its test is CROSS-PROCESS, because the defect was.** An engine seeded once per process
     never repeats within it, so every in-process "two nonces differ" case passed on the broken
     build -- measured: with `DrawNonce` neutered back to a zero-seeded engine, that case stays
@@ -289,45 +323,72 @@ plausible simpler design gets wrong.
   is what must be proved. This produces "the frames on this connection come from `d`, for
   `a`", and neither end can state the endpoint identically -- an acceptor binds the
   wildcard, a dialler reaches it through `--raft-self` or NAT. A relay at another address
-  can only forward frames whose MACs it cannot make, which a network path already can.
-  Binding it would refuse the NAT'd member and stop nothing.
+  can only forward frames it cannot seal, which a network path already can. Binding it
+  would refuse the NAT'd member and stop nothing.
 
-- **A pre-shared key proves "holds the cluster key", never WHICH holder.** Any key holder
-  can claim any member id; nothing in a PSK can separate them. That is a non-goal stated
-  rather than a gap left silent, and the credential seam takes the claimed ids as inputs so
-  a per-node credential can replace the shared one without a wire change -- an identity in
-  the frame rather than an address is where #178 points. Confidentiality is the other
-  non-goal: log entries stay in cleartext, as they were.
+- **A signature proves WHICH member, which is what the pre-shared key could not -- and the
+  claim that it could be swapped in "without a wire change" was WRONG.** Under #1308 any key
+  holder could claim any member id. `IRaftPeerCredential.hpp` argued that a per-node
+  credential could replace the shared one without the wire moving, because every field it
+  MACed already named its ids, and this rulebook repeated it. A signature is 64 bytes where a
+  MAC was 32, agreeing a session key needs both ends' ephemeral keys on the wire, and a
+  verifier needs the SIGNER's public key rather than one shared secret -- every handshake
+  frame changed shape. **A claim that a replacement needs no wire change is a claim about the
+  replacement's construction, made before there was one.** Confidentiality is still a
+  non-goal: log entries stay in cleartext.
 
 - **Every session frame is tagged, the sequence number never travels, and a verified
   message naming another sender closes the connection.**
-  - The tag is `Frame`-domain MAC over `[nonceA, nonceD, seq, header, payload]`. `seq`
-    counts the connection's frames from zero on both ends, so a frame replayed, reordered
-    or dropped fails the NEXT tag; the nonces make a frame spliced in from another
-    connection fail; an on-path injection fails outright.
-  - Header and payload are two FIELDS, because the server reads them apart and MACs what
-    it read without first copying them together. The opener advances only on success.
+  - The tag is an HMAC under the SESSION key over `[seq, header, payload]`. `seq` counts the
+    connection's frames from zero on both ends, so a frame replayed, reordered or dropped
+    fails the NEXT tag; a frame spliced in from another connection fails because that
+    connection agreed another key; an on-path injection fails outright. One key per
+    direction, which a Raft connection is.
+  - Header and payload are two FIELDS, because the server reads them apart and tags what it
+    read without first copying them together. The opener advances only on success.
   - The tag sits OUTSIDE `payloadLength`, so `WireFrame` keeps its meaning and
     `CompileCacheWire` is untouched.
   - The proven dialler id is what `RaftNode` reads: `SenderOf(message)` naming anybody
-    else is `frames_refused_sender`, and only a key holder can produce one, so a rise is a
-    defect in a member rather than an attacker.
+    else is `frames_refused_sender`, and only the proven member can produce one, so a rise
+    is a defect in a member rather than an attacker.
   - An unknown message type is still stepped over -- after its tag verifies, and it
     consumes a `seq`. Stepping over an UNVERIFIED frame would be a free injection channel.
 
-- **The version is a property of the CONNECTION, and it moved to 2 because the GRAMMAR
-  changed** -- and to 3 for #1449, whose `InstallSnapshot` carries a configuration of two
-  sets where it carried one list (see *Learners* below). A handshake before the first
-  message and a trailer after every frame are a different grammar, which is what a version
-  is for -- the opposite of #402, where only discovery's MAC input changed and
-  `DiscoveryWire::CurrentVersion` rightly stayed. Read the two together: the question is
-  always WHICH changed. `MinSupportedVersion` moved with it both times: a version 1 peer
-  authenticates nothing and accepting one is the per-connection fallback this ticket
-  refuses, and a version 2 peer cannot read a configuration of two sets; so a fleet upgrades its
-  consensus members together. A session frame whose version byte differs from the handshake's closes the
-  connection, because stepping over it would mean guessing whether a trailer follows.
-  `RaftWire.hpp`'s old "Why there is no handshake" section argued against a VERSION
-  negotiation per reconnect, soundly; it is now "Why there is a handshake", because
+- **A revoked key ends the sessions it proved, at their next frame -- PULLED, not pushed.**
+  Both ends re-ask the roster (`IRaftPeerIdentity::StillProves`) for every frame: the acceptor
+  after the tag verifies, the dialler before it seals. So an applied `RevokeKey` -- or a
+  re-admission under another key -- closes the session at its next frame
+  (`connections_ended_key_withdrawn`, `dials_ended_key_withdrawn`), and the redial is judged
+  against the roster as it is then. A push from the state machine would be a close from the
+  apply thread on a connection the reactor owns; a Raft peer is never quiet for longer than a
+  heartbeat, so the pull costs no latency worth a thread hazard. Over TCP a dialler whose
+  acceptor closed learns so from its next write's reset; the in-memory socket accepts writes
+  nobody reads, so the link and node cases READDRESS to force the redial and say why.
+
+- **The roster is the command line until the cluster says anything, and then the cluster.**
+  `Cluster::RosterKeys` answers from `--raft-peer`'s `@<key>`, then from `ClusterState`, which
+  WINS wherever it states a key: a member re-admitted under a new key proves itself with the
+  new one whatever a command line typed a year ago. **A bootstrap key the state has revoked is
+  revoked, whatever the command line says** -- a restart with the original command line must
+  not bring it back, which would be removal failing open. A member the state records with no
+  key falls back to its bootstrap key only when that key is not revoked. A principal is a
+  stranger here: it never joins consensus. So a fresh cluster whose members were given no
+  keys cannot FORM, and says so in `connections_refused_unknown_key` rather than trusting
+  whoever answers first; `--print-identity` is how an operator gets every member's token
+  before any of them starts, minting into the state directory the start then reads.
+
+- **The version is a property of the CONNECTION, and it moves when the GRAMMAR does** -- to 2
+  for #1308's handshake and trailer, to 3 for #1449, whose `InstallSnapshot` carries a
+  configuration of two sets where it carried one list (see *Learners* below), and to 4 for
+  #178, whose challenge, proof and verdict carry ephemeral keys and signatures. The opposite of
+  #402, where only discovery's MAC input changed and `DiscoveryWire::CurrentVersion` rightly
+  stayed: the question is always WHICH changed. `MinSupportedVersion` moved with it every
+  time: a version 1 peer authenticates nothing, a version 3 peer proves the pre-shared key,
+  and accepting either is the per-connection fallback these tickets refuse -- so a fleet
+  upgrades its consensus members together. A session frame whose version byte differs from
+  the handshake's closes the connection, because stepping over it would mean guessing whether
+  a trailer follows. `RaftWire.hpp`'s old "Why there is no handshake" section argued against a
+  VERSION negotiation per reconnect, soundly; it is now "Why there is a handshake", because
   freshness is the one thing a frame cannot prove about itself.
 
 - **Pre-authentication reachability is a COLUMN of `MessageTable`.** Each row's
@@ -336,7 +397,7 @@ plausible simpler design gets wrong.
   a type other than `Proof` or a length over that row's ceiling BEFORE buffering the
   payload, and every handshake ceiling is `static_assert`ed within `MaxHandshakePayload`
   (4096). The `0xFC` wire's rule, one protocol over: an unbounded pre-auth read is a
-  memory-exhaustion hole reachable without the key.
+  memory-exhaustion hole reachable by anybody.
 
 - **One handshake bound, at both ends** (`RaftWire::HandshakeBound`, 5 s), armed through
   `ArmSocketDeadline`. Before it, a connection that sent nothing held one of the
@@ -347,70 +408,80 @@ plausible simpler design gets wrong.
   tests over an unturned reactor use, not a production setting.
 
 - **Whether the wire authenticates is a STARTUP decision, never a per-connection
-  fallback.** `StartupPolicyRejection` refuses `RunsConsensus && clusterKeyFile.empty()`
-  by name (`ConsensusNeedsClusterKeyRefusal`, which names both remedies: generate a key, or
-  `--enroll-from` a member), after the two `--discovery` rows so their more specific
-  sentences still answer first. `ConsensusTier::Start` returns the same constant for a
-  `NodeConfig` no argv produced, and reads the key through `ReadClusterKey` BEFORE anything
-  is bound or dialled. The server and transport take the credential, their own id and an
-  `ISecureRandom` as REQUIRED constructor arguments -- no default and no null -- so an
-  unauthenticated peer connection cannot be constructed. "No key, so skip the check" is
-  the shape the worker's lease rule (#282) refuses one surface over: the port open, every
-  refusal counter at zero, and the fleet healthy-looking from both ends.
+  fallback.** `ConsensusTier::Start` refuses a start with no identity key
+  (`ConsensusNeedsIdentityKeyRefusal`) before anything is bound or dialled -- and no
+  configuration reaches that refusal, because a consensus node always has a state directory
+  (`HoldsNodeKey`, asserted over every consensus shape). The key is resolved by the START and
+  PASSED to the tier, never read twice, so the key a node announces and the key it proves
+  itself with are one reading of one file. The server and transport take the identity and an
+  `ISecureRandom` as REQUIRED constructor arguments -- no default and no null -- and their own
+  id IS the identity's, never a parameter beside it that could name somebody the proofs do
+  not. `ConsensusNeedsClusterKeyRefusal` stays in the startup table for reasons that MOVED:
+  the tier no longer reads the cluster key, but a consensus node still signs leases, proves
+  itself on the node port and hands the key over at enrollment with it, and #178 retires it
+  surface by surface. "No key, so skip the check" is the shape the worker's lease rule (#282)
+  refuses one surface over: the port open, every refusal counter at zero, and the fleet
+  healthy-looking from both ends.
 
 - **Layering decides where the seam sits.** `Cluster/` already includes `Consensus/`
-  headers, so `Consensus/` cannot include `ClusterSigning.hpp`. The seam is
-  `Consensus::IRaftPeerCredential` (`Sign`/`Verify` over a `RaftPeerMac` purpose), and
-  `Cluster::PskRaftPeerCredential` implements it over `SignFields`/`VerifyFields`, holding
-  the key in `SecureByteBuffer`. Its purpose-to-domain map is an `EnumTable` with
-  `RowsInEnumeratorOrder` and a `static_assert` that no two purposes share a domain -- a
-  proof reflected back as a verdict, or a discovery tag reused here, fails because each is
-  in a different domain (`fastcache-raft-dial-v1`, `-verdict-v1`, `-frame-v1`). The session
-  code never compares a tag itself.
+  headers, so `Consensus/` cannot read `ClusterState`. It states what it needs instead:
+  `Consensus::IRaftPeerKeys` -- this node's own key, which signs and never leaves it, and the
+  roster's keys for a peer id, NOW -- and `Consensus::IRaftPeerIdentity` (`Self`, `Sign`,
+  `Verify`, `StillProves`) over it, whose one implementation is `RaftPeerIdentity`.
+  `Cluster::RosterKeys` implements the keys over `ClusterState` and the command line. The two
+  signatures are labelled by `RaftPeerSignatureLabels` (`fastcache-raft-proof-v2`,
+  `-verdict-v2`), `static_assert`ed present and distinct, so a proof reflected back as a
+  verdict verifies as nothing; the session key's HKDF label is `fastcache-raft-session-v2`.
+  The pre-shared key's three Raft rows left `SigningDomainTable`, and their `-v1` labels are
+  retired rather than reused. Frame sealing is `Core/SessionSeal`, not Raft's, because the
+  `0xFC` wire needs it next. The session code never compares a tag itself.
 
 - **One refusal, one row -- at BOTH ends, because one misconfigured machine shows on two.**
-  Eight acceptor rows (`no_handshake`, `handshake_timeout`, `proof`, `wrong_target`,
-  `own_id`, `frames_refused_tag`, `frames_refused_sender`, `full`) and six dialler rows
-  (`timeout`, `no_challenge`, `acceptor_proof`, `wrong_target`, `own_id`,
-  `ended_by_acceptor`), each a row of `Consensus/RaftPeerRefusals.hpp` beside its log
-  sentence. `full` was an uncounted close before. A peer that sent NOTHING and closed asked
-  nothing, so it is closed and NOT counted. Refusals before authentication are logged at
-  most once per 60 s and name only the source address -- anything on the network can
-  provoke them, and an id nobody proved is not worth printing; refusals after
-  authentication name the proven ids, unthrottled; a dialler's refusals are throttled per
-  peer.
+  Every refusal is a row of `Consensus/RaftPeerRefusals.hpp` beside its log sentence, and the
+  key refusals are apart by REMEDY: `unknown_key` (a key never given), `proof` (somebody
+  signing for an id whose key it does not hold), `revoked_key` (the removed machine, still
+  dialling), `ended_key_withdrawn` (a session the roster outlived), and at the dialler
+  `acceptor_key_unknown`, `acceptor_key_revoked`, `own_key_revoked` and `ended_key_withdrawn`.
+  A peer that sent NOTHING and closed asked nothing, so it is closed and NOT counted. Refusals
+  before authentication are logged at most once per 60 s and name only the source address,
+  except a revoked key, which names the WHOLE key, since that is what an operator matches
+  against the revocation they made; refusals after authentication name the proven ids,
+  unthrottled; a dialler's refusals are throttled per peer.
 
 - **What became false was removed, not kept** (the project's position on superseded
   code). `EnrollmentConfigured`'s key clause could no longer decide anything, so the
   predicate is gone and `ServesEnrollment` asks `RunsConsensus`; `EnrollmentResponder`
   still reads the key before `ClusterAdmit`, because a key file readable at boot can break
   later. `NodeMembership`'s refusal to let a replicated `fleet-open` WIDEN a keyless node is
-  gone too: cluster state reaches only a consensus node, and every consensus node now holds
-  the key its lease check verifies with. The RELOAD guard in `ValidateNodeReloadable`
-  stays, because a node that runs no consensus can still be keyless and be opened by its
-  operator. Enrollment itself reaches nothing new: `--enroll-from` writes the key before
-  the joiner ever starts consensus.
+  gone too: cluster state reaches only a consensus node, and every consensus node holds the
+  key its lease check verifies with. The RELOAD guard in `ValidateNodeReloadable` stays,
+  because a node that runs no consensus can still be keyless and be opened by its operator.
+  And at #178 `PskRaftPeerCredential` went with its rows, rather than staying as a second way
+  to authenticate this wire.
 
 - **`RaftClusterHarness` authenticates EVERY message**, through the same session objects
   the server and transport drive, and delivers what the receiver DECODED rather than what
-  was sent. Four decisions, each with a way to get it wrong:
+  was sent. Five decisions, each with a way to get it wrong:
   - **One session per message**, not per link: the harness has no connections, and a
     session that outlived a partition or a restart would be a property of the harness, not
     of the wire. The loss, reorder and duplication adversary stays intact; `seq` is the
     unit cases' subject.
-  - **Nonces come from a source of their own**, never `_network`, so every existing seed
-    sees a byte-identical delay and loss schedule. Drawing from `_network` would silently
-    change what every adversarial run tests. That source is the operating system's
-    generator (#1527), as in production, and a run stays a function of its seeds: a nonce's
-    VALUE decides nothing, since every MAC over it verifies under the right key alone.
-  - **The credential factory is REQUIRED at construction.** A defaulted one would let a
-    case forget the key and still read as a cluster that forms.
-  - **An intruder case is read beside the formation case, under the same neuter.**
-    `Intrude` puts a campaigning non-member holding another key, or none, on the network,
-    and `Join(who, credential)` admits a joiner holding the wrong one. With
-    `PskRaftPeerCredential::Verify` answering true those are the cases that must go red,
-    and the formation case must stay green -- a harness where both go red is measuring the
-    neuter, not the wire.
+  - **Nonces and ephemeral keys come from a source of their own**, never `_network`, so every
+    existing seed sees a byte-identical delay and loss schedule. That source is the operating
+    system's generator (#1527), as in production, and a run stays a function of its seeds:
+    a nonce's VALUE decides nothing, since every signature over it verifies under the signer's
+    key alone.
+  - **The identity factory is REQUIRED at construction.** A defaulted one would let a case
+    forget who its members are and still read as a cluster that forms.
+  - **A machine's NAME on the network and the id it proves are two things**: messages route by
+    name, and the node inside runs as its identity's id. That is what lets `Intrude` put n3's
+    twin on the network claiming n2 -- a network keyed by one of them could not express it --
+    while messages addressed to n2 still reach n2.
+  - **An intruder case is read beside the formation case, under the same neuter.** With
+    `RaftPeerIdentity::Verify` answering `Verified`, the intruder sections -- a key the roster
+    lacks, a member's id claimed with another member's key, a revoked key -- are the cases
+    that must go red, and the formation cases must stay green; a harness where both go red is
+    measuring the neuter, not the wire.
 
 ## A refusal code carries its own permanence, and there are THREE answers
 
@@ -1382,7 +1453,7 @@ tick -- the scheduler answers `NotLeader` and the fleet page goes dark until it 
 - **The formats moved, each refused by name.** The configuration payload is two id lists and
   carries no version of its own -- its containers do: the Raft store is format 2
   (`FileRaftStorage`, every log record now carrying its format so an old log can be told from a
-  torn one), `RaftWire` is version 3, `ClusterState`'s encoding is 5, and the live-stats
+  torn one), `RaftWire` was version 3 (4 since #178), `ClusterState`'s encoding is 5, and the live-stats
   grammar is `-5`. An old store is `UnsupportedFormatVersion` -- a new `ConsensusErrorCode`,
   `Moment`, mapped to `InvalidClusterChange` on the wire -- judged from the header before the
   CRC, so an intact store of another vintage never reads as damage. `CommandVersion` did NOT
@@ -1408,9 +1479,10 @@ tick -- the scheduler answers `NotLeader` and the fleet page goes dark until it 
 
 [#178](https://github.com/LASTRADA-Software/fastcached/issues/178) PR 2: every node with a
 state directory holds an Ed25519 identity key, and `ClusterState` records members' keys,
-principals admitted by key, and keys revoked for good. Nothing VERIFIES against them yet --
-the cluster key still proves membership -- so every rule below is about getting the record
-right before anything trusts it.
+principals admitted by key, and keys revoked for good. PR 3 made the Raft peer wire VERIFY
+against them (see *The Raft peer wire*); the `0xFC` surface, discovery and leases still use
+the cluster key until later PRs move them. Every rule below is about getting the record
+right, because the wire now trusts it.
 
 - **Only an ABSENT key file mints.** `node-key` is read back on every start; a file that is
   there and cannot be used -- unreadable, truncated, not a key file, another build's format,

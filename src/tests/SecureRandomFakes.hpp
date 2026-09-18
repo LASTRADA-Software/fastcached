@@ -85,6 +85,18 @@ class ScriptedSecureRandom final: public ISecureRandom
         _failure = std::move(failure);
     }
 
+    /// Serve @p fills more draws, then refuse every later one with @p failure: the generator
+    /// that stops in the MIDDLE of an operation drawing more than once, which `Deny` between two
+    /// calls cannot reach.
+    /// @param fills How many more draws succeed.
+    /// @param failure What each draw after them answers.
+    void DenyAfter(std::size_t fills, SecureRandomError failure)
+    {
+        std::scoped_lock const lock { _mutex };
+        _denyFrom = _fills + fills;
+        _pendingFailure = std::move(failure);
+    }
+
     /// @copydoc ISecureRandom::Fill
     [[nodiscard]] std::expected<void, SecureRandomError> Fill(std::span<std::byte> out) override
     {
@@ -93,6 +105,8 @@ class ScriptedSecureRandom final: public ISecureRandom
         // Counted before the failure is answered, so a case can assert the seam was ASKED in
         // exactly the case where nothing came back -- the question a refusal test depends on.
         ++_fills;
+        if (_denyFrom.has_value() && _fills > *_denyFrom)
+            _failure = _pendingFailure;
         if (_failure.has_value())
             return std::unexpected { *_failure };
 
@@ -113,6 +127,8 @@ class ScriptedSecureRandom final: public ISecureRandom
     mutable std::mutex _mutex;
     std::vector<std::byte> _script;
     std::optional<SecureRandomError> _failure;
+    std::optional<std::size_t> _denyFrom;
+    std::optional<SecureRandomError> _pendingFailure;
     std::size_t _served { 0 };
     std::size_t _fills { 0 };
 };

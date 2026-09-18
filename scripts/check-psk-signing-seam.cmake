@@ -70,6 +70,7 @@ set(FastCachedPskSigners
     "FastCache/Core/Sha256.cpp|Implements it, against FIPS 180-4 and RFC 4231 vectors."
     "FastCache/Cluster/ClusterSigning.hpp|The one construction. SignFields folds the domain label in ahead of every field and VerifyFields is the only comparison exposed, so a caller can neither omit a label nor reach for a non-constant-time ==."
     "FastCache/Core/Hkdf.cpp|HKDF-SHA256 (RFC 5869), which is a key DERIVATION and not a signer: HMAC is its PRF, keyed by a salt and then by the PRK it extracts, and what it extracts from is a per-session X25519 secret, never the cluster key. It is part of the crypto seam that retires the pre-shared key (#178), and it is checked against RFC 5869's own vectors rather than through SignFields, whose domain-labelled message is not HKDF's."
+    "FastCache/Core/SessionSeal.cpp|Tags a session's frames under that session's OWN key, which HKDF derives from an ephemeral X25519 exchange both ends signed with their identity keys -- never the cluster key (#178). Separation between wires is in the key rather than a label field: each wire derives its key under its own HKDF info, so a tag made in one session verifies in no other, and there is no second key for an unlabelled message to collide under."
 )
 
 # ---------------------------------------------------------------------------

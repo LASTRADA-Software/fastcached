@@ -41,9 +41,9 @@ namespace FastCache::Distributed
 ///
 /// The consequence is stated because it decides what this can be used for: removing one
 /// key-holding machine still means rotating the key on all the others. Making node
-/// REMOVAL meaningful needs per-node identity, which is #178's "credential in the frame"
-/// and its own threat model. `Consensus::IRaftPeerCredential` says the same of the Raft
-/// wire, in the same words, and for the same reason.
+/// REMOVAL meaningful needs per-node identity, which is #178's threat model: the Raft peer
+/// wire has it (`Consensus::IRaftPeerIdentity`, each end signing with its own key, and a
+/// revocation one roster entry), and this surface does not yet.
 ///
 /// ## The construction
 ///
@@ -70,8 +70,8 @@ namespace FastCache::Distributed
 ///
 /// ## No seam, and that is not an omission
 ///
-/// `Consensus/` needed `IRaftPeerCredential` because `Cluster/` includes `Consensus/`, so
-/// a consensus header reaching back would have made the two directories include each
+/// `Consensus/` needs `IRaftPeerKeys` because `Cluster/` includes `Consensus/`, so a
+/// consensus header reaching back would have made the two directories include each
 /// other. `Distributed/` already includes `Cluster/` and nothing goes the other way, so
 /// this calls `Cluster::SignFields` directly -- which is the one door the pre-shared key
 /// signs through, and `ctest -R psk-signing-seam` is what keeps it the only one.

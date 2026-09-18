@@ -373,6 +373,8 @@ TEST_CASE("NodeConfig: every flag that is worker state reaches the supervisor", 
         // Reports on a configuration and exits; a service that printed its ports at
         // every boot instead of serving them would be one that never starts.
         "--print-surfaces",
+        // The same, for this node's identity (#178).
+        "--print-identity",
         // The enrollment verbs, and the same rule the cluster ones above carry -- with
         // the sharpest consequence in the set. `--enroll-open` is the one flag here
         // whose replay is a SECURITY event rather than a wasted one: a registration
@@ -590,11 +592,11 @@ TEST_CASE("NodeConfig: several --scheduler values are kept in order, and a regis
 TEST_CASE("NodeConfig: a node running consensus without a cluster key file is refused at startup",
           "[node][config][consensus][policy]")
 {
-    // #1308. Every connection between members proves the cluster's key before a message
-    // is read, so a keyless consensus node is not a degraded member: it could neither be
-    // heard nor hear anybody. It used to be LEGAL, and the enrollment window on one was
-    // approvable while it had no key to hand over. Refused HERE, where an operator is
-    // watching and an install consults it, and never answered per connection.
+    // #1308, and a reason that moved at #178. The Raft peer wire proves each member's own
+    // identity key now, but a consensus node still signs leases, proves itself on the node
+    // port and hands the key over at enrollment with it -- and the enrollment window on a
+    // keyless one was approvable while it had no key to hand over. Refused HERE, where an
+    // operator is watching and an install consults it, and never answered per connection.
     auto clustered = Installable();
     clustered.nodeId = "n1";
     clustered.raftListen = "6680";
@@ -619,8 +621,7 @@ TEST_CASE("NodeConfig: a node running consensus without a cluster key file is re
     CHECK(ConsensusNeedsClusterKeyRefusal.contains("head -c 32 /dev/urandom | base64"));
     CHECK(ConsensusNeedsClusterKeyRefusal.contains("--enroll-from"));
 
-    // A joiner is asked the same: it proves the key to the members it dials, or it is
-    // refused by every one of them.
+    // A joiner is asked the same: it is a consensus node like any other.
     auto joiner = clustered;
     joiner.nodeId = "n4";
     joiner.raftJoin = true;

@@ -5,7 +5,7 @@
 #
 # That check is the enforcement half of #402: the seam takes its domain label as
 # a required parameter, which binds whoever goes THROUGH it and says nothing at
-# all about a fourth signer calling `HmacSha256` itself. So the rule the
+# all about another signer calling `HmacSha256` itself. So the rule the
 # rulebook states -- one key, one construction -- rests on a scan, and a scan is
 # the shape of guard this tree keeps catching going blind: #510's reader lost
 # four of five targets to one stray `]` in a comment and reported success, and
@@ -55,7 +55,7 @@ file(REMOVE_RECURSE "${root}")
 set(failures)
 
 # ---------------------------------------------------------------------------
-# The four files the signer table allows, written as stand-ins rather than
+# The five files the signer table allows, written as stand-ins rather than
 # copied from the tree: a selftest that copied the real ones would start
 # failing for reasons that belong to those files rather than to this check.
 #
@@ -78,9 +78,12 @@ function(fastcached_make_tree name seamBody extraPath extraBody outVar)
     file(WRITE "${tree}/src/FastCache/Core/Sha256.cpp"
          "Digest HmacSha256(Key key, Message message) { return Compute(key, message); }\n")
     file(WRITE "${tree}/src/FastCache/Cluster/ClusterSigning.hpp" "${seamBody}")
-    # HKDF's derivation, the one allowed caller that is not the seam (#178).
+    # HKDF's derivation and a session's frame tags, the two allowed callers that are not
+    # the seam: neither is keyed by the cluster key (#178).
     file(WRITE "${tree}/src/FastCache/Core/Hkdf.cpp"
          "Prk Extract(Salt salt, Ikm ikm) { return HmacSha256(salt, ikm); }\n")
+    file(WRITE "${tree}/src/FastCache/Core/SessionSeal.cpp"
+         "Tag Seal(SessionKey key, Frame frame) { return HmacSha256(key, frame); }\n")
 
     if(NOT extraPath STREQUAL "")
         file(WRITE "${tree}/src/${extraPath}" "${extraBody}\n")
@@ -129,16 +132,16 @@ function(fastcached_run_check tree outObjected outOutput)
 endfunction()
 
 # ---------------------------------------------------------------------------
-# 1. The four allowed files and nothing else. Without this the check could
+# 1. The five allowed files and nothing else. Without this the check could
 #    refuse everything, which is exactly as useless as refusing nothing and
 #    looks a great deal more like rigour.
 fastcached_make_tree("clean" "${signingSeam}" "" "" tree)
 fastcached_run_check("${tree}" objected output)
 if(objected)
-    list(APPEND failures "clean: a tree with exactly the four allowed files was refused -- the check refuses everything")
+    list(APPEND failures "clean: a tree with exactly the five allowed files was refused -- the check refuses everything")
 endif()
 
-# 2. A fourth signer. The whole point: a new caller of the primitive is an
+# 2. One more signer. The whole point: a new caller of the primitive is an
 #    ordinary call to a public function in Core/ that no compiler remarks on.
 fastcached_make_tree("newsigner" "${signingSeam}"
     "apps/node/Announce.cpp" "Digest Tag(Key k, Message m) { return HmacSha256(k, m); }" tree)
@@ -200,6 +203,7 @@ file(WRITE "${tree}/src/FastCache/Core/Sha256.cpp"
 file(WRITE "${tree}/src/FastCache/Cluster/ClusterSigning.hpp"
      "Digest SignFields(Key key, Domain domain, Fields fields) { return MacIt(key, Encode(domain, fields)); }\n")
 file(WRITE "${tree}/src/FastCache/Core/Hkdf.cpp" "Prk Extract(Salt salt, Ikm ikm) { return MacIt(salt, ikm); }\n")
+file(WRITE "${tree}/src/FastCache/Core/SessionSeal.cpp" "Tag Seal(SessionKey key, Frame frame) { return MacIt(key, frame); }\n")
 fastcached_run_check("${tree}" objected output)
 if(NOT objected)
     list(APPEND failures "renamed: the primitive was spelled something else everywhere and the check reported success -- it had stopped looking at anything and would have gone on passing")

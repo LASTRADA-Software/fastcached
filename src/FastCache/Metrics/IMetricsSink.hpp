@@ -1343,13 +1343,13 @@ class IMetricsSink
 
         /// A Raft peer connection whose first frame was not a proof this build can read. (#1308)
         RaftPeerConnectionsRefusedNoHandshake,
-        /// A Raft peer connection that did not prove the key within the handshake bound. (#1308)
+        /// A Raft peer connection that did not prove its id within the handshake bound. (#1308)
         RaftPeerConnectionsRefusedHandshakeTimeout,
-        /// A Raft peer connection whose proof did not verify: no key, or a different one. (#1308)
+        /// A Raft peer connection whose proof did not verify under the key held for its id. (#1308, #178)
         RaftPeerConnectionsRefusedProof,
-        /// A Raft dialler that proved the key but dialled another member. (#1308)
+        /// A Raft dialler that proved its id but dialled another member. (#1308)
         RaftPeerConnectionsRefusedWrongTarget,
-        /// A Raft dialler that proved the key under this node's own id. (#1308)
+        /// A Raft dialler that proved this node's own id, holding its private key. (#1308, #178)
         RaftPeerConnectionsRefusedOwnId,
         /// A Raft session frame whose tag did not verify, which ends the connection. (#1308)
         RaftPeerFramesRefusedTag,
@@ -1361,11 +1361,11 @@ class IMetricsSink
         RaftPeerDialsRefusedTimeout,
         /// A Raft dial whose acceptor opened with something other than a challenge this build reads. (#1308)
         RaftPeerDialsRefusedNoChallenge,
-        /// A Raft dial whose acceptor's verdict did not verify: it does not hold this key. (#1308)
+        /// A Raft dial whose acceptor's verdict did not verify under the key held for its id. (#1308, #178)
         RaftPeerDialsRefusedAcceptorProof,
         /// A Raft dial answered, signed, by a member other than the one dialled. (#1308)
         RaftPeerDialsRefusedWrongTarget,
-        /// A Raft dial refused, signed, because the acceptor holds this node's own id. (#1308)
+        /// A Raft dial refused, signed, because the acceptor proved this node's own id from it. (#1308, #178)
         RaftPeerDialsRefusedOwnId,
         /// A Raft dial the acceptor closed after this node's proof, with no signed verdict. (#1308)
         RaftPeerDialsEndedByAcceptor,
@@ -1375,6 +1375,21 @@ class IMetricsSink
         /// rise names a client that does not -- one whose members would otherwise join with no
         /// identity while their operator was shown a key. (#178)
         ClusterAdmissionsRefusedMalformedKey,
+
+        /// A Raft peer connection whose proof claimed an id this node holds no key for. (#178)
+        RaftPeerConnectionsRefusedUnknownKey,
+        /// A Raft peer connection proved with a key the cluster has revoked. (#178)
+        RaftPeerConnectionsRefusedRevokedKey,
+        /// A proven Raft peer connection this node closed because the cluster no longer holds its key. (#178)
+        RaftPeerConnectionsEndedKeyWithdrawn,
+        /// A Raft dial answered by a member this node holds no key for. (#178)
+        RaftPeerDialsRefusedAcceptorKeyUnknown,
+        /// A Raft dial answered by a member whose key the cluster has revoked. (#178)
+        RaftPeerDialsRefusedAcceptorKeyRevoked,
+        /// A Raft dial refused, by a verified verdict, because the cluster revoked this node's key. (#178)
+        RaftPeerDialsRefusedOwnKeyRevoked,
+        /// A proven Raft dial this node ended because the cluster no longer holds the acceptor's key. (#178)
+        RaftPeerDialsEndedKeyWithdrawn,
 
         Last,
     };

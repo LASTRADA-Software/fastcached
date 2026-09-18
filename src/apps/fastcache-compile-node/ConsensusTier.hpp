@@ -10,11 +10,13 @@
 #include <FastCache/Cluster/ClusterState.hpp>
 #include <FastCache/Cluster/ClusterStateMachine.hpp>
 #include <FastCache/Cluster/MembershipPolicy.hpp>
+#include <FastCache/Cluster/RosterKeys.hpp>
 #include <FastCache/Consensus/FileRaftStorage.hpp>
-#include <FastCache/Consensus/IRaftPeerCredential.hpp>
+#include <FastCache/Consensus/IRaftPeerIdentity.hpp>
 #include <FastCache/Consensus/RaftDriver.hpp>
 #include <FastCache/Consensus/RaftPeerServer.hpp>
 #include <FastCache/Consensus/RaftPeerTransport.hpp>
+#include <FastCache/Core/Ed25519.hpp>
 #include <FastCache/Core/IRandomSource.hpp>
 #include <FastCache/Core/ISecureRandom.hpp>
 #include <FastCache/Core/Logger.hpp>
@@ -46,6 +48,20 @@
 
 namespace FastCache::Node
 {
+
+/// Why a consensus tier cannot start without this node's identity key (#178).
+///
+/// Every Raft peer connection proves each end's OWN key, so a node without one could neither
+/// be heard nor hear anybody -- and running consensus unauthenticated instead is the
+/// per-connection fallback #1308 refused, one key later. **No configuration reaches it**: a
+/// node running consensus always has a state directory (`HoldsNodeKey`), and the start resolves
+/// the key there -- or refuses, naming the file -- before this tier exists. So it names the
+/// caller that skipped that, rather than a flag to change. It ends without a full stop for
+/// `ConsensusNamesNoSelfPeerRefusal`'s reason.
+inline constexpr std::string_view ConsensusNeedsIdentityKeyRefusal =
+    "consensus needs this node's identity key and was started without one: every Raft peer connection proves each "
+    "end's own key, so a node without one could neither be heard nor hear anybody. The start resolves it out of the "
+    "state directory before consensus exists, so this is a caller that skipped that";
 
 /// Where clients should be told to reach this node's scheduler.
 ///
@@ -283,17 +299,23 @@ class ConsensusTier final: public Distributed::IClusterAdmin, public IConsensusS
     /// @param schedulerBound What this node's scheduler surface bound, empty when
     ///        it serves none. Only the PORT is taken from it; see
     ///        `AdvertisedSchedulerEndpoint` for why the host cannot be.
+    /// @param identityKey This node's identity key, as the start resolved it out of the state
+    ///        directory (#178). Taken rather than read again, so the key every peer connection
+    ///        proves and the one the node announced are one reading of one file. Disengaged is
+    ///        refused (`ConsensusNeedsIdentityKeyRefusal`).
     /// @param onRole Told this node's role; must outlive the tier.
     /// @param onMembers Told the member set; must outlive the tier.
     /// @param metrics Where a refused peer connection is counted; must outlive the tier.
     /// @param logger Where progress and refusals are reported.
     /// @return The running tier, or the fatal reason.
-    [[nodiscard]] static std::expected<std::unique_ptr<ConsensusTier>, std::string> Start(NodeConfig const& cfg,
-                                                                                          std::string_view schedulerBound,
-                                                                                          RoleObserver onRole,
-                                                                                          MembersObserver onMembers,
-                                                                                          IMetricsSink& metrics,
-                                                                                          ILogger& logger);
+    [[nodiscard]] static std::expected<std::unique_ptr<ConsensusTier>, std::string> Start(
+        NodeConfig const& cfg,
+        std::string_view schedulerBound,
+        std::optional<Ed25519KeyPair> const& identityKey,
+        RoleObserver onRole,
+        MembersObserver onMembers,
+        IMetricsSink& metrics,
+        ILogger& logger);
 
     ConsensusTier(ConsensusTier const&) = delete;
     ConsensusTier& operator=(ConsensusTier const&) = delete;
@@ -383,7 +405,8 @@ class ConsensusTier final: public Distributed::IClusterAdmin, public IConsensusS
   private:
     ConsensusTier(Cluster::ClusterMember self,
                   Consensus::FileRaftStorage storage,
-                  std::unique_ptr<Consensus::IRaftPeerCredential const> credential,
+                  Ed25519KeyPair identityKey,
+                  std::span<Cluster::ClusterMember const> knownMembers,
                   std::string boundEndpoint,
                   RoleObserver onRole,
                   MembersObserver onMembers,
@@ -536,10 +559,16 @@ class ConsensusTier final: public Distributed::IClusterAdmin, public IConsensusS
     /// Where a refused peer connection is counted.
     IMetricsSink& _metrics;
 
-    /// The cluster key, as the peer wire proves it (#1308). Read once, before anything
-    /// is dialled or accepted, and declared before the transport and the server, which
-    /// both hold a reference to it.
-    std::unique_ptr<Consensus::IRaftPeerCredential const> _credential;
+    /// This node's identity key, and what the cluster says every other member proves itself
+    /// with (#178): the members this node's command line names, until the replicated state
+    /// says otherwise, which it does from `OnStateChanged` on every applied change. Declared
+    /// before `_identity` and before the transport and the server, which all hold a reference
+    /// into it, and before `_application`, whose apply callback writes it.
+    Cluster::RosterKeys _roster;
+
+    /// Who this node is on the Raft peer wire: its id, proved with `_roster`'s own key, and
+    /// every peer's proof and verdict checked against `_roster`'s keys.
+    Consensus::RaftPeerIdentity _identity;
 
     /// Name resolution for the peer dials, off the reactor thread.
     ///
@@ -714,6 +743,8 @@ class ConsensusTier final: public Distributed::IClusterAdmin, public IConsensusS
 /// single-machine deployment, not a degraded one.
 /// @param cfg The parsed configuration.
 /// @param schedulerTier Told this node's role; may be null when it serves none.
+/// @param identityKey This node's identity key, as the start resolved it; see
+///        `ConsensusTier::Start`.
 /// @param membership Told the replicated member set; must outlive the tier.
 /// @param metrics Where a refused peer connection is counted; must outlive the tier.
 /// @param logger Where progress and refusals are reported.
@@ -743,6 +774,7 @@ class ConsensusTier final: public Distributed::IClusterAdmin, public IConsensusS
     NodeConfig const& cfg,
     std::unique_ptr<SchedulerTier> const& schedulerTier,
     std::string_view schedulerBound,
+    std::optional<Ed25519KeyPair> const& identityKey,
     NodeMembership& membership,
     IMetricsSink& metrics,
     ILogger& logger);

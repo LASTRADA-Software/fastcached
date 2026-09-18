@@ -43,6 +43,7 @@ target_sources(FastCache
         Consensus/RaftDriver.cpp
         Consensus/RaftLog.cpp
         Consensus/RaftNode.cpp
+        Consensus/RaftPeerIdentity.cpp
         Consensus/RaftPeerServer.cpp
         Consensus/RaftPeerSession.cpp
         Consensus/RaftPeerTransport.cpp
@@ -54,6 +55,7 @@ target_sources(FastCache
         Core/PathKind.cpp
         Core/SecureBytes.cpp
         Core/SecureRandom.cpp
+        Core/SessionSeal.cpp
         Core/Sha256.cpp
         Core/X25519.cpp
         Cluster/ClusterState.cpp
@@ -61,6 +63,7 @@ target_sources(FastCache
         Cluster/DiscoveryService.cpp
         Cluster/MembershipPolicy.cpp
         Cluster/PeerDirectory.cpp
+        Cluster/RosterKeys.cpp
         Net/InMemoryDatagram.cpp
         Net/SharedPortDatagram.cpp
         Net/UdpSocket.cpp

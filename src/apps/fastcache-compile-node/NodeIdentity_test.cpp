@@ -724,3 +724,40 @@ TEST_CASE("A service registration keeps the key its --raft-peer entries name", "
     REQUIRE(replayedPeer != replayed.raftPeers.end());
     CHECK(replayedPeer->publicKey == std::optional { KeyOf(0x42) });
 }
+
+TEST_CASE("What --print-identity prints is the token --raft-peer reads back into this member", "[node][identity][key]")
+{
+    // #178: every member's --raft-peer has to name every other member's key before any of them
+    // starts, and this is where an operator copies it from. So the token is asserted by
+    // PARSING it, the way the other members will, rather than by its spelling.
+    auto const key = Ed25519KeyPair::FromSeed(ScriptedSecureRandom::Ascending(Ed25519SeedBytes)).value().PublicKey();
+
+    SECTION("a consensus member prints its id, its key and its token")
+    {
+        auto const text = DescribeIdentity("n1", key, std::optional<std::string> { "10.0.0.7:6680" });
+        CHECK(text.contains(std::format("node-id n1\n")));
+        CHECK(text.contains(std::format("public-key {}\n", FormatEd25519PublicKey(key))));
+
+        auto const tokenAt = text.find("raft-peer ");
+        REQUIRE(tokenAt != std::string::npos);
+        auto const token = std::string_view { text }.substr(tokenAt + std::string_view { "raft-peer " }.size());
+        auto const member = Cluster::ParseMemberSpec(token.substr(0, token.find('\n')));
+        REQUIRE(member.has_value());
+        CHECK(Unwrap(member).id == "n1");
+        CHECK(Unwrap(member).raftEndpoint == "10.0.0.7:6680");
+        CHECK(Unwrap(member).publicKey == key);
+    }
+
+    SECTION("a node its peers could not dial yet prints no token rather than a guessed one")
+    {
+        auto const text = DescribeIdentity("n1", key, std::nullopt);
+        CHECK(text.contains("public-key "));
+        CHECK_FALSE(text.contains("raft-peer"));
+    }
+
+    SECTION("a node that runs no consensus has a key and no id to print")
+    {
+        auto const text = DescribeIdentity("", key, std::nullopt);
+        CHECK(text == std::format("public-key {}\n", FormatEd25519PublicKey(key)));
+    }
+}

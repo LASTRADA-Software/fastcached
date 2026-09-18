@@ -160,6 +160,7 @@ if(FASTCACHED_BUILD_TESTS)
         NodeIdentity_test.cpp
         NodeKey.cpp
         NodeKey_test.cpp
+        RaftKeyRevocation_test.cpp
         NodeSurfaces.cpp
         NodeSurfaces_test.cpp
         NodeMembership_test.cpp

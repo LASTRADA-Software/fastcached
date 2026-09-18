@@ -4,7 +4,7 @@
 #include <FastCache/Async/IReactor.hpp>
 #include <FastCache/Async/Task.hpp>
 #include <FastCache/Consensus/IRaftMessageSink.hpp>
-#include <FastCache/Consensus/IRaftPeerCredential.hpp>
+#include <FastCache/Consensus/IRaftPeerIdentity.hpp>
 #include <FastCache/Consensus/RaftPeerRefusals.hpp>
 #include <FastCache/Consensus/RaftTypes.hpp>
 #include <FastCache/Consensus/RaftWire.hpp>
@@ -28,7 +28,7 @@ namespace FastCache::Consensus
 /// Limits a peer connection is held to.
 struct PeerServerOptions
 {
-    /// Largest frame payload this node will buffer from a peer that has proved the key.
+    /// Largest frame payload this node will buffer from a peer that has proved its id.
     ///
     /// The wire's length field is a u32, so a peer — or something that is not a
     /// peer at all — can declare four gigabytes. Without a cap the declared
@@ -46,7 +46,7 @@ struct PeerServerOptions
     /// reconnecting peer never waits behind its own stale connection.
     std::size_t maxConnections { 64 };
 
-    /// How long a connection may take to prove the key before it is closed and counted.
+    /// How long a connection may take to prove an id before it is closed and counted.
     ///
     /// `RaftWire::HandshakeBound`, which the dialling end uses too. Non-positive arms
     /// no deadline at all -- `ArmSocketDeadline`'s rule -- which exists for a test that
@@ -70,14 +70,14 @@ struct OpenConnections
     std::vector<ISocket*> sockets; ///< One per connection currently being served.
 };
 
-/// Accepts peer connections, proves each one holds the cluster key, and turns their
+/// Accepts peer connections, has each one prove which member it is, and turns their
 /// frames into `RaftMessage`s.
 ///
 /// The inbound counterpart to `RaftPeerTransport`. It runs on the reactor like
 /// every other server here, because accepting and reading are what the reactor
 /// already does.
 ///
-/// ## Nothing is read from a peer that has not proved the key (#1308)
+/// ## Nothing is read from a peer that has not proved its id (#1308, #178)
 ///
 /// Every connection opens with `RaftPeerSession`'s handshake: this end sends a
 /// challenge before reading a byte, reads exactly one proof no larger than
@@ -85,8 +85,18 @@ struct OpenConnections
 /// answers with a signed verdict. Only an accepted connection has its frames read,
 /// and each of those is checked against the session before it is decoded. Every way a
 /// connection is refused moves its own counter (`AcceptorRefusals`), because each names
-/// a different thing to go and fix. A connection that proves the key is attributed to
+/// a different thing to go and fix. A connection that proves an id is attributed to
 /// the member it proved, and a message naming any other sender ends it.
+///
+/// ## A revoked key ends the connections it proved
+///
+/// Every frame is re-checked against the roster (`IRaftPeerIdentity::StillProves`) before
+/// it is delivered, so an applied `RevokeKey` -- or a re-admission under another key --
+/// closes a connection that proved the old key at its next frame, and the redial is judged
+/// against the roster as it is then. Pulled per frame rather than pushed by the state
+/// machine, because the connection belongs to the reactor's thread and the roster moves on
+/// another: a push would be a close from the wrong thread, and a Raft peer is never quiet
+/// for long.
 ///
 /// ## What closes a connection and what does not
 ///
@@ -134,19 +144,17 @@ class RaftPeerServer
     /// @param sink Where decoded messages go.
     /// @param logger Where refusals are reported.
     /// @param metrics Where refusals are counted.
-    /// @param credential What a peer's proof is checked against, and what this node's
-    ///        verdicts are signed with.
-    /// @param self This node's id: the member a dialler must have meant.
-    /// @param random Where each connection's challenge nonce comes from. A connection this
-    ///        node cannot draw one for is closed before it is challenged (#1527).
+    /// @param identity Who this node is -- the member a dialler must have meant -- what its
+    ///        verdicts are signed with, and what a peer's proof is checked against.
+    /// @param random Where each connection's challenge nonce and ephemeral key come from. A
+    ///        connection this node cannot draw them for is closed before it is challenged (#1527).
     /// @param options Frame, connection and handshake limits.
     RaftPeerServer(IListener& listener,
                    IReactor& reactor,
                    IRaftMessageSink& sink,
                    ILogger& logger,
                    IMetricsSink& metrics,
-                   IRaftPeerCredential const& credential,
-                   NodeId self,
+                   IRaftPeerIdentity const& identity,
                    ISecureRandom& random,
                    PeerServerOptions options = {});
 
@@ -222,7 +230,7 @@ class RaftPeerServer
     /// @param detail What was seen, for the log line; never a claimed id.
     void NotePreAuthRefusal(AcceptorRefusal refusal, std::string_view peer, std::string_view detail);
 
-    /// Count a refusal of a peer that proved the key, and log it naming who it proved.
+    /// Count a refusal of a peer that proved its id, and log it naming who it proved.
     /// @param refusal Which refusal.
     /// @param peer The address the connection came from.
     /// @param dialler The member the connection proved.
@@ -238,7 +246,7 @@ class RaftPeerServer
     /// **Not an `AcceptorRefusal`, and it moves no counter**: every row there names something
     /// about the PEER to go and fix, and this names nothing about it -- the fault is this
     /// host's generator, and it is every connection from every peer. So it is the transport's
-    /// "cannot prove the key" line one end over: an Error naming the cause, throttled because
+    /// "cannot prove this node's id" line one end over: an Error naming the cause, throttled because
     /// anything that can reach the port provokes it.
     /// @param peer The address the connection came from.
     /// @param error Why the draw failed.
@@ -249,8 +257,7 @@ class RaftPeerServer
     IRaftMessageSink& _sink;
     ILogger& _logger;
     IMetricsSink& _metrics;
-    IRaftPeerCredential const& _credential;
-    NodeId _self;
+    IRaftPeerIdentity const& _identity;
     ISecureRandom& _random;
     PeerServerOptions _options;
 
