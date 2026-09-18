@@ -5789,6 +5789,42 @@ set_tests_properties("ranges-seam-selftest" PROPERTIES
     TIMEOUT 180
 )
 
+# No first-party file includes a Monocypher header except `Core/Ed25519.cpp` and
+# `Core/X25519.cpp`, the crypto seam (#178). The include directories are PUBLIC on the
+# vendored library and FastCache links it PRIVATE, which keeps them from FastCache's consumers
+# and not from FastCache itself -- so the build cannot say this and a scan does. The permitted
+# rows are the positive control: each must be seen INCLUDING Monocypher, or it is refused as
+# stale, which is what a broken pattern or an enumeration that missed `src/` looks like.
+add_test(
+    NAME "crypto-seam"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DGIT_EXECUTABLE=${GIT_EXECUTABLE}"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-crypto-seam.cmake"
+)
+set_tests_properties("crypto-seam" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 120
+)
+
+# And that check must be SEEN to refuse each spelling of the crossing, seen to stay quiet over
+# a comment and over the seam's own pointer bridge, and seen to refuse a stale row and an empty
+# tree -- by directory walk and by a staged git index. It prints how many cases ran.
+add_test(
+    NAME "crypto-seam-selftest"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DGIT_EXECUTABLE=${GIT_EXECUTABLE}"
+        "-DFASTCACHED_SCRATCH_DIR=${CMAKE_CURRENT_BINARY_DIR}/crypto-seam-selftest"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-crypto-seam-selftest.cmake"
+)
+set_tests_properties("crypto-seam-selftest" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 180
+)
+
 # No first-party C++ walks an enum's enumerators by hand now that `Enumerators<Enum>()`
 # exists (#1476). Ten sites spelled the same walk before #1441 -- `views::iota` from zero to
 # `EnumeratorCount<Enum>` plus a `static_cast<Enum>(index)` in the body -- and NOTHING refused
