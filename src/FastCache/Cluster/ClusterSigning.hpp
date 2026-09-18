@@ -75,6 +75,11 @@ namespace FastCache::Cluster
 /// added without appearing here, and cannot appear here without a label -- which
 /// is the half of the rule that was previously written in prose and enforced
 /// nowhere.
+///
+/// **PRIVATE: persisted and transmitted nowhere.** What a tag covers is the row's LABEL,
+/// never this value, so a row may be removed or inserted anywhere and the ordinals bind
+/// nothing -- which is why #178 removing the lease's and the discovery proof's rows moved
+/// `NodeProof` to zero without a version anywhere noticing.
 enum class SigningDomain : std::uint8_t
 {
     /// A caller's proof, on the `0xFC` surface, that it holds the cluster key. See
