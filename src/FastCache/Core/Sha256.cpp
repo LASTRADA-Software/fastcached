@@ -8,7 +8,7 @@
 
 #if defined(_M_X64) || defined(__x86_64__)
     #include <immintrin.h>
-#elif defined(__APPLE__) && defined(__aarch64__)
+#elif defined(__aarch64__) || defined(_M_ARM64)
     #include <arm_neon.h>
 #endif
 
@@ -207,11 +207,20 @@ namespace
     constexpr CompressBlocksFunction X86ShaNiBlocks = nullptr;
 #endif
 
-#if defined(__APPLE__) && defined(__aarch64__)
-    // Asked for although Apple's default target enables sha2: an explicit -march=armv8-a
-    // refuses the intrinsics otherwise (.agent/rules/build-and-toolchain.md, the same
-    // entry). Only clang compiles this block.
-    #define FASTCACHED_ARM_SHA2_TARGET __attribute__((target("sha2")))
+#if defined(__aarch64__) || defined(_M_ARM64)
+    // Asked for per function, for the x86 engine's reason -- and asked for even where the
+    // default target enables sha2, as Apple's does: an explicit -march=armv8-a refuses the
+    // intrinsics otherwise (.agent/rules/build-and-toolchain.md, the same entry). The two
+    // GNU-family spellings differ: GCC's aarch64 attribute takes an extension as `+sha2`,
+    // and clang takes the feature name. cl needs no attribute, since its ARM64 intrinsics
+    // are always declared and the instruction is chosen by this function's caller.
+    #if defined(__clang__)
+        #define FASTCACHED_ARM_SHA2_TARGET __attribute__((target("sha2")))
+    #elif defined(__GNUC__)
+        #define FASTCACHED_ARM_SHA2_TARGET __attribute__((target("+sha2")))
+    #else
+        #define FASTCACHED_ARM_SHA2_TARGET
+    #endif
 
     /// One of a block's four message vectors, in the byte order SHA-256 reads.
     /// @param block The 64-byte block.

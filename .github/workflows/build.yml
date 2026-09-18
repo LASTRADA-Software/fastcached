@@ -508,9 +508,16 @@ jobs:
               ;;
           esac
 
+  # The `-arm64` leg exists for #1432: SHA-256's ARMv8 engine and its detection are
+  # compiled and run only where a leg builds them, and a detection branch no leg
+  # compiles rots with nothing to say so. A matrix ROW, not a job, for
+  # `check-release-gate`'s reason; `suffix` is empty on the x86 rows, so their context
+  # names -- which are REQUIRED -- do not move. `sha256Engine` is what the runner's CPU
+  # is known to offer: GitHub's arm64 runners are Neoverse cores with SHA2, while its
+  # x86 runners are a mix with and without SHA-NI, so an x86 row states nothing.
   linux:
-    name: "Linux-${{ matrix.preset }}"
-    runs-on: ubuntu-24.04
+    name: "Linux-${{ matrix.preset }}${{ matrix.suffix }}"
+    runs-on: ${{ matrix.runner }}
     needs: changes
     # A job-level condition on a MATRIX job is the shape #300 warns about, and
     # this is the one form of it that is safe: `!cancelled()` is false only while
@@ -524,6 +531,12 @@ jobs:
       fail-fast: false
       matrix:
         preset: [clang-release, gcc-release]
+        runner: [ubuntu-24.04]
+        include:
+          - preset: gcc-release
+            runner: ubuntu-24.04-arm
+            suffix: "-arm64"
+            sha256Engine: arm-sha2
     steps:
       - uses: actions/checkout@v4
         if: ${{ needs.changes.outputs.code != 'false' }}
@@ -535,8 +548,8 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ env.CPM_SOURCE_CACHE }}
-          key: cpm-${{ runner.os }}-${{ matrix.preset }}-${{ hashFiles('CMakeLists.txt') }}
-          restore-keys: cpm-${{ runner.os }}-${{ matrix.preset }}-
+          key: cpm-${{ runner.os }}-${{ matrix.preset }}${{ matrix.suffix }}-${{ hashFiles('CMakeLists.txt') }}
+          restore-keys: cpm-${{ runner.os }}-${{ matrix.preset }}${{ matrix.suffix }}-
 
       # `save` on a branch push and nowhere else, and this is the canonical
       # statement of that clause — every other `ccache-action` step in this file
@@ -581,7 +594,7 @@ jobs:
         if: ${{ needs.changes.outputs.code != 'false' }}
         uses: hendrikmuhs/ccache-action@v1.2
         with:
-          key: ${{ runner.os }}-${{ matrix.preset }}
+          key: ${{ runner.os }}-${{ matrix.preset }}${{ matrix.suffix }}
           max-size: 256M
           save: ${{ github.event_name == 'push' && github.ref_type == 'branch' }}
 
@@ -631,8 +644,11 @@ jobs:
         if: ${{ needs.changes.outputs.code != 'false' }}
         run: cmake --build --preset ${{ matrix.preset }}
 
+      # Empty on a row that states no engine, which the test reads as "not stated".
       - name: "Test"
         if: ${{ needs.changes.outputs.code != 'false' }}
+        env:
+          FASTCACHED_EXPECT_SHA256_ENGINE: ${{ matrix.sha256Engine }}
         run: ctest --preset ${{ matrix.preset }}
 
       # Both binaries the smoke jobs drive: the daemon every job starts, and the
@@ -1672,7 +1688,12 @@ jobs:
       - name: "Build"
         run: cmake --build --preset clang-release
 
+      # `macos-14` is Apple Silicon, whose every core has the ARMv8 SHA-256 instructions,
+      # so this leg holds itself to the hardware engine rather than letting a detection
+      # that answered nothing SKIP every case that would have noticed (#1432).
       - name: "Test"
+        env:
+          FASTCACHED_EXPECT_SHA256_ENGINE: arm-sha2
         run: ctest --preset clang-release
 
   # Builds the container image (which compiles with TLS on against the system
@@ -1872,9 +1893,12 @@ jobs:
             --compiler g++-14 \
             --port 11611 || { c=$?; [ "$c" = 77 ] && echo "::error::smoke skipped, nothing verified"; exit "$c"; }
 
+  # The `-arm64` row is the Linux job's, for the same reason (#1432), and `msvcArch`
+  # is what the dev shell targets: the x86 rows name `x64`, which is the action's own
+  # default, so their environment does not move.
   windows:
-    name: "Windows-${{ matrix.preset }}"
-    runs-on: windows-2025
+    name: "Windows-${{ matrix.preset }}${{ matrix.suffix }}"
+    runs-on: ${{ matrix.runner }}
     needs: changes
     # A job-level condition on a MATRIX job is the shape #300 warns about, and
     # this is the one form of it that is safe: `!cancelled()` is false only while
@@ -1943,6 +1967,14 @@ jobs:
         # compiles exercises none of the runtime it was added for. The
         # `iterator-debug-canary` test is what refuses to believe it did.
         preset: [cl-release, clangcl-release, cl-debug]
+        runner: [windows-2025]
+        msvcArch: [x64]
+        include:
+          - preset: cl-release
+            runner: windows-11-arm
+            msvcArch: arm64
+            suffix: "-arm64"
+            sha256Engine: arm-sha2
     steps:
       - uses: actions/checkout@v4
         if: ${{ needs.changes.outputs.code != 'false' }}
@@ -1954,8 +1986,8 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ env.CPM_SOURCE_CACHE }}
-          key: cpm-${{ runner.os }}-${{ matrix.preset }}-${{ hashFiles('CMakeLists.txt') }}
-          restore-keys: cpm-${{ runner.os }}-${{ matrix.preset }}-
+          key: cpm-${{ runner.os }}-${{ matrix.preset }}${{ matrix.suffix }}-${{ hashFiles('CMakeLists.txt') }}
+          restore-keys: cpm-${{ runner.os }}-${{ matrix.preset }}${{ matrix.suffix }}-
 
       # v0.0.11 rather than v0.0.6: GitHub's cache service v1 is gone, and only
       # the newer action exports the ACTIONS_RESULTS_URL / ACTIONS_RUNTIME_TOKEN
@@ -1981,6 +2013,7 @@ jobs:
         uses: ilammy/msvc-dev-cmd@v1
         with:
           toolset: "14.44"
+          arch: ${{ matrix.msvcArch }}
 
       - name: "Configure"
         if: ${{ needs.changes.outputs.code != 'false' }}
@@ -2078,6 +2111,8 @@ jobs:
       # `Test Failed.`. The reading after a red needs that distinction (#1515).
       - name: "Test"
         if: ${{ needs.changes.outputs.code != 'false' }}
+        env:
+          FASTCACHED_EXPECT_SHA256_ENGINE: ${{ matrix.sha256Engine }}
         run: ctest --preset ${{ matrix.preset }} --output-log out/build/${{ matrix.preset }}/ctest-output.log
 
       # The other half of the bracket, and it only runs on a red.
@@ -2149,7 +2184,7 @@ jobs:
         if: ${{ needs.changes.outputs.code != 'false' }}
         uses: actions/upload-artifact@v4
         with:
-          name: fastcached-windows-${{ matrix.preset }}
+          name: fastcached-windows-${{ matrix.preset }}${{ matrix.suffix }}
           path: out/build/${{ matrix.preset }}/target/fastcached.exe
           if-no-files-found: error
 

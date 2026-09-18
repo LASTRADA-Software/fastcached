@@ -663,6 +663,8 @@ NonBindingContexts=(
     "Deploy to Pages|NotBinding|a deployment, not a check, and it runs only after a push to master has already merged"
     "Build site (strict)|NotBinding|docs.yml is not reachable from a code change; a docs break is caught on the push that lands it and blocks no unrelated work"
     "Check the release gate covers every job|NotBinding|it guards a TAG run, and a tag is not a merge. A release that lost a gating job is caught by this job on the tag, which is the event that can act on it"
+    "Linux-gcc-release-arm64|NotBinding|#1432: the arm64 legs exist to compile and run the ARMv8 SHA-256 engine and its detection on GitHub's partner arm64 images. A required context there would make every merge depend on a runner pool this repository cannot fix, and an unrequired failure is still reported by the notifier (merge-group-report.yml)"
+    "Windows-cl-release-arm64|NotBinding|#1432, as above"
 
     # Nobody has decided. Tallied per issue on every run.
     #
