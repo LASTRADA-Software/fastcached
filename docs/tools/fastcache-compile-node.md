@@ -1317,15 +1317,19 @@ It prints back the two things the leader wrote down:
 recorded, as received:
   member id           n4
   consensus endpoint  10.0.0.4:6680
+  seat                voter (the verb this request was sent as)
 
 Appended, not committed: a majority has to take it, and this leader cannot
 see that yet. Ask for the cluster state again to see the result.
 
-Compare both lines above against the machine itself -- the id it minted into
---cluster-dir, and the consensus endpoint its own --print-surfaces prints
-(or `fastcache-cli node` against it). They are two spellings of one thing,
-and nothing else compares them.
+Compare the first two lines against the machine itself -- the id it minted
+into --cluster-dir, and the consensus endpoint its own --print-surfaces
+prints (or `fastcache-cli node` against it). They are two spellings of one
+thing, and nothing else compares them.
 ```
+
+The seat is not an echo: the leader's receipt does not carry it, because it can only
+have answered the verb it was sent, so it is printed as what it is.
 
 **Read both lines against the machine you are bringing in, because that comparison
 is the whole reason they are printed.** The address typed here and the one that node
@@ -1382,6 +1386,67 @@ addresses — see below.
 **Nothing about the existing members changes.** They are not restarted, their
 command lines are not edited, and the new member survives *their* restarts as well
 as its own, because it is a log entry rather than a flag.
+
+### A machine that is usually away: admitting a learner
+
+A member admitted with `--cluster-admit` is a **voter**: every quorum counts it — the
+one that commits an entry, the one that elects a leader, and the one a leader checks it
+still has contact with. That is right for a machine that is always on, and wrong for
+one that is not. In a cluster of an always-on node and a laptop, the laptop leaving the
+VPN costs the always-on node its majority, so it stops leading at its next check: the
+scheduler answers `NotLeader`, and the fleet page and history go dark until the laptop
+comes back ([#178](https://github.com/LASTRADA-Software/fastcached/issues/178)).
+
+Admit such a machine as a **learner** instead — same token, same `--raft-join` on the
+machine itself:
+
+```sh
+fastcache-compile-node --scheduler=10.0.0.1:6675 --cluster-admit-learner=laptop=10.0.0.9:6680
+```
+
+A learner is replicated to and **counted by nothing** (#1449):
+
+- it receives the log and snapshots and applies them like any member, so it holds the
+  same cluster state, and it serves whatever surfaces its other tiers serve;
+- it **never stands for election and never votes**. A learner asked for a vote refuses
+  it — an explicit refusal, not silence — and one whose election timer would have fired
+  has no election timer at all;
+- it counts towards no commitment and no leadership check, so its absence costs the
+  cluster nothing: the always-on node above keeps leading while the laptop is away, and
+  restarted on its own it becomes leader again with no one else present;
+- it can never be the leader.
+
+**It answers as any follower does, and that includes writes.** A learner follows the
+leader it hears from, so its scheduler asked for anything a leader must decide answers
+`NotLeader` naming the leader's scheduler endpoint, exactly as a following voter's does
+— clients and `--scheduler` lists follow that redirect the same way. Before it has
+heard from any leader it is `undecided`, as every node waiting to be admitted is.
+
+**Promotion and demotion are re-admissions.** `--cluster-admit` on a learner promotes
+it; `--cluster-admit-learner` on a voter demotes it. The cluster moves one member at a
+time, in a fixed order — additions, then promotions, then demotions, then removals —
+because a configuration change that moved two voters at once could give the old and the
+new configuration majorities with no voter in common. A promotion waits, like any voter
+addition, until the member's address can be dialled; a demotion that would leave the
+cluster with no voter at all is never proposed. A learner is removed on exactly the
+terms any member is — `--cluster-forget` — and **never for being absent**: nothing here
+asks whether a member answers.
+
+`--cluster-status` shows which seat each member was admitted into (`seat=voter` or
+`seat=learner`). That is the record the leader is moving towards, so for a moment
+after an admit it can run ahead of what consensus counts; `fastcache-cli node` against
+the machine reports `consensus-standing`, which is what consensus counts that machine
+as **now**, and each node logs it whenever its configuration changes:
+
+```
+consensus: this node counts 1 member(s): n1; learners, counted by no quorum: laptop; it is a voter
+```
+
+A learner that should be promoted before the voter it replaces is retired is promoted
+first and forgotten second — the fixed order above does that for you if both are
+recorded at once. And the one thing a learner cannot do for you: if the only voters
+are gone for good, a learner cannot take over, because it was never part of the
+majority that decides. Promote it while a voter is still there to commit the change.
 
 ### Enrolling a machine instead of typing it
 
@@ -1511,11 +1576,13 @@ directly, and each exits when it has an answer:
 fastcache-compile-node --scheduler=10.0.0.1:6675 --cluster-status
 fastcache-compile-node --scheduler=10.0.0.1:6675 --cluster-set=fleet-open=1
 fastcache-compile-node --scheduler=10.0.0.1:6675 --cluster-admit=n4=10.0.0.4:6680
+fastcache-compile-node --scheduler=10.0.0.1:6675 --cluster-admit-learner=laptop=10.0.0.9:6680
 fastcache-compile-node --scheduler=10.0.0.1:6675 --cluster-forget=n3
 ```
 
-`--cluster-status` prints the members, the settings, and **every key this build
-knows** — because the question an operator usually has is "what *can* I set", and a
+`--cluster-status` prints the members — each with the `seat` it was admitted into,
+`voter` or `learner` (see [admitting a learner](#a-machine-that-is-usually-away-admitting-a-learner))
+— the settings, and **every key this build knows** — because the question an operator usually has is "what *can* I set", and a
 report listing only what somebody had already set would answer it wrongly by
 omission.
 
@@ -2557,11 +2624,11 @@ the **quorum**, answered by whichever node you scrape, leader or not.
 
 | Series | Says |
 |---|---|
-| `fastcache_node_consensus_members` | How many members the configuration this node operates under names. `0` is a *reading*, not an absence: the node holds no configuration, so it stands for no election and grants no vote. That is the ordinary waiting state of a `--raft-join` node before it is admitted, and a fault for any other — see the alert below. |
+| `fastcache_node_consensus_members` | How many members the configuration this node operates under names — voters and learners alike. `0` is a *reading*, not an absence: the node holds no configuration, so it stands for no election and grants no vote. That is the ordinary waiting state of a `--raft-join` node before it is admitted, and a fault for any other — see the alert below. |
 | `fastcache_node_consensus_term` | The election term this node is operating in. A gauge and not a counter: wiping `--cluster-dir` legitimately resets it, and a counter that resets renders as a spike of its whole history. |
 | `fastcache_node_consensus_commit_index` | How far this node's replicated log is committed. Far behind its peers means it is being caught up rather than taking part. |
 | `fastcache_node_consensus_role` | One sample per role — `follower`, `pre-candidate`, `candidate`, `leader` — with exactly one of them `1`. A node cycling between `candidate` and `follower` is a cluster that cannot settle. |
-| `fastcache_node_consensus_member` | One sample per member of that configuration, carrying its id. The set rather than only its size, because "which members does this node count" is what you ask when an election will not resolve. No samples at all when the configuration is empty. |
+| `fastcache_node_consensus_member` | One sample per member of that configuration, carrying its id and its `seat` — `voter` or `learner`. The set rather than only its size, because "which members does this node count" is what you ask when an election will not resolve, and since learners exist the seat is half that answer: `count by (seat)` says how many a quorum counts. No samples at all when the configuration is empty. |
 | `fastcache_node_consensus_leader` | The member this node believes leads. **Absent** when it believes none does, which is what an election in progress looks like — not an empty label, which a dashboard would draw as a member. |
 
 The alert worth writing is `fastcache_node_consensus_members == 0` sustained on a node

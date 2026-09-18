@@ -2,7 +2,6 @@
 #include <FastCache/Consensus/RaftConfig.hpp>
 #include <FastCache/Consensus/RaftMembership.hpp>
 
-#include <algorithm>
 #include <format>
 
 namespace FastCache::Consensus
@@ -13,26 +12,29 @@ std::expected<void, ConsensusError> RaftConfig::Validate() const
     if (self.empty())
         return std::unexpected { InvalidConfiguration("this node has no identity: `self` is empty") };
 
-    // An empty member set is accepted, and it is not "no configuration was
+    // An empty configuration is accepted, and it is not "no configuration was
     // supplied": it is a node waiting to be admitted to a cluster it has not
-    // joined yet. The two rules below are about the shape of a member set, so they
-    // have nothing to say about one that does not exist. What still applies is
+    // joined yet. The two rules below are about the shape of a configuration, so
+    // they have nothing to say about one that does not exist. What still applies is
     // everything else -- `self` above, because a node with no identity cannot be
     // admitted either, and the timings below, because a node with no cluster still
     // arms an election timer it declines to act on.
-    if (!members.empty())
+    auto const bootstrap = Bootstrap();
+    if (!Membership::IsEmpty(bootstrap))
     {
-        if (std::ranges::find(members, self) == members.end())
+        // In EITHER set: a node may be bootstrapped as a learner, which is what a
+        // usually-absent machine is on its own command line (#1449).
+        if (!Membership::IsMember(bootstrap, self))
             return std::unexpected { InvalidConfiguration(
                 std::format("`self` ({}) is not among the cluster members", self)) };
 
-        // What makes a member set usable is one rule, and `Membership::Validate`
+        // What makes a configuration usable is one rule, and `Membership::Validate`
         // is where it lives -- the same one `ProposeMembership` applies to a set
         // arriving through the log. A second copy here was already not equivalent:
         // it refused a duplicate and accepted an empty id, so a bootstrap list
         // containing `""` started a node that would have refused the identical set
         // had a peer proposed it.
-        if (auto valid = Membership::Validate(members); !valid.has_value())
+        if (auto valid = Membership::Validate(bootstrap); !valid.has_value())
             return std::unexpected { valid.error() };
     }
 
@@ -60,20 +62,9 @@ std::expected<void, ConsensusError> RaftConfig::Validate() const
     return {};
 }
 
-std::size_t RaftConfig::Quorum() const noexcept
+Configuration RaftConfig::Bootstrap() const
 {
-    return (members.size() / 2) + 1;
-}
-
-std::vector<NodeId> RaftConfig::Peers() const
-{
-    auto peers = std::vector<NodeId> {};
-    peers.reserve(members.empty() ? 0 : members.size() - 1);
-    for (auto const& member: members)
-        if (member != self)
-            peers.push_back(member);
-
-    return peers;
+    return Configuration { .voters = voters, .learners = learners };
 }
 
 } // namespace FastCache::Consensus

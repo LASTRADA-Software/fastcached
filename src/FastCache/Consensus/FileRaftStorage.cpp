@@ -36,10 +36,54 @@ namespace
     constexpr std::uint32_t LogMagic = 0x4643524CU;      // "FCRL"
     constexpr std::uint32_t SnapshotMagic = 0x4643524EU; // "FCRN"
 
-    /// Bumped when either layout changes. A version this build does not know is
-    /// refused rather than guessed at: reading an unknown layout as if it were
-    /// this one produces a log, not an error.
-    constexpr std::uint16_t FormatVersion = 1;
+    /// Bumped when any of the three layouts changes -- including a payload one of
+    /// them carries, which is what moved it last. A version this build does not
+    /// know is refused rather than guessed at: reading an unknown layout as if it
+    /// were this one produces a log, not an error. And it is refused as
+    /// `UnsupportedFormatVersion`, never as the `StorageFailure` damage is, because
+    /// the code is what an operator acts on and "corrupt" is what gets a healthy
+    /// store deleted.
+    ///
+    /// 2 (#1449): a configuration carries VOTERS and LEARNERS -- two nested id lists
+    /// where format 1 had one flat list -- in the snapshot's configuration field and
+    /// in the payload of every `Configuration` log entry. It is also the version at
+    /// which each log RECORD states the format: format 1's records carried no version
+    /// at all, so the log could not refuse an old layout and would have read a
+    /// format-1 configuration entry as whatever the new decoder made of it -- which
+    /// `RaftNode` discards as unreadable, silently falling back to the bootstrap set.
+    ///
+    /// No conversion: a store is a Raft log, the one installation rebuilds, and a
+    /// node refused here is moved aside and rejoins (#332's position, stated in
+    /// AGENT.md). The version is still bumped rather than skipped, because it is how
+    /// the mismatch is DETECTED.
+    constexpr std::uint16_t FormatVersion = 2;
+
+    /// What a format-1 log reads as in the slot format 2 put the version in.
+    ///
+    /// Format 1 wrote a record's u64 index straight after the magic, so the two bytes
+    /// now read as the version are that index's high half -- zero for any log shorter
+    /// than 2^48 entries, which is every log. Named so the refusal can say which
+    /// build wrote the file rather than report a version no build ever wrote.
+    constexpr std::uint16_t UnversionedLogReadsAs = 0;
+
+    /// The format a log whose records carry no version was written in.
+    constexpr std::uint16_t UnversionedLogFormat = 1;
+
+    /// What an operator does about a store another build wrote.
+    ///
+    /// One sentence for every such refusal, because the three files are ONE store and
+    /// go aside together: a remedy naming only the file that happened to be read
+    /// first leaves the other two to refuse the next start, one at a time. And it
+    /// says where that leaves the node, since "move it aside" alone reads as
+    /// harmless -- it is a node with an empty log, and whatever the cluster agreed
+    /// at runtime has to be agreed again. The identity is named as staying, because
+    /// it lives in the same directory and a wiped identity is a different node.
+    constexpr std::string_view ForeignStoreRemedy =
+        "it is intact, and there is no conversion: stop the node, move raft-state, raft-log and raft-snapshot out of "
+        "its state directory -- leaving node-id where it is -- and start it again. It comes back with an empty log "
+        "under its bootstrap configuration, so anything the cluster agreed at runtime (members admitted with "
+        "--cluster-admit or --cluster-admit-learner, cluster settings) has to be agreed again: re-run those "
+        "commands once a leader is elected; see docs/operations/upgrading-a-fleet.md";
 
     constexpr std::string_view StateFileName = "raft-state";
     constexpr std::string_view LogFileName = "raft-log";
@@ -76,6 +120,43 @@ namespace
 #endif
     }
 
+    /// Bytes every file here opens with, in every format: the magic, then the version.
+    constexpr auto FileHeaderSize = sizeof(std::uint32_t) + sizeof(std::uint16_t);
+
+    /// Judge the header every file here opens with, before anything that depends on
+    /// the layout behind it is read.
+    ///
+    /// The ORDER is the point. The magic and the version sit at the same offsets in
+    /// every format, and nothing else does -- a minimum length, a field offset, even
+    /// where a record's CRC ends all move with the layout. So the version is asked
+    /// before any of them, or a file another build wrote fails a check drawn from
+    /// this build's layout first and is reported as damage.
+    /// @param raw The file's (or record's) bytes.
+    /// @param magic The magic this kind of file carries.
+    /// @param what What the file is, for the message.
+    /// @return Nothing when it is this build's format; otherwise why not.
+    [[nodiscard]] std::expected<void, ConsensusError> JudgeHeader(std::span<std::byte const> raw,
+                                                                  std::uint32_t magic,
+                                                                  std::string_view what)
+    {
+        if (raw.size() < FileHeaderSize)
+            return std::unexpected { FastCache::StorageFailure(std::format("the {} record is corrupt", what)) };
+
+        if (ReadBigEndian<std::uint32_t>(raw) != magic)
+            return std::unexpected { FastCache::StorageFailure(std::format("the {} file is not one of ours", what)) };
+
+        auto const version = ReadBigEndian<std::uint16_t>(raw.subspan(sizeof(std::uint32_t)));
+        if (version != FormatVersion)
+            return std::unexpected { FastCache::UnsupportedFormatVersion(
+                std::format("the {} file is in Raft store format {} and this build reads format {}; {}",
+                            what,
+                            version,
+                            FormatVersion,
+                            ForeignStoreRemedy)) };
+
+        return {};
+    }
+
     /// Verify a trailing CRC32C over everything before it.
     /// @param raw The whole record, CRC included.
     /// @return True when the record is intact.
@@ -94,23 +175,14 @@ namespace
     /// @return The state, or why it could not be read.
     [[nodiscard]] std::expected<PersistentState, ConsensusError> ParseState(std::span<std::byte const> raw)
     {
-        constexpr auto minimum = sizeof(std::uint32_t) + sizeof(std::uint16_t) + sizeof(std::uint64_t)
-                                 + sizeof(std::uint32_t) + 1 + sizeof(std::uint32_t);
+        if (auto header = JudgeHeader(raw, StateMagic, "state"); !header.has_value())
+            return std::unexpected { header.error() };
+
+        constexpr auto minimum = FileHeaderSize + sizeof(std::uint64_t) + sizeof(std::uint32_t) + 1 + sizeof(std::uint32_t);
         if (raw.size() < minimum || !ChecksumHolds(raw))
             return std::unexpected { FastCache::StorageFailure("the state record is corrupt") };
 
-        auto cursor = std::size_t { 0 };
-        auto const magic = ReadBigEndian<std::uint32_t>(raw.subspan(cursor));
-        cursor += sizeof(std::uint32_t);
-        if (magic != StateMagic)
-            return std::unexpected { FastCache::StorageFailure("the state file is not one of ours") };
-
-        auto const version = ReadBigEndian<std::uint16_t>(raw.subspan(cursor));
-        cursor += sizeof(std::uint16_t);
-        if (version != FormatVersion)
-            return std::unexpected { FastCache::StorageFailure(
-                std::format("state format version {} is not supported (this build writes {})", version, FormatVersion)) };
-
+        auto cursor = FileHeaderSize;
         auto state = PersistentState {};
         state.currentTerm = Term { .value = ReadBigEndian<std::uint64_t>(raw.subspan(cursor)) };
         cursor += sizeof(std::uint64_t);
@@ -144,7 +216,20 @@ namespace
         std::size_t length {};
     };
 
-    /// Encode one log record, index included.
+    /// Why the bytes at the front of a log are not a record this build reads.
+    ///
+    /// Two answers, not one, because the log's reader does opposite things with them:
+    /// a record that is torn or damaged ends the log there -- it was never
+    /// acknowledged -- while a record another build laid out says the WHOLE file is
+    /// that build's, which is a refusal of the store and not a tail to discard.
+    struct UnreadableRecord
+    {
+        /// The version the record's header states, when it is intact enough to state
+        /// one this build does not read; nullopt for a torn or damaged record.
+        std::optional<std::uint16_t> foreignVersion;
+    };
+
+    /// Encode one log record, format and index included.
     /// @param index The index this entry occupies.
     /// @param entry What to write.
     /// @return The record's bytes, CRC last.
@@ -152,6 +237,7 @@ namespace
     {
         auto body = std::vector<std::byte> {};
         PutBigEndian<std::uint32_t>(body, LogMagic);
+        PutBigEndian<std::uint16_t>(body, FormatVersion);
         PutBigEndian<std::uint64_t>(body, index.value);
         PutBigEndian<std::uint64_t>(body, entry.term.value);
         body.push_back(static_cast<std::byte>(entry.kind));
@@ -162,20 +248,28 @@ namespace
     }
 
     /// Decode one log record from the front of `raw`.
+    ///
+    /// The header first, for `JudgeHeader`'s reason: where this record's CRC ends is a
+    /// property of the layout, so a record another build wrote would otherwise fail a
+    /// check drawn from this build's and read as torn.
     /// @param raw Remaining file contents.
-    /// @return The record, or nullopt when it is incomplete or corrupt.
-    [[nodiscard]] std::optional<DecodedRecord> ParseLogRecord(std::span<std::byte const> raw)
+    /// @return The record; or why it is not one this build reads.
+    [[nodiscard]] std::expected<DecodedRecord, UnreadableRecord> ParseLogRecord(std::span<std::byte const> raw)
     {
-        constexpr auto header =
-            sizeof(std::uint32_t) + sizeof(std::uint64_t) + sizeof(std::uint64_t) + 1 + sizeof(std::uint32_t);
-        if (raw.size() < header + sizeof(std::uint32_t))
-            return std::nullopt;
+        auto const torn = std::unexpected { UnreadableRecord { .foreignVersion = std::nullopt } };
 
-        auto cursor = std::size_t { 0 };
-        auto const magic = ReadBigEndian<std::uint32_t>(raw.subspan(cursor));
-        cursor += sizeof(std::uint32_t);
-        if (magic != LogMagic)
-            return std::nullopt;
+        if (raw.size() < FileHeaderSize || ReadBigEndian<std::uint32_t>(raw) != LogMagic)
+            return torn;
+
+        auto cursor = sizeof(std::uint32_t);
+        auto const version = ReadBigEndian<std::uint16_t>(raw.subspan(cursor));
+        cursor += sizeof(std::uint16_t);
+        if (version != FormatVersion)
+            return std::unexpected { UnreadableRecord { .foreignVersion = version } };
+
+        constexpr auto header = FileHeaderSize + sizeof(std::uint64_t) + sizeof(std::uint64_t) + 1 + sizeof(std::uint32_t);
+        if (raw.size() < header + sizeof(std::uint32_t))
+            return torn;
 
         auto index = LogIndex { .value = ReadBigEndian<std::uint64_t>(raw.subspan(cursor)) };
         cursor += sizeof(std::uint64_t);
@@ -191,7 +285,7 @@ namespace
         auto const kind = DecodeWireEnum<EntryKind>(static_cast<std::uint8_t>(raw[cursor]));
         cursor += 1;
         if (!kind.has_value())
-            return std::nullopt;
+            return torn;
 
         entry.kind = *kind;
 
@@ -200,7 +294,7 @@ namespace
 
         auto const total = cursor + payloadLength + sizeof(std::uint32_t);
         if (total > raw.size() || !ChecksumHolds(raw.first(total)))
-            return std::nullopt;
+            return torn;
 
         auto const payload = raw.subspan(cursor, payloadLength);
         entry.payload.assign(payload.begin(), payload.end());
@@ -219,11 +313,11 @@ namespace
         PutBigEndian<std::uint64_t>(body, snapshot.lastIncludedIndex.value);
         PutBigEndian<std::uint64_t>(body, snapshot.lastIncludedTerm.value);
 
-        // The member set through `Membership::Encode`, so this reader and the log
+        // The configuration through `Membership::Encode`, so this reader and the log
         // entry's cannot come to disagree about how a configuration is spelled.
-        auto const members = Membership::Encode(snapshot.members);
-        auto const tail =
-            WireFields::Encode({ std::span<std::byte const> { members }, std::span<std::byte const> { snapshot.state } });
+        auto const configuration = Membership::Encode(snapshot.configuration);
+        auto const tail = WireFields::Encode(
+            { std::span<std::byte const> { configuration }, std::span<std::byte const> { snapshot.state } });
         body.insert(body.end(), tail.begin(), tail.end());
 
         PutBigEndian<std::uint32_t>(body, Crc32c::Compute(body));
@@ -235,23 +329,14 @@ namespace
     /// @return The snapshot, or why it could not be read.
     [[nodiscard]] std::expected<RaftSnapshot, ConsensusError> ParseSnapshot(std::span<std::byte const> raw)
     {
-        constexpr auto minimum = sizeof(std::uint32_t) + sizeof(std::uint16_t) + sizeof(std::uint64_t)
-                                 + sizeof(std::uint64_t) + sizeof(std::uint32_t);
+        if (auto header = JudgeHeader(raw, SnapshotMagic, "snapshot"); !header.has_value())
+            return std::unexpected { header.error() };
+
+        constexpr auto minimum = FileHeaderSize + sizeof(std::uint64_t) + sizeof(std::uint64_t) + sizeof(std::uint32_t);
         if (raw.size() < minimum || !ChecksumHolds(raw))
             return std::unexpected { FastCache::StorageFailure("the snapshot record is corrupt") };
 
-        auto cursor = std::size_t { 0 };
-        auto const magic = ReadBigEndian<std::uint32_t>(raw.subspan(cursor));
-        cursor += sizeof(std::uint32_t);
-        if (magic != SnapshotMagic)
-            return std::unexpected { FastCache::StorageFailure("the snapshot file is not one of ours") };
-
-        auto const version = ReadBigEndian<std::uint16_t>(raw.subspan(cursor));
-        cursor += sizeof(std::uint16_t);
-        if (version != FormatVersion)
-            return std::unexpected { FastCache::StorageFailure(
-                std::format("snapshot format version {} is not supported (this build writes {})", version, FormatVersion)) };
-
+        auto cursor = FileHeaderSize;
         auto snapshot = RaftSnapshot {};
         snapshot.lastIncludedIndex = LogIndex { .value = ReadBigEndian<std::uint64_t>(raw.subspan(cursor)) };
         cursor += sizeof(std::uint64_t);
@@ -263,11 +348,11 @@ namespace
         if (!fields.has_value())
             return std::unexpected { FastCache::StorageFailure("the snapshot record's fields do not fit") };
 
-        auto members = Membership::Decode((*fields)[0]);
-        if (!members.has_value())
+        auto configuration = Membership::Decode((*fields)[0]);
+        if (!configuration.has_value())
             return std::unexpected { FastCache::StorageFailure("the snapshot's configuration is malformed") };
 
-        snapshot.members = *std::move(members);
+        snapshot.configuration = *std::move(configuration);
         snapshot.state.assign((*fields)[1].begin(), (*fields)[1].end());
         return snapshot;
     }
@@ -556,7 +641,32 @@ std::expected<void, ConsensusError> FileRaftStorage::ScanLog(std::vector<LogEntr
     {
         auto record = ParseLogRecord(std::span { raw }.subspan(cursor));
         if (!record.has_value())
+        {
+            // Another build's layout, and only the FIRST record may say so. A log is
+            // written by one build from its first record to its last -- nothing here
+            // converts a record in place -- so the first record's header speaks for
+            // the file. A later record naming another version is a tail torn inside
+            // its header, which is a crash to discard rather than a store to refuse:
+            // refusing it would strand a node that merely lost power, and the
+            // version it names is whatever the disk happened to hold there.
+            //
+            // Copied out of the refusal first, so the check and the read are of one
+            // local rather than of two calls the analyser cannot tie together.
+            auto const foreign = record.error().foreignVersion;
+            if (!expected.has_value() && foreign.has_value())
+            {
+                auto const stated = *foreign;
+                auto const written = stated == UnversionedLogReadsAs ? UnversionedLogFormat : stated;
+                return std::unexpected { FastCache::UnsupportedFormatVersion(
+                    std::format("{} is in Raft store format {} and this build reads format {}; {}",
+                                _logPath.string(),
+                                written,
+                                FormatVersion,
+                                ForeignStoreRemedy)) };
+            }
+
             break; // A torn tail: it was never acknowledged, so nobody committed on it.
+        }
 
         // The first record states where this log begins; every later one must
         // continue it. A gap means the file was rewritten by something that is not

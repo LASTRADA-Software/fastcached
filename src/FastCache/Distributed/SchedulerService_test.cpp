@@ -1820,9 +1820,12 @@ class RecordingCluster final: public IClusterAdmin
     /// When engaged, refuse every proposal with this error.
     std::optional<ConsensusError> refusal;
 
+    /// What the cluster has agreed, as a scheduler reads it -- empty unless a case says.
+    Cluster::ClusterState state;
+
     [[nodiscard]] Cluster::ClusterState ClusterState() const override
     {
-        return {};
+        return state;
     }
 
     [[nodiscard]] std::expected<void, ConsensusError> ProposeToCluster(Cluster::Command const& command) override
@@ -1885,7 +1888,7 @@ TEST_CASE("An admission answers with what the leader RECORDED, so a typed addres
     // no round trip, is put its own half on the screen, and this is that half.
     Admitting fleet;
 
-    auto const reply = fleet.Service().ClusterAdmit(Insider, "node-c", "10.0.0.9:6675");
+    auto const reply = fleet.Service().ClusterAdmit(Insider, "node-c", "10.0.0.9:6675", Cluster::MemberSeat::Voter);
     REQUIRE(reply.status == Wire::Status::Ok);
 
     auto const receipt = ReceiptOf(reply);
@@ -1929,7 +1932,7 @@ TEST_CASE("An admission refused before a command exists carries no receipt", "[d
     {
         Admitting fleet;
 
-        auto const reply = fleet.Service().ClusterAdmit(Outsider, "node-c", "10.0.0.9:6675");
+        auto const reply = fleet.Service().ClusterAdmit(Outsider, "node-c", "10.0.0.9:6675", Cluster::MemberSeat::Voter);
         REQUIRE(reply.status == Wire::Status::Error);
         CHECK(reply.payload.empty());
         CHECK(fleet.cluster.proposed.empty());
@@ -1941,7 +1944,7 @@ TEST_CASE("An admission refused before a command exists carries no receipt", "[d
         // seam at all, which is the one arrangement `Admitting` cannot express.
         Leading bare;
 
-        auto const reply = bare.service.ClusterAdmit(Insider, "node-c", "10.0.0.9:6675");
+        auto const reply = bare.service.ClusterAdmit(Insider, "node-c", "10.0.0.9:6675", Cluster::MemberSeat::Voter);
         REQUIRE(reply.status == Wire::Status::Error);
         CHECK(reply.error == Wire::ErrorCode::NoCluster);
         CHECK(reply.payload.empty());
@@ -1960,7 +1963,7 @@ TEST_CASE("An admission refused once the command exists carries no receipt", "[d
                                                  .context = "somebody else leads",
                                                  .knownLeader = std::string { "10.0.0.2:6675" } };
 
-        auto const reply = fleet.Service().ClusterAdmit(Insider, "node-c", "10.0.0.9:6675");
+        auto const reply = fleet.Service().ClusterAdmit(Insider, "node-c", "10.0.0.9:6675", Cluster::MemberSeat::Voter);
         REQUIRE(reply.status == Wire::Status::Error);
         CHECK(reply.payload.empty());
     }
@@ -1972,7 +1975,7 @@ TEST_CASE("An admission refused once the command exists carries no receipt", "[d
         // after it would be attached to a command nothing proposed.
         Admitting fleet;
 
-        auto const reply = fleet.Service().ClusterAdmit(Insider, "node-c", "");
+        auto const reply = fleet.Service().ClusterAdmit(Insider, "node-c", "", Cluster::MemberSeat::Voter);
         REQUIRE(reply.status == Wire::Status::Error);
         CHECK(reply.payload.empty());
         CHECK(fleet.cluster.proposed.empty());
@@ -1994,7 +1997,7 @@ TEST_CASE("The receipt says what was recorded and the reply says nothing about c
     // in prose, and prose is what would end up claiming the member is in force.
     Admitting fleet;
 
-    auto const reply = fleet.Service().ClusterAdmit(Insider, "node-c", "10.0.0.9:6675");
+    auto const reply = fleet.Service().ClusterAdmit(Insider, "node-c", "10.0.0.9:6675", Cluster::MemberSeat::Voter);
     REQUIRE(reply.status == Wire::Status::Ok);
     CHECK(reply.message.empty());
 }
@@ -2022,7 +2025,7 @@ TEST_CASE("The two verbs that share Offer answer exactly as they did", "[distrib
 
     // And the admission beside them, in the same case, so "all three are empty" and
     // "all three carry a receipt" are both red rather than one of them passing.
-    auto const admit = fleet.Service().ClusterAdmit(Insider, "node-c", "10.0.0.9:6675");
+    auto const admit = fleet.Service().ClusterAdmit(Insider, "node-c", "10.0.0.9:6675", Cluster::MemberSeat::Voter);
     REQUIRE(admit.status == Wire::Status::Ok);
     CHECK_FALSE(admit.payload.empty());
 }
@@ -2085,4 +2088,38 @@ TEST_CASE("Each client forget warns again, because each is about a different hos
     REQUIRE(records.size() == 3);
     for (auto const* const host: { "10.0.0.7", "10.0.0.8", "10.0.0.9" })
         CHECK(std::ranges::any_of(records, [host](auto const& record) { return record.message.contains(host); }));
+}
+
+TEST_CASE("An admission proposes the verb its seat names, and no opinion keeps the recorded seat",
+          "[distributed][scheduler][cluster-admit][learner]")
+{
+    // #1449. The seat an operator asks for is the VERB that reaches consensus --
+    // `MemberSeatTable` is the one statement of which -- so asking for a learner must
+    // propose `AddLearner`, and a promotion is `AddMember` on a learner.
+    //
+    // The third arm is enrollment's: an approval, which recovery repeats, states no
+    // seat. Read as "voter" it would promote a member the operator had demoted, so it
+    // reads the RECORD instead, and a voter only where there is none.
+    Admitting fleet;
+    fleet.cluster.state.members.push_back(
+        Cluster::ClusterMember { .id = "laptop",
+                                 .raftEndpoint = "10.0.0.9:6675",
+                                 .schedulerEndpoint = {},
+                                 .schedulerEndpointHistory = Cluster::SchedulerEndpointHistory::NeverAnnounced,
+                                 .seat = Cluster::MemberSeat::Learner });
+
+    auto const proposedFor = [&fleet](std::string_view id, std::optional<Cluster::MemberSeat> seat) {
+        fleet.cluster.proposed.clear();
+        auto const reply = fleet.Service().ClusterAdmit(Insider, id, "10.0.0.9:6675", seat);
+        REQUIRE(reply.status == Wire::Status::Ok);
+        REQUIRE(fleet.cluster.proposed.size() == 1);
+        return fleet.cluster.proposed.front().kind;
+    };
+
+    CHECK(proposedFor("node-c", Cluster::MemberSeat::Learner) == Cluster::CommandKind::AddLearner);
+    CHECK(proposedFor("node-c", Cluster::MemberSeat::Voter) == Cluster::CommandKind::AddMember);
+    CHECK(proposedFor("laptop", Cluster::MemberSeat::Voter) == Cluster::CommandKind::AddMember);
+
+    CHECK(proposedFor("laptop", std::nullopt) == Cluster::CommandKind::AddLearner);
+    CHECK(proposedFor("node-c", std::nullopt) == Cluster::CommandKind::AddMember);
 }

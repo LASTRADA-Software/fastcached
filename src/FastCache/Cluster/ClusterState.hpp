@@ -45,6 +45,23 @@ enum class SchedulerEndpointHistory : std::uint8_t
     Last = 2,           ///< Not a history, and never travels. See `DecodeWireEnum`.
 };
 
+/// Which of the consensus configuration's two sets a member is recorded in (#1449).
+///
+/// **Persisted and transmitted**: one byte per member, in a snapshot and in every
+/// `ClusterStatus` reply. The ordinals are explicit and append only, and `Last` never
+/// travels.
+///
+/// The RECORD of what the operator decided, never a reading of what consensus
+/// currently counts: the leader moves the configuration towards it one change at a
+/// time (`NextQuorumChange`), so between an admit and its commit the two may differ,
+/// and a report that needs the one in force asks consensus rather than this.
+enum class MemberSeat : std::uint8_t
+{
+    Voter = 0,   ///< Counted by every quorum: commitment, elections and CheckQuorum.
+    Learner = 1, ///< Replicated to and counted by nothing, and never stands for election.
+    Last = 2,    ///< Not a seat, and never travels. See `DecodeWireEnum`.
+};
+
 /// One member of the cluster, as the replicated state records it.
 ///
 /// **The endpoint is the point.** `Consensus::RaftMembership` carries ids and
@@ -88,6 +105,13 @@ struct ClusterMember
 
     /// Whether `schedulerEndpoint` has ever held a value since this id was admitted.
     SchedulerEndpointHistory schedulerEndpointHistory { SchedulerEndpointHistory::NeverAnnounced };
+
+    /// Which set the operator admitted this member into (#1449).
+    ///
+    /// Written by the verb that admitted it -- `AddMember` records a voter and
+    /// `AddLearner` a learner -- so re-admitting through the other verb is how a member
+    /// is promoted or demoted, and nothing else writes it.
+    MemberSeat seat { MemberSeat::Voter };
 
     [[nodiscard]] friend bool operator==(ClusterMember const&, ClusterMember const&) = default;
 };
@@ -539,22 +563,100 @@ enum class CommandKind : std::uint8_t
     /// committed entry rather than a reload on each machine.
     ForgetClient,
 
+    /// `AddMember`, recording the member as a LEARNER (#1449).
+    ///
+    /// A verb rather than a field on `AddMember`, for the reason `AdmitClient` is one:
+    /// the layout stays as it is and `CommandVersion` does not move. Everything else is
+    /// `AddMember`'s -- the same fields, the same wholesale record, the same move -- so
+    /// admitting a voter through this verb DEMOTES it, and admitting a learner through
+    /// `AddMember` promotes it. `MemberSeatTable` says which verb writes which seat.
+    AddLearner,
+
     Last, ///< Not a verb, and has no row: the length of a table keyed by one.
 };
+
+/// How one `MemberSeat` is spelled, and which verb records a member in it.
+struct MemberSeatRow
+{
+    MemberSeat seat;        ///< The seat this row describes.
+    std::string_view name;  ///< Its one spelling: a table cell, a JSON value and a report word alike.
+    CommandKind admittedBy; ///< The verb that records a member in this seat.
+
+    /// The set of a consensus configuration a member in this seat is placed in.
+    std::vector<Consensus::NodeId> Consensus::Configuration::* set;
+
+    /// Whether a quorum counts a member in this seat.
+    ///
+    /// What decides whether moving a member INTO the seat must wait until every node
+    /// can dial it: a member counted before its votes can arrive is a quorum that has
+    /// grown and cannot be satisfied.
+    bool counted;
+};
+
+/// One row per `MemberSeat`, in enumerator order.
+///
+/// The one statement of which verb writes which seat and which configuration set it
+/// means, so `Apply`, the scheduler that builds the command, `NextQuorumChange` that
+/// moves consensus towards it and every renderer read the same answer.
+inline constexpr EnumTable<MemberSeat, MemberSeatRow> MemberSeatTable { {
+    { .seat = MemberSeat::Voter,
+      .name = "voter",
+      .admittedBy = CommandKind::AddMember,
+      .set = &Consensus::Configuration::voters,
+      .counted = true },
+    { .seat = MemberSeat::Learner,
+      .name = "learner",
+      .admittedBy = CommandKind::AddLearner,
+      .set = &Consensus::Configuration::learners,
+      .counted = false },
+} };
+
+static_assert(RowsInEnumeratorOrder(MemberSeatTable, &MemberSeatRow::seat),
+              "MemberSeatTable must hold one row per MemberSeat, in enumerator order");
+
+/// The seat `kind` admits a member into, if it admits one at all.
+/// @param kind A verb.
+/// @return The seat whose row names @p kind, or nullopt for a verb that admits no member.
+[[nodiscard]] constexpr std::optional<MemberSeat> SeatAdmittedBy(CommandKind kind) noexcept
+{
+    for (auto const& row: MemberSeatTable)
+        if (row.admittedBy == kind)
+            return row.seat;
+    return std::nullopt;
+}
+
+/// The seat `id` is recorded in, or a voter when `state` has no record of it.
+///
+/// The one reading of *no opinion about the seat*, shared by every caller that re-admits a
+/// member without deciding its seat -- the membership reconciler and an enrollment
+/// approval -- so neither can promote a demoted member by re-proposing it as a voter.
+/// Declared here and defined in the translation unit, beside `ClusterState`'s lookups.
+/// @param state The replicated state.
+/// @param id The member.
+/// @return Its recorded seat, or `MemberSeat::Voter`.
+[[nodiscard]] MemberSeat RecordedSeatOf(ClusterState const& state, std::string_view id);
+
+/// The spelling of `seat`, from `MemberSeatTable`.
+/// @param seat A seat.
+/// @return Its row's name.
+[[nodiscard]] constexpr std::string_view MemberSeatName(MemberSeat seat) noexcept
+{
+    return MemberSeatTable[static_cast<std::size_t>(seat)].name;
+}
 
 /// One change to the cluster's state, as it travels in a log entry.
 struct Command
 {
     CommandKind kind { CommandKind::AddMember };
-    /// The member id for `AddMember`/`RemoveMember`, the setting name for
+    /// The member id for `AddMember`/`AddLearner`/`RemoveMember`, the setting name for
     /// `SetSetting`, the client's host (a port, if given, is ignored) for
     /// `AdmitClient`/`ForgetClient`.
     std::string key;
-    /// The consensus endpoint for `AddMember`, the value for `SetSetting`, empty
-    /// otherwise.
+    /// The consensus endpoint for `AddMember`/`AddLearner`, the value for `SetSetting`,
+    /// empty otherwise.
     std::string value;
 
-    /// `AddMember` only: where clients reach the fleet while this member leads.
+    /// `AddMember`/`AddLearner` only: where clients reach the fleet while this member leads.
     ///
     /// Applied **wholesale**, so an empty one clears whatever was recorded rather
     /// than leaving it. That is the right way round: a member is re-admitted when its

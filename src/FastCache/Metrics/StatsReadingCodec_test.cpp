@@ -100,7 +100,8 @@ void GiveEveryCounterItsOwnValue(IMetricsSink& sink)
                              .hostLoad = HostLoadReading { .cpu = CpuTicks { .busy = 7'700'001, .total = 9'100'003 },
                                                            .availableMemoryBytes = 21'474'836'480 },
                              .upstreamConfigured = false,
-                             .consensus = ConsensusStatus { .members = { "node-a1", "node-b2", "" },
+                             .consensus = ConsensusStatus { .configuration = { .voters = { "node-a1", "node-b2", "" },
+                                                                               .learners = { "laptop-c3" } },
                                                             .knownLeader = Consensus::NodeId { "node-b2" },
                                                             .term = Consensus::Term { .value = 41 },
                                                             .commitIndex = Consensus::LogIndex { .value = 918'273 },
@@ -379,6 +380,12 @@ TEST_CASE("This build's live-stats layout is the pinned one", "[metrics][livesta
     // client built before the change will refuse this node. Update the constant in the same
     // change, and say in its message that clients and nodes upgrade together.
     INFO(std::format("StatsReadingLayout is 0x{:016x}", StatsReadingLayout));
+    // Moved by #1449: the consensus block's one member list became two -- voters, then
+    // learners -- so `StatsReadingWire::Grammar` went to `-5` and the field is named
+    // `configuration`. Clients and nodes upgrade together: a `fastcache-cli` built before this
+    // refuses a node built after it by name (`ForeignLayout`), rather than reading the
+    // learners as the leader's id.
+    //
     // Moved by #1428: four counters joined the catalogue for the cluster-key proof
     // (`node_proofs_accepted`, `_rejected`, `_unchallenged`, `_malformed`), which changes which
     // cells every live-stats reading carries. Clients and nodes upgrade together -- a
@@ -391,7 +398,7 @@ TEST_CASE("This build's live-stats layout is the pinned one", "[metrics][livesta
     //
     // Moved by #1484 before that: the counter cells carry a second bitmap saying WHICH absence
     // each absent cell is, so `StatsReadingWire::Grammar` went to `-4`.
-    CHECK(StatsReadingLayout == 0x1d62a8398609a77eULL);
+    CHECK(StatsReadingLayout == 0xb5cb4ebe15bbdd84ULL);
 }
 
 TEST_CASE("A truncated or padded reading is refused and never half-read", "[metrics][livestats]")

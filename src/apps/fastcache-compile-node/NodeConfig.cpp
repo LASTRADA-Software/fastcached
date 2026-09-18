@@ -222,8 +222,8 @@ namespace
             auto& request = TargetOf<&NodeConfig::cluster>(result);
             request.action = Action;
 
-            if constexpr (Action == ClusterAction::Admit || Action == ClusterAction::Set
-                          || Action == ClusterAction::AdmitClient)
+            if constexpr (Action == ClusterAction::Admit || Action == ClusterAction::AdmitLearner
+                          || Action == ClusterAction::Set || Action == ClusterAction::AdmitClient)
             {
                 // These two COMMIT their operand through consensus: an admitted
                 // member's id and endpoint land in every peer's `ClusterState` and
@@ -278,18 +278,21 @@ namespace
                                   "names no host"));
                 request.key = std::string { value };
             }
-            else if constexpr (Action == ClusterAction::Admit)
+            else if constexpr (Action == ClusterAction::Admit || Action == ClusterAction::AdmitLearner)
             {
                 // The same grammar `--raft-peer` takes, through the same function:
                 // an operator adding a member types the token they would have put in
                 // that flag, the documentation tells them so, and a second
                 // implementation would be two flags accepting different token sets
                 // for one concept -- with only one of them being what the transport
-                // actually dials.
+                // actually dials. The learner flag takes it too (#1449): which set a
+                // member is admitted into is the flag, never a second grammar.
                 auto member = Cluster::ParseMemberSpec(value);
                 if (!member.has_value())
-                    return std::unexpected(ArgvError(
-                        ConfigErrorCode::ParseError, "cluster-admit", std::format("not <id>=<host>:<port>: {}", value)));
+                    return std::unexpected(
+                        ArgvError(ConfigErrorCode::ParseError,
+                                  Action == ClusterAction::Admit ? "cluster-admit" : "cluster-admit-learner",
+                                  std::format("not <id>=<host>:<port>: {}", value)));
 
                 request.key = std::move(member->id);
                 request.value = std::move(member->raftEndpoint);
@@ -1009,7 +1012,22 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
                          "reason --raft-peer takes both: an id with no address\n"
                          "is counted towards quorum and never reached. The\n"
                          "member itself must have been started with\n"
-                         "--raft-join." },
+                         "--raft-join. A VOTER: counted by every quorum. On a\n"
+                         "learner this promotes it." },
+        { .primary = "--cluster-admit-learner",
+          .arity = Arity::Value,
+          .operand = "=<id>=<host>:<port>",
+          .apply = SelectClusterAction<ClusterAction::AdmitLearner>(),
+          .description = "add a member as a LEARNER and exit, or move a voter\n"
+                         "into that set. A learner is replicated to and\n"
+                         "counted by nothing: it never votes and never stands\n"
+                         "for election, so a machine that comes and goes --\n"
+                         "a laptop on a VPN -- costs the cluster no quorum\n"
+                         "while it is away. It follows the leader and\n"
+                         "redirects writes to it as any follower does.\n"
+                         "--cluster-admit on it promotes it; the same token\n"
+                         "as --cluster-admit, and the member must likewise\n"
+                         "have been started with --raft-join." },
         { .primary = "--cluster-forget",
           .arity = Arity::Value,
           .operand = "=<node-id>",
@@ -1708,6 +1726,9 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
         { "--cluster-status", "asks a running cluster a question and exits" },
         { "--cluster-set", "changes a running cluster's settings and exits" },
         { "--cluster-admit", "admits a member and exits" },
+        { "--cluster-admit-learner",
+          "admits a member as a learner and exits; a key would re-admit it at every start, demoting a "
+          "member somebody had since promoted" },
         { "--cluster-forget", "removes a member and exits" },
         { "--cluster-admit-client", "admits a client host and exits" },
         { "--cluster-forget-client",

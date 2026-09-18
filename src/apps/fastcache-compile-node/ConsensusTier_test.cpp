@@ -264,18 +264,20 @@ TEST_CASE("What a node reports about its own quorum is one read of the driver", 
     // was dropped or crossed -- and a crossed `term`/`commitIndex` is exactly the
     // shape `Consensus::Term` and `Consensus::LogIndex` are distinct types to
     // prevent, so a case checking only "something came back" would pass under it.
-    auto const progress = Consensus::RaftDriver::Progress { .members = { "n1", "n2", "n3" },
-                                                            .commitIndex = Consensus::LogIndex { .value = 12 },
-                                                            .term = Consensus::Term { .value = 4 },
-                                                            .role = Consensus::Role::Leader,
-                                                            .knownLeader = Consensus::NodeId { "n1" } };
+    auto const progress =
+        Consensus::RaftDriver::Progress { .configuration = { .voters = { "n1", "n3", "n2" }, .learners = { "n5", "n4" } },
+                                          .commitIndex = Consensus::LogIndex { .value = 12 },
+                                          .term = Consensus::Term { .value = 4 },
+                                          .role = Consensus::Role::Leader,
+                                          .knownLeader = Consensus::NodeId { "n1" } };
 
     auto const status = ConsensusStatusFrom(progress);
 
     // Verbatim, in the order consensus holds it: a caller comparing two nodes needs
     // to see the order a configuration was adopted in, and sorting here would take
     // that away with nothing saying so.
-    CHECK(status.members == std::vector<Consensus::NodeId> { "n1", "n2", "n3" });
+    CHECK(status.configuration.voters == std::vector<Consensus::NodeId> { "n1", "n3", "n2" });
+    CHECK(status.configuration.learners == std::vector<Consensus::NodeId> { "n5", "n4" });
     CHECK(status.knownLeader == Consensus::NodeId { "n1" });
     CHECK(status.term.value == 4);
     CHECK(status.commitIndex.value == 12);
@@ -293,13 +295,14 @@ TEST_CASE("A node that has adopted no configuration reports an empty set, not a 
     // So `knownLeader` is NOT constrained to `members`, and the pairing is the
     // diagnosis: a node naming a leader while counting nobody is admitted to the
     // fleet and absent from the quorum, which is invisible while that leader lives.
-    auto const status = ConsensusStatusFrom(Consensus::RaftDriver::Progress { .members = {},
+    auto const status = ConsensusStatusFrom(Consensus::RaftDriver::Progress { .configuration = {},
                                                                               .commitIndex = Consensus::LogIndex {},
                                                                               .term = Consensus::Term {},
                                                                               .role = Consensus::Role::Follower,
                                                                               .knownLeader = Consensus::NodeId { "n1" } });
 
-    CHECK(status.members.empty());
+    CHECK(status.configuration.voters.empty());
+    CHECK(status.configuration.learners.empty());
     CHECK(status.knownLeader == Consensus::NodeId { "n1" });
     CHECK(status.role == Consensus::Role::Follower);
     CHECK(status.term.value == 0);

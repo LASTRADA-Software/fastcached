@@ -61,6 +61,11 @@ enum class ClusterAction : std::uint8_t
     /// which is the direction that fails OPEN -- miss one and it serves the retired host
     /// indefinitely, with admission succeeding being the ordinary case.
     ForgetClient,
+
+    /// `Admit`, recording the member as a LEARNER (#1449): replicated to, counted by no
+    /// quorum, never a candidate. On a voter this demotes it; `Admit` on a learner
+    /// promotes it.
+    AdmitLearner,
 };
 
 /// One cluster-administration request, as parsed from the command line.
@@ -68,12 +73,12 @@ struct ClusterRequest
 {
     ClusterAction action { ClusterAction::None };
 
-    /// The setting name for `Set`, the member id for `Forget` and `Admit`, the client's
-    /// host for `AdmitClient` and `ForgetClient`.
+    /// The setting name for `Set`, the member id for `Forget`, `Admit` and
+    /// `AdmitLearner`, the client's host for `AdmitClient` and `ForgetClient`.
     std::string key;
 
-    /// The setting's new value for `Set`, the consensus endpoint for `Admit`,
-    /// empty otherwise.
+    /// The setting's new value for `Set`, the consensus endpoint for `Admit` and
+    /// `AdmitLearner`, empty otherwise.
     std::string value;
 };
 

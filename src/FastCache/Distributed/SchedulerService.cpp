@@ -220,6 +220,11 @@ namespace
         { .code = ConsensusErrorCode::MembershipUnchanged, .reported = Wire::ErrorCode::ClusterChangeNotNeeded },
         { .code = ConsensusErrorCode::NotLeader, .reported = Wire::ErrorCode::NotLeader },
         { .code = ConsensusErrorCode::StorageFailure, .reported = Wire::ErrorCode::StorageWriteFailed },
+        // A store another build wrote is judged when the node STARTS, which it then
+        // refuses to do -- so a running leader has no proposal to refuse with it, and
+        // the row is the closed-by-default answer the decode rows below give, for
+        // their reason.
+        { .code = ConsensusErrorCode::UnsupportedFormatVersion, .reported = Wire::ErrorCode::InvalidClusterChange },
         { .code = ConsensusErrorCode::MalformedFrame, .reported = Wire::ErrorCode::InvalidClusterChange },
         { .code = ConsensusErrorCode::UnknownMessageType, .reported = Wire::ErrorCode::InvalidClusterChange },
         { .code = ConsensusErrorCode::UnsupportedVersion, .reported = Wire::ErrorCode::InvalidClusterChange },
@@ -592,7 +597,8 @@ SchedulerReply SchedulerService::OfferClientVerb(CallerContext const& caller,
 
 SchedulerReply SchedulerService::ClusterAdmit(CallerContext const& caller,
                                               std::string_view memberId,
-                                              std::string_view raftEndpoint)
+                                              std::string_view raftEndpoint,
+                                              std::optional<Cluster::MemberSeat> seat)
 {
     if (auto refusal = Gate(caller); refusal.has_value())
         return std::move(*refusal);
@@ -606,7 +612,15 @@ SchedulerReply SchedulerService::ClusterAdmit(CallerContext const& caller,
     // would redirect clients to an address that member no longer answers. The member
     // still records that it HAD one, so a report says *cleared* rather than *never
     // announced* (#1340) -- which `Apply` derives, so this command carries nothing more.
-    auto const command = Cluster::Command { .kind = Cluster::CommandKind::AddMember,
+    //
+    // The verb is the seat's (#1449): `MemberSeatTable` is the one statement of which
+    // command records which set, so a promotion is this call with `Voter` on a learner
+    // and a demotion is this call with `Learner` on a voter. A caller with no opinion --
+    // an enrollment approval, which recovery repeats -- keeps the seat already recorded,
+    // or a voter for a member there is no record of: absent is not `Voter`, or a
+    // re-approval would promote a member the operator demoted.
+    auto const resolved = seat.has_value() ? *seat : Cluster::RecordedSeatOf(_admin->ClusterState(), memberId);
+    auto const command = Cluster::Command { .kind = Cluster::MemberSeatTable[static_cast<std::size_t>(resolved)].admittedBy,
                                             .key = std::string { memberId },
                                             .value = std::string { raftEndpoint },
                                             .schedulerEndpoint = {} };

@@ -2,6 +2,7 @@
 #pragma once
 
 #include "CompileCapacity.hpp"
+#include "ConsensusStanding.hpp"
 #include "EnrollmentWindow.hpp"
 #include "FrameEndpoint.hpp"
 #include "NodeMembership.hpp"
@@ -524,6 +525,15 @@ struct NodeRuntimeSources
     /// initializer must follow declaration order, so a member added in the middle silently
     /// breaks every call site that named the ones after it.
     NodeMembership const* membership { nullptr };
+
+    /// Where this node sits in its own consensus configuration; null on a node that runs
+    /// no consensus (#1449).
+    ///
+    /// Null is ABSENT for this record's reason: a standing is a claim about a
+    /// configuration, and a node with none to hold has nothing to claim. A slot in
+    /// production, because the tier is built after this surface -- see
+    /// `ConsensusStandingSlot`. Appended, for `membership`'s reason.
+    IConsensusStandingSource const* consensus { nullptr };
 };
 
 /// The production `INodeStatusSource`: config for the surfaces, a clock for the uptime.

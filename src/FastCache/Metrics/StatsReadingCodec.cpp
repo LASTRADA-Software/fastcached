@@ -149,16 +149,22 @@ namespace
     /// @return Nothing when the block read whole; otherwise why it did not.
     [[nodiscard]] std::optional<StatsReadingFault> ReadConsensus(ByteCursor& in, ConsensusStatus& status)
     {
-        auto& [members, knownLeader, term, commitIndex, role] = status;
-        std::uint32_t count = 0;
-        if (!in.ReadCount(count, MinMemberBytes))
-            return StatsReadingFault::Truncated;
-        // No `reserve(count)`: the count is bounded by the bytes present, not by anything this
-        // side owns, and a member is larger in memory than its four-byte minimum on the wire.
-        for ([[maybe_unused]] auto const member: std::views::iota(std::uint32_t { 0 }, count))
+        auto& [configuration, knownLeader, term, commitIndex, role] = status;
+        // The voters, then the learners (#1449): two counted lists, read by one loop over the
+        // two sets rather than two copies of it.
+        for (auto* const set: { &configuration.voters, &configuration.learners })
         {
-            if (!in.ReadField(members.emplace_back()))
+            std::uint32_t count = 0;
+            if (!in.ReadCount(count, MinMemberBytes))
                 return StatsReadingFault::Truncated;
+            // No `reserve(count)`: the count is bounded by the bytes present, not by anything
+            // this side owns, and a member is larger in memory than its four-byte minimum on
+            // the wire.
+            for ([[maybe_unused]] auto const member: std::views::iota(std::uint32_t { 0 }, count))
+            {
+                if (!in.ReadField(set->emplace_back()))
+                    return StatsReadingFault::Truncated;
+            }
         }
         auto leaderPresent = std::uint8_t { 0 };
         if (!in.ReadU8(leaderPresent))
@@ -266,10 +272,13 @@ std::vector<std::byte> EncodeStatsReading(StatsReading const& reading)
 
     if (consensus.has_value())
     {
-        auto const& [members, knownLeader, term, commitIndex, role] = *consensus;
-        out.U32(static_cast<std::uint32_t>(members.size()));
-        for (auto const& member: members)
-            out.Text(member);
+        auto const& [configuration, knownLeader, term, commitIndex, role] = *consensus;
+        for (auto const* const set: { &configuration.voters, &configuration.learners })
+        {
+            out.U32(static_cast<std::uint32_t>(set->size()));
+            for (auto const& member: *set)
+                out.Text(member);
+        }
         out.U8(knownLeader.has_value() ? 1U : 0U);
         if (knownLeader.has_value())
             out.Text(*knownLeader);

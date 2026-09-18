@@ -2,9 +2,12 @@
 #pragma once
 
 #include <FastCache/Consensus/RaftTypes.hpp>
+#include <FastCache/Core/EnumTable.hpp>
 
 #include <cstddef>
+#include <cstdint>
 #include <optional>
+#include <string_view>
 #include <variant>
 #include <vector>
 
@@ -137,12 +140,57 @@ struct RaftSnapshot
 {
     LogIndex lastIncludedIndex {}; ///< The index the state is as of.
     Term lastIncludedTerm {};      ///< Term of that index.
-    std::vector<NodeId> members;   ///< The configuration as of that index.
+    Configuration configuration;   ///< The configuration as of that index, voters and learners.
     std::vector<std::byte> state;  ///< The application's own bytes, never interpreted here.
 
     /// Value equality, for tests and for skipping a redundant write.
     [[nodiscard]] bool operator==(RaftSnapshot const&) const = default;
 };
+
+/// Why this node DENIED a vote or a pre-vote it was asked for.
+///
+/// **Private: never transmitted and never persisted**, so the enumerators carry no
+/// explicit values. The wire says `VoteDecision::Denied` and nothing else, and a
+/// candidate needs nothing else -- a refusal is a refusal to it. What needs the reason
+/// is whoever reads THIS node: a test asserting which rule refused, and a driver that
+/// reports it.
+///
+/// It exists because a learner asked for a vote must refuse BY ROW rather than by
+/// silence (#1449). Silence is a node that does not answer, which a candidate cannot
+/// tell from a lost message; a bare `Denied` is an answer whose reason no test can
+/// assert, and every one of the refusals below produces the same `Denied`. So each
+/// refusal is a row, and a case asserts the row it expects rather than a decision
+/// several rules share.
+enum class VoteRefusal : std::uint8_t
+{
+    CastsNoVote,        ///< This node's standing grants no vote: a learner, or a node with no cluster.
+    StaleTerm,          ///< The request's term is behind this node's.
+    CandidateNotAVoter, ///< The candidate is not a voter in this node's configuration.
+    LeaderLive,         ///< A leader is demonstrably live, so there is no election to support.
+    AlreadyVoted,       ///< This node's one vote for the term is promised to somebody else.
+    LogBehind,          ///< The candidate's log is behind this node's (§5.4.1).
+    Last,               ///< Not a refusal, and has no row: `VoteRefusalTable`'s length.
+};
+
+/// How one `VoteRefusal` is spelled.
+struct VoteRefusalRow
+{
+    VoteRefusal refusal {}; ///< The refusal this row describes.
+    std::string_view name;  ///< For a log line and a test failure message.
+};
+
+/// One row per `VoteRefusal`, in enumerator order.
+inline constexpr EnumTable<VoteRefusal, VoteRefusalRow> VoteRefusalTable { {
+    { .refusal = VoteRefusal::CastsNoVote, .name = "casts no vote" },
+    { .refusal = VoteRefusal::StaleTerm, .name = "stale term" },
+    { .refusal = VoteRefusal::CandidateNotAVoter, .name = "candidate is not a voter" },
+    { .refusal = VoteRefusal::LeaderLive, .name = "a leader is live" },
+    { .refusal = VoteRefusal::AlreadyVoted, .name = "already voted" },
+    { .refusal = VoteRefusal::LogBehind, .name = "candidate's log is behind" },
+} };
+
+static_assert(RowsInEnumeratorOrder(VoteRefusalTable, &VoteRefusalRow::refusal),
+              "VoteRefusalTable must hold one row per VoteRefusal, in enumerator order");
 
 /// Everything a node wants done as a result of one event.
 ///
@@ -233,6 +281,16 @@ struct RaftOutput
     /// difference between a log that can be read after the fact and one that
     /// cannot.
     std::optional<TermAdoption> adoptedTerm;
+
+    /// Which rule denied the vote or pre-vote this event answered; absent when it
+    /// granted one or answered none.
+    ///
+    /// Nothing to DO, like `adoptedTerm`: the `Denied` itself is already in
+    /// `messages`. What this adds is the reason, which the wire does not carry and a
+    /// candidate does not need -- see `VoteRefusal`. A driver that ignores it is still
+    /// correct; a case that asserts it can say which rule refused rather than only
+    /// that one did.
+    std::optional<VoteRefusal> voteRefusal;
 };
 
 } // namespace FastCache::Consensus

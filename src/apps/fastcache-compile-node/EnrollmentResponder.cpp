@@ -459,7 +459,11 @@ std::vector<std::byte> EnrollmentResponder::AnswerDecision(Wire::EnrollControlVe
         // Through `SchedulerService::ClusterAdmit`, which is the same entry point
         // `--cluster-admit` reaches: one gate, one validation, one mapping from a
         // consensus refusal onto a wire code.
-        auto const reply = _scheduler.ClusterAdmit(Context(peer), subject, entry->raftEndpoint);
+        //
+        // With NO opinion about the seat (#1449): a first approval admits a voter, and a
+        // re-approval -- which recovery repeats -- keeps whatever seat the member holds,
+        // so it cannot promote a machine the operator demoted to a learner.
+        auto const reply = _scheduler.ClusterAdmit(Context(peer), subject, entry->raftEndpoint, std::nullopt);
 
         // **A RE-APPROVAL reaches a cluster that already holds this member, and that is
         // a `Satisfied` refusal rather than a failure.** The consensus rulebook draws

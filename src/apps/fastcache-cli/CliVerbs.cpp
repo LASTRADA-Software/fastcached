@@ -997,6 +997,29 @@ namespace
         return "unknown";
     }
 
+    /// What to call one consensus standing (#1449).
+    ///
+    /// Spelled as `Consensus::StandingTable` spells the same four, hyphenated where that
+    /// table has a space, so a record field stays one token in every format.
+    /// @param standing The wire tag.
+    /// @return A stable lower-case name.
+    [[nodiscard]] std::string_view NameOfConsensusStanding(CompileCacheWire::WireConsensusStanding standing) noexcept
+    {
+        switch (standing)
+        {
+            case CompileCacheWire::WireConsensusStanding::NoCluster:
+                return "no-cluster";
+            case CompileCacheWire::WireConsensusStanding::Voter:
+                return "voter";
+            case CompileCacheWire::WireConsensusStanding::Learner:
+                return "learner";
+            case CompileCacheWire::WireConsensusStanding::Outsider:
+                return "outsider";
+        }
+        // Unreachable for `NameOfEnrollmentState`'s reason.
+        return "unknown";
+    }
+
     /// What to call one cordon state.
     /// @param state The wire tag.
     /// @return A stable lower-case name.
@@ -1143,6 +1166,16 @@ namespace
         if (fields.runtime.consensusEndpoint.has_value())
             record.push_back({ .name = std::string { CompileCacheWire::ConsensusEndpointField },
                                .value = TextCell(*fields.runtime.consensusEndpoint) });
+
+        // **Which set consensus counts this node in** (#1449): `voter`, `learner`, or --
+        // on a node waiting to be admitted -- `no-cluster`. A learner and a following
+        // voter report the same `scheduler-role`, and only one of them stands when the
+        // leader goes. Absent on a node running no consensus, for the enrollment state's
+        // reason.
+        if (fields.runtime.consensusStanding.has_value())
+            record.push_back(
+                { .name = "consensus-standing",
+                  .value = TextCell(std::string { NameOfConsensusStanding(*fields.runtime.consensusStanding) }) });
 
         // How many `--cluster-forget-client` tombstones this node is ENFORCING (#1471), which
         // is the field an operator reads after issuing one. Through `AddOptionalNumber`, so
@@ -1552,12 +1585,17 @@ namespace
             // And `scheduler-state` says which absence (#1340): never announced, or
             // cleared by a re-admit. A column of its own rather than a word in the
             // endpoint cell, so `scheduler` stays an address or ABSENT in every format.
+            //
+            // `seat` is the set the operator admitted the member into (#1449) -- the
+            // RECORD, which consensus moves towards one change at a time. What a node is
+            // counted as right now is its own `consensus-standing` under `node`.
             rows.push_back({ TextCell(member.id),
+                             TextCell(std::string { Cluster::MemberSeatName(member.seat) }),
                              TextCell(member.raftEndpoint),
                              member.schedulerEndpoint.empty() ? AbsentCell() : TextCell(member.schedulerEndpoint),
                              TextCell(std::string { Cluster::SchedulerEndpointStateName(member) }) });
 
-        return TableValue({ "id", "raft", "scheduler", "scheduler-state" }, std::move(rows));
+        return TableValue({ "id", "seat", "raft", "scheduler", "scheduler-state" }, std::move(rows));
     }
 
     /// Every setting this build knows, with what the cluster has agreed for it.
@@ -1709,12 +1747,21 @@ namespace
     ///
     /// `ClusterChangeAccepted` is untouched and still answers the other two verbs: the
     /// hazard is `AddMember`'s alone, since it is the only command carrying an ADDRESS.
+    ///
+    /// One handler for both admission verbs (#1449), the verb a template argument as it is
+    /// for the encoder. The seat is reported as REQUESTED, never as recorded: the receipt
+    /// does not echo it, because it is the verb's byte and the client already knows it.
+    /// @tparam op `Op::ClusterAdmit` (a voter) or `Op::ClusterAdmitLearner`.
     /// @param context What to run against.
     /// @return The answer.
+    template <CompileCacheWire::Op op>
+        requires(CompileCacheWire::IsMemberAdmission(op))
     [[nodiscard]] Answer ClusterAdmit(VerbContext const& context)
     {
+        constexpr auto seat =
+            op == CompileCacheWire::Op::ClusterAdmitLearner ? Cluster::MemberSeat::Learner : Cluster::MemberSeat::Voter;
         auto const reply = AskNode(context,
-                                   CompileCacheWire::EncodeClusterAdmit(CompileCacheWire::ClusterAdmitRequest {
+                                   CompileCacheWire::EncodeClusterAdmit<op>(CompileCacheWire::ClusterAdmitRequest {
                                        .memberId = context.operands[0], .raftEndpoint = context.operands[1] }));
         if (!reply.has_value())
             return reply.error();
@@ -1729,14 +1776,15 @@ namespace
             // reaches here.
             return Concluded(
                 Outcome::Protocol,
-                std::format("{} answered cluster-admit with a receipt this client cannot read", context.node->Address()));
+                std::format("{} answered the admission with a receipt this client cannot read", context.node->Address()));
 
-        return Answered(
-            RecordValue({ Field { .name = "recorded", .value = BooleanCell(true) },
-                          Field { .name = "member-id-as-received", .value = TextCell(receipt->memberId) },
-                          Field { .name = std::format("{}-as-recorded", CompileCacheWire::ConsensusEndpointField),
-                                  .value = TextCell(receipt->raftEndpoint) },
-                          Field { .name = "state", .value = TextCell("appended, not committed") } }));
+        return Answered(RecordValue(
+            { Field { .name = "recorded", .value = BooleanCell(true) },
+              Field { .name = "member-id-as-received", .value = TextCell(receipt->memberId) },
+              Field { .name = std::format("{}-as-recorded", CompileCacheWire::ConsensusEndpointField),
+                      .value = TextCell(receipt->raftEndpoint) },
+              Field { .name = "seat-as-requested", .value = TextCell(std::string { Cluster::MemberSeatName(seat) }) },
+              Field { .name = "state", .value = TextCell("appended, not committed") } }));
     }
 
     /// A reply from the node that leads, and every node asked on the way to it.
@@ -2246,10 +2294,21 @@ namespace
           .minOperands = 2,
           .maxOperands = 2,
           .operands = " <member-id> <raft-endpoint>",
-          .summary = "add a member, or record that one has moved",
+          .summary = "add a member as a voter, or record that one has moved",
           .protocolCommand = "cluster-admit",
           .modifiers = Modifier::None,
-          .handler = &ClusterAdmit,
+          .handler = &ClusterAdmit<CompileCacheWire::Op::ClusterAdmit>,
+          .nodeFallback = nullptr,
+          .session = nullptr },
+        { .name = "cluster-admit-learner",
+          .wire = Wire::Node,
+          .minOperands = 2,
+          .maxOperands = 2,
+          .operands = " <member-id> <raft-endpoint>",
+          .summary = "add a member as a learner (counted by no quorum), or demote a voter",
+          .protocolCommand = "cluster-admit-learner",
+          .modifiers = Modifier::None,
+          .handler = &ClusterAdmit<CompileCacheWire::Op::ClusterAdmitLearner>,
           .nodeFallback = nullptr,
           .session = nullptr },
 

@@ -42,7 +42,8 @@ constexpr auto Start = TimePoint {};
 [[nodiscard]] RaftConfig ThreeNodes(NodeId self = "n1")
 {
     return RaftConfig { .self = std::move(self),
-                        .members = { "n1", "n2", "n3" },
+                        .voters = { "n1", "n2", "n3" },
+                        .learners = {},
                         .electionTimeoutMin = ElectionMin,
                         .electionTimeoutMax = 300ms,
                         .heartbeatInterval = 50ms };
@@ -58,7 +59,7 @@ constexpr auto Start = TimePoint {};
 [[nodiscard]] RaftConfig NoCluster()
 {
     auto config = ThreeNodes("joiner");
-    config.members.clear();
+    config.voters.clear();
     return config;
 }
 
@@ -70,12 +71,12 @@ constexpr auto Start = TimePoint {};
 /// nine-field designated initializer is the shape a transposed field hides in.
 /// @param node The node being admitted.
 /// @param leaderId Who is speaking.
-/// @param members The configuration the entry carries.
+/// @param configuration The configuration the entry carries.
 /// @param term The leader's term.
 /// @param at When it arrives.
 /// @return What the node answered.
 [[nodiscard]] RaftOutput AdmitBy(
-    RaftNode& node, NodeId const& leaderId, std::vector<NodeId> const& members, Term term, TimePoint at)
+    RaftNode& node, NodeId const& leaderId, Configuration const& configuration, Term term, TimePoint at)
 {
     return node.Receive(AppendEntriesRequest { .term = term,
                                                .leaderId = leaderId,
@@ -83,7 +84,7 @@ constexpr auto Start = TimePoint {};
                                                .prevLogTerm = Term::None(),
                                                .entries = { LogEntry { .term = term,
                                                                        .kind = EntryKind::Configuration,
-                                                                       .payload = Membership::Encode(members) } },
+                                                                       .payload = Membership::Encode(configuration) } },
                                                .leaderCommit = LogIndex::BeforeFirst() },
                         at);
 }
@@ -261,7 +262,7 @@ TEST_CASE("A single-node cluster elects itself immediately", "[consensus][raft][
 {
     ScriptedRandomSource random { { 0 } };
     auto config = ThreeNodes();
-    config.members = { "n1" };
+    config.voters = { "n1" };
     RaftNode node = MakeNode(config, random);
 
     auto const output = node.Tick(At(ElectionMin.count()));
@@ -299,7 +300,7 @@ TEST_CASE("A retransmitted vote response is not counted twice", "[consensus][raf
     // why the tally is a set rather than a counter.
     ScriptedRandomSource random { { 0 } };
     auto config = ThreeNodes();
-    config.members = { "n1", "n2", "n3", "n4", "n5" }; // quorum 3
+    config.voters = { "n1", "n2", "n3", "n4", "n5" }; // quorum 3
     RaftNode node = MakeNode(config, random);
 
     DriveToCandidate(node, At(ElectionMin.count()));
@@ -334,6 +335,7 @@ TEST_CASE("A node grants at most one vote per term", "[consensus][raft][election
                                                               .lastLogTerm = Term::None() },
                                          At(11));
     CHECK(MessagesOfType<RequestVoteResponse>(second).at(0).decision == VoteDecision::Denied);
+    CHECK(second.voteRefusal == std::optional { VoteRefusal::AlreadyVoted });
     CHECK(fix.node.VotedFor() == std::optional<NodeId> { "n2" });
 }
 
@@ -367,6 +369,7 @@ TEST_CASE("A candidate from an older term is refused", "[consensus][raft][electi
     auto const responses = MessagesOfType<RequestVoteResponse>(output);
     REQUIRE(responses.size() == 1);
     CHECK(responses[0].decision == VoteDecision::Denied);
+    CHECK(output.voteRefusal == std::optional { VoteRefusal::StaleTerm });
     // The refusal carries this node's term, which is how the stale candidate
     // learns it has already lost.
     CHECK(responses[0].term == Term { .value = 1 });
@@ -393,6 +396,7 @@ TEST_CASE("A vote is refused to a candidate whose log is behind", "[consensus][r
                                          At(20));
 
     CHECK(MessagesOfType<RequestVoteResponse>(output).at(0).decision == VoteDecision::Denied);
+    CHECK(output.voteRefusal == std::optional { VoteRefusal::LogBehind });
     // It still adopted the higher term -- refusing the vote and ignoring the term
     // are different things.
     CHECK(fix.node.CurrentTerm() == Term { .value = 3 });
@@ -586,15 +590,15 @@ TEST_CASE("A non-member is not voted for", "[consensus][raft][election]")
                                          At(20));
 
     CHECK(MessagesOfType<RequestVoteResponse>(output).at(0).decision == VoteDecision::Denied);
+    CHECK(output.voteRefusal == std::optional { VoteRefusal::CandidateNotAVoter });
     CHECK_FALSE(fix.node.VotedFor().has_value());
 }
 
 TEST_CASE("An unrunnable configuration is refused rather than constructed", "[consensus][raft][election]")
 {
     // The factory is what makes RaftConfig::Validate unbypassable. With `self`
-    // outside `members`, Peers() returns every member while Quorum() still assumes
-    // this node is one of them, so the node would count a self-vote it is not
-    // entitled to -- silent, not loud.
+    // outside the configuration, the node would replicate to every member while
+    // believing it is one of them -- silent, not loud.
     ScriptedRandomSource random { { 0 } };
     auto config = ThreeNodes();
     config.self = "outsider";
@@ -628,7 +632,7 @@ TEST_CASE("Election Safety: one term cannot produce two leaders", "[consensus][r
 
     ScriptedRandomSource voterRandom { { 0 } };
     auto voterConfig = ThreeNodes("n3");
-    voterConfig.members = members;
+    voterConfig.voters = members;
     RaftNode voter = MakeNode(voterConfig, voterRandom);
 
     auto const ask = [](NodeId candidate) {
@@ -666,8 +670,9 @@ TEST_CASE("The election timeout is drawn fresh every time", "[consensus][raft][e
 
 TEST_CASE("Role traits cover every role exactly once", "[consensus][raft][election]")
 {
-    // The table is what a Learner row will be added to, so a missing or duplicated
-    // row should fail here rather than as a mis-armed timer somewhere else.
+    // A missing or duplicated row should fail here rather than as a mis-armed timer
+    // somewhere else. A learner is NOT a row of this table (#1449); it is a row of
+    // `StandingTable`, whose case is below.
     CHECK(TraitsOf(Role::Follower).timer == TimerKind::Election);
     CHECK(TraitsOf(Role::Candidate).timer == TimerKind::Election);
     CHECK(TraitsOf(Role::Leader).timer == TimerKind::Heartbeat);
@@ -789,7 +794,7 @@ TEST_CASE("A single-node cluster commits its own proposal immediately", "[consen
 {
     ScriptedRandomSource random { { 0 } };
     auto config = ThreeNodes();
-    config.members = { "n1" };
+    config.voters = { "n1" };
     RaftNode node = MakeNode(config, random);
     DriveToCandidate(node, At(ElectionMin.count()));
     REQUIRE(node.CurrentRole() == Role::Leader);
@@ -1192,6 +1197,7 @@ TEST_CASE("A pre-vote is refused while a leader is being heard from", "[consensu
     auto const replies = MessagesOfType<PreVoteResponse>(output);
     REQUIRE(replies.size() == 1);
     CHECK(replies[0].decision == VoteDecision::Denied);
+    CHECK(output.voteRefusal == std::optional { VoteRefusal::LeaderLive });
 }
 
 TEST_CASE("A granted pre-vote does not raise the asker's term", "[consensus][raft][prevote]")
@@ -1260,6 +1266,7 @@ TEST_CASE("A pre-vote from outside the configuration is refused", "[consensus][r
     auto const replies = MessagesOfType<PreVoteResponse>(output);
     REQUIRE(replies.size() == 1);
     CHECK(replies[0].decision == VoteDecision::Denied);
+    CHECK(output.voteRefusal == std::optional { VoteRefusal::CandidateNotAVoter });
 }
 
 TEST_CASE("A pre-vote from a node with a stale log is refused", "[consensus][raft][prevote]")
@@ -1281,6 +1288,7 @@ TEST_CASE("A pre-vote from a node with a stale log is refused", "[consensus][raf
     auto const replies = MessagesOfType<PreVoteResponse>(output);
     REQUIRE(replies.size() == 1);
     CHECK(replies[0].decision == VoteDecision::Denied);
+    CHECK(output.voteRefusal == std::optional { VoteRefusal::LogBehind });
 }
 
 TEST_CASE("Standing for election does not make a node refuse its peers' pre-votes", "[consensus][raft][prevote]")
@@ -1471,7 +1479,7 @@ TEST_CASE("A leader hearing from less than a quorum grants a pre-vote", "[consen
     // counting any contact at all would let it veto that from inside a minority.
     ScriptedRandomSource random { { 0 } };
     auto config = ThreeNodes();
-    config.members = { "n1", "n2", "n3", "n4", "n5" }; // quorum 3
+    config.voters = { "n1", "n2", "n3", "n4", "n5" }; // quorum 3
     RaftNode node = MakeNode(config, random);
 
     DriveToCandidate(node, At(ElectionMin.count()));
@@ -1689,7 +1697,7 @@ TEST_CASE("A node with no cluster is admitted by the first leader that speaks to
     ScriptedRandomSource random { { 0 } };
     auto node = MakeNode(NoCluster(), random);
 
-    auto const admitted = std::vector<NodeId> { "n1", "n2", "n3", "joiner" };
+    auto const admitted = Configuration { .voters = { "n1", "n2", "n3", "joiner" }, .learners = {} };
     auto const output = AdmitBy(node, "n1", admitted, Term { .value = 7 }, At(10));
 
     auto const replies = MessagesOfType<AppendEntriesResponse>(output);
@@ -1697,7 +1705,7 @@ TEST_CASE("A node with no cluster is admitted by the first leader that speaks to
     CHECK(replies[0].result == AppendResult::Accepted);
 
     CHECK(node.HasCluster());
-    CHECK(node.ActiveMembers() == admitted);
+    CHECK(node.ActiveConfiguration() == admitted);
     REQUIRE(node.KnownLeader().has_value());
     CHECK(Unwrap(node.KnownLeader()) == "n1");
 }
@@ -1711,7 +1719,7 @@ TEST_CASE("Once admitted, a node refuses a leader its configuration does not nam
     ScriptedRandomSource random { { 0 } };
     auto node = MakeNode(NoCluster(), random);
 
-    (void) AdmitBy(node, "n1", { "n1", "joiner" }, Term { .value = 7 }, At(10));
+    (void) AdmitBy(node, "n1", Configuration { .voters = { "n1", "joiner" }, .learners = {} }, Term { .value = 7 }, At(10));
     REQUIRE(node.HasCluster());
 
     // The stranger speaks in the term this node already holds, so §5.1's
@@ -1748,6 +1756,7 @@ TEST_CASE("A node with no cluster grants no votes", "[consensus][raft][membershi
     auto const replies = MessagesOfType<RequestVoteResponse>(output);
     REQUIRE(replies.size() == 1);
     CHECK(replies[0].decision == VoteDecision::Denied);
+    CHECK(output.voteRefusal == std::optional { VoteRefusal::CastsNoVote });
     CHECK_FALSE(node.VotedFor().has_value());
 }
 
@@ -1853,4 +1862,223 @@ TEST_CASE("A step-down is reported only when a higher term actually arrived", "[
             At(ElectionMin.count()));
         CHECK_FALSE(output.adoptedTerm.has_value());
     }
+}
+
+// --------------------------------------------------------------------------
+// Learners (#1449): replicated to, counted by nothing, never standing.
+
+namespace
+{
+
+/// `ThreeNodes` seen from `self`, with `n4` added as a LEARNER.
+/// @param self Which member this node is.
+/// @return The configuration.
+[[nodiscard]] RaftConfig ThreeVotersAndALearner(NodeId self)
+{
+    auto config = ThreeNodes(std::move(self));
+    config.learners = { "n4" };
+    return config;
+}
+
+/// The same four machines with `n4` a VOTER: the control every learner case here is
+/// held against, so what differs between the two answers is the row and nothing else.
+/// @param self Which member this node is.
+/// @return The configuration.
+[[nodiscard]] RaftConfig FourVoters(NodeId self)
+{
+    auto config = ThreeNodes(std::move(self));
+    config.voters.emplace_back("n4");
+    return config;
+}
+
+/// A vote request n1 makes in term 5 with a log nobody is ahead of: every rule but a
+/// standing's would grant it.
+/// @return The request.
+[[nodiscard]] RequestVoteRequest VoteForN1()
+{
+    return RequestVoteRequest { .term = Term { .value = 5 },
+                                .candidateId = "n1",
+                                .lastLogIndex = LogIndex::BeforeFirst(),
+                                .lastLogTerm = Term::None() };
+}
+
+/// The same question, asked as a pre-vote.
+/// @return The request.
+[[nodiscard]] PreVoteRequest PreVoteForN1()
+{
+    return PreVoteRequest { .term = Term { .value = 1 },
+                            .candidateId = "n1",
+                            .lastLogIndex = LogIndex::BeforeFirst(),
+                            .lastLogTerm = Term::None() };
+}
+
+} // namespace
+
+TEST_CASE("Standing traits cover every standing exactly once", "[consensus][raft][learner]")
+{
+    // The learner row is the point of the table, and `NoCluster` is its oldest
+    // instance: two standings that neither stand nor vote, and two that do.
+    CHECK(TraitsOf(Standing::Voter).timer == TimerKind::Election);
+    CHECK(TraitsOf(Standing::Voter).votes);
+    CHECK(TraitsOf(Standing::Learner).timer == TimerKind::None);
+    CHECK_FALSE(TraitsOf(Standing::Learner).votes);
+    CHECK(TraitsOf(Standing::NoCluster).timer == TimerKind::None);
+    CHECK_FALSE(TraitsOf(Standing::NoCluster).votes);
+
+    for (auto const& row: StandingTable)
+        CHECK(TraitsOf(row.standing).standing == row.standing);
+}
+
+TEST_CASE("A node knows its own standing in its configuration", "[consensus][raft][learner]")
+{
+    ScriptedRandomSource random { { 0 } };
+    CHECK(MakeNode(ThreeVotersAndALearner("n1"), random).CurrentStanding() == Standing::Voter);
+    CHECK(MakeNode(ThreeVotersAndALearner("n4"), random).CurrentStanding() == Standing::Learner);
+    CHECK(MakeNode(NoCluster(), random).CurrentStanding() == Standing::NoCluster);
+}
+
+TEST_CASE("A learner refuses a vote by its row, and never stands", "[consensus][raft][learner]")
+{
+    // What a learner may NOT do, each against the same four machines with it as a
+    // VOTER -- which does the opposite in every section. The row is the only thing
+    // that differs, so the row is what each refusal is asserted to be.
+    ScriptedRandomSource random { { 0 } };
+    auto learner = MakeNode(ThreeVotersAndALearner("n4"), random);
+    auto voter = MakeNode(FourVoters("n4"), random);
+    REQUIRE(learner.CurrentStanding() == Standing::Learner);
+    REQUIRE(voter.CurrentStanding() == Standing::Voter);
+
+    SECTION("asked for a vote, it answers -- and the answer is its row")
+    {
+        auto const refused = learner.Receive(VoteForN1(), At(10));
+        auto const replies = MessagesOfType<RequestVoteResponse>(refused);
+
+        // It ANSWERS: silence would be a learner a candidate cannot tell from a lost
+        // message, which is not what refusing means.
+        REQUIRE(replies.size() == 1);
+        CHECK(replies[0].decision == VoteDecision::Denied);
+        CHECK(refused.voteRefusal == std::optional { VoteRefusal::CastsNoVote });
+
+        // And spends nothing: no vote recorded for the term it was told about.
+        CHECK_FALSE(learner.VotedFor().has_value());
+
+        auto const granted = voter.Receive(VoteForN1(), At(10));
+        CHECK(MessagesOfType<RequestVoteResponse>(granted).at(0).decision == VoteDecision::Granted);
+        CHECK_FALSE(granted.voteRefusal.has_value());
+    }
+
+    SECTION("asked for a pre-vote, it answers the same way")
+    {
+        auto const refused = learner.Receive(PreVoteForN1(), At(10));
+        REQUIRE(MessagesOfType<PreVoteResponse>(refused).size() == 1);
+        CHECK(MessagesOfType<PreVoteResponse>(refused).at(0).decision == VoteDecision::Denied);
+        CHECK(refused.voteRefusal == std::optional { VoteRefusal::CastsNoVote });
+
+        auto const granted = voter.Receive(PreVoteForN1(), At(10));
+        CHECK(MessagesOfType<PreVoteResponse>(granted).at(0).decision == VoteDecision::Granted);
+    }
+
+    SECTION("its election timer would have fired, and it does not pre-vote")
+    {
+        // Far past any deadline either node could have drawn. The voter stands, which
+        // is what makes the learner's silence mean something rather than a clock
+        // nobody advanced.
+        auto const late = At(100 * ElectionMin.count());
+
+        CHECK(learner.NextDeadline() == TimePoint::max());
+        auto const quiet = learner.Tick(late);
+        CHECK(quiet.messages.empty());
+        CHECK_FALSE(quiet.persist.has_value());
+        CHECK(learner.CurrentRole() == Role::Follower);
+        CHECK(learner.CurrentTerm() == Term::None());
+
+        auto const stood = voter.Tick(late);
+        CHECK(voter.CurrentRole() == Role::PreCandidate);
+        CHECK_FALSE(MessagesOfType<PreVoteRequest>(stood).empty());
+    }
+}
+
+TEST_CASE("A candidate asks only voters, and replicates to learners once it leads", "[consensus][raft][learner]")
+{
+    // A learner casts no vote, so asking one costs a message and a refusal and can
+    // change no tally. It is still a member: the moment a leader exists, it is sent
+    // the log like anybody else.
+    ScriptedRandomSource random { { 0 } };
+    auto node = MakeNode(ThreeVotersAndALearner("n1"), random);
+
+    auto const preVote = node.Tick(At(ElectionMin.count()));
+    for (auto const& message: preVote.messages)
+        CHECK(message.to != "n4");
+    CHECK(MessagesOfType<PreVoteRequest>(preVote).size() == 2);
+
+    DriveToCandidate(node, At(ElectionMin.count()));
+    auto const won =
+        node.Receive(RequestVoteResponse { .term = node.CurrentTerm(), .decision = VoteDecision::Granted, .voterId = "n2" },
+                     At(ElectionMin.count()));
+    REQUIRE(node.CurrentRole() == Role::Leader);
+
+    auto toLearner = false;
+    for (auto const& message: won.messages)
+        toLearner = toLearner || (message.to == "n4" && std::holds_alternative<AppendEntriesRequest>(message.message));
+    CHECK(toLearner);
+}
+
+TEST_CASE("A learner's grant is not counted toward an election", "[consensus][raft][learner]")
+{
+    // A learner should never grant -- its row refuses -- but a tally is not the place
+    // to trust that: a grant carrying a learner's id would otherwise be a quorum of
+    // somebody the configuration does not count.
+    ScriptedRandomSource random { { 0 } };
+    auto node = MakeNode(ThreeVotersAndALearner("n1"), random);
+    (void) node.Tick(At(ElectionMin.count()));
+    REQUIRE(node.CurrentRole() == Role::PreCandidate);
+
+    (void) node.Receive(PreVoteResponse { .term = Term { .value = 1 }, .decision = VoteDecision::Granted, .voterId = "n4" },
+                        At(ElectionMin.count()));
+    CHECK(node.CurrentRole() == Role::PreCandidate);
+}
+
+TEST_CASE("A learner promoted in its log begins to stand", "[consensus][raft][learner]")
+{
+    // Voting is a property of the LATEST configuration, so the moment the entry that
+    // promotes it is in this node's log it stands and votes like any voter -- nothing
+    // restarts, and no role moves.
+    ScriptedRandomSource random { { 0 } };
+    auto node = MakeNode(ThreeVotersAndALearner("n4"), random);
+    REQUIRE(node.NextDeadline() == TimePoint::max());
+
+    (void) AdmitBy(
+        node, "n1", Configuration { .voters = { "n1", "n2", "n3", "n4" }, .learners = {} }, Term { .value = 2 }, At(10));
+
+    CHECK(node.CurrentStanding() == Standing::Voter);
+    CHECK(node.NextDeadline() == At(10 + ElectionMin.count()));
+
+    auto const granted = node.Receive(RequestVoteRequest { .term = Term { .value = 3 },
+                                                           .candidateId = "n2",
+                                                           .lastLogIndex = LogIndex { .value = 1 },
+                                                           .lastLogTerm = Term { .value = 2 } },
+                                      At(10 + ElectionMin.count()));
+    CHECK(MessagesOfType<RequestVoteResponse>(granted).at(0).decision == VoteDecision::Granted);
+}
+
+TEST_CASE("A follower accepts a leader its configuration names only as a learner", "[consensus][raft][learner]")
+{
+    // A learner never stands, so a sender this node's configuration calls a learner
+    // leads only because a LATER configuration promoted it -- one this node has not
+    // received yet, and could never receive if it refused the leader carrying it. The
+    // guard exists for a machine the configuration does not contain; a learner is in
+    // it. `A non-member cannot become this node's leader` is the control.
+    ScriptedRandomSource random { { 0 } };
+    auto node = MakeNode(ThreeVotersAndALearner("n1"), random);
+
+    auto const output = node.Receive(AppendEntriesRequest { .term = Term { .value = 3 },
+                                                            .leaderId = "n4",
+                                                            .prevLogIndex = LogIndex::BeforeFirst(),
+                                                            .prevLogTerm = Term::None(),
+                                                            .entries = {},
+                                                            .leaderCommit = LogIndex::BeforeFirst() },
+                                     At(20));
+
+    CHECK(MessagesOfType<AppendEntriesResponse>(output).at(0).result == AppendResult::Accepted);
+    CHECK(node.KnownLeader() == std::optional<NodeId> { "n4" });
 }
