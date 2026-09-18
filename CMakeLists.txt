@@ -448,6 +448,13 @@ if(FASTCACHED_BUILD_TUI)
     add_subdirectory(vendor)
 endif()
 
+# Monocypher, the vendored Ed25519 / X25519 implementation behind `Core/Ed25519`,
+# `Core/X25519` and `Core/Hkdf` (#178). Unconditional, and here with the other third-party
+# code, BEFORE the pedantic/clang-tidy includes below, for the reason every dependency above
+# is. cmake/Monocypher.cmake carries why it is built as C++ and why it gets the sanitizers
+# anyway.
+include(Monocypher)
+
 # ----------------------------------------------------------------------------
 # Toolchain helpers (warning levels, sanitizers, coverage, clang-tidy).
 #
@@ -489,15 +496,35 @@ include(InstructionSetProbe)
 # well, or instrumented objects would not link. libunicode is a different directory and stays
 # uninstrumented, like every other third-party dependency. `ctest -R vendor-sanitized` asserts the
 # result in the OBJECTS, where a flag that never reached a compile line would show.
-if(FASTCACHED_BUILD_TUI AND SANITIZER_COMPILE_OPTIONS)
-    get_property(_fcVendorTargets DIRECTORY "${CMAKE_SOURCE_DIR}/vendor" PROPERTY BUILDSYSTEM_TARGETS)
+#
+# Monocypher (#178) is the second vendored copy and the same case exactly: declared above the
+# includes, so the directory-scoped flags never reach it. It is built from cmake/Monocypher.cmake
+# in THIS directory rather than under `vendor/`, whose directory is added only with the TUI, so
+# its targets come from the list that module states beside them rather than from a directory walk.
+if(SANITIZER_COMPILE_OPTIONS)
+    set(_fcVendorTargets ${FASTCACHED_MONOCYPHER_TARGETS})
     if(NOT _fcVendorTargets)
         message(FATAL_ERROR
-            "The vendor/ directory declares no targets, so the sanitizer flags reached none of them. "
-            "A derived set that comes back empty is this block having stopped working, not a vendored "
-            "library that needs no instrumentation.")
+            "cmake/Monocypher.cmake named no targets in FASTCACHED_MONOCYPHER_TARGETS, so the sanitizer "
+            "flags reached none of them. An empty list is this block having stopped working, not a "
+            "cryptographic library that needs no instrumentation.")
+    endif()
+    if(FASTCACHED_BUILD_TUI)
+        get_property(_fcTuiVendorTargets DIRECTORY "${CMAKE_SOURCE_DIR}/vendor" PROPERTY BUILDSYSTEM_TARGETS)
+        if(NOT _fcTuiVendorTargets)
+            message(FATAL_ERROR
+                "The vendor/ directory declares no targets, so the sanitizer flags reached none of them. "
+                "A derived set that comes back empty is this block having stopped working, not a vendored "
+                "library that needs no instrumentation.")
+        endif()
+        list(APPEND _fcVendorTargets ${_fcTuiVendorTargets})
     endif()
     foreach(_fcVendorTarget IN LISTS _fcVendorTargets)
+        if(NOT TARGET ${_fcVendorTarget})
+            message(FATAL_ERROR
+                "The sanitizer block was handed `${_fcVendorTarget}` as a vendored target, and no such "
+                "target exists. The list that named it has drifted from the targets it describes.")
+        endif()
         get_target_property(_fcVendorTargetType ${_fcVendorTarget} TYPE)
         if(_fcVendorTargetType MATCHES "^(OBJECT_LIBRARY|STATIC_LIBRARY|SHARED_LIBRARY|MODULE_LIBRARY|EXECUTABLE)$")
             target_compile_options(${_fcVendorTarget} PRIVATE ${SANITIZER_COMPILE_OPTIONS})
