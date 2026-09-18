@@ -649,3 +649,75 @@ TEST_CASE("A learner caught up by a snapshot learns that it is one", "[consensus
     REQUIRE(output.saveSnapshot.has_value());
     CHECK(output.saveSnapshot.value_or(RaftSnapshot {}).configuration == configuration);
 }
+
+TEST_CASE("A follower whose application cannot read a leader's snapshot refuses it, stays behind, and still hears "
+          "the leader",
+          "[consensus][raft][snapshot]")
+{
+    // #1552. Taken on, a snapshot resets the log, moves both indices past it and is
+    // persisted and acknowledged -- so a node whose application could not then read it
+    // would apply every later entry on the state the snapshot was meant to replace, and
+    // report that as current. Refused, the node stays exactly where it was: behind, and
+    // saying so to the leader, which advances nothing for it.
+    //
+    // The leader is still HEARD: a refused offer arms the election timer like any other
+    // word from a leader, so the node does not campaign against the leader offering it.
+    ScriptedRandomSource random { { 0 } };
+    auto node = std::move(RaftNode::Create(ThreeNodes("n2"), random, TimePoint {})).value();
+
+    auto const offer = InstallSnapshotRequest { .term = Term { .value = 1 },
+                                                .leaderId = "n1",
+                                                .lastIncludedIndex = LogIndex { .value = 4 },
+                                                .lastIncludedTerm = Term { .value = 1 },
+                                                .configuration = { .voters = { "n1", "n2", "n3" }, .learners = {} },
+                                                .state = BytesFromString("a format this build does not read") };
+
+    SECTION("control: a snapshot it can read is taken on")
+    {
+        auto const output = node.Receive(offer, At(10), SnapshotReadability::Readable);
+        auto const replies = MessagesOfType<InstallSnapshotResponse>(output);
+        REQUIRE(replies.size() == 1);
+        CHECK(replies[0].result == AppendResult::Accepted);
+        CHECK(node.LastApplied() == LogIndex { .value = 4 });
+        CHECK(output.restoreSnapshot.has_value());
+        CHECK_FALSE(output.refusedSnapshot.has_value());
+    }
+
+    SECTION("a snapshot it cannot read is refused, and nothing is taken on")
+    {
+        auto const output = node.Receive(offer, At(10), SnapshotReadability::Unreadable);
+        auto const replies = MessagesOfType<InstallSnapshotResponse>(output);
+        REQUIRE(replies.size() == 1);
+        REQUIRE(replies[0].result == AppendResult::Rejected);
+        CHECK(output.refusedSnapshot == std::optional { LogIndex { .value = 4 } });
+
+        // Nothing moved: not the log point, not either index, and nothing to persist or
+        // hand to the application.
+        CHECK(node.Log().SnapshotIndex() == LogIndex::BeforeFirst());
+        CHECK(node.CommitIndex() == LogIndex::BeforeFirst());
+        CHECK(node.LastApplied() == LogIndex::BeforeFirst());
+        CHECK_FALSE(output.saveSnapshot.has_value());
+        CHECK_FALSE(output.restoreSnapshot.has_value());
+
+        // And the leader was heard. Its election deadline would have fallen at 150 on its
+        // own; the offer at 10 moved it to 160, so at 155 nothing is asked of anybody.
+        //
+        // A REQUIRE: a refusal decided before the leader was heard fails this and the two
+        // below it together, and with the covered section that was exactly four -- which a
+        // Catch2 exit status collides with `SKIP_RETURN_CODE 4` (#1152). Measured, on this
+        // case, by moving the refusal above the leader being heard.
+        REQUIRE(node.KnownLeader() == std::optional<NodeId> { "n1" });
+        CHECK(node.CurrentRole() == Role::Follower);
+        CHECK(MessagesOfType<PreVoteRequest>(node.Tick(At(ElectionMin.count() + 5))).empty());
+    }
+
+    SECTION("a snapshot it already covers needs no reading, and is answered as it always was")
+    {
+        (void) node.Receive(offer, At(10), SnapshotReadability::Readable);
+        auto const output = node.Receive(offer, At(20), SnapshotReadability::Unreadable);
+        auto const replies = MessagesOfType<InstallSnapshotResponse>(output);
+        REQUIRE(replies.size() == 1);
+        REQUIRE(replies[0].result == AppendResult::Accepted);
+        CHECK_FALSE(output.refusedSnapshot.has_value());
+    }
+}

@@ -1,20 +1,29 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "ConsensusTier.hpp"
+#include "DiscoveryTier.hpp"
 #include "NodeIdentity.hpp"
 #include "NodeMembership.hpp"
 #include "SchedulerTier.hpp"
 
+#include <FastCache/Async/Task.hpp>
 #include <FastCache/Cluster/ClusterState.hpp>
+#include <FastCache/Cluster/PskRaftPeerCredential.hpp>
 #include <FastCache/Consensus/FileRaftStorage.hpp>
+#include <FastCache/Consensus/RaftPeerSession.hpp>
+#include <FastCache/Consensus/RaftWire.hpp>
 #include <FastCache/Core/HostPort.hpp>
+#include <FastCache/Core/ISecureRandom.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
+#include <FastCache/Net/BlockingConnector.hpp>
 #include <FastCache/Net/BlockingSocket.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -23,6 +32,7 @@
 #include <memory>
 #include <optional>
 #include <ranges>
+#include <span>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -274,7 +284,8 @@ TEST_CASE("What a node reports about its own quorum is one read of the driver", 
                                           .term = Consensus::Term { .value = 4 },
                                           .role = Consensus::Role::Leader,
                                           .knownLeader = Consensus::NodeId { "n1" },
-                                          .matchIndex = {} };
+                                          .matchIndex = {},
+                                          .installRefusal = std::nullopt };
 
     auto const status = ConsensusStatusFrom(progress);
 
@@ -305,7 +316,8 @@ TEST_CASE("A node that has adopted no configuration reports an empty set, not a 
                                                                               .term = Consensus::Term {},
                                                                               .role = Consensus::Role::Follower,
                                                                               .knownLeader = Consensus::NodeId { "n1" },
-                                                                              .matchIndex = {} });
+                                                                              .matchIndex = {},
+                                                                              .installRefusal = std::nullopt });
 
     CHECK(status.configuration.voters.empty());
     CHECK(status.configuration.learners.empty());
@@ -616,5 +628,267 @@ TEST_CASE("The remedy for unreadable consensus state names only flags this node 
             CHECK(std::ranges::any_of(options, [flag](auto const& row) { return row.primary.starts_with(flag); }));
         else
             CHECK(std::ranges::any_of(options, [flag](auto const& row) { return row.primary == flag; }));
+    }
+}
+
+TEST_CASE("A node refusing its leader's snapshot says so as an Alert condition, and says when it stops",
+          "[node][consensus][snapshot][conditions]")
+{
+    // #1552's surfaces. A node that cannot read what its leader sends stays behind, and from
+    // the outside that is a slow node -- so it is a Live Alert row, `unreadable-leader-snapshot`,
+    // whose detail says who offered what and why this build cannot read it, and an Error line.
+    // Its end is reported too: watching it clear is watching the upgrade land.
+    CapturingLogger logger;
+    NodeConditions conditions;
+    auto const refusal = Consensus::RaftDriver::InstallRefusal {
+        .index = Consensus::LogIndex { .value = 812 },
+        .leader = "n1",
+        .reason = FastCache::UnsupportedFormatVersion("cluster state encoding version 6 (this build reads 5)")
+    };
+
+    ReportInstallRefusal(refusal, logger, &conditions);
+    REQUIRE(conditions.StateOf(NodeCondition::UnreadableLeaderSnapshot) == CompileCacheWire::ConditionState::Raised);
+    auto const rows = conditions.Snapshot();
+    auto const row = std::ranges::find(
+        rows, RowFor(NodeCondition::UnreadableLeaderSnapshot).id, &CompileCacheWire::NodeConditionFields::id);
+    REQUIRE(row != rows.end());
+    CHECK(row->detail == DescribeInstallRefusal(refusal));
+    CHECK(row->detail.contains("leader n1"));
+    CHECK(row->detail.contains("log entry 812"));
+    CHECK(row->detail.contains("version 6 (this build reads 5)"));
+    CHECK(row->severity == "alert");
+    CHECK(row->persistence == "live");
+
+    ReportInstallRefusal(std::nullopt, logger, &conditions);
+    CHECK(conditions.StateOf(NodeCondition::UnreadableLeaderSnapshot) == CompileCacheWire::ConditionState::Clear);
+
+    auto const lines = logger.Snapshot();
+    CHECK(std::ranges::any_of(
+        lines, [](auto const& line) { return line.level == LogLevel::Error && line.message.contains("cannot read"); }));
+    CHECK(std::ranges::any_of(
+        lines, [](auto const& line) { return line.level == LogLevel::Info && line.message.contains("caught up"); }));
+}
+
+namespace
+{
+/// One read from @p socket. A `BlockingSocket` blocks rather than suspends, so `SyncRun`
+/// completes this in one resume -- and the connector's `ioTimeout` bounds it.
+/// @param socket Source; never null.
+/// @param buffer Where to put what arrives.
+/// @return How many bytes arrived; zero at the end or on an error.
+[[nodiscard]] Task<std::size_t> ReadOnce(ISocket* socket, std::span<std::byte> buffer)
+{
+    auto const read = co_await socket->Read(buffer);
+    co_return read.has_value() ? *read : std::size_t { 0 };
+}
+
+/// One write to @p socket, for `ReadOnce`'s reason.
+/// @param socket Destination; never null.
+/// @param bytes What to send.
+/// @return How many bytes were accepted; zero on an error.
+[[nodiscard]] Task<std::size_t> WriteOnce(ISocket* socket, std::span<std::byte const> bytes)
+{
+    auto const written = co_await socket->Write(bytes);
+    co_return written.has_value() ? *written : std::size_t { 0 };
+}
+
+/// One peer-wire frame as it arrived: its header and the payload it declared.
+struct PeerFrame
+{
+    Consensus::RaftWire::FrameHeader header {}; ///< What the frame declared.
+    std::vector<std::byte> payload;             ///< Exactly `header.payloadLength` bytes.
+};
+
+/// Read exactly one peer-wire frame from @p socket, and not a byte of the next.
+/// @param socket Where it arrives.
+/// @return The frame, or nullopt when the peer ended first or sent no frame.
+[[nodiscard]] std::optional<PeerFrame> ReadPeerFrame(ISocket& socket)
+{
+    auto bytes = std::vector<std::byte> {};
+    auto const fill = [&socket, &bytes](std::size_t want) {
+        while (bytes.size() < want)
+        {
+            auto chunk = std::array<std::byte, 512> {};
+            auto const room = std::min(chunk.size(), want - bytes.size());
+            auto const got = SyncRun(ReadOnce(&socket, std::span { chunk }.first(room)));
+            if (got == 0)
+                return false;
+            bytes.insert(bytes.end(), chunk.begin(), chunk.begin() + static_cast<std::ptrdiff_t>(got));
+        }
+        return true;
+    };
+
+    if (!fill(Consensus::RaftWire::HeaderSize))
+        return std::nullopt;
+    auto const header = Consensus::RaftWire::DecodeHeader(bytes);
+    if (!header.has_value() || !fill(Consensus::RaftWire::HeaderSize + header->payloadLength))
+        return std::nullopt;
+    return PeerFrame { .header = *header,
+                       .payload = std::vector<std::byte> {
+                           bytes.begin() + static_cast<std::ptrdiff_t>(Consensus::RaftWire::HeaderSize), bytes.end() } };
+}
+
+/// Stand in for leader `n1` on @p port's peer wire and make it @p offer.
+///
+/// Every step is production's own, in production's order: the dialler's handshake answers
+/// the acceptor's challenge, the frame is sealed in the session that proof opened, and the
+/// SIGNED verdict is read back and required to be an acceptance -- so a case built on this
+/// asserts about a message the tier actually read, never about one a failed handshake
+/// dropped on the floor.
+/// @param port The tier's peer port.
+/// @param keyFile The cluster key the tier holds.
+/// @param offer What the leader says.
+/// @return The connection, open: the case holds it until it has seen what it waits for,
+///         because a close with the verdict unread can reach the tier as a reset.
+[[nodiscard]] std::unique_ptr<ISocket> OfferAsLeader(std::uint16_t port,
+                                                     std::filesystem::path const& keyFile,
+                                                     Consensus::RaftMessage const& offer)
+{
+    auto key = ReadClusterKey(keyFile);
+    REQUIRE(key.has_value());
+    Cluster::PskRaftPeerCredential const credential { *std::move(key) };
+    SystemSecureRandom random;
+    auto handshake = Consensus::DiallerHandshake::Create(credential, "n1", "n2", random);
+    REQUIRE(handshake.has_value());
+
+    BlockingConnector connector { DefaultAddressResolver(),
+                                  BlockingConnectorOptions { .ioTimeout = std::chrono::seconds { 10 } } };
+    auto dialled = SyncRun(connector.Connect(
+        "127.0.0.1", port, DialOptions { .connectTimeout = std::chrono::seconds { 5 }, .keepAlive = KeepAlive::No }));
+    REQUIRE(dialled.has_value());
+    auto socket = *std::move(dialled);
+
+    auto const challengeFrame = ReadPeerFrame(*socket);
+    REQUIRE(challengeFrame.has_value());
+    auto const challenge =
+        Consensus::RaftWire::DecodeChallenge(Unwrap(challengeFrame).header, Unwrap(challengeFrame).payload);
+    REQUIRE(challenge.has_value());
+    auto const proof = handshake->Answer(*challenge);
+    REQUIRE(proof.has_value());
+
+    auto wire = Consensus::RaftWire::EncodeProof(*proof);
+    auto const frame = Consensus::RaftWire::Encode(offer);
+    auto sealer =
+        Consensus::FrameSealer { credential,
+                                 Consensus::SessionNonces { .acceptor = challenge->nonce, .dialler = proof->nonce } };
+    auto const tag = sealer.Seal(frame);
+    wire.insert(wire.end(), frame.begin(), frame.end());
+    wire.insert(wire.end(), tag.begin(), tag.end());
+    REQUIRE(SyncRun(WriteOnce(socket.get(), wire)) == wire.size());
+
+    auto const verdictFrame = ReadPeerFrame(*socket);
+    REQUIRE(verdictFrame.has_value());
+    auto const verdict = Consensus::RaftWire::DecodeVerdict(Unwrap(verdictFrame).header, Unwrap(verdictFrame).payload);
+    REQUIRE(verdict.has_value());
+    REQUIRE(handshake->Conclude(*verdict).outcome == Consensus::VerdictOutcome::Accepted);
+    return socket;
+}
+} // namespace
+
+TEST_CASE("A running tier offered a snapshot it cannot read raises unreadable-leader-snapshot, and takes nothing on",
+          "[node][consensus][snapshot][conditions]")
+{
+    // #1552's wiring, end to end, at the door a leader reaches: the real peer wire, the
+    // tier's own driver and its own `ClusterStateMachine`, and the registry `main` hands
+    // it. No second build is needed, because this case IS the leader: it proves the key
+    // as `n1` and offers the previous build's cluster state, from the shared builder.
+    // Anything between the wire and the condition that stopped carrying the refusal --
+    // the driver never asking, the node taking it on, the observer not installed, the
+    // report not raising -- leaves the row clear, and this case red.
+    NullLogger logger;
+    AtomicMetricsSink metrics;
+    NodeConditions conditions;
+
+    auto const freePort = [] {
+        auto probe = BlockingListener::Bind("127.0.0.1", 0);
+        REQUIRE(probe);
+        REQUIRE(probe->IsBound());
+        auto const port = probe->BoundPort();
+        probe.reset();
+        return port;
+    };
+    auto const self = freePort();
+    // Nobody answers here. The tier dials its leader and fails, which is ordinary for a
+    // follower that has not reached its leader yet; the leader reaches IT, below.
+    auto const leaderPort = freePort();
+
+    auto const scratch = Testing::UniqueScratchPath("consensus-unreadable-install");
+    std::filesystem::create_directories(scratch);
+    {
+        auto key = std::ofstream { scratch / "cluster.key", std::ios::binary };
+        key << std::string(32, 'k');
+    }
+
+    NodeConfig cfg;
+    cfg.nodeId = "n2";
+    cfg.raftListen = std::format("127.0.0.1:{}", self);
+    cfg.raftPeers = { Unwrap(Cluster::ParseMemberSpec(std::format("n1=127.0.0.1:{}", leaderPort))),
+                      Unwrap(Cluster::ParseMemberSpec(std::format("n2=127.0.0.1:{}", self))) };
+    cfg.clusterKeyFile = scratch / "cluster.key";
+    cfg.clusterDir = scratch / "state";
+
+    auto started = ConsensusTier::Start(
+        cfg,
+        {},
+        [](Distributed::SchedulerRole, std::string_view, std::uint64_t) {},
+        [](Cluster::ClusterState const&) {},
+        metrics,
+        logger,
+        &conditions);
+    REQUIRE(started.has_value());
+    auto const& tier = *started;
+    REQUIRE(conditions.StateOf(NodeCondition::UnreadableLeaderSnapshot) == CompileCacheWire::ConditionState::Clear);
+
+    auto const offer = [](std::vector<std::byte> state) {
+        return Consensus::RaftMessage { Consensus::InstallSnapshotRequest {
+            .term = Consensus::Term { .value = 1 },
+            .leaderId = "n1",
+            .lastIncludedIndex = Consensus::LogIndex { .value = 3 },
+            .lastIncludedTerm = Consensus::Term { .value = 1 },
+            .configuration = Consensus::Configuration { .voters = { "n1", "n2" }, .learners = {} },
+            .state = std::move(state) } };
+    };
+    auto const commit = [&tier] {
+        return std::format("commit index {}", tier->Status().commitIndex.value);
+    };
+
+    SECTION("control: a snapshot this build reads is taken on, and nothing is raised")
+    {
+        auto current = Cluster::ClusterState {};
+        Cluster::Apply(current, HostCommand(Cluster::CommandKind::ForgetClient, "10.0.0.7"));
+        auto const connection = OfferAsLeader(self, cfg.clusterKeyFile, offer(Cluster::Encode(current)));
+
+        REQUIRE(Testing::WaitUntil(
+            "the offered snapshot to be taken on",
+            [&tier] { return tier->ClusterState().HasForgotten("10.0.0.7"); },
+            commit));
+        CHECK(conditions.StateOf(NodeCondition::UnreadableLeaderSnapshot) == CompileCacheWire::ConditionState::Clear);
+        connection->Close();
+    }
+
+    SECTION("the previous build's state is refused, raised by name, and nothing is taken on")
+    {
+        auto const connection = OfferAsLeader(self, cfg.clusterKeyFile, offer(Testing::EncodePreviousClusterState()));
+
+        REQUIRE(Testing::WaitUntil(
+            "the refusal to be raised",
+            [&conditions] {
+                return conditions.StateOf(NodeCondition::UnreadableLeaderSnapshot)
+                       == CompileCacheWire::ConditionState::Raised;
+            },
+            commit));
+        auto const rows = conditions.Snapshot();
+        auto const row = std::ranges::find(
+            rows, RowFor(NodeCondition::UnreadableLeaderSnapshot).id, &CompileCacheWire::NodeConditionFields::id);
+        REQUIRE(row != rows.end());
+        CHECK(row->detail.contains("leader n1"));
+        CHECK(row->detail.contains("log entry 3"));
+        CHECK(row->detail.contains(std::format("version {}", Testing::PreviousClusterStateVersion)));
+        CHECK(row->detail.contains("reads 6"));
+
+        // Nothing taken on: not the previous build's member, not a moved commit index.
+        CHECK_FALSE(tier->ClusterState().RaftEndpointOf("n1").has_value());
+        CHECK(tier->Status().commitIndex == Consensus::LogIndex::BeforeFirst());
+        connection->Close();
     }
 }

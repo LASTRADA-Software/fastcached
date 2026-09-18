@@ -60,6 +60,11 @@ class ClusterStateMachine final: public Consensus::IRaftStateMachine
     /// @return Nothing when `Apply` would act on it; otherwise why not.
     [[nodiscard]] std::expected<void, ConsensusError> CanRead(std::span<std::byte const> command) const override;
 
+    /// Whether @p state decodes as a state this build holds, in `CanRead`'s two codes.
+    /// @param state A snapshot's bytes.
+    /// @return Nothing when `RestoreSnapshot` would replace the state with it; otherwise why not.
+    [[nodiscard]] std::expected<void, ConsensusError> CanRestore(std::span<std::byte const> state) const override;
+
     [[nodiscard]] std::vector<std::byte> TakeSnapshot() override;
 
     /// Replace the state with the one @p state encodes, or refuse and keep it.
