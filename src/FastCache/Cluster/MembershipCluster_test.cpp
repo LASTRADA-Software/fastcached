@@ -132,7 +132,8 @@ class Fleet
                                           .raftEndpoint = EndpointOf(*leader),
                                           .schedulerEndpoint = {},
                                           .schedulerEndpointHistory = SchedulerEndpointHistory::NeverAnnounced,
-                                          .seat = MemberSeat::Voter };
+                                          .seat = MemberSeat::Voter,
+                                          .publicKey = std::nullopt };
         auto const quorum =
             NextQuorumChange(state,
                              configuration,
@@ -159,8 +160,12 @@ class Fleet
             !allowed.has_value())
             return allowed;
 
-        std::ignore = _cluster.ProposeOnLeader(
-            Encode(Command { .kind = CommandKind::RemoveMember, .key = id, .value = {}, .schedulerEndpoint = {} }));
+        std::ignore = _cluster.ProposeOnLeader(Encode(Command { .kind = CommandKind::RemoveMember,
+                                                                .key = id,
+                                                                .value = {},
+                                                                .schedulerEndpoint = {},
+                                                                .publicKey = std::nullopt,
+                                                                .role = std::nullopt }));
         return {};
     }
 
@@ -170,8 +175,12 @@ class Fleet
     bool Admit(Consensus::NodeId const& id)
     {
         return _cluster
-            .ProposeOnLeader(Encode(
-                Command { .kind = CommandKind::AddMember, .key = id, .value = EndpointOf(id), .schedulerEndpoint = {} }))
+            .ProposeOnLeader(Encode(Command { .kind = CommandKind::AddMember,
+                                              .key = id,
+                                              .value = EndpointOf(id),
+                                              .schedulerEndpoint = {},
+                                              .publicKey = std::nullopt,
+                                              .role = std::nullopt }))
             .has_value();
     }
 
@@ -208,7 +217,8 @@ class Fleet
             desired.push_back(
                 DesiredMember { .id = id,
                                 .raftEndpoint = EndpointOf(id),
-                                .schedulerEndpoint = id == who ? std::optional { std::string {} } : std::nullopt });
+                                .schedulerEndpoint = id == who ? std::optional { std::string {} } : std::nullopt,
+                                .publicKey = std::nullopt });
         return desired;
     }
 
@@ -257,8 +267,12 @@ void Fleet::Reconcile(std::size_t passes)
 /// @return The command's bytes.
 [[nodiscard]] std::vector<std::byte> SettingWrite(std::string value)
 {
-    return Encode(Command {
-        .kind = CommandKind::SetSetting, .key = "lease-lifetime", .value = std::move(value), .schedulerEndpoint = {} });
+    return Encode(Command { .kind = CommandKind::SetSetting,
+                            .key = "lease-lifetime",
+                            .value = std::move(value),
+                            .schedulerEndpoint = {},
+                            .publicKey = std::nullopt,
+                            .role = std::nullopt });
 }
 } // namespace
 
@@ -329,8 +343,12 @@ TEST_CASE("A cluster that forgets its leader commits a configuration without it,
 
     // And the cluster that is left still commits.
     REQUIRE(fleet.Cluster()
-                .ProposeOnLeader(Encode(Command {
-                    .kind = CommandKind::SetSetting, .key = "lease-lifetime", .value = "20min", .schedulerEndpoint = {} }))
+                .ProposeOnLeader(Encode(Command { .kind = CommandKind::SetSetting,
+                                                  .key = "lease-lifetime",
+                                                  .value = "20min",
+                                                  .schedulerEndpoint = {},
+                                                  .publicKey = std::nullopt,
+                                                  .role = std::nullopt }))
                 .has_value());
     fleet.Cluster().Run(60);
     CHECK(fleet.StateAt(successor).SettingOf("lease-lifetime") == "20min");

@@ -271,8 +271,12 @@ TEST_CASE("A peer discovery proves is recorded as a learner", "[node][discovery]
 
     REQUIRE(plan.proposals.size() == 1);
     CHECK(plan.proposals.front()
-          == Cluster::Command {
-              .kind = Cluster::CommandKind::AddLearner, .key = "n2", .value = "n2.local:6675", .schedulerEndpoint = {} });
+          == Cluster::Command { .kind = Cluster::CommandKind::AddLearner,
+                                .key = "n2",
+                                .value = "n2.local:6675",
+                                .schedulerEndpoint = {},
+                                .publicKey = std::nullopt,
+                                .role = std::nullopt });
     CHECK(plan.forgotten.empty());
 }
 

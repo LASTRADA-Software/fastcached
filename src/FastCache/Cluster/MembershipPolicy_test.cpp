@@ -689,7 +689,12 @@ struct Leader
 /// @return The command.
 [[nodiscard]] Command Forget(std::string id)
 {
-    return Command { .kind = CommandKind::RemoveMember, .key = std::move(id), .value = {}, .schedulerEndpoint = {} };
+    return Command { .kind = CommandKind::RemoveMember,
+                     .key = std::move(id),
+                     .value = {},
+                     .schedulerEndpoint = {},
+                     .publicKey = std::nullopt,
+                     .role = std::nullopt };
 }
 } // namespace
 
@@ -784,7 +789,12 @@ TEST_CASE("Only an operator's admit brings a forgotten member back", "[cluster][
     REQUIRE_FALSE(leader.Records("n3"));
 
     Apply(leader.state,
-          Command { .kind = CommandKind::AddMember, .key = "n3", .value = "10.0.0.3:6680", .schedulerEndpoint = {} });
+          Command { .kind = CommandKind::AddMember,
+                    .key = "n3",
+                    .value = "10.0.0.3:6680",
+                    .schedulerEndpoint = {},
+                    .publicKey = std::nullopt,
+                    .role = std::nullopt });
     CHECK_FALSE(leader.state.HasForgotten("10.0.0.3"));
 
     for ([[maybe_unused]] auto const pass: std::views::iota(0, 4))
@@ -806,9 +816,12 @@ namespace
 /// @return The command.
 [[nodiscard]] Command Admit(std::string id, std::string raft)
 {
-    return Command {
-        .kind = CommandKind::AddMember, .key = std::move(id), .value = std::move(raft), .schedulerEndpoint = {}
-    };
+    return Command { .kind = CommandKind::AddMember,
+                     .key = std::move(id),
+                     .value = std::move(raft),
+                     .schedulerEndpoint = {},
+                     .publicKey = std::nullopt,
+                     .role = std::nullopt };
 }
 } // namespace
 
