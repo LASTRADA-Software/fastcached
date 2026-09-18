@@ -592,8 +592,6 @@ namespace
         std::uint32_t datalen = 0;
         if (!ParseUnsigned(args[1], datalen))
             co_return co_await WriteAll(socket, "CLIENT_ERROR bad datalen\r\n");
-        auto const flagTokens = args.subspan(2);
-        auto const f = ParseSetFlags(flagTokens);
 
         // Keep this connection's source tag across the reads below. They are
         // co_await points, so another connection can run on this reactor thread
@@ -618,6 +616,18 @@ namespace
         // engine call is co_await-free, so the tag stays ours for the line
         // TracingStorage emits.
         Detail::storageSourceTag = ourSourceTag;
+
+        // The flags are parsed here, after the reads, and not above them: nothing
+        // before the engine call needs them, and a value held across a co_await is
+        // one the compiler has to place in the coroutine frame. MSVC 19.44 on ARM64
+        // did not. It built the flags parsed above the reads in the resume
+        // function's STACK frame, and read them back from there after resuming, so
+        // every flag was whatever the reads had left on the stack: a CAS-guarded
+        // append ran as a quiet store or a mark-stale and answered nothing (#1545).
+        // Parsed here, they are dead before the reply is written, so they never
+        // cross a suspension. The tokens they read are the caller's, which it keeps
+        // alive across this whole call, exactly as `key` above relies on.
+        auto const f = ParseSetFlags(args.subspan(2));
 
         auto const exptime = f.hasTtl ? f.ttl : 0U;
         auto const flagsValue = f.hasFlags ? f.flags : 0U;

@@ -83,6 +83,17 @@ std::string Exchange(MetaFixture& fix, std::string_view req)
     return FastCache::SyncRun(ReadAvailable(fix.pair.client.get()));
 }
 
+/// Overwrite 16 KiB of the stack below the caller. The stores go through a
+/// volatile glvalue, so the optimiser may not drop them as dead: a value a
+/// coroutine left on the stack instead of in its frame is then gone rather than
+/// surviving by luck.
+void DirtyTheStack()
+{
+    std::array<std::byte, 16 * 1024> scratch {};
+    for (auto& b: scratch)
+        *static_cast<std::byte volatile*>(&b) = std::byte { 0x5A };
+}
+
 } // namespace
 
 TEST_CASE("meta ms keeps its own source tag across the payload read", "[protocol][meta][ms][logsource]")
@@ -118,6 +129,41 @@ TEST_CASE("meta ms keeps its own source tag across the payload read", "[protocol
     // Ours, not the interloper's. Asserting the PREFIX rather than that a line
     // exists: both states emit one, and both name a plausible client.
     REQUIRE(records[0].message.starts_with("[203.0.113.7] storage: "));
+}
+
+TEST_CASE("meta ms keeps its flags across the payload read", "[protocol][meta][ms][cas][regression]")
+{
+    // #1545. HandleMs suspends twice reading the payload. On Windows ARM64, MSVC 19.44
+    // kept the flags it had parsed BEFORE those reads in the resume function's stack
+    // frame rather than the coroutine frame, and read them back from there after
+    // resuming: a CAS-guarded append ran as a quiet store and answered nothing.
+    //
+    // The conversation fixture above could not see it reliably. Its reads find the
+    // payload already buffered, so little runs on the stack between suspending and
+    // resuming, and the stale flags usually survived. Here every read reaches the
+    // socket, and the read hook overwrites the stack below it, so flags left there
+    // are gone. The reply AND the stored value are asserted: `EX` alone could come
+    // from garbage that happened to carry a CAS precondition.
+    FastCache::ManualClock clock;
+    FastCache::InMemoryLruStorage storage;
+    FastCache::CacheEngine engine { storage, clock };
+    auto const hi = FastCache::AsBytes(std::string_view { "hi" });
+    REQUIRE(engine.Set("k", std::vector<std::byte> { hi.begin(), hi.end() }, 0, 0).has_value());
+
+    auto const bytes = FastCache::AsBytes(std::string_view { "X\r\n" });
+    FastCache::Testing::ScriptedSocket socket { std::vector<std::byte> { bytes.begin(), bytes.end() } };
+    socket.SetOnRead([] { DirtyTheStack(); });
+    FastCache::ByteReader reader { socket, 1024, 1024, 256 };
+
+    std::array<std::string_view, 4> const args { "k", "1", "M=A", "C999" };
+    REQUIRE(FastCache::SyncRun(FastCache::MemcachedMeta::Dispatch(&socket, &engine, &reader, "ms", args)));
+
+    auto const& sent = socket.Sent();
+    REQUIRE(std::string_view { reinterpret_cast<char const*>(sent.data()), sent.size() } == "EX\r\n");
+    auto const stored = engine.Peek("k");
+    REQUIRE(stored.has_value());
+    REQUIRE(stored->found);
+    REQUIRE(stored->entry.ValueSize() == 2); // "hi", neither replaced nor appended to
 }
 
 TEST_CASE("meta mn returns MN", "[protocol][meta]")
