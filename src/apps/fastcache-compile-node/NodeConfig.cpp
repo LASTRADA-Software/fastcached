@@ -1081,8 +1081,9 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
             .explicitBit = &NodeConfig::discoveryAddressExplicit,
             .description = "announce this node on the segment and listen for peers\n"
                            "here; off unless given. Needs --listen-raft and\n"
-                           "--cluster-key-file. Without it a cluster is exactly\n"
-                           "the --raft-peer list an operator typed.",
+                           "--cluster-key-file. A peer that proves the key joins as\n"
+                           "a learner, counted by no quorum; --cluster-admit\n"
+                           "promotes it to a voter.",
             .yamlKey = "discovery",
             .same = FieldEq<&NodeConfig::discoveryAddress>(),
         },

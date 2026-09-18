@@ -43,9 +43,35 @@ namespace
     {
         return !configuration.voters.empty();
     }
+
+    /// The seat `id` is recorded in: wherever something already placed it, else a newcomer's.
+    ///
+    /// In precedence order, and the order is the rule (#1535). The operator's record
+    /// first, even where consensus has not caught up with it -- a demotion in flight is
+    /// the record running ahead, and reading the configuration first would undo it.
+    /// Then the configuration, for the member it counts and the state never recorded:
+    /// every `--raft-peer` member, and this node itself before its first pass. Only
+    /// then `NewcomerSeat`.
+    /// @param state The replicated state.
+    /// @param active The configuration consensus holds.
+    /// @param id The member.
+    /// @return Its seat.
+    [[nodiscard]] MemberSeat SeatFor(ClusterState const& state,
+                                     Consensus::Configuration const& active,
+                                     Consensus::NodeId const& id)
+    {
+        if (auto const it = std::ranges::find(state.members, id, &ClusterMember::id); it != state.members.end())
+            return it->seat;
+        for (auto const& row: MemberSeatTable)
+            if (Consensus::Membership::Contains(active.*row.set, id))
+                return row.seat;
+        return NewcomerSeat;
+    }
 } // namespace
 
-MembershipPlan MembershipProposals(ClusterState const& state, std::span<DesiredMember const> desired)
+MembershipPlan MembershipProposals(ClusterState const& state,
+                                   Consensus::Configuration const& active,
+                                   std::span<DesiredMember const> desired)
 {
     MembershipPlan plan;
     for (auto const& member: desired)
@@ -66,12 +92,11 @@ MembershipPlan MembershipProposals(ClusterState const& state, std::span<DesiredM
         // rule this type exists for -- no opinion means whatever is recorded stands.
         auto const scheduler = member.schedulerEndpoint.value_or(known ? it->schedulerEndpoint : std::string {});
 
-        // The seat by the same rule (#1449), which is what keeps a node's own record
-        // from undoing an operator's demotion: a node always desires itself, and a
-        // record re-proposed as a voter on every pass would promote it straight back.
-        // Absent and unrecorded is a voter, which is what this reconciler has always
-        // admitted -- `RecordedSeatOf`, the one reading of *no opinion*.
-        auto const seat = member.seat.value_or(RecordedSeatOf(state, member.id));
+        // Never the desire's to decide (#1535): whatever placed the member keeps it
+        // there, which is what stops this node's own record undoing a demotion and a
+        // rediscovered peer undoing a promotion, and a member nothing placed joins as
+        // a learner an operator promotes.
+        auto const seat = SeatFor(state, active, member.id);
 
         if (known && it->raftEndpoint == member.raftEndpoint && it->schedulerEndpoint == scheduler && it->seat == seat)
             continue;

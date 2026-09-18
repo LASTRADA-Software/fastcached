@@ -52,17 +52,10 @@ namespace
 /// @param raft Where its consensus port answers.
 /// @param scheduler What this node knows about its scheduler port; absent for "no
 ///        opinion", which is what discovery has about a peer.
-/// @param seat Which set it should be in; absent for "no opinion", which is what every
-///        production caller has today (#1449).
 /// @return The desire.
-[[nodiscard]] DesiredMember Desire(std::string id,
-                                   std::string raft,
-                                   std::optional<std::string> scheduler = std::nullopt,
-                                   std::optional<MemberSeat> seat = std::nullopt)
+[[nodiscard]] DesiredMember Desire(std::string id, std::string raft, std::optional<std::string> scheduler = std::nullopt)
 {
-    return DesiredMember {
-        .id = std::move(id), .raftEndpoint = std::move(raft), .schedulerEndpoint = std::move(scheduler), .seat = seat
-    };
+    return DesiredMember { .id = std::move(id), .raftEndpoint = std::move(raft), .schedulerEndpoint = std::move(scheduler) };
 }
 
 /// The state a cluster reaches after admitting each of `members`.
@@ -76,19 +69,26 @@ namespace
 /// `MembershipProposals`, spelled without the span conversion at every call.
 /// @param state What the cluster holds.
 /// @param desired What this node believes.
+/// @param active What consensus counts; nobody by default, so every member the state
+///        does not record is a newcomer.
 /// @return The whole plan: what to propose, and what was refused.
-[[nodiscard]] MembershipPlan Plan(ClusterState const& state, std::vector<DesiredMember> const& desired)
+[[nodiscard]] MembershipPlan Plan(ClusterState const& state,
+                                  std::vector<DesiredMember> const& desired,
+                                  Consensus::Configuration const& active = {})
 {
-    return MembershipProposals(state, std::span<DesiredMember const> { desired });
+    return MembershipProposals(state, active, std::span<DesiredMember const> { desired });
 }
 
 /// The proposals alone, which is all most cases are about.
 /// @param state What the cluster holds.
 /// @param desired What this node believes.
+/// @param active What consensus counts; nobody by default.
 /// @return The proposals.
-[[nodiscard]] std::vector<Command> Proposals(ClusterState const& state, std::vector<DesiredMember> const& desired)
+[[nodiscard]] std::vector<Command> Proposals(ClusterState const& state,
+                                             std::vector<DesiredMember> const& desired,
+                                             Consensus::Configuration const& active = {})
 {
-    return Plan(state, desired).proposals;
+    return Plan(state, desired, active).proposals;
 }
 
 /// A configuration of voters alone: every configuration before #1449.
@@ -146,16 +146,19 @@ TEST_CASE("A record the state already holds is not proposed again", "[cluster][m
 
 TEST_CASE("A member the state has never heard of is proposed", "[cluster][membership]")
 {
+    // `n1` is this node, counted since it bootstrapped and recorded by nobody yet, so it
+    // is recorded where consensus counts it; `n2` is placed nowhere and joins as the
+    // learner a newcomer is (#1535).
     ClusterState const state;
-    auto const proposals =
-        Proposals(state, { Desire("n1", "10.0.0.1:6675", "10.0.0.1:7000"), Desire("n2", "10.0.0.2:6675") });
+    auto const proposals = Proposals(
+        state, { Desire("n1", "10.0.0.1:6675", "10.0.0.1:7000"), Desire("n2", "10.0.0.2:6675") }, Voters({ "n1" }));
 
     REQUIRE(proposals.size() == 2);
     CHECK(proposals[0]
           == Command {
               .kind = CommandKind::AddMember, .key = "n1", .value = "10.0.0.1:6675", .schedulerEndpoint = "10.0.0.1:7000" });
-    CHECK(proposals[1].key == "n2");
-    CHECK(proposals[1].schedulerEndpoint.empty());
+    CHECK(proposals[1]
+          == Command { .kind = CommandKind::AddLearner, .key = "n2", .value = "10.0.0.2:6675", .schedulerEndpoint = {} });
 }
 
 TEST_CASE("A record that differs in any field is re-proposed", "[cluster][membership]")
@@ -518,28 +521,48 @@ TEST_CASE("Additions come first, then promotions, then demotions, then removals"
     CHECK_FALSE(QuorumChange(state, active).has_value());
 }
 
-TEST_CASE("A node's own record keeps the seat the operator recorded", "[cluster][membership][learner]")
+TEST_CASE("A seat something already placed is never the desire's to change", "[cluster][membership][learner]")
 {
-    // A node desires ITSELF on every pass, with no opinion about its seat. Were that
-    // read as "voter", an operator's demotion would be undone one interval after it
-    // committed: the reconciler would re-propose the node as a voter, and win.
-    auto const state = StateOf({ Learner("n1", "10.0.0.1:6675") });
+    // A node desires ITSELF on every pass and discovery desires every peer it proves, and
+    // neither says anything about a seat (#1449, #1535). Were an unrecorded seat read as
+    // either one, an operator's decision would be undone one interval after it committed.
+    SECTION("this node's own record keeps the operator's demotion")
+    {
+        auto const state = StateOf({ Learner("n1", "10.0.0.1:6675") });
+        CHECK(Proposals(state, { Desire("n1", "10.0.0.1:6675", std::string {}) }, Voters({ "n1" })).empty());
+    }
 
-    CHECK(Proposals(state, { Desire("n1", "10.0.0.1:6675", std::string {}) }).empty());
+    SECTION("a rediscovered learner the operator promoted stays promoted")
+    {
+        auto const state = StateOf({ Member("n1", "10.0.0.1:6675"), Member("n2", "10.0.0.2:6675") });
+        CHECK(Proposals(state, { Desire("n2", "10.0.0.2:6675") }, Configured({ "n1" }, { "n2" })).empty());
+    }
 
-    // No opinion about a member nobody recorded admits a VOTER, as discovery always has.
-    auto const fresh = Proposals(ClusterState {}, { Desire("n2", "10.0.0.2:6675") });
-    REQUIRE(fresh.size() == 1);
-    CHECK(fresh[0].kind == CommandKind::AddMember);
+    SECTION("the record outranks a configuration that has not caught up with it")
+    {
+        // A demotion in flight: recorded a learner, still counted a voter. Reading the
+        // configuration first would re-record a voter and undo it.
+        auto const state = StateOf({ Member("n1", "10.0.0.1:6675"), Learner("n2", "10.0.0.2:6675") });
+        CHECK(Proposals(state, { Desire("n2", "10.0.0.2:6675") }, Voters({ "n1", "n2" })).empty());
+    }
 
-    // An opinion is honoured, through the verb `MemberSeatTable` names for it.
-    auto const asked = Proposals(state, { Desire("n1", "10.0.0.1:6675", std::string {}, MemberSeat::Voter) });
-    REQUIRE(asked.size() == 1);
-    CHECK(asked[0].kind == CommandKind::AddMember);
+    SECTION("a member counted and recorded nowhere else takes the set it is counted in")
+    {
+        auto const typed = Proposals(ClusterState {}, { Desire("n2", "10.0.0.2:6675") }, Voters({ "n1", "n2" }));
+        REQUIRE(typed.size() == 1);
+        CHECK(typed[0].kind == CommandKind::AddMember);
 
-    auto const learner = Proposals(ClusterState {}, { Desire("n3", "10.0.0.3:6675", std::nullopt, MemberSeat::Learner) });
-    REQUIRE(learner.size() == 1);
-    CHECK(learner[0].kind == CommandKind::AddLearner);
+        auto const learner = Proposals(ClusterState {}, { Desire("n3", "10.0.0.3:6675") }, Configured({ "n1" }, { "n3" }));
+        REQUIRE(learner.size() == 1);
+        CHECK(learner[0].kind == CommandKind::AddLearner);
+    }
+
+    SECTION("and only a member placed nowhere is a newcomer, recorded as a learner")
+    {
+        auto const fresh = Proposals(ClusterState {}, { Desire("n4", "10.0.0.4:6675") }, Voters({ "n1" }));
+        REQUIRE(fresh.size() == 1);
+        CHECK(fresh[0].kind == CommandKind::AddLearner);
+    }
 }
 
 // --------------------------------------------------------------------------
@@ -567,7 +590,7 @@ struct Leader
     void Pass()
     {
         auto const top = state;
-        for (auto const& command: Proposals(top, desired))
+        for (auto const& command: Proposals(top, desired, active))
             Apply(state, command);
         if (auto const change = NextQuorumChange(top, active, self, boot); change.has_value())
             active = Unwrap(change);
@@ -707,4 +730,97 @@ TEST_CASE("Only an operator's admit brings a forgotten member back", "[cluster][
 
     CHECK(leader.Records("n3"));
     CHECK(Consensus::Membership::IsMember(leader.active, "n3"));
+}
+
+// --------------------------------------------------------------------------
+// Learner first (#1535): a machine discovery proves is replicated to and counted by
+// nothing, until an operator decides it should vote.
+
+namespace
+{
+/// What `--cluster-admit=<id>=<endpoint>` commits: a voter's record.
+/// @param id The member.
+/// @param raft Where its consensus port answers.
+/// @return The command.
+[[nodiscard]] Command Admit(std::string id, std::string raft)
+{
+    return Command {
+        .kind = CommandKind::AddMember, .key = std::move(id), .value = std::move(raft), .schedulerEndpoint = {}
+    };
+}
+} // namespace
+
+TEST_CASE("A machine discovery proves joins as a learner, and the quorum grows only when an operator promotes it",
+          "[cluster][membership][learner][discovery]")
+{
+    // #1535. `n1` bootstrapped alone and `n2` proved the key. Admitted as a voter the
+    // moment it could be dialled, `n2` would make every commit need both machines from
+    // then on -- asserted at EVERY pass, because the failure is the quorum growing on the
+    // pass after the record commits rather than at the end.
+    auto leader = Leader { .state = StateOf({}),
+                           .active = Voters({ "n1" }),
+                           .self = "n1",
+                           .boot = { "n1" },
+                           .desired = { Desire("n1", "10.0.0.1:6680", std::string {}), Desire("n2", "10.0.0.2:6680") } };
+
+    for (auto const pass: std::views::iota(0, 4))
+    {
+        leader.Pass();
+        INFO("reconcile pass " << pass);
+        CHECK(leader.active.voters == std::vector<Consensus::NodeId> { "n1" });
+    }
+
+    // Recorded as a learner, and replicated to: in the configuration, counted by nothing.
+    REQUIRE(leader.Records("n2"));
+    CHECK(RecordedSeatOf(leader.state, "n2") == MemberSeat::Learner);
+    CHECK(leader.active == Configured({ "n1" }, { "n2" }));
+
+    // Promotion is the operator's act, and it is one more change -- the voter set grows by
+    // exactly this member, once.
+    Apply(leader.state, Admit("n2", "10.0.0.2:6680"));
+    for ([[maybe_unused]] auto const pass: std::views::iota(0, 4))
+        leader.Pass();
+    CHECK(leader.active == Voters({ "n1", "n2" }));
+
+    // And discovery, which goes on proving `n2` on every beacon, does not demote it back.
+    CHECK(RecordedSeatOf(leader.state, "n2") == MemberSeat::Voter);
+}
+
+TEST_CASE("A machine recorded as a voter and discovered again stays a voter", "[cluster][membership][learner][discovery]")
+{
+    // The control the case above needs: a reconciler that recorded every proven peer as a
+    // learner would pass it, and would demote every voter discovery rediscovered.
+    SECTION("recorded by the state")
+    {
+        auto leader = Leader { .state = StateOf({ Member("n1", "10.0.0.1:6680"), Member("n2", "10.0.0.2:6680") }),
+                               .active = Voters({ "n1", "n2" }),
+                               .self = "n1",
+                               .boot = { "n1" },
+                               .desired = { Desire("n1", "10.0.0.1:6680", std::string {}), Desire("n2", "10.0.0.2:6680") } };
+        for ([[maybe_unused]] auto const pass: std::views::iota(0, 4))
+            leader.Pass();
+
+        CHECK(RecordedSeatOf(leader.state, "n2") == MemberSeat::Voter);
+        CHECK(leader.active == Voters({ "n1", "n2" }));
+    }
+
+    SECTION("typed into --raft-peer, so counted by the configuration and recorded nowhere")
+    {
+        // The case a desire's source cannot see: nothing puts a typed member in the state,
+        // so to anything reading only the state it looks exactly like a newcomer.
+        auto leader = Leader { .state = StateOf({}),
+                               .active = Voters({ "n1", "n2" }),
+                               .self = "n1",
+                               .boot = { "n1", "n2" },
+                               .desired = { Desire("n1", "10.0.0.1:6680", std::string {}), Desire("n2", "10.0.0.2:6680") } };
+        for (auto const pass: std::views::iota(0, 4))
+        {
+            leader.Pass();
+            INFO("reconcile pass " << pass);
+            CHECK(leader.active == Voters({ "n1", "n2" }));
+        }
+
+        REQUIRE(leader.Records("n2"));
+        CHECK(RecordedSeatOf(leader.state, "n2") == MemberSeat::Voter);
+    }
 }

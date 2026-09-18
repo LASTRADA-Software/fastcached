@@ -258,12 +258,13 @@ void DiscoveryTier::PublishAuthenticated()
         // only that node can announce it. An empty string here would read as "I know
         // it has none" and clear whatever the peer had announced about itself.
         //
-        // No seat either, for the same reason and with the same consequence (#1449):
-        // no opinion keeps whatever the cluster recorded, and a peer it has no record of
-        // is admitted as a VOTER, as discovery always has. Desiring a proven peer as a
-        // LEARNER first is the step this leaves for later.
+        // And no seat, because a desire carries none (#1535). The proof says this peer
+        // holds the key, which is no reason to count it: a peer the cluster has placed
+        // nowhere is recorded as a LEARNER and an operator promotes it, while one it
+        // already records or counts keeps that seat. Decided by the leader against the
+        // state it holds at every pass, which this tier cannot see.
         members.push_back(Cluster::DesiredMember {
-            .id = peer.nodeId, .raftEndpoint = peer.raftEndpoint, .schedulerEndpoint = std::nullopt, .seat = std::nullopt });
+            .id = peer.nodeId, .raftEndpoint = peer.raftEndpoint, .schedulerEndpoint = std::nullopt });
 
     if (_onPeers && !members.empty())
         _onPeers(members);
