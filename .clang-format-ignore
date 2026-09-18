@@ -16,3 +16,4 @@
 # the offered files under the roots -- so a row here that stops matching, or one that
 # declines first-party code, is caught in the step that caused it.
 vendor/endo/**
+vendor/monocypher/**
