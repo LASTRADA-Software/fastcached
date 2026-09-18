@@ -397,8 +397,12 @@ TEST_CASE("A running one-voter tier refuses to forget its only voter, and nothin
     // CHECK rather than REQUIRE, and the error read only when there is one: the log
     // assertion below has to be REACHED when the refusal is missing, or a tier that
     // appended the forget would stop this case before the half that measures it.
-    auto const refused = tier->ProposeToCluster(
-        Cluster::Command { .kind = Cluster::CommandKind::RemoveMember, .key = "n1", .value = {}, .schedulerEndpoint = {} });
+    auto const refused = tier->ProposeToCluster(Cluster::Command { .kind = Cluster::CommandKind::RemoveMember,
+                                                                   .key = "n1",
+                                                                   .value = {},
+                                                                   .schedulerEndpoint = {},
+                                                                   .publicKey = std::nullopt,
+                                                                   .role = std::nullopt });
     CHECK_FALSE(refused.has_value());
     if (!refused.has_value())
     {
@@ -412,7 +416,9 @@ TEST_CASE("A running one-voter tier refuses to forget its only voter, and nothin
     REQUIRE(tier->ProposeToCluster(Cluster::Command { .kind = Cluster::CommandKind::SetSetting,
                                                       .key = "lease-lifetime",
                                                       .value = "20min",
-                                                      .schedulerEndpoint = {} })
+                                                      .schedulerEndpoint = {},
+                                                      .publicKey = std::nullopt,
+                                                      .role = std::nullopt })
                 .has_value());
     REQUIRE(Testing::WaitUntil(
         "the sentinel setting to commit",
