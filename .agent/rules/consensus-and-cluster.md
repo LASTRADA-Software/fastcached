@@ -769,6 +769,34 @@ and it is recorded here because the question will be asked again.
     derived rather than scanned for separately.** They are the same question, and
     two backward scans answering it independently are two places for the rule to
     drift.
+  - **A recovered snapshot reaches the APPLICATION, and constructing the driver is
+    what hands it over**
+    ([#1542](https://github.com/LASTRADA-Software/fastcached/issues/1542)). A node
+    recovered from storage comes back with `_lastApplied` AT the snapshot's boundary,
+    so nothing the snapshot covers is ever applied again -- and `RestoreSnapshot` was
+    called only on `output.restoreSnapshot`, which only `OnInstallSnapshot` sets. So a
+    node that compacted (every 512 entries) and restarted ran without every cluster
+    fact its snapshot held: members, settings, and the forget tombstones, which made
+    REMOVAL fail OPEN -- a forgotten host admitted again after a restart, reported by
+    nothing. It recovered only if a leader later sent it an `InstallSnapshot`, which a
+    follower whose log is current never gets. `RaftDriver`'s constructor now restores
+    a node's snapshot into the application before any step can apply an entry above
+    it: every driver is built there, so no caller has to remember, and
+    `IRaftStateMachine::RestoreSnapshot` states both of its callers -- recovery and
+    install. Asked of the boundary (`SnapshotIndex() != BeforeFirst()`), never of the
+    bytes, because an empty state is a legitimate snapshot. `ConsensusTier` reads the
+    recovered term BEFORE constructing the driver, since the restore's publication
+    announces the role.
+  - **The harness's state machine holds real state, and a restart empties it.** Its
+    `RestoreSnapshot` was a no-op ("this machine records what it was told") and its
+    `TakeSnapshot` returned nothing, so every restart case passed whether or not a
+    snapshot reached the application -- the fake more permissive than the component
+    it stands for, which is exactly how #1542 went unseen. `Member::application` is
+    now the application's state (snapshotted, restored wholesale, cleared by
+    `Restart` as a process's memory is) and `Member::applied` stays the HISTORY State
+    Machine Safety is checked against. A restart case asserts the application, not
+    only the log; the harness takes a `CompactionPolicy`, so a case can make every
+    node compact at all.
 - **A seeded draw must be the same on every platform, or a seeded harness is not
   reproducible.** `std::mt19937_64` is specified bit-for-bit by the standard;
   `std::uniform_int_distribution` is **not** — how it reduces the engine's output

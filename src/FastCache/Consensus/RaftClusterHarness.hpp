@@ -10,8 +10,10 @@
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/IRandomSource.hpp>
 #include <FastCache/Core/ISecureRandom.hpp>
+#include <FastCache/Core/WireFields.hpp>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -21,9 +23,9 @@
 #include <optional>
 #include <ranges>
 #include <set>
+#include <span>
 #include <stdexcept>
 #include <string>
-#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -78,7 +80,14 @@ class RaftClusterHarness
     /// @param credentials What each member, and each later `Join`, proves the key with.
     /// @param seedOffset Staggers each node's election timer draws, so a cluster
     ///        whose members all draw identically does not split its vote forever.
-    RaftClusterHarness(std::vector<NodeId> members, CredentialFactory credentials, std::uint64_t seedOffset = 1);
+    /// @param compaction When every node trims its log into a snapshot; never by
+    ///        default, as for a driver. A case about recovery or installation from a
+    ///        snapshot names a threshold, and every node -- restarted or joined later --
+    ///        runs with it.
+    RaftClusterHarness(std::vector<NodeId> members,
+                       CredentialFactory credentials,
+                       std::uint64_t seedOffset = 1,
+                       CompactionPolicy compaction = {});
 
     /// A cluster bootstrapped with voters AND learners (#1449).
     ///
@@ -88,7 +97,11 @@ class RaftClusterHarness
     /// @param configuration The voters and the learners.
     /// @param credentials What each member, and each later `Join`, proves the key with.
     /// @param seedOffset As for the other constructor.
-    RaftClusterHarness(Configuration configuration, CredentialFactory credentials, std::uint64_t seedOffset = 1);
+    /// @param compaction As for the other constructor.
+    RaftClusterHarness(Configuration configuration,
+                       CredentialFactory credentials,
+                       std::uint64_t seedOffset = 1,
+                       CompactionPolicy compaction = {});
 
     /// Advance the clock, deliver what is due, and tick every node.
     ///
@@ -118,7 +131,10 @@ class RaftClusterHarness
     ///
     /// Which is exactly what a process restart looks like from the algorithm's
     /// side, and the reason the storage lives in the harness rather than in the
-    /// node.
+    /// node. And from the APPLICATION's side (#1542): its state is emptied first,
+    /// because a process that restarts remembers nothing it applied, so whatever
+    /// the node holds afterwards is what recovery gave back -- the snapshot's
+    /// state, restored, and the entries above it, re-applied.
     /// @param who Which node.
     void Restart(NodeId const& who);
 
@@ -226,8 +242,23 @@ class RaftClusterHarness
         /// it a bootstrap set on its second start that it never had on its first.
         Configuration bootstrap;
 
-        /// What this node has applied, in order. The state machine's whole job.
+        /// Every entry handed to this node's application, in order, across restarts.
+        ///
+        /// A HISTORY of `Apply` calls, which is what State Machine Safety is checked
+        /// against. It is not the application's state: a restart re-applies what the
+        /// node recovers, so an entry can appear here more than once, and an entry a
+        /// snapshot carried in never appears here at all.
         std::vector<AppliedEntry> applied;
+
+        /// What this node's application HOLDS: every entry it has applied or been
+        /// restored with, in index order (#1542).
+        ///
+        /// The state the machine snapshots and restores, emptied by a restart the way
+        /// a process's memory is. Before #1542 the harness kept no state at all and
+        /// restored nothing, so every restart case passed whether or not a recovered
+        /// snapshot reached the application -- a fake more permissive than the
+        /// component it stands for. This is what a restart case asserts on.
+        std::vector<AppliedEntry> application;
     };
 
   private:
@@ -259,7 +290,14 @@ class RaftClusterHarness
         NodeId _from;
     };
 
-    /// Records what a node applied, which is what State Machine Safety is about.
+    /// A real state machine: it holds what it applied, snapshots it and restores it.
+    ///
+    /// Its state is `Member::application`, the ordered entries it has applied, and
+    /// its snapshot is exactly that state encoded -- so a restore that never happens
+    /// leaves a restarted node visibly missing what its snapshot covered, and a
+    /// restore that merged instead of replacing would visibly keep what an installed
+    /// snapshot superseded. Every `Apply` is also recorded in `Member::applied`, the
+    /// history State Machine Safety is checked against.
     class RecordingMachine final: public IRaftStateMachine
     {
       public:
@@ -276,21 +314,46 @@ class RaftClusterHarness
 
         [[nodiscard]] std::vector<std::byte> TakeSnapshot() override
         {
-            return {};
+            return EncodeApplication(_harness.Find(_who).application);
         }
 
         void RestoreSnapshot(std::span<std::byte const> state) override
         {
-            std::ignore = state;
-            // Nothing to restore: this machine records what it was told rather
-            // than holding state, and the safety properties the harness checks
-            // are about the LOG, which the node has already replaced.
+            _harness.RestoreApplication(_who, state);
         }
 
       private:
         RaftClusterHarness& _harness;
         NodeId _who;
     };
+
+    /// Encode an application's state as a snapshot: `[u64 index][payload]` per entry.
+    /// @param application The entries, in index order.
+    /// @return The bytes.
+    [[nodiscard]] static std::vector<std::byte> EncodeApplication(std::vector<AppliedEntry> const& application);
+
+    /// Read back what `EncodeApplication` wrote.
+    /// @param state The snapshot's bytes.
+    /// @return The entries, or nullopt for bytes it cannot have written.
+    [[nodiscard]] static std::optional<std::vector<AppliedEntry>> DecodeApplication(std::span<std::byte const> state);
+
+    /// Replace `who`'s application state with the one `state` encodes.
+    ///
+    /// Wholesale, as `IRaftStateMachine::RestoreSnapshot` requires. Bytes this
+    /// harness's own encoder could not have produced are a VIOLATION rather than an
+    /// empty state, because an empty state is exactly what a missed restore looks
+    /// like and the two must not read alike.
+    /// @param who The node.
+    /// @param state A snapshot `EncodeApplication` produced, on some node.
+    void RestoreApplication(NodeId const& who, std::span<std::byte const> state);
+
+    /// Build a driver for `member` over `node`, the one way this harness makes one.
+    ///
+    /// Shared by `AddNode` and `Restart`, so the compaction policy -- and whatever the
+    /// next collaborator is -- cannot reach a first start and miss a restart.
+    /// @param member The node's world.
+    /// @param node The Raft node the driver takes over.
+    void BuildDriver(Member& member, RaftNode node);
 
     /// The configuration every node in this cluster runs with.
     ///
@@ -365,6 +428,10 @@ class RaftClusterHarness
     /// series rather than start a second one that could collide with it.
     std::uint64_t _seedOffset { 1 };
 
+    /// When every node's driver trims its log; kept so a restart or a join runs
+    /// with the policy the cluster was built with.
+    CompactionPolicy _compaction {};
+
     /// The configuration the harness was constructed with: every bootstrap node,
     /// by the set it was started in.
     Configuration _members;
@@ -404,16 +471,21 @@ class RaftClusterHarness
 
 inline RaftClusterHarness::RaftClusterHarness(std::vector<NodeId> members,
                                               CredentialFactory credentials,
-                                              std::uint64_t seedOffset):
-    RaftClusterHarness { Configuration { .voters = std::move(members), .learners = {} }, std::move(credentials), seedOffset }
+                                              std::uint64_t seedOffset,
+                                              CompactionPolicy compaction):
+    RaftClusterHarness {
+        Configuration { .voters = std::move(members), .learners = {} }, std::move(credentials), seedOffset, compaction
+    }
 {
 }
 
 inline RaftClusterHarness::RaftClusterHarness(Configuration configuration,
                                               CredentialFactory credentials,
-                                              std::uint64_t seedOffset):
+                                              std::uint64_t seedOffset,
+                                              CompactionPolicy compaction):
     _credentials { std::move(credentials) },
     _seedOffset { seedOffset },
+    _compaction { compaction },
     _members { std::move(configuration) }
 {
     // Voters first and then learners, which is the order the seed series is drawn
@@ -445,10 +517,70 @@ inline void RaftClusterHarness::AddNode(NodeId const& who,
     member->bootstrap = std::move(bootstrap);
 
     auto node = RaftNode::Create(ConfigFor(member->id, member->bootstrap), *member->random, _clock.Now());
-    member->driver =
-        std::make_unique<RaftDriver>(std::move(node).value(), *member->storage, *member->transport, *member->machine);
+    BuildDriver(*member, std::move(node).value());
 
     _nodes.push_back(std::move(member));
+}
+
+inline void RaftClusterHarness::BuildDriver(Member& member, RaftNode node)
+{
+    member.driver =
+        std::make_unique<RaftDriver>(std::move(node), *member.storage, *member.transport, *member.machine, _compaction);
+}
+
+inline std::vector<std::byte> RaftClusterHarness::EncodeApplication(std::vector<AppliedEntry> const& application)
+{
+    // The indices are written out before any span into them is taken, so the list
+    // below never views storage a growing vector has moved.
+    auto indices = std::vector<std::array<std::byte, sizeof(std::uint64_t)>> {};
+    indices.reserve(application.size());
+    for (auto const& entry: application)
+        indices.push_back(WireFields::ToBigEndian<std::uint64_t>(entry.index.value));
+
+    // Indexed rather than zipped: `std::views::zip` is not uniformly available across
+    // the standard libraries this project builds against.
+    auto fields = std::vector<std::span<std::byte const>> {};
+    fields.reserve(application.size() * 2);
+    for (auto const at: std::views::iota(std::size_t { 0 }, application.size()))
+    {
+        fields.emplace_back(indices[at]);
+        fields.emplace_back(application[at].payload);
+    }
+    return WireFields::Encode(WireFields::FieldList { fields });
+}
+
+inline std::optional<std::vector<AppliedEntry>> RaftClusterHarness::DecodeApplication(std::span<std::byte const> state)
+{
+    auto const fields = WireFields::SplitAll(state);
+    if (!fields.has_value() || fields->size() % 2 != 0)
+        return std::nullopt;
+
+    auto entries = std::vector<AppliedEntry> {};
+    entries.reserve(fields->size() / 2);
+    // Pairs by position rather than `std::views::chunk`, for `zip`'s reason above.
+    for (auto const at: std::views::iota(std::size_t { 0 }, fields->size() / 2))
+    {
+        auto const index = WireFields::FromBigEndian<std::uint64_t>((*fields)[2 * at]);
+        if (!index.has_value())
+            return std::nullopt;
+        auto const payload = (*fields)[(2 * at) + 1];
+        entries.push_back(AppliedEntry { .index = LogIndex { .value = *index },
+                                         .payload = std::vector<std::byte> { payload.begin(), payload.end() } });
+    }
+    return entries;
+}
+
+inline void RaftClusterHarness::RestoreApplication(NodeId const& who, std::span<std::byte const> state)
+{
+    auto restored = DecodeApplication(state);
+    if (!restored.has_value())
+    {
+        _violations.push_back("Snapshot: " + who + " was handed application state its own encoder cannot have written");
+        return;
+    }
+
+    // Replace, never merge -- the contract this harness exists to hold production to.
+    Find(who).application = *std::move(restored);
 }
 
 inline RaftConfig RaftClusterHarness::ConfigFor(NodeId const& who, Configuration bootstrap)
@@ -594,6 +726,7 @@ inline void RaftClusterHarness::Enqueue(NodeId const& from, NodeId const& to, Ra
 inline void RaftClusterHarness::RecordApplied(NodeId const& who, AppliedEntry const& entry)
 {
     Find(who).applied.push_back(entry);
+    Find(who).application.push_back(entry);
 
     // State Machine Safety, checked where it happens: no two nodes may apply
     // different commands at the same index. This is the property everything else
@@ -638,10 +771,35 @@ inline void RaftClusterHarness::CheckInvariants()
             // the same bytes, in the log of every leader of a term above T.
             // Leaders at or below T are deliberately not checked -- see the note
             // on `Committed`.
+            //
+            // "In the log" includes the part of it a snapshot replaced (#1542). Until
+            // this harness compacted, no leader held one, and the check read the log
+            // alone; a compacted leader holds an entry below its boundary only in its
+            // snapshot -- which, now that the harness's application keeps real state,
+            // says exactly which commands it covers, so the property is checked there
+            // rather than waived. Decoded once per leader per step.
+            auto const boundary = raft.SnapshotIndex().value;
+            auto const covered = boundary == 0 ? std::optional { std::vector<AppliedEntry> {} }
+                                               : DecodeApplication(raft.CurrentSnapshot().state);
+            if (!covered.has_value())
+                _violations.push_back("Snapshot: leader " + node->id
+                                      + " holds a snapshot its own encoder cannot have written");
+
             for (auto const& [index, committed]: _appliedAt)
             {
                 if (term <= committed.term)
                     continue;
+
+                if (index <= boundary)
+                {
+                    auto const& snapshotted = covered.value_or(std::vector<AppliedEntry> {});
+                    auto const found = std::ranges::find(snapshotted, LogIndex { .value = index }, &AppliedEntry::index);
+                    if (found == snapshotted.end() || found->payload != committed.payload)
+                        _violations.push_back("Leader Completeness: leader " + node->id + " of term " + std::to_string(term)
+                                              + " has no snapshot of the entry committed at index " + std::to_string(index)
+                                              + " in term " + std::to_string(committed.term));
+                    continue;
+                }
 
                 // Stated as "must hold exactly this" rather than as a list of ways
                 // it may be wrong. Enumerating the failures left a hole: only
@@ -836,10 +994,13 @@ inline void RaftClusterHarness::Restart(NodeId const& who)
     if (!recovered.has_value())
         return;
 
+    // Forgotten before the new driver exists, as a process's memory is: whatever the
+    // application holds from here on, recovery put there.
+    member.application.clear();
+
     auto node =
         RaftNode::Create(ConfigFor(member.id, member.bootstrap), *member.random, _clock.Now(), std::move(recovered).value());
-    member.driver =
-        std::make_unique<RaftDriver>(std::move(node).value(), *member.storage, *member.transport, *member.machine);
+    BuildDriver(member, std::move(node).value());
 }
 
 inline void RaftClusterHarness::RequireNew(NodeId const& who) const

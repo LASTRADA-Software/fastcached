@@ -10,6 +10,7 @@
 #include <array>
 #include <chrono>
 #include <cstdint>
+#include <format>
 #include <memory>
 #include <ranges>
 #include <set>
@@ -1041,6 +1042,113 @@ TEST_CASE("A learner is promoted and demoted one change at a time, across the wh
     REQUIRE(cluster.ProposeOnLeader(FastCache::BytesFromString("after")).has_value());
     cluster.Run(60);
     CHECK_FALSE(cluster.At("n4").applied.empty());
+
+    RequireNoViolations(cluster);
+}
+
+// --------------------------------------------------------------------------
+// A snapshot reaches the application, on recovery and on install (#1542).
+
+namespace
+{
+
+/// Whether two applications hold the same entries, index and bytes alike.
+/// @param lhs One.
+/// @param rhs The other.
+/// @return True when they are the same sequence.
+[[nodiscard]] bool SameApplication(std::span<AppliedEntry const> lhs, std::span<AppliedEntry const> rhs)
+{
+    return std::ranges::equal(lhs, rhs, [](AppliedEntry const& left, AppliedEntry const& right) {
+        return left.index == right.index && left.payload == right.payload;
+    });
+}
+
+/// Trims every node's log into a snapshot once four applied entries pile up.
+constexpr auto CompactOften = CompactionPolicy { .appliedEntriesBeforeCompaction = 4 };
+
+/// Propose `count` commands on whoever leads, letting each replicate.
+/// @param cluster The cluster.
+/// @param count How many.
+void ProposeSeveral(RaftClusterHarness& cluster, int count)
+{
+    for (auto const step: std::views::iota(0, count))
+    {
+        REQUIRE(cluster.ProposeOnLeader(FastCache::BytesFromString(std::format("e{}", step))).has_value());
+        cluster.Run(5);
+    }
+}
+
+} // namespace
+
+TEST_CASE("A node restarted after compacting holds in its application what its snapshot covered",
+          "[consensus][raft][cluster][snapshot]")
+{
+    // The harness half of #1542. Its state machine used to hold nothing and restore
+    // nothing, so every restart case here passed whether or not a recovered snapshot
+    // reached the application. It now holds what it applied, and a restart empties it
+    // the way a process's memory is emptied -- so what n2 holds after restarting is
+    // exactly what recovery gave back.
+    RaftClusterHarness cluster { { "n1", "n2", "n3" }, ClusterKey, 1, CompactOften };
+    REQUIRE(SettleOnLeader(cluster));
+    ProposeSeveral(cluster, 10);
+    cluster.Run(60);
+
+    auto const snapshotIndex = cluster.At("n2").driver->Node().SnapshotIndex();
+    REQUIRE(snapshotIndex != LogIndex::BeforeFirst());
+    auto const before = cluster.At("n2").application;
+    REQUIRE(SameApplication(before, cluster.At("n1").application));
+
+    cluster.Restart("n2");
+
+    // Before a single step: exactly what the snapshot covers, restored -- not empty, and
+    // not the entries above it, which only a commit can bring back.
+    //
+    // The size is a REQUIRE: a missed restore fails every check below together, and
+    // exactly four of them used to -- which a Catch2 exit status collides with
+    // `SKIP_RETURN_CODE 4`, scoring the neutered fix SKIPPED rather than failed (#1152).
+    // Measured on this case before this line was a REQUIRE.
+    auto const covered = static_cast<std::size_t>(
+        std::ranges::count_if(before, [snapshotIndex](AppliedEntry const& entry) { return entry.index <= snapshotIndex; }));
+    REQUIRE(covered > 0);
+    auto const& restored = cluster.At("n2").application;
+    REQUIRE(restored.size() == covered);
+    CHECK(SameApplication(restored, std::span { before }.first(std::min(covered, before.size()))));
+
+    // And once it is caught up, all of it: the same as before the restart, and the same
+    // as the leader's.
+    cluster.Run(120);
+    CHECK(SameApplication(cluster.At("n2").application, before));
+    CHECK(SameApplication(cluster.At("n2").application, cluster.At("n1").application));
+
+    RequireNoViolations(cluster);
+}
+
+TEST_CASE("A follower caught up by an installed snapshot holds in its application what the snapshot covered",
+          "[consensus][raft][cluster][snapshot]")
+{
+    // The other half of `RestoreSnapshot`'s contract, which the old no-op restore let
+    // through just as silently: a follower the leader can no longer replay to is sent
+    // the state instead, and its application must hold that state -- not the handful
+    // of entries it applied itself before it fell behind.
+    RaftClusterHarness cluster { { "n1", "n2", "n3" }, ClusterKey, 1, CompactOften };
+    REQUIRE(SettleOnLeader(cluster));
+
+    auto const leader = Unwrap(cluster.Leader());
+    auto const lagging = NodeId { leader == "n3" ? "n2" : "n3" };
+
+    cluster.Partition({ lagging });
+    ProposeSeveral(cluster, 10);
+    cluster.Run(60);
+    REQUIRE(cluster.At(leader).driver->Node().SnapshotIndex() > cluster.At(lagging).driver->Node().LastApplied());
+
+    cluster.Heal();
+    cluster.Run(200);
+
+    // Installed rather than replayed: the entries below the leader's snapshot were
+    // never applied on the lagging node, one by one, yet its application holds them.
+    CHECK(cluster.At(lagging).driver->Node().SnapshotIndex() != LogIndex::BeforeFirst());
+    CHECK(SameApplication(cluster.At(lagging).application, cluster.At(leader).application));
+    CHECK(cluster.At(lagging).applied.size() < cluster.At(leader).application.size());
 
     RequireNoViolations(cluster);
 }

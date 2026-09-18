@@ -13,7 +13,7 @@ RaftDriver::RaftDriver(RaftNode node,
                        IRaftStorage& storage,
                        IRaftTransport& transport,
                        IRaftStateMachine& application,
-                       CompactionPolicy compaction) noexcept:
+                       CompactionPolicy compaction):
     _node { std::move(node) },
     _storage { storage },
     _transport { transport },
@@ -23,6 +23,18 @@ RaftDriver::RaftDriver(RaftNode node,
     _reportedTerm { _node.CurrentTerm() },
     _reportedLeader { _node.KnownLeader() }
 {
+    // Recovery's half of `IRaftStateMachine::RestoreSnapshot` (#1542): the other half
+    // is an installed snapshot, which `Deliver` hands over. A node holding a snapshot
+    // at construction recovered it -- nothing has run yet to compact or install one --
+    // and its applied index sits at the snapshot's boundary, so the state the snapshot
+    // describes reaches the application HERE or never. Before any entry above it can
+    // be applied, because no step has been taken; and without a caller having to know,
+    // because the one that did not know is the defect.
+    //
+    // Asked of the boundary rather than of the bytes: an application's empty state is
+    // a legitimate snapshot, and "no snapshot" is `BeforeFirst`, never an empty buffer.
+    if (_node.SnapshotIndex() != LogIndex::BeforeFirst())
+        _application.RestoreSnapshot(_node.CurrentSnapshot().state);
 }
 
 void RaftDriver::ObserveRole(RoleObserver observer)
