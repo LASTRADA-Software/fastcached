@@ -1235,7 +1235,7 @@ TEST_CASE("A follower that cannot read its leader's snapshot stays behind, appli
     // was -- same application, same applied index -- while the other two carry on without
     // it. Nothing is applied on its stale base, and no safety property is disturbed. Once
     // it can read the snapshot (an upgrade), it takes it on and catches up by itself.
-    RaftClusterHarness cluster { { "n1", "n2", "n3" }, ClusterKey, 1, CompactOften };
+    RaftClusterHarness cluster { { "n1", "n2", "n3" }, Members(), 1, CompactOften };
     REQUIRE(SettleOnLeader(cluster));
     auto const leader = Unwrap(cluster.Leader());
     auto const behind = NodeId { leader == "n3" ? "n2" : "n3" };
