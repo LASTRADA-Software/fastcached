@@ -3,6 +3,7 @@
 
 #include <FastCache/Cluster/ClusterState.hpp>
 
+#include <expected>
 #include <optional>
 #include <span>
 #include <string>
@@ -129,8 +130,8 @@ struct MembershipPlan
 /// precisely a proposal that would have cleared one. Asked only of a desire that would
 /// propose something -- one the state already matches changes nothing and lifts
 /// nothing. It covers this node's OWN record too: a leader whose host was forgotten
-/// stops re-proposing itself, and goes on counting itself only because it never
-/// proposes its own removal (`NextQuorumChange`).
+/// stops re-proposing itself, and proposes its own removal instead
+/// (`NextQuorumChange`, #1539).
 ///
 /// **Undoing a forget is the operator's, and it is deliberate**: `--cluster-admit`
 /// commits `AddMember` directly -- never through this function -- and that lifts the
@@ -193,14 +194,30 @@ struct MembershipPlan
 /// endpoint that has become unreadable is a bad record, and shrinking the quorum
 /// over one would turn a typo into a cluster that cannot elect.
 ///
-/// **This node's own removal.** A leader taking itself out of the quorum it leads
-/// is an operator's decision and stays one — and short of a forget it would not
-/// stick anyway, since a node always desires its own record and the next pass would
-/// propose putting it back. A configuration flapping on a timer is worse than one
-/// that is merely wrong. A leader whose own host WAS forgotten stops re-proposing
-/// its record (`MembershipProposals`, #1528) and is still counted here, so the
-/// quorum drops it only under another leader: the record is honoured, the quorum
-/// fails closed.
+/// **This node's own removal -- until the operator forgets it (#1539).** A leader
+/// taking itself out of the quorum it leads is an operator's decision, and absent a
+/// forget it would not stick anyway: a node always desires its own record, so the
+/// next pass would propose putting it back, and a configuration flapping on a timer
+/// is worse than one that is merely wrong.
+///
+/// A forget IS that decision, and it means the same thing whoever currently leads. A
+/// leader whose own record is gone AND whose host the cluster has forgotten -- the
+/// two facts `RemoveMember` writes together, and the one reading of *forgotten* that
+/// the first pass of a fresh leader, which has recorded nothing yet, cannot produce
+/// -- stops re-proposing its record (`MembershipProposals`, #1528) and proposes its
+/// own removal, LAST: after every other change it can still make as the leader.
+/// Once that commits it steps down (`RaftNode`, §4.2.2 -- #1449's demoted leader is
+/// the same rule), and the remaining voters elect a leader that never admits it
+/// again. Never the last voter: a configuration nobody is counted in can commit
+/// nothing, and forgetting the only voter is refused BY NAME before anything is
+/// proposed (`ValidateForget`), so the record never runs ahead of a quorum that
+/// could not follow it.
+///
+/// Its own bootstrap entry does not protect it, for a reason that holds only for
+/// this one entry: a node cannot start without naming itself, so that entry records
+/// how it was started, not an operator's assertion about who belongs. Every OTHER
+/// member this node's command line names is still such an assertion, and a forgotten
+/// one stays counted, below, exactly as before.
 ///
 /// **The removal of a bootstrap member.** This is the one that is not obvious, and
 /// getting it wrong shrinks a healthy cluster to one node: `--raft-peer` puts a
@@ -235,12 +252,34 @@ struct MembershipPlan
 /// than too few.
 /// @param state The cluster's state as this node last applied it.
 /// @param active The configuration consensus currently holds, both sets.
-/// @param self This node's id.
-/// @param bootstrap The ids this node was started with, in either set; never removed.
+/// @param self This node's own record as it announces it; its id and its consensus
+///        endpoint are read, the endpoint to ask whether its host was forgotten.
+/// @param bootstrap The ids this node was started with, in either set; never removed,
+///        except this node itself once it is forgotten.
 /// @return The configuration to propose, or nullopt when nothing should change.
 [[nodiscard]] std::optional<Consensus::Configuration> NextQuorumChange(ClusterState const& state,
                                                                        Consensus::Configuration const& active,
-                                                                       Consensus::NodeId const& self,
+                                                                       ClusterMember const& self,
                                                                        std::span<Consensus::NodeId const> bootstrap);
+
+/// Whether forgetting `id` leaves the quorum something it can follow (#1539).
+///
+/// Asked before a `RemoveMember` is proposed, because afterwards is too late: the
+/// command applies whatever it names, and the only voter's removal is one
+/// `NextQuorumChange` can never propose -- a configuration with no voter commits
+/// nothing, including the change that would undo it. So the record would say
+/// *forgotten* while consensus went on counting the member, and its host would be
+/// refused by every surface while it led. Refused by NAME instead, while the operator
+/// who typed `--cluster-forget` is reading the answer.
+///
+/// Against the configuration consensus holds rather than the state: which members
+/// are COUNTED is the question, and a typed `--raft-peer` voter is counted while
+/// recorded nowhere.
+/// @param active The configuration consensus currently holds.
+/// @param id The member to be forgotten.
+/// @return Nothing when it may be proposed; `InvalidConfiguration`, naming the member,
+///         when it is the only voter.
+[[nodiscard]] std::expected<void, ConsensusError> ValidateForget(Consensus::Configuration const& active,
+                                                                 Consensus::NodeId const& id);
 
 } // namespace FastCache::Cluster

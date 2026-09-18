@@ -1136,6 +1136,26 @@ and it is recorded here because the question will be asked again.
     tombstone is the operator's: `--cluster-admit` commits `AddMember` directly. The
     tombstone is a HOST, so a loopback cluster -- which records none -- is not covered,
     and #178's per-node keys are what replace it with an identity.
+  - **A forget means the same thing whoever currently leads**
+    ([#1539](https://github.com/LASTRADA-Software/fastcached/issues/1539)). After #1528 a
+    forgotten LEADER stopped recording itself and still led, counted, indefinitely:
+    `NextQuorumChange` skipped `id == self`, and a node's own bootstrap set always names
+    it. Now a leader that is FORGOTTEN proposes its own removal, LAST -- after every
+    change it can still make as the leader -- and steps down once it commits (`RaftNode`,
+    §4.2.2; #1449's demoted leader is the same rule). **Forgotten is BOTH facts
+    `RemoveMember` writes**, the record gone AND the host tombstoned: record absence
+    alone is every fresh leader's first pass, and a tombstone alone may be a client
+    forget naming a member's machine. Neutered to absence alone, five cases go red,
+    including the pre-existing *this node never proposes its own removal*. **Its own
+    bootstrap entry does not protect it, and nobody else's is touched**: a node names
+    itself because it cannot start otherwise, so that one entry asserts nothing, while a
+    forgotten typed FOLLOWER stays counted exactly as before -- the control. Forgetting
+    the ONLY voter is refused BY NAME before it is proposed (`ValidateForget`, from
+    `ConsensusTier::Propose`, `InvalidConfiguration`): afterwards the record would say
+    forgotten while no configuration could ever drop it. Pinned in `RaftClusterHarness`
+    (`MembershipCluster_test`): the configuration commits without the leader, it steps
+    down, a successor is elected and refuses it by name; neutering the self-removal keeps
+    it in the configuration and leading.
   - **The quorum follows the state, never the other way round, and one step at a
     time.** Additions come first: growing before shrinking keeps the quorum reachable
     through a replacement, where the other order passes through a configuration

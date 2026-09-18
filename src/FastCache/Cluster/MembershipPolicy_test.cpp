@@ -106,7 +106,9 @@ namespace
 /// cluster pass their own.
 /// @param state What the cluster holds.
 /// @param active What consensus holds, both sets.
-/// @param self This node's id.
+/// @param self This node's id. Its record is given an endpoint on a host of its own,
+///        which no case here forgets -- the cases about a forgotten leader call
+///        `NextQuorumChange` with the record they mean.
 /// @param bootstrap What this node was started with; itself by default.
 /// @return The proposed configuration, or nullopt.
 [[nodiscard]] std::optional<Consensus::Configuration> QuorumChange(
@@ -116,7 +118,7 @@ namespace
     std::optional<std::vector<Consensus::NodeId>> const& bootstrap = std::nullopt)
 {
     auto const started = bootstrap.value_or(std::vector<Consensus::NodeId> { self });
-    return NextQuorumChange(state, active, self, started);
+    return NextQuorumChange(state, active, Member(self, self + ".self:6675"), started);
 }
 
 /// The same, for a configuration of voters alone -- which every case before #1449 was.
@@ -592,8 +594,16 @@ struct Leader
         auto const top = state;
         for (auto const& command: Proposals(top, desired, active))
             Apply(state, command);
-        if (auto const change = NextQuorumChange(top, active, self, boot); change.has_value())
+        if (auto const change = NextQuorumChange(top, active, Self(), boot); change.has_value())
             active = Unwrap(change);
+    }
+
+    /// This node's own record as it announces it: its id, where its desire says it answers.
+    /// @return The record.
+    [[nodiscard]] ClusterMember Self() const
+    {
+        auto const it = std::ranges::find(desired, self, &DesiredMember::id);
+        return Member(self, it != desired.end() ? it->raftEndpoint : std::string {});
     }
 
     /// Whether the state records `id`.
@@ -823,4 +833,78 @@ TEST_CASE("A machine recorded as a voter and discovered again stays a voter", "[
         REQUIRE(leader.Records("n2"));
         CHECK(RecordedSeatOf(leader.state, "n2") == MemberSeat::Voter);
     }
+}
+
+// --------------------------------------------------------------------------
+// A forgotten leader (#1539): a forget means the same thing whoever leads.
+
+TEST_CASE("A forgotten leader proposes its own removal, after every other change", "[cluster][membership][quorum][forget]")
+{
+    // `n1` leads and the operator forgot it: its record gone, its host tombstoned --
+    // the two facts `RemoveMember` writes.
+    auto state = StateOf({ Member("n2", "10.0.0.2:6680"), Member("n3", "10.0.0.3:6680") });
+    state.forgotten = { "10.0.0.1" };
+    auto const self = Member("n1", "10.0.0.1:6680");
+    auto const typed = std::vector<Consensus::NodeId> { "n1", "n2", "n3" };
+
+    // Its own bootstrap entry does not protect it: it names itself because it could not
+    // start otherwise, which asserts nothing about whether it belongs.
+    auto const change = NextQuorumChange(state, Voters({ "n1", "n2", "n3" }), self, typed);
+    REQUIRE(change.has_value());
+    CHECK(Unwrap(change) == Voters({ "n2", "n3" }));
+
+    // Nor does having no bootstrap set at all, which stops a node removing any PEER.
+    auto const joined = NextQuorumChange(state, Voters({ "n1", "n2", "n3" }), self, std::vector<Consensus::NodeId> {});
+    REQUIRE(joined.has_value());
+    CHECK(Unwrap(joined) == Voters({ "n2", "n3" }));
+
+    // LAST: a change it can still make as the leader goes first, because once its own
+    // removal commits it leads nothing.
+    auto grown = state;
+    grown.members.push_back(Learner("n4", "10.0.0.4:6680"));
+    auto const first = NextQuorumChange(grown, Voters({ "n1", "n2", "n3" }), self, typed);
+    REQUIRE(first.has_value());
+    CHECK(Unwrap(first) == Configured({ "n1", "n2", "n3" }, { "n4" }));
+}
+
+TEST_CASE("A leader is forgotten only by both facts a forget writes", "[cluster][membership][quorum][forget]")
+{
+    // Either fact alone is something else, and removing on it would be the flaw the
+    // bootstrap rule exists for, reached from this node's side.
+    auto const self = Member("n1", "10.0.0.1:6680");
+    auto const typed = std::vector<Consensus::NodeId> { "n1", "n2", "n3" };
+
+    SECTION("nothing recorded yet: a fresh leader's first pass")
+    {
+        CHECK_FALSE(NextQuorumChange(StateOf({}), Voters({ "n1", "n2", "n3" }), self, typed).has_value());
+    }
+
+    SECTION("its host tombstoned while its record stands: a client forget naming a member's machine")
+    {
+        auto recorded = StateOf({ Member("n1", "10.0.0.1:6680") });
+        recorded.forgotten = { "10.0.0.1" };
+        CHECK_FALSE(NextQuorumChange(recorded, Voters({ "n1", "n2", "n3" }), self, typed).has_value());
+    }
+}
+
+TEST_CASE("The last voter is never removed, and forgetting it is refused by name", "[cluster][membership][quorum][forget]")
+{
+    // A configuration nobody is counted in commits nothing, including the change that
+    // would undo it -- so the policy never proposes it, and the forget that would ask
+    // for it is refused while the operator is still reading the answer.
+    auto state = StateOf({});
+    state.forgotten = { "10.0.0.1" };
+    CHECK_FALSE(
+        NextQuorumChange(state, Voters({ "n1" }), Member("n1", "10.0.0.1:6680"), std::vector<Consensus::NodeId> { "n1" })
+            .has_value());
+
+    auto const refused = ValidateForget(Voters({ "n1" }), "n1");
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error().code == ConsensusErrorCode::InvalidConfiguration);
+    CHECK(refused.error().context.starts_with("cannot forget n1: it is the cluster's only voter"));
+
+    // Every other forget leaves somebody counted.
+    CHECK(ValidateForget(Voters({ "n1", "n2" }), "n1").has_value());
+    CHECK(ValidateForget(Configured({ "n1" }, { "n2" }), "n2").has_value());
+    CHECK(ValidateForget(Voters({ "n1" }), "n9").has_value());
 }
