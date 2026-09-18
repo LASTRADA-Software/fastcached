@@ -1,8 +1,9 @@
 # Vendored file manifest -- see vendor/VENDOR.md.
 #
-# SHA-256 of every file under vendor/endo. scripts/check-vendor-verbatim.cmake compares the
-# tree against this list, so a vendored file edited in place is refused rather than
-# discovered months later by somebody trying to send the change upstream.
+# SHA-256 of every file under every third-party root in scripts/lib/third-party-roots.txt.
+# scripts/check-vendor-verbatim.cmake compares the tree against this list, so a vendored file
+# edited in place is refused rather than discovered months later by somebody trying to send the
+# change upstream.
 #
 # A line ending `local-change-of <sha256>` differs from upstream, whose hash it records, and one
 # ending `local-change-new` is not in upstream. Every such path must be named by a row of
@@ -12,7 +13,8 @@
 #     cmake -DFASTCACHED_SOURCE_DIR=<root> -DFASTCACHED_VENDOR_WRITE_MANIFEST=ON \
 #           -P scripts/check-vendor-verbatim.cmake
 #
-# After a re-sync from upstream blobs, and only then, =RESYNC marks every file upstream's.
+# After a re-sync of ONE root from upstream, and only then, =RESYNC with
+# -DFASTCACHED_VENDOR_RESYNC_ROOT=<root> marks that root's files upstream's.
 #
 2edccd6f506c75e4d3a55fcf6b08f4fe2d1b794c823faac1a0e7b3c405ce04b6  vendor/endo/coro/Cancellation.hpp
 b10927f0e35e6ed3fa60c4cb1ffddc9e16b65b4820424328d7423d9c0d0994ec  vendor/endo/coro/Task.hpp
@@ -190,3 +192,9 @@ b1f1e748b8f328a9b6beabf8b2f959cf97ccc59839a524105cabbb3d34a67c33  vendor/endo/tu
 72606b77909c4412e4430b934b4ec54171e126eabd20a852b701ef995212e271  vendor/endo/tui/runtime/platform/TerminalEventSourceWin32.cpp  local-change-of 3d7939c9000d5e3e825e079253734d89ea15fb471f673521b722e77b20d58db9
 e4ac50a4040a4a2d4200644a7d86500abc6cc2656ae737330afc912e92736136  vendor/endo/tui/runtime/testing/MockEventSource.hpp
 7b4e07a62be90e5ce03738d2f54dc2b83d2938d5f2fd5513f2e325e4065885f7  vendor/endo/tui/test_main.cpp
+75a4d04559754a1016006f2c0e194cc7b459583cf9b1e2ce4ec10c74cb3de578  vendor/monocypher/AUTHORS.md
+5f8360e4c06ddcc584bdb4b210c6af824c4bb301e6a9a521869b6d90795ca4b3  vendor/monocypher/LICENCE.md
+57eb914fc88136119bd41655cccb8c250048bf54d470540625186f8ab16f64be  vendor/monocypher/src/monocypher.c
+c494da712122da7ff679fdcf318a5317e84972b6c950fe9d896212947797facd  vendor/monocypher/src/monocypher.h
+60fce3578fb00b00da96490653d993c4cb427b1e1be38183285c66e04d22cc18  vendor/monocypher/src/optional/monocypher-ed25519.c
+abc4fad381879f5c29176ebe014b9189956b3dfe0a3e36459b6990bc57212380  vendor/monocypher/src/optional/monocypher-ed25519.h

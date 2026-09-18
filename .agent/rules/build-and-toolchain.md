@@ -6043,7 +6043,10 @@ requires them to agree, because two readers of one format are two parsers.
 - **A root is the upstream COPY, never the directory holding copies.** `vendor/endo`, not
   `vendor`: `vendor/CMakeLists.txt`, `VENDOR.md` and `MANIFEST` are written here, and a root
   of `vendor` answers *third-party* for this project's own build glue, dropping it from every
-  scan that reads the file. The next import is its own row.
+  scan that reads the file. The next import is its own row -- and the second was: `vendor/monocypher`
+  (#178). The verbatim check and the figures check read the file too, so that row is also what
+  hashes the copy into `vendor/MANIFEST` and asks `vendor/VENDOR.md` to describe it; a re-sync
+  names ONE root (`FASTCACHED_VENDOR_RESYNC_ROOT`), so it cannot bless another copy's changes.
 - **clang-format is the enumerator no script can make ask**, so each root is also a row of
   `.clang-format-ignore`, refused when missing -- and `local-gate.sh` compares the
   formatter's declined count with the offered files under the roots, both directions: fewer
