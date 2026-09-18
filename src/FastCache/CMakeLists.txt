@@ -51,6 +51,7 @@ target_sources(FastCache
         Core/FigureText.cpp
         Core/PathKind.cpp
         Core/SecureBytes.cpp
+        Core/SecureRandom.cpp
         Core/Sha256.cpp
         Cluster/ClusterState.cpp
         Cluster/ClusterStateMachine.cpp

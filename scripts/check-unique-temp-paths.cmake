@@ -46,8 +46,10 @@
 #   * It reads only `src/`. A script or a fixture outside it that names a temp path is the
 #     POSIX helpers' concern (`scripts/lib/e2e-common.sh`).
 #   * A NEW legitimate consumer of the platform entropy source is an exemption row, not a
-#     reason to widen the pattern: there is one randomness seam and a second one is a design
-#     decision somebody should have to write down.
+#     reason to widen the pattern: there is one seam that reads the device, and a second one is
+#     a design decision somebody should have to write down. `Core/ISecureRandom.hpp` (#1527) is
+#     such a decision and reads NO device: it asks the operating system's generator directly,
+#     because an engine seeded from this device is exactly what repeated nonces across processes.
 
 cmake_minimum_required(VERSION 3.20)
 
@@ -202,6 +204,8 @@ if(violations)
     message("                    -- pid AND counter, and the pid is what two PROCESSES cannot share.")
     message("For RANDOMNESS:     Core/IRandomSource.hpp, injected, which is also what makes it")
     message("                    testable against a scripted source.")
+    message("For bytes that must NEVER REPEAT -- a nonce, a minted id: Core/ISecureRandom.hpp,")
+    message("                    the operating system's generator, whose failure is a refusal.")
     message("")
     message("If a caller genuinely needs the platform device, add a row to")
     message("`FastCachedRandomDeviceExemptions` in this file saying why.")

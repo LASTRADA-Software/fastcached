@@ -50,6 +50,19 @@ namespace
                      "error, and a counter could carry neither",
     };
 
+    /// This node's generator could not draw a challenge (#1527).
+    ///
+    /// `NoCluster` for `KeyUnreadable`'s reason, and the two are the same shape: this node cannot
+    /// run the exchange right now, the caller did nothing wrong, and a caller reading `NoCluster`
+    /// goes on being judged by its address exactly as before the verb existed. Never answered with
+    /// a nonce drawn from anywhere else -- a weak challenge is the replay window #1527 closes.
+    constexpr Cc::UncountedRefusal NoNonce {
+        .code = Wire::ErrorCode::NoCluster,
+        .rationale = "this node's own random source cannot draw a challenge, which is a fact about this machine "
+                     "rather than about the caller or the fleet; the Error beside it names the primitive and what it "
+                     "answered, and a counter could carry neither",
+    };
+
     /// A verb routed here that this component does not own.
     constexpr Cc::UncountedRefusal NotThisComponentsVerb {
         .code = Wire::UnimplementedVerb,
@@ -185,6 +198,22 @@ std::vector<std::byte> NodeProofResponder::EndpointRefusalReply(EndpointRefusal 
 {
     auto const& row = EndpointRefusals[static_cast<std::size_t>(refusal)];
     return AnswerEndpointRefusal(_metrics, ErrorCodeFor(refusal), row.answer, row.rationale, detail);
+}
+
+std::expected<Nonce, std::vector<std::byte>> NodeProofResponder::IssueChallenge()
+{
+    auto nonce = DrawNonce(_random);
+    if (nonce.has_value())
+        return *nonce;
+
+    // Named on the way out, for `KeyUnreadable`'s reason: no counter can carry WHICH machine is
+    // broken. Not throttled, because this path is behind the credential gate wherever one is
+    // configured, and one line per challenge asked is the rate the key-file line is said at too.
+    _logger.Log(
+        LogLevel::Error,
+        std::format("node proof: refused a challenge, because this node cannot draw one: {}", nonce.error().ToString()));
+    return std::unexpected(
+        Cc::RefuseWithoutCounter(NoNonce, "this node cannot draw a challenge from its random source right now"));
 }
 
 std::expected<std::string, std::vector<std::byte>> NodeProofResponder::Verify(std::span<std::byte const> challenge,

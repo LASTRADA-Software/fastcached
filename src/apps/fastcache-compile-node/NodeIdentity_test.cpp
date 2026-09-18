@@ -2,11 +2,12 @@
 #include "NodeIdentity.hpp"
 #include "NodeSurfaces.hpp"
 
-#include <FastCache/Core/IRandomSource.hpp>
+#include <FastCache/Core/ISecureRandom.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -14,11 +15,13 @@
 #include <vector>
 
 #include <tests/ScratchPath.hpp>
+#include <tests/SecureRandomFakes.hpp>
 #include <tests/Unwrap.hpp>
 
 using namespace FastCache;
 using namespace FastCache::Node;
 using FastCache::Testing::ScratchDirectory;
+using FastCache::Testing::ScriptedSecureRandom;
 using FastCache::Testing::Unwrap;
 
 namespace
@@ -66,6 +69,19 @@ namespace
     return text;
 }
 
+/// The bytes a mint reads to render @p high and then @p low as its hex, big-endian.
+/// @param high The first 64 bits of the id.
+/// @param low The last 64 bits of the id.
+/// @return The sixteen bytes.
+[[nodiscard]] std::vector<std::byte> IdScript(std::uint64_t high, std::uint64_t low)
+{
+    std::vector<std::byte> bytes;
+    for (auto const half: { high, low })
+        for (auto const shift: { 56U, 48U, 40U, 32U, 24U, 16U, 8U, 0U })
+            bytes.push_back(static_cast<std::byte>((half >> shift) & 0xFFU));
+    return bytes;
+}
+
 /// Resolve, requiring success, so a case reads as the property it is about.
 ///
 /// `Testing::Unwrap` takes a `std::optional`; this returns `std::expected`, and the
@@ -76,7 +92,7 @@ namespace
 /// @param configured What `--node-id` said, or empty.
 /// @param random Where a mint's bits come from.
 /// @return The identity.
-[[nodiscard]] NodeIdentity Resolved(std::filesystem::path const& dir, std::string_view configured, IRandomSource& random)
+[[nodiscard]] NodeIdentity Resolved(std::filesystem::path const& dir, std::string_view configured, ISecureRandom& random)
 {
     auto resolved = ResolveNodeIdentity(dir, configured, random);
     REQUIRE(resolved.has_value());
@@ -97,7 +113,7 @@ TEST_CASE("A node mints an identity once and reads it back forever", "[node][ide
     // until somebody notices the cluster is counting a member that no longer exists.
     ScratchDirectory const scratch { "node-identity" };
 
-    ScriptedRandomSource first { { 0x0123456789ABCDEFULL, 0xFEDCBA9876543210ULL } };
+    ScriptedSecureRandom first { IdScript(0x0123456789ABCDEFULL, 0xFEDCBA9876543210ULL) };
     auto const minted = Resolved(scratch.Path(), {}, first);
     CHECK(minted.origin == NodeIdentityOrigin::Minted);
     CHECK(minted.id.size() == MintedNodeIdLength);
@@ -106,14 +122,14 @@ TEST_CASE("A node mints an identity once and reads it back forever", "[node][ide
     // the same script a re-mint would produce the same string and the assertion below
     // would hold for the wrong reason -- the exact shape of a green test that could not
     // fail. This source would mint something else if anything asked it to.
-    ScriptedRandomSource second { { 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL } };
+    ScriptedSecureRandom second { IdScript(0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL) };
     auto const readBack = Resolved(scratch.Path(), {}, second);
     CHECK(readBack.id == minted.id);
     CHECK(readBack.origin == NodeIdentityOrigin::Recorded);
 
     // And it was READ rather than re-derived, which the equality above cannot show on
     // its own: the source was never consulted.
-    CHECK(second.DrawCount() == 0);
+    CHECK(second.FillCount() == 0);
 
     // Delete the record and the id changes. This is the acceptance clause's own
     // red-check written down: if the identity were derived from the machine rather than
@@ -125,7 +141,7 @@ TEST_CASE("A node mints an identity once and reads it back forever", "[node][ide
     // forgotten which term it voted in is `--cluster-dir`'s own documented hazard, two
     // leaders in one term, made automatic.
     std::filesystem::remove(scratch.Path() / NodeIdentityFileName);
-    ScriptedRandomSource third { { 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL } };
+    ScriptedSecureRandom third { IdScript(0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL) };
     auto const afresh = Resolved(scratch.Path(), {}, third);
     CHECK(afresh.id != minted.id);
     CHECK(afresh.origin == NodeIdentityOrigin::Minted);
@@ -147,7 +163,7 @@ TEST_CASE("Two nodes on one machine get different identities", "[node][identity]
 
     // ONE source, drawn from twice. Two sources would make this pass on the scripts
     // rather than on the design.
-    SystemRandomSource random { 20260908 };
+    SystemSecureRandom random;
     auto const first = Resolved(left, {}, random);
     auto const second = Resolved(right, {}, random);
 
@@ -168,7 +184,7 @@ TEST_CASE("An operator's --node-id wins and is recorded", "[node][identity]")
     // it down would leave the next start, made by a service whose registration somebody
     // edited, resolving something else entirely.
     ScratchDirectory const scratch { "node-identity-override" };
-    SystemRandomSource random { 20260908 };
+    SystemSecureRandom random;
 
     auto const typed = Resolved(scratch.Path(), "n1", random);
     CHECK(typed.id == "n1");
@@ -198,7 +214,7 @@ TEST_CASE("A recorded identity that cannot be read is refused, never replaced", 
     //
     // So it REFUSES, and the message says what deleting the file would cost.
     ScratchDirectory const scratch { "node-identity-damaged" };
-    SystemRandomSource random { 20260908 };
+    SystemSecureRandom random;
     auto const path = scratch.Path() / NodeIdentityFileName;
     std::filesystem::create_directories(scratch.Path());
 
@@ -233,15 +249,42 @@ TEST_CASE("A minted identity is 128 bits of the source it was given", "[node][id
     // rendering is pinned as well as the length -- a mint that silently truncated, or
     // that folded the two halves together, would still produce something 32 characters
     // long.
-    ScriptedRandomSource random { { 0x0123456789ABCDEFULL, 0xFEDCBA9876543210ULL } };
-    CHECK(MintNodeId(random) == "0123456789abcdeffedcba9876543210");
-    CHECK(random.DrawCount() == 2);
+    ScriptedSecureRandom random { IdScript(0x0123456789ABCDEFULL, 0xFEDCBA9876543210ULL) };
+    CHECK(MintNodeId(random).value() == "0123456789abcdeffedcba9876543210");
+    CHECK(random.FillCount() == 1);
 
-    // Two draws, not one: a single 64-bit value rendered twice would pass a length
+    // All sixteen bytes, not eight: one 64-bit half rendered twice would pass a length
     // check and halve the space.
-    ScriptedRandomSource halves { { 1, 2 } };
-    auto const id = MintNodeId(halves);
+    ScriptedSecureRandom halves { IdScript(1, 2) };
+    auto const id = MintNodeId(halves).value();
     CHECK(id.substr(0, 16) != id.substr(16));
+}
+
+TEST_CASE("An identity the generator cannot draw is refused by name, and nothing is written", "[node][identity]")
+{
+    // No fallback to a weaker source, and no half-made state: the refusal names the seam's own
+    // failure, and the state directory a start would have created is not there (#1527). A node
+    // that cannot mint refuses to start rather than run under an id two machines could share.
+    ScratchDirectory const scratch { "node-identity-no-entropy" };
+    auto const state = scratch.Path() / "state";
+    ScriptedSecureRandom denied { ScriptedSecureRandom::DeniedFailure() };
+
+    auto const minted = MintNodeId(denied);
+    REQUIRE_FALSE(minted.has_value());
+    CHECK(minted.error().primitive == ScriptedSecureRandom::DeniedFailure().primitive);
+
+    auto const refused = ResolveNodeIdentity(state, {}, denied);
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error().contains("cannot mint an identity"));
+    CHECK(refused.error().contains(ScriptedSecureRandom::DeniedFailure().primitive));
+    CHECK_FALSE(std::filesystem::exists(state));
+    CHECK(denied.FillCount() == 2);
+
+    // The controls: an identity that needs no draw is not refused for want of one, and the
+    // source is not even asked -- so the refusal above is the MINT's, not the resolver's.
+    CHECK(Resolved(state, "n1", denied).id == "n1");
+    CHECK(Resolved(state, {}, denied).origin == NodeIdentityOrigin::Recorded);
+    CHECK(denied.FillCount() == 2);
 }
 
 TEST_CASE("The state directory has one author, and the default names no identity", "[node][identity]")
@@ -266,7 +309,7 @@ TEST_CASE("A --raft-self host becomes this node's own member entry", "[node][ide
     // `--raft-peer=<id>=<host>:<port>`, and a node that names no member of its own
     // configuration is refused -- so without this a derived identity is unusable.
     ScratchDirectory const scratch { "node-identity-self" };
-    SystemRandomSource random { 20260908 };
+    SystemSecureRandom random;
 
     auto cfg = ClusteredNode(scratch.Path());
     REQUIRE(ClusterSelfMember(cfg) == nullptr);
@@ -432,7 +475,7 @@ TEST_CASE("A configuration survives having its identity applied twice", "[node][
     // that has already been through `ApplyNodeIdentity` -- and a node whose reloads are
     // all refused by name is one whose operator cannot change a log level.
     ScratchDirectory const scratch { "node-identity-reload" };
-    SystemRandomSource random { 20260908 };
+    SystemSecureRandom random;
 
     auto cfg = ClusteredNode(scratch.Path());
     auto const identity = Resolved(NodeStateDirectory(cfg), cfg.nodeId, random);
@@ -512,7 +555,7 @@ TEST_CASE("A service registration bakes in the resolved identity", "[node][ident
     // a registration nobody edited, and the cluster would count a member that no longer
     // exists beside a stranger nobody admitted. Both nodes are up the whole time.
     ScratchDirectory const scratch { "node-identity-install" };
-    SystemRandomSource random { 20260908 };
+    SystemSecureRandom random;
 
     auto cfg = ClusteredNode(scratch.Path());
     cfg.advertise = "10.0.0.7:6674";

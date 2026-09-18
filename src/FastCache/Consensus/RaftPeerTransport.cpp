@@ -350,19 +350,23 @@ Task<std::optional<SessionNonces>> PeerSenderAccess::Handshake(RaftPeerTransport
         co_return std::nullopt;
     }
 
-    DiallerHandshake dialling { self->_credential, self->_self, where.id, self->_random };
+    // Both failures below are faults of THIS node rather than of the peer, so neither is a
+    // dial refusal and neither moves a peer counter -- but each is every connection to every
+    // peer, so it is said, at most once per interval per peer. A nonce that cannot be drawn
+    // abandons the connection rather than proving with a weak one (#1527).
+    auto begun = DiallerHandshake::Create(self->_credential, self->_self, where.id, self->_random);
+    if (!begun.has_value())
+    {
+        self->NoteOwnFault(
+            *peer, where, std::format("this node cannot draw a handshake nonce: {}", begun.error().ToString()));
+        co_return std::nullopt;
+    }
+    auto& dialling = *begun;
+
     auto const proof = dialling.Answer(*challenge);
     if (!proof.has_value())
     {
-        // A fault of THIS node's configuration rather than of the peer, so it is not a
-        // dial refusal and moves no peer counter -- but it is every connection to every
-        // peer, so it is said, at most once per interval per peer.
-        if (auto const now = self->_reactor.Clock().Now(); now >= peer->nextRefusalReport)
-        {
-            peer->nextRefusalReport = now + RaftPeerTransport::RefusalReportInterval;
-            self->_logger.Log(LogLevel::Error,
-                              std::format("raft: cannot prove the key to peer {}: {}", where.id, proof.error()));
-        }
+        self->NoteOwnFault(*peer, where, proof.error());
         co_return std::nullopt;
     }
 
@@ -511,7 +515,7 @@ RaftPeerTransport::RaftPeerTransport(NodeId self,
                                      ILogger& logger,
                                      IMetricsSink& metrics,
                                      IRaftPeerCredential const& credential,
-                                     IRandomSource& random,
+                                     ISecureRandom& random,
                                      PeerTransportOptions options):
     _self { std::move(self) },
     _reactor { reactor },
@@ -720,6 +724,16 @@ void RaftPeerTransport::NoteSenderThrew(NodeId const& peer) noexcept
     // error rather than a condition to recover from, and wrapping it here would
     // only move where that is discovered.
     _logger.Log(LogLevel::Error, std::format("raft: peer {} sender threw; the connection was dropped", peer));
+}
+
+void RaftPeerTransport::NoteOwnFault(Peer& peer, PeerEndpoint const& where, std::string_view reason)
+{
+    auto const now = _reactor.Clock().Now();
+    if (now < peer.nextRefusalReport)
+        return;
+    peer.nextRefusalReport = now + RefusalReportInterval;
+
+    _logger.Log(LogLevel::Error, std::format("raft: cannot prove the key to peer {}: {}", where.id, reason));
 }
 
 void RaftPeerTransport::NoteDialRefusal(Peer& peer,

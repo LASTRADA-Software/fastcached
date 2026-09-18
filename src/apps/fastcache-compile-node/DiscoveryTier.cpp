@@ -74,7 +74,7 @@ DiscoveryTier::DiscoveryTier(std::unique_ptr<IDatagramSocket> socket,
     _logger { logger },
     _onPeers { std::move(onPeers) },
     _socket { std::move(socket) },
-    _random { std::make_unique<SystemRandomSource>() },
+    _random { std::make_unique<SystemSecureRandom>() },
     _directory { _clock, config.clusterId, config.nodeId },
     _beaconInterval { config.beaconInterval },
     // Due immediately rather than one interval from now: a node that waited would be

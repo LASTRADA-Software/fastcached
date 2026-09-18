@@ -11,7 +11,7 @@
 #include <FastCache/Consensus/RaftTypes.hpp>
 #include <FastCache/Consensus/RaftWire.hpp>
 #include <FastCache/Core/Clock.hpp>
-#include <FastCache/Core/IRandomSource.hpp>
+#include <FastCache/Core/ISecureRandom.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Net/IConnector.hpp>
@@ -197,7 +197,8 @@ class RaftPeerTransport final: public IRaftTransport
     /// @param metrics Where a refused dial is counted.
     /// @param credential What this node's proofs are made with, and an acceptor's
     ///        verdicts checked against.
-    /// @param random Where each connection's nonce comes from.
+    /// @param random Where each connection's nonce comes from. A connection this node cannot
+    ///        draw one for is abandoned before it proves anything (#1527).
     /// @param options Timeouts and queue bound.
     RaftPeerTransport(NodeId self,
                       std::vector<PeerEndpoint> peers,
@@ -206,7 +207,7 @@ class RaftPeerTransport final: public IRaftTransport
                       ILogger& logger,
                       IMetricsSink& metrics,
                       IRaftPeerCredential const& credential,
-                      IRandomSource& random,
+                      ISecureRandom& random,
                       PeerTransportOptions options = {});
 
     RaftPeerTransport(RaftPeerTransport const&) = delete;
@@ -398,6 +399,18 @@ class RaftPeerTransport final: public IRaftTransport
     /// @param detail What was seen, for the log line.
     void NoteDialRefusal(Peer& peer, PeerEndpoint const& where, DiallerRefusal refusal, std::string_view detail);
 
+    /// Say that this node could not prove the key to a peer for a reason of its OWN, at most
+    /// once per `RefusalReportInterval` per peer. Reactor thread only.
+    ///
+    /// **Not a `DiallerRefusal`, and it moves no counter**: every row there names something
+    /// about the peer, and this names this node -- an id no handshake can carry, or a
+    /// generator that cannot draw a nonce (#1527). It is every connection to every peer, so
+    /// it is said as an Error.
+    /// @param peer The peer that was dialled.
+    /// @param where Where it was dialled.
+    /// @param reason Why this node could not, completing "cannot prove the key to ...: ".
+    void NoteOwnFault(Peer& peer, PeerEndpoint const& where, std::string_view reason);
+
     friend struct PeerSenderAccess;
 
     NodeId _self;
@@ -406,7 +419,7 @@ class RaftPeerTransport final: public IRaftTransport
     ILogger& _logger;
     IMetricsSink& _metrics;
     IRaftPeerCredential const& _credential;
-    IRandomSource& _random;
+    ISecureRandom& _random;
     PeerTransportOptions _options;
 
     /// Cancelled by `RequestStop`; observed by every backoff and loop condition.

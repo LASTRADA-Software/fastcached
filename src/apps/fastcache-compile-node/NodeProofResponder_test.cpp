@@ -60,7 +60,7 @@ struct ProvingNode
     SchedulerResponder scheduler { protocol, membership, metrics };
 
     Testing::ScriptedClusterKey key { RightKey };
-    Testing::FixedRandomSource random;
+    Testing::ScriptedSecureRandom random { Testing::FixedChallengeScript() };
     NodeProofResponder prover { key, random, metrics, logger };
 
     ProvingNode()
@@ -68,10 +68,10 @@ struct ProvingNode
         service.SetRole(Distributed::SchedulerRole::Leader, {}, Distributed::StandaloneSchedulerTerm);
     }
 
-    /// The challenge this node's prover issues, which is fixed by `FixedRandom`.
+    /// The challenge this node's prover issues, which is fixed by `FixedChallengeScript`.
     [[nodiscard]] Nonce Challenge()
     {
-        return prover.IssueChallenge();
+        return prover.IssueChallenge().value();
     }
 };
 
@@ -276,10 +276,10 @@ TEST_CASE("A node that holds no cluster key proves nothing, and says which flag 
     AtomicMetricsSink metrics;
     CapturingLogger logger;
     Testing::ScriptedClusterKey const absent { "", "open: no such file or directory" };
-    Testing::FixedRandomSource random;
+    Testing::ScriptedSecureRandom random { Testing::FixedChallengeScript() };
     NodeProofResponder prover { absent, random, metrics, logger };
 
-    auto const challenge = prover.IssueChallenge();
+    auto const challenge = prover.IssueChallenge().value();
     auto const refused = prover.Verify(challenge, ProofPayload(RightKey, challenge, ProvingNodeId));
     REQUIRE_FALSE(refused.has_value());
     CHECK(ErrorOf(refused.error()) == Wire::ErrorCode::NoCluster);
@@ -293,6 +293,36 @@ TEST_CASE("A node that holds no cluster key proves nothing, and says which flag 
     auto const lines = logger.Snapshot();
     CHECK(std::ranges::any_of(lines, [](CapturingLogger::Record const& record) {
         return record.level == LogLevel::Warn && record.message.contains("no such file or directory");
+    }));
+}
+
+TEST_CASE("A challenge this node cannot draw is refused as NoCluster, uncounted, and said", "[node][proof]")
+{
+    // Never a nonce from anywhere weaker (#1527). `NoCluster` for the key file's reason: the
+    // caller did nothing wrong, and a caller reading it goes on being judged by its address.
+    // Uncounted -- every node-proof counter describes a CALLER -- and the Error is where the
+    // seam's own failure is named.
+    AtomicMetricsSink metrics;
+    CapturingLogger logger;
+    Testing::ScriptedClusterKey const key { RightKey };
+    Testing::ScriptedSecureRandom denied { Testing::ScriptedSecureRandom::DeniedFailure() };
+    NodeProofResponder prover { key, denied, metrics, logger };
+
+    auto const refused = prover.IssueChallenge();
+
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(denied.FillCount() == 1);
+    CHECK(ErrorOf(refused.error()) == Wire::ErrorCode::NoCluster);
+    for (auto const counter: { IMetricsSink::Counter::NodeProofsAccepted,
+                               IMetricsSink::Counter::NodeProofsRejected,
+                               IMetricsSink::Counter::NodeProofsMalformed,
+                               IMetricsSink::Counter::NodeProofsUnchallenged })
+        CHECK(metrics.Read(counter) == 0);
+
+    auto const lines = logger.Snapshot();
+    CHECK(std::ranges::any_of(lines, [](CapturingLogger::Record const& record) {
+        return record.level == LogLevel::Error
+               && record.message.contains(Testing::ScriptedSecureRandom::DeniedFailure().primitive);
     }));
 }
 
@@ -375,7 +405,7 @@ TEST_CASE("A node holding no cluster key refuses the whole node-proof family by 
 
     // The control: with a prover, the family is served and the door admits it.
     Testing::ScriptedClusterKey key { RightKey };
-    Testing::FixedRandomSource random;
+    Testing::ScriptedSecureRandom random { Testing::FixedChallengeScript() };
     NodeProofResponder prover { key, random, metrics, logger };
     MergedResponder served { SurfaceComponents { .scheduler = &scheduler, .nodeProof = &prover } };
     CHECK(served.NodeProver() == &prover);

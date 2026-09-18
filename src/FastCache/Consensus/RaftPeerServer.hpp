@@ -9,7 +9,7 @@
 #include <FastCache/Consensus/RaftTypes.hpp>
 #include <FastCache/Consensus/RaftWire.hpp>
 #include <FastCache/Core/Clock.hpp>
-#include <FastCache/Core/IRandomSource.hpp>
+#include <FastCache/Core/ISecureRandom.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Net/IListener.hpp>
@@ -137,7 +137,8 @@ class RaftPeerServer
     /// @param credential What a peer's proof is checked against, and what this node's
     ///        verdicts are signed with.
     /// @param self This node's id: the member a dialler must have meant.
-    /// @param random Where each connection's challenge nonce comes from.
+    /// @param random Where each connection's challenge nonce comes from. A connection this
+    ///        node cannot draw one for is closed before it is challenged (#1527).
     /// @param options Frame, connection and handshake limits.
     RaftPeerServer(IListener& listener,
                    IReactor& reactor,
@@ -146,7 +147,7 @@ class RaftPeerServer
                    IMetricsSink& metrics,
                    IRaftPeerCredential const& credential,
                    NodeId self,
-                   IRandomSource& random,
+                   ISecureRandom& random,
                    PeerServerOptions options = {});
 
     /// Accept loop; returns when the listener is closed via `Shutdown()`.
@@ -231,6 +232,18 @@ class RaftPeerServer
                            std::string_view dialler,
                            std::string_view detail);
 
+    /// Say that a connection was closed unchallenged because no nonce could be drawn, at most
+    /// once per `PreAuthReportInterval`.
+    ///
+    /// **Not an `AcceptorRefusal`, and it moves no counter**: every row there names something
+    /// about the PEER to go and fix, and this names nothing about it -- the fault is this
+    /// host's generator, and it is every connection from every peer. So it is the transport's
+    /// "cannot prove the key" line one end over: an Error naming the cause, throttled because
+    /// anything that can reach the port provokes it.
+    /// @param peer The address the connection came from.
+    /// @param error Why the draw failed.
+    void NoteNoNonce(std::string_view peer, SecureRandomError const& error);
+
     IListener& _listener;
     IReactor& _reactor;
     IRaftMessageSink& _sink;
@@ -238,7 +251,7 @@ class RaftPeerServer
     IMetricsSink& _metrics;
     IRaftPeerCredential const& _credential;
     NodeId _self;
-    IRandomSource& _random;
+    ISecureRandom& _random;
     PeerServerOptions _options;
 
     OpenConnections _open;
@@ -258,13 +271,17 @@ class RaftPeerServer
     std::atomic<std::uint64_t> _skipped { 0 };
     std::atomic<std::uint64_t> _delivered { 0 };
 
-    /// Guards `_nextPreAuthReport`. The connection tasks share the reactor's thread,
-    /// but a test drives the accept loop from its own, and a lock costs nothing at a
-    /// rate bounded by the throttle it guards.
+    /// Guards `_nextPreAuthReport` and `_nextNoNonceReport`. The connection tasks share the
+    /// reactor's thread, but a test drives the accept loop from its own, and a lock costs
+    /// nothing at a rate bounded by the throttle it guards.
     std::mutex _reportMutex;
 
     /// When the next pre-authentication refusal may be logged.
     TimePoint _nextPreAuthReport {};
+
+    /// When the next connection closed for want of a nonce may be logged. Its own throttle,
+    /// so a stranger provoking refusals cannot keep the line that names THIS host's fault quiet.
+    TimePoint _nextNoNonceReport {};
 };
 
 } // namespace FastCache::Consensus

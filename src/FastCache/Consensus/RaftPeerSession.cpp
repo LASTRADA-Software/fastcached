@@ -130,10 +130,18 @@ namespace
     }
 } // namespace
 
-AcceptorHandshake::AcceptorHandshake(IRaftPeerCredential const& credential, NodeId self, IRandomSource& random):
+std::expected<AcceptorHandshake, SecureRandomError> AcceptorHandshake::Create(IRaftPeerCredential const& credential,
+                                                                              NodeId self,
+                                                                              ISecureRandom& random)
+{
+    return DrawNonce(random).transform(
+        [&](Nonce const& nonce) { return AcceptorHandshake { credential, std::move(self), nonce }; });
+}
+
+AcceptorHandshake::AcceptorHandshake(IRaftPeerCredential const& credential, NodeId self, Nonce const& nonce):
     _credential { credential },
     _self { std::move(self) },
-    _challenge { .nonce = DrawNonce(random) }
+    _challenge { .nonce = nonce }
 {
 }
 
@@ -172,11 +180,20 @@ AcceptorHandshake::Judgement AcceptorHandshake::Judge(RaftWire::ProofFrame const
     };
 }
 
-DiallerHandshake::DiallerHandshake(IRaftPeerCredential const& credential, NodeId self, NodeId target, IRandomSource& random):
+std::expected<DiallerHandshake, SecureRandomError> DiallerHandshake::Create(IRaftPeerCredential const& credential,
+                                                                            NodeId self,
+                                                                            NodeId target,
+                                                                            ISecureRandom& random)
+{
+    return DrawNonce(random).transform(
+        [&](Nonce const& nonce) { return DiallerHandshake { credential, std::move(self), std::move(target), nonce }; });
+}
+
+DiallerHandshake::DiallerHandshake(IRaftPeerCredential const& credential, NodeId self, NodeId target, Nonce const& nonce):
     _credential { credential },
     _self { std::move(self) },
     _target { std::move(target) },
-    _nonce { DrawNonce(random) }
+    _nonce { nonce }
 {
 }
 

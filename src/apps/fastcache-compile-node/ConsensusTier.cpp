@@ -198,9 +198,8 @@ ConsensusTier::ConsensusTier(Cluster::ClusterMember self,
     _logger { logger },
     _storage { std::move(storage) },
     // Unseeded, so two nodes started together do not draw the same election timeout and
-    // split the vote round after round -- nor the same handshake nonce. The seeded
-    // constructor exists so a failure can be replayed, and nothing replays a production
-    // node.
+    // split the vote round after round. The seeded constructor exists so a failure can be
+    // replayed, and nothing replays a production node. Handshake nonces are `_nonces`'s.
     _random { std::make_unique<SystemRandomSource>() },
     _metrics { metrics },
     _credential { std::move(credential) },
@@ -408,7 +407,7 @@ std::expected<void, std::string> ConsensusTier::Launch(NodeConfig const& cfg,
     auto ids = _bootstrapIds;
 
     _transport = std::make_unique<Consensus::RaftPeerTransport>(
-        cfg.nodeId, std::move(peers), _reactor, *_connector, _logger, _metrics, *_credential, *_random);
+        cfg.nodeId, std::move(peers), _reactor, *_connector, _logger, _metrics, *_credential, _nonces);
 
     auto recovered = _storage.Load();
     if (!recovered.has_value())
@@ -451,7 +450,7 @@ std::expected<void, std::string> ConsensusTier::Launch(NodeConfig const& cfg,
 
     _sink = std::make_unique<DriverSink>(*_driver, _logger);
     _peerServer = std::make_unique<Consensus::RaftPeerServer>(
-        *_listener, _reactor, *_sink, _logger, _metrics, *_credential, cfg.nodeId, *_random);
+        *_listener, _reactor, *_sink, _logger, _metrics, *_credential, cfg.nodeId, _nonces);
 
     // Both loops on ONE reactor, and neither through `SyncRun`: that function
     // resumes a coroutine exactly once and throws when it is still suspended, so a

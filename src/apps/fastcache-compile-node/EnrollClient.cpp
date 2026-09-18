@@ -495,7 +495,7 @@ std::expected<void, std::string> StoreClusterKey(std::filesystem::path const& pa
 
 std::expected<std::string, std::string> RunEnrollClient(NodeConfig const& cfg,
                                                         ICredentialSource const& credential,
-                                                        IRandomSource& random,
+                                                        ISecureRandom& random,
                                                         IDrainWait& wait,
                                                         IEndpointDialer& dialer)
 {

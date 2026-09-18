@@ -4,7 +4,7 @@
 #include <FastCache/Cluster/DiscoveryWire.hpp>
 #include <FastCache/Cluster/PeerDirectory.hpp>
 #include <FastCache/Core/Clock.hpp>
-#include <FastCache/Core/IRandomSource.hpp>
+#include <FastCache/Core/ISecureRandom.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Core/SecureBytes.hpp>
 #include <FastCache/Net/IDatagramSocket.hpp>
@@ -62,6 +62,7 @@ enum class DiscoveryEvent : std::uint8_t
     Closed,            ///< The socket was shut down.
     Ignored,           ///< Not ours, malformed, or for another cluster.
     PeerSeen,          ///< A beacon was recorded; a challenge went out.
+    ChallengeWithheld, ///< A beacon was recorded, but no nonce could be drawn, so no challenge went out.
     ChallengeAnswered, ///< A challenge arrived and was answered with a proof.
     PeerAuthenticated, ///< A proof checked out; the peer may now be proposed.
     ProofRejected,     ///< A proof did not check out, and was discarded.
@@ -105,9 +106,16 @@ class DiscoveryService
     /// interval, so an operator who looks at any minute of the log sees it.
     static constexpr std::chrono::seconds UnnameableReportInterval { 60 };
 
+    /// How often a challenge withheld for want of a nonce is reported, at most.
+    ///
+    /// Throttled for `UnnameableReportInterval`'s reason: a beacon provokes it, and anything
+    /// on the segment can send one. What it reports is this host's own generator failing, so
+    /// every beacon from every peer provokes it until that is fixed (#1527).
+    static constexpr std::chrono::seconds NoNonceReportInterval { 60 };
+
     DiscoveryService(IDatagramSocket& socket,
                      IClock& clock,
-                     IRandomSource& random,
+                     ISecureRandom& random,
                      PeerDirectory& directory,
                      DiscoveryConfig config,
                      ILogger& logger);
@@ -143,11 +151,13 @@ class DiscoveryService
     /// Ask a peer to prove it holds the key.
     /// @param peer Who to challenge.
     /// @param replyTo Where to send it.
-    void IssueChallenge(DiscoveryWire::Beacon const& peer, DatagramAddress const& replyTo);
+    /// @return Whether a challenge went out: false when no nonce could be drawn, which is
+    ///         reported here and leaves any earlier challenge to that peer as it was.
+    [[nodiscard]] bool IssueChallenge(DiscoveryWire::Beacon const& peer, DatagramAddress const& replyTo);
 
     IDatagramSocket& _socket;
     IClock& _clock;
-    IRandomSource& _random;
+    ISecureRandom& _random;
     PeerDirectory& _directory;
     DiscoveryConfig _config;
     ILogger& _logger;
@@ -167,6 +177,10 @@ class DiscoveryService
     /// Value-initialized so the first one always is: the epoch is behind any clock
     /// this runs on, including a `ManualClock` that has never been advanced.
     TimePoint _nextUnnameableReport {};
+
+    /// When a challenge withheld for want of a nonce may next be reported; value-initialized
+    /// for the reason `_nextUnnameableReport` is.
+    TimePoint _nextNoNonceReport {};
 };
 
 } // namespace FastCache::Cluster

@@ -152,7 +152,15 @@ Task<std::optional<ProvenPeer>> PeerServerAccess::Handshake(RaftPeerServer* self
         return std::nullopt;
     };
 
-    AcceptorHandshake handshake { self->_credential, self->_self, self->_random };
+    // Drawn before anything is written: a connection this node cannot challenge with a fresh
+    // nonce is one it must not challenge at all (#1527), so it is closed unchallenged.
+    auto begun = AcceptorHandshake::Create(self->_credential, self->_self, self->_random);
+    if (!begun.has_value())
+    {
+        self->NoteNoNonce(peer, begun.error());
+        co_return std::nullopt;
+    }
+    auto& handshake = *begun;
 
     // FIRST, before a byte is read. The challenge is what makes a proof unreplayable,
     // and it costs a stranger nothing it could use: a nonce is not signed by anything.
@@ -358,7 +366,7 @@ RaftPeerServer::RaftPeerServer(IListener& listener,
                                IMetricsSink& metrics,
                                IRaftPeerCredential const& credential,
                                NodeId self,
-                               IRandomSource& random,
+                               ISecureRandom& random,
                                PeerServerOptions options):
     _listener { listener },
     _reactor { reactor },
@@ -392,6 +400,24 @@ void RaftPeerServer::NotePreAuthRefusal(AcceptorRefusal refusal, std::string_vie
                             row.says,
                             detail.empty() ? "" : ": ",
                             detail));
+}
+
+void RaftPeerServer::NoteNoNonce(std::string_view peer, SecureRandomError const& error)
+{
+    {
+        auto const guard = std::scoped_lock { _reportMutex };
+        auto const now = _reactor.Clock().Now();
+        if (now < _nextNoNonceReport)
+            return;
+        _nextNoNonceReport = now + PreAuthReportInterval;
+    }
+
+    _logger.Log(LogLevel::Error,
+                std::format("raft: closed the peer connection from {} without challenging it, because this node "
+                            "cannot draw a handshake nonce: {}. Every peer connection fails this way until it can; "
+                            "the fault is this host's, not the peer's (this line repeats at most once a minute)",
+                            peer,
+                            error.ToString()));
 }
 
 void RaftPeerServer::NoteProvenRefusal(AcceptorRefusal refusal,

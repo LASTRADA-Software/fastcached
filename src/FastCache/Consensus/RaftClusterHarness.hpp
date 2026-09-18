@@ -9,6 +9,7 @@
 #include <FastCache/Consensus/RaftWire.hpp>
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/IRandomSource.hpp>
+#include <FastCache/Core/ISecureRandom.hpp>
 
 #include <algorithm>
 #include <chrono>
@@ -332,7 +333,14 @@ class RaftClusterHarness
 
     /// Every handshake nonce. A source apart from `_network`, so authenticating a
     /// message draws nothing an existing seed's delays and losses depended on.
-    SystemRandomSource _nonces { 0x0A11CE };
+    ///
+    /// The operating system's generator, the one production draws from (#1527), and
+    /// NOT a seeded engine: that is what a nonce is now made of, and an engine here
+    /// would be the one place left that still spelled a nonce the old way. Determinism
+    /// does not suffer, because a nonce's VALUE decides nothing -- every MAC over it
+    /// verifies under the right key and fails under any other whatever the bytes are --
+    /// so a run is still a function of its seeds alone.
+    SystemSecureRandom _nonces;
 
     /// What each member and each plain `Join` proves the key with.
     CredentialFactory _credentials;
@@ -502,9 +510,14 @@ inline std::optional<RaftMessage> RaftClusterHarness::Authenticate(InFlight cons
     auto const& sender = Find(message.from);
     auto const& receiver = Find(message.to);
 
-    // The receiver is the acceptor: it challenges before it has read anything.
-    AcceptorHandshake acceptor { *receiver.credential, receiver.id, _nonces };
-    DiallerHandshake dialler { *sender.credential, sender.id, receiver.id, _nonces };
+    // The receiver is the acceptor: it challenges before it has read anything. A nonce
+    // that cannot be drawn is a delivery refused, as it is a connection closed on the wire.
+    auto acceptorBegun = AcceptorHandshake::Create(*receiver.credential, receiver.id, _nonces);
+    auto diallerBegun = DiallerHandshake::Create(*sender.credential, sender.id, receiver.id, _nonces);
+    if (!acceptorBegun.has_value() || !diallerBegun.has_value())
+        return std::nullopt;
+    auto& acceptor = *acceptorBegun;
+    auto& dialler = *diallerBegun;
 
     auto const proof = dialler.Answer(acceptor.Challenge());
     if (!proof.has_value())

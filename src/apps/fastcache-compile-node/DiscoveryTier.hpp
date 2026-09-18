@@ -8,7 +8,7 @@
 #include <FastCache/Cluster/MembershipPolicy.hpp>
 #include <FastCache/Cluster/PeerDirectory.hpp>
 #include <FastCache/Core/Clock.hpp>
-#include <FastCache/Core/IRandomSource.hpp>
+#include <FastCache/Core/ISecureRandom.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Core/SecureBytes.hpp>
 #include <FastCache/Net/IDatagramSocket.hpp>
@@ -157,7 +157,7 @@ class DiscoveryTier
     // below it -- the reference chain the other tiers own for the same reason.
     std::unique_ptr<IDatagramSocket> _socket;
     SteadyClock _clock;
-    std::unique_ptr<IRandomSource> _random;
+    std::unique_ptr<ISecureRandom> _random;
     Cluster::PeerDirectory _directory;
     std::chrono::seconds _beaconInterval;
     TimePoint _nextBeacon;
