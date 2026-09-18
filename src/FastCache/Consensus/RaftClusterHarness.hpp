@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#include <FastCache/Consensus/IRaftPeerCredential.hpp>
+#include <FastCache/Consensus/IRaftPeerIdentity.hpp>
 #include <FastCache/Consensus/InMemoryRaftStorage.hpp>
 #include <FastCache/Consensus/RaftDriver.hpp>
 #include <FastCache/Consensus/RaftOutput.hpp>
@@ -10,6 +10,7 @@
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/IRandomSource.hpp>
 #include <FastCache/Core/ISecureRandom.hpp>
+#include <FastCache/Core/SessionSeal.hpp>
 #include <FastCache/Core/WireFields.hpp>
 
 #include <algorithm>
@@ -55,32 +56,39 @@ namespace FastCache::Consensus
 /// network decision comes from an injected `IRandomSource`, so a failure is
 /// reproducible from its seed rather than being a flake to re-run.
 ///
-/// ## Every message proves the key (#1308)
+/// ## Every message proves who sent it (#1308, #178)
 ///
-/// Each delivery runs the peer wire's whole exchange between the sender's credential and
-/// the receiver's -- challenge, proof, verdict, a sealed frame opened at the other end --
-/// through the SAME `RaftPeerSession` objects the production transport and server drive,
-/// and the receiver is handed what it decoded rather than what was sent. One session per
-/// message rather than per link: the harness has no connections, and a session that
-/// outlived a partition or a restart would be a property of the harness, not of the wire.
+/// Each delivery runs the peer wire's whole exchange between the sender's identity and
+/// the receiver's -- challenge, proof, verdict, a frame sealed under the key the two agreed
+/// and opened at the other end -- through the SAME `RaftPeerSession` objects the production
+/// transport and server drive, and the receiver is handed what it decoded rather than what
+/// was sent. One session per message rather than per link: the harness has no connections,
+/// and a session that outlived a partition or a restart would be a property of the harness,
+/// not of the wire.
 ///
-/// So a cluster formed here is one whose every message was authenticated, and a node
-/// holding the wrong key -- or none -- is a case (`Intrude`, `Join` with a credential)
-/// rather than a caveat. The credential is REQUIRED at construction: a harness that
-/// defaulted one would let a case forget the key and still read as a cluster that forms.
-/// Nonces come from a source of their own, so adding the handshake moved none of the
-/// delay and loss draws an existing seed produces.
+/// So a cluster formed here is one whose every message was signed by the member it names,
+/// and a machine that is not that member -- claiming an id whose key it does not hold, or
+/// holding a key the roster revoked -- is a case (`Intrude`, `Join` with an identity) rather
+/// than a caveat. The identity factory is REQUIRED at construction: a harness that defaulted
+/// one would let a case forget who its members are and still read as a cluster that forms.
+/// Nonces and ephemeral keys come from a source of their own, so adding the handshake moved
+/// none of the delay and loss draws an existing seed produces.
+///
+/// A machine's NAME on this network and the id it proves are two things, and are the same
+/// for every honest member: messages are routed by name, and the node inside runs as the id
+/// its identity proves. That is what lets `Intrude` put a machine on the network that CLAIMS
+/// an existing member's id, which a network keyed by one of them could not express.
 class RaftClusterHarness
 {
   public:
     /// One node's whole world: its storage, its transport, and what it applied.
     struct Member;
 
-    /// Makes the credential a member proves the cluster key with.
-    using CredentialFactory = std::function<std::unique_ptr<IRaftPeerCredential const>(NodeId const& who)>;
+    /// Makes the identity a member proves itself with, as sender and as receiver.
+    using IdentityFactory = std::function<std::unique_ptr<IRaftPeerIdentity const>(NodeId const& who)>;
 
     /// @param members Every node in the cluster, each one a voter.
-    /// @param credentials What each member, and each later `Join`, proves the key with.
+    /// @param identities Who each member, and each later `Join`, is.
     /// @param seedOffset Staggers each node's election timer draws, so a cluster
     ///        whose members all draw identically does not split its vote forever.
     /// @param compaction When every node trims its log into a snapshot; never by
@@ -88,7 +96,7 @@ class RaftClusterHarness
     ///        snapshot names a threshold, and every node -- restarted or joined later --
     ///        runs with it.
     RaftClusterHarness(std::vector<NodeId> members,
-                       CredentialFactory credentials,
+                       IdentityFactory identities,
                        std::uint64_t seedOffset = 1,
                        CompactionPolicy compaction = {});
 
@@ -98,11 +106,11 @@ class RaftClusterHarness
     /// as its bootstrap -- which is how a learner a configuration names on its own
     /// command line comes up.
     /// @param configuration The voters and the learners.
-    /// @param credentials What each member, and each later `Join`, proves the key with.
+    /// @param identities Who each member, and each later `Join`, is.
     /// @param seedOffset As for the other constructor.
     /// @param compaction As for the other constructor.
     RaftClusterHarness(Configuration configuration,
-                       CredentialFactory credentials,
+                       IdentityFactory identities,
                        std::uint64_t seedOffset = 1,
                        CompactionPolicy compaction = {});
 
@@ -163,23 +171,28 @@ class RaftClusterHarness
     /// @param who The new node's id; must not already exist.
     void Join(NodeId const& who);
 
-    /// `Join`, with a credential of the case's choosing rather than the cluster's.
+    /// `Join`, with an identity of the case's choosing rather than the cluster's.
     ///
-    /// The joiner an operator admitted by id and gave the wrong key file: the leader's
-    /// configuration names it, and nothing it is sent may reach it.
-    /// @param who The new node's id; must not already exist.
-    /// @param credential What it proves the key with.
-    void Join(NodeId const& who, std::unique_ptr<IRaftPeerCredential const> credential);
+    /// The joiner an operator admitted by id whose key the roster does not hold: the
+    /// leader's configuration names it, and nothing it is sent may reach it.
+    /// @param who The new node's name on the network; must not already exist.
+    /// @param identity Who it proves itself as, and with which key.
+    void Join(NodeId const& who, std::unique_ptr<IRaftPeerIdentity const> identity);
 
-    /// Put a machine on the network that claims membership and does not hold the key.
+    /// Put a machine on the network that claims membership and cannot prove it.
     ///
-    /// Bootstrapped with every member AND itself, so it campaigns: its election timer
-    /// expires and it asks every member for a vote, which is the traffic an intruder
-    /// that could be heard would use to disrupt a cluster. It is not added to the
-    /// harness's member list, and nothing counts it towards a quorum.
-    /// @param who Its id; must not already exist.
-    /// @param credential What it presents instead of the cluster key.
-    void Intrude(NodeId const& who, std::unique_ptr<IRaftPeerCredential const> credential);
+    /// Bootstrapped with every member AND the id it claims, so it campaigns: its election
+    /// timer expires and it asks every member for a vote, which is the traffic an intruder
+    /// that could be heard would use to disrupt a cluster. It is not added to the harness's
+    /// member list, and nothing counts it towards a quorum.
+    ///
+    /// The id it runs as is its IDENTITY's, which may be an existing member's: a machine
+    /// holding every byte it ever held, claiming the id of a member whose key it does not
+    /// hold. Messages addressed to that id still reach the member, since the network routes
+    /// by name.
+    /// @param who Its name on the network; must not already exist.
+    /// @param identity What it proves itself as.
+    void Intrude(NodeId const& who, std::unique_ptr<IRaftPeerIdentity const> identity);
 
     /// How many messages addressed to a node were refused before reaching it.
     /// @param who The receiver.
@@ -236,8 +249,9 @@ class RaftClusterHarness
         /// happens to draw.
         std::unique_ptr<SystemRandomSource> random;
 
-        /// What this node proves the cluster key with, as sender and as receiver.
-        std::unique_ptr<IRaftPeerCredential const> credential;
+        /// Who this node proves itself as, as sender and as receiver; the id its Raft node
+        /// runs as is this identity's.
+        std::unique_ptr<IRaftPeerIdentity const> identity;
 
         std::unique_ptr<InMemoryRaftStorage> storage;
         std::unique_ptr<IRaftTransport> transport;
@@ -403,10 +417,10 @@ class RaftClusterHarness
     /// and `Join`. Two copies would let the next per-node collaborator be wired
     /// into bootstrap nodes and silently absent from joiners — a difference in
     /// exactly the dimension this harness exists to compare.
-    /// @param who The node's id.
+    /// @param who The node's name on the network.
     /// @param bootstrap Its bootstrap configuration; empty for a joiner.
-    /// @param credential What it proves the key with.
-    void AddNode(NodeId const& who, Configuration bootstrap, std::unique_ptr<IRaftPeerCredential const> credential);
+    /// @param identity Who it proves itself as.
+    void AddNode(NodeId const& who, Configuration bootstrap, std::unique_ptr<IRaftPeerIdentity const> identity);
 
     /// Refuse a second node under an id already on the network.
     /// @param who The id about to be added.
@@ -416,7 +430,7 @@ class RaftClusterHarness
     ///
     /// Every step the production ends take, in their order, with their objects: a
     /// failure at any of them is a refusal, and only a message that decoded from a
-    /// frame the receiver opened -- naming the sender that proved the key -- is
+    /// frame the receiver opened -- naming the sender that proved its id -- is
     /// delivered.
     /// @param message The message, with its sender and receiver.
     /// @return What the receiver decoded, or nullopt when the exchange refused it.
@@ -445,19 +459,21 @@ class RaftClusterHarness
     /// from the same seed rather than being a flake to re-run.
     SystemRandomSource _network { 0x5EED };
 
-    /// Every handshake nonce. A source apart from `_network`, so authenticating a
-    /// message draws nothing an existing seed's delays and losses depended on.
+    /// Every handshake nonce and ephemeral key. A source apart from `_network`, so
+    /// authenticating a message draws nothing an existing seed's delays and losses depended
+    /// on.
     ///
     /// The operating system's generator, the one production draws from (#1527), and
     /// NOT a seeded engine: that is what a nonce is now made of, and an engine here
     /// would be the one place left that still spelled a nonce the old way. Determinism
-    /// does not suffer, because a nonce's VALUE decides nothing -- every MAC over it
-    /// verifies under the right key and fails under any other whatever the bytes are --
-    /// so a run is still a function of its seeds alone.
+    /// does not suffer, because a nonce's VALUE decides nothing -- every signature over it
+    /// verifies under the signer's key and under no other, and every session key agreed from
+    /// it is shared by exactly the two ends, whatever the bytes are -- so a run is still a
+    /// function of its seeds alone.
     SystemSecureRandom _nonces;
 
-    /// What each member and each plain `Join` proves the key with.
-    CredentialFactory _credentials;
+    /// Who each member and each plain `Join` is.
+    IdentityFactory _identities;
 
     /// Refused deliveries, by receiver.
     std::map<NodeId, std::uint64_t> _refusedAt;
@@ -511,20 +527,20 @@ class RaftClusterHarness
 // translation unit here would never be compiled.
 
 inline RaftClusterHarness::RaftClusterHarness(std::vector<NodeId> members,
-                                              CredentialFactory credentials,
+                                              IdentityFactory identities,
                                               std::uint64_t seedOffset,
                                               CompactionPolicy compaction):
     RaftClusterHarness {
-        Configuration { .voters = std::move(members), .learners = {} }, std::move(credentials), seedOffset, compaction
+        Configuration { .voters = std::move(members), .learners = {} }, std::move(identities), seedOffset, compaction
     }
 {
 }
 
 inline RaftClusterHarness::RaftClusterHarness(Configuration configuration,
-                                              CredentialFactory credentials,
+                                              IdentityFactory identities,
                                               std::uint64_t seedOffset,
                                               CompactionPolicy compaction):
-    _credentials { std::move(credentials) },
+    _identities { std::move(identities) },
     _seedOffset { seedOffset },
     _compaction { compaction },
     _members { std::move(configuration) }
@@ -534,16 +550,16 @@ inline RaftClusterHarness::RaftClusterHarness(Configuration configuration,
     // existed, so no existing case's schedule moved.
     for (auto const* const set: { &_members.voters, &_members.learners })
         for (auto const& id: *set)
-            AddNode(id, _members, _credentials(id));
+            AddNode(id, _members, _identities(id));
 }
 
 inline void RaftClusterHarness::AddNode(NodeId const& who,
                                         Configuration bootstrap,
-                                        std::unique_ptr<IRaftPeerCredential const> credential)
+                                        std::unique_ptr<IRaftPeerIdentity const> identity)
 {
     auto member = std::make_unique<Member>();
     member->id = who;
-    member->credential = std::move(credential);
+    member->identity = std::move(identity);
     member->storage = std::make_unique<InMemoryRaftStorage>();
     member->transport = std::make_unique<QueueingTransport>(*this, member->id);
     member->machine = std::make_unique<RecordingMachine>(*this, member->id);
@@ -557,7 +573,7 @@ inline void RaftClusterHarness::AddNode(NodeId const& who,
     member->random = std::make_unique<SystemRandomSource>((_seedOffset * 1000) + _nodes.size());
     member->bootstrap = std::move(bootstrap);
 
-    auto node = RaftNode::Create(ConfigFor(member->id, member->bootstrap), *member->random, _clock.Now());
+    auto node = RaftNode::Create(ConfigFor(member->identity->Self(), member->bootstrap), *member->random, _clock.Now());
 
     // A node that has never run recovered nothing, so nothing can be refused; one that
     // was is this harness broken, not an outcome for a case to assert.
@@ -722,8 +738,9 @@ inline std::optional<RaftMessage> RaftClusterHarness::Authenticate(InFlight cons
 
     // The receiver is the acceptor: it challenges before it has read anything. A nonce
     // that cannot be drawn is a delivery refused, as it is a connection closed on the wire.
-    auto acceptorBegun = AcceptorHandshake::Create(*receiver.credential, receiver.id, _nonces);
-    auto diallerBegun = DiallerHandshake::Create(*sender.credential, sender.id, receiver.id, _nonces);
+    // The sender dials the id it ADDRESSED, which is the member it believes it is talking to.
+    auto acceptorBegun = AcceptorHandshake::Create(*receiver.identity, _nonces);
+    auto diallerBegun = DiallerHandshake::Create(*sender.identity, message.to, _nonces);
     if (!acceptorBegun.has_value() || !diallerBegun.has_value())
         return std::nullopt;
     auto& acceptor = *acceptorBegun;
@@ -733,23 +750,22 @@ inline std::optional<RaftMessage> RaftClusterHarness::Authenticate(InFlight cons
     if (!proof.has_value())
         return std::nullopt;
 
-    auto const judgement = acceptor.Judge(*proof);
-    if (judgement.outcome != ProofOutcome::Accepted || !judgement.verdict.has_value())
+    auto judgement = acceptor.Judge(*proof);
+    if (judgement.outcome != ProofOutcome::Accepted || !judgement.verdict.has_value() || !judgement.session.has_value())
         return std::nullopt;
 
-    auto const conclusion = dialler.Conclude(*judgement.verdict);
-    if (conclusion.outcome != VerdictOutcome::Accepted)
+    auto conclusion = dialler.Conclude(*judgement.verdict);
+    if (conclusion.outcome != VerdictOutcome::Accepted || !conclusion.session.has_value())
         return std::nullopt;
 
-    // Each end seals and opens under the nonces IT concluded with, so a disagreement
-    // about the session is a refused frame here exactly as it is on a connection.
+    // Each end seals and opens under the key IT agreed, so a disagreement about the
+    // session is a refused frame here exactly as it is on a connection.
     auto const frame = RaftWire::Encode(message.message);
-    auto const tag = FrameSealer { *sender.credential, conclusion.nonces }.Seal(frame);
-
     auto const bytes = std::span<std::byte const> { frame };
     auto const header = bytes.first(RaftWire::HeaderSize);
     auto const payload = bytes.subspan(RaftWire::HeaderSize);
-    if (!FrameOpener { *receiver.credential, judgement.nonces }.Open(header, payload, tag))
+    auto const tag = FrameSealer { *std::move(conclusion.session) }.Seal(header, payload);
+    if (!FrameOpener { *std::move(judgement.session) }.Open(header, payload, tag))
         return std::nullopt;
 
     auto const decodedHeader = RaftWire::DecodeHeader(header);
@@ -1067,8 +1083,8 @@ inline std::expected<void, ConsensusError> RaftClusterHarness::Restart(NodeId co
     if (!recovered.has_value())
         return std::unexpected { std::move(recovered).error() };
 
-    auto node =
-        RaftNode::Create(ConfigFor(member.id, member.bootstrap), *member.random, _clock.Now(), std::move(recovered).value());
+    auto node = RaftNode::Create(
+        ConfigFor(member.identity->Self(), member.bootstrap), *member.random, _clock.Now(), std::move(recovered).value());
     if (!node.has_value())
         return std::unexpected { std::move(node).error() };
     return BuildDriver(member, std::move(node).value());
@@ -1083,26 +1099,29 @@ inline void RaftClusterHarness::RequireNew(NodeId const& who) const
 
 inline void RaftClusterHarness::Join(NodeId const& who)
 {
-    Join(who, _credentials(who));
+    Join(who, _identities(who));
 }
 
-inline void RaftClusterHarness::Join(NodeId const& who, std::unique_ptr<IRaftPeerCredential const> credential)
+inline void RaftClusterHarness::Join(NodeId const& who, std::unique_ptr<IRaftPeerIdentity const> identity)
 {
     RequireNew(who);
 
     // The same construction every bootstrap node gets, differing in exactly one
     // thing: no bootstrap set. Anything else that differed would be a difference in
     // the very dimension this harness exists to compare.
-    AddNode(who, {}, std::move(credential));
+    AddNode(who, {}, std::move(identity));
 }
 
-inline void RaftClusterHarness::Intrude(NodeId const& who, std::unique_ptr<IRaftPeerCredential const> credential)
+inline void RaftClusterHarness::Intrude(NodeId const& who, std::unique_ptr<IRaftPeerIdentity const> identity)
 {
     RequireNew(who);
 
+    // The id it CLAIMS joins its bootstrap set -- unless it is a member's, which is already
+    // there, and a configuration naming one id twice is not one `RaftNode::Create` accepts.
     auto bootstrap = _members;
-    bootstrap.voters.push_back(who);
-    AddNode(who, std::move(bootstrap), std::move(credential));
+    if (std::ranges::find(bootstrap.voters, identity->Self()) == bootstrap.voters.end())
+        bootstrap.voters.push_back(identity->Self());
+    AddNode(who, std::move(bootstrap), std::move(identity));
 }
 
 } // namespace FastCache::Consensus

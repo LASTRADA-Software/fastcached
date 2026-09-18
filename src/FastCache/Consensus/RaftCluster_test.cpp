@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-#include <FastCache/Cluster/PskRaftPeerCredential.hpp>
 #include <FastCache/Consensus/RaftClusterHarness.hpp>
 #include <FastCache/Core/Bytes.hpp>
-#include <FastCache/Core/SecureBytes.hpp>
 #include <FastCache/Core/WireFields.hpp>
 
 #include <catch2/catch_test_macros.hpp>
@@ -22,6 +20,7 @@
 #include <utility>
 #include <vector>
 
+#include <tests/RaftPeerKeyFakes.hpp>
 #include <tests/Unwrap.hpp>
 
 using namespace FastCache;
@@ -32,44 +31,42 @@ using FastCache::Testing::Unwrap;
 namespace
 {
 
-/// The key every member of every cluster in this file holds.
-/// @param who Which member; every one gets the same key.
-/// @return Its credential.
-[[nodiscard]] std::unique_ptr<IRaftPeerCredential const> ClusterKey(NodeId const& who)
+/// Every machine any case in this file starts, each under its own key: the roster a member
+/// holds. Joiners are on it too, which is what an operator admitting them with their key does.
+/// @return A fresh roster, so a case that revokes changes nobody else's.
+[[nodiscard]] std::shared_ptr<Testing::SharedRoster> Roster()
 {
-    std::ignore = who;
-    return std::make_unique<Cluster::PskRaftPeerCredential const>(SecureByteBuffer(32, std::byte { 0x5A }));
+    return Testing::SharedRoster::Of({ "n1", "n2", "n3", "n4", "n5" });
 }
 
-/// A key that is not the cluster's.
-/// @return Its credential.
-[[nodiscard]] std::unique_ptr<IRaftPeerCredential const> StrangerKey()
+/// Who each member of a cluster in this file is: itself, under its own key, over @p roster.
+/// @param roster What every member believes about everybody's keys.
+/// @return The factory the harness requires.
+[[nodiscard]] RaftClusterHarness::IdentityFactory MembersOf(std::shared_ptr<Testing::SharedRoster const> roster)
 {
-    return std::make_unique<Cluster::PskRaftPeerCredential const>(SecureByteBuffer(32, std::byte { 0x33 }));
+    return [roster = std::move(roster)](NodeId const& who) -> std::unique_ptr<IRaftPeerIdentity const> {
+        return Testing::TestPeerIdentity::Honest(who, roster);
+    };
 }
 
-/// What a machine holding NO key can present: a tag of zeroes, and a check of every
-/// tag it is shown that nothing passes.
-class NoKey final: public IRaftPeerCredential
+/// The ordinary cluster: every member honest, over a roster of its own.
+/// @return The factory the harness requires.
+[[nodiscard]] RaftClusterHarness::IdentityFactory Members()
 {
-  public:
-    [[nodiscard]] Sha256::Digest Sign(RaftPeerMac purpose, WireFields::FieldList fields) const override
-    {
-        std::ignore = purpose;
-        std::ignore = fields;
-        return {};
-    }
+    return MembersOf(Roster());
+}
 
-    [[nodiscard]] bool Verify(RaftPeerMac purpose,
-                              WireFields::FieldList fields,
-                              Sha256::Digest const& presented) const override
-    {
-        std::ignore = purpose;
-        std::ignore = fields;
-        std::ignore = presented;
-        return false;
-    }
-};
+/// A machine proving itself as @p claimed with the key of @p machine, over @p roster.
+/// @param claimed The id it runs as and signs for.
+/// @param machine Whose key it holds.
+/// @param roster What it believes about everybody else.
+/// @return The identity.
+[[nodiscard]] std::unique_ptr<IRaftPeerIdentity const> Posing(NodeId const& claimed,
+                                                              std::string const& machine,
+                                                              std::shared_ptr<Testing::SharedRoster const> roster)
+{
+    return std::make_unique<Testing::TestPeerIdentity const>(claimed, Testing::TestKeyPair(machine), std::move(roster));
+}
 
 /// Every safety property, reported by name rather than as a bare count.
 ///
@@ -133,15 +130,15 @@ constexpr std::array Everyone { "n1", "n2", "n3", "n4" };
 
 TEST_CASE("A three-node cluster elects exactly one leader", "[consensus][raft][cluster]")
 {
-    RaftClusterHarness cluster { { "n1", "n2", "n3" }, ClusterKey };
+    RaftClusterHarness cluster { { "n1", "n2", "n3" }, Members() };
 
     REQUIRE(SettleOnLeader(cluster));
     CHECK(cluster.Leaders().size() == 1);
     RequireNoViolations(cluster);
 
-    // Every message proved the key, and the positive half of that is what makes the
-    // intruder cases below mean anything: members holding one key refuse nothing, and
-    // each of them was heard.
+    // Every message proved its sender's id, and the positive half of that is what makes the
+    // intruder cases below mean anything: members proving their own keys refuse nothing,
+    // and each of them was heard.
     for (auto const* const id: { "n1", "n2", "n3" })
     {
         CAPTURE(id);
@@ -152,7 +149,7 @@ TEST_CASE("A three-node cluster elects exactly one leader", "[consensus][raft][c
 
 TEST_CASE("A five-node cluster elects exactly one leader", "[consensus][raft][cluster]")
 {
-    RaftClusterHarness cluster { { "n1", "n2", "n3", "n4", "n5" }, ClusterKey, 7 };
+    RaftClusterHarness cluster { { "n1", "n2", "n3", "n4", "n5" }, Members(), 7 };
 
     REQUIRE(SettleOnLeader(cluster));
     CHECK(cluster.Leaders().size() == 1);
@@ -161,7 +158,7 @@ TEST_CASE("A five-node cluster elects exactly one leader", "[consensus][raft][cl
 
 TEST_CASE("A committed entry reaches every node", "[consensus][raft][cluster]")
 {
-    RaftClusterHarness cluster { { "n1", "n2", "n3" }, ClusterKey };
+    RaftClusterHarness cluster { { "n1", "n2", "n3" }, Members() };
     REQUIRE(SettleOnLeader(cluster));
 
     REQUIRE(cluster.ProposeOnLeader(FastCache::BytesFromString("hello")).has_value());
@@ -181,7 +178,7 @@ TEST_CASE("Entries are applied in the same order on every node", "[consensus][ra
 {
     // State Machine Safety stated the way an application experiences it: not
     // merely that nobody disagrees, but that everyone sees the same sequence.
-    RaftClusterHarness cluster { { "n1", "n2", "n3" }, ClusterKey };
+    RaftClusterHarness cluster { { "n1", "n2", "n3" }, Members() };
     REQUIRE(SettleOnLeader(cluster));
 
     for (auto const index: std::views::iota(0, 8))
@@ -224,7 +221,7 @@ TEST_CASE("A minority partition cannot elect or commit", "[consensus][raft][clus
     // mechanism. An isolated *follower* keeps standing for election and keeps
     // losing. Either way the guarantee is the same and it is the one asserted
     // here: nothing the minority does can be committed.
-    RaftClusterHarness cluster { { "n1", "n2", "n3" }, ClusterKey };
+    RaftClusterHarness cluster { { "n1", "n2", "n3" }, Members() };
     REQUIRE(SettleOnLeader(cluster));
 
     cluster.Partition({ "n1" });
@@ -251,7 +248,7 @@ TEST_CASE("A minority partition cannot elect or commit", "[consensus][raft][clus
 
 TEST_CASE("A majority keeps working when a minority is cut off", "[consensus][raft][cluster]")
 {
-    RaftClusterHarness cluster { { "n1", "n2", "n3", "n4", "n5" }, ClusterKey, 3 };
+    RaftClusterHarness cluster { { "n1", "n2", "n3", "n4", "n5" }, Members(), 3 };
     REQUIRE(SettleOnLeader(cluster));
 
     // Isolate two of five. The remaining three are still a quorum.
@@ -276,7 +273,7 @@ TEST_CASE("A healed partition converges and loses nothing", "[consensus][raft][c
 {
     // The case the whole design is for: a node comes back and its log is repaired
     // to match, without any committed entry being lost or duplicated.
-    RaftClusterHarness cluster { { "n1", "n2", "n3", "n4", "n5" }, ClusterKey, 11 };
+    RaftClusterHarness cluster { { "n1", "n2", "n3", "n4", "n5" }, Members(), 11 };
     REQUIRE(SettleOnLeader(cluster));
 
     cluster.Partition({ "n4", "n5" });
@@ -302,7 +299,7 @@ TEST_CASE("A restarted node rejoins without violating anything", "[consensus][ra
 {
     // A restart is a new node recovered from the same storage, which is what a
     // process restart looks like from the algorithm's side.
-    RaftClusterHarness cluster { { "n1", "n2", "n3" }, ClusterKey };
+    RaftClusterHarness cluster { { "n1", "n2", "n3" }, Members() };
     REQUIRE(SettleOnLeader(cluster));
 
     REQUIRE(cluster.ProposeOnLeader(FastCache::BytesFromString("before")).has_value());
@@ -324,7 +321,7 @@ TEST_CASE("Restarting every node in turn preserves what was committed", "[consen
 {
     // Rolling restarts, which is what upgrading a fleet looks like. Nothing that
     // was committed may go missing.
-    RaftClusterHarness cluster { { "n1", "n2", "n3" }, ClusterKey, 5 };
+    RaftClusterHarness cluster { { "n1", "n2", "n3" }, Members(), 5 };
     REQUIRE(SettleOnLeader(cluster));
     REQUIRE(cluster.ProposeOnLeader(FastCache::BytesFromString("durable")).has_value());
     cluster.Run(80);
@@ -360,7 +357,7 @@ TEST_CASE("The cluster survives heavy message loss", "[consensus][raft][cluster]
 {
     // Raft is supposed to be indifferent to loss rather than merely tolerant of
     // it: progress gets slower and nothing becomes unsafe.
-    RaftClusterHarness cluster { { "n1", "n2", "n3" }, ClusterKey, 13 };
+    RaftClusterHarness cluster { { "n1", "n2", "n3" }, Members(), 13 };
     cluster.SetLossPercent(30);
 
     REQUIRE(SettleOnLeader(cluster, 600));
@@ -375,7 +372,7 @@ TEST_CASE("A long adversarial run violates nothing", "[consensus][raft][cluster]
     // The soak: loss, reordering, rolling partitions and restarts together, with
     // every safety property checked after every single step. This is the case
     // that exercises interleavings nobody wrote down.
-    RaftClusterHarness cluster { { "n1", "n2", "n3", "n4", "n5" }, ClusterKey, 23 };
+    RaftClusterHarness cluster { { "n1", "n2", "n3", "n4", "n5" }, Members(), 23 };
     cluster.SetLossPercent(15);
 
     auto proposals = 0;
@@ -414,7 +411,7 @@ TEST_CASE("A machine with no cluster is admitted into a running one", "[consensu
     // with a longer bootstrap list. The joiner is brought up with no configuration
     // at all: it is reachable, it does nothing, and admission is what gives it
     // both a member set and a leader.
-    RaftClusterHarness cluster { { "n1", "n2", "n3" }, ClusterKey };
+    RaftClusterHarness cluster { { "n1", "n2", "n3" }, Members() };
     REQUIRE(SettleOnLeader(cluster));
 
     auto const committed = Unwrap(cluster.ProposeOnLeader(FastCache::BytesFromString("before")));
@@ -489,19 +486,21 @@ TEST_CASE("A machine with no cluster is admitted into a running one", "[consensu
 namespace
 {
 
-/// Put an intruder holding @p credential beside a formed cluster, and check nothing it sent
-/// reached a member while the cluster carried on.
-/// @param credential What the intruder presents instead of the cluster key.
-void CheckIntruderIsNeverHeard(std::unique_ptr<IRaftPeerCredential const> credential)
+/// Put an intruder beside a formed cluster, and check nothing it sent reached a member while
+/// the cluster carried on.
+/// @param roster The roster every member holds; the case may have revoked from it.
+/// @param intruder Who the intruder proves itself as, and with which key.
+void CheckIntruderIsNeverHeard(std::shared_ptr<Testing::SharedRoster const> const& roster,
+                               std::unique_ptr<IRaftPeerIdentity const> intruder)
 {
-    RaftClusterHarness cluster { { "n1", "n2", "n3" }, ClusterKey };
+    RaftClusterHarness cluster { { "n1", "n2", "n3" }, MembersOf(roster) };
     REQUIRE(SettleOnLeader(cluster));
     auto const term = Unwrap(cluster.TermOfLeader());
 
-    cluster.Intrude("n9", std::move(credential));
+    cluster.Intrude("intruder", std::move(intruder));
     cluster.Run(400);
 
-    CHECK(cluster.DeliveredFrom("n9") == 0);
+    CHECK(cluster.DeliveredFrom("intruder") == 0);
     auto const refused = cluster.RefusedAt("n1") + cluster.RefusedAt("n2") + cluster.RefusedAt("n3");
     CHECK(refused > 0);
 
@@ -521,36 +520,52 @@ void CheckIntruderIsNeverHeard(std::unique_ptr<IRaftPeerCredential const> creden
 
 } // namespace
 
-TEST_CASE("A machine without the cluster key is never heard by a member", "[consensus][raft][cluster][handshake]")
+TEST_CASE("A machine that cannot prove a member's id is never heard by a member", "[consensus][raft][cluster][handshake]")
 {
-    // #1308. Before the handshake a machine that could reach the Raft port WAS a member
-    // as far as the wire could tell: nothing it sent was checked. The intruder claims
-    // membership and campaigns -- its election timer expires and it asks every member
-    // for a vote -- so a single message of it reaching a member is visible, and the
-    // count of refusals says each attempt met the check rather than being lost.
-    SECTION("a key that is not the cluster's")
+    // #1308, #178. The intruder claims membership and campaigns -- its election timer
+    // expires and it asks every member for a vote -- so a single message of it reaching a
+    // member is visible, and the count of refusals says each attempt met the check rather
+    // than being lost. Every other case in this file forms a cluster through the same
+    // handshake, so a check that let the intruder through by accepting everything would
+    // leave those green and this red; one that accepted nothing would do the reverse.
+    auto const roster = Roster();
+
+    SECTION("a machine the roster holds no key for")
     {
-        CheckIntruderIsNeverHeard(StrangerKey());
+        CheckIntruderIsNeverHeard(roster, Posing("n9", "n9", roster));
     }
 
-    SECTION("no key at all")
+    SECTION("n3, holding every byte it ever held, claiming n2's id")
     {
-        CheckIntruderIsNeverHeard(std::make_unique<NoKey const>());
+        // The case the pre-shared key could not refuse: n3 held the cluster key, so any id
+        // it claimed was proved. It holds its OWN key and the whole roster -- public keys --
+        // and neither signs as n2. Campaigning as n2 at a higher term would depose the
+        // leader if a single vote request landed, so "the same term" below is the check.
+        CheckIntruderIsNeverHeard(roster, Posing("n2", "n3", roster));
+    }
+
+    SECTION("a machine whose key the cluster revoked")
+    {
+        // Proves its own id with the key it always had, and the roster no longer names it.
+        roster->Admit("n9", Testing::TestKeyPair("n9").PublicKey());
+        roster->Revoke("n9");
+        CheckIntruderIsNeverHeard(roster, Posing("n9", "n9", roster));
     }
 }
 
 TEST_CASE("A joiner admitted with the wrong key receives nothing, and the cluster still commits",
           "[consensus][raft][cluster][membership][handshake]")
 {
-    // The operator admitted n4 by id and handed it the wrong key file. The leader's
-    // configuration names it and the leader replicates to it -- and every one of those
-    // messages is refused at n4, which proves nothing it is sent came from the cluster.
-    // `A machine with no cluster is admitted into a running one` is the control: the
-    // same steps with the cluster's key, and n4 catches up.
-    RaftClusterHarness cluster { { "n1", "n2", "n3" }, ClusterKey };
+    // The operator admitted n4 under a key that is not the one the machine answering as n4
+    // holds. The leader's configuration names it and the leader replicates to it -- and
+    // every one of those exchanges is refused, because the verdict n4 signs does not verify
+    // under the key the roster holds for n4. `A machine with no cluster is admitted into a
+    // running one` is the control: the same steps with n4's own key, and n4 catches up.
+    auto const roster = Roster();
+    RaftClusterHarness cluster { { "n1", "n2", "n3" }, MembersOf(roster) };
     REQUIRE(SettleOnLeader(cluster));
 
-    cluster.Join("n4", StrangerKey());
+    cluster.Join("n4", Posing("n4", "a-reinstalled-n4", roster));
     REQUIRE(cluster.ProposeMembershipOnLeader(Voters({ "n1", "n2", "n3", "n4" })).has_value());
     cluster.Run(120);
 
@@ -585,7 +600,7 @@ TEST_CASE("A cluster that admitted a member re-elects after losing the leader", 
     // false, so a joiner that lost its configuration neither campaigns nor answers,
     // and a four-member quorum with one node dead and one silent can never reach
     // three.
-    RaftClusterHarness cluster { { "n1", "n2", "n3" }, ClusterKey };
+    RaftClusterHarness cluster { { "n1", "n2", "n3" }, Members() };
     REQUIRE(SettleOnLeader(cluster));
 
     cluster.Join("n4");
@@ -637,7 +652,7 @@ TEST_CASE("An admitted member survives its own restart", "[consensus][raft][clus
     // line. The joiner was started with no bootstrap set and has none to fall back
     // on, so a restart that did not re-derive its configuration from its own log
     // would come back with no cluster and wait to be admitted a second time.
-    RaftClusterHarness cluster { { "n1", "n2", "n3" }, ClusterKey };
+    RaftClusterHarness cluster { { "n1", "n2", "n3" }, Members() };
     REQUIRE(SettleOnLeader(cluster));
 
     cluster.Join("n4");
@@ -674,7 +689,7 @@ TEST_CASE("A cluster formed on a bare quorum keeps its leader when the last memb
     // Every other election in this file happens with all peers already reachable,
     // so nothing covered the shape the failing artifact actually showed: a cluster
     // that has ELECTED but not yet FORMED.
-    RaftClusterHarness cluster { { "n1", "n2", "n3" }, ClusterKey };
+    RaftClusterHarness cluster { { "n1", "n2", "n3" }, Members() };
     auto const joiner = std::string { "n3" };
 
     // n3 is in the configuration and unreachable -- a member whose process has not
@@ -736,7 +751,7 @@ TEST_CASE("A leader that loses quorum contact stops being one", "[consensus][raf
     // What made it invisible is that `HasQuorumContact` already existed and was
     // consulted only when answering somebody else's pre-vote. The leader knew, and
     // acted on it only on another node's behalf.
-    RaftClusterHarness cluster { { "n1", "n2", "n3" }, ClusterKey };
+    RaftClusterHarness cluster { { "n1", "n2", "n3" }, Members() };
     REQUIRE(SettleOnLeader(cluster));
 
     auto const isolated = Unwrap(cluster.Leader());
@@ -791,7 +806,7 @@ TEST_CASE("A healthy cluster never changes term", "[consensus][raft][cluster][pr
     // that reports future regressions as flakes. The exact form of the rule is
     // pinned by the `ManualClock` cases on `RaftNode`; this is the end-to-end
     // statement that nothing perturbs a cluster nobody is perturbing.
-    RaftClusterHarness cluster { { "n1", "n2", "n3" }, ClusterKey };
+    RaftClusterHarness cluster { { "n1", "n2", "n3" }, Members() };
     REQUIRE(SettleOnLeader(cluster));
 
     REQUIRE(cluster.Leader().has_value());
@@ -828,7 +843,7 @@ TEST_CASE("A cluster of one that admits a second member keeps leading", "[consen
     // At three members and above somebody else can campaign, so the same defect
     // presents as an election storm that eventually settles -- which is why a case
     // asserting only that a leader exists eventually passes under it.
-    RaftClusterHarness cluster { { "n1" }, ClusterKey };
+    RaftClusterHarness cluster { { "n1" }, Members() };
     REQUIRE(SettleOnLeader(cluster));
     REQUIRE(Unwrap(cluster.Leader()) == "n1");
 
@@ -890,7 +905,7 @@ namespace
 /// @return The cluster, `n1` leading.
 [[nodiscard]] std::unique_ptr<RaftClusterHarness> PairWith(Configuration const& seat)
 {
-    auto cluster = std::make_unique<RaftClusterHarness>(std::vector<NodeId> { "n1" }, ClusterKey);
+    auto cluster = std::make_unique<RaftClusterHarness>(std::vector<NodeId> { "n1" }, Members());
     REQUIRE(SettleOnLeader(*cluster));
     REQUIRE(Unwrap(cluster->Leader()) == "n1");
 
@@ -1008,7 +1023,7 @@ TEST_CASE("A learner is promoted and demoted one change at a time, across the wh
     // The node-level cases pin each step's rule; this is every message authenticated,
     // every member applying the same configurations in the same order, and the
     // invariants checked at every step while a member moves between the two sets.
-    RaftClusterHarness cluster { { "n1", "n2", "n3" }, ClusterKey };
+    RaftClusterHarness cluster { { "n1", "n2", "n3" }, Members() };
     REQUIRE(SettleOnLeader(cluster));
 
     cluster.Join("n4");
@@ -1090,7 +1105,7 @@ TEST_CASE("A node restarted after compacting holds in its application what its s
     // reached the application. It now holds what it applied, and a restart empties it
     // the way a process's memory is emptied -- so what n2 holds after restarting is
     // exactly what recovery gave back.
-    RaftClusterHarness cluster { { "n1", "n2", "n3" }, ClusterKey, 1, CompactOften };
+    RaftClusterHarness cluster { { "n1", "n2", "n3" }, Members(), 1, CompactOften };
     REQUIRE(SettleOnLeader(cluster));
     ProposeSeveral(cluster, 10);
     cluster.Run(60);
@@ -1132,7 +1147,7 @@ TEST_CASE("A follower caught up by an installed snapshot holds in its applicatio
     // through just as silently: a follower the leader can no longer replay to is sent
     // the state instead, and its application must hold that state -- not the handful
     // of entries it applied itself before it fell behind.
-    RaftClusterHarness cluster { { "n1", "n2", "n3" }, ClusterKey, 1, CompactOften };
+    RaftClusterHarness cluster { { "n1", "n2", "n3" }, Members(), 1, CompactOften };
     REQUIRE(SettleOnLeader(cluster));
 
     auto const leader = Unwrap(cluster.Leader());
@@ -1163,7 +1178,7 @@ TEST_CASE("A node whose own recovered snapshot its application cannot read stays
     // application cannot read is refused there -- and here that leaves it DOWN, which is
     // what a process that refused to start is: no driver, and an application holding
     // nothing, because the refusal handed it nothing. The rest of the cluster carries on.
-    RaftClusterHarness cluster { { "n1", "n2", "n3" }, ClusterKey, 1, CompactOften };
+    RaftClusterHarness cluster { { "n1", "n2", "n3" }, Members(), 1, CompactOften };
     REQUIRE(SettleOnLeader(cluster));
     ProposeSeveral(cluster, 10);
     cluster.Run(60);

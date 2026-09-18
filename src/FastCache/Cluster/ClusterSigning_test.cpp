@@ -45,9 +45,7 @@ TEST_CASE("Each domain's label is the byte string on the wire", "[cluster][signi
     // so it would read as a guarantee while asserting nothing.
     CHECK(DescribeSigningDomain(SigningDomain::DiscoveryProof).label == "fastcache-discovery-v1");
     CHECK(DescribeSigningDomain(SigningDomain::LeaseToken).label == "fastcache-lease-v1");
-    CHECK(DescribeSigningDomain(SigningDomain::RaftPeerDialler).label == "fastcache-raft-dial-v1");
-    CHECK(DescribeSigningDomain(SigningDomain::RaftPeerVerdict).label == "fastcache-raft-verdict-v1");
-    CHECK(DescribeSigningDomain(SigningDomain::RaftPeerFrame).label == "fastcache-raft-frame-v1");
+    CHECK(DescribeSigningDomain(SigningDomain::NodeProof).label == "fastcache-node-proof-v1");
 }
 
 TEST_CASE("One field list signs differently in each domain", "[cluster][signing]")

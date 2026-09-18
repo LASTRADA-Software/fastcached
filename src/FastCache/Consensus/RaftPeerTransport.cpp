@@ -9,12 +9,14 @@
 #include <FastCache/Net/SocketDeadline.hpp>
 #include <FastCache/Protocol/Framing/LineReader.hpp>
 
+#include <algorithm>
 #include <cassert>
 #include <chrono>
 #include <format>
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -131,6 +133,14 @@ namespace
         };
     }
 
+    /// An acceptor that proved its id and took this node: the key it proved that with, and the
+    /// session its frames go out under.
+    struct ProvenAcceptor
+    {
+        Ed25519PublicKey provenKey; ///< Re-checked against the roster before every frame.
+        SessionKey session;         ///< What this end's frames are sealed under.
+    };
+
 } // namespace
 
 /// Grants the free-function senders access to the transport's privates.
@@ -192,19 +202,20 @@ struct PeerSenderAccess
         NodeId _peerId;
     };
 
-    /// One connection's life: dial, prove the key, serve, end.
+    /// One connection's life: dial, prove this node's id, serve, end.
     static Task<Outcome> ServeOnce(RaftPeerTransport* self, RaftPeerTransport::Peer* peer);
 
-    /// Prove the key to the acceptor at `peer->socket`, and check its verdict, within the
-    /// handshake bound.
+    /// Prove this node's id to the acceptor at `peer->socket`, and check its verdict, within
+    /// the handshake bound.
     /// @param self The transport.
     /// @param peer The peer being dialled; its socket is connected.
     /// @param where Where it was dialled, for the log line.
-    /// @return The session's nonces when the acceptor accepted this node as the member it
-    ///         dialled; nothing otherwise, the refusal already counted.
-    static Task<std::optional<SessionNonces>> Handshake(RaftPeerTransport* self,
-                                                        RaftPeerTransport::Peer* peer,
-                                                        PeerEndpoint where);
+    /// @return The key the acceptor proved itself with and the session's key, when it
+    ///         accepted this node as the member it dialled; nothing otherwise, the refusal
+    ///         already counted.
+    static Task<std::optional<ProvenAcceptor>> Handshake(RaftPeerTransport* self,
+                                                         RaftPeerTransport::Peer* peer,
+                                                         PeerEndpoint where);
 
     /// One peer's whole life. Ends only on a stop.
     static Task<void> RunSender(RaftPeerTransport* self, RaftPeerTransport::Peer* peer);
@@ -271,11 +282,11 @@ Task<PeerSenderAccess::Outcome> PeerSenderAccess::ServeOnce(RaftPeerTransport* s
         co_return Outcome::Retry;
     }
 
-    // Nothing is sent to an address until what answers there has proved the key and
+    // Nothing is sent to an address until what answers there has proved the member's id and
     // accepted this node as the member it dialled -- and until then the peer is not
     // CONNECTED either, so `ConnectedPeers()` counts authenticated sessions only.
-    auto const nonces = co_await Handshake(self, peer, where);
-    if (!nonces.has_value())
+    auto proven = co_await Handshake(self, peer, where);
+    if (!proven.has_value())
     {
         peer->socket->Close();
         peer->socket.reset();
@@ -283,7 +294,7 @@ Task<PeerSenderAccess::Outcome> PeerSenderAccess::ServeOnce(RaftPeerTransport* s
     }
 
     Session const session { self, where };
-    FrameSealer sealer { self->_credential, *nonces };
+    FrameSealer sealer { std::move(proven->session) };
 
     while (true)
     {
@@ -291,11 +302,25 @@ Task<PeerSenderAccess::Outcome> PeerSenderAccess::ServeOnce(RaftPeerTransport* s
         if (!frame.has_value())
             co_return Outcome::Stop; // the outbox was closed
 
+        // The roster, asked again before every frame: a key revoked since the handshake ends
+        // the session here, and the redial is judged against the roster as it is now. The
+        // frame is dropped with the session, which Raft already survives for any message.
+        if (!self->_identity.StillProves(where.id, proven->provenKey))
+        {
+            self->NoteDialRefusal(*peer, where, DiallerRefusal::KeyWithdrawn, "");
+            self->_dropped.fetch_add(1, std::memory_order_relaxed);
+            peer->socket->Close();
+            peer->socket.reset();
+            co_return Outcome::Retry;
+        }
+
         // Sealed HERE rather than when queued, because a frame's tag is bound to the
         // connection it goes out on and to its position there -- and a queued frame
         // outlives the connection that was current when it was framed. Appended to the
         // frame so it goes out in the one write `ISocket::Write`'s contract makes whole.
-        auto const tag = sealer.Seal(*frame);
+        auto const bytes = std::span<std::byte const> { *frame };
+        auto const headerSize = std::min(bytes.size(), RaftWire::HeaderSize);
+        auto const tag = sealer.Seal(bytes.first(headerSize), bytes.subspan(headerSize));
         frame->insert(frame->end(), tag.begin(), tag.end());
 
         // Written from a local of this frame, never from a queue element:
@@ -311,9 +336,9 @@ Task<PeerSenderAccess::Outcome> PeerSenderAccess::ServeOnce(RaftPeerTransport* s
     }
 }
 
-Task<std::optional<SessionNonces>> PeerSenderAccess::Handshake(RaftPeerTransport* self,
-                                                               RaftPeerTransport::Peer* peer,
-                                                               PeerEndpoint where)
+Task<std::optional<ProvenAcceptor>> PeerSenderAccess::Handshake(RaftPeerTransport* self,
+                                                                RaftPeerTransport::Peer* peer,
+                                                                PeerEndpoint where)
 {
     using ReadOutcome = HandshakeFrameRead::Outcome;
     auto* const socket = peer->socket.get();
@@ -354,7 +379,7 @@ Task<std::optional<SessionNonces>> PeerSenderAccess::Handshake(RaftPeerTransport
     // dial refusal and neither moves a peer counter -- but each is every connection to every
     // peer, so it is said, at most once per interval per peer. A nonce that cannot be drawn
     // abandons the connection rather than proving with a weak one (#1527).
-    auto begun = DiallerHandshake::Create(self->_credential, self->_self, where.id, self->_random);
+    auto begun = DiallerHandshake::Create(self->_identity, where.id, self->_random);
     if (!begun.has_value())
     {
         self->NoteOwnFault(
@@ -380,14 +405,15 @@ Task<std::optional<SessionNonces>> PeerSenderAccess::Handshake(RaftPeerTransport
     if (verdictRead.outcome == ReadOutcome::Ended)
     {
         // EOF after the proof with no verdict is how an acceptor refuses what it cannot
-        // sign: a proof whose MAC failed -- this node's key is not the acceptor's -- or one
-        // it could not read. A refusal it COULD sign arrives as a verdict below.
+        // sign: a proof whose signature it could not verify -- it holds no key for this
+        // node's id, or another one -- or one it could not read. A refusal it COULD sign
+        // arrives as a verdict below.
         self->NoteDialRefusal(*peer, where, expiry.expired ? DiallerRefusal::Timeout : DiallerRefusal::EndedByAcceptor, "");
         co_return std::nullopt;
     }
 
-    // Anything but a verdict that verifies is an acceptor this node cannot tell holds the
-    // key, which is all an unverifiable answer can mean.
+    // Anything but a verdict that verifies is an acceptor this node cannot tell is the member
+    // it claims to be, which is all an unverifiable answer can mean.
     auto const verdict =
         verdictRead.outcome == ReadOutcome::Read
             ? RaftWire::DecodeVerdict(verdictRead.header, verdictRead.payload)
@@ -399,16 +425,34 @@ Task<std::optional<SessionNonces>> PeerSenderAccess::Handshake(RaftPeerTransport
         co_return std::nullopt;
     }
 
-    auto const conclusion = dialling.Conclude(*verdict);
+    auto conclusion = dialling.Conclude(*verdict);
     switch (conclusion.outcome)
     {
         case VerdictOutcome::Accepted:
-            // Disarmed only now: the bound is on proving the key, and a session after it
-            // is the unbounded stream a peer connection always was.
+            // `Conclude` agrees the key before it answers Accepted, so this is never absent;
+            // were it ever, it is an acceptance this end cannot act on, counted as one.
+            if (!conclusion.session.has_value())
+            {
+                self->NoteDialRefusal(*peer, where, DiallerRefusal::AcceptorProof, "");
+                co_return std::nullopt;
+            }
+            // Disarmed only now: the bound is on proving an id, and a session after it is
+            // the unbounded stream a peer connection always was.
             deadline.reset();
-            co_return conclusion.nonces;
+            co_return ProvenAcceptor { .provenKey = conclusion.provenKey, .session = *std::move(conclusion.session) };
         case VerdictOutcome::Forged:
             self->NoteDialRefusal(*peer, where, DiallerRefusal::AcceptorProof, "");
+            co_return std::nullopt;
+        case VerdictOutcome::AcceptorKeyUnknown:
+            self->NoteDialRefusal(
+                *peer, where, DiallerRefusal::AcceptorKeyUnknown, std::format("{} answered there", verdict->acceptor));
+            co_return std::nullopt;
+        case VerdictOutcome::AcceptorKeyRevoked:
+            self->NoteDialRefusal(
+                *peer, where, DiallerRefusal::AcceptorKeyRevoked, std::format("{} answered there", verdict->acceptor));
+            co_return std::nullopt;
+        case VerdictOutcome::OwnKeyRevoked:
+            self->NoteDialRefusal(*peer, where, DiallerRefusal::OwnKeyRevoked, "");
             co_return std::nullopt;
         case VerdictOutcome::WrongTarget:
             self->NoteDialRefusal(
@@ -508,21 +552,20 @@ DetachedTask PeerSenderAccess::CloseSockets(RaftPeerTransport* self, std::option
     co_return;
 }
 
-RaftPeerTransport::RaftPeerTransport(NodeId self,
-                                     std::vector<PeerEndpoint> peers,
+RaftPeerTransport::RaftPeerTransport(std::vector<PeerEndpoint> peers,
                                      IReactor& reactor,
                                      IConnector& connector,
                                      ILogger& logger,
                                      IMetricsSink& metrics,
-                                     IRaftPeerCredential const& credential,
+                                     IRaftPeerIdentity const& identity,
                                      ISecureRandom& random,
                                      PeerTransportOptions options):
-    _self { std::move(self) },
+    _identity { identity },
+    _self { identity.Self() },
     _reactor { reactor },
     _connector { connector },
     _logger { logger },
     _metrics { metrics },
-    _credential { credential },
     _random { random },
     _options { options }
 {
@@ -733,7 +776,7 @@ void RaftPeerTransport::NoteOwnFault(Peer& peer, PeerEndpoint const& where, std:
         return;
     peer.nextRefusalReport = now + RefusalReportInterval;
 
-    _logger.Log(LogLevel::Error, std::format("raft: cannot prove the key to peer {}: {}", where.id, reason));
+    _logger.Log(LogLevel::Error, std::format("raft: cannot prove this node's id to peer {}: {}", where.id, reason));
 }
 
 void RaftPeerTransport::NoteDialRefusal(Peer& peer,

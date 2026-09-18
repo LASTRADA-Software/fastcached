@@ -4,13 +4,15 @@
 #include <FastCache/Consensus/RaftMembership.hpp>
 #include <FastCache/Consensus/RaftOutput.hpp>
 #include <FastCache/Consensus/RaftTypes.hpp>
+#include <FastCache/Core/Ed25519.hpp>
 #include <FastCache/Core/Errors/ConsensusError.hpp>
 #include <FastCache/Core/Nonce.hpp>
 #include <FastCache/Core/Ranges.hpp>
-#include <FastCache/Core/Sha256.hpp>
+#include <FastCache/Core/SessionSeal.hpp>
 #include <FastCache/Core/Utf8.hpp>
 #include <FastCache/Core/WireFields.hpp>
 #include <FastCache/Core/WireFrame.hpp>
+#include <FastCache/Core/X25519.hpp>
 
 #include <algorithm>
 #include <array>
@@ -53,11 +55,11 @@ namespace FastCache::Consensus::RaftWire
 /// ```
 ///
 /// The first three are the HANDSHAKE and carry no trailer: their own fields hold the
-/// tags. Everything after is a SESSION frame, and its tag sits after the payload,
+/// signatures. Everything after is a SESSION frame, and its tag sits after the payload,
 /// outside `payloadLength` -- so the header keeps exactly the meaning `WireFrame`
 /// gives it, and the compile-cache wire that shares it is untouched. Which types are
-/// legal in which part is `FramePhase`, a column of `MessageTable`. What the tags are
-/// MACs over is `RaftPeerSession`'s (#1308).
+/// legal in which part is `FramePhase`, a column of `MessageTable`. What the signatures
+/// cover, and what key the tags are made under, is `RaftPeerSession`'s (#1308, #178).
 ///
 /// The field grammar is `Core/WireFields.hpp`, shared verbatim with the
 /// compile-cache wire so the two cannot drift. All multi-byte integers are
@@ -92,12 +94,13 @@ namespace FastCache::Consensus::RaftWire
 /// travels in every frame.
 ///
 /// What changed is that the wire authenticates (#1308), and freshness is the one
-/// thing a frame cannot prove about itself. A MAC over a frame alone accepts that
+/// thing a frame cannot prove about itself. A tag over a frame alone accepts that
 /// frame again tomorrow, on another connection, from anybody who recorded it. So each
 /// connection opens with a challenge the ACCEPTOR chose, and every frame after it is
-/// bound to that exchange. A reconnect costs one round trip and four MACs, which is
-/// the price the old section was right to refuse for a version check and is cheap for
-/// the question it now answers.
+/// bound to that exchange. A reconnect costs one round trip, two signatures, two
+/// verifications and a Diffie-Hellman exchange at each end (#178), which is the price the
+/// old section was right to refuse for a version check and is cheap for the question it now
+/// answers.
 ///
 /// It also makes the version a property of the CONNECTION. A handshake frame at a
 /// version this build does not speak ends the connection before anything is read, and
@@ -132,21 +135,35 @@ using WireVersion = WireFrame::Version;
 /// replicated to a version 2 follower is one it cannot read and silently ignores,
 /// counting a quorum of the configuration before it. The question the #402/#1308 pair
 /// asks is always WHICH changed, and here a field's grammar did.
-inline constexpr WireVersion CurrentVersion = 3;
+///
+/// 4 since #178, and it is the grammar a third time: every handshake frame changed shape. A
+/// connection is proved by each end's OWN key rather than by a key every member shares, so a
+/// proof and a verdict carry a 64-byte Ed25519 signature where they carried a 32-byte MAC, and a
+/// challenge and a proof each carry an X25519 ephemeral key, from which the two ends agree a
+/// session key nobody else holds. A version 3 peer's handshake is refused by its arity before
+/// any field is read -- and should it ever decode, it proves nothing this build can check.
+inline constexpr WireVersion CurrentVersion = 4;
 
 /// The oldest version this build still accepts.
 ///
 /// Equal to `CurrentVersion`: a version 1 peer authenticates nothing, and accepting
 /// one would be the per-connection fallback #1308 exists to refuse; a version 2 peer
-/// spells a configuration this build cannot read (#1449). So the consensus members of
-/// a fleet upgrade together.
-inline constexpr WireVersion MinSupportedVersion = 3;
+/// spells a configuration this build cannot read (#1449); a version 3 peer proves only that
+/// it holds the key every member shares, which is exactly what #178 stopped accepting. So
+/// the consensus members of a fleet upgrade together.
+inline constexpr WireVersion MinSupportedVersion = 4;
 
 /// Size of the fixed frame header: magic, version, type, payload length.
 inline constexpr std::size_t HeaderSize = WireFrame::HeaderSize;
 
-/// Size of the tag after every session frame, and of the tags a handshake carries.
-inline constexpr std::size_t TagSize = Sha256::DigestSize;
+/// Size of the tag after every session frame: an HMAC-SHA256 under the session's own key.
+inline constexpr std::size_t TagSize = SessionTagBytes;
+
+/// Size of the signature a proof and a verdict each carry.
+inline constexpr std::size_t SignatureSize = Ed25519SignatureBytes;
+
+/// Size of the ephemeral key a challenge and a proof each carry.
+inline constexpr std::size_t EphemeralKeySize = X25519KeyBytes;
 
 /// The longest node id a handshake carries.
 ///
@@ -160,14 +177,14 @@ inline constexpr std::size_t MaxHandshakeIdBytes = 1024;
 /// How long a connection may take to finish its handshake, at either end.
 ///
 /// ONE number for both ends, because they bound one exchange from opposite sides: an
-/// acceptor closes a connection that has not proved the key within it, and a dialler
+/// acceptor closes a connection that has not proved its id within it, and a dialler
 /// abandons an acceptor that has not challenged or answered within it.
 ///
 /// The acceptor's half is the one that matters. Before #1308 a connection that sent
 /// nothing held one of `PeerServerOptions::maxConnections` slots for as long as its
 /// socket lived, so anything that could reach the port could hold all of them. Sized
-/// for a round trip plus four MACs on a loaded or instrumented host, not for a network
-/// round trip on an idle one.
+/// for a round trip plus the handshake's signatures and Diffie-Hellman exchange on a loaded
+/// or instrumented host, not for a network round trip on an idle one.
 inline constexpr std::chrono::milliseconds HandshakeBound { 5000 };
 
 /// Wire type codes. One byte, third in the frame header.
@@ -198,8 +215,8 @@ enum class MessageType : std::uint8_t
 
     // The handshake (#1308). Numbered from 0x10 so the session types keep room to grow
     // without a gap in either run meaning anything.
-    Challenge = 0x10, ///< Acceptor -> dialler: the nonce a proof must answer.
-    Proof = 0x11,     ///< Dialler -> acceptor: who it is, whom it dialled, and the MAC over both nonces.
+    Challenge = 0x10, ///< Acceptor -> dialler: the nonce and ephemeral key a proof must answer.
+    Proof = 0x11,     ///< Dialler -> acceptor: who it is, whom it dialled, its own fresh values, signed.
     Verdict = 0x12,   ///< Acceptor -> dialler: the signed answer to that proof.
 };
 
@@ -227,7 +244,7 @@ class FramePhase
         return FramePhase { ceiling };
     }
 
-    /// A session frame, read only on a connection that has proved the key.
+    /// A session frame, read only on a connection whose dialler has proved its id.
     /// @return The phase. The connection's own frame cap governs its size.
     [[nodiscard]] static constexpr FramePhase Session() noexcept
     {
@@ -310,22 +327,23 @@ inline constexpr std::array MessageTable {
                         .name = "InstallSnapshotResponse",
                         .fieldCount = 4,
                         .phase = FramePhase::Session() },
-    // The acceptor's nonce.
+    // The acceptor's nonce and its ephemeral key.
     MessageDescriptor { .type = MessageType::Challenge,
                         .name = "Challenge",
-                        .fieldCount = 1,
-                        .phase = FramePhase::Handshake(Detail::HandshakeCeiling({ NonceBytes })) },
-    // The dialler's id, the id it dialled, its nonce, and its tag.
+                        .fieldCount = 2,
+                        .phase = FramePhase::Handshake(Detail::HandshakeCeiling({ NonceBytes, EphemeralKeySize })) },
+    // The dialler's id, the id it dialled, its nonce, its ephemeral key, and its signature.
     MessageDescriptor { .type = MessageType::Proof,
                         .name = "Proof",
-                        .fieldCount = 4,
-                        .phase = FramePhase::Handshake(
-                            Detail::HandshakeCeiling({ MaxHandshakeIdBytes, MaxHandshakeIdBytes, NonceBytes, TagSize })) },
-    // The verdict, the acceptor's id, and its tag.
+                        .fieldCount = 5,
+                        .phase = FramePhase::Handshake(Detail::HandshakeCeiling(
+                            { MaxHandshakeIdBytes, MaxHandshakeIdBytes, NonceBytes, EphemeralKeySize, SignatureSize })) },
+    // The verdict, the acceptor's id, and its signature.
     MessageDescriptor { .type = MessageType::Verdict,
                         .name = "Verdict",
                         .fieldCount = 3,
-                        .phase = FramePhase::Handshake(Detail::HandshakeCeiling({ 1, MaxHandshakeIdBytes, TagSize })) },
+                        .phase =
+                            FramePhase::Handshake(Detail::HandshakeCeiling({ 1, MaxHandshakeIdBytes, SignatureSize })) },
 };
 
 /// Whether every handshake row is bounded by `MaxHandshakePayload`.
@@ -867,56 +885,66 @@ namespace Detail
 }
 
 // ---------------------------------------------------------------------------
-// The handshake (#1308). What these frames carry is here; what the tags inside them
-// are MACs over, and in what order a connection may send them, is `RaftPeerSession`.
+// The handshake (#1308, #178). What these frames carry is here; what the signatures inside
+// them cover, and in what order a connection may send them, is `RaftPeerSession`.
 
-/// What an acceptor answers a proof whose MAC verified.
+/// What an acceptor answers a proof whose signature verified.
 ///
 /// **ORDINALS ARE A WIRE CONTRACT. Append only; never insert or reorder.** The byte is a
-/// field of the Verdict frame and is inside the acceptor's MAC.
+/// field of the Verdict frame and is inside the acceptor's signature.
 ///
 /// Acceptance is deliberately NOT ordinal zero. A zeroed byte is what a buffer nobody
 /// filled holds, and it should read as a refusal if it ever reads as anything.
 enum class HandshakeVerdict : std::uint8_t
 {
     WrongTarget, ///< The dialler asked for another member: its address for that member is stale.
-    OwnId,       ///< The dialler claims this node's own id: a cloned state directory, or a duplicated --node-id.
-    Accepted,    ///< The dialler proved the key, for this node, as another member.
-    Last,        ///< Not a verdict, and never travels. See `DecodeWireEnum`.
+    OwnId,       ///< The dialler proved this node's own id: a copied state directory.
+    Accepted,    ///< The dialler proved its id, dialled this node, and is another member.
+
+    /// The dialler's signature verified under a key this node's roster has REVOKED (#178). Signed
+    /// like the others, and for their reason: only the machine holding that key can have produced
+    /// the proof, so telling it is no oracle -- and without it a revoked machine reports every
+    /// refused redial as a key problem on the other end.
+    KeyRevoked,
+
+    Last, ///< Not a verdict, and never travels. See `DecodeWireEnum`.
 };
 
 static_assert(static_cast<std::uint8_t>(HandshakeVerdict::WrongTarget) == 0,
               "HandshakeVerdict ordinals are a wire contract");
 static_assert(static_cast<std::uint8_t>(HandshakeVerdict::OwnId) == 1, "HandshakeVerdict ordinals are a wire contract");
 static_assert(static_cast<std::uint8_t>(HandshakeVerdict::Accepted) == 2, "HandshakeVerdict ordinals are a wire contract");
+static_assert(static_cast<std::uint8_t>(HandshakeVerdict::KeyRevoked) == 3, "HandshakeVerdict ordinals are a wire contract");
 
-/// The acceptor's opening: a nonce it chose, before it has read a byte.
+/// The acceptor's opening: its fresh values, before it has read a byte.
 struct ChallengeFrame
 {
-    Nonce nonce {}; ///< What the dialler's proof must answer.
+    Nonce nonce {};               ///< What the dialler's proof must answer.
+    X25519PublicKey ephemeral {}; ///< The acceptor's half of this connection's Diffie-Hellman exchange.
 
     /// Value equality, so a round trip is asserted whole.
     [[nodiscard]] bool operator==(ChallengeFrame const&) const = default;
 };
 
-/// The dialler's proof that it holds the key.
+/// The dialler's proof of who it is.
 struct ProofFrame
 {
-    NodeId dialler;        ///< Who is dialling.
-    NodeId target;         ///< Which member it believes it dialled.
-    Nonce nonce {};        ///< The dialler's own nonce, so the acceptor's answer is fresh too.
-    Sha256::Digest tag {}; ///< The MAC over both nonces and both ids.
+    NodeId dialler;                ///< Who is dialling.
+    NodeId target;                 ///< Which member it believes it dialled.
+    Nonce nonce {};                ///< The dialler's own nonce, so the acceptor's answer is fresh too.
+    X25519PublicKey ephemeral {};  ///< The dialler's half of the Diffie-Hellman exchange.
+    Ed25519Signature signature {}; ///< The dialler's signature over the whole transcript so far.
 
     /// Value equality, so a round trip is asserted whole.
     [[nodiscard]] bool operator==(ProofFrame const&) const = default;
 };
 
-/// The acceptor's signed answer to a proof whose MAC verified.
+/// The acceptor's signed answer to a proof whose signature verified.
 struct VerdictFrame
 {
     HandshakeVerdict verdict { HandshakeVerdict::WrongTarget }; ///< What it decided.
     NodeId acceptor;                                            ///< Which member answered.
-    Sha256::Digest tag {};                                      ///< The MAC over both nonces, both ids and the verdict.
+    Ed25519Signature signature {}; ///< The acceptor's signature over the whole transcript and this verdict.
 
     /// Value equality, so a round trip is asserted whole.
     [[nodiscard]] bool operator==(VerdictFrame const&) const = default;
@@ -929,7 +957,8 @@ struct VerdictFrame
 [[nodiscard]] inline std::vector<std::byte> EncodeChallenge(ChallengeFrame const& challenge,
                                                             WireVersion version = CurrentVersion)
 {
-    std::array const fields { std::span<std::byte const> { challenge.nonce } };
+    std::array const fields { std::span<std::byte const> { challenge.nonce },
+                              std::span<std::byte const> { challenge.ephemeral } };
     return Detail::Frame<MessageType::Challenge>(version, fields);
 }
 
@@ -942,7 +971,8 @@ struct VerdictFrame
     std::array const fields { WireFields::AsBytes(proof.dialler),
                               WireFields::AsBytes(proof.target),
                               std::span<std::byte const> { proof.nonce },
-                              std::span<std::byte const> { proof.tag } };
+                              std::span<std::byte const> { proof.ephemeral },
+                              std::span<std::byte const> { proof.signature } };
     return Detail::Frame<MessageType::Proof>(version, fields);
 }
 
@@ -955,7 +985,7 @@ struct VerdictFrame
     auto const decided = Detail::EnumField(verdict.verdict);
     std::array const fields { std::span<std::byte const> { decided },
                               WireFields::AsBytes(verdict.acceptor),
-                              std::span<std::byte const> { verdict.tag } };
+                              std::span<std::byte const> { verdict.signature } };
     return Detail::Frame<MessageType::Verdict>(version, fields);
 }
 
@@ -1036,7 +1066,7 @@ namespace Detail
     /// An id a handshake carries, or refused.
     ///
     /// Empty, over `MaxHandshakeIdBytes`, or not UTF-8 is refused as a malformed frame,
-    /// before any MAC: this is what the frame IS rather than what it claims, and an id
+    /// before any signature: this is what the frame IS rather than what it claims, and an id
     /// that is not text is one no log line may print and no membership can name --
     /// `PeerDirectory::NoteBeacon`'s rule, at this door.
     /// @param field The field's bytes.
@@ -1060,9 +1090,12 @@ namespace Detail
     return Detail::HandshakeFields<MessageType::Challenge>(header, payload)
         .and_then([](auto const& fields) -> std::expected<ChallengeFrame, ConsensusError> {
             auto const nonce = Detail::FixedField<NonceBytes>(fields[0]);
+            auto const ephemeral = Detail::FixedField<EphemeralKeySize>(fields[1]);
             if (!nonce.has_value())
                 return std::unexpected { MalformedWireFrame("Challenge: the nonce is not a nonce's width") };
-            return ChallengeFrame { .nonce = *nonce };
+            if (!ephemeral.has_value())
+                return std::unexpected { MalformedWireFrame("Challenge: the ephemeral key is not a key's width") };
+            return ChallengeFrame { .nonce = *nonce, .ephemeral = *ephemeral };
         });
 }
 
@@ -1078,12 +1111,18 @@ namespace Detail
             auto dialler = Detail::HandshakeId(fields[0]);
             auto target = Detail::HandshakeId(fields[1]);
             auto const nonce = Detail::FixedField<NonceBytes>(fields[2]);
-            auto const tag = Detail::FixedField<TagSize>(fields[3]);
+            auto const ephemeral = Detail::FixedField<EphemeralKeySize>(fields[3]);
+            auto const signature = Detail::FixedField<SignatureSize>(fields[4]);
             if (!dialler.has_value() || !target.has_value())
                 return std::unexpected { MalformedWireFrame("Proof: an id is empty, too long, or not UTF-8") };
-            if (!nonce.has_value() || !tag.has_value())
-                return std::unexpected { MalformedWireFrame("Proof: the nonce or the tag is the wrong width") };
-            return ProofFrame { .dialler = *std::move(dialler), .target = *std::move(target), .nonce = *nonce, .tag = *tag };
+            if (!nonce.has_value() || !ephemeral.has_value() || !signature.has_value())
+                return std::unexpected { MalformedWireFrame(
+                    "Proof: the nonce, the ephemeral key or the signature is the wrong width") };
+            return ProofFrame { .dialler = *std::move(dialler),
+                                .target = *std::move(target),
+                                .nonce = *nonce,
+                                .ephemeral = *ephemeral,
+                                .signature = *signature };
         });
 }
 
@@ -1098,14 +1137,14 @@ namespace Detail
         .and_then([](auto const& fields) -> std::expected<VerdictFrame, ConsensusError> {
             auto const verdict = Detail::DecodeEnum<HandshakeVerdict>(fields[0]);
             auto acceptor = Detail::HandshakeId(fields[1]);
-            auto const tag = Detail::FixedField<TagSize>(fields[2]);
+            auto const signature = Detail::FixedField<SignatureSize>(fields[2]);
             if (!verdict.has_value())
                 return std::unexpected { MalformedWireFrame("Verdict: the verdict names no known outcome") };
             if (!acceptor.has_value())
                 return std::unexpected { MalformedWireFrame("Verdict: the id is empty, too long, or not UTF-8") };
-            if (!tag.has_value())
-                return std::unexpected { MalformedWireFrame("Verdict: the tag is the wrong width") };
-            return VerdictFrame { .verdict = *verdict, .acceptor = *std::move(acceptor), .tag = *tag };
+            if (!signature.has_value())
+                return std::unexpected { MalformedWireFrame("Verdict: the signature is the wrong width") };
+            return VerdictFrame { .verdict = *verdict, .acceptor = *std::move(acceptor), .signature = *signature };
         });
 }
 

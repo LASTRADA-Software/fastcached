@@ -904,8 +904,8 @@ against the rest of the fleet.
 
 --8<-- "node-credential-gap.md"
 
-Beyond the lease and consensus — whose every connection proves the cluster key, see
-[Raft peer authentication](../operations/cluster-communication.md#raft-peer-authentication)
+Beyond the lease and consensus — whose every connection proves each member's own identity
+key, see [Raft peer authentication](../operations/cluster-communication.md#raft-peer-authentication)
 — the fleet's own traffic is unauthenticated, so treat its boundary as **network
 reachability plus membership** and size the network accordingly.
 

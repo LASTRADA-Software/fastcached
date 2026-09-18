@@ -19,9 +19,9 @@
 ///
 /// ## Why this exists
 ///
-/// One key MACs several different things -- a discovery proof, a lease token, and
-/// since #1308 the Raft peer handshake and every frame after it -- and the first two
-/// used to build their own messages inline, from `HmacSha256` and
+/// One key MACs several different things -- a discovery proof, a lease token, a node's
+/// proof on the `0xFC` surface -- and the first two used to build their own messages
+/// inline, from `HmacSha256` and
 /// `WireFields::Encode`. Those are primitives, not a construction: what a message
 /// is made of was written twice, and the rulebook's requirement that *every*
 /// message carry a domain label was true of exactly one of them. The lease
@@ -83,35 +83,21 @@ enum class SigningDomain : std::uint8_t
     /// The scheduler's signed grant. See `Distributed/LeaseToken`.
     LeaseToken,
 
-    /// A Raft dialler's proof over the acceptor's challenge. See `Consensus/RaftPeerSession`.
-    RaftPeerDialler,
-
-    /// A Raft acceptor's signed verdict on that proof. See `Consensus/RaftPeerSession`.
-    ///
-    /// A domain of its own rather than the dialler's with a role field, so a proof
-    /// reflected back as a verdict -- or the reverse -- is a tag in the wrong domain and
-    /// cannot verify whatever its fields happen to say (#1308).
-    RaftPeerVerdict,
-
-    /// One Raft session frame, bound to its connection's nonces and its position. See
-    /// `Consensus/RaftPeerSession`.
-    RaftPeerFrame,
-
     /// A caller's proof, on the `0xFC` surface, that it holds the cluster key. See
     /// `Distributed/NodeProof`.
     ///
-    /// Its own domain and NOT `RaftPeerDialler`'s, although both are "a dialler proves the
-    /// key over a challenge": a tag minted for one wire must not verify on the other. The
-    /// Raft wire admits a peer to CONSENSUS; this one admits a caller to the compile and
-    /// scheduler verbs of a node that may run no consensus at all, and the two populations
-    /// differ. Sharing a label would make a captured Raft proof spendable here.
-    ///
     /// There is deliberately no verdict domain beside it, which is where this departs from
-    /// the Raft pair. There a verdict is SIGNED because both ends must agree about the
-    /// connection and an unsigned refusal of a key holder is a confident wrong signal. Here
-    /// the proof is an OPTIONAL upgrade: a caller that presents none is admitted or refused
-    /// by address exactly as before, so the only thing a refusal has to reach is this
-    /// server's own counters.
+    /// the Raft peer handshake. There a verdict is SIGNED because both ends must agree about
+    /// the connection and an unsigned refusal is a confident wrong signal. Here the proof is
+    /// an OPTIONAL upgrade: a caller that presents none is admitted or refused by address
+    /// exactly as before, so the only thing a refusal has to reach is this server's own
+    /// counters.
+    ///
+    /// The Raft peer wire had three rows here until #178, when its handshake moved to each
+    /// node's OWN key and this key stopped signing anything about consensus. Their labels are
+    /// retired, never reused: a new row spelled `fastcache-raft-dial-v1`,
+    /// `fastcache-raft-verdict-v1` or `fastcache-raft-frame-v1` would accept every tag an older
+    /// build ever minted under it.
     NodeProof,
 
     Last, ///< Not a domain, and has no row: the length of a table keyed by one.
@@ -138,16 +124,11 @@ struct SigningDomainDescriptor
 /// authenticates. `fastcache-discovery-v1` is new: the discovery proof had no
 /// label at all, so its message -- and therefore every proof tag -- changes.
 ///
-/// The three `fastcache-raft-*` rows are the peer wire's (#1308): before them a Raft
-/// connection proved nothing, so there is no earlier tag for them to stay compatible
-/// with. `fastcache-node-proof-v1` is the `0xFC` surface's (#1428) and is new for the
-/// same reason.
+/// `fastcache-node-proof-v1` is the `0xFC` surface's (#1428): before it a caller there
+/// proved nothing, so there is no earlier tag for it to stay compatible with.
 inline constexpr EnumTable<SigningDomain, SigningDomainDescriptor> SigningDomainTable { {
     { .domain = SigningDomain::DiscoveryProof, .label = "fastcache-discovery-v1" },
     { .domain = SigningDomain::LeaseToken, .label = "fastcache-lease-v1" },
-    { .domain = SigningDomain::RaftPeerDialler, .label = "fastcache-raft-dial-v1" },
-    { .domain = SigningDomain::RaftPeerVerdict, .label = "fastcache-raft-verdict-v1" },
-    { .domain = SigningDomain::RaftPeerFrame, .label = "fastcache-raft-frame-v1" },
     { .domain = SigningDomain::NodeProof, .label = "fastcache-node-proof-v1" },
 } };
 
@@ -236,7 +217,7 @@ static_assert(SigningLabelsSeparateDomains(),
 /// **What that does and does not guarantee.** This module exposes no other
 /// comparison, and each wire's verifier goes through it -- `VerifyLeaseToken` via
 /// `AuthenticateLeaseToken`, `DiscoveryService` via `DiscoveryWire::VerifyProofTag`,
-/// and the Raft peer wire via `PskRaftPeerCredential::Verify`. It does NOT make a hand-rolled comparison
+/// and the `0xFC` surface via `VerifyNodeProof`. It does NOT make a hand-rolled comparison
 /// impossible: signing entry points are public because minting is a separate act,
 /// so a future caller could take a tag from one and compare it itself. That is
 /// the residual, and it is smaller than it was rather than gone. `ctest -R

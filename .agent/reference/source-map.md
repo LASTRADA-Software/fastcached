@@ -33,7 +33,10 @@ src/FastCache/
                 refusing the all-zero secret) and Hkdf (RFC 5869, over Sha256's
                 HMAC) -- which is the ONLY first-party code that reaches the
                 vendored Monocypher, so each primitive's traps are decided once,
-                beside its RFC vectors (#178)
+                beside its RFC vectors (#178) -- and SessionSeal, the one construction
+                that tags a session's frames under the key its handshake agreed, at an
+                implicit position: here rather than beside the Raft peer wire it was
+                written for, because the `0xFC` wire needs the same thing next
   Async/        Task<T>, Cancellation, ResumeOn, SleepUntil,
                 InterruptibleSleepUntil (a bounded wait a stop can interrupt),
                 DeadlineTimer (the same shape with a callback, for a timeout that
@@ -80,11 +83,12 @@ src/FastCache/
                 RaftLog::Compact's precondition satisfiable at all) /
                 IRaftTransport / IRaftStateMachine / IRaftMessageSink seams, plus
                 RaftWire (the 0xFA peer frame), RaftPeerSession (the handshake
-                and the per-frame tag every peer connection proves the cluster key
-                with — pure, so the server, the transport and RaftClusterHarness
-                drive the same objects — reached through IRaftPeerCredential,
-                because Cluster/ includes Consensus/ and the key's signing seam
-                lives in Cluster/), RaftPeerTransport (outbound, one coroutine per
+                every peer connection proves each end's OWN identity key with, and
+                the session key both ends agree for the per-frame tag -- pure, so the
+                server, the transport and RaftClusterHarness drive the same objects --
+                reached through IRaftPeerIdentity over IRaftPeerKeys, because
+                Cluster/ includes Consensus/ and the roster the keys come from is
+                Cluster/'s ClusterState), RaftPeerTransport (outbound, one coroutine per
                 peer on the reactor), RaftPeerServer (inbound, also on the reactor)
                 and RaftMembership (the member set as a log entry) — Raft,
                 split into a pure state machine and a coroutine driver that
@@ -109,8 +113,9 @@ src/FastCache/
                 of the sockets sharing a port is handed a unicast and the
                 challenge and the proof are both unicast),
                 PeerDirectory (who proved the key, and where),
-                PskRaftPeerCredential (the pre-shared key as the Raft peer wire
-                proves it, one SigningDomain per MAC purpose),
+                RosterKeys (the keys the Raft peer wire judges members by: the
+                command line's `@<key>` until the replicated state says otherwise,
+                with a revoked key staying revoked whatever the command line says),
                 ClusterState + ClusterStateMachine — the cluster's replicated
                 configuration: who is a member, WHERE they answer, and the settings
                 every member must agree on — and MembershipPolicy, the pure decision

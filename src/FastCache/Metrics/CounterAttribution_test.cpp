@@ -545,7 +545,7 @@ TEST_CASE("counter-attribution: the mechanism figures quoted beside the table st
     // was never taken under. Drift is a red build, which is what the previous "106 of 144" --
     // a sentence with nothing watching it -- did not get.
     CHECK(incremented.size() == 39);
-    CHECK(refusalRow.size() == 104);
+    CHECK(refusalRow.size() == 111);
     CHECK(outcomeRow.size() == 7);
     CHECK(returned.size() == 4);
 
@@ -556,9 +556,9 @@ TEST_CASE("counter-attribution: the mechanism figures quoted beside the table st
     // No catalogue row is written by none of the four. The check for that is the whole
     // catalogue, not a count: a row nobody writes is a row whose surface was guessed.
     CHECK(anyWriter.size() == spellings.size());
-    CHECK(spellings.size() - incremented.size() == 111);
+    CHECK(spellings.size() - incremented.size() == 118);
 
-    // 102 rows have a refusal row; 101 of them have no increment site. Two figures one apart
+    // 111 rows have a refusal row; 110 of them have no increment site. Two figures one apart
     // measuring different things is how a census gets quoted wrong -- the first draft of the
     // comment beside `CounterSoleWriterTable` said 101 for both -- so the REACH of a
     // SurfaceRefusal-only reading is asserted separately from the row count.
@@ -566,9 +566,9 @@ TEST_CASE("counter-attribution: the mechanism figures quoted beside the table st
     for (auto const& name: refusalRow)
         if (!incremented.contains(name))
             reachedByRefusalRowsAlone.insert(name);
-    CHECK(reachedByRefusalRowsAlone.size() == 103);
+    CHECK(reachedByRefusalRowsAlone.size() == 110);
 
-    // And four rows are written two ways, which is why the column sums to 152 over 148 rows.
+    // And four rows are written two ways, which is why the column sums to 161 over 157 rows.
     CHECK(incremented.size() + refusalRow.size() + outcomeRow.size() + returned.size() == spellings.size() + 4);
 }
 

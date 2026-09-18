@@ -170,6 +170,31 @@ enum class IdentityNeed : std::uint8_t
 [[nodiscard]] std::optional<std::string> SelfKeyContradiction(NodeConfig const& cfg,
                                                               std::optional<Ed25519PublicKey> const& held);
 
+/// Why `--print-identity` has nothing to print (#178).
+///
+/// A node with no state directory holds no key (`HoldsNodeKey`), so there is no identity a
+/// peer could be told about -- and minting one somewhere it would not survive a restart would
+/// hand the operator a key the next start does not hold.
+inline constexpr std::string_view PrintIdentityNeedsStateDirectory =
+    "--print-identity needs a state directory to find or mint the identity in: this node runs no consensus and "
+    "names no --cluster-dir. Pass the flags the node runs with";
+
+/// What `--print-identity` prints (#178): one `name value` line per fact, the names the ones
+/// `fastcache-cli node` reports under.
+///
+/// Pure, and apart from the verb, so what an operator copies into the other members'
+/// command lines is asserted rather than eyeballed: the `raft-peer` line is the token
+/// `--raft-peer` parses back into this very member, key included.
+/// @param id The node's id; empty on a node that runs no consensus and was named none, which
+///        prints no `node-id` line and no token.
+/// @param key Its public key, shown whole.
+/// @param dialAddress Where its peers dial it, when this configuration says; without one the
+///        token cannot be written and is left out rather than guessed.
+/// @return The lines, each ending in a newline.
+[[nodiscard]] std::string DescribeIdentity(std::string_view id,
+                                           Ed25519PublicKey const& key,
+                                           std::optional<std::string> const& dialAddress);
+
 /// Put a resolved identity into a configuration, including this node's own peer entry.
 ///
 /// **Both halves, in one function, because a derived identity is unusable without the
