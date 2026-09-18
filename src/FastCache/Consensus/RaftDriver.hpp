@@ -148,6 +148,36 @@ class RaftDriver
     /// -- it is on the path that also has to send the next heartbeat.
     using RoleObserver = std::function<void(RoleChange const& change)>;
 
+    /// A leader's snapshot this node would not take on, because its application
+    /// cannot read the state (#1552).
+    ///
+    /// Held for as long as it describes this node: from the first refusal until the
+    /// node has applied past the index it refused -- by a snapshot it CAN read, or by
+    /// entries a later leader still holds. Until then the node is a follower that is
+    /// behind and knows it, and says so.
+    struct InstallRefusal
+    {
+        LogIndex index;        ///< The snapshot, by the index it is as of.
+        NodeId leader;         ///< Who offered it.
+        ConsensusError reason; ///< Why the application cannot read it, versions and all.
+
+        /// Value equality, so a refusal repeated every heartbeat is reported once.
+        [[nodiscard]] bool operator==(InstallRefusal const& other) const noexcept
+        {
+            return index == other.index && leader == other.leader && reason.code == other.reason.code
+                   && reason.context == other.reason.context;
+        }
+    };
+
+    /// Told whenever this node starts refusing a leader's snapshot, starts refusing a
+    /// different one, or stops refusing -- and never otherwise.
+    ///
+    /// Pushed for `RoleObserver`'s reason, and called from the same threads under the
+    /// same rules: whichever advanced the node, and it must not block. A leader offers
+    /// the snapshot again every round, so an observer told each time would be told the
+    /// same thing several times a second.
+    using InstallRefusalObserver = std::function<void(std::optional<InstallRefusal> const& refusal)>;
+
     /// Build a driver over @p node, handing @p application what the node recovered.
     ///
     /// **The one way a driver is built**, and a factory rather than a constructor
@@ -193,6 +223,10 @@ class RaftDriver
     /// Called once, before `Run`.
     /// @param observer Told about role changes; may be empty to stop observing.
     void ObserveRole(RoleObserver observer);
+
+    /// Install the install-refusal observer, for `ObserveRole`'s reasons.
+    /// @param observer Told when a refusal starts, changes or ends; may be empty.
+    void ObserveInstallRefusal(InstallRefusalObserver observer);
 
     /// Advance time, doing whatever falls due.
     /// @param now The current instant.
@@ -280,6 +314,13 @@ class RaftDriver
         /// index -- and read apart they could straddle a commit. Empty on a node that
         /// does not lead, which tracks nobody's log but its own.
         std::unordered_map<NodeId, LogIndex> matchIndex;
+
+        /// The leader's snapshot this node is refusing, if it is (#1552).
+        ///
+        /// Under the same lock as `commitIndex` for `term`'s reason: a refusal describes
+        /// a node that has NOT reached an index, and read apart from the commit index the
+        /// two could describe different moments.
+        std::optional<InstallRefusal> installRefusal;
     };
 
     /// @return What this node believes about its own cluster, read together.
@@ -376,6 +417,11 @@ class RaftDriver
     /// @param cause What a step-down reported, if this step had one.
     void PublishRoleIfChanged(std::optional<TermAdoption> const& cause);
 
+    /// Hold @p refusal as this node's install refusal, reporting it only if it moved.
+    /// `_mutex` must be held.
+    /// @param refusal The refusal now in force, or nullopt when there is none.
+    void PublishInstallRefusal(std::optional<InstallRefusal> refusal);
+
     /// Trade the applied prefix of the log for a snapshot, if enough has piled up.
     ///
     /// Runs after the outputs rather than as one of them, because it is
@@ -396,6 +442,10 @@ class RaftDriver
     IRaftStateMachine& _application;
     CompactionPolicy _compaction;
     RoleObserver _onRole;
+    InstallRefusalObserver _onInstallRefusal;
+
+    /// The leader's snapshot this node is refusing; see `InstallRefusal`.
+    std::optional<InstallRefusal> _installRefusal;
 
     /// What was last reported, so an unchanged role is not re-announced.
     ///

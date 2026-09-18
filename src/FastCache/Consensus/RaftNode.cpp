@@ -1088,7 +1088,7 @@ std::expected<RaftNode::Proposal, ConsensusError> RaftNode::Propose(std::vector<
     return Proposal { .index = index, .output = std::move(output) };
 }
 
-RaftOutput RaftNode::Receive(RaftMessage const& message, TimePoint now)
+RaftOutput RaftNode::Receive(RaftMessage const& message, TimePoint now, SnapshotReadability readability)
 {
     auto output = RaftOutput {};
 
@@ -1122,7 +1122,7 @@ RaftOutput RaftNode::Receive(RaftMessage const& message, TimePoint now)
                    [&](RequestVoteResponse const& response) { OnRequestVoteResponse(response, now, output); },
                    [&](AppendEntriesRequest const& request) { OnAppendEntries(request, now, output); },
                    [&](AppendEntriesResponse const& response) { OnAppendEntriesResponse(response, now, output); },
-                   [&](InstallSnapshotRequest const& request) { OnInstallSnapshot(request, now, output); },
+                   [&](InstallSnapshotRequest const& request) { OnInstallSnapshot(request, now, readability, output); },
                    [&](InstallSnapshotResponse const& response) { OnInstallSnapshotResponse(response, now, output); },
                },
                message);
@@ -1139,7 +1139,10 @@ bool RaftNode::IsPreVoteExempt(RaftMessage const& message) noexcept
     return response != nullptr && response->decision == VoteDecision::Granted;
 }
 
-void RaftNode::OnInstallSnapshot(InstallSnapshotRequest const& request, TimePoint now, RaftOutput& output)
+void RaftNode::OnInstallSnapshot(InstallSnapshotRequest const& request,
+                                 TimePoint now,
+                                 SnapshotReadability readability,
+                                 RaftOutput& output)
 {
     auto const reply = [&](AppendResult result, LogIndex matchIndex) {
         output.messages.push_back(OutboundMessage {
@@ -1194,6 +1197,26 @@ void RaftNode::OnInstallSnapshot(InstallSnapshotRequest const& request, TimePoin
     if (request.lastIncludedIndex <= _log.SnapshotIndex() || request.lastIncludedIndex <= _commitIndex)
     {
         reply(AppendResult::Accepted, _commitIndex);
+        return;
+    }
+
+    // A snapshot this node's application cannot read is REFUSED, and this is the last
+    // point that can (#1552): everything below resets the log, moves both indices past
+    // the snapshot, persists it and acknowledges it -- after which the application would
+    // hold its old state under an applied index that says otherwise, and every later
+    // entry would be applied on top of the wrong base. Refused, this node stays exactly
+    // where it was: a follower that is BEHIND, which Raft already knows how to be, rather
+    // than one reporting a state it does not hold. The leader counts the answer as
+    // contact, advances nothing and offers the snapshot again, so the node catches up
+    // the moment it can read one -- an upgrade, or a leader whose format it shares.
+    //
+    // After the covered check, which needs no reading: a node already holding this much
+    // state answers as it always has. And after the leader was HEARD, above, so a refused
+    // install still keeps this node from campaigning against the leader offering it.
+    if (readability == SnapshotReadability::Unreadable)
+    {
+        output.refusedSnapshot = request.lastIncludedIndex;
+        reply(AppendResult::Rejected, LogIndex::BeforeFirst());
         return;
     }
 

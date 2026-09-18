@@ -134,6 +134,22 @@ static_assert(std::ranges::none_of(StandingTable,
     return StandingTable[static_cast<std::size_t>(standing)];
 }
 
+/// Whether this node's application can take on the state a leader's snapshot carries.
+///
+/// **Private: never transmitted or persisted**, so no enumerator states a value.
+///
+/// Decided by the driver, which holds the application, and handed to `RaftNode::Receive`
+/// beside the message (#1552) -- the node is where the PROTOCOL consequence is decided,
+/// and it must be decided there: a snapshot the application cannot read is refused
+/// before the node resets its log, moves its indices or acknowledges anything, while
+/// the leader that sent it still counts as heard. Deciding it after the node had taken
+/// the snapshot on would leave an acknowledgement nothing can retract.
+enum class SnapshotReadability : std::uint8_t
+{
+    Readable,   ///< Take it on, as ever.
+    Unreadable, ///< Refuse it: answer `Rejected` and stay where this node is.
+};
+
 /// One Raft node, as a deterministic state machine.
 ///
 /// **Performs no I/O and reads no clock of its own.** Time arrives as a
@@ -404,8 +420,13 @@ class RaftNode
     /// Handle one received message.
     /// @param message The message, from any member.
     /// @param now The current instant.
+    /// @param readability For an `InstallSnapshotRequest`, whether the application can
+    ///        take its state on -- the driver asks, since only it holds the application
+    ///        (#1552). Ignored for every other message.
     /// @return What the driver should do.
-    [[nodiscard]] RaftOutput Receive(RaftMessage const& message, TimePoint now);
+    [[nodiscard]] RaftOutput Receive(RaftMessage const& message,
+                                     TimePoint now,
+                                     SnapshotReadability readability = SnapshotReadability::Readable);
 
   private:
     /// Private, so `Create` is the only way in and its validation cannot be
@@ -654,7 +675,10 @@ class RaftNode
     void OnRequestVoteResponse(RequestVoteResponse const& response, TimePoint now, RaftOutput& output);
     void OnAppendEntries(AppendEntriesRequest const& request, TimePoint now, RaftOutput& output);
     void OnAppendEntriesResponse(AppendEntriesResponse const& response, TimePoint now, RaftOutput& output);
-    void OnInstallSnapshot(InstallSnapshotRequest const& request, TimePoint now, RaftOutput& output);
+    void OnInstallSnapshot(InstallSnapshotRequest const& request,
+                           TimePoint now,
+                           SnapshotReadability readability,
+                           RaftOutput& output);
     void OnInstallSnapshotResponse(InstallSnapshotResponse const& response, TimePoint now, RaftOutput& output);
     [[nodiscard]] bool NeedsSnapshot(NodeId const& peer) const;
     [[nodiscard]] InstallSnapshotRequest MakeInstallSnapshotFor() const;

@@ -148,6 +148,17 @@ class RaftClusterHarness
     /// @return Nothing once it runs again; otherwise why it does not, and it is down.
     [[nodiscard]] std::expected<void, ConsensusError> Restart(NodeId const& who);
 
+    /// Make a node's application unable, or able again, to read any snapshot.
+    ///
+    /// What a member running a build that reads another state format looks like from
+    /// the consensus layer's side (#1552): every snapshot a leader offers it is one its
+    /// application cannot take on. Lifting it is that member being upgraded to the
+    /// format its leader writes -- and a node that stayed behind rather than taking a
+    /// snapshot on catches up by itself from there.
+    /// @param who Which node.
+    /// @param unreadable Whether snapshots are now beyond it.
+    void SetSnapshotsUnreadable(NodeId const& who, bool unreadable);
+
     /// Bring up a machine that has no cluster, on the same network.
     ///
     /// The shape a node being added to a running fleet actually has: an empty
@@ -262,6 +273,10 @@ class RaftClusterHarness
         /// snapshot carried in never appears here at all.
         std::vector<AppliedEntry> applied;
 
+        /// Whether this node's application can read no snapshot at all; see
+        /// `SetSnapshotsUnreadable`.
+        bool snapshotsUnreadable = false;
+
         /// What this node's application HOLDS: every entry it has applied or been
         /// restored with, in index order (#1542).
         ///
@@ -333,6 +348,11 @@ class RaftClusterHarness
             return {};
         }
 
+        [[nodiscard]] std::expected<void, ConsensusError> CanRestore(std::span<std::byte const> state) const override
+        {
+            return _harness.CanRestoreApplication(_who, state);
+        }
+
         [[nodiscard]] std::vector<std::byte> TakeSnapshot() override
         {
             return EncodeApplication(_harness.Find(_who).application);
@@ -358,6 +378,16 @@ class RaftClusterHarness
     /// @param state The snapshot's bytes.
     /// @return The entries, or nullopt for bytes it cannot have written.
     [[nodiscard]] static std::optional<std::vector<AppliedEntry>> DecodeApplication(std::span<std::byte const> state);
+
+    /// Whether `who`'s application could take on `state`, without taking it on.
+    ///
+    /// Refused for bytes its encoder cannot have written, and for every snapshot while a
+    /// case has made the member unable to read them (`SetSnapshotsUnreadable`).
+    /// @param who The node.
+    /// @param state A snapshot's bytes.
+    /// @return Nothing when `RestoreApplication` would take it on; otherwise why not.
+    [[nodiscard]] std::expected<void, ConsensusError> CanRestoreApplication(NodeId const& who,
+                                                                            std::span<std::byte const> state) const;
 
     /// Replace `who`'s application state with the one `state` encodes, or refuse it.
     ///
@@ -618,22 +648,41 @@ inline std::optional<std::vector<AppliedEntry>> RaftClusterHarness::DecodeApplic
     return entries;
 }
 
+inline std::expected<void, ConsensusError> RaftClusterHarness::CanRestoreApplication(NodeId const& who,
+                                                                                     std::span<std::byte const> state) const
+{
+    if (At(who).snapshotsUnreadable)
+        return std::unexpected { UnsupportedFormatVersion(who + " reads no snapshot: a case made it so") };
+    if (!DecodeApplication(state).has_value())
+        return std::unexpected { StorageFailure(who + "'s encoder cannot have written these bytes") };
+    return {};
+}
+
+inline void RaftClusterHarness::SetSnapshotsUnreadable(NodeId const& who, bool unreadable)
+{
+    Find(who).snapshotsUnreadable = unreadable;
+}
+
 inline std::expected<void, ConsensusError> RaftClusterHarness::RestoreApplication(NodeId const& who,
                                                                                   std::span<std::byte const> state,
                                                                                   SnapshotOrigin origin)
 {
-    auto restored = DecodeApplication(state);
-    if (!restored.has_value())
+    // Refused exactly where `CanRestoreApplication` refuses, so the two cannot come to
+    // disagree -- which the driver treats as fatal, and which would be this harness's doing.
+    // An INSTALLED one refused here is a violation as well: the driver asked first, so it
+    // should never have been handed one (#1552).
+    if (auto readable = CanRestoreApplication(who, state); !readable.has_value())
     {
-        auto const refused = std::format(
-            "{} holds application state the encoder {} uses cannot have written", TraitsOf(origin).described, who);
+        auto refusal = std::move(readable).error();
+        refusal.context = std::format("{}: {}", TraitsOf(origin).described, refusal.context);
         if (origin == SnapshotOrigin::Installed)
-            _violations.push_back("Snapshot: " + refused);
-        return std::unexpected { StorageFailure(refused) };
+            _violations.push_back("Snapshot: " + refusal.context + ", and it was handed to the application anyway");
+        return std::unexpected { std::move(refusal) };
     }
 
-    // Replace, never merge -- the contract this harness exists to hold production to.
-    Find(who).application = *std::move(restored);
+    // Replace, never merge -- the contract this harness exists to hold production to. It
+    // decodes: `CanRestoreApplication` asked that very question above.
+    Find(who).application = DecodeApplication(state).value_or(std::vector<AppliedEntry> {});
     return {};
 }
 

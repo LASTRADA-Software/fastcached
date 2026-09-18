@@ -114,6 +114,13 @@ tombstones). Either way the directory is intact; what an operator does is:
    with empty logs under their bootstrap configuration (`--raft-peer`), or waiting to be
    admitted if they were started with `--raft-join`.
 
+A RUNNING member offered a snapshot by a leader on another state format does not stop: it
+refuses the snapshot and stays behind, raising the `unreadable-leader-snapshot` condition
+(`fastcache-cli node-conditions`, and the fleet page). It follows no change the cluster makes
+until it can read what the leader sends, and catches up by itself once it runs the leader's
+build — nothing needs moving aside. That is the one condition a mixed fleet shows on its own,
+and the reason to finish an upgrade rather than leave it half done.
+
 Whatever the cluster agreed at **runtime** has to be agreed again once a leader is
 elected: members admitted with `--cluster-admit` or `--cluster-admit-learner`, and
 cluster settings (`--cluster-set`). Members found by `--discovery` are re-admitted by

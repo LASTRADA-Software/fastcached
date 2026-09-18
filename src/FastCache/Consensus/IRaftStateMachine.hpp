@@ -23,7 +23,9 @@ namespace FastCache::Consensus
 /// call says which it is (#1542). A snapshot this node RECOVERED is its own durable
 /// state, and a node that cannot read it refuses to start -- running on the entries
 /// above it alone would be a state no member of the cluster ever held. One a leader
-/// INSTALLED arrived while the node was running, and the machine keeps what it holds.
+/// INSTALLS is asked about first, through `CanRestore`, and a node that cannot read it
+/// does not take it on at all: it stays behind (#1552). So an installed snapshot
+/// refused HERE is a machine contradicting its own answer, and the node stops.
 enum class SnapshotOrigin : std::uint8_t
 {
     Recovered, ///< This node's own, read back from its storage when the driver was built.
@@ -47,15 +49,16 @@ struct SnapshotOriginTraits
 ///
 /// A table rather than two literals at the one implementation that logs, because
 /// the consequence is not that implementation's to decide: a recovered snapshot is
-/// refused by `RaftDriver::Create`, and an installed one is kept out by every
-/// machine's contract below. The wording belongs beside the contract it states.
+/// refused by `RaftDriver::Create`, and an installed one that `CanRestore` accepted and
+/// `RestoreSnapshot` then refused stops the driver (#1552). The wording belongs beside
+/// the contract it states.
 inline constexpr EnumTable<SnapshotOrigin, SnapshotOriginTraits> SnapshotOriginTable { {
     { .origin = SnapshotOrigin::Recovered,
       .described = "the snapshot this node recovered from its own storage",
       .consequence = "this node will not start on it" },
     { .origin = SnapshotOrigin::Installed,
       .described = "a snapshot the leader installed",
-      .consequence = "keeping current state" },
+      .consequence = "keeping current state, and this node stops following its cluster" },
 } };
 
 static_assert(RowsInEnumeratorOrder(SnapshotOriginTable, &SnapshotOriginTraits::origin),
@@ -126,6 +129,23 @@ class IRaftStateMachine
     ///         codes `RestoreSnapshot` refuses with.
     [[nodiscard]] virtual std::expected<void, ConsensusError> CanRead(std::span<std::byte const> command) const = 0;
 
+    /// Whether `RestoreSnapshot` could take on @p state, without taking it on.
+    ///
+    /// Asked of every snapshot a LEADER sends, before the node installs it (#1552). A
+    /// node that took on a snapshot its application could not read would move its
+    /// applied index past it and persist and acknowledge it, while the application kept
+    /// its old state -- so every entry after it would be applied on a base the snapshot
+    /// was meant to replace, and the node would serve that as a current replica. Asked
+    /// first, a refusal means the node never took it on: it answers the leader that it
+    /// did not, stays where it was, and says so.
+    ///
+    /// Const and free of effects, for `CanRead`'s reason; and in agreement with
+    /// `RestoreSnapshot`, which may be handed exactly the bytes this accepted.
+    /// @param state A snapshot's application bytes.
+    /// @return Nothing when `RestoreSnapshot` would replace the state with it; otherwise
+    ///         why not, in the two codes `RestoreSnapshot` refuses with.
+    [[nodiscard]] virtual std::expected<void, ConsensusError> CanRestore(std::span<std::byte const> state) const = 0;
+
     /// Serialize everything applied so far, so the log below it can be discarded.
     ///
     /// The bytes are opaque to consensus, exactly as an entry's payload is. What
@@ -154,9 +174,10 @@ class IRaftStateMachine
     /// cannot read are refused whole, never half-restored: at recovery the refusal
     /// stops the node starting (`RaftDriver::Create`), and at install the machine
     /// keeps what it holds, since clearing it would turn "I cannot read your state"
-    /// into "the cluster has no members". What a node should do next with a leader's
-    /// snapshot it cannot read is the install path's own question, and this call does
-    /// not answer it.
+    /// into "the cluster has no members". An install reaches here only once
+    /// `CanRestore` accepted the same bytes, so a refusal at install is the machine
+    /// contradicting itself -- and the driver, which has by then persisted and
+    /// acknowledged the snapshot, stops (#1552).
     /// @param state Bytes previously produced by `TakeSnapshot` on some node.
     /// @param origin Which of the two callers this is, so a refusal says so.
     /// @return Nothing once the state is replaced. Otherwise why not:

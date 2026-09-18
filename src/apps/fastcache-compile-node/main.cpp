@@ -1093,7 +1093,8 @@ using Node::NodeReloader;
                                       nodeSurface != nullptr ? nodeSurface->BoundEndpoint() : std::string {},
                                       membership,
                                       metrics,
-                                      logger);
+                                      logger,
+                                      &conditions);
     if (!consensusOrRefusal.has_value())
     {
         // No flag prefix here, for the reason the cache tier's line below has none:

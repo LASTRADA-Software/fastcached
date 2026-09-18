@@ -291,6 +291,16 @@ struct RaftOutput
     /// correct; a case that asserts it can say which rule refused rather than only
     /// that one did.
     std::optional<VoteRefusal> voteRefusal;
+
+    /// The index of a leader's snapshot this node would not take on, because its
+    /// application cannot read the state (#1552); absent otherwise.
+    ///
+    /// Nothing to DO -- the `Rejected` answer is already in `messages`, and nothing was
+    /// installed, persisted or applied. What it adds is that the refusal happened, which
+    /// the driver turns into a report an operator can see: a node refusing every snapshot
+    /// its leader sends is a node that will never catch up until something changes, and
+    /// from the outside it looks exactly like a slow one.
+    std::optional<LogIndex> refusedSnapshot;
 };
 
 } // namespace FastCache::Consensus

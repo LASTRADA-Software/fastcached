@@ -1210,3 +1210,56 @@ TEST_CASE("A node whose own recovered snapshot its application cannot read stays
 
     RequireNoViolations(cluster);
 }
+
+TEST_CASE("A follower that cannot read its leader's snapshot stays behind, applies nothing, and catches up once it can",
+          "[consensus][raft][cluster][snapshot]")
+{
+    // #1552 across a cluster. A follower cut off while the leader compacted can only be
+    // caught up by the leader's snapshot; one whose build reads another state format
+    // refuses it rather than take on a state it cannot hold, and so stays EXACTLY where it
+    // was -- same application, same applied index -- while the other two carry on without
+    // it. Nothing is applied on its stale base, and no safety property is disturbed. Once
+    // it can read the snapshot (an upgrade), it takes it on and catches up by itself.
+    RaftClusterHarness cluster { { "n1", "n2", "n3" }, ClusterKey, 1, CompactOften };
+    REQUIRE(SettleOnLeader(cluster));
+    auto const leader = Unwrap(cluster.Leader());
+    auto const behind = NodeId { leader == "n3" ? "n2" : "n3" };
+
+    cluster.Partition({ behind });
+    ProposeSeveral(cluster, 10);
+    cluster.Run(60);
+    REQUIRE(cluster.At(leader).driver->Node().SnapshotIndex() > cluster.At(behind).driver->Node().LastApplied());
+
+    cluster.SetSnapshotsUnreadable(behind, true);
+    auto const heldBefore = cluster.At(behind).application;
+    auto const appliedBefore = cluster.At(behind).driver->Node().LastApplied();
+    auto const historyBefore = cluster.At(behind).applied.size();
+
+    cluster.Heal();
+    cluster.Run(200);
+
+    // Refused, and held as a refusal of the leader's snapshot.
+    auto const held = cluster.At(behind).driver->CurrentProgress().installRefusal;
+    REQUIRE(held.has_value());
+    CHECK(Unwrap(held).leader == leader);
+
+    // Stayed exactly where it was: nothing installed, nothing applied after it.
+    CHECK(cluster.At(behind).driver->Node().LastApplied() == appliedBefore);
+    CHECK(SameApplication(cluster.At(behind).application, heldBefore));
+    CHECK(cluster.At(behind).applied.size() == historyBefore);
+
+    // The next entry commits without it, and does not reach it either.
+    auto const next = cluster.ProposeOnLeader(FastCache::BytesFromString("after the refusal"));
+    REQUIRE(next.has_value());
+    cluster.Run(60);
+    CHECK(cluster.At(leader).driver->Node().CommitIndex() >= Unwrap(next));
+    CHECK(cluster.At(behind).applied.size() == historyBefore);
+    RequireNoViolations(cluster);
+
+    // Upgraded: it reads the snapshot now, takes it on and catches up, and the refusal ends.
+    cluster.SetSnapshotsUnreadable(behind, false);
+    cluster.Run(200);
+    CHECK_FALSE(cluster.At(behind).driver->CurrentProgress().installRefusal.has_value());
+    CHECK(SameApplication(cluster.At(behind).application, cluster.At(leader).application));
+    RequireNoViolations(cluster);
+}

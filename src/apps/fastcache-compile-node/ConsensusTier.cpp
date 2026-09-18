@@ -183,6 +183,35 @@ std::string UnreadableConsensusStateRefusal(std::filesystem::path const& directo
                        Consensus::UnreadableStateRemedy);
 }
 
+std::string DescribeInstallRefusal(Consensus::RaftDriver::InstallRefusal const& refusal)
+{
+    return std::format("leader {} offered a snapshot as of log entry {} that this build cannot read ({}); this node "
+                       "stays behind it and follows no change the cluster makes until it can",
+                       refusal.leader,
+                       refusal.index.value,
+                       refusal.reason.context);
+}
+
+void ReportInstallRefusal(std::optional<Consensus::RaftDriver::InstallRefusal> const& refusal,
+                          ILogger& logger,
+                          NodeConditions* conditions)
+{
+    if (!refusal.has_value())
+    {
+        logger.Log(LogLevel::Info,
+                   "consensus: this node has caught up past the leader's snapshot it could not read, and follows its "
+                   "cluster again");
+        if (conditions != nullptr)
+            conditions->Clear(NodeCondition::UnreadableLeaderSnapshot);
+        return;
+    }
+
+    auto const said = DescribeInstallRefusal(*refusal);
+    logger.Logf(LogLevel::Error, "consensus: {}", said);
+    if (conditions != nullptr)
+        conditions->Raise(NodeCondition::UnreadableLeaderSnapshot, said);
+}
+
 std::string AdvertisedSchedulerEndpoint(std::string_view raftEndpoint, std::string_view schedulerBound)
 {
     // Nothing to advertise when this node serves no scheduler surface, which is a
@@ -211,7 +240,8 @@ ConsensusTier::ConsensusTier(Cluster::ClusterMember self,
                              RoleObserver onRole,
                              MembersObserver onMembers,
                              IMetricsSink& metrics,
-                             ILogger& logger):
+                             ILogger& logger,
+                             NodeConditions* conditions):
     _logger { logger },
     _storage { std::move(storage) },
     // Unseeded, so two nodes started together do not draw the same election timeout and
@@ -225,7 +255,8 @@ ConsensusTier::ConsensusTier(Cluster::ClusterMember self,
     _onRole { std::move(onRole) },
     _boundEndpoint { std::move(boundEndpoint) },
     _self { std::move(self) },
-    _onMembers { std::move(onMembers) }
+    _onMembers { std::move(onMembers) },
+    _conditions { conditions }
 {
     // Seeded with this node's own record, and its scheduler endpoint travels as a
     // value that is PRESENT even when it is empty. That is an assertion -- "I know
@@ -253,7 +284,8 @@ std::expected<std::unique_ptr<ConsensusTier>, std::string> ConsensusTier::Start(
                                                                                 RoleObserver onRole,
                                                                                 MembersObserver onMembers,
                                                                                 IMetricsSink& metrics,
-                                                                                ILogger& logger)
+                                                                                ILogger& logger,
+                                                                                NodeConditions* conditions)
 {
     // The bootstrap set, and this node must be in it. A node whose own id names no
     // member could never win a vote and could never be voted for -- it would stand
@@ -347,7 +379,8 @@ std::expected<std::unique_ptr<ConsensusTier>, std::string> ConsensusTier::Start(
         std::move(onRole),
         std::move(onMembers),
         metrics,
-        logger } };
+        logger,
+        conditions } };
 
     if (auto started = tier->Launch(cfg, members, bootstrap, endpoint.host, endpoint.port); !started.has_value())
         return std::unexpected { started.error() };
@@ -495,6 +528,15 @@ std::expected<void, std::string> ConsensusTier::Launch(NodeConfig const& cfg,
     // the moment it happens -- see `RaftDriver::RoleObserver`, and note it may call
     // this from either the timer thread or a peer reader.
     _driver->ObserveRole([this](Consensus::RaftDriver::RoleChange const& change) { PublishRole(change); });
+
+    // Answered before either loop runs, so no surface ever reads it undecided: a driver
+    // that has just been built has refused nothing. From here on the driver says when a
+    // refusal starts and ends (#1552).
+    if (_conditions != nullptr)
+        _conditions->Clear(NodeCondition::UnreadableLeaderSnapshot);
+    _driver->ObserveInstallRefusal([this](std::optional<Consensus::RaftDriver::InstallRefusal> const& refusal) {
+        ReportInstallRefusal(refusal, _logger, _conditions);
+    });
 
     // Announced BEFORE anything starts, and unconditionally. Until consensus says
     // otherwise this node is `Undecided`, which is what a node in a cluster that
@@ -1153,7 +1195,8 @@ std::expected<std::unique_ptr<ConsensusTier>, std::string> StartConsensusOrExpla
     std::string_view schedulerBound,
     NodeMembership& membership,
     IMetricsSink& metrics,
-    ILogger& logger)
+    ILogger& logger,
+    NodeConditions* conditions)
 {
     // No cluster configured, which is the common deployment: one machine, leading
     // itself. Requiring an operator to configure a one-member cluster to get that
@@ -1191,7 +1234,8 @@ std::expected<std::unique_ptr<ConsensusTier>, std::string> StartConsensusOrExpla
             membership.PublishCluster(state);
         },
         metrics,
-        logger);
+        logger,
+        conditions);
 
     // Wired here rather than at construction, and the order is forced: consensus
     // needs the port the scheduler surface BOUND in order to announce where

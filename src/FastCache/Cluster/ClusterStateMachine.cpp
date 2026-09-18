@@ -71,6 +71,13 @@ std::expected<void, ConsensusError> ClusterStateMachine::CanRead(std::span<std::
     return DecodeCommand(command).transform([](Command const&) {}).transform_error(AsHeldStateRefusal);
 }
 
+std::expected<void, ConsensusError> ClusterStateMachine::CanRestore(std::span<std::byte const> state) const
+{
+    // The decoder `RestoreSnapshot` uses, so the two cannot come to disagree about which
+    // bytes are a state -- a disagreement the driver has to treat as fatal (#1552).
+    return DecodeState(state).transform([](ClusterState const&) {}).transform_error(AsHeldStateRefusal);
+}
+
 std::vector<std::byte> ClusterStateMachine::TakeSnapshot()
 {
     auto const guard = std::shared_lock { _mutex };

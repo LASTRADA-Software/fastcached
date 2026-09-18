@@ -567,8 +567,12 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
 - **A node whose OWN snapshot, or a command its own log holds, is one this build cannot read REFUSES TO
   START** -- by name, naming the directory, both versions and the remedy -- and never runs on part of its
   state. `Create` asks `CanRead` of every command FIRST, then restores, so a refusal hands the application
-  NOTHING. The remedy keeps `node-id` and `node-key` and rejoins with `--raft-join`; a leader's INSTALLED
-  snapshot is a different question and keeps its behaviour.
+  NOTHING. The remedy keeps `node-id` and `node-key` and rejoins with `--raft-join`.
+- **A leader's snapshot the application cannot read is REFUSED before the node takes it on**, never taken
+  on and then half-restored: the driver asks `CanRestore` first and the node answers `Rejected`, stays
+  BEHIND and still counts the leader as heard (#1552). Refusing and staying behind, not stopping the tier:
+  it keeps its vote, applies nothing on a stale base, and catches up by itself once it can read one. It
+  is the `unreadable-leader-snapshot` condition, Live and Alert.
 - A seeded draw must be identical on every standard library — `UniformInRange`, never
   `std::uniform_int_distribution`.
 - A node being admitted must never have bootstrapped a cluster of itself, so
