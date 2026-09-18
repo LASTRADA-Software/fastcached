@@ -1615,6 +1615,11 @@ what differs between compilers, standard libraries, hosts and tool versions.
   across presets holds `PEDANTIC_COMPILER` ON with `WERROR` OFF, which is a database no correction to
   the configure line explains. And **a symptom with two mechanisms reads as unreproducible the moment
   either one alone is ruled out.**
+- **A build under WSL is I/O-bound on `/mnt/<drive>`, not CPU-bound.** Keep the BUILD TREE on the
+  Linux filesystem (`cmake -S /mnt/... -B "$HOME/bld/<name>"`); sources may stay. Derive `-j` from
+  the host rather than inheriting a number from a script, and set `CTEST_PARALLEL_LEVEL` — a local
+  shell inherits none of CI's `env:`, so the suite runs SERIAL and nothing says so. `mold` helps
+  most on the filesystem you should not be using.
 - **When the SUBJECT under test is the build environment, a green local gate is not weak evidence —
   it is none.** One change, one afternoon, four platform defects, none visible locally: a `/_deps/`
   DENYLIST that CI's in-repo CPM cache walked past (an exclusion list bets on the world's layout; an

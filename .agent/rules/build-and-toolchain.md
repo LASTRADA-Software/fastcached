@@ -5634,6 +5634,96 @@ unreadable work tree; after `repair-worktree-pointers.sh --apply`, none failed.
   `ScratchDirectory`, which clears first. A pid separates LIVE processes; it does not separate
   a live one from a dead one's leftovers unless something clears them.
 
+## A build under WSL is I/O-bound on the Windows drive mount, not CPU-bound
+
+**The build TREE must not live under `/mnt/<drive>`.** Under WSL2 that is a **9p** mount
+(DrvFs under WSL1), where every `open` and `stat` is an RPC to the Windows side, and a build
+is millions of them; the Linux root is ext4. The SOURCES may stay there -- git, the Windows
+toolchain and an editor all reach them, and the measurement below kept them there -- but the
+objects, archives, depfiles, link outputs and `.ninja_deps` must not:
+
+```sh
+cmake -S /mnt/d/<worktree> -B "$HOME/bld/<name>" -G Ninja      # tree on ext4, sources on 9p
+```
+
+**This is stated as a MECHANISM and not as a path**, because the next machine has a different
+drive letter, a different distro and possibly WSL1. What transfers is *the build tree does not
+belong on a filesystem reached over a protocol*; what does not transfer is any of the numbers
+below.
+
+### The measurement, pinned (2026-09-18)
+
+Conditions are PINNED here and deliberately do not point at their source: a measurement's
+conditions are the world at one instant, and a pointer would let an unrelated edit silently
+re-attribute a real reading to conditions it was never taken under.
+
+<!-- table-total: none -->
+| condition | value |
+|---|---|
+| host | Ubuntu 26.04.1 LTS under WSL2, 32 cores, 45 GiB |
+| filesystems | sources and arm A/D tree on 9p (`/mnt/d`); arm B/C tree on ext4 (`/dev/sdd`) |
+| compiler | g++ 14.3.0, `CMAKE_BUILD_TYPE=Debug`, `-j 32` |
+| linkers | GNU ld 2.46, mold 2.40.4 |
+| launcher | `USE_COMPILER_CACHE=OFF` in every arm, or the reading is of the cache |
+| CPM cache | warm and shared by both arms, already on ext4 |
+| commit | `0f38bd77`, both trees identical afterwards at 4.7 GB / 4737 files |
+| swap | **0 pages in every phase** -- 32 parallel C++23 TUs against 45 GiB can page, and a paging run measures the memory ceiling while looking exactly like a slow filesystem |
+
+<!-- table-total: none -->
+| arm | configure | cold build | relink |
+|---|---|---|---|
+| 9p + GNU ld | 78.5s | 450.6s | 188.1s |
+| ext4 + GNU ld | 52.6s | 131.5s | 8.3s |
+| ext4 + mold | 33.5s | -- | 6.1s |
+| 9p + mold | 44.9s | -- | 30.3s |
+
+**The build tree alone is 3.4x on a cold build and 22.6x on a relink**, with the same
+compiler, the same linker and the sources left on 9p. The relink figure is the one a day is
+made of: edit one file, rebuild, and the wait goes from 188s to 8s.
+
+**mold is real and secondary, and its shape is the interesting part.** It is worth 1.36x on
+ext4 and **6.2x on 9p** -- the win is largest on the filesystem you should not be using,
+which inverts the usual "a faster linker is a faster CPU" story: most of GNU ld's cost here
+is I/O, which 9p amplifies and mold largely avoids. And 9p+mold (30.3s) is still 3.6x slower
+than ext4+GNU ld (8.3s), so **mold compensates for the wrong filesystem rather than
+substituting for the right one.** Install it (`apt install mold`) and pass
+`-DCMAKE_EXE_LINKER_FLAGS=-fuse-ld=mold` with the shared and module pair beside it.
+
+A cold build under mold was NOT measured; linking is about 8s of ext4's 131.5s, so it can
+only move that figure by a couple of percent. That sentence is an inference from the other
+two readings and is marked as one rather than written as a third.
+
+### Parallelism is derived from the host, and said out loud
+
+**A `-j` inherited from a script is a number chosen for no machine.** Every build in the
+session that produced this section ran `-j 6` on a 32-core host, because 6 was what the
+script said. Derive it (`-j "$(nproc)"`, or let ninja default to `nproc + 2`) and print what
+was derived, for the reason a benchmark states its build before any figure.
+
+**And a local shell inherits NONE of CI's environment**, which is where the suite goes
+quiet: `CTEST_PARALLEL_LEVEL` is set once in `build.yml`'s `env:` precisely so every ctest
+invocation inherits it, and a WSL shell has no such thing -- so a local suite runs **serial**
+unless it is set, and nothing says so. The figure justifying it lives in that file's own
+comment and is deliberately not restated here.
+
+Not `nproc` for the SUITE, though: these tests are themselves multi-threaded -- reactors,
+thread pools -- so 1:1 process-to-core oversubscribes and manufactures bounded-wait
+timeouts, which present as flakes rather than as a slow run. CI's 4-on-4 is 1:1 only because
+a hosted runner's tests are short and single-threaded.
+
+**The configuration is validated rather than merely faster:** the whole suite passes from an
+ext4 tree -- 4902 tests, 0 failures, 153.5s at `CTEST_PARALLEL_LEVEL=16`. A rule recommending
+a layout nobody had run the suite in would be this file's own *a fixture that has never
+completed has told you nothing*, one level up.
+
+### What this does NOT change
+
+`scripts/local-gate.sh` owns `out/build/gate-clang-debug` and `out/build/gate-gcc-release`
+**under the source directory**, so a gate run stays on the Windows mount and stays slow.
+That is stated rather than fixed here: those paths are the gate's, moving them is its own
+change, and a reader who speeds up their dev builds and then finds the gate unchanged should
+meet this sentence rather than a puzzle.
+
 ## What the TSan scope covers, and the three ways it has been wrong
 
 The scope is **one Catch2 tag expression**, living in `scripts/tsan-gate.sh`'s `TARGETS`
