@@ -463,7 +463,9 @@ std::vector<std::byte> EnrollmentResponder::AnswerDecision(Wire::EnrollControlVe
         // With NO opinion about the seat (#1449): a first approval admits a voter, and a
         // re-approval -- which recovery repeats -- keeps whatever seat the member holds,
         // so it cannot promote a machine the operator demoted to a learner.
-        auto const reply = _scheduler.ClusterAdmit(Context(peer), subject, entry->raftEndpoint, std::nullopt);
+        // No key: an enrollment carries none yet, and no opinion keeps whatever is recorded
+        // -- the same reading the seat gets, for the same reason (#178).
+        auto const reply = _scheduler.ClusterAdmit(Context(peer), subject, entry->raftEndpoint, std::nullopt, std::nullopt);
 
         // **A RE-APPROVAL reaches a cluster that already holds this member, and that is
         // a `Satisfied` refusal rather than a failure.** The consensus rulebook draws

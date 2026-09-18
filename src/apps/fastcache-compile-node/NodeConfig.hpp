@@ -7,6 +7,7 @@
 #include <FastCache/Config/SecretProvenance.hpp>
 #include <FastCache/Config/YamlReader.hpp>
 #include <FastCache/Core/Compression.hpp>
+#include <FastCache/Core/Ed25519.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Distributed/NodePolicy.hpp>
 #include <FastCache/Platform/HostInfo.hpp>
@@ -80,6 +81,11 @@ struct ClusterRequest
     /// The setting's new value for `Set`, the consensus endpoint for `Admit` and
     /// `AdmitLearner`, empty otherwise.
     std::string value;
+
+    /// The member's identity key for `Admit` and `AdmitLearner` when the operator typed
+    /// `@<key>` (#178), disengaged otherwise -- which the leader reads as *no opinion* and
+    /// which keeps whatever key is recorded, never as a key to clear.
+    std::optional<Ed25519PublicKey> publicKey;
 };
 
 /// What an operator asked of a seed's enrollment window, instead of serving.
@@ -823,6 +829,20 @@ struct NodeConfig
     std::string seedConfigTemplate;
 
     bool printSurfaces { false };
+
+    /// This node's identity key as the start resolved it, or absent on a node that holds
+    /// none (#178).
+    ///
+    /// **Not a flag**: nothing a command line or a file says reaches it. `ApplyNodeIdentity`
+    /// writes it, from what `ResolveNodeKey` read or minted, into every configuration this
+    /// process builds -- the running one and every reload candidate -- for the reason `nodeId`
+    /// is written the same way: a candidate built without it would hold a key that has
+    /// CHANGED. Only the public half: the secret never enters a configuration.
+    ///
+    /// Among the byte-wide members rather than beside `nodeId`, because it is 33 bytes with
+    /// no alignment of its own, and between two eight-aligned members it would cost seven
+    /// bytes of padding the struct's budget does not have.
+    std::optional<Ed25519PublicKey> identityPublicKey;
 
     /// Whether to cordon this machine's own worker, or lift its cordon, instead of serving.
     ///
@@ -1607,7 +1627,7 @@ using NodePublicPathFlag = PublicPathFlag;
 /// **Two rules, not one, and only the first is #384's.** The configuration file is
 /// provenance-gated: `--requirepass` can arrive in argv instead, where the exposure
 /// is `ps` rather than a mode, and that is a different problem with a different
-/// owner. The four files `NodeSecretFileTable()` names are not gated at all --
+/// owner. The files `NodeSecretFileTable()` names are not gated at all --
 /// the path is not the secret and the file is, so a world-readable cluster key is
 /// exposed however its path was named
 /// ([#752](https://github.com/LASTRADA-Software/fastcached/issues/752)).

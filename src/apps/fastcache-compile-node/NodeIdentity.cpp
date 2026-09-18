@@ -227,7 +227,8 @@ std::expected<NodeIdentity, std::string> ResolveNodeIdentity(std::filesystem::pa
         if (configured.empty() || configured == trimmed)
             return NodeIdentity { .id = std::string { trimmed },
                                   .origin =
-                                      configured.empty() ? NodeIdentityOrigin::Recorded : NodeIdentityOrigin::Configured };
+                                      configured.empty() ? NodeIdentityOrigin::Recorded : NodeIdentityOrigin::Configured,
+                                  .publicKey = std::nullopt };
     }
 
     // Drawn BEFORE anything is created, so a mint this host cannot draw leaves no directory
@@ -250,11 +251,30 @@ std::expected<NodeIdentity, std::string> ResolveNodeIdentity(std::filesystem::pa
         return std::unexpected { written.error() };
 
     return NodeIdentity { .id = *minted,
-                          .origin = configured.empty() ? NodeIdentityOrigin::Minted : NodeIdentityOrigin::Configured };
+                          .origin = configured.empty() ? NodeIdentityOrigin::Minted : NodeIdentityOrigin::Configured,
+                          .publicKey = std::nullopt };
+}
+
+std::optional<std::string> SelfKeyContradiction(NodeConfig const& cfg, std::optional<Ed25519PublicKey> const& held)
+{
+    auto const* const self = ClusterSelfMember(cfg);
+    if (!held.has_value() || self == nullptr || !self->publicKey.has_value() || self->publicKey == held)
+        return std::nullopt;
+    return std::format("--raft-peer names this node ({}) with the key {}, and the key it holds is {}: either the token "
+                       "was copied from another node, or this is not the state directory it was written for. Correct "
+                       "the --raft-peer entry, or run this node from the state directory that holds that key",
+                       self->id,
+                       FormatEd25519PublicKey(*self->publicKey),
+                       FormatEd25519PublicKey(*held));
 }
 
 void ApplyNodeIdentity(NodeConfig& cfg, NodeIdentity const& identity)
 {
+    // The key first, because it does not need an id: a node that runs no consensus has
+    // none, and still reports the key it holds.
+    if (identity.publicKey.has_value())
+        cfg.identityPublicKey = identity.publicKey;
+
     // An identity with no id is an invocation that needed none -- a node running no
     // consensus. Answered here rather than at each call site so the reload path can
     // call this unconditionally: a branch inside that lambda is a branch that has to be
@@ -265,9 +285,17 @@ void ApplyNodeIdentity(NodeConfig& cfg, NodeIdentity const& identity)
     cfg.nodeId = identity.id;
 
     // Nothing to synthesise when the operator named this node's own `--raft-peer`, which
-    // they can only have done for an id they typed.
-    if (ClusterSelfMember(cfg) != nullptr)
+    // they can only have done for an id they typed -- but the key is filled in when the
+    // entry names none, so the record this node announces carries the key it holds. An
+    // entry naming ANOTHER key is left as typed: that is `SelfKeyContradiction`'s refusal,
+    // and quietly overwriting it would hide the mistake it exists to report.
+    if (auto const self = std::ranges::find(cfg.raftPeers, cfg.nodeId, &Cluster::ClusterMember::id);
+        self != cfg.raftPeers.end())
+    {
+        if (!self->publicKey.has_value())
+            self->publicKey = identity.publicKey;
         return;
+    }
 
     // Through `ConsensusDialAddressOf`, the one derivation of where peers dial this node
     // (#1328): `--print-surfaces` and `NodeStatus` report it, so building the entry any
@@ -289,7 +317,8 @@ void ApplyNodeIdentity(NodeConfig& cfg, NodeIdentity const& identity)
                                  .raftEndpoint = std::move(*endpoint),
                                  .schedulerEndpoint = {},
                                  .schedulerEndpointHistory = Cluster::SchedulerEndpointHistory::NeverAnnounced,
-                                 .seat = Cluster::MemberSeat::Voter });
+                                 .seat = Cluster::MemberSeat::Voter,
+                                 .publicKey = identity.publicKey });
 }
 
 } // namespace FastCache::Node

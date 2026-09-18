@@ -144,15 +144,18 @@ TEST_CASE("Every fleet column reaches the page, the JSON and the text", "[distri
     // would be maintained by the same person who forgot the renderer. This is the
     // same rule `MetricsCatalog`'s test follows, one axis over.
     auto snapshot = LeadingSnapshot();
-    snapshot.cluster =
-        Cluster::ClusterState { .members = { Cluster::ClusterMember {
-                                    .id = "n1", .raftEndpoint = "10.0.0.2:6675", .schedulerEndpoint = "10.0.0.2:6676" } },
-                                .settings = {},
-                                .clients = {},
-                                // A tombstone for the tier's reason: this case walks the TABLES, and a
-                                // section rendering from an empty vector would be covered by asserting
-                                // almost nothing about it.
-                                .forgotten = { "10.0.0.9" } };
+    snapshot.cluster = Cluster::ClusterState {
+        .members = { Cluster::ClusterMember {
+            .id = "n1", .raftEndpoint = "10.0.0.2:6675", .schedulerEndpoint = "10.0.0.2:6676", .publicKey = std::nullopt } },
+        .settings = {},
+        .clients = {},
+        // A tombstone for the tier's reason: this case walks the TABLES, and a
+        // section rendering from an empty vector would be covered by asserting
+        // almost nothing about it.
+        .forgotten = { "10.0.0.9" },
+        .principals = {},
+        .revokedKeys = {}
+    };
     snapshot.workers = { WorkerReport { .info = WorkerInfo { .id = "w1",
                                                              .fingerprint = "gcc-13-abcdef",
                                                              .endpoint = "10.0.0.2:7100",
@@ -792,16 +795,26 @@ TEST_CASE("A member that never announced and one a re-admit cleared render diffe
     auto snapshot = LeadingSnapshot();
     Cluster::ClusterState state;
     Apply(state,
-          Cluster::Command {
-              .kind = Cluster::CommandKind::AddMember, .key = "quiet", .value = "10.0.0.1:6675", .schedulerEndpoint = {} });
+          Cluster::Command { .kind = Cluster::CommandKind::AddMember,
+                             .key = "quiet",
+                             .value = "10.0.0.1:6675",
+                             .schedulerEndpoint = {},
+                             .publicKey = std::nullopt,
+                             .role = std::nullopt });
     Apply(state,
           Cluster::Command { .kind = Cluster::CommandKind::AddMember,
                              .key = "moved",
                              .value = "10.0.0.2:6675",
-                             .schedulerEndpoint = "10.0.0.2:6676" });
+                             .schedulerEndpoint = "10.0.0.2:6676",
+                             .publicKey = std::nullopt,
+                             .role = std::nullopt });
     Apply(state,
-          Cluster::Command {
-              .kind = Cluster::CommandKind::AddMember, .key = "moved", .value = "10.0.0.2:6675", .schedulerEndpoint = {} });
+          Cluster::Command { .kind = Cluster::CommandKind::AddMember,
+                             .key = "moved",
+                             .value = "10.0.0.2:6675",
+                             .schedulerEndpoint = {},
+                             .publicKey = std::nullopt,
+                             .role = std::nullopt });
     snapshot.cluster = state;
 
     // The text section: one row each, and the rows differ in the state column while
@@ -900,7 +913,8 @@ TEST_CASE("Collecting a fleet reads the registry per machine and the counters as
     CHECK(scheduler.Register(member, announce).status == CompileCacheWire::Status::Ok);
 
     Cluster::ClusterState state;
-    state.members.push_back(Cluster::ClusterMember { .id = "n1", .raftEndpoint = "10.0.0.2:6675", .schedulerEndpoint = {} });
+    state.members.push_back(Cluster::ClusterMember {
+        .id = "n1", .raftEndpoint = "10.0.0.2:6675", .schedulerEndpoint = {}, .publicKey = std::nullopt });
     FakeCluster cluster { state };
 
     auto const snapshot = CollectFleet(FleetSources { .scheduler = &scheduler, .cluster = &cluster, .metrics = &metrics });
@@ -1687,10 +1701,13 @@ TEST_CASE("A peer that got its bytes past the door cannot make the whole fleet's
     snapshot.leaderEndpoint = "10.0.0.2:7100\xFF";
     snapshot.cluster = Cluster::ClusterState { .members = { Cluster::ClusterMember { .id = "n\x80\x80",
                                                                                      .raftEndpoint = "10.0.0.2:6675\xC3",
-                                                                                     .schedulerEndpoint = "\xE2\x82" } },
+                                                                                     .schedulerEndpoint = "\xE2\x82",
+                                                                                     .publicKey = std::nullopt } },
                                                .settings = {},
                                                .clients = {},
-                                               .forgotten = {} };
+                                               .forgotten = {},
+                                               .principals = {},
+                                               .revokedKeys = {} };
     snapshot.workers = { WorkerReport { .info = WorkerInfo { .id = "w1",
                                                              .fingerprint = "gcc-13-ab\x80\x80",
                                                              .endpoint = "10.0.0.2:7100\xFF",
@@ -2197,11 +2214,19 @@ TEST_CASE("The forgotten clients reach every surface, and absent is not the same
         // would assert the representation rather than what the cluster records.
         Cluster::ClusterState state;
         Apply(state,
-              Cluster::Command {
-                  .kind = Cluster::CommandKind::ForgetClient, .key = "10.0.0.7", .value = {}, .schedulerEndpoint = {} });
+              Cluster::Command { .kind = Cluster::CommandKind::ForgetClient,
+                                 .key = "10.0.0.7",
+                                 .value = {},
+                                 .schedulerEndpoint = {},
+                                 .publicKey = std::nullopt,
+                                 .role = std::nullopt });
         Apply(state,
-              Cluster::Command {
-                  .kind = Cluster::CommandKind::ForgetClient, .key = "10.0.0.8", .value = {}, .schedulerEndpoint = {} });
+              Cluster::Command { .kind = Cluster::CommandKind::ForgetClient,
+                                 .key = "10.0.0.8",
+                                 .value = {},
+                                 .schedulerEndpoint = {},
+                                 .publicKey = std::nullopt,
+                                 .role = std::nullopt });
         snapshot.cluster = state;
 
         auto const json = RenderFleetJson(snapshot, NoHistory());
@@ -2226,11 +2251,19 @@ TEST_CASE("The forgotten clients reach every surface, and absent is not the same
         // already undone.
         Cluster::ClusterState state;
         Apply(state,
-              Cluster::Command {
-                  .kind = Cluster::CommandKind::ForgetClient, .key = "10.0.0.7", .value = {}, .schedulerEndpoint = {} });
+              Cluster::Command { .kind = Cluster::CommandKind::ForgetClient,
+                                 .key = "10.0.0.7",
+                                 .value = {},
+                                 .schedulerEndpoint = {},
+                                 .publicKey = std::nullopt,
+                                 .role = std::nullopt });
         Apply(state,
-              Cluster::Command {
-                  .kind = Cluster::CommandKind::AdmitClient, .key = "10.0.0.7", .value = {}, .schedulerEndpoint = {} });
+              Cluster::Command { .kind = Cluster::CommandKind::AdmitClient,
+                                 .key = "10.0.0.7",
+                                 .value = {},
+                                 .schedulerEndpoint = {},
+                                 .publicKey = std::nullopt,
+                                 .role = std::nullopt });
         snapshot.cluster = state;
 
         CHECK(RenderFleetJson(snapshot, NoHistory()).contains(R"("forgotten":[])"));

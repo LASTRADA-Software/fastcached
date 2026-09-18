@@ -68,7 +68,7 @@ std::span<SecretFileRow<Config, std::string> const> DaemonSecretFileTable() noex
         // local account can impersonate this daemon to its clients or decrypt a
         // captured session -- and `--requirepass` travels over that same connection,
         // so this exposure composes with the one #384 was written about.
-        { .flag = "--tls-key", .path = &Config::tlsKeyPath },
+        { .flag = "--tls-key", .path = [](Config const& config) { return config.tlsKeyPath; } },
     });
     return table;
 }
@@ -128,8 +128,8 @@ std::vector<std::filesystem::path> DaemonSecretFiles(Config const& cfg, bool sec
     // the path is not the secret and the file is, so a world-readable private key is
     // exposed whether its path was typed or read out of a configuration file.
     for (auto const& row: DaemonSecretFileTable())
-        if (auto const& path = cfg.*row.path; !path.empty())
-            files.emplace_back(path);
+        if (auto path = row.path(cfg); !path.empty())
+            files.emplace_back(std::move(path));
 
     return files;
 }

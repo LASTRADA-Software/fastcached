@@ -355,6 +355,10 @@ TEST_CASE("This build's live-stats layout is the pinned one", "[metrics][livesta
     // client built before the change will refuse this node. Update the constant in the same
     // change, and say in its message that clients and nodes upgrade together.
     INFO(std::format("StatsReadingLayout is 0x{:016x}", StatsReadingLayout));
+    // Moved by #178: one counter joined the catalogue for a cluster admission whose identity key
+    // is not one (`cluster_admissions_refused_malformed_key`), which changes which cells every
+    // live-stats reading carries. Clients and nodes upgrade together, as below.
+    //
     // Moved by #1449: the consensus block's one member list became two -- voters, then
     // learners -- so `StatsReadingWire::Grammar` went to `-5` and the field is named
     // `configuration`. Clients and nodes upgrade together: a `fastcache-cli` built before this
@@ -373,7 +377,7 @@ TEST_CASE("This build's live-stats layout is the pinned one", "[metrics][livesta
     //
     // Moved by #1484 before that: the counter cells carry a second bitmap saying WHICH absence
     // each absent cell is, so `StatsReadingWire::Grammar` went to `-4`.
-    CHECK(StatsReadingLayout == 0xb5cb4ebe15bbdd84ULL);
+    CHECK(StatsReadingLayout == 0xa185d03acd9e1bf8ULL);
 }
 
 TEST_CASE("A truncated or padded reading is refused and never half-read", "[metrics][livestats]")

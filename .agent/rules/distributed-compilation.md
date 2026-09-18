@@ -1548,7 +1548,7 @@ Consequences that are each load-bearing:
     routing around it** — and check which frame it is about before concluding it
     forbids the shape.
   - **Two arms, because the difference is whether there is a SECOND moment at all.**
-    A worker started with no configuration file still names four key files and still
+    A worker started with no configuration file still names its key files and still
     has to be told; what it has no use for is the memory, since nothing will re-ask.
     `ReportSecretExposure` is that arm and carries no watcher, so there is no second
     copy of the remembering rule — and both arms are asserted by the wiring scan

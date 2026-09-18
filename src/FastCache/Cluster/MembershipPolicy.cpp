@@ -136,7 +136,14 @@ MembershipPlan MembershipProposals(ClusterState const& state,
         // a learner an operator promotes.
         auto const seat = SeatFor(state, active, member.id);
 
-        if (known && it->raftEndpoint == member.raftEndpoint && it->schedulerEndpoint == scheduler && it->seat == seat)
+        // The key by the same rule once more (#178): no opinion is whatever is recorded. The
+        // command carries the opinion itself rather than the resolved value, because
+        // `AddMember` reads an absent key as *keep*, which is this rule stated once more at
+        // the layer that applies it.
+        auto const publicKey = member.publicKey.or_else([&] { return known ? it->publicKey : std::nullopt; });
+
+        if (known && it->raftEndpoint == member.raftEndpoint && it->schedulerEndpoint == scheduler && it->seat == seat
+            && it->publicKey == publicKey)
             continue;
 
         // A forget outranks an observation (#1528). Asked with the host `Apply` would
@@ -153,7 +160,9 @@ MembershipPlan MembershipProposals(ClusterState const& state,
         plan.proposals.push_back(Command { .kind = MemberSeatTable[static_cast<std::size_t>(seat)].admittedBy,
                                            .key = member.id,
                                            .value = member.raftEndpoint,
-                                           .schedulerEndpoint = scheduler });
+                                           .schedulerEndpoint = scheduler,
+                                           .publicKey = member.publicKey,
+                                           .role = std::nullopt });
     }
     return plan;
 }

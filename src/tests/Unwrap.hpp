@@ -3,6 +3,7 @@
 
 #include <concepts>
 #include <cstdlib>
+#include <expected>
 #include <optional>
 
 namespace FastCache::Testing
@@ -71,6 +72,25 @@ template <typename T>
     if (!value.has_value())
         std::abort();
     return *value;
+}
+
+/// `Unwrap` for a `std::expected`, on the same terms: `REQUIRE` it first.
+///
+/// A parser that used to answer an `optional` and now says WHY it refused -- the
+/// member-token grammar since #178, whose `@<key>` refusal needs its own sentence --
+/// keeps every call site that only ever wanted the value. The reason is the caller's to
+/// assert through `.error()` where it matters; here it is discarded, because a case
+/// reaching this line has already required that there is none.
+/// @tparam T The contained type.
+/// @tparam E The refusal type.
+/// @param value The result, already `REQUIRE`d to hold a value.
+/// @return A reference to its value, or to a shared default-constructed one.
+template <typename T, typename E>
+    requires std::default_initializable<T>
+[[nodiscard]] T const& Unwrap(std::expected<T, E> const& value)
+{
+    static T const absent {};
+    return value.has_value() ? *value : absent;
 }
 
 } // namespace FastCache::Testing

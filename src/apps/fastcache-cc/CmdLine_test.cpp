@@ -24,13 +24,6 @@ using FastCache::Testing::Unwrap;
 namespace
 {
 
-/// The same, for the `expected` that carries a refusal's reason.
-template <typename T, typename E>
-[[nodiscard]] T Unwrap(std::expected<T, E> const& value)
-{
-    return value.value_or(T {});
-}
-
 ParsedCommand Parse(std::vector<std::string> const& argv)
 {
     return ParseCommand(std::span<std::string const> { argv });

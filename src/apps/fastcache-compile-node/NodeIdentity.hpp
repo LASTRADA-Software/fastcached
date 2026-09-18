@@ -3,12 +3,14 @@
 
 #include "NodeConfig.hpp"
 
+#include <FastCache/Core/Ed25519.hpp>
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/ISecureRandom.hpp>
 
 #include <cstdint>
 #include <expected>
 #include <filesystem>
+#include <optional>
 #include <string>
 #include <string_view>
 
@@ -37,6 +39,13 @@ struct NodeIdentity
 {
     std::string id;                                           ///< What the cluster admits and counts votes against.
     NodeIdentityOrigin origin { NodeIdentityOrigin::Minted }; ///< Where it came from.
+
+    /// The public half of this node's identity key, or absent on a node that holds none (#178).
+    ///
+    /// Carried beside the id rather than resolved apart from it, because the two are applied to
+    /// every configuration together: a reload candidate that received the id and not the key
+    /// would hold a self member whose key has changed.
+    std::optional<Ed25519PublicKey> publicKey;
 };
 
 /// What a node says at startup about where its identity came from.
@@ -146,6 +155,21 @@ enum class IdentityNeed : std::uint8_t
 /// @return `MintedNodeIdLength` lowercase hex characters, or why none could be drawn.
 [[nodiscard]] std::expected<std::string, SecureRandomError> MintNodeId(ISecureRandom& random);
 
+/// Whether this node's own `--raft-peer` names a key other than the one it holds (#178).
+///
+/// A startup refusal, asked once the key is resolved. `@<key>` on this node's own entry is
+/// the operator's claim about the machine they are typing on, and a claim that disagrees with
+/// the key in its state directory is one of two mistakes -- a token copied from another node,
+/// or a state directory that is not the one the operator thinks -- and running on with it
+/// would announce a key to the cluster that the node does not hold. Both are the operator's
+/// to resolve, so the node refuses rather than choosing.
+/// @param cfg The configuration, with its identity applied.
+/// @param held The key this node holds, or nothing on a node that holds none -- which
+///        nothing can contradict.
+/// @return Why this node refuses to start, or nullopt when there is no contradiction.
+[[nodiscard]] std::optional<std::string> SelfKeyContradiction(NodeConfig const& cfg,
+                                                              std::optional<Ed25519PublicKey> const& held);
+
 /// Put a resolved identity into a configuration, including this node's own peer entry.
 ///
 /// **Both halves, in one function, because a derived identity is unusable without the
@@ -157,6 +181,11 @@ enum class IdentityNeed : std::uint8_t
 /// function, for the reason `AssembleEffectiveConfig` is a required argument to the
 /// reloader: a candidate rebuilt without it holds an empty `--node-id`, which is an
 /// unreloadable field that has changed, so every reload would be refused by name.
+///
+/// The key reaches the configuration here too (#178), and before the id: a node that runs
+/// no consensus has no id and may still hold a key. This node's own entry gets it when the
+/// entry names none, so the record a leader announces carries the key it holds; an entry
+/// that names a DIFFERENT one is left as typed and refused by `SelfKeyContradiction`.
 /// @param cfg The configuration to complete.
 /// @param identity What this node runs as.
 void ApplyNodeIdentity(NodeConfig& cfg, NodeIdentity const& identity);

@@ -77,10 +77,12 @@ namespace
     /// says where that leaves the node, since "move it aside" alone reads as
     /// harmless -- it is a node with an empty log, and whatever the cluster agreed
     /// at runtime has to be agreed again. The identity is named as staying, because
-    /// it lives in the same directory and a wiped identity is a different node.
+    /// it lives in the same directory and a wiped identity is a different node -- both
+    /// halves of it, the id and the key that proves it (#178).
     constexpr std::string_view ForeignStoreRemedy =
         "it is intact, and there is no conversion: stop the node, move raft-state, raft-log and raft-snapshot out of "
-        "its state directory -- leaving node-id where it is -- and start it again. It comes back with an empty log "
+        "its state directory -- leaving node-id and node-key where they are -- and start it again. It comes back with "
+        "an empty log "
         "under its bootstrap configuration, so anything the cluster agreed at runtime (members admitted with "
         "--cluster-admit or --cluster-admit-learner, cluster settings) has to be agreed again: re-run those "
         "commands once a leader is elected; see docs/operations/upgrading-a-fleet.md";

@@ -223,8 +223,14 @@ ConsensusTier::ConsensusTier(Cluster::ClusterMember self,
     // and a node that asserted its own on every pass would undo a demotion one interval
     // after it committed. Before its first pass it is recorded where the configuration
     // already counts it.
-    _desired.push_back(Cluster::DesiredMember {
-        .id = _self.id, .raftEndpoint = _self.raftEndpoint, .schedulerEndpoint = _self.schedulerEndpoint });
+    //
+    // The KEY is the scheduler endpoint's way round again (#178): a node is the authority
+    // on the key it holds, read out of its own state directory, and nobody else can say
+    // it. Absent on a node that holds none, which is no opinion rather than a claim.
+    _desired.push_back(Cluster::DesiredMember { .id = _self.id,
+                                                .raftEndpoint = _self.raftEndpoint,
+                                                .schedulerEndpoint = _self.schedulerEndpoint,
+                                                .publicKey = _self.publicKey });
 }
 
 std::expected<std::unique_ptr<ConsensusTier>, std::string> ConsensusTier::Start(NodeConfig const& cfg,
@@ -558,7 +564,10 @@ std::expected<Consensus::LogIndex, ConsensusError> ConsensusTier::Propose(Cluste
     // Validated BEFORE it is proposed, which is the only place a change can be
     // refused: an entry is applied after it is committed, when there is nobody left
     // to report a failure to and no way to un-commit it.
-    if (auto const allowed = Cluster::Validate(command); !allowed.has_value())
+    //
+    // Against the state this node has applied (#178), because the rules about keys are
+    // rules about what the roster already holds: a revoked key, one held under another id.
+    if (auto const allowed = Cluster::ValidateAgainst(_application.State(), command); !allowed.has_value())
         return std::unexpected { allowed.error() };
 
     // And a forget against the configuration consensus holds (#1539): forgetting the
