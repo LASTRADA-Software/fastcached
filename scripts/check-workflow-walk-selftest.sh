@@ -112,7 +112,28 @@ Counted() {
 # printed: a transcript carrying one line per input line would be unreadable, and
 # the tally is what says a kind fired at all.
 cat > "${FastCachedWork}/drive.awk" <<'DRIVER'
-function WorkflowOn(kind,   c) {
+# The `if:` conditions `WorkflowMatrixDecide` is driven with, each against one job's combinations.
+BEGIN {
+    Cond("arm", "${{ matrix.suffix == '' }}")
+    Cond("arm", "matrix.suffix != ''")
+    Cond("arm", "${{ matrix.suffix == '' && steps.c.outputs.cache-hit != 'true' }}")
+    Cond("arm", "${{ matrix.suffix == '' || github.event_name == 'push' }}")
+    Cond("arm", "${{ (matrix.preset == 'GCC-RELEASE') && !(matrix.suffix != '') }}")
+    Cond("arm", "${{ matrix.Suffix == '' }}")
+    Cond("arm", "${{ !cancelled() && matrix.suffix == '' }}")
+    Cond("arm", "${{ matrix.missing == 'x' }}")
+    Cond("arm", "${{ matrix.missing == '0' }}")
+    Cond("arm", "${{ matrix.suffix < 'a' }}")
+    Cond("arm", "")
+    Cond("arm", "${{ matrix.suffix == 'it''s' }}")
+    Cond("arm", "${{ matrix.suffix == '' }} && x")
+    Cond("arm", "${{ false || matrix.runner == 'ubuntu-24.04-arm' }}")
+    Cond("excluded", "${{ matrix.version == '10' }}")
+    Cond("excluded", "${{ matrix.os == 'b, c' }}")
+}
+function Cond(job, text) { condJob[++condCount] = job; cond[condCount] = text }
+
+function WorkflowOn(kind,   c, i, decided) {
     tally[WfPass, kind]++
     if (WfPass != 2) return
     if (kind == "text")
@@ -133,6 +154,13 @@ function WorkflowOn(kind,   c) {
         printf "job\t%s\tat=%d\trunsOn=<%s>\tshell=<%s>\tenvnames=%s\n",
                WfJob, WfJobStart, WfRunsOn, WfJobShell, Names(WfJobEnv)
         if (WfHasMatrix) {
+            # Every condition of this job decided for every combination, one letter each (#1540).
+            for (i = 1; i <= condCount; i++) {
+                if (condJob[i] != WfJob) continue
+                decided = ""
+                for (c = 1; c <= WfComboCount; c++) decided = decided WorkflowMatrixDecide(cond[i], c)
+                printf "decide\t%s\t%d\t%s\n", WfJob, i, decided
+            }
             printf "matrix\t%s\tcount=%d\tunread=<%s>\n", WfJob, WfComboCount, WfMatrixUnread
             for (c = 1; c <= WfComboCount; c++) {
                 printf "combo\t%s\t%d\t%s\n", WfJob, c, WorkflowComboLabel(c)
@@ -739,6 +767,26 @@ Judge() {
         Require "${text}" 'combo	quoting	2	(name=x, y)' "a quoted flow-sequence item keeps its comma"
         Require "${text}" 'combo	quoting	3	(name=it'"'"'s)' "a doubled apostrophe in a single-quoted item is one"
 
+        # A step `if:` decided per combination (#1540), one letter per leg of `arm`
+        # (clang-release, gcc-release, gcc-release-arm64) or of `excluded`. Each
+        # line is a rule: U never becomes F, and only matrix terms decide anything.
+        Require "${text}" 'decide	arm	1	TTF' "a missing key is null, and null equals ''"
+        Require "${text}" 'decide	arm	2	FFT' "a condition with no \${{ }} wrapper is still an expression"
+        Require "${text}" 'decide	arm	3	UUF' "true AND unknown stays unknown, false AND unknown is false"
+        Require "${text}" 'decide	arm	4	TTU' "true OR unknown is true, false OR unknown stays unknown"
+        Require "${text}" 'decide	arm	5	FTF' "strings compare case-insensitively, through parentheses and negation"
+        Require "${text}" 'decide	arm	6	UUU' "a key matching only case-folded decides nothing"
+        Require "${text}" 'decide	arm	7	UUF' "a function call decides nothing, and its arguments are skipped"
+        Require "${text}" 'decide	arm	8	FFF' "null differs from a non-numeric string"
+        Require "${text}" 'decide	arm	9	UUU' "null against a numeric string is GitHub's coercion, undecided"
+        Require "${text}" 'decide	arm	10	UUU' "an operator the evaluator does not model decides nothing"
+        Require "${text}" 'decide	arm	11	TTT' "an empty condition runs"
+        Require "${text}" 'decide	arm	12	FFF' "a doubled apostrophe in a literal is one"
+        Require "${text}" 'decide	arm	13	UUU' "text outside the \${{ }} wrapper decides nothing"
+        Require "${text}" 'decide	arm	14	FFT' "false is a literal, and a runner is a matrix value like any other"
+        Require "${text}" 'decide	excluded	15	UUUU' "a matrix value that could be a number decides nothing"
+        Require "${text}" 'decide	excluded	16	FTTF' "a quoted value keeps its comma through the comparison"
+
         # A matrix written below the steps still reaches them.
         Require "${text}" 'step-expand	late	2	runsOn=<windows-11-arm>' "a step sees the combinations of a matrix written after it"
 
@@ -891,6 +939,22 @@ Neuter matrix-key-case '/differ only in case, and whether GitHub reads them/s/^/
     "keys that differ only in case being refused"
 Neuter matrix-bare-dash 's/{ WorkflowMatrixItem(itemInd, ""); return }$/return/' matrix \
     "a bare dash in the matrix being refused"
+Neuter decide-and-unknown '/(a == "T" && b == "T")/s/: "U"$/: "F"/' matrix \
+    "true AND unknown staying unknown rather than becoming false"
+Neuter decide-or-unknown '/(a == "F" && b == "F")/s/: "U"$/: "T"/' matrix \
+    "false OR unknown staying unknown rather than becoming true"
+Neuter decide-case 's/eq = (tolower(ta) == tolower(tb))/eq = (ta == tb)/' matrix \
+    "strings comparing case-insensitively, as GitHub compares them"
+Neuter decide-null-empty 's/^            if (ta == "") eq = 1$/            if (0) eq = 1/' matrix \
+    "a missing key equalling an empty string"
+Neuter decide-null-numeric '/\[Ii\]nfinity/s/^/#/' matrix \
+    "a missing key against a numeric string staying undecided"
+Neuter decide-typed-value '/(ka == "m" && WorkflowExprTyped(ta))/s/^/#/' matrix \
+    "a matrix value that could be a number deciding nothing"
+Neuter decide-empty-runs 's/^    if (e == "") return "T"$/    if (e == "") return "F"/' matrix \
+    "an empty condition meaning the step runs"
+Neuter decide-folded-key '/if (WorkflowMatrixFoldedKey(key)) return "u\\034"/s/^/#/' matrix \
+    "a key matching only case-folded deciding nothing"
 Neuter matrix-flow-quotes 's/^        if (ch == "\\"" || ch == sq) { q = ch; item = item ch; continue }$/        #&/' matrix \
     "a comma inside a quoted flow item separating nothing"
 
