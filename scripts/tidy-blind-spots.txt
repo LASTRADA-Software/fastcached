@@ -13,9 +13,12 @@
 # that is deleted or renamed cannot leave rows quietly claiming coverage. The list
 # is never the evidence -- the measurement is.
 #
-# The count of units reached by NO leg is printed on every run. That number is
-# https://github.com/LASTRADA-Software/fastcached/issues/858, and it is 5 until a
-# macOS leg exists.
+# The count of units reached by NO leg is printed on every run, and deliberately not
+# restated here: a figure in prose beside the table it describes is a second claim, and
+# this one went stale the first time a row was added. It is two kinds of unit, and the
+# reason column says which: the kqueue units, reached by nothing until a macOS leg exists
+# (https://github.com/LASTRADA-Software/fastcached/issues/858), and the instruction-set
+# probe, which holds no code for ANY analyser to read on any platform (#1447).
 #
 # Format: <path><TAB><reached-by, comma-separated, or `none`><TAB><reason>
 src/FastCache/Async/IocpReactor.cpp	clang-tidy-windows	`#if defined(_WIN32)`
@@ -30,3 +33,4 @@ src/FastCache/Async/KqueueReactor_test.cpp	none	`#if defined(__APPLE__)`; no mac
 src/FastCache/Net/KqueueConnector.cpp	none	`#if defined(__APPLE__)`; no macOS analyser leg exists
 src/FastCache/Net/KqueueSocket.cpp	none	`#if defined(__APPLE__)`; no macOS analyser leg exists
 src/FastCache/Net/KqueueSocket_test.cpp	none	`#if defined(__APPLE__)`; no macOS analyser leg exists
+src/tests/InstructionSetBaseline.cpp	none	preprocessor directives and `#error` only, on every platform: there is no code for an analyser to read, and what it decides is driven by `ctest -R instruction-set-probe-selftest` (#1447)

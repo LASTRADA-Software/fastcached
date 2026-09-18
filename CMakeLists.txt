@@ -463,6 +463,7 @@ include(Coverage)
 include(ClangTidy)
 include(Utf8CodePage)
 include(ErrorPopups)
+include(InstructionSetProbe)
 
 # ----------------------------------------------------------------------------
 # The vendored TUI gets the sanitizer flags TARGET BY TARGET, and that is not a style choice.
@@ -668,6 +669,14 @@ fastcached_declare_utf8_code_page()
 # included with the other helpers so every test registration can name its variable.
 
 fastcached_suppress_error_popups()
+
+# ----------------------------------------------------------------------------
+# No executable is compiled for an instruction set above its architecture's baseline
+# (#1447): each compiles a probe that asks the compiler's predefined macros, in the build's
+# own environment. Attached by the same walk as the two above, for the same reason.
+# cmake/InstructionSetProbe.cmake says why the build and not a test.
+
+fastcached_probe_instruction_set_baseline()
 
 # ----------------------------------------------------------------------------
 # The `coverage` / `coverage-clean` targets, when ENABLE_COVERAGE is on. Last in

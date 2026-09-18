@@ -53,7 +53,8 @@
 #   - Flags that never reach a compile command: a compiler's BUILD-TIME environment (cl's `CL` and `_CL_`,
 #     clang's `CCC_OVERRIDE_OPTIONS`), driver configuration files clang reads beside its binary, defaults a
 #     compiler was built with (a GCC configured `--with-arch=`), and the link line, where LTO code
-#     generation may take its own `-march`. Asking the compiler itself is #1447.
+#     generation may take its own `-march`. Those are asked of the COMPILER instead:
+#     `src/tests/InstructionSetBaseline.cpp`, which every executable compiles (#1447).
 #   - A generator that writes no compile database (Visual Studio).
 #   - A flag inside a quoted define (`-DX="-msha"`) is REFUSED, not understood, and a response file named
 #     inside a response file is refused rather than followed: the reader errs toward refusing.
